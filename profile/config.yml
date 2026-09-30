@@ -9,6 +9,25 @@
 #
 # Sections owned by other migration steps are marked slots; each owner fills only its own.
 
+# ── Look and feel (Jo, 2026-09-30: "i hate my omp i guess layout and prompt composer") ──
+# The setup wizard wrote composer.shape pi, symbolPreset nerd and theme titanium into the first
+# rendered profile; none of them was chosen. These are the keys Jo's default profile
+# (~/.omp/agent/config.yml) runs, so the as2 session looks like their daily omp. Pure display:
+# nothing in surface/, gates/ or classifier/ reads them. Reversal: delete the block; OMP's
+# defaults return on the next render.
+symbolPreset: unicode
+composer:
+  shape: field
+theme:
+  dark: titanium
+  light: light
+hideThinkingBlock: true
+display:
+  hideToolActivity: true
+  showTokenUsage: true
+  showTurnTime: true
+  shimmer: kitt
+
 # ── Extensions (SPEC-2.0.md § B8; omp://extension-loading.md § "Explicitly configured paths") ──
 extensions:
   # M5: orchestrator surface — wake = the ledger rendered, the five § B3 lines, stakes/mode
