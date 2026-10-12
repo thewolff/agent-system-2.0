@@ -33,18 +33,26 @@
 // Test run: the newest held `test-run-failed:` the test runner sent about a workload no lane holds
 // under a live lease (MIGRATION.md item 24, PLAN § 2.5), shown once: delivery consumes it, a lane
 // taking the workload hides it, a `test-run:` green written after it clears it.
+// Chaos: each held `chaos-failed:` message the surface itself wrote (`SURFACE_BY`) to the
+// orchestrator on the standing workload, one line per night (surface/src/chaos-alert.ts
+// `recordChaosAlerts` writes them before every read; PLAN wl-mv5lpzqacbe5ts § 2.2), shown once:
+// delivery consumes it, and the delivered message stays the night's dedup record. A body by any
+// other writer, on another workload or to another recipient, or that does not parse, is no line.
 // Due: an open workload whose brief starts `due:<date> ` with date <= now by instant (Codex S4).
 // Answerable lines (a waiting reserved request, an open question with options) carry a
 // session-stable number Jo answers with, set by surface/src/numbering.ts, never here. An idle line
 // has no one-word answer, so it is never numbered.
 import { type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import { type ControlEntry, controlEntries, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
+import { parseChaosFailed } from "./chaos-alert";
 import { questionSubject } from "./orchestrator-question";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { parseTestRunFailed, testRuns } from "./test-run";
-import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
+import {
+	ARTIFACT_FAILURES_SURFACED, CHAOS_FAILED_PREFIX, DUE_PREFIX, HOLD_HOURS, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY, TEST_RUN_FAILED_PREFIX,
+} from "./types";
 
-export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle";
+export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "chaos" | "lane-died" | "question" | "due" | "idle";
 
 export interface ErrorLine {
 	kind: ErrorKind;
@@ -275,7 +283,7 @@ function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: reado
 	};
 }
 
-/** Every line owed right now, in § B3 order (1–3), the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the due rows. */
+/** Every line owed right now, in § B3 order (1–3), the test-run lines, the chaos lines, § B3 order (4–5) with the idle lines after the deaths, then the due rows. */
 export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger.inFlight(), opts: ErrorOptions = {}): ErrorLine[] {
 	const now = opts.now ?? ledger.now();
 	const holdHours = opts.holdHours ?? HOLD_HOURS;
@@ -283,6 +291,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 	const held: ErrorLine[] = [];
 	const artifact: ErrorLine[] = [];
 	const testRun: ErrorLine[] = [];
+	const chaos: ErrorLine[] = [];
 	const died: ErrorLine[] = [];
 	const idle: ErrorLine[] = [];
 	const questions: ErrorLine[] = [];
@@ -312,6 +321,17 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		}
 		const run = testRunLine(ledger, workload, pendingMessages, now);
 		if (run) testRun.push(run);
+		if (wl === STANDING_WORKLOAD_ID) {
+			// One line per night, oldest night first (one reconcile writes several in the same millisecond, so ledger order is not night order).
+			const nights = pendingMessages.flatMap((m) => {
+				if (m.state !== "held" || m.created_by !== SURFACE_BY || m.recipient !== ORCHESTRATOR_RECIPIENT || !m.body.startsWith(CHAOS_FAILED_PREFIX)) return [];
+				const a = parseChaosFailed(m.body);
+				return a ? [{ m, a }] : [];
+			});
+			for (const { m, a } of nights.sort((x, y) => x.a.day.localeCompare(y.a.day))) {
+				chaos.push({ kind: "chaos", workloadId: wl, rowId: m.id, messageIds: [m.id], line: `nightly chaos run ${a.day} (${a.fault ?? "-"}): ${a.verdict} — ${short(a.reason, 120)} — report ${a.report ?? "-"}` });
+			}
+		}
 		for (const d of laneDeaths(ledger, wl)) {
 			if (d.state !== "held") continue;
 			died.push({ kind: "lane-died", workloadId: wl, rowId: d.id, messageIds: [d.id], line: `lane ${d.holder} on ${label} died: ${d.body.slice(d.body.indexOf(":", 11) + 1).trim()}, ${workload.open_slices} open slice(s)${workload.holder && workload.holder !== d.holder ? `; ${workload.holder} holds it now` : ""}` });
@@ -347,5 +367,5 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			due.push({ kind: "due", workloadId: wl, rowId: wl, line: `scheduled and past due (${scheduled.due}): ${short(scheduled.text, 120)} — close ${wl} with a receipt when done` });
 		}
 	}
-	return [...reserved, ...held, ...artifact, ...testRun, ...died, ...idle, ...questions, ...due];
+	return [...reserved, ...held, ...artifact, ...testRun, ...chaos, ...died, ...idle, ...questions, ...due];
 }

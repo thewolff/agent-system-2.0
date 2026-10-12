@@ -22,11 +22,13 @@
 // re-reads the ledger so a question written by a lane, a lane's death, a lane that ended on purpose
 // with work open and nobody holding it (MIGRATION.md item 68), or a hold crossing four hours with
 // nobody typing is pushed as an aside. Each read first records lapsed leases as lane-died rows
-// (surface/src/signals.ts) and each delivery consumes the held orchestrator-bound
-// messages behind its lines (surface/src/delivery.ts), so a line is delivered once until its
-// state changes. The tick's catch-up lines go to their own queue (`tickNotices`) and are pushed as
-// `surface-notices` asides with the same confirmation, resends and fallback as a wake; while a wake
-// is pending or in flight they wait and ride it. Jo's word echoes (`notices`) are never pushed.
+// (surface/src/signals.ts) and owed nightly chaos failures as chaos-failed: rows
+// (surface/src/chaos-alert.ts, HOME from the session's env), and each delivery consumes the held
+// orchestrator-bound messages behind its lines (surface/src/delivery.ts), so a line is delivered
+// once until its state changes. The tick's catch-up lines go to their own queue (`tickNotices`)
+// and are pushed as `surface-notices` asides with the same confirmation, resends and fallback as a
+// wake; while a wake is pending or in flight they wait and ride it. Jo's word echoes (`notices`)
+// are never pushed.
 //
 // Every pushed message, and Jo's turn message when it re-renders a pushed one, carries
 // `details.surfaceKey` (`wake:<id>`, `notices:<id>`, shared by a push's resends and its re-render)
@@ -34,6 +36,7 @@
 // assistant message, so copies OMP queued without a turn (the ACP defer branch) reach the model once,
 // and drops there the copies of a wake a later trigger superseded unconfirmed (its key retired).
 import { contractPath, injectContract } from "../../gates/src/rows/r02-contract";
+import { recordChaosAlerts } from "../src/chaos-alert";
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
@@ -46,11 +49,12 @@ import { closeWorkloadWithEntry } from "./workload";
 
 const APPLIED_HEADING = "## Applied from the surface since your last turn";
 
-/** The lines owed now, after this read's own writes (lapsed leases persisted as lane-died rows), numbered with the session's numbering. */
+/** The lines owed now, after this read's own writes (lapsed leases persisted as lane-died rows, owed chaos nights as chaos-failed: rows), numbered with the session's numbering. */
 function readLines(s: SurfaceSession): ErrorLine[] {
 	const ledger = s.ledger();
 	const now = s.now();
 	recordLapsedLeases(ledger, SURFACE_BY, now);
+	recordChaosAlerts(ledger, SURFACE_BY, now, s.env);
 	return s.numbering.assign(errorLines(ledger, ledger.inFlight(), { now, holdHours: HOLD_HOURS }));
 }
 
@@ -94,6 +98,7 @@ function renderWakeTurn(s: SurfaceSession, trigger: WakeTrigger, ticks: readonly
 		ensureStandingWorkload(ledger);
 		const now = s.now();
 		recordLapsedLeases(ledger, SURFACE_BY, now);
+		recordChaosAlerts(ledger, SURFACE_BY, now, s.env);
 		const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now, numbering: s.numbering });
 		text = rendered.text;
 		s.delivered.take(rendered.lines);
@@ -185,6 +190,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			}
 			const now = s.now();
 			recordLapsedLeases(ledger, SURFACE_BY, now);
+			recordChaosAlerts(ledger, SURFACE_BY, now, s.env);
 			const rendered = renderWake(ledger, { heading: `read on demand${wl ? `: ${wl}` : ""}`, holdHours: HOLD_HOURS, now, workloadId: wl, numbering: s.numbering });
 			s.delivered.take(rendered.lines);
 			if (wl) consumeLines(ledger, rendered.lines);

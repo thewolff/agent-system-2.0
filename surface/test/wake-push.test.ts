@@ -4,13 +4,18 @@
 // their own queue. The test plays OMP's part: it fires the one-shot (ctx.setTimeout) and the poll
 // (ctx.setInterval), emits `message_end` for a pushed message the way OMP admits it, keeps unconfirmed
 // sends as OMP's ACP branch would, and runs the `context` hook over what would reach the model.
+// The nightly chaos alert (PLAN wl-mv5lpzqacbe5ts § 5) is read the same way, through the registered
+// on-demand `orchestrator_ledger` tool, with the session env's HOME armed; those two tests import
+// only what origin/main already has and spell the nightly paths and report out, so they fail there
+// by assertion.
 import { describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONTRACT_MARKER } from "../../gates/src/rows/r02-contract";
 import { Ledger } from "../../ledger/src/index";
 import { launchVerdict } from "../extensions/launch";
 import orchestratorSurface from "../index";
+import { nightlyFault } from "../src/chaos";
 import { doneBody } from "../src/launch";
 import { surfaceSession } from "../src/session";
 import { SURFACE_BY } from "../src/types";
@@ -386,5 +391,50 @@ describe("Fix 2: the tick's notices are pushed from their own queue, and confirm
 		const carrying = out.filter((m) => typeof m.content === "string" && m.content.includes(w.line(1)));
 		expect(carrying).toEqual([render]);
 		expect(appliedOf(turn)).toEqual([`- ${w.line(1)}`, `- ${w.line(2)}`]);
+	});
+});
+
+describe("the nightly chaos alert reaches the surface's read (PLAN wl-mv5lpzqacbe5ts § 5)", () => {
+	/** A temp HOME whose `agent-scratch/agent-system-2.0/chaos/nightly` is armed from `on`, and a writer of nightly reports in it. */
+	function armedHome(on: string) {
+		const home = tmp("chaos-home");
+		const nightly = join(home, "agent-scratch", "agent-system-2.0", "chaos", "nightly");
+		mkdirSync(nightly, { recursive: true });
+		writeFileSync(join(nightly, "arming.log"), `on ${on}\n`);
+		const report = (day: string, verdict: string, reason: string): string => {
+			const path = join(nightly, `${day}-${nightlyFault(day)}.md`);
+			writeFileSync(path, `# chaos ${nightlyFault(day)}: ${verdict}\n\n- verdict: **${verdict}** — ${reason}\n- fault: ${nightlyFault(day)}\n`);
+			return path;
+		};
+		return { home, report };
+	}
+	/** The on-demand ledger read at `now` (October 2026 is PDT: a night is judged from 05:15 PT, 12:15Z) and its chaos lines. */
+	async function read(home: string, now: string) {
+		const t = surface({ env: { HOME: home } });
+		t.s().now = () => now;
+		const text = (await t.f.tool("orchestrator_ledger").execute("1", {}, undefined, undefined, t.ctx)).content[0]!.text;
+		return { text, lines: text.split("\n").filter((l) => l.includes("nightly chaos run")) };
+	}
+
+	test("a failed nightly chaos report in an armed HOME gives one needs-you line naming fault, verdict and report", async () => {
+		const h = armedHome("2026-10-01T12:00:00Z");
+		const path = h.report("2026-10-02", "FAIL", "two needs-you lines for one death");
+		const { lines } = await read(h.home, "2026-10-02T13:00:00.000Z");
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain("2026-10-02");
+		expect(lines[0]).toContain(nightlyFault("2026-10-02"));
+		expect(lines[0]).toContain("FAIL");
+		expect(lines[0]).toContain("two needs-you lines for one death");
+		expect(lines[0]).toContain(path);
+	});
+
+	test("a missed armed night gives one line, and a passed night none", async () => {
+		const h = armedHome("2026-09-30T12:00:00Z");
+		h.report("2026-10-01", "PASS", "one line, nothing orphaned");
+		const { lines } = await read(h.home, "2026-10-02T13:00:00.000Z");
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain("2026-10-02");
+		expect(lines[0]).toContain("MISSED");
+		expect(lines.some((l) => l.includes("2026-10-01"))).toBe(false);
 	});
 });

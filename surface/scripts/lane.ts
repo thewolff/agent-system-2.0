@@ -307,7 +307,7 @@ function cmdLaunch(wl: string, who: string): number {
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: branchBody(p.branch, p.base) });
 		});
 		const log = openSync(join(p.dir, "runner.log"), "a");
-		const runner = spawn(["bun", import.meta.path, "run", wl, laneId], {
+		const runner = spawn(runnerArgv(import.meta.path, wl, laneId), {
 			cwd: p.worktree, env: laneEnv(process.env, { workloadId: wl, laneId }), stdin: "ignore", stdout: log, stderr: log, detached: true,
 		});
 		runner.unref();
@@ -701,6 +701,20 @@ export function isRunnerCommand(command: string, wl: string, laneId: string): bo
 	return new RegExp(`(?:^|[\\s/])lane\\.ts run ${esc(wl)} ${esc(laneId)}(?:\\s|$)`).test(command);
 }
 
+/** The argv `cmdLaunch` spawns a lane's runner with, `bun <script> run <wl> <laneId>`: the command line `isRunnerCommand` recognises. */
+export function runnerArgv(script: string, wl: string, laneId: string): string[] {
+	return ["bun", script, "run", wl, laneId];
+}
+
+/**
+ * The shared text of `lane.ts run`'s two `already running` refusals (exit `held`): the run lock's live owner
+ * (`holdRunnerLock`, which adds ` holds <path>`) and the recorded live omp or runner (`liveRunnerOf`). chaos's
+ * SECOND_RUNNER_REFUSAL (surface/src/chaos.ts) matches it.
+ */
+export function alreadyRunningText(laneId: string, pid: number | string, what: "omp" | "runner" = "runner"): string {
+	return `${laneId} already running: ${what} pid ${pid}`;
+}
+
 /** One `ps <args>` as run: its exit code (null when killed by a signal) and both streams. */
 export interface PsResult {
 	exitCode: number | null;
@@ -938,7 +952,7 @@ function holdRunnerLock(ledger: Ledger, wl: string, laneId: string, probe: Runne
 	switch (r.state) {
 		case "same":
 		case "raced":
-			throw new Fail("run", `${laneId} already running: runner pid ${pid} holds ${path}`, STARTER_EXIT.held!);
+			throw new Fail("run", `${alreadyRunningText(laneId, pid)} holds ${path}`, STARTER_EXIT.held!);
 		case "unknown":
 			throw new Fail("run", `${laneId} not started: ${path} names runner pid ${pid}, alive, with no start time to verify it by; nothing was written, retryable once it exits`, STARTER_EXIT.held!);
 		case "failed":
@@ -973,7 +987,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 		if (live?.unverified) {
 			throw new Fail("run", `${laneId} not started: the recorded ${live.what} pid ${live.pid} is alive and no start time was recorded for it, so it cannot be told from this lane's omp; nothing was written, retryable once it exits`, STARTER_EXIT.held!);
 		}
-		if (live !== null) throw new Fail("run", `${laneId} already running: ${live.what} pid ${live.pid}`, STARTER_EXIT.held!);
+		if (live !== null) throw new Fail("run", alreadyRunningText(laneId, live.pid, live.what), STARTER_EXIT.held!);
 		return await runOwned(ledger, w, wl, laneId, lock);
 	} finally {
 		lock.release();

@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 // chaos: the nightly chaos run's CLI (the approved plan of workload wl-mv45yxnkw2251c, revision 4,
 // §§ 2.1–2.7). One injected fault per run against a scratch copy of this checkout and a throwaway
-// ledger, judged within 5 minutes, reported to ~/agent-scratch/agent-system-2.0/chaos/.
+// ledger, judged within 5 minutes, reported to $HOME/agent-scratch/agent-system-2.0/chaos/ (R): a
+// manual --fault run's report in R, a --nightly run's in R/nightly, beside the attempt marker main
+// writes before the run starts (PLAN wl-mv5lpzqacbe5ts § 2.1; surface/src/chaos-alert.ts reads them).
 //
 //   bun surface/scripts/chaos.ts --fault <name> [--kill runner]   run one fault
 //   bun surface/scripts/chaos.ts --nightly                        the 03:00 PT rotation (launchd)
@@ -35,40 +37,43 @@
 //  5. The workload is opened in the throwaway ledger with its `repo:` entry, and the lane launched
 //     with `bun surface/scripts/lane.ts launch <wl> --requested-by chaos` from S/repo. The stub
 //     scripts the lane (§ 2.2), the change hand, the review hand and the orchestrator.
-//  6. The fault's trigger is read from the throwaway ledger every 1 s; the injection records its
+//  6. The fault's trigger is read from the throwaway ledger every 1 s; whether, and on what, it fires is
+//     a pure predicate in surface/src/chaos-triggers.ts (bound to the real producers by
+//     surface/test/chaos-bindings.test.ts); the injection records its
 //     fault evidence (FAULT_EVIDENCE). The judge polls every 5 s for 300 s, settles 30 s, and
 //     `verdict` decides; the measured phase's egress, the nonce check and the harness checks feed it.
 //  7. Every process the run owns is killed (Run.killAll: chaos's live children, the pids it verified when it learned them,
 //     the scratch ledger's lane-started: omps and runners, and everything below them, each start time checked right before
 //     its signal; a process that merely names S is never one), the live state is snapshotted again and diffed, the
-//     report is written, and S is deleted on PASS and kept otherwise. Exit 0 PASS, 1 FAIL, 2 HARNESS-ERROR.
+//     report is published (temp file, then rename), and S is deleted on PASS and kept otherwise. Exit 0 PASS, 1 FAIL, 2 HARNESS-ERROR.
 //
 // Fault 4's trigger is the one not polled: "the lane's turn after its first lane_add_slice" is the
 // very next request, which a 1 s poll would race, so the lane script's match arms the refusal on
-// that request inside the stub (the request is then refused in the same call).
+// that request inside the stub (the request is then refused in the same call; `refusalArms`).
 //
 // chaos never exports AGENT_SYSTEM_LEDGER_DB in a shell command (P-11 row 10): the scratch path is
 // set only in the env objects passed to Bun.spawn.
 import type { Subprocess } from "bun";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
-import { parseHandSpawn, settledTokens } from "../../classifier/src/lab";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { type EntryRow, Ledger } from "../../ledger/src/index";
 import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import {
 	copyIntoScratch, END_RECEIPT_SKEW_MS, type Evidence, type EvidenceItem, emptySeen, FAULT_EVIDENCE, FAULTS, type FaultName, firstHolder, HarnessError, type IsolationDiff,
 	type IsolationSnapshot, isFault, isolationDiff, isolationSnapshot, isOmpCommand, isScratchRunner, judgePoll, killRefusal, killTargets, type LaneStart, laneStarts, liveActorsOf,
-	namesPath, newStarts, nightlyDue, nightlyFault, type OwnedProc,
+	namesPath, newStarts, nightlyDue, nightlyFault, type OwnedProc, ptParts,
 	type Poll, POLL_MS, type ProcRow, PS_SHIM, type PsSource, removeFromScratch, type RunReport, renderReport, reportPath, sameStart, scratchNewPathRefusal, SECOND_RUNNER_EVIDENCE,
 	secondRunnerJudgement, type Seen, SETTLE_MS, type Verdict,
 	verdict, WINDOW_MS, type WorkloadRows, workloadRows, writeScratchFile,
 } from "../src/chaos";
+import { chaosRoot, nightlyDir, publishReport, writeAttemptMarker } from "../src/chaos-alert";
+import { chaosSpawns, firstLaneStart, firstSpawnSeen, handKillTarget, laneEnd, orchestratorBootDue, refusalArms, reviewKillTarget } from "../src/chaos-triggers";
 import { recordRepo } from "../src/decision-log";
 import { laneDir, STARTER_EXIT, worktreePath } from "../src/launch";
 import { type Proxy, type ProxyAttempt, startProxy } from "./chaos-proxy";
 import { type Stub, type StubProfile, type StubRequest, type StubScript, type StubTurn, startStub, writeStubProfile } from "./chaos-stub";
-import { isRunnerCommand } from "./lane";
+import { isRunnerCommand, runnerArgv } from "./lane";
 
 /**
  * Hosts whose measured-phase proxy attempts are listed in the report rather than failing the run.
@@ -82,7 +87,11 @@ const EXEMPT_LABEL = "exempt (omp catalog refetch, refused by the proxy; Jo in-m
 /** The checkout this script runs from: the code under test, cloned into the scratch root. */
 const SOURCE = resolve(import.meta.dir, "..", "..");
 const PROFILE = "agent-system-2";
-const REPORTS_DIR = join(homedir(), "agent-scratch", "agent-system-2.0", "chaos");
+/**
+ * R, where reports go, from the HOME this process was given (the plist sets it), never `homedir()`: the surface's
+ * reconciler names the same dir from its own session env (PLAN wl-mv5lpzqacbe5ts § 2.1). main refuses an unset HOME.
+ */
+const REPORTS_DIR = chaosRoot(process.env.HOME ?? "");
 /** The scratch lease (§ 2.1): a runner killed with its lane surfaces through the lapse inside the window. */
 const LEASE_MS = 120_000;
 /** The chat model every chat role is pinned to (writeStubProfile's default). */
@@ -112,18 +121,65 @@ const PROBE_FENCE_MARK = "chaos-probe-fence";
 const PROBE_MODEL_MARK = "chaos-probe-model";
 const FENCE_OK = "chaos-fence-ok";
 
+/** The tier-file openings (tiers/lane.md, tiers/orchestrator.md) the stub classifies a session's requests by; chaos-bindings.test.ts runs them on the files. */
+export const LANE_TIER_MARK = /You are a \*\*lane\*\*/;
+export const ORCHESTRATOR_TIER_MARK = /You are the \*\*orchestrator\*\* surface/;
+
+/** One step of the stub lane's script: a tool call, and for a completion the hands that must have spawned and settled first. */
+export interface ChaosLaneStep {
+	tool: string;
+	input: Record<string, unknown>;
+	afterHands?: number;
+}
+
+/**
+ * The stub lane's nine scripted tool calls (§ 2.2) for workload `wl` in run `token`, in order; `Run.laneTurn` picks the next
+ * from what the conversation already did, with `wait` / `bash` between them while a hand runs. chaos-bindings.test.ts runs
+ * the ledger ones through the real lane tools.
+ */
+export function chaosLanePlan(wl: string, token: string): ChaosLaneStep[] {
+	const brief = (slice: string, task: string, done: string, inputs: string) =>
+		`slice: ${slice}\nworkload: ${wl}\ntask: ${task}\ndone-condition: ${done}\ninputs: ${inputs}\nstakes: normal\nceiling-share: 10`;
+	return [
+		{ tool: "ledger_wake_read", input: { body: `chaos ${token}: fresh workload ${wl}, no slices yet; next: cut the change slice.`, i: "Recording the wake read" } },
+		{ tool: "lane_add_slice", input: { id: SL_CHANGE, kind: "change-small", task: "append one line to chaos/scratch.txt and run bun test chaos/", doneCondition: "bun test chaos/ exits 0 with the line appended to chaos/scratch.txt", inputs: "chaos/scratch.txt and chaos/scratch.test.ts in the lane worktree", i: "Adding the change slice" } },
+		{
+			tool: "task",
+			input: {
+				i: "Dispatching the change hand",
+				context: `# Goal\nchaos scratch run ${token}`,
+				tasks: [{ name: SL_CHANGE, agent: "fast", solutionSpace: "one fix: append the line, given", task: brief(SL_CHANGE, `append one line to chaos/scratch.txt and run bun test chaos/ (${BUILD_MARK})`, "bun test chaos/ exits 0 with the line appended", "chaos/scratch.txt, chaos/scratch.test.ts in the lane worktree") }],
+			},
+		},
+		{ tool: "lane_complete_slice", afterHands: 1, input: { slice: SL_CHANGE, artifact: "bun test chaos/ → exit 0 (the hand's report)", i: "Completing the change slice" } },
+		{ tool: "lane_add_slice", input: { id: SL_REVIEW, kind: "judge", task: "review the change", doneCondition: "a review-findings block with no blocking finding", inputs: "chaos/scratch.txt on the lane branch", i: "Adding the review slice" } },
+		{
+			tool: "task",
+			input: {
+				i: "Dispatching the review",
+				context: `# Goal\nchaos scratch run ${token}`,
+				tasks: [{ name: SL_REVIEW, agent: "standard", solutionSpace: "judge: one change to review", task: brief(SL_REVIEW, `review the change on ${SL_CHANGE}: one line appended to chaos/scratch.txt (${REVIEW_MARK})`, "a review-findings block", "chaos/scratch.txt on the lane branch") }],
+			},
+		},
+		{ tool: "lane_complete_slice", afterHands: 2, input: { slice: SL_REVIEW, artifact: "review-findings: no findings", i: "Completing the review slice" } },
+		{ tool: "lane_add_slice", input: { id: SL_HOLD, task: "chaos-hold: wait for Jo", doneCondition: "Jo answers close or keep", inputs: "none", i: "Adding the hold slice" } },
+		{ tool: "lane_raise_question", input: { slice: SL_HOLD, body: `**QUESTION**\nchaos ${token}: close this scratch workload, or keep it? close ends it; keep leaves it parked.`, options: ["close", "keep"], i: "Raising the hold question" } },
+	];
+}
+
 const HELP = `usage: bun surface/scripts/chaos.ts --fault <name> [--kill runner]
        bun surface/scripts/chaos.ts --nightly
        bun surface/scripts/chaos.ts --help
 
 Runs one injected fault against a scratch copy of this checkout and a throwaway ledger under
 $TMPDIR/as2-chaos-<runId>, judges it within 5 minutes of injection (plus a 30 s settle), and writes
-${REPORTS_DIR}/<PT date>-<fault>.md.
+${REPORTS_DIR}/<PT date>-<fault>.md (--nightly: ${nightlyDir(REPORTS_DIR)}/<PT date>-<fault>.md).
 
   --fault <name>   one of: ${FAULTS.join(", ")}
   --kill runner    with lane-kill-mid-hand: SIGKILL the lane runner as well as its omp
   --nightly        run FAULTS[days since epoch of the PT date % 5], only while PT wall time is in
-                   [03:00, 03:15) and that date has no report yet (otherwise exit 0, nothing written);
+                   [03:00, 03:15) and that date has no report in ${nightlyDir(REPORTS_DIR)} yet (otherwise
+                   exit 0, nothing written); writes ${nightlyDir(REPORTS_DIR)}/<PT date>.attempt first;
                    requires fence: on
   --help           this text
 
@@ -366,7 +422,8 @@ class Run {
 	/** Fault-specific state. */
 	f: Record<string, unknown> = {};
 
-	constructor(readonly fault: FaultName, readonly variant: string | null, readonly nightly: boolean) {
+	/** `reportsDir`: where the report goes; R for a manual --fault run, R/nightly for --nightly (PLAN wl-mv5lpzqacbe5ts § 2.1). */
+	constructor(readonly fault: FaultName, readonly variant: string | null, readonly nightly: boolean, readonly reportsDir: string) {
 		for (const name of FAULT_EVIDENCE[fault]) this.items.set(name, { name, observed: "not observed", at: null });
 	}
 
@@ -658,8 +715,8 @@ class Run {
 		const lane: StubScript = {
 			kind: "lane",
 			match: (r) => {
-				const isLane = /You are a \*\*lane\*\*/.test(r.system) || (r.tools.includes("lane_add_slice") && r.firstUser.includes(this.wl));
-				if (isLane && this.fault === "provider-refusal" && this.f.refusalArmed === undefined && r.results.some((x) => x.name === "lane_add_slice")) {
+				const isLane = LANE_TIER_MARK.test(r.system) || (r.tools.includes("lane_add_slice") && r.firstUser.includes(this.wl));
+				if (isLane && this.fault === "provider-refusal" && refusalArms(r, this.f.refusalArmed !== undefined)) {
 					// Fault 4's trigger and action, in the request itself: refused in this same call (see the header).
 					this.f.refusalArmed = true;
 					this.stub!.setMode({ mode: "refuse", kind: "lane" });
@@ -673,7 +730,7 @@ class Run {
 		};
 		const orchestrator: StubScript = {
 			kind: "orchestrator",
-			match: (r) => r.tools.includes("orchestrator_wake_read") || /You are the \*\*orchestrator\*\* surface/.test(r.system),
+			match: (r) => r.tools.includes("orchestrator_wake_read") || ORCHESTRATOR_TIER_MARK.test(r.system),
 			steps: [{ text: "recording the wake read", tool: { name: "orchestrator_wake_read", input: { body: `chaos ${this.token}: scratch orchestrator; the chaos workload ${this.wl} runs under its lane; next: wait.`, i: "Recording the wake read" } } }],
 			after: { text: "**PMDW**\nchaos scratch orchestrator: nothing to do." },
 		};
@@ -694,33 +751,7 @@ class Run {
 	/** The lane's ten scripted steps (§ 2.2), chosen from what the conversation already did; waits for its hands between them. */
 	laneTurn(request: StubRequest): StubTurn {
 		for (const r of request.results) if (r.name !== null && !this.laneResults.has(r.toolUseId)) this.laneResults.set(r.toolUseId, `${r.name}${r.isError ? " (error)" : ""}: ${oneLine(r.text, 240)}`);
-		const brief = (slice: string, task: string, done: string, inputs: string) =>
-			`slice: ${slice}\nworkload: ${this.wl}\ntask: ${task}\ndone-condition: ${done}\ninputs: ${inputs}\nstakes: normal\nceiling-share: 10`;
-		const plan: { tool: string; input: Record<string, unknown>; afterHands?: number }[] = [
-			{ tool: "ledger_wake_read", input: { body: `chaos ${this.token}: fresh workload ${this.wl}, no slices yet; next: cut the change slice.`, i: "Recording the wake read" } },
-			{ tool: "lane_add_slice", input: { id: SL_CHANGE, kind: "change-small", task: "append one line to chaos/scratch.txt and run bun test chaos/", doneCondition: "bun test chaos/ exits 0 with the line appended to chaos/scratch.txt", inputs: "chaos/scratch.txt and chaos/scratch.test.ts in the lane worktree", i: "Adding the change slice" } },
-			{
-				tool: "task",
-				input: {
-					i: "Dispatching the change hand",
-					context: `# Goal\nchaos scratch run ${this.token}`,
-					tasks: [{ name: SL_CHANGE, agent: "fast", solutionSpace: "one fix: append the line, given", task: brief(SL_CHANGE, `append one line to chaos/scratch.txt and run bun test chaos/ (${BUILD_MARK})`, "bun test chaos/ exits 0 with the line appended", "chaos/scratch.txt, chaos/scratch.test.ts in the lane worktree") }],
-				},
-			},
-			{ tool: "lane_complete_slice", afterHands: 1, input: { slice: SL_CHANGE, artifact: "bun test chaos/ → exit 0 (the hand's report)", i: "Completing the change slice" } },
-			{ tool: "lane_add_slice", input: { id: SL_REVIEW, kind: "judge", task: "review the change", doneCondition: "a review-findings block with no blocking finding", inputs: "chaos/scratch.txt on the lane branch", i: "Adding the review slice" } },
-			{
-				tool: "task",
-				input: {
-					i: "Dispatching the review",
-					context: `# Goal\nchaos scratch run ${this.token}`,
-					tasks: [{ name: SL_REVIEW, agent: "standard", solutionSpace: "judge: one change to review", task: brief(SL_REVIEW, `review the change on ${SL_CHANGE}: one line appended to chaos/scratch.txt (${REVIEW_MARK})`, "a review-findings block", "chaos/scratch.txt on the lane branch") }],
-				},
-			},
-			{ tool: "lane_complete_slice", afterHands: 2, input: { slice: SL_REVIEW, artifact: "review-findings: no findings", i: "Completing the review slice" } },
-			{ tool: "lane_add_slice", input: { id: SL_HOLD, task: "chaos-hold: wait for Jo", doneCondition: "Jo answers close or keep", inputs: "none", i: "Adding the hold slice" } },
-			{ tool: "lane_raise_question", input: { slice: SL_HOLD, body: `**QUESTION**\nchaos ${this.token}: close this scratch workload, or keep it? close ends it; keep leaves it parked.`, options: ["close", "keep"], i: "Raising the hold question" } },
-		];
+		const plan = chaosLanePlan(this.wl, this.token);
 		let ptr = 0;
 		let trailingWaits = 0;
 		for (const r of request.results) {
@@ -735,10 +766,8 @@ class Run {
 		if (!step) return { text: "chaos lane: the hold question is raised; parking." };
 		if (step.afterHands !== undefined && this.ledger && trailingWaits < 150) {
 			const dispatch = [...request.results].reverse().find((x) => x.name === "task");
-			const entries = this.ledger.entries(this.wl);
-			const spawns = entries.flatMap((e) => parseHandSpawn(e.body)?.token ?? []);
-			const settled = settledTokens(entries);
-			const running = spawns.filter((t) => !settled.has(t));
+			const spawns = chaosSpawns(this.ledger.entries(this.wl));
+			const running = spawns.filter((s) => !s.settled);
 			if (dispatch && !dispatch.isError && (spawns.length < step.afterHands || running.length > 0)) {
 				if (running.length > 0 && request.tools.includes("wait")) return { text: "waiting for the hand", tool: { name: "wait", input: { i: "Waiting for the hand" } } };
 				return { text: "waiting for the hand to settle", tool: { name: "bash", input: { command: "sleep 2", i: "Waiting for the hand to settle" } } };
@@ -849,22 +878,6 @@ class Run {
 		return this.ledger!.db.query<{ body: string; created_at: string }, [string]>("SELECT body, created_at FROM messages WHERE workload_id = ? ORDER BY created_at").all(this.wl);
 	}
 
-	spawns(): { token: string; review: boolean; at: string; settled: boolean }[] {
-		const entries = this.entries();
-		const settled = settledTokens(entries);
-		return entries.flatMap((e) => {
-			const s = parseHandSpawn(e.body);
-			return s ? [{ token: s.token, review: s.review, at: e.created_at, settled: settled.has(s.token) }] : [];
-		});
-	}
-
-	laneEnded(laneId: string): { body: string; at: string } | null {
-		const e = this.entries().find((x) => x.body.startsWith(`lane-exit: ${laneId} `));
-		if (e) return { body: e.body, at: e.created_at };
-		const m = this.messages().find((x) => x.body.startsWith(`lane-died: ${laneId}`));
-		return m ? { body: m.body, at: m.created_at } : null;
-	}
-
 	launch(requestedBy: string): Promise<Ran> {
 		return this.run(["bun", "surface/scripts/lane.ts", "launch", this.wl, "--requested-by", requestedBy], { cwd: this.repo, ms: 120_000 });
 	}
@@ -901,7 +914,7 @@ class Run {
 		const deadline = Date.now() + TRIGGER_MS;
 		while (this.injectedAt === null) {
 			if (Date.now() > deadline) throw new HarnessError(`the ${this.fault} trigger never fired within ${TRIGGER_MS / 1000} s of the launch`);
-			const ended = this.laneEnded(this.laneId);
+			const ended = laneEnd(this.entries(), this.messages(), this.laneId);
 			if (ended && this.injectedAt === null) throw new HarnessError(`the lane ended before the ${this.fault} trigger: ${oneLine(ended.body)}`);
 			await this.trigger();
 			if (this.injectedAt === null) await Bun.sleep(1_000);
@@ -950,7 +963,7 @@ class Run {
 		const routed = new Set([...(this.profile?.routedModelIds ?? []), JUDGE_MODEL]);
 		const counts = stub.counts();
 		for (const id of [...Object.keys(counts.messages), ...Object.keys(counts.judge)]) if (id !== "" && !routed.has(id)) this.harness.push(`unrouted model ${id}`);
-		const firstSpawn = this.spawns()[0];
+		const firstSpawn = chaosSpawns(this.entries())[0];
 		if (firstSpawn && this.measuredAt !== null) {
 			const judged = stub.log().some((e) => e.outcome === "judged" && e.at >= this.measuredAt! && e.at <= Date.parse(firstSpawn.at));
 			if (!judged) this.harness.push("no /v1/systemone request before the first hand-spawn: the classifier ran some other way");
@@ -971,16 +984,15 @@ class Run {
 		const fire = () => {
 			this.triggerAt = iso();
 		};
-		const openHeld = (kind: string) => stub.held().find((h) => h.kind === kind && h.outcome === "open");
 		switch (this.fault) {
 			case "lane-kill-mid-hand": {
-				const hand = this.spawns().find((s) => !s.review && !s.settled);
-				const held = openHeld("hand");
-				if (!hand || !held) return;
+				const entries = this.entries();
+				const target = handKillTarget({ spawns: chaosSpawns(entries), held: stub.held(), starts: laneStarts(entries), laneId: this.laneId! });
+				if (target === null) return;
 				fire();
-				this.f.held = held.id;
-				const start = laneStarts(this.entries()).filter((s) => s.laneId === this.laneId).at(-1);
-				if (!start) throw new HarnessError(`no lane-started: entry for ${this.laneId} at the trigger`);
+				if ("error" in target) throw new HarnessError(`no lane-started: entry for ${this.laneId} at the trigger`);
+				this.f.held = target.held.id;
+				const { start } = target;
 				// The omp must be the one lane-started: recorded (its start time) and run from the scratch root (`--cwd` is the
 				// scratch worktree); the runner the one the launch named (its start time when chaos verified it), still running
 				// `lane.ts run <wl> <laneId>` from the scratch repo.
@@ -1023,14 +1035,14 @@ class Run {
 				return;
 			}
 			case "orchestrator-kill-mid-review": {
-				if (this.orchestrator === null && laneStarts(this.entries()).some((s) => s.laneId === this.laneId)) this.startOrchestrator();
-				const review = this.spawns().find((s) => s.review && !s.settled);
-				const held = openHeld("review");
-				if (!review || !held || this.orchestrator === null) return;
+				if (this.orchestrator === null && orchestratorBootDue(this.entries(), this.laneId!)) this.startOrchestrator();
+				const due = reviewKillTarget({ spawns: chaosSpawns(this.entries()), held: stub.held(), orchestratorRunning: this.orchestrator !== null });
+				if (due === null) return;
+				const { review, held } = due;
 				fire();
 				this.f.reviewToken = review.token;
 				this.f.held = held.id;
-				const old = this.orchestrator;
+				const old = this.orchestrator!;
 				// The orchestrator chaos spawned: its start time when spawned, an omp run with `--cwd` the scratch repo.
 				const target = { pid: old.pid, start: this.orchestratorLstart, want: (c: string) => isOmpCommand(c) && namesPath(c, this.repo), what: "orchestrator" };
 				const shield = this.shield ?? ancestorPids(this.psBin);
@@ -1055,7 +1067,7 @@ class Run {
 				return;
 			}
 			case "network-block-60s": {
-				if (this.spawns().length === 0) return;
+				if (!firstSpawnSeen({ spawns: chaosSpawns(this.entries()) })) return;
 				fire();
 				stub.setMode({ mode: "blackhole", ms: BLACKHOLE_MS });
 				this.injectedAt = iso();
@@ -1064,7 +1076,7 @@ class Run {
 			case "provider-refusal":
 				return; // armed inside the stub's lane match
 			case "duplicate-lane-runner": {
-				const first = laneStarts(this.entries()).find((s) => s.laneId === this.laneId);
+				const first = firstLaneStart(this.entries(), this.laneId!);
 				if (!first) return;
 				fire();
 				this.injectedAt = iso();
@@ -1086,7 +1098,7 @@ class Run {
 		// Start records are attributed by writer: only one whose runnerPid is this spawned runner's counts, since the first runner
 		// re-records its own start (model, session) under its own pid during the watch.
 		const before = new Set(laneStarts(this.entries()).filter((s) => s.laneId === first.laneId).map((s) => s.entryId));
-		const runner = this.spawn(["bun", "surface/scripts/lane.ts", "run", this.wl, first.laneId], { cwd: this.repo });
+		const runner = this.spawn(runnerArgv("surface/scripts/lane.ts", this.wl, first.laneId), { cwd: this.repo });
 		const errText = new Response(runner.stderr).text();
 		const outText = new Response(runner.stdout).text();
 		const deadline = Date.now() + SECOND_RUNNER_WATCH_MS;
@@ -1160,7 +1172,7 @@ class Run {
 				const h = stub.held().find((x) => x.id === this.f.held);
 				if (h && h.outcome === "dropped") this.observe("held hand connection dropped", `stub hold ${h.id} (${h.kind}, ${h.model}) dropped by the client at ${iso(h.ended ?? Date.now())}`, { at: iso(h.ended ?? Date.now()) });
 				if (h && h.outcome !== "open" && stub.mode().mode === "stall") stub.setMode({ mode: "normal" });
-				const ended = this.laneEnded(this.laneId!);
+				const ended = laneEnd(this.entries(), this.messages(), this.laneId!);
 				if (ended && after(ended.at)) this.observe("lane-exit or lane-died followed", oneLine(ended.body, 240), { at: ended.at });
 				else if (this.variant === "kill runner") {
 					const died = this.lastPoll?.lines.find((l) => l.kind === "lane-died");
@@ -1174,7 +1186,7 @@ class Run {
 					const wake = this.ledger!.entries("wl-orchestrator", "wake-read").find((e) => Date.parse(e.created_at) > restart);
 					if (wake) this.observe("new orchestrator wake read after restart", `wake-read entry ${wake.id} at ${wake.created_at}, after the restart at ${iso(restart)}`, { at: wake.created_at });
 				}
-				const settled = this.spawns().find((s) => s.token === this.f.reviewToken && s.settled);
+				const settled = chaosSpawns(this.entries()).find((s) => s.token === this.f.reviewToken && s.settled);
 				if (settled) this.observe("review hand settled", `hand-settled: ${settled.token}`);
 				return;
 			}
@@ -1280,9 +1292,8 @@ class Run {
 			rows, runners: this.runners, stubCounts, isolation: diff,
 			scratch: { path: this.S || "(not created)", kept: keep }, notes: this.notes,
 		};
-		mkdirSync(REPORTS_DIR, { recursive: true });
-		const path = reportPath(REPORTS_DIR, new Date(this.started), this.fault);
-		writeFileSync(path, renderReport(report));
+		const path = reportPath(this.reportsDir, new Date(this.started), this.fault);
+		publishReport(path, renderReport(report));
 		if (!keep && this.S) rmSync(this.S, { recursive: true, force: true });
 		process.stdout.write(`chaos ${this.fault}${this.variant ? ` (${this.variant})` : ""}: ${v.verdict} — ${oneLine(v.reason, 600)}\nreport: ${path}\nscratch: ${this.S || "(not created)"} (${keep ? "kept" : "deleted"})\n`);
 		return v.verdict === "PASS" ? 0 : v.verdict === "FAIL" ? 1 : 2;
@@ -1309,13 +1320,19 @@ async function main(argv: string[]): Promise<number> {
 		process.stdout.write(HELP);
 		return 0;
 	}
+	if (!isAbsolute(process.env.HOME ?? "")) {
+		process.stderr.write(`chaos: HOME is ${process.env.HOME === undefined ? "not set" : `not an absolute path (${process.env.HOME})`}; reports go under $HOME/agent-scratch/agent-system-2.0/chaos\n`);
+		return 2;
+	}
 	let fault = a.fault;
 	if (a.nightly) {
 		const now = new Date();
 		if (!nightlyDue(now, REPORTS_DIR)) return 0;
 		fault = nightlyFault(now);
+		// The night started: a report-less night is CRASHED from here on, not MISSED (surface/src/chaos-alert.ts).
+		writeAttemptMarker(REPORTS_DIR, ptParts(now).day, { startedAt: now.toISOString(), fault, pid: process.pid });
 	}
-	return new Run(fault!, a.variant, a.nightly).execute();
+	return new Run(fault!, a.variant, a.nightly, a.nightly ? nightlyDir(REPORTS_DIR) : REPORTS_DIR).execute();
 }
 
 if (import.meta.main) {

@@ -9,7 +9,13 @@
 // job out and deletes its plist before any install step, with no bun on PATH and an unreadable
 // ledger path, and writes nothing else; and it fails closed (review r2, openai #3): only exit 113
 // with "Could not find service" counts as absent, and a missing launchctl, any other print failure
-// or a failed bootout exits 1 with the plist kept.
+// or a failed bootout exits 1 with the plist kept. And arming.log (PLAN wl-mv5lpzqacbe5ts § 2.1):
+// =off appends one `off` line to an armed log after a confirmed bootout or absence and writes
+// nothing else, creates no log where there is none, and leaves the log alone on a launchctl
+// failure; --chaos-nightly appends `on` once across a re-install. Both judge the state by the log's
+// last VALID `on|off <UTC ISO Z>` line, skipping malformed ones and ones whose time is not a real
+// instant as the surface's parser does, and an append to a log with no trailing newline writes one
+// first (review r1 of wl-mv5lpzqacbe5ts; the impossible instants, review r2).
 import { beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -275,12 +281,19 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 	/** Every path under `dir`, relative, sorted. */
 	const tree = (dir: string) => (readdirSync(dir, { recursive: true }) as string[]).sort();
 
+	/** A fake launchctl's bin directory (for PATH) and the argv lines it was called with. */
+	interface FakeLaunchctl {
+		bin: string;
+		calls: () => string[];
+	}
+
 	/**
 	 * A fake launchctl that logs its argv. `print` answers from a flag file as launchd does (0 loaded;
 	 * 113 with "Could not find service" on stderr not), as fresh-machine-test.sh step 13's does, unless
-	 * `printFails` gives it another exit and stderr; `bootout` clears the flag, or exits `bootoutExit`.
+	 * `printFails` gives it another exit and stderr; `bootout` clears the flag, or exits `bootoutExit`;
+	 * `bootstrap` sets it.
 	 */
-	function fakeLaunchctl(name: string, loaded: boolean, opts: { printFails?: [number, string]; bootoutExit?: number } = {}): { bin: string; calls: () => string[] } {
+	function fakeLaunchctl(name: string, loaded: boolean, opts: { printFails?: [number, string]; bootoutExit?: number } = {}): FakeLaunchctl {
 		const dir = join(root, `chaos-off-${name}`);
 		const bin = join(dir, "bin");
 		const log = join(dir, "launchctl.log");
@@ -297,6 +310,7 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 			'case "$1" in',
 			`\tprint) ${print} ;;`,
 			`\tbootout) ${bootout} ;;`,
+			`\tbootstrap) : >'${flag}' ;;`,
 			"esac",
 			"",
 		].join("\n"));
@@ -421,5 +435,212 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		expect(r.exitCode).toBe(1);
 		expect(launchctl.calls()).toEqual([`print ${service}`, `bootout ${service}`]);
 		plistKept(home, plist);
+	});
+
+	// arming.log (PLAN wl-mv5lpzqacbe5ts § 2.1): the append-only `on|off <UTC ISO Z>` history under
+	// $HOME/agent-scratch/agent-system-2.0/chaos/nightly. Literal paths and lines, no repo imports.
+	const NIGHTLY = join("agent-scratch", "agent-system-2.0", "chaos", "nightly");
+	const ARMING = join(NIGHTLY, "arming.log");
+	const ARMED = "on 2026-10-01T10:00:00Z\n";
+	const OFF_LINE = /^off \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/;
+	const ON_LINE = /^on \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/;
+	/** The directories from $HOME down to the nightly dir, as `tree` lists them. */
+	const nightlyDirs = NIGHTLY.split("/").map((_, i, parts) => parts.slice(0, i + 1).join("/"));
+
+	/** A temp HOME holding a chaos plist and, when `log` is a string, `arming.log` with that text. */
+	function homeWithLog(name: string, log: string | null): { home: string; plist: string; log: string } {
+		const { home, plist } = homeWithPlist(name);
+		const path = join(home, ARMING);
+		if (log !== null) {
+			mkdirSync(dirname(path), { recursive: true });
+			writeFileSync(path, log);
+		}
+		return { home, plist, log: path };
+	}
+
+	test("--chaos-nightly=off appends off to an armed arming.log", () => {
+		const { home, plist, log } = homeWithLog("armed-loaded", ARMED);
+		const launchctl = fakeLaunchctl("armed-loaded", true);
+		const from = Math.floor(Date.now() / 1000);
+		const r = off(home, `${launchctl.bin}:${systemPath}`);
+		const to = Math.ceil(Date.now() / 1000);
+		expect(r.out).toContain(`chaos nightly booted out: ${service}`);
+		expect(r.exitCode).toBe(0);
+		expect(existsSync(plist)).toBe(false);
+		const lines = readFileSync(log, "utf8").split("\n");
+		expect(lines.length).toBe(3);
+		expect(lines[0]).toBe(ARMED.trimEnd());
+		expect(lines[1]).toMatch(OFF_LINE);
+		expect(lines[2]).toBe("");
+		const offAt = Date.parse(lines[1]!.slice("off ".length)) / 1000;
+		expect(offAt).toBeGreaterThanOrEqual(from);
+		expect(offAt).toBeLessThanOrEqual(to);
+		expect(tree(home)).toEqual(["Library", join("Library", "LaunchAgents"), ...nightlyDirs, ARMING].sort());
+	});
+
+	test("=off with the job confirmed absent (113) appends off to an armed log too; nothing else is written", () => {
+		const { home, log } = homeWithLog("armed-absent", "on 2026-09-01T10:00:00Z\noff 2026-09-02T10:00:00Z\non 2026-10-01T10:00:00Z\n");
+		const launchctl = fakeLaunchctl("armed-absent", false);
+		const r = off(home, `${launchctl.bin}:${systemPath}`);
+		expect(r.out).toContain(`chaos nightly: no job loaded at ${service}`);
+		expect(r.exitCode).toBe(0);
+		expect(launchctl.calls()).toEqual([`print ${service}`]);
+		const lines = readFileSync(log, "utf8").split("\n");
+		expect(lines.slice(0, 3)).toEqual(["on 2026-09-01T10:00:00Z", "off 2026-09-02T10:00:00Z", "on 2026-10-01T10:00:00Z"]);
+		expect(lines[3]).toMatch(OFF_LINE);
+		expect(lines.slice(4)).toEqual([""]);
+		expect(tree(home)).toEqual(["Library", join("Library", "LaunchAgents"), ...nightlyDirs, ARMING].sort());
+	});
+
+	test("=off with no arming.log creates none: neither the file nor its directory, and with the directory present still no file", () => {
+		const bare = homeWithLog("no-log", null);
+		const r1 = off(bare.home, `${fakeLaunchctl("no-log", true).bin}:${systemPath}`);
+		expect(r1.exitCode).toBe(0);
+		expect(tree(bare.home)).toEqual(["Library", join("Library", "LaunchAgents")]);
+		const withDir = homeWithLog("no-log-dir", null);
+		mkdirSync(join(withDir.home, NIGHTLY), { recursive: true });
+		const r2 = off(withDir.home, `${fakeLaunchctl("no-log-dir", true).bin}:${systemPath}`);
+		expect(r2.exitCode).toBe(0);
+		expect(tree(withDir.home)).toEqual(["Library", join("Library", "LaunchAgents"), ...nightlyDirs].sort());
+	});
+
+	test("=off appends nothing when arming.log is already off, and a second =off adds nothing", () => {
+		const disarmed = "on 2026-10-01T10:00:00Z\noff 2026-10-02T10:00:00Z\n";
+		const { home, log } = homeWithLog("already-off", disarmed);
+		const launchctl = fakeLaunchctl("already-off", true);
+		expect(off(home, `${launchctl.bin}:${systemPath}`).exitCode).toBe(0);
+		expect(readFileSync(log, "utf8")).toBe(disarmed);
+		expect(off(home, `${launchctl.bin}:${systemPath}`).exitCode).toBe(0);
+		expect(readFileSync(log, "utf8")).toBe(disarmed);
+	});
+
+	for (const [name, path, opts] of [
+		["print-fails", true, { printFails: [5, "Bad request."] }],
+		["bootout-fails", true, { bootoutExit: 5 }],
+		["no-launchctl", false, {}],
+	] as const) {
+		test(`a launchctl failure (${name}) leaves arming.log untouched, exit 1`, () => {
+			const { home, plist, log } = homeWithLog(`armed-${name}`, ARMED);
+			const r = off(home, path ? `${fakeLaunchctl(`armed-${name}`, true, opts as { printFails?: [number, string]; bootoutExit?: number }).bin}:${systemPath}` : noLaunchctlPath);
+			expect(r.out).toContain("install: FAIL:");
+			expect(r.exitCode).toBe(1);
+			expect(readFileSync(log, "utf8")).toBe(ARMED);
+			expect(readFileSync(plist, "utf8")).toBe("<plist/>\n");
+			expect(tree(home)).toEqual(["Library", join("Library", "LaunchAgents"), join("Library", "LaunchAgents", `${label}.plist`), ...nightlyDirs, ARMING].sort());
+		});
+	}
+
+	/**
+	 * A fake launchctl with nothing loaded and an `omp` stand-in beside it (the job's PATH needs omp's
+	 * directory; the stand-in answers `type -P omp` whoever runs the test), and a function that runs
+	 * the scratch copy's full installer with --chaos-nightly under `home` and expects it to succeed.
+	 */
+	function chaosNightly(name: string, home: string): { launchctl: FakeLaunchctl; arm: () => string } {
+		const launchctl = fakeLaunchctl(name, false);
+		writeFileSync(join(launchctl.bin, "omp"), "#!/bin/bash\nexit 0\n");
+		chmodSync(join(launchctl.bin, "omp"), 0o755);
+		const arm = () => {
+			const r = Bun.spawnSync(["bash", join(copy, "install", "install.sh"), "--chaos-nightly"], {
+				env: { PATH: `${launchctl.bin}:${process.env.PATH ?? ""}`, HOME: home }, stdout: "pipe", stderr: "pipe",
+			});
+			const out = r.stdout.toString() + r.stderr.toString();
+			expect(out).toContain("install complete");
+			expect(r.exitCode).toBe(0);
+			return out;
+		};
+		return { launchctl, arm };
+	}
+
+	test.if(process.platform === "darwin")("--chaos-nightly appends on once across a re-install, and again only after an off", () => {
+		const home = join(root, "home-chaos-arm");
+		mkdirSync(home, { recursive: true });
+		const { launchctl, arm } = chaosNightly("arm", home);
+		const log = join(home, ARMING);
+		arm();
+		const first = readFileSync(log, "utf8");
+		expect(first.split("\n")).toEqual([expect.stringMatching(ON_LINE), ""]);
+		arm();
+		expect(readFileSync(log, "utf8")).toBe(first);
+		expect(launchctl.calls().filter((c) => c.startsWith("bootstrap"))).toHaveLength(2);
+		expect(off(home, `${launchctl.bin}:${systemPath}`).exitCode).toBe(0);
+		const disarmed = readFileSync(log, "utf8").split("\n");
+		expect(disarmed).toEqual([first.trimEnd(), expect.stringMatching(OFF_LINE), ""]);
+		arm();
+		expect(readFileSync(log, "utf8").split("\n")).toEqual([...disarmed.slice(0, 2), expect.stringMatching(ON_LINE), ""]);
+	});
+
+	// The state is the last VALID line (review r1 of wl-mv5lpzqacbe5ts): a line that is not exactly
+	// `on|off <UTC ISO Z>` is skipped, as the surface's parseArmingLog skips it, and never rewritten.
+	const VALID_LINE = /^(on|off) \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/;
+
+	test.if(process.platform === "darwin")("last valid line: an empty arming.log and --chaos-nightly gives exactly one on line", () => {
+		const home = join(root, "home-chaos-arm-empty");
+		mkdirSync(join(home, NIGHTLY), { recursive: true });
+		writeFileSync(join(home, ARMING), "");
+		const { arm } = chaosNightly("arm-empty", home);
+		expect(arm()).toContain("chaos nightly armed: on appended to");
+		expect(readFileSync(join(home, ARMING), "utf8").split("\n")).toEqual([expect.stringMatching(ON_LINE), ""]);
+	});
+
+	test("last valid line: a valid on, then a malformed `off truncated`, then =off appends a valid off; earlier lines byte-identical", () => {
+		const before = "on 2026-10-01T10:00:00Z\noff truncated\n";
+		const { home, log } = homeWithLog("armed-malformed-off", before);
+		const r = off(home, `${fakeLaunchctl("armed-malformed-off", true).bin}:${systemPath}`);
+		expect(r.out).toContain("chaos nightly disarmed: off appended to");
+		expect(r.exitCode).toBe(0);
+		const after = readFileSync(log, "utf8");
+		expect(after.startsWith(before)).toBe(true);
+		expect(after.slice(before.length)).toMatch(/^off \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\n$/);
+	});
+
+	test.if(process.platform === "darwin")("last valid line: a valid on and a valid off, then junk, then --chaos-nightly appends on; earlier lines byte-identical", () => {
+		const before = "on 2026-09-01T10:00:00Z\noff 2026-09-02T10:00:00Z\non 2026-10-0\n";
+		const home = join(root, "home-chaos-arm-junk");
+		mkdirSync(join(home, NIGHTLY), { recursive: true });
+		writeFileSync(join(home, ARMING), before);
+		const { arm } = chaosNightly("arm-junk", home);
+		expect(arm()).toContain("chaos nightly armed: on appended to");
+		const after = readFileSync(join(home, ARMING), "utf8");
+		expect(after.startsWith(before)).toBe(true);
+		expect(after.slice(before.length)).toMatch(/^on \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\n$/);
+	});
+
+	test("last valid line: an unterminated last valid on, then =off writes a newline then off, and every line parses", () => {
+		const before = "on 2026-09-01T10:00:00Z\noff 2026-09-02T10:00:00Z\non 2026-10-01T10:00:00Z";
+		const { home, log } = homeWithLog("armed-unterminated", before);
+		const r = off(home, `${fakeLaunchctl("armed-unterminated", true).bin}:${systemPath}`);
+		expect(r.out).toContain("chaos nightly disarmed: off appended to");
+		expect(r.exitCode).toBe(0);
+		const after = readFileSync(log, "utf8");
+		expect(after.startsWith(`${before}\n`)).toBe(true);
+		const lines = after.split("\n");
+		expect(lines.at(-1)).toBe("");
+		expect(lines.slice(0, -1)).toEqual([...before.split("\n"), expect.stringMatching(OFF_LINE)]);
+		for (const line of lines.slice(0, -1)) expect(line).toMatch(VALID_LINE);
+	});
+
+	// A line of the right shape whose time is not a real instant is skipped too, as parseArmingLog
+	// skips it (review r2 of wl-mv5lpzqacbe5ts): February has no 30th and October no 32nd.
+	test.if(process.platform === "darwin")("last valid line: only `on 2026-02-30T00:00:00Z`, then --chaos-nightly appends on; the line is byte-identical", () => {
+		const before = "on 2026-02-30T00:00:00Z\n";
+		const home = join(root, "home-chaos-arm-impossible");
+		mkdirSync(join(home, NIGHTLY), { recursive: true });
+		writeFileSync(join(home, ARMING), before);
+		const { arm } = chaosNightly("arm-impossible", home);
+		expect(arm()).toContain("chaos nightly armed: on appended to");
+		const after = readFileSync(join(home, ARMING), "utf8");
+		expect(after.startsWith(before)).toBe(true);
+		expect(after.slice(before.length)).toMatch(/^on \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\n$/);
+	});
+
+	test("last valid line: a valid on, then `off 2026-10-32T10:00:00Z`, then =off appends a valid off; earlier lines byte-identical", () => {
+		const before = "on 2026-10-01T10:00:00Z\noff 2026-10-32T10:00:00Z\n";
+		const { home, log } = homeWithLog("armed-impossible-off", before);
+		const r = off(home, `${fakeLaunchctl("armed-impossible-off", true).bin}:${systemPath}`);
+		expect(r.out).toContain("chaos nightly disarmed: off appended to");
+		expect(r.exitCode).toBe(0);
+		const after = readFileSync(log, "utf8");
+		expect(after.startsWith(before)).toBe(true);
+		expect(after.slice(before.length)).toMatch(/^off \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\n$/);
 	});
 });

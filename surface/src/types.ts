@@ -121,6 +121,22 @@ export const TEST_RUN_FAILED_PREFIX = "test-run-failed:";
 export const TEST_REQUESTED_PREFIX = "test-requested:";
 export const TEST_RUN_PREFIX = "test-run:";
 export const PUSH_DEST_PREFIX = "push-dest:";
+/**
+ * Body prefix of the surface's own message for a nightly chaos run that failed or never reported
+ * (PLAN wl-mv5lpzqacbe5ts § 2.2; formatted and parsed in surface/src/chaos-alert.ts). Only the
+ * surface writes it, on the standing workload, to the orchestrator.
+ */
+export const CHAOS_FAILED_PREFIX = "chaos-failed:";
+/** How long after the 03:15 PT end of the nightly window a night is judged: a run still going then reads as crashed. */
+export const CHAOS_GRACE_MS = 2 * 3_600_000;
+/** The chaos root under HOME: manual reports, the launchd log, and the nightly dir (`<HOME>/<this>`). */
+export const CHAOS_ROOT_RELATIVE = "agent-scratch/agent-system-2.0/chaos";
+/** Under the chaos root: the nightly-only dir (reports, attempt markers, `arming.log`). */
+export const CHAOS_NIGHTLY_DIR = "nightly";
+/** Under the nightly dir: the append-only arming history, one `on|off <UTC ISO Z>` line per change. */
+export const CHAOS_ARMING_LOG = "arming.log";
+/** Under the chaos root: where launchd sends the nightly job's stdout and stderr (install/com.agent-system-2.chaos.plist). */
+export const CHAOS_LAUNCHD_LOG = "launchd.log";
 /** The recipient of every lane→orchestrator signal message; the surface consumes them at read. */
 export const ORCHESTRATOR_RECIPIENT = "orchestrator";
 /** § A3: a held thing older than this surfaces unsolicited. */

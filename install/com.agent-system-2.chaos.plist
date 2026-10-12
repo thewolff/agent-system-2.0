@@ -3,16 +3,22 @@
 <!--
   agent-system 2.0: the nightly fault-injection chaos run, as a launchd user agent. TEMPLATE:
   install/install.sh with its chaos-nightly flag fills the upper-case placeholder values
-  (XML-escaped), writes the result to $HOME/Library/LaunchAgents/com.agent-system-2.chaos.plist and
-  loads it with launchctl bootstrap; the flag's =off form boots it out and deletes that file.
-  Without the flag install.sh never writes it. (An XML comment cannot hold a double hyphen, so the
-  flags are not spelled out here; install/install.sh's header has them.) launchd fires the job every
-  quarter hour of every local hour; surface/scripts/chaos.ts in nightly mode proceeds only inside
-  [03:00, 03:15) America/Los_Angeles on a Pacific date with no report yet, and otherwise exits 0 at
-  once and writes nothing, so exactly one fire a night runs in any time zone and across DST. PATH
-  holds the directories of bun, omp and git as resolved at install (launchd's own PATH lacks them).
-  No ledger variable: chaos builds its own scratch ledger and never writes the live one; its
-  isolation proof opens the live ledger read-only to check that.
+  (XML-escaped), writes the result to $HOME/Library/LaunchAgents/com.agent-system-2.chaos.plist,
+  loads it with launchctl bootstrap and records the arming in
+  $HOME/agent-scratch/agent-system-2.0/chaos/nightly/arming.log; the flag's =off form boots it out,
+  records the disarming there and deletes that file. Without the flag install.sh never writes it.
+  (An XML comment cannot hold a double hyphen, so the flags are not spelled out here;
+  install/install.sh's header has them.) launchd fires the job every quarter hour of every local
+  hour; surface/scripts/chaos.ts in nightly mode proceeds only inside [03:00, 03:15)
+  America/Los_Angeles on a Pacific date with no report yet in chaos/nightly, and otherwise exits 0
+  at once and writes nothing, so exactly one fire a night runs in any time zone and across DST.
+  When it proceeds it writes the night's attempt marker in chaos/nightly, then its report there.
+  PATH holds the directories of bun, omp and git as resolved at install (launchd's own PATH lacks
+  them); HOME names where the reports go. No ledger variable: chaos still never writes the live
+  ledger. It builds its own scratch ledger, and its isolation proof opens the live ledger read-only
+  to check that. The surface (surface/src/chaos-alert.ts) turns the nightly files, the arming log,
+  the attempt markers and the reports, into the needs-you alert for a night that failed, crashed or
+  never ran.
 -->
 <plist version="1.0">
 <dict>

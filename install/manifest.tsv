@@ -384,11 +384,15 @@ surface/test/fixtures/claim-check/t3-b.jsonl	test	-
 surface/test/fixtures/claim-check/t3-c.jsonl	test	-
 surface/test/fixtures/claim-check/t3-d.jsonl	test	-
 surface/src/chaos.ts	module	-
+surface/src/chaos-alert.ts	module	-
+surface/src/chaos-triggers.ts	module	-
 surface/scripts/chaos.ts	module	-
 surface/scripts/chaos-stub.ts	module	-
 surface/scripts/chaos-proxy.ts	module	-
 surface/test/chaos.test.ts	test	-
 surface/test/chaos-stub.test.ts	test	-
+surface/test/chaos-alert.test.ts	test	-
+surface/test/chaos-bindings.test.ts	test	-
 surface/scripts/ps-shim/ps	module	-
 surface/test/ps-shim.test.ts	test	-
 surface/test/lane-run-guard.test.ts	test	-

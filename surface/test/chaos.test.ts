@@ -507,9 +507,16 @@ describe("isolation snapshot and diff", () => {
 });
 
 describe("nightly window and rotation", () => {
+	// nightlyDue(now, R) takes the chaos root R and reads R/nightly (PLAN wl-mv5lpzqacbe5ts § 2.1); the literal
+	// "nightly" keeps this file on symbols origin/main has, so the regression case below fails there by assertion.
 	const reports = () => tmp("chaos-reports");
+	const nightly = (root: string): string => {
+		const dir = join(root, "nightly");
+		mkdirSync(dir, { recursive: true });
+		return dir;
+	};
 
-	test("due at PT 03:05, not at 03:20; the window is [03:00, 03:15) and a report for the PT date stops it", () => {
+	test("due at PT 03:05, not at 03:20; the window is [03:00, 03:15) and a nightly report for the PT date stops it", () => {
 		const dir = reports();
 		expect(nightlyDue(new Date("2026-07-15T10:05:00Z"), dir)).toBe(true); // 03:05 PDT
 		expect(nightlyDue(new Date("2026-07-15T10:20:00Z"), dir)).toBe(false); // 03:20 PDT
@@ -518,10 +525,45 @@ describe("nightly window and rotation", () => {
 		expect(nightlyDue(new Date("2026-07-15T09:59:59Z"), dir)).toBe(false);
 		expect(nightlyDue(new Date("2026-07-15T10:15:00Z"), dir)).toBe(false);
 		writeFileSync(join(dir, "launchd.log"), "");
+		writeFileSync(join(nightly(dir), "arming.log"), "on 2026-07-01T00:00:00Z\n");
 		expect(nightlyDue(new Date("2026-07-15T10:05:00Z"), dir)).toBe(true);
-		writeFileSync(join(dir, "2026-07-15-provider-refusal.md"), "# report");
+		writeFileSync(join(nightly(dir), "2026-07-15-provider-refusal.md"), "# report");
 		expect(nightlyDue(new Date("2026-07-15T10:05:00Z"), dir)).toBe(false);
 		expect(nightlyDue(new Date("2026-07-16T10:05:00Z"), dir)).toBe(true);
+	});
+
+	test("a manual --fault report does not stop that night's --nightly", () => {
+		const dir = reports();
+		const now = new Date("2026-07-15T10:05:00Z"); // 03:05 PDT
+		// A manual run earlier the same PT date wrote its report in R itself, as every manual run does.
+		const manual = reportPath(dir, new Date("2026-07-15T07:28:00Z"), "duplicate-lane-runner");
+		expect(manual).toBe(join(dir, "2026-07-15-duplicate-lane-runner.md"));
+		writeFileSync(manual, "# report");
+		writeFileSync(join(dir, "2026-07-15-lane-kill-mid-hand.md"), "# report");
+		expect(nightlyDue(now, dir)).toBe(true);
+	});
+
+	test("a nightly report stops only its own PT date; no R at all, or an empty R/nightly, is due", () => {
+		const root = reports();
+		expect(nightlyDue(new Date("2026-07-15T10:05:00Z"), join(root, "absent"))).toBe(true);
+		const dir = nightly(root);
+		expect(nightlyDue(new Date("2026-07-15T10:05:00Z"), root)).toBe(true);
+		writeFileSync(join(dir, "2026-07-14-lane-kill-mid-hand.md"), "# report");
+		writeFileSync(join(dir, "2026-07-16-network-block-60s.md.tmp"), "# half a report");
+		expect(nightlyDue(new Date("2026-07-15T10:05:00Z"), root)).toBe(true);
+		expect(nightlyDue(new Date("2026-07-14T10:05:00Z"), root)).toBe(false);
+		expect(nightlyDue(new Date("2026-07-16T10:05:00Z"), root)).toBe(true);
+	});
+
+	test("the night's report goes to R/nightly/<PT date>-<fault>.md, and once there that night is no longer due", () => {
+		const root = reports();
+		const now = new Date("2026-10-12T10:05:00Z"); // 2026-10-12 03:05 PDT
+		expect(nightlyDue(now, root)).toBe(true);
+		const path = reportPath(nightly(root), now, nightlyFault(now));
+		expect(path).toBe(join(root, "nightly", `2026-10-12-${nightlyFault("2026-10-12")}.md`));
+		writeFileSync(path, "# report");
+		expect(nightlyDue(now, root)).toBe(false);
+		expect(nightlyDue(new Date("2026-10-13T10:05:00Z"), root)).toBe(true);
 	});
 
 	test("from a UTC+5:30 clock: 15:35 IST is 03:05 PDT and due, 15:50 IST is not", () => {

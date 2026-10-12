@@ -30,13 +30,15 @@
 # file that counts as a copy; a HOME and a ledger path holding "@REPO@" and "&" land in the plist
 # exactly as given. The backup plist is never loaded. And the nightly chaos job (macOS, step 13),
 # against a fake `launchctl` first on PATH that records its argv: an install without the flag
-# writes no chaos plist and runs no launchctl; --chaos-nightly writes a plist that lints, holds
-# exactly the four quarter-hour StartCalendarInterval entries and absolute paths (bun, the clone's
-# surface/scripts/chaos.ts, HOME, a PATH of the bun, omp and git directories, the log under
-# ~/agent-scratch/agent-system-2.0/chaos, whose directory install creates) and no ledger variable,
-# and bootstraps it into gui/<uid>; a re-run boots the loaded job out first; --chaos-nightly=off
-# boots it out and deletes the plist; the flag is refused with exit 2 and nothing written when omp
-# is not on PATH, and so is an unknown argument. No real launchctl runs.
+# writes no chaos plist, no arming.log and runs no launchctl; --chaos-nightly writes a plist that
+# lints, holds exactly the four quarter-hour StartCalendarInterval entries and absolute paths (bun,
+# the clone's surface/scripts/chaos.ts, HOME, a PATH of the bun, omp and git directories, the log
+# under ~/agent-scratch/agent-system-2.0/chaos, whose directory and nightly/ install creates) and
+# no ledger variable, bootstraps it into gui/<uid> and appends one `on <UTC ISO>` line to
+# chaos/nightly/arming.log; a re-run boots the loaded job out first and adds no arming line;
+# --chaos-nightly=off boots it out, deletes the plist and appends one `off <UTC ISO>` line, and a
+# second =off adds nothing; the flag is refused with exit 2 and nothing written when omp is not on
+# PATH, and so is an unknown argument. No real launchctl runs.
 #
 # Usage:   bash install/fresh-machine-test.sh
 # Env:     FRESH_TEST_ROOT  where the temp clone and temp HOME go (default: ${TMPDIR:-/tmp})
@@ -606,6 +608,8 @@ else
 	CHAOS_PLIST="$FAKE_HOME/Library/LaunchAgents/com.agent-system-2.chaos.plist"
 	CHAOS_LABEL="gui/$(id -u)/com.agent-system-2.chaos"
 	CHAOS_LOG="$FAKE_HOME/agent-scratch/agent-system-2.0/chaos/launchd.log"
+	ARMING_LOG="$FAKE_HOME/agent-scratch/agent-system-2.0/chaos/nightly/arming.log"
+	ARMING_LINE='^(on|off) [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
 	# A fake launchctl first on PATH: it appends its argv (one line per call) to a log, and keeps a
 	# flag file so `print` answers as launchd does for this label (0 loaded, 113 not loaded).
 	FAKE_BIN="$WORK/fake-launchctl-bin"
@@ -628,8 +632,9 @@ else
 	[ ! -e "$CHAOS_PLIST" ] || die "the no-flag installs above wrote $CHAOS_PLIST"
 	chaos_install >/dev/null || die "no-flag install with the fake launchctl on PATH exited $?"
 	[ ! -e "$CHAOS_PLIST" ] || die "a no-flag install wrote $CHAOS_PLIST"
+	[ ! -e "$ARMING_LOG" ] || die "a no-flag install wrote $ARMING_LOG"
 	[ -z "$(launchctl_calls)" ] || die "a no-flag install ran launchctl: $(launchctl_calls)"
-	ok "no flag: no chaos plist under $FAKE_HOME/Library/LaunchAgents and no launchctl call"
+	ok "no flag: no chaos plist under $FAKE_HOME/Library/LaunchAgents, no arming.log and no launchctl call"
 
 	chaos_install --chaos-nightly || die "install --chaos-nightly exited $?"
 	[ -f "$CHAOS_PLIST" ] || die "install --chaos-nightly wrote no plist at $CHAOS_PLIST"
@@ -666,23 +671,34 @@ else
 	[ -d "$(dirname "$CHAOS_LOG")" ] || die "install did not create the log directory $(dirname "$CHAOS_LOG")"
 	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST")"
 	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
-	ok "plist lints; four StartCalendarInterval entries (Minute 0, 15, 30, 45); absolute bun, chaos.ts, WorkingDirectory, HOME, PATH=$WANT_PATH and log; no ledger variable; bootstrapped into gui/$(id -u)"
+	[ -f "$ARMING_LOG" ] || die "install --chaos-nightly wrote no arming log at $ARMING_LOG"
+	[ "$(wc -l <"$ARMING_LOG" | tr -d ' ')" = 1 ] || die "arming.log after install holds $(wc -l <"$ARMING_LOG" | tr -d ' ') lines, expected 1: $(cat "$ARMING_LOG")"
+	grep -Eq "$ARMING_LINE" "$ARMING_LOG" && [ "$(cut -c1-3 "$ARMING_LOG")" = "on " ] || die "arming.log after install is not one on line: $(cat "$ARMING_LOG")"
+	cp -p "$ARMING_LOG" "$WORK/arming.after-install"
+	ok "plist lints; four StartCalendarInterval entries (Minute 0, 15, 30, 45); absolute bun, chaos.ts, WorkingDirectory, HOME, PATH=$WANT_PATH and log; no ledger variable; bootstrapped into gui/$(id -u); arming.log: $(cat "$ARMING_LOG")"
 
 	rm -f "$LAUNCHCTL_LOG"
 	chaos_install --chaos-nightly >/dev/null || die "re-run of install --chaos-nightly exited $?"
 	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootout $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST")"
 	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "re-run launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
-	ok "a re-run boots the loaded job out before bootstrapping the rewritten plist"
+	cmp -s "$ARMING_LOG" "$WORK/arming.after-install" || die "a re-run changed arming.log: $(cat "$ARMING_LOG")"
+	ok "a re-run boots the loaded job out before bootstrapping the rewritten plist, and adds no arming line"
 
 	rm -f "$LAUNCHCTL_LOG"
 	chaos_install --chaos-nightly=off || die "install --chaos-nightly=off exited $?"
 	[ ! -e "$CHAOS_PLIST" ] || die "--chaos-nightly=off left $CHAOS_PLIST"
 	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootout $CHAOS_LABEL")"
 	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "=off launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	[ "$(wc -l <"$ARMING_LOG" | tr -d ' ')" = 2 ] || die "arming.log after =off holds $(wc -l <"$ARMING_LOG" | tr -d ' ') lines, expected 2: $(cat "$ARMING_LOG")"
+	[ "$(head -n 1 "$ARMING_LOG")" = "$(cat "$WORK/arming.after-install")" ] || die "=off changed arming.log's on line: $(cat "$ARMING_LOG")"
+	last="$(tail -n 1 "$ARMING_LOG")"
+	[[ "$last" =~ $ARMING_LINE ]] && [ "${last%% *}" = off ] || die "arming.log's last line after =off is not an off line: $last"
+	cp -p "$ARMING_LOG" "$WORK/arming.after-off"
 	rm -f "$LAUNCHCTL_LOG"
 	chaos_install --chaos-nightly=off >/dev/null || die "a second --chaos-nightly=off exited $?"
 	[ "$(launchctl_calls)" = "print $CHAOS_LABEL" ] || die "=off with nothing loaded ran '$(launchctl_calls)', expected only the print"
-	ok "=off booted the job out of $CHAOS_LABEL and deleted the plist; with nothing loaded it only asks"
+	cmp -s "$ARMING_LOG" "$WORK/arming.after-off" || die "a second =off changed arming.log: $(cat "$ARMING_LOG")"
+	ok "=off booted the job out of $CHAOS_LABEL, deleted the plist and appended one off line ($last); with nothing loaded it only asks and appends nothing"
 
 	# omp not on PATH: a PATH holding bun and the system directories only.
 	NO_OMP_BIN="$WORK/no-omp-bin"

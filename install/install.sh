@@ -28,12 +28,24 @@
 # a PATH of the bun, omp and git directories, written to
 # $HOME/Library/LaunchAgents/com.agent-system-2.chaos.plist and loaded with
 # `launchctl bootstrap gui/$UID` (a loaded copy is booted out first). Its log goes to
-# $HOME/agent-scratch/agent-system-2.0/chaos/launchd.log. --chaos-nightly=off only boots that job
-# out and deletes the plist, then exits: it runs right after the argument is read, before the bun
-# check and every install step, so it needs no bun, writes no ledger and registers nothing (stopping
-# the job never depends on a reinstall succeeding). It fails closed: when launchctl is missing or
-# cannot confirm the job is absent, it says why, keeps the plist and exits 1. Without a flag nothing
-# about the chaos job is written, read or run.
+# $HOME/agent-scratch/agent-system-2.0/chaos/launchd.log. It also creates that dir's nightly/
+# (the nightly run's reports and attempt markers) and, once the job is loaded, appends
+# `on <UTC ISO>` (`date -u +%Y-%m-%dT%H:%M:%SZ`) to nightly/arming.log, but only when that file is
+# absent, has no valid line, or its last valid line is `off`, so a re-install while armed adds
+# nothing. A valid line is exactly `on|off <UTC ISO Z>`, the surface's ARMING_LINE, with a time that
+# is a real instant; any other line is skipped when reading the state, as the surface skips it, and
+# is never rewritten or dropped.
+# --chaos-nightly=off only boots that job out and deletes the plist, then exits: it runs right
+# after the argument is read, before the bun check and every install step, so it needs no bun,
+# writes no ledger and registers nothing (stopping the job never depends on a reinstall
+# succeeding). Once the bootout succeeded or launchctl confirmed the job absent, it appends
+# `off <UTC ISO>` to nightly/arming.log, but only when that file exists and its last valid line is
+# `on`; it never creates the directory or the file. Either append first writes a newline when the
+# file does not end in one, so an unterminated line never joins the new record. The surface reads
+# arming.log's [on, off) intervals to know which nights were owed a run (surface/src/chaos-alert.ts).
+# It fails closed: when launchctl is missing or cannot confirm the job is absent, it says why, keeps
+# the plist, leaves arming.log untouched and exits 1. Without a flag nothing about the chaos job is
+# written, read or run.
 #
 # Usage:   bash install/install.sh [--chaos-nightly | --chaos-nightly=off]
 # Env:     AGENT_SYSTEM_LEDGER_DB   ledger file (default: $HOME/.agent-system-2/ledger.db)
@@ -41,8 +53,9 @@
 #                                   $HOME/.omp/profiles/<profile>/agent (omp://config-usage.md § Profiles)
 # Exit:    0 installed, or (=off) the chaos job is confirmed not loaded and its plist is gone
 #          1 other failure (=off: launchctl not on PATH, `launchctl print` failed for a reason other
-#            than "Could not find service", or bootout failed, each with the plist kept; or the
-#            plist removal failed)
+#            than "Could not find service", or bootout failed, each with the plist and arming.log
+#            kept; or arming.log could not be read, or the arming.log append or the plist removal
+#            failed)
 #          2 manifest or profile check failed, an argument other than the flag, or --chaos-nightly
 #            refused: not macOS, or omp or git not on PATH (nothing written)
 #          3 ledger path refused as synced or network folder (nothing written)
@@ -87,15 +100,72 @@ CHAOS_LABEL="com.agent-system-2.chaos"
 CHAOS_TEMPLATE="$REPO/install/$CHAOS_LABEL.plist"
 CHAOS_PLIST="$LAUNCH_AGENTS/$CHAOS_LABEL.plist"
 CHAOS_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/chaos"
+# The nightly run's own dir and the arming history the surface reads (surface/src/chaos-alert.ts).
+CHAOS_NIGHTLY_DIR="$CHAOS_LOG_DIR/nightly"
+CHAOS_ARMING_LOG="$CHAOS_NIGHTLY_DIR/arming.log"
+
+# The arming state is the first word of arming.log's last VALID line: a line matching
+# `on|off <UTC ISO Z>` exactly, the pattern of surface/src/chaos-alert.ts ARMING_LINE, whose time is
+# a real instant (arming_instant). Any other line is skipped, as the surface's parseArmingLog skips
+# it, so a junk, truncated or impossible-time last line never decides whether the log is armed.
+# Prints `on`, `off`, or nothing (no file, or no valid line); fails (exit 1) when grep cannot read
+# the file. -a reads a file holding NUL bytes as text.
+arming_state() {
+	local valid status last
+	[ -f "$CHAOS_ARMING_LOG" ] || return 0
+	if valid="$(grep -a -E '^(on|off) [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$CHAOS_ARMING_LOG")"; then
+		:
+	else
+		status=$?
+		[ "$status" = 1 ] || fail "could not read $CHAOS_ARMING_LOG (grep exited $status)" 1
+		return 0
+	fi
+	# From the last shape-valid line back to the first; the first whose time is real decides.
+	while [ -n "$valid" ]; do
+		last="${valid##*$'\n'}"
+		if arming_instant "${last#* }"; then
+			printf '%s' "${last%% *}"
+			return 0
+		fi
+		if [[ "$valid" == *$'\n'* ]]; then valid="${valid%$'\n'*}"; else valid=""; fi
+	done
+}
+# Whether $1, already shaped YYYY-MM-DDTHH:MM:SSZ, names a real instant: the rule parseArmingLog
+# applies by round-tripping the time through Date, i.e. the proleptic Gregorian calendar for every
+# four-digit year (0000 included), month 01-12, day 01 to the month's length, hour 00-23, minute and
+# second 00-59, so hour 24, second 60 and day rollovers are not real. Checked 2026-10-12 under bash
+# 3.2 against bun's Date on 10617 times (21 years from 0000 to 9999 among them 0100, 1900 and 2000,
+# every month 00-13 and day 00-32, hours 00-25 with minutes and seconds up to 99): no disagreement.
+# Plain arithmetic, not BSD date's round trip: that answers "nonexistent time" for years before 1900
+# (1899, 1000 and 0001 tried), which Date accepts. 10# reads 08 and 09 as decimal.
+arming_instant() {
+	local y=$((10#${1:0:4})) m=$((10#${1:5:2})) d=$((10#${1:8:2})) days
+	((m >= 1 && m <= 12 && 10#${1:11:2} <= 23 && 10#${1:14:2} <= 59 && 10#${1:17:2} <= 59)) || return 1
+	case "$m" in
+		2) if ((y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))); then days=29; else days=28; fi ;;
+		4 | 6 | 9 | 11) days=30 ;;
+		*) days=31 ;;
+	esac
+	((d >= 1 && d <= days))
+}
+# Appends one `$1 <UTC ISO Z>` record (`$1` is on or off) to arming.log. Earlier lines are never
+# rewritten: when the file is non-empty and its last byte is not a newline, the record starts with
+# one, so an unterminated line never joins the new record.
+arming_append() {
+	local sep=""
+	if [ -s "$CHAOS_ARMING_LOG" ] && [ "$(tail -c 1 "$CHAOS_ARMING_LOG"; printf x)" != $'\nx' ]; then sep=$'\n'; fi
+	printf '%s%s %s\n' "$sep" "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$CHAOS_ARMING_LOG"
+}
 
 # --chaos-nightly=off: stop the job and exit, before anything else runs. It reads no manifest, needs
-# no bun, and writes nothing but the plist removal. It fails closed: only `launchctl print` exiting
-# 113 with "Could not find service" on stderr (what launchd answers for a label it does not have,
-# checked 2026-10-12 on macOS 26.6 against gui/<uid>/com.agent-system-2.nonexistent-probe: exit 113,
-# stderr "Bad request." then "Could not find service ...") confirms the job is absent. Any other
-# failure, or no launchctl at all, cannot tell absent from loaded, so the plist is kept and the run
-# exits 1: deleting the plist of a job that may still be loaded would leave it running with no file
-# to show for it.
+# no bun, and writes nothing but the plist removal and one `off` line in an armed arming.log. It
+# fails closed: only `launchctl print` exiting 113 with "Could not find service" on stderr (what
+# launchd answers for a label it does not have, checked 2026-10-12 on macOS 26.6 against
+# gui/<uid>/com.agent-system-2.nonexistent-probe: exit 113, stderr "Bad request." then "Could not
+# find service ...") confirms the job is absent. Any other failure, or no launchctl at all, cannot
+# tell absent from loaded, so the plist and arming.log are kept as they are and the run exits 1:
+# deleting the plist of a job that may still be loaded would leave it running with no file to show
+# for it.
 if [ "$CHAOS" = off ]; then
 	CHAOS_SERVICE="gui/$UID/$CHAOS_LABEL"
 	step "chaos nightly off: $CHAOS_SERVICE, $CHAOS_PLIST"
@@ -110,13 +180,23 @@ if [ "$CHAOS" = off ]; then
 	else
 		fail "launchctl print $CHAOS_SERVICE exited $print_status (${print_err:-no stderr}), so whether the job is loaded is unknown; $CHAOS_PLIST is kept" 1
 	fi
+	# The job is confirmed not loaded: close the open armed interval, if there is one, judged by the
+	# log's last valid line (arming_state). Never creates the directory or the file; a log that is
+	# absent, has no valid line, or whose last valid line is off is left as it is.
+	arming="$(arming_state)"
+	if [ "$arming" = on ]; then
+		arming_append off || fail "could not append off to $CHAOS_ARMING_LOG" 1
+		step "chaos nightly disarmed: off appended to $CHAOS_ARMING_LOG"
+	else
+		step "chaos nightly: $CHAOS_ARMING_LOG is absent or not armed; left as it is"
+	fi
 	if [ -e "$CHAOS_PLIST" ] || [ -L "$CHAOS_PLIST" ]; then
 		rm -f "$CHAOS_PLIST" || fail "could not remove $CHAOS_PLIST" 1
 		step "chaos nightly removed: $CHAOS_PLIST"
 	else
 		step "chaos nightly: no plist at $CHAOS_PLIST"
 	fi
-	step "chaos nightly off: no job loaded, no plist; nothing else was run or written"
+	step "chaos nightly off: no job loaded, no plist, arming.log closed if it was armed; nothing else was run or written"
 	exit 0
 fi
 
@@ -141,7 +221,8 @@ fill_template() {
 # --chaos-nightly is checked here, before anything is written: launchd is macOS only, and the job's
 # PATH is built from where bun, omp and git are now (launchd's own PATH has none of ~/.bun/bin), so
 # a missing omp or git refuses the flag rather than writing a job that cannot start a session.
-# (CHAOS_LABEL, CHAOS_TEMPLATE, CHAOS_PLIST and CHAOS_LOG_DIR are set above, beside the =off path.)
+# (CHAOS_LABEL, CHAOS_TEMPLATE, CHAOS_PLIST, CHAOS_LOG_DIR, CHAOS_NIGHTLY_DIR and CHAOS_ARMING_LOG are
+# set above, beside the =off path.)
 if [ "$CHAOS" = on ]; then
 	[ "$(uname -s)" = Darwin ] || fail "--chaos-nightly is a launchd job; this is not macOS" 2
 	[ -f "$CHAOS_TEMPLATE" ] || fail "--chaos-nightly: no template at $CHAOS_TEMPLATE" 2
@@ -448,10 +529,13 @@ fi
 # Only with the flag; without it this step does nothing and runs nothing. launchd keeps the plist a
 # job was bootstrapped with and refuses to bootstrap a label that is already loaded, so a loaded job
 # is booted out before the new plist replaces it; `launchctl print` exits 113 for a label that is not
-# loaded. Reversal: bash install/install.sh --chaos-nightly=off (handled before step 1, above).
+# loaded. Once the job is loaded, arming.log gains `on <UTC ISO>`, but only when it is absent, has no
+# valid line, or its last valid line is `off` (arming_state), so a re-install or plist rewrite while
+# armed adds nothing.
+# Reversal: bash install/install.sh --chaos-nightly=off (handled before step 1, above).
 if [ "$CHAOS" = on ]; then
 	step "chaos nightly: install/${CHAOS_TEMPLATE##*/} -> $CHAOS_PLIST"
-	mkdir -p "$LAUNCH_AGENTS" "$CHAOS_LOG_DIR"
+	mkdir -p "$LAUNCH_AGENTS" "$CHAOS_LOG_DIR" "$CHAOS_NIGHTLY_DIR"
 	fill_template "$CHAOS_TEMPLATE" "BUN=$CHAOS_BUN" "HOME=$HOME" "REPO=$REPO" "PATH=$CHAOS_PATH" \
 		>"$CHAOS_PLIST.tmp.$$" || { rm -f "$CHAOS_PLIST.tmp.$$"; fail "chaos job template ${CHAOS_TEMPLATE##*/} could not be filled" 1; }
 	/usr/bin/plutil -lint "$CHAOS_PLIST.tmp.$$" >/dev/null || { rm -f "$CHAOS_PLIST.tmp.$$"; fail "the filled chaos job plist does not lint" 1; }
@@ -460,6 +544,13 @@ if [ "$CHAOS" = on ]; then
 	fi
 	mv -f "$CHAOS_PLIST.tmp.$$" "$CHAOS_PLIST"
 	launchctl bootstrap "gui/$UID" "$CHAOS_PLIST" || fail "launchctl bootstrap gui/$UID $CHAOS_PLIST exited $?" 1
+	arming="$(arming_state)"
+	if [ "$arming" != on ]; then
+		arming_append on || fail "could not append on to $CHAOS_ARMING_LOG" 1
+		step "chaos nightly armed: on appended to $CHAOS_ARMING_LOG"
+	else
+		step "chaos nightly: $CHAOS_ARMING_LOG is already armed; nothing appended"
+	fi
 	step "chaos nightly loaded: fires every quarter hour, runs once a night at 03:00 America/Los_Angeles; log $CHAOS_LOG_DIR/launchd.log; turn off with: bash install/install.sh --chaos-nightly=off"
 fi
 

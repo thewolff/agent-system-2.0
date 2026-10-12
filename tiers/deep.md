@@ -27,7 +27,7 @@ Read the kind off your task, then follow the matching line.
 - **understand**: return a bounded report that answers the task, with an absolute `file:line` receipt for every claim. Read only the spans the task needs, and write nothing.
 - **change-small**: make the one-file change the task asks for, reuse the patterns already in the code, and run the test or diff that checks it. Report the file, the command, and its exit code.
 - **change-large**: read the surrounding code before writing and keep one convention across every file you touch. State the steps before taking them and verify each against the done-condition. Report every file changed with its line ranges, every command with its exit code, and every part of the task you did not reach.
-- **judge**: judge from evidence you inspected in this slice; every finding carries its receipt, and anything without one is marked as inference. Name the options you weighed, the one you chose, and what would change the answer; separate what is blocking from what is worth knowing. A ruling is the artifact: a fix you recommend becomes a new slice the lane cuts.
+- **judge**: judge from evidence you inspected in this slice; every finding carries its receipt, and anything without one is marked as inference. Name the options you weighed, the one you chose, and what would change the answer; separate what is blocking from what is worth knowing. A ruling is the artifact: a fix you recommend becomes a new slice the lane cuts. A review of a PR that changes lane, runner or recovery behaviour checks for a `chaos: <fault>` line in its PR body or a new fault in the PR (`tiers/lane.md`, *Chaos coverage*), and reports a missing one as a `major` finding.
 
 ## Every slice
 

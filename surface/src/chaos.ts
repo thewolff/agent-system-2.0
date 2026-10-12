@@ -3,7 +3,7 @@
 // snapshot and its diff, and the report. surface/scripts/chaos.ts (the CLI) drives it.
 //
 // Reading and deciding are kept apart. Only these read anything: `judgePoll` (the throwaway ledger it
-// is handed), `nightlyDue` / `reportPath` (a listing of the reports dir), `workloadRows`,
+// is handed), `nightlyDue` (a listing of R/nightly) / `reportPath` (a listing of the reports dir), `workloadRows`,
 // `scratchWriteRefusal` (lstat of the scratch path it is handed), and `isolationSnapshot`, which
 // gathers the live state read-only: the ledger opened `{ readonly: true }`, git run with
 // `GIT_OPTIONAL_LOCKS=0` and `--no-optional-locks` so `git status` never rewrites the live
@@ -23,6 +23,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { type Builders, builderLabs, parseHandSpawn, settledTokens } from "../../classifier/src/lab";
 import type { HandSessionModels } from "../../classifier/src/hand-session";
 import type { Ledger } from "../../ledger/src/index";
+import { nightlyDir } from "./chaos-alert";
 import { type ErrorKind, errorLines } from "./errors";
 import { STARTER_EXIT } from "./launch";
 
@@ -78,12 +79,14 @@ export function reportExists(reportsDir: string, day: string): boolean {
 
 /**
  * Whether `--nightly` runs at `now` (§ 2.6): the America/Los_Angeles wall time is in [03:00, 03:15)
- * and that PT date has no report yet. Anything else exits 0 at once and writes nothing.
+ * and that PT date has no nightly report yet. `root` is the chaos root R; only R/nightly
+ * (`nightlyDir`, PLAN wl-mv5lpzqacbe5ts § 2.1) is read, so a manual `--fault` report in R does not
+ * stop the night. Anything else exits 0 at once and writes nothing.
  */
-export function nightlyDue(now: Date, reportsDir: string): boolean {
+export function nightlyDue(now: Date, root: string): boolean {
 	const { day, minuteOfDay } = ptParts(now);
 	if (minuteOfDay < NIGHTLY_START_MINUTE || minuteOfDay >= NIGHTLY_END_MINUTE) return false;
-	return !reportExists(reportsDir, day);
+	return !reportExists(nightlyDir(root), day);
 }
 
 /**

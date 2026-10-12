@@ -42,7 +42,7 @@ import {
 import { testRuns } from "../src/test-run";
 import { releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
 import {
-	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, type Ctx, LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL,
+	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, CHAOS_FAILED_PREFIX, type Ctx, LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL,
 	LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, LANE_HANDOFF_TOOL, LANE_MESSAGE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_RELEASE_TOOL,
 	LANE_WITHDRAW_RESERVED_TOOL, ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, type SurfaceAPI, TEST_RUN_FAILED_PREFIX, type ToolResult,
 } from "../src/types";
@@ -61,7 +61,7 @@ const SLICE_ID_RE = /^sl-\S+$/;
 const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text: t }], details });
 
 /** Message bodies the machinery writes and the surface reads as signals; a lane's own message must not open with one. */
-const PUSHED_SIGNAL_PREFIXES = [LANE_DIED_PREFIX, PROMPT_WAIT_PREFIX, PROMPT_RESOLVED_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, TEST_RUN_FAILED_PREFIX];
+const PUSHED_SIGNAL_PREFIXES = [LANE_DIED_PREFIX, PROMPT_WAIT_PREFIX, PROMPT_RESOLVED_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, TEST_RUN_FAILED_PREFIX, CHAOS_FAILED_PREFIX];
 
 /** The slice kinds `lane_add_slice` takes; the routing kinds, so the plan slice is `judge` (SPEC § B6). */
 const SLICE_KINDS = ["locate", "understand", "change-small", "change-large", "judge"] as const;
