@@ -498,7 +498,7 @@ describe("scheduled second copy (S2)", () => {
 
 		openAt("2026-09-28T10:00:00.000Z");
 		expect(copies(path)).toEqual(["ledger-2026-09-28T10-00-00.000Z.db"]);
-		openAt("2026-09-28T11:00:00.000Z");
+		openAt("2026-09-28T10:30:00.000Z"); // 30 min later: inside the 55 min interval
 		expect(copies(path)).toEqual(["ledger-2026-09-28T10-00-00.000Z.db"]);
 		openAt("2026-09-29T10:00:00.000Z");
 		openAt("2026-09-30T10:00:00.000Z");
@@ -516,12 +516,35 @@ describe("scheduled second copy (S2)", () => {
 		Ledger.open(path, { create: true }).close();
 		const a = script("backup.ts", path);
 		expect([a.exitCode, a.err]).toEqual([0, ""]);
-		expect(a.out).toMatch(/^backup ok: took .*ledger-.*\.db\n$/);
+		expect(a.out).toMatch(/^backup ok: took .*ledger-.*\.db\noff-disk: none configured \(.*\/backup-offdisk-dir absent\); every copy is on the ledger's disk\n$/);
 		expect(script("backup.ts", path).out).toMatch(/^backup ok: none due; newest /);
 		expect(script("backup.ts", path, "--force").out).toMatch(/^backup ok: took /);
 		expect(copies(path).length).toBe(2);
 		const check = Bun.spawnSync([SQLITE3, copyPaths(path)[0]!, "PRAGMA user_version; PRAGMA integrity_check;"]);
 		expect(check.stdout.toString().trim().split("\n")).toEqual(["5", "ok"]);
+	});
+
+	test("off-disk (A1-3): a configured destination that is missing, on the ledger's disk, or not one absolute path fails the job after the local copy; nothing is created there", () => {
+		const dir = scratch("s2-offdisk");
+		const path = join(dir, "ledger.db");
+		Ledger.open(path, { create: true }).close();
+		const config = join(dir, "backup-offdisk-dir");
+		const missing = join(dir, "unmounted");
+		writeFileSync(config, `${missing}\n`);
+		const a = script("backup.ts", path);
+		expect(a.exitCode).toBe(1);
+		expect(a.out).toMatch(/^backup ok: took /);
+		expect(a.err).toContain(`off-disk destination ${missing} does not exist (not mounted?); it is never created here`);
+		expect(existsSync(missing)).toBe(false);
+		const sameDisk = join(dir, "same-disk");
+		mkdirSync(sameDisk);
+		writeFileSync(config, `${sameDisk}\n`);
+		const b = script("backup.ts", path);
+		expect(b.exitCode).toBe(1);
+		expect(b.err).toContain(`off-disk destination ${sameDisk} is on the same disk as the ledger`);
+		expect(readdirSync(sameDisk)).toEqual([]);
+		writeFileSync(config, "relative/dir\n");
+		expect(script("backup.ts", path).err).toContain("must hold exactly one absolute directory path");
 	});
 });
 
@@ -701,7 +724,7 @@ describe("a failed snapshot never leaves a file that counts as a copy (M2 third 
 		// The good copy is aged; a newer, empty one sits beside it, as the old module left behind.
 		const aged = "ledger-2020-01-01T00-00-00.000Z.db";
 		renameSync(join(copyDir, good!), join(copyDir, aged));
-		const empty = `ledger-${new Date(Date.now() - 3_600_000).toISOString().replace(/:/g, "-")}`;
+		const empty = `ledger-${new Date(Date.now() - 60_000).toISOString().replace(/:/g, "-")}`;
 		writeFileSync(join(copyDir, empty + ".db"), "");
 
 		const job = script("backup.ts", path);
@@ -709,7 +732,7 @@ describe("a failed snapshot never leaves a file that counts as a copy (M2 third 
 		expect(job.out).toMatch(/^backup ok: took /);
 		expect(job.err).toContain(`/${empty}.db as `);
 		expect(job.err).toContain(`/${empty}.db.invalid, not a complete copy (empty file)`);
-		const taken = job.out.replace(/^backup ok: took /, "").trim();
+		const taken = job.out.split("\n")[0]!.replace(/^backup ok: took /, "").trim();
 		expect(readdirSync(copyDir).sort()).toEqual(["SOURCE", aged, `${empty}.db.invalid`, basename(taken)].sort());
 		const check = Bun.spawnSync([SQLITE3, taken, "PRAGMA user_version; PRAGMA integrity_check;"]);
 		expect(check.stdout.toString().trim().split("\n")).toEqual(["5", "ok"]);

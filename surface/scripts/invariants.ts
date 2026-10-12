@@ -18,14 +18,16 @@
 //   bun surface/scripts/invariants.ts --repo <dir>    the checkout the git invariants read (default:
 //                                                     the checkout this script is in)
 //   bun surface/scripts/invariants.ts --backup-gap <hours>
-//                                                     stale-backup's threshold (default 30: the job's 24 h
-//                                                     copy interval plus 6 h): how far the newest ledger
+//                                                     stale-backup's threshold (default 3: about three
+//                                                     runs of the hourly job): how far the newest ledger
 //                                                     write may run ahead of the newest copy
 //
 // The ledger is the one the surface opens: $AGENT_SYSTEM_LEDGER_DB, else $HOME/.agent-system-2/ledger.db
 // (ledger/src/locality.ts defaultLedgerPath). Lane rpc logs are read from the lane directory the
 // launcher writes (surface/src/launch.ts laneDir). Live lanes are the `surface/scripts/lane.ts run
-// <wl> <lane>` processes `pgrep -fl` lists.
+// <wl> <lane>` processes `pgrep -fl` finds. Where a line carries only the process name (Linux procps
+// prints the name, macOS the full argument list), that pid's command line is read with
+// `ps -ww -o command=` (unlimited width).
 //
 // | Invariant | Fires when | Key |
 // |---|---|---|
@@ -41,7 +43,7 @@
 // | checkout-behind-main | `git rev-parse HEAD` differs from `origin/main` in the checkout. Behind (HEAD is an ancestor of origin/main): `behind origin/main by <n>; fast-forward at a lull` (or `fast-forward would refuse` with the modified tracked files, or `git status failed` when cleanliness could not be read). Diverged (neither is an ancestor of the other): `DIVERGED … needs a person`. Ahead only (origin/main is an ancestor of HEAD: local commits not yet on main) is not a finding. It never fetches, so origin/main is whatever the checkout already has. | `checkout-behind-main:<head12>:<origin12>` (`…:diverged:…` when diverged) |
 // | process-older-than-head | an `omp --cwd <checkout>` process (not a persistent seat: commands naming `/seat-sessions/` are skipped) started before HEAD arrived, where "arrived" is the later of HEAD's commit time and its newest reflog entry | `process-older-than-head:<pid>:<head12>` |
 // | ff-lull | checkout-behind-main with tracked files clean (`git status --porcelain --untracked-files=no` succeeded and printed nothing) AND zero review hands in flight. In flight = a `hand-spawn: … review yes` token with no `hand-settled: <token>` whose spawning lane has a live `lane.ts run` process: the `liveReviews` set the classifier passes to `builderLabs`. Unsettled review hands whose lane is gone are listed, not counted. The text cites the fingerprint rule (classifier/src/fingerprint.ts header: a review's fingerprint covers its lane's worktree only) rather than asserting the fast-forward is safe. | `ff-lull:<origin12>:<id of the newest review hand-settled entry>`, so one notice per lull |
-// | stale-backup | the ledger's newest write (max `created_at` across every table that has one, up to as-of) is newer than the newest scheduled copy (`ledger-<time>.db` in `backups/<backupNamespace>/` beside the ledger, the directory ledger/scripts/backup.ts writes; its time read from the name, copies named after as-of ignored; a copy counts only if the ledger's `copyProblem` accepts it as complete, so an empty, unreadable, corrupt or wrong-version file named like a copy is passed over for the next older one) by more than `--backup-gap` hours (default 30: the job's 24 h copy interval plus 6 h, so a finding means a daily copy was missed, not a busy day): writes no copy captured. Never the copy's wall-clock age: an old copy of a quiet ledger is not a finding (2026-10-09T18:03Z to 2026-10-11T18:10Z the ledger wrote nothing and every copy matched it). With no complete copy at all the gap runs from the ledger's first write. The text names the newest write, the newest complete copy, each newer file passed over with its problem, and the backup directory. | `stale-backup:<newest complete copy file name>` (`stale-backup:none` with no complete copy) |
+// | stale-backup | the ledger's newest write (max `created_at` across every table that has one, up to as-of) is newer than the newest scheduled copy (`ledger-<time>.db` in `backups/<backupNamespace>/` beside the ledger, the directory ledger/scripts/backup.ts writes; its time read from the name, copies named after as-of ignored; a copy counts only if the ledger's `copyProblem` accepts it as complete, so an empty, unreadable, corrupt or wrong-version file named like a copy is passed over for the next older one) by more than `--backup-gap` hours (default 3: the job runs hourly and a copy is due every 55 min, so a finding means about three runs missed, not one late run): writes no copy captured. Never the copy's wall-clock age: an old copy of a quiet ledger is not a finding (2026-10-09T18:03Z to 2026-10-11T18:10Z the ledger wrote nothing and every copy matched it). With no complete copy at all the gap runs from the ledger's first write. The text names the newest write, the newest complete copy, each newer file passed over with its problem, and the backup directory. The same test runs over the off-disk mirror (`<destination>/<backupNamespace>/`, the destination named in `backup-offdisk-dir` beside the ledger, ledger/src/offdisk.ts); with no destination configured, or a config that does not hold one absolute path, the off-disk half is a skip with the reason. | `stale-backup:<newest complete copy file name>` (`stale-backup:none` with no complete copy); off-disk `stale-backup:off-disk:<name or none>` |
 //
 // Skips. An invariant that cannot be judged here is reported as `skipped: <reason>` rather than
 // silently passing: the three git/process invariants under `--as-of` (git state and the process
@@ -53,8 +55,8 @@
 // fails is a skip, never "no process": pgrep exit 1 (no match) is an answer, any other failure
 // carries its exit code and stderr into the reason; a `ps` call that fails for a process still
 // alive is a skip too (only a pid that is gone reads as "exited between pgrep and ps"). silent-lane
-// reads file mtimes as they are now, like the rpc logs; stale-backup reads the backup directory and
-// its files as they are now and says so in its finding under `--as-of`.
+// reads file mtimes as they are now, like the rpc logs; stale-backup reads the backup directories and
+// their files as they are now and says so in its finding under `--as-of`.
 //
 // Replay (`--as-of`). "Alive" means a lane process alive now whose lane had already started by
 // as-of; a lane alive then that has died since reads as dead, and rpc logs are read as they are now.
@@ -68,7 +70,8 @@ import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { builderLabs, describeBuilders, excludedLabs, parseHandSpawn } from "../../classifier/src/lab";
-import { BACKUP_DEFAULTS, BACKUP_NAME, backupNamespace, copyProblem, processAlive } from "../../ledger/src/index";
+import { BACKUP_NAME, backupNamespace, copyProblem, processAlive } from "../../ledger/src/index";
+import { offDiskNamespace, readOffDiskConfig } from "../../ledger/src/offdisk";
 import type { EntryKind, EntryRow, InstructionRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import { type ReservedLedgerView, reservedStates } from "../src/errors";
@@ -134,11 +137,13 @@ export interface Input {
 	orchestrators: () => Probe<OrchestratorProcess[]>;
 	/** The ledger's scheduled-copy directory, and how far the newest write may run ahead of the newest copy. */
 	backups: { dir: string; gapMs: number };
+	/** The off-disk mirror's namespace directory (ledger/src/offdisk.ts), judged with the same gap; or why it is not judged (none configured). */
+	offDisk: { dir: string } | { skipped: string };
 }
 
 const MIN = 60_000;
-/** stale-backup's default gap between the newest ledger write and the newest copy: the job's copy interval plus 6 h, so a finding means a daily copy was missed. */
-export const BACKUP_GAP_MS = BACKUP_DEFAULTS.intervalMs + 6 * 60 * MIN;
+/** stale-backup's default gap between the newest ledger write and the newest copy: 3 h, so with the hourly job (a copy due every 55 min) a finding means about three runs missed, not one late run. */
+export const BACKUP_GAP_MS = 3 * 60 * MIN;
 const LANE_STARTED = /^lane-started:\s+(\S+)/;
 const LANE_EXIT = /^lane-exit:\s+(\S+)\s+code\s+(\S+)\s+signal\s+(\S+)\s+outcome\s+(\S+)/;
 const HAND_SETTLED = /^hand-settled:\s+(\S+)/;
@@ -306,7 +311,7 @@ export function check(input: Input): Report {
 				workload: wl,
 				since: dead.silentSince,
 				text: `${dead.laneId} started ${dead.started} has no lane-exit, no lane.ts process, and the workload has been silent ${age(dead.silentSince)}: the lane died without telling anyone.`,
-				query: `${openEntries.shown} -- then: newest 'lane-started: <lane>' per workload with no 'lane-exit: <lane> ...'; pgrep -fl 'surface/scripts/lane.ts run <workload> <lane>'`,
+				query: `${openEntries.shown} -- then: newest 'lane-started: <lane>' per workload with no 'lane-exit: <lane> ...'; pgrep -f 'surface/scripts/lane.ts run <workload> <lane>'`,
 			});
 		}
 	}
@@ -332,7 +337,7 @@ export function check(input: Input): Report {
 				workload: w.id,
 				since: last,
 				text: `lane ${w.holder} on ${w.id} silent ${hours}h (last transcript write ${lastWrite ?? "none"}); process alive, lease held — hung, not dead; stop + relaunch`,
-				query: `${held.shown} -- then: pgrep -fl 'surface/scripts/lane.ts run ${w.id} ${w.holder}'; newest mtime under ${input.lanesDirOf(w.id)}; newest entry on ${w.id}`,
+				query: `${held.shown} -- then: pgrep -f 'surface/scripts/lane.ts run ${w.id} ${w.holder}'; newest mtime under ${input.lanesDirOf(w.id)}; newest entry on ${w.id}`,
 			});
 		}
 	}
@@ -617,7 +622,7 @@ export function check(input: Input): Report {
 				workload: "checkout",
 				since,
 				text: `lull for a fast-forward of ${repo}: 0 review hands in flight (a review's fingerprint covers its lane's worktree only and leaves refs other than HEAD's out, classifier/src/fingerprint.ts header, so none is in flight to be changed), tracked files clean (untracked not checked), ${liveLanes.size} lanes alive${orphanReviews.length ? ` (unsettled review hands whose lane is gone, not counted: ${orphanReviews.join(", ")})` : ""}. Last review settled: ${lastSettle ? `${lastSettle.id} at ${lastSettle.created_at}` : "none"}.`,
-				query: `${unsettled.shown} -- in flight = review yes and the spawning lane (created_by) is in pgrep -fl 'surface/scripts/lane.ts run'; last settle: ${rv.shown}`,
+				query: `${unsettled.shown} -- in flight = review yes and the spawning lane (created_by) is in pgrep -f 'surface/scripts/lane.ts run'; last settle: ${rv.shown}`,
 			});
 		}
 	}
@@ -626,35 +631,39 @@ export function check(input: Input): Report {
 	// A finding only when the ledger's newest write is newer than the newest copy by more than the gap: writes no
 	// copy captured. Never the copy's wall-clock age: 2026-10-09T18:03Z to 2026-10-11T18:10Z the ledger wrote
 	// nothing, every copy matched it, and an age-of-copy rule read that as stale (wl-mv4gn9l7spcsg0 FINDINGS.md).
+	// The same test runs over the off-disk mirror (ledger/src/offdisk.ts) when a destination is configured; with
+	// none configured (or its config unreadable) the off-disk half is a skip, never a pass.
 	const { dir: backupDir, gapMs } = input.backups;
 	const replayNote = replay ? " (replay: the backup directory and its files are read as they are on disk now, not as of as-of: copies pruned since are missing, copies named after as-of are ignored)" : "";
 	const hours = (ms: number) => `${(ms / (60 * MIN)).toFixed(1)}h`;
-	let copies: { name: string; at: string }[] | null = null;
-	try {
-		copies = (existsSync(backupDir) ? readdirSync(backupDir) : []).flatMap(name => {
-			const m = BACKUP_NAME.exec(name);
-			return m ? [{ name, at: `${m[1]}T${m[2]}:${m[3]}:${m[4]}` }] : [];
-		}).filter(c => c.at <= asOf).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
-	} catch (e) {
-		skip("stale-backup", `the backup directory ${backupDir} could not be listed: ${e instanceof Error ? e.message : String(e)}`);
-	}
-	if (copies) {
-		// Every created_at across the tables that have one (the copy is the whole file, so these are the copied tables).
-		const writesSql = db.query<{ name: string }, []>(
-			"SELECT m.name FROM sqlite_master m WHERE m.type = 'table' AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE name = 'created_at') ORDER BY m.name",
-		).all().map(t => `SELECT created_at FROM "${t.name}"`).join(" UNION ALL ");
-		const writes = run<{ oldest: string | null; newest: string | null }>(
-			`SELECT min(created_at) AS oldest, max(created_at) AS newest FROM (${writesSql}) WHERE created_at <= :asOf`,
-			{ ":asOf": asOf },
-		);
-		const { oldest, newest } = writes.rows[0]!;
+	// Every created_at across the tables that have one (the copy is the whole file, so these are the copied tables).
+	const writesSql = db.query<{ name: string }, []>(
+		"SELECT m.name FROM sqlite_master m WHERE m.type = 'table' AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE name = 'created_at') ORDER BY m.name",
+	).all().map(t => `SELECT created_at FROM "${t.name}"`).join(" UNION ALL ");
+	const writes = run<{ oldest: string | null; newest: string | null }>(
+		`SELECT min(created_at) AS oldest, max(created_at) AS newest FROM (${writesSql}) WHERE created_at <= :asOf`,
+		{ ":asOf": asOf },
+	);
+	const { oldest, newest } = writes.rows[0]!;
+	/** Judge the copies in `dir`; `where` is "" for the local copies and "off-disk " for the mirror. */
+	const judgeCopies = (dir: string, where: "" | "off-disk ") => {
+		let copies: { name: string; at: string }[];
+		try {
+			copies = (existsSync(dir) ? readdirSync(dir) : []).flatMap(name => {
+				const m = BACKUP_NAME.exec(name);
+				return m ? [{ name, at: `${m[1]}T${m[2]}:${m[3]}:${m[4]}` }] : [];
+			}).filter(c => c.at <= asOf).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+		} catch (e) {
+			skip("stale-backup", `the ${where}backup directory ${dir} could not be listed: ${e instanceof Error ? e.message : String(e)}`);
+			return;
+		}
 		// The newest copy that is a complete ledger by the backup writer's own test (copyProblem: not empty, readable,
 		// integrity_check ok, at SCHEMA_VERSION). A newer file named like a copy that fails it captured nothing, so the
 		// walk goes back past it; opening is read-only, and quarantining such a file stays the writer's job.
 		const rejected: string[] = [];
 		let newestCopy: { name: string; at: string } | undefined;
 		for (const c of copies.toReversed()) {
-			const problem = copyProblem(join(backupDir, c.name));
+			const problem = copyProblem(join(dir, c.name));
 			if (problem === null) { newestCopy = c; break; }
 			rejected.push(`${c.name} (${problem})`);
 		}
@@ -663,19 +672,22 @@ export function check(input: Input): Report {
 		const behindMs = newest && capturedAt ? Date.parse(newest) - Date.parse(capturedAt) : 0;
 		if (behindMs > gapMs) {
 			const copyText = (newestCopy
-				? `newest ledger backup ${newestCopy.at} (${newestCopy.name})`
-				: `no ledger backup at or before ${asOf} (first ledger write ${oldest})`)
+				? `newest ${where}ledger backup ${newestCopy.at} (${newestCopy.name})`
+				: `no ${where}ledger backup at or before ${asOf} (first ledger write ${oldest})`)
 				+ (rejected.length ? `; not counted, not a complete copy: ${rejected.join(", ")}` : "");
 			findings.push({
-				key: `stale-backup:${newestCopy?.name ?? "none"}`,
+				key: `stale-backup:${where ? "off-disk:" : ""}${newestCopy?.name ?? "none"}`,
 				invariant: "stale-backup",
 				workload: "ledger",
 				since: capturedAt!,
-				text: `newest ledger write ${newest} is ${hours(behindMs)} newer than ${copyText} in ${backupDir} (gap ${hours(gapMs)})${replayNote}: writes since then are in no copy. The job is ledger/scripts/backup.ts (launchd agent com.agent-system-2.ledger-backup on macOS).`,
-				query: `ls ${backupDir}/ledger-*.db; copyProblem() (ledger/src/index.ts) on each, newest first; ${writes.shown}`,
+				text: `newest ledger write ${newest} is ${hours(behindMs)} newer than ${copyText} in ${dir} (gap ${hours(gapMs)})${replayNote}: writes since then are in no ${where}copy. The job is ledger/scripts/backup.ts (launchd agent com.agent-system-2.ledger-backup on macOS).`,
+				query: `ls ${dir}/ledger-*.db; copyProblem() (ledger/src/index.ts) on each, newest first; ${writes.shown}`,
 			});
 		}
-	}
+	};
+	judgeCopies(backupDir, "");
+	if ("skipped" in input.offDisk) skip("stale-backup", `off-disk copy: ${input.offDisk.skipped}`);
+	else judgeCopies(input.offDisk.dir, "off-disk ");
 
 	return {
 		asOf, replay, liveLanes: liveLanes ? [...liveLanes] : null, reviewsInFlight, orphanReviews, findings, skipped,
@@ -715,14 +727,62 @@ function pgrep(args: string[], run: Run = spawnRun): Probe<string[]> {
 	}
 }
 
-/** `<workload> <laneId>` per `surface/scripts/lane.ts run` process, or why the process table could not be read. */
-export function liveLanesFromPgrep(): Probe<Set<string>> {
-	if (!available("pgrep")) return { skipped: "pgrep is not available on this machine" };
-	const p = pgrep(["-fl", "surface/scripts/lane\\.ts run "]);
-	if ("skipped" in p) return p;
+/** What the process probes call; the defaults are the real machine. */
+export interface PsDeps {
+	run: Run;
+	/** Whether a pid still exists (ledger/src/index.ts processAlive: only ESRCH is gone). */
+	alive: (pid: number) => boolean;
+	available: (cmd: string) => boolean;
+}
+const realPs: PsDeps = { run: spawnRun, alive: processAlive, available };
+
+/**
+ * One `ps [flags] -o <field>= -p <pid>` (the same flags on macOS and Linux procps). A call that fails
+ * for a pid that is gone means the process exited between pgrep and ps; one that fails for a pid still
+ * alive (or cannot start) is "could not look".
+ */
+function psField(deps: PsDeps, field: string, pid: string, flags: string[] = []): { out: string } | { gone: true } | { failed: string } {
+	const argv = ["ps", ...flags, "-o", `${field}=`, "-p", pid];
+	let p: RunResult;
+	try {
+		p = deps.run(argv);
+	} catch (e) {
+		return { failed: `${argv.join(" ")} could not start: ${e instanceof Error ? e.message : String(e)}` };
+	}
+	if (p.exitCode === 0) return { out: p.stdout.trim() };
+	if (!deps.alive(Number(pid))) return { gone: true };
+	const err = p.stderr.trim();
+	return { failed: `${argv.join(" ")} exited ${p.exitCode} while pid ${pid} is alive${err ? `: ${err}` : ""}` };
+}
+
+/**
+ * `<workload> <laneId>` per `surface/scripts/lane.ts run` process, or why the process table could not
+ * be read. `pgrep -fl` prints the full command line on macOS but only the process name on Linux
+ * procps, where the lane would never match; a line that does not carry the matched text is the name
+ * only, and that pid's command line comes from `ps -ww -o command=` (`-ww`: unlimited width, since
+ * procps leaves redirected output width undefined and a cut line would drop or shorten the lane key).
+ * A macOS line normally carries the full argument list, so ps is called only where pgrep could not
+ * read a process's arguments: macOS ps is setuid root, and a Seatbelt-fenced process (a seat, a lane)
+ * cannot exec it (EPERM), so a ps per pid would turn every live lane into "liveness unknown" inside
+ * the fence. The match is an unanchored substring: any command line carrying
+ * `surface/scripts/lane.ts run <a> <b>` (an editor or shell payload too) counts as a lane.
+ */
+export function liveLanesFromPgrep(deps: PsDeps = realPs): Probe<Set<string>> {
+	if (!deps.available("pgrep")) return { skipped: "pgrep is not available on this machine" };
+	const lines = pgrep(["-fl", "surface/scripts/lane\\.ts run "], deps.run);
+	if ("skipped" in lines) return lines;
 	const out = new Set<string>();
-	for (const line of p.found) {
-		const m = /surface\/scripts\/lane\.ts run (\S+) (\S+)/.exec(line);
+	for (const line of lines.found) {
+		const [pid = "", rest = ""] = /^\s*(\d+)\s*(.*)$/.exec(line)?.slice(1) ?? [];
+		let command = rest;
+		if (!rest.includes("surface/scripts/lane.ts run ")) {
+			if (!deps.available("ps")) return { skipped: "ps is not available on this machine" };
+			const read = psField(deps, "command", pid, ["-ww"]);
+			if ("failed" in read) return { skipped: `ps failed: ${read.failed}` };
+			if ("gone" in read) continue; // the process exited between pgrep and ps
+			command = read.out;
+		}
+		const m = /surface\/scripts\/lane\.ts run (\S+) (\S+)/.exec(command);
 		if (m) out.add(`${m[1]} ${m[2]}`);
 	}
 	return { found: out };
@@ -739,43 +799,22 @@ export function gitIn(repo: string): Git {
 	};
 }
 
-/** What `orchestratorsFromPs` calls; the defaults are the real machine. */
-export interface PsDeps {
-	run: Run;
-	/** Whether a pid still exists (ledger/src/index.ts processAlive: only ESRCH is gone). */
-	alive: (pid: number) => boolean;
-	available: (cmd: string) => boolean;
-}
-
 /**
  * Every `omp --cwd <repo>` process with its `ps` start time, or why they could not be listed. A `ps`
  * call that fails for a pid that is gone means the process exited between pgrep and ps and is left
  * out; one that fails for a pid still alive (or cannot start) is "could not look": a skip, never a
  * vanished process, so a broken ps cannot hide an orchestrator older than HEAD.
  */
-export function orchestratorsFromPs(repo: string, deps: PsDeps = { run: spawnRun, alive: processAlive, available }): Probe<OrchestratorProcess[]> {
+export function orchestratorsFromPs(repo: string, deps: PsDeps = realPs): Probe<OrchestratorProcess[]> {
 	if (!deps.available("ps")) return { skipped: "ps is not available on this machine" };
 	if (!deps.available("pgrep")) return { skipped: "pgrep is not available on this machine" };
 	const pids = pgrep(["-f", `omp --cwd ${repo.replaceAll(".", "\\.")}( |$)`], deps.run);
 	if ("skipped" in pids) return pids;
-	const ps = (field: string, pid: string): { out: string } | { gone: true } | { failed: string } => {
-		const argv = ["ps", "-o", `${field}=`, "-p", pid];
-		let p: RunResult;
-		try {
-			p = deps.run(argv);
-		} catch (e) {
-			return { failed: `${argv.join(" ")} could not start: ${e instanceof Error ? e.message : String(e)}` };
-		}
-		if (p.exitCode === 0) return { out: p.stdout.trim() };
-		if (!deps.alive(Number(pid))) return { gone: true };
-		const err = p.stderr.trim();
-		return { failed: `${argv.join(" ")} exited ${p.exitCode} while pid ${pid} is alive${err ? `: ${err}` : ""}` };
-	};
 	const found: OrchestratorProcess[] = [];
 	for (const pid of pids.found) {
-		const lstart = ps("lstart", pid);
+		const lstart = psField(deps, "lstart", pid);
 		if ("failed" in lstart) return { skipped: `ps failed: ${lstart.failed}` };
-		const command = ps("command", pid);
+		const command = psField(deps, "command", pid);
 		if ("failed" in command) return { skipped: `ps failed: ${command.failed}` };
 		if ("gone" in lstart || "gone" in command) continue; // the process exited between pgrep and ps
 		found.push({ pid, command: command.out, started: lstart.out ? new Date(lstart.out) : null });
@@ -853,6 +892,18 @@ export function parseArgs(argv: string[], scriptDir: string): Args {
 	return args;
 }
 
+/** The off-disk mirror stale-backup judges for the ledger at canonical path `canonical`, or why it is skipped. */
+export function offDiskInput(canonical: string): Input["offDisk"] {
+	try {
+		const { config, dir } = readOffDiskConfig(canonical);
+		return dir === null
+			? { skipped: `no off-disk destination configured (${config} absent): every copy is on the ledger's own disk` }
+			: { dir: offDiskNamespace(dir, canonical) };
+	} catch (e) {
+		return { skipped: e instanceof Error ? e.message : String(e) };
+	}
+}
+
 export function main(argv: string[]): number {
 	const args = parseArgs(argv, import.meta.dir);
 	const ledgerPath = defaultLedgerPath();
@@ -871,6 +922,7 @@ export function main(argv: string[]): number {
 			git: available("git") ? gitIn(args.repo) : null,
 			orchestrators: () => orchestratorsFromPs(args.repo),
 			backups: { dir: join(dirname(canonical), "backups", backupNamespace(canonical)), gapMs: args.backupGapMs },
+			offDisk: offDiskInput(canonical),
 		});
 		if (args.reviews) console.log(reviewsLine(report));
 		else if (args.json) {

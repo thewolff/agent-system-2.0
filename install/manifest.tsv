@@ -15,6 +15,10 @@ ledger/src/index.ts	ledger-module	-
 ledger/src/locality.ts	ledger-module	-
 ledger/scripts/init.ts	ledger-init	-
 ledger/scripts/backup.ts	ledger-backup	-
+ledger/src/offdisk.ts	ledger-module	-
+ledger/scripts/restore.ts	module	-
+ledger/test/restore.test.ts	test	-
+ledger/test/offdisk.test.ts	test	-
 ledger/test/facts.test.ts	test	-
 ledger/test/install.test.ts	test	-
 ledger/test/ledger.test.ts	test	-

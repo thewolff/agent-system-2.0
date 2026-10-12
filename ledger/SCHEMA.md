@@ -51,9 +51,10 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
     when that name is taken (an earlier set-aside file is never replaced), kept, and reported on
     stderr ("ledger: set aside … as ….invalid[.N], not a complete copy (…)"). Remove `.invalid`
     files by hand once inspected; pruning does not touch them.
-  - **When.** A copy is due when the ledger's newest copy is at least 24 hours old, or there is
-    none. After a copy lands, that ledger's newest 7 are kept (`OpenOptions.backup` sets `dir`,
-    `intervalMs`, `keep`, or `false`), and dead writers' temporary files are removed.
+  - **When.** A copy is due when the ledger's newest copy is at least 55 minutes old, or there is
+    none, so each run of the hourly job takes one. After a copy lands, that ledger's newest 48 are
+    kept, two days of hourly copies (`OpenOptions.backup` sets `dir`, `intervalMs`, `keep`, or
+    `false`), and dead writers' temporary files are removed.
   - **The periodic job (the schedule).** `bun run ledger/scripts/backup.ts [path] [--force]`
     (path default: `$AGENT_SYSTEM_LEDGER_DB`, else the default above) takes a copy when due and
     prints `backup ok: took <copy>` or `backup ok: none due; newest <copy>`. It is strict: when a
@@ -77,6 +78,37 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
     scheduled backup failed: …") and does not fail the open, so a writer stays available when
     backup storage is not. It only runs when some writer opens the ledger; a long-lived connection
     gets no new copy from it, which is why the periodic job is the schedule.
+  - **Off-disk copy (optional).** Every copy above sits on the ledger's own disk. To keep one
+    elsewhere, write one absolute directory path (an external drive, a second disk) into
+    `backup-offdisk-dir` beside the ledger, for example
+    `echo /Volumes/Spare/agent-system-2 > ~/.agent-system-2/backup-offdisk-dir`. The job then
+    mirrors the newest complete copy to `<that directory>/<stem>-<hash>/` under the same name (the
+    same `SOURCE` rule), checked with the same complete-copy test before it gets its name, and keeps
+    the newest 48 there. It prints a second line, `off-disk ok: copied …` or `off-disk ok: up to date;
+    newest …`, and exits 1 when the directory does not exist (an unmounted drive is never created
+    on the ledger's disk), is on the same device as the ledger, or the file does not hold exactly
+    one absolute path. With no such file it prints `off-disk: none configured (…)`, and the
+    invariant report's `stale-backup` lists the off-disk half as skipped with that reason.
+  - **Restore.** `bun run ledger/scripts/restore.ts <backup> [ledger]` (ledger default as above).
+    Stop every lane and the orchestrator first; it refuses, changing nothing, when the backup is not
+    a complete copy, or while any `surface/scripts/lane.ts run` process, any `omp --cwd <this
+    checkout>` process, or any process holding the ledger or its `-wal`/`-shm` (lsof, or
+    `/proc/<pid>/fd` on Linux without lsof) is running, and when it cannot check. An incomplete
+    check counts as one it could not make: lsof printing a diagnostic, or a process whose
+    `/proc/<pid>/fd` cannot be read while `/proc/<pid>` still exists. Then it renames
+    the ledger and its `-wal`/`-shm` to `ledger.db.pre-restore-<time>{,-wal,-shm}` (never deleted),
+    copies the backup in through a checked temporary file, opens it once with `Ledger.open` (which
+    turns the copy's `delete` journal back to WAL), prints the writes lost (every `provenance` row
+    of the moved-aside file that the restored one does not hold: rows inserted since, per table,
+    and updates reverted, per table; an empty restored copy is named as one), runs
+    `surface/scripts/invariants.ts` over the restored ledger, and prints the lines that undo it: one
+    subshell that sets the restored files aside as `ledger.db.restored-<time>{,-wal,-shm}` and moves
+    the originals back, stopping at the first name already taken. When a run fails partway, the undo
+    it prints covers exactly the files it moved: originals it never moved stay where they are, and
+    files at the ledger's names are set aside only once the replacement was installed. Leases in the
+    copy name lanes that have since exited: expect `dead-lane` / `orphan-hand` findings until they
+    lapse. Exit codes: 0 restored, 1 failed (the undo is printed when anything was moved), 2 refused
+    or usage, 3 path refused.
 
 ## Rules every writer is bound by
 

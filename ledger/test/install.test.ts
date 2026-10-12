@@ -138,7 +138,7 @@ describe.if(process.platform === "darwin")("install: the periodic backup job is 
 			const took = runJob();
 			expect([took.exitCode, took.err]).toEqual([0, ""]);
 			expect(took.out).toMatch(/^backup ok: took /);
-			const fresh = took.out.replace(/^backup ok: took /, "").trim();
+			const fresh = took.out.split("\n")[0]!.replace(/^backup ok: took /, "").trim();
 			const sqlite3 = existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
 			expect(Bun.spawnSync([sqlite3, fresh, "SELECT brief FROM workloads WHERE id = 'wl-writer';"]).stdout.toString().trim()).toBe("written by the open writer");
 

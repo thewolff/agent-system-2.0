@@ -138,7 +138,7 @@ describe("the question row", () => {
 		const db = new Database(path, { readonly: true });
 		const noProbe: Probe<never> = { skipped: "not run" };
 		const at = Date.parse(ledger.question(q)!.created_at);
-		const run = (minutes: number) => check({ db, asOf: new Date(at + minutes * 60_000).toISOString(), replay: true, liveLanes: { found: new Set<string>() }, lanesDirOf: () => "/nonexistent", repo: "/nonexistent", git: null, orchestrators: () => noProbe, backups: { dir: "/nonexistent", gapMs: 30 * 60 * 60_000 } });
+		const run = (minutes: number) => check({ db, asOf: new Date(at + minutes * 60_000).toISOString(), replay: true, liveLanes: { found: new Set<string>() }, lanesDirOf: () => "/nonexistent", repo: "/nonexistent", git: null, orchestrators: () => noProbe, backups: { dir: "/nonexistent", gapMs: 30 * 60 * 60_000 }, offDisk: noProbe });
 		expect(run(20).findings.filter((f) => f.invariant === "stuck-question")).toEqual([]);
 		const stuck = run(31).findings.filter((f) => f.invariant === "stuck-question");
 		expect(stuck).toMatchObject([{ key: `stuck-question:${q}`, workload: STANDING_WORKLOAD_ID, since: ledger.question(q)!.created_at }]);

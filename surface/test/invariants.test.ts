@@ -16,7 +16,7 @@ import { backupNamespace, copyProblem, Ledger } from "../../ledger/src/index";
 import { canonicalPath } from "../../ledger/src/locality";
 import { laneExitBody } from "../src/launch";
 import { reservedStates } from "../src/errors";
-import { BACKUP_GAP_MS, check, gitIn, type Git, type Input, jsonLines, newestWrite, orchestratorsFromPs, parseArgs, type Probe, type PsDeps, renderTable, type Report, reservedView, reviewsLine, type Run } from "../scripts/invariants";
+import { BACKUP_GAP_MS, check, gitIn, type Git, type Input, jsonLines, liveLanesFromPgrep, newestWrite, offDiskInput, orchestratorsFromPs, parseArgs, type Probe, type PsDeps, renderTable, type Report, reservedView, reviewsLine, type Run } from "../scripts/invariants";
 import { AS_OF, buildFixture, LANE_RUNNER } from "./fixtures/invariants/build";
 
 const SCRIPT = join(import.meta.dir, "..", "scripts", "invariants.ts");
@@ -48,7 +48,7 @@ const noGit: Pick<Input, "repo" | "git" | "orchestrators"> = { repo: "/nonexiste
 function run(over: Partial<Input> = {}): Report {
 	return check({
 		db, asOf: AS_OF, replay: true, liveLanes: live(`${fixture.waiting.wl} ${fixture.waiting.lane}`), lanesDirOf: () => "/nonexistent/lanes", ...noGit,
-		backups: { dir: freshBackups, gapMs: BACKUP_GAP_MS }, ...over,
+		backups: { dir: freshBackups, gapMs: BACKUP_GAP_MS }, offDisk: { dir: freshBackups }, ...over,
 	});
 }
 const keys = (r: Report) => r.findings.map((f) => f.key);
@@ -371,20 +371,20 @@ describe("stale-backup: the newest write runs ahead of the newest copy by more t
 	const oldCopy = "ledger-2026-10-10T12-00-00.000Z.db";
 	const backupFinding = (r: Report) => r.findings.find((x) => x.invariant === "stale-backup");
 
-	test("recent writes and an old copy: the 20:50 write is 32.8 h past the previous day's 12:00 copy, over the default 30 h (the 24 h copy interval plus 6 h); the text names both times and the directory", () => {
-		expect(BACKUP_GAP_MS).toBe(30 * 60 * 60_000);
+	test("recent writes and an old copy: the 20:50 write is 32.8 h past the previous day's 12:00 copy, over the default 3 h (about three runs of the hourly job); the text names both times and the directory", () => {
+		expect(BACKUP_GAP_MS).toBe(3 * 60 * 60_000);
 		const dir = copiesIn("backups-old", oldCopy);
 		const f = backupFinding(run({ replay: false, backups: { dir, gapMs: BACKUP_GAP_MS } }))!;
 		expect(f.key).toBe(`stale-backup:${oldCopy}`);
 		expect(f.workload).toBe("ledger");
 		expect(f.since).toBe("2026-10-10T12:00:00.000Z");
-		expect(f.text).toStartWith(`newest ledger write 2026-10-11T20:50:00.000Z is 32.8h newer than newest ledger backup 2026-10-10T12:00:00.000Z (${oldCopy}) in ${dir} (gap 30.0h): writes since then are in no copy.`);
+		expect(f.text).toStartWith(`newest ledger write 2026-10-11T20:50:00.000Z is 32.8h newer than newest ledger backup 2026-10-10T12:00:00.000Z (${oldCopy}) in ${dir} (gap 3.0h): writes since then are in no copy.`);
 		expect(f.text).not.toContain("replay");
 		expect(f.query).toContain(`ls ${dir}/ledger-*.db; `);
 	});
 
-	test("a quiet ledger and an old copy: three days after a 17:00 copy, the newest write (20:50) is 3.8 h past it, inside 30 h: no finding", () => {
-		const dir = copiesIn("backups-quiet", "ledger-2026-10-11T17-00-00.000Z.db");
+	test("a quiet ledger and an old copy: three days after an 18:30 copy, the newest write (20:50) is 2.3 h past it, inside 3 h: no finding", () => {
+		const dir = copiesIn("backups-quiet", "ledger-2026-10-11T18-30-00.000Z.db");
 		expect(backupFinding(run({ asOf: "2026-10-14T21:00:00.000Z", backups: { dir, gapMs: BACKUP_GAP_MS } }))).toBeUndefined();
 		// A copy after every write is never behind, whatever the gap.
 		expect(backupFinding(run({ asOf: "2026-10-14T21:00:00.000Z", backups: { dir: freshBackups, gapMs: 60_000 } }))).toBeUndefined();
@@ -438,7 +438,7 @@ describe("stale-backup: the newest write runs ahead of the newest copy by more t
 		const dir = copiesIn("backups-fallback-in", older);
 		wrongVersion(join(dir, rejected));
 		expect(copyProblem(join(dir, rejected))).toBe("user_version 0, not 5");
-		expect(backupFinding(run({ replay: false, backups: { dir, gapMs: BACKUP_GAP_MS } }))).toBeUndefined();
+		expect(backupFinding(run({ replay: false, backups: { dir, gapMs: 4 * 60 * 60_000 } }))).toBeUndefined();
 		// With a one-minute gap the 20:50 write is 3.8 h past the 17:00 copy, not 5 min before the rejected 20:55 one.
 		const f = backupFinding(run({ replay: false, backups: { dir, gapMs: 60_000 } }))!;
 		expect(f.key).toBe(`stale-backup:${older}`);
@@ -455,7 +455,7 @@ describe("stale-backup: the newest write runs ahead of the newest copy by more t
 		const f = backupFinding(run({ replay: false, backups: { dir, gapMs: BACKUP_GAP_MS } }))!;
 		expect(f.key).toBe(`stale-backup:${oldCopy}`);
 		expect(f.since).toBe("2026-10-10T12:00:00.000Z");
-		expect(f.text).toStartWith(`newest ledger write 2026-10-11T20:50:00.000Z is 32.8h newer than newest ledger backup 2026-10-10T12:00:00.000Z (${oldCopy}); not counted, not a complete copy: ${rejected} (${problem}) in ${dir} (gap 30.0h)`);
+		expect(f.text).toStartWith(`newest ledger write 2026-10-11T20:50:00.000Z is 32.8h newer than newest ledger backup 2026-10-10T12:00:00.000Z (${oldCopy}); not counted, not a complete copy: ${rejected} (${problem}) in ${dir} (gap 3.0h)`);
 	});
 
 	test("the CLI reads backups/<namespace> beside the ledger and takes --backup-gap in hours", () => {
@@ -471,12 +471,36 @@ describe("stale-backup: the newest write runs ahead of the newest copy by more t
 		const keysOf = (extra: string[]) => {
 			const p = spawnSync("bun", [SCRIPT, "--json", "--as-of", AS_OF, ...extra], { encoding: "utf8", env });
 			expect(p.status).toBe(0);
-			return p.stdout.trim().split("\n").map((l) => JSON.parse(l)).filter((l) => l.invariant === "stale-backup").map((l) => l.key);
+			return p.stdout.trim().split("\n").map((l) => JSON.parse(l)).filter((l) => l.invariant === "stale-backup" && l.key).map((l) => l.key);
 		};
 		expect(keysOf(["--backup-gap", "2"])).toEqual([`stale-backup:${copy}`]);
 		expect(keysOf([])).toEqual([]);
 		expect(() => parseArgs(["--backup-gap", "0"], "/r")).toThrow("positive number of hours");
 		expect(parseArgs(["--backup-gap", "6"], "/r").backupGapMs).toBe(6 * 60 * 60_000);
+	});
+
+	test("the off-disk mirror: none configured is a skip naming the config file, never a pass; a configured mirror is judged with the same gap under its own key", () => {
+		const none = { skipped: "no off-disk destination configured (/x/backup-offdisk-dir absent): every copy is on the ledger's own disk" };
+		const r = run({ replay: false, offDisk: none });
+		expect(skipsOf(r, "stale-backup")).toEqual([`off-disk copy: ${none.skipped}`]);
+		expect(backupFinding(r)).toBeUndefined();
+		const offDir = copiesIn("offdisk-old", oldCopy);
+		const stale = run({ replay: false, offDisk: { dir: offDir } }).findings.filter((x) => x.invariant === "stale-backup");
+		expect(stale.map((x) => x.key)).toEqual([`stale-backup:off-disk:${oldCopy}`]);
+		expect(stale[0]!.text).toStartWith(`newest ledger write 2026-10-11T20:50:00.000Z is 32.8h newer than newest off-disk ledger backup 2026-10-10T12:00:00.000Z (${oldCopy}) in ${offDir} (gap 3.0h): writes since then are in no off-disk copy.`);
+		// An unmounted mirror holds no copy: with a 2 h gap, the 18:00 to 20:50 writes (2.8 h) are in no off-disk copy.
+		expect(run({ replay: false, backups: { dir: freshBackups, gapMs: 2 * 60 * 60_000 }, offDisk: { dir: join(offDir, "unmounted") } }).findings.filter((x) => x.invariant === "stale-backup").map((x) => x.key)).toEqual(["stale-backup:off-disk:none"]);
+	});
+
+	test("offDiskInput: the config file beside the ledger names the destination; absent is a skip, a relative or multi-line path is a skip with the reason", () => {
+		const dir = tmp("offdisk-config");
+		const ledgerPath = join(dir, "ledger.db");
+		expect(offDiskInput(ledgerPath)).toEqual({ skipped: `no off-disk destination configured (${join(dir, "backup-offdisk-dir")} absent): every copy is on the ledger's own disk` });
+		writeFileSync(join(dir, "backup-offdisk-dir"), "/Volumes/Spare/as2\n");
+		expect(offDiskInput(ledgerPath)).toEqual({ dir: join("/Volumes/Spare/as2", backupNamespace(ledgerPath)) });
+		writeFileSync(join(dir, "backup-offdisk-dir"), "relative/dir\n");
+		const bad = offDiskInput(ledgerPath);
+		expect("skipped" in bad ? bad.skipped : bad.dir).toContain("must hold exactly one absolute directory path");
 	});
 });
 
@@ -506,6 +530,52 @@ describe("orchestratorsFromPs: a failed ps is a skip, a vanished pid is not", ()
 	});
 });
 
+describe("liveLanesFromPgrep: pgrep -fl, and ps -ww -o command= only for a line carrying just the process name (Linux procps), so a macOS line carrying the arguments never needs the setuid ps a Seatbelt fence refuses", () => {
+	const calls: string[][] = [];
+	const deps = (pgrepOut: string, ps: Run, alive = true): PsDeps => ({
+		available: () => true,
+		alive: () => alive,
+		run: (argv) => {
+			calls.push(argv);
+			return argv[0] === "pgrep" ? { exitCode: 0, stdout: pgrepOut, stderr: "" } : ps(argv);
+		},
+	});
+	const noPs: Run = (argv) => { throw new Error(`ps called: ${argv.join(" ")}`); };
+
+	// The match boundary is the two operands after the full phrase. The match is unanchored, so an
+	// editor line carrying the phrase and both operands counts as a lane: known, graded nonblocking in
+	// review, noted in the PR #74 body. These tests pin that, not an exclusion of arbitrary commands.
+	test("macOS: the full command line is on the pgrep -fl line, so ps is never called; a line missing the lane operand is ignored, one carrying both operands counts (unanchored)", () => {
+		calls.length = 0;
+		const out = [
+			"11 bun /Users/u/as2/surface/scripts/lane.ts run wl-a wl-a-lane-2",
+			"12 vim surface/scripts/lane.ts run wl-b",
+			"13 vim surface/scripts/lane.ts run wl-c wl-c-lane-1",
+		].join("\n");
+		expect(liveLanesFromPgrep(deps(`${out}\n`, noPs))).toEqual({ found: new Set(["wl-a wl-a-lane-2", "wl-c wl-c-lane-1"]) });
+		expect(calls).toEqual([["pgrep", "-fl", "surface/scripts/lane\\.ts run "]]);
+	});
+
+	test("Linux procps: a line with only the process name has its command line read from ps -ww (unlimited width), a long one whole; the same operand boundary applies", () => {
+		calls.length = 0;
+		const longRoot = `/home/u/${"deep/".repeat(40)}as2`;
+		const commands: Record<string, string> = {
+			"11": `bun ${longRoot}/surface/scripts/lane.ts run wl-a wl-a-lane-2`,
+			"12": "vim surface/scripts/lane.ts run wl-b",
+			"13": "vim surface/scripts/lane.ts run wl-c wl-c-lane-1",
+		};
+		const p = liveLanesFromPgrep(deps("11 bun\n12 vim\n13 vim\n", (argv) => ({ exitCode: 0, stdout: `${commands[argv.at(-1)!]}\n`, stderr: "" })));
+		expect(p).toEqual({ found: new Set(["wl-a wl-a-lane-2", "wl-c wl-c-lane-1"]) });
+		expect(calls.filter((a) => a[0] === "ps")).toEqual(["11", "12", "13"].map((pid) => ["ps", "-ww", "-o", "command=", "-p", pid]));
+	});
+
+	test("a name-only pid gone between pgrep and ps is left out; ps failing for a live pid is a skip", () => {
+		expect(liveLanesFromPgrep(deps("11 bun\n", () => ({ exitCode: 1, stdout: "", stderr: "" }), false))).toEqual({ found: new Set() });
+		expect(liveLanesFromPgrep(deps("11 bun\n", () => ({ exitCode: 1, stdout: "", stderr: "denied" }), true)))
+			.toEqual({ skipped: "ps failed: ps -ww -o command= -p 11 exited 1 while pid 11 is alive: denied" });
+	});
+});
+
 describe("output and the CLI", () => {
 	test("--json is one object per finding, then one per skipped invariant, each carrying asOf", () => {
 		const r = run();
@@ -532,10 +602,10 @@ describe("output and the CLI", () => {
 		const lines = p.stdout.trim().split("\n").map((l) => JSON.parse(l));
 		const byInvariant: Record<string, string[]> = {};
 		for (const l of lines.filter((l) => l.key)) (byInvariant[l.invariant as string] ??= []).push(l.key as string);
-		// No backups/ beside the temp ledger: the gap runs from the first write (18:00 to 20:50), inside the default 30 h.
+		// No backups/ beside the temp ledger: the gap runs from the first write (18:00 to 20:50), inside the default 3 h.
 		expect(Object.keys(byInvariant).sort()).toEqual(["dead-lane", "orphan-hand", "provider-refusal-loop", "stale-reserved", "stuck-question"]);
 		expect(byInvariant["stale-reserved"]).toEqual([`stale-reserved:${fixture.waiting.request}`]);
-		expect(lines.filter((l) => l.skipped).map((l) => l.invariant)).toEqual(["checkout-behind-main", "process-older-than-head", "ff-lull"]);
+		expect(lines.filter((l) => l.skipped).map((l) => l.invariant)).toEqual(["checkout-behind-main", "process-older-than-head", "ff-lull", "stale-backup"]);
 		expect(p.stderr).toContain(`as-of ${AS_OF} (REPLAY`);
 		expect(p.stderr).toContain("stale-reserved=1 stuck-question=1");
 	});
@@ -553,7 +623,7 @@ describe("output and the CLI", () => {
 		expect(reviews.stdout.trim().split("\n")).toEqual([expect.stringMatching(/^lanes-alive \d+ reviews-in-flight \d+/)]);
 		const table = spawnSync("bun", [SCRIPT, "--as-of", AS_OF], { encoding: "utf8", env });
 		expect(table.status).toBe(0);
-		expect(table.stdout).toMatch(/\n\d+ finding\(s\): dead-lane=1 silent-lane=0 orphan-hand=1 .* 3 skipped; \d+ ms\n$/);
+		expect(table.stdout).toMatch(/\n\d+ finding\(s\): dead-lane=1 silent-lane=0 orphan-hand=1 .* 4 skipped; \d+ ms\n$/);
 	});
 
 	test("a bad argument or a missing ledger exits 2 with the message", () => {

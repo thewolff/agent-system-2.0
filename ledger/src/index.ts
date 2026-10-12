@@ -59,12 +59,12 @@ export interface BackupPolicy {
 	 * named for the source ledger (`backupNamespace`), so ledgers sharing a root never share copies.
 	 */
 	dir?: string;
-	/** A copy is due when the newest is at least this old. Default 24 hours. */
+	/** A copy is due when the newest is at least this old. Default 55 minutes, so each hourly job run is due. */
 	intervalMs?: number;
-	/** Copies kept; older ones are removed after a new copy lands. Default 7. */
+	/** Copies kept; older ones are removed after a new copy lands. Default 48 (two days of hourly copies). */
 	keep?: number;
 }
-export const BACKUP_DEFAULTS = { intervalMs: 24 * 60 * 60 * 1000, keep: 7 } as const;
+export const BACKUP_DEFAULTS = { intervalMs: 55 * 60 * 1000, keep: 48 } as const;
 /** A scheduled copy's file name, `ledger-<ISO time with : as ->.db`; the groups rebuild the ISO time. */
 export const BACKUP_NAME = /^ledger-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2}\.\d{3}Z)\.db$/;
 /** `backup()`'s temporary snapshot beside a scheduled copy: `.<copy name>.<writer pid>-<random>.tmp[-wal|-shm|-journal]`. */

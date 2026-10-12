@@ -5,9 +5,10 @@
   user agent. TEMPLATE: install/install.sh fills the upper-case placeholder values (XML-escaped)
   and writes the result to $HOME/Library/LaunchAgents/com.agent-system-2.ledger-backup.plist. It
   never loads it; the load and unload commands are in ledger/SCHEMA.md ("Scheduled second copy").
-  Every hour (and once at load) launchd runs the backup job, which takes a copy only when the
-  ledger's newest copy is a day old, and exits nonzero when a due copy fails. PATH is set because
-  the locality check runs df.
+  Every hour (and once at load) launchd runs the backup job, which takes a copy when the ledger's
+  newest copy is 55 minutes old (so each hourly run is due), keeps the newest 48, mirrors the newest
+  to the off-disk destination when backup-offdisk-dir beside the ledger names one, and exits
+  nonzero when a due copy or the mirror fails. PATH is set because the locality check runs df.
 -->
 <plist version="1.0">
 <dict>

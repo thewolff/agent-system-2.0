@@ -521,8 +521,9 @@ else
 	set -e
 	printf 'job -> exit %s: %s\n' "$status" "$out"
 	[ "$status" -eq 0 ] || die "the backup job exited $status against an open writer"
-	TAKEN="${out#backup ok: took }"
-	[ "$TAKEN" != "$out" ] && [ -f "$TAKEN" ] || die "the backup job did not take a copy"
+	# The job prints the copy on its first line, then the off-disk line.
+	TAKEN="$(printf '%s\n' "$out" | sed -n '1s/^backup ok: took //p')"
+	[ -n "$TAKEN" ] && [ -f "$TAKEN" ] || die "the backup job did not take a copy"
 	[ "$("$SQLITE3" "$TAKEN" "SELECT brief FROM workloads WHERE id = 'wl-writer';")" = "written by the open writer" ] \
 		|| die "the copy does not hold the open writer's row"
 	ok "the job took $TAKEN while the writer was open; it holds the writer's row"
