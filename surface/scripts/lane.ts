@@ -7,9 +7,10 @@
 //                                        spawn `run` detached; prints `lane <laneId> runner <pid>`
 //   run <wl> <laneId>                    the runner: one `omp --mode rpc --no-ui` child, the first prompt and
 //                                        up to CONTINUE_LIMIT continue prompts on it, lane-started:/lane-ready:/
-//                                        lane-exit:, the turn-end decision once omp is settled (src/turn-end.ts),
-//                                        stop requests, its own deadline and the ceiling meter (spend:, the 80 %
-//                                        question, the 100 % stop) polled every STOP_POLL_MS. It first takes the
+//                                        lane-exit:, the turn-end decision once omp is settled while the lane holds
+//                                        the workload (src/turn-end.ts; decided at once after a release or a close,
+//                                        MIGRATION.md item 112), stop requests, its own deadline and the ceiling meter
+//                                        (spend:, the 80 % question, the 100 % stop) polled every STOP_POLL_MS. It first takes the
 //                                        lane id's run lock (takeRunnerLock, one owner per lane id) and then checks
 //                                        the recorded omp and runner pids (liveRunnerOf); a lane id held or running,
 //                                        or one whose owner ps could not verify, exits 7 (held) before any ledger
@@ -20,10 +21,12 @@
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy, then
 //                                        omp in the TUI in the foreground (--model when Jo named one, --resume
 //                                        when recorded on that same model)
-//   stop <wl>                            write the lane-stop: request; wait for lane-exit:; with no
-//                                        runner alive, accept, end omp (SIGTERM, then SIGKILL after the
-//                                        grace, each only while the pid's start time matches
-//                                        lane-started:), release only once it is gone
+//   stop <wl> [<laneId>]                 write the lane-stop: request (the holder, or the named lane); wait for
+//                                        lane-exit:; with no runner alive, accept, end omp (SIGTERM, then SIGKILL
+//                                        after the grace, each only while the pid's start time matches
+//                                        lane-started:), release only once it is gone. On a closed workload the
+//                                        ledger takes no entry: SIGTERM the runner while its command line is
+//                                        still `lane.ts run <wl> <laneId>`, then verify omp gone (item 112)
 //   cleanup <wl>                         remove the worktree when clean and pushed; keep the branch
 //   log <wl>                             print the runner log path and tail it
 //   ctx-index <wl> <laneId> --by runner|starter
@@ -56,7 +59,7 @@ import {
 	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
-	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
+	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, type RecordedLaneStart, resolutions, resumePlan, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, type PromptError, promptErrorOf, releasedOpen, sliceCounts, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
@@ -1054,6 +1057,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	let heldOpenSent = false;
 	/** The get_state id the hold sends once the hands settled: its `isSettled` is omp's word that no woken turn is running (D1). */
 	const SETTLE_CHECK = "settle-check";
+	/** omp is inside a run: between an `agent_start` and the next `agent_end` frame (a woken turn included). */
+	let agentRunning = false;
 	const timers: ReturnType<typeof setTimeout>[] = [];
 	const send = (frame: Frame): void => {
 		if (child && !ended) child.stdin.write(`${JSON.stringify(frame)}\n`);
@@ -1142,6 +1147,15 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		}
 		try {
 			const { workload: cur, control } = controlNow();
+			// A closed workload refuses every entry (the ledger's insert triggers), so the exit can only be logged here; the
+			// freed slot still starts the queue and the sessions are still indexed (MIGRATION.md item 112).
+			if (cur?.status === "closed") {
+				const final = outcome ?? "completed";
+				process.stderr.write(`runner: ${wl} closed at ${cur.closed_at ?? "-"}; ${laneId} ended ${final} (omp exit code ${code ?? "-"} signal ${signal ?? "-"}); no lane-exit: line, the ledger refuses entries on a closed workload\n`);
+				spawnDrain(wl, laneId);
+				spawnCtxIndex(wl, laneId, "runner");
+				return;
+			}
 			const held = cur !== null && cur.status === "open" && cur.holder === laneId;
 			// omp exited before the runner decided: a release with this lane's released-open: marker is still open-work (D4).
 			const exit = outcome === null ? exitOutcome(laneId, { ready, held, releasedOpen: releasedOpenNow() }) : null;
@@ -1224,10 +1238,12 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	 * The runner decides the outcome and records it before EOF (`recordDecision`): a death enqueues its lane-died:, whatever
 	 * the holder, so the lane's session_shutdown finds it (D5) and a release cannot hide it (D3); an intended outcome records
 	 * `lane-decided:` so the shutdown reads the end as intended. The death body is kept for finish()'s retry. Then EOF.
+	 * A workload the decision already read as closed takes no entry (MIGRATION.md item 112), so nothing is attempted; a close
+	 * racing the write still lands in recordDecision's own catches (PR #75 review N1).
 	 */
-	const conclude = (final: LaneOutcome, death: string | null): void => {
+	const conclude = (final: LaneOutcome, death: string | null, closed = false): void => {
 		outcome = final;
-		recordDecision(ledger, { workloadId: wl, laneId, outcome: final, death, settled });
+		if (!closed) recordDecision(ledger, { workloadId: wl, laneId, outcome: final, death, settled });
 		if (death !== null) decidedDeath = settled ? death : `${death}${BACKGROUND_SUFFIX}`;
 		end();
 	};
@@ -1245,6 +1261,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				unsettledHands: unsettledHandsOf(entries, ledger.routings(wl), laneId),
 				held: cur !== null && cur.status === "open" && cur.holder === laneId,
 				handedOff: cur?.holder === JO_HOLDER,
+				closed: cur?.status === "closed",
 				releasedOpen: releasedOpen(controlEntries(entries, holders), laneId),
 				receipt: doneBecause(entries, holders) !== null,
 				slices: sliceCounts(ledger.slices(wl)),
@@ -1269,7 +1286,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 						process.stderr.write(`runner: the held-open message could not be written: ${String(err)}\n`);
 					}
 				}
-			} else conclude(t.decision, turnEndDeathBody(laneId, t, input));
+			} else conclude(t.decision, turnEndDeathBody(laneId, t, input), input.closed === true);
 		} catch (err) {
 			process.stderr.write(`runner: the turn-end decision failed: ${String(err)}\n`);
 			conclude("error", turnEndFailedDeathBody(laneId, String(err)));
@@ -1417,6 +1434,15 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					holding = false;
 					send({ id: SETTLE_CHECK, type: "get_state" });
 				}
+				// The lane no longer holds its workload (released, handed off, closed, its lease taken) and omp is between runs:
+				// background work or a hand keeps nothing the lane can still do, so the turn is decided now (MIGRATION.md item
+				// 112). OMP 18.8.6 only latches the shutdown lane_release / lane_handoff request and acts on it at the next client
+				// frame, which a waiting runner never sends, and the session_settled it waits for may never come.
+				if ((awaitingSettle || holding) && outcome === null && current === null && !agentRunning && !(cur !== null && cur.status === "open" && cur.holder === laneId)) {
+					awaitingSettle = false;
+					holding = false;
+					decideTurn();
+				}
 				// Renew the lease while ready and alive (the lane row renews too; this covers a lane whose timer stalled).
 				if (ready && outcome === null && cur && cur.holder === laneId) {
 					const n = Number(process.env[LEASE_MS_ENV]);
@@ -1465,6 +1491,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					rerecord = true;
 				}
 				if (rerecord) record(startRecord());
+				if (o.type === "agent_start") agentRunning = true;
+				else if (o.type === "agent_end") agentRunning = false;
 				// A turn ends (B2) at the prompt_result for the prompt this runner sent, its status kept; agent_end is not an end.
 				if (o.type === "prompt_result" && o.id === current && outcome === null) {
 					current = null;
@@ -1475,8 +1503,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					else {
 						if (status !== "completed") failedStatus ??= status === "aborted" ? "aborted" : "error";
 						if (status === "error") promptError ??= promptErrorOf(o);
-						if (settled) decideTurn();
-						else awaitingSettle = true;
+						// Unsettled, turnEnd waits only while the lane still holds the workload (D1, item 112).
+						decideTurn();
 					}
 				}
 				if (o.type === "session_settled" && awaitingSettle && outcome === null) {
@@ -1484,15 +1512,10 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					settled = true;
 					decideTurn();
 				}
-				// The hold's settle check: decide now, or wait for the woken turn's session_settled.
+				// The hold's settle check: decide now, or (still held) wait for the woken turn's session_settled.
 				if (o.type === "response" && o.id === SETTLE_CHECK && outcome === null) {
-					if (data?.isSettled === false) {
-						settled = false;
-						awaitingSettle = true;
-					} else {
-						settled = true;
-						decideTurn();
-					}
+					settled = data?.isSettled !== false;
+					decideTurn();
 				}
 			}
 		}
@@ -1607,18 +1630,24 @@ async function cmdInteractive(wl: string): Promise<number> {
 
 // ---- stop, cleanup, log ------------------------------------------------------------------------------
 
-async function cmdStop(wl: string): Promise<number> {
+/**
+ * `stop <wl> [<laneId>]`: the holder lane (or the newest lane-started:) unless a lane is named; a named lane that no
+ * longer holds the workload still answers its own stop request (MIGRATION.md item 112).
+ */
+async function cmdStop(wl: string, only?: string): Promise<number> {
+	if (only !== undefined && !/^lane-\S+-\d+$/.test(only)) throw new Fail("stop", `${only} is not a lane id`, 1);
 	const ledger = openLedger();
 	const w = ledger.workload(wl);
 	if (!w) throw new Fail("stop", `no workload ${wl}`, 1);
 	const es = ledger.entries(wl);
 	const control = controlEntries(es, holdersOf(es, w.holder));
-	const started = laneStarted(control);
-	const laneId = w.holder?.startsWith("lane-") ? w.holder : started?.laneId ?? null;
+	const started = laneStarted(control, only);
+	const laneId = only ?? (w.holder?.startsWith("lane-") ? w.holder : started?.laneId ?? null);
 	if (!laneId) {
 		line(`${wl} has no lane to stop (holder ${w.holder ?? "nobody"})`);
 		return 0;
 	}
+	if (w.status === "closed") return stopClosedLane(wl, laneId, w.closed_at, started?.laneId === laneId ? started : null);
 	const req = ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStopRequestBody(laneId, "as2-lane-stop", "jo") });
 	line(`stop requested of ${laneId} (entry ${req}); waiting for lane-exit:`);
 	const runnerAlive = started !== null && started.runnerPid > 0 && startTime(started.runnerPid) !== null;
@@ -1657,6 +1686,58 @@ async function cmdStop(wl: string): Promise<number> {
 	// may never finalize); the claim keeps a late supervisor's worker from repeating it.
 	if (r.wrote) spawnCtxIndex(wl, laneId, "starter");
 	line(r.released ? `released ${wl} from ${laneId}` : `${wl} is held by ${r.holder ?? "nobody"}, not ${laneId}; nothing released`);
+	return 0;
+}
+
+/** `pid`'s command line runs `lane.ts run <wl> <laneId>` (a recycled pid, or another lane's runner, does not); a ps that fails or passes PS_TIMEOUT_MS (`runPs`) reads as not. */
+function runsLane(pid: number, wl: string, laneId: string): boolean {
+	let r: PsResult;
+	try {
+		r = runPs(["-p", String(pid), "-o", "command="]);
+	} catch {
+		return false;
+	}
+	if (r.exitCode !== 0) return false;
+	const t = r.stdout.trim().split(/\s+/);
+	const i = t.findIndex((x) => x.endsWith("lane.ts"));
+	return i >= 0 && t[i + 1] === "run" && t[i + 2] === wl && t[i + 3] === laneId;
+}
+
+/**
+ * A closed workload's lane (MIGRATION.md item 112): the ledger refuses the stop request and the exit, so the runner is
+ * sent SIGTERM by hand, only while its pid still runs this lane; its signal stop aborts omp, ends omp's stdin and kills
+ * omp after the grace. Then omp is verified gone against lane-started:'s start time. Nothing reaches the ledger.
+ */
+async function stopClosedLane(wl: string, laneId: string, closedAt: string | null, started: RecordedLaneStart | null): Promise<number> {
+	line(`${wl} closed at ${closedAt ?? "-"}; the ledger refuses a stop request, so ${laneId} is stopped by signal`);
+	if (started === null) {
+		line(`${laneId} recorded no lane-started:; nothing to stop`);
+		return 0;
+	}
+	const runner = started.runnerPid;
+	if (runner > 0 && runsLane(runner, wl, laneId)) {
+		try {
+			process.kill(runner, "SIGTERM");
+		} catch {
+			// ESRCH: it ended between the check and the signal
+		}
+		const deadline = Date.now() + END_GRACE_MS + 15_000;
+		while (runsLane(runner, wl, laneId) && Date.now() < deadline) await Bun.sleep(200);
+		if (runsLane(runner, wl, laneId)) {
+			process.stderr.write(`lane stop: runner pid ${runner} of ${laneId} survived SIGTERM for ${Math.round((END_GRACE_MS + 15_000) / 1000)} s; not killed, so its omp is not orphaned\n`);
+			return 1;
+		}
+		line(`runner pid ${runner} of ${laneId} ended after SIGTERM`);
+	} else line(`runner pid ${runner} is not running lane.ts run ${wl} ${laneId}; not signalled`);
+	if (started.pid > 0) {
+		const ended = await endRecorded(started.pid, started.start);
+		if (ended === "unverifiable" || ended === "survived") {
+			process.stderr.write(`lane stop: omp pid ${started.pid} ${ended === "survived" ? "survived SIGTERM and SIGKILL" : "is alive and lane-started: recorded no start time to verify it against"}\n`);
+			return 1;
+		}
+		line(ended === "gone" ? `omp pid ${started.pid} is gone` : ended === "other" ? `omp pid ${started.pid} has a different start time; not signalled` : `omp pid ${started.pid} ended after ${ended}`);
+	}
+	line(`no lane-exit: written for ${laneId}: the ledger refuses entries on a closed workload`);
 	return 0;
 }
 
@@ -1745,7 +1826,7 @@ async function main(argv: string[]): Promise<number> {
 		case "interactive":
 			return cmdInteractive(wl);
 		case "stop":
-			return cmdStop(wl);
+			return cmdStop(wl, rest[0]);
 		case "cleanup":
 			return cmdCleanup(wl);
 		case "log":

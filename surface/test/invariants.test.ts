@@ -15,6 +15,7 @@ import { Database } from "bun:sqlite";
 import { backupNamespace, copyProblem, Ledger } from "../../ledger/src/index";
 import { canonicalPath } from "../../ledger/src/locality";
 import { laneExitBody } from "../src/launch";
+import { SURFACE_BY } from "../src/types";
 import { reservedStates } from "../src/errors";
 import { BACKUP_GAP_MS, check, gitIn, type Git, type Input, jsonLines, newestWrite, orchestratorsFromPs, parseArgs, type Probe, type PsDeps, renderTable, type Report, reservedView, reviewsLine, type Run } from "../scripts/invariants";
 import { AS_OF, buildFixture, LANE_RUNNER } from "./fixtures/invariants/build";
@@ -109,7 +110,7 @@ describe("the ledger invariants over the fixture (as-of, one lane alive)", () =>
 	test("replay skips the three git/process invariants with the reason, and the report says so", () => {
 		for (const i of ["checkout-behind-main", "process-older-than-head", "ff-lull"]) expect(skipsOf(r, i)).toEqual([expect.stringContaining("replay (--as-of)")]);
 		expect(renderTable(r)).toContain("[checkout-behind-main] skipped: replay");
-		expect(renderTable(r)).toContain("6 finding(s): dead-lane=1 silent-lane=0 orphan-hand=1"); // + stale-reserved, stuck-question, provider-refusal-loop, silent-orchestrator
+		expect(renderTable(r)).toContain("6 finding(s): dead-lane=1 silent-lane=0 leaked-runner=0 orphan-hand=1"); // + stale-reserved, stuck-question, provider-refusal-loop, silent-orchestrator
 	});
 });
 
@@ -219,6 +220,77 @@ describe("silent-lane: alive, lease held, nothing written for 45 min", () => {
 	test("with no lane directory the ledger alone decides, and the text says no transcript", () => {
 		const r = run({ liveLanes: alive, lanesDirOf: () => "/nonexistent/lanes" });
 		expect(r.findings.find((x) => x.invariant === "silent-lane")!.text).toContain("silent 2.5h (last transcript write none)");
+	});
+});
+
+describe("leaked-runner: a runner alive more than 10 min after its lane ended (MIGRATION.md item 112)", () => {
+	const copy = buildFixture(join(tmp("leak"), "ledger.db"));
+	let now = "2026-10-11T19:00:00.000Z";
+	const w = Ledger.open(copy.path, { backup: false, backupOnOpen: false, clock: () => now, skipLocalityCheck: true });
+	const at = (hm: string, write: () => void) => {
+		now = `2026-10-11T${hm}:00.000Z`;
+		write();
+	};
+	const started = (wl: string, lane: string) => w.recordEntry({ by: LANE_RUNNER, workloadId: wl, kind: "assumption", body: `lane-started: ${lane} {"pid":1,"start":"","session":null,"argv":[],"runnerPid":2}` });
+	const open = (id: string) => w.openWorkload({ by: "orchestrator", brief: id, stakes: "normal", mode: "autonomous", id });
+	// Closed 60 min before as-of; closed 5 min before; closed after as-of; superseded at 19:30; started after as-of.
+	const closed = open("wl-fixture-leak-closed");
+	const recent = open("wl-fixture-leak-recent");
+	const later = open("wl-fixture-leak-later");
+	const superseded = open("wl-fixture-leak-superseded");
+	const future = open("wl-fixture-leak-future");
+	// A starts, B supersedes it, then A's metadata rerecord lands after B's start (PR #75 review B1).
+	const rerecord = open("wl-fixture-leak-rerecord");
+	at("19:10", () => {
+		started(closed, "lane-fixture-leak-closed-1");
+		started(recent, "lane-fixture-leak-recent-1");
+		started(later, "lane-fixture-leak-later-1");
+		started(superseded, "lane-fixture-leak-superseded-1");
+		started(rerecord, "lane-fixture-leak-rerecord-a");
+	});
+	at("19:20", () => started(superseded, "lane-fixture-leak-superseded-1")); // the runner's second record (with the session): not a successor
+	at("19:30", () => {
+		started(superseded, "lane-fixture-leak-superseded-2");
+		started(rerecord, "lane-fixture-leak-rerecord-b");
+	});
+	at("19:40", () => started(rerecord, "lane-fixture-leak-rerecord-a")); // A's metadata rerecord, after B started: still not B's successor
+	at("20:00", () => w.closeWorkload(closed, { by: SURFACE_BY }));
+	at("20:55", () => w.closeWorkload(recent, { by: SURFACE_BY }));
+	at("21:30", () => {
+		w.closeWorkload(later, { by: SURFACE_BY });
+		started(future, "lane-fixture-leak-future-1");
+	});
+	w.close();
+	const ro = new Database(copy.path, { readonly: true });
+	afterAll(() => ro.close());
+	const all = live(
+		`${closed} lane-fixture-leak-closed-1`, `${recent} lane-fixture-leak-recent-1`, `${later} lane-fixture-leak-later-1`,
+		`${superseded} lane-fixture-leak-superseded-1`, `${superseded} lane-fixture-leak-superseded-2`, `${future} lane-fixture-leak-future-1`,
+	);
+	const leaks = (r: Report) => r.findings.filter((f) => f.invariant === "leaked-runner");
+
+	test("a runner on a workload closed 60 min ago and a runner superseded by a later lane 90 min ago fire; one closed 5 min ago, one closed after as-of, the superseding lane and one started after as-of do not", () => {
+		const found = leaks(run({ db: ro, liveLanes: all }));
+		expect(found.map((f) => [f.key, f.workload, f.since])).toEqual([
+			["leaked-runner:lane-fixture-leak-closed-1", closed, "2026-10-11T20:00:00.000Z"],
+			["leaked-runner:lane-fixture-leak-superseded-1", superseded, "2026-10-11T19:30:00.000Z"],
+		]);
+		expect(found[0]!.text).toBe(`the runner of lane-fixture-leak-closed-1 is alive 60 min after its lane ended (${closed} closed at 2026-10-11T20:00:00.000Z), holding its omp for nothing; stop it with \`as2 lane stop ${closed} lane-fixture-leak-closed-1\``);
+		expect(found[1]!.text).toContain("(lane-fixture-leak-superseded-2 started at 2026-10-11T19:30:00.000Z)");
+		expect(found[0]!.query).toContain(`pgrep -fl 'surface/scripts/lane.ts run ${closed} lane-fixture-leak-closed-1'`);
+	});
+
+	test("an old lane's metadata rerecord landing after its successor started does not make the successor leaked: only the old lane fires, ended at the successor's first start", () => {
+		const found = leaks(run({ db: ro, liveLanes: live(`${rerecord} lane-fixture-leak-rerecord-a`, `${rerecord} lane-fixture-leak-rerecord-b`) }));
+		expect(found.map((f) => [f.key, f.workload, f.since])).toEqual([["leaked-runner:lane-fixture-leak-rerecord-a", rerecord, "2026-10-11T19:30:00.000Z"]]);
+		expect(found[0]!.text).toContain("(lane-fixture-leak-rerecord-b started at 2026-10-11T19:30:00.000Z)");
+	});
+
+	test("past the later close, the closed-after-as-of runner fires too; with no process table the invariant is skipped with the probe's reason", () => {
+		expect(leaks(run({ db: ro, liveLanes: all, asOf: "2026-10-11T22:00:00.000Z" })).map((f) => f.key)).toContain("leaked-runner:lane-fixture-leak-later-1");
+		const r = run({ db: ro, liveLanes: { skipped: "pgrep -fl … exited 2: pgrep: cannot read /proc" } });
+		expect(skipsOf(r, "leaked-runner")).toEqual([expect.stringContaining("pgrep: cannot read /proc")]);
+		expect(leaks(r)).toEqual([]);
 	});
 });
 
@@ -553,7 +625,7 @@ describe("output and the CLI", () => {
 		expect(reviews.stdout.trim().split("\n")).toEqual([expect.stringMatching(/^lanes-alive \d+ reviews-in-flight \d+/)]);
 		const table = spawnSync("bun", [SCRIPT, "--as-of", AS_OF], { encoding: "utf8", env });
 		expect(table.status).toBe(0);
-		expect(table.stdout).toMatch(/\n\d+ finding\(s\): dead-lane=1 silent-lane=0 orphan-hand=1 .* 3 skipped; \d+ ms\n$/);
+		expect(table.stdout).toMatch(/\n\d+ finding\(s\): dead-lane=1 silent-lane=0 leaked-runner=0 orphan-hand=1 .* 3 skipped; \d+ ms\n$/);
 	});
 
 	test("a bad argument or a missing ledger exits 2 with the message", () => {

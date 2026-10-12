@@ -9,13 +9,14 @@
 // never writing lane-died:.
 import { afterAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "bun";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, type QuestionRow } from "../../ledger/src/index";
 import { ceilingBody, CEILING_OPTIONS, parseSpend } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
-import { branchName, type ControlEntry, doneBody, laneCap, laneDir, laneEnv, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, verdictOf, worktreePath } from "../src/launch";
+import { branchName, type ControlEntry, doneBody, laneCap, laneDir, laneEnv, laneExit, laneExitBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, verdictOf, worktreePath } from "../src/launch";
 // A namespace import, not named ones: a name lane.ts stops exporting fails only the test that calls it, not the module load.
 import * as laneScript from "../scripts/lane";
 import { SURFACE_BY } from "../src/types";
@@ -1057,6 +1058,92 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		expect(snap.deaths).toEqual([`lane-died: ${laneId}: released with 1 open slice(s), no done-because`]);
 		expect(promptsOf(r)).toHaveLength(1);
 		expect(eventsOf(r, promptsOf(r)[0]!.pid)).toContain("background-done");
+	}, 60_000);
+
+	// MIGRATION.md item 112, the leaked lanes of 2026-10-12: lane_release asks omp to shut down, OMP 18.8.6's rpc mode only
+	// latches that until the next client frame (deferShutdown), and the session_settled the runner waited for never came.
+	test("item 112: lane_release in the prompt with a background job still pending, omp only latching the shutdown → the runner decides at the unsettled prompt_result: EOF, completed, no wait for session_settled", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r);
+		setScript(r, { deferShutdown: true, steps: [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }, { tool: "lane_release", args: {} }, { background: "never" }] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "completed" });
+		const events = eventsOf(r, promptsOf(r)[0]!.pid);
+		expect(events).toContain("eof");
+		expect(events).toContain("background-killed");
+		expect(promptsOf(r)).toHaveLength(1);
+		expect(laneSnapshot(r, wl).deaths).toEqual([]);
+	}, 60_000);
+
+	test("item 112: a woken turn releases, omp only latches the shutdown and never sends session_settled, the surface closes the workload → the runner ends within a stop poll, omp gets EOF, and runner.log says why no lane-exit: was written", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r);
+		setScript(r, {
+			deferShutdown: true,
+			neverSettle: true,
+			prompts: [[{ background: 1000 }], [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }, { tool: "lane_release", args: {} }, { sleepMs: 3000 }]],
+		});
+		const laneId = launched(r, wl);
+		const started = (await startedOf(r, wl, laneId))!;
+		await until("the lane's release", () => {
+			const w = laneSnapshot(r, wl).workload;
+			return w !== null && w.holder === null && laneSnapshot(r, wl).bodies.some((b) => b.includes("done-because:"));
+		});
+		const l = ledgerOf(r);
+		try {
+			l.closeWorkload(wl, { by: SURFACE_BY });
+		} finally {
+			l.close();
+		}
+		await until("the runner's exit", () => !alive(started.runnerPid), 30_000);
+		expect(alive(started.pid)).toBe(false);
+		expect(eventsOf(r, started.pid)).toContain("eof");
+		expect(laneExit(laneSnapshot(r, wl).control, laneId)).toBeNull();
+		const log = readFileSync(join(laneDir(wl, r.home), "runner.log"), "utf8");
+		expect(log).toContain(`${laneId} ended completed`);
+		// The runner saw the workload closed, so it attempts no decision write the ledger would refuse (PR #75 review N1).
+		expect(log).not.toContain("could not be written");
+		expect(log).not.toContain("could not be withdrawn");
+	}, 60_000);
+
+	test("item 112: `lane.ts stop <wl> <lane>` on a closed workload signals the lane's runner only while its command line is `lane.ts run <wl> <lane>`, then ends the recorded omp; a lane whose runner pid runs something else is not signalled; nothing is written", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r);
+		const dummy = join(r.root, "dummy", "lane.ts");
+		mkdirSync(join(r.root, "dummy"), { recursive: true });
+		// The runner stand-in blocks on its stdin pipe, which this test holds open until the stop signals it.
+		writeFileSync(dummy, "await Bun.stdin.stream().getReader().read();\n");
+		const lane1 = laneIdOf(wl, 1);
+		const lane2 = laneIdOf(wl, 2);
+		const runner = spawn(["bun", dummy, "run", wl, lane1], { stdio: ["pipe", "ignore", "ignore"] });
+		const omp = spawn(["sleep", "300"], { stdio: ["ignore", "ignore", "ignore"] });
+		const bystander = spawn(["sleep", "301"], { stdio: ["ignore", "ignore", "ignore"] });
+		try {
+			await until("the dummy runner's command line", () => laneScript.startTime(runner.pid) !== null);
+			const l = ledgerOf(r);
+			try {
+				const start = laneScript.startTime(omp.pid) ?? "";
+				l.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(lane1, { pid: omp.pid, start, session: null, argv: [], runnerPid: runner.pid }) });
+				l.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(lane2, { pid: 0, start: "", session: null, argv: [], runnerPid: bystander.pid }) });
+				l.closeWorkload(wl, { by: SURFACE_BY });
+			} finally {
+				l.close();
+			}
+			const before = laneSnapshot(r, wl).bodies.length;
+			const other = lane(r, ["stop", wl, lane2]);
+			expect(other.code).toBe(0);
+			expect(other.out).toContain(`runner pid ${bystander.pid} is not running lane.ts run ${wl} ${lane2}; not signalled`);
+			expect(alive(bystander.pid)).toBe(true);
+			const stopped = lane(r, ["stop", wl, lane1]);
+			expect(stopped.code).toBe(0);
+			expect(stopped.out).toContain(`runner pid ${runner.pid} of ${lane1} ended after SIGTERM`);
+			expect(stopped.out).toContain(`omp pid ${omp.pid} ended after SIGTERM`);
+			expect(stopped.out).toContain(`no lane-exit: written for ${lane1}`);
+			await until("both recorded processes gone", () => !alive(runner.pid) && !alive(omp.pid), 10_000);
+			expect(laneSnapshot(r, wl).bodies).toHaveLength(before);
+		} finally {
+			for (const p of [runner, omp, bystander]) p.kill("SIGKILL");
+		}
 	}, 60_000);
 
 	/** The `isSettled` of each settle-check get_state reply in the runner's frames file (D6's hold → settle → decide). */

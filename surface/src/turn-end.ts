@@ -18,9 +18,9 @@ export const CONTINUE_LIMIT = 2;
 export const BACKGROUND_SUFFIX = "; background work was in flight";
 
 /**
- * - `wait`: omp reported background work; nothing until `session_settled` (D1).
+ * - `wait`: omp reported background work while the lane holds the workload; nothing until `session_settled` (D1).
  * - `continue`: send a continue prompt on the same omp (D2 step 6, D6 step 0).
- * - `hold`: a hand of this lane is unsettled and the continue prompts are spent: keep omp, poll the ledger (D6).
+ * - `hold`: the lane holds the workload, a hand of it is unsettled and the continue prompts are spent: keep omp, poll the ledger (D6).
  * - the rest are the lane's outcome; `open-work`, `error` and `aborted` are deaths.
  */
 export type TurnEndDecision = "wait" | "hold" | "continue" | "parked" | "resume-pending" | "completed" | "released" | "open-work" | "error" | "aborted";
@@ -48,6 +48,8 @@ export interface TurnEndInput {
 	held: boolean;
 	/** The holder is Jo: the lane called lane_handoff (D2 step 1). */
 	handedOff: boolean;
+	/** The workload is closed (absent reads as open): no entry can be written for it any more (MIGRATION.md item 112). */
+	closed?: boolean;
 	/** The open-slice count this lane's `released-open:` marker names, or null when it wrote none (D4). */
 	releasedOpen: number | null;
 	/** A holder's `done-because:` stands. */
@@ -89,11 +91,19 @@ export interface TurnEnd {
 	parkError: string | null;
 }
 
-/** The turn-end decision (D2), step 0 (D6) first and the handoff before the park. */
+/**
+ * The turn-end decision (D2), step 0 (D6) first and the handoff before the park. Background work (D1) and an unsettled
+ * hand (D6) keep the turn only while the lane holds the workload: after a release or handoff every lane tool refuses, so
+ * nothing omp still runs is lane work, and waiting on it leaked runners for hours (MIGRATION.md item 112). A closed
+ * workload completes the lane before anything that would write.
+ */
 export function turnEnd(i: TurnEndInput): TurnEnd {
 	const decided = (decision: TurnEndDecision): TurnEnd => ({ decision, parkError: null });
-	if (!i.settled) return decided("wait");
-	if (i.unsettledHands.length > 0) return decided(i.continues < i.limit ? "continue" : "hold");
+	if (i.held) {
+		if (!i.settled) return decided("wait");
+		if (i.unsettledHands.length > 0) return decided(i.continues < i.limit ? "continue" : "hold");
+	}
+	if (i.closed) return decided("completed");
 	if (i.handedOff) return decided("released");
 	if (i.status !== "completed") return decided(i.status);
 	let park: { parked: false } | { parked: true; open: number };

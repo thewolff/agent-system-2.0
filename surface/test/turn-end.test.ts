@@ -113,6 +113,26 @@ describe("turn end: the decision order (D1, D6 step 0, D2)", () => {
 		expect(turnEnd(input({ slices: none }).i).decision).toBe("continue");
 		expect(turnEnd(input({ slices: none, continues: 2 }).i).decision).toBe("open-work");
 	});
+
+	test("item 112: a lane that no longer holds its workload (released, handed off, closed, lease lost) is decided even while omp reports background work or a hand unsettled — never wait or hold", () => {
+		// The leak, 2026-10-12: lane_release / lane_handoff request omp's shutdown, OMP 18.8.6 rpc only latches it, and no
+		// session_settled followed; a wait here kept the runner and its omp alive for hours on closed workloads.
+		expect(turnEnd(input({ settled: false, held: false }).i).decision).toBe("completed");
+		expect(turnEnd(input({ settled: false, held: false, releasedOpen: 1 }).i).decision).toBe("open-work");
+		expect(turnEnd(input({ settled: false, held: false, handedOff: true }).i).decision).toBe("released");
+		for (const continues of [0, 2]) expect(turnEnd(input({ held: false, unsettledHands: [HAND], continues }).i).decision).toBe("completed");
+		// Still held: D1 and D6 stand as before.
+		expect(turnEnd(input({ settled: false }).i).decision).toBe("wait");
+		expect(turnEnd(input({ unsettledHands: [HAND], continues: 2 }).i).decision).toBe("hold");
+	});
+
+	test("item 112: a closed workload completes the lane before the status, the park or the release marker are read, so the runner writes nothing the ledger refuses", () => {
+		for (const status of ["completed", "error", "aborted"] as const) {
+			const { i, calls } = input({ held: false, closed: true, settled: false, status, releasedOpen: 1 }, { parked: true, open: 1 });
+			expect(turnEnd(i).decision).toBe("completed");
+			expect(calls).toHaveLength(0);
+		}
+	});
 });
 
 describe("turn end: the texts", () => {

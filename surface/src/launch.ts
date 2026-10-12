@@ -467,8 +467,10 @@ const stringOrNull = (v: object, key: string): string | null => {
 	return typeof x === "string" ? x : null;
 };
 
+/** A parsed `lane-started:` with the lane it names and its model fields. */
+export type RecordedLaneStart = LaneStarted & { laneId: string; model: string | null; ranModel: string | null; resumeSkipped: string | null };
 /** The newest `lane-started:` for `laneId` (or for any lane when omitted), parsed. */
-export function laneStarted(control: readonly ControlEntry[], laneId?: string): (LaneStarted & { laneId: string; model: string | null; ranModel: string | null; resumeSkipped: string | null }) | null {
+export function laneStarted(control: readonly ControlEntry[], laneId?: string): RecordedLaneStart | null {
 	for (let i = control.length - 1; i >= 0; i--) {
 		const c = control[i]!;
 		if (c.prefix !== "lane-started" || c.laneId === null || (laneId !== undefined && c.laneId !== laneId)) continue;

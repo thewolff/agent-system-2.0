@@ -13,9 +13,10 @@
 #                              to the template's value)
 #          as2 lane <wl>       run workload <wl> by hand as a lane in this terminal (user-driven mode;
 #                              DESIGN-lane-launcher.md decision 14): bun surface/scripts/lane.ts interactive <wl>
-#          as2 lane stop|cleanup|log <wl>
-#                              stop the workload's lane (requested through the ledger; signals omp only
-#                              when its pid still matches), remove a clean pushed worktree, tail the runner log
+#          as2 lane stop <wl> [<laneId>] | as2 lane cleanup|log <wl>
+#                              stop the workload's lane, or the named one (requested through the ledger;
+#                              on a closed workload by signal to its runner; signals only when the pid
+#                              still matches), remove a clean pushed worktree, tail the runner log
 #          as2 --print [args]  print the omp command line `as2 [args]` would run, without running it
 #          as2 -h | --help     this text
 # Env:     AGENT_SYSTEM_PROFILE  OMP profile name (default: agent-system-2), as install/install.sh
@@ -87,9 +88,12 @@ case "${1-}" in
 				sub="$1"
 				shift
 				[ -n "${1-}" ] || { printf 'as2 lane %s: a workload id is required\n' "$sub" >&2; exit 1; }
+				if [ "$sub" = stop ] && [ -n "${2-}" ]; then
+					exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/lane.ts" stop "$1" "$2"
+				fi
 				exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/lane.ts" "$sub" "$1"
 				;;
-			'') printf 'as2 lane: a workload id is required (as2 lane <wl> | as2 lane stop|cleanup|log <wl>)\n' >&2; exit 1 ;;
+			'') printf 'as2 lane: a workload id is required (as2 lane <wl> | as2 lane stop <wl> [<laneId>] | as2 lane cleanup|log <wl>)\n' >&2; exit 1 ;;
 			*) exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/lane.ts" interactive "$1" ;;
 		esac
 		;;

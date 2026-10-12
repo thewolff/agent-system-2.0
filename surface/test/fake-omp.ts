@@ -43,12 +43,18 @@
 //     stateOnAbort?: true,         hold the get_state reply until an abort frame arrives (a late session record, review 2 R5)
 //     eofDelayMs?: n,              wait n ms between stdin EOF and the shutdown (the runner's late writes land first)
 //     shutdownOnTerm?: false,      SIGTERM exits without session_shutdown (default: shutdown, like EOF)
+//     deferShutdown?: true,        a tool's ctx.shutdown() (lane_release, lane_handoff) only latches, as OMP 18.8.6's rpc
+//                                mode does (rpc-mode.ts RpcShutdownCoordinator: `pi.shutdown()` "only *requests*
+//                                shutdown"): the turn runs on, and the fake shuts down at the next client frame or EOF
+//     neverSettle?: true,          a woken turn ends without `session_settled` (the leaked lanes of 2026-10-12, MIGRATION.md
+//                                item 112: no session_settled frame after the unsettled prompt_result, ever)
 //     holdStdoutUntil?: path }     a helper process inherits stdout and holds it open until that file exists (at most
 //                                30 s), so the runner's read loop, and its finish(), wait past this process's own death
 //                                (SIGKILL included) until the test opens the gate: a window the test controls
 // Record (JSONL appended at $FAKE_OMP_RECORD): { pid, argv, cwd, env: { AGENT_SYSTEM_*, OMP_PROFILE }, session, resumed }
 // at start, then { pid, event } for each frame or signal seen: prompt (with its id and message), abort, eof, sigterm,
-// sigint, background-done / background-killed, and wake.
+// sigint, background-done / background-killed, and wake. Each prompt and each woken turn runs between `agent_start` and
+// `agent_end` frames, as omp's do.
 // A new session file opens as OMP's does: a `title` line, then `{"type":"session","id":"<uuid>",…}` (the
 // header surface/src/ctx-index.ts reads), and get_state's sessionId is that id; a resumed file keeps its own header.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -216,23 +222,25 @@ const runSteps = async (steps: readonly FakeStep[]): Promise<number | "never" | 
 		const text = r.content[0]?.text ?? "";
 		lastSlice = (/\bsl-[a-z0-9]+\b/.exec(text) ?? [])[0] ?? lastSlice;
 		appendFileSync(session, `${JSON.stringify({ type: "tool", tool: step.tool, text })}\n`);
-		if (ctx.shutdowns.length > 0) break;
+		if (ctx.shutdowns.length > 0 && !script.deferShutdown) break;
 	}
 	return null;
 };
 const nextSteps = (): readonly FakeStep[] => script.prompts?.[turn++] ?? script.steps ?? [];
 
-/** A woken turn (no prompt_result): its steps, then the shutdown the lane asked for, or `session_settled`. */
+/** A woken turn (no prompt_result): its steps, then the shutdown the lane asked for, or `session_settled` (none with `neverSettle`). */
 const wokenTurn = async (steps: readonly FakeStep[]): Promise<void> => {
 	woken = true;
 	aborted = false;
+	emit({ type: "agent_start", fake: true });
 	await runSteps(steps);
 	woken = false;
-	if (ctx.shutdowns.length > 0) {
+	emit({ type: "agent_end", fake: true });
+	if (ctx.shutdowns.length > 0 && !script.deferShutdown) {
 		await shutdown();
 		return;
 	}
-	emit({ type: "session_settled" });
+	if (!script.neverSettle) emit({ type: "session_settled" });
 };
 
 /** The job a background step left: after `ms` the woken turn runs and the session settles; an EOF first kills it. */
@@ -250,6 +258,7 @@ const background = (ms: number | "never"): void => {
 const runPrompt = async (message: string): Promise<void> => {
 	aborted = false;
 	running = true;
+	emit({ type: "agent_start", fake: true });
 	appendFileSync(session, `${JSON.stringify({ type: "message", role: "user", text: message })}\n`);
 	const limit = durationMs(maxTime);
 	const deadline = setTimeout(() => {
@@ -261,7 +270,7 @@ const runPrompt = async (message: string): Promise<void> => {
 	const job = await runSteps(nextSteps());
 	clearTimeout(deadline);
 	if (running && !aborted) result("completed", job === null);
-	if (ctx.shutdowns.length > 0) {
+	if (ctx.shutdowns.length > 0 && !script.deferShutdown) {
 		await shutdown();
 		return;
 	}
@@ -323,6 +332,8 @@ for (;;) {
 				result("aborted");
 			}
 		}
+		// OMP 18.8.6 re-checks a latched shutdown after each client command (rpc-mode.ts `afterSerialCommand`).
+		if (script.deferShutdown && ctx.shutdowns.length > 0) await shutdown();
 	}
 }
 eofSeen = true;

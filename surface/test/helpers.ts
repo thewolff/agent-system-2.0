@@ -206,6 +206,10 @@ export interface FakeScript {
 	stateOnAbort?: boolean;
 	eofDelayMs?: number;
 	shutdownOnTerm?: boolean;
+	/** A tool's ctx.shutdown() only latches, as OMP 18.8.6's rpc mode does: the fake shuts down at the next client frame or EOF (MIGRATION.md item 112). */
+	deferShutdown?: boolean;
+	/** A woken turn ends without `session_settled` (MIGRATION.md item 112). */
+	neverSettle?: boolean;
 	/** A helper holds the fake's stdout open until this file exists (≤ 30 s): the runner's finish() waits past omp's death for the test. */
 	holdStdoutUntil?: string;
 }
@@ -355,11 +359,22 @@ function rootControl(r: LaneRoot): ControlEntry[] {
 	}
 }
 
+/** The lanes started on a closed workload: the ledger refuses their lane-exit:, so a lane's end there is its runner gone (MIGRATION.md item 112). */
+function closedLanes(r: LaneRoot): Set<string> {
+	const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+	try {
+		return new Set(l.db.query<{ id: string }, []>("SELECT id FROM workloads WHERE status = 'closed'").all().flatMap(({ id }) =>
+			controlEntries(l.entries(id)).flatMap((c) => (c.prefix === "lane-started" && c.laneId !== null ? [c.laneId] : []))));
+	} finally {
+		l.close();
+	}
+}
+
 /**
  * Before a root is removed: every runner's lane and every lane a drain launched has ended (lane-exit:, or
- * launch-failed: for a starter that failed after its reservation), every runner process is gone, every runner
- * that wrote its own lane-exit: has its `spawned` line, and every spawned drain has logged its end and is
- * gone. Repeated until a pass finds no new launch and no new drain, since a drain's lane spawns its own drain.
+ * launch-failed: for a starter that failed after its reservation, or, on a closed workload, its runner gone), every
+ * runner process is gone, every runner that wrote its own lane-exit: has its `spawned` line, and every spawned drain
+ * has logged its end and is gone. Repeated until a pass finds no new launch and no new drain, since a drain's lane spawns its own drain.
  * When a wait fails (its timeout, or an unreadable ledger), every runner and drain of the root still alive is
  * SIGKILLed and waited for until it is gone, then the failure is rethrown: the caller removes the root only
  * after this returns or rejects, so no process it waited on outlives its root.
@@ -374,7 +389,10 @@ export async function settleDrains(r: LaneRoot, timeoutMs = 60_000): Promise<voi
 			const runnerLanes = new Set(control.filter((c) => c.prefix === "lane-started" && c.createdBy === "lane-runner").map((c) => c.laneId!));
 			const lanes = new Set([...runnerLanes, ...control.filter((c) => c.prefix === "launch" && / requested-by lane-runner$/.test(c.rest)).map((c) => c.laneId!)]);
 			for (const laneId of lanes) {
-				await until(`the end of ${laneId}`, () => rootControl(r).some((c) => c.laneId === laneId && (c.prefix === "lane-exit" || c.prefix === "launch-failed")), left());
+				const runner = laneStarted(control, laneId)?.runnerPid ?? 0;
+				await until(`the end of ${laneId}`, () =>
+					rootControl(r).some((c) => c.laneId === laneId && (c.prefix === "lane-exit" || c.prefix === "launch-failed")) ||
+					(runner > 0 && !alive(runner) && closedLanes(r).has(laneId)), left());
 			}
 			for (const laneId of runnerLanes) {
 				const pid = laneStarted(control, laneId)?.runnerPid;

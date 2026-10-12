@@ -31,6 +31,7 @@
 // |---|---|---|
 // | dead-lane | an open workload's newest `lane-started:` lane has no `lane-exit:`, no `lane.ts run <wl> <lane>` process, and the workload has no entry for 20 min | `dead-lane:<lane>` |
 // | silent-lane | a lane with a live `lane.ts run <wl> <lane>` process that still holds its workload (`holder` is the lane and the lease has not lapsed) whose newest write anywhere — any file under the lane directory `~/.agent-system-2/lanes/<wl>/` (transcripts, rpc log, runner log) or any ledger entry on the workload — is more than 45 min old: hung, not dead (the lease renews from the runner, so it stays held). The live case, 2026-10-11: omp at 2 s of CPU after 4 h, transcript mtime at the launch minute. | `silent-lane:<lane>` |
+// | leaked-runner | a live `lane.ts run <wl> <lane>` process whose lane is over: its workload closed, or a later lane's `lane-started:` on the workload superseded it, more than 10 min before as-of (whichever came first). The live case, 2026-10-12 (MIGRATION.md item 112): 16 runners, each holding an idle omp for hours after lane_release, waiting for a `session_settled` omp never sent. In replay the process counts only when its lane had started by as-of, and a close after as-of does not count. | `leaked-runner:<lane>` |
 // | orphan-hand | a `hand-spawn:` token has no `hand-settled:` and the lane that wrote it (`created_by`) has exited, been superseded by a later `lane-started:`, or is dead (no exit, no process, workload silent 20 min: the dead-lane case); the text lists the row `builderLabs` counts as builders | `orphan-hand:<token>` |
 // | no-independent-lab | the classifier's own `builderLabs` (classifier/src/lab.ts) excludes all three labs; review tokens held by a live spawning lane are passed as `liveReviews`, as the classifier does | `no-independent-lab:<wl>` |
 // | stale-reserved | a `reserved-request` entry older than 30 min that `reservedStates` (surface/src/errors.ts) still finds `waiting`: no `approve <id>` / `deny <id>` instruction, no `reserved-withdrawn: <id>`, its raising lane still holds the workload (a `lane-stopped` request is closed, not stale), and no later request repeats it | `stale-reserved:<entry>` |
@@ -48,8 +49,8 @@
 // table are read as they are now, not as of then), when the checkout is not a git repository or
 // has no origin/main, when git, pgrep or ps are not on this machine, and process-older-than-head
 // when no orchestrator process (`omp --cwd <checkout>`) runs here: on any other machine there is
-// nothing to compare HEAD against. dead-lane, silent-lane, stuck-review, silent-orchestrator and
-// ff-lull need the process table too and are skipped when it could not be read. A probe that
+// nothing to compare HEAD against. dead-lane, silent-lane, leaked-runner, stuck-review,
+// silent-orchestrator and ff-lull need the process table too and are skipped when it could not be read. A probe that
 // fails is a skip, never "no process": pgrep exit 1 (no match) is an answer, any other failure
 // carries its exit code and stderr into the reason; a `ps` call that fails for a process still
 // alive is a skip too (only a pid that is gone reads as "exited between pgrep and ps"). silent-lane
@@ -76,7 +77,7 @@ import { laneDir } from "../src/launch";
 import { STANDING_WORKLOAD_ID } from "../src/types";
 
 export const INVARIANTS = [
-	"dead-lane", "silent-lane", "orphan-hand", "no-independent-lab", "stale-reserved", "stuck-question", "stuck-review",
+	"dead-lane", "silent-lane", "leaked-runner", "orphan-hand", "no-independent-lab", "stale-reserved", "stuck-question", "stuck-review",
 	"provider-refusal-loop", "silent-orchestrator", "checkout-behind-main", "process-older-than-head", "ff-lull", "stale-backup",
 ] as const;
 export type Invariant = (typeof INVARIANTS)[number];
@@ -333,6 +334,47 @@ export function check(input: Input): Report {
 				since: last,
 				text: `lane ${w.holder} on ${w.id} silent ${hours}h (last transcript write ${lastWrite ?? "none"}); process alive, lease held — hung, not dead; stop + relaunch`,
 				query: `${held.shown} -- then: pgrep -fl 'surface/scripts/lane.ts run ${w.id} ${w.holder}'; newest mtime under ${input.lanesDirOf(w.id)}; newest entry on ${w.id}`,
+			});
+		}
+	}
+
+	// ---- 1c. leaked-runner ----------------------------------------------------------------------
+	// The runner of a lane that is over still holds omp (MIGRATION.md item 112). The raw probe set is read here: the
+	// replay filter above keeps lanes of open workloads only, and a closed workload is half of this invariant.
+	const LEAK_MS = 10 * MIN;
+	const LANE_STARTS_SQL = `SELECT w.status, w.closed_at, e.body, e.created_at FROM workloads w
+	  LEFT JOIN entries e ON e.workload_id = w.id AND e.kind = 'assumption' AND e.body LIKE 'lane-started: %' AND e.created_at <= :asOf
+	  WHERE w.id = :wl ORDER BY e.created_at, e.rowid`;
+	if (!("found" in input.liveLanes)) skip("leaked-runner", NO_PGREP);
+	else {
+		for (const l of [...input.liveLanes.found].sort()) {
+			const [wl = "", lane = ""] = l.split(" ");
+			const starts = run<{ status: string; closed_at: string | null; body: string | null; created_at: string | null }>(LANE_STARTS_SQL, { ":wl": wl, ":asOf": asOf });
+			const w = starts.rows[0];
+			if (!w) continue;
+			// Succession is by each lane's FIRST start: a lane re-records lane-started when its session or model
+			// metadata arrives, and that rerecord can land after a successor started; it is not a new lane.
+			const seen = new Set<string>();
+			const lanes = starts.rows.flatMap((r) => {
+				const id = r.body === null ? undefined : LANE_STARTED.exec(r.body)?.[1];
+				if (id === undefined || r.created_at === null || seen.has(id)) return [];
+				seen.add(id);
+				return [{ id, at: r.created_at }];
+			});
+			const mine = lanes.findIndex((s) => s.id === lane);
+			if (mine < 0) continue; // not started by as-of
+			const closedAt = w.status === "closed" && w.closed_at !== null && w.closed_at <= asOf ? w.closed_at : null;
+			const next = lanes.slice(mine + 1).find((s) => s.id !== lane) ?? null;
+			const ends = [...(closedAt ? [{ at: closedAt, why: `${wl} closed at ${closedAt}` }] : []), ...(next ? [{ at: next.at, why: `${next.id} started at ${next.at}` }] : [])];
+			const end = ends.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0))[0];
+			if (!end || end.at > ago(LEAK_MS)) continue;
+			findings.push({
+				key: `leaked-runner:${lane}`,
+				invariant: "leaked-runner",
+				workload: wl,
+				since: end.at,
+				text: `the runner of ${lane} is alive ${age(end.at)} after its lane ended (${end.why}), holding its omp for nothing; stop it with \`as2 lane stop ${wl} ${lane}\``,
+				query: `${starts.shown} -- then: pgrep -fl 'surface/scripts/lane.ts run ${wl} ${lane}'`,
 			});
 		}
 	}
