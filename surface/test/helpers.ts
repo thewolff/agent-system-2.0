@@ -186,7 +186,7 @@ export type FakeStep =
 	| { result: string; error?: { message: string; provider?: string; model?: string; retryable: boolean } }
 	| { usage: { usd: number; tokens: number }; hand?: string }
 	| { background: number | "never" } | { wake: { ms: number; steps: FakeStep[] } }
-	| { ledger: { body: string; slice?: string } | { routing: { slice: string } } };
+	| { ledger: { body: string; slice?: string; kind?: "wake-read" | "assumption" } | { routing: { slice: string } } } | { frame: Record<string, unknown> };
 /** The fake omp's script (surface/test/fake-omp.ts header). */
 export interface FakeScript {
 	claim?: boolean;

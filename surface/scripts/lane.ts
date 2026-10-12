@@ -49,6 +49,7 @@ import {
 import {
 	type Ceiling, CEILING_OPTIONS, type CeilingOption, ceilingQuestionBody, crossed, effectiveCeiling, scanSpend, type Spend, spendBody, wallMinutes,
 } from "../src/ceiling";
+import { COMPACTION_LOOP_REASON, COMPACTION_LOOP_TURNS, COMPACTION_WATCH_START, compactionLoopBody, compactionLoopDeathBody, compactionStep } from "../src/compaction-loop";
 import { newLaneSession, runCtxIndex, topLevelSessions } from "../src/ctx-index";
 import { decisionLogContext, repoOf } from "../src/decision-log";
 import { factsBlock } from "../src/facts";
@@ -59,6 +60,11 @@ import {
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
+	BURN_WATCH_START, burnEvidence, burnStep, FLIGHT_CLOCK_START, flightElapsed, flightReset, flightStep, lastProgress, NO_PROGRESS_REASON, noProgressEvidence, RUNAWAY_DEFAULTS,
+	type RunawayLimits, runawayBody, runawayDeathBody,
+	TOKEN_BURN_REASON, TOKEN_TOTAL_REASON, totalEvidence,
+} from "../src/runaway";
+import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, type PromptError, promptErrorOf, releasedOpen, sliceCounts, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
 	type TurnEndInput, unsettledHands, unsettledHandsOf,
 } from "../src/turn-end";
@@ -68,7 +74,7 @@ import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
 const TIER_FILE = join(REPO_ROOT, "tiers", "lane.md");
-/** A millisecond knob from the environment, or its fallback (the fake-omp tests shorten the two waits below). */
+/** A positive-number knob from the environment (milliseconds or tokens), or its fallback (the fake-omp tests shorten the waits below). */
 const msEnv = (name: string, fallback: number): number => {
 	const n = Number(process.env[name]);
 	return Number.isFinite(n) && n > 0 ? n : fallback;
@@ -79,6 +85,13 @@ const READY_POLL_MS = 1_000;
 /** After `abort` and stdin EOF, the wait before SIGKILL (§ 3 stop path). */
 const END_GRACE_MS = msEnv("AGENT_SYSTEM_LANE_END_GRACE_MS", 30_000);
 const PROFILE = process.env.AGENT_SYSTEM_PROFILE || process.env.OMP_PROFILE || "agent-system-2";
+/** The runaway trips (MIGRATION.md item 111, src/runaway.ts): no progress, the token burn rate, the run's token total. */
+const RUNAWAY: RunawayLimits = {
+	noProgressMs: msEnv("AGENT_SYSTEM_LANE_NO_PROGRESS_MS", RUNAWAY_DEFAULTS.noProgressMs),
+	burnTokens: msEnv("AGENT_SYSTEM_LANE_BURN_TOKENS", RUNAWAY_DEFAULTS.burnTokens),
+	burnWindowMs: msEnv("AGENT_SYSTEM_LANE_BURN_WINDOW_MS", RUNAWAY_DEFAULTS.burnWindowMs),
+	totalTokens: msEnv("AGENT_SYSTEM_LANE_TOTAL_TOKENS", RUNAWAY_DEFAULTS.totalTokens),
+};
 
 class Fail extends Error {
 	constructor(readonly stage: string, message: string, readonly code: number) {
@@ -1054,6 +1067,16 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	let heldOpenSent = false;
 	/** The get_state id the hold sends once the hands settled: its `isSettled` is omp's word that no woken turn is running (D1). */
 	const SETTLE_CHECK = "settle-check";
+	/** OMP's auto-compactions per turn (MIGRATION.md item 111, src/compaction-loop.ts): COMPACTION_LOOP_TURNS compacted turns in a row stop the lane. */
+	let compaction = COMPACTION_WATCH_START;
+	/**
+	 * The runaway trips (src/runaway.ts): the newest progress write seen (ms; the floor is ready), the no-progress clock (in-turn
+	 * time since it, from the rpc stream's agent_start/agent_end; reset at ready, on progress and while held for hands) and this
+	 * run's token samples.
+	 */
+	let progressSeen = 0;
+	let flight = FLIGHT_CLOCK_START;
+	let burn = BURN_WATCH_START;
 	const timers: ReturnType<typeof setTimeout>[] = [];
 	const send = (frame: Frame): void => {
 		if (child && !ended) child.stdin.write(`${JSON.stringify(frame)}\n`);
@@ -1202,6 +1225,60 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			send({ id: "abort", type: "abort" });
 		}
 		end();
+	};
+
+	/**
+	 * A runaway trip (item 111: compaction-loop, no-progress, token-burn, token-total): the evidence entry and the needs-you death
+	 * line (kept for finish()'s retry), then the stop path with the trip as its reason. Fail-closed: a write that fails is logged
+	 * and the stop is taken anyway.
+	 */
+	const runaway = (reason: string, entry: string, death: string): void => {
+		try {
+			record(entry);
+		} catch (err) {
+			process.stderr.write(`runner: the ${reason} entry could not be written: ${String(err)}\n`);
+		}
+		decidedDeath = death;
+		try {
+			enqueueRunnerDeath(ledger, { workloadId: wl, laneId, body: decidedDeath });
+		} catch (err) {
+			process.stderr.write(`runner: the lane-died: line could not be written: ${String(err)}\n`);
+		}
+		stop(reason, reason);
+	};
+	const stopCompactionLoop = (): void => {
+		const ran = ranModel ?? model;
+		runaway(COMPACTION_LOOP_REASON, compactionLoopBody(laneId, compaction, ran), compactionLoopDeathBody(laneId, compaction, ran));
+	};
+	/**
+	 * One stop-poll check of the other three trips, after the meter's scan (the token tally is the meter's). No progress counts
+	 * in-turn time only, and none while the lane is held for its hands; the token trips count all of it. A check that throws is
+	 * logged, never fatal, like the meter.
+	 */
+	const guard = (): void => {
+		if (!ready || outcome !== null || finished) return;
+		const trip = (reason: string, evidence: string): void => runaway(reason, runawayBody(laneId, reason, evidence), runawayDeathBody(laneId, reason, evidence));
+		try {
+			const now = Date.now();
+			if (holding) flight = flightReset(flight, now);
+			else {
+				const last = lastProgress([...ledger.entries(wl), ...ledger.questions(wl), ...ledger.slices(wl)], laneId, progressSeen);
+				if (last > progressSeen) {
+					progressSeen = last;
+					flight = flightReset(flight, now);
+				}
+				const inTurn = flightElapsed(flight, now);
+				if (inTurn >= RUNAWAY.noProgressMs) return trip(NO_PROGRESS_REASON, noProgressEvidence(inTurn, RUNAWAY.noProgressMs, progressSeen));
+			}
+			if (sessionsDir === null) return;
+			const s = burnStep(burn, now, tally.tokens, RUNAWAY.burnWindowMs);
+			burn = s.watch;
+			const ran = ranModel ?? model;
+			if (s.total > RUNAWAY.totalTokens) trip(TOKEN_TOTAL_REASON, totalEvidence(s, RUNAWAY, ran));
+			else if (s.window > RUNAWAY.burnTokens) trip(TOKEN_BURN_REASON, burnEvidence(s, RUNAWAY, ran));
+		} catch (err) {
+			process.stderr.write(`runner: the runaway guard failed: ${String(err)}\n`);
+		}
 	};
 
 	const sendPrompt = (message: string): void => {
@@ -1359,6 +1436,10 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					record(laneReadyBody(laneId, ledger.now()));
 					sendPrompt(prompt);
 					ready = true;
+					// The runaway trips start here: the no-progress clock, and the token baseline from the meter's scan just above.
+					progressSeen = Date.now();
+					flight = flightReset(flight, progressSeen);
+					burn = burnStep(BURN_WATCH_START, progressSeen, tally.tokens, RUNAWAY.burnWindowMs).watch;
 				} else if (Date.now() - spawnedAt >= READY_MS) {
 					if (claimed) {
 						failModel(`named ${model}, no get_state model within ${readyMinutes}`);
@@ -1412,6 +1493,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					conclude("deadline", laneDiedDeadlineBody(laneId, maxTime, inFlightNow()));
 				}
 				if (ready && outcome === null) meter(cur?.stakes ?? w.stakes, control);
+				guard();
 				// D6: held for the lane's hands; once all of them settled, omp's own word on settled (get_state) comes first.
 				if (holding && outcome === null && unsettledHands(ledger, wl, laneId).length === 0) {
 					holding = false;
@@ -1465,6 +1547,11 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					rerecord = true;
 				}
 				if (rerecord) record(startRecord());
+				if (o.type === "turn_start" || o.type === "auto_compaction_start") {
+					compaction = compactionStep(compaction, o.type);
+					if (compaction.run >= COMPACTION_LOOP_TURNS && outcome === null && !finished) stopCompactionLoop();
+				}
+				if (o.type === "agent_start" || o.type === "agent_end") flight = flightStep(flight, o.type, Date.now());
 				// A turn ends (B2) at the prompt_result for the prompt this runner sent, its status kept; agent_end is not an end.
 				if (o.type === "prompt_result" && o.id === current && outcome === null) {
 					current = null;

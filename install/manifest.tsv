@@ -365,6 +365,10 @@ surface/test/facts.test.ts	test	-
 surface/src/orchestrator-question.ts	module	-
 surface/extensions/question.ts	module	-
 surface/test/orchestrator-question.test.ts	test	-
+surface/src/compaction-loop.ts	module	-
+surface/test/compaction-loop.test.ts	test	-
+surface/src/runaway.ts	module	-
+surface/test/runaway.test.ts	test	-
 surface/src/chaos.ts	module	-
 surface/scripts/chaos.ts	module	-
 surface/scripts/chaos-stub.ts	module	-

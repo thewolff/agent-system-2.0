@@ -15,6 +15,7 @@ import { Database } from "bun:sqlite";
 import { backupNamespace, copyProblem, Ledger } from "../../ledger/src/index";
 import { canonicalPath } from "../../ledger/src/locality";
 import { laneExitBody } from "../src/launch";
+import { spendBody } from "../src/ceiling";
 import { reservedStates } from "../src/errors";
 import { BACKUP_GAP_MS, check, gitIn, type Git, type Input, jsonLines, newestWrite, orchestratorsFromPs, parseArgs, type Probe, type PsDeps, renderTable, type Report, reservedView, reviewsLine, type Run } from "../scripts/invariants";
 import { AS_OF, buildFixture, LANE_RUNNER } from "./fixtures/invariants/build";
@@ -219,6 +220,56 @@ describe("silent-lane: alive, lease held, nothing written for 45 min", () => {
 	test("with no lane directory the ledger alone decides, and the text says no transcript", () => {
 		const r = run({ liveLanes: alive, lanesDirOf: () => "/nonexistent/lanes" });
 		expect(r.findings.find((x) => x.invariant === "silent-lane")!.text).toContain("silent 2.5h (last transcript write none)");
+	});
+});
+
+describe("compaction-loop (MIGRATION.md item 111): a lane with no exit whose rpc log ends in compacted turn after compacted turn", () => {
+	const C = '{"type":"auto_compaction_start","reason":"threshold","action":"remote"}';
+	const T = '{"type":"turn_start"}';
+	const rest = ['{"type":"auto_compaction_end","action":"remote"}', '{"type":"turn_end"}'];
+	/** A lanes directory whose `lane-1.jsonl` has `compacted` turns, each after an auto_compaction_start, following two plain turns. */
+	const lanesDir = (tag: string, compacted: number): string => {
+		const dir = tmp(tag);
+		const lines = [T, ...rest, T, ...rest, ...Array.from({ length: compacted }, () => [C, T, ...rest]).flat()];
+		writeFileSync(join(dir, "lane-1.jsonl"), `${lines.join("\n")}\n`);
+		return dir;
+	};
+	const loop = lanesDir("compaction-loop", 6);
+	const healthy = lanesDir("compaction-healthy", 4);
+
+	test("the looping log on a lane with no lane-exit fires; the same log on a lane that exited, and four compacted turns, do not", () => {
+		const r = run({ lanesDirOf: (wl) => (wl === fixture.deadLane.wl || wl === fixture.stopped.wl ? loop : healthy) });
+		const found = r.findings.filter((f) => f.invariant === "compaction-loop");
+		expect(found.map((f) => f.key)).toEqual([`compaction-loop:${fixture.deadLane.lane}`]);
+		expect(found[0]!.workload).toBe(fixture.deadLane.wl);
+		// Read from the end: 6 compacted turns, the plain turn before them, and the plain turn that stops the scan.
+		expect(found[0]!.text).toContain("auto-compacted before the last 6 turns in a row (6 auto_compaction_start for 8 turn_start in the last ");
+		expect(renderTable(r)).toContain("compaction-loop=1");
+	});
+
+	test("no lane directory is no finding", () => {
+		expect(run().findings.some((f) => f.invariant === "compaction-loop")).toBe(false);
+	});
+});
+
+describe("token-burn (MIGRATION.md item 111): a lane whose own spend:, over its life, is past the runner's run-total cap", () => {
+	test("150M on the first lane is under the 200M cap; the second lane's 400M cumulative is 250M of its own and fires", () => {
+		const copy = buildFixture(join(tmp("burn"), "ledger.db"));
+		const w = Ledger.open(copy.path, { backup: false, backupOnOpen: false, clock: () => "2026-10-11T20:40:00.000Z", skipLocalityCheck: true });
+		const wl = copy.deadLane.wl;
+		w.recordEntry({ by: LANE_RUNNER, workloadId: wl, kind: "assumption", body: spendBody("lane-fixture-deadlane-1", { usd: 0, tokens: 150_000_000, wallMin: 60 }) });
+		w.recordEntry({ by: LANE_RUNNER, workloadId: wl, kind: "assumption", body: spendBody("lane-fixture-deadlane-2", { usd: 0, tokens: 400_000_000, wallMin: 90 }) });
+		w.close();
+		const ro = new Database(copy.path, { readonly: true });
+		try {
+			const found = run({ db: ro }).findings.filter((f) => f.invariant === "token-burn");
+			expect(found.map((f) => f.key)).toEqual(["token-burn:lane-fixture-deadlane-2"]);
+			expect(found[0]!.text).toContain("spent 250M tokens over its life");
+			expect(found[0]!.since).toBe("2026-10-11T20:40:00.000Z");
+		} finally {
+			ro.close();
+		}
+		expect(run().findings.some((f) => f.invariant === "token-burn")).toBe(false);
 	});
 });
 

@@ -3,7 +3,8 @@
 // unit tests"): a shell shim named `omp` on PATH ahead of the real binary execs this file. It
 // records argv, env and cwd, speaks the rpc frames the runner reads (measured on OMP 18.4.4 in
 // ~/agent-scratch/agent-system-2.0/migration/M7/lane-launcher/verify/out: `ready` first, the
-// `get_state` response with `data.sessionFile`, `agent_end` then `prompt_result` with status
+// `get_state` response with `data.sessionFile`, `agent_start` when a prompt or a woken turn starts (the no-progress clock,
+// MIGRATION.md item 111), `agent_end` when it ends, then for a prompt `prompt_result` with status
 // `completed` or `aborted` — an `abort` frame and `--max-time` both end with `aborted` — and
 // `sessionSettled`, false while a background job may still wake the session, then `session_settled`
 // once it has: @oh-my-pi/pi-coding-agent/src/modes/rpc/rpc-types.ts `RpcPromptResultFrame`), and
@@ -16,8 +17,10 @@
 //     noSession?: true,            the get_state reply carries no sessionFile
 //     steps: [ { tool, args } | { sleepMs } | { exit: code } | { hang: true } | { result: "aborted" | "error", error? }
 //              | { usage: { usd, tokens }, hand? } | { background: ms | "never" } | { wake: { ms, steps } }
-//              | { ledger: { body, slice? } | { routing: { slice } } } ],
+//              | { ledger: { body, slice?, kind? } | { routing: { slice } } } | { frame: { type, … } } ],
 //                                an arg value "$slice" is the id the newest tool result named (lane_add_slice mints it);
+//                                a frame step writes that rpc frame to stdout as is (`{ "type": "auto_compaction_start" }`,
+//                                `{ "type": "turn_start" }`: the compaction loop, MIGRATION.md item 111);
 //                                a usage step appends one assistant message with that usage (usage.cost.total,
 //                                usage.totalTokens) to the session file, or with `hand` to <session>/<hand>.jsonl, where
 //                                OMP writes a hand's session file (the runner's ceiling meter reads both);
@@ -150,7 +153,7 @@ const ledgerStep = (step: Extract<FakeStep, { ledger: unknown }>["ledger"]): voi
 	const ledger = Ledger.open(defaultLedgerPath(process.env));
 	try {
 		if ("body" in step) {
-			ledger.recordEntry({ by, workloadId, sliceId: step.slice ? fill(step.slice) : null, kind: "assumption", body: fill(step.body) });
+			ledger.recordEntry({ by, workloadId, sliceId: step.slice ? fill(step.slice) : null, kind: step.kind ?? "assumption", body: fill(step.body) });
 			return;
 		}
 		const sliceId = fill(step.routing.slice);
@@ -211,6 +214,10 @@ const runSteps = async (steps: readonly FakeStep[]): Promise<number | "never" | 
 			ledgerStep(step.ledger);
 			continue;
 		}
+		if ("frame" in step) {
+			emit(step.frame);
+			continue;
+		}
 		const args = Object.fromEntries(Object.entries(step.args).map(([k, v]) => [k, v === "$slice" ? lastSlice : v]));
 		const r = await f.tool(step.tool).execute(`c${Date.now()}`, args, undefined, undefined, ctx);
 		const text = r.content[0]?.text ?? "";
@@ -226,7 +233,9 @@ const nextSteps = (): readonly FakeStep[] => script.prompts?.[turn++] ?? script.
 const wokenTurn = async (steps: readonly FakeStep[]): Promise<void> => {
 	woken = true;
 	aborted = false;
+	emit({ type: "agent_start" });
 	await runSteps(steps);
+	emit({ type: "agent_end", fake: true });
 	woken = false;
 	if (ctx.shutdowns.length > 0) {
 		await shutdown();
@@ -250,6 +259,7 @@ const background = (ms: number | "never"): void => {
 const runPrompt = async (message: string): Promise<void> => {
 	aborted = false;
 	running = true;
+	emit({ type: "agent_start" });
 	appendFileSync(session, `${JSON.stringify({ type: "message", role: "user", text: message })}\n`);
 	const limit = durationMs(maxTime);
 	const deadline = setTimeout(() => {

@@ -37,6 +37,8 @@
 // | stuck-question | a question open for more than 30 min | `stuck-question:<q>` |
 // | stuck-review | a `hand-spawn: … review yes` with no `hand-settled:` after 45 min while any lane on the workload is alive | `stuck-review:<token>` |
 // | provider-refusal-loop | 2+ `lane-exit:` on one workload within 30 min, each with refusal evidence (`usage polic`, `non-retryable`, `refusal`) in ledger entries/messages from 2 min before to 5 min after the exit (never past as-of), or, for `outcome error`, in the final `prompt_result` of the lane's rpc log `lane-<n>.jsonl` (read as it is now) | `provider-refusal-loop:<wl>:<first lane>` |
+// | compaction-loop | a lane on an open workload with no `lane-exit:` (its runner did not stop it) whose rpc log `lane-<n>.jsonl` ends in `COMPACTION_LOOP_TURNS` (5) or more consecutive turns that each followed an `auto_compaction_start` (surface/src/compaction-loop.ts `trailingCompactionRun`: read backwards from the end, at most 16 MiB, as it is now; MIGRATION.md item 111) | `compaction-loop:<lane>` |
+// | token-burn | a lane on an open workload whose newest `spend:` entry is more than the runner's run-total cap (`RUNAWAY_DEFAULTS.totalTokens`, 200M, surface/src/runaway.ts) above the newest `spend:` of the lane before it: the tokens it spent over its life, from the ledger alone (spend: lines are cumulative per workload; MIGRATION.md item 111) | `token-burn:<lane>` |
 // | silent-orchestrator | no `wl-orchestrator` entry for 2 h while any lane process is alive | `silent-orchestrator:<last entry id>` |
 // | checkout-behind-main | `git rev-parse HEAD` differs from `origin/main` in the checkout. Behind (HEAD is an ancestor of origin/main): `behind origin/main by <n>; fast-forward at a lull` (or `fast-forward would refuse` with the modified tracked files, or `git status failed` when cleanliness could not be read). Diverged (neither is an ancestor of the other): `DIVERGED … needs a person`. Ahead only (origin/main is an ancestor of HEAD: local commits not yet on main) is not a finding. It never fetches, so origin/main is whatever the checkout already has. | `checkout-behind-main:<head12>:<origin12>` (`…:diverged:…` when diverged) |
 // | process-older-than-head | an `omp --cwd <checkout>` process (not a persistent seat: commands naming `/seat-sessions/` are skipped) started before HEAD arrived, where "arrived" is the later of HEAD's commit time and its newest reflog entry | `process-older-than-head:<pid>:<head12>` |
@@ -72,12 +74,15 @@ import { BACKUP_DEFAULTS, BACKUP_NAME, backupNamespace, copyProblem, processAliv
 import type { EntryKind, EntryRow, InstructionRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import { type ReservedLedgerView, reservedStates } from "../src/errors";
+import { COMPACTION_LOOP_TURNS, trailingCompactionRun } from "../src/compaction-loop";
+import { parseSpend } from "../src/ceiling";
+import { RUNAWAY_DEFAULTS } from "../src/runaway";
 import { laneDir } from "../src/launch";
 import { STANDING_WORKLOAD_ID } from "../src/types";
 
 export const INVARIANTS = [
 	"dead-lane", "silent-lane", "orphan-hand", "no-independent-lab", "stale-reserved", "stuck-question", "stuck-review",
-	"provider-refusal-loop", "silent-orchestrator", "checkout-behind-main", "process-older-than-head", "ff-lull", "stale-backup",
+	"provider-refusal-loop", "compaction-loop", "token-burn", "silent-orchestrator", "checkout-behind-main", "process-older-than-head", "ff-lull", "stale-backup",
 ] as const;
 export type Invariant = (typeof INVARIANTS)[number];
 
@@ -192,11 +197,16 @@ export function reservedView(db: Database): ReservedLedgerView {
 	};
 }
 
+/** A lane's rpc log: `<lanes dir>/lane-<n>.jsonl`, n the lane id's trailing number; null when the id has none. */
+export function laneLogPath(dir: string, laneId: string): string | null {
+	const n = /-(\d+)$/.exec(laneId)?.[1];
+	return n ? join(dir, `lane-${n}.jsonl`) : null;
+}
+
 /** The final prompt_result error message in a lane's rpc log (`<lanes dir>/lane-<n>.jsonl`), from its last 64 KB. */
 export function laneLogError(dir: string, laneId: string): string | null {
-	const n = /-(\d+)$/.exec(laneId)?.[1];
-	if (!n) return null;
-	const path = join(dir, `lane-${n}.jsonl`);
+	const path = laneLogPath(dir, laneId);
+	if (!path) return null;
 	if (!existsSync(path)) return null;
 	const size = statSync(path).size;
 	const len = Math.min(size, 65_536);
@@ -492,6 +502,57 @@ export function check(input: Input): Report {
 				since: refusals[i]!.at,
 				text: `${cluster.length} lanes died on a provider refusal within 30 min (${cluster.map(c => c.lane).join(", ")}); a relaunch on the same model will die again. Last: ${cluster.at(-1)!.why}`,
 				query: `${lastShown.replace(/'[^']*'/g, "?")} -- per lane-exit, ±window; outcome error also reads the last prompt_result in ${input.lanesDirOf("<workload>")}/lane-<n>.jsonl`,
+			});
+		}
+	}
+
+	// ---- 7b. compaction-loop ----------------------------------------------------------------------
+	// The runner stops a looping lane itself (lane-exit outcome stop, reason compaction-loop); this catches one it
+	// did not: a runner from before item 111, or one that died mid-loop. Only lanes with no lane-exit are read; the scan
+	// stops at the log's first plain turn from the end, never past 16 MiB (wl-mv457r7iqmq29s lane-2, healthy: 6 MiB).
+	for (const [wl, entries] of byWorkload) {
+		for (const [laneId, lane] of lanesOf(entries)) {
+			if (lane.exit) continue;
+			const path = laneLogPath(input.lanesDirOf(wl), laneId);
+			const tail = path ? trailingCompactionRun(path) : null;
+			if (!tail || tail.run < COMPACTION_LOOP_TURNS) continue;
+			findings.push({
+				key: `compaction-loop:${laneId}`,
+				invariant: "compaction-loop",
+				workload: wl,
+				since: lane.started,
+				text: `lane ${laneId} on ${wl}: OMP auto-compacted before the last ${tail.open ? `${tail.run}+` : tail.run} turns in a row (${tail.compactions} auto_compaction_start for ${tail.turns} turn_start in the last ${Math.ceil(tail.bytesRead / 1024)} KiB of its rpc log); stuck, not busy: stop it and relaunch on another model or a fresh session`,
+				query: `${openEntries.shown.replace(/'[^']*'/g, "?")} -- lanes with lane-started: and no lane-exit:; then the tail of ${path}: auto_compaction_start before each turn_start`,
+			});
+		}
+	}
+
+	// ---- 7c. token-burn ---------------------------------------------------------------------------
+	// spend: lines are the runner's meter, cumulative over the workload (a relaunch rescans every session file), so a lane's own
+	// tokens are its newest spend: minus the newest spend: of the lane before it. Read from the ledger only: no session file.
+	const SPEND_LINE = /^spend:\s+(\S+)\s+(.*)$/;
+	for (const [wl, entries] of byWorkload) {
+		/** Lane id -> its newest spend:, in the order of each lane's newest (a lane's later line re-inserts it). */
+		const newest = new Map<string, { tokens: number; at: string }>();
+		for (const e of entries) {
+			const m = SPEND_LINE.exec(e.body);
+			const s = m ? parseSpend(m[2]!) : null;
+			if (!m || !s) continue;
+			newest.delete(m[1]!);
+			newest.set(m[1]!, { tokens: s.tokens, at: e.created_at });
+		}
+		let before = 0;
+		for (const [laneId, s] of newest) {
+			const own = s.tokens - before;
+			before = s.tokens;
+			if (own <= RUNAWAY_DEFAULTS.totalTokens) continue;
+			findings.push({
+				key: `token-burn:${laneId}`,
+				invariant: "token-burn",
+				workload: wl,
+				since: s.at,
+				text: `lane ${laneId} on ${wl} spent ${Math.round(own / 1e5) / 10}M tokens over its life (spend: lines; the runner's run-total cap is ${RUNAWAY_DEFAULTS.totalTokens / 1e6}M, the largest completed lane measured 188.9M): read its session before relaunching`,
+				query: `${openEntries.shown.replace(/'[^']*'/g, "?")} -- the spend: entries per lane, each lane's newest minus the newest of the lane before it`,
 			});
 		}
 	}
