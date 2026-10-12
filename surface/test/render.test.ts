@@ -363,6 +363,27 @@ describe("render and one-liner (§ B7, § A1.2, § B13.1)", () => {
 		expect(r.text).not.toContain(`## ${STANDING_WORKLOAD_ID}`);
 	});
 
+	test("every event line names its ledger row id, so a CLAIM about it cites the row and not the render time", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const en = ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "assumption", body: "Commit b34782a" });
+		const ins = ledger.recordInstruction({ by: "surface", workloadId: wl, body: "go on", author: "jo", channel: "direct" });
+		expect(en).toMatch(/^en-/);
+		expect(ins).toMatch(/^in-/);
+		const q1 = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which token?", options: ["x", "y"] });
+		const ans = ledger.answerQuestion(q1, { by: "surface", answer: "x", author: "jo", channel: "direct" });
+		const q2 = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which file?", options: ["a", "b"] });
+		const wd = ledger.withdrawQuestion(q2, { by: "surface", reason: "moot", author: "jo", channel: "direct", then: "replan" });
+		const flip = ledger.flipMode(wl, { by: "surface", mode: "user-driven", author: "jo", channel: "direct" });
+		for (const id of [ans, wd, flip]) expect(id).toMatch(/^in-/);
+		const text = renderWake(ledger, { lastN: 20 }).text;
+		expect(text).toMatch(new RegExp(`\\n- \\S+Z assumption ${en} by lane-a on ${sl}: Commit b34782a`));
+		expect(text).toMatch(new RegExp(`\\n- \\S+Z instruction ${ins} \\(jo via direct\\): go on`));
+		expect(text).toMatch(new RegExp(`\\n- \\S+Z answer ${ans} to ${q1} \\(jo via direct\\): x`));
+		expect(text).toMatch(new RegExp(`\\n- \\S+Z withdrawal ${wd} of ${q2} \\(jo via direct, then replan\\): moot`));
+		expect(text).toMatch(new RegExp(`\\n- \\S+Z mode-flip ${flip} → user-driven \\(jo via direct\\)`));
+	});
+
 	test("needs-you bullets carry #n on answerable lines: 1..k in line order by default, the passed numbering's numbers when given", () => {
 		const { ledger } = tempLedger();
 		const { wl, sl } = workloadWithSlice(ledger);

@@ -66,13 +66,14 @@ function oneLinerParts(ledger: Ledger, workload: WorkloadStatusRow): { state: st
 
 const when = (iso: string): string => iso.replace(/\.\d{3}Z$/, "Z");
 
+// Every event line names its row id (en-/in-/sl-/msg-), so a CLAIM about it can cite the row, not the render time.
 function instructionLine(i: InstructionRow): string {
 	const who = `${i.author} via ${i.channel}`;
 	switch (i.kind) {
-		case "answer": return `${when(i.created_at)} answer to ${i.question_id} (${who}): ${i.body}`;
-		case "withdrawal": return `${when(i.created_at)} withdrew ${i.question_id} (${who}, then ${i.disposition}): ${i.body}`;
-		case "mode-flip": return `${when(i.created_at)} mode → ${i.body} (${who})`;
-		default: return `${when(i.created_at)} instruction (${who})${i.slice_id ? ` on ${i.slice_id}` : ""}: ${i.body}`;
+		case "answer": return `${when(i.created_at)} answer ${i.id} to ${i.question_id} (${who}): ${i.body}`;
+		case "withdrawal": return `${when(i.created_at)} withdrawal ${i.id} of ${i.question_id} (${who}, then ${i.disposition}): ${i.body}`;
+		case "mode-flip": return `${when(i.created_at)} mode-flip ${i.id} → ${i.body} (${who})`;
+		default: return `${when(i.created_at)} instruction ${i.id} (${who})${i.slice_id ? ` on ${i.slice_id}` : ""}: ${i.body}`;
 	}
 }
 
@@ -112,7 +113,7 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 	}
 	const recent = [
 		...ledger.instructions(workload.id).map((i) => ({ at: i.created_at, line: instructionLine(i) })),
-		...ledger.entries(workload.id).map((e) => ({ at: e.created_at, line: `${when(e.created_at)} ${e.kind} by ${e.created_by}${e.slice_id ? ` on ${e.slice_id}` : ""}: ${e.body}` })),
+		...ledger.entries(workload.id).map((e) => ({ at: e.created_at, line: `${when(e.created_at)} ${e.kind} ${e.id} by ${e.created_by}${e.slice_id ? ` on ${e.slice_id}` : ""}: ${e.body}` })),
 		...ledger.db.query<SliceRow, [string]>("SELECT * FROM slices WHERE workload_id = ? AND state IN ('done', 'cancelled')").all(workload.id)
 			.map((s) => ({ at: s.changed_at, line: `${when(s.changed_at)} slice ${s.id} ${s.state} by ${s.changed_by}${s.artifact ? `: ${s.artifact}` : ""}` })),
 		...ledger.db.query<MessageRow, [string]>("SELECT * FROM messages WHERE workload_id = ? AND state IN ('consumed', 'acted-on')").all(workload.id)
