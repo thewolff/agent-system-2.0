@@ -9,6 +9,7 @@ import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
+import { LAB_SCAN_MS } from "../extensions/lab-budget";
 import { launchVerdict } from "../extensions/launch";
 import orchestratorSurface from "../index";
 import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
@@ -87,7 +88,7 @@ describe("the tick's refused close is told once per refusal", () => {
 
 		timers.length = 0;
 		await f.emit("session_start", { type: "session_start" }, ctx);
-		expect(timers).toHaveLength(1);
+		expect(timers.map((t) => t.ms).slice(1)).toEqual([LAB_SCAN_MS]); // the poll first, then the lab-budget meter (MIGRATION.md item 113)
 
 		// the same refusal on two ticks: retried both times, told once
 		await tick();
@@ -152,7 +153,7 @@ describe("the tick's catch-up runs when the poll throws (MIGRATION.md item 71)",
 		const s = surfaceSession(ctx, e);
 		timers.length = 0;
 		await f.emit("session_start", { type: "session_start" }, ctx);
-		expect(timers).toHaveLength(1);
+		expect(timers.map((t) => t.ms).slice(1)).toEqual([LAB_SCAN_MS]); // the poll first, then the lab-budget meter (MIGRATION.md item 113)
 
 		let thrown: unknown = null;
 		try {
@@ -186,7 +187,7 @@ describe("the tick's catch-up runs when the poll throws (MIGRATION.md item 71)",
 		const s = surfaceSession(ctx, e);
 		timers.length = 0;
 		await f.emit("session_start", { type: "session_start" }, ctx);
-		expect(timers).toHaveLength(1);
+		expect(timers.map((t) => t.ms).slice(1)).toEqual([LAB_SCAN_MS]); // the poll first, then the lab-budget meter (MIGRATION.md item 113)
 		// Jo's first turn takes the session-start wake: nothing pending, nothing in flight, so the catch-up's push is live.
 		await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx);
 		expect(s.pending).toBeNull();

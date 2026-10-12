@@ -208,3 +208,27 @@ testRunner:
   soloCapMin: 10
   reportCapMb: 50
   queueMaxMin: 60
+
+# ── Per-lab token budget (MIGRATION.md item 113; surface/src/lab-budget.ts labBudgetConfig) ──
+# Tokens (OMP's usage.totalTokens, cache reads included) each lab may spend per rolling window, counted
+# from every `spend:` entry (lanes and their hands, reviews included) and `orchestrator-spend:` entry
+# (the orchestrator's own turns and hands) across all workloads. Over a budget, or at quotaReservePct
+# or less remaining in a fresh `omp usage` report (no older than quotaMaxAgeMin), the lab is held: no
+# new launch, relaunch or review dispatch on it, its running lanes are stopped, and Jo is asked once
+# (`lift` restarts the windows and relaunches what the hold stopped; `keep` stays held). The values
+# below are the code's defaults, written out; the basis is in MIGRATION.md item 113. Env overrides
+# per value: AGENT_SYSTEM_LAB_BUDGET_<LAB>_<5H|24H>, AGENT_SYSTEM_LAB_QUOTA_RESERVE_PCT. A malformed
+# value keeps its default. Reversal: delete the block, and the same defaults stand from the code.
+labBudget:
+  tokens:
+    anthropic:
+      5h: 800000000
+      24h: 2000000000
+    openai:
+      5h: 80000000
+      24h: 150000000
+    kimi:
+      5h: 100000000
+      24h: 250000000
+  quotaReservePct: 10
+  quotaMaxAgeMin: 30

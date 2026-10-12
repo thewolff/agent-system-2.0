@@ -207,6 +207,12 @@ describe("control writers (Codex review 2, R4)", () => {
 		expect(["test-requested: tr-1 pr=1", "test-run: tr-1 green", "push-dest: origin wl/x"].map(reservedPrefix)).toEqual(["test-requested", "test-run", "push-dest"]);
 		expect(reservedPrefix("test-run-failed: wl-m sl-x red")).toBeNull();
 	});
+	test("orchestrator-spend: (MIGRATION.md item 113) is the surface's alone and reserved: a lane, the runner or the starter writing it is dropped, and the lane tools refuse it", () => {
+		const body = "orchestrator-spend: 01a12d67 usd 1.5 tokens 2000000 wall 0 labs anthropic:2000000:1.5";
+		expect(control([entry(SURFACE_BY, body)]).map((c) => [c.prefix, c.laneId, c.rest])).toEqual([["orchestrator-spend", null, "01a12d67 usd 1.5 tokens 2000000 wall 0 labs anthropic:2000000:1.5"]]);
+		for (const forger of ["lane-m-1", LANE_RUNNER_BY, LANE_STARTER_BY]) expect(control([entry(forger, body)], "lane-m-1")).toEqual([]);
+		expect(reservedPrefix(body)).toBe("orchestrator-spend");
+	});
 });
 
 describe("resume session (Codex review B6)", () => {

@@ -75,7 +75,7 @@ export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
-	"test-requested", "test-run", "push-dest", "lane-model",
+	"test-requested", "test-run", "push-dest", "lane-model", "orchestrator-spend",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -118,6 +118,8 @@ const LANE_SCOPED: Record<string, true> = {
  * `done-because:` its writer is a holder (`validWriter`), and the lane tools refuse it as a body.
  * `lane-model: <provider/model|default> by jo at <iso>` is the surface's alone: Jo's `model` on the open or launch tool
  * (MIGRATION.md item 85). It is not lane-scoped; `laneModel` reads the newest, and the runner and `as2 lane` read it at every spawn.
+ * `orchestrator-spend: <sessionId> usd <x> tokens <n> wall 0[ labs …]` is the surface's alone, on the standing workload: the
+ * orchestrator's own usage since its previous record (MIGRATION.md item 113, surface/src/lab-budget.ts); a lane cannot forge it.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -146,6 +148,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"test-run": [TEST_RUNNER_BY],
 	"push-dest": [],
 	"lane-model": [SURFACE_BY],
+	"orchestrator-spend": [SURFACE_BY],
 };
 
 export interface ControlEntry {
@@ -354,7 +357,7 @@ export function instructionLine(i: InstructionRow): string {
 
 // ---- the predicate -----------------------------------------------------------------------------
 
-export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched";
+export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched" | "lab-budget";
 export type LaunchVerdict = { launch: true; cause: Cause } | { launch: false; reason: LaunchReason };
 
 /** A holder under a lease that is null or not yet lapsed at `now`. */
@@ -1008,6 +1011,8 @@ export const STARTER_EXIT: Record<string, number> = {
 	ledger: 8,
 	closed: 9,
 	"not-launchable": 10,
+	/** The workload's lab is over its budget (MIGRATION.md item 113): the starter raised Jo's question and reserved nothing. */
+	"lab-budget": 11,
 };
 
 /** The by-hand command for a user-driven workload (decision 14). */

@@ -42,6 +42,8 @@
 // | process-older-than-head | an `omp --cwd <checkout>` process (not a persistent seat: commands naming `/seat-sessions/` are skipped) started before HEAD arrived, where "arrived" is the later of HEAD's commit time and its newest reflog entry | `process-older-than-head:<pid>:<head12>` |
 // | ff-lull | checkout-behind-main with tracked files clean (`git status --porcelain --untracked-files=no` succeeded and printed nothing) AND zero review hands in flight. In flight = a `hand-spawn: … review yes` token with no `hand-settled: <token>` whose spawning lane has a live `lane.ts run` process: the `liveReviews` set the classifier passes to `builderLabs`. Unsettled review hands whose lane is gone are listed, not counted. The text cites the fingerprint rule (classifier/src/fingerprint.ts header: a review's fingerprint covers its lane's worktree only) rather than asserting the fast-forward is safe. | `ff-lull:<origin12>:<id of the newest review hand-settled entry>`, so one notice per lull |
 // | stale-backup | the ledger's newest write (max `created_at` across every table that has one, up to as-of) is newer than the newest scheduled copy (`ledger-<time>.db` in `backups/<backupNamespace>/` beside the ledger, the directory ledger/scripts/backup.ts writes; its time read from the name, copies named after as-of ignored; a copy counts only if the ledger's `copyProblem` accepts it as complete, so an empty, unreadable, corrupt or wrong-version file named like a copy is passed over for the next older one) by more than `--backup-gap` hours (default 30: the job's 24 h copy interval plus 6 h, so a finding means a daily copy was missed, not a busy day): writes no copy captured. Never the copy's wall-clock age: an old copy of a quiet ledger is not a finding (2026-10-09T18:03Z to 2026-10-11T18:10Z the ledger wrote nothing and every copy matched it). With no complete copy at all the gap runs from the ledger's first write. The text names the newest write, the newest complete copy, each newer file passed over with its problem, and the backup directory. | `stale-backup:<newest complete copy file name>` (`stale-backup:none` with no complete copy) |
+// | lab-budget | a lab is held by the per-lab budget (MIGRATION.md item 113; surface/src/lab-budget.ts `labStates`, the rule the launch gate, the runner and the classifier apply): its tokens in the rolling 5 h or 24 h window, counted from every `spend:` and `orchestrator-spend:` entry the ledger attributes to it since Jo's newest `lift` of it, reach the lab's budget, or a quota report shows a limit of the lab at or under `quotaReservePct` remaining (a limit with a reset time holds until that reset whatever the report's age, and stops counting at it; one without a reset time holds only while its report is no older than `quotaMaxAgeMin`). The config is profile/config.yml's `labBudget:` block over the defaults, then the env; the quota is the cache `omp usage` fills (`lab-quota.json` beside the ledger), not used under `--as-of` (it holds the newest probe only). The text is the held line (usage per window, top consumers), the lanes alive on the lab (the runner stops each within a minute, so one still alive means its runner predates item 113 or its check failed), and whether Jo's lab-budget question is open | `lab-budget:<lab>:<causes>:<answer id of Jo's newest lift or keep, or none>` |
+// | lab-budget (unknown) | a lab's coverage is unknown (`labStates` status `unknown`, PR #79 review B4): tokens not split by lab (legacy `spend:` rows, never apportioned) could take a window from its known usage to the budget, or no quota report of the lab is newer than `quotaMaxAgeMin` (kimi has no quota coverage and is never unknown for it; replay leaves the quota gap out, the cache holds the newest probe). Not held: no launch is refused and no lane is stopped. The text is the unknown line plus that statement | `lab-budget:<lab>:unknown:<causes>` (causes `5h`, `24h`, `quota`, joined by `+`) |
 //
 // Skips. An invariant that cannot be judged here is reported as `skipped: <reason>` rather than
 // silently passing: the three git/process invariants under `--as-of` (git state and the process
@@ -72,12 +74,16 @@ import { BACKUP_DEFAULTS, BACKUP_NAME, backupNamespace, copyProblem, processAliv
 import type { EntryKind, EntryRow, InstructionRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import { type ReservedLedgerView, reservedStates } from "../src/errors";
+import {
+	LAB_WINDOWS, type LabBudgetConfig, labBudgetQuestionLab, labDecisions, labHeldLine, laneLabs, labStates, type QuotaSnapshot, type UsageRow, usageEvents,
+} from "../src/lab-budget";
+import { labQuestionRows, loadLabBudgetConfig, quotaCachePath, readQuota, USAGE_SQL } from "../src/lab-budget-io";
 import { laneDir } from "../src/launch";
 import { STANDING_WORKLOAD_ID } from "../src/types";
 
 export const INVARIANTS = [
 	"dead-lane", "silent-lane", "orphan-hand", "no-independent-lab", "stale-reserved", "stuck-question", "stuck-review",
-	"provider-refusal-loop", "silent-orchestrator", "checkout-behind-main", "process-older-than-head", "ff-lull", "stale-backup",
+	"provider-refusal-loop", "silent-orchestrator", "checkout-behind-main", "process-older-than-head", "ff-lull", "stale-backup", "lab-budget",
 ] as const;
 export type Invariant = (typeof INVARIANTS)[number];
 
@@ -134,6 +140,23 @@ export interface Input {
 	orchestrators: () => Probe<OrchestratorProcess[]>;
 	/** The ledger's scheduled-copy directory, and how far the newest write may run ahead of the newest copy. */
 	backups: { dir: string; gapMs: number };
+	/** The lab budget's config and quota (`labBudgetInput`); absent, `check` reads them from this process's env. */
+	labBudget?: LabBudgetInput;
+}
+
+/** What the `lab-budget` invariant reads besides the ledger: the config (with the problems each kept at its default) and the quota cache. */
+export interface LabBudgetInput {
+	config: LabBudgetConfig;
+	errors: string[];
+	quota: QuotaSnapshot | null;
+	/** Where the quota was read from, for the finding's query. */
+	quotaFrom: string;
+}
+
+/** The lab budget as the surface, the runner and the classifier read it under `env`: profile/config.yml's `labBudget:`, the env, the quota cache. */
+export function labBudgetInput(env: Record<string, string | undefined>): LabBudgetInput {
+	const { config, errors } = loadLabBudgetConfig(env);
+	return { config, errors, quota: readQuota(env), quotaFrom: quotaCachePath(env) };
 }
 
 const MIN = 60_000;
@@ -677,6 +700,77 @@ export function check(input: Input): Report {
 		}
 	}
 
+	// ---- lab-budget -------------------------------------------------------------------------------
+	// The budget's own rule (surface/src/lab-budget.ts labStates) as of as-of: a held lab is a finding. Rows and Jo's
+	// answers after as-of are left out; the quota cache holds only the newest probe, so replay judges by tokens alone.
+	const lb = input.labBudget ?? labBudgetInput(process.env);
+	const asOfMs = Date.parse(asOf);
+	const usage = run<UsageRow>(USAGE_SQL);
+	const usageRowsAsOf = usage.rows.filter(r => r.created_at <= asOf);
+	const labQs = labQuestionRows({ db });
+	const decisions = labDecisions(labQs.questions, labQs.instructions).filter(d => d.at <= asOfMs);
+	const labEvents = usageEvents(usageRowsAsOf);
+	const quota = replay ? null : lb.quota;
+	const states = labStates({ events: labEvents, decisions, quota, config: lb.config, now: asOfMs });
+	const labOfLane = laneLabs(usageRowsAsOf);
+	const configNote = lb.errors.length > 0 ? ` Config problems, each kept at its default: ${lb.errors.join("; ")}.` : "";
+	for (const s of Object.values(states)) {
+		if (s.status === "healthy") continue;
+		if (s.status === "unknown") {
+			// Unknown coverage is reported, never held (PR #79 review B4). Replay has no quota (the cache holds the newest probe),
+			// so a quota gap there is the replay's, not the lab's, and is left out.
+			const gaps = replay ? s.unknown.filter(u => !u.startsWith("quota ")) : s.unknown;
+			if (gaps.length === 0) continue;
+			findings.push({
+				key: `lab-budget:${s.lab}:unknown:${[...new Set(gaps.map(u => u.split(" ")[0]!))].join("+")}`,
+				invariant: "lab-budget",
+				workload: `lab:${s.lab}`,
+				since: asOf,
+				text: `lab budget: ${s.lab} coverage unknown (${gaps.join("; ")}). Not held: no launch is refused and no running lane is stopped for it.${configNote}`,
+				query: `${usage.shown} -- deltas per workload (surface/src/lab-budget.ts usageEvents; legacy unsplit rows are unattributed); quota: ${replay ? "not read (replay)" : lb.quotaFrom}`,
+			});
+			continue;
+		}
+		// Since: the event that took a tripped window to its budget, or the probe that showed the quota at the reserve.
+		const starts: string[] = [];
+		for (const w of LAB_WINDOWS) {
+			if (s.usage[w.id] < s.budget[w.id]) continue;
+			const from = Math.max(asOfMs - w.ms, s.liftedAt ?? Number.NEGATIVE_INFINITY);
+			let sum = 0;
+			for (const e of labEvents) {
+				if (e.lab !== s.lab || e.at <= from || e.at > asOfMs) continue;
+				sum += e.tokens;
+				if (sum >= s.budget[w.id]) {
+					starts.push(new Date(e.at).toISOString());
+					break;
+				}
+			}
+		}
+		if (quota && s.reasons.some(r => r.startsWith("quota "))) starts.push(new Date(quota.probedAt).toISOString());
+		const causes = [...new Set(s.reasons.map(r => r.split(" ")[0]!))].join("+");
+		const last = decisions.filter(d => d.lab === s.lab).at(-1);
+		const open = labQs.questions.filter(q => q.state === "open" && q.created_at <= asOf && labBudgetQuestionLab(q) === s.lab);
+		const alive = liveLanes ? [...liveLanes].filter(l => labOfLane.get(l.split(" ")[1]!) === s.lab) : null;
+		const lanesText = alive === null
+			? `lanes alive on ${s.lab}: unknown (${NO_PGREP})`
+			: alive.length > 0
+				? `lanes alive on ${s.lab}: ${alive.join(", ")} (the runner stops a lane whose lab is held within a minute, so these run a runner from before item 113 or its check failed)`
+				: `no lane alive on ${s.lab}`;
+		const askText = open.length > 0
+			? `Jo's lab-budget question ${open.map(q => q.id).join(", ")} is open (lift or keep)`
+			: last?.word === "keep" && asOfMs - last.at < 5 * 60 * MIN
+				? `Jo answered keep (${last.answerId}) at ${new Date(last.at).toISOString()}; not asked again until ${new Date(last.at + 5 * 60 * MIN).toISOString()}`
+				: `no lab-budget question is open: the next launch, runner check or tick on ${s.lab} raises it`;
+		findings.push({
+			key: `lab-budget:${s.lab}:${causes}:${last?.answerId ?? "none"}`,
+			invariant: "lab-budget",
+			workload: `lab:${s.lab}`,
+			since: starts.sort()[0] ?? asOf,
+			text: `${labHeldLine(s)}${replay ? " (replay: tokens only, the quota cache holds the newest probe)" : ""}. No new lane launch, relaunch or review dispatch runs on ${s.lab}; ${lanesText}; ${askText}.${configNote}`,
+			query: `${usage.shown} -- deltas per workload (surface/src/lab-budget.ts usageEvents); lab-budget questions: SELECT * FROM questions WHERE slice_id LIKE 'sl-lab-budget-%'; quota: ${replay ? "not read (replay)" : lb.quotaFrom}`,
+		});
+	}
+
 	return {
 		asOf, replay, liveLanes: liveLanes ? [...liveLanes] : null, reviewsInFlight, orphanReviews, findings, skipped,
 		elapsedMs: Math.round(performance.now() - t0),
@@ -871,6 +965,7 @@ export function main(argv: string[]): number {
 			git: available("git") ? gitIn(args.repo) : null,
 			orchestrators: () => orchestratorsFromPs(args.repo),
 			backups: { dir: join(dirname(canonical), "backups", backupNamespace(canonical)), gapMs: args.backupGapMs },
+			labBudget: labBudgetInput(process.env),
 		});
 		if (args.reviews) console.log(reviewsLine(report));
 		else if (args.json) {

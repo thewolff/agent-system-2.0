@@ -172,6 +172,7 @@ import {
 } from "./src/rounds";
 import { isTier, route, STAKES, type Routing, type Tier } from "./src/route";
 import { identity, loadTierTable, modelIdentity, type TierTable } from "./src/tier-table";
+import { heldLabs } from "../surface/src/lab-budget-io";
 import { controlEntries } from "../surface/src/launch";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../surface/src/types";
 
@@ -194,6 +195,11 @@ export interface ClassifierDeps {
 	calibration: Calibration;
 	/** The ledger the routing rows land in; opened lazily in production. */
 	ledger(): RoutingLedger;
+	/**
+	 * The labs over their budget (surface/src/lab-budget-io.ts `heldLabs`, MIGRATION.md item 113), each with the reason a
+	 * dispatch on it is refused: their entries are skipped like a refused login, so a review needing one parks. None when absent.
+	 */
+	labHolds?(): ReadonlyMap<string, string>;
 	/** `created_by` on routing rows: this lane's id. */
 	laneId: string;
 	/** The workload this session is bound to (`AGENT_SYSTEM_WORKLOAD_ID`, gates/src/types.ts), if any. */
@@ -428,14 +434,15 @@ function routingNote(routing: Pending["routing"] | null, tier: Tier, models: str
 /**
  * DESIGN-2.0.md P-11 row 15 / SPEC-2.0.md § B11: the row's entries OMP's final selection will keep —
  * in the registry, on an enabled provider, credentialed session-free and (given a spawn key) for it,
- * on a provider that has not refused the login on the workload (`refused`, `refusedProviders`) —
- * in row order, and why each other entry was skipped.
+ * on a provider that has not refused the login on the workload (`refused`, `refusedProviders`), and
+ * on no lab over its budget (`labHolds`) — in row order, and why each other entry was skipped.
  */
 async function usableRow(
 	row: readonly string[],
 	registry: ModelAvailability,
 	disabled: ReadonlySet<string>,
 	refused: ReadonlyMap<string, string>,
+	labHolds: ReadonlyMap<string, string>,
 	spawnKey: string | null,
 ) {
 	const available = registry.getAvailable();
@@ -446,6 +453,7 @@ async function usableRow(
 		if (!model) why[selector] = "not in the model registry";
 		else if (disabled.has(model.provider)) why[selector] = "provider disabled";
 		else if (refused.has(model.provider)) why[selector] = `its provider refused the login on ${refused.get(model.provider)}`;
+		else if (labHolds.has(labOf(model.provider) ?? "")) why[selector] = labHolds.get(labOf(model.provider)!)!;
 		else if (!(await registry.getApiKey(model))) why[selector] = "no credentials";
 		else if (spawnKey && !(await registry.getApiKey(model, spawnKey))) why[selector] = `no credentials for spawn ${spawnKey}`;
 		else usable.push(selector);
@@ -1504,7 +1512,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					}
 					const row = deps.tierTable()[c.routing.tier];
 					const disabled = new Set(await deps.disabledProviders(ctx));
-					const { usable, why } = await usableRow(row, ctx.modelRegistry as unknown as ModelAvailability, disabled, refusedProviders(entries), null);
+					const { usable, why } = await usableRow(row, ctx.modelRegistry as unknown as ModelAvailability, disabled, refusedProviders(entries), deps.labHolds?.() ?? new Map(), null);
 					if (!attempt.live) throw retired();
 					const plan = reviewPlan({ row, usable, builders: buildersOf(c.workloadId), stakes: "production", grant: false, skipped: why });
 					if (plan.kind === "fanout") {
@@ -1623,7 +1631,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const spawnKey = event.spawnKey ?? null;
 				const disabled = new Set(await deps.disabledProviders(ctx));
 				const loginRefused = found ? refusedProviders(deps.ledger().entries(found.workloadId)) : new Map<string, string>();
-				const { usable, why, skipped } = await usableRow(table[tier], ctx.modelRegistry as unknown as ModelAvailability, disabled, loginRefused, spawnKey);
+				const { usable, why, skipped } = await usableRow(table[tier], ctx.modelRegistry as unknown as ModelAvailability, disabled, loginRefused, deps.labHolds?.() ?? new Map(), spawnKey);
 				if (found?.review) {
 					// After the credential awaits, before planning (so a hold never parks): a review whose token
 					// another instance recorded terminal, a loop stopped since classification (D10), an open
@@ -1929,6 +1937,19 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	};
 }
 
+/**
+ * The classifier's `labHolds` over the ledger the extension already holds open (PR #79 review S2): it never opens one of
+ * its own, so a dispatch reads the lab budget from the same ledger its routing rows go to, and a process whose ledger is
+ * not open yet (an unclassified eval spawn that reached no routing row) gates on no lab rather than opening the default
+ * ledger path. A test seam: production passes the closure over its `ledger` variable.
+ */
+export function sharedLedgerLabHolds(shared: () => Pick<Ledger, "db"> | undefined, env: Record<string, string | undefined>): () => ReadonlyMap<string, string> {
+	return () => {
+		const open = shared();
+		return open === undefined ? new Map() : heldLabs(open, env);
+	};
+}
+
 /** Production wiring: the host's `judge` role, the active profile's config.yml, and the ledger. */
 function productionExtension(): (pi: ExtensionAPI) => void {
 	let agentDir: string | undefined;
@@ -1963,6 +1984,8 @@ function productionExtension(): (pi: ExtensionAPI) => void {
 		laneId: process.env[LANE_ENV] || `lane-${process.pid}`,
 		boundWorkload: () => process.env[WORKLOAD_ENV] || undefined,
 		ledger: () => (ledger ??= Ledger.open(defaultLedgerPath(process.env))),
+		// Read at a dispatch over the ledger the routing rows already opened: never at load, and never an open of its own.
+		labHolds: sharedLedgerLabHolds(() => ledger, process.env),
 		async judge(ctx) {
 			// Same entry-module rule as settingsFor above.
 			const [{ settings }, { resolveJudge }] = await Promise.all([

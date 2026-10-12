@@ -123,14 +123,14 @@ describe("spend scan (§ 2 items 3, 4)", () => {
 		writeFileSync(join(dir, "2026_lane", "0-Hand.jsonl"), assistant(0.5, 2000));
 		writeFileSync(join(dir, "2026_lane", "nested", "1-Deep.jsonl"), assistant(0.125, 500));
 		writeFileSync(join(dir, "2026_lane", "notes.log"), assistant(100, 100));
-		expect(scanSpend(dir, new Map(), zero)).toEqual({ usd: 0.875, tokens: 3500, wallMin: 7 });
+		expect(scanSpend(dir, new Map(), zero)).toEqual({ usd: 0.875, tokens: 3500, wallMin: 7, labs: {} });
 	});
 	test("missing or partial usage counts 0; a missing directory adds nothing", () => {
 		const dir = tmp("ceiling-scan");
 		roots.push(dir);
 		writeFileSync(join(dir, "s.jsonl"), `${assistant(undefined, 10)}${assistant(0.5, "12")}${JSON.stringify({ type: "message", message: { role: "assistant" } })}\nnot json\n`);
-		expect(scanSpend(dir, new Map(), zero)).toEqual({ usd: 0.5, tokens: 10, wallMin: 7 });
-		expect(scanSpend(join(dir, "absent"), new Map(), { usd: 1, tokens: 2, wallMin: 3 })).toEqual({ usd: 1, tokens: 2, wallMin: 3 });
+		expect(scanSpend(dir, new Map(), zero)).toEqual({ usd: 0.5, tokens: 10, wallMin: 7, labs: {} });
+		expect(scanSpend(join(dir, "absent"), new Map(), { usd: 1, tokens: 2, wallMin: 3 })).toEqual({ usd: 1, tokens: 2, wallMin: 3, labs: {} });
 	});
 	test("offsets advance: a rescan adds only what was appended, a partial trailing line waits for its newline", () => {
 		const dir = tmp("ceiling-scan");
@@ -139,17 +139,17 @@ describe("spend scan (§ 2 items 3, 4)", () => {
 		writeFileSync(file, assistant(1, 100));
 		const offsets = new Map<string, number>();
 		let acc = scanSpend(dir, offsets, zero);
-		expect(acc).toEqual({ usd: 1, tokens: 100, wallMin: 7 });
+		expect(acc).toEqual({ usd: 1, tokens: 100, wallMin: 7, labs: {} });
 		expect(scanSpend(dir, offsets, acc)).toEqual(acc);
 		const line = assistant(2, 200);
 		appendFileSync(file, line.slice(0, 40));
 		acc = scanSpend(dir, offsets, acc);
-		expect(acc).toEqual({ usd: 1, tokens: 100, wallMin: 7 });
+		expect(acc).toEqual({ usd: 1, tokens: 100, wallMin: 7, labs: {} });
 		appendFileSync(file, line.slice(40));
 		mkdirSync(join(dir, "s"));
 		writeFileSync(join(dir, "s", "hand.jsonl"), assistant(4, 400));
 		acc = scanSpend(dir, offsets, acc);
-		expect(acc).toEqual({ usd: 7, tokens: 700, wallMin: 7 });
+		expect(acc).toEqual({ usd: 7, tokens: 700, wallMin: 7, labs: {} });
 		expect(scanSpend(dir, offsets, acc)).toEqual(acc);
 	});
 });

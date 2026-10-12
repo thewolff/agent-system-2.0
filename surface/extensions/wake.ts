@@ -37,11 +37,13 @@ import { contractPath, injectContract } from "../../gates/src/rows/r02-contract"
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
+import { gatedVerdict, labQuestionRows, labStopped, readLabView, releaseClearedLabs } from "../src/lab-budget-io";
+import { laneCap } from "../src/launch";
 import { renderWake } from "../src/render";
 import { type SurfaceSession, surfaceSession, type WakeTrigger } from "../src/session";
 import { recordLapsedLeases } from "../src/signals";
 import { type Ctx, HOLD_HOURS, type HostMessage, LEDGER_TOOL, PUSH_TRIES, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
-import { launchVerdict, triggerLaunch } from "./launch";
+import { labHoldNotice, launchVerdict, triggerLaunch } from "./launch";
 import { closeWorkloadWithEntry } from "./workload";
 
 const APPLIED_HEADING = "## Applied from the surface since your last turn";
@@ -292,6 +294,11 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		s.launching = true;
 		try {
 			const ledger = s.ledger();
+			// The lab budget (MIGRATION.md item 113): a lab whose hold cleared releases its open question and relaunches what it
+			// stopped, whether or not Jo answered keep (PR #79 review S1). The view is read only when there is something to release.
+			if (labQuestionRows(ledger).questions.some((q) => q.state === "open") || labStopped(ledger).length > 0) {
+				for (const line of releaseClearedLabs(ledger, readLabView(ledger, env))) s.tickNotices.push(`tick: ${line}`);
+			}
 			for (const w of ledger.inFlight()) {
 				const id = w.workload.id;
 				if (id === STANDING_WORKLOAD_ID) continue;
@@ -326,6 +333,14 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				}
 				s.stuckFinished.delete(id);
 				s.refusedClose.delete(id);
+				if (verdict?.launch === false && verdict.reason === "lab-budget") {
+					// Held by the lab budget: Jo is asked once per lab (the question), and told here only when it was raised.
+					const rows = ledger.launchRows(id, laneCap(env));
+					const hold = rows ? gatedVerdict(ledger, env, rows).hold : null;
+					const notice = hold ? labHoldNotice(ledger, id, hold) : null;
+					if (notice?.raised) s.tickNotices.push(`tick: ${notice.line}`);
+					continue;
+				}
 				if (!verdict?.launch) continue;
 				const r = await triggerLaunch(pi, ledger, env, id, "tick");
 				if (r.line) s.tickNotices.push(`tick: ${r.line}`);

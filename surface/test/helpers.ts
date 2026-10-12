@@ -184,7 +184,7 @@ export interface FakeRecord {
 export type FakeStep =
 	| { tool: string; args: Record<string, unknown> } | { sleepMs: number } | { exit: number } | { hang: true }
 	| { result: string; error?: { message: string; provider?: string; model?: string; retryable: boolean } }
-	| { usage: { usd: number; tokens: number }; hand?: string }
+	| { usage: { usd: number; tokens: number; provider?: string }; hand?: string }
 	| { background: number | "never" } | { wake: { ms: number; steps: FakeStep[] } }
 	| { ledger: { body: string; slice?: string } | { routing: { slice: string } } };
 /** The fake omp's script (surface/test/fake-omp.ts header). */
@@ -264,7 +264,7 @@ export function laneRoot(over: Record<string, string> = {}): LaneRoot {
 	const script = join(root, "omp-script.json");
 	const env: Record<string, string> = {
 		PATH: `${bin}:${process.env.PATH ?? ""}`, HOME: home, AGENT_SYSTEM_LEDGER_DB: ledgerPath, FAKE_OMP_RECORD: record, FAKE_OMP_SCRIPT: script,
-		AGENT_SYSTEM_LANE_READY_MS: "4000", AGENT_SYSTEM_LANE_END_GRACE_MS: "1500", AGENT_SYSTEM_LEASE_MS: "60000", ...over,
+		AGENT_SYSTEM_LANE_READY_MS: "4000", AGENT_SYSTEM_LANE_END_GRACE_MS: "1500", AGENT_SYSTEM_LEASE_MS: "60000", AGENT_SYSTEM_LAB_QUOTA_PROBE: "off", ...over,
 	};
 	return { root, home, repo, remote, ledgerPath, record, script, env };
 }

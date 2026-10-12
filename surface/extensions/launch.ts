@@ -10,10 +10,14 @@
 // message in the starter; a refusal wrote nothing. The result is one line for the tool result or
 // the log. The open tool, the answer and withdrawal paths, the mode flip and the wake tick all call
 // it; the tool below adds Jo's `launch-requested:` cause first, with Jo's `lane-model:` in the same
-// transaction when `model` is given (MIGRATION.md item 85).
+// transaction when `model` is given (MIGRATION.md item 85). The predicate's launch is then checked
+// against the lab budget (MIGRATION.md item 113, surface/src/lab-budget.ts): a workload whose next lane
+// runs on a held lab is not launched, and the lab-budget question is raised for Jo once.
 import type { Ledger } from "../../ledger/src/index";
+import { labHeldLine, type LabState, labUnknownLine } from "../src/lab-budget";
+import { gatedVerdict, raiseLabBudgetQuestion } from "../src/lab-budget-io";
 import {
-	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, type LaunchVerdict, launchRequestedBody, modelProblem, verdictOf,
+	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, type LaunchVerdict, launchRequestedBody, modelProblem,
 } from "../src/launch";
 import { surfaceSession } from "../src/session";
 import { DUE_PREFIX, LAUNCH_LANE_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult } from "../src/types";
@@ -37,7 +41,7 @@ export interface LaunchOutcome {
 export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, workloadId: string, who: string): Promise<LaunchOutcome> {
 	const rows = ledger.launchRows(workloadId, laneCap(env));
 	if (!rows) return { attempted: false, code: null, line: `no workload ${workloadId}` };
-	const verdict = verdictOf(rows);
+	const { verdict, hold, coverage } = gatedVerdict(ledger, env, rows);
 	if (!verdict.launch) {
 		switch (verdict.reason) {
 			case "standing":
@@ -57,6 +61,8 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 				return { attempted: false, code: null, line: `${workloadId} has had a lane and no new cause: relaunch on your word with ${LAUNCH_LANE_TOOL}` };
 			case "closed":
 				return { attempted: false, code: null, line: `${workloadId} is closed; nothing launched` };
+			case "lab-budget":
+				return { attempted: false, code: null, line: labHoldNotice(ledger, workloadId, hold!).line };
 		}
 	}
 	if (!pi.exec) return { attempted: false, code: null, line: `${workloadId}: the host has no exec for extensions, so the starter could not run; launch by hand with \`bun ${LANE_SCRIPT} launch ${workloadId}\`` };
@@ -64,7 +70,9 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 		const r = await pi.exec("bun", [LANE_SCRIPT, "launch", workloadId, "--requested-by", who], { timeout: 30_000 });
 		const out = (r.stdout.trim() || r.stderr.trim()).split("\n").filter(Boolean);
 		const last = out[out.length - 1] ?? (r.killed ? "the starter was killed before it printed" : `the starter exited ${r.code} without a line`);
-		return { attempted: true, code: r.code, line: r.code === 0 ? `${workloadId}: ${last}` : `${workloadId}: launch failed (starter exit ${r.code}): ${last}` };
+		// The receipt names a lab whose budget coverage is unknown (PR #79 review B4): the launch went ahead, nothing is held.
+		const tail = coverage ? `; ${labUnknownLine(coverage)}` : "";
+		return { attempted: true, code: r.code, line: r.code === 0 ? `${workloadId}: ${last}${tail}` : `${workloadId}: launch failed (starter exit ${r.code}): ${last}` };
 	} catch (err) {
 		return { attempted: true, code: null, line: `${workloadId}: the starter could not be run: ${String(err)}` };
 	}
@@ -72,12 +80,25 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 
 /**
  * The verdict alone, for the tick: whether a launch would be attempted now, or the workload is
- * awaiting close (the tick closes it). The tick execs only on a launch verdict, so a refused
- * workload costs one read per poll and no process. Null when there is no such workload.
+ * awaiting close (the tick closes it), or held by the lab budget. The tick execs only on a launch
+ * verdict, so a refused workload costs one read per poll and no process. Null when there is no such workload.
  */
 export function launchVerdict(ledger: Ledger, env: Record<string, string | undefined>, workloadId: string): LaunchVerdict | null {
 	const rows = ledger.launchRows(workloadId, laneCap(env));
-	return rows && verdictOf(rows);
+	return rows && gatedVerdict(ledger, env, rows).verdict;
+}
+
+/** A launch held by the lab budget: the question raised for Jo on this workload when none is open for the lab, and the line saying so. */
+export function labHoldNotice(ledger: Ledger, workloadId: string, hold: LabState): { line: string; raised: string | null } {
+	let raised: string | null = null;
+	let failed = "";
+	try {
+		raised = raiseLabBudgetQuestion(ledger, { by: SURFACE_BY, workloadId, state: hold });
+	} catch (err) {
+		failed = `; the question could not be raised: ${String(err)}`;
+	}
+	const asked = raised ? `; asked Jo (${raised})` : failed || "; the lab-budget question is already open or Jo answered keep";
+	return { line: `${workloadId} not launched: ${labHeldLine(hold)}${asked}`, raised };
 }
 
 export default function launchRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {

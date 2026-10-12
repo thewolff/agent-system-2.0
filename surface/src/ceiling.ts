@@ -9,6 +9,7 @@
 // compared; wall is lane run time in minutes.
 import { closeSync, type Dirent, fstatSync, openSync, readdirSync, readSync } from "node:fs";
 import { join } from "node:path";
+import { type Lab, LABS, labOf } from "../../classifier/src/lab";
 import type { InstructionRow, RoutingKind, Stakes } from "../../ledger/src/index";
 import { type ControlEntry, JO_HOLDER } from "./launch";
 import { SURFACE_BY } from "./types";
@@ -17,10 +18,21 @@ export interface Ceiling {
 	usd: number;
 	wallMin: number;
 }
+/** One lab's share of a spend: tokens and dollars on that lab's providers (classifier/src/lab.ts `labOf`). */
+export interface LabTally {
+	tokens: number;
+	usd: number;
+}
+export type LabTallies = Partial<Record<Lab, LabTally>>;
 export interface Spend {
 	usd: number;
 	tokens: number;
 	wallMin: number;
+	/**
+	 * The same usage split by lab (MIGRATION.md item 113): usage on a provider with no lab (the TypeSafe judge) is in the
+	 * totals and in no lab. Absent on a legacy `spend:` body, which carried no split.
+	 */
+	labs?: LabTallies;
 }
 
 // ---- sizing ------------------------------------------------------------------------------------
@@ -102,12 +114,38 @@ export function effectiveCeiling(control: readonly ControlEntry[], instructions:
 
 // ---- spend: ------------------------------------------------------------------------------------
 
-/** `spend: <laneId> usd <x> tokens <n> wall <min>`: dollars to 4 places, wall to 0.1 min. */
+/**
+ * `spend: <laneId> usd <x> tokens <n> wall <min>[ labs <lab>:<tokens>:<usd>,…]`: dollars to 4 places, wall to 0.1 min; the
+ * labs tail (MIGRATION.md item 113) names each lab with usage, in `LABS` order, and is left off when none has any.
+ */
 export function spendBody(laneId: string, s: Spend): string {
-	return `spend: ${laneId} usd ${Math.round(s.usd * 1e4) / 1e4} tokens ${Math.round(s.tokens)} wall ${Math.round(s.wallMin * 10) / 10}`;
+	const labs = s.labs ? labsText(s.labs) : "";
+	return `spend: ${laneId} usd ${Math.round(s.usd * 1e4) / 1e4} tokens ${Math.round(s.tokens)} wall ${Math.round(s.wallMin * 10) / 10}${labs ? ` labs ${labs}` : ""}`;
 }
 
-const SPEND_REST = /^usd\s+(\S+)\s+tokens\s+(\S+)\s+wall\s+(\S+)$/;
+/** `<lab>:<tokens>:<usd>` joined by commas, in `LABS` order, for each lab with tokens or dollars; "" when none has. */
+export function labsText(labs: LabTallies): string {
+	return LABS.flatMap((lab) => {
+		const t = labs[lab];
+		return t && (t.tokens > 0 || t.usd > 0) ? [`${lab}:${Math.round(t.tokens)}:${Math.round(t.usd * 1e4) / 1e4}`] : [];
+	}).join(",");
+}
+
+/** The inverse of `labsText`; null when any item is malformed or names a lab `LABS` does not have. */
+export function parseLabs(text: string): LabTallies | null {
+	const out: LabTallies = {};
+	for (const item of text.split(",")) {
+		const m = /^([a-z]+):(\S+):(\S+)$/.exec(item);
+		if (!m || !(LABS as readonly string[]).includes(m[1]!)) return null;
+		const tokens = count(m[2]!);
+		const usd = count(m[3]!);
+		if (tokens === null || usd === null) return null;
+		out[m[1] as Lab] = { tokens, usd };
+	}
+	return out;
+}
+
+const SPEND_REST = /^usd\s+(\S+)\s+tokens\s+(\S+)\s+wall\s+(\S+)(?:\s+labs\s+(\S+))?$/;
 
 /** A `spend:` entry's `rest` (after the prefix and the lane id, as `controlEntries` splits it), parsed; null when malformed. */
 export function parseSpend(rest: string): Spend | null {
@@ -116,38 +154,57 @@ export function parseSpend(rest: string): Spend | null {
 	const usd = count(m[1]!);
 	const tokens = count(m[2]!);
 	const wallMin = count(m[3]!);
-	return usd === null || tokens === null || wallMin === null ? null : { usd, tokens, wallMin };
+	if (usd === null || tokens === null || wallMin === null) return null;
+	if (m[4] === undefined) return { usd, tokens, wallMin };
+	const labs = parseLabs(m[4]);
+	return labs === null ? null : { usd, tokens, wallMin, labs };
 }
 
 // ---- metering ----------------------------------------------------------------------------------
 
 /**
- * Add the assistant usage OMP wrote since the last scan to `acc` (§ 2 item 4). Every `*.jsonl`
+ * Add the model usage OMP wrote since the last scan to `acc` (§ 2 item 4). Every `*.jsonl`
  * under `sessionsDir`, recursively (a hand's session file is `<session>/<agent>.jsonl`), is read from
  * its offset in `offsets` (keyed by path; absent = 0) to its last newline; `offsets` advances past
  * what was read, so a partial trailing line waits for the next scan and nothing is counted twice.
- * A line counts when it is `{"type":"message","message":{"role":"assistant","usage":…}}`: its
- * `usage.cost.total` in dollars and `usage.totalTokens`; a missing or non-numeric field counts 0.
- * `acc.wallMin` passes through. A missing directory adds nothing.
+ * A line counts when it is `{"type":"message","message":{"role":"assistant","usage":…}}` or a
+ * `{"type":"model_usage","usage":…}` record (OMP's journal of a call made outside a turn: a cache warm,
+ * a judge; MIGRATION.md item 113): its `usage.cost.total` in dollars and `usage.totalTokens`, a
+ * missing or non-numeric field counting 0, added to the totals and to the lab of its `provider`
+ * (`labOf`; none for a provider with no lab). `acc.wallMin` passes through. A missing directory adds nothing.
  */
 export function scanSpend(sessionsDir: string, offsets: Map<string, number>, acc: Spend): Spend {
+	return scanFiles(jsonlFiles(sessionsDir), offsets, acc);
+}
+
+/** `scanSpend` over a list of session files (the orchestrator's own file and its hands' directory, MIGRATION.md item 113). */
+export function scanFiles(files: readonly string[], offsets: Map<string, number>, acc: Spend): Spend {
 	let usd = acc.usd;
 	let tokens = acc.tokens;
-	for (const file of jsonlFiles(sessionsDir)) {
+	const labs: LabTallies = {};
+	for (const lab of LABS) if (acc.labs?.[lab]) labs[lab] = { ...acc.labs[lab]! };
+	for (const file of files) {
 		const from = offsets.get(file) ?? 0;
 		const chunk = readComplete(file, from);
 		if (chunk === null) continue;
 		offsets.set(file, from + chunk.bytes);
 		for (const line of chunk.text.split("\n")) {
-			const u = assistantUsage(line);
+			const u = lineUsage(line);
+			if (u === null) continue;
 			usd += u.usd;
 			tokens += u.tokens;
+			const lab = u.provider === null ? null : labOf(u.provider);
+			if (lab === null) continue;
+			const t = (labs[lab] ??= { tokens: 0, usd: 0 });
+			t.tokens += u.tokens;
+			t.usd += u.usd;
 		}
 	}
-	return { usd, tokens, wallMin: acc.wallMin };
+	return { usd, tokens, wallMin: acc.wallMin, labs };
 }
 
-function jsonlFiles(dir: string): string[] {
+/** Every `*.jsonl` under `dir`, recursively; none for a missing directory. */
+export function jsonlFiles(dir: string): string[] {
 	let items: Dirent[];
 	try {
 		items = readdirSync(dir, { withFileTypes: true });
@@ -189,19 +246,33 @@ function readComplete(file: string, from: number): { text: string; bytes: number
 	}
 }
 
-function assistantUsage(line: string): { usd: number; tokens: number } {
-	if (!line.includes('"assistant"')) return { usd: 0, tokens: 0 };
+function lineUsage(line: string): { usd: number; tokens: number; provider: string | null } | null {
+	if (!line.includes('"assistant"') && !line.includes('"model_usage"')) return null;
 	let v: unknown;
 	try {
 		v = JSON.parse(line);
 	} catch {
-		return { usd: 0, tokens: 0 };
+		return null;
 	}
-	const rec = v as { type?: unknown; message?: { role?: unknown; usage?: { totalTokens?: unknown; cost?: { total?: unknown } } } } | null;
-	if (rec === null || typeof rec !== "object" || rec.type !== "message" || rec.message?.role !== "assistant") return { usd: 0, tokens: 0 };
-	const cost = rec.message.usage?.cost?.total;
-	const total = rec.message.usage?.totalTokens;
-	return { usd: typeof cost === "number" && Number.isFinite(cost) ? cost : 0, tokens: typeof total === "number" && Number.isFinite(total) ? total : 0 };
+	type Usage = { totalTokens?: unknown; cost?: { total?: unknown } };
+	const rec = v as { type?: unknown; provider?: unknown; usage?: Usage; message?: { role?: unknown; provider?: unknown; usage?: Usage } } | null;
+	if (rec === null || typeof rec !== "object") return null;
+	let usage: Usage | undefined;
+	let provider: unknown;
+	if (rec.type === "message" && rec.message?.role === "assistant") {
+		usage = rec.message.usage;
+		provider = rec.message.provider;
+	} else if (rec.type === "model_usage") {
+		usage = rec.usage;
+		provider = rec.provider;
+	} else return null;
+	const cost = usage?.cost?.total;
+	const total = usage?.totalTokens;
+	return {
+		usd: typeof cost === "number" && Number.isFinite(cost) ? cost : 0,
+		tokens: typeof total === "number" && Number.isFinite(total) ? total : 0,
+		provider: typeof provider === "string" ? provider : null,
+	};
 }
 
 /**

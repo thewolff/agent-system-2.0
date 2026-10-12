@@ -179,7 +179,7 @@ describe("a relaunch on the same ceiling (§ 2 items 3, 4)", () => {
 		writeFileSync(join(dir, "2026_lane", "0-Hand.jsonl"), assistant(10));
 		c.at("2026-10-01T11:00:00.000Z");
 		const run1: Spend = { ...scanSpend(dir, new Map(), { usd: 0, tokens: 0, wallMin: 0 }), wallMin: wallMinutes(control(), Date.parse(c.now()), start1) };
-		expect(run1).toEqual({ usd: 40, tokens: 2000, wallMin: 60 });
+		expect(run1).toEqual({ usd: 40, tokens: 2000, wallMin: 60, labs: {} });
 		const first = step(fresh, NORMAL, run1, ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), ledger.instructions(wl), NORMAL));
 		expect(first).toMatchObject({ level: 80, raise: true, stop: false });
 		raiseCeilingQuestion(ledger, { workloadId: wl, laneId: lane1, spend: run1, ceiling: NORMAL, stakes: "normal" });
@@ -194,7 +194,7 @@ describe("a relaunch on the same ceiling (§ 2 items 3, 4)", () => {
 		writeFileSync(laneFile, assistant(2.5), { flag: "a" });
 		c.at("2026-10-01T13:30:00.000Z");
 		const run2: Spend = { ...scanSpend(dir, new Map(), { usd: 0, tokens: 0, wallMin: 0 }), wallMin: wallMinutes(control(), Date.parse(c.now()), start2) };
-		expect(run2).toEqual({ usd: 42.5, tokens: 3000, wallMin: 90 });
+		expect(run2).toEqual({ usd: 42.5, tokens: 3000, wallMin: 90, labs: {} });
 		const state = () => ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), ledger.instructions(wl), NORMAL);
 		expect(state()).toBe("none");
 		expect(step({ raised: [] }, NORMAL, run2, state())).toMatchObject({ level: 80, raise: true, stop: false });

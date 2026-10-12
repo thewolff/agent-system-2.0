@@ -338,6 +338,10 @@ surface/extensions/ceiling.ts	module	-
 surface/test/ceiling.test.ts	test	-
 surface/test/ceiling-meter.test.ts	test	-
 surface/test/ceiling-surface.test.ts	test	-
+surface/src/lab-budget.ts	module	-
+surface/src/lab-budget-io.ts	module	-
+surface/extensions/lab-budget.ts	module	-
+surface/test/lab-budget.test.ts	test	-
 surface/test/plan-first.test.ts	test	-
 surface/src/wtree.ts	module	-
 surface/test/wtree.test.ts	test	-

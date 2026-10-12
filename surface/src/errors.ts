@@ -38,6 +38,7 @@
 // session-stable number Jo answers with, set by surface/src/numbering.ts, never here. An idle line
 // has no one-word answer, so it is never numbered.
 import { type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
+import { labBudgetQuestionLab } from "./lab-budget";
 import { type ControlEntry, controlEntries, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
 import { questionSubject } from "./orchestrator-question";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
@@ -337,7 +338,8 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 				questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `the orchestrator asked you (${q.id}${about ? `, about ${about}` : ""}): ${short(q.body, 120)} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
 				continue;
 			}
-			const body = isPlanQuestionIn(control, q) ? q.body.split("\n").join("\n  ") : short(q.body, 120);
+			// The lab-budget question (MIGRATION.md item 113) shows whole: its lab, usage per window and top consumers are the point.
+			const body = isPlanQuestionIn(control, q) ? q.body.split("\n").join("\n  ") : labBudgetQuestionLab(q) !== null ? q.body : short(q.body, 120);
 			questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `lane on ${label} is waiting on you (${q.id}, slice ${q.slice_id}): ${body} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
 		}
 		for (const w of openPromptWaits(ledger, wl)) {

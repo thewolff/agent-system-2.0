@@ -15,7 +15,7 @@ import { handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, type QuestionRow } from "../../ledger/src/index";
 import { ceilingBody, CEILING_OPTIONS, parseSpend } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
-import { branchName, type ControlEntry, doneBody, laneCap, laneDir, laneEnv, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, verdictOf, worktreePath } from "../src/launch";
+import { branchName, type ControlEntry, doneBody, laneCap, laneDir, laneEnv, laneExit, laneExitBody, laneModelBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, verdictOf, worktreePath } from "../src/launch";
 // A namespace import, not named ones: a name lane.ts stops exporting fails only the test that calls it, not the module load.
 import * as laneScript from "../scripts/lane";
 import { SURFACE_BY } from "../src/types";
@@ -1290,6 +1290,102 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 		const starts = fakeRecords(r).filter((x) => x.argv !== undefined);
 		expect(starts).toHaveLength(2);
 		expect(eventsOf(r, starts[1]!.pid)).toEqual(["abort", "eof"]);
+	}, 60_000);
+});
+
+/** The quota cache beside the root's ledger (the default `lab-quota.json`), fresh now, with openai-codex's 7-day limit at `remainingFraction`. */
+function quotaFile(r: LaneRoot, remainingFraction: number): void {
+	const report = { reports: [{ provider: "openai-codex", limits: [{ id: "openai-codex:primary", label: "7 days", window: { durationMs: 604_800_000, resetsAt: Date.now() + 86_400_000 }, amount: { remainingFraction } }] }] };
+	writeFileSync(join(r.ledgerPath, "..", "lab-quota.json"), JSON.stringify({ probedAt: Date.now(), report }));
+}
+const labQuestionsOf = (questions: readonly QuestionRow[]) => questions.filter((q) => q.slice_id.startsWith("sl-lab-budget-"));
+
+describe("lane script: the lab budget (MIGRATION.md item 113)", () => {
+	test("launch refusal: Jo's model is on a held lab (openai at 5 % quota): the starter exits lab-budget, reserves nothing, and raises the lab-budget question once", () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r);
+		const l = ledgerOf(r);
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: laneModelBody("openai-codex/gpt-6-sol", l.now()) });
+		l.close();
+		quotaFile(r, 0.05);
+		const first = lane(r, ["launch", wl, "--requested-by", "test"]);
+		expect(first.code).toBe(STARTER_EXIT["lab-budget"]!);
+		expect(first.err).toContain("lab budget: openai is held (quota openai-codex:primary 5% left (reserve 10%))");
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(STARTER_EXIT["lab-budget"]!);
+		const snap = laneSnapshot(r, wl);
+		expect(snap.workload!.holder).toBeNull();
+		expect(snap.control.filter((c) => c.prefix === "launch" || c.prefix === "lane-started")).toEqual([]);
+		const qs = labQuestionsOf(snap.questions);
+		expect(qs.map((q) => [q.created_by, q.state, JSON.parse(q.options)])).toEqual([[LANE_STARTER_BY, "open", ["lift", "keep"]]]);
+		expect(fakeRecords(r)).toEqual([]);
+	}, 60_000);
+
+	test("runner stop: a lane OMP reports on a held lab is stopped before it spends a prompt: lane-stop: accepted lab-budget-openai, outcome stop reason lab-budget, no lane-died: though a slice is open, released, the question raised by the runner", async () => {
+		const r = makeRoot({ AGENT_SYSTEM_LAB_CHECK_MS: "1000" });
+		const { wl } = openWorkload(r, { slice: true });
+		quotaFile(r, 0.05);
+		writeFileSync(r.script, JSON.stringify({ stateModel: { provider: "openai-codex", id: "gpt-6-sol" }, steps: [{ usage: { usd: 0.1, tokens: 10 } }, { hang: true }] }));
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "stop", reason: "lab-budget" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.deaths).toEqual([]);
+		expect(snap.workload!.holder).toBeNull();
+		expect(snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === laneId).map((c) => [c.createdBy, c.rest])).toEqual([[LANE_RUNNER_BY, "accepted lab-budget-openai"]]);
+		expect(labQuestionsOf(snap.questions).map((q) => [q.created_by, q.state])).toEqual([[LANE_RUNNER_BY, "open"]]);
+		const [rec] = fakeRecords(r);
+		expect(eventsOf(r, rec!.pid)).toContain("abort");
+	}, 60_000);
+
+	test("the control: with openai held, a lane OMP reports on kimi runs to completion untouched, and no question is raised", async () => {
+		const r = makeRoot({ AGENT_SYSTEM_LAB_CHECK_MS: "1000" });
+		const { wl } = openWorkload(r);
+		quotaFile(r, 0.05);
+		writeFileSync(r.script, JSON.stringify({ stateModel: { provider: "moonshot", id: "kimi-k3" }, steps: [{ usage: { usd: 0.1, tokens: 10 } }, { sleepMs: 2500 }, { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] }));
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "completed" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.control.filter((c) => c.prefix === "lane-stop")).toEqual([]);
+		expect(labQuestionsOf(snap.questions)).toEqual([]);
+	}, 60_000);
+
+	test("B2: the runner adds its own unflushed tokens at each check: no flush is due, the lane's own openai tokens pass the 5 h budget, and the next check stops it", async () => {
+		const r = makeRoot({ AGENT_SYSTEM_LAB_CHECK_MS: "1000", AGENT_SYSTEM_LAB_SPEND_MS: "3600000", AGENT_SYSTEM_LAB_BUDGET_OPENAI_5H: "100" });
+		const { wl } = openWorkload(r);
+		quotaFile(r, 0.9);
+		// sleepMs outlasts STOP_POLL_MS (5 s), so a check runs after the usage lands and before the lane completes.
+		writeFileSync(r.script, JSON.stringify({ stateModel: { provider: "openai-codex", id: "gpt-6-sol" }, steps: [{ usage: { usd: 0.1, tokens: 150, provider: "openai-codex" } }, { sleepMs: 12_000 }, { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] }));
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "stop", reason: "lab-budget" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === laneId).map((c) => c.rest)).toEqual(["accepted lab-budget-openai"]);
+		// No flush was due, so nothing reached the ledger before the stop's own spend: line; every line (the stop's, the exit's)
+		// carries the lane's cumulative 150, which usageEvents reads as one delta, so the check counted the unflushed 150 once.
+		expect([...new Set(spendsOf(snap.control, laneId).map((s) => s.tokens))]).toEqual([150]);
+	}, 60_000);
+
+	test("S3: a first launch with no named model waits for OMP's get_state model before the first prompt, and a held lab stops it with no prompt sent", async () => {
+		const r = makeRoot({ AGENT_SYSTEM_LAB_CHECK_MS: "1000" });
+		const { wl } = openWorkload(r);
+		quotaFile(r, 0.05);
+		writeFileSync(r.script, JSON.stringify({ stateModel: { provider: "openai-codex", id: "gpt-6-sol" }, stateDelayMs: 1500, steps: [{ usage: { usd: 0.1, tokens: 10 } }, { hang: true }] }));
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "stop", reason: "lab-budget" });
+		const [rec] = fakeRecords(r);
+		expect(eventsOf(r, rec!.pid)).not.toContain("prompt");
+		expect(laneSnapshot(r, wl).control.filter((c) => c.prefix === "lane-ready")).toEqual([]);
+	}, 60_000);
+
+	test("B4: unknown is not held: with no quota report at all, a lane on openai runs to completion and no question is raised", async () => {
+		const r = makeRoot({ AGENT_SYSTEM_LAB_CHECK_MS: "1000" });
+		const { wl } = openWorkload(r);
+		writeFileSync(r.script, JSON.stringify({ stateModel: { provider: "openai-codex", id: "gpt-6-sol" }, steps: [{ usage: { usd: 0.1, tokens: 10 } }, { sleepMs: 2500 }, { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] }));
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		expect(await exitOf(r, wl, laneIdOf(wl, 1))).toMatchObject({ outcome: "completed" });
+		expect(labQuestionsOf(laneSnapshot(r, wl).questions)).toEqual([]);
 	}, 60_000);
 });
 

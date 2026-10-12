@@ -41,6 +41,7 @@ import { type Subprocess, spawn, spawnSync } from "bun";
 import { appendFileSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { type Lab, LABS, labOf } from "../../classifier/src/lab";
 import { fenceTargets } from "../../gates/src/fence";
 import { canonicalPath } from "../../ledger/src/locality";
 import {
@@ -51,12 +52,14 @@ import {
 } from "../src/ceiling";
 import { newLaneSession, runCtxIndex, topLevelSessions } from "../src/ctx-index";
 import { decisionLogContext, repoOf } from "../src/decision-log";
+import { labHeldLine, type LabState, labUnknownLine, nextLaneLab } from "../src/lab-budget";
+import { gatedVerdict, nextLabState, raiseLabBudgetQuestion, readLabView, refreshQuota } from "../src/lab-budget-io";
 import { factsBlock } from "../src/facts";
 import {
 	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
-	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
+	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, type PromptError, promptErrorOf, releasedOpen, sliceCounts, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
@@ -76,6 +79,9 @@ const msEnv = (name: string, fallback: number): number => {
 /** The readiness window: the lane's own claim must land within the pre-claim lease (decisions 8, 14). */
 const READY_MS = msEnv("AGENT_SYSTEM_LANE_READY_MS", PRECLAIM_LEASE_MS);
 const READY_POLL_MS = 1_000;
+/** The runner's lab budget poll (MIGRATION.md item 113): a running `spend:` while the lane grows, and the held-lab check. */
+const LAB_SPEND_EVERY_MS = msEnv("AGENT_SYSTEM_LAB_SPEND_MS", 10 * 60_000);
+const LAB_CHECK_EVERY_MS = msEnv("AGENT_SYSTEM_LAB_CHECK_MS", 60_000);
 /** After `abort` and stdin EOF, the wait before SIGKILL (§ 3 stop path). */
 const END_GRACE_MS = msEnv("AGENT_SYSTEM_LANE_END_GRACE_MS", 30_000);
 const PROFILE = process.env.AGENT_SYSTEM_PROFILE || process.env.OMP_PROFILE || "agent-system-2";
@@ -285,7 +291,23 @@ function failAfterReserve(ledger: Ledger, wl: string, laneId: string, f: Fail, l
 	}
 }
 
+/**
+ * An autonomous launch onto a held lab (MIGRATION.md item 113) reserves nothing: the starter raises Jo's
+ * lab-budget question (once per lab) and exits `lab-budget`. A lab whose coverage is unknown launches, and the
+ * starter says so on stderr. An interactive lane is Jo at the keyboard and is not gated.
+ */
+function labGateOrExit(ledger: Ledger, wl: string): void {
+	const rows = ledger.launchRows(wl, laneCap(process.env));
+	if (rows === null) return;
+	const s = nextLabState(ledger, process.env, controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder, rows.holders)));
+	if (s?.status === "unknown") process.stderr.write(`lane: ${wl}: ${labUnknownLine(s)}\n`);
+	if (s?.status !== "held") return;
+	raiseLabBudgetQuestion(ledger, { by: LANE_STARTER_BY, workloadId: wl, state: s });
+	throw new Fail("reserve", `${wl} not launched: ${labHeldLine(s)}`, STARTER_EXIT["lab-budget"]!);
+}
+
 function reserveOrExit(ledger: Ledger, wl: string, who: string, interactive: boolean): string {
+	if (!interactive) labGateOrExit(ledger, wl);
 	const r = ledger.reserveLane(wl, {
 		by: LANE_STARTER_BY, cap: laneCap(process.env), leaseMs: PRECLAIM_LEASE_MS, requestedBy: who,
 		decide: interactive ? decideInteractive : decideLaunch,
@@ -426,7 +448,8 @@ async function cmdDrain(after: string): Promise<number> {
 				const next = ledger.inFlight().map((w) => w.workload.id).find((id) => {
 					if (tried.has(id)) return false;
 					const rows = ledger.launchRows(id, cap);
-					return rows !== null && verdictOf(rows).launch;
+					// A workload on a held lab is not tried (MIGRATION.md item 113): the surface's tick raises Jo's question for it.
+					return rows !== null && gatedVerdict(ledger, process.env, rows).verdict.launch;
 				});
 				if (next === undefined) break;
 				tried.add(next);
@@ -1095,8 +1118,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	 */
 	const meter = (stakes: Stakes, control: readonly ControlEntry[]): boolean => {
 		let stopping = false;
+		let spend: Spend | null = null;
 		try {
-			const spend = measure(control);
+			spend = measure(control);
 			const instructions = ledger.instructions(wl);
 			const ceiling = effectiveCeiling(control, instructions, stakes);
 			const step = meterStep(meterState, { ceiling, spend, question: ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), instructions, ceiling) });
@@ -1108,7 +1132,61 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			process.stderr.write(`runner: the ceiling meter failed: ${String(err)}\n`);
 		}
 		if (stopping) stop("ceiling", "ceiling");
+		else if (spend !== null && labStep(spend, control)) stopping = true;
 		return stopping;
+	};
+
+	// The lab budget (MIGRATION.md item 113): a running total on the ledger every LAB_SPEND_EVERY_MS while it grows, so the
+	// budget sees a long lane before it ends, and a check every LAB_CHECK_EVERY_MS (the first poll at once, before the first prompt).
+	// At each check the runner adds its own measured, unflushed spend (PR #79 review B2); another lane's unflushed usage
+	// reaches this check only at that lane's next flush, so the budget can lag other lanes by up to LAB_SPEND_EVERY_MS.
+	let labSpendAt = Date.now();
+	let labSpendTokens = 0;
+	let labCheckedAt = 0;
+	/** This lane's spend at the previous lab check; null before the first, whose baseline holds the earlier runs' hands. */
+	let labSeen: Spend | null = null;
+	/** The unknown-coverage line last logged for this lane's lab, so a lasting gap is logged once, not every check. */
+	let labUnknownSaid = "";
+	/**
+	 * One lab poll: record the running `spend:` when due, then stop the lane when the lab it runs on is held, or when a held lab's
+	 * share of this lane's spend (its hands') grew since the last check. A lab whose coverage is unknown is never a stop: it is
+	 * logged. The stop raises Jo's lab-budget question (once per lab) and accepts `lab-budget-<lab>` through the stop path, which
+	 * the lift's relaunch reads. A failure (a budget read that fails) is logged and the lane keeps running.
+	 */
+	const labStep = (spend: Spend, control: readonly ControlEntry[]): boolean => {
+		let held: LabState | null = null;
+		try {
+			const now = Date.now();
+			if (spend.tokens > labSpendTokens && now - labSpendAt >= LAB_SPEND_EVERY_MS) {
+				record(spendBody(laneId, spend));
+				labSpendAt = now;
+				labSpendTokens = spend.tokens;
+			}
+			if (now - labCheckedAt < LAB_CHECK_EVERY_MS) return false;
+			labCheckedAt = now;
+			void refreshQuota(process.env, PROFILE, now);
+			const own = labOf(ranModel ?? model ?? "") ?? nextLaneLab(control);
+			const unflushed = { workload_id: wl, body: spendBody(laneId, spend), created_by: LANE_RUNNER_BY, created_at: new Date(now).toISOString() };
+			const view = readLabView(ledger, process.env, now, [unflushed]);
+			const grew = (lab: Lab): boolean => labSeen !== null && (spend.labs?.[lab]?.tokens ?? 0) > (labSeen.labs?.[lab]?.tokens ?? 0);
+			held = LABS.map((lab) => view.states[lab]).find((s) => s.status === "held" && (s.lab === own || grew(s.lab))) ?? null;
+			labSeen = spend;
+			const ownState = own === null ? null : view.states[own];
+			const unknownLine = ownState?.status === "unknown" ? labUnknownLine(ownState) : "";
+			if (unknownLine !== labUnknownSaid) {
+				labUnknownSaid = unknownLine;
+				if (unknownLine) process.stderr.write(`runner: ${laneId} runs on: ${unknownLine}\n`);
+			}
+			if (held === null) return false;
+			record(spendBody(laneId, spend));
+			raiseLabBudgetQuestion(ledger, { by: LANE_RUNNER_BY, workloadId: wl, state: held, now });
+		} catch (err) {
+			process.stderr.write(`runner: the lab budget check failed, the lane keeps running: ${String(err)}\n`);
+		}
+		if (held === null) return false;
+		process.stderr.write(`runner: ${laneId} stopped: ${labHeldLine(held)}\n`);
+		stop(`lab-budget-${held.lab}`, "lab-budget");
+		return true;
 	};
 
 	/** Once: stdin EOF, then SIGKILL after the grace period if the child has not exited. */
@@ -1337,14 +1415,18 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		send({ id: "state", type: "get_state" });
 
 		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it. A named model
-		// also needs OMP's get_state to report exactly that provider/id (item 85). Ready means the claim, the model, the lane-ready:
-		// receipt and the prompt all landed; a failure in any of them is fatal (review 2, R2).
+		// also needs OMP's get_state to report exactly that provider/id (item 85); with no named model the runner still waits for
+		// get_state's answer (until the readiness window ends) so the lab budget checks the lab OMP started on before the first
+		// prompt (PR #79 review S3). Ready means the claim, the model, the lane-ready: receipt and the prompt all landed; a failure
+		// in any of them is fatal (review 2, R2).
 		const readyPoll = setInterval(() => {
 			if (ready || finished || outcome !== null || fatal !== null) return;
 			try {
 				const cur = ledger.workload(wl);
 				const claimed = cur !== null && cur.holder === laneId && cur.changed_by === laneId;
-				if (claimed && (model === null || modelChecked)) {
+				const windowOver = Date.now() - spawnedAt >= READY_MS;
+				if (claimed && (model === null ? stateSeen || windowOver : modelChecked)) {
+					if (!stateSeen) process.stderr.write(`runner: ${laneId}: no get_state answer within ${readyMinutes}; the lab budget checks the workload's last known lab until OMP names one\n`);
 					clearInterval(readyPoll);
 					const { workload: latest, control } = controlNow();
 					const stakes = latest?.stakes ?? w.stakes;
@@ -1359,7 +1441,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					record(laneReadyBody(laneId, ledger.now()));
 					sendPrompt(prompt);
 					ready = true;
-				} else if (Date.now() - spawnedAt >= READY_MS) {
+				} else if (windowOver) {
 					if (claimed) {
 						failModel(`named ${model}, no get_state model within ${readyMinutes}`);
 						return;

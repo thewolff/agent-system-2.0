@@ -6,6 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
+import { LAB_SCAN_MS } from "../extensions/lab-budget";
 import orchestratorSurface from "../index";
 import { Delivered, consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
@@ -123,8 +124,7 @@ describe("between wakes: a line written by another connection after the wake rea
 		// busy: the poll cannot push the pending wake (an idle one would; surface/test/wake-push.test.ts), and pushes nothing else while it is pending
 		const ctx = ctxOf({ idle: false });
 		await f.emit("session_start", { type: "session_start" }, ctx);
-		expect(timers).toHaveLength(1);
-		expect(timers[0]!.ms).toBe(1234);
+		expect(timers.map((t) => t.ms)).toEqual([1234, LAB_SCAN_MS]); // the poll, then the lab-budget meter (MIGRATION.md item 113)
 		const poll = timers[0]!.fn;
 		// wake pending on a busy session: the poll stays quiet (the wake carries everything)
 		const lane = open(e);

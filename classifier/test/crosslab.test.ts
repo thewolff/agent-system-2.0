@@ -12,12 +12,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkBriefFields } from "../../gates/src/rows/r05-brief-fields";
 import { Ledger, type Stakes } from "../../ledger/src/index";
-import { createClassifierExtension, REVIEW_FINDINGS_PARAGRAPH } from "../extension";
+import { createClassifierExtension, REVIEW_FINDINGS_PARAGRAPH, sharedLedgerLabHolds } from "../extension";
 import { loadCalibration } from "../src/classify";
 import { reviewStopBody, stopReviewsInstructionBody } from "../src/review-stop";
 import { handSpawnBody } from "../src/lab";
 import { countRounds, parseReviewRound, reviewRoundsBody, roundsInstructionBody } from "../src/rounds";
 import { tierTableFromConfig, type TierTable } from "../src/tier-table";
+import { spendBody } from "../../surface/src/ceiling";
 import { JO_HOLDER } from "../../surface/src/launch";
 import { SURFACE_BY } from "../../surface/src/types";
 import { asyncDelivery, dist, fakeRegistry, recordedQuestion } from "./helpers";
@@ -92,10 +93,14 @@ type Item = { agent: string; name: string; task?: string };
 /** What a `tool_call` or `before_subagent_spawn` handler returns: a refusal, the rewritten call (flat or batch), or a model row. */
 type Reply = { block?: boolean; reason?: string; input?: Item & { tasks: Item[]; context?: string }; model?: string[]; note?: string } | undefined;
 
-/** One lane process: the classifier bound to the lane's session and to its hands' sessions. A second `lane(w)` is a restart. */
-function lane(w: World, opts: { fingerprint?: (cwd: string) => string } = {}) {
+/**
+ * One lane process: the classifier bound to the lane's session and to its hands' sessions. A second `lane(w)` is a restart.
+ * `labHolds`: the lab budget's held labs (item 113), as a map or as the deps function itself. `ledger`: the deps ledger opener.
+ */
+function lane(w: World, opts: { fingerprint?: (cwd: string) => string; labHolds?: ReadonlyMap<string, string> | (() => ReadonlyMap<string, string>); ledger?: () => Ledger } = {}) {
 	const handlers: Record<string, Handler> = {};
 	const handSession: Record<string, Handler> = {};
+	const holds = opts.labHolds;
 	const logs: string[] = [];
 	const extension = createClassifierExtension({
 		judge: async () => JUDGE as never,
@@ -103,11 +108,12 @@ function lane(w: World, opts: { fingerprint?: (cwd: string) => string } = {}) {
 		disabledProviders: async () => [],
 		question: recordedQuestion(),
 		calibration: loadCalibration(),
-		ledger: () => w.ledger,
+		ledger: opts.ledger ?? (() => w.ledger),
 		laneId: "lane-test",
 		boundWorkload: () => w.wl,
 		log: line => logs.push(line),
 		...(opts.fingerprint ? { fingerprint: opts.fingerprint } : {}),
+		...(holds === undefined ? {} : { labHolds: typeof holds === "function" ? holds : () => holds }),
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
@@ -121,8 +127,8 @@ function lane(w: World, opts: { fingerprint?: (cwd: string) => string } = {}) {
 	return {
 		logs,
 		toolCall: (input: unknown, toolCallId = "call-1") => handlers.tool_call!({ type: "tool_call", toolName: "task", toolCallId, input }, ctx) as Promise<Reply>,
-		spawn: (agent: string, spawnKey: string) =>
-			handlers.before_subagent_spawn!({ type: "before_subagent_spawn", agent, invocationKind: "task", patterns: [], spawnKey }, ctx) as Promise<Reply>,
+		spawn: (agent: string, spawnKey: string, invocationKind = "task") =>
+			handlers.before_subagent_spawn!({ type: "before_subagent_spawn", agent, invocationKind, patterns: [], spawnKey }, ctx) as Promise<Reply>,
 		/** An assistant turn of the lane itself. */
 		laneMessage: (selector: string) => handlers.message_end!(assistant(selector), ctx),
 		/** An assistant turn in hand `agentId`'s own session. */
@@ -577,6 +583,60 @@ describe("Park", () => {
 		expect(out?.content?.[0]?.text).toContain("parked on question");
 		expect(questions(w)).toHaveLength(1);
 		expect(questions(w)[0]!.body).toContain("the review hand sl-x ended with no model answering");
+	});
+});
+
+describe("the lab budget (MIGRATION.md item 113): a held lab is skipped at dispatch", () => {
+	const HELD = "lab budget held: 5h tokens 41M of budget 40M; Jo lifts it with lift on the lab-budget question";
+	test("openai held: a review off the anthropic builder runs on kimi alone, and a change dispatch loses its openai entry", async () => {
+		const w = world();
+		const h = lane(w, { labHolds: new Map([["openai", HELD]]) });
+		h.laneMessage(OPUS);
+		expect((await reviewSpawn(h, w))?.model).toEqual([KIMI]);
+		const out = await h.toolCall({ agent: "strong", name: "sl-work", task: brief(w, "change the loader") }, "c1");
+		expect((await h.spawn(out!.input.agent, "sl-work"))?.model).toEqual([OPUS, KIMI]);
+	});
+	test("openai and kimi held: the review parks, and the question names the budget for each held entry", async () => {
+		const w = world();
+		const h = lane(w, { labHolds: new Map([["openai", HELD], ["kimi", HELD]]) });
+		h.laneMessage(OPUS);
+		const spawn = await reviewSpawn(h, w);
+		expect(spawn?.block).toBe(true);
+		const [q] = questions(w);
+		expect(spawn?.reason).toContain(`parked on question ${q!.id}`);
+		expect(q!.body).toContain(`${SOL} (${HELD})`);
+		expect(q!.body).toContain(`${KIMI} (${HELD})`);
+	});
+	test("no lab held: the row is unchanged (the control)", async () => {
+		const w = world();
+		const h = lane(w, { labHolds: new Map() });
+		h.laneMessage(OPUS);
+		expect((await reviewSpawn(h, w))?.model).toEqual([SOL, KIMI]);
+	});
+	test("PR #79 review S2: the production labHolds reads the extension's open ledger and never reaches the default ledger path", async () => {
+		const w = world();
+		// An env whose default-ledger keys throw: reaching defaultLedgerPath (an open of its own) fails the test.
+		const env = new Proxy<Record<string, string | undefined>>(
+			{ AGENT_SYSTEM_LAB_QUOTA_FILE: join(w.dir, "lab-quota.json"), AGENT_SYSTEM_LAB_BUDGET_OPENAI_5H: "1" },
+			{
+				get(target, key) {
+					if (key === "AGENT_SYSTEM_LEDGER_DB" || key === "HOME") throw new Error(`defaultLedgerPath reached (${String(key)})`);
+					return Reflect.get(target, key);
+				},
+			},
+		);
+		w.ledger.recordEntry({ by: "lane-runner", workloadId: w.wl, kind: "assumption", body: spendBody("lane-test", { usd: 0, tokens: 10, wallMin: 1, labs: { openai: { tokens: 10, usd: 0 } } }) });
+		let shared: Ledger | undefined;
+		const h = lane(w, { labHolds: sharedLedgerLabHolds(() => shared, env), ledger: () => (shared ??= w.ledger) });
+		// An unclassified eval spawn before anything opened the ledger: no lab is gated, and nothing is opened for it.
+		expect((await h.spawn("strong", "ev-1", "eval"))?.model).toEqual([OPUS, SOL, KIMI]);
+		expect(shared).toBeUndefined();
+		h.laneMessage(OPUS);
+		// A classified review opens the shared ledger for its routing rows; the held openai entry is skipped from it.
+		expect((await reviewSpawn(h, w))?.model).toEqual([KIMI]);
+		expect(shared).toBe(w.ledger);
+		// The eval spawn after that reads the same open ledger.
+		expect((await h.spawn("strong", "ev-2", "eval"))?.model).toEqual([OPUS, KIMI]);
 	});
 });
 

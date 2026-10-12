@@ -15,11 +15,11 @@
 //   { claim?: false,               skip session_start (an extension that did not load: never ready)
 //     noSession?: true,            the get_state reply carries no sessionFile
 //     steps: [ { tool, args } | { sleepMs } | { exit: code } | { hang: true } | { result: "aborted" | "error", error? }
-//              | { usage: { usd, tokens }, hand? } | { background: ms | "never" } | { wake: { ms, steps } }
+//              | { usage: { usd, tokens, provider? }, hand? } | { background: ms | "never" } | { wake: { ms, steps } }
 //              | { ledger: { body, slice? } | { routing: { slice } } } ],
 //                                an arg value "$slice" is the id the newest tool result named (lane_add_slice mints it);
 //                                a usage step appends one assistant message with that usage (usage.cost.total,
-//                                usage.totalTokens) to the session file, or with `hand` to <session>/<hand>.jsonl, where
+//                                usage.totalTokens, and message.provider when given) to the session file, or with `hand` to <session>/<hand>.jsonl, where
 //                                OMP writes a hand's session file (the runner's ceiling meter reads both);
 //                                a background step ends the prompt with `sessionSettled: false`; after `ms` it records
 //                                `background-done`, runs the next turn's steps as the woken turn (no prompt_result) and
@@ -204,7 +204,7 @@ const runSteps = async (steps: readonly FakeStep[]): Promise<number | "never" | 
 		if ("usage" in step) {
 			const file = step.hand ? join(session.replace(/\.jsonl$/, ""), `${step.hand}.jsonl`) : session;
 			mkdirSync(dirname(file), { recursive: true });
-			appendFileSync(file, `${JSON.stringify({ type: "message", message: { role: "assistant", usage: { totalTokens: step.usage.tokens, cost: { total: step.usage.usd } } } })}\n`);
+			appendFileSync(file, `${JSON.stringify({ type: "message", message: { role: "assistant", ...(step.usage.provider ? { provider: step.usage.provider } : {}), usage: { totalTokens: step.usage.tokens, cost: { total: step.usage.usd } } } })}\n`);
 			continue;
 		}
 		if ("ledger" in step) {

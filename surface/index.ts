@@ -20,6 +20,7 @@
 import type { KindJudge } from "../classifier/src/classify";
 import { type HostModules, hostSettings } from "../gates/src/host";
 import ceilingRow from "./extensions/ceiling";
+import labBudgetRow from "./extensions/lab-budget";
 import laneRow from "./extensions/lane";
 import laneToolsRow from "./extensions/lane-tools";
 import launchRow from "./extensions/launch";
@@ -50,6 +51,7 @@ export default function orchestratorSurface(pi: SurfaceAPI, env: Record<string, 
 	workloadRow(pi, env, deps);
 	launchRow(pi, env);
 	ceilingRow(pi, env);
+	labBudgetRow(pi, env);
 	questionRow(pi, env);
 	laneRow(pi, env);
 	laneToolsRow(pi, env);

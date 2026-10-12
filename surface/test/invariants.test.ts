@@ -14,6 +14,7 @@ import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
 import { backupNamespace, copyProblem, Ledger } from "../../ledger/src/index";
 import { canonicalPath } from "../../ledger/src/locality";
+import { LAB_BUDGET_DEFAULTS } from "../src/lab-budget";
 import { laneExitBody } from "../src/launch";
 import { reservedStates } from "../src/errors";
 import { BACKUP_GAP_MS, check, gitIn, type Git, type Input, jsonLines, newestWrite, orchestratorsFromPs, parseArgs, type Probe, type PsDeps, renderTable, type Report, reservedView, reviewsLine, type Run } from "../scripts/invariants";
@@ -48,7 +49,7 @@ const noGit: Pick<Input, "repo" | "git" | "orchestrators"> = { repo: "/nonexiste
 function run(over: Partial<Input> = {}): Report {
 	return check({
 		db, asOf: AS_OF, replay: true, liveLanes: live(`${fixture.waiting.wl} ${fixture.waiting.lane}`), lanesDirOf: () => "/nonexistent/lanes", ...noGit,
-		backups: { dir: freshBackups, gapMs: BACKUP_GAP_MS }, ...over,
+		backups: { dir: freshBackups, gapMs: BACKUP_GAP_MS }, labBudget: { config: LAB_BUDGET_DEFAULTS, errors: [], quota: null, quotaFrom: "/nonexistent/lab-quota.json" }, ...over,
 	});
 }
 const keys = (r: Report) => r.findings.map((f) => f.key);

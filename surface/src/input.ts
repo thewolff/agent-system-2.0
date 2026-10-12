@@ -38,7 +38,7 @@
 // (then cancel) every open round-limit or park question on the stopped loops, ends each loop with no
 // round running, and echoes per loop the latest settled round's findings or the round still running.
 // A bare `rounds <n>` or `stop-reviews` with several workloads in view asks "which one?".
-import { parkQuestions } from "../../classifier/src/lab";
+import { type Lab, parkQuestions } from "../../classifier/src/lab";
 import { reviewStopBody, stopReviewsInstructionBody } from "../../classifier/src/review-stop";
 import {
 	countRounds, effectiveRoundLimit, type FindingKind, type Findings, parseReviewLimit, REVIEW_ROUND_DEFAULTS, reviewLoopEndBody,
@@ -49,6 +49,8 @@ import { LOW_CONFIDENCE_THRESHOLD } from "../../classifier/src/route";
 import { LANE_RUNNER_BY, type Ledger, type Mode, type QuestionRow, type RoutingKind, type SliceRow, type Stakes } from "../../ledger/src/index";
 import { type Ceiling, CEILING_OPTIONS, ceilingBody, effectiveCeiling, sizeFor } from "./ceiling";
 import { closedReservedRefusal, waitingReserved } from "./errors";
+import { LAB_BUDGET_OPTIONS, labBudgetQuestionLab } from "./lab-budget";
+import { relaunchStopped } from "./lab-budget-io";
 import { controlEntries, heldLive, holdersOf, isPlanQuestionIn, launchRequestedBody, planApprovedBody } from "./launch";
 import type { Numbering, Target } from "./numbering";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
@@ -658,6 +660,19 @@ function settleCeiling(ledger: Ledger, q: QuestionRow, word: string, answerId: s
 	return `${raised}; ${why}, so a relaunch is requested`;
 }
 
+/**
+ * The lab-budget question's answer (MIGRATION.md item 113), inside the answer's transaction: every answer completes the
+ * question's slice; `lift` is the ledger instruction the budget reads (surface/src/lab-budget.ts `labDecisions`: the windows
+ * restart at the answer), and it also writes Jo's `launch-requested:` on each workload the hold stopped (`relaunchStopped`).
+ * `keep` leaves the lab held until its usage rolls out of the window. Returns the receipt tail.
+ */
+function settleLabBudget(ledger: Ledger, q: QuestionRow, lab: Lab, word: string, answerId: string): string {
+	ledger.completeSlice(q.slice_id, { by: SURFACE_BY, artifact: `answered ${word} ${answerId}` });
+	if (word !== "lift") return `; the ${lab} lab stays held until its usage rolls out of the window (not asked again for 5 hours)`;
+	const relaunched = relaunchStopped(ledger, lab, "jo", "lab budget lift");
+	return `; the ${lab} lab budget is lifted: its windows restart now${relaunched.length > 0 ? `; a relaunch is requested for ${relaunched.join(", ")}` : ""}`;
+}
+
 /** Is `q` the plan question (decision 15, PLAN wl-muq22rnjcfrrpc D9 part two): `isPlanQuestionIn` on its workload's control entries. */
 export function isPlanQuestion(ledger: Ledger, q: { id: string; workload_id: string }): boolean {
 	const w = ledger.workload(q.workload_id);
@@ -700,6 +715,7 @@ export function apply(ledger: Ledger, cmd: Command): string {
 			const word = cmd.answer.toLowerCase();
 			const ceiling = isCeilingQuestion(q0, ledger.slice(q0.slice_id)) && (CEILING_OPTIONS as readonly string[]).includes(word);
 			const roundLimit = !ceiling && (ROUND_LIMIT_OPTIONS as readonly string[]).includes(word) && isReviewLimitQuestion(ledger, q0);
+			const labHold = (LAB_BUDGET_OPTIONS as readonly string[]).includes(word.split(/\s+/)[0]!) ? labBudgetQuestionLab(q0) : null;
 			if (plan && word === "cancel") {
 				const id = ledger.withdrawQuestion(cmd.questionId, { ...stamp, reason: "plan cancelled from the surface", then: "cancel" });
 				return `cancelled the plan: withdrew ${cmd.questionId} (withdrawal ${id}); slice ${q0.slice_id} is ${ledger.slice(q0.slice_id)?.state ?? "unknown"}`;
@@ -710,6 +726,7 @@ export function apply(ledger: Ledger, cmd: Command): string {
 				if (plan && word === "approve") ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: planApprovedBody(answerId) });
 				if (ceiling) tail = settleCeiling(ledger, q0, word, answerId);
 				if (roundLimit) tail = settleReviewLimit(ledger, q0, word as RoundLimitOption, answerId);
+				if (labHold !== null) tail = settleLabBudget(ledger, q0, labHold, word.split(/\s+/)[0]!, answerId);
 				return answerId;
 			});
 			const slice = ledger.slice(q0.slice_id);
