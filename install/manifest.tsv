@@ -133,6 +133,7 @@ gates/test/r06-eval-literals.test.ts	test	-
 gates/test/r06-eval-process.test.ts	test	-
 gates/test/r06-quoted-data.test.ts	test	-
 gates/test/r06-alias.test.ts	test	-
+gates/test/r06-cond-assign.test.ts	test	-
 gates/extensions/r15-orchestrator-role.ts	extension	-
 gates/src/rows/r15-orchestrator-role.ts	module	-
 gates/src/host.ts	module	-
