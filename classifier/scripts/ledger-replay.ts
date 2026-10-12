@@ -86,6 +86,8 @@ export interface ReplayLine {
 	stakes: string;
 	builders: string;
 	unknown: number;
+	/** Lanes whose lab could not be read at all (`builderLabs().gaps`, MIGRATION.md item 109): named; every lab is then a builder and the review parks. */
+	gaps: number;
 	tier: string;
 	rowLabs: string;
 	decision: string;
@@ -95,21 +97,20 @@ export interface ReplayLine {
 const labName = (selector: string) => labOf(selector) ?? `unknown:${providerOf(selector)}`;
 
 export function formatLine(l: ReplayLine): string {
-	const unknown = l.unknown > 0 ? ` unknown=${l.unknown}` : "";
 	const needs = l.needsYou.length > 0 ? ` ${l.needsYou.join(",")}` : "";
-	return `${l.snapshot} ${l.workload} ${l.status} stakes=${l.stakes} builders=${l.builders}${unknown} review@${l.tier}[${l.rowLabs}]=${l.decision} needs-you=${l.needsYou.length}${needs}`;
+	return `${l.snapshot} ${l.workload} ${l.status} stakes=${l.stakes} builders=${buildersOf(l)} review@${l.tier}[${l.rowLabs}]=${l.decision} needs-you=${l.needsYou.length}${needs}`;
 }
 
-const LINE = /^(\S+) (\S+) (\S+) stakes=(\S+) builders=(\S+)(?: unknown=(\d+))? review@([^[\s]+)\[([^\]]*)\]=(\S+) needs-you=(\d+)(?: (\S+))?$/;
+const LINE = /^(\S+) (\S+) (\S+) stakes=(\S+) builders=(\S+)(?: unknown=(\d+))?(?: gaps=(\d+))? review@([^[\s]+)\[([^\]]*)\]=(\S+) needs-you=(\d+)(?: (\S+))?$/;
 
 export function parseLine(text: string): ReplayLine | null {
 	const m = LINE.exec(text);
 	if (!m) return null;
-	const needsYou = m[11] ? m[11].split(",") : [];
-	if (needsYou.length !== Number(m[10])) return null;
+	const needsYou = m[12] ? m[12].split(",") : [];
+	if (needsYou.length !== Number(m[11])) return null;
 	return {
-		snapshot: m[1]!, workload: m[2]!, status: m[3]!, stakes: m[4]!, builders: m[5]!, unknown: m[6] ? Number(m[6]) : 0,
-		tier: m[7]!, rowLabs: m[8]!, decision: m[9]!, needsYou,
+		snapshot: m[1]!, workload: m[2]!, status: m[3]!, stakes: m[4]!, builders: m[5]!, unknown: m[6] ? Number(m[6]) : 0, gaps: m[7] ? Number(m[7]) : 0,
+		tier: m[8]!, rowLabs: m[9]!, decision: m[10]!, needsYou,
 	};
 }
 
@@ -142,6 +143,7 @@ export function replaySnapshot(ledger: Ledger, snapshot: string, now: string, ta
 			snapshot, workload: id, status, stakes,
 			builders: builders.labs.length > 0 ? builders.labs.join(",") : "none",
 			unknown: builders.unknown.length,
+			gaps: builders.gaps.length,
 			tier, rowLabs: row.map(labName).join(","), decision,
 			needsYou: needs.get(id) ?? [],
 		};
@@ -202,7 +204,7 @@ export interface LineDiff {
 	new: string;
 }
 
-const buildersOf = (l: ReplayLine) => `${l.builders}${l.unknown > 0 ? ` unknown=${l.unknown}` : ""}`;
+const buildersOf = (l: ReplayLine) => `${l.builders}${l.unknown > 0 ? ` unknown=${l.unknown}` : ""}${l.gaps > 0 ? ` gaps=${l.gaps}` : ""}`;
 const needsOf = (l: ReplayLine) => `${l.needsYou.length}${l.needsYou.length > 0 ? ` ${l.needsYou.join(",")}` : ""}`;
 
 /** Kinds added and removed between two needs-you lists, as a multiset: `+question -held`. */

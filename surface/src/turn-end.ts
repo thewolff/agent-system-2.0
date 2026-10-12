@@ -227,14 +227,16 @@ export function releasedOpen(control: readonly ControlEntry[], laneId: string): 
  * D6's predicate, pure: the tokens of `hand-spawn:` entries `laneId` wrote with no valid
  * `hand-settled:`. A `hand-settled: <token> routing <rid>` counts only when `<rid>` is a row of these
  * routings (the workload's) created at or after the spawn: the classifier writes that row in the
- * same settle, and the entry's writer proves nothing (the classifier stamps the lane id).
+ * same settle, and the entry's writer proves nothing (the classifier stamps the lane id). The
+ * starter's `orphaned` settle (MIGRATION.md item 109, no routing row) does not count here: it is
+ * written for a lane already superseded, whose own turn end this predicate no longer governs.
  */
 export function unsettledHandsOf(entries: readonly EntryRow[], routings: readonly Pick<RoutingRow, "id" | "created_at">[], laneId: string): UnsettledHand[] {
 	const routed = new Map(routings.map((r) => [r.id, r.created_at]));
 	const settles: { token: string; routing: string }[] = [];
 	for (const e of entries) {
 		if (e.kind !== "assumption") continue;
-		for (const [token, routing] of settledTokens([e])) settles.push({ token, routing });
+		for (const [token, routing] of settledTokens([e])) if (routing !== null) settles.push({ token, routing });
 	}
 	const out: UnsettledHand[] = [];
 	for (const e of entries) {

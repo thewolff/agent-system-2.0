@@ -210,7 +210,12 @@ export interface ReserveRows {
 	cap: number;
 	now: string;
 }
-export type ReserveVerdict = { launch: true; cause: string } | { launch: false; reason: string };
+/**
+ * A launch verdict. `also`: entries the policy wants written beside the `launch:` attempt, in the
+ * same transaction and stamped by the same writer (the lane starter's settle of every hand the
+ * launched lane supersedes, surface/src/launch.ts `decideLaunch`; MIGRATION.md item 109).
+ */
+export type ReserveVerdict = { launch: true; cause: string; also?: { sliceId: string | null; body: string }[] } | { launch: false; reason: string };
 
 export interface WorkloadRow {
 	id: string;
@@ -578,7 +583,8 @@ export class Ledger {
 	 * questions, instructions and slices and the live-lane count, hands them to `decide`, and on a
 	 * launch verdict mints the ordinal, pre-claims for the lane id with `leaseMs` (stamped `by`, the
 	 * starter, so the lane's own claim is a real readiness signal) and writes the attempt entry
-	 * `launch: <laneId> cause <cause> requested-by <who>`. A refusal returns before any write.
+	 * `launch: <laneId> cause <cause> requested-by <who>`, then the verdict's `also` entries, in that
+	 * order. A refusal returns before any write.
 	 */
 	reserveLane(workloadId: string, input: Stamp & {
 		cap: number; leaseMs: number; requestedBy: string; decide: (rows: ReserveRows) => ReserveVerdict;
@@ -594,6 +600,7 @@ export class Ledger {
 			const claim = this.claimWorkload(workloadId, { by: input.by, holder: laneId, leaseMs: input.leaseMs });
 			if (!claim.won) return { ok: false as const, reason: "held" };
 			this.recordEntry({ by: input.by, workloadId, kind: "assumption", body: `launch: ${laneId} cause ${verdict.cause} requested-by ${input.requestedBy}` });
+			for (const e of verdict.also ?? []) this.recordEntry({ by: input.by, workloadId, sliceId: e.sliceId, kind: "assumption", body: e.body });
 			return { ok: true as const, laneId, cause: verdict.cause };
 		});
 	}

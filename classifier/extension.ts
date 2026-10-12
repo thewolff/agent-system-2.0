@@ -121,7 +121,9 @@ import { repoFingerprint } from "./src/fingerprint";
 import {
 	type Builders,
 	builderLabs,
+	cancelledTokens,
 	handBuilderBody,
+	handCancelledBody,
 	handSettledBody,
 	handSpawnBody,
 	handSpawns,
@@ -129,6 +131,7 @@ import {
 	type Lab,
 	labOf,
 	laneBuilderBody,
+	laneBuilderGapBody,
 	openParkQuestion,
 	PARK_OPTIONS,
 	parkQuestionBody,
@@ -152,6 +155,7 @@ import {
 	FINDING_KINDS,
 	type Findings,
 	type FindingsOrUnknown,
+	NO_ROUND_VERDICTS,
 	parseFindings,
 	parseReviewRound,
 	parseReviewLimit,
@@ -724,12 +728,35 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	/** Could `agentId` be the agent OMP allocated for this hand's spawn? */
 	const couldBe = (hand: Hand, agentId: string) => hand.spawnKey === agentId || spawnKeyNames(agentId, hand.dispatchName);
 
+	/** Gap texts already recorded as `builder-lab-gap:` entries (item 109): one entry per gap per workload. */
+	const recordedGaps = new Set<string>();
 	/**
 	 * D3, recomputed from the ledger at each use. Review hands in flight in this process are checked
-	 * by their own fingerprint at settle, so they do not count (lab.ts `builderLabs`).
+	 * by their own fingerprint at settle, so they do not count (lab.ts `builderLabs`). A lane whose lab
+	 * cannot be read at all (`gaps`, MIGRATION.md item 109) makes every lab a builder, so the next
+	 * review parks with the gap text as its reason; each gap is recorded once as a `builder-lab-gap:`
+	 * entry so the ledger names the cause, in its own transaction, never blocking the read (a failed
+	 * write is logged).
 	 */
-	const buildersOf = (workloadId: string): Builders =>
-		builderLabs(deps.ledger(), workloadId, new Set(hands.filter(h => h.review).map(h => h.token)));
+	const buildersOf = (workloadId: string): Builders => {
+		const builders = builderLabs(deps.ledger(), workloadId, new Set(hands.filter(h => h.review).map(h => h.token)));
+		for (const gap of builders.gaps) {
+			const key = `${workloadId} ${gap}`;
+			if (recordedGaps.has(key)) continue;
+			try {
+				const ledger = deps.ledger();
+				const body = laneBuilderGapBody(gap);
+				ledger.write(() => {
+					if (ledger.entries(workloadId).some(e => e.body === body)) return;
+					ledger.recordEntry({ by: deps.laneId, workloadId, kind: "assumption", body });
+				});
+				recordedGaps.add(key);
+			} catch (error) {
+				deps.log?.(`agent-system-2 classifier: the builder-lab gap on ${workloadId} could not be recorded (${message(error)})`);
+			}
+		}
+		return builders;
+	};
 
 	/** D2 check 2: why a review hand's output is withheld for changing the work, or null when it did not. */
 	function workChanged(hand: Hand): string | null {
@@ -809,12 +836,12 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			const failed = new Set(
 				entries.flatMap(e => {
 					const r = e.kind === "assumption" ? parseReviewRound(e.body) : null;
-					return r?.verdict === "failed-dispatch" ? [r.token] : [];
+					return r && NO_ROUND_VERDICTS.includes(r.verdict) ? [r.token] : [];
 				}),
 			);
 			if (members.length > 0 && members.every(m => failed.has(m.token))) {
 				fanOuts.delete(group);
-				log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId}: every spawned member failed to dispatch, so it is no round and nothing parks; the review is dispatched again`);
+				log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId}: every spawned member failed to dispatch, was orphaned or was cancelled, so it is no round and nothing parks; the review is dispatched again`);
 				return;
 			}
 			const reasons: string[] = [];
@@ -1014,8 +1041,14 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * `failed-dispatch` (no round), no fingerprint check and no builder mark, no park; a 401 / 403 also
 	 * writes `provider-refused:` (step 9). A review hand's `review-round:` (D9) lands in the
 	 * same transaction, with the findings parsed from `delivered` (what reached the lane for it).
+	 * `cancelled`: the hand's job was cancelled with nothing shown (a `proc://<id>/kill` on a running
+	 * hand, MIGRATION.md item 109): it settles now rather than holding its round open — its row records
+	 * what answered, a review's verdict is `cancelled` (terminal, no round, `countRounds`), its
+	 * (absent) output is refused like any unread hand's, and no park question is raised for it. Its
+	 * `hand-cancelled:` entry lands in the same transaction, so a delivery after a restart is refused
+	 * too (`recover`), whatever its row records.
 	 */
-	function settle(hand: Hand, agentId: string, reported: string | null, log: (line: string) => void, delivered: string | null): Verdict {
+	function settle(hand: Hand, agentId: string, reported: string | null, log: (line: string) => void, delivered: string | null, cancelled = false): Verdict {
 		hands.splice(hands.indexOf(hand), 1);
 		const key = handKey(hand.root, agentId);
 		const seen = answered.get(key) ?? [];
@@ -1041,8 +1074,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		if (changed) {
 			refusal = `${refusal ? `${refusal}; ` : ""}${agentId}: the review changed the work: ${changed}. A review hand does not change the work; the lane dispatches the fix as a change slice`;
 		}
+		if (cancelled) refusal = `${agentId}: its job was cancelled before its result was shown${refusal ? `; ${refusal}` : ""}`;
 		const findings = hand.review ? handFindings(delivered, hand.root, agentId) : UNKNOWN;
-		const roundVerdict: ReviewVerdict = failedDispatch ? "failed-dispatch" : refusal ? "withheld" : "accepted";
+		const roundVerdict: ReviewVerdict = cancelled ? "cancelled" : failedDispatch ? "failed-dispatch" : refusal ? "withheld" : "accepted";
 		const loginRefused = new Map(errors.flatMap(e => (e.status === 401 || e.status === 403 ? [[e.provider, e.status] as const] : [])));
 		try {
 			const ledger = deps.ledger();
@@ -1056,18 +1090,19 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					for (const model of new Map(models.map(m => [labOf(m) ?? m, m])).values()) entry(handBuilderBody(labOf(model), hand.token, model));
 				}
 				if (failedDispatch) for (const [provider, status] of loginRefused) entry(providerRefusedBody(provider, status, hand.token));
+				if (cancelled) entry(handCancelledBody(hand.token));
 				entry(handSettledBody(hand.token, routingId));
 				if (hand.review) writeRound(ledger, hand, roundVerdict, findings);
 			});
 		} catch (error) {
 			// The row is the record of what ran (SPEC-2.0.md § A1.3); output with no record is refused.
 			refusal = `${refusal ? `${refusal}; ` : ""}${agentId}: its routing row could not be written (${message(error)})`;
-			if (hand.review) recordRound(hand, failedDispatch ? "failed-dispatch" : "withheld", findings, log); // its round still ends
+			if (hand.review) recordRound(hand, cancelled ? "cancelled" : failedDispatch ? "failed-dispatch" : "withheld", findings, log); // its round still ends
 		}
 		if (hand.review && hand.group.startsWith("fg-")) {
-			memberEnded(hand, `${agentId} ${failedDispatch ? "failed to dispatch" : refusal ? "withheld" : "accepted"}`, true, log, null);
+			memberEnded(hand, `${agentId} ${cancelled ? "cancelled" : failedDispatch ? "failed to dispatch" : refusal ? "withheld" : "accepted"}`, true, log, null);
 		} else if (hand.review) {
-			if (outcome === "refused-model-unknown" && !failedDispatch) {
+			if (outcome === "refused-model-unknown" && !failedDispatch && !cancelled) {
 				// D6 runtime outage: no model answered on a single review hand (e.g. every allowed entry failed).
 				// A loop Jo stopped (D10) takes no park question. A failed dispatch is no round: the review is
 				// dispatched again, routed off a provider that refused the login (step 9).
@@ -1104,7 +1139,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * `[<parent>.]sl-…` — tier dispatches are named after their slice and slice ids are `sl-…`
 	 * (ledger/schema.sql slices.id GLOB 'sl-?*') — so the job is not a tier hand. A tier hand with no
 	 * row, more than one, or a ledger that cannot be read, is refused; so is a review whose token a
-	 * `review-withheld:` entry names (D2 check 2). A production fan-out member's group is re-checked
+	 * `review-withheld:` entry names (D2 check 2), and any hand whose token a `hand-cancelled:` entry
+	 * names (its job was cancelled before its result was shown). A production fan-out member's group is re-checked
 	 * from its `hand-spawn:` entries (D5 [N2]). A review hand settled by no instance (lost with its
 	 * process) gets its `review-round:` here, with its verdict and the findings in `delivered`, so its
 	 * round can complete (D9/D10). `at`: when the output was delivered (ms). A verdict or a row whose
@@ -1146,7 +1182,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						? { outcome: row.outcome, refusal: `${agentId}: its routing row ${row.id} (slice ${row.slice_id}) records ${row.outcome}${row.ran_models ? ` on ${JSON.parse(row.ran_models).join(", ")}` : ""}` }
 						: token && withheldTokens(entries).has(token)
 							? { outcome: "ran", refusal: `${agentId}: its routing row ${row.id} (slice ${row.slice_id}) is a review that changed the work (review-withheld: ${token}), so its output stays withheld` }
-							: { outcome: "ran", refusal: null };
+							: token && cancelledTokens(entries).has(token)
+								? { outcome: "ran", refusal: `${agentId}: its job was cancelled before its result was shown (hand-cancelled: ${token}), so its output stays withheld` }
+								: { outcome: "ran", refusal: null };
 			if (rows.length === 1) remember(key, since(token), verdict, false);
 			else unmatched.set(`${key} ${at}`, verdict);
 			// The hand's spawn entry: by its routing's token, else by this root and a spawn key naming this agent id, spawned by then.
@@ -1767,13 +1805,16 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				// `proc://<id>/kill` write (both consume them: no `async-result` follows), a `read proc://<id>`
 				// — is where a hand's output reaches the lane, so each finished task job in it settles like a
 				// delivery (`settleDelivered`, PLAN wl-muq13bkdghblmo step 2): a held hand on its result, even
-				// an empty one (its output file is read), except a cancelled one with nothing shown, which
-				// stays held; an unheld one only when text is shown. A status-only listing (`op: "jobs"`, the
-				// `read proc://` listing) settles nothing. Either way a queued task job can end before its hand
-				// spawns: cancelled (async/job-manager.ts:417-424, no delivery follows) or aborted before
-				// execution (task/index.ts:1129-1142); its slice is released (`dropUnspawned`). A job that
-				// cannot be tied to one hand (`jobOwners`) settles and releases nothing, and its shown output
-				// is withheld; so is any shown output when the lane has no session file, as in `context`.
+				// an empty one (its output file is read); a held hand shown `cancelled` with nothing settles
+				// `cancelled` (MIGRATION.md item 109: the live kimi review of wl-mv4osi70ng2e4g held its
+				// round for 45 min after `proc://<id>/kill`, and every re-dispatch was refused until Jo
+				// accepted by hand); an unheld one only when text is shown. A status-only listing (`op:
+				// "jobs"`, the `read proc://` listing) settles nothing. Either way a queued task job can end
+				// before its hand spawns: cancelled (async/job-manager.ts:417-424, no delivery follows) or
+				// aborted before execution (task/index.ts:1129-1142); its slice is released
+				// (`dropUnspawned`). A job that cannot be tied to one hand (`jobOwners`) settles and releases
+				// nothing, and its shown output is withheld; so is any shown output when the lane has no
+				// session file, as in `context`.
 				const details = (event.details ?? undefined) as SnapshotDetails | undefined;
 				const list = (jobs: unknown) => (Array.isArray(jobs) ? (jobs as (JobSnapshot | undefined)[]) : []);
 				const consumed = details?.op === "wait" || details?.op === "cancel" ? list(details.jobs) : details?.proc?.op === "cancel" ? list(details.proc.jobs) : null;
@@ -1802,9 +1843,14 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						}
 						continue;
 					}
-					const held = hands.some(h => h.root === root && h.spawnKey === agentId && h.dispatchedAt <= at);
-					if (shown.length === 0 || (held ? job.status === "cancelled" && !text : !text)) {
-						if (!held) dropUnspawned(agentId, `ended ${job.status}`, at);
+					const hand = hands.find(h => h.root === root && h.spawnKey === agentId && h.dispatchedAt <= at);
+					if (hand && job.status === "cancelled" && !text && shown.length > 0) {
+						// Nothing shown, so nothing to withhold: the settle is the whole effect.
+						settle(hand, agentId, null, log, null, true);
+						continue;
+					}
+					if (shown.length === 0 || (!hand && !text)) {
+						if (!hand) dropUnspawned(agentId, `ended ${job.status}`, at);
 						continue;
 					}
 					const refusal = settleDelivered(root, agentId, text, at)?.refusal;

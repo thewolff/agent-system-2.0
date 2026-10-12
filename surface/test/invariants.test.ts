@@ -12,9 +12,10 @@ import { copyFileSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
-import { backupNamespace, copyProblem, Ledger } from "../../ledger/src/index";
+import { backupNamespace, copyProblem, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { canonicalPath } from "../../ledger/src/locality";
 import { laneExitBody } from "../src/launch";
+import { orphanSettleEntries } from "../../classifier/src/lab";
 import { reservedStates } from "../src/errors";
 import { BACKUP_GAP_MS, check, gitIn, type Git, type Input, jsonLines, newestWrite, orchestratorsFromPs, parseArgs, type Probe, type PsDeps, renderTable, type Report, reservedView, reviewsLine, type Run } from "../scripts/invariants";
 import { AS_OF, buildFixture, LANE_RUNNER } from "./fixtures/invariants/build";
@@ -159,6 +160,35 @@ describe("liveness", () => {
 		} finally {
 			ro.close();
 		}
+	});
+
+	test("item 109: the starter's `hand-settled: … orphaned` settles the orphan: orphan-hand and stuck-review clear, and the fixture without it is the pre-fix shape both still catch", () => {
+		const copy = buildFixture(join(tmp("orphaned"), "ledger.db"));
+		const now = "2026-10-11T20:55:00.000Z";
+		const w = Ledger.open(copy.path, { backup: false, backupOnOpen: false, clock: () => now, skipLocalityCheck: true });
+		// The dead lane's hold is gone (the live case: its lease lapsed); the starter launches the next lane, settling what it orphans.
+		w.releaseWorkload(fixture.deadLane.wl, { by: fixture.deadLane.lane, holder: fixture.deadLane.lane });
+		const reserved = w.reserveLane(fixture.deadLane.wl, {
+			by: LANE_STARTER_BY, requestedBy: "test", leaseMs: 60_000, cap: 4,
+			decide: (rows) => ({ launch: true, cause: "test", also: orphanSettleEntries(rows.entries) }),
+		});
+		expect(reserved.ok).toBe(true);
+		w.close();
+		const ro = new Database(copy.path, { readonly: true });
+		try {
+			const settles = ro.query<{ body: string; created_by: string }, []>("SELECT body, created_by FROM entries WHERE body LIKE 'hand-settled: %' ORDER BY created_at").all();
+			expect(settles).toEqual([{ body: `hand-settled: ${fixture.deadLane.token} orphaned lane ${fixture.deadLane.lane} reason superseded-without-lane-exit`, created_by: LANE_STARTER_BY }]);
+			const dead = run({ db: ro, liveLanes: live() });
+			expect(keys(dead)).not.toContain(`orphan-hand:${fixture.deadLane.token}`);
+			const alive = run({ db: ro, liveLanes: live(`${fixture.deadLane.wl} ${fixture.deadLane.lane}`) });
+			expect(keys(alive)).not.toContain(`stuck-review:${fixture.deadLane.token}`);
+			expect(alive.reviewsInFlight).toEqual([]);
+		} finally {
+			ro.close();
+		}
+		// The same fixture before the settle is the live shape of 2026-10-11T18:10:46Z (four orphan-hand findings) and today's stuck-review.
+		expect(keys(run({ liveLanes: live() }))).toContain(`orphan-hand:${fixture.deadLane.token}`);
+		expect(keys(run({ liveLanes: live(`${fixture.deadLane.wl} ${fixture.deadLane.lane}`) }))).toContain(`stuck-review:${fixture.deadLane.token}`);
 	});
 });
 

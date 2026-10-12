@@ -16,7 +16,7 @@ import {
 	type SliceRow, TEST_RUNNER_BY, type WorkloadRow,
 } from "../../ledger/src/index";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
-import { labOf } from "../../classifier/src/lab";
+import { labOf, orphanSettleEntries } from "../../classifier/src/lab";
 import { ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 // ---- knobs -------------------------------------------------------------------------------------
@@ -396,10 +396,18 @@ export function verdictOf(rows: ReserveRows): LaunchVerdict {
 	return launchable(rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap);
 }
 
-/** `reserveLane`'s policy for an autonomous launch: the predicate over the rows the transaction read. */
+/**
+ * `reserveLane`'s policy for an autonomous launch: the predicate over the rows the transaction read.
+ * A launch supersedes every earlier lane of the workload, so the verdict carries the starter's
+ * `hand-settled: … orphaned` (and a review's `review-round: … orphaned`) for each `hand-spawn:` of an
+ * earlier lane with no `hand-settled:` (`orphanSettleEntries`), written in the same transaction as
+ * the `launch:` attempt (MIGRATION.md item 109: on 2026-10-11 an orchestrator restart relaunched
+ * three lanes at one instant and left four hands open with no `lane-exit:`, so `builderLabs` counted
+ * their whole rows as builders and the next review parked).
+ */
 export function decideLaunch(rows: ReserveRows): ReserveVerdict {
 	const v = verdictOf(rows);
-	return v.launch ? { launch: true, cause: causeText(v.cause) } : v;
+	return v.launch ? { launch: true, cause: causeText(v.cause), also: orphanSettleEntries(rows.entries) } : v;
 }
 
 export type InteractiveReason = "closed" | "standing" | "due" | "autonomous" | "held";
@@ -416,9 +424,10 @@ export function interactiveVerdict(w: WorkloadRow, now: string): { launch: true 
 	if (heldLive(w, now)) return { launch: false, reason: "held" };
 	return { launch: true };
 }
+/** The interactive policy as `reserveLane` runs it; it supersedes earlier lanes the same way `decideLaunch` does. */
 export function decideInteractive(rows: ReserveRows): ReserveVerdict {
 	const v = interactiveVerdict(rows.workload, rows.now);
-	return v.launch ? { launch: true, cause: "interactive" } : v;
+	return v.launch ? { launch: true, cause: "interactive", also: orphanSettleEntries(rows.entries) } : v;
 }
 
 // ---- exit classification -----------------------------------------------------------------------
@@ -761,7 +770,7 @@ export function doneLine(control: readonly ControlEntry[]): string | null {
  */
 export const CLASSIFIER_MACHINERY_PREFIXES = [
 	"hand-spawn", "hand-settled", "review-round", "review-group", "review-withheld", "review-park", "review-same-lab", "review-limit", "review-loop-end",
-	"builder-lab", "provider-refused",
+	"builder-lab", "builder-lab-gap", "provider-refused", "hand-cancelled",
 ] as const;
 
 /**

@@ -11,13 +11,20 @@ import { join } from "node:path";
 import {
 	type BuilderLedgerView,
 	builderLabs,
+	describeBuilders,
+	excludedLabs,
+	isBuilder,
 	isReviewDispatch,
 	isReviewRouting,
+	LABS,
 	labOf,
+	orphanSettleEntries,
 	parkQuestionBody,
 	reviewPlan,
+	settledTokens,
 	unspentGrant,
 } from "../src/lab";
+import { countRounds } from "../src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY } from "../../ledger/src/index";
 import { route } from "../src/route";
 import { LANE_RUNNER_BY, LANE_STARTER_BY } from "../../ledger/src/index";
@@ -48,6 +55,7 @@ const routing = (over: Partial<Row>): Row => ({
 });
 const view = (entries: FixtureEntry[], routings: Row[] = []): BuilderLedgerView => ({ entries: () => entries, routings: () => routings });
 const LANE = [entry('lane-started: lane-a {"pid":1}'), entry("builder-lab: anthropic lane lane-a model anthropic/claude-opus-5-5")];
+const GAP = (lane: string) => `lane ${lane} has a lane-started: entry, no builder-lab: entry and no model in its lane-started: record, so the lab it ran on is unknown`;
 
 describe("D1: provider → lab", () => {
 	test("the map names three labs; a provider it does not name has no lab", () => {
@@ -80,10 +88,46 @@ describe("D2: which dispatches are reviews", () => {
 });
 
 describe("D3: who built the work, from the ledger", () => {
-	test("a lane's builder-lab entry; a lane that started with none makes the provenance unknown", () => {
-		expect(builderLabs(view(LANE), "wl")).toEqual({ labs: ["anthropic"], unknown: [] });
-		const unknown = builderLabs(view([...LANE, entry('lane-started: lane-b {"pid":2}')]), "wl");
-		expect(unknown.unknown).toEqual(["lane lane-b has a lane-started: entry and no builder-lab: entry, so the lab it ran on is unknown"]);
+	test("a lane's builder-lab entry; a lane that started with none and names no model is a named gap, and every lab is then a builder (item 109)", () => {
+		expect(builderLabs(view(LANE), "wl")).toEqual({ labs: ["anthropic"], unknown: [], gaps: [] });
+		const gap = builderLabs(view([...LANE, entry('lane-started: lane-b {"pid":2}')]), "wl");
+		expect(gap).toEqual({ labs: ["anthropic"], unknown: [], gaps: [GAP("lane-b")] });
+		expect(excludedLabs(gap)).toEqual([...LABS]);
+		expect(isBuilder(gap, "openai")).toBe(true);
+		expect(describeBuilders(gap)).toBe(`every lab: ${GAP("lane-b")}`);
+	});
+
+	describe("item 109: a lane with lane-started: and no builder-lab: counts the lab its lane-started: record names", () => {
+		// The live shape of 2026-10-12T04:25:54Z: lane-mv4p2l2tdl8eps-2 wrote lane-ready:, then its second
+		// lane-started: with ranModel, and its builder-lab: only 100 s later at its first answer; in
+		// between, every lab was a builder and the next review parked (22 no-independent-lab findings).
+		const LIVE = "lane-mv4p2l2tdl8eps-2";
+		const record = (over: Record<string, unknown>, by = LANE_RUNNER_BY) =>
+			entry(`lane-started: ${LIVE} ${JSON.stringify({ pid: 70797, session: null, ordinal: 2, runnerPid: 28137, model: null, ranModel: null, resumeSkipped: null, ...over })}`, null, by);
+		const ready = entry(`lane-ready: ${LIVE} at 2026-10-12T04:25:54.431Z`, null, LANE_RUNNER_BY);
+		const ANTHROPIC = "anthropic/claude-opus-5-5";
+
+		test("ranModel from OMP's get_state names the lab; so does Jo's named model when get_state has not answered", () => {
+			expect(builderLabs(view([record({}), ready, record({ session: "s", ranModel: ANTHROPIC })]), "wl")).toEqual({ labs: ["anthropic"], unknown: [], gaps: [] });
+			expect(builderLabs(view([record({ model: "openai-codex/gpt-6-sol" }), ready]), "wl")).toEqual({ labs: ["openai"], unknown: [], gaps: [] });
+			// ranModel wins over model: what answered, not what was named.
+			expect(builderLabs(view([record({ model: "openai-codex/gpt-6-sol", ranModel: ANTHROPIC }), ready]), "wl").labs).toEqual(["anthropic"]);
+			// The newest record's null does not erase an older record's model.
+			expect(builderLabs(view([record({ ranModel: ANTHROPIC }), ready, record({ session: "s" })]), "wl").labs).toEqual(["anthropic"]);
+		});
+
+		test("the builder-lab: entry, once written, is the lane's lab; the record only fills the window before it", () => {
+			const marked = [record({ model: "openai-codex/gpt-6-sol" }), ready, entry(`builder-lab: anthropic lane ${LIVE} model ${ANTHROPIC}`, null, LIVE)];
+			expect(builderLabs(view(marked), "wl")).toEqual({ labs: ["anthropic"], unknown: [], gaps: [] });
+		});
+
+		test("only the runner's or the starter's record is read; a model on an unmapped provider is still every lab", () => {
+			expect(builderLabs(view([record({ ranModel: ANTHROPIC }, LIVE), ready]), "wl")).toEqual({ labs: [], unknown: [], gaps: [GAP(LIVE)] });
+			expect(builderLabs(view([record({ ranModel: ANTHROPIC }, LANE_STARTER_BY), ready]), "wl").labs).toEqual(["anthropic"]);
+			expect(builderLabs(view([record({ ranModel: "mystery/model-x" }), ready]), "wl").unknown).toEqual([
+				`lane ${LIVE} (from its lane-started: record) ran on mystery/model-x: unknown lab for provider mystery; add it to classifier/src/lab.ts`,
+			]);
+		});
 	});
 
 	test("non-review rows count what ran, or their whole row when it is unknown; review rows do not count", () => {
@@ -116,30 +160,32 @@ describe("D3: who built the work, from the ledger", () => {
 		const mark = entry("builder-lab: openai hand dt-1 model openai-codex/gpt-6-sol");
 		const voided = (by: string, token = "dt-1") => entry(`builder-lab-void: hand ${token} by in-x`, "sl-x", by);
 		expect(builderLabs(view([...LANE, mark]), "wl").labs).toEqual(["anthropic", "openai"]);
-		expect(builderLabs(view([...LANE, mark, voided(SURFACE_BY)]), "wl")).toEqual({ labs: ["anthropic"], unknown: [] });
+		expect(builderLabs(view([...LANE, mark, voided(SURFACE_BY)]), "wl")).toEqual({ labs: ["anthropic"], unknown: [], gaps: [] });
 		expect(builderLabs(view([...LANE, voided(SURFACE_BY), mark, entry("builder-lab: kimi hand dt-1 model moonshot/kimi-k2.7-code")]), "wl").labs).toEqual(["anthropic"]);
 		expect(builderLabs(view([...LANE, mark, voided("lane-a")]), "wl").labs).toEqual(["anthropic", "openai"]);
 		expect(builderLabs(view([...LANE, mark, voided(SURFACE_BY, "dt-2")]), "wl").labs).toEqual(["anthropic", "openai"]);
 		const laneB = [entry('lane-started: lane-b {"pid":2}'), entry("builder-lab: openai lane lane-b model openai-codex/gpt-6-sol")];
-		expect(builderLabs(view([...LANE, ...laneB, voided(SURFACE_BY, "lane-b")]), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [] });
+		expect(builderLabs(view([...LANE, ...laneB, voided(SURFACE_BY, "lane-b")]), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [], gaps: [] });
 	});
 
-	test("T5a: a runner lane that ended before lane-ready: never got a prompt and is not unknown; anything less fails closed", () => {
+	test("T5a: a runner lane that ended before lane-ready: never got a prompt and is no gap; anything less is a named gap", () => {
 		const started = [entry('lane-started: lane-b {"pid":2}', null, LANE_RUNNER_BY), entry('lane-started: lane-b {"pid":2,"session":"s"}', null, LANE_RUNNER_BY)];
 		const failed = entry("launch-failed: lane-b model: named openai-codex/gpt-6-sol, omp started anthropic/claude-opus-5-5", null, LANE_RUNNER_BY);
 		const exited = entry("lane-exit: lane-b code 0 signal - outcome stop", null, LANE_RUNNER_BY);
-		const UNKNOWN = ["lane lane-b has a lane-started: entry and no builder-lab: entry, so the lab it ran on is unknown"];
-		expect(builderLabs(view([...LANE, ...started, failed]), "wl")).toEqual({ labs: ["anthropic"], unknown: [] });
-		expect(builderLabs(view([...LANE, ...started, exited]), "wl").unknown).toEqual([]);
-		expect(builderLabs(view([...LANE, ...started, { ...failed, created_by: LANE_STARTER_BY }]), "wl").unknown).toEqual([]);
+		const GAPS = [GAP("lane-b")];
+		expect(builderLabs(view([...LANE, ...started, failed]), "wl")).toEqual({ labs: ["anthropic"], unknown: [], gaps: [] });
+		expect(builderLabs(view([...LANE, ...started, exited]), "wl").gaps).toEqual([]);
+		expect(builderLabs(view([...LANE, ...started, { ...failed, created_by: LANE_STARTER_BY }]), "wl").gaps).toEqual([]);
 		// A lane-ready: from any writer means a prompt may have gone out.
-		expect(builderLabs(view([...LANE, ...started, entry("lane-ready: lane-b at t", null, LANE_RUNNER_BY), exited]), "wl").unknown).toEqual(UNKNOWN);
-		expect(builderLabs(view([...LANE, ...started, entry("lane-ready: lane-b at t", null, "lane-b"), exited]), "wl").unknown).toEqual(UNKNOWN);
+		expect(builderLabs(view([...LANE, ...started, entry("lane-ready: lane-b at t", null, LANE_RUNNER_BY), exited]), "wl").gaps).toEqual(GAPS);
+		expect(builderLabs(view([...LANE, ...started, entry("lane-ready: lane-b at t", null, "lane-b"), exited]), "wl").gaps).toEqual(GAPS);
 		// Still running (no end), an end the lane wrote itself, or a lane-started: the runner did not write.
-		expect(builderLabs(view([...LANE, ...started]), "wl").unknown).toEqual(UNKNOWN);
-		expect(builderLabs(view([...LANE, ...started, { ...exited, created_by: "lane-b" }]), "wl").unknown).toEqual(UNKNOWN);
-		expect(builderLabs(view([...LANE, started[0]!, entry('lane-started: lane-b {"pid":3}', null, LANE_STARTER_BY), exited]), "wl").unknown).toEqual(UNKNOWN);
-		expect(builderLabs(view([...LANE, entry('lane-started: lane-b {"pid":2}'), failed]), "wl").unknown).toEqual(UNKNOWN);
+		expect(builderLabs(view([...LANE, ...started]), "wl").gaps).toEqual(GAPS);
+		expect(builderLabs(view([...LANE, ...started, { ...exited, created_by: "lane-b" }]), "wl").gaps).toEqual(GAPS);
+		expect(builderLabs(view([...LANE, started[0]!, entry('lane-started: lane-b {"pid":3}', null, LANE_STARTER_BY), exited]), "wl").gaps).toEqual(GAPS);
+		expect(builderLabs(view([...LANE, entry('lane-started: lane-b {"pid":2}'), failed]), "wl").gaps).toEqual(GAPS);
+		// A gap is its own category, never `unknown`: the park question names the gap, not an unmapped provider.
+		expect(builderLabs(view([...LANE, ...started]), "wl").unknown).toEqual([]);
 	});
 });
 
@@ -202,7 +248,7 @@ describe("T1: wl-mv0n866rd9jlds, a lane that died with two change hands in fligh
 			routing({ session_root: missing, agent_id: "sl-fix-71-r1-2" }),
 			routing({ session_root: missing, agent_id: "sl-fix-72-r1-2" }),
 		];
-		expect(builderLabs(view(entries, routings), "wl")).toEqual({ labs: ["anthropic"], unknown: [] });
+		expect(builderLabs(view(entries, routings), "wl")).toEqual({ labs: ["anthropic"], unknown: [], gaps: [] });
 	});
 });
 
@@ -221,7 +267,7 @@ describe("T2: a dead hand counts the models that answered in its session file", 
 	test("(a) an answering turn counts; an error turn, a malformed line and a user line do not", () => {
 		const root = freshRoot();
 		session(root, "sl-k", [header(t(3)), userTurn(t(3)), turn(OPENAI, t(4)), turn(KIMI, t(5), "error"), "{not json", ""]);
-		expect(builderLabs(view(killedByExit(root)), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [] });
+		expect(builderLabs(view(killedByExit(root)), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [], gaps: [] });
 	});
 
 	test("(b) a collision: the file a routings row claims is another hand's; the unclaimed -2 file is this one's", () => {
@@ -229,7 +275,7 @@ describe("T2: a dead hand counts the models that answered in its session file", 
 		session(root, "sl-k", [header(t(3)), turn(KIMI, t(4))]);
 		session(root, "sl-k-2", [header(t(3)), turn(OPENAI, t(4))]);
 		const older = routing({ kind: "judge", ran_models: JSON.stringify([KIMI]), session_root: root, agent_id: "sl-k" });
-		expect(builderLabs(view(killedByExit(root), [older]), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [] });
+		expect(builderLabs(view(killedByExit(root), [older]), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [], gaps: [] });
 		const elsewhere = routing({ kind: "judge", ran_models: JSON.stringify([KIMI]), session_root: join(root, "other"), agent_id: "sl-k" });
 		expect(builderLabs(view(killedByExit(root), [elsewhere]), "wl").labs).toEqual(["anthropic", "openai", "kimi"]);
 	});
@@ -237,37 +283,37 @@ describe("T2: a dead hand counts the models that answered in its session file", 
 	test("(c) only <key>-2.jsonl present: its model counts", () => {
 		const root = freshRoot();
 		session(root, "sl-k-2", [header(t(3)), turn(KIMI, t(4))]);
-		expect(builderLabs(view(killedByExit(root)), "wl")).toEqual({ labs: ["anthropic", "kimi"], unknown: [] });
+		expect(builderLabs(view(killedByExit(root)), "wl")).toEqual({ labs: ["anthropic", "kimi"], unknown: [], gaps: [] });
 	});
 
 	test("(d) the window: a successor's review file opened after its spawn, and a file opened before the dead spawn, are not read", () => {
 		const root = freshRoot();
 		session(root, "sl-k", [header(t(3)), userTurn(t(3)), turn(OPENAI, t(4), "error")]);
 		session(root, "sl-k-2", [header(t(13)), turn(KIMI, t(14))]);
-		expect(builderLabs(view(killedByStart(root, [review(root, 12)])), "wl", live)).toEqual({ labs: ["anthropic"], unknown: [] });
+		expect(builderLabs(view(killedByStart(root, [review(root, 12)])), "wl", live)).toEqual({ labs: ["anthropic"], unknown: [], gaps: [] });
 		const before = freshRoot();
 		session(before, "sl-k", [header(t(1)), turn(OPENAI, t(1))]);
-		expect(builderLabs(view(killedByStart(before)), "wl")).toEqual({ labs: ["anthropic"], unknown: [] });
+		expect(builderLabs(view(killedByStart(before)), "wl")).toEqual({ labs: ["anthropic"], unknown: [], gaps: [] });
 	});
 
 	test("(e) a survivor: a file opened before the retirement counts a turn written after the successor's first spawn", () => {
 		const root = freshRoot();
 		session(root, "sl-k", [header(t(3)), turn(OPENAI, t(20))]);
-		expect(builderLabs(view(killedByStart(root, [review(freshRoot(), 12)])), "wl", live)).toEqual({ labs: ["anthropic", "openai"], unknown: [] });
+		expect(builderLabs(view(killedByStart(root, [review(freshRoot(), 12)])), "wl", live)).toEqual({ labs: ["anthropic", "openai"], unknown: [], gaps: [] });
 	});
 
 	test("(f) a delayed open: after the successor started but before its first spawn, or with no successor spawn at all, counts", () => {
 		const root = freshRoot();
 		session(root, "sl-k", [header(t(10.5)), turn(OPENAI, t(10.6))]);
-		expect(builderLabs(view(killedByStart(root, [review(freshRoot(), 12)])), "wl", live)).toEqual({ labs: ["anthropic", "openai"], unknown: [] });
-		expect(builderLabs(view(killedByStart(root)), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [] });
+		expect(builderLabs(view(killedByStart(root, [review(freshRoot(), 12)])), "wl", live)).toEqual({ labs: ["anthropic", "openai"], unknown: [], gaps: [] });
+		expect(builderLabs(view(killedByStart(root)), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [], gaps: [] });
 	});
 
 	test("(g) a spawn by the dead hand's own lane after its death entry does not bound the window", () => {
 		const root = freshRoot();
 		session(root, "sl-k", [header(t(60)), turn(OPENAI, t(61))]);
 		const late = [spawned(L, "dt-late", { root: freshRoot(), key: "sl-late", row: ["anthropic/claude-opus-5-5"], m: 55 })];
-		expect(builderLabs(view([...killedByExit(root), ...late]), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [] });
+		expect(builderLabs(view([...killedByExit(root), ...late]), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [], gaps: [] });
 	});
 
 	test("(h) a late spawn of the old lane after its successor's live review: the review's file is not read through it", () => {
@@ -277,13 +323,127 @@ describe("T2: a dead hand counts the models that answered in its session file", 
 			started(L, 0), laneLab(L, 1), started(M, 10), laneLab(M, 11), review(root, 12),
 			spawned(L, "dt-late", { root, key: "sl-k", m: 13 }), exited(L, 20),
 		];
-		expect(builderLabs(view(entries), "wl", live)).toEqual({ labs: ["anthropic"], unknown: [] });
+		expect(builderLabs(view(entries), "wl", live)).toEqual({ labs: ["anthropic"], unknown: [], gaps: [] });
 	});
 
 	test("a file with turns and no session header is not read", () => {
 		const root = freshRoot();
 		session(root, "sl-k", [turn(OPENAI, t(4))]);
-		expect(builderLabs(view(killedByExit(root)), "wl")).toEqual({ labs: ["anthropic"], unknown: [] });
+		expect(builderLabs(view(killedByExit(root)), "wl")).toEqual({ labs: ["anthropic"], unknown: [], gaps: [] });
+	});
+});
+
+describe("item 109: the starter settles the hands a launch orphans", () => {
+	// The live shape of wl-mv0n866rd9jlds: lane -2 spawned dt-mv19brokdc5afe0d and dt-mv19brok90ed1cd2
+	// at 2026-10-09T17:46Z and went silent; Jo relaunched after the lease lapsed at 2026-10-11T18:10:46Z
+	// (lane -3, no lane-exit: for -2), and the two open rows counted every lab until the next review
+	// parked. Lane -1 exited before its orphan: the reason says so.
+	const [lane1, lane2] = ["lane-mv0n866rd9jlds-1", "lane-mv0n866rd9jlds-2"];
+	const root = "/Users/jowolff/code/agent-system-2.0-lanes/wl-mv0n866rd9jlds/.omp";
+	const entries = [
+		started(lane1, 0), laneLab(lane1, 1),
+		spawned(lane1, "dt-mv18l7h70265556f", { root, key: "sl-plan-r1", review: true, row: [OPENAI, KIMI], m: 2 }),
+		exited(lane1, 4),
+		started(lane2, 10), laneLab(lane2, 11),
+		spawned(lane2, "dt-c1", { root, key: "sl-fix-70", m: 12 }),
+		settledBy(lane2, "dt-c1", "rt-c1", 13),
+		spawned(lane2, "dt-mv19brokdc5afe0d", { root, key: "sl-fix-71-r1", m: 14 }),
+		spawned(lane2, "dt-mv19brok90ed1cd2", { root, key: "sl-fix-72-r1", m: 14 }),
+		spawned(lane2, "dt-mv1911h67667a865", { root, key: "sl-x-review", review: true, row: [OPENAI], m: 15 }),
+	];
+	const orphaned = (token: string, lane: string, reason: string) => `hand-settled: ${token} orphaned lane ${lane} reason ${reason}`;
+
+	test("every unsettled hand-spawn: of a lane gets its orphaned settle; a review hand its orphaned round; a settled one nothing", () => {
+		expect(orphanSettleEntries(entries)).toEqual([
+			{ sliceId: "sl-x", body: orphaned("dt-mv18l7h70265556f", lane1, "superseded-after-lane-exit") },
+			{ sliceId: "sl-x", body: "review-round: sl-x round 1 token dt-mv18l7h70265556f group dg-dt-mv18l7h70265556f verdict orphaned blocking unknown counts unknown" },
+			{ sliceId: "sl-x", body: orphaned("dt-mv19brokdc5afe0d", lane2, "superseded-without-lane-exit") },
+			{ sliceId: "sl-x", body: orphaned("dt-mv19brok90ed1cd2", lane2, "superseded-without-lane-exit") },
+			{ sliceId: "sl-x", body: orphaned("dt-mv1911h67667a865", lane2, "superseded-without-lane-exit") },
+			// Its group is the slice's second open group, so it takes round 2, as the classifier's writeRound would.
+			{ sliceId: "sl-x", body: "review-round: sl-x round 2 token dt-mv1911h67667a865 group dg-dt-mv1911h67667a865 verdict orphaned blocking unknown counts unknown" },
+		]);
+	});
+
+	test("the starter's orphaned settle is a settle: the rows stop counting and the tokens read back with no routing; from any other writer it is ignored", () => {
+		expect(builderLabs(view(entries), "wl", new Set(), () => []).labs).toEqual(["anthropic", "openai", "kimi"]);
+		const settles = orphanSettleEntries(entries).map((e) => entry(e.body, e.sliceId, LANE_STARTER_BY, t(20)));
+		const after = [...entries, ...settles, started("lane-mv0n866rd9jlds-3", 21), laneLab("lane-mv0n866rd9jlds-3", 22)];
+		expect(builderLabs(view(after), "wl", new Set(), () => [])).toEqual({ labs: ["anthropic"], unknown: [], gaps: [] });
+		expect(settledTokens(after).get("dt-mv19brokdc5afe0d")).toBeNull();
+		expect(settledTokens(after).get("dt-c1")).toBe("rt-c1");
+		expect(orphanSettleEntries(after)).toEqual([]);
+		// A lane forging the starter's settle settles nothing, and a round already written is not written twice.
+		const forged = [...entries, ...orphanSettleEntries(entries).map((e) => entry(e.body, e.sliceId, lane2, t(20)))];
+		expect(settledTokens(forged).has("dt-mv19brokdc5afe0d")).toBe(false);
+		expect(orphanSettleEntries(forged).map((e) => e.body)).toEqual(orphanSettleEntries(entries).map((e) => e.body).filter((b) => !b.startsWith("review-round:")));
+	});
+
+	test("an orphaned review is no round: the slice's count holds nothing open and the next round is 1", () => {
+		const settles = orphanSettleEntries(entries).map((e) => entry(e.body, e.sliceId, LANE_STARTER_BY, t(20)));
+		expect(countRounds([...entries, ...settles], "sl-x")).toEqual({ rounds: [], failed: 0, passed: false, next: 1 });
+		expect(countRounds(entries, "sl-x").rounds.map((r) => r.complete)).toEqual([false, false]);
+	});
+});
+
+describe("PR #76 B1: an orphaned settle ends the hand's accounting, never its provenance", () => {
+	// Lane L (anthropic) spawns one hand at minute 2 and goes silent with no lane-exit:. The starter's
+	// reservation for lane M at minute 20 writes the orphaned settles; M starts at 21, marks anthropic,
+	// and spawns (and settles) its first hand at 23, which bounds the old hand's session window.
+	const nextRow = (root: string) => routing({ session_root: root, agent_id: "sl-next" });
+	/** The ledger before the reservation, after it, and after it plus the successor's launch. */
+	const ledgers = (root: string, token: string, key: string, review = false) => {
+		const before = [started(L, 0), laneLab(L, 1), spawned(L, token, { root, key, review, row: review ? [OPENAI, KIMI] : STRONG, m: 2 })];
+		const reserved = [
+			...before,
+			...orphanSettleEntries(before).map((e) => entry(e.body, e.sliceId, LANE_STARTER_BY, t(20))),
+			entry(`launch: ${M} cause interactive requested-by jo`, null, LANE_STARTER_BY, t(20)),
+		];
+		expect(settledTokens(reserved).get(token)).toBeNull();
+		const launched = [
+			...reserved, started(M, 21), laneLab(M, 22),
+			spawned(M, "dt-next", { root, key: "sl-next", row: ["anthropic/claude-opus-5-5"], m: 23 }), settledBy(M, "dt-next", "rt-next", 24),
+		];
+		return { before, reserved, launched };
+	};
+
+	test("an answered change hand: its answering lab stays a builder after the orphaned settle, with or without a successor lane-started:", () => {
+		const root = freshRoot();
+		session(root, "sl-c", [header(t(3)), turn(OPENAI, t(4))]);
+		const { before, reserved, launched } = ledgers(root, "dt-chg", "sl-c");
+		expect(builderLabs(view(before), "wl").labs).toEqual(["anthropic", "openai", "kimi"]);
+		// The reservation alone (the launch may yet fail before lane-started:) makes the hand terminal.
+		expect(builderLabs(view(reserved), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [], gaps: [] });
+		const builders = builderLabs(view(launched, [nextRow(root)]), "wl");
+		expect(builders).toEqual({ labs: ["anthropic", "openai"], unknown: [], gaps: [] });
+		expect(excludedLabs(builders)).toEqual(["anthropic", "openai"]);
+	});
+
+	test("an answered review hand: its answering lab stays a builder after the orphaned settle", () => {
+		const root = freshRoot();
+		session(root, "sl-r", [header(t(3)), turn(KIMI, t(4))]);
+		const { reserved, launched } = ledgers(root, "dt-rev", "sl-r", true);
+		expect(reserved.some((e) => e.created_by === LANE_STARTER_BY && e.body.startsWith("review-round: sl-x round 1 token dt-rev ") && e.body.includes("verdict orphaned"))).toBe(true);
+		expect(builderLabs(view(reserved), "wl").labs).toEqual(["anthropic", "kimi"]);
+		expect(excludedLabs(builderLabs(view(launched, [nextRow(root)]), "wl"))).toEqual(["anthropic", "kimi"]);
+	});
+
+	test("a late-answering survivor: a turn written after the successor's first spawn still counts across the reservation", () => {
+		const root = freshRoot();
+		session(root, "sl-s", [header(t(3)), turn(OPENAI, t(30))]);
+		const { launched } = ledgers(root, "dt-surv", "sl-s");
+		expect(builderLabs(view(launched, [nextRow(root)]), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [], gaps: [] });
+		// A file the old hand opened only after the successor's first spawn is not its own.
+		const late = freshRoot();
+		session(late, "sl-s", [header(t(25)), turn(OPENAI, t(26))]);
+		expect(builderLabs(view(ledgers(late, "dt-surv", "sl-s").launched, [nextRow(late)]), "wl").labs).toEqual(["anthropic"]);
+	});
+
+	test("an orphaned hand with no answer no longer counts its whole row", () => {
+		const root = freshRoot();
+		const { reserved, launched } = ledgers(root, "dt-empty", "sl-e");
+		expect(builderLabs(view(reserved), "wl").labs).toEqual(["anthropic"]);
+		expect(builderLabs(view(launched, [nextRow(root)]), "wl")).toEqual({ labs: ["anthropic"], unknown: [], gaps: [] });
 	});
 });
 
@@ -325,7 +485,7 @@ describe("T3: which entries kill a hand", () => {
 });
 
 describe("D4–D6: reviewPlan", () => {
-	const anthropic = { labs: ["anthropic" as const], unknown: [] };
+	const anthropic = { labs: ["anthropic" as const], unknown: [], gaps: [] };
 
 	test("normal stakes: one hand on the labs outside the builders, the allowlist filtered the same way", () => {
 		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: anthropic, stakes: "normal", grant: false })).toEqual({
@@ -336,18 +496,18 @@ describe("D4–D6: reviewPlan", () => {
 			sameLab: false,
 			short: null,
 		});
-		const two = reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: ["anthropic", "openai"], unknown: [] }, stakes: "normal", grant: false });
+		const two = reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: ["anthropic", "openai"], unknown: [], gaps: [] }, stakes: "normal", grant: false });
 		expect(two).toMatchObject({ kind: "single", models: ["moonshot/kimi-k2.7-code"] });
 	});
 
 	test("T16: builders that include kimi keep a review off every moonshot model", () => {
-		const plan = reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: ["anthropic", "kimi"], unknown: [] }, stakes: "normal", grant: false });
+		const plan = reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: ["anthropic", "kimi"], unknown: [], gaps: [] }, stakes: "normal", grant: false });
 		expect(plan).toEqual({ kind: "single", models: ["openai-codex/gpt-6-sol"], allow: ["openai-codex/gpt-6-sol"], excluded: ["anthropic", "kimi"], sameLab: false, short: null });
 	});
 
 	test("filters per lab, not per entry: a row with two entries of one lab keeps both", () => {
 		const row = ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "openai/gpt-6", "kimi-code/k3"];
-		const plan = reviewPlan({ row, usable: row, builders: { labs: ["anthropic", "kimi"], unknown: [] }, stakes: "normal", grant: false });
+		const plan = reviewPlan({ row, usable: row, builders: { labs: ["anthropic", "kimi"], unknown: [], gaps: [] }, stakes: "normal", grant: false });
 		expect(plan).toMatchObject({ kind: "single", models: ["openai-codex/gpt-6-sol", "openai/gpt-6"] });
 	});
 
@@ -379,7 +539,14 @@ describe("D4–D6: reviewPlan", () => {
 			excluded: ["anthropic"],
 			reasons: ["anthropic/claude-opus-5-5 (builder lab anthropic)", "openai-codex/gpt-6-sol (no credentials)", "moonshot/kimi-k2.7-code (provider disabled)"],
 		});
-		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: [], unknown: ["x"] }, stakes: "normal", grant: false }).kind).toBe("park");
+		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: [], unknown: ["x"], gaps: [] }, stakes: "normal", grant: false }).kind).toBe("park");
+		// A gap parks the same way (item 109, fail closed): every row entry is a builder's.
+		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: ["anthropic"], unknown: [], gaps: [GAP("lane-b")] }, stakes: "production", grant: false })).toEqual({
+			kind: "park",
+			excluded: [...LABS],
+			reasons: ["anthropic/claude-opus-5-5 (builder lab anthropic)", "openai-codex/gpt-6-sol (builder lab openai)", "moonshot/kimi-k2.7-code (builder lab kimi)"],
+		});
+		expect(parkQuestionBody("sl-x", { labs: ["anthropic"], unknown: [], gaps: [GAP("lane-b")] }, [])).toContain(`(every lab: ${GAP("lane-b")})`);
 		const mystery = ["anthropic/claude-opus-5-5", "mystery/model-x"];
 		expect(reviewPlan({ row: mystery, usable: mystery, builders: anthropic, stakes: "normal", grant: false })).toMatchObject({
 			kind: "park",
@@ -411,7 +578,7 @@ describe("D4–D6: reviewPlan", () => {
 	test("a pinned member keeps only its lab, and is refused when its lab is gone or became a builder", () => {
 		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: anthropic, stakes: null, grant: false, pin: "kimi" })).toMatchObject({ kind: "single", models: ["moonshot/kimi-k2.7-code"] });
 		expect(reviewPlan({ row: STRONG, usable: STRONG.slice(0, 2), builders: anthropic, stakes: null, grant: false, pin: "kimi" }).kind).toBe("park");
-		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: ["anthropic", "kimi"], unknown: [] }, stakes: null, grant: false, pin: "kimi" }).kind).toBe("park");
+		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: ["anthropic", "kimi"], unknown: [], gaps: [] }, stakes: null, grant: false, pin: "kimi" }).kind).toBe("park");
 	});
 });
 
@@ -437,7 +604,7 @@ describe("D6: reading Jo's answer", () => {
 	});
 
 	test("the park question names the builder's lab, the reasons, and both answers", () => {
-		const body = parkQuestionBody("sl-x", { labs: ["anthropic"], unknown: [] }, ["openai-codex/gpt-6-sol (no credentials)", "kimi-code/kimi-for-coding (provider disabled)"]);
+		const body = parkQuestionBody("sl-x", { labs: ["anthropic"], unknown: [], gaps: [] }, ["openai-codex/gpt-6-sol (no credentials)", "kimi-code/kimi-for-coding (provider disabled)"]);
 		expect(body).toBe(
 			"No lab other than the builder's (anthropic) can review sl-x: openai-codex/gpt-6-sol (no credentials), kimi-code/kimi-for-coding (provider disabled). " +
 				"**same-lab**: run this one review on anthropic, the builder's lab. " +

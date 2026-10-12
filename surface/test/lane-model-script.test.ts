@@ -71,14 +71,15 @@ const startsOf = (r: LaneRoot, wl: string, laneId: string) =>
 	laneSnapshot(r, wl).control.filter((c) => c.prefix === "lane-started" && c.laneId === laneId)
 		.map((c) => ({ by: c.createdBy, ...(JSON.parse(c.rest) as { session: string | null; model?: string | null; ranModel?: string | null; resumeSkipped?: string | null }) }));
 const readyLines = (r: LaneRoot, wl: string, laneId: string) => laneSnapshot(r, wl).control.filter((c) => c.prefix === "lane-ready" && c.laneId === laneId);
-const unknownOf = (r: LaneRoot, wl: string) => {
+const buildersOf = (r: LaneRoot, wl: string) => {
 	const l = ledgerOf(r);
 	try {
-		return builderLabs(l, wl).unknown;
+		return builderLabs(l, wl);
 	} finally {
 		l.close();
 	}
 };
+const unknownOf = (r: LaneRoot, wl: string) => buildersOf(r, wl).unknown;
 
 describe("T1–T3: the runner starts on Jo's model and keeps the session only on it", () => {
 	test("T1p: --model in the argv; lane-started: records model and ranModel; still two starts, ready, then the prompt", async () => {
@@ -239,7 +240,7 @@ describe("T4: a named model OMP does not report fails the launch before any prom
 });
 
 describe("T5c: lane-ready: only just before the first prompt", () => {
-	test("an at-ceiling relaunch stops before lane-ready: and before any prompt; builderLabs names it neither builder nor unknown", async () => {
+	test("an at-ceiling relaunch stops before lane-ready: and before any prompt; builderLabs names it neither builder nor unknown nor gap, while the prompted lane's lab is derived from its lane-started: record (item 109)", async () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r, X);
 		surfaceWrite(r, wl, [ceilingBody({ usd: 1, wallMin: 60 }, "test tiny ceiling")]);
@@ -256,9 +257,11 @@ describe("T5c: lane-ready: only just before the first prompt", () => {
 		expect(await exitOf(r, wl, lane2)).toMatchObject({ outcome: "stop", reason: "ceiling" });
 		expect(readyLines(r, wl, lane2)).toEqual([]);
 		expect(eventsOf(r, spawnRecord(r, 2).pid)).not.toContain("prompt");
-		const unknown = unknownOf(r, wl);
-		expect(unknown.some((u) => u.includes(laneIdOf(wl, 1)))).toBe(true);
-		expect(unknown.some((u) => u.includes(lane2))).toBe(false);
+		const builders = buildersOf(r, wl);
+		// Lane 1 prompted on X without a builder-lab: entry (it stopped at the ceiling before an answer),
+		// so its lab is read from its lane-started: record rather than left unknown (item 109); lane 2
+		// never got a prompt, so it is neither a builder, nor unknown, nor a gap.
+		expect(builders).toEqual({ labs: ["openai"], unknown: [], gaps: [] });
 	}, 60_000);
 });
 

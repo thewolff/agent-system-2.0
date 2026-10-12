@@ -11,7 +11,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkBriefFields } from "../../gates/src/rows/r05-brief-fields";
-import { Ledger, type Stakes } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, Ledger, type Stakes } from "../../ledger/src/index";
 import { createClassifierExtension, REVIEW_FINDINGS_PARAGRAPH } from "../extension";
 import { loadCalibration } from "../src/classify";
 import { reviewStopBody, stopReviewsInstructionBody } from "../src/review-stop";
@@ -263,13 +263,25 @@ describe("Routing", () => {
 		expect(review?.reason).toContain("non-review work of workload wl-cross is still in flight (sl-work)");
 	});
 
-	test("a lane with lane-started: and no builder-lab: parks the review", async () => {
+	test("item 109: a lane with lane-started: and no builder-lab: is routed off the lab its lane-started: record names, not parked", async () => {
+		const w = world({ laneStarted: false });
+		w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.wl, kind: "assumption", body: `lane-started: lane-test {"pid":1,"session":null,"model":null,"ranModel":"${OPUS}"}` });
+		const h = lane(w); // the lane has not answered yet: no builder-lab entry
+		expect((await reviewSpawn(h, w))?.model).toEqual([SOL, KIMI]);
+		expect(questions(w)).toHaveLength(0);
+		expect(bodies(w, "builder-lab-gap:")).toEqual([]);
+	});
+
+	test("item 109: a lane whose lane-started: record names no model is a recorded gap: the review parks naming it, and the gap is recorded once", async () => {
 		const w = world();
-		const h = lane(w); // the lane never answered: no builder-lab entry
-		const spawn = await reviewSpawn(h, w);
-		expect(spawn?.block).toBe(true);
+		const h = lane(w); // the lane never answered: no builder-lab entry, and its record has no model
+		const gapText = "lane lane-test has a lane-started: entry, no builder-lab: entry and no model in its lane-started: record, so the lab it ran on is unknown";
+		expect((await reviewSpawn(h, w))?.block).toBe(true);
 		expect(questions(w)).toHaveLength(1);
-		expect(questions(w)[0]!.body).toContain("lane lane-test has a lane-started: entry and no builder-lab: entry");
+		expect(questions(w)[0]!.body).toContain(`(every lab: ${gapText})`);
+		expect(bodies(w, "builder-lab-gap:")).toEqual([`builder-lab-gap: ${gapText}`]);
+		await reviewSpawn(h, w, "sl-y", "rev-2");
+		expect(bodies(w, "builder-lab-gap:")).toEqual([`builder-lab-gap: ${gapText}`]); // recorded once
 	});
 
 	test("an unknown provider parks: in the builder history, and as the only other entry of the row", async () => {

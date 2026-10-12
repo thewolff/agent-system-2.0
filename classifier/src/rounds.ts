@@ -137,10 +137,17 @@ function asFindings(x: unknown): Findings | null {
  * question was open (D10: terminal, and the round counts only the members that spawned), or a failed
  * dispatch: it spawned and no model answered on it, every turn ended on a provider error (PLAN
  * wl-muq13bkdghblmo step 8). Like `stopped` it is terminal and not counted, so a round of only
- * failed dispatches is no round and the next dispatch takes its number.
+ * failed dispatches is no round and the next dispatch takes its number. `orphaned` (its lane was
+ * superseded before its result arrived; the lane starter writes it, MIGRATION.md item 109) and
+ * `cancelled` (its job was cancelled with nothing shown) are terminal and not counted the same way:
+ * no review happened, so no round is spent on them.
  */
-export const REVIEW_VERDICTS = ["accepted", "withheld", "refused", "dropped", "stopped", "failed-dispatch"] as const;
+export const REVIEW_VERDICTS = ["accepted", "withheld", "refused", "dropped", "stopped", "failed-dispatch", "orphaned", "cancelled"] as const;
 export type ReviewVerdict = (typeof REVIEW_VERDICTS)[number];
+/** The verdicts of a member that spawned and is terminal without a review having run: not counted toward its round. */
+export const UNCOUNTED_VERDICTS: readonly ReviewVerdict[] = ["stopped", "failed-dispatch", "orphaned", "cancelled"];
+/** The verdicts of a spawned member that make a group of only such members no round at all. */
+export const NO_ROUND_VERDICTS: readonly ReviewVerdict[] = ["failed-dispatch", "orphaned", "cancelled"];
 
 export interface ReviewRoundEntry {
 	slice: string;
@@ -338,8 +345,9 @@ export interface RoundCount {
  * and the tokens of the `review-round:` entries naming the group. It is complete only when every one
  * of them has its `review-round:`, so a listed member that never spawned holds it open until it is
  * known dropped. A group with no member that spawned (only `refused`, `dropped` or `stopped`
- * verdicts, no `hand-spawn:`), or whose spawned members are all `failed-dispatch`, is not a round.
- * A `stopped` or `failed-dispatch` member is terminal and does not count toward the round's result
+ * verdicts, no `hand-spawn:`), or whose spawned members are all `failed-dispatch`, `orphaned` or
+ * `cancelled` (`NO_ROUND_VERDICTS`), is not a round. A `stopped`, `failed-dispatch`, `orphaned` or
+ * `cancelled` member (`UNCOUNTED_VERDICTS`) is terminal and does not count toward the round's result
  * (D10; PLAN wl-muq13bkdghblmo step 8). A group belongs to the loop open when its first entry was
  * written; each `review-loop-end:` of the slice opens the next loop, so a round still running when
  * its loop ended does not count toward the new one. A round fails when any counted member is not
@@ -393,10 +401,10 @@ export function countRounds(entries: readonly EntryInput[], slice: string): Roun
 	}
 	const rounds: Round[] = [];
 	for (const [id, g] of groups) {
-		if (g.loop !== loop || [...g.ran].every((token) => g.tokens.get(token)?.verdict === "failed-dispatch")) continue;
+		if (g.loop !== loop || [...g.ran].every((token) => NO_ROUND_VERDICTS.includes(g.tokens.get(token)?.verdict ?? "accepted"))) continue;
 		const complete = [...g.tokens.values()].every((r) => r !== null);
 		const members: RoundMember[] = [...g.tokens].flatMap(([token, r]) =>
-			r?.verdict === "stopped" || r?.verdict === "failed-dispatch"
+			r !== null && UNCOUNTED_VERDICTS.includes(r.verdict)
 				? []
 				: [{ token, verdict: r?.verdict ?? null, findings: r?.findings ?? UNKNOWN, accepted: r?.verdict === "accepted" && !withheld.has(token), spawned: g.ran.has(token) }],
 		);
