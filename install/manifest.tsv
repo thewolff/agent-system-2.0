@@ -364,6 +364,8 @@ surface/scripts/invariants.ts	module	-
 surface/test/invariants.test.ts	test	-
 surface/test/fixtures/invariants/build.ts	test	-
 surface/test/fixtures/invariants/ledger.db	test	-
+surface/src/invariant-watch.ts	module	-
+surface/test/invariant-timer.test.ts	test	-
 surface/src/facts.ts	module	-
 surface/test/facts.test.ts	test	-
 surface/src/orchestrator-question.ts	module	-

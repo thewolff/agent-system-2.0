@@ -28,6 +28,13 @@
 // `surface-notices` asides with the same confirmation, resends and fallback as a wake; while a wake
 // is pending or in flight they wait and ride it. Jo's word echoes (`notices`) are never pushed.
 //
+// A second timer on the same context (MIGRATION.md item 104) runs the invariant report
+// (surface/scripts/invariants.ts `check`) in-process every INVARIANT_MS (default 10 min) and puts a
+// needs-you line on the tick's queue for each finding whose key was never surfaced; the key is
+// recorded on the ledger when the line is delivered (a confirmed push, or Jo's turn rendering the
+// queue), so a restart neither re-announces a delivered key nor loses an undelivered one
+// (surface/src/invariant-watch.ts).
+//
 // Every pushed message, and Jo's turn message when it re-renders a pushed one, carries
 // `details.surfaceKey` (`wake:<id>`, `notices:<id>`, shared by a push's resends and its re-render)
 // and `details.renderSeq`. The `context` hook keeps the newest message per key after the last
@@ -37,6 +44,7 @@ import { contractPath, injectContract } from "../../gates/src/rows/r02-contract"
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
+import { confirmInvariantLines, newInvariantLines } from "../src/invariant-watch";
 import { renderWake } from "../src/render";
 import { type SurfaceSession, surfaceSession, type WakeTrigger } from "../src/session";
 import { recordLapsedLeases } from "../src/signals";
@@ -339,6 +347,43 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	};
 
 	/**
+	 * The invariant tick (MIGRATION.md item 104; surface/src/invariant-watch.ts): run the report
+	 * in-process, queue a needs-you line per finding (and persistent skip) never surfaced before, and
+	 * push the queue. A run that fails is told once per distinct failure, and breaks any skip streak:
+	 * the run before the next one is the failed one, which skipped nothing.
+	 */
+	const invariantTick = (s: SurfaceSession, ctx: Ctx): void => {
+		if (!s.active) return;
+		try {
+			const lines = newInvariantLines(s.ledger(), s.invariantReport(), s.invariantSkips, s.invariantPending);
+			s.invariantFailure = null;
+			s.tickNotices.push(...lines);
+		} catch (err) {
+			s.invariantSkips.clear();
+			const failure = `tick: the invariant report failed: ${String(err)}`;
+			if (s.invariantFailure !== failure) {
+				s.invariantFailure = failure;
+				s.tickNotices.push(failure);
+			}
+		}
+		pushNotices(s, ctx, false);
+	};
+
+	/**
+	 * Delivered tick lines: the invariant lines among them are recorded as surfaced now, not at queue
+	 * (a crash in between tells them again after the restart). A failed write is a stderr line; the
+	 * keys stay pending, so this process does not queue them again and the next process tells them.
+	 */
+	const confirmInvariants = (s: SurfaceSession, delivered: readonly string[]): void => {
+		if (s.invariantPending.size === 0) return;
+		try {
+			confirmInvariantLines(s.ledger(), s.invariantPending, delivered);
+		} catch (err) {
+			process.stderr.write(`surface: recording delivered invariant lines failed: ${String(err)}\n`);
+		}
+	};
+
+	/**
 	 * A wake trigger: a new wake with its own key and tries, superseding any earlier one, and its push
 	 * one WAKE_PUSH_MS later. The key of a superseded wake that was in flight or fell back is retired,
 	 * so the `context` guard drops the copies of it OMP's ACP branch deferred to Jo's next prompt.
@@ -372,6 +417,17 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 					process.stderr.write(`surface: the tick's catch-up failed: ${String(err)}\n`);
 				});
 			}, s.pollMs);
+		}
+		if (!s.invariantTimer) {
+			s.invariantTimer = true;
+			ctx.setInterval(() => {
+				// The push can throw through sendMessage like the catch-up's: a stderr line, the lines stay queued for the poll.
+				try {
+					invariantTick(s, ctx);
+				} catch (err) {
+					process.stderr.write(`surface: the invariant tick's push failed: ${String(err)}\n`);
+				}
+			}, s.invariantMs);
 		}
 		triggerWake(s, ctx, resumed ? "restart" : "session-start");
 		return undefined;
@@ -419,6 +475,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		s.pendingNoticesId = null;
 		s.noticesExhausted = false;
 		const applied = [...s.notices, ...s.tickNotices];
+		confirmInvariants(s, s.tickNotices);
 		s.notices.length = 0;
 		s.tickNotices.length = 0;
 		if (applied.length > 0) parts.push("", appliedBlock(applied));
@@ -442,11 +499,13 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		if (wake && key === `wake:${wake.wakeId}`) {
 			s.wakeInFlight = null;
 			s.tickNotices.splice(0, s.tickNotices.length, ...without(s.tickNotices, wake.carried));
+			confirmInvariants(s, wake.carried);
 		}
 		const batch = s.noticesInFlight;
 		if (batch && key === `notices:${batch.batchId}`) {
 			s.noticesInFlight = null;
 			s.tickNotices.splice(0, s.tickNotices.length, ...without(s.tickNotices, batch.lines));
+			confirmInvariants(s, batch.lines);
 		}
 		return undefined;
 	});
