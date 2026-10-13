@@ -41,8 +41,10 @@ function surface(db: string) {
 		const started = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: ["base"] }, ctx)) as Started;
 		return started.messages[0]?.content ?? "";
 	};
-	const say = async (prompt: string): Promise<string[]> => {
+	/** The turn's prompt; `source` names OMP's `input` before it (Jo typed it: interactive or rpc), none when null. */
+	const say = async (prompt: string, source: string | null = null): Promise<string[]> => {
 		notices.length = 0;
+		if (source !== null) await f.emit("input", { text: prompt, source }, ctx);
 		await f.emit("before_agent_start", { prompt, systemPrompt: [] }, ctx);
 		return [...notices];
 	};
@@ -155,7 +157,7 @@ describe("Jo's answer", () => {
 		const q = s.idOf(await s.raise({ body: "Open the fix workload now, or later?", options: ["now", "later"], about: wl }));
 		const cmd = interpret(ledger, `later ${q}`);
 		expect(cmd).toEqual({ kind: "answer", workloadId: STANDING_WORKLOAD_ID, questionId: q, answer: "later" });
-		const lines = await s.say(`later ${q}`);
+		const lines = await s.say(`later ${q}`, "interactive");
 		expect(lines).toHaveLength(1);
 		expect(lines[0]).toMatch(new RegExp(`^answered the orchestrator's ${q} with "later" \\(answer in-\\S+\\); recorded on ${wl} as instruction in-\\S+$`));
 		const row = ledger.question(q)!;
@@ -173,7 +175,7 @@ describe("Jo's answer", () => {
 		const q = s.idOf(await s.raise({ body: "Now or later?", options: ["now", "later"], about: wl }));
 		expect(interpret(ledger, "now")).toEqual({ kind: "answer", workloadId: STANDING_WORKLOAD_ID, questionId: q, answer: "now" });
 		await s.wake(); // numbers the needs-you lines
-		const lines = await s.say("1 now");
+		const lines = await s.say("1 now", "interactive");
 		expect(lines[0]).toContain(`#1 → answered the orchestrator's ${q} with "now"`);
 		expect(ledger.instructions(wl).map((i) => i.body)).toEqual([`Jo: "now" — answers ${q}: Now or later?`]);
 	});
@@ -188,12 +190,12 @@ describe("Jo's answer", () => {
 		expect(ledger.question(q)!.state).toBe("open");
 		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
 		expect(ledger.instructions(wl)).toEqual([]);
-		const typed = await s.say(`now ${q}`);
+		const typed = await s.say(`now ${q}`, "interactive");
 		expect(typed).toHaveLength(1);
 		expect(typed[0]).toContain(`could not apply "now ${q}": ${q} is about ${wl}, which is closed`);
 		expect(typed[0]).toContain(`${q} stays open`);
 		await s.wake();
-		const batch = await s.say("1 now");
+		const batch = await s.say("1 now", "interactive");
 		expect(batch.join("\n")).toContain(`${q} is about ${wl}, which is closed`);
 		expect(ledger.question(q)!.state).toBe("open");
 		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
@@ -213,7 +215,7 @@ describe("Jo's answer", () => {
 		const s = surface(path);
 		const q = s.idOf(await s.raise({ body: "Now or later?", options: ["now", "later"], about: wl }));
 		expect(interpret(ledger, `withdraw ${q}`)).toEqual({ kind: "withdraw", workloadId: STANDING_WORKLOAD_ID, questionId: q, then: "replan" });
-		const receipt = apply(ledger, { kind: "withdraw", workloadId: STANDING_WORKLOAD_ID, questionId: q, then: "cancel" });
+		const receipt = apply(ledger, { kind: "withdraw", workloadId: STANDING_WORKLOAD_ID, questionId: q, then: "cancel" }, true);
 		expect(receipt).toMatch(new RegExp(`^withdrew the orchestrator's ${q} \\(withdrawal in-\\S+, then replan\\); the standing slice stays open$`));
 		const row = ledger.question(q)!;
 		expect(row.state).toBe("withdrawn");
@@ -222,8 +224,31 @@ describe("Jo's answer", () => {
 		expect(ledger.instructions(wl)).toEqual([]);
 		const q2 = s.idOf(await s.raise({ body: "Again?", options: ["yes", "no"], about: wl }));
 		expect(ledger.question(q2)).toMatchObject({ state: "open", slice_id: STANDING_SLICE_ID });
-		expect((await s.say(`withdraw ${q2}`))[0]).toContain("the standing slice stays open");
+		expect((await s.say(`withdraw ${q2}`, "interactive"))[0]).toContain("the standing slice stays open");
 		expect(ledger.slice(STANDING_SLICE_ID)!.state).toBe("open");
+	});
+
+	test("round 2, B1: `apply` answers or withdraws the orchestrator's question only under Jo's typed input; a lane's question is untouched by the rule", async () => {
+		const { ledger, path } = tempLedger();
+		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		const s = surface(path);
+		const q = s.idOf(await s.raise({ body: "Now or later?", options: ["now", "later"], about: wl }));
+		const refusal = `${q} is the orchestrator's own question, and only words Jo typed at the surface answer or withdraw it; this prompt carried no matching typed input, so nothing was applied`;
+		expect(() => apply(ledger, interpret(ledger, `now ${q}`)!)).toThrow(refusal);
+		expect(() => apply(ledger, interpret(ledger, `withdraw ${q}`)!)).toThrow(refusal);
+		expect(ledger.question(q)!.state).toBe("open");
+		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
+		expect(ledger.instructions(wl)).toEqual([]);
+		// At the surface: no input, an extension's, or one that does not match: refused with the same line, nothing written.
+		expect(await s.say(`now ${q}`)).toEqual([`could not apply "now ${q}": ${refusal}`]);
+		expect(await s.say(`now ${q}`, "extension")).toEqual([`could not apply "now ${q}": ${refusal}`]);
+		await s.f.emit("input", { text: `later ${q}`, source: "interactive" }, s.ctx);
+		expect(await s.say(`now ${q}`)).toEqual([`could not apply "now ${q}": ${refusal}`]);
+		expect(ledger.question(q)!.state).toBe("open");
+		// A lane's question answers from the prompt as before.
+		const sl = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const lq = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Left or right?", options: ["left", "right"] });
+		expect((await s.say(`left ${lq}`))[0]).toContain(`answered ${lq} with "left"`);
 	});
 });
 

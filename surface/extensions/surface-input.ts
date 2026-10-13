@@ -43,6 +43,17 @@
 // or a prompt the `input` text does not match, writes nothing: the model then has no receipt, and
 // Jo answers by `<option> q-…` or instructs by a lane's word instead (fail closed).
 //
+// The same typed input is the one authority for a command that answers or withdraws the
+// orchestrator's own question (Codex review of PR #55 round 2, B1): `<option> q-…`, `withdraw q-…`,
+// a numbered batch or a paste line naming such a row applies only when Jo typed this exact prompt
+// (source interactive or rpc, read once per turn), and `apply` refuses it otherwise, so an
+// extension-sent prompt, a session_stop continuation, `omp -p`, a prompt the typed text does not
+// match, or the same prompt arriving again with no new `input` resolves nothing, and a batch or
+// paste carrying one applies nothing. Every other command still applies from the prompt alone.
+// Limit (MIGRATION.md item 105, ruled 2026-10-12): OMP hands this handler the text as rewritten by
+// every `input` handler loaded before it, source unchanged, so an in-process extension that runs
+// first can rewrite Jo's text undetected; in-process extensions are inside the trust boundary.
+//
 // Lane launcher (DESIGN-lane-launcher.md decisions 7 and 9): an answer or a withdrawal is a
 // resolution a parked lane resumes on, so the launch trigger runs after it (once per workload for
 // a batch; `stop-reviews` withdraws the open review questions on its loops, so it runs it too); a
@@ -74,8 +85,8 @@ const span = (i: PasteInstruction): string => (i.from === i.to ? `line ${i.from}
  * would leave a relaunch nothing to consume; a flip to user-driven while an autonomous lane holds
  * the workload writes the `lane-stop:` request the runner accepts.
  */
-function applyOne(ledger: Ledger, cmd: Command): string {
-	let r = apply(ledger, cmd);
+function applyOne(ledger: Ledger, cmd: Command, typed: boolean): string {
+	let r = apply(ledger, cmd, typed);
 	if (cmd.kind === "mode") {
 		const w = ledger.workload(cmd.workloadId);
 		if (cmd.mode === "user-driven" && w && w.holder?.startsWith("lane-") && heldLive(w, ledger.now())) {
@@ -143,8 +154,8 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 	 * workload besides the standing one), its id echoed for the recorder. `ledger` is the turn's
 	 * handle when the prompt was read against the ledger already, else opened here.
 	 */
-	const joInputRow = (s: SurfaceSession, ctx: Ctx, text: string, typed: string | null, ledger: Ledger | null): void => {
-		if (typed === null || typed.trim() !== text) return;
+	const joInputRow = (s: SurfaceSession, ctx: Ctx, text: string, joTyped: boolean, ledger: Ledger | null): void => {
+		if (!joTyped) return;
 		try {
 			const l = ledger ?? s.ledger();
 			const inFlight = l.inFlight();
@@ -188,11 +199,13 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		// What Jo typed for this turn, if OMP's `input` said so; taken whether or not the prompt applies as a command.
 		const typed = s.typed;
 		s.typed = null;
+		// Jo typed exactly this prompt (read once, above): the one authority an answer or withdrawal of the orchestrator's own question applies under (`apply`).
+		const joTyped = typed !== null && typed.trim() === text;
 		// Several lines are a paste, one command per line (a numbered batch one per line included, so its refusals name their lines).
 		const paste = text.includes("\n");
 		// Prose passes through untouched, without a ledger read (unless it is Jo's receipt, see the header): only a batch-shaped prompt, a short command, or a paste with such a line can be a command.
 		if (paste ? !text.split("\n").some((l) => commandShaped(l.trim())) : !commandShaped(text)) {
-			joInputRow(s, ctx, text, typed, null);
+			joInputRow(s, ctx, text, joTyped, null);
 			return undefined;
 		}
 		let ledger: Ledger;
@@ -207,7 +220,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		if (paste) {
 			const r = interpretPaste(ledger, s.numbering, text);
 			if (!r) {
-				joInputRow(s, ctx, text, typed, ledger);
+				joInputRow(s, ctx, text, joTyped, ledger);
 				return undefined;
 			}
 			/** The refusal echo: one verdict per command line, the held instructions, then the one line to fix. */
@@ -231,8 +244,8 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 					r.items.flatMap((item) => {
 						if (item.kind === "instruction") return [{ wl: null, line: `${span(item)} → an instruction for you, one row: "${item.text.replace(/\s*\n\s*/g, " ")}"` }];
 						try {
-							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd)}` }));
-							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd) }];
+							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, joTyped)}` }));
+							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd, joTyped) }];
 						} catch (err) {
 							throw new LineFailure(item.line, item.text, err);
 						}
@@ -265,7 +278,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			let lines: string[];
 			try {
 				// D4: all-or-nothing, one transaction; each answer through apply(), so each is its own ledger row.
-				const echoes = ledger.write(() => batch.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd)}` })));
+				const echoes = ledger.write(() => batch.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, joTyped)}` })));
 				await launchAfter(ledger, echoes);
 				lines = echoes.map((e) => e.line);
 			} catch (err) {
@@ -279,7 +292,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		try {
 			const cmd = interpret(ledger, text);
 			if (!cmd) {
-				joInputRow(s, ctx, text, typed, ledger);
+				joInputRow(s, ctx, text, joTyped, ledger);
 				return undefined;
 			}
 			if (cmd.kind === "ambiguous") {
@@ -290,7 +303,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				echo(s, ctx, text, [cmd.why], "warning");
 				return undefined;
 			}
-			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd)) }];
+			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd, joTyped)) }];
 			await launchAfter(ledger, echoes);
 			receipt = echoes[0]!.line;
 		} catch (err) {

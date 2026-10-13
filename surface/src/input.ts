@@ -666,9 +666,25 @@ export function isPlanQuestion(ledger: Ledger, q: { id: string; workload_id: str
 	return isPlanQuestionIn(controlEntries(entries, holdersOf(entries, w.holder, ledger.holders(q.workload_id))), q);
 }
 
-/** Apply a command through the ledger module as Jo via the surface. Returns the one-line receipt. */
-export function apply(ledger: Ledger, cmd: Command): string {
+/** The orchestrator's own question (MIGRATION.md item 105) `cmd` answers or withdraws, else null. */
+export const standingQuestionOf = (cmd: Command): string | null =>
+	(cmd.kind === "answer" || cmd.kind === "withdraw") && cmd.workloadId === STANDING_WORKLOAD_ID ? cmd.questionId : null;
+
+/** The refusal for an orchestrator question resolved by a prompt Jo did not type (PR #55 round 2, B1). */
+export const untypedStandingRefusal = (questionId: string): string =>
+	`${questionId} is the orchestrator's own question, and only words Jo typed at the surface answer or withdraw it; this prompt carried no matching typed input, so nothing was applied`;
+
+/**
+ * Apply a command through the ledger module as Jo via the surface. Returns the one-line receipt.
+ * `typed`: the prompt carrying `cmd` is what Jo typed this turn (OMP's `input`, source interactive
+ * or rpc, matching the prompt, read once; surface/extensions/surface-input.ts). An answer or a
+ * withdrawal of the orchestrator's own question throws without it (Codex review of PR #55 round 2,
+ * B1): an extension-sent prompt, a session_stop continuation or an `omp -p` prompt resolves none.
+ */
+export function apply(ledger: Ledger, cmd: Command, typed = false): string {
 	const stamp = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
+	const own = standingQuestionOf(cmd);
+	if (own !== null && !typed) throw new Error(untypedStandingRefusal(own));
 	switch (cmd.kind) {
 		case "stakes": {
 			// The instruction goes first, so the re-sized `ceiling:` entry can name it when it raises (§ 2 item 2).
