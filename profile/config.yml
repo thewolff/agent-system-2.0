@@ -100,10 +100,10 @@ extensions:
   - "{repo}/classifier/extension.ts"
 
 
-# ── Skills (DESIGN-2.0.md § C6.1: 22 rows; MIGRATION.md M6; skills/VENDOR.md) ──
+# ── Skills (DESIGN-2.0.md § C6.1: 23 rows; MIGRATION.md M6; skills/VENDOR.md) ──
 # The checkout's skills/ is the only skill source: the providers that would pull skills from
 # ~/.claude, ~/.codex, ~/.agents, the profile's own agent/skills, or the working directory are off
-# (extensibility/skills.ts loadSkills isSourceEnabled), and includeSkills names the 22 manifest
+# (extensibility/skills.ts loadSkills isSourceEnabled), and includeSkills names the 23 manifest
 # rows exactly (omp://skills.md: includeSkills is an allowlist; empty means all). The installer
 # refuses a render whose list differs from the manifest's `skill` rows. Reversal: an empty
 # includeSkills with the providers back on returns to the machine's own skill set.
@@ -132,6 +132,7 @@ skills:
     - humanizer
     - impeccable
     - interview-me
+    - jo-deck
     - observability-and-instrumentation
     - performance-optimization
     - research

@@ -1,6 +1,6 @@
 # skills/ — vendored sources and pins
 
-Every directory under `skills/` is one of the 22 rows of DESIGN-2.0.md § C6.1. Rows 1–21 were copied from the source named here at the pin named here (§ C6.4, refreshed per `research/skill-pack-refresh.md` § 7) and then owned by this repo; row 22, `seo-audit`, was written in this repo (workload wl-mv5jz4vewt8mbk, `migration/items/seo-audit-skill.md`) and has no upstream. Nothing here tracks upstream automatically; a re-pin is a deliberate re-diff against the commit in this table. Every edit made after the copy is marked in-file with a `<!-- owned: … -->` comment at the edit, so `grep -rn 'owned:' skills/` lists the whole delta.
+Every directory under `skills/` is one of the 23 rows of DESIGN-2.0.md § C6.1. Rows 1–21 were copied from the source named here at the pin named here (§ C6.4, refreshed per `research/skill-pack-refresh.md` § 7) and then owned by this repo; row 22, `seo-audit`, was written in this repo (workload wl-mv5jz4vewt8mbk, `migration/items/seo-audit-skill.md`) and has no upstream; row 23, `jo-deck`, was copied from Jo's dirs (`~/.agents/skills/jo-deck`, the newer of two copies) on 2026-10-13 by workload wl-mv6zfcyl8s54w0 (`migration/items/jo-deck-skill.md`) and owned from then. Nothing here tracks upstream automatically; a re-pin is a deliberate re-diff against the commit in this table. Every edit made after the copy is marked in-file with a `<!-- owned: … -->` comment at the edit, so `grep -rn 'owned:' skills/` lists the whole delta.
 
 Copied 2026-09-29 by the M6 migration step (`MIGRATION.md` M6). The copy script and the tag clones it read from are scratch: `/Users/jowolff/agent-scratch/agent-system-2.0/migration/M6/{build-skills.sh,clones/}`.
 
@@ -13,13 +13,13 @@ Copied 2026-09-29 by the M6 migration step (`MIGRATION.md` M6). The copy script 
 | blader/humanizer | https://github.com/blader/humanizer.git | `v3.1.0` | `225a6f39ac85f76ee48dbad772ea4abe4ed6c9d8` | MIT (`humanizer/LICENSE`) | 2026-09-29 |
 | obra/superpowers | https://github.com/obra/superpowers.git | `v6.4.2` | `8ca22dba9a94f28898bbce59f2537ff4d87c747d` | MIT (`execute-plan/LICENSE`) | 2026-09-29 |
 | newdle-claude-plugins (ours) | `/Users/jowolff/code/shipyard/repos/newdle-claude-plugins`, `plugins/newdle/skills/` | — | `2f7e67f8c1463df64895804815d16b88e266ff90` | ours | 2026-09-29 |
-| Jo's user skill dirs (ours) | `~/.claude/skills/`, `~/.agents/skills/` | — | not versioned; copied as found | ours | 2026-09-29 |
+| Jo's user skill dirs (ours) | `~/.claude/skills/`, `~/.agents/skills/` | — | not versioned; copied as found | ours | 2026-09-29; 2026-10-13 (row 23) |
 
 The impeccable skill runs a launcher (`impeccable/scripts/impeccable`) that downloads its engine binary on first use; the engine pin at `skill-v4.3.1` is `engine-v0.1.5` (research/skill-pack-refresh.md § 7). Nothing in this repo vendors the binary.
 
 ## Rows
 
-"Source path" is relative to the pack's clone root (or to the plugin's `plugins/newdle/skills/` for ours). "Absorbed" names the upstream or 1.x skills whose text was folded in as skill-local `references/`; they are not discoverable as skills (nested `SKILL.md` files were renamed so OMP's provider counts exactly 22).
+"Source path" is relative to the pack's clone root (or to the plugin's `plugins/newdle/skills/` for ours). "Absorbed" names the upstream or 1.x skills whose text was folded in as skill-local `references/`; they are not discoverable as skills (nested `SKILL.md` files were renamed so OMP's provider counts exactly 23).
 
 | # | skill dir | pack @ pin | source path(s) | absorbed into it | owned edits |
 |---|---|---|---|---|---|
@@ -45,7 +45,8 @@ The impeccable skill runs a launcher (`impeccable/scripts/impeccable`) that down
 | 20 | `impeccable` | impeccable skill-v4.3.1 | `.pi/skills/impeccable/` (whole dir: `SKILL.md`, `reference/`, `scripts/`) — the `.pi` variant, chosen because OMP leaves `${CLAUDE_SKILL_DIR}` unexpanded (M6 check 1) | — | `allowed-tools` frontmatter key dropped; base-directory note names the OMP location |
 | 21 | `execute-plan` | superpowers v6.4.2 | `skills/subagent-driven-development/SKILL.md` → `SKILL.md`; `skills/subagent-driven-development/{implementer-prompt,task-reviewer-prompt,re-review-prompt}.md`; `skills/subagent-driven-development/scripts/{sdd-workspace,task-brief,review-package}` + `skills/executing-plans/scripts/{task-start,task-done}` → `scripts/`; `skills/executing-plans/SKILL.md` → `references/executing-plans.md`; `skills/requesting-code-review/code-reviewer.md` → `code-reviewer-prompt.md`; `LICENSE` | executing-plans; `incremental-implementation` | rename + description; `superpowers:*` refs → rows #3–#7; four stops → SPEC § A4 reserved list; `Ruling:` → ledger `assumption` entry; main-branch consent line and `finishing-a-development-branch` hand-off removed. Scripts unchanged (workspace path `.superpowers/sdd/` kept) |
 | 22 | `seo-audit` | — (written in this repo, 2026-10-12) | — | supersedes the plugin's `newdle-seo-audit`; no text copied | not a copy: every rule row cites a primary source listed in `references/sources.md` |
+| 23 | `jo-deck` | Jo's dirs | `~/.agents/skills/jo-deck/{SKILL.md,references/presentation-principles.md}` (newest; `~/.claude/skills/jo-deck` differs only in Notes bullet 1, `~/.claude` vs `~/.Codex`) | — | header marker; Notes bullet 1 path line; voice/VOICE.md § HTML artifacts precedence (deck folder `/Users/jowolff/html-artifacts/<slug>/`, Venture Bros template, no publishing; Jo 2026-10-13) |
 
 ## Discovery contract
 
-The profile's `skills` block (`profile/config.yml`) points `customDirectories` at this directory and lists these 22 names in `includeSkills`; every provider that would pull skills from `~/.claude`, `~/.codex`, or `~/.agents` is off. OMP's native provider requires a frontmatter `description` (`omp://skills.md`); every `SKILL.md` here has one. Skill-local links are relative to the skill directory (`references/…`), because `skill://<name>/<path>` refuses `..`.
+The profile's `skills` block (`profile/config.yml`) points `customDirectories` at this directory and lists these 23 names in `includeSkills`; every provider that would pull skills from `~/.claude`, `~/.codex`, or `~/.agents` is off. OMP's native provider requires a frontmatter `description` (`omp://skills.md`); every `SKILL.md` here has one. Skill-local links are relative to the skill directory (`references/…`), because `skill://<name>/<path>` refuses `..`.

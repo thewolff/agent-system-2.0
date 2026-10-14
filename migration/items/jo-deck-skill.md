@@ -1,0 +1,13 @@
+---
+title: `jo-deck`: Jo's deck skill vendored as core skill #23, its decks under voice/VOICE.md § HTML artifacts
+status: building
+workload: wl-mv6zfcyl8s54w0
+pr: 128
+---
+**Built on branch `wl/wl-mv6zfcyl8s54w0`.** Workload `wl-mv6zfcyl8s54w0` (normal stakes, plan revision 4 at `~/agent-scratch/agent-system-2.0/wl-mv6zfcyl8s54w0/PLAN.md`, approved by Jo). **What shipped:** `skills/jo-deck/` (`SKILL.md` and `references/presentation-principles.md`, copied once from `~/.agents/skills/jo-deck` and owned from here, every edit marked `<!-- owned: … -->`); a `skill` row and a `skill-asset` row in `install/manifest.tsv`; `jo-deck` in `profile/config.yml` `skills.includeSkills`; and the core count 22 → 23 in `install/fresh-machine-test.sh`, the profile's skills comment, `skills/VENDOR.md` (row 23) and `DESIGN-2.0.md` (§ C6.1 row 23; the § C6.2 personal-library cell notes the move).
+
+**Two copies, newest used.** Jo's machine held two: `~/.agents/skills/jo-deck/SKILL.md` (2026-07-24) and `~/.claude/skills/jo-deck/SKILL.md` (2026-06-18). Their only difference is Notes bullet 1, which names `~/.Codex` in the newer copy and `~/.claude` in the older; `references/presentation-principles.md` is identical in both. The older copy has nothing the newer lacks beyond that one word, and neither path is right once the skill lives here, so the vendored bullet names `skills/VENDOR.md` row 23 instead. Jo's home copies are unchanged.
+
+**VOICE.md governs its decks.** Owned edits make voice/VOICE.md § HTML artifacts win over the skill's own defaults: decks live under `/Users/jowolff/html-artifacts/<slug>/` (not `~/decks/<slug>/`), are never published anywhere, and are designed from the Venture Bros template at `/Users/jowolff/references/venture-bros-palette.html`, read before designing every time; the scaffold's theme becomes a local `assets/theme.css` built from that template. reveal.js stays the engine, and the story and panel discipline and the principles file are untouched. Jo chose this: "revise" on q-mv6zwl6yw4ldds (VOICE.md wins), then approve on q-mv706hmvg85nuo.
+
+**Installed profile re-render (after merge, by Jo).** The installed profile at `~/.omp/profiles/agent-system-2/agent/config.yml` had 21 `includeSkills` before this work, with neither `jo-deck` nor `seo-audit`. `install/install.sh` renders `{repo}` as its own checkout, so running it from the lane worktree would point the live profile at the worktree; it runs from `/Users/jowolff/code/agent-system-2.0` once this PR merges and that checkout fast-forwards, by Jo, with the script `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mv6zfcyl8s54w0/rerender-profile.sh`.
