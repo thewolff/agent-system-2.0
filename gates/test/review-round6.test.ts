@@ -36,7 +36,7 @@ const reason = (command: string) => {
 	return (checkReserved(c, ctx) ?? checkRawLedgerWrite(c, ctx))?.reason ?? "";
 };
 const evalCode = (language: "py" | "js", code: string) => verdict(checkToolCall(call("eval", { language, code }), ctx));
-const turn = (text: string) => verdict(checkTurnShape(text));
+const turn = (text: string) => verdict(checkTurnShape(text, "lane", { batch: null }));
 const RM = "r" + "m";
 
 type V = "ALLOW" | "REFUSE";

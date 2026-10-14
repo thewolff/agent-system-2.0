@@ -1003,6 +1003,40 @@ Rejected: keeping this as a Session C communication-rule input without a require
 (Jo: it is a need, not a preference); prose-only enforcement (OMP already has the settings;
 the turn-shape rule rides the P-23 gate).
 
+**Amended 2026-10-13 — one-message answers** (`migration/items/one-message-answers.md`; workload
+wl-mv66ylg1op3wg0). Jo, about 04:37Z (the workload's brief; the surface gave it no input id):
+*"Jo answers everything in one message. (1) Every Ilex turn that has needs-you items ends with one
+line, "send: <n> <word>, <n> <word>, ...", holding Ilex's recommended answer for every open item.
+(2) Jo typing "ok" at the surface applies that exact line as a numbered batch: ledgered,
+all-or-nothing, refused whole if any number went stale. (3) Ilex's reply to a batch is the applied
+list plus the new needs-you list, nothing else; no follow-up commentary on items Jo just answered.
+… Reason (Jo): we never get anything done because I send things one at a time and Ilex always has
+more to say."* Then ledger input `in-mv67564pwap534`: *"(a) Use the TypeSafe judge (typesafe/jev)
+to sort each open item as routine or needs-Jo; only routine items go in the send: line that ok
+applies, and needs-Jo items are listed with a one-line reason and are never covered by ok."* And
+`in-mv6uf1b4z6jsao`, which replaces (2)'s all-or-nothing: *"change the batch rule. A numbered batch
+applies every valid answer and skips only stale or invalid numbers, listing each skipped number and
+why. Never refuse the whole batch for one bad number."*
+- **Item 1.** One ask per turn now means one ask in the orchestrator's prose, last. Every open
+  needs-you item is answered after the message, through the block the surface renders (display
+  `surface-send-line`): the needs-Jo list, each item with a one-line reason, then one
+  `send: <n> <word>, …` line holding the recommended answer to every item the judge sorted
+  routine. The orchestrator records a recommendation for every open item (`orchestrator_recommend`)
+  and never types the line. Jo's `ok` applies exactly the last send line rendered, each answer its
+  own ledger row. **Skip-bad-numbers rule:** a numbered batch, typed or applied by `ok`, applies
+  every valid answer and skips only stale or invalid numbers, naming each with its reason
+  (`#n skipped: <reason>`); one bad number never refuses the batch. `ok` is refused whole only when
+  something else was shown after the send line. A reply to a batch is the applied list and the new
+  needs-Jo list, which the surface shows; the orchestrator adds no commentary on what Jo answered.
+- **Item 3, the gate.** P-11 row 1 gains three checks on the orchestrator. A reply line starting
+  `send:` is refused on every turn. On a batch turn (the surface's `surface-batch-turn` session
+  entry, scoped to the turn it was written for), every labeled block but at most one new
+  **QUESTION** is refused, unlabeled prose is refused, and so is any line naming an applied `q-…` or
+  `en-…` id or `#n`. Session entries that cannot be read refuse the reply, naming why (fail
+  closed). The one-QUESTION and closing-ask checks stand for the prose. Homes: `voice/VOICE.md`
+  § *Open ledger items are answered after the message*, `tiers/orchestrator.md` § *Reading state
+  between wakes*, `gates/src/rows/r01-turn-shape.ts` and `gates/extensions/r01-turn-shape.ts`.
+
 ## Session C — keep / change / drop pass (P-10)
 
 **Opened 2026-09-24.** Jo: *"sure let's do it"*, *"to session c"*. Disposition ledger lives in

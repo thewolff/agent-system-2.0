@@ -151,7 +151,7 @@ describe("S1: turn shape (row 1)", () => {
 		["**ACTION**\nRun:\n```\ngit push origin feature\n```", "BLOCK"],
 		["**QUESTION**\nChoose A or B?\n\nHere is more prose after the ask.", "BLOCK"],
 	];
-	for (const [text, want] of cases) test(`${want}: ${JSON.stringify(text)}`, () => expect(verdict(checkTurnShape(text))).toBe(want));
+	for (const [text, want] of cases) test(`${want}: ${JSON.stringify(text)}`, () => expect(verdict(checkTurnShape(text, "lane", { batch: null }))).toBe(want));
 });
 
 describe("S2: an errored read is no receipt (row 3)", () => {

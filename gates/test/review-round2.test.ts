@@ -218,5 +218,5 @@ describe("R2-S2: exactly one closing ask, as a structured decision block (row 1)
 		["**CLAIM**\nThe matcher reads `a?b` and https://example.com/x?y=1 literally.\n```ts\nconst x = a ?? b;\n```\n**QUESTION**\nShip now or wait? Recommend now.", "ALLOW"],
 		["**PMDW**\nDone, nothing needs you.", "ALLOW"],
 	];
-	for (const [text, want] of cases) test(`${want}: ${JSON.stringify(text)}`, () => expect(verdict(checkTurnShape(text))).toBe(want));
+	for (const [text, want] of cases) test(`${want}: ${JSON.stringify(text)}`, () => expect(verdict(checkTurnShape(text, "lane", { batch: null }))).toBe(want));
 });

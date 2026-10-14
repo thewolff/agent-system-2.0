@@ -266,8 +266,9 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		},
 	});
 
-	/** Send one keyed aside that starts a turn on an idle session. */
+	/** Send one keyed aside that starts a turn on an idle session. A wake shows needs-you lines, so it takes the next displaySeq (PLAN wl-mv66ylg1op3wg0 D5: a `send:` line before it is no longer the last thing shown). */
 	const sendKeyed = (s: SurfaceSession, customType: string, content: string, surfaceKey: string): void => {
+		if (customType === "surface-wake") s.displaySeq++;
 		pi.sendMessage?.({ customType, content, display: true, details: { surfaceKey, renderSeq: s.nextSeq() } }, { deliverAs: "aside", triggerTurn: true });
 	};
 
@@ -354,9 +355,11 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			const out = fire.length > 0 || due ? release(s, lines, fire, !away) : [];
 			if (out.length > 0) {
 				const content = [planned(s, ctx, needsYouBlock(out, NEEDS_YOU_HEADING)), "", countLine(s.ledger())].join("\n");
+				s.displaySeq++;
 				pi.sendMessage({ customType: "surface-needs-you", content, display: true }, { deliverAs: "aside", triggerTurn: true });
 			}
 		} catch (err) {
+			s.displaySeq++;
 			pi.sendMessage({ customType: "surface-needs-you", content: `## needs you\n- the ledger could not be read between wakes: ${String(err)}`, display: true }, { deliverAs: "aside", triggerTurn: true });
 		}
 		pushNotices(s, ctx, true);

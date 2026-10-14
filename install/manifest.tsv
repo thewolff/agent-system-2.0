@@ -141,6 +141,7 @@ gates/src/host.ts	module	-
 gates/test/r15-orchestrator-role.test.ts	test	-
 gates/test/host.test.ts	test	-
 gates/test/turn-shape-once.test.ts	test	-
+gates/test/r01-batch-turn.test.ts	test	-
 gates/extensions/r17-spawn-rate.ts	extension	-
 gates/src/rows/r17-spawn-rate.ts	module	-
 gates/test/r17-spawn-rate.test.ts	test	-
@@ -1087,7 +1088,14 @@ surface/test/facts.test.ts	test	-
 surface/src/orchestrator-question.ts	module	-
 surface/extensions/question.ts	module	-
 surface/test/orchestrator-question.test.ts	test	-
+surface/test/paste-blocks.test.ts	test	-
+surface/test/batch-skip.test.ts	test	-
+surface/src/triage.ts	module	-
+surface/triage-question.json	data	-
+surface/extensions/send-line.ts	module	-
+surface/test/triage.test.ts	test	-
 surface/test/typed-input.test.ts	test	-
+surface/test/send-line.test.ts	test	-
 surface/scripts/claim-check.ts	module	-
 surface/test/claim-check.test.ts	test	-
 surface/test/fixtures/claim-check/t1-a.jsonl	test	-

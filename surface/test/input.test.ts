@@ -11,9 +11,9 @@ import { countRounds, effectiveRoundLimit, type Findings, reviewLimitBody, revie
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
-import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
-import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody, verdictOf } from "../src/launch";
+import { apply, type BatchPiece, commandShaped, interpret, interpretBatch, interpretPaste, isSkip, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
+import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody, verdictOf } from "../src/launch";
 import { ensureStandingWorkload } from "../src/identity";
 import { Numbering } from "../src/numbering";
 import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
@@ -45,10 +45,10 @@ function numbered(ledger: Ledger, numbering = new Numbering()): Numbering {
 	return numbering;
 }
 
-/** Apply an accepted batch the way the surface does: one transaction, one row per answer. */
-function applyBatch(ledger: Ledger, r: BatchResult | null): string[] {
-	if (!r?.ok) throw new Error(`not an accepted batch: ${JSON.stringify(r)}`);
-	return ledger.write(() => r.items.map((i) => apply(ledger, i.cmd)));
+/** Apply a batch's valid pieces the way the surface does: one transaction, one row per answer; refuses a batch with a skipped piece, so a test names its skips itself. */
+function applyBatch(ledger: Ledger, r: BatchPiece[] | null): string[] {
+	if (!r || r.some(isSkip)) throw new Error(`not a batch of valid pieces: ${JSON.stringify(r)}`);
+	return ledger.write(() => r.flatMap((p) => (isSkip(p) ? [] : [apply(ledger, p.cmd)])));
 }
 
 const allInstructions = (ledger: Ledger) => ledger.inFlight().flatMap((w) => ledger.instructions(w.workload.id));
@@ -277,7 +277,7 @@ describe("numbered batches", () => {
 		for (const text of ["1 approve, 2 deny", "1 approve\n2 deny", "#1 approve\nq2: deny", " 1) Approve,\n\n Q2. DENY ,"]) {
 			const { ledger, wl, e1, e2, numbering } = reservedPair();
 			const r = interpretBatch(ledger, numbering, text);
-			expect(r).toMatchObject({ ok: true, items: [{ n: 1 }, { n: 2 }] });
+			expect(r).toMatchObject([{ n: 1 }, { n: 2 }]);
 			const receipts = applyBatch(ledger, r);
 			expect(receipts).toEqual([expect.stringContaining(`approved reserved request ${e1}`), expect.stringContaining(`denied reserved request ${e2}`)]);
 			expect(ledger.instructions(wl).map((i) => [i.kind, i.body, i.author, i.channel])).toEqual([
@@ -297,13 +297,10 @@ describe("numbered batches", () => {
 		expect(numbering.numberOf(e1)).toBe(1);
 		expect(numbering.numberOf(p.q)).toBe(2);
 		const r = interpretBatch(ledger, numbering, "1 deny, 2 APPROVE");
-		expect(r).toEqual({
-			ok: true,
-			items: [
-				{ n: 1, cmd: { kind: "reserved", workloadId: wl, entryId: e1, verdict: "deny" } },
-				{ n: 2, cmd: { kind: "answer", workloadId: p.wl, questionId: p.q, answer: "approve" } },
-			],
-		});
+		expect(r).toEqual([
+			{ n: 1, cmd: { kind: "reserved", workloadId: wl, entryId: e1, verdict: "deny" } },
+			{ n: 2, cmd: { kind: "answer", workloadId: p.wl, questionId: p.q, answer: "approve" } },
+		]);
 		expect(applyBatch(ledger, r)[1]).toContain("plan approved");
 		expect(ledger.instructions(wl).map((i) => i.body)).toEqual([`deny ${e1}`]);
 		expect(ledger.question(p.q)!.state).toBe("answered");
@@ -317,41 +314,44 @@ describe("numbered batches", () => {
 		const { wl, sl } = workloadWithSlice(ledger);
 		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which?", options: ["left", "right"] });
 		const r = interpretBatch(ledger, numbered(ledger), "1 withdraw");
-		expect(r).toEqual({ ok: true, items: [{ n: 1, cmd: { kind: "withdraw", workloadId: wl, questionId: q, then: "replan" } }] });
+		expect(r).toEqual([{ n: 1, cmd: { kind: "withdraw", workloadId: wl, questionId: q, then: "replan" } }]);
 		applyBatch(ledger, r);
 		expect(ledger.question(q)!.state).toBe("withdrawn");
 	});
 
-	test("one bad piece refuses the whole batch with one line per piece: unknown number, wrong word, duplicate", () => {
-		const { ledger, numbering } = reservedPair();
-		expect(interpretBatch(ledger, numbering, "1 approve, 2 maybe, 7 deny")).toEqual({
-			ok: false,
-			lines: ["#1 ok, not applied", "#2 takes: approve / deny", "#7 is not on the needs-you list"],
-		});
-		expect(interpretBatch(ledger, numbering, "1 approve\n2 deny\n1 deny")).toEqual({
-			ok: false,
-			lines: ["#1 appears more than once in this batch", "#2 ok, not applied", "#1 appears more than once in this batch"],
-		});
+	test("a bad piece is skipped with its reason, never refusing the others (D9): unknown number, wrong word, duplicate (every piece with it)", () => {
+		const { ledger, wl, e1, e2, numbering } = reservedPair();
+		expect(interpretBatch(ledger, numbering, "1 approve, 2 maybe, 7 deny")).toEqual([
+			{ n: 1, cmd: { kind: "reserved", workloadId: wl, entryId: e1, verdict: "approve" } },
+			{ n: 2, skip: "takes: approve / deny" },
+			{ n: 7, skip: "not on the needs-you list" },
+		]);
+		expect(interpretBatch(ledger, numbering, "1 approve\n2 deny\n1 deny")).toEqual([
+			{ n: 1, skip: "appears more than once in this batch" },
+			{ n: 2, cmd: { kind: "reserved", workloadId: wl, entryId: e2, verdict: "deny" } },
+			{ n: 1, skip: "appears more than once in this batch" },
+		]);
+		// interpreting writes nothing
 		expect(allInstructions(ledger)).toHaveLength(0);
 	});
 
-	test("a stale number is refused: its row was answered since it was numbered; a question takes its options or withdraw", () => {
+	test("a stale number is skipped: its row was answered since it was numbered; a question takes its options or withdraw", () => {
 		const { ledger, wl, sl, e1, numbering } = reservedPair();
 		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which?", options: ["Left", "right"] });
 		numbered(ledger, numbering);
 		expect(numbering.numberOf(q)).toBe(3);
 		apply(ledger, interpret(ledger, `approve ${e1}`)!);
-		expect(interpretBatch(ledger, numbering, "1 deny, 3 up")).toEqual({
-			ok: false,
-			lines: [`#1 (${e1}) is no longer waiting`, "#3 takes: Left / right / withdraw"],
-		});
+		expect(interpretBatch(ledger, numbering, "1 deny, 3 up")).toEqual([
+			{ n: 1, skip: `${e1} is no longer waiting` },
+			{ n: 3, skip: "takes: Left / right / withdraw" },
+		]);
 		apply(ledger, interpret(ledger, `right ${q}`)!);
-		expect(interpretBatch(ledger, numbering, "3 left")).toEqual({ ok: false, lines: [`#3 (${q}) is no longer waiting`] });
+		expect(interpretBatch(ledger, numbering, "3 left")).toEqual([{ n: 3, skip: `${q} is no longer waiting` }]);
 		// a fresh assign does not hand #1 or #3 to another row
 		const e3 = ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "tag" });
 		numbered(ledger, numbering);
 		expect(numbering.numberOf(e3)).toBe(4);
-		expect(interpretBatch(ledger, numbering, "1 approve")).toEqual({ ok: false, lines: [`#1 (${e1}) is no longer waiting`] });
+		expect(interpretBatch(ledger, numbering, "1 approve")).toEqual([{ n: 1, skip: `${e1} is no longer waiting` }]);
 	});
 
 	test("prose is not a batch: every piece must be `<n> <word>`", () => {
@@ -360,7 +360,7 @@ describe("numbered batches", () => {
 		expect(interpretBatch(ledger, numbering, "1 approve, and then 2 deny")).toBeNull();
 		expect(interpretBatch(ledger, numbering, "approve")).toBeNull();
 		expect(interpretBatch(ledger, numbering, " , \n")).toBeNull();
-		expect(interpretBatch(ledger, numbering, "1 approve")).toMatchObject({ ok: true, items: [{ n: 1 }] });
+		expect(interpretBatch(ledger, numbering, "1 approve")).toMatchObject([{ n: 1 }]);
 	});
 
 	test("`ceiling 60 8` is the ceiling command, never a batch, even with numbered rows waiting", () => {
@@ -381,10 +381,10 @@ describe("a paste of several lines (MIGRATION.md item 48)", () => {
 		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which?", options: ["left", "right"] });
 		return { ledger, wl, sl, e1, e2, q, numbering: numbered(ledger) };
 	}
-	/** Apply an accepted paste the way the surface does: one transaction, in order, one row per command. */
+	/** Apply an accepted paste the way the surface does: one transaction, in order, one row per command and per valid numbered piece (skipped pieces apply nothing). */
 	function applyPaste(ledger: Ledger, r: PasteResult | null): string[] {
 		if (!r?.ok) throw new Error(`not an accepted paste: ${JSON.stringify(r)}`);
-		return ledger.write(() => r.items.flatMap((i) => (i.kind === "instruction" ? [] : i.kind === "batch" ? i.items.map((b) => apply(ledger, b.cmd)) : [apply(ledger, i.cmd)])));
+		return ledger.write(() => r.items.flatMap((i) => (i.kind === "instruction" ? [] : i.kind === "batch" ? i.pieces.flatMap((p) => (isSkip(p) ? [] : [apply(ledger, p.cmd)])) : [apply(ledger, i.cmd)])));
 	}
 
 	test("commandShaped: a numbered piece or a line short enough for its word; `ceiling` runs to four words, `rounds` to three", () => {
@@ -423,7 +423,7 @@ describe("a paste of several lines (MIGRATION.md item 48)", () => {
 			items: [
 				{
 					line: 1, text: "1 approve, 2 deny", kind: "batch",
-					items: [
+					pieces: [
 						{ n: 1, cmd: { kind: "reserved", workloadId: wl, entryId: e1, verdict: "approve" } },
 						{ n: 2, cmd: { kind: "reserved", workloadId: wl, entryId: e2, verdict: "deny" } },
 					],
@@ -540,13 +540,25 @@ describe("a paste of several lines (MIGRATION.md item 48)", () => {
 		});
 		expect(interpretPaste(ledger, numbering, `3 left\nright ${q}`)).toEqual({
 			ok: false,
-			refused: [{ line: 1, text: "3 left", why: null }, { line: 2, text: `right ${q}`, why: [`${q} is already answered on line 1 (#3); once per row`] }],
+			refused: [
+				{ line: 1, text: "3 left", why: null, pieces: [{ n: 3, cmd: { kind: "answer", workloadId: wl, questionId: q, answer: "left" } }] },
+				{ line: 2, text: `right ${q}`, why: [`${q} is already answered on line 1 (#3); once per row`] },
+			],
 			held: [],
 		});
+		// a numbered piece answering a row an earlier line resolves is skipped, never a refusal (D9); the line's other pieces stand
 		expect(interpretPaste(ledger, numbering, `withdraw ${q}\n1 approve, 3 left`)).toEqual({
-			ok: false,
-			refused: [{ line: 1, text: `withdraw ${q}`, why: null }, { line: 2, text: "1 approve, 3 left", why: [`#3: ${q} is already answered on line 1; once per row`] }],
-			held: [],
+			ok: true,
+			items: [
+				{ line: 1, text: `withdraw ${q}`, kind: "command", cmd: { kind: "withdraw", workloadId: wl, questionId: q, then: "replan" } },
+				{
+					line: 2, text: "1 approve, 3 left", kind: "batch",
+					pieces: [
+						{ n: 1, cmd: { kind: "reserved", workloadId: wl, entryId: e1, verdict: "approve" } },
+						{ n: 3, skip: `${q} is already answered on line 1; once per row` },
+					],
+				},
+			],
 		});
 		expect(interpretPaste(ledger, numbering, `approve ${e1}\ndeny ${e1}`)).toMatchObject({
 			ok: false,
@@ -564,24 +576,37 @@ describe("a paste of several lines (MIGRATION.md item 48)", () => {
 		expect(interpretPaste(ledger, numbering, "fix it\nplease")).toBeNull();
 	});
 
-	test("one bad line refuses the whole paste: the verdict names each command line by number and text, nothing is applied", () => {
+	test("a non-numbered bad line refuses the whole paste, naming each command line by number and text; a numbered line's bad number is skipped, never a refusal (D9)", () => {
 		const { ledger, wl, e1, numbering } = rows();
-		const bad = interpretPaste(ledger, numbering, `production ${wl}\n9 deny\nthen relaunch it`);
-		expect(bad).toEqual({
+		// a number not given is skipped: the stakes line and the instruction stand
+		expect(interpretPaste(ledger, numbering, `production ${wl}\n9 deny\nthen relaunch it`)).toEqual({
+			ok: true,
+			items: [
+				{ line: 1, text: `production ${wl}`, kind: "command", cmd: { kind: "stakes", workloadId: wl, stakes: "production" } },
+				{ line: 2, text: "9 deny", kind: "batch", pieces: [{ n: 9, skip: "not on the needs-you list" }] },
+				{ kind: "instruction", from: 3, to: 3, text: "then relaunch it" },
+			],
+		});
+		// a non-numbered line naming an id that does not resolve refuses the paste: the numbered line's verdict carries its pieces
+		expect(interpretPaste(ledger, numbering, `9 deny\ndeny en-nope\nthen relaunch it`)).toEqual({
 			ok: false,
 			refused: [
-				{ line: 1, text: `production ${wl}`, why: null },
-				{ line: 2, text: "9 deny", why: ["#9 is not on the needs-you list"] },
+				{ line: 1, text: "9 deny", why: null, pieces: [{ n: 9, skip: "not on the needs-you list" }] },
+				{ line: 2, text: "deny en-nope", why: ["no entry en-nope on the needs-you list"] },
 			],
 			held: [{ kind: "instruction", from: 3, to: 3, text: "then relaunch it" }],
 		});
 		// a bare word fitting several rows: the ambiguous command is the verdict, for the caller's "which one?"
 		const which = interpretPaste(ledger, numbering, `approve\nproduction ${wl}`);
 		expect(which).toMatchObject({ ok: false, refused: [{ line: 1, text: "approve", why: { kind: "ambiguous", word: "approve" } }, { line: 2, why: null }], held: [] });
-		// a number given on two lines is caught across the paste, as in one batch
+		// a number given on two lines is caught across the paste, as in one batch: both pieces skipped, the line between stands
 		expect(interpretPaste(ledger, numbering, `1 approve\nproduction ${wl}\n1 deny`)).toMatchObject({
-			ok: false,
-			refused: [{ line: 1, why: ["#1 appears more than once in this batch"] }, { line: 2, why: null }, { line: 3, why: ["#1 appears more than once in this batch"] }],
+			ok: true,
+			items: [
+				{ line: 1, kind: "batch", pieces: [{ n: 1, skip: "appears more than once in this batch" }] },
+				{ line: 2, kind: "command" },
+				{ line: 3, kind: "batch", pieces: [{ n: 1, skip: "appears more than once in this batch" }] },
+			],
 		});
 		expect(ledger.workload(wl)!.stakes).toBe("normal");
 		expect(allInstructions(ledger)).toHaveLength(0);
@@ -1097,7 +1122,7 @@ describe("cancel-slice (PLAN wl-mv5i3lulwwbbi8 D1)", () => {
 		requestRun(ledger, wl, sl);
 		c.at("2026-10-12T10:00:10.000Z");
 		const before = state(ledger, wl, sl);
-		expect(() => apply(ledger, cmd!, noBeat)).toThrow(`test run ${RUN} (PR #17) on ${sl} is live: its test-run: settles the slice; cancel it once the run has ended`);
+		expect(() => apply(ledger, cmd!, false, noBeat)).toThrow(`test run ${RUN} (PR #17) on ${sl} is live: its test-run: settles the slice; cancel it once the run has ended`);
 		expect(state(ledger, wl, sl)).toEqual(before);
 		expect(ledger.instructions(wl)).toEqual([]);
 		expect(ledger.slice(sl)!.state).toBe("open");

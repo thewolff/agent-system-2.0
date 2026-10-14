@@ -9,9 +9,12 @@
 // `ceiling` word with more than one workload in view is refused the same way, the workloads as
 // candidates; `<word> wl-…` names the workload. A numbered batch
 // ("1 approve, 2 deny", or one per line) answers needs-you lines by their session number
-// (surface/src/numbering.ts): validated whole, applied all-or-nothing (MIGRATION.md § M7 follow-ups
-// item 1). Every applied word is a ledger row (§ B5: the flip is a ledgered instruction), author
-// "jo", channel "surface". Anything else is ordinary conversation for the orchestrator model.
+// (surface/src/numbering.ts; MIGRATION.md § M7 follow-ups item 1). Each piece is checked on its own
+// (PLAN wl-mv66ylg1op3wg0 D9): a number not given, a row no longer waiting, a word the row does not
+// take, or a number given twice (every piece with it) is skipped with its reason, and the valid
+// pieces apply; one bad number never refuses the batch. Every applied word is a ledger row (§ B5:
+// the flip is a ledgered instruction), author "jo", channel "surface". Anything else is ordinary
+// conversation for the orchestrator model.
 //
 // Answer lines (PLAN wl-mv5msri070p0qo D2): a line that is exactly `<word> <id>` followed by
 // whitespace, `#` and any text (a line of the `pending` block) is read as `<word> <id>`
@@ -21,17 +24,21 @@
 //
 // A paste of several lines (MIGRATION.md item 48): each non-empty line is read on its own with the
 // rules above (a numbered batch line keeps its comma form; `ceiling` and `rounds` keep their long
-// forms; a stakes or mode word takes only a `wl-…` id, or a `q-…`/`en-…` id it answers), checked whole and applied
-// all-or-nothing in order, so `production wl-x` then `ceiling 120 wl-x` both land. A command naming
-// an id that does not resolve (`approve en-nope`) refuses the paste, and so does a question or
-// reserved request answered twice across lines. Consecutive lines that are no command form one
-// plain-words instruction for the orchestrator, which records it as one row
-// (`orchestrator_record_instruction`) after the commands land; a command line between two such
-// runs separates two instructions. A paste with no command line at all is prose and passes through
-// untouched, as a single prose line does. The wrapper of a `pending` block pasted back (its
-// heading, the fence around its answer lines, the generated sentences under it,
-// `pendingWrapperLines`) is dropped, so the block pasted whole forwards no instruction of its own;
-// any other line Jo pasted, a fence of Jo's own included, is kept.
+// forms; a stakes or mode word takes only a `wl-…` id, or a `q-…`/`en-…` id it answers) and applied
+// in order, so `production wl-x` then `ceiling 120 wl-x` both land. The numbered pieces of every line
+// are one batch under the skip rule above, and a piece answering a row an earlier line resolves is
+// skipped too. A command line that is not numbered is checked whole with the paste: one naming an id
+// that does not resolve (`approve en-nope`), an ambiguous or refused word, or a row it resolves a
+// second time across lines refuses the paste. Consecutive lines that are no command form one
+// plain-words run (`PasteInstruction`, its text the lines as typed, joined, outer whitespace
+// trimmed); a command line between two such runs separates two. Each run is its own Jo input row,
+// written by the surface in the paste's transaction with the commands (surface/extensions/
+// surface-input.ts), its `in-…` id named after the commit for `orchestrator_record_instruction` to
+// spend. A paste with no command line at all is prose and passes through untouched, as a single
+// prose line does. The wrapper of a `pending` block pasted back (its heading, the fence around its
+// answer lines, the generated sentences under it, `pendingWrapperLines`) is dropped, so the block
+// pasted whole forwards no instruction of its own; any other line Jo pasted, a fence of Jo's own
+// included, is kept.
 //
 // The workload ceiling (DESIGN-workload-ceiling.md § 1 B and D, § 2 items 2 and 5): the stakes word
 // re-sizes the ceiling, `ceiling <usd> [<hours>] [wl-…]` sets Jo's exact figure, and an answer to the
@@ -92,6 +99,7 @@ import { answerOrchestratorQuestion } from "./orchestrator-question";
 import { PAIR_OPTION, type PairSite, pairOfferStamp, pairTakenBody, parsePairOffer } from "./pair-suggest";
 import { parseHeartbeat, recordLive, runDirOf, runsRoot, testRuns } from "./test-run";
 import { pendingWrapperLines } from "./pending";
+
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 /** A "which one?" candidate: a needs-you row (`Target`) or, for a bare stakes, mode, `ceiling`, `rounds` or `stop-reviews` word, a workload in view. */
@@ -238,11 +246,20 @@ function bareTargets(ledger: Ledger, view: string[], word: string): Target[] {
 /** One piece of a numbered batch: `1 approve`, `#1 approve`, `1: approve`, `q1: approve`, `1) deny`. */
 const BATCH_PIECE = /^(?:#|q)?(\d+)\s*[:.)]?\s+(\S+)$/i;
 
+/** A valid piece of a numbered batch: its number and the command it applies. */
 export interface BatchItem {
 	n: number;
 	cmd: Command;
 }
-export type BatchResult = { ok: true; items: BatchItem[] } | { ok: false; lines: string[] };
+/** A piece of a numbered batch that is skipped, never applied: its number and why (`not on the needs-you list`, `en-… is no longer waiting`, `takes: …`). */
+export interface BatchSkip {
+	n: number;
+	skip: string;
+}
+export type BatchPiece = BatchItem | BatchSkip;
+
+/** Is `p` a skipped piece. */
+export const isSkip = (p: BatchPiece): p is BatchSkip => "skip" in p;
 
 /**
  * The words a single-line command may run to: `ceiling <usd> [<hours>] [wl-…]` is four, `rounds <n> [wl-…]` and
@@ -275,33 +292,30 @@ export function parseBatch(text: string): { n: number; word: string }[] | null {
 
 /**
  * Interpret `text` as a numbered batch (`parseBatch`); null when it is not one, so prose passes
- * through. Each piece is checked against the session numbering: the number was given, its row
- * still waits, the word fits the row, the number appears once. All pass → the commands in order;
- * any fails → one line per piece, nothing to apply.
+ * through. Each piece is checked on its own against the session numbering (D9): the number was
+ * given, its row still waits, the word fits the row, the number appears once. Returns every piece
+ * in batch order, a valid one with its command and a failing one skipped with its reason; one bad
+ * number never refuses the others.
  */
-export function interpretBatch(ledger: Ledger, numbering: Numbering, text: string): BatchResult | null {
+export function interpretBatch(ledger: Ledger, numbering: Numbering, text: string): BatchPiece[] | null {
 	const parsed = parseBatch(text);
-	if (!parsed) return null;
-	const checked = checkBatch(ledger, numbering, parsed);
-	const items = checked.filter((c): c is BatchItem => typeof c !== "string");
-	if (items.length === checked.length) return { ok: true, items };
-	return { ok: false, lines: checked.map((c) => (typeof c === "string" ? c : `#${c.n} ok, not applied`)) };
+	return parsed ? checkBatch(ledger, numbering, parsed) : null;
 }
 
-/** Each piece of a parsed batch checked against the session numbering (`interpretBatch`): the command, or the one-line refusal. */
-function checkBatch(ledger: Ledger, numbering: Numbering, parsed: readonly { n: number; word: string }[]): (BatchItem | string)[] {
+/** Each piece of a parsed batch checked against the session numbering (`interpretBatch`): the command, or skipped with its reason. A number given twice skips every piece with it. */
+function checkBatch(ledger: Ledger, numbering: Numbering, parsed: readonly { n: number; word: string }[]): BatchPiece[] {
 	const inFlight = ledger.inFlight();
 	const open = new Set(inFlight.map((w) => w.workload.id));
 	const questions = new Map(inFlight.flatMap((w) => w.openQuestions).map((q) => [q.id, q]));
-	return parsed.map(({ n, word }): BatchItem | string => {
-		if (parsed.filter((x) => x.n === n).length > 1) return `#${n} appears more than once in this batch`;
+	return parsed.map(({ n, word }): BatchPiece => {
+		if (parsed.filter((x) => x.n === n).length > 1) return { n, skip: "appears more than once in this batch" };
 		const t = numbering.target(n);
-		if (!t) return `#${n} is not on the needs-you list`;
-		const stale = `#${n} (${t.rowId}) is no longer waiting`;
+		if (!t) return { n, skip: "not on the needs-you list" };
+		const stale = { n, skip: `${t.rowId} is no longer waiting` };
 		const w = word.toLowerCase();
 		if (t.kind === "reserved") {
 			if (!open.has(t.workloadId) || !waitingReserved(ledger, t.workloadId).some((r) => r.id === t.rowId)) return stale;
-			if (w !== "approve" && w !== "deny") return `#${n} takes: approve / deny`;
+			if (w !== "approve" && w !== "deny") return { n, skip: "takes: approve / deny" };
 			return { n, cmd: { kind: "reserved", workloadId: t.workloadId, entryId: t.rowId, verdict: w } };
 		}
 		const q = questions.get(t.rowId);
@@ -312,14 +326,14 @@ function checkBatch(ledger: Ledger, numbering: Numbering, parsed: readonly { n: 
 			return { n, cmd: { kind: "withdraw", workloadId: q.workload_id, questionId: q.id, then } };
 		}
 		const answer = q.options.find((o) => o.toLowerCase() === w);
-		if (answer === undefined) return `#${n} takes: ${[...q.options, "withdraw"].join(" / ")}`;
+		if (answer === undefined) return { n, skip: `takes: ${[...q.options, "withdraw"].join(" / ")}` };
 		return { n, cmd: { kind: "answer", workloadId: q.workload_id, questionId: q.id, answer } };
 	});
 }
 
-/** One command line of a paste (`interpretPaste`): a numbered batch line (its pieces checked), or one word command; `line` is 1-based in the paste. */
-export type PasteCommand = { line: number; text: string } & ({ kind: "batch"; items: BatchItem[] } | { kind: "command"; cmd: Exclude<Command, { kind: "ambiguous" | "refused" }> });
-/** A run of plain-words lines of a paste, `from`–`to` (1-based, inclusive), for the orchestrator to record as one instruction row. */
+/** One command line of a paste (`interpretPaste`): a numbered batch line (its pieces, each valid or skipped), or one word command; `line` is 1-based in the paste. */
+export type PasteCommand = { line: number; text: string } & ({ kind: "batch"; pieces: BatchPiece[] } | { kind: "command"; cmd: Exclude<Command, { kind: "ambiguous" | "refused" }> });
+/** A run of plain-words lines of a paste, `from`–`to` (1-based, inclusive): written by the surface as one Jo input row with the paste's commands. */
 export interface PasteInstruction {
 	kind: "instruction";
 	from: number;
@@ -327,11 +341,17 @@ export interface PasteInstruction {
 	text: string;
 }
 export type PasteItem = PasteCommand | PasteInstruction;
-/** A refused paste's verdict per command line: `why` is the batch pieces' refusals, the ambiguous command (the caller words "which one?"), or null for a line that would have applied. */
+/**
+ * A refused paste's verdict per command line: `why` is the line's refusal (an id that does not
+ * resolve, a refused word, a row resolved twice), the ambiguous command (the caller words "which
+ * one?"), or null for a line that would have applied. A numbered line never refuses the paste: its
+ * `why` is null and `pieces` carries its pieces, each valid or skipped.
+ */
 export interface PasteRefusal {
 	line: number;
 	text: string;
 	why: string[] | Extract<Command, { kind: "ambiguous" }> | null;
+	pieces?: BatchPiece[];
 }
 export type PasteResult = { ok: true; items: PasteItem[] } | { ok: false; refused: PasteRefusal[]; held: PasteInstruction[] };
 
@@ -426,7 +446,9 @@ function resolves(cmd: Command): string | null {
 /**
  * Interpret a paste of several lines (MIGRATION.md item 48). Each non-empty line is one of:
  * - a numbered batch line (`parseBatch`), its pieces checked against the numbering as one batch
- *   with every other batch line's, so a number given twice across lines is refused;
+ *   with every other batch line's (D9): a bad piece is skipped with its reason, a number given
+ *   twice across lines skips every piece with it, and a piece answering a row an earlier line
+ *   resolves is skipped; a numbered line never refuses the paste;
  * - a word command (`interpret`, when the line is `commandShaped`), except that a stakes or mode
  *   word with a second word that is no `wl-…`, `q-…` or `en-…` id is prose (`production ready`);
  *   a line `<word> <id>  # …` is read as `<word> <id>` (`stripTail`), the tail dropped;
@@ -438,8 +460,8 @@ function resolves(cmd: Command): string | null {
  *   its heading, the fence around its answer lines, the generated sentences under it): dropped,
  *   neither a command nor part of an instruction; a fence or heading-like line of Jo's own is kept.
  * Null when no line is a command or a refused one: the paste is prose and passes through. Every
- * command line must resolve before any is applied, and a question or reserved request answered
- * twice across lines (`1 left` then `right q-X` when #1 is q-X) is refused on the later line;
+ * line that is not numbered must resolve before any is applied, and a question or reserved request
+ * resolved again by such a line (`1 left` then `right q-X` when #1 is q-X) is refused on it;
  * otherwise `refused` carries one verdict per command line and `held` the instructions, and
  * nothing is to be applied.
  */
@@ -518,15 +540,14 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 		}
 		endProse();
 		if (r.kind === "batch") {
-			const own = checked.slice(next, next + r.pieces.length);
-			next += r.pieces.length;
-			const bad = own.flatMap((c) => {
-				if (typeof c === "string") return [c];
+			const own = checked.slice(next, next + r.pieces.length).map((c): BatchPiece => {
+				if (isSkip(c)) return c;
 				const dup = twice(c.cmd, `line ${r.line} (#${c.n})`);
-				return dup === null ? [] : [`#${c.n}: ${dup}`];
+				return dup === null ? c : { n: c.n, skip: dup };
 			});
-			refused.push({ line: r.line, text: r.text, why: bad.length > 0 ? bad : null });
-			items.push({ line: r.line, text: r.text, kind: "batch", items: own.filter((c): c is BatchItem => typeof c !== "string") });
+			next += r.pieces.length;
+			refused.push({ line: r.line, text: r.text, why: null, pieces: own });
+			items.push({ line: r.line, text: r.text, kind: "batch", pieces: own });
 		} else if (r.kind === "invalid") {
 			refused.push({ line: r.line, text: r.text, why: [r.why] });
 		} else if (r.cmd.kind === "ambiguous") {
@@ -905,6 +926,13 @@ export function isPlanQuestion(ledger: Ledger, q: { id: string; workload_id: str
 	return control !== null && isPlanQuestionIn(control, q);
 }
 
+/** The orchestrator's own question (MIGRATION.md item 105) `cmd` answers or withdraws, else null. */
+export const standingQuestionOf = (cmd: Command): string | null =>
+	(cmd.kind === "answer" || cmd.kind === "withdraw") && cmd.workloadId === STANDING_WORKLOAD_ID ? cmd.questionId : null;
+
+/** The refusal for an orchestrator question resolved by a prompt Jo did not type (PR #55 round 2, B1). */
+export const untypedStandingRefusal = (questionId: string): string =>
+	`${questionId} is the orchestrator's own question, and only words Jo typed at the surface answer or withdraw it; this prompt carried no matching typed input, so nothing was applied`;
 /**
  * The control entry a mode flip implies, written in the caller's transaction (decision 6; Codex review S3): a flip to
  * user-driven while an autonomous lane holds the workload live writes the `lane-stop:` request the runner accepts; a
@@ -961,11 +989,18 @@ function applyPair(ledger: Ledger, q: QuestionRow, answer: string): string {
 
 /**
  * Apply a command through the ledger module as Jo via the surface. Returns the one-line receipt.
+ * `typed`: the prompt carrying `cmd` is what Jo typed this turn (OMP's `input`, source interactive
+ * or rpc, matching the prompt, read once; surface/extensions/surface-input.ts). An answer or a
+ * withdrawal of the orchestrator's own question throws without it (Codex review of PR #55 round 2,
+ * B1): an extension-sent prompt, a session_stop continuation or an `omp -p` prompt resolves none.
  * `heartbeatOf` is the run heartbeat reader `cancel-slice` re-checks its live-run refusal with; pass
- * the one `interpret` was given.
+ * the one `interpret` was given. Always `apply(ledger, cmd, typed, heartbeatOf)`: the boolean slot
+ * never takes the reader.
  */
-export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = runHeartbeat(process.env)): string {
+export function apply(ledger: Ledger, cmd: Command, typed = false, heartbeatOf: HeartbeatOf = runHeartbeat(process.env)): string {
 	const stamp = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
+	const own = standingQuestionOf(cmd);
+	if (own !== null && !typed) throw new Error(untypedStandingRefusal(own));
 	switch (cmd.kind) {
 		case "stakes": {
 			// The instruction goes first, so the re-sized `ceiling:` entry can name it when it raises (§ 2 item 2).

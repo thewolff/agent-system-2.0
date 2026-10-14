@@ -34,7 +34,7 @@ const reason = (command: string) => checkToolCall(call("bash", { command }), ctx
 /** Row 6 alone: the repo is on `main` with no origin, so rows 8 and 9 would refuse a push or an edit for their own reasons. */
 const row6 = (toolName: string, input: Record<string, unknown>) => verdict(checkReserved(call(toolName, input), ctx));
 const evalCode = (language: "py" | "js", code: string) => verdict(checkToolCall(call("eval", { language, code }), ctx));
-const turn = (text: string) => verdict(checkTurnShape(text));
+const turn = (text: string) => verdict(checkTurnShape(text, "lane", { batch: null }));
 const RM = "r" + "m";
 
 interface Row {
@@ -112,7 +112,7 @@ const CONFIRMED: Row[] = [
 
 /** The verdict verify.ts computes for one row: rows 6 and 10 for bash/eval, row 1 for a message. */
 function replay(r: Row): "ALLOW" | "REFUSE" {
-	if (r.tool === "message") return verdict(checkTurnShape(r.input));
+	if (r.tool === "message") return verdict(checkTurnShape(r.input, "lane", { batch: null }));
 	const here: CallContext = { ...ctx, env: { ...ctx.env, ...r.env } };
 	const c = r.tool === "bash" ? call("bash", { command: r.input }) : call("eval", { code: r.input, language: r.lang ?? "js" });
 	return verdict(checkReserved(c, here) ?? checkRawLedgerWrite(c, here));

@@ -183,7 +183,7 @@ describe("R3-S1: a question mark is not a decision (row 1)", () => {
 		["**CLAIM**\nIs the gate built? Yes.", "BLOCK"],
 		["**PMDW**\nShip now or wait?", "BLOCK"],
 	];
-	for (const [text, want] of cases) test(`${want}: ${JSON.stringify(text)}`, () => expect(verdict(checkTurnShape(text))).toBe(want));
+	for (const [text, want] of cases) test(`${want}: ${JSON.stringify(text)}`, () => expect(verdict(checkTurnShape(text, "lane", { batch: null }))).toBe(want));
 });
 
 describe("ordinary work: the review's 60-command sample plus 40 more, every one ALLOW", () => {

@@ -212,7 +212,7 @@ describe("S3: row 1 reads structural blocks after one quote/code normalization",
 		["**PMDW**\nShip now or wait?", "BLOCK", "a decision outside a QUESTION block"],
 		["**CLAIM**\nThe label `**QUESTION**` stays inline.\n\n**PMDW**\nWant me to proceed?", "ALLOW", "a check-in with an inline-code label"],
 	];
-	for (const [text, want, why] of table) test(`${want} (${why}): ${JSON.stringify(text)}`, () => expect(verdict(checkTurnShape(text))).toBe(want));
+	for (const [text, want, why] of table) test(`${want} (${why}): ${JSON.stringify(text)}`, () => expect(verdict(checkTurnShape(text, "lane", { batch: null }))).toBe(want));
 });
 
 describe("S4: git arguments follow command names on `expanded` (row 6)", () => {

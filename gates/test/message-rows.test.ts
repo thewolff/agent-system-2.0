@@ -26,44 +26,44 @@ const good = [
 
 describe("row 1: turn shape to Jo", () => {
 	test("allows one closing ask, last, with a script-path command", () => {
-		expect(checkTurnShape(good)).toBeNull();
-		expect(checkTurnShape("**PMDW**\nDone, nothing needs you.")).toBeNull();
+		expect(checkTurnShape(good, "lane", { batch: null })).toBeNull();
+		expect(checkTurnShape("**PMDW**\nDone, nothing needs you.", "lane", { batch: null })).toBeNull();
 	});
 	test("refuses two asks in one turn", () => {
-		const r = checkTurnShape("**QUESTION**\nA or B?\n\n**QUESTION**\nC or D?");
+		const r = checkTurnShape("**QUESTION**\nA or B?\n\n**QUESTION**\nC or D?", "lane", { batch: null });
 		expect(r?.reason).toContain("2 QUESTIONs");
 	});
 	test("refuses a bare command handed to Jo", () => {
-		const r = checkTurnShape("**ACTION**\nRun this:\n```bash\ngit push origin feat\n```");
+		const r = checkTurnShape("**ACTION**\nRun this:\n```bash\ngit push origin feat\n```", "lane", { batch: null });
 		expect(r?.reason).toContain("bare command (`git push origin feat`)");
 	});
 	// tiers/orchestrator.md § What you never do: the orchestrator hands Jo no command at all, not
 	// even the lane's one `zsh <path>` line.
 	const ORCH_REFUSAL = "a lane runs it, or ask Jo for one word";
 	test("orchestrator: a bare command fence is refused", () => {
-		const r = checkTurnShape("**ACTION**\nRun this:\n```bash\ngit push origin feat\n```", "orchestrator");
+		const r = checkTurnShape("**ACTION**\nRun this:\n```bash\ngit push origin feat\n```", "orchestrator", { batch: null });
 		expect(r?.reason).toContain(ORCH_REFUSAL);
 		expect(r?.reason).toContain("it hands Jo a command (`git push origin feat`)");
 	});
 	test("orchestrator: a script-path fence line is refused; the same text passes as a lane", () => {
 		const msg = "**ACTION**\nRun it with:\n```bash\nzsh ~/agent-scratch/x/run.sh\n```";
-		expect(checkTurnShape(msg, "orchestrator")?.reason).toContain(`it hands Jo a command (\`zsh ~/agent-scratch/x/run.sh\`); ${ORCH_REFUSAL}`);
-		expect(checkTurnShape(msg)).toBeNull();
-		expect(checkTurnShape(msg, "lane")).toBeNull();
-		expect(checkTurnShape(good)).toBeNull();
-		expect(checkTurnShape(good, "orchestrator")?.reason).toContain(ORCH_REFUSAL);
+		expect(checkTurnShape(msg, "orchestrator", { batch: null })?.reason).toContain(`it hands Jo a command (\`zsh ~/agent-scratch/x/run.sh\`); ${ORCH_REFUSAL}`);
+		expect(checkTurnShape(msg, "lane", { batch: null })).toBeNull();
+		expect(checkTurnShape(msg, "lane", { batch: null })).toBeNull();
+		expect(checkTurnShape(good, "lane", { batch: null })).toBeNull();
+		expect(checkTurnShape(good, "orchestrator", { batch: null })?.reason).toContain(ORCH_REFUSAL);
 	});
 	test("orchestrator: a script line in prose or in inline code is refused", () => {
-		expect(checkTurnShape("**ACTION**\nRun it:\nzsh ~/agent-scratch/x/run.sh", "orchestrator")?.reason).toContain(ORCH_REFUSAL);
-		expect(checkTurnShape("**ACTION**\nRun it: `zsh ~/agent-scratch/x/run.sh`", "orchestrator")?.reason).toContain(ORCH_REFUSAL);
+		expect(checkTurnShape("**ACTION**\nRun it:\nzsh ~/agent-scratch/x/run.sh", "orchestrator", { batch: null })?.reason).toContain(ORCH_REFUSAL);
+		expect(checkTurnShape("**ACTION**\nRun it: `zsh ~/agent-scratch/x/run.sh`", "orchestrator", { batch: null })?.reason).toContain(ORCH_REFUSAL);
 	});
 	test("orchestrator: a code fence and an inline command receipt are not hand-overs", () => {
-		expect(checkTurnShape("**CLAIM**\n```ts\nconst x = 1;\n```", "orchestrator")).toBeNull();
-		expect(checkTurnShape("**CLAIM**\nThe tree is clean: `git status` printed nothing to commit.", "orchestrator")).toBeNull();
+		expect(checkTurnShape("**CLAIM**\n```ts\nconst x = 1;\n```", "orchestrator", { batch: null })).toBeNull();
+		expect(checkTurnShape("**CLAIM**\nThe tree is clean: `git status` printed nothing to commit.", "orchestrator", { batch: null })).toBeNull();
 	});
 	test("refuses a needs-you block that is not first, and an ask that is not last", () => {
-		expect(checkTurnShape("**CLAIM**\nStuff happened.\n## Needs you\n**GUESS**\nx")?.reason).toContain("needs-you block is not first");
-		expect(checkTurnShape("**QUESTION**\nA or B?\n**CLAIM**\nmore after")?.reason).toContain("closing ask is not last");
+		expect(checkTurnShape("**CLAIM**\nStuff happened.\n## Needs you\n**GUESS**\nx", "lane", { batch: null })?.reason).toContain("needs-you block is not first");
+		expect(checkTurnShape("**QUESTION**\nA or B?\n**CLAIM**\nmore after", "lane", { batch: null })?.reason).toContain("closing ask is not last");
 	});
 	// voice/VOICE.md § Older items are counted, not re-listed: every message ends with one count line
 	// after the closing ask. It is a footer, not prose after the ask, and only as the last line.
@@ -81,44 +81,44 @@ describe("row 1: turn shape to Jo", () => {
 	];
 	for (const [name, msg] of countPasses) {
 		test(`the count line may follow the closing ask, as the last line: ${name}`, () => {
-			expect(checkTurnShape(msg)).toBeNull();
+			expect(checkTurnShape(msg, "lane", { batch: null })).toBeNull();
 		});
 	}
 	test("the count line followed by more prose, or other prose after the ask, is still refused", () => {
-		expect(checkTurnShape(`**QUESTION**\nShip now or wait for M5?\n${COUNT}\nmore after`)?.reason).toContain(`prose follows it: "3 others waiting:`);
-		expect(checkTurnShape(`**PMDW**\nWant me to push it?\nnothing else waiting\nmore after`)?.reason).toContain(`prose follows it: "nothing else waiting"`);
-		expect(checkTurnShape(`Want me to restart it?\n${COUNT}\nIt is floating today.`)?.reason).toContain("closing ask is not last");
-		expect(checkTurnShape(`**QUESTION**\nShip now or wait for M5?\nIt is floating today.\n${COUNT}`)?.reason).toContain(`prose follows it: "It is floating today."`);
-		expect(checkTurnShape(`**PMDW**\nWant me to push it?\nIt is floating today.\nnothing else waiting`)?.reason).toContain(`prose follows it: "It is floating today."`);
+		expect(checkTurnShape(`**QUESTION**\nShip now or wait for M5?\n${COUNT}\nmore after`, "lane", { batch: null })?.reason).toContain(`prose follows it: "3 others waiting:`);
+		expect(checkTurnShape(`**PMDW**\nWant me to push it?\nnothing else waiting\nmore after`, "lane", { batch: null })?.reason).toContain(`prose follows it: "nothing else waiting"`);
+		expect(checkTurnShape(`Want me to restart it?\n${COUNT}\nIt is floating today.`, "lane", { batch: null })?.reason).toContain("closing ask is not last");
+		expect(checkTurnShape(`**QUESTION**\nShip now or wait for M5?\nIt is floating today.\n${COUNT}`, "lane", { batch: null })?.reason).toContain(`prose follows it: "It is floating today."`);
+		expect(checkTurnShape(`**PMDW**\nWant me to push it?\nIt is floating today.\nnothing else waiting`, "lane", { batch: null })?.reason).toContain(`prose follows it: "It is floating today."`);
 		// Only the exact footer is exempt: a near-miss is prose.
-		expect(checkTurnShape("**QUESTION**\nShip now or wait for M5?\n3 others waiting, see the list")?.reason).toContain("closing ask is not last");
-		expect(checkTurnShape("**QUESTION**\nShip now or wait for M5?\nnothing else waiting for now")?.reason).toContain("closing ask is not last");
+		expect(checkTurnShape("**QUESTION**\nShip now or wait for M5?\n3 others waiting, see the list", "lane", { batch: null })?.reason).toContain("closing ask is not last");
+		expect(checkTurnShape("**QUESTION**\nShip now or wait for M5?\nnothing else waiting for now", "lane", { batch: null })?.reason).toContain("closing ask is not last");
 	});
 	test("a non-shell code fence is not a command", () => {
-		expect(checkTurnShape("**CLAIM**\n```ts\nconst x = 1;\n```")).toBeNull();
+		expect(checkTurnShape("**CLAIM**\n```ts\nconst x = 1;\n```", "lane", { batch: null })).toBeNull();
 	});
 	// contract/output-types.md § Guess basis: a GUESS carries its basis in the label. Every form is a
 	// block label exactly like the plain one.
 	for (const guess of ["GUESS", "GUESS(inference)", "GUESS(pattern)", "GUESS(recall)"]) {
 		test(`**${guess}** is a block label`, () => {
 			// A labeled block above the needs-you heading is not content above it.
-			expect(checkTurnShape(`**${guess}**\n## Needs you\n**CLAIM**\nx`)).toBeNull();
-			expect(checkTurnShape(`**${guess}**\nThe caller probably handles the null.\n\n**QUESTION**\nGuard it or delete it?`)).toBeNull();
+			expect(checkTurnShape(`**${guess}**\n## Needs you\n**CLAIM**\nx`, "lane", { batch: null })).toBeNull();
+			expect(checkTurnShape(`**${guess}**\nThe caller probably handles the null.\n\n**QUESTION**\nGuard it or delete it?`, "lane", { batch: null })).toBeNull();
 			// It ends the QUESTION block: its text is not part of the ask.
 			expect(questionBlocks(`**QUESTION**\nGuard it or delete it?\n**${guess}**\nnote`)).toEqual(["Guard it or delete it?"]);
 		});
 		test(`**${guess}** refusals name the block and the offending line`, () => {
-			expect(checkTurnShape(`**QUESTION**\nGuard it or delete it?\n**${guess}**\nmore after`)?.reason).toContain(
+			expect(checkTurnShape(`**QUESTION**\nGuard it or delete it?\n**${guess}**\nmore after`, "lane", { batch: null })?.reason).toContain(
 				`the closing ask is not last (a **${guess}** block follows the QUESTION)`,
 			);
-			expect(checkTurnShape(`**${guess}**\nThe SDK needs an explicit region?`)?.reason).toContain(
+			expect(checkTurnShape(`**${guess}**\nThe SDK needs an explicit region?`, "lane", { batch: null })?.reason).toContain(
 				`a ${guess} asks something ("The SDK needs an explicit region?")`,
 			);
 		});
 	}
 	test("a GUESS with a basis the contract does not grade is no block label", () => {
-		expect(checkTurnShape("**GUESS(hunch)**\nThe SDK needs an explicit region?")?.reason).toContain(`unlabeled prose asks something`);
-		expect(checkTurnShape("**GUESS(hunch)**\n## Needs you\n**CLAIM**\nx")?.reason).toContain("needs-you block is not first");
+		expect(checkTurnShape("**GUESS(hunch)**\nThe SDK needs an explicit region?", "lane", { batch: null })?.reason).toContain(`unlabeled prose asks something`);
+		expect(checkTurnShape("**GUESS(hunch)**\n## Needs you\n**CLAIM**\nx", "lane", { batch: null })?.reason).toContain("needs-you block is not first");
 	});
 });
 
@@ -247,23 +247,23 @@ describe("trivial ask: row 1 on a plain reply and on one QUESTION with options",
 			"**QUESTION**",
 			"Does the look-and-feel pull request, PR #1 adding the composer/symbol/display block to `profile/config.yml`, get merged now, or wait until your fable session's `setupVersion` batch lands first? I recommend merging now: it touches a different region of the file.",
 		].join("\n");
-		expect(checkTurnShape(ilex1)).toBeNull();
-		expect(checkTurnShape(ilex2)).toBeNull();
+		expect(checkTurnShape(ilex1, "lane", { batch: null })).toBeNull();
+		expect(checkTurnShape(ilex2, "lane", { batch: null })).toBeNull();
 	});
 	test("a which-question with its options still refuses a second decision", () => {
-		expect(checkTurnShape("**QUESTION**\nWhich branch, main or feature, and should I deploy today?")?.reason).toContain("2 separate decisions");
-		expect(checkTurnShape("**QUESTION**\nDoes it merge now or later, and deploy today or tomorrow?")?.reason).toContain("2 separate decisions");
+		expect(checkTurnShape("**QUESTION**\nWhich branch, main or feature, and should I deploy today?", "lane", { batch: null })?.reason).toContain("2 separate decisions");
+		expect(checkTurnShape("**QUESTION**\nDoes it merge now or later, and deploy today or tomorrow?", "lane", { batch: null })?.reason).toContain("2 separate decisions");
 	});
 	test("a plain reply may carry one ask, options included, last", () => {
-		expect(checkTurnShape("The host is on 18.4.4. Want it pinned in the profile, or left floating?")).toBeNull();
-		expect(checkTurnShape("M7 has one workload open, with two slices left.")).toBeNull();
+		expect(checkTurnShape("The host is on 18.4.4. Want it pinned in the profile, or left floating?", "lane", { batch: null })).toBeNull();
+		expect(checkTurnShape("M7 has one workload open, with two slices left.", "lane", { batch: null })).toBeNull();
 	});
 	test("a plain reply with two asks, two decisions, or prose after its ask is refused", () => {
-		expect(checkTurnShape("Pin it? Or restart first?")?.reason).toContain("asks 2 things");
-		expect(checkTurnShape("Pin it to 18.4.4 or 18.3.0, and restart now or later?")?.reason).toContain("2 separate decisions");
-		expect(checkTurnShape("Want me to pin it?\nIt is floating today.")?.reason).toContain("not last");
+		expect(checkTurnShape("Pin it? Or restart first?", "lane", { batch: null })?.reason).toContain("asks 2 things");
+		expect(checkTurnShape("Pin it to 18.4.4 or 18.3.0, and restart now or later?", "lane", { batch: null })?.reason).toContain("2 separate decisions");
+		expect(checkTurnShape("Want me to pin it?\nIt is floating today.", "lane", { batch: null })?.reason).toContain("not last");
 	});
 	test("unlabeled prose asking inside a labeled message is still refused", () => {
-		expect(checkTurnShape("**CLAIM**\nIt is pinned.\n\nShould I restart it?")?.reason).toContain("asks something");
+		expect(checkTurnShape("**CLAIM**\nIt is pinned.\n\nShould I restart it?", "lane", { batch: null })?.reason).toContain("asks something");
 	});
 });

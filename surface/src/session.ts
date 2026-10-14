@@ -47,6 +47,34 @@ export interface TypedEntry {
 /** How many discarded typed texts the surface remembers, only to warn when one arrives late (surface/extensions/surface-input.ts). */
 export const DISCARDED_KEPT = 20;
 
+/**
+ * The `send:` line last rendered to Jo (PLAN wl-mv66ylg1op3wg0 D5, surface/extensions/send-line.ts):
+ * its ledger id (`sr-…`), its pieces as rendered (`3 approve, 5 extend`, read back by interpretBatch),
+ * and the displaySeq it was rendered at. `ok` applies it only while `seq === displaySeq` (D6).
+ */
+export interface SendLineBinding {
+	id: string;
+	pieces: string;
+	seq: number;
+}
+
+/** What a batch applied, for the gate's batch-turn rules (D7, D8): every row it answered and those rows' numbers; `lines` are the echo lines of the answers to the orchestrator's own questions, which the hidden turn acts on. */
+export interface AppliedBatch {
+	appliedIds: string[];
+	numbers: number[];
+	lines: string[];
+}
+
+/**
+ * A batch reply (D7): the applied and skipped lines, shown above a fresh needs-Jo list and `send:`
+ * line; `trigger` is set when an applied answer is to the orchestrator's own question, so a turn is
+ * started on it after the reply is shown.
+ */
+export interface BatchReply {
+	lines: string[];
+	trigger: AppliedBatch | null;
+}
+
 export class SurfaceSession {
 	/** This session is the orchestrator surface. */
 	readonly active: boolean;
@@ -129,6 +157,16 @@ export class SurfaceSession {
 	quietTurn = false;
 	/** Jo typed `pending` while the session was busy: shown, rendered fresh, at the next idle poll (D1). */
 	pendingDisplay = false;
+	/**
+	 * Incremented by every surface display Jo sees that shows needs-you or answer lines (PLAN
+	 * wl-mv66ylg1op3wg0 D5): the send-line display, a `pending` block, the wake and needs-you asides,
+	 * a batch reply. A binding is the last thing shown exactly when its `seq` equals this.
+	 */
+	displaySeq = 0;
+	/** The `send:` line last rendered (D5), consumed by the `ok` that applies it (D6); null when the last render had no routine item. */
+	sendLine: SendLineBinding | null = null;
+	/** A batch reply made while a turn streamed (D7): shown one macrotask after that turn's terminal `agent_end`, in place of its send-line render. */
+	heldReply: BatchReply | null = null;
 	/** The clock the surface reads the ledger at; tests move it. */
 	now: () => string = () => new Date().toISOString();
 	#ledger: Ledger | null = null;

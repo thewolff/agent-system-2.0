@@ -13,7 +13,7 @@ import { ceilingBody } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
 import { doneBody, exitClass, laneExit, laneModelBody, laneStarted, verdictOf } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
-import { alive, type FakeScript, type FakeStep, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, sh, until } from "./helpers";
+import { alive, drainSettled, type FakeScript, type FakeStep, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, sh, until } from "./helpers";
 
 const A = "anthropic/claude-opus-5-5";
 const X = "openai-codex/gpt-6-sol";
@@ -63,7 +63,16 @@ const launch = (r: LaneRoot, wl: string, script: FakeScript, by = "test") => {
 	const out = sh(["bun", LANE_SCRIPT, "launch", wl, "--requested-by", by], r.repo, r.env);
 	expect(out.code).toBe(0);
 };
-const exitOf = (r: LaneRoot, wl: string, laneId: string) => until(`lane-exit: of ${laneId}`, () => laneExit(laneSnapshot(r, wl).control, laneId));
+/**
+ * The lane's `lane-exit:`, once the drain its runner spawned in that same exit write has ended. The drain launches any workload whose launch predicate says
+ * launch (MIGRATION.md item 71): a `launch-requested:` or an answer the test writes after the exit marker would otherwise race it for the reservation, and
+ * the test's own launch would read `held` (exit 7). The run lock is per lane id, so it never guards the next lane's launch.
+ */
+const exitOf = async (r: LaneRoot, wl: string, laneId: string) => {
+	const exit = await until(`lane-exit: of ${laneId}`, () => laneExit(laneSnapshot(r, wl).control, laneId));
+	await drainSettled(r, laneId);
+	return exit;
+};
 /** The n-th (1-based) fake omp spawn's record: argv, pid, session. */
 const spawnRecord = (r: LaneRoot, n: number) => fakeRecords(r).filter((x) => x.argv !== undefined)[n - 1]!;
 const eventsOf = (r: LaneRoot, pid: number) => fakeRecords(r).filter((x) => x.pid === pid && x.event).map((x) => x.event!);

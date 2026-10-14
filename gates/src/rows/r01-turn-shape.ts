@@ -1,4 +1,4 @@
-// P-11 row 1 (DESIGN-2.0.md:338; C2.1; SPEC-2.0.md § B16 items 1-2): a message addressed to Jo
+// P-11 row 1 (DESIGN-2.0.md:338; C2.1; SPEC-2.0.md § B16 items 1-3): a message addressed to Jo
 // carries at most one ask/QUESTION, hands Jo a command only as a script path, and puts the needs-you
 // block first and the closing ask last. On the orchestrator session it hands Jo no command at all,
 // not even a script path: a lane runs it, or the ask is one word (tiers/orchestrator.md § What you
@@ -8,6 +8,13 @@
 // from the draft and is rewritten, so the history Jo keeps holds the marker and the rewrite; the
 // draft may show while it streams, because OMP does not retract streamed text
 // (gates/extensions/r01-turn-shape.ts).
+//
+// The orchestrator never types the `send:` line: the surface writes it after the message, from the
+// recommendations recorded with orchestrator_recommend (SPEC-2.0.md § B16 item 3, amended
+// 2026-10-13). On a batch turn (`turn.batch`: Jo's answers the surface applied, read from the
+// session's `surface-batch-turn` entry by the extension) the reply carries at most one new QUESTION
+// and nothing else, and names none of the applied ids or numbers: the surface already showed Jo
+// what was applied.
 import type { Refusal } from "../types";
 
 /**
@@ -45,6 +52,17 @@ const RECOMMENDATION_LINE = /^\s*(?:\*\*|_)?(?:recommend(?:ed|ation|s)?|default)
 const COUNT_LINE = /^\s*[*_]*(?:\d+\s+others?\s+waiting:\s+`?pending`?\s+shows\s+them\s+all|nothing\s+else\s+waiting)\.?[*_]*\.?\s*$/i;
 const NEEDS_YOU = /^\s*(?:#{1,6}\s*|\*\*)?needs you\b/i;
 const ENVELOPE = /<!--\s*output-types[\s\S]*?-->/g;
+
+/**
+ * A line that reads as the surface's machine `send: <n> <word>, …` line, behind any quote, list or
+ * emphasis marker. Read from the raw line: fenced or quoted, it is still a send line on Jo's screen.
+ */
+const SEND_LINE = /^[\s>*_`~+-]*send:/i;
+
+/** What row 1 knows of the turn besides its text. `batch`: the answers the surface applied this turn, or null on a normal turn. */
+export interface TurnInput {
+	batch: { appliedIds: string[]; numbers: number[] } | null;
+}
 
 interface Fence {
 	lang: string;
@@ -227,11 +245,46 @@ function orchestratorHandOver(lines: string[], fences: Fence[]): string | null {
 	return null;
 }
 
+const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * A batch turn's problems (SPEC-2.0.md § B16 item 3, amended 2026-10-13): the surface already showed
+ * Jo the applied list and the new needs-you list, so the reply holds at most one QUESTION block (a
+ * new question, which row 15 binds) and nothing else, and it names no applied id or `#n`. `raw` are
+ * the message's lines as written, fences included: a fenced line is still on Jo's screen.
+ */
+function batchProblems(raw: string[], labels: string[], batch: NonNullable<TurnInput["batch"]>): string[] {
+	const out: string[] = [];
+	let label = "";
+	let prose = false;
+	const blocks = new Set<string>();
+	for (const [i, line] of raw.entries()) {
+		if (labels[i]) {
+			label = labels[i]!;
+			continue;
+		}
+		if (!line.trim() || label === "QUESTION") continue;
+		if (label) blocks.add(label);
+		else prose = true;
+	}
+	const shape = "a reply to Jo's batch carries at most one new **QUESTION** and nothing else; the surface already showed the applied list and the needs-you list";
+	if (prose) out.push(`it carries unlabeled prose on a batch turn; ${shape}`);
+	for (const b of blocks) out.push(`it carries a **${b}** block on a batch turn; ${shape}`);
+	const named = [
+		...batch.appliedIds.map((id) => ({ name: id, re: new RegExp(`(?<![\\w-])${escapeRegExp(id)}(?![\\w-])`) })),
+		...batch.numbers.map((n) => ({ name: `#${n}`, re: new RegExp(`(?<![\\w&#])#${n}(?!\\d)`) })),
+	];
+	const hit = named.filter((x) => raw.some((l) => x.re.test(l))).map((x) => x.name);
+	if (hit.length > 0) out.push(`it names ${hit.join(", ")}, which Jo just answered; it adds no commentary on an applied answer`);
+	return out;
+}
+
 /**
  * Row 1 over the final text of a turn addressed to Jo. `role` is the session speaking: a lane may
- * hand Jo a script path; the orchestrator hands over no command at all.
+ * hand Jo a script path; the orchestrator hands over no command at all. `turn` is what the session
+ * entries say of this turn (gates/extensions/r01-turn-shape.ts); a normal turn is `{ batch: null }`.
  */
-export function checkTurnShape(message: string, role: "orchestrator" | "lane" = "lane"): Refusal {
+export function checkTurnShape(message: string, role: "orchestrator" | "lane", turn: TurnInput): Refusal {
 	const text = message.replace(ENVELOPE, "").trimEnd();
 	const { lines, fences } = structure(text);
 	const own = lines.map(ownProse);
@@ -362,6 +415,16 @@ export function checkTurnShape(message: string, role: "orchestrator" | "lane" = 
 			const trailing = askLine < 0 ? undefined : own.slice(from).find((l, j) => l.trim() && from + j !== countLine && !OPTION_LINE.test(l) && !RECOMMENDATION_LINE.test(l));
 			if (trailing) problems.push(`the closing ask is not last (prose follows it: "${trailing.trim()}")`);
 		}
+	}
+
+	// (d) the machine send line and the batch turn (SPEC-2.0.md § B16 items 1 and 3, amended
+	// 2026-10-13), on the orchestrator. The send line is the surface's alone, on every turn; a batch
+	// turn carries at most one new QUESTION and no word on what Jo just answered.
+	if (role === "orchestrator") {
+		const raw = text.split("\n");
+		const send = raw.find((l) => SEND_LINE.test(l));
+		if (send !== undefined) problems.push(`it types a \`send:\` line ("${send.trim()}"); the surface writes the one send line after the message, from the recommendations recorded with orchestrator_recommend`);
+		if (turn.batch) problems.push(...batchProblems(raw, labels, turn.batch));
 	}
 
 	if (problems.length === 0) return null;

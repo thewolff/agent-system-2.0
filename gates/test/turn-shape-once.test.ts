@@ -104,13 +104,13 @@ describe("row 1 withholds a refused orchestrator reply", () => {
 		turnShapeRow(f.pi, orchestratorEnv());
 		const ctx = ctxOf();
 		const draft = "**PMDW**\n`zsh /tmp/ops.sh`";
-		expect(checkTurnShape(draft, "orchestrator")).not.toBeNull();
+		expect(checkTurnShape(draft, "orchestrator", { batch: null })).not.toBeNull();
 		const content = await f.emitAssistantMessage(assistant(text(draft)), ctx);
 		expect(content).toBeDefined();
 		const marker = content!.map((b) => b.text ?? "").join("");
 		expect(marker).not.toContain("/tmp/ops.sh");
 		expect(marker).not.toContain("`");
-		expect(checkTurnShape(marker, "orchestrator")).toBeNull();
+		expect(checkTurnShape(marker, "orchestrator", { batch: null })).toBeNull();
 
 		const stop = (await f.emit("session_stop", { last_assistant_message: { role: "assistant", content } }, ctx)) as { decision: string; reason: string };
 		expect(stop?.decision).toBe("block");
@@ -125,7 +125,7 @@ describe("row 1 withholds a refused orchestrator reply", () => {
 		const MARKER = "(Reply held by P-11 row 1. The corrected reply follows.)";
 		const thinking: Block = { type: "thinking", thinking: "t", thinkingSignature: "sig" };
 		const refusedThenStop = async (draft: string) => {
-			expect(checkTurnShape(draft, "orchestrator")).not.toBeNull();
+			expect(checkTurnShape(draft, "orchestrator", { batch: null })).not.toBeNull();
 			const content = await f.emitAssistantMessage(assistant(text(draft), thinking, text("second block")), ctx);
 			expect(content).toBeDefined();
 			const stop = (await f.emit("session_stop", { last_assistant_message: { role: "assistant", content } }, ctx)) as { decision: string; reason: string };
@@ -226,7 +226,7 @@ describe("row 1 with no readable ledger (item 105 fix round 2)", () => {
 	});
 
 	test("U2: a reply naming a question is held at publication, and its stop blocks with row 15's reason and the held reply", async () => {
-		expect(checkTurnShape(ASKED, "orchestrator")).toBeNull();
+		expect(checkTurnShape(ASKED, "orchestrator", { batch: null })).toBeNull();
 		const f = fakePi();
 		turnShapeRow(f.pi, noLedgerEnv());
 		const ctx = ctxOf();

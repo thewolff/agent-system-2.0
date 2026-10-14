@@ -13,7 +13,7 @@ import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index"
 import orchestratorSurface from "../index";
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
-import { apply, ceilingOf, interpret, interpretBatch, isCeilingQuestion } from "../src/input";
+import { apply, ceilingOf, interpret, interpretBatch, isCeilingQuestion, isSkip } from "../src/input";
 import { controlEntries } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { oneLiner, renderWorkload } from "../src/render";
@@ -255,9 +255,8 @@ describe("the runner's ceiling question as a numbered needs-you line", () => {
 		const { wl, sl, q, numbering, line, n } = numberedCeiling(l);
 		expect(line).toMatchObject({ kind: "question", n: expect.any(Number), options: ["stop", "extend", "split"] });
 		const r = interpretBatch(l, numbering, `${n} extend`);
-		expect(r).toEqual({ ok: true, items: [{ n, cmd: { kind: "answer", workloadId: wl, questionId: q, answer: "extend" } }] });
-		if (!r?.ok) throw new Error("not accepted");
-		const [receipt] = l.write(() => r.items.map((i) => apply(l, i.cmd)));
+		expect(r).toEqual([{ n, cmd: { kind: "answer", workloadId: wl, questionId: q, answer: "extend" } }]);
+		const [receipt] = l.write(() => (r ?? []).flatMap((p) => (isSkip(p) ? [] : [apply(l, p.cmd)])));
 		expect(receipt).toContain("ceiling raised to $100 / 12h");
 		const answer = l.question(q)!.resolved_by!;
 		expect(ceilingBodies(l, wl).at(-1)).toBe(`ceiling: usd 100 wall 720 source extend one block by ${answer}`);
@@ -269,9 +268,8 @@ describe("the runner's ceiling question as a numbered needs-you line", () => {
 		const { ledger: l } = tempLedger();
 		const { wl, sl, q, numbering, n } = numberedCeiling(l);
 		const r = interpretBatch(l, numbering, `${n} withdraw`);
-		expect(r).toEqual({ ok: true, items: [{ n, cmd: { kind: "withdraw", workloadId: wl, questionId: q, then: "cancel" } }] });
-		if (!r?.ok) throw new Error("not accepted");
-		l.write(() => r.items.map((i) => apply(l, i.cmd)));
+		expect(r).toEqual([{ n, cmd: { kind: "withdraw", workloadId: wl, questionId: q, then: "cancel" } }]);
+		l.write(() => (r ?? []).flatMap((p) => (isSkip(p) ? [] : [apply(l, p.cmd)])));
 		expect(l.question(q)!.state).toBe("withdrawn");
 		expect(l.instructions(wl).at(-1)).toMatchObject({ kind: "withdrawal", disposition: "cancel" });
 		expect(l.slice(sl)!.state).toBe("cancelled");
@@ -281,9 +279,8 @@ describe("the runner's ceiling question as a numbered needs-you line", () => {
 		const { ledger: l } = tempLedger();
 		const { wl, sl, q, numbering, n } = numberedCeiling(l);
 		const r = interpretBatch(l, numbering, `${n} stop`);
-		expect(r).toEqual({ ok: true, items: [{ n, cmd: { kind: "answer", workloadId: wl, questionId: q, answer: "stop" } }] });
-		if (!r?.ok) throw new Error("not accepted");
-		l.write(() => r.items.map((i) => apply(l, i.cmd)));
+		expect(r).toEqual([{ n, cmd: { kind: "answer", workloadId: wl, questionId: q, answer: "stop" } }]);
+		l.write(() => (r ?? []).flatMap((p) => (isSkip(p) ? [] : [apply(l, p.cmd)])));
 		expect(l.slice(sl)).toMatchObject({ state: "done", artifact: `answered stop ${l.question(q)!.resolved_by!}` });
 		expect(ceilingBodies(l, wl)).toEqual(["ceiling: usd 50 wall 360 source stakes normal"]);
 	});

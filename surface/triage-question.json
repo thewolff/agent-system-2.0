@@ -1,0 +1,13 @@
+{
+  "triage": {
+    "type": "choice",
+    "instructions": "An open item is waiting on Jo's one-word answer, and the orchestrator has recommended an answer. Decide whether Jo's bare `ok` may apply the recommended answer with the other routine items, or whether Jo must decide this item himself. Pick exactly one of the five choices; when in doubt, pick a needs-jo choice.",
+    "criteria": {
+      "routine": "the recommended answer follows from the question and its reason, can be undone cheaply, stays inside work Jo already approved, and spends nothing beyond what Jo already set",
+      "needs-jo-irreversible": "the recommended answer cannot be undone cheaply: it deletes, publishes, merges, deploys or closes something for good",
+      "needs-jo-product-call": "the answer decides what the product does or what Jo wants, not how already-approved work gets done",
+      "needs-jo-cost": "the answer spends money or time beyond what Jo set: a raised ceiling, more review rounds, a bigger model or a longer run",
+      "needs-jo-unclear": "the question, its options or the recommendation's reason are unclear, or the recommended answer does not follow from them"
+    }
+  }
+}

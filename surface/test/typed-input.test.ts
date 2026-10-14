@@ -100,14 +100,15 @@ describe("red before: every typed message is a row or a warning", () => {
 			await t.wake();
 			notices.length = 0;
 			notified.length = 0;
+			// A word command, not `1 approve`: a typed numbered batch is applied at submit and starts no turn (PLAN wl-mv66ylg1op3wg0 D7).
 			if (order.startsWith("command")) {
 				await t.input(A);
-				await t.input("1 approve");
+				await t.input("approve");
 			} else {
-				await t.input("1 approve");
+				await t.input("approve");
 				await t.input(A);
 			}
-			await t.start("1 approve");
+			await t.start("approve");
 			await t.start(A);
 			expect(t.ledger.question(q)!.state).toBe("answered");
 			expect(notices.some((n) => n.includes(`answered the orchestrator's ${q} with "approve"`))).toBe(true);
@@ -131,7 +132,7 @@ describe("red before: every typed message is a row or a warning", () => {
 		expect(t.s().typed).toEqual([]);
 	});
 
-	test("T4 joined: an OMP `all` delivery of two typed messages writes one row, one entry and one singular echo per message, never a merged row; joined with a command line it warns and writes no Jo row (main: no row)", async () => {
+	test("T4 joined: an OMP `all` delivery of two typed messages writes one row, one entry and one singular echo per message, never a merged row; joined with an answer to the orchestrator's own question it is not Jo's exact typed prompt, so the answer is refused, nothing is written and Jo is warned, and a separately typed answer then applies (main: no row)", async () => {
 		const t = surface();
 		await t.input(A);
 		await t.input(B);
@@ -144,20 +145,36 @@ describe("red before: every typed message is a row or a warning", () => {
 		expect(t.joRows().some((r) => r.body.includes("\n"))).toBe(false);
 		expect(warnings()).toEqual([]);
 
+		// The joined take is not one prompt Jo typed exactly (joTyped is false), so PR #68's own-question guard refuses the
+		// paste's answer line: the question stays open, no answer or mirror is written, and the held prose gets no row.
 		const u = surface();
 		const q = await u.raise(["approve", "revise"]);
 		await u.wake();
 		notices.length = 0;
 		notified.length = 0;
+		const onSubject = u.ledger.instructions(u.wl).length;
 		await u.input(A);
-		await u.input("1 approve");
-		await u.start(`${A}\n\n1 approve`);
-		expect(u.ledger.question(q)!.state).toBe("answered");
-		expect(warnings()).toContain(
-			"2 messages Jo typed arrived joined as one prompt (OMP steeringMode all); none got an input row: re-send the plain-words ones one at a time, or set steeringMode to one-at-a-time",
-		);
+		// A word command line: a typed numbered batch never joins a prompt, it is applied at submit (PLAN wl-mv66ylg1op3wg0 D7).
+		await u.input("approve");
+		await u.start(`${A}\n\napprove`);
+		expect(u.ledger.question(q)!.state).toBe("open");
+		expect(u.ledger.question(q)!.resolved_by).toBeNull();
+		expect(u.ledger.instructions(STANDING_WORKLOAD_ID).filter((i) => i.question_id === q)).toEqual([]);
+		expect(u.ledger.instructions(u.wl)).toHaveLength(onSubject);
 		expect(u.joRows()).toEqual([]);
 		expect(u.f.entries.filter((e) => e.type === "surface-jo-input")).toEqual([]);
+		expect(u.s().typed).toEqual([]);
+		expect(warnings().some((w) => w.includes(q))).toBe(true);
+
+		// Recovery: Jo types the answer again on its own; that take is exact, so the same question is answered as Jo.
+		await u.input("approve");
+		await u.start("approve");
+		const answer = u.ledger.instructions(STANDING_WORKLOAD_ID).filter((i) => i.question_id === q);
+		expect(answer.map(({ kind, author, channel, body }) => ({ kind, author, channel, body }))).toEqual([{ kind: "answer", author: "jo", channel: "surface", body: "approve" }]);
+		expect(u.ledger.question(q)!.state).toBe("answered");
+		expect(u.ledger.question(q)!.resolved_by).toBe(answer[0]!.id);
+		expect(u.ledger.instructions(u.wl).slice(onSubject).map((i) => i.author)).toEqual(["jo"]);
+		expect(u.joRows()).toEqual([]);
 		expect(u.s().typed).toEqual([]);
 	});
 

@@ -186,7 +186,9 @@ export const LAUNCH_LANE_TOOL = "orchestrator_launch_lane";
 export const LOWER_CEILING_TOOL = "orchestrator_lower_ceiling";
 /** Ask Jo a question as a `questions` row on the standing slice, before the QUESTION block names its id (MIGRATION.md item 105; surface/extensions/question.ts). */
 export const RAISE_QUESTION_TOOL = "orchestrator_raise_question";
-export const SURFACE_TOOLS = [WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, RECORD_INSTRUCTION_TOOL, LEDGER_TOOL, LAUNCH_LANE_TOOL, LOWER_CEILING_TOOL, RAISE_QUESTION_TOOL] as const;
+/** Record the orchestrator's recommended one-word answer for an answerable needs-you row (PLAN wl-mv66ylg1op3wg0 D3; surface/extensions/send-line.ts). */
+export const RECOMMEND_TOOL = "orchestrator_recommend";
+export const SURFACE_TOOLS = [WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, RECORD_INSTRUCTION_TOOL, LEDGER_TOOL, LAUNCH_LANE_TOOL, LOWER_CEILING_TOOL, RAISE_QUESTION_TOOL, RECOMMEND_TOOL] as const;
 /** Surface tools that read rather than work (P-11 row 3's working-call test): the wake read records only that it read. */
 export const SURFACE_READ_TOOLS = [WAKE_READ_TOOL, LEDGER_TOOL] as const;
 /**
