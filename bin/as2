@@ -2,10 +2,10 @@
 # as2: the one-word launcher for agent-system 2.0 (Jo, 2026-09-29: "i am never going to remember a
 # command that long").
 #
-# Usage:   as2 [omp args...]   start the orchestrator, in <repo> (its cwd is fixed, not the shell's:
+# Usage:   as2 [omp args...]   start the orchestrator (Ilex), in <repo> (its cwd is fixed, not the shell's:
 #                              Jo's second session ran from ~/tmp, 2026-09-30):
-#                              env OMP_PROFILE=<profile> AGENT_SYSTEM_ROLE=orchestrator omp --cwd <repo>
-#                                --append-system-prompt <prompt> [args...]
+#                              env OMP_PROFILE=<profile> AGENT_SYSTEM_ROLE=orchestrator [AGENT_SYSTEM_AS2_LAUNCH=1]
+#                                omp --cwd <repo> --append-system-prompt <prompt> [--resume=<file>] [args...]
 #                              <prompt> is $HOME/.agent-system-2/orchestrator/system.md, rendered first
 #                              from the voice document and the output-types contract, so every turn
 #                              sends the same system prompt (surface/scripts/orchestrator-prompt.ts);
@@ -13,6 +13,25 @@
 #                              is "all" (the clean shell is on for the orchestrator), the shell-start
 #                              hooks are dropped (gates/src/shell-start.ts):
 #                                env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 OMP_PROFILE=...
+#                              Ilex resumes its designated conversation (surface/scripts/orchestrator-session.ts):
+#                              <file> is the newest `orchestrator-session:` entry in the ledger whose file
+#                              exists, is a regular file, was started in <repo> and holds a reply; a dead
+#                              newer one is named on stderr and skipped; with none, a new conversation
+#                              starts and stderr says so. No session folder is scanned. Args omp's own
+#                              parser reads as a session choice (-c/--continue, -r/--resume[=<file>],
+#                              --session <file>, --session-dir, --no-session, --fork, --from-claude,
+#                              --from-codex, --goal) get no --resume=<file>; a parser as2 cannot load is
+#                              named on stderr and the args go to omp as given. AGENT_SYSTEM_AS2_LAUNCH=1
+#                              marks an Ilex launch, whose session the surface records as the designated
+#                              one: plain, --resume, --session and -c/--continue launches; never
+#                              --session-dir, --goal, --fork, --no-session or --from-*. For a new
+#                              conversation, /new (or /clear) inside Ilex.
+#          as2 --resume=<file> resume that conversation instead (omp's own flag, passed through).
+#                              Every resuming launch (as2's own --resume=<file>, or --resume, --session,
+#                              -c/--continue) first looks for a running Ilex (pgrep -f 'omp --cwd <repo>
+#                              --append-system-prompt'): two on one conversation would corrupt it, so on
+#                              a match as2 exits 1 without starting omp, naming each pid, its start time
+#                              and command line, and how to stop it (/exit in its terminal, or kill <pid>)
 #          as2 install         run <repo>/install/install.sh (ledger, profile, this launcher); its
 #                              last line names the providers to log in to once per profile
 #                              (/login inside the session; OMP's first-launch wizard is skipped)
@@ -38,7 +57,7 @@
 #          as2 --print [args]  render <prompt>, then print the omp command line `as2 [args]` would run, without running it
 #          as2 -h | --help     this text
 # Env:     AGENT_SYSTEM_PROFILE  OMP profile name (default: agent-system-2), as install/install.sh
-# Exit:    omp's (or install.sh's) own status when launching · 0 ok · 1 failure
+# Exit:    omp's (or install.sh's) own status when launching · 0 ok · 1 failure, or Ilex already running
 #
 # <repo> is this script's real directory's parent (bin/..), resolved through any symbolic link,
 # so the link install.sh places at $HOME/.local/bin/as2 finds the checkout it points into.
@@ -65,6 +84,45 @@ PROMPT="$HOME/.agent-system-2/orchestrator/system.md"
 # so a launch never passes one (the script names the missing source on stderr).
 render_prompt() {
 	bun "$REPO/surface/scripts/orchestrator-prompt.ts" "$PROMPT" || exit 1
+}
+
+# Which conversation this launch opens (PLAN wl-mv8wzipdczs2rk D1): surface/scripts/orchestrator-session.ts
+# reads Jo's args with omp's own parser and the ledger's `orchestrator-session:` pointers, notes on stderr,
+# and prints `<launch> <guard> <file>`. Sets launch_env (AGENT_SYSTEM_AS2_LAUNCH=1 for an Ilex launch, else
+# empty), guard (1: the launch resumes) and resume_file (as2's own --resume=<file>, or empty). A run that
+# fails adds nothing: today's command line.
+session_decision() {
+	decision="$(bun "$REPO/surface/scripts/orchestrator-session.ts" "$REPO" "$AGENT_DIR" -- "$@")" || decision="0 0 "
+	launch_env=""
+	if [ "${decision%% *}" = 1 ]; then launch_env="AGENT_SYSTEM_AS2_LAUNCH=1"; fi
+	rest="${decision#* }"
+	guard="${rest%% *}"
+	resume_file="${rest#* }"
+}
+
+# Two omp processes writing one session file would corrupt it: a resuming launch stops while an as2-launched
+# omp runs on <repo> (its command line starts `omp --cwd <repo> --append-system-prompt`), naming each one.
+# A coarse guard, not file locking. A pid gone by the time ps looks (ps exits 0 empty, or 1) is not counted; a pid
+# ps cannot read (any other failure, e.g. a sandbox refusing ps) is counted: refusing beats two writers.
+ilex_guard() {
+	pattern="omp --cwd $(printf '%s' "$REPO" | sed 's/[][\\.*^$+?(){}|]/\\&/g') --append-system-prompt"
+	running=""
+	for pid in $(pgrep -f "$pattern" || true); do
+		if cmd="$(ps -ww -o command= -p "$pid" 2>/dev/null)"; then
+			[ -n "$cmd" ] || continue
+			cmd="$(printf '%s\n' "$cmd" | cut -c1-120)"
+		else
+			[ "$?" -ne 1 ] || continue
+			cmd="(ps could not read its command line)"
+		fi
+		started="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//')" || started=""
+		[ -n "$started" ] || started="unknown"
+		printf 'as2: Ilex is already running (pid %s, started %s): %s\n' "$pid" "$started" "$cmd" >&2
+		printf '%s\n' 'as2: two Ilex processes on one conversation would corrupt it, so this as2 did not start.' >&2
+		printf 'as2: quit that Ilex (/exit in its terminal), or run: kill %s — then run as2 again.\n' "$pid" >&2
+		running=1
+	done
+	if [ -n "$running" ]; then exit 1; fi
 }
 
 usage() {
@@ -266,17 +324,22 @@ case "${1-}" in
 	--print)
 		shift
 		render_prompt
+		session_decision "$@"
+		if [ -n "$resume_file" ]; then set -- "--resume=$resume_file" "$@"; fi
 		line="env"
 		if orchestrator_clean; then line="$line -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4"; fi
-		line="$line OMP_PROFILE=$(quote "$PROFILE_NAME") AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(quote "$REPO") --append-system-prompt $(quote "$PROMPT")"
+		line="$line -u AGENT_SYSTEM_AS2_LAUNCH OMP_PROFILE=$(quote "$PROFILE_NAME") AGENT_SYSTEM_ROLE=orchestrator${launch_env:+ $launch_env} omp --cwd $(quote "$REPO") --append-system-prompt $(quote "$PROMPT")"
 		for arg in "$@"; do line="$line $(quote "$arg")"; done
 		printf '%s\n' "$line"
 		;;
 	*)
 		render_prompt
+		session_decision "$@"
+		if [ "$guard" = 1 ]; then ilex_guard; fi
+		if [ -n "$resume_file" ]; then set -- "--resume=$resume_file" "$@"; fi
 		if orchestrator_clean; then
-			exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 OMP_PROFILE="$PROFILE_NAME" AGENT_SYSTEM_ROLE=orchestrator omp --cwd "$REPO" --append-system-prompt "$PROMPT" "$@"
+			exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 -u AGENT_SYSTEM_AS2_LAUNCH OMP_PROFILE="$PROFILE_NAME" AGENT_SYSTEM_ROLE=orchestrator ${launch_env:+"$launch_env"} omp --cwd "$REPO" --append-system-prompt "$PROMPT" "$@"
 		fi
-		exec env OMP_PROFILE="$PROFILE_NAME" AGENT_SYSTEM_ROLE=orchestrator omp --cwd "$REPO" --append-system-prompt "$PROMPT" "$@"
+		exec env -u AGENT_SYSTEM_AS2_LAUNCH OMP_PROFILE="$PROFILE_NAME" AGENT_SYSTEM_ROLE=orchestrator ${launch_env:+"$launch_env"} omp --cwd "$REPO" --append-system-prompt "$PROMPT" "$@"
 		;;
 esac

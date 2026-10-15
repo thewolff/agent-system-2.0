@@ -288,11 +288,14 @@ describe("bin/as2 drops exactly SHELL_START_HOOK_NAMES only where the clean shel
 		expect(r.status).toBe(0);
 		return r.stdout;
 	};
-	const MAIN = "env OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd ";
+	// as2 marks an Ilex launch only when it can read Jo's args with the installed omp's parser; with no omp on PATH
+	// (the outside-the-fence runner) it launches the args as given, unmarked (surface/scripts/orchestrator-session.ts).
+	const MARK = Bun.which("omp") ? " AGENT_SYSTEM_AS2_LAUNCH=1" : "";
+	const MAIN = `env -u AGENT_SYSTEM_AS2_LAUNCH OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator${MARK} omp --cwd `;
 
 	test('gates.cleanShell "all": the launch line drops every hook name', () => {
 		const line = print('gates:\n  cleanShell: "all"\n');
-		expect(line).toStartWith(`env ${SHELL_START_HOOK_NAMES.map((n) => `-u ${n}`).join(" ")} OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd `);
+		expect(line).toStartWith(`env ${SHELL_START_HOOK_NAMES.map((n) => `-u ${n}`).join(" ")} -u AGENT_SYSTEM_AS2_LAUNCH OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator${MARK} omp --cwd `);
 		expect(line).not.toContain("PI_NO_PTY");
 	});
 

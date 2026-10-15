@@ -28,6 +28,12 @@ export type Ctx = GatesCtx & {
 	modelRegistry?: unknown;
 	/** The session's current effective system prompt blocks (ExtensionContext.getSystemPrompt, types.ts:529 on OMP 18.8); at session_start the base prompt the launch built. */
 	getSystemPrompt?(): string[];
+	/** The session's id and its allocated file (ReadonlySessionManager.getSessionId / getSessionFile, OMP 18.8.6 session-manager.ts:3091-3097; the file may not be on disk yet). */
+	sessionManager: GatesCtx["sessionManager"] & { getSessionId?(): string; getSessionFile?(): string | undefined };
+	/** The active model (ExtensionContext.model, types.ts:507 on OMP 18.8.6; pi-catalog Model.contextWindow is `number | null`); the wake-size entry reads its context window. */
+	model?: { contextWindow?: number | null } | undefined;
+	/** Context usage for the active model (ExtensionContext.getContextUsage, types.ts:491 on OMP 18.8.6). */
+	getContextUsage?(): { tokens: number; contextWindow: number; percent: number } | undefined;
 };
 type Handler<E, R = unknown> = (event: E, ctx: Ctx) => R | Promise<R>;
 /** A custom message the surface sends or returns; `details` carries the push key the `context` guard reads (surface/extensions/wake.ts). */
@@ -44,6 +50,8 @@ export interface HostMessage {
 	details?: unknown;
 	/** An assistant message's text and tool-call blocks (pi-ai AssistantMessage.content); read through gates/src/session.ts `messageText`. */
 	content?: unknown;
+	/** An assistant message's token usage (pi-catalog Usage, OMP 18.8.6): the wake-size sample reads input, cacheRead, cacheWrite. */
+	usage?: { input?: number; cacheRead?: number; cacheWrite?: number };
 }
 /**
  * The `session_before_compact` preparation as surface/extensions/plan-path.ts edits it (pi-agent-core
@@ -71,6 +79,8 @@ export type SurfaceAPI = GatesAPI<Ctx> & {
 	on(event: "tool_approval_resolved", h: Handler<{ sessionId: string; toolCallId: string; toolName: string; approved: boolean; reason?: string }>): void;
 	on(event: "tool_execution_end", h: Handler<{ toolCallId: string; toolName: string; result: unknown; isError: boolean }>): void;
 	on(event: "session_shutdown", h: Handler<{ type: "session_shutdown" }>): void;
+	/** OMP's in-process new / fork / resume (shared-events.ts SessionSwitchEvent, OMP 18.8.6): the session manager now holds the other session. */
+	on(event: "session_switch", h: Handler<{ type: "session_switch"; reason: "new" | "resume" | "fork"; previousSessionFile: string | undefined }>): void;
 	/** OMP 18.4.4 types.ts:1267-1271: the turn's message may carry `details` (agent-session.ts:7306-7318 keeps them). */
 	on(event: "before_agent_start", h: Handler<{ prompt: string; systemPrompt: string[] }, { systemPrompt?: string[]; message?: SurfaceMessage } | undefined>): void;
 	/** Fires for a turn's input messages (pi-agent-core agent-loop.ts emitInputMessages) and for an aside folded into context (agent-session.ts:1178-1181). */

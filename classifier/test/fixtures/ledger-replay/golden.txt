@@ -33,11 +33,11 @@ backup-2026-10-02T16-24-10.088Z wl-mupw2k1ebjcc8w closed stakes=throwaway builde
 backup-2026-10-02T16-24-10.088Z wl-mupwa13fkgcagw closed stakes=normal builders=none unknown=4 review@strong[anthropic,openai,kimi]=park needs-you=0
 backup-2026-10-02T16-24-10.088Z wl-mupy2zmubhtwqo closed stakes=throwaway builders=none review@fast[anthropic,openai,kimi]=single:anthropic,openai,kimi needs-you=0
 backup-2026-10-02T16-24-10.088Z wl-mupzpidbb3ksg0 closed stakes=normal builders=anthropic unknown=2 review@strong[anthropic,openai,kimi]=park needs-you=0
-backup-2026-10-02T16-24-10.088Z wl-muq0ex1024xtkw open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=2 held,idle
+backup-2026-10-02T16-24-10.088Z wl-muq0ex1024xtkw open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=1 idle
 backup-2026-10-02T16-24-10.088Z wl-muq13bkdghblmo open stakes=normal builders=anthropic,openai review@strong[anthropic,openai,kimi]=single:kimi needs-you=1 idle
-backup-2026-10-02T16-24-10.088Z wl-muq1v31q5ly7ls open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=2 held,question
-backup-2026-10-02T16-24-10.088Z wl-muq22rnjcfrrpc open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=2 held,idle
-backup-2026-10-02T16-24-10.088Z wl-muq2qnqmubroxs open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=2 held,question
+backup-2026-10-02T16-24-10.088Z wl-muq1v31q5ly7ls open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=1 question
+backup-2026-10-02T16-24-10.088Z wl-muq22rnjcfrrpc open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=1 idle
+backup-2026-10-02T16-24-10.088Z wl-muq2qnqmubroxs open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=1 question
 backup-2026-10-02T16-24-10.088Z wl-muq51lq93q7cow closed stakes=normal builders=anthropic,openai review@strong[anthropic,openai,kimi]=single:kimi needs-you=0
 backup-2026-10-02T16-24-10.088Z wl-muq6kr7iooobgg closed stakes=throwaway builders=anthropic review@fast[anthropic,openai,kimi]=single:openai,kimi needs-you=0
 backup-2026-10-02T16-24-10.088Z wl-muq79izj7kalmo closed stakes=throwaway builders=anthropic review@fast[anthropic,openai,kimi]=single:openai,kimi needs-you=0
@@ -67,13 +67,13 @@ backup-2026-10-07T16-37-10.733Z wl-mupy2zmubhtwqo closed stakes=throwaway builde
 backup-2026-10-07T16-37-10.733Z wl-mupzpidbb3ksg0 closed stakes=normal builders=anthropic unknown=2 review@strong[anthropic,openai,kimi]=park needs-you=0
 backup-2026-10-07T16-37-10.733Z wl-muq0ex1024xtkw open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=1 idle
 backup-2026-10-07T16-37-10.733Z wl-muq13bkdghblmo closed stakes=normal builders=anthropic,openai review@strong[anthropic,openai,kimi]=single:kimi needs-you=0
-backup-2026-10-07T16-37-10.733Z wl-muq1v31q5ly7ls open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=2 held,question
-backup-2026-10-07T16-37-10.733Z wl-muq22rnjcfrrpc open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=2 held,question
+backup-2026-10-07T16-37-10.733Z wl-muq1v31q5ly7ls open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=1 question
+backup-2026-10-07T16-37-10.733Z wl-muq22rnjcfrrpc open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=1 question
 backup-2026-10-07T16-37-10.733Z wl-muq2qnqmubroxs closed stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=0
 backup-2026-10-07T16-37-10.733Z wl-muq51lq93q7cow closed stakes=normal builders=anthropic,openai review@strong[anthropic,openai,kimi]=single:kimi needs-you=0
 backup-2026-10-07T16-37-10.733Z wl-muq6kr7iooobgg closed stakes=throwaway builders=anthropic review@fast[anthropic,openai,kimi]=single:openai,kimi needs-you=0
 backup-2026-10-07T16-37-10.733Z wl-muq79izj7kalmo closed stakes=throwaway builders=anthropic review@fast[anthropic,openai,kimi]=single:openai,kimi needs-you=0
-backup-2026-10-07T16-37-10.733Z wl-muraerdsgw7gn4 open stakes=production builders=anthropic review@deep[anthropic,openai,kimi]=fanout:openai,kimi needs-you=2 held,question
+backup-2026-10-07T16-37-10.733Z wl-muraerdsgw7gn4 open stakes=production builders=anthropic review@deep[anthropic,openai,kimi]=fanout:openai,kimi needs-you=1 question
 backup-2026-10-08T16-38-35.059Z wl-orchestrator open stakes=throwaway builders=none review@fast[anthropic,openai,kimi]=single:anthropic,openai,kimi needs-you=0
 backup-2026-10-08T16-38-35.059Z wl-munj2s89eq49og closed stakes=throwaway builders=none review@fast[anthropic,openai,kimi]=single:anthropic,openai,kimi needs-you=0
 backup-2026-10-08T16-38-35.059Z wl-munjgi4ouzco3k closed stakes=normal builders=none review@strong[anthropic,openai,kimi]=single:anthropic,openai,kimi needs-you=0
@@ -98,7 +98,7 @@ backup-2026-10-08T16-38-35.059Z wl-mupw2k1ebjcc8w closed stakes=throwaway builde
 backup-2026-10-08T16-38-35.059Z wl-mupwa13fkgcagw closed stakes=normal builders=none unknown=4 review@strong[anthropic,openai,kimi]=park needs-you=0
 backup-2026-10-08T16-38-35.059Z wl-mupy2zmubhtwqo closed stakes=throwaway builders=none review@fast[anthropic,openai,kimi]=single:anthropic,openai,kimi needs-you=0
 backup-2026-10-08T16-38-35.059Z wl-mupzpidbb3ksg0 closed stakes=normal builders=anthropic unknown=2 review@strong[anthropic,openai,kimi]=park needs-you=0
-backup-2026-10-08T16-38-35.059Z wl-muq0ex1024xtkw open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=2 held,question
+backup-2026-10-08T16-38-35.059Z wl-muq0ex1024xtkw open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=1 question
 backup-2026-10-08T16-38-35.059Z wl-muq13bkdghblmo closed stakes=normal builders=anthropic,openai review@strong[anthropic,openai,kimi]=single:kimi needs-you=0
 backup-2026-10-08T16-38-35.059Z wl-muq1v31q5ly7ls open stakes=normal builders=anthropic,openai,kimi review@strong[anthropic,openai,kimi]=park needs-you=0
 backup-2026-10-08T16-38-35.059Z wl-muq22rnjcfrrpc open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=1 idle
@@ -147,7 +147,7 @@ backup-2026-10-09T16-59-40.338Z wl-mv049108m8whds closed stakes=normal builders=
 backup-2026-10-09T16-59-40.338Z wl-mv08kdxmpzj0n4 closed stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=0
 backup-2026-10-09T16-59-40.338Z wl-mv0n5r9cbafe9s open stakes=production builders=anthropic review@deep[anthropic,openai,kimi]=fanout:openai,kimi needs-you=1 idle
 backup-2026-10-09T16-59-40.338Z wl-mv0n866rd9jlds open stakes=production builders=anthropic review@deep[anthropic,openai,kimi]=fanout:openai,kimi needs-you=1 question
-backup-2026-10-09T16-59-40.338Z wl-mv0ntc3s9bz0g0 open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=2 held,question
+backup-2026-10-09T16-59-40.338Z wl-mv0ntc3s9bz0g0 open stakes=normal builders=anthropic review@strong[anthropic,openai,kimi]=single:openai,kimi needs-you=1 question
 backup-2026-10-10T17-20-31.871Z wl-orchestrator open stakes=throwaway builders=none review@fast[anthropic,openai,kimi]=single:anthropic,openai,kimi needs-you=0
 backup-2026-10-10T17-20-31.871Z wl-munj2s89eq49og closed stakes=throwaway builders=none review@fast[anthropic,openai,kimi]=single:anthropic,openai,kimi needs-you=0
 backup-2026-10-10T17-20-31.871Z wl-munjgi4ouzco3k closed stakes=normal builders=none review@strong[anthropic,openai,kimi]=single:anthropic,openai,kimi needs-you=0

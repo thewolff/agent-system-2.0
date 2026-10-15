@@ -84,8 +84,16 @@ export const CONTROL_PREFIXES = [
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
 	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
+	"orchestrator-session", "wake-size",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
+
+/** Set by `bin/as2` only on an Ilex launch (PLAN wl-mv8wzipdczs2rk D1): the orchestrator session it starts may move the pointer. */
+export const AS2_LAUNCH_ENV = "AGENT_SYSTEM_AS2_LAUNCH";
+/** `orchestrator-session: <absolute session file> <sessionId>`: the designated Ilex conversation `bin/as2` resumes (D1). */
+export const ORCHESTRATOR_SESSION_PREFIX = "orchestrator-session:";
+/** `wake-size: <trigger> <wakeId> session <sessionId> …`: one per orchestrator wake, its first successful turn's prompt size (D4). */
+export const WAKE_SIZE_PREFIX = "wake-size:";
 
 /** Prefixes whose first token after the colon is the lane id the entry is about. */
 const LANE_SCOPED: Record<string, true> = {
@@ -142,6 +150,9 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * hide its own over-cap line with a forged `scratch-under-cap:`: `scratch-over-cap:` / `scratch-under-cap:` are the lane row's
  * turn-end measure, written as the lane holding the workload (a holder, `validWriter`); `scratch-disk:` / `scratch-disk-ok:` the
  * daily sweep's (SCRATCH_SWEEP_BY, on the standing workload); `scratch-removed:` / `scratch-remove-failed:` the close's (the surface).
+ * `orchestrator-session: <absolute session file> <sessionId>` and `wake-size: <trigger> <wakeId> session <sessionId> …` are the
+ * surface's alone (PLAN wl-mv8wzipdczs2rk D1, D4; surface/extensions/wake.ts), on the standing workload: the pointer `bin/as2`
+ * resumes (surface/scripts/orchestrator-session.ts reads it) and each wake's first-turn size. A lane's copy is never the pointer.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -180,6 +191,8 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"scratch-disk-ok": [SCRATCH_SWEEP_BY],
 	"scratch-removed": [SURFACE_BY],
 	"scratch-remove-failed": [SURFACE_BY],
+	"orchestrator-session": [SURFACE_BY],
+	"wake-size": [SURFACE_BY],
 };
 
 export interface ControlEntry {

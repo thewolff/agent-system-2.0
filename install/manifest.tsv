@@ -1196,6 +1196,11 @@ surface/scripts/orchestrator-prompt.ts	module	-
 surface/test/base-prompt.test.ts	test	-
 # Test runner self-refresh (migration/items/test-runner-self-refresh.md): row 6 pins for the refresh helper's sudo forms.
 gates/test/as2test-refresh-pins.test.ts	test	-
+# Ilex resumes its full conversation (migration/items/ilex-resumes-full-history.md): bin/as2 picks the conversation to
+# resume from the ledger's orchestrator-session: pointers with this script; the surface records wake-size: per wake.
+surface/scripts/orchestrator-session.ts	module	-
+surface/test/as2-resume.test.ts	test	-
+surface/test/wake-size.test.ts	test	-
 # Jo's plugins (wl-mv8r90k9nci4qo, 2026-10-14): i-have-audhd and ask-graham vendored from
 # jo-wolff-plugins at the pin in plugins/VENDOR.md, upstream *.test.mjs left out. All used in place:
 # profile/config.yml loads plugins/index.ts (orchestrator only) and lists each plugins/<p>/skills dir.

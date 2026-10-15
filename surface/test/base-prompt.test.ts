@@ -7,7 +7,7 @@
 // prompt leaves the prompt byte-identical, that a push after such a launch inlines neither, and that
 // as2 refuses to launch when a source file is missing.
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import contractRow from "../../gates/extensions/r02-contract";
 import { CONTRACT_MARKER } from "../../gates/src/rows/r02-contract";
@@ -120,16 +120,36 @@ describe("a base prompt carrying the file: every turn sends the same system prom
 });
 
 describe("bin/as2 renders the file before omp and refuses to launch without a source", () => {
-	/** as2 under sh with a scratch HOME and a fake omp first on PATH that records its argv. */
+	/** The installed omp, whose `src` the fake omp's package borrows; null on the outside-the-fence runner. */
+	const OMP_ON_PATH = Bun.which("omp");
+	/** With no real parser, as2 names that once on stderr and launches Jo's args as given (orchestrator-session.ts). */
+	const NO_PARSER = /^as2: cannot read your arguments with omp's own parser \(.*\); launching them as given, without resuming Ilex's conversation\n$/;
+	/**
+	 * as2 under sh with a scratch HOME and ledger, and first on PATH a fake omp that records its argv and a pgrep that
+	 * finds no Ilex. With omp installed, the fake sits in a package whose `src` is the installed OMP's, so as2 reads
+	 * Jo's args with the real parser; without it, the fake stands alone and as2 takes its no-parser route.
+	 */
 	function as2(args: string[], over: Record<string, string> = {}) {
 		const e = env(over);
 		const home = tmp("home");
 		const bin = tmp("bin");
 		const argvFile = join(home, "omp-argv");
-		writeFileSync(join(bin, "omp"), `#!/bin/sh\nprintf '%s\\n' "$@" > '${argvFile}'\n`);
-		chmodSync(join(bin, "omp"), 0o755);
+		const fake = `#!/bin/sh\nprintf '%s\\n' "$@" > '${argvFile}'\n`;
+		if (OMP_ON_PATH) {
+			const pkg = tmp("pkg");
+			mkdirSync(join(pkg, "dist"));
+			writeFileSync(join(pkg, "dist", "cli.js"), fake);
+			chmodSync(join(pkg, "dist", "cli.js"), 0o755);
+			symlinkSync(join(dirname(dirname(realpathSync(OMP_ON_PATH))), "src"), join(pkg, "src"));
+			symlinkSync(join(pkg, "dist", "cli.js"), join(bin, "omp"));
+		} else {
+			writeFileSync(join(bin, "omp"), fake);
+			chmodSync(join(bin, "omp"), 0o755);
+		}
+		writeFileSync(join(bin, "pgrep"), "#!/bin/sh\nexit 1\n");
+		chmodSync(join(bin, "pgrep"), 0o755);
 		const r = Bun.spawnSync(["sh", AS2, ...args], {
-			env: { PATH: `${bin}:${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, AGENT_SYSTEM_VOICE: e.AGENT_SYSTEM_VOICE!, AGENT_SYSTEM_CONTRACT: e.AGENT_SYSTEM_CONTRACT! },
+			env: { PATH: `${bin}:${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, AGENT_SYSTEM_LEDGER_DB: e.AGENT_SYSTEM_LEDGER_DB!, AGENT_SYSTEM_VOICE: e.AGENT_SYSTEM_VOICE!, AGENT_SYSTEM_CONTRACT: e.AGENT_SYSTEM_CONTRACT! },
 		});
 		const prompt = join(home, ".agent-system-2", "orchestrator", "system.md");
 		return {
@@ -144,7 +164,8 @@ describe("bin/as2 renders the file before omp and refuses to launch without a so
 
 	test("launch: the file is written, then omp gets --append-system-prompt <file> before Jo's args", () => {
 		const r = as2(["--resume", "x"]);
-		expect(r.stderr).toBe("");
+		if (OMP_ON_PATH) expect(r.stderr).toBe("");
+		else expect(r.stderr).toMatch(NO_PARSER);
 		expect(r.code).toBe(0);
 		expect(readFileSync(r.prompt, "utf8")).toBe(rendered(r.e));
 		const argv = r.ompArgv()!;

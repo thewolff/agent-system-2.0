@@ -88,6 +88,12 @@ export class SurfaceSession {
 	pendingWakeId: string | null = null;
 	/** Keys (`wake:<id>`) of wakes a new trigger superseded while in flight or fallen back: the `context` guard drops their deferred copies. */
 	readonly retiredKeys = new Set<string>();
+	/**
+	 * The wake not yet measured (PLAN wl-mv8wzipdczs2rk D4): set at its trigger, `taken` once a push or Jo's turn took it.
+	 * The first assistant `message_end` after the take with a positive prompt size records its `wake-size:` entry and
+	 * clears it; a new trigger or `session_shutdown` first records it as unmeasured. One entry per wake, never zero.
+	 */
+	unmeasured: { trigger: WakeTrigger; wakeId: string; sessionId: string; taken: boolean } | null = null;
 	/** A tick batch pushed and not yet confirmed: resent at the next idle polls, up to PUSH_TRIES sends. */
 	noticesInFlight: { batchId: string; lines: string[]; content: string; tries: number } | null = null;
 	/** A batch was never confirmed: no tick line is pushed until Jo's turn renders the queue. */

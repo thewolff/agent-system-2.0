@@ -148,6 +148,48 @@ describe("F2: held > 4h (§ B3 item 2, § A3)", () => {
 		c.plusHours(5);
 		expect(kinds(ledger, c.now())).toEqual([]);
 	});
+
+	// PLAN wl-mv8wzipdczs2rk D3: the workload's second form is left out where another line carries the workload.
+	test("F2g: a user-driven workload with one open slice, no lane and no activity for 5h is no line (no lane by design)", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const wl = ledger.openWorkload({ by: "orchestrator", brief: "Rename the feed header token by hand", stakes: "normal", mode: "user-driven" });
+		ledger.addSlice({ by: "lane-a", workloadId: wl, task: "Rename the token", doneCondition: "d", inputs: "i" });
+		c.plusHours(5);
+		expect(text(ledger, c.now())).toEqual([]);
+	});
+
+	test("F2h: an open question on a no-lane workload idle 5h is the question line only (§ B3 item 5: the four-hour clock does not apply)", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const { wl, sl } = wlWithSlice(ledger);
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which token?", options: ["a", "b"] });
+		c.plusHours(5);
+		expect(text(ledger, c.now())).toEqual([`lane on ${wl} is waiting on you (${q}, slice ${sl}): Which token? — answer with one word: a / b (or \`withdraw\`)`]);
+	});
+
+	test("F2i: a waiting reserved request on a no-lane workload idle 5h is the reserved line only", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const { wl, sl } = wlWithSlice(ledger);
+		const en = ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "push to main" });
+		c.plusHours(5);
+		expect(text(ledger, c.now())).toEqual([`reserved action waiting on you (${wl}): push to main — \`approve ${en}\` or \`deny ${en}\``]);
+	});
+
+	test("F2j: the held-message form is unchanged: a message to a lane held 5h on a user-driven workload with an open question is still line 2", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const wl = ledger.openWorkload({ by: "orchestrator", brief: "Rename the feed header token by hand", stakes: "normal", mode: "user-driven" });
+		const sl = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "Rename the token", doneCondition: "d", inputs: "i" });
+		ledger.enqueue({ by: "surface", workloadId: wl, sliceId: sl, sender: "jo", recipient: "lane-a", body: "use the token" });
+		ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which token?", options: ["a", "b"] });
+		c.plusHours(5);
+		expect(text(ledger, c.now())).toEqual([
+			expect.stringMatching(new RegExp(`^held 5h on ${wl}: message msg-.* \\(jo → lane-a\\) has had no live lane since `)),
+			expect.stringMatching(/^lane on wl-.* is waiting on you/),
+		]);
+	});
 });
 
 describe("F3: question answered, slice not resumed", () => {

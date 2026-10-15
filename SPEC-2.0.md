@@ -253,6 +253,22 @@ tech to hold the ledger for 2.x yet, correct?"* — correct). P-13 names it a Ph
 a candidate; OMP's native memory backends (`local`, `mnemopi`, `hindsight`, `sharpshooter`) are
 held as candidates from the cross-lab review. It is a Session B question (Q on P-13).
 
+*Amended 2026-10-15 — parked workloads carry no held line.* (`migration/items/ilex-resumes-full-history.md`;
+Jo, ledger input `in-mv8wzcsggrzv9c`: *"Drop stale held lines from the wake"*; built in
+wl-mv8wzipdczs2rk, plan D3). The workload-level form above (open, no lane, no activity for 4 hours)
+is not pushed when another line or the tick already carries the workload: (a) mode `user-driven`,
+which has no lane by design and whose line shows `by hand: as2 lane <wl>`; (b) an open question,
+where § B3 item 5 already says the four-hour clock does not apply and the question line carries it;
+(c) a waiting reserved request, carried by its own line; (d) a lane that ended on purpose leaving
+open slices with no question and no waiting request, carried by the idle line (MIGRATION.md item
+68), so one line and not two; (e) a workload awaiting close — its newest lane lifecycle entry an
+intended `lane-exit:`, no open or paused slice, no open question, and a holder's `done-because:`
+recorded — which the tick closes or reports as unable to close. Every other case keeps the held
+line: a never-launched autonomous workload, an unintended lane end (open work, error, deadline,
+aborted, died, never ready), and an intended end with no open slice and nothing receipted. A held
+message is unchanged. The rule applies wherever the needs-you lines are computed: the wake render,
+the pushes between wakes and the on-demand ledger read.
+
 ### A4 · Reserved-action command list (P-7b item 3)
 
 **Ruled 2026-09-23.** Jo: *"yes as stated"*. "Irreversible actions outside the repository" =

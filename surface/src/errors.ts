@@ -14,7 +14,14 @@
 //    message to the orchestrator is consumed by the surface at read, so it is never "held with no
 //    live lane"), older than HOLD_HOURS; or an open workload — sliced or not (§ A3: "the workload
 //    itself open with no lane and no activity"; the standing workload excepted) — with no holder and
-//    no activity for HOLD_HOURS, compared unrounded (Codex S2).
+//    no activity for HOLD_HOURS, compared unrounded (Codex S2). That workload-level form is left out
+//    when another line or the tick already carries the workload (`heldElsewhere`, PLAN
+//    wl-mv8wzipdczs2rk D3): a user-driven workload (no lane by design; the render's `by hand:`), an
+//    open question (§ B3 item 5: the four-hour clock does not apply), a waiting reserved request
+//    (line 1), the item-68 idle line (line 6), or a workload awaiting close (an intended `lane-exit:`
+//    newest, no open or paused slice, a holder's `done-because:`: the tick closes it). It stays for a
+//    never-launched autonomous workload, an unintended lane end, and an intended end with no open
+//    slice and nothing receipted. The held-message form is never left out.
 // 3. a slice that failed its runtime artifact twice: ARTIFACT_FAILURES_SURFACED `artifact-failed:`
 //    messages on one slice since its last `artifact-passed:` (surface/src/signals.ts; writers: the
 //    lane's artifact observer in surface/extensions/lane.ts and P-11 row 8 for a refused push).
@@ -49,7 +56,7 @@
 import { type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { isCeilingQuestion } from "./input";
-import { type ControlEntry, type ControlPrefix, controlEntries, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
+import { type ControlEntry, type ControlPrefix, controlEntries, doneBecause, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
 import { questionSubject } from "./orchestrator-question";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { parseTestRunFailed, testRuns } from "./test-run";
@@ -273,6 +280,22 @@ function idleExit(control: readonly ControlEntry[]): { id: string; laneId: strin
 }
 
 /**
+ * Whether a workload with no holder and no activity for HOLD_HOURS is already carried by another line
+ * or by the tick, so the workload-level held line would only repeat it (PLAN wl-mv8wzipdczs2rk D3):
+ * user-driven (no lane by design), `asking` (an open question; § B3 item 5), `waiting` (a reserved
+ * request on line 1), `idle` (item 68's line fires for it), or awaiting close — the newest lane
+ * lifecycle entry an intended `lane-exit:` (`idleExit`), no open or paused slice, and a holder's
+ * `done-because:` standing (`doneBecause`), which the tick closes or reports once.
+ */
+function heldElsewhere(ledger: Ledger, workload: WorkloadStatusRow, asking: boolean, waiting: boolean, idle: boolean): boolean {
+	if (workload.mode === "user-driven" || asking || waiting || idle) return true;
+	if (workload.open_slices + workload.paused_slices > 0) return false;
+	const entries = ledger.entries(workload.id);
+	if (!idleExit(controlEntries(entries))) return false;
+	return doneBecause(entries, holdersOf(entries, workload.holder, ledger.holders(workload.id))) !== null;
+}
+
+/**
  * The § 2.5 line for a workload: its newest held `test-run-failed:` from the test runner, unless a
  * lane holds the workload under a live lease or a green `test-run:` was written after it. The run
  * dir is the newest `test-run:` entry's on the message's slice. A delivery consumes every held one.
@@ -317,14 +340,24 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		const label = wl === STANDING_WORKLOAD_ID ? "orchestrator" : wl;
 		const scheduled = parseDue(workload.brief);
 		const requests = reservedStates(ledger, wl);
+		const waiting = requests.some((r) => r.state.kind === "waiting");
 		for (const r of requests) {
 			if (r.state.kind !== "waiting") continue;
 			reserved.push({ kind: "reserved", workloadId: wl, rowId: r.id, line: `reserved action waiting on you (${label}): ${short(r.body)}${repeatNote(r, requests)} — \`approve ${r.id}\` or \`deny ${r.id}\`` });
 		}
+		// Item 68: no holder, no question, no reserved request — only an intended lane-exit: as the newest
+		// lifecycle entry says the lane ended on purpose and left the work to nobody. A lapsed holder is
+		// still the holder and is the lane-died line's; `lane-exit:` needs no holder list to validate.
+		const ended = openQuestions.length === 0 && wl !== STANDING_WORKLOAD_ID && workload.open_slices > 0 && !workload.holder && !waiting
+			? idleExit(controlEntries(ledger.entries(wl)))
+			: null;
 		const oldest = pendingMessages.find((m) => m.state === "held" && m.recipient !== ORCHESTRATOR_RECIPIENT);
 		if (oldest && hoursElapsed(oldest.created_at, now) >= holdHours) {
 			held.push({ kind: "held", workloadId: wl, rowId: oldest.id, line: `held ${hoursBetween(oldest.created_at, now)}h on ${label}: message ${oldest.id} (${oldest.sender} → ${oldest.recipient}) has had no live lane since ${oldest.created_at}` });
-		} else if (wl !== STANDING_WORKLOAD_ID && !scheduled && !workload.holder && hoursElapsed(workload.last_activity_at, now) >= holdHours) {
+		} else if (
+			wl !== STANDING_WORKLOAD_ID && !scheduled && !workload.holder && hoursElapsed(workload.last_activity_at, now) >= holdHours &&
+			!heldElsewhere(ledger, workload, openQuestions.length > 0, waiting, ended !== null)
+		) {
 			// Fable F2d: an open workload with no slices yet and no lane is held too. The standing workload and a
 			// scheduled row (M11 `due:` brief) are not a lane's work: neither ever has a lane, both are excluded.
 			held.push({ kind: "held", workloadId: wl, rowId: wl, line: `held ${hoursBetween(workload.last_activity_at, now)}h on ${label}: ${workload.open_slices} open slice(s), no lane, no activity since ${workload.last_activity_at}` });
@@ -348,13 +381,8 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		if (openQuestions.length > 0) {
 			const entries = ledger.entries(wl);
 			control = controlEntries(entries, holdersOf(entries, workload.holder, ledger.holders(wl)));
-		} else if (wl !== STANDING_WORKLOAD_ID && workload.open_slices > 0 && !workload.holder && !requests.some((r) => r.state.kind === "waiting")) {
-			// Item 68: no holder, no question, no reserved request — only an intended lane-exit: as the newest
-			// lifecycle entry says the lane ended on purpose and left the work to nobody. A lapsed holder is
-			// still the holder and is the lane-died line's; `lane-exit:` needs no holder list to validate.
-			const ended = idleExit(controlEntries(ledger.entries(wl)));
-			if (ended) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; relaunch, close, or instruct` });
 		}
+		if (ended) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; relaunch, close, or instruct` });
 		for (const q of openQuestions) {
 			if (wl === STANDING_WORKLOAD_ID) {
 				// The orchestrator's own ask to Jo (MIGRATION.md item 105), its subject workload from the surface's subject entry.

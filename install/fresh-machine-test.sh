@@ -286,7 +286,7 @@ ok "install's last line names the four providers and the once-per-profile /login
 # the template's gates.cleanShell is "off", so no shell-start hook is dropped.
 # --print renders the base-prompt file first (voice + contract, surface/scripts/orchestrator-prompt.ts) and names it.
 AS2_PROMPT="$FAKE_HOME/.agent-system-2/orchestrator/system.md"
-PRINT_WANT="env OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(cd -P "$CLONE" && pwd -P) --append-system-prompt $AS2_PROMPT"
+PRINT_WANT="env -u AGENT_SYSTEM_AS2_LAUNCH OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator AGENT_SYSTEM_AS2_LAUNCH=1 omp --cwd $(cd -P "$CLONE" && pwd -P) --append-system-prompt $AS2_PROMPT"
 for sh in zsh bash; do
 	command -v "$sh" >/dev/null 2>&1 || die "$sh not found; the launcher is tested under zsh and bash"
 	got="$(env -i PATH="$FAKE_HOME/.local/bin:$PATH" HOME="$FAKE_HOME" "$sh" "$AS2" --print)" || die "$sh $AS2 --print exited $?"

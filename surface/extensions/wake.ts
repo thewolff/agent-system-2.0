@@ -52,11 +52,20 @@
 // wake, Jo's turn, `orchestrator_ledger`), the needs-you block (the `surface-needs-you` aside and Jo's
 // turn) and each tick line as it is queued — carries an open plan question's path beneath each line
 // naming it (surface/src/plan-paths.ts), decorated once where it is produced.
+//
+// The designated conversation and the first-turn size (PLAN wl-mv8wzipdczs2rk D1, D2, D4). An orchestrator
+// session `bin/as2` launched as Ilex (AGENT_SYSTEM_AS2_LAUNCH=1) records `orchestrator-session: <file> <id>`
+// on the standing workload at session_start and session_switch, from the file OMP allocated (it may not
+// be on disk yet; `bin/as2`'s reader checks), unless the newest pointer already names that file. Each
+// wake records one `wake-size:` entry: the prompt size of the first assistant message after the wake was
+// taken whose input + cache read + cache write is positive, or `unmeasured` when a new trigger or the
+// session's end comes first. Nothing here compacts: OMP's configured auto-compaction is the only trigger.
 import { CONTRACT_MARKER, contractPath, injectContract } from "../../gates/src/rows/r02-contract";
 import { BACK_HEADING, countLine, lineKey, NEEDS_YOU_HEADING, onFire, pendingText, present, QUIET_HEADING, surfaceWord } from "../src/batch";
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
+import { AS2_LAUNCH_ENV, controlEntries, ORCHESTRATOR_SESSION_PREFIX, WAKE_SIZE_PREFIX } from "../src/launch";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { renderWake } from "../src/render";
 import { type SurfaceSession, surfaceSession, voiceInPrompt, voiceSection, type WakeTrigger } from "../src/session";
@@ -65,6 +74,70 @@ import { type Ctx, HOLD_HOURS, type HostMessage, LEDGER_TOOL, PUSH_TRIES, STANDI
 import { launchVerdict, triggerLaunch } from "./launch";
 import { showPending } from "./surface-input";
 import { closeWorkloadWithEntry } from "./workload";
+
+const WAKE_SIZE_TAIL = "— warning only, nothing compacted";
+
+/** Record one surface control entry on the standing workload; a ledger failure is a warning, never a thrown handler. */
+function recordControl(s: SurfaceSession, ctx: Ctx, body: string): void {
+	try {
+		const ledger = s.ledger();
+		ensureStandingWorkload(ledger);
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+	} catch (err) {
+		ctx.ui.notify(`surface: could not record \`${body}\` in the ledger: ${String(err)}`, "warning");
+	}
+}
+
+/**
+ * D1's writer: on an Ilex launch (`bin/as2` set AS2_LAUNCH_ENV), point the ledger at this session's file
+ * unless the newest pointer already names it. Existence is not checked here; the reader checks it.
+ */
+function recordOrchestratorSession(s: SurfaceSession, ctx: Ctx, env: Record<string, string | undefined>): void {
+	if (env[AS2_LAUNCH_ENV] !== "1") return;
+	const file = ctx.sessionManager.getSessionFile?.();
+	if (!file) return;
+	try {
+		const ledger = s.ledger();
+		ensureStandingWorkload(ledger);
+		const newest = controlEntries(ledger.entries(STANDING_WORKLOAD_ID, "assumption")).findLast((c) => c.prefix === "orchestrator-session");
+		// The file is everything before the pointer's last space: the session id never holds one.
+		if (newest && newest.rest.slice(0, newest.rest.lastIndexOf(" ")) === file) return;
+	} catch (err) {
+		ctx.ui.notify(`surface: could not read the orchestrator-session pointer: ${String(err)}`, "warning");
+		return;
+	}
+	recordControl(s, ctx, `${ORCHESTRATOR_SESSION_PREFIX} ${file} ${ctx.sessionManager.getSessionId?.() ?? "-"}`);
+}
+
+/** The unmeasured wake recorded as such (`why`: superseded by <trigger>, or session ended), and cleared. */
+function recordUnmeasured(s: SurfaceSession, ctx: Ctx, why: string): void {
+	const w = s.unmeasured;
+	if (!w) return;
+	s.unmeasured = null;
+	recordControl(s, ctx, `${WAKE_SIZE_PREFIX} ${w.trigger} ${w.wakeId} session ${w.sessionId} unmeasured (${why} before a successful turn) ${WAKE_SIZE_TAIL}`);
+}
+
+/** A usage bucket as a token count: a positive finite number, else 0. */
+const tokens = (n: unknown): number => (typeof n === "number" && Number.isFinite(n) && n > 0 ? n : 0);
+
+/**
+ * D4's sample: the taken, unmeasured wake measured by `m` when it is an assistant message whose input + cache
+ * read + cache write is positive (a zero-usage message, a failed provider attempt, is skipped), with the share
+ * of the model's context window when OMP exposes one.
+ */
+function sampleWake(s: SurfaceSession, ctx: Ctx, m: HostMessage): void {
+	const w = s.unmeasured;
+	if (!w?.taken || m.role !== "assistant") return;
+	const input = tokens(m.usage?.input);
+	const read = tokens(m.usage?.cacheRead);
+	const write = tokens(m.usage?.cacheWrite);
+	const n = input + read + write;
+	if (n === 0) return;
+	s.unmeasured = null;
+	const window = tokens(ctx.model?.contextWindow) || tokens(ctx.getContextUsage?.()?.contextWindow);
+	const share = window > 0 ? `, ${Math.round((n / window) * 100)}% of ${window}` : "";
+	recordControl(s, ctx, `${WAKE_SIZE_PREFIX} ${w.trigger} ${w.wakeId} session ${w.sessionId} first turn ${n} prompt tokens (input ${input}, cache read ${read}, cache write ${write})${share} ${WAKE_SIZE_TAIL}`);
+}
 
 const APPLIED_HEADING = "## Applied from the surface since your last turn";
 
@@ -178,8 +251,9 @@ function renderWakeTurn(s: SurfaceSession, ctx: Ctx, trigger: WakeTrigger, ticks
 
 /**
  * Take the pending wake: clear the mark, render it, owe the read. Synchronous from the test to the
- * clear, so a push and Jo's turn cannot both take one wake. The id is the fallen-back wake's when
- * there is one, so a re-render shares its key. With `withTicks` (a push) the queued tick lines ride
+ * clear, so a push and Jo's turn cannot both take one wake. The id is the one its trigger minted (a
+ * fallen-back wake keeps it), so a re-render shares its key; the take starts the wake's size sample (D4).
+ * With `withTicks` (a push) the queued tick lines ride
  * the render, except those of a batch in flight and all of them once a batch fell back to Jo's turn.
  */
 function takeWake(s: SurfaceSession, ctx: Ctx, withTicks: boolean): { wakeId: string; trigger: WakeTrigger; text: string; carried: string[] } | null {
@@ -191,6 +265,7 @@ function takeWake(s: SurfaceSession, ctx: Ctx, withTicks: boolean): { wakeId: st
 	const carried = withTicks && !s.noticesExhausted ? without(s.tickNotices, s.noticesInFlight?.lines ?? []) : [];
 	const text = renderWakeTurn(s, ctx, trigger, carried);
 	s.owed = { trigger, since: new Date().toISOString() };
+	if (s.unmeasured) s.unmeasured.taken = true;
 	return { wakeId, trigger, text, carried };
 }
 
@@ -430,13 +505,17 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	/**
 	 * A wake trigger: a new wake with its own key and tries, superseding any earlier one, and its push
 	 * one WAKE_PUSH_MS later. The key of a superseded wake that was in flight or fell back is retired,
-	 * so the `context` guard drops the copies of it OMP's ACP branch deferred to Jo's next prompt.
+	 * so the `context` guard drops the copies of it OMP's ACP branch deferred to Jo's next prompt. A
+	 * superseded wake still unmeasured gets its `unmeasured` wake-size entry; the new one is unmeasured until sampled (D4).
 	 */
 	const triggerWake = (s: SurfaceSession, ctx: Ctx, trigger: WakeTrigger): void => {
 		const superseded = s.wakeInFlight?.wakeId ?? s.pendingWakeId;
 		if (superseded) s.retiredKeys.add(`wake:${superseded}`);
 		s.pending = trigger;
-		s.pendingWakeId = null;
+		recordUnmeasured(s, ctx, `superseded by ${trigger}`);
+		const wakeId = s.mintId();
+		s.pendingWakeId = wakeId;
+		s.unmeasured = { trigger, wakeId, sessionId: ctx.sessionManager.getSessionId?.() ?? "-", taken: false };
 		s.wakeInFlight = null;
 		s.wakeExhausted = false;
 		ctx.setTimeout(() => pushWake(s, ctx, false), s.wakePushMs);
@@ -468,7 +547,22 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				});
 			}, s.pollMs);
 		}
+		recordOrchestratorSession(s, ctx, env);
 		triggerWake(s, ctx, resumed ? "restart" : "session-start");
+		return undefined;
+	});
+
+	// D1: OMP's in-process `/new`, fork or resume puts another session in the same manager; an Ilex launch points the ledger at it.
+	pi.on("session_switch", (_e, ctx) => {
+		const s = surfaceSession(ctx, env);
+		if (s.active) recordOrchestratorSession(s, ctx, env);
+		return undefined;
+	});
+
+	// D4: a wake still unmeasured when the session ends is recorded as such.
+	pi.on("session_shutdown", (_e, ctx) => {
+		const s = surfaceSession(ctx, env);
+		if (s.active) recordUnmeasured(s, ctx, "session ended");
 		return undefined;
 	});
 
@@ -550,10 +644,12 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	// emitInputMessages) and for an aside it folds into context without a turn (agent-session.ts
 	// #foldStrandedIrcAsidesIntoContext, plan mode or after an Esc); both reach extension handlers
 	// through #emitSessionEvent → #emitExtensionEvent (OMP 18.4.4). A confirmed push leaves the
-	// in-flight record and takes exactly the tick lines it carried off the queue.
+	// in-flight record and takes exactly the tick lines it carried off the queue. An assistant message's
+	// `message_end` (pi-agent-core agent-loop.ts, a snapshot carrying `usage`) is the taken wake's size sample (D4).
 	pi.on("message_end", (event, ctx) => {
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
+		sampleWake(s, ctx, event.message);
 		const key = pushKey(event.message)?.surfaceKey;
 		if (!key) return undefined;
 		const wake = s.wakeInFlight;

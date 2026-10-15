@@ -177,6 +177,8 @@ describe("needs-you lines (§ B3, § A3, M11)", () => {
 		ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "deploy" });
 		ledger.enqueue({ by: "lane-a", workloadId: wl, sliceId: sl, sender: "lane-a", recipient: "orchestrator", body: `${ARTIFACT_FAILED_PREFIX} 1` });
 		ledger.enqueue({ by: "lane-a", workloadId: wl, sliceId: sl, sender: "lane-a", recipient: "orchestrator", body: `${ARTIFACT_FAILED_PREFIX} 2` });
+		// the held-message form: the workload-level form is left out while a question or a reserved request carries the workload (PLAN wl-mv8wzipdczs2rk D3)
+		ledger.enqueue({ by: "surface", workloadId: wl, sliceId: sl, sender: "jo", recipient: "lane-a", body: "use the token" });
 		ledger.openWorkload({ by: "surface", brief: "due:2020-01-01 overdue thing", stakes: "throwaway", mode: "autonomous" });
 		c.plusHours(5);
 		expect(errorLines(ledger, undefined, { now: c.now() }).map((l) => l.kind)).toEqual(["reserved", "held", "artifact", "question", "due"]);
@@ -515,5 +517,49 @@ describe("a lane that ended on purpose with work open and nobody holding it (MIG
 		const { wl } = endedLane(ledger);
 		const r = renderWake(ledger);
 		expect(r.text).toContain(`## needs you\n- lane lane-a on ${wl} ended (completed) with 2 open slice(s) and no question; relaunch, close, or instruct\n`);
+	});
+});
+
+describe("the workload-level held line after a lane ended (PLAN wl-mv8wzipdczs2rk D3)", () => {
+	/**
+	 * lane-a launched by the starter, claimed, released, and the runner's `lane-exit: … outcome <outcome>`;
+	 * `open` slices left open (the rest completed), `receipt` a holder's `done-because:` before the exit; then 5 h pass.
+	 */
+	function ended(outcome: string, o: { open: number; receipt?: boolean }) {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const { wl, sl } = workloadWithSlice(ledger);
+		const sl2 = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "second", doneCondition: "d", inputs: "b.ts" });
+		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-a cause first requested-by surface" });
+		expect(ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 }).won).toBe(true);
+		for (const s of [sl, sl2].slice(0, 2 - o.open)) ledger.completeSlice(s, { by: "lane-a", artifact: "bun test exit 0" });
+		if (o.receipt) ledger.recordEntry({ by: "lane-a", workloadId: wl, kind: "assumption", body: "done-because: bun test passes on the PR head" });
+		ledger.releaseWorkload(wl, { by: "lane-a", holder: "lane-a" });
+		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody("lane-a", { code: 0, signal: null, outcome }) });
+		c.plusHours(5);
+		return { wl, lines: errorLines(ledger, undefined, { now: c.now() }).map((l) => l.line) };
+	}
+
+	test("(d) intended exit with open slices: the idle line only, no held line beside it", () => {
+		const { wl, lines } = ended("completed", { open: 2 });
+		expect(lines).toEqual([`lane lane-a on ${wl} ended (completed) with 2 open slice(s) and no question; relaunch, close, or instruct`]);
+	});
+
+	test("(e) intended exit, no open slice, a holder's done-because: recorded: awaiting close, no line", () => {
+		expect(ended("completed", { open: 0, receipt: true }).lines).toEqual([]);
+	});
+
+	test("kept: intended exit (completed, and stop at the ceiling), no open slice, no done-because:: the held line", () => {
+		for (const outcome of ["completed", "stop"]) {
+			const { wl, lines } = ended(outcome, { open: 0 });
+			expect(lines).toEqual([expect.stringMatching(new RegExp(`^held 5h on ${wl}: 0 open slice\\(s\\), no lane, no activity since `))]);
+		}
+	});
+
+	test("kept: an unintended exit (open-work, error) with open slices: the held line, no idle line", () => {
+		for (const outcome of ["open-work", "error"]) {
+			const { wl, lines } = ended(outcome, { open: 2 });
+			expect(lines).toEqual([expect.stringMatching(new RegExp(`^held 5h on ${wl}: 2 open slice\\(s\\), no lane, no activity since `))]);
+		}
 	});
 });
