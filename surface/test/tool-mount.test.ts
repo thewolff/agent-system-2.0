@@ -12,12 +12,12 @@
 // receives, and none of them is in the `read xd://` device listing.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { Server } from "bun";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { WAKE_READ_TOOL as LANE_WAKE_READ_TOOL } from "../../gates/src/rows/r07-wake-read";
 import { ARTIFACT_TOOL, CLOSE_WORKLOAD_TOOL, IDENTITY_TOOL, LEDGER_TOOL, OPEN_WORKLOAD_TOOL, RECORD_INSTRUCTION_TOOL, SCHEDULE_TOOL, WAKE_READ_TOOL } from "../src/types";
+import { tmpDir } from "../../ledger/test/tmp";
 
 const REPO = resolve(import.meta.dir, "..", "..");
 const LEDGER_TOOLS = [WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, RECORD_INSTRUCTION_TOOL, LEDGER_TOOL, ARTIFACT_TOOL, LANE_WAKE_READ_TOOL];
@@ -76,7 +76,7 @@ describe.skipIf(NO_OMP)(`real omp session, tools.xdev at its default: the nine l
 			},
 		});
 
-		root = mkdtempSync(join(tmpdir(), "surface-tool-mount-"));
+		root = tmpDir("surface-tool-mount-");
 		const home = join(root, "home");
 		const cwd = join(root, "cwd");
 		mkdirSync(join(home, ".omp", "agent"), { recursive: true });

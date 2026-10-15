@@ -8,9 +8,9 @@
 // ceiling off `check`'s output (`legacy ceiling N`) rather than hardcoding it. The fixture's legacy
 // items run to 114 (54 twice), below any ceiling the tool may carry.
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { tmpDir } from "../../ledger/test/tmp";
 
 const ROOT = join(import.meta.dir, "..", "..");
 const CLI = join(ROOT, "surface", "scripts", "migration-items.ts");
@@ -96,7 +96,7 @@ function cli(w: World, cwd: string, args: string[], env?: Record<string, string>
 
 /** A bare origin whose main holds the fixture, a developer clone and a bot clone. */
 function world(): World {
-	const root = mkdtempSync(join(tmpdir(), "surface-migration-items-"));
+	const root = tmpDir("surface-migration-items-");
 	roots.push(root);
 	const env: Record<string, string> = {};
 	for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !k.startsWith("GIT_")) env[k] = v;

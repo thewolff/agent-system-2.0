@@ -7,8 +7,7 @@
  * real git repository, the crosslab harness.
  */
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, Ledger, type Stakes } from "../../ledger/src/index";
 import { SURFACE_BY } from "../../surface/src/types";
@@ -17,6 +16,7 @@ import { loadCalibration } from "../src/classify";
 import { countRounds, parseReviewRound, type ReviewRoundEntry } from "../src/rounds";
 import { tierTableFromConfig } from "../src/tier-table";
 import { currentModel, DEFAULT_LANE_MODEL, dist, type FakeRegistry, fakeRegistry, recordedQuestion } from "./helpers";
+import { tmpDir } from "../../ledger/test/tmp";
 
 const ROWS = {
 	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna", "moonshot/kimi-k2.7-code-highspeed"],
@@ -62,7 +62,7 @@ interface World {
 
 /** A workload on a temp ledger, the lane's repository, its session file, and a mutable registry. */
 function world(opts: { stakes?: Stakes } = {}): World {
-	const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "review-defects-"));
+	const dir = tmpDir("review-defects-");
 	dirs.push(dir);
 	const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backup: false });
 	const wl = ledger.openWorkload({ id: "wl-defects", brief: "review defects test", stakes: opts.stakes ?? "normal", mode: "autonomous", by: "orch-test" });

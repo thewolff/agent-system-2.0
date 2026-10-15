@@ -1,15 +1,15 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 // Only names that also existed before the N1-N4 fixes, so each regression below fails on its own
 // assertion against the old module rather than the whole file failing to load.
 import { assertLocalPath, defaultLedgerPath, Ledger, LEDGER_DB_ENV, LedgerLocationError, SCHEMA_VERSION } from "../src/index";
+import { tmpDir } from "./tmp";
 
 const REPO = join(import.meta.dir, "..", "..");
 const SQLITE3 = existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
-const scratch = (label: string) => mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), `ledger-${label}-`));
+const scratch = (label: string) => tmpDir(`ledger-${label}-`);
 const fresh = (label: string, opts: Parameters<typeof Ledger.open>[1] = {}) =>
 	Ledger.open(join(scratch(label), "ledger.db"), { create: true, ...opts });
 

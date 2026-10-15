@@ -4,8 +4,7 @@
  * on a fake OMP host with a real temp ledger and a real git repository, the crosslab harness.
  */
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CLASSIFIER_BY, LANE_RUNNER_BY, Ledger, type Stakes } from "../../ledger/src/index";
 import { JO_HOLDER, laneExitBody, laneStartedBody } from "../../surface/src/launch";
@@ -17,6 +16,7 @@ import { laneBuilderBody } from "../src/lab";
 import { countRounds, parseReviewRound, reviewLoopEndBody, reviewRoundsBody, roundsInstructionBody } from "../src/rounds";
 import { tierTableFromConfig } from "../src/tier-table";
 import { currentModel, DEFAULT_LANE_MODEL, dist, type FakeRegistry, fakeRegistry, recordedQuestion } from "./helpers";
+import { tmpDir } from "../../ledger/test/tmp";
 
 const ROWS = {
 	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna", "moonshot/kimi-k2.7-code-highspeed"],
@@ -87,7 +87,7 @@ interface World {
 }
 /** `started: false`: lane A (lane-test) has no start record. */
 function world(opts: { stakes?: Stakes; started?: boolean } = {}): World {
-	const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "snapshot-settle-"));
+	const dir = tmpDir("snapshot-settle-");
 	dirs.push(dir);
 	const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backup: false });
 	const wl = ledger.openWorkload({ id: "wl-snap", brief: "snapshot settle test", stakes: opts.stakes ?? "normal", mode: "autonomous", by: "orch-test" });

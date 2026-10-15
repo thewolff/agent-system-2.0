@@ -3,10 +3,10 @@
  * check 2): every change a `bash` write can make to the work moves it, and taking it writes nothing.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, lstatSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, lstatSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { repoFingerprint } from "../src/fingerprint";
+import { tmpDir } from "../../ledger/test/tmp";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -30,7 +30,7 @@ function git(cwd: string, ...args: string[]): string {
 
 /** A repository with one commit: a.txt, a script, a symlink, and an ignored file. */
 function scratchRepo(): string {
-	const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "fingerprint-"));
+	const dir = tmpDir("fingerprint-");
 	dirs.push(dir);
 	git(dir, "init", "-q");
 	writeFileSync(join(dir, "a.txt"), "one\n");
@@ -170,7 +170,7 @@ describe("repoFingerprint", () => {
 	});
 
 	test("a directory that is no repository throws, so a caller fails closed", () => {
-		const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "fingerprint-none-"));
+		const dir = tmpDir("fingerprint-none-");
 		dirs.push(dir);
 		expect(() => repoFingerprint(dir)).toThrow(/rev-parse --show-toplevel/);
 	});

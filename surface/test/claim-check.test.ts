@@ -8,8 +8,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	checkSession,
@@ -28,6 +27,7 @@ import {
 	symbolsIn,
 	unwrapCommand,
 } from "../scripts/claim-check";
+import { tmpDir } from "../../ledger/test/tmp";
 
 const SCRIPT = join(import.meta.dir, "..", "scripts", "claim-check.ts");
 const FIXTURES = join(import.meta.dir, "fixtures", "claim-check");
@@ -752,7 +752,7 @@ function fingerprint(root: string): string[] {
 }
 
 function replayRoot(): { tmp: string; root: string } {
-	const tmp = mkdtempSync(join(tmpdir(), "claim-check-replay-"));
+	const tmp = tmpDir("claim-check-replay-");
 	const root = join(tmp, "lanes", "wl-test", "sessions");
 	mkdirSync(join(root, "2026-a"), { recursive: true });
 	const lane = new Transcript().edit("lane-ed1", "src/a.ts").bash("lane-b1", "bun test", " 3 pass\n 1 fail").doneBecause("lane-d1", "All tests pass.").text("Released.").toString();

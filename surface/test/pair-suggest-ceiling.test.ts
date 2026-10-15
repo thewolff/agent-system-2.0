@@ -11,14 +11,14 @@
 // Regression: the offering cases fail on 946c016 by assertion (no `pair` option, no `pair:` line, no `pair-offer:`).
 // C alone and switch off are guards that pass there too.
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CLASSIFIER_BY, LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
 import { type Ceiling, CEILING_OPTIONS, ceilingQuestionBody, type Spend } from "../src/ceiling";
 import { SURFACE_BY } from "../src/types";
 import { raiseCeilingQuestion } from "../scripts/lane";
 import { tempLedger, workloadWithSlice } from "./helpers";
+import { tmpDir } from "../../ledger/test/tmp";
 
 const NORMAL: Ceiling = { usd: 50, wallMin: 360 };
 const SPEND: Spend = { usd: 40, tokens: 1000, wallMin: 30 };
@@ -31,7 +31,7 @@ let agentDir = "";
 let home = "";
 
 beforeAll(() => {
-	home = mkdtempSync(join(tmpdir(), "pair-ceiling-home-"));
+	home = tmpDir("pair-ceiling-home-");
 	agentDir = join(home, ".omp", "profiles", PROFILE, "agent");
 	mkdirSync(agentDir, { recursive: true });
 	process.env.HOME = home;

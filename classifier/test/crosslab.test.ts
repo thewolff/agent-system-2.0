@@ -7,8 +7,7 @@
  * (D10) wired test lists.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { checkBriefFields } from "../../gates/src/rows/r05-brief-fields";
 import { LANE_RUNNER_BY, Ledger, type Stakes } from "../../ledger/src/index";
@@ -21,6 +20,7 @@ import { tierTableFromConfig, type TierTable } from "../src/tier-table";
 import { JO_HOLDER } from "../../surface/src/launch";
 import { SURFACE_BY } from "../../surface/src/types";
 import { asyncDelivery, currentModel, DEFAULT_LANE_MODEL, dist, fakeRegistry, recordedQuestion } from "./helpers";
+import { tmpDir } from "../../ledger/test/tmp";
 
 const ROWS = {
 	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna", "moonshot/kimi-k2.7-code-highspeed"],
@@ -58,7 +58,7 @@ function git(cwd: string, ...args: string[]): void {
  * `creds` lists the credentialed models (edit it to take a lab down or bring it back).
  */
 function world(opts: { stakes?: Stakes; slices?: string[]; table?: TierTable; laneStarted?: boolean } = {}) {
-	const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "crosslab-"));
+	const dir = tmpDir("crosslab-");
 	dirs.push(dir);
 	const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backup: false });
 	const wl = ledger.openWorkload({ id: "wl-cross", brief: "crosslab test", stakes: opts.stakes ?? "normal", mode: "autonomous", by: "orch-test" });

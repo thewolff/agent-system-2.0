@@ -6,8 +6,7 @@
  * does, and imports only modules that predate the rule, so this file also runs on the baseline.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger, type Stakes } from "../../ledger/src/index";
 import { laneModelBody } from "../../surface/src/launch";
@@ -16,6 +15,7 @@ import { createClassifierExtension } from "../extension";
 import { loadCalibration } from "../src/classify";
 import { tierTableFromConfig, type TierTable } from "../src/tier-table";
 import { asyncDelivery, dist, fakeRegistry, recordedQuestion } from "./helpers";
+import { tmpDir } from "../../ledger/test/tmp";
 
 const ROWS = {
 	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna", "moonshot/kimi-k2.7-code-highspeed"],
@@ -53,7 +53,7 @@ afterEach(() => {
 
 /** A workload on a temp ledger, the lane's session file on disk, and a registry whose credentialed list (`creds`) the test edits. */
 function world(opts: { stakes?: Stakes; table?: TierTable; available?: string[]; sessionless?: string[] } = {}) {
-	const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "lane-lab-"));
+	const dir = tmpDir("lane-lab-");
 	dirs.push(dir);
 	const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backup: false });
 	const wl = ledger.openWorkload({ id: "wl-lanelab", brief: "lane lab test", stakes: opts.stakes ?? "normal", mode: "autonomous", by: "orch-test" });

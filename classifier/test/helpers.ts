@@ -1,7 +1,7 @@
-import { mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
+import { tmpDir } from "../../ledger/test/tmp";
 import { createClassifierExtension } from "../extension";
 import { type Calibration, type KindQuestion, loadCalibration, loadKindQuestion } from "../src/classify";
 import type { TierTable } from "../src/tier-table";
@@ -96,7 +96,8 @@ export function fakeRegistry(available: string[], credentialed: string[] = avail
 
 /** A real schema-v5 ledger in a scratch directory with one open workload and the named slices. */
 export function scratchLedger(slices: string[] = ["sl-one", "sl-two"], workloadId = "wl-abc123") {
-	const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "classifier-ledger-"));
+	// tmpDir puts it in a watched run root: under LEDGER_TEST_TMP when that is set, else this run's own.
+	const dir = tmpDir("classifier-ledger-");
 	const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backup: false });
 	ledger.openWorkload({ id: workloadId, brief: "classifier test", stakes: "normal", mode: "autonomous", by: "orch-test" });
 	for (const id of slices) ledger.addSlice({ id, workloadId, task: id, doneCondition: "d", inputs: "i", by: "lane-test" });

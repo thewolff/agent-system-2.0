@@ -7,8 +7,7 @@
 // surface/test/launch.test.ts).
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { Ctx } from "../src/session";
 import {
@@ -22,7 +21,7 @@ import {
 	type ShellStartHost,
 	shellStart,
 } from "../src/shell-start";
-import { environOf, type ShellStartOver, shellStartFixture } from "./helpers";
+import { environOf, type ShellStartOver, shellStartFixture, tmp } from "./helpers";
 
 const REPO = resolve(import.meta.dir, "..", "..");
 const OMP = "/Users/jowolff/.bun/install/global/node_modules/@oh-my-pi";
@@ -278,7 +277,7 @@ describe.skipIf(!HAS_OMP)("ACP is read the way OMP's own CLI reads its argv", ()
 describe("bin/as2 drops exactly SHELL_START_HOOK_NAMES only where the clean shell is on for the orchestrator, and sets no PI_NO_PTY (revision 8: no global change)", () => {
 	/** `bin/as2 --print` under a scratch HOME whose installed profile config is `config` (null: none). */
 	const print = (config: string | null): string => {
-		const home = mkdtempSync(join(tmpdir(), "as2-print-"));
+		const home = tmp("print");
 		if (config !== null) {
 			const agentDir = join(home, ".omp", "profiles", "agent-system-2", "agent");
 			mkdirSync(agentDir, { recursive: true });

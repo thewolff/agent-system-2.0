@@ -1165,6 +1165,15 @@ tiers/test/bunfig.toml	test	-
 ledger/test/isolate-preload.ts	test	-
 ledger/test/live-ledger-guard.test.ts	test	-
 ledger/test/fixtures/live-guard/reach.fixture.ts	test	-
+# Watched test temp roots (wl-mv8mof9kktbh1c): the preload's tmp.ts and its regression test with fixtures.
+ledger/test/tmp.ts	test	-
+ledger/test/tmp-cleanup.test.ts	test	-
+ledger/test/fixtures/tmp-cleanup/io.ts	test	-
+ledger/test/fixtures/tmp-cleanup/inline.fixture.ts	test	-
+ledger/test/fixtures/tmp-cleanup/import-only.ts	test	-
+ledger/test/fixtures/tmp-cleanup/nested.fixture.ts	test	-
+ledger/test/fixtures/tmp-cleanup/scratch-ledger.fixture.ts	test	-
+ledger/test/fixtures/tmp-cleanup/swap.fixture.ts	test	-
 surface/src/pending.ts	module	-
 surface/src/batch.ts	module	-
 surface/test/pending.test.ts	test	-

@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { tmpDir } from "../../ledger/test/tmp";
 import type { FenceSettings, FenceTarget, ShellStartCheck } from "../src/fence";
 import type { Ctx, GatesAPI } from "../src/session";
 import { CERTIFIED } from "./helpers";
@@ -73,7 +73,7 @@ export async function runProbe(
 	fence: FenceModule,
 	expected: { row: number } | { stdout: string } | { landing: true },
 ): Promise<Outcome> {
-	const root = mkdtempSync(join(tmpdir(), "as2-probe-"));
+	const root = tmpDir("as2-probe-");
 	try {
 		const home = join(root, "home");
 		const origin = join(root, "origin.git");

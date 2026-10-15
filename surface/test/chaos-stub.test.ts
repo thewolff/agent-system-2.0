@@ -10,12 +10,12 @@
 // Plus the stub's stall / blackhole / reset mechanics in-process, and the proxy's parsing.
 // Skipped when omp is not on PATH. Keys are the literal chaos-stub and fake strings; no credential is read.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { parseHead, type Proxy, startProxy } from "../scripts/chaos-proxy";
 import { installedRoleIds, ROLE_IDS, REFUSAL_EXPLANATION, type Stub, type StubProfile, type StubScript, startStub, writeStubProfile } from "../scripts/chaos-stub";
+import { tmpDir } from "../../ledger/test/tmp";
 
 const REPO = join(import.meta.dir, "..", "..");
 const STUB_SCRIPT = join(REPO, "surface", "scripts", "chaos-stub.ts");
@@ -74,7 +74,7 @@ describe.skipIf(OMP === null)("chaos stub and proxy against the installed omp", 
 	let profile: StubProfile;
 
 	beforeAll(() => {
-		root = realpathSync(mkdtempSync(join(tmpdir(), "chaos-stub-")));
+		root = realpathSync(tmpDir("chaos-stub-"));
 		home = join(root, "home");
 		cwd = join(root, "work");
 		mkdirSync(cwd, { recursive: true });

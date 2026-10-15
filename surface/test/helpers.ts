@@ -3,15 +3,15 @@
 // gates/test/extension.test.ts so the two extensions are driven the same way), a workload with
 // one slice, and the scratch root the lane script's process tests run in (the fake omp on PATH,
 // a temp HOME with the profile config and the ledger, a temp git repo with a bare remote).
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
+import { tmpDir } from "../../ledger/test/tmp";
 import { type ControlEntry, controlEntries, holdersOf, laneStarted } from "../src/launch";
 import { laneDeaths } from "../src/signals";
 import type { SurfaceAPI } from "../src/types";
 
-export const tmp = (tag: string): string => mkdtempSync(join(tmpdir(), `surface-${tag}-`));
+export const tmp = (tag: string): string => tmpDir(`surface-${tag}-`);
 
 /** A settable clock: `at(iso)` moves it; every ledger write stamps the current value. */
 export function clock(start = "2026-10-01T10:00:00.000Z"): { now: () => string; at: (iso: string) => void; plusHours: (h: number) => void } {

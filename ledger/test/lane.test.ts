@@ -3,13 +3,12 @@
 // The policy here is a stand-in for the surface's predicate (that one is tested against
 // `reserveLane` in surface/test/launch.test.ts); these tests are about what the transaction does.
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, type ReserveRows, type ReserveVerdict } from "../src/index";
+import { tmpDir } from "./tmp";
 
 const REPO = join(import.meta.dir, "..", "..");
-const scratch = (label: string) => mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), `lane-${label}-`));
+const scratch = (label: string) => tmpDir(`lane-${label}-`);
 const fresh = (label: string) => {
 	const path = join(scratch(label), "ledger.db");
 	return { path, ledger: Ledger.open(path, { create: true }) };

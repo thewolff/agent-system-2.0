@@ -6,12 +6,12 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { BACKUP_SOURCE_FILE, backupNamespace, canonicalPath, Ledger, LiveLedgerUnderTestError } from "../../ledger/src/index";
 import { assertOwnedOnly, BACKUP_NAME, diffLines, diffReport, FIXTURE_DIR, GOLDEN_PATH, readManifest, refreeze, replayFixture, replaySnapshot, TIER_CONFIG_PATH, updateGolden } from "../scripts/ledger-replay";
 import { labOf } from "../src/lab";
 import { loadTierTable } from "../src/tier-table";
+import { tmpDir } from "../../ledger/test/tmp";
 
 test("the ledger replay matches golden.txt line for line", () => {
 	const names = readManifest().snapshots.map((s) => s.name);
@@ -60,7 +60,7 @@ function syntheticFixture(root: string): string {
 }
 
 test("refreeze refuses a fixture dir holding a .db.gz its manifest does not list, naming it, and changes nothing", () => {
-	const root = mkdtempSync(join(tmpdir(), "ledger-replay-owned-"));
+	const root = tmpDir("ledger-replay-owned-");
 	try {
 		const live = syntheticLive(root, 1);
 		const dir = syntheticFixture(root);
@@ -76,7 +76,7 @@ test("refreeze refuses a fixture dir holding a .db.gz its manifest does not list
 }, 60_000);
 
 test("refreeze refuses on coverage when the live ledger has no workload and no backups, and changes nothing", () => {
-	const root = mkdtempSync(join(tmpdir(), "ledger-replay-coverage-"));
+	const root = tmpDir("ledger-replay-coverage-");
 	try {
 		const live = syntheticLive(root, 0);
 		const dir = syntheticFixture(root);
@@ -90,7 +90,7 @@ test("refreeze refuses on coverage when the live ledger has no workload and no b
 }, 60_000);
 
 test("refreeze refuses a backup SOURCE or a backup copy linked into a live root before reading it (Guard A, MIGRATION.md item 114)", () => {
-	const root = mkdtempSync(join(tmpdir(), "ledger-replay-live-link-"));
+	const root = tmpDir("ledger-replay-live-link-");
 	const was = process.env.AS2_TEST_LIVE_ROOTS;
 	try {
 		const liveRoot = join(root, "marked-live");
@@ -119,7 +119,7 @@ test("refreeze refuses a backup SOURCE or a backup copy linked into a live root 
 }, 60_000);
 
 test("refreeze keeps and reports a file that appears in the old fixture after its ownership check, and removes only what it owns", () => {
-	const root = mkdtempSync(join(tmpdir(), "ledger-replay-swap-"));
+	const root = tmpDir("ledger-replay-swap-");
 	try {
 		const live = syntheticLive(root, 1);
 		const dir = syntheticFixture(root);
@@ -142,7 +142,7 @@ test("refreeze keeps and reports a file that appears in the old fixture after it
 }, 60_000);
 
 test("the BACKUP_NAME mirror matches a copy the ledger's backupIfDue writes, and refreeze takes that copy", () => {
-	const root = mkdtempSync(join(tmpdir(), "ledger-replay-backup-name-"));
+	const root = tmpDir("ledger-replay-backup-name-");
 	try {
 		// The ledger's own scheduled copy, in its default backups dir beside a live ledger under root.
 		const live = canonicalPath(join(root, "live", "ledger.db"));
@@ -175,7 +175,7 @@ test("the BACKUP_NAME mirror matches a copy the ledger's backupIfDue writes, and
 }, 60_000);
 
 test("assertOwnedOnly returns the names it owns, and refuses a subdirectory, an unparsable manifest, and entries with no manifest", () => {
-	const dir = mkdtempSync(join(tmpdir(), "ledger-replay-owned-"));
+	const dir = tmpDir("ledger-replay-owned-");
 	try {
 		writeFileSync(join(dir, "manifest.json"), JSON.stringify({ refrozenAt: "2026-10-11T00:00:00.000Z", snapshots: [{ name: "a", file: "a.db.gz" }] }));
 		writeFileSync(join(dir, "a.db.gz"), "a");
@@ -201,7 +201,7 @@ test("assertOwnedOnly returns the names it owns, and refuses a subdirectory, an 
 });
 
 test("--update refuses, naming it, when one manifest snapshot replays to no line, and writes no golden.txt", () => {
-	const dir = mkdtempSync(join(tmpdir(), "ledger-replay-update-"));
+	const dir = tmpDir("ledger-replay-update-");
 	try {
 		// One real snapshot (it has workloads) and an empty ledger built here (it has none).
 		const real = readManifest().snapshots[0]!;
@@ -222,7 +222,7 @@ test("--update refuses, naming it, when one manifest snapshot replays to no line
 }, 60_000);
 
 test("a production review replays on the deep row with its OpenAI entry from the strong row (Jo, in-mv5qfm8910ycjk): with no strong OpenAI entry the openai lab drops out", () => {
-	const dir = mkdtempSync(join(tmpdir(), "ledger-replay-review-row-"));
+	const dir = tmpDir("ledger-replay-review-row-");
 	try {
 		const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backupOnOpen: false, backup: false, skipLocalityCheck: true });
 		try {

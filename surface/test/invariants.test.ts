@@ -8,8 +8,7 @@
 // its origin; and the CLI (--json, --reviews, a bad argument, the checked-in fixture from the repo).
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { copyFileSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
 import { backupNamespace, copyProblem, Ledger } from "../../ledger/src/index";
@@ -18,11 +17,12 @@ import { laneExitBody } from "../src/launch";
 import { reservedStates } from "../src/errors";
 import { BACKUP_GAP_MS, check, gitIn, type Git, type Input, jsonLines, newestWrite, orchestratorsFromPs, parseArgs, type Probe, type PsDeps, renderTable, type Report, reservedView, reviewsLine, type Run } from "../scripts/invariants";
 import { AS_OF, buildFixture, LANE_RUNNER } from "./fixtures/invariants/build";
+import { tmpDir } from "../../ledger/test/tmp";
 
 const SCRIPT = join(import.meta.dir, "..", "scripts", "invariants.ts");
 const CHECKED_IN = join(import.meta.dir, "fixtures", "invariants", "ledger.db");
 
-const tmp = (tag: string) => mkdtempSync(join(tmpdir(), `invariants-${tag}-`));
+const tmp = (tag: string) => tmpDir(`invariants-${tag}-`);
 const fixture = buildFixture(join(tmp("ledger"), "ledger.db"));
 const db = new Database(fixture.path, { readonly: true });
 /** A backup directory holding complete copies of the fixture ledger named like the job's copies: stale-backup reads a copy's time from its name and counts it only if copyProblem accepts it. */

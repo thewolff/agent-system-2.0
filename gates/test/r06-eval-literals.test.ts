@@ -9,13 +9,13 @@
 // code still reads the path as a script), a reserved spelling in a non-spawning literal, and a
 // quoted-word form in Bun's shell tag still refuse.
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { checkReserved, reservedAction } from "../src/rows/r06-reserved";
 import type { CallContext } from "../src/types";
+import { tmpDir } from "../../ledger/test/tmp";
 
-const dir = mkdtempSync(join(tmpdir(), "gates-r06-eval-literals-"));
+const dir = tmpDir("gates-r06-eval-literals-");
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 const mig = join(dir, "MIGRATION.md");
 // MIGRATION.md line 49 at cc34784^, the text the 17:56Z hold matched.

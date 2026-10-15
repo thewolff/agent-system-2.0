@@ -6,8 +6,7 @@
 // texts kept), so the test needs nothing outside the repository.
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { wrapCommand } from "../src/fence";
 import { checkToolCall } from "../src/gates";
@@ -15,6 +14,7 @@ import type { Refusal } from "../src/types";
 import {
 	type Check, classify, collectCalls, exitCode, isHandTranscript, jsonLines, liveEvidence, main, parseSession, renderExamples, renderTable, replay, replayInput, ROWS, rowOf, toolEventInput,
 } from "../scripts/guard-replay";
+import { tmpDir } from "../../ledger/test/tmp";
 
 const FIXTURES = join(import.meta.dir, "fixtures", "guard-replay");
 const SCRIPT = join(import.meta.dir, "..", "scripts", "guard-replay.ts");
@@ -25,7 +25,7 @@ const corpus = () => collectCalls([FIXTURES], 0);
 
 /** A one-session transcript on disk, for the CLI. */
 function transcript(lines: Record<string, unknown>[]): string {
-	const root = mkdtempSync(join(tmpdir(), "guard-replay-"));
+	const root = tmpDir("guard-replay-");
 	writeFileSync(join(root, "s.jsonl"), `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
 	return root;
 }

@@ -6,14 +6,14 @@
 // code's unreadable launches (D2), the respelling text (D3) and row 10's precedence (D1 (f)).
 // Every probe is inert: the gate only reads the strings; nothing here runs a process.
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { checkToolCall } from "../src/gates";
 import { checkReserved, reservedAction } from "../src/rows/r06-reserved";
 import type { CallContext, Refusal } from "../src/types";
+import { tmpDir } from "../../ledger/test/tmp";
 
-const dir = mkdtempSync(join(tmpdir(), "gates-r06-eval-process-"));
+const dir = tmpDir("gates-r06-eval-process-");
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 writeFileSync(join(dir, "a.py"), 'import subprocess; subprocess.run(["git","status"])\n');
 writeFileSync(join(dir, "b.py"), 'c = "kubectl delete deployment app"; print(c)\n');

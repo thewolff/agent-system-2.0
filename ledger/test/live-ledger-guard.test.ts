@@ -11,9 +11,9 @@ import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { backupNamespace, Ledger, LiveLedgerUnderTestError, SCHEMA_VERSION } from "../src/index";
+import { tmpDir } from "./tmp";
 
 const REPO = join(import.meta.dir, "..", "..");
 const FIXTURE = join(import.meta.dir, "fixtures", "live-guard", "reach.fixture.ts");
@@ -68,7 +68,7 @@ function runFixture(cwd: string, extra: Record<string, string>): { exitCode: num
 }
 
 beforeAll(() => {
-	scratch = mkdtempSync(join(tmpdir(), "live-guard-"));
+	scratch = tmpDir("live-guard-");
 	home = join(scratch, "sentinel-home");
 	liveDir = join(home, ".agent-system-2");
 	liveDb = join(liveDir, "ledger.db");

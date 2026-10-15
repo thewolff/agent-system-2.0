@@ -24,13 +24,16 @@ import { testRequestedBody } from "../src/test-run";
 import { releasedOpen } from "../src/turn-end";
 import { recordRepo } from "../src/decision-log";
 import { LANE_FULL_TEST_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
+import { tmpDir } from "../../ledger/test/tmp";
+import { ctxOf, fakePi, notices, tempLedger } from "./helpers";
 
 const LANE_MODEL = "anthropic/claude-opus-5-5";
 const OTHER_LAB = "openai-codex/gpt-6-astra";
 
 // PLAN wl-muq22rnjcfrrpc D7: the plan file and the review verdict a plan question names are real files.
-const PLAN_DIR = tmp("plan");
+// Under /tmp, not TMPDIR: the review line carries the verdict path and must stay within D7's 160
+// characters whatever this machine's TMPDIR is.
+const PLAN_DIR = tmpDir("plan-", "/tmp");
 const PLAN_FILE = join(PLAN_DIR, "PLAN.md");
 const VERDICT_FILE = join(PLAN_DIR, "PLAN-REVIEW-r1.md");
 writeFileSync(PLAN_FILE, "# PLAN\n");

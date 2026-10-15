@@ -927,6 +927,8 @@ export interface Fixture {
  * One test file's scratch root (short: a broker's socket path lives under it), fence setup and stub.
  * The only skip is no omp on PATH. With omp there, a fence that cannot be set up throws here, so the
  * file fails at load instead of passing with every session skipped (review r1 finding 4).
+ * The root stays in /tmp rather than a watched run root (ledger/test/tmp.ts): a broker's socket here is
+ * about 90 characters, and a run root's 30 more would pass the 104-byte sun_path limit. close() removes it.
  */
 export function fixture(): Fixture {
 	const root = mkdtempSync("/tmp/ss-");

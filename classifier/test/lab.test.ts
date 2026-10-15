@@ -5,8 +5,7 @@
  * whose lane exited or was replaced before it settled counts only the models in its session file.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	type BuilderLedgerView,
@@ -25,6 +24,7 @@ import { route } from "../src/route";
 import { LANE_RUNNER_BY, LANE_STARTER_BY } from "../../ledger/src/index";
 import { SURFACE_BY } from "../../surface/src/types";
 import { dist } from "./helpers";
+import { tmpDir } from "../../ledger/test/tmp";
 
 const STRONG = ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "moonshot/kimi-k2.7-code"];
 const AT = "2026-10-11T10:00:00.000Z";
@@ -147,7 +147,7 @@ describe("D3: who built the work, from the ledger", () => {
 
 // ---- PLAN wl-mv45jcsi4h3nr4: dead hands ------------------------------------------------------
 
-const dir = mkdtempSync(join(tmpdir(), "as2-dead-hands-"));
+const dir = tmpDir("as2-dead-hands-");
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 let roots = 0;
 const freshRoot = () => {

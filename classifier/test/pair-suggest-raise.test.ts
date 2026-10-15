@@ -13,8 +13,7 @@
  * switch-off, missing-config, throwaway, user-driven and forged-signal cases are guards that pass there too.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CLASSIFIER_BY, Ledger, type Mode, type Stakes } from "../../ledger/src/index";
 import { JO_HOLDER } from "../../surface/src/launch";
@@ -26,6 +25,7 @@ import {
 } from "../src/rounds";
 import { tierTableFromConfig } from "../src/tier-table";
 import { dist, fakeRegistry, recordedQuestion } from "./helpers";
+import { tmpDir } from "../../ledger/test/tmp";
 
 const ROWS = {
 	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna", "moonshot/kimi-k2.7-code-highspeed"],
@@ -57,7 +57,7 @@ let agentDir = "";
 const dirs: string[] = [];
 
 beforeAll(() => {
-	const home = mkdtempSync(join(tmpdir(), "pair-raise-home-"));
+	const home = tmpDir("pair-raise-home-");
 	dirs.push(home);
 	agentDir = join(home, ".omp", "profiles", PROFILE, "agent");
 	mkdirSync(agentDir, { recursive: true });
@@ -99,7 +99,7 @@ interface World {
 }
 
 function world(opts: { stakes?: Stakes; mode?: Mode } = {}): World {
-	const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "pair-raise-"));
+	const dir = tmpDir("pair-raise-");
 	dirs.push(dir);
 	const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backup: false });
 	const wl = ledger.openWorkload({ id: `wl-pairraise${++seq}`, brief: "Restyle the settings modal", stakes: opts.stakes ?? "normal", mode: opts.mode ?? "autonomous", by: "orch-test" });

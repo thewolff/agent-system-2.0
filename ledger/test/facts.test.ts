@@ -1,12 +1,12 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Ledger, LedgerSchemaVersionError } from "../src/index";
+import { tmpDir } from "./tmp";
 
 // Synthetic facts only, in the live row shape (MIGRATION.md row M8); no live ledger is opened.
-const scratch = (label: string) => mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), `ledger-${label}-`));
+const scratch = (label: string) => tmpDir(`ledger-${label}-`);
 /** A settable clock, so created_at is known and can run against insertion order. */
 function settable(start = "2026-10-01T10:00:00.000Z") {
 	let t = start;

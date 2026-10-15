@@ -3,12 +3,12 @@
  * which candidate files are read, the window on a file's session header, and what counts as an answer.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type HandSessionQuery, handSessionModels } from "../src/hand-session";
+import { tmpDir } from "../../ledger/test/tmp";
 
-const dir = mkdtempSync(join(tmpdir(), "as2-hand-session-"));
+const dir = tmpDir("as2-hand-session-");
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 let roots = 0;
 const freshRoot = () => {

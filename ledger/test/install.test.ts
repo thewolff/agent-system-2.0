@@ -11,9 +11,9 @@
 // with "Could not find service" counts as absent, and a missing launchctl, any other print failure
 // or a failed bootout exits 1 with the plist kept.
 import { beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { tmpDir } from "./tmp";
 
 const REPO = join(import.meta.dir, "..", "..");
 const T = "\t";
@@ -56,7 +56,7 @@ function manifestWith(...pairs: [string, string][]): void {
 const MANIFEST_DIRS = ["ledger", "install", "profile", "tiers", "classifier", "gates", "skills", "bin", "surface", "contract", "voice"];
 
 beforeAll(() => {
-	root = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "ledger-install-"));
+	root = tmpDir("ledger-install-");
 	copy = join(root, "repo");
 	for (const dir of MANIFEST_DIRS) cpSync(join(REPO, dir), join(copy, dir), { recursive: true });
 	for (const d of MANIFEST_DIRS) {

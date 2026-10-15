@@ -2,10 +2,10 @@
 // module in the path (the CLI's connection runs foreign_keys=0, like any foreign tool).
 // Mirrors the prototype's ledger-lifecycle/sqlite/logs/11-foreign-write.log.
 import { beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../src/index";
+import { tmpDir } from "./tmp";
 
 const SQLITE3 = process.env.SQLITE3 ?? (existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3");
 const NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
@@ -27,7 +27,7 @@ function snapshot(): string {
 }
 
 beforeAll(() => {
-	const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "ledger-raw-"));
+	const dir = tmpDir("ledger-raw-");
 	dbPath = join(dir, "ledger.db");
 	const l = Ledger.open(dbPath, { create: true });
 	const by = "orch-1";

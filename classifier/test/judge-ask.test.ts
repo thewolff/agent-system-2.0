@@ -15,8 +15,7 @@
 // `$HOME/.omp/profiles/<profile>/agent/config.yml` with `PI_CODING_AGENT_DIR` at the same directory (as
 // pair-suggest-raise.test.ts).
 import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CLASSIFIER_BY, Ledger } from "../../ledger/src/index";
 import { CEILING_OPTIONS } from "../../surface/src/ceiling";
@@ -24,6 +23,7 @@ import { raiseCeilingQuestion } from "../../surface/scripts/lane";
 import { askChoices } from "../src/judge-ask";
 import { tierTableFromConfig } from "../src/tier-table";
 import { extensionHost, fakeRegistry } from "./helpers";
+import { tmpDir } from "../../ledger/test/tmp";
 
 const QUESTIONS = JSON.parse(readFileSync(join(import.meta.dir, "..", "pair-signal-question.json"), "utf8"));
 
@@ -36,7 +36,7 @@ let home = "";
 const dirs: string[] = [];
 
 beforeAll(() => {
-	home = mkdtempSync(join(tmpdir(), "judge-ask-home-"));
+	home = tmpDir("judge-ask-home-");
 	agentDir = join(home, ".omp", "profiles", PROFILE, "agent");
 	mkdirSync(agentDir, { recursive: true });
 	process.env.HOME = home;
@@ -197,7 +197,7 @@ let seq = 0;
 
 /** A fresh ledger with one autonomous normal-stakes workload (a unique id: the attempt map is per workload) and one done slice. */
 function workload(): { ledger: Ledger; wl: string } {
-	const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "judge-ask-"));
+	const dir = tmpDir("judge-ask-");
 	dirs.push(dir);
 	const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backup: false });
 	const wl = `wl-jask${++seq}${Date.now().toString(36)}`;
