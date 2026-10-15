@@ -12,7 +12,7 @@ import { LANE_RUNNER_BY, Ledger, type QuestionRow } from "../../ledger/src/index
 import { ceilingBody } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
 import { doneBody, exitClass, laneExit, laneModelBody, laneStarted, verdictOf } from "../src/launch";
-import { SURFACE_BY } from "../src/types";
+import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { alive, type FakeScript, type FakeStep, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, sh, until } from "./helpers";
 
 const A = "anthropic/claude-opus-5-5";
@@ -139,7 +139,7 @@ describe("T1–T3: the runner starts on Jo's model and keeps the session only on
 		// Jo's request with no model lands without a launch (the surface's exec did not run it): the tick's predicate finds it launchable.
 		request(r, wl);
 		const l = ledgerOf(r);
-		const verdict = verdictOf(l.launchRows(wl, 3)!);
+		const verdict = verdictOf(l.launchRows(wl, 3, STANDING_WORKLOAD_ID)!);
 		l.close();
 		expect(verdict).toMatchObject({ launch: true, cause: { kind: "request" } });
 		launch(r, wl, { steps: DONE }, "tick");

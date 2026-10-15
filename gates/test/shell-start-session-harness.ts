@@ -41,6 +41,7 @@ import { userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { laneEnv } from "../../surface/src/launch";
+import { STANDING_WORKLOAD_ID } from "../../surface/src/types";
 import { type FenceTarget, fenceProfile, fenceTargets } from "../src/fence";
 import { type CleanShellValue, readCleanShell } from "../src/clean-shell";
 import { startRssWatchdog } from "./rss-watchdog";
@@ -356,7 +357,7 @@ export function reserveLane(h: Home): { workloadId: string; laneId: string } {
 	const l = Ledger.open(h.ledgerPath, { create: true, backup: false, backupOnOpen: false });
 	try {
 		const workloadId = l.openWorkload({ by: "orchestrator-surface", brief: "shell-start session probe", stakes: "normal", mode: "autonomous" });
-		const res = l.reserveLane(workloadId, { by: LANE_STARTER_BY, cap: 3, leaseMs: 600_000, requestedBy: "test", decide: () => ({ launch: true, cause: "first" }) });
+		const res = l.reserveLane(workloadId, { by: LANE_STARTER_BY, cap: 3, leaseMs: 600_000, requestedBy: "test", receiptWorkload: STANDING_WORKLOAD_ID, decide: () => ({ launch: true, cause: "first" }) });
 		if (!res.ok) throw new Error(res.reason);
 		return { workloadId, laneId: res.laneId };
 	} finally {

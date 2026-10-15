@@ -18,7 +18,7 @@ import { launchVerdict } from "../extensions/launch";
 import orchestratorSurface from "../index";
 import { recordRepo } from "../src/decision-log";
 import { branchName, doneBody, laneExit, laneStarted, worktreePath } from "../src/launch";
-import { SURFACE_BY } from "../src/types";
+import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, drainSettled, fakePi, fakeRecords, git, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, notices, setScript, settleDrains, sh, timers, until } from "./helpers";
 
 const roots: LaneRoot[] = [];
@@ -165,7 +165,7 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		f.execs.answer = (command, args) => {
 			if (command === "git" && args[2] === "add") {
 				const l2 = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
-				const res = l2.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "race", decide: () => ({ launch: true, cause: "request" }) });
+				const res = l2.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "race", receiptWorkload: STANDING_WORKLOAD_ID, decide: () => ({ launch: true, cause: "request" }) });
 				l2.close();
 				if (!res.ok) throw new Error(res.reason);
 			}

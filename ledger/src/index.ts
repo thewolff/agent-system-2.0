@@ -140,6 +140,17 @@ function retryBusy<T>(retries: number, fn: () => T): T {
 }
 
 /**
+ * A launch decision's receipt workload (`launchRows`, `reserveLane`) must be named: a missing, non-string
+ * or blank id throws before anything is read, so a caller that forgot it fails closed instead of deciding
+ * without Jo's pending inputs. Checked at run time, not only by the type.
+ */
+function requireReceiptWorkload(id: unknown): void {
+	if (typeof id !== "string" || id.trim() === "") {
+		throw new Error("a launch decision names its receipt workload (where Jo's typed inputs live); none was given, so nothing was read and nothing launches");
+	}
+}
+
+/**
  * Apply the schema to a file that had none, inside BEGIN IMMEDIATE so the write lock is held
  * before any dependent statement runs. Re-reads the version under the lock: when another
  * connection initialized the file first, nothing is applied. Returns whether this call applied it.
@@ -215,6 +226,13 @@ export interface ReserveRows {
 	slices: SliceRow[];
 	/** Every holder the workload ever had, oldest first (`holders`). */
 	holders: string[];
+	/**
+	 * The receipt workload's raw instruction rows, oldest first (created_at, rowid): the workload the caller
+	 * names as where Jo's typed inputs are written. The policy decides which are authentic and what they say.
+	 */
+	receiptInputs: InstructionRow[];
+	/** The receipt workload's raw `assumption` entries, oldest first: what spent an input, and which workload a question is about. */
+	receiptEntries: EntryRow[];
 	/** Open autonomous workloads held by a `lane-*` holder whose lease is null or not yet lapsed at `now`. */
 	liveLanes: number;
 	cap: number;
@@ -561,10 +579,14 @@ export class Ledger {
 
 	/**
 	 * What a launch decision reads (the surface's own predicate run, and `reserveLane` inside its
-	 * transaction): the workload row, its entries, questions, instructions and slices, and the
-	 * live-lane count at `now`. Null when there is no such workload.
+	 * transaction): the workload row, its entries, questions, instructions and slices, the live-lane
+	 * count at `now`, and the raw instructions and assumption entries of `receiptWorkload`, the
+	 * workload the caller names as where Jo's typed inputs and their readings live (this module knows
+	 * no surface constant). A missing or empty `receiptWorkload` throws before any read: the decision
+	 * fails closed. Null when there is no such workload.
 	 */
-	launchRows(workloadId: string, cap: number): ReserveRows | null {
+	launchRows(workloadId: string, cap: number, receiptWorkload: string): ReserveRows | null {
+		requireReceiptWorkload(receiptWorkload);
 		const now = this.now();
 		const workload = this.db.query<WorkloadRow, [string]>("SELECT * FROM workloads WHERE id = ?").get(workloadId);
 		if (!workload) return null;
@@ -575,6 +597,8 @@ export class Ledger {
 			instructions: this.instructions(workloadId),
 			slices: this.slices(workloadId),
 			holders: this.holders(workloadId),
+			receiptInputs: this.instructions(receiptWorkload),
+			receiptEntries: this.entries(receiptWorkload, "assumption"),
 			liveLanes: this.liveLaneHolders(now).length,
 			cap,
 			now,
@@ -592,16 +616,18 @@ export class Ledger {
 
 	/**
 	 * Reserve a lane on the workload (decision 8): one transaction reads the workload row, its entries,
-	 * questions, instructions and slices and the live-lane count, hands them to `decide`, and on a
-	 * launch verdict mints the ordinal, pre-claims for the lane id with `leaseMs` (stamped `by`, the
-	 * starter, so the lane's own claim is a real readiness signal) and writes the attempt entry
-	 * `launch: <laneId> cause <cause> requested-by <who>`. A refusal returns before any write.
+	 * questions, instructions and slices, the live-lane count and the receipt workload's rows
+	 * (`launchRows`, `receiptWorkload` required: a missing or empty one throws before the transaction),
+	 * hands them to `decide`, and on a launch verdict mints the ordinal, pre-claims for the lane id with
+	 * `leaseMs` (stamped `by`, the starter, so the lane's own claim is a real readiness signal) and writes
+	 * the attempt entry `launch: <laneId> cause <cause> requested-by <who>`. A refusal returns before any write.
 	 */
 	reserveLane(workloadId: string, input: Stamp & {
-		cap: number; leaseMs: number; requestedBy: string; decide: (rows: ReserveRows) => ReserveVerdict;
+		cap: number; leaseMs: number; requestedBy: string; receiptWorkload: string; decide: (rows: ReserveRows) => ReserveVerdict;
 	}): ReserveResult {
+		requireReceiptWorkload(input.receiptWorkload);
 		return this.write(() => {
-			const rows = this.launchRows(workloadId, input.cap);
+			const rows = this.launchRows(workloadId, input.cap, input.receiptWorkload);
 			if (!rows) return { ok: false as const, reason: "no such workload" };
 			const verdict = input.decide(rows);
 			if (!verdict.launch) return { ok: false as const, reason: verdict.reason };

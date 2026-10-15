@@ -10,10 +10,13 @@
 // message in the starter; a refusal wrote nothing. The result is one line for the tool result or
 // the log. The open tool, the answer and withdrawal paths, the mode flip and the wake tick all call
 // it; the tool below adds Jo's `launch-requested:` cause first, with Jo's `lane-model:` in the same
-// transaction when `model` is given (MIGRATION.md item 85).
+// transaction when `model` is given (MIGRATION.md item 85). While Jo's model input for the workload is
+// pending (PLAN wl-mv8d45mqycd8g0 D3, `pendingLaneModel`) the trigger starts nothing and names the input,
+// and the tool refuses before any write, in either mode, with or without `model`: the recorder
+// (`orchestrator_record_instruction`) records that model and starts what was waiting on it.
 import type { Ledger } from "../../ledger/src/index";
 import {
-	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, type LaunchVerdict, launchRequestedBody, modelProblem, verdictOf,
+	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, type LaunchVerdict, launchRequestedBody, modelProblem, pendingLaneModel, pendingModelLine, verdictOf,
 } from "../src/launch";
 import { surfaceSession } from "../src/session";
 import { DUE_PREFIX, LAUNCH_LANE_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult } from "../src/types";
@@ -35,7 +38,7 @@ export interface LaunchOutcome {
  * `requested-by` the starter records. Never throws: an exec failure is a line.
  */
 export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, workloadId: string, who: string): Promise<LaunchOutcome> {
-	const rows = ledger.launchRows(workloadId, laneCap(env));
+	const rows = ledger.launchRows(workloadId, laneCap(env), STANDING_WORKLOAD_ID);
 	if (!rows) return { attempted: false, code: null, line: `no workload ${workloadId}` };
 	const verdict = verdictOf(rows);
 	if (!verdict.launch) {
@@ -43,8 +46,12 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 			case "standing":
 			case "due":
 				return { attempted: false, code: null, line: null };
-			case "user-driven":
+			case "user-driven": {
+				// The by-hand starter waits on Jo's pending model too (decideInteractive): name the input instead of a command that would refuse.
+				const pending = pendingLaneModel(workloadId, rows.receiptInputs, rows.receiptEntries);
+				if (pending) return { attempted: false, code: null, line: `${workloadId} is user-driven; ${pendingModelLine(workloadId, pending)}, then run it by hand with \`${byHandLine(workloadId)}\`` };
 				return { attempted: false, code: null, line: `${workloadId} is user-driven: no lane launches by itself; run it by hand with \`${byHandLine(workloadId)}\`` };
+			}
 			case "held":
 				return { attempted: false, code: null, line: `${workloadId} is held by ${rows.workload.holder} (lease until ${rows.workload.holder_lease_until ?? "none"}); nothing launched` };
 			case "cap": {
@@ -57,6 +64,8 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 				return { attempted: false, code: null, line: `${workloadId} has had a lane and no new cause: relaunch on your word with ${LAUNCH_LANE_TOOL}` };
 			case "closed":
 				return { attempted: false, code: null, line: `${workloadId} is closed; nothing launched` };
+			case "pending-model":
+				return { attempted: false, code: null, line: `${pendingModelLine(workloadId, verdict.pending)}; nothing launched yet` };
 		}
 	}
 	if (!pi.exec) return { attempted: false, code: null, line: `${workloadId}: the host has no exec for extensions, so the starter could not run; launch by hand with \`bun ${LANE_SCRIPT} launch ${workloadId}\`` };
@@ -76,7 +85,7 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
  * workload costs one read per poll and no process. Null when there is no such workload.
  */
 export function launchVerdict(ledger: Ledger, env: Record<string, string | undefined>, workloadId: string): LaunchVerdict | null {
-	const rows = ledger.launchRows(workloadId, laneCap(env));
+	const rows = ledger.launchRows(workloadId, laneCap(env), STANDING_WORKLOAD_ID);
 	return rows && verdictOf(rows);
 }
 
@@ -91,7 +100,8 @@ export default function launchRow(pi: SurfaceAPI, env: Record<string, string | u
 			"Records `launch-requested:` on the workload, then runs the launcher and returns its one line (the lane id, a refusal, or the typed failure). " +
 			"A user-driven workload is not launched: the by-hand command is returned instead. " +
 			"`model` (Jo's word only) names the model this workload's lanes run on, kept across relaunches until changed: an exact `provider/model` (e.g. `openai-codex/gpt-6-sol`) on a provider with a known lab, no `:level` suffix; `default` clears it. " +
-			"A different model than the recorded session ran on starts a fresh session; a lane whose OMP does not report that model fails its launch. On a user-driven workload it is recorded for the by-hand lane.",
+			"A different model than the recorded session ran on starts a fresh session; a lane whose OMP does not report that model fails its launch. On a user-driven workload it is recorded for the by-hand lane. " +
+			"While Jo's model input for the workload is pending (typed, not yet recorded with orchestrator_record_instruction), this tool refuses before any write, in either mode and with or without `model`, naming that input: record it instead, which starts any lane waiting on it.",
 		parameters: z.object({
 			workloadId: z.string().describe("The open workload (wl-…)."),
 			reason: z.string().optional().describe("Why, in a few words (e.g. 'relaunch after death'); recorded in the request."),
@@ -112,6 +122,8 @@ export default function launchRow(pi: SurfaceAPI, env: Record<string, string | u
 			if (!w) return text(`No workload ${id}; nothing was written.`);
 			if (w.status === "closed") return text(`${id} is closed (${w.closed_at}); nothing was written.`);
 			if (w.brief.startsWith(DUE_PREFIX)) return text(`${id} is a scheduled row: it never has a lane; nothing was written.`);
+			const pending = pendingLaneModel(id, ledger.instructions(STANDING_WORKLOAD_ID), ledger.entries(STANDING_WORKLOAD_ID, "assumption"));
+			if (pending) return text(`Refused: ${pendingModelLine(id, pending)}. Nothing was written.`, { id, pendingInput: pending.inputId });
 			if (w.mode === "user-driven") {
 				if (model === null) return text(`${id} is user-driven: no lane launches by itself. Run it by hand with \`${byHandLine(id)}\`, or flip it with the word autonomous. Nothing was written.`);
 				const modelId = ledger.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: laneModelBody(model, s.now()) });

@@ -19,7 +19,9 @@ import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_CAP_ENV, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
 import { labOf } from "../../classifier/src/lab";
-import { ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
+import { isJoInput, spentIn, subjectIn } from "./orchestrator-question";
+import { modelLines, modelLineShape } from "./pending-lane-model";
+import { ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, RECORD_INSTRUCTION_TOOL, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 // ---- knobs -------------------------------------------------------------------------------------
 
@@ -387,7 +389,14 @@ export function instructionLine(i: InstructionRow): string {
 // ---- the predicate -----------------------------------------------------------------------------
 
 export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched";
-export type LaunchVerdict = { launch: true; cause: Cause } | { launch: false; reason: LaunchReason };
+/**
+ * A launch verdict. `pending-model` (PLAN wl-mv8d45mqycd8g0 D3) refuses a start the predicate would make while
+ * Jo's newest model input for the workload is not yet recorded (`pendingLaneModel`), naming that input.
+ */
+export type LaunchVerdict =
+	| { launch: true; cause: Cause }
+	| { launch: false; reason: LaunchReason }
+	| { launch: false; reason: "pending-model"; pending: ModelInput };
 
 /** A holder under a lease that is null or not yet lapsed at `now`. */
 export function heldLive(w: { holder: string | null; holder_lease_until: string | null }, now: string): boolean {
@@ -421,17 +430,25 @@ export function launchable(
 	return { launch: false, reason: "died-not-relaunched" };
 }
 
-/** The predicate over the rows a launch decision reads (`Ledger.launchRows`): the surface's run and `reserveLane`'s. */
+/**
+ * The predicate over the rows a launch decision reads (`Ledger.launchRows`): the surface's run and `reserveLane`'s.
+ * A start the predicate allows waits while Jo's model input for the workload is pending (D3): held, capped,
+ * awaiting-close and the cause rules keep their reasons, and the cause stays unconsumed.
+ */
 export function verdictOf(rows: ReserveRows): LaunchVerdict {
 	const holders = holdersOf(rows.entries, rows.workload.holder, rows.holders);
 	const control = controlEntries(rows.entries, holders);
-	return launchable(rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap);
+	const v = launchable(rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap);
+	if (!v.launch) return v;
+	const pending = pendingLaneModel(rows.workload.id, rows.receiptInputs, rows.receiptEntries);
+	return pending ? { launch: false, reason: "pending-model", pending } : v;
 }
 
 /** `reserveLane`'s policy for an autonomous launch: the predicate over the rows the transaction read. */
 export function decideLaunch(rows: ReserveRows): ReserveVerdict {
 	const v = verdictOf(rows);
-	return v.launch ? { launch: true, cause: causeText(v.cause) } : v;
+	if (v.launch) return { launch: true, cause: causeText(v.cause) };
+	return v.reason === "pending-model" ? { launch: false, reason: `pending-model: ${pendingModelLine(rows.workload.id, v.pending)}` } : v;
 }
 
 export type InteractiveReason = "closed" | "standing" | "due" | "autonomous" | "held";
@@ -448,9 +465,12 @@ export function interactiveVerdict(w: WorkloadRow, now: string): { launch: true 
 	if (heldLive(w, now)) return { launch: false, reason: "held" };
 	return { launch: true };
 }
+/** `reserveLane`'s policy for Jo's `as2 lane <wl>`: the interactive verdict, then the same pending-model wait (D3) as an autonomous start. */
 export function decideInteractive(rows: ReserveRows): ReserveVerdict {
 	const v = interactiveVerdict(rows.workload, rows.now);
-	return v.launch ? { launch: true, cause: "interactive" } : v;
+	if (!v.launch) return v;
+	const pending = pendingLaneModel(rows.workload.id, rows.receiptInputs, rows.receiptEntries);
+	return pending ? { launch: false, reason: `pending-model: ${pendingModelLine(rows.workload.id, pending)}` } : { launch: true, cause: "interactive" };
 }
 
 // ---- exit classification -----------------------------------------------------------------------
@@ -613,6 +633,75 @@ export function modelProblem(value: string): string | null {
 	if (!MODEL_SELECTOR.test(value)) return `\`${value}\` is not an exact provider/model selector, e.g. openai-codex/gpt-6-sol (or \`default\`)`;
 	if (labOf(value) === null) return `\`${value}\` names a provider with no known lab; add it to classifier/src/lab.ts first`;
 	return null;
+}
+
+// ---- Jo's pending model (PLAN wl-mv8d45mqycd8g0 D1, D3) -------------------------------------------
+
+/**
+ * What an input's model lines (surface/src/pending-lane-model.ts) amount to: none; one valid intent, the
+ * selector of its last line, for one workload; or invalid (a near-miss `lane model` line, models for more than
+ * one workload, a selector `modelProblem` refuses), `target` the one workload it names when there is one.
+ * Only a valid intent in an authentic Jo input has model authority.
+ */
+export type ModelIntent =
+	| { kind: "none" }
+	| { kind: "valid"; selector: string; target: string }
+	| { kind: "invalid"; why: string; target: string | null };
+
+export function modelIntent(text: string): ModelIntent {
+	const { lines, nearMisses } = modelLines(text);
+	if (lines.length === 0 && nearMisses.length === 0) return { kind: "none" };
+	const targets = [...new Set(lines.map((l) => l.target))];
+	const miss = nearMisses[0];
+	const target = targets.length === 1 ? targets[0]! : targets.length === 0 && miss ? (/\bwl-[a-z0-9]+/i.exec(miss.text)?.[0]?.toLowerCase() ?? null) : null;
+	if (miss) return { kind: "invalid", target, why: `"${miss.text}" is not a model line; write it as \`${modelLineShape(target ?? "<wl-…>")}\`` };
+	if (target === null) return { kind: "invalid", target, why: `it names lane models for ${targets.join(" and ")}; one input names one workload's model` };
+	for (const l of lines) {
+		const problem = modelProblem(l.selector);
+		if (problem !== null) return { kind: "invalid", target, why: `lane model ${l.selector}: ${problem}` };
+	}
+	return { kind: "valid", selector: lines[lines.length - 1]!.selector, target };
+}
+
+/** Jo's model input for a workload: the authentic input row, the selector its model lines name, and when it was typed. */
+export interface ModelInput {
+	inputId: string;
+	selector: string;
+	createdAt: string;
+}
+
+/**
+ * The newest authentic Jo input (`isJoInput`) whose model intent is valid and names `workloadId`, in ledger
+ * order (created_at, then rowid: the order `inputs` is read in), or null. Only that input can block or change
+ * the workload's model; an older one is superseded, recorded or not.
+ */
+export function newestModelInput(workloadId: string, inputs: readonly InstructionRow[]): ModelInput | null {
+	for (let i = inputs.length - 1; i >= 0; i--) {
+		const row = inputs[i]!;
+		if (!isJoInput(row)) continue;
+		const intent = modelIntent(row.body);
+		if (intent.kind === "valid" && intent.target === workloadId) return { inputId: row.id, selector: intent.selector, createdAt: row.created_at };
+	}
+	return null;
+}
+
+/**
+ * The model input a workload waits for (D1, D3): its `newestModelInput` while no reading spent it on the
+ * workload itself or on an orchestrator question about the workload (the recorder writes that reading with
+ * the `lane-model:` line, in one transaction). `inputs` and `entries` are the standing workload's raw
+ * instructions and assumption entries (`ReserveRows.receiptInputs`, `receiptEntries`). Null: nothing pending.
+ */
+export function pendingLaneModel(workloadId: string, inputs: readonly InstructionRow[], entries: readonly EntryRow[]): ModelInput | null {
+	const newest = newestModelInput(workloadId, inputs);
+	if (!newest) return null;
+	const spent = spentIn(entries, newest.inputId);
+	if (spent === workloadId || (spent?.startsWith("q-") && subjectIn(entries, spent) === workloadId)) return null;
+	return newest;
+}
+
+/** The one line a pending model wait reads as, wherever a start is refused or the workload is rendered: the input, its model, the recorder, the correction. */
+export function pendingModelLine(workloadId: string, pending: ModelInput): string {
+	return `${workloadId} waits for Jo's model input ${pending.inputId} (lane model ${pending.selector}): record it with ${RECORD_INSTRUCTION_TOOL} naming workloadId ${workloadId} and inputId ${pending.inputId}, which starts any lane waiting on it; to name another model Jo sends \`${modelLineShape(workloadId)}\``;
 }
 
 /**

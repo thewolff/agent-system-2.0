@@ -20,7 +20,8 @@ import { closeCheck, closeScratchRoot, commitCloseEntry, type EntryPublish, logD
 import { decisionLogContext, lastWorkloadOn, recordRepo, repoOf } from "../src/decision-log";
 import { identityOf, recordIdentity } from "../src/identity";
 import { ceilingBody, sizeFor } from "../src/ceiling";
-import { controlEntries, doneBecause, doneBody, doneLine, holdersOf, laneModelBody, modelProblem, planFirstBody, supersededBy } from "../src/launch";
+import { controlEntries, doneBecause, doneBody, doneLine, holdersOf, laneModelBody, modelIntent, modelProblem, newestModelInput, planFirstBody, supersededBy } from "../src/launch";
+import { modelLineShape } from "../src/pending-lane-model";
 import { stakesSource } from "../src/input";
 import { answerOrchestratorQuestion, inputSpent, joInput, type OrchestratorAnswer, questionSubject, readingBody } from "../src/orchestrator-question";
 import { oneLiner } from "../src/render";
@@ -316,7 +317,8 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 		description:
 			"When Jo's message answers a QUESTION you asked about an open workload, or instructs you about one, record it here before anything else, so a lane picking the workload up reads the decision from the ledger. " +
 			"Jo's words are never a parameter: the surface writes what Jo typed as an input row and names it to you (`Jo's words above are input in-…`); pass that inputId with your one-line reading. With questionId (a question you raised with orchestrator_raise_question), the question row is answered with the input row's body and the instruction row goes on the workload the question is about, in one transaction; with workloadId alone, the instruction row goes on that workload with the input row's body. Your reading goes in its own entry either way. " +
-			"An input is spent once; a message the surface gave no input id has no receipt and records nothing. A message that neither answers nor instructs (a question about your question, something unrelated) records nothing. Until the row exists, your next working call on the workload is refused (P-11 row 15).",
+			"An input is spent once; a message the surface gave no input id has no receipt and records nothing. A message that neither answers nor instructs (a question about your question, something unrelated) records nothing. Until the row exists, your next working call on the workload is refused (P-11 row 15). " +
+			"When the input row itself carries Jo's model line (`lane model <provider/model> for <wl-…>`), record it on that workload (or answer a question about that workload): its `lane-model:` is written from the row's own words, never from your reading, with the instruction and the reading in one transaction; only Jo's newest model input for the workload can be recorded. After that commit, any lane start that waited on the model runs (an autonomous workload's waiting launch starts on the named model; a user-driven one gets its by-hand command), so a duplicate record is refused and starts nothing.",
 		parameters: z.object({
 			workloadId: z.string().optional().describe("The open workload the instruction is about (wl-…); with questionId, the question's own subject when omitted."),
 			reading: z.string().describe("Your one-line reading of what Jo decided, with the referent restored (e.g. \"use the drafted README line: <the line>\")."),
@@ -342,6 +344,34 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 				if (spent) return `${inputId} already ${spent.startsWith("q-") ? "answered" : "instructed"} ${spent}, and one input is recorded once`;
 				return input;
 			};
+			/**
+			 * Inside the recording transaction (PLAN wl-mv8d45mqycd8g0 D4): the receipt checked again, then Jo's model read from the
+			 * input row's own bytes (`modelIntent`), refused unless it names `target`, the workload is open and the input is Jo's newest
+			 * valid model input for it, and its `lane-model:` written on `target`. Null when the input names no valid model. Throws the refusal.
+			 */
+			const recordModel = (target: string): { input: InstructionRow; model: { selector: string; entryId: string } | null; invalid: string | null } => {
+				const input = receipt();
+				if (typeof input === "string") throw new Error(input);
+				const intent = modelIntent(input.body);
+				if (intent.kind === "none") return { input, model: null, invalid: null };
+				if (intent.kind === "invalid") return { input, model: null, invalid: `no lane model was recorded: ${intent.why}; to name one Jo sends \`${modelLineShape(intent.target ?? target)}\`` };
+				if (intent.target !== target) throw new Error(`${inputId} names lane model ${intent.selector} for ${intent.target}, not ${target}: a model input is recorded on its own workload (workloadId ${intent.target}, or a question about it)`);
+				const w = ledger.workload(target);
+				if (!w || w.status !== "open") throw new Error(`${target} is ${w ? "closed" : "not in the ledger"}: its lane model cannot be recorded`);
+				const newest = newestModelInput(target, ledger.instructions(STANDING_WORKLOAD_ID));
+				if (newest && newest.inputId !== inputId) {
+					throw new Error(`${inputId} is not Jo's newest model input for ${target}: ${newest.inputId} (lane model ${newest.selector}) supersedes it; record ${newest.inputId} instead`);
+				}
+				const entryId = ledger.recordEntry({ by: SURFACE_BY, workloadId: target, kind: "assumption", body: laneModelBody(intent.selector, s.now()) });
+				return { input, model: { selector: intent.selector, entryId }, invalid: null };
+			};
+			/** After the commit: the launch trigger for a recorded model's workload (D4), as the line the result carries. */
+			const startAfter = async (target: string, model: { selector: string; entryId: string } | null, invalid: string | null): Promise<string> => {
+				if (invalid) return `; ${invalid}`;
+				if (!model) return "";
+				const launch = await triggerLaunch(pi, ledger, env, target, "jo");
+				return `; lane model ${model.selector} recorded on ${target} (${model.entryId})${launch.line ? `; ${launch.line}` : ""}`;
+			};
 			if (questionId) {
 				// The answer path (MIGRATION.md item 105, fix round 1): the one write that touches the standing workload, through the
 				// question row, with Jo's words read from the input row the surface wrote — never from this call's parameters.
@@ -353,12 +383,18 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 				if (input.created_at <= q.created_at) return text(`${inputId} was not typed after ${questionId} was raised, so it cannot answer it; nothing was recorded.`);
 				const subject = questionSubject(ledger, questionId);
 				if (id && id !== STANDING_WORKLOAD_ID && id !== subject) return text(subject ? `${questionId} is about ${subject}, not ${id}; nothing was recorded.` : `${questionId} has no subject workload: its answer is recorded on the question alone, not on ${id}; nothing was recorded.`);
-				let answered: { answer: OrchestratorAnswer; reading: string };
+				const intent = modelIntent(input.body);
+				// A model input answers only a question about its own workload (D4): an unscoped or other-subject answer cannot spend it.
+				if (intent.kind === "valid" && intent.target !== subject) {
+					return text(`${inputId} names lane model ${intent.selector} for ${intent.target}, and ${questionId} is ${subject ? `about ${subject}` : "about no workload"}: record it with workloadId ${intent.target} instead; nothing was recorded.`);
+				}
+				let answered: { answer: OrchestratorAnswer; reading: string; model: { selector: string; entryId: string } | null; invalid: string | null };
 				try {
 					answered = ledger.write(() => {
+						const m = subject === null ? { model: null, invalid: null } : recordModel(subject);
 						const answer = answerOrchestratorQuestion(ledger, q, { answer: input.body, mirrorBody: `Jo: "${input.body}" — reading: ${reading} (answers ${questionId})` });
 						const entry = ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: q.slice_id, kind: "assumption", body: readingBody(reading, inputId, questionId) });
-						return { answer, reading: entry };
+						return { answer, reading: entry, model: m.model, invalid: m.invalid };
 					});
 				} catch (err) {
 					return text(`${err instanceof Error ? err.message : String(err)}; nothing was recorded.`);
@@ -366,22 +402,34 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 				const { answer: r, reading: entry } = answered;
 				pi.appendEntry("surface-instruction", { id: r.answerId, workloadId: STANDING_WORKLOAD_ID, questionId, inputId, mirrorId: r.mirrorId, about: r.about });
 				const mirror = r.mirrorId ? `; instruction ${r.mirrorId} on ${r.about} (author jo, channel surface): "${input.body}" — ${reading}` : "";
-				return text(`Answered ${questionId} with Jo's input ${inputId} (answer ${r.answerId}, reading ${entry})${mirror}`, { id: r.answerId, questionId, inputId, workloadId: r.about, mirrorId: r.mirrorId, readingId: entry });
+				const after = subject === null ? "" : await startAfter(subject, answered.model, answered.invalid);
+				return text(`Answered ${questionId} with Jo's input ${inputId} (answer ${r.answerId}, reading ${entry})${mirror}${after}`, {
+					id: r.answerId, questionId, inputId, workloadId: r.about, mirrorId: r.mirrorId, readingId: entry, modelId: answered.model?.entryId ?? null,
+				});
 			}
 			if (id === STANDING_WORKLOAD_ID) return text("Jo's instructions are recorded on the workload they are about, not the standing one (an answer to your own question names its questionId); nothing was recorded.");
 			if (!id) return text("An instruction names the open workload it is about (wl-…), or the questionId it answers; nothing was recorded.");
 			const w = ledger.workload(id);
 			if (!w) return text(`No workload ${id}; nothing was recorded.`);
 			if (w.status === "closed") return text(`${id} is closed (${w.closed_at}); nothing was recorded.`);
-			const input = receipt();
-			if (typeof input === "string") return text(`${input}; nothing was recorded.`);
-			const recorded = ledger.write(() => {
-				const row = ledger.recordInstruction({ by: SURFACE_BY, workloadId: id, body: `Jo: "${input.body}" — reading: ${reading}`, author: "jo", channel: "surface" });
-				const entry = ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: input.slice_id, kind: "assumption", body: readingBody(reading, inputId, id) });
-				return { row, entry };
-			});
+			const early = receipt();
+			if (typeof early === "string") return text(`${early}; nothing was recorded.`);
+			let recorded: { row: string; entry: string; body: string; model: { selector: string; entryId: string } | null; invalid: string | null };
+			try {
+				recorded = ledger.write(() => {
+					const m = recordModel(id);
+					const row = ledger.recordInstruction({ by: SURFACE_BY, workloadId: id, body: `Jo: "${m.input.body}" — reading: ${reading}`, author: "jo", channel: "surface" });
+					const entry = ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: m.input.slice_id, kind: "assumption", body: readingBody(reading, inputId, id) });
+					return { row, entry, body: m.input.body, model: m.model, invalid: m.invalid };
+				});
+			} catch (err) {
+				return text(`${err instanceof Error ? err.message : String(err)}; nothing was recorded.`);
+			}
 			pi.appendEntry("surface-instruction", { id: recorded.row, workloadId: id, inputId, readingId: recorded.entry });
-			return text(`Recorded instruction ${recorded.row} on ${id} from Jo's input ${inputId} (author jo, channel surface; reading ${recorded.entry}): "${input.body}" — ${reading}`, { id: recorded.row, workloadId: id, inputId, readingId: recorded.entry });
+			const after = await startAfter(id, recorded.model, recorded.invalid);
+			return text(`Recorded instruction ${recorded.row} on ${id} from Jo's input ${inputId} (author jo, channel surface; reading ${recorded.entry}): "${recorded.body}" — ${reading}${after}`, {
+				id: recorded.row, workloadId: id, inputId, readingId: recorded.entry, modelId: recorded.model?.entryId ?? null,
+			});
 		},
 	});
 }

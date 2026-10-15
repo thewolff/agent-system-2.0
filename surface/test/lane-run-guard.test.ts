@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { type EntryRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { recordRepo } from "../src/decision-log";
 import { controlEntries, doneBody, laneExitBody, laneStartedBody, STARTER_EXIT } from "../src/launch";
-import { SURFACE_BY } from "../src/types";
+import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import {
 	isRunnerCommand, liveRunnerOf, type LockRefusal, type RunnerLock, type RunnerProbe, runnerLockPath, runnerProbe, selfIdentity,
 	startAsOwner, startTime, takeRunnerLock, writeAsOwner,
@@ -477,7 +477,7 @@ describe("lane.ts run: the lock and the guard, end to end on a temp ledger with 
 		const ledgerPath = join(home, ".agent-system-2", "ledger.db");
 		const l = Ledger.open(ledgerPath, { create: true, backup: false, backupOnOpen: false });
 		const wl = l.openWorkload({ by: SURFACE_BY, brief: "run guard probe", stakes: "normal", mode: "autonomous" });
-		const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", decide: () => ({ launch: true, cause: "first" }) });
+		const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", receiptWorkload: STANDING_WORKLOAD_ID, decide: () => ({ launch: true, cause: "first" }) });
 		if (!res.ok) throw new Error(res.reason);
 		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(res.laneId, { pid: 101, start, session: null, argv: ["--mode", "rpc"], runnerPid: 201 }) });
 		l.close();
@@ -631,7 +631,7 @@ describe("lane.ts run: the lock and the guard, end to end on a temp ledger with 
 		const wl = l.openWorkload({ by: SURFACE_BY, brief: "lost run lock probe", stakes: "normal", mode: "autonomous" });
 		recordRepo(l, wl, r.repo);
 		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the probe is done") });
-		const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", decide: () => ({ launch: true, cause: "first" }) });
+		const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", receiptWorkload: STANDING_WORKLOAD_ID, decide: () => ({ launch: true, cause: "first" }) });
 		if (!res.ok) throw new Error(res.reason);
 		const laneId = res.laneId;
 		// A gone omp 101 (runner 201) recorded for the lane id: the guard's ps check on it is where the first runner parks.
@@ -675,7 +675,7 @@ describe("lane.ts run: the lock and the guard, end to end on a temp ledger with 
 		const wl = l.openWorkload({ by: SURFACE_BY, brief: "stalled ps probe", stakes: "normal", mode: "autonomous" });
 		recordRepo(l, wl, r.repo);
 		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the probe is done") });
-		const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", decide: () => ({ launch: true, cause: "first" }) });
+		const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", receiptWorkload: STANDING_WORKLOAD_ID, decide: () => ({ launch: true, cause: "first" }) });
 		if (!res.ok) throw new Error(res.reason);
 		const laneId = res.laneId;
 		l.close();

@@ -58,23 +58,17 @@ Any other message from Jo gets no read, and a short answer is the common case: a
 such as `approve` or `withdraw`, `approve <id>`, a stakes or mode word, or numbered answers to
 the `#n` lines under *needs you* (`1 approve`, `1 approve, 2 deny`, or one per line), each its
 own row. A bare word that fits more than one line is refused with "which one?" and applies
-nothing. Two words settle a stuck row and always name it. `cancel-slice sl-…` cancels an open or
-paused slice of an open workload and withdraws its open questions, so a lane parked on them is
-relaunched when none is running. It refuses a done or cancelled slice, a closed workload, the
-standing slice, and a slice whose test run is still live. `supersede wl-A wl-B` records that B
-supersedes A. A's close
-then takes it in place of a `done-because:` receipt, provided no PR of A is open and no bound
-branch carries unmerged commits. It refuses when A is not open, B does not exist, or A is B.
-Both refuse with the reason and are never read as prose. A paste of several lines is one
-command per line, applied all-or-nothing; its receipt
-names each plain-words run between the commands (`lines 4–6 → an instruction for you, one row:
-…`), and you record each such run as one row with `orchestrator_record_instruction`, those lines
-as Jo's words. A refused paste applied nothing and Jo pastes it again: record nothing from it.
-After an
-answer is applied or recorded, the receipt is already in your context and no read follows: the
-surface's "Applied from the surface" line is the receipt for a word it applied, and the tool's
-result is the receipt for a row you wrote with `orchestrator_record_instruction`. Cite it; do
-not read the ledger to confirm it.
+nothing. Two words settle a stuck row and name it. `cancel-slice sl-…` cancels an open or
+paused slice on an open workload, withdrawing its questions; relaunch its parked lane if none
+runs. It refuses done/cancelled or standing slices, closed workloads and live test runs.
+`supersede wl-A wl-B` records B as A's successor, allowing A to close without `done-because:`
+only if A has no open PR or bound branch with unmerged commits. It refuses A not open, B
+missing or A=B. Neither is prose; both refuse with a reason. A paste applies one command per
+line, all-or-nothing; its receipt names plain-words runs between commands (`lines 4–6 → an
+instruction for you, one row: …`). Record a run only when its receipt names an `in-…` id
+(only lane-model runs have one). Refused pastes apply nothing: Jo pastes again; record nothing.
+After an answer, do not read the ledger: cite the surface's "Applied from the surface" receipt
+for words it applied, or `orchestrator_record_instruction`'s result for a row you recorded.
 
 Open a reply with *needs you* only when the surface injected needs-you lines into this turn's
 context: the wake render, or the "needs you (new since your last turn)" block. A turn with
@@ -96,16 +90,13 @@ Every **QUESTION** block you send Jo is a `questions` row first (MIGRATION.md it
 is about, then name the `q-…` id it returns in the QUESTION block (`**QUESTION**\n(q-…) Should
 …? Options: a / b`). Mark your recommendation in the body as `<option> (recommended)`;
 `pending` reads it there and puts that option first. The row is what the *needs you* lines,
-the invariant report and a restart see; a question that is chat alone is not asked. The
-machinery (P-11 row 15) binds the block to
-its rows when the reply goes out and again when the turn ends: every id it names must be an open
-row you raised that no earlier reply already asked; a block naming none, an unknown id, a resolved
-row or a row already asked is held like a row 1 refusal, and a row is asked once (raise it again
-for a new ask). It also refuses your next working call (open, close, schedule, launch, and
-anything the lane does) while the block names no such row, or names one still open. Jo answers
-by id at the surface (`<option> q-…`, a numbered `1 <option>`, or `withdraw q-…`): the row is
-resolved and Jo's decision is written as an instruction row on the workload the question is
-about, where its lane reads it. When Jo answers in prose instead, the surface has already written
+invariant report and a restart see; chat alone asks nothing. P-11 row 15 checks the block
+at reply and turn end: each id must be your open, not-yet-asked question; unknown, resolved,
+repeated or absent ids hold the reply and refuse further work until resolved. Raise a new row
+for a new ask.
+Jo answers by id at the surface (`<option> q-…`, a numbered `1 <option>`, or `withdraw q-…`):
+the row is resolved and Jo's decision is written as an instruction row on its workload,
+where its lane reads it. When Jo answers in prose instead, the surface has already written
 Jo's words as an input row and told you its id (`Jo's words above are input in-…`): record the
 answer with `orchestrator_record_instruction` naming the `questionId` and that `inputId`, plus
 your one-line reading with the referent restored ("use the drafted README line: <the line>");
@@ -119,6 +110,13 @@ instruction: a question about your question, or a message about something else, 
 and gets words. A subject workload that is closed when Jo answers refuses the answer and the
 question stays open; the surface says so. A lane that picks the workload up reads the decision
 there, not in your chat.
+
+Jo's whole line `lane model <provider/model | default> for wl-…`, alone or in a paste, stays
+pending until you record its `in-…` id on that workload (or answer your question about it).
+The tick, `orchestrator_launch_lane` and `as2 lane` refuse to start there, naming that id.
+Recording commits the model and your reading before starting a waiting autonomous lane.
+Newest valid line wins; older recordings refuse with the newer id. If prose names another
+model, ask Jo for the exact line instead of recording the older one.
 
 ## The one-liner
 
@@ -255,5 +253,5 @@ a file except `/dev/null`. `read`, `grep`, `find`, `ls` and the ledger tools sta
 command the gates do not model is refused, not allowed, and a one-command change Jo names is no
 exception: it is a workload, opened in one line, and a lane runs it.
 
-With `gates.cleanShell` on, a bash call with `name`, or `pty: true` without `PI_NO_PTY=1`, is
+With `gates.cleanShell` on, bash with `name` or `pty: true` without `PI_NO_PTY=1` is
 refused; use `async: true`.

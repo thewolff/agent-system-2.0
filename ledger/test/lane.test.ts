@@ -26,7 +26,9 @@ function decide(rows: ReserveRows): ReserveVerdict {
 	if (attempts.length === 0) return { launch: true, cause: "first" };
 	return { launch: false, reason: "died-not-relaunched" };
 }
-const reserve = (l: Ledger, wl: string, cap = 3) => l.reserveLane(wl, { by: LANE_STARTER_BY, cap, leaseMs: 180_000, requestedBy: "test", decide });
+/** The workload the caller names as where Jo's typed inputs live: the surface passes its standing workload; the ledger hard-codes none. */
+const RECEIPTS = "wl-receipts";
+const reserve = (l: Ledger, wl: string, cap = 3) => l.reserveLane(wl, { by: LANE_STARTER_BY, cap, leaseMs: 180_000, requestedBy: "test", receiptWorkload: RECEIPTS, decide });
 const launches = (l: Ledger, wl: string) => l.entries(wl, "assumption").filter((e) => e.body.startsWith("launch: "));
 
 describe("holder-checked release (decision 5)", () => {
@@ -76,7 +78,7 @@ describe("reserveLane (decision 8)", () => {
 		expect(reserve(l, w)).toMatchObject({ ok: true, laneId: "lane-ord-1" });
 		expect(l.releaseWorkload(w, { by: LANE_STARTER_BY, holder: "lane-ord-1" })).toEqual({ released: true });
 		// the policy would now refuse (one attempt exists); a policy that allows again mints the next ordinal
-		const again = l.reserveLane(w, { by: LANE_STARTER_BY, cap: 3, leaseMs: 1000, requestedBy: "jo", decide: () => ({ launch: true, cause: "request en-x" }) });
+		const again = l.reserveLane(w, { by: LANE_STARTER_BY, cap: 3, leaseMs: 1000, requestedBy: "jo", receiptWorkload: RECEIPTS, decide: () => ({ launch: true, cause: "request en-x" }) });
 		expect(again).toEqual({ ok: true, laneId: "lane-ord-2", cause: "request en-x" });
 		expect(launches(l, w).map((e) => e.body)).toEqual(["launch: lane-ord-1 cause first requested-by test", "launch: lane-ord-2 cause request en-x requested-by jo"]);
 		l.close();
@@ -93,13 +95,54 @@ describe("reserveLane (decision 8)", () => {
 			seen.push(rows.liveLanes);
 			return { launch: false, reason: "spy" };
 		};
-		const peek = (wl: string) => l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 1000, requestedBy: "t", decide: spy });
+		const peek = (wl: string) => l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 1000, requestedBy: "t", receiptWorkload: RECEIPTS, decide: spy });
 		l.claimWorkload(a, { by: "lane-a-1", holder: "lane-a-1", leaseMs: 60_000 });
 		l.claimWorkload(b, { by: "lane-b-1", holder: "lane-b-1", leaseMs: 50 });
 		l.claimWorkload(c, { by: "orch", holder: "jo", leaseMs: null });
 		Bun.sleepSync(80);
 		peek(d);
 		expect(seen).toEqual([1]);
+		l.close();
+	});
+
+	test("the receipt workload's raw instructions and assumption entries reach the policy, oldest first, inside the transaction", () => {
+		const { ledger: l } = fresh("receipts");
+		const r = l.openWorkload({ brief: "receipts", stakes: "normal", mode: "autonomous", by: "orch", id: RECEIPTS });
+		const w = l.openWorkload({ brief: "w", stakes: "normal", mode: "autonomous", by: "orch" });
+		const first = l.recordInstruction({ by: "surface", workloadId: r, body: "one", author: "jo", channel: "surface" });
+		const second = l.recordInstruction({ by: "surface", workloadId: r, body: "two", author: "jo", channel: "surface" });
+		const reading = l.recordEntry({ by: "surface", workloadId: r, kind: "assumption", body: "reading: x" });
+		const seen: ReserveRows[] = [];
+		const res = l.reserveLane(w, { by: LANE_STARTER_BY, cap: 3, leaseMs: 1000, requestedBy: "t", receiptWorkload: r, decide: (rows) => {
+			seen.push(rows);
+			return { launch: false, reason: "pending-model: waits" };
+		} });
+		expect(res).toEqual({ ok: false, reason: "pending-model: waits" });
+		expect(seen[0]!.receiptInputs.map((i) => i.id)).toEqual([first, second]);
+		expect(seen[0]!.receiptEntries.map((e) => e.id)).toEqual([reading]);
+		expect(launches(l, w)).toHaveLength(0);
+		expect(l.workload(w)!.holder).toBeNull();
+		expect(l.launchRows(w, 3, r)!.receiptInputs.map((i) => i.body)).toEqual(["one", "two"]);
+		l.close();
+	});
+
+	test("a launch decision with no receipt workload fails closed: it throws before reading or writing anything", () => {
+		const { ledger: l } = fresh("no-receipts");
+		const w = l.openWorkload({ brief: "w", stakes: "normal", mode: "autonomous", by: "orch" });
+		let called = false;
+		const spy = (): ReserveVerdict => {
+			called = true;
+			return { launch: true, cause: "first" };
+		};
+		for (const missing of [undefined, "", "   "]) {
+			// A caller written against the old signature (no receiptWorkload) is not stopped by the type at run time.
+			const input = { by: LANE_STARTER_BY, cap: 3, leaseMs: 1000, requestedBy: "t", receiptWorkload: missing, decide: spy } as unknown as Parameters<Ledger["reserveLane"]>[1];
+			expect(() => l.reserveLane(w, input)).toThrow("names its receipt workload");
+			expect(() => l.launchRows(w, 3, missing as unknown as string)).toThrow("names its receipt workload");
+		}
+		expect(called).toBe(false);
+		expect(launches(l, w)).toHaveLength(0);
+		expect(l.workload(w)!.holder).toBeNull();
 		l.close();
 	});
 
@@ -119,7 +162,7 @@ describe("reserveLane (decision 8)", () => {
 				if (rows.entries.some((e) => e.body.startsWith("launch: "))) return { launch: false, reason: "died-not-relaunched" };
 				return { launch: true, cause: "first" };
 			};
-			console.log(JSON.stringify(l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 180_000, requestedBy: "worker", decide })));
+			console.log(JSON.stringify(l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 180_000, requestedBy: "worker", receiptWorkload: ${JSON.stringify(RECEIPTS)}, decide })));
 			l.close();`;
 		const procs: Bun.Subprocess<"ignore", "pipe", "pipe">[] = [];
 		for (const wl of wls) for (let i = 0; i < 3; i++) procs.push(Bun.spawn(["bun", "-e", worker, "--", path, wl], { stdout: "pipe", stderr: "pipe" }));

@@ -1192,3 +1192,6 @@ surface/scripts/orchestrator-prompt.ts	module	-
 surface/test/base-prompt.test.ts	test	-
 # Test runner self-refresh (migration/items/test-runner-self-refresh.md): row 6 pins for the refresh helper's sudo forms.
 gates/test/as2test-refresh-pins.test.ts	test	-
+# Pending lane model before start (migration/items/pending-model-start.md): Jo's typed lane-model line reader.
+surface/src/pending-lane-model.ts	module	-
+surface/test/pending-lane-model.test.ts	test	-

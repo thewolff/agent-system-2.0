@@ -65,7 +65,7 @@ describe("launch predicate matrix (§ 3 states)", () => {
 
 describe("awaiting close: the holder's done-because: stands (L1, the by-hand wasted launch)", () => {
 	const rows = (w: WorkloadRow, entries: EntryRow[], holders: string[] = []): ReserveRows => ({
-		workload: w, entries, questions: [], instructions: [], slices: [], holders, liveLanes: 0, cap: 3, now: NOW,
+		workload: w, entries, questions: [], instructions: [], slices: [], holders, receiptInputs: [], receiptEntries: [], liveLanes: 0, cap: 3, now: NOW,
 	});
 	const done = (by: string) => entry(by, "done-because: all five slices done");
 	test("a by-hand holder's receipt, no launch: history: the ledger's recorded holder makes it the holder's; nothing launches", () => {

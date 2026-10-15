@@ -16,9 +16,9 @@ import { type ErrorLine, errorLines, parseDue } from "./errors";
 import { type Identity, identityOf } from "./identity";
 import { parseSpend } from "./ceiling";
 import { ceilingOf, ceilingText } from "./input";
-import { byHandLine, controlEntries, doneLine, holdersOf, isPlanQuestionIn, planFirst } from "./launch";
+import { byHandLine, controlEntries, doneLine, holdersOf, isPlanQuestionIn, pendingLaneModel, pendingModelLine, planFirst } from "./launch";
 import { Numbering } from "./numbering";
-import { LAST_N, LEDGER_TOOL, STANDING_WORKLOAD_ID } from "./types";
+import { LAST_N, LEDGER_TOOL, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID } from "./types";
 
 export interface RenderOptions {
 	now?: string;
@@ -85,6 +85,12 @@ function instructionLine(i: InstructionRow): string {
 	}
 }
 
+/** Jo's model input the workload waits for (PLAN wl-mv8d45mqycd8g0 D3), read from the standing workload's input rows and reading receipts; null when none. */
+function pendingModel(ledger: Ledger, workloadId: string) {
+	if (workloadId === STANDING_WORKLOAD_ID) return null;
+	return pendingLaneModel(workloadId, ledger.instructions(STANDING_WORKLOAD_ID), ledger.entries(STANDING_WORKLOAD_ID, "assumption"));
+}
+
 /** One workload's block. */
 export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: number = LAST_N): string {
 	const { workload, slices, openQuestions, pendingMessages } = w;
@@ -108,6 +114,8 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 	const lane = workload.holder ? `${workload.holder} (lease until ${workload.holder_lease_until ?? "none"})` : "none";
 	out.push(`opened ${when(workload.created_at)} by ${workload.created_by}; last activity ${when(workload.last_activity_at)}; lane: ${lane}`);
 	if (workload.mode === "user-driven" && !due && !workload.holder) out.push(`by hand: \`${byHandLine(workload.id)}\``);
+	const pending = pendingModel(ledger, workload.id);
+	if (pending) out.push(`model pending: ${pendingModelLine(workload.id, pending)}`);
 	out.push(`slices: ${slices.length === 0 ? "none open" : ""}`);
 	for (const s of slices) out.push(`- ${s.id} [${s.state}] ${s.task} — done when: ${s.done_condition}; inputs: ${s.inputs}`);
 	if (openQuestions.length > 0) {
@@ -162,6 +170,8 @@ export function workloadLine(ledger: Ledger, w: InFlightWorkload, lines: readonl
 	if (mine.length > 0) parts.push(`needs you: ${mine.map((l) => (l.n === undefined ? l.kind : `#${l.n}`)).join(", ")}`);
 	if (openQuestions.length > 0) parts.push(`open questions: ${openQuestions.map((q) => q.id).join(", ")}`);
 	if (pendingMessages.length > 0) parts.push(`${pendingMessages.length} message(s) not yet acted on`);
+	const pending = pendingModel(ledger, workload.id);
+	if (pending) parts.push(`waits for model input ${pending.inputId} (lane model ${pending.selector}): record it with ${RECORD_INSTRUCTION_TOOL}`);
 	return parts.join(" · ");
 }
 

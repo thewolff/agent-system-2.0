@@ -69,7 +69,7 @@ import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } fr
 import { PAIR_OPTION, type PairSignalId, pairOffer, pairOfferBody, readPairSuggestConfig } from "../src/pair-suggest";
 import { laneDeaths } from "../src/signals";
 import { parseHeartbeat, runDirOf, runsRoot, testRuns } from "../src/test-run";
-import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV } from "../src/types";
+import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV, STANDING_WORKLOAD_ID } from "../src/types";
 import { readCleanShell } from "../../gates/src/clean-shell";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 
@@ -283,7 +283,7 @@ function failAfterReserve(ledger: Ledger, wl: string, laneId: string, f: Fail, l
 
 function reserveOrExit(ledger: Ledger, wl: string, who: string, interactive: boolean): string {
 	const r = ledger.reserveLane(wl, {
-		by: LANE_STARTER_BY, cap: laneCap(process.env), leaseMs: PRECLAIM_LEASE_MS, requestedBy: who,
+		by: LANE_STARTER_BY, cap: laneCap(process.env), leaseMs: PRECLAIM_LEASE_MS, requestedBy: who, receiptWorkload: STANDING_WORKLOAD_ID,
 		decide: interactive ? decideInteractive : decideLaunch,
 	});
 	if (r.ok) return r.laneId;
@@ -421,7 +421,7 @@ async function cmdDrain(after: string): Promise<number> {
 			for (;;) {
 				const next = ledger.inFlight().map((w) => w.workload.id).find((id) => {
 					if (tried.has(id)) return false;
-					const rows = ledger.launchRows(id, cap);
+					const rows = ledger.launchRows(id, cap, STANDING_WORKLOAD_ID);
 					return rows !== null && verdictOf(rows).launch;
 				});
 				if (next === undefined) break;

@@ -38,6 +38,11 @@
 // between commands reach the orchestrator as one instruction per run, named in the echo by their
 // line span, for it to record as one row afterwards: the commands are transactional, the prose is
 // handed on, not committed with them. A paste with no command line at all is prose.
+// One exception (PLAN wl-mv8d45mqycd8g0 D2): a run carrying Jo's model line (`lane model <provider/model>
+// for <wl-…>`, surface/src/pending-lane-model.ts) is written as Jo's input row in the commands'
+// transaction, its in- id echoed, so the workload waits for it before any launch the commands hand
+// on (`pendingLaneModel`). A run whose model line is invalid or names no open workload, or a
+// model-bearing paste Jo did not type as one message, refuses the whole paste before any write.
 //
 // Jo's prose as a receipt (Codex review of PR #55, B1; MIGRATION.md item 105 fix round 1; PLAN
 // wl-mv65nllu5g181s): while an orchestrator question is open or a workload besides the standing one
@@ -80,7 +85,9 @@ import type { Ledger } from "../../ledger/src/index";
 import { AWAY_NOTICE, pendingText, surfaceWord } from "../src/batch";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
-import { apply, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, modeFlipControl, type PasteInstruction, runHeartbeat } from "../src/input";
+import { apply, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, modeFlipControl, type PasteInstruction, type PasteItem, runHeartbeat } from "../src/input";
+import { controlEntries, laneModel, modelIntent, pendingLaneModel } from "../src/launch";
+import { modelLineShape } from "../src/pending-lane-model";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { oneLinerCore } from "../src/render";
 import { DISCARDED_KEPT, type SurfaceSession, surfaceSession, type TypedEntry } from "../src/session";
@@ -96,6 +103,39 @@ const launches = (cmd: Command): string | null => resumes(cmd) ?? (cmd.kind === 
 
 /** `line 5` or `lines 5–7`: the span of a paste's plain-words run. */
 const span = (i: PasteInstruction): string => (i.from === i.to ? `line ${i.from}` : `lines ${i.from}–${i.to}`);
+
+/** A model-bearing plain-words run of a paste (PLAN wl-mv8d45mqycd8g0 D2): Jo's valid model line(s) for one open workload. */
+interface ModelRun {
+	selector: string;
+	target: string;
+}
+
+/**
+ * Every plain-words run of a validated paste that carries Jo's model line, checked before anything is written (D1, D2):
+ * a run whose model lines are not valid (`modelIntent`) or whose workload is not open refuses the whole paste on its span.
+ */
+function modelRuns(ledger: Ledger, items: readonly PasteItem[]): { ok: true; runs: Map<PasteInstruction, ModelRun> } | { ok: false; item: PasteInstruction; why: string } {
+	const runs = new Map<PasteInstruction, ModelRun>();
+	for (const item of items) {
+		if (item.kind !== "instruction") continue;
+		const intent = modelIntent(item.text);
+		if (intent.kind === "none") continue;
+		if (intent.kind === "invalid") return { ok: false, item, why: `${intent.why}; no lane model is taken from this paste` };
+		const w = ledger.workload(intent.target);
+		if (!w || w.status !== "open" || w.id === STANDING_WORKLOAD_ID) {
+			return { ok: false, item, why: `lane model ${intent.selector} names ${intent.target}, which is ${w ? (w.status === "open" ? "the standing workload" : "closed") : "not in the ledger"}; a lane model names an open workload` };
+		}
+		runs.set(item, { selector: intent.selector, target: intent.target });
+	}
+	return { ok: true, runs };
+}
+
+/** The model a workload's lanes run on now, for a warning: Jo's pending input when there is one, else the recorded `lane-model:` or the profile default. */
+function modelInForce(ledger: Ledger, target: string): string {
+	const pending = pendingLaneModel(target, ledger.instructions(STANDING_WORKLOAD_ID), ledger.entries(STANDING_WORKLOAD_ID, "assumption"));
+	if (pending) return `Jo's model input ${pending.inputId} (lane model ${pending.selector}) still waits to be recorded`;
+	return `${target} runs on ${laneModel(controlEntries(ledger.entries(target, "assumption"))) ?? "the profile default"}`;
+}
 
 /**
  * Apply one word command: `apply`, plus the control entry a mode flip implies (`modeFlipControl`), in the caller's
@@ -259,7 +299,24 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			});
 			pi.appendEntry("surface-jo-input", { id });
 			const answer = open.length > 0 ? `if they answer ${open.join(" or ")}, record that with ${RECORD_INSTRUCTION_TOOL} naming questionId and inputId ${id}; ` : "";
-			echo(s, ctx, text, [`Jo's words above are input ${id}: ${answer}if they instruct you about an open workload, record that with ${RECORD_INSTRUCTION_TOOL} naming workloadId and inputId ${id} (Jo's words are read from the row, never from your parameters); if they do neither, record nothing`], "info");
+			const lines = [`Jo's words above are input ${id}: ${answer}if they instruct you about an open workload, record that with ${RECORD_INSTRUCTION_TOOL} naming workloadId and inputId ${id} (Jo's words are read from the row, never from your parameters); if they do neither, record nothing`];
+			// Jo's model line (PLAN wl-mv8d45mqycd8g0 D1, D2): a valid one makes its workload wait for the recording; an invalid one is an ordinary input with no model effect.
+			const intent = modelIntent(text);
+			let warn = false;
+			if (intent.kind === "valid") {
+				const w = l.workload(intent.target);
+				if (w?.status === "open" && w.id !== STANDING_WORKLOAD_ID) {
+					lines.push(`it names lane model ${intent.selector} for ${intent.target}: ${intent.target} starts no lane until you record ${id} with ${RECORD_INSTRUCTION_TOOL} naming workloadId ${intent.target}, which starts any lane waiting on it`);
+				} else {
+					warn = true;
+					lines.push(`it names lane model ${intent.selector} for ${intent.target}, which is ${w ? (w.status === "open" ? "the standing workload" : "closed") : "not in the ledger"}: no lane runs on it`);
+				}
+			} else if (intent.kind === "invalid") {
+				warn = true;
+				const target = intent.target;
+				lines.push(`no lane model taken from ${id}: ${intent.why}; ${target ? modelInForce(l, target) : "no workload's model changed"}; to name a model Jo sends \`${modelLineShape(target ?? "<wl-…>")}\``);
+			}
+			echo(s, ctx, text, lines, warn ? "warning" : "info");
 		} catch (err) {
 			echo(s, ctx, text, [`could not write Jo's words as an input row: ${reason(err)}`], "warning");
 		}
@@ -350,7 +407,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 	};
 
 	/** A turn's prompt as Jo's input (see the header): a command applies; prose goes to `asProse`, which the caller's take decides. */
-	const turn = async (s: SurfaceSession, ctx: Ctx, text: string, asProse: (ledger: Ledger | null) => void): Promise<undefined> => {
+	const turn = async (s: SurfaceSession, ctx: Ctx, text: string, joTyped: boolean, asProse: (ledger: Ledger | null) => void): Promise<undefined> => {
 		// Several lines are a paste, one command per line (a numbered batch one per line included, so its refusals name their lines).
 		const paste = text.includes("\n");
 		// Prose passes through untouched, without a ledger read (unless it is Jo's receipt, see the header): only a batch-shaped prompt, a short command, or a paste with such a line can be a command.
@@ -388,20 +445,49 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				refuse(verdicts, r.held, r.refused.find((f) => f.why !== null)!.line);
 				return undefined;
 			}
+			// Jo's model lines among the plain-words runs (PLAN wl-mv8d45mqycd8g0 D1, D2): checked whole before anything is written, so a
+			// refused run, or a paste that is not one message Jo typed, leaves no mode flip, no input row and no pending model behind.
+			const models = modelRuns(ledger, r.items);
+			const commandsUnapplied = r.items.flatMap((i) => (i.kind === "instruction" ? [] : [{ at: i.line, line: `line ${i.line} "${i.text}": ok, not applied` }]));
+			const heldBut = (bad: PasteInstruction): PasteInstruction[] => r.items.filter((i): i is PasteInstruction => i.kind === "instruction" && i !== bad);
+			if (!models.ok) {
+				refuse([...commandsUnapplied, { at: models.item.from, line: `${span(models.item)}: ${models.why}` }], heldBut(models.item), models.item.from);
+				return undefined;
+			}
+			const untyped = joTyped ? undefined : [...models.runs].at(0);
+			if (untyped) {
+				const [item, m] = untyped;
+				const why = `${span(item)}: names lane model ${m.selector} for ${m.target}, and this paste is not one message Jo typed, so it carries no model authority: Jo re-sends it as one message`;
+				refuse([...commandsUnapplied, { at: item.from, line: why }], heldBut(item), item.from);
+				return undefined;
+			}
 			let echoes: { wl: string | null; line: string }[];
+			const inputIds: string[] = [];
 			try {
-				// All-or-nothing, one transaction, in paste order; each command through apply(), so each is its own ledger row.
-				echoes = ledger.write(() =>
-					r.items.flatMap((item) => {
-						if (item.kind === "instruction") return [{ wl: null, line: `${span(item)} → an instruction for you, one row: "${item.text.replace(/\s*\n\s*/g, " ")}"` }];
+				// All-or-nothing, one transaction, in paste order; each command through apply(), so each is its own ledger row. Each model run
+				// is Jo's input row in the same transaction, so every one exists before launchAfter runs, whatever line it sat on (D2).
+				echoes = ledger.write(() => {
+					inputIds.length = 0; // a busy retry runs the transaction again from the top
+					return r.items.flatMap((item) => {
+						if (item.kind === "instruction") {
+							const m = models.runs.get(item);
+							if (!m) return [{ wl: null, line: `${span(item)} → an instruction for you, one row: "${item.text.replace(/\s*\n\s*/g, " ")}"` }];
+							ensureStandingWorkload(ledger);
+							const id = ledger.recordInstruction({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: standingSlice(ledger)?.id ?? null, body: item.text, author: "jo", channel: "surface" });
+							inputIds.push(id);
+							return [{
+								wl: null,
+								line: `${span(item)} → Jo's words are input ${id}, naming lane model ${m.selector} for ${m.target}: record it with ${RECORD_INSTRUCTION_TOOL} naming workloadId ${m.target} and inputId ${id} (Jo's words are read from the row, never from your parameters); ${m.target} starts no lane until then`,
+							}];
+						}
 						try {
 							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, heartbeatOf)}` }));
 							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd, heartbeatOf) }];
 						} catch (err) {
 							throw new LineFailure(item.line, item.text, err);
 						}
-					}),
-				);
+					});
+				});
 			} catch (err) {
 				// The transaction rolled back: the ledger's refusal, on its line; every other command line stands unapplied.
 				const held = r.items.filter((i): i is PasteInstruction => i.kind === "instruction");
@@ -415,6 +501,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				else echo(s, ctx, text, [`could not apply "${text}": ${reason(err)}`], "warning");
 				return undefined;
 			}
+			for (const id of inputIds) pi.appendEntry("surface-jo-input", { id });
 			await launchAfter(ledger, echoes);
 			echo(s, ctx, text, echoes.map((e) => e.line), "info");
 			return undefined;
@@ -495,7 +582,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			joInputRow(s, ctx, text, joTyped, ledger);
 		};
 		try {
-			return await turn(s, ctx, text, asProse);
+			return await turn(s, ctx, text, joTyped, asProse);
 		} finally {
 			if (take?.kind === "joined" && !prose) {
 				echo(s, ctx, text, [`${take.texts.length} messages Jo typed arrived joined as one prompt (OMP steeringMode all); none got an input row: re-send the plain-words ones one at a time, or set steeringMode to one-at-a-time`], "warning");

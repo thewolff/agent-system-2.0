@@ -19,7 +19,7 @@ import { branchName, type ControlEntry, doneBody, laneCap, laneDir, laneEnv, lan
 import { heartbeatText, runDirOf, runsRoot, testRequestedBody, testRunBody } from "../src/test-run";
 // A namespace import, not named ones: a name lane.ts stops exporting fails only the test that calls it, not the module load.
 import * as laneScript from "../scripts/lane";
-import { SURFACE_BY } from "../src/types";
+import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import {
 	alive, drainEnded, drainLinesOf, drainSettled, drainsSpawned, type FakeStep, fakeRecords, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh, until,
 } from "./helpers";
@@ -341,7 +341,7 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const r = makeRoot();
 		const l = ledgerOf(r);
 		const wl = l.openWorkload({ by: SURFACE_BY, brief: "no repo", stakes: "normal", mode: "autonomous" });
-		const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", decide: () => ({ launch: true, cause: "first" }) });
+		const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", receiptWorkload: STANDING_WORKLOAD_ID, decide: () => ({ launch: true, cause: "first" }) });
 		l.close();
 		if (!res.ok) throw new Error(res.reason);
 		const run = lane(r, ["run", wl, res.laneId]);
@@ -1382,7 +1382,7 @@ describe("item 71: a queued launch starts when a lane slot frees (the runner's d
 	const priorAttempt = (r: LaneRoot, wl: string): string => {
 		const l = ledgerOf(r);
 		try {
-			const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", decide: () => ({ launch: true, cause: "first" }) });
+			const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", receiptWorkload: STANDING_WORKLOAD_ID, decide: () => ({ launch: true, cause: "first" }) });
 			if (!res.ok) throw new Error(res.reason);
 			l.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: res.laneId });
 			l.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(res.laneId, { code: 0, signal: null, outcome: "completed" }) });
@@ -1403,7 +1403,7 @@ describe("item 71: a queued launch starts when a lane slot frees (the runner's d
 	const verdict = (r: LaneRoot, wl: string) => {
 		const l = ledgerOf(r);
 		try {
-			return verdictOf(l.launchRows(wl, laneCap(r.env))!);
+			return verdictOf(l.launchRows(wl, laneCap(r.env), STANDING_WORKLOAD_ID)!);
 		} finally {
 			l.close();
 		}

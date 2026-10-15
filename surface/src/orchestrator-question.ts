@@ -23,7 +23,7 @@
 // — go through `answerOrchestratorQuestion`. A withdrawal on the standing slice always replans
 // (`apply`): a `cancel` would cancel the slice (schema.sql questions_resolution_settles_slice) and
 // no orchestrator question could be raised again.
-import type { InstructionRow, Ledger } from "../../ledger/src/index";
+import type { EntryRow, InstructionRow, Ledger } from "../../ledger/src/index";
 import { ensureStandingWorkload, standingSlice } from "./identity";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
@@ -53,8 +53,13 @@ export function raiseOrchestratorQuestion(ledger: Ledger, input: { body: string;
 
 /** The subject workload of an orchestrator question, from its surface-written subject entry; null when the ask named none. */
 export function questionSubject(ledger: Ledger, questionId: string): string | null {
-	for (const e of ledger.entries(STANDING_WORKLOAD_ID, "assumption")) {
-		if (e.created_by !== SURFACE_BY) continue;
+	return subjectIn(ledger.entries(STANDING_WORKLOAD_ID, "assumption"), questionId);
+}
+
+/** `questionSubject` over the standing workload's assumption entries already read (a launch decision's snapshot): pure. */
+export function subjectIn(entries: readonly EntryRow[], questionId: string): string | null {
+	for (const e of entries) {
+		if (e.kind !== "assumption" || e.workload_id !== STANDING_WORKLOAD_ID || e.created_by !== SURFACE_BY) continue;
 		const m = SUBJECT.exec(e.body);
 		if (m && m[1] === questionId) return m[2]!;
 	}
@@ -79,8 +84,13 @@ const READING = /\(input (in-[a-z0-9]+) (?:answers|instructs) ((?:q|wl)-[a-z0-9]
 
 /** The question or workload `inputId` was already spent on (its reading entry names it), or null while the input is unused. */
 export function inputSpent(ledger: Ledger, inputId: string): string | null {
-	for (const e of ledger.entries(STANDING_WORKLOAD_ID, "assumption")) {
-		if (e.created_by !== SURFACE_BY || !e.body.startsWith("reading: ")) continue;
+	return spentIn(ledger.entries(STANDING_WORKLOAD_ID, "assumption"), inputId);
+}
+
+/** `inputSpent` over the standing workload's assumption entries already read (a launch decision's snapshot): pure, the one reading-receipt parser. */
+export function spentIn(entries: readonly EntryRow[], inputId: string): string | null {
+	for (const e of entries) {
+		if (e.kind !== "assumption" || e.workload_id !== STANDING_WORKLOAD_ID || e.created_by !== SURFACE_BY || !e.body.startsWith("reading: ")) continue;
 		const m = READING.exec(e.body);
 		if (m && m[1] === inputId) return m[2]!;
 	}
