@@ -26,6 +26,7 @@ import {
 	copyProblem,
 	defaultLedgerPath,
 	Ledger,
+	migrateLedger,
 	type Stakes,
 } from "../../ledger/src/index";
 import { errorLines } from "../../surface/src/errors";
@@ -168,7 +169,10 @@ function replayBytes(bytes: Uint8Array, name: string, now: string, table: TierTa
 	try {
 		const path = join(tmp, "ledger.db");
 		writeFileSync(path, bytes);
-		// skipLocalityCheck: a temporary copy; the check would read $HOME and spawn df/mount.
+		// skipLocalityCheck: a temporary copy; the check would read $HOME and spawn df/mount. Fixtures
+		// frozen at an older schema are upgraded explicitly (Ledger.open never upgrades); the copy is
+		// throwaway, so no snapshot, and its frozen leases are not live lanes.
+		migrateLedger(path, { snapshot: false, force: true, skipLocalityCheck: true });
 		const ledger = Ledger.open(path, { backupOnOpen: false, backup: false, clock: () => now, skipLocalityCheck: true });
 		try {
 			return replaySnapshot(ledger, name, now, table);

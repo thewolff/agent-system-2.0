@@ -159,7 +159,8 @@ describe("provenance cannot be omitted", () => {
 		expect(() => l.openWorkload({ brief: "b", stakes: "normal", mode: "autonomous", by: "" })).toThrow("CHECK constraint failed");
 		const w = l.openWorkload({ brief: "b", stakes: "normal", mode: "autonomous", by: "orch-1" });
 		expect(() => l.addSlice({ workloadId: w, task: "t", doneCondition: "d", inputs: "i", by: "   " })).toThrow("CHECK constraint failed");
-		expect(() => l.db.run("UPDATE workloads SET stakes = 'production' WHERE id = ?", [w])).toThrow("unstamped update");
+		// An unstamped holder change (stakes would meet workloads_stakes_needs_instruction first, schema version 6).
+		expect(() => l.db.run("UPDATE workloads SET holder = 'lane-x' WHERE id = ?", [w])).toThrow("unstamped update");
 		l.close();
 	});
 
@@ -305,7 +306,7 @@ describe("runtime obligations", () => {
 		const init = Bun.spawnSync(["bun", "run", join(REPO, "ledger", "scripts", "init.ts")], { env, stdout: "pipe", stderr: "pipe" });
 		expect(init.stderr.toString()).toBe("");
 		expect(init.exitCode).toBe(0);
-		expect(init.stdout.toString()).toContain(`ledger ok: path=${path} schema_version=5 journal_mode=wal`);
+		expect(init.stdout.toString()).toContain(`ledger ok: path=${path} schema_version=6 journal_mode=wal`);
 		const use = Bun.spawnSync(["bun", "-e", `
 			import { Ledger } from ${JSON.stringify(join(REPO, "ledger", "src", "index.ts"))};
 			const l = Ledger.open();
@@ -521,11 +522,11 @@ describe("scheduled second copy (S2)", () => {
 		expect(script("backup.ts", path, "--force").out).toMatch(/^backup ok: took /);
 		expect(copies(path).length).toBe(2);
 		const check = Bun.spawnSync([SQLITE3, copyPaths(path)[0]!, "PRAGMA user_version; PRAGMA integrity_check;"]);
-		expect(check.stdout.toString().trim().split("\n")).toEqual(["5", "ok"]);
+		expect(check.stdout.toString().trim().split("\n")).toEqual(["6", "ok"]);
 	});
 });
 
-describe("a ledger at an older or unknown schema version is refused unchanged, never upgraded (N1)", () => {
+describe("a ledger at a version older than the oldest upgrade (5), or unknown, is refused unchanged, never upgraded (N1; version 5's upgrade is freeze.test.ts)", () => {
 	/** Everything the refusal must leave alone: version, schema objects, rows. */
 	const state = (path: string) =>
 		sqlite(path, "PRAGMA user_version; SELECT count(*) FROM sqlite_master; SELECT group_concat(id || ':' || brief) FROM workloads;").out;
@@ -544,7 +545,7 @@ describe("a ledger at an older or unknown schema version is refused unchanged, n
 			expect(sqlite(path, `INSERT INTO workloads (id, brief, stakes, mode, created_by, created_at, changed_by, changed_at) VALUES ('wl-old', 'written under version ${version}', 'normal', 'autonomous', ${RAW_STAMPS});`).err).toBe("");
 			const before = state(path);
 			expect(before.split("\n")[0]).toBe(String(version));
-			const refusal = [`ledger at ${realpathSync(path)} is schema version ${version}`, "predates the supported schema (version 5)"];
+			const refusal = [`ledger at ${realpathSync(path)} is schema version ${version}`, "predates the supported schema (version 6) and every version this module upgrades"];
 
 			for (const opts of [{}, { create: true }]) {
 				let error: unknown;
@@ -622,7 +623,7 @@ describe("a ledger at an older or unknown schema version is refused unchanged, n
 		const path = l.path;
 		l.close();
 		sqlite(path, "PRAGMA user_version = 7;");
-		expect(() => Ledger.open(path)).toThrow(`ledger at ${path} is schema version 7, which is not the supported schema (version 5)`);
+		expect(() => Ledger.open(path)).toThrow(`ledger at ${path} is schema version 7, which is not the supported schema (version 6)`);
 		expect(script("init.ts", path).exitCode).toBe(4);
 		expect(sqlite(path, "PRAGMA user_version;").out).toBe("7");
 	});
@@ -650,7 +651,11 @@ describe("a nonpositive physical identity is refused, so ordinary writes keep wo
 			const r = sqlite(l.path, `INSERT INTO provenance (seq, at, workload_id, lane_instance, tbl, row_id, action) VALUES (${seq}, ${RAW_NOW}, '${w}', 'raw', 'workloads', '${w}', 'insert');`);
 			expect({ exitCode: r.exitCode, err: r.err }).toMatchObject({ exitCode: 1, err: expect.stringContaining("a provenance seq is a positive integer") });
 		}
-		l.setStakes(w, { stakes: "production", by: "orch-1" });
+		// As the surface writes it: the stakes change with its `stakes: <stakes>` instruction, one transaction.
+		l.write(() => {
+			l.recordInstruction({ by: "orch-1", workloadId: w, author: "jo", channel: "surface", body: "stakes: production" });
+			l.setStakes(w, { stakes: "production", by: "orch-1" });
+		});
 		expect(l.workload(w)?.stakes).toBe("production");
 		expect(sqlite(l.path, "SELECT count(*) FROM provenance WHERE seq <= 0;").out).toBe("0");
 		l.close();
@@ -763,7 +768,7 @@ describe("a failed snapshot never leaves a file that counts as a copy (M2 third 
 		const taken = job.out.replace(/^backup ok: took /, "").trim();
 		expect(readdirSync(copyDir).sort()).toEqual(["SOURCE", aged, `${empty}.db.invalid`, basename(taken)].sort());
 		const check = Bun.spawnSync([SQLITE3, taken, "PRAGMA user_version; PRAGMA integrity_check;"]);
-		expect(check.stdout.toString().trim().split("\n")).toEqual(["5", "ok"]);
+		expect(check.stdout.toString().trim().split("\n")).toEqual(["6", "ok"]);
 	});
 });
 
@@ -884,7 +889,7 @@ describe("initialization honours busyRetries (S4)", () => {
 		const path = join(scratch("s4-wait"), "ledger.db");
 		const holder = await holdFreshFile(path, 400);
 		const l = Ledger.open(path, { create: true, busyTimeoutMs: 0, busyRetries: 8 });
-		expect(l.db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(5);
+		expect(l.db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(6);
 		expect(l.openWorkload({ brief: "b", stakes: "normal", mode: "autonomous", by: "o" })).toMatch(/^wl-/);
 		l.close();
 		expect(await holder.exited).toBe(0);

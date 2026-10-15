@@ -58,8 +58,15 @@ const eventsOf = (r: LaneRoot, pid: number) => fakeRecords(r).filter((x) => x.pi
 const exitOf = (r: LaneRoot, wl: string, laneId: string) => until(`lane-exit: of ${laneId}`, () => laneExit(laneSnapshot(r, wl).control, laneId));
 const startedOf = (r: LaneRoot, wl: string, laneId: string) => until(`lane-started: of ${laneId}`, () => laneStarted(laneSnapshot(r, wl).control, laneId));
 const readyOf = (r: LaneRoot, wl: string, laneId: string) => until(`lane-ready: of ${laneId}`, () => laneSnapshot(r, wl).control.find((c) => c.prefix === "lane-ready" && c.laneId === laneId));
-/** Fault injection on the temp ledger only: a trigger that aborts the insert of an entry whose body starts with `prefix`. */
+/**
+ * Fault injection on the temp ledger only: a trigger that aborts the insert of an entry whose body starts with `prefix`.
+ * Ledger.open refuses a file with a trigger schema.sql does not have, so the trigger is named to it as a fault
+ * (AGENT_SYSTEM_LEDGER_FAULT_TRIGGERS, ledger/SCHEMA.md "Trigger check"): in the lane script's environment, and in this
+ * process's, which reads the same file afterwards (snapshots, settleDrains).
+ */
 function failEntryInsert(r: LaneRoot, prefix: string, message: string): void {
+	r.env.AGENT_SYSTEM_LEDGER_FAULT_TRIGGERS = "inject_failure";
+	process.env.AGENT_SYSTEM_LEDGER_FAULT_TRIGGERS = "inject_failure";
 	const db = new Database(r.ledgerPath);
 	try {
 		db.exec(`CREATE TRIGGER inject_failure BEFORE INSERT ON entries WHEN NEW.body LIKE '${prefix}%' BEGIN SELECT RAISE(ABORT, '${message}'); END;`);

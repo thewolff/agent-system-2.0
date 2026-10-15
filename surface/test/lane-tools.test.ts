@@ -1104,8 +1104,11 @@ describe("item 40: lane_release with work open, and the terminal pair while a ha
 	});
 
 	test("D4 atomicity: a marker insert that fails rolls the release back — the lane still holds, no ctx.shutdown, its tools still work", async () => {
-		const { ledger, wl, ctx, call } = laneFixture();
+		const { ledger, wl, env, ctx, call } = laneFixture();
 		ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "open", doneCondition: "d", inputs: "i" });
+		// The tool's own ledger handle is opened before the fault goes in: Ledger.open refuses a file carrying a
+		// trigger schema.sql does not have (ledger/SCHEMA.md, Trigger check); an open connection sees it all the same.
+		gateSession(ctx, env).ledger();
 		ledger.db.exec("CREATE TRIGGER inject_marker_failure BEFORE INSERT ON entries WHEN NEW.body LIKE 'released-open:%' BEGIN SELECT RAISE(ABORT, 'injected marker failure'); END;");
 		const reply = await call("lane_release", {});
 		expect(reply).toContain("could not be released: injected marker failure");

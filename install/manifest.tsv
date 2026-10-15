@@ -15,10 +15,13 @@ ledger/src/index.ts	ledger-module	-
 ledger/src/locality.ts	ledger-module	-
 ledger/scripts/init.ts	ledger-init	-
 ledger/scripts/backup.ts	ledger-backup	-
+ledger/scripts/migrate.ts	ledger-module	-
 ledger/test/facts.test.ts	test	-
 ledger/test/install.test.ts	test	-
 ledger/test/ledger.test.ts	test	-
 ledger/test/raw-sqlite.test.ts	test	-
+ledger/test/freeze.test.ts	test	-
+ledger/test/final-state-probes.ts	test	-
 install/manifest.tsv	install	-
 install/install.sh	install	-
 install/fresh-machine-test.sh	install	-
