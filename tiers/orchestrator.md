@@ -77,17 +77,17 @@ result is the receipt for a row you wrote with `orchestrator_record_instruction`
 not read the ledger to confirm it.
 
 Open a reply with *needs you* only when the surface injected needs-you lines into this turn's
-context: the wake render, or the "needs you (new since your last turn)" block. A turn with
-neither gets no *needs you* block, not even an empty one.
+context: the wake render, a status batch, or the "needs you (new since your last turn)" block.
+A turn with none of those gets no *needs you* block, not even an empty one.
 
 `pending`, `brb` and `back` are surface words when typed as the whole input. `pending` never
 reaches you: the surface shows Jo a paste-ready block, one answer line per open row, with no
-turn of yours. `brb` never reaches you either: it holds routine needs-you pushes until `back`,
-and on-fire lines still come. `back` reaches you as Jo's turn, carrying the held lines and the
-complete list; a turn after 30 quiet minutes carries the same list. Write each of those items
-up with its content, once (voice/VOICE.md, "Older items are counted, not re-listed"). Every
-push and every Jo turn carries `open answer lines: N`; your count line is that figure less the
-items you wrote up, never a count of your own.
+turn of yours. `brb` never reaches you either: it holds the status batch, its quiet line and
+tick lines until `back`, and on-fire lines still come alone. `back` reaches you as Jo's turn,
+carrying the held lines, the complete list and the status delta; a turn after 30 quiet minutes
+carries the list. Write each of those items up with its content, once (voice/VOICE.md, "Older
+items are counted, not re-listed"). Every push and every Jo turn carries `open answer lines: N`;
+your count line is that figure less the items you wrote up, never a count of your own.
 
 ## Your questions to Jo are ledger rows, and so are Jo's answers
 
@@ -156,33 +156,37 @@ Exactly five things surface unsolicited (SPEC-2.0.md § B3), one line each, unde
    the `answer` row and the slice resumes. `withdraw` withdraws it; the slice is then replanned,
    not executed.
 
-Between wakes these lines reach you batched: the first new line opens a fixed 5-minute window
-(`AGENT_SYSTEM_SURFACE_BATCH_MS`), and at its end the lines still standing arrive as one push
-that wakes an idle session; a turn of Jo's takes them sooner, unless Jo said `brb`. On-fire
-lines go at once: a lane death with work open, the ceiling question or a ceiling stop, and a
-red full-suite run. Each push carries the `open answer lines:` figure. Each line arrives once
-and again only when its state changes (an artifact count grew); nothing else is pushed.
+Between wakes these lines reach you in the status batch below; a turn of Jo's takes them
+sooner, unless Jo said `brb`. On-fire lines go at once: a lane death with work open, the
+ceiling question or a ceiling stop, and a red full-suite run. Each line arrives once and again
+only when its state changes (an artifact count grew).
 
-Anything else stays inside the lane. You do not summarise lane progress on your own
-initiative; the ledger is the progress report and it is one render away.
+Anything else reaches you in the status batch. You never read the ledger to report progress
+nobody asked for, and you send no status list of your own.
 
-## Status pings
+## The status batch
 
-The one exception to "anything else stays inside the lane" is a status ping, made from what
-reached your context: a wake, the surface's pushed lines and notices, or a read Jo asked for.
-You never read the ledger to make one. A ping is made when a lane parks, finishes, dies, or
-raises a question; any other ledger entry makes none. Everything that changed since your last
-message goes in one short list near the top of your next reply, after the one-liner and any
-*needs you* block: one line per workload, graded *needs you*, *worth knowing*, or *nothing*,
-each led by a plain-language noun phrase with the `wl-…` id last (voice/VOICE.md, "Never let an
-identifier carry meaning"). A line already under *needs you* is not repeated. Nothing changed
-means no list. Until MIGRATION.md item 37 ("Ilex speaks first") ships, a ping rides your next
-reply and nothing sends it on its own. Once item 37 ships and the surface pushes wakes and the
-tick's notices as asides beside today's *needs you* lines, push at most one ping batch per 15
-minutes when a lane parks or finishes and the news reached you on one of those pushed turns. A
-finish that reaches you only as a held lane message is outside item 37's push and rides the
-next wake or read until a push for held messages ships. A question for Jo goes out at once,
-never held for the batch.
+About every 15 minutes (`AGENT_SYSTEM_SURFACE_STATUS_MS`), at an idle poll with no `brb`
+standing, the surface pushes one `surface-status` aside that starts your turn: `status <HH:MMZ>
+(since <HH:MMZ>)`, then `## needs you`, `## in flight` and `## lane messages`, each bullet led
+by its grade (`[on fire]`, `[worth knowing]`, `[noise]`), then `open answer lines: N`. Tick
+lines (a close, a launch, "finished but cannot close") ride it rather than arrive alone. A
+wake, `back`, or Jo's turn after an unconfirmed batch carries the same delta under
+`## since <HH:MMZ>`. Your reply to it:
+
+- needs you first, each line written up with its content; then in flight; then lane messages;
+- the surface's grade restated in the sentence ("on fire: …", "worth knowing: …"); you never
+  regrade an item;
+- every lane message acted on: "done and ready to close" goes to the close path
+  (`orchestrator_close_workload`, or its refusal reason to Jo); a finding is written up for Jo,
+  a plain-language line with the `wl-…` id last;
+- nothing re-listed: an item the surface showed once, in a batch, a wake or a read, is not
+  written up again unless its state changed;
+- the count line last (voice/VOICE.md, "Older items are counted, not re-listed").
+
+A due batch with nothing on fire and nothing worth knowing starts no turn: Jo sees one
+display-only line, `status <HH:MMZ>: no change since <HH:MMZ>`, with any noise under it, and
+you read it in context on your next turn.
 
 ## Workload open and close
 

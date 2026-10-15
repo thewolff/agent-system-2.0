@@ -1,7 +1,8 @@
-// Batched needs-you arrivals (PLAN wl-mv5msri070p0qo D3, D4): which § B3 lines go out on their own
-// poll (on fire) and which wait in the session's hold for one push per window, plus the blocks the
-// surface adds around them. Pure: reads only; the hold itself lives on the session
-// (surface/src/session.ts) and the poll and Jo's turn drive it (surface/extensions/wake.ts).
+// Batched needs-you arrivals (PLAN wl-mv5msri070p0qo D3, D4; the window replaced by the status clock,
+// PLAN wl-mv8igegljun18g D1): which § B3 lines go out on their own poll (on fire) and which wait in the
+// session's hold for the next status batch (surface/src/status.ts), plus the blocks the surface adds
+// around them. Pure: reads only; the hold itself lives on the session (surface/src/session.ts) and the
+// poll and Jo's turn drive it (surface/extensions/wake.ts).
 //
 // On fire (D3), a line pushes at once on the poll that finds it:
 // 1. `lane-died` on a workload that still has open or paused slices;
@@ -10,7 +11,7 @@
 // 3. `idle` whose `lane-exit:` is `outcome stop reason ceiling`: a ceiling stop after the question
 //    was answered or withdrawn;
 // 4. `test-run`: a red or error full-suite run at a PR head.
-// Everything else waits for the window.
+// Everything else waits for the status batch.
 import type { Ledger } from "../../ledger/src/index";
 import type { ErrorLine } from "./errors";
 import { isCeilingQuestion } from "./input";
@@ -23,8 +24,8 @@ export const BACK_HEADING = "back: everything waiting on you (complete list; wri
 export const QUIET_HEADING = "quiet stretch: everything waiting on you (complete list, once)";
 /** The heading of a needs-you push and of a Jo turn carrying lines new since his last turn. */
 export const NEEDS_YOU_HEADING = "needs you (new since your last turn)";
-/** `brb`'s one confirmation (D4). */
-export const AWAY_NOTICE = "holding needs-you pushes until `back`; on-fire items still come through";
+/** `brb`'s one confirmation (D4; the status batch held too, PLAN wl-mv8igegljun18g D5). */
+export const AWAY_NOTICE = "holding status batches and needs-you pushes until `back`; on-fire items still come through";
 
 /** A line's identity, as `Delivered` keys it (surface/src/delivery.ts): `kind:workloadId:rowId`. */
 export const lineKey = (l: ErrorLine): string => `${l.kind}:${l.workloadId}:${l.rowId}`;
@@ -68,7 +69,12 @@ export function pendingText(ledger: Ledger): string {
 	return pendingBlock(pendingItems(ledger), pendingWaits(ledger)).text;
 }
 
-/** The count line every needs-you push and every Jo turn carries (D3): N is the pending block's count. */
+/** How many open answer lines the `pending` block lists: the N of the count line and of the status quiet line (PLAN wl-mv8igegljun18g D4). */
+export function openAnswerCount(ledger: Ledger): number {
+	return pendingBlock(pendingItems(ledger)).count;
+}
+
+/** The count line every needs-you push, status batch and Jo turn carries (D3): N is the pending block's count. */
 export function countLine(ledger: Ledger): string {
-	return `open answer lines: ${pendingBlock(pendingItems(ledger)).count} (\`pending\` shows them all)`;
+	return `open answer lines: ${openAnswerCount(ledger)} (\`pending\` shows them all)`;
 }

@@ -1,9 +1,9 @@
-// Ilex speaks first (MIGRATION.md item 37; PLAN.md rev 8 of wl-muq0ex1024xtkw, § Tests W1–W9, N1–N6; W10 from review round 1):
-// a pending wake (launch, restart, compaction) is pushed as an aside when the session is idle and
-// confirmed by its `message_end`, or rides Jo's turn; the tick's notices are pushed the same way from
-// their own queue. The test plays OMP's part: it fires the one-shot (ctx.setTimeout) and the poll
-// (ctx.setInterval), emits `message_end` for a pushed message the way OMP admits it, keeps unconfirmed
-// sends as OMP's ACP branch would, and runs the `context` hook over what would reach the model.
+// Ilex speaks first (MIGRATION.md item 37; PLAN.md rev 8 of wl-muq0ex1024xtkw, § Tests W1–W9, N1–N6; W10 from review round 1;
+// N1–N6 moved to the status batch, PLAN wl-mv8igegljun18g D1, D3): a pending wake (launch, restart, compaction) is pushed as
+// an aside when the session is idle and confirmed by its `message_end`, or rides Jo's turn; the tick's lines ride the
+// next status batch, a pushed wake or Jo's turn, and are never pushed on their own. The test plays OMP's part: it fires the
+// one-shot (ctx.setTimeout) and the poll (ctx.setInterval), emits `message_end` for a pushed message the way OMP admits it,
+// keeps unconfirmed sends as OMP's ACP branch would, and runs the `context` hook over what would reach the model.
 import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -14,7 +14,7 @@ import orchestratorSurface from "../index";
 import { doneBody } from "../src/launch";
 import { surfaceSession } from "../src/session";
 import { SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, type Sent, timeouts, timers, tmp } from "./helpers";
+import { clock, ctxOf, fakePi, type Sent, timeouts, timers, tmp } from "./helpers";
 
 const APPLIED = "## Applied from the surface since your last turn";
 type Turn = { systemPrompt: string[]; messages: Sent["message"][] };
@@ -213,10 +213,10 @@ describe("Fix 1: a pending wake is pushed as an aside, and confirmed", () => {
 		const earlier = [{ role: "user", content: "hi", timestamp: 0 }, keyed("surface-wake", "wake:0", 1, "old wake a"), keyed("surface-wake", "wake:0", 2, "old wake b"), { role: "assistant", content: [{ type: "text", text: "ok" }], timestamp: 0 }];
 		const tail = [
 			keyed("surface-wake", "wake:1", 1, "wake copy 1"),
-			keyed("surface-notices", "notices:1", 3, "notice copy 1"),
+			keyed("surface-status", "status:1", 3, "status copy 1"),
 			keyed("surface-wake", "wake:1", 2, "wake copy 2"),
 			{ role: "custom", customType: "surface-needs-you", content: "unkeyed", display: true, timestamp: 0 },
-			keyed("surface-notices", "notices:1", 4, "notice copy 2"),
+			keyed("surface-status", "status:1", 4, "status copy 2"),
 		];
 		const out = await t.f.context([...earlier, ...tail], t.ctx);
 		expect(out).toEqual([...earlier, tail[2], tail[3], tail[4]]);
@@ -273,34 +273,51 @@ describe("Fix 1: a pending wake is pushed as an aside, and confirmed", () => {
 	});
 });
 
-describe("Fix 2: the tick's notices are pushed from their own queue, and confirmed", () => {
+describe("Fix 2, moved to the status batch: the tick's lines ride the next batch, a pushed wake or Jo's turn (PLAN wl-mv8igegljun18g D1)", () => {
+	/** A surface on a settable session clock (the status interval is measured on it): `minutes` moves it. */
+	function clocked(o: { idle?: boolean } = {}) {
+		const t = surface(o);
+		const c = clock("2026-10-01T10:00:00.000Z");
+		t.s().now = c.now;
+		const minutes = (m: number) => c.at(new Date(Date.parse(c.now()) + m * 60_000).toISOString());
+		/** The batches that start a turn (a quiet line is the same custom type, sent with no options). */
+		const batches = () => t.of("surface-status").filter((x) => (x.options as { triggerTurn?: boolean } | undefined)?.triggerTurn === true);
+		return { ...t, minutes, batches };
+	}
 	/** A surface whose wake Jo already took and read. */
 	async function awake(o: { idle?: boolean } = {}) {
-		const t = surface(o);
+		const t = clocked(o);
 		await t.start();
 		await t.jo();
 		await t.read();
 		return t;
 	}
+	const tickBullet = (line: string) => `- [worth knowing] ${line}`;
 
-	test("N1 a tick notice is pushed as an aside; once confirmed, Jo's next turn carries no Applied block and the same state sends nothing", async () => {
+	test("N1 a tick line queued after a status poll waits for the next batch and rides it, never an aside of its own; once confirmed, Jo's next turn carries no Applied block and the same state adds nothing", async () => {
 		const t = await awake();
 		const w = stuck(t.e);
 		t.tick();
-		const pushed = t.of("surface-notices");
+		expect(t.s().tickNotices).toEqual([w.line(1)]);
+		expect(t.f.sent).toEqual([]);
+		t.minutes(15);
+		t.tick();
+		const pushed = t.batches();
 		expect(pushed).toHaveLength(1);
-		expect(pushed[0]!.message.content).toBe(`${APPLIED}\n- ${w.line(1)}`);
+		expect(pushed[0]!.message.content.split("\n\n## in flight\n")[1]).toContain(tickBullet(w.line(1)));
 		expect(pushed[0]!.options).toEqual({ deliverAs: "aside", triggerTurn: true });
-		expect(keyOf(pushed[0]!.message)).toMatch(/^notices:/);
+		expect(keyOf(pushed[0]!.message)).toMatch(/^status:/);
 		await t.admit(pushed[0]!);
+		expect(t.s().tickNotices).toEqual([]);
 		expect(appliedOf(await t.jo())).toEqual([]);
 		t.tick();
-		expect(t.of("surface-notices")).toHaveLength(1);
+		expect(t.s().tickNotices).toEqual([]);
+		expect(t.batches()).toHaveLength(1);
 	});
 
-	/** N2's shared start: a tick line queued while the wake is pending rides the wake aside; a second line queued after it goes out alone. */
+	/** N2's shared start: a tick line queued while the wake is pending rides the wake aside; a second line queued after it waits for the next batch. */
 	async function ridesTheWake() {
-		const t = surface({ idle: false });
+		const t = clocked({ idle: false });
 		const w = stuck(t.e);
 		await t.start();
 		t.tick(); // busy: the wake stays pending, the tick's line waits for it
@@ -310,72 +327,91 @@ describe("Fix 2: the tick's notices are pushed from their own queue, and confirm
 		const wakes = t.of("surface-wake");
 		expect(wakes).toHaveLength(1);
 		expect(occurrences(wakes[0]!.message.content, `- ${w.line(1)}`)).toBe(1);
-		expect(t.of("surface-notices")).toEqual([]);
 		w.addSlice();
 		t.opts.idle = false;
 		t.tick(); // busy: the second line is queued after the render
 		expect(t.f.sent).toHaveLength(1);
 		await t.admit(wakes[0]!);
+		expect(t.s().tickNotices).toEqual([w.line(2)]);
 		t.opts.idle = true;
 		t.tick();
-		const pushed = t.of("surface-notices");
-		expect(pushed).toHaveLength(1);
-		expect(pushed[0]!.message.content).toBe(`${APPLIED}\n- ${w.line(2)}`);
-		return { t, w, pushed: pushed[0]! };
+		expect(t.f.sent).toHaveLength(1);
+		return { t, w };
 	}
 
-	test("N2 rides the wake: the line queued while the wake was pending goes out once inside it; the later line goes out alone; confirmed, Jo's turn carries neither", async () => {
-		const { t, pushed } = await ridesTheWake();
-		await t.admit(pushed);
+	test("N2 rides the wake: the line queued while the wake was pending goes out once inside it; the later line rides the next status batch alone; confirmed, Jo's turn carries neither", async () => {
+		const { t, w } = await ridesTheWake();
+		t.minutes(15);
+		t.tick();
+		const pushed = t.batches();
+		expect(pushed).toHaveLength(1);
+		expect(occurrences(pushed[0]!.message.content, w.line(2))).toBe(1);
+		expect(occurrences(pushed[0]!.message.content, w.line(1))).toBe(0);
+		await t.admit(pushed[0]!);
 		expect(appliedOf(await t.jo())).toEqual([]);
 	});
 
-	test("N2 variant: the later batch left unconfirmed reaches Jo's turn alone, never the line the wake carried", async () => {
+	test("N2 variant: the later line reaches Jo's turn alone before any batch, never the line the wake carried", async () => {
 		const { t, w } = await ridesTheWake();
 		expect(appliedOf(await t.jo())).toEqual([`- ${w.line(2)}`]);
+		t.minutes(15);
 		t.tick();
-		expect(t.of("surface-notices")).toHaveLength(1);
+		for (const b of t.batches()) expect(b.message.content).not.toContain(w.line(2));
 	});
 
-	test("N3 echoes stay with Jo's turn: only the tick notice is pushed; the word echo arrives in that turn's message", async () => {
+	test("N3 echoes stay with Jo's turn: only the tick line rides the batch; the word echo arrives in that turn's message", async () => {
 		const t = await awake();
 		const w = stuck(t.e);
 		t.s().notices.push(`stakes on ${w.wl} → production`);
 		t.tick();
-		const pushed = t.of("surface-notices");
+		t.minutes(15);
+		t.tick();
+		const pushed = t.batches();
 		expect(pushed).toHaveLength(1);
-		expect(pushed[0]!.message.content).toBe(`${APPLIED}\n- ${w.line(1)}`);
+		expect(pushed[0]!.message.content).toContain(tickBullet(w.line(1)));
+		expect(pushed[0]!.message.content).not.toContain("→ production");
 		await t.admit(pushed[0]!);
 		expect(appliedOf(await t.jo())).toEqual([`- stakes on ${w.wl} → production`]);
 	});
 
-	test("N4 a dropped batch is resent at the next two polls, then nothing, even with a new line queued; Jo's turn carries the old and the new line once each", async () => {
+	test("N4 a dropped batch is resent at the next two idle polls, then nothing, even with a new line queued and the interval past; Jo's turn retires it and carries the old and the new line once each", async () => {
 		const t = await awake();
 		const w = stuck(t.e);
 		t.tick();
+		t.minutes(15);
 		t.tick();
 		t.tick();
-		const pushed = t.of("surface-notices");
+		t.tick();
+		const pushed = t.batches();
 		expect(pushed).toHaveLength(3);
-		expect(new Set(pushed.map((p) => p.message.content))).toEqual(new Set([`${APPLIED}\n- ${w.line(1)}`]));
+		expect(new Set(pushed.map((p) => p.message.content)).size).toBe(1);
 		expect(new Set(pushed.map((p) => keyOf(p.message))).size).toBe(1);
 		t.tick();
 		w.addSlice();
 		t.tick();
-		expect(t.of("surface-notices")).toHaveLength(3);
-		expect(appliedOf(await t.jo())).toEqual([`- ${w.line(1)}`, `- ${w.line(2)}`]);
+		t.minutes(30);
 		t.tick();
-		expect(t.of("surface-notices")).toHaveLength(3);
+		expect(t.of("surface-status")).toHaveLength(3);
+		const turn = await t.jo();
+		expect(appliedOf(turn)).toEqual([`- ${w.line(1)}`, `- ${w.line(2)}`]);
+		expect(t.s().retiredKeys.has(keyOf(pushed[0]!.message)!)).toBe(true);
+		// the interval is long past and Jo's ordinary turn does not restart it: the next poll may show the quiet line, never another turn
+		t.tick();
+		expect(t.batches()).toHaveLength(3);
 	});
 
 	test("N5 distinct batches survive the guard: two batches confirmed by fold-style message_end leave the queue empty, both reach the model, and Jo's turn renders neither again", async () => {
 		const t = await awake();
 		const w = stuck(t.e);
 		t.tick();
-		await t.admit(t.of("surface-notices")[0]!);
+		t.minutes(15);
+		t.tick();
+		await t.admit(t.batches()[0]!);
 		w.addSlice();
 		t.tick();
-		const pushed = t.of("surface-notices");
+		t.minutes(15);
+		t.tick();
+		const pushed = t.batches();
 		expect(pushed).toHaveLength(2);
 		await t.admit(pushed[1]!);
 		expect(keyOf(pushed[0]!.message)).not.toBe(keyOf(pushed[1]!.message));
@@ -385,20 +421,21 @@ describe("Fix 2: the tick's notices are pushed from their own queue, and confirm
 		expect(appliedOf(await t.jo())).toEqual([]);
 	});
 
-	test("N6 notice fallback under ACP defer: the 3 deferred copies give way to Jo's render, which carries the old and the newer line", async () => {
+	test("N6 batch fallback under ACP defer: the 3 deferred copies are dropped by the guard once Jo's turn retires their key; his render carries the old and the newer line", async () => {
 		const t = await awake();
 		const w = stuck(t.e);
+		t.tick();
+		t.minutes(15);
 		t.tick();
 		t.tick();
 		t.tick();
 		t.tick();
 		w.addSlice();
 		t.tick();
-		const deferred = t.of("surface-notices").map((p) => asContext(p.message));
+		const deferred = t.of("surface-status").map((p) => asContext(p.message));
 		expect(deferred).toHaveLength(3);
 		const turn = await t.jo();
 		const render = asContext(turn.messages[0]!);
-		expect(keyOf(render)).toBe(keyOf(deferred[0]!));
 		const out = (await t.f.context([...deferred, render], t.ctx)) as { content?: string }[];
 		const carrying = out.filter((m) => typeof m.content === "string" && m.content.includes(w.line(1)));
 		expect(carrying).toEqual([render]);

@@ -18,6 +18,7 @@ import { launchVerdict } from "../extensions/launch";
 import orchestratorSurface from "../index";
 import { recordRepo } from "../src/decision-log";
 import { branchName, doneBody, laneExit, laneStarted, worktreePath } from "../src/launch";
+import { surfaceSession } from "../src/session";
 import { SURFACE_BY } from "../src/types";
 import { ctxOf, drainSettled, fakePi, fakeRecords, git, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, notices, setScript, settleDrains, sh, timers, until } from "./helpers";
 
@@ -41,22 +42,30 @@ function orchestrator(r: LaneRoot) {
 		const p = sh([command, ...args], r.repo, r.env);
 		return { stdout: p.out, stderr: p.err, code: p.code, killed: false };
 	};
-	orchestratorSurface(f.pi, { ...r.env, AGENT_SYSTEM_ROLE: "orchestrator" }, {});
+	const env = { ...r.env, AGENT_SYSTEM_ROLE: "orchestrator" };
+	orchestratorSurface(f.pi, env, {});
 	const ctx = ctxOf({ cwd: r.repo });
 	const call = async (tool: string, params: Record<string, unknown>) => {
 		const res = await f.tool(tool).execute("1", params, undefined, undefined, ctx);
 		return { text: res.content[0]!.text, details: res.details as Record<string, unknown> | undefined };
 	};
-	/** Jo's first turn takes the wake and he reads it, so a later tick's poll pushes notices rather than the wake (MIGRATION.md item 37). */
+	/** Jo's first turn takes the wake and he reads it, so a later tick's lines queue for the status batch rather than ride the wake (MIGRATION.md item 37). */
 	const awake = async () => {
 		timers.length = 0;
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx);
 		await call("orchestrator_wake_read", { body: "nothing open" });
 	};
-	/** The tick's notices, pushed as `surface-notices` asides. */
-	const pushedNotices = () => f.sent.filter((s) => s.message.customType === "surface-notices");
-	return { f, ctx, call, awake, pushedNotices };
+	/** The tick's lines queued for the next status batch, pushed wake or Jo's turn (PLAN wl-mv8igegljun18g D1): never pushed on their own. */
+	const queued = () => surfaceSession(ctx, env).tickNotices;
+	/** Jo's next turn: the lines of its Applied block. */
+	const appliedTurn = async (): Promise<string[]> => {
+		const turn = (await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
+		const text = turn.messages.map((m) => m.content).join("\n");
+		const heading = "## Applied from the surface since your last turn\n";
+		return text.includes(heading) ? text.split(heading)[1]!.split("\n\n")[0]!.split("\n") : [];
+	};
+	return { f, ctx, call, awake, queued, appliedTurn };
 }
 const exitOf = (r: LaneRoot, wl: string, laneId: string) => until(`lane-exit: of ${laneId}`, () => laneExit(laneSnapshot(r, wl).control, laneId), 60_000);
 const addSlice = { tool: "lane_add_slice", args: { task: "add the line", doneCondition: "README has the line", inputs: "README.md", kind: "change-small" } };
@@ -231,12 +240,11 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		l.close();
 		return wl;
 	};
-	const APPLIED = "## Applied from the surface since your last turn\n";
 
 	test("the tick closes a released workload whose by-hand holder wrote done-because: (L1): no lane launched, the entry committed, the close stamped as the surface, one notice line", async () => {
 		const r = laneRoot();
 		roots.push(r);
-		const { f, awake, pushedNotices } = orchestrator(r);
+		const { f, awake, queued, appliedTurn } = orchestrator(r);
 		const wl = byHand(r, { completeSlice: true });
 		await awake();
 		timers[0]!.fn();
@@ -253,10 +261,11 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		const close = l.provenance(wl).filter((p) => p.tbl === "workloads" && (p.detail ?? "").includes("status open->closed"));
 		l.close();
 		expect(close.map((p) => p.lane_instance)).toEqual([SURFACE_BY]);
-		// the close's notice is pushed when the catch-up ends, after the awaited close
-		const [notice] = await until("the tick's notice", () => (pushedNotices().length > 0 ? pushedNotices() : null));
-		const applied = notice!.message.content.split(APPLIED)[1]!.split("\n");
-		expect(applied).toHaveLength(1);
+		// the close's line is queued when the catch-up ends, after the awaited close; nothing is pushed for it
+		const [line] = await until("the tick's line", () => (queued().length > 0 ? [...queued()] : null));
+		expect(f.sent.filter((s) => s.message.customType !== "surface-status")).toEqual([]);
+		const applied = await appliedTurn();
+		expect(applied).toEqual([`- ${line}`]);
 		expect(applied[0]).toStartWith(`- tick: closed ${wl}: README.md carries a verify line — Decision-log entry `);
 		expect(applied[0]).toEndWith(` committed on ${branchName(wl)}; pushed to origin; PR opened: ${PR_URL}.`);
 	}, 120_000);
@@ -264,7 +273,7 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 	test("the tick's close names a publish failure in its one notice line: gh failing leaves the entry committed and pushed, the close done, and Jo told there is no PR and why", async () => {
 		const r = laneRoot();
 		roots.push(r);
-		const { f, awake, pushedNotices } = orchestrator(r);
+		const { f, awake, queued, appliedTurn } = orchestrator(r);
 		const real = f.execs.answer;
 		f.execs.answer = (command, args) => (command === "gh" ? { stdout: "", stderr: "gh: not logged in", code: 1, killed: false } : real(command, args));
 		const wl = byHand(r, { completeSlice: true });
@@ -272,46 +281,42 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		timers[0]!.fn();
 		await until("the tick's close", () => laneSnapshot(r, wl).workload?.status === "closed");
 		expect(git(r.repo, ["ls-remote", "origin", `refs/heads/${branchName(wl)}`]).out.split(/\s/)[0]).toBe(git(r.repo, ["rev-parse", branchName(wl)]).out);
-		const [notice] = await until("the tick's notice", () => (pushedNotices().length > 0 ? pushedNotices() : null));
-		const applied = notice!.message.content.split(APPLIED)[1]!.split("\n");
+		await until("the tick's line", () => (queued().length > 0 ? [...queued()] : null));
+		const applied = await appliedTurn();
 		expect(applied).toHaveLength(1);
 		expect(applied[0]).toStartWith(`- tick: closed ${wl}: README.md carries a verify line — Decision-log entry `);
 		expect(applied[0]).toEndWith(` committed on ${branchName(wl)}; pushed to origin; no PR: gh pr list exited 1: gh: not logged in; open one from ${branchName(wl)}.`);
 	}, 120_000);
 
-	test("the tick does not close a workload awaiting close while a slice is open, and says so once per state: one notice after two ticks, again when the slice count changes", async () => {
+	test("the tick does not close a workload awaiting close while a slice is open, and says so once per state: one queued line after two ticks, again when the slice count changes; Jo's turn carries both", async () => {
 		const r = laneRoot();
 		roots.push(r);
-		const { f, ctx, awake, pushedNotices } = orchestrator(r);
+		const { f, awake, queued, appliedTurn } = orchestrator(r);
 		const wl = byHand(r, { completeSlice: false });
-		/** The pushed notices so far, each confirmed the way OMP admits it (its message_end), as their lines. */
-		const told = async () => {
-			const pushed = pushedNotices();
-			for (const p of pushed) await f.admit(p, ctx);
-			return pushed.map((p) => p.message.content.split(APPLIED)[1]!);
-		};
+		const stuckLine = (open: number) => `tick: ${wl} is finished but cannot close: ${open} open slice(s), 0 paused, 0 open question(s) — resolve them or close by hand`;
 		await awake();
 		// the stuck path awaits nothing (no close, no starter), so the catch-up has finished when the tick returns
 		timers[0]!.fn();
-		expect(await told()).toEqual([`- tick: ${wl} is finished but cannot close: 1 open slice(s), 0 paused, 0 open question(s) — resolve them or close by hand`]);
+		expect([...queued()]).toEqual([stuckLine(1)]);
 		timers[0]!.fn();
 		expect(laneSnapshot(r, wl).workload!.status).toBe("open");
 		expect(f.execs.calls).toEqual([]);
 		expect(git(r.repo, ["log", "--oneline"]).out.split("\n")).toHaveLength(1);
 		// same state on the next tick: nothing new
 		timers[0]!.fn();
-		expect(await told()).toHaveLength(1);
+		expect([...queued()]).toEqual([stuckLine(1)]);
 		// the counts change: told again, still no close and no launch
 		const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
 		l.addSlice({ by: SURFACE_BY, workloadId: wl, task: "one more", doneCondition: "d", inputs: "i" });
 		l.close();
 		timers[0]!.fn();
-		expect((await told()).slice(1)).toEqual([`- tick: ${wl} is finished but cannot close: 2 open slice(s), 0 paused, 0 open question(s) — resolve them or close by hand`]);
+		expect([...queued()]).toEqual([stuckLine(1), stuckLine(2)]);
 		timers[0]!.fn();
-		expect(await told()).toHaveLength(2);
-		// confirmed, the queue is drained: Jo's next turn carries no Applied block
-		const turn = (await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
-		expect(turn.messages.map((m) => m.content).join("\n")).not.toContain(APPLIED);
+		expect(queued()).toHaveLength(2);
+		// never pushed on their own: Jo's next turn carries both once, and drains the queue
+		expect(f.sent).toEqual([]);
+		expect(await appliedTurn()).toEqual([`- ${stuckLine(1)}`, `- ${stuckLine(2)}`]);
+		expect(queued()).toEqual([]);
 		expect(laneSnapshot(r, wl).workload!.status).toBe("open");
 		expect(f.execs.calls).toEqual([]);
 	}, 120_000);

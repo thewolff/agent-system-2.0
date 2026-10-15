@@ -8,7 +8,8 @@ import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import { Delivered } from "./delivery";
 import { Numbering } from "./numbering";
-import { BATCH_MS, BATCH_MS_ENV, type Ctx, POLL_MS, POLL_MS_ENV, QUIET_MS, QUIET_MS_ENV, ROLE_ENV, SURFACE_TOOLS, VOICE_ENV, WAKE_PUSH_MS, WAKE_PUSH_MS_ENV, WAKE_READ_TOOL } from "./types";
+import type { Receipt, StatusCore } from "./status";
+import { type Ctx, POLL_MS, POLL_MS_ENV, QUIET_MS, QUIET_MS_ENV, ROLE_ENV, STATUS_MS, STATUS_MS_ENV, SURFACE_TOOLS, VOICE_ENV, WAKE_PUSH_MS, WAKE_PUSH_MS_ENV, WAKE_READ_TOOL } from "./types";
 
 export const REPO_ROOT = join(import.meta.dir, "..", "..");
 export const VOICE_RELATIVE = join("voice", "VOICE.md");
@@ -71,7 +72,7 @@ export class SurfaceSession {
 	startSeq = 0;
 	/** The last DISCARDED_KEPT discarded typed texts (warned about, given no row): read only to warn when one arrives late, never a source of rows. */
 	readonly discarded: string[] = [];
-	/** The tick's lines (launch catch-up results), pushed as `surface-notices` asides; a line leaves only when a confirmed push or Jo's turn carried it. */
+	/** The tick's lines (launch catch-up results): a line leaves only when a confirmed status batch, a confirmed pushed wake or Jo's turn carried it (PLAN wl-mv8igegljun18g D1). */
 	readonly tickNotices: string[] = [];
 	/** The voice document reached the system prompt at least once, from the launch's base prompt or a turn's append (probes read this). */
 	voiceInjected = false;
@@ -80,20 +81,22 @@ export class SurfaceSession {
 	 * (bin/as2 launch), or a `before_agent_start` ran in this process. Until then a pushed wake inlines both.
 	 */
 	promptPrimed = false;
-	/** A wake pushed as an aside and not yet confirmed by its `message_end`: resent at the next idle polls, up to PUSH_TRIES sends. */
-	wakeInFlight: { wakeId: string; trigger: WakeTrigger; content: string; tries: number; carried: string[] } | null = null;
+	/**
+	 * A wake pushed as an aside and not yet confirmed by its `message_end`: resent at the next idle polls, up to PUSH_TRIES sends.
+	 * `receipt` is what its delta section and needs-you lines move at that confirmation (PLAN wl-mv8igegljun18g D2a), null when the render failed.
+	 */
+	wakeInFlight: { wakeId: string; trigger: WakeTrigger; content: string; tries: number; carried: string[]; receipt: Receipt | null } | null = null;
 	/** The pushed wake was never confirmed: it is pending for Jo's turn and nothing pushes it until his turn or a new trigger. */
 	wakeExhausted = false;
 	/** The key of a wake that fell back to pending: Jo's render reuses it so the guard drops every deferred copy. */
 	pendingWakeId: string | null = null;
-	/** Keys (`wake:<id>`) of wakes a new trigger superseded while in flight or fallen back: the `context` guard drops their deferred copies. */
+	/** Keys (`wake:<id>`, `status:<id>`) of pushes a later trigger or a takeover retired unconfirmed: the `context` guard drops their deferred copies. */
 	readonly retiredKeys = new Set<string>();
-	/** A tick batch pushed and not yet confirmed: resent at the next idle polls, up to PUSH_TRIES sends. */
-	noticesInFlight: { batchId: string; lines: string[]; content: string; tries: number } | null = null;
-	/** A batch was never confirmed: no tick line is pushed until Jo's turn renders the queue. */
-	noticesExhausted = false;
-	/** The key of the batch that fell back to Jo's turn, which renders the queue under it. */
-	pendingNoticesId: string | null = null;
+	/**
+	 * The status core (surface/src/status.ts, seat `orchestrator`): the 15-minute clock, the told set and floor, the batch in
+	 * flight. Created by the wake row (surface/extensions/wake.ts), which owns the callbacks that push.
+	 */
+	status: StatusCore | null = null;
 	/** Which § B3 lines this session has delivered, in which state (surface/src/delivery.ts). */
 	readonly delivered = new Delivered();
 	/** The numbers Jo answers needs-you lines with (surface/src/numbering.ts): stable for the session, never reused. */
@@ -115,13 +118,12 @@ export class SurfaceSession {
 	readonly refusedClose = new Map<string, string>();
 	/**
 	 * Routine needs-you lines found between wakes and not pushed yet (PLAN wl-mv5msri070p0qo D3), by
-	 * identity (`kind:workloadId:rowId`, surface/src/batch.ts lineKey): pushed as one aside when the
-	 * window ends, or taken by Jo's turn, re-checked against a fresh read either way. A wake clears it.
+	 * identity (`kind:workloadId:rowId`, surface/src/batch.ts lineKey): carried by the next status batch
+	 * (PLAN wl-mv8igegljun18g D1), or taken by Jo's turn, re-checked against a fresh read either way. A wake clears it;
+	 * a batch takes it into its record, and a takeover of that batch puts it back.
 	 */
 	readonly heldNeedsYou = new Set<string>();
-	/** When the first line now held was held (ms on the session clock): the window runs `batchMs` from here and does not slide. */
-	holdSince: number | null = null;
-	/** Jo typed `brb` (D4): the window never flushes and only `back` drains the hold; on-fire lines still go out, alone. */
+	/** Jo typed `brb` (D4): no status batch, quiet line or resend until `back`; on-fire lines still go out, alone. */
 	away: { since: string } | null = null;
 	/** Jo's previous typed input, on the session clock (D4's quiet stretch). */
 	lastTypedAt: string | null = null;
@@ -161,11 +163,10 @@ export class SurfaceSession {
 		return Number.isFinite(n) && n > 0 ? n : WAKE_PUSH_MS;
 	}
 
-	/** How long a routine needs-you line waits for others before the hold is pushed; 0 pushes at the poll that finds it. */
-	get batchMs(): number {
-		const raw = this.env[BATCH_MS_ENV];
-		const n = raw === undefined || raw.trim() === "" ? Number.NaN : Number(raw);
-		return Number.isFinite(n) && n >= 0 ? n : BATCH_MS;
+	/** How often the status batch is due (PLAN wl-mv8igegljun18g D1). */
+	get statusMs(): number {
+		const n = Number(this.env[STATUS_MS_ENV]);
+		return Number.isFinite(n) && n > 0 ? n : STATUS_MS;
 	}
 
 	/** How long Jo's silence must last for his next turn to carry the complete list. */
@@ -174,7 +175,7 @@ export class SurfaceSession {
 		return Number.isFinite(n) && n > 0 ? n : QUIET_MS;
 	}
 
-	/** A fresh push id (`wake:<id>`, `notices:<id>`). */
+	/** A fresh push id (`wake:<id>`). */
 	mintId(): string {
 		return `${this.#tag}-${++this.#serial}`;
 	}

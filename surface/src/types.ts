@@ -161,13 +161,15 @@ export const POLL_MS = 60_000;
 /** How long after session_start / session_compact the surface first tries to push a pending wake (ms); default WAKE_PUSH_MS. */
 export const WAKE_PUSH_MS_ENV = "AGENT_SYSTEM_SURFACE_WAKE_PUSH_MS";
 export const WAKE_PUSH_MS = 1_000;
-/** How long the surface holds routine needs-you lines before pushing them as one aside (ms), from the first held line, never sliding; default BATCH_MS. 0 pushes at the poll that finds them. */
-export const BATCH_MS_ENV = "AGENT_SYSTEM_SURFACE_BATCH_MS";
-export const BATCH_MS = 300_000;
+/** How often the surface's status batch is due (ms; PLAN wl-mv8igegljun18g D1): at the first idle poll this long after the last batch, wake render or `back`; default STATUS_MS. */
+export const STATUS_MS_ENV = "AGENT_SYSTEM_SURFACE_STATUS_MS";
+export const STATUS_MS = 900_000;
+/** The cap on a status delta section, in characters (PLAN wl-mv8igegljun18g D2a [R3-5]): an item that would cross it waits for the next batch. */
+export const STATUS_DELTA_CHARS = 24_000;
 /** A Jo turn this long after his previous typed input carries the complete pending list once (ms); default QUIET_MS. */
 export const QUIET_MS_ENV = "AGENT_SYSTEM_SURFACE_QUIET_MS";
 export const QUIET_MS = 1_800_000;
-/** How many times an unconfirmed wake or notice batch is sent before it falls back to Jo's next turn. */
+/** How many times an unconfirmed wake or status batch is sent before it falls back to Jo's next turn. */
 export const PUSH_TRIES = 3;
 
 /** Tools the surface registers on the orchestrator session. */

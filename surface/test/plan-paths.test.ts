@@ -28,8 +28,9 @@ type Turn = { systemPrompt: string[]; messages: Sent["message"][] };
 function env(): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
 	writeFileSync(voice, "VOICE DOC BODY");
-	// AGENT_SYSTEM_SURFACE_BATCH_MS 0: a held needs-you line goes out at the poll that finds it (PLAN wl-mv5msri070p0qo D3), as these tests read it.
-	const e = { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: join(tmp("ledger"), "ledger.db"), AGENT_SYSTEM_VOICE: voice, HOME: "/nonexistent-home", AGENT_SYSTEM_SURFACE_BATCH_MS: "0" };
+	// AGENT_SYSTEM_SURFACE_STATUS_MS 1 with a session clock that moves a second per read (start below): a held needs-you line goes out in
+	// the status batch of the poll that finds it (PLAN wl-mv8igegljun18g D1), as these tests read it.
+	const e = { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: join(tmp("ledger"), "ledger.db"), AGENT_SYSTEM_VOICE: voice, HOME: "/nonexistent-home", AGENT_SYSTEM_SURFACE_STATUS_MS: "1" };
 	Ledger.open(e.AGENT_SYSTEM_LEDGER_DB, { create: true, backup: false, backupOnOpen: false }).close();
 	return e;
 }
@@ -69,10 +70,12 @@ async function start(e: Record<string, string>, o: { exec?: boolean } = {}) {
 	orchestratorSurface(f.pi, e, {});
 	let idle = true;
 	const ctx = Object.assign(ctxOf(), { isIdle: () => idle });
+	const s = surfaceSession(ctx, e);
+	let at = Date.now();
+	s.now = () => new Date((at += 1000)).toISOString();
 	await f.emit("session_start", { type: "session_start" }, ctx);
 	const first = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as Turn;
 	await f.tool("orchestrator_wake_read").execute("1", { body: "resuming" }, undefined, undefined, ctx);
-	const s = surfaceSession(ctx, e);
 	/** OMP finishing an orchestrator turn: each message's `message_end`, then `agent_end`; returns the one-shots it armed. */
 	const turn = async (messages: unknown[]) => {
 		for (const message of messages) await f.emit("message_end", { type: "message_end", message }, ctx);
@@ -95,6 +98,13 @@ async function start(e: Record<string, string>, o: { exec?: boolean } = {}) {
 		n: (rowId: string) => s.numbering.numberOf(rowId)!,
 		/** The messages sent as one customType. */
 		of: (customType: string) => f.sent.filter((x) => x.message.customType === customType),
+		/** One poll, the catch-up settled, and every status message it sent confirmed (its `message_end`). */
+		pollConfirmed: async () => {
+			const before = f.sent.length;
+			timers[0]!.fn();
+			await settle(s);
+			for (const m of f.sent.slice(before)) if (m.message.customType === "surface-status") await f.emit("message_end", { type: "message_end", message: { role: "custom", ...m.message, timestamp: 0 } }, ctx);
+		},
 		jo: async (prompt: string) => (await f.emit("before_agent_start", { prompt, systemPrompt: [] }, ctx)) as Turn,
 		ledgerTool: async () => (await f.tool("orchestrator_ledger").execute("1", {}, undefined, undefined, ctx)).content[0]!.text,
 		turn,
@@ -187,7 +197,7 @@ describe("the orchestrator's own message (D3)", () => {
 		const pp = { role: "custom", customType: PLAN_PATH, content: `plan for ${q}: ${P}`, display: true };
 		const user = { role: "user", content: "hi" };
 		const reply = { role: "assistant", content: [{ type: "text", text: `see ${q}` }] };
-		const other = { role: "custom", customType: "surface-notices", content: "x", display: true };
+		const other = { role: "custom", customType: "surface-status", content: "x", display: true };
 		expect(await x.f.context([user, reply, pp, other], x.ctx)).toEqual([user, reply, other]);
 
 		const a = { role: "user", content: "a" };
@@ -370,7 +380,7 @@ describe("surface lines (D2)", () => {
 		l2.close();
 		x.f.sent.length = 0;
 		timers[0]!.fn();
-		const aside = x.of("surface-needs-you").map((m) => m.message.content);
+		const aside = x.of("surface-status").map((m) => m.message.content);
 		expect(aside).toHaveLength(1);
 		expect(aside[0]).toContain(`the orchestrator asked you (${oq}): Is ${q} the plan to approve tonight? — answer with one word: yes / no (or \`withdraw\`)\n  plan for ${q}: ${P}`);
 		expect(count(aside[0]!, P)).toBe(1);
@@ -417,10 +427,12 @@ describe("surface lines (D2)", () => {
 		expect(launchVerdict(l2, e, launchable).launch).toBe(true);
 		l2.close();
 		x.f.sent.length = 0;
-		timers[0]!.fn();
-		await settle(x.s);
-		routes.needsYou = x.of("surface-needs-you").map((m) => m.message.content).join("\n");
-		routes.tick = x.of("surface-notices").map((m) => m.message.content).join("\n");
+		// the first batch carries the needs-you line; the tick's line, queued after that poll, rides the next one
+		await x.pollConfirmed();
+		await x.pollConfirmed();
+		const batches = x.of("surface-status").map((m) => m.message.content);
+		routes.needsYou = batches.filter((b) => b.includes("\n\n## needs you\n")).join("\n");
+		routes.tick = batches.filter((b) => b.includes("tick: ")).join("\n");
 
 		await x.idleTurn([assistant(`#${n} waits.`)]);
 		routes.planPath = x.of(PLAN_PATH).map((m) => m.message.content).join("\n");
@@ -476,17 +488,17 @@ describe("surface lines (D2)", () => {
 		for (const q of order) expect(count(applied, paths[q]!)).toBe(1);
 		expect(applied.indexOf(paths[order[0]!]!)).toBeLessThan(applied.indexOf(paths[order[1]!]!));
 
-		// a tick notice naming a plan q- id: its path once in the surface-notices aside
+		// a tick line naming a plan q- id: its path once in the status batch that carries it
 		const l2 = open(e);
 		const launchable = l2.openWorkload({ by: SURFACE_BY, brief: "Add a verify line", stakes: "normal", mode: "autonomous" });
 		expect(launchVerdict(l2, e, launchable).launch).toBe(true);
 		l2.close();
 		x.f.sent.length = 0;
-		timers[0]!.fn();
-		await settle(x.s);
-		const notices9 = x.of("surface-notices").map((m) => m.message.content);
+		await x.pollConfirmed();
+		await x.pollConfirmed();
+		const notices9 = x.of("surface-status").map((m) => m.message.content).filter((b) => b.includes("tick: "));
 		expect(notices9).toHaveLength(1);
-		expect(notices9[0]).toContain(`- tick: ${launchable}: lane-t launched; it waits on ${one.q}\n  plan for ${one.q}: ${paths[one.q]}`);
+		expect(notices9[0]).toContain(`- [worth knowing] tick: ${launchable}: lane-t launched; it waits on ${one.q}\n  plan for ${one.q}: ${paths[one.q]}`);
 		expect(count(notices9[0]!, paths[one.q]!)).toBe(1);
 
 		// two open plan questions sharing one plan file: each header keeps its own path, a line naming both gets two lines

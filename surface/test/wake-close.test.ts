@@ -171,7 +171,7 @@ describe("the tick's catch-up runs when the poll throws (MIGRATION.md item 71)",
 		expect(f.execs.calls.filter((c) => c.command === "bun").map((c) => c.args.slice(1))).toEqual([["launch", wl, "--requested-by", "tick"]]);
 	});
 
-	test("later in the session (the wake settled), a catch-up whose own notice push throws is contained: no unhandled rejection, the starter still ran, a stderr line, and the line stays queued", async () => {
+	test("later in the session (the wake settled), the catch-up never pushes its own line, so a throwing sendMessage cannot reach it: no unhandled rejection, the starter still ran, no stderr line, and the line stays queued for the next status batch (PLAN wl-mv8igegljun18g D1)", async () => {
 		const e = env();
 		const f = fakePi(undefined, { exec: true });
 		let failing = false;
@@ -188,14 +188,14 @@ describe("the tick's catch-up runs when the poll throws (MIGRATION.md item 71)",
 		timers.length = 0;
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		expect(timers).toHaveLength(1);
-		// Jo's first turn takes the session-start wake: nothing pending, nothing in flight, so the catch-up's push is live.
+		// Jo's first turn takes the session-start wake: nothing pending, nothing in flight.
 		await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx);
 		expect(s.pending).toBeNull();
 		expect(s.wakeInFlight).toBeNull();
-		expect(s.noticesInFlight).toBeNull();
+		expect(s.status?.inFlight ?? null).toBeNull();
 		expect(s.tickNotices).toEqual([]);
 
-		// A workload that becomes launchable after the wake: the catch-up's starter line is the notice it pushes.
+		// A workload that becomes launchable after the wake: the catch-up's starter line is queued, never pushed.
 		const l = open(e);
 		const wl = l.openWorkload({ by: SURFACE_BY, brief: "Add a verify line to the README", stakes: "normal", mode: "autonomous" });
 		expect(launchVerdict(l, e, wl)).toEqual({ launch: true, cause: { kind: "first" } });
@@ -221,7 +221,7 @@ describe("the tick's catch-up runs when the poll throws (MIGRATION.md item 71)",
 				setImmediate(resolve);
 				await promise;
 			}
-			// The rejection, if any, settles after `launching` drops (the push is in the catch-up's `finally`): give it event-loop turns to surface, no wall-clock wait.
+			// A rejection, if any, would settle after `launching` drops: give it event-loop turns to surface, no wall-clock wait.
 			for (let i = 0; i < 5; i++) {
 				const { promise, resolve } = Promise.withResolvers<void>();
 				setImmediate(resolve);
@@ -233,9 +233,10 @@ describe("the tick's catch-up runs when the poll throws (MIGRATION.md item 71)",
 		}
 		expect(rejections).toEqual([]);
 		expect(f.execs.calls.filter((c) => c.command === "bun").map((c) => c.args.slice(1))).toEqual([["launch", wl, "--requested-by", "tick"]]);
-		expect(stderr).toEqual(["surface: the tick's catch-up failed: Error: send failed\n"]);
+		expect(stderr).toEqual([]);
 		const line = `tick: ${wl}: the starter exited 0 without a line`;
 		expect(s.tickNotices).toEqual([line]);
-		expect(s.noticesInFlight?.lines).toEqual([line]);
+		expect(f.sent).toEqual([]);
+		expect(s.status?.inFlight ?? null).toBeNull();
 	});
 });

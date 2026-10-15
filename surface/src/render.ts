@@ -18,6 +18,8 @@ import { parseSpend } from "./ceiling";
 import { ceilingOf, ceilingText } from "./input";
 import { byHandLine, controlEntries, doneLine, holdersOf, isPlanQuestionIn, planFirst } from "./launch";
 import { Numbering } from "./numbering";
+import type { Told } from "./status";
+import { entryIdentity, sliceIdentity, workloadOpenedIdentity, workloadTitle } from "./status-ilex";
 import { LAST_N, LEDGER_TOOL, STANDING_WORKLOAD_ID } from "./types";
 
 export interface RenderOptions {
@@ -44,6 +46,8 @@ export interface Rendered {
 	lines: ErrorLine[];
 	identity: Identity | null;
 	inFlight: InFlightWorkload[];
+	/** The status identities (surface/src/status-ilex.ts) of every event the workload blocks show: a read marks them told (PLAN wl-mv8igegljun18g D2a [R5-1]). */
+	told: Told[];
 }
 
 /**
@@ -85,10 +89,15 @@ function instructionLine(i: InstructionRow): string {
 	}
 }
 
-/** One workload's block. */
-export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: number = LAST_N): string {
+/**
+ * One workload's block, and the status identity of every event its text shows (PLAN wl-mv8igegljun18g D2a [R5-1], [R6-1]):
+ * `wl-open:<id>` (the block shows `opened …`), each listed slice, and each done / cancelled slice and valid `lane-started:` /
+ * `lane-exit:` entry that made the last-N window. Derived from the rendered lines, never listed by hand.
+ */
+export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: number = LAST_N): { text: string; told: Told[] } {
 	const { workload, slices, openQuestions, pendingMessages } = w;
 	const out: string[] = [];
+	const told: Told[] = [{ identity: workloadOpenedIdentity(workload.id), ts: workload.created_at }];
 	const due = parseDue(workload.brief);
 	out.push(`## ${workload.id}${due ? ` (scheduled, due ${due.due})` : ""}`);
 	out.push(`brief: ${workload.brief}`);
@@ -109,7 +118,10 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 	out.push(`opened ${when(workload.created_at)} by ${workload.created_by}; last activity ${when(workload.last_activity_at)}; lane: ${lane}`);
 	if (workload.mode === "user-driven" && !due && !workload.holder) out.push(`by hand: \`${byHandLine(workload.id)}\``);
 	out.push(`slices: ${slices.length === 0 ? "none open" : ""}`);
-	for (const s of slices) out.push(`- ${s.id} [${s.state}] ${s.task} — done when: ${s.done_condition}; inputs: ${s.inputs}`);
+	for (const s of slices) {
+		out.push(`- ${s.id} [${s.state}] ${s.task} — done when: ${s.done_condition}; inputs: ${s.inputs}`);
+		told.push({ identity: sliceIdentity(s), ts: s.changed_at });
+	}
 	if (openQuestions.length > 0) {
 		out.push("open questions:");
 		// A multi-line body keeps its lines under the bullet, indented as errorLines indents them (PLAN wl-muq22rnjcfrrpc D8);
@@ -125,25 +137,27 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 		out.push("messages not yet acted on:");
 		for (const m of pendingMessages) out.push(`- ${m.id} [${m.state}] ${m.sender} → ${m.recipient}${m.slice_id ? ` (${m.slice_id})` : ""}: ${m.body}`);
 	}
-	const recent = [
+	const lanes = new Set(control.filter((c) => c.prefix === "lane-started" || c.prefix === "lane-exit").map((c) => c.id));
+	const recent: { at: string; line: string; told?: Told }[] = [
 		...ledger.instructions(workload.id).map((i) => ({ at: i.created_at, line: instructionLine(i) })),
-		...ledger.entries(workload.id).map((e) => ({ at: e.created_at, line: `${when(e.created_at)} ${e.kind} by ${e.created_by}${e.slice_id ? ` on ${e.slice_id}` : ""}: ${e.body}` })),
+		...ledger.entries(workload.id).map((e) => ({
+			at: e.created_at,
+			line: `${when(e.created_at)} ${e.kind} by ${e.created_by}${e.slice_id ? ` on ${e.slice_id}` : ""}: ${e.body}`,
+			...(lanes.has(e.id) ? { told: { identity: entryIdentity(e.id), ts: e.created_at } } : {}),
+		})),
 		...ledger.db.query<SliceRow, [string]>("SELECT * FROM slices WHERE workload_id = ? AND state IN ('done', 'cancelled')").all(workload.id)
-			.map((s) => ({ at: s.changed_at, line: `${when(s.changed_at)} slice ${s.id} ${s.state} by ${s.changed_by}${s.artifact ? `: ${s.artifact}` : ""}` })),
+			.map((s) => ({ at: s.changed_at, line: `${when(s.changed_at)} slice ${s.id} ${s.state} by ${s.changed_by}${s.artifact ? `: ${s.artifact}` : ""}`, told: { identity: sliceIdentity(s), ts: s.changed_at } })),
 		...ledger.db.query<MessageRow, [string]>("SELECT * FROM messages WHERE workload_id = ? AND state IN ('consumed', 'acted-on')").all(workload.id)
 			.map((m) => ({ at: m.changed_at, line: `${when(m.changed_at)} message ${m.id} ${m.state} (${m.sender} → ${m.recipient}${m.slice_id ? `, ${m.slice_id}` : ""}): ${m.body}` })),
 	].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0)).slice(-lastN);
 	if (recent.length > 0) {
 		out.push(`last ${recent.length} ledger entries:`);
-		for (const r of recent) out.push(`- ${r.line}`);
+		for (const r of recent) {
+			out.push(`- ${r.line}`);
+			if (r.told) told.push(r.told);
+		}
 	}
-	return out.join("\n");
-}
-
-/** The title a workload line carries: the brief's first line, whitespace collapsed, cut at 80 characters with `…`. */
-function title(brief: string): string {
-	const first = (brief.split("\n").find((l) => l.trim() !== "") ?? "").replace(/\s+/g, " ").trim();
-	return first.length > 80 ? `${first.slice(0, 79)}…` : first;
+	return { text: out.join("\n"), told };
 }
 
 /**
@@ -154,7 +168,7 @@ function title(brief: string): string {
 export function workloadLine(ledger: Ledger, w: InFlightWorkload, lines: readonly ErrorLine[]): string {
 	const { workload, slices, openQuestions, pendingMessages } = w;
 	const due = parseDue(workload.brief);
-	const parts = [`- ${workload.id}${due ? ` (scheduled, due ${due.due})` : ""}: ${title(workload.brief)}`, oneLinerCore(ledger, workload), `lane: ${workload.holder ?? "none"}`];
+	const parts = [`- ${workload.id}${due ? ` (scheduled, due ${due.due})` : ""}: ${workloadTitle(workload.brief)}`, oneLinerCore(ledger, workload), `lane: ${workload.holder ?? "none"}`];
 	const states = new Map<string, number>();
 	for (const s of slices) states.set(s.state, (states.get(s.state) ?? 0) + 1);
 	parts.push(`slices: ${states.size === 0 ? "none open" : [...states].map(([state, n]) => `${n} ${state}`).join(", ")}`);
@@ -182,15 +196,18 @@ export function renderWake(ledger: Ledger, opts: RenderOptions = {}): Rendered {
 	const work = inFlight.filter((w) => w.workload.id !== STANDING_WORKLOAD_ID && (!opts.workloadId || w.workload.id === opts.workloadId));
 	const compact = opts.compact ?? (opts.trigger !== undefined && !opts.workloadId);
 	out.push("");
+	const told: Told[] = [];
 	if (work.length === 0) out.push("## open workloads\nnone");
 	else if (compact) {
 		out.push(`## open workloads (one line each; one workload's slices, questions with options, messages and recent entries: ${LEDGER_TOOL} with workload: <wl-…>)`);
 		for (const w of work) out.push(workloadLine(ledger, w, lines));
 	} else {
 		for (const w of work) {
-			out.push(renderWorkload(ledger, w, opts.lastN));
+			const block = renderWorkload(ledger, w, opts.lastN);
+			out.push(block.text);
 			out.push("");
+			told.push(...block.told);
 		}
 	}
-	return { text: out.join("\n").trimEnd(), lines, identity, inFlight };
+	return { text: out.join("\n").trimEnd(), lines, identity, inFlight, told };
 }

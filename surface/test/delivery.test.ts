@@ -31,6 +31,37 @@ type Started = { systemPrompt: string[]; messages: { customType: string; content
 const count = (n: number) => `open answer lines: ${n} (\`pending\` shows them all)`;
 /** A turn's message texts. */
 const texts = (t: unknown) => (t as Started).messages.map((m) => m.content);
+/** A status batch's needs-you bullets (PLAN wl-mv8igegljun18g D2), or null when it has none. */
+const needsOf = (content: string): string | null => content.includes("\n\n## needs you\n") ? content.split("\n\n## needs you\n")[1]!.split("\n\n")[0]! : null;
+
+/**
+ * A surface past its first wake on a settable clock with a one-minute status interval: `batch()` moves the clock a
+ * minute, polls, and confirms whatever status message the poll sent (its `message_end`); `needs()` lists the batches
+ * carrying a needs-you section.
+ */
+async function clocked(start: string) {
+	timers.length = 0;
+	const f = fakePi();
+	const e = env({ AGENT_SYSTEM_SURFACE_STATUS_MS: "60000" });
+	orchestratorSurface(f.pi, e);
+	const ctx = ctxOf();
+	const c = clock(start);
+	surfaceSession(ctx, e).now = c.now;
+	await f.emit("session_start", { type: "session_start" }, ctx);
+	await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx);
+	await f.tool("orchestrator_wake_read").execute("1", { body: "nothing open" }, undefined, undefined, ctx);
+	const status = () => f.sent.filter((x) => x.message.customType === "surface-status");
+	return {
+		f, e, ctx, c,
+		batch: async () => {
+			c.at(new Date(Date.parse(c.now()) + 60_000).toISOString());
+			const before = f.sent.length;
+			timers[0]!.fn();
+			for (const x of f.sent.slice(before)) if (x.message.customType === "surface-status") await f.admit(x, ctx);
+		},
+		needs: () => status().filter((x) => needsOf(x.message.content) !== null),
+	};
+}
 
 describe("Delivered: a line reaches the orchestrator once per state", () => {
 	test("new lines are taken once; a changed state token is taken again; a vanished line is forgotten so its return is new", () => {
@@ -154,14 +185,17 @@ describe("between wakes: a line written by another connection after the wake rea
 		expect(texts(await f.emit("before_agent_start", { prompt: "still", systemPrompt: [] }, ctx))).toEqual([count(2)]);
 	});
 
-	test("the poll pushes a fresh line through pi.sendMessage as a turn-triggering aside, once; nothing while a wake is pending on a busy session; nothing when quiet", async () => {
+	test("a fresh routine line rides the next status batch as a turn-triggering aside, once; nothing while a wake is pending on a busy session; nothing before the interval (PLAN wl-mv8igegljun18g D1)", async () => {
 		timers.length = 0;
 		const f = fakePi();
-		// a batch window of 0: a routine line goes out at the poll that finds it (batching itself: surface/test/batch.test.ts)
-		const e = env({ AGENT_SYSTEM_SURFACE_POLL_MS: "1234", AGENT_SYSTEM_SURFACE_BATCH_MS: "0" });
+		const e = env({ AGENT_SYSTEM_SURFACE_POLL_MS: "1234", AGENT_SYSTEM_SURFACE_STATUS_MS: "60000" });
 		orchestratorSurface(f.pi, e);
 		// busy: the poll cannot push the pending wake (an idle one would; surface/test/wake-push.test.ts), and pushes nothing else while it is pending
-		const ctx = ctxOf({ idle: false });
+		const opts = { idle: false };
+		const ctx = ctxOf(opts);
+		const c = clock("2026-09-01T10:00:00.000Z");
+		surfaceSession(ctx, e).now = c.now;
+		const minute = () => c.at(new Date(Date.parse(c.now()) + 60_000).toISOString());
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		expect(timers).toHaveLength(1);
 		expect(timers[0]!.ms).toBe(1234);
@@ -170,36 +204,44 @@ describe("between wakes: a line written by another connection after the wake rea
 		const lane = open(e);
 		const { wl, sl } = workloadWithSlice(lane);
 		const q = lane.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Before the wake", options: ["a", "b"] });
+		minute();
 		poll();
 		expect(f.sent).toEqual([]);
 		await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx);
 		await f.tool("orchestrator_wake_read").execute("1", { body: `resuming ${wl}` }, undefined, undefined, ctx);
+		opts.idle = true;
 		poll();
-		expect(f.sent).toEqual([]); // the wake delivered q already
+		expect(f.sent).toEqual([]); // the wake delivered q already, and the interval restarted at its render
 		lane.answerQuestion(q, { by: "surface", answer: "a", author: "jo", channel: "surface" });
 		lane.enqueue({ by: "lane-a", workloadId: wl, sliceId: sl, sender: "lane-a", recipient: ORCHESTRATOR_RECIPIENT, body: `${ARTIFACT_FAILED_PREFIX} bun test exit 1` });
 		lane.enqueue({ by: "lane-a", workloadId: wl, sliceId: sl, sender: "lane-a", recipient: ORCHESTRATOR_RECIPIENT, body: `${ARTIFACT_FAILED_PREFIX} bun test exit 1` });
 		poll();
-		expect(f.sent).toHaveLength(1);
-		expect(f.sent[0]!.message.customType).toBe("surface-needs-you");
-		expect(f.sent[0]!.message.content).toContain(`slice ${sl} (${wl}) failed its runtime artifact 2 times`);
-		expect(f.sent[0]!.options).toEqual({ deliverAs: "aside", triggerTurn: true });
+		expect(f.sent).toEqual([]); // routine: held for the batch
+		minute();
 		poll();
 		expect(f.sent).toHaveLength(1);
-		// the next turn does not repeat what the poll pushed
+		expect(f.sent[0]!.message.customType).toBe("surface-status");
+		expect(needsOf(f.sent[0]!.message.content)).toContain(`slice ${sl} (${wl}) failed its runtime artifact 2 times`);
+		expect(f.sent[0]!.options).toEqual({ deliverAs: "aside", triggerTurn: true });
+		await f.admit(f.sent[0]!, ctx);
+		poll();
+		expect(f.sent).toHaveLength(1);
+		// the next turn does not repeat what the batch carried
 		expect(texts(await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx))).toEqual([count(0)]);
-		// a third failure is a new state: pushed again
+		// a third failure is a new state: in the next batch again
 		lane.enqueue({ by: "lane-a", workloadId: wl, sliceId: sl, sender: "lane-a", recipient: ORCHESTRATOR_RECIPIENT, body: `${ARTIFACT_FAILED_PREFIX} bun test exit 1` });
+		minute();
 		poll();
 		expect(f.sent).toHaveLength(2);
-		expect(f.sent[1]!.message.content).toContain("failed its runtime artifact 3 times");
+		expect(needsOf(f.sent[1]!.message.content)).toContain("failed its runtime artifact 3 times");
 		lane.close();
 	});
 
 	test("a lease that lapses between wakes is written as a lane-died row by the surface's read and delivered once", async () => {
 		timers.length = 0;
 		const f = fakePi();
-		const e = env();
+		// a day-long status interval: the death goes out on its own on-fire push, not inside a batch
+		const e = env({ AGENT_SYSTEM_SURFACE_STATUS_MS: "86400000" });
 		orchestratorSurface(f.pi, e);
 		const ctx = ctxOf();
 		const c = clock("2026-09-01T10:00:00.000Z");
@@ -222,78 +264,65 @@ describe("between wakes: a line written by another connection after the wake rea
 		lane.close();
 	});
 
-	test("a lane that ended on purpose with open slices and no question is pushed once per exit entry, not every poll (MIGRATION.md item 68)", async () => {
-		timers.length = 0;
-		const f = fakePi();
-		const e = env({ AGENT_SYSTEM_SURFACE_BATCH_MS: "0" });
-		orchestratorSurface(f.pi, e);
-		const ctx = ctxOf();
-		await f.emit("session_start", { type: "session_start" }, ctx);
-		await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx);
-		await f.tool("orchestrator_wake_read").execute("1", { body: "nothing open" }, undefined, undefined, ctx);
+	test("a lane that ended on purpose with open slices and no question rides a status batch once per exit entry, not every batch (MIGRATION.md item 68)", async () => {
+		const { f, e, ctx, batch, needs } = await clocked("2026-09-01T10:00:00.000Z");
 		// the lane's connection: launched, two slices, parked by hand with an intended exit and nobody holding it
 		const lane = open(e);
 		const { wl, sl } = workloadWithSlice(lane);
 		lane.addSlice({ by: "lane-a", workloadId: wl, task: "second", doneCondition: "d", inputs: "b.ts" });
 		lane.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-a cause first requested-by surface" });
 		expect(lane.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 }).won).toBe(true);
-		timers[0]!.fn();
-		expect(f.sent).toEqual([]);
+		await batch();
+		expect(needs()).toEqual([]);
 		lane.releaseWorkload(wl, { by: "lane-a", holder: "lane-a" });
 		lane.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody("lane-a", { code: 0, signal: null, outcome: "completed" }) });
-		timers[0]!.fn();
-		expect(f.sent).toHaveLength(1);
-		expect(f.sent[0]!.message.customType).toBe("surface-needs-you");
-		expect(f.sent[0]!.message.content).toBe(`## needs you (new since your last turn)\n- lane lane-a on ${wl} ended (completed) with 2 open slice(s) and no question; relaunch, close, or instruct\n\n${count(0)}`);
-		expect(f.sent[0]!.options).toEqual({ deliverAs: "aside", triggerTurn: true });
-		timers[0]!.fn();
-		timers[0]!.fn();
-		expect(f.sent).toHaveLength(1);
+		await batch();
+		expect(needs()).toHaveLength(1);
+		expect(needsOf(needs()[0]!.message.content)).toBe(`- [worth knowing] lane lane-a on ${wl} ended (completed) with 2 open slice(s) and no question; relaunch, close, or instruct`);
+		// the idle line said the exit: no second `lane ended` bullet for it
+		expect(needs()[0]!.message.content).not.toContain(`lane lane-a ended on ${wl}`);
+		expect(needs()[0]!.options).toEqual({ deliverAs: "aside", triggerTurn: true });
+		await batch();
+		await batch();
+		expect(needs()).toHaveLength(1);
 		expect(texts(await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx))).toEqual([count(0)]);
-		// a relaunch that ends the same way is a new exit entry: pushed again, once
+		// a relaunch that ends the same way is a new exit entry: in a batch again, once
 		lane.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-b cause first requested-by surface" });
 		expect(lane.claimWorkload(wl, { by: "lane-b", holder: "lane-b", leaseMs: 3_600_000 }).won).toBe(true);
-		timers[0]!.fn();
-		expect(f.sent).toHaveLength(1);
+		await batch();
+		expect(needs()).toHaveLength(1);
 		lane.releaseWorkload(wl, { by: "lane-b", holder: "lane-b" });
 		lane.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody("lane-b", { code: 0, signal: null, outcome: "parked" }) });
-		timers[0]!.fn();
-		timers[0]!.fn();
-		expect(f.sent).toHaveLength(2);
-		expect(f.sent[1]!.message.content).toContain(`lane lane-b on ${wl} ended (parked) with 2 open slice(s)`);
+		await batch();
+		await batch();
+		expect(needs()).toHaveLength(2);
+		expect(needs()[1]!.message.content).toContain(`lane lane-b on ${wl} ended (parked) with 2 open slice(s)`);
 		// a question raised on it replaces the idle line; the slice pauses so one slice stays open
 		const q = lane.raiseQuestion({ by: "lane-b", workloadId: wl, sliceId: sl, body: "which?", options: ["x", "y"] });
-		timers[0]!.fn();
-		expect(f.sent).toHaveLength(3);
-		expect(f.sent[2]!.message.content).toContain("is waiting on you");
-		expect(f.sent[2]!.message.content).not.toContain("ended (parked)");
-		// answered: the same exit entry is back on the line, and it was already pushed (Codex review of PR #27)
+		await batch();
+		expect(needs()).toHaveLength(3);
+		expect(needsOf(needs()[2]!.message.content)).toContain("is waiting on you");
+		expect(needsOf(needs()[2]!.message.content)).not.toContain("ended (parked)");
+		// answered: the same exit entry is back on the line, and it was already delivered (Codex review of PR #27)
 		lane.answerQuestion(q, { by: "surface", answer: "x", author: "jo", channel: "surface" });
-		timers[0]!.fn();
-		timers[0]!.fn();
-		expect(f.sent).toHaveLength(3);
+		await batch();
+		await batch();
+		expect(needs()).toHaveLength(3);
 		expect(texts(await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx))).toEqual([count(0)]);
-		// a third lane that ends again is a newer exit entry: pushed once
+		// a third lane that ends again is a newer exit entry: in a batch once
 		lane.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-c cause first requested-by surface" });
 		expect(lane.claimWorkload(wl, { by: "lane-c", holder: "lane-c", leaseMs: 3_600_000 }).won).toBe(true);
 		lane.releaseWorkload(wl, { by: "lane-c", holder: "lane-c" });
 		lane.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody("lane-c", { code: 0, signal: null, outcome: "completed" }) });
-		timers[0]!.fn();
-		timers[0]!.fn();
-		expect(f.sent).toHaveLength(4);
-		expect(f.sent[3]!.message.content).toContain(`lane lane-c on ${wl} ended (completed) with 2 open slice(s)`);
+		await batch();
+		await batch();
+		expect(needs()).toHaveLength(4);
+		expect(needs()[3]!.message.content).toContain(`lane lane-c on ${wl} ended (completed) with 2 open slice(s)`);
 		lane.close();
 	});
 
-	test("a plan question offering approve is pushed whole: the path on the line beneath the q- id, each other line indented under it (PLAN wl-muq22rnjcfrrpc D8, PLAN wl-mv61a8dh4aeneo D2)", async () => {
-		timers.length = 0;
-		const f = fakePi();
-		const e = env({ AGENT_SYSTEM_SURFACE_BATCH_MS: "0" });
-		orchestratorSurface(f.pi, e);
-		const ctx = ctxOf();
-		await f.emit("session_start", { type: "session_start" }, ctx);
-		await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx);
-		await f.tool("orchestrator_wake_read").execute("1", { body: "nothing open" }, undefined, undefined, ctx);
+	test("a plan question offering approve rides the status batch whole: the path on the line beneath the q- id, each other line indented under it (PLAN wl-muq22rnjcfrrpc D8, PLAN wl-mv61a8dh4aeneo D2)", async () => {
+		const { e, batch, needs } = await clocked("2026-09-01T10:00:00.000Z");
 		const plan = [
 			"/Users/jo/agent-scratch/wl-x/PLAN.md",
 			"- sl-flip: plan-first by default unless the judge says change-small at 0.9 or Jo says no plan",
@@ -315,10 +344,11 @@ describe("between wakes: a line written by another connection after the wake rea
 			return id;
 		});
 		lane.close();
-		timers[0]!.fn();
-		expect(f.sent).toHaveLength(1);
-		expect(f.sent[0]!.message.content).toBe(
-			`## needs you (new since your last turn)\n- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${plan.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)\n\n${count(1)}`,
+		await batch();
+		expect(needs()).toHaveLength(1);
+		expect(needsOf(needs()[0]!.message.content)).toBe(
+			`- [worth knowing] #1 lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${plan.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`,
 		);
+		expect(needs()[0]!.message.content.endsWith(`\n\n${count(1)}`)).toBe(true);
 	});
 });

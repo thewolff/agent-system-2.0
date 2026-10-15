@@ -1,7 +1,8 @@
 // Batched needs-you arrivals and the surface words brb / back (PLAN wl-mv5msri070p0qo D3, D4,
-// § 3 sl-surface-wire). The test plays OMP's part: it fires the poll (ctx.setInterval), emits Jo's
-// `input` event and his turn's `before_agent_start`, and moves the session clock (`s.now`) and the
-// lane connection's clock together, so the fixed window and the quiet stretch are measured on it.
+// § 3 sl-surface-wire; the hold flushed by the status batch, PLAN wl-mv8igegljun18g D1). The test
+// plays OMP's part: it fires the poll (ctx.setInterval), emits Jo's `input` event and his turn's
+// `before_agent_start`, and moves the session clock (`s.now`) and the lane connection's clock
+// together, so the status interval and the quiet stretch are measured on it.
 import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -45,6 +46,10 @@ async function surface() {
 	return {
 		f, ctx, s, c, lane,
 		needsYou: (): Sent[] => f.sent.filter((x) => x.message.customType === "surface-needs-you"),
+		/** The status batches and quiet lines (surface-status) sent so far. */
+		status: (): Sent[] => f.sent.filter((x) => x.message.customType === "surface-status"),
+		/** OMP admitting a sent message: its `message_end`. */
+		admit: (entry: Sent) => f.admit(entry, ctx),
 		poll: () => timers[0]!.fn(),
 		minutes: (m: number) => c.at(new Date(Date.parse(c.now()) + m * 60_000).toISOString()),
 		/** Jo's `input` event for `text` (OMP's interactive source): what the handlers return. */
@@ -121,8 +126,8 @@ describe("onFire: the four kinds that go out on their own poll", () => {
 	});
 });
 
-describe("the window: routine lines wait and go out together (D3)", () => {
-	test("three routine lines on three polls inside the window: nothing until it ends, then one surface-needs-you carrying all three and the count", async () => {
+describe("the status batch flushes the hold (D3; PLAN wl-mv8igegljun18g D1)", () => {
+	test("three routine lines on three polls: nothing until the status interval since the wake render ends, then one surface-status carrying all three under needs you, and the count last", async () => {
 		const t = await surface();
 		const { wl, sl } = workloadWithSlice(t.lane);
 		const q1 = ask(t.lane, wl, sl, "First?");
@@ -133,25 +138,30 @@ describe("the window: routine lines wait and go out together (D3)", () => {
 		t.minutes(1);
 		const en = t.lane.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "push main" });
 		t.poll();
-		t.minutes(2);
+		t.minutes(12);
 		t.poll();
 		expect(t.needsYou()).toEqual([]);
-		// the window runs from the first line, not the last: 5 minutes after q1
+		expect(t.status()).toEqual([]);
+		// the interval runs from the wake render (Jo's first turn), not from the first line: 15 minutes after it
 		t.minutes(1);
 		t.poll();
-		expect(t.needsYou()).toHaveLength(1);
-		const push = t.needsYou()[0]!;
+		expect(t.needsYou()).toEqual([]);
+		expect(t.status()).toHaveLength(1);
+		const push = t.status()[0]!;
 		expect(push.options).toEqual({ deliverAs: "aside", triggerTurn: true });
-		expect(push.message.content.startsWith(NEEDS)).toBe(true);
-		for (const id of [q1, q2, en]) expect(push.message.content).toContain(id);
+		const needs = push.message.content.split("\n\n## ")[1]!;
+		expect(needs.startsWith("needs you\n")).toBe(true);
+		for (const id of [q1, q2, en]) expect(needs).toContain(id);
 		expect(push.message.content.endsWith(`\n\n${count(3)}`)).toBe(true);
+		expect(t.s.heldNeedsYou.size).toBe(0);
+		await t.admit(push);
 		t.minutes(10);
 		t.poll();
-		expect(t.needsYou()).toHaveLength(1);
-		expect(t.s.heldNeedsYou.size).toBe(0);
+		expect(t.status()).toHaveLength(1);
+		expect(t.needsYou()).toEqual([]);
 	});
 
-	test("the flush re-checks every held line: a question answered and a due row whose workload closed are not pushed; what still stands is", async () => {
+	test("the batch re-checks every held line: a question answered and a due row whose workload closed are not listed; what still stands is", async () => {
 		const t = await surface();
 		const { wl, sl } = workloadWithSlice(t.lane);
 		const q1 = ask(t.lane, wl, sl, "Answered before the flush?");
@@ -163,46 +173,52 @@ describe("the window: routine lines wait and go out together (D3)", () => {
 		t.poll();
 		t.lane.answerQuestion(q1, { by: "surface", answer: "yes", author: "jo", channel: "surface" });
 		t.lane.closeWorkload(due, { by: SURFACE_BY });
-		t.minutes(4);
+		t.minutes(14);
 		t.poll();
-		expect(t.needsYou()).toHaveLength(1);
-		const content = t.needsYou()[0]!.message.content;
+		expect(t.needsYou()).toEqual([]);
+		expect(t.status()).toHaveLength(1);
+		const content = t.status()[0]!.message.content;
 		expect(content).toContain(q3);
 		expect(content).not.toContain(q1);
 		expect(content).not.toContain("scheduled and past due");
 		expect(content.endsWith(count(1))).toBe(true);
 	});
 
-	test("a held line gone by the flush leaves nothing to push: no message at all", async () => {
+	test("a held line gone by the batch leaves no needs-you section", async () => {
 		const t = await surface();
 		const { wl, sl } = workloadWithSlice(t.lane);
 		const q = ask(t.lane, wl, sl, "Answered before the flush?");
 		t.poll();
 		t.lane.answerQuestion(q, { by: "surface", answer: "no", author: "jo", channel: "surface" });
-		t.minutes(6);
+		t.minutes(16);
 		t.poll();
 		expect(t.needsYou()).toEqual([]);
+		expect(t.status()).toHaveLength(1);
+		expect(t.status()[0]!.message.content).not.toContain("## needs you");
+		expect(t.status()[0]!.message.content).not.toContain(q);
 		expect(t.s.heldNeedsYou.size).toBe(0);
 	});
 
-	test("a lane death with no open work waits for the window, and its message moves to delivered only when it is pushed", async () => {
+	test("a lane death with no open work waits for the batch, and its message moves to delivered only when the batch is confirmed", async () => {
 		const t = await surface();
 		const wl = t.lane.openWorkload({ by: "lane-x", brief: "nothing left", stakes: "normal", mode: "autonomous" });
 		const m = death(t.lane, wl, 0);
 		t.poll();
 		expect(t.needsYou()).toEqual([]);
 		expect(t.lane.message(m)!.state).toBe("held");
-		t.minutes(3);
+		t.minutes(10);
 		t.poll();
 		expect(t.lane.message(m)!.state).toBe("held");
-		t.minutes(2);
+		t.minutes(5);
 		t.poll();
-		expect(t.needsYou()).toHaveLength(1);
-		expect(t.needsYou()[0]!.message.content).toContain(`lane lane-x on ${wl} died`);
+		expect(t.status()).toHaveLength(1);
+		expect(t.status()[0]!.message.content).toContain(`lane lane-x on ${wl} died`);
+		expect(t.lane.message(m)!.state).toBe("held");
+		await t.admit(t.status()[0]!);
 		expect(t.lane.message(m)!.state).toBe("delivered");
 	});
 
-	test("a wake render clears the hold: the lines it carried are not pushed after it", async () => {
+	test("a wake render clears the hold: the lines it carried are not in the batch after it", async () => {
 		const t = await surface();
 		const { wl, sl } = workloadWithSlice(t.lane);
 		const q = ask(t.lane, wl, sl, "Before the compaction?");
@@ -212,12 +228,13 @@ describe("the window: routine lines wait and go out together (D3)", () => {
 		expect(await t.jo("go on")).toContain(q);
 		expect(t.s.heldNeedsYou.size).toBe(0);
 		await t.f.tool("orchestrator_wake_read").execute("2", { body: "resuming" }, undefined, undefined, t.ctx);
-		t.minutes(6);
+		t.minutes(16);
 		t.poll();
 		expect(t.needsYou()).toEqual([]);
+		for (const x of t.status()) expect(x.message.content).not.toContain(q);
 	});
 
-	test("Jo's turn takes the re-checked hold into 'needs you (new since your last turn)' with the count; the window then has nothing to push", async () => {
+	test("Jo's turn takes the re-checked hold into 'needs you (new since your last turn)' with the count; the batch then lists neither line", async () => {
 		const t = await surface();
 		const { wl, sl } = workloadWithSlice(t.lane);
 		const q1 = ask(t.lane, wl, sl, "First?");
@@ -228,48 +245,50 @@ describe("the window: routine lines wait and go out together (D3)", () => {
 		expect(turn).toContain(q1);
 		expect(turn).toContain(q2);
 		expect(turn.endsWith(`\n\n${count(2)}`)).toBe(true);
-		t.minutes(6);
+		t.minutes(16);
 		t.poll();
 		expect(t.needsYou()).toEqual([]);
+		expect(t.status()).toHaveLength(1);
+		expect(t.status()[0]!.message.content).not.toContain(q1);
+		expect(t.status()[0]!.message.content).not.toContain(q2);
+		await t.admit(t.status()[0]!);
 		expect(await t.jo("and now?")).toBe(count(2));
 	});
 
-	test("an on-demand ledger read takes what it showed out of the hold: a full read, and a read scoped to another workload (whose render still lists every needs-you line), leave nothing for the window (code review r1, finding 3)", async () => {
+	test("an on-demand ledger read takes what it showed out of the hold: a full read, and a read scoped to another workload (whose render still lists every needs-you line), leave nothing for the batch (code review r1, finding 3)", async () => {
 		for (const scoped of [false, true]) {
 			const t = await surface();
 			const { wl, sl } = workloadWithSlice(t.lane);
 			const other = workloadWithSlice(t.lane).wl;
-			const q = ask(t.lane, wl, sl, "Still open at the window's end?");
+			const q = ask(t.lane, wl, sl, "Still open at the batch?");
 			t.poll();
 			expect(t.s.heldNeedsYou.size).toBe(1);
 			const read = (await t.f.tool("orchestrator_ledger").execute("1", scoped ? { workload: other } : {}, undefined, undefined, t.ctx)).content[0]!.text;
 			expect(read.split("\n\n## ")[1]).toContain(q);
 			expect(t.s.heldNeedsYou.size).toBe(0);
-			expect(t.s.holdSince).toBeNull();
-			t.minutes(6);
+			t.minutes(16);
 			t.poll();
 			expect(t.needsYou()).toEqual([]);
+			for (const x of t.status()) expect(x.message.content).not.toContain(q);
 			expect(t.lane.question(q)!.state).toBe("open");
 		}
 	});
 
-	test("an on-demand read leaves a line it did not show in the hold, window kept: it still goes out at the window's end", async () => {
+	test("an on-demand read leaves a line it did not show in the hold: it still goes out in the next batch", async () => {
 		const t = await surface();
 		const { wl, sl } = workloadWithSlice(t.lane);
 		const q1 = ask(t.lane, wl, sl, "Shown by the read?");
 		t.poll();
-		const since = t.s.holdSince;
 		await t.f.tool("orchestrator_ledger").execute("1", {}, undefined, undefined, t.ctx);
 		t.minutes(1);
 		const q2 = ask(t.lane, wl, sl, "Raised after the read?");
 		t.poll();
 		expect(t.s.heldNeedsYou.size).toBe(1);
-		expect(t.s.holdSince).not.toBe(since);
-		t.minutes(6);
+		t.minutes(15);
 		t.poll();
-		expect(t.needsYou()).toHaveLength(1);
-		expect(t.needsYou()[0]!.message.content).toContain(q2);
-		expect(t.needsYou()[0]!.message.content).not.toContain(q1);
+		expect(t.status()).toHaveLength(1);
+		expect(t.status()[0]!.message.content).toContain(q2);
+		expect(t.status()[0]!.message.content).not.toContain(q1);
 	});
 });
 
@@ -326,39 +345,43 @@ describe("on fire: pushed on its own poll, carrying the hold (D3)", () => {
 	});
 });
 
-describe("brb and back (D4)", () => {
-	test("brb is handled with no turn and confirmed once; an on-fire line goes out alone and the hold stays; back carries the hold and the complete block", async () => {
+describe("brb and back (D4; the status batch, PLAN wl-mv8igegljun18g D5)", () => {
+	test("brb is handled with no turn and confirmed once; an on-fire line goes out alone and the hold stays; no status batch past the interval; back carries the hold, the complete block and one fresh delta", async () => {
 		const t = await surface();
 		const { wl, sl } = workloadWithSlice(t.lane);
 		const routine = ask(t.lane, wl, sl, "Routine?");
 		t.poll();
 		expect(await t.type("brb")).toEqual({ handled: true });
-		expect(notices).toEqual(["holding needs-you pushes until `back`; on-fire items still come through"]);
+		expect(notices).toEqual(["holding status batches and needs-you pushes until `back`; on-fire items still come through"]);
 		expect(t.s.away).toEqual({ since: t.c.now() });
 		t.minutes(1);
-		const { q: ceiling } = ceilingQuestion(t.lane);
+		const { wl: ceilingWl, q: ceiling } = ceilingQuestion(t.lane);
 		t.poll();
 		expect(t.needsYou()).toHaveLength(1);
 		expect(t.needsYou()[0]!.message.content).toContain(ceiling);
 		expect(t.needsYou()[0]!.message.content).not.toContain(routine);
 		expect(t.needsYou()[0]!.message.content.endsWith(count(2))).toBe(true);
-		// away: the window never flushes
-		t.minutes(10);
+		// away: no status batch and no quiet line, even two intervals on
+		t.minutes(31);
 		t.poll();
 		expect(t.needsYou()).toHaveLength(1);
+		expect(t.status()).toEqual([]);
 		expect(t.s.heldNeedsYou.size).toBe(1);
 		// back reaches the model as Jo's turn
 		expect(await t.type("back")).toBeUndefined();
 		const turn = await t.jo("back");
 		expect(turn.startsWith(BACK)).toBe(true);
 		expect(turn.split("## pending:")[0]).toContain(`is waiting on you (${routine}, slice ${sl})`);
-		expect(turn).toContain(`\n\n${t.block()}\n\n${count(2)}`);
+		expect(turn).toContain(`\n\n${t.block()}\n\n## since 19:00Z\n### in flight\n`);
+		expect(turn.split("## since 19:00Z")[1]).toContain(`${ceilingWl} opened`);
 		expect(turn.endsWith(count(2))).toBe(true);
 		expect(t.s.away).toBeNull();
 		expect(t.s.heldNeedsYou.size).toBe(0);
+		// back restarts the interval
 		t.minutes(10);
 		t.poll();
 		expect(t.needsYou()).toHaveLength(1);
+		expect(t.status()).toEqual([]);
 	});
 
 	test("brb, a routine line, an ordinary turn, then back: the ordinary turn carries only the count and leaves the hold; back carries it", async () => {
@@ -380,11 +403,15 @@ describe("brb and back (D4)", () => {
 		expect(t.s.heldNeedsYou.size).toBe(0);
 	});
 
-	test("back while not away is the digest without a hold: the complete block under the back heading", async () => {
+	test("back while not away is the digest without a hold: the complete block under the back heading, then one fresh delta", async () => {
 		const t = await surface();
 		const { wl, sl } = workloadWithSlice(t.lane);
 		ask(t.lane, wl, sl, "Seen already?");
 		await t.jo("anything?");
+		// raising the question paused the slice: one item in its current state, cut and paused
+		const delta = `## since 19:00Z\n### in flight\n- [worth knowing] ${wl} opened: Fix the feed header offset in newdle-web\n- [worth knowing] slice ${sl} on ${wl} cut and paused: Move the header offset into a token`;
+		expect(await t.jo("back")).toBe(`${BACK}\n\n${t.block()}\n\n${delta}\n\n${count(1)}`);
+		// that turn confirmed it: a second back has no delta
 		expect(await t.jo("back")).toBe(`${BACK}\n\n${t.block()}\n\n${count(1)}`);
 	});
 

@@ -73,7 +73,7 @@
 // Surface words (PLAN wl-mv5msri070p0qo D1, D4), each only as the whole trimmed input: `pending`
 // and `brb` are read from the `input` event and handled there, so OMP drops them and no turn starts
 // (`pending` shows the block of every open answer line as a `surface-pending` message, queued for
-// the next idle poll while the session streams; `brb` holds the routine needs-you pushes); neither
+// the next idle poll while the session streams; `brb` holds the status batch and the routine needs-you pushes); neither
 // goes on the typed FIFO. `back` reaches the model, and the wake row reads it in its
 // `before_agent_start`; its turn takes its own typed entry and writes no row.
 import type { Ledger } from "../../ledger/src/index";

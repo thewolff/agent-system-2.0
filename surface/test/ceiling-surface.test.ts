@@ -348,7 +348,7 @@ describe("the one-liner and the render", () => {
 		const { ledger: l } = tempLedger();
 		const { wl } = withCeilingQuestion(l);
 		expect(oneLiner(l, l.workload(wl)!)).toMatch(/ · ceiling \$50 \/ 6h$/);
-		const block = () => renderWorkload(l, l.inFlight().find((w) => w.workload.id === wl)!);
+		const block = () => renderWorkload(l, l.inFlight().find((w) => w.workload.id === wl)!).text;
 		expect(block()).not.toContain("spent $");
 		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: "spend: lane-t-1 usd 3.1 tokens 1000 wall 10" });
 		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: "spend: lane-t-1 usd 40.4567 tokens 90000 wall 290.5" });

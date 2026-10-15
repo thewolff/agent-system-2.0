@@ -38,29 +38,37 @@ export class Delivered {
 		return fresh;
 	}
 
+	/** Whether the line with this identity (`kind:workloadId:rowId`) was delivered in some state and is still remembered. */
+	has(identity: string): boolean {
+		return this.#seen.has(identity);
+	}
+
 	get size(): number {
 		return this.#seen.size;
 	}
 }
 
-/** Move every held orchestrator-bound message behind `lines` to `delivered`: the surface has read them. */
-export function consumeLines(ledger: Ledger, lines: ErrorLine[]): number {
+/** Move each of `ids` that is still a held orchestrator-bound message to `delivered`: the surface has shown it (a message an earlier delivery moved is skipped). */
+export function consumeIds(ledger: Ledger, ids: readonly string[]): number {
 	let n = 0;
-	for (const l of lines) {
-		for (const id of l.messageIds ?? []) {
-			const m = ledger.message(id);
-			if (!m || m.state !== "held" || m.recipient !== ORCHESTRATOR_RECIPIENT) continue;
-			ledger.advanceMessage(id, "delivered", { by: SURFACE_BY });
-			n++;
-		}
+	for (const id of ids) {
+		const m = ledger.message(id);
+		if (!m || m.state !== "held" || m.recipient !== ORCHESTRATOR_RECIPIENT) continue;
+		ledger.advanceMessage(id, "delivered", { by: SURFACE_BY });
+		n++;
 	}
 	return n;
 }
 
+/** Move every held orchestrator-bound message behind `lines` to `delivered`: the surface has read them. */
+export function consumeLines(ledger: Ledger, lines: ErrorLine[]): number {
+	return consumeIds(ledger, lines.flatMap((l) => l.messageIds ?? []));
+}
+
 /**
- * At a wake the whole queue was rendered: every held orchestrator-bound message on an open workload
- * is delivered. The on-demand ledger read (orchestrator_ledger) does the same, for one workload when
- * it rendered one.
+ * The on-demand ledger read (orchestrator_ledger) rendered every held orchestrator-bound message on an open
+ * workload (or on the one workload it rendered) whole in its blocks: they are delivered. A wake consumes only
+ * what its delta section rendered whole (PLAN wl-mv8igegljun18g D2a), through `consumeIds`.
  */
 export function consumeAllToOrchestrator(ledger: Ledger, workloadId?: string): number {
 	const sql = `SELECT m.id FROM messages m JOIN workloads w ON w.id = m.workload_id WHERE w.status = 'open' AND m.state = 'held' AND m.recipient = ?1 ${workloadId ? "AND m.workload_id = ?2" : ""} ORDER BY m.created_at, m.rowid`;

@@ -124,9 +124,10 @@ figure less the items written up in this message. When N is 0 the line is
 `nothing else waiting`.
 
 On `back`, or when the surface marks a quiet stretch, Jo gets the complete list once, each
-item written up with its content and never as a list of ids. `brb` holds the routine
-needs-you pushes (on-fire items still come through at once), and `back` releases them as that
-one digest.
+item written up with its content and never as a list of ids. `brb` holds the routine pushes:
+the 15-minute status batch, its quiet line, the tick lines and the needs-you lines that ride the
+batch (on-fire items still come through at once, alone), and `back` releases them as that one
+digest.
 
 **The conflict this resolves.** "When resuming any thread, restate its content" and "the
 closing ask must survive being read alone", applied to every message, made each needs-you
