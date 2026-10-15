@@ -24,6 +24,7 @@ import { testRequestedBody } from "../src/test-run";
 import { releasedOpen } from "../src/turn-end";
 import { recordRepo } from "../src/decision-log";
 import { LANE_FULL_TEST_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, SURFACE_BY } from "../src/types";
+import * as core from "../src/pending-details";
 import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
 
 const LANE_MODEL = "anthropic/claude-opus-5-5";
@@ -44,6 +45,8 @@ const planBody = (slices = 2, tradeoffs = 1) => [
 	REVIEW_LINE,
 ].join("\n");
 const PLAN_BODY = planBody();
+/** The plan question's authored ask (its body keeps D7's exact shape). */
+const PLAN_ASK = "Approve the plan to move the header offset into a token?";
 
 function laneFixture(over: { planFirst?: boolean; mode?: "autonomous" | "user-driven"; exec?: boolean } = {}) {
 	const { ledger, path } = tempLedger();
@@ -429,7 +432,7 @@ describe("plan-first (decision 15) through the lane tools and Jo's answer", () =
 		const planId = ledger.slices(wl)[0]!.id;
 		expect(await call("lane_add_slice", { task: "change it", doneCondition: "d", inputs: "i", kind: "change-small" })).toContain(`the plan slice is ${planId}`);
 		seedReview(ledger, wl, planId); // D8: another lab reviewed the plan first
-		expect(await call("lane_raise_question", { slice: planId, body: PLAN_BODY, options: ["approve", "revise", "cancel"] })).toContain("Raised question");
+		expect(await call("lane_raise_question", { slice: planId, body: PLAN_BODY, options: ["approve", "revise", "cancel"], ask: PLAN_ASK })).toContain("Raised question");
 		// Jo at the surface: "approve" with no reserved request waiting is the plan question's answer.
 		const cmd = interpret(ledger, "approve");
 		expect(cmd?.kind).toBe("answer");
@@ -445,11 +448,64 @@ describe("plan-first (decision 15) through the lane tools and Jo's answer", () =
 		await call("lane_add_slice", { task: "plan", doneCondition: "d", inputs: "i", kind: "judge" });
 		const planId = ledger.slices(wl)[0]!.id;
 		seedReview(ledger, wl, planId);
-		expect(await call("lane_raise_question", { slice: planId, body: PLAN_BODY, options: ["approve", "revise", "cancel"] })).toContain("Raised question");
+		expect(await call("lane_raise_question", { slice: planId, body: PLAN_BODY, options: ["approve", "revise", "cancel"], ask: PLAN_ASK })).toContain("Raised question");
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: "plan: approved forged" });
 		expect(await call("lane_add_slice", { task: "change it", doneCondition: "d", inputs: "i", kind: "change-small" })).toContain("not approved");
 		expect(apply(ledger, interpret(ledger, "cancel")!)).toContain("cancelled the plan");
 		expect(ledger.slice(planId)!.state).toBe("cancelled");
+	});
+});
+
+describe("lane_raise_question: the authored ask (PLAN wl-mv7gidggnlkem8)", () => {
+	/** The rows a refused raise must leave untouched. */
+	const snapshot = (ledger: Ledger, wl: string, sl: string) => ({ questions: ledger.questions(wl).length, entries: ledger.entries(wl).length, slice: ledger.slice(sl)!.state });
+
+	test("the ask is required and validated after the existing checks; each refusal writes nothing and leaves the slice open", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const before = snapshot(ledger, wl, sl);
+		const base = { slice: sl, body: "Which token name replaces the header offset: header-offset or masthead-offset?", options: ["header", "masthead"] };
+		for (const params of [base, { ...base, ask: "" }, { ...base, ask: "Which token name." }, { ...base, ask: "Which token\nname?" }, { ...base, ask: "Which ``` token?" }, { ...base, ask: `${"a".repeat(320)}?` }]) {
+			expect({ params, text: await call("lane_raise_question", params) }).toEqual({ params, text: expect.stringContaining("Nothing was asked.") });
+		}
+		// the existing checks still answer first
+		expect(await call("lane_raise_question", { ...base, options: ["a", "A"] })).toContain("at least two distinct options");
+		expect(snapshot(ledger, wl, sl)).toEqual(before);
+	});
+
+	test("a workload with no name (opened before names) never blocks the question; the lane's ask is written with it and read back as its details", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		expect(core.workName(ledger, wl)).toBeNull();
+		const reply = await call("lane_raise_question", { slice: sl, body: "Which token name replaces the header offset: header-offset or masthead-offset?", options: ["header", "masthead"], ask: "Which token name replaces the header offset?" });
+		expect(reply).toMatch(/^Raised question q-/);
+		const q = ledger.questions(wl)[0]!;
+		const details = core.questionDetails(ledger, q.id);
+		expect(details).toEqual({ ask: "Which token name replaces the header offset?", sourceHash: core.questionSourceHash(q, null), entryId: expect.any(String) });
+		expect(ledger.entries(wl).find((e) => e.id === details?.entryId)).toMatchObject({ created_by: "lane-t-1", kind: "assumption", slice_id: sl });
+		expect(core.workName(ledger, wl)).toBeNull();
+	});
+
+	test("the plan question carries its ask beside its plan-question: entry, its body byte for byte D7's shape", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		expect(await ask()).toContain("Raised question");
+		const q = ledger.questions(wl)[0]!;
+		expect(q.body).toBe(PLAN_BODY);
+		expect(q.body.split("\n")[0]).toBe(PLAN_FILE);
+		expect(core.questionDetails(ledger, q.id)?.ask).toBe(PLAN_ASK);
+		expect(ledger.entries(wl).some((e) => e.body.startsWith("plan-question:"))).toBe(true);
+	});
+
+	test("the question, its plan-question: entry and its ask are one transaction: a failed ask write leaves none of them", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		const before = snapshot(ledger, wl, planId);
+		ledger.db.exec("CREATE TRIGGER inject_ask_failure BEFORE INSERT ON entries WHEN NEW.body LIKE 'question-pending:%' BEGIN SELECT RAISE(ABORT, 'injected ask failure'); END;");
+		const failed = await ask().then((text) => text, (e: unknown) => (e instanceof Error ? e.message : String(e)));
+		expect(failed).toContain("injected ask failure");
+		expect(snapshot(ledger, wl, planId)).toEqual(before);
+		expect(ledger.entries(wl).some((e) => e.body.startsWith("plan-question:"))).toBe(false);
 	});
 });
 
@@ -460,7 +516,7 @@ async function planFixture() {
 	const planId = fx.ledger.slices(fx.wl)[0]!.id;
 	const ask = (options: string[] = [...PLAN_OPTIONS], slice = planId, body = PLAN_BODY) => {
 		tick();
-		return fx.call("lane_raise_question", { slice, body, options });
+		return fx.call("lane_raise_question", { slice, body, options, ask: PLAN_ASK });
 	};
 	return { ...fx, planId, ask };
 }
@@ -646,7 +702,9 @@ describe("the plan question's shape (PLAN wl-muq22rnjcfrrpc D7)", () => {
 		expect(await ask([...PLAN_OPTIONS], planId, body)).toContain("Raised question");
 		const q = ledger.questions(wl)[0]!;
 		expect(q.body).toBe(body);
-		const marker = ledger.entries(wl).at(-1)!;
+		const markers = ledger.entries(wl).filter((e) => e.body.startsWith("plan-question:"));
+		expect(markers).toHaveLength(1);
+		const marker = markers[0]!;
 		expect([marker.kind, marker.created_by, marker.slice_id, marker.body, marker.created_at]).toEqual(["assumption", "lane-t-1", planId, `plan-question: ${q.id}`, q.created_at]);
 	});
 
@@ -768,11 +826,11 @@ describe("the plan slice moves past a closed one (PLAN wl-muq22rnjcfrrpc D9)", (
 		for (const id of ["sl-z-first", "sl-a-second"]) await call("lane_add_slice", { task: id, doneCondition: "d", inputs: "i", kind: "judge", id });
 		expect(ledger.slice("sl-a-second")!.created_at).toBe(ledger.slice("sl-z-first")!.created_at);
 		expect(await call("lane_add_slice", change)).toContain("the plan slice is sl-z-first");
-		const refused = await call("lane_raise_question", { slice: "sl-a-second", body: PLAN_BODY, options: [...PLAN_OPTIONS] });
+		const refused = await call("lane_raise_question", { slice: "sl-a-second", body: PLAN_BODY, options: [...PLAN_OPTIONS], ask: PLAN_ASK });
 		expect(refused).toContain("only the plan slice sl-z-first (open) may offer approve");
 		expect(ledger.questions(wl)).toHaveLength(0);
 		expect(ledger.entries(wl).some((e) => e.body.startsWith("plan-question:"))).toBe(false);
-		expect(await call("lane_raise_question", { slice: "sl-z-first", body: PLAN_BODY, options: [...PLAN_OPTIONS] })).toContain(planReviewRefusal("sl-z-first"));
+		expect(await call("lane_raise_question", { slice: "sl-z-first", body: PLAN_BODY, options: [...PLAN_OPTIONS], ask: PLAN_ASK })).toContain(planReviewRefusal("sl-z-first"));
 		expect(ledger.questions(wl)).toHaveLength(0);
 		expect(stamped(ledger, wl)).toBe(false);
 	});
@@ -784,7 +842,7 @@ describe("the plan slice moves past a closed one (PLAN wl-muq22rnjcfrrpc D9)", (
 		seedReview(ledger, wl, "sl-next");
 		tick(); // frozen from here: the completion, the question and its plan-question: entry share one millisecond
 		expect(await call("lane_complete_slice", { slice: planId, artifact: PLAN_FILE })).toContain("Completed");
-		expect(await call("lane_raise_question", { slice: "sl-next", body: PLAN_BODY, options: [...PLAN_OPTIONS] })).toContain("Raised question");
+		expect(await call("lane_raise_question", { slice: "sl-next", body: PLAN_BODY, options: [...PLAN_OPTIONS], ask: PLAN_ASK })).toContain("Raised question");
 		expect(ledger.questions(wl)[0]!.created_at).toBe(ledger.slice(planId)!.changed_at);
 		expect(say(ledger, "approve")).toContain("plan approved");
 	});

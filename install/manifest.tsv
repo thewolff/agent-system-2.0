@@ -1192,3 +1192,14 @@ surface/scripts/orchestrator-prompt.ts	module	-
 surface/test/base-prompt.test.ts	test	-
 # Test runner self-refresh (migration/items/test-runner-self-refresh.md): row 6 pins for the refresh helper's sudo forms.
 gates/test/as2test-refresh-pins.test.ts	test	-
+# Readable pending rows (wl-mv7gidggnlkem8): authored work names and asks as control entries, their
+# creator writes, the reviewed-manifest backfill tool and its read-only export/check script.
+surface/src/pending-details.ts	module	-
+surface/extensions/pending-descriptions.ts	module	-
+surface/scripts/pending-descriptions.ts	module	-
+surface/test/pending-details.test.ts	test	-
+surface/test/pending-prefix.test.ts	test	-
+surface/test/pending-hook.test.ts	test	-
+surface/test/workload.test.ts	test	-
+surface/test/schedule-script.test.ts	test	-
+surface/test/pending-descriptions.test.ts	test	-

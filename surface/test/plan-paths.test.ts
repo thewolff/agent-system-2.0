@@ -19,7 +19,7 @@ import { raiseOrchestratorQuestion } from "../src/orchestrator-question";
 import type { withPlanPaths as WithPlanPaths } from "../src/plan-paths";
 import { surfaceSession } from "../src/session";
 import { SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, notices, type Sent, timeouts, timers, tmp, workloadWithSlice } from "./helpers";
+import { askQuestion, ctxOf, fakePi, notices, raiseAsked, type Sent, timeouts, timers, tmp, workloadWithSlice } from "./helpers";
 
 const PLAN_PATH = "surface-plan-path";
 const APPLIED = "## Applied from the surface since your last turn";
@@ -40,15 +40,16 @@ const planBody = (path: string) => [path, "- sl-build: build the change, one lin
 
 /**
  * A plan-first workload held by `holder` whose slice raised the plan question (`path` first), with the
- * holder's `plan-question:` entry in the same write, as lane_raise_question writes them.
+ * holder's `plan-question:` entry and the plan's authored ask in the same write, as lane_raise_question writes them.
  */
 function seedPlan(l: Ledger, path: string, holder = "lane-a"): { wl: string; sl: string; q: string } {
-	const { wl, sl } = workloadWithSlice(l, { brief: `Plan held by ${holder}` });
+	const { wl, sl } = workloadWithSlice(l, { brief: `Plan held by ${holder}`, name: `Plan held by ${holder}` });
 	l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
 	expect(l.claimWorkload(wl, { by: holder, holder, leaseMs: null }).won).toBe(true);
 	const q = l.write(() => {
 		const id = l.raiseQuestion({ by: holder, workloadId: wl, sliceId: sl, body: planBody(path), options: ["approve", "revise", "cancel"] });
 		l.recordEntry({ by: holder, workloadId: wl, sliceId: sl, kind: "assumption", body: `plan-question: ${id}` });
+		askQuestion(l, id, holder, `Should we approve ${holder}'s build plan, revise it, or cancel it?`);
 		return id;
 	});
 	return { wl, sl, q };
@@ -56,7 +57,7 @@ function seedPlan(l: Ledger, path: string, holder = "lane-a"): { wl: string; sl:
 
 /** A user-driven workload (the tick never launches it) with one reserved request waiting on Jo. */
 function seedReserved(l: Ledger): string {
-	const { wl, sl } = workloadWithSlice(l, { brief: "Push the release", mode: "user-driven" });
+	const { wl, sl } = workloadWithSlice(l, { brief: "Push the release", mode: "user-driven", name: "Release push" });
 	return l.recordEntry({ by: "lane-r", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "push main" });
 }
 
@@ -290,11 +291,11 @@ describe("nothing for what is not an open plan question (guards)", () => {
 		const e = env();
 		const l = open(e);
 		// plan-first, its body even starts with a path, but no holder wrote plan-question: for it
-		const { wl, sl } = workloadWithSlice(l, { brief: "Review parked" });
+		const { wl, sl } = workloadWithSlice(l, { brief: "Review parked", name: "Parked review" });
 		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
 		expect(l.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: null }).won).toBe(true);
-		const park = l.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "/tmp/plan-park/PLAN.md\nreview-park: the reviewer's lab is down; same-lab or wait?", options: ["same-lab", "wait"] });
-		const orch = raiseOrchestratorQuestion(l, { body: "/tmp/plan-orch/PLAN.md is the one to keep?", options: ["yes", "no"], about: null });
+		const park = raiseAsked(l, { by: "lane-a", workloadId: wl, sliceId: sl, body: "/tmp/plan-park/PLAN.md\nreview-park: the reviewer's lab is down; same-lab or wait?", options: ["same-lab", "wait"], ask: "Should the plan review run on the same lab, or wait for the other lab?" });
+		const orch = raiseOrchestratorQuestion(l, { body: "/tmp/plan-orch/PLAN.md is the one to keep?", options: ["yes", "no"], about: null, ask: "Should /tmp/plan-orch/PLAN.md be the plan file we keep?", name: "Plan file to keep" });
 		const reserved = seedReserved(l);
 		l.close();
 		const x = await start(e);
@@ -321,7 +322,7 @@ describe("nothing for what is not an open plan question (guards)", () => {
 		expect(armed).toEqual([]);
 		expect(x.of(PLAN_PATH)).toEqual([]);
 		const l2 = open(e);
-		raiseOrchestratorQuestion(l2, { body: `Is PR #${n} the one to merge?`, options: ["yes", "no"], about: null });
+		raiseOrchestratorQuestion(l2, { body: `Is PR #${n} the one to merge?`, options: ["yes", "no"], about: null, ask: `Is PR #${n} the pull request to merge?`, name: "Pull request to merge" });
 		l2.close();
 		x.f.sent.length = 0;
 		timers[0]!.fn();
@@ -366,7 +367,7 @@ describe("surface lines (D2)", () => {
 		expect(needs).not.toContain("plan for");
 
 		const l2 = open(e);
-		const oq = raiseOrchestratorQuestion(l2, { body: `Is ${q} the plan to approve tonight?`, options: ["yes", "no"], about: null });
+		const oq = raiseOrchestratorQuestion(l2, { body: `Is ${q} the plan to approve tonight?`, options: ["yes", "no"], about: null, ask: "Should the waiting plan be approved tonight?", name: "Tonight's plan approval" });
 		l2.close();
 		x.f.sent.length = 0;
 		timers[0]!.fn();
@@ -412,7 +413,7 @@ describe("surface lines (D2)", () => {
 		routes.echo = notices.join("\n");
 
 		const l2 = open(e);
-		raiseOrchestratorQuestion(l2, { body: `Keep ${q} as written?`, options: ["yes", "no"], about: null });
+		raiseOrchestratorQuestion(l2, { body: `Keep ${q} as written?`, options: ["yes", "no"], about: null, ask: "Should the waiting plan be kept as written?", name: "Plan kept as written" });
 		const launchable = l2.openWorkload({ by: SURFACE_BY, brief: "Add a verify line", stakes: "normal", mode: "autonomous" });
 		expect(launchVerdict(l2, e, launchable).launch).toBe(true);
 		l2.close();

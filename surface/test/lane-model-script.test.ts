@@ -116,7 +116,7 @@ describe("T1–T3: the runner starts on Jo's model and keeps the session only on
 	test("T2p: the tick's resume after Jo's answer keeps --model and the parked session", async () => {
 		const r = makeRoot();
 		const { wl, sl } = openWorkload(r, X);
-		launch(r, wl, { steps: [{ tool: "lane_raise_question", args: { slice: sl, body: "push now?", options: ["yes", "no"] } }] });
+		launch(r, wl, { steps: [{ tool: "lane_raise_question", args: { slice: sl, body: "push now?", options: ["yes", "no"], ask: "Should the lane push the branch now?" } }] });
 		const lane1 = laneIdOf(wl, 1);
 		expect(await exitOf(r, wl, lane1)).toMatchObject({ outcome: "parked" });
 		const session1 = spawnRecord(r, 1).session!;

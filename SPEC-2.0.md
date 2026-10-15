@@ -706,6 +706,13 @@ question only if it was marked when raised: `lane_raise_question` writes the con
 `plan-question: <question id>`, as the holding lane, when it raises an approve question on the plan
 slice while `plan: first` stands, and Jo's approve writes `plan: approved` only on a marked
 question. A question raised before its slice held the plan role never approves the plan.
+Like every lane question since wl-mv7gidggnlkem8 (`migration/items/readable-pending-rows.md`;
+Jo's choice *authored*, in-mv7ho4lzs1bhts), the plan question also carries a required `ask`, one
+plain question ending with `?` that `pending` shows on the row's `# Question:` line, kept apart
+from the body: the body keeps exactly the shape above, its first line the plan path, and the ask
+is checked and written with the question in one transaction. A plan question raised before asks
+were required shows a fixed sentence built only from the options it offers ("Should we approve
+the plan, revise it, or cancel it?"); one offering any other option waits for a reviewed ask.
 
 ### B7 · Wake: the ledger rendered, never a hand's prose (P-17)
 

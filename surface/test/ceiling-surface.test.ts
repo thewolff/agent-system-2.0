@@ -18,7 +18,7 @@ import { controlEntries } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { oneLiner, renderWorkload } from "../src/render";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
+import { ctxOf, fakePi, nameWork, notices, tempLedger, tmp } from "./helpers";
 
 function env(): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
@@ -40,9 +40,10 @@ const judge = async () => ({
 
 const ceilingBodies = (l: Ledger, wl: string) => controlEntries(l.entries(wl, "assumption")).filter((c) => c.prefix === "ceiling").map((c) => c.body);
 
-/** A normal workload opened by the surface with its ceiling entry, a lane launched on it once, and the runner's ceiling question raised. */
+/** A normal workload opened and named by the surface with its ceiling entry, a lane launched on it once, and the runner's ceiling question raised (a machine question: no authored ask). */
 function withCeilingQuestion(l: Ledger) {
 	const wl = l.openWorkload({ by: SURFACE_BY, brief: "Move the header offset into a token", stakes: "normal", mode: "autonomous" });
+	nameWork(l, wl, SURFACE_BY, "Header offset token");
 	l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: "ceiling: usd 50 wall 360 source stakes normal" });
 	l.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-t-1 cause first requested-by test" });
 	const sl = l.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: "sl-ceiling-1", task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
@@ -57,9 +58,9 @@ describe("ceiling at open and on Jo's stakes word", () => {
 		orchestratorSurface(f.pi, e, { judge });
 		const ctx = ctxOf();
 		const openTool = f.tool("orchestrator_open_workload");
-		const small = await openTool.execute("1", { brief: "rename a variable", done: "renamed", stakes: "normal" }, undefined, undefined, ctx);
-		const large = await openTool.execute("1", { brief: "build the billing subsystem", done: "billing runs", stakes: "normal" }, undefined, undefined, ctx);
-		const prod = await openTool.execute("1", { brief: "ship the billing subsystem", done: "shipped", stakes: "production" }, undefined, undefined, ctx);
+		const small = await openTool.execute("1", { brief: "rename a variable", name: "Variable rename", done: "renamed", stakes: "normal" }, undefined, undefined, ctx);
+		const large = await openTool.execute("1", { brief: "build the billing subsystem", name: "Billing subsystem build", done: "billing runs", stakes: "normal" }, undefined, undefined, ctx);
+		const prod = await openTool.execute("1", { brief: "ship the billing subsystem", name: "Billing subsystem ship", done: "shipped", stakes: "production" }, undefined, undefined, ctx);
 		const idOf = (r: { details?: unknown }): string => {
 			const d = r.details;
 			if (d && typeof d === "object" && "id" in d && typeof d.id === "string") return d.id;

@@ -12,8 +12,8 @@
 // flip from the prompt and applies it first; the wake row's before_agent_start then renders the
 // ledger (already reflecting the flip), injects the voice document and carries the receipt into the
 // turn's context; the plan-path row then puts open plan questions' paths under the orchestrator's
-// messages (PLAN wl-mv61a8dh4aeneo D3); the workload, launch and ceiling rows only register tools;
-// the lane rows register last.
+// messages (PLAN wl-mv61a8dh4aeneo D3); the workload, launch, ceiling, question and pending-descriptions
+// rows only register tools; the lane rows register last.
 //
 // This is the extension entry, so it is the one file here that may bare-import `@oh-my-pi/*`
 // (loader rule, gates/src/host.ts): the plan-first size judge (decision 15) resolves through the
@@ -25,6 +25,7 @@ import ceilingRow from "./extensions/ceiling";
 import laneRow from "./extensions/lane";
 import laneToolsRow from "./extensions/lane-tools";
 import launchRow from "./extensions/launch";
+import pendingDescriptionsRow from "./extensions/pending-descriptions";
 import planPathRow from "./extensions/plan-path";
 import questionRow from "./extensions/question";
 import surfaceInputRow from "./extensions/surface-input";
@@ -55,6 +56,7 @@ export default function orchestratorSurface(pi: SurfaceAPI, env: Record<string, 
 	launchRow(pi, env);
 	ceilingRow(pi, env);
 	questionRow(pi, env);
+	pendingDescriptionsRow(pi, env);
 	laneRow(pi, env);
 	laneToolsRow(pi, env);
 }

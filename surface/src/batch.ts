@@ -63,12 +63,12 @@ export function present(keys: ReadonlySet<string>, current: readonly ErrorLine[]
 	return current.filter((l) => keys.has(lineKey(l)));
 }
 
-/** The `pending` block: every open answer line, with the prompt waits under it (surface/src/pending.ts). */
+/** The `pending` block: every open answer line as an entry, then the prompt waits as uncounted entries (surface/src/pending.ts). */
 export function pendingText(ledger: Ledger): string {
 	return pendingBlock(pendingItems(ledger), pendingWaits(ledger)).text;
 }
 
 /** The count line every needs-you push and every Jo turn carries (D3): N is the pending block's count. */
 export function countLine(ledger: Ledger): string {
-	return `open answer lines: ${pendingBlock(pendingItems(ledger)).count} (\`pending\` shows them all)`;
+	return `open answer lines: ${pendingItems(ledger).length} (\`pending\` shows them all)`;
 }

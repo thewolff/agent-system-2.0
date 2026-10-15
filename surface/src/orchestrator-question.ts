@@ -25,6 +25,7 @@
 // no orchestrator question could be raised again.
 import type { InstructionRow, Ledger } from "../../ledger/src/index";
 import { ensureStandingWorkload, standingSlice } from "./identity";
+import { questionFieldsProblem, recordQuestionDetails } from "./pending-details";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 /** The old in-body subject form, reserved: a body starting so is refused, never stored. */
@@ -38,15 +39,23 @@ export const questionSubjectBody = (questionId: string, about: string): string =
 const SUBJECT = /^question-about: (q-[a-z0-9]+) (wl-[a-z0-9]+)$/;
 
 /**
- * Raise the orchestrator's question on the standing slice: the row, and when it is about a
- * workload, the subject entry naming it, in one transaction. Validation is the tool's.
+ * Raise the orchestrator's question on the standing slice: the row, the subject entry naming the
+ * workload it is about (when it is about one), and its authored details (surface/src/pending-details.ts:
+ * the plain `ask`, and the work `name` only when it is about no workload; a bound ask inherits its
+ * subject's name, and a subject still lacking one is no obstacle), in one transaction. The ask and
+ * name are validated first and a bad one throws with nothing written; the body, options and subject
+ * are the tool's to validate.
  */
-export function raiseOrchestratorQuestion(ledger: Ledger, input: { body: string; options: string[]; about: string | null }): string {
+export function raiseOrchestratorQuestion(ledger: Ledger, input: { body: string; options: string[]; about: string | null; ask: string; name?: string }): string {
+	const problem = questionFieldsProblem({ ask: input.ask, name: input.name, unbound: !input.about });
+	if (problem !== null) throw new Error(problem);
 	return ledger.write(() => {
 		ensureStandingWorkload(ledger);
 		const slice = standingSlice(ledger)!;
 		const id = ledger.raiseQuestion({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: slice.id, body: input.body, options: input.options });
 		if (input.about) ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: slice.id, kind: "assumption", body: questionSubjectBody(id, input.about) });
+		// After the subject entry: the details' source hash covers the subject.
+		recordQuestionDetails(ledger, { questionId: id, by: SURFACE_BY, ask: input.ask, name: input.name });
 		return id;
 	});
 }

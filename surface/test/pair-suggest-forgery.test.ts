@@ -98,12 +98,11 @@ describe("D9 (2): a lane cannot raise its own question offering pair", () => {
 	test("lane_raise_question refuses an option pair, in any case and position, with no question raised", async () => {
 		const { ledger, wl, call } = laneFixture();
 		const sl = ledger.addSlice({ by: LANE, workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const before = snapshot(ledger, wl);
 		for (const options of [["pair", "continue"], [...ROUND_LIMIT_OPTIONS, "pair"], ["continue", "Pair"]]) {
-			const reply = await call("lane_raise_question", { slice: sl, body: "Should Jo pair on this?", options });
-			expect({ options, raised: reply.startsWith("Raised question") }).toEqual({ options, raised: false });
+			await call("lane_raise_question", { slice: sl, body: "Should Jo pair on this?", options, ask: "Should Jo pair on this workload?" });
+			expect(snapshot(ledger, wl)).toEqual(before);
 		}
-		expect(ledger.questions(wl)).toEqual([]);
-		expect(ledger.slice(sl)!.state).toBe("open");
 	});
 });
 

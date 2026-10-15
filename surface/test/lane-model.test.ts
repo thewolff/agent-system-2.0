@@ -55,7 +55,7 @@ function surface() {
 describe("T1/T2: Jo's lane-model: line and the argv", () => {
 	test("T1u: the open tool records Jo's model as the surface; laneArgv carries --model after --max-time, before --resume", async () => {
 		const s = surface();
-		const r = await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", done: "it is done", stakes: "normal", model: X });
+		const r = await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", name: "Header offset token", done: "it is done", stakes: "normal", model: X });
 		const id = String(r.details?.id);
 		expect(r.text).toContain(`lane model: ${X}`);
 		const l = s.ledger();
@@ -72,7 +72,7 @@ describe("T1/T2: Jo's lane-model: line and the argv", () => {
 
 	test("T1u: the launch tool writes lane-model: in the launch-requested: transaction, model first", async () => {
 		const s = surface();
-		const id = String((await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", done: "it is done", stakes: "normal" })).details?.id);
+		const id = String((await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", name: "Header offset token", done: "it is done", stakes: "normal" })).details?.id);
 		const r = await s.call("orchestrator_launch_lane", { workloadId: id, model: X, reason: "relaunch on openai" });
 		expect(r.text).toContain(`with lane model ${X}`);
 		const l = s.ledger();
@@ -211,13 +211,14 @@ describe("T7: a model Jo cannot name is refused with nothing written", () => {
 	test("the open tool opens nothing; the launch tool writes nothing", async () => {
 		const s = surface();
 		for (const model of BAD) {
-			const r = await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", done: "it is done", stakes: "normal", model });
-			expect(r.text).toContain("Nothing was opened.");
+			const r = await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", name: "Header offset token", done: "it is done", stakes: "normal", model });
+			// refused for its model, the only bad field (the tool trims what it was given)
+			expect(r.text).toContain(`${modelProblem(model.trim())}. Nothing was opened.`);
 		}
 		let l = s.ledger();
 		expect(l.inFlight().length).toBe(0);
 		l.close();
-		const id = String((await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", done: "it is done", stakes: "normal" })).details?.id);
+		const id = String((await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", name: "Header offset token", done: "it is done", stakes: "normal" })).details?.id);
 		l = s.ledger();
 		const before = l.entries(id).length;
 		l.close();
@@ -229,7 +230,7 @@ describe("T7: a model Jo cannot name is refused with nothing written", () => {
 
 	test("on a user-driven workload the model is recorded and the by-hand line returned; nothing launches", async () => {
 		const s = surface();
-		const id = String((await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", done: "it is done", stakes: "normal", mode: "user-driven" })).details?.id);
+		const id = String((await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", name: "Header offset token", done: "it is done", stakes: "normal", mode: "user-driven" })).details?.id);
 		const r = await s.call("orchestrator_launch_lane", { workloadId: id, model: X });
 		expect(r.text).toContain(`Recorded lane model ${X}`);
 		expect(r.text).toContain(`as2 lane ${id}`);

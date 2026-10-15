@@ -5,7 +5,9 @@
 // at the surface resolves the row and mirrors the decision on the subject workload in one
 // transaction (a mirror that cannot be written rolls the answer back); a withdrawal with `cancel`
 // never cancels the standing slice, so a second question can always be raised; a restarted
-// surface re-renders the open ones at its wake.
+// surface re-renders the open ones at its wake. Every question carries its authored ask, and a name
+// exactly when it is about no workload, validated before and written in the raise's transaction; a
+// subject workload that still lacks a name never blocks it.
 import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -16,7 +18,8 @@ import { check, type Probe } from "../scripts/invariants";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
 import { apply, interpret } from "../src/input";
-import { answerOrchestratorQuestion, questionSubject, questionSubjectBody } from "../src/orchestrator-question";
+import { answerOrchestratorQuestion, questionSubject, questionSubjectBody, raiseOrchestratorQuestion } from "../src/orchestrator-question";
+import * as core from "../src/pending-details";
 import { STANDING_BRIEF, STANDING_SLICE_ID, STANDING_SLICE_TASK, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
 
@@ -87,14 +90,16 @@ describe("the question row", () => {
 		const { ledger, path } = tempLedger();
 		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
 		const s = surface(path);
-		expect(await s.raise({ body: `about ${wl}: Change the plan?`, options: ["yes", "no"] })).toContain("never as an `about wl-…:` prefix");
-		expect(await s.raise({ body: "about wl-orchestrator: Change the plan?", options: ["yes", "no"] })).toContain("Nothing was asked");
-		expect(ledger.questions(STANDING_WORKLOAD_ID)).toEqual([]);
-		const q = s.idOf(await s.raise({ body: "Change the plan?", options: ["yes", "no"], about: wl }));
+		const before = { questions: ledger.questions(STANDING_WORKLOAD_ID).length, entries: ledger.entries(STANDING_WORKLOAD_ID).length };
+		await s.raise({ body: `about ${wl}: Change the plan?`, options: ["yes", "no"], ask: "Change the plan?", about: wl });
+		expect({ questions: ledger.questions(STANDING_WORKLOAD_ID).length, entries: ledger.entries(STANDING_WORKLOAD_ID).length }).toEqual(before);
+		await s.raise({ body: "about wl-orchestrator: Change the plan?", options: ["yes", "no"], ask: "Change the plan?", name: "Orchestrator decisions" });
+		expect({ questions: ledger.questions(STANDING_WORKLOAD_ID).length, entries: ledger.entries(STANDING_WORKLOAD_ID).length }).toEqual(before);
+		const q = s.idOf(await s.raise({ body: "Change the plan?", options: ["yes", "no"], about: wl, ask: "Change the plan?" }));
 		expect(ledger.question(q)!.body).toBe("Change the plan?");
 		expect(questionSubject(ledger, q)).toBe(wl);
-		expect(ledger.entries(STANDING_WORKLOAD_ID, "assumption").map((e) => [e.created_by, e.body])).toEqual([[SURFACE_BY, questionSubjectBody(q, wl)]]);
-		const bare = s.idOf(await s.raise({ body: "Rename me?", options: ["yes", "no"] }));
+		expect(ledger.entries(STANDING_WORKLOAD_ID, "assumption").filter((e) => e.body.startsWith("question-about:")).map((e) => [e.created_by, e.body])).toEqual([[SURFACE_BY, questionSubjectBody(q, wl)]]);
+		const bare = s.idOf(await s.raise({ body: "Rename me?", options: ["yes", "no"], ask: "Rename me?", name: "Orchestrator rename" }));
 		expect(questionSubject(ledger, bare)).toBeNull();
 		// The needs-you line, the recorder and the typed answer all read that one entry: the line names the subject from it.
 		const lines = errorLines(ledger).filter((l) => l.kind === "question").map((l) => l.line);
@@ -116,7 +121,7 @@ describe("the question row", () => {
 		expect(await s.raise({ body: "x?", options: ["a", "b"], about: "wl-nope" })).toContain("No workload wl-nope");
 		expect(await s.raise({ body: "x?", options: ["a", "b"], about: done })).toContain("is closed");
 		expect(ledger.questions(STANDING_WORKLOAD_ID)).toEqual([]);
-		const text = await s.raise({ body: "Open a production workload for the empty-slice\n  wake-read fix now, or later?", options: ["now", "later"], about: wl });
+		const text = await s.raise({ body: "Open a production workload for the empty-slice\n  wake-read fix now, or later?", options: ["now", "later"], about: wl, ask: "Open the wake-read fix workload now or later?" });
 		const q = s.idOf(text);
 		expect(text).toContain(`about ${wl} (now / later); name ${q} in your QUESTION block`);
 		expect(ledger.question(q)).toMatchObject({
@@ -145,6 +150,67 @@ describe("the question row", () => {
 		expect(stuck[0]!.text).toContain("has been open 31 min");
 		db.close();
 	});
+
+	test("the ask is required and validated, the name required exactly when the ask is about no workload; each refusal writes nothing", async () => {
+		const { ledger, path } = tempLedger();
+		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix the wake read", stakes: "normal", mode: "autonomous" });
+		const s = surface(path);
+		const base = { body: "Ship the wake-read fix tonight?", options: ["yes", "no"] };
+		const refused = [
+			{ ...base, about: wl },
+			{ ...base, about: wl, ask: "" },
+			{ ...base, about: wl, ask: "Ship the wake-read fix tonight." },
+			{ ...base, about: wl, ask: "Ship the fix\ntonight?" },
+			{ ...base, about: wl, ask: "Ship \u2066the fix\u2069 tonight?" },
+			{ ...base, about: wl, ask: "Ship it tonight?", name: "Wake-read fix" },
+			{ ...base, ask: "Ship it tonight?" },
+			{ ...base, ask: "Ship it tonight?", name: "wl-mv7gidggnlkem8" },
+			{ ...base, ask: "Ship it tonight?", name: "two\nlines" },
+		];
+		for (const params of refused) expect({ params, text: await s.raise(params) }).toEqual({ params, text: expect.stringContaining("Nothing was asked.") });
+		expect(ledger.questions(STANDING_WORKLOAD_ID)).toEqual([]);
+		expect(ledger.entries(STANDING_WORKLOAD_ID)).toEqual([]);
+	});
+
+	test("a subject workload with no name yet never blocks the ask; the ask (and an unbound ask's name) is written with the row and read back as its details", async () => {
+		const { ledger, path } = tempLedger();
+		// opened before names existed: no work-name entry
+		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix the wake read", stakes: "normal", mode: "autonomous" });
+		const s = surface(path);
+		const q = s.idOf(await s.raise({ body: "Ship the wake-read fix tonight, or wait for the smoke run?", options: ["ship", "wait"], about: wl, ask: "Ship the wake-read fix tonight?" }));
+		expect(core.workName(ledger, wl)).toBeNull();
+		expect(core.questionDetails(ledger, q)).toEqual({ ask: "Ship the wake-read fix tonight?", sourceHash: core.questionSourceHash(ledger.question(q)!, wl), entryId: expect.any(String) });
+		const bare = s.idOf(await s.raise({ body: "Rename the standing slice?", options: ["yes", "no"], ask: "Rename the standing slice?", name: "Standing slice rename" }));
+		expect(core.questionDetails(ledger, bare)).toEqual({ ask: "Rename the standing slice?", name: "Standing slice rename", sourceHash: core.questionSourceHash(ledger.question(bare)!, null), entryId: expect.any(String) });
+		for (const id of [q, bare]) {
+			const entryId = core.questionDetails(ledger, id)?.entryId;
+			expect(ledger.entries(STANDING_WORKLOAD_ID).find((e) => e.id === entryId)).toMatchObject({ created_by: SURFACE_BY, kind: "assumption", slice_id: STANDING_SLICE_ID });
+		}
+	});
+
+	test("raiseOrchestratorQuestion validates its own ask and name first: a refusal throws with nothing written, not even the standing workload", () => {
+		const { ledger } = tempLedger();
+		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		const raise = (input: { about: string | null; ask: string; name?: string }) => () => raiseOrchestratorQuestion(ledger, { body: "Ship it tonight?", options: ["yes", "no"], ...input });
+		expect(raise({ about: null, ask: "Ship it tonight?" })).toThrow();
+		expect(raise({ about: wl, ask: "Ship it tonight?", name: "Fix" })).toThrow();
+		expect(raise({ about: wl, ask: "no question mark" })).toThrow();
+		expect(ledger.workload(STANDING_WORKLOAD_ID)).toBeNull();
+		const q = raise({ about: wl, ask: "Ship it tonight?" })();
+		expect(questionSubject(ledger, q)).toBe(wl);
+		expect(core.questionDetails(ledger, q)?.ask).toBe("Ship it tonight?");
+	});
+
+	test("the row, its subject entry and its details are one transaction: a failed details write leaves no question and no subject", () => {
+		const { ledger } = tempLedger();
+		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		ensureStandingWorkload(ledger);
+		ledger.db.exec("CREATE TRIGGER inject_details_failure BEFORE INSERT ON entries WHEN NEW.body LIKE 'question-pending:%' BEGIN SELECT RAISE(ABORT, 'injected details failure'); END;");
+		expect(() => raiseOrchestratorQuestion(ledger, { body: "Ship it tonight?", options: ["yes", "no"], about: wl, ask: "Ship it tonight?" })).toThrow("injected details failure");
+		expect(ledger.questions(STANDING_WORKLOAD_ID)).toEqual([]);
+		expect(ledger.entries(STANDING_WORKLOAD_ID)).toEqual([]);
+		expect(ledger.slice(STANDING_SLICE_ID)!.state).toBe("open");
+	});
 });
 
 describe("Jo's answer", () => {
@@ -152,7 +218,7 @@ describe("Jo's answer", () => {
 		const { ledger, path } = tempLedger();
 		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix the wake read", stakes: "normal", mode: "autonomous" });
 		const s = surface(path);
-		const q = s.idOf(await s.raise({ body: "Open the fix workload now, or later?", options: ["now", "later"], about: wl }));
+		const q = s.idOf(await s.raise({ body: "Open the fix workload now, or later?", options: ["now", "later"], about: wl, ask: "Open the fix workload now or later?" }));
 		const cmd = interpret(ledger, `later ${q}`);
 		expect(cmd).toEqual({ kind: "answer", workloadId: STANDING_WORKLOAD_ID, questionId: q, answer: "later" });
 		const lines = await s.say(`later ${q}`);
@@ -170,7 +236,7 @@ describe("Jo's answer", () => {
 		const { ledger, path } = tempLedger();
 		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
 		const s = surface(path);
-		const q = s.idOf(await s.raise({ body: "Now or later?", options: ["now", "later"], about: wl }));
+		const q = s.idOf(await s.raise({ body: "Now or later?", options: ["now", "later"], about: wl, ask: "Do the fix now or later?" }));
 		expect(interpret(ledger, "now")).toEqual({ kind: "answer", workloadId: STANDING_WORKLOAD_ID, questionId: q, answer: "now" });
 		await s.wake(); // numbers the needs-you lines
 		const lines = await s.say("1 now");
@@ -182,7 +248,7 @@ describe("Jo's answer", () => {
 		const { ledger, path } = tempLedger();
 		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
 		const s = surface(path);
-		const q = s.idOf(await s.raise({ body: "Now or later?", options: ["now", "later"], about: wl }));
+		const q = s.idOf(await s.raise({ body: "Now or later?", options: ["now", "later"], about: wl, ask: "Do the fix now or later?" }));
 		ledger.closeWorkload(wl, { by: "lane-a" });
 		expect(() => answerOrchestratorQuestion(ledger, { id: q }, { answer: "now", mirrorBody: "x" })).toThrow(new RegExp(`^${q} is about ${wl}, which is closed \\(.+\\): the answer was not recorded and ${q} stays open; \`withdraw ${q}\` withdraws it$`));
 		expect(ledger.question(q)!.state).toBe("open");
@@ -198,7 +264,7 @@ describe("Jo's answer", () => {
 		expect(ledger.question(q)!.state).toBe("open");
 		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
 		// A question with no subject answers alone; one whose subject is gone from the file is refused the same way.
-		const bare = s.idOf(await s.raise({ body: "Rename?", options: ["yes", "no"] }));
+		const bare = s.idOf(await s.raise({ body: "Rename?", options: ["yes", "no"], ask: "Rename the standing slice?", name: "Standing slice rename" }));
 		expect(answerOrchestratorQuestion(ledger, { id: bare }, { answer: "yes", mirrorBody: "x" })).toMatchObject({ about: null, mirrorId: null });
 		expect(ledger.question(bare)!.state).toBe("answered");
 		const ghost = ledger.raiseQuestion({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: STANDING_SLICE_ID, body: "x?", options: ["a", "b"] });
@@ -211,7 +277,7 @@ describe("Jo's answer", () => {
 		const { ledger, path } = tempLedger();
 		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
 		const s = surface(path);
-		const q = s.idOf(await s.raise({ body: "Now or later?", options: ["now", "later"], about: wl }));
+		const q = s.idOf(await s.raise({ body: "Now or later?", options: ["now", "later"], about: wl, ask: "Do the fix now or later?" }));
 		expect(interpret(ledger, `withdraw ${q}`)).toEqual({ kind: "withdraw", workloadId: STANDING_WORKLOAD_ID, questionId: q, then: "replan" });
 		const receipt = apply(ledger, { kind: "withdraw", workloadId: STANDING_WORKLOAD_ID, questionId: q, then: "cancel" });
 		expect(receipt).toMatch(new RegExp(`^withdrew the orchestrator's ${q} \\(withdrawal in-\\S+, then replan\\); the standing slice stays open$`));
@@ -220,7 +286,7 @@ describe("Jo's answer", () => {
 		expect(ledger.instructions(STANDING_WORKLOAD_ID).find((i) => i.id === row.resolved_by)).toMatchObject({ kind: "withdrawal", disposition: "replan" });
 		expect(ledger.slice(STANDING_SLICE_ID)!.state).toBe("open");
 		expect(ledger.instructions(wl)).toEqual([]);
-		const q2 = s.idOf(await s.raise({ body: "Again?", options: ["yes", "no"], about: wl }));
+		const q2 = s.idOf(await s.raise({ body: "Again?", options: ["yes", "no"], about: wl, ask: "Ask about the fix again?" }));
 		expect(ledger.question(q2)).toMatchObject({ state: "open", slice_id: STANDING_SLICE_ID });
 		expect((await s.say(`withdraw ${q2}`))[0]).toContain("the standing slice stays open");
 		expect(ledger.slice(STANDING_SLICE_ID)!.state).toBe("open");
@@ -257,8 +323,8 @@ describe("Jo's input as the answer's receipt (fix round 1, B1)", () => {
 		expect(ledger.instructions(wl).map((i) => i.body)).toEqual(['Jo: "hello there, start with the README" — reading: start with the README']);
 		expect(await record(s, { workloadId: wl, inputId: hello })).toBe(`${hello} already instructed ${wl}, and one input is recorded once; nothing was recorded.`);
 		expect(ledger.instructions(wl)).toHaveLength(1);
-		const q = s.idOf(await s.raise({ body: "Keep the draft, or rewrite it?", options: ["keep", "rewrite"], about: wl }));
-		const q2 = s.idOf(await s.raise({ body: "Ship tonight?", options: ["yes", "no"], about: wl }));
+		const q = s.idOf(await s.raise({ body: "Keep the draft, or rewrite it?", options: ["keep", "rewrite"], about: wl, ask: "Keep the draft or rewrite it?" }));
+		const q2 = s.idOf(await s.raise({ body: "Ship tonight?", options: ["yes", "no"], about: wl, ask: "Ship the fix tonight?" }));
 		await Bun.sleep(2); // the receipt must postdate the question: a tie in the millisecond stamp is refused
 		// Not typed by Jo (no `input`, or one from an extension): no row, and the recorder has nothing to bind.
 		expect(await s.say("keep it, the draft is fine")).toEqual([]);
@@ -290,7 +356,7 @@ describe("Jo's input as the answer's receipt (fix round 1, B1)", () => {
 		// An input typed before the question was raised cannot answer it.
 		expect(await record(s, { questionId: q2, inputId: input })).not.toContain("Answered");
 		const early = ledger.recordInstruction({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, body: "yes", author: "jo", channel: "surface" });
-		const q3 = s.idOf(await s.raise({ body: "Really?", options: ["yes", "no"] }));
+		const q3 = s.idOf(await s.raise({ body: "Really?", options: ["yes", "no"], ask: "Really rename the standing slice?", name: "Standing slice rename" }));
 		expect(await record(s, { questionId: q3, inputId: early })).toBe(`${early} was not typed after ${q3} was raised, so it cannot answer it; nothing was recorded.`);
 		// A workload that is not the question's subject is refused; a closed subject leaves the question open (B4).
 		expect(await record(s, { questionId: q2, inputId: early, workloadId: "wl-other" })).toBe(`${q2} is about ${wl}, not wl-other; nothing was recorded.`);
@@ -307,8 +373,8 @@ describe("restart", () => {
 		const { ledger, path } = tempLedger();
 		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
 		const first = surface(path);
-		const q1 = first.idOf(await first.raise({ body: "Now or later?", options: ["now", "later"], about: wl }));
-		const q2 = first.idOf(await first.raise({ body: "Rename me?", options: ["yes", "no"] }));
+		const q1 = first.idOf(await first.raise({ body: "Now or later?", options: ["now", "later"], about: wl, ask: "Do the fix now or later?" }));
+		const q2 = first.idOf(await first.raise({ body: "Rename me?", options: ["yes", "no"], ask: "Rename the standing slice?", name: "Standing slice rename" }));
 		ledger.close();
 		const again = surface(path);
 		const wake = await again.wake();

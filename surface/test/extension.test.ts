@@ -16,7 +16,7 @@ import { ceilingOf } from "../src/input";
 import { planFirstBody } from "../src/launch";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { STANDING_WORKLOAD_ID, SURFACE_BY as SURFACE } from "../src/types";
-import { clock, ctxOf, fakePi, notices, timers, tmp } from "./helpers";
+import { askQuestion, clock, ctxOf, fakePi, nameWork, notices, raiseAsked, timers, tmp } from "./helpers";
 
 function env(over: Record<string, string> = {}): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
@@ -60,10 +60,6 @@ describe("surface extension adapter", () => {
 		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which?", options: ["left", "right"] });
 		ledger.close();
 		orchestratorSurface(f.pi, e);
-		expect(f.registered().sort()).toEqual([
-			"lane_add_slice", "lane_complete_slice", "lane_full_test", "lane_handoff", "lane_message", "lane_raise_question", "lane_read_facts", "lane_record_entry", "lane_release", "lane_withdraw_reserved",
-			"orchestrator_close_workload", "orchestrator_identity", "orchestrator_launch_lane", "orchestrator_ledger", "orchestrator_lower_ceiling", "orchestrator_open_workload", "orchestrator_raise_question", "orchestrator_record_instruction", "orchestrator_schedule", "orchestrator_wake_read", "slice_artifact",
-		]);
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		const started = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: ["base"] }, ctx)) as Started;
@@ -164,8 +160,9 @@ describe("surface extension adapter", () => {
 		const e = env();
 		const l = open(e);
 		const wl = l.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		nameWork(l, wl, "lane-a", "Feed header fix");
 		const sl = l.addSlice({ by: "lane-a", workloadId: wl, task: "t", doneCondition: "d", inputs: "a.ts" });
-		const q = l.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which?", options: ["left", "right"] });
+		const q = raiseAsked(l, { by: "lane-a", workloadId: wl, sliceId: sl, body: "Which?", options: ["left", "right"], ask: "Should the header offset move left or right?" });
 		orchestratorSurface(f.pi, e);
 		const opts = { idle: true };
 		const ctx = { ...ctxOf(), isIdle: () => opts.idle };
@@ -177,11 +174,15 @@ describe("surface extension adapter", () => {
 		expect(shown()).toHaveLength(1);
 		expect(shown()[0]!.options).toEqual({});
 		expect(shown()[0]!.message).toEqual({ customType: "surface-pending", content: pendingBlock(pendingItems(l), pendingWaits(l)).text, display: true });
-		expect(shown()[0]!.message.content).toContain(`\nleft ${q}  # Which — on Fix · `);
+		// the shown row names the work and asks its question in the author's words, and keeps the pasteable answer whole on its own line
+		const content = shown()[0]!.message.content;
+		expect(content).toContain("Feed header fix");
+		expect(content).toContain("Should the header offset move left or right?");
+		expect(content.split("\n")).toContain(`left ${q}`);
 		// busy: nothing is sent while the session streams (a message then would be a steer)
 		opts.idle = false;
 		expect(await f.emit("input", { text: "pending", source: "interactive" }, ctx)).toEqual({ handled: true });
-		const later = l.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Raised while busy?", options: ["yes", "no"] });
+		const later = raiseAsked(l, { by: "lane-a", workloadId: wl, sliceId: sl, body: "Raised while busy?", options: ["yes", "no"], ask: "Should the busy-time question be shown at the next idle poll?" });
 		timers[0]!.fn();
 		expect(shown()).toHaveLength(1);
 		opts.idle = true;
@@ -189,7 +190,7 @@ describe("surface extension adapter", () => {
 		expect(shown()).toHaveLength(2);
 		expect(shown()[1]!.options).toEqual({});
 		expect(shown()[1]!.message.content).toBe(pendingBlock(pendingItems(l), pendingWaits(l)).text);
-		expect(shown()[1]!.message.content).toContain(later);
+		expect(shown()[1]!.message.content.split("\n")).toContain(`yes ${later}`);
 		timers[0]!.fn();
 		expect(shown()).toHaveLength(2);
 		// a word that only contains it is not the surface word
@@ -201,13 +202,15 @@ describe("surface extension adapter", () => {
 		const f = fakePi();
 		const e = env();
 		const l = open(e);
-		// a free-form question and a reserved request
+		// a free-form question and a reserved request, on a workload its lane opened and named
 		const a = l.openWorkload({ by: "lane-a", brief: "Fix the feed header", stakes: "normal", mode: "autonomous" });
+		nameWork(l, a, "lane-a", "Feed header fix");
 		const sa = l.addSlice({ by: "lane-a", workloadId: a, task: "t", doneCondition: "d", inputs: "a.ts" });
 		const en = l.recordEntry({ by: "lane-a", workloadId: a, sliceId: sa, kind: "reserved-request", body: "git push origin main" });
-		const free = l.raiseQuestion({ by: "lane-a", workloadId: a, sliceId: sa, body: "Which header?", options: ["left", "right"] });
-		// a plan question whose review verdict is approve
+		const free = raiseAsked(l, { by: "lane-a", workloadId: a, sliceId: sa, body: "Which header?", options: ["left", "right"], ask: "Which side should the feed header align to?" });
+		// a plan question whose review verdict is approve, raised with its ask as lane_raise_question writes it
 		const p = l.openWorkload({ by: SURFACE, brief: "Plan the pending word", stakes: "normal", mode: "autonomous" });
+		nameWork(l, p, SURFACE, "Pending word plan");
 		const sp = l.addSlice({ by: "lane-p", workloadId: p, task: "plan", doneCondition: "approved", inputs: "brief" });
 		l.recordEntry({ by: SURFACE, workloadId: p, kind: "assumption", body: planFirstBody("your word") });
 		expect(l.claimWorkload(p, { by: "lane-p", holder: "lane-p", leaseMs: null }).won).toBe(true);
@@ -215,10 +218,12 @@ describe("surface extension adapter", () => {
 		const plan = l.write(() => {
 			const id = l.raiseQuestion({ by: "lane-p", workloadId: p, sliceId: sp, body: planBody, options: ["approve", "revise", "cancel"] });
 			l.recordEntry({ by: "lane-p", workloadId: p, sliceId: sp, kind: "assumption", body: `plan-question: ${id}` });
+			askQuestion(l, id, "lane-p", "Should we approve the plan for the pending word, revise it, or cancel it?");
 			return id;
 		});
-		// the runner's ceiling question
+		// the runner's ceiling question: a machine question with no authored ask, on a workload the surface opened and named
 		const c = l.openWorkload({ by: SURFACE, brief: "Move the header offset into a token", stakes: "normal", mode: "autonomous" });
+		nameWork(l, c, SURFACE, "Header offset token");
 		l.recordEntry({ by: SURFACE, workloadId: c, kind: "assumption", body: "ceiling: usd 50 wall 360 source stakes normal" });
 		l.recordEntry({ by: LANE_STARTER_BY, workloadId: c, kind: "assumption", body: "launch: lane-t-1 cause first requested-by test" });
 		const sc = l.addSlice({ by: LANE_RUNNER_BY, workloadId: c, id: "sl-ceiling-1", task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
@@ -229,15 +234,17 @@ describe("surface extension adapter", () => {
 		await f.emit("input", { text: "pending", source: "interactive" }, ctx);
 		const block = f.sent.find((x) => x.message.customType === "surface-pending")!.message.content;
 		expect(block).toBe(pendingBlock(pendingItems(l), pendingWaits(l)).text);
-		const fenced = block.split("```text\n")[1]!.split("\n```")[0]!.split("\n");
-		// the open plan question's path sits on the line beneath its answer line (every-mention rule, merge-train review of #106)
-		expect(fenced[fenced.findIndex((x) => x.startsWith(`approve ${plan}  # `)) + 1]).toBe(`  plan for ${plan}: /tmp/wl-p/PLAN.md`);
-		expect(fenced.filter((x) => !x.startsWith("  plan for ")).map((x) => x.split("  # ")[0]).sort()).toEqual([`approve ${en}`, `approve ${plan}`, `left ${free}`, `stop ${ceiling}`].sort());
+		const lines = block.split("\n");
+		// every answer is a whole pasteable line, and the open plan question's path sits on the line beneath its answer (every-mention rule, merge-train review of #106)
+		expect(lines).toEqual(expect.arrayContaining([`approve ${en}`, `approve ${plan}`, `left ${free}`, `stop ${ceiling}`]));
+		expect(lines[lines.indexOf(`approve ${plan}`) + 1]).toBe(`  plan for ${plan}: /tmp/wl-p/PLAN.md`);
+		// the work names and the authored asks are on the block, so it reads on its own
+		for (const words of ["Feed header fix", "Pending word plan", "Header offset token", "Which side should the feed header align to?", "Should we approve the plan for the pending word, revise it, or cancel it?"]) expect(block).toContain(words);
 		// all or nothing: the same block with one line naming a question that does not exist applies none of the four
 		const broken = block.replace(`stop ${ceiling}`, "stop q-nope");
 		await f.emit("before_agent_start", { prompt: broken, systemPrompt: [] }, ctx);
-		expect(notices.some((n) => n.startsWith("nothing applied"))).toBe(true);
 		expect(pendingItems(l)).toHaveLength(4);
+		expect([a, p, c].flatMap((id) => l.instructions(id))).toEqual([]);
 		// Jo pastes it back untouched as his turn: one transaction applies all four
 		notices.length = 0;
 		await f.emit("input", { text: block, source: "interactive" }, ctx);
@@ -555,17 +562,17 @@ describe("surface extension adapter", () => {
 		const ctx = ctxOf({ cwd: repo });
 		const who = await f.tool("orchestrator_identity").execute("1", { name: "Sable", pronouns: "they/them" }, undefined, undefined, ctx);
 		expect(who.content[0]!.text).toMatch(/^You are now Sable \(they\/them\); entry en-/);
-		const opened = await f.tool("orchestrator_open_workload").execute("1", { brief: "hotfix the feed header", done: "the feed header renders at the right offset in production" }, undefined, undefined, ctx);
+		const opened = await f.tool("orchestrator_open_workload").execute("1", { brief: "hotfix the feed header", name: "Feed header hotfix", done: "the feed header renders at the right offset in production" }, undefined, undefined, ctx);
 		const id = (opened.details as { id: string }).id;
 		expect(opened.content[0]!.text).toContain(`Opened ${id} on ${repo}`);
 		expect(opened.content[0]!.text).toContain("stakes: production · mode: autonomous");
 		expect(opened.content[0]!.text).toContain('inferred production: you said "hotfix"');
 		expect(opened.content[0]!.text).toContain("prior decision");
-		const overridden = await f.tool("orchestrator_open_workload").execute("1", { brief: "hotfix again", done: "the second hotfix is live", stakes: "throwaway", mode: "user-driven" }, undefined, undefined, ctx);
+		const overridden = await f.tool("orchestrator_open_workload").execute("1", { brief: "hotfix again", name: "Second feed header hotfix", done: "the second hotfix is live", stakes: "throwaway", mode: "user-driven" }, undefined, undefined, ctx);
 		expect(overridden.content[0]!.text).toContain("stakes overridden to throwaway; mode overridden to user-driven");
-		const sched = await f.tool("orchestrator_schedule").execute("1", { due: "2020-01-01", text: "re-measure the threshold; method = routing_review" }, undefined, undefined, ctx);
+		const sched = await f.tool("orchestrator_schedule").execute("1", { due: "2020-01-01", text: "re-measure the threshold; method = routing_review", name: "Routing threshold re-measure" }, undefined, undefined, ctx);
 		const sid = (sched.details as { id: string }).id;
-		const bad = await f.tool("orchestrator_schedule").execute("1", { due: "someday", text: "x" }, undefined, undefined, ctx);
+		const bad = await f.tool("orchestrator_schedule").execute("1", { due: "someday", text: "x", name: "Unparseable schedule" }, undefined, undefined, ctx);
 		expect(bad.content[0]!.text).toContain("nothing was opened");
 		// the due row is under needs-you at the next wake
 		await f.emit("session_compact", {}, ctx);

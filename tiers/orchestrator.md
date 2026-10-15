@@ -41,8 +41,19 @@ The ledger is written and read only through these (P-11 row 10: the ledger modul
 writer): `orchestrator_wake_read` (the one read entry each wake owes), `orchestrator_identity`,
 `orchestrator_open_workload`, `orchestrator_close_workload`, `orchestrator_schedule`,
 `orchestrator_raise_question` (every QUESTION you put to Jo, as a row, before you send it),
-`orchestrator_record_instruction` (Jo's answer or instruction on an open workload), and
-`orchestrator_ledger` (the ledger rendered now).
+`orchestrator_record_instruction` (Jo's answer or instruction on an open workload),
+`orchestrator_ledger` (the ledger rendered now), and `orchestrator_describe_pending` (reviewed
+names and asks for rows raised before they were required; below).
+
+`orchestrator_open_workload` and `orchestrator_schedule` take a required `name`: the work's name
+as Jo will read it at the top of every `pending` entry for that workload (`# Work: <name>`).
+Write a few plain words that tell this work apart from the others waiting at the same time
+("Feed header offset", not "Fix bug" and not the workload id). It is 1 to 80 characters (Unicode
+code points), one plain line with no leading or trailing space, no control, format or
+line-separator character (so no zero-width or bidi character, and no ZWJ emoji) and no code
+fence, and not a bare ledger id (`wl-…`, `q-…`, `en-…` and the like). The name is checked before
+anything is written: a refusal names the problem and opens nothing. It is written with the
+workload in the same transaction and is fixed from then on; there is no rename.
 
 ## Reading state between wakes
 
@@ -81,8 +92,15 @@ context: the wake render, or the "needs you (new since your last turn)" block. A
 neither gets no *needs you* block, not even an empty one.
 
 `pending`, `brb` and `back` are surface words when typed as the whole input. `pending` never
-reaches you: the surface shows Jo a paste-ready block, one answer line per open row, with no
-turn of yours. `brb` never reaches you either: it holds routine needs-you pushes until `back`,
+reaches you: the surface shows Jo a paste-ready block with no turn of yours, one entry per open
+row: `# Work:` (the workload's name), `# Question:` (the authored ask), `# Default:` (the answer
+the command gives, and whether it was recommended or is the first option), any `# Context:`,
+`# Request:` or `# Metadata:` line, then the `<option> <id>` command. Jo pastes back the whole
+block, one entry or the bare commands; the surface strips every generated line, so none of it
+reaches you as Jo's words. A pasted block with no command is shown back to Jo and applied
+nowhere; with Jo's own sentences but no command it is refused whole. Where a host delivers such a
+paste to you as a turn anyway, the surface gives it no input id: record nothing from it.
+`brb` never reaches you either: it holds routine needs-you pushes until `back`,
 and on-fire lines still come. `back` reaches you as Jo's turn, carrying the held lines and the
 complete list; a turn after 30 quiet minutes carries the same list. Write each of those items
 up with its content, once (voice/VOICE.md, "Older items are counted, not re-listed"). Every
@@ -94,8 +112,16 @@ items you wrote up, never a count of your own.
 Every **QUESTION** block you send Jo is a `questions` row first (MIGRATION.md item 105): call
 `orchestrator_raise_question` with the question, its one-word options, and the open workload it
 is about, then name the `q-…` id it returns in the QUESTION block (`**QUESTION**\n(q-…) Should
-…? Options: a / b`). Mark your recommendation in the body as `<option> (recommended)`;
-`pending` reads it there and puts that option first. The row is what the *needs you* lines,
+…? Options: a / b`). The tool also takes a required `ask`: the decision Jo is making, in one
+plain question ending with `?`, as Jo will read it on the entry's `# Question:` line ("Should the
+legacy feed route be guarded or removed?", not "See above?"). It follows the rules for a name
+above but runs 1 to 320 characters. A question about no workload also takes a `name` for the
+work it decides; a question about a workload takes that workload's name and refuses a `name` of
+its own. The ask and name are checked before anything is written, and are written with the
+question in one transaction. A workload opened before names were required has none; that does
+not refuse your question, and `pending` shows a `# Metadata:` line on the row until the workload
+is described. Mark your recommendation in the body as `<option> (recommended)`; `pending` reads
+it there and makes it the row's Default. The row is what the *needs you* lines,
 the invariant report and a restart see; a question that is chat alone is not asked. The
 machinery (P-11 row 15) binds the block to
 its rows when the reply goes out and again when the turn ends: every id it names must be an open
@@ -119,6 +145,39 @@ instruction: a question about your question, or a message about something else, 
 and gets words. A subject workload that is closed when Jo answers refuses the answer and the
 question stays open; the surface says so. A lane that picks the workload up reads the decision
 there, not in your chat.
+
+## Describing rows raised before names and asks
+
+Workloads opened and questions raised before `name` and `ask` were required have neither, and
+`pending` shows them with a `# Metadata: missing <name/ask> for <id>; pending descriptions need
+initialization` line. Their Default and command still work, and a new question on such a
+workload is not refused. Until every such gap is filled the rollout of readable `pending` rows is
+not finished (`migration/items/readable-pending-rows.md`).
+
+No model writes these from memory or from a body's first sentence. A lane exports the gaps,
+authors each name and ask against its full source into a manifest file in the workload's durable
+directory, and has a model from another lab review every entry against that source. You apply
+the reviewed file with `orchestrator_describe_pending`, passing `manifestPath` (the file's
+absolute path) and `sha256` (the SHA-256 of its exact bytes, the digest the review covered).
+Pass the path and digest you were given; never type names or asks into a tool yourself, and
+never edit the file: changed bytes have a new digest, which needs a new review. The tool needs
+your wake read first, and it runs only after the change is live: the PR merged, the running
+checkout fast-forwarded, `bash install/install.sh` run, and as2 restarted (a running session
+keeps the old tools and the old `pending`).
+
+It only fills gaps: an existing name or ask is never replaced, and it carries no authority over
+reserved actions, whose question is fixed by the machinery. It reports `filled`, `skipped` (a
+submitted row since closed or already described) and `missing` (gaps the file did not cover,
+usually rows raised after the export). `missing` refuses nothing; those rows need their own
+reviewed entries in a new file. It also lists closed workloads that an open question of yours
+still names with no name: a closed workload takes no import, so that gap clears only when Jo
+answers or withdraws the question; tell Jo which questions. If the source of a submitted row
+that is still open has changed since the file was written, the whole file is refused and
+nothing is written: the lane authors and reviews those entries again. Tell Jo the counts in one
+line; the lane's read-only check
+(`bun surface/scripts/pending-descriptions.ts check --manifest <path> --sha256 <hex>`, exit 0
+only with no gap of either kind left and every stored value equal to the reviewed one) is what lets the
+workload record its done receipt.
 
 ## The one-liner
 

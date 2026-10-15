@@ -18,7 +18,10 @@
 // checks its body against the plan question's shape (PLAN wl-muq22rnjcfrrpc D7) and writes the
 // holder's `plan-question:` entry in the question's transaction (D9 part two). While `plan: first`
 // stands unapproved it refuses `approve` on any other slice, naming the plan slice and the ways out
-// (PLAN wl-mv5i3lulwwbbi8 D4).
+// (PLAN wl-mv5i3lulwwbbi8 D4). Every question, plan or not, carries the lane's authored `ask` (one
+// plain sentence ending ?; surface/src/pending-details.ts), validated after the checks above and
+// written in the question's transaction; the workload's name is inherited, and a workload that still
+// lacks one never blocks the question.
 // MIGRATION.md item 40 (PLAN wl-muq1v31q5ly7ls D4, D6): `lane_release` writes `released-open:` in the
 // release's own transaction when open or paused slices remain and no holder receipt stands, and the
 // terminal pair refuses while a hand this lane spawned is unsettled (surface/src/turn-end.ts);
@@ -47,6 +50,7 @@ import {
 	planQuestionProblem, planSlice, reservedPrefix,
 } from "../src/launch";
 import { PAIR_OPTION } from "../src/pair-suggest";
+import { askProblem, recordQuestionDetails } from "../src/pending-details";
 import { testRuns } from "../src/test-run";
 import { releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
 import {
@@ -308,11 +312,13 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			`each line at most ${PLAN_QUESTION_LINE_MAX} characters and nothing else: the plan file's absolute path; one \`- <slice id>: <what it does>\` line per slice; ` +
 			"1 to 3 `tradeoff: <one line>` lines; one `review: <verdict>, <model>, <absolute path to the verdict file>` line. " +
 			"A plan question offering approve is refused until a review hand named after the plan slice has reviewed the plan on another lab since the last question, and refused in any other shape. " +
-			"Until the plan is approved, a question offering approve on any other slice is refused.",
+			"Until the plan is approved, a question offering approve on any other slice is refused. " +
+			"`ask` is required on every question, the plan question too: the decision itself as one plain sentence ending with ?, read on its own in Jo's pending list.",
 		parameters: z.object({
 			slice: z.string().describe("The slice id (sl-…) the question is about."),
 			body: z.string().describe("The question, in plain words (the plan slice's approve question: the plan in the shape above)."),
 			options: z.array(z.string()).describe("At least two answers Jo can give in one word each."),
+			ask: z.string().describe("The question itself, one plain sentence ending with ? (1 to 320 characters, one line, no code fence), e.g. \"Approve the plan to move the header offset into a token?\"."),
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -321,6 +327,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			const slice = String(params.slice ?? "").trim();
 			const body = String(params.body ?? "").trim();
 			const options = Array.isArray(params.options) ? params.options.map((x) => String(x).trim()).filter((x) => x.length > 0) : [];
+			const ask = typeof params.ask === "string" ? params.ask.trim() : "";
 			if (!slice || !body) return text("A question names a slice id and a body; nothing was asked.");
 			if (new Set(options.map((x) => x.toLowerCase())).size < 2) return text("A question offers at least two distinct options Jo can answer with; nothing was asked.");
 			// PLAN wl-mv67564rdkfvnk D9 (2): `pair` is offered only by the round-limit and ceiling raise sites, never by a lane.
@@ -353,10 +360,13 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 					return text(`A plan question offering approve has this shape, one item per line, each line at most ${PLAN_QUESTION_LINE_MAX} characters, nothing else:\n${PLAN_QUESTION_SHAPE}\nThis body does not: ${problem}. Nothing was asked.`);
 				}
 			}
-			// D9 part two: the plan question's role is recorded as it is raised, by the holding lane, in the same write.
+			const asked = askProblem(ask);
+			if (asked !== null) return text(`${asked} Nothing was asked.`);
+			// D9 part two: the plan question's role is recorded as it is raised, by the holding lane, in the same write; so is every question's ask.
 			const id = ledger.write(() => {
 				const q = ledger.raiseQuestion({ by: o.own.laneId, workloadId, sliceId: slice, body, options });
 				if (plan) ledger.recordEntry({ by: o.own.laneId, workloadId, sliceId: slice, kind: "assumption", body: planQuestionBody(q) });
+				recordQuestionDetails(ledger, { questionId: q, by: o.own.laneId, ask });
 				return q;
 			});
 			return text(`Raised question ${id} on ${slice} (${options.join(" / ")}); the slice is paused until Jo answers.`, { id });

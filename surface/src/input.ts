@@ -13,11 +13,12 @@
 // item 1). Every applied word is a ledger row (§ B5: the flip is a ledgered instruction), author
 // "jo", channel "surface". Anything else is ordinary conversation for the orchestrator model.
 //
-// Answer lines (PLAN wl-mv5msri070p0qo D2): a line that is exactly `<word> <id>` followed by
-// whitespace, `#` and any text (a line of the `pending` block) is read as `<word> <id>`
-// (`stripTail`), alone and in a paste; nothing else loses a `#` (`fix # 3 now` stays prose). A
-// stakes or mode word naming a question or reserved request (`autonomous q-…`) is an answer to it,
-// never a flip: the flip takes no id or a `wl-…` id.
+// Answer lines (PLAN wl-mv5msri070p0qo D2): a `pending` entry's command is a bare `<word> <id>`. A
+// line that is exactly `<word> <id>` followed by whitespace, `#` and any text (the older layout's
+// answer line, still read when pasted alone) is read as `<word> <id>` (`stripTail`), alone and in a
+// paste; nothing else loses a `#` (`fix # 3 now` stays prose). A stakes or mode word naming a
+// question or reserved request (`autonomous q-…`) is an answer to it, never a flip: the flip takes
+// no id or a `wl-…` id.
 //
 // A paste of several lines (MIGRATION.md item 48): each non-empty line is read on its own with the
 // rules above (a numbered batch line keeps its comma form; `ceiling` and `rounds` keep their long
@@ -28,10 +29,16 @@
 // plain-words instruction for the orchestrator, which records it as one row
 // (`orchestrator_record_instruction`) after the commands land; a command line between two such
 // runs separates two instructions. A paste with no command line at all is prose and passes through
-// untouched, as a single prose line does. The wrapper of a `pending` block pasted back (its
-// heading, the fence around its answer lines, the generated sentences under it,
-// `pendingWrapperLines`) is dropped, so the block pasted whole forwards no instruction of its own;
-// any other line Jo pasted, a fence of Jo's own included, is kept.
+// untouched, as a single prose line does.
+//
+// A `pending` block pasted back (PLAN wl-mv7gidggnlkem8; surface/src/pending.ts `pendingWrapperLines`,
+// read against what pending shows now): its heading, fence, entry fields and plan path lines are
+// dropped, never commands and never part of an instruction. A complete commandless question or
+// prompt-wait card copied without the heading/fence is also read as one whole entry: a current card
+// alone is `wrapperOnly`; mixed with prose or edited/stale it is refused whole. A partial field
+// fragment without a heading or command remains prose. A fence of Jo's own is kept. Refused whole
+// before any line is read (`kind: "refused"`): an old heading; generated-looking lines that no
+// longer match pending in a container or with a command; a container with Jo's words and no command.
 //
 // The workload ceiling (DESIGN-workload-ceiling.md § 1 B and D, § 2 items 2 and 5): the stakes word
 // re-sizes the ceiling, `ceiling <usd> [<hours>] [wl-…]` sets Jo's exact figure, and an answer to the
@@ -333,7 +340,13 @@ export interface PasteRefusal {
 	text: string;
 	why: string[] | Extract<Command, { kind: "ambiguous" }> | null;
 }
-export type PasteResult = { ok: true; items: PasteItem[] } | { ok: false; refused: PasteRefusal[]; held: PasteInstruction[] };
+export type PasteResult =
+	| { ok: true; items: PasteItem[] }
+	| { ok: false; refused: PasteRefusal[]; held: PasteInstruction[] }
+	/** Only `pending`'s own generated text (a container and nothing else): nothing to apply, nothing to pass on. */
+	| { ok: false; kind: "wrapperOnly" }
+	/** Refused whole before any line is read as a command (`why`); `held` are Jo's own words in it, reported, never passed on. */
+	| { ok: false; kind: "refused"; why: string; held: PasteInstruction[] };
 
 /**
  * An id-shaped token: a reserved request (`en-…`), a question (`q-…`), a workload (`wl-…`) or a
@@ -434,10 +447,14 @@ function resolves(cmd: Command): string | null {
  *   `approve en-nope`, `production wl-nope`): refused, never prose;
  * - plain words otherwise; consecutive plain-words lines form one instruction and a command line
  *   separates two;
- * - a line of a `pending` block pasted back that is its generated wrapper (`pendingWrapperLines`:
- *   its heading, the fence around its answer lines, the generated sentences under it): dropped,
+ * - a line of a `pending` block pasted back that is its generated text (`pendingWrapperLines`: its
+ *   heading, fence, entry fields matching what pending shows now, plan path lines): dropped,
  *   neither a command nor part of an instruction; a fence or heading-like line of Jo's own is kept.
- * Null when no line is a command or a refused one: the paste is prose and passes through. Every
+ * Refused whole first (`kind: "refused"`), whatever else the paste holds: a heading of an old
+ * layout; generated-looking lines matching nothing pending shows now, when the paste carries a
+ * container or a command; a container with Jo's words and no command line. A container with no
+ * command and no words of Jo's is `kind: "wrapperOnly"`.
+ * Null when no line is a command or a refused one and no container is in it: the paste is prose and passes through. Every
  * command line must resolve before any is applied, and a question or reserved request answered
  * twice across lines (`1 left` then `right q-X` when #1 is q-X) is refused on the later line;
  * otherwise `refused` carries one verdict per command line and `held` the instructions, and
@@ -445,7 +462,9 @@ function resolves(cmd: Command): string | null {
  */
 export function interpretPaste(ledger: Ledger, numbering: Numbering, text: string, heartbeatOf: HeartbeatOf = runHeartbeat(process.env)): PasteResult | null {
 	const raw = text.split("\n");
-	const generated = pendingWrapperLines(raw);
+	const wrapper = pendingWrapperLines(ledger, raw);
+	// Generated lines, and stale ones (which refuse the paste below), are never read as commands or held as Jo's words.
+	const generated = new Set([...wrapper.lines, ...wrapper.stale]);
 	type Read = { line: number; text: string } & (
 		| { kind: "batch"; pieces: { n: number; word: string }[] }
 		| { kind: "command"; cmd: Command }
@@ -482,7 +501,44 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 			read.push({ line, text: t, kind: "invalid", why: `"${t}" is not a command the surface knows${takes}` });
 		}
 	}
-	if (!read.some((r) => r.kind !== "prose")) return null;
+	/** Lines `from`–`to` (1-based) as one instruction, the generated lines among them left out. */
+	const run = (from: number, to: number): PasteInstruction => ({
+		kind: "instruction", from, to,
+		text: raw.slice(from - 1, to).filter((_, k) => !generated.has(from - 1 + k)).join("\n").trim(),
+	});
+	/** Every run of consecutive plain-words lines, as the instructions a refused paste holds. */
+	const runs = (): PasteInstruction[] => {
+		const out: PasteInstruction[] = [];
+		let open: { from: number; to: number } | null = null;
+		for (const r of read) {
+			if (r.kind === "prose") open = open === null ? { from: r.line, to: r.line } : { from: open.from, to: r.line };
+			else if (open !== null) {
+				out.push(run(open.from, open.to));
+				open = null;
+			}
+		}
+		return open === null ? out : [...out, run(open.from, open.to)];
+	};
+	const commands = read.some((r) => r.kind !== "prose");
+	const refresh = "nothing applied: run `pending` again and paste from the fresh block";
+	if (wrapper.old !== null) {
+		// The older layout's own lines cannot be told from Jo's, so none of them is echoed back as Jo's words.
+		return { ok: false, kind: "refused", why: `line ${wrapper.old + 1} heads a pending block in a layout this surface does not read (an older block, or its heading edited or wrapped); ${refresh}`, held: [] };
+	}
+	if (wrapper.stale.length > 0) {
+		const at = wrapper.stale.map((i) => i + 1);
+		const lines = at.length === 1 ? `line ${at[0]} looks` : `lines ${at.join(", ")} look`;
+		return {
+			ok: false, kind: "refused", held: runs(),
+			why: `${lines} like pending's own text but no longer match what pending shows (a row answered, a session resolved or a description filled since the copy, or the text edited or wrapped); ${refresh}`,
+		};
+	}
+	if (!commands) {
+		if (!wrapper.container) return null;
+		const held = runs();
+		if (held.length === 0) return { ok: false, kind: "wrapperOnly" };
+		return { ok: false, kind: "refused", held, why: "this paste is pending's own text with your words and no answer line in it: nothing applied, and your words were not passed on; send your words alone, or with the answer lines you mean" };
+	}
 	// Every batch piece of the paste is one batch: checked together, so a number twice across lines is caught.
 	const pieces = read.flatMap((r) => (r.kind === "batch" ? r.pieces : []));
 	const checked = checkBatch(ledger, numbering, pieces);
@@ -505,8 +561,7 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 	let prose: { from: number; to: number } | null = null;
 	const endProse = () => {
 		if (prose === null) return;
-		const lines = raw.slice(prose.from - 1, prose.to).filter((_, k) => !generated.has(prose!.from - 1 + k));
-		const instruction: PasteInstruction = { kind: "instruction", from: prose.from, to: prose.to, text: lines.join("\n").trim() };
+		const instruction = run(prose.from, prose.to);
 		items.push(instruction);
 		held.push(instruction);
 		prose = null;

@@ -5,12 +5,13 @@
 // `supersede <wl-A> <wl-B>` (PLAN wl-mv5i3lulwwbbi8 D1, D2), `test-pr <wl-…> <N> [<N> …]`
 // (any length, never read as a batch; PLAN wl-mv5qdfvv82ivwg § 2.1), or a numbered batch
 // answering needs-you lines by their session number ("1 approve, 2 deny", or one per line;
-// MIGRATION.md § M7 follow-ups item 1). Read
-// from the turn's prompt in `before_agent_start` rather than from the `input` event, because
-// OMP emits `input` from the interactive TUI and rpc only (input-controller.ts, rpc-mode.ts), never
-// for `omp -p`, and the surface has to behave the same from the TUI,
-// an rpc front-end and `omp -p`. Every current answerable line is numbered first (the session's
-// Numbering, surface/src/numbering.ts), so a number or a "which one?" refusal always names the row
+// MIGRATION.md § M7 follow-ups item 1). Commands are read from the turn's prompt in
+// `before_agent_start`, so the surface behaves the same from the TUI, an rpc front-end, `omp -p` and
+// any host that emits no `input` event. (The installed OMP emits `input` for interactive and rpc
+// prompts only, never for `omp -p`, and honours `handled`: modes/controllers/input-controller.ts,
+// modes/rpc/rpc-mode.ts. The `input` row below uses that for the surface words and for a `pending`
+// block pasted back that holds nothing to apply.) Every current answerable line is numbered first
+// (the session's Numbering, surface/src/numbering.ts), so a number or a "which one?" refusal always names the row
 // Jo sees. A batch of any length is checked whole and applied all-or-nothing in one transaction,
 // one ledger row and one echo line per answer; a refused batch writes nothing and echoes one line
 // per piece. A single word or word pair is applied as before, except that a bare answer word
@@ -38,6 +39,17 @@
 // between commands reach the orchestrator as one instruction per run, named in the echo by their
 // line span, for it to record as one row afterwards: the commands are transactional, the prose is
 // handed on, not committed with them. A paste with no command line at all is prose.
+//
+// A `pending` block pasted back (PLAN wl-mv7gidggnlkem8; surface/src/pending.ts pendingWrapperLines):
+// its generated text is never a command and never Jo's words. A complete headerless commandless
+// card is treated the same way; partial field fragments remain prose. A paste holding nothing to
+// apply — current wrapperOnly, or whole-paste refusal (old layout, edited/stale card, generated
+// lines no longer matching pending, or generated text with Jo's words and no answer command) — is
+// consumed in the `input` row for interactive and rpc prompts: echoed, `handled`, no turn, no Jo
+// input row, the held words reported rather than dropped. `before_agent_start` reads the same paste
+// for a host that delivers no `input`, writing no Jo-input row; there the host's own turn may still
+// run. Structural recognition routes complete cards and pending headings to the ledger even with
+// no command; isolated metadata-looking lines remain prose.
 //
 // Jo's prose as a receipt (Codex review of PR #55, B1; MIGRATION.md item 105 fix round 1; PLAN
 // wl-mv65nllu5g181s): while an orchestrator question is open or a workload besides the standing one
@@ -80,7 +92,8 @@ import type { Ledger } from "../../ledger/src/index";
 import { AWAY_NOTICE, pendingText, surfaceWord } from "../src/batch";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
-import { apply, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, modeFlipControl, type PasteInstruction, runHeartbeat } from "../src/input";
+import { apply, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, modeFlipControl, type PasteInstruction, type PasteResult, runHeartbeat } from "../src/input";
+import { pendingShaped } from "../src/pending";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { oneLinerCore } from "../src/render";
 import { DISCARDED_KEPT, type SurfaceSession, surfaceSession, type TypedEntry } from "../src/session";
@@ -96,6 +109,16 @@ const launches = (cmd: Command): string | null => resumes(cmd) ?? (cmd.kind === 
 
 /** `line 5` or `lines 5–7`: the span of a paste's plain-words run. */
 const span = (i: PasteInstruction): string => (i.from === i.to ? `line ${i.from}` : `lines ${i.from}–${i.to}`);
+
+/** A paste's verdict when it holds nothing to apply: `pending`'s own text alone, or refused whole; else null (apply it, or pass it on). */
+type Consumed = Extract<PasteResult, { kind: string }>;
+const consumed = (r: PasteResult | null): Consumed | null => (r !== null && !r.ok && "kind" in r ? r : null);
+
+/** The echo for a consumed paste: the verdict, then each held run of Jo's words, reported back so nothing of Jo's is silently dropped. */
+function consumedLines(r: Consumed): string[] {
+	if (r.kind === "wrapperOnly") return ["this paste is only pending's own text: nothing to apply, and nothing passed on as your words"];
+	return [r.why, ...r.held.map((h) => `${span(h)} (your words, not passed on): "${h.text.replace(/\s*\n\s*/g, " ")}"`)];
+}
 
 /**
  * Apply one word command: `apply`, plus the control entry a mode flip implies (`modeFlipControl`), in the caller's
@@ -313,6 +336,25 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		const typed = event.source === "interactive" || event.source === "rpc";
 		const prev = s.lastTypedAt;
 		if (typed) s.lastTypedAt = s.now();
+		// A complete headerless card also holds nothing to apply; consume it before the host starts a turn.
+		const text = event.text.trim();
+		if (typed && (text.includes("\n") || pendingShaped(text))) {
+			let r: Consumed | null = null;
+			try {
+				const ledger = s.ledger();
+				s.numbering.assign(errorLines(ledger));
+				r = consumed(interpretPaste(ledger, s.numbering, text, runHeartbeat(env)));
+			} catch {
+				// An unreadable ledger is reported by before_agent_start, which reads the same paste again.
+			}
+			if (r !== null) {
+				// No turn starts, so nothing is queued for a model turn's context: recorded once and shown to Jo.
+				const lines = consumedLines(r);
+				pi.appendEntry("surface-input", { text, receipt: lines.join("\n") });
+				for (const l of lines) ctx.ui.notify(l, "warning");
+				return { handled: true };
+			}
+		}
 		const word = surfaceWord(event.text);
 		if (word === "pending") {
 			// While the session streams, a message without deliverAs would become a steer: the next idle poll shows it, rendered then.
@@ -351,10 +393,11 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 
 	/** A turn's prompt as Jo's input (see the header): a command applies; prose goes to `asProse`, which the caller's take decides. */
 	const turn = async (s: SurfaceSession, ctx: Ctx, text: string, asProse: (ledger: Ledger | null) => void): Promise<undefined> => {
-		// Several lines are a paste, one command per line (a numbered batch one per line included, so its refusals name their lines).
-		const paste = text.includes("\n");
-		// Prose passes through untouched, without a ledger read (unless it is Jo's receipt, see the header): only a batch-shaped prompt, a short command, or a paste with such a line can be a command.
-		if (paste ? !text.split("\n").some((l) => commandShaped(l.trim())) : !commandShaped(text)) {
+		// Several lines are a paste, one command per line (numbered batches included).
+		// Pending headings and complete headerless commandless cards are read even with no command.
+		const paste = text.includes("\n") || pendingShaped(text);
+		// Plain prose avoids a ledger read unless it could be a command or a complete generated card.
+		if (paste ? !pendingShaped(text) && !text.split("\n").some((l) => commandShaped(l.trim())) : !commandShaped(text)) {
 			asProse(null);
 			return undefined;
 		}
@@ -372,6 +415,11 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			const r = interpretPaste(ledger, s.numbering, text, heartbeatOf);
 			if (!r) {
 				asProse(ledger);
+				return undefined;
+			}
+			// Only reached for a host that sent no `input` (or one the ledger failed in): the same verdict, no Jo-input row.
+			if (!r.ok && "kind" in r) {
+				echo(s, ctx, text, consumedLines(r), "warning");
 				return undefined;
 			}
 			/** The refusal echo: one verdict per command line, the held instructions, then the one line to fix. */

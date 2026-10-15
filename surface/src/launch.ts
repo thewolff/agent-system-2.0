@@ -84,6 +84,7 @@ export const CONTROL_PREFIXES = [
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
 	"test-requested", "test-run", "push-dest", "lane-model", "superseded", "pair-taken", "test-pr",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
+	"work-name", "question-pending",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -139,6 +140,9 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * hide its own over-cap line with a forged `scratch-under-cap:`: `scratch-over-cap:` / `scratch-under-cap:` are the lane row's
  * turn-end measure, written as the lane holding the workload (a holder, `validWriter`); `scratch-disk:` / `scratch-disk-ok:` the
  * daily sweep's (SCRATCH_SWEEP_BY, on the standing workload); `scratch-removed:` / `scratch-remove-failed:` the close's (the surface).
+ * `work-name:` and `question-pending:` are the authored pending-row metadata (PLAN wl-mv7gidggnlkem8): reserved so the lane tools
+ * refuse them and `doneBecause` and the decision log skip them, with no writer here, so `controlEntries` never returns them. Their
+ * one reader and writer is surface/src/pending-details.ts, under its own source-creator / missing-only-import trust rule.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -176,6 +180,8 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"scratch-disk-ok": [SCRATCH_SWEEP_BY],
 	"scratch-removed": [SURFACE_BY],
 	"scratch-remove-failed": [SURFACE_BY],
+	"work-name": [],
+	"question-pending": [],
 };
 
 export interface ControlEntry {

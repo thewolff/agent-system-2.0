@@ -169,7 +169,7 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 	test("parked: an open question parks the lane (lane-parked: with the session), the shutdown writes no lane-died:; the answer relaunches with --resume of that session and the fake continues the recorded conversation; the stale request after the park is refused (predicate: resume consumed once)", async () => {
 		const r = makeRoot();
 		const { wl, sl } = openWorkload(r, { slice: true });
-		setScript(r, { steps: [{ tool: "lane_raise_question", args: { slice: sl, body: "push now?", options: ["yes", "no"] } }] });
+		setScript(r, { steps: [{ tool: "lane_raise_question", args: { slice: sl, body: "push now?", options: ["yes", "no"], ask: "Should the lane push the branch now?" } }] });
 		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
 		const lane1 = laneIdOf(wl, 1);
 		const exit1 = await exitOf(r, wl, lane1);
@@ -213,7 +213,7 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 	test("resume-pending: the answer lands before the park, so the runner's outcome is resume-pending and the drain its exit spawns relaunches once with cause resume", async () => {
 		const r = makeRoot();
 		const { wl, sl } = openWorkload(r, { slice: true });
-		setScript(r, { steps: [{ tool: "lane_raise_question", args: { slice: sl, body: "q?", options: ["a", "b"] } }, { sleepMs: 2500 }] });
+		setScript(r, { steps: [{ tool: "lane_raise_question", args: { slice: sl, body: "q?", options: ["a", "b"], ask: "Should the probe take path a or path b?" } }, { sleepMs: 2500 }] });
 		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
 		const lane1 = laneIdOf(wl, 1);
 		const q = await until("question", () => laneSnapshot(r, wl).questions[0]);
@@ -257,7 +257,7 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		);
 		const promptOf = (n: number) => fakeRecords(r).filter((x) => x.event === "prompt")[n]!.message!;
 
-		setScript(r, { steps: [{ tool: "lane_raise_question", args: { slice: sl, body: "go on?", options: ["yes", "no"] } }] });
+		setScript(r, { steps: [{ tool: "lane_raise_question", args: { slice: sl, body: "go on?", options: ["yes", "no"], ask: "Should the probe go on?" } }] });
 		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
 		expect((await exitOf(r, wl, laneIdOf(wl, 1))).outcome).toBe("parked");
 		// the drain lane 1's exit spawned has read the ledger and gone: the answer below is the explicit relaunch's to take
@@ -790,7 +790,7 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 	test("T1: a slice open, the turn ends after a plain entry; continue 1 parks a question → two prompts on the same omp, parked, no lane-died:", async () => {
 		const r = makeRoot();
 		const { wl, sl } = openWorkload(r, { slice: true });
-		setScript(r, { prompts: [[note], [{ tool: "lane_raise_question", args: { slice: sl, body: "which way?", options: ["a", "b"] } }]] });
+		setScript(r, { prompts: [[note], [{ tool: "lane_raise_question", args: { slice: sl, body: "which way?", options: ["a", "b"], ask: "Which way should the probe go, a or b?" } }]] });
 		const laneId = launched(r, wl);
 		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "parked" });
 		const ps = promptsOf(r);
@@ -805,7 +805,7 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		setScript(r, {
 			prompts: [
 				[{ tool: "lane_record_entry", args: { body: "next step: add the judge-kind plan slice" } }],
-				[{ tool: "lane_add_slice", args: { task: "plan", doneCondition: "the plan file", inputs: "the brief", kind: "judge" } }, { tool: "lane_raise_question", args: { slice: "$slice", body: "go?", options: ["go", "hold"] } }],
+				[{ tool: "lane_add_slice", args: { task: "plan", doneCondition: "the plan file", inputs: "the brief", kind: "judge" } }, { tool: "lane_raise_question", args: { slice: "$slice", body: "go?", options: ["go", "hold"], ask: "Should the probe go ahead or hold?" } }],
 			],
 		});
 		const laneId = launched(r, wl);
@@ -921,7 +921,7 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 	test("T5 (controls): a parked question, a done-because, and a release with nothing open each end after one prompt as today, no lane-died:", async () => {
 		const question = makeRoot();
 		const q = openWorkload(question, { slice: true });
-		setScript(question, { steps: [{ tool: "lane_raise_question", args: { slice: q.sl, body: "which way?", options: ["a", "b"] } }] });
+		setScript(question, { steps: [{ tool: "lane_raise_question", args: { slice: q.sl, body: "which way?", options: ["a", "b"], ask: "Which way should the probe go, a or b?" } }] });
 		expect(await exitOf(question, q.wl, launched(question, q.wl))).toMatchObject({ outcome: "parked" });
 		expect(promptsOf(question)).toHaveLength(1);
 
@@ -984,7 +984,7 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		test(`T6h: lane_handoff with a slice open${asked ? " and a question the lane raised earlier" : ""} → released, no lane-parked:, no lane-died:`, async () => {
 			const r = makeRoot();
 			const { wl, sl } = openWorkload(r, { slice: true });
-			const ask: FakeStep[] = asked ? [{ tool: "lane_raise_question", args: { slice: sl, body: "which way?", options: ["a", "b"] } }] : [];
+			const ask: FakeStep[] = asked ? [{ tool: "lane_raise_question", args: { slice: sl, body: "which way?", options: ["a", "b"], ask: "Which way should the probe go, a or b?" } }] : [];
 			setScript(r, { steps: [...ask, { tool: "lane_handoff", args: {} }] });
 			const laneId = launched(r, wl);
 			expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "released" });
@@ -1010,7 +1010,7 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		const { wl, sl } = openWorkload(r, { slice: true });
 		setScript(r, {
 			prompts: [
-				[spawnStep("dt-t8", sl!), { tool: "lane_raise_question", args: { slice: sl, body: "which way?", options: ["a", "b"] } }],
+				[spawnStep("dt-t8", sl!), { tool: "lane_raise_question", args: { slice: sl, body: "which way?", options: ["a", "b"], ask: "Which way should the probe go, a or b?" } }],
 				settleSteps("dt-t8", sl!),
 			],
 		});
@@ -1093,7 +1093,7 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		const r = makeRoot();
 		const { wl, sl } = openWorkload(r, { slice: true });
 		// the stop poll (5 s) sees the settle inside the woken turn's 7 s sleep; a decision at the get_state would be open-work
-		const woken: FakeStep[] = [...settleSteps("dt-n2", sl!), { sleepMs: 7000 }, { tool: "lane_raise_question", args: { slice: sl, body: "which way?", options: ["a", "b"] } }];
+		const woken: FakeStep[] = [...settleSteps("dt-n2", sl!), { sleepMs: 7000 }, { tool: "lane_raise_question", args: { slice: sl, body: "which way?", options: ["a", "b"], ask: "Which way should the probe go, a or b?" } }];
 		setScript(r, { prompts: [[spawnStep("dt-n2", sl!), { wake: { ms: 3000, steps: woken } }]], steps: [note] });
 		const laneId = launched(r, wl);
 		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "parked" });

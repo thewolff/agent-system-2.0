@@ -292,7 +292,8 @@ function answerSession(workloads: string[] = [REAL_WL]) {
 	const cited = () => read((l) => l.entries(STANDING_WORKLOAD_ID, "assumption").map((e) => e.body).filter((b) => b.startsWith("question-published:")));
 	/** The orchestrator raises its ask through the tool; the returned id. */
 	const raise = async (about: string | null = REAL_WL): Promise<string> => {
-		const r = await f.tool("orchestrator_raise_question").execute("1", { body: "What should the one README line say?", options: ["draft", "mine"], ...(about ? { about } : {}) }, undefined, undefined, ctx);
+		const authored = about ? { about } : { name: "README line wording" };
+		const r = await f.tool("orchestrator_raise_question").execute("1", { body: "What should the one README line say?", options: ["draft", "mine"], ask: "Should the README line use my drafted wording or yours?", ...authored }, undefined, undefined, ctx);
 		const m = /^Raised question (q-\S+)/.exec(r.content[0]!.text);
 		if (!m) throw new Error(`not raised: ${r.content[0]!.text}`);
 		return m[1]!;

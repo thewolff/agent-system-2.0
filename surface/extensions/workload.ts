@@ -6,7 +6,8 @@
 //
 // Lane launcher (DESIGN-lane-launcher.md): open writes the `done:` line (decision 16) and, when the
 // trigger fires, `plan: first <trigger>` (decision 15), and Jo's `lane-model:` when `model` is given
-// (MIGRATION.md item 85), all in the transaction that opens the workload, then runs the launch trigger
+// (MIGRATION.md item 85), all in the transaction that opens the workload, with the workload's authored
+// work `name` (surface/src/pending-details.ts), then runs the launch trigger
 // (surface/extensions/launch.ts) and carries its one line; close (`closeWorkloadWithEntry`, shared
 // by the close tool and the wake tick's auto-close of a workload awaiting close) refuses a workload
 // held under a live lease or without the holder's `done-because:` receipt, commits the rendered
@@ -23,6 +24,7 @@ import { ceilingBody, sizeFor } from "../src/ceiling";
 import { controlEntries, doneBecause, doneBody, doneLine, holdersOf, laneModelBody, modelProblem, planFirstBody, supersededBy } from "../src/launch";
 import { stakesSource } from "../src/input";
 import { answerOrchestratorQuestion, inputSpent, joInput, type OrchestratorAnswer, questionSubject, readingBody } from "../src/orchestrator-question";
+import { nameProblem, recordWorkName } from "../src/pending-details";
 import { oneLiner } from "../src/render";
 import { surfaceSession } from "../src/session";
 import { inferMode, inferStakes, type JudgedSize, judgedLarge, planFirstTrigger, saidNoPlan, saidPlanIt } from "../src/stakes";
@@ -195,9 +197,11 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			"Production stakes are always plan-first; Jo's 'plan it' (or `plan: \"first\"`) sets it and wins over no plan; at throwaway stakes only a brief judged a large change is plan-first. " +
 			"An autonomous workload's lane is launched here; a user-driven one gets its by-hand command. " +
 			"`model` (Jo's word only) names the model the workload's lanes run on, kept across relaunches: an exact `provider/model` (e.g. `openai-codex/gpt-6-sol`) on a provider with a known lab, no `:level` suffix; a bad value opens nothing. " +
+			"`name` is required: the plain name Jo's pending list shows for this work, fixed once opened. " +
 			"Returns the id, the one-liner, the launch line, and the repository's decision-log entries newer than the last 2.0 workload on it.",
 		parameters: z.object({
 			brief: z.string().describe("What Jo said, as the workload brief."),
+			name: z.string().describe("A plain name for the work, as Jo would say it (1 to 80 characters, one line, not a bare id), e.g. \"Header offset token\". Fixed once opened."),
 			done: z.string().optional().describe("One sentence: what is true when this workload is over. Required; ask Jo when you cannot infer it."),
 			repo: z.string().optional().describe("Absolute path of the target repository. Default: the session's cwd."),
 			branch: z.string().optional().describe("Target branch, when known."),
@@ -217,6 +221,9 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			if (!done) {
 				return text("A workload states its outcome: pass `done` — one sentence, what is true when this workload is over. When Jo's words do not say, ask Jo first (a plain reply) and open once they answer. Nothing was opened.");
 			}
+			const name = typeof params.name === "string" ? params.name.trim() : "";
+			const named = nameProblem(name);
+			if (named !== null) return text(`Refused: ${named} Pass \`name\`, the plain name Jo's pending list shows for this work. Nothing was opened.`);
 			const model = typeof params.model === "string" ? params.model.trim() : null;
 			const problem = model === null ? null : modelProblem(model);
 			if (problem !== null) return text(`Refused: ${problem}. Nothing was opened.`);
@@ -238,6 +245,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			const id = ledger.write(() => {
 				const wl = ledger.openWorkload({ by: SURFACE_BY, brief, stakes: finalStakes, mode: modeOverride ?? mode.value });
 				recordRepo(ledger, wl, repo);
+				recordWorkName(ledger, { workloadId: wl, by: SURFACE_BY, name });
 				ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody(done) });
 				if (plan.trigger !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody(plan.trigger) });
 				if (sized?.entry) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: sized.entry });
@@ -251,6 +259,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			const launch = await triggerLaunch(pi, ledger, env, id, "open");
 			const lines = [
 				`Opened ${id} on ${repo}.`,
+				`name: ${name}`,
 				`done: ${done}`,
 				oneLiner(ledger, row),
 				`stakes ${stakesOverride ? `overridden to ${stakesOverride}` : `inferred ${stakes.value}: ${stakes.reason}`}; mode ${modeOverride ? `overridden to ${modeOverride}` : `inferred ${mode.value}: ${mode.reason}`}.`,
@@ -292,10 +301,13 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 		name: SCHEDULE_TOOL,
 		loadMode: "essential",
 		label: "Schedule A Row",
-		description: "Schedule something for a date: a workload of its own whose brief starts `due:<date>`; it is listed under needs-you at every wake once past due, until closed with a receipt.",
+		description:
+			"Schedule something for a date: a workload of its own whose brief starts `due:<date>`; it is listed under needs-you at every wake once past due, until closed with a receipt. " +
+			"`name` is required: the plain name Jo's pending list shows for the scheduled work.",
 		parameters: z.object({
 			due: z.string().describe("ISO date or datetime (e.g. 2026-11-01)."),
 			text: z.string().describe("What to do when due, including the method pointer."),
+			name: z.string().describe("A plain name for the scheduled work (1 to 80 characters, one line, not a bare id), e.g. \"Re-measure the routing threshold\". Fixed once scheduled."),
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -303,9 +315,18 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			if (!s.active) return inactive;
 			const due = String(params.due ?? "").trim();
 			const what = String(params.text ?? "").trim();
+			const name = typeof params.name === "string" ? params.name.trim() : "";
 			if (Number.isNaN(Date.parse(due)) || !what) return text("A scheduled row needs a parseable due date and a text; nothing was opened.");
-			const id = s.ledger().openWorkload({ by: SURFACE_BY, brief: `${DUE_PREFIX}${due} ${what}`, stakes: "throwaway", mode: "autonomous" });
-			return text(`Scheduled ${id}, due ${due}: ${what}`, { id, due });
+			const named = nameProblem(name);
+			if (named !== null) return text(`Refused: ${named} Pass \`name\`, the plain name Jo's pending list shows for the scheduled work. Nothing was opened.`);
+			const ledger = s.ledger();
+			// The row and its name in one transaction: a scheduled row never exists unnamed.
+			const id = ledger.write(() => {
+				const wl = ledger.openWorkload({ by: SURFACE_BY, brief: `${DUE_PREFIX}${due} ${what}`, stakes: "throwaway", mode: "autonomous" });
+				recordWorkName(ledger, { workloadId: wl, by: SURFACE_BY, name });
+				return wl;
+			});
+			return text(`Scheduled ${id} (${name}), due ${due}: ${what}`, { id, due, name });
 		},
 	});
 

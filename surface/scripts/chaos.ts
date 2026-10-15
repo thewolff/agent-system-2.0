@@ -66,6 +66,7 @@ import {
 } from "../src/chaos";
 import { recordRepo } from "../src/decision-log";
 import { laneDir, STARTER_EXIT, worktreePath } from "../src/launch";
+import { recordWorkName } from "../src/pending-details";
 import { type Proxy, type ProxyAttempt, startProxy } from "./chaos-proxy";
 import { type Stub, type StubProfile, type StubRequest, type StubScript, type StubTurn, startStub, writeStubProfile } from "./chaos-stub";
 import { isRunnerCommand } from "./lane";
@@ -719,7 +720,7 @@ class Run {
 			},
 			{ tool: "lane_complete_slice", afterHands: 2, input: { slice: SL_REVIEW, artifact: "review-findings: no findings", i: "Completing the review slice" } },
 			{ tool: "lane_add_slice", input: { id: SL_HOLD, task: "chaos-hold: wait for Jo", doneCondition: "Jo answers close or keep", inputs: "none", i: "Adding the hold slice" } },
-			{ tool: "lane_raise_question", input: { slice: SL_HOLD, body: `**QUESTION**\nchaos ${this.token}: close this scratch workload, or keep it? close ends it; keep leaves it parked.`, options: ["close", "keep"], i: "Raising the hold question" } },
+			{ tool: "lane_raise_question", input: { slice: SL_HOLD, body: `**QUESTION**\nchaos ${this.token}: close this scratch workload, or keep it? close ends it; keep leaves it parked.`, options: ["close", "keep"], ask: `Should the ${this.token} scratch workload be closed, or kept parked?`, i: "Raising the hold question" } },
 		];
 		let ptr = 0;
 		let trailingWaits = 0;
@@ -874,11 +875,16 @@ class Run {
 		this.ledger = Ledger.open(this.env.AGENT_SYSTEM_LEDGER_DB!, { backupOnOpen: false });
 		this.measuredAt = Date.now();
 		this.proxy!.setPhase("measured");
-		this.ledger.openWorkload({
-			by: "chaos", id: this.wl, stakes: "normal", mode: "autonomous",
-			brief: `chaos run ${this.token}: append one line to chaos/scratch.txt and run bun test chaos/, have another lab check it, then park on a question.`,
+		// The workload and its authored work name in one write, as the open tool writes them.
+		const ledger = this.ledger;
+		ledger.write(() => {
+			ledger.openWorkload({
+				by: "chaos", id: this.wl, stakes: "normal", mode: "autonomous",
+				brief: `chaos run ${this.token}: append one line to chaos/scratch.txt and run bun test chaos/, have another lab check it, then park on a question.`,
+			});
+			recordWorkName(ledger, { workloadId: this.wl, by: "chaos", name: `Chaos scratch run ${this.runId}` });
 		});
-		recordRepo(this.ledger, this.wl, this.repo);
+		recordRepo(ledger, this.wl, this.repo);
 
 		if (this.fault === "lane-kill-mid-hand") stub.setMode({ mode: "stall", kind: "hand", ms: HAND_STALL_MS });
 		if (this.fault === "orchestrator-kill-mid-review") stub.setMode({ mode: "stall", kind: "review", ms: REVIEW_STALL_MS });

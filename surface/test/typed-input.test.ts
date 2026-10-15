@@ -47,7 +47,7 @@ function surface() {
 	const modelSaw = (): string => [...model, ...s().notices].join("\n");
 	const joRows = () => ledger.instructions(STANDING_WORKLOAD_ID).filter((i) => i.kind === "instruction" && i.author === "jo");
 	const raise = async (options: string[]): Promise<string> => {
-		const text = (await f.tool("orchestrator_raise_question").execute("1", { body: "Ship the header fix?", options, about: wl }, undefined, undefined, ctx)).content[0]!.text;
+		const text = (await f.tool("orchestrator_raise_question").execute("1", { body: "Ship the header fix?", options, about: wl, ask: "Ship the header fix?" }, undefined, undefined, ctx)).content[0]!.text;
 		const m = /^Raised question (q-\S+)/.exec(text);
 		if (!m) throw new Error(`not raised: ${text}`);
 		return m[1]!;

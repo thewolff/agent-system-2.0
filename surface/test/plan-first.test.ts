@@ -41,8 +41,8 @@ function detail(details: unknown, key: "id" | "planFirst"): string | null {
 	return v;
 }
 
-/** Open one workload through the open tool; return the tool's text and the workload's plan and ceiling control lines. */
-async function openWith(deps: Deps, params: Record<string, unknown>) {
+/** Open one workload through the open tool under its authored `name`; return the tool's text and the workload's plan and ceiling control lines. */
+async function openWith(deps: Deps, params: { name: string } & Record<string, unknown>) {
 	const f = fakePi();
 	const e = env();
 	orchestratorSurface(f.pi, e, deps);
@@ -64,36 +64,36 @@ const NORMAL_X3 = "ceiling: usd 150 wall 1080 source stakes normal x3 change-lar
 
 describe("normal stakes: plan-first unless judged change-small at 0.9 or higher (regressions, each wrote no flag before)", () => {
 	test("(a) judged change-small 0.70 writes `plan: first default`, ceiling ×1", async () => {
-		const o = await openWith(judging("change-small", 0.7), { brief: "rename a variable", stakes: "normal" });
+		const o = await openWith(judging("change-small", 0.7), { brief: "rename a variable", name: "Variable rename", stakes: "normal" });
 		expect(o.plan).toEqual(["plan: first default"]);
 		expect(o.ceiling).toEqual([NORMAL_X1]);
 		expect(o.planFirst).toBe("default");
 	});
 	test("(b) judged understand 0.63 writes `plan: first default`", async () => {
-		const o = await openWith(judging("understand", 0.63), { brief: "look at how the header offset is computed", stakes: "normal" });
+		const o = await openWith(judging("understand", 0.63), { brief: "look at how the header offset is computed", name: "Header offset computation", stakes: "normal" });
 		expect(o.plan).toEqual(["plan: first default"]);
 		expect(o.ceiling).toEqual([NORMAL_X1]);
 	});
 	test("(c) judged change-large 0.22 writes `plan: first default`, ceiling ×1 (only change-large > 0.55 sizes ×3)", async () => {
-		const o = await openWith(judging("change-large", 0.22), { brief: "move the header offset into a token", stakes: "normal" });
+		const o = await openWith(judging("change-large", 0.22), { brief: "move the header offset into a token", name: "Header offset token", stakes: "normal" });
 		expect(o.plan).toEqual(["plan: first default"]);
 		expect(o.ceiling).toEqual([NORMAL_X1]);
 	});
 	test("(d) no judge wired writes `plan: first default` and says the brief was not sized", async () => {
-		const o = await openWith({}, { brief: "move the header offset into a token", stakes: "normal" });
+		const o = await openWith({}, { brief: "move the header offset into a token", name: "Header offset token", stakes: "normal" });
 		expect(o.plan).toEqual(["plan: first default"]);
 		expect(o.ceiling).toEqual([NORMAL_X1]);
 		expect(o.text).toContain("no judge is wired");
 	});
 	test("(e) a judge that throws writes `plan: first default`", async () => {
-		const o = await openWith({ judge: async () => ({ judge: async () => { throw new Error("judge offline"); } }) }, { brief: "move the header offset into a token", stakes: "normal" });
+		const o = await openWith({ judge: async () => ({ judge: async () => { throw new Error("judge offline"); } }) }, { brief: "move the header offset into a token", name: "Header offset token", stakes: "normal" });
 		expect(o.plan).toEqual(["plan: first default"]);
 		expect(o.text).toContain("judge offline");
 	});
 	test("(e) a judge with a malformed distribution writes `plan: first default`", async () => {
 		const bad = answer("change-small", 0.95);
 		bad.answers.kind.probabilities = { "change-small": 0.95, "change-large": 0.5, locate: 0, understand: 0, judge: 0 };
-		const o = await openWith({ judge: async () => ({ judge: async () => bad }) }, { brief: "rename a variable", stakes: "normal" });
+		const o = await openWith({ judge: async () => ({ judge: async () => bad }) }, { brief: "rename a variable", name: "Variable rename", stakes: "normal" });
 		expect(o.plan).toEqual(["plan: first default"]);
 		expect(o.ceiling).toEqual([NORMAL_X1]);
 	});
@@ -101,14 +101,14 @@ describe("normal stakes: plan-first unless judged change-small at 0.9 or higher 
 
 describe("controls (hold before and after)", () => {
 	test("judged change-small 0.95 writes no flag and names the skip", async () => {
-		const o = await openWith(judging("change-small", 0.95), { brief: "rename a variable", stakes: "normal" });
+		const o = await openWith(judging("change-small", 0.95), { brief: "rename a variable", name: "Variable rename", stakes: "normal" });
 		expect(o.plan).toEqual([]);
 		expect(o.ceiling).toEqual([NORMAL_X1]);
 		expect(o.planFirst).toBeNull();
 		expect(o.text).toContain("change-small");
 	});
 	test("judged change-large 0.82 writes `plan: first large change`, ceiling ×3", async () => {
-		const o = await openWith(judging("change-large", 0.82), { brief: "build the billing subsystem", stakes: "normal" });
+		const o = await openWith(judging("change-large", 0.82), { brief: "build the billing subsystem", name: "Billing subsystem", stakes: "normal" });
 		expect(o.plan).toEqual(["plan: first large change"]);
 		expect(o.ceiling).toEqual([NORMAL_X3]);
 	});
@@ -116,29 +116,29 @@ describe("controls (hold before and after)", () => {
 
 describe('the "no plan" word', () => {
 	test('"no plan" on a brief judged change-large 0.82 writes no flag and keeps the ×3 ceiling', async () => {
-		const o = await openWith(judging("change-large", 0.82), { brief: "build the billing subsystem, no plan", stakes: "normal" });
+		const o = await openWith(judging("change-large", 0.82), { brief: "build the billing subsystem, no plan", name: "Billing subsystem", stakes: "normal" });
 		expect(o.plan).toEqual([]);
 		expect(o.ceiling).toEqual([NORMAL_X3]);
 		expect(o.text).toContain('no plan first: you said "no plan".');
 		expect(o.text).not.toContain("the orchestrator passed");
 	});
 	test('`plan: "none"` writes no flag, the judge still sizes the ceiling', async () => {
-		const o = await openWith(judging("change-large", 0.82), { brief: "build the billing subsystem", stakes: "normal", plan: "none" });
+		const o = await openWith(judging("change-large", 0.82), { brief: "build the billing subsystem", name: "Billing subsystem", stakes: "normal", plan: "none" });
 		expect(o.plan).toEqual([]);
 		expect(o.ceiling).toEqual([NORMAL_X3]);
 		expect(o.text).toContain('no plan first: the orchestrator passed plan: "none".');
 		expect(o.text).not.toContain("you said");
 	});
 	test('the quoted mention "no plan" alone is not the word: `plan: first default`', async () => {
-		const o = await openWith(judging("change-small", 0.7), { brief: 'skip the plan only when the judge says small or I say "no plan"', stakes: "normal" });
+		const o = await openWith(judging("change-small", 0.7), { brief: 'skip the plan only when the judge says small or I say "no plan"', name: "Plan skip rule", stakes: "normal" });
 		expect(o.plan).toEqual(["plan: first default"]);
 	});
 	test('"no plan" together with "plan it" fails toward a plan: `your word`', async () => {
-		const o = await openWith(judging("change-small", 0.95), { brief: "no plan needed? no, plan it", stakes: "normal" });
+		const o = await openWith(judging("change-small", 0.95), { brief: "no plan needed? no, plan it", name: "Planned change", stakes: "normal" });
 		expect(o.plan).toEqual(["plan: first your word"]);
 	});
 	test('"no plan" at production stakes does not lift it: `production`, and the result says so', async () => {
-		const o = await openWith(judging("change-small", 0.95), { brief: "fix the header, no plan", stakes: "production" });
+		const o = await openWith(judging("change-small", 0.95), { brief: "fix the header, no plan", name: "Header fix", stakes: "production" });
 		expect(o.plan).toEqual(["plan: first production"]);
 		expect(o.text).toContain('"no plan" does not lift it');
 	});
@@ -146,11 +146,11 @@ describe('the "no plan" word', () => {
 
 describe("throwaway keeps today's rule: plan-first only on a judged large change", () => {
 	test("judged change-small 0.5 writes no flag", async () => {
-		const o = await openWith(judging("change-small", 0.5), { brief: "try out a header token", stakes: "throwaway" });
+		const o = await openWith(judging("change-small", 0.5), { brief: "try out a header token", name: "Header token trial", stakes: "throwaway" });
 		expect(o.plan).toEqual([]);
 	});
 	test("judged change-large 0.82 writes `plan: first large change`", async () => {
-		const o = await openWith(judging("change-large", 0.82), { brief: "build the billing subsystem", stakes: "throwaway" });
+		const o = await openWith(judging("change-large", 0.82), { brief: "build the billing subsystem", name: "Billing subsystem", stakes: "throwaway" });
 		expect(o.plan).toEqual(["plan: first large change"]);
 	});
 });
