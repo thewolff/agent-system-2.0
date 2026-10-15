@@ -1073,6 +1073,7 @@ surface/test/lane-script.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-
 surface/test/lane-model.test.ts	test	-
 surface/test/lane-model-script.test.ts	test	-
+surface/test/lane-model-repeat.probe.test.ts	test	-
 surface/test/lane-headroom-script.test.ts	test	-
 surface/src/ctx-index.ts	module	-
 surface/test/ctx-index.test.ts	test	-
@@ -1094,6 +1095,8 @@ surface/src/test-run.ts	module	-
 surface/test/test-run.test.ts	test	-
 surface/scripts/test-runner.ts	module	-
 surface/test/test-runner.test.ts	test	-
+surface/src/test-batch.ts	module	-
+surface/test/test-batch.test.ts	test	-
 surface/scripts/test-exec.ts	module	-
 surface/src/as2test.ts	module	-
 surface/test/as2test.test.ts	test	-

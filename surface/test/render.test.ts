@@ -213,7 +213,7 @@ describe("needs-you: the test runner's failed run on an unheld workload (MIGRATI
 			const t: TestRun = {
 				runId, verdict, sha: SHA, pr: 7, reason: verdict === "error" ? "runner died" : null, headAtEnd: SHA, base: null, mergeBase: null,
 				full: verdict === "error" ? null : { pass: 5, fail: names.length, skip: 0, exit: names.length ? 1 : 0, ms: 900, error: null }, solo: [],
-				failures: names.map((name) => ({ part: "full", name, firstError: "error: nope" })), runDir: `/runs/${runId}`, preflight: "ok",
+				failures: names.map((name) => ({ part: "full", name, firstError: "error: nope" })), runDir: `/runs/${runId}`, preflight: "ok", mode: "full", basis: null, merge: null,
 			};
 			ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRunBody(t) });
 			const failed = testRunFailedOf(wl, sl, t);

@@ -272,9 +272,11 @@ bash:
 # The repos whose PRs the runner tests, by GitHub origin (owner/repo), each with its command; for
 # any other repo lane_full_test refuses and the close check does not apply. The caps are minutes of
 # wall per part (the full suite, each changed test file alone), the most a report may weigh when
-# imported, and how long a run may wait for the machine-wide lock. OMP has no registration for the
-# key and keeps it in the raw layer; the runner reads it from the checkout it runs from. Reversal:
-# delete the block, and the runner serves no repo.
+# imported, and the backstop on a run's wait for the machine-wide lock: a waiting run is dropped only
+# when superseded (a newer request on its slice, or its PR merged or closed) or past queueMaxMin,
+# when the runner re-requests it at the back of the queue (Jo, in-mv9340e04pgbnk: a 6 h backstop). OMP has
+# no registration for the key and keeps it in the raw layer; the runner reads it from the checkout it
+# runs from. Reversal: delete the block, and the runner serves no repo.
 testRunner:
   repos:
     - origin: thewolff/agent-system-2.0
@@ -282,7 +284,7 @@ testRunner:
   fullCapMin: 20
   soloCapMin: 10
   reportCapMb: 50
-  queueMaxMin: 60
+  queueMaxMin: 360
 
 # ── The pair-suggest switch (PLAN wl-mv67564rdkfvnk D2; surface/src/pair-suggest.ts pairSuggestOn) ──
 # `off`, `all`, or a list of workload ids ([wl-a, wl-b]). When it covers an autonomous workload above

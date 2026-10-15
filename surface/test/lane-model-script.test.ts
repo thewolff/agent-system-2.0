@@ -20,8 +20,9 @@ const X = "openai-codex/gpt-6-sol";
 const DONE: FakeStep[] = [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }];
 
 const roots: LaneRoot[] = [];
-// A root is removed only after settleDrains is done with it (every runner's drain, MIGRATION.md item 71, and every lane
-// a drain launched has ended); the failure is thrown only after the removal.
+// A root is removed only after settleDrains is done with it: every runner's drain (MIGRATION.md item 71) and every
+// lane a drain launched has ended, or, when that wait failed, every runner and drain of the root still alive was
+// SIGKILLed and is gone; the failure is thrown only after the removal.
 afterAll(async () => {
 	const settled = await Promise.allSettled(roots.map((r) => settleDrains(r)));
 	for (const r of roots) rmSync(r.root, { recursive: true, force: true });

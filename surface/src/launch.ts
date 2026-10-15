@@ -83,6 +83,7 @@ export const CONTROL_PREFIXES = [
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
 	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr",
+	"test-batch", "test-batch-requested", "test-batch-run", "test-batch-attribution", "test-batch-credit",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
@@ -138,6 +139,10 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * `test-pr: <N> [<N> …] <instruction id>` is the surface's alone: Jo's `test-pr <wl-…> <N> [<N> …]` (surface/src/input.ts,
  * PLAN wl-mv5qdfvv82ivwg § 2), on that workload, naming Jo's instruction written first in the same transaction; `boundPrs`
  * reads it and the test runner admits the named PRs for a run with no push (migration/items/test-pr-binds-named-prs.md).
+ * `test-batch: <N…> <instruction id>` is the surface's alone: Jo's `test-batch` word, written with the instruction it
+ * names in one transaction; the starter accepts no batch without both (surface/src/test-batch.ts `batchInstruction`).
+ * `test-batch-requested:`, `test-batch-run:`, `test-batch-attribution:` and `test-batch-credit:` are the test
+ * runner's alone (plan wl-mv615mkeaf1yio § 4): a credit is what lets a merged PR's close pass on a batch green.
  * The scratch lines (PLAN wl-mv5oikd5jtquww § 1.5, gates/src/scratch.ts SCRATCH_ENTRY) are machinery's alone, so a lane cannot
  * hide its own over-cap line with a forged `scratch-under-cap:`: `scratch-over-cap:` / `scratch-under-cap:` are the lane row's
  * turn-end measure, written as the lane holding the workload (a holder, `validWriter`); `scratch-disk:` / `scratch-disk-ok:` the
@@ -174,6 +179,11 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	superseded: [SURFACE_BY],
 	"pair-taken": [SURFACE_BY],
 	"test-pr": [SURFACE_BY],
+	"test-batch": [SURFACE_BY],
+	"test-batch-requested": [TEST_RUNNER_BY],
+	"test-batch-run": [TEST_RUNNER_BY],
+	"test-batch-attribution": [TEST_RUNNER_BY],
+	"test-batch-credit": [TEST_RUNNER_BY],
 	"scratch-over-cap": [],
 	"scratch-under-cap": [],
 	"scratch-disk": [SCRATCH_SWEEP_BY],

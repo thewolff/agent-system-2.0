@@ -11,7 +11,7 @@ import { countRounds, effectiveRoundLimit, type Findings, reviewLimitBody, revie
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
-import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
+import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, requestTestBatch, TEST_PR_MAX, workloadsInView } from "../src/input";
 import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody, verdictOf } from "../src/launch";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { ensureStandingWorkload } from "../src/identity";
@@ -986,6 +986,64 @@ describe("review round limit (D9) and stop-reviews (D10)", () => {
 		expect(ledger.question(cq)!.state).toBe("answered");
 		expect(ledger.slice(ceilingSlice)!.state).toBe("done");
 		expect(bodies(ledger, wl, "review-loop-end:")).toEqual([`review-loop-end: ${sl} reason stop-reviews`]);
+	});
+});
+
+describe("test-batch: Jo's batch run of 2 to 8 PRs (plan wl-mv615mkeaf1yio § 4)", () => {
+	const usage = "test-batch <wl-…> <N> <N> …";
+	test("the workload, then PRs separated by spaces or commas in Jo's order; anything else is refused with the reason, never prose", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		expect(interpret(ledger, `test-batch ${wl} 15 12`)).toEqual({ kind: "test-batch", workloadId: wl, prs: [15, 12] });
+		expect(interpret(ledger, `test-batch ${wl}, #12, #15,#3`)).toEqual({ kind: "test-batch", workloadId: wl, prs: [12, 15, 3] });
+		expect(interpret(ledger, `TEST-BATCH ${wl} 1 2 3 4 5 6 7 8`)).toEqual({ kind: "test-batch", workloadId: wl, prs: [1, 2, 3, 4, 5, 6, 7, 8] });
+		expect(interpret(ledger, "test-batch")).toEqual({ kind: "refused", why: `test-batch names the workload first: ${usage}` });
+		expect(interpret(ledger, "test-batch 12 15")).toEqual({ kind: "refused", why: `test-batch names the workload first: ${usage}` });
+		expect(interpret(ledger, "test-batch wl-nosuch 12 15")).toEqual({ kind: "refused", why: "wl-nosuch is not an open workload" });
+		expect(interpret(ledger, `test-batch ${wl} 12`)).toEqual({ kind: "refused", why: `a batch takes 2 to 8 PRs; 1 named: ${usage}` });
+		expect(interpret(ledger, `test-batch ${wl} 12 12`)).toEqual({ kind: "refused", why: `PR #12 is named twice; a batch names each PR once: ${usage}` });
+		expect(interpret(ledger, `test-batch ${wl} 12 next`)).toEqual({ kind: "refused", why: `next is not a PR number (a positive whole number): ${usage}` });
+		expect(interpret(ledger, `test-batch ${wl} 1 2 3 4 5 6 7 8 9`)).toMatchObject({ kind: "refused" });
+		// any length is command-shaped; the other long words keep their limits
+		expect(maxWords("test-batch wl-x 1 2 3")).toBe(Number.POSITIVE_INFINITY);
+		expect(maxWords("ceiling 20 2 wl-x")).toBe(4);
+		expect(commandShaped(`test-batch ${wl} 1 2 3 4 5 6 7 8`)).toBe(true);
+		expect(allInstructions(ledger)).toHaveLength(0);
+	});
+
+	test("applied, Jo's instruction and the surface's test-batch: entry naming it commit together; the starter accepts exactly that pair", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const cmd = interpret(ledger, `test-batch ${wl} 15 12`)!;
+		if (cmd.kind !== "test-batch") throw new Error(`not a test-batch: ${JSON.stringify(cmd)}`);
+		const { instructionId, line } = requestTestBatch(ledger, cmd);
+		expect(line).toBe(`batch of PRs #15, #12 on ${wl} requested (instruction ${instructionId})`);
+		expect(ledger.instructions(wl).map((i) => [i.id, i.body, i.author, i.created_by])).toEqual([[instructionId, `test-batch ${wl} 15 12`, "jo", SURFACE_BY]]);
+		expect(controlEntries(ledger.entries(wl)).filter((c) => c.prefix === "test-batch").map((c) => c.body)).toEqual([`test-batch: 15 12 ${instructionId}`]);
+	});
+
+	test("apply refuses test-batch and writes nothing: the surface writes the request and starts the batch, so a request is never left unstarted", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const cmd = interpret(ledger, `test-batch ${wl} 15 12`)!;
+		expect(cmd.kind).toBe("test-batch");
+		const entries = ledger.entries(wl).length;
+		expect(() => apply(ledger, cmd)).toThrow("test-batch is applied by the surface, which writes the request and starts the batch (requestTestBatch + startBatch)");
+		expect(ledger.instructions(wl)).toEqual([]);
+		expect(ledger.entries(wl)).toHaveLength(entries);
+		expect(allInstructions(ledger)).toHaveLength(0);
+	});
+
+	test("never in a paste: a line naming test-batch refuses the paste; a numbered batch cannot carry it", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const numbering = numbered(ledger);
+		expect(interpretPaste(ledger, numbering, `test-batch ${wl} 12 15\nthen carry on`)).toMatchObject({
+			ok: false, refused: [{ line: 1, text: `test-batch ${wl} 12 15`, why: ["test-batch runs on its own line, not in a paste"] }],
+		});
+		expect(parseBatch(`1 test-batch`)).not.toBeNull();
+		expect(interpretBatch(ledger, numbering, `1 test-batch`)).toMatchObject({ ok: false });
+		expect(allInstructions(ledger)).toHaveLength(0);
 	});
 });
 

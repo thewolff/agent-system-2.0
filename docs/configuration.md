@@ -24,7 +24,7 @@ Edit the files in the checkout and re-run `bash install/install.sh`. The install
 | `retry.fallbackChains.judge` | `[]` | Keeps OMP from falling back to another judge |
 | `gates.fence.enabled` | `true` | `false` runs bash unwrapped; the gates write one ledger entry per lane session saying so |
 | `testRunner.repos` | `thewolff/agent-system-2.0` with `bun test` | The GitHub `owner/repo` origins the test runner serves, each with its test command. Replace it with your own repositories |
-| `testRunner.fullCapMin` / `soloCapMin` / `reportCapMb` / `queueMaxMin` | 20 / 10 / 50 / 60 | Per-run caps for the full suite, each changed file alone, report size, and lock wait |
+| `testRunner.fullCapMin` / `soloCapMin` / `reportCapMb` / `queueMaxMin` | 20 / 10 / 50 / 360 | Per-run caps for the full suite, each changed file alone, and report size; the lock wait's backstop, after which the runner re-requests the run at the back of the queue |
 | `compaction.thresholdPercent` | 25 | When the orchestrator and lanes compact their context |
 | `skills.includeSkills` | 22 skills | Must equal the manifest's `skill` rows exactly, or the install is refused. Adding a skill means adding `skills/<name>/SKILL.md` with a frontmatter `description` and a manifest row |
 | `extensions` | surface, gates, classifier | Order matters: the surface must load before the gates, and the gates before the classifier |

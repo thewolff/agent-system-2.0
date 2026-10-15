@@ -57,7 +57,7 @@ import {
 	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, laneDeaths, laneDiedShutdownBody,
 	promptResolvedBody, promptWaitBody, recordableArtifactCommands, recordLapsedLease,
 } from "../src/signals";
-import { parseHeartbeat, type ResultRecord, type RunRecord, runDirOf, runsRoot, STARTUP_LEASE_MS, testRuns } from "../src/test-run";
+import { parseHeartbeat, prGoneOf, rerequestedAs, type ResultRecord, type RunRecord, runDirOf, runsRoot, STARTUP_LEASE_MS, testRuns } from "../src/test-run";
 import {
 	ARTIFACT_TOOL, type Ctx, INSTRUCTION_POLL_MS, INSTRUCTION_POLL_MS_ENV, LANE_FULL_TEST_TOOL, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, type SurfaceAPI,
 	type ToolResult,
@@ -173,7 +173,11 @@ export function testRunAside(workloadId: string, rec: RunRecord, res: ResultReco
 	const part = (p: { pass: number; fail: number; skip: number; error: string | null }) => `${p.pass} passed, ${p.fail} failed, ${p.skip} skipped${p.error ? ` (error: ${oneLine(p.error)})` : ""}`;
 	const lines = [`Test run ${res.runId} on ${workloadId}: ${res.verdict} at ${res.sha} (PR #${res.pr}, slice ${slice}, ledger entry ${res.entryId}).`];
 	if (res.reason) lines.push(`Reason: ${oneLine(res.reason)}`);
-	lines.push(`Full suite: ${res.full ? part(res.full) : "not run"}.`);
+	if (res.mode === "doc-merge" && res.basis !== null && res.merge !== null) {
+		lines.push(`Full suite: not run: doc-merge on basis ${res.basis.runId} at ${res.basis.sha} (merged main ${res.merge.main}, main tip ${res.merge.tip}; docs the merge touched: ${res.merge.docs.join(", ") || "none"}).`);
+	} else {
+		lines.push(`Full suite: ${res.full ? part(res.full) : "not run"}.`);
+	}
 	lines.push(`Changed test files alone: ${res.solo.length === 0 ? "none" : res.solo.map((s) => `${s.file} ${part(s)}`).join("; ")}.`);
 	const where = res.runDir ? join(res.runDir, "result.json") : `ledger entry ${res.entryId} (this run wrote no run dir)`;
 	if (res.failures.length > 0) {
@@ -183,8 +187,17 @@ export function testRunAside(workloadId: string, rec: RunRecord, res: ResultReco
 	}
 	lines.push(`Result: ${where}`);
 	if (res.verdict === "green") lines.push(greenLine(slice, res.runId, sliceRow));
-	else if (res.verdict === "superseded") lines.push(`For the record only: a later request on ${slice} owns it, and this run settled nothing.`);
-	else lines.push(`${slice} stays open: fix, push, then call ${LANE_FULL_TEST_TOOL} with pr ${res.pr} and slice ${slice} again.`);
+	else if (res.verdict === "superseded") {
+		const gone = prGoneOf(res.reason);
+		lines.push(gone
+			? `For the record only: PR #${gone.pr} was ${gone.state === "MERGED" ? "merged" : "closed"} while this run waited in the queue, so it ran nothing, settled nothing and is not re-requested.`
+			: `For the record only: a later request on ${slice} owns it, and this run settled nothing.`);
+	} else {
+		const again = rerequestedAs(res.reason);
+		lines.push(again
+			? `${slice} stays open: the runner re-requested PR #${res.pr} on it as ${again}, at the back of the queue, and that run's result comes as its own aside. Do not call ${LANE_FULL_TEST_TOOL} for it.`
+			: `${slice} stays open: fix, push, then call ${LANE_FULL_TEST_TOOL} with pr ${res.pr} and slice ${slice} again.`);
+	}
 	return lines.join("\n");
 }
 

@@ -76,14 +76,17 @@
 // the next idle poll while the session streams; `brb` holds the routine needs-you pushes); neither
 // goes on the typed FIFO. `back` reaches the model, and the wake row reads it in its
 // `before_agent_start`; its turn takes its own typed entry and writes no row.
+//
+// `test-batch <wl-…> <N> …` (plan wl-mv615mkeaf1yio § 4): the rows `requestTestBatch` writes, then the starter's exec and its line.
 import type { Ledger } from "../../ledger/src/index";
 import { AWAY_NOTICE, pendingText, surfaceWord } from "../src/batch";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
-import { apply, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, modeFlipControl, type PasteInstruction, runHeartbeat } from "../src/input";
+import { apply, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, modeFlipControl, type PasteInstruction, requestTestBatch, runHeartbeat } from "../src/input";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { oneLinerCore } from "../src/render";
 import { DISCARDED_KEPT, type SurfaceSession, surfaceSession, type TypedEntry } from "../src/session";
+import { startBatch } from "../src/test-batch";
 import { type Ctx, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY } from "../src/types";
 import { triggerLaunch } from "./launch";
 
@@ -453,6 +456,11 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			}
 			if (cmd.kind === "refused") {
 				echo(s, ctx, text, [cmd.why], "warning");
+				return undefined;
+			}
+			if (cmd.kind === "test-batch") {
+				const asked = requestTestBatch(ledger, cmd);
+				echo(s, ctx, text, [`${asked.line}; ${await startBatch(pi.exec?.bind(pi), cmd.workloadId, asked.instructionId)}`], "info");
 				return undefined;
 			}
 			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd, heartbeatOf)) }];

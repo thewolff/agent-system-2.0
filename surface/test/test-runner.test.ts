@@ -8,6 +8,7 @@
 // user. A fake sudo cannot deny the current user its own files, so it forwards `probe` to the real
 // wrapper and reports every answer closed (the real denial is proved at S8, plan § 8). Boundaries
 // are paused through the runner's AGENT_SYSTEM_TEST_HOOKS files and the wrapper's rendered `hooks`.
+// The doc-only main-merge facts (plan wl-mv615mkeaf1yio § 3) are read in process from real merges.
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
@@ -17,11 +18,16 @@ import { Ledger, LiveLedgerUnderTestError, TEST_RUNNER_BY } from "../../ledger/s
 import { renderExecWrapper } from "../src/as2test";
 import { recordRepo } from "../src/decision-log";
 import {
-	childLayout, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, runnerDiedRun, type TestRun, testRequestedBody, testRunBody, testRuns, workDirOf,
-	WRAPPER_EXIT, type WrapperCall, wrapperArgv,
+	childLayout, docMergeDecision, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, type PrView, runnerDiedRun, type RunRecord, type TestRun, testRequestedBody, testRunBody,
+	testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
-import { importPart, importReport, lockRow, openLockDb, publishIfOwner, START_EXIT } from "../scripts/test-runner";
+import { admit, buildBatch, type Claimant, gatherMergeFacts, importPart, importReport, lockRow, openLockDb, publishIfOwner, publishSub, queueRows, requestBatch, START_EXIT, tryAcquire, verifyBundleSteps, withdraw } from "../scripts/test-runner";
+import { requestTestBatch } from "../src/input";
+import {
+	batchAdmissible, batchAttribution, batchAttributions, batchCredits, batchRequests, batchRunnerDiedRun, batchRuns, batchSettleArtifact, batchSlice, newestBatchAttribution, readRunsSnapshot,
+	type TestBatchAttribution, testBatchAttributionBody, testBatchRequestedBody, type TestBatchRun, testBatchRunBody,
+} from "../src/test-batch";
 import { alive, tmp, until } from "./helpers";
 
 setDefaultTimeout(180_000);
@@ -89,7 +95,7 @@ const EXITS = `import { test } from "bun:test";
 test("exits before the report", () => { process.exit(0); });
 `;
 
-const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7 } as const;
+const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7, green2: 8 } as const;
 type PrName = keyof typeof PR;
 const PR_FILES: Record<PrName, Record<string, string>> = {
 	green: { "a.test.ts": PASS("a") },
@@ -100,6 +106,8 @@ const PR_FILES: Record<PrName, Record<string, string>> = {
 	exit: { "exits.test.ts": EXITS },
 	// git lists ` a.test.ts` first (a space sorts before `a`); trimmed, it would name its sibling.
 	space: { " a.test.ts": PASS("space a"), "a.test.ts": PASS("a") },
+	// A second green PR for the batch run (plan wl-mv615mkeaf1yio § 4): another file than PR #1's, so the two merge cleanly.
+	green2: { "b.test.ts": PASS("b") },
 };
 
 interface Fixture {
@@ -380,6 +388,32 @@ function staleRow(w: World): void {
 		db.close();
 	}
 }
+/** The world's runs.db for the queue tests: reads and writes wait out a runner's short transaction (2 s busy wait). */
+const queueDbOf = (w: World): Database => openLockDb(w.runs, 2_000);
+/** What the starter does, without its gh call or its spawn: the admission commits, then the `test-requested:`. Returns the run id. */
+function admitted(w: World, wl: string, slice: string, pr: number, sha: string, runId = newRunId()): string {
+	const db = queueDbOf(w);
+	try {
+		admit(db, runId);
+	} finally {
+		db.close();
+	}
+	w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: slice, kind: "assumption", body: testRequestedBody({ runId, pr, sha, slice, by: LANE }) });
+	return runId;
+}
+/** The run ids admitted to the world's queue, in request order. */
+function queued(w: World): string[] {
+	const db = queueDbOf(w);
+	try {
+		return queueRows(db).map((r) => r.runId);
+	} finally {
+		db.close();
+	}
+}
+/** Another run holds the lock with a heartbeat ten minutes ahead: fresh for the whole test, with no timer to keep it so. */
+function holdLock(db: Database): void {
+	db.query("INSERT INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, 'tr-otherholder', 1, 1, '/nowhere', ?)").run(Date.now() + 600_000);
+}
 
 // ---- the starter -------------------------------------------------------------------------------------
 
@@ -556,7 +590,7 @@ describe("start: the reservation (§ 2.2 step 3)", () => {
 		}
 	});
 
-	test("a run that waits past queueMaxMin ends error queued too long, without touching the holder's lock or current", async () => {
+	test("a run that waits past queueMaxMin ends at the backstop, without touching the holder's lock or current; with no PR to read, its re-request is refused", async () => {
 		const w = world({ queueMaxMin: 0.01 });
 		const { wl, slice } = workload(w);
 		const db = lockDbOf(w);
@@ -565,7 +599,9 @@ describe("start: the reservation (§ 2.2 step 3)", () => {
 			const runId = request(w, wl, slice, PR.green, fx.head.green);
 			await spawnRun(w, runId).exited;
 			const run = await resultOf(w, wl, runId);
-			expect(run).toMatchObject({ verdict: "error", reason: "queued too long", full: null });
+			expect(run).toMatchObject({ verdict: "error", full: null });
+			expect(run.reason).toStartWith(`queued past the 0.01 min backstop; re-request refused: gh pr view ${PR.green} -R ${OWNER_REPO} failed: no pull requests found`);
+			expect(testRuns(w.ledger.entries(wl))).toHaveLength(1);
 			expect(lockRow(db)!.runId).toBe("tr-otherholder");
 			expect(existsSync(join(w.as2, "stage", "current"))).toBe(false);
 			expect(heldMessages(w, wl).map((m) => m.body)).toEqual([`test-run-failed: ${wl} ${slice} error at ${fx.head.green}: 0 failing`]);
@@ -1251,6 +1287,373 @@ describe("the runs lock and current", () => {
 	});
 });
 
+// ---- the lock in request order (plan wl-mv615mkeaf1yio § 2) ------------------------------------------------
+
+describe("the lock queue in process: admission order decides, never run ids or who polls first", () => {
+	/** A runs root and a stage dir of their own; nothing is spawned. */
+	function queueDb(): { db: Database; stage: string; runs: string } {
+		const root = realpathSync(tmp("trun-queue"));
+		roots.push(root);
+		const stage = join(root, "stage");
+		mkdirSync(stage);
+		const runs = join(root, "runs");
+		return { db: openLockDb(runs, 0), stage, runs };
+	}
+	const as = (runId: string): Claimant => ({ runId, pid: 1, runDir: `/nowhere/${runId}` });
+	const ids = (db: Database) => queueRows(db).map((r) => r.runId);
+	const T0 = Date.now();
+
+	test("runs.db carries the queue, created idempotently; admissions get rising seqs in commit order; withdraw removes only its own row", () => {
+		const { db, runs } = queueDb();
+		const late = makeRunId(T0, "zzzz");
+		const early = makeRunId(T0 - 60_000, "0000");
+		const first = admit(db, late, T0);
+		const second = admit(db, early, T0 + 1);
+		expect(second).toBeGreaterThan(first);
+		expect(() => admit(db, late, T0 + 2)).toThrow();
+		db.close();
+		const again = openLockDb(runs, 0);
+		try {
+			expect(queueRows(again)).toEqual([{ seq: first, runId: late, admittedAt: T0 }, { seq: second, runId: early, admittedAt: T0 + 1 }]);
+			withdraw(again, late);
+			withdraw(again, "tr-neveradmitted");
+			expect(ids(again)).toEqual([early]);
+		} finally {
+			again.close();
+		}
+	});
+
+	test("delayed start: A admitted first whose runner has not beaten yet keeps B off a free lock; A takes it and leaves the queue in the same transaction; then B", () => {
+		const { db, stage } = queueDb();
+		const A = makeRunId(T0, "aaaa");
+		const B = makeRunId(T0, "bbbb");
+		admit(db, A, T0);
+		admit(db, B, T0 + 1_000);
+		const beats = new Map<string, number>([[B, T0 + 1_500]]);
+		const hb = (id: string) => beats.get(id) ?? null;
+		expect(tryAcquire(db, stage, as(B), hb, T0 + 2_000)).toBeNull();
+		expect(lockRow(db)).toBeNull();
+		expect(existsSync(join(stage, "current"))).toBe(false);
+		expect(ids(db)).toEqual([A, B]);
+		beats.set(A, T0 + 3_000);
+		expect(tryAcquire(db, stage, as(A), hb, T0 + 3_000)).toEqual({ displaced: null });
+		expect(lockRow(db)!.runId).toBe(A);
+		expect(readFileSync(join(stage, "current"), "utf8")).toBe(`${A}\n`);
+		expect(ids(db)).toEqual([B]);
+		expect(tryAcquire(db, stage, as(B), hb, T0 + 4_000)).toBeNull();
+		db.query("DELETE FROM lock").run();
+		expect(tryAcquire(db, stage, as(B), hb, T0 + 5_000)).toEqual({ displaced: null });
+		expect(lockRow(db)!.runId).toBe(B);
+		expect(ids(db)).toEqual([]);
+	});
+
+	test("ids sorting the other way: three waiters behind a holder are granted in admission order, whoever polls first", () => {
+		const { db, stage } = queueDb();
+		const X = makeRunId(T0, "zzzz");
+		const Y = makeRunId(T0 - 120_000, "0000");
+		const Z = makeRunId(T0 - 60_000, "mmmm");
+		expect([Y, Z, X]).toEqual([X, Y, Z].sort());
+		for (const [i, id] of [X, Y, Z].entries()) admit(db, id, T0 + i);
+		holdLock(db);
+		const hb = () => T0 + 10_000;
+		const order: string[] = [];
+		for (let round = 0; round < 3; round++) {
+			db.query("DELETE FROM lock").run();
+			for (const id of [Z, Y, X]) {
+				if (order.includes(id)) continue;
+				const took = tryAcquire(db, stage, as(id), hb, T0 + 10_000 + round);
+				if (took) order.push(id);
+			}
+		}
+		expect(order).toEqual([X, Y, Z]);
+		expect(ids(db)).toEqual([]);
+	});
+
+	test("dead admissions ahead (a stale heartbeat, or none past the 120 s lease) are skipped and deleted, also by a waiter that cannot take the lock yet", () => {
+		const { db, stage } = queueDb();
+		const silent = makeRunId(T0, "dea1");
+		const stale = makeRunId(T0, "dea2");
+		const W = makeRunId(T0, "wait");
+		admit(db, silent, T0 - 200_000);
+		admit(db, stale, T0 - 200_000);
+		admit(db, W, T0 - 1_000);
+		const beats: Record<string, number> = { [stale]: T0 - 61_000 };
+		holdLock(db);
+		expect(tryAcquire(db, stage, as(W), (id) => beats[id] ?? null, T0)).toBeNull();
+		expect(ids(db)).toEqual([W]);
+		db.query("DELETE FROM lock").run();
+		expect(tryAcquire(db, stage, as(W), (id) => beats[id] ?? null, T0 + 1)).toEqual({ displaced: null });
+		expect(ids(db)).toEqual([]);
+	});
+
+	test("a stale holder is taken over by the queue head only; the takeover removes the head's admission with the row it installs", () => {
+		const { db, stage } = queueDb();
+		db.query("INSERT INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, 'tr-staleholder', 1, 1, '/nowhere', ?)").run(T0 - 120_000);
+		const A = makeRunId(T0, "aaaa");
+		const B = makeRunId(T0, "bbbb");
+		admit(db, A, T0 - 2_000);
+		admit(db, B, T0 - 1_000);
+		const hb = () => T0;
+		expect(tryAcquire(db, stage, as(B), hb, T0)).toBeNull();
+		expect(lockRow(db)!.runId).toBe("tr-staleholder");
+		expect(tryAcquire(db, stage, as(A), hb, T0)).toEqual({ displaced: "tr-staleholder" });
+		expect(lockRow(db)!.runId).toBe(A);
+		expect(ids(db)).toEqual([B]);
+		expect(readFileSync(join(stage, "current"), "utf8")).toBe(`${A}\n`);
+	});
+
+	test("a waiter with no admission (its starter predates the queue, or its row was deleted as dead) is admitted at its first poll, at the tail", () => {
+		const { db, stage } = queueDb();
+		const A = makeRunId(T0, "aaaa");
+		const N = makeRunId(T0 - 60_000, "0000");
+		admit(db, A, T0);
+		expect(tryAcquire(db, stage, as(N), () => null, T0 + 1_000)).toBeNull();
+		expect(queueRows(db).map((r) => [r.runId, r.admittedAt])).toEqual([[A, T0], [N, T0 + 1_000]]);
+		// A's runner never beats: past its 120 s lease it is dead, and N leads.
+		expect(tryAcquire(db, stage, as(N), () => null, T0 + 121_000)).toEqual({ displaced: null });
+		expect(ids(db)).toEqual([]);
+	});
+});
+
+describe("the lock queue end to end (plan wl-mv615mkeaf1yio § 2)", () => {
+	test("start admits the run before it writes test-requested:; a refused start removes the admission it made", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		setPr(w, PR.green, { sha: fx.head.green, headRefName: `wl/${wl}` });
+		const db = queueDbOf(w);
+		holdLock(db);
+		try {
+			const r = start(w, wl, PR.green, ["--slice", slice]);
+			expect(r.code).toBe(START_EXIT.ok);
+			const runId = /^test-run (tr-[a-z0-9]+) /.exec(r.out)![1]!;
+			const rows = queueRows(db);
+			expect(rows.map((x) => x.runId)).toEqual([runId]);
+			const requestedAt = Date.parse(testRuns(w.ledger.entries(wl)).find((x) => x.request.runId === runId)!.request.createdAt);
+			expect(rows[0]!.admittedAt).toBeLessThanOrEqual(requestedAt);
+			// The second start is refused (the first run is live): it was admitted, seq 2, and took its admission back.
+			const refused = start(w, wl, PR.green, ["--slice", slice]);
+			expect(refused.code).toBe(START_EXIT.refused);
+			expect(queueRows(db).map((x) => x.runId)).toEqual([runId]);
+			expect(db.query<{ seq: number }, []>("SELECT seq FROM sqlite_sequence WHERE name = 'queue'").get()!.seq).toBe(2);
+			db.query("DELETE FROM lock").run();
+			expect((await resultOf(w, wl, runId)).verdict).toBe("green");
+			await until("the run released the lock", () => lockRow(db) === null);
+			expect(queued(w)).toEqual([]);
+		} finally {
+			db.close();
+		}
+	});
+
+	test("(a) delayed start: A is admitted first but paused before acquire; B, admitted later, never takes the free lock while A is live; A goes first, then B", async () => {
+		const w = world();
+		const a = workload(w);
+		const b = workload(w);
+		// Both ask for a sha the PR does not have: once a run holds the lock it ends at once as stale.
+		const A = admitted(w, a.wl, a.slice, PR.green, fx.main);
+		arm(w, A, "before-acquire");
+		const ca = spawnRun(w, A);
+		await reached(w, A, "before-acquire");
+		const B = admitted(w, b.wl, b.slice, PR.green, fx.main);
+		const cb = spawnRun(w, B);
+		await until("B polled three times behind A", () => marks(w, B, "queued").length >= 3);
+		expect(marks(w, B, "acquired")).toEqual([]);
+		const db = queueDbOf(w);
+		try {
+			expect(lockRow(db)).toBeNull();
+		} finally {
+			db.close();
+		}
+		expect(queued(w)).toEqual([A, B]);
+		go(w, A, "before-acquire");
+		await Promise.all([ca.exited, cb.exited]);
+		expect((await resultOf(w, a.wl, A)).verdict).toBe("stale");
+		expect((await resultOf(w, b.wl, B)).verdict).toBe("stale");
+		expect(marks(w, B, "acquired")[0]!.at as number).toBeGreaterThanOrEqual(marks(w, A, "result")[0]!.at as number);
+		expect(queued(w)).toEqual([]);
+	});
+
+	test("(b) ids sorting the other way: the earlier admission takes the freed lock although the later one, with the smaller id, polls every 200 ms", async () => {
+		const w = world();
+		const a = workload(w);
+		const b = workload(w);
+		const db = queueDbOf(w);
+		holdLock(db);
+		try {
+			const first = admitted(w, a.wl, a.slice, PR.green, fx.main, makeRunId(Date.now(), "zzzz"));
+			const second = admitted(w, b.wl, b.slice, PR.green, fx.main, makeRunId(Date.now() - 60_000, "0000"));
+			expect(second < first).toBe(true);
+			const cf = spawnRun(w, first, { AGENT_SYSTEM_TEST_RUNNER_POLL_MS: "10000" });
+			const cs = spawnRun(w, second);
+			await until("second queued", () => marks(w, second, "queued").length >= 1);
+			// Free the lock just after first's poll: first sleeps 10 s, second polls within 200 ms.
+			const n = marks(w, first, "queued").length;
+			await until("first's next poll", () => marks(w, first, "queued").length > n, 60_000);
+			db.query("DELETE FROM lock").run();
+			await Promise.all([cf.exited, cs.exited]);
+			expect((await resultOf(w, a.wl, first)).verdict).toBe("stale");
+			expect((await resultOf(w, b.wl, second)).verdict).toBe("stale");
+			expect(marks(w, second, "acquired")[0]!.at as number).toBeGreaterThanOrEqual(marks(w, first, "result")[0]!.at as number);
+			expect(queued(w)).toEqual([]);
+		} finally {
+			db.close();
+		}
+	});
+
+	test("(c) three waiters queued behind a holder are granted in admission order, the fastest pollers admitted last", async () => {
+		const w = world();
+		const ws = [workload(w), workload(w), workload(w)];
+		const db = queueDbOf(w);
+		holdLock(db);
+		try {
+			const ids = ws.map((x) => admitted(w, x.wl, x.slice, PR.green, fx.main));
+			const polls = ["10000", "1000", "200"];
+			const children = ids.map((id, i) => spawnRun(w, id, { AGENT_SYSTEM_TEST_RUNNER_POLL_MS: polls[i]! }));
+			await until("all three queued", () => ids.every((id) => marks(w, id, "queued").length >= 1));
+			const n = marks(w, ids[0]!, "queued").length;
+			await until("the first admission's next poll", () => marks(w, ids[0]!, "queued").length > n, 60_000);
+			db.query("DELETE FROM lock").run();
+			await Promise.all(children.map((c) => c.exited));
+			const at = ids.map((id) => marks(w, id, "acquired")[0]!.at as number);
+			expect(at[0]!).toBeLessThan(at[1]!);
+			expect(at[1]!).toBeLessThan(at[2]!);
+			expect(queued(w)).toEqual([]);
+		} finally {
+			db.close();
+		}
+	});
+
+	test("every exit leaves the queue: the backstop, an error before acquisition, no profile to run under", async () => {
+		const w = world({ queueMaxMin: 0.01 });
+		const db = queueDbOf(w);
+		holdLock(db);
+		try {
+			const q = workload(w);
+			// No PR for the fake gh to show: the backstop's re-request is refused, so nothing else joins the queue.
+			const tooLong = admitted(w, q.wl, q.slice, PR.green, fx.head.green);
+			await spawnRun(w, tooLong).exited;
+			const backstopped = await resultOf(w, q.wl, tooLong);
+			expect(backstopped.verdict).toBe("error");
+			expect(backstopped.reason).toStartWith("queued past the 0.01 min backstop; re-request refused: ");
+			expect(queued(w)).toEqual([]);
+
+			// A workload with no repo: entry fails in the body before acquire.
+			const bare = w.ledger.openWorkload({ by: SURFACE_BY, brief: "no repo", stakes: "normal", mode: "autonomous" });
+			const bareSlice = w.ledger.addSlice({ by: LANE, workloadId: bare, task: "full suite", doneCondition: "a green test-run", inputs: "the PR" });
+			const early = admitted(w, bare, bareSlice, PR.green, fx.head.green);
+			await spawnRun(w, early).exited;
+			expect(await resultOf(w, bare, early)).toMatchObject({ verdict: "error", reason: `${bare} has no repo: entry` });
+			expect(queued(w)).toEqual([]);
+
+			// No profile: the run records its error before a Runner exists.
+			const c = workload(w);
+			const noProfile = admitted(w, c.wl, c.slice, PR.green, fx.head.green);
+			await spawnRun(w, noProfile, { AGENT_SYSTEM_TEST_RUNNER_CONFIG: join(w.root, "missing.yml") }).exited;
+			expect((await resultOf(w, c.wl, noProfile)).reason).toContain("could not be read");
+			expect(queued(w)).toEqual([]);
+			expect(lockRow(db)!.runId).toBe("tr-otherholder");
+		} finally {
+			db.close();
+		}
+	});
+
+	test("a queued run whose request was superseded withdraws at its next poll: superseded, its admission removed, the holder untouched", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const db = queueDbOf(w);
+		holdLock(db);
+		const runId = admitted(w, wl, slice, PR.green, fx.head.green);
+		const child = spawnRun(w, runId);
+		try {
+			await until("queued", () => marks(w, runId, "queued").length >= 1);
+			// What a later starter writes for a runner whose heartbeat went stale: `runner died`, then its own request.
+			w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: slice, kind: "assumption", body: testRunBody(runnerDiedRun({ runId, pr: PR.green, sha: fx.head.green, slice, by: LANE })) });
+			request(w, wl, slice, PR.green, fx.head.green);
+			const rec = await until("the withdrawal", () => {
+				const r = testRuns(w.ledger.entries(wl)).find((x) => x.request.runId === runId);
+				return r && r.results.length >= 2 ? r : null;
+			}, 60_000);
+			expect(rec.results.map((r) => r.verdict)).toEqual(["error", "superseded"]);
+			expect(rec.results[1]!.reason).toContain("the request was superseded while the run was queued");
+			await child.exited;
+			expect(queued(w)).toEqual([]);
+			expect(lockRow(db)!.runId).toBe("tr-otherholder");
+			expect(marks(w, runId, "acquired")).toEqual([]);
+		} finally {
+			child.kill();
+			db.close();
+		}
+	});
+
+	// Jo's queue drop rule (in-mv9340e04pgbnk): past the backstop the runner re-requests at once, at the queue tail.
+	test("a run past the backstop is re-requested by the runner: its error names the new run, which has the same PR, slice and requester and is admitted at the tail after the result; no message", async () => {
+		const w = world({ queueMaxMin: 0.01 });
+		const { wl, slice } = workload(w);
+		// The PR as gh shows it at the backstop: open, bound, its head at main, so the re-request ends at once as stale once it runs.
+		setPr(w, PR.green, { sha: fx.main, headRefName: `wl/${wl}` });
+		const db = queueDbOf(w);
+		holdLock(db);
+		const first = admitted(w, wl, slice, PR.green, fx.head.green);
+		// result.json blocks the first run after its result and the re-request commit, before it hands the queue on.
+		const release = holdResultJson(w, first);
+		const child = spawnRun(w, first);
+		try {
+			const run = await resultOf(w, wl, first);
+			expect(run).toMatchObject({ verdict: "error", full: null });
+			const again = /^queued past the 0\.01 min backstop; re-requested as (tr-[a-z0-9]+)$/.exec(run.reason ?? "")?.[1];
+			if (!again) throw new Error(`the backstop's reason names no re-request: ${run.reason}`);
+			const next = testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === again)!;
+			expect(next.request).toMatchObject({ pr: PR.green, sha: fx.main, slice, by: LANE });
+			expect(next.results).toEqual([]);
+			// Written, not yet handed on: the first run still holds its admission and the new run has none.
+			expect(queued(w)).toEqual([first]);
+			// The new run waits at the default backstop, so it is still queued when the test looks.
+			writeFileSync(join(w.root, "config.yml"), `testRunner:\n  repos:\n    - origin: ${OWNER_REPO}\n      command: bun test\n  fullCapMin: 2\n  soloCapMin: 2\n  reportCapMb: 5\n`);
+			expect(JSON.parse(await release())).toMatchObject({ runId: first, verdict: "error", reason: run.reason });
+			await child.exited;
+			await until("the re-request queued behind the holder", () => marks(w, again, "queued").length >= 1);
+			expect(queued(w)).toEqual([again]);
+			expect(runnerLog(w, first)).toContain(`re-requested as ${again}: runner `);
+			// A re-requested run has nothing for the orchestrator to act on.
+			expect(heldMessages(w, wl)).toEqual([]);
+			expect(readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n")).toHaveLength(1);
+			db.query("DELETE FROM lock").run();
+			expect((await resultOf(w, wl, again)).verdict).toBe("stale");
+			expect(w.ledger.slice(slice)!.state).toBe("open");
+			await until("the queue empty", () => queued(w).length === 0);
+		} finally {
+			child.kill();
+			db.close();
+		}
+	});
+
+	test("a queued run whose PR reads MERGED ends superseded at its next PR check: nothing settled, no message, not re-requested", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		setPr(w, PR.green, { sha: fx.head.green, headRefName: `wl/${wl}` });
+		const db = queueDbOf(w);
+		holdLock(db);
+		const runId = admitted(w, wl, slice, PR.green, fx.head.green);
+		const child = spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_PR_CHECK_MS: "300" });
+		try {
+			await until("an OPEN read while queued", () => marks(w, runId, "pr-state").some((m) => m.state === "OPEN"));
+			setPr(w, PR.green, { sha: fx.head.green, headRefName: `wl/${wl}`, state: "MERGED" });
+			const run = await resultOf(w, wl, runId);
+			expect(run.verdict).toBe("superseded");
+			expect(run.reason).toStartWith(`PR #${PR.green} is MERGED`);
+			await child.exited;
+			expect(testRuns(w.ledger.entries(wl)).map((r) => r.request.runId)).toEqual([runId]);
+			expect(w.ledger.slice(slice)!.state).toBe("open");
+			expect(heldMessages(w, wl)).toEqual([]);
+			expect(queued(w)).toEqual([]);
+			expect(lockRow(db)!.runId).toBe("tr-otherholder");
+			expect(marks(w, runId, "acquired")).toEqual([]);
+		} finally {
+			child.kill();
+			db.close();
+		}
+	});
+});
+
 describe("exclusive sweeps (§ 2.3 step 1, the order of a run)", () => {
 	/**
 	 * A's sweep holds the sweep lock, paused at `point`; A's row goes stale; B takes over, publishes and
@@ -1329,6 +1732,356 @@ describe("exclusive sweeps (§ 2.3 step 1, the order of a run)", () => {
 	});
 });
 
+// ---- the batch run (plan wl-mv615mkeaf1yio § 4) ----------------------------------------------------------
+
+describe("the batch run end to end (plan wl-mv615mkeaf1yio § 4)", () => {
+	/**
+	 * PR `pr` on a workload of its own (head branch `wl/<id>`, as the fake gh answers), with the
+	 * runner's full green there as the runner writes it, ran at `ranAt` (the pinned head unless
+	 * given). The starter's admission reads only these rows. Returns the own workload.
+	 */
+	function ownGreen(w: World, pr: number, head: string, ranAt = head): string {
+		const own = w.ledger.openWorkload({ by: SURFACE_BY, brief: `PR #${pr}'s own work`, stakes: "normal", mode: "autonomous" });
+		setPr(w, pr, { sha: head, headRefName: `wl/${own}` });
+		const request = { runId: newRunId(), pr, sha: ranAt, slice: "sl-full-own-1", by: LANE };
+		w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: own, kind: "assumption", body: testRequestedBody(request) });
+		w.ledger.recordEntry({
+			by: TEST_RUNNER_BY, workloadId: own, kind: "assumption",
+			body: testRunBody({
+				...runnerDiedRun(request, `/runs/${request.runId}`), verdict: "green", reason: null, headAtEnd: ranAt,
+				full: { pass: 2, fail: 0, skip: 0, exit: 0, ms: 900, error: null }, preflight: "ok",
+			}),
+		});
+		return own;
+	}
+
+	/** Jo's word at the surface (her instruction and the `test-batch:` entry naming it, in one transaction), then the starter as the surface execs it. */
+	function startBatch(w: World, wl: string, prs: number[], env: Record<string, string> = {}) {
+		const { instructionId } = requestTestBatch(w.ledger, { kind: "test-batch", workloadId: wl, prs });
+		const r = Bun.spawnSync([process.execPath, RUNNER, "start-batch", wl, instructionId], { env: { ...w.env, ...env }, stdout: "pipe", stderr: "pipe" });
+		const out = r.stdout.toString().trim();
+		const m = /^test-batch (tr-[a-z0-9]+) runner (\d+) prs (\S+) slice (sl-batch-\S+) log (\S+)$/.exec(out);
+		return {
+			instructionId, code: r.exitCode, out, err: r.stderr.toString().trim(),
+			runId: m?.[1] ?? null, pid: m ? Number(m[2]) : null, prs: m?.[3] ?? null, slice: m?.[4] ?? null, log: m?.[5] ?? null,
+		};
+	}
+
+	/** The batch's own `test-batch-run:`, once written. */
+	async function batchResultOf(w: World, wl: string, runId: string, timeoutMs = 150_000): Promise<TestBatchRun & { entryId: string }> {
+		try {
+			return await until(`the test-batch-run: of ${runId}`, () => batchRuns(w.ledger.entries(wl)).find((r) => r.runId === runId), timeoutMs);
+		} catch (e) {
+			throw new Error(`${(e as Error).message}\n--- runner.log ---\n${runnerLog(w, runId)}`);
+		}
+	}
+
+	/** The attribution's `test-batch-attribution:`, once written. */
+	async function attributionOf(w: World, wl: string, id: string, timeoutMs = 240_000): Promise<TestBatchAttribution> {
+		try {
+			return await until(`the test-batch-attribution: of ${id}`, () => batchAttributions(w.ledger.entries(wl)).find((a) => a.runId === id), timeoutMs);
+		} catch (e) {
+			throw new Error(`${(e as Error).message}\n--- runner.log ---\n${runnerLog(w, id)}`);
+		}
+	}
+
+	/** An earlier batch of PRs #1 and #8 on `wl`: its slice and its `test-batch-requested:`, `agoMs` in the past. */
+	function earlierBatch(w: World, wl: string, agoMs: number): { runId: string; slice: string; prs: { pr: number; sha: string }[] } {
+		const prs = [{ pr: PR.green, sha: fx.head.green }, { pr: PR.green2, sha: fx.head.green2 }];
+		const runId = newRunId();
+		const f = batchSlice(wl, prs.map((p) => p.pr), w.ledger.slices(wl).map((s) => s.id));
+		const slice = w.ledger.addSlice({ by: TEST_RUNNER_BY, workloadId: wl, id: f.id, task: f.task, doneCondition: f.doneCondition, inputs: "an earlier batch" });
+		w.ago(agoMs, () => w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: slice, kind: "assumption", body: testBatchRequestedBody({ runId, prs, slice, by: "jo" }) }));
+		return { runId, slice, prs };
+	}
+
+	test("green: start-batch pins two PRs with full greens on their own workloads; their merges onto origin/main test green; test-batch-run: green settles the batch slice, each PR's own workload gets its test-batch-credit:, the orchestrator its line", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		const own1 = ownGreen(w, PR.green, fx.head.green);
+		const own8 = ownGreen(w, PR.green2, fx.head.green2);
+		const r = startBatch(w, wl, [PR.green, PR.green2]);
+		expect([r.code, r.err]).toEqual([START_EXIT.ok, ""]);
+		expect(r.runId).not.toBeNull();
+		const runId = r.runId!;
+		const slice = r.slice!;
+		expect(slice).toBe(batchSlice(wl, [PR.green, PR.green2], []).id);
+		expect(r.prs).toBe(`#${PR.green}@${fx.head.green.slice(0, 7)},#${PR.green2}@${fx.head.green2.slice(0, 7)}`);
+		expect(r.log).toBe(join(w.runs, runId, "runner.log"));
+		expect(w.ledger.slice(slice)).toMatchObject({ state: "open", created_by: TEST_RUNNER_BY });
+
+		const run = await batchResultOf(w, wl, runId);
+		expect(run).toMatchObject({
+			verdict: "green", reason: null, base: fx.main, attribution: null, runDir: join(w.runs, runId), failures: [],
+			prs: [{ pr: PR.green, sha: fx.head.green }, { pr: PR.green2, sha: fx.head.green2 }], headsAtEnd: [fx.head.green, fx.head.green2],
+		});
+		// xa.test.ts (main), a.test.ts (#1) and b.test.ts (#8): one full suite, at the last merge step
+		expect(run.full).toMatchObject({ pass: 3, fail: 0, exit: 0, error: null });
+		expect(run.steps).toHaveLength(3);
+		expect(run.steps[0]!.commit).toBe(fx.main);
+		await until("the batch slice settled", () => w.ledger.slice(slice)?.state === "done");
+		expect(w.ledger.slice(slice)).toMatchObject({ changed_by: TEST_RUNNER_BY, artifact: batchSettleArtifact(run) });
+
+		const finalTree = run.steps[2]!.tree;
+		expect(batchCredits(w.ledger.entries(own1))).toEqual([{ runId, pr: PR.green, sha: fx.head.green, base: fx.main, step: 1, n: 2, finalTree }]);
+		expect(batchCredits(w.ledger.entries(own8))).toEqual([{ runId, pr: PR.green2, sha: fx.head.green2, base: fx.main, step: 2, n: 2, finalTree }]);
+		expect(batchCredits(w.ledger.entries(wl))).toEqual([]);
+		expect(heldMessages(w, wl).map((m) => m.body)).toEqual([
+			`test-batch-result: ${wl} ${runId} batch ${runId} of PRs #${PR.green}, #${PR.green2} green onto ${fx.main.slice(0, 7)}: full 3/0/0; credit written for #${PR.green}, #${PR.green2}`,
+		]);
+
+		// _as2test's clone is the last merge step; a sweep after publish and after the one full part; the lock released, the queue empty
+		expect(g(join(workDirOf(runId, w.as2), "repo"), "rev-parse", "HEAD")).toBe(run.steps[2]!.commit);
+		expect(marks(w, runId, "sweep").map((x) => x.after)).toEqual(["publish", "full"]);
+		const db = lockDbOf(w);
+		expect(lockRow(db)).toBeNull();
+		db.close();
+		expect(queued(w)).toEqual([]);
+		expect(JSON.parse(readFileSync(join(w.runs, runId, "result.json"), "utf8"))).toMatchObject({ runId, verdict: "green" });
+	});
+
+	test("red: PR #2 breaks the suite; the red result names its attribution id, whose run waits its turn in the queue, bisects over full-suite prefixes in sub-runs and writes test-batch-attribution: broken by PR #2", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		ownGreen(w, PR.green, fx.head.green);
+		// PR #2's own green as the runner writes one: the admission reads the ledger only, and the batch's suite is what finds the break.
+		ownGreen(w, PR.red, fx.head.red);
+		const r = startBatch(w, wl, [PR.green, PR.red]);
+		expect([r.code, r.err]).toEqual([START_EXIT.ok, ""]);
+		const runId = r.runId!;
+
+		const run = await batchResultOf(w, wl, runId);
+		expect(run).toMatchObject({ verdict: "red", reason: null, base: fx.main, prs: [{ pr: PR.green, sha: fx.head.green }, { pr: PR.red, sha: fx.head.red }] });
+		expect(run.full).toMatchObject({ fail: 25 });
+		expect(run.failures[0]!.name).toContain("red.test.ts");
+		const attr = run.attribution!;
+		expect(attr).toMatch(/^tr-[a-z0-9]+$/);
+		expect(attr).not.toBe(runId);
+		// a red settles the batch slice on its verdict, and credits nothing
+		expect(w.ledger.slice(r.slice!)).toMatchObject({ state: "done", changed_by: TEST_RUNNER_BY });
+		expect(w.ledger.slice(r.slice!)!.artifact).toStartWith(`test-batch-run ${runId}: red`);
+		expect(w.ledger.slice(r.slice!)!.artifact).toContain(`; attribution ${attr}; `);
+		expect(batchCredits(w.ledger.entries(wl))).toEqual([]);
+
+		const a = await attributionOf(w, wl, attr);
+		expect(a.batch).toBe(runId);
+		expect(a.outcome).toMatchObject({ kind: "broken", step: 2, pr: PR.red });
+		// step 0 (main alone) first, then the midpoint of 0..2: both green, so step 2 (PR #2) is the green→red step
+		expect(a.outcome.probes.map((p) => [p.step, p.verdict])).toEqual([[0, "green"], [1, "green"]]);
+		const row = w.ledger.entries(wl).find((e) => e.body.startsWith(`test-batch-attribution: ${attr} `))!;
+		expect(row.body).toStartWith(`test-batch-attribution: ${attr} batch=${runId} broken by PR #${PR.red} at step 2: `);
+		expect(newestBatchAttribution(w.runs, () => w.ledger.entries(wl), Date.now())!.state).toEqual({ state: "done", id: attr, outcome: a.outcome });
+		expect(heldMessages(w, wl).map((m) => m.body)).toEqual([
+			expect.stringMatching(new RegExp(`^test-batch-result: ${wl} ${runId} batch ${runId} of PRs #${PR.green}, #${PR.red} red: full 3/25/0, first .*; attribution ${attr} queued$`)),
+			expect.stringMatching(new RegExp(`^test-batch-result: ${wl} ${attr} attribution of batch ${runId}: broken by PR #${PR.red} at step 2: `)),
+		]);
+
+		// the attribution took the lock through the queue once, under its own id; each probe was a sub-run with its own run dir and report
+		expect(marks(w, attr, "acquired")).toHaveLength(1);
+		const probes = [...runnerLog(w, attr).matchAll(/probe of step (\d+) as (tr-[a-z0-9]+)/g)].map((m) => ({ step: Number(m[1]), sub: m[2]! }));
+		expect(probes.map((p) => p.step)).toEqual([0, 1]);
+		for (const p of probes) {
+			expect(p.sub).not.toBe(attr);
+			expect(existsSync(join(w.runs, p.sub, "full.xml"))).toBe(true);
+		}
+		const db = lockDbOf(w);
+		expect(lockRow(db)).toBeNull();
+		db.close();
+		expect(current(w)).toBe(attr);
+		expect(queued(w)).toEqual([]);
+	}, 300_000);
+
+	for (const point of ["after-result", "after-admit"] as const) {
+		test(`a red batch killed ${point} (AGENT_SYSTEM_TEST_RUNNER_CRASH_AT): the red stands, and the reader over the runs.db snapshot reads its attribution lost`, async () => {
+			const w = world();
+			const { wl } = workload(w);
+			ownGreen(w, PR.green, fx.head.green);
+			ownGreen(w, PR.red, fx.head.red);
+			const r = startBatch(w, wl, [PR.green, PR.red], { AGENT_SYSTEM_TEST_RUNNER_CRASH_AT: point });
+			expect([r.code, r.err]).toEqual([START_EXIT.ok, ""]);
+			const runId = r.runId!;
+			const run = await batchResultOf(w, wl, runId);
+			expect(run.verdict).toBe("red");
+			const attr = run.attribution!;
+			await until(`batch runner ${r.pid} gone`, () => !alive(r.pid!), 60_000);
+
+			// SIGKILL ran no finally: the lock row still names the dead batch; the attribution's runner was never spawned
+			const snap = readRunsSnapshot(w.runs);
+			expect(snap.lock?.runId).toBe(runId);
+			expect(existsSync(join(w.runs, attr, "runner.json"))).toBe(false);
+			const rows = batchAttributions(w.ledger.entries(wl));
+			expect(rows).toEqual([]);
+			if (point === "after-result") {
+				// no bundle handed over, no queue row
+				expect(existsSync(join(w.as2, "stage", attr))).toBe(false);
+				expect(snap.queue).toEqual([]);
+				expect(batchAttribution(run, snap.queue, snap.lock, rows, Date.now())).toEqual({ state: "lost", id: attr });
+			} else {
+				// the bundle handed over and the queue row admitted, with no runner behind it: queued through the startup lease, lost after it
+				expect(existsSync(join(w.as2, "stage", attr, "repo.bundle"))).toBe(true);
+				expect(snap.queue.map((q) => [q.runId, q.heartbeatAt])).toEqual([[attr, null]]);
+				expect(batchAttribution(run, snap.queue, snap.lock, rows, Date.now())).toEqual({ state: "running", id: attr, where: "queued" });
+				expect(batchAttribution(run, snap.queue, snap.lock, rows, Date.now() + 121_000)).toEqual({ state: "lost", id: attr });
+			}
+			expect(newestBatchAttribution(w.runs, () => w.ledger.entries(wl), Date.now() + 121_000)!.state).toEqual({ state: "lost", id: attr });
+			// the red line went out with the result, before the kill; no attribution line follows
+			expect(heldMessages(w, wl).map((m) => m.body)).toEqual([expect.stringContaining(`; attribution ${attr} queued`)]);
+		});
+	}
+
+	test("start-batch refuses a PR with no full green at its pinned head on its own workload, or whose head branch names no workload: nothing admitted, no slice, no request", () => {
+		const w = world();
+		const { wl } = workload(w);
+		ownGreen(w, PR.green, fx.head.green);
+		// PR #8's newest own run is a green at main, not at the head gh reports
+		const own8 = ownGreen(w, PR.green2, fx.head.green2, fx.main);
+		const ownRun = testRuns(w.ledger.entries(own8))[0]!.request.runId;
+		const moved = startBatch(w, wl, [PR.green, PR.green2]);
+		expect(moved.code).toBe(START_EXIT.refused);
+		expect(moved.err).toBe(`test-runner start-batch: PR #${PR.green2} has no full green at ${fx.head.green2.slice(0, 7)} (its newest run ${ownRun} on ${own8} ran at ${fx.main.slice(0, 7)})`);
+
+		setPr(w, PR.green2, { sha: fx.head.green2, headRefName: "feature/b" });
+		const unowned = startBatch(w, wl, [PR.green, PR.green2]);
+		expect(unowned.code).toBe(START_EXIT.refused);
+		expect(unowned.err).toBe(`test-runner start-batch: PR #${PR.green2} has no full green at ${fx.head.green2.slice(0, 7)} (its head branch feature/b names no wl/<id> workload in the ledger)`);
+
+		expect(w.ledger.entries(wl).filter((e) => e.body.startsWith("test-batch-requested:"))).toEqual([]);
+		expect(w.ledger.slices(wl).filter((s) => s.id.startsWith("sl-batch-"))).toEqual([]);
+		expect(queued(w)).toEqual([]);
+	});
+
+	test("a batch whose runner died (no heartbeat past the 120 s lease) is settled by the next start-batch on its workload as error runner died, with its line; the new batch then runs", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		ownGreen(w, PR.green, fx.head.green);
+		ownGreen(w, PR.green2, fx.head.green2);
+		const dead = earlierBatch(w, wl, 200_000);
+		const r = startBatch(w, wl, [PR.green, PR.green2]);
+		expect([r.code, r.err]).toEqual([START_EXIT.ok, ""]);
+		expect(batchRuns(w.ledger.entries(wl)).find((x) => x.runId === dead.runId)).toMatchObject({
+			verdict: "error", reason: "runner died", runDir: join(w.runs, dead.runId), full: null, attribution: null, prs: dead.prs,
+		});
+		expect(heldMessages(w, wl).map((m) => m.body)).toEqual([`test-batch-result: ${wl} ${dead.runId} batch ${dead.runId} of PRs #${PR.green}, #${PR.green2} error: runner died`]);
+		expect(r.slice).not.toBe(dead.slice);
+		expect((await batchResultOf(w, wl, r.runId!)).verdict).toBe("green");
+		expect(w.ledger.slice(r.slice!)!.state).toBe("done");
+		// the dead batch's slice settles on its error row, as a red batch's does on its red
+		expect(w.ledger.slice(dead.slice)).toMatchObject({ state: "done", changed_by: TEST_RUNNER_BY });
+		expect(w.ledger.slice(dead.slice)!.artifact).toStartWith(`test-batch-run ${dead.runId}: error`);
+		expect(w.ledger.slice(dead.slice)!.artifact).toContain("; runner died; ");
+	});
+
+	test("a batch settled as runner died whose runner comes back writes nothing: it leaves the queue at its first poll, and the settle row stays its only result", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		const late = earlierBatch(w, wl, 0);
+		w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: late.slice, kind: "assumption", body: testBatchRunBody(batchRunnerDiedRun({ runId: late.runId, prs: late.prs, slice: late.slice, by: "jo" }, join(w.runs, late.runId))) });
+		const db = queueDbOf(w);
+		try {
+			admit(db, late.runId);
+		} finally {
+			db.close();
+		}
+		expect(await spawnRun(w, late.runId).exited).toBe(0);
+		expect(batchRuns(w.ledger.entries(wl)).filter((x) => x.runId === late.runId)).toEqual([expect.objectContaining({ verdict: "error", reason: "runner died" })]);
+		expect(runnerLog(w, late.runId)).toContain(`nothing written: ${late.runId} already has its test-batch-run:`);
+		expect(marks(w, late.runId, "acquired")).toEqual([]);
+		expect(queued(w)).toEqual([]);
+		expect(heldMessages(w, wl)).toEqual([]);
+		expect(w.ledger.slice(late.slice)!.state).toBe("open");
+	});
+});
+
+describe("the batch starter's request transaction, in process (review r1 finding 3, review r2 finding 2)", () => {
+	/** A throwaway ledger and runs lock for `fn`, both closed after. */
+	function inProcess(fn: (ledger: Ledger, db: Database, runs: string) => void): void {
+		const root = realpathSync(tmp("trun-reqbatch"));
+		const ledgerRoot = realpathSync(tmp("trun-reqbatch-ledger"));
+		roots.push(root, ledgerRoot);
+		const ledger = Ledger.open(join(ledgerRoot, "ledger.db"), { create: true, backup: false, backupOnOpen: false });
+		const db = openLockDb(join(root, "runs"), 0);
+		try {
+			fn(ledger, db, join(root, "runs"));
+		} finally {
+			db.close();
+			ledger.close();
+		}
+	}
+
+	/** PR `pr` at `sha` on a workload of its own with the runner's full green there at that head; returns the starter's gh view of it and the own workload. */
+	function ownGreenView(ledger: Ledger, pr: number, sha: string): { view: PrView; own: string } {
+		const own = ledger.openWorkload({ by: SURFACE_BY, brief: `PR #${pr}'s own work`, stakes: "normal", mode: "autonomous" });
+		const request = { runId: newRunId(), pr, sha, slice: "sl-full-own-1", by: LANE };
+		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: own, kind: "assumption", body: testRequestedBody(request) });
+		ledger.recordEntry({
+			by: TEST_RUNNER_BY, workloadId: own, kind: "assumption",
+			body: testRunBody({
+				...runnerDiedRun(request, `/runs/${request.runId}`), verdict: "green", reason: null, headAtEnd: sha,
+				full: { pass: 2, fail: 0, skip: 0, exit: 0, ms: 900, error: null }, preflight: "ok",
+			}),
+		});
+		return { own, view: { number: pr, state: "OPEN", headRefOid: sha, headRefName: `wl/${own}`, baseRefName: "main", isCrossRepository: false } };
+	}
+
+	/** What `f` throws (it must throw). */
+	function thrown(f: () => unknown): unknown {
+		try {
+			f();
+		} catch (e) {
+			return e;
+		}
+		throw new Error("expected a throw");
+	}
+
+	test("one instruction starts one batch: a second starter that passed the early check is refused inside the request transaction, and its admission is removed", () => {
+		inProcess((ledger, db, runs) => {
+			const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "batch", stakes: "normal", mode: "autonomous" });
+			const { instructionId } = requestTestBatch(ledger, { kind: "test-batch", workloadId: wl, prs: [12, 15] });
+			const views = [ownGreenView(ledger, 12, "a".repeat(40)).view, ownGreenView(ledger, 15, "b".repeat(40)).view];
+			const first = makeRunId(Date.now(), "first1");
+			const second = makeRunId(Date.now() + 1, "second");
+			// Both starters passed batchInstruction before either wrote (the race): only the check inside the transaction stands between them.
+			const { slice, prs } = requestBatch(ledger, db, runs, wl, instructionId, first, views);
+			expect(prs).toEqual([{ pr: 12, sha: "a".repeat(40) }, { pr: 15, sha: "b".repeat(40) }]);
+			expect(() => requestBatch(ledger, db, runs, wl, instructionId, second, views)).toThrow(`${instructionId} already started batch ${first}`);
+			expect(queueRows(db).map((r) => r.runId)).toEqual([first]);
+			expect(batchRequests(ledger.entries(wl)).map((r) => [r.runId, r.slice])).toEqual([[first, slice]]);
+			expect(ledger.slices(wl).filter((s) => s.id.startsWith("sl-batch-")).map((s) => s.id)).toEqual([slice]);
+		});
+	});
+
+	test("a run requested, or a red written, on a PR's own workload after the early check refuses the batch inside the request transaction: no slice, no request, its admission removed", () => {
+		inProcess((ledger, db, runs) => {
+			const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "batch", stakes: "normal", mode: "autonomous" });
+			const { instructionId } = requestTestBatch(ledger, { kind: "test-batch", workloadId: wl, prs: [12, 15] });
+			const head = "b".repeat(40);
+			const a = ownGreenView(ledger, 12, "a".repeat(40));
+			const b = ownGreenView(ledger, 15, head);
+			const views = [a.view, b.view];
+			// The early check (the starter's, before its admission) passes on these views and rows.
+			expect(batchAdmissible([a, b].map(({ view, own }) => ({ view, records: testRuns(ledger.entries(own)) }))).ok).toBe(true);
+			// Then, before the request transaction, a lane asks for a new run of PR #15 on its own workload: the full green is no longer its newest run.
+			const late = { runId: newRunId(), pr: 15, sha: head, slice: "sl-full-own-2", by: LANE };
+			ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: b.own, kind: "assumption", body: testRequestedBody(late) });
+			const pending = thrown(() => requestBatch(ledger, db, runs, wl, instructionId, makeRunId(Date.now(), "pendng"), views));
+			expect(pending).toMatchObject({ message: `PR #15 has no full green at ${head.slice(0, 7)} (its newest run ${late.runId} on ${b.own} has no result)`, code: START_EXIT.refused });
+			// That run then ends red: still refused.
+			ledger.recordEntry({
+				by: TEST_RUNNER_BY, workloadId: b.own, kind: "assumption",
+				body: testRunBody({
+					...runnerDiedRun(late, `/runs/${late.runId}`), verdict: "red", reason: null, headAtEnd: head,
+					full: { pass: 1, fail: 1, skip: 0, exit: 1, ms: 900, error: null }, preflight: "ok",
+				}),
+			});
+			const red = thrown(() => requestBatch(ledger, db, runs, wl, instructionId, makeRunId(Date.now() + 1, "redrun"), views));
+			expect(red).toMatchObject({ message: `PR #15 has no full green at ${head.slice(0, 7)} (its newest run ${late.runId} on ${b.own} is red)`, code: START_EXIT.refused });
+			expect(queueRows(db)).toEqual([]);
+			expect(batchRequests(ledger.entries(wl))).toEqual([]);
+			expect(ledger.slices(wl).filter((s) => s.id.startsWith("sl-batch-"))).toEqual([]);
+		});
+	});
+});
+
 describe("the runs lock under test (Guard A, MIGRATION.md item 114)", () => {
 	test("a runs.db that is a symlink into a live ledger root is refused, and its target is left as it was", () => {
 		const live = tmp("runner-live");
@@ -1349,5 +2102,314 @@ describe("the runs lock under test (Guard A, MIGRATION.md item 114)", () => {
 			else process.env.AS2_TEST_LIVE_ROOTS = was;
 		}
 		expect(readFileSync(target).equals(bytes)).toBe(true);
+	});
+});
+
+describe("the doc-only main-merge facts from real merges, in process (plan wl-mv615mkeaf1yio § 3)", () => {
+	const MAIN = "refs/remotes/origin/main";
+	/** A repo whose base commit B holds two code files and MIGRATION.md; the lane branch `wl` is checked out at B. */
+	function repo(): { dir: string; b: string } {
+		const dir = realpathSync(tmp("trun-merge"));
+		roots.push(dir);
+		g(dir, "init", "-q", "-b", "main");
+		const b = commit(dir, { "code.ts": "one\ntwo\nthree\n", "main.ts": "m\n", "MIGRATION.md": "# items\n1. first\n" }, "base");
+		g(dir, "checkout", "-q", "-b", "wl");
+		return { dir, b };
+	}
+	function commit(dir: string, files: Record<string, string>, msg: string): string {
+		for (const [f, text] of Object.entries(files)) writeFileSync(join(dir, f), text);
+		g(dir, "add", "-A");
+		g(dir, "commit", "-q", "-m", msg);
+		return g(dir, "rev-parse", "HEAD");
+	}
+	/** On main (from wherever it is), then back on `wl`; origin/main is moved to main's tip as the runner's fetch would. */
+	function onMain(dir: string, files: Record<string, string>, msg: string): string {
+		g(dir, "checkout", "-q", "main");
+		const sha = commit(dir, files, msg);
+		g(dir, "update-ref", MAIN, sha);
+		g(dir, "checkout", "-q", "wl");
+		return sha;
+	}
+	/** `git merge` on `wl` that may stop on a conflict: its exit code. */
+	const merge = (dir: string, ...args: string[]): number | null => Bun.spawnSync(["git", "merge", "--no-edit", ...args], { cwd: dir, env: GIT_ENV, stdout: "pipe", stderr: "pipe" }).exitCode;
+	/** The basis: a full green of PR #9 at `sha`, as testRuns gives it. */
+	function greenAt(sha: string): RunRecord[] {
+		const request = { runId: "tr-0basis", pr: 9, sha, slice: "sl-full-x-1", by: LANE, entryId: "e-1", createdAt: "2026-10-13T00:00:00.000Z" };
+		const result = { ...runnerDiedRun(request), verdict: "green" as const, reason: null, full: { pass: 1, fail: 0, skip: 0, exit: 0, ms: 1, error: null }, entryId: "e-2", createdAt: "2026-10-13T00:01:00.000Z" };
+		return [{ request, results: [result], result }];
+	}
+	const head = (dir: string): string => g(dir, "rev-parse", "HEAD");
+
+	test("a MIGRATION.md conflict resolved by hand with code merged from one side each: the five lists, one merge base, P2 on the chain; doc-merge", async () => {
+		const { dir, b } = repo();
+		const p1 = commit(dir, { "code.ts": "ONE\ntwo\nthree\n", "MIGRATION.md": "# items\n1. first\n2. the lane's item\n" }, "the lane's change");
+		const p2 = onMain(dir, { "main.ts": "m2\n", "MIGRATION.md": "# items\n1. first\n2. main's item\n" }, "main moves");
+		expect(merge(dir, "main")).toBe(1);
+		writeFileSync(join(dir, "MIGRATION.md"), "# items\n1. first\n2. main's item\n3. the lane's item\n");
+		g(dir, "add", "MIGRATION.md");
+		g(dir, "commit", "-q", "--no-edit");
+		const h = head(dir);
+		const facts = await gatherMergeFacts(dir, GIT_ENV, h, MAIN);
+		expect(facts).toEqual({
+			parents: [p1, p2], tip: p2, mainOnChain: true, mergeBases: [b],
+			diffs: { baseP1: ["MIGRATION.md", "code.ts"], baseP2: ["MIGRATION.md", "main.ts"], p1p2: ["MIGRATION.md", "code.ts", "main.ts"], p1h: ["MIGRATION.md", "main.ts"], p2h: ["MIGRATION.md", "code.ts"] },
+		});
+		expect(docMergeDecision(facts, greenAt(p1), 9)).toEqual({ mode: "doc-merge", basis: { runId: "tr-0basis", sha: p1 }, merge: { main: p2, tip: p2, docs: ["MIGRATION.md"] } });
+		// main moved on after the merge: P2 is still a main state on the chain, and the tip is recorded as it is
+		const tip = onMain(dir, { "late.ts": "l\n" }, "main moves again");
+		expect(docMergeDecision(await gatherMergeFacts(dir, GIT_ENV, h, MAIN), greenAt(p1), 9)).toEqual({ mode: "doc-merge", basis: { runId: "tr-0basis", sha: p1 }, merge: { main: p2, tip, docs: ["MIGRATION.md"] } });
+	});
+
+	test("a conflicted code file resolved by hand, or with -X ours: both sides changed it; full suite", async () => {
+		for (const resolve of ["hand", "ours"] as const) {
+			const { dir } = repo();
+			const p1 = commit(dir, { "code.ts": "ONE\ntwo\nthree\n" }, "the lane's change");
+			onMain(dir, { "code.ts": "uno\ntwo\nthree\n" }, "main's change");
+			if (resolve === "hand") {
+				expect(merge(dir, "main")).toBe(1);
+				writeFileSync(join(dir, "code.ts"), "ONE uno\ntwo\nthree\n");
+				g(dir, "add", "code.ts");
+				g(dir, "commit", "-q", "--no-edit");
+			} else {
+				expect(merge(dir, "-X", "ours", "main")).toBe(0);
+				expect(readFileSync(join(dir, "code.ts"), "utf8")).toBe("ONE\ntwo\nthree\n");
+			}
+			const facts = await gatherMergeFacts(dir, GIT_ENV, head(dir), MAIN);
+			expect([resolve, docMergeDecision(facts, greenAt(p1), 9)]).toEqual([resolve, { mode: "full", reason: "the merge resolution touched code.ts: both sides changed it to different content" }]);
+		}
+	});
+
+	test("a merge that drops main's one-sided change (-s ours) fails the dropped-side check; an edit no side made fails the neither-version check", async () => {
+		const dropped = repo();
+		const p1 = commit(dropped.dir, { "code.ts": "ONE\ntwo\nthree\n" }, "the lane's change");
+		const p2 = onMain(dropped.dir, { "main.ts": "m2\n" }, "main's change");
+		expect(merge(dropped.dir, "-s", "ours", "main")).toBe(0);
+		const f1 = await gatherMergeFacts(dropped.dir, GIT_ENV, head(dropped.dir), MAIN);
+		expect(f1.parents).toEqual([p1, p2]);
+		expect(f1.diffs!.p1h).toEqual([]);
+		expect(f1.diffs!.p2h).toEqual(["code.ts", "main.ts"]);
+		expect(docMergeDecision(f1, greenAt(p1), 9)).toEqual({ mode: "full", reason: "the merge resolution touched main.ts: the merge dropped main's change, the only side that changed it" });
+
+		const evil = repo();
+		const q1 = commit(evil.dir, { "code.ts": "ONE\ntwo\nthree\n" }, "the lane's change");
+		onMain(evil.dir, { "MIGRATION.md": "# items\n1. first\n2. main's item\n" }, "main's doc");
+		expect(merge(evil.dir, "--no-commit", "main")).toBe(0);
+		writeFileSync(join(evil.dir, "main.ts"), "edited in the merge\n");
+		g(evil.dir, "add", "main.ts");
+		g(evil.dir, "commit", "-q", "--no-edit");
+		const f2 = await gatherMergeFacts(evil.dir, GIT_ENV, head(evil.dir), MAIN);
+		expect(docMergeDecision(f2, greenAt(q1), 9)).toEqual({ mode: "full", reason: "the merge resolution touched main.ts: the merge holds neither parent's version" });
+	});
+
+	test("P2 merged into main by a merge commit is an ancestor of origin/main but not on its first-parent chain: full suite", async () => {
+		const { dir, b } = repo();
+		const p1 = commit(dir, { "code.ts": "ONE\ntwo\nthree\n" }, "the lane's change");
+		g(dir, "checkout", "-q", "-b", "side", b);
+		const side = commit(dir, { "main.ts": "from a side branch\n" }, "a side branch commit main never was");
+		g(dir, "checkout", "-q", "main");
+		expect(merge(dir, "--no-ff", "side")).toBe(0);
+		g(dir, "update-ref", MAIN, "main");
+		g(dir, "checkout", "-q", "wl");
+		expect(merge(dir, "side")).toBe(0);
+		const facts = await gatherMergeFacts(dir, GIT_ENV, head(dir), MAIN);
+		expect(facts.parents).toEqual([p1, side]);
+		expect(g(dir, "merge-base", "--is-ancestor", side, MAIN)).toBe("");
+		expect(facts.mainOnChain).toBe(false);
+		expect(docMergeDecision(facts, greenAt(p1), 9)).toEqual({ mode: "full", reason: `the second parent ${side.slice(0, 7)} is not on origin/main's first-parent chain` });
+	});
+
+	test("a criss-cross merge has two merge bases and no diffs are read; a head with one parent reads nothing past its parents", async () => {
+		const { dir, b } = repo();
+		const x1 = commit(dir, { "code.ts": "ONE\ntwo\nthree\n" }, "x1");
+		g(dir, "checkout", "-q", "main");
+		const y1 = commit(dir, { "main.ts": "m2\n" }, "y1");
+		expect(merge(dir, x1)).toBe(0);
+		g(dir, "update-ref", MAIN, "main");
+		g(dir, "checkout", "-q", "wl");
+		expect(merge(dir, y1)).toBe(0);
+		const x2 = commit(dir, { "code.ts": "ONE\nTWO\nthree\n" }, "x2");
+		expect(merge(dir, "main")).toBe(0);
+		const facts = await gatherMergeFacts(dir, GIT_ENV, head(dir), MAIN);
+		expect(facts.parents[0]).toBe(x2);
+		expect([...facts.mergeBases!].sort()).toEqual([x1, y1].sort());
+		expect(facts.diffs).toBeNull();
+		expect(docMergeDecision(facts, greenAt(x2), 9)).toEqual({ mode: "full", reason: "the parents have 2 merge bases, not 1" });
+
+		const linear = await gatherMergeFacts(dir, GIT_ENV, x1, MAIN);
+		expect(linear).toEqual({ parents: [b], tip: g(dir, "rev-parse", MAIN), mainOnChain: null, mergeBases: null, diffs: null });
+		expect(docMergeDecision(linear, greenAt(b), 9)).toEqual({ mode: "full", reason: "the head has 1 parent(s), not 2" });
+	});
+});
+
+describe("the batch's trusted git and the runs.db snapshot, in process (plan wl-mv615mkeaf1yio § 4)", () => {
+	/** A repo at M0 with three PR commits off it: p1 and p2 touch different files, p3 conflicts with p1. */
+	function batchRepo(): { dir: string; m0: string; p1: string; p2: string; p3: string } {
+		const dir = realpathSync(tmp("trun-batch"));
+		roots.push(dir);
+		g(dir, "init", "-q", "-b", "main");
+		const put = (files: Record<string, string>, msg: string): string => {
+			for (const [f, text] of Object.entries(files)) writeFileSync(join(dir, f), text);
+			g(dir, "add", "-A");
+			g(dir, "commit", "-q", "-m", msg);
+			return g(dir, "rev-parse", "HEAD");
+		};
+		const m0 = put({ "a.txt": "a\n", "b.txt": "b\n" }, "M0");
+		const off = (name: string, files: Record<string, string>): string => {
+			g(dir, "checkout", "-q", "-b", name, m0);
+			const sha = put(files, name);
+			g(dir, "checkout", "-q", "main");
+			return sha;
+		};
+		return { dir, m0, p1: off("p1", { "a.txt": "a from p1\n" }), p2: off("p2", { "b.txt": "b from p2\n" }), p3: off("p3", { "a.txt": "a from p3\n" }) };
+	}
+	const tree = (dir: string, c: string): string => g(dir, "rev-parse", `${c}^{tree}`);
+
+	test("buildBatch: step 0 is M0, each step a --no-ff merge of the next head onto the last, named as2-batch-<k>, by the runner's identity", async () => {
+		const { dir, m0, p1, p2 } = batchRepo();
+		const r = await buildBatch(dir, GIT_ENV, m0, [p1, p2]);
+		expect(r.conflict).toBeNull();
+		expect(r.steps).toHaveLength(3);
+		expect(r.steps[0]).toEqual({ commit: m0, tree: tree(dir, m0) });
+		for (const [k, s] of r.steps.entries()) {
+			expect(g(dir, "rev-parse", `refs/heads/as2-batch-${k}`)).toBe(s.commit);
+			expect(tree(dir, s.commit)).toBe(s.tree);
+		}
+		expect(g(dir, "rev-list", "--parents", "-n", "1", r.steps[1]!.commit)).toBe(`${r.steps[1]!.commit} ${m0} ${p1}`);
+		expect(g(dir, "rev-list", "--parents", "-n", "1", r.steps[2]!.commit)).toBe(`${r.steps[2]!.commit} ${r.steps[1]!.commit} ${p2}`);
+		expect(g(dir, "show", `${r.steps[2]!.commit}:a.txt`)).toBe("a from p1");
+		expect(g(dir, "show", `${r.steps[2]!.commit}:b.txt`)).toBe("b from p2");
+		expect(g(dir, "log", "-1", "--format=%cn <%ce>", r.steps[2]!.commit)).toBe("agent-system test-runner <test-runner@agent-system.invalid>");
+	});
+
+	test("buildBatch: a conflicting merge is aborted and its 1-based step returned with the steps before it", async () => {
+		const { dir, m0, p1, p3 } = batchRepo();
+		const r = await buildBatch(dir, GIT_ENV, m0, [p1, p3]);
+		expect(r.conflict).toBe(2);
+		expect(r.steps.map((s) => s.commit)).toEqual([m0, g(dir, "rev-parse", "refs/heads/as2-batch-1")]);
+		expect(existsSync(join(dir, ".git", "MERGE_HEAD"))).toBe(false);
+		expect(Bun.spawnSync(["git", "rev-parse", "--verify", "-q", "refs/heads/as2-batch-2"], { cwd: dir, env: GIT_ENV }).exitCode).not.toBe(0);
+	});
+
+	test("verifyBundleSteps: every step in the bundle with its tree is null; a wrong tree, a missing commit and a missing bundle are named; the clone dir is removed", async () => {
+		const { dir, m0, p1, p2 } = batchRepo();
+		const { steps } = await buildBatch(dir, GIT_ENV, m0, [p1, p2]);
+		const bundle = join(dir, "..", `${dir.split("/").at(-1)}.bundle`);
+		roots.push(bundle);
+		g(dir, "bundle", "create", "-q", bundle, "--all");
+		const into = join(dir, "..", `${dir.split("/").at(-1)}-verify`);
+		expect(await verifyBundleSteps(bundle, into, GIT_ENV, steps)).toBeNull();
+		expect(existsSync(into)).toBe(false);
+		const wrongTree = steps.map((s, k) => (k === 1 ? { ...s, tree: steps[0]!.tree } : s));
+		expect(await verifyBundleSteps(bundle, into, GIT_ENV, wrongTree)).toBe(`step 1 has tree ${steps[1]!.tree.slice(0, 7)}, not the recorded ${steps[0]!.tree.slice(0, 7)}`);
+		const missing = [...steps, { commit: "f".repeat(40), tree: steps[0]!.tree }];
+		expect(await verifyBundleSteps(bundle, into, GIT_ENV, missing)).toBe(`step 3 (fffffff) is not in the bundle`);
+		expect(await verifyBundleSteps(join(dir, "no.bundle"), into, GIT_ENV, steps)).toStartWith(`git clone of ${join(dir, "no.bundle")} failed: `);
+		expect(existsSync(into)).toBe(false);
+	});
+
+	/** A runs root and a stage dir of their own; nothing is spawned. */
+	function lockDb(): { db: Database; stage: string; runs: string } {
+		const root = realpathSync(tmp("trun-batchlock"));
+		roots.push(root);
+		const stage = join(root, "stage");
+		mkdirSync(stage);
+		const runs = join(root, "runs");
+		return { db: openLockDb(runs, 0), stage, runs };
+	}
+	const as = (runId: string): Claimant => ({ runId, pid: 1, runDir: `/nowhere/${runId}` });
+
+	test("publishSub: the holder's sub-run is published as current while the lock row keeps the holder; a run that is not the holder publishes nothing", () => {
+		const { db, stage } = lockDb();
+		const holder = makeRunId(Date.now(), "attr");
+		const sub = makeRunId(Date.now(), "sub1");
+		try {
+			expect(tryAcquire(db, stage, as(holder), () => null)).toEqual({ displaced: null });
+			expect(publishSub(db, stage, holder, sub)).toBe(true);
+			expect(readFileSync(join(stage, "current"), "utf8")).toBe(`${sub}\n`);
+			expect(lockRow(db)?.runId).toBe(holder);
+			expect(publishSub(db, stage, makeRunId(Date.now(), "othr"), makeRunId(Date.now(), "sub2"))).toBe(false);
+			expect(readFileSync(join(stage, "current"), "utf8")).toBe(`${sub}\n`);
+			expect(publishIfOwner(db, stage, holder)).toBe(true);
+			expect(readFileSync(join(stage, "current"), "utf8")).toBe(`${holder}\n`);
+		} finally {
+			db.close();
+		}
+	});
+
+	/**
+	 * The runner's acquisition as it happens in production: another process, runs.db with no busy wait.
+	 * (A writer in this process beside the reader's read-only connection gets SQLITE_IOERR_LOCK from its
+	 * BEGIN IMMEDIATE, never the cross-process SQLITE_BUSY, so it would not model the runner.)
+	 */
+	function acquireElsewhere(runs: string, stage: string, runId: string): { code: number | null; out: string } {
+		const script = `import { openLockDb, tryAcquire } from ${JSON.stringify(RUNNER)};
+const db = openLockDb(${JSON.stringify(runs)}, 0);
+try { console.log(JSON.stringify(tryAcquire(db, ${JSON.stringify(stage)}, { runId: ${JSON.stringify(runId)}, pid: 1, runDir: "/nowhere" }, () => null))); }
+catch (e) { console.log(String(e)); process.exit(3); }`;
+		const r = Bun.spawnSync([process.execPath, "-e", script], { env: process.env, stdout: "pipe", stderr: "pipe" });
+		return { code: r.exitCode, out: `${r.stdout.toString().trim()}${r.stderr.toString().trim()}` };
+	}
+
+	test("the reader's one read transaction: an acquisition cannot commit between its lock read and its queue read, so the attribution is queued, then holding, never neither", () => {
+		const { db, stage, runs } = lockDb();
+		const batch = makeRunId(Date.now(), "btch");
+		const x = makeRunId(Date.now(), "attr");
+		admit(db, x);
+		db.close();
+		let between: { code: number | null; out: string } | null = null;
+		const snap = readRunsSnapshot(runs, () => {
+			between = acquireElsewhere(runs, stage, x);
+		});
+		expect(between!).toEqual({ code: 3, out: expect.stringMatching(/database is locked|SQLITE_BUSY/) });
+		expect(snap.lock).toBeNull();
+		expect(snap.queue.map((q) => q.runId)).toEqual([x]);
+		expect(batchAttribution({ runId: batch, attribution: x }, snap.queue, snap.lock, [], Date.now())).toEqual({ state: "running", id: x, where: "queued" });
+
+		expect(acquireElsewhere(runs, stage, x)).toEqual({ code: 0, out: JSON.stringify({ displaced: null }) });
+		const after = readRunsSnapshot(runs);
+		expect(after.queue).toEqual([]);
+		expect(after.lock?.runId).toBe(x);
+		expect(batchAttribution({ runId: batch, attribution: x }, after.queue, after.lock, [], Date.now())).toEqual({ state: "running", id: x, where: "holding the lock" });
+	});
+
+	test("the attribution reader reads runs.db before the ledger: a result committed and its lock row removed after the first ledger read is done, never lost (review r1 finding 4)", () => {
+		const { db, stage, runs } = lockDb();
+		const ledgerRoot = realpathSync(tmp("trun-batchlock-ledger"));
+		roots.push(ledgerRoot);
+		const ledger = Ledger.open(join(ledgerRoot, "ledger.db"), { create: true, backup: false, backupOnOpen: false });
+		const batch = makeRunId(Date.now(), "btch");
+		const x = makeRunId(Date.now(), "attr");
+		try {
+			const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "batch", stakes: "normal", mode: "autonomous" });
+			const prs = [{ pr: 12, sha: "a".repeat(40) }, { pr: 15, sha: "b".repeat(40) }];
+			const steps = ["1", "2", "3"].map((c) => ({ commit: c.repeat(40), tree: c.repeat(40) }));
+			const red: TestBatchRun = {
+				runId: batch, verdict: "red", base: steps[0]!.commit, prs, steps, full: { pass: 9, fail: 1, skip: 0, exit: 1, ms: 1, error: null },
+				failures: [{ part: "full", name: "a.test.ts > breaks", firstError: "boom" }], attribution: x, reason: null, headsAtEnd: prs.map((p) => p.sha), runDir: null, preflight: null,
+			};
+			ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, kind: "assumption", body: testBatchRunBody(red) });
+			// the attribution holds the lock with a fresh heartbeat
+			expect(tryAcquire(db, stage, as(x), () => null)).toEqual({ displaced: null });
+			const outcome = { kind: "main-red" as const, probes: [] };
+			const reads: string[] = [];
+			let finished = false;
+			const entriesNow = () => {
+				reads.push("ledger");
+				const e = ledger.entries(wl);
+				if (!finished) {
+					// The runner's finish lands right after this read: its attribution row commits, then its lock row goes.
+					finished = true;
+					ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, kind: "assumption", body: testBatchAttributionBody({ runId: x, batch, outcome }) });
+					db.query("DELETE FROM lock WHERE runId = ?").run(x);
+				}
+				return e;
+			};
+			const state = newestBatchAttribution(runs, entriesNow, Date.now(), () => reads.push("runs.db"))!.state;
+			expect(state).toEqual({ state: "done", id: x, outcome });
+			expect(reads).toEqual(["ledger", "runs.db", "ledger"]);
+		} finally {
+			db.close();
+			ledger.close();
+		}
 	});
 });

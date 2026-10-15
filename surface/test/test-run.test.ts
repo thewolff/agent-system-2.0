@@ -2,8 +2,9 @@
 // four bodies, the profile block, the junit report and console log of Bun 1.3.14 (captured fixtures
 // plus one live run of the installed bun on a tiny fixture), the changed-test-file filter, the
 // verdict and settle decision with ownership, liveness and the starter's reservation, retention,
-// the bound-branch rule, the close-freshness decision, the untrusted child's env with its git shim
-// (run for real through `env -i`), and the wrapper's argv contract.
+// the bound-branch rule, the doc-only main-merge rule (plan wl-mv615mkeaf1yio § 3), the
+// close-freshness decision, the untrusted child's env with its git shim (run for real through
+// `env -i`), and the wrapper's argv contract.
 import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -11,11 +12,12 @@ import { type EntryRow, type InstructionRow, TEST_RUNNER_BY } from "../../ledger
 import { boundPrs, holdersOf, testPrBody, testPrInstructionBody } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
 import {
-	AS2TEST_EXEC, authoritativeRun, boundBranches, buildTestRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
-	type ClosePr, closeFreshness, decideRun, decisionLogFault, decisionLogOnly, fullSuiteSlice, gitShimText, heartbeatText, isBunTestFile, KEEP_RUNS, lockHolderStale,
+	type Admission, AS2TEST_EXEC, authoritativeRun, backstopReason, boundBranches, buildTestRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
+	type CloseCredit, type ClosePr, closeFreshness, decideRun, decisionLogFault, decisionLogOnly, DOC_MERGE_DOCS, docMergeDecision, fullSuiteSlice, gitShimText, heartbeatText, isBunTestFile,
+	KEEP_RUNS, lockHolderStale, type MergeDiffs, type MergeFacts,
 	logFirstErrors, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseJunit, parsePushDest, parseTestRequested,
-	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queuedTooLong, type RangeCommit, recordLive, reportCapBytes,
-	reservation, resultJson, type RunFacts, runDirOf, runLive, runnerDiedRun, runsRoot, servedRepo, settleArtifact, stageDirOf, pushDestBody,
+	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, prGoneOf, type PrView, pruneRuns, queueHead, queueWaitDecision, type RangeCommit, recordLive, reportCapBytes,
+	rerequestedAs, reservation, resultJson, type RunFacts, type RunRecord, runDirOf, runLive, runnerDiedRun, runsRoot, servedRepo, settleArtifact, stageDirOf, pushDestBody,
 	TEST_RUNNER_DEFAULTS, type TestRequested, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf, testRunnerConfig,
 	TestRunShapeError, testRuns, WRAPPER_EXIT, wrapperArgv, workDirOf,
 } from "../src/test-run";
@@ -37,7 +39,8 @@ const request = (runId: string, pr: number, sha: string, slice = "sl-full-t-1", 
 const run = (r: TestRequested, verdict: TestRun["verdict"], over: Partial<TestRun> = {}): TestRun => ({
 	runId: r.runId, verdict, sha: r.sha, pr: r.pr, reason: null, headAtEnd: r.sha, base: D, mergeBase: D,
 	full: { pass: 3, fail: verdict === "red" ? 1 : 0, skip: 0, exit: verdict === "red" ? 1 : 0, ms: 1200, error: null }, solo: [],
-	failures: verdict === "red" ? [{ part: "full", name: "x.test.ts > broken", firstError: "error: nope" }] : [], runDir: `/runs/${r.runId}`, preflight: "ok", ...over,
+	failures: verdict === "red" ? [{ part: "full", name: "x.test.ts > broken", firstError: "error: nope" }] : [], runDir: `/runs/${r.runId}`, preflight: "ok",
+	mode: "full", basis: null, merge: null, ...over,
 });
 const reqEntry = (r: TestRequested, by = TEST_RUNNER_BY) => entry(by, testRequestedBody(r), ++seq, r.slice);
 const runEntry = (t: TestRun, by = TEST_RUNNER_BY) => entry(by, testRunBody(t), ++seq);
@@ -210,6 +213,25 @@ describe("bodies: format and parse round-trip exactly; malformed bodies are reje
 		const stale = { ...runnerDiedRun(r), verdict: "stale" as const, reason: "requested aaaaaaa but the PR head was bbbbbbb" };
 		expect(parseTestRun(testRunBody(stale))).toEqual(stale);
 	});
+	test("test-run: mode; a row from before modes parses as full; a doc-merge row carries basis and merge and round-trips; mismatched mode fields are rejected", () => {
+		const r = request("tr-0abc12", 17, C);
+		const full = testRunBody(run(r, "green"));
+		expect(full.endsWith(`"preflight":"ok","mode":"full"}`)).toBe(true);
+		// a body exactly as the runner wrote it before this change: no mode, no basis, no merge
+		const old = full.replace(',"mode":"full"', "");
+		expect(old.includes("mode")).toBe(false);
+		expect(parseTestRun(old)).toMatchObject({ runId: "tr-0abc12", verdict: "green", mode: "full", basis: null, merge: null });
+		const dm = run(r, "green", { full: null, mode: "doc-merge", basis: { runId: "tr-0basis1", sha: A }, merge: { main: B, tip: D, docs: ["MIGRATION.md", ".ai/decision-log/x.md"] } });
+		const body = testRunBody(dm);
+		expect(body).toContain(`"mode":"doc-merge","basis":{"runId":"tr-0basis1","sha":"${A}"},"merge":{"main":"${B}","tip":"${D}","docs":["MIGRATION.md",".ai/decision-log/x.md"]}`);
+		expect(parseTestRun(body)).toEqual(dm);
+		for (const bad of [
+			body.replace('"mode":"doc-merge"', '"mode":"fast"'), body.replace('"mode":"doc-merge"', '"mode":"full"'), body.replace(`"basis":{"runId":"tr-0basis1","sha":"${A}"},`, ""),
+			body.replace('"runId":"tr-0basis1"', '"runId":"basis"'), body.replace(`"main":"${B}"`, '"main":"abc"'), body.replace('"docs":["MIGRATION.md"', '"docs":[3'),
+			full.replace('"mode":"full"', `"mode":"full","basis":{"runId":"tr-0basis1","sha":"${A}"}`),
+		]) expect(parseTestRun(bad)).toBeNull();
+		expect(() => testRunBody({ ...dm, merge: null })).toThrow(TestRunShapeError);
+	});
 	test("test-run: malformed bodies are rejected", () => {
 		const r = request("tr-0abc12", 17, A);
 		const good = testRunBody(run(r, "green"));
@@ -263,7 +285,7 @@ describe("profile: the testRunner block", () => {
 	test("the checkout's profile/config.yml serves agent-system-2.0 with bun test and the plan's caps", () => {
 		const doc = Bun.YAML.parse(readFileSync(join(REPO, "profile", "config.yml"), "utf8"));
 		const c = testRunnerConfig(doc);
-		expect(c).toEqual({ ok: true, config: { repos: [{ origin: "thewolff/agent-system-2.0", command: "bun test" }], fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 60 } });
+		expect(c).toEqual({ ok: true, config: { repos: [{ origin: "thewolff/agent-system-2.0", command: "bun test" }], fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 360 } });
 		if (!c.ok) throw new Error(c.error);
 		const config = c.config;
 		for (const url of ["https://github.com/thewolff/agent-system-2.0.git", "git@github.com:thewolff/agent-system-2.0.git", "ssh://git@github.com/TheWolff/agent-system-2.0", "thewolff/agent-system-2.0"]) {
@@ -397,7 +419,8 @@ describe("verdict and settle", () => {
 		pass: 10, fail, skip: 0, exit: fail > 0 ? 1 : 0, ms: 5, error: null, failures: Array.from({ length: fail }, (_, i) => ({ name: `f > t${i}`, firstError: `error: e${i}` })), ...over,
 	});
 	const facts = (over: Partial<RunFacts> = {}): RunFacts => ({
-		requestedSha: A, fetchedSha: A, error: null, full: part(), solo: [{ file: "./x.test.ts", ...part() }], headAtStart: A, headAtEnd: A, owner: true, sliceState: "open", ...over,
+		requestedSha: A, fetchedSha: A, error: null, full: part(), solo: [{ file: "./x.test.ts", ...part() }], headAtStart: A, headAtEnd: A, owner: true, sliceState: "open",
+		mode: "full", basis: null, merge: null, ...over,
 	});
 	test("green at an unchanged head settles an open slice, and only an open one", () => {
 		expect(decideRun(facts())).toEqual({ verdict: "green", outcome: "green", reason: null, settle: true });
@@ -443,6 +466,27 @@ describe("verdict and settle", () => {
 		const g = buildTestRun(r, facts(), decideRun(facts()), { base: B, mergeBase: C, runDir: "/runs/tr-0abc12", preflight: "ok" });
 		expect(settleArtifact(g)).toBe(`test-run tr-0abc12: green at ${A} on PR #17; full 10/0/0; alone: ./x.test.ts 10/0; /runs/tr-0abc12`);
 		expect(() => settleArtifact(t)).toThrow(TestRunShapeError);
+	});
+	test("doc-merge (plan wl-mv615mkeaf1yio § 3): no full part is green only with a basis; the parts it ran still decide; the entry and the artifact name the basis", () => {
+		const basis = { runId: "tr-0basis1", sha: B };
+		const merge = { main: C, tip: D, docs: ["MIGRATION.md"] };
+		const dm = (over: Partial<RunFacts> = {}) => facts({ full: null, mode: "doc-merge", basis, merge, ...over });
+		expect(decideRun(dm())).toEqual({ verdict: "green", outcome: "green", reason: null, settle: true });
+		// no test file changed: no part ran at all, and the green rests on the basis
+		expect(decideRun(dm({ solo: [] }))).toEqual({ verdict: "green", outcome: "green", reason: null, settle: true });
+		// full === null and no basis: error, whatever the mode says
+		expect(decideRun(dm({ basis: null }))).toEqual({ verdict: "error", outcome: "error", reason: "the full suite did not run", settle: false });
+		expect(decideRun(facts({ full: null, mode: "full" }))).toMatchObject({ verdict: "error", reason: "the full suite did not run" });
+		expect(decideRun(dm({ solo: [{ file: "./x.test.ts", ...part(1) }] }))).toMatchObject({ verdict: "red", settle: false });
+		expect(decideRun(dm({ solo: [{ file: "./x.test.ts", ...part(0, { exit: 3 }) }] }))).toMatchObject({ verdict: "error", reason: "./x.test.ts: exit 3" });
+		expect(decideRun(dm({ headAtEnd: B }))).toMatchObject({ verdict: "stale" });
+		const r = request("tr-0abc12", 17, A);
+		const t = buildTestRun(r, dm({ solo: [] }), decideRun(dm({ solo: [] })), { base: D, mergeBase: C, runDir: "/runs/tr-0abc12", preflight: "ok" });
+		expect(t).toMatchObject({ verdict: "green", full: null, solo: [], mode: "doc-merge", basis, merge });
+		expect(parseTestRun(testRunBody(t))).toEqual(t);
+		expect(settleArtifact(t)).toBe(`test-run tr-0abc12: green at ${A} on PR #17; doc-merge on basis tr-0basis1 at ${B}; alone: none; /runs/tr-0abc12`);
+		const withSolo = buildTestRun(r, dm(), decideRun(dm()), { base: D, mergeBase: C, runDir: null, preflight: "ok" });
+		expect(settleArtifact(withSolo)).toBe(`test-run tr-0abc12: green at ${A} on PR #17; doc-merge on basis tr-0basis1 at ${B}; alone: ./x.test.ts 10/0; no run dir`);
 	});
 	test("the orchestrator hears a non-green, owned result only when no lane holds the workload live", () => {
 		expect(notifiesOrchestrator("red", false)).toBe(true);
@@ -669,8 +713,46 @@ describe("liveness from the heartbeat", () => {
 		expect(parseHeartbeat("garbage", "tr-1")).toBeNull();
 		expect(lockHolderStale(NOW - 60_000, NOW)).toBe(false);
 		expect(lockHolderStale(NOW - 60_001, NOW)).toBe(true);
-		expect(queuedTooLong(NOW - 60 * 60_000, NOW, { queueMaxMin: 60 })).toBe(false);
-		expect(queuedTooLong(NOW - 60 * 60_000 - 1, NOW, { queueMaxMin: 60 })).toBe(true);
+	});
+	// Jo's queue drop rule (in-mv92rsb78t4em8, in-mv9340e04pgbnk): only superseded or past the 6 h backstop.
+	test("a run queued 61 minutes is not dropped under the default config, whatever an open or unread PR state", () => {
+		const config = { queueMaxMin: TEST_RUNNER_DEFAULTS.queueMaxMin };
+		for (const prState of [null, "OPEN"]) expect(queueWaitDecision({ waitedMs: 61 * 60_000, pr: 17, prState, config })).toEqual({ act: "wait" });
+		expect(queueWaitDecision({ waitedMs: 360 * 60_000, pr: 17, prState: "OPEN", config })).toEqual({ act: "wait" });
+		expect(config.queueMaxMin).toBe(360);
+	});
+	test("past queueMaxMin the backstop drops the run; the reason names the re-request or why it was refused", () => {
+		const config = { queueMaxMin: TEST_RUNNER_DEFAULTS.queueMaxMin };
+		expect(queueWaitDecision({ waitedMs: 360 * 60_000 + 1, pr: 17, prState: "OPEN", config })).toEqual({ act: "backstop", reason: "queued past the 360 min backstop" });
+		// An unreadable PR state never drops a run, nor keeps it past the backstop.
+		expect(queueWaitDecision({ waitedMs: 361 * 60_000, pr: 17, prState: null, config })).toEqual({ act: "backstop", reason: "queued past the 360 min backstop" });
+		// A batch or an attribution watches no PR: the backstop alone drops it.
+		expect(queueWaitDecision({ waitedMs: 361 * 60_000, pr: null, prState: "MERGED", config })).toEqual({ act: "backstop", reason: "queued past the 360 min backstop" });
+		expect(queueWaitDecision({ waitedMs: 61 * 60_000, pr: null, prState: "MERGED", config })).toEqual({ act: "wait" });
+		const again = backstopReason(360, { runId: "tr-0abc1234zzzz" });
+		expect(again).toBe("queued past the 360 min backstop; re-requested as tr-0abc1234zzzz");
+		expect(rerequestedAs(again)).toBe("tr-0abc1234zzzz");
+		const refused = backstopReason(360, { refused: "slice sl-x is paused, not open" });
+		expect(refused).toBe("queued past the 360 min backstop; re-request refused: slice sl-x is paused, not open");
+		expect(rerequestedAs(refused)).toBeNull();
+		expect(rerequestedAs(backstopReason(0.01, { runId: "tr-0abc1234zzzz" }))).toBe("tr-0abc1234zzzz");
+		expect(rerequestedAs("runner died")).toBeNull();
+		expect(rerequestedAs(null)).toBeNull();
+	});
+	test("a queued run whose PR is MERGED or CLOSED is superseded, before the backstop and past it", () => {
+		const config = { queueMaxMin: 360 };
+		for (const state of ["MERGED", "CLOSED"] as const) {
+			for (const waitedMs of [5 * 60_000, 400 * 60_000]) {
+				const d = queueWaitDecision({ waitedMs, pr: 17, prState: state, config });
+				expect(d).toEqual({ act: "superseded", reason: `PR #17 is ${state}` });
+				if (d.act !== "superseded") throw new Error("not superseded");
+				expect(prGoneOf(d.reason)).toEqual({ pr: 17, state });
+				// finish prefixes the lost lock or request to decideRun's own reason.
+				expect(prGoneOf(`${d.reason}; lost ownership of the request; the run found error (the PR head was never fetched)`)).toEqual({ pr: 17, state });
+			}
+		}
+		expect(prGoneOf("the request was superseded while the run was queued; lost ownership of the request")).toBeNull();
+		expect(prGoneOf(null)).toBeNull();
 	});
 	test("the starter's reservation: refused while a run is live (startup lease included); dead unsettled requests are settled first", () => {
 		const r1 = request("tr-1", 17, A);
@@ -691,6 +773,38 @@ describe("liveness from the heartbeat", () => {
 	});
 });
 
+describe("the lock queue's head (plan wl-mv615mkeaf1yio § 2)", () => {
+	const at = (s: number) => NOW - s * 1000;
+	const adm = (seq: number, runId: string, admittedAgoS: number): Admission => ({ seq, runId, admittedAt: at(admittedAgoS) });
+	test("delayed start: A was admitted first and its runner has not beaten yet, B beats; A is the head while its 120 s startup lease runs", () => {
+		const A = adm(1, "tr-00000000aaaa", 30);
+		const B = adm(2, "tr-00000000bbbb", 5);
+		const beats: Record<string, number> = { [B.runId]: at(1) };
+		expect(queueHead([A, B], (id) => beats[id] ?? null, NOW)).toEqual({ head: A, dead: [] });
+		// one second before the lease ends A is still the head; at 120 s it is dead and B leads
+		expect(queueHead([A, B], (id) => (id === B.runId ? at(-88) : null), at(-89))).toEqual({ head: A, dead: [] });
+		expect(queueHead([A, B], (id) => (id === B.runId ? at(-89) : null), at(-90))).toEqual({ head: B, dead: [A] });
+	});
+	test("seq order wins over run-id order, whatever order the rows come in", () => {
+		const later = adm(7, "tr-000000000aaa", 10);
+		const earlier = adm(3, "tr-zzzzzzzzzzzz", 10);
+		expect(queueHead([later, earlier], () => at(1), NOW)).toEqual({ head: earlier, dead: [] });
+	});
+	test("dead admissions are skipped and returned for deletion: a stale heartbeat, or no heartbeat past the lease", () => {
+		const stale = adm(1, "tr-00000000dead", 300);
+		const silent = adm(2, "tr-0000000silen", 120);
+		const live = adm(3, "tr-00000000live", 300);
+		const behind = adm(4, "tr-0000000behin", 2);
+		const beats: Record<string, number> = { [stale.runId]: at(60), [live.runId]: at(59) };
+		expect(queueHead([behind, live, silent, stale], (id) => beats[id] ?? null, NOW)).toEqual({ head: live, dead: [stale, silent] });
+	});
+	test("an empty queue, or one of dead rows only, has no head", () => {
+		expect(queueHead([], () => null, NOW)).toEqual({ head: null, dead: [] });
+		const gone = adm(1, "tr-00000000gone", 121);
+		expect(queueHead([gone], () => null, NOW)).toEqual({ head: null, dead: [gone] });
+	});
+});
+
 // ---- 8. retention -------------------------------------------------------------------------------------------
 
 describe("retention", () => {
@@ -701,14 +815,99 @@ describe("retention", () => {
 		expect(pruneRuns([{ id: "tr-b", at: 1 }, { id: "tr-a", at: 1 }, { id: "tr-c", at: 2 }], 1)).toEqual(["tr-a", "tr-b"]);
 		expect(pruneRuns([], 10)).toEqual([]);
 	});
+	test("a run live in the queue is never pruned, whatever its age, and the rest prune as before (plan wl-mv615mkeaf1yio § 4)", () => {
+		const runs = Array.from({ length: 13 }, (_, i) => ({ id: `tr-${String(i).padStart(2, "0")}`, at: NOW + i * 1000 }));
+		expect(pruneRuns(runs, KEEP_RUNS, new Set(["tr-00", "tr-nosuch"]))).toEqual(["tr-01", "tr-02"]);
+		expect(pruneRuns(runs, KEEP_RUNS, new Set())).toEqual(["tr-00", "tr-01", "tr-02"]);
+	});
 });
 
-// ---- 9. close freshness ---------------------------------------------------------------------------------------
+// ---- 9. the doc-only main-merge rule (plan wl-mv615mkeaf1yio § 3) -----------------------------------------------
+
+/** One finished run of the runner on the workload: its request and its `test-run:`, parsed back through testRuns. */
+const finished = (runId: string, pr: number, sha: string, verdict: TestRun["verdict"] = "green", over: Partial<TestRun> = {}): RunRecord[] => {
+	const q = request(runId, pr, sha);
+	return testRuns([reqEntry(q), runEntry(run(q, verdict, over))]);
+};
+
+describe("the doc-only main-merge rule (plan wl-mv615mkeaf1yio § 3)", () => {
+	// H = D merges P1 = A (the branch's green head) with P2 = B (a main state); C is their merge base.
+	const diffs = (o: Partial<MergeDiffs> = {}): MergeDiffs => ({ baseP1: [], baseP2: [], p1p2: [], p1h: [], p2h: [], ...o });
+	const facts = (o: Partial<MergeFacts> = {}): MergeFacts => ({ parents: [A, B], tip: B, mainOnChain: true, mergeBases: [C], diffs: diffs(), ...o });
+	const basis = finished("tr-1", 17, A);
+	const full = (reason: string) => ({ mode: "full" as const, reason });
+	// the branch changed x.ts and MIGRATION.md, main changed y.ts and MIGRATION.md, MIGRATION.md resolved by hand
+	const docOnly = diffs({
+		baseP1: ["MIGRATION.md", "surface/src/x.ts"], baseP2: ["MIGRATION.md", "ledger/src/y.ts"], p1p2: ["MIGRATION.md", "ledger/src/y.ts", "surface/src/x.ts"],
+		p1h: ["MIGRATION.md", "ledger/src/y.ts"], p2h: ["MIGRATION.md", "surface/src/x.ts"],
+	});
+	test("the doc list is exactly MIGRATION.md and USER-GUIDE.md at the root, plus the decision-log prefix", () => {
+		expect(DOC_MERGE_DOCS).toEqual({ files: ["MIGRATION.md", "USER-GUIDE.md"], prefixes: [".ai/decision-log/"] });
+	});
+	test("a doc-only resolution passes: the basis, the merged main, the fetched tip and the docs it touched are recorded", () => {
+		expect(docMergeDecision(facts({ diffs: docOnly }), basis, 17)).toEqual({ mode: "doc-merge", basis: { runId: "tr-1", sha: A }, merge: { main: B, tip: B, docs: ["MIGRATION.md"] } });
+		// every listed doc may differ in any way; the tip may be ahead of the merged main state
+		const docs = ["MIGRATION.md", "USER-GUIDE.md", ".ai/decision-log/2026-10-13--x.md"];
+		expect(docMergeDecision(facts({ tip: D, diffs: diffs({ p1h: docs, p2h: docs }) }), basis, 17)).toEqual({ mode: "doc-merge", basis: { runId: "tr-1", sha: A }, merge: { main: B, tip: D, docs: [".ai/decision-log/2026-10-13--x.md", "MIGRATION.md", "USER-GUIDE.md"] } });
+	});
+	test("a code file trivially merged from one side passes, from either side, with no doc touched", () => {
+		const oneSide = diffs({ baseP1: ["surface/src/x.ts"], baseP2: ["ledger/src/y.ts"], p1p2: ["ledger/src/y.ts", "surface/src/x.ts"], p1h: ["ledger/src/y.ts"], p2h: ["surface/src/x.ts"] });
+		expect(docMergeDecision(facts({ diffs: oneSide }), basis, 17)).toEqual({ mode: "doc-merge", basis: { runId: "tr-1", sha: A }, merge: { main: B, tip: B, docs: [] } });
+		// both sides made the same change: no conflict, H equals both parents there
+		const same = diffs({ baseP1: ["surface/src/x.ts"], baseP2: ["surface/src/x.ts"] });
+		expect(docMergeDecision(facts({ diffs: same }), basis, 17)).toMatchObject({ mode: "doc-merge" });
+	});
+	test("H must have exactly two parents", () => {
+		expect(docMergeDecision(facts({ parents: [A], mainOnChain: null, mergeBases: null, diffs: null }), basis, 17)).toEqual(full("the head has 1 parent(s), not 2"));
+		expect(docMergeDecision(facts({ parents: [A, B, C] }), basis, 17)).toEqual(full("the head has 3 parent(s), not 2"));
+	});
+	test("(1) the earlier green: no run at P1, a red, one without a full part, a doc-merge green, another PR's green, and a newer red over a green all fail", () => {
+		const at = (verdict: TestRun["verdict"], over: Partial<TestRun> = {}) => docMergeDecision(facts({ diffs: docOnly }), finished("tr-1", 17, A, verdict, over), 17);
+		expect(docMergeDecision(facts({ diffs: docOnly }), [], 17)).toEqual(full("PR #17 has no run at the first parent aaaaaaa"));
+		expect(docMergeDecision(facts({ diffs: docOnly }), finished("tr-1", 17, B), 17)).toEqual(full("PR #17 has no run at the first parent aaaaaaa"));
+		expect(docMergeDecision(facts({ diffs: docOnly }), finished("tr-1", 18, A), 17)).toEqual(full("PR #17 has no run at the first parent aaaaaaa"));
+		expect(at("red")).toEqual(full("the newest run at the first parent aaaaaaa, tr-1, is red"));
+		expect(at("green", { full: null })).toEqual(full("the newest run at the first parent aaaaaaa, tr-1, is a full green without a full part"));
+		const reduced = { full: null, mode: "doc-merge" as const, basis: { runId: "tr-0", sha: C }, merge: { main: B, tip: B, docs: [] } };
+		expect(at("green", reduced)).toEqual(full("the newest run at the first parent aaaaaaa, tr-1, is a doc-merge green without a full part"));
+		const newerRed = [...basis, ...finished("tr-2", 17, A, "red")];
+		expect(docMergeDecision(facts({ diffs: docOnly }), newerRed, 17)).toEqual(full("the newest run at the first parent aaaaaaa, tr-2, is red"));
+		// a request with no result yet (unfinished) is the newest run and is not a green
+		const unfinished = testRuns([reqEntry(request("tr-1", 17, A))]);
+		expect(docMergeDecision(facts({ diffs: docOnly }), unfinished, 17)).toEqual(full("the newest run at the first parent aaaaaaa, tr-1, is unfinished"));
+	});
+	test("(2) P2 off origin/main's first-parent chain fails", () => {
+		expect(docMergeDecision(facts({ diffs: docOnly, mainOnChain: false }), basis, 17)).toEqual(full("the second parent bbbbbbb is not on origin/main's first-parent chain"));
+	});
+	test("(3) two merge bases (a criss-cross) fail, and so does none", () => {
+		expect(docMergeDecision(facts({ mergeBases: [C, D], diffs: null }), basis, 17)).toEqual(full("the parents have 2 merge bases, not 1"));
+		expect(docMergeDecision(facts({ mergeBases: [], diffs: null }), basis, 17)).toEqual(full("the parents have 0 merge bases, not 1"));
+	});
+	test("(4) each of the three five-diff kinds on a code path fails, whichever side; a path outside the list fails as code", () => {
+		// changed on both sides to different content (an --ours/--theirs or hand resolution of a conflicted code file)
+		const both = diffs({ baseP1: ["surface/src/x.ts"], baseP2: ["surface/src/x.ts"], p1p2: ["surface/src/x.ts"], p2h: ["surface/src/x.ts"] });
+		expect(docMergeDecision(facts({ diffs: both }), basis, 17)).toEqual(full("the merge resolution touched surface/src/x.ts: both sides changed it to different content"));
+		// H holds neither parent's version of a file neither side changed (an evil merge)
+		const neither = diffs({ p1h: ["surface/src/z.ts"], p2h: ["surface/src/z.ts"] });
+		expect(docMergeDecision(facts({ diffs: neither }), basis, 17)).toEqual(full("the merge resolution touched surface/src/z.ts: the merge holds neither parent's version"));
+		// H dropped the one side that changed the file: the branch's, then main's
+		const droppedBranch = diffs({ baseP1: ["surface/src/x.ts"], p1p2: ["surface/src/x.ts"], p1h: ["surface/src/x.ts"] });
+		expect(docMergeDecision(facts({ diffs: droppedBranch }), basis, 17)).toEqual(full("the merge resolution touched surface/src/x.ts: the merge dropped the branch's change, the only side that changed it"));
+		const droppedMain = diffs({ baseP2: ["ledger/src/y.ts"], p1p2: ["ledger/src/y.ts"], p2h: ["ledger/src/y.ts"] });
+		expect(docMergeDecision(facts({ diffs: droppedMain }), basis, 17)).toEqual(full("the merge resolution touched ledger/src/y.ts: the merge dropped main's change, the only side that changed it"));
+		// not on Jo's list: a nested USER-GUIDE.md and a migration item are code to this rule
+		for (const p of ["docs/USER-GUIDE.md", "migration/items/x.md", ".ai/decision-logx.md"]) {
+			expect(docMergeDecision(facts({ diffs: diffs({ p1h: [p, "MIGRATION.md"], p2h: [p, "MIGRATION.md"] }) }), basis, 17)).toEqual(full(`the merge resolution touched ${p}: the merge holds neither parent's version`));
+		}
+	});
+});
+
+// ---- 10. close freshness --------------------------------------------------------------------------------------
 
 describe("close freshness (§ 2.4 item 4)", () => {
-	const green = (sha: string, runId = "tr-1") => ({ runId, verdict: "green" as const, sha });
-	const pr = (over: Partial<ClosePr> = {}): ClosePr => ({ number: 17, state: "OPEN", headRefName: "wl/wl-t", headSha: A, result: green(A), headCompare: null, candidateCompare: null, waivedRun: null, ...over });
-	const facts = (prs: ClosePr[], changed: string[] = ["surface/src/x.ts"], candidate = A) => ({ failure: null, branch: "wl/wl-t", candidate: { sha: candidate, changed }, prs });
+	const green = (sha: string, runId = "tr-1") => ({ runId, verdict: "green" as const, sha, mode: "full" as const, basis: null, merge: null });
+	const pr = (over: Partial<ClosePr> = {}): ClosePr => ({ number: 17, state: "OPEN", headRefName: "wl/wl-t", headSha: A, result: green(A), docMerge: null, headCompare: null, candidateCompare: null, waivedRun: null, ...over });
+	const facts = (prs: ClosePr[], changed: string[] = ["surface/src/x.ts"], candidate = A, runs: RunRecord[] = []) => ({ failure: null, branch: "wl/wl-t", candidate: { sha: candidate, changed }, prs, runs });
 	const one = (sha: string, files: string[], parents = 1): RangeCommit => ({ sha, parents, files });
 	const ahead = (...commits: RangeCommit[]) => ({ status: "ahead" as const, commits });
 	const logOnly = ahead(one(B, [".ai/decision-log/2026-10-08--1200--ilex--x.md"]));
@@ -749,7 +948,7 @@ describe("close freshness (§ 2.4 item 4)", () => {
 		const recs = testRuns([reqEntry(g), runEntry(run(g, "green")), reqEntry(r), runEntry(run(r, "red"))]);
 		const auth = authoritativeRun(recs, 17)!;
 		expect(auth.result!.verdict).toBe("red");
-		const refused = closeFreshness(facts([pr({ result: { runId: auth.result!.runId, verdict: auth.result!.verdict, sha: auth.result!.sha } })]));
+		const refused = closeFreshness(facts([pr({ result: { ...green(A), runId: auth.result!.runId, verdict: auth.result!.verdict, sha: auth.result!.sha } })]));
 		expect(refused).toEqual({ close: false, reason: "PR #17's newest test-run tr-2 is red: fix it and call lane_full_test (a waiver passes only a merged PR)" });
 		const old = request("tr-3", 17, A);
 		const newer = request("tr-4", 17, A);
@@ -757,7 +956,7 @@ describe("close freshness (§ 2.4 item 4)", () => {
 		const a2 = authoritativeRun(late, 17)!;
 		expect(a2.request.runId).toBe("tr-4");
 		expect(a2.result!.verdict).toBe("green");
-		expect(closeFreshness(facts([pr({ result: { runId: "tr-4", verdict: "green", sha: A } })])).close).toBe(true);
+		expect(closeFreshness(facts([pr({ result: green(A, "tr-4") })])).close).toBe(true);
 		expect(authoritativeRun(late, 99)).toBeNull();
 	});
 	test("no PR with a code delta refuses; an empty set with no delta closes; decision-log-only is no delta", () => {
@@ -782,8 +981,119 @@ describe("close freshness (§ 2.4 item 4)", () => {
 		expect(closeFreshness({ ...facts([pr()]), failure: "gh: HTTP 502" })).toEqual({ close: false, reason: "the close check could not answer: gh: HTTP 502" });
 		expect(closeFreshness({ ...facts([], []), failure: "git: not a repository" }).close).toBe(false);
 	});
+	// A doc-merge green tr-2 at H = A, on the basis tr-1 (a full green of PR #17 at P1 = B), merging the main state P2 = C.
+	const dmGreen = (basis = { runId: "tr-1", sha: B }) => ({ runId: "tr-2", verdict: "green" as const, sha: A, mode: "doc-merge" as const, basis, merge: { main: C, tip: D, docs: ["MIGRATION.md"] } });
+	const dmPr = (over: Partial<ClosePr> = {}): ClosePr => pr({ result: dmGreen(), docMerge: { parents: [B, C], mainOnChain: true }, ...over });
+	const basisRuns = finished("tr-1", 17, B);
+	const refuse = (why: string) => ({ close: false as const, reason: `PR #17's doc-merge green tr-2 does not hold: ${why}; call lane_full_test` });
+	test("a doc-merge green closes when its basis, its parents and the merged main hold (plan wl-mv615mkeaf1yio § 3); descent after it is unchanged", () => {
+		expect(closeFreshness(facts([dmPr()], ["surface/src/x.ts"], A, basisRuns))).toEqual({
+			close: true, why: "every PR in the set is green at its head (PR #17: doc-merge tr-2 on basis tr-1 at bbbbbbb, main ccccccc) and covers aaaaaaa",
+		});
+		const log = ahead(one(D, [".ai/decision-log/x.md"]));
+		expect(closeFreshness(facts([dmPr({ headSha: D, headCompare: log, candidateCompare: log })], ["surface/src/x.ts"], D, basisRuns))).toMatchObject({ close: true });
+		const code = ahead(one(D, ["surface/src/x.ts"]));
+		expect(closeFreshness(facts([dmPr({ headSha: D, headCompare: code })], ["surface/src/x.ts"], A, basisRuns))).toEqual({
+			close: false, reason: "PR #17's head ddddddd is not the green aaaaaaa: commit ddddddd changes surface/src/x.ts; call lane_full_test",
+		});
+	});
+	test("a doc-merge green whose basis does not resolve to a full green of the same PR on this workload refuses", () => {
+		// a forged basis id: no run tr-9 anywhere
+		expect(closeFreshness(facts([dmPr({ result: dmGreen({ runId: "tr-9", sha: B }) })], ["surface/src/x.ts"], A, basisRuns))).toEqual(refuse("its basis tr-9 is not a finished run on this workload"));
+		// a basis from another workload: tr-1 is only in that workload's records; this one's hold an unrelated green tr-5
+		const otherWorkload = finished("tr-1", 17, B);
+		expect(otherWorkload[0]!.result!.verdict).toBe("green");
+		expect(closeFreshness(facts([dmPr()], ["surface/src/x.ts"], A, finished("tr-5", 17, B)))).toEqual(refuse("its basis tr-1 is not a finished run on this workload"));
+		// a basis from another PR
+		expect(closeFreshness(facts([dmPr()], ["surface/src/x.ts"], A, finished("tr-1", 18, B)))).toEqual(refuse("its basis tr-1 is a run of PR #18"));
+		// a basis that ran at another sha than the one the green names
+		expect(closeFreshness(facts([dmPr({ result: dmGreen({ runId: "tr-1", sha: D }) })], ["surface/src/x.ts"], A, basisRuns))).toEqual(refuse("its basis tr-1 ran at bbbbbbb, not ddddddd"));
+		// a red basis, a green without a full part, a doc-merge basis
+		expect(closeFreshness(facts([dmPr()], ["surface/src/x.ts"], A, finished("tr-1", 17, B, "red")))).toEqual(refuse("its basis tr-1 is not a full green (red, mode full)"));
+		expect(closeFreshness(facts([dmPr()], ["surface/src/x.ts"], A, finished("tr-1", 17, B, "green", { full: null })))).toEqual(refuse("its basis tr-1 is not a full green (green, mode full)"));
+		const reduced = { full: null, mode: "doc-merge" as const, basis: { runId: "tr-0", sha: D }, merge: { main: C, tip: C, docs: [] } };
+		expect(closeFreshness(facts([dmPr()], ["surface/src/x.ts"], A, finished("tr-1", 17, B, "green", reduced)))).toEqual(refuse("its basis tr-1 is not a full green (green, mode doc-merge)"));
+	});
+	test("a doc-merge green whose re-read parents are not exactly basis.sha and merge.main, or whose merged main is off origin's first-parent chain, refuses", () => {
+		const parents = (p: string[]) => closeFreshness(facts([dmPr({ docMerge: { parents: p, mainOnChain: true } })], ["surface/src/x.ts"], A, basisRuns));
+		expect(parents([C, B])).toEqual(refuse("aaaaaaa's parents are ccccccc bbbbbbb, not the basis bbbbbbb and main ccccccc"));
+		expect(parents([B, D])).toEqual(refuse("aaaaaaa's parents are bbbbbbb ddddddd, not the basis bbbbbbb and main ccccccc"));
+		expect(parents([B])).toEqual(refuse("aaaaaaa's parents are bbbbbbb, not the basis bbbbbbb and main ccccccc"));
+		expect(parents([B, C, D])).toEqual(refuse("aaaaaaa's parents are bbbbbbb ccccccc ddddddd, not the basis bbbbbbb and main ccccccc"));
+		expect(closeFreshness(facts([dmPr({ docMerge: { parents: [B, C], mainOnChain: false } })], ["surface/src/x.ts"], A, basisRuns))).toEqual(refuse("the merged main ccccccc is not on origin's first-parent chain"));
+		expect(closeFreshness(facts([dmPr({ docMerge: null })], ["surface/src/x.ts"], A, basisRuns))).toEqual(refuse("the merge aaaaaaa was not re-read"));
+	});
+	// A batch tr-b1 of PRs #17 at B and #18 at C onto M0, green with final tree T9; landed as L1 = merge(M0, B), L2 = merge(L1, C) with tree T9.
+	const M0 = "0".repeat(40);
+	const [L1, L2, T8, T9, E] = ["1", "2", "8", "9", "e"].map((c) => c.repeat(40)) as [string, string, string, string, string];
+	const credit = (over: Partial<CloseCredit> = {}): CloseCredit => ({
+		runId: "tr-b1", pr: 17, sha: B, base: M0, step: 1, n: 2, finalTree: T9,
+		batch: { verdict: "green", prs: [{ pr: 17, sha: B }, { pr: 18, sha: C }], finalTree: T9 },
+		landed: [{ sha: L1, parents: [M0, B], tree: T8 }, { sha: L2, parents: [L1, C], tree: T9 }], candidateCompare: null, ...over,
+	});
+	const merged = (over: Partial<ClosePr> = {}) => pr({ state: "MERGED", headSha: B, result: null, credits: [credit()], ...over });
+	const refuseCredit = (why: string) => ({ close: false as const, reason: `PR #17 has no test-run result: call lane_full_test; its batch credit tr-b1 does not hold: ${why}` });
+	test("a merged PR with no green of its own closes on a batch credit that landed (plan wl-mv615mkeaf1yio § 4); the candidate is covered at the credited sha or past it by decision-log only", () => {
+		expect(closeFreshness(facts([merged()], ["surface/src/x.ts"], B))).toEqual({
+			close: true, why: "every PR in the set is green at its head (PR #17: batch tr-b1 green at bbbbbbb, step 1 of 2 onto 0000000, landed) and covers bbbbbbb",
+		});
+		// a red own run is replaced by the credit the same way
+		expect(closeFreshness(facts([merged({ result: { ...green(B), verdict: "red" } })], ["surface/src/x.ts"], B)).close).toBe(true);
+		const log = ahead(one(E, [".ai/decision-log/x.md"]));
+		expect(closeFreshness(facts([merged({ credits: [credit({ candidateCompare: log })] })], ["surface/src/x.ts"], E)).close).toBe(true);
+		expect(closeFreshness(facts([merged({ credits: [credit({ candidateCompare: ahead(one(E, ["surface/src/x.ts"])) })] })], ["surface/src/x.ts"], E))).toEqual({
+			close: false, reason: "local wl/wl-t has untested commit eeeeeee",
+		});
+	});
+	test("a credit refuses when the PR is open, when the batch did not land as tested, or when it does not credit this PR at its merged head", () => {
+		expect(closeFreshness(facts([merged({ state: "OPEN" })], ["surface/src/x.ts"], B))).toEqual({
+			close: false, reason: "PR #17 has no test-run result: call lane_full_test (its batch credit tr-b1 counts only once the PR is merged)",
+		});
+		expect(closeFreshness(facts([merged({ credits: [credit({ landed: [] })] })], ["surface/src/x.ts"], B))).toEqual(
+			refuseCredit("the batch did not land: origin's first-parent chain has 0 commit(s) after its base 0000000, not 2"),
+		);
+		// the PRs landed in another order
+		const swapped = [{ sha: L1, parents: [M0, C], tree: T8 }, { sha: L2, parents: [L1, B], tree: T9 }];
+		expect(closeFreshness(facts([merged({ credits: [credit({ landed: swapped })] })], ["surface/src/x.ts"], B))).toEqual(
+			refuseCredit("the batch did not land: 1111111, commit 1 after 0000000 on origin's first-parent chain, is not the merge of PR #17 at bbbbbbb onto 0000000"),
+		);
+		// landed with a tree the suite never ran
+		const otherTree = [{ sha: L1, parents: [M0, B], tree: T8 }, { sha: L2, parents: [L1, C], tree: T8 }];
+		expect(closeFreshness(facts([merged({ credits: [credit({ landed: otherTree })] })], ["surface/src/x.ts"], B))).toEqual(
+			refuseCredit("the batch did not land: 2222222's tree 8888888 is not the tested final tree 9999999"),
+		);
+		expect(closeFreshness(facts([merged({ credits: [credit({ batch: null })] })], ["surface/src/x.ts"], B))).toEqual(refuseCredit("its batch tr-b1 has no test-batch-run row"));
+		expect(closeFreshness(facts([merged({ credits: [credit({ batch: { verdict: "red", prs: [{ pr: 17, sha: B }, { pr: 18, sha: C }], finalTree: T9 } })] })], ["surface/src/x.ts"], B))).toEqual(
+			refuseCredit("its batch tr-b1 is red"),
+		);
+		expect(closeFreshness(facts([merged({ credits: [credit({ step: 2 })] })], ["surface/src/x.ts"], B))).toEqual(refuseCredit("its batch tr-b1 does not list PR #17 at bbbbbbb as step 2 of 2"));
+		expect(closeFreshness(facts([merged({ credits: [credit({ finalTree: T8 })] })], ["surface/src/x.ts"], B))).toEqual(refuseCredit("its batch tr-b1's final tree is not the credited 8888888"));
+		expect(closeFreshness(facts([merged({ headSha: E })], ["surface/src/x.ts"], B))).toEqual(refuseCredit("it credits bbbbbbb, not the merged head eeeeeee"));
+		expect(closeFreshness(facts([merged({ credits: [] })], ["surface/src/x.ts"], B))).toEqual({ close: false, reason: "PR #17 has no test-run result: call lane_full_test" });
+	});
+	test("every credit at the merged head is read: a newer credit that did not land never shadows an older one that did; with none holding, the newest one's fault is named (review r1 finding 2)", () => {
+		const landedOld = credit({ runId: "tr-old" });
+		const unlanded = credit({ runId: "tr-new", landed: [] });
+		expect(closeFreshness(facts([merged({ credits: [landedOld, unlanded] })], ["surface/src/x.ts"], B))).toEqual({
+			close: true, why: "every PR in the set is green at its head (PR #17: batch tr-old green at bbbbbbb, step 1 of 2 onto 0000000, landed) and covers bbbbbbb",
+		});
+		// the order does not matter: an older credit that did not land beside a newer one that did
+		expect(closeFreshness(facts([merged({ credits: [unlanded, credit({ runId: "tr-newer" })] })], ["surface/src/x.ts"], B)).close).toBe(true);
+		// the candidate is covered through any credit that holds
+		const log = ahead(one(E, [".ai/decision-log/x.md"]));
+		expect(closeFreshness(facts([merged({ credits: [credit({ runId: "tr-old", candidateCompare: log }), credit({ runId: "tr-new", landed: [], candidateCompare: log })] })], ["surface/src/x.ts"], E)).close).toBe(true);
+		// none holds: the refusal names the newest credit and its own fault
+		expect(closeFreshness(facts([merged({ credits: [credit({ runId: "tr-old", batch: null }), unlanded] })], ["surface/src/x.ts"], B))).toEqual({
+			close: false,
+			reason: "PR #17 has no test-run result: call lane_full_test; its batch credit tr-new does not hold: the batch did not land: origin's first-parent chain has 0 commit(s) after its base 0000000, not 2",
+		});
+		// an open PR still never passes on one, naming the newest
+		expect(closeFreshness(facts([merged({ state: "OPEN", credits: [landedOld, unlanded] })], ["surface/src/x.ts"], B))).toEqual({
+			close: false, reason: "PR #17 has no test-run result: call lane_full_test (its batch credit tr-new counts only once the PR is merged)",
+		});
+	});
 	test("PLAN wl-mv5i3lulwwbbi8 D3: a merged PR passes on Jo's waiver of its authoritative red at its head; an older run, another sha or an open PR do not", () => {
-		const red = (sha: string, runId = "tr-2") => ({ runId, verdict: "red" as const, sha });
+		const red = (sha: string, runId = "tr-2") => ({ ...green(sha, runId), verdict: "red" as const });
 		// Tinker's shape: merged, red at the merged head, that run waived, no code delta on the candidate
 		expect(closeFreshness(facts([pr({ state: "MERGED", result: red(A), waivedRun: "tr-2" })], []))).toEqual({
 			close: true, why: "every PR in the set is green at its head or merged with a waived run (#17 (tr-2))",

@@ -12,6 +12,7 @@
 // - the junit report (Bun's `--reporter=junit`) and the console log beside it, read into a part result;
 // - the changed-test-file filter on Bun's discovery names;
 // - the verdict and settle decision, ownership, liveness, the starter's reservation, retention;
+// - the doc-only main-merge rule (plan wl-mv615mkeaf1yio § 3): the doc list and the decision over the trusted clone's facts;
 // - the bound-branch rule for a PR, and the close-freshness decision over compare results;
 // - the untrusted child's environment, its git shim and gitconfig, and the wrapper's argv contract.
 import { dirname, join } from "node:path";
@@ -80,7 +81,7 @@ export interface TestRunnerConfig {
 	queueMaxMin: number;
 }
 /** The plan's defaults (§ 2.2 step 4, § 2.3 steps 1 and 3), used for a key the block leaves out. */
-export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 60 };
+export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 360 };
 
 /**
  * The `testRunner:` block of a parsed profile config (`Bun.YAML.parse` of profile/config.yml). No
@@ -214,6 +215,19 @@ export interface Failure {
 	/** The whole first non-empty line of its error. */
 	firstError: string;
 }
+/** How a run was tested: the full suite plus the changed test files alone, or the changed test files alone on a doc-only main merge (plan wl-mv615mkeaf1yio § 3). */
+export type RunMode = "full" | "doc-merge";
+/** The green a doc-merge run stands on: a mode-full green of the same PR at the merge's first parent. */
+export interface RunBasis {
+	runId: string;
+	sha: string;
+}
+/** The merge a doc-merge run certified: the main state it merged (H's second parent), origin/main as fetched, and the doc paths the resolution touched. */
+export interface MergeRecord {
+	main: string;
+	tip: string;
+	docs: string[];
+}
 export interface TestRun {
 	runId: string;
 	verdict: TestVerdict;
@@ -232,6 +246,12 @@ export interface TestRun {
 	runDir: string | null;
 	/** The preflight's summary (§ 3.1), null when it never ran. */
 	preflight: string | null;
+	/** `full`, or `doc-merge`; a row written before modes existed parses as `full`. */
+	mode: RunMode;
+	/** Set exactly when mode is `doc-merge`. */
+	basis: RunBasis | null;
+	/** Set exactly when mode is `doc-merge`. */
+	merge: MergeRecord | null;
 }
 
 const nat = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
@@ -258,6 +278,27 @@ function failureOf(v: unknown): Failure | null {
 	if (typeof f.part !== "string" || typeof f.name !== "string" || typeof f.firstError !== "string") return null;
 	return { part: f.part, name: f.name, firstError: f.firstError };
 }
+function basisOf(v: unknown): RunBasis | null {
+	if (v === null || typeof v !== "object") return null;
+	const b = v as Record<string, unknown>;
+	return isRunId(b.runId) && isSha(b.sha) ? { runId: b.runId, sha: b.sha } : null;
+}
+function mergeOf(v: unknown): MergeRecord | null {
+	if (v === null || typeof v !== "object") return null;
+	const m = v as Record<string, unknown>;
+	if (!isSha(m.main) || !isSha(m.tip) || !Array.isArray(m.docs) || !m.docs.every((d) => typeof d === "string" && d !== "")) return null;
+	return { main: m.main, tip: m.tip, docs: [...(m.docs as string[])] };
+}
+/** mode, basis and merge from untrusted fields: an absent mode is `full` (a row from before modes); `full` carries neither basis nor merge, `doc-merge` both. */
+function modeOf(v: Record<string, unknown>): Pick<TestRun, "mode" | "basis" | "merge"> | null {
+	if (v.mode === undefined || v.mode === "full") {
+		return (v.basis === undefined || v.basis === null) && (v.merge === undefined || v.merge === null) ? { mode: "full", basis: null, merge: null } : null;
+	}
+	if (v.mode !== "doc-merge") return null;
+	const basis = basisOf(v.basis);
+	const merge = mergeOf(v.merge);
+	return basis && merge ? { mode: "doc-merge", basis, merge } : null;
+}
 
 /** The canonical TestRun built from untrusted fields, or null: the one shape both the formatter and the parser accept. */
 function canonicalRun(head: { runId: unknown; verdict: unknown; sha: unknown; pr: unknown }, v: Record<string, unknown>): TestRun | null {
@@ -271,23 +312,25 @@ function canonicalRun(head: { runId: unknown; verdict: unknown; sha: unknown; pr
 	const solo = v.solo.map(soloOf);
 	const failures = v.failures.map(failureOf);
 	if (solo.some((s) => s === null) || failures.some((f) => f === null)) return null;
+	const mode = modeOf(v);
+	if (mode === null) return null;
 	return {
 		runId: head.runId, verdict: head.verdict as TestVerdict, sha: head.sha, pr: head.pr, reason: v.reason, headAtEnd: v.headAtEnd,
-		base: v.base, mergeBase: v.mergeBase, full, solo: solo as SoloCounts[], failures: failures as Failure[], runDir: v.runDir, preflight: v.preflight,
+		base: v.base, mergeBase: v.mergeBase, full, solo: solo as SoloCounts[], failures: failures as Failure[], runDir: v.runDir, preflight: v.preflight, ...mode,
 	};
 }
 
 /**
  * `test-run: <run id> <verdict> sha=<sha> pr=<N> {json}` (§ 2.3 step 6). The json repeats sha and pr
- * and carries reason, headAtEnd, base, mergeBase, full, solo, failures (every one), runDir and
- * preflight, on one line. The same object goes to `result.json`.
+ * and carries reason, headAtEnd, base, mergeBase, full, solo, failures (every one), runDir,
+ * preflight and mode, plus basis and merge on a doc-merge run, on one line. The same object goes to `result.json`.
  */
 export function testRunBody(run: TestRun): string {
 	const c = canonicalRun(run, run as unknown as Record<string, unknown>);
 	need(c !== null, `test-run ${run.runId} does not have the shape its body carries`);
 	const json = JSON.stringify({
 		sha: c!.sha, pr: c!.pr, reason: c!.reason, headAtEnd: c!.headAtEnd, base: c!.base, mergeBase: c!.mergeBase, full: c!.full, solo: c!.solo,
-		failures: c!.failures, runDir: c!.runDir, preflight: c!.preflight,
+		failures: c!.failures, runDir: c!.runDir, preflight: c!.preflight, mode: c!.mode, ...(c!.mode === "doc-merge" ? { basis: c!.basis, merge: c!.merge } : {}),
 	});
 	return `${TEST_RUN_PREFIX} ${c!.runId} ${c!.verdict} sha=${c!.sha} pr=${c!.pr} ${json}`;
 }
@@ -317,7 +360,7 @@ export function resultJson(run: TestRun): string {
 export function runnerDiedRun(request: TestRequested, runDir: string | null = null): TestRun {
 	return {
 		runId: request.runId, verdict: "error", sha: request.sha, pr: request.pr, reason: "runner died", headAtEnd: null, base: null, mergeBase: null,
-		full: null, solo: [], failures: [], runDir, preflight: null,
+		full: null, solo: [], failures: [], runDir, preflight: null, mode: "full", basis: null, merge: null,
 	};
 }
 
@@ -496,9 +539,75 @@ export function reservation(
 	return { ok: true, settleDead };
 }
 
-/** A run that has waited for the lock past `queueMaxMin` ends `error queued too long` (§ 2.3 step 1). */
-export function queuedTooLong(waitStartMs: number, nowMs: number, config: Pick<TestRunnerConfig, "queueMaxMin">): boolean {
-	return nowMs - waitStartMs > config.queueMaxMin * 60_000;
+/** A queued single run reads its PR's state at most this often while it waits for the lock (Jo, in-mv9340e04pgbnk). */
+export const PR_CHECK_EVERY_MS = 300_000;
+
+/** What a run waiting for the lock does at one poll: keep waiting, end `superseded` (its PR is gone), or end at the backstop. */
+export type QueueWait = { act: "wait" } | { act: "superseded"; reason: string } | { act: "backstop"; reason: string };
+
+/**
+ * Jo's queue drop rule (in-mv92rsb78t4em8, in-mv9340e04pgbnk): a waiting run is dropped only when it is
+ * superseded, or past the `queueMaxMin` backstop (6 h by default). Superseded here is its PR read as
+ * MERGED or CLOSED (`superseded`, which settles nothing and is not re-requested); a newer request for
+ * the same slice is the runner's `stillWanted` check, before this. An unread state (`null`: not read
+ * yet, no PR to watch, or gh did not answer) never drops a run. The backstop's `error` is re-requested
+ * by the runner itself for a single run (`backstopReason`). Queue order stays first come, first served.
+ */
+export function queueWaitDecision(o: { waitedMs: number; pr: number | null; prState: string | null; config: Pick<TestRunnerConfig, "queueMaxMin"> }): QueueWait {
+	if (o.pr !== null && (o.prState === "MERGED" || o.prState === "CLOSED")) return { act: "superseded", reason: `PR #${o.pr} is ${o.prState}` };
+	if (o.waitedMs > o.config.queueMaxMin * 60_000) return { act: "backstop", reason: backstopReason(o.config.queueMaxMin, null) };
+	return { act: "wait" };
+}
+
+/**
+ * The backstop's `error` reason: `queued past the <N> min backstop`, then `; re-requested as <run id>`
+ * when the runner re-requested the run, or `; re-request refused: <why>` when it could not. A batch or
+ * an attribution is never re-requested and carries the bare form.
+ */
+export function backstopReason(queueMaxMin: number, rerequest: { runId: string } | { refused: string } | null): string {
+	const base = `queued past the ${queueMaxMin} min backstop`;
+	if (rerequest === null) return base;
+	return "runId" in rerequest ? `${base}; re-requested as ${rerequest.runId}` : `${base}; re-request refused: ${rerequest.refused}`;
+}
+
+const REREQUESTED_RE = /^queued past the \S+ min backstop; re-requested as (tr-[a-z0-9]+)$/;
+
+/** The run id a backstopped run's reason names as its re-request, or null for any other reason. */
+export function rerequestedAs(reason: string | null): string | null {
+	return reason === null ? null : (REREQUESTED_RE.exec(reason)?.[1] ?? null);
+}
+
+const PR_GONE_RE = /^PR #([1-9]\d*) is (MERGED|CLOSED)(?:;|$)/;
+
+/** A queued run superseded because its PR was merged or closed: the PR and the state its reason names, else null. */
+export function prGoneOf(reason: string | null): { pr: number; state: "MERGED" | "CLOSED" } | null {
+	const m = reason === null ? null : PR_GONE_RE.exec(reason);
+	return m ? { pr: Number(m[1]), state: m[2] as "MERGED" | "CLOSED" } : null;
+}
+
+/** One row of runs.db's `queue`: a starter's admission. `seq` is the request order (the order admissions committed in). */
+export interface Admission {
+	seq: number;
+	runId: string;
+	admittedAt: number;
+}
+
+/**
+ * The lock queue's decision (plan wl-mv615mkeaf1yio § 2): the head is the live admission with the
+ * smallest `seq`, never the smallest run id. An admission is live by `runLive` over its heartbeat
+ * file: under 60 s old, or none yet and admitted under 120 s ago. Every admission that is not live is
+ * dead, for the transaction that read them to delete. An empty queue, or one of dead rows only, has no head.
+ */
+export function queueHead(
+	admissions: readonly Admission[], heartbeatOf: (runId: string) => number | null, nowMs: number,
+): { head: Admission | null; dead: Admission[] } {
+	let head: Admission | null = null;
+	const dead: Admission[] = [];
+	for (const a of [...admissions].sort((x, y) => x.seq - y.seq)) {
+		if (!runLive({ settled: false, requestedAtMs: a.admittedAt, heartbeatAtMs: heartbeatOf(a.runId) }, nowMs)) dead.push(a);
+		else head ??= a;
+	}
+	return { head, dead };
 }
 
 // ---- the full-suite slice ------------------------------------------------------------------------
@@ -911,6 +1020,95 @@ export function partResult(p: PartInput): PartResult {
 	return { ...counts, ...base, error: null, failures };
 }
 
+// ---- the doc-only main-merge rule (plan wl-mv615mkeaf1yio § 3) ---------------------------------------
+
+/**
+ * Jo's doc list: the paths a main merge's resolution may change while the run still skips the full
+ * suite. Exactly these root files, plus the decision-log prefix. The runner runs from Jo's checkout,
+ * so a PR that edits this constant changes nothing until Jo merges it; nothing from a PR tree or a
+ * lane is read for the list. Widening it is Jo's call.
+ */
+export const DOC_MERGE_DOCS: { readonly files: readonly string[]; readonly prefixes: readonly string[] } = {
+	files: ["MIGRATION.md", "USER-GUIDE.md"],
+	prefixes: [DECISION_LOG_DIR],
+};
+
+/** The five `git diff --no-renames --name-only -z` lists over a merge H of P1 and P2 whose single merge base is B. */
+export interface MergeDiffs {
+	/** B..P1 */
+	baseP1: readonly string[];
+	/** B..P2 */
+	baseP2: readonly string[];
+	/** P1..P2 */
+	p1p2: readonly string[];
+	/** P1..H */
+	p1h: readonly string[];
+	/** P2..H */
+	p2h: readonly string[];
+}
+
+/** What the runner reads for the rule from its own fetched clone. A field after the one that already decides is null: it was not read. */
+export interface MergeFacts {
+	/** H's parents in order, from `git rev-list --parents -n1 H`. */
+	parents: readonly string[];
+	/** `refs/remotes/origin/main` as fetched in this run. */
+	tip: string;
+	/** H's second parent is in `git rev-list --first-parent origin/main`; null unless H has two parents. */
+	mainOnChain: boolean | null;
+	/** `git merge-base --all P1 P2`; null unless H has two parents. */
+	mergeBases: readonly string[] | null;
+	/** Read only when there is exactly one merge base. */
+	diffs: MergeDiffs | null;
+}
+
+export type MergeDecision = { mode: "doc-merge"; basis: RunBasis; merge: MergeRecord } | { mode: "full"; reason: string };
+
+/**
+ * Every path the merge resolution did not take trivially from one side, with why, sorted. A path
+ * fails when it changed on both sides to different content (B..P1, B..P2 and P1..P2); when H holds
+ * neither parent's version (P1..H and P2..H); or when H dropped the one side that changed it (B..P1
+ * only, yet P1..H; B..P2 only, yet P2..H).
+ */
+function resolutionTouched(d: MergeDiffs): { path: string; why: string }[] {
+	const [bp1, bp2, p1p2, p1h, p2h] = [d.baseP1, d.baseP2, d.p1p2, d.p1h, d.p2h].map((l) => new Set(l)) as [Set<string>, Set<string>, Set<string>, Set<string>, Set<string>];
+	const out: { path: string; why: string }[] = [];
+	for (const path of [...new Set([...bp1, ...bp2, ...p1p2, ...p1h, ...p2h])].sort()) {
+		const why = bp1.has(path) && bp2.has(path) && p1p2.has(path) ? "both sides changed it to different content"
+			: p1h.has(path) && p2h.has(path) ? "the merge holds neither parent's version"
+			: bp1.has(path) && !bp2.has(path) && p1h.has(path) ? "the merge dropped the branch's change, the only side that changed it"
+			: bp2.has(path) && !bp1.has(path) && p2h.has(path) ? "the merge dropped main's change, the only side that changed it"
+			: null;
+		if (why !== null) out.push({ path, why });
+	}
+	return out;
+}
+
+/**
+ * The doc-only main-merge rule (plan wl-mv615mkeaf1yio § 3), decided in the trusted phase over the
+ * facts the runner read from its own clone and the workload's runner records. A run of PR `pr` at
+ * H is a doc-merge run, the changed test files alone and no full suite, only when H has exactly two
+ * parents P1 and P2 and: (1) the newest run of this PR on this workload at P1 is a green with a
+ * full part and mode `full` (a doc-merge green never counts); (2) P2 is on origin/main's
+ * first-parent chain; (3) P1 and P2 have a single merge base; (4) every path the resolution did not
+ * take trivially from one side is on the doc list. Anything else runs the full suite, with the reason.
+ */
+export function docMergeDecision(f: MergeFacts, records: readonly RunRecord[], pr: number): MergeDecision {
+	if (f.parents.length !== 2) return { mode: "full", reason: `the head has ${f.parents.length} parent(s), not 2` };
+	const [p1, p2] = f.parents as [string, string];
+	const newest = records.filter((r) => r.request.pr === pr && r.request.sha === p1).at(-1);
+	if (newest === undefined) return { mode: "full", reason: `PR #${pr} has no run at the first parent ${sha7(p1)}` };
+	const g = newest.result;
+	if (g === null || g.verdict !== "green") return { mode: "full", reason: `the newest run at the first parent ${sha7(p1)}, ${newest.request.runId}, is ${g?.verdict ?? "unfinished"}` };
+	if (g.mode !== "full" || g.full === null) return { mode: "full", reason: `the newest run at the first parent ${sha7(p1)}, ${g.runId}, is a ${g.mode} green without a full part` };
+	if (f.mainOnChain !== true) return { mode: "full", reason: `the second parent ${sha7(p2)} is not on origin/main's first-parent chain` };
+	if (f.mergeBases === null || f.mergeBases.length !== 1) return { mode: "full", reason: `the parents have ${f.mergeBases?.length ?? "unknown"} merge bases, not 1` };
+	if (f.diffs === null) return { mode: "full", reason: "the merge's diffs were not read" };
+	const touched = resolutionTouched(f.diffs);
+	const code = touched.find((t) => !DOC_MERGE_DOCS.files.includes(t.path) && !DOC_MERGE_DOCS.prefixes.some((p) => t.path.startsWith(p)));
+	if (code !== undefined) return { mode: "full", reason: `the merge resolution touched ${code.path}: ${code.why}` };
+	return { mode: "doc-merge", basis: { runId: g.runId, sha: p1 }, merge: { main: p2, tip: f.tip, docs: touched.map((t) => t.path) } };
+}
+
 // ---- verdict and settle ----------------------------------------------------------------------------
 
 export interface RunFacts {
@@ -930,6 +1128,12 @@ export interface RunFacts {
 	owner: boolean;
 	/** The slice's state read in the write transaction; null when it is gone. */
 	sliceState: SliceState | null;
+	/** The trusted phase's docMergeDecision; `full` until it decides otherwise. */
+	mode: RunMode;
+	/** Set with mode `doc-merge`. */
+	basis: RunBasis | null;
+	/** Set with mode `doc-merge`. */
+	merge: MergeRecord | null;
 }
 export interface RunDecision {
 	/** What the entry records: `superseded` for a run that lost ownership. */
@@ -944,9 +1148,10 @@ export interface RunDecision {
 /**
  * The verdict (§ 2.3 step 6, § 2.4) and whether to settle (§ 2.2 step 5, § 2.3 step 7), in this order:
  * a fetched head that is not the requested sha is `stale` before any test; a run-level failure is
- * `error`; a head that moved by the end is `stale` whatever the counts; any failing test in any
- * part is `red` (a solo failure with the suite green included); a part that errored is `error`;
- * otherwise `green`. A run that does not own its request records `superseded` and settles nothing.
+ * `error`; a run with no full part is `error` unless it is a doc-merge run with a basis (plan
+ * wl-mv615mkeaf1yio § 3); a head that moved by the end is `stale` whatever the counts; any failing
+ * test in any part is `red` (a solo failure with the suite green included); a part that errored is
+ * `error`; otherwise `green`. A run that does not own its request records `superseded` and settles nothing.
  */
 export function decideRun(f: RunFacts): RunDecision {
 	const outcome = ((): { outcome: RunDecision["outcome"]; reason: string | null } => {
@@ -955,14 +1160,14 @@ export function decideRun(f: RunFacts): RunDecision {
 		}
 		if (f.error !== null) return { outcome: "error", reason: f.error };
 		if (f.fetchedSha === null) return { outcome: "error", reason: "the PR head was never fetched" };
-		if (f.full === null) return { outcome: "error", reason: "the full suite did not run" };
+		if (f.full === null && !(f.mode === "doc-merge" && f.basis !== null)) return { outcome: "error", reason: "the full suite did not run" };
 		if (f.headAtEnd === null) return { outcome: "error", reason: "the PR head could not be re-read at the end" };
 		if (f.headAtStart !== f.requestedSha || f.headAtEnd !== f.headAtStart) {
 			return { outcome: "stale", reason: `the PR head moved to ${sha7(f.headAtEnd)} during the run of ${sha7(f.requestedSha)}` };
 		}
-		const parts = [f.full, ...f.solo];
-		if (parts.some((p) => p.fail > 0)) return { outcome: "red", reason: null };
-		const broken = [{ p: f.full, label: "full" }, ...f.solo.map((s) => ({ p: s, label: s.file }))].find(({ p }) => p.error !== null || p.exit !== 0);
+		const parts = [...(f.full ? [{ p: f.full, label: "full" }] : []), ...f.solo.map((s) => ({ p: s, label: s.file }))];
+		if (parts.some(({ p }) => p.fail > 0)) return { outcome: "red", reason: null };
+		const broken = parts.find(({ p }) => p.error !== null || p.exit !== 0);
 		if (broken) return { outcome: "error", reason: `${broken.label}: ${broken.p.error ?? `exit ${broken.p.exit}`}` };
 		return { outcome: "green", reason: null };
 	})();
@@ -990,7 +1195,7 @@ export function buildTestRun(
 		base: extra.base, mergeBase: extra.mergeBase,
 		full: facts.full ? { pass: facts.full.pass, fail: facts.full.fail, skip: facts.full.skip, exit: facts.full.exit, ms: facts.full.ms, error: facts.full.error } : null,
 		solo: facts.solo.map((s) => ({ file: s.file, pass: s.pass, fail: s.fail, skip: s.skip, exit: s.exit, ms: s.ms, error: s.error })),
-		failures: failuresOf(facts.full, facts.solo), runDir: extra.runDir, preflight: extra.preflight,
+		failures: failuresOf(facts.full, facts.solo), runDir: extra.runDir, preflight: extra.preflight, mode: facts.mode, basis: facts.basis, merge: facts.merge,
 	};
 }
 
@@ -999,18 +1204,25 @@ export function notifiesOrchestrator(verdict: TestVerdict, heldLive: boolean): b
 	return verdict !== "green" && verdict !== "superseded" && !heldLive;
 }
 
-/** The artifact a settled slice carries (§ 2.3 step 7). */
+/** The artifact a settled slice carries (§ 2.3 step 7); a doc-merge green names its basis in place of the full counts (plan wl-mv615mkeaf1yio § 3). */
 export function settleArtifact(run: TestRun): string {
-	need(run.verdict === "green" && run.full !== null, `test-run ${run.runId} is not a green with a full part`);
+	const docMerge = run.mode === "doc-merge" && run.basis !== null;
+	need(run.verdict === "green" && (run.full !== null || docMerge), `test-run ${run.runId} is not a green with a full part or a doc-merge basis`);
+	const tested = docMerge ? `doc-merge on basis ${run.basis!.runId} at ${run.basis!.sha}` : `full ${run.full!.pass}/${run.full!.fail}/${run.full!.skip}`;
 	const alone = run.solo.length === 0 ? "none" : run.solo.map((s) => `${s.file} ${s.pass}/${s.fail}`).join(", ");
-	return `test-run ${run.runId}: green at ${run.sha} on PR #${run.pr}; full ${run.full!.pass}/${run.full!.fail}/${run.full!.skip}; alone: ${alone}; ${run.runDir ?? "no run dir"}`;
+	return `test-run ${run.runId}: green at ${run.sha} on PR #${run.pr}; ${tested}; alone: ${alone}; ${run.runDir ?? "no run dir"}`;
 }
 
 // ---- retention -------------------------------------------------------------------------------------
 
-/** The runs to prune (§ 2.3 step 9): all but the newest `keep`, oldest first; order by start time, then id. */
-export function pruneRuns(runs: readonly { id: string; at: number }[], keep: number = KEEP_RUNS): string[] {
-	const sorted = [...runs].sort((a, b) => a.at - b.at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+/**
+ * The runs to prune (§ 2.3 step 9): all but the newest `keep`, oldest first; order by start time, then id.
+ * A run with a live row in the runs.db queue (admitted, not yet ended) is never pruned and does not
+ * count toward `keep`: a batch's attribution run waits there on the bundle its batch hard-linked into
+ * its stage dir (plan wl-mv615mkeaf1yio § 4).
+ */
+export function pruneRuns(runs: readonly { id: string; at: number }[], keep: number = KEEP_RUNS, liveQueued: ReadonlySet<string> = new Set()): string[] {
+	const sorted = [...runs].filter((r) => !liveQueued.has(r.id)).sort((a, b) => a.at - b.at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 	return sorted.slice(0, Math.max(0, sorted.length - Math.max(0, keep))).map((r) => r.id);
 }
 
@@ -1065,7 +1277,13 @@ export interface ClosePr {
 	/** The PR's head; a merged PR's final head. */
 	headSha: string;
 	/** The authoritative result (authoritativeRun(...).result), or null. */
-	result: { runId: string; verdict: TestVerdict; sha: string } | null;
+	result: Pick<TestRun, "runId" | "verdict" | "sha" | "mode" | "basis" | "merge"> | null;
+	/**
+	 * For a doc-merge green on a PR that is not closed, re-read at the close (plan wl-mv615mkeaf1yio
+	 * § 3): the green sha's parents (`git rev-list --parents -n1`), and whether `merge.main` is on
+	 * origin's default branch's first-parent chain. Null otherwise.
+	 */
+	docMerge: { parents: readonly string[]; mainOnChain: boolean } | null;
 	/** Compare from result.sha to headSha; null when there is no result or the two are equal. */
 	headCompare: CompareResult | null;
 	/** For a PR from the workload's branch: compare from result.sha to the candidate; null otherwise. */
@@ -1076,6 +1294,30 @@ export interface ClosePr {
 	 * its non-green result while it was the newest request on that slice; else null. Only a merged PR at that run's sha passes on it.
 	 */
 	waivedRun: string | null;
+	/**
+	 * A merged PR's batch credits (plan wl-mv615mkeaf1yio § 4), read at the close, oldest first: every
+	 * `test-batch-credit:` on this workload for this PR at its merged head, each with its batch's own
+	 * `test-batch-run:` row and origin's first-parent chain after its base. Absent or empty when the
+	 * PR is not merged or carries no credit at its head.
+	 */
+	credits?: readonly CloseCredit[];
+}
+/** One batch credit as the close check reads it. */
+export interface CloseCredit {
+	runId: string;
+	pr: number;
+	sha: string;
+	/** M0. */
+	base: string;
+	step: number;
+	n: number;
+	finalTree: string;
+	/** The batch's `test-batch-run:` row, found by run id across the ledger; null when none parses. */
+	batch: { verdict: string; prs: readonly { pr: number; sha: string }[]; finalTree: string | null } | null;
+	/** Up to n commits directly after `base` on origin's default branch's first-parent chain, oldest first. */
+	landed: readonly { sha: string; parents: readonly string[]; tree: string }[];
+	/** For a PR from the workload's branch: compare from the credited sha to the candidate; null otherwise. */
+	candidateCompare: CompareResult | null;
 }
 export interface CloseFacts {
 	/** Why git or gh could not answer, or null. Any failure refuses (fails closed). */
@@ -1086,16 +1328,105 @@ export interface CloseFacts {
 	candidate: { sha: string; changed: readonly string[] };
 	/** The PR set: every PR from the branch, from a `push-dest:` branch, or named by a `test-requested:`, in any state. */
 	prs: readonly ClosePr[];
+	/** The workload's own runner records (testRuns of its entries), where a doc-merge green's basis must resolve. */
+	runs: readonly RunRecord[];
 }
 export type CloseDecision = { close: true; why: string } | { close: false; reason: string };
 
 /**
+ * Why a doc-merge green does not hold at the close (plan wl-mv615mkeaf1yio § 3), or null when it
+ * does: its basis resolves in this workload's runs to a green, mode-full run of the same PR at
+ * basis.sha; the green sha's parents are exactly basis.sha and merge.main, in that order; and
+ * merge.main is on origin's first-parent chain.
+ */
+function docMergeFault(pr: ClosePr, r: NonNullable<ClosePr["result"]>, runs: readonly RunRecord[]): string | null {
+	if (r.basis === null || r.merge === null) return "it names no basis or merge";
+	const { runId, sha } = r.basis;
+	const basis = runs.find((x) => x.request.runId === runId)?.result ?? null;
+	if (basis === null) return `its basis ${runId} is not a finished run on this workload`;
+	if (basis.pr !== pr.number) return `its basis ${runId} is a run of PR #${basis.pr}`;
+	if (basis.sha !== sha) return `its basis ${runId} ran at ${sha7(basis.sha)}, not ${sha7(sha)}`;
+	if (basis.verdict !== "green" || basis.mode !== "full" || basis.full === null) return `its basis ${runId} is not a full green (${basis.verdict}, mode ${basis.mode})`;
+	if (pr.docMerge === null) return `the merge ${sha7(r.sha)} was not re-read`;
+	const parents = pr.docMerge.parents;
+	if (parents.length !== 2 || parents[0] !== sha || parents[1] !== r.merge.main) {
+		return `${sha7(r.sha)}'s parents are ${parents.map(sha7).join(" ") || "none"}, not the basis ${sha7(sha)} and main ${sha7(r.merge.main)}`;
+	}
+	if (!pr.docMerge.mainOnChain) return `the merged main ${sha7(r.merge.main)} is not on origin's first-parent chain`;
+	return null;
+}
+
+/**
+ * Why a batch credit does not stand for a merged PR (plan wl-mv615mkeaf1yio § 4), or null when it
+ * does: it credits the PR's merged head; its batch row is a green listing that (PR, sha) at its
+ * step, with the same final tree; and the batch landed: the n commits directly after `base` on
+ * origin's first-parent chain are merges whose second parents are the batch's heads in Jo's order,
+ * the n-th with the final tree the full suite passed.
+ */
+function creditFault(pr: ClosePr, c: CloseCredit): string | null {
+	if (c.pr !== pr.number) return `it is a credit for PR #${c.pr}`;
+	if (c.sha !== pr.headSha) return `it credits ${sha7(c.sha)}, not the merged head ${sha7(pr.headSha)}`;
+	if (c.batch === null) return `its batch ${c.runId} has no test-batch-run row`;
+	if (c.batch.verdict !== "green") return `its batch ${c.runId} is ${c.batch.verdict}`;
+	const prs = c.batch.prs;
+	const at = prs[c.step - 1];
+	if (prs.length !== c.n || at?.pr !== pr.number || at.sha !== c.sha) return `its batch ${c.runId} does not list PR #${pr.number} at ${sha7(c.sha)} as step ${c.step} of ${c.n}`;
+	if (c.batch.finalTree !== c.finalTree) return `its batch ${c.runId}'s final tree is not the credited ${sha7(c.finalTree)}`;
+	if (c.landed.length < c.n) return `the batch did not land: origin's first-parent chain has ${c.landed.length} commit(s) after its base ${sha7(c.base)}, not ${c.n}`;
+	for (let i = 0; i < c.n; i++) {
+		const k = c.landed[i]!;
+		const want = prs[i]!;
+		const prev = i === 0 ? c.base : c.landed[i - 1]!.sha;
+		if (k.parents.length !== 2 || k.parents[0] !== prev || k.parents[1] !== want.sha) {
+			return `the batch did not land: ${sha7(k.sha)}, commit ${i + 1} after ${sha7(c.base)} on origin's first-parent chain, is not the merge of PR #${want.pr} at ${sha7(want.sha)} onto ${sha7(prev)}`;
+		}
+	}
+	const last = c.landed[c.n - 1]!;
+	if (last.tree !== c.finalTree) return `the batch did not land: ${sha7(last.sha)}'s tree ${sha7(last.tree)} is not the tested final tree ${sha7(c.finalTree)}`;
+	return null;
+}
+
+/**
+ * Why a PR's own authoritative run does not hold at its head (the rule before batch credits), or the note a doc-merge
+ * green adds, or the waived run id when a merged PR passes on Jo's waiver of its non-green run at its final head
+ * (PLAN wl-mv5i3lulwwbbi8 D3; an open PR never passes on a waiver).
+ */
+function ownGreenFault(pr: ClosePr, runs: readonly RunRecord[]): { fault: string } | { note: string | null } | { waived: string } {
+	const r = pr.result;
+	if (r === null) return { fault: `PR #${pr.number} has no test-run result: call lane_full_test` };
+	if (r.verdict !== "green") {
+		const newest = `PR #${pr.number}'s newest test-run ${r.runId} is ${r.verdict}`;
+		if (pr.state === "OPEN") return { fault: `${newest}: fix it and call lane_full_test (a waiver passes only a merged PR)` };
+		if (pr.waivedRun !== r.runId) {
+			return { fault: `${newest}: a merged PR passes only on Jo's \`waive\` answering a question that offers waive on the run's slice, asked after the result` };
+		}
+		if (pr.headSha !== r.sha) return { fault: `${newest} and waived, but at ${sha7(r.sha)}, not the merged head ${sha7(pr.headSha)}` };
+		return { waived: r.runId };
+	}
+	let note: string | null = null;
+	if (r.mode === "doc-merge") {
+		const bad = docMergeFault(pr, r, runs);
+		if (bad !== null) return { fault: `PR #${pr.number}'s doc-merge green ${r.runId} does not hold: ${bad}; call lane_full_test` };
+		note = `PR #${pr.number}: doc-merge ${r.runId} on basis ${r.basis!.runId} at ${sha7(r.basis!.sha)}, main ${sha7(r.merge!.main)}`;
+	}
+	const fault = pr.headSha === r.sha ? null : decisionLogFault(pr.headCompare);
+	if (fault !== null) return { fault: `PR #${pr.number}'s head ${sha7(pr.headSha)} is not the green ${sha7(r.sha)}: ${fault}; call lane_full_test` };
+	return { note };
+}
+
+/**
  * The close check (§ 2.4 item 4). Every open or merged PR in the set needs an authoritative green at
- * S, with its head at S or descended from it through commits that each touch only the decision log;
- * a merged PR whose authoritative non-green run Jo waived (`waivedRun`) passes when that run's sha is
- * its final head, and an open PR never passes on a waiver. A candidate with a code delta needs such a
- * green on a PR from the branch that covers C the same way (a waiver covers nothing). The one
- * exemption is an empty PR set with no code delta. Anything git or gh could not answer refuses.
+ * S, with its head at S or descended from it through commits that each touch only the decision log.
+ * A doc-merge green counts only when `docMergeFault` finds nothing (plan wl-mv615mkeaf1yio § 3).
+ * A merged PR whose authoritative non-green run Jo waived (`waivedRun`) passes when that run's sha is
+ * its final head, and an open PR never passes on a waiver (PLAN wl-mv5i3lulwwbbi8 D3).
+ * A merged PR without such a green or waiver passes on any of its batch credits that `creditFault`
+ * finds nothing in (plan wl-mv615mkeaf1yio § 4; review r1 finding 2: a newer credit that did not land
+ * never shadows an older one that did); with none, it refuses with the newest credit's fault. An
+ * open PR never passes on a credit, since landing is unproven.
+ * A candidate with a code delta needs such a green, or such a credit, on a PR from the branch that
+ * covers C the same way (a waiver covers nothing). The one exemption is an empty PR set with no code
+ * delta. Anything git or gh could not answer refuses.
  */
 export function closeFreshness(f: CloseFacts): CloseDecision {
 	if (f.failure !== null) return { close: false, reason: `the close check could not answer: ${f.failure}` };
@@ -1105,31 +1436,39 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 			? { close: true, why: "no PR and no code delta" }
 			: { close: false, reason: `${f.branch} changes ${delta[0]} but has no PR: push and open the PR, then lane_full_test` };
 	}
+	const notes: string[] = [];
 	const waived: string[] = [];
+	const ownHolds = new Set<number>();
+	const creditHolds = new Map<number, readonly CloseCredit[]>();
 	for (const pr of f.prs) {
 		if (pr.state === "CLOSED") continue;
-		const r = pr.result;
-		if (r === null) return { close: false, reason: `PR #${pr.number} has no test-run result: call lane_full_test` };
-		if (r.verdict !== "green") {
-			const newest = `PR #${pr.number}'s newest test-run ${r.runId} is ${r.verdict}`;
-			if (pr.state === "OPEN") return { close: false, reason: `${newest}: fix it and call lane_full_test (a waiver passes only a merged PR)` };
-			if (pr.waivedRun !== r.runId) {
-				return { close: false, reason: `${newest}: a merged PR passes only on Jo's \`waive\` answering a question that offers waive on the run's slice, asked after the result` };
-			}
-			if (pr.headSha !== r.sha) return { close: false, reason: `${newest} and waived, but at ${sha7(r.sha)}, not the merged head ${sha7(pr.headSha)}` };
-			waived.push(`#${pr.number} (${r.runId})`);
+		const own = ownGreenFault(pr, f.runs);
+		if ("waived" in own) {
+			waived.push(`#${pr.number} (${own.waived})`);
 			continue;
 		}
-		const fault = pr.headSha === r.sha ? null : decisionLogFault(pr.headCompare);
-		if (fault !== null) {
-			return { close: false, reason: `PR #${pr.number}'s head ${sha7(pr.headSha)} is not the green ${sha7(r.sha)}: ${fault}; call lane_full_test` };
+		if ("note" in own) {
+			ownHolds.add(pr.number);
+			if (own.note !== null) notes.push(own.note);
+			continue;
 		}
+		const credits = pr.credits ?? [];
+		const newest = credits.at(-1);
+		if (newest === undefined) return { close: false, reason: own.fault };
+		if (pr.state !== "MERGED") return { close: false, reason: `${own.fault} (its batch credit ${newest.runId} counts only once the PR is merged)` };
+		const holding = credits.filter((c) => creditFault(pr, c) === null);
+		const c = holding.at(-1);
+		if (c === undefined) return { close: false, reason: `${own.fault}; its batch credit ${newest.runId} does not hold: ${creditFault(pr, newest)}` };
+		creditHolds.set(pr.number, holding);
+		notes.push(`PR #${pr.number}: batch ${c.runId} green at ${sha7(c.sha)}, step ${c.step} of ${c.n} onto ${sha7(c.base)}, landed`);
 	}
 	if (delta.length > 0) {
 		const own = f.prs.filter((p) => p.headRefName === f.branch);
 		if (own.length === 0) return { close: false, reason: `${f.branch} changes ${delta[0]} but has no PR: push and open the PR, then lane_full_test` };
 		const covered = own.some(
-			(p) => p.state !== "CLOSED" && p.result?.verdict === "green" && (f.candidate.sha === p.result.sha || decisionLogOnly(p.candidateCompare)),
+			(p) =>
+				(ownHolds.has(p.number) && (f.candidate.sha === p.result!.sha || decisionLogOnly(p.candidateCompare))) ||
+				(creditHolds.get(p.number) ?? []).some((c) => f.candidate.sha === c.sha || decisionLogOnly(c.candidateCompare)),
 		);
 		if (!covered) {
 			if (own.every((p) => p.state === "CLOSED")) return { close: false, reason: `PR #${own.at(-1)!.number} is closed; reopen it, or reset the branch` };
@@ -1137,7 +1476,8 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 		}
 	}
 	const head = waived.length === 0 ? "every PR in the set is green at its head" : `every PR in the set is green at its head or merged with a waived run (${waived.join(", ")})`;
-	return { close: true, why: `${head}${delta.length > 0 ? ` and covers ${sha7(f.candidate.sha)}` : ""}` };
+	const noted = notes.length > 0 ? ` (${notes.join("; ")})` : "";
+	return { close: true, why: `${head}${noted}${delta.length > 0 ? ` and covers ${sha7(f.candidate.sha)}` : ""}` };
 }
 
 // ---- the untrusted child: env, git shim, gitconfig (§ 3) -------------------------------------------

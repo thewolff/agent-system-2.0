@@ -2,20 +2,22 @@
 // surface/extensions/workload.ts): for a repo the test runner serves, the close needs an
 // authoritative green at every open or merged PR head in the workload's set, the local wl/<id> tip
 // (the pinned candidate C) covered by a green from wl/<id> when it carries code, and it fails closed
-// when git or gh cannot answer. Real git on a bare origin that `https://github.com/example/repo.git`
-// resolves to through `url.<bare>.insteadOf` (so the origin URL names a served `owner/repo` while every
-// fetch and push stays local), a fake `gh` first on PATH that records its argv and answers
-// `pr list --state all` per head branch from `prs/<branch>.json`, and a testRunner config through
-// `$AGENT_SYSTEM_TEST_RUNNER_CONFIG`.
+// when git or gh cannot answer; a doc-merge green holds only when its basis, its parents and the
+// merged main re-check (plan wl-mv615mkeaf1yio § 3). Real git on a bare origin that
+// `https://github.com/example/repo.git` resolves to through `url.<bare>.insteadOf` (so the origin URL
+// names a served `owner/repo` while every fetch and push stays local), a fake `gh` first on PATH that
+// records its argv and answers `pr list --state all` per head branch from `prs/<branch>.json`, and a
+// testRunner config through `$AGENT_SYSTEM_TEST_RUNNER_CONFIG`.
 import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { closeWorkloadWithEntry } from "../extensions/workload";
-import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
+import { landedChain, TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
+import { testBatchCreditBody, testBatchRunBody } from "../src/test-batch";
 import { recordRepo } from "../src/decision-log";
 import { branchName, worktreePath } from "../src/launch";
-import { testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
+import { type RunBasis, testRequestedBody, type TestRun, testRunBody, type TestVerdict } from "../src/test-run";
 import { SURFACE_BY, type SurfaceAPI } from "../src/types";
 import { clock, tempLedger, tmp } from "./helpers";
 
@@ -161,8 +163,8 @@ function requested(x: Closable, runId: string, pr: number, sha: string): void {
 	x.tick();
 	x.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: x.wl, kind: "assumption", body: testRequestedBody({ runId, pr, sha, slice: "sl-full-1", by: "lane-a" }) });
 }
-/** The runner's `test-run:` entry for a request. */
-function ran(x: Closable, runId: string, pr: number, sha: string, verdict: TestVerdict): void {
+/** The runner's `test-run:` entry for a request; `over` makes it, for one, a doc-merge run. */
+function ran(x: Closable, runId: string, pr: number, sha: string, verdict: TestVerdict, over: Partial<TestRun> = {}): void {
 	x.tick();
 	const red = verdict === "red";
 	x.ledger.recordEntry({
@@ -171,6 +173,7 @@ function ran(x: Closable, runId: string, pr: number, sha: string, verdict: TestV
 			runId, verdict, sha, pr, reason: verdict === "superseded" ? "a newer request owns the slice" : null, headAtEnd: sha, base: null, mergeBase: null,
 			full: { pass: 3, fail: red ? 1 : 0, skip: 0, exit: red ? 1 : 0, ms: 900, error: null }, solo: [],
 			failures: red ? [{ part: "full", name: "x.test.ts > broken", firstError: "error: nope" }] : [], runDir: `/runs/${runId}`, preflight: "ok",
+			mode: "full", basis: null, merge: null, ...over,
 		}),
 	});
 }
@@ -529,6 +532,183 @@ describe("close check: a served repo's close needs a green at every PR head and 
 		expect(r.text).not.toContain("Close check");
 		expect(g(w, w.work, "rev-parse", `${x.branch}~1`)).toBe(s);
 		expect(ghCalls(w).some((c) => c.includes("--state all"))).toBe(false);
+	});
+});
+
+describe("close check: a doc-merge green re-checks its basis, its parents and the merged main (plan wl-mv615mkeaf1yio § 3)", () => {
+	/**
+	 * P1, the lane's head, has a full green tr-1 (written on `basisOn`, this workload unless given); main
+	 * then moves to P2 (a MIGRATION.md change), pushed; the lane runs `git merge <mergeRef>` (origin/main
+	 * unless given) and pushes the merge H as PR #7's head. `init` is main's first commit.
+	 */
+	function merged(w: World, x: Closable, o: { mergeRef?: string; basisOn?: Closable } = {}): { p1: string; p2: string; h: string; init: string } {
+		const init = g(w, w.work, "rev-parse", "main");
+		const { lane, sha: p1 } = laneWithCode(w, x);
+		const p2 = commitFile(w, w.work, "MIGRATION.md", "main's item");
+		g(w, w.work, "push", "-q", "origin", "main");
+		g(w, lane, "fetch", "-q", "origin");
+		g(w, lane, "merge", "-q", "--no-edit", o.mergeRef ?? "origin/main");
+		const h = g(w, lane, "rev-parse", "HEAD");
+		g(w, lane, "push", "-q", "origin", x.branch);
+		prs(w, x.branch, [{ number: 7, state: "OPEN", headRefOid: h }]);
+		requested(o.basisOn ?? x, "tr-1", 7, p1);
+		ran(o.basisOn ?? x, "tr-1", 7, p1, "green");
+		return { p1, p2, h, init };
+	}
+	/** The doc-merge green tr-2 at H, as the runner writes it. */
+	function docMergeGreen(x: Closable, h: string, basis: RunBasis, main: string): void {
+		requested(x, "tr-2", 7, h);
+		ran(x, "tr-2", 7, h, "green", { full: null, mode: "doc-merge", basis, merge: { main, tip: main, docs: [] } });
+	}
+	const refusal = (why: string) => `PR #7's doc-merge green tr-2 does not hold: ${why}; call lane_full_test`;
+
+	test("a doc-merge green at the merge of the green head and a main state closes, and the close check names it", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const { p1, p2, h } = merged(w, x);
+		expect(g(w, w.work, "rev-list", "--parents", "-n", "1", h)).toBe(`${h} ${p1} ${p2}`);
+		docMergeGreen(x, h, { runId: "tr-1", sha: p1 }, p2);
+		writeFileSync(join(w.bin, "open-pr"), PR_URL);
+
+		const r = await close(w, x);
+
+		expect(r.closed).toBe(true);
+		expect(r.text).toContain(`Close check: every PR in the set is green at its head (PR #7: doc-merge tr-2 on basis tr-1 at ${s7(p1)}, main ${s7(p2)}) and covers ${s7(h)}.`);
+		expectPublishedOn(w, x, h);
+	});
+
+	test("a forged basis id refuses", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const { p1, p2, h } = merged(w, x);
+		docMergeGreen(x, h, { runId: "tr-9", sha: p1 }, p2);
+
+		expectRefused(w, x, await close(w, x), refusal("its basis tr-9 is not a finished run on this workload"), h);
+	});
+
+	test("a basis that is a full green on another workload refuses", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const other: Closable = { ...x, wl: x.ledger.openWorkload({ by: SURFACE_BY, brief: "another workload", stakes: "normal", mode: "autonomous" }) };
+		const { p1, p2, h } = merged(w, x, { basisOn: other });
+		docMergeGreen(x, h, { runId: "tr-1", sha: p1 }, p2);
+
+		expectRefused(w, x, await close(w, x), refusal("its basis tr-1 is not a finished run on this workload"), h);
+	});
+
+	test("a merge.main that is not H's second parent refuses, though it is on main's first-parent chain", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const { p1, p2, h, init } = merged(w, x);
+		docMergeGreen(x, h, { runId: "tr-1", sha: p1 }, init);
+
+		expectRefused(w, x, await close(w, x), refusal(`${s7(h)}'s parents are ${s7(p1)} ${s7(p2)}, not the basis ${s7(p1)} and main ${s7(init)}`), h);
+	});
+
+	test("a merged P2 that main never was (a side-branch commit) refuses: it is off origin's first-parent chain", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		g(w, w.work, "checkout", "-q", "-b", "side");
+		const side = commitFile(w, w.work, "side.txt", "a side-branch commit");
+		g(w, w.work, "checkout", "-q", "main");
+		const { p1, h } = merged(w, x, { mergeRef: "side" });
+		expect(g(w, w.work, "rev-list", "--parents", "-n", "1", h)).toBe(`${h} ${p1} ${side}`);
+		docMergeGreen(x, h, { runId: "tr-1", sha: p1 }, side);
+
+		expectRefused(w, x, await close(w, x), refusal(`the merged main ${s7(side)} is not on origin's first-parent chain`), h);
+	});
+});
+
+describe("close check: a merged PR's batch credit (plan wl-mv615mkeaf1yio § 4)", () => {
+	const BATCH = "tr-0mvbatch01abcd";
+	/**
+	 * PR #7 (the lane's head S, no green of its own) and PR #8 (P8, made in another clone) were batched
+	 * by Jo on a workload of Jo's own: a green test-batch-run there, the credit on this workload. With
+	 * `land`, main then merged them in that order with --no-ff and pushed: L1 = merge(M0, S), L2 =
+	 * merge(L1, P8), L2's tree being the batch's final tree.
+	 */
+	function batched(w: World, x: Closable, land: boolean): { s: string; m0: string; l1: string; l2: string | null; finalTree: string } {
+		const { sha: s } = laneWithCode(w, x);
+		const other = join(w.root, "other");
+		g(w, w.root, "clone", "-q", ORIGIN_URL, other);
+		const m0 = g(w, other, "rev-parse", "origin/main");
+		g(w, other, "checkout", "-q", "-b", "pr8", m0);
+		const p8 = commitFile(w, other, "c.txt", "PR 8's change");
+		g(w, other, "checkout", "-q", "main");
+		g(w, other, "merge", "-q", "--no-ff", "--no-edit", s);
+		const l1 = g(w, other, "rev-parse", "HEAD");
+		g(w, other, "merge", "-q", "--no-ff", "--no-edit", p8);
+		const l2 = g(w, other, "rev-parse", "HEAD");
+		const finalTree = g(w, other, "rev-parse", "HEAD^{tree}");
+		if (land) g(w, other, "push", "-q", "origin", "main");
+		const jo = x.ledger.openWorkload({ by: SURFACE_BY, brief: "Jo's batch", stakes: "normal", mode: "autonomous" });
+		x.tick();
+		x.ledger.recordEntry({
+			by: TEST_RUNNER_BY, workloadId: jo, kind: "assumption",
+			body: testBatchRunBody({
+				runId: BATCH, verdict: "green", base: m0, prs: [{ pr: 7, sha: s }, { pr: 8, sha: p8 }],
+				steps: [m0, l1, l2].map((c) => ({ commit: c, tree: g(w, other, "rev-parse", `${c}^{tree}`) })), full: { pass: 3, fail: 0, skip: 0, exit: 0, ms: 900, error: null },
+				failures: [], attribution: null, reason: null, headsAtEnd: [s, p8], runDir: `/runs/${BATCH}`, preflight: "ok",
+			}),
+		});
+		x.tick();
+		x.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: x.wl, kind: "assumption", body: testBatchCreditBody({ runId: BATCH, pr: 7, sha: s, base: m0, step: 1, n: 2, finalTree }) });
+		prs(w, x.branch, [{ number: 7, state: "MERGED", headRefOid: s }]);
+		return { s, m0, l1, l2: land ? l2 : null, finalTree };
+	}
+
+	test("a credit whose batch landed as tested closes the merged PR with no green of its own, and the close check names it", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const { s, m0 } = batched(w, x, true);
+		const r = await close(w, x);
+		expect(r.closed).toBe(true);
+		// main merged S, so the candidate has no code delta left against origin/main: nothing to cover
+		expect(r.text).toContain(`Close check: every PR in the set is green at its head (PR #7: batch ${BATCH} green at ${s7(s)}, step 1 of 2 onto ${s7(m0)}, landed).`);
+		expectPublishedOn(w, x, s);
+	});
+
+	test("a credit whose batch never landed refuses, naming the chain it read", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const { s, m0 } = batched(w, x, false);
+		expectRefused(w, x, await close(w, x),
+			`PR #7 has no test-run result: call lane_full_test; its batch credit ${BATCH} does not hold: the batch did not land: origin's first-parent chain has 0 commit(s) after its base ${s7(m0)}, not 2`, s);
+	});
+
+	test("a newer credit at the same head that does not hold never shadows the older one that landed (review r1 finding 2)", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const { s, m0, finalTree } = batched(w, x, true);
+		// a later batch of the same PR at the same head, whose test-batch-run: row is not in the ledger
+		x.tick();
+		x.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: x.wl, kind: "assumption", body: testBatchCreditBody({ runId: "tr-0mvbatch02abcd", pr: 7, sha: s, base: m0, step: 1, n: 2, finalTree }) });
+		const r = await close(w, x);
+		expect(r.closed).toBe(true);
+		expect(r.text).toContain(`Close check: every PR in the set is green at its head (PR #7: batch ${BATCH} green at ${s7(s)}, step 1 of 2 onto ${s7(m0)}, landed).`);
+		expectPublishedOn(w, x, s);
+	});
+
+	test("landedChain reads up to n first-parent commits after the base, oldest first, with tree and parents; a base the clone lacks is no landing", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const { s, m0, l1, l2 } = batched(w, x, true);
+		g(w, w.work, "fetch", "-q", "origin");
+		const exec = piOf(w).exec!;
+		const chain = await landedChain(exec, w.work, m0, "origin/main", 2);
+		expect(chain.map((c) => [c.sha, c.parents])).toEqual([[l1, [m0, s]], [l2!, [l1, expect.any(String)]]]);
+		expect(chain[1]!.tree).toBe(g(w, w.work, "rev-parse", `${l2}^{tree}`));
+		expect(await landedChain(exec, w.work, m0, "origin/main", 1)).toHaveLength(1);
+		expect(await landedChain(exec, w.work, "f".repeat(40), "origin/main", 2)).toEqual([]);
 	});
 });
 

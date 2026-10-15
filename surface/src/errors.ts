@@ -37,6 +37,10 @@
 // Test run: the newest held `test-run-failed:` the test runner sent about a workload no lane holds
 // under a live lease (MIGRATION.md item 24, PLAN § 2.5), shown once: delivery consumes it, a lane
 // taking the workload hides it, a `test-run:` green written after it clears it.
+// Test batch (plan wl-mv615mkeaf1yio § 4): every held `test-batch-result:` the test runner sent, whatever
+// holds the workload (Jo started the batch, not a lane), shown once and consumed by delivery; and, for
+// the newest batch on a workload when it is red and its attribution renders `lost` (`batchAttribution`
+// over one runs.db snapshot), a line asking Jo to run the batch again, until a newer batch is requested.
 // Due: an open workload whose brief starts `due:<date> ` with date <= now by instant (Codex S4).
 // Scratch (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): an open workload whose newest valid `scratch-over-cap:` /
 // `scratch-under-cap:` control entry (a holder's: the lane extension's turn-end measure, surface/extensions/lane.ts)
@@ -52,7 +56,8 @@ import { isCeilingQuestion } from "./input";
 import { type ControlEntry, type ControlPrefix, controlEntries, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
 import { questionSubject } from "./orchestrator-question";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
-import { parseTestRunFailed, testRuns } from "./test-run";
+import { deadBatches, heartbeatFileOf, type NewestBatchAttribution, newestBatchAttribution, parseTestBatchResult, TEST_BATCH_RESULT_PREFIX } from "./test-batch";
+import { parseTestRunFailed, runsRoot, testRuns } from "./test-run";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
 
 export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch";
@@ -92,6 +97,8 @@ export interface ErrorLine {
 export interface ErrorOptions {
 	now?: string;
 	holdHours?: number;
+	/** The test runner's runs root, read for a red batch's attribution; defaults to `runsRoot(process.env)`. */
+	runs?: string;
 }
 
 const short = (s: string, n = 90): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
@@ -299,6 +306,49 @@ function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: reado
 	};
 }
 
+/**
+ * The batch lines for a workload (plan wl-mv615mkeaf1yio § 4): one per held `test-batch-result:` from
+ * the test runner (delivery consumes it), then the newest batch's lost attribution, read from runs.db
+ * only when the newest batch is red with an attribution and no attribution row, then one per batch
+ * whose runner died before its result (`deadBatches`; the next start-batch on the workload settles
+ * it). A runs.db that cannot be read says nothing: `lost` is never shown on a guess.
+ */
+function testBatchLines(ledger: Ledger, wl: string, pending: readonly MessageRow[], nowMs: number, runs: string | undefined): ErrorLine[] {
+	const out: ErrorLine[] = [];
+	for (const m of pending) {
+		if (m.state !== "held" || m.recipient !== ORCHESTRATOR_RECIPIENT || m.created_by !== TEST_RUNNER_BY || !m.body.startsWith(TEST_BATCH_RESULT_PREFIX)) continue;
+		const r = parseTestBatchResult(m.body);
+		if (r && r.workloadId === wl) out.push({ kind: "test-run", workloadId: wl, rowId: m.id, messageIds: [m.id], line: `test batch ${r.runId} on ${wl}: ${r.text}` });
+	}
+	let root: string;
+	try {
+		root = runs ?? runsRoot(process.env);
+	} catch {
+		return out;
+	}
+	let newest: NewestBatchAttribution | null = null;
+	try {
+		// The reader reads the entries itself, again after its runs.db snapshot (review r1 finding 4).
+		newest = newestBatchAttribution(root, () => ledger.entries(wl, "assumption"), nowMs);
+	} catch {
+		newest = null;
+	}
+	const entries = ledger.entries(wl, "assumption");
+	if (newest?.state.state === "lost") {
+		out.push({
+			kind: "test-run", workloadId: wl, rowId: newest.run.entryId, state: "lost",
+			line: `test batch ${newest.run.runId} on ${wl} is red and its attribution ${newest.state.id} never ran: the red stands, no PR is named — run \`test-batch ${wl} ${newest.run.prs.map((p) => p.pr).join(" ")}\` again for attribution`,
+		});
+	}
+	for (const d of deadBatches(entries, (id) => heartbeatFileOf(root, id), nowMs)) {
+		out.push({
+			kind: "test-run", workloadId: wl, rowId: d.entryId, state: "died",
+			line: `test batch ${d.runId} on ${wl} (PRs ${d.prs.map((p) => `#${p.pr}`).join(", ")}): its runner died before its result, and slice ${d.slice} has none — run \`test-batch ${wl} ${d.prs.map((p) => p.pr).join(" ")}\` again; that start settles it as error runner died`,
+		});
+	}
+	return out;
+}
+
 /** Every line owed right now, in § B3 order (1–3), the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the due rows, then the scratch lines. */
 export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger.inFlight(), opts: ErrorOptions = {}): ErrorLine[] {
 	const now = opts.now ?? ledger.now();
@@ -337,6 +387,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		}
 		const run = testRunLine(ledger, workload, pendingMessages, now);
 		if (run) testRun.push(run);
+		testRun.push(...testBatchLines(ledger, wl, pendingMessages, Date.parse(now), opts.runs));
 		for (const d of laneDeaths(ledger, wl)) {
 			if (d.state !== "held") continue;
 			died.push({ kind: "lane-died", workloadId: wl, rowId: d.id, messageIds: [d.id], line: `lane ${d.holder} on ${label} died: ${d.body.slice(d.body.indexOf(":", 11) + 1).trim()}, ${workload.open_slices} open slice(s)${workload.holder && workload.holder !== d.holder ? `; ${workload.holder} holds it now` : ""}` });
