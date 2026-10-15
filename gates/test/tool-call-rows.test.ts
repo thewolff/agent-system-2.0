@@ -127,6 +127,42 @@ describe("row 6: § A4 reserved actions", () => {
 		expect(checkReserved({ toolName: "write", input: { path: "/r/.git/hooks/pre-commit", content: "abc" } }, lane())?.block).toBe(true);
 		expect(checkReserved({ toolName: "write", input: { path: "/r/.gitignore", content: "abc" } }, lane())).toBeNull();
 	});
+	describe("switching the GitHub identity gh acts as (PLAN wl-mv66ylim0gahog § 6.3)", () => {
+		const identity = [
+			"gh auth switch -u thewolff",
+			"gh auth token -u thewolff",
+			"gh auth login --with-token < t.txt",
+			"gh auth logout -u thewolff-engineer",
+			"gh auth refresh -s repo",
+			"gh auth setup-git",
+			"gh --hostname github.com auth switch",
+			"GH_TOKEN=abc gh issue create --title x --body y",
+			"GITHUB_TOKEN=abc gh issue list",
+			"export GH_TOKEN=abc; gh issue list",
+			"env GITHUB_TOKEN=abc gh issue list",
+			'GH_TOKEN="$(cat t.txt)" gh issue list',
+			"GH_TOKEN=$(gh auth token -u thewolff) gh issue list",
+			"security find-generic-password -s gh:github.com -w",
+			"security find-internet-password -s github.com -w",
+			"sh -c 'gh auth switch'",
+			"gh auth status --show-token",
+			"gh auth status -a -t",
+		];
+		for (const cmd of identity) {
+			test(`refuses: ${cmd}`, () => {
+				const r = checkReserved({ toolName: "bash", input: { command: cmd } }, lane());
+				expect(r?.block).toBe(true);
+				expect(r?.reason).toContain("§ A4 reserved list");
+			});
+		}
+		test("refuses GH_TOKEN set through the bash tool's env", () => {
+			expect(checkReserved({ toolName: "bash", input: { command: "gh issue list", env: { GH_TOKEN: "abc" } } }, lane())?.reason).toContain("setting GH_TOKEN");
+		});
+		const free = ["gh auth status", "gh auth status -a", "gh auth status -h github.com", "gh issue list --label as2", "gh api graphql -f query='{viewer{login}}'", "export GH_TOKEN", "security list-keychains", "echo GH_TOKEN_IS_UNSET"];
+		for (const cmd of free) {
+			test(`allows: ${cmd}`, () => expect(checkReserved({ toolName: "bash", input: { command: cmd } }, lane())).toBeNull());
+		}
+	});
 });
 
 describe("row 8: a push needs the target's upstream and a test record for its tree", () => {

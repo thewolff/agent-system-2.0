@@ -12,6 +12,8 @@ import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "..
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
 import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
+import { readSwitch } from "../src/issues/switch";
+import { trackerEntryOf } from "../src/issues/tracker";
 import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody, verdictOf } from "../src/launch";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { ensureStandingWorkload } from "../src/identity";
@@ -986,6 +988,119 @@ describe("review round limit (D9) and stop-reviews (D10)", () => {
 		expect(ledger.question(cq)!.state).toBe("answered");
 		expect(ledger.slice(ceilingSlice)!.state).toBe("done");
 		expect(bodies(ledger, wl, "review-loop-end:")).toEqual([`review-loop-end: ${sl} reason stop-reviews`]);
+	});
+});
+
+describe("the issues switch and the tracker word (PLAN wl-mv66ylim0gahog § 7, § 13.2)", () => {
+	const assumptions = (ledger: Ledger, wl: string, prefix: string) => ledger.entries(wl, "assumption").filter((e) => e.body.startsWith(prefix));
+
+	test("`issues on` / `issues off`: Jo's instruction and the switch entry naming it on wl-orchestrator, by the surface; the switch reads it back", () => {
+		const { ledger } = tempLedger();
+		workloadWithSlice(ledger);
+		expect(readSwitch(ledger).on).toBe(false);
+		for (const [text, on] of [["issues on", true], ["Issues OFF", false], ["issues on", true]] as const) {
+			const cmd = interpret(ledger, text)!;
+			expect(cmd).toEqual({ kind: "issues", on });
+			const receipt = apply(ledger, cmd);
+			const i = ledger.instructions(STANDING_WORKLOAD_ID).at(-1)!;
+			expect([i.kind, i.body, i.author, i.channel, i.created_by]).toEqual(["instruction", `issues: ${on ? "on" : "off"}`, "jo", "surface", SURFACE_BY]);
+			const e = assumptions(ledger, STANDING_WORKLOAD_ID, "switch:").at(-1)!;
+			expect(e.body).toBe(`switch: issues ${on ? "on" : "off"} orchestrator by ${i.id}`);
+			expect(e.created_by).toBe(SURFACE_BY);
+			expect(receipt).toBe(`issues: ${on ? "on" : "off"} (instruction ${i.id})`);
+			expect(readSwitch(ledger)).toMatchObject({ on, entryId: e.id, instructionId: i.id });
+		}
+		expect(assumptions(ledger, STANDING_WORKLOAD_ID, "switch:")).toHaveLength(3);
+		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toHaveLength(3);
+	});
+
+	test("the instruction and its entry are one transaction: an entry the ledger refuses leaves no instruction", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		ledger.write(() => ensureStandingWorkload(ledger)); // the standing workload exists before, so only the word's rows can roll back
+		const recordEntry = ledger.recordEntry.bind(ledger);
+		ledger.recordEntry = () => {
+			throw new Error("refused");
+		};
+		expect(() => apply(ledger, interpret(ledger, "issues on")!)).toThrow("refused");
+		expect(() => apply(ledger, interpret(ledger, `tracker ${wl} github`)!)).toThrow("refused");
+		ledger.recordEntry = recordEntry;
+		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
+		expect(ledger.instructions(wl)).toEqual([]);
+		expect(readSwitch(ledger).on).toBe(false);
+	});
+
+	test("`tracker <wl> linear ENG | github | none`: Jo's instruction and the `tracker:` entry naming it on the workload; the tracker reads it back", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const cases = [
+			[`tracker ${wl} linear ENG`, { kind: "linear", team: "ENG" }, "linear ENG"],
+			[`tracker ${wl} github`, { kind: "github" }, "github"],
+			[`tracker ${wl} none`, null, "none"],
+			[`Tracker ${wl} LINEAR eng`, { kind: "linear", team: "ENG" }, "linear ENG"],
+		] as const;
+		for (const [text, tracker, kind] of cases) {
+			const cmd = interpret(ledger, text)!;
+			expect(cmd).toEqual({ kind: "tracker", workloadId: wl, tracker });
+			const receipt = apply(ledger, cmd);
+			const i = ledger.instructions(wl).at(-1)!;
+			expect([i.kind, i.body, i.author, i.channel, i.created_by]).toEqual(["instruction", `tracker: ${kind}`, "jo", "surface", SURFACE_BY]);
+			const e = assumptions(ledger, wl, "tracker:").at(-1)!;
+			expect(e.body).toBe(`tracker: ${wl} ${kind} by ${i.id}`);
+			expect(e.created_by).toBe(SURFACE_BY);
+			expect(receipt).toBe(`tracker on ${wl} → ${kind} (instruction ${i.id})`);
+			expect(trackerEntryOf(wl, ledger.entries(wl, "assumption"))).toEqual({ tracker, entryId: e.id });
+		}
+		expect(ledger.instructions(wl)).toHaveLength(cases.length);
+		expect(commandShaped(`tracker ${wl} linear ENG`)).toBe(true);
+		expect(commandShaped(`tracker ${wl} linear ENG now`)).toBe(false);
+	});
+
+	test("malformed forms, an unknown id, a closed workload and the standing workload are refused with a one-line hint and write nothing", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const closed = ledger.openWorkload({ by: SURFACE_BY, brief: "Done already", stakes: "normal", mode: "autonomous" });
+		ledger.closeWorkload(closed, { by: SURFACE_BY });
+		ledger.write(() => ensureStandingWorkload(ledger));
+		const form = "the word is: tracker <wl-id> github | linear <TEAM> | none";
+		const refusals: [string, string][] = [
+			[`tracker ${wl}`, `"tracker ${wl}" is not a form the word takes; ${form}`],
+			[`tracker ${wl} gitlab`, `"tracker ${wl} gitlab" is not a form the word takes; ${form}`],
+			[`tracker ${wl} linear`, `"tracker ${wl} linear" is not a form the word takes; ${form}`],
+			[`tracker ${wl} linear 9X`, `"tracker ${wl} linear 9X" is not a form the word takes; ${form}`],
+			[`tracker ${wl} github ENG`, `"tracker ${wl} github ENG" is not a form the word takes; ${form}`],
+			[`tracker ${wl} none now`, `"tracker ${wl} none now" is not a form the word takes; ${form}`],
+			["tracker wl-nope github", `no workload wl-nope; ${form}`],
+			["tracker wl- github", `no workload wl-; ${form}`],
+			[`tracker ${closed} linear ENG`, `${closed} is closed; the tracker word takes an open workload`],
+			[`tracker ${STANDING_WORKLOAD_ID} github`, `${STANDING_WORKLOAD_ID} is the standing workload and has no issue; ${form}`],
+		];
+		for (const [text, why] of refusals) {
+			const cmd = interpret(ledger, text)!;
+			expect(cmd).toEqual({ kind: "refused", why });
+			expect(why.includes("\n")).toBe(false);
+			expect(() => apply(ledger, cmd)).toThrow("refused, never applied");
+		}
+		// a closed workload named by a command built elsewhere is refused inside the transaction too
+		expect(() => apply(ledger, { kind: "tracker", workloadId: closed, tracker: { kind: "github" } })).toThrow("is not an open workload");
+		// `issues` with anything but on/off, and `tracker` not followed by an id, are prose
+		for (const text of ["issues", "issues remain", "issues on now", "tracker", "tracker github", "tracker is down"]) expect(interpret(ledger, text)).toBeNull();
+		for (const w of [wl, closed, STANDING_WORKLOAD_ID]) expect(ledger.instructions(w)).toEqual([]);
+		for (const w of [wl, closed]) expect(assumptions(ledger, w, "tracker:")).toEqual([]);
+		expect(assumptions(ledger, STANDING_WORKLOAD_ID, "switch:")).toEqual([]);
+	});
+
+	test("in a paste: the words apply with the other lines; a malformed or unresolved tracker line refuses the whole paste", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const numbering = numbered(ledger);
+		const bad = interpretPaste(ledger, numbering, `issues on\ntracker ${wl} gitlab`)!;
+		expect(bad).toMatchObject({ ok: false, refused: [{ line: 1, why: null }, { line: 2, why: [expect.stringContaining("is not a form the word takes")] }] });
+		expect(interpretPaste(ledger, numbering, `issues on\ntracker wl-nope github`)).toMatchObject({ ok: false, refused: [{ line: 1, why: null }, { line: 2, why: ["wl-nope is not an open workload"] }] });
+		const good = interpretPaste(ledger, numbering, `issues on\ntracker ${wl} linear ENG`)!;
+		expect(good).toMatchObject({ ok: true, items: [{ kind: "command", cmd: { kind: "issues", on: true } }, { kind: "command", cmd: { kind: "tracker", workloadId: wl } }] });
+		expect(ledger.instructions(wl)).toEqual([]);
+		expect(ledger.workload(STANDING_WORKLOAD_ID)).toBeNull();
 	});
 });
 

@@ -88,7 +88,7 @@ describe("the tick's refused close is told once per refusal", () => {
 
 		timers.length = 0;
 		await f.emit("session_start", { type: "session_start" }, ctx);
-		expect(timers).toHaveLength(1);
+		expect(timers).toHaveLength(2); // the wake poll (timers[0], registered first) and the issues row's own
 
 		// the same refusal on two ticks: retried both times, told once
 		await tick();
@@ -153,7 +153,7 @@ describe("the tick's catch-up runs when the poll throws (MIGRATION.md item 71)",
 		const s = surfaceSession(ctx, e);
 		timers.length = 0;
 		await f.emit("session_start", { type: "session_start" }, ctx);
-		expect(timers).toHaveLength(1);
+		expect(timers).toHaveLength(2); // the wake poll (timers[0], registered first) and the issues row's own
 
 		let thrown: unknown = null;
 		try {
@@ -187,7 +187,7 @@ describe("the tick's catch-up runs when the poll throws (MIGRATION.md item 71)",
 		const s = surfaceSession(ctx, e);
 		timers.length = 0;
 		await f.emit("session_start", { type: "session_start" }, ctx);
-		expect(timers).toHaveLength(1);
+		expect(timers).toHaveLength(2); // the wake poll (timers[0], registered first) and the issues row's own
 		// Jo's first turn takes the session-start wake: nothing pending, nothing in flight, so the catch-up's push is live.
 		await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx);
 		expect(s.pending).toBeNull();

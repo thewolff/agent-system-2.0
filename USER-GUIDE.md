@@ -93,6 +93,22 @@ With one open workload the word applies to it. With several, add the id: `produc
 - With it on, round-limit and ceiling questions on an autonomous workload above throwaway stakes can offer `pair` (section 2). The offer fires when the review loop stalls, when you have sent three or more long steers, or when jev reads the brief as UI/taste work or as ambiguous. At most 2 offers per workload, 60 minutes apart, and none after you decline one unless a new signal fires.
 - Jev answers in the background. A question raised before its answer arrives, or while jev is down, offers on the other signals only; nothing waits for jev.
 
+### Issues projection (`issues on|off`, `tracker`)
+
+Each open workload gets one tracker issue, kept in step with the ledger by the surface. The design, rollout and residuals are in `migration/items/github-issues-projection.md`.
+
+- **Words.** Type each as the whole message, or as one line of a paste.
+  - `issues on` / `issues off`: the switch. It is off until the first `issues on`. Off stops every call the projection makes (pushes, the PR scan and footers, the hourly reconcile, intake). It does not stop a close's own branch push and decision-log PR.
+  - `tracker <wl-id> github | linear <TEAM> | none`: moves one open workload's issue, for example `tracker wl-… linear ENG`. The old issue is closed `not planned` with a comment naming the new place, and the next tick creates the new one. Refused, with nothing written, for a closed workload, `wl-orchestrator` or a malformed form.
+- **Where issues live.** It goes by the workload's repo origin (`issues.trackers` in `profile/config.yml`). `thewolff/agent-system-2.0` uses GitHub issues on that repo. `ContextPress/*` uses Linear team ENG, through `LINEAR_API_KEY`. Any other repo gets none. `issues.overrides` sends wl-mv5jz4vewt8mbk (the SEO audit) to Linear ENG. A `tracker` word beats both.
+- **What you see.**
+  - Each issue is titled `wl-<id> — <first line of the brief>`. A machine block between `<!-- as2:begin -->` / `<!-- as2:end -->` gives stakes, mode, holder, ceiling, slices, open questions and PRs. Your text outside it is kept.
+  - The labels are `as2`, `running` / `waiting`, `question`, `awaiting-merge` and `unmerged`. On Linear, In Progress / In Review / Done / Canceled stand in for the states.
+  - A PR into `main` gets a machine-added `<!-- as2 -->` `Closes #N`. A closed workload's issue waits with `awaiting-merge` and closes when its PR merges. A workload with no PR closes its issue at the ledger close.
+  - An issue you file on `thewolff/jo-issues` after `issues on` (as `thewolff`, and edited or renamed by no one else) becomes your input on `wl-orchestrator` (`issues.intakeRepo`; without it, intake reads the first exact GitHub repo in `issues.trackers`). Ilex is told `Jo filed issue #N → input in-…`, and the issue gets the `intake` label and a comment. An issue labelled `plumb` or `as2-train` is skipped: Plumb and the merge train's alerts file there as `thewolff` too. It stays as it is, with no label or comment, and is counted as ignored in the hourly drift entry (`issues.intakeSkipLabels`, default `plumb`, `as2-train`). An issue on jo-issues is never a workload's issue: a workload opened from your input gets its own. Linear has no intake and no PR footer.
+  - Problems arrive as `tick: issues: …` lines. Examples: `issue for wl-… not updated after turn …`, two drifting reconciles in a row, a parked link. Every hour an `issues-drift: <N>` entry is recorded on `wl-orchestrator`.
+- **Check.** `bun surface/scripts/issues.ts check` prints `drift: <N>` (or `drift: unknown (…)`) and one line per difference. It writes nothing to the ledger or a tracker, and nothing to the sidecar but its call count: its tracker reads count against the same 300-per-hour budget as the projector, capped at 20 per run, and at either cap it stops with `drift: unknown (budget)`. Exit 0 means no drift, 1 means drift or unknown, and 2 means no `issues:` block or no sidecar yet.
+
 ## 4. Read the screen
 
 - **Wake block:** `# Ledger at <time> (wake: <why>)`, then `you are <name> (<pronouns>)`, then `## needs you`, then `## open workloads` with one line per open workload: id, the brief's first line, the one-liner, the lane, slice counts, its `#n` needs-you numbers, open question ids and unread message count. A workload's full block comes from `orchestrator_ledger` with `workload: wl-…` (with no workload it renders every block).

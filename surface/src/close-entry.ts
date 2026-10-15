@@ -27,6 +27,11 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { SCRATCH_ENTRY, scratchBase, scratchRootFor } from "../../gates/src/scratch";
 import { homeDir, type InstructionRow, type Ledger, type QuestionRow } from "../../ledger/src/index";
+import { loadIssuesConfig } from "./issues/config";
+import { closesFooter } from "./issues/footer";
+import { Sidecar, sidecarPath } from "./issues/sidecar";
+import { readSwitch } from "./issues/switch";
+import { linkTracker } from "./issues/tracker";
 import { renderClose } from "./decision-log";
 import { ensureStandingWorkload, identityOf } from "./identity";
 import { fileIdentity, removeChild } from "./scratch-remove";
@@ -34,7 +39,7 @@ import { branchName, holdersOf } from "./launch";
 import { REPO_ROOT } from "./session";
 import {
 	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, type RangeCommit, type RunRecord,
-	SHA_RE, servedRepo, type TestRunnerConfig, testRunnerConfig, testRuns,
+	ownerRepoOf, SHA_RE, servedRepo, type TestRunnerConfig, testRunnerConfig, testRuns,
 } from "./test-run";
 import { DECISION_LOG_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, type SurfaceAPI } from "./types";
 
@@ -180,6 +185,37 @@ async function commitPath(exec: Exec, wt: string, path: string, id: string): Pro
 	return { error: commit.code === 0 ? null : failed("git commit", commit), already: false };
 }
 
+/**
+ * The issue a decision-log PR this close creates should close (PLAN wl-mv66ylim0gahog § 5, § 13.2 footer guard): the sidecar
+ * link's issue number when the issues config is present, the switch is on, the link has a number, its effective tracker is
+ * GitHub, and its repo is `prRepo`, the repository the PR is created in; else null. A moved or Linear link has no number. Read-
+ * only, and called only when `publishEntry` is about to run `gh pr create`. Any failure (config, ledger, sidecar) is null: the
+ * close never throws here.
+ */
+function closesIssue(ledger: Ledger, env: Record<string, string | undefined>, id: string, prRepo: string | null): number | null {
+	let sidecar: Sidecar | null = null;
+	try {
+		if (prRepo === null) return null;
+		const cfg = loadIssuesConfig(env);
+		if (!cfg.ok || cfg.config === null || !readSwitch(ledger).on) return null;
+		const path = sidecarPath(env);
+		if (!existsSync(path)) return null;
+		sidecar = Sidecar.open(path);
+		const link = sidecar.link(id);
+		if (!link || link.repo !== prRepo.toLowerCase() || linkTracker(ledger, cfg.config, id, link.repo)?.kind !== "github") return null;
+		const n = link.issue_number;
+		return typeof n === "number" && Number.isSafeInteger(n) && n > 0 ? n : null;
+	} catch {
+		return null;
+	} finally {
+		try {
+			sidecar?.close();
+		} catch {
+			// a failed close of a read-only look changes nothing
+		}
+	}
+}
+
 export interface EntryCommit {
 	/** Where the entry is: an absolute path when the file is on disk, else `<branch>:.ai/decision-log/<file>`; empty when `refused`. */
 	path: string;
@@ -193,9 +229,10 @@ export interface EntryCommit {
 	notes: string[];
 	/**
 	 * For `publishEntry`: the repo top, its default branch, whether it has an origin; null when nothing was committed.
-	 * Under a pin, `sha` is the commit to push by sha and `ownerRepo` the repo every `gh` call names with `-R`.
+	 * Under a pin, `sha` is the commit to push by sha and `ownerRepo` the repo every `gh` call names with `-R`. `closes(prRepo)`
+	 * is the issue number a created PR's body closes (`prRepo`: the owner/repo it is created in, null when unknown), or null.
 	 */
-	publish: { top: string; defaultBranch: string | null; origin: boolean; sha: string | null; ownerRepo: string | null } | null;
+	publish: { top: string; defaultBranch: string | null; origin: boolean; sha: string | null; ownerRepo: string | null; closes: (prRepo: string | null) => number | null } | null;
 	/** Under a pin: why the close must not go ahead (the branch moved after the close check, or the commit is not D on C); else null. */
 	refused: string | null;
 }
@@ -378,7 +415,7 @@ export async function commitCloseEntry(
 	const path = t.tempDir === null ? rendered : `${branch}:.ai/decision-log/${basename(rendered)}`;
 	return {
 		path, branch, commit: null, already: c.already, notes, refused: null,
-		publish: { top: t.top, defaultBranch: t.defaultBranch, origin: t.origin, sha, ownerRepo: pin?.ownerRepo ?? null },
+		publish: { top: t.top, defaultBranch: t.defaultBranch, origin: t.origin, sha, ownerRepo: pin?.ownerRepo ?? null, closes: (prRepo) => closesIssue(ledger, env, id, prRepo) },
 	};
 }
 
@@ -425,7 +462,16 @@ export async function publishEntry(pi: SurfaceAPI, e: EntryCommit, id: string): 
 	if (push !== null) return { push, pr: null, prCreated: false, prReason: `not pushed; ${byHand}` };
 	if (defaultBranch === null) return { push, pr: null, prCreated: false, prReason: `the default branch of ${top} cannot be resolved; ${byHand}` };
 	const title = `docs: decision-log entry ${basename(e.path).replace(/\.md$/, "")} (workload ${id})`;
-	const body = `The decision-log entry rendered when workload ${id} closed, committed on its lane branch ${e.branch} by the orchestrator surface's close.`;
+	const plain = `The decision-log entry rendered when workload ${id} closed, committed on its lane branch ${e.branch} by the orchestrator surface's close.`;
+	let n: number | null = null;
+	try {
+		// The repo the PR is created in: the pin's, else the checkout's origin (raw config, no insteadOf expansion).
+		const prRepo = ownerRepo ?? ownerRepoOf((await git(exec, top, ["config", "--get", "remote.origin.url"])).out);
+		n = e.publish.closes(prRepo);
+	} catch {
+		n = null;
+	}
+	const body = n === null ? plain : `${plain}${closesFooter(n)}`;
 	const create = await run(exec, "gh", ["pr", "create", ...repoArgs, "--head", e.branch, "--base", defaultBranch, "--title", title, "--body", body], NETWORK_MS, top);
 	if (create.code !== 0) return { push, pr: null, prCreated: false, prReason: `${failed("gh pr create", create)}; ${byHand}` };
 	const created = create.out.split("\n").filter(Boolean).at(-1) ?? "";

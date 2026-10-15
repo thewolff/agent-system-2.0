@@ -1196,6 +1196,32 @@ surface/scripts/orchestrator-prompt.ts	module	-
 surface/test/base-prompt.test.ts	test	-
 # Test runner self-refresh (migration/items/test-runner-self-refresh.md): row 6 pins for the refresh helper's sudo forms.
 gates/test/as2test-refresh-pins.test.ts	test	-
+# GitHub issues projection (wl-mv66ylim0gahog): the issues row, its modules and tests.
+surface/extensions/issues.ts	module	-
+surface/src/issues/config.ts	module	-
+surface/src/issues/sidecar.ts	module	-
+surface/src/issues/render.ts	module	-
+surface/src/issues/prs.ts	module	-
+surface/src/issues/github.ts	module	-
+surface/src/issues/switch.ts	module	-
+surface/src/issues/footer.ts	module	-
+surface/src/issues/projector.ts	module	-
+surface/src/issues/intake.ts	module	-
+surface/src/issues/tracker.ts	module	-
+surface/src/issues/linear.ts	module	-
+surface/src/issues/turnend.ts	module	-
+surface/src/issues/reconcile.ts	module	-
+surface/scripts/issues.ts	module	-
+surface/test/issues-render.test.ts	test	-
+surface/test/issues-prs.test.ts	test	-
+surface/test/issues-projector.test.ts	test	-
+surface/test/issues-footer.test.ts	test	-
+surface/test/issues-intake.test.ts	test	-
+surface/test/issues-fakes.ts	test	-
+surface/test/issues-tracker.test.ts	test	-
+surface/test/issues-linear.test.ts	test	-
+surface/test/issues-turnend.test.ts	test	-
+surface/test/issues-reconcile.test.ts	test	-
 # Phoenix tracing (wl-mv65t5d34lts00): the tracing switch (reader, word, tests) and the Phoenix LaunchAgent,
 # on by default. install/phoenix-agent.sh fills and loads the plist; install.sh runs it (step 6e).
 install/com.agent-system-2.phoenix.plist	install	-

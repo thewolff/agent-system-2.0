@@ -1,7 +1,10 @@
 // P-11 row 6 (DESIGN-2.0.md:343; SPEC-2.0.md:224-242 § A4): the reserved actions are refused from
 // any 2.0 agent — force-push, hard reset, branch or tag deletion, `rm -rf`, DROP/TRUNCATE,
 // production database writes, infrastructure teardown, secret rotation, push to a protected branch,
-// deploy. Build requirements on the gate: browser writes, and shell reached through `eval`.
+// deploy. Build requirements on the gate: browser writes, and shell reached through `eval`. Also
+// reserved (PLAN wl-mv66ylim0gahog § 6.3): switching the GitHub identity gh acts as — `gh auth
+// switch|token|login|logout|refresh|setup-git`, a GH_TOKEN/GITHUB_TOKEN assignment, a keychain
+// password read — so only Jo's own account can author an issue intake accepts.
 // Patterns ported from the 1.x `careful-guard.mjs` DENY/ASK tables (newdle plugin 0.2.172).
 //
 // Two passes over a shell command, and a refusal from either wins. The raw pass matches the rules
@@ -92,6 +95,11 @@ const RULES: Rule[] = [
 	{ re: new RegExp(`${GH}release\\s+(create|delete|edit)(?![\\w-])`, "i"), why: "gh release publishes or destroys a release" },
 	{ re: new RegExp(`${GH}pr\\s+merge(?![\\w-])[^\\n]*--admin\\b`, "i"), why: "gh pr merge --admin bypasses branch protection" },
 	{ re: new RegExp(`${GH}api\\b[^\\n]*(?:-X[=\\s]*|--method[=\\s]+)(POST|PUT|PATCH|DELETE)(?![\\w-])`, "i"), why: "gh api with a mutating method" },
+	// switching the GitHub identity gh acts as (PLAN wl-mv66ylim0gahog § 6.3): agents run gh as the
+	// default account, so an issue only Jo's account can author proves Jo filed it. `gh auth status` stays free.
+	{ re: new RegExp(`${GH}auth\\s+(switch|token|login|logout|refresh|setup-git)(?![\\w-])`, "i"), why: "gh auth switching or reading a GitHub account's credentials" },
+	{ re: new RegExp(`${GH}auth\\s+status\\b[^\\n]*\\s(?:--show-token|-[a-z]*t[a-z]*)(?![\\w-])`), why: "gh auth status --show-token (prints every account's token)" },
+	{ re: /\bsecurity\s+find-(generic|internet)-password\b/i, why: "reading a password from the keychain (security find-generic-password / find-internet-password)" },
 ];
 
 /**
@@ -454,7 +462,7 @@ const HEAD_SENSITIVE: Record<string, true> = {
 	gh: true, psql: true, mysql: true, mongosh: true, mongo: true, "redis-cli": true, pg_restore: true, pg_dump: true, supabase: true,
 	doctl: true, kubectl: true, terraform: true, tofu: true, pulumi: true, aws: true, gcloud: true, fly: true, flyctl: true, heroku: true,
 	docker: true, vault: true, vercel: true, netlify: true, wrangler: true, firebase: true, serverless: true, sls: true, cdk: true, eb: true,
-	helm: true, npm: true, pnpm: true, yarn: true, bun: true, dd: true,
+	helm: true, npm: true, pnpm: true, yarn: true, bun: true, dd: true, security: true,
 };
 
 /** SQL that only reads: one SELECT/SHOW/EXPLAIN/WITH/VALUES/TABLE statement with no writing keyword or side-effecting function. */
@@ -630,6 +638,17 @@ function reservedInExec(e: Exec, data?: Set<Word>, scratch?: Scratch): string | 
 	if (OUTPUT_ONLY[name]) return null;
 	const text = execText(data ? { ...e, argv: e.argv.filter((w) => !data.has(w)) } : e).replace(/\n/g, " ");
 	for (const { re, why } of RULES) if (re.test(text)) return why;
+	return null;
+}
+
+/** The variables that pick the GitHub account gh acts as (PLAN wl-mv66ylim0gahog § 6.3). */
+const GH_IDENTITY_ENV = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
+
+/** An assignment of GH_TOKEN or GITHUB_TOKEN anywhere in the command or the tool's env (a bare `export NAME` re-exports what is already there and passes). */
+function ghIdentityAssignment(assigned: Map<string, Word[]>): string | null {
+	for (const name of GH_IDENTITY_ENV) {
+		if ((assigned.get(name) ?? []).some((w) => w.opaque || w.text.includes("="))) return `setting ${name}, which picks the GitHub account gh acts as`;
+	}
 	return null;
 }
 
@@ -1139,6 +1158,8 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 			const why = reservedInExec(e, data?.words, scratch) ?? barePushOfProtected(e, scratch);
 			if (why) return refuse(why, `Command: ${cmd}`);
 		}
+		const identity = ghIdentityAssignment(x.assigned);
+		if (identity) return refuse(identity, `Command: ${cmd}`);
 		// Files an interpreter writes because of its environment (astra-7 B3): none inside .git.
 		const ienv = interpreterEnv(x, cwd);
 		for (const w of ienv.writes) {

@@ -13,7 +13,8 @@
 // ledger (already reflecting the flip), injects the voice document and carries the receipt into the
 // turn's context; the plan-path row then puts open plan questions' paths under the orchestrator's
 // messages (PLAN wl-mv61a8dh4aeneo D3); the workload, launch and ceiling rows only register tools;
-// the lane rows register last.
+// the issues row only runs its own poll (the GitHub-issues projection, fire-and-forget); the lane
+// rows register last.
 //
 // This is the extension entry, so it is the one file here that may bare-import `@oh-my-pi/*`
 // (loader rule, gates/src/host.ts): the plan-first size judge (decision 15) resolves through the
@@ -22,6 +23,7 @@
 import type { KindJudge } from "../classifier/src/classify";
 import { type HostModules, hostSettings } from "../gates/src/host";
 import ceilingRow from "./extensions/ceiling";
+import issuesRow from "./extensions/issues";
 import laneRow from "./extensions/lane";
 import laneToolsRow from "./extensions/lane-tools";
 import launchRow from "./extensions/launch";
@@ -55,6 +57,7 @@ export default function orchestratorSurface(pi: SurfaceAPI, env: Record<string, 
 	launchRow(pi, env);
 	ceilingRow(pi, env);
 	questionRow(pi, env);
+	issuesRow(pi, env);
 	laneRow(pi, env);
 	laneToolsRow(pi, env);
 }

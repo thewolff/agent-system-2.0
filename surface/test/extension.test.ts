@@ -543,6 +543,54 @@ describe("surface extension adapter", () => {
 		expect(notices).toEqual([]);
 	});
 
+	test("`issues on|off` and `tracker <wl> …` typed at the surface write the instruction and entry; a refused form writes nothing; a lane's prompt never applies them (PLAN wl-mv66ylim0gahog § 7, § 13.2)", async () => {
+		const f = fakePi();
+		const e = env();
+		let ledger = open(e);
+		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		const closed = ledger.openWorkload({ by: SURFACE, brief: "Old", stakes: "normal", mode: "autonomous" });
+		ledger.closeWorkload(closed, { by: SURFACE });
+		ledger.close();
+		// a lane loading the surface (its prompt is a model's or the runner's text, never Jo's) applies nothing
+		const lane = fakePi();
+		orchestratorSurface(lane.pi, { ...e, AGENT_SYSTEM_ROLE: "lane" });
+		notices.length = 0;
+		for (const prompt of ["issues on", `tracker ${wl} github`]) await lane.emit("before_agent_start", { prompt, systemPrompt: [] }, ctxOf());
+		expect(notices).toEqual([]);
+		ledger = open(e);
+		expect(ledger.workload(STANDING_WORKLOAD_ID)).toBeNull();
+		expect(ledger.instructions(wl)).toEqual([]);
+		ledger.close();
+		orchestratorSurface(f.pi, e);
+		const ctx = ctxOf();
+		notices.length = 0;
+		const on = (await f.emit("before_agent_start", { prompt: "issues on", systemPrompt: [] }, ctx)) as Started;
+		await f.emit("before_agent_start", { prompt: `tracker ${wl} linear ENG`, systemPrompt: [] }, ctx);
+		await f.emit("before_agent_start", { prompt: "issues off", systemPrompt: [] }, ctx);
+		ledger = open(e);
+		const [ion, ioff] = ledger.instructions(STANDING_WORKLOAD_ID);
+		const [itr] = ledger.instructions(wl);
+		expect([ion, ioff, itr].map((i) => [i!.body, i!.author, i!.channel])).toEqual([["issues: on", "jo", "surface"], ["issues: off", "jo", "surface"], ["tracker: linear ENG", "jo", "surface"]]);
+		expect(notices).toEqual([`issues: on (instruction ${ion!.id})`, `tracker on ${wl} → linear ENG (instruction ${itr!.id})`, `issues: off (instruction ${ioff!.id})`]);
+		expect(on.messages[0]!.content).toContain(`issues: on (instruction ${ion!.id})`);
+		expect(ledger.entries(STANDING_WORKLOAD_ID, "assumption").filter((x) => x.body.startsWith("switch:")).map((x) => [x.body, x.created_by])).toEqual([
+			[`switch: issues on orchestrator by ${ion!.id}`, SURFACE],
+			[`switch: issues off orchestrator by ${ioff!.id}`, SURFACE],
+		]);
+		expect(ledger.entries(wl, "assumption").filter((x) => x.body.startsWith("tracker:")).map((x) => [x.body, x.created_by])).toEqual([[`tracker: ${wl} linear ENG by ${itr!.id}`, SURFACE]]);
+		ledger.close();
+		// refused with a one-line hint, nothing written
+		notices.length = 0;
+		for (const prompt of [`tracker ${wl} gitlab`, "tracker wl-nope github", `tracker ${closed} none`]) await f.emit("before_agent_start", { prompt, systemPrompt: [] }, ctx);
+		const form = "the word is: tracker <wl-id> github | linear <TEAM> | none";
+		expect(notices).toEqual([`"tracker ${wl} gitlab" is not a form the word takes; ${form}`, `no workload wl-nope; ${form}`, `${closed} is closed; the tracker word takes an open workload`]);
+		ledger = open(e);
+		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toHaveLength(2);
+		expect(ledger.instructions(wl)).toHaveLength(1);
+		expect(ledger.instructions(closed)).toEqual([]);
+		ledger.close();
+	});
+
 	test("identity, open (stakes inferred, decision log carried), schedule, close (decision log rendered)", async () => {
 		const f = fakePi();
 		const e = env();
