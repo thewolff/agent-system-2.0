@@ -287,15 +287,15 @@ describe("recordDecision: the runner's decided outcome on the ledger before EOF 
 			db.exec(statement);
 			db.close();
 		};
-		const ceilingQuestion = () => raiseCeilingQuestion(ledger, { workloadId: wl, laneId: LANE, spend: { usd: 40, tokens: 1000, wallMin: 0 }, ceiling: { usd: 50, wallMin: 360 }, stakes: "normal" }).questionId;
+		const ceilingQuestion = async () => (await raiseCeilingQuestion(ledger, { workloadId: wl, laneId: LANE, spend: { usd: 40, tokens: 1000, wallMin: 0 }, ceiling: { usd: 50, wallMin: 360 }, stakes: "normal" })).questionId;
 		const markers = () => ledger.entries(wl).filter((e) => e.body.startsWith("lane-decided:")).map((e) => [e.created_by, e.body]);
 		const deaths = () => laneDeaths(ledger, wl).map((d) => d.body);
 		return { ledger, wl, sql, ceilingQuestion, markers, deaths };
 	};
 
-	test("completed with an open ceiling question: the question withdrawn, then the marker the shutdown reads as intended", () => {
+	test("completed with an open ceiling question: the question withdrawn, then the marker the shutdown reads as intended", async () => {
 		const { ledger, wl, ceilingQuestion, markers, deaths } = decided();
-		const q = ceilingQuestion();
+		const q = await ceilingQuestion();
 		expect(recordDecision(ledger, { workloadId: wl, laneId: LANE, outcome: "completed", death: null, settled: true })).toEqual({ death: "none", withdrawn: true, marker: "written" });
 		expect(ledger.question(q)!.state).toBe("withdrawn");
 		expect(markers()).toEqual([[LANE_RUNNER_BY, `lane-decided: ${LANE} completed`]]);
@@ -304,9 +304,9 @@ describe("recordDecision: the runner's decided outcome on the ledger before EOF 
 		expect(deaths()).toEqual([]);
 	});
 
-	test("completed whose ceiling withdrawal throws: no marker, so the shutdown's death stands (round 3, major 1)", () => {
+	test("completed whose ceiling withdrawal throws: no marker, so the shutdown's death stands (round 3, major 1)", async () => {
 		const { ledger, wl, sql, ceilingQuestion, markers, deaths } = decided();
-		const q = ceilingQuestion();
+		const q = await ceilingQuestion();
 		sql("CREATE TRIGGER fail_withdrawal BEFORE INSERT ON instructions BEGIN SELECT RAISE(ABORT, 'injected withdrawal failure'); END;");
 		expect(recordDecision(ledger, { workloadId: wl, laneId: LANE, outcome: "completed", death: null, settled: true })).toEqual({ death: "none", withdrawn: "failed", marker: "skipped" });
 		expect(ledger.question(q)!.state).toBe("open");
@@ -338,9 +338,9 @@ describe("recordDecision: the runner's decided outcome on the ledger before EOF 
 		expect(markers()).toEqual([]);
 	});
 
-	test("parked: the marker, no withdrawal (an open ceiling question stays open), no death", () => {
+	test("parked: the marker, no withdrawal (an open ceiling question stays open), no death", async () => {
 		const { ledger, wl, ceilingQuestion, markers, deaths } = decided();
-		const q = ceilingQuestion();
+		const q = await ceilingQuestion();
 		expect(recordDecision(ledger, { workloadId: wl, laneId: LANE, outcome: "parked", death: null, settled: true })).toEqual({ death: "none", withdrawn: false, marker: "written" });
 		expect(ledger.question(q)!.state).toBe("open");
 		expect(markers()).toEqual([[LANE_RUNNER_BY, `lane-decided: ${LANE} parked`]]);

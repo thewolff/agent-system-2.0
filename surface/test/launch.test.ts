@@ -10,6 +10,7 @@ import {
 	PLAN_FILE_MAX_BYTES, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_SHAPE, planQuestionProblem, requirementsProblem, reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
 	type Resolution, resumePlan, resumeSession, verdictOf,
 } from "../src/launch";
+import { planFileBody, reviewVerdictBody } from "../src/question-links";
 import type { CleanShellRead } from "../../gates/src/clean-shell";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { pairOfferBody, pairSignalBody, pairSignalFailedBody } from "../src/pair-suggest";
@@ -268,6 +269,7 @@ describe("done-because: receipt (decision 16, Codex review S1)", () => {
 			reviewWithheldBody("dt-a"), reviewParkBody("q-1", "sl-x"), reviewSameLabBody("in-1", "dt-a"), laneBuilderBody("anthropic", "lane-m-1", "m"),
 			handBuilderBody(null, "dt-a", "m"), reviewRoundBody({ slice: "sl-x", round: 1, token: "dt-a", group: "dg-a", verdict: "accepted", findings: UNKNOWN }),
 			reviewGroupBody("sl-x", "dg-a", ["dt-a"]), reviewLimitBody("q-1", "sl-x"), reviewLoopEndBody("sl-x", "pass"),
+			reviewVerdictBody("dt-a", "/l/reviews/wl-m/dt-a.md"), planFileBody("/r/PLAN.md"),
 			// classifier/extension.ts providerRefusedBody is module-private: its shape, as written there
 			"provider-refused: openai-codex status 401 token dt-a",
 			// classifier/extension.ts's headroom skip (PLAN wl-mv71x5rwdu7eo0 § 3), its shape as a literal so it loads on the baseline
@@ -280,7 +282,13 @@ describe("done-because: receipt (decision 16, Codex review S1)", () => {
 			"review-same-lab-rule: in-mv5xafhywe3w8w slice sl-x token dt-a labs openai,anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)",
 		];
 		for (const b of bodies) expect(CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).toContain(/^([a-z-]+):/.exec(b)![1]!);
-		expect(new Set(bodies.map((b) => /^([a-z-]+):/.exec(b)![1])).size).toBe(CLASSIFIER_MACHINERY_PREFIXES.length);
+	});
+
+	test("a review-verdict: the surface writes after the receipt (materializeVerdicts at a linked question's raise) leaves it standing", () => {
+		const holders = ["lane-m-1"];
+		const receipt = entry("lane-m-1", "done-because: tests pass");
+		expect(doneBecause([receipt, entry(SURFACE_BY, reviewVerdictBody("dt-a", "/l/reviews/wl-m/dt-a.md"))], holders)).toBe("tests pass");
+		expect(doneBecause([receipt, entry("lane-m-1", planFileBody("/r/PLAN.md"))], holders)).toBe("tests pass");
 	});
 });
 

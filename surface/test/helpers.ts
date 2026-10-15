@@ -268,9 +268,9 @@ export function tempRepo(): string {
  * does not exist, so the runner's guard is open and never reads the real quota-watch polls (PLAN wl-mv71x5rwdu7eo0 § 4); a
  * headroom test passes its own fixture in `over`.
  */
-export function laneRoot(over: Record<string, string> = {}): LaneRoot {
+export function laneRoot(over: Record<string, string> = {}, rootPath?: string): LaneRoot {
 	// git rev-parse --show-toplevel reports the canonical path and the worktree is derived from it: the root is canonical too.
-	const root = realpathSync(tmp("lane-root"));
+	const root = realpathSync(rootPath ?? tmp("lane-root"));
 	const home = join(root, "home");
 	const profile = join(home, ".omp", "profiles", "agent-system-2", "agent");
 	mkdirSync(profile, { recursive: true });

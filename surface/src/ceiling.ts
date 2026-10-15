@@ -11,6 +11,7 @@ import { closeSync, type Dirent, fstatSync, openSync, readdirSync, readSync } fr
 import { join } from "node:path";
 import type { InstructionRow, RoutingKind, Stakes } from "../../ledger/src/index";
 import { type ControlEntry, JO_HOLDER } from "./launch";
+import { linkHeader, type Links } from "./question-links";
 import { SURFACE_BY } from "./types";
 
 export interface Ceiling {
@@ -243,10 +244,16 @@ export function crossed(s: Spend, c: Ceiling): 0 | 80 | 100 {
 export const CEILING_OPTIONS = ["stop", "extend", "split"] as const;
 export type CeilingOption = (typeof CEILING_OPTIONS)[number];
 
-/** The body of the question raised at 80 % (§ 2 item 4): where the spend stands, stop as the default, and what each answer does. */
-export function ceilingQuestionBody(wl: string, s: Spend, c: Ceiling, stakes: Stakes): string {
+/**
+ * The body of the question raised at 80 % (§ 2 item 4): its link header comes first (PLAN
+ * wl-mv66q5b148uznk § Question kinds; the spend has no file, so it stays in the text), then
+ * where the spend stands, stop as the default, and what each answer does.
+ */
+export function ceilingQuestionBody(wl: string, s: Spend, c: Ceiling, stakes: Stakes, links: Links): string {
+	if (!links) throw new Error(`the ceiling question of ${wl} offers extend, so it carries its links (plan file, review verdict files, PRs); none were given`);
 	const pct = (a: number, b: number) => Math.floor((a / b) * 100);
 	return [
+		...linkHeader(links),
 		`${wl} has used $${s.usd.toFixed(2)} of its $${c.usd} ceiling (${pct(s.usd, c.usd)} %) and ${Math.round(s.wallMin)} of ${c.wallMin} minutes (${pct(s.wallMin, c.wallMin)} %), ${stakes} stakes; ${s.tokens} tokens.`,
 		`stop (the default): the lane keeps working and is stopped at the ceiling; nothing relaunches.`,
 		`extend: the ceiling grows by one more block of this workload's own size and the lane goes on (a stopped lane relaunches); for an exact figure say \`ceiling <usd> [<hours>] ${wl}\` instead.`,

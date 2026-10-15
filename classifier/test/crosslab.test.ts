@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { checkBriefFields } from "../../gates/src/rows/r05-brief-fields";
 import { LANE_RUNNER_BY, Ledger, type Stakes } from "../../ledger/src/index";
 import { createClassifierExtension, REVIEW_FINDINGS_PARAGRAPH } from "../extension";
@@ -18,7 +18,7 @@ import { reviewStopBody, stopReviewsInstructionBody } from "../src/review-stop";
 import { handSpawnBody } from "../src/lab";
 import { countRounds, parseReviewRound, reviewRoundsBody, reviewRoundsExtendBody, roundsInstructionBody } from "../src/rounds";
 import { tierTableFromConfig, type TierTable } from "../src/tier-table";
-import { JO_HOLDER } from "../../surface/src/launch";
+import { JO_HOLDER, planFirstBody } from "../../surface/src/launch";
 import { SURFACE_BY } from "../../surface/src/types";
 import { asyncDelivery, currentModel, DEFAULT_LANE_MODEL, dist, fakeRegistry, recordedQuestion } from "./helpers";
 
@@ -185,6 +185,20 @@ type Lane = ReturnType<typeof lane>;
 
 const bodies = (w: World, prefix = "") => w.ledger.entries(w.wl).map(e => e.body).filter(b => b.startsWith(prefix));
 const questions = (w: World) => w.ledger.questions(w.wl);
+/** One macrotask turn: every microtask queued before it has run. */
+function turn(): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setImmediate(resolve);
+	return promise;
+}
+/**
+ * The questions once a round-limit question is raised: it is raised after the settle's transaction, when
+ * its links are read (PLAN wl-mv66q5b148uznk; the PR read awaits), so wait up to 200 macrotask turns.
+ */
+async function raised(w: World) {
+	for (let i = 0; i < 200 && !questions(w).some(q => JSON.parse(q.options).includes("extend")); i++) await turn();
+	return questions(w);
+}
 
 /** A blocking tier dispatch of `sliceId` that spawns, answers on `model`, and settles. */
 async function settled(h: Lane, w: World, sliceId: string, task: string, model: string, call: string) {
@@ -842,7 +856,7 @@ describe("Round limit (D9), wired", () => {
 		expect(byToken.get(tokens[1]!)?.findings).toMatchObject({ counts: { blocking: {} }, titles: [] });
 	});
 
-	test("the round that reaches the limit raises one extend/accept/stop question at its settle; dispatches after it are refused with no second question", async () => {
+	test("the round at the limit raises one question; dispatches are refused and a withdrawn question is re-raised", async () => {
 		const w = world();
 		const h = lane(w);
 		h.laneMessage(OPUS);
@@ -850,7 +864,7 @@ describe("Round limit (D9), wired", () => {
 		await reviewRound(h, w, "rev-2", blocking("second"));
 		expect(questions(w)).toHaveLength(0);
 		await reviewRound(h, w, "rev-3", reply({ severity: "blocking", kind: "correctness", title: "the grant races" }, { severity: "major", kind: "design", title: "two sources of truth" }));
-		const [q] = questions(w);
+		const [q] = await raised(w);
 		expect(questions(w)).toHaveLength(1);
 		expect(JSON.parse(q!.options)).toEqual(["extend", "accept", "stop"]);
 		expect(bodies(w, "review-limit:")).toEqual([`review-limit: ${q!.id} slice sl-x`]);
@@ -866,11 +880,13 @@ describe("Round limit (D9), wired", () => {
 		}
 		expect(questions(w)).toHaveLength(1);
 
-		// Withdrawn without an answer: the loop is still at its limit, and no second question is raised.
+		// Withdrawn without an answer: the loop remains at its limit; redispatch raises a fresh question.
 		w.ledger.withdrawQuestion(q!.id, { by: SURFACE_BY, reason: "later", author: JO_HOLDER, channel: "surface", then: "replan" });
 		const held = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-6");
-		expect(held?.reason).toContain("is at its round limit (3 failed rounds of 3 allowed)");
-		expect(questions(w)).toHaveLength(1);
+		expect(held?.block).toBe(true);
+		const asked = await raised(w);
+		expect(asked).toHaveLength(2);
+		expect(held?.reason).toContain(`question ${asked[1]!.id}`);
 	});
 
 	test("the limit survives a restart: rounds are counted from the ledger", async () => {
@@ -881,7 +897,7 @@ describe("Round limit (D9), wired", () => {
 		await reviewRound(h, w, "rev-2", blocking("b"));
 		const restarted = lane(w);
 		await reviewRound(restarted, w, "rev-3", blocking("c"));
-		expect(questions(w)).toHaveLength(1);
+		expect(await raised(w)).toHaveLength(1);
 		const third = lane(w);
 		expect((await third.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-4"))?.block).toBe(true);
 		expect(questions(w)).toHaveLength(1);
@@ -901,7 +917,7 @@ describe("Round limit (D9), wired", () => {
 		expect(questions(w)).toHaveLength(0);
 		expect(rounds(w).map(r => r.round)).toEqual([1, 2, 3, 1, 2]);
 		await reviewRound(h, w, "rev-6", blocking("e"));
-		expect(questions(w)).toHaveLength(1);
+		expect(await raised(w)).toHaveLength(1);
 		expect(questions(w)[0]!.body).toContain("Blocking per round: round 1: 1 · round 2: 1 · round 3: 1");
 	});
 
@@ -949,11 +965,69 @@ describe("Round limit (D9), wired", () => {
 			[1, "withheld"],
 		]);
 		expect(all[0]!.group).toBe(all[1]!.group);
-		expect(questions(w)).toHaveLength(1); // the limit question; the accepted leg means no park
+		expect(await raised(w)).toHaveLength(1); // the limit question; the accepted leg means no park
 		expect(bodies(w, "review-limit:")).toHaveLength(1);
 		expect(questions(w)[0]!.body).toContain("1 failed round of 1 allowed (production stakes)");
 		expect(questions(w)[0]!.body).toContain(`Output not accepted: ${all[1]!.token} (withheld)`);
 		expect(bodies(w, "review-loop-end:")).toEqual([]);
+	});
+});
+
+describe("Links (PLAN wl-mv66q5b148uznk § New ledger records 1–2), wired", () => {
+	/** A plan-first workload (the surface's `plan: first`): its plan slice is sl-x, its first open slice. */
+	const planFirstWorld = () => {
+		const w = world();
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.wl, kind: "assumption", body: planFirstBody("your word") });
+		const plan = join(w.dir, "PLAN.md");
+		writeFileSync(plan, "# PLAN\n");
+		return { w, plan };
+	};
+
+	test("a review of the plan slice is refused without a `plan file:` line naming an existing file by absolute path; nothing is recorded", async () => {
+		const { w } = planFirstWorld();
+		const h = lane(w);
+		h.laneMessage(OPUS);
+		const cases: [string, string][] = [
+			["", "this brief has none"],
+			["\nplan file: PLAN.md", "`plan file: PLAN.md` is not an absolute path"],
+			[`\nplan file: ${join(w.dir, "MISSING.md")}`, `no file exists at ${join(w.dir, "MISSING.md")}`],
+			[`\nplan file: ${w.dir}`, `no file exists at ${w.dir}`],
+		];
+		for (const [line, why] of cases) {
+			const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the plan") + line }, `c-${why}`);
+			expect({ line, block: out?.block }).toEqual({ line, block: true });
+			expect(out?.reason).toContain("sl-x is the plan slice of plan-first workload wl-cross");
+			expect(out?.reason).toContain(why);
+		}
+		expect(bodies(w, "plan-file:")).toEqual([]);
+		expect(bodies(w, "hand-spawn:")).toEqual([]);
+	});
+
+	test("the plan slice's review with its plan file records `plan-file:` as the lane; another slice's review needs none", async () => {
+		const { w, plan } = planFirstWorld();
+		const h = lane(w);
+		h.laneMessage(OPUS);
+		expect((await h.toolCall({ agent: "strong", name: "sl-x", task: `${brief(w, "review the plan")}\nplan file: ${plan}` }, "c1"))?.block).toBeUndefined();
+		expect(w.ledger.entries(w.wl).filter(e => e.body.startsWith("plan-file:")).map(e => [e.created_by, e.body])).toEqual([["lane-test", `plan-file: ${plan}`]]);
+
+		const other = planFirstWorld().w;
+		const g = lane(other);
+		g.laneMessage(OPUS);
+		expect((await g.toolCall({ agent: "strong", name: "sl-y", task: brief(other, "review the change") }, "c1"))?.block).toBeUndefined();
+		expect(bodies(other, "plan-file:")).toEqual([]);
+	});
+
+	test("every review hand that settles writes its verdict file beside the ledger and a `review-verdict:` naming it", async () => {
+		const w = world();
+		const h = lane(w);
+		h.laneMessage(OPUS);
+		await reviewRound(h, w, "rev-1", blocking("the grant races"));
+		const [r] = rounds(w);
+		const file = join(dirname(w.ledger.path), "reviews", w.wl, `${r!.token}.md`);
+		expect(bodies(w, "review-verdict:")).toEqual([`review-verdict: ${r!.token} ${file}`]);
+		const text = await Bun.file(file).text();
+		expect(text).toContain(`verdict: accepted`);
+		expect(text).toContain("the grant races");
 	});
 });
 
@@ -1088,7 +1162,7 @@ describe("REVIEW-r1 regressions", () => {
 		expect(bodies(w, "hand-spawn:")).toHaveLength(1);
 		h.handMessage("sl-x", SOL);
 		h.deliver(["sl-x"], blocking("first"));
-		expect(questions(w)).toHaveLength(1); // the one round reached the limit of 1
+		expect(await raised(w)).toHaveLength(1); // the one round reached the limit of 1
 		const after = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-3");
 		expect(after?.reason).toContain(`question ${questions(w)[0]!.id} (review-limit:; options extend / accept / stop) is open`);
 	});
@@ -2095,7 +2169,7 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 		roundsLimit(w, 1);
 		const h = await built(w);
 		await reviewRound(h, w, "rev-1", blocking("first"), { model: KIMI });
-		const [q] = questions(w);
+		const [q] = await raised(w);
 		expect(bodies(w, "review-limit:")).toEqual([`review-limit: ${q!.id} slice sl-x`]);
 		const refused = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-2");
 		expect(refused?.block).toBe(true);

@@ -52,16 +52,26 @@
 // wake, Jo's turn, `orchestrator_ledger`), the needs-you block (the `surface-needs-you` aside and Jo's
 // turn) and each tick line as it is queued — carries an open plan question's path beneath each line
 // naming it (surface/src/plan-paths.ts), decorated once where it is produced.
+//
+// Question links (PLAN wl-mv66q5b148uznk § The rule): each tick also walks the open linked questions
+// (`refreshLinks`). One with no `question-links:` entry (raised before links existed) gets its links
+// computed — legacy verdict files materialized, the PRs read — and recorded as the surface; the needs-you
+// render computes the same links in memory until then (surface/src/errors.ts `shownLinks`). One with an
+// entry has its PRs re-read every tick while its last read failed (`pr: unverified`), at most every
+// LINKS_REREAD_MS otherwise, and a newer entry is recorded only when its link lines changed — never for
+// a failed read alone, which shows nothing new. A changed entry re-delivers the question's line.
 import { CONTRACT_MARKER, contractPath, injectContract } from "../../gates/src/rows/r02-contract";
 import { BACK_HEADING, countLine, lineKey, NEEDS_YOU_HEADING, onFire, pendingText, present, QUIET_HEADING, surfaceWord } from "../src/batch";
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
-import { type ErrorLine, errorLines } from "../src/errors";
+import { type ErrorLine, errorLines, linksState } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
+import { questionSubject } from "../src/orchestrator-question";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
+import { isLinkedQuestion, type Links, linksAtRaise, questionLinks, recordQuestionLinks } from "../src/question-links";
 import { renderWake } from "../src/render";
 import { type SurfaceSession, surfaceSession, voiceInPrompt, voiceSection, type WakeTrigger } from "../src/session";
 import { recordLapsedLeases } from "../src/signals";
-import { type Ctx, HOLD_HOURS, type HostMessage, LEDGER_TOOL, PUSH_TRIES, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
+import { type Ctx, HOLD_HOURS, type HostMessage, LEDGER_TOOL, LINKS_REREAD_MS, PUSH_TRIES, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
 import { launchVerdict, triggerLaunch } from "./launch";
 import { showPending } from "./surface-input";
 import { closeWorkloadWithEntry } from "./workload";
@@ -199,6 +209,17 @@ function pushKey(m: HostMessage): { surfaceKey: string; renderSeq: number; super
 	const d = m.details as { surfaceKey?: unknown; renderSeq?: unknown; supersedes?: unknown } | null | undefined;
 	if (!d || typeof d.surfaceKey !== "string" || typeof d.renderSeq !== "number") return null;
 	return { surfaceKey: d.surfaceKey, renderSeq: d.renderSeq, supersedes: Array.isArray(d.supersedes) ? d.supersedes.filter((k): k is string => typeof k === "string") : [] };
+}
+
+/**
+ * Does `fresh` name other link lines than `recorded` (`linksState`)? A failed PR read over a verified
+ * entry is no change unless the other lines moved: it lists the same recorded PRs and adds only that it failed.
+ */
+function linksChanged(recorded: Links, fresh: Links): boolean {
+	const now = linksState(fresh);
+	if (now === linksState(recorded)) return false;
+	if (fresh.prs.unverified === null || recorded.prs.unverified !== null) return true;
+	return now.split("\n").filter((l) => l !== "pr: unverified").join("\n") !== linksState(recorded);
 }
 
 export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
@@ -427,6 +448,59 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		}
 	};
 
+	/** Per surface session: whether a links pass is running, and when each open linked question's PRs were last read successfully (ms). */
+	const linkPasses = new WeakMap<SurfaceSession, { running: boolean; readAt: Map<string, number> }>();
+
+	/**
+	 * The tick's links pass (PLAN wl-mv66q5b148uznk § The rule): every open linked question — a lane's on its
+	 * workload and slice, an orchestrator's on its subject with no slice — with no `question-links:` entry,
+	 * or whose PRs are due a re-read, gets its links computed now (`linksAtRaise`: legacy verdicts
+	 * materialized, PRs read and recorded as `pr-seen:`) and recorded as the surface when there was no
+	 * entry or `linksChanged`. One pass at a time; a question's failure is a stderr line, never the pass's.
+	 */
+	const refreshLinks = async (s: SurfaceSession): Promise<void> => {
+		const exec = pi.exec?.bind(pi);
+		if (!exec) return;
+		let pass = linkPasses.get(s);
+		if (!pass) {
+			pass = { running: false, readAt: new Map() };
+			linkPasses.set(s, pass);
+		}
+		if (pass.running) return;
+		pass.running = true;
+		try {
+			const ledger = s.ledger();
+			const open = new Set<string>();
+			for (const { workload, openQuestions } of ledger.inFlight()) {
+				for (const q of openQuestions) {
+					if (!isLinkedQuestion(q.options)) continue;
+					const orchestrator = workload.id === STANDING_WORKLOAD_ID;
+					const subject = orchestrator ? questionSubject(ledger, q.id) : workload.id;
+					if (!subject) continue;
+					open.add(q.id);
+					const sliceId = orchestrator ? null : q.slice_id;
+					const recorded = questionLinks(ledger, subject, q.id);
+					const now = Date.parse(s.now());
+					const readAt = pass.readAt.get(q.id) ?? (recorded ? Date.parse(recorded.createdAt) : Number.NEGATIVE_INFINITY);
+					if (recorded && recorded.links.prs.unverified === null && now - readAt < LINKS_REREAD_MS) continue;
+					try {
+						const fresh = await linksAtRaise(exec, ledger, { workloadId: subject, sliceId, by: SURFACE_BY });
+						if (fresh.prs.unverified === null) pass.readAt.set(q.id, now);
+						if (recorded && !linksChanged(recorded.links, fresh)) continue;
+						// The question may have been answered while the PRs were read.
+						if (ledger.question(q.id)?.state !== "open") continue;
+						recordQuestionLinks(ledger, { by: SURFACE_BY, workloadId: subject, sliceId, questionId: q.id, links: fresh });
+					} catch (err) {
+						process.stderr.write(`surface: the links of ${q.id} could not be refreshed: ${String(err)}\n`);
+					}
+				}
+			}
+			for (const id of [...pass.readAt.keys()]) if (!open.has(id)) pass.readAt.delete(id);
+		} finally {
+			pass.running = false;
+		}
+	};
+
 	/**
 	 * A wake trigger: a new wake with its own key and tries, superseding any earlier one, and its push
 	 * one WAKE_PUSH_MS later. The key of a superseded wake that was in flight or fell back is retired,
@@ -465,6 +539,9 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				// second send (it would throw again) and never an unhandled rejection; the lines stay queued for the next push.
 				catchUp(s, ctx).catch((err: unknown) => {
 					process.stderr.write(`surface: the tick's catch-up failed: ${String(err)}\n`);
+				});
+				refreshLinks(s).catch((err: unknown) => {
+					process.stderr.write(`surface: the tick's links pass failed: ${String(err)}\n`);
 				});
 			}, s.pollMs);
 		}

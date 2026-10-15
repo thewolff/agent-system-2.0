@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CLASSIFIER_BY, LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
 import { type Ceiling, CEILING_OPTIONS, ceilingQuestionBody, type Spend } from "../src/ceiling";
+import { expectedLinks, linkHeader } from "../src/question-links";
 import { SURFACE_BY } from "../src/types";
 import { raiseCeilingQuestion } from "../scripts/lane";
 import { tempLedger, workloadWithSlice } from "./helpers";
@@ -60,8 +61,8 @@ function steer(ledger: Ledger, wl: string, words: string): void {
 /** Quoted words over 80 characters: a long steer (signal B). */
 const LONG = "Use the existing token scale rather than new pixel values, and keep the header aligned with the sidebar grid.";
 
-function raise(ledger: Ledger, wl: string): { body: string; options: string[]; id: string } {
-	const { questionId } = raiseCeilingQuestion(ledger, { workloadId: wl, laneId: `lane-${wl.slice(3)}-1`, spend: SPEND, ceiling: NORMAL, stakes: "normal" });
+async function raise(ledger: Ledger, wl: string): Promise<{ body: string; options: string[]; id: string }> {
+	const { questionId } = await raiseCeilingQuestion(ledger, { workloadId: wl, laneId: `lane-${wl.slice(3)}-1`, spend: SPEND, ceiling: NORMAL, stakes: "normal" });
 	const q = ledger.question(questionId)!;
 	return { id: q.id, body: q.body, options: JSON.parse(q.options) as string[] };
 }
@@ -73,20 +74,24 @@ function parsedOffer(body: string): { q: string; site: string; signals: string[]
 	return m ? { q: m[1]!, site: m[2]!, signals: m[3]!.toLowerCase().split(",").sort() } : null;
 }
 
-const BASE = (wl: string) => ceilingQuestionBody(wl, SPEND, NORMAL, "normal");
+const BASE = (ledger: Ledger, wl: string) => ceilingQuestionBody(wl, SPEND, NORMAL, "normal",
+	expectedLinks(ledger, { workloadId: wl, sliceId: null, prs: { ok: true, prs: [] } }));
 const CEILING_TAIL = (wl: string) =>
 	`Answering pair is stop plus a switch to user-driven: the autonomous lane stops at the ceiling, and you continue it yourself (as2 lane ${wl}).`;
 
 describe("ceiling raise with pair-suggest on (D1, D3, D6)", () => {
-	test("signals B and C (three long steers, no done slice): options end with pair, the body is the unchanged body plus one last `pair:` line, and one lane-runner pair-offer: names the question", () => {
+	test("signals B and C (three long steers, no done slice): options end with pair, the body is the linked body plus one last `pair:` line, and one lane-runner pair-offer: names the question", async () => {
 		pairSuggest("all");
 		const { ledger } = tempLedger();
 		const { wl } = workloadWithSlice(ledger);
 		for (let i = 0; i < 3; i++) steer(ledger, wl, LONG);
-		const q = raise(ledger, wl);
+		const q = await raise(ledger, wl);
 		expect(q.options).toEqual([...CEILING_OPTIONS, "pair"]);
 		const lines = q.body.split("\n");
-		expect(lines.slice(0, -1).join("\n")).toBe(BASE(wl));
+		expect(lines.slice(0, -1).join("\n")).toBe(BASE(ledger, wl));
+		const header = linkHeader(expectedLinks(ledger, { workloadId: wl, sliceId: null, prs: { ok: true, prs: [] } }));
+		expect(lines.slice(0, header.length)).toEqual(header);
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith(`question-links: ${q.id} `))).toHaveLength(1);
 		const line = lines.at(-1)!;
 		expect(line).toStartWith("pair: ");
 		expect(line).toContain("3 long steers from you since open");
@@ -96,55 +101,55 @@ describe("ceiling raise with pair-suggest on (D1, D3, D6)", () => {
 		expect(parsedOffer(o[0]!.body)).toEqual({ q: q.id, site: "ceiling", signals: ["b", "c"] });
 	});
 
-	test("B with a done slice: offered on B alone, with B's reason as the whole reason", () => {
+	test("B with a done slice: offered on B alone, with B's reason as the whole reason", async () => {
 		pairSuggest("all");
 		const { ledger } = tempLedger();
 		const { wl, sl } = workloadWithSlice(ledger);
 		ledger.completeSlice(sl, { by: "lane-a", artifact: "bun test → exit 0" });
 		for (let i = 0; i < 4; i++) steer(ledger, wl, LONG);
-		const q = raise(ledger, wl);
+		const q = await raise(ledger, wl);
 		expect(q.options).toEqual([...CEILING_OPTIONS, "pair"]);
-		expect(q.body).toBe(`${BASE(wl)}\npair: 4 long steers from you since open. ${CEILING_TAIL(wl)}`);
+		expect(q.body).toBe(`${BASE(ledger, wl)}\npair: 4 long steers from you since open. ${CEILING_TAIL(wl)}`);
 		expect(parsedOffer(offers(ledger, wl)[0]!.body)?.signals).toEqual(["b"]);
 	});
 
-	test("E alone (a classifier-stamped `pair-signal: taste yes 0.91`) with a done slice: offered with the jev reason", () => {
+	test("E alone (a classifier-stamped `pair-signal: taste yes 0.91`) with a done slice: offered with the jev reason", async () => {
 		pairSuggest("all");
 		const { ledger } = tempLedger();
 		const { wl, sl } = workloadWithSlice(ledger);
 		ledger.completeSlice(sl, { by: "lane-a", artifact: "bun test → exit 0" });
 		ledger.recordEntry({ by: CLASSIFIER_BY, workloadId: wl, kind: "assumption", body: "pair-signal: taste yes 0.91 ambiguous no 0.85 judge typesafe/jev-1.13.0 cost 0.0001" });
-		const q = raise(ledger, wl);
+		const q = await raise(ledger, wl);
 		expect(q.options).toEqual([...CEILING_OPTIONS, "pair"]);
-		expect(q.body).toBe(`${BASE(wl)}\npair: jev: UI/taste work (0.91). ${CEILING_TAIL(wl)}`);
+		expect(q.body).toBe(`${BASE(ledger, wl)}\npair: jev: UI/taste work (0.91). ${CEILING_TAIL(wl)}`);
 		expect(parsedOffer(offers(ledger, wl)[0]!.body)?.signals).toEqual(["e"]);
 	});
 });
 
 describe("ceiling raise with nothing to offer: byte-identical to the raise without the feature (guards)", () => {
-	test("C alone (no done slice, two long steers only): no offer", () => {
+	test("C alone (no done slice, two long steers only): no offer", async () => {
 		pairSuggest("all");
 		const { ledger } = tempLedger();
 		const { wl } = workloadWithSlice(ledger);
 		for (let i = 0; i < 2; i++) steer(ledger, wl, LONG);
-		const q = raise(ledger, wl);
+		const q = await raise(ledger, wl);
 		expect(q.options).toEqual([...CEILING_OPTIONS]);
-		expect(q.body).toBe(BASE(wl));
+		expect(q.body).toBe(BASE(ledger, wl));
 		expect(offers(ledger, wl)).toEqual([]);
 	});
 
-	test("switch off with B and C: body and options exactly the unchanged raise's, no pair-offer:", () => {
+	test("switch off with B and C: body and options exactly the linked raise's, no pair-offer:", async () => {
 		pairSuggest("off");
 		const { ledger } = tempLedger();
 		const { wl } = workloadWithSlice(ledger);
 		for (let i = 0; i < 3; i++) steer(ledger, wl, LONG);
-		const q = raise(ledger, wl);
+		const q = await raise(ledger, wl);
 		expect(q.options).toEqual([...CEILING_OPTIONS]);
-		expect(q.body).toBe(BASE(wl));
+		expect(q.body).toBe(BASE(ledger, wl));
 		expect(offers(ledger, wl)).toEqual([]);
 	});
 
-	test("long words that are not Jo's surface instructions (a direct-channel instruction, a relay of short words) do not count toward B", () => {
+	test("long words that are not Jo's surface instructions (a direct-channel instruction, a relay of short words) do not count toward B", async () => {
 		pairSuggest("all");
 		const { ledger } = tempLedger();
 		const { wl } = workloadWithSlice(ledger);
@@ -153,12 +158,12 @@ describe("ceiling raise with nothing to offer: byte-identical to the raise witho
 			// the body is long, the quoted words are not: B measures the quoted words of a relay
 			ledger.recordInstruction({ by: SURFACE_BY, workloadId: wl, body: `Jo: "yes, go on" — reading: ${LONG}`, author: "jo", channel: "surface" });
 		}
-		const q = raise(ledger, wl);
+		const q = await raise(ledger, wl);
 		expect(q.options).toEqual([...CEILING_OPTIONS]);
-		expect(q.body).toBe(BASE(wl));
+		expect(q.body).toBe(BASE(ledger, wl));
 	});
 
-	test("a pair offer that throws while it is computed: the plain question is raised, the throw is logged, and the raise does not fail (review fix 4)", () => {
+	test("a pair offer that throws while it is computed: the linked question is raised, the throw is logged, and the raise does not fail (review fix 4)", async () => {
 		pairSuggest("all");
 		const { ledger } = tempLedger();
 		const { wl } = workloadWithSlice(ledger);
@@ -174,14 +179,14 @@ describe("ceiling raise with nothing to offer: byte-identical to the raise witho
 		const logged: string[] = [];
 		const write = process.stderr.write;
 		process.stderr.write = ((chunk: string) => { logged.push(String(chunk)); return true; }) as typeof process.stderr.write;
-		const out: { q?: { body: string; options: string[]; id: string } } = {};
+		let q: { body: string; options: string[]; id: string } | undefined;
 		try {
-			expect(() => { out.q = raise(broken, wl); }).not.toThrow();
+			q = await raise(broken, wl);
 		} finally {
 			process.stderr.write = write;
 		}
-		expect(out.q?.options).toEqual([...CEILING_OPTIONS]);
-		expect(out.q?.body).toBe(BASE(wl));
+		expect(q?.options).toEqual([...CEILING_OPTIONS]);
+		expect(q?.body).toBe(BASE(ledger, wl));
 		expect(offers(ledger, wl)).toEqual([]);
 		expect(logged.join("")).toContain(`the pair offer on ${wl} could not be computed (Error: injected instructions read failure)`);
 	});

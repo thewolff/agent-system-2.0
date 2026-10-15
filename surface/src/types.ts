@@ -80,12 +80,51 @@ export type SurfaceAPI = GatesAPI<Ctx> & {
 	/** OMP 18.3.0: `deliverAs: "aside"` injects at the next step boundary; an idle session starts a turn regardless of `triggerTurn`. */
 	sendMessage?(message: SurfaceMessage, options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" }): void;
 	exec?(command: string, args: string[], options?: { timeout?: number; cwd?: string }): Promise<ExecResult>;
+	/** OMP's ExtensionAPI.registerMessageRenderer (pi-coding-agent extensibility/extensions/types.ts, OMP 18.8.6): the component OMP draws a custom message with; surface/extensions/display.ts. */
+	registerMessageRenderer?(customType: string, renderer: MessageRenderer): void;
 	/** The zod members the lane tools use beyond the gates' slice (surface/extensions/lane-tools.ts). */
 	zod: { array(item: unknown): ZodSchema; enum(values: readonly [string, ...string[]]): ZodSchema };
 };
 interface ZodSchema {
 	describe(text: string): unknown;
 	optional(): { describe(text: string): unknown };
+}
+
+/** A pi-tui component as the surface builds one (pi-tui tui.ts Component: rows for a width). */
+export interface TuiComponent {
+	render(width: number): string[];
+}
+/** The pi-tui Theme members the surface's renderer reads (pi-tui theme/theme-class.ts, OMP 18.8.6). */
+export interface TuiTheme {
+	fg(color: string, text: string): string;
+	bg(color: string, text: string): string;
+	bold(text: string): string;
+	readonly boxRound: unknown;
+}
+/** A custom message as OMP hands it to a message renderer (pi-tui chat/messages.ts CustomMessage; only the fields the surface reads). */
+export interface RenderedMessage {
+	customType: string;
+	content: string | readonly { type: string; text?: string }[];
+}
+/** OMP's MessageRenderer (pi-tui chat/extension-types.ts): a component, or undefined for OMP's own Markdown card. */
+export type MessageRenderer = (message: RenderedMessage, options: { expanded: boolean }, theme: TuiTheme) => TuiComponent | undefined;
+/**
+ * The pi-tui modules the surface's renderer draws with: `@oh-my-pi/pi-tui` (components, theme) and
+ * `@oh-my-pi/pi-tui/render/hyperlink` (OSC 8, honouring OMP's hyperlink policy). Only the extension entry
+ * imports them (loader rule, gates/src/host.ts) and hands them over (surface/index.ts).
+ */
+export interface SurfaceTui {
+	Box: new (paddingX?: number, paddingY?: number, bgFn?: (text: string) => string) => TuiComponent & {
+		addChild(component: TuiComponent): void;
+		setBorder(border?: { chars: unknown; color?: (text: string) => string }): void;
+		setIgnoreTight?(ignore: boolean): unknown;
+	};
+	Text: new (text?: string, paddingX?: number, paddingY?: number) => TuiComponent;
+	Spacer: new (lines?: number) => TuiComponent;
+	Markdown: new (text: string, paddingX: number, paddingY: number, theme: unknown, defaultTextStyle?: { color?: (text: string) => string }) => TuiComponent;
+	getMarkdownTheme(): unknown;
+	fileHyperlink(filePath: string, displayText: string): string;
+	uriHyperlink(uri: string, displayText: string): string;
 }
 
 /** The provenance stamp on every write the surface makes. */
@@ -169,6 +208,8 @@ export const QUIET_MS_ENV = "AGENT_SYSTEM_SURFACE_QUIET_MS";
 export const QUIET_MS = 1_800_000;
 /** How many times an unconfirmed wake or notice batch is sent before it falls back to Jo's next turn. */
 export const PUSH_TRIES = 3;
+/** How often the surface's tick re-reads the PRs of an open linked question whose last read succeeded (ms); one whose read failed (`pr: unverified`) is re-read every tick (PLAN wl-mv66q5b148uznk § The rule). */
+export const LINKS_REREAD_MS = 10 * 60_000;
 
 /** Tools the surface registers on the orchestrator session. */
 export const WAKE_READ_TOOL = "orchestrator_wake_read";

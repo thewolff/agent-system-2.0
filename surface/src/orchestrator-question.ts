@@ -25,6 +25,7 @@
 // no orchestrator question could be raised again.
 import type { InstructionRow, Ledger } from "../../ledger/src/index";
 import { ensureStandingWorkload, standingSlice } from "./identity";
+import { type Links, recordQuestionLinks } from "./question-links";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 /** The old in-body subject form, reserved: a body starting so is refused, never stored. */
@@ -39,14 +40,17 @@ const SUBJECT = /^question-about: (q-[a-z0-9]+) (wl-[a-z0-9]+)$/;
 
 /**
  * Raise the orchestrator's question on the standing slice: the row, and when it is about a
- * workload, the subject entry naming it, in one transaction. Validation is the tool's.
+ * workload, the subject entry naming it, in one transaction. A linked question's `links`
+ * (surface/src/question-links.ts) are recorded in the same transaction as its `question-links:`
+ * entry on the subject workload, where the links point and its PRs are re-read. Validation is the tool's.
  */
-export function raiseOrchestratorQuestion(ledger: Ledger, input: { body: string; options: string[]; about: string | null }): string {
+export function raiseOrchestratorQuestion(ledger: Ledger, input: { body: string; options: string[]; about: string | null; links?: Links | null }): string {
 	return ledger.write(() => {
 		ensureStandingWorkload(ledger);
 		const slice = standingSlice(ledger)!;
 		const id = ledger.raiseQuestion({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: slice.id, body: input.body, options: input.options });
 		if (input.about) ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: slice.id, kind: "assumption", body: questionSubjectBody(id, input.about) });
+		if (input.about && input.links) recordQuestionLinks(ledger, { by: SURFACE_BY, workloadId: input.about, questionId: id, links: input.links });
 		return id;
 	});
 }

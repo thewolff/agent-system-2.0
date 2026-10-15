@@ -5,7 +5,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, type EntryRow, type InstructionRow } from "../../ledger/src/index";
-import { ceilingBody, crossed, effectiveCeiling, parseCeiling, parseSpend, scanSpend, sizeFor, spendBody, wallMinutes } from "../src/ceiling";
+import { ceilingBody, ceilingQuestionBody, crossed, effectiveCeiling, parseCeiling, parseSpend, scanSpend, sizeFor, spendBody, wallMinutes } from "../src/ceiling";
 import { controlEntries } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
 import { tmp } from "./helpers";
@@ -102,6 +102,13 @@ describe("effective ceiling (§ 2 item 1: a raise needs Jo)", () => {
 		expect(controlEntries([ceilingAt(1, 500, 720, undefined, "lane-m-1")])).toEqual([]);
 		expect(eff([ceilingAt(1, 500, 720, undefined, "lane-m-1")])).toEqual({ usd: 50, wallMin: 360 });
 		expect(eff([ceilingAt(1, 50, 360), ceilingAt(2, 1, 1, undefined, "lane-m-1")])).toEqual({ usd: 50, wallMin: 360 });
+	});
+});
+
+describe("ceiling question links", () => {
+	test("refuses to build an extend question without a link header at runtime", () => {
+		expect(() => ceilingQuestionBody("wl-m", { usd: 40, tokens: 1000, wallMin: 0 }, { usd: 50, wallMin: 360 }, "normal",
+			undefined as unknown as Parameters<typeof ceilingQuestionBody>[4])).toThrow(/offers extend.*none were given/);
 	});
 });
 

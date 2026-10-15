@@ -353,15 +353,16 @@ describe("surface lines (D2)", () => {
 		expect(notices[0]).not.toContain(`plan for #${x.n(reserved)}`);
 	});
 
-	test("7a: needs-you: the plan question's own line has its path directly beneath the q- id, once; an orchestrator question naming the plan q- id gets the path beneath its line", async () => {
+	test("7a: needs-you: the plan question's own line has its path directly beneath the q- id, once, its link lines next (PLAN wl-mv66q5b148uznk § Display); an orchestrator question naming the plan q- id gets the path beneath its line", async () => {
 		const e = env();
 		const l = open(e);
 		const P = "/tmp/plan-seven/PLAN.md";
-		const { q, sl } = seedPlan(l, P);
+		const { wl, q, sl } = seedPlan(l, P);
 		l.close();
 		const x = await start(e);
 		const needs = x.wake.slice(x.wake.indexOf("## needs you"), x.wake.indexOf("\n## ", x.wake.indexOf("## needs you") + 1));
-		expect(needs).toContain(`(${q}, slice ${sl}):\n  ${P}\n  - sl-build: `);
+		// The path stays beneath the q- id (it is the plan link); the computed review line follows it, then body line 2.
+		expect(needs).toContain(`(${q}, slice ${sl}):\n  ${P}\n  review: none — no review round has completed on ${wl}\n  - sl-build: `);
 		expect(count(needs, P)).toBe(1);
 		expect(needs).not.toContain("plan for");
 
@@ -497,7 +498,7 @@ describe("surface lines (D2)", () => {
 		const b = seedPlan(l3, shared, "lane-b");
 		l3.close();
 		const y = await start(e2);
-		for (const p of [a, b]) expect(y.wake).toContain(`(${p.q}, slice ${p.sl}):\n  ${shared}\n  - sl-build: `);
+		for (const p of [a, b]) expect(y.wake).toContain(`(${p.q}, slice ${p.sl}):\n  ${shared}\n  review: none — no review round has completed on ${p.wl}\n  - sl-build: `);
 		await y.idleTurn([assistant(`${a.q} and ${b.q} share one plan.`)]);
 		expect(y.of(PLAN_PATH).map((m) => m.message.content)).toEqual([`plan for ${a.q}: ${shared}\nplan for ${b.q}: ${shared}`]);
 

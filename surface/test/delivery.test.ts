@@ -97,17 +97,20 @@ describe("the ceiling question's stop at 100 % is a new state of its line (PLAN 
 		const q = ledger.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body: "80 % of the ceiling", options: [...CEILING_OPTIONS] });
 		const d = new Delivered();
 		const at80 = errorLines(ledger).find((l) => l.rowId === q)!;
-		expect(at80.state).toBeUndefined();
+		// The ceiling question offers extend, so it is linked (PLAN wl-mv66q5b148uznk): its state is its link lines, `stopped` after them at 100 %.
+		const links = at80.state!;
+		expect(links.split("\n")[0]).toStartWith("plan: ");
+		expect(links.split("\n")).not.toContain("stopped");
 		expect(at80.line).not.toContain("stopped at the ceiling");
 		expect(d.take([at80])).toHaveLength(1);
 		// a stop for another reason changes nothing
 		c.plusHours(1);
 		const req = ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: "lane-stop: lane-t-1 requested mode-flip by jo" });
 		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: `lane-stop: lane-t-1 accepted ${req}` });
-		expect(errorLines(ledger).find((l) => l.rowId === q)!.state).toBeUndefined();
+		expect(errorLines(ledger).find((l) => l.rowId === q)!.state).toBe(links);
 		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: "lane-stop: lane-t-1 accepted ceiling" });
 		const at100 = errorLines(ledger).find((l) => l.rowId === q)!;
-		expect(at100.state).toBe("stopped");
+		expect(at100.state).toBe(`${links}\nstopped`);
 		expect(at100.line.endsWith("(or `withdraw`); the lane stopped at the ceiling")).toBe(true);
 		expect(d.take([at100])).toEqual([at100]);
 		expect(d.take([at100])).toEqual([]);
@@ -285,7 +288,7 @@ describe("between wakes: a line written by another connection after the wake rea
 		lane.close();
 	});
 
-	test("a plan question offering approve is pushed whole: the path on the line beneath the q- id, each other line indented under it (PLAN wl-muq22rnjcfrrpc D8, PLAN wl-mv61a8dh4aeneo D2)", async () => {
+	test("a plan question offering approve is pushed whole: the path on the line beneath the q- id, its link lines next, each other line indented under it (PLAN wl-muq22rnjcfrrpc D8, PLAN wl-mv61a8dh4aeneo D2, PLAN wl-mv66q5b148uznk § Display)", async () => {
 		timers.length = 0;
 		const f = fakePi();
 		const e = env({ AGENT_SYSTEM_SURFACE_BATCH_MS: "0" });
@@ -317,8 +320,9 @@ describe("between wakes: a line written by another connection after the wake rea
 		lane.close();
 		timers[0]!.fn();
 		expect(f.sent).toHaveLength(1);
+		// The path is the plan link, so it is not repeated; the computed review line (no round yet) follows it, then body lines 2..n.
 		expect(f.sent[0]!.message.content).toBe(
-			`## needs you (new since your last turn)\n- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${plan.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)\n\n${count(1)}`,
+			`## needs you (new since your last turn)\n- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${[plan[0], `review: none — no review round has completed on ${wl}`, ...plan.slice(1)].join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)\n\n${count(1)}`,
 		);
 	});
 });

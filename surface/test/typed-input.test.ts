@@ -10,6 +10,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import orchestratorSurface from "../index";
 import { surfaceSession } from "../src/session";
+import { expectedLinks, linkHeader } from "../src/question-links";
 import { STANDING_WORKLOAD_ID } from "../src/types";
 import { ctxOf, fakePi, notified, notices, tempLedger, timeouts, tmp } from "./helpers";
 
@@ -47,7 +48,10 @@ function surface() {
 	const modelSaw = (): string => [...model, ...s().notices].join("\n");
 	const joRows = () => ledger.instructions(STANDING_WORKLOAD_ID).filter((i) => i.kind === "instruction" && i.author === "jo");
 	const raise = async (options: string[]): Promise<string> => {
-		const text = (await f.tool("orchestrator_raise_question").execute("1", { body: "Ship the header fix?", options, about: wl }, undefined, undefined, ctx)).content[0]!.text;
+		const header = options.some((o) => ["approve", "accept", "extend"].includes(o))
+			? `${linkHeader(expectedLinks(ledger, { workloadId: wl, sliceId: null, prs: { ok: true, prs: [] } })).join("\n")}\n`
+			: "";
+		const text = (await f.tool("orchestrator_raise_question").execute("1", { body: `${header}Ship the header fix?`, options, about: wl }, undefined, undefined, ctx)).content[0]!.text;
 		const m = /^Raised question (q-\S+)/.exec(text);
 		if (!m) throw new Error(`not raised: ${text}`);
 		return m[1]!;

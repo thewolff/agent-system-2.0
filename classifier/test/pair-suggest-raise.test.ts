@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CLASSIFIER_BY, Ledger, type Mode, type Stakes } from "../../ledger/src/index";
 import { JO_HOLDER } from "../../surface/src/launch";
+import { expectedLinks, linkHeader } from "../../surface/src/question-links";
 import { SURFACE_BY } from "../../surface/src/types";
 import { createClassifierExtension } from "../extension";
 import { loadCalibration } from "../src/classify";
@@ -195,11 +196,19 @@ function pairSignal(w: World, body: string, by = CLASSIFIER_BY): void {
 }
 const TASTE_YES = "pair-signal: taste yes 0.91 ambiguous no 0.85 judge typesafe/jev-1.13.0 cost 0.0001";
 
+/** The linked limit question is raised after settle awaits its PR read. */
+function turn(): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setImmediate(resolve);
+	return promise;
+}
+
 /** Settle `rounds` blocking rounds of sl-x and return the one round-limit question. */
 async function toTheLimit(w: World, rounds: number): Promise<{ id: string; body: string; options: string[] }> {
 	const h = lane(w);
 	h.laneMessage(OPUS);
 	for (let i = 1; i <= rounds; i++) await reviewRound(h, w, `rev-${i}`, `finding ${i}`);
+	for (let i = 0; i < 200 && w.ledger.questions(w.wl).length === 0; i++) await turn();
 	const qs = w.ledger.questions(w.wl);
 	expect(qs).toHaveLength(1);
 	return { id: qs[0]!.id, body: qs[0]!.body, options: JSON.parse(qs[0]!.options) as string[] };
@@ -208,7 +217,8 @@ async function toTheLimit(w: World, rounds: number): Promise<{ id: string; body:
 /** The body the unchanged raise writes: `roundLimitQuestionBody` over the rows the raise read. */
 function baseBody(w: World): string {
 	const entries = w.ledger.entries(w.wl).filter((e) => !/^(review-limit|pair-offer):/.test(e.body));
-	return roundLimitQuestionBody(SL, countRounds(entries, SL), effectiveRoundLimit(entries, w.ledger.instructions(w.wl), w.stakes, SL), w.stakes);
+	return roundLimitQuestionBody(SL, countRounds(entries, SL), effectiveRoundLimit(entries, w.ledger.instructions(w.wl), w.stakes, SL), w.stakes,
+		expectedLinks(w.ledger, { workloadId: w.wl, sliceId: SL, prs: { ok: true, prs: [] } }));
 }
 
 const offers = (w: World) => w.ledger.entries(w.wl).filter((e) => e.body.startsWith("pair-offer:"));
@@ -222,7 +232,7 @@ const ROUND_LIMIT_TAIL = (wl: string) =>
 	`Answering pair stops this review loop like stop and switches this workload to user-driven, so you steer the lane yourself (as2 lane ${wl}).`;
 
 describe("round-limit raise with pair-suggest on (D1, D3, D6)", () => {
-	test("switch all and a classifier-stamped `pair-signal: taste yes 0.91`: options end with pair, the body is the unchanged body plus one last `pair:` line, and one classifier-stamped pair-offer: names the question", async () => {
+	test("switch all and a classifier-stamped `pair-signal: taste yes 0.91`: options end with pair, the linked body has one last `pair:` line, and classifier-stamped pair-offer: names the question", async () => {
 		pairSuggest("all");
 		const w = world();
 		roundsLimit(w, 1);
@@ -232,6 +242,9 @@ describe("round-limit raise with pair-suggest on (D1, D3, D6)", () => {
 		const line = `pair: jev: UI/taste work (0.91). ${ROUND_LIMIT_TAIL(w.wl)}`;
 		expect(q.body.split("\n").at(-1)).toBe(line);
 		expect(q.body).toBe(`${baseBody(w)}\n${line}`);
+		const header = linkHeader(expectedLinks(w.ledger, { workloadId: w.wl, sliceId: SL, prs: { ok: true, prs: [] } }));
+		expect(q.body.split("\n").slice(0, header.length)).toEqual(header);
+		expect(w.ledger.entries(w.wl).filter((e) => e.body.startsWith(`question-links: ${q.id} `))).toHaveLength(1);
 		const o = offers(w);
 		expect(o.map((e) => e.created_by)).toEqual([CLASSIFIER_BY]);
 		expect(parsedOffer(o[0]!.body)).toEqual({ q: q.id, site: "round-limit", signals: ["e"] });

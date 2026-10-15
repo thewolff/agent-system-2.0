@@ -58,6 +58,10 @@ import {
 	LANE_WITHDRAW_RESERVED_TOOL, ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, type SurfaceAPI, TEST_RUN_FAILED_PREFIX, type ToolResult,
 } from "../src/types";
 import { isReleased, markReleased } from "./lane";
+import { type Exec, isLinkedQuestion, type Links, linkProblem, linksAtRaise, planLinkProblem, recordQuestionLinks } from "../src/question-links";
+
+/** A header line `linkHeader` writes (`plan:`, `review:`, `review (sl-…, round n):`, `pr:`), as `linkProblem` reads one (surface/src/question-links.ts). */
+const LINK_LINE = /^(plan|review|pr)(\s\([^)]*\))?:/;
 
 /**
  * The installed starter (PLAN wl-muraerdsgw7gn4 § 2.1): this extension is loaded from the main
@@ -313,10 +317,13 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			"1 to 3 `tradeoff: <one line>` lines; one `review: <verdict>, <model>, <absolute path to the verdict file>` line. " +
 			`The plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\n` +
 			"A plan question offering approve is refused until a review hand named after the plan slice has reviewed the plan on another lab since the last question, and refused in any other shape. " +
+			"Any question offering approve, accept or extend carries links the machinery computes from the ledger and the open PRs: the plan question's line 1 is the recorded plan file and its review line names a verdict file of the plan slice's newest review round; " +
+			"any other such question starts with its `plan:`, `review:` (or `review (<slice>, round <n>):`) and `pr:` lines, one per line, then the question. " +
+			"A body without the exact lines is refused with the lines to paste; a failed PR read is refused with gh's error: raise it again once gh answers. " +
 			"Until the plan is approved, a question offering approve on any other slice is refused.",
 		parameters: z.object({
 			slice: z.string().describe("The slice id (sl-…) the question is about."),
-			body: z.string().describe("The question, in plain words (the plan slice's approve question: the plan in the shape above)."),
+			body: z.string().describe("The question, in plain words (the plan slice's approve question: the plan in the shape above; any other approve / accept / extend question: its link lines first)."),
 			options: z.array(z.string()).describe("At least two answers Jo can give in one word each."),
 		}),
 		approval: "write",
@@ -331,7 +338,14 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			// PLAN wl-mv67564rdkfvnk D9 (2): `pair` is offered only by the round-limit and ceiling raise sites, never by a lane.
 			if (options.some((x) => x.toLowerCase() === PAIR_OPTION)) return text(`The option \`${PAIR_OPTION}\` is offered only by the round-limit and ceiling questions the machinery raises; nothing was asked.`);
 			if (options.some((x) => /\s/.test(x))) return text("Each option is one word (Jo answers with it alone or as `<option> q-…`); nothing was asked.");
-			const refused = reserved(body, "asked") ?? runnerSignal(body, "asked");
+			// A linked question (approve, accept or extend) opens with its link lines, `plan:` among them; those lines are held to the
+			// exact computed header below, before anything is written, so the reserved checks read the question's own words after them.
+			const linked = isLinkedQuestion(options);
+			const lines = body.split("\n");
+			let lead = 0;
+			while (linked && lead < lines.length && LINK_LINE.test(lines[lead]!.trim())) lead++;
+			const prose = lines.slice(lead).join("\n").trim();
+			const refused = reserved(prose, "asked") ?? runnerSignal(prose, "asked");
 			if (refused) return refused;
 			const on = sliceOn(o.own, slice, "asked");
 			if (!on.ok) return on.result;
@@ -386,10 +400,29 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 					);
 				}
 			}
-			// D9 part two: the plan question's role is recorded as it is raised, by the holding lane, in the same write.
+			// A question offering approve, accept or extend carries links computed from the ledger and the open PRs
+			// (PLAN wl-mv66q5b148uznk § The rule): the plan question keeps D7's shape and is checked after it (its plan
+			// line, its verdict file); any other starts with the exact header. A failed PR read refuses either: retry.
+			// OMP's runner for the PR read; a host without one fails the read, so a linked question is refused (retry), never asked unlinked.
+			const exec: Exec = pi.exec ? pi.exec.bind(pi) : () => Promise.reject(new Error("the host has no exec for extensions"));
+			let links: Links | null = null;
+			if (linked) {
+				try {
+					links = await linksAtRaise(exec, ledger, { workloadId, sliceId: slice, by: o.own.laneId });
+				} catch (error) {
+					return text(`The question links could not be prepared (${error instanceof Error ? error.message : String(error)}); retry after the ledger or verdict files are available. Nothing was asked.`);
+				}
+			}
+			if (links !== null) {
+				// After the plan checks, linkProblem's first reason left is the failed read (the plan question's PRs show at display).
+				const problem = plan ? (planLinkProblem(body, links, ledger, workloadId, slice) ?? (links.prs.unverified !== null ? linkProblem(body, links) : null)) : linkProblem(body, links);
+				if (problem !== null) return text(`${problem}. Nothing was asked.`);
+			}
+			// D9 part two: the plan question's role is recorded as it is raised, by the holding lane, in the same write; so are its links.
 			const id = ledger.write(() => {
 				const q = ledger.raiseQuestion({ by: o.own.laneId, workloadId, sliceId: slice, body, options });
 				if (plan) ledger.recordEntry({ by: o.own.laneId, workloadId, sliceId: slice, kind: "assumption", body: planQuestionBody(q) });
+				if (links !== null) recordQuestionLinks(ledger, { by: o.own.laneId, workloadId, sliceId: slice, questionId: q, links });
 				return q;
 			});
 			return text(`Raised question ${id} on ${slice} (${options.join(" / ")}); the slice is paused until Jo answers.`, { id });

@@ -24,8 +24,13 @@
 //    `prompt-wait:` (a leaked blocking prompt, § B3 item 5 first trigger). A question is cut at 120
 //    characters, except the plan question (`isPlanQuestionIn`, PLAN wl-muq22rnjcfrrpc D8): it shows
 //    whole, its body starting on the line beneath the q- id (the plan path directly beneath the line
-//    naming the question, PLAN wl-mv61a8dh4aeneo D2) and every body line indented two spaces. The
-//    runner's ceiling question takes the state `stopped` once the workload's newest `lane-stop:` is
+//    naming the question, PLAN wl-mv61a8dh4aeneo D2) and every body line indented two spaces. A linked
+//    question (one offering approve, accept or extend; PLAN wl-mv66q5b148uznk § Display) shows its links
+//    first, one whole line each beneath the q- id (`shownLinks`: its newest `question-links:` entry, else
+//    computed now), then its body without the header it starts with, cut at 120; the plan question keeps
+//    its path line first and its link lines follow it, then body lines 2..n. A linked line is delivered
+//    again when its links change (`linksState`). The runner's ceiling question takes the state `stopped`
+//    (after its link lines: it offers extend, so it is linked) once the workload's newest `lane-stop:` is
 //    `accepted ceiling`, written at or after it (PLAN wl-mv5msri070p0qo D3), so the stop at 100 %
 //    reaches the surface again though the question surfaced at 80 %.
 // 6. a lane that ended leaving work idle (MIGRATION.md item 68): an open workload (the standing one
@@ -51,6 +56,7 @@ import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { isCeilingQuestion } from "./input";
 import { type ControlEntry, type ControlPrefix, controlEntries, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
 import { questionSubject } from "./orchestrator-question";
+import { expectedLinks, isLinkedQuestion, linkHeader, type Links, questionLinks, questionLinksIn, recordedPrs } from "./question-links";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { parseTestRunFailed, testRuns } from "./test-run";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
@@ -95,6 +101,40 @@ export interface ErrorOptions {
 }
 
 const short = (s: string, n = 90): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+
+/**
+ * The links a linked question shows (PLAN wl-mv66q5b148uznk § The rule, § Display): its newest
+ * `question-links:` entry on `workloadId` (the question's own workload; an orchestrator question's
+ * subject), read from `control` when the caller has the workload's control entries; else — a question
+ * raised before links existed, until the tick records its entry (surface/extensions/wake.ts) — the
+ * links computed now from the ledger, with the PRs the ledger records.
+ */
+export function shownLinks(ledger: Ledger, o: { workloadId: string; sliceId: string | null; questionId: string; control?: readonly ControlEntry[] }): Links {
+	const recorded = o.control ? questionLinksIn(o.control, o.questionId) : questionLinks(ledger, o.workloadId, o.questionId);
+	return recorded?.links ?? expectedLinks(ledger, { workloadId: o.workloadId, sliceId: o.sliceId, prs: { ok: true, prs: recordedPrs(ledger, o.workloadId) } });
+}
+
+/** A linked question's state: its link lines, a failed PR read's reason left out, so a reworded failure is not a change. */
+export function linksState(links: Links): string {
+	return linkHeader(links).map((l) => (l.startsWith("pr: unverified") ? "pr: unverified" : l)).join("\n");
+}
+
+/** A header line a linked question's body starts with (question-links.ts `linkHeader`'s shapes). */
+const HEADER_LINE = /^(plan|review|pr)(\s\([^)]*\))?:/;
+
+/**
+ * A linked question's body beneath its q- id: its link lines first, then the body without the header it
+ * starts with, cut at 120. The plan question (`plan`) keeps #112's layout: body line 1, its plan path,
+ * stays first, the link lines follow it (less a `plan:` line naming that same path), then lines 2..n whole.
+ */
+function linkedBody(body: string, links: Links, plan: boolean): string {
+	const header = linkHeader(links);
+	const lines = body.split("\n");
+	if (plan) return `\n  ${[lines[0]!, ...header.filter((l) => l !== `plan: ${lines[0]!.trim()}`), ...lines.slice(1)].join("\n  ")}`;
+	const start = lines.findIndex((l) => !HEADER_LINE.test(l));
+	const text = start < 0 ? "" : short(lines.slice(start).join("\n"), 120);
+	return `\n  ${[...header, ...text.split("\n")].join("\n  ")}`;
+}
 
 /** Hours between two ISO timestamps, unrounded. */
 export function hoursElapsed(from: string, to: string): number {
@@ -357,17 +397,24 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		}
 		for (const q of openQuestions) {
 			if (wl === STANDING_WORKLOAD_ID) {
-				// The orchestrator's own ask to Jo (MIGRATION.md item 105), its subject workload from the surface's subject entry.
+				// The orchestrator's own ask to Jo (MIGRATION.md item 105), its subject workload from the surface's subject entry;
+				// a linked one's links are its subject's (it names one: surface/extensions/question.ts).
 				const about = questionSubject(ledger, q.id);
-				questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `the orchestrator asked you (${q.id}${about ? `, about ${about}` : ""}): ${short(q.body, 120)} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
+				const links = about && isLinkedQuestion(q.options) ? shownLinks(ledger, { workloadId: about, sliceId: null, questionId: q.id }) : null;
+				const body = links ? linkedBody(q.body, links, false) : ` ${short(q.body, 120)}`;
+				questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(links ? { state: linksState(links) } : {}), line: `the orchestrator asked you (${q.id}${about ? `, about ${about}` : ""}):${body} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
 				continue;
 			}
-			const body = isPlanQuestionIn(control, q) ? `\n  ${q.body.split("\n").join("\n  ")}` : ` ${short(q.body, 120)}`;
+			const plan = isPlanQuestionIn(control, q);
+			const links = isLinkedQuestion(q.options) ? shownLinks(ledger, { workloadId: wl, sliceId: q.slice_id, questionId: q.id, control }) : null;
+			const body = links ? linkedBody(q.body, links, plan) : plan ? `\n  ${q.body.split("\n").join("\n  ")}` : ` ${short(q.body, 120)}`;
 			// The stop at 100 % (PLAN wl-mv5msri070p0qo D3): the workload's newest lane-stop: accepted the ceiling at or after the question; a new state, so it is delivered again.
 			const stop = control.filter((c) => c.prefix === "lane-stop").at(-1);
 			const stopped = stop !== undefined && /^accepted ceiling\b/.test(stop.rest) && stop.createdAt >= q.created_at && isCeilingQuestion(q, slices.find((s) => s.id === q.slice_id) ?? ledger.slice(q.slice_id));
+			// The ceiling question offers extend, so it is linked too: its state is its link lines, then `stopped` once the lane stopped.
+			const state = [...(links ? [linksState(links)] : []), ...(stopped ? ["stopped"] : [])].join("\n");
 			questions.push({
-				kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(stopped ? { state: "stopped" } : {}),
+				kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(state ? { state } : {}),
 				line: `lane on ${label} is waiting on you (${q.id}, slice ${q.slice_id}):${body} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)${stopped ? "; the lane stopped at the ceiling" : ""}`,
 			});
 		}

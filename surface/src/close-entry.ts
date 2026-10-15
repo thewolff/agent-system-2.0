@@ -36,6 +36,7 @@ import {
 	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, type RangeCommit, type RunRecord,
 	SHA_RE, servedRepo, type TestRunnerConfig, testRunnerConfig, testRuns,
 } from "./test-run";
+import { createdPr, recordPrsSeen } from "./question-links";
 import { DECISION_LOG_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, type SurfaceAPI } from "./types";
 
 const LOCAL_MS = 15_000;
@@ -194,8 +195,9 @@ export interface EntryCommit {
 	/**
 	 * For `publishEntry`: the repo top, its default branch, whether it has an origin; null when nothing was committed.
 	 * Under a pin, `sha` is the commit to push by sha and `ownerRepo` the repo every `gh` call names with `-R`.
+	 * `ledger` is where the PR a `gh pr create` opens is recorded (`pr-seen:`).
 	 */
-	publish: { top: string; defaultBranch: string | null; origin: boolean; sha: string | null; ownerRepo: string | null } | null;
+	publish: { top: string; defaultBranch: string | null; origin: boolean; sha: string | null; ownerRepo: string | null; ledger: Ledger } | null;
 	/** Under a pin: why the close must not go ahead (the branch moved after the close check, or the commit is not D on C); else null. */
 	refused: string | null;
 }
@@ -378,7 +380,7 @@ export async function commitCloseEntry(
 	const path = t.tempDir === null ? rendered : `${branch}:.ai/decision-log/${basename(rendered)}`;
 	return {
 		path, branch, commit: null, already: c.already, notes, refused: null,
-		publish: { top: t.top, defaultBranch: t.defaultBranch, origin: t.origin, sha, ownerRepo: pin?.ownerRepo ?? null },
+		publish: { top: t.top, defaultBranch: t.defaultBranch, origin: t.origin, sha, ownerRepo: pin?.ownerRepo ?? null, ledger },
 	};
 }
 
@@ -405,7 +407,7 @@ export async function publishEntry(pi: SurfaceAPI, e: EntryCommit, id: string): 
 	if (e.publish === null) return { push: "nothing was committed", pr: null, prCreated: false, prReason: `nothing was committed; ${byHand}` };
 	if (!pi.exec) return { push: "the host has no exec for extensions", pr: null, prCreated: false, prReason: `the host has no exec; ${byHand}` };
 	const exec = pi.exec.bind(pi);
-	const { top, defaultBranch, origin, sha, ownerRepo } = e.publish;
+	const { top, defaultBranch, origin, sha, ownerRepo, ledger } = e.publish;
 	if (!origin) return { push: `${top} has no origin remote`, pr: null, prCreated: false, prReason: `no origin remote; push ${e.branch} and ${byHand}` };
 	const p = sha === null
 		? await git(exec, top, ["push", "--quiet", "-u", "origin", e.branch], NETWORK_MS)
@@ -429,7 +431,17 @@ export async function publishEntry(pi: SurfaceAPI, e: EntryCommit, id: string): 
 	const create = await run(exec, "gh", ["pr", "create", ...repoArgs, "--head", e.branch, "--base", defaultBranch, "--title", title, "--body", body], NETWORK_MS, top);
 	if (create.code !== 0) return { push, pr: null, prCreated: false, prReason: `${failed("gh pr create", create)}; ${byHand}` };
 	const created = create.out.split("\n").filter(Boolean).at(-1) ?? "";
-	return created ? { push, pr: created, prCreated: true, prReason: null } : { push, pr: null, prCreated: false, prReason: `gh pr create printed no url; ${byHand}` };
+	if (!created) return { push, pr: null, prCreated: false, prReason: `gh pr create printed no url; ${byHand}` };
+	// The PR is recorded when it is made (PLAN wl-mv66q5b148uznk § The rule, pr): a recording failure never fails the publish.
+	const seen = createdPr(create.out);
+	if (seen) {
+		try {
+			recordPrsSeen(ledger, id, SURFACE_BY, [seen]);
+		} catch {
+			// the PR exists; the tick's `gh pr list` read records it
+		}
+	}
+	return { push, pr: created, prCreated: true, prReason: null };
 }
 
 // ---- the close check (PLAN § 2.4 item 4) ------------------------------------------------------------

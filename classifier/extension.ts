@@ -129,6 +129,16 @@
  * loop's running round still settles, ends the loop (`review-loop-end: … stop-reviews`) and
  * enqueues one orchestrator message with its findings.
  *
+ * Links (PLAN wl-mv66q5b148uznk § The rule, § New ledger records 1–2). Wherever `review-round:` is
+ * written, the hand's verdict file `<dir of the ledger file>/reviews/<wl>/<token>.md` is written too
+ * (its round record and its reply, or why it never replied) with its `review-verdict:` entry. A review
+ * of a plan-first workload's plan slice must carry a brief line `plan file: <absolute path of an
+ * existing file>`, or it is refused; the path is recorded as `plan-file:`. The round-limit question is
+ * raised after its round's transaction, once its links are read (`linksAtRaise`, one `gh pr list`
+ * through `pi.exec`): its body starts with their header and they are recorded as `question-links:`
+ * in the question's transaction. A failed PR read never holds the question; it shows as
+ * `pr: unverified`.
+ *
  * The pair trigger (PLAN wl-mv67564rdkfvnk D1, D4; surface/src/pair-suggest.ts): when the installed profile's
  * `pairSuggest` switch covers the bound workload, a background jev call asks classifier/pair-signal-question.json's
  * `taste` and `ambiguous` about the brief (single-flight, three attempts at most, 10 s each) and writes one
@@ -136,8 +146,8 @@
  * a last `pair:` line and a classifier-stamped `pair-offer:`, when `pairOffer` finds a signal.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { LANE_ENV, WORKLOAD_ENV } from "../gates/src/types";
 import { type HostModules, hostSettings, readSetting } from "../gates/src/host";
 import { CLASSIFIER_BY, type EntryRow, Ledger, type QuestionRow, type RoutingOutcome, type Stakes } from "../ledger/src/index";
@@ -212,17 +222,20 @@ import {
 	reviewLoopEndBody,
 	reviewRoundBody,
 	type ReviewVerdict,
+	reviewVerdictText,
 	ROUND_LIMIT_OPTIONS,
 	roundBlockingText,
 	roundLimitQuestionBody,
 	SEVERITIES,
 	severityLine,
 	UNKNOWN,
+	type VerdictSource,
 } from "./src/rounds";
 import { isTier, route, STAKES, type Routing, type Tier } from "./src/route";
 import { identity, loadTierTable, modelIdentity, type TierTable } from "./src/tier-table";
-import { controlEntries, type LaneStarted, laneStarted } from "../surface/src/launch";
+import { controlEntries, holdersOf, type LaneStarted, laneStarted, planFirst, planSlice } from "../surface/src/launch";
 import { ompPidState, type PidState } from "../surface/src/omp-probe";
+import { type Exec, linksAtRaise, planFileBody, recordedPlanFile, recordQuestionLinks, reviewVerdictBody, verdictPath } from "../surface/src/question-links";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../surface/src/types";
 import {
 	PAIR_OPTION, type PairLedger, type PairSignalId, pairExposureBody, pairOffer, pairOfferBody, pairOfferStamp, pairSignalBody, pairSignalFailedBody, pairSuggestOn,
@@ -251,8 +264,12 @@ export interface ClassifierDeps {
 	question: KindQuestion;
 	/** The question and judge the 0.55 threshold was measured with (classifier/calibration.json). */
 	calibration: Calibration;
-	/** The ledger the routing rows land in; opened lazily in production. */
-	ledger(): RoutingLedger;
+	/**
+	 * The ledger the routing rows land in; opened lazily in production. The whole module, not the
+	 * routing port: a linked question's links (surface/src/question-links.ts) read the ledger file's
+	 * directory, its slices and its holders.
+	 */
+	ledger(): Ledger;
 	/** `created_by` on routing rows: this lane's id. */
 	laneId: string;
 	/** The workload this session is bound to (`AGENT_SYSTEM_WORKLOAD_ID`, gates/src/types.ts), if any. */
@@ -275,6 +292,11 @@ export interface ClassifierDeps {
 	ompState(pid: number, start: string): PidState;
 	/** Lost-hand settle (D2): when the file at `path` was last written (ms since the epoch), or null when it does not exist. Production: `statSync(path).mtimeMs`. */
 	lastWrite(path: string): number | null;
+	/**
+	 * The PR read of the round-limit question's links (`gh pr list`, surface/src/question-links.ts
+	 * `readPrs`; PLAN wl-mv66q5b148uznk § The rule, pr). OMP's `pi.exec` when absent.
+	 */
+	exec?: Exec;
 }
 
 /** One classified tier item, waiting for its spawn. */
@@ -683,19 +705,48 @@ function findingsIn(text: string | null): FindingsOrUnknown {
 }
 
 /**
- * D9: a review hand's findings, from what was delivered for it; when that carries no readable block
- * (OMP may cut a long result to a preview), from the full output OMP writes before the result exists
- * (`<artifactsDir>/<id>.md`, task/executor.ts finalizeRunResult).
+ * D9 and PLAN wl-mv66q5b148uznk § New ledger records 1: a review hand's reply, what its verdict file
+ * holds and its findings are read from. What was delivered for it when that carries a readable
+ * findings block; else (OMP may cut a long result to a preview) the full output OMP writes before the
+ * result exists (`<artifactsDir>/<id>.md`, task/executor.ts finalizeRunResult); else what was delivered;
+ * else why there is no reply.
  */
-function handFindings(delivered: string | null, root: string, agentId: string): FindingsOrUnknown {
-	const f = findingsIn(delivered);
-	if (f !== UNKNOWN) return f;
+function handReply(delivered: string | null, root: string, agentId: string): VerdictSource {
+	const lane = { reply: delivered ?? "", from: `the output delivered to the lane for ${agentId}` };
+	if (delivered && findingsIn(delivered) !== UNKNOWN) return lane;
 	const file = join(root, `${agentId}.md`);
 	try {
-		return existsSync(file) ? findingsIn(readFileSync(file, "utf8")) : UNKNOWN;
+		if (existsSync(file)) return { reply: readFileSync(file, "utf8"), from: file };
 	} catch {
-		return UNKNOWN;
+		// unreadable: the delivered text, if any, is all there is
 	}
+	return delivered ? lane : { why: `nothing was delivered for ${agentId} and its output file ${file} could not be read` };
+}
+
+/** A `plan file:` brief line, in the line syntax of the § B9 fields (classifier/src/brief.ts FIELD_LINE). */
+const PLAN_FILE_LINE = /^[ \t]*(?:[-*][ \t]+)?(?:\*\*)?plan file(?:\*\*)?[ \t]*:(?:\*\*)?[ \t]*(\S.*?)[ \t]*$/im;
+
+/**
+ * PLAN wl-mv66q5b148uznk § New ledger records 2: the plan a review of `sliceId` is dispatched on. Null
+ * when the dispatch reviews no plan: the workload is not plan-first, or `sliceId` is not its plan slice
+ * (`planSlice`). Otherwise the brief's `plan file:` line (task first, then the batch context) must name
+ * an existing file by its absolute path; the path, else why the dispatch is refused.
+ */
+function planReviewFile(ledger: Ledger, workloadId: string, sliceId: string, task: string | undefined, context: string | undefined): string | { problem: string } | null {
+	const entries = ledger.entries(workloadId);
+	const control = controlEntries(entries, holdersOf(entries, ledger.workload(workloadId)?.holder ?? null, ledger.holders(workloadId)));
+	if (!planFirst(control) || planSlice(ledger.slices(workloadId))?.id !== sliceId) return null;
+	const value = [task, context].map(text => (text ? PLAN_FILE_LINE.exec(text)?.[1] : undefined)).find(v => v !== undefined);
+	const rule = `${sliceId} is the plan slice of plan-first workload ${workloadId}, so its review names the plan it reviews on a brief line \`plan file: <absolute path of the plan file>\``;
+	if (value === undefined) return { problem: `${rule}; this brief has none` };
+	if (!isAbsolute(value)) return { problem: `${rule}; \`plan file: ${value}\` is not an absolute path` };
+	let file = false;
+	try {
+		file = statSync(value).isFile();
+	} catch {
+		// absent or unreadable: no plan file there
+	}
+	return file ? value : { problem: `${rule}; no file exists at ${value}` };
 }
 
 /** A message's text: a string, or its text parts joined. */
@@ -961,6 +1012,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	/** `<workload> <lane> <lab>` already recorded as a lane builder (D3 item 1): one entry per lab per lane. */
 	const laneLabs = new Set<string>();
 	const fingerprint = deps.fingerprint ?? repoFingerprint;
+	/** Pending round-limit raises by `<workload> <slice>`; a concurrent dispatch and shutdown await the same raise. */
+	const raisingLimit = new Map<string, Promise<void>>();
+	/** The host's `pi.exec`, from the first session bound: the links' PR read when `deps.exec` is absent. */
+	let hostExec: Exec | undefined;
+	const noExec: Exec = async () => {
+		throw new Error("the host has no exec for extensions");
+	};
 
 	/**
 	 * The pair trigger's jev attempt (PLAN wl-mv67564rdkfvnk D4): workloads whose attempt is over in this process (a
@@ -1289,26 +1347,44 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	/**
 	 * D9: write review hand `p`'s `review-round:` entry, once per token (a replay finds it written), stamped `by`
 	 * (this lane, or CLASSIFIER_BY for a lost hand's settle). Call inside a ledger write transaction.
+	 * PLAN wl-mv66q5b148uznk § New ledger records 1: with it, the hand's verdict file
+	 * (`<dir of the ledger file>/reviews/<wl>/<token>.md`: its round record and `source`, its reply or why it
+	 * has none) and its `review-verdict:` entry, so every member of a complete round has a file to link. A
+	 * file that cannot be written is logged and left to `materializeVerdicts` at the question's raise: the
+	 * round's accounting never waits on it.
 	 */
-	function writeRound(ledger: RoutingLedger, p: Pick<Pending, "workloadId" | "sliceId" | "token" | "group">, verdict: ReviewVerdict, findings: FindingsOrUnknown, by = deps.laneId): void {
+	function writeRound(
+		ledger: Ledger,
+		p: Pick<Pending, "workloadId" | "sliceId" | "token" | "group">,
+		verdict: ReviewVerdict,
+		findings: FindingsOrUnknown,
+		source: VerdictSource,
+		log: (line: string) => void,
+		by = deps.laneId,
+	): void {
 		const entries = ledger.entries(p.workloadId);
 		if (entries.some(e => e.body.startsWith("review-round: ") && e.body.includes(` token ${p.token} `))) return;
 		const count = countRounds(entries, p.sliceId);
 		const round = count.rounds.find(r => r.group === p.group)?.n ?? count.next;
-		ledger.recordEntry({
-			by,
-			workloadId: p.workloadId,
-			sliceId: p.sliceId,
-			kind: "assumption",
-			body: reviewRoundBody({ slice: p.sliceId, round, token: p.token, group: p.group, verdict, findings }),
-		});
+		const record = { slice: p.sliceId, round, token: p.token, group: p.group, verdict, findings };
+		const entry = (body: string) => ledger.recordEntry({ by, workloadId: p.workloadId, sliceId: p.sliceId, kind: "assumption", body });
+		entry(reviewRoundBody(record));
+		const path = verdictPath(ledger.path, p.workloadId, p.token);
+		try {
+			mkdirSync(dirname(path), { recursive: true });
+			writeFileSync(path, reviewVerdictText(p.workloadId, record, source));
+		} catch (error) {
+			log(`agent-system-2 classifier: the verdict file ${path} of ${p.token} (${p.sliceId}) could not be written (${message(error)}); it is written from the ledger when a question links it`);
+			return;
+		}
+		entry(reviewVerdictBody(p.token, path));
 	}
 
 	/** `writeRound` in its own transaction; a failure is logged (the round then waits for a replay). */
-	function recordRound(p: Pick<Pending, "workloadId" | "sliceId" | "token" | "group">, verdict: ReviewVerdict, findings: FindingsOrUnknown, log: (line: string) => void): void {
+	function recordRound(p: Pick<Pending, "workloadId" | "sliceId" | "token" | "group">, verdict: ReviewVerdict, findings: FindingsOrUnknown, source: VerdictSource, log: (line: string) => void): void {
 		try {
 			const ledger = deps.ledger();
-			ledger.write(() => writeRound(ledger, p, verdict, findings));
+			ledger.write(() => writeRound(ledger, p, verdict, findings, source, log));
 		} catch (error) {
 			log(`agent-system-2 classifier: the review-round entry for ${p.token} (${p.sliceId}) could not be written (${message(error)})`);
 		}
@@ -1337,9 +1413,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * Then: on a loop Jo
 	 * stopped, `review-loop-end: … stop-reviews` and one orchestrator message with the round's
 	 * findings; else a passing round ends the loop (`review-loop-end: … pass`); else a failing round
-	 * that brings the loop's failed rounds to its limit raises the extend / accept / stop question and
-	 * its `review-limit:` entry, once (an open one is not raised again). A round no longer in the
-	 * current loop was already handled.
+	 * that brings the loop's failed rounds to its limit starts a deferred extend / accept / stop raise.
+	 * Shutdown awaits that raise; a later dispatch retries it when no limit question is open.
+	 * A round no longer in the current loop was already handled.
 	 */
 	function roundSettled(workloadId: string, sliceId: string, group: string, log: (line: string) => void, dispatch: Pending["routing"] | null): void {
 		const fan = fanOuts.get(group);
@@ -1352,12 +1428,17 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			const ledger = deps.ledger();
 			const stakes = ledger.workload(workloadId)?.stakes ?? "normal";
 			const settledLost: string[] = [];
+			let atLimit = false;
 			const done = ledger.write(() => {
 				settledLost.length = 0; // a busy-retried transaction runs this body again
+				atLimit = false;
 				let entries = ledger.entries(workloadId);
 				let round = countRounds(entries, sliceId).rounds.find(r => r.group === group);
 				const dropped = round?.members.filter(m => m.verdict === null && !m.spawned) ?? [];
-				for (const m of dropped) writeRound(ledger, { workloadId, sliceId, token: m.token, group }, "dropped", UNKNOWN);
+				for (const m of dropped) {
+					const why = `${m.token} is a member of review round ${group} of ${sliceId} that never spawned, in a group no live process of this lane holds; it was recorded dropped when its round was closed`;
+					writeRound(ledger, { workloadId, sliceId, token: m.token, group }, "dropped", UNKNOWN, { why }, log);
+				}
 				const lost = (dispatch ? (round?.members ?? []) : []).flatMap(m => {
 					if (m.verdict !== null || !m.spawned) return [];
 					const hand = handLost(entries, m.token, deps.laneId, deps, Date.now());
@@ -1390,7 +1471,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						judgeModel: r.judgeModel,
 					});
 					ledger.recordEntry({ by: CLASSIFIER_BY, workloadId, sliceId, kind: "assumption", body: handSettledBody(spawn.token, routingId) });
-					writeRound(ledger, { workloadId, sliceId, token: spawn.token, group }, "failed-dispatch", UNKNOWN, CLASSIFIER_BY);
+					const why = `${agentId} (${spawn.token}) spawned and never settled, and no process the ledger records can still run it (lost-hand settle): its result died with its omp process, so it is a failed dispatch`;
+					writeRound(ledger, { workloadId, sliceId, token: spawn.token, group }, "failed-dispatch", UNKNOWN, { why }, log, CLASSIFIER_BY);
 					settledLost.push(`${spawn.token} (${agentId})`);
 				}
 				if (dropped.length + lost.length > 0) entries = ledger.entries(workloadId);
@@ -1412,26 +1494,65 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				}
 				const limit = effectiveRoundLimit(entries, instructions, stakes, sliceId);
 				if (count.failed < limit.total || openLimitQuestion(entries, ledger.questions(workloadId), sliceId)) return null;
-				const offer = roundLimitPairOffer(ledger, workloadId, count, log);
-				const body = roundLimitQuestionBody(sliceId, count, limit, stakes);
-				const questionId = ledger.raiseQuestion({
-					by: deps.laneId,
-					workloadId,
-					sliceId,
-					body: offer ? `${body}\n${offer.line}` : body,
-					options: offer ? [...ROUND_LIMIT_OPTIONS, PAIR_OPTION] : [...ROUND_LIMIT_OPTIONS],
-				});
-				entry(reviewLimitBody(questionId, sliceId));
-				if (offer) ledger.recordEntry({ by: pairOfferStamp("round-limit"), workloadId, kind: "assumption", body: pairOfferBody(questionId, "round-limit", offer.signals) });
-				return `review round ${round.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total}); question ${questionId} (review-limit:; extend / accept / stop${offer ? " / pair" : ""}) is raised`;
+				atLimit = true;
+				return null;
 			});
 			if (settledLost.length > 0) {
 				log(`agent-system-2 classifier: review hand(s) ${settledLost.join(", ")} of ${sliceId} settled as failed dispatches: no process the ledger records can still run them (lost-hand settle, written as ${CLASSIFIER_BY})`);
 			}
 			if (done) log(`agent-system-2 classifier: ${done}`);
+			if (atLimit) void raiseLimitQuestion(workloadId, sliceId, log);
 		} catch (error) {
 			log(`agent-system-2 classifier: review round ${group} of ${sliceId} could not be closed (${message(error)})`);
 		}
+	}
+
+	/**
+	 * Raise the extend / accept / stop question with the final round's verdict links and the PRs of
+	 * `wl/<wl>`. A failed PR read remains visible as `pr: unverified`, rather than blocking the guard.
+	 * A settle and a redispatch of this slice share one pending raise; a failed materialization or
+	 * ledger write is logged and a subsequent dispatch can retry. The transaction checks the current
+	 * loop, limit, stop and open question after the links read, so a stale raise cannot ask twice.
+	 */
+	function raiseLimitQuestion(workloadId: string, sliceId: string, log: (line: string) => void): Promise<void> {
+		const key = `${workloadId} ${sliceId}`;
+		const pending = raisingLimit.get(key);
+		if (pending) return pending;
+		const raise = (async () => {
+			try {
+				const ledger = deps.ledger();
+				const loop = reviewLoop(ledger.entries(workloadId), sliceId);
+				const links = await linksAtRaise(deps.exec ?? hostExec ?? noExec, ledger, { workloadId, sliceId, by: deps.laneId });
+				const done = ledger.write(() => {
+					const entries = ledger.entries(workloadId);
+					const instructions = ledger.instructions(workloadId);
+					if (reviewLoop(entries, sliceId) !== loop || loopStop(entries, instructions, workloadId, sliceId) || openLimitQuestion(entries, ledger.questions(workloadId), sliceId)) return null;
+					const count = countRounds(entries, sliceId);
+					const stakes = ledger.workload(workloadId)?.stakes ?? "normal";
+					const limit = effectiveRoundLimit(entries, instructions, stakes, sliceId);
+					const final = count.rounds.at(-1);
+					if (!final?.complete || final.passed || count.failed < limit.total) return null;
+					const offer = roundLimitPairOffer(ledger, workloadId, count, log);
+					const body = roundLimitQuestionBody(sliceId, count, limit, stakes, links);
+					const questionId = ledger.raiseQuestion({
+						by: deps.laneId,
+						workloadId,
+						sliceId,
+						body: offer ? `${body}\n${offer.line}` : body,
+						options: offer ? [...ROUND_LIMIT_OPTIONS, PAIR_OPTION] : [...ROUND_LIMIT_OPTIONS],
+					});
+					ledger.recordEntry({ by: deps.laneId, workloadId, sliceId, kind: "assumption", body: reviewLimitBody(questionId, sliceId) });
+					recordQuestionLinks(ledger, { by: deps.laneId, workloadId, sliceId, questionId, links });
+					if (offer) ledger.recordEntry({ by: pairOfferStamp("round-limit"), workloadId, kind: "assumption", body: pairOfferBody(questionId, "round-limit", offer.signals) });
+					return `review round ${final.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total}); question ${questionId} (review-limit:; extend / accept / stop${offer ? " / pair" : ""}) is raised with its links`;
+				});
+				if (done) log(`agent-system-2 classifier: ${done}`);
+			} catch (error) {
+				log(`agent-system-2 classifier: the round-limit question of ${sliceId} could not be raised (${message(error)})`);
+			}
+		})().finally(() => raisingLimit.delete(key));
+		raisingLimit.set(key, raise);
+		return raise;
 	}
 
 	/**
@@ -1443,7 +1564,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	function memberEnded(member: Pending, why: string, reached: boolean, log: (line: string) => void, verdict: "refused" | "dropped" | "stopped" | null): void {
 		const fan = fanOuts.get(member.group);
 		if (!fan) return;
-		if (verdict) recordRound(member, verdict, UNKNOWN, log);
+		if (verdict) recordRound(member, verdict, UNKNOWN, { why }, log);
 		fan.ended.set(member.token, why);
 		if (reached) fan.reached.add(member.token);
 		void checkFanOut(member.group, fan.workloadId, fan.sliceId, log);
@@ -1492,7 +1613,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		if (changed) {
 			refusal = `${refusal ? `${refusal}; ` : ""}${agentId}: the review changed the work: ${changed}. A review hand does not change the work; the lane dispatches the fix as a change slice`;
 		}
-		const findings = hand.review ? handFindings(delivered, hand.root, agentId) : UNKNOWN;
+		const reply = hand.review ? handReply(delivered, hand.root, agentId) : null;
+		const findings = reply && "reply" in reply ? findingsIn(reply.reply) : UNKNOWN;
 		const roundVerdict: ReviewVerdict = failedDispatch ? "failed-dispatch" : refusal ? "withheld" : "accepted";
 		const now = clock();
 		const providerRefused = new Map(
@@ -1511,12 +1633,12 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				}
 				if (failedDispatch) for (const [provider, status] of providerRefused) entry(providerRefusedBody(provider, status, hand.token));
 				entry(handSettledBody(hand.token, routingId));
-				if (hand.review) writeRound(ledger, hand, roundVerdict, findings);
+				if (reply) writeRound(ledger, hand, roundVerdict, findings, reply, log);
 			});
 		} catch (error) {
 			// The row is the record of what ran (SPEC-2.0.md § A1.3); output with no record is refused.
 			refusal = `${refusal ? `${refusal}; ` : ""}${agentId}: its routing row could not be written (${message(error)})`;
-			if (hand.review) recordRound(hand, failedDispatch ? "failed-dispatch" : "withheld", findings, log); // its round still ends
+			if (reply) recordRound(hand, failedDispatch ? "failed-dispatch" : "withheld", findings, reply, log); // its round still ends
 		}
 		if (hand.review && hand.group.startsWith("fg-")) {
 			memberEnded(hand, `${agentId} ${failedDispatch ? "failed to dispatch" : refusal ? "withheld" : "accepted"}`, true, log, null);
@@ -1560,16 +1682,17 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		answered.delete(key);
 		failedTurns.delete(key);
 		let refusal = `${agentId}: ${why}, so it settled as lost (refused-model-unknown) and any output shown for it later is withheld`;
+		const source: VerdictSource = { why: `${agentId}: ${why}; no reply was delivered` };
 		try {
 			const ledger = deps.ledger();
 			ledger.write(() => {
 				const routingId = recordRouting(hand, hand.models, "refused-model-unknown", null, agentId);
 				ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body: handSettledBody(hand.token, routingId) });
-				if (hand.review) writeRound(ledger, hand, "withheld", UNKNOWN);
+				if (hand.review) writeRound(ledger, hand, "withheld", UNKNOWN, source, log);
 			});
 		} catch (error) {
 			refusal = `${refusal}; ${agentId}: its routing row could not be written (${message(error)})`;
-			if (hand.review) recordRound(hand, "withheld", UNKNOWN, log); // its round still ends
+			if (hand.review) recordRound(hand, "withheld", UNKNOWN, source, log); // its round still ends
 		}
 		log(`agent-system-2 classifier: ${refusal}`);
 		if (hand.review && hand.group.startsWith("fg-")) memberEnded(hand, `${agentId} ${why}`, true, log, null);
@@ -1648,7 +1771,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const sliceId = spawn.sliceId;
 				if (spawn.group.startsWith("fg-")) void checkFanOut(spawn.group, workloadId, sliceId, log);
 				const member = { workloadId, sliceId, token: spawn.token, group: spawn.group };
-				recordRound(member, verdict.refusal ? "withheld" : "accepted", handFindings(delivered, root, agentId), log);
+				const reply = handReply(delivered, root, agentId);
+				recordRound(member, verdict.refusal ? "withheld" : "accepted", "reply" in reply ? findingsIn(reply.reply) : UNKNOWN, reply, log);
 				roundSettled(workloadId, sliceId, spawn.group, log, null);
 			}
 		} catch (error) {
@@ -1730,6 +1854,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		/** Calls whose `tool_result` arrived: only these may keep pending entries past the turn. */
 		const returned = new Set<string>();
 		const log = (line: string) => (deps.log ? deps.log(line) : pi.logger?.warn(line));
+		// OMP's `pi.exec` (extensibility/extensions/types.ts) runs the links' PR read; any bound session's will do.
+		if (!hostExec && typeof pi.exec === "function") hostExec = pi.exec.bind(pi);
 		/**
 		 * Drop an attempt's own reservations. By identity: a retired attempt's `finally` runs after the
 		 * turn already released its reservations, and must not remove a newer attempt's.
@@ -1967,15 +2093,20 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				}
 
 				// D10: a loop Jo stopped takes no further round. D9: a loop at its round limit, or whose
-				// limit question is open, takes none until Jo answers; no second question is raised here;
-				// and no round starts while another round of the slice is still running, so every round
-				// counts toward the limit (read from the ledger, so it holds across a restart; a round
-				// whose unspawned members are known dropped is closed first).
+				// limit question is open, takes none until Jo answers; if a deferred raise was lost or failed,
+				// the dispatch awaits a new raise before refusing. No round starts while another round of
+				// the slice is still running, so every round counts toward the limit (read from the ledger).
+				// A round whose unspawned members are known dropped is closed first.
 				// D6: a slice parked on its review question is not reviewed again until Jo answers.
 				// D5: a production review is expanded into one item per other available lab.
 				const plans = new Map<number, ReviewPlan | "granted" | "kimi-out">();
+				/** PLAN wl-mv66q5b148uznk § New ledger records 2: the plan each plan-slice review is dispatched on, recorded at publish. */
+				const planFiles = new Map<number, string>();
 				for (const c of classified.filter(c => c.review)) {
 					const ledger = deps.ledger();
+					const planFile = planReviewFile(ledger, c.workloadId, c.sliceId, c.item.task, context);
+					if (typeof planFile === "object" && planFile !== null) return fail(`task ${c.index + 1}: ${planFile.problem}`);
+					if (planFile !== null) planFiles.set(c.index, planFile);
 					for (const r of countRounds(ledger.entries(c.workloadId), c.sliceId).rounds) {
 						if (!r.complete) roundSettled(c.workloadId, c.sliceId, r.group, log, c.routing);
 					}
@@ -1990,8 +2121,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					if (running) return fail(`task ${c.index + 1}: ${runningRoundLine(c.sliceId, running)}`);
 					const limit = effectiveRoundLimit(entries, instructions, ledger.workload(c.workloadId)?.stakes ?? "normal", c.sliceId);
 					if (count.failed >= limit.total) {
+						await raiseLimitQuestion(c.workloadId, c.sliceId, log);
+						if (!attempt.live) throw retired();
+						const current = deps.ledger();
+						const question = openLimitQuestion(current.entries(c.workloadId), current.questions(c.workloadId), c.sliceId);
+						if (question) return fail(`task ${c.index + 1}: ${limitQuestionLine(c.sliceId, question)}`);
 						return fail(
-							`task ${c.index + 1}: the review of ${c.sliceId} is at its round limit (${count.failed} failed rounds of ${limit.total} allowed); no further round starts until Jo raises the limit (rounds <n>, or extend on its round-limit question)`,
+							`task ${c.index + 1}: the review of ${c.sliceId} reached its round limit (${count.failed} failed rounds of ${limit.total} allowed); its round-limit question could not be raised or the loop changed while links were read. Retry the dispatch; no further round starts until Jo raises the limit (rounds <n>, or extend on an open round-limit question)`,
 						);
 					}
 					const open = openParkQuestion(entries, ledger.questions(c.workloadId), c.sliceId);
@@ -2057,6 +2193,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 							return;
 						}
 						const plan = plans.get(index);
+						const planFile = planFiles.get(index);
+						if (planFile !== undefined && recordedPlanFile(ledger!.entries(c.workloadId)) !== planFile) {
+							ledger!.recordEntry({ by: deps.laneId, workloadId: c.workloadId, sliceId: c.sliceId, kind: "assumption", body: planFileBody(planFile) });
+						}
 						const loop = c.review ? reviewLoop(ledger!.entries(c.workloadId), c.sliceId) : null;
 						const base = { toolCallId: event.toolCallId, sliceId: c.sliceId, workloadId: c.workloadId, routing: c.routing, review: c.review, loop, dispatchedAt: Date.now() };
 						if (typeof plan === "object" && plan.kind === "fanout") {
@@ -2349,6 +2489,11 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		// on every turn end and tool result, so a switch flipped on mid-session is picked up at the next event.
 		pi.on("session_start", (_event, ctx) => {
 			void schedulePairSignal(ctx, log);
+		});
+		// Await pending raises within OMP's bounded shutdown window. If exit cuts a slow read short,
+		// the next at-limit review dispatch recovers the missing question.
+		pi.on("session_shutdown", async () => {
+			await Promise.all([...raisingLimit.values()]);
 		});
 
 		pi.on("tool_result", (event, ctx) => {

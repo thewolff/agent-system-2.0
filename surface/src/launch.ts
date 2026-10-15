@@ -11,7 +11,7 @@
 // forge one, and the lane tools refuse the prefixes outright (surface/extensions/lane-tools.ts).
 import { basename, dirname, isAbsolute, join } from "node:path";
 import {
-	type EntryRow, homeDir, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type ReserveRows, type ReserveVerdict,
+	CLASSIFIER_BY, type EntryRow, homeDir, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type ReserveRows, type ReserveVerdict,
 	type SliceRow, TEST_RUNNER_BY, type WorkloadRow,
 } from "../../ledger/src/index";
 import { type CleanShellRead, cleanShellOn } from "../../gates/src/clean-shell";
@@ -82,7 +82,7 @@ export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
-	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr",
+	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "question-links", "pr-seen", "superseded", "pair-taken", "test-pr",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
@@ -128,6 +128,12 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * `done-because:` its writer is a holder (`validWriter`), and the lane tools refuse it as a body.
  * `lane-model: <provider/model|default> by jo at <iso>` is the surface's alone: Jo's `model` on the open or launch tool
  * (MIGRATION.md item 85). It is not lane-scoped; `laneModel` reads the newest, and the runner and `as2 lane` read it at every spawn.
+ * `question-links: <question id> <json>` is the machinery-computed links of a question offering approve, accept or
+ * extend (plan file, review verdict files, PRs; surface/src/question-links.ts, PLAN wl-mv66q5b148uznk § The rule), the
+ * newest per question winning; `pr-seen: <n> <url>` records a PR of `wl/<wl>` once seen (at `gh pr create`, or by any
+ * successful `gh pr list` read). Each is written by a holder (the lane tools, the classifier, the lane's bash hook),
+ * the runner (the ceiling question) or the surface (its tick, the orchestrator tool, the close), so `validWriter`
+ * admits those three and `lane_record_entry` refuses either as a body.
  * `lane-headroom: <laneId> <from> -> <to> (<reason>)` is the runner's alone (PLAN wl-mv71x5rwdu7eo0 § 4, Jo's in-mv8p5m2t005tts and
  * in-mv8qzqym1ihmv4): an unnamed lane whose first `get_state` model was projected out of quota was moved by `set_model` to the
  * strong row's first entry that is not, and OMP confirmed it. It is never Jo's word: `laneModel` reads `lane-model:` only.
@@ -170,6 +176,8 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"test-run": [TEST_RUNNER_BY],
 	"push-dest": [],
 	"lane-model": [SURFACE_BY],
+	"question-links": [LANE_RUNNER_BY, SURFACE_BY],
+	"pr-seen": [LANE_RUNNER_BY, SURFACE_BY],
 	"lane-headroom": [LANE_RUNNER_BY],
 	superseded: [SURFACE_BY],
 	"pair-taken": [SURFACE_BY],
@@ -208,6 +216,7 @@ function validWriter(prefix: ControlPrefix, rest: string, createdBy: string, hol
 	if (prefix === "done-because" || prefix === "reserved-withdrawn" || prefix === "plan-question" || prefix === "push-dest" || prefix === "scratch-over-cap" || prefix === "scratch-under-cap") {
 		return holders.includes(createdBy);
 	}
+	if (prefix === "question-links" || prefix === "pr-seen") return holders.includes(createdBy) || WRITERS[prefix].includes(createdBy);
 	if (prefix === "released-open") return laneId === createdBy && holders.includes(createdBy);
 	if (prefix === "lane-stop") {
 		if (/^accepted\b/.test(rest)) return createdBy === LANE_RUNNER_BY || createdBy === LANE_STARTER_BY;
@@ -938,17 +947,36 @@ export function doneLine(control: readonly ControlEntry[]): string | null {
  * KIMI_OUT_RULE), the loop's end and limit, builder labs, provider refusals; a lost hand's settle is stamped
  * `classifier`, CLASSIFIER_BY). They are machinery, not the lane's word, so they never supersede a `done-because:`
  * (`doneBecause`), and `lane_record_entry` refuses a body opening with any of them (surface/extensions/lane-tools.ts,
- * PLAN wl-mv64rsqw2fcs1s D5). A closed list: any other line, prefixed or not, still does. The pair
- * trigger's `pair-signal:` / `pair-signal-failed:` (the classifier's jev attempt), `pair-exposure:` (the lane's
- * classifier reading the switch on) and `pair-offer:` (stamped by the classifier at the round limit, by the lane runner
- * at the ceiling) are listed here so no lane can forge them (PLAN wl-mv67564rdkfvnk D9, surface/src/pair-suggest.ts).
+ * PLAN wl-mv64rsqw2fcs1s D5). A closed list: any other line, prefixed or not, still does.
+ * `review-verdict: <token> <path>` (a review hand's verdict file, written where its `review-round:` is) and
+ * `plan-file: <path>` (the plan a plan-slice review was dispatched on) are PLAN wl-mv66q5b148uznk § New ledger
+ * records 1–2; `classifierMachineryWriter` says who may write each (`review-verdict:` also comes from the surface
+ * and the runner, so a surface-written one never supersedes a receipt either). The pair trigger's
+ * `pair-signal:` / `pair-signal-failed:` (the classifier's jev attempt), `pair-exposure:` (the lane's
+ * classifier reading the switch on) and `pair-offer:` (stamped by the classifier at the round limit, by
+ * the lane runner at the ceiling) are listed so no lane can forge them (PLAN wl-mv67564rdkfvnk D9).
  * `headroom-skip: <selector> token <dt> <reason>` is the classifier's record of a tier-row entry it skipped as projected out of
  * quota (PLAN wl-mv71x5rwdu7eo0 § 3, classifier/src/headroom.ts), written beside `provider-refused:`.
  */
 export const CLASSIFIER_MACHINERY_PREFIXES = [
 	"hand-spawn", "hand-settled", "review-round", "review-group", "review-withheld", "review-park", "review-same-lab", "review-same-lab-rule", "review-limit",
-	"review-loop-end", "builder-lab", "provider-refused", "headroom-skip", "pair-signal", "pair-signal-failed", "pair-offer", "pair-exposure",
+	"review-loop-end", "builder-lab", "provider-refused", "headroom-skip", "review-verdict", "plan-file", "pair-signal", "pair-signal-failed", "pair-offer", "pair-exposure",
 ] as const;
+
+/**
+ * Writers of a classifier machinery line beyond the lane (the classifier stamps its lines with the lane id) and
+ * CLASSIFIER_BY: `review-verdict:` is also written by `materializeVerdicts` (surface/src/question-links.ts), which runs
+ * where a linked question is raised: the surface (the orchestrator tool, its tick) and the runner (the ceiling question).
+ */
+const CLASSIFIER_MACHINERY_ALSO: Readonly<Record<string, readonly string[]>> = {
+	"review-verdict": [SURFACE_BY, LANE_RUNNER_BY],
+};
+
+/** May `createdBy` write the classifier machinery line `prefix`: a lane (not the starter or the runner), the classifier, or a writer `CLASSIFIER_MACHINERY_ALSO` names. */
+export function classifierMachineryWriter(prefix: string, createdBy: string): boolean {
+	if (createdBy === CLASSIFIER_BY || CLASSIFIER_MACHINERY_ALSO[prefix]?.includes(createdBy)) return true;
+	return createdBy.startsWith("lane-") && createdBy !== LANE_STARTER_BY && createdBy !== LANE_RUNNER_BY;
+}
 
 /**
  * The holder's `done-because:` receipt (decision 16): the workload's newest `assumption` entry by a

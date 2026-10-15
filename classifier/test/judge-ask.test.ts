@@ -228,8 +228,8 @@ function host(ledger: Ledger, wl: string, judge: { judge(req: { state: string })
 
 const pairEntries = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => /^pair-signal(-failed)?:/.test(e.body)).map((e) => [e.created_by, e.body]);
 
-function ceilingRaise(ledger: Ledger, wl: string): { options: string[]; offers: number } {
-	const { questionId } = raiseCeilingQuestion(ledger, { workloadId: wl, laneId: "lane-test", spend: { usd: 40, tokens: 1000, wallMin: 30 }, ceiling: { usd: 50, wallMin: 360 }, stakes: "normal" });
+async function ceilingRaise(ledger: Ledger, wl: string): Promise<{ options: string[]; offers: number }> {
+	const { questionId } = await raiseCeilingQuestion(ledger, { workloadId: wl, laneId: "lane-test", spend: { usd: 40, tokens: 1000, wallMin: 30 }, ceiling: { usd: 50, wallMin: 360 }, stakes: "normal" });
 	return {
 		options: JSON.parse(ledger.question(questionId)!.options) as string[],
 		offers: ledger.entries(wl).filter((e) => e.body.startsWith(`pair-offer: ${questionId} `)).length,
@@ -339,7 +339,7 @@ describe("the background pair-signal attempt (D4)", () => {
 		h.otherToolResult("read", {});
 		await flush();
 		expect(pairEntries(ledger, wl)).toEqual([[CLASSIFIER_BY, SUCCESS]]);
-		const raised = ceilingRaise(ledger, wl);
+		const raised = await ceilingRaise(ledger, wl);
 		expect(raised).toEqual({ options: [...CEILING_OPTIONS, "pair"], offers: 1 });
 		const offer = ledger.entries(wl).find((e) => e.body.startsWith("pair-offer:"))!.body;
 		expect(offer).toMatch(/ signals e$/i);
@@ -354,11 +354,11 @@ describe("the background pair-signal attempt (D4)", () => {
 		await h.turnEnd();
 		await flush();
 		expect(j.calls.length).toBe(1);
-		expect(ceilingRaise(ledger, wl)).toEqual({ options: [...CEILING_OPTIONS], offers: 0 });
+		expect(await ceilingRaise(ledger, wl)).toEqual({ options: [...CEILING_OPTIONS], offers: 0 });
 		d.resolve(reply(GOOD, 0.0001));
 		await flush();
 		expect(pairEntries(ledger, wl)).toEqual([[CLASSIFIER_BY, SUCCESS]]);
-		expect(ceilingRaise(ledger, wl)).toEqual({ options: [...CEILING_OPTIONS, "pair"], offers: 1 });
+		expect(await ceilingRaise(ledger, wl)).toEqual({ options: [...CEILING_OPTIONS, "pair"], offers: 1 });
 	});
 
 	test("the 0.70 cut is on the judge's own confidence: taste yes 0.69996 is written unrounded and offers nothing; 0.70 offers pair on E", async () => {
@@ -369,7 +369,7 @@ describe("the background pair-signal attempt (D4)", () => {
 			const h = host(ledger, wl, pairJudge(async () => reply(answers, 0.0001)).judge);
 			await h.turnEnd();
 			await flush();
-			return { signal: pairEntries(ledger, wl).map(([, body]) => body), raised: ceilingRaise(ledger, wl) };
+			return { signal: pairEntries(ledger, wl).map(([, body]) => body), raised: await ceilingRaise(ledger, wl) };
 		};
 		const below = await run(0.69996);
 		expect(below.raised).toEqual({ options: [...CEILING_OPTIONS], offers: 0 });

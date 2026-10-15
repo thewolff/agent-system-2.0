@@ -7,6 +7,7 @@ import { errorLines, parseDue, reservedStates, waitingReserved } from "../src/er
 import { ensureStandingWorkload, identityOf, recordIdentity } from "../src/identity";
 import { laneExitBody, planFirstBody } from "../src/launch";
 import { Numbering } from "../src/numbering";
+import { PLAN_MISSING_REASON, reviewNoneReason } from "../src/question-links";
 import { oneLiner, renderWake } from "../src/render";
 import { artifactFailures, laneDiedShutdownBody } from "../src/signals";
 import { testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf } from "../src/test-run";
@@ -46,9 +47,13 @@ function planQuestion(ledger: Ledger, over: { planFirst?: boolean; marker?: stri
 	return { wl, sl, q };
 }
 
-/** The needs-you line `errorLines` writes with a body cut at 120 (surface/src/errors.ts `short`). */
-const cutLine = (wl: string, q: string, sl: string) =>
-	`lane on ${wl} is waiting on you (${q}, slice ${sl}): ${PLAN_BODY.slice(0, 119)}… — answer with one word: approve / revise / cancel (or \`withdraw\`)`;
+/**
+ * The needs-you line `errorLines` writes for the plan body offering approve when it is not the plan
+ * question: its link lines first (PLAN wl-mv66q5b148uznk § Display), then the body cut at 120
+ * (surface/src/errors.ts `short`), each line indented beneath the q- id.
+ */
+const cutLine = (wl: string, q: string, sl: string, links: string[]) =>
+	`lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${[...links, ...`${PLAN_BODY.slice(0, 119)}…`.split("\n")].join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`;
 
 describe("needs-you lines (§ B3, § A3, M11)", () => {
 	test("nothing open renders a needs-you block that says nothing, and no workloads", () => {
@@ -74,18 +79,19 @@ describe("needs-you lines (§ B3, § A3, M11)", () => {
 		expect(ledger.slice(sl)!.state).toBe("open");
 	});
 
-	test("a plan question offering approve shows whole: the path on the line beneath the q- id, every other line indented under it, the answer tail last (PLAN wl-muq22rnjcfrrpc D8, PLAN wl-mv61a8dh4aeneo D2)", () => {
+	test("a plan question offering approve shows whole: the path on the line beneath the q- id, its link lines next, every other line indented under it, the answer tail last (PLAN wl-muq22rnjcfrrpc D8, PLAN wl-mv61a8dh4aeneo D2, PLAN wl-mv66q5b148uznk § Display)", () => {
 		const { ledger } = tempLedger();
 		const { wl, sl, q } = planQuestion(ledger);
 		const r = renderWake(ledger);
-		const whole = `- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${PLAN_LINES.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`;
+		const whole = `- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${[PLAN_LINES[0], `review: none — ${reviewNoneReason(wl)}`, ...PLAN_LINES.slice(1)].join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`;
 		expect(r.text).toContain(`\n${whole}\n`);
 		expect(r.lines.map((l) => l.line)).toEqual([whole.slice("- #1 ".length)]);
 		// the workload block starts the body on the line beneath the q- id the same way
 		expect(r.text).toContain(`\n- ${q} on ${sl}:\n  ${PLAN_LINES.join("\n  ")} — options: approve / revise / cancel\n`);
 	});
 
-	test("pin (PLAN wl-mv8vwb04cy18n4 D2): a plan question's `prompt-only:` lines, one at exactly 160 characters, show whole on the needs-you line and in the workload block", () => {
+	// PLAN wl-mv8vwb04cy18n4 D2: prompt-only reasons render whole in needs-you and the workload block.
+	test("a plan question's prompt-only reasons remain whole at the 160-character boundary", () => {
 		const { ledger } = tempLedger();
 		const base = "prompt-only: R8: a one-time proof by the prefail slice; no committed code re-runs old trees ";
 		const promptOnly = [`${base}${"z".repeat(160 - base.length)}`, "prompt-only: R11: the change reaches main only by Jo's merge; no gate refuses a lane's merge here"];
@@ -93,16 +99,19 @@ describe("needs-you lines (§ B3, § A3, M11)", () => {
 		const lines = [...PLAN_LINES.slice(0, 5), ...promptOnly, ...PLAN_LINES.slice(5)];
 		const { wl, sl, q } = planQuestion(ledger, { body: lines.join("\n") });
 		const r = renderWake(ledger);
-		const whole = `- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${lines.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`;
+		const shown = [lines[0], `review: none — ${reviewNoneReason(wl)}`, ...lines.slice(1)];
+		const whole = `- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${shown.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`;
 		expect(r.text).toContain(`\n${whole}\n`);
 		expect(r.text).toContain(`\n- ${q} on ${sl}:\n  ${lines.join("\n  ")} — options: approve / revise / cancel\n`);
 	});
 
-	test("controls: a question on a workload that is not plan-first, and one whose plan-question: entry no holder wrote, keep the 120-character cut", () => {
+	test("controls: a question on a workload that is not plan-first, and one whose plan-question: entry no holder wrote, keep the 120-character cut after their link lines", () => {
+		// Not plan-first, the holder's plan-question: names line 1 as the plan; no valid plan-question: on a plan-first workload leaves the plan file missing.
+		const plan = (over: { planFirst?: boolean; marker?: string | null }) => (over.planFirst === false ? `plan: ${PLAN_LINES[0]}` : `plan: missing — ${PLAN_MISSING_REASON}`);
 		for (const over of [{ planFirst: false }, { marker: "lane-x" }, { marker: null }]) {
 			const { ledger } = tempLedger();
 			const { wl, sl, q } = planQuestion(ledger, over);
-			expect(errorLines(ledger).map((l) => l.line)).toEqual([cutLine(wl, q, sl)]);
+			expect(errorLines(ledger).map((l) => l.line)).toEqual([cutLine(wl, q, sl, [plan(over), `review: none — ${reviewNoneReason(wl)}`])]);
 		}
 	});
 

@@ -72,6 +72,7 @@ import {
 } from "../src/turn-end";
 import { waitingReserved } from "../src/errors";
 import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
+import { type Exec, expectedLinks, type Links, linksAtRaise, recordedPrs, recordQuestionLinks } from "../src/question-links";
 import { PAIR_OPTION, type PairSignalId, pairOffer, pairOfferBody, readPairSuggestConfig } from "../src/pair-suggest";
 import { laneDeaths } from "../src/signals";
 import { parseHeartbeat, runDirOf, runsRoot, testRuns } from "../src/test-run";
@@ -478,6 +479,8 @@ export interface MeterInputs {
 	spend: Spend;
 	/** The ceiling question for this ceiling value, as the ledger shows it (`ceilingQuestionState`). */
 	question: CeilingQuestionState;
+	/** A different ceiling value's question is still being written; only one raise may be in flight. */
+	raisePending: boolean;
 }
 /** One poll's decision. `raise` and `stop` both write a `spend:` entry; neither is "none". */
 export interface MeterResult {
@@ -494,20 +497,21 @@ export const ceilingKey = (c: Ceiling): string => `usd ${c.usd} wall ${c.wallMin
 
 /**
  * One poll of the meter, pure. From 80 % of either half, the question is raised once per ceiling
- * value in this run while none is open or answered for it, and the lane keeps working. At 100 % the
- * lane stops, whatever the question says; when none is open or answered for this value (the spend
- * jumped past 80 % between polls, a relaunch after a withdrawn question, or Jo withdrew it), the
- * question is raised with the stop, so a ceiling stop always leaves Jo the three answers. A withdrawn
- * question reads as never raised (`ceilingQuestionState`), so a relaunch at 85 % raises afresh; this
- * run's memory keeps a question Jo withdrew from coming back before 100 %. An extend answer is a
- * raised ceiling, a new value the caller passes in, with its own question state; an extend whose
- * raise has not landed leaves the old value in force, and the old value stops (stop is the default).
+ * value in this run while none is open or answered for it, and the lane keeps working. Only a raise
+ * that can start now marks its ceiling value raised; a different value's in-flight raise leaves this
+ * value eligible at a later poll. At 100 % the lane stops, whatever the question says. With no
+ * question open or answered for this value (the spend jumped past 80 % between polls, a relaunch
+ * after a withdrawn question, or Jo withdrew it), the question is raised with the stop when no
+ * other raise is pending; the runner retries a skipped stop after the older raise settles. A
+ * withdrawn question reads as never raised (`ceilingQuestionState`), so a relaunch at 85 % raises
+ * afresh; this run's memory keeps a question Jo withdrew from coming back before 100 %.
+ * An extend answer gives the caller a new ceiling value with its own question state.
  */
 export function meterStep(state: MeterState, inputs: MeterInputs): MeterResult {
 	const level = crossed(inputs.spend, inputs.ceiling);
 	if (level === 0) return { state, level, raise: false, stop: false };
 	const key = ceilingKey(inputs.ceiling);
-	const raise = inputs.question === "none" && (level === 100 || !state.raised.includes(key));
+	const raise = !inputs.raisePending && inputs.question === "none" && (level === 100 || !state.raised.includes(key));
 	return { state: raise && !state.raised.includes(key) ? { raised: [...state.raised, key] } : state, level, raise, stop: level === 100 };
 }
 
@@ -550,15 +554,45 @@ function ceilingPairOffer(ledger: Ledger, workloadId: string): { line: string; s
 }
 
 /**
- * The raise, in one write stamped `lane-runner`: the slice `sl-ceiling-<wl>-<n>` (slice ids are
- * ledger-wide, so the workload is in the id; n = 1 + the workload's ceiling slices), the question on
- * it with the three options (the file pauses the slice), and the `spend:` entry. When the installed
- * profile's `pairSuggest` switch covers the workload and a signal fired (PLAN wl-mv67564rdkfvnk D1,
- * surface/src/pair-suggest.ts `pairOffer`, read before anything is written), the question also offers
- * `pair` with one last `pair:` line, and a `pair-offer:` entry records it; an offer that throws is
- * logged and the plain question raised. `ceilingQuestionState` reads an answer of `pair` as stop.
+ * OMP's `pi.exec` shape for the runner, which has no OMP host: the command's output and exit code, SIGKILLed
+ * (`killed`) past `timeout`. A command that cannot be spawned rejects.
  */
-export function raiseCeilingQuestion(ledger: Ledger, r: { workloadId: string; laneId: string; spend: Spend; ceiling: Ceiling; stakes: Stakes }): { sliceId: string; questionId: string } {
+export const runnerExec: Exec = async (command, args, options) => {
+	const p = spawn([command, ...args], { cwd: options?.cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+	let killed = false;
+	const timer = options?.timeout ? setTimeout(() => {
+		killed = true;
+		p.kill("SIGKILL");
+	}, options.timeout) : undefined;
+	try {
+		const [stdout, stderr, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+		return { stdout, stderr, code, killed };
+	} finally {
+		clearTimeout(timer);
+	}
+};
+
+/**
+ * The raise. First the question's links (PLAN wl-mv66q5b148uznk § The rule), outside the write: legacy review
+ * rounds materialized and the open PRs of `wl/<wl>` read through `exec` (default `runnerExec`). The ceiling
+ * guards the budget, so nothing here holds it back: a failed PR read carries every recorded PR and
+ * `pr: unverified — …` (the surface's tick re-reads it), and a failure computing the links at all falls back
+ * to the ledger's links with that failure as the unverified reason. Then one write stamped `lane-runner`: the
+ * slice `sl-ceiling-<wl>-<n>` (slice ids are ledger-wide, so the workload is in the id; n = 1 + the workload's
+ * ceiling slices), the question on it with the link header and stop / extend / split (plus `pair`
+ * when `ceilingPairOffer` finds a signal), its `question-links:` entry and the `spend:` entry.
+ * A pair offer is recorded as `pair-offer:`; a failed offer computation is logged without
+ * withholding the ceiling question. `ceilingQuestionState` reads a pair answer as stop.
+ */
+export async function raiseCeilingQuestion(
+	ledger: Ledger, r: { workloadId: string; laneId: string; spend: Spend; ceiling: Ceiling; stakes: Stakes; exec?: Exec },
+): Promise<{ sliceId: string; questionId: string }> {
+	let links: Links;
+	try {
+		links = await linksAtRaise(r.exec ?? runnerExec, ledger, { workloadId: r.workloadId, sliceId: null, by: LANE_RUNNER_BY });
+	} catch (err) {
+		links = expectedLinks(ledger, { workloadId: r.workloadId, sliceId: null, prs: { ok: false, reason: oneLine(err), prs: recordedPrs(ledger, r.workloadId) } });
+	}
 	return ledger.write(() => {
 		const offer = ceilingPairOffer(ledger, r.workloadId);
 		const prefix = `sl-ceiling-${r.workloadId.replace(/^wl-/, "")}-`;
@@ -568,11 +602,12 @@ export function raiseCeilingQuestion(ledger: Ledger, r: { workloadId: string; la
 			by: LANE_RUNNER_BY, workloadId: r.workloadId, id: `${prefix}${n}`, task: "Jo decides the ceiling overrun",
 			doneCondition: `Jo answers stop, extend or split for the ceiling ${ceilingKey(r.ceiling)}`, inputs: "ceiling",
 		});
-		const body = ceilingQuestionBody(r.workloadId, r.spend, r.ceiling, r.stakes);
+		const body = ceilingQuestionBody(r.workloadId, r.spend, r.ceiling, r.stakes, links);
 		const questionId = ledger.raiseQuestion({
 			by: LANE_RUNNER_BY, workloadId: r.workloadId, sliceId,
 			body: offer ? `${body}\n${offer.line}` : body, options: offer ? [...CEILING_OPTIONS, PAIR_OPTION] : [...CEILING_OPTIONS],
 		});
+		recordQuestionLinks(ledger, { by: LANE_RUNNER_BY, workloadId: r.workloadId, sliceId, questionId, links });
 		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: spendBody(r.laneId, r.spend) });
 		if (offer) ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: pairOfferBody(questionId, "ceiling", offer.signals) });
 		return { sliceId, questionId };
@@ -1116,9 +1151,15 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		return { ...tally, wallMin: wallMinutes(control, Date.now(), runStart) };
 	};
 	/**
+	 * The ceiling question's raise in flight: its links read the open PRs first (`raiseCeilingQuestion`), so it is async.
+	 * One at a time. Keep its captured key so an overrun on a different ceiling is retried before exit.
+	 */
+	const ceilingRaise: { pending: Promise<void> | null; key: string | null } = { pending: null, key: null };
+	let deferredCeiling = false;
+	/**
 	 * One meter poll: raise at 80 % once per ceiling value, stop at 100 % through the stop path (acceptance `ceiling`, outcome stop,
-	 * no lane-died:). A failure is logged, never fatal; a stop the step called for is taken even when its writes failed. Returns
-	 * whether it stopped the lane.
+	 * no lane-died:). A failure is logged, never fatal; a stop the step called for is taken even when its writes failed. A raise that
+	 * fails is forgotten, so a later poll raises again. Returns whether it stopped the lane.
 	 */
 	const meter = (stakes: Stakes, control: readonly ControlEntry[]): boolean => {
 		let stopping = false;
@@ -1126,16 +1167,50 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			const spend = measure(control);
 			const instructions = ledger.instructions(wl);
 			const ceiling = effectiveCeiling(control, instructions, stakes);
-			const step = meterStep(meterState, { ceiling, spend, question: ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), instructions, ceiling) });
+			const question = ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), instructions, ceiling);
+			const step = meterStep(meterState, { ceiling, spend, question, raisePending: ceilingRaise.pending !== null });
 			stopping = step.stop;
-			if (step.raise) raiseCeilingQuestion(ledger, { workloadId: wl, laneId, spend, ceiling, stakes });
-			else if (step.stop) record(spendBody(laneId, spend));
+			// Only a raise started for this poll's captured ceiling marks its value raised. A pending raise for another
+			// value leaves this one eligible at the next poll; if this poll stops, retry once the prior raise settles.
+			if (step.stop && ceilingRaise.pending !== null && ceilingRaise.key !== ceilingKey(ceiling) && question === "none") deferredCeiling = true;
+			if (step.raise) {
+				const key = ceilingKey(ceiling);
+				ceilingRaise.key = key;
+				ceilingRaise.pending = raiseCeilingQuestion(ledger, { workloadId: wl, laneId, spend, ceiling, stakes }).then(
+					() => {
+						if (outcome === "completed" || outcome === "released") withdrawCeilingQuestions(ledger, wl);
+					},
+					(err: unknown) => {
+						process.stderr.write(`runner: the ceiling question could not be raised: ${String(err)}\n`);
+						meterState = { raised: meterState.raised.filter((k) => k !== key) };
+					},
+				).catch((err: unknown) => {
+					process.stderr.write(`runner: the ceiling question could not be withdrawn: ${String(err)}\n`);
+				}).finally(() => {
+					ceilingRaise.pending = null;
+					ceilingRaise.key = null;
+				});
+			} else if (step.stop && !step.raise) record(spendBody(laneId, spend));
 			meterState = step.state;
 		} catch (err) {
 			process.stderr.write(`runner: the ceiling meter failed: ${String(err)}\n`);
 		}
 		if (stopping) stop("ceiling", "ceiling");
 		return stopping;
+	};
+
+	/** Finish a deferred 100 % question for a changed ceiling after the older value's link read settles. */
+	const settleCeilingRaise = async (): Promise<void> => {
+		await ceilingRaise.pending;
+		if (!deferredCeiling || outcome !== "stop" || stopReason !== "ceiling") return;
+		deferredCeiling = false;
+		try {
+			const { workload: current, control } = controlNow();
+			meter(current?.stakes ?? w.stakes, control);
+			await ceilingRaise.pending;
+		} catch (err) {
+			process.stderr.write(`runner: the deferred ceiling question could not be raised: ${String(err)}\n`);
+		}
 	};
 
 	/** Once: stdin EOF, then SIGKILL after the grace period if the child has not exited. */
@@ -1628,6 +1703,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			}
 		}
 		const code = await omp.exited;
+		// Both a current ceiling raise and a different value deferred at its stop settle before the exit record.
+		await settleCeilingRaise();
 		if (fatal !== null) throw fatal;
 		finish(code, omp.signalCode ?? null);
 	} catch (err) {
@@ -1644,6 +1721,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		}
 		child.kill("SIGKILL");
 		const code = await child.exited;
+		await settleCeilingRaise();
 		if (!ready) readinessFailure = `${f.stage} failed: ${f.message}`;
 		outcome ??= ready ? "died" : "never-ready";
 		finish(code, child.signalCode ?? null);

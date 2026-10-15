@@ -67,6 +67,7 @@ classifier/test/kimi-rule.test.ts	test	-
 classifier/test/lab.test.ts	test	-
 classifier/test/lane-lab.test.ts	test	-
 classifier/test/ledger-replay.test.ts	test	-
+classifier/test/question-links.test.ts	test	-
 classifier/test/review-defects.test.ts	test	-
 classifier/test/profile-rows.test.ts	test	-
 classifier/test/replay.test.ts	test	-
@@ -1138,6 +1139,10 @@ surface/test/lane-run-guard.test.ts	test	-
 surface/src/plan-paths.ts	module	-
 surface/extensions/plan-path.ts	module	-
 surface/test/plan-paths.test.ts	test	-
+surface/src/question-links.ts	module	-
+surface/extensions/display.ts	module	-
+surface/test/question-links.test.ts	test	-
+surface/test/question-links-render.test.ts	test	-
 install/com.agent-system-2.chaos.plist	install	-
 gates/src/scratch.ts	module	-
 gates/test/scratch.test.ts	test	-

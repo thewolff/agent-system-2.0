@@ -57,6 +57,7 @@ import {
 	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, laneDeaths, laneDiedShutdownBody,
 	promptResolvedBody, promptWaitBody, recordableArtifactCommands, recordLapsedLease,
 } from "../src/signals";
+import { createdPr, readPrs, recordPrsSeen, runsGhPrCreate } from "../src/question-links";
 import { parseHeartbeat, type ResultRecord, type RunRecord, runDirOf, runsRoot, STARTUP_LEASE_MS, testRuns } from "../src/test-run";
 import {
 	ARTIFACT_TOOL, type Ctx, INSTRUCTION_POLL_MS, INSTRUCTION_POLL_MS_ENV, LANE_FULL_TEST_TOOL, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, type SurfaceAPI,
@@ -561,6 +562,22 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 			if (!command) return undefined;
 			// BashToolDetails.exitCode is set only for a completed non-zero exit (pi-tui src/tools/bash.ts:38-39), as row 3 reads it.
 			const code = typeof d.exitCode === "number" ? d.exitCode : event.isError ? 1 : 0;
+			// A PR is recorded when it is made (PLAN wl-mv66q5b148uznk § The rule, pr): the URL an exit-0 `gh pr create`
+			// printed last, else one `gh pr list` read of `wl/<wl>`. A backgrounded create returned above; the tick reads it.
+			if (code === 0 && runsGhPrCreate(command)) {
+				try {
+					// OMP's tool_result event carries the result's content; the gates' event slice does not declare it.
+					const content: unknown = "content" in event ? event.content : undefined;
+					const output = Array.isArray(content)
+						? content.flatMap((c: unknown) => (c !== null && typeof c === "object" && "text" in c && typeof c.text === "string" ? [c.text] : [])).join("\n")
+						: "";
+					const pr = createdPr(output);
+					if (pr) recordPrsSeen(ledger, s.workloadId!, s.laneId, [pr]);
+					else if (pi.exec) void readPrs(pi.exec.bind(pi), ledger, s.workloadId!, s.laneId).catch((err) => warn(ctx, "the PR gh pr create made", err));
+				} catch (err) {
+					warn(ctx, "the PR gh pr create made", err);
+				}
+			}
 			// The tree it ran on, only when it passed and nothing changed the tree during the run: on every
 			// open, paused or done slice that declared this command.
 			if (code === 0 && before?.command === command) {
