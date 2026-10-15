@@ -40,6 +40,7 @@ export type PairSite = "round-limit" | "ceiling";
 export const PAIR_SIGNALS = ["a", "b", "c", "d1", "d2", "e"] as const;
 export type PairSignalId = (typeof PAIR_SIGNALS)[number];
 
+// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 /** D3: the jev answer counts at this confidence of the chosen answer or more. */
 export const PAIR_CONFIDENCE = 0.7;
 /** D3 B: a steer is long past this many characters of Jo's own words. */

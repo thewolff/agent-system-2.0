@@ -766,6 +766,7 @@ async function judgeProbe(cwd: string, brief: string): Promise<void> {
 	const standaloneModule: { openStandaloneJudge(cwd: string, purpose: string): Promise<{ judge: KindJudge; close(): void }> } = await import(
 		join(ompPackagesRoot(), "pi-coding-agent", "src", "judgment", "standalone.ts")
 	);
+	// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 	const standalone = await standaloneModule.openStandaloneJudge(cwd, "chaos-preflight");
 	try {
 		const c = await classify(brief, standalone.judge, loadKindQuestion());

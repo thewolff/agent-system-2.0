@@ -50,11 +50,13 @@ export const unknownLabReason = (provider: string) => `unknown lab for provider 
 
 // ---- D2: which dispatches are reviews -------------------------------------------------------
 
+// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 /** A dispatch is a review when its kind is judge, or it was low-confidence with judge in its top two. */
 export function isReviewDispatch(routing: Pick<Routing, "kind" | "lowConfidence" | "topTwo">): boolean {
 	return routing.kind === "judge" || (routing.lowConfidence && routing.topTwo.includes("judge"));
 }
 
+// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 /**
  * D2 read-back of a settled `routings` row: `kind = judge`, or `pull_up_to` set and judge in the top
  * two of its stored probabilities. Unreadable probabilities read as not a review: a non-review row

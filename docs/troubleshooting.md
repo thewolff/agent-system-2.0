@@ -33,7 +33,7 @@ The installer writes `~/Library/LaunchAgents/com.agent-system-2.ledger-backup.pl
 ### Every hand dispatch is refused
 
 - **No credentials.** Logins are per OMP profile and stored in the profile's own `agent.db`; logins in OMP's default profile do not count. Run `/login` in the as2 session for each provider the installer named.
-- **No judge.** The classifier routes only on `typesafe/jev-1.13.0` and fails closed without a TypeSafe credential, or when the judge in the profile differs from the calibrated one.
+- **No judge.** The classifier routes only on `typesafe/jev-1.13.0` (capability card: [skills/jev/SKILL.md](../skills/jev/SKILL.md)) and fails closed without a TypeSafe credential, or when the judge in the profile differs from the calibrated one.
 - **No usable model in the tier's row.** The refusal lists each row entry with its reason (`not in the model registry`, `provider disabled`, `no credentials`).
 
 ### Every review parks with a `same-lab` / `wait` question

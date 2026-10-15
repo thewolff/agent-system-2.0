@@ -33,6 +33,7 @@ const NO_PLAN_WORDS = /\bno[- ]plan\b/gi;
 /** Opening → closing quote pairs: the phrase wrapped in one of these on its own is a mention, not the word (PLAN.md D4). */
 const QUOTE_PAIRS: Record<string, string> = { '"': '"', "'": "'", "\u201c": "\u201d", "\u2018": "\u2019", "`": "`" };
 
+// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 /** At normal stakes the open-time judge skips the plan only on change-small at this confidence or higher (MIGRATION.md item 42, PLAN.md D1). */
 export const PLAN_SKIP_CONFIDENCE = 0.9;
 
@@ -85,6 +86,7 @@ export interface JudgedSize {
 	confidence: number;
 }
 
+// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 /** The judge found a large change: change-large above the low-confidence threshold. The ceiling's ×3 follows exactly this (PLAN.md D5). */
 export function judgedLarge(judged: JudgedSize | null): boolean {
 	return judged !== null && judged.choice === "change-large" && judged.confidence > LOW_CONFIDENCE_THRESHOLD;

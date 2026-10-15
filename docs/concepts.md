@@ -45,7 +45,7 @@ Also planned: a steered lane launched as a HerdR-managed seat with its own pane 
 
 ## Hands, tiers and the classifier
 
-Before every dispatch the classifier asks the judge model (`typesafe/jev-1.13.0`) what kind of task the brief is, then routes:
+Before every dispatch the classifier asks the judge model (`typesafe/jev-1.13.0`, capability card: [skills/jev/SKILL.md](../skills/jev/SKILL.md)) what kind of task the brief is, then routes:
 
 1. **Kind to tier** (`KIND_TIER`, `classifier/src/route.ts`): `locate` → `fast`; `understand` and `change-small` → `standard`; `change-large` → `strong`; `judge` → `deep`.
 2. **Low confidence pulls up.** At a confidence of 0.55 or below, the higher tier of the top two kinds is used.

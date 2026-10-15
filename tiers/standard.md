@@ -34,6 +34,8 @@ Read the kind off your task, then follow the matching line.
 - Where the clean shell is on, a named bash call (`name`) is refused, and so is a `pty: true` call
   unless the process carries `PI_NO_PTY=1`; use `async: true` (`timeout: 0` for no deadline) and
   poll readiness with a command.
+- Before any Jev call (eval `judge()` / `judge_batch()`, a `typesafe/` model, a classifier question or
+  threshold), read skill://jev: it says what Jev is good, weak and untested at.
 - Close the slice with the artifact the done-condition names.
 - Throwaway copies, fails-before copies and probe repos go under `$AS2_SCRATCH`, your workload's scratch root
   (shared with your lane, removed at close and by the daily sweep), never in the worktree or /tmp. Spell targets

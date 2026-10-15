@@ -34,6 +34,7 @@ import type { Ctx, SurfaceAPI } from "./src/types";
 
 export type { SurfaceAPI } from "./src/types";
 
+// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 /** OMP's `judge` role, resolved through the host's own modules (same entry-module rule as classifier/extension.ts). */
 async function hostJudge(ctx: Ctx): Promise<KindJudge> {
 	const [{ VERSION }, { Settings }, { lookup }, { resolveJudge }] = await Promise.all([

@@ -830,6 +830,7 @@ function roundFindingsText(r: Round): string {
 	return unknown > 0 && unknown < r.members.length ? `${text} · unknown: ${unknown} hand${unknown === 1 ? "" : "s"} with no readable findings block` : text;
 }
 
+// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 /**
  * The open-time classifier's verdict on the brief, read back from the `brief-judged:` entry the open
  * tool wrote, with the open tool's rule: change-large above the low-confidence threshold, else null.

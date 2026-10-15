@@ -17,6 +17,8 @@
 #
 # When TypeSafe retires 1.13.0 the judge fails closed; moving the pin needs a new classifier sample
 # and calibration.json, never an edit to this id alone.
+#
+# Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 providers:
   typesafe:
     baseUrl: https://api.typesafe.ai

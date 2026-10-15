@@ -154,6 +154,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 	const judgeSize = async (brief: string, ctx: Ctx): Promise<{ judged: JudgedSize | null; note: string; entry: string | null }> => {
 		if (!deps.judge) return { judged: null, note: "plan-first size check skipped: no judge is wired into this surface.", entry: null };
 		try {
+			// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 			const c = await classify(brief, await deps.judge(ctx), loadKindQuestion());
 			return {
 				judged: { choice: c.choice, confidence: c.confidence },

@@ -113,6 +113,7 @@ function validated(reply: ChoiceReply | null | undefined, questions: ChoiceQuest
 	return { ok: true, answers, model: String(reply.model), provider: String(reply.provider), ...reported };
 }
 
+// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 /**
  * Ask every question in `questions` about `state` in one judge call. Resolves, never rejects: a failure is
  * `{ ok: false }` with `failure` and a `reason` naming it (`timeout …`, `error: …`, `malformed: …`); a malformed reply

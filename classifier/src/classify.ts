@@ -37,6 +37,7 @@ export interface Calibration {
 	judgeModel: string;
 }
 
+// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 export function loadCalibration(path: string = CALIBRATION_PATH): Calibration {
 	const raw = JSON.parse(readFileSync(path, "utf8")) as { question_sha256?: unknown; judge_model?: unknown };
 	if (typeof raw.question_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(raw.question_sha256)) {
@@ -106,6 +107,7 @@ export async function classify(
 	question: KindQuestion,
 	signal?: AbortSignal,
 ): Promise<Classification> {
+	// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 	const result = await judge.judge({ state: brief, questions: question }, { signal });
 	return {
 		...checkedAnswer(result.answers?.kind),

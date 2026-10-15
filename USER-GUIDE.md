@@ -82,7 +82,7 @@ With one open workload the word applies to it. With several, add the id: `produc
 ### Pair suggestions (`as2 pair-suggest`)
 
 - In a terminal: `as2 pair-suggest all` (every workload), `as2 pair-suggest wl-…` (adds one workload), `as2 pair-suggest off` (the default). It sets `pairSuggest` in the installed profile's config and prints the old and new value. The next question reads it; no restart.
-- With it on, round-limit and ceiling questions on an autonomous workload above throwaway stakes can offer `pair` (section 2). The offer fires when the review loop stalls, when you have sent three or more long steers, or when jev reads the brief as UI/taste work or as ambiguous. At most 2 offers per workload, 60 minutes apart, and none after you decline one unless a new signal fires.
+- With it on, round-limit and ceiling questions on an autonomous workload above throwaway stakes can offer `pair` (section 2). The offer fires when the review loop stalls, when you have sent three or more long steers, or when jev (capability card: [skills/jev/SKILL.md](skills/jev/SKILL.md)) reads the brief as UI/taste work or as ambiguous. At most 2 offers per workload, 60 minutes apart, and none after you decline one unless a new signal fires.
 - Jev answers in the background. A question raised before its answer arrives, or while jev is down, offers on the other signals only; nothing waits for jev.
 
 ## 4. Read the screen

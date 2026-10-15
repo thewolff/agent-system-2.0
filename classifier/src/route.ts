@@ -35,6 +35,7 @@ export const STAKES_CAP: Readonly<Record<Stakes, Tier>> = {
 // SPEC-2.0.md § A1.3 "Measured 2026-09-23": threshold 0.55. Flagged means at or below it (ruled
 // 2026-09-29 after the M3 gate run: a brief answered at exactly 0.55 was under-served in one of two
 // live draws; the sweeps in research/classifier-sample.md were computed strictly-below).
+// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 export const LOW_CONFIDENCE_THRESHOLD = 0.55;
 
 export function isKind(value: unknown): value is Kind {

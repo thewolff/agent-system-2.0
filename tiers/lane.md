@@ -22,6 +22,8 @@ a lane opens no blocking human prompt; reserved actions go through the § A4 gat
 
 Commands run through the bash tool. Eval is for computation and file reads; P-11 row 6 refuses eval code that starts a process (`Bun.$`, `Bun.spawn`, `child_process`, `subprocess`, `os.system`, `!cmd`, `%pip`, a nested `tool.bash`, …) outright, and nothing reaches Jo. Run the command with bash, and put the same rule in every hand brief you write (SPEC-2.0.md § A4, *Amended 2026-10-08 — no process from eval*).
 
+Before any Jev call (eval `judge()` / `judge_batch()`, a `typesafe/` model, a classifier question or threshold), read skill://jev: it says what Jev is good, weak and untested at.
+
 Where the clean shell is on for your workload (`gates.cleanShell`), a named bash call (`name`) is refused, and so is a `pty: true` call unless the process carries `PI_NO_PTY=1`: they start shells the fence cannot certify. Run a long job with `async: true` (`timeout: 0` for no deadline) and poll readiness with a command; put the same rule in every hand brief you write.
 
 A `sandbox-exec … /bin/bash -c` wrapper on a bash call that ran is the M4b fence's own revision, not a slip: do not report it. A wrapper you type yourself is refused by P-11 row 18 before it runs; resend the bare command it names.

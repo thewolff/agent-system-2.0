@@ -89,6 +89,7 @@ const LEASE_MS = 120_000;
 const CHAT_MODEL = "anthropic/claude-haiku-4-5";
 /** The egress self-test: an un-routed provider, with a fake key given only to that probe. */
 const EGRESS_PROBE = { provider: "groq", model: "groq/gemma2-9b-it", host: "api.groq.com", keyEnv: "GROQ_API_KEY" };
+// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 const JUDGE_MODEL = "jev-1.13.0";
 /** From launch to the trigger: the lane must reach the fault's moment within this. */
 const TRIGGER_MS = 240_000;

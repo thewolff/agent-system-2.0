@@ -998,6 +998,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			}
 			pairQuestions ??= loadChoiceQuestions();
 			// OMP's judge answers any typed question map; KindJudge types only the kind question.
+			// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 			const judge: ChoiceJudge = { judge: async (request, options) => ((await deps.judge(ctx)) as unknown as ChoiceJudge).judge(request, options) };
 			const r = await askChoices(judge, w.brief, pairQuestions, { timeoutMs: PAIR_SIGNAL_TIMEOUT_MS });
 			const body = r.ok
@@ -1897,6 +1898,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			const retired = () =>
 				new Error(`call ${event.toolCallId} was retired at the end of its turn while still being classified; its late classification is discarded`);
 			try {
+				// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 				const judge = await deps.judge(ctx);
 				if (!attempt.live) throw retired();
 				const classified = await Promise.all(
@@ -2540,6 +2542,7 @@ function productionExtension(): (pi: ExtensionAPI) => void {
 				throw error; // unreadable is not absent: the settle fails and the round holds
 			}
 		},
+		// Jev capability card: skills/jev/SKILL.md (read before changing this call or its threshold)
 		async judge(ctx) {
 			// Same entry-module rule as settingsFor above.
 			const [{ settings }, { resolveJudge }] = await Promise.all([
