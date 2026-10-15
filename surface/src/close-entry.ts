@@ -17,8 +17,9 @@
 // only `.ai/decision-log/`, read commit by commit with `git rev-list --parents` (never the net diff).
 // The decision is surface/src/test-run.ts `closeFreshness`; a merged PR whose authoritative non-green
 // run Jo waived (`waivedRunOf`, PLAN wl-mv5i3lulwwbbi8 D3) passes it. A workload Jo superseded
-// (`supersede <A> <B>`, D2) is decided by `supersededFreshness` instead: no open PR in the set and no
-// bound branch with a commit origin's default lacks. Unlike the rest of this path it fails
+// (`supersede <A> <B>`, D2) or withdrew (`withdraw <wl>`, PLAN wl-mv8s939084z1ts D5; the `StandIn`) is
+// decided by `supersededFreshness` instead: no open PR in the set and no bound branch with a commit
+// origin's default lacks, the refusal naming which word stood in. Unlike the rest of this path it fails
 // closed: when git or gh cannot answer, the close is refused. A passed check pins the publication:
 // the entry commit D must be made, have the single parent C and touch only `.ai/decision-log/`, and
 // it is pushed as `D:refs/heads/wl/<id>` by sha, a plain fast-forward.
@@ -639,16 +640,29 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, s: Close
 	return { failure: null, branch, candidate: { sha: candidate, changed }, prs };
 }
 
-/** Jo's `supersede <A> <B>` as `supersededBy` (surface/src/launch.ts) reads it: the successor and Jo's instruction. */
-export interface Superseded {
-	by: string;
+/**
+ * Jo's word that stands in for the holder's receipt and swaps the close check for `supersededFreshness`:
+ * `supersede <A> <B>` as `supersededBy` reads it (PLAN wl-mv5i3lulwwbbi8 D2) or `withdraw <wl>` as
+ * `withdrawnBy` reads it (PLAN wl-mv8s939084z1ts D5), both in surface/src/launch.ts. `label` names it in
+ * the check's text (`superseded by wl-B`, `withdrawn`); `instructionId` is Jo's instruction.
+ */
+export interface StandIn {
+	kind: "superseded" | "withdrawn";
+	label: string;
 	instructionId: string;
 }
 
-/** What a superseded close decides on (PLAN wl-mv5i3lulwwbbi8 D2), or the failure that refuses it. */
+/** The stand-in for a workload's close, or null: superseded wins over withdrawn when both stand, since it names a successor (PLAN wl-mv8s939084z1ts D4). */
+export function standInOf(superseded: { by: string; instructionId: string } | null, withdrawn: { instructionId: string } | null): StandIn | null {
+	if (superseded) return { kind: "superseded", label: `superseded by ${superseded.by}`, instructionId: superseded.instructionId };
+	if (withdrawn) return { kind: "withdrawn", label: "withdrawn", instructionId: withdrawn.instructionId };
+	return null;
+}
+
+/** What a superseded or withdrawn close decides on (PLAN wl-mv5i3lulwwbbi8 D2, wl-mv8s939084z1ts D5), or the failure that refuses it. */
 export interface SupersededFacts {
 	failure: string | null;
-	superseded: Superseded;
+	standIn: StandIn;
 	/** `origin/<default>`. */
 	baseName: string;
 	/** The close set's PRs, in any state. */
@@ -658,14 +672,14 @@ export interface SupersededFacts {
 }
 
 /**
- * The close check of a workload Jo superseded (PLAN wl-mv5i3lulwwbbi8 D2), in place of
- * `closeFreshness`: no PR in the whole close set is open, and no bound branch (`wl/<id>` and every
- * holder's `push-dest:` branch, local and on origin) carries a commit origin's default lacks. Any
- * failure refuses (fails closed).
+ * The close check of a workload Jo superseded (PLAN wl-mv5i3lulwwbbi8 D2) or withdrew (PLAN
+ * wl-mv8s939084z1ts D5), in place of `closeFreshness`: no PR in the whole close set is open, and no
+ * bound branch (`wl/<id>` and every holder's `push-dest:` branch, local and on origin) carries a
+ * commit origin's default lacks. Any failure refuses (fails closed). The text names which word stands in.
  */
 export function supersededFreshness(f: SupersededFacts): CloseDecision {
 	if (f.failure !== null) return { close: false, reason: `the close check could not answer: ${f.failure}` };
-	const by = `superseded by ${f.superseded.by} (Jo, ${f.superseded.instructionId})`;
+	const by = `${f.standIn.label} (Jo, ${f.standIn.instructionId})`;
 	const open = f.prs.find((p) => p.state === "OPEN");
 	if (open) return { close: false, reason: `${by}, but PR #${open.number} from ${open.headRefName} is open: merge or close it first` };
 	const u = f.unmerged[0];
@@ -675,7 +689,7 @@ export function supersededFreshness(f: SupersededFacts): CloseDecision {
 	return { close: true, why: `${by}: no open PR in the set and no unmerged commit on a bound branch` };
 }
 
-async function gatherSupersededFacts(s: CloseSet, superseded: Superseded): Promise<SupersededFacts> {
+async function gatherSupersededFacts(s: CloseSet, standIn: StandIn): Promise<SupersededFacts> {
 	const unmerged: { ref: string; commits: string[] }[] = [];
 	for (const b of s.branches) {
 		for (const ref of [`refs/heads/${b}`, `refs/remotes/origin/${b}`]) {
@@ -685,7 +699,7 @@ async function gatherSupersededFacts(s: CloseSet, superseded: Superseded): Promi
 			if (commits.length > 0) unmerged.push({ ref, commits });
 		}
 	}
-	return { failure: null, superseded, baseName: s.baseName, prs: s.heads, unmerged };
+	return { failure: null, standIn, baseName: s.baseName, prs: s.heads, unmerged };
 }
 
 /** A directory inside a git work tree or repository, judged without exec: some `.git` at or above it. */
@@ -699,13 +713,13 @@ function insideGit(dir: string): boolean {
 /**
  * The close check (PLAN § 2.4 item 4) for the workload's repo. A repo whose `origin` is not in the
  * profile's `testRunner.repos` is not checked. For one that is, the decision is `closeFreshness`
- * over the facts git and gh give — `supersededFreshness` instead for a workload Jo superseded
- * (`superseded`, PLAN wl-mv5i3lulwwbbi8 D2) — and a passed check carries the pin `commitCloseEntry`
+ * over the facts git and gh give — `supersededFreshness` instead for a workload Jo superseded or
+ * withdrew (`standIn`, PLAN wl-mv5i3lulwwbbi8 D2, wl-mv8s939084z1ts D5) — and a passed check carries the pin `commitCloseEntry`
  * publishes on. It fails closed: a profile whose block does not parse, a host with no exec in a git
  * checkout, and any git or gh call that cannot answer all refuse.
  */
 export async function closeCheck(
-	pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, id: string, repo: string, superseded: Superseded | null = null,
+	pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, id: string, repo: string, standIn: StandIn | null = null,
 ): Promise<CloseCheck> {
 	const branch = branchName(id);
 	const unanswered = (failure: string): CloseCheck => ({ served: true, pin: null, decision: closeFreshness({ failure, branch, candidate: { sha: "", changed: [] }, prs: [] }) });
@@ -724,7 +738,7 @@ export async function closeCheck(
 	try {
 		const s = await gatherCloseSet(exec, ledger, id, repo, served.origin);
 		candidate = s.candidate;
-		decision = superseded ? supersededFreshness(await gatherSupersededFacts(s, superseded)) : closeFreshness(await gatherCloseFacts(exec, ledger, id, s));
+		decision = standIn ? supersededFreshness(await gatherSupersededFacts(s, standIn)) : closeFreshness(await gatherCloseFacts(exec, ledger, id, s));
 	} catch (err) {
 		if (!(err instanceof Unanswered)) throw err;
 		return unanswered(err.message);

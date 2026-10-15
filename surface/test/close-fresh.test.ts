@@ -14,7 +14,7 @@ import { type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { closeWorkloadWithEntry } from "../extensions/workload";
 import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { recordRepo } from "../src/decision-log";
-import { branchName, worktreePath } from "../src/launch";
+import { branchName, withdrawInstructionBody, withdrawnBody, worktreePath } from "../src/launch";
 import { testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
 import { SURFACE_BY, type SurfaceAPI } from "../src/types";
 import { clock, tempLedger, tmp } from "./helpers";
@@ -737,6 +737,86 @@ describe("PLAN wl-mv5i3lulwwbbi8 D2: a superseded workload closes with no open P
 			const s = merged(w, x);
 			withDone(x);
 			if (o) supersede(x, o);
+
+			expectRefused(w, x, await close(w, x), NO_RECEIPT, s);
+			expect(ghCalls(w)).toEqual([]);
+		}
+	}, 30_000);
+});
+
+// ---- PLAN wl-mv8s939084z1ts D5: a workload Jo withdrew closes through the superseded rule ---------------
+
+/** Jo's `withdraw <wl>` as the surface writes it: the instruction on the workload, then `withdrawn: <in-…>` naming it. */
+function withdraw(x: Closable, o: { entryBy?: string; author?: string } = {}): string {
+	const ins = x.ledger.recordInstruction({ by: SURFACE_BY, workloadId: x.wl, body: withdrawInstructionBody(x.wl), author: o.author ?? "jo", channel: "surface" });
+	x.ledger.recordEntry({ by: o.entryBy ?? SURFACE_BY, workloadId: x.wl, kind: "assumption", body: withdrawnBody(ins) });
+	return ins;
+}
+
+describe("PLAN wl-mv8s939084z1ts D5: a withdrawn workload closes with no open PR and no unmerged commit, its entry naming the withdrawal", () => {
+	test("every PR merged and no commit outside main: closes without a receipt; the entry and the close receipt say withdrawn", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const s = merged(w, x);
+		withDone(x);
+		const ins = withdraw(x);
+
+		const r = await close(w, x);
+
+		expect(r.closed).toBe(true);
+		expect(r.text).toContain(`Close check: withdrawn (Jo, ${ins}): no open PR in the set and no unmerged commit on a bound branch.`);
+		const said = `withdrawn by Jo (${ins}): closed with no done-because: receipt`;
+		expect(r.receipt).toBe(said);
+		const d = expectPublishedOn(w, x, s);
+		const file = g(w, w.work, "diff-tree", "-r", "--no-commit-id", "--name-only", s, d);
+		expect(g(w, w.work, "show", `${d}:${file}`)).toContain(`- orchestrator (surface): close receipt: ${said}`);
+		expect(receipts(x)).toEqual([`close receipt: ${said}`]);
+	});
+
+	test("an open PR from wl/<id> refuses, naming the withdrawal", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const s = merged(w, x, "OPEN");
+		withDone(x);
+		const ins = withdraw(x);
+
+		expectRefused(w, x, await close(w, x), `withdrawn (Jo, ${ins}), but PR #7 from ${x.branch} is open: merge or close it first`, s);
+		expect(receipts(x)).toEqual([]);
+	});
+
+	test("an unmerged commit on wl/<id> refuses", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const { sha: s } = laneWithCode(w, x);
+		withDone(x);
+		const ins = withdraw(x);
+
+		expectRefused(w, x, await close(w, x), `withdrawn (Jo, ${ins}), but refs/heads/${x.branch} has 1 commit(s) not in origin/main, first ${s7(s)}: merge them, or delete the branch`, s);
+	});
+
+	test("superseded and withdrawn both standing: superseded wins, the refusal and the receipt name the successor", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const s = merged(w, x, "OPEN");
+		withDone(x);
+		withdraw(x);
+		const by = supersede(x);
+
+		expectRefused(w, x, await close(w, x), `${by}, but PR #7 from ${x.branch} is open: merge or close it first`, s);
+	});
+
+	test("a withdrawn: entry a lane wrote, or one naming an instruction not Jo's, counts for nothing; G3 still asks for the receipt", async () => {
+		for (const o of [{ entryBy: "lane-a" }, { author: "orchestrator" }]) {
+			const w = world();
+			withOrigin(w);
+			const x = closable(w);
+			const s = merged(w, x);
+			withDone(x);
+			withdraw(x, o);
 
 			expectRefused(w, x, await close(w, x), NO_RECEIPT, s);
 			expect(ghCalls(w)).toEqual([]);

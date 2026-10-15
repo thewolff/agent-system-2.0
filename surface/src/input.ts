@@ -70,6 +70,17 @@
 // (`boundPrs`, surface/src/launch.ts). The workload is always named, never inferred. The word is the
 // command or `refused` with the reason (not an open workload, the standing one, no number, a bad
 // number), never prose and never a numbered-batch piece, at any length.
+//
+// Withdrawing a workload with no done-because: receipt (PLAN wl-mv8s939084z1ts D1–D4): `withdraw <wl-…>`
+// (exactly one workload id; a line whose second word starts `wl-` is the command or `refused`, at
+// any length, never prose and never a numbered-batch piece) writes Jo's instruction `withdraw <wl>`
+// on the workload, then the surface's `withdrawn: <instruction id>` naming it, in one transaction;
+// the close reads both (`withdrawnBy`) in place of the holder's receipt, and the surface closes the
+// workload right after (surface/extensions/surface-input.ts `closeAfter`). Refused, writing nothing
+// (`withdrawRefusal`, checked again inside `apply`): no such workload, the standing one, one not
+// open, a scheduled `due:` row, any open or paused slice (named), any open question, or a holder
+// under a live lease. Done and cancelled slices are both allowed. Bare `withdraw` and `withdraw
+// <q-…>` keep their question meaning.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parkQuestions } from "../../classifier/src/lab";
@@ -85,14 +96,14 @@ import { type Ceiling, CEILING_OPTIONS, ceilingBody, effectiveCeiling, sizeFor }
 import { closedReservedRefusal, waitingReserved } from "./errors";
 import {
 	attempts, type ControlEntry, controlEntries, heldLive, holdersOf, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, planApprovedBody, planFirst,
-	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody,
+	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody, withdrawInstructionBody, withdrawnBody,
 } from "./launch";
 import type { Numbering, Target } from "./numbering";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
 import { PAIR_OPTION, type PairSite, pairOfferStamp, pairTakenBody, parsePairOffer } from "./pair-suggest";
 import { parseHeartbeat, recordLive, runDirOf, runsRoot, testRuns } from "./test-run";
 import { pendingWrapperLines } from "./pending";
-import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
+import { DUE_PREFIX, MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 /** A "which one?" candidate: a needs-you row (`Target`) or, for a bare stakes, mode, `ceiling`, `rounds` or `stop-reviews` word, a workload in view. */
 export type Candidate = Target | { kind: "workload"; workloadId: string };
@@ -114,6 +125,8 @@ export type Command =
 	| { kind: "supersede"; workloadId: string; by: string }
 	/** `test-pr <wl-…> <N…>`: Jo binds these PR numbers to the workload for a test run with no push. */
 	| { kind: "test-pr"; workloadId: string; prs: number[] }
+	/** `withdraw <wl-…>`: Jo withdraws the workload, closed with no done-because: receipt (PLAN wl-mv8s939084z1ts D1). */
+	| { kind: "withdraw-workload"; workloadId: string }
 	/** A bare word that fits more than one row or workload: refused, never applied. */
 	| { kind: "ambiguous"; word: string; candidates: Candidate[] }
 	/** A command naming a row it cannot take (`deny en-…` for a request no longer waiting): refused with `why`, never applied and never prose. */
@@ -145,8 +158,10 @@ export function runHeartbeat(env: Record<string, string | undefined>): Heartbeat
  * sl-…` names one slice's loop. An answer word (`approve`/`deny`, `withdraw`, an option) alone
  * applies only when it fits exactly one row; fitting several it is `ambiguous`, and the second word
  * (an entry or question id) picks the row. `cancel-slice` and `supersede` always name their rows
- * and are the command or `refused`, never prose; `heartbeatOf` reads a test run's heartbeat for
- * `cancel-slice`'s live-run refusal (the surface passes its own env's).
+ * and are the command or `refused`, never prose; so is a `withdraw` whose second word is a `wl-…`
+ * id, at any length (PLAN wl-mv8s939084z1ts D1), while bare `withdraw` and `withdraw q-…` withdraw
+ * a question as before. `heartbeatOf` reads a test run's heartbeat for `cancel-slice`'s live-run
+ * refusal (the surface passes its own env's).
  */
 export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf = runHeartbeat(process.env)): Command | null {
 	const words = stripTail(text).trim().split(/\s+/);
@@ -166,6 +181,8 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 	if (word === "supersede") return supersedeCommand(ledger, words.slice(1));
 	// Always the command or `refused`, at any length, so a long binding never passes as prose.
 	if (word === "test-pr") return testPrCommand(ledger, words.slice(1));
+	// PLAN wl-mv8s939084z1ts D1: `withdraw wl-…` is the command or `refused` at any length; bare `withdraw` and `withdraw q-…` go on below.
+	if (word === "withdraw" && /^wl-/i.test(words[1] ?? "")) return withdrawWorkloadCommand(ledger, words.slice(1));
 	if (words.length === 0 || words.length > 2) return null;
 	const arg = words[1];
 	const target = (): string | null => (arg && view.includes(arg) ? arg : view.length === 1 ? view[0]! : null);
@@ -246,10 +263,11 @@ export type BatchResult = { ok: true; items: BatchItem[] } | { ok: false; lines:
 
 /**
  * The words a single-line command may run to: `ceiling <usd> [<hours>] [wl-…]` is four, `rounds <n> [wl-…]` and
- * `supersede <wl-A> <wl-B>` three, `test-pr <wl-…> <N> [<N> …]` any number (`interpret` refuses past `TEST_PR_MAX`),
- * everything else two.
+ * `supersede <wl-A> <wl-B>` three, `test-pr <wl-…> <N> [<N> …]` and `withdraw wl-…` (PLAN wl-mv8s939084z1ts D1)
+ * any number (`interpret` refuses past `TEST_PR_MAX`, and `withdraw` past one id), everything else two.
  */
 export function maxWords(text: string): number {
+	if (/^withdraw\s+wl-/i.test(text)) return Number.POSITIVE_INFINITY;
 	const long = /^(ceiling|rounds|supersede|test-pr)(?:\s|$)/i.exec(text)?.[1]!.toLowerCase() ?? null;
 	return long === "ceiling" ? 4 : long === "rounds" || long === "supersede" ? 3 : long === "test-pr" ? Number.POSITIVE_INFINITY : 2;
 }
@@ -406,7 +424,7 @@ function looseWorkloadPair(text: string): boolean {
 	return workloadWord && words.length === 2 && !/^wl-/i.test(words[1]!) && !ANSWER_ID.test(words[1]!);
 }
 
-/** What a command resolves, for the once-per-row check across a paste: the question it answers or withdraws, the reserved request it decides, the slice it cancels or the workload it supersedes; else null. */
+/** What a command resolves, for the once-per-row check across a paste: the question it answers or withdraws, the reserved request it decides, the slice it cancels or the workload it supersedes or withdraws; else null. */
 function resolves(cmd: Command): string | null {
 	switch (cmd.kind) {
 		case "answer":
@@ -417,6 +435,7 @@ function resolves(cmd: Command): string | null {
 		case "cancel-slice":
 			return cmd.sliceId;
 		case "supersede":
+		case "withdraw-workload":
 			return cmd.workloadId;
 		default:
 			return null;
@@ -496,7 +515,7 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 		const id = resolves(cmd);
 		if (id === null) return null;
 		if (first[id] !== undefined) {
-			const done = cmd.kind === "reserved" ? "decided" : cmd.kind === "cancel-slice" ? "cancelled" : cmd.kind === "supersede" ? "superseded" : "answered";
+			const done = cmd.kind === "reserved" ? "decided" : cmd.kind === "cancel-slice" ? "cancelled" : cmd.kind === "supersede" ? "superseded" : cmd.kind === "withdraw-workload" ? "withdrawn" : "answered";
 			return `${id} is already ${done} on ${first[id]}; once per row`;
 		}
 		first[id] = where;
@@ -695,6 +714,38 @@ function supersedeCommand(ledger: Ledger, rest: readonly string[]): Command {
 	const [a, b] = rest as [string, string];
 	const why = supersedeRefusal(ledger, a, b);
 	return why === null ? { kind: "supersede", workloadId: a, by: b } : { kind: "refused", why };
+}
+
+/**
+ * Why `withdraw <wl>` cannot withdraw the workload as the ledger stands (PLAN wl-mv8s939084z1ts D2), or null: it exists,
+ * is not the standing workload, is open, is no scheduled `due:` row (closed with its receipt through the close tool),
+ * has no open or paused slice and no open question (one refusal names every one: a question always pauses its slice), and
+ * no holder holds it under a live lease. Done and cancelled slices are both allowed, and so is no slice at all. `apply`
+ * checks it again inside its transaction.
+ */
+function withdrawRefusal(ledger: Ledger, wl: string): string | null {
+	if (wl === STANDING_WORKLOAD_ID) return "the standing workload is never withdrawn";
+	const w = ledger.workload(wl);
+	if (!w) return `no workload ${wl}`;
+	if (w.status !== "open") return `${wl} is ${w.status}: only an open workload is withdrawn`;
+	if (w.brief.startsWith(DUE_PREFIX)) return `${wl} is a scheduled row: close it with its receipt through the close tool`;
+	const live = ledger.slices(wl).filter((s) => s.state === "open" || s.state === "paused").map((s) => `${s.id} (${s.state})`);
+	const asked = ledger.questions(wl).filter((q) => q.state === "open").map((q) => q.id);
+	if (live.length > 0 || asked.length > 0) {
+		const questions = asked.length === 0 ? [] : [`open question${asked.length === 1 ? "" : "s"} ${asked.join(", ")}`];
+		const what = [...(live.length === 0 ? [] : [live.join(", ")]), ...questions].join(" and ");
+		return `${wl} has ${what}: cancel-slice each first (it withdraws the slice's questions too); only a workload with no open or paused slice and no open question is withdrawn`;
+	}
+	if (heldLive(w, ledger.now())) return `${wl} is held by ${w.holder} under a live lease: stop it first (as2 lane stop ${wl})`;
+	return null;
+}
+
+/** `withdraw <wl-…>` after the word (PLAN wl-mv8s939084z1ts D1): exactly one workload id, `withdrawRefusal` clear; anything else is `refused` with the reason, never prose. */
+function withdrawWorkloadCommand(ledger: Ledger, rest: readonly string[]): Command {
+	if (rest.length !== 1 || !/^wl-\S+$/i.test(rest[0]!)) return { kind: "refused", why: "withdraw names one workload: withdraw wl-…" };
+	const wl = rest[0]!;
+	const why = withdrawRefusal(ledger, wl);
+	return why === null ? { kind: "withdraw-workload", workloadId: wl } : { kind: "refused", why };
 }
 
 /**
@@ -1074,6 +1125,17 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 				ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: testPrBody(cmd.prs, id) });
 				const prs = cmd.prs.map((n) => `#${n}`).join(", ");
 				return `${cmd.prs.length === 1 ? "PR" : "PRs"} ${prs} bound to ${cmd.workloadId} for test runs with no push (instruction ${id})`;
+			});
+		}
+		case "withdraw-workload": {
+			// PLAN wl-mv8s939084z1ts D2, D3: refusal re-checked, then Jo's instruction and the surface's `withdrawn:` naming it, in one
+			// transaction; the close reads both (`withdrawnBy`) in place of a done-because: receipt.
+			return ledger.write(() => {
+				const why = withdrawRefusal(ledger, cmd.workloadId);
+				if (why !== null) throw new Error(why);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: withdrawInstructionBody(cmd.workloadId) });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: withdrawnBody(id) });
+				return `withdrew ${cmd.workloadId} (instruction ${id}); closing it with no done-because: receipt`;
 			});
 		}
 		case "ambiguous":

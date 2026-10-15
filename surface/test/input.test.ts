@@ -12,7 +12,7 @@ import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "..
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
 import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
-import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody, verdictOf } from "../src/launch";
+import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody, verdictOf, withdrawnBy } from "../src/launch";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { ensureStandingWorkload } from "../src/identity";
 import { Numbering } from "../src/numbering";
@@ -1278,5 +1278,137 @@ describe("test-pr: Jo binds PRs to a workload for a test run with no push (PLAN 
 			refused: [{ line: 1, text: `normal ${wl}`, why: null }, { line: 2, text: `test-pr ${wl} 79 x`, why: ["x is not a PR number (a positive whole number): test-pr <wl-…> <N> [<N> …]"] }],
 			held: [],
 		});
+	});
+});
+
+describe("withdraw <wl-…>: Jo withdraws a workload, closed with no done-because: receipt (PLAN wl-mv8s939084z1ts D1–D3)", () => {
+	/** Every row the word could write on `wl`: its instructions and the surface's `withdrawn:` entries. */
+	const written = (ledger: Ledger, wl: string) => [...ledger.instructions(wl), ...ledger.entries(wl).filter((e) => e.body.startsWith("withdrawn"))];
+	/** An open workload whose slices ended in `states`, in order (none: a workload with no slice). */
+	const settled = (ledger: Ledger, states: readonly ("done" | "cancelled")[], brief = "Prototype the data-viz panel"): string => {
+		const wl = ledger.openWorkload({ by: "lane-a", brief, stakes: "normal", mode: "autonomous" });
+		for (const state of states) {
+			const sl = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+			if (state === "done") ledger.completeSlice(sl, { by: "lane-a", artifact: "x" });
+			else ledger.cancelSlice(sl, { by: SURFACE_BY });
+		}
+		return wl;
+	};
+	/** The refusal `interpret` gives, and that `apply` of it throws; nothing is written on `wl`. */
+	const refusedWithNothing = (ledger: Ledger, text: string, why: string, wl: string) => {
+		const cmd = interpret(ledger, text);
+		expect(cmd).toEqual({ kind: "refused", why });
+		expect(() => apply(ledger, cmd!)).toThrow("refused, never applied");
+		expect(written(ledger, wl)).toEqual([]);
+	};
+
+	test("writes Jo's instruction on the workload, then the surface's `withdrawn:` naming it; withdrawnBy finds it", () => {
+		const { ledger } = tempLedger();
+		const wl = settled(ledger, ["cancelled", "cancelled"]);
+		const cmd = interpret(ledger, `withdraw ${wl}`);
+		expect(cmd).toEqual({ kind: "withdraw-workload", workloadId: wl });
+		const receipt = apply(ledger, cmd!);
+		const ins = ledger.instructions(wl);
+		expect(ins.map((i) => [i.kind, i.body, i.author, i.channel, i.created_by])).toEqual([["instruction", `withdraw ${wl}`, "jo", "surface", SURFACE_BY]]);
+		expect(receipt).toBe(`withdrew ${wl} (instruction ${ins[0]!.id}); closing it with no done-because: receipt`);
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith("withdrawn")).map((e) => [e.kind, e.created_by, e.body])).toEqual([["assumption", SURFACE_BY, `withdrawn: ${ins[0]!.id}`]]);
+		expect(controlEntries(ledger.entries(wl)).filter((e) => e.prefix === "withdrawn").map((e) => e.body)).toEqual([`withdrawn: ${ins[0]!.id}`]);
+		expect(withdrawnBy(ledger.entries(wl), ledger.instructions(wl))).toEqual({ instructionId: ins[0]!.id });
+		expect(verdictOf(ledger.launchRows(wl, 3)!)).toMatchObject({ launch: false, reason: "withdrawn" });
+	});
+
+	test("accepted for an all-cancelled, a done-only, a done+cancelled and a no-slice workload; the word is case-insensitive", () => {
+		const { ledger } = tempLedger();
+		for (const states of [["cancelled"], ["done"], ["done", "cancelled", "done"], []] as const) {
+			const wl = settled(ledger, states);
+			expect(interpret(ledger, `withdraw ${wl}`)).toEqual({ kind: "withdraw-workload", workloadId: wl });
+			apply(ledger, interpret(ledger, `Withdraw ${wl}`)!);
+			expect(withdrawnBy(ledger.entries(wl), ledger.instructions(wl))).not.toBeNull();
+		}
+	});
+
+	test("each D2 refusal is the reason, never prose, and writes nothing", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		ensureStandingWorkload(ledger);
+		// an open slice, named
+		const { wl: openWl, sl: openSl } = workloadWithSlice(ledger);
+		ledger.cancelSlice(ledger.addSlice({ by: "lane-a", workloadId: openWl, task: "old", doneCondition: "d", inputs: "i" }), { by: SURFACE_BY });
+		const tail = "cancel-slice each first (it withdraws the slice's questions too); only a workload with no open or paused slice and no open question is withdrawn";
+		refusedWithNothing(ledger, `withdraw ${openWl}`, `${openWl} has ${openSl} (open): ${tail}`, openWl);
+		// a paused slice and its open question, both named
+		const { wl: askWl, sl: askSl } = workloadWithSlice(ledger);
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: askWl, sliceId: askSl, body: "Which?", options: ["left", "right"] });
+		expect(ledger.slice(askSl)!.state).toBe("paused");
+		refusedWithNothing(ledger, `withdraw ${askWl}`, `${askWl} has ${askSl} (paused) and open question ${q}: ${tail}`, askWl);
+		// a holder under a live lease; once the lease lapses the word is accepted
+		const heldWl = settled(ledger, ["done"]);
+		expect(ledger.claimWorkload(heldWl, { by: "lane-a", holder: "lane-a", leaseMs: 60_000 }).won).toBe(true);
+		refusedWithNothing(ledger, `withdraw ${heldWl}`, `${heldWl} is held by lane-a under a live lease: stop it first (as2 lane stop ${heldWl})`, heldWl);
+		// closed, standing, scheduled, missing
+		const closedWl = settled(ledger, ["done"]);
+		ledger.closeWorkload(closedWl, { by: SURFACE_BY });
+		refusedWithNothing(ledger, `withdraw ${closedWl}`, `${closedWl} is closed: only an open workload is withdrawn`, closedWl);
+		refusedWithNothing(ledger, `withdraw ${STANDING_WORKLOAD_ID}`, "the standing workload is never withdrawn", STANDING_WORKLOAD_ID);
+		const dueWl = settled(ledger, [], "due:2026-11-01 re-measure the threshold");
+		refusedWithNothing(ledger, `withdraw ${dueWl}`, `${dueWl} is a scheduled row: close it with its receipt through the close tool`, dueWl);
+		refusedWithNothing(ledger, "withdraw wl-nope", "no workload wl-nope", "wl-nope");
+		c.plusHours(1);
+		expect(interpret(ledger, `withdraw ${heldWl}`)).toEqual({ kind: "withdraw-workload", workloadId: heldWl });
+	});
+
+	test("apply checks the refusal again: a slice opened between the reading and the apply throws and writes nothing", () => {
+		const { ledger } = tempLedger();
+		const wl = settled(ledger, ["cancelled"]);
+		const cmd = interpret(ledger, `withdraw ${wl}`)!;
+		expect(cmd.kind).toBe("withdraw-workload");
+		const sl = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "late", doneCondition: "d", inputs: "i" });
+		expect(() => apply(ledger, cmd)).toThrow(`${wl} has ${sl} (open): cancel-slice each first`);
+		expect(written(ledger, wl)).toEqual([]);
+	});
+
+	test("bare `withdraw` and `withdraw q-…` keep their question meaning; past one workload id it is refused, and command-shaped only for a wl- id", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which?", options: ["left", "right"] });
+		const question = { kind: "withdraw", workloadId: wl, questionId: q, then: "replan" } as const;
+		expect(interpret(ledger, "withdraw")).toEqual(question);
+		expect(interpret(ledger, `withdraw ${q}`)).toEqual(question);
+		expect(interpret(ledger, `withdraw ${q} please`)).toBeNull();
+		expect(commandShaped(`withdraw ${q} please`)).toBe(false);
+		expect(commandShaped("withdraw q-1 please")).toBe(false);
+		expect(maxWords("withdraw q-1")).toBe(2);
+		const arity = { kind: "refused", why: "withdraw names one workload: withdraw wl-…" } as const;
+		for (const text of ["withdraw wl-x please", `withdraw ${wl} ${wl}`, "withdraw wl-", `withdraw ${wl} ${q}`]) expect(interpret(ledger, text)).toEqual(arity);
+		expect(commandShaped("withdraw wl-x please")).toBe(true);
+		expect(maxWords("withdraw wl-x please")).toBe(Number.POSITIVE_INFINITY);
+		expect(parseBatch(`withdraw ${wl}`)).toBeNull();
+		expect(written(ledger, wl)).toEqual([]);
+		expect(ledger.question(q)!.state).toBe("open");
+	});
+
+	test("in a paste: a withdrawal is a command line; `withdraw wl-nope` refuses the paste; the same workload twice is refused once per row", () => {
+		const { ledger } = tempLedger();
+		const wl = settled(ledger, ["cancelled"]);
+		const numbering = numbered(ledger);
+		expect(interpretPaste(ledger, numbering, `normal ${wl}\nwithdraw ${wl}\nthe panel moved to the next sprint`)).toEqual({
+			ok: true,
+			items: [
+				{ line: 1, text: `normal ${wl}`, kind: "command", cmd: { kind: "stakes", workloadId: wl, stakes: "normal" } },
+				{ line: 2, text: `withdraw ${wl}`, kind: "command", cmd: { kind: "withdraw-workload", workloadId: wl } },
+				{ kind: "instruction", from: 3, to: 3, text: "the panel moved to the next sprint" },
+			],
+		});
+		expect(interpretPaste(ledger, numbering, `normal ${wl}\nwithdraw wl-nope`)).toEqual({
+			ok: false,
+			refused: [{ line: 1, text: `normal ${wl}`, why: null }, { line: 2, text: "withdraw wl-nope", why: ["wl-nope is not an open workload"] }],
+			held: [],
+		});
+		expect(interpretPaste(ledger, numbering, `withdraw ${wl}\nwithdraw ${wl}`)).toEqual({
+			ok: false,
+			refused: [{ line: 1, text: `withdraw ${wl}`, why: null }, { line: 2, text: `withdraw ${wl}`, why: [`${wl} is already withdrawn on line 1; once per row`] }],
+			held: [],
+		});
+		expect(written(ledger, wl)).toEqual([]);
 	});
 });

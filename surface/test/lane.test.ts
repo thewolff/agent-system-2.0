@@ -13,7 +13,8 @@ import orchestratorSurface from "../index";
 import { errorLines } from "../src/errors";
 import { openPromptWaits, artifactCommandBody, artifactCommands, artifactTrees } from "../src/signals";
 import { heartbeatText, settleArtifact, testRequestedBody, type TestRun, testRunBody } from "../src/test-run";
-import { ARTIFACT_TOOL, INSTRUCTION_POLL_MS, LANE_RELEASE_TOOL, LEASE_MS } from "../src/types";
+import { withdrawInstructionBody, withdrawnBody } from "../src/launch";
+import { ARTIFACT_TOOL, INSTRUCTION_POLL_MS, LANE_RELEASE_TOOL, LEASE_MS, SURFACE_BY } from "../src/types";
 import { workingTree } from "../src/wtree";
 import { ctxOf, fakePi, git, notices, tempRepo, timers, tmp } from "./helpers";
 
@@ -87,6 +88,33 @@ describe("lane row: claim and lease (§ B3 item 4 writer)", () => {
 		expect(ledger.workload(wl)!.holder).toBe("lane-b");
 		expect(notices.some((n) => n.includes("held by lane-b under a live lease"))).toBe(true);
 		expect(messages(ledger, wl)).toHaveLength(1);
+	});
+
+	test("a lane whose lease lapsed before Jo's `withdraw <wl>` does not renew it: start, timer and turn end leave the lapsed lease, so the close is not held off (PLAN wl-mv8s939084z1ts D6)", async () => {
+		timers.length = 0;
+		const { ledger, wl, env } = laneEnv();
+		const f = fakePi();
+		orchestratorSurface(f.pi, env);
+		const ctx = ctxOf();
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		expect(ledger.workload(wl)!.holder).toBe("lane-a");
+		// The lane stalls past its lease; Jo withdraws the workload (the rows the surface's word writes).
+		const lapsed = "2026-09-01T11:00:00.000Z";
+		ledger.db.query("UPDATE workloads SET holder_lease_until = ?, rev = rev + 1 WHERE id = ?").run(lapsed, wl);
+		const ins = ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: wl, body: withdrawInstructionBody(wl) });
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: withdrawnBody(ins) });
+		notices.length = 0;
+		timers[0]!.fn();
+		await f.emit("agent_end", { willContinue: false }, ctx);
+		expect(ledger.workload(wl)!.holder_lease_until).toBe(lapsed);
+		expect(notices.filter((n) => n.includes(`workload ${wl} was withdrawn by Jo (instruction ${ins})`))).toHaveLength(2);
+		// A lane-written `withdrawn:` is no withdrawal: a fresh lane on another workload still claims as before.
+		const other = laneEnv({ AGENT_SYSTEM_LANE_ID: "lane-z" });
+		other.ledger.recordEntry({ by: "lane-z", workloadId: other.wl, kind: "assumption", body: withdrawnBody("in-forged") });
+		const g = fakePi();
+		orchestratorSurface(g.pi, other.env);
+		await g.emit("session_start", { type: "session_start" }, ctxOf());
+		expect(other.ledger.workload(other.wl)!.holder).toBe("lane-z");
 	});
 
 	test("session_shutdown with open work writes the lane-died row and releases the workload; with nothing open it only releases", async () => {

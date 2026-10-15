@@ -6,9 +6,9 @@ import { handBuilderBody, handSettledBody, handSpawnBody, laneBuilderBody, revie
 import { reviewGroupBody, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type InstructionRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
 import {
-	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv, launchable, maxTimeMs,
-	reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
-	type Resolution, resumePlan, resumeSession, verdictOf,
+	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideInteractive, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv,
+	launchable, maxTimeMs, reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
+	type Resolution, resumePlan, resumeSession, verdictOf, withdrawInstructionBody, withdrawnBody, withdrawnBy,
 } from "../src/launch";
 import type { CleanShellRead } from "../../gates/src/clean-shell";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
@@ -452,5 +452,88 @@ describe("supersededBy: Jo's `supersede` word on A (PLAN wl-mv5i3lulwwbbi8 D2)",
 		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { workload_id: "wl-other" })])).toBeNull();
 		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", supersedeInstructionBody("wl-m", "wl-c"))])).toBeNull();
 		expect(supersededBy([entry(SURFACE_BY, "superseded: wl-b")], [word])).toBeNull();
+	});
+});
+
+describe("withdrawn: Jo's `withdraw <wl>` word (PLAN wl-mv8s939084z1ts D3, D6)", () => {
+	const jo = (id: string, body: string, over: Partial<InstructionRow> = {}): InstructionRow => ({
+		id, workload_id: "wl-m", slice_id: null, kind: "instruction", question_id: null, disposition: null, channel: "surface", author: "jo",
+		body, created_by: SURFACE_BY, created_at: NOW, ...over,
+	});
+	const word = jo("in-1", withdrawInstructionBody("wl-m"));
+	const rows = (w: WorkloadRow, entries: EntryRow[], instructions: InstructionRow[] = [word], holders: string[] = []): ReserveRows => ({
+		workload: w, entries, questions: [], instructions, slices: [], holders, liveLanes: 0, cap: 3, now: NOW,
+	});
+
+	test("the surface's entry naming Jo's instruction on the workload stands; the newest valid one wins", () => {
+		expect(withdrawInstructionBody("wl-m")).toBe("withdraw wl-m");
+		expect(withdrawnBody("in-1")).toBe("withdrawn: in-1");
+		expect(reservedPrefix(withdrawnBody("in-1"))).toBe("withdrawn");
+		expect(withdrawnBy([entry(SURFACE_BY, withdrawnBody("in-1"))], [word])).toEqual({ instructionId: "in-1" });
+		const later = jo("in-2", withdrawInstructionBody("wl-m"));
+		const both = [entry(SURFACE_BY, withdrawnBody("in-1")), entry(SURFACE_BY, withdrawnBody("in-2"))];
+		expect(withdrawnBy(both, [word, later])).toEqual({ instructionId: "in-2" });
+		// The newest names a forged instruction: the older valid one stands.
+		expect(withdrawnBy([...both, entry(SURFACE_BY, withdrawnBody("in-9"))], [word, later])).toEqual({ instructionId: "in-2" });
+		expect(withdrawnBy([], [word])).toBeNull();
+	});
+
+	test("forgeries count for nothing: a lane's entry, or an instruction not Jo's surface word for this workload", () => {
+		const body = withdrawnBody("in-1");
+		expect(withdrawnBy([entry("lane-m-1", body)], [word])).toBeNull();
+		expect(controlEntries([entry("lane-m-1", body)], ["lane-m-1"])).toEqual([]);
+		expect(withdrawnBy([entry(SURFACE_BY, body)], [])).toBeNull();
+		expect(withdrawnBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { author: "lane-m-1" })])).toBeNull();
+		expect(withdrawnBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { author: "orchestrator" })])).toBeNull();
+		expect(withdrawnBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { created_by: "lane-m-1", channel: "direct" })])).toBeNull();
+		expect(withdrawnBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { kind: "answer" })])).toBeNull();
+		expect(withdrawnBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { workload_id: "wl-other" })])).toBeNull();
+		expect(withdrawnBy([entry(SURFACE_BY, body)], [jo("in-1", withdrawInstructionBody("wl-other"))])).toBeNull();
+		expect(withdrawnBy([entry(SURFACE_BY, "withdrawn:")], [word])).toBeNull();
+		expect(withdrawnBy([entry(SURFACE_BY, "withdrawn: in-1 and more")], [word])).toBeNull();
+	});
+
+	test("launchable: withdrawn beats an unconsumed launch-requested:, a receipt, the user-driven return and a live holder; closed, standing and due still come first", () => {
+		const withdrawn = entry(SURFACE_BY, withdrawnBody("in-1"));
+		const req = entry(SURFACE_BY, `launch-requested: by jo at ${NOW}`);
+		const done = entry("lane-m-1", "done-because: all five slices done");
+		const tried = launch("lane-m-1", "first");
+		const no = { launch: false, reason: "withdrawn" } as const;
+		expect(verdictOf(rows(workload(), [tried, req, withdrawn]))).toEqual(no);
+		expect(decideLaunch(rows(workload(), [tried, req, withdrawn]))).toEqual(no);
+		expect(verdictOf(rows(workload(), [tried, done, req, withdrawn]))).toEqual(no);
+		expect(verdictOf(rows(workload(), [withdrawn]))).toEqual(no);
+		expect(verdictOf(rows(workload({ mode: "user-driven" }), [withdrawn]))).toEqual(no);
+		expect(verdictOf(rows(workload({ holder: "jo" }), [withdrawn]))).toEqual(no);
+		expect(verdictOf(rows(workload({ status: "closed" }), [withdrawn]))).toEqual({ launch: false, reason: "closed" });
+		expect(verdictOf(rows(workload({ id: STANDING_WORKLOAD_ID }), [withdrawn]))).toEqual({ launch: false, reason: "standing" });
+		expect(verdictOf(rows(workload({ brief: "due: remind me" }), [withdrawn]))).toEqual({ launch: false, reason: "due" });
+		expect(launchable(workload(), control([tried, req]), null, [], NOW, 0, 3, true)).toEqual(no);
+	});
+
+	test("no withdrawal, or a forged one, keeps every verdict as before", () => {
+		const req = entry(SURFACE_BY, `launch-requested: by jo at ${NOW}`);
+		const tried = launch("lane-m-1", "first");
+		const forged = entry("lane-m-1", withdrawnBody("in-1"));
+		expect(verdictOf(rows(workload(), [tried, req]))).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+		expect(verdictOf(rows(workload(), [tried, req, forged]))).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+		expect(verdictOf(rows(workload(), [tried, req, entry(SURFACE_BY, withdrawnBody("in-1"))], []))).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+		expect(verdictOf(rows(workload({ mode: "user-driven" }), [forged]))).toEqual({ launch: false, reason: "user-driven" });
+		expect(verdictOf(rows(workload(), [tried, entry("lane-m-1", "done-because: all done")]))).toEqual({ launch: false, reason: "awaiting-close" });
+		expect(launchable(workload(), control([]), null, [], NOW, 0, 3)).toEqual({ launch: true, cause: { kind: "first" } });
+	});
+
+	test("decideInteractive: `as2 lane <wl>` refuses a withdrawn workload in either mode; closed, standing and due come first; none withdrawn decides as before", () => {
+		const withdrawn = entry(SURFACE_BY, withdrawnBody("in-1"));
+		const no = { launch: false, reason: "withdrawn" } as const;
+		expect(decideInteractive(rows(workload({ mode: "user-driven" }), [withdrawn]))).toEqual(no);
+		expect(decideInteractive(rows(workload(), [withdrawn]))).toEqual(no);
+		expect(decideInteractive(rows(workload({ mode: "user-driven", status: "closed" }), [withdrawn]))).toEqual({ launch: false, reason: "closed" });
+		expect(decideInteractive(rows(workload({ mode: "user-driven", id: STANDING_WORKLOAD_ID }), [withdrawn]))).toEqual({ launch: false, reason: "standing" });
+		expect(decideInteractive(rows(workload({ mode: "user-driven", brief: "due: remind me" }), [withdrawn]))).toEqual({ launch: false, reason: "due" });
+		expect(decideInteractive(rows(workload({ mode: "user-driven" }), []))).toEqual({ launch: true, cause: "interactive" });
+		expect(decideInteractive(rows(workload({ mode: "user-driven" }), [entry("lane-m-1", withdrawnBody("in-1"))]))).toEqual({ launch: true, cause: "interactive" });
+		expect(decideInteractive(rows(workload(), []))).toEqual({ launch: false, reason: "autonomous" });
+		expect(decideInteractive(rows(workload({ mode: "user-driven", holder: "jo" }), []))).toEqual({ launch: false, reason: "held" });
 	});
 });

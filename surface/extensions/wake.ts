@@ -366,7 +366,8 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	 * The tick catch-up (DESIGN-lane-launcher.md decision 7): every open workload the predicate says
 	 * to launch now gets one starter run, so a resolution or a cap slot that arrived with nobody
 	 * typing does not wait for Jo's next turn. A workload the predicate refuses as `awaiting-close`
-	 * (its holder's `done-because:` stands, nobody holds it) with no open or paused slice and no open
+	 * (its holder's `done-because:` stands, nobody holds it) or as `withdrawn` (Jo's `withdraw <wl>`
+	 * stands, PLAN wl-mv8s939084z1ts D6, in either mode) with no open or paused slice and no open
 	 * question is closed through the close tool's own path (`closeWorkloadWithEntry`, decision 13:
 	 * the entry committed, the close stamped as the surface); one that still has an open or paused
 	 * slice or an open question is told once as "finished but cannot close", again only when its
@@ -375,6 +376,8 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	 * (`s.refusedClose`), cleared when the workload closes or stops being ready to close. Runs after
 	 * the poll persisted lapsed leases; one catch-up at a time; a line per attempt goes to the tick's
 	 * queue, pushed when the catch-up ends. The session's `cwd` is the close tool's fallback repository.
+	 * A withdrawn close the word could not finish (a git failure, an open PR Jo then closes) completes
+	 * here on a later poll with no new word.
 	 */
 	const catchUp = async (s: SurfaceSession, ctx: Ctx): Promise<void> => {
 		if (s.launching || !pi.exec) return;
@@ -385,7 +388,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				const id = w.workload.id;
 				if (id === STANDING_WORKLOAD_ID) continue;
 				const verdict = launchVerdict(ledger, env, id);
-				if (verdict?.launch === false && verdict.reason === "awaiting-close") {
+				if (verdict?.launch === false && (verdict.reason === "awaiting-close" || verdict.reason === "withdrawn")) {
 					const { open_slices: open, paused_slices: paused, open_questions: questions } = w.workload;
 					if (open > 0 || paused > 0 || questions > 0) {
 						s.refusedClose.delete(id);

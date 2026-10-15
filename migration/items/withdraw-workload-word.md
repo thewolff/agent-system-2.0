@@ -1,0 +1,42 @@
+---
+title: Jo's `withdraw wl-…` word closes a workload with no done-because receipt
+status: open
+workload: wl-mv8s939084z1ts
+pr: 151
+---
+**Built on branch `wl/wl-mv8s939084z1ts`.** Workload `wl-mv8s939084z1ts` (normal stakes, plan revision 3 at `~/agent-scratch/agent-system-2.0/wl-mv8s939084z1ts/PLAN.md`, reviewed cross-lab by openai in two rounds, `PLAN-REVIEW-r1.md` and `PLAN-REVIEW-r2.md`). Jo's words (input `in-mv8s8uyibh3vnk`, 2026-10-14): *"add a `withdraw <workload>` word so Jo can close a workload whose slices are all cancelled (3 are stuck open now). One word, recorded in the ledger, refuses while any slice is live."*
+
+**Evidence.** Three workloads are stuck open. Jo cancelled their live slices, and `orchestrator_close_workload` refuses each one because no lane wrote a `done-because:` receipt; Jo had no word that closes a workload without one. A read-only read of the live ledger (`~/.agent-system-2/ledger.db`, 2026-10-14) shows all three open, with no holder and no open question:
+- `wl-mv8fb0xnlc0b28` (the founder signature data-viz prototype, repo `/Users/jowolff/code/shipyard`): 1 slice cancelled, 1 done (its ceiling slice).
+- `wl-mv5jz4vewt8mbk` (the `seo-audit` skill, migration/items/seo-audit-skill.md): 2 slices cancelled, 25 done. PR #114 is merged, and `git log origin/main..origin/wl/wl-mv5jz4vewt8mbk` is empty.
+- `wl-mv5r8wl7lnc1z4` (the forgery boundary): 1 slice cancelled. It has no `wl/` branch on origin and no PR.
+
+`supersede wl-A wl-B` (migration/items/nine-surface-runner-classifier-defects.md, D2) closes a workload without a receipt only when another workload replaces it, and none of these three has a successor.
+
+**The fix** (PLAN D1–D6):
+- **D1, the word** (`surface/src/input.ts`). `withdraw <wl-…>` is a new `Command` kind, `withdraw-workload`. A line whose first word is `withdraw` and whose second starts `wl-` is always the command or `refused` with the reason, at any length, never prose: `withdraw wl-x please` is refused with "withdraw names one workload: withdraw wl-…". A bare `withdraw` and `withdraw q-…` keep their question meaning, and a bare `withdraw` never targets a workload. In a paste it is a command line, once per workload, and never a numbered-batch piece.
+- **D2, the refusals** (`withdrawRefusal`, checked when the word is read and again inside the write, which then writes nothing). Refused when there is no such workload, when it is the standing workload, not open, or a scheduled row (`due:` brief), or when any slice is open or paused (the refusal names them), any question is open, or a lane holds it under a live lease. Done and cancelled slices are allowed, and so is a workload with no slices. This follows Jo's "refuses while any slice is live": two of the three stuck workloads carry done slices.
+- **D3, the record** (`surface/src/input.ts`, `surface/src/launch.ts`). In one transaction, Jo's instruction `withdraw <wl>` goes on the workload (author jo, channel surface), then the surface's control entry `withdrawn: <instruction id>`. `withdrawn` joins `CONTROL_PREFIXES` with the surface as its only writer, so lane tools refuse it as a body. `withdrawnBy(entries, instructions)` mirrors `supersededBy`: it counts only a surface-written `withdrawn:` that names Jo's surface-written `withdraw <wl>` instruction on the same workload.
+- **D4, the close** (`surface/extensions/surface-input.ts`, `surface/extensions/workload.ts`). After the transaction commits, `closeAfter` runs `closeWorkloadWithEntry` for each withdrawn workload, on the single-word and paste paths, and never on a refused paste. The echo carries the result: `Closed wl-…` with the decision-log entry, or `<wl> stays open: <refusal>; the tick retries the close`. A throw is caught and echoed as "withdrawn …, but the close failed", never "could not apply", because the record is already committed. `closeWorkloadWithEntry` takes `withdrawnBy` in place of a `done-because:` receipt, and the close receipt reads `withdrawn by Jo (<in-…>): closed with no done-because: receipt`. When both `superseded:` and `withdrawn:` stand, superseded wins.
+- **D5, the served-repo check** (`surface/src/close-entry.ts`). A withdrawn workload goes through the same rule as a superseded one: no PR of the close set is open, and no bound branch carries a commit that origin's default branch lacks. The check fails closed. `closeCheck`'s stand-in names which kind it is (`withdrawn (Jo, in-…), but PR #7 … is open: merge or close it first`). A repo the test runner does not serve (shipyard) gets no check, as today.
+- **D6, no relaunch; the tick finishes** (`surface/src/launch.ts`, `surface/extensions/launch.ts`, `surface/extensions/wake.ts`). `launchable` returns a new reason, `withdrawn`, right after its `closed`/`standing`/`due` checks. That comes before the `user-driven` return, the live-holder check and the `launch-requested:` check, so an unconsumed request (`cancel-slice` writes one) never launches a lane on a withdrawn workload. The launch extension says `<wl> was withdrawn by Jo and is awaiting close; nothing launched`. `catchUp` in `wake.ts` treats `withdrawn` like `awaiting-close`, so a close the word could not finish (a git failure, or an open PR that Jo then closes) completes on a later tick in either mode with no new word. `decideInteractive` refuses a withdrawn workload with `InteractiveReason` `withdrawn`, so `as2 lane <wl>` takes no lease on it.
+
+Docs: the USER-GUIDE.md § 3 word table and `tiers/orchestrator.md` describe the word next to `supersede`.
+
+**Tests** (named by the plan's slices):
+- `surface/test/launch.test.ts`: `withdrawnBy` forgeries count for nothing. `launchable` returns `withdrawn` ahead of an unconsumed `launch-requested:` and of the `user-driven` return, `decideInteractive` refuses a withdrawn user-driven workload, and verdicts with no withdrawal are unchanged.
+- `surface/test/close-fresh.test.ts` (served): a merged PR closes; an open PR or an unmerged branch is refused; a lane-written `withdrawn:`, or one naming a non-Jo instruction, counts for nothing.
+- `surface/test/close-entry.test.ts` (unserved): a withdrawn workload closes without a receipt, and the entry and close receipt say withdrawn.
+- `surface/test/wake-close.test.ts`: an autonomous withdrawn workload with an unconsumed `launch-requested:` is closed by the tick and launches nothing. A user-driven withdrawn workload is refused on the first tick (served, close check fails), told once, and closed on a later tick.
+- `surface/test/lane-tools.test.ts`: a `withdrawn:` body is refused as a forgery.
+- `surface/test/input.test.ts`: the word writes the instruction and `withdrawn:`, and every D2 refusal writes nothing. All-cancelled, done-only, done+cancelled and no-slice workloads are accepted. `withdraw q-…` and a bare `withdraw` are unchanged. `withdraw wl-x please` is refused while `withdraw q-1 please` stays prose-shaped. A paste is once per row, and `withdraw wl-nope` is refused.
+- `surface/test/extension.test.ts` (fake exec): typing the word closes the workload and echoes `Closed`. A refused close leaves it open with `withdrawn:` standing, and the echo says the tick retries. A close that throws echoes "withdrawn …, but the close failed". A paste with a withdrawal closes exactly once. A paste with a refused later line makes no close call and writes no rows.
+
+**After merge.** (1) Reload. Per MIGRATION.md item 91 ("Merged" is not "running"), the surface keeps the code it started with: fast-forward the checkout the surface runs from and restart `as2`. Until then, `withdraw wl-…` is read as prose. (2) Jo types, one line each or as one paste:
+- `withdraw wl-mv8fb0xnlc0b28`
+- `withdraw wl-mv5jz4vewt8mbk`
+- `withdraw wl-mv5r8wl7lnc1z4`
+
+Each should echo `Closed wl-…`. `wl-mv5jz4vewt8mbk` is on a served repo: its PR #114 is merged and its branch carries nothing that origin/main lacks, so the D5 check passes. `wl-mv5r8wl7lnc1z4` has no branch and no PR. `wl-mv8fb0xnlc0b28` is on shipyard, which the test runner does not serve. If any of them echoes `stays open`, the reason names what to clear, and the tick finishes the close after that.
+
+**Rollback.** One commit per change slice; no schema change. Revert sl-wd-word before sl-wd-core, because it imports core's exports. Rows the new code writes stay inert under the old code: `withdrawn:` is not a control prefix there, so it is an ordinary surface note. `doneBecause` would treat that note as superseding a receipt, but a withdrawn workload has no receipt, so nothing changes.

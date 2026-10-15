@@ -3,7 +3,8 @@
 // (up to four words, never read as a batch), `rounds <n> [wl-…]` (up to three words, never read as
 // a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), `cancel-slice <sl-…>` and
 // `supersede <wl-A> <wl-B>` (PLAN wl-mv5i3lulwwbbi8 D1, D2), `test-pr <wl-…> <N> [<N> …]`
-// (any length, never read as a batch; PLAN wl-mv5qdfvv82ivwg § 2.1), or a numbered batch
+// (any length, never read as a batch; PLAN wl-mv5qdfvv82ivwg § 2.1), `withdraw <wl-…>` (any length,
+// never read as a batch; PLAN wl-mv8s939084z1ts D1), or a numbered batch
 // answering needs-you lines by their session number ("1 approve, 2 deny", or one per line;
 // MIGRATION.md § M7 follow-ups item 1). Read
 // from the turn's prompt in `before_agent_start` rather than from the `input` event, because
@@ -70,6 +71,16 @@
 // to user-driven while an autonomous lane holds the workload writes the `lane-stop:` request the
 // runner accepts.
 //
+// Closing a withdrawn workload (PLAN wl-mv8s939084z1ts D4): after the transaction that applied a
+// `withdraw <wl-…>` commits, on the single word and the paste path (never on a refused paste or a
+// rolled-back transaction), `closeAfter` closes each withdrawn workload through
+// `closeWorkloadWithEntry` (the close tool's body, no receipt: the withdrawal stands in for it) and
+// appends its line to that command's echo: `Closed <wl>.` with the decision-log entry, or `<wl> stays
+// open: <refusal>; the tick retries the close`. A close that throws is named the same way (`withdrawn,
+// but the close failed: …`), never as "could not apply", since the withdrawal is committed; the wake
+// tick finishes a close the word could not (surface/extensions/wake.ts `catchUp`). A withdrawal is
+// no resolution a lane resumes on, so it runs no launch trigger.
+//
 // Surface words (PLAN wl-mv5msri070p0qo D1, D4), each only as the whole trimmed input: `pending`
 // and `brb` are read from the `input` event and handled there, so OMP drops them and no turn starts
 // (`pending` shows the block of every open answer line as a `surface-pending` message, queued for
@@ -86,6 +97,7 @@ import { oneLinerCore } from "../src/render";
 import { DISCARDED_KEPT, type SurfaceSession, surfaceSession, type TypedEntry } from "../src/session";
 import { type Ctx, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY } from "../src/types";
 import { triggerLaunch } from "./launch";
+import { closeWorkloadWithEntry } from "./workload";
 
 /** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null; `stop-reviews` and `cancel-slice` withdraw questions too. */
 const resumes = (cmd: Command): string | null =>
@@ -96,6 +108,9 @@ const launches = (cmd: Command): string | null => resumes(cmd) ?? (cmd.kind === 
 
 /** `line 5` or `lines 5–7`: the span of a paste's plain-words run. */
 const span = (i: PasteInstruction): string => (i.from === i.to ? `line ${i.from}` : `lines ${i.from}–${i.to}`);
+
+/** One applied command's echo line: `wl` the workload the launch trigger runs for after it; `closes` the workload a `withdraw <wl-…>` closes after its transaction commits (PLAN wl-mv8s939084z1ts D4). */
+type Echo = { wl: string | null; line: string; closes?: string };
 
 /**
  * Apply one word command: `apply`, plus the control entry a mode flip implies (`modeFlipControl`), in the caller's
@@ -337,7 +352,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		return undefined;
 	});
 	/** Run the launch trigger once per workload the applied commands hand on, appending its line to the last echo for that workload; a trigger that throws is named there, the commands being applied already. */
-	const launchAfter = async (ledger: Ledger, echoes: { wl: string | null; line: string }[]): Promise<void> => {
+	const launchAfter = async (ledger: Ledger, echoes: Echo[]): Promise<void> => {
 		for (const wl of [...new Set(echoes.map((e) => e.wl).filter((wl) => wl !== null))]) {
 			const last = echoes.findLast((e) => e.wl === wl)!;
 			try {
@@ -345,6 +360,23 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				if (launched.line) last.line += `; ${launched.line}`;
 			} catch (err) {
 				last.line += `; applied, but the launch on ${wl} after it failed: ${String(err)}`;
+			}
+		}
+	};
+
+	/**
+	 * PLAN wl-mv8s939084z1ts D4: close each workload a committed `withdraw <wl-…>` withdrew, appending the close's line to that
+	 * command's echo: its text when closed, else the refusal and that the tick retries; a close that throws is named there too, never
+	 * as "could not apply", the withdrawal being committed already.
+	 */
+	const closeAfter = async (ledger: Ledger, ctx: Ctx, s: SurfaceSession, echoes: Echo[]): Promise<void> => {
+		for (const e of echoes) {
+			if (e.closes === undefined) continue;
+			try {
+				const r = await closeWorkloadWithEntry(pi, ledger, env, e.closes, { now: s.now(), cwd: ctx.cwd, receipt: null });
+				e.line += r.closed ? `; ${r.text}` : `; ${e.closes} stays open: ${r.text}; the tick retries the close`;
+			} catch (err) {
+				e.line += `; withdrawn, but the close failed: ${reason(err)}; the tick retries`;
 			}
 		}
 	};
@@ -388,7 +420,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				refuse(verdicts, r.held, r.refused.find((f) => f.why !== null)!.line);
 				return undefined;
 			}
-			let echoes: { wl: string | null; line: string }[];
+			let echoes: Echo[];
 			try {
 				// All-or-nothing, one transaction, in paste order; each command through apply(), so each is its own ledger row.
 				echoes = ledger.write(() =>
@@ -396,7 +428,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 						if (item.kind === "instruction") return [{ wl: null, line: `${span(item)} → an instruction for you, one row: "${item.text.replace(/\s*\n\s*/g, " ")}"` }];
 						try {
 							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, heartbeatOf)}` }));
-							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd, heartbeatOf) }];
+							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd, heartbeatOf), closes: item.cmd.kind === "withdraw-workload" ? item.cmd.workloadId : undefined }];
 						} catch (err) {
 							throw new LineFailure(item.line, item.text, err);
 						}
@@ -416,6 +448,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				return undefined;
 			}
 			await launchAfter(ledger, echoes);
+			await closeAfter(ledger, ctx, s, echoes);
 			echo(s, ctx, text, echoes.map((e) => e.line), "info");
 			return undefined;
 		}
@@ -455,8 +488,9 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				echo(s, ctx, text, [cmd.why], "warning");
 				return undefined;
 			}
-			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd, heartbeatOf)) }];
+			const echoes: Echo[] = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd, heartbeatOf)), closes: cmd.kind === "withdraw-workload" ? cmd.workloadId : undefined }];
 			await launchAfter(ledger, echoes);
+			await closeAfter(ledger, ctx, s, echoes);
 			receipt = echoes[0]!.line;
 		} catch (err) {
 			receipt = `could not apply "${text}": ${reason(err)}`;

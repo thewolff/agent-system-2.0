@@ -3,6 +3,7 @@
 // first message at start and after compaction, voice document in the system prompt, wake-read
 // owed and enforced on tool calls and at stop), Jo's one-word input applied and shown next turn,
 // `cancel-slice` on a parked lane's question runs the launch trigger (PLAN wl-mv5i3lulwwbbi8 D1),
+// `withdraw <wl-…>` closes the workload right after its record commits (PLAN wl-mv8s939084z1ts D4),
 // and the identity / open / close / schedule tools.
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -11,9 +12,10 @@ import { reviewLimitBody, ROUND_LIMIT_OPTIONS } from "../../classifier/src/round
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { CEILING_OPTIONS } from "../src/ceiling";
+import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { errorLines } from "../src/errors";
 import { ceilingOf } from "../src/input";
-import { planFirstBody } from "../src/launch";
+import { planFirstBody, withdrawnBy } from "../src/launch";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { STANDING_WORKLOAD_ID, SURFACE_BY as SURFACE } from "../src/types";
 import { clock, ctxOf, fakePi, notices, timers, tmp } from "./helpers";
@@ -702,5 +704,138 @@ describe("cancel-slice at the surface (PLAN wl-mv5i3lulwwbbi8 D1)", () => {
 		expect(l.slice(sl)!.state).toBe("cancelled");
 		expect(l.instructions(wl).map((i) => [i.kind, i.author, i.channel])).toEqual([["instruction", "jo", "surface"], ["withdrawal", "jo", "surface"]]);
 		l.close();
+	});
+});
+
+describe("withdraw <wl-…> at the surface (PLAN wl-mv8s939084z1ts D4)", () => {
+	const ORIGIN_URL = "https://github.com/example/repo.git";
+	/** The env with a test-runner config serving example/repo: the fake exec's `git config` answer decides served or not. */
+	function servedEnv(): Record<string, string> {
+		const config = join(tmp("config"), "config.yml");
+		writeFileSync(config, "setupVersion: 2\ntestRunner:\n  repos:\n    - origin: example/repo\n      command: bun test\n");
+		return env({ [TEST_RUNNER_CONFIG_ENV]: config });
+	}
+	/** An open workload whose one slice was cancelled and that no one holds: the word's accepted case. */
+	function cancelledWorkload(e: Record<string, string>): string {
+		const l = open(e);
+		const wl = l.openWorkload({ by: SURFACE, brief: "Prototype the data-viz panel", stakes: "normal", mode: "autonomous" });
+		l.cancelSlice(l.addSlice({ by: SURFACE, workloadId: wl, task: "draw the panel", doneCondition: "it renders", inputs: "the feed" }), { by: SURFACE });
+		l.close();
+		return wl;
+	}
+	/**
+	 * The surface on the fake exec (no git or gh process runs): while `git.origin`, `git config` names a served origin and
+	 * `git rev-parse --show-toplevel` then fails, so the close check refuses; otherwise the repo has no origin and is not served.
+	 */
+	function surface(e: Record<string, string>, git = { origin: false }) {
+		const f = fakePi(undefined, { exec: true });
+		f.execs.answer = (command, args) => {
+			if (command === "git" && args[2] === "config") return git.origin ? { stdout: `${ORIGIN_URL}\n`, stderr: "", code: 0, killed: false } : { stdout: "", stderr: "", code: 1, killed: false };
+			if (command === "git" && args[2] === "rev-parse" && args[3] === "--show-toplevel") return { stdout: "", stderr: "fatal: no", code: 128, killed: false };
+			return { stdout: "", stderr: "", code: 0, killed: false };
+		};
+		orchestratorSurface(f.pi, e, {});
+		return f;
+	}
+	/** The `surface-close` entries the close appends, one per workload it closed. */
+	const closes = (entries: readonly { type: string }[]) => entries.filter((x) => x.type === "surface-close");
+
+	test("typed: the record is written and the workload closes at once, the echo carrying `Closed <wl>`; no launch runs", async () => {
+		const e = servedEnv();
+		const wl = cancelledWorkload(e);
+		const f = surface(e);
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `withdraw ${wl}`, systemPrompt: [] }, ctxOf({ cwd: tmp("repo") }));
+		const l = open(e);
+		const [ins] = l.instructions(wl).filter((i) => i.kind === "instruction");
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toStartWith(`withdrew ${wl} (instruction ${ins!.id}); closing it with no done-because: receipt; Closed ${wl}.`);
+		expect(l.workload(wl)!.status).toBe("closed");
+		expect(l.instructions(wl).map((i) => i.body)).toContain(`close receipt: withdrawn by Jo (${ins!.id}): closed with no done-because: receipt`);
+		l.close();
+		expect(closes(f.entries)).toHaveLength(1);
+		expect(f.execs.calls.filter((c) => c.command === "bun")).toEqual([]);
+	});
+
+	test("a refused close (served repo whose git fails) leaves it open with the withdrawal standing, and the echo says the tick retries", async () => {
+		const e = servedEnv();
+		const wl = cancelledWorkload(e);
+		const repo = tmp("repo");
+		const f = surface(e, { origin: true });
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `withdraw ${wl}`, systemPrompt: [] }, ctxOf({ cwd: repo }));
+		const l = open(e);
+		const by = withdrawnBy(l.entries(wl), l.instructions(wl));
+		expect(by).not.toBeNull();
+		expect(notices).toEqual([
+			`withdrew ${wl} (instruction ${by!.instructionId}); closing it with no done-because: receipt; ${wl} stays open: ${wl} cannot close: the close check could not answer: ${repo} is not a git checkout (git rev-parse exited 128: fatal: no); the tick retries the close`,
+		]);
+		expect(l.workload(wl)!.status).toBe("open");
+		l.close();
+		expect(closes(f.entries)).toEqual([]);
+	});
+
+	test("a close that throws is named after the committed withdrawal, never as `could not apply`", async () => {
+		const e = servedEnv();
+		const wl = cancelledWorkload(e);
+		// the repo is a regular file: rendering the decision-log entry under it throws inside the close
+		const notDir = join(tmp("repo"), "a-file");
+		writeFileSync(notDir, "not a directory");
+		const f = surface(e);
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `withdraw ${wl}`, systemPrompt: [] }, ctxOf({ cwd: notDir }));
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toMatch(new RegExp(`^withdrew ${wl} \\(instruction in-\\S+\\); closing it with no done-because: receipt; withdrawn, but the close failed: .+; the tick retries$`));
+		expect(notices[0]).not.toContain("could not apply");
+		const l = open(e);
+		expect(l.workload(wl)!.status).toBe("open");
+		expect(withdrawnBy(l.entries(wl), l.instructions(wl))).not.toBeNull();
+		l.close();
+	});
+
+	test("a paste of a withdrawal and a valid command closes exactly once; a paste whose later line is refused closes nothing and writes nothing", async () => {
+		const e = servedEnv();
+		const wl = cancelledWorkload(e);
+		const f = surface(e);
+		const ctx = ctxOf({ cwd: tmp("repo") });
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `withdraw ${wl}\nwithdraw wl-nope`, systemPrompt: [] }, ctx);
+		expect(notices).toEqual([`line 1 "withdraw ${wl}": ok, not applied`, 'line 2 "withdraw wl-nope": wl-nope is not an open workload', "nothing applied: fix line 2 and paste all of it again"]);
+		let l = open(e);
+		expect(l.instructions(wl)).toEqual([]);
+		expect(withdrawnBy(l.entries(wl), l.instructions(wl))).toBeNull();
+		l.close();
+		expect(f.execs.calls).toEqual([]);
+		expect(closes(f.entries)).toEqual([]);
+
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `production ${wl}\nwithdraw ${wl}`, systemPrompt: [] }, ctx);
+		expect(notices).toHaveLength(2);
+		expect(notices[0]).toStartWith(`stakes on ${wl} → production`);
+		expect(notices[1]).toStartWith(`withdrew ${wl} (instruction `);
+		expect(notices[1]).toContain(`; Closed ${wl}.`);
+		expect(closes(f.entries)).toHaveLength(1);
+		l = open(e);
+		expect(l.workload(wl)).toMatchObject({ status: "closed", stakes: "production" });
+		l.close();
+	});
+
+	test("`withdraw wl-x please` typed is refused with the reason, and writes no Jo-input prose row", async () => {
+		const e = servedEnv();
+		const wl = cancelledWorkload(e);
+		const f = surface(e);
+		const ctx = ctxOf();
+		notices.length = 0;
+		const text = `withdraw ${wl} please`;
+		await f.emit("input", { text, source: "interactive" }, ctx);
+		await f.emit("before_agent_start", { prompt: text, systemPrompt: [] }, ctx);
+		expect(notices).toEqual(["withdraw names one workload: withdraw wl-…"]);
+		expect(f.entries.filter((x) => x.type === "surface-jo-input")).toEqual([]);
+		const l = open(e);
+		expect(l.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
+		expect(l.instructions(wl)).toEqual([]);
+		expect(l.workload(wl)!.status).toBe("open");
+		l.close();
+		expect(closes(f.entries)).toEqual([]);
 	});
 });

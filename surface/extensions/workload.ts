@@ -8,19 +8,19 @@
 // trigger fires, `plan: first <trigger>` (decision 15), and Jo's `lane-model:` when `model` is given
 // (MIGRATION.md item 85), all in the transaction that opens the workload, then runs the launch trigger
 // (surface/extensions/launch.ts) and carries its one line; close (`closeWorkloadWithEntry`, shared
-// by the close tool and the wake tick's auto-close of a workload awaiting close) refuses a workload
-// held under a live lease or without the holder's `done-because:` receipt, commits the rendered
+// by the close tool and the wake tick's auto-close of a workload awaiting close or withdrawn) refuses a workload
+// held under a live lease or without the holder's `done-because:` receipt (unless Jo superseded or withdrew it), commits the rendered
 // entry (decision 13) on the workload's lane branch wl/<id>, never on the checkout's current branch,
 // and pushes it to an open PR (surface/src/close-entry.ts), through the extension API's exec, never
 // the bash tool. Once the row has closed, the workload's scratch root is removed in-process
 // (`closeScratchRoot`, PLAN wl-mv5oikd5jtquww § 1.5); a failed removal is an entry, never a failed close.
 import type { InstructionRow, Ledger } from "../../ledger/src/index";
 import { classify, type KindJudge, loadKindQuestion } from "../../classifier/src/classify";
-import { closeCheck, closeScratchRoot, commitCloseEntry, type EntryPublish, logDirOf, publishEntry, recordCloseReceipt, type Superseded } from "../src/close-entry";
+import { closeCheck, closeScratchRoot, commitCloseEntry, type EntryPublish, logDirOf, publishEntry, recordCloseReceipt, type StandIn, standInOf } from "../src/close-entry";
 import { decisionLogContext, lastWorkloadOn, recordRepo, repoOf } from "../src/decision-log";
 import { identityOf, recordIdentity } from "../src/identity";
 import { ceilingBody, sizeFor } from "../src/ceiling";
-import { controlEntries, doneBecause, doneBody, doneLine, holdersOf, laneModelBody, modelProblem, planFirstBody, supersededBy } from "../src/launch";
+import { controlEntries, doneBecause, doneBody, doneLine, holdersOf, laneModelBody, modelProblem, planFirstBody, supersededBy, withdrawnBy } from "../src/launch";
 import { stakesSource } from "../src/input";
 import { answerOrchestratorQuestion, inputSpent, joInput, type OrchestratorAnswer, questionSubject, readingBody } from "../src/orchestrator-question";
 import { oneLiner } from "../src/render";
@@ -45,7 +45,7 @@ export interface CloseOutcome {
 	/** The one line for the tool result or the tick's notice. */
 	text: string;
 	details?: unknown;
-	/** The holder's standing `done-because:` receipt, or null (a scheduled row, a workload with no done: line). */
+	/** The holder's standing `done-because:` receipt; with none, on a close Jo's superseded or withdrawn word stood in for, the close receipt naming it; else null (a scheduled row, a workload with no done: line). */
 	receipt: string | null;
 	/** On a close, what became of the decision-log entry (committed where, pushed or not, the PR or why none), which the tick's notice carries too. */
 	entry?: string;
@@ -56,13 +56,14 @@ export interface CloseOutcome {
  * of a workload awaiting close. Refused — nothing written — for the standing workload, a closed
  * one, a holder under a live lease, open or paused slices, open questions, or a done: line with no
  * standing `done-because:` from its holder — unless Jo superseded the workload (`supersede <A> <B>`,
- * surface/src/launch.ts `supersededBy`, PLAN wl-mv5i3lulwwbbi8 D2), which stands in for the receipt
- * and is named, with the successor, in the close receipt the entry carries. For a repo the test
- * runner serves, the close check (PLAN § 2.4 item 4; surface/src/close-entry.ts `closeCheck`) runs
- * next and refuses — fails closed — unless every PR in the workload's set is green at its head (or
- * merged with a run Jo waived, D3) and the candidate wl/<id> tip is covered; for a superseded
- * workload, unless no PR in the set is open and no bound branch carries a commit origin's default
- * lacks. Its pin then binds the commit and the push, and a commit that fails or does not
+ * surface/src/launch.ts `supersededBy`, PLAN wl-mv5i3lulwwbbi8 D2) or withdrew it (`withdraw <wl>`,
+ * `withdrawnBy`, PLAN wl-mv8s939084z1ts D4), which stands in for the receipt and is named (with the
+ * successor, for a supersede) in the close receipt the entry carries; superseded wins when both stand.
+ * For a repo the test runner serves, the close check (PLAN § 2.4 item 4; surface/src/close-entry.ts
+ * `closeCheck`) runs next and refuses — fails closed — unless every PR in the workload's set is green
+ * at its head (or merged with a run Jo waived, D3) and the candidate wl/<id> tip is covered; for a
+ * superseded or withdrawn workload, unless no PR in the set is open and no bound branch carries a
+ * commit origin's default lacks. Its pin then binds the commit and the push, and a commit that fails or does not
  * sit on the pin refuses too. Otherwise the decision-log entry is rendered from the ledger and
  * committed on the workload's lane branch wl/<id> through `pi.exec` (never on the checkout's
  * current branch; surface/src/close-entry.ts), then the row closes, stamped
@@ -88,23 +89,28 @@ export async function closeWorkloadWithEntry(
 	}
 	const scheduled = w.brief.startsWith(DUE_PREFIX);
 	let done: string | null = null;
-	// PLAN wl-mv5i3lulwwbbi8 D2: Jo's `supersede <A> <B>` stands in for the holder's receipt (G3) and swaps the close check for supersededFreshness.
-	let superseded: Superseded | null = null;
+	// PLAN wl-mv5i3lulwwbbi8 D2, wl-mv8s939084z1ts D4: Jo's `supersede <A> <B>` or `withdraw <wl>` stands in for the holder's receipt (G3)
+	// and swaps the close check for supersededFreshness; superseded wins when both stand (it names a successor).
+	let standIn: StandIn | null = null;
 	if (!scheduled) {
 		const entries = ledger.entries(id, "assumption");
 		const holders = holdersOf(entries, w.holder, ledger.holders(id));
 		const line = doneLine(controlEntries(entries, holders));
 		done = doneBecause(entries, holders);
-		superseded = supersededBy(entries, ledger.instructions(id));
-		if (line !== null && done === null && superseded === null) {
+		const instructions = ledger.instructions(id);
+		standIn = standInOf(supersededBy(entries, instructions), withdrawnBy(entries, instructions));
+		if (line !== null && done === null && standIn === null) {
 			return refused(`${id} cannot close: no \`done-because:\` receipt from its holder against the done: line (${line}), or a later note by the lane or the surface supersedes it. The lane writes it with lane_record_entry before it releases.`);
 		}
 	}
-	// The entry and the ledger's close receipt name the successor (D2).
-	const receipt = superseded ? `superseded by ${superseded.by} (Jo, ${superseded.instructionId})${o.receipt ? `; ${o.receipt}` : ""}` : o.receipt;
+	// The entry and the ledger's close receipt name the successor (D2) or the withdrawal (wl-mv8s939084z1ts D4).
+	const said = standIn?.kind === "superseded"
+		? `${standIn.label} (Jo, ${standIn.instructionId})`
+		: standIn?.kind === "withdrawn" ? `withdrawn by Jo (${standIn.instructionId}): closed with no done-because: receipt` : null;
+	const receipt = said ? `${said}${o.receipt ? `; ${o.receipt}` : ""}` : o.receipt;
 	const repo = repoOf(ledger, id) ?? o.cwd;
 	// MIGRATION.md item 24: a served repo's close needs a green at every PR head and on the candidate; it fails closed (decision 13's one exception).
-	const check = scheduled ? null : await closeCheck(pi, ledger, env, id, repo, superseded);
+	const check = scheduled ? null : await closeCheck(pi, ledger, env, id, repo, standIn);
 	if (check?.served && !check.decision.close) return refused(`${id} cannot close: ${check.decision.reason}`);
 	const checked = check?.served && check.decision.close ? check.decision.why : null;
 	// Decision 13 as amended (M7 follow-ups 11, 12): the entry is committed on wl/<id>, this path only; a failed commit never blocks an unserved repo's close.
@@ -140,7 +146,7 @@ export async function closeWorkloadWithEntry(
 	if (entry?.notes.length) tail += ` Also: ${entry.notes.join("; ")}.`;
 	if (checked !== null) tail += ` Close check: ${checked}.`;
 	const scratchNote = scratch ? ` ${scratch}` : "";
-	return { closed: true, text: `Closed ${id}.${scratchNote}${tail}`, details, receipt: done, entry: `${tail.trim()}${scratchNote}` };
+	return { closed: true, text: `Closed ${id}.${scratchNote}${tail}`, details, receipt: done ?? said, entry: `${tail.trim()}${scratchNote}` };
 }
 
 export default function workloadRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, deps: WorkloadDeps = {}): void {
@@ -272,7 +278,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 		label: "Close Workload",
 		description:
 			"Close a workload: one decision-log entry is rendered from the ledger into the repository's .ai/decision-log/ (filename YYYY-MM-DD--HHMM--<your name>--<slug>.md) and committed on the workload's lane branch wl/<id> and pushed to its PR, then the row closes. " +
-			"Refused while slices are open or paused, a question is open, a lane holds it under a live lease, or the holder has not written its `done-because:` receipt. " +
+			"Refused while slices are open or paused, a question is open, a lane holds it under a live lease, or the holder has not written its `done-because:` receipt (unless Jo superseded or withdrew it). " +
 			"For a repository the test runner serves, also refused when a PR of the workload is not green at its head, local wl/<id> carries code no green covers, or git or gh cannot answer. For a scheduled row, `receipt` is the receipt it closes with.",
 		parameters: z.object({
 			workloadId: z.string().describe("The workload id (wl-…)."),
