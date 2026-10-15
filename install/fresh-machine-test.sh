@@ -4,9 +4,9 @@
 # $HOME, and that the OMP profile lands under it too: config.yml rendered from profile/config.yml
 # with {repo} filled, models.yml beside it, the six tier files linked into agents/, and OMP's own
 # skill discovery under that HOME and profile listing exactly the manifest's `skill` rows (the
-# 22 of DESIGN-2.0.md § C6.1) with decoy skills planted in ~/.claude and ~/.agents not among them,
-# and OMP's own extension loading under that HOME and profile loading exactly the three configured
-# extensions in the order surface, gates, classifier, with no load error. The launcher
+# 24 of DESIGN-2.0.md § C6.1, including 2 from vendored plugins) with decoy skills planted in ~/.claude and ~/.agents not among them,
+# and OMP's own extension loading under that HOME and profile loading exactly the four configured
+# extensions in the order surface, gates, classifier, plugins, with no load error. The launcher
 # (`launcher` rows, bin/as2) is linked at $HOME/.local/bin/as2, `as2 --print` prints the exact omp
 # command under zsh and bash alike, and `as2 off` / `as2 on` flip gates.fence.enabled in the
 # rendered profile config. The installed OMP reads the rendered setupVersion, it equals that OMP's
@@ -120,6 +120,8 @@ grep -qF '{repo}' "$PROFILE/config.yml" && die "rendered config still holds {rep
 grep -qF -- "- \"$CLONE/skills\"" "$PROFILE/config.yml" || die "rendered config does not point customDirectories at $CLONE/skills"
 grep -qF -- "- \"$CLONE/classifier/extension.ts\"" "$PROFILE/config.yml" || die "rendered config does not name the classifier extension by the clone's path"
 grep -qF -- "- \"$CLONE/gates/index.ts\"" "$PROFILE/config.yml" || die "rendered config does not name the gates extension by the clone's path"
+grep -qF -- "- \"$CLONE/plugins/ask-graham/skills\"" "$PROFILE/config.yml" || die "rendered config does not point customDirectories at $CLONE/plugins/ask-graham/skills"
+grep -qF -- "- \"$CLONE/plugins/i-have-audhd/skills\"" "$PROFILE/config.yml" || die "rendered config does not point customDirectories at $CLONE/plugins/i-have-audhd/skills"
 cmp -s "$CLONE/profile/models.yml" "$PROFILE/models.yml" || die "models.yml under the profile differs from profile/models.yml"
 ok "config.yml rendered with {repo}=$CLONE; models.yml placed beside it"
 TIERS="$(cd "$CLONE/tiers" && find . -maxdepth 1 -name '*.md' -type f | sed 's|^\./||' | LC_ALL=C sort)"
@@ -138,8 +140,11 @@ mkdir -p "$FAKE_HOME/.claude/skills/decoy-claude-user" "$FAKE_HOME/.agents/skill
 for d in "$FAKE_HOME/.claude/skills/decoy-claude-user" "$FAKE_HOME/.agents/skills/decoy-agents-user" "$FAKE_HOME/.omp/profiles/agent-system-2/agent/skills/decoy-profile-native"; do
 	printf -- '---\nname: %s\ndescription: decoy skill; must not be listed\n---\n# decoy\n' "${d##*/}" >"$d/SKILL.md"
 done
-WANT="$(awk -F'\t' '$2 == "skill" { sub(/^skills\//, "", $1); sub(/\/SKILL\.md$/, "", $1); print $1 }' "$CLONE/install/manifest.tsv" | LC_ALL=C sort)"
-[ "$(printf '%s' "$WANT" | grep -c .)" -eq 22 ] || die "manifest has $(printf '%s' "$WANT" | grep -c .) skill rows, expected 22 (DESIGN-2.0.md § C6.1)"
+# Each `skill` row is skills/<n>/SKILL.md or plugins/<p>/skills/<n>/SKILL.md (plugins/VENDOR.md); WANT is
+# the names, WANT_AT each name with the exact file it must be discovered from.
+WANT_AT="$(awk -F'\t' -v clone="$CLONE" '$2 == "skill" { n = $1; sub(/\/SKILL\.md$/, "", n); sub(/^.*\//, "", n); print n "\t" clone "/" $1 }' "$CLONE/install/manifest.tsv" | LC_ALL=C sort)"
+WANT="$(printf '%s\n' "$WANT_AT" | cut -f1)"
+[ "$(printf '%s' "$WANT" | grep -c .)" -eq 24 ] || die "manifest has $(printf '%s' "$WANT" | grep -c .) skill rows, expected 24 (DESIGN-2.0.md § C6.1's 22 plus the 2 vendored plugin skills)"
 # The listing goes through the installed omp package's own discovery (Settings → cfgSkills →
 # discoverSkills), the code path the CLI uses (sdk.ts `cfgSkills.get(settings)`; OMP 18.4.4 has no
 # Settings.getGroup, which this step called on 18.3.0); omp has no skill-listing subcommand.
@@ -162,16 +167,18 @@ grep -q "^agentDir=$FAKE_HOME/.omp/profiles/agent-system-2/agent\$" "$LISTING" |
 GOT="$(awk -F'\t' 'NF == 3 && $1 != "warning" { print $1 }' "$LISTING" | LC_ALL=C sort)"
 [ "$GOT" = "$WANT" ] || die "discovered skills differ from the manifest's skill rows; got: $(printf '%s' "$GOT" | tr '\n' ' ') want: $(printf '%s' "$WANT" | tr '\n' ' ')"
 grep -q 'decoy' "$LISTING" && die "a decoy skill was discovered"
-[ "$(awk -F'\t' 'NF == 3 && $1 != "warning" && $3 !~ "^'"$CLONE"'/skills/" ' "$LISTING" | wc -l | tr -d ' ')" -eq 0 ] || die "a discovered skill does not come from $CLONE/skills"
+GOT_AT="$(awk -F'\t' 'NF == 3 && $1 != "warning" { print $1 "\t" $3 }' "$LISTING" | LC_ALL=C sort)"
+[ "$GOT_AT" = "$WANT_AT" ] || die "a discovered skill does not come from its manifest row's file; got: $(printf '%s' "$GOT_AT" | tr '\n' ' ')"
 grep -q '^warning' "$LISTING" && die "skill discovery reported warnings"
-ok "exactly 22 skills discovered, all from $CLONE/skills, no decoy, no warnings; listing kept at $LISTING"
+ok "exactly 24 skills discovered, each from its manifest row's file (22 under $CLONE/skills, 2 under $CLONE/plugins/*/skills), no decoy, no warnings; listing kept at $LISTING"
 
 # The same package's extension loading, as a session does it (sdk.ts discoverSessionExtensionPaths:
 # cfgExtensions + cfgDisabledExtensions read from settings — OMP 18.4.4 has no Settings.get —
 # ambient discovery on, then loadExtensions). The fake
-# HOME holds no native, hook or plugin extensions, so what loads is exactly the rendered config's
-# `extensions:` list, in its order (load order is tool_call handler order; profile/config.yml says
-# why each sits where it does).
+# HOME holds no native, hook or plugin extensions (OMP's user plugin root may still resolve to the
+# machine's ~/.omp/plugins; the disabled names below keep Jo's marketplace copies out of it), so what
+# loads is exactly the rendered config's `extensions:` list, in its order (load order is tool_call
+# handler order; profile/config.yml says why each sits where it does).
 EXT_LISTING="$WORK/extension-listing.txt"
 (cd "$WORK" && env -i PATH="$PATH" HOME="$FAKE_HOME" OMP_PROFILE=agent-system-2 bun -e "
 	const m = await import('$OMP_PKG/src/index.ts');
@@ -186,10 +193,39 @@ EXT_LISTING="$WORK/extension-listing.txt"
 sed 's/^/  /' "$EXT_LISTING"
 grep -q '^error' "$EXT_LISTING" && die "OMP reported an extension load error"
 CONFIGURED="$(bun -e "for (const p of Bun.YAML.parse(await Bun.file('$PROFILE/config.yml').text()).extensions) console.log('loaded\t' + p)")"
-EXT_WANT="$(printf 'loaded\t%s\n' "$CLONE/surface/index.ts" "$CLONE/gates/index.ts" "$CLONE/classifier/extension.ts")"
-[ "$CONFIGURED" = "$EXT_WANT" ] || die "the rendered config's extensions are not exactly surface, gates, classifier in that order"
-[ "$(cat "$EXT_LISTING")" = "$EXT_WANT" ] || die "OMP did not load exactly surface, gates, classifier in that order"
-ok "OMP loaded exactly three extensions, in order: surface, gates, classifier (the rendered config's order); no load errors; listing kept at $EXT_LISTING"
+EXT_WANT="$(printf 'loaded\t%s\n' "$CLONE/surface/index.ts" "$CLONE/gates/index.ts" "$CLONE/classifier/extension.ts" "$CLONE/plugins/index.ts")"
+[ "$CONFIGURED" = "$EXT_WANT" ] || die "the rendered config's extensions are not exactly surface, gates, classifier, plugins in that order"
+[ "$(cat "$EXT_LISTING")" = "$EXT_WANT" ] || die "OMP did not load exactly surface, gates, classifier, plugins in that order"
+ok "OMP loaded exactly four extensions, in order: surface, gates, classifier, plugins (the rendered config's order); no load errors; listing kept at $EXT_LISTING"
+
+# Clash C11 (plugins/VENDOR.md): installed copies of i-have-audhd and ask-graham must not load beside
+# plugins/index.ts. A project plugin root (<anchor>/.omp/plugins, extensibility/plugins/loader.ts
+# loadEnabledPlugins) seeded with both, plus a control plugin, under a fresh anchor dir: the control
+# loads (the seeding reaches discovery), the two disabled names do not, plugins/index.ts still does.
+DECOY_DIR="$WORK/plugin-decoy"
+for p in i-have-audhd ask-graham decoy-control; do
+	mkdir -p "$DECOY_DIR/.omp/plugins/node_modules/$p/omp"
+	printf '{"name":"%s","version":"0.0.1","omp":{"extensions":["omp/%s-omp.ts"]}}\n' "$p" "$p" >"$DECOY_DIR/.omp/plugins/node_modules/$p/package.json"
+	printf 'export default function () {}\n' >"$DECOY_DIR/.omp/plugins/node_modules/$p/omp/$p-omp.ts"
+done
+printf '{"plugins":{"i-have-audhd":{"version":"0.0.1","enabled":true},"ask-graham":{"version":"0.0.1","enabled":true},"decoy-control":{"version":"0.0.1","enabled":true}}}\n' >"$DECOY_DIR/.omp/plugins/omp-plugins.lock.json"
+DECOY_LISTING="$WORK/extension-listing-plugin-decoy.txt"
+(cd "$DECOY_DIR" && env -i PATH="$PATH" HOME="$FAKE_HOME" OMP_PROFILE=agent-system-2 bun -e "
+	const m = await import('$OMP_PKG/src/index.ts');
+	const { cfgExtensions, cfgDisabledExtensions } = await import('$OMP_PKG/src/extensibility/settings.ts');
+	const agentDir = m.getAgentDir();
+	const settings = await m.Settings.loadReadOnly({ cwd: process.cwd(), agentDir });
+	const r = await m.discoverAndLoadExtensions(cfgExtensions.get(settings), process.cwd(), undefined, cfgDisabledExtensions.get(settings));
+	for (const e of r.extensions) console.log('loaded\t' + e.path);
+	for (const e of r.errors) console.log('error\t' + e.path + '\t' + e.error);
+	process.exit(0);
+" >"$DECOY_LISTING") || die "extension loading with seeded plugin copies exited $?"
+sed 's/^/  /' "$DECOY_LISTING"
+grep -q '^error' "$DECOY_LISTING" && die "OMP reported an extension load error with seeded plugin copies"
+grep -qF "/decoy-control/omp/decoy-control-omp.ts" "$DECOY_LISTING" || die "the seeded control plugin did not load, so the C11 check is vacuous"
+grep -qE '/(i-have-audhd|ask-graham)/omp/[a-z-]+-omp\.ts$' "$DECOY_LISTING" && die "an installed copy of i-have-audhd or ask-graham loaded beside plugins/index.ts (clash C11)"
+grep -qxF "$(printf 'loaded\t%s' "$CLONE/plugins/index.ts")" "$DECOY_LISTING" || die "plugins/index.ts did not load with seeded plugin copies"
+ok "seeded installed copies of i-have-audhd and ask-graham stay unloaded (disabledExtensions), the control plugin and plugins/index.ts load; listing kept at $DECOY_LISTING"
 
 step "3c2. under the rendered profile OMP skips its first-launch wizard (M7 finding 2) and reads Jo's look-and-feel keys"
 # The installed omp package's own reads, as main.ts's cold-launch gate does them: setupVersion from

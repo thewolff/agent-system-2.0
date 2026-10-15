@@ -1,0 +1,9 @@
+{
+  "name": "i-have-audhd",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "omp": {
+    "extensions": ["./omp/i-have-audhd-omp.ts"]
+  }
+}

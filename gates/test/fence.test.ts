@@ -342,7 +342,8 @@ describe("every extension profile/config.yml loads returns undefined from tool_c
 			const f = fakePi();
 			mod.default(f.pi);
 			const results = await f.results("tool_call", { toolName: "bash", toolCallId: "ext-1", input: { command: "echo hi" } }, ctxOf(REPO));
-			expect(results.length).toBeGreaterThan(0);
+			// No result at all is an extension with no tool_call handler (plugins/index.ts: its adapters
+			// register none, plugins/test/loader.test.ts), which cannot drop the wrapper either.
 			expect(results).toEqual(results.map(() => undefined));
 		});
 	}

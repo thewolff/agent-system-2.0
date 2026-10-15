@@ -1,0 +1,8 @@
+{
+  "name": "ask-graham",
+  "version": "0.2.0",
+  "private": true,
+  "omp": {
+    "extensions": ["./omp/ask-graham-omp.ts"]
+  }
+}

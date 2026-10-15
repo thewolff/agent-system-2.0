@@ -9,7 +9,7 @@
 # and build the OMP profile: render the `profile` row profile/config.yml with {repo} filled into
 # $HOME/.omp/profiles/<profile>/agent/config.yml, place the `profile` row profile/models.yml beside
 # it, and link every `tier` row into $HOME/.omp/profiles/<profile>/agent/agents/. `skill` rows
-# (skills/<name>/SKILL.md) and `skill-asset` rows are used in place through the profile's
+# (skills/<name>/SKILL.md or plugins/<p>/skills/<n>/SKILL.md) and `skill-asset` rows are used in place through the profile's
 # skills.customDirectories; the render is refused when its skills.includeSkills is not exactly
 # the set of `skill` rows, or when a `skill` row lacks a frontmatter description (omp://skills.md:
 # the native provider requires one). Each `launcher` row (bin/<name>, destination
@@ -66,7 +66,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="$REPO/install/manifest.tsv"
 # Directories whose every file must have a manifest row. Listed ahead of the steps that create
 # them so a new directory cannot slip in unchecked.
-MACHINERY_DIRS=(ledger install extensions agents profile skills tiers classifier gates bin surface contract voice)
+MACHINERY_DIRS=(ledger install extensions agents profile skills plugins tiers classifier gates bin surface contract voice)
 # The one schema file the ledger module applies (ledger/src/index.ts SCHEMA_PATH). The manifest's
 # ledger-schema row must name exactly this file; the init script re-checks it against the module.
 CANONICAL_SCHEMA="ledger/schema.sql"
@@ -274,13 +274,21 @@ while IFS= read -r line || [ -n "$line" ]; do
 			tier_rows="$tier_rows$path"$'\n' ;;
 		skill)
 			[ "$dest" = "-" ] || fail "manifest line $line_no: kind skill is used in place through the profile's customDirectories; destination must be -" 2
-			case "$path" in skills/*/SKILL.md) ;; *) fail "manifest line $line_no: kind skill is skills/<name>/SKILL.md; got $path" 2 ;; esac
-			name="${path#skills/}"; name="${name%/SKILL.md}"
-			case "$name" in */*) fail "manifest line $line_no: kind skill is one level under skills/ (omp://skills.md); got $path" 2 ;; esac
-			skill_names="$skill_names$name"$'\n' ;;
+			# skill_names holds each skill's directory, repo-relative: skills/<n> or plugins/<p>/skills/<n>.
+			case "$path" in
+				skills/*/SKILL.md)
+					name="${path#skills/}"; name="${name%/SKILL.md}"
+					case "$name" in */*) fail "manifest line $line_no: kind skill is one level under skills/ (omp://skills.md); got $path" 2 ;; esac ;;
+				plugins/*/skills/*/SKILL.md)
+					plugin="${path#plugins/}"; plugin="${plugin%%/*}"
+					name="${path#plugins/"$plugin"/skills/}"; name="${name%/SKILL.md}"
+					case "$name" in */*) fail "manifest line $line_no: kind skill is one level under plugins/<p>/skills/ (omp://skills.md); got $path" 2 ;; esac ;;
+				*) fail "manifest line $line_no: kind skill is skills/<name>/SKILL.md or plugins/<plugin>/skills/<name>/SKILL.md; got $path" 2 ;;
+			esac
+			skill_names="$skill_names${path%/SKILL.md}"$'\n' ;;
 		skill-asset)
 			[ "$dest" = "-" ] || fail "manifest line $line_no: kind skill-asset is used in place; destination must be -" 2
-			case "$path" in skills/*) ;; *) fail "manifest line $line_no: kind skill-asset lives under skills/; got $path" 2 ;; esac ;;
+			case "$path" in skills/* | plugins/*/skills/*) ;; *) fail "manifest line $line_no: kind skill-asset lives under skills/ or plugins/<p>/skills/; got $path" 2 ;; esac ;;
 		launcher)
 			[ "$dest" = "{local_bin}/${path##*/}" ] || fail "manifest line $line_no: launcher destination must be {local_bin}/${path##*/}" 2
 			case "$path" in bin/*) ;; *) fail "manifest line $line_no: kind launcher is bin/<name>; got $path" 2 ;; esac
@@ -345,10 +353,12 @@ step "no unmanifested files, no symbolic links"
 # ---- 2b. render the profile and check it before anything is written ---------------------------
 # {repo} in the template becomes this checkout's absolute path; substituted text is never scanned
 # again. The render is refused (exit 2, nothing written) when the result is not YAML, when a
-# {repo} survives, when skills.customDirectories is not exactly [<repo>/skills], when
-# skills.includeSkills is not exactly the manifest's `skill` rows, or when a `skill` row's SKILL.md
-# has no frontmatter description (omp://skills.md: the native provider drops such a skill, and the
-# allowlist would then name a skill that never loads).
+# {repo} survives, when skills.customDirectories is not exactly [<repo>/skills] followed by one
+# <repo>/plugins/<p>/skills per vendored plugin with a `skill` row (sorted; plugins/VENDOR.md), when
+# two skill rows share a name, when skills.includeSkills is not exactly the names of the manifest's
+# `skill` rows, or when a `skill` row's SKILL.md has no frontmatter description (omp://skills.md:
+# the native provider drops such a skill, and the allowlist would then name a skill that never
+# loads).
 step "profile: rendering $CONFIG_ROW for profile $PROFILE_NAME"
 set +e
 RENDERED="$(bun -e '
@@ -361,20 +371,30 @@ RENDERED="$(bun -e '
 	const skills = doc && typeof doc === "object" ? doc.skills : undefined;
 	if (!skills || typeof skills !== "object") fail(`${template} has no skills: block`);
 	const dirs = skills.customDirectories;
-	if (!Array.isArray(dirs) || dirs.length !== 1 || dirs[0] !== `${repo}/skills`) fail(`skills.customDirectories must be exactly [${repo}/skills]; got ${JSON.stringify(dirs)}`);
-	const want = [...new Set(names)].sort();
+	// Each argument is a skill directory, repo-relative: skills/<n> or plugins/<p>/skills/<n>. Its
+	// parent is the customDirectory OMP scans one level down; <n> is the name includeSkills lists.
+	const rows = [...new Set(names)].sort().map((d) => ({ dir: d, parent: d.slice(0, d.lastIndexOf("/")), name: d.slice(d.lastIndexOf("/") + 1) }));
+	const seen = new Map();
+	for (const r of rows) {
+		if (seen.has(r.name)) fail(`skill name ${r.name} is provided twice: ${seen.get(r.name)} and ${r.dir}`);
+		seen.set(r.name, r.dir);
+	}
+	const plugins = [...new Set(rows.map((r) => r.parent).filter((p) => p !== "skills"))].sort();
+	const wantDirs = [`${repo}/skills`, ...plugins.map((p) => `${repo}/${p}`)];
+	if (!Array.isArray(dirs) || dirs.length !== wantDirs.length || dirs.some((d, i) => d !== wantDirs[i])) fail(`skills.customDirectories must be exactly ${JSON.stringify(wantDirs)} (<repo>/skills, then each plugin skills dir with a skill row, sorted); got ${JSON.stringify(dirs)}`);
+	const want = rows.map((r) => r.name).sort();
 	const have = Array.isArray(skills.includeSkills) ? [...new Set(skills.includeSkills.map(String))].sort() : null;
 	if (!have) fail("skills.includeSkills must be a list");
 	const missing = want.filter((n) => !have.includes(n));
 	const extra = have.filter((n) => !want.includes(n));
 	if (missing.length || extra.length) fail(`skills.includeSkills differs from the manifest skill rows; missing from config: [${missing}] not in manifest: [${extra}]`);
-	for (const n of want) {
-		const path = `${repo}/skills/${n}/SKILL.md`;
+	for (const r of rows) {
+		const path = `${repo}/${r.dir}/SKILL.md`;
 		const head = (await Bun.file(path).text()).match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
 		let fm;
 		try { fm = head ? Bun.YAML.parse(head[1]) : null; } catch (e) { fail(`${path}: frontmatter is not YAML: ${e.message}`); }
 		if (!fm || typeof fm !== "object" || typeof fm.description !== "string" || !fm.description.trim()) fail(`${path}: frontmatter has no description (omp://skills.md requires one)`);
-		if (fm.name !== undefined && fm.name !== n) fail(`${path}: frontmatter name ${JSON.stringify(fm.name)} differs from its directory ${n}`);
+		if (fm.name !== undefined && fm.name !== r.name) fail(`${path}: frontmatter name ${JSON.stringify(fm.name)} differs from its directory ${r.name}`);
 	}
 	process.stdout.write(text.endsWith("\n") ? text : text + "\n");
 ' "$REPO/$CONFIG_ROW" "$REPO" $skill_names)"

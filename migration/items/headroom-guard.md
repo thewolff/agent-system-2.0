@@ -3,6 +3,7 @@ title: Quota headroom guard at hand and lane spawns; strong-row OpenAI entry on 
 status: building
 workload: wl-mv71x5rwdu7eo0
 pr: 150
+number: 136
 ---
 **Built on branch `wl/wl-mv71x5rwdu7eo0`.** Workload `wl-mv71x5rwdu7eo0` (cheaper routing, normal stakes). This is v1 only, as Jo cut it (in-mv8qzqym1ihmv4): the quota headroom guard (in-mv8p5m2t005tts) plus the strong-row OpenAI entry moved to gpt-6.1-sol. The plan is revision 6 at `~/agent-scratch/agent-system-2.0/wl-mv71x5rwdu7eo0/PLAN.md`, approved by Jo. The routing report, the sizing fix, the cheaper review tier, Opus at medium effort and Haiku 5.5 come later on the same workload.
 

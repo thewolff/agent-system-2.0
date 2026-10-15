@@ -1,0 +1,17 @@
+{
+  "_comment": "A generic example. It describes nobody. Copy it to ~/.claude/i-have-audhd.json, replace every value with traits your own reader actually has, and keep that copy out of version control if it describes a real person. The injection half reads reader and traits. The enforcement half reads the optional enforcement object: mode (block | warn | off, unset = per-rule built-ins), judgeCommand (null = the five judge-gated rules are inactive and each fired trigger is logged to skipped.log), rules (per-rule mode overrides), and armOmp (true lets OMP seats block; absent or false keeps OMP seats at warn, and Claude Code ignores it). Configure a judge command that accepts the prompt on stdin and writes verdict JSON on stdout; verify it in your environment before enabling it. The command below is an example, not the default.",
+  "reader": "the engineer who owns this service",
+  "traits": [
+    "reads the first two lines of any message and skims the rest",
+    "wants the decision named before the reasoning that produced it",
+    "treats an unanswered question as answered unless it is the last line"
+  ],
+  "enforcement": {
+    "mode": "warn",
+    "judgeCommand": "codex exec --skip-git-repo-check -",
+    "rules": {
+      "name-the-artifact": "block"
+    },
+    "armOmp": false
+  }
+}
