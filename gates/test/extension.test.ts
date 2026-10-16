@@ -3,14 +3,19 @@
 // blocking it, row 1 at session_stop, row 11 on input (including a failed write), row 7's wake cycle
 // with its recovery tool and its stop check, and `ask` removed for an autonomous lane.
 import { describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { parseFindings } from "../../classifier/src/rounds";
+import receiptsRow from "../extensions/r03-receipts";
 import { errorLines } from "../../surface/src/errors";
 import { artifactTreeBody } from "../../surface/src/signals";
-import { STANDING_WORKLOAD_ID } from "../../surface/src/types";
+import { STANDING_SLICE_TASK, STANDING_WORKLOAD_ID } from "../../surface/src/types";
 import pushRebaseRow from "../extensions/r08-push-rebase";
 import reservedRow from "../extensions/r06-reserved";
 import p11Gates, { type GatesAPI } from "../index";
+import { DISPLAY_LINKS } from "../extensions/open-links";
 import { CONTRACT_MARKER } from "../src/rows/r02-contract";
 import { brief, commit, git, repoWithOrigin, tempLedger, testRecord, tmp } from "./helpers";
 
@@ -27,7 +32,7 @@ const schema = (): unknown => ({ describe: () => schema(), optional: () => schem
  * A fake OMP extension API whose emit follows the runner's chaining (runner.ts emitToolCall,
  * emitBeforeAgentStart, emit for session_stop, input): tool_call stops at the first block and
  * otherwise returns the last result; before_agent_start threads the system prompt and collects
- * messages; session_stop stops at the first block; input stops at the first `handled`.
+ * messages; context threads replacement messages; session_stop stops at the first block; input stops at the first `handled`.
  */
 function fakePi(tools = ["read", "bash", "ask", "task", "yield"]) {
 	const handlers = new Map<string, AnyHandler[]>();
@@ -59,8 +64,15 @@ function fakePi(tools = ["read", "bash", "ask", "task", "yield"]) {
 		}
 		let last: unknown;
 		for (const h of hs) {
-			const r = (await h(event, ctx)) as { block?: boolean; decision?: string; handled?: boolean } | undefined;
+			const r = (await h(event, ctx)) as { block?: boolean; decision?: string; handled?: boolean; messages?: unknown[] } | undefined;
 			if (!r) continue;
+			if (name === "context") {
+				if (!r.messages) continue;
+				event = { ...event, messages: r.messages };
+			}
+			if (name === "assistant_message" && "content" in r) {
+				event = { ...event, message: { ...(event.message as object), content: r.content } };
+			}
 			last = r;
 			if (r.block || r.decision === "block" || r.handled) return r;
 		}
@@ -332,4 +344,102 @@ describe("gates extension adapter", () => {
 		expect(reasonOf(await f.emit("tool_call", push("p4"), ctx))).toContain("P-11 row 8");
 		expect(failures()).toHaveLength(3);
 	});
+});
+
+// T2/T3 intentionally import only pre-existing entry points: the unpacked baseline reaches
+// behavioral assertions rather than failing to import the new links module.
+describe("T2 settled links through the gates entry", () => {
+	const root = mkdtempSync(join(process.env.AS2_SCRATCH ?? tmpdir(), "openlinks-entry-"));
+	mkdirSync(join(root, "My Docs"));
+	const path = join(root, "My Docs/x.ts");
+	writeFileSync(path, "one\ntwo\nthree");
+	const url = pathToFileURL(path).href;
+	const linked = `[${path.replace(/[\\`*_\[\]<>~&$]/g, "\\$&")}](${url})`;
+	const env = { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_CONTRACT: "/nonexistent", HOME: "/nonexistent-home" };
+	const message = (text: string, tool = false) => ({ role: "assistant", content: [{ type: "text", text }, ...(tool ? [{ type: "toolCall", id: "c1", name: "read", arguments: {} }] : [])] });
+	test("context is a no-op without link asides and composes filtering with a later extension", async () => {
+		const f = fakePi();
+		p11Gates(f.pi, env);
+		const ctx = ctxOf({ hasUI: true, cwd: root });
+		const kept = { role: "custom", customType: "other-extension", content: "keep" };
+		expect(await f.emit("context", { type: "context", messages: [kept] }, ctx)).toBeUndefined();
+		const appended = { role: "user", content: "later extension" };
+		let seen: unknown;
+		f.pi.on("context", (event) => {
+			seen = event.messages;
+			return { messages: [...event.messages, appended] };
+		});
+		const aside = { role: "custom", customType: DISPLAY_LINKS, content: "display only" };
+		const messages = [aside, kept];
+		expect(await f.emit("context", { type: "context", messages }, ctx)).toEqual({ messages: [kept, appended] });
+		expect(seen).toEqual([kept]);
+		expect(messages).toEqual([aside, kept]);
+	});
+	test("rewrites ordinary text and tool-call messages, while row 1 still holds handed-over commands", async () => {
+		const f = fakePi();
+		p11Gates(f.pi, env);
+		const ctx = ctxOf({ hasUI: true, cwd: root });
+		const original = message(`**PMDW**\nOpen ${path}.`);
+		const normal = (await f.emit("assistant_message", { message: original }, ctx) ?? original) as { content: { text: string }[] };
+		expect(normal.content[0]!.text).toContain(linked);
+		expect(await f.emit("session_stop", { last_assistant_message: { content: normal.content } }, ctx)).toBeUndefined();
+		const tool = (await f.emit("assistant_message", { message: message(path, true) }, ctx) ?? message(path, true)) as { content: { type: string; text?: string }[] };
+		expect(tool.content[0]!.text).toBe(linked);
+		expect(tool.content[1]!.type).toBe("toolCall");
+		const held = await f.emit("assistant_message", { message: message("**ACTION**\nbash ~/x.sh") }, ctx) as { content: { text: string }[] };
+		expect(held.content[0]!.text).toContain("Reply held");
+		expect((await f.emit("session_stop", { last_assistant_message: { content: held.content } }, ctx) as { reason: string }).reason).toContain("P-11 row 1");
+	});
+	test("row 15 binds the QUESTION row despite a linked path in its body", async () => {
+		const { ledger, path: db } = tempLedger();
+		ledger.openWorkload({ id: STANDING_WORKLOAD_ID, by: "orch", brief: "standing", stakes: "normal", mode: "autonomous" });
+		const slice = ledger.addSlice({ by: "orch", workloadId: STANDING_WORKLOAD_ID, task: STANDING_SLICE_TASK, doneCondition: "d", inputs: "i", id: "sl-orchestrator-standing" });
+		const q = ledger.raiseQuestion({ by: "orch", workloadId: STANDING_WORKLOAD_ID, sliceId: slice, body: `Open ${path}?`, options: ["yes", "no"] });
+		const f = fakePi();
+		p11Gates(f.pi, { ...env, AGENT_SYSTEM_LEDGER_DB: db });
+		const ctx = ctxOf({ hasUI: true, cwd: root });
+		const original = message(`**QUESTION**\n(${q}) Open ${path}? Options: yes / no`);
+		const result = (await f.emit("assistant_message", { message: original }, ctx) ?? original) as { content: { text: string }[] };
+		expect(result.content[0]!.text).toContain(linked);
+		expect(result.content[0]!.text).not.toContain("Reply held");
+		expect(ledger.entries(STANDING_WORKLOAD_ID, "assumption").some(e => e.body.includes(`question-published: ${q}`))).toBe(true);
+	});
+	test("a hand's fenced review-findings still parses", async () => {
+		const f = fakePi();
+		p11Gates(f.pi, env);
+		const block = '```review-findings\n{"findings":[]}\n```';
+		const text = `${path}\n${block}`;
+		const r = (await f.emit("assistant_message", { message: message(text) }, ctxOf({ hasUI: false, parent: "/sessions/lane.jsonl", cwd: root })) ?? message(text)) as { content: { text: string }[] };
+		expect(r.content[0]!.text).toContain(linked);
+		expect(r.content[0]!.text).toContain(block);
+		expect(parseFindings(r.content[0]!.text)).toEqual(parseFindings(block));
+	});
+});
+
+describe("T3 receipt checks through existing receipts adapter", () => {
+	const root = mkdtempSync(join(process.env.AS2_SCRATCH ?? tmpdir(), "linked-receipts-"));
+	mkdirSync(join(root, "My Docs"));
+	const path = join(root, "My Docs/x.ts");
+	writeFileSync(path, "one\ntwo\nthree");
+	for (const linked of [false, true]) for (const hand of [false, true]) {
+		test(`${linked ? "linked" : "bare"} CLAIM in ${hand ? "hand yield" : "session stop"}`, async () => {
+			const f = fakePi();
+			receiptsRow(f.pi, { AGENT_SYSTEM_ROLE: "orchestrator" });
+			const ctx = ctxOf({ hasUI: !hand, ...(hand ? { parent: "/lane.jsonl" } : {}), cwd: root });
+			const report = (line: number) => `**CLAIM**\n${linked ? `[${path}:${line}](${pathToFileURL(path).href})` : `${path}:${line}`}`;
+			const flags = async (line: number): Promise<string> => {
+				if (hand) {
+					const r = await f.emit("tool_call", { toolName: "yield", input: { data: { report: report(line) } } }, ctx) as { input?: { data: { report: string } } } | undefined;
+					return r?.input?.data.report ?? "";
+				}
+				f.entries.length = 0;
+				await f.emit("session_stop", { last_assistant_message: { content: report(line) } }, ctx);
+				return JSON.stringify(f.entries);
+			};
+			expect(await flags(3)).toContain("not read this session");
+			await f.emit("tool_result", { toolName: "read", input: { path }, details: { resolvedPath: path }, isError: false }, ctx);
+			expect(await flags(3)).not.toContain("not read this session");
+			expect(await flags(9)).toContain("past the file's 3 lines");
+		});
+	}
 });

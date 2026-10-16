@@ -13,6 +13,8 @@ here, and classifier/test/review-round1.test.ts checks that list against the rou
 You are a **standard** hand, the tier on the mid model row. Most slices here are **understand** work (read and report on a surface) or **change-small** work (a single-file write that a test or a diff checks). A locate slice the classifier was unsure of is pulled up here too (SPEC-2.0.md § A1.3). Do the task your brief states, to its
 done-condition; your tier sets your model, never the scope of your task.
 
+Write raw absolute receipts and URLs; render machinery makes Jo-facing links, while stored documents and ledger rows stay raw (`contract/output-types.md`, "The receipt rule").
+
 ## Your brief
 
 Your brief has six fields (SPEC-2.0.md § B9): workload, task, done-condition, inputs, stakes,

@@ -61,12 +61,14 @@ import { BACK_HEADING, countLine, lineKey, NEEDS_YOU_HEADING, onFire, pendingTex
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
+import { linkTerminal } from "../src/linked-api";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { renderWake } from "../src/render";
 import { RANK_AUDIT_DIR, runAudit } from "../src/rank-audit";
 import { readRankConfig } from "../src/rank-launch";
 import { type SurfaceSession, surfaceSession, voiceInPrompt, voiceSection, type WakeTrigger } from "../src/session";
 import { recordLapsedLeases } from "../src/signals";
+import type { ResultTextConstructor, ResultTextLoader } from "../src/types";
 import { type Ctx, HOLD_HOURS, type HostMessage, LEDGER_TOOL, PUSH_TRIES, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
 import { launchVerdict, triggerLaunch } from "./launch";
 import { showPending } from "./surface-input";
@@ -207,7 +209,12 @@ function pushKey(m: HostMessage): { surfaceKey: string; renderSeq: number; super
 	return { surfaceKey: d.surfaceKey, renderSeq: d.renderSeq, supersedes: Array.isArray(d.supersedes) ? d.supersedes.filter((k): k is string => typeof k === "string") : [] };
 }
 
-export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
+export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, loadText?: ResultTextLoader): Promise<void> {
+	let Text: ResultTextConstructor | undefined;
+	let textError: unknown;
+	// The entry returns this preload to OMP's awaited factory, before restored results can paint.
+	// Offline sessions that never render stay inert; a read/render surfaces loader failure explicitly.
+	const textReady = Promise.resolve().then(() => loadText?.()).then((value) => { Text = value; }).catch((error: unknown) => { textError = error; });
 	const z = pi.zod;
 	pi.registerTool({
 		name: WAKE_READ_TOOL,
@@ -251,9 +258,15 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			workload: z.string().optional().describe("One workload id (wl-…) to render; omit for every open workload."),
 		}),
 		approval: "read",
+		renderResult(result) {
+			if (!Text) throw new Error(`The ledger result renderer could not load the host Text constructor: ${String(textError ?? "no Text loader was supplied")}`);
+			return new Text(linkTerminal(result.content.map((part) => part.text).join("\n")), 0, 0);
+		},
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const s = surfaceSession(ctx, env);
 			if (!s.active) return { content: [{ type: "text", text: "This session is not the orchestrator surface; nothing was read." }] };
+			await textReady;
+			if (!Text) throw new Error(`The ledger result renderer could not load the host Text constructor: ${String(textError ?? "no Text loader was supplied")}`);
 			const ledger = s.ledger();
 			ensureStandingWorkload(ledger);
 			const wl = typeof params.workload === "string" && params.workload.trim() ? params.workload.trim() : undefined;
@@ -637,4 +650,5 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		if (!s.active || !s.owed) return undefined;
 		return { decision: "block", reason: `wake (${s.owed.trigger}): the wake-read entry is still owed; call ${WAKE_READ_TOOL} with what you resume.` };
 	});
+	return textReady;
 }

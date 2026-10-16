@@ -20,6 +20,8 @@
 //   last non-block result is what runs (runner.ts emitToolCall), so it wraps only a bash call every
 //   row allowed, its revision never reaches a row (row 18 reads the typed command), and its
 //   tool_result cleanup runs after rows 3 and 8 read the original command.
+import openLinks from "./extensions/open-links";
+import { linkedApi } from "./src/links";
 import askPolicyRow from "./extensions/r14-ask-policy";
 import briefFieldsRow from "./extensions/r05-brief-fields";
 import contractRow from "./extensions/r02-contract";
@@ -130,6 +132,8 @@ export default function p11Gates(
 	startCheck: ShellStartCheck = hostShellStart,
 	cleanShell: CleanShellCheck | undefined = fenceSettings === hostFenceSettings ? hostCleanShell : undefined,
 ): void {
+	openLinks(pi);
+	pi = linkedApi(pi);
 	contractRow(pi, env);
 	receiptsRow(pi, env);
 	askPolicyRow(pi, env);

@@ -25,7 +25,8 @@ import {
 } from "../src/launch";
 import { testRequestedBody } from "../src/test-run";
 import { releasedOpen } from "../src/turn-end";
-import { recordRepo } from "../src/decision-log";
+import { recordRepo, renderClose } from "../src/decision-log";
+import { openPlanPath } from "../src/plan-paths";
 import { LANE_FULL_TEST_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
 
@@ -36,7 +37,7 @@ const OTHER_LAB = "openai-codex/gpt-6-astra";
 // PLAN wl-mv8vwb04cy18n4 D1: the plan file carries a `## Requirements` section; this one marks no requirement prompt-only.
 const PLAN_DIR = tmp("plan");
 const PLAN_FILE = join(PLAN_DIR, "PLAN.md");
-const VERDICT_FILE = join(PLAN_DIR, "PLAN-REVIEW-r1.md");
+const VERDICT_FILE = join(PLAN_DIR, "r.md");
 writeFileSync(PLAN_FILE, [
 	"# PLAN", "", "## Design", "", "The header offset moves into one token.", "",
 	"## Requirements", "",
@@ -152,6 +153,48 @@ function jo(ledger: Ledger, questionId: string, answer: string): string {
 	tick();
 	return ledger.answerQuestion(questionId, { by: SURFACE_BY, answer, author: "jo", channel: "surface" });
 }
+
+describe("T4: lane-written handles stay raw on disk", () => {
+	test("entry, message and plan question expand caller-local paths before storage and preserve openPlanPath and decision logs", async () => {
+		const x = laneFixture({ planFirst: true });
+		Object.assign(x.ctx.sessionManager, { getSessionFile: () => join(PLAN_DIR, "lane.jsonl"), getSessionId: () => "lane-local" });
+		Object.assign(x.ctx, { localProtocolOptions: { getArtifactsDir: () => PLAN_DIR } });
+		// Optional on the baseline: absence of the new machinery must fail a stored-body assertion, not module loading.
+		const linksPath = join(import.meta.dir, "..", "..", "gates", "src", "links.ts");
+		const links = await import(linksPath).catch((error: Error & { code?: string }) => {
+			if (error.code === "MODULE_NOT_FOUND" || error.code === "ERR_MODULE_NOT_FOUND") return undefined;
+			throw error;
+		});
+		links?.setLinkRouter({
+			async locate(handle: string, rc: { localProtocolOptions?: { getArtifactsDir?(): string }; sessionId?: string; rules: unknown[] }) {
+				expect(rc.sessionId).toBe("lane-local");
+				expect(rc.rules).toEqual([]);
+				return handle === "local://PLAN.md" ? join(rc.localProtocolOptions!.getArtifactsDir!(), "PLAN.md") : null;
+			},
+			locateSync() { return undefined; },
+		});
+		try {
+			expect(await x.call("lane_record_entry", { body: "Read local://PLAN.md" })).toContain("Recorded entry");
+			expect(x.ledger.entries(x.wl).at(-1)!.body).toBe(`Read ${PLAN_FILE}`);
+			expect(await x.call("lane_message", { body: "Review local://PLAN.md and artifact://missing" })).toContain("Sent message");
+			expect(x.ledger.inFlight().find((w) => w.workload.id === x.wl)!.pendingMessages.at(-1)!.body).toBe(`Review ${PLAN_FILE} and artifact://missing`);
+			await x.call("lane_add_slice", { task: "plan", doneCondition: "approved", inputs: "brief", kind: "judge", id: "sl-local-plan" });
+			seedReview(x.ledger, x.wl, "sl-local-plan");
+			const body = PLAN_BODY.replace(PLAN_FILE, "local://PLAN.md");
+			expect(await x.call("lane_raise_question", { slice: "sl-local-plan", body, options: ["approve", "revise", "cancel"] })).toContain("Raised question");
+			const q = x.ledger.questions(x.wl).at(-1)!;
+			expect(q.body).toBe(PLAN_BODY);
+			expect(openPlanPath(x.ledger, q.id)).toBe(PLAN_FILE);
+			const log = renderClose(x.ledger, x.wl, PLAN_DIR, null, { write: false });
+			expect(log.text).toContain(PLAN_FILE);
+			expect(log.text).not.toContain("local://PLAN.md");
+			expect(log.text).not.toContain("file://");
+			expect(q.body).not.toContain("](");
+		} finally {
+			links?.setLinkRouter(undefined);
+		}
+	});
+});
 
 describe("lane tools: ownership", () => {
 	test("all ten register; an orchestrator session and an unbound lane are refused with nothing written", async () => {

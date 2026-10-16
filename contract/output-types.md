@@ -77,6 +77,17 @@ This governs the **receipt**, not the prose. Write sentences however reads best 
 
 Two paths are exempt because they are already unambiguous: a path inside a fenced command you are handing over to be run in a stated directory, and a path quoted verbatim out of tool output (a stack trace, a `git status`, a linter). Quoting a tool's own relative path is reporting what it printed; inventing one is not.
 
+**Openable receipts are a render contract, not prompt-only guidance.** Write raw absolute
+receipts; machinery makes Jo-facing paths and URLs clickable at render. A rendered file
+receipt keeps the absolute path and its `:line`, `:line-end` or `:line:column` suffix visible,
+while its file-URL target names only the file. Receipt auditing reads the decoded target
+and the visible line suffix, so linking does not weaken the evidence rule. An agent may
+write the display link itself in a Jo-facing message; documents, decision logs and ledger
+rows instead keep raw paths and stable anchors, never display markdown file links or
+file URLs. Lane tools may expand a session-bound handle to a raw absolute path before
+storing it; clickability is added only at render. The approved coverage and exceptions
+are in `migration/items/openable-links.md`, under "Render contract" and "Approved limitations and upstream requests".
+
 **Examples in this file write `<repo-root>` where a real report carries the actual absolute root.** That is a slot, not a literal — substitute the root you derived, and never emit `<repo-root>` itself in a report. It appears here rather than a plausible-looking path precisely because a plausible-looking path would be copied.
 
 ### Writing a citation INTO a document is the opposite job

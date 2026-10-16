@@ -1207,6 +1207,16 @@ surface/scripts/orchestrator-prompt.ts	module	-
 surface/test/base-prompt.test.ts	test	-
 # Test runner self-refresh (migration/items/test-runner-self-refresh.md): row 6 pins for the refresh helper's sudo forms.
 gates/test/as2test-refresh-pins.test.ts	test	-
+# Openable links (migration/items/openable-links.md): render-only linking and the local herdr action.
+gates/src/links.ts	module	-
+gates/extensions/open-links.ts	extension	-
+gates/test/links.test.ts	test	-
+gates/test/open-links.test.ts	test	-
+surface/src/linked-api.ts	module	-
+surface/test/linked-api.test.ts	test	-
+install/herdr-file-links/herdr-plugin.toml	install	-
+install/herdr-file-links/open-file.sh	install	-
+ledger/test/file-links-install.test.ts	test	-
 # Jev ranking, show-only first (migration/items/jev-ranking.md): the ranking, the as2_rank tool, the audit, the launch gate, the CLIs.
 surface/src/rank.ts	module	-
 surface/src/rank-audit.ts	module	-

@@ -25,6 +25,10 @@
 # does not start is reported and does not fail the install. The last line names the providers the rendered profile
 # routes to and says each needs a /login once per profile (the profile's setupVersion skips OMP's
 # first-launch sign-in scene).
+# File links also install in the default OMP profile (persistent seats do not use the as2 profile):
+# ~/.omp/agent/extensions/as2-open-links.ts points into this checkout. If herdr is on PATH, its
+# as2.file-links plugin is linked from install/herdr-file-links; without herdr one notice is printed.
+# Reversal: herdr plugin unlink as2.file-links; remove the default-profile extension symlink.
 #
 # Three flags (macOS only), each optional and usable together. --chaos-nightly also writes the nightly
 # chaos job: the template install/com.agent-system-2.chaos.plist filled with this checkout, the
@@ -535,6 +539,21 @@ while IFS= read -r tier; do
 	step "tier linked: $PROFILE_DIR/agents/${tier##*/} -> $REPO/$tier"
 done <<<"$tier_rows"
 step "profile ready: omp --profile $PROFILE_NAME (or OMP_PROFILE=$PROFILE_NAME); skills load from $REPO/skills"
+
+# ---- 5b. file links in default-profile seats and herdr -------------------------------------------
+# The default profile auto-discovers this extension; as2 itself loads it through gates/index.ts.
+# Like tier links, this points at the checkout that `as2 install` runs from, never a lane copy
+# unless somebody explicitly runs install there. No herdr command runs without a herdr on PATH.
+DEFAULT_EXTENSIONS="$HOME/.omp/agent/extensions"
+mkdir -p "$DEFAULT_EXTENSIONS"
+ln -sfn "$REPO/gates/extensions/open-links.ts" "$DEFAULT_EXTENSIONS/as2-open-links.ts"
+step "default-profile extension linked: $DEFAULT_EXTENSIONS/as2-open-links.ts -> $REPO/gates/extensions/open-links.ts"
+if command -v herdr >/dev/null 2>&1; then
+	herdr plugin link "$REPO/install/herdr-file-links" || fail "herdr plugin link exited $?" 1
+	step "herdr file-link handler linked: as2.file-links"
+else
+	step "note: herdr is not on PATH; file-link handler not registered (install herdr, then re-run this script)"
+fi
 
 # ---- 6. the launcher (launcher rows) ------------------------------------------------------------
 # A symbolic link into the checkout, like the tier files: the script resolves its own real path to

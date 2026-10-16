@@ -16,7 +16,7 @@ import { ceilingOf } from "../src/input";
 import { planFirstBody } from "../src/launch";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { STANDING_WORKLOAD_ID, SURFACE_BY as SURFACE } from "../src/types";
-import { clock, ctxOf, fakePi, notices, timers, tmp } from "./helpers";
+import { clock, ctxOf, fakePi, loadTestText, notices, timers, tmp } from "./helpers";
 
 function env(over: Record<string, string> = {}): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
@@ -612,7 +612,7 @@ describe("surface extension adapter", () => {
 		const wl = seed.openWorkload({ by: "lane-a", brief: "Add a line to the README", stakes: "normal", mode: "autonomous" });
 		const sl = seed.addSlice({ by: "lane-a", workloadId: wl, task: "write the line", doneCondition: "README.md has it", inputs: "README.md" });
 		seed.close();
-		orchestratorSurface(f.pi, e);
+		await orchestratorSurface(f.pi, e, { loadText: loadTestText });
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		const wake = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as Started;

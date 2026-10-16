@@ -54,6 +54,7 @@ import {
 } from "../src/launch";
 import { checkoutOwnerRepo, recordTrainTask, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_DETAIL_MAX_BYTES, TRAIN_TASK_KINDS, type TrainTaskKind } from "../src/merge-train";
 import { PAIR_OPTION } from "../src/pair-suggest";
+import { expandCallerHandles } from "../src/linked-api";
 import { testRuns } from "../src/test-run";
 import { releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
 import {
@@ -325,10 +326,13 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const before = owned(ctx, "asked");
+			if (!before.ok) return before.result;
+			const slice = String(params.slice ?? "").trim();
+			const body = await expandCallerHandles(String(params.body ?? "").trim(), pi, ctx);
+			// Locating is async: use current ownership, not the lease/holder snapshot from before it.
 			const o = owned(ctx, "asked");
 			if (!o.ok) return o.result;
-			const slice = String(params.slice ?? "").trim();
-			const body = String(params.body ?? "").trim();
 			const options = Array.isArray(params.options) ? params.options.map((x) => String(x).trim()).filter((x) => x.length > 0) : [];
 			if (!slice || !body) return text("A question names a slice id and a body; nothing was asked.");
 			if (new Set(options.map((x) => x.toLowerCase())).size < 2) return text("A question offers at least two distinct options Jo can answer with; nothing was asked.");
@@ -413,9 +417,11 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const before = owned(ctx, "recorded");
+			if (!before.ok) return before.result;
+			const body = await expandCallerHandles(String(params.body ?? "").trim(), pi, ctx);
 			const o = owned(ctx, "recorded");
 			if (!o.ok) return o.result;
-			const body = String(params.body ?? "").trim();
 			if (!body) return text("An entry has a body; nothing was recorded.");
 			const prefix = reservedPrefix(body);
 			if (prefix !== null && prefix !== "done-because") return reserved(body, "recorded")!;
@@ -448,9 +454,11 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const before = owned(ctx, "sent");
+			if (!before.ok) return before.result;
+			const body = await expandCallerHandles(String(params.body ?? "").trim(), pi, ctx);
 			const o = owned(ctx, "sent");
 			if (!o.ok) return o.result;
-			const body = String(params.body ?? "").trim();
 			if (!body) return text("A message has a body; nothing was sent.");
 			const refused = reserved(body, "sent");
 			if (refused) return refused;

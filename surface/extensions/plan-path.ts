@@ -12,9 +12,8 @@
 // never a rethrow: the timer callback has no handler). `pi.sendMessage` with no `deliverAs` on an
 // idle session appends and paints the message and starts no turn (OMP 18.8.6). A mid-turn message
 // (text before its tool calls) gets its lines when the turn goes idle, below the tool output (the
-// plan's tradeoff 2). OMP renders the message content as Markdown, so each line's path has its
-// Markdown-special characters backslash-escaped (markdownEscape) or a path like `/a/*x*/` would lose
-// characters on screen; planLine and every other route stay plain text.
+// plan's tradeoff 2). The shared linkedApi adapter turns raw plan paths into Markdown links at
+// the send boundary, with the same escaping as every other surface message.
 //
 // The lines never reach a model: the `context` hook drops every `surface-plan-path` message from each
 // request, and `session_before_compact` removes them from the preparation's `messagesToSummarize`,
@@ -31,12 +30,6 @@ import { type CompactionPreparation, type Ctx, type HostMessage, PUSH_TRIES, typ
 export const PLAN_PATH_TYPE = "surface-plan-path";
 /** How long after `agent_end`, and between busy re-checks, the queue is tried (ms). */
 export const PLAN_PATH_FLUSH_MS = 100;
-
-/**
- * `text` with each Markdown-special character (\ ` * _ [ < > ~ & $) backslash-escaped, so OMP's Markdown
- * shows it as written. `]` stays bare: an escaped `[` already stops a link, and `\[…\]` is pi-tui's math.
- */
-const markdownEscape = (text: string): string => text.replace(/[\\`*_[<>~&$]/g, "\\$&");
 
 const isPlanPath = (m: HostMessage): boolean => m.customType === PLAN_PATH_TYPE;
 
@@ -86,7 +79,7 @@ export default function planPathRow(pi: SurfaceAPI, env: Record<string, string |
 		try {
 			const ledger = s.ledger();
 			const q = queueOf(s);
-			for (const line of text.split("\n")) for (const m of planMentions(ledger, s.numbering, line)) q.lines.push(planLine({ ref: m.ref, path: markdownEscape(m.path) }));
+			for (const line of text.split("\n")) for (const m of planMentions(ledger, s.numbering, line)) q.lines.push(planLine({ ref: m.ref, path: m.path }));
 		} catch (err) {
 			ctx.ui.notify(`the plan paths could not be read from the ledger: ${err instanceof Error ? err.message : String(err)}`, "warning");
 		}

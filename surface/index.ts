@@ -32,9 +32,14 @@ import rankRow from "./extensions/rank";
 import surfaceInputRow from "./extensions/surface-input";
 import wakeRow from "./extensions/wake";
 import workloadRow, { type WorkloadDeps } from "./extensions/workload";
-import type { Ctx, SurfaceAPI } from "./src/types";
+import { linkedApi } from "./src/linked-api";
+import type { Ctx, ResultTextLoader, SurfaceAPI } from "./src/types";
 
 export type { SurfaceAPI } from "./src/types";
+export type SurfaceDeps = WorkloadDeps & { loadText?: ResultTextLoader };
+
+/** Entry-relative lazy host import, as hostJudge below; no copied terminal layout. */
+const hostText: ResultTextLoader = async () => (await import("@oh-my-pi/pi-tui")).Text;
 
 /** OMP's `judge` role, resolved through the host's own modules (same entry-module rule as classifier/extension.ts). */
 async function hostJudge(ctx: Ctx): Promise<KindJudge> {
@@ -49,9 +54,10 @@ async function hostJudge(ctx: Ctx): Promise<KindJudge> {
 	return resolveJudge({ settings: settings as never, registry: ctx.modelRegistry as never }) as unknown as KindJudge;
 }
 
-export default function orchestratorSurface(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, deps: WorkloadDeps = { judge: hostJudge }): void {
+export default function orchestratorSurface(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, deps: SurfaceDeps = { judge: hostJudge }): Promise<void> {
+	pi = linkedApi(pi);
 	surfaceInputRow(pi, env);
-	wakeRow(pi, env);
+	const textReady = wakeRow(pi, env, deps.loadText ?? hostText);
 	planPathRow(pi, env);
 	workloadRow(pi, env, deps);
 	launchRow(pi, env);
@@ -60,4 +66,6 @@ export default function orchestratorSurface(pi: SurfaceAPI, env: Record<string, 
 	rankRow(pi, env, deps);
 	laneRow(pi, env);
 	laneToolsRow(pi, env);
+	// OMP awaits extension factories before restoring tool displays. Registration above remains synchronous.
+	return textReady;
 }

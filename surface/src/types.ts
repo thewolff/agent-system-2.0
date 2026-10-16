@@ -65,6 +65,14 @@ export interface ExecResult {
 	killed: boolean;
 }
 
+/** Host-owned Text layout, injected by the entry so row modules never bare-import OMP. */
+export interface ResultText {
+	render(width: number): readonly string[];
+	invalidate(): void;
+}
+export type ResultTextConstructor = new (text: string, paddingX?: number, paddingY?: number) => ResultText;
+export type ResultTextLoader = () => Promise<ResultTextConstructor>;
+
 /** The extension API as the surface rows see it: the gates' slice plus the lane-boundary events and the push action. */
 export type SurfaceAPI = GatesAPI<Ctx> & {
 	on(event: "tool_approval_requested", h: Handler<{ sessionId: string; toolCallId: string; toolName: string; reason?: string }>): void;

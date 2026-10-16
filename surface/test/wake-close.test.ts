@@ -6,8 +6,9 @@
 // surface's `pi.exec` is the fake one (no git or gh process runs), answering the close check as a
 // served repo whose `git rev-parse` fails, so the refusal comes from the real close path.
 import { describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { Ledger } from "../../ledger/src/index";
 import { launchVerdict } from "../extensions/launch";
 import orchestratorSurface from "../index";
@@ -84,7 +85,16 @@ describe("the tick's refused close is told once per refusal", () => {
 			}
 		};
 		const closeChecks = () => f.execs.calls.filter((c) => c.command === "git" && c.args[2] === "config").length;
-		const refusal = (fatal: string) => `- tick: ${wl} cannot close: the close check could not answer: ${repo} is not a git checkout (git rev-parse exited 128: ${fatal})`;
+		const expectRefusal = (lines: string[], fatal: string) => {
+			expect(lines).toHaveLength(1);
+			expect(lines[0]).toStartWith(`- tick: ${wl} cannot close:`);
+			expect(lines[0]).toContain(`](${pathToFileURL(repo).href})`);
+			expect(lines[0]).toContain("git rev-parse exited 128");
+			expect(lines[0]).toContain(fatal);
+			const l = open(e);
+			expect(l.workload(wl)!.status).toBe("open");
+			l.close();
+		};
 
 		timers.length = 0;
 		await f.emit("session_start", { type: "session_start" }, ctx);
@@ -94,7 +104,7 @@ describe("the tick's refused close is told once per refusal", () => {
 		await tick();
 		await tick();
 		expect(closeChecks()).toBe(2);
-		expect(await applied()).toEqual([refusal("fatal: first")]);
+		expectRefusal(await applied(), "fatal: first");
 		await tick();
 		expect(closeChecks()).toBe(3);
 		expect(await applied()).toEqual([]);
@@ -104,7 +114,7 @@ describe("the tick's refused close is told once per refusal", () => {
 		await tick();
 		await tick();
 		expect(closeChecks()).toBe(5);
-		expect(await applied()).toEqual([refusal("fatal: second")]);
+		expectRefusal(await applied(), "fatal: second");
 
 		// not ready (a slice opens), then ready again: the same refusal is told again
 		const l = open(e);
@@ -112,26 +122,40 @@ describe("the tick's refused close is told once per refusal", () => {
 		l.close();
 		await tick();
 		expect(closeChecks()).toBe(5);
-		expect(await applied()).toEqual([`- tick: ${wl} is finished but cannot close: 1 open slice(s), 0 paused, 0 open question(s) — resolve them or close by hand`]);
+		const stuck = await applied();
+		expect(stuck).toHaveLength(1);
+		expect(stuck[0]).toStartWith(`- tick: ${wl}`);
+		expect(stuck[0]).toContain("cannot close:");
+		expect(stuck[0]).toContain("1 open slice(s)");
+		expect(stuck[0]).toContain("0 paused");
+		expect(stuck[0]).toContain("0 open question(s)");
 		const l2 = open(e);
 		l2.completeSlice(sl, { by: HAND, artifact: "done" });
 		l2.close();
 		await tick();
 		await tick();
 		expect(closeChecks()).toBe(7);
-		expect(await applied()).toEqual([refusal("fatal: second")]);
+		expectRefusal(await applied(), "fatal: second");
 
 		// the close goes through (the repo is no longer served): told as usual
 		git.origin = false;
 		await tick();
 		const closed = await applied();
 		expect(closed).toHaveLength(1);
-		expect(closed[0]).toStartWith(`- tick: closed ${wl}: README.md carries a verify line — Decision-log entry rendered at ${join(repo, ".ai", "decision-log")}/`);
+		expect(closed[0]).toStartWith(`- tick: closed ${wl}:`);
+		const logDir = join(repo, ".ai", "decision-log");
+		const entries = readdirSync(logDir);
+		expect(entries).toHaveLength(1);
+		expect(closed[0]).toContain(`](${pathToFileURL(join(logDir, entries[0]!)).href})`);
+		expect(closed[0]).toContain("not committed:");
+		expect(closed[0]).toContain("git rev-parse exited 128");
+		expect(closed[0]).toContain("fatal: second");
 		const after = open(e);
 		expect(after.workload(wl)!.status).toBe("closed");
 		after.close();
 		await tick();
 		expect(await applied()).toEqual([]);
+		expect(f.execs.calls.filter((c) => c.command === "bun")).toEqual([]);
 	});
 });
 

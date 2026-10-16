@@ -11,7 +11,7 @@ import { CONTRACT_MARKER } from "../../gates/src/rows/r02-contract";
 import { Ledger } from "../../ledger/src/index";
 import { launchVerdict } from "../extensions/launch";
 import orchestratorSurface from "../index";
-import { doneBody } from "../src/launch";
+import { doneBody, planFirstBody } from "../src/launch";
 import { surfaceSession } from "../src/session";
 import { SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, type Sent, timeouts, timers, tmp } from "./helpers";
@@ -96,6 +96,44 @@ const keyOf = (m: { details?: unknown }) => (m.details as Key | undefined)?.surf
 const occurrences = (text: string, needle: string) => text.split(needle).length - 1;
 
 describe("Fix 1: a pending wake is pushed as an aside, and confirmed", () => {
+	test("T4: space-bearing ledger paths link synchronously without changing wake retries or notice confirmation", async () => {
+		const t = surface();
+		const path = join(tmp("linked-wake"), "PLAN with spaces.md");
+		writeFileSync(path, "# Plan\n");
+		const target = new URL(`file://${path}`).href;
+		const linked = `[${path}](${target})`;
+		const l = Ledger.open(t.e.AGENT_SYSTEM_LEDGER_DB!, { backup: false, backupOnOpen: false });
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "Review plan", stakes: "normal", mode: "user-driven" });
+		const sl = l.addSlice({ by: "lane-a", workloadId: wl, task: "plan", doneCondition: "reviewed", inputs: path });
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
+		expect(l.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: null }).won).toBe(true);
+		l.write(() => {
+			const q = l.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: path, options: ["approve", "revise"] });
+			l.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "assumption", body: `plan-question: ${q}` });
+		});
+		l.close();
+		await t.start();
+		t.fire();
+		const first = t.of("surface-wake")[0]!;
+		expect(first.message.content).toContain(linked);
+		const key = `wake:${t.s().wakeInFlight!.wakeId}`;
+		expect(keyOf(first.message)).toBe(key);
+		expect(t.s().wakeInFlight!.tries).toBe(1);
+		t.s().tickNotices.push(`tick: reviewed ${path}`);
+		t.tick();
+		expect(t.s().wakeInFlight!.tries).toBe(2);
+		t.tick();
+		expect(t.s().wakeInFlight!.tries).toBe(3);
+		expect(t.of("surface-wake").map((m) => keyOf(m.message))).toEqual([key, key, key]);
+		expect(t.of("surface-notices")).toHaveLength(0);
+		await t.admit(first);
+		expect(t.s().wakeInFlight).toBeNull();
+		t.tick();
+		const notice = t.of("surface-notices");
+		expect(notice).toHaveLength(1);
+		expect(notice[0]!.message.content).toContain(`tick: reviewed ${linked}`);
+	});
+
 	test("W1 launch: the one-shot pushes the wake with the voice and contract inlined; bash is owed; message_end confirms; Jo's next turn carries no wake; the read clears the block", async () => {
 		const t = surface();
 		await t.start();
@@ -105,7 +143,8 @@ describe("Fix 1: a pending wake is pushed as an aside, and confirmed", () => {
 		expect(wakes).toHaveLength(1);
 		const content = wakes[0]!.message.content;
 		expect(content).toContain("(wake: session-start)");
-		expect(content).toContain(`# Voice document (${t.e.AGENT_SYSTEM_VOICE})\n\nVOICE DOC BODY`);
+		expect(content).toContain(`[${t.e.AGENT_SYSTEM_VOICE}](${new URL(`file://${t.e.AGENT_SYSTEM_VOICE}`).href})`);
+		expect(content).toContain("VOICE DOC BODY");
 		expect(content).toContain(`${CONTRACT_MARKER}\nCONTRACT DOC BODY`);
 		expect(content.indexOf("VOICE DOC BODY")).toBeLessThan(content.indexOf("(wake: session-start)"));
 		expect(content.indexOf("CONTRACT DOC BODY")).toBeLessThan(content.indexOf("(wake: session-start)"));

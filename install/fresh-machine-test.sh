@@ -72,6 +72,14 @@ FAKE_HOME="$WORK/home"
 SQLITE3="$(command -v sqlite3)"
 [ -x /usr/bin/sqlite3 ] && SQLITE3=/usr/bin/sqlite3
 
+# Never register a real plugin from this throwaway clone, even when herdr is installed on the
+# developer's PATH. T5's Bun test records and asserts the link command separately.
+HERDR_TEST_BIN="$WORK/fake-herdr-bin"
+mkdir -p "$HERDR_TEST_BIN"
+printf '#!/bin/sh\nexit 0\n' >"$HERDR_TEST_BIN/herdr"
+chmod 755 "$HERDR_TEST_BIN/herdr"
+export PATH="$HERDR_TEST_BIN:$PATH"
+
 step() { printf '\n==> %s\n' "$*"; }
 ok() { printf 'PASS: %s\n' "$*"; }
 die() { printf 'FAIL: %s\n' "$*"; exit 1; }

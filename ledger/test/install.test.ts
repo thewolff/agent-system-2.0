@@ -24,6 +24,7 @@ let root: string;
 let copy: string;
 let manifest: string;
 let original: string;
+let installPath: string;
 
 /** Run the scratch copy's installer the way a fresh machine would: PATH, a temp HOME, and `env`. */
 function install(label: string, env: Record<string, string> = {}): { exitCode: number; out: string; db: string; home: string } {
@@ -31,7 +32,7 @@ function install(label: string, env: Record<string, string> = {}): { exitCode: n
 	mkdirSync(home, { recursive: true });
 	const db = env.AGENT_SYSTEM_LEDGER_DB ?? join(home, ".agent-system-2", "ledger.db");
 	const r = Bun.spawnSync(["bash", join(copy, "install", "install.sh")], {
-		env: { PATH: process.env.PATH ?? "", HOME: home, ...env }, stdout: "pipe", stderr: "pipe",
+		env: { PATH: installPath, HOME: home, ...env }, stdout: "pipe", stderr: "pipe",
 	});
 	return { exitCode: r.exitCode ?? -1, out: r.stdout.toString() + r.stderr.toString(), db, home };
 }
@@ -57,6 +58,14 @@ const MANIFEST_DIRS = ["ledger", "install", "profile", "tiers", "classifier", "g
 
 beforeAll(() => {
 	root = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "ledger-install-"));
+	// Do not inherit herdr/ctx from the developer's PATH: installer runs must never register a real
+	// plugin. Only Bun and system utilities are needed for these ledger/manifest tests.
+	const bin = join(root, "bin");
+	mkdirSync(bin);
+	symlinkSync(process.execPath, join(bin, "bun"));
+	installPath = `${bin}:/usr/bin:/bin`;
+	expect(Bun.which("herdr", { PATH: installPath })).toBeNull();
+	expect(Bun.which("ctx", { PATH: installPath })).toBeNull();
 	copy = join(root, "repo");
 	for (const dir of MANIFEST_DIRS) cpSync(join(REPO, dir), join(copy, dir), { recursive: true });
 	for (const d of MANIFEST_DIRS) {

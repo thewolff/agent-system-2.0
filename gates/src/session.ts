@@ -44,7 +44,9 @@ export interface Ctx {
 	hasUI: boolean;
 	cwd: string;
 	/** `getBranch`: the current branch, root to leaf, custom entries included (OMP session/session-manager.ts getBranch); optional because not every host or fake carries it. */
-	sessionManager: { getHeader(): { parentSession?: string } | null; getEntries(): { type: string }[]; getBranch?(): BranchEntry[] };
+	sessionManager: { getHeader(): { parentSession?: string } | null; getEntries(): { type: string }[]; getBranch?(): BranchEntry[]; getSessionFile?(): string | undefined; getSessionId?(): string };
+	/** The calling host's local:// mapping (OMP ExtensionContext.localProtocolOptions). */
+	localProtocolOptions?: { getArtifactsDir?: () => string | null; getSessionId?: () => string | null };
 	ui: { notify(message: string, type?: "info" | "warning" | "error"): void };
 }
 /**
@@ -97,6 +99,8 @@ export interface GatesAPI<C extends Ctx = Ctx> {
 	getAllTools(): { name: string }[];
 	setActiveTools(names: string[]): Promise<void>;
 	appendEntry(customType: string, data?: unknown): void;
+	/** Session-local slash commands; skill entries carry this caller's skill file path. */
+	getCommands?(): { name: string; source?: string; path?: string }[];
 	registerTool(tool: {
 		name: string;
 		label: string;
@@ -109,6 +113,8 @@ export interface GatesAPI<C extends Ctx = Ctx> {
 		 *  first real session 2026-09-30: the wake gate refused `write xd://orchestrator_wake_read` as "not the wake read". */
 		loadMode?: "essential" | "discoverable";
 		/** OMP passes the session's context fifth (omp://extensions.md, "Current `execute` signature"). */
+		/** OMP's Component-shaped custom result renderer (extensions/types.ts ToolDefinition.renderResult). */
+		renderResult?(result: ToolResult, options: { expanded: boolean; isPartial: boolean }, theme: unknown, args?: Record<string, unknown>): { render(width: number): readonly string[]; invalidate(): void };
 		execute(toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: C): Promise<ToolResult>;
 	}): void;
 	zod: { object(shape: Record<string, unknown>): unknown; string(): StringSchema };

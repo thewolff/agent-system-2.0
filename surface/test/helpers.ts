@@ -177,6 +177,31 @@ export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resum
 	};
 };
 
+/** Minimal offline Text double; ANSI controls are indivisible and only visible characters consume width. */
+export const loadTestText = async () => class TestText {
+	constructor(private readonly text: string) {}
+	invalidate(): void {}
+	render(width: number): string[] {
+		const rows: string[] = [];
+		for (const line of this.text.split("\n")) {
+			let row = "";
+			let columns = 0;
+			for (const token of line.match(/\x1b\]8;[^\x07]*(?:\x07)|\x1b\[[0-9;]*m|[^\x1b]/gu) ?? []) {
+				const size = token.startsWith("\x1b") ? 0 : Bun.stringWidth(token);
+				if (size > 0 && columns + size > width && columns > 0) {
+					rows.push(row);
+					row = "";
+					columns = 0;
+				}
+				row += token;
+				columns += size;
+			}
+			rows.push(row);
+		}
+		return rows;
+	}
+};
+
 // ---- the lane script's scratch root (surface/test/lane-script.test.ts, lane-smoke.test.ts) ----------
 
 export const LANE_SCRIPT = join(import.meta.dir, "..", "scripts", "lane.ts");
