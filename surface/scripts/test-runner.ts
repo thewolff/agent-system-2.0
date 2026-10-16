@@ -36,6 +36,7 @@
 //                                           install the preflight checks instead of the real one (`installSpec`)
 //   AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS   the heartbeat period (default 15 s)
 //   AGENT_SYSTEM_TEST_RUNNER_POLL_MS        the lock wait's poll (default 2 s)
+//   AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS    post-sweep async deadline (default 150 s; SQLite retries add a finite grace)
 //   AGENT_SYSTEM_TEST_RUNNER_BUSY_MS        runs.db busy_timeout (default 5 s)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS    the refresh helper's cap (default REFRESH_CAP_S plus a minute, 15 min)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS  its SIGTERM-to-SIGKILL grace (default 10 s)
@@ -46,9 +47,10 @@
 import { spawn, spawnSync, type Subprocess } from "bun";
 import { Database } from "bun:sqlite";
 import {
-	appendFileSync, chmodSync, closeSync, constants as FS, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync,
+	appendFileSync, chmodSync, closeSync, constants as FS, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, renameSync,
 	rmSync, type Stats, writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { assertNotLiveLedgerUnderTest, defaultLedgerPath, Ledger, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import {
@@ -211,11 +213,14 @@ function hookSync(runId: string, point: string, info: Record<string, unknown> = 
 	while (!existsSync(`${h.base}.go`)) Bun.sleepSync(25);
 	hookResume(h.base);
 }
-async function hook(runId: string, point: string, info: Record<string, unknown> = {}): Promise<void> {
+async function hook(runId: string, point: string, info: Record<string, unknown> = {}, deadline = Infinity): Promise<void> {
 	const h = hookMark(runId, point, info);
 	if (!h || !existsSync(`${h.base}.pause`)) return;
 	writeFileSync(`${h.base}.reached`, JSON.stringify({ pid: process.pid, at: Date.now(), ...info }));
-	while (!existsSync(`${h.base}.go`)) await Bun.sleep(25);
+	while (!existsSync(`${h.base}.go`)) {
+		if (Date.now() >= deadline) throw new Stop(`post-sweep deadline exceeded at ${point}`);
+		await Bun.sleep(25);
+	}
 	hookResume(h.base);
 }
 
@@ -520,14 +525,43 @@ const NO_HOOKS = ["-c", "core.hooksPath=/dev/null"];
 /** The network commands' extra settings (§ 2.3 step 2): no template, and only the keychain helper. */
 const NETWORK = [...NO_HOOKS, "-c", "init.templateDir=", "-c", "credential.helper=", "-c", "credential.helper=osxkeychain"];
 
-/** One command, stdout verbatim: never trimmed, since NUL-delimited output (`git diff -z`) may begin or end with a path's own whitespace. */
-async function run(cmd: string[], o: { cwd: string; env: Record<string, string>; timeoutMs: number }): Promise<{ code: number | null; out: string; err: string }> {
-	const p = spawn(cmd, { cwd: o.cwd, env: o.env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-	const timer = setTimeout(() => p.kill("SIGKILL"), o.timeoutMs);
-	const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
-	await p.exited;
-	clearTimeout(timer);
-	return { code: p.exitCode, out, err: err.trim() };
+/**
+ * File-backed output cannot wait for EOF held by a grandchild. Poll the exit status with a
+ * deadline as well: signalling a process does not bound an unresolved stream/exited promise.
+ * Each caller owns its private output directory; no output is trimmed except stderr.
+ */
+export async function run(cmd: string[], o: {
+	cwd: string; env: Record<string, string | undefined>; timeoutMs: number; inheritStderr?: boolean;
+	onSpawn?: (pid: number) => void;
+}): Promise<{ code: number | null; signal: string | null; out: string; err: string }> {
+	const dir = mkdtempSync(join(tmpdir(), "as2-runner-command-"));
+	const outPath = join(dir, "stdout");
+	const errPath = join(dir, "stderr");
+	const outFd = openSync(outPath, "w", 0o600);
+	const errFd = openSync(errPath, "w", 0o600);
+	let p: Subprocess | undefined;
+	try {
+		try {
+			p = spawn(cmd, { cwd: o.cwd, env: o.env, stdin: "ignore", stdout: outFd, stderr: o.inheritStderr ? "inherit" : errFd });
+		} finally {
+			closeSync(outFd);
+			closeSync(errFd);
+		}
+		o.onSpawn?.(p.pid);
+		const deadline = Date.now() + o.timeoutMs;
+		while (p.exitCode === null && p.signalCode === null) {
+			if (Date.now() >= deadline) {
+				// Release the wait even if signalling is refused or Bun never reports completion.
+				try { p.kill("SIGKILL"); } catch { /* the deadline still applies */ }
+				throw new Stop(`command timed out after ${o.timeoutMs} ms: ${cmd.join(" ")}`);
+			}
+			await Bun.sleep(Math.min(25, Math.max(1, deadline - Date.now())));
+		}
+		return { code: p.exitCode, signal: p.signalCode ?? null, out: readFileSync(outPath, "utf8"), err: readFileSync(errPath, "utf8").trim() };
+	} finally {
+		p?.unref();
+		rmSync(dir, { recursive: true, force: true });
+	}
 }
 
 type Wrapped = { code: number | null; signal: string | null; out: string };
@@ -550,6 +584,7 @@ class Runner {
 	/** The run learnt it no longer holds the row (heartbeat or checkpoint) or its request. */
 	private superseded: string | null = null;
 	private soloCalls = 0;
+	private postSweepDeadline = Infinity;
 	private baseSoloCalls = 0;
 	private basePrepared = false;
 	private url = "";
@@ -656,19 +691,27 @@ class Runner {
 	 */
 	async wrap(call: WrapperCall, capMs: number | null = null): Promise<Wrapped> {
 		const argv = wrapperArgv(call, this.exec);
-		const p = spawn(argv, { cwd: this.as2root, env: process.env, stdin: "ignore", stdout: "pipe", stderr: "inherit" });
-		hookMark(this.id, `spawn-${call.sub}`, { pid: p.pid });
 		let outlived = false;
 		const watchdog = capMs === null ? null : setTimeout(() => {
 			outlived = true;
 			this.log(`${call.sub} outlived its cap by ${OUTLIVE_MS / 1000} s; sweeping`);
 			void this.wrap({ sub: "sweep", runId: this.id }).catch((e) => this.log(`the outlive sweep failed: ${errText(e)}`));
 		}, capMs + OUTLIVE_MS);
-		const out = await new Response(p.stdout).text();
-		await p.exited;
-		clearTimeout(watchdog ?? undefined);
+		let r: Wrapped;
+		try {
+			r = await run(argv, {
+				cwd: this.as2root, env: process.env,
+				timeoutMs: (capMs ?? 0) + OUTLIVE_MS + 120_000, inheritStderr: true,
+				onSpawn: (pid) => {
+					hookMark(this.id, `spawn-${call.sub}`, { pid });
+					this.log(`${argv.slice(4).join(" ")}: started pid ${pid}`);
+				},
+			});
+		} finally {
+			clearTimeout(watchdog ?? undefined);
+		}
+		const { out } = r;
 		if (out.trim()) process.stdout.write(out.endsWith("\n") ? out : `${out}\n`);
-		const r = { code: p.exitCode, signal: p.signalCode ?? null, out };
 		this.log(`${argv.slice(4).join(" ")} → ${r.signal ?? `exit ${r.code}`}${outlived ? " (after the outlive sweep)" : ""}`);
 		return r;
 	}
@@ -978,10 +1021,10 @@ class Runner {
 	}
 
 	/** `git ls-remote <origin> refs/pull/<N>/head` with the trusted settings (§ 2.3 step 5); null when it cannot answer. */
-	async headNow(): Promise<string | null> {
+	async headNow(timeoutMs = 120_000): Promise<string | null> {
 		const pr = this.request.pr;
 		const r = await run(["git", ...NETWORK, "ls-remote", this.url, `refs/pull/${pr}/head`], {
-			cwd: this.runDir, env: trustedEnv(join(this.runDir, "trusted.gitconfig")), timeoutMs: 120_000,
+			cwd: this.runDir, env: trustedEnv(join(this.runDir, "trusted.gitconfig")), timeoutMs,
 		});
 		if (r.code !== 0) {
 			this.log(`ls-remote failed: ${r.err.split("\n").at(-1) || `exit ${r.code}`}`);
@@ -1014,7 +1057,7 @@ class Runner {
 		}
 	}
 
-	/** Steps in the plan's order: lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare → parts with a sweep after each → head re-check. */
+	/** Steps in the plan's order: lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare → parts with a sweep after each → base runs → post-sweep finalization deadline → head re-check. */
 	async body(): Promise<void> {
 		({ url: this.url, repo: this.repo, ownerRepo: this.ownerRepo } = servedOf(this.ledger, this.wl, this.config));
 		await this.acquire();
@@ -1032,8 +1075,10 @@ class Runner {
 			await this.sweep(file);
 		}
 		await this.baseRuns();
-		await hook(this.id, "head-recheck");
-		this.f.headAtEnd = await this.headNow();
+		this.postSweepDeadline = Date.now() + msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", 150_000);
+		this.log(`post-sweep finalization started; deadline ${new Date(this.postSweepDeadline).toISOString()}`);
+		await hook(this.id, "head-recheck", {}, this.postSweepDeadline);
+		this.f.headAtEnd = await this.headNow(Math.max(1, this.postSweepDeadline - Date.now()));
 	}
 
 	/**
@@ -1079,12 +1124,20 @@ class Runner {
 		this.log(`test-run ${run.verdict}${run.reason ? `: ${run.reason}` : ""}`);
 		if (settled?.ok) this.log(`settled ${this.request.slice}`);
 		else if (settled) this.log(`the settle of ${this.request.slice} was refused: ${settled.reason}`);
+		this.writeResult(run);
+		return run;
+	}
+
+	private writeResult(run: TestRun): void {
+		const tmp = join(this.runDir, `.result.${process.pid}.json`);
 		try {
-			writeFileSync(join(this.runDir, "result.json"), resultJson(run), { mode: 0o600 });
+			writeFileSync(tmp, resultJson(run), { mode: 0o600 });
+			renameSync(tmp, join(this.runDir, "result.json"));
 		} catch (e) {
 			this.log(`result.json not written: ${errText(e)}`);
+		} finally {
+			rmSync(tmp, { force: true });
 		}
-		return run;
 	}
 
 	async main(): Promise<number> {
@@ -1101,9 +1154,34 @@ class Runner {
 				else this.f.error = `the runner failed: ${errText(e)}`;
 				if (!(e instanceof Superseded)) this.log(`stopped: ${this.f.error}`);
 			}
-			await hook(this.id, "result");
-			const run = this.finish();
+			if (!Number.isFinite(this.postSweepDeadline)) this.postSweepDeadline = Date.now() + msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", 150_000);
+			try {
+				await hook(this.id, "result", {}, this.postSweepDeadline);
+				if (Date.now() >= this.postSweepDeadline) throw new Stop("post-sweep deadline exceeded before publication");
+			} catch (e) {
+				this.f.error = errText(e);
+				this.log(`stopped: ${this.f.error}`);
+			}
+			// Bound synchronous SQLite waits too; JS timers cannot interrupt them. The retry
+			// counts are finite (runs: 12; ledger: 6), including the finally's release.
+			this.lockDb.exec("PRAGMA busy_timeout = 100");
+			this.ledger.db.exec("PRAGMA busy_timeout = 100");
+			let run: TestRun;
+			try {
+				run = this.finish();
+			} catch (e) {
+				// A locked/unavailable ledger cannot accept a transaction. Preserve a local
+				// error verdict instead of silently leaving no artifact; never settle here.
+				const reason = `result publication failed: ${errText(e)}${this.f.error ? `; ${this.f.error}` : ""}`;
+				const run = buildTestRun(this.request, this.f, { verdict: "error", outcome: "error", reason, settle: false }, {
+					base: this.f.base, mergeBase: this.f.mergeBase, runDir: this.runDir, preflight: this.f.preflight,
+				});
+				this.log(`test-run error: ${reason}`);
+				this.writeResult(run);
+				return START_EXIT.failed;
+			}
 			// Only a terminal state, and only on the sha the fetch confirmed this run tested (trusted's sha check).
+			// postStatus never throws and kills gh after 15 s.
 			const state = this.f.fetchedSha === run.sha ? FULL_SUITE_STATE[run.verdict] : undefined;
 			if (state) await this.postStatus(state, run.sha, `full suite ${run.verdict}, run ${run.runId}`);
 			return 0;
