@@ -1,8 +1,11 @@
 {
   "name": "i-have-audhd",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
   "omp": {
     "extensions": ["./omp/i-have-audhd-omp.ts"]
   }

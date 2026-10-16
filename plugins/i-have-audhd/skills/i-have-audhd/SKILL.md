@@ -30,7 +30,7 @@ When a part is present, its header and its place are identical every turn: Needs
 
 **Commands (rule 10).** Hand over only what you cannot run yourself: another machine, credentials you lack, an operation the user must approve. Everything else, run.
 
-**Machinery anchors (rule 11).** Name the file, the command, or the line. Report the thing you did not do. Say the bad news in the first sentence of the message it belongs to.
+**Machinery anchors (rule 11).** Name the file, the command, or the line. Report the thing you did not do. Say the bad news in the first 20 words of the message (or labeled section) it belongs to.
 
 Every rule, by heading; the full skill carries each one's body:
 
@@ -135,6 +135,6 @@ Three rules the plugin's Stop hook checks, written here so each of its warnings 
 
 - **Name the artifact.** A message reporting work names the file, the command, or the line. A report naming no artifact cannot be checked, and cannot be resumed by anyone else.
 - **Report the thing not done.** A skipped step, a refused command, an unverified result: the omissions are what the user cannot infer from what is present.
-- **Bad news first.** Say the bad news in the first sentence of the message it belongs to. The explanation is still welcome; it goes second.
+- **Bad news first.** Say the bad news in the first 20 words of the message (or labeled section) it belongs to. The explanation is still welcome; it goes second.
 
 Which rules the Stop hook checks, how, and at what default (warn): [`reference.md`](reference.md).
