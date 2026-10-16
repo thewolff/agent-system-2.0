@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "panel synthesis output — report.json",
+  "description": "Output contract of a panel's synthesis hand, every mode (wl-mv5m7qvgkxhpj4 CONTRACT.md § 1). The classifier publishes it as out/report.json and its markdown as out/REPORT.md; references/panel/scripts/panel.ts check enforces the rules the descriptions state.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["legs", "synth", "findings", "dropped", "markdown"],
+  "properties": {
+    "legs": {
+      "type": "array",
+      "description": "One entry per lab, all three labs, copied from out/status.json: status and model exactly as status.json has them.",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["lab", "status", "model", "reason"],
+        "properties": {
+          "lab": { "type": "string", "enum": ["anthropic", "openai", "kimi"] },
+          "status": { "type": "string", "enum": ["landed", "missing", "excluded"] },
+          "model": { "type": "string", "description": "status.json's model for the lab; the empty string when status.json has null." },
+          "reason": { "type": "string", "description": "status.json's reason for a missing or excluded leg; the empty string when there is none." }
+        }
+      }
+    },
+    "synth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lab", "builderLab"],
+      "properties": {
+        "lab": { "type": "string", "enum": ["anthropic", "openai", "kimi"], "description": "The lab of the model writing this synthesis." },
+        "builderLab": { "type": "boolean", "description": "true when the dispatch named this lab a builder lab of the workload." }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "description": "One entry per synthesized finding, in report order.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "title", "section", "supportIds", "refuteIds"],
+        "properties": {
+          "id": { "type": "string", "description": "S1, S2, … in report order." },
+          "title": { "type": "string" },
+          "section": { "type": "string", "description": "The text of the ## heading of REPORT.md the finding sits under." },
+          "supportIds": { "type": "array", "description": "Leg item ids (<lab>-<n>) that assert this finding. Its n/3 is the number of distinct labs here.", "items": { "type": "string" } },
+          "refuteIds": { "type": "array", "description": "Leg item ids that contradict it. Non-empty together with supportIds puts the finding in the mode's disagreement section.", "items": { "type": "string" } }
+        }
+      }
+    },
+    "dropped": {
+      "type": "array",
+      "description": "Every landed leg item id not in any finding, each with the reason it was cut.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "reason"],
+        "properties": {
+          "id": { "type": "string" },
+          "reason": { "type": "string", "description": "Why it was cut: taste, duplicate of an id already counted, out of lane, unreceipted. Never empty." }
+        }
+      }
+    },
+    "markdown": { "type": "string", "description": "The full REPORT.md text." }
+  }
+}

@@ -5,6 +5,8 @@ description: Subjects every non-trivial decision to a fresh-context adversarial 
 
 # Doubt-Driven Development
 
+From an as2 lane this mode's cross-model pass runs as a panel (`doubt`), not an external CLI, so the non-interactive skip below does not apply there: see [`panel/panel.md`](panel/panel.md).
+
 ## Overview
 
 A confident answer is not a correct one. Long sessions accumulate context that quietly turns assumptions into "facts" without anyone noticing. Doubt-driven development is the discipline of materializing a fresh-context reviewer — biased to **disprove**, not approve — before any non-trivial output stands.

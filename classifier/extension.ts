@@ -136,13 +136,13 @@
  * a last `pair:` line and a classifier-stamped `pair-offer:`, when `pairOffer` finds a signal.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { LANE_ENV, WORKLOAD_ENV } from "../gates/src/types";
 import { type HostModules, hostSettings, readSetting } from "../gates/src/host";
 import { CLASSIFIER_BY, type EntryRow, Ledger, type QuestionRow, type RoutingOutcome, type Stakes } from "../ledger/src/index";
 import { defaultLedgerPath } from "../ledger/src/locality";
-import { briefField, briefSlice, briefStakes } from "./src/brief";
+import { briefField, briefPanel, briefSlice, briefStakes, type PanelField, withoutPanelLines } from "./src/brief";
 import { buildRow } from "./src/build-row";
 import {
 	type Calibration,
@@ -171,9 +171,11 @@ import {
 	kimiOutRuleActive,
 	type Lab,
 	labOf,
+	LABS,
 	laneBuilderBody,
 	openParkQuestion,
 	PARK_OPTIONS,
+	panelPin,
 	parkQuestionBody,
 	parseHandSpawn,
 	reviewParkBody,
@@ -187,11 +189,44 @@ import {
 	reviewWithheldBody,
 	settledTokens,
 	spentGrants,
+	synthLab,
 	tokenOfRouting,
 	unspentGrant,
 	withheldTokens,
 } from "./src/lab";
 import type { RoutingLedger } from "./src/ledger-port";
+import {
+	finishSynth,
+	groupManifest,
+	groupOfRun,
+	ingestRun,
+	landedLabs,
+	type LegLine,
+	legHeld,
+	legLine,
+	memberTask,
+	namesPanelsDir,
+	panelDir,
+	panelDispatchHeld,
+	panelGroupBody,
+	panelGroups,
+	panelLegBody,
+	type Manifest,
+	type PanelLedger,
+	type PanelMode,
+	type PanelRole,
+	panelSynthBody,
+	readNoFollow,
+	roleOf,
+	sweepPanels,
+	synthHeld,
+	synthReply,
+	synthTask,
+	verifyFiles,
+	voidRun,
+	writeLeg,
+	writeSynthEnd,
+} from "./src/panel";
 import { reviewStopOn } from "./src/review-stop";
 import {
 	countRounds,
@@ -221,7 +256,7 @@ import {
 } from "./src/rounds";
 import { isTier, route, STAKES, type Routing, type Tier } from "./src/route";
 import { identity, loadTierTable, modelIdentity, type TierTable } from "./src/tier-table";
-import { controlEntries, type LaneStarted, laneStarted } from "../surface/src/launch";
+import { controlEntries, holdersOf, type LaneStarted, laneStarted, planFirst, planSlice } from "../surface/src/launch";
 import { ompPidState, type PidState } from "../surface/src/omp-probe";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../surface/src/types";
 import {
@@ -251,8 +286,8 @@ export interface ClassifierDeps {
 	question: KindQuestion;
 	/** The question and judge the 0.55 threshold was measured with (classifier/calibration.json). */
 	calibration: Calibration;
-	/** The ledger the routing rows land in; opened lazily in production. */
-	ledger(): RoutingLedger;
+	/** The ledger the routing rows land in (and panels' lines and directories, PLAN wl-mv5m7qvgkxhpj4 § 3); opened lazily in production. */
+	ledger(): PanelLedger;
 	/** `created_by` on routing rows: this lane's id. */
 	laneId: string;
 	/** The workload this session is bound to (`AGENT_SYSTEM_WORKLOAD_ID`, gates/src/types.ts), if any. */
@@ -308,6 +343,8 @@ interface Pending {
 	 * published, read in the transaction that writes a fan-out's `review-group:`. Null for other work.
 	 */
 	loop: number | null;
+	/** A three-lab panel's member or synthesis hand (classifier/src/panel.ts): its group is `pg-…`. Null for other work. */
+	panel: PanelRole | null;
 	/**
 	 * When the call was published (ms since the epoch). Output delivered before it belongs to an earlier
 	 * hand that OMP may have given the same agent id (a resumed lane session keeps its old deliveries),
@@ -626,8 +663,33 @@ async function kimiOutEvidence(
 /** D2 check 1: the tools that change files. A review hand's own session may not call them. */
 const EDITING_TOOLS: Record<string, true> = { edit: true, write: true, ast_edit: true, notebook: true };
 
-/** A dispatch token (`dt-…`) or group id (`dg-…` one hand, `fg-…` a fan-out): unique per process and across restarts. */
-const newToken = (prefix: "dt" | "dg" | "fg") => `${prefix}-${Date.now().toString(36)}${crypto.randomUUID().replace(/-/g, "").slice(0, 8)}`;
+/** A dispatch token (`dt-…`) or group id (`dg-…` one hand, `fg-…` a fan-out, `pg-…` a three-lab panel): unique per process and across restarts. */
+const newToken = (prefix: "dt" | "dg" | "fg" | "pg") => `${prefix}-${Date.now().toString(36)}${crypto.randomUUID().replace(/-/g, "").slice(0, 8)}`;
+
+/** While `plan: first` stands on the workload (surface/src/launch.ts `planFirst`), whether `sliceId` is its plan slice (`planSlice`). */
+function isPlanSlice(ledger: PanelLedger, workloadId: string, sliceId: string): boolean {
+	const entries = ledger.entries(workloadId);
+	const control = controlEntries(entries, holdersOf(entries, ledger.workload(workloadId)?.holder ?? null));
+	return planFirst(control) !== null && planSlice(ledger.slices(workloadId))?.id === sliceId;
+}
+
+/**
+ * A panel item's plan, made at classification (PLAN wl-mv5m7qvgkxhpj4 § 3.4): `panel` — its group
+ * id and directory, the labs with a usable entry (members) and the ones without (a `panel-leg: …
+ * missing` line at publish, no substitute); its run is ingested once every item of the call has
+ * passed its checks (`ingested`). `panel-synth` — the group, the lab it is pinned to, and its inputs.
+ */
+type PanelPlan =
+	| {
+			kind: "panel";
+			run: string;
+			pg: string;
+			pdir: string;
+			members: Lab[];
+			missing: { lab: Lab; reason: string }[];
+			ingested: { inputs: Record<string, string>; mode: PanelMode; schema: unknown; tasks: Record<Lab, string> } | null;
+	  }
+	| { kind: "panel-synth"; run: string; pg: string; pdir: string; lab: Lab; builderLab: boolean; task: string; schema: unknown };
 
 /** D5 [R6]: a review's effective stakes, the higher of the brief's and the workload row's. */
 function effectiveStakes(brief: Stakes | null, workload: Stakes | null): Stakes | null {
@@ -1450,6 +1512,263 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		roundSettled(member.workloadId, member.sliceId, member.group, log, null);
 	}
 
+	// ---- Three-lab panels (PLAN wl-mv5m7qvgkxhpj4 § 3.4; classifier/src/panel.ts) -----------------
+	// A panel hand is a review (`hand-spawn: … review yes group pg-…`), but it is no review round: it
+	// writes no `review-round:`, never parks, and no fan-out tracks it. Its end is its `panel-leg:` /
+	// `panel-synth:` line, and after every such line its group is evaluated (`sweepPanelsOf`).
+
+	/** Evaluate every open panel group of `workloadId` now (panel.ts `sweepPanels`: timeouts, publication, a settled synthesis whose publication was cut off); each thing it did is logged. */
+	function sweepPanelsOf(workloadId: string, log: (line: string) => void): void {
+		try {
+			for (const line of sweepPanels(deps.ledger(), { workloadId, by: deps.laneId })) log(`agent-system-2 classifier: panel ${line}`);
+		} catch (error) {
+			log(`agent-system-2 classifier: the panels of workload ${workloadId} could not be evaluated (${message(error)})`);
+		}
+	}
+
+	/** `legHeld` / `synthHeld` for a panel hand at its spawn, read from the ledger (so it holds across instances). */
+	function panelHeld(ledger: PanelLedger, hand: Pick<Pending, "workloadId" | "group" | "token">, panel: PanelRole): string | null {
+		const entries = ledger.entries(hand.workloadId);
+		const instructions = ledger.instructions(hand.workloadId);
+		return panel.role === "leg"
+			? legHeld(entries, instructions, ledger.workload(hand.workloadId)?.stakes ?? "normal", hand.workloadId, hand.group, panel.lab)
+			: synthHeld(entries, instructions, hand.workloadId, hand.group, hand.token);
+	}
+
+	/**
+	 * A panel hand that ends with no output to judge (refused or held at its spawn, dropped before it,
+	 * its routing row unwritten): a leg is `missing <reason>`, a synthesis attempt `failed <reason>`
+	 * (one refused, held or dropped before it ran does not count toward its two attempts). A line the
+	 * hand already has stands. Then its group is evaluated.
+	 */
+	function panelEnded(hand: Pick<Pending, "workloadId" | "group" | "token">, panel: PanelRole, reason: string, log: (line: string) => void): void {
+		try {
+			const ledger = deps.ledger();
+			const at = { workloadId: hand.workloadId, by: deps.laneId };
+			ledger.write(() =>
+				panel.role === "leg"
+					? writeLeg(ledger, at, hand.group, panel.lab, { status: "missing", reason })
+					: writeSynthEnd(ledger, at, hand.group, hand.token, { status: "failed", reason }),
+			);
+		} catch (error) {
+			log(`agent-system-2 classifier: panel ${hand.group}'s ${panel.role === "leg" ? `${panel.lab} leg` : `synthesis ${hand.token}`} could not be recorded ${reason} (${message(error)})`);
+		}
+		sweepPanelsOf(hand.workloadId, log);
+	}
+
+	/** What a settled panel hand ended as, judged before the settle transaction (panel.ts `legLine` / `synthReply`). */
+	type PanelEnd = { leg: LegLine } | { void: string } | { failed: string } | { reply: string | null };
+
+	/**
+	 * A settled panel hand's end: `withheld` is why its verdict withheld the output (no model answered,
+	 * off its row, it changed the work), which makes a leg missing and a synthesis attempt failed; else
+	 * a leg is audited, read, bound to `delivered` (what reached the lane for it) and validated (a
+	 * tampered input voids the run), a synthesis hand audited and its reply read.
+	 */
+	function panelEnd(hand: Pick<Pending, "workloadId" | "group">, panel: PanelRole, root: string, agentId: string, withheld: string | null, delivered: string | null): PanelEnd {
+		try {
+			const ledger = deps.ledger();
+			const state = panelGroups(ledger.entries(hand.workloadId)).get(hand.group);
+			if (!state) return panel.role === "leg" ? { leg: { status: "missing", reason: "no-panel-group" } } : { failed: "no-panel-group" };
+			const lanes = join(dirname(ledger.path), "lanes");
+			if (panel.role === "leg") {
+				const line = legLine(state, panel.lab, { root, agentId }, lanes, withheld, delivered);
+				return "void" in line ? line : { leg: line };
+			}
+			if (withheld) return { failed: withheld };
+			const reply = synthReply(state, { root, agentId }, lanes);
+			return "failed" in reply ? reply : { reply: reply.text };
+		} catch (error) {
+			const reason = `ledger-unreadable ${message(error)}`;
+			return panel.role === "leg" ? { leg: { status: "missing", reason } } : { failed: reason };
+		}
+	}
+
+	/**
+	 * A panel hand's end, inside the transaction that writes its routing row: its leg line (a void
+	 * run writes `panel-run: … void` and the leg `missing run-void`) or its synthesis attempt's
+	 * failure. A good synthesis reply is published after the transaction (`panelSettled`). Returns the
+	 * status already recorded when the hand has a line (a timeout came first: this result is late).
+	 */
+	function writePanelEnd(ledger: PanelLedger, hand: Pick<Pending, "workloadId" | "group" | "token">, panel: PanelRole, end: PanelEnd): string | null {
+		const at = { workloadId: hand.workloadId, by: deps.laneId };
+		// A reply is published after the transaction, unless its attempt already ended (a timeout): then it is late.
+		if ("reply" in end) return panelGroups(ledger.entries(hand.workloadId)).get(hand.group)?.synths.get(hand.token)?.end?.status ?? null;
+		if ("failed" in end) return writeSynthEnd(ledger, at, hand.group, hand.token, { status: "failed", reason: end.failed })?.status ?? null;
+		if ("void" in end) voidRun(ledger, at, hand.group, end.void);
+		if (panel.role !== "leg") return null;
+		return writeLeg(ledger, at, hand.group, panel.lab, "void" in end ? { status: "missing", reason: "run-void" } : end.leg)?.status ?? null;
+	}
+
+	/**
+	 * After a panel hand's settle transaction: a good synthesis reply is published (`finishSynth`),
+	 * a late result is discarded, and the group is evaluated. Returns the verdict's refusal: a leg
+	 * that did not land, or a synthesis that did not, keeps its output from the lane (the panel's
+	 * record is `<pdir>/out/`, not the hand's reply).
+	 */
+	function panelSettled(
+		hand: Pick<Pending, "workloadId" | "group" | "token">,
+		panel: PanelRole,
+		end: PanelEnd,
+		late: string | null,
+		refusal: string | null,
+		agentId: string,
+		log: (line: string) => void,
+	): string | null {
+		const who = panel.role === "leg" ? `panel ${hand.group}'s ${panel.lab} leg ${agentId}` : `panel ${hand.group}'s synthesis ${agentId}`;
+		const add = (why: string) => {
+			refusal = `${refusal ? `${refusal}; ` : ""}${who}: ${why}`;
+		};
+		if (late) {
+			log(`agent-system-2 classifier: ${who} settled after its line was written (${late}); its late result is discarded`);
+			add(`it was already recorded ${late}; its late result is discarded`);
+		} else if ("leg" in end && end.leg.status !== "landed") {
+			add(`${end.leg.status} (${end.leg.reason}); its output is not part of the panel`);
+		} else if ("void" in end) {
+			add(`the panel run is void (${end.void})`);
+		} else if ("failed" in end) {
+			add(`failed (${end.failed})`);
+		} else if ("reply" in end) {
+			try {
+				const done = finishSynth(deps.ledger(), { workloadId: hand.workloadId, by: deps.laneId }, hand.group, hand.token, panel, end.reply);
+				if ("void" in done) add(`the panel run is void (${done.void})`);
+				else if (done.status === "failed") add(`failed (${done.reason})`);
+			} catch (error) {
+				add(`its report could not be published (${message(error)})`);
+			}
+		}
+		sweepPanelsOf(hand.workloadId, log);
+		return refusal;
+	}
+
+	/**
+	 * Recovery for a panel hand this instance holds no state on (its process was lost): its role
+	 * rebuilt from its group's `panel-group:` members, else it is the synthesis hand pinned to its
+	 * spawn row's lab; then judged as a live settle would, on what was `delivered` for it, unless it
+	 * already has a line.
+	 */
+	function panelRecovered(
+		workloadId: string,
+		spawn: { token: string; group: string; row: readonly string[] },
+		root: string,
+		agentId: string,
+		verdict: Verdict,
+		delivered: string | null,
+		log: (line: string) => void,
+	): void {
+		const ledger = deps.ledger();
+		const state = panelGroups(ledger.entries(workloadId)).get(spawn.group);
+		const lab = state ? (roleOf(state, spawn.token)?.lab ?? labOf(spawn.row[0] ?? "")) : null;
+		if (!state || !lab) return;
+		const panel: PanelRole = roleOf(state, spawn.token) ?? { group: spawn.group, pdir: state.group.pdir, lab, role: "synth" };
+		if (panel.role === "leg" ? state.legs.has(lab) : state.synths.get(spawn.token)?.end) return; // already judged
+		const withheld =
+			verdict.refusal === null
+				? null
+				: verdict.outcome === "refused-model-unknown"
+					? "models-unknown"
+					: verdict.outcome === "ran"
+						? "withheld changed-work"
+						: `withheld ${verdict.outcome}`;
+		const hand = { workloadId, group: spawn.group, token: spawn.token };
+		const end = panelEnd(hand, panel, root, agentId, withheld, delivered);
+		const late = ledger.write(() => writePanelEnd(ledger, hand, panel, end));
+		verdict.refusal = panelSettled(hand, panel, end, late, verdict.refusal, agentId, log);
+	}
+
+	/**
+	 * The plan of a `panel:` / `panel-synth:` review item (PLAN wl-mv5m7qvgkxhpj4 § 3.4), or why it is
+	 * refused. `panel:` — a new run (one group per run), the slice not stopped and under its panel bound
+	 * (the review round limit), each lab's usable entries read once: a lab with none is `missing`, never
+	 * substituted. `panel-synth:` — the run's group swept first (timeouts, publication), published,
+	 * not void, no other synthesis running, under two failures; `out/` and the synthesis inputs
+	 * re-hashed (a mismatch voids the run); pinned to the first usable non-builder lab. `live` throws
+	 * when the call was retired during an await; `runs` holds the runs this call already named.
+	 */
+	async function planPanel(
+		c: { index: number; sliceId: string; workloadId: string; routing: Pending["routing"]; item: TaskItem },
+		field: PanelField,
+		ctx: ExtensionContext,
+		waiting: () => { sliceId: string; where: string }[],
+		live: () => void,
+		runs: Set<string>,
+		log: (line: string) => void,
+	): Promise<PanelPlan | string> {
+		const ledger = deps.ledger();
+		let run: string;
+		try {
+			run = realpathSync(field.run);
+		} catch (error) {
+			return `the panel run ${field.run} cannot be read (${message(error)})`;
+		}
+		if (runs.has(run)) return `the panel run ${run} is named twice in this call`;
+		runs.add(run);
+		const names = field.field === "panel" ? LABS.map(lab => `${c.sliceId}--${lab}`) : [`${c.sliceId}--synth`];
+		for (const name of names) {
+			if (!OMP_AGENT_ID.test(name)) return `\`${c.sliceId}\` is too long for its panel hand name \`${name}\` (at most 48 characters, an OMP agent id); use a shorter slice id`;
+			const conflict = spawnKeyConflict(name, waiting(), "pending ");
+			if (conflict) return conflict;
+		}
+		// Every panel hand is a review: it plans on `reviewRow` (Jo, in-mv5qfm8910ycjk). The legs and the
+		// synthesis lab are read with the refusals and the quota headroom the spawn applies (PLAN
+		// wl-mv71x5rwdu7eo0 § 3), so a lab the spawn would refuse is not picked when another can run.
+		const row = reviewRow(deps.tierTable(), c.routing.tier);
+		const disabled = new Set(await deps.disabledProviders(ctx));
+		live();
+		const now = clock();
+		const registry = ctx.modelRegistry as unknown as ModelAvailability;
+		const { usable, why } = await usableRow(row, registry, disabled, refusedProviders(ledger.entries(c.workloadId), now), null, headroom({ now }));
+		live();
+		const at = { workloadId: c.workloadId, by: deps.laneId };
+		if (field.field === "panel") {
+			const entries = ledger.entries(c.workloadId);
+			const existing = groupOfRun(entries, run);
+			if (existing) return `the panel run ${run} was already dispatched as ${existing.pg}; prepare a new run (one group per run)`;
+			const held = panelDispatchHeld(entries, ledger.instructions(c.workloadId), ledger.workload(c.workloadId)?.stakes ?? "normal", c.workloadId, c.sliceId);
+			if (held) return held;
+			const pins = LABS.map(lab => ({ lab, ...panelPin({ row, usable, lab, skipped: why }) }));
+			const members = pins.filter(p => p.models.length > 0).map(p => p.lab);
+			if (members.length === 0) return `no lab can run a panel member now (${pins.flatMap(p => p.reasons).join(", ")}); dispatch the panel again later`;
+			const pg = newToken("pg");
+			const missing = pins.filter(p => p.models.length === 0).map(p => ({ lab: p.lab, reason: `no-usable-model ${p.reasons.join(", ")}` }));
+			return { kind: "panel", run, pg, pdir: panelDir(ledger.path, c.workloadId, pg), members, missing, ingested: null };
+		}
+		sweepPanelsOf(c.workloadId, log);
+		const entries = ledger.entries(c.workloadId);
+		const state = groupOfRun(entries, run);
+		if (!state) return `the panel run ${run} was never dispatched as a panel (no panel-group entry names it); dispatch its panel first`;
+		if (state.group.slice !== c.sliceId) return `the panel run ${run} is ${state.pg} of slice ${state.group.slice}, not ${c.sliceId}`;
+		const held = synthHeld(entries, ledger.instructions(c.workloadId), c.workloadId, state.pg, null);
+		if (held) return held;
+		const bad = verifyFiles(state.group.pdir, state.published.out!);
+		if (bad) return `panel ${state.pg} is void (${voidRun(ledger, at, state.pg, `hash ${bad}`)}); run a new panel`;
+		let manifest: Manifest;
+		let schema: unknown;
+		try {
+			manifest = groupManifest(state.group);
+			const badIn = verifyFiles(join(state.group.pdir, "in"), state.group.inputs, [manifest.synthPrompt, manifest.synthSchema, ...manifest.synthInputs]);
+			if (badIn) return `panel ${state.pg} is void (${voidRun(ledger, at, state.pg, `hash in/${badIn}`)}); run a new panel`;
+			schema = JSON.parse(readNoFollow(join(state.group.pdir, "in", manifest.synthSchema)).toString("utf8"));
+		} catch (error) {
+			return `panel ${state.pg} is void (${voidRun(ledger, at, state.pg, message(error))}); run a new panel`;
+		}
+		const pick = synthLab({ row, usable, builders: buildersOf(c.workloadId), skipped: why });
+		if ("reasons" in pick) return `no lab can run panel ${state.pg}'s synthesis now (${pick.reasons.join(", ")}); dispatch it again later`;
+		const task = synthTask(withoutPanelLines(c.item.task ?? ""), state.group.pdir, manifest, landedLabs(state), pick.lab, pick.builderLab);
+		return { kind: "panel-synth", run, pg: state.pg, pdir: state.group.pdir, lab: pick.lab, builderLab: pick.builderLab, task, schema };
+	}
+
+	/** Ingest a `panel` plan's run into its directory and make its members' tasks and schema; throws with the reason. */
+	function ingestPanel(plan: Extract<PanelPlan, { kind: "panel" }>, c: { sliceId: string; workloadId: string; item: TaskItem }): void {
+		const ingested = ingestRun(plan.run, c.workloadId, c.sliceId, plan.pdir);
+		const manifest = ingested.manifest;
+		const schema: unknown = JSON.parse(readNoFollow(join(plan.pdir, "in", manifest.legSchema)).toString("utf8"));
+		const text = withoutPanelLines(c.item.task ?? "");
+		const tasks = { anthropic: "", openai: "", kimi: "" };
+		for (const lab of LABS) tasks[lab] = memberTask(text, plan.pdir, manifest, lab);
+		plan.ingested = { inputs: ingested.inputs, mode: manifest.mode, schema, tasks };
+	}
+
 	/**
 	 * The one verdict on `agentId`'s hand: every model that answered on it (plus the model its task
 	 * result reports, when there is one) against its row allowlist, and for a review hand the
@@ -1492,12 +1811,26 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		if (changed) {
 			refusal = `${refusal ? `${refusal}; ` : ""}${agentId}: the review changed the work: ${changed}. A review hand does not change the work; the lane dispatches the fix as a change slice`;
 		}
-		const findings = hand.review ? handFindings(delivered, hand.root, agentId) : UNKNOWN;
+		const findings = hand.review && !hand.panel ? handFindings(delivered, hand.root, agentId) : UNKNOWN;
 		const roundVerdict: ReviewVerdict = failedDispatch ? "failed-dispatch" : refusal ? "withheld" : "accepted";
 		const now = clock();
 		const providerRefused = new Map(
 			[...errors.filter(e => isKimiQuotaRefusal(e.provider, e.status, e.error, now)), ...errors.filter(e => e.status === 401 || e.status === 403)].map(e => [e.provider, e.status!] as const),
 		);
+		// A panel hand is judged before the transaction (its session audited, its result file read, its
+		// inputs re-hashed); its line lands in the transaction with its routing row.
+		const panelWithheld = failedDispatch
+			? "failed-dispatch"
+			: outcome === "refused-model-unknown"
+				? "no-model-answered"
+				: outcome === "refused-out-of-row"
+					? `withheld out-of-row ${off.join(", ")}`
+					: changed
+						? "withheld changed-work"
+						: null;
+		const end = hand.panel ? panelEnd(hand, hand.panel, hand.root, agentId, panelWithheld, delivered) : null;
+		let late: string | null = null;
+		let written = true;
 		try {
 			const ledger = deps.ledger();
 			const entry = (body: string) => ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body });
@@ -1511,14 +1844,19 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				}
 				if (failedDispatch) for (const [provider, status] of providerRefused) entry(providerRefusedBody(provider, status, hand.token));
 				entry(handSettledBody(hand.token, routingId));
-				if (hand.review) writeRound(ledger, hand, roundVerdict, findings);
+				if (hand.panel) late = writePanelEnd(ledger, hand, hand.panel, end!);
+				else if (hand.review) writeRound(ledger, hand, roundVerdict, findings);
 			});
 		} catch (error) {
 			// The row is the record of what ran (SPEC-2.0.md § A1.3); output with no record is refused.
 			refusal = `${refusal ? `${refusal}; ` : ""}${agentId}: its routing row could not be written (${message(error)})`;
-			if (hand.review) recordRound(hand, failedDispatch ? "failed-dispatch" : "withheld", findings, log); // its round still ends
+			written = false;
+			if (hand.panel) panelEnded(hand, hand.panel, "routing-unwritten", log);
+			else if (hand.review) recordRound(hand, failedDispatch ? "failed-dispatch" : "withheld", findings, log); // its round still ends
 		}
-		if (hand.review && hand.group.startsWith("fg-")) {
+		if (hand.panel) {
+			if (written) refusal = panelSettled(hand, hand.panel, end!, late, refusal, agentId, log);
+		} else if (hand.review && hand.group.startsWith("fg-")) {
 			memberEnded(hand, `${agentId} ${failedDispatch ? "failed to dispatch" : refusal ? "withheld" : "accepted"}`, true, log, null);
 		} else if (hand.review) {
 			if (outcome === "refused-model-unknown" && !failedDispatch) {
@@ -1538,6 +1876,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			}
 			roundSettled(hand.workloadId, hand.sliceId, hand.group, log, null);
 		}
+		// Panel timeouts have no timer: they are evaluated at every settle (a panel hand's own, in `panelSettled`).
+		if (!hand.panel) sweepPanelsOf(hand.workloadId, log);
 		const verdict = { outcome, refusal };
 		remember(key, hand.dispatchedAt, verdict, true);
 		return verdict;
@@ -1551,6 +1891,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * findings, all by this lane, in one transaction. Unlike a hand lost with another lane's process
 	 * (`roundSettled`, `handLost`: `failed-dispatch` by CLASSIFIER_BY, no round), the withheld member
 	 * stays in its round, which `countRounds` reads as unread unless another member's known block fails it (D9).
+	 * A panel hand is no round member: it ends through its panel instead (a leg `missing`, a synthesis
+	 * attempt `failed`, reason `withheld cancelled-no-output`), with no `review-round:`.
 	 * No fingerprint check, no builder mark, no park. Its verdict is kept, so text a later snapshot or
 	 * delivery shows for it is withheld and writes nothing (`recover`).
 	 */
@@ -1560,19 +1902,27 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		answered.delete(key);
 		failedTurns.delete(key);
 		let refusal = `${agentId}: ${why}, so it settled as lost (refused-model-unknown) and any output shown for it later is withheld`;
+		const end = hand.panel ? panelEnd(hand, hand.panel, hand.root, agentId, "withheld cancelled-no-output", null) : null;
+		let late: string | null = null;
+		let written = true;
 		try {
 			const ledger = deps.ledger();
 			ledger.write(() => {
 				const routingId = recordRouting(hand, hand.models, "refused-model-unknown", null, agentId);
 				ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body: handSettledBody(hand.token, routingId) });
-				if (hand.review) writeRound(ledger, hand, "withheld", UNKNOWN);
+				if (hand.panel) late = writePanelEnd(ledger, hand, hand.panel, end!);
+				else if (hand.review) writeRound(ledger, hand, "withheld", UNKNOWN);
 			});
 		} catch (error) {
 			refusal = `${refusal}; ${agentId}: its routing row could not be written (${message(error)})`;
-			if (hand.review) recordRound(hand, "withheld", UNKNOWN, log); // its round still ends
+			written = false;
+			if (hand.panel) panelEnded(hand, hand.panel, "routing-unwritten", log);
+			else if (hand.review) recordRound(hand, "withheld", UNKNOWN, log); // its round still ends
 		}
 		log(`agent-system-2 classifier: ${refusal}`);
-		if (hand.review && hand.group.startsWith("fg-")) memberEnded(hand, `${agentId} ${why}`, true, log, null);
+		if (hand.panel) {
+			if (written) refusal = panelSettled(hand, hand.panel, end!, late, refusal, agentId, log) ?? refusal;
+		} else if (hand.review && hand.group.startsWith("fg-")) memberEnded(hand, `${agentId} ${why}`, true, log, null);
 		else if (hand.review) roundSettled(hand.workloadId, hand.sliceId, hand.group, log, null);
 		const verdict: Verdict = { outcome: "refused-model-unknown", refusal };
 		remember(key, hand.dispatchedAt, verdict, true);
@@ -1644,7 +1994,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			const spawn = handSpawns(entries).findLast(s =>
 				token ? s.token === token : s.root === root && s.spawnKey !== null && spawnKeyNames(agentId, s.spawnKey) && since(s.token) <= at,
 			);
-			if (workloadId && spawn?.review && spawn.sliceId) {
+			if (workloadId && spawn?.review && spawn.group.startsWith("pg-")) {
+				// A panel hand: its line, never a review round (classifier/src/panel.ts).
+				panelRecovered(workloadId, spawn, root, agentId, verdict, delivered, log);
+			} else if (workloadId && spawn?.review && spawn.sliceId) {
 				const sliceId = spawn.sliceId;
 				if (spawn.group.startsWith("fg-")) void checkFanOut(spawn.group, workloadId, sliceId, log);
 				const member = { workloadId, sliceId, token: spawn.token, group: spawn.group };
@@ -1745,7 +2098,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		 */
 		const dropPending = (i: number, why: string) => {
 			const [entry] = pending.splice(i, 1);
-			if (entry?.review) memberEnded(entry, `${entry.dispatchName} ${why} before its hand spawned`, false, log, "dropped");
+			if (entry?.panel) panelEnded(entry, entry.panel, `dropped ${why} before its hand spawned`, log);
+			else if (entry?.review) memberEnded(entry, `${entry.dispatchName} ${why} before its hand spawned`, false, log, "dropped");
 		};
 		/**
 		 * An async member whose job ended before its hand spawned: nothing will spawn for its entry, so
@@ -1816,6 +2170,19 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						`agent-system-2 classifier refused ${event.toolName}: a review hand does not change the work; the lane dispatches the fix as a change slice. Report the change as a finding instead.`,
 					);
 				}
+				// PLAN wl-mv5m7qvgkxhpj4 § 3.1: in every session, nothing but the classifier writes a panel's
+				// directory. Tamper evidence is the ledger's hashes; this refuses the plain attempt.
+				let named: string | null;
+				try {
+					named = namesPanelsDir(event.input, dirname(deps.ledger().path), ctx.cwd);
+				} catch {
+					named = JSON.stringify(event.input ?? null).match(/[^"\s]*\/lanes\/[^/"\s]+\/panels(?:\/[^"\s]*)?/)?.[0] ?? null;
+				}
+				if (named) {
+					return refuse(
+						`agent-system-2 classifier refused ${event.toolName}: ${named} is in a panel directory (<ledger dir>/lanes/<workload>/panels/), which only the classifier writes; its files are hashed into the ledger`,
+					);
+				}
 				return undefined;
 			}
 			if (event.toolName !== "task") return undefined;
@@ -1843,7 +2210,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			// Every routing lands on its slice's ledger row (ruling 2026-09-28), so each tier item
 			// names its slice; check that before spending a judge call.
 			const problems: string[] = [];
-			const targets: { item: TaskItem; index: number; sliceId: string; workloadId: string; workloadStakes: Stakes | null }[] = [];
+			const targets: { item: TaskItem; index: number; sliceId: string; workloadId: string; workloadStakes: Stakes | null; panel: PanelField | null }[] = [];
 			const bound = deps.boundWorkload();
 			// A fan-out member waits under its slice (one dispatch per slice) and its own dispatch name.
 			const waiting = () => [
@@ -1891,7 +2258,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						problems.push(`${at}: ${conflict}`);
 						continue;
 					}
-					targets.push({ item, index, sliceId, workloadId, workloadStakes: ledger.workload(workloadId)?.stakes ?? null });
+					// PLAN wl-mv5m7qvgkxhpj4 § 3.4 rule 7: a panel never stands in for the plan's own cross-lab review.
+					const panel = briefPanel(item.task, context);
+					if (panel && isPlanSlice(ledger, workloadId, sliceId)) {
+						problems.push(`${at}: ${sliceId} is the plan slice of workload ${workloadId}; a panel never stands in for the plan's cross-lab review, so review the plan with an ordinary review hand`);
+						continue;
+					}
+					targets.push({ item, index, sliceId, workloadId, workloadStakes: ledger.workload(workloadId)?.stakes ?? null, panel });
 				}
 			} catch (error) {
 				return fail(`the ledger could not be read (${message(error)})`);
@@ -1917,7 +2290,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const judge = await deps.judge(ctx);
 				if (!attempt.live) throw retired();
 				const classified = await Promise.all(
-					targets.map(async ({ item, index, sliceId, workloadId, workloadStakes }) => {
+					targets.map(async ({ item, index, sliceId, workloadId, workloadStakes, panel }) => {
 						const classification = await classify(item.task ?? "", judge, deps.question, attempt.abort.signal);
 						if (!attempt.live) throw retired();
 						// S4 / R2-S1: a threshold measured on one judge says nothing about another's confidences.
@@ -1940,6 +2313,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 							sliceId,
 							workloadId,
 							review,
+							panel,
 							routing: {
 								...routing,
 								probabilities: classification.probabilities as Record<string, number>,
@@ -1949,6 +2323,15 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					}),
 				);
 				if (!attempt.live) throw retired();
+
+				// PLAN wl-mv5m7qvgkxhpj4 § 3.4 rule 6: a panel is a review; anything else naming a panel run is refused.
+				for (const c of classified) {
+					if (c.panel && !c.review) {
+						return fail(
+							`task ${c.index + 1} (${c.sliceId}) names a panel run (${c.panel.field}: ${c.panel.run}) but was classified ${c.routing.kind}, not a review; a panel runs only as a review dispatch`,
+						);
+					}
+				}
 
 				// D3 ordering: a review runs after the work it reviews has settled.
 				for (const review of classified.filter(c => c.review)) {
@@ -1973,8 +2356,20 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				// whose unspawned members are known dropped is closed first).
 				// D6: a slice parked on its review question is not reviewed again until Jo answers.
 				// D5: a production review is expanded into one item per other available lab.
-				const plans = new Map<number, ReviewPlan | "granted" | "kimi-out">();
+				// A panel item (PLAN wl-mv5m7qvgkxhpj4 § 3.4) is no review round: it takes its own checks
+				// (`planPanel`), not D9/D10/D6/D5's.
+				const plans = new Map<number, ReviewPlan | "granted" | "kimi-out" | PanelPlan>();
+				const runs = new Set<string>();
 				for (const c of classified.filter(c => c.review)) {
+					if (c.panel) {
+						const plan = await planPanel(c, c.panel, ctx, waiting, () => {
+							if (!attempt.live) throw retired();
+						}, runs, log);
+						if (!attempt.live) throw retired();
+						if (typeof plan === "string") return fail(`task ${c.index + 1}: ${plan}`);
+						plans.set(c.index, plan);
+						continue;
+					}
 					const ledger = deps.ledger();
 					for (const r of countRounds(ledger.entries(c.workloadId), c.sliceId).rounds) {
 						if (!r.complete) roundSettled(c.workloadId, c.sliceId, r.group, log, c.routing);
@@ -2037,6 +2432,16 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						return fail(`task ${c.index + 1}: no lab other than the builder's can review ${c.sliceId}; ${parkedLine(c.sliceId, park(c.workloadId, c.sliceId, plan.reasons, null))}`);
 					}
 				}
+				// Every item passed: now each panel's run is ingested (its directory is new; nothing reads the run again).
+				for (const c of classified) {
+					const plan = plans.get(c.index);
+					if (typeof plan !== "object" || plan.kind !== "panel") continue;
+					try {
+						ingestPanel(plan, c);
+					} catch (error) {
+						return fail(`task ${c.index + 1}: the panel run ${plan.run} cannot be ingested: ${message(error)}`);
+					}
+				}
 
 				// Publish the whole call at once; its reservations become pending entries. Indices are the
 				// rewritten call's: what OMP's per-member progress reports. A production fan-out's whole
@@ -2048,6 +2453,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const published: Pending[] = [];
 				const revised: TaskItem[] = [];
 				const groups: FanOut[] = [];
+				/** A panel's ledger lines, written in the publish transaction after re-checking what another instance could have written. */
+				const panelLines: (() => void)[] = [];
 				const ledger = classified.some(c => c.review) ? deps.ledger() : null;
 				const publish = () => {
 					items.forEach((item, index) => {
@@ -2058,7 +2465,59 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						}
 						const plan = plans.get(index);
 						const loop = c.review ? reviewLoop(ledger!.entries(c.workloadId), c.sliceId) : null;
-						const base = { toolCallId: event.toolCallId, sliceId: c.sliceId, workloadId: c.workloadId, routing: c.routing, review: c.review, loop, dispatchedAt: Date.now() };
+						const base = { toolCallId: event.toolCallId, sliceId: c.sliceId, workloadId: c.workloadId, routing: c.routing, review: c.review, loop, dispatchedAt: Date.now(), panel: null };
+						if (typeof plan === "object" && plan.kind === "panel") {
+							const ingested = plan.ingested!;
+							const members: Record<Lab, string | null> = { anthropic: null, openai: null, kimi: null };
+							for (const lab of plan.members) {
+								const token = newToken("dt");
+								members[lab] = token;
+								revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--${lab}`, task: ingested.tasks[lab], outputSchema: ingested.schema });
+								published.push({
+									...base,
+									loop: null,
+									index: revised.length - 1,
+									dispatchName: `${c.sliceId}--${lab}`,
+									token,
+									group: plan.pg,
+									lab,
+									note: `panel ${plan.pg} (${plan.pdir}): ${ingested.mode} leg pinned to ${lab}`,
+									panel: { group: plan.pg, pdir: plan.pdir, lab, role: "leg" },
+								});
+							}
+							panelLines.push(() => {
+								const entries = ledger!.entries(c.workloadId);
+								const existing = groupOfRun(entries, plan.run);
+								if (existing) throw new Error(`task ${c.index + 1}: the panel run ${plan.run} was dispatched as ${existing.pg} meanwhile`);
+								const held = panelDispatchHeld(entries, ledger!.instructions(c.workloadId), ledger!.workload(c.workloadId)?.stakes ?? "normal", c.workloadId, c.sliceId);
+								if (held) throw new Error(`task ${c.index + 1}: ${held}`);
+								const entry = (body: string) => ledger!.recordEntry({ by: deps.laneId, workloadId: c.workloadId, sliceId: c.sliceId, kind: "assumption", body });
+								entry(panelGroupBody(plan.pg, { run: plan.run, pdir: plan.pdir, slice: c.sliceId, mode: ingested.mode, inputs: ingested.inputs, members }));
+								for (const m of plan.missing) entry(panelLegBody(plan.pg, m.lab, { status: "missing", reason: m.reason }));
+							});
+							return;
+						}
+						if (typeof plan === "object" && plan.kind === "panel-synth") {
+							const token = newToken("dt");
+							revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--synth`, task: plan.task, outputSchema: plan.schema });
+							published.push({
+								...base,
+								loop: null,
+								index: revised.length - 1,
+								dispatchName: `${c.sliceId}--synth`,
+								token,
+								group: plan.pg,
+								lab: plan.lab,
+								note: `panel ${plan.pg} (${plan.pdir}): synthesis pinned to ${plan.lab}${plan.builderLab ? " (a builder lab: no other lab was usable)" : ""}`,
+								panel: { group: plan.pg, pdir: plan.pdir, lab: plan.lab, role: "synth", builderLab: plan.builderLab },
+							});
+							panelLines.push(() => {
+								const held = synthHeld(ledger!.entries(c.workloadId), ledger!.instructions(c.workloadId), c.workloadId, plan.pg, null);
+								if (held) throw new Error(`task ${c.index + 1}: ${held}`);
+								ledger!.recordEntry({ by: deps.laneId, workloadId: c.workloadId, sliceId: c.sliceId, kind: "assumption", body: panelSynthBody(plan.pg, token) });
+							});
+							return;
+						}
 						if (typeof plan === "object" && plan.kind === "fanout") {
 							const group = newToken("fg");
 							const members = plan.members.map(member => {
@@ -2083,12 +2542,15 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					for (const g of groups) {
 						ledger!.recordEntry({ by: deps.laneId, workloadId: g.workloadId, sliceId: g.sliceId, kind: "assumption", body: reviewGroupBody(g.sliceId, g.group, g.tokens) });
 					}
+					for (const write of panelLines) write();
 				};
 				if (ledger) ledger.write(publish);
 				else publish();
 				for (const g of groups) fanOuts.set(g.group, g);
 				pending.push(...published);
-				return { input: batch ? { ...input, tasks: revised } : revised.length === 1 ? revised[0]! : { context: "", tasks: revised } };
+				// A member's task carries no panel line, and neither does a batch's shared context.
+				const shared = batch && panelLines.length > 0 && typeof input.context === "string" ? { context: withoutPanelLines(input.context) } : {};
+				return { input: batch ? { ...input, ...shared, tasks: revised } : revised.length === 1 ? revised[0]! : { context: "", tasks: revised } };
 			} catch (error) {
 				// SPEC-2.0.md § A1.3: a dispatch the classifier could not route is refused, not sent on
 				// an unclassified guess. Nothing was published, so late answers have nowhere to land.
@@ -2108,7 +2570,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			let found: Pending | null = null;
 			/** A refused spawn is a fan-out member's terminal state (D5 [N2]). */
 			const refused = (reason: string) => {
-				if (found?.review) memberEnded(found, `${found.dispatchName} refused at spawn (${reason})`, true, log, "refused");
+				if (found?.panel) panelEnded(found, found.panel, `refused ${reason}`, log);
+				else if (found?.review) memberEnded(found, `${found.dispatchName} refused at spawn (${reason})`, true, log, "refused");
 				return refuse(reason);
 			};
 			// A throwing handler must not let the spawn through on the native row: every failure refuses.
@@ -2171,7 +2634,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					return reason;
 				};
 				// A review plans on `reviewRow` (Jo, in-mv5qfm8910ycjk); every other spawn on its tier row's
-				// entries of the lane's lab, read off the lane's current model at this spawn.
+				// entries of the lane's lab, read off the lane's current model at this spawn. A panel hand is a
+				// review.
 				const laneModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 				const build = found?.review ? null : buildRow(table, tier, laneModel);
 				if (build && "error" in build) return refuse(refusedRow(`agent-system-2 classifier: ${build.error}`));
@@ -2180,7 +2644,15 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const { usable, why, skipped, projected: out } = await usableRow(row, registry, disabled, providerRefused, spawnKey, room);
 				const pin = found?.lab ?? null;
 				projected = Object.entries(out).filter(([selector]) => pin === null || labOf(selector) === pin);
-				if (found?.review) {
+				if (found?.panel) {
+					// A panel hand: its group not void, its leg not already ended, the slice not stopped and the
+					// group within its bound; a synthesis attempt the only live one, under two failures (panel.ts).
+					const held = panelHeld(deps.ledger(), found, found.panel);
+					if (held) {
+						panelEnded(found, found.panel, `held ${held}`, log);
+						return refuse(`agent-system-2 classifier: ${held}`);
+					}
+				} else if (found?.review) {
 					// After the credential awaits, before planning (so a hold never parks): a review whose token
 					// another instance recorded terminal, a loop stopped since classification (D10), an open
 					// round-limit question (D9), the end of the loop it was published in (REVIEW-r3), or another
@@ -2209,7 +2681,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				): "recorded" | "spent" | "expired" | { held: string } => {
 					const ledger = deps.ledger();
 					return ledger.write(() => {
-						const held = hand.review ? reviewHeld(ledger, hand) : null;
+						const held = hand.panel ? panelHeld(ledger, hand, hand.panel) : hand.review ? reviewHeld(ledger, hand) : null;
 						if (held) return { held };
 						const entries = ledger.entries(hand.workloadId);
 						const entry = (body: string) => ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body });
@@ -2237,6 +2709,33 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				}
 				// Only a classified review reaches here, and a classified spawn has a session file (above).
 				if (!found || !root) throw new Error(`review spawn ${spawnKey ?? "(no spawn key)"} has no classification or no lane session file`);
+
+				// A panel hand (PLAN wl-mv5m7qvgkxhpj4 § 3.4 rule 1): pinned to its lab's entries alone, builder
+				// lab or not; with none usable it is refused (a leg `missing`, never substituted).
+				if (found.panel) {
+					const panel = found.panel;
+					const pin = panelPin({ row, usable, lab: panel.lab, skipped: why });
+					const role = panel.role === "leg" ? `${panel.lab} leg` : "synthesis";
+					if (pin.models.length === 0) {
+						const reason = refusedRow(`agent-system-2 classifier: no ${panel.lab} model can run panel ${found.group}'s ${role} at this spawn: ${pin.reasons.join(", ")}; no other lab is substituted`);
+						panelEnded(found, panel, `${panel.role === "leg" ? "no-usable-model" : "refused no-usable-model"} ${pin.reasons.join(", ")}`, log);
+						return refuse(reason);
+					}
+					const recorded = recordSpawn(found, pin.models, null, null);
+					if (recorded !== "recorded") {
+						const held = recorded === "spent" ? "its grant was spent" : recorded.held;
+						panelEnded(found, panel, `held ${held}`, log);
+						return refuse(`agent-system-2 classifier: ${held}`);
+					}
+					let before: Hand["before"];
+					try {
+						before = { digest: fingerprint(ctx.cwd) };
+					} catch (error) {
+						before = { error: message(error) }; // withheld at settle: fail closed
+					}
+					hands.push({ ...found, root, spawnKey, tier, models: pin.models, row: pin.allow, cwd: ctx.cwd, before });
+					return { model: pin.models, note: routingNote(found.routing, tier, pin.models, skipped, found.note ? [found.note] : []) };
+				}
 
 				// D4: a review runs only on labs outside the builders, recomputed now; a fan-out member only
 				// on its own lab. D6: a held same-lab grant appends the builder's entries, spent atomically
@@ -2465,6 +2964,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			}
 			if (drift.length === 0) return undefined;
 			return { isError: true, content: [{ type: "text" as const, text: withheld("task result", drift) }] };
+		});
+
+		// PLAN wl-mv5m7qvgkxhpj4 § 3.4 rule 2: panel timeouts have no timer; a session start (a lane
+		// resumed after its process was lost) evaluates its workload's open panels, as every settle does.
+		pi.on("session_start", () => {
+			const workloadId = deps.boundWorkload();
+			if (workloadId) sweepPanelsOf(workloadId, log);
 		});
 
 		// Triad row 4: a `task` call blocked by a later extension's `tool_call` handler never executes, so it

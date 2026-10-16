@@ -6,6 +6,8 @@ argument-hint: "<brief files, directory, or inline prose> [--draft path] [--cont
 
 # quorum — Cross-Provider Plan Generation
 
+From an as2 lane this mode runs as a panel (`quorum`, then `quorum-refute`), never through `scripts/`: see [`../panel/panel.md`](../panel/panel.md).
+
 ## Overview
 
 One model planning is one lab's priors deciding what the plan looks like — subagents

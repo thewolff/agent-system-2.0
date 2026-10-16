@@ -564,3 +564,43 @@ export function reviewPlan(input: ReviewPlanInput): ReviewPlan {
 			: null;
 	return { kind: "single", models: others, allow: allowOthers, excluded, sameLab: false, short };
 }
+
+// ---- Three-lab panels (PLAN wl-mv5m7qvgkxhpj4 § 3.4 rule 1; classifier/src/panel.ts) ---------
+
+/**
+ * A panel member's spawn row: only `lab`'s entries, builder lab or not. A panel is not a gate review,
+ * so the builder exclusion and the D5 fan-out do not apply to it; the pin alone keeps every other
+ * lab off the member, so no other lab is ever substituted. `reasons` say why the lab has no usable
+ * entry (empty when `models` is not).
+ */
+export function panelPin(input: { row: readonly string[]; usable: readonly string[]; lab: Lab; skipped?: Readonly<Record<string, string>> }): {
+	models: string[];
+	allow: string[];
+	reasons: string[];
+} {
+	const mine = input.row.filter(s => labOf(s) === input.lab);
+	const models = input.usable.filter(s => labOf(s) === input.lab);
+	const reasons =
+		mine.length === 0
+			? [`no ${input.lab} entry in the row`]
+			: models.length > 0
+				? []
+				: mine.map(s => `${s} (${input.skipped?.[s] ?? "not usable"})`);
+	return { models, allow: mine.map(modelIdentity), reasons };
+}
+
+/**
+ * The lab a panel's synthesis hand runs on: the first lab in row order with a usable entry that is
+ * not a builder; when there is none (every lab a builder, or the others down), the first usable
+ * builder lab, named as one (`builderLab`). Synthesis is not a gate review, so it never parks; with
+ * no usable lab at all it gets `reasons` and is dispatched again later.
+ */
+export function synthLab(input: { row: readonly string[]; usable: readonly string[]; builders: Builders; skipped?: Readonly<Record<string, string>> }):
+	| { lab: Lab; builderLab: boolean }
+	| { reasons: string[] } {
+	const labs = input.usable.flatMap(s => labOf(s) ?? []);
+	const other = labs.find(lab => !isBuilder(input.builders, lab));
+	if (other) return { lab: other, builderLab: false };
+	if (labs.length > 0) return { lab: labs[0]!, builderLab: true };
+	return { reasons: input.row.map(s => `${s} (${input.skipped?.[s] ?? "not usable"})`) };
+}

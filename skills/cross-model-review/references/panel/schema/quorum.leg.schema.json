@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "panel quorum leg — one plan as plan elements",
+  "description": "Output contract of one quorum panel leg. It carries references/quorum/prompts/plan.schema.json's plan with summary as a mode field and every step, risk, assumption and open question as one entry of items, tagged by kind, so each plan element gets its own id (<lab>-<n>, assigned by the classifier by position) and synthesis can account for every one. A field a kind does not use is the empty string (depends_on: the empty array).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "items"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "The approach in one short paragraph."
+    },
+    "items": {
+      "type": "array",
+      "description": "Steps first in execution order, then risks by severity, then assumptions, then open questions.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "title", "what", "where", "depends_on", "mitigation"],
+        "properties": {
+          "kind": { "type": "string", "enum": ["step", "risk", "assumption", "open_question"] },
+          "title": { "type": "string", "description": "step: short title for the step. risk: what breaks, lands out of order, or is hard to reverse. assumption: the fact relied on, or the ambiguity resolved by fiat. open_question: what must be answered." },
+          "what": { "type": "string", "description": "step: the change and how it is verified. Empty string for the other kinds." },
+          "where": { "type": "string", "description": "step: files, repos, or systems touched — from the grounding pack when one exists. open_question: by whom or from where it is answered. Empty string for the other kinds." },
+          "depends_on": {
+            "type": "array",
+            "description": "step: titles of prior steps this one needs. Empty for the other kinds and for a step that needs none.",
+            "items": { "type": "string" }
+          },
+          "mitigation": { "type": "string", "description": "risk: how the plan contains it. Empty string for the other kinds." }
+        }
+      }
+    }
+  }
+}

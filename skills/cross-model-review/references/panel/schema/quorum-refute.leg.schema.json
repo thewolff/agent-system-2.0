@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "panel quorum-refute leg — attacks on the other legs' plans",
+  "description": "Output contract of one quorum-refute panel leg: references/quorum/prompts/refute-plan.schema.json's critiques flattened into one items array, one entry per attack, each naming the plan it targets by payload label. A plan with nothing genuinely wrong simply has no entry. The classifier assigns item ids <lab>-<n> by position; provider labels reattach only at synthesis.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "description": "Every attack on every plan in the packet. Empty is a valid verdict — nothing genuinely wrong was found.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["target", "type", "where", "what", "basis"],
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Which plan this attack addresses, by payload label.",
+            "enum": ["plan-1", "plan-2"]
+          },
+          "type": {
+            "type": "string",
+            "enum": ["false_assumption", "omission", "break_point"]
+          },
+          "where": { "type": "string", "description": "The step or claim in the plan under attack." },
+          "what": { "type": "string", "description": "The failure: what does not hold, is missing, or breaks when executed as written." },
+          "basis": { "type": "string", "description": "The receipt: the brief line, pack fact, or plan step it rests on. 'Seems thin' is not a basis." }
+        }
+      }
+    }
+  }
+}

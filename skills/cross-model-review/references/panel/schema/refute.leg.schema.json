@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "panel refute leg — attacks on one existing plan",
+  "description": "Output contract of one refute panel leg: references/quorum/prompts/refute-plan.schema.json's critique of the single plan in the packet (PLAN 1) flattened into one items array, one entry per attack. The classifier assigns item ids <lab>-<n> by position.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "description": "Every attack on the plan. Empty is a valid verdict — nothing genuinely wrong was found.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["target", "type", "where", "what", "basis"],
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "The plan this attack addresses, by payload label: there is one plan in this mode.",
+            "enum": ["plan-1"]
+          },
+          "type": {
+            "type": "string",
+            "enum": ["false_assumption", "omission", "break_point"]
+          },
+          "where": { "type": "string", "description": "The step or claim in the plan under attack." },
+          "what": { "type": "string", "description": "The failure: what does not hold, is missing, or breaks when executed as written." },
+          "basis": { "type": "string", "description": "The receipt: the plan line or step it rests on. 'Seems thin' is not a basis." }
+        }
+      }
+    }
+  }
+}
