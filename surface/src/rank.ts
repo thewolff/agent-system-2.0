@@ -394,14 +394,18 @@ export function parseShown(body: string): Shown | null {
 	return { hash: m[1]!, by: m[2]!, goals: m[3]!, items };
 }
 
-/** `rank-override: <wl> input <in-id> shown <rank-shown entry id>`: Jo's "X first", a pin (D4). */
-export function formatOverride(o: { workloadId: string; input: string; shown: string }): string {
-	return `rank-override: ${o.workloadId} input ${o.input} shown ${o.shown}`;
+/**
+ * `rank-override: <wl> input <in-id> shown <rank-shown entry id> [pos <k>]`: Jo's "X first", a pin (D4). `pos` is the
+ * item's 1-based place in a ruled list (`first: [A, B, …]`, PLAN wl-mv8wzytml878b4 D1); a single `first` has none.
+ */
+export function formatOverride(o: { workloadId: string; input: string; shown: string; pos?: number }): string {
+	return `rank-override: ${o.workloadId} input ${o.input} shown ${o.shown}${o.pos === undefined ? "" : ` pos ${o.pos}`}`;
 }
-const OVERRIDE = /^rank-override: (wl-\S+) input (in-\S+) shown (\S+)$/;
-export function parseOverride(body: string): { workloadId: string; input: string; shown: string } | null {
+const OVERRIDE = /^rank-override: (wl-\S+) input (in-\S+) shown (\S+?)(?: pos ([1-9]\d*))?$/;
+export function parseOverride(body: string): { workloadId: string; input: string; shown: string; pos?: number } | null {
 	const m = OVERRIDE.exec(body.trim());
-	return m ? { workloadId: m[1]!, input: m[2]!, shown: m[3]! } : null;
+	if (!m) return null;
+	return m[4] === undefined ? { workloadId: m[1]!, input: m[2]!, shown: m[3]! } : { workloadId: m[1]!, input: m[2]!, shown: m[3]!, pos: Number(m[4]) };
 }
 
 /** `rank-unpin: <wl> input <in-id>`: Jo's "drop the pin on X" (D4). */
@@ -536,11 +540,17 @@ export interface Pin {
 	input: string;
 	/** The `rank-shown: … by pick` entry the override names. */
 	shown: string;
+	/** The item's place in its ruled list (`rank-override: … pos <k>`); absent on a single `first`. */
+	pos?: number;
 	entryId: string;
 	at: string;
 }
 
-/** Jo's live pins, newest first (D4): a `rank-override:` lives until its workload closes or a newer `rank-unpin:` names it. */
+/**
+ * Jo's live pins in rank order (D4; PLAN wl-mv8wzytml878b4 D1): a `rank-override:` lives until its workload closes or a
+ * newer `rank-unpin:` names it. One ruling is one input row: the newest ruling first, a ruled list by its `pos`, so a
+ * single `first` (no `pos`) sits above every older ruling and older single pins keep newest-first.
+ */
 export function livePins(ledger: Ledger): Pin[] {
 	const control = controlEntries(ledger.entries(STANDING_WORKLOAD_ID));
 	const decided = new Set<string>();
@@ -554,10 +564,13 @@ export function livePins(ledger: Ledger): Pin[] {
 			const o = parseOverride(c.body);
 			if (!o || decided.has(o.workloadId)) continue;
 			decided.add(o.workloadId);
-			if (ledger.workload(o.workloadId)?.status === "open") out.push({ workloadId: o.workloadId, input: o.input, shown: o.shown, entryId: c.id, at: c.createdAt });
+			if (ledger.workload(o.workloadId)?.status === "open") out.push({ ...o, entryId: c.id, at: c.createdAt });
 		}
 	}
-	return out;
+	// `out` is newest first: a ruling's place is where its newest live override stands; inside it, `pos` (a stable sort).
+	const ruling = new Map<string, number>();
+	for (const p of out) if (!ruling.has(p.input)) ruling.set(p.input, ruling.size);
+	return out.sort((a, b) => ruling.get(a.input)! - ruling.get(b.input)! || (a.pos ?? 0) - (b.pos ?? 0));
 }
 
 // ---- the order (D1) ----------------------------------------------------------------------------------------------
@@ -571,6 +584,8 @@ export interface RankItem {
 	createdAt: string;
 	/** Jo's live pin: `pinned (Jo, <input>)`. */
 	pinned?: Pin;
+	/** Its 1-based place among Jo's ruled (pinned) items in this order: the table's `ruled #k` (PLAN wl-mv8wzytml878b4 D1). */
+	pinPos?: number;
 	score?: number;
 	terms: RankTerms | null;
 	flags: string[];
@@ -589,9 +604,10 @@ export interface RankOptions {
 const olderFirst = (a: RankItem, b: RankItem): number => a.createdAt.localeCompare(b.createdAt) || a.workloadId.localeCompare(b.workloadId);
 
 /**
- * Every open workload in rank order (D1, D4): Jo's pins first (newest pin first), then the enforcer band (scored items
- * Jev says build an enforcer: Jo's machinery-first word of 2026-10-14), then the other scored items, each by score
- * (ties: the older workload first), then unscored items oldest first. The standing workload and `due:` rows are never
+ * Every open workload in rank order (D1, D4): Jo's pins first (`livePins` order: the newest ruling first, a ruled list by
+ * its `pos`), then the enforcer band (scored items Jev says build an enforcer: Jo's machinery-first word of 2026-10-14),
+ * then the other scored items, each by score (ties: the older workload first), then unscored items oldest first. Each
+ * pinned item carries `pinPos`, its place among the pins. The standing workload and `due:` rows are never
  * ranked; user-driven workloads are. A pure read over stored rows: no judge call, no write.
  */
 export function rankOpen(ledger: Ledger, now: string, opts: RankOptions = {}): RankItem[] {
@@ -617,6 +633,7 @@ export function rankOpen(ledger: Ledger, now: string, opts: RankOptions = {}): R
 		items.push(item);
 	}
 	const pinned = pins.flatMap((p) => items.filter((i) => i.pinned === p));
+	pinned.forEach((i, k) => (i.pinPos = k + 1));
 	const scored = items.filter((i) => !i.pinned && i.score !== undefined).sort((a, b) => Number(b.enforcer) - Number(a.enforcer) || b.score! - a.score! || olderFirst(a, b));
 	const unscored = items.filter((i) => !i.pinned && i.score === undefined).sort(olderFirst);
 	return [...pinned, ...scored, ...unscored];
@@ -625,4 +642,9 @@ export function rankOpen(ledger: Ledger, now: string, opts: RankOptions = {}): R
 /** The order a pick is audited against (D6): the waiting items alone, Jev's order, pins ignored. */
 export function rankPick(ledger: Ledger, now: string): RankItem[] {
 	return rankOpen(ledger, now, { pins: false, waitingOnly: true });
+}
+
+/** Each ranked workload's 1-based place in `rankOpen`'s order (PLAN wl-mv8wzytml878b4 D1), for the render's `rank #n`. */
+export function rankPosition(ledger: Ledger, now: string): Map<string, number> {
+	return new Map(rankOpen(ledger, now).map((i, n) => [i.workloadId, n + 1]));
 }

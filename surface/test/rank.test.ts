@@ -17,7 +17,7 @@ import { ensureStandingWorkload } from "../src/identity";
 import { controlEntries } from "../src/launch";
 import {
 	briefHash, currentGoals, formatAudit, formatGoals, formatOverride, formatShown, formatSignal, formatSignalFailed, formatUnpin, goalsAsked, goalsHash,
-	livePins, parseAudit, parseGoals, parseOverride, parseShown, parseSignal, parseSignalFailed, parseUnpin, RANK_WEIGHTS, rankOpen, rankPick,
+	livePins, parseAudit, parseGoals, parseOverride, parseShown, parseSignal, parseSignalFailed, parseUnpin, RANK_WEIGHTS, rankOpen, rankPick, rankPosition,
 	rankQuestions, rankState, readSignal, scoreSignal, SEED_GOALS, type SignalAnswer, type SignalAnswers, signalCurrent,
 } from "../src/rank";
 import { RANK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
@@ -508,6 +508,72 @@ describe("pins (D4): rankOpen honours them, rankPick ignores them", () => {
 		c.at(at(0, 17));
 		pin(mid, "in-4");
 		expect(livePins(ledger).map((p) => [p.workloadId, p.input])).toEqual([[mid, "in-4"]]);
+	});
+});
+
+describe("wl-mv8wzytml878b4 T7: Jo's ruled list (D1)", () => {
+	/** Five open workloads Jev orders e1 > e2 > e3 > e4 > e5 (by their unblocks_jo answers), opened oldest first. */
+	function five() {
+		const w = world();
+		const ids = ["e1", "e2", "e3", "e4", "e5"].map((t) => open(w.ledger, `Jev's ${t}`));
+		const levels = [0.9, 0.8, 0.7, 0.66, 0.1];
+		ids.forEach((wl, k) => signal(w.ledger, wl, answers({ unblocks_jo: bool(levels[k]!) })));
+		const override = (wl: string, input: string, pos?: number) =>
+			w.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: formatOverride({ workloadId: wl, input, shown: "en-shown", pos }) });
+		const unpin = (wl: string, input: string) => w.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: formatUnpin({ workloadId: wl, input }) });
+		return { ...w, ids, override, unpin };
+	}
+
+	test("a ruled list [A, B, C] (one input, pos 1–3) ranks A, B, C at #1–#3 above Jev's order, whatever order the rows were written in", () => {
+		const { ledger, c, ids, override } = five();
+		const [e1, e2, e3, e4, e5] = ids as [string, string, string, string, string];
+		expect(order(ledger, at(0))).toEqual([e1, e2, e3, e4, e5]);
+		c.at(at(0, 13));
+		// written out of pos order: the rank follows pos, not the row order
+		override(e3, "in-list", 2);
+		override(e5, "in-list", 1);
+		override(e4, "in-list", 3);
+		const ranked = rankOpen(ledger, at(0, 14));
+		expect(ranked.map((i) => [i.workloadId, i.pinned?.pos ?? null, i.pinPos ?? null])).toEqual([[e5, 1, 1], [e3, 2, 2], [e4, 3, 3], [e1, null, null], [e2, null, null]]);
+		expect([...rankPosition(ledger, at(0, 14))]).toEqual([[e5, 1], [e3, 2], [e4, 3], [e1, 4], [e2, 5]]);
+		// rankPick ignores the ruling
+		expect(rankPick(ledger, at(0, 14)).map((i) => i.workloadId)).toEqual([e1, e2, e3, e4, e5]);
+	});
+
+	test("a newer ruling ranks above an older one; a single first without pos sits above every older ruling; older single pins keep newest-first", () => {
+		const { ledger, c, ids, override, unpin } = five();
+		const [e1, e2, e3, e4, e5] = ids as [string, string, string, string, string];
+		override(e5, "in-old-1");
+		c.at(at(0, 13));
+		override(e4, "in-old-2");
+		expect(order(ledger, at(0, 13))).toEqual([e4, e5, e1, e2, e3]);
+		// a list over the two legacy pins, replacing them as the tool does: the dropped ones unpinned, the list by pos
+		c.at(at(0, 14));
+		unpin(e4, "in-list");
+		unpin(e5, "in-list");
+		override(e3, "in-list", 1);
+		override(e2, "in-list", 2);
+		expect(order(ledger, at(0, 14))).toEqual([e3, e2, e1, e4, e5]);
+		expect(livePins(ledger).map((p) => [p.workloadId, p.input, p.pos])).toEqual([[e3, "in-list", 1], [e2, "in-list", 2]]);
+		// a later single first: above the list, no pos; its pinPos is 1 and the list follows
+		c.at(at(0, 15));
+		override(e5, "in-single");
+		const ranked = rankOpen(ledger, at(0, 15));
+		expect(ranked.map((i) => [i.workloadId, i.pinPos ?? null])).toEqual([[e5, 1], [e3, 2], [e2, 3], [e1, null], [e4, null]]);
+		// a newer list that names an item of the older one takes it: its own pos, above what is left of the older list
+		c.at(at(0, 16));
+		override(e2, "in-newer", 1);
+		override(e1, "in-newer", 2);
+		expect(order(ledger, at(0, 16))).toEqual([e2, e1, e5, e3, e4]);
+	});
+
+	test("pos reads back as written; a body without pos parses as before; pos 0 or a non-number is malformed", () => {
+		const body = formatOverride({ workloadId: "wl-a", input: "in-2", shown: "en-3", pos: 4 });
+		expect(body).toBe("rank-override: wl-a input in-2 shown en-3 pos 4");
+		expect(parseOverride(body)).toEqual({ workloadId: "wl-a", input: "in-2", shown: "en-3", pos: 4 });
+		expect(parseOverride("rank-override: wl-a input in-2 shown en-3")).toEqual({ workloadId: "wl-a", input: "in-2", shown: "en-3" });
+		expect(parseOverride("rank-override: wl-a input in-2 shown en-3 pos 0")).toBeNull();
+		expect(parseOverride("rank-override: wl-a input in-2 shown en-3 pos x")).toBeNull();
 	});
 });
 

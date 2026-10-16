@@ -61,14 +61,15 @@ import { BACK_HEADING, countLine, lineKey, NEEDS_YOU_HEADING, onFire, pendingTex
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
+import { laneCap } from "../src/launch";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { renderWake } from "../src/render";
 import { RANK_AUDIT_DIR, runAudit } from "../src/rank-audit";
-import { readRankConfig } from "../src/rank-launch";
+import { preemptFor, readRankConfig } from "../src/rank-launch";
 import { type SurfaceSession, surfaceSession, voiceInPrompt, voiceSection, type WakeTrigger } from "../src/session";
 import { recordLapsedLeases } from "../src/signals";
 import { type Ctx, HOLD_HOURS, type HostMessage, LEDGER_TOOL, PUSH_TRIES, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
-import { launchVerdict, triggerLaunch } from "./launch";
+import { launchVerdict, priorityPausingLine, triggerLaunch } from "./launch";
 import { showPending } from "./surface-input";
 import { closeWorkloadWithEntry } from "./workload";
 
@@ -381,12 +382,20 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	 * (`s.refusedClose`), cleared when the workload closes or stops being ready to close. Runs after
 	 * the poll persisted lapsed leases; one catch-up at a time; a line per attempt goes to the tick's
 	 * queue, pushed when the catch-up ends. The session's `cwd` is the close tool's fallback repository.
+	 * Before the per-workload loop, `preemptFor` runs once (PLAN wl-mv8wzytml878b4 D3): in `order`, a
+	 * Jo-ruled workload waiting at cap gets one priority stop on the lowest-ranked running lane below it.
 	 */
 	const catchUp = async (s: SurfaceSession, ctx: Ctx): Promise<void> => {
 		if (s.launching || !pi.exec) return;
 		s.launching = true;
 		try {
 			const ledger = s.ledger();
+			try {
+				const pause = preemptFor(ledger, ledger.now(), laneCap(env), readRankConfig(env), SURFACE_BY).paused;
+				if (pause) tick(s, ctx, `tick: ${priorityPausingLine(pause)}`);
+			} catch (err) {
+				tick(s, ctx, `tick: the priority pause check failed: ${String(err)}`);
+			}
 			for (const w of ledger.inFlight()) {
 				const id = w.workload.id;
 				if (id === STANDING_WORKLOAD_ID) continue;

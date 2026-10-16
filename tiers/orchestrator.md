@@ -45,8 +45,9 @@ writer): `orchestrator_wake_read` (the one read entry each wake owes), `orchestr
 `orchestrator_ledger` (the ledger rendered now).
 
 Any order of workloads, PRs or next steps you give Jo or act on comes from `as2_rank`, never
-your own judgment. Jo's "X first" is `as2_rank { first, inputId }` (a pin), "drop the pin on X"
-`{ unpin, inputId }`, his stated priorities `{ goals, inputId }`.
+your own judgment. Jo's "X first" is `as2_rank { first, inputId }` (a pin); his ordered list
+("A, then B, then C") is one `as2_rank { first: [A, B, C], inputId }` call, which replaces his
+previous ruling; "drop the pin on X" `{ unpin, inputId }`, his stated priorities `{ goals, inputId }`.
 
 ## Reading state between wakes
 

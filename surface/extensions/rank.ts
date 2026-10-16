@@ -4,11 +4,14 @@
 // against the unspent input row of his words before anything else, and a refusal writes nothing and asks no judge;
 // (2) every open workload without a current signal is asked through the session's judge (`askJudgment`, concurrency 4,
 // 30 s each), answers held in memory; (3) one ledger transaction re-checks the input, writes `rank-goals:`, the signal
-// and failure rows, the `rank-shown: … by pick` snapshot and the pin change, then the call's own `rank-shown:` from
-// `rankOpen` and the reading entry that spends the input; (4) the table is that `rankOpen`, so `first` shows its
-// workload at #1 in the same reply. `fillSignals` is also the open-time background ask (surface/extensions/workload.ts).
-// The order itself is computed only in surface/src/rank.ts (`rankOpen`, D1); the wake line (surface/src/render.ts) and
-// `as2 rank` (surface/scripts/rank.ts) read the same rows without a judge or a write.
+// and failure rows, the `rank-shown: … by pick` snapshot and the pin change (a ruled list `first: [A, B, …]` writes one
+// `rank-override: … pos <k>` per item and unpins every standing pin not in it: PLAN wl-mv8wzytml878b4 D1), then the
+// call's own `rank-shown:` from `rankOpen` and the reading entry that spends the input; (4) after a `first` ruling
+// commits, `preemptFor` (surface/src/rank-launch.ts, D3) may pause the lowest running lane for a ruled waiter at cap;
+// (5) the table is step 3's `rankOpen`, so `first` shows its workload at #1 in the same reply. `fillSignals` is also the
+// open-time background ask (surface/extensions/workload.ts). The order itself is computed only in surface/src/rank.ts
+// (`rankOpen`, D1); the wake line (surface/src/render.ts) and `as2 rank` (surface/scripts/rank.ts) read the same rows
+// without a judge or a write.
 import { basename } from "node:path";
 import type { KindJudge } from "../../classifier/src/classify";
 import { askJudgment, type JudgmentJudge } from "../../classifier/src/judge-ask";
@@ -16,11 +19,12 @@ import { gateSession } from "../../gates/src/session";
 import type { Ledger } from "../../ledger/src/index";
 import { ensureStandingWorkload } from "../src/identity";
 import { inputSpent, joInput, readingBody } from "../src/orchestrator-question";
+import { controlEntries, laneCap, priorityPausedOf, priorityPausingOf } from "../src/launch";
 import {
 	briefHash, currentGoals, formatGoals, formatOverride, formatShown, formatSignal, formatSignalFailed, formatUnpin, goalsHash, goalsProblem, livePins,
 	MAX_SIGNAL_FAILURES, RANK_WEIGHTS, rankDay, rankOpen, rankPick, rankQuestions, rankState, readSignal, type RankItem, type RankTermName,
 } from "../src/rank";
-import { parallelRead, type RankConfig, readRankConfig } from "../src/rank-launch";
+import { parallelRead, preemptFor, type PreemptResult, type RankConfig, readRankConfig } from "../src/rank-launch";
 import { surfaceSession } from "../src/session";
 import { type Ctx, DUE_PREFIX, RANK_BY, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult } from "../src/types";
 
@@ -131,28 +135,35 @@ export async function askAtOpen(ledger: Ledger, workloadId: string, deps: RankDe
 const cell = (n: number): string => n.toFixed(2);
 const TERM_HEADS: Record<RankTermName, string> = { goal_max: "goal", unblocks_jo: "unblocks", fixes_breakage: "fixes", urgency: "urgency", cuts_spend: "spend" };
 
-/** One table row: rank, id, mode/state, pin, score, the five terms with `?` marks, flags, title. */
-function row(n: number, i: RankItem): string {
-	const pin = i.pinned ? `pinned (Jo, ${i.pinned.input})` : "-";
+/**
+ * One table row: rank, id, mode/state (with `priority-paused for <X>` / `priority-pausing for <X>` from the workload's
+ * stop rows, PLAN wl-mv8wzytml878b4 D4), Jo's ruling (`ruled #k`), score, the five terms with `?` marks, flags, title.
+ */
+function row(ledger: Ledger, n: number, i: RankItem): string {
+	const control = controlEntries(ledger.entries(i.workloadId, "assumption"));
+	const paused = priorityPausedOf(control);
+	const pausing = paused ? null : priorityPausingOf(control);
+	const state = `${i.mode}/${i.state}${paused ? `; priority-paused for ${paused.forWl}` : pausing ? `; priority-pausing for ${pausing.forWl}` : ""}`;
+	const pin = i.pinned ? `ruled #${i.pinPos} (Jo, ${i.pinned.input})` : "-";
 	const score = i.score === undefined ? `unscored (${i.unscored})` : cell(i.score);
 	const terms = (Object.keys(RANK_WEIGHTS) as RankTermName[]).map((k) => {
 		const t = i.terms?.[k];
 		if (!t) return "-";
 		return `${cell(t.value)}${t.mark}${k === "urgency" && t.detail.startsWith("due ") ? ` (${t.detail})` : ""}`;
 	});
-	return [String(n), i.workloadId, `${i.mode}/${i.state}`, pin, score, ...terms, i.flags.length > 0 ? i.flags.join(", ") : "-", i.title].join(" · ");
+	return [String(n), i.workloadId, state, pin, score, ...terms, i.flags.length > 0 ? i.flags.join(", ") : "-", i.title].join(" · ");
 }
 
 /**
  * The table every full view prints (D4 step 4; `as2 rank` without the fill): the top rows in `items`' order, the
  * unscored list with reasons, the goals line, the weights, the parallel read for the top items, and the launch-order
- * line (`show-only: …` while the mode is show).
+ * line (`show-only: …` only while the mode is show).
  */
 export function rankTable(ledger: Ledger, now: string, items: readonly RankItem[], o: { top: number; heading: string; fill: string; config: RankConfig }): string {
 	const shown = items.slice(0, o.top);
-	const lines = [o.heading, o.fill, "", `# · workload · mode/state · pin · score · ${(Object.keys(RANK_WEIGHTS) as RankTermName[]).map((k) => TERM_HEADS[k]).join(" · ")} · flags · title`];
+	const lines = [o.heading, o.fill, "", `# · workload · mode/state · ruled · score · ${(Object.keys(RANK_WEIGHTS) as RankTermName[]).map((k) => TERM_HEADS[k]).join(" · ")} · flags · title`];
 	if (items.length === 0) lines.push("no open workload to rank");
-	shown.forEach((i, n) => lines.push(row(n + 1, i)));
+	shown.forEach((i, n) => lines.push(row(ledger, n + 1, i)));
 	if (items.length > shown.length) lines.push(`(${items.length - shown.length} more not shown; a larger top shows them)`);
 	lines.push("");
 	const unscored = items.filter((i) => i.score === undefined);
@@ -197,13 +208,14 @@ export default function rankRow(pi: SurfaceAPI, env: Record<string, string | und
 		label: "Rank Open Workloads (Jev)",
 		description:
 			"The one order of open workloads (Jev ranking): any order of workloads, PRs or next steps you give Jo or act on comes from this tool, never your own judgment. " +
-			"Asks Jev about workloads with no current signal first, then returns the table: rank, mode/state, Jo's pins, score, each term with ? where Jev was unsure, flags, the unscored list, the goals line, the weights and the parallel read. " +
-			"Orchestrator only, each with inputId (the input row of Jo's words): `goals` records Jo's stated priorities (1-6 lines); `first` pins Jo's \"X first\" above every unpinned workload; `unpin` drops that pin. Without an unspent input nothing is written and nothing is asked.",
+			"Asks Jev about workloads with no current signal first, then returns the table: rank, mode/state (with priority-paused / priority-pausing for <wl>), Jo's ruling (ruled #k), score, each term with ? where Jev was unsure, flags, the unscored list, the goals line, the weights and the parallel read. " +
+			"Orchestrator only, each with inputId (the input row of Jo's words): `goals` records Jo's stated priorities (1-6 lines); `first` pins Jo's \"X first\" above every unpinned workload, or, given a list [A, B, C], rules that order (A #1, B #2, C #3) and replaces Jo's previous ruling (pins not in the list are dropped); `unpin` drops that pin. " +
+			"After a `first` ruling, a ruled workload waiting at the lane cap may pause the lowest-ranked running lane (launch order `order` only); the reply names the pause. Without an unspent input nothing is written and nothing is asked.",
 		parameters: z.object({
 			top: z.string().optional().describe(`Rows to show, a number (default ${RANK_TOP}).`),
 			refresh: z.string().optional().describe("'yes' to re-ask Jev about every open workload, current signal or not."),
 			goals: z.array(z.string()).optional().describe("Orchestrator only: Jo's stated priorities, 1-6 lines, with inputId."),
-			first: z.string().optional().describe("Orchestrator only: the workload (wl-…) Jo said goes first; a pin, with inputId."),
+			first: z.union([z.string(), z.array(z.string())]).optional().describe("Orchestrator only, with inputId: the workload (wl-…) Jo said goes first (a pin), or Jo's ordered list [wl-…, wl-…] (his ruled order, replacing the previous one)."),
 			unpin: z.string().optional().describe("Orchestrator only: the workload (wl-…) whose pin Jo dropped, with inputId."),
 			inputId: z.string().optional().describe("The input row (in-…) the surface named for Jo's words; required with goals, first or unpin."),
 		}),
@@ -215,10 +227,13 @@ export default function rankRow(pi: SurfaceAPI, env: Record<string, string | und
 			const top = Number.isInteger(topRaw) && topRaw > 0 ? topRaw : RANK_TOP;
 			const word = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
 			const goals: unknown[] | undefined = params.goals === undefined ? undefined : Array.isArray(params.goals) ? params.goals : [params.goals];
-			const first = word(params.first);
+			// `first` is one workload (a pin, no pos) or Jo's ruled list (one pin per item with its pos; it replaces his previous ruling).
+			const ruled = Array.isArray(params.first);
+			const firsts: string[] = Array.isArray(params.first) ? params.first.map(word) : word(params.first) ? [word(params.first)] : [];
+			const first = firsts[0] ?? "";
 			const unpin = word(params.unpin);
 			const inputId = word(params.inputId);
-			const jo = goals !== undefined || first !== "" || unpin !== "";
+			const jo = goals !== undefined || ruled || first !== "" || unpin !== "";
 			const refuse = (why: string) => text(`Refused: ${why}. Nothing was written and Jev was not asked.`);
 
 			// Step 1: Jo's parameters and their receipt, before anything is asked or written.
@@ -226,7 +241,12 @@ export default function rankRow(pi: SurfaceAPI, env: Record<string, string | und
 			if (jo || inputId) {
 				if (c.role !== "orchestrator") return refuse(`goals, first and unpin are Jo's words, recorded only by the orchestrator with the input row of them (this session is ${c.by})`);
 				if (!jo) return refuse("inputId spends Jo's input on goals, first or unpin, and none was given");
-				if (first && unpin) return refuse("one call pins or unpins, not both");
+				if ((ruled || first) && unpin) return refuse("one call pins or unpins, not both");
+				if (ruled && firsts.length === 0) return refuse("first is an empty list; name the workloads in Jo's order");
+				const blank = firsts.indexOf("");
+				if (blank !== -1) return refuse(`first's item ${blank + 1} is not a workload id`);
+				const twice = firsts.find((wl, k) => firsts.indexOf(wl) !== k);
+				if (twice) return refuse(`${twice} is listed twice in first`);
 				if (!inputId) return refuse("Jo's words are the input row the surface named (`Jo's words above are input in-…`): pass inputId; with none named there is no receipt");
 				const input = joInput(ledger, inputId);
 				if (!input) return refuse(`${inputId} is not an input Jo typed at the surface`);
@@ -237,7 +257,7 @@ export default function rankRow(pi: SurfaceAPI, env: Record<string, string | und
 					const problem = goalsProblem(goals);
 					if (problem) return refuse(problem);
 				}
-				for (const wl of [first, unpin].filter(Boolean)) {
+				for (const wl of [...firsts, unpin].filter(Boolean)) {
 					const w = ledger.workload(wl);
 					if (!w) return refuse(`no workload ${wl}`);
 					if (w.status !== "open") return refuse(`${wl} is ${w.status}`);
@@ -256,7 +276,7 @@ export default function rankRow(pi: SurfaceAPI, env: Record<string, string | und
 				: `fill: asked ${filled.length} (${filled.length - failed.length} answered, ${failed.length} failed${failed.length > 0 ? `: ${failed.map((f) => `${f.workloadId} ${f.reason}`).join("; ")}` : ""})`;
 
 			// Step 3: one transaction.
-			let committed: { items: RankItem[]; shown: string; pick: string | null; reading: string | null };
+			let committed: { items: RankItem[]; shown: string; pick: string | null; reading: string | null; dropped: string[] };
 			try {
 				committed = ledger.write(() => {
 					const spentNow = inputId ? inputSpent(ledger, inputId) : null;
@@ -267,10 +287,19 @@ export default function rankRow(pi: SurfaceAPI, env: Record<string, string | und
 						if (ledger.workload(f.workloadId)?.status === "open") ledger.recordEntry({ by: RANK_BY, workloadId: f.workloadId, kind: "assumption", body: f.body });
 					}
 					let pick: string | null = null;
+					const dropped: string[] = [];
 					if (first || unpin) {
-						pick = ledger.recordEntry({ by: RANK_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: formatShown({ by: "pick", goals: currentGoals(ledger, now).hash, items: rankPick(ledger, now) }) });
-						const body = first ? formatOverride({ workloadId: first, input: inputId, shown: pick }) : formatUnpin({ workloadId: unpin, input: inputId });
-						ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+						const shownId = ledger.recordEntry({ by: RANK_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: formatShown({ by: "pick", goals: currentGoals(ledger, now).hash, items: rankPick(ledger, now) }) });
+						pick = shownId;
+						const bodies: string[] = [];
+						if (!ruled) bodies.push(first ? formatOverride({ workloadId: first, input: inputId, shown: shownId }) : formatUnpin({ workloadId: unpin, input: inputId }));
+						else {
+							// Jo's new ruled list replaces his previous ruling: every standing pin not in it is dropped.
+							for (const p of livePins(ledger)) if (!firsts.includes(p.workloadId)) dropped.push(p.workloadId);
+							bodies.push(...dropped.map((wl) => formatUnpin({ workloadId: wl, input: inputId })));
+							bodies.push(...firsts.map((wl, k) => formatOverride({ workloadId: wl, input: inputId, shown: shownId, pos: k + 1 })));
+						}
+						for (const body of bodies) ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
 					}
 					const items = rankOpen(ledger, now);
 					const shown = ledger.recordEntry({ by: RANK_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: formatShown({ by: c.by, goals: currentGoals(ledger, now).hash, items }) });
@@ -278,22 +307,38 @@ export default function rankRow(pi: SurfaceAPI, env: Record<string, string | und
 					if (jo) {
 						const said = [
 							...(proposed ? [`rank goals: ${proposed.map((g) => `"${g}"`).join(" | ")}`] : []),
-							...(first ? [`${first} first (a pin)`] : []),
+							...(ruled ? [`ruled order ${firsts.join(" > ")} (pins #1-#${firsts.length}${dropped.length > 0 ? `; dropped the pins on ${dropped.join(", ")}` : ""})`] : first ? [`${first} first (a pin)`] : []),
 							...(unpin ? [`drop the pin on ${unpin}`] : []),
 						];
 						reading = ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: inputSlice, kind: "assumption", body: readingBody(`as2_rank ${said.join("; ")}`, inputId, first || unpin || STANDING_WORKLOAD_ID) });
 					}
-					return { items, shown, pick, reading };
+					return { items, shown, pick, reading, dropped };
 				});
 			} catch (err) {
 				if (err instanceof InputSpent) return text(`Refused: ${err.message}, and one input is recorded once. Nothing was written; Jev's answers were dropped.`);
 				throw err;
 			}
 
-			// Step 4: the table from step 3's order.
+			// Step 4: a `first` ruling may pause the lowest running lane for a ruled waiter at cap (D3; writes only in `order`).
+			const config = readRankConfig(env);
+			let pause: string | null = null;
+			let paused: PreemptResult["paused"] = null;
+			if (first) {
+				try {
+					paused = preemptFor(ledger, now, laneCap(env), config, SURFACE_BY).paused;
+					if (paused) pause = `priority-pausing ${paused.laneId} on ${paused.workloadId} for ${paused.forWl}`;
+				} catch (err) {
+					pause = `priority pause could not run (${String(err).split("\n")[0]}); the ruling above is recorded`;
+				}
+			}
+
+			// Step 5: the table from step 3's order, its marks read now (a pause just written shows as priority-pausing).
 			const heading = `Jev rank (${RANK_TOOL}, by ${c.by}, ${now}; rank-shown ${committed.shown}${committed.reading ? `; Jo's input ${inputId} spent, reading ${committed.reading}` : ""})`;
-			const table = rankTable(ledger, now, committed.items, { top, heading, fill, config: readRankConfig(env) });
-			return text(table, { items: committed.items.map((i) => i.workloadId), shown: committed.shown, pick: committed.pick, reading: committed.reading, asked: filled.length, failed: failed.length });
+			const table = rankTable(ledger, now, committed.items, { top, heading, fill, config });
+			return text(pause ? `${table}\n${pause}` : table, {
+				items: committed.items.map((i) => i.workloadId), shown: committed.shown, pick: committed.pick, reading: committed.reading, dropped: committed.dropped, paused,
+				asked: filled.length, failed: failed.length,
+			});
 		},
 	});
 }

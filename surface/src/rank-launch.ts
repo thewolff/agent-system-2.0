@@ -1,7 +1,9 @@
 // Jev ranking's launch gate (PLAN wl-mv8k039gvogt8g § 2 D7) and Jo's pick snapshot (D6). The profile key `jevRank`
-// (raw layer, like `pairSuggest`) is read fresh at each decision: `show` (the default; missing or malformed reads as
-// show) changes no launch, `order` admits a workload only when no higher-ranked workload (`rankOpen`, Jo's pins first)
-// is launchable now, and `parallel` adds the parallel rule (`parallelVerdict`) while any other lane runs.
+// (raw layer, like `pairSuggest`) is read fresh at each decision: `order` (the default since PLAN wl-mv8wzytml878b4 D2;
+// missing or malformed reads as order) admits a workload only when no higher-ranked workload (`rankOpen`, Jo's pins
+// first) is launchable now, `show` changes no launch, and `parallel` adds the parallel rule (`parallelVerdict`) while
+// any other lane runs. In `order` alone, `preemptFor` (PLAN wl-mv8wzytml878b4 D3) pauses the lowest-ranked running lane
+// for a Jo-ruled workload waiting at cap.
 //
 // `rankGate` is composed into the starter's `decideLaunch` (surface/scripts/lane.ts `reserveOrExit`), so it runs inside
 // `reserveLane`'s transaction for the drain, the open tool and the wake tick alike; the surface runs it again as its own
@@ -9,14 +11,16 @@
 // with cause `request <id>` so the reservation consumes it, and `decideInteractive` never calls the gate.
 //
 // Every function here reads ledger rows and, for the parallel rule's file check, asks git for a repository's identity.
-// Nothing here writes, except `writePickSnapshot`, which its callers run inside their own pick transaction.
+// Nothing here writes, except `writePickSnapshot`, which its callers run inside their own pick transaction, and
+// `preemptFor`, which writes one priority stop in its own transaction.
 import { realpathSync } from "node:fs";
 import type { Ledger, ReserveRows, ReserveVerdict } from "../../ledger/src/index";
 import { type Ceiling, crossed, effectiveCeiling, parseSpend, type Spend } from "./ceiling";
 import { repoOf } from "./decision-log";
 import { ensureStandingWorkload } from "./identity";
 import {
-	attempts, boundPrs, causeText, consumedIds, controlEntries, decideLaunch, holdersOf, type LaunchVerdict, verdictOf,
+	attempts, boundPrs, causeText, consumedIds, controlEntries, decideLaunch, holdersOf, laneStopRequestBody, type LaunchVerdict,
+	PRIORITY_REASON_PREFIX, priorityPausingOf, verdictOf,
 } from "./launch";
 import { readPairSuggestConfig } from "./pair-suggest";
 import { currentGoals, formatShown, rankOpen, type RankItem, rankPick } from "./rank";
@@ -34,14 +38,14 @@ export interface RankConfig {
 }
 /** The profile key (raw layer). */
 export const JEV_RANK_KEY = "jevRank";
-export const DEFAULT_RANK_CONFIG: RankConfig = { mode: "show", parallelBudgetUsd: 0 };
+export const DEFAULT_RANK_CONFIG: RankConfig = { mode: "order", parallelBudgetUsd: 0 };
 
 const isMode = (x: unknown): x is RankMode => typeof x === "string" && (RANK_MODES as readonly string[]).includes(x);
 const isBudget = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x) && x >= 0;
 
 /**
  * The `jevRank` block of a parsed profile config. A missing key, a value that is not a mapping, or an unknown mode reads
- * as `show` with budget 0; a valid mode with a missing or malformed budget keeps the mode with budget 0 (unknown).
+ * as `order` with budget 0; a valid mode with a missing or malformed budget keeps the mode with budget 0 (unknown).
  */
 export function parseRankConfig(config: unknown): RankConfig {
 	if (typeof config !== "object" || config === null || Array.isArray(config)) return { ...DEFAULT_RANK_CONFIG };
@@ -114,6 +118,54 @@ function higherLaunchable(ledger: Ledger, workloadId: string, now: string, cap: 
 /** The order the drain walks in `order` / `parallel` (D7): `rankOpen`'s, pins first. */
 export function drainOrder(ledger: Ledger, now: string): string[] {
 	return rankOpen(ledger, now).map((i) => i.workloadId);
+}
+
+// ---- priority pause (PLAN wl-mv8wzytml878b4 D3) ----------------------------------------------------------------------
+
+export interface PreemptResult {
+	/** The lane asked to stop, its workload, and the ruled workload it makes room for; null when nothing was written. */
+	paused: { laneId: string; workloadId: string; forWl: string } | null;
+	/** One line: what was written, or why nothing was. */
+	reason: string;
+}
+
+/**
+ * Make room at cap for a Jo-ruled workload (D3), in one transaction that reads everything it decides on. Only in mode
+ * `order`. `waiting` = the ruled (pinned) autonomous workloads not running whose own `verdictOf` with the cap lifted
+ * launches, in rank order; `pending` = the live lanes whose priority stop is requested and not yet exited (slots on their
+ * way). Pauses only for `waiting[pending.length]`: the lowest-ranked workload below it held by a live autonomous `lane-*`
+ * with a `lane-ready:` and no `lane-stop:` of any reason, by writing `lane-stop: <L> requested priority-for-<X> by rank`
+ * stamped `by`. The runner's stop path does the rest; the drain gives the freed slot to the top-ranked launchable workload.
+ */
+export function preemptFor(ledger: Ledger, now: string, cap: number, config: RankConfig, by: string): PreemptResult {
+	if (config.mode !== "order") return { paused: null, reason: `jevRank mode ${config.mode}: priority pause is off` };
+	return ledger.write((): PreemptResult => {
+		const live = ledger.liveLaneHolders(now);
+		if (live.length < cap) return { paused: null, reason: `below cap (${live.length} of ${cap} lanes)` };
+		const ranked = rankOpen(ledger, now);
+		const waiting = ranked.filter((i) => {
+			if (i.pinned === undefined || i.mode !== "autonomous" || i.state === "running") return false;
+			const rows = ledger.launchRows(i.workloadId, Infinity);
+			return rows !== null && verdictOf(rows).launch;
+		});
+		const pending = live.filter((l) => priorityPausingOf(controlEntries(ledger.entries(l.workloadId, "assumption")))?.laneId === l.holder).length;
+		const x = waiting[pending];
+		if (x === undefined) {
+			return { paused: null, reason: waiting.length === 0 ? "no ruled workload waiting" : `${pending} priority stop(s) already on their way for ${waiting.length} ruled workload(s)` };
+		}
+		const xAt = ranked.findIndex((i) => i.workloadId === x.workloadId);
+		for (let i = ranked.length - 1; i > xAt; i--) {
+			const item = ranked[i]!;
+			const laneId = live.find((l) => l.workloadId === item.workloadId)?.holder;
+			if (laneId === undefined) continue;
+			const c = controlEntries(ledger.entries(item.workloadId, "assumption"));
+			if (!c.some((e) => e.prefix === "lane-ready" && e.laneId === laneId)) continue;
+			if (c.some((e) => e.prefix === "lane-stop" && e.laneId === laneId)) continue;
+			ledger.recordEntry({ by, workloadId: item.workloadId, kind: "assumption", body: laneStopRequestBody(laneId, `${PRIORITY_REASON_PREFIX}${x.workloadId}`, "rank") });
+			return { paused: { laneId, workloadId: item.workloadId, forWl: x.workloadId }, reason: `priority-pausing ${laneId} on ${item.workloadId} for ${x.workloadId}` };
+		}
+		return { paused: null, reason: `no running lane ranked below ${x.workloadId} to pause` };
+	});
 }
 
 // ---- the parallel rule (D7) ----------------------------------------------------------------------------------------

@@ -5,12 +5,13 @@ import { TEST_RUNNER_BY } from "../../ledger/src/index";
 import { consumeLines } from "../src/delivery";
 import { errorLines, parseDue, reservedStates, waitingReserved } from "../src/errors";
 import { ensureStandingWorkload, identityOf, recordIdentity } from "../src/identity";
-import { laneExitBody, planFirstBody } from "../src/launch";
+import { laneExitBody, laneStopAcceptedBody, laneStopRequestBody, planFirstBody } from "../src/launch";
 import { Numbering } from "../src/numbering";
-import { oneLiner, renderWake } from "../src/render";
+import { oneLiner, rankLines, renderWake } from "../src/render";
+import { briefHash, formatOverride, formatSignal, goalsHash, rankOpen, type SignalAnswers } from "../src/rank";
 import { artifactFailures, laneDiedShutdownBody } from "../src/signals";
 import { testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf } from "../src/test-run";
-import { ARTIFACT_FAILED_PREFIX, LEDGER_TOOL, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ARTIFACT_FAILED_PREFIX, LEDGER_TOOL, ORCHESTRATOR_RECIPIENT, RANK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
 
@@ -391,6 +392,10 @@ describe("render and one-liner (§ B7, § A1.2, § B13.1)", () => {
 			new RegExp(`^- ${wl}: .+ · stakes: production · mode: user-driven · ceiling .+ · lane: none · slices: 1 paused · needs you: #${n} · open questions: ${q} · 1 message\\(s\\) not yet acted on$`),
 		);
 		expect(workloadLines.find((l) => l.startsWith(`- ${other}: `))).toContain(`- ${other}: Second workload · stakes: normal · mode: autonomous`);
+		// two unscored workloads opened in the same millisecond tie on age and break on id, so take the place from rankOpen
+		const place = rankOpen(ledger, ledger.now()).findIndex((i) => i.workloadId === other) + 1;
+		expect(place).toBeGreaterThan(0);
+		expect(workloadLines.find((l) => l.startsWith(`- ${other}: `))).toContain(` · rank #${place} · lane: none`);
 		expect(wake.text).toContain(`${LEDGER_TOOL} with workload: <wl-…>`);
 		// no block: no block heading, no slice task, no question options, no message body, no recent entries
 		expect(wake.text).not.toContain(`## ${wl}`);
@@ -528,5 +533,126 @@ describe("a lane that ended on purpose with work open and nobody holding it (MIG
 		const { wl } = endedLane(ledger);
 		const r = renderWake(ledger);
 		expect(r.text).toContain(`## needs you\n- lane lane-a on ${wl} ended (completed) with 2 open slice(s) and no question; relaunch, close, or instruct\n`);
+	});
+});
+
+describe("T9 rank and priority pause in the render (PLAN wl-mv8wzytml878b4 D4)", () => {
+	// Local wall-clock instants, as rank.test.ts uses: the rank day is the local calendar day, so this holds in any time zone.
+	const at = (hour: number): string => new Date(2026, 9, 14, hour).toISOString();
+	const t = new Date(2026, 9, 14);
+	const D = `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}-${String(t.getDate()).padStart(2, "0")}`;
+	const answers = (over: SignalAnswers = {}): SignalAnswers => ({
+		unblocks_jo: { type: "bool", bool: 0.1 }, cuts_spend: { type: "bool", bool: 0.1 }, fixes_breakage: { type: "bool", bool: 0.1 },
+		states_deadline: { type: "bool", bool: 0.05 }, irreversible: { type: "bool", bool: 0.05 }, builds_enforcer: { type: "bool", bool: 0.1 },
+		deadline_when: { type: "choice", choice: "none", confidence: 0.9 }, ...over,
+	});
+	/** A `priority-signal:` as the ranking machinery stores it (rank.test.ts `signal`). */
+	function signal(ledger: Ledger, wl: string, a: SignalAnswers): void {
+		const body = formatSignal({ brief: briefHash(ledger.workload(wl)!.brief), goals: goalsHash([]), askedOn: D, judge: "typesafe/jev-1.13.0", tokens: 812, cost: 0.0000341, answers: a });
+		ledger.recordEntry({ by: RANK_BY, workloadId: wl, kind: "assumption", body });
+	}
+	const open = (ledger: Ledger, brief: string) => ledger.openWorkload({ by: SURFACE_BY, brief, stakes: "normal", mode: "autonomous" });
+	const lineOf = (text: string, wl: string) => text.split("\n").find((l) => l.startsWith(`- ${wl}`))!;
+
+	/** Four ranked workloads (one unscored, two scored, one pinned by Jo) and one `due:` row. */
+	function ranked() {
+		const c = clock(at(9));
+		const { ledger } = tempLedger(c.now);
+		ensureStandingWorkload(ledger);
+		const unscored = open(ledger, "Unscored oldest");
+		c.at(at(10));
+		const high = open(ledger, "High scored");
+		c.at(at(11));
+		const low = open(ledger, "Low scored");
+		c.at(at(12));
+		const pinned = open(ledger, "Pinned by Jo");
+		const due = ledger.openWorkload({ by: SURFACE_BY, brief: "due:2026-11-01 re-measure the classifier threshold", stakes: "throwaway", mode: "autonomous" });
+		signal(ledger, high, answers({ unblocks_jo: { type: "bool", bool: 0.9 }, fixes_breakage: { type: "bool", bool: 0.9 } }));
+		signal(ledger, low, answers());
+		signal(ledger, pinned, answers());
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: formatOverride({ workloadId: pinned, input: "in-1", shown: "en-1" }) });
+		c.at(at(13));
+		return { ledger, c, unscored, high, low, pinned, due };
+	}
+
+	test("each ranked line carries rank #n in rankOpen's order, Jo's pinned item marked ruled; a due: row and the standing row carry none", () => {
+		const { ledger, c, unscored, high, low, pinned, due } = ranked();
+		const items = rankOpen(ledger, c.now());
+		expect(items.map((i) => i.workloadId)).toEqual([pinned, high, low, unscored]);
+		const wake = renderWake(ledger, { trigger: "compaction" });
+		items.forEach((item, i) => {
+			expect(lineOf(wake.text, item.workloadId)).toContain(` · rank #${i + 1}${item.pinned ? " ruled" : ""} · lane: none`);
+		});
+		expect(lineOf(wake.text, pinned)).toContain(" · rank #1 ruled · ");
+		expect(lineOf(wake.text, high)).toContain(" · rank #2 · ");
+		expect(lineOf(wake.text, due)).toMatch(new RegExp(`^- ${due} \\(scheduled, due 2026-11-01\\): `));
+		expect(lineOf(wake.text, due)).not.toContain("rank #");
+		expect(wake.text).not.toContain(STANDING_WORKLOAD_ID);
+		expect(wake.text.match(/rank #\d/g)).toHaveLength(4);
+		// the block (on-demand read): the header carries the same mark; the due row's header none
+		const blocks = renderWake(ledger).text;
+		expect(blocks).toContain(`## ${pinned} · rank #1 ruled\n`);
+		expect(blocks).toContain(`## ${low} · rank #3\n`);
+		expect(blocks).toContain(`## ${due} (scheduled, due 2026-11-01)\n`);
+		expect(renderWake(ledger, { workloadId: unscored }).text).toContain(`## ${unscored} · rank #4\n`);
+	});
+
+	test("the rank line's label names the mode in force: show-only, launch order (order), launch order parallel", () => {
+		const { ledger, c } = ranked();
+		const label = (rankMode?: string) => renderWake(ledger, { trigger: "tick", rankMode }).text.split("\n").find((l) => l.startsWith("Rank ("));
+		expect(label()).toStartWith("Rank (Jev, show-only): 1 ");
+		expect(label("show")).toStartWith("Rank (Jev, show-only): 1 ");
+		expect(label("order")).toStartWith("Rank (Jev, launch order): 1 ");
+		expect(label("parallel")).toStartWith("Rank (Jev, launch order parallel): 1 ");
+		expect(rankLines(ledger, c.now(), "order")[0]).not.toContain("launch order order");
+	});
+
+	/** lane-a launched on a fresh workload and holding it under a live lease (the starter's `launch:`, then the claim). */
+	function running(ledger: Ledger, brief: string) {
+		const wl = open(ledger, brief);
+		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-a cause first requested-by surface" });
+		expect(ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 }).won).toBe(true);
+		return wl;
+	}
+	/** The runner's stop path: `lane-stop: accepted`, the release, `lane-exit: … outcome stop reason <reason>`. */
+	function stopped(ledger: Ledger, wl: string, request: string, reason: string) {
+		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneStopAcceptedBody("lane-a", request) });
+		ledger.releaseWorkload(wl, { by: "lane-a", holder: "lane-a" });
+		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody("lane-a", { code: 0, signal: null, outcome: "stop", reason }) });
+	}
+
+	test("a pending priority stop shows priority-pausing for X beside the lane; after the accepted stop and its exit, priority-paused beside lane: none; a launch ends it", () => {
+		const { ledger } = tempLedger();
+		const x = open(ledger, "Jo's first");
+		const wl = running(ledger, "Running lower");
+		const request = ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: laneStopRequestBody("lane-a", `priority-for-${x}`, "rank") });
+		const pausing = renderWake(ledger, { trigger: "tick" });
+		expect(lineOf(pausing.text, wl)).toContain(` · lane: lane-a · priority-pausing for ${x} · slices: `);
+		expect(lineOf(pausing.text, wl)).not.toContain("priority-paused");
+		expect(lineOf(pausing.text, x)).not.toContain("priority-");
+		expect(pausing.lines.filter((l) => l.workloadId === wl)).toEqual([]);
+
+		stopped(ledger, wl, request, `priority-for-${x}`);
+		const paused = renderWake(ledger, { trigger: "tick" });
+		expect(lineOf(paused.text, wl)).toContain(` · lane: none · priority-paused for ${x} (relaunches when a slot reaches it) · slices: `);
+		expect(lineOf(paused.text, wl)).not.toContain("priority-pausing");
+		// not a needs-you line: nothing for Jo to do
+		expect(paused.lines.filter((l) => l.workloadId === wl)).toEqual([]);
+		expect(renderWake(ledger, { workloadId: wl }).text).toContain(`; lane: none · priority-paused for ${x} (relaunches when a slot reaches it)\n`);
+
+		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-b cause request en-1 requested-by surface" });
+		expect(lineOf(renderWake(ledger, { trigger: "tick" }).text, wl)).not.toContain("priority-");
+	});
+
+	test("a ceiling stop shows neither mark, pending or after its exit", () => {
+		const { ledger } = tempLedger();
+		const wl = running(ledger, "Ceiling-stopped");
+		const request = ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: laneStopRequestBody("lane-a", "ceiling", "surface") });
+		expect(lineOf(renderWake(ledger, { trigger: "tick" }).text, wl)).not.toContain("priority-");
+		stopped(ledger, wl, request, "ceiling");
+		const wake = renderWake(ledger, { trigger: "tick" });
+		expect(lineOf(wake.text, wl)).toContain(" · lane: none · slices: ");
+		expect(wake.text).not.toContain("priority-");
+		expect(renderWake(ledger, { workloadId: wl }).text).not.toContain("priority-");
 	});
 });
