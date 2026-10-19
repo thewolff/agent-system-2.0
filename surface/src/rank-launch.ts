@@ -5,8 +5,9 @@
 //
 // `rankGate` is composed into the starter's `decideLaunch` (surface/scripts/lane.ts `reserveOrExit`), so it runs inside
 // `reserveLane`'s transaction for the drain, the open tool and the wake tick alike; the surface runs it again as its own
-// pre-check (surface/extensions/launch.ts). Jo's word is never gated: an unconsumed `launch-requested:` admits at once,
-// with cause `request <id>` so the reservation consumes it, and `decideInteractive` never calls the gate.
+// pre-check (surface/extensions/launch.ts). Jo's word is never gated: a `request` verdict admits at once, and so does a
+// `first` one while a `launch-requested:` is pending, with cause `request <id>` so the reservation consumes it; a `relaunch`
+// (PLAN wl-mvfqvd5hy8zv28 § 1.3) is ranked like `first` and `resume`. `decideInteractive` never calls the gate.
 //
 // Every function here reads ledger rows and, for the parallel rule's file check, asks git for a repository's identity.
 // Nothing here writes, except `writePickSnapshot`, which its callers run inside their own pick transaction.
@@ -60,7 +61,7 @@ export function readRankConfig(env: Record<string, string | undefined> = process
 
 // ---- the gate (D7) -------------------------------------------------------------------------------------------------
 
-/** Jo's `launch-requested:` on the workload that no `launch:` attempt names yet (the consumption rule `launchable` uses), or null. */
+/** The `launch-requested:` on the workload that no `launch:` attempt names yet (the consumption rule `launchable` uses), or null. */
 export function pendingRequest(rows: ReserveRows): string | null {
 	const control = controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder, rows.holders));
 	const consumed = consumedIds(attempts(control));
@@ -69,16 +70,19 @@ export function pendingRequest(rows: ReserveRows): string | null {
 
 /**
  * The launch decision with the rank gate applied, over the rows `reserveLane` (or the surface's pre-check) read.
- * `show`: `launchable`'s decision unchanged. `order` / `parallel`: a refusal stays a refusal; a pending Jo request admits
- * at once with cause `request <id>` (even when `launchable` reports `first`, so the reservation consumes it); otherwise
- * the workload is refused `ranked: below <wl>` while a higher-ranked workload is launchable now, and under `parallel`
- * refused `parallel: <reason>` when `parallelVerdict` holds it.
+ * `show`: `launchable`'s decision unchanged. `order` / `parallel`: a refusal stays a refusal; a `request` verdict admits at
+ * once (Jo's word, or a machinery request for a lane the relaunch owes nothing), and so does a `first` verdict while a
+ * request is pending, with cause `request <id>` so the reservation consumes it; every other cause — `first`, `resume`, and a
+ * `relaunch`, a train request folded into it included (PLAN wl-mvfqvd5hy8zv28 § 1.3) — is refused `ranked: below <wl>` while
+ * a higher-ranked workload is launchable now, and under `parallel` refused `parallel: <reason>` when `parallelVerdict` holds it.
  */
 export function rankGate(ledger: Ledger, rows: ReserveRows, config: RankConfig): LaunchVerdict {
 	const v = verdictOf(rows);
-	if (config.mode === "show" || !v.launch) return v;
-	const request = pendingRequest(rows);
-	if (request !== null) return { launch: true, cause: { kind: "request", id: request } };
+	if (config.mode === "show" || !v.launch || v.cause.kind === "request") return v;
+	if (v.cause.kind === "first") {
+		const request = pendingRequest(rows);
+		if (request !== null) return { launch: true, cause: { kind: "request", id: request } };
+	}
 	const above = higherLaunchable(ledger, rows.workload.id, rows.now, rows.cap, config);
 	if (above !== null) return { launch: false, reason: `ranked: below ${above}` };
 	if (config.mode === "parallel") {

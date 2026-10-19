@@ -13,11 +13,11 @@ import orchestratorSurface from "../index";
 import { spendBody } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
-import { controlEntries, doneBody, laneExitBody, laneStopRequestBody, launchRequestedBody, STARTER_EXIT, verdictOf } from "../src/launch";
+import { controlEntries, doneBody, laneDiedExitBody, laneExitBody, laneStopRequestBody, launchRequestedBody, STARTER_EXIT, verdictOf } from "../src/launch";
 import { briefHash, formatOverride, formatSignal, goalsHash, parseShown, rankDay, rankOpen, type SignalAnswers } from "../src/rank";
 import { parallelRead, parallelVerdict, parseRankConfig, type RankConfig, readRankConfig } from "../src/rank-launch";
 import { testRequestedBody } from "../src/test-run";
-import { RANK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, RANK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 // A namespace import, as lane-script.test.ts does: a name lane.ts stops exporting fails only the test that calls it.
 import * as laneScript from "../scripts/lane";
 import {
@@ -335,6 +335,39 @@ describe("T16 order gate", () => {
 		const req = request(l, lo);
 		expect(reserve(l, lo, ORDER)).toEqual({ ok: true, laneId: laneIdOf(lo, 2), cause: `request ${req}` });
 		expect(reserve(l, byHand, ORDER, true)).toMatchObject({ ok: true, cause: "interactive" });
+	});
+
+	/** A lane on `wl` that died with an open slice and its `lane-died:` recorded: relaunch 1 is due. */
+	function deadLane(l: Ledger, wl: string): string {
+		const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", decide: () => ({ launch: true, cause: "first" }) });
+		if (!res.ok) throw new Error(res.reason);
+		l.addSlice({ by: res.laneId, workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(res.laneId, { code: 1, signal: null, outcome: "error" }) });
+		l.enqueue({ by: LANE_RUNNER_BY, workloadId: wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: laneDiedExitBody(res.laneId, "error", 1, null) });
+		l.releaseWorkload(wl, { by: LANE_RUNNER_BY, holder: res.laneId });
+		return res.laneId;
+	}
+
+	test("PLAN wl-mvfqvd5hy8zv28 § 1.3: a train request for a dead lane is folded into its relaunch and waits below a higher-ranked launchable workload; then admitted, consuming it", () => {
+		const { l, open } = world();
+		const lo = open("lo, its lane died", { unblocks: 0.1 });
+		const hi = open("hi", { unblocks: 0.9 });
+		const dead = deadLane(l, lo);
+		const train = l.recordEntry({ by: MERGE_TRAIN_BY, workloadId: lo, kind: "assumption", body: launchRequestedBody(MERGE_TRAIN_BY, l.now(), "train task tt-1 owner") });
+		expect(verdictOf(l.launchRows(lo, 3)!)).toEqual({ launch: true, cause: { kind: "relaunch", lane: dead, n: 1, request: train } });
+		expect(reserve(l, lo, ORDER)).toEqual({ ok: false, reason: `ranked: below ${hi}` });
+		expect(launches(l, lo)).toHaveLength(1);
+		running(l, hi);
+		expect(reserve(l, lo, ORDER)).toEqual({ ok: true, laneId: laneIdOf(lo, 2), cause: `relaunch ${dead} 1 ${train}` });
+	});
+
+	test("PLAN wl-mvfqvd5hy8zv28 § 1.3: Jo's request on a dead lane still jumps the rank", () => {
+		const { l, open } = world();
+		const lo = open("lo, its lane died", { unblocks: 0.1 });
+		open("hi", { unblocks: 0.9 });
+		deadLane(l, lo);
+		const req = request(l, lo);
+		expect(reserve(l, lo, ORDER)).toEqual({ ok: true, laneId: laneIdOf(lo, 2), cause: `request ${req}` });
 	});
 
 	test("real paths: the open check queues the lower one with no starter run, the starter the tick execs refuses it with nothing written, the top launches, and a drain then starts the lower one", async () => {

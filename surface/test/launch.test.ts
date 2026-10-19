@@ -4,12 +4,13 @@
 import { describe, expect, test } from "bun:test";
 import { handBuilderBody, handSettledBody, handSpawnBody, laneBuilderBody, reviewParkBody, reviewSameLabBody, reviewWithheldBody } from "../../classifier/src/lab";
 import { reviewGroupBody, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
-import { LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type InstructionRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type InstructionRow, type ReserveRows, type SliceRow, type WorkloadRow } from "../../ledger/src/index";
 import {
-	boundPrs, CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv, launchable, maxTimeMs,
+	attempts, boundPrs, causeText, CLASSIFIER_MACHINERY_PREFIXES, consumedIds, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv, laneExitBody, launchable, maxTimeMs,
 	PLAN_FILE_MAX_BYTES, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_SHAPE, planQuestionProblem, requirementsProblem, reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
 	testPrBody, testPrInstructionBody, type Resolution, resumePlan, resumeSession, verdictOf, waivedPrs, waivePrBody, waivePrInstructionBody,
 } from "../src/launch";
+import { relaunchRead } from "../src/relaunch";
 import type { CleanShellRead } from "../../gates/src/clean-shell";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { pairOfferBody, pairSignalBody, pairSignalFailedBody } from "../src/pair-suggest";
@@ -46,10 +47,12 @@ describe("launch predicate matrix (§ 3 states)", () => {
 		["resume already consumed (tick catch-up idempotence)", workload(), [launch("lane-m-1", "first"), launch("lane-m-2", "resume in-1")], [resolution("in-1", "lane-m-1")], 0, { launch: false, reason: "died-not-relaunched" }],
 		["a launch: stamped by a lane is not an attempt", workload(), [entry("lane-m-9", "launch: lane-m-9 cause first requested-by me")], [], 0, { launch: true, cause: { kind: "first" } }],
 	];
+	/** The relaunch reading over the matrix row's entries: no slices, so a dead lane is owed no relaunch (relaunch.test.ts covers that). */
+	const read = (w: WorkloadRow, entries: EntryRow[]) => relaunchRead({ workload: w, entries, questions: [], instructions: [], slices: [], holders: [], deaths: [], liveLanes: 0, cap: 3, now: NOW });
 	for (const [name, w, entries, resolved, live, want] of rows) {
 		test(name, () => {
 			const c = control(entries, w.holder);
-			const v = launchable(w, c, null, resolved, NOW, live, 3);
+			const v = launchable(w, c, null, resolved, NOW, live, 3, read(w, entries));
 			if (typeof want === "object" && want !== null && "cause" in want && (want as { cause: { kind: string; id?: string } }).cause.kind === "request") {
 				expect(v).toMatchObject({ launch: true, cause: { kind: "request" } });
 				expect((v as { cause: { id: string } }).cause.id).toMatch(/^e-\d+$/);
@@ -58,14 +61,57 @@ describe("launch predicate matrix (§ 3 states)", () => {
 	}
 	test("the request-consumed row consumes by the request entry's real id", () => {
 		const req = entry(SURFACE_BY, `launch-requested: by jo at ${NOW}`);
-		const c = control([launch("lane-m-1", "first"), req, launch("lane-m-2", `request ${req.id}`)]);
-		expect(launchable(workload(), c, null, [], NOW, 0, 3)).toEqual({ launch: false, reason: "died-not-relaunched" });
+		const entries = [launch("lane-m-1", "first"), req, launch("lane-m-2", `request ${req.id}`)];
+		expect(launchable(workload(), control(entries), null, [], NOW, 0, 3, read(workload(), entries))).toEqual({ launch: false, reason: "died-not-relaunched" });
+	});
+});
+
+describe("launch predicate matrix: the dead-lane relaunch (PLAN wl-mvfqvd5hy8zv28 § 1.3; relaunch.test.ts holds the full matrix)", () => {
+	const slice = { id: "sl-1", workload_id: "wl-m", task: "t", done_condition: "d", inputs: "i", state: "open", artifact: null, created_by: "lane-m-1", created_at: "2026-10-01T08:00:00.000Z", changed_by: "lane-m-1", changed_at: "2026-10-01T08:00:00.000Z", rev: 0 } as SliceRow;
+	const died = (lane: string, at: string) => ({ laneId: lane, createdAt: at });
+	const exit = (lane: string, outcome: string) => entry(LANE_RUNNER_BY, laneExitBody(lane, { code: 1, signal: null, outcome }));
+	const rows = (entries: EntryRow[], deaths: { laneId: string; createdAt: string }[], liveLanes = 0): ReserveRows => ({
+		workload: workload(), entries, questions: [], instructions: [], slices: [slice], holders: [], deaths, liveLanes, cap: 3, now: NOW,
+	});
+	test("died with an open slice and its lane-died: recorded: relaunch 1 of the dead lane, at once", () => {
+		expect(verdictOf(rows([launch("lane-m-1", "first"), exit("lane-m-1", "error")], [died("lane-m-1", "2026-10-01T09:59:59.000Z")])))
+			.toEqual({ launch: true, cause: { kind: "relaunch", lane: "lane-m-1", n: 1 } });
+	});
+	test("died with no lane-died: recorded (an unrecorded lapse): died-not-relaunched", () => {
+		expect(verdictOf(rows([launch("lane-m-1", "first")], []))).toEqual({ launch: false, reason: "died-not-relaunched" });
+	});
+	test("relaunch 2 inside its gap: relaunch-backoff; past it: relaunch 2", () => {
+		const entries = [launch("lane-m-1", "first"), exit("lane-m-1", "error"), launch("lane-m-2", "relaunch lane-m-1 1"), exit("lane-m-2", "error")];
+		expect(verdictOf(rows(entries, [died("lane-m-1", "2026-10-01T09:00:00.000Z"), died("lane-m-2", "2026-10-01T09:55:00.000Z")]))).toEqual({ launch: false, reason: "relaunch-backoff" });
+		expect(verdictOf(rows(entries, [died("lane-m-1", "2026-10-01T09:00:00.000Z"), died("lane-m-2", "2026-10-01T09:50:00.000Z")])))
+			.toEqual({ launch: true, cause: { kind: "relaunch", lane: "lane-m-2", n: 2 } });
+	});
+	test("relaunch 3's lane died with no progress: relaunch-exhausted, before the cap", () => {
+		const entries = [launch("lane-m-1", "first"), launch("lane-m-2", "relaunch lane-m-1 1"), launch("lane-m-3", "relaunch lane-m-2 2"), launch("lane-m-4", "relaunch lane-m-3 3"), exit("lane-m-4", "error")];
+		const deaths = ["lane-m-1", "lane-m-2", "lane-m-3", "lane-m-4"].map((l) => died(l, "2026-10-01T09:00:00.000Z"));
+		expect(verdictOf(rows(entries, deaths))).toEqual({ launch: false, reason: "relaunch-exhausted" });
+		expect(verdictOf(rows(entries, deaths, 3))).toEqual({ launch: false, reason: "relaunch-exhausted" });
+	});
+	test("Jo's stop on the dead lane: stopped, until Jo's word newer than it", () => {
+		const entries = [launch("lane-m-1", "first"), exit("lane-m-1", "error"), entry(LANE_STARTER_BY, "lane-stop: lane-m-1 requested as2-lane-stop by jo")];
+		const deaths = [died("lane-m-1", "2026-10-01T09:00:00.000Z")];
+		expect(verdictOf(rows(entries, deaths))).toEqual({ launch: false, reason: "stopped" });
+		const req = entry(SURFACE_BY, `launch-requested: by jo at ${NOW}`);
+		expect(verdictOf(rows([...entries, req], deaths))).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+	});
+	test("the cause text round-trips, the folded request among the consumed ids", () => {
+		const cause = { kind: "relaunch", lane: "lane-m-1", n: 2, request: "en-7" } as const;
+		expect(causeText(cause)).toBe("relaunch lane-m-1 2 en-7");
+		const parsed = attempts(control([launch("lane-m-2", causeText(cause))]));
+		expect(parsed[0]!.cause).toEqual(cause);
+		expect([...consumedIds(parsed)]).toEqual(["en-7"]);
+		expect(attempts(control([launch("lane-m-2", "relaunch lane-m-1 0")]))[0]!.cause).toBeNull();
 	});
 });
 
 describe("awaiting close: the holder's done-because: stands (L1, the by-hand wasted launch)", () => {
 	const rows = (w: WorkloadRow, entries: EntryRow[], holders: string[] = []): ReserveRows => ({
-		workload: w, entries, questions: [], instructions: [], slices: [], holders, liveLanes: 0, cap: 3, now: NOW,
+		workload: w, entries, questions: [], instructions: [], slices: [], holders, deaths: [], liveLanes: 0, cap: 3, now: NOW,
 	});
 	const done = (by: string) => entry(by, "done-because: all five slices done");
 	test("a by-hand holder's receipt, no launch: history: the ledger's recorded holder makes it the holder's; nothing launches", () => {
