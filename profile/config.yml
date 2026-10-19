@@ -105,7 +105,7 @@ extensions:
   # ask-graham's every-idea nudge, and a lane's reader is the orchestrator, not Jo. Last in the list:
   # OMP returns the first session_stop block, so the surface's and the gates' blocks run first, and
   # neither plugin has a tool_call handler, so the fence order above is unaffected.
-  # Reversal: delete the line (and the two plugin skill dirs and names below).
+  # Reversal: delete the line (and the plugin skill dirs and names below).
   - "{repo}/plugins/index.ts"
 
 # The same two plugins installed through `omp plugin install` (Jo's default profile, 2026-10-14) live
@@ -120,12 +120,12 @@ disabledExtensions:
   - "extension-module:ask-graham-omp"
 
 
-# ── Skills (DESIGN-2.0.md § C6.1: 22 rows; MIGRATION.md M6; skills/VENDOR.md; plus the 2 vendored
+# ── Skills (DESIGN-2.0.md § C6.1: 22 rows; MIGRATION.md M6; skills/VENDOR.md; plus the 3 vendored
 #    plugin skills, plugins/VENDOR.md) ──
 # The checkout's skills/ and the vendored plugins' skills/ dirs are the only skill sources: the
 # providers that would pull skills from ~/.claude, ~/.codex, ~/.agents, the profile's own
 # agent/skills, or the working directory are off (extensibility/skills.ts loadSkills
-# isSourceEnabled), and includeSkills names the 24 manifest `skill` rows exactly (omp://skills.md:
+# isSourceEnabled), and includeSkills names the 25 manifest `skill` rows exactly (omp://skills.md:
 # includeSkills is an allowlist; empty means all). The installer refuses a render whose list differs
 # from the manifest's `skill` rows, or whose customDirectories is not <repo>/skills followed by the
 # plugin skill dirs that hold a `skill` row. Reversal: an empty includeSkills with the providers back
@@ -143,6 +143,7 @@ skills:
     - "{repo}/skills"
     - "{repo}/plugins/ask-graham/skills"
     - "{repo}/plugins/i-have-audhd/skills"
+    - "{repo}/plugins/reminders-review/skills"
   includeSkills:
     - accessibility
     - api-and-interface-design
@@ -161,6 +162,7 @@ skills:
     - interview-me
     - observability-and-instrumentation
     - performance-optimization
+    - reminders-review
     - research
     - resolving-merge-conflicts
     - security-and-hardening

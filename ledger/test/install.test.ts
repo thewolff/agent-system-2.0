@@ -304,13 +304,14 @@ describe("install: symbolic links under a machinery directory are refused (S5)",
 describe("install: the vendored plugins' skills and loader (plugins/VENDOR.md)", () => {
 	const rendered = (home: string) => join(home, ".omp", "profiles", "agent-system-2", "agent", "config.yml");
 
-	test("the render lists <repo>/skills then both plugin skill dirs, names both plugin skills, and loads plugins/index.ts last", () => {
+	test("the render lists <repo>/skills then all three plugin skill dirs, names all three plugin skills, and loads plugins/index.ts last", () => {
 		const r = install("plugins-baseline");
 		expect(r.exitCode).toBe(0);
 		const doc = Bun.YAML.parse(readFileSync(rendered(r.home), "utf8")) as { extensions: string[]; skills: { customDirectories: string[]; includeSkills: string[] } };
-		expect(doc.skills.customDirectories).toEqual([`${copy}/skills`, `${copy}/plugins/ask-graham/skills`, `${copy}/plugins/i-have-audhd/skills`]);
+		expect(doc.skills.customDirectories).toEqual([`${copy}/skills`, `${copy}/plugins/ask-graham/skills`, `${copy}/plugins/i-have-audhd/skills`, `${copy}/plugins/reminders-review/skills`]);
 		expect(doc.skills.includeSkills).toContain("ask-graham");
 		expect(doc.skills.includeSkills).toContain("i-have-audhd");
+		expect(doc.skills.includeSkills).toContain("reminders-review");
 		expect(doc.extensions.at(-1)).toBe(`${copy}/plugins/index.ts`);
 	});
 

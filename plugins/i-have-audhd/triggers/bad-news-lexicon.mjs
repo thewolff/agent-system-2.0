@@ -1,23 +1,26 @@
 // bad-news-lexicon.mjs — bad-news-first trigger: a negative-lexicon gate over a substantive message.
 //
 // WHAT THIS DECIDES (the deterministic half only)
-//   Does the message have ≥ 200 substantive chars AND contain a word from the negative
+//   Does the unit have ≥ 200 substantive chars AND contain a word from the negative
 //   lexicon (failed, failure, error, broke, broken, blocker, regression, cannot, can't,
 //   rejected, lost, missed, wrong — configurable)? That is the TRIGGER. Lexicon words match
 //   at word START, case-insensitively, so "errors" matches "error" and "terror" does not.
+//   The Stop hook runs this per unit: each block-labeled section of a labeled message, or the
+//   whole message when it has no labels (checks/sections.mjs).
 //
 // WHY THE GATE IS DELIBERATELY OVER-INCLUSIVE
 //   "Fixed the error" and "tests failed yesterday, now green" both trip this gate while
 //   carrying no bad news at all. That is fine, because the gate decides APPLICABILITY, not
-//   guilt: whether a message contains GENUINELY bad news — and whether the first substantive
-//   sentence states it — is the whole judgment, and it belongs to the judge. A deterministic
-//   version of that judgment would flag every message that mentions an error on its way to
+//   guilt: whether a unit contains GENUINELY bad news — and whether its opening 20 words
+//   state it — is the whole judgment, and it belongs to the judge. A deterministic version
+//   of that judgment would flag every message that mentions an error on its way to
 //   reporting success.
 //
 // Usage:
 //   import { badNewsGate, badNewsQuestion } from "./bad-news-lexicon.mjs";
 
-import { classifyLines, proseCharCount } from "../checks/lines.mjs";
+import { classifyLines } from "../checks/lines.mjs";
+import { OPENING_WORDS } from "../checks/sections.mjs";
 
 const DEFAULTS = {
   minProseChars: 200,
@@ -29,14 +32,15 @@ const DEFAULTS = {
 
 export const badNewsQuestion =
   "Rule 'bad news first': when a message carries genuinely bad news — a failure, a blocker, a " +
-  "loss, a rejection — the FIRST substantive sentence states it or directly points to it. Not " +
-  "after the context that explains it; the explanation is welcome and goes second. Weigh this " +
+  `loss, a rejection — its opening ${OPENING_WORDS} words state it or directly point to it. Not ` +
+  "after the context that explains it; the explanation is welcome and goes second. A long " +
+  `first sentence that reaches the bad news only after word ${OPENING_WORDS} buries it. Weigh this ` +
   "honestly: technical prose that merely CONTAINS the words error, failed, or broken while " +
   "reporting success ('fixed the error', 'tests failed yesterday, now green') is NOT bad " +
   "news — bad news is a present, unresolved cost to the reader. Answer violation=true only " +
-  "when the message contains genuinely bad news AND the first substantive sentence neither " +
-  "states it nor directs the reader to it. When unsure, or when there is no genuinely bad " +
-  "news, answer violation=false.";
+  `when the message contains genuinely bad news AND its opening ${OPENING_WORDS} words neither ` +
+  "state it nor direct the reader to it. When unsure, or when there is no genuinely bad news, " +
+  "answer violation=false.";
 
 export function badNewsGate(text, options = {}) {
   const opts = { ...DEFAULTS, ...options };

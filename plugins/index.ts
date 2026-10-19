@@ -1,6 +1,7 @@
 // plugins/index.ts — the one OMP extension entry for Jo's vendored plugins (plugins/VENDOR.md):
-// i-have-audhd (the AuDHD writing core at session start, a warn-only Stop check) and ask-graham
-// (a hidden "should we build this?" nudge on each typed input at intensity every-idea).
+// i-have-audhd (the AuDHD writing core at session start, a warn-only Stop check whose findings reach
+// the next turn) and ask-graham (a hidden "should we build this?" nudge at each agent start at
+// intensity every-idea, and a once-per-turn Stop check for the verdict line, VENDOR.md C12).
 //
 // Orchestrator session only (AGENT_SYSTEM_ROLE=orchestrator, set by bin/as2). A lane is an
 // `omp --mode rpc` session (surface/src/launch.ts laneArgv), so every runner prompt arrives as an

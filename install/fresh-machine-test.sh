@@ -4,7 +4,7 @@
 # $HOME, and that the OMP profile lands under it too: config.yml rendered from profile/config.yml
 # with {repo} filled, models.yml beside it, the six tier files linked into agents/, and OMP's own
 # skill discovery under that HOME and profile listing exactly the manifest's `skill` rows (the
-# 24 of DESIGN-2.0.md § C6.1, including 2 from vendored plugins) with decoy skills planted in ~/.claude and ~/.agents not among them,
+# 22 of DESIGN-2.0.md § C6.1 plus 3 from vendored plugins) with decoy skills planted in ~/.claude and ~/.agents not among them,
 # and OMP's own extension loading under that HOME and profile loading exactly the four configured
 # extensions in the order surface, gates, classifier, plugins, with no load error. The launcher
 # (`launcher` rows, bin/as2) is linked at $HOME/.local/bin/as2, `as2 --print` prints the exact omp
@@ -122,6 +122,7 @@ grep -qF -- "- \"$CLONE/classifier/extension.ts\"" "$PROFILE/config.yml" || die 
 grep -qF -- "- \"$CLONE/gates/index.ts\"" "$PROFILE/config.yml" || die "rendered config does not name the gates extension by the clone's path"
 grep -qF -- "- \"$CLONE/plugins/ask-graham/skills\"" "$PROFILE/config.yml" || die "rendered config does not point customDirectories at $CLONE/plugins/ask-graham/skills"
 grep -qF -- "- \"$CLONE/plugins/i-have-audhd/skills\"" "$PROFILE/config.yml" || die "rendered config does not point customDirectories at $CLONE/plugins/i-have-audhd/skills"
+grep -qF -- "- \"$CLONE/plugins/reminders-review/skills\"" "$PROFILE/config.yml" || die "rendered config does not point customDirectories at $CLONE/plugins/reminders-review/skills"
 cmp -s "$CLONE/profile/models.yml" "$PROFILE/models.yml" || die "models.yml under the profile differs from profile/models.yml"
 ok "config.yml rendered with {repo}=$CLONE; models.yml placed beside it"
 TIERS="$(cd "$CLONE/tiers" && find . -maxdepth 1 -name '*.md' -type f | sed 's|^\./||' | LC_ALL=C sort)"
@@ -144,7 +145,7 @@ done
 # the names, WANT_AT each name with the exact file it must be discovered from.
 WANT_AT="$(awk -F'\t' -v clone="$CLONE" '$2 == "skill" { n = $1; sub(/\/SKILL\.md$/, "", n); sub(/^.*\//, "", n); print n "\t" clone "/" $1 }' "$CLONE/install/manifest.tsv" | LC_ALL=C sort)"
 WANT="$(printf '%s\n' "$WANT_AT" | cut -f1)"
-[ "$(printf '%s' "$WANT" | grep -c .)" -eq 24 ] || die "manifest has $(printf '%s' "$WANT" | grep -c .) skill rows, expected 24 (DESIGN-2.0.md § C6.1's 22 plus the 2 vendored plugin skills)"
+[ "$(printf '%s' "$WANT" | grep -c .)" -eq 25 ] || die "manifest has $(printf '%s' "$WANT" | grep -c .) skill rows, expected 25 (DESIGN-2.0.md § C6.1's 22 plus the 3 vendored plugin skills)"
 # The listing goes through the installed omp package's own discovery (Settings → cfgSkills →
 # discoverSkills), the code path the CLI uses (sdk.ts `cfgSkills.get(settings)`; OMP 18.4.4 has no
 # Settings.getGroup, which this step called on 18.3.0); omp has no skill-listing subcommand.
@@ -170,7 +171,7 @@ grep -q 'decoy' "$LISTING" && die "a decoy skill was discovered"
 GOT_AT="$(awk -F'\t' 'NF == 3 && $1 != "warning" { print $1 "\t" $3 }' "$LISTING" | LC_ALL=C sort)"
 [ "$GOT_AT" = "$WANT_AT" ] || die "a discovered skill does not come from its manifest row's file; got: $(printf '%s' "$GOT_AT" | tr '\n' ' ')"
 grep -q '^warning' "$LISTING" && die "skill discovery reported warnings"
-ok "exactly 24 skills discovered, each from its manifest row's file (22 under $CLONE/skills, 2 under $CLONE/plugins/*/skills), no decoy, no warnings; listing kept at $LISTING"
+ok "exactly 25 skills discovered, each from its manifest row's file (22 under $CLONE/skills, 3 under $CLONE/plugins/*/skills), no decoy, no warnings; listing kept at $LISTING"
 
 # The same package's extension loading, as a session does it (sdk.ts discoverSessionExtensionPaths:
 # cfgExtensions + cfgDisabledExtensions read from settings — OMP 18.4.4 has no Settings.get —
