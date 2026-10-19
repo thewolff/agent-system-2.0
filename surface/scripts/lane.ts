@@ -62,7 +62,7 @@ import { decisionLogContext, repoOf } from "../src/decision-log";
 import { factsBlock } from "../src/facts";
 import { ownerTasks } from "../src/merge-train";
 import {
-	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
+	attempts, branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, scratchCapMb, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
@@ -76,7 +76,7 @@ import { waitingReserved } from "../src/errors";
 import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
 import { PAIR_OPTION, type PairSignalId, pairOffer, pairOfferBody, readPairSuggestConfig } from "../src/pair-suggest";
 import { decideRanked, drainOrder, type RankConfig, rankShadowLine, readRankConfig, writePickSnapshot } from "../src/rank-launch";
-import { laneDeaths } from "../src/signals";
+import { laneDeaths, laneDiedSignalBody } from "../src/signals";
 import { readTracingSetting, tracingEnv } from "../src/tracing";
 import { parseHeartbeat, runDirOf, runsRoot, testRuns } from "../src/test-run";
 import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV } from "../src/types";
@@ -1072,6 +1072,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	let outcome: LaneOutcome | null = null;
 	/** The accepted stop's reason for `lane-exit: … outcome stop reason <r>` (decision 6; Codex review 2, R6). */
 	let stopReason: string | null = null;
+	/** The signal (SIGTERM / SIGINT) whose stop ended the lane: a restart, recorded as a death (PLAN wl-mvfqvd5hy8zv28 § 1.2). */
+	let stopSignal: NodeJS.Signals | null = null;
 	/** The death line conclude() (with its background suffix) or failModel() decided, retried first in finish() whatever the holder. */
 	let decidedDeath: string | null = null;
 	let ready = false;
@@ -1249,6 +1251,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			}
 			let drained = false;
 			const owned = writeAsOwner(ledger, lock, () => {
+				// A restart death whose write in stop() failed lands here; a no-op when it is there, or once a successor's launch: is newer.
+				if (stopSignal !== null) restartDeath(stopSignal);
 				if (exit?.death) enqueueRunnerDeath(ledger, { workloadId: wl, laneId, body: exit.death });
 				if (held && !intended && !laneDeaths(ledger, wl).some((d) => d.holder === laneId)) {
 					const body = final === "never-ready"
@@ -1278,19 +1282,38 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	};
 
 	/**
+	 * A restart's canonical death (PLAN wl-mvfqvd5hy8zv28 § 1.2), inside the caller's owner write: `lane-died: … stopped by signal`,
+	 * only while this lane is the workload's newest attempt and the workload is open, at most once per lane (enqueueRunnerDeath).
+	 */
+	const restartDeath = (sig: NodeJS.Signals): void => {
+		const cur = ledger.workload(wl);
+		if (cur === null || cur.status !== "open") return;
+		if (attempts(controlEntries(ledger.entries(wl))).at(-1)?.laneId !== laneId) return;
+		enqueueRunnerDeath(ledger, { workloadId: wl, laneId, body: laneDiedSignalBody(laneId, sig, cur.open_slices + cur.paused_slices) });
+	};
+
+	/**
 	 * A stop, from the ledger or a signal: acceptance persisted first, then abort and end (decision 14). A stop after the
 	 * runner decided the outcome (and enqueued its death) is accepted and recorded, and the decided outcome stands (D3).
+	 * A signal stop (`sig`, a restart) writes its acceptance and, when it is what ends the lane, its death in one owner write
+	 * before the abort reaches omp (PLAN wl-mvfqvd5hy8zv28 § 1.2): nothing can release the lane before it, so the death precedes
+	 * any successor's launch:; a runner whose lock names another runner writes neither.
 	 */
-	const stop = (ref: string, reason: string): void => {
+	const stop = (ref: string, reason: string, sig: NodeJS.Signals | null = null): void => {
 		if (outcome === "stop" || finished) return;
 		try {
-			record(laneStopAcceptedBody(laneId, ref));
+			if (sig === null) record(laneStopAcceptedBody(laneId, ref));
+			else if (!writeAsOwner(ledger, lock, () => {
+				record(laneStopAcceptedBody(laneId, ref));
+				if (outcome === null) restartDeath(sig);
+			})) process.stderr.write(`runner: ${lock.path} names another runner or none; the signal stop was not recorded\n`);
 		} catch (err) {
 			process.stderr.write(`runner: the stop acceptance could not be written: ${String(err)}\n`);
 		}
 		if (outcome === null) {
 			outcome = "stop";
 			stopReason = reason;
+			stopSignal = sig;
 			send({ id: "abort", type: "abort" });
 		}
 		end();
@@ -1391,8 +1414,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			conclude("error", turnEndFailedDeathBody(laneId, String(err)));
 		}
 	};
-	process.on("SIGTERM", () => stop("signal", "signal"));
-	process.on("SIGINT", () => stop("signal", "signal"));
+	process.on("SIGTERM", () => stop("signal", "signal", "SIGTERM"));
+	process.on("SIGINT", () => stop("signal", "signal", "SIGINT"));
 	process.on("SIGHUP", () => undefined);
 
 	try {

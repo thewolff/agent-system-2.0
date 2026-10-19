@@ -1,18 +1,18 @@
 // The signal rows the lane writes and the surface reads (surface/src/signals.ts): a lapsed lease
-// recorded once per holder and lease, prompt waits resolved by their own row or by the lane's
+// recorded once per lane (any lane-died: row naming it counts), prompt waits resolved by their own row or by the lane's
 // death, the newest artifact-command declaration per live slice (and per open, paused or done slice
 // for the artifact-tree recorder), failures counted since the last pass, and the artifact-tree
 // records of passing runs.
 import { describe, expect, test } from "bun:test";
 import {
-	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, artifactTrees, laneDeaths, laneDiedShutdownBody,
+	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, artifactTrees, laneDeaths, laneDiedShutdownBody, laneDiedSignalBody,
 	openPromptWaits, promptResolvedBody, promptWaitBody, recordableArtifactCommands, recordLapsedLease, recordLapsedLeases, unrecordedLapse,
 } from "../src/signals";
 import { ORCHESTRATOR_RECIPIENT } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
 
 describe("lapsed leases", () => {
-	test("recorded once per holder and lease, only when lapsed; a renewed lease that lapses again is a new death", () => {
+	test("recorded once per lane, only when lapsed; the same lane's renewed lease that lapses again adds no second death, another lane's lapse does (PLAN wl-mvfqvd5hy8zv28 § 1.2)", () => {
 		const c = clock("2026-09-01T10:00:00.000Z");
 		const { ledger } = tempLedger(c.now);
 		const { wl } = workloadWithSlice(ledger);
@@ -27,11 +27,18 @@ describe("lapsed leases", () => {
 		expect(recordLapsedLease(ledger, ledger.workload(wl)!, "surface", c.now())).toBeNull();
 		expect(recordLapsedLeases(ledger, "surface", c.now())).toEqual([]);
 		expect(laneDeaths(ledger, wl)).toEqual([expect.objectContaining({ id, holder: "lane-a", state: "held", body: "lane-died: lane-a: lease lapsed 2026-09-01T11:00:00.000Z" })]);
-		// the same lane renews (a reclaim after a lapse) and lapses again: a second death
+		// the same lane renews (a reclaim after a lapse) and lapses again: still its one death, and no unrecorded lapse
 		ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 });
 		c.plusHours(2);
+		expect(unrecordedLapse(ledger, ledger.workload(wl)!, c.now())).toBe(false);
+		expect(recordLapsedLeases(ledger, "surface", c.now())).toEqual([]);
+		expect(laneDeaths(ledger, wl).map((d) => d.id)).toEqual([id]);
+		// another lane takes over and lapses: its own death
+		ledger.claimWorkload(wl, { by: "lane-c", holder: "lane-c", leaseMs: 3_600_000 });
+		c.plusHours(2);
+		expect(unrecordedLapse(ledger, ledger.workload(wl)!, c.now())).toBe(true);
 		expect(recordLapsedLeases(ledger, "surface", c.now())).toHaveLength(1);
-		expect(laneDeaths(ledger, wl)).toHaveLength(2);
+		expect(laneDeaths(ledger, wl).map((d) => d.holder)).toEqual(["lane-a", "lane-c"]);
 		// a closed workload records nothing (the close waits for the lease to lapse: closeWorkload refuses a live holder, Codex review S2)
 		const other = workloadWithSlice(ledger);
 		ledger.claimWorkload(other.wl, { by: "lane-b", holder: "lane-b", leaseMs: 1000 });
@@ -39,6 +46,18 @@ describe("lapsed leases", () => {
 		c.plusHours(1);
 		ledger.closeWorkload(other.wl, { by: "lane-b" });
 		expect(recordLapsedLease(ledger, ledger.workload(other.wl)!, "surface", c.now())).toBeNull();
+	});
+
+	test("a lane whose runner recorded its restart death (stopped by signal) and then lapsed gets no lease-lapse death and no unrecorded lapse (review r6 F2, r7 F1)", () => {
+		const c = clock("2026-09-01T10:00:00.000Z");
+		const { ledger } = tempLedger(c.now);
+		const { wl } = workloadWithSlice(ledger);
+		ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 });
+		const death = ledger.enqueue({ by: "lane-runner", workloadId: wl, sender: "lane-runner", recipient: ORCHESTRATOR_RECIPIENT, body: laneDiedSignalBody("lane-a", "SIGTERM", 1) });
+		c.plusHours(2);
+		expect(unrecordedLapse(ledger, ledger.workload(wl)!, c.now())).toBe(false);
+		expect(recordLapsedLease(ledger, ledger.workload(wl)!, "surface", c.now())).toBeNull();
+		expect(laneDeaths(ledger, wl)).toEqual([expect.objectContaining({ id: death, holder: "lane-a", body: "lane-died: lane-a: stopped by signal SIGTERM (restart), 1 open slice(s)" })]);
 	});
 });
 

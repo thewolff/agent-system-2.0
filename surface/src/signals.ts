@@ -4,9 +4,10 @@
 // the body formats so the writers (surface/extensions/lane.ts, gates row 8, the surface's own
 // lease observer) and the readers (errors.ts) cannot drift.
 //
-// - `lane-died: <holder>: lease lapsed <until>` / `… session shutdown at <t>`: the owning session is
-//   gone with the workload still open (§ B3 item 4). Written by whoever observes it first: the lane
-//   itself at session_shutdown, a reclaiming lane before it takes the workload over, or the surface
+// - `lane-died: <holder>: lease lapsed <until>` / `… session shutdown at <t>` / `… stopped by signal <SIG> (restart)`: the
+//   owning session is gone with the workload still open (§ B3 item 4), one row per lane. Written by whoever observes it
+//   first: the runner when a restart signal stops it, the lane itself at session_shutdown, a reclaiming lane before it
+//   takes the workload over, or the surface
 //   when it reads a lapsed lease. Held until the surface renders it, then `delivered`: that state
 //   change is the "surfaced once" mark (SPEC-2.0.md:411-412), so a takeover or a reopen never
 //   erases the death and a repeated wake never repeats it.
@@ -48,6 +49,14 @@ export function laneDiedShutdownBody(holder: string, at: string, openSlices: num
 	return `${LANE_DIED_PREFIX} ${holder}: session shutdown at ${at} with ${openSlices} open slice(s)`;
 }
 
+/**
+ * The body of the death the runner records when a restart's SIGTERM/SIGINT stops its lane, in the transaction that accepts
+ * the signal (PLAN wl-mvfqvd5hy8zv28 § 1.2): a graceful restart stop releases the holder, so no lapse would record it.
+ */
+export function laneDiedSignalBody(laneId: string, signal: string, openSlices: number): string {
+	return `${LANE_DIED_PREFIX} ${laneId}: stopped by signal ${signal} (restart), ${openSlices} open slice(s)`;
+}
+
 const LANE_DIED_BODY = /^lane-died:\s*(\S+?):\s/;
 
 /** Every lane-died message on a workload, oldest first (any state). */
@@ -59,22 +68,22 @@ export function laneDeaths(ledger: Ledger, workloadId: string): LaneDeath[] {
 }
 
 /**
- * Persist the death of `workload`'s holder whose lease has lapsed, once per (holder, lease):
- * the same lapse observed by the surface and by a reclaiming lane lands one row. Returns the
- * message id, or null when the lease is live, there is no holder, or the row already exists.
+ * Persist the death of `workload`'s holder whose lease has lapsed, once per lane (the guard `enqueueRunnerDeath` keeps,
+ * PLAN wl-mvfqvd5hy8zv28 § 1.2): the same lapse observed by the surface and by a reclaiming lane lands one row, and a lane
+ * whose death is already recorded (its runner's restart death, its own shutdown) gets no second one, so each lane has one
+ * death row and one death time. Returns the message id, or null when the lease is live, there is no holder, or a
+ * lane-died message already names the holder.
  */
 export function recordLapsedLease(ledger: Ledger, workload: WorkloadStatusRow, by: string, now: string = ledger.now()): string | null {
 	if (workload.status !== "open" || !workload.holder || !workload.holder_lease_until || workload.holder_lease_until >= now) return null;
-	const body = laneDiedLapsedBody(workload.holder, workload.holder_lease_until);
-	if (laneDeaths(ledger, workload.id).some((d) => d.body === body)) return null;
-	return ledger.enqueue({ by, workloadId: workload.id, sender: by, recipient: ORCHESTRATOR_RECIPIENT, body });
+	if (laneDeaths(ledger, workload.id).some((d) => d.holder === workload.holder)) return null;
+	return ledger.enqueue({ by, workloadId: workload.id, sender: by, recipient: ORCHESTRATOR_RECIPIENT, body: laneDiedLapsedBody(workload.holder, workload.holder_lease_until) });
 }
 
-/** A lapsed lease no lane-died row records yet (the surface writes it before rendering; pure readers see it here). */
+/** A lapsed lease whose holder no lane-died row names yet (the surface writes it before rendering; pure readers see it here). */
 export function unrecordedLapse(ledger: Ledger, workload: WorkloadStatusRow, now: string): boolean {
 	if (!workload.holder || !workload.holder_lease_until || workload.holder_lease_until >= now) return false;
-	const body = laneDiedLapsedBody(workload.holder, workload.holder_lease_until);
-	return !laneDeaths(ledger, workload.id).some((d) => d.body === body);
+	return !laneDeaths(ledger, workload.id).some((d) => d.holder === workload.holder);
 }
 
 /** `recordLapsedLease` over every open workload; the ids written. The surface calls this before every read. */

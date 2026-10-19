@@ -16,6 +16,8 @@ import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, type QuestionRow, TEST_RUNNER_
 import { ceilingBody, CEILING_OPTIONS, parseSpend } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
 import { branchName, type ControlEntry, doneBody, laneCap, laneDir, laneEnv, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, verdictOf, worktreePath } from "../src/launch";
+import { errorLines } from "../src/errors";
+import { laneDeaths, laneDiedSignalBody, recordLapsedLeases, unrecordedLapse } from "../src/signals";
 import { heartbeatText, runDirOf, runsRoot, testRequestedBody, testRunBody } from "../src/test-run";
 // A namespace import, not named ones: a name lane.ts stops exporting fails only the test that calls it, not the module load.
 import * as laneScript from "../scripts/lane";
@@ -81,6 +83,15 @@ const ctxIndexOf = (r: LaneRoot, wl: string, laneId: string, n = 2) =>
 		const rows = laneSnapshot(r, wl).control.filter((c) => c.prefix === "ctx-index" && c.laneId === laneId);
 		return rows.length >= n ? rows : null;
 	});
+/** The workload's lane-died messages, oldest first, with their times. */
+const deathRows = (r: LaneRoot, wl: string) => {
+	const l = ledgerOf(r);
+	try {
+		return laneDeaths(l, wl);
+	} finally {
+		l.close();
+	}
+};
 
 describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 	test("launch reserves and prints the lane and runner; the runner records start (twice: null then the session), ready after the lane's own claim, the prompt, completion, release and lane-exit: completed; a second launch while held is refused with nothing written", async () => {
@@ -458,7 +469,7 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(alive(started.pid)).toBe(false);
 	}, 40_000);
 
-	test("B4 stop from a signal: SIGTERM to the runner persists `accepted signal`, abort ends the prompt, outcome stop, no lane-died:", async () => {
+	test("B4 stop from a signal (a restart, PLAN wl-mvfqvd5hy8zv28 § 1.2): SIGTERM to the runner persists `accepted signal` and exactly one `lane-died: … stopped by signal SIGTERM (restart)`, abort ends the prompt, outcome stop, released; finish writes no second death", async () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r, { slice: true });
 		setScript(r, { steps: [{ hang: true }] });
@@ -470,11 +481,112 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const exit = await exitOf(r, wl, laneId);
 		expect(exit).toMatchObject({ code: "0", signal: "-", outcome: "stop", reason: "signal" });
 		const snap = laneSnapshot(r, wl);
-		expect(snap.deaths).toEqual([]);
+		expect(snap.deaths).toEqual([laneDiedSignalBody(laneId, "SIGTERM", 1)]);
 		expect(snap.workload!.holder).toBeNull();
 		expect(snap.bodies).toContain(`${LANE_RUNNER_BY} lane-stop: ${laneId} accepted signal`);
+		// the death is written with the acceptance, before the exit
+		const accepted = snap.control.find((c) => c.prefix === "lane-stop" && c.laneId === laneId)!;
+		const death = deathRows(r, wl)[0]!;
+		const exitAt = snap.control.find((c) => c.prefix === "lane-exit" && c.laneId === laneId)!.createdAt;
+		expect(death.created_at >= accepted.createdAt && death.created_at <= exitAt).toBe(true);
 		expect(eventsOf(r, started.pid)).toEqual(["prompt", "abort", "eof"]);
 	}, 30_000);
+
+	test("restart sequence (PLAN wl-mvfqvd5hy8zv28 sl-rl-runner): acceptance → the lane's shutdown release → a catch-up reservation → the runner's late finish gives one lane-died:, the signal one, before the successor's launch:, and no second", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice: true });
+		// The window is held open by the fake: its helper keeps omp's stdout open past its exit, so finish() waits for the gate.
+		const gate = join(r.root, "stdout-gate");
+		setScript(r, { steps: [{ hang: true }], holdStdoutUntil: gate });
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		await readyOf(r, wl, laneId);
+		const started = (await startedOf(r, wl, laneId))!;
+		process.kill(started.runnerPid, "SIGTERM");
+		// omp aborts, gets EOF, and its lane row's shutdown releases (the accepted stop is intended); the runner has not finished
+		await until("the shutdown's release", () => laneSnapshot(r, wl).workload!.holder === null);
+		await until("omp gone", () => !alive(started.pid), 10_000);
+		expect(laneExit(laneSnapshot(r, wl).control, laneId)).toBeNull();
+		// the catch-up's reservation of a successor, through the launch predicate inside reserveLane's transaction
+		const l = ledgerOf(r);
+		let successor: string;
+		try {
+			l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: `launch-requested: by jo at ${l.now()}` });
+			const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", decide: verdictOf });
+			if (!res.ok) throw new Error(res.reason);
+			successor = res.laneId;
+		} finally {
+			l.close();
+		}
+		writeFileSync(gate, "");
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "stop", reason: "signal" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.deaths).toEqual([laneDiedSignalBody(laneId, "SIGTERM", 1)]);
+		expect(snap.workload!.holder).toBe(successor);
+		const launch = snap.control.find((c) => c.prefix === "launch" && c.laneId === successor)!;
+		expect(deathRows(r, wl)[0]!.created_at < launch.createdAt).toBe(true);
+	}, 60_000);
+
+	test("a runner SIGKILLed before any signal stop writes no death; with omp gone too, its lease lapse is the surface's to record", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice: true });
+		setScript(r, { steps: [{ hang: true }], ignoreEof: true });
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		await readyOf(r, wl, laneId);
+		const started = (await startedOf(r, wl, laneId))!;
+		process.kill(started.runnerPid, "SIGKILL");
+		process.kill(started.pid, "SIGKILL");
+		await until("runner and omp gone", () => !alive(started.runnerPid) && !alive(started.pid), 10_000);
+		const snap = laneSnapshot(r, wl);
+		expect(snap.deaths).toEqual([]);
+		expect(snap.workload!.holder).toBe(laneId);
+		const lapsed = snap.workload!.holder_lease_until!;
+		const l = ledgerOf(r);
+		try {
+			// one second past the lease: it has lapsed
+			expect(recordLapsedLeases(l, SURFACE_BY, new Date(Date.parse(lapsed) + 1000).toISOString())).toHaveLength(1);
+		} finally {
+			l.close();
+		}
+		expect(laneSnapshot(r, wl).deaths).toEqual([`lane-died: ${laneId}: lease lapsed ${lapsed}`]);
+		// the by-hand stop writes the exit the root's settle waits for
+		expect(lane(r, ["stop", wl]).code).toBe(0);
+	}, 30_000);
+
+	test("a runner killed after the signal's acceptance and before its release: the lease lapses and the surface reads; still exactly one lane-died:, the signal one, no unrecorded lapse and no synthetic death line (review r6 F2, r7 F1)", async () => {
+		// The runner's SIGKILL of omp after EOF is 30 s out: the test kills both first, so nothing releases the lane.
+		const r = makeRoot({ AGENT_SYSTEM_LANE_END_GRACE_MS: "30000" });
+		const { wl } = openWorkload(r, { slice: true });
+		setScript(r, { steps: [{ hang: true }], ignoreAbort: true, ignoreEof: true });
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		await readyOf(r, wl, laneId);
+		const started = (await startedOf(r, wl, laneId))!;
+		process.kill(started.runnerPid, "SIGTERM");
+		await until("the restart death", () => laneSnapshot(r, wl).deaths.length > 0);
+		process.kill(started.runnerPid, "SIGKILL");
+		process.kill(started.pid, "SIGKILL");
+		await until("runner and omp gone", () => !alive(started.runnerPid) && !alive(started.pid), 10_000);
+		const snap = laneSnapshot(r, wl);
+		expect(snap.workload!.holder).toBe(laneId);
+		expect(laneExit(snap.control, laneId)).toBeNull();
+		const later = new Date(Date.parse(snap.workload!.holder_lease_until!) + 1000).toISOString();
+		const [death] = deathRows(r, wl);
+		const l = ledgerOf(r);
+		try {
+			expect(recordLapsedLeases(l, SURFACE_BY, later)).toEqual([]);
+			expect(unrecordedLapse(l, l.workload(wl)!, later)).toBe(false);
+			const died = errorLines(l, l.inFlight(), { now: later }).filter((x) => x.kind === "lane-died" && x.workloadId === wl);
+			expect(died.map((x) => x.rowId)).toEqual([death!.id]);
+		} finally {
+			l.close();
+		}
+		expect(laneSnapshot(r, wl).deaths).toEqual([laneDiedSignalBody(laneId, "SIGTERM", 1)]);
+		// its time is the one death time a relaunch backs off from
+		expect(deathRows(r, wl).map((d) => d.created_at)).toEqual([death!.created_at]);
+		expect(lane(r, ["stop", wl]).code).toBe(0);
+	}, 60_000);
 
 	test("R5 (review 2): the session record that lands after an accepted stop keeps the stop intended — the shutdown with a slice open writes no lane-died:", async () => {
 		const r = makeRoot();
