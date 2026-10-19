@@ -156,7 +156,12 @@ Exactly five things surface unsolicited (SPEC-2.0.md § B3), one line each, unde
    workload over since. On a user-driven workload that line ends `continue it with as2 lane
    wl-…, close, or instruct`, never "relaunch". After Jo takes `pair`, the workload shows the
    taken line in its place: `you took pair on <workload> (q-…); its lane has ended. Continue it
-   in another terminal:`, then `as2 lane wl-…` alone on the next line;
+   in another terminal:`, then `as2 lane wl-…` alone on the next line. On an autonomous workload
+   the machinery relaunches a dead lane itself (SPEC-2.0.md § B3 item 4, *Amended 2026-10-19 —
+   dead lanes relaunch*) and hides its death line meanwhile, so do not relaunch it on your own. The
+   line to act on is the unnumbered `incident on <workload>: relaunch of <lane> stopped after 3/3
+   retries without progress: …`, shown once: offer Jo relaunch (`orchestrator_launch_lane` on Jo's
+   word, which starts the count again), close, or an instruction;
 5. a lane waiting on a human: an open `question` row, rendered at once with its options, or a
    human prompt a lane's session opened anyway (a tool approval or an `ask`), named with the
    session to answer or end. Jo's one-word answer to a question is the option name; it becomes

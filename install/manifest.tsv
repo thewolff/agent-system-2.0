@@ -1245,6 +1245,13 @@ surface/test/rank.test.ts	test	-
 surface/test/rank-tool.test.ts	test	-
 surface/test/rank-audit.test.ts	test	-
 surface/test/rank-launch.test.ts	test	-
+# Dead-lane relaunch (migration/items/dead-lane-relaunch.md): the relaunch reading, the retry budget and its one incident
+# (escalation phase 2 imports incident.ts), the surface's pre-read step and death hiding, and their tests.
+surface/src/relaunch.ts	module	-
+surface/src/incident.ts	module	-
+surface/src/relaunch-surface.ts	module	-
+surface/test/relaunch.test.ts	test	-
+surface/test/relaunch-tick.test.ts	test	-
 # Phoenix tracing (wl-mv65t5d34lts00): the tracing switch (reader, word, tests) and the Phoenix LaunchAgent,
 # on by default. install/phoenix-agent.sh fills and loads the plist; install.sh runs it (step 6e).
 install/com.agent-system-2.phoenix.plist	install	-

@@ -448,6 +448,23 @@ complexity). Exactly four things surface unsolicited, one line each in the singl
    **twice** (starting number, Jo's to change); **amended 2026-10-01:** a review slice's failed review rounds are not counted here but by the review round limit (§ B4, *Amended 2026-10-01 — review round limit*), and this count stays for every other slice;
 4. a lane that died — session gone, workload still open — surfaced once even if the orchestrator
    reopens it, because a vanished worker is the 1.x "seat forgot" failure Jo wants to see.
+   **Amended 2026-10-19 — dead lanes relaunch** (`migration/items/dead-lane-relaunch.md`; flow fix 2 of
+   the flow-repair ruling in-mvfiztvfi7ez28, backoff by Jo's steer in-mvfrxewspo835s; built in
+   wl-mvfqvd5hy8zv28). On an autonomous workload a lane that died (an unintended exit, a signal stop,
+   a lapsed lease) while the workload has an open unpaused slice and no open question is relaunched by
+   the machinery's drain or tick, within the lane cap and in rank order, with the launch cause
+   `relaunch <dead lane> <n>`. Relaunch 1 is immediate; relaunches 2 and 3 wait 10 minutes after the
+   replaced death's `lane-died:` message. After `RETRY_LIMIT` = 3 relaunches without progress (a new
+   slice, a slice done, a new question, a `done-because:`, a new artifact tree) the surface writes
+   exactly one `incident: relaunch …` message, shown as one needs-you line naming Jo's choices
+   (relaunch with `orchestrator_launch_lane`, close, or instruct); nothing relaunches the workload
+   again until Jo's word. The count resets on progress and on Jo's word. Parked (a paused slice or an
+   open question), done (`done-because:`), Jo-stopped (`lane-stop … by jo`, or the runner's `accepted
+   ceiling`) and user-driven workloads are never relaunched, and the merge-train workload is excluded.
+   While a relaunch takes a death on (due, waiting out the backoff, or named by a later `relaunch`
+   cause), its death and idle lines are hidden; the incident is then the line this item surfaces. A
+   death the relaunch does not take on is surfaced once, as above. The limit, the counting rule and the
+   incident line are defined once (`surface/src/incident.ts`), for escalation phase 2 to share.
 Everything else — a hand failing once, a retry, a slow slice, a ceiling cap firing, a workload
 opening or closing — stays inside the lane and the ledger, queryable on demand. P-16 proposals
 ride this same channel. Rejected, recorded for Session C not to re-propose: narrower (items 1–2
