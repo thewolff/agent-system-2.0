@@ -6,19 +6,22 @@
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY, type WorkloadRow } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY, type WorkloadRow } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { recordRepo, repoOf } from "../src/decision-log";
 import { errorLines, trainRouted } from "../src/errors";
+import { recordIncidentOnce, RETRY_LIMIT } from "../src/incident";
 import { applyTrain, interpret } from "../src/input";
-import { controlEntries, firstPrompt, laneExitBody, trainFixBody } from "../src/launch";
 import {
-	fixBindings, forkOf, forkTaskAlert, nextAttempt, openTrainFix, ownerDeliveries, ownerTasks, recordTrainTask, settleTasks, type TaskView, TRAIN_TASK_KINDS, type TrainPush, type TrainTask,
-	trainPushesOf,
-	trainSliceId, trainTaskWindows, twiceFailed, unsettledTasks,
+	controlEntries, decideLaunch, firstPrompt, laneDiedExitBody, laneExitBody, launchRequestedBody, laneStopAcceptedBody, laneStopRequestBody, trainFixBody, verdictOf,
+} from "../src/launch";
+import {
+	fixBindings, forkOf, forkTaskAlert, heldTrainPrs, nextAttempt, openTrainFix, ownerDeliveries, ownerTasks, raiseTwiceFailed, recordTrainTask, settleTasks, type TaskView,
+	TRAIN_TASK_KINDS, trainHeldDetail, type TrainPush, type TrainTask, trainPushesOf, trainSliceId, trainTaskWindows, twiceFailed, unsettledTasks,
 } from "../src/merge-train";
+import { relaunchState } from "../src/relaunch";
 import { makeRunId, pushDestBody, testRequestedBody, type TestRun, testRunBody, testRunFailedBody } from "../src/test-run";
-import { INSTRUCTION_POLL_MS, LANE_TOOLS, LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX } from "../src/types";
+import { INSTRUCTION_POLL_MS, LANE_TOOLS, LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX } from "../src/types";
 import { clock, ctxOf, fakePi, tempLedger, timers, tmp } from "./helpers";
 
 const REPO = "thewolff/product";
@@ -623,5 +626,255 @@ describe("train-aware routing (D9 F16)", () => {
 		expect(w.settle({ 101: H2 })).toEqual([expect.stringContaining(`${t.id} failed run ${red} red`)]);
 		// settled: its counted red stays routed, but the error it never counted now reaches Jo
 		expect(shown()).toEqual([mError]);
+	});
+});
+
+describe("an owner death the relaunch takes on is not a train attempt (PLAN wl-mvfqvd5hy8zv28 § 1.7)", () => {
+	const MIN_H = 1 / 60;
+	/**
+	 * The owner's lanes as the starter and the runner leave them on `w`'s ledger. `reserve` is `reserveLane` under the launch
+	 * predicate, so its cause is the relaunch counter as written. `die` ends lane `laneId` as the runner does: an unintended
+	 * `lane-exit:` and its `lane-died:`, or for `signal` the restart stop's acceptance, death and exit (§ 1.2); then the release.
+	 */
+	const lanes = (w: { ledger: Ledger; owner: string }) => {
+		const reserve = (leaseMs = 10 * 60_000) => {
+			const r = w.ledger.reserveLane(w.owner, { by: LANE_STARTER_BY, cap: 5, leaseMs, requestedBy: "tick", decide: decideLaunch });
+			if (!r.ok) throw new Error(r.reason);
+			return r;
+		};
+		const runner = (body: string) => w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.owner, kind: "assumption", body });
+		const died = (body: string) => w.ledger.enqueue({ by: LANE_RUNNER_BY, workloadId: w.owner, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body });
+		const die = (laneId: string, how: "error" | "open-work" | "signal" = "error") => {
+			if (how === "signal") {
+				runner(laneStopAcceptedBody(laneId, "signal"));
+				died(`lane-died: ${laneId}: stopped by signal SIGTERM (restart), 1 open slice(s)`);
+				runner(laneExitBody(laneId, { code: null, signal: "SIGTERM", outcome: "stop", reason: "signal" }));
+			} else {
+				runner(laneExitBody(laneId, { code: 1, signal: null, outcome: how }));
+				died(laneDiedExitBody(laneId, how, 1, null));
+			}
+			w.ledger.releaseWorkload(w.owner, { by: LANE_RUNNER_BY, holder: laneId });
+		};
+		/** The surface's incident on the owner (§ 1.5) through `recordIncidentOnce`, its detail naming the held PRs; `stillDue` defaults to the spent budget. */
+		const incident = (deadLane: string, stillDue = () => relaunchState(w.ledger.launchRows(w.owner, 5)!).kind === "exhausted") =>
+			recordIncidentOnce(w.ledger, {
+				by: SURFACE_BY, kind: "relaunch", workloadId: w.owner, key: deadLane, count: RETRY_LIMIT, limit: RETRY_LIMIT,
+				detail: `lane-died: ${deadLane}: error (exit 1); ${trainHeldDetail(heldTrainPrs(w.ledger, w.owner))}`,
+			}, stillDue);
+		const joWord = () => w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.owner, kind: "assumption", body: launchRequestedBody("jo", w.ledger.now()) });
+		return { reserve, die, incident, joWord };
+	};
+	const messageBody = (l: Ledger, id: string) => l.db.query<{ body: string }, [string]>("SELECT body FROM messages WHERE id = ?").get(id)!.body;
+
+	test.each(["error", "open-work", "signal"] as const)("an owner lane exit that is a death (%s) settles nothing; the relaunched lane gets the same task as the same attempt", (how) => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const { reserve, die } = lanes(w);
+		const first = reserve();
+		w.ledger.addSlice({ by: first.laneId, workloadId: w.owner, task: "fix #101", doneCondition: "green", inputs: "#101" });
+		c.plusHours(0.01);
+		const t = w.task(101, H0);
+		c.plusHours(0.1);
+		die(first.laneId, how);
+		expect(w.settle({ 101: H0 })).toEqual([]);
+		expect(ownerDeliveries(w.ledger)).toEqual([{ kind: "launch", task: expect.objectContaining({ id: t.id, attempt: 1 }), owner: w.owner }]);
+		const next = reserve();
+		expect(next.cause).toBe(`relaunch ${first.laneId} 1`);
+		expect(ownerTasks(w.ledger, w.owner)).toEqual([expect.objectContaining({ id: t.id, attempt: 1, pr: 101 })]);
+		c.plusHours(0.5);
+		expect(w.settle({ 101: H0 })).toEqual([]);
+		expect(nextAttempt(w.ledger, w.train, 101)).toBe(1);
+	});
+
+	test("an intended exit still settles failed: the relaunched lane's release with no push, and a death after Jo's stop of the lane", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const { reserve, die } = lanes(w);
+		const first = reserve();
+		w.ledger.addSlice({ by: first.laneId, workloadId: w.owner, task: "fix #101", doneCondition: "green", inputs: "#101" });
+		c.plusHours(0.01);
+		const t = w.task(101, H0);
+		c.plusHours(0.1);
+		die(first.laneId);
+		expect(w.settle({ 101: H0 })).toEqual([]);
+		const next = reserve();
+		c.plusHours(0.1);
+		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.owner, kind: "assumption", body: laneExitBody(next.laneId, { code: 0, signal: null, outcome: "released" }) });
+		w.ledger.releaseWorkload(w.owner, { by: LANE_RUNNER_BY, holder: next.laneId });
+		expect(w.settle({ 101: H0 })).toEqual([expect.stringContaining(`${t.id} failed lane ${next.laneId} on ${w.owner} exited (code 0 signal - outcome released)`)]);
+
+		// Jo stopped the lane: its error exit is no death the relaunch takes on (§ 1.1 step 2), so it is the attempt's end
+		const c2 = clock();
+		const v = world({ now: c2.now });
+		const vl = lanes(v);
+		const lane = vl.reserve();
+		v.ledger.addSlice({ by: lane.laneId, workloadId: v.owner, task: "fix #101", doneCondition: "green", inputs: "#101" });
+		c2.plusHours(0.01);
+		const u = v.task(101, H0);
+		c2.plusHours(0.1);
+		v.ledger.recordEntry({ by: SURFACE_BY, workloadId: v.owner, kind: "assumption", body: laneStopRequestBody(lane.laneId, "as2-lane-stop", "jo") });
+		vl.die(lane.laneId);
+		expect(v.settle({ 101: H0 })).toEqual([expect.stringContaining(`${u.id} failed lane ${lane.laneId}`)]);
+	});
+
+	test("a live relaunched owner's 2 h with no push still settles failed, and two of them still raise the failed-twice question", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const { reserve, die } = lanes(w);
+		const first = reserve();
+		w.ledger.addSlice({ by: first.laneId, workloadId: w.owner, task: "fix #101", doneCondition: "green", inputs: "#101" });
+		c.plusHours(0.01);
+		const t1 = w.task(101, H0);
+		c.plusHours(0.1);
+		die(first.laneId);
+		// the relaunched lane stays live through both tasks
+		reserve(6 * 3_600_000);
+		c.plusHours(1.5);
+		expect(w.settle({ 101: H0 })).toEqual([]);
+		c.plusHours(0.5);
+		expect(w.settle({ 101: H0 })).toEqual([`train-task-settled: ${t1.id} failed no push for 2 h since ${t1.createdAt}`]);
+		expect(twiceFailed(w.ledger, w.train)).toEqual([]);
+		c.plusHours(0.01);
+		const t2 = w.task(101, H0);
+		expect(t2.attempt).toBe(2);
+		c.plusHours(2);
+		expect(w.settle({ 101: H0 })).toEqual([`train-task-settled: ${t2.id} failed no push for 2 h since ${t2.createdAt}`]);
+		const due = twiceFailed(w.ledger, w.train);
+		expect(due.map((d) => d.task.id)).toEqual([t2.id]);
+		const q = raiseTwiceFailed(w.ledger, w.train, due[0]!);
+		expect(q).not.toBeNull();
+		expect(w.ledger.questions(w.train)).toEqual([expect.objectContaining({ id: q, slice_id: trainSliceId(w.train, 101), options: JSON.stringify(["retry", "skip", "stop"]) })]);
+	});
+
+	test("while the owner's incident holds #101, a second PR of the same owner with red runs still settles failed and raises the failed-twice question", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const { reserve, die, incident } = lanes(w);
+		const first = reserve();
+		const sl = w.ledger.addSlice({ by: first.laneId, workloadId: w.owner, task: "fix #101 and #106", doneCondition: "green", inputs: "#101 #106" });
+		c.plusHours(0.01);
+		const a = w.task(101, H0);
+		const b = w.task(106, H0);
+		expect(b.owner).toBe(w.owner);
+		c.plusHours(0.1);
+		die(first.laneId);
+		c.plusHours(0.01);
+		const inc = incident(first.laneId, () => true);
+		expect(inc).not.toBeNull();
+		expect(heldTrainPrs(w.ledger, w.owner)).toEqual([101, 106]);
+		expect(messageBody(w.ledger, inc!)).toEndWith("; train #101 held, train #106 held");
+		c.plusHours(0.1);
+		const red1 = w.run(w.owner, sl, 106, H1, "red");
+		expect(w.settle({ 101: H0, 106: H1 })).toEqual([`train-task-settled: ${b.id} failed run ${red1} red at ${H1}`]);
+		c.plusHours(0.01);
+		const b2 = w.task(106, H1);
+		expect(b2.attempt).toBe(2);
+		c.plusHours(0.1);
+		const red2 = w.run(w.owner, sl, 106, H2, "red");
+		c.plusHours(3);
+		expect(w.settle({ 101: H0, 106: H2 })).toEqual([`train-task-settled: ${b2.id} failed run ${red2} red at ${H2}`]);
+		const due = twiceFailed(w.ledger, w.train);
+		expect(due.map((d) => d.pr)).toEqual([106]);
+		expect(raiseTwiceFailed(w.ledger, w.train, due[0]!)).not.toBeNull();
+		// #101 is held, not failed, 3 h on
+		expect(unsettledTasks(w.ledger, w.train).map((t) => t.id)).toEqual([a.id]);
+	});
+
+	test("an incident on the owner stops the no-push rule until Jo's word launch; then 2 h after that launch with no push settles failed", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const { reserve, die, incident, joWord } = lanes(w);
+		const first = reserve();
+		w.ledger.addSlice({ by: first.laneId, workloadId: w.owner, task: "fix #101", doneCondition: "green", inputs: "#101" });
+		c.plusHours(0.01);
+		const t = w.task(101, H0);
+		c.plusHours(0.1);
+		die(first.laneId);
+		c.plusHours(0.01);
+		expect(incident(first.laneId, () => true)).not.toBeNull();
+		c.plusHours(5);
+		expect(w.settle({ 101: H0 })).toEqual([]);
+		expect(twiceFailed(w.ledger, w.train)).toEqual([]);
+		const word = joWord();
+		const wordAt = c.now();
+		expect(reserve().cause).toBe(`request ${word}`);
+		expect(ownerTasks(w.ledger, w.owner)).toEqual([expect.objectContaining({ id: t.id, attempt: 1 })]);
+		c.plusHours(1.5);
+		expect(w.settle({ 101: H0 })).toEqual([]);
+		c.plusHours(0.5);
+		expect(w.settle({ 101: H0 })).toEqual([`train-task-settled: ${t.id} failed no push for 2 h since ${wordAt}`]);
+
+		// only the surface's incident holds: a lane's note shaped like one does not
+		const c2 = clock();
+		const v = world({ now: c2.now });
+		const u = v.task(101, H0);
+		c2.plusHours(0.1);
+		v.ledger.enqueue({ by: OWNER_LANE, workloadId: v.owner, sender: OWNER_LANE, recipient: ORCHESTRATOR_RECIPIENT, body: `incident: relaunch ${v.owner} key ${OWNER_LANE} after 3/3 retries without progress: x` });
+		c2.plusHours(2);
+		expect(v.settle({ 101: H0 })).toEqual([`train-task-settled: ${u.id} failed no push for 2 h since ${u.createdAt}`]);
+	});
+
+	test("the full sequence: the original owner lane and three relaunched lanes die, the incident is written, the tick's settle and alert run each poll; the task stays unsettled and owned with no failed-twice question, and Jo's word launch gives the owner the same task", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const { reserve, die, incident, joWord } = lanes(w);
+		const verdict = () => verdictOf(w.ledger.launchRows(w.owner, 5)!);
+		const settled: string[] = [];
+		const incidents: string[] = [];
+		/** One poll: the train tick's settles and failed-twice alerts (train-tick.ts step 2), then the surface's incident step (§ 1.5). */
+		const poll = () => {
+			settled.push(...w.settle({ 101: H0 }));
+			for (const due of twiceFailed(w.ledger, w.train)) raiseTwiceFailed(w.ledger, w.train, due);
+			const s = relaunchState(w.ledger.launchRows(w.owner, 5)!);
+			const id = s.kind === "exhausted" ? incident(s.lane) : null;
+			if (id) incidents.push(id);
+		};
+		const first = reserve();
+		expect(first.cause).toBe("first");
+		w.ledger.addSlice({ by: first.laneId, workloadId: w.owner, task: "fix #101", doneCondition: "green", inputs: "#101" });
+		c.plusHours(0.01);
+		const t = w.task(101, H0);
+		let lane = first.laneId;
+		for (let n = 1; n <= RETRY_LIMIT; n++) {
+			c.plusHours(2 * MIN_H);
+			die(lane);
+			poll();
+			// relaunch 1 at once, 2 and 3 after the backoff; the tick polls every minute meanwhile
+			for (let i = 0; i < 15 && !verdict().launch; i++) {
+				c.plusHours(MIN_H);
+				poll();
+			}
+			const r = reserve();
+			expect(r.cause).toBe(`relaunch ${lane} ${n}`);
+			lane = r.laneId;
+			poll();
+		}
+		c.plusHours(2 * MIN_H);
+		die(lane);
+		poll();
+		expect(verdict()).toEqual({ launch: false, reason: "relaunch-exhausted" });
+		expect(incidents).toHaveLength(1);
+		expect(messageBody(w.ledger, incidents[0]!)).toStartWith(`incident: relaunch ${w.owner} key ${lane} after 3/3 retries without progress: `);
+		expect(messageBody(w.ledger, incidents[0]!)).toEndWith("train #101 held");
+		// six hours of polls, the train's own owner delivery re-requesting a launch the predicate refuses
+		for (let i = 0; i < 36; i++) {
+			c.plusHours(10 * MIN_H);
+			if (i === 0) w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: w.owner, kind: "assumption", body: launchRequestedBody("merge-train", c.now(), `train task ${t.id} on #101`) });
+			poll();
+		}
+		expect(verdict()).toEqual({ launch: false, reason: "relaunch-exhausted" });
+		expect(settled).toEqual([]);
+		expect(incidents).toHaveLength(1);
+		expect(w.ledger.questions(w.train)).toEqual([]);
+		expect(unsettledTasks(w.ledger, w.train).map((x) => x.id)).toEqual([t.id]);
+		expect(ownerTasks(w.ledger, w.owner).map((x) => x.id)).toEqual([t.id]);
+		// Jo's word: the owner relaunches and gets the same task, the same attempt
+		const word = joWord();
+		expect(ownerDeliveries(w.ledger)).toEqual([{ kind: "launch", task: expect.objectContaining({ id: t.id }), owner: w.owner }]);
+		expect(reserve().cause).toBe(`request ${word}`);
+		expect(ownerTasks(w.ledger, w.owner)).toEqual([expect.objectContaining({ id: t.id, attempt: 1, pr: 101 })]);
+		poll();
+		expect(settled).toEqual([]);
+		expect(w.ledger.questions(w.train)).toEqual([]);
 	});
 });
