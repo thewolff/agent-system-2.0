@@ -62,6 +62,16 @@ const request = (r: LaneRoot, wl: string, model?: string) => {
 	l.close();
 	surfaceWrite(r, wl, [...(model !== undefined ? [laneModelBody(model, now)] : []), `launch-requested: by jo at ${now}`]);
 };
+/**
+ * No open slice at the death: the machinery's relaunch of a dead lane (PLAN wl-mvfqvd5hy8zv28 § 1.3) owes the workload
+ * nothing, so the launch after the death is Jo's alone. These tests prove Jo's relaunch's model and session; the
+ * automatic relaunch's cause is lane-script.test.ts's.
+ */
+const noOpenSlice = (r: LaneRoot, sl: string) => {
+	const l = ledgerOf(r);
+	l.cancelSlice(sl, { by: SURFACE_BY });
+	l.close();
+};
 const launch = (r: LaneRoot, wl: string, script: FakeScript, by = "test") => {
 	setScript(r, script);
 	const out = sh(["bun", LANE_SCRIPT, "launch", wl, "--requested-by", by], r.repo, r.env);
@@ -113,7 +123,8 @@ describe("T1–T3: the runner starts on Jo's model and keeps the session only on
 
 	test("T2p: after a death a relaunch with no model keeps --model and resumes the session on it", async () => {
 		const r = makeRoot();
-		const { wl } = openWorkload(r, X);
+		const { wl, sl } = openWorkload(r, X);
+		noOpenSlice(r, sl);
 		launch(r, wl, { steps: [{ exit: 3 }] });
 		const lane1 = laneIdOf(wl, 1);
 		expect(await settledExit(r, wl, lane1)).toMatchObject({ outcome: "died" });
@@ -144,7 +155,8 @@ describe("T1–T3: the runner starts on Jo's model and keeps the session only on
 
 	test("T2p: the tick's catch-up of Jo's request after a death keeps --model and resumes the session on it", async () => {
 		const r = makeRoot();
-		const { wl } = openWorkload(r, X);
+		const { wl, sl } = openWorkload(r, X);
+		noOpenSlice(r, sl);
 		launch(r, wl, { steps: [{ exit: 3 }] });
 		const lane1 = laneIdOf(wl, 1);
 		expect(await settledExit(r, wl, lane1)).toMatchObject({ outcome: "died" });
@@ -166,7 +178,8 @@ describe("T1–T3: the runner starts on Jo's model and keeps the session only on
 
 	test("T3p: a relaunch naming another model starts fresh: --model, no --resume, resumeSkipped names the old session", async () => {
 		const r = makeRoot();
-		const { wl } = openWorkload(r, null);
+		const { wl, sl } = openWorkload(r, null);
+		noOpenSlice(r, sl);
 		launch(r, wl, { steps: [{ exit: 3 }] });
 		const lane1 = laneIdOf(wl, 1);
 		await settledExit(r, wl, lane1);
@@ -289,7 +302,8 @@ describe("T6: omp's prompt error rides the death line", () => {
 describe("T8: named then cleared", () => {
 	test("T8a-p: the X lane holding the newest session: default runs with neither --model nor --resume and names s2", async () => {
 		const r = makeRoot();
-		const { wl } = openWorkload(r, null);
+		const { wl, sl } = openWorkload(r, null);
+		noOpenSlice(r, sl);
 		launch(r, wl, { steps: [{ exit: 3 }] });
 		await settledExit(r, wl, laneIdOf(wl, 1));
 		request(r, wl, X);
@@ -309,7 +323,8 @@ describe("T8: named then cleared", () => {
 
 	test("T8b-p: the X launch failed before a session: default resumes the default-era s1", async () => {
 		const r = makeRoot();
-		const { wl } = openWorkload(r, null);
+		const { wl, sl } = openWorkload(r, null);
+		noOpenSlice(r, sl);
 		launch(r, wl, { steps: [{ exit: 3 }] });
 		const lane1 = laneIdOf(wl, 1);
 		await settledExit(r, wl, lane1);

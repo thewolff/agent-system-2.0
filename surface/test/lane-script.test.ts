@@ -417,25 +417,40 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(laneSnapshot(r, wl).deaths).toEqual([`lane-died: ${lane1}: died (exit 3)`]);
 		expect(laneSnapshot(r, wl).workload!.holder).toBeNull();
 		await drainSettled(r, lane1);
+		// The drain lane 1's exit spawned relaunches it at once (PLAN wl-mvfqvd5hy8zv28 § 1.3): lane 2 re-reads the script and
+		// dies the same way; its drain finds relaunch 2 in its backoff and launches nothing, so Jo's request below is lane 3's.
+		const lane2 = laneIdOf(wl, 2);
+		expect(await exitOf(r, wl, lane2)).toMatchObject({ code: "3", outcome: "died" });
+		await drainSettled(r, lane2);
+		const launchOf = (laneId: string) => laneSnapshot(r, wl).bodies.find((b) => b.startsWith(`${LANE_STARTER_BY} launch: ${laneId} `));
+		expect(launchOf(lane2)).toMatch(new RegExp(`^${LANE_STARTER_BY} launch: ${lane2} cause relaunch ${lane1} 1(?: |$)`));
 
 		const l = ledgerOf(r);
 		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: `launch-requested: by jo at ${l.now()}` });
 		l.close();
 		setScript(r, { steps: [{ hang: true }] });
 		expect(lane(r, ["launch", wl, "--requested-by", "jo"]).code).toBe(0);
-		const lane2 = laneIdOf(wl, 2);
-		await readyOf(r, wl, lane2);
-		const started = (await startedOf(r, wl, lane2))!;
+		const lane3 = laneIdOf(wl, 3);
+		await readyOf(r, wl, lane3);
+		const started = (await startedOf(r, wl, lane3))!;
+		// Lane 3's death is relaunched at once too (Jo's request restarts the count): that relaunch must end, not hang.
+		setScript(r, { steps: [{ exit: 3 }] });
 		const t0 = Date.now();
 		process.kill(started.pid, "SIGKILL");
-		const exit2 = await exitOf(r, wl, lane2);
+		const exit3 = await exitOf(r, wl, lane3);
 		expect(Date.now() - t0).toBeLessThan(5_000);
-		expect(exit2).toMatchObject({ signal: "SIGKILL", outcome: "died" });
+		expect(exit3).toMatchObject({ signal: "SIGKILL", outcome: "died" });
+		const lane4 = laneIdOf(wl, 4);
+		expect(await exitOf(r, wl, lane4)).toMatchObject({ code: "3", outcome: "died" });
+		await drainSettled(r, lane4);
 		const snap = laneSnapshot(r, wl);
-		expect(snap.deaths).toEqual([`lane-died: ${lane1}: died (exit 3)`, `lane-died: ${lane2}: died (signal SIGKILL)`]);
+		expect(snap.deaths).toEqual([
+			`lane-died: ${lane1}: died (exit 3)`, `lane-died: ${lane2}: died (exit 3)`, `lane-died: ${lane3}: died (signal SIGKILL)`, `lane-died: ${lane4}: died (exit 3)`,
+		]);
 		expect(snap.workload!.holder).toBeNull();
-		expect(snap.bodies.filter((b) => b.startsWith(`${LANE_STARTER_BY} launch: `)).map((b) => b.split(" ")[4])).toEqual(["first", "request"]);
-	}, 40_000);
+		expect(snap.bodies.filter((b) => b.startsWith(`${LANE_STARTER_BY} launch: `)).map((b) => b.split(" ")[4])).toEqual(["first", "relaunch", "request", "relaunch"]);
+		expect(launchOf(lane4)).toMatch(new RegExp(`^${LANE_STARTER_BY} launch: ${lane4} cause relaunch ${lane3} 1(?: |$)`));
+	}, 60_000);
 
 	test("B4 stop from the ledger: acceptance persisted, then abort → stdin EOF → SIGKILL after the grace when omp ignores both; outcome stop, no lane-died:, released", async () => {
 		const r = makeRoot();
@@ -477,6 +492,8 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const laneId = laneIdOf(wl, 1);
 		await readyOf(r, wl, laneId);
 		const started = (await startedOf(r, wl, laneId))!;
+		// The signal death with a slice open is relaunched at once (PLAN wl-mvfqvd5hy8zv28 § 1.3): that lane must end, not hang.
+		setScript(r, { steps: [{ exit: 3 }] });
 		process.kill(started.runnerPid, "SIGTERM");
 		const exit = await exitOf(r, wl, laneId);
 		expect(exit).toMatchObject({ code: "0", signal: "-", outcome: "stop", reason: "signal" });
@@ -490,6 +507,10 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const exitAt = snap.control.find((c) => c.prefix === "lane-exit" && c.laneId === laneId)!.createdAt;
 		expect(death.created_at >= accepted.createdAt && death.created_at <= exitAt).toBe(true);
 		expect(eventsOf(r, started.pid)).toEqual(["prompt", "abort", "eof"]);
+		const lane2 = laneIdOf(wl, 2);
+		expect(await exitOf(r, wl, lane2)).toMatchObject({ code: "3", outcome: "died" });
+		expect(laneSnapshot(r, wl).bodies).toContainEqual(expect.stringMatching(new RegExp(`^${LANE_STARTER_BY} launch: ${lane2} cause relaunch ${laneId} 1(?: |$)`)));
+		await drainSettled(r, lane2);
 	}, 30_000);
 
 	test("restart sequence (PLAN wl-mvfqvd5hy8zv28 sl-rl-runner): acceptance → the lane's shutdown release → a catch-up reservation → the runner's late finish gives one lane-died:, the signal one, before the successor's launch:, and no second", async () => {
@@ -577,8 +598,9 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		try {
 			expect(recordLapsedLeases(l, SURFACE_BY, later)).toEqual([]);
 			expect(unrecordedLapse(l, l.workload(wl)!, later)).toBe(false);
+			// the death is the relaunch's to take on (a signal death with a slice open, PLAN wl-mvfqvd5hy8zv28 § 1.6): no error line
 			const died = errorLines(l, l.inFlight(), { now: later }).filter((x) => x.kind === "lane-died" && x.workloadId === wl);
-			expect(died.map((x) => x.rowId)).toEqual([death!.id]);
+			expect(died).toEqual([]);
 		} finally {
 			l.close();
 		}
