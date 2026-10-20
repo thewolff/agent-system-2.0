@@ -113,6 +113,7 @@ gates/src/rows/r09-protected-edit.ts	module	-
 gates/src/rows/r10-raw-ledger.ts	module	-
 gates/src/rows/r11-jo-instruction.ts	module	-
 gates/src/rows/r14-ask-policy.ts	module	-
+gates/src/rulings.ts	module	-
 gates/src/session.ts	module	-
 gates/src/shell-parse.ts	module	-
 gates/src/targets.ts	module	-
@@ -121,6 +122,7 @@ gates/src/test-run.ts	module	-
 gates/src/git-model.ts	module	-
 gates/src/fence.ts	module	-
 gates/test/case-and-noexec.test.ts	test	-
+gates/test/rulings.test.ts	test	-
 gates/test/extension.test.ts	test	-
 gates/test/helpers.ts	test	-
 gates/test/known-fragment.test.ts	test	-
@@ -1135,6 +1137,7 @@ surface/scripts/train-tick.ts	module	-
 surface/test/train-tick.test.ts	test	-
 surface/test/train-world.ts	test	-
 surface/test/train-escalation.test.ts	test	-
+surface/test/train-signoff.test.ts	test	-
 install/com.agent-system-2.train-tick.plist	install	-
 surface/scripts/test-exec.ts	module	-
 surface/src/as2test.ts	module	-
@@ -1213,6 +1216,7 @@ ledger/test/live-ledger-guard.test.ts	test	-
 ledger/test/fixtures/live-guard/reach.fixture.ts	test	-
 surface/src/pending.ts	module	-
 surface/src/batch.ts	module	-
+surface/src/notice.ts	module	-
 surface/test/pending.test.ts	test	-
 surface/test/batch.test.ts	test	-
 # Migration items one file each (wl-mv5mvvs64ahq0w): the numbering tool .github/workflows/migration-number.yml runs.
@@ -1228,7 +1232,6 @@ surface/scripts/pair-suggest.ts	module	-
 classifier/test/judge-ask.test.ts	test	-
 classifier/test/pair-suggest-raise.test.ts	test	-
 surface/test/pair-suggest-answer.test.ts	test	-
-surface/test/pair-suggest-ceiling.test.ts	test	-
 surface/test/pair-suggest-forgery.test.ts	test	-
 surface/test/pair-suggest-module.test.ts	test	-
 surface/test/pair-suggest-switch.test.ts	test	-

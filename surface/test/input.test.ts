@@ -6,10 +6,10 @@
 // approve receipt (PLAN wl-mv5i3lulwwbbi8 D1, D2, D4).
 import { describe, expect, test } from "bun:test";
 import { handSpawnBody, reviewParkBody } from "../../classifier/src/lab";
+import { askJo, checkRulings } from "../../gates/src/rulings";
 import { reviewStopOn } from "../../classifier/src/review-stop";
 import { countRounds, effectiveRoundLimit, type Findings, reviewLimitBody, reviewRoundBody, ROUND_LIMIT_OPTIONS } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
-import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
 import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
 import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody, verdictOf, waivedPrs, waivePrBody } from "../src/launch";
@@ -123,7 +123,7 @@ describe("one-word inputs", () => {
 		expect(ledger.slice(sl)!.state).toBe("open");
 		const q2 = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Really?", options: ["yes", "no"] });
 		const w = interpret(ledger, "withdraw")!;
-		expect(w).toMatchObject({ kind: "withdraw", questionId: q2, then: "replan" });
+		expect(w).toMatchObject({ kind: "withdraw", questionId: q2 });
 		expect(apply(ledger, w)).toContain("replanned, not executed");
 		expect(ledger.question(q2)!.state).toBe("withdrawn");
 		expect(ledger.slice(sl)!.state).toBe("open");
@@ -317,7 +317,7 @@ describe("numbered batches", () => {
 		const { wl, sl } = workloadWithSlice(ledger);
 		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which?", options: ["left", "right"] });
 		const r = interpretBatch(ledger, numbered(ledger), "1 withdraw");
-		expect(r).toEqual({ ok: true, items: [{ n: 1, cmd: { kind: "withdraw", workloadId: wl, questionId: q, then: "replan" } }] });
+		expect(r).toEqual({ ok: true, items: [{ n: 1, cmd: { kind: "withdraw", workloadId: wl, questionId: q } }] });
 		applyBatch(ledger, r);
 		expect(ledger.question(q)!.state).toBe("withdrawn");
 	});
@@ -969,24 +969,6 @@ describe("review round limit (D9) and stop-reviews (D10)", () => {
 		round(ledger, wl, sl, 1, { unknown: true });
 		expect(apply(ledger, interpret(ledger, "stop-reviews")!)).toContain(`${sl}: round 1 left unknown`);
 	});
-
-	test("the ceiling question's bare `stop` still answers the ceiling question, untouched by `stop-reviews`", () => {
-		const { ledger } = tempLedger();
-		const { wl, sl } = workloadWithSlice(ledger);
-		const park = parkQuestion(ledger, wl, sl);
-		const ceilingSlice = ledger.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: "sl-ceiling-1", task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
-		const cq = ledger.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: ceilingSlice, body: "80 % of the ceiling", options: [...CEILING_OPTIONS] });
-		expect(CEILING_OPTIONS).toContain("stop");
-		apply(ledger, interpret(ledger, "stop-reviews")!);
-		expect(ledger.question(park)!.state).toBe("withdrawn");
-		expect(ledger.question(cq)!.state).toBe("open");
-		const stop = interpret(ledger, "stop")!;
-		expect(stop).toEqual({ kind: "answer", workloadId: wl, questionId: cq, answer: "stop" });
-		apply(ledger, stop);
-		expect(ledger.question(cq)!.state).toBe("answered");
-		expect(ledger.slice(ceilingSlice)!.state).toBe("done");
-		expect(bodies(ledger, wl, "review-loop-end:")).toEqual([`review-loop-end: ${sl} reason stop-reviews`]);
-	});
 });
 
 describe("cancel-slice (PLAN wl-mv5i3lulwwbbi8 D1)", () => {
@@ -1152,6 +1134,33 @@ describe("supersede (PLAN wl-mv5i3lulwwbbi8 D2)", () => {
 		expect(ledger.entries(a).length).toBe(n);
 		expect(ledger.instructions(a)).toEqual([]);
 		expect(commandShaped(`supersede ${a} ${closed.wl}`)).toBe(true);
+	});
+});
+
+describe("end-ruling (PLAN wl-mvfkv7llkp7nk0 § 1, R1)", () => {
+	test("writes Jo's instruction `end-ruling <id>` on the standing workload; the ruling no longer decides; ending it twice is refused", () => {
+		const { ledger } = tempLedger();
+		const cmd = interpret(ledger, "end-ruling merges");
+		expect(cmd).toEqual({ kind: "end-ruling", ruling: "merges" });
+		expect(commandShaped("end-ruling merges")).toBe(true);
+		const receipt = apply(ledger, cmd!);
+		const ins = ledger.instructions(STANDING_WORKLOAD_ID);
+		expect(ins.map((i) => [i.kind, i.body, i.author, i.channel, i.created_by])).toEqual([["instruction", "end-ruling merges", "jo", "surface", SURFACE_BY]]);
+		expect(receipt).toBe(`Jo's ruling merges is ended (instruction ${ins[0]!.id}); its questions go to you again`);
+		expect(interpret(ledger, "end-ruling merges")).toEqual({ kind: "refused", why: "the ruling merges is already ended" });
+		// The lane's merge question, which the ruling decided before, is now raised.
+		const { wl, sl } = workloadWithSlice(ledger);
+		const lane = { asker: "lane" as const, builders: { labs: ["anthropic" as const], unknown: [] }, stakes: "normal", train: false };
+		expect(checkRulings({ body: "merge?", options: ["merge", "wait"] }, lane, { now: Date.now(), ended: new Set() })).toMatchObject({ ruling: "merges" });
+		expect(askJo(ledger, { by: "lane-a", workloadId: wl, sliceId: sl, body: "merge?", options: ["merge", "wait"] }, lane)).toHaveProperty("raised");
+	});
+
+	test("an unknown ruling id, or no id, is refused with nothing written", () => {
+		const { ledger } = tempLedger();
+		ensureStandingWorkload(ledger);
+		expect(interpret(ledger, "end-ruling nope")).toEqual({ kind: "refused", why: "nope is no standing ruling (kimi-out, flow-repair, merges, models, gates-stakes, train-signoff)" });
+		expect(interpret(ledger, "end-ruling")).toEqual({ kind: "refused", why: "end-ruling names one ruling: end-ruling <kimi-out | flow-repair | merges | models | gates-stakes | train-signoff>" });
+		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
 	});
 });
 

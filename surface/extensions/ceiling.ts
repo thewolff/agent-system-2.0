@@ -1,5 +1,5 @@
 // The orchestrator's half of the workload ceiling (DESIGN-workload-ceiling.md § 2 item 2): lowering.
-// Raising is Jo's, through the `ceiling` word or the *extend* answer (surface/src/input.ts), each of
+// Raising is Jo's, through the `ceiling` and `extend` words (surface/src/input.ts), each of
 // which names Jo's instruction; this tool writes a `ceiling:` entry that lowers either half and
 // refuses any value above the one in force, so it never needs one.
 import { ceilingBody } from "../src/ceiling";
@@ -18,7 +18,7 @@ export default function ceilingRow(pi: SurfaceAPI, env: Record<string, string | 
 		label: "Lower Ceiling",
 		description:
 			"Lower an open workload's ceiling: dollars, wall minutes, or both, each at or below the value in force. " +
-			"Raising is Jo's alone (the word `ceiling <usd> [<hours>]`, or answering extend on the ceiling question); a value above the current one is refused.",
+			"Raising is Jo's alone (the words `ceiling <usd> [<hours>] <wl>` and `extend <wl>`); a value above the current one is refused.",
 		parameters: z.object({
 			workloadId: z.string().describe("The open workload (wl-…)."),
 			usd: z.string().optional().describe("The new dollar ceiling, a number (e.g. 20); at or below the current one."),
@@ -46,7 +46,7 @@ export default function ceilingRow(pi: SurfaceAPI, env: Record<string, string | 
 				...(usd !== null && usd > cur.usd ? [`$${usd} is above the $${cur.usd} in force`] : []),
 				...(wallMin !== null && wallMin > cur.wallMin ? [`${wallMin} min is above the ${cur.wallMin} min in force`] : []),
 			];
-			if (over.length > 0) return text(`Refused: ${over.join("; ")}. Raising is Jo's (the word \`ceiling <usd> [<hours>]\`, or extend on the ceiling question); nothing was written.`);
+			if (over.length > 0) return text(`Refused: ${over.join("; ")}. Raising is Jo's (the words \`ceiling <usd> [<hours>] ${id}\` and \`extend ${id}\`); nothing was written.`);
 			const next = { usd: usd ?? cur.usd, wallMin: wallMin ?? cur.wallMin };
 			const entryId = ledger.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: ceilingBody(next, "lowered by orchestrator") });
 			pi.appendEntry("surface-ceiling", { id, entryId, ...next });

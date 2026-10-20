@@ -23,6 +23,10 @@
 // — go through `answerOrchestratorQuestion`. A withdrawal on the standing slice always replans
 // (`apply`): a `cancel` would cancel the slice (schema.sql questions_resolution_settles_slice) and
 // no orchestrator question could be raised again.
+//
+// The raise goes through Jo's standing rulings (gates/src/rulings.ts `askJo`, PLAN wl-mvfkv7llkp7nk0 § 1): a question a
+// ruling decides writes no row and no subject entry, only the surface's `ruling-applied:` on the standing slice.
+import { type AskResult, askJo, type ModelSubject } from "../../gates/src/rulings";
 import type { InstructionRow, Ledger } from "../../ledger/src/index";
 import { ensureStandingWorkload, standingSlice } from "./identity";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
@@ -38,16 +42,27 @@ export const questionSubjectBody = (questionId: string, about: string): string =
 const SUBJECT = /^question-about: (q-[a-z0-9]+) (wl-[a-z0-9]+)$/;
 
 /**
- * Raise the orchestrator's question on the standing slice: the row, and when it is about a
- * workload, the subject entry naming it, in one transaction. Validation is the tool's.
+ * Raise the orchestrator's question on the standing slice through the standing rulings: the row, and when it is about
+ * a workload, the subject entry naming it, in one transaction; or a ruling's decision with neither. Validation is the
+ * tool's; `reviewModel` reads the review row's OpenAI model for a review-model question.
  */
-export function raiseOrchestratorQuestion(ledger: Ledger, input: { body: string; options: string[]; about: string | null }): string {
+export function raiseOrchestratorQuestion(
+	ledger: Ledger,
+	input: { body: string; options: string[]; about: string | null; subject?: ModelSubject | null },
+	reviewModel?: () => string | null,
+): AskResult {
 	return ledger.write(() => {
 		ensureStandingWorkload(ledger);
 		const slice = standingSlice(ledger)!;
-		const id = ledger.raiseQuestion({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: slice.id, body: input.body, options: input.options });
-		if (input.about) ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: slice.id, kind: "assumption", body: questionSubjectBody(id, input.about) });
-		return id;
+		const asked = askJo(
+			ledger,
+			{ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: slice.id, body: input.body, options: input.options, subject: input.subject ?? null },
+			{ asker: "orchestrator", about: input.about, reviewModel },
+		);
+		if ("raised" in asked && input.about) {
+			ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: slice.id, kind: "assumption", body: questionSubjectBody(asked.raised, input.about) });
+		}
+		return asked;
 	});
 }
 

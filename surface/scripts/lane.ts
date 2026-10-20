@@ -9,7 +9,7 @@
 //                                        up to CONTINUE_LIMIT continue prompts on it, lane-started:/lane-ready:/
 //                                        lane-exit:, the turn-end decision once omp is settled (src/turn-end.ts),
 //                                        stop requests, its own deadline and the ceiling meter (spend:, the 80 %
-//                                        question, the 100 % stop) polled every STOP_POLL_MS. It first takes the
+//                                        notice, the 100 % stop and its notice) polled every STOP_POLL_MS. It first takes the
 //                                        lane id's run lock (takeRunnerLock, one owner per lane id) and then checks
 //                                        the recorded omp and runner pids (liveRunnerOf); a lane id held or running,
 //                                        or one whose owner ps could not verify, exits 7 (held) before any ledger
@@ -52,10 +52,11 @@ import { SCRATCH_ENV } from "../../gates/src/scratch";
 import { ensureScratchRoot } from "../src/scratch-root";
 import { canonicalPath, homeDir } from "../../ledger/src/locality";
 import {
-	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type ReserveResult, type SliceRow, type Stakes, type WorkloadRow,
+	type EntryRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type ReserveResult, type Stakes, type WorkloadRow,
 } from "../../ledger/src/index";
 import {
-	type Ceiling, CEILING_OPTIONS, type CeilingOption, ceilingQuestionBody, crossed, effectiveCeiling, scanSpend, type Spend, spendBody, wallMinutes,
+	type Ceiling, ceilingKey, type CeilingNoticeLevel, ceilingNoticeBody, crossed, effectiveCeiling, originalCeiling, pairedCeilingPromptLine, parseCeilingNotice, scanSpend, type Spend,
+	spendBody, wallMinutes,
 } from "../src/ceiling";
 import { newLaneSession, runCtxIndex, topLevelSessions } from "../src/ctx-index";
 import { decisionLogContext, repoOf } from "../src/decision-log";
@@ -75,7 +76,7 @@ import {
 } from "../src/turn-end";
 import { waitingReserved } from "../src/errors";
 import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
-import { PAIR_OPTION, type PairSignalId, pairOffer, pairOfferBody, readPairSuggestConfig } from "../src/pair-suggest";
+import { sendNotice } from "../src/notice";
 import { decideRanked, drainOrder, type RankConfig, rankShadowLine, readRankConfig, writePickSnapshot } from "../src/rank-launch";
 import { laneDeaths } from "../src/signals";
 import { readTracingSetting, tracingEnv } from "../src/tracing";
@@ -259,8 +260,8 @@ function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 	return { repo: top.out, worktree, branch, base, dir, systemPromptPath, sessionDir, scratch };
 }
 
-/** The one prompt (§ 7 item 3), from the rows as they stand at launch; a metered lane's ceiling line goes after the stakes line (DESIGN-workload-ceiling.md § 2 item 4). */
-function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared, ceilingLine: string | null): string {
+/** The one prompt (§ 7 item 3), from the rows as they stand at launch; the ceiling line (the runner's `ceilingPromptLine`, a by-hand lane's `pairedCeilingPromptLine`) goes after the stakes line (DESIGN-workload-ceiling.md § 2 item 4). */
+function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared, ceilingLine: string): string {
 	const entries = ledger.entries(w.id);
 	const control = controlEntries(entries, holdersOf(entries, w.holder));
 	const instructions = ledger.instructions(w.id);
@@ -285,7 +286,6 @@ function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared, 
 		scratch: { root: p.scratch, capMb: scratchCapMb(process.env) }, trainTasks: ownerTasks(ledger, w.id),
 		runnerServed, trainOrFix: isTrainOrFix(entries, instructions),
 	});
-	if (ceilingLine === null) return prompt;
 	const out = prompt.split("\n");
 	out.splice(out.indexOf(`stakes: ${w.stakes} · mode: ${w.mode}`) + 1, 0, ceilingLine);
 	return out.join("\n");
@@ -530,160 +530,124 @@ async function cmdDrain(after: string): Promise<number> {
 	return code;
 }
 
-// ---- the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4) ------------------------------------
+// ---- the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4; PLAN wl-mvfkv7llkp7nk0 § 4) ---------------------------
 
-/**
- * Where the ceiling question raised for one ceiling value stands: never raised (or only withdrawn: the
- * runner's own cancel at a clean finish, or Jo's withdraw), open, or answered with one of the options.
- */
-export type CeilingQuestionState = "none" | "open" | CeilingOption;
-
-/** The runner's memory across polls in this run: the ceiling values (`ceilingKey`) it raised a question for. */
+/** The runner's memory across polls in this run: the notices it sent, each keyed `<level> <ceilingKey>`. */
 export interface MeterState {
-	raised: readonly string[];
+	sent: readonly string[];
 }
 export interface MeterInputs {
 	/** The effective ceiling now (`effectiveCeiling`). */
 	ceiling: Ceiling;
 	/** The workload's spend so far: every session file's usage and the wall across runs. */
 	spend: Spend;
-	/** The ceiling question for this ceiling value, as the ledger shows it (`ceilingQuestionState`). */
-	question: CeilingQuestionState;
+	/** The levels the ledger already holds a ceiling notice for at this ceiling value (`ceilingNoticesSent`). */
+	sent: readonly CeilingNoticeLevel[];
 }
-/** One poll's decision. `raise` and `stop` both write a `spend:` entry; neither is "none". */
+/** One poll's decision. A notice and a stop both write a `spend:` entry. */
 export interface MeterResult {
 	state: MeterState;
 	level: 0 | 80 | 100;
-	/** Raise the ceiling question: once per ceiling value, from 80 % on. */
-	raise: boolean;
-	/** Stop the lane: at 100 %, whatever the question for this value says. */
+	/** Send the notice for this level: once per level per ceiling value. */
+	notice: CeilingNoticeLevel | null;
+	/** Stop the lane: at 100 %, every time. */
 	stop: boolean;
 }
 
-/** A ceiling value as the meter keys it: an extend or a lowering is a new value that may raise again. */
-export const ceilingKey = (c: Ceiling): string => `usd ${c.usd} wall ${c.wallMin}`;
-
 /**
- * One poll of the meter, pure. From 80 % of either half, the question is raised once per ceiling
- * value in this run while none is open or answered for it, and the lane keeps working. At 100 % the
- * lane stops, whatever the question says; when none is open or answered for this value (the spend
- * jumped past 80 % between polls, a relaunch after a withdrawn question, or Jo withdrew it), the
- * question is raised with the stop, so a ceiling stop always leaves Jo the three answers. A withdrawn
- * question reads as never raised (`ceilingQuestionState`), so a relaunch at 85 % raises afresh; this
- * run's memory keeps a question Jo withdrew from coming back before 100 %. An extend answer is a
- * raised ceiling, a new value the caller passes in, with its own question state; an extend whose
- * raise has not landed leaves the old value in force, and the old value stops (stop is the default).
+ * One poll of the meter, pure. From 80 % of either half, the 80 % notice is sent once per ceiling value and the lane
+ * keeps working; at 100 % the lane stops and the stop notice is sent once per ceiling value (a poll that jumps past 80 %
+ * straight to 100 % sends only the stop notice). Once per value is the ledger's notices for it (a relaunch on the same
+ * value sends nothing again) and this run's memory. Nothing is asked and nothing extends: a raised ceiling is Jo's word
+ * (`extend`, `ceiling`), a new value the caller passes in, which may notify again at its own 80 % and 100 %.
  */
 export function meterStep(state: MeterState, inputs: MeterInputs): MeterResult {
 	const level = crossed(inputs.spend, inputs.ceiling);
-	if (level === 0) return { state, level, raise: false, stop: false };
-	const key = ceilingKey(inputs.ceiling);
-	const raise = inputs.question === "none" && (level === 100 || !state.raised.includes(key));
-	return { state: raise && !state.raised.includes(key) ? { raised: [...state.raised, key] } : state, level, raise, stop: level === 100 };
+	if (level === 0) return { state, level, notice: null, stop: false };
+	const key = `${level} ${ceilingKey(inputs.ceiling)}`;
+	const notice = inputs.sent.includes(level) || state.sent.includes(key) ? null : level;
+	return { state: notice === null ? state : { sent: [...state.sent, key] }, level, notice, stop: level === 100 };
 }
 
-/** The runner's ceiling question: its slice is `sl-ceiling-…` and the runner raised it (the predicate surface/src/input.ts exports as `isCeilingQuestion`). */
-const ceilingQuestion = (q: QuestionRow, slice: SliceRow): boolean => slice.id.startsWith("sl-ceiling-") && q.created_by === LANE_RUNNER_BY;
-
-/** The ceiling slice's done condition ends with the ceiling value its question was raised for (`raiseCeilingQuestion`). */
-const RAISED_FOR = /\bceiling (usd \S+ wall \S+)$/;
-
-/**
- * The newest ceiling question raised for `ceiling`'s value that is open or answered, as `meterStep`
- * reads it; a withdrawn one is skipped (it no longer asks anything), so a value whose questions were
- * all withdrawn reads `"none"`. Jo's `pair` (PLAN wl-mv67564rdkfvnk D7: stop plus a flip to user-driven, settled by
- * the surface as stop) reads as stop by name; any other answer that is none of the options reads as stop, the default.
- */
-export function ceilingQuestionState(
-	questions: readonly QuestionRow[], slices: readonly SliceRow[], instructions: readonly InstructionRow[], ceiling: Ceiling,
-): CeilingQuestionState {
+/** The levels of the runner's ceiling notices on the workload for `ceiling`'s value (`parseCeilingNotice`), whatever their delivery state. */
+export function ceilingNoticesSent(ledger: Ledger, workloadId: string, ceiling: Ceiling): CeilingNoticeLevel[] {
 	const key = ceilingKey(ceiling);
-	for (let i = questions.length - 1; i >= 0; i--) {
-		const q = questions[i]!;
-		const slice = slices.find((s) => s.id === q.slice_id);
-		if (!slice || !ceilingQuestion(q, slice) || RAISED_FOR.exec(slice.done_condition)?.[1] !== key || q.state === "withdrawn") continue;
-		if (q.state === "open") return "open";
-		const word = instructions.find((x) => x.id === q.resolved_by)?.body.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
-		if (word === PAIR_OPTION) return "stop";
-		return (CEILING_OPTIONS as readonly string[]).includes(word) ? (word as CeilingOption) : "stop";
-	}
-	return "none";
-}
-
-/** D1 at the ceiling raise: the offer, or null; a failure to compute it never blocks the raise (as the round-limit site's `roundLimitPairOffer`). */
-function ceilingPairOffer(ledger: Ledger, workloadId: string): { signals: PairSignalId[] } | null {
-	try {
-		return pairOffer(ledger, workloadId, "ceiling", { config: readPairSuggestConfig() });
-	} catch (err) {
-		process.stderr.write(`runner: the pair offer on ${workloadId} could not be computed (${String(err)}); the ceiling question is raised without it\n`);
-		return null;
-	}
-}
-
-/**
- * The raise, in one write stamped `lane-runner`: the slice `sl-ceiling-<wl>-<n>` (slice ids are
- * ledger-wide, so the workload is in the id; n = 1 + the workload's ceiling slices), the question on
- * it with the three options (the file pauses the slice), and the `spend:` entry. When the installed
- * profile's `pairSuggest` switch covers the workload and a signal fired (PLAN wl-mv67564rdkfvnk D1,
- * surface/src/pair-suggest.ts `pairOffer`, read before anything is written), the question also stores
- * `pair` as its last option and a `pair-offer:` entry records it; the body is unchanged (PLAN
- * wl-mvb9mw00ycfjeo D1: the surface shows the offer on its own line). An offer that throws is logged
- * and the plain question raised. `ceilingQuestionState` reads an answer of `pair` as stop.
- */
-export function raiseCeilingQuestion(ledger: Ledger, r: { workloadId: string; laneId: string; spend: Spend; ceiling: Ceiling; stakes: Stakes }): { sliceId: string; questionId: string } {
-	return ledger.write(() => {
-		const offer = ceilingPairOffer(ledger, r.workloadId);
-		const prefix = `sl-ceiling-${r.workloadId.replace(/^wl-/, "")}-`;
-		let n = 1 + ledger.slices(r.workloadId).filter((s) => s.id.startsWith(prefix)).length;
-		while (ledger.slice(`${prefix}${n}`) !== null) n += 1;
-		const sliceId = ledger.addSlice({
-			by: LANE_RUNNER_BY, workloadId: r.workloadId, id: `${prefix}${n}`, task: "Jo decides the ceiling overrun",
-			doneCondition: `Jo answers stop, extend or split for the ceiling ${ceilingKey(r.ceiling)}`, inputs: "ceiling",
-		});
-		const questionId = ledger.raiseQuestion({
-			by: LANE_RUNNER_BY, workloadId: r.workloadId, sliceId,
-			body: ceilingQuestionBody(r.workloadId, r.spend, r.ceiling, r.stakes), options: offer ? [...CEILING_OPTIONS, PAIR_OPTION] : [...CEILING_OPTIONS],
-		});
-		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: spendBody(r.laneId, r.spend) });
-		if (offer) ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: pairOfferBody(questionId, "ceiling", offer.signals) });
-		return { sliceId, questionId };
+	const rows = ledger.db.query<{ body: string }, [string, string]>(
+		"SELECT body FROM messages WHERE workload_id = ? AND created_by = ? AND body LIKE 'notice: ceiling %' ORDER BY created_at, id",
+	).all(workloadId, LANE_RUNNER_BY);
+	return rows.flatMap((m) => {
+		const n = parseCeilingNotice(m.body);
+		return n !== null && n.key === key && n.workloadId === workloadId ? [n.level] : [];
 	});
 }
 
-/** A lane that finished under the ceiling withdraws every open ceiling question (`then: cancel`), so the close is not blocked (§ 2 item 4). */
-export function withdrawCeilingQuestions(ledger: Ledger, workloadId: string): string[] {
-	const slices = ledger.slices(workloadId);
-	const out: string[] = [];
-	for (const q of ledger.questions(workloadId)) {
-		const slice = slices.find((s) => s.id === q.slice_id);
-		if (q.state !== "open" || !slice || !ceilingQuestion(q, slice)) continue;
-		ledger.withdrawQuestion(q.id, { by: LANE_RUNNER_BY, reason: "finished under the ceiling", author: LANE_RUNNER_BY, channel: "direct", then: "cancel" });
-		out.push(q.id);
+/** The notice for `level`, in one write stamped `lane-runner` with the `spend:` entry: the notice (surface/src/notice.ts) and the spend it reports. Returns the message id. */
+export function sendCeilingNotice(
+	ledger: Ledger, r: { workloadId: string; laneId: string; level: CeilingNoticeLevel; spend: Spend; ceiling: Ceiling; stakes: Stakes },
+): string {
+	return ledger.write(() => {
+		const id = sendNotice(ledger, { by: LANE_RUNNER_BY, workloadId: r.workloadId, body: ceilingNoticeBody(r.level, r.workloadId, r.spend, r.ceiling, r.stakes) });
+		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: spendBody(r.laneId, r.spend) });
+		return id;
+	});
+}
+
+/** One meter poll's outcome: the step, and whether its ceiling stop's `lane-stop: <lane> accepted ceiling` is already on the ledger. */
+export interface MeterPoll extends MeterResult {
+	accepted: boolean;
+}
+
+/**
+ * One meter poll on the ledger, in one transaction: the ceiling in force read now (the workload's control entries, its
+ * instructions and its stakes), the step over `spend`, the notice or the stop's `spend:` entry, and on a stop the
+ * `lane-stop: <lane> accepted ceiling`. A raise (surface/src/input.ts `raiseCeiling`, also one transaction) therefore
+ * lands either before it, and the lane goes on under the new value, or after it, and sees the accepted stop and requests
+ * the relaunch; never between a stop decided on the old value and its acceptance. When the writes fail after a stop was
+ * decided, the stop still stands (`accepted` false: the caller accepts it on its own) and the state is unchanged;
+ * any other failure throws.
+ */
+export function meterPoll(ledger: Ledger, r: { workloadId: string; laneId: string; spend: Spend; state: MeterState }): MeterPoll {
+	let decided = null as MeterResult | null;
+	try {
+		const step = ledger.write(() => {
+			decided = null;
+			const w = ledger.workload(r.workloadId);
+			if (!w) throw new Error(`no workload ${r.workloadId}`);
+			const es = ledger.entries(r.workloadId);
+			const ceiling = effectiveCeiling(controlEntries(es, holdersOf(es, w.holder)), ledger.instructions(r.workloadId), w.stakes);
+			const s = meterStep(r.state, { ceiling, spend: r.spend, sent: ceilingNoticesSent(ledger, r.workloadId, ceiling) });
+			decided = s;
+			if (s.notice !== null) sendCeilingNotice(ledger, { workloadId: r.workloadId, laneId: r.laneId, level: s.notice, spend: r.spend, ceiling, stakes: w.stakes });
+			else if (s.stop) ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: spendBody(r.laneId, r.spend) });
+			if (s.stop) ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: laneStopAcceptedBody(r.laneId, "ceiling") });
+			return s;
+		});
+		return { ...step, accepted: step.stop };
+	} catch (err) {
+		if (decided === null || !decided.stop) throw err;
+		process.stderr.write(`runner: the ceiling stop's writes failed: ${String(err)}\n`);
+		return { ...decided, state: r.state, accepted: false };
 	}
-	return out;
 }
 
 /** What `recordDecision` wrote, step by step (the tests read it; the runner only logs failures). */
 export interface DecisionRecord {
 	death: "written" | "present" | "failed" | "none";
-	withdrawn: boolean | "failed";
-	marker: "written" | "skipped" | "failed" | "none";
+	marker: "written" | "failed" | "none";
 }
 
 /**
  * The runner's decided outcome on the ledger before stdin EOF (MIGRATION.md item 40), each step in its own try/catch that
  * logs and goes on: (1) a death enqueues its lane-died: line (D5; whatever the holder, so a release cannot hide it, D3),
- * with the background suffix when omp was not settled; (2) `completed` / `released` withdraw the open ceiling questions
- * (then cancel), so the close is not blocked and the lane's shutdown does not count the paused ceiling slice as its
- * unfinished work; (3) an intended outcome records `lane-decided:` so the lane row's session_shutdown reads the end as
- * intended (`exitClass`, decision 14), only when step 2 did not throw: a paused ceiling slice behind an intended marker
- * would be lost, so the shutdown death stands instead. A death outcome never writes the marker: its record is its death.
+ * with the background suffix when omp was not settled; (2) an intended outcome records `lane-decided:` so the lane row's
+ * session_shutdown reads the end as intended (`exitClass`, decision 14). A death outcome never writes the marker: its
+ * record is its death.
  */
 export function recordDecision(
 	ledger: Ledger,
 	d: { workloadId: string; laneId: string; outcome: LaneOutcome; death: string | null; settled: boolean },
 ): DecisionRecord {
-	const out: DecisionRecord = { death: "none", withdrawn: false, marker: "none" };
+	const out: DecisionRecord = { death: "none", marker: "none" };
 	if (d.death !== null) {
 		try {
 			const id = enqueueRunnerDeath(ledger, { workloadId: d.workloadId, laneId: d.laneId, body: d.settled ? d.death : `${d.death}${BACKGROUND_SUFFIX}` });
@@ -693,24 +657,13 @@ export function recordDecision(
 			process.stderr.write(`runner: the lane-died: line could not be written: ${String(err)}\n`);
 		}
 	}
-	if (d.outcome === "completed" || d.outcome === "released") {
-		try {
-			out.withdrawn = withdrawCeilingQuestions(ledger, d.workloadId).length > 0;
-		} catch (err) {
-			out.withdrawn = "failed";
-			process.stderr.write(`runner: the ceiling question could not be withdrawn: ${String(err)}\n`);
-		}
-	}
 	if (INTENDED_OUTCOMES[d.outcome]) {
-		if (out.withdrawn === "failed") out.marker = "skipped";
-		else {
-			try {
-				ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: d.workloadId, kind: "assumption", body: laneDecidedBody(d.laneId, d.outcome) });
-				out.marker = "written";
-			} catch (err) {
-				out.marker = "failed";
-				process.stderr.write(`runner: the lane-decided: line could not be written: ${String(err)}\n`);
-			}
+		try {
+			ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: d.workloadId, kind: "assumption", body: laneDecidedBody(d.laneId, d.outcome) });
+			out.marker = "written";
+		} catch (err) {
+			out.marker = "failed";
+			process.stderr.write(`runner: the lane-decided: line could not be written: ${String(err)}\n`);
 		}
 	}
 	return out;
@@ -720,7 +673,7 @@ export function recordDecision(
 export function ceilingPromptLine(c: Ceiling, s: Spend): string {
 	const usd = Math.max(0, c.usd - s.usd);
 	const wall = Math.max(0, c.wallMin - s.wallMin);
-	return `ceiling: $${c.usd} / ${c.wallMin} min for the workload; spent so far $${s.usd.toFixed(2)} / ${Math.round(s.wallMin)} min (${Math.round(s.tokens)} tokens); set each brief's ceiling-share from the remainder, $${usd.toFixed(2)} / ${Math.round(wall)} min. At 80 % Jo is asked; at 100 % this lane is stopped.`;
+	return `ceiling: $${c.usd} / ${c.wallMin} min for the workload; spent so far $${s.usd.toFixed(2)} / ${Math.round(s.wallMin)} min (${Math.round(s.tokens)} tokens); set each brief's ceiling-share from the remainder, $${usd.toFixed(2)} / ${Math.round(wall)} min. At 80 % Jo gets a notice; at 100 % this lane is stopped and Jo is told.`;
 }
 
 // ---- the run guard: one runner per lane id ---------------------------------------------------------
@@ -1179,7 +1132,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	// every file at byte 0, so a relaunch counts the whole workload; the wall is the finished runs plus this one since its spawn.
 	const offsets = new Map<string, number>();
 	let tally: Spend = { usd: 0, tokens: 0, wallMin: 0 };
-	let meterState: MeterState = { raised: [] };
+	let meterState: MeterState = { sent: [] };
 	let sessionsDir: string | null = null;
 	let runStart: number | null = null;
 	const measure = (control: readonly ControlEntry[]): Spend => {
@@ -1187,25 +1140,23 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		return { ...tally, wallMin: wallMinutes(control, Date.now(), runStart) };
 	};
 	/**
-	 * One meter poll: raise at 80 % once per ceiling value, stop at 100 % through the stop path (acceptance `ceiling`, outcome stop,
-	 * no lane-died:). A failure is logged, never fatal; a stop the step called for is taken even when its writes failed. Returns
-	 * whether it stopped the lane.
+	 * One meter poll (`meterPoll`): the 80 % notice once per ceiling value; at 100 % the stop notice once per ceiling value
+	 * and the stop through the stop path (acceptance `ceiling`, outcome stop, no lane-died:), the ceiling read and the
+	 * acceptance in one transaction. `control` is the poll's snapshot, for the wall only. A failure is logged, never fatal; a
+	 * stop the step called for is taken even when its writes failed. Returns whether it stopped the lane.
 	 */
-	const meter = (stakes: Stakes, control: readonly ControlEntry[]): boolean => {
+	const meter = (control: readonly ControlEntry[]): boolean => {
 		let stopping = false;
+		let accepted = false;
 		try {
-			const spend = measure(control);
-			const instructions = ledger.instructions(wl);
-			const ceiling = effectiveCeiling(control, instructions, stakes);
-			const step = meterStep(meterState, { ceiling, spend, question: ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), instructions, ceiling) });
-			stopping = step.stop;
-			if (step.raise) raiseCeilingQuestion(ledger, { workloadId: wl, laneId, spend, ceiling, stakes });
-			else if (step.stop) record(spendBody(laneId, spend));
-			meterState = step.state;
+			const polled = meterPoll(ledger, { workloadId: wl, laneId, spend: measure(control), state: meterState });
+			stopping = polled.stop;
+			accepted = polled.accepted;
+			meterState = polled.state;
 		} catch (err) {
 			process.stderr.write(`runner: the ceiling meter failed: ${String(err)}\n`);
 		}
-		if (stopping) stop("ceiling", "ceiling");
+		if (stopping) stop("ceiling", "ceiling", accepted);
 		return stopping;
 	};
 
@@ -1286,13 +1237,16 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	/**
 	 * A stop, from the ledger or a signal: acceptance persisted first, then abort and end (decision 14). A stop after the
 	 * runner decided the outcome (and enqueued its death) is accepted and recorded, and the decided outcome stands (D3).
+	 * `accepted`: the acceptance is already on the ledger (the meter's ceiling stop, `meterPoll`).
 	 */
-	const stop = (ref: string, reason: string): void => {
+	const stop = (ref: string, reason: string, accepted = false): void => {
 		if (outcome === "stop" || finished) return;
-		try {
-			record(laneStopAcceptedBody(laneId, ref));
-		} catch (err) {
-			process.stderr.write(`runner: the stop acceptance could not be written: ${String(err)}\n`);
+		if (!accepted) {
+			try {
+				record(laneStopAcceptedBody(laneId, ref));
+			} catch (err) {
+				process.stderr.write(`runner: the stop acceptance could not be written: ${String(err)}\n`);
+			}
 		}
 		if (outcome === null) {
 			outcome = "stop";
@@ -1478,7 +1432,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					const { workload: latest, control } = controlNow();
 					const stakes = latest?.stakes ?? w.stakes;
 					// A relaunch already at or past the ceiling stops here, before lane-ready: and before the first prompt spends a model turn past it.
-					if (meter(stakes, control)) {
+					if (meter(control)) {
 						ready = true;
 						return;
 					}
@@ -1566,7 +1520,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					send({ id: "abort", type: "abort" });
 					conclude("deadline", laneDiedDeadlineBody(laneId, maxTime, inFlightNow()));
 				}
-				if (ready && outcome === null) meter(cur?.stakes ?? w.stakes, control);
+				if (ready && outcome === null) meter(control);
 				// D6: held for the lane's hands, and (PLAN wl-mv5i3lulwwbbi8 D8) the workload's live test runs; once none is left,
 				// omp's own word on settled (get_state) comes first.
 				if (holding && outcome === null) {
@@ -1758,8 +1712,16 @@ async function cmdInteractive(wl: string): Promise<number> {
 		for (const n of notes) process.stderr.write(`lane: tracing: ${n}\n`);
 		line(`lane ${laneId} on ${wl} in ${p.worktree} (branch ${p.branch}); first prompt copied to ${join(p.dir, "prompt.md")}`);
 		if (skipped !== null) line(`a fresh session on ${model ?? "the profile default"}: ${skipped}`);
-		// Interactive lanes are not metered (DESIGN-workload-ceiling.md § 2, "Not covered"): no ceiling line.
-		writeFileSync(join(p.dir, "prompt.md"), promptFor(ledger, w, laneId, p, null));
+		// Jo's ruling (in-mvfo7nphl9xn28, PLAN wl-mvfkv7llkp7nk0 § 4.1): a by-hand lane is paired with Jo and has no meter. It
+		// is never stopped at the ceiling and puts no ceiling question or notice on the surface; only `cmdRun` meters. The
+		// lane extension (surface/extensions/lane.ts) reports its spend instead: to the lane at every turn start, to Jo's pane
+		// at each 25 % of the original ceiling. The first prompt says so, with the spend so far.
+		const es = ledger.entries(wl);
+		const control = controlEntries(es, holdersOf(es, ledger.workload(wl)?.holder ?? null));
+		const instructions = ledger.instructions(wl);
+		const spent: Spend = { ...scanSpend(p.sessionDir, new Map(), { usd: 0, tokens: 0, wallMin: 0 }), wallMin: wallMinutes(control, Date.now(), null) };
+		const pairedLine = pairedCeilingPromptLine(effectiveCeiling(control, instructions, w.stakes), originalCeiling(control, instructions, w.stakes), spent);
+		writeFileSync(join(p.dir, "prompt.md"), promptFor(ledger, w, laneId, p, pairedLine));
 		// The TUI's ^C belongs to omp (a foreground process group signal reaches both); this wrapper waits for the exit.
 		process.on("SIGINT", () => undefined);
 		// The session files already here belong to earlier lanes: the one this OMP creates is the one not in this snapshot.

@@ -9,12 +9,16 @@ import { describe, expect, test } from "bun:test";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { type GhResult, tick } from "../scripts/train-tick";
 import { errorLines } from "../src/errors";
-import { controlEntries, laneExitBody, launchFailedBody, trainBoardBody } from "../src/launch";
+import { ensureStandingWorkload } from "../src/identity";
+import { applyTrain, interpret } from "../src/input";
+import { controlEntries, decideLaunch, laneExitBody, launchFailedBody, planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody } from "../src/launch";
 import {
-	fixBindings, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainPrs, trainRetries, trainSliceId,
+	actionable, fixBindings, mainRedNotices, protectionEpisodes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertBody, trainAlertMarker,
+	trainHeadWokenBody, trainHoldBody, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody,
 } from "../src/merge-train";
+import { trainMergedNoticeBody } from "../src/notice";
 import { makeRunId, testRequestedBody } from "../src/test-run";
-import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ESCALATION_BY, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import {
 	boardWorld, COMMIT_FILES_CAP, COMMIT_FILES_PER_PAGE, DECISION_LOG_FILE, type FakeDiffEntry, type FakeIssue, H0, H1, H2, JO, OWNER_LANE, protectedRules, REPO, TRAIN_LANE, world,
 } from "./train-world";
@@ -391,6 +395,51 @@ describe("retries of a released train and fork PRs (D8-D10, review gtb-r1)", () 
 		expect(w.creates()).toHaveLength(1);
 		expect(w.creates()[0]).toEqual(expect.arrayContaining(["--label", TRAIN_ALERT_LABEL]));
 	});
+
+	/** `lane` holds #101 at H0 until `until` (`train-hold:`, PLAN wl-mvfkv7llkp7nk0 § 3), leaves its slices open, and exits released. */
+	const held = (w: World, lane: string, until: string): string => {
+		worked(w, lane);
+		const id = w.ledger.recordEntry({ by: lane, workloadId: w.train, kind: "assumption", body: trainHoldBody(101, H0, until) });
+		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.train, kind: "assumption", body: laneExitBody(lane, { code: 0, signal: null, outcome: "released" }) });
+		return id;
+	};
+	const holdWakes = (w: World, holdId: string) => w.ledger.entries(w.train).filter((e) => e.created_by === MERGE_TRAIN_BY && e.body === trainWakeBody(101, holdId)).length;
+
+	test("a timed hold wakes the released train once its time passes, with one train-wake: that consumes it (PLAN wl-mvfkv7llkp7nk0 § 3, R10)", () => {
+		const w = world();
+		const holdId = held(w, TRAIN_LANE, "2026-10-01T12:00:00.000Z");
+		w.c.plusHours(1.5);
+		w.run();
+		expect(trainLaunches(w)).toBe(0);
+		expect(actionable(w.ledger, w.train)).toEqual([]);
+		w.c.at("2026-10-01T12:00:00.000Z");
+		expect(actionable(w.ledger, w.train)).toEqual([`#101 hold-expired (${holdId})`]);
+		w.run();
+		expect(trainLaunches(w)).toBe(1);
+		expect(holdWakes(w, holdId)).toBe(1);
+		expect(w.ledger.slice(trainSliceId(w.train, 101))!.state).toBe("open");
+		// the woken lane dies before it records an outcome: the consumed hold does not wake the train again
+		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.train, kind: "assumption", body: laneExitBody(holder(w), { code: 0, signal: null, outcome: "released" }) });
+		w.c.plusHours(1);
+		w.run();
+		w.run();
+		expect(trainLaunches(w)).toBe(1);
+		expect(holdWakes(w, holdId)).toBe(1);
+	});
+
+	test("an `until jo` hold wakes the train only when the PR's workload no longer holds it, here on Jo's approve after a halt", () => {
+		const w = world();
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.owner, kind: "assumption", body: planHaltedBody("in-1") });
+		const holdId = held(w, TRAIN_LANE, "jo");
+		w.c.plusHours(10);
+		w.run();
+		w.run();
+		expect(trainLaunches(w)).toBe(0);
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.owner, kind: "assumption", body: "plan: approved in-2" });
+		w.run();
+		expect(trainLaunches(w)).toBe(1);
+		expect(holdWakes(w, holdId)).toBe(1);
+	});
 });
 
 describe("alert sends with an uncertain outcome (D9, review gtb-r1 findings 9 and 10)", () => {
@@ -660,6 +709,19 @@ describe("auto-boarding, the live half (PLAN wl-mvbjiettjrfpxc D1, D3, D4)", () 
 		expect(w.boards()).toEqual([expect.objectContaining({ pr: 130, workload: wl, head: H0 })]);
 	});
 
+	test("PLAN wl-mvfkv7llkp7nk0 § 3: a PR its plan's auto-start holds never boards, its skip names the hold; one Jo approved after the auto-start boards", () => {
+		const w = boardWorld();
+		const auto = { by: ESCALATION_BY, body: planAutoApprovedBody("dg-1") };
+		const held = w.landing(132, { entries: [auto] });
+		w.run();
+		w.run();
+		expect(w.boards()).toEqual([]);
+		expect(w.skips()).toEqual([expect.stringMatching(new RegExp(`^train-board-skip: workload ${held} pr 132 head ${H0} #132 is held: .* until jo$`))]);
+		const approved = w.landing(133, { entries: [auto, { by: SURFACE_BY, body: planApprovedBody("in-1") }] });
+		w.run();
+		expect(w.boards()).toEqual([expect.objectContaining({ pr: 133, workload: approved, head: H0 })]);
+	});
+
 	test("R3: one skip row per head and reason across passes, a new head a new row; a PR seen MERGED ends its scan for good", () => {
 		const w = boardWorld();
 		const wl = w.landing(131);
@@ -765,5 +827,87 @@ describe("main's protection, verified again (PLAN wl-mvbjiettjrfpxc D6)", () => 
 		expect(w.g.issues[0]!.state).toBe("CLOSED");
 		expect(errorLines(w.ledger).filter((l) => l.kind === "train")).toEqual([]);
 		expect(w.boards()).toHaveLength(1);
+	});
+});
+
+describe("one merge notice per PR the train merged (PLAN wl-mvg8itbt0rz3ls D4)", () => {
+	const MERGED = (pr: number) => `merged by train ${"d".repeat(40)} (run tr-${pr})`;
+	/** A train world with the standing workload, the train lane's PR slices completed with `artifacts` (by PR). */
+	const merged = (artifacts: Record<number, string>, o: { signoff?: { pr: number; by: string } } = {}) => {
+		const w = world();
+		ensureStandingWorkload(w.ledger);
+		for (const [pr, artifact] of Object.entries(artifacts)) {
+			const sl = w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: trainSliceId(w.train, Number(pr)), task: `PR #${pr}`, doneCondition: "terminal", inputs: `#${pr}` });
+			if (o.signoff?.pr === Number(pr)) {
+				w.ledger.recordEntry({ by: o.signoff.by, workloadId: w.train, sliceId: sl, kind: "assumption", body: `ruling-applied: train-signoff kind merge slice ${sl} answer merge` });
+			}
+			w.ledger.completeSlice(sl, { by: TRAIN_LANE, artifact });
+		}
+		return w;
+	};
+	/** The tick's merge control entries on the standing workload. */
+	const entries = (w: { ledger: Ledger }) =>
+		w.ledger.entries(STANDING_WORKLOAD_ID, "assumption").filter((e) => e.created_by === MERGE_TRAIN_BY && e.body.startsWith("train-notice: merged")).map((e) => e.body);
+	/** Every notice on the standing workload, as sent. */
+	const sent = (w: { ledger: Ledger }) =>
+		w.ledger.db.query<{ body: string; created_by: string }, [string]>("SELECT body, created_by FROM messages WHERE workload_id = ? ORDER BY created_at, rowid").all(STANDING_WORKLOAD_ID);
+	const close = (w: { ledger: Ledger; train: string }) => {
+		w.ledger.releaseWorkload(w.train, { by: TRAIN_LANE, holder: TRAIN_LANE });
+		w.ledger.closeWorkload(w.train, { by: SURFACE_BY });
+	};
+
+	test("R7: a PR the train merged gets one notice and one control entry across two ticks; Jo's own merge gets none", () => {
+		const w = merged({ 101: MERGED(101), 106: `merged by Jo ${"e".repeat(40)}` });
+		w.run();
+		expect(entries(w)).toEqual([`train-notice: merged ${REPO} #101 ${w.train}`]);
+		expect(sent(w)).toEqual([{ body: `notice: merge train merged #101 (${REPO}, normal stakes): ${MERGED(101)}`, created_by: MERGE_TRAIN_BY }]);
+		expect(errorLines(w.ledger).filter((l) => l.kind === "notice").map((l) => l.line)).toEqual([expect.stringContaining(`merge train merged #101 (${REPO}, normal stakes)`)]);
+		w.c.plusHours(0.1);
+		w.run();
+		expect(entries(w)).toHaveLength(1);
+		expect(sent(w)).toHaveLength(1);
+	});
+
+	test("R7: a skipped PR gets no notice", () => {
+		const w = merged({ 101: "skipped: CLOSED", 106: `merged by Jo ${"e".repeat(40)}` });
+		w.run();
+		expect(entries(w)).toEqual([]);
+		expect(sent(w)).toEqual([]);
+	});
+
+	test("R7: the train's ruling-applied: train-signoff on the slice names Jo's train word; written by anyone but a holder it does not", () => {
+		const prod = merged({ 101: MERGED(101) }, { signoff: { pr: 101, by: TRAIN_LANE } });
+		prod.run();
+		expect(sent(prod).map((m) => m.body)).toEqual([`notice: merge train merged #101 (${REPO}, production, Jo's train word (ruling train-signoff)): ${MERGED(101)}`]);
+		const other = merged({ 101: MERGED(101) }, { signoff: { pr: 101, by: OWNER_LANE } });
+		other.run();
+		expect(sent(other).map((m) => m.body)).toEqual([`notice: merge train merged #101 (${REPO}, normal stakes): ${MERGED(101)}`]);
+	});
+
+	test("R7: a train closed 2 h earlier still notifies, one closed 25 h earlier does not", () => {
+		const recent = merged({ 101: MERGED(101) });
+		close(recent);
+		recent.c.plusHours(2);
+		recent.run();
+		expect(entries(recent)).toEqual([`train-notice: merged ${REPO} #101 ${recent.train}`]);
+		expect(sent(recent)).toHaveLength(1);
+		const old = merged({ 101: MERGED(101) });
+		close(old);
+		old.c.plusHours(25);
+		old.run();
+		expect(entries(old)).toEqual([]);
+		expect(sent(old)).toEqual([]);
+	});
+
+	test("the control entry disturbs neither the protection nor the red-main reader; the artifact is collapsed and clipped to 160", () => {
+		const w = merged({ 101: MERGED(101), 106: MERGED(106) }); // no PR left pending: main's protection is not read
+		w.run();
+		expect(entries(w)).toHaveLength(2);
+		expect(protectionEpisodes(w.ledger).size).toBe(0);
+		expect(mainRedNotices(w.ledger).size).toBe(0);
+		const body = trainMergedNoticeBody(REPO, 7, false, `merged by train\n  ${"x".repeat(300)}`);
+		const artifact = body.slice(`merge train merged #7 (${REPO}, normal stakes): `.length);
+		expect(artifact).toHaveLength(160);
+		expect(artifact).toBe(`merged by train ${"x".repeat(143)}…`);
 	});
 });

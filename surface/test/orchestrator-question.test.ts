@@ -147,6 +147,43 @@ describe("the question row", () => {
 	});
 });
 
+describe("Jo's standing rulings (PLAN wl-mvfkv7llkp7nk0 § 1, R1, R3)", () => {
+	const applied = (ledger: Ledger) =>
+		ledger.entries(STANDING_WORKLOAD_ID).filter((e) => e.body.startsWith("ruling-applied:")).map((e) => [e.created_by, e.slice_id, e.body]);
+
+	test("a question a ruling decides writes no row and no subject entry, leaves the standing slice open, records the surface's ruling-applied entry and returns the decided text", async () => {
+		const { ledger, path } = tempLedger();
+		const s = surface(path);
+		const reply = await s.raise({ body: "The fix touches gates/src/rows/r08.ts. Open it at normal or production stakes?", options: ["normal", "production"] });
+		expect(reply).toStartWith("decided by Jo's ruling gates-stakes: open it at production stakes");
+		expect(reply).toContain("do not publish a QUESTION block");
+		expect(ledger.questions(STANDING_WORKLOAD_ID)).toEqual([]);
+		expect(ledger.slice(STANDING_SLICE_ID)!.state).toBe("open");
+		expect(applied(ledger)).toEqual([[SURFACE_BY, STANDING_SLICE_ID, `ruling-applied: gates-stakes kind stakes slice ${STANDING_SLICE_ID} answer production`]]);
+		expect(s.f.entries.filter((e) => e.type === "surface-question")).toEqual([]);
+	});
+
+	test("flow-repair decides an open-or-later question; a stakes question about an open workload is a conversion and is raised", async () => {
+		const { ledger, path } = tempLedger();
+		const wl = ledger.openWorkload({ by: "lane-a", brief: "Touch gates/", stakes: "normal", mode: "autonomous" });
+		const s = surface(path);
+		expect(await s.raise({ body: "Open the docs workload now, or later?", options: ["open", "later"] })).toContain("decided by Jo's ruling flow-repair");
+		const q = s.idOf(await s.raise({ body: "Its PR now touches gates/src: normal or production?", options: ["normal", "production"], about: wl }));
+		expect(questionSubject(ledger, q)).toBe(wl);
+		expect(applied(ledger).map((a) => a[2])).toEqual([`ruling-applied: flow-repair kind open-workload slice ${STANDING_SLICE_ID} answer later`]);
+	});
+
+	test("a model question needs its subject: refused without one", async () => {
+		const { ledger, path } = tempLedger();
+		const s = surface(path);
+		expect(await s.raise({ body: "Which model for the lanes?", options: ["anthropic/claude-opus-5-5", "openai-codex/gpt-6.1-sol"] })).toContain("declare `subject`");
+		expect(ledger.questions(STANDING_WORKLOAD_ID)).toEqual([]);
+		expect(await s.raise({ body: "Which model for the lanes?", options: ["anthropic/claude-opus-5-5", "openai-codex/gpt-6.1-sol"], subject: "lane-model" })).toContain(
+			"decided by Jo's ruling models: run the lane on anthropic/claude-opus-5-5",
+		);
+	});
+});
+
 describe("Jo's answer", () => {
 	test("`<option> q-…` resolves the row and writes Jo's instruction on the subject workload in one transaction; the lane on that workload reads it there; the standing slice is open again", async () => {
 		const { ledger, path } = tempLedger();
@@ -207,13 +244,14 @@ describe("Jo's answer", () => {
 		expect(ledger.question(ghost)!.state).toBe("open");
 	});
 
-	test("a withdrawal with `cancel` never cancels the standing slice: it replans, the slice is open, and a second question is raised", async () => {
+	test("a withdrawal never cancels the standing slice: it replans, the slice is open, and a second question is raised", async () => {
 		const { ledger, path } = tempLedger();
 		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
 		const s = surface(path);
 		const q = s.idOf(await s.raise({ body: "Now or later?", options: ["now", "later"], about: wl }));
-		expect(interpret(ledger, `withdraw ${q}`)).toEqual({ kind: "withdraw", workloadId: STANDING_WORKLOAD_ID, questionId: q, then: "replan" });
-		const receipt = apply(ledger, { kind: "withdraw", workloadId: STANDING_WORKLOAD_ID, questionId: q, then: "cancel" });
+		const cmd = interpret(ledger, `withdraw ${q}`)!;
+		expect(cmd).toEqual({ kind: "withdraw", workloadId: STANDING_WORKLOAD_ID, questionId: q });
+		const receipt = apply(ledger, cmd);
 		expect(receipt).toMatch(new RegExp(`^withdrew the orchestrator's ${q} \\(withdrawal in-\\S+, then replan\\); the standing slice stays open$`));
 		const row = ledger.question(q)!;
 		expect(row.state).toBe("withdrawn");

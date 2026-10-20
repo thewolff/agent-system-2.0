@@ -449,10 +449,11 @@ export function reviewRow(table: TierTable, tier: Tier): string[] {
 
 /**
  * Jo's standing rule (input in-mv5xafhywe3w8w, 2026-10-13): a review that parks only because Kimi is out goes same-lab with
- * no question (PLAN wl-mv5xay6bjp0268). It ends at the end of 2026-10-31 America/Los_Angeles (2026-11-01T00:00-07:00, PDT)
- * or on Jo's word, whichever is first; ending it early is setting `endsAt` to the moment of Jo's word, merging, and relaunching
- * the lanes. `rowOmission`: the installed tier rows dropped moonshot for this outage (2026-10-12 14:28 PDT), so a review row
- * with no kimi entry counts as Kimi out while the rule is active.
+ * no question (PLAN wl-mv5xay6bjp0268). Its record is the `kimi-out` ruling of gates/src/rulings.ts `STANDING_RULINGS`, which
+ * dates it by `endsAt`: the end of 2026-10-31 America/Los_Angeles (2026-11-01T00:00-07:00, PDT), or at once on Jo's
+ * `end-ruling kimi-out` (the classifier reads both through `rulingActive`). `kimiOutRuleActive` is the date alone, for the
+ * ledger-less checks: quota marking and honouring a 429 refusal. `rowOmission`: the installed tier rows dropped moonshot for
+ * this outage (2026-10-12 14:28 PDT), so a review row with no kimi entry counts as Kimi out while the rule is active.
  */
 export const KIMI_OUT_RULE = { input: "in-mv5xafhywe3w8w", endsAt: Date.parse("2026-11-01T00:00:00-07:00"), rowOmission: true } as const;
 export const kimiOutRuleActive = (now: number) => now < KIMI_OUT_RULE.endsAt;

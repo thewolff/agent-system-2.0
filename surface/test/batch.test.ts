@@ -8,9 +8,10 @@ import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { onFire } from "../src/batch";
-import { CEILING_OPTIONS } from "../src/ceiling";
+import { ceilingNoticeBody } from "../src/ceiling";
 import { errorLines } from "../src/errors";
 import { laneExitBody } from "../src/launch";
+import { sendNotice } from "../src/notice";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { surfaceSession } from "../src/session";
 import { laneDiedShutdownBody } from "../src/signals";
@@ -62,14 +63,14 @@ async function surface() {
 
 const ask = (l: Ledger, wl: string, sl: string, body: string) => l.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body, options: ["yes", "no"] });
 
-/** The runner's ceiling question at 80 % on a workload of its own (surface/test/ceiling-surface.test.ts withCeilingQuestion). */
-function ceilingQuestion(l: Ledger) {
+/** The runner's ceiling notice at `level` on a workload of its own: what the lane runner's meter sends (surface/scripts/lane.ts sendCeilingNotice). */
+function ceilingNotice(l: Ledger, level: 80 | 100 = 80, by = LANE_RUNNER_BY) {
 	const wl = l.openWorkload({ by: SURFACE_BY, brief: "Move the header offset into a token", stakes: "normal", mode: "autonomous" });
 	l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: "ceiling: usd 50 wall 360 source stakes normal" });
 	l.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-t-1 cause first requested-by test" });
-	const sl = l.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: "sl-ceiling-1", task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
-	const q = l.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body: "80 % of the ceiling", options: [...CEILING_OPTIONS] });
-	return { wl, sl, q };
+	const body = ceilingNoticeBody(level, wl, { usd: level === 80 ? 40 : 50, tokens: 1000, wallMin: 10 }, { usd: 50, wallMin: 360 }, "normal");
+	const m = sendNotice(l, { by, workloadId: wl, body });
+	return { wl, m, needle: `ceiling ${level} % at usd 50 wall 360 on ${wl}` };
 }
 
 /** A lane that launched, held the workload, released it and exited with `outcome`/`reason`: an idle line. */
@@ -93,14 +94,18 @@ function redRun(l: Ledger) {
 	return wl;
 }
 
-describe("onFire: the four kinds that go out on their own poll", () => {
-	test("a death with open or paused work, the ceiling question, a ceiling stop's idle exit and a red run are on fire; their quiet twins are not", () => {
+describe("onFire: the kinds that go out on their own poll", () => {
+	test("a death with open or paused work, the runner's ceiling notice, a ceiling stop's idle exit and a red run are on fire; their quiet twins are not", () => {
 		const { ledger: l } = tempLedger();
 		const live = workloadWithSlice(l).wl;
 		death(l, live, 1);
 		const empty = l.openWorkload({ by: "lane-x", brief: "nothing left", stakes: "normal", mode: "autonomous" });
 		death(l, empty, 0);
-		const { q: ceiling } = ceilingQuestion(l);
+		const ceiling = ceilingNotice(l);
+		const stop = ceilingNotice(l, 100);
+		const forged = ceilingNotice(l, 80, "lane-x");
+		const plain = workloadWithSlice(l).wl;
+		const note = sendNotice(l, { by: "lane-x", workloadId: plain, body: "the train holds" });
 		const { wl: other, sl } = workloadWithSlice(l);
 		const routine = ask(l, other, sl, "Which?");
 		const stopped = idleExit(l, "stop", "ceiling");
@@ -113,7 +118,10 @@ describe("onFire: the four kinds that go out on their own poll", () => {
 		};
 		expect(fire("lane-died", live)).toBe(true);
 		expect(fire("lane-died", empty)).toBe(false);
-		expect(fire("question", l.question(ceiling)!.workload_id, ceiling)).toBe(true);
+		expect(fire("notice", ceiling.wl, ceiling.m)).toBe(true);
+		expect(fire("notice", stop.wl, stop.m)).toBe(true);
+		expect(fire("notice", forged.wl, forged.m)).toBe(false);
+		expect(fire("notice", plain, note)).toBe(false);
 		expect(fire("question", other, routine)).toBe(false);
 		expect(fire("idle", stopped)).toBe(true);
 		expect(fire("idle", parked)).toBe(false);
@@ -202,6 +210,28 @@ describe("the window: routine lines wait and go out together (D3)", () => {
 		expect(t.lane.message(m)!.state).toBe("delivered");
 	});
 
+	test("a notice is routine: it waits for the window, is pushed once unnumbered, its message moves to delivered then, and nothing repeats it", async () => {
+		const t = await surface();
+		const { wl } = workloadWithSlice(t.lane);
+		const m = sendNotice(t.lane, { by: LANE_RUNNER_BY, workloadId: wl, body: "the plan started on its own" });
+		const line = errorLines(t.lane).find((l) => l.rowId === m)!;
+		expect(onFire(t.lane, line)).toBe(false);
+		t.poll();
+		t.minutes(3);
+		t.poll();
+		expect(t.needsYou()).toEqual([]);
+		expect(t.lane.message(m)!.state).toBe("held");
+		t.minutes(2);
+		t.poll();
+		expect(t.needsYou()).toHaveLength(1);
+		expect(t.needsYou()[0]!.message.content).toBe(`${NEEDS}\n- notice on ${wl} (nothing to answer): the plan started on its own\n\n${count(0)}`);
+		expect(t.lane.message(m)!.state).toBe("delivered");
+		t.minutes(10);
+		t.poll();
+		expect(t.needsYou()).toHaveLength(1);
+		expect(await t.jo("ok")).toBe(count(0));
+	});
+
 	test("a wake render clears the hold: the lines it carried are not pushed after it", async () => {
 		const t = await surface();
 		const { wl, sl } = workloadWithSlice(t.lane);
@@ -280,7 +310,8 @@ describe("on fire: pushed on its own poll, carrying the hold (D3)", () => {
 			death(l, wl, 1);
 			return `lane lane-x on ${wl} died`;
 		}],
-		["the runner's ceiling question", (l) => ceilingQuestion(l).q],
+		["the runner's ceiling notice", (l) => ceilingNotice(l).needle],
+		["the runner's stop notice at 100 %", (l) => ceilingNotice(l, 100).needle],
 		["an idle exit that is a ceiling stop (outcome stop reason ceiling)", (l) => `lane lane-c on ${idleExit(l, "stop", "ceiling")} ended (stop)`],
 		["a red full-suite run", (l) => `full suite red on ${redRun(l)}`],
 	];
@@ -305,25 +336,6 @@ describe("on fire: pushed on its own poll, carrying the hold (D3)", () => {
 			expect(t.needsYou()).toHaveLength(1);
 		});
 	}
-
-	test("the ceiling question at 80 % unanswered is pushed, and pushed again at once when the lane's lane-stop: accepted ceiling lands", async () => {
-		const t = await surface();
-		const { wl, q } = ceilingQuestion(t.lane);
-		t.poll();
-		expect(t.needsYou()).toHaveLength(1);
-		expect(t.needsYou()[0]!.message.content).toContain(q);
-		expect(t.needsYou()[0]!.message.content).not.toContain("the lane stopped at the ceiling");
-		t.poll();
-		expect(t.needsYou()).toHaveLength(1);
-		t.minutes(1);
-		t.lane.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: "lane-stop: lane-t-1 accepted ceiling" });
-		t.poll();
-		expect(t.needsYou()).toHaveLength(2);
-		expect(t.needsYou()[1]!.message.content).toContain(`(${q}, slice sl-ceiling-1)`);
-		expect(t.needsYou()[1]!.message.content).toContain("; the lane stopped at the ceiling");
-		t.poll();
-		expect(t.needsYou()).toHaveLength(2);
-	});
 });
 
 describe("brb and back (D4)", () => {
@@ -336,12 +348,12 @@ describe("brb and back (D4)", () => {
 		expect(notices).toEqual(["holding needs-you pushes until `back`; on-fire items still come through"]);
 		expect(t.s.away).toEqual({ since: t.c.now() });
 		t.minutes(1);
-		const { q: ceiling } = ceilingQuestion(t.lane);
+		const { needle } = ceilingNotice(t.lane, 100);
 		t.poll();
 		expect(t.needsYou()).toHaveLength(1);
-		expect(t.needsYou()[0]!.message.content).toContain(ceiling);
+		expect(t.needsYou()[0]!.message.content).toContain(needle);
 		expect(t.needsYou()[0]!.message.content).not.toContain(routine);
-		expect(t.needsYou()[0]!.message.content.endsWith(count(2))).toBe(true);
+		expect(t.needsYou()[0]!.message.content.endsWith(count(1))).toBe(true);
 		// away: the window never flushes
 		t.minutes(10);
 		t.poll();
@@ -352,8 +364,8 @@ describe("brb and back (D4)", () => {
 		const turn = await t.jo("back");
 		expect(turn.startsWith(BACK)).toBe(true);
 		expect(turn.split("## pending:")[0]).toContain(`is waiting on you (${routine}, slice ${sl})`);
-		expect(turn).toContain(`\n\n${t.block()}\n\n${count(2)}`);
-		expect(turn.endsWith(count(2))).toBe(true);
+		expect(turn).toContain(`\n\n${t.block()}\n\n${count(1)}`);
+		expect(turn.endsWith(count(1))).toBe(true);
 		expect(t.s.away).toBeNull();
 		expect(t.s.heldNeedsYou.size).toBe(0);
 		t.minutes(10);

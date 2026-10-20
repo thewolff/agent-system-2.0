@@ -487,6 +487,31 @@ A4 gate (item 1); a material non-reserved choice goes through a `question` row t
 dependent work (item 5). Those two are the only human waits a lane can hit; item 5's prompt-event
 trigger is the safety net if a blocking prompt leaks anyway.
 
+**Amended 2026-10-19 — standing rulings are checked before a question; notices** (`migration/items/escalation-policy.md`;
+Jo, ledger input `in-mvfkupc4p9nt34` opening the escalation-policy work, and the policy draft's § 4: *"a ruling comes only
+from Jo's words … The ruling check has to be code"*; plan `~/agent-scratch/agent-system-2.0/wl-mvfkv7llkp7nk0/PLAN.md`
+rev 5 §§ 1–2, approved by Jo; built in wl-mvfkv7llkp7nk0). Two changes to item 5's question trigger. **Rulings
+first:** `askJo` (`gates/src/rulings.ts`) is the only production path to `Ledger.raiseQuestion`. It reads the question's
+kind from its option set (`questionKind`: `review-park`, `open-workload`, `merge`, `stakes`, and for a question whose
+every option is a `provider/model` id the `subject` its asker declares, `lane-model` or `review-model`, refused when
+missing) and checks Jo's standing rulings (`STANDING_RULINGS`): `kimi-out` (in-mv5xafhywe3w8w, ends
+2026-11-01T00:00-07:00), `flow-repair` (in-mvfiyyv2kuha80), `merges` (in-mv91wdhs446ark), `models` (in-mv5qagioc4en0g,
+in-mvfiu1uyldnksg) and `gates-stakes` (in-mv0novd17fre9s), each with the scope, exceptions and end its source gives;
+`train-signoff` (in-mvg8clpoo9xn28) joins them under § B4, *Amended 2026-10-20 — Jo's train word is the production sign-off*.
+When an active ruling covers the question, no question row is written and nothing pauses; the asker records
+`ruling-applied: <ruling> kind <k> slice <sl> answer <a>`, and the lane and orchestrator tools return the ruling and
+its action instead of a question id. Every other question, of kind `other` (round limit, merge train, plan, safety) or
+outside a ruling's scope, is raised as before. A ruling is added only by a code change from Jo's words, and Jo's
+`end-ruling <id>` ends one at once. The invariant report's `ruling-miss` lists a question raised since the ledger's
+first `ruling-applied:` entry (the check's activation) that an active ruling would have decided, the runtime check for
+a raise path that bypasses `askJo`. **Notices:**
+something Jo is told and does not answer (a ceiling at 80 %, a ceiling stop, a plan that started on its own,
+§ B6 and § B11 *Amended 2026-10-19*) is a `notice:` message to the orchestrator written by trusted tool code
+(`sendNotice`, `surface/src/notice.ts`), never a `questions` row. It shows after every other needs-you line as
+`notice on <workload> (nothing to answer): …`, unnumbered and not answerable, until delivery marks it delivered once.
+The two ceiling notices are on fire for the batch; every other notice waits for the window. A `notice:` written by a
+lane that holds or held the workload shows only as that lane's message.
+
 ### B4 · Stakes → tier cap, and review as a stakes property (P-9, P-8a, A4 "approved")
 
 **Ruled 2026-09-23.** Jo: *"yes to your reccos"*, after *"so would every normal workload cost
@@ -496,7 +521,7 @@ fable time?"* exposed that A1.2/A1.3 had left the stakes→cap table unset.
 |---|---|---|---|
 | throwaway | fast | none | none |
 | normal | strong | a *judge* slice (runs on strong under the cap); merge proceeds on pass | told in one line after the merge |
-| production | deep | a *judge* slice on deep, **then Jo** | approves the merge; the deploy is a separate reserved one-liner (A4) |
+| production | deep | a *judge* slice on deep, **then Jo** | Jo's `train` word on the PR is his approval of the merge: the train merges it once green with its review passed and tells him in one line after (*Amended 2026-10-20*, below); the deploy is a separate reserved one-liner (A4) |
 
 So fable is spent only on production workloads' judge slices and on anything Jo raises. A judge
 slice's closing artifact (B1) is its written verdict plus the slice's runtime artifacts; how many
@@ -530,6 +555,29 @@ in one line after the merge" no longer holds: Jo hears only of a production-stak
 conflict the owner fails twice, a red main (once per `main-red` issue), or a main protection the
 tick cannot verify (named once per episode). Production-stakes and user-driven lanes keep the rule
 above unchanged; production auto-boarding is a non-goal.
+
+**Amended 2026-10-20 — Jo's train word is the production sign-off** (`migration/items/train-signoff-ruling.md`;
+jo-issues #155; Jo, 2026-10-19 9:10 PM PDT: *"i dont want to be asked twice"*; Jo's standing ruling, ledger input
+`in-mvg8clpoo9xn28`: *"my train word on a production-stakes PR is my merge approval. The train merges that PR once it
+is green and its review passes, without asking me again, and tells me in one line after it merges."*; Jo's
+`machinery` (in-mvg8ibntzpnzeo) to carry it in every train, and his `issue155` (instruction in-mvg9zz54ejepz4) to make it the
+permanent rule; plan `~/agent-scratch/agent-system-2.0/wl-mvg8itbt0rz3ls/PLAN.md` §§ 1–2; built in wl-mvg8itbt0rz3ls).
+This amends the production row above. Before it, a production PR needed Jo's `train <N>` to board, and then the train
+asked Jo merged / skip / stop before it merged. Now Jo's `train <N>` (or `train wl-<train> <N>`) is his approval of
+the merge. The mechanism is a standing ruling, `train-signoff`, in `gates/src/rulings.ts` (§ B3, *Amended 2026-10-19 —
+standing rulings are checked before a question*). It decides the train lane's merged / skip / stop question, answer
+`merge`, when all of these hold, read by the question tool and never taken from the lane's words: an authenticated
+`train` word of Jo's named the PR; the PR is on a same-repo `wl/` branch whose workload's newest review is settled and
+passed; the PR is green at its current head; and main's protection reads `ok` live. Then no question row is written,
+the question tool records `ruling-applied: train-signoff kind merge slice <sl> answer merge`, and the train lane merges
+at once with a merge commit pinned to the head it verified (`--match-head-commit`, never `--admin`). If any of these fails, or a
+`gh` read fails, Jo is asked as before. Auto-boarding still never boards a production PR, so a PR only the train tick
+boarded still asks. A question already open when this lands stays Jo's to answer. Jo's `end-ruling train-signoff`
+ends the ruling at once with no code change, and from then on every production PR asks again. **One line after each
+train merge:** the train tick sends Jo one notice per PR any train merged (`merged by train …`), once, naming either
+his train word (production) or normal stakes. Normal-stakes train merges therefore again send the one-line notice the
+normal row promises; this replaces the auto-board amendment's "no longer holds" sentence above. No notice is sent for a
+PR Jo merged himself or one the train skipped.
 
 **Amended 2026-10-01 — cross-lab review** (MIGRATION.md item 23; Jo: *"any review should happen
 via a model from a lab that did not build it. if the agent building it was anthropic? we use openai
@@ -818,6 +866,35 @@ checked: that a locator exists (a test the plan will write does not exist yet) o
 enforces its requirement; Jo judges that from the plan, the cross-lab plan review reads it, and the
 code review checks it in the diff.
 
+**Amended 2026-10-19 — a normal plan that passes cross-lab review starts on its own, and stops before merge**
+(`migration/items/escalation-policy.md`; Jo, 2026-10-19: *"yes to auto-start, stop at 100%"*, deciding the escalation
+draft's decision 1, *"A normal-stakes plan that passes cross-lab review starts without Jo's `approve`. Jo gets a notice
+and can stop it before merge. It never opens new work while the flow-repair gate is up."*; plan rev 5 § 3; built in
+wl-mvfkv7llkp7nk0). When a lane raises the plan question (an `approve` question on the plan slice while `plan: first`
+stands), `lane_raise_question` raises no question when all of these hold (`planAutoStartRound`,
+`surface/extensions/lane-tools.ts`): (a) the workload is at normal stakes; (b) the passing round is the latest review
+state, meaning the newest `review-loop-end:` on the plan slice is `reason pass` and no `hand-spawn: … review yes` and
+no review routing on the slice came after it; the round it closes was created after the slice's last question was
+resolved; and every member of that round ran, was not withheld, carries no same-lab token (no Jo grant, no Kimi-out
+rule token) and answered only on labs outside the builders. Jo's `accept` at a round limit, a mixed round and any
+later review all fail (b). (c) The body passes the plan-question shape check above. (d) The workload was never
+halted. (e) The `flow-repair` ruling is not active (§ B3, *Amended 2026-10-19*). Then, in one write, the fixed writer
+`escalation` (`ESCALATION_BY`) records `plan: approved auto <round group>`, a form valid only from that writer, which
+every reader of plan approval accepts and no lane can write, and sends Jo a notice carrying the plan body: *"plan
+started without your approve on <wl> (normal stakes, cross-lab review passed); it will not merge until 4 h after your
+next message here; `halt <wl>` stops it"*. The lane is told to add its change slices. Auto-start never opens a
+workload and never launches a lane. Production plans, and every plan while flow repair is up, still go to Jo as above.
+**Stop before merge:** for such a workload `prStakes` (`surface/src/merge-train.ts`) answers `hold: <reason> until
+<time|jo>`. The hold lasts until 4 h (`HOLD_HOURS`) after Jo's first typed surface message created after the notice
+was delivered (the standing-workload instruction `joInputRow` writes; mirrors on other workloads do not count), and
+until Jo when there is none. The train records `train-hold: pr <N> head <sha> until <…>`, leaves the PR's slices open
+and moves on. The tick's `hold-expired` reason wakes it once per hold (its own `train-wake:` consumes it), and the
+train re-reads `prStakes` just before `gh pr merge`. Not caught: a `halt` written in the seconds between that read and
+the merge. **`halt <wl>`** writes Jo's instruction, the surface's `plan: halted <instruction>` and a `lane-stop:`
+request to a live holder. `planFirst` then reads the workload as unapproved, so change slices are refused. The train
+holds its PRs with no end, auto-start never fires on it again, and Jo's `approve` on its next plan question approves
+it as before.
+
 ### B7 · Wake: the ledger rendered, never a hand's prose (P-17)
 
 **Ruled 2026-09-23.** Jo: *"i think we should refer to a ledger over an agent's prose pretty
@@ -928,6 +1005,21 @@ inventory each lab's lanes take their own entries from and each review takes the
 entries from. Rate-limit exhaustion still stays inside the lane (B3) under the four-hour rule
 (A3).
 
+**Amended 2026-10-19 — the workload ceiling stops and tells; paired lanes are never stopped**
+(`DESIGN-workload-ceiling.md` § 2, *Amended 2026-10-19*; `migration/items/escalation-policy.md`; Jo, 2026-10-19: *"yes
+to auto-start, stop at 100%"*, deciding the escalation draft's decision 2, *"At 100% of a ceiling, as2 stops and sends a
+notice. Jo can extend with one word. There is no automatic extension."*; Jo's paired-workload amendment
+in-mvfo7nphl9xn28; plan rev 5 §§ 4–4.1; built in wl-mvfkv7llkp7nk0). The lane runner's meter raises no question at any
+level. At 80 % of either half of the workload ceiling it sends Jo one notice per ceiling value, and the lane goes on.
+At 100 % the lane stops (`lane-stop: … accepted ceiling`, outcome `stop`) and Jo gets one stop notice per ceiling
+value (§ B3, *Amended 2026-10-19*). No ceiling extends on its own, at any stakes. Raising stays Jo's (§ B12.1 item 2).
+`extend <wl>` adds one more block of the workload's own size; `ceiling <usd> [<hours>] <wl>` sets a figure. Each
+writes Jo's instruction and then the `ceiling:` entry naming it. Either word relaunches an autonomous lane the ceiling
+stopped, when that lane's spend is under the new value and no relaunch is already waiting. A workload whose holder is a
+live by-hand lane (`as2 lane <wl>`, `launch:` cause `interactive`) is never stopped at its ceiling and puts nothing
+about it on the needs-you list. That lane gets its spend against the ceiling at every turn start, and Jo gets a line
+in its pane at every further 25 % of the original ceiling's dollars, past 100 % too.
+
 ### B12 · Two decisions held since the triple-check (P-7b, P-16/P-15)
 
 **B12.1 The reserved list is five, closed by default — ruled 2026-09-23.** Jo: *"yes"* (after
@@ -936,7 +1028,8 @@ account for?"*). The five: (1) opening/closing a phase; (2) spend above a worklo
 raising one; (3) the A4 command list — `careful`'s enumeration, protected-branch push, deploy;
 (4) changes to the system's own rules or machinery, including a workload's exceptions field;
 (5) **production-stakes sign-off before merge** (P-4 "both", placed by B4) — in force before,
-now counted. *Closed by default* means: the orchestrator cannot grow the list; it **may always
+now counted; Jo's `train` word naming the PR is that sign-off (§ B4, *Amended 2026-10-20 — Jo's train word is the
+production sign-off*). *Closed by default* means: the orchestrator cannot grow the list; it **may always
 ask** about anything unlisted (escalating is not reserved, `PREFERENCES.md` § P-7b); additions
 are Jo's ruling under item 4; per-workload extras go in the Jo-only exceptions field (P-5);
 a scenario nobody foresaw costs one incident — B3 surfaces it, P-16 proposes the addition, Jo

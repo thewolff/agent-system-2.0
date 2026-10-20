@@ -4,16 +4,18 @@
 // until it resolves; a declared artifact command's bash results write the slice's outcomes. Every
 // row is read back through errorLines, the way the surface reads it.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CERTIFIED } from "../../gates/test/helpers";
 import { registerFence } from "../../gates/src/fence";
-import { Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { LANE_STARTER_BY, Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { type Ceiling, ceilingBody, pairedCeilingPromptLine, pairedSpendStep, type Spend } from "../src/ceiling";
 import orchestratorSurface from "../index";
 import { errorLines } from "../src/errors";
+import { laneDir, laneStartedBody } from "../src/launch";
 import { openPromptWaits, artifactCommandBody, artifactCommands, artifactTrees } from "../src/signals";
 import { heartbeatText, settleArtifact, testRequestedBody, type TestRun, testRunBody } from "../src/test-run";
-import { ARTIFACT_TOOL, INSTRUCTION_POLL_MS, LANE_RELEASE_TOOL, LEASE_MS } from "../src/types";
+import { ARTIFACT_TOOL, INSTRUCTION_POLL_MS, LANE_RELEASE_TOOL, LEASE_MS, SURFACE_BY } from "../src/types";
 import { workingTree } from "../src/wtree";
 import { ctxOf, fakePi, git, notices, tempRepo, timers, tmp } from "./helpers";
 
@@ -661,5 +663,101 @@ describe("lane row: the test runner's results reach the lane as asides (PLAN wl-
 		expect(said.filter((x) => x.startsWith("runner for tr-0abc1234eeee died"))).toHaveLength(1);
 		expect(said.filter((x) => x.startsWith("runner for tr-0abc1234ffff"))).toEqual([]);
 		expect(said.filter((x) => x.startsWith("Test run tr-0abc1234ffff") && x.includes("Reason: runner died") && x.includes("Full suite: not run."))).toHaveLength(1);
+	});
+});
+
+describe("lane row: a by-hand (paired) lane's spend (PLAN wl-mvfkv7llkp7nk0 § 4.1, R17)", () => {
+	const ORIGINAL: Ceiling = { usd: 150, wallMin: 720 };
+	const at = (usd: number): Spend => ({ usd, tokens: 0, wallMin: 0 });
+	const assistant = (usd: number) => `${JSON.stringify({ type: "message", message: { role: "assistant", usage: { totalTokens: 1000, cost: { total: usd } } } })}\n`;
+	/** A lane session on a $150 production ceiling whose `launch:` says `cause <cause>`, with the lane's session file under its lane dir. */
+	async function paired(cause: "interactive" | "first") {
+		const home = tmp("home");
+		const { ledger, wl, env } = laneEnv({ HOME: home });
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: ceilingBody(ORIGINAL, "stakes production") });
+		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: `launch: lane-a cause ${cause} requested-by jo` });
+		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody("lane-a", { pid: 1, start: "x", session: null, argv: [], runnerPid: 2 }) });
+		const sessions = join(laneDir(wl, home), "sessions");
+		mkdirSync(sessions, { recursive: true });
+		const file = join(sessions, "s.jsonl");
+		writeFileSync(file, "");
+		const f = fakePi();
+		orchestratorSurface(f.pi, env);
+		const ctx = ctxOf();
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		notices.length = 0;
+		const spendMessages = async () => {
+			const r = (await f.emit("before_agent_start", { prompt: "go", systemPrompt: [] }, ctx)) as { messages: { customType: string; content: string }[] };
+			return r.messages.filter((m) => m.customType === "lane-spend").map((m) => m.content);
+		};
+		return {
+			ledger, wl, spendMessages,
+			spend: (usd: number) => appendFileSync(file, assistant(usd)),
+			end: (willContinue = false) => f.emit("agent_end", { willContinue }, ctx),
+			pane: () => notices.filter((n) => n.startsWith("spend on ")),
+		};
+	}
+
+	test("a by-hand lane gets its spend against the ceiling in force at every turn start; Jo gets one pane line at each further 25 % of the original $150, past 100 % too; a runner's lane gets neither", async () => {
+		const p = await paired("interactive");
+		expect(await p.spendMessages()).toEqual(["spend: $0.00 of $150 ceiling (0 %), 0 min; paired: not stopped at the ceiling"]);
+		expect(p.pane()).toEqual([]);
+		p.spend(37.5);
+		await p.end();
+		expect(p.pane()).toEqual([`spend on ${p.wl}: $37.50, past $37.50 (25 % of the original $150 ceiling), 0 min; paired: not stopped at the ceiling`]);
+		p.spend(37.5);
+		expect(await p.spendMessages()).toEqual(["spend: $75.00 of $150 ceiling (50 %), 0 min; paired: not stopped at the ceiling"]);
+		expect(p.pane()).toHaveLength(2);
+		expect(p.pane()[1]).toContain("past $75.00 (50 % of the original $150 ceiling)");
+		// A lowering applies without Jo: the message reads the ceiling in force, the pane marks stay on the original.
+		p.ledger.recordEntry({ by: SURFACE_BY, workloadId: p.wl, kind: "assumption", body: ceilingBody({ usd: 100, wallMin: 720 }, "lowered") });
+		p.spend(37.5);
+		// a turn end that continues is not a final one: no measure
+		await p.end(true);
+		expect(p.pane()).toHaveLength(2);
+		await p.end();
+		expect(p.pane()).toHaveLength(3);
+		expect(p.pane()[2]).toContain("$112.50, past $112.50 (75 % of the original $150 ceiling)");
+		p.spend(37.5);
+		expect(await p.spendMessages()).toEqual(["spend: $150.00 of $100 ceiling (150 %), 0 min; paired: not stopped at the ceiling"]);
+		expect(p.pane()[3]).toContain("$150.00, past $150.00 (100 % of the original $150 ceiling)");
+		p.spend(37.5);
+		await p.end();
+		expect(p.pane()[4]).toContain("$187.50, past $187.50 (125 % of the original $150 ceiling)");
+		// nothing new spent: the message again, no pane line
+		expect(await p.spendMessages()).toEqual(["spend: $187.50 of $100 ceiling (187 %), 0 min; paired: not stopped at the ceiling"]);
+		await p.end();
+		expect(p.pane().map((l) => /past (\$\S+)/.exec(l)![1])).toEqual(["$37.50", "$75.00", "$112.50", "$150.00", "$187.50"]);
+
+		// A lane its runner started (cause first) gets no spend message and Jo no pane line.
+		const run = await paired("first");
+		expect(await run.spendMessages()).toEqual([]);
+		run.spend(80);
+		await run.end();
+		expect(await run.spendMessages()).toEqual([]);
+		expect(run.pane()).toEqual([]);
+	});
+
+	test("pairedSpendStep: the first measure records where the spend stands; then one line per 25 % mark reached, each once, past 100 % without end", () => {
+		const first = pairedSpendStep({ shown: null }, "wl-x", at(80), ORIGINAL);
+		expect(first).toEqual({ state: { shown: 2 }, lines: [] });
+		expect(pairedSpendStep(first.state, "wl-x", at(112.49), ORIGINAL)).toEqual({ state: { shown: 2 }, lines: [] });
+		const jump = pairedSpendStep(first.state, "wl-x", at(160), ORIGINAL);
+		expect(jump.state).toEqual({ shown: 4 });
+		expect(jump.lines).toEqual([
+			"spend on wl-x: $160.00, past $112.50 (75 % of the original $150 ceiling), 0 min; paired: not stopped at the ceiling",
+			"spend on wl-x: $160.00, past $150.00 (100 % of the original $150 ceiling), 0 min; paired: not stopped at the ceiling",
+		]);
+		expect(pairedSpendStep(jump.state, "wl-x", at(160), ORIGINAL).lines).toEqual([]);
+		expect(pairedSpendStep(jump.state, "wl-x", { usd: 300, tokens: 0, wallMin: 61.4 }, ORIGINAL).lines.map((l) => /past (\$\S+) \((\d+) %.*, (\d+) min/.exec(l)!.slice(1))).toEqual([
+			["$187.50", "125", "61"], ["$225.00", "150", "61"], ["$262.50", "175", "61"], ["$300.00", "200", "61"],
+		]);
+		expect(pairedSpendStep({ shown: null }, "wl-x", at(0), ORIGINAL).state).toEqual({ shown: 0 });
+	});
+
+	test("pairedCeilingPromptLine: the ceiling in force, the spend so far, never stopped, and the pane cadence of the original ceiling", () => {
+		expect(pairedCeilingPromptLine({ usd: 100, wallMin: 720 }, ORIGINAL, { usd: 12.345, tokens: 4567.8, wallMin: 30.6 })).toBe(
+			"ceiling: $100 / 720 min for the workload; spent so far $12.35 / 31 min (4568 tokens); you are paired with Jo; you are never stopped at the ceiling; the extension tells Jo the spend in the pane at every 25 % of the original ceiling ($150, so every $37.50).",
+		);
 	});
 });

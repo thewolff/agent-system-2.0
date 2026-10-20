@@ -10,7 +10,8 @@
 //
 // The consumer half: a delivered line's held orchestrator-bound messages move to `delivered`
 // (P-7c one step), which is what makes a lane death "surfaced once" and what keeps a held
-// `artifact-failed:` message from ever meaning "no live lane" (fable (a)).
+// `artifact-failed:` message from ever meaning "no live lane" (fable (a)). A notice
+// (surface/src/notice.ts) is shown only while held, so this one step is also what makes it shown once.
 import type { Ledger } from "../../ledger/src/index";
 import type { ErrorLine } from "./errors";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "./types";

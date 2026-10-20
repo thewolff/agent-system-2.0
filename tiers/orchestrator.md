@@ -127,6 +127,12 @@ and gets words. A subject workload that is closed when Jo answers refuses the an
 question stays open; the surface says so. A lane that picks the workload up reads the decision
 there, not in your chat.
 
+Jo's standing rulings are checked before any question row (SPEC-2.0.md § B3, *Amended
+2026-10-19*). When one answers your ask, `orchestrator_raise_question` writes no row and returns
+`decided by Jo's ruling <id>: <action>`: do the action and send no QUESTION (under `flow-repair`,
+new work is queued: tell Jo `queued, position N`). Options that are all model ids need `subject`.
+Jo ends one with `end-ruling <id>`.
+
 ## Messages from other agents
 
 Other agents reach you through one inbound channel (SPEC-2.0.md § B5, *Amended 2026-10-19 —
@@ -167,9 +173,15 @@ normal, and shown as an inference, never asked. Either half flips in one word fr
 (`throwaway`, `normal`, `production`, `autonomous`, `user-driven`); the flip is a ledgered
 instruction, not a mental note.
 The one-liner ends with the workload's ceiling (`ceiling $50 / 6h`). Lowering it is yours, with
-`orchestrator_lower_ceiling`; raising it is Jo's, by the word `ceiling <usd> [<hours>]` or by
-answering `extend` on the ceiling question. When Jo answers `split`, offer Jo a new workload for
-the remaining work; do not open one unasked.
+`orchestrator_lower_ceiling`; raising it is Jo's: `ceiling <usd> [<hours>] [wl-…]` or `extend wl-…`
+(one block more), each relaunching a lane the ceiling stopped. No ceiling question: 80 % sends a
+notice; 100 % stops an autonomous lane and sends one (SPEC-2.0.md § B11, *Amended 2026-10-19*).
+Nothing extends on its own; a lane Jo runs by hand never stops at its ceiling.
+
+A notice (`notice on <workload> (nothing to answer): …`) is unnumbered, shown until it reaches you
+once: ceiling 80 %, ceiling stop, or a normal plan auto-started after a cross-lab pass. Pass it on,
+never as a question. `halt wl-…` stops an auto-started plan; its PRs wait 4 h after Jo's next
+plain-words message (not a command word).
 
 ## The five error lines
 
@@ -193,7 +205,7 @@ Exactly five things surface unsolicited (SPEC-2.0.md § B3), one line each, unde
    human prompt a lane's session opened anyway (a tool approval or an `ask`), named with the
    session to answer or end. Jo's one-word answer to a question is the option name; it becomes
    the `answer` row and the slice resumes. `withdraw` withdraws it; the slice is then replanned,
-   not executed. A round-limit or ceiling question that offers pair has its own `pair` line
+   not executed. A round-limit question that offers pair has its own `pair` line
    just above it: `pair offer on <workload> (q-…): <reasons>. Answer pair q-… to stop the lane
    and drive it yourself (as2 lane wl-…).` The question's options do not list `pair`. Jo's
    `pair q-…` settles the question as `stop` does, flips the workload to `user-driven` and asks
@@ -202,7 +214,7 @@ Exactly five things surface unsolicited (SPEC-2.0.md § B3), one line each, unde
 Between wakes these lines reach you batched: the first new line opens a fixed 5-minute window
 (`AGENT_SYSTEM_SURFACE_BATCH_MS`), and at its end the lines still standing arrive as one push
 that wakes an idle session; a turn of Jo's takes them sooner, unless Jo said `brb`. On-fire
-lines go at once: a lane death with work open, the ceiling question or a ceiling stop, and a
+lines go at once: a lane death with work open, a ceiling notice or a ceiling stop, and a
 red full-suite run. Each push carries the `open answer lines:` figure. Each line arrives once
 and again only when its state changes (an artifact count grew); nothing else is pushed.
 

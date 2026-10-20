@@ -115,6 +115,12 @@ export const TRAIN_TASK_FAILED_PREFIX = "train-task-failed:";
  * `priority-signal-failed:` and `rank-shown:`, written by whichever session ranks (the orchestrator, a lane, a hand).
  */
 export const RANK_BY = "as2-rank";
+/**
+ * The escalation policy's machinery stamp (PLAN wl-mvfkv7llkp7nk0 § 3): `lane_raise_question`'s auto-start of a
+ * cross-lab-passed normal-stakes plan writes `plan: approved auto <round group>` and its notice as this, never as the lane.
+ * The one `plan:` form it may write is `approved auto …` (surface/src/launch.ts `validWriter`).
+ */
+export const ESCALATION_BY = "escalation";
 
 /**
  * The orchestrator's standing workload: the one open workload that carries rows belonging to no

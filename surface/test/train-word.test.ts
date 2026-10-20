@@ -10,7 +10,7 @@ import orchestratorSurface from "../index";
 import { recordRepo, repoOf } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { apply, applyTrain, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, TRAIN_IN_BATCH } from "../src/input";
-import { boundPrs, controlEntries, planFirst, trainBoardBody } from "../src/launch";
+import { boundPrs, controlEntries, planAutoApprovedBody, planAutoStartNoticeBody, planFirst, planHaltedBody, trainBoardBody } from "../src/launch";
 import {
 	KNOWN_FLAKES, prStakes, RESOLVE_COMMAND, type StakesView, TRAIN_DONE, TRAIN_PREPARE, TRAIN_PUSH, trainBody, trainBrief, trainFullSliceId, trainHold, trainInstructionBody,
 	trainPrs, trainSkippedOf, trainSliceId, trainSlicePr,
@@ -18,7 +18,8 @@ import {
 import { Numbering } from "../src/numbering";
 import { errorLines } from "../src/errors";
 import { type ClosePr, closeFreshness, makeRunId, runnerDiedRun, testRequestedBody, testRunBody } from "../src/test-run";
-import { LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { sendNotice } from "../src/notice";
+import { ESCALATION_BY, LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, ctxOf, fakePi, notices, tempLedger, tmp, workloadWithSlice } from "./helpers";
 
 const LANE = "lane-train-1";
@@ -166,6 +167,15 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		expect(lines[record]).toContain("`merged by train <merge commit sha> (run <id>)`");
 		// the merged / skip / stop question is production's only
 		expect(lines.filter((l) => l.includes("merged / skip / stop"))).toEqual([lines[production]!]);
+		// PLAN wl-mvg8itbt0rz3ls D3 (R9): the production question goes through Jo's rulings; a train-signoff decision is acted on at once
+		const prod = lines[production]!;
+		expect(prod).toContain("goes through Jo's rulings");
+		expect(prod).toContain("`decided by Jo's ruling train-signoff`");
+		expect(prod.indexOf("decided by Jo's ruling train-signoff")).toBeLessThan(prod.indexOf("Otherwise do not wait for it"));
+		for (const s of ["c. to e. with the head a. read", "no question and no wait"]) expect(prod).toContain(s);
+		const rules = lines.find((l) => l.startsWith("Rules: "))!;
+		expect(rules).toContain("a production PR's merge is Jo's: his merged answer, or his ruling train-signoff deciding the question");
+		expect(rules).not.toContain("a production PR's merge is Jo's;");
 		const returning = lines.find((l) => l.startsWith("Returning a PR to its owner"))!;
 		expect(returning).toContain(`${LANE_TRAIN_RETURN_TOOL} { pr: <n>, kind: red | conflict | stack, detail: <absolute path of the detail file> }`);
 		// a red and a conflict go back to the owner; none asks Jo
@@ -203,7 +213,8 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 				expect(lines[step(1)]).toContain(s);
 			}
 			const b = lines.findIndex((l) => l.startsWith("   b. "));
-			expect(lines[b]).toContain("`hold: …`, or a second exit 2 → record step 1's `train-error:` and pass the PR over, no question and no merge");
+			// main's protection hold is named whole: a plan's `hold: <reason> until <time|jo>` (PLAN wl-mvfkv7llkp7nk0 § 3) is a train-hold:, not a train-error:
+			expect(lines[b]).toContain("`hold: main protection unverified (<gap>)`, or a second exit 2 → record step 1's `train-error:` and pass the PR over, no question and no merge");
 			expect(lines[b]).toContain("`production: <reason>` → Production stakes");
 			// before done-because, list once more; "nothing runnable" is an entry
 			const terminal = lines.find((l) => l.startsWith("Terminal outcomes: "))!;
@@ -226,8 +237,8 @@ function checkout(url: string): string {
 }
 
 /** A temp ledger with three workloads on checkouts: normal on the train repo, production on it, normal on another repo; and one with no repo:. */
-function stakesWorld() {
-	const { ledger, path } = tempLedger();
+function stakesWorld(now?: () => string) {
+	const { ledger, path } = tempLedger(now);
 	const on = checkout("git@github.com:TheWolff/agent-system-2.0.git");
 	const elsewhere = checkout("https://github.com/thewolff/newdle-web.git");
 	const normal = workloadWithSlice(ledger).wl;
@@ -271,6 +282,53 @@ describe("prStakes (rev 17.1 D1): normal only for a same-repo wl/<id> branch who
 		const w = stakesWorld();
 		w.ledger.recordEntry({ by: LANE, workloadId: w.bare, kind: "assumption", body: `repo: ${w.on}` });
 		expect(prStakes(view({ headRefName: `wl/${w.bare}` }), REPO, w.ledger)).toEqual({ stakes: "production", reason: `${w.bare} has no repo: entry` });
+	});
+});
+
+describe("prStakes hold (PLAN wl-mvfkv7llkp7nk0 § 3, R10): an auto-started or halted plan holds its PRs", () => {
+	test("auto-start holds until jo while its notice is held and until Jo types; then HOLD_HOURS after Jo's first typed message; then normal", () => {
+		const c = clock();
+		const w = stakesWorld(c.now);
+		const of = () => prStakes(view({ headRefName: `wl/${w.normal}` }), REPO, w.ledger);
+		w.ledger.recordEntry({ by: ESCALATION_BY, workloadId: w.normal, kind: "assumption", body: planAutoApprovedBody("dg-1") });
+		const notice = sendNotice(w.ledger, { by: ESCALATION_BY, workloadId: w.normal, body: planAutoStartNoticeBody(w.normal, "/plans/PLAN.md") });
+		ensureStandingWorkload(w.ledger);
+		const typed = (at: string, over: Partial<{ workloadId: string; author: string; by: string }> = {}) => {
+			c.at(at);
+			return w.ledger.recordInstruction({ by: over.by ?? SURFACE_BY, workloadId: over.workloadId ?? STANDING_WORKLOAD_ID, body: "what's up", author: over.author ?? "jo", channel: "surface" });
+		};
+		// Jo typing before the notice reached the orchestrator starts nothing.
+		typed("2026-10-01T10:30:00.000Z");
+		expect(of()).toMatchObject({ stakes: "hold", until: "jo" });
+		c.at("2026-10-01T11:00:00.000Z");
+		w.ledger.advanceMessage(notice, "delivered", { by: SURFACE_BY });
+		expect(of()).toMatchObject({ stakes: "hold", until: "jo" });
+		// An instruction mirrored onto the workload, or one not Jo's surface words, is not Jo's typed message.
+		typed("2026-10-01T11:10:00.000Z", { workloadId: w.normal });
+		typed("2026-10-01T11:20:00.000Z", { by: "orchestrator" });
+		expect(of()).toMatchObject({ stakes: "hold", until: "jo" });
+		const first = typed("2026-10-01T12:00:00.000Z");
+		typed("2026-10-01T13:00:00.000Z");
+		expect(of()).toEqual({ stakes: "hold", until: "2026-10-01T16:00:00.000Z", reason: expect.stringContaining(first) });
+		c.at("2026-10-01T15:59:59.000Z");
+		expect(of().stakes).toBe("hold");
+		c.at("2026-10-01T16:00:00.000Z");
+		expect(of()).toEqual({ stakes: "normal", reason: `${w.normal} on ${REPO}, stakes normal` });
+	});
+
+	test("Jo's halt holds until jo with no end; a later approve, or no plan: line at all, holds nothing; a forged auto approval holds nothing", () => {
+		const w = stakesWorld();
+		const of = () => prStakes(view({ headRefName: `wl/${w.normal}` }), REPO, w.ledger);
+		expect(of().stakes).toBe("normal");
+		w.ledger.recordEntry({ by: LANE, workloadId: w.normal, kind: "assumption", body: planAutoApprovedBody("dg-1") });
+		expect(of().stakes).toBe("normal");
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.normal, kind: "assumption", body: planHaltedBody("in-1") });
+		expect(of()).toMatchObject({ stakes: "hold", until: "jo" });
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.normal, kind: "assumption", body: "plan: approved in-2" });
+		expect(of().stakes).toBe("normal");
+		// Production stays production: a hold never lowers it.
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.prod, kind: "assumption", body: planHaltedBody("in-3") });
+		expect(prStakes(view({ headRefName: `wl/${w.prod}` }), REPO, w.ledger).stakes).toBe("production");
 	});
 });
 
@@ -376,6 +434,20 @@ exit 1
 		const gone = run(w.path, [], ["stakes", "--repo", REPO, "--pr", "999"]);
 		expect(gone.code).toBe(2);
 		expect(gone.err).toContain("no pull requests found");
+	});
+
+	test("a halted workload's PR prints `hold: <reason> until jo`, exit 0, before main's protection is read (PLAN wl-mvfkv7llkp7nk0 § 3)", () => {
+		const w = stakesWorld();
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.normal, kind: "assumption", body: planHaltedBody("in-1") });
+		const r = run(w.path, [view({ number: 101, headRefName: `wl/${w.normal}` })], ["stakes", "--repo", REPO, "--pr", "101"], PROTECTED);
+		expect(r.code).toBe(0);
+		expect(r.out).toMatch(new RegExp(`^hold: ${w.normal} is halted by Jo .* until jo\\n$`));
+		expect(r.calls()).toHaveLength(1);
+		// with --hold-ok and main's protection unverified, the plan's hold is still the line: it is printed before protection is read
+		const held = run(w.path, [view({ number: 101, headRefName: `wl/${w.normal}` })], ["stakes", "--hold-ok", "--repo", REPO, "--pr", "101"]);
+		expect(held.code).toBe(0);
+		expect(held.out).toMatch(new RegExp(`^hold: ${w.normal} is halted by Jo .* until jo\\n$`));
+		expect(held.calls()).toHaveLength(1);
 	});
 
 	test("R9: --hold-ok turns a normal PR's unverified protection into `hold:`, keeps production and verified normal, and leaves the plain output unchanged", () => {
