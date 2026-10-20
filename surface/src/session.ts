@@ -3,12 +3,16 @@
 // globalThis). Only a top-level session whose role env is `orchestrator` is a surface; a lane or a
 // hand loading this extension gets an inert session.
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
+import type { Invariant, Report } from "../scripts/invariants";
 import { Delivered } from "./delivery";
+import { liveReport } from "./invariant-watch";
+import { laneCap } from "./launch";
 import { Numbering } from "./numbering";
-import { BATCH_MS, BATCH_MS_ENV, type Ctx, POLL_MS, POLL_MS_ENV, QUIET_MS, QUIET_MS_ENV, ROLE_ENV, SURFACE_TOOLS, VOICE_ENV, WAKE_PUSH_MS, WAKE_PUSH_MS_ENV, WAKE_READ_TOOL } from "./types";
+import { BATCH_MS, BATCH_MS_ENV, type Ctx, INVARIANT_MS, INVARIANT_MS_ENV, POLL_MS, POLL_MS_ENV, QUIET_MS, QUIET_MS_ENV, ROLE_ENV, SURFACE_TOOLS, VOICE_ENV, WAKE_PUSH_MS, WAKE_PUSH_MS_ENV, WAKE_READ_TOOL } from "./types";
 
 export const REPO_ROOT = join(import.meta.dir, "..", "..");
 export const VOICE_RELATIVE = join("voice", "VOICE.md");
@@ -129,6 +133,19 @@ export class SurfaceSession {
 	quietTurn = false;
 	/** Jo typed `pending` while the session was busy: shown, rendered fresh, at the next idle poll (D1). */
 	pendingDisplay = false;
+	/** The invariant timer is registered (one per session, beside the poll; MIGRATION.md item 104). */
+	invariantTimer = false;
+	/** Each invariant the last invariant run skipped, with its reason: a skip on two runs in a row is surfaced (surface/src/invariant-watch.ts). */
+	readonly invariantSkips = new Map<Invariant, string>();
+	/** Invariant lines queued and not yet delivered, line → the keys it carries: recorded as surfaced only on delivery (surface/src/invariant-watch.ts). */
+	readonly invariantPending = new Map<string, string[]>();
+	/** The last failure of the invariant run told as a tick line: the same failure is told once until it changes or a run succeeds. */
+	invariantFailure: string | null = null;
+	/**
+	 * The invariant report, run at each invariant tick; tests replace it. Default: `liveReport` over this session's ledger and the as2
+	 * checkout, its flow signals judged against this process's lane cap (`laneCap(env)`, the launcher's: PLAN wl-mv654hoqwpfhmo § 3a).
+	 */
+	invariantReport: () => Report = () => liveReport(this.ledger().path, REPO_ROOT, this.now(), this.env.HOME || homedir(), laneCap(this.env));
 	/** The clock the surface reads the ledger at; tests move it. */
 	now: () => string = () => new Date().toISOString();
 	#ledger: Ledger | null = null;
@@ -172,6 +189,12 @@ export class SurfaceSession {
 	get quietMs(): number {
 		const n = Number(this.env[QUIET_MS_ENV]);
 		return Number.isFinite(n) && n > 0 ? n : QUIET_MS;
+	}
+
+	/** How often the invariant report runs. */
+	get invariantMs(): number {
+		const n = Number(this.env[INVARIANT_MS_ENV]);
+		return Number.isFinite(n) && n > 0 ? n : INVARIANT_MS;
 	}
 
 	/** A fresh push id (`wake:<id>`, `notices:<id>`). */

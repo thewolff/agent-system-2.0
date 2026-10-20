@@ -542,4 +542,34 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		}
 		expect(tree(home)).toEqual([]);
 	});
+
+	test("--flow-signals=off boots out the flow-signals fallback by its template's label and deletes its plist, before any install step", () => {
+		const flowLabel = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(readFileSync(join(REPO, "install", "com.agent-system-2.flow-signals.plist"), "utf8"))?.[1] ?? "";
+		expect(flowLabel).toBe("com.agent-system-2.flow-signals");
+		const flowService = `gui/${process.getuid?.() ?? 0}/${flowLabel}`;
+		const home = join(root, "home-flow-signals-off");
+		const plist = join(home, "Library", "LaunchAgents", `${flowLabel}.plist`);
+		mkdirSync(dirname(plist), { recursive: true });
+		writeFileSync(plist, "<plist/>\n");
+		const launchctl = fakeLaunchctl("flow-signals-off", true);
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--flow-signals=off"], {
+			env: { PATH: `${launchctl.bin}:${systemPath}`, HOME: home }, stdout: "pipe", stderr: "pipe",
+		});
+		const out = r.stdout.toString() + r.stderr.toString();
+		expect(out).toContain(`flow signals booted out: ${flowService}`);
+		expect(out).toContain(`flow signals removed: ${plist}`);
+		expect(out).not.toContain("reading manifest");
+		expect(r.exitCode).toBe(0);
+		expect(existsSync(plist)).toBe(false);
+	});
+
+	test("--flow-signals=off with an installing flag, or --flow-signals twice, is refused with exit 2 and writes nothing", () => {
+		const home = join(root, "home-flow-signals-refused");
+		mkdirSync(home, { recursive: true });
+		for (const args of [["--flow-signals=off", "--train-tick"], ["--flow-signals", "--flow-signals=off"], ["--flow-signals", "--flow-signals"]]) {
+			const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), ...args], { env: { PATH: systemPath, HOME: home }, stdout: "pipe", stderr: "pipe" });
+			expect(r.exitCode).toBe(2);
+		}
+		expect(tree(home)).toEqual([]);
+	});
 });

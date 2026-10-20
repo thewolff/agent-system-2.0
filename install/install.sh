@@ -46,7 +46,12 @@
 # of the gh, bun, omp, git and osascript directories, written to
 # $HOME/Library/LaunchAgents/com.agent-system-2.train-tick.plist and loaded; it runs
 # surface/scripts/train-tick.ts every 300 s, logging to
-# $HOME/agent-scratch/agent-system-2.0/train-tick/launchd.log. Each flag's =off form only boots
+# $HOME/agent-scratch/agent-system-2.0/train-tick/launchd.log. --flow-signals writes the fallback writer
+# of the noon flow-signals line (PLAN wl-mv654hoqwpfhmo § 3a) the same way:
+# install/com.agent-system-2.flow-signals.plist filled with this checkout, the absolute bun path, $HOME and
+# the ledger path, written to $HOME/Library/LaunchAgents/com.agent-system-2.flow-signals.plist and loaded;
+# it runs surface/scripts/flow-signals.ts every 1800 s, logging to
+# $HOME/agent-scratch/agent-system-2.0/flow-signals/launchd.log. Each flag's =off form only boots
 # that job out and deletes its plist, then exits: it runs right after the arguments are read, before
 # the bun check and every install step, so it needs no bun, writes no ledger and registers nothing
 # (stopping a job never depends on a reinstall succeeding). It fails closed: when launchctl is missing
@@ -55,7 +60,7 @@
 # about its job is written, read or run.
 #
 # Usage:   bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off]
-#                                  [--train-tick | --train-tick=off]
+#                                  [--train-tick | --train-tick=off] [--flow-signals | --flow-signals=off]
 # Env:     AGENT_SYSTEM_LEDGER_DB   ledger file (default: $HOME/.agent-system-2/ledger.db)
 #          AGENT_SYSTEM_PROFILE     OMP profile name (default: agent-system-2); the profile lives at
 #                                   $HOME/.omp/profiles/<profile>/agent (omp://config-usage.md § Profiles)
@@ -66,7 +71,8 @@
 #          2 manifest or profile check failed, an argument other than the flags (or a flag twice, or
 #            an =off form with an installing flag), --chaos-nightly refused: not macOS, or omp or git
 #            not on PATH, or --scratch-sweep refused: not macOS, or --train-tick refused: not macOS, gh,
-#            bun, omp, git or osascript not on PATH, or `gh auth status` failed (nothing written)
+#            bun, omp, git or osascript not on PATH, or `gh auth status` failed, or --flow-signals
+#            refused: not macOS (nothing written)
 #          3 ledger path refused as synced or network folder (nothing written)
 #          4 the ledger file exists at a schema version other than the supported one (5), e.g. a
 #            version-1 to -4 ledger from before schema v5 (nothing written; no upgrade exists:
@@ -96,11 +102,12 @@ LOCAL_BIN="$HOME/.local/bin"
 step() { printf '==> %s\n' "$*"; }
 fail() { printf 'install: FAIL: %s\n' "$1" >&2; exit "${2:-1}"; }
 
-# The three launchd jobs: each off unless its flag names it (empty = do nothing about it at all).
+# The four launchd jobs: each off unless its flag names it (empty = do nothing about it at all).
 CHAOS=""
 SWEEP=""
 TICK=""
-USAGE="usage: bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off] [--train-tick | --train-tick=off]"
+FLOW=""
+USAGE="usage: bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off] [--train-tick | --train-tick=off] [--flow-signals | --flow-signals=off]"
 for arg in "$@"; do
 	case "$arg" in
 		--chaos-nightly | --chaos-nightly=off)
@@ -112,12 +119,15 @@ for arg in "$@"; do
 		--train-tick | --train-tick=off)
 			[ -z "$TICK" ] || fail "$USAGE; the train-tick flag is given twice: $*" 2
 			if [ "$arg" = --train-tick ]; then TICK=on; else TICK=off; fi ;;
+		--flow-signals | --flow-signals=off)
+			[ -z "$FLOW" ] || fail "$USAGE; the flow-signals flag is given twice: $*" 2
+			if [ "$arg" = --flow-signals ]; then FLOW=on; else FLOW=off; fi ;;
 		*) fail "$USAGE; got: $*" 2 ;;
 	esac
 done
 # An =off form stops its job and exits before any install step, so it cannot share a run with a flag
 # that installs one.
-if { [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ]; } && { [ "$CHAOS" = on ] || [ "$SWEEP" = on ] || [ "$TICK" = on ]; }; then
+if { [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ] || [ "$FLOW" = off ]; } && { [ "$CHAOS" = on ] || [ "$SWEEP" = on ] || [ "$TICK" = on ] || [ "$FLOW" = on ]; }; then
 	fail "$USAGE; an =off form stops a job and exits, so it cannot be combined with a flag that installs one; got: $*" 2
 fi
 
@@ -133,6 +143,10 @@ TICK_LABEL="com.agent-system-2.train-tick"
 TICK_TEMPLATE="$REPO/install/$TICK_LABEL.plist"
 TICK_PLIST="$LAUNCH_AGENTS/$TICK_LABEL.plist"
 TICK_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/train-tick"
+FLOW_LABEL="com.agent-system-2.flow-signals"
+FLOW_TEMPLATE="$REPO/install/$FLOW_LABEL.plist"
+FLOW_PLIST="$LAUNCH_AGENTS/$FLOW_LABEL.plist"
+FLOW_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/flow-signals"
 
 # An =off form: stop the job and delete its plist (job_off NAME LABEL PLIST), then exit, before anything
 # else runs. It reads no manifest, needs no bun, and writes nothing but the plist removal. It fails
@@ -164,10 +178,11 @@ job_off() {
 	fi
 	step "$name off: no job loaded, no plist"
 }
-if [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ]; then
+if [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ] || [ "$FLOW" = off ]; then
 	if [ "$CHAOS" = off ]; then job_off "chaos nightly" "$CHAOS_LABEL" "$CHAOS_PLIST"; fi
 	if [ "$SWEEP" = off ]; then job_off "scratch sweep" "$SWEEP_LABEL" "$SWEEP_PLIST"; fi
 	if [ "$TICK" = off ]; then job_off "train tick" "$TICK_LABEL" "$TICK_PLIST"; fi
+	if [ "$FLOW" = off ]; then job_off "flow signals" "$FLOW_LABEL" "$FLOW_PLIST"; fi
 	step "nothing else was run or written"
 	exit 0
 fi
@@ -212,7 +227,7 @@ load_job() {
 # --chaos-nightly is checked here, before anything is written: launchd is macOS only, and the job's
 # PATH is built from where bun, omp and git are now (launchd's own PATH has none of ~/.bun/bin), so
 # a missing omp or git refuses the flag rather than writing a job that cannot start a session.
-# (The CHAOS_*, SWEEP_* and TICK_* label, template, plist and log names are set above, beside the =off path.)
+# (The CHAOS_*, SWEEP_*, TICK_* and FLOW_* label, template, plist and log names are set above, beside the =off path.)
 if [ "$CHAOS" = on ]; then
 	[ "$(uname -s)" = Darwin ] || fail "--chaos-nightly is a launchd job; this is not macOS" 2
 	[ -f "$CHAOS_TEMPLATE" ] || fail "--chaos-nightly: no template at $CHAOS_TEMPLATE" 2
@@ -238,6 +253,15 @@ if [ "$SWEEP" = on ]; then
 	[ -f "$SWEEP_TEMPLATE" ] || fail "--scratch-sweep: no template at $SWEEP_TEMPLATE" 2
 	SWEEP_BUN="$(type -P bun)" || fail "--scratch-sweep: bun not found on PATH" 2
 	case "$SWEEP_BUN" in /*) ;; *) SWEEP_BUN="$PWD/$SWEEP_BUN" ;; esac
+fi
+
+# --flow-signals is checked here too, before anything is written: launchd is macOS only. The job runs bun (absolute) and
+# nothing else, so it needs no omp or git.
+if [ "$FLOW" = on ]; then
+	[ "$(uname -s)" = Darwin ] || fail "--flow-signals is a launchd job; this is not macOS" 2
+	[ -f "$FLOW_TEMPLATE" ] || fail "--flow-signals: no template at $FLOW_TEMPLATE" 2
+	FLOW_BUN="$(type -P bun)" || fail "--flow-signals: bun not found on PATH" 2
+	case "$FLOW_BUN" in /*) ;; *) FLOW_BUN="$PWD/$FLOW_BUN" ;; esac
 fi
 
 # --train-tick is checked here too, before anything is written (PLAN wl-mv8s8srodefytc rev 17.1 D10 F15): the tick runs gh,
@@ -615,6 +639,15 @@ if [ "$TICK" = on ]; then
 	load_job "train tick" "$TICK_LABEL" "$TICK_TEMPLATE" "$TICK_PLIST" "$TICK_LOG_DIR" \
 		"BUN=$TICK_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS" "PROFILE=$PROFILE_NAME" "PATH=$TICK_PATH"
 	step "train tick loaded: runs every 5 minutes; log $TICK_LOG_DIR/launchd.log; turn off with: bash install/install.sh --train-tick=off"
+fi
+
+# ---- 6d3. the fallback flow-signals writer (--flow-signals only) ---------------------------------
+# Only with the flag, the same way as 6c. The job carries the ledger this install wrote, so it reads and writes that
+# ledger's standing workload. Reversal: bash install/install.sh --flow-signals=off.
+if [ "$FLOW" = on ]; then
+	load_job "flow signals" "$FLOW_LABEL" "$FLOW_TEMPLATE" "$FLOW_PLIST" "$FLOW_LOG_DIR" \
+		"BUN=$FLOW_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS"
+	step "flow signals fallback loaded: runs every 30 minutes, writes the noon line past 12:30 America/Los_Angeles when the orchestrator has not; log $FLOW_LOG_DIR/launchd.log; turn off with: bash install/install.sh --flow-signals=off"
 fi
 
 # ---- 6e. Phoenix, on by default (wl-mv65t5d34lts00 PLAN.md § 8.1) ------------------------------------

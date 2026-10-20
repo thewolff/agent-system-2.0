@@ -42,6 +42,13 @@
 // takes one. Every needs-you push and every Jo turn ends with the `open answer lines:` count. A wake
 // render clears the hold; an `orchestrator_ledger` read takes the lines it showed out of it.
 //
+// A second timer on the same context (MIGRATION.md item 104) runs the invariant report
+// (surface/scripts/invariants.ts `check`) in-process every INVARIANT_MS (default 10 min) and puts a
+// needs-you line on the tick's queue for each finding whose key was never surfaced; the key is
+// recorded on the ledger when the line is delivered (a confirmed push, or Jo's turn rendering the
+// queue), so a restart neither re-announces a delivered key nor loses an undelivered one
+// (surface/src/invariant-watch.ts).
+//
 // Every pushed message, and Jo's turn message when it re-renders a pushed one, carries
 // `details.surfaceKey` (`wake:<id>`, `notices:<id>`, shared by a push's resends and its re-render)
 // and `details.renderSeq`. The `context` hook keeps the newest message per key after the last
@@ -61,6 +68,8 @@ import { BACK_HEADING, countLine, lineKey, NEEDS_YOU_HEADING, onFire, pendingTex
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
+import { confirmInvariantLines, newInvariantLines, writeNoonFlow } from "../src/invariant-watch";
+import { laneCapSource } from "../src/launch";
 import { linkTerminal } from "../src/linked-api";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { renderWake } from "../src/render";
@@ -467,6 +476,50 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	};
 
 	/**
+	 * The invariant tick (MIGRATION.md item 104; surface/src/invariant-watch.ts): run the report
+	 * in-process, queue a needs-you line per finding (and persistent skip) never surfaced before, and
+	 * push the queue. Each line is queued through `tick()`, the one decoration point (plan paths beneath
+	 * it); `invariantPending` keeps the undecorated line, which delivery matches by first line. A run
+	 * that fails is told once per distinct failure, and breaks any skip streak: the run before the next
+	 * one is the failed one, which skipped nothing. At or after noon Pacific the same report writes the
+	 * day's `flow-signals:` line once (PLAN wl-mv654hoqwpfhmo § 3a), which errorLines then shows Jo.
+	 */
+	const invariantTick = (s: SurfaceSession, ctx: Ctx): void => {
+		if (!s.active) return;
+		let failure: string | null = null;
+		try {
+			const report = s.invariantReport();
+			const lines = newInvariantLines(s.ledger(), report, s.invariantSkips, s.invariantPending);
+			for (const line of lines) tick(s, ctx, line);
+			try {
+				writeNoonFlow(s.ledger(), report, laneCapSource(s.env));
+			} catch (err) {
+				failure = `tick: the noon flow-signals write failed: ${String(err)}`;
+			}
+		} catch (err) {
+			s.invariantSkips.clear();
+			failure = `tick: the invariant report failed: ${String(err)}`;
+		}
+		if (failure !== null && s.invariantFailure !== failure) tick(s, ctx, failure);
+		s.invariantFailure = failure;
+		pushNotices(s, ctx, false);
+	};
+
+	/**
+	 * Delivered tick lines: the invariant lines among them are recorded as surfaced now, not at queue
+	 * (a crash in between tells them again after the restart). A failed write is a stderr line; the
+	 * keys stay pending, so this process does not queue them again and the next process tells them.
+	 */
+	const confirmInvariants = (s: SurfaceSession, delivered: readonly string[]): void => {
+		if (s.invariantPending.size === 0) return;
+		try {
+			confirmInvariantLines(s.ledger(), s.invariantPending, delivered);
+		} catch (err) {
+			process.stderr.write(`surface: recording delivered invariant lines failed: ${String(err)}\n`);
+		}
+	};
+
+	/**
 	 * A wake trigger: a new wake with its own key and tries, superseding any earlier one, and its push
 	 * one WAKE_PUSH_MS later. The key of a superseded wake that was in flight or fell back is retired,
 	 * so the `context` guard drops the copies of it OMP's ACP branch deferred to Jo's next prompt.
@@ -507,6 +560,17 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				});
 				auditTick(s, ctx);
 			}, s.pollMs);
+		}
+		if (!s.invariantTimer) {
+			s.invariantTimer = true;
+			ctx.setInterval(() => {
+				// The push can throw through sendMessage like the catch-up's: a stderr line, the lines stay queued for the poll.
+				try {
+					invariantTick(s, ctx);
+				} catch (err) {
+					process.stderr.write(`surface: the invariant tick's push failed: ${String(err)}\n`);
+				}
+			}, s.invariantMs);
 		}
 		triggerWake(s, ctx, resumed ? "restart" : "session-start");
 		return undefined;
@@ -571,6 +635,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		s.pendingNoticesId = null;
 		s.noticesExhausted = false;
 		const applied = [...s.notices, ...s.tickNotices];
+		confirmInvariants(s, s.tickNotices);
 		s.notices.length = 0;
 		s.tickNotices.length = 0;
 		if (applied.length > 0) parts.push("", appliedBlock(applied));
@@ -600,11 +665,13 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		if (wake && key === `wake:${wake.wakeId}`) {
 			s.wakeInFlight = null;
 			s.tickNotices.splice(0, s.tickNotices.length, ...without(s.tickNotices, wake.carried));
+			confirmInvariants(s, wake.carried);
 		}
 		const batch = s.noticesInFlight;
 		if (batch && key === `notices:${batch.batchId}`) {
 			s.noticesInFlight = null;
 			s.tickNotices.splice(0, s.tickNotices.length, ...without(s.tickNotices, batch.lines));
+			confirmInvariants(s, batch.lines);
 		}
 		return undefined;
 	});

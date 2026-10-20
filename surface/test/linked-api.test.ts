@@ -9,6 +9,7 @@ import orchestratorSurface from "../index";
 import { surfaceSession } from "../src/session";
 import type { FakeTool } from "./helpers";
 import { ctxOf, fakePi, loadTestText, notices, tempLedger, timeouts, timers, tmp } from "./helpers";
+import { INVARIANT_MS } from "../src/types";
 
 // Runtime-selected installed host, the same discovery convention as plan-paths.test.ts.
 let host: string | null = null;
@@ -84,7 +85,9 @@ describe("shared synchronous surface adapter", () => {
 
 			// A fresh between-wake question, not just the initial wake/on-demand render.
 			ledger.raiseQuestion({ by: "lane-old", workloadId: wl, sliceId: sl, body: `later question ${body}`, options: ["yes", "no"] });
-			for (const timer of timers) timer.fn();
+			// The invariant timer (MIGRATION.md item 104) pushes its own surface-notices; this test fires the poll only.
+			const poll = () => { for (const timer of timers) if (timer.ms !== INVARIANT_MS) timer.fn(); };
+			poll();
 			const needsYou = f.sent.find((s) => s.message.customType === "surface-needs-you")!;
 			plainHandles(needsYou.message.content);
 			expect(needsYou.message.content).toContain("later question local://PLAN.md");
@@ -93,7 +96,7 @@ describe("shared synchronous surface adapter", () => {
 			plainHandles(f.sent.find((s) => s.message.customType === "surface-pending")!.message.content);
 			const session = surfaceSession(ctx, env);
 			session.tickNotices.push(`tick ${body}`);
-			for (const timer of timers) timer.fn();
+			poll();
 			plainHandles(f.sent.find((s) => s.message.customType === "surface-notices")!.message.content);
 			session.notices.push(`applied ${body}`);
 			const turn = await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx) as { messages: { content: string }[] };
