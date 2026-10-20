@@ -99,7 +99,14 @@ const cases: [string, string, () => string, string][] = [
 	["workload opened already closed", "workloads", () => `INSERT INTO workloads (id, brief, stakes, mode, status, closed_at, created_by, created_at, changed_by, changed_at) VALUES ('wl-born-closed', 'b', 'normal', 'autonomous', 'closed', ${NOW}, 'tool:sqlite3', ${NOW}, 'tool:sqlite3', ${NOW});`, "a workload is opened in status open"],
 	["workload mode flipped without a mode-flip instruction", "workloads", () => `UPDATE workloads SET mode = 'user-driven', ${STAMP} WHERE id = '${ids.w}';`, "a mode flip needs a mode-flip instruction"],
 	["workload brief rewritten", "workloads", () => `UPDATE workloads SET brief = 'forged', ${STAMP} WHERE id = '${ids.w}';`, "never change"],
-	["workload stakes outside the three levels", "workloads", () => `UPDATE workloads SET stakes = 'yolo', ${STAMP} WHERE id = '${ids.w}';`, "CHECK constraint failed"],
+	// The stakes instruction is recorded first so the CHECK, not the instruction trigger, is what refuses; the
+	// transaction is never committed, so the instruction goes when the connection does.
+	["workload stakes outside the three levels", "workloads", () => `BEGIN; INSERT INTO instructions (id, workload_id, kind, channel, author, body, created_by, created_at) VALUES ('in-yolo', '${ids.w}', 'instruction', 'surface', 'jo', 'stakes: yolo', 'tool:sqlite3', ${NOW}); UPDATE workloads SET stakes = 'yolo', ${STAMP} WHERE id = '${ids.w}';`, "CHECK constraint failed"],
+	["workload stakes changed without a stakes instruction (v6)", "workloads", () => `UPDATE workloads SET stakes = 'production', ${STAMP} WHERE id = '${ids.w}';`, "a stakes change needs a \"stakes: <stakes>\" instruction"],
+	["closed workload restamped (v6)", "workloads", () => `UPDATE workloads SET ${STAMP} WHERE id = '${ids.wClosed}';`, "a closed workload is final"],
+	["done slice artifact rewritten (v6)", "slices", () => `UPDATE slices SET artifact = 'forged.log', ${STAMP} WHERE id = '${ids.sDone}';`, "a done or cancelled slice is final"],
+	["cancelled slice restamped (v6)", "slices", () => `UPDATE slices SET ${STAMP} WHERE id = '${ids.sCancelled}';`, "a done or cancelled slice is final"],
+	["acted-on message restamped (v6)", "messages", () => `UPDATE messages SET ${STAMP} WHERE id = '${ids.mActed}';`, "an acted-on message is final"],
 	// questions
 	["question open->answered with no answer instruction", "questions", () => `UPDATE questions SET state = 'answered', resolved_by = 'in-fake', ${STAMP} WHERE id = '${ids.qOpen}';`, "a question is resolved only by an answer or withdrawal instruction naming it"],
 	["question open->withdrawn by an answer instruction for another question", "questions", () => `UPDATE questions SET state = 'withdrawn', resolved_by = '${ids.iAnswer}', ${STAMP} WHERE id = '${ids.qOpen}';`, "a question is resolved only by an answer or withdrawal instruction naming it"],

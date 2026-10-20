@@ -462,13 +462,13 @@ describe("stale-backup: the newest write runs ahead of the newest copy by more t
 		const older = "ledger-2026-10-11T17-00-00.000Z.db";
 		const dir = copiesIn("backups-fallback-in", older);
 		wrongVersion(join(dir, rejected));
-		expect(copyProblem(join(dir, rejected))).toBe("user_version 0, not 5");
+		expect(copyProblem(join(dir, rejected))).toBe("user_version 0, not one this module opens (6 or one it upgrades)");
 		expect(backupFinding(run({ replay: false, backups: { dir, gapMs: BACKUP_GAP_MS } }))).toBeUndefined();
 		// With a one-minute gap the 20:50 write is 3.8 h past the 17:00 copy, not 5 min before the rejected 20:55 one.
 		const f = backupFinding(run({ replay: false, backups: { dir, gapMs: 60_000 } }))!;
 		expect(f.key).toBe(`stale-backup:${older}`);
 		expect(f.since).toBe("2026-10-11T17:00:00.000Z");
-		expect(f.text).toContain(`3.8h newer than newest ledger backup 2026-10-11T17:00:00.000Z (${older}); not counted, not a complete copy: ${rejected} (user_version 0, not 5) in ${dir}`);
+		expect(f.text).toContain(`3.8h newer than newest ledger backup 2026-10-11T17:00:00.000Z (${older}); not counted, not a complete copy: ${rejected} (user_version 0, not one this module opens (6 or one it upgrades)) in ${dir}`);
 	});
 
 	test("a newest copy that is not a database falls back to an older complete copy outside the gap: the finding fires on the older copy and names the rejected file", () => {
@@ -502,6 +502,83 @@ describe("stale-backup: the newest write runs ahead of the newest copy by more t
 		expect(keysOf([])).toEqual([]);
 		expect(() => parseArgs(["--backup-gap", "0"], "/r")).toThrow("positive number of hours");
 		expect(parseArgs(["--backup-gap", "6"], "/r").backupGapMs).toBe(6 * 60 * 60_000);
+	});
+});
+
+describe("ledger-health: the live file's pages, foreign keys and trigger set (ledger audit A5-1, A5-2)", () => {
+	const healthOf = (r: Report) => r.findings.filter((x) => x.invariant === "ledger-health");
+	/** A copy of the fixture ledger with `edit` applied over a writable connection, then opened read-only as the check opens it. */
+	const edited = (tag: string, edit: (w: Database) => void): Database => {
+		const path = join(tmp(tag), "ledger.db");
+		copyFileSync(fixture.path, path);
+		const w = new Database(path);
+		edit(w);
+		w.close();
+		return new Database(path, { readonly: true });
+	};
+
+	test("a fresh ledger and the checked-in version-5 fixture are healthy: no finding", () => {
+		expect(healthOf(run())).toEqual([]);
+		const v5 = new Database(CHECKED_IN, { readonly: true });
+		try {
+			expect(v5.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(5);
+			expect(healthOf(run({ db: v5 }))).toEqual([]);
+		} finally {
+			v5.close();
+		}
+	});
+
+	test("a dropped, a rewritten and an extra trigger are one finding naming each, and the finding is read-only", () => {
+		const ro = edited("drift", (w) => {
+			w.run("DROP TRIGGER slices_final");
+			w.run("DROP TRIGGER messages_acted_on_final");
+			w.run("CREATE TRIGGER messages_acted_on_final BEFORE UPDATE ON messages WHEN 0 BEGIN SELECT 1; END");
+			w.run("CREATE TRIGGER stray_trigger BEFORE DELETE ON entries BEGIN SELECT 1; END");
+		});
+		try {
+			const before = ro.query("SELECT name, sql FROM sqlite_master ORDER BY name").all();
+			const found = healthOf(run({ db: ro, replay: false }));
+			expect(found).toHaveLength(1);
+			expect(found[0]!.key).toMatch(/^ledger-health:triggers:[0-9a-f]{12}$/);
+			expect(found[0]!.workload).toBe("ledger");
+			expect(found[0]!.text).toContain("missing slices_final; changed messages_acted_on_final (sha256 ");
+			expect(found[0]!.text).toContain("not in schema.sql stray_trigger");
+			expect(ro.query("SELECT name, sql FROM sqlite_master ORDER BY name").all()).toEqual(before);
+		} finally {
+			ro.close();
+		}
+	});
+
+	test("a row naming a parent that does not exist (the sqlite3 CLI writes with foreign keys off) is a foreign-keys finding, and only that", () => {
+		const ro = edited("fk", (w) => {
+			// The entries triggers refuse the orphan before the foreign key is ever consulted, so they are taken off
+			// for the one insert and put back with their exact text: the trigger set stays the one schema.sql gives.
+			const triggers = w.query<{ name: string; sql: string }, []>("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'entries'").all();
+			for (const t of triggers) w.run(`DROP TRIGGER ${t.name}`);
+			w.run(`INSERT INTO entries (id, workload_id, slice_id, kind, body, created_by, created_at) VALUES ('en-orphan', '${fixture.waiting.wl}', 'sl-ghost', 'assumption', 'b', 'tool:sqlite3', '2026-10-11T19:00:00.000Z')`);
+			for (const t of triggers) w.run(t.sql);
+		});
+		try {
+			const found = healthOf(run({ db: ro, replay: false }));
+			expect(found.map((f) => f.key.split(":").slice(0, 2).join(":"))).toEqual(["ledger-health:foreign-keys"]);
+			expect(found[0]!.text).toContain("1 row(s) name a parent row that does not exist: entries rowid ");
+			expect(found[0]!.text).toContain("-> slices");
+		} finally {
+			ro.close();
+		}
+	});
+
+	test("a version Ledger.open neither supports nor upgrades is a triggers finding naming the version; replay says the file is checked as it is now", () => {
+		const ro = edited("version", (w) => w.run("PRAGMA user_version = 4"));
+		try {
+			const found = healthOf(run({ db: ro }));
+			expect(found).toHaveLength(1);
+			expect(found[0]!.key).toMatch(/^ledger-health:triggers:/);
+			expect(found[0]!.text).toContain("schema version 4, which Ledger.open neither supports (6) nor upgrades");
+			expect(found[0]!.text).toContain("(replay: the file is checked as it is now, not as of as-of)");
+		} finally {
+			ro.close();
+		}
 	});
 });
 

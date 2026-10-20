@@ -21,21 +21,132 @@ export {
 	mountLocality,
 } from "./locality";
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 export const SCHEMA_PATH = join(import.meta.dir, "..", "schema.sql");
 
 /**
- * The file's `user_version` is not the one this module supports. Nothing is upgraded: a file at
- * an older version (versions 1 to 4 predate the supported schema) or an unknown one is refused before
- * the module writes anything to it, so it is left exactly as found.
+ * The upgrades `migrateLedger` applies (ledger/scripts/migrate.ts), keyed by the version each takes
+ * a file from (ledger/SCHEMA.md, Versioning). `Ledger.open` never applies them: opening a ledger
+ * never upgrades it (Jo's standing rule; a branch's test once upgraded the live file by opening it).
+ * An upgrade only adds triggers, and takes each one's statement from schema.sql itself, so an
+ * upgraded file and a new one carry the same trigger text, which the open-time trigger check compares.
+ */
+export const MIGRATIONS: Readonly<Record<number, { to: number; addsTriggers: readonly string[] }>> = {
+	5: {
+		to: 6,
+		addsTriggers: [
+			"workloads_stakes_needs_instruction", "workloads_standing_never_closes",
+			"workloads_closed_final", "slices_final", "messages_acted_on_final",
+		],
+	},
+};
+
+/** Whether the module recognises a file at `version`: the supported one, or one `migrateLedger` upgrades from. */
+export function openableVersion(version: number): boolean {
+	for (let at = version; ; at = MIGRATIONS[at]!.to) {
+		if (at === SCHEMA_VERSION) return true;
+		if (!MIGRATIONS[at]) return false;
+	}
+}
+
+/**
+ * The file's `user_version` is one this module neither supports nor upgrades. Such a file (versions
+ * 1 to 4 predate the oldest upgrade; any other number is unknown) is refused before the module
+ * writes anything to it, so it is left exactly as found.
  */
 export class LedgerSchemaVersionError extends Error {
 	constructor(readonly path: string, readonly version: number) {
 		super(version > 0 && version < SCHEMA_VERSION
-			? `ledger at ${path} is schema version ${version}, which predates the supported schema (version ${SCHEMA_VERSION}); ` +
-				"there is no upgrade, so the file is refused unchanged: move it aside and install a new ledger (ledger/SCHEMA.md, Versioning)"
+			? `ledger at ${path} is schema version ${version}, which predates the supported schema (version ${SCHEMA_VERSION}) ` +
+				"and every version this module upgrades; the file is refused unchanged: move it aside and install a new ledger (ledger/SCHEMA.md, Versioning)"
 			: `ledger at ${path} is schema version ${version}, which is not the supported schema (version ${SCHEMA_VERSION}); ` +
 				"the file is refused unchanged (ledger/SCHEMA.md, Versioning)");
+	}
+}
+
+/** The command that upgrades a ledger, as `LedgerNeedsMigrationError` names it. */
+export const MIGRATE_SCRIPT = join(import.meta.dir, "..", "scripts", "migrate.ts");
+
+/**
+ * The file is at a version `migrateLedger` upgrades from. `Ledger.open` refuses it before writing
+ * anything and names the explicit command; opening never upgrades.
+ */
+export class LedgerNeedsMigrationError extends LedgerSchemaVersionError {
+	constructor(path: string, version: number) {
+		super(path, version);
+		this.message = `ledger at ${path} is schema version ${version}; this module opens version ${SCHEMA_VERSION} and never upgrades on open: ` +
+			`run \`bun run ${MIGRATE_SCRIPT} ${path}\` (ledger/SCHEMA.md, Versioning)`;
+	}
+}
+
+/** A version-0 file that already holds schema objects: not an empty file, so it is never initialized. */
+export class LedgerNotEmptyError extends LedgerSchemaVersionError {
+	constructor(path: string, readonly objects: number) {
+		super(path, 0);
+		this.message = `ledger at ${path} is schema version 0 but already holds ${objects} schema object(s), so it is not an empty file ` +
+			"this module may initialize; the file is refused unchanged: point the ledger path at a new file or move this one aside (ledger/SCHEMA.md, Versioning)";
+	}
+}
+
+/** The version `migrateLedger` checked changed before its write lock was taken; nothing was upgraded. */
+export class LedgerSchemaChangedError extends LedgerSchemaVersionError {
+	constructor(path: string, readonly checked: number, version: number) {
+		super(path, version);
+		this.message = `ledger at ${path} was schema version ${checked} when checked and is ${version} under the migration's write lock; ` +
+			"another process changed it, so this run upgraded nothing: stop every writer and run the migration again (ledger/SCHEMA.md, Versioning)";
+	}
+}
+
+/**
+ * A file whose committed state SQLite can only read by writing: a non-empty -wal with no -shm, which
+ * a read-only connection cannot rebuild the WAL index for. Refused unchanged rather than opened
+ * read-write, which would recover the WAL into the file before its version could be checked.
+ */
+export class LedgerUnreadableError extends Error {
+	constructor(readonly path: string) {
+		super(`ledger at ${path} has a write-ahead log (${path}-wal) and no shared-memory file (${path}-shm), so its schema version cannot be ` +
+			"read without writing to it; the file is refused unchanged: recover it by hand with sqlite3 once you know which module version " +
+			"should own it (ledger/SCHEMA.md, Versioning)");
+	}
+}
+
+/** A lane holds a workload under a live lease, so `migrateLedger` refuses without `force`. */
+export class LedgerHeldError extends Error {
+	constructor(readonly path: string, readonly held: { id: string; holder: string; lease: string | null }[]) {
+		super(`ledger at ${path} is held by ${held.length} live lane(s) (${held.map((h) => `${h.id} by ${h.holder}`).join(", ")}); ` +
+			"the file is refused unchanged: stop the lanes, or pass --force");
+	}
+}
+
+/** How a file's triggers differ from the set schema.sql gives its version (`triggerDrift`). */
+export interface TriggerDrift {
+	version: number;
+	/** Triggers the version carries that the file lacks. */
+	missing: string[];
+	/** Triggers whose statement text differs: the first 12 hex digits of the SHA-256 of each text. */
+	changed: { name: string; expected: string; found: string }[];
+	/** Triggers in the file that schema.sql does not give the version. */
+	unexpected: string[];
+}
+
+/** One line naming every difference in `d`. */
+export function describeDrift(d: TriggerDrift): string {
+	return [
+		d.missing.length ? `missing ${d.missing.join(", ")}` : "",
+		d.changed.length ? `changed ${d.changed.map((c) => `${c.name} (sha256 ${c.found}, schema.sql ${c.expected})`).join(", ")}` : "",
+		d.unexpected.length ? `not in schema.sql ${d.unexpected.join(", ")}` : "",
+	].filter(Boolean).join("; ");
+}
+
+/**
+ * The file's triggers are not the ones schema.sql gives its version (ledger audit A5-1): a rule the
+ * module and every reader rely on may be missing or rewritten. The file is refused; when an upgrade
+ * found it, the upgrade was rolled back, so nothing was written either way.
+ */
+export class LedgerTriggerDriftError extends Error {
+	constructor(readonly path: string, readonly drift: TriggerDrift) {
+		super(`ledger at ${path} (schema version ${drift.version}) does not carry the triggers schema.sql gives that version, ` +
+			`so the file is refused unchanged: ${describeDrift(drift)} (ledger/SCHEMA.md, Trigger check)`);
 	}
 }
 
@@ -100,7 +211,8 @@ export function backupNamespace(source: string): string {
 
 /**
  * Why the file at `path` is not a complete copy of a ledger (empty, unreadable, failing
- * `PRAGMA integrity_check`, or not at SCHEMA_VERSION), or null when it is one.
+ * `PRAGMA integrity_check`, or at a version `Ledger.open` does not open), or null when it is one.
+ * A copy at a version `Ledger.open` upgrades is complete: it is upgraded when it is opened.
  */
 export function copyProblem(path: string): string | null {
 	assertNotLiveLedgerUnderTest(path);
@@ -117,7 +229,7 @@ export function copyProblem(path: string): string | null {
 		const integrity = db.query<{ integrity_check: string }, []>("PRAGMA integrity_check").all().map((r) => r.integrity_check);
 		if (integrity.join("\n") !== "ok") return `integrity_check: ${integrity.slice(0, 3).join("; ")}`;
 		const version = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
-		if (version !== SCHEMA_VERSION) return `user_version ${version}, not ${SCHEMA_VERSION}`;
+		if (!openableVersion(version)) return `user_version ${version}, not one this module opens (${SCHEMA_VERSION} or one it upgrades)`;
 		return null;
 	} catch (e) {
 		return `unreadable: ${e instanceof Error ? e.message : String(e)}`;
@@ -139,16 +251,62 @@ function retryBusy<T>(retries: number, fn: () => T): T {
 	}
 }
 
+const userVersion = (db: Database) => db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
+const schemaObjects = (db: Database) => db.query<{ n: number }, []>("SELECT count(*) AS n FROM sqlite_master").get()!.n;
+
+/** `path` as a SQLite URI filename with `query` (RFC 3986: `%`, `?` and `#` escaped, as SQLite decodes them). */
+const uriFilename = (path: string, query: string) => `file:${path.replace(/[%?#]/g, (c) => encodeURIComponent(c))}?${query}`;
+
+/**
+ * Run `read` on a connection that writes nothing: not the file, not its -wal, not its -shm, and
+ * creates neither. Measured on SQLite 3.51 (bun:sqlite) with a crash-left WAL, recorded in
+ * ledger/test/freeze.test.ts: a read-write connection checkpoints the WAL into the file and truncates
+ * the -wal on close; a plain read-only one leaves both but rewrites the -shm (it rebuilds the WAL
+ * index); `mode=ro&readonly_shm=1` changes none of the three and still reads the WAL's committed
+ * frames. That connection cannot open a WAL-mode file that has no -wal and -shm to read; such a file
+ * has no WAL content, so its main file is the whole committed state and `immutable=1` reads it
+ * without locks or sidecars. A non-empty -wal with no -shm cannot be read without writing one:
+ * LedgerUnreadableError.
+ */
+export function inspect<T>(path: string, retries: number, read: (db: Database) => T): T {
+	const attempt = (query: string) => {
+		const db = new Database(uriFilename(path, query), { readonly: true, strict: true });
+		try {
+			db.exec("PRAGMA busy_timeout = 5000");
+			return retryBusy(retries, () => read(db));
+		} finally {
+			db.close();
+		}
+	};
+	try {
+		return attempt("mode=ro&readonly_shm=1");
+	} catch (e) {
+		if (!(e instanceof Error && "code" in e && e.code === "SQLITE_CANTOPEN")) throw e;
+		const wal = `${path}-wal`;
+		if (existsSync(wal) && statSync(wal).size > 0) throw new LedgerUnreadableError(path);
+		return attempt("immutable=1");
+	}
+}
+
+/** The schema version of the ledger at `path`, read without writing anything (`inspect`). */
+export const schemaVersionOf = (path: string): number => inspect(path, 5, userVersion);
+
 /**
  * Apply the schema to a file that had none, inside BEGIN IMMEDIATE so the write lock is held
  * before any dependent statement runs. Re-reads the version under the lock: when another
- * connection initialized the file first, nothing is applied. Returns whether this call applied it.
+ * connection initialized the file first, nothing is applied. A version-0 file that holds any schema
+ * object is not empty and is refused under the same lock (LedgerNotEmptyError). Returns whether this
+ * call applied the schema.
  */
-function initialize(db: Database): boolean {
+function initialize(db: Database, path: string): boolean {
 	db.exec("BEGIN IMMEDIATE");
 	try {
-		const version = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
-		if (version === 0) db.exec(schemaBody());
+		const version = userVersion(db);
+		if (version === 0) {
+			const objects = schemaObjects(db);
+			if (objects > 0) throw new LedgerNotEmptyError(path, objects);
+			db.exec(schemaBody());
+		}
 		db.exec("COMMIT");
 		return version === 0;
 	} catch (e) {
@@ -163,6 +321,232 @@ function ensureWal(db: Database): void {
 	const set = db.query<{ journal_mode: string }, []>("PRAGMA journal_mode = WAL").get()!.journal_mode;
 	// SQLite reports the unchanged mode instead of an error when another connection blocks the switch.
 	if (set !== "wal") throw Object.assign(new Error(`could not switch journal_mode to wal (still ${set})`), { code: "SQLITE_BUSY" });
+}
+
+let schemaTriggerCache: ReadonlyMap<string, string> | null = null;
+
+/** schema.sql's triggers, name to statement text as sqlite_master stores it: schema.sql run once into an in-memory database. */
+function schemaTriggers(): ReadonlyMap<string, string> {
+	if (schemaTriggerCache) return schemaTriggerCache;
+	const mem = new Database(":memory:");
+	try {
+		mem.exec(schemaBody());
+		schemaTriggerCache = new Map(mem.query<{ name: string; sql: string }, []>("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'")
+			.all().map((r) => [r.name, r.sql]));
+	} finally {
+		mem.close();
+	}
+	return schemaTriggerCache;
+}
+
+/**
+ * The triggers a ledger at `version` carries, name to statement text, or null for a version
+ * `Ledger.open` does not open: schema.sql's, less those the upgrades from `version` on add.
+ */
+export function expectedTriggers(version: number): ReadonlyMap<string, string> | null {
+	if (!openableVersion(version)) return null;
+	const out = new Map(schemaTriggers());
+	for (let at = version; at !== SCHEMA_VERSION; at = MIGRATIONS[at]!.to) {
+		for (const name of MIGRATIONS[at]!.addsTriggers) out.delete(name);
+	}
+	return out;
+}
+
+const sqlHash = (sql: string) => createHash("sha256").update(sql).digest("hex").slice(0, 12);
+
+/**
+ * How the triggers in `db` differ from the set schema.sql gives the file's version (names, and each
+ * statement's text by SHA-256), or null when they match. Reads `sqlite_master` and `user_version`
+ * only. Throws LedgerSchemaVersionError for a version `Ledger.open` does not open.
+ */
+export function triggerDrift(db: Database): TriggerDrift | null {
+	const version = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
+	const want = expectedTriggers(version);
+	if (!want) throw new LedgerSchemaVersionError(db.filename, version);
+	const have = new Map(db.query<{ name: string; sql: string }, []>("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'")
+		.all().map((r) => [r.name, r.sql]));
+	const drift: TriggerDrift = { version, missing: [], changed: [], unexpected: [] };
+	for (const [name, sql] of want) {
+		const found = have.get(name);
+		if (found === undefined) drift.missing.push(name);
+		else if (sqlHash(found) !== sqlHash(sql)) drift.changed.push({ name, expected: sqlHash(sql), found: sqlHash(found) });
+	}
+	for (const name of have.keys()) if (!want.has(name)) drift.unexpected.push(name);
+	for (const list of [drift.missing, drift.unexpected]) list.sort();
+	drift.changed.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+	return drift.missing.length || drift.changed.length || drift.unexpected.length ? drift : null;
+}
+
+/**
+ * Refuse a drifted file. One allowance, for tests that inject a failure into a ledger another
+ * process then opens: triggers named in $AGENT_SYSTEM_LEDGER_FAULT_TRIGGERS (comma-separated) may be
+ * present beyond schema.sql's set. It never excuses a missing or rewritten trigger, and
+ * `triggerDrift` (so the ledger-health invariant) still reports them. Nothing in production sets it:
+ * an extra trigger can drop a write silently (RAISE(IGNORE)), so an unnamed extra is refused.
+ */
+function assertTriggers(db: Database, path: string): void {
+	const drift = triggerDrift(db);
+	if (!drift) return;
+	const allowed = new Set((process.env.AGENT_SYSTEM_LEDGER_FAULT_TRIGGERS ?? "").split(",").map((n) => n.trim()).filter(Boolean));
+	const unexpected = drift.unexpected.filter((n) => !allowed.has(n));
+	if (drift.missing.length || drift.changed.length || unexpected.length) throw new LedgerTriggerDriftError(path, { ...drift, unexpected });
+}
+
+/**
+ * Upgrade a file from `from`, the version `migrateLedger` checked, to SCHEMA_VERSION, inside BEGIN
+ * IMMEDIATE so the write lock is held before anything is read. Under the lock: the version must
+ * still be `from` (else LedgerSchemaChangedError: another process changed it); unless `force`, no
+ * lane may hold a workload under a live lease (else LedgerHeldError), since a lane can take one
+ * after the early check; the trigger set is checked against `from`'s before anything is written
+ * and against SCHEMA_VERSION before COMMIT (LedgerTriggerDriftError). Any refusal rolls back, so
+ * the file stays at `from`, unchanged. Returns the version read under the lock just before COMMIT.
+ * Only `migrateLedger` calls it.
+ */
+function upgrade(db: Database, path: string, from: number, force: boolean): number {
+	db.exec("BEGIN IMMEDIATE");
+	try {
+		const locked = userVersion(db);
+		if (locked !== from) throw new LedgerSchemaChangedError(path, from, locked);
+		if (!force) {
+			const held = liveHolds(db);
+			if (held.length) throw new LedgerHeldError(path, held);
+		}
+		assertTriggers(db, path);
+		const statements = schemaTriggers();
+		for (let at = from; at !== SCHEMA_VERSION; at = MIGRATIONS[at]!.to) {
+			for (const name of MIGRATIONS[at]!.addsTriggers) db.exec(statements.get(name)!);
+			db.exec(`PRAGMA user_version = ${MIGRATIONS[at]!.to}`);
+		}
+		assertTriggers(db, path);
+		const to = userVersion(db);
+		db.exec("COMMIT");
+		return to;
+	} catch (e) {
+		if (db.inTransaction) db.exec("ROLLBACK");
+		throw e;
+	}
+}
+
+export interface MigrateOptions {
+	/** Upgrade even while a lane holds a workload under a live lease. Default false. */
+	force?: boolean;
+	/** Take a `VACUUM INTO` snapshot beside the file before writing. Default true; only throwaway copies turn it off. */
+	snapshot?: boolean;
+	/** As OpenOptions.skipLocalityCheck. */
+	skipLocalityCheck?: boolean;
+	/** Time for the snapshot's name. Default now. */
+	now?: () => Date;
+	/**
+	 * Called once the snapshot is checked and before the upgrade's transaction begins, with the
+	 * recovery facts, so they are recorded before anything in the file can change: migrate.ts prints
+	 * them here. Not called when nothing is to be upgraded.
+	 */
+	beforeUpgrade?: (recovery: { path: string; from: number; snapshot: string | null; undo: string }) => void;
+}
+
+export interface MigrateResult {
+	path: string;
+	from: number;
+	/** The version read under the upgrade's write lock just before COMMIT (`from` when nothing was upgraded). */
+	to: number;
+	/** The pre-upgrade snapshot, or null when nothing was upgraded or snapshots were off. */
+	snapshot: string | null;
+	/** SQL that takes the upgraded file back to `from` losslessly (drops the added triggers), or null when nothing was upgraded. */
+	undo: string | null;
+}
+
+/** Workloads a lane holds under a live lease: the same test `workloads_holder_no_steal` applies. */
+function liveHolds(db: Database): { id: string; holder: string; lease: string | null }[] {
+	return db.query<{ id: string; holder: string; lease: string | null }, []>(`SELECT id, holder, holder_lease_until AS lease FROM workloads
+		WHERE status = 'open' AND holder IS NOT NULL
+		AND (holder_lease_until IS NULL OR holder_lease_until >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) ORDER BY id`).all();
+}
+
+/** What `migrateLedger` would do to a file, read without writing anything (`planMigration`). */
+export interface MigrationPlan {
+	/** The canonical path the upgrade would open. */
+	path: string;
+	from: number;
+	/** SCHEMA_VERSION; equal to `from` when the file is already current and nothing would be written. */
+	to: number;
+	/** Each upgrade step in the order it runs, with the triggers it creates. Empty when current. */
+	steps: { from: number; to: number; addsTriggers: readonly string[] }[];
+	/** Workloads held under a live lease. Non-empty only with `force`: without it they are refused (LedgerHeldError). */
+	held: { id: string; holder: string; lease: string | null }[];
+	/** SQL that takes the upgraded file back to `from` losslessly, or null when nothing would be upgraded. */
+	undo: string | null;
+}
+
+/**
+ * Every check `migrateLedger` makes before it writes, on a connection that writes nothing
+ * (`inspect`), and the upgrade those checks lead to. Throws what the upgrade would throw before
+ * its snapshot: LedgerSchemaVersionError for a version `MIGRATIONS` does not lead from,
+ * LedgerTriggerDriftError for a file whose triggers are not its version's, and LedgerHeldError
+ * for a live lease unless `force`. This is migrate.ts's `--dry-run` and its preview.
+ */
+export function planMigration(path: string, opts: Pick<MigrateOptions, "force" | "skipLocalityCheck"> = {}): MigrationPlan {
+	assertNotLiveLedgerUnderTest(path);
+	const target = opts.skipLocalityCheck ? path : assertLocalPath(path);
+	if (!existsSync(target)) throw new Error(`no ledger at ${target}`);
+	const { from, held } = inspect(target, 5, (r) => {
+		const found = userVersion(r);
+		if (found !== SCHEMA_VERSION && !MIGRATIONS[found]) throw new LedgerSchemaVersionError(target, found);
+		assertTriggers(r, target);
+		const holds = found === SCHEMA_VERSION ? [] : liveHolds(r);
+		if (holds.length && !opts.force) throw new LedgerHeldError(target, holds);
+		return { from: found, held: holds };
+	});
+	if (from === SCHEMA_VERSION) return { path: target, from, to: from, steps: [], held, undo: null };
+	const steps: MigrationPlan["steps"] = [];
+	for (let at = from; at !== SCHEMA_VERSION; at = MIGRATIONS[at]!.to) steps.push({ from: at, ...MIGRATIONS[at]! });
+	const drops = [...steps].reverse().flatMap((s) => [...s.addsTriggers].reverse().map((name) => `DROP TRIGGER ${name};`));
+	const undo = ["BEGIN IMMEDIATE;", ...drops, `PRAGMA user_version = ${from};`, "COMMIT;"].join(" ");
+	return { path: target, from, to: SCHEMA_VERSION, steps, held, undo };
+}
+
+/**
+ * The explicit upgrade (ledger/scripts/migrate.ts). Every check before the snapshot is
+ * `planMigration`'s, on a connection that writes nothing: a file at SCHEMA_VERSION is checked and
+ * left untouched, never opened read-write; a file at any version `MIGRATIONS` does not lead from is
+ * refused (LedgerSchemaVersionError); a file whose triggers drift from its version's set is refused
+ * (LedgerTriggerDriftError); a file a lane holds under a live lease is refused unless `force`
+ * (LedgerHeldError, the early refusal). Then it is snapshotted with `VACUUM INTO` beside it, and the
+ * snapshot checked to be a complete copy at `from`; then `beforeUpgrade` gets the snapshot and the
+ * undo; then `upgrade` runs, which checks the version and the holders again under its write lock.
+ * A throw means the upgrade did not commit; a snapshot already written stays where it was written.
+ */
+export function migrateLedger(path: string, opts: MigrateOptions = {}): MigrateResult {
+	const plan = planMigration(path, opts);
+	const { path: target, from } = plan;
+	if (plan.undo === null) return { path: target, from, to: from, snapshot: null, undo: null };
+	const undo = plan.undo;
+	const db = new Database(target, { readwrite: true, create: false, strict: true });
+	try {
+		db.exec("PRAGMA busy_timeout = 5000");
+		db.exec("PRAGMA foreign_keys = ON");
+		retryBusy(5, () => db.exec("PRAGMA synchronous = FULL"));
+		let snapshot: string | null = null;
+		if (opts.snapshot !== false) {
+			snapshot = snapshotPath(target, opts.now?.() ?? new Date());
+			if (existsSync(snapshot)) throw new Error(`snapshot ${snapshot} already exists; nothing was written`);
+			retryBusy(5, () => db.exec(`VACUUM INTO '${snapshot!.replaceAll("'", "''")}'`));
+			const problem = copyProblem(snapshot);
+			const copy = new Database(snapshot, { readonly: true });
+			const copyVersion = userVersion(copy);
+			copy.close();
+			if (problem || copyVersion !== from) throw new Error(`snapshot ${snapshot} is not a complete version-${from} copy (${problem ?? `version ${copyVersion}`}); the ledger was not upgraded`);
+		}
+		opts.beforeUpgrade?.({ path: target, from, snapshot, undo });
+		const to = retryBusy(5, () => upgrade(db, target, from, !!opts.force));
+		return { path: target, from, to, snapshot, undo };
+	} finally {
+		db.close();
+	}
+}
+
+/** Where `migrateLedger` writes the pre-upgrade snapshot of `target` taken at `at`: beside it, `<stem>-pre-v<N>-<time>.db`. */
+export function snapshotPath(target: string, at: Date): string {
+	return join(dirname(target), `${basename(target).replace(/\.db$/, "")}-pre-v${SCHEMA_VERSION}-${at.toISOString().replaceAll(":", "-")}.db`);
 }
 
 export type Stakes = "throwaway" | "normal" | "production";
@@ -439,11 +823,22 @@ export class Ledger {
 	/**
 	 * Open the ledger at `path` (default: $AGENT_SYSTEM_LEDGER_DB or $HOME/.agent-system-2/ledger.db).
 	 * The path is canonicalised and refused when synced or remote; the canonical path is opened.
-	 * Every connection: busy_timeout first, then foreign_keys, then WAL; initialization of a new
-	 * file runs under the same busy-retry policy as every write. A file at any schema version but
-	 * the supported one is refused unchanged (LedgerSchemaVersionError). Opening an existing ledger
-	 * takes the scheduled backup when one is due, unless `backupOnOpen` is false. A `readonly` open
-	 * sets busy_timeout and checks the version only: it writes nothing, not even a pragma.
+	 * Before any read-write handle exists, an existing file's version is read through `inspect`, a
+	 * connection that writes nothing (not the file, its -wal, or its -shm): opening never upgrades, so
+	 * a file at a version `MIGRATIONS` leads from is refused with the command that upgrades it
+	 * (LedgerNeedsMigrationError, `migrateLedger`), a file at any other version but the supported one
+	 * or 0 is refused (LedgerSchemaVersionError), and a version-0 file that already holds schema
+	 * objects is refused rather than initialized (LedgerNotEmptyError), all with the file, its -wal and
+	 * its -shm byte-identical. A read-write handle would not be: SQLite's last connection checkpoints a
+	 * crash-left WAL into the file on close. Then every read-write connection: busy_timeout first, then
+	 * foreign_keys, then synchronous = FULL (a committed write survives power loss, not only a process
+	 * crash; ledger audit A1-1), then WAL; initialization of a new file runs under the same busy-retry
+	 * policy as every write. The version is checked again on that connection, and the file's triggers
+	 * are compared with schema.sql's: a file whose set differs is refused (LedgerTriggerDriftError).
+	 * Opening an existing ledger takes the scheduled backup when one is due, unless `backupOnOpen` is
+	 * false. A `readonly` open sets busy_timeout and checks the version and triggers only: it writes no
+	 * pragma. Under test, a path inside a live ledger root is refused before anything is opened
+	 * (LiveLedgerUnderTestError; ledger/src/locality.ts, Guard A).
 	 */
 	static open(path: string = defaultLedgerPath(), opts: OpenOptions = {}): Ledger {
 		if (opts.readonly && opts.create) throw new Error("a readonly ledger cannot be created: open with { readonly: true } or { create: true }, not both");
@@ -455,21 +850,32 @@ export class Ledger {
 		if (fresh && !opts.create) throw new Error(`no ledger at ${target}; open with { create: true } or run the install script`);
 		if (fresh) mkdirSync(dirname(target), { recursive: true });
 		const retries = opts.busyRetries ?? 5;
+		if (!fresh) {
+			const { version: found, objects } = inspect(target, retries, (r) => ({ version: userVersion(r), objects: schemaObjects(r) }));
+			if (MIGRATIONS[found]) throw new LedgerNeedsMigrationError(target, found);
+			if (found === 0 && objects > 0) throw new LedgerNotEmptyError(target, objects);
+			if (found !== 0 && found !== SCHEMA_VERSION) throw new LedgerSchemaVersionError(target, found);
+		}
 		const db = opts.readonly
 			? new Database(target, { readonly: true, strict: true })
 			: new Database(target, { readwrite: true, create: !!opts.create, strict: true });
 		let initialized = false;
 		try {
 			db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.trunc(opts.busyTimeoutMs ?? 5000))}`);
-			if (!opts.readonly) db.exec("PRAGMA foreign_keys = ON");
-			const version = () => db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
-			if (!opts.readonly && retryBusy(retries, version) === 0) {
+			if (!opts.readonly) {
+				db.exec("PRAGMA foreign_keys = ON");
+				// Unlike foreign_keys, this pragma reads the schema, so it waits on a concurrent initializer.
+				retryBusy(retries, () => db.exec("PRAGMA synchronous = FULL"));
+			}
+			if (!opts.readonly && retryBusy(retries, () => userVersion(db)) === 0) {
 				if (!opts.create) throw new Error(`ledger at ${target} has no schema; open with { create: true }`);
 				retryBusy(retries, () => ensureWal(db));
-				initialized = retryBusy(retries, () => initialize(db));
+				initialized = retryBusy(retries, () => initialize(db, target));
 			}
-			const v = retryBusy(retries, version);
+			const v = retryBusy(retries, () => userVersion(db));
+			if (MIGRATIONS[v]) throw new LedgerNeedsMigrationError(target, v);
 			if (v !== SCHEMA_VERSION) throw new LedgerSchemaVersionError(target, v);
+			retryBusy(retries, () => assertTriggers(db, target));
 			if (!opts.readonly) retryBusy(retries, () => ensureWal(db));
 		} catch (e) {
 			db.close();

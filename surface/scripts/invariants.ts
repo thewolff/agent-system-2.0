@@ -42,6 +42,7 @@
 // | process-older-than-head | an `omp --cwd <checkout>` process (not a persistent seat: commands naming `/seat-sessions/` are skipped) started before HEAD arrived, where "arrived" is the later of HEAD's commit time and its newest reflog entry | `process-older-than-head:<pid>:<head12>` |
 // | ff-lull | checkout-behind-main with tracked files clean (`git status --porcelain --untracked-files=no` succeeded and printed nothing) AND zero review hands in flight. In flight = a `hand-spawn: … review yes` token with no `hand-settled: <token>` whose spawning lane has a live `lane.ts run` process: the `liveReviews` set the classifier passes to `builderLabs`. Unsettled review hands whose lane is gone are listed, not counted. The text cites the fingerprint rule (classifier/src/fingerprint.ts header: a review's fingerprint covers its lane's worktree only) rather than asserting the fast-forward is safe. | `ff-lull:<origin12>:<id of the newest review hand-settled entry>`, so one notice per lull |
 // | stale-backup | the ledger's newest write (max `created_at` across every table that has one, up to as-of) is newer than the newest scheduled copy (`ledger-<time>.db` in `backups/<backupNamespace>/` beside the ledger, the directory ledger/scripts/backup.ts writes; its time read from the name, copies named after as-of ignored; a copy counts only if the ledger's `copyProblem` accepts it as complete, so an empty, unreadable, corrupt or wrong-version file named like a copy is passed over for the next older one) by more than `--backup-gap` hours (default 30: the job's 24 h copy interval plus 6 h, so a finding means a daily copy was missed, not a busy day): writes no copy captured. Never the copy's wall-clock age: an old copy of a quiet ledger is not a finding (2026-10-09T18:03Z to 2026-10-11T18:10Z the ledger wrote nothing and every copy matched it). With no complete copy at all the gap runs from the ledger's first write. The text names the newest write, the newest complete copy, each newer file passed over with its problem, and the backup directory. | `stale-backup:<newest complete copy file name>` (`stale-backup:none` with no complete copy) |
+// | ledger-health | the live ledger file itself, checked read-only as it is now (also under `--as-of`): `PRAGMA quick_check` reports anything but `ok` or fails; `PRAGMA foreign_key_check` lists a row whose parent does not exist; or the trigger set (names, and each statement's text by SHA-256, from `sqlite_master`) is not the one ledger/schema.sql gives the file's `user_version` (`triggerDrift`, ledger/src/index.ts: missing, changed, or not in schema.sql), or the version is one `Ledger.open` neither supports nor upgrades. One finding per failing check | `ledger-health:<quick-check\|foreign-keys\|triggers>:<sha256 of what failed, 12 hex>` |
 //
 // Skips. An invariant that cannot be judged here is reported as `skipped: <reason>` rather than
 // silently passing: the three git/process invariants under `--as-of` (git state and the process
@@ -64,10 +65,13 @@
 // Each finding carries `key`, `invariant`, `workload`, `since`, `text` and `query` (the SQL with
 // its parameters inlined, pasteable into `sqlite3 -readonly`); `--json` adds `asOf`.
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { builderLabs, describeBuilders, excludedLabs, parseHandSpawn } from "../../classifier/src/lab";
-import { BACKUP_DEFAULTS, BACKUP_NAME, backupNamespace, copyProblem, processAlive } from "../../ledger/src/index";
+import {
+	BACKUP_DEFAULTS, BACKUP_NAME, backupNamespace, copyProblem, describeDrift, openableVersion, processAlive, SCHEMA_VERSION, triggerDrift,
+} from "../../ledger/src/index";
 import type { EntryKind, EntryRow, InstructionRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { assertNotLiveLedgerUnderTest, canonicalPath, defaultLedgerPath, homeDir } from "../../ledger/src/locality";
 import { type ReservedLedgerView, reservedStates } from "../src/errors";
@@ -76,7 +80,7 @@ import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID } from "../src/types";
 
 export const INVARIANTS = [
 	"dead-lane", "silent-lane", "orphan-hand", "no-independent-lab", "stale-reserved", "stuck-question", "stuck-review",
-	"provider-refusal-loop", "silent-orchestrator", "checkout-behind-main", "process-older-than-head", "ff-lull", "stale-backup",
+	"provider-refusal-loop", "silent-orchestrator", "checkout-behind-main", "process-older-than-head", "ff-lull", "stale-backup", "ledger-health",
 ] as const;
 export type Invariant = (typeof INVARIANTS)[number];
 
@@ -648,7 +652,7 @@ export function check(input: Input): Report {
 		);
 		const { oldest, newest } = writes.rows[0]!;
 		// The newest copy that is a complete ledger by the backup writer's own test (copyProblem: not empty, readable,
-		// integrity_check ok, at SCHEMA_VERSION). A newer file named like a copy that fails it captured nothing, so the
+		// integrity_check ok, at a version Ledger.open opens). A newer file named like a copy that fails it captured nothing, so the
 		// walk goes back past it; opening is read-only, and quarantining such a file stays the writer's job.
 		const rejected: string[] = [];
 		let newestCopy: { name: string; at: string } | undefined;
@@ -673,6 +677,48 @@ export function check(input: Input): Report {
 				text: `newest ledger write ${newest} is ${hours(behindMs)} newer than ${copyText} in ${backupDir} (gap ${hours(gapMs)})${replayNote}: writes since then are in no copy. The job is ledger/scripts/backup.ts (launchd agent com.agent-system-2.ledger-backup on macOS).`,
 				query: `ls ${backupDir}/ledger-*.db; copyProblem() (ledger/src/index.ts) on each, newest first; ${writes.shown}`,
 			});
+		}
+	}
+
+	// ---- ledger-health ----------------------------------------------------------------------------
+	// The live file itself (ledger audit A5-1, A5-2), read-only: page and index health (PRAGMA quick_check;
+	// integrity_check otherwise runs only on copies), foreign keys (PRAGMA foreign_key_check: the sqlite3 CLI
+	// writes with them off) and the trigger set against the one schema.sql gives the file's version (a missing
+	// or rewritten trigger passes integrity_check and user_version alike; Ledger.open refuses such a file).
+	// One finding per failing check; each key carries a digest of what failed, so a different failure is a new
+	// finding.
+	const healthNote = replay ? " (replay: the file is checked as it is now, not as of as-of)" : "";
+	const health = (kind: string, detail: string, text: string, query: string) => findings.push({
+		key: `ledger-health:${kind}:${createHash("sha256").update(detail).digest("hex").slice(0, 12)}`,
+		invariant: "ledger-health", workload: "ledger", since: asOf, text: `${text}${healthNote}`, query,
+	});
+	const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+	try {
+		const problems = db.query<{ quick_check: string }, []>("PRAGMA quick_check").all().map(r => r.quick_check);
+		if (problems.join("\n") !== "ok") {
+			health("quick-check", problems.join("\n"), `PRAGMA quick_check on the live ledger reports ${problems.length} problem(s): ${problems.slice(0, 5).join("; ")}${problems.length > 5 ? "; …" : ""}. The newest complete copy is the restore point (stale-backup reads the copies).`, "PRAGMA quick_check;");
+		}
+	} catch (e) {
+		health("quick-check", errText(e), `PRAGMA quick_check on the live ledger failed: ${errText(e)}.`, "PRAGMA quick_check;");
+	}
+	try {
+		const orphans = db.query<{ table: string; rowid: number | null; parent: string }, []>("PRAGMA foreign_key_check").all();
+		if (orphans.length) {
+			const shown = orphans.map(r => `${r.table} rowid ${r.rowid} -> ${r.parent}`);
+			health("foreign-keys", shown.join("\n"), `PRAGMA foreign_key_check: ${orphans.length} row(s) name a parent row that does not exist: ${shown.slice(0, 5).join(", ")}${orphans.length > 5 ? ", …" : ""}.`, "PRAGMA foreign_key_check;");
+		}
+	} catch (e) {
+		health("foreign-keys", errText(e), `PRAGMA foreign_key_check on the live ledger failed: ${errText(e)}.`, "PRAGMA foreign_key_check;");
+	}
+	const triggersQuery = "PRAGMA user_version; SELECT name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name;";
+	const fileVersion = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
+	if (!openableVersion(fileVersion)) {
+		health("triggers", `version ${fileVersion}`, `the ledger is schema version ${fileVersion}, which Ledger.open neither supports (${SCHEMA_VERSION}) nor upgrades, so its trigger set has nothing to be compared with.`, triggersQuery);
+	} else {
+		const drift = triggerDrift(db);
+		if (drift) {
+			const described = describeDrift(drift);
+			health("triggers", described, `the ledger's triggers are not the ones schema.sql gives schema version ${drift.version}: ${described}. Ledger.open refuses this file until they are; a rule the module relies on may be gone.`, triggersQuery);
 		}
 	}
 

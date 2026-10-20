@@ -1,4 +1,4 @@
-# Ledger schema, version 5
+# Ledger schema, version 6
 
 The agent-system 2.0 ledger is one SQLite file in WAL mode. This document is for a person or a
 non-OMP tool reading or writing it. The authoritative definition is `ledger/schema.sql`; this page
@@ -25,6 +25,18 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
 
   The module then opens the canonical path, so what was checked is what is opened
   (`Ledger#path` is that canonical path).
+- **Tests never reach the live ledger** (Guard A, `ledger/src/locality.ts`). Every `bunfig.toml`
+  preloads `ledger/test/isolate-preload.ts`, which points `HOME` and `AGENT_SYSTEM_LEDGER_DB` at a
+  per-run temp home before any test module loads. Under test (`NODE_ENV=test`, or a process the
+  preload isolated), `defaultLedgerPath`, `Ledger.open`, `migrateLedger`, the backup paths and the
+  scripts that open a ledger raw refuse any path inside a live ledger root with
+  `LiveLedgerUnderTestError`, before anything is created or opened. The live roots are the passwd
+  home's `.agent-system-2` (Bun's `os` home calls follow `$HOME`, so it is read with `id -P` or
+  `getent`), the real HOME and ledger directory the preload recorded, and each entry of
+  `AS2_TEST_LIVE_ROOTS`. Paths are compared canonically, so a symlink into a root is refused too.
+  The guard exists because a real-HOME `bun test` once reached the default path through a gate
+  that opened its ledger, and that run upgraded the live file to a branch's schema under every
+  process running main (2026-10-12).
 - Copying: never `cp` a WAL database; it loses what is still in the `-wal` file. Take a copy with
   `VACUUM INTO '<path>'` (the module's `backup()`), or `sqlite3 ledger.db ".backup '<path>'"`.
 - **Scheduled second copy** (§ B2 prior art e). A copy is a `VACUUM INTO` snapshot named
@@ -39,8 +51,8 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
     Moving or renaming a ledger gives it a new namespace; its old copies stay where they were.
   - **Complete copies only.** A snapshot is written to a temporary dot-file in the namespace
     directory (`.ledger-<time>.db.<pid>-<random>.tmp`, where `<pid>` is the writing process),
-    checked (non-empty, `PRAGMA integrity_check` ok, `user_version` equal to the supported schema
-    version, 4), and only then linked to
+    checked (non-empty, `PRAGMA integrity_check` ok, `user_version` the supported schema version,
+    6, or 5, the one migrate.ts upgrades), and only then linked to
     its `ledger-<time>.db` name; on any failure the temporary file is removed and the error
     propagates ("snapshot of … is not a complete copy (…)", or SQLite's own error). A writer
     killed before that cleanup (SIGKILL, power loss) leaves its temporary file; the next copy
@@ -154,7 +166,11 @@ the module's generated ids always are (`sl-` plus base36 characters, 17 in 2026)
 | `created_by`, `created_at`, `changed_by`, `changed_at`, `rev` | provenance and stamp |
 
 - Opened `open` with no holder ("a workload is opened in status open with no holder").
-- `open → closed`, once; a closed workload stays closed ("illegal workload transition").
+- `open → closed`, once; a closed workload stays closed ("illegal workload transition"), and
+  nothing else on it changes either: holder, lease, stakes, mode and stamp are final (version 6, "a
+  closed workload is final: nothing on it changes").
+- The standing workload `wl-orchestrator` is never closed (version 6, "the standing workload
+  wl-orchestrator is never closed").
 - Closing is refused while any slice is `open` or `paused` or any question is `open` ("cannot
   close a workload with open or paused slices or open questions"). A closed workload holds no lane.
 - **Lease and reclaim.** The holder changes to a different holder only after a release (holder set
@@ -163,6 +179,10 @@ the module's generated ids always are (`sl-` plus base36 characters, 17 in 2026)
 - **Mode flip is an instruction.** `mode` changes only if an `instructions` row of kind
   `mode-flip` with the new mode as its body was recorded on this workload at or after the
   workload's last change ("a mode flip needs a mode-flip instruction").
+- **A stakes change is an instruction** (version 6). `stakes` changes only if an `instructions`
+  row of kind `instruction` with body `stakes: <new stakes>` was recorded on this workload at or
+  after the workload's last change ("a stakes change needs a "stakes: <stakes>" instruction
+  recorded since the last workload change"). The surface records both in one transaction.
 - Last activity is derived, not stored: `workload_status.last_activity_at` is the latest
   `provenance.at` for the workload.
 
@@ -186,7 +206,9 @@ paused ──► cancelled   the file does it when the last question is resolved
                   the slice said cancel
 open ──► done     with a non-blank artifact
 open ──► cancelled, paused ──► cancelled   only when no question on it is open
-done, cancelled   final
+done, cancelled   final: nothing on a done or cancelled slice changes, its artifact and stamp
+                  included (version 6, "a done or cancelled slice is final: nothing on it changes,
+                  its artifact included")
 ```
 
 ### `messages` — the four-state queue
@@ -201,7 +223,9 @@ done, cancelled   final
 
 Born `held` ("message must be enqueued in state held"); then exactly
 `held → delivered → consumed → acted-on`, one step at a time, never backwards ("illegal message
-transition"). Only `state` and its stamp change ("only state and its stamp change on a message").
+transition"). Only `state` and its stamp change ("only state and its stamp change on a message"),
+and an `acted-on` message is final: not even its stamp changes (version 6, "an acted-on message is
+final: nothing on it changes").
 The age of the oldest held message is `now - min(created_at) WHERE state = 'held'`
 (index `messages_state_created`).
 
@@ -341,17 +365,20 @@ SELECT id, workload_id, created_at AS enqueued_at,
 ## Connections
 
 The module sets, on every connection and in this order: `busy_timeout` (default 5000 ms), then
-`foreign_keys = ON`, then `journal_mode = wal`. Every write runs in `BEGIN IMMEDIATE` and is
+`foreign_keys = ON`, then `synchronous = FULL` (version 6, ledger audit A1-1: Bun's SQLite and the
+macOS `sqlite3` both open at `NORMAL` (1), under which WAL may lose the latest commits on power
+loss, though not on a process crash), then `journal_mode = wal`. A foreign tool writing the file
+should set `synchronous = FULL` too. Every write runs in `BEGIN IMMEDIATE` and is
 retried on `SQLITE_BUSY`, which `BEGIN IMMEDIATE` and `COMMIT` can both return. Opening is covered
-by the same retry policy (`busyRetries`, default 5): reading the version, switching to WAL, and
+by the same retry policy (`busyRetries`, default 5): reading the version, switching to WAL,
 initializing a new file, which takes `BEGIN IMMEDIATE` before any schema statement runs and
 re-reads the version under the lock, so a file another process initialized first is left alone
-and a failed attempt rolls back to an empty file. Keep read transactions short: a long-lived
-reader stops WAL checkpoints.
+and a failed attempt rolls back to an empty file, and upgrading an older one (Versioning). Keep
+read transactions short: a long-lived reader stops WAL checkpoints.
 
 ## Versioning
 
-`PRAGMA user_version` is the schema version: **5**. `ledger/schema.sql` creates version 5 from an
+`PRAGMA user_version` is the schema version: **6**. `ledger/schema.sql` creates version 6 from an
 empty file (`sqlite3 ledger.db < ledger/schema.sql`); it has exactly one `BEGIN;` line and one
 `COMMIT;` line, and the module runs the statements between them inside its own `BEGIN
 IMMEDIATE`. The installer accepts exactly one manifest `ledger-schema` row, and it must name
@@ -364,30 +391,158 @@ schema change, so the two tables are version 3 (commit `de28132`). Version 4 (co
 `1fe1b6e`) adds the dispatch's `outcome` and `ran_models` to `routings` and lets `models` be empty
 for a refused spawn. Version 5 adds the hand's `session_root` and `agent_id` to `routings` (one
 row per hand), and counts tab-, newline- and other whitespace-only model names as blank (M3 fix
-round 5). There is
-**no upgrade**: a file at version 1 to 4, or at any version other than 5, is refused before
+round 5). Version 6 (ledger audit A3-1, A2-3, A2-4) adds five triggers and no column: done and
+cancelled slices, acted-on messages and closed workloads are final
+(`slices_final`, `messages_acted_on_final`, `workloads_closed_final`); a stakes change needs its
+`stakes: <stakes>` instruction (`workloads_stakes_needs_instruction`); `wl-orchestrator` is never
+closed (`workloads_standing_never_closes`).
+
+**Upgrade from version 5: only by command, never by opening.** Opening a ledger never upgrades
+it. On 2026-10-12, a branch's test opened the live file through a default path and upgraded it
+under every process running main. Since then, `Ledger.open` refuses a version-5 file before any
+read-write connection to it exists. The refusal is `LedgerNeedsMigrationError`, with this text:
+"ledger at `<path>` is schema version 5; this module opens version 6 and never upgrades on open:
+run `` `bun run <repo>/ledger/scripts/migrate.ts <path>` `` (ledger/SCHEMA.md, Versioning)". On a
+version-5 file, `init.ts` and `backup.ts` exit **4**, and so does the installer.
+
+**A refusal writes nothing: not the file, not its `-wal`, not its `-shm`.** A read-write
+connection cannot promise that. When the last connection to a file closes, SQLite checkpoints a
+WAL that a crashed writer left behind into the main file and truncates the `-wal`, whether or
+not the connection wrote anything. So `Ledger.open` and `migrate.ts` read the version, and every
+check made before a write, through `inspect`, a connection opened as
+`file:<path>?mode=ro&readonly_shm=1`. Measured on SQLite 3.51 (bun:sqlite), with a crash-left WAL,
+in `ledger/test/freeze.test.ts`:
+
+| Connection | Main file | `-wal` | `-shm` |
+| --- | --- | --- | --- |
+| read-write | changed | truncated | changed |
+| plain read-only | unchanged | unchanged | changed (the WAL index is rebuilt) |
+| `mode=ro&readonly_shm=1` | unchanged | unchanged | unchanged |
+
+The `mode=ro&readonly_shm=1` connection still reads the commits in the WAL. It cannot open a
+WAL-mode file that has no `-wal` and no `-shm`. Such a file has no WAL content, so its main file is
+its whole committed state, and `immutable=1` reads that without locks or sidecars. A non-empty
+`-wal` with no `-shm` is a different case: it cannot be read without writing a `-shm`, so it is
+refused unchanged with `LedgerUnreadableError` (exit **1** from `init.ts`).
+
+A version-0 file that already holds any schema object is not an empty file. It is refused rather
+than initialized: `LedgerNotEmptyError`, exit **4** from `init.ts` and the installer. This check
+runs before the journal mode is touched, and again under the initialization lock.
+
+`bun run ledger/scripts/migrate.ts [path] [--dry-run] [--force]` is the upgrade, run in this order:
+
+1. Every check before the snapshot runs on the `inspect` connection, which writes nothing. A file
+   already at version 6 is checked and never opened read-write. The command exits 0 and prints
+   "already current; nothing written", so it is idempotent.
+2. A version-5 file that does not carry exactly version 5's triggers (Trigger check) is refused,
+   exit **5**.
+3. A version-5 file is refused while any lane holds a workload under a live lease. A live lease is
+   `holder` set and `holder_lease_until` NULL or not yet past, the same test as
+   `workloads_holder_no_steal`. The exit is **6**, and the refusal names the workloads and holders.
+   `--force` skips this check, and only this one. This is the early refusal; step 7 repeats it
+   under the write lock.
+4. The command prints a preview: the path, the version from and to, the triggers the upgrade
+   adds, that no row is written or rewritten, the live leases `--force` overrides, the snapshot
+   name it would write and the undo. With `--dry-run` it stops here, exit 0, having made every
+   check above and written nothing. Otherwise it asks for confirmation and reads one line from
+   stdin: anything but `MIGRATE` (end of input included) is refused, exit **7**, with nothing
+   written. A script that drives it pipes the word in (`printf 'MIGRATE\n' | bun run …/migrate.ts <path>`).
+5. A `VACUUM INTO` snapshot is written beside the file, as `<stem>-pre-v6-<time>.db`. It is
+   checked to be a complete version-5 copy, and nothing is upgraded when it is not.
+6. The command prints the snapshot path and the undo before the upgrade starts. The undo is
+   lossless and keeps every row written since. It is shell-quoted, so it can be pasted into zsh or
+   sh as printed: `sqlite3 '<path>' 'BEGIN IMMEDIATE; DROP TRIGGER …; PRAGMA user_version = 5; COMMIT;'`.
+7. The upgrade runs in one `BEGIN IMMEDIATE` transaction, and under that lock it:
+   - re-reads the version. If it is no longer the version checked in step 1, the run is refused with
+     `LedgerSchemaChangedError` (exit **4**) and upgrades nothing.
+   - re-checks the leases unless `--force` was given. A lane that took a lease after step 3 is
+     refused here, exit **6**.
+   - checks the triggers again;
+   - creates the five triggers with schema.sql's own text;
+   - sets `user_version = 6`;
+   - checks against version 6;
+   - commits.
+
+   Any failure rolls back and leaves the file at version 5. No row is written or rewritten; rows a
+   version-5 writer left in a final state are kept as they are.
+
+**What the exit code tells you.** Exit 0 means upgraded, already current, or a dry run whose checks
+passed. Exit 2 is an unknown argument. A non-zero exit before the snapshot and undo lines are printed means nothing was written. A non-zero exit after them means
+the snapshot is kept, and the command's last line reads the version back ("schema version read back
+now: 5: the upgrade did not commit"). Whether the upgrade committed is shown, not assumed.
+
+The steps are `MIGRATIONS` in `ledger/src/index.ts` (`migrateLedger`); a later version adds an
+entry there.
+
+**Deploy procedure for version 6 (the only one).** A merged PR changes nothing that is running.
+The installed checkout is the problem. as2, the profile's extensions, lane runners and the hourly
+backup job all run modules in place from it, so updating it activates the version-6 module in the
+next process any of them starts. That process refuses a version-5 ledger. Meanwhile the
+version-5 module refuses a version-6 ledger. So the two never overlap:
+
+1. **Stage.** Check out the merged version-6 code in a separate clone, not the installed checkout.
+   Every installed entry point stays on version 5.
+2. **Block launches and pause backups.** Quit every as2 session; the orchestrator is what launches
+   lanes. Unload the backup job with `launchctl bootout gui/$(id -u)/com.agent-system-2.ledger-backup`.
+3. **Drain and stop every writer.** Stop each lane (`as2 lane stop <wl>`) until no workload is
+   under a live lease and `lsof -- <ledger>` lists no process. A lease query alone does not prove
+   no process is still running.
+4. **Migrate**, from the staged clone, without `--force`. Run it with `--dry-run` first and read
+   the preview, then run it for real and type `MIGRATE`. Keep the snapshot path and the printed
+   undo. Any refusal stops the deploy: fix the cause, never reach for `--force` as routine.
+5. **Activate every version-6 consumer together.** Fast-forward the installed checkout to the
+   merged commit. Check that `init.ts` opens the ledger, then reload the backup job.
+6. **Resume.** Start as2.
+
+To roll back, stop every writer again. Check that the ledger reads version 6, then apply the saved
+undo. Return the installed checkout to its previous commit, then restart. The snapshot is recovery
+evidence. Restoring it would discard every row written after it was taken, which is a separate
+decision. `~/agent-scratch/agent-system-2.0/ledger-freeze/deploy-v6.zsh` runs steps 1 to 6. It
+previews first, waits for a typed confirmation, logs to `deploy-v6.log` and saves the undo to
+`deploy-v6-undo.txt`.
+
+A file at version 1 to 4, or at any version that is neither 6 nor upgraded, is refused before
 anything is written to it, and left exactly as found. The refusal names the file and its version:
 
-- "ledger at `<path>` is schema version 4, which predates the supported schema (version 5); there
-  is no upgrade, so the file is refused unchanged: move it aside and install a new ledger
-  (ledger/SCHEMA.md, Versioning)" (the same text for versions 1 to 3);
+- "ledger at `<path>` is schema version 4, which predates the supported schema (version 6) and
+  every version this module upgrades; the file is refused unchanged: move it aside and install a
+  new ledger (ledger/SCHEMA.md, Versioning)" (the same text for versions 1 to 3);
 - for any other version: "ledger at `<path>` is schema version `<n>`, which is not the supported
-  schema (version 5); the file is refused unchanged (ledger/SCHEMA.md, Versioning)".
+  schema (version 6); the file is refused unchanged (ledger/SCHEMA.md, Versioning)".
 
-`Ledger.open` throws `LedgerSchemaVersionError`; `ledger/scripts/init.ts` and
-`ledger/scripts/backup.ts` exit **4**; `install/install.sh` exits **4** and writes nothing. To
-proceed, move the old file aside (for example `mv ledger.db ledger.v4.db`) and re-run the
-installer, which creates a new version-5 ledger. Later versions will ship as migrations.
+`Ledger.open` throws `LedgerSchemaVersionError`, or one of its subclasses:
+`LedgerNeedsMigrationError` for version 5, `LedgerNotEmptyError` for a non-empty version 0, and
+`LedgerSchemaChangedError` from migrate. `ledger/scripts/init.ts` and `ledger/scripts/backup.ts`
+exit **4**, and `install/install.sh` exits **4** and writes nothing. For versions 1 to 4, move the
+old file aside (for example `mv ledger.db ledger.v4.db`) and re-run the installer, which creates a
+new version-6 ledger. For version 5, run migrate.ts as part of the deploy procedure above.
 
 `Ledger.open` never changes the schema version or the schema of a ledger that has one: with or
 without `readonly`, it refuses any version other than the supported one and leaves the file unchanged.
 Only a file with no schema yet (`user_version` 0, new or empty) is initialized, and only with
-`create`. A migration runs only
-by an explicit command, `bun ledger/scripts/migrate.ts [path]`, which the ledger-freeze item of PR #72
-(`plumb/ledger-freeze-and-drift`) introduces with a `VACUUM INTO` snapshot taken before any write, a printed undo, and a refusal
-while a lane holds a workload under a live lease. Until that lands there is no upgrade at all: a
-file at another version is moved aside by hand, as above. The N1 case "a ledger at the version
+`create`. The only upgrade is the explicit command above. The N1 case "a ledger at the version
 immediately below SCHEMA_VERSION, built from git history, is refused unchanged by open, init and the
-backup job" in `ledger/test/ledger.test.ts` holds this for whichever version is current: it builds
-the previous version's file from git history and checks that open, `init.ts` and `backup.ts` all
+backup job" in `ledger/test/ledger.test.ts` holds this for whichever version is current: at version 6
+it builds the version-5 file from git history and checks that open, `init.ts` and `backup.ts` all
 refuse it and leave its version, schema, rows and bytes as they were.
+
+### Trigger check
+
+The rules live in triggers, and a missing or rewritten trigger passes `PRAGMA integrity_check` and
+`user_version` alike. So every `Ledger.open` of a version-6 file, and migrate.ts before it upgrades
+a version-5 file, compares the file's triggers (name, and the SHA-256 of each statement's text in
+`sqlite_master`) with the set schema.sql gives the file's version (for version 5: version 6's set
+less the triggers the upgrade adds). A file whose set differs is refused before anything is written: "ledger at `<path>` (schema version
+`<n>`) does not carry the triggers schema.sql gives that version, so the file is refused
+unchanged: missing `<a>`; changed `<b>` (sha256 `<12 hex>`, schema.sql `<12 hex>`); not in
+schema.sql `<c>` (ledger/SCHEMA.md, Trigger check)". `Ledger.open` throws
+`LedgerTriggerDriftError`; `init.ts` exits **5**; `backup.ts` exits **1**. An extra trigger is
+refused too: one can drop a write silently (`SELECT RAISE(IGNORE)` in a `BEFORE INSERT ON
+provenance` drops the log row and the write goes on). The one exception is for tests that inject a
+failure into a file another process then opens: extra triggers named in
+`AGENT_SYSTEM_LEDGER_FAULT_TRIGGERS` (comma-separated) are let through. It never excuses a missing
+or changed trigger, `ledger-health` still reports the extra, and nothing outside the tests sets it.
+To repair a drifted file, restore the newest complete copy,
+or recreate the named triggers with schema.sql's text. `surface/scripts/invariants.ts` reports
+the same comparison read-only as the `ledger-health` invariant, beside `PRAGMA quick_check` and
+`PRAGMA foreign_key_check` on the live file.

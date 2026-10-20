@@ -1,4 +1,4 @@
--- agent-system 2.0 ledger schema, version 5.
+-- agent-system 2.0 ledger schema, version 6.
 -- Human documentation: ledger/SCHEMA.md. Ruling: SPEC-2.0.md § B2 ("Ruled 2026-09-24").
 --
 -- The state-order and provenance rules live HERE, as CHECK constraints and triggers, so every
@@ -425,6 +425,37 @@ WHEN NEW.mode IS NOT OLD.mode AND NOT EXISTS (
     AND body = NEW.mode AND created_at >= OLD.changed_at)
 BEGIN SELECT RAISE(ABORT, 'a mode flip needs a mode-flip instruction recorded since the last workload change'); END;
 
+-- A stakes change is a ledgered instruction too (schema version 6, ledger audit A2-3): the surface
+-- records `stakes: <stakes>` and changes the stakes in one transaction (surface/src/input.ts); the
+-- file now refuses a change with no such instruction, as it does a mode flip.
+CREATE TRIGGER workloads_stakes_needs_instruction BEFORE UPDATE OF stakes ON workloads
+WHEN NEW.stakes IS NOT OLD.stakes AND NOT EXISTS (
+  SELECT 1 FROM instructions WHERE workload_id = OLD.id AND kind = 'instruction'
+    AND body = 'stakes: ' || NEW.stakes AND created_at >= OLD.changed_at)
+BEGIN SELECT RAISE(ABORT, 'a stakes change needs a "stakes: <stakes>" instruction recorded since the last workload change'); END;
+
+-- The standing orchestrator workload is never closed (schema version 6, ledger audit A2-4): every
+-- wake writes to it, and a closed workload takes no entries.
+CREATE TRIGGER workloads_standing_never_closes BEFORE UPDATE OF status ON workloads
+WHEN OLD.id = 'wl-orchestrator' AND OLD.status = 'open' AND NEW.status = 'closed'
+BEGIN SELECT RAISE(ABORT, 'the standing workload wl-orchestrator is never closed'); END;
+
+-- Final states are final (schema version 6, ledger audit A3-1): a closed workload, a done or
+-- cancelled slice and an acted-on message take no UPDATE at all. A change of state out of a final
+-- state is already refused by the state-order trigger of its table; these refuse every update that
+-- keeps the state, which the state-order triggers let through: a second completion rewriting a done
+-- slice's artifact, a re-advance of an acted-on message, stakes set on a closed workload. Between the
+-- two, exactly one trigger refuses each update of a final row.
+CREATE TRIGGER workloads_closed_final BEFORE UPDATE ON workloads
+WHEN OLD.status = 'closed' AND NEW.status IS OLD.status
+BEGIN SELECT RAISE(ABORT, 'a closed workload is final: nothing on it changes'); END;
+CREATE TRIGGER slices_final BEFORE UPDATE ON slices
+WHEN OLD.state IN ('done', 'cancelled') AND NEW.state IS OLD.state
+BEGIN SELECT RAISE(ABORT, 'a done or cancelled slice is final: nothing on it changes, its artifact included'); END;
+CREATE TRIGGER messages_acted_on_final BEFORE UPDATE ON messages
+WHEN OLD.state = 'acted-on' AND NEW.state IS OLD.state
+BEGIN SELECT RAISE(ABORT, 'an acted-on message is final: nothing on it changes'); END;
+
 -- Slices: born open. open <-> paused (paused only while a question on the slice is open);
 -- open -> done (with an artifact); open|paused -> cancelled (no open question). done and
 -- cancelled are final.
@@ -619,6 +650,6 @@ SELECT w.*,
   (SELECT min(m.created_at) FROM messages m WHERE m.workload_id = w.id AND m.state = 'held') AS oldest_held_at
 FROM workloads w;
 
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 
 COMMIT;
