@@ -236,6 +236,9 @@ export interface FakeRecord {
 	command?: string;
 	provider?: string;
 	modelId?: string;
+	/** At EOF or a deliberately late claim: the real shared classifier's intent and current workload holder. */
+	intended?: boolean;
+	holder?: string | null;
 }
 /** One step of the fake omp's script (surface/test/fake-omp.ts header). */
 export type FakeStep =
@@ -247,6 +250,12 @@ export type FakeStep =
 /** The fake omp's script (surface/test/fake-omp.ts header). */
 export interface FakeScript {
 	claim?: boolean;
+	/** Claim only after stdin EOF, deterministically later than the runner's first state decision. */
+	claimOnEof?: boolean;
+	/** Exit on EOF without the extension shutdown, to exercise the runner's late-claim release. */
+	shutdownOnEof?: boolean;
+	/** Record the real shared exit classifier's answer at EOF before the extension shuts down. */
+	inspectEofIntent?: boolean;
 	noSession?: boolean;
 	/** get_state's `data.model` instead of the one `--model` names; null: no model at all (MIGRATION.md item 85). */
 	stateModel?: { provider?: string; id?: string } | null;
@@ -254,6 +263,11 @@ export interface FakeScript {
 	stateFail?: boolean;
 	/** get_state answers this many ms late. */
 	stateDelayMs?: number;
+	/** Hold the state response until the test creates this file (fresh eligibility changes after spawn). */
+	stateWaitUntil?: string;
+	/** Reject set_model, or acknowledge it without changing the reported model. */
+	setModelFail?: boolean;
+	setModelUnconfirmed?: boolean;
 	steps?: FakeStep[];
 	/** The n-th turn (prompt or woken turn) runs `prompts[n]`, falling back to `steps`. */
 	prompts?: FakeStep[][];
@@ -419,11 +433,13 @@ function rootControl(r: LaneRoot): ControlEntry[] {
  * launch-failed: for a starter that failed after its reservation), every runner process is gone, every runner
  * that wrote its own lane-exit: has its `spawned` line, and every spawned drain has logged its end and is
  * gone. Repeated until a pass finds no new launch and no new drain, since a drain's lane spawns its own drain.
+ * `syntheticExits` names only ledger-only fixture exits with no runner to spawn a drain; all real processes
+ * and all drains (including any unexpectedly spawned by a synthetic lane) still have to settle.
  * When a wait fails (its timeout, or an unreadable ledger), every runner and drain of the root still alive is
  * SIGKILLed and waited for until it is gone, then the failure is rethrown: the caller removes the root only
  * after this returns or rejects, so no process it waited on outlives its root.
  */
-export async function settleDrains(r: LaneRoot, timeoutMs = 60_000): Promise<void> {
+export async function settleDrains(r: LaneRoot, timeoutMs = 60_000, syntheticExits: readonly string[] = []): Promise<void> {
 	if (!existsSync(r.ledgerPath)) return;
 	const deadline = Date.now() + timeoutMs;
 	const left = () => Math.max(1_000, deadline - Date.now());
@@ -439,7 +455,7 @@ export async function settleDrains(r: LaneRoot, timeoutMs = 60_000): Promise<voi
 				const pid = laneStarted(control, laneId)?.runnerPid;
 				if (pid) await until(`runner ${pid} gone`, () => !alive(pid), left());
 			}
-			for (const c of control) if (c.prefix === "lane-exit" && c.createdBy === "lane-runner") await drainOf(r, c.laneId!, left());
+			for (const c of control) if (c.prefix === "lane-exit" && c.createdBy === "lane-runner" && !syntheticExits.includes(c.laneId!)) await drainOf(r, c.laneId!, left());
 			const spawned = drainsSpawned(r);
 			for (const d of spawned) await drainEnded(r, d.pid, left());
 			const now = `${control.filter((c) => c.prefix === "launch").length} ${spawned.length}`;

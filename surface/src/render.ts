@@ -24,6 +24,7 @@ import { pairOfferLine, shownOptions } from "./pair-suggest";
 import { Numbering } from "./numbering";
 import { currentGoals, parseAudit, rankDay, rankOpen } from "./rank";
 import { LAST_N, LEDGER_TOOL, STANDING_WORKLOAD_ID } from "./types";
+import { waitingLane } from "./lab-wait";
 
 export interface RenderOptions {
 	now?: string;
@@ -112,7 +113,8 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 		const c = ceilingOf(ledger, workload.id);
 		out.push(`spent $${Number(spend.usd.toFixed(2))} of $${Number(c.usd.toFixed(2))} · ${Number(spend.wallMin.toFixed(1))} of ${c.wallMin} min`);
 	}
-	const lane = workload.holder ? `${workload.holder} (lease until ${workload.holder_lease_until ?? "none"})` : "none";
+	const lane = waitingLane(workload, ledger.entries(workload.id, "assumption"), ledger.instructions(workload.id))
+		?? (workload.holder ? `${workload.holder} (lease until ${workload.holder_lease_until ?? "none"})` : "none");
 	out.push(`opened ${when(workload.created_at)} by ${workload.created_by}; last activity ${when(workload.last_activity_at)}; lane: ${lane}`);
 	if (workload.mode === "user-driven" && !due && !workload.holder) out.push(`by hand: \`${byHandLine(workload.id)}\``);
 	out.push(`slices: ${slices.length === 0 ? "none open" : ""}`);
@@ -164,7 +166,8 @@ function title(brief: string): string {
 export function workloadLine(ledger: Ledger, w: InFlightWorkload, lines: readonly ErrorLine[]): string {
 	const { workload, slices, openQuestions, pendingMessages } = w;
 	const due = parseDue(workload.brief);
-	const parts = [`- ${workload.id}${due ? ` (scheduled, due ${due.due})` : ""}: ${title(workload.brief)}`, oneLinerCore(ledger, workload), `lane: ${workload.holder ?? "none"}`];
+	const lane = waitingLane(workload, ledger.entries(workload.id, "assumption"), ledger.instructions(workload.id)) ?? workload.holder ?? "none";
+	const parts = [`- ${workload.id}${due ? ` (scheduled, due ${due.due})` : ""}: ${title(workload.brief)}`, oneLinerCore(ledger, workload), `lane: ${lane}`];
 	const states = new Map<string, number>();
 	for (const s of slices) states.set(s.state, (states.get(s.state) ?? 0) + 1);
 	parts.push(`slices: ${states.size === 0 ? "none open" : [...states].map(([state, n]) => `${n} ${state}`).join(", ")}`);

@@ -21,6 +21,7 @@ import {
 import { rankGate, readRankConfig, writePickSnapshot } from "../src/rank-launch";
 import { surfaceSession } from "../src/session";
 import { DUE_PREFIX, LAUNCH_LANE_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult } from "../src/types";
+import { type LabWaitContext, labOut, readLabWaitContext, recordLabWait, waitLine } from "../src/lab-wait";
 
 const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text: t }], details });
 const inactive = text("This session is not the orchestrator surface; nothing was written.");
@@ -37,15 +38,29 @@ export interface LaunchOutcome {
 	line: string | null;
 }
 
+export interface LaunchOptions {
+	/** A tick shares this snapshot across all candidates and both of its pre-checks. */
+	wait?: LabWaitContext;
+	toldWaits?: Set<string>;
+}
+
 /**
  * Run the predicate for one workload and exec the starter when it says launch. `who` is the
  * `requested-by` the starter records. Never throws: an exec failure is a line.
  */
-export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, workloadId: string, who: string): Promise<LaunchOutcome> {
+export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, workloadId: string, who: string, options: LaunchOptions = {}): Promise<LaunchOutcome> {
 	const rows = ledger.launchRows(workloadId, laneCap(env));
 	if (!rows) return { attempted: false, code: null, line: `no workload ${workloadId}` };
-	const verdict = rankGate(ledger, rows, readRankConfig(env));
+	const wait = options.wait ?? readLabWaitContext(ledger, env);
+	const waiting = (out: { model: string; reason: string }, attempted: boolean, code: number | null): LaunchOutcome => {
+		const standing = recordLabWait(ledger, workloadId, out.model, out.reason);
+		if (standing) options.toldWaits?.add(standing.entryId);
+		return { attempted, code, line: standing ? waitLine(workloadId, standing) : null };
+	};
+	const verdict = rankGate(ledger, rows, readRankConfig(env), wait);
 	if (!verdict.launch) {
+		const out = labOut(verdict.reason);
+		if (out) return waiting(out, false, null);
 		switch (verdict.reason) {
 			case "standing":
 			case "due":
@@ -80,6 +95,9 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 		// The reservation's own gate run binds: a higher-ranked workload that became launchable after the pre-check queues this one.
 		const below = r.code === STARTER_EXIT["not-launchable"] ? /not launched: ranked: below (\S+)$/.exec(last) : null;
 		if (below) return { attempted: true, code: r.code, line: queuedLine(workloadId, below[1]!) };
+		const bindingOut = r.code === STARTER_EXIT["not-launchable"] ? /not launched: (lab-out: [\s\S]+)$/.exec(last) : null;
+		const outWait = bindingOut ? labOut(bindingOut[1]!) : null;
+		if (outWait) return waiting(outWait, true, r.code);
 		return { attempted: true, code: r.code, line: r.code === 0 ? `${workloadId}: ${last}` : `${workloadId}: launch failed (starter exit ${r.code}): ${last}` };
 	} catch (err) {
 		return { attempted: true, code: null, line: `${workloadId}: the starter could not be run: ${String(err)}` };
@@ -92,9 +110,9 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
  * execs only on a launch verdict, so a refused workload — a queued one included — costs one read per
  * poll and no process. Null when there is no such workload.
  */
-export function launchVerdict(ledger: Ledger, env: Record<string, string | undefined>, workloadId: string): LaunchVerdict | null {
+export function launchVerdict(ledger: Ledger, env: Record<string, string | undefined>, workloadId: string, wait: LabWaitContext = readLabWaitContext(ledger, env)): LaunchVerdict | null {
 	const rows = ledger.launchRows(workloadId, laneCap(env));
-	return rows && rankGate(ledger, rows, readRankConfig(env));
+	return rows && rankGate(ledger, rows, readRankConfig(env), wait);
 }
 
 export default function launchRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
@@ -149,7 +167,7 @@ export default function launchRow(pi: SurfaceAPI, env: Record<string, string | u
 				if (model !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: laneModelBody(model, now) });
 				return ledger.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: launchRequestedBody("jo", now, reason ?? undefined) });
 			});
-			const outcome = await triggerLaunch(pi, ledger, env, id, "jo");
+			const outcome = await triggerLaunch(pi, ledger, env, id, "jo", { toldWaits: s.toldWaits });
 			pi.appendEntry("surface-launch", { id, requestId, code: outcome.code });
 			return text(`Recorded launch request ${requestId} on ${id}${model !== null ? ` with lane model ${model}` : ""}.${outcome.line ? ` ${outcome.line}` : ""}`, { id, requestId, code: outcome.code, attempted: outcome.attempted });
 		},

@@ -400,12 +400,12 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 	 * Run the launch trigger once per workload the applied commands hand on, appending its line to the last echo for that workload; a trigger that throws is named there, the commands being applied already.
 	 * A trigger that launched nothing adds no line to a workload whose echoes already carry its by-hand command as a line (a pair receipt, D6).
 	 */
-	const launchAfter = async (ledger: Ledger, echoes: Echo[]): Promise<void> => {
+	const launchAfter = async (ledger: Ledger, echoes: Echo[], s: SurfaceSession): Promise<void> => {
 		for (const wl of [...new Set(echoes.map((e) => e.wl).filter((wl) => wl !== null))]) {
 			const last = echoes.findLast((e) => e.wl === wl)!;
 			const byHand = echoes.some((e) => e.wl === wl && e.line.split("\n").includes(byHandLine(wl)));
 			try {
-				const launched = await triggerLaunch(pi, ledger, env, wl, "jo");
+				const launched = await triggerLaunch(pi, ledger, env, wl, "jo", { toldWaits: s.toldWaits });
 				if (launched.line && !(byHand && !launched.attempted)) last.line += `; ${launched.line}`;
 			} catch (err) {
 				last.line += `; applied, but the launch on ${wl} after it failed: ${String(err)}`;
@@ -496,7 +496,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				else echo(s, ctx, text, [`could not apply "${text}": ${reason(err)}`], "warning");
 				return undefined;
 			}
-			await launchAfter(ledger, echoes);
+			await launchAfter(ledger, echoes, s);
 			echo(s, ctx, text, (await copyPair(ctx, echoes)).map((e) => e.line), "info");
 			return undefined;
 		}
@@ -512,7 +512,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				// D4: all-or-nothing, one transaction; each answer through apply(), so each is its own ledger row.
 				const heartbeatOf = runHeartbeat(env);
 				const echoes: Echo[] = ledger.write(() => batch.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, heartbeatOf)}`, pair: pairOf(cmd) })));
-				await launchAfter(ledger, echoes);
+				await launchAfter(ledger, echoes, s);
 				lines = (await copyPair(ctx, echoes)).map((e) => e.line);
 			} catch (err) {
 				lines = [`could not apply "${text}": ${reason(err)}`];
@@ -538,7 +538,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				return undefined;
 			}
 			const echoes = [ledger.write(() => applyOne(ledger, cmd, heartbeatOf, ctx.cwd))];
-			await launchAfter(ledger, echoes);
+			await launchAfter(ledger, echoes, s);
 			receipt = (await copyPair(ctx, echoes))[0]!.line;
 		} catch (err) {
 			receipt = `could not apply "${text}": ${reason(err)}`;

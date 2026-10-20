@@ -253,7 +253,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			const row = ledger.workload(id)!;
 			// Jev rank (PLAN wl-mv8k039gvogt8g D4): the new workload's signal is asked in the background and written on its own; a throwing or hanging judge never fails or delays the open.
 			void askAtOpen(ledger, id, deps, ctx, (line) => process.stderr.write(`surface: ${line}\n`));
-			const launch = await triggerLaunch(pi, ledger, env, id, "open");
+			const launch = await triggerLaunch(pi, ledger, env, id, "open", { toldWaits: s.toldWaits });
 			const lines = [
 				`Opened ${id} on ${repo}.`,
 				`done: ${done}`,

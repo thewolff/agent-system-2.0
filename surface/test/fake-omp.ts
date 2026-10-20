@@ -38,6 +38,12 @@
 //                                `set_model` frame replaces it (PLAN wl-mv71x5rwdu7eo0 § 4), as omp's does
 //     stateFail?: true,            get_state answers `success: false` with no data
 //     stateDelayMs?: n,            get_state answers n ms late
+//     stateWaitUntil?: path,       hold get_state until the test creates path (deterministic fresh-row changes)
+//     setModelFail?: true,         reject set_model without changing the model
+//     setModelUnconfirmed?: true,  acknowledge set_model but keep reporting the old model
+//     claimOnEof?: true,           defer the real session_start/claim until stdin EOF (after the runner's decision)
+//     shutdownOnEof?: false,       exit after EOF without session_shutdown (runner must release a late claim)
+//     inspectEofIntent?: true,     record the shared classifier's answer at EOF, before session_shutdown
 //     ignoreAbort?: true,          keep running after an abort frame (the runner's kill path)
 //     ignoreEof?: true,            keep running after stdin EOF too (the runner's bounded SIGKILL, B4)
 //     ignoreTerm?: true,           record SIGTERM and keep running (a child the by-hand stop must escalate on, review 2 R1)
@@ -62,7 +68,8 @@ import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import orchestratorSurface from "../index";
-import { ctxOf, type FakeScript, type FakeStep, fakePi } from "./helpers";
+import { ctxOf, type FakeScript, type FakeStep, fakePi, until } from "./helpers";
+import { controlEntries, exitClass, holdersOf } from "../src/launch";
 
 const script: FakeScript = process.env.FAKE_OMP_SCRIPT && existsSync(process.env.FAKE_OMP_SCRIPT) ? (JSON.parse(readFileSync(process.env.FAKE_OMP_SCRIPT, "utf8")) as FakeScript) : { steps: [] };
 const argv = process.argv.slice(2);
@@ -129,7 +136,7 @@ const shutdown = async (): Promise<void> => {
 };
 
 emit({ type: "ready", protocolVersion: 1, fake: true });
-if (script.claim !== false) await f.emit("session_start", { type: "session_start" }, ctx);
+if (script.claim !== false && !script.claimOnEof) await f.emit("session_start", { type: "session_start" }, ctx);
 
 /** The current prompt ended on an abort, the max-time or a result step: the rest of its steps are skipped. */
 let aborted = false;
@@ -311,6 +318,7 @@ for (;;) {
 			recordLine({ command: o.type, id: o.id, ...(o.type === "set_model" ? { provider: o.provider, modelId: o.modelId } : {}) });
 		}
 		if (o.type === "get_state") {
+			if (script.stateWaitUntil) await until("the test's state response gate", () => existsSync(script.stateWaitUntil!));
 			const state = { ...(stateModel ? { model: stateModel } : {}), isSettled: !running && !backgroundPending && !woken };
 			const reply = script.stateFail
 				? { id: o.id, type: "response", command: "get_state", success: false, error: "fake get_state failure" }
@@ -322,8 +330,10 @@ for (;;) {
 			else emit(reply);
 		} else if (o.type === "set_model") {
 			// omp://rpc.md § Model: `{ type: "set_model", provider, modelId }` answers with the selected Model.
-			stateModel = { provider: String(o.provider ?? ""), id: String(o.modelId ?? "") };
-			emit({ id: o.id, type: "response", command: "set_model", success: true, data: stateModel });
+			if (!script.setModelFail && !script.setModelUnconfirmed) stateModel = { provider: String(o.provider ?? ""), id: String(o.modelId ?? "") };
+			emit(script.setModelFail
+				? { id: o.id, type: "response", command: "set_model", success: false, error: "fake set_model refusal" }
+				: { id: o.id, type: "response", command: "set_model", success: true, data: stateModel });
 		} else if (o.type === "prompt") {
 			const message = String(o.message ?? "");
 			recordLine({ event: "prompt", id: o.id, message });
@@ -344,6 +354,21 @@ for (;;) {
 }
 eofSeen = true;
 recordLine({ event: "eof" });
+if (script.claimOnEof) await f.emit("session_start", { type: "session_start" }, ctx);
+if (script.claimOnEof || script.inspectEofIntent) {
+	const ledger = Ledger.open(defaultLedgerPath(process.env));
+	try {
+		const wl = process.env.AGENT_SYSTEM_WORKLOAD_ID!;
+		const laneId = process.env.AGENT_SYSTEM_LANE_ID!;
+		const w = ledger.workload(wl);
+		const entries = ledger.entries(wl);
+		const intended = exitClass(controlEntries(entries, holdersOf(entries, w?.holder ?? null)), laneId) === "intended";
+		recordLine({ event: script.claimOnEof ? "late-claim" : "shutdown-intent", intended, holder: w?.holder ?? null });
+	} finally {
+		ledger.close();
+	}
+}
+if (script.shutdownOnEof === false) process.exit(0);
 if (backgroundPending) recordLine({ event: "background-killed" });
 if (script.ignoreEof) await new Promise<never>(() => undefined);
 if (script.eofDelayMs) await Bun.sleep(script.eofDelayMs);

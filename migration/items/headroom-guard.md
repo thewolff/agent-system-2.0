@@ -38,3 +38,5 @@ The replacement uses `decisionFor` and exceptional-admission `retained` notes in
 **Install.** The guard runs from the repo. The tier-row change reaches lanes when the profile is installed after merge.
 
 **Rollback.** Revert the original PR to reverse this historical delivery. The `limits` field in `watch.py` is harmless to leave in place. Reversing the window-scaled replacement means reverting its own PR; any live stopgap edit remains a separate Plumb action, as documented in the successor's **Rollback** section.
+
+Normal autonomous unnamed lanes wait for their own lab instead of moving: [Normal lanes wait for their own lab](normal-lanes-wait-for-lab.md).

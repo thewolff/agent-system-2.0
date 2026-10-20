@@ -1089,6 +1089,7 @@ contract/output-types-incidents.md	doc	-
 voice/VOICE.md	doc	-
 voice/agent-collaboration-with-adhd-and-autism.md	doc	-
 surface/src/launch.ts	module	-
+surface/src/lab-wait.ts	module	-
 surface/extensions/launch.ts	module	-
 surface/extensions/lane-tools.ts	module	-
 surface/scripts/lane.ts	module	-
@@ -1097,6 +1098,7 @@ surface/test/lane-tools.test.ts	test	-
 ledger/test/lane.test.ts	test	-
 surface/test/fake-omp.ts	test	-
 surface/test/launch.test.ts	test	-
+surface/test/lab-wait.test.ts	test	-
 surface/test/lane-script.test.ts	test	-
 surface/test/lane-live-lane.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-

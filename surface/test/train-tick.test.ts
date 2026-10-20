@@ -12,6 +12,7 @@ import { type GhResult, tick } from "../scripts/train-tick";
 import { type Ceiling, ceilingBody, type Spend, spendBody } from "../src/ceiling";
 import { errorLines } from "../src/errors";
 import { controlEntries, decideLaunch, laneExitBody, launchFailedBody, trainBoardBody } from "../src/launch";
+import { readLabWaitContext } from "../src/lab-wait";
 import {
 	fixBindings, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainPrs, trainRetries, trainSliceId,
 } from "../src/merge-train";
@@ -806,7 +807,8 @@ describe("the relaunch loop, replaying wl-mvggzumu8zs5xc (PLAN wl-mvgn310dpi5gcg
 		const drained: string[] = [];
 		/** The drain a minute after a tick: `reserveLane`'s own predicate serves a pending request; the lane does the incident's pass. */
 		const drain = () => {
-			const r = w.ledger.reserveLane(w.train, { by: LANE_STARTER_BY, cap: 10, leaseMs: 3 * MIN, requestedBy: LANE_RUNNER_BY, decide: decideLaunch });
+			const wait = readLabWaitContext(w.ledger);
+			const r = w.ledger.reserveLane(w.train, { by: LANE_STARTER_BY, cap: 10, leaseMs: 3 * MIN, requestedBy: LANE_RUNNER_BY, decide: (rows) => decideLaunch(rows, wait) });
 			if (!r.ok) return;
 			drained.push(w.c.now());
 			// the pass-over only inside a longer note (review r1 #3), then lane_release with #101 open, then the runner's exit
@@ -836,7 +838,8 @@ describe("the relaunch loop, replaying wl-mvggzumu8zs5xc (PLAN wl-mvgn310dpi5gcg
 		const w = settledWorld();
 		const launch = (wl: string) => {
 			if (w.offset(w.c.now()) < 20) return CAP;
-			const r = w.ledger.reserveLane(wl, { by: LANE_STARTER_BY, cap: 10, leaseMs: 3 * MIN, requestedBy: MERGE_TRAIN_BY, decide: decideLaunch });
+			const wait = readLabWaitContext(w.ledger);
+			const r = w.ledger.reserveLane(wl, { by: LANE_STARTER_BY, cap: 10, leaseMs: 3 * MIN, requestedBy: MERGE_TRAIN_BY, decide: (rows) => decideLaunch(rows, wait) });
 			return r.ok ? { code: 0, line: `launched ${r.laneId}` } : { code: 1, line: r.reason };
 		};
 		w.at(0);

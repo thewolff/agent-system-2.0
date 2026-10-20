@@ -72,6 +72,8 @@ import { recordLapsedLeases } from "../src/signals";
 import type { ResultTextConstructor, ResultTextLoader } from "../src/types";
 import { type Ctx, HOLD_HOURS, type HostMessage, LEDGER_TOOL, PUSH_TRIES, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
 import { launchVerdict, triggerLaunch } from "./launch";
+import { labOut, readLabWaitContext, reconcileLabWait, recordLabWait, standingWait, waitLine, waits } from "../src/lab-wait";
+import { controlEntries } from "../src/launch";
 import { showPending } from "./surface-input";
 import { closeWorkloadWithEntry } from "./workload";
 
@@ -399,10 +401,18 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		s.launching = true;
 		try {
 			const ledger = s.ledger();
+			const wait = readLabWaitContext(ledger, env);
 			for (const w of ledger.inFlight()) {
 				const id = w.workload.id;
 				if (id === STANDING_WORKLOAD_ID) continue;
-				const verdict = launchVerdict(ledger, env, id);
+				let standing = reconcileLabWait(ledger, id, wait);
+				const verdict = launchVerdict(ledger, env, id, wait);
+				const out = verdict?.launch === false ? labOut(verdict.reason) : null;
+				if (out) standing = recordLabWait(ledger, id, out.model, out.reason);
+				if (standing && !s.toldWaits.has(standing.entryId)) {
+					s.toldWaits.add(standing.entryId);
+					tick(s, ctx, `tick: ${waitLine(id, standing)}`);
+				}
 				if (verdict?.launch === false && verdict.reason === "awaiting-close") {
 					const { open_slices: open, paused_slices: paused, open_questions: questions } = w.workload;
 					if (open > 0 || paused > 0 || questions > 0) {
@@ -437,7 +447,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				s.stuckFinished.delete(id);
 				s.refusedClose.delete(id);
 				if (!verdict?.launch) continue;
-				const r = await triggerLaunch(pi, ledger, env, id, "tick");
+				const r = await triggerLaunch(pi, ledger, env, id, "tick", { wait, toldWaits: s.toldWaits });
 				if (r.line) tick(s, ctx, `tick: ${r.line}`);
 			}
 		} catch (err) {
@@ -484,6 +494,14 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	pi.on("session_start", (_e, ctx) => {
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
+		// Initial waits are already in the wake render; a runner entry arriving after this seed is news at the next poll.
+		const ledger = s.ledger();
+		for (const { workload } of ledger.inFlight()) {
+			const entries = ledger.entries(workload.id, "assumption");
+			const control = controlEntries(entries);
+			const standing = standingWait(control);
+			if (standing && waits(workload, control, entries, ledger.instructions(workload.id))) s.toldWaits.add(standing.entryId);
+		}
 		// Launched by bin/as2: the base prompt already carries the voice and the contract, so no push inlines them.
 		const base = ctx.getSystemPrompt?.() ?? [];
 		if (voiceInPrompt(base) && base.some((p) => p.includes(CONTRACT_MARKER))) {

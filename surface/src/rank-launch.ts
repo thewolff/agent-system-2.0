@@ -5,8 +5,8 @@
 //
 // `rankGate` is composed into the starter's `decideLaunch` (surface/scripts/lane.ts `reserveOrExit`), so it runs inside
 // `reserveLane`'s transaction for the drain, the open tool and the wake tick alike; the surface runs it again as its own
-// pre-check (surface/extensions/launch.ts). Jo's word is never gated: an unconsumed `launch-requested:` admits at once,
-// with cause `request <id>` so the reservation consumes it, and `decideInteractive` never calls the gate.
+// pre-check (surface/extensions/launch.ts). Jo's word bypasses ranking, not the lab gate: an unconsumed `launch-requested:`
+// admits with cause `request <id>` only after the shared quota verdict passes; `decideInteractive` never calls the gate.
 //
 // Every function here reads ledger rows and, for the parallel rule's file check, asks git for a repository's identity.
 // Nothing here writes, except `writePickSnapshot`, which its callers run inside their own pick transaction.
@@ -22,6 +22,7 @@ import { readPairSuggestConfig } from "./pair-suggest";
 import { currentGoals, formatShown, rankOpen, type RankItem, rankPick } from "./rank";
 import { parseTestRequested } from "./test-run";
 import { RANK_BY, STANDING_WORKLOAD_ID } from "./types";
+import type { LabWaitContext } from "./lab-wait";
 
 // ---- the switch (D7) -----------------------------------------------------------------------------------------------
 
@@ -74,12 +75,12 @@ export function pendingRequest(rows: ReserveRows): string | null {
  * the workload is refused `ranked: below <wl>` while a higher-ranked workload is launchable now, and under `parallel`
  * refused `parallel: <reason>` when `parallelVerdict` holds it.
  */
-export function rankGate(ledger: Ledger, rows: ReserveRows, config: RankConfig): LaunchVerdict {
-	const v = verdictOf(rows);
+export function rankGate(ledger: Ledger, rows: ReserveRows, config: RankConfig, wait: LabWaitContext): LaunchVerdict {
+	const v = verdictOf(rows, wait);
 	if (config.mode === "show" || !v.launch) return v;
 	const request = pendingRequest(rows);
 	if (request !== null) return { launch: true, cause: { kind: "request", id: request } };
-	const above = higherLaunchable(ledger, rows.workload.id, rows.now, rows.cap, config);
+	const above = higherLaunchable(ledger, rows.workload.id, rows.now, rows.cap, config, wait);
 	if (above !== null) return { launch: false, reason: `ranked: below ${above}` };
 	if (config.mode === "parallel") {
 		const p = parallelVerdict(ledger, rows.workload.id, rows.now, config);
@@ -89,9 +90,9 @@ export function rankGate(ledger: Ledger, rows: ReserveRows, config: RankConfig):
 }
 
 /** `rankGate` in `reserveLane`'s verdict shape: what the starter composes into `decideLaunch` (in `show`, `decideLaunch` itself). */
-export function decideRanked(ledger: Ledger, rows: ReserveRows, config: RankConfig): ReserveVerdict {
-	if (config.mode === "show") return decideLaunch(rows);
-	const v = rankGate(ledger, rows, config);
+export function decideRanked(ledger: Ledger, rows: ReserveRows, config: RankConfig, wait: LabWaitContext): ReserveVerdict {
+	if (config.mode === "show") return decideLaunch(rows, wait);
+	const v = rankGate(ledger, rows, config, wait);
 	return v.launch ? { launch: true, cause: causeText(v.cause) } : v;
 }
 
@@ -99,12 +100,12 @@ export function decideRanked(ledger: Ledger, rows: ReserveRows, config: RankConf
  * The first workload ranked above `workloadId` that is launchable now (`launchRows` + `verdictOf`), or null. Under
  * `parallel` a higher workload the parallel rule holds does not block the ones below it: the drain tries the next.
  */
-function higherLaunchable(ledger: Ledger, workloadId: string, now: string, cap: number, config: RankConfig): string | null {
+function higherLaunchable(ledger: Ledger, workloadId: string, now: string, cap: number, config: RankConfig, wait: LabWaitContext): string | null {
 	for (const item of rankOpen(ledger, now)) {
 		if (item.workloadId === workloadId) return null;
 		if (item.state === "running" || item.mode !== "autonomous") continue;
 		const rows = ledger.launchRows(item.workloadId, cap);
-		if (!rows || !verdictOf(rows).launch) continue;
+		if (!rows || !verdictOf(rows, wait).launch) continue;
 		if (config.mode === "parallel" && parallelVerdict(ledger, item.workloadId, now, config).verdict === "hold") continue;
 		return item.workloadId;
 	}
@@ -243,12 +244,12 @@ export function parallelRead(ledger: Ledger, now: string, items: readonly RankIt
  * would have tried first among the workloads not yet tried (`rankOpen` order, the first one `launchable` admits) and
  * its parallel verdict. `rank-shadow <pid> picked <wl> ranked-would <wl|none> parallel <start|hold (<reason>)|->`.
  */
-export function rankShadowLine(ledger: Ledger, pid: number, picked: string, tried: ReadonlySet<string>, cap: number, config: RankConfig): string {
+export function rankShadowLine(ledger: Ledger, pid: number, picked: string, tried: ReadonlySet<string>, cap: number, config: RankConfig, wait: LabWaitContext): string {
 	const now = ledger.now();
 	const would = drainOrder(ledger, now).find((id) => {
 		if (tried.has(id)) return false;
 		const rows = ledger.launchRows(id, cap);
-		return rows !== null && verdictOf(rows).launch;
+		return rows !== null && verdictOf(rows, wait).launch;
 	}) ?? null;
 	let parallel = "-";
 	if (would !== null) {

@@ -22,6 +22,7 @@ import { labOf } from "../../classifier/src/lab";
 import {
 	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
 } from "./types";
+import { labGate, type LabWaitContext } from "./lab-wait";
 
 // ---- knobs -------------------------------------------------------------------------------------
 
@@ -84,7 +85,7 @@ export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
-	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr", "waive-pr", "train",
+	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "lab-wait", "superseded", "pair-taken", "test-pr", "waive-pr", "train",
 	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-notice", "train-autoboard",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
@@ -136,6 +137,8 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * `lane-headroom: <laneId> <from> -> <to> (<reason>)` is the runner's alone (PLAN wl-mv71x5rwdu7eo0 § 4, Jo's in-mv8p5m2t005tts and
  * in-mv8qzqym1ihmv4): an unnamed lane whose first `get_state` model was projected out of quota was moved by `set_model` to the
  * strong row's first entry that is not, and OMP confirmed it. It is never Jo's word: `laneModel` reads `lane-model:` only.
+ * `lab-wait: <model> (<guard reason>)` / `lab-wait: <model> clear (<why>)` record a normal lane's wait episode.
+ * Only the surface and runner write them; they are not Jo's named-model instruction.
  * `superseded: <wl-B> <instruction id>` is the surface's alone: Jo's `supersede <wl-A> <wl-B>` (surface/src/input.ts, PLAN
  * wl-mv5i3lulwwbbi8 D2), on A, naming Jo's instruction written first; `supersededBy` reads it and the close takes it in place of a receipt.
  * `pair-taken: <q> by <answer> mode user-driven` is the surface's alone: Jo's `pair` answer on an offered question
@@ -196,6 +199,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"push-dest": [],
 	"lane-model": [SURFACE_BY],
 	"lane-headroom": [LANE_RUNNER_BY],
+	"lab-wait": [SURFACE_BY, LANE_RUNNER_BY],
 	superseded: [SURFACE_BY],
 	"pair-taken": [SURFACE_BY],
 	"test-pr": [SURFACE_BY],
@@ -311,6 +315,7 @@ export type Cause =
 	| { kind: "first" }
 	| { kind: "request"; id: string }
 	| { kind: "resume"; ids: string[] }
+	| { kind: "waited"; laneId: string }
 	| { kind: "interactive" };
 
 export interface Attempt {
@@ -328,6 +333,7 @@ export function causeText(cause: Cause): string {
 		case "interactive": return "interactive";
 		case "request": return `request ${cause.id}`;
 		case "resume": return `resume ${cause.ids.join(" ")}`;
+		case "waited": return `waited ${cause.laneId}`;
 	}
 }
 
@@ -337,6 +343,7 @@ function parseCause(tokens: string[]): Cause | null {
 	if (kind === "interactive" && ids.length === 0) return { kind: "interactive" };
 	if (kind === "request" && ids.length === 1) return { kind: "request", id: ids[0]! };
 	if (kind === "resume" && ids.length >= 1) return { kind: "resume", ids };
+	if (kind === "waited" && ids.length === 1 && /^lane-\S+$/.test(ids[0]!)) return { kind: "waited", laneId: ids[0]! };
 	return null;
 }
 
@@ -438,7 +445,7 @@ export function instructionLine(i: InstructionRow): string {
  * higher-ranked workload is launchable now, `parallel: <reason>` when the parallel rule holds. `launchable` never returns them.
  */
 export type RankRefusal = `ranked: below ${string}` | `parallel: ${string}`;
-export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched" | RankRefusal;
+export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched" | `lab-out: ${string}` | RankRefusal;
 export type LaunchVerdict = { launch: true; cause: Cause } | { launch: false; reason: LaunchReason };
 
 /** A holder under a lease that is null or not yet lapsed at `now`. */
@@ -470,19 +477,22 @@ export function launchable(
 	if (req) return { launch: true, cause: { kind: "request", id: req.id } };
 	const res = resolved.filter((r) => !consumed.has(r.instructionId));
 	if (res.length > 0) return { launch: true, cause: { kind: "resume", ids: res.map((r) => r.instructionId) } };
+	const latest = tried.at(-1)!;
+	if (laneExit(control, latest.laneId)?.outcome === "waiting") return { launch: true, cause: { kind: "waited", laneId: latest.laneId } };
 	return { launch: false, reason: "died-not-relaunched" };
 }
 
 /** The predicate over the rows a launch decision reads (`Ledger.launchRows`): the surface's run and `reserveLane`'s. */
-export function verdictOf(rows: ReserveRows): LaunchVerdict {
+export function verdictOf(rows: ReserveRows, wait: LabWaitContext): LaunchVerdict {
 	const holders = holdersOf(rows.entries, rows.workload.holder, rows.holders);
 	const control = controlEntries(rows.entries, holders);
-	return launchable(rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap);
+	const verdict = launchable(rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap);
+	return verdict.launch ? labGate(rows, wait) ?? verdict : verdict;
 }
 
 /** `reserveLane`'s policy for an autonomous launch: the predicate over the rows the transaction read. */
-export function decideLaunch(rows: ReserveRows): ReserveVerdict {
-	const v = verdictOf(rows);
+export function decideLaunch(rows: ReserveRows, wait: LabWaitContext): ReserveVerdict {
+	const v = verdictOf(rows, wait);
 	return v.launch ? { launch: true, cause: causeText(v.cause) } : v;
 }
 
@@ -542,6 +552,10 @@ export interface LaneStarted {
 	model?: string | null;
 	/** `provider/id` from OMP's `get_state` answer, once it arrived. */
 	ranModel?: string | null;
+	/** The model OMP initially reported, before any move. */
+	startModel?: string | null;
+	/** The workload's own model, which an eligible runner holds it to. */
+	homeModel?: string | null;
 	/** Why the recorded session was not resumed: `<session> ran on <model|default|unknown>` (`resumePlan`). */
 	resumeSkipped?: string | null;
 }
@@ -565,6 +579,7 @@ export function laneStarted(control: readonly ControlEntry[], laneId?: string): 
 				return {
 					laneId: c.laneId, pid: v.pid, start, session, argv: v.argv.map(String), runnerPid,
 					model: stringOrNull(v, "model"), ranModel: stringOrNull(v, "ranModel"), resumeSkipped: stringOrNull(v, "resumeSkipped"),
+					startModel: stringOrNull(v, "startModel"), homeModel: stringOrNull(v, "homeModel"),
 				};
 			}
 		} catch {
@@ -696,10 +711,10 @@ export function stateModelOf(response: Record<string, unknown>): string | null {
  * the rest are deaths. `open-work` is a turn that ended with work open after the continue prompts,
  * or a release that left open slices and no receipt (MIGRATION.md item 40, surface/src/turn-end.ts).
  */
-export const LANE_OUTCOMES = ["completed", "parked", "resume-pending", "stop", "released", "interactive", "deadline", "aborted", "error", "open-work", "died", "never-ready"] as const;
+export const LANE_OUTCOMES = ["completed", "parked", "resume-pending", "stop", "released", "interactive", "waiting", "deadline", "aborted", "error", "open-work", "died", "never-ready"] as const;
 export type LaneOutcome = (typeof LANE_OUTCOMES)[number];
 export const INTENDED_OUTCOMES: Record<LaneOutcome, boolean> = {
-	completed: true, parked: true, "resume-pending": true, stop: true, released: true, interactive: true,
+	completed: true, parked: true, "resume-pending": true, stop: true, released: true, interactive: true, waiting: true,
 	deadline: false, aborted: false, error: false, "open-work": false, died: false, "never-ready": false,
 };
 /**

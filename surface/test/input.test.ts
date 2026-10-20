@@ -20,6 +20,7 @@ import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
 import { testRequestedBody } from "../src/test-run";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
+import { readLabWaitContext } from "../src/lab-wait";
 
 /**
  * A plan-first workload held by lane-a whose plan slice raised the plan question (decision 15), with
@@ -1034,7 +1035,7 @@ describe("cancel-slice (PLAN wl-mv5i3lulwwbbi8 D1)", () => {
 		expect(ledger.question(q)!.state).toBe("withdrawn");
 		expect(ledger.slice(sl)!.state).toBe("cancelled");
 		expect(launchRequests(ledger, wl)).toEqual([expect.stringMatching(new RegExp(`^launch-requested: by jo at \\S+ \\(cancel-slice ${sl}\\)$`))]);
-		expect(verdictOf(ledger.launchRows(wl, 3)!)).toMatchObject({ launch: true, cause: { kind: "request" } });
+		expect(verdictOf(ledger.launchRows(wl, 3)!, readLabWaitContext(ledger))).toMatchObject({ launch: true, cause: { kind: "request" } });
 	});
 
 	test("while a lane holds the workload live, the question is withdrawn and no relaunch is asked", () => {

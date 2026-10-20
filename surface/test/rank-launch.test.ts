@@ -23,6 +23,7 @@ import * as laneScript from "../scripts/lane";
 import {
 	ctxOf, drainLinesOf, drainLog, fakePi, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh, tempLedger, tempRepo, tmp,
 } from "./helpers";
+import { readLabWaitContext } from "../src/lab-wait";
 
 const REPO = resolve(import.meta.dir, "..", "..");
 const SHOW: RankConfig = { mode: "show", parallelBudgetUsd: 0 };
@@ -316,12 +317,12 @@ describe("T16 order gate", () => {
 		open("hi", { unblocks: 0.9 });
 		const req = request(l, lo);
 		const rows = l.launchRows(lo, 3)!;
-		expect(verdictOf(rows)).toEqual({ launch: true, cause: { kind: "first" } });
+		expect(verdictOf(rows, readLabWaitContext(l))).toEqual({ launch: true, cause: { kind: "first" } });
 		const r = reserve(l, lo, ORDER);
 		expect(r).toEqual({ ok: true, laneId: laneIdOf(lo, 1), cause: `request ${req}` });
 		l.recordEntry({ by: laneIdOf(lo, 1), workloadId: lo, kind: "assumption", body: "done-because: the probe is done" });
 		l.releaseWorkload(lo, { by: laneIdOf(lo, 1), holder: laneIdOf(lo, 1) });
-		expect(verdictOf(l.launchRows(lo, 3)!)).toEqual({ launch: false, reason: "awaiting-close" });
+		expect(verdictOf(l.launchRows(lo, 3)!, readLabWaitContext(l))).toEqual({ launch: false, reason: "awaiting-close" });
 		expect(reserve(l, lo, ORDER)).toEqual({ ok: false, reason: "awaiting-close" });
 		expect(launches(l, lo)).toHaveLength(1);
 	});

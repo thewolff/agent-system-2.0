@@ -113,6 +113,8 @@ export class SurfaceSession {
 	 * notice repeats only when the text changes. Cleared when the workload closes or stops being ready.
 	 */
 	readonly refusedClose = new Map<string, string>();
+	/** Standing lab-wait entry ids already shown in a launch response, tick notice or the session's initial wake. */
+	readonly toldWaits = new Set<string>();
 	/**
 	 * Routine needs-you lines found between wakes and not pushed yet (PLAN wl-mv5msri070p0qo D3), by
 	 * identity (`kind:workloadId:rowId`, surface/src/batch.ts lineKey): pushed as one aside when the

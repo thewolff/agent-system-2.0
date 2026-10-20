@@ -23,6 +23,7 @@ import { SURFACE_BY } from "../src/types";
 import {
 	alive, drainEnded, drainLinesOf, drainSettled, drainsSpawned, type FakeStep, fakeRecords, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh, until,
 } from "./helpers";
+import { readLabWaitContext } from "../src/lab-wait";
 
 const roots: LaneRoot[] = [];
 const makeRoot = (over: Record<string, string> = {}): LaneRoot => {
@@ -1403,7 +1404,7 @@ describe("item 71: a queued launch starts when a lane slot frees (the runner's d
 	const verdict = (r: LaneRoot, wl: string) => {
 		const l = ledgerOf(r);
 		try {
-			return verdictOf(l.launchRows(wl, laneCap(r.env))!);
+			return verdictOf(l.launchRows(wl, laneCap(r.env))!, readLabWaitContext(l, r.env));
 		} finally {
 			l.close();
 		}

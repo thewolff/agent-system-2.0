@@ -10,6 +10,7 @@ import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { applyTrain, interpret } from "../src/input";
 import { decideLaunch, parseTrainBoard } from "../src/launch";
+import { readLabWaitContext } from "../src/lab-wait";
 import { recordTrainTask, TRAIN_ALERT_REPO, type TrainTask } from "../src/merge-train";
 import { makeRunId, testRequestedBody, type TestRun, testRunBody } from "../src/test-run";
 import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
@@ -205,7 +206,8 @@ export function world(prs: readonly number[] = [101, 106]) {
 	/** The fake launcher: lane.ts launch's reservation (decideLaunch consumes the request), with no process behind the lane. */
 	const launch = (wl: string) => {
 		launches.push(wl);
-		const r = ledger.reserveLane(wl, { by: LANE_STARTER_BY, cap: 10, leaseMs: 60_000, requestedBy: MERGE_TRAIN_BY, decide: decideLaunch });
+		const wait = readLabWaitContext(ledger);
+		const r = ledger.reserveLane(wl, { by: LANE_STARTER_BY, cap: 10, leaseMs: 60_000, requestedBy: MERGE_TRAIN_BY, decide: (rows) => decideLaunch(rows, wait) });
 		return r.ok ? { code: 0, line: `launched ${r.laneId}` } : { code: 1, line: r.reason };
 	};
 	const run = () => tick({ ledger, gh: g.gh, launch, notify: (_t, text) => { notes.push(text); return true; } });
@@ -275,7 +277,8 @@ export function boardWorld() {
 	const logs: string[] = [];
 	const launch = (wl: string) => {
 		launches.push(wl);
-		const r = ledger.reserveLane(wl, { by: LANE_STARTER_BY, cap: 10, leaseMs: 60_000, requestedBy: MERGE_TRAIN_BY, decide: decideLaunch });
+		const wait = readLabWaitContext(ledger);
+		const r = ledger.reserveLane(wl, { by: LANE_STARTER_BY, cap: 10, leaseMs: 60_000, requestedBy: MERGE_TRAIN_BY, decide: (rows) => decideLaunch(rows, wait) });
 		return r.ok ? { code: 0, line: `launched ${r.laneId}` } : { code: 1, line: r.reason };
 	};
 	const run = () => tick({ ledger, gh: g.gh, launch, notify: () => true, log: (l) => logs.push(l), config: SERVED });
