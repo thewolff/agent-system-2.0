@@ -167,6 +167,24 @@ function checkedTyped(name: string, q: JudgmentQuestion, raw: unknown): Judgment
 	return { type: "score", score, confidence, probabilities };
 }
 
+/**
+ * Answers already in askJudgment's typed form (a stored answer set, `bool` as `{ type: "bool", bool }`) checked against
+ * `questions` by the rules askJudgment applies to a reply: every question answered whole and of its own type. The
+ * answers, or the reason they are malformed.
+ */
+export function checkJudgmentAnswers(questions: JudgmentQuestions, answers: unknown): Record<string, JudgmentAnswer> | string {
+	if (typeof answers !== "object" || answers === null) return "no answers";
+	const out: Record<string, JudgmentAnswer> = {};
+	for (const [name, q] of Object.entries(questions)) {
+		const raw: unknown = Reflect.get(answers, name);
+		if (typeof raw !== "object" || raw === null || Reflect.get(raw, "type") !== q.type) return `${name}: not a ${q.type} answer`;
+		const a = checkedTyped(name, q, q.type === "bool" ? { noul: Reflect.get(raw, "bool") } : raw);
+		if (typeof a === "string") return a;
+		out[name] = a;
+	}
+	return out;
+}
+
 /** The judge's reply, validated against every question asked; a fake or a broken judge may hand back anything. */
 function validated<A, Q>(
 	reply: ChoiceReply | null | undefined, questions: Record<string, Q>, check: (name: string, q: Q, raw: unknown) => A | string,

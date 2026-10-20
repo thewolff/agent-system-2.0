@@ -1,0 +1,13 @@
+# Filled by install/install.sh --backlog-rank (PLAN D5).
+# A missed calendar elapse catches up when this user timer starts again.
+# User timers require a logged-in user unless linger is already enabled; install never enables it.
+[Unit]
+Description=Hourly wake-up for daily backlog rank
+
+[Timer]
+OnCalendar=*-*-* *:15:00
+Persistent=true
+Unit=as2-backlog-rank.service
+
+[Install]
+WantedBy=timers.target

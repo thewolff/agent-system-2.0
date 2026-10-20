@@ -1,0 +1,372 @@
+== jev typesafe/jev-1.13.0 · today 2026-10-20 · 185 items · goals /Users/jowolff/agent-scratch/agent-system-2.0/rank-1020/GOALS.md ==
+ 1. as2: the review loop can't read Fable's review findings, so it re-runs Fable reviews and the cost data blames Fable (jo-issues#173)  score 0.7
+      goal 2 0.95 ×0.3 · unblocks_jo 0.81 ×0.2 · fixes_breakage 0.89 ×0.15 · urgency 0 (states_deadline 0.03, day none conf 0.96) ×0.2 · cuts_spend 0.79 ×0.15
+ 2. Real-time model routing that weighs each lab's remaining plan quota, task size and quality (jo-issues#7)  score 0.671
+      goal 2 0.97 ×0.3 · unblocks_jo 0.68 ×0.2 · fixes_breakage 0.69 ×0.15 · urgency 0 (states_deadline 0.09, day none conf 0.94) ×0.2 · cuts_spend 0.93 ×0.15
+ 3. A released lane runner must exit, and the wall meter must not count it (jo-issues#47)  score 0.6295
+      goal 1 0.92 ×0.3 · unblocks_jo 0.69 ×0.2 · fixes_breakage 0.93 ×0.15 · urgency 0 (states_deadline 0.03, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+ 4. headroom-skip entry between the Kimi-out rule and hand-spawn stops a same-lab plan review from approving (as2#228)  score 0.614
+      goal 1 0.93 ×0.3 · unblocks_jo 0.84 ×0.2 · fixes_breakage 0.87 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.25 ×0.15
+ 5. Lanes hand unfenced runs to Jo's terminal instead of an outside-the-fence runner (jo-issues#45)  score 0.597
+      goal 1 0.97 ×0.3 · unblocks_jo 0.90 ×0.2 · fixes_breakage 0.71 ×0.15 · urgency 0 (states_deadline 0.04, day none conf 0.99) ×0.2 · cuts_spend 0.13 ×0.15
+ 6. Plumb's subagents run on models from whatever lab Jo specifies (jo-issues#118)  score 0.594
+      goal 2 0.94 ×0.3 · unblocks_jo 0.83 ×0.2 · fixes_breakage 0.26 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.72 ×0.15
+ 7. Answering `cancel` or `accept` reopens the slice instead of settling it; runner-owned slices stay open (as2#226)  score 0.588
+      goal 1 0.94 ×0.3 · unblocks_jo 0.83 ×0.2 · fixes_breakage 0.86 ×0.15 · urgency 0 (states_deadline 0.01, day none conf 1.00) ×0.2 · cuts_spend 0.08 ×0.15
+ 8. as2: check every surface word against the surface before handing it to Jo (Ilex's unchecked pastes kept failing) (jo-issues#161)  score 0.5835
+      goal 1 0.91 ×0.3 · unblocks_jo 0.83 ×0.2 · fixes_breakage 0.81 ×0.15 · urgency 0 (states_deadline 0.31, day none conf 0.57) ×0.2 · cuts_spend 0.16 ×0.15
+ 9. A pushed surface message started a turn that hung with no model request (jo-issues#69)  score 0.5815
+      goal 1 0.97 ×0.3 · unblocks_jo 0.81 ×0.2 · fixes_breakage 0.79 ×0.15 · urgency 0 (states_deadline 0.14, day none conf 1.00) ×0.2 · cuts_spend 0.06 ×0.15
+10. Orchestrator can't ask Jo to approve a reserved action: row 1 wants a QUESTION block, row 15 wants a q-row it has none of (as2#234)  score 0.576
+      goal 1 0.91 ×0.3 · unblocks_jo 0.84 ×0.2 · fixes_breakage 0.77 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.13 ×0.15
+11. ask-graham nudge piles up again: same line injected up to 5x per user message (jo-issues#51)  score 0.5725
+      goal 3 0.78 ×0.3 · unblocks_jo 0.67 ×0.2 · fixes_breakage 0.87 ×0.15 · urgency 0 (states_deadline 0.03, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+12. An open orchestrator question about one workload blocks opening any new workload Jo asks for (as2#232)  score 0.5675
+      goal 1 0.83 ×0.3 · unblocks_jo 0.89 ×0.2 · fixes_breakage 0.80 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.13 ×0.15
+13. as2 merge train: Jo's train N on a production-stakes PR is the merge approval; never ask Jo a second time (jo-issues#155)  score 0.5675
+      goal 1 0.98 ×0.3 · unblocks_jo 0.89 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.06, day none conf 0.70) ×0.2 · cuts_spend 0.13 ×0.15
+14. Gate row 6 holds commands that run nothing (jo-issues#74)  score 0.565
+      goal 1 0.93 ×0.3 · unblocks_jo 0.75 ×0.2 · fixes_breakage 0.78 ×0.15 · urgency 0 (states_deadline 0.06, day none conf 1.00) ×0.2 · cuts_spend 0.12 ×0.15
+15. as2: approving a request whose lane already stopped should say 'closed, nothing to decide' instead of refusing the whole batch (migration item 92) (jo-issues#152)  score 0.5635
+      goal 1 0.86 ×0.3 · unblocks_jo 0.84 ×0.2 · fixes_breakage 0.76 ×0.15 · urgency 0 (states_deadline 0.08, day none conf 0.87) ×0.2 · cuts_spend 0.15 ×0.15
+16. as2 receipts gate (P-11 row 3) fits the orchestrator: stop flagging relayed lane results, the gate's own stub, and grepped files (jo-issues#175)  score 0.562
+      goal 1 0.87 ×0.3 · unblocks_jo 0.75 ×0.2 · fixes_breakage 0.67 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.33 ×0.15
+17. Mode inference matches a bare topic word: a brief about "pair offers" opened user-driven (as2#233)  score 0.562
+      goal 1 0.90 ×0.3 · unblocks_jo 0.82 ×0.2 · fixes_breakage 0.71 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.15 ×0.15
+18. as2: stop asking Jo to approve lane commands whose target is only known at run time (P-11 row 6 reserved actions) (jo-issues#159)  score 0.556
+      goal 1 0.96 ×0.3 · unblocks_jo 0.95 ×0.2 · fixes_breakage 0.33 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 0.96) ×0.2 · cuts_spend 0.19 ×0.15
+19. as2test.test.ts T5 is flaky: it asserts no new as2test-refresh.* dir appears in shared /private/tmp (as2#229)  score 0.5535
+      goal 1 0.93 ×0.3 · unblocks_jo 0.70 ×0.2 · fixes_breakage 0.84 ×0.15 · urgency 0 (states_deadline 0.01, day none conf 1.00) ×0.2 · cuts_spend 0.05 ×0.15
+20. as2: answering pair should tell Jo the next step (as2 lane wl-…) (jo-issues#53)  score 0.5465
+      goal 1 0.80 ×0.3 · unblocks_jo 0.91 ×0.2 · fixes_breakage 0.74 ×0.15 · urgency 0 (states_deadline 0.07, day none conf 0.96) ×0.2 · cuts_spend 0.09 ×0.15
+21. Receipt paths are always absolute, never elided with …/, and the audit flags each elided cite once (jo-issues#177)  score 0.545
+      goal 1 0.73 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.80 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.70 ×0.15
+22. Re-rank all open jo-issues tickets against Jo's top three goals with Jev, Oct 20 at 10 AM PDT (jo-issues#153)  score 0.543
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.29 ×0.15 · urgency 1 (states_deadline 0.94, day oct-20 conf 0.99) ×0.2 · cuts_spend 0.33 ×0.15
+23. as2 merge train auto-board ignores Depends-on (boards onto the newest train) and treats gates/ PRs as normal stakes (jo-issues#158)  score 0.543
+      goal 1 0.88 ×0.3 · unblocks_jo 0.81 ×0.2 · fixes_breakage 0.69 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 0.95) ×0.2 · cuts_spend 0.09 ×0.15
+24. Share as2 with Graham (and maybe Dan): readiness checklist (jo-issues#168)  score 0.541
+      goal 1 0.69 ×0.3 · unblocks_jo 0.66 ×0.2 · fixes_breakage 0.84 ×0.15 · urgency 0 (states_deadline 0.17, day none conf 0.71) ×0.2 · cuts_spend 0.50? ×0.15
+25. wl-mv71x5rwdu7eo0 — Jo (2026-10-13, input in-mv71wv0tc0xo1s): "open a normal workload: cheaper rout… (as2#209)  score 0.54
+      goal 2 0.93 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.20 ×0.15 · urgency 0 (states_deadline 0.10, day none conf 1.00) ×0.2 · cuts_spend 0.88 ×0.15
+26. The lane runner does not follow a session file OMP has moved, and the spend meter counts copied history twice (jo-issues#86)  score 0.54
+      goal 2 0.77 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.90 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 0.99) ×0.2 · cuts_spend 0.50? ×0.15
+27. as2: detect a lane that is alive but making no progress (jo-issues#170)  score 0.5395
+      goal 1 0.94 ×0.3 · unblocks_jo 0.82 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.03, day none conf 0.99) ×0.2 · cuts_spend 0.13 ×0.15
+28. Train lanes write the train-error: pr <n> pass-over inside a longer note, where the tick cannot see it (as2#285)  score 0.5375
+      goal 1 0.91 ×0.3 · unblocks_jo 0.69 ×0.2 · fixes_breakage 0.73 ×0.15 · urgency 0 (states_deadline 0.06, day none conf 0.96) ×0.2 · cuts_spend 0.12 ×0.15
+29. Add GLM (Z.ai) as a fourth lab for review hands (jo-issues#17)  score 0.5375
+      goal 2 0.91 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.23 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.86 ×0.15
+30. Gate row 15 pins the orchestrator's open QUESTION on the newest workload and blocks every working call until Jo answers (jo-issues#61)  score 0.5375
+      goal 1 0.94 ×0.3 · unblocks_jo 0.82 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.20, day none conf 1.00) ×0.2 · cuts_spend 0.11 ×0.15
+31. A review refused at routing still spawns and runs a hand (jo-issues#62)  score 0.533
+      goal 1 0.89 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.87 ×0.15 · urgency 0 (states_deadline 0.07, day none conf 1.00) ×0.2 · cuts_spend 0.23 ×0.15
+32. Lanes add files without install/manifest.tsv rows (jo-issues#87)  score 0.5255
+      goal 1 0.91 ×0.3 · unblocks_jo 0.68 ×0.2 · fixes_breakage 0.70 ×0.15 · urgency 0 (states_deadline 0.11, day none conf 1.00) ×0.2 · cuts_spend 0.07 ×0.15
+33. Tell Jo by code when any paid provider refuses for money (balance, suspension, insufficient-quota 429) (jo-issues#8)  score 0.525
+      goal 1 0.81 ×0.3 · unblocks_jo 0.90 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.10, day none conf 1.00) ×0.2 · cuts_spend 0.18 ×0.15
+34. Paused workloads resume in rank order, by machinery (jo-issues#38)  score 0.525
+      goal 1 0.90 ×0.3 · unblocks_jo 0.83 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.50?, day none conf 0.82) ×0.2 · cuts_spend 0.10 ×0.15
+35. A production review quietly fell to one lab after a relaunch (jo-issues#63)  score 0.524
+      goal 1 0.87 ×0.3 · unblocks_jo 0.81 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.18 ×0.15
+36. Receipts audit: close the evidence gaps that make 24 false flags (jo-issues#176)  score 0.5215
+      goal 1 0.78 ×0.3 · unblocks_jo 0.68 ×0.2 · fixes_breakage 0.87 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.14 ×0.15
+37. wl-mv8cvw0lq3rlds — Jo (2026-10-14, input in-mv8cvpblctusjk): "Open a normal workload: plain `as2` … (as2#192)  score 0.515
+      goal 1 0.69 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.88 ×0.15 · urgency 0 (states_deadline 0.09, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+38. One gate core: OMP extensions call checkToolCall instead of mirroring it, then a Claude Code adapter (jo-issues#113)  score 0.5125
+      goal 1 0.82 ×0.3 · unblocks_jo 0.80 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.05, day none conf 1.00) ×0.2 · cuts_spend 0.21 ×0.15
+39. Test helper tmp() leaks mkdtemp dirs into TMPDIR (jo-issues#15)  score 0.5115
+      goal 1 0.87 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.95 ×0.15 · urgency 0 (states_deadline 0.03, day none conf 1.00) ×0.2 · cuts_spend 0.06 ×0.15
+40. PR #17's open cross-root snapshot finding (jo-issues#85)  score 0.51
+      goal 1 0.93 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.76 ×0.15 · urgency 0 (states_deadline 0.08, day none conf 1.00) ×0.2 · cuts_spend 0.12 ×0.15
+41. Approval questions carry links to the plan being approved (jo-issues#2)  score 0.508
+      goal 1 0.82 ×0.3 · unblocks_jo 0.87 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.08 ×0.15
+42. Ilex can't hand Jo a command even when no lane is free to run it, and doesn't say why (jo-issues#64)  score 0.5035
+      goal 1 0.83 ×0.3 · unblocks_jo 0.81 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.04, day none conf 1.00) ×0.2 · cuts_spend 0.11 ×0.15
+43. wl-mv8k0fby51uakg — Jo (2026-10-14, input in-mv8jz0p1gonklc): "Open a normal workload: OMP harness … (as2#198)  score 0.493
+      goal 1 0.65 ×0.3 · unblocks_jo 0.74 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.09, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+44. The close check counts a relaunched lane's own wake-read or note as replacing its done-because receipt (jo-issues#60)  score 0.492
+      goal 1 0.85 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.78 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.14 ×0.15
+45. Ilex wake: trim dead weight, keep full history (jo-issues#37)  score 0.4915
+      goal 2 0.70 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.12, day none conf 0.99) ×0.2 · cuts_spend 0.71 ×0.15
+46. A parked or exited lane stays "running" in Ilex's status line (jo-issues#76)  score 0.491
+      goal 1 0.82 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.89 ×0.15 · urgency 0 (states_deadline 0.10, day none conf 0.99) ×0.2 · cuts_spend 0.07 ×0.15
+47. Intent recorded as instruction (finding L2) (jo-issues#88)  score 0.4905
+      goal 1 0.84 ×0.3 · unblocks_jo 0.73 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.09, day none conf 1.00) ×0.2 · cuts_spend 0.11 ×0.15
+48. Borrow four cheap Gas Town processes (no always-on agents) (jo-issues#57)  score 0.478
+      goal 2 0.75 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.34 ×0.15 · urgency 0 (states_deadline 0.79, day none conf 0.57) ×0.2 · cuts_spend 0.68 ×0.15
+49. Add a withdraw <workload> word: 3 workloads stuck open with cancelled slices (jo-issues#10)  score 0.4745
+      goal 1 0.68 ×0.3 · unblocks_jo 0.90 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.11 ×0.15
+50. Fetch timeouts re-announce a blocked close: tick dedupe keeps only the last refusal (as2#224)  score 0.4735
+      goal 1 0.79 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.77 ×0.15 · urgency 0 (states_deadline 0.03, day none conf 1.00) ×0.2 · cuts_spend 0.14 ×0.15
+51. "Merged" is not "running": the running checkout sat 18 commits behind main for two days and nobody noticed (jo-issues#67)  score 0.472
+      goal 1 0.84 ×0.3 · unblocks_jo 0.67 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.03, day none conf 1.00) ×0.2 · cuts_spend 0.08 ×0.15
+52. Re-check the 39 open plans written before the machinery-first gate (jo-issues#112)  score 0.4685
+      goal 1 0.75 ×0.3 · unblocks_jo 0.74 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.03, day none conf 1.00) ×0.2 · cuts_spend 0.13 ×0.15
+53. as2: send priority PRs through without waiting behind the merge train (jo-issues#169)  score 0.4665
+      goal 1 0.83 ×0.3 · unblocks_jo 0.88 ×0.2 · fixes_breakage 0.17 ×0.15 · urgency 0 (states_deadline 0.06, day none conf 0.56) ×0.2 · cuts_spend 0.10 ×0.15
+54. A steered lane says nothing until Jo types (jo-issues#83)  score 0.466
+      goal 1 0.69 ×0.3 · unblocks_jo 0.78 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.18 ×0.15
+55. Jev rank runs count as workload activity, so every held line shows the rank run's timestamp (as2#227)  score 0.4655
+      goal 1 0.75 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.80 ×0.15 · urgency 0 (states_deadline 0.03, day none conf 1.00) ×0.2 · cuts_spend 0.13 ×0.15
+56. wl-mv8s939084z1ts — Jo (2026-10-14, input in-mv8s8uyibh3vnk): "Open a normal workload: add a `withd… (as2#207)  score 0.461
+      goal 1 0.50? ×0.3 · unblocks_jo 0.67 ×0.2 · fixes_breakage 0.68 ×0.15 · urgency 0 (states_deadline 0.10, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+57. Gate row 10 refuses read-only sqlite3 -readonly calls that use -separator or -header (jo-issues#68)  score 0.452
+      goal 1 0.75 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.69 ×0.15 · urgency 0 (states_deadline 0.05, day none conf 1.00) ×0.2 · cuts_spend 0.15 ×0.15
+58. Every backlog re-rank rewrites the rank on GitHub; stale rank labels can't exist (jo-issues#114)  score 0.4465
+      goal 1 0.63 ×0.3 · unblocks_jo 0.81 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.03, day none conf 0.99) ×0.2 · cuts_spend 0.13 ×0.15
+59. Phoenix tracing wired, and Phoenix used everywhere Jev is used (jo-issues#1)  score 0.4445
+      goal 1 0.66 ×0.3 · unblocks_jo 0.67 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.03, day none conf 1.00) ×0.2 · cuts_spend 0.25 ×0.15
+60. Quorum run on 'as2 asks Jo decisions that have no effect' (jo-issues#44)  score 0.4435
+      goal 3 0.65 ×0.3 · unblocks_jo 0.68 ×0.2 · fixes_breakage 0.25 ×0.15 · urgency 0 (states_deadline 0.50?, day none conf 0.97) ×0.2 · cuts_spend 0.50? ×0.15
+61. Production snapshots load locally (snapshot sync fix, Ilex workload) (jo-issues#128)  score 0.442
+      goal 1 0.50? ×0.3 · unblocks_jo 0.77 ×0.2 · fixes_breakage 0.88 ×0.15 · urgency 0 (states_deadline 0.10, day none conf 1.00) ×0.2 · cuts_spend 0.04 ×0.15
+62. A hand is settled against a stale delivery by agent id (jo-issues#81)  score 0.438
+      goal 1 0.83 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.10, day none conf 1.00) ×0.2 · cuts_spend 0.10 ×0.15
+63. One channel for other agents to message Ilex: phase 1 Plumb (ends Jo relaying), phase 2 Juno (remote, notes only) (jo-issues#13)  score 0.4325
+      goal 1 0.66 ×0.3 · unblocks_jo 0.88 ×0.2 · fixes_breakage 0.23 ×0.15 · urgency 0 (states_deadline 0.06, day none conf 1.00) ×0.2 · cuts_spend 0.16 ×0.15
+64. wl-mv4sweogs5xdkw — Jo (2026-10-12): "Row 6 (gates/src/rows/r06-reserved.ts) under-refuses six shel… (as2#178)  score 0.43
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.70 ×0.15 · urgency 0 (states_deadline 0.09, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+65. reminders-review: show notes and URLs, and ask when a Reminders.app link can't be seen (jo-issues#143)  score 0.4285
+      goal 1 0.50? ×0.3 · unblocks_jo 0.74 ×0.2 · fixes_breakage 0.78 ×0.15 · urgency 0 (states_deadline 0.26, day oct-20 conf 0.44) ×0.2 · cuts_spend 0.09 ×0.15
+66. Why as2 work is stuck, and how to prevent it (Fable analysis) (jo-issues#132)  score 0.423
+      goal 1 0.69 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.18, day none conf 1.00) ×0.2 · cuts_spend 0.28 ×0.15
+67. as2 neurodivergent criteria, need 2: sensory load and predictability (B1–B3) (jo-issues#149)  score 0.4185
+      goal 3 0.92 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.10 ×0.15 · urgency 0 (states_deadline 0.07, day none conf 0.97) ×0.2 · cuts_spend 0.19 ×0.15
+68. as2 neurodivergent criteria, need 1: attention and executive function (A1–A7) (jo-issues#148)  score 0.417
+      goal 3 0.91 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.09 ×0.15 · urgency 0 (states_deadline 0.08, day none conf 0.99) ×0.2 · cuts_spend 0.21 ×0.15
+69. Jev capability card in the as2 repo (jo-issues#23)  score 0.415
+      goal 1 0.67 ×0.3 · unblocks_jo 0.73 ×0.2 · fixes_breakage 0.14 ×0.15 · urgency 0 (states_deadline 0.04, day none conf 1.00) ×0.2 · cuts_spend 0.32 ×0.15
+70. as2: a "later" answer word so pending can reach zero (jo-issues#52)  score 0.412
+      goal 3 0.70 ×0.3 · unblocks_jo 0.72 ×0.2 · fixes_breakage 0.22 ×0.15 · urgency 0 (states_deadline 0.50?, day none conf 0.85) ×0.2 · cuts_spend 0.16 ×0.15
+71. JevRouter steals: every Jev call leaves a record (+4 smaller ideas) (jo-issues#115)  score 0.411
+      goal 2 0.66 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.26 ×0.15 · urgency 0 (states_deadline 0.12, day none conf 0.99) ×0.2 · cuts_spend 0.50? ×0.15
+72. as2 PR titles and branch names are machine IDs, not readable: title PRs from what the work does, IDs last (jo-issues#154)  score 0.4075
+      goal 3 0.87 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.22 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 0.99) ×0.2 · cuts_spend 0.09 ×0.15
+73. Show every time in Seattle time (Plumb + Ilex), enforced by machinery, configurable in as2 (jo-issues#58)  score 0.4055
+      goal 1 0.50? ×0.3 · unblocks_jo 0.85 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.06, day none conf 0.99) ×0.2 · cuts_spend 0.07 ×0.15
+74. as2 live checkout: remove the test-runner queueMaxMin stopgap (1440) once #266 and #272 are live (jo-issues#163)  score 0.403
+      goal 1 0.80 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.33 ×0.15 · urgency 0 (states_deadline 0.10, day none conf 0.99) ×0.2 · cuts_spend 0.09 ×0.15
+75. OpenClaw nightly failing and a plaintext password in ~/.openclaw and the ctx index (jo-issues#22)  score 0.4015
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.93 ×0.15 · urgency 0 (states_deadline 0.06, day none conf 1.00) ×0.2 · cuts_spend 0.08 ×0.15
+76. A repo with no origin/HEAD falls back to the current branch as the default (jo-issues#109)  score 0.4
+      goal 1 0.72 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.06, day none conf 1.00) ×0.2 · cuts_spend 0.06 ×0.15
+77. wl-mv7gtie2w23da8 — Jo (2026-10-14): "open a production workload: row 6 follows a literal cd. `cd /… (as2#185)  score 0.4
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.16, day none conf 0.99) ×0.2 · cuts_spend 0.50? ×0.15
+78. wl-mv8igegljun18g — Jo (2026-10-14, input in-mv8ifptahaamtc): "Open a normal workload: build MIGRAT… (as2#190)  score 0.4
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.08, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+79. wl-mv8r90k9nci4qo — Jo (2026-10-14, input in-mv8r8pyzevw074): "Open a normal workload: add my i-hav… (as2#191)  score 0.4
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.09, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+80. wl-mv7gidggnlkem8 — Jo (2026-10-14, input in-mv7g6ce1gcs7pc): "Open a normal workload: each pending… (as2#193)  score 0.4
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.10, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+81. A steered lane has no spending limit and no spend record of its own (jo-issues#65)  score 0.4
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+82. Every train lane resumes one growing session file, so each short pass costs about $6 (as2#282)  score 0.4
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.02, day none conf 0.99) ×0.2 · cuts_spend 0.50? ×0.15
+83. as2 merge train: one standing train per branch, never created as an instance; two trains at once is impossible (jo-issues#174)  score 0.3975
+      goal 1 0.50? ×0.3 · unblocks_jo 0.75 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.02, day none conf 0.97) ×0.2 · cuts_spend 0.15 ×0.15
+84. Merge as2 PR 139 (machine send lines, ledgered ok batches, command-separated prose rows) (jo-issues#41)  score 0.395
+      goal 1 0.50? ×0.3 · unblocks_jo 0.67 ×0.2 · fixes_breakage 0.24 ×0.15 · urgency 0 (states_deadline 0.50?, day none conf 0.96) ×0.2 · cuts_spend 0.50? ×0.15
+85. as2 neurodivergent criteria, need 3: reading and writing (C1–C3, plus N1) (jo-issues#150)  score 0.392
+      goal 3 0.94 ×0.3 · unblocks_jo 0.33 ×0.2 · fixes_breakage 0.09 ×0.15 · urgency 0 (states_deadline 0.05, day none conf 0.99) ×0.2 · cuts_spend 0.21 ×0.15
+86. ask-graham: quieter mode inside Newdle repos (jo-issues#25)  score 0.3905
+      goal 2 0.62 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.19 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+87. Nothing stops a shelved decision being re-proposed (jo-issues#46)  score 0.388
+      goal 1 0.50? ×0.3 · unblocks_jo 0.74 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.05, day none conf 1.00) ×0.2 · cuts_spend 0.10 ×0.15
+88. OMP literacy: close the runtime gaps, mark it a snapshot, and force a docs check on harness questions (jo-issues#55)  score 0.388
+      goal 1 0.62 ×0.3 · unblocks_jo 0.69 ×0.2 · fixes_breakage 0.29 ×0.15 · urgency 0 (states_deadline 0.20, day none conf 0.91) ×0.2 · cuts_spend 0.13 ×0.15
+89. A close can hold the surface tick for about 4 minutes on network timeouts (jo-issues#106)  score 0.3875
+      goal 1 0.68 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.14, day none conf 1.00) ×0.2 · cuts_spend 0.05 ×0.15
+90. Pending rows lead with a plain name, question and default answer (jo-issues#29)  score 0.387
+      goal 3 0.77 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.22 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.16 ×0.15
+91. Raising stakes mid-run does not add a review slice (jo-issues#107)  score 0.386
+      goal 1 0.74 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.31 ×0.15 · urgency 0 (states_deadline 0.10, day none conf 0.99) ×0.2 · cuts_spend 0.11 ×0.15
+92. A hand routes around a gate refusal instead of stopping (jo-issues#70)  score 0.3775
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.70 ×0.15 · urgency 0 (states_deadline 0.06, day none conf 1.00) ×0.2 · cuts_spend 0.15 ×0.15
+93. The receipts gate flags a cited lane receipt (jo-issues#84)  score 0.375
+      goal 1 0.67 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.28 ×0.15 · urgency 0 (states_deadline 0.04, day none conf 1.00) ×0.2 · cuts_spend 0.22 ×0.15
+94. wl-mv8y56eo1egjcw — Jo (2026-10-14, input in-mv8y4aks1wvd34; Jo's issue 49): "Open a production wor… (as2#197)  score 0.3745
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.33 ×0.15 · urgency 0 (states_deadline 0.10, day none conf 0.99) ×0.2 · cuts_spend 0.50? ×0.15
+95. Jo's stakes answer to an orchestrator question is recorded but never applied; the workload stays production (as2#231)  score 0.3745
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.33 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+96. Plumb's ledger PR 72 (schema v6 freeze, item 109) waits on a runner run (jo-issues#43)  score 0.374
+      goal 1 0.50? ×0.3 · unblocks_jo 0.79 ×0.2 · fixes_breakage 0.29 ×0.15 · urgency 0 (states_deadline 0.04, day none conf 0.95) ×0.2 · cuts_spend 0.15 ×0.15
+97. A lane's parked question reaches Jo only on the 60 s poll (jo-issues#98)  score 0.373
+      goal 1 0.50? ×0.3 · unblocks_jo 0.68 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.20, day none conf 1.00) ×0.2 · cuts_spend 0.08 ×0.15
+98. A refused draft stays on screen (triple messages) (jo-issues#82)  score 0.373
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.73 ×0.15 · urgency 0 (states_deadline 0.25, day none conf 0.96) ×0.2 · cuts_spend 0.09 ×0.15
+99. as2 sidekick agent: think things through with Plumb memory without opening a lane (jo-issues#24)  score 0.372
+      goal 1 0.52 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.12 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.66 ×0.15
+100. A renamed lane branch (for example -pr3) gets an entry-only PR of its own (jo-issues#103)  score 0.37
+      goal 1 0.72 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.30 ×0.15 · urgency 0 (states_deadline 0.05, day none conf 1.00) ×0.2 · cuts_spend 0.06 ×0.15
+101. Plumb charter: read the as2 OMP guide before answering OMP questions (after agent-system-2.0 #144 merges) (jo-issues#167)  score 0.3695
+      goal 1 0.66 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.34 ×0.15 · urgency 0 (states_deadline 0.29, day none conf 0.90) ×0.2 · cuts_spend 0.13 ×0.15
+102. Trial OMP's advisor on one lane, agent-end only (jo-issues#95)  score 0.368
+      goal 2 0.70 ×0.3 · unblocks_jo 0.26 ×0.2 · fixes_breakage 0.20 ×0.15 · urgency 0 (states_deadline 0.04, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+103. Record spend so tasks can be estimated (jo-issues#104)  score 0.3675
+      goal 2 0.77 ×0.3 · unblocks_jo 0.24 ×0.2 · fixes_breakage 0.09 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+104. crosslab.test.ts T3e failed once on the runner (no provider-refused: entry) and passes in every rerun (as2#230)  score 0.367
+      goal 1 0.74 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.19 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.11 ×0.15
+105. wl-mv8wzipdczs2rk — Jo (2026-10-14, input in-mv8wzcsggrzv9c; from Plumb's backlog item 37): "no com… (as2#205)  score 0.367
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.28 ×0.15 · urgency 0 (states_deadline 0.09, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+106. Reminders walkthrough skill: go through chosen Apple Reminders lists one by one, answer, act on confirm, close on yes (shareable) (jo-issues#120)  score 0.366
+      goal 3 0.62 ×0.3 · unblocks_jo 0.77 ×0.2 · fixes_breakage 0.06 ×0.15 · urgency 0 (states_deadline 0.25, day oct-20 conf 0.50) ×0.2 · cuts_spend 0.12 ×0.15
+107. as2 installs on a machine that is not Jo's (jo-issues#80)  score 0.3655
+      goal 1 0.71 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.21 ×0.15 · urgency 0 (states_deadline 0.08, day none conf 1.00) ×0.2 · cuts_spend 0.14 ×0.15
+108. Self-healing as2: Phoenix traces, analytics and Jev detecting and fixing problems (jo-issues#26)  score 0.364
+      goal 1 0.66 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.17 ×0.15 · urgency 0 (states_deadline 0.22, day none conf 0.97) ×0.2 · cuts_spend 0.27 ×0.15
+109. as2 custom voice: tone and delivery designed for AuDHD and neurodivergent users (separate from the /live plumbing workload) (jo-issues#166)  score 0.3635
+      goal 3 0.99 ×0.3 · unblocks_jo 0.19 ×0.2 · fixes_breakage 0.09 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.10 ×0.15
+110. The orchestrator has no way to keep a durable note: file writes are refused and no ledger tool is meant for one (as2#235)  score 0.3625
+      goal 1 0.56 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.13 ×0.15
+111. wl-mv8vwb04cy18n4 — Jo (2026-10-14, input in-mv8vw0sx5g4d8g): "Open a production workload: machiner… (as2#204)  score 0.3625
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.25 ×0.15 · urgency 0 (states_deadline 0.08, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+112. as2: Jo's own words leave stuck rows that need a second word (ceiling, split) (jo-issues#145)  score 0.361
+      goal 1 0.50? ×0.3 · unblocks_jo 0.77 ×0.2 · fixes_breakage 0.27 ×0.15 · urgency 0 (states_deadline 0.08, day none conf 1.00) ×0.2 · cuts_spend 0.11 ×0.15
+113. wl-mv615mkeaf1yio — Jo (2026-10-13, input in-mv614yq9da5kao): "Open a production workload in agent-… (as2#168)  score 0.361
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.24 ×0.15 · urgency 0 (states_deadline 0.09, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+114. Row 1's held-reply re-prompt is applied as Jo's command: a drafted 'merged q-…' answered a question (as2#225)  score 0.361
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.04, day none conf 1.00) ×0.2 · cuts_spend 0.24 ×0.15
+115. A batch answer accepts id forms, not only numbers (jo-issues#75)  score 0.3605
+      goal 1 0.54 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.01, day none conf 1.00) ×0.2 · cuts_spend 0.15 ×0.15
+116. Plugin effect monitoring: Plumb owns it; confirm Verge's PluginEffectMonitor stopped (jo-issues#40)  score 0.36
+      goal 1 0.57 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.05, day none conf 0.99) ×0.2 · cuts_spend 0.10 ×0.15
+117. Ilex speaks first: graded status batch every 15 minutes (jo-issues#31)  score 0.3595
+      goal 1 0.67 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.17 ×0.15 · urgency 0 (states_deadline 0.33, day none conf 0.99) ×0.2 · cuts_spend 0.22 ×0.15
+118. wl-mv8wzytml878b4 — Jo (2026-10-14, input in-mv8wzj70t412ps; from Plumb's backlog item 38): "Open a… (as2#212)  score 0.3595
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.23 ×0.15 · urgency 0 (states_deadline 0.10, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+119. wl-mv654hoqwpfhmo — Jo (2026-10-13, input in-mv653jlbh8wlc0): "Open a production workload in agent-… (as2#213)  score 0.358
+      goal 3 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.22 ×0.15 · urgency 0 (states_deadline 0.11, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+120. Plain as2 launches Ilex like launch-seat --resume ilex (jo-issues#19)  score 0.3575
+      goal 1 0.50? ×0.3 · unblocks_jo 0.82 ×0.2 · fixes_breakage 0.20 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.09 ×0.15
+121. ask-graham: always ask "Do you want me to research and see if something comparable exists?", then search and rank options by researched criteria (jo-issues#121)  score 0.3575
+      goal 3 0.58 ×0.3 · unblocks_jo 0.66 ×0.2 · fixes_breakage 0.08 ×0.15 · urgency 0 (states_deadline 0.04, day none conf 0.99) ×0.2 · cuts_spend 0.27 ×0.15
+122. Jev receipt-audit flags feed the lane's review round (warnings alone don't work) (jo-issues#117)  score 0.357
+      goal 1 0.63 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.28 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.18 ×0.15
+123. as2 escalation policy, phase 2: build the rest of the draft (involve-now vs queue, tell-don't-ask, never-ask) from the mature-systems survey (jo-issues#141)  score 0.357
+      goal 1 0.65 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.12 ×0.15 · urgency 0 (states_deadline 0.14, day none conf 0.97) ×0.2 · cuts_spend 0.30 ×0.15
+124. wl-mv4rzy6vmvjeo0 — Jo (2026-10-12): "open three production workloads, one each for MIGRATION.md it… (as2#160)  score 0.355
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.20 ×0.15 · urgency 0 (states_deadline 0.10, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+125. wl-mv60mkkt1ohg5c — Jo (2026-10-13, input in-mv60lrzuqobi0w): open a production workload to decoupl… (as2#180)  score 0.355
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.20 ×0.15 · urgency 0 (states_deadline 0.07, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+126. wl-mv6zl15365nf9c — Jo (2026-10-13, input in-mv6zke5p4xavpc): "open a production workload: move dec… (as2#187)  score 0.355
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.20 ×0.15 · urgency 0 (states_deadline 0.10, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+127. ctx and Jev off switches for fresh installs (Jev off needs a measured fallback judge) (jo-issues#42)  score 0.354
+      goal 2 0.61 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.17 ×0.15 · urgency 0 (states_deadline 0.08, day none conf 1.00) ×0.2 · cuts_spend 0.31 ×0.15
+128. Bring your own judge: one-command calibration so any judge model can replace Jev (jo-issues#138)  score 0.3535
+      goal 2 0.62 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.12 ×0.15 · urgency 0 (states_deadline 0.05, day none conf 0.91) ×0.2 · cuts_spend 0.33 ×0.15
+129. A newcomer's guide (jo-issues#110)  score 0.3515
+      goal 1 0.50? ×0.3 · unblocks_jo 0.67 ×0.2 · fixes_breakage 0.14 ×0.15 · urgency 0 (states_deadline 0.19, day none conf 0.99) ×0.2 · cuts_spend 0.31 ×0.15
+130. Parked 2026-10-12: 'don't ask me' read as user-driven, ceiling word, kimi-k3 capture gap, rebase merges (jo-issues#48)  score 0.351
+      goal 1 0.63 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.17 ×0.15 · urgency 0 (states_deadline 0.50?, day none conf 0.96) ×0.2 · cuts_spend 0.25 ×0.15
+131. Daily tech briefing replacing Hermes (TLDR archive, HTML by 9am PT) (jo-issues#18)  score 0.3505
+      goal 3 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.17 ×0.15 · urgency 0 (states_deadline 0.96, day none conf 0.68) ×0.2 · cuts_spend 0.50? ×0.15
+132. Quiet enough to hand over (jo-issues#99)  score 0.35
+      goal 1 0.69 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.17 ×0.15 · urgency 0 (states_deadline 0.13, day none conf 1.00) ×0.2 · cuts_spend 0.11 ×0.15
+133. A train task settles failed by the 2 h no-push rule while the owner's lane is still live (as2#284)  score 0.349
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.50?, day none conf 0.87) ×0.2 · cuts_spend 0.16 ×0.15
+134. Migrate Plumb's memory and charter facts into the ledger, the day before cutover (jo-issues#71)  score 0.3485  [irreversible 0.77: needs Jo]
+      goal 1 0.69 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.20 ×0.15 · urgency 0 (states_deadline 0.96, day none conf 0.61) ×0.2 · cuts_spend 0.07 ×0.15
+135. wl-mv4rzy53lb8oao — Jo (2026-10-12): "open three production workloads, one each for MIGRATION.md it… (as2#159)  score 0.3475
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.15 ×0.15 · urgency 0 (states_deadline 0.10, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+136. Review hands get no named review skill, so review quality depends on which lab obeys OMP's generic skill hint (jo-issues#101)  score 0.3465
+      goal 1 0.59 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.30 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.17 ×0.15
+137. ask-graham enforces its verdict in machinery: a Stop check flags a turn that read the skill but gave no Verdict line (jo-issues#9)  score 0.346
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.03, day none conf 0.99) ×0.2 · cuts_spend 0.14 ×0.15
+138. wl-mv8yvhif09c0sg — Jo (2026-10-15, input in-mv8yv64dfuqdc0; Jo's issue 52): "Open a normal workloa… (as2#196)  score 0.346
+      goal 2 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.14 ×0.15 · urgency 0 (states_deadline 0.07, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+139. A released lane's runner waits up to 15 min (SETTLE_IDLE_MS) before lane-exit: (as2#283)  score 0.346
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.21, day none conf 0.97) ×0.2 · cuts_spend 0.14 ×0.15
+140. Cutover: retire all twelve 1.x seats at one moment (jo-issues#77)  score 0.343
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.12 ×0.15 · urgency 0 (states_deadline 0.19, day none conf 0.99) ×0.2 · cuts_spend 0.50? ×0.15
+141. Prerequisites written down and checked at install (jo-issues#90)  score 0.34
+      goal 1 0.68 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.18 ×0.15 · urgency 0 (states_deadline 0.09, day none conf 1.00) ×0.2 · cuts_spend 0.06 ×0.15
+142. ask-graham: weigh upkeep and warn when a recommended package looks unmaintained (jo-issues#171)  score 0.3365
+      goal 1 0.56 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.34 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 0.97) ×0.2 · cuts_spend 0.11 ×0.15
+143. Evals: re-check Jev against human labels, and keep eval pass rates over time (jo-issues#136)  score 0.336
+      goal 1 0.56 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.30 ×0.15 · urgency 0 (states_deadline 0.05, day none conf 1.00) ×0.2 · cuts_spend 0.16 ×0.15
+144. as2 migration: close M7 with Jo's sign-off, and mark four steps deferred by Jo (jo-issues#151)  score 0.3335
+      goal 1 0.60 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.24 ×0.15 · urgency 0 (states_deadline 0.21, day none conf 0.96) ×0.2 · cuts_spend 0.11 ×0.15
+145. as2: direct the surface through OMP live voice with verbatim user transcripts (jo-issues#165)  score 0.3295
+      goal 1 0.50? ×0.3 · unblocks_jo 0.71 ×0.2 · fixes_breakage 0.13 ×0.15 · urgency 0 (states_deadline 0.03, day none conf 0.99) ×0.2 · cuts_spend 0.12 ×0.15
+146. Adopt a well-reviewed research-brief skill for Plumb and as2 (jo-issues#111)  score 0.3295
+      goal 2 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.26 ×0.15 · urgency 0 (states_deadline 0.03, day none conf 1.00) ×0.2 · cuts_spend 0.27 ×0.15
+147. wl-mv6144px2e2n7k — Jo (2026-10-13) answered "train" on q-mv60z5420wtji8 (answer in-mv613jr16zyj28)… (as2#188)  score 0.319
+      goal 1 0.50? ×0.3 · unblocks_jo 0.32 ×0.2 · fixes_breakage 0.20 ×0.15 · urgency 0 (states_deadline 0.07, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+148. Subagents can send seat messages signed as Plumb (jo-issues#14)  score 0.3145  [irreversible 0.69: needs Jo]
+      goal 1 0.50? ×0.3 · unblocks_jo 0.26 ×0.2 · fixes_breakage 0.68 ×0.15 · urgency 0 (states_deadline 0.01, day none conf 1.00) ×0.2 · cuts_spend 0.07 ×0.15
+149. A copy or move into a known directory is judged on the directory word only, not on the file it creates (jo-issues#72)  score 0.309
+      goal 1 0.50? ×0.3 · unblocks_jo 0.30 ×0.2 · fixes_breakage 0.50? ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.16 ×0.15
+150. wl-mv65f7lqigfclc — Jo (2026-10-13) answered "open" on q-mv65apdo3zn3eo (answer in-mv65e7zm1p8kqo):… (as2#161)  score 0.308
+      goal 1 0.50? ×0.3 · unblocks_jo 0.31 ×0.2 · fixes_breakage 0.14 ×0.15 · urgency 0 (states_deadline 0.08, day none conf 0.99) ×0.2 · cuts_spend 0.50? ×0.15
+151. Every lane's first hand dispatch is refused by P-11 row 5 (jo-issues#100)  score 0.308
+      goal 3 0.53 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.21 ×0.15 · urgency 0 (states_deadline 0.05, day none conf 0.95) ×0.2 · cuts_spend 0.11 ×0.15
+152. wl-mv8mof9kktbh1c — Jo (2026-10-14, input in-mv8moaa07ocykg): "Open a normal workload: surface/test… (as2#206)  score 0.3075
+      goal 1 0.50? ×0.3 · unblocks_jo 0.30 ×0.2 · fixes_breakage 0.15 ×0.15 · urgency 0 (states_deadline 0.08, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+153. Firecrawl and Perplexity for our agents: parked, check on 2026-11-02 (jo-issues#142)  score 0.306
+      goal 1 0.50? ×0.3 · unblocks_jo 0.33 ×0.2 · fixes_breakage 0.10 ×0.15 · urgency 0 (states_deadline 0.98, day later conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+154. wl-mv66q5b148uznk — Jo (2026-10-13, input in-mv66pnvxccj8xs): "open a normal workload in agent-syst… (as2#214)  score 0.304
+      goal 3 0.50? ×0.3 · unblocks_jo 0.29 ×0.2 · fixes_breakage 0.14 ×0.15 · urgency 0 (states_deadline 0.07, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+155. wl-mv8d45mqycd8g0 — Jo (2026-10-14, input in-mv8d3woi66tkow): "Open a normal workload: a lane-model… (as2#211)  score 0.3035
+      goal 3 0.50? ×0.3 · unblocks_jo 0.31 ×0.2 · fixes_breakage 0.11 ×0.15 · urgency 0 (states_deadline 0.10, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+156. wl-mv8s8swjr478qo — Jo (2026-10-14, input in-mv8s87c55yumm8): "Open a normal workload: a Jev capabi… (as2#199)  score 0.303
+      goal 1 0.50? ×0.3 · unblocks_jo 0.30 ×0.2 · fixes_breakage 0.12 ×0.15 · urgency 0 (states_deadline 0.08, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+157. Move the loud quota watcher from Plumb into as2 (jo-issues#49)  score 0.3025
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.20 ×0.15 · urgency 0 (states_deadline 0.09, day none conf 0.97) ×0.2 · cuts_spend 0.15 ×0.15
+158. wl-mv8vwv9rumcveo — Jo (2026-10-14, input in-mv8vwpp1o6oxz4): "Open a normal workload: Jo is told, … (as2#210)  score 0.3005
+      goal 2 0.50? ×0.3 · unblocks_jo 0.31 ×0.2 · fixes_breakage 0.09 ×0.15 · urgency 0 (states_deadline 0.12, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+159. wl-mv6zfcyl8s54w0 — Jo (2026-10-13, input in-mv6zeumvh03xfk): "open a normal workload: add Jo's jo-… (as2#174)  score 0.299
+      goal 1 0.50? ×0.3 · unblocks_jo 0.28 ×0.2 · fixes_breakage 0.12 ×0.15 · urgency 0 (states_deadline 0.07, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+160. Run the paste-race smoke test in a terminal (jo-issues#32)  score 0.2985
+      goal 1 0.51 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.16 ×0.15 · urgency 0 (states_deadline 0.02, day none conf 1.00) ×0.2 · cuts_spend 0.15 ×0.15
+161. wl-mv7gst1nsoe4u8 — Jo (2026-10-14, input in-mv7gsctoafq4g0): "Time ceilings sit far below real lan… (as2#184)  score 0.296
+      goal 2 0.50? ×0.3 · unblocks_jo 0.28 ×0.2 · fixes_breakage 0.10 ×0.15 · urgency 0 (states_deadline 0.50?, day none conf 0.91) ×0.2 · cuts_spend 0.50? ×0.15
+162. Once as2 is shared, changes ship as releases, not as live main (jo-issues#93)  score 0.2875
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.19 ×0.15 · urgency 0 (states_deadline 0.07, day none conf 0.99) ×0.2 · cuts_spend 0.06 ×0.15
+163. GitHub-issues projection of the ledger (jo-issues#3)  score 0.2845
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.09 ×0.15 · urgency 0 (states_deadline 0.06, day none conf 1.00) ×0.2 · cuts_spend 0.14 ×0.15
+164. A change under gates/ is production stakes, whoever opens it (jo-issues#79)  score 0.2845
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.13 ×0.15 · urgency 0 (states_deadline 0.07, day none conf 0.90) ×0.2 · cuts_spend 0.10 ×0.15
+165. Revisit the Simple Technical English plan when the flow-repair gate lifts (jo-issues#135)  score 0.2845
+      goal 2 0.50? ×0.3 · unblocks_jo 0.32 ×0.2 · fixes_breakage 0.13 ×0.15 · urgency 0 (states_deadline 0.12, day none conf 0.96) ×0.2 · cuts_spend 0.34 ×0.15
+166. wl-mv746bobfbygow — Jo (2026-10-13, input in-mv745ubcsvolxc): "Open a normal workload after the loc… (as2#173)  score 0.283
+      goal 2 0.50? ×0.3 · unblocks_jo 0.23 ×0.2 · fixes_breakage 0.08 ×0.15 · urgency 0 (states_deadline 0.16, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+167. wl-mv8d7uzu8r63uo — Jo (2026-10-14, input in-mv8d7lzl0iphq8): "Open a normal workload: your P-11 ro… (as2#181)  score 0.2795
+      goal 2 0.50? ×0.3 · unblocks_jo 0.22 ×0.2 · fixes_breakage 0.07 ×0.15 · urgency 0 (states_deadline 0.19, day none conf 0.99) ×0.2 · cuts_spend 0.50? ×0.15
+168. wl-mv734imdks3mdc — Jo (2026-10-13, input in-mv733zdrwaxjb4): "Open a normal workload: in skills/, … (as2#169)  score 0.278
+      goal 2 0.50? ×0.3 · unblocks_jo 0.22 ×0.2 · fixes_breakage 0.06 ×0.15 · urgency 0 (states_deadline 0.12, day none conf 0.99) ×0.2 · cuts_spend 0.50? ×0.15
+169. wl-mv72a3eo35lyps — Jo (2026-10-13, input in-mv729n7ypokkcg): "open a normal workload: as2 is publi… (as2#166)  score 0.2775
+      goal 2 0.50? ×0.3 · unblocks_jo 0.21 ×0.2 · fixes_breakage 0.07 ×0.15 · urgency 0 (states_deadline 0.18, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+170. wl-mv74cy2uro3kzk — Jo (2026-10-13, input in-mv74cb62lig2rk): "Open a normal workload: guard-replay… (as2#175)  score 0.277
+      goal 1 0.50? ×0.3 · unblocks_jo 0.20 ×0.2 · fixes_breakage 0.08 ×0.15 · urgency 0 (states_deadline 0.15, day none conf 0.99) ×0.2 · cuts_spend 0.50? ×0.15
+171. Signature dataviz: charts from Jon's data sources in the enrichment process, stored in newdle-db, picked by editors in kitchen (jo-issues#172)  score 0.277
+      goal 1 0.50? ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.06 ×0.15 · urgency 0 (states_deadline 0.04, day none conf 0.86) ×0.2 · cuts_spend 0.12 ×0.15
+172. wl-mv8vyhw6tdo6io — Jo (2026-10-14, input in-mv8vybdird80zk): "Open a normal workload, plan first: … (as2#189)  score 0.276
+      goal 3 0.50? ×0.3 · unblocks_jo 0.21 ×0.2 · fixes_breakage 0.06 ×0.15 · urgency 0 (states_deadline 0.16, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+173. wl-mv7golz58d7668 — Jo (2026-10-14, input in-mv7gogk8twdji8): "Open a normal workload, after wl-mv6… (as2#179)  score 0.2755
+      goal 2 0.50? ×0.3 · unblocks_jo 0.20 ×0.2 · fixes_breakage 0.07 ×0.15 · urgency 0 (states_deadline 0.20, day none conf 1.00) ×0.2 · cuts_spend 0.50? ×0.15
+174. wl-mv7gtqofeypc74 — Jo (2026-10-14, input in-mv7gtihg03n5s0): "open a normal workload: lane log ret… (as2#186)  score 0.274
+      goal 2 0.50? ×0.3 · unblocks_jo 0.20 ×0.2 · fixes_breakage 0.06 ×0.15 · urgency 0 (states_deadline 0.20, day none conf 0.99) ×0.2 · cuts_spend 0.50? ×0.15
+175. wl-mv72nurvlwba4g — Jo (2026-10-13, input in-mv72nm1zaslu68): "open a normal workload: any hand or … (as2#167)  score 0.272
+      goal 2 0.50? ×0.3 · unblocks_jo 0.19 ×0.2 · fixes_breakage 0.06 ×0.15 · urgency 0 (states_deadline 0.19, day none conf 0.99) ×0.2 · cuts_spend 0.50? ×0.15
+176. wl-mv73n0xd49vqps — Jo (2026-10-13, input in-mv73mcts2r8lq8): "Open a normal workload, front of que… (as2#170)  score 0.2705
+      goal 3 0.50? ×0.3 · unblocks_jo 0.19 ×0.2 · fixes_breakage 0.05 ×0.15 · urgency 0 (states_deadline 0.12, day none conf 0.99) ×0.2 · cuts_spend 0.50? ×0.15
+177. wl-mv73ymkyzgmqkg — Jo (2026-10-13, input in-mv73xjyepfqlts): "Open a normal workload, after PR 107… (as2#171)  score 0.2695
+      goal 2 0.50? ×0.3 · unblocks_jo 0.17 ×0.2 · fixes_breakage 0.07 ×0.15 · urgency 0 (states_deadline 0.15, day none conf 0.99) ×0.2 · cuts_spend 0.50? ×0.15
+178. Run one real Newdle product-repo task through as2 that hits a reserved action (jo-issues#94)  score 0.2635
+      goal 2 0.50? ×0.3 · unblocks_jo 0.32 ×0.2 · fixes_breakage 0.15 ×0.15 · urgency 0 (states_deadline 0.03, day none conf 1.00) ×0.2 · cuts_spend 0.18 ×0.15
+179. Optional: remove the newdle plugin from Jo's Claude config after cutover (jo-issues#97)  score 0.25
+      goal 1 0.50? ×0.3 · unblocks_jo 0.29 ×0.2 · fixes_breakage 0.08 ×0.15 · urgency 0 (states_deadline 0.08, day none conf 1.00) ×0.2 · cuts_spend 0.20 ×0.15
+180. as2 paired mode: pairing in a lane is a real mode, not user-driven plus a pasted skill (jo-issues#139)  score 0.2495
+      goal 1 0.36 ×0.3 · unblocks_jo 0.50? ×0.2 · fixes_breakage 0.13 ×0.15 · urgency 0 (states_deadline 0.03, day none conf 1.00) ×0.2 · cuts_spend 0.14 ×0.15
+181. as2's edge over Gas City: neurodivergent-friendly (Jo's call) (jo-issues#123)  score 0.2255
+      goal 3 0.50? ×0.3 · unblocks_jo 0.25 ×0.2 · fixes_breakage 0.04 ×0.15 · urgency 0 (states_deadline 0.04, day none conf 1.00) ×0.2 · cuts_spend 0.13 ×0.15
+182. Idea: a Linux distro for neurodivergent users with agents built in (Jo + Graham) (jo-issues#124)  score 0.2095
+      goal 3 0.37 ×0.3 · unblocks_jo 0.29 ×0.2 · fixes_breakage 0.03 ×0.15 · urgency 0 (states_deadline 0.04, day none conf 1.00) ×0.2 · cuts_spend 0.24 ×0.15
+183. as2 review: five ideas from Anthropic's code-review post (queued behind flow repair) (jo-issues#144)  score 0.1735
+      goal 3 0.34 ×0.3 · unblocks_jo 0.12 ×0.2 · fixes_breakage 0.05 ×0.15 · urgency 0 (states_deadline 0.10, day none conf 1.00) ×0.2 · cuts_spend 0.26 ×0.15
+184. Voice front end for directing agents: talk to a Max Headroom-style character with fake-3D background (shareable) (jo-issues#164)  score 0.1725
+      goal 3 0.30 ×0.3 · unblocks_jo 0.32 ×0.2 · fixes_breakage 0.03 ×0.15 · urgency 0 (states_deadline 0.10, day none conf 0.75) ×0.2 · cuts_spend 0.10 ×0.15
+185. VPS (the old openclaw host): what to use it for, recorded for later (jo-issues#140)  score 0.1535
+      goal 2 0.26 ×0.3 · unblocks_jo 0.13 ×0.2 · fixes_breakage 0.06 ×0.15 · urgency 0 (states_deadline 0.14, day none conf 0.64) ×0.2 · cuts_spend 0.27 ×0.15
+jev cost $0.0004 job jdgb-15adfb60c9d42eab

@@ -1324,3 +1324,15 @@ plugins/i-have-audhd/triggers/batch-heading.mjs	module	-
 plugins/i-have-audhd/triggers/conclusion-first.mjs	module	-
 plugins/i-have-audhd/triggers/todo-unfinished.mjs	module	-
 plugins/test/loader.test.ts	test	-
+# Daily backlog rank (PLAN wl-mvh42n85yo0m4g D1/D5): logic, runner, replay and opt-in schedulers.
+surface/src/backlog-rank.ts	module	-
+surface/scripts/backlog-rank.ts	module	-
+surface/test/backlog-rank.test.ts	test	-
+surface/test/backlog-rank-run.test.ts	test	-
+surface/test/fixtures/backlog-rank-fake-gh.ts	test	-
+surface/test/fixtures/backlog-rank-1220/answers-1220.jsonl	test	-
+surface/test/fixtures/backlog-rank-1220/GOALS.md	test	-
+surface/test/fixtures/backlog-rank-1220/rank-1220.out	test	-
+install/com.agent-system-2.backlog-rank.plist	install	-
+install/as2-backlog-rank.service	install	-
+install/as2-backlog-rank.timer	install	-

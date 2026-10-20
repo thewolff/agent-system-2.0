@@ -30,7 +30,7 @@
 # as2.file-links plugin is linked from install/herdr-file-links; without herdr one notice is printed.
 # Reversal: herdr plugin unlink as2.file-links; remove the default-profile extension symlink.
 #
-# Three flags (macOS only), each optional and usable together. --chaos-nightly also writes the nightly
+# Three macOS-only flags, each optional and usable together. --chaos-nightly also writes the nightly
 # chaos job: the template install/com.agent-system-2.chaos.plist filled with this checkout, the
 # absolute bun path, $HOME and a PATH of the bun, omp and git directories, written to
 # $HOME/Library/LaunchAgents/com.agent-system-2.chaos.plist and loaded with
@@ -53,20 +53,27 @@
 # or cannot confirm the job is absent, it says why, keeps the plist and exits 1. The =off forms
 # may be given together; an =off form with an installing flag is refused. Without a flag nothing
 # about its job is written, read or run.
+# --backlog-rank is opt-in on macOS and Linux: hourly at :15, with wake catch-up. macOS uses
+# load_job/job_off below; Linux uses a systemd user service and Persistent=true timer, with
+# fail-closed removal. It prints the login/linger limitation and never changes linger.
+# Both jobs carry absolute bun/script/ledger/state paths, HOME, OMP_PROFILE and tool PATH.
+# Reversal: bash install/install.sh --backlog-rank=off (no bun or reinstall required).
 #
 # Usage:   bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off]
-#                                  [--train-tick | --train-tick=off]
+#                                  [--train-tick | --train-tick=off] [--backlog-rank | --backlog-rank=off]
 # Env:     AGENT_SYSTEM_LEDGER_DB   ledger file (default: $HOME/.agent-system-2/ledger.db)
 #          AGENT_SYSTEM_PROFILE     OMP profile name (default: agent-system-2); the profile lives at
 #                                   $HOME/.omp/profiles/<profile>/agent (omp://config-usage.md § Profiles)
-# Exit:    0 installed, or (=off) each named job is confirmed not loaded and its plist is gone
-#          1 other failure (=off: launchctl not on PATH, `launchctl print` failed for a reason other
-#            than "Could not find service", or bootout failed, each with the plist kept; or the
-#            plist removal failed)
+#          AGENT_SYSTEM_BACKLOG_RANK_DIR  rank state (default: $HOME/.agent-system-2/backlog-rank)
+# Exit:    0 installed, or (=off) each named job is confirmed stopped and its scheduler files are gone
+#          1 other failure (=off: scheduler unavailable, inspection or stop/disable failed, keeping
+#            scheduler files; a removal failed; or a systemd daemon-reload failed after removal)
 #          2 manifest or profile check failed, an argument other than the flags (or a flag twice, or
 #            an =off form with an installing flag), --chaos-nightly refused: not macOS, or omp or git
 #            not on PATH, or --scratch-sweep refused: not macOS, or --train-tick refused: not macOS, gh,
 #            bun, omp, git or osascript not on PATH, or `gh auth status` failed (nothing written)
+#            --backlog-rank refused: unsupported OS, missing scheduler/template/tool, unavailable
+#            systemd user manager, failed gh auth, or a control character in a job value (nothing written)
 #          3 ledger path refused as synced or network folder (nothing written)
 #          4 the ledger file exists at a schema version other than the supported one (5), e.g. a
 #            version-1 to -4 ledger from before schema v5 (nothing written; no upgrade exists:
@@ -96,11 +103,12 @@ LOCAL_BIN="$HOME/.local/bin"
 step() { printf '==> %s\n' "$*"; }
 fail() { printf 'install: FAIL: %s\n' "$1" >&2; exit "${2:-1}"; }
 
-# The three launchd jobs: each off unless its flag names it (empty = do nothing about it at all).
+# Scheduled jobs: each off unless its flag names it (empty = do nothing about it at all).
 CHAOS=""
 SWEEP=""
 TICK=""
-USAGE="usage: bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off] [--train-tick | --train-tick=off]"
+BACKLOG=""
+USAGE="usage: bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off] [--train-tick | --train-tick=off] [--backlog-rank | --backlog-rank=off]"
 for arg in "$@"; do
 	case "$arg" in
 		--chaos-nightly | --chaos-nightly=off)
@@ -112,12 +120,15 @@ for arg in "$@"; do
 		--train-tick | --train-tick=off)
 			[ -z "$TICK" ] || fail "$USAGE; the train-tick flag is given twice: $*" 2
 			if [ "$arg" = --train-tick ]; then TICK=on; else TICK=off; fi ;;
+		--backlog-rank | --backlog-rank=off)
+			[ -z "$BACKLOG" ] || fail "$USAGE; the backlog-rank flag is given twice: $*" 2
+			if [ "$arg" = --backlog-rank ]; then BACKLOG=on; else BACKLOG=off; fi ;;
 		*) fail "$USAGE; got: $*" 2 ;;
 	esac
 done
 # An =off form stops its job and exits before any install step, so it cannot share a run with a flag
 # that installs one.
-if { [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ]; } && { [ "$CHAOS" = on ] || [ "$SWEEP" = on ] || [ "$TICK" = on ]; }; then
+if { [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ] || [ "$BACKLOG" = off ]; } && { [ "$CHAOS" = on ] || [ "$SWEEP" = on ] || [ "$TICK" = on ] || [ "$BACKLOG" = on ]; }; then
 	fail "$USAGE; an =off form stops a job and exits, so it cannot be combined with a flag that installs one; got: $*" 2
 fi
 
@@ -133,6 +144,57 @@ TICK_LABEL="com.agent-system-2.train-tick"
 TICK_TEMPLATE="$REPO/install/$TICK_LABEL.plist"
 TICK_PLIST="$LAUNCH_AGENTS/$TICK_LABEL.plist"
 TICK_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/train-tick"
+BACKLOG_LABEL="com.agent-system-2.backlog-rank"
+BACKLOG_TEMPLATE="$REPO/install/$BACKLOG_LABEL.plist"
+BACKLOG_PLIST="$LAUNCH_AGENTS/$BACKLOG_LABEL.plist"
+BACKLOG_STATE="${AGENT_SYSTEM_BACKLOG_RANK_DIR:-$HOME/.agent-system-2/backlog-rank}"
+case "$BACKLOG_STATE" in /*) ;; *) BACKLOG_STATE="$PWD/$BACKLOG_STATE" ;; esac
+BACKLOG_UNIT="as2-backlog-rank"
+SYSTEMD_USER="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+case "$SYSTEMD_USER" in /*) ;; *) SYSTEMD_USER="$PWD/$SYSTEMD_USER" ;; esac
+
+# Inspect machine-readable state, never treat a failed bus connection as "absent".
+# https://www.freedesktop.org/software/systemd/man/latest/systemctl.html#show
+backlog_unit_state() {
+	local unit="$1" state load="" active="" enabled="" key value fields=""
+	state="$(systemctl --user show "$unit" --all -p LoadState -p ActiveState -p UnitFileState)" \
+		|| fail "cannot inspect $unit; backlog rank unit files are kept" 1
+	while IFS='=' read -r key value; do
+		case "$key" in
+			LoadState) load="$value"; fields="${fields}L" ;;
+			ActiveState) active="$value"; fields="${fields}A" ;;
+			UnitFileState) enabled="$value"; fields="${fields}U" ;;
+		esac
+	done <<<"$state"
+	[[ "$fields" == *L* && "$fields" == *A* && "$fields" == *U* ]] \
+		|| fail "incomplete state for $unit; unit files are kept" 1
+	case "$load" in loaded | not-found | masked) ;; *) fail "unknown LoadState for $unit ($load); unit files are kept" 1 ;; esac
+	case "$active" in inactive | failed) ;; *) fail "$unit is not stopped ($active); unit files are kept" 1 ;; esac
+	case "$enabled" in disabled | static | masked | '') ;; *) fail "$unit is not disabled ($enabled); unit files are kept" 1 ;; esac
+}
+backlog_systemd_off() {
+	command -v systemctl >/dev/null 2>&1 || fail "systemctl not found; backlog rank unit files are kept" 1
+	# show must succeed even for not-found units; other errors leave both files for diagnosis.
+	local unit state
+	for unit in "$BACKLOG_UNIT.timer" "$BACKLOG_UNIT.service"; do
+		state="$(systemctl --user show "$unit" -p LoadState)" || fail "cannot inspect $unit; unit files are kept" 1
+		case "$state" in
+			LoadState=not-found) ;;
+			LoadState=loaded | LoadState=masked)
+				if [ "$unit" = "$BACKLOG_UNIT.timer" ]; then
+					systemctl --user disable --now "$unit" || fail "cannot disable $unit; unit files are kept" 1
+				else
+					systemctl --user stop "$unit" || fail "cannot stop $unit; unit files are kept" 1
+				fi ;;
+			*) fail "unknown state for $unit ($state); unit files are kept" 1 ;;
+		esac
+	done
+	for unit in "$BACKLOG_UNIT.timer" "$BACKLOG_UNIT.service"; do backlog_unit_state "$unit"; done
+	rm -f "$SYSTEMD_USER/$BACKLOG_UNIT.timer" "$SYSTEMD_USER/$BACKLOG_UNIT.service" \
+		|| fail "could not remove backlog rank unit files" 1
+	systemctl --user daemon-reload || fail "backlog rank stopped and files removed, but daemon-reload failed" 1
+	step "backlog rank off: timer disabled, service stopped, unit files removed"
+}
 
 # An =off form: stop the job and delete its plist (job_off NAME LABEL PLIST), then exit, before anything
 # else runs. It reads no manifest, needs no bun, and writes nothing but the plist removal. It fails
@@ -164,10 +226,17 @@ job_off() {
 	fi
 	step "$name off: no job loaded, no plist"
 }
-if [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ]; then
+if [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ] || [ "$BACKLOG" = off ]; then
 	if [ "$CHAOS" = off ]; then job_off "chaos nightly" "$CHAOS_LABEL" "$CHAOS_PLIST"; fi
 	if [ "$SWEEP" = off ]; then job_off "scratch sweep" "$SWEEP_LABEL" "$SWEEP_PLIST"; fi
 	if [ "$TICK" = off ]; then job_off "train tick" "$TICK_LABEL" "$TICK_PLIST"; fi
+	if [ "$BACKLOG" = off ]; then
+		case "$(uname -s)" in
+			Darwin) job_off "backlog rank" "$BACKLOG_LABEL" "$BACKLOG_PLIST" ;;
+			Linux) backlog_systemd_off ;;
+			*) fail "--backlog-rank=off supports macOS or Linux only" 2 ;;
+		esac
+	fi
 	step "nothing else was run or written"
 	exit 0
 fi
@@ -260,6 +329,63 @@ if [ "$TICK" = on ]; then
 	done <<<"$dirs:"
 	gh_status="$(gh auth status 2>&1)" || fail "--train-tick: \`gh auth status\` failed, so the tick could not read PRs or file alerts: $(printf '%s' "$gh_status" | tail -n 1)" 2
 fi
+
+# Backlog rank prerequisites, before ledger/profile writes. Never fetch or render a token:
+# the script resolves the board account's token in memory at runtime.
+if [ "$BACKLOG" = on ]; then
+	BACKLOG_OS="$(uname -s)"
+	case "$BACKLOG_OS" in
+		Darwin)
+			command -v launchctl >/dev/null 2>&1 || fail "--backlog-rank: launchctl not found on PATH" 2
+			[ -f "$BACKLOG_TEMPLATE" ] || fail "--backlog-rank: no template at $BACKLOG_TEMPLATE" 2 ;;
+		Linux)
+			command -v systemctl >/dev/null 2>&1 || fail "--backlog-rank: systemctl not found on PATH" 2
+			systemctl --user show-environment >/dev/null 2>&1 || fail "--backlog-rank: systemd user manager is unavailable" 2
+			for suffix in service timer; do
+				[ -f "$REPO/install/$BACKLOG_UNIT.$suffix" ] || fail "--backlog-rank: no $suffix template" 2
+			done ;;
+		*) fail "--backlog-rank supports macOS or Linux only" 2 ;;
+	esac
+	BACKLOG_PATH=""
+	for tool in gh bun omp git; do
+		tool_bin="$(type -P "$tool")" || fail "--backlog-rank: $tool not found on PATH" 2
+		case "$tool_bin" in /*) ;; *) tool_bin="$PWD/$tool_bin" ;; esac
+		if [ "$tool" = bun ]; then BACKLOG_BUN="$tool_bin"; fi
+		BACKLOG_PATH="${BACKLOG_PATH:+$BACKLOG_PATH:}$(dirname "$tool_bin")"
+	done
+	dirs="$BACKLOG_PATH:/usr/bin:/bin:/usr/sbin:/sbin"
+	BACKLOG_PATH=""
+	while IFS= read -r -d: dir; do
+		case ":$BACKLOG_PATH:" in *":$dir:"*) ;; *) BACKLOG_PATH="${BACKLOG_PATH:+$BACKLOG_PATH:}$dir" ;; esac
+	done <<<"$dirs:"
+	gh auth status >/dev/null 2>&1 || fail "--backlog-rank: gh auth status failed" 2
+	# Refuse line/control injection before writing anything. Unit rendering escapes literal specifiers.
+	for value in "$HOME" "$REPO" "$BACKLOG_BUN" "$BACKLOG_STATE" "$LEDGER_ABS" "$PROFILE_NAME" "$BACKLOG_PATH"; do
+		[[ "$value" != *[[:cntrl:]]* ]] || fail "--backlog-rank: paths/profile must not contain control characters" 2
+	done
+fi
+
+# Single-pass systemd substitution: literal scalar vs quoted words, no shell.
+# WorkingDirectory does not unquote or C-unescape; only double its percent specifiers.
+# ExecStart's ":" prefix disables $ expansion; Environment= never expands $.
+# https://github.com/systemd/systemd/blob/v252/src/core/load-fragment.c (config_parse_working_directory)
+# https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#Command%20lines
+# https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#Environment=
+fill_systemd_template() {
+	bun -e '
+		const [template, ...pairs] = process.argv.slice(1);
+		const values = new Map(pairs.map((p) => [p.slice(0, p.indexOf("=")), p.slice(p.indexOf("=") + 1)]));
+		const escape = (s) => s.replace(/\\/g, "\\\\").replace(/"/g, "\\\"").replace(/%/g, "%%");
+		const text = (await Bun.file(template).text()).split("\n").map((line) =>
+			line.replace(/@([A-Z_]+)@/g, (token, name) => {
+				if (!values.has(name)) { console.error(`install: ${template} has ${token}, which has no value`); process.exit(1); }
+				const value = values.get(name);
+				return line.startsWith("WorkingDirectory=") ? value.replace(/%/g, "%%") : escape(value);
+			})
+		).join("\n");
+		process.stdout.write(text.endsWith("\n") ? text : text + "\n");
+	' "$@"
+}
 
 # ---- 1. read and validate the manifest ------------------------------------------------------
 step "reading manifest $MANIFEST"
@@ -615,6 +741,28 @@ if [ "$TICK" = on ]; then
 	load_job "train tick" "$TICK_LABEL" "$TICK_TEMPLATE" "$TICK_PLIST" "$TICK_LOG_DIR" \
 		"BUN=$TICK_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS" "PROFILE=$PROFILE_NAME" "PATH=$TICK_PATH"
 	step "train tick loaded: runs every 5 minutes; log $TICK_LOG_DIR/launchd.log; turn off with: bash install/install.sh --train-tick=off"
+fi
+
+# ---- 6d3. daily backlog rank (--backlog-rank only) -----------------------------------------------
+if [ "$BACKLOG" = on ]; then
+	BACKLOG_VALUES=("BUN=$BACKLOG_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS"
+		"PROFILE=$PROFILE_NAME" "PATH=$BACKLOG_PATH" "STATE=$BACKLOG_STATE")
+	if [ "$BACKLOG_OS" = Darwin ]; then
+		load_job "backlog rank" "$BACKLOG_LABEL" "$BACKLOG_TEMPLATE" "$BACKLOG_PLIST" "$BACKLOG_STATE" "${BACKLOG_VALUES[@]}"
+		step "backlog rank loaded: hourly at :15, catch-up on wake; log $BACKLOG_STATE/launchd.log"
+	else
+		mkdir -p "$SYSTEMD_USER"
+		for suffix in service timer; do
+			fill_systemd_template "$REPO/install/$BACKLOG_UNIT.$suffix" "${BACKLOG_VALUES[@]}" >"$SYSTEMD_USER/$BACKLOG_UNIT.$suffix.tmp.$$" \
+				|| { rm -f "$SYSTEMD_USER/$BACKLOG_UNIT."*.tmp."$$"; fail "backlog rank $suffix template could not be filled" 1; }
+		done
+		for suffix in service timer; do mv -f "$SYSTEMD_USER/$BACKLOG_UNIT.$suffix.tmp.$$" "$SYSTEMD_USER/$BACKLOG_UNIT.$suffix"; done
+		systemctl --user daemon-reload || fail "backlog rank daemon-reload failed" 1
+		systemctl --user enable --now "$BACKLOG_UNIT.timer" || fail "backlog rank timer enable failed" 1
+		step "backlog rank enabled: hourly at :15 with catch-up; logs: journalctl --user -u $BACKLOG_UNIT.service"
+		step "Linux user timer runs only while logged in unless linger is enabled; this installer never enables linger"
+	fi
+	step "turn off with: bash install/install.sh --backlog-rank=off"
 fi
 
 # ---- 6e. Phoenix, on by default (wl-mv65t5d34lts00 PLAN.md § 8.1) ------------------------------------

@@ -1,0 +1,22 @@
+# Filled by install/install.sh --backlog-rank; no tokens are stored in this unit.
+# WorkingDirectory is a literal scalar; ExecStart/Environment use quoted words.
+# The scalar's trailing slash protects a basename ending in backslash or whitespace.
+# Literal percent specifiers are escaped in both forms.
+# ExecStart's colon prefix disables environment expansion in paths containing dollars.
+# https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#Command%20lines
+[Unit]
+Description=Daily Jev backlog rank and board sync
+
+[Service]
+Type=oneshot
+ExecStart=:"@BUN@" "@REPO@/surface/scripts/backlog-rank.ts"
+WorkingDirectory=@REPO@/
+Environment="HOME=@HOME@"
+Environment="OMP_PROFILE=@PROFILE@"
+Environment="AGENT_SYSTEM_PROFILE=@PROFILE@"
+Environment="AGENT_SYSTEM_LEDGER_DB=@LEDGER_DB@"
+Environment="AGENT_SYSTEM_BACKLOG_RANK_DIR=@STATE@"
+Environment="PATH=@PATH@"
+UnsetEnvironment=GH_TOKEN GITHUB_TOKEN
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Daily backlog rank (PLAN D5): opt-in via install/install.sh's backlog-rank flag.
+  The installer XML-escapes every placeholder and loads this user agent; the off form
+  confirms it is stopped before removing the plist. No flag leaves this job untouched.
+  Hourly calendar fires coalesce on wake; the script's durable due rule runs once a day
+  or resumes an unfinished run. Tokens are obtained in memory by the script, not stored here.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.agent-system-2.backlog-rank</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@BUN@</string>
+		<string>@REPO@/surface/scripts/backlog-rank.ts</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>@HOME@</string>
+		<key>OMP_PROFILE</key>
+		<string>@PROFILE@</string>
+		<key>AGENT_SYSTEM_PROFILE</key>
+		<string>@PROFILE@</string>
+		<key>AGENT_SYSTEM_LEDGER_DB</key>
+		<string>@LEDGER_DB@</string>
+		<key>AGENT_SYSTEM_BACKLOG_RANK_DIR</key>
+		<string>@STATE@</string>
+		<key>PATH</key>
+		<string>@PATH@</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>@REPO@</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Minute</key>
+		<integer>15</integer>
+	</dict>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>@STATE@/launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>@STATE@/launchd.log</string>
+</dict>
+</plist>

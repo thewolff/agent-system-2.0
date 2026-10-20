@@ -543,3 +543,233 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		expect(tree(home)).toEqual([]);
 	});
 });
+
+describe("install: backlog-rank scheduling (PLAN D5, R9/R10/R15)", () => {
+	const label = "com.agent-system-2.backlog-rank";
+	const unit = "as2-backlog-rank";
+	const shellQuote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
+	function fixture(name: string, os: string, options: { failure?: string; absent?: boolean } = {}) {
+		const dir = join(root, `backlog-${name}`);
+		const home = join(dir, `home & "' \\ $HOME %h @REPO@`);
+		const bin = join(dir, "bin");
+		const log = join(dir, "calls");
+		mkdirSync(home, { recursive: true });
+		mkdirSync(bin);
+		function executable(name: string, text: string) {
+			writeFileSync(join(bin, name), `#!/bin/bash\n${text}\n`);
+			chmodSync(join(bin, name), 0o755);
+		}
+		executable("uname", `echo ${shellQuote(os)}`);
+		executable("gh", `echo 'gh '"$*" >>${shellQuote(log)}\nexit ${options.failure === "auth" ? 1 : 0}`);
+		for (const tool of ["omp", "git"]) executable(tool, "exit 0");
+		symlinkSync(process.execPath, join(bin, "bun"));
+		const dirnameBin = Bun.which("dirname", { PATH: installPath });
+		if (!dirnameBin) throw new Error("test setup: dirname is required");
+		symlinkSync(dirnameBin, join(bin, "dirname"));
+		executable("launchctl", [
+			`echo 'launchctl '"$*" >>${shellQuote(log)}`,
+			options.failure === "launchctl" ? "exit 5" : "",
+			options.failure === "bootout" || options.failure === "loaded"
+				? 'if [ "$1" = print ]; then exit 0; fi'
+				: `if [ "$1" = print ]; then echo 'Could not find service' >&2; exit 113; fi`,
+			options.failure === "bootout" ? 'if [ "$1" = bootout ]; then exit 5; fi' : "",
+			"exit 0",
+		].join("\n"));
+		executable("systemctl", [
+			`echo 'systemctl '"$*" >>${shellQuote(log)}`,
+			`[ "$2" != ${shellQuote(options.failure ?? "never")} ] || exit 5`,
+			'if [ "$2" = show ]; then',
+			`  echo LoadState=${options.absent ? "not-found" : "loaded"}`,
+			'  if [ "$#" -gt 5 ]; then',
+			`    echo ActiveState=${options.failure === "still-active" ? "active" : "inactive"}`,
+			options.failure === "incomplete" ? "" : `    echo UnitFileState=${options.absent ? "" : options.failure === "still-enabled" ? "enabled" : "disabled"}`,
+			"  fi",
+			"fi",
+			"exit 0",
+		].join("\n"));
+		const env = {
+			PATH: `${bin}:/usr/bin:/bin`, HOME: home,
+			AGENT_SYSTEM_LEDGER_DB: join(home, "ledger.db"),
+			AGENT_SYSTEM_PROFILE: `rank "' $HOME %h`,
+			AGENT_SYSTEM_BACKLOG_RANK_DIR: `state "' $HOME %h @HOME@`,
+			GH_TOKEN: "never-render-this-token", GITHUB_TOKEN: "never-render-this-token",
+		};
+		const run = (args: string[], overrides: Record<string, string> = {}) => {
+			const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), ...args], {
+				cwd: dir, env: { ...env, ...overrides }, stdout: "pipe", stderr: "pipe",
+			});
+			return { code: r.exitCode, out: r.stdout.toString() + r.stderr.toString() };
+		};
+		return {
+			home, bin, dir, env, run,
+			plist: join(home, "Library", "LaunchAgents", `${label}.plist`),
+			service: join(home, ".config", "systemd", "user", `${unit}.service`),
+			timer: join(home, ".config", "systemd", "user", `${unit}.timer`),
+			calls: () => existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : [],
+		};
+	}
+	const unitQuote = (s: string) => s.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("%", "%%");
+
+	test("no flag leaves backlog jobs untouched and never contacts either scheduler", () => {
+		const f = fixture("no-flag", "Linux");
+		const r = f.run([]);
+		expect(r.code).toBe(0);
+		expect(f.calls()).toEqual([]);
+		expect(existsSync(f.service)).toBe(false);
+		expect(existsSync(f.plist)).toBe(false);
+	});
+
+	test("Linux installs an hourly persistent user timer, absolute quoted environment and no tokens; off removes both units", () => {
+		const f = fixture("linux", "Linux");
+		const r = f.run(["--backlog-rank"]);
+		expect({ code: r.code, out: r.out }).toEqual({ code: 0, out: expect.stringContaining("unless linger is enabled") });
+		const service = readFileSync(f.service, "utf8");
+		const timer = readFileSync(f.timer, "utf8");
+		expect(service).toContain(`ExecStart=:"${unitQuote(join(f.bin, "bun"))}" "${unitQuote(join(copy, "surface", "scripts", "backlog-rank.ts"))}"`);
+		for (const [key, value] of Object.entries({
+			HOME: f.home, OMP_PROFILE: f.env.AGENT_SYSTEM_PROFILE, PATH: `${f.bin}:/usr/bin:/bin:/usr/sbin:/sbin`,
+			AGENT_SYSTEM_LEDGER_DB: f.env.AGENT_SYSTEM_LEDGER_DB,
+			AGENT_SYSTEM_BACKLOG_RANK_DIR: join(f.dir, f.env.AGENT_SYSTEM_BACKLOG_RANK_DIR),
+		})) expect(service).toContain(`Environment="${key}=${unitQuote(value)}"`);
+		expect(service).toContain(`WorkingDirectory=${copy.replaceAll("%", "%%")}/\n`);
+		expect(service).not.toContain("never-render-this-token");
+		expect(timer).toContain("OnCalendar=*-*-* *:15:00");
+		expect(timer).toContain("Persistent=true");
+		expect(timer).toContain("WantedBy=timers.target");
+		expect(f.calls()).toContain("systemctl --user daemon-reload");
+		expect(f.calls()).toContain(`systemctl --user enable --now ${unit}.timer`);
+		expect(f.calls().join("\n")).not.toContain("linger");
+		const off = f.run(["--backlog-rank=off"], { PATH: `${f.bin}:/usr/bin:/bin`, AGENT_SYSTEM_LEDGER_DB: "/unreadable/ledger.db" });
+		expect(off.code).toBe(0);
+		expect(off.out).not.toContain("reading manifest");
+		expect(existsSync(f.service)).toBe(false);
+		expect(existsSync(f.timer)).toBe(false);
+		expect(f.calls()).toContain(`systemctl --user disable --now ${unit}.timer`);
+		expect(f.calls()).toContain(`systemctl --user stop ${unit}.service`);
+	});
+
+	test.skipIf(process.platform !== "darwin")("macOS loads an XML-escaped hourly calendar job and off removes it", () => {
+		const f = fixture("mac", "Darwin");
+		const r = f.run(["--backlog-rank"]);
+		expect({ code: r.code, out: r.out }).toEqual({ code: 0, out: expect.stringContaining("backlog rank loaded") });
+		const job = JSON.parse(Bun.spawnSync(["/usr/bin/plutil", "-convert", "json", "-o", "-", f.plist], { stdout: "pipe" }).stdout.toString());
+		expect(job.ProgramArguments).toEqual([join(f.bin, "bun"), join(copy, "surface", "scripts", "backlog-rank.ts")]);
+		expect(job.StartCalendarInterval).toEqual({ Minute: 15 });
+		expect(job.WorkingDirectory).toBe(copy);
+		expect(job.EnvironmentVariables).toEqual({
+			HOME: f.home, OMP_PROFILE: f.env.AGENT_SYSTEM_PROFILE, AGENT_SYSTEM_PROFILE: f.env.AGENT_SYSTEM_PROFILE,
+			AGENT_SYSTEM_LEDGER_DB: f.env.AGENT_SYSTEM_LEDGER_DB,
+			AGENT_SYSTEM_BACKLOG_RANK_DIR: join(f.dir, f.env.AGENT_SYSTEM_BACKLOG_RANK_DIR),
+			PATH: `${f.bin}:/usr/bin:/bin:/usr/sbin:/sbin`,
+		});
+		expect(readFileSync(f.plist, "utf8")).not.toContain("never-render-this-token");
+		expect(f.calls()).toContain(`launchctl bootstrap gui/${process.getuid?.() ?? 0} ${f.plist}`);
+		expect(f.run(["--backlog-rank=off"]).code).toBe(0);
+		expect(existsSync(f.plist)).toBe(false);
+	});
+
+	for (const os of ["Darwin", "Linux"]) {
+		test(`${os}: duplicate and mixed install/off flags refuse before any writes`, () => {
+			const f = fixture(`flags-${os}`, os);
+			for (const args of [
+				["--backlog-rank", "--backlog-rank"], ["--backlog-rank", "--backlog-rank=off"],
+				["--backlog-rank=off", "--backlog-rank=off"],
+				["--backlog-rank=off", "--scratch-sweep"], ["--train-tick=off", "--backlog-rank"],
+			]) expect(f.run(args).code).toBe(2);
+			expect(readdirSync(f.home)).toEqual([]);
+			expect(f.calls()).toEqual([]);
+		});
+		test(`${os}: failed gh authentication refuses before ledger/profile/job writes`, () => {
+			const f = fixture(`auth-${os}`, os, { failure: "auth" });
+			expect(f.run(["--backlog-rank"]).code).toBe(2);
+			expect(readdirSync(f.home)).toEqual([]);
+		});
+	}
+
+	for (const failure of ["show-environment", "disable", "stop", "show", "still-active", "still-enabled", "incomplete"]) {
+		test(`Linux: ${failure} fails closed, keeping both unit files`, () => {
+			const f = fixture(`linux-off-${failure}`, "Linux", { failure });
+			mkdirSync(dirname(f.service), { recursive: true });
+			writeFileSync(f.service, "service\n");
+			writeFileSync(f.timer, "timer\n");
+			const args = failure === "show-environment" ? ["--backlog-rank"] : ["--backlog-rank=off"];
+			const r = f.run(args);
+			expect(r.code).toBe(failure === "show-environment" ? 2 : 1);
+			expect(readFileSync(f.service, "utf8")).toBe("service\n");
+			expect(readFileSync(f.timer, "utf8")).toBe("timer\n");
+			expect(existsSync(f.env.AGENT_SYSTEM_LEDGER_DB)).toBe(false);
+			expect(r.out).not.toContain("reading manifest");
+		});
+	}
+	test("Linux: confirmed absent off is idempotent without bun and writes no install state", () => {
+		const f = fixture("absent", "Linux", { absent: true });
+		rmSync(join(f.bin, "bun"));
+		expect(f.run(["--backlog-rank=off"]).code).toBe(0);
+		expect(readdirSync(f.home)).toEqual([]);
+	});
+	test("macOS: failed inspection keeps the plist without bun or install work", () => {
+		const f = fixture("mac-off-fail", "Darwin", { failure: "launchctl" });
+		rmSync(join(f.bin, "bun"));
+		mkdirSync(dirname(f.plist), { recursive: true });
+		writeFileSync(f.plist, "keep\n");
+		expect(f.run(["--backlog-rank=off"]).code).toBe(1);
+		expect(readFileSync(f.plist, "utf8")).toBe("keep\n");
+		expect(existsSync(f.env.AGENT_SYSTEM_LEDGER_DB)).toBe(false);
+	});
+	test("unsupported OS refuses before writes", () => {
+		const f = fixture("unsupported", "FreeBSD");
+		expect(f.run(["--backlog-rank"]).code).toBe(2);
+		expect(readdirSync(f.home)).toEqual([]);
+	});
+	for (const os of ["Darwin", "Linux"]) {
+		for (const tool of ["bun", "gh", "omp", "git", os === "Darwin" ? "launchctl" : "systemctl"]) {
+			test(`${os}: missing ${tool} refuses before writes`, () => {
+				const f = fixture(`missing-${os}-${tool}`, os);
+				rmSync(join(f.bin, tool));
+				const r = f.run(["--backlog-rank"], { PATH: f.bin });
+				expect(r.code).toBe(tool === "bun" ? 1 : 2);
+				expect(readdirSync(f.home)).toEqual([]);
+			});
+		}
+		test(`${os}: missing scheduler fails closed on off and keeps its files`, () => {
+			const f = fixture(`missing-off-${os}`, os);
+			const file = os === "Darwin" ? f.plist : f.service;
+			mkdirSync(dirname(file), { recursive: true });
+			writeFileSync(file, "keep\n");
+			rmSync(join(f.bin, os === "Darwin" ? "launchctl" : "systemctl"));
+			expect(f.run(["--backlog-rank=off"], { PATH: f.bin }).code).toBe(1);
+			expect(readFileSync(file, "utf8")).toBe("keep\n");
+		});
+		test(`${os}: control characters refuse before writes`, () => {
+			const f = fixture(`control-${os}`, os);
+			expect(f.run(["--backlog-rank"], { AGENT_SYSTEM_BACKLOG_RANK_DIR: "state\nEnvironment=BAD=yes" }).code).toBe(2);
+			expect(readdirSync(f.home)).toEqual([]);
+		});
+	}
+	test("macOS: loaded off boots out before deleting, and failed bootout keeps the plist", () => {
+		for (const failure of ["loaded", "bootout"]) {
+			const f = fixture(`mac-${failure}`, "Darwin", { failure });
+			mkdirSync(dirname(f.plist), { recursive: true });
+			writeFileSync(f.plist, "keep\n");
+			expect(f.run(["--backlog-rank=off"]).code).toBe(failure === "loaded" ? 0 : 1);
+			expect(f.calls()).toEqual([
+				`launchctl print gui/${process.getuid?.() ?? 0}/${label}`,
+				`launchctl bootout gui/${process.getuid?.() ?? 0}/${label}`,
+			]);
+			expect(existsSync(f.plist)).toBe(failure === "bootout");
+		}
+	});
+	test("Linux: default state, relative ledger and XDG unit directory become absolute without rescanning placeholders", () => {
+		const f = fixture("linux-defaults", "Linux");
+		const config = join(f.home, "config %h");
+		const r = f.run(["--backlog-rank"], {
+			AGENT_SYSTEM_BACKLOG_RANK_DIR: "", AGENT_SYSTEM_LEDGER_DB: "relative ledger.db", XDG_CONFIG_HOME: config,
+		});
+		expect({ code: r.code, out: r.out }).toEqual({ code: 0, out: expect.stringContaining("backlog rank enabled") });
+		const service = readFileSync(join(config, "systemd", "user", `${unit}.service`), "utf8");
+		expect(service).toContain(`Environment="AGENT_SYSTEM_BACKLOG_RANK_DIR=${unitQuote(join(f.home, ".agent-system-2", "backlog-rank"))}"`);
+		expect(service).toContain(`Environment="AGENT_SYSTEM_LEDGER_DB=${unitQuote(join(f.dir, "relative ledger.db"))}"`);
+		expect(f.run(["--backlog-rank=off"], { XDG_CONFIG_HOME: config }).code).toBe(0);
+		expect(existsSync(join(config, "systemd", "user", `${unit}.service`))).toBe(false);
+	});
+});
