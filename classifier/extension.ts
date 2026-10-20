@@ -702,14 +702,20 @@ function effectiveStakes(brief: Stakes | null, workload: Stakes | null): Stakes 
 /**
  * D9: the fixed paragraph appended to every review item's brief. Its first line names no § B9 field
  * (gates/src/rows/r05-brief-fields.ts reads the first occurrence of each), so row 5 reads the brief
- * as before.
+ * as before. It ends with one complete block `parseFindings` parses (PLAN wl-mv654hoqwpfhmo § 10): a
+ * placeholder holding one blocking finding, so a reply that copies it verbatim fails the round
+ * visibly instead of reading as a clean review.
  */
 export const REVIEW_FINDINGS_PARAGRAPH = [
 	"",
 	"",
 	"Findings block (agent-system 2.0 review round limit): end your final report with one fenced code block whose info string is review-findings, holding JSON",
 	'{"findings":[{"severity":"blocking|major|minor","kind":"correctness|security|tests|design|docs|other","title":"…"}]}',
-	"with one entry per finding you report and an empty list when there is none. Only the last such block is read; a missing or malformed block fails the review round.",
+	'with one entry per finding you report; when there is none, the block holds the empty list, {"findings":[]}. Only the last such block is read; a missing or malformed block fails the review round.',
+	"The complete block, fences included, with a placeholder entry: replace the entry with your findings, or the list with the empty one. Copied as it stands, it reports one blocking finding.",
+	"```review-findings",
+	'{"findings":[{"severity":"blocking","kind":"other","title":"unreplaced placeholder from the brief\'s example block: the reviewer sent no findings of its own"}]}',
+	"```",
 ].join("\n");
 
 /** A review item's brief with the findings paragraph, appended once. */
@@ -746,19 +752,70 @@ function findingsIn(text: string | null): FindingsOrUnknown {
 }
 
 /**
+ * PLAN wl-mv654hoqwpfhmo § 10 (Jo, q-mvfor0be7rezgg): a hand's final assistant text, read from its
+ * session file: the text parts of the assistant messages after the last user message and after the
+ * last assistant message that calls a tool other than `yield`, in session order, one per line. That
+ * is OMP's harvest rule (task/executor.ts, `startedMoreWork`): a turn that starts more work makes
+ * every earlier report text stale, its own text included. So a block split around the yield call (its
+ * closing fence a text part of its own) rejoins, a block turn followed by a `developer` reminder and a
+ * yield-only turn is read, and nothing before the window is: not the brief and its example block, not
+ * a reply an earlier user message superseded, not a draft or an echo that later tool work superseded.
+ * A session with no user message reads as "".
+ */
+function finalAssistantText(session: string): string {
+	let texts: string[] = [];
+	let replied = false;
+	for (const line of session.split("\n")) {
+		// Most lines (custom rows, usage, the session header) are not message records: skip them unparsed.
+		if (!line.includes('"type":"message"')) continue;
+		let record: unknown;
+		try {
+			record = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (typeof record !== "object" || record === null) continue;
+		const { type, message } = record as { type?: unknown; message?: unknown };
+		if (type !== "message" || typeof message !== "object" || message === null) continue;
+		const { role, content } = message as { role?: unknown; content?: unknown };
+		if (role === "user") {
+			texts = [];
+			replied = true;
+		} else if (role === "assistant" && replied) {
+			// OMP's `startedMoreWork`: the message calls a tool other than `yield`.
+			if (Array.isArray(content) && content.some(part => typeof part === "object" && part !== null && part.type === "toolCall" && part.name !== "yield")) {
+				texts = [];
+				continue;
+			}
+			const text = messageText(content);
+			if (text) texts.push(text);
+		}
+	}
+	return texts.join("\n");
+}
+
+/**
  * D9: a review hand's findings, from what was delivered for it; when that carries no readable block
  * (OMP may cut a long result to a preview), from the full output OMP writes before the result exists
- * (`<artifactsDir>/<id>.md`, task/executor.ts finalizeRunResult).
+ * (`<artifactsDir>/<id>.md`, task/executor.ts finalizeRunResult); when that has none either, from the
+ * hand's final assistant text in its session file (`handKey`; PLAN wl-mv654hoqwpfhmo § 10: A10 found
+ * Kimi hands writing the block there and yielding the findings without it). The first source that
+ * parses wins; a missing or unreadable file is no source.
  */
-function handFindings(delivered: string | null, root: string, agentId: string): FindingsOrUnknown {
+export function handFindings(delivered: string | null, root: string, agentId: string): FindingsOrUnknown {
+	const read = (file: string): string | null => {
+		try {
+			return readFileSync(file, "utf8");
+		} catch {
+			return null;
+		}
+	};
 	const f = findingsIn(delivered);
 	if (f !== UNKNOWN) return f;
-	const file = join(root, `${agentId}.md`);
-	try {
-		return existsSync(file) ? findingsIn(readFileSync(file, "utf8")) : UNKNOWN;
-	} catch {
-		return UNKNOWN;
-	}
+	const md = findingsIn(read(join(root, `${agentId}.md`)));
+	if (md !== UNKNOWN) return md;
+	const session = read(handKey(root, agentId));
+	return session === null ? UNKNOWN : parseFindings(finalAssistantText(session));
 }
 
 /** A message's text: a string, or its text parts joined. */

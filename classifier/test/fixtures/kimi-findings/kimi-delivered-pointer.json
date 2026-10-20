@@ -1,0 +1,5 @@
+{
+  "verdict": "revise",
+  "summary": "Core mechanism verified sound (all OMP citations exact; hook changes only outbound copy; unwrap rule safe; hands/orchestrator covered). Revise for: (1) unacknowledged wrapper leak via multi-job async-result labels built from the wrapped command; (2) done-line scope vs tradeoff 2 needs Jo's confirmation; plus four minors (exemption prefix breadth, compaction read direction, cacheRead acceptance gate flakiness, drifted executor.ts line citation).",
+  "report": "See full findings report in the preceding message; it ends with the review-findings fenced block (6 findings: 2 major, 4 minor)."
+}

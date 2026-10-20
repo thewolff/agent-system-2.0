@@ -1,0 +1,5 @@
+{
+  "verdict": "approve-with-findings",
+  "bottom_line": "approve-with-findings: rev 4's reframe onto the part-3 invariant closes every round-3 finding and survives every bypass constructed and probed; the two remaining items (F1 test pins, F2 printf -v note) do not block.",
+  "review_findings": "```review-findings\n{\"findings\":[{\"severity\":\"minor\",\"kind\":\"tests\",\"title\":\"Pin the head spellings the invariant leans on: a{l,}ias / $'al\\x69as' g=git (expanded-resolves-to-alias), alia[s] / $(echo ali)as g=git (blind-refused today), and alias -p g=git\"},{\"severity\":\"minor\",\"kind\":\"design\",\"title\":\"readHeadUnmodeled is vacuous for OUTPUT_ONLY heads, so alias p='printf -v' passes part 3; harmless for item 81 (part 1 name-refuses the switch targets) but wider than the invariant's 'safe read-only head' wording\"}]}\n```"
+}
