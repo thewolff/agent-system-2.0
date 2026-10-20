@@ -347,6 +347,9 @@ describe("done-because: receipt (decision 16, Codex review S1)", () => {
 			"pair-exposure: lane-m-1 on",
 			// classifier/src/lab.ts reviewSameLabRuleBody (PLAN wl-mv5xay6bjp0268 § 2.2), as a literal so it loads on the baseline
 			"review-same-lab-rule: in-mv5xafhywe3w8w slice sl-x token dt-a labs openai,anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)",
+			// classifier/src/panel.ts: a three-lab panel's record (wl-mv5m7qvgkxhpj4), as literals so they load on the baseline
+			"panel-group: pg-a {\"run\":\"/r\"}", "panel-leg: pg-a kimi missing no-usable-model", "panel-synth: pg-a dt-a",
+			"panel-published: pg-a out {}", "panel-run: pg-a void hash in/packet.md",
 		];
 		for (const b of bodies) expect(CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).toContain(/^([a-z-]+):/.exec(b)![1]!);
 		expect(new Set(bodies.map((b) => /^([a-z-]+):/.exec(b)![1])).size).toBe(CLASSIFIER_MACHINERY_PREFIXES.length);
