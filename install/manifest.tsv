@@ -1,5 +1,5 @@
 # agent-system 2.0 install manifest (SPEC-2.0.md § B8): the machinery table, machine-read.
-# One row per artifact under a machinery directory: path (repo-relative), kind, destination.
+# One row per artifact under a machinery directory: path (repo-relative), kind, destination, and an optional proposal_id.
 # install/install.sh fails when a file under a machinery directory has no row here, or when any
 # symbolic link sits under one. Exactly one ledger-schema row (ledger/schema.sql, the file the
 # module applies), one ledger-init row, one ledger-backup row and one ledger-backup-agent row.
@@ -7,8 +7,11 @@
 #              "{ledger_db}" = the ledger file ($AGENT_SYSTEM_LEDGER_DB, default $HOME/.agent-system-2/ledger.db);
 #              "{launch_agents}/<name>" = $HOME/Library/LaunchAgents/<name>, written filled in on macOS
 #              only, never loaded by the installer.
+# proposal_id (optional fourth column): "-" = no tuning proposal made the row; "p-<id>" = the proposal
+#              (B14.3) the row came from (PLAN wl-mv654hoqwpfhmo § 11.3). A three-column row means
+#              proposal_id "-"; a fourth column that is present must be "-" or p-[a-z0-9]+.
 # Columns are separated by one TAB. Lines starting with # are comments.
-path	kind	destination
+path	kind	destination	proposal_id
 ledger/SCHEMA.md	doc	-
 ledger/schema.sql	ledger-schema	{ledger_db}
 ledger/src/index.ts	ledger-module	-

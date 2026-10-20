@@ -25,6 +25,9 @@
 # does not start is reported and does not fail the install. The last line names the providers the rendered profile
 # routes to and says each needs a /login once per profile (the profile's setupVersion skips OMP's
 # first-launch sign-in scene).
+# A row's optional fourth column, proposal_id, is `-` or the p-<id> of the tuning proposal the row came from
+# (PLAN wl-mv654hoqwpfhmo § 11.3); a three-column row means `-`. Five or more fields, an empty field or any
+# other proposal_id fails the install.
 # File links also install in the default OMP profile (persistent seats do not use the as2 profile):
 # ~/.omp/agent/extensions/as2-open-links.ts points into this checkout. If herdr is on PATH, its
 # as2.file-links plugin is linked from install/herdr-file-links; without herdr one notice is printed.
@@ -285,13 +288,20 @@ while IFS= read -r line || [ -n "$line" ]; do
 	line_no=$((line_no + 1))
 	case "$line" in '#'* | '') continue ;; esac
 	if [ "$header_seen" -eq 0 ]; then
-		[ "$line" = "$(printf 'path\tkind\tdestination')" ] || fail "manifest line $line_no: expected header 'path<TAB>kind<TAB>destination'" 2
+		[ "$line" = "$(printf 'path\tkind\tdestination\tproposal_id')" ] || fail "manifest line $line_no: expected header 'path<TAB>kind<TAB>destination<TAB>proposal_id'" 2
 		header_seen=1
 		continue
 	fi
-	IFS=$'\t' read -r path kind dest extra <<<"$line"
-	[ -n "${path:-}" ] && [ -n "${kind:-}" ] && [ -n "${dest:-}" ] && [ -z "${extra:-}" ] \
-		|| fail "manifest line $line_no: need exactly three TAB-separated fields: $line" 2
+	# Three or four TAB-separated fields, none empty: the count is taken from the TABs themselves, since `read` folds
+	# runs of TABs and would hide an empty field.
+	tabs=${line//[^$'\t']/}
+	{ [ "${#tabs}" -eq 2 ] || [ "${#tabs}" -eq 3 ]; } && [[ $line != $'\t'* && $line != *$'\t' && $line != *$'\t\t'* ]] \
+		|| fail "manifest line $line_no: need three or four TAB-separated fields, none empty (path, kind, destination, optional proposal_id): $line" 2
+	IFS=$'\t' read -r path kind dest proposal_id <<<"$line"
+	# proposal_id (PLAN wl-mv654hoqwpfhmo § 11.3): absent means "-", no tuning proposal made the row; else that proposal's p-<id>.
+	proposal_id=${proposal_id:--}
+	[[ $proposal_id == - || $proposal_id =~ ^p-[a-z0-9]+$ ]] \
+		|| fail "manifest line $line_no: proposal_id '$proposal_id' is neither - nor a p-<id>: $line" 2
 	[ -f "$REPO/$path" ] || fail "manifest line $line_no: $path does not exist in the repo" 2
 	[ ! -L "$REPO/$path" ] || fail "manifest line $line_no: $path is a symbolic link; machinery artifacts are regular files" 2
 	case "$kind" in

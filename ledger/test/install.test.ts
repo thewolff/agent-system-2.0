@@ -259,6 +259,39 @@ describe("install: the manifest's ledger-schema row is strict (S1)", () => {
 	});
 });
 
+describe("install: a manifest row's optional proposal_id (PLAN wl-mv654hoqwpfhmo § 11.3, PR-P)", () => {
+	const FIELDS = "need three or four TAB-separated fields, none empty";
+	const cases: [label: string, from: string, to: string, why: string][] = [
+		["empty-proposal", DOC_ROW, `${DOC_ROW}${T}`, FIELDS],
+		["fifth-field", DOC_ROW, `${DOC_ROW}${T}-${T}extra`, FIELDS],
+		["empty-kind", DOC_ROW, `ledger/SCHEMA.md${T}${T}doc${T}-`, FIELDS],
+		["bad-proposal", DOC_ROW, `${DOC_ROW}${T}proposal-1`, "proposal_id 'proposal-1' is neither - nor a p-<id>"],
+		["old-header", ["path", "kind", "destination", "proposal_id"].join(T), ["path", "kind", "destination"].join(T), "expected header 'path<TAB>kind<TAB>destination<TAB>proposal_id'"],
+	];
+	for (const [label, from, to, why] of cases) {
+		test(`${label} is refused with exit 2, nothing written`, () => {
+			manifestWith([from, to]);
+			const r = install(label);
+			writeFileSync(manifest, original);
+			expect(r.out).toContain(why);
+			expect(r.exitCode).toBe(2);
+			expect(existsSync(r.db)).toBe(false);
+		});
+	}
+
+	test("a three-column row reads as proposal_id -, and a fourth column of - or a proposal's p- id is accepted", () => {
+		expect(DOC_ROW.split(T)).toHaveLength(3);
+		const accepted = [["three-columns", DOC_ROW], ["dash", `${DOC_ROW}${T}-`], ["p-id", `${DOC_ROW}${T}p-mv0abc123`]] as const;
+		const runs = accepted.map(([label, to]) => {
+			manifestWith([DOC_ROW, to]);
+			const r = install(label);
+			writeFileSync(manifest, original);
+			return [label, r.exitCode, r.out.includes("install complete")];
+		});
+		expect(runs).toEqual(accepted.map(([label]) => [label, 0, true]));
+	});
+});
+
 describe("install: every machinery file has exactly one manifest row (P-11 manifest-or-fail)", () => {
 	test("an unmanifested regular file under a machinery directory is refused and named, nothing written", () => {
 		const file = "ledger/src/unmanifested-probe.ts";

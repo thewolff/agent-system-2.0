@@ -9,8 +9,8 @@
 // never writing lane-died:.
 import { afterAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join, relative, sep } from "node:path";
 import { handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, type QuestionRow, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { ceilingBody, CEILING_OPTIONS, parseSpend } from "../src/ceiling";
@@ -310,6 +310,78 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		expect(await hooksOf(true)).toEqual([]);
 		expect(await hooksOf(false)).toEqual(["BASH_ENV", "CDPATH"]);
 	}, 60_000);
+});
+
+describe("provenance (PLAN wl-mv654hoqwpfhmo § 11.3 day one, PR-P): lane-started: names the as2 checkout the runner runs from", () => {
+	/** This tree's own checkout: the source of the machinery copied below. */
+	const SOURCE = join(import.meta.dir, "..", "..");
+	/** The top-level directories the lane script loads modules and files from at run time (its import graph, tiers/lane.md, the contract, the voice, the profile template). */
+	const MACHINERY = ["surface", "gates", "classifier", "ledger", "tiers", "contract", "voice", "profile"];
+	/**
+	 * A git checkout under the root holding this tree's machinery (test directories left out) and one tracked file, committed:
+	 * `bun <copy>/surface/scripts/lane.ts launch` runs the starter, and through it the runner and the drain, from the copy, so the
+	 * copy is the as2 checkout the lane runs under, and its HEAD and dirtiness are the test's to set.
+	 */
+	function as2Checkout(r: LaneRoot): { dir: string; script: string; head: string } {
+		const dir = join(r.root, "as2");
+		for (const d of MACHINERY) {
+			cpSync(join(SOURCE, d), join(dir, d), { recursive: true, filter: (src) => !relative(SOURCE, src).split(sep).some((s) => s === "test" || s === "node_modules" || s === ".DS_Store") });
+		}
+		writeFileSync(join(dir, "provenance.txt"), "committed\n");
+		for (const args of [["init", "-q", "-b", "main"], ["config", "user.email", "t@example.invalid"], ["config", "user.name", "t"], ["config", "commit.gpgsign", "false"], ["add", "-A"], ["commit", "-q", "-m", "as2 copy"]]) {
+			const g = git(dir, args);
+			if (g.code !== 0) throw new Error(`git ${args.join(" ")}: ${g.err}`);
+		}
+		return { dir, script: join(dir, "surface", "scripts", "lane.ts"), head: git(dir, ["rev-parse", "HEAD"]).out };
+	}
+	/** Every lane-started: record of the root's one lane, launched from `script`, once its lane-exit: has landed. */
+	async function startsFrom(r: LaneRoot, script: string): Promise<Record<string, unknown>[]> {
+		const { wl } = openWorkload(r);
+		setScript(r, { steps: [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] });
+		const launched = sh(["bun", script, "launch", wl, "--requested-by", "test"], r.repo, r.env);
+		expect({ code: launched.code, err: launched.err }).toMatchObject({ code: STARTER_EXIT.ok });
+		const laneId = laneIdOf(wl, 1);
+		expect((await exitOf(r, wl, laneId)).outcome).toBe("completed");
+		return laneSnapshot(r, wl).control.filter((c) => c.prefix === "lane-started" && c.laneId === laneId).map((c) => JSON.parse(c.rest) as Record<string, unknown>);
+	}
+
+	test("as2Commit is the HEAD sha of that checkout on every lane-started: record; as2Dirty is false while its tracked files are clean (an untracked file included) and true once one has an uncommitted change", async () => {
+		// One root per launch: a lane's exit spawns the drain (MIGRATION.md item 71), which may start the next open workload of its root.
+		const clean = makeRoot();
+		const as2 = as2Checkout(clean);
+		expect(as2.head).toMatch(/^[0-9a-f]{40}$/);
+		// an untracked file only (the live checkout always has some, e.g. .ai/ notes): not dirty
+		writeFileSync(join(as2.dir, "untracked.txt"), "never added\n");
+		expect(git(as2.dir, ["status", "--porcelain"]).out).toBe("?? untracked.txt");
+		expect(laneScript.readAs2Provenance(as2.dir)).toEqual({ as2Commit: as2.head, as2Dirty: false });
+		const cleanStarts = await startsFrom(clean, as2.script);
+		expect(cleanStarts).toHaveLength(2);
+		expect(cleanStarts.map((s) => ({ as2Commit: s.as2Commit, as2Dirty: s.as2Dirty }))).toEqual([
+			{ as2Commit: as2.head, as2Dirty: false },
+			{ as2Commit: as2.head, as2Dirty: false },
+		]);
+
+		// an uncommitted change to a tracked file: HEAD is the same commit, the checkout is dirty
+		writeFileSync(join(as2.dir, "provenance.txt"), "changed, not committed\n");
+		expect(git(as2.dir, ["status", "--porcelain"]).out).toBe("M provenance.txt\n?? untracked.txt");
+		const dirty = makeRoot();
+		const dirtyStarts = await startsFrom(dirty, as2.script);
+		expect(dirtyStarts).toHaveLength(2);
+		expect(dirtyStarts.map((s) => ({ as2Commit: s.as2Commit, as2Dirty: s.as2Dirty }))).toEqual([
+			{ as2Commit: as2.head, as2Dirty: true },
+			{ as2Commit: as2.head, as2Dirty: true },
+		]);
+		expect(git(as2.dir, ["rev-parse", "HEAD"]).out).toBe(as2.head);
+	}, 90_000);
+
+	test("readAs2Provenance: a directory git cannot read leaves both fields null and throws nothing; this checkout reads as a commit", () => {
+		const r = makeRoot();
+		const notGit = join(r.root, "not-a-checkout");
+		mkdirSync(notGit);
+		expect(laneScript.readAs2Provenance(notGit)).toEqual({ as2Commit: null, as2Dirty: null });
+		expect(laneScript.readAs2Provenance(join(r.root, "missing"))).toEqual({ as2Commit: null, as2Dirty: null });
+		expect(laneScript.readAs2Provenance(SOURCE).as2Commit).toBe(git(SOURCE, ["rev-parse", "HEAD"]).out);
+	});
 });
 
 describe("lane script: every exit is classified (decision 14; Codex review B1, B2, B3, B4)", () => {

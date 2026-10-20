@@ -6,7 +6,7 @@ import { handBuilderBody, handSettledBody, handSpawnBody, laneBuilderBody, revie
 import { reviewGroupBody, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type InstructionRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
 import {
-	boundPrs, CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv, launchable, maxTimeMs,
+	as2ProvenanceOf, boundPrs, CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv, laneStartedBody, launchable, maxTimeMs,
 	PLAN_FILE_MAX_BYTES, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_SHAPE, planQuestionProblem, requirementsProblem, reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
 	testPrBody, testPrInstructionBody, type Resolution, resumePlan, resumeSession, TRAIN_LANDS_LINE, verdictOf, waivedPrs, waivePrBody, waivePrInstructionBody,
 } from "../src/launch";
@@ -302,6 +302,25 @@ describe("resume session (Codex review B6)", () => {
 		expect(resumePlan(c, "lane-m-3", [resolution("in-1", "lane-m-1")], null).resume).toBe("/one.jsonl");
 		expect(resumePlan(c, "lane-m-2", [], null).resume).toBe("/two.jsonl");
 		expect(resumePlan(c, "lane-m-3", [resolution("in-1", "lane-m-7")], null).resume).toBe("/two.jsonl");
+	});
+});
+
+describe("lane-started: provenance (PLAN wl-mv654hoqwpfhmo § 11.3, PR-P)", () => {
+	const SHA = "0123456789abcdef0123456789abcdef01234567";
+	test("as2ProvenanceOf: a clean HEAD answer is the commit, porcelain output is dirty; a failed, missing or malformed answer is null", () => {
+		expect(as2ProvenanceOf({ code: 0, out: `${SHA}\n` }, { code: 0, out: "" })).toEqual({ as2Commit: SHA, as2Dirty: false });
+		expect(as2ProvenanceOf({ code: 0, out: SHA }, { code: 0, out: " M surface/src/launch.ts\n" })).toEqual({ as2Commit: SHA, as2Dirty: true });
+		expect(as2ProvenanceOf({ code: 128, out: "" }, { code: 128, out: "fatal: not a git repository" })).toEqual({ as2Commit: null, as2Dirty: null });
+		expect(as2ProvenanceOf(null, null)).toEqual({ as2Commit: null, as2Dirty: null });
+		expect(as2ProvenanceOf({ code: 0, out: "HEAD" }, null)).toEqual({ as2Commit: null, as2Dirty: null });
+	});
+	test("laneStartedBody adds as2Commit and as2Dirty after the start fields, nulls included; without them the record has neither", () => {
+		const s = { pid: 1, start: "x", session: null, argv: [], runnerPid: 2 };
+		expect(laneStartedBody("lane-m-1", s, { as2Commit: SHA, as2Dirty: true })).toBe(`lane-started: lane-m-1 {"pid":1,"start":"x","session":null,"argv":[],"runnerPid":2,"as2Commit":"${SHA}","as2Dirty":true}`);
+		expect(laneStartedBody("lane-m-1", s, { as2Commit: null, as2Dirty: null })).toBe('lane-started: lane-m-1 {"pid":1,"start":"x","session":null,"argv":[],"runnerPid":2,"as2Commit":null,"as2Dirty":null}');
+		expect(laneStartedBody("lane-m-1", s)).toBe('lane-started: lane-m-1 {"pid":1,"start":"x","session":null,"argv":[],"runnerPid":2}');
+		// the parse a resume reads is unchanged by the two fields
+		expect(resumeSession(control([entry(LANE_RUNNER_BY, laneStartedBody("lane-m-1", { ...s, session: "/one.jsonl" }, { as2Commit: SHA, as2Dirty: false }))]))).toBe("/one.jsonl");
 	});
 });
 

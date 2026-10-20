@@ -63,7 +63,7 @@ import { factsBlock } from "../src/facts";
 import { loadTestRunnerConfig } from "../src/close-entry";
 import { checkoutOwnerRepo, isTrainOrFix, ownerTasks } from "../src/merge-train";
 import {
-	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
+	type As2Provenance, as2ProvenanceOf, branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, scratchCapMb, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
@@ -143,6 +143,27 @@ const git = (repo: string, args: string[], timeoutMs?: number): { code: number; 
 /** The bound on the starter's `git fetch` before it cuts a branch; a fetch past it counts as failed. Well inside the 30 s the trigger gives the whole starter (surface/extensions/launch.ts). */
 const FETCH_TIMEOUT_MS = msEnv("AGENT_SYSTEM_LANE_FETCH_TIMEOUT_MS", 10_000);
 const which = (bin: string): string | null => Bun.which(bin);
+/** The bound on each of `readAs2Provenance`'s two git reads; past it the field is null and the launch goes on. */
+const PROVENANCE_GIT_TIMEOUT_MS = 10_000;
+
+/**
+ * The as2 checkout this script runs from (`repo`, default REPO_ROOT: the machinery the installed profile points at) as
+ * `lane-started:` records it (PLAN wl-mv654hoqwpfhmo § 11.3): `git rev-parse HEAD` and `git status --porcelain
+ * --untracked-files=no` (tracked changes only: the live checkout always holds untracked notes such as `.ai/`), the second
+ * without optional locks so it never writes that checkout's index. A git that fails, times out or cannot be run leaves its
+ * field null; nothing here throws, so provenance never blocks a launch.
+ */
+export function readAs2Provenance(repo: string = REPO_ROOT): As2Provenance {
+	const ask = (args: string[]) => {
+		try {
+			const r = git(repo, args, PROVENANCE_GIT_TIMEOUT_MS);
+			return r.timedOut ? null : r;
+		} catch {
+			return null;
+		}
+	};
+	return as2ProvenanceOf(ask(["rev-parse", "--verify", "HEAD"]), ask(["--no-optional-locks", "status", "--porcelain", "--untracked-files=no"]));
+}
 
 /**
  * `ps -p <pid> -o stat=,lstart=`: the process start time, or null when no such process (macOS first, § 7 item 5).
@@ -1163,6 +1184,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	 * through the post-spawn failure path: omp is killed and reaped, then the failure is finalized as the lock's owner.
 	 */
 	let ompStart: string | null = null;
+	// The as2 checkout this runner runs from, read once before the spawn's write (git never runs inside a ledger write), so every
+	// lane-started: of this run names the same commit (PLAN wl-mv654hoqwpfhmo § 11.3).
+	const as2 = readAs2Provenance();
 	const startRecord = (): string => {
 		const c = child;
 		if (c !== null && ompStart === null) {
@@ -1172,7 +1196,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				throw new Fail("run", `${laneId} not started: omp pid ${c.pid}'s start time, which its lane-started: records, could not be read (${oneLine(err)}); omp is killed and its start not recorded`, STARTER_EXIT.unknown!);
 			}
 		}
-		return laneStartedBody(laneId, { pid: c?.pid ?? 0, start: ompStart ?? "", session, argv, runnerPid: process.pid, model, ranModel, resumeSkipped });
+		return laneStartedBody(laneId, { pid: c?.pid ?? 0, start: ompStart ?? "", session, argv, runnerPid: process.pid, model, ranModel, resumeSkipped }, as2);
 	};
 
 	// The ceiling meter (DESIGN-workload-ceiling.md § 2 items 3, 4): the offsets live as long as the run and the first scan starts
@@ -1771,9 +1795,10 @@ async function cmdInteractive(wl: string): Promise<number> {
 		// re-record after omp exits runs no ps, so a ps failing there cannot end in the catch, which would record launch-failed:
 		// for a lane that ran and drop its lane-exit: (openai review r5).
 		let ompStart: string | null = null;
+		const as2 = readAs2Provenance();
 		const record = (session: string | null): void => {
 			ompStart ??= startTime(child.pid) ?? "";
-			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(laneId, { pid: child.pid, start: ompStart, session, argv, runnerPid: process.pid, model, resumeSkipped: skipped }) });
+			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(laneId, { pid: child.pid, start: ompStart, session, argv, runnerPid: process.pid, model, resumeSkipped: skipped }, as2) });
 		};
 		record(resume);
 		const code = await child.exited;

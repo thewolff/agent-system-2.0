@@ -546,6 +546,34 @@ export interface LaneStarted {
 	resumeSkipped?: string | null;
 }
 
+/**
+ * The as2 checkout a lane runs under (PLAN wl-mv654hoqwpfhmo § 11.3, B14.3 day one): `as2Commit` is its HEAD sha and
+ * `as2Dirty` whether its tracked files have uncommitted changes (untracked files do not count), each null when git could
+ * not say. The runner reads both from the checkout `lane.ts` runs from (`readAs2Provenance`); `laneStartedBody` adds them.
+ * A `lane-started:` written before this had neither field, and none is backfilled.
+ */
+export interface As2Provenance {
+	as2Commit: string | null;
+	as2Dirty: boolean | null;
+}
+
+/** One git command's answer as `as2ProvenanceOf` reads it, or null when git could not be run at all. */
+export interface GitAnswer {
+	code: number;
+	out: string;
+}
+
+const COMMIT_SHA = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+
+/** `git rev-parse HEAD` and `git status --porcelain --untracked-files=no` answers as provenance (pure): a failed or malformed answer is null, never a guess. */
+export function as2ProvenanceOf(head: GitAnswer | null, status: GitAnswer | null): As2Provenance {
+	const sha = head?.code === 0 ? head.out.trim() : "";
+	return {
+		as2Commit: COMMIT_SHA.test(sha) ? sha : null,
+		as2Dirty: status?.code === 0 ? status.out.trim() !== "" : null,
+	};
+}
+
 const stringOrNull = (v: object, key: string): string | null => {
 	const x: unknown = Reflect.get(v, key);
 	return typeof x === "string" ? x : null;
@@ -1238,8 +1266,9 @@ export function laneHeadroomBody(laneId: string, from: string, to: string, reaso
 export function launchFailedBody(laneId: string, stage: string, reason: string): string {
 	return `launch-failed: ${laneId} ${stage}: ${oneLine(reason)}`;
 }
-export function laneStartedBody(laneId: string, started: LaneStarted): string {
-	return `lane-started: ${laneId} ${JSON.stringify(started)}`;
+/** `lane-started: <laneId> {json}`: the start fields, then the as2 checkout's `as2Commit` and `as2Dirty` when `as2` is given (PLAN wl-mv654hoqwpfhmo § 11.3). */
+export function laneStartedBody(laneId: string, started: LaneStarted, as2?: As2Provenance): string {
+	return `lane-started: ${laneId} ${JSON.stringify(as2 === undefined ? started : { ...started, as2Commit: as2.as2Commit, as2Dirty: as2.as2Dirty })}`;
 }
 export function laneReadyBody(laneId: string, at: string): string {
 	return `lane-ready: ${laneId} at ${at}`;

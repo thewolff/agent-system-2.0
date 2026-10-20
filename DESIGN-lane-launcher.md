@@ -80,7 +80,7 @@ sequenceDiagram
     Starter->>Runner: spawn lane.ts run detached (own session, stdio → log), exit 0 with lane id
     Surface-->>Ilex: tool result: opened, lane <id> launching
     Runner->>Omp: spawn in worktree: --cwd, --session-dir, --append-system-prompt <tier body>, --max-time, [--model <Jo's lane-model:>], [--resume <same-model session>], env role=lane
-    Runner->>Ledger: lane-started: <laneId> pid <p> start <t> runner <rp> session <path> model <named> ranModel <get_state's> resumeSkipped <why> …
+    Runner->>Ledger: lane-started: <laneId> pid <p> start <t> runner <rp> session <path> model <named> ranModel <get_state's> resumeSkipped <why> as2Commit <sha> as2Dirty <bool> …
     Omp->>Ledger: session_start: claimWorkload(holder = laneId, 15 min)  ← readiness
     Runner->>Omp: get_state → data.model must be exactly the named provider/id (item 85; any other answer, none, or none in 3 min: launch-failed: … model: …, no prompt)
     Runner->>Ledger: lane-ready: (claim observed within 3 min, model confirmed, the ceiling meter under 100 %; written immediately before the prompt)
@@ -161,7 +161,8 @@ Runner signal handling pseudocode (≤ 30 lines in the original; *amended 2026-1
 child = spawn(omp, argv, { cwd: worktree, env, stdin: pipe, stdout: pipe, stderr: log })
     -- item 85: argv adds --model <sel> when Jo's newest lane-model: names one (never --model default), and --resume only when
     -- the chosen session's origin lane ran on that same model (its lane-started: model; legacy = default; none = unknown → fresh)
-record lane-started: (pid, start time via the startTime(pid) helper stop uses, session path, argv, model, ranModel, resumeSkipped)
+record lane-started: (pid, start time via the startTime(pid) helper stop uses, session path, argv, model, ranModel, resumeSkipped,
+    as2Commit, as2Dirty: the HEAD and tracked-changes state of the checkout lane.ts runs from, read once per run; null when git cannot say; PLAN wl-mv654hoqwpfhmo § 11.3)
 readiness = wait ≤ 3 min for workload.changed_by == laneId and, with a named model, get_state's provider/id == it
             else  fail("never ready") at stage readiness (no claim) or model (mismatch, no model, get_state failed, no answer)
 meter at 100 % → stop before lane-ready: (no prompt); else record lane-ready:, send prompt p1
