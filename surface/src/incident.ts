@@ -5,6 +5,7 @@
 // number, the counting rule and the line are defined once. Nothing here decides a launch.
 import type { EntryRow, Ledger, QuestionRow, SliceRow } from "../../ledger/src/index";
 import type { ControlEntry } from "./launch";
+import { isRunnerFullSuiteSlice } from "./test-run";
 import { ARTIFACT_TREE_PREFIX, ORCHESTRATOR_RECIPIENT } from "./types";
 
 /**
@@ -59,12 +60,14 @@ function artifactTreeOf(e: EntryRow, holders: readonly string[]): string | null 
  * Whether the workload made progress after the attempt entry `since` (§ 1.4, review r1 F2, F6): a slice created after it,
  * a slice in state `done` changed after it, a question created after it, a valid `done-because:` after it, or a valid
  * `artifact-tree:` after it whose tree no earlier valid `artifact-tree:` on the workload names. Re-running the same artifact
- * on the same tree is not progress. "After" is ledger order for entries and a strictly later timestamp for slice and
- * question rows: an equal timestamp counts as before, since the relaunched lane cannot write in its reservation's millisecond.
+ * on the same tree is not progress, nor is the full-suite slice the test runner adds for a run requested with no slice
+ * (`isRunnerFullSuiteSlice`, review r1 M3): a test request is the lane asking, not the work moving. "After" is ledger order
+ * for entries and a strictly later timestamp for slice and question rows: an equal timestamp counts as before, since the
+ * relaunched lane cannot write in its reservation's millisecond.
  */
 export function progressAfter(rows: ProgressRows, since: { entryId: string; createdAt: string }): boolean {
 	const t = since.createdAt;
-	if (rows.slices.some((s) => s.created_at > t || (s.state === "done" && s.changed_at > t))) return true;
+	if (rows.slices.some((s) => !isRunnerFullSuiteSlice(s) && (s.created_at > t || (s.state === "done" && s.changed_at > t)))) return true;
 	if (rows.questions.some((q) => q.created_at > t)) return true;
 	const at = rows.entries.findIndex((e) => e.id === since.entryId);
 	const order = new Map(rows.entries.map((e, i) => [e.id, i] as const));
@@ -99,15 +102,46 @@ export interface Incident {
 	detail: string;
 }
 
+/** `incident: <kind> <wl> key `: what every incident of one kind on one workload starts with. */
+export function incidentScope(i: Pick<Incident, "kind" | "workloadId">): string {
+	return `${INCIDENT_PREFIX} ${i.kind} ${i.workloadId} key `;
+}
+
 /** `incident: <kind> <wl> key <key> after `: the part of the body that identifies one incident. */
 export function incidentKey(i: Pick<Incident, "kind" | "workloadId" | "key">): string {
-	return `${INCIDENT_PREFIX} ${i.kind} ${i.workloadId} key ${i.key} after `;
+	return `${incidentScope(i)}${i.key} after `;
 }
+
+/** What follows the count in every incident body. */
+const INCIDENT_COUNT_TAIL = " retries without progress: ";
 
 /** `incident: <kind> <wl> key <key> after <count>/<limit> retries without progress: <detail>` (§ 1.5). */
 export function incidentBody(i: Incident): string {
 	const detail = i.detail.replace(/\s+/g, " ").trim().slice(0, INCIDENT_DETAIL_MAX);
-	return `${incidentKey(i)}${i.count}/${i.limit} retries without progress: ${detail}`;
+	return `${incidentKey(i)}${i.count}/${i.limit}${INCIDENT_COUNT_TAIL}${detail}`;
+}
+
+const reEscape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const INCIDENT_BODY = new RegExp(`^${reEscape(INCIDENT_PREFIX)} (\\S+) (\\S+) key (\\S+) after (\\d+)/(\\d+)${reEscape(INCIDENT_COUNT_TAIL)}(.*)$`, "s");
+
+/** `incidentBody` read back; null when the body is not one. Every reader of an incident body parses it here. */
+export function parseIncident(body: string): Incident | null {
+	const m = INCIDENT_BODY.exec(body);
+	return m ? { kind: m[1]!, workloadId: m[2]!, key: m[3]!, count: Number(m[4]), limit: Number(m[5]), detail: m[6]! } : null;
+}
+
+/**
+ * The incidents of `kind` on `workloadId` that `by` wrote, held or delivered, oldest first: the rows a reader keys a hold or a
+ * hidden death to. Only `by`'s own messages count, as in `recordIncidentOnce`.
+ */
+export function incidentsOn(ledger: Ledger, by: string, kind: string, workloadId: string): { createdAt: string; incident: Incident }[] {
+	const scope = incidentScope({ kind, workloadId });
+	return ledger.db.query<{ body: string; created_at: string }, [string, string, number, string]>(
+		"SELECT body, created_at FROM messages WHERE workload_id = ? AND created_by = ? AND substr(body, 1, ?) = ? ORDER BY created_at, rowid",
+	).all(workloadId, by, scope.length, scope).flatMap((m) => {
+		const incident = parseIncident(m.body);
+		return incident ? [{ createdAt: m.created_at, incident }] : [];
+	});
 }
 
 /**

@@ -4,16 +4,17 @@
 // re-created surface and the rank gate run on a temp ledger, the rows `Ledger.launchRows` reads.
 import { describe, expect, test } from "bun:test";
 import {
-	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, type QuestionRow, type ReserveRows, type SliceRow, type WorkloadRow,
+	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, type QuestionRow, type ReserveRows, type SliceRow, TEST_RUNNER_BY, type WorkloadRow,
 } from "../../ledger/src/index";
-import { INCIDENT_DETAIL_MAX, incidentBody, nextRetry, progressAfter, recordIncidentOnce, RELAUNCH_BACKOFF_MS, RETRY_LIMIT } from "../src/incident";
+import { INCIDENT_DETAIL_MAX, incidentBody, nextRetry, parseIncident, progressAfter, recordIncidentOnce, RELAUNCH_BACKOFF_MS, RETRY_LIMIT } from "../src/incident";
 import {
-	causeText, consumedIds, attempts, controlEntries, decideLaunch, holdersOf, laneDiedExitBody, laneExitBody, launchFailedBody, launchRequestedBody,
+	causeText, consumedIds, attempts, controlEntries, decideLaunch, holdersOf, laneDiedExitBody, laneExitBody, laneStartedBody, launchFailedBody, launchRequestedBody,
 	laneStopAcceptedBody, laneStopRequestBody, prBindingInstructionBody, verdictOf,
 } from "../src/launch";
 import { briefHash, formatSignal, goalsHash, rankDay, type SignalAnswers } from "../src/rank";
 import { type RankConfig, rankGate } from "../src/rank-launch";
-import { laneEnd, relaunchRead, relaunchState } from "../src/relaunch";
+import { laneEnd, type PidAlive, pidAlive, relaunchRead, relaunchState } from "../src/relaunch";
+import { fullSuiteSlice, makeRunId, testRequestedBody } from "../src/test-run";
 import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, RANK_BY, SURFACE_BY } from "../src/types";
 import { triggerLaunch } from "../extensions/launch";
 import { fakePi, tempLedger } from "./helpers";
@@ -115,12 +116,14 @@ function world(over: Partial<WorkloadRow> = {}) {
 		/** `as2 lane stop`'s request (the starter writes it), and an acceptance naming `ref`. */
 		stop: (n: number) => entry(LANE_STARTER_BY, laneStopRequestBody(lane(n), "as2-lane-stop", "jo")),
 		accept: (n: number, ref: string) => entry(LANE_RUNNER_BY, laneStopAcceptedBody(lane(n), ref)),
+		/** The runner's `lane-started:` for lane n, naming its own pid `runnerPid`. */
+		started: (n: number, runnerPid: number) => entry(LANE_RUNNER_BY, laneStartedBody(lane(n), { pid: runnerPid + 1, start: "x", session: null, argv: [], runnerPid })),
 		rows,
-		verdict: (liveLanes = 0, cap = 3) => verdictOf(rows(liveLanes, cap)),
-		state: () => relaunchState(rows()),
-		end: (n: number) => {
+		verdict: (liveLanes = 0, cap = 3, alive: PidAlive = pidAlive) => verdictOf(rows(liveLanes, cap), alive),
+		state: (alive: PidAlive = pidAlive) => relaunchState(rows(), alive),
+		end: (n: number, alive: PidAlive = pidAlive) => {
 			const r = rows();
-			return laneEnd(r.workload, controlEntries(r.entries, holdersOf(r.entries, r.workload.holder)), lane(n), r.now);
+			return laneEnd(r.workload, controlEntries(r.entries, holdersOf(r.entries, r.workload.holder)), lane(n), r.now, alive);
 		},
 	};
 	return api;
@@ -305,6 +308,77 @@ describe("relaunch due (§ 1.3): a died lane with an open slice, no open questio
 	});
 });
 
+describe("a lapsed lease whose runner is alive is not a death (review r1 M2)", () => {
+	const RUNNER = 4242;
+	const runnerAlive: PidAlive = (pid) => pid === RUNNER;
+	const runnerGone: PidAlive = () => false;
+	/** Lane 1 with its runner's lane-started:, its lease lapsed and the surface's lane-died: for the lapse recorded. */
+	function lapsed() {
+		const x = launched();
+		x.started(1, RUNNER);
+		x.lapse();
+		x.died(1);
+		return x;
+	}
+
+	test("the runner alive: live, state none, no relaunch and no train request launches (held); Jo's word still does", () => {
+		const x = lapsed();
+		expect(x.end(1, runnerAlive)).toEqual({ kind: "live" });
+		expect(x.state(runnerAlive)).toEqual({ kind: "none" });
+		expect(x.verdict(0, 3, runnerAlive)).toEqual({ launch: false, reason: "held" });
+		x.request("train");
+		expect(x.verdict(0, 3, runnerAlive)).toEqual({ launch: false, reason: "held" });
+		const req = x.request("jo");
+		expect(x.verdict(0, 3, runnerAlive)).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+	});
+
+	test("the runner gone: the lapse is a death and relaunches as before", () => {
+		const x = lapsed();
+		expect(x.end(1, runnerGone)).toEqual({ kind: "died" });
+		expect(x.verdict(0, 3, runnerGone)).toEqual({ launch: true, cause: { kind: "relaunch", lane: lane(1), n: 1 } });
+	});
+
+	test("the default probe asks the kernel: this test process is alive, an exited child is gone; 0 and negatives name no process", () => {
+		const child = Bun.spawnSync(["true"]);
+		expect(child.exitCode).toBe(0);
+		expect(pidAlive(process.pid)).toBe(true);
+		expect(pidAlive(child.pid)).toBe(false);
+		expect(pidAlive(0)).toBe(false);
+		expect(pidAlive(-1)).toBe(false);
+		const alive = launched();
+		alive.started(1, process.pid);
+		alive.lapse();
+		alive.died(1);
+		expect(alive.verdict()).toEqual({ launch: false, reason: "held" });
+		const gone = launched();
+		gone.started(1, child.pid);
+		gone.lapse();
+		gone.died(1);
+		expect(gone.verdict()).toEqual({ launch: true, cause: { kind: "relaunch", lane: lane(1), n: 1 } });
+	});
+
+	test("reserveLane on a real ledger: no successor is reserved over a live runner, one is once it is gone", () => {
+		let t = T0;
+		const { ledger: l } = tempLedger(() => iso(t));
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "fix it", stakes: "normal", mode: "autonomous" });
+		let alive = true;
+		const probe: PidAlive = (pid) => alive && pid === RUNNER;
+		const reserve = () => l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 3 * MIN, requestedBy: "tick", decide: (r) => decideLaunch(r, probe) });
+		const first = reserve();
+		if (!first.ok) throw new Error(first.reason);
+		t += 1000;
+		l.addSlice({ by: first.laneId, workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(first.laneId, { pid: RUNNER + 1, start: "x", session: null, argv: [], runnerPid: RUNNER }) });
+		l.enqueue({ by: SURFACE_BY, workloadId: wl, sender: SURFACE_BY, recipient: ORCHESTRATOR_RECIPIENT, body: `lane-died: ${first.laneId}: lease lapsed` });
+		t += 10 * MIN;
+		expect(reserve()).toEqual({ ok: false, reason: "held" });
+		expect(l.workload(wl)!.holder).toBe(first.laneId);
+		alive = false;
+		expect(reserve()).toMatchObject({ ok: true, cause: `relaunch ${first.laneId} 1` });
+		l.close();
+	});
+});
+
 describe("Jo's stop vetoes every cause until Jo's word newer than the stop (review r1 F1, r2 F1)", () => {
 	test("r1 F1: Jo's stop after a death, before the tick", () => {
 		const x = deadOnce();
@@ -358,18 +432,45 @@ describe("Jo's stop vetoes every cause until Jo's word newer than the stop (revi
 		q2.resolved_by = ans2.id;
 		expect(answered.verdict()).toEqual({ launch: true, cause: { kind: "resume", ids: [ans2.id] } });
 	});
-	test("r2 F1: a Jo request newer than the stop launches as Jo's request, the older one untouched; the ceiling's stop and Jo's extend alike", () => {
+	test("r2 F1, r1 m1: a Jo request newer than the stop launches as Jo's request; the older one is answered by the stop; the ceiling's stop and Jo's extend alike", () => {
 		const x = deadOnce();
-		x.request("jo");
+		const older = x.request("jo");
 		x.stop(1);
 		const newer = x.request("jo");
 		expect(x.verdict()).toEqual({ launch: true, cause: { kind: "request", id: newer.id } });
+		// the review's probe: the newer request's lane dies, then its relaunch's lane dies; the older request never launches
+		x.launch(2, `request ${newer.id}`);
+		x.exit(2, "error");
+		x.died(2);
+		expect(x.verdict()).toEqual({ launch: true, cause: { kind: "relaunch", lane: lane(2), n: 1 } });
+		x.launch(3, `relaunch ${lane(2)} 1`);
+		x.exit(3, "error");
+		x.died(3);
+		expect(x.verdict()).toEqual({ launch: false, reason: "relaunch-backoff" });
+		x.advance(RELAUNCH_BACKOFF_MS);
+		expect(x.verdict()).toEqual({ launch: true, cause: { kind: "relaunch", lane: lane(3), n: 2 } });
+		expect(consumedIds(attempts(controlEntries(x.entries, holdersOf(x.entries, null)))).has(older.id)).toBe(false);
 		const ceiling = launched();
+		ceiling.request("jo");
 		ceiling.accept(1, "ceiling");
 		ceiling.exit(1, "stop", "ceiling");
 		expect(ceiling.verdict()).toEqual({ launch: false, reason: "stopped" });
 		const extend = ceiling.entry(SURFACE_BY, launchRequestedBody("jo", ceiling.now(), "ceiling extend"));
 		expect(ceiling.verdict()).toEqual({ launch: true, cause: { kind: "request", id: extend.id } });
+		ceiling.launch(2, `request ${extend.id}`);
+		ceiling.exit(2, "error");
+		ceiling.died(2);
+		expect(ceiling.verdict()).toEqual({ launch: true, cause: { kind: "relaunch", lane: lane(2), n: 1 } });
+	});
+	test("r1 m1: an old Jo request behind a stop does not keep a finished workload from awaiting close", () => {
+		const x = deadOnce();
+		x.request("jo");
+		x.stop(1);
+		const newer = x.request("jo");
+		x.launch(2, `request ${newer.id}`);
+		x.entry(lane(2), "done-because: the work is done");
+		x.exit(2, "completed");
+		expect(x.verdict()).toEqual({ launch: false, reason: "awaiting-close" });
 	});
 });
 
@@ -458,13 +559,26 @@ describe("progress resets the counter (§ 1.4, review r1 F2, F6)", () => {
 		same.tree(lane(2), "b".repeat(40));
 		expect(same.state()).toMatchObject({ kind: "due", n: 1 });
 	});
-	test("an artifact-tree: by a non-holder, a test request and a train request are not progress", () => {
+	test("an artifact-tree: by a non-holder, a test request (the runner's full-suite slice and its test-requested:) and a train request are not progress", () => {
 		const { x } = second();
 		x.tree("hand-x", "c".repeat(40));
-		x.entry("test-runner", `test-requested: pr 7 head ${"d".repeat(40)}`);
+		// `lane_full_test` with no slice, as test-runner.ts's start writes it: the runner adds fullSuiteSlice's slice, then test-requested: on it
+		const sha = "d".repeat(40);
+		const f = fullSuiteSlice(WL, 7, x.slices.map((s) => s.id));
+		const full = x.slice("open", { id: f.id, task: f.task, done_condition: f.doneCondition, inputs: `PR #7 at ${sha}`, created_by: TEST_RUNNER_BY, changed_by: TEST_RUNNER_BY });
+		x.entry(TEST_RUNNER_BY, testRequestedBody({ runId: makeRunId(Date.parse(x.now()), "abcd"), pr: 7, sha, slice: full.id, by: lane(2) }), full.id);
 		x.request("train");
 		x.kill(2);
 		expect(x.state()).toMatchObject({ kind: "due", n: 2 });
+		// the runner completing it on a green is not the lane's progress either
+		full.state = "done";
+		full.changed_at = x.now();
+		expect(x.state()).toMatchObject({ kind: "due", n: 2 });
+		// a slice of the same id shape that the lane itself added is
+		const own = second();
+		own.x.slice("open", { id: fullSuiteSlice(WL, 7, own.x.slices.map((s) => s.id)).id });
+		own.x.kill(2);
+		expect(own.x.state()).toMatchObject({ kind: "due", n: 1 });
 	});
 	test("a slice created at the attempt's own millisecond is before it; one millisecond later is progress", () => {
 		const { x, a } = second();
@@ -655,14 +769,52 @@ describe("the merge-train workload is outside the relaunch (§ 1.8)", () => {
 		const req = x.request("train");
 		expect(x.verdict()).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
 	});
-	test("step 7: a machinery request for a dead lane the relaunch does not take on (an open question) is not a launch: died-not-relaunched", () => {
+	test("r1 M1: a machinery request for a dead lane the relaunch does not take on launches as a request, as on 251e354: an open question", () => {
 		const x = launched();
 		x.question(lane(1), x.slices[0]!.id, "open");
 		x.exit(1, "error");
 		x.died(1);
-		x.request("train");
-		expect(x.state()).toEqual({ kind: "none" });
 		expect(x.verdict()).toEqual({ launch: false, reason: "died-not-relaunched" });
+		const req = x.request("train");
+		expect(x.state()).toEqual({ kind: "none" });
+		expect(x.verdict()).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+	});
+	test("r1 M1 (a): a done-because:, then a restart's signal stop: the train request launches as a request", () => {
+		const x = launched();
+		x.entry(lane(1), "done-because: the work is done");
+		x.accept(1, "signal");
+		x.exit(1, "stop", "signal");
+		x.died(1);
+		expect(x.end(1)).toEqual({ kind: "died" });
+		expect(x.verdict()).toEqual({ launch: false, reason: "awaiting-close" });
+		const req = x.request("train");
+		expect(x.state()).toEqual({ kind: "none" });
+		expect(x.verdict()).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+	});
+	test("r1 M1 (b): an error exit with no open slice: the train request launches as a request", () => {
+		const x = world();
+		x.slice("done");
+		x.launch(1, "first");
+		x.exit(1, "error");
+		x.died(1);
+		expect(x.end(1)).toEqual({ kind: "died" });
+		expect(x.verdict()).toEqual({ launch: false, reason: "died-not-relaunched" });
+		const req = x.request("train");
+		expect(x.state()).toEqual({ kind: "none" });
+		expect(x.verdict()).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+	});
+	test("r1 M1: due still folds a train request; the unrecorded lapse and Jo's stop still refuse it (waiting and exhausted: the backoff and counter tests)", () => {
+		const due = deadOnce();
+		const t1 = due.request("train");
+		expect(due.verdict()).toEqual({ launch: true, cause: { kind: "relaunch", lane: lane(1), n: 1, request: t1.id } });
+		const lapse = launched();
+		lapse.lapse();
+		lapse.request("train");
+		expect(lapse.verdict()).toEqual({ launch: false, reason: "died-not-relaunched" });
+		const stopped = deadOnce();
+		stopped.stop(1);
+		stopped.request("train");
+		expect(stopped.verdict()).toEqual({ launch: false, reason: "stopped" });
 	});
 });
 
@@ -674,6 +826,12 @@ describe("the incident (§ 1.5)", () => {
 		expect(body).toStartWith(`incident: relaunch ${WL} key ${lane(4)} after 3/3 retries without progress: lane-died: ${lane(4)}: prompt ended error x`);
 		expect(body).not.toContain("\n");
 		expect(body.length).toBe(`incident: relaunch ${WL} key ${lane(4)} after 3/3 retries without progress: `.length + INCIDENT_DETAIL_MAX);
+	});
+	test("r1 m5: parseIncident reads incidentBody back; anything else is not an incident", () => {
+		const i = { kind: "relaunch", workloadId: WL, key: lane(4), count: 3, limit: RETRY_LIMIT, detail: "lane-died: lane-r-4: error (exit 1); train #101 held" };
+		expect(parseIncident(incidentBody(i))).toEqual(i);
+		expect(parseIncident(`incident: relaunch ${WL} key ${lane(4)} after three retries`)).toBeNull();
+		expect(parseIncident("lane-died: lane-r-4: error")).toBeNull();
 	});
 	test("recordIncidentOnce: written once per kind, workload and key; stillDue is re-checked inside; a forged lane note does not count", () => {
 		const { ledger: l } = tempLedger();

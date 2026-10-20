@@ -6,14 +6,43 @@
 import type { ReserveRows } from "../../ledger/src/index";
 import { nextRetry, progressAfter, RELAUNCH_BACKOFF_MS, RETRY_LIMIT } from "./incident";
 import {
-	type Attempt, attempts, type ControlEntry, controlEntries, doneBecause, heldLive, holdersOf, isIntendedOutcome, laneExit, prBindings,
+	type Attempt, attempts, type ControlEntry, controlEntries, doneBecause, heldLive, holdersOf, isIntendedOutcome, laneExit, laneStarted, prBindings,
 } from "./launch";
 import { isRunnerCeilingSlice } from "./turn-end";
+
+/** The incident kind of a dead lane's spent relaunch budget (§ 1.5); its key is the dead lane. */
+export const RELAUNCH_INCIDENT = "relaunch";
+
+/** Whether a process with this pid exists; the predicate's one outside read (§ 1.1, review r1 M2), injectable for tests. */
+export type PidAlive = (pid: number) => boolean;
+
+/**
+ * `process.kill(pid, 0)`: alive unless the kernel answers ESRCH (EPERM is a live process this user may not signal). A pid that
+ * is not a positive integer names no process: 0 and negatives would address process groups.
+ */
+export const pidAlive: PidAlive = (pid) => {
+	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (e) {
+		return (e as NodeJS.ErrnoException).code !== "ESRCH";
+	}
+};
+
+/**
+ * A stop that vetoes the machinery (§ 1.1 step 2, review r1 F1): Jo's `lane-stop: L requested <reason> by jo`, accepted or
+ * not, or the runner's `accepted ceiling`. A `launch-requested: by jo` older than one is answered by it and never launches.
+ */
+export function isVetoStop(c: ControlEntry): boolean {
+	return c.prefix === "lane-stop" && (/^requested\s+\S+\s+by\s+jo(?:\s|$)/.test(c.rest) || /^accepted\s+ceiling\b/.test(c.rest));
+}
 
 /**
  * How lane L, the newest attempt's, ended (§ 1.1), checked in this order: `live` while any holder's lease is live;
  * `stopped` by Jo or the ceiling (the veto, whatever the order of stop and death, review r1 F1), with the stop entry;
- * `died`; else `intended`.
+ * `died`; else `intended`. A lapse with no exit whose runner's recorded pid is still alive (`alive`) is `live`, not `died`:
+ * the runner outlived its lease (a sleeping Mac) and renews on wake, so no successor may take the workload (review r1 M2).
  */
 export type LaneEnd =
 	| { kind: "live" }
@@ -21,11 +50,11 @@ export type LaneEnd =
 	| { kind: "died" }
 	| { kind: "intended" };
 
-export function laneEnd(w: ReserveRows["workload"], control: readonly ControlEntry[], laneId: string, now: string): LaneEnd {
+export function laneEnd(w: ReserveRows["workload"], control: readonly ControlEntry[], laneId: string, now: string, alive: PidAlive = pidAlive): LaneEnd {
 	if (heldLive(w, now)) return { kind: "live" };
 	const mine = control.filter((c) => c.laneId === laneId);
-	// Jo's `lane-stop: L requested <reason> by jo`, accepted or not, or the runner's `accepted ceiling`: the newest one.
-	const stop = mine.findLast((c) => c.prefix === "lane-stop" && (/^requested\s+\S+\s+by\s+jo(?:\s|$)/.test(c.rest) || /^accepted\s+ceiling\b/.test(c.rest)));
+	// The newest veto stop on this lane.
+	const stop = mine.findLast(isVetoStop);
 	if (stop) return { kind: "stopped", entryId: stop.id, createdAt: stop.createdAt };
 	if (mine.some((c) => c.prefix === "launch-failed")) return { kind: "died" };
 	const exit = laneExit(control, laneId);
@@ -34,7 +63,10 @@ export function laneEnd(w: ReserveRows["workload"], control: readonly ControlEnt
 	if (exit === null && (w.holder === laneId || w.holder === null)) {
 		const marked = mine.some((c) =>
 			c.prefix === "lane-parked" || (c.prefix === "lane-decided" && isIntendedOutcome(c.rest)) || (c.prefix === "lane-stop" && /^accepted\b/.test(c.rest)));
-		if (!marked) return { kind: "died" };
+		if (!marked) {
+			const runner = laneStarted(mine, laneId)?.runnerPid ?? 0;
+			return runner > 0 && alive(runner) ? { kind: "live" } : { kind: "died" };
+		}
 	}
 	return { kind: "intended" };
 }
@@ -71,21 +103,21 @@ export interface ParsedRows {
 	receipt: string | null;
 }
 
-/** The newest attempt's relaunch reading over the rows a launch decision reads. */
-export function relaunchRead(rows: ReserveRows, parsed?: ParsedRows): RelaunchRead {
+/** The newest attempt's relaunch reading over the rows a launch decision reads; `alive` probes the runner's recorded pid. */
+export function relaunchRead(rows: ReserveRows, parsed?: ParsedRows, alive: PidAlive = pidAlive): RelaunchRead {
 	const holders = parsed?.holders ?? holdersOf(rows.entries, rows.workload.holder, rows.holders);
 	const control = parsed?.control ?? controlEntries(rows.entries, holders);
 	const receipt = parsed === undefined ? doneBecause(rows.entries, holders) : parsed.receipt;
 	const train = prBindings(rows.entries, rows.instructions, ["train"]).length > 0;
 	const last = attempts(control).at(-1);
 	if (last === undefined) return { lane: null, end: null, train, state: { kind: "none" } };
-	const end = laneEnd(rows.workload, control, last.laneId, rows.now);
+	const end = laneEnd(rows.workload, control, last.laneId, rows.now, alive);
 	return { lane: last.laneId, end, train, state: train ? { kind: "none" } : stateOf(rows, holders, control, receipt, last, end) };
 }
 
 /** `relaunchRead`'s state alone: what the surface's incident step reads per open workload. */
-export function relaunchState(rows: ReserveRows): RelaunchState {
-	return relaunchRead(rows).state;
+export function relaunchState(rows: ReserveRows, alive: PidAlive = pidAlive): RelaunchState {
+	return relaunchRead(rows, undefined, alive).state;
 }
 
 function stateOf(rows: ReserveRows, holders: readonly string[], control: readonly ControlEntry[], receipt: string | null, last: Attempt, end: LaneEnd): RelaunchState {

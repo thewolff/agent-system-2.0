@@ -16,9 +16,9 @@
 import { type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, launchRequestedBody, type OwnerTrainTask, parseTrainFix, prBindingInstructionBody, prBindings, type TrainFix, trainFixBody } from "./launch";
 import { type EntryRow, type InstructionRow, type Ledger, newId, type QuestionRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
 import { canonicalPath } from "../../ledger/src/locality";
-import { INCIDENT_PREFIX } from "./incident";
+import { incidentsOn } from "./incident";
 import { DEFAULT_BRANCH } from "./merge-train-stack";
-import { laneEnd } from "./relaunch";
+import { laneEnd, RELAUNCH_INCIDENT } from "./relaunch";
 import { ownerRepoOf, pushDestBody, SETTLING_VERDICTS, SHA_RE, testRuns } from "./test-run";
 import { LANE_FULL_TEST_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX } from "./types";
 
@@ -710,9 +710,6 @@ interface SettleEvent {
 	evidence: string;
 }
 
-/** The incident kind the dead-lane relaunch writes (PLAN wl-mvfqvd5hy8zv28 § 1.5): `incident: relaunch <wl> key <lane> after …`. */
-const RELAUNCH_INCIDENT_KIND = "relaunch";
-
 /** A stretch in which an owner's relaunch incident holds a task's no-push rule (§ 1.7): from the incident to Jo's word launch, or open. */
 interface IncidentHold {
 	from: string;
@@ -721,16 +718,16 @@ interface IncidentHold {
 
 /**
  * The holds owner `o`'s relaunch incidents put on a task created at `t0` (PLAN wl-mvfqvd5hy8zv28 § 1.7): each `incident: relaunch`
- * message the surface wrote on `o` after t0 holds from its creation to the first `launch-requested: by jo` on `o` after it, or
- * stays open while there is none. `control` is `o`'s control entries, oldest first.
+ * message the surface wrote on `o` holds from its creation to the first `launch-requested: by jo` on `o` after it, or stays
+ * open while there is none. An incident written before the task holds it too while it still stands at t0 (review r1 m6): the
+ * owner is as dead for the new task as for the old one. One that Jo's word ended by t0 holds nothing. `control` is `o`'s
+ * control entries, oldest first.
  */
 function incidentHolds(ledger: Ledger, o: string, control: readonly ControlEntry[], t0: string): IncidentHold[] {
-	const key = `${INCIDENT_PREFIX} ${RELAUNCH_INCIDENT_KIND} ${o} key `;
-	const incidents = ledger.db.query<{ created_at: string }, [string, string, number, string, string]>(
-		"SELECT created_at FROM messages WHERE workload_id = ? AND created_by = ? AND substr(body, 1, ?) = ? AND created_at > ? ORDER BY created_at, rowid",
-	).all(o, SURFACE_BY, key.length, key, t0);
 	const joWords = control.filter((c) => c.prefix === "launch-requested" && c.createdBy === SURFACE_BY && /^by jo(?:\s|$)/.test(c.rest)).map((c) => c.createdAt);
-	return incidents.map((i) => ({ from: i.created_at, to: joWords.find((at) => at > i.created_at) ?? null }));
+	return incidentsOn(ledger, SURFACE_BY, RELAUNCH_INCIDENT, o)
+		.map((i) => ({ from: i.createdAt, to: joWords.find((at) => at > i.createdAt) ?? null }))
+		.filter((h) => h.to === null || h.to > t0);
 }
 
 /**

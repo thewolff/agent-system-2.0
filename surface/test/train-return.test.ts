@@ -814,6 +814,45 @@ describe("an owner death the relaunch takes on is not a train attempt (PLAN wl-m
 		expect(v.settle({ 101: H0 })).toEqual([`train-task-settled: ${u.id} failed no push for 2 h since ${u.createdAt}`]);
 	});
 
+	test("r1 m6: an incident written before the task holds it too, until Jo's word; one Jo's word ended before the task holds nothing", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const { reserve, die, incident, joWord } = lanes(w);
+		const first = reserve();
+		w.ledger.addSlice({ by: first.laneId, workloadId: w.owner, task: "fix #101", doneCondition: "green", inputs: "#101" });
+		c.plusHours(0.1);
+		die(first.laneId);
+		c.plusHours(0.01);
+		expect(incident(first.laneId, () => true)).not.toBeNull();
+		c.plusHours(0.1);
+		// the train hands the already-exhausted owner a task
+		const t = w.task(101, H0);
+		c.plusHours(5);
+		expect(w.settle({ 101: H0 })).toEqual([]);
+		expect(twiceFailed(w.ledger, w.train)).toEqual([]);
+		const word = joWord();
+		const wordAt = c.now();
+		expect(reserve().cause).toBe(`request ${word}`);
+		c.plusHours(2);
+		expect(w.settle({ 101: H0 })).toEqual([`train-task-settled: ${t.id} failed no push for 2 h since ${wordAt}`]);
+
+		const c2 = clock();
+		const v = world({ now: c2.now });
+		const vl = lanes(v);
+		const lane = vl.reserve();
+		v.ledger.addSlice({ by: lane.laneId, workloadId: v.owner, task: "fix #101", doneCondition: "green", inputs: "#101" });
+		c2.plusHours(0.1);
+		vl.die(lane.laneId);
+		c2.plusHours(0.01);
+		expect(vl.incident(lane.laneId, () => true)).not.toBeNull();
+		c2.plusHours(0.1);
+		vl.joWord();
+		c2.plusHours(0.1);
+		const u = v.task(101, H0);
+		c2.plusHours(2);
+		expect(v.settle({ 101: H0 })).toEqual([`train-task-settled: ${u.id} failed no push for 2 h since ${u.createdAt}`]);
+	});
+
 	test("the full sequence: the original owner lane and three relaunched lanes die, the incident is written, the tick's settle and alert run each poll; the task stays unsettled and owned with no failed-twice question, and Jo's word launch gives the owner the same task", () => {
 		const c = clock();
 		const w = world({ now: c.now });

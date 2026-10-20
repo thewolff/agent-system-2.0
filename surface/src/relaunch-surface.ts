@@ -11,32 +11,12 @@
 // `relaunch` cause, and for good once an incident keyed to it exists, held or delivered. Every one of these is a durable
 // ledger fact; none reads a message's delivery state.
 import type { Ledger } from "../../ledger/src/index";
-import { INCIDENT_PREFIX, recordIncidentOnce, RETRY_LIMIT } from "./incident";
+import { incidentsOn, recordIncidentOnce, RETRY_LIMIT } from "./incident";
 import { attempts, controlEntries, holdersOf, laneExit } from "./launch";
 import { heldTrainPrs, trainHeldDetail } from "./merge-train";
-import { type RelaunchState, relaunchRead } from "./relaunch";
+import { RELAUNCH_INCIDENT, type RelaunchState, relaunchRead } from "./relaunch";
 import { laneDeaths, recordLapsedLeases } from "./signals";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
-
-/** The incident kind of a dead lane's spent relaunch budget; its key is the dead lane. */
-export const RELAUNCH_INCIDENT = "relaunch";
-
-/** An `incident:` body read back (`incidentBody`'s shape, surface/src/incident.ts); null when the body is not one. */
-export interface ParsedIncident {
-	kind: string;
-	workloadId: string;
-	key: string;
-	count: number;
-	limit: number;
-	detail: string;
-}
-
-const INCIDENT_BODY = new RegExp(`^${INCIDENT_PREFIX} (\\S+) (\\S+) key (\\S+) after (\\d+)/(\\d+) retries without progress: (.*)$`, "s");
-
-export function parseIncident(body: string): ParsedIncident | null {
-	const m = INCIDENT_BODY.exec(body);
-	return m ? { kind: m[1]!, workloadId: m[2]!, key: m[3]!, count: Number(m[4]), limit: Number(m[5]), detail: m[6]! } : null;
-}
 
 /** The newest attempt's relaunch state at `now`, over the rows a launch decision reads; none for no such workload. */
 function stateAt(ledger: Ledger, workloadId: string, now: string): RelaunchState {
@@ -104,15 +84,7 @@ export function relaunchView(ledger: Ledger, workloadId: string, now: string): R
 	const read = relaunchRead({ ...rows, now });
 	const control = controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder, rows.holders));
 	const relaunched = new Set(attempts(control).flatMap((a) => (a.cause?.kind === "relaunch" ? [a.cause.lane] : [])));
-	const prefix = `${INCIDENT_PREFIX} ${RELAUNCH_INCIDENT} ${workloadId} key `;
-	const incidents = new Set(
-		ledger.db.query<{ body: string }, [string, string, number, string]>(
-			"SELECT body FROM messages WHERE workload_id = ? AND created_by = ? AND substr(body, 1, ?) = ?",
-		).all(workloadId, SURFACE_BY, prefix.length, prefix).flatMap((m) => {
-			const p = parseIncident(m.body);
-			return p ? [p.key] : [];
-		}),
-	);
+	const incidents = new Set(incidentsOn(ledger, SURFACE_BY, RELAUNCH_INCIDENT, workloadId).map((i) => i.incident.key));
 	return { state: read.state, relaunched, incidents };
 }
 

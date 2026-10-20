@@ -66,13 +66,13 @@
 // has no one-word answer, so it is never numbered.
 import { type EntryRow, type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
-import { INCIDENT_PREFIX } from "./incident";
+import { INCIDENT_PREFIX, parseIncident } from "./incident";
 import { isCeilingQuestion, openPairOffer } from "./input";
 import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
 import { type TaskWindow, TRAIN_ALERT_LADDER, trainAlertLevel, trainTaskWindows } from "./merge-train";
 import { questionSubject } from "./orchestrator-question";
 import { pairOfferLine, pairTakenLine, pairTakenQuestion, shownOptions } from "./pair-suggest";
-import { machineryDeath, parseIncident, type RelaunchView, relaunchView } from "./relaunch-surface";
+import { machineryDeath, type RelaunchView, relaunchView } from "./relaunch-surface";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { parseTestRunFailed, testRuns } from "./test-run";
 import {

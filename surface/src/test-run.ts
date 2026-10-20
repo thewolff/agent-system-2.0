@@ -15,7 +15,7 @@
 // - the bound-branch rule for a PR, and the close-freshness decision over compare results;
 // - the untrusted child's environment, its git shim and gitconfig, and the wrapper's argv contract.
 import { dirname, join } from "node:path";
-import { type EntryRow, type SliceState, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { type EntryRow, type SliceRow, type SliceState, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import { branchName, controlEntries } from "./launch";
 import { PUSH_DEST_PREFIX, TEST_REQUESTED_PREFIX, TEST_RUN_FAILED_PREFIX, TEST_RUN_PREFIX } from "./types";
@@ -558,6 +558,9 @@ export function fullSuiteSlice(workloadId: string, pr: number, existingSliceIds:
 	}
 	return { id: `${stem}${n + 1}`, task: `full suite outside the fence at PR #${pr}`, doneCondition: "a green test-run at the PR head" };
 }
+
+/** The slice the starter adds for a run requested with no slice (`fullSuiteSlice`): the runner's, not the lane's work. */
+export const isRunnerFullSuiteSlice = (s: Pick<SliceRow, "id" | "created_by">): boolean => s.id.startsWith("sl-full-") && s.created_by === TEST_RUNNER_BY;
 
 // ---- the bound branch -----------------------------------------------------------------------------
 

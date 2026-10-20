@@ -461,6 +461,8 @@ complexity). Exactly four things surface unsolicited, one line each in the singl
    again until Jo's word. The count resets on progress and on Jo's word. Parked (a paused slice or an
    open question), done (`done-because:`), Jo-stopped (`lane-stop … by jo`, or the runner's `accepted
    ceiling`) and user-driven workloads are never relaunched, and the merge-train workload is excluded.
+   A lapsed lease whose recorded runner process is still alive is not a death, and nothing but Jo's
+   word launches over it.
    While a relaunch takes a death on (due, waiting out the backoff, or named by a later `relaunch`
    cause), its death and idle lines are hidden; the incident is then the line this item surfaces. A
    death the relaunch does not take on is surfaced once, as above. The limit, the counting rule and the
