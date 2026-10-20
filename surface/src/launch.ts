@@ -311,6 +311,7 @@ export type Cause =
 	| { kind: "first" }
 	| { kind: "request"; id: string }
 	| { kind: "resume"; ids: string[] }
+	| { kind: "priority"; exitId: string }
 	| { kind: "interactive" };
 
 export interface Attempt {
@@ -328,6 +329,7 @@ export function causeText(cause: Cause): string {
 		case "interactive": return "interactive";
 		case "request": return `request ${cause.id}`;
 		case "resume": return `resume ${cause.ids.join(" ")}`;
+		case "priority": return `priority ${cause.exitId}`;
 	}
 }
 
@@ -337,6 +339,7 @@ function parseCause(tokens: string[]): Cause | null {
 	if (kind === "interactive" && ids.length === 0) return { kind: "interactive" };
 	if (kind === "request" && ids.length === 1) return { kind: "request", id: ids[0]! };
 	if (kind === "resume" && ids.length >= 1) return { kind: "resume", ids };
+	if (kind === "priority" && ids.length === 1) return { kind: "priority", exitId: ids[0]! };
 	return null;
 }
 
@@ -451,7 +454,9 @@ export function heldLive(w: { holder: string | null; holder_lease_until: string 
  * surface to decide whether to exec the starter and again by `reserveLane` inside its transaction,
  * the run that binds. `receipt` is the holder's standing `done-because:` (`doneBecause`), or null:
  * a finished workload is awaiting close, not a lane's next launch, unless Jo's unconsumed
- * `launch-requested:` says otherwise (Jo's word to relaunch wins over the tick's close).
+ * `launch-requested:` says otherwise (Jo's word to relaunch wins over the tick's close). A workload
+ * priority-paused (`priorityPausedOf`, PLAN wl-mv8wzytml878b4 D3) relaunches with cause `priority <exit id>`,
+ * after first, request and resume; any later launch attempt ends that state, so it is consumed once.
  */
 export function launchable(
 	w: WorkloadRow, control: readonly ControlEntry[], receipt: string | null, resolved: readonly Resolution[], now: string, liveLanes: number, cap: number,
@@ -470,6 +475,8 @@ export function launchable(
 	if (req) return { launch: true, cause: { kind: "request", id: req.id } };
 	const res = resolved.filter((r) => !consumed.has(r.instructionId));
 	if (res.length > 0) return { launch: true, cause: { kind: "resume", ids: res.map((r) => r.instructionId) } };
+	const paused = priorityPausedOf(control);
+	if (paused !== null) return { launch: true, cause: { kind: "priority", exitId: paused.exitId } };
 	return { launch: false, reason: "died-not-relaunched" };
 }
 
@@ -603,8 +610,9 @@ export function sessionOrigin(control: readonly ControlEntry[], laneId?: string)
 /**
  * The session the attempt `laneId` resumes (decisions 6, 7, 14) and the lane that recorded it: for a
  * `resume` cause, the newest session of the lane that raised the questions the consumed resolutions
- * answer; for a request, a first launch after a death, or the interactive `as2 lane <wl>`, the newest
- * session on the workload. `resumePlan` decides whether it is resumed.
+ * answer; for a request, a priority relaunch (the paused lane's own session, the newest), a first launch
+ * after a death, or the interactive `as2 lane <wl>`, the newest session on the workload. `resumePlan`
+ * decides whether it is resumed.
  */
 function resumeOrigin(control: readonly ControlEntry[], laneId: string, resolved: readonly Resolution[]): { session: string; laneId: string } | null {
 	const cause = attempts(control).find((a) => a.laneId === laneId)?.cause ?? null;
@@ -739,6 +747,73 @@ export function laneExit(control: readonly ControlEntry[], laneId: string): { co
 		if (c.prefix !== "lane-exit" || c.laneId !== laneId) continue;
 		const m = /^code\s+(\S+)\s+signal\s+(\S+)\s+outcome\s+(\S+)(?:\s+reason\s+(\S+))?/.exec(c.rest);
 		if (m) return { code: m[1]!, signal: m[2]!, outcome: m[3]!, reason: m[4] ?? null };
+	}
+	return null;
+}
+
+// ---- priority pause (PLAN wl-mv8wzytml878b4 D3) ---------------------------------------------------
+
+/** The stop reason of a priority pause: `priority-for-<wl>`, one token so `pendingStop` parses it. */
+export const PRIORITY_REASON_PREFIX = "priority-for-";
+
+/** The workload a `priority-for-<wl>` reason names, or null for any other reason. */
+function priorityFor(reason: string | null): string | null {
+	if (reason === null || !reason.startsWith(PRIORITY_REASON_PREFIX)) return null;
+	const wl = reason.slice(PRIORITY_REASON_PREFIX.length);
+	return wl === "" ? null : wl;
+}
+
+/** A `lane-stop:` request's rest: `requested <reason> by <who>`. */
+const STOP_REQUESTED = /^requested\s+(\S+)\s+by\s+\S+/;
+
+/** Whether some valid `launch:` attempt sits after control index `at`. */
+function attemptAfter(control: readonly ControlEntry[], at: number): boolean {
+	const ids = new Set(attempts(control).map((a) => a.entryId));
+	for (let i = at + 1; i < control.length; i++) if (ids.has(control[i]!.id)) return true;
+	return false;
+}
+
+/**
+ * The workload is priority-paused (D3): its newest `lane-exit:` has outcome `stop` and reason `priority-for-<X>`, the
+ * `lane-stop: <lane> accepted <ref>` for that lane names a valid `requested priority-for-<X>` entry, and no `launch:`
+ * attempt is newer than that exit. A death, a ceiling stop, Jo's `as2 lane stop` (`by-hand`) and a death recorded
+ * before a late acceptance (outcome not `stop`) are not; any later launch attempt, whatever its cause, ends the state.
+ */
+export function priorityPausedOf(control: readonly ControlEntry[]): { laneId: string; forWl: string; exitId: string } | null {
+	let at = -1;
+	for (let i = control.length - 1; i >= 0 && at < 0; i--) if (control[i]!.prefix === "lane-exit" && control[i]!.laneId !== null) at = i;
+	if (at < 0) return null;
+	const exit = control[at]!;
+	const laneId = exit.laneId!;
+	const m = /^code\s+\S+\s+signal\s+\S+\s+outcome\s+(\S+)(?:\s+reason\s+(\S+))?/.exec(exit.rest);
+	if (!m || m[1] !== "stop") return null;
+	const forWl = priorityFor(m[2] ?? null);
+	if (forWl === null || attemptAfter(control, at)) return null;
+	const requests = new Map<string, string>();
+	for (const c of control) {
+		if (c.prefix !== "lane-stop" || c.laneId !== laneId) continue;
+		const reason = STOP_REQUESTED.exec(c.rest)?.[1];
+		if (reason !== undefined) requests.set(c.id, reason);
+	}
+	const accepted = control.some((c) => {
+		if (c.prefix !== "lane-stop" || c.laneId !== laneId) return false;
+		const a = /^accepted\s+(\S+)/.exec(c.rest);
+		return a !== null && requests.get(a[1]!) === `${PRIORITY_REASON_PREFIX}${forWl}`;
+	});
+	return accepted ? { laneId, forWl, exitId: exit.id } : null;
+}
+
+/**
+ * The priority stop on its way (D3): the newest valid `lane-stop: <lane> requested priority-for-<X> by …` whose lane has
+ * no `lane-exit:` yet and no `launch:` attempt after it (accepted or not: the slot is still taken), or null.
+ */
+export function priorityPausingOf(control: readonly ControlEntry[]): { laneId: string; forWl: string; requestId: string } | null {
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.prefix !== "lane-stop" || c.laneId === null) continue;
+		const forWl = priorityFor(STOP_REQUESTED.exec(c.rest)?.[1] ?? null);
+		if (forWl === null || laneExit(control, c.laneId) !== null || attemptAfter(control, i)) continue;
+		return { laneId: c.laneId, forWl, requestId: c.id };
 	}
 	return null;
 }

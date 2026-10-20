@@ -81,7 +81,7 @@ export type SurfaceAPI = GatesAPI<Ctx> & {
 	sendMessage?(message: SurfaceMessage, options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" }): void;
 	exec?(command: string, args: string[], options?: { timeout?: number; cwd?: string }): Promise<ExecResult>;
 	/** The zod members the lane tools use beyond the gates' slice (surface/extensions/lane-tools.ts). */
-	zod: { array(item: unknown): ZodSchema; enum(values: readonly [string, ...string[]]): ZodSchema };
+	zod: { array(item: unknown): ZodSchema; enum(values: readonly [string, ...string[]]): ZodSchema; union(items: readonly unknown[]): ZodSchema };
 };
 interface ZodSchema {
 	describe(text: string): unknown;

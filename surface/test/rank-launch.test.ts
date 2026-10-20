@@ -1,4 +1,5 @@
-// Jev ranking's launch gate (PLAN wl-mv8k039gvogt8g § 2 D6, D7; § 3 tests T12, T15–T20). The gate is driven through the
+// Jev ranking's launch gate (PLAN wl-mv8k039gvogt8g § 2 D6, D7; § 3 tests T12, T15–T20) and rank-ordered launch with
+// priority pause (PLAN wl-mv8wzytml878b4 D2, D3; tests T1–T3, T5: `order` is the default, `preemptFor`). The gate is driven through the
 // real paths: the starter's reservation (`reserve` in surface/scripts/lane.ts, the policy `reserveOrExit` hands to
 // `reserveLane`), the surface's pre-check and exec (surface/extensions/launch.ts `triggerLaunch` / `launchVerdict`, the
 // open tool's and the wake tick's), and the drain as the process it is, against the fake omp (surface/test/helpers.ts
@@ -13,15 +14,19 @@ import orchestratorSurface from "../index";
 import { spendBody } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
-import { controlEntries, doneBody, laneExitBody, laneStopRequestBody, launchRequestedBody, STARTER_EXIT, verdictOf } from "../src/launch";
+import {
+	controlEntries, doneBody, LANE_CAP_ENV, laneExitBody, laneReadyBody, laneStopAcceptedBody, laneStopRequestBody, launchRequestedBody, PRIORITY_REASON_PREFIX, priorityPausedOf,
+	STARTER_EXIT, verdictOf,
+} from "../src/launch";
 import { briefHash, formatOverride, formatSignal, goalsHash, parseShown, rankDay, rankOpen, type SignalAnswers } from "../src/rank";
-import { parallelRead, parallelVerdict, parseRankConfig, type RankConfig, readRankConfig } from "../src/rank-launch";
+import { parallelRead, parallelVerdict, parseRankConfig, preemptFor, type RankConfig, readRankConfig } from "../src/rank-launch";
+import { surfaceSession } from "../src/session";
 import { testRequestedBody } from "../src/test-run";
 import { RANK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 // A namespace import, as lane-script.test.ts does: a name lane.ts stops exporting fails only the test that calls it.
 import * as laneScript from "../scripts/lane";
 import {
-	ctxOf, drainLinesOf, drainLog, fakePi, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh, tempLedger, tempRepo, tmp,
+	ctxOf, drainLinesOf, drainLog, fakePi, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh, tempLedger, tempRepo, timers, tmp,
 } from "./helpers";
 
 const REPO = resolve(import.meta.dir, "..", "..");
@@ -80,6 +85,17 @@ function world() {
 	return { l, open };
 }
 const reserve = (l: Ledger, wl: string, config: RankConfig, interactive = false) => laneScript.reserve(l, wl, interactive ? "jo" : "test", interactive, config);
+/** Runs `f` with AGENT_SYSTEM_MAX_LANES at `cap` in this process's env, where the starter's `reserve` reads its cap. */
+function withCap<T>(cap: number, f: () => T): T {
+	const before = process.env[LANE_CAP_ENV];
+	process.env[LANE_CAP_ENV] = String(cap);
+	try {
+		return f();
+	} finally {
+		if (before === undefined) delete process.env[LANE_CAP_ENV];
+		else process.env[LANE_CAP_ENV] = before;
+	}
+}
 
 /** An env whose HOME holds the installed profile config `text` (none when null), where `readRankConfig` reads it. */
 function homeWith(text: string | null): Record<string, string> {
@@ -92,6 +108,7 @@ function homeWith(text: string | null): Record<string, string> {
 	return { HOME: home, AGENT_SYSTEM_PROFILE: "agent-system-2" };
 }
 const ORDER_YAML = "setupVersion: 2\njevRank:\n  mode: order\n  parallelBudgetUsd: 0\n";
+const SHOW_YAML = "setupVersion: 2\njevRank:\n  mode: show\n  parallelBudgetUsd: 0\n";
 
 // ---- real-process fixtures (lane-script.test.ts's) -----------------------------------------------------------------
 
@@ -178,29 +195,31 @@ describe("T12 as2 rank-mode", () => {
 		return { env, config, run, parsed, others, ompRan: () => existsSync(ran) };
 	}
 
-	test("on the installed template: sets jevRank.mode and the budget, prints old -> new, keeps every other key, never runs omp; readRankConfig reads what it wrote", () => {
+	test("on the installed template (order): sets jevRank.mode and the budget, prints old -> new, keeps every other key, never runs omp; readRankConfig reads what it wrote", () => {
 		const s = setup("");
 		copyFileSync(TEMPLATE, s.config);
 		const before = s.parsed();
-		expect(before.jevRank).toEqual({ mode: "show", parallelBudgetUsd: 0 });
+		expect(before.jevRank).toEqual({ mode: "order", parallelBudgetUsd: 0 });
+		expect(readRankConfig(s.env)).toEqual(ORDER);
 
-		const order = s.run("order");
-		expect(order.code).toBe(0);
-		expect(order.out).toContain("jevRank: mode show parallelBudgetUsd 0 -> mode order parallelBudgetUsd 0");
-		expect(s.parsed().jevRank).toEqual({ mode: "order", parallelBudgetUsd: 0 });
+		// show reverses the default
+		const show = s.run("show");
+		expect(show.code).toBe(0);
+		expect(show.out).toContain("jevRank: mode order parallelBudgetUsd 0 -> mode show parallelBudgetUsd 0");
+		expect(s.parsed().jevRank).toEqual({ mode: "show", parallelBudgetUsd: 0 });
 		expect(s.others(s.parsed())).toEqual(s.others(before));
-		expect(readRankConfig(s.env)).toEqual({ mode: "order", parallelBudgetUsd: 0 });
+		expect(readRankConfig(s.env)).toEqual(SHOW);
 
 		const par = s.run("parallel", "--budget", "12.5");
 		expect(par.code).toBe(0);
-		expect(par.out).toContain("jevRank: mode order parallelBudgetUsd 0 -> mode parallel parallelBudgetUsd 12.5");
+		expect(par.out).toContain("jevRank: mode show parallelBudgetUsd 0 -> mode parallel parallelBudgetUsd 12.5");
 		expect(readRankConfig(s.env)).toEqual({ mode: "parallel", parallelBudgetUsd: 12.5 });
 
-		// show reverses the mode; with no --budget the budget in force is kept
-		const show = s.run("show");
-		expect(show.code).toBe(0);
-		expect(show.out).toContain("-> mode show parallelBudgetUsd 12.5");
-		expect(readRankConfig(s.env)).toEqual({ mode: "show", parallelBudgetUsd: 12.5 });
+		// with no --budget the budget in force is kept
+		const order = s.run("order");
+		expect(order.code).toBe(0);
+		expect(order.out).toContain("-> mode order parallelBudgetUsd 12.5");
+		expect(readRankConfig(s.env)).toEqual({ mode: "order", parallelBudgetUsd: 12.5 });
 		expect(s.others(s.parsed())).toEqual(s.others(before));
 		expect(s.ompRan()).toBe(false);
 	});
@@ -233,28 +252,30 @@ describe("T12 as2 rank-mode", () => {
 	});
 });
 
-// ---- T15 -----------------------------------------------------------------------------------------------------------
+// ---- T15 / T1 ------------------------------------------------------------------------------------------------------
 
-describe("T15 mode read; show changes no launch", () => {
-	test("missing, malformed and show read as show; a valid mode keeps it, a malformed budget reads 0", () => {
-		expect(readRankConfig(homeWith(null))).toEqual(SHOW);
-		expect(readRankConfig(homeWith("setupVersion: 2\n"))).toEqual(SHOW);
-		expect(readRankConfig(homeWith("jevRank: loud\n"))).toEqual(SHOW);
-		expect(readRankConfig(homeWith("jevRank:\n  mode: fast\n  parallelBudgetUsd: 5\n"))).toEqual(SHOW);
-		expect(readRankConfig(homeWith("jevRank: [order]\n"))).toEqual(SHOW);
-		expect(readRankConfig(homeWith("jevRank: {\n"))).toEqual(SHOW);
+describe("T15 / T1 mode read (missing reads order); an explicit show changes no launch", () => {
+	test("missing and malformed read as order; a valid mode keeps it, a malformed budget reads 0", () => {
+		expect(readRankConfig(homeWith(null))).toEqual(ORDER);
+		expect(readRankConfig(homeWith("setupVersion: 2\n"))).toEqual(ORDER);
+		expect(readRankConfig(homeWith("jevRank: loud\n"))).toEqual(ORDER);
+		expect(readRankConfig(homeWith("jevRank:\n  mode: fast\n  parallelBudgetUsd: 5\n"))).toEqual(ORDER);
+		expect(readRankConfig(homeWith("jevRank: [order]\n"))).toEqual(ORDER);
+		expect(readRankConfig(homeWith("jevRank: {\n"))).toEqual(ORDER);
+		expect(parseRankConfig(null)).toEqual(ORDER);
 		expect(readRankConfig(homeWith("jevRank:\n  mode: show\n  parallelBudgetUsd: 5\n"))).toEqual({ mode: "show", parallelBudgetUsd: 5 });
+		expect(readRankConfig(homeWith(SHOW_YAML))).toEqual(SHOW);
 		expect(readRankConfig(homeWith("jevRank:\n  mode: parallel\n  parallelBudgetUsd: -3\n"))).toEqual({ mode: "parallel", parallelBudgetUsd: 0 });
 		expect(readRankConfig(homeWith("jevRank:\n  mode: parallel\n  parallelBudgetUsd: lots\n"))).toEqual({ mode: "parallel", parallelBudgetUsd: 0 });
 		expect(readRankConfig(homeWith(ORDER_YAML))).toEqual(ORDER);
 	});
 
-	test("show: the open and tick paths admit the lower-ranked workload as today (cause first, even with Jo's request pending), and the starter reserves it", async () => {
+	test("explicit show: the open and tick paths admit the lower-ranked workload as today (cause first, even with Jo's request pending), and the starter reserves it", async () => {
 		const { l, open } = world();
 		const lo = open("lo: older, Jev ranks it lower", { unblocks: 0.1 });
 		const hi = open("hi: newer, Jev ranks it higher", { unblocks: 0.9 });
 		const req = request(l, lo);
-		const env = homeWith("setupVersion: 2\n");
+		const env = homeWith(SHOW_YAML);
 		expect(launchVerdict(l, env, lo)).toEqual({ launch: true, cause: { kind: "first" } });
 		const f = fakePi(undefined, { exec: true });
 		const out = await triggerLaunch(f.pi, l, env, lo, "open");
@@ -268,8 +289,8 @@ describe("T15 mode read; show changes no launch", () => {
 		expect(reserve(l, hi, SHOW)).toMatchObject({ ok: true, cause: "first" });
 	});
 
-	test("show: the drain picks today's workload (oldest first, not Jev's top) and logs one rank-shadow line naming what order would have tried", () => {
-		const r = makeRoot(null, { AGENT_SYSTEM_MAX_LANES: "1" });
+	test("explicit show: the drain picks today's workload (oldest first, not Jev's top) and logs one rank-shadow line naming what order would have tried", () => {
+		const r = makeRoot(SHOW_YAML, { AGENT_SYSTEM_MAX_LANES: "1" });
 		const lo = openIn(r, "lo: older, Jev ranks it lower", 0.1);
 		const hi = openIn(r, "hi: newer, Jev ranks it higher", 0.9);
 		hang(r);
@@ -280,6 +301,306 @@ describe("T15 mode read; show changes no launch", () => {
 		]);
 		expect(laneSnapshot(r, lo).bodies).toContain(`${LANE_STARTER_BY} launch: ${laneIdOf(lo, 1)} cause first requested-by lane-runner`);
 	}, 60_000);
+});
+
+describe("T1 / T2 the default (no jevRank in the installed profile) follows the rank: the slot goes to the newer, higher-ranked workload", () => {
+	test("open path, tick path and drain: the older, lower-ranked one is queued below the top, the top gets the slot, no rank-shadow line", async () => {
+		const r = makeRoot(null, { AGENT_SYSTEM_MAX_LANES: "1" });
+		const lo = openIn(r, "lo: older, Jev ranks it lower", 0.1);
+		const hi = openIn(r, "hi: newer, Jev ranks it higher", 0.9);
+		hang(r);
+		const l = ledgerOf(r);
+		try {
+			expect(readRankConfig(r.env)).toEqual(ORDER);
+			const f = execPi(r);
+			expect((await triggerLaunch(f.pi, l, r.env, lo, "open")).line).toBe(`${lo} queued behind ${hi} (Jev rank); it launches once nothing ranked above it is launchable`);
+			expect(f.execs.calls).toEqual([]);
+			const tick = lane(r, ["launch", lo, "--requested-by", "tick"]);
+			expect(tick.code).toBe(STARTER_EXIT["not-launchable"]);
+			expect(tick.err).toContain(`${lo} not launched: ranked: below ${hi}`);
+			const pid = drain(r, "wl-ended");
+			expect(drainLinesOf(r, pid).map((x) => x.replace(/: .*$/, ""))).toEqual([`start ${pid} after wl-ended`, `attempt ${pid} ${hi} exit 0`, `end ${pid} attempts 1`]);
+			expect(launches(l, hi)).toEqual([`launch: ${laneIdOf(hi, 1)} cause first requested-by lane-runner`]);
+			expect(launches(l, lo)).toEqual([]);
+		} finally {
+			l.close();
+			stopAll(r, [lo, hi]);
+		}
+	}, 60_000);
+});
+
+/**
+ * The orchestrator surface (surface/index.ts, its wake tick in surface/extensions/wake.ts) on a temp ledger, with the
+ * installed profile `yaml` and AGENT_SYSTEM_MAX_LANES at `cap`, its exec fake (`f.execs`). Open the workloads first, then
+ * `start()`: it registers the surface and runs `session_start`; `tick()` then runs one poll's catch-up to its end, and
+ * `told()` gives the `- tick: …` lines the next turn carries.
+ */
+function wakeWorld(yaml: string, cap: number) {
+	const voice = join(tmp("voice"), "VOICE.md");
+	writeFileSync(voice, "VOICE");
+	const env = { ...homeWith(yaml), AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: join(tmp("ledger"), "ledger.db"), AGENT_SYSTEM_VOICE: voice, AGENT_SYSTEM_MAX_LANES: String(cap) };
+	// Real time, but every stamp a millisecond after the last: two workloads opened back to back keep their creation order
+	// (the catch-up walks `inFlight`, `ORDER BY created_at, id`, and ids do not sort by creation within a millisecond).
+	let last = 0;
+	const clock = () => new Date((last = Math.max(Date.now(), last + 1))).toISOString();
+	const l = Ledger.open(env.AGENT_SYSTEM_LEDGER_DB, { create: true, backup: false, backupOnOpen: false, clock });
+	ensureStandingWorkload(l);
+	/** An autonomous workload, scored when `unblocks` is given. */
+	const open = (brief: string, unblocks?: number): string => {
+		const wl = l.openWorkload({ by: SURFACE_BY, brief, stakes: "normal", mode: "autonomous" });
+		if (unblocks !== undefined) signal(l, wl, unblocks);
+		return wl;
+	};
+	const f = fakePi(undefined, { exec: true });
+	const start = async () => {
+		orchestratorSurface(f.pi, env, {});
+		const ctx = ctxOf({ cwd: tmp("cwd") });
+		const s = surfaceSession(ctx, env);
+		timers.length = 0;
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		const tick = async () => {
+			timers[0]!.fn();
+			while (s.launching) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				setImmediate(resolve);
+				await promise;
+			}
+		};
+		const told = async (): Promise<string[]> => {
+			const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
+			return (turn.messages[0]?.content ?? "").split("\n").filter((x) => x.startsWith("- tick: "));
+		};
+		return { tick, told };
+	};
+	return { env, l, open, f, start };
+}
+
+describe("T2 through the wake tick: a free slot goes to the newer, higher-ranked workload", () => {
+	test("tick launches the newer, higher-ranked workload into the free slot, never the older one; under explicit show the tick launches the older one", async () => {
+		for (const [yaml, mode] of [[ORDER_YAML, "order"], [SHOW_YAML, "show"]] as const) {
+			const w = wakeWorld(yaml, 2);
+			const { l } = w;
+			live(l, w.open("L, running", 0.5));
+			const lo = w.open("lo: older, Jev ranks it lower", 0.1);
+			const hi = w.open("hi: newer, Jev ranks it higher", 0.9);
+			// the catch-up walks the open workloads oldest first: lo before hi
+			const walk = l.inFlight().map((x) => x.workload.id);
+			expect(walk.indexOf(lo)).toBeLessThan(walk.indexOf(hi));
+			// The starter the tick execs, in process: its reservation at the surface's cap, so a launch takes the one free slot.
+			w.f.execs.answer = (_command, args) => {
+				const r = withCap(2, () => laneScript.reserve(l, args[2]!, args[4]!, false, readRankConfig(w.env)));
+				return r.ok
+					? { stdout: `lane ${r.laneId} reserved\n`, stderr: "", code: STARTER_EXIT.ok, killed: false }
+					: { stdout: "", stderr: `${args[2]} not launched: ${r.reason}\n`, code: STARTER_EXIT["not-launchable"], killed: false };
+			};
+			const { tick, told } = await w.start();
+			await tick();
+			await tick();
+			const [top, other] = mode === "order" ? [hi, lo] : [lo, hi];
+			expect({ yaml, execs: w.f.execs.calls.map((c) => c.args.slice(1)) }).toEqual({ yaml, execs: [["launch", top, "--requested-by", "tick"]] });
+			expect({ yaml, top: launches(l, top), other: launches(l, other) }).toEqual({ yaml, top: [`launch: ${laneIdOf(top, 1)} cause first requested-by tick`], other: [] });
+			const lines = (await told()).filter((x) => x.startsWith(`- tick: ${lo}`) || x.startsWith(`- tick: ${hi}`));
+			expect({ yaml, lines }).toEqual({ yaml, lines: [`- tick: ${top}: lane ${laneIdOf(top, 1)} reserved`] });
+			l.close();
+		}
+	});
+});
+
+// ---- T3 priority pause: preemptFor (PLAN wl-mv8wzytml878b4 D3) ------------------------------------------------------
+
+/** A ready lane under a live lease on `wl`: claimed by `lane-<wl>-1` and its runner's `lane-ready:` written. */
+function live(l: Ledger, wl: string): string {
+	running(l, wl);
+	l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneReadyBody(laneIdOf(wl, 1), l.now()) });
+	return laneIdOf(wl, 1);
+}
+/** The `lane-stop:` bodies on `wl`, as written. */
+const stops = (l: Ledger, wl: string) => l.entries(wl, "assumption").filter((e) => e.body.startsWith("lane-stop: ")).map((e) => `${e.created_by} ${e.body}`);
+const priorityStop = (laneId: string, x: string) => `${SURFACE_BY} lane-stop: ${laneId} requested ${PRIORITY_REASON_PREFIX}${x} by rank`;
+const preempt = (l: Ledger, cap: number, config: RankConfig = ORDER) => preemptFor(l, l.now(), cap, config, SURFACE_BY);
+
+describe("T3 priority pause: who preemptFor stops, and when it writes nothing", () => {
+	test("cap full, ruled X waiting, unruled L running below: one lane-stop: L requested priority-for-X; a repeat before L exits writes nothing", () => {
+		const { l, open } = world();
+		const lw = open("L, running, Jev ranks it high", { unblocks: 0.9 });
+		const laneL = live(l, lw);
+		const x = open("X, ruled by Jo", { unblocks: 0.1 });
+		pin(l, x);
+		expect(preempt(l, 1)).toEqual({ paused: { laneId: laneL, workloadId: lw, forWl: x }, reason: `priority-pausing ${laneL} on ${lw} for ${x}` });
+		expect(stops(l, lw)).toEqual([priorityStop(laneL, x)]);
+		expect(preempt(l, 1).paused).toBeNull();
+		expect(stops(l, lw)).toHaveLength(1);
+	});
+
+	test("two waiting ruled X1 above X2 get two victims, X1's the lowest-ranked; a third call writes nothing", () => {
+		const { l, open } = world();
+		const a = open("A, highest Jev", { unblocks: 0.9 });
+		const b = open("B", { unblocks: 0.5 });
+		const c = open("C, lowest Jev", { unblocks: 0.1 });
+		const [la, lb, lc] = [live(l, a), live(l, b), live(l, c)];
+		const x2 = open("X2", { unblocks: 0.2 });
+		const x1 = open("X1", { unblocks: 0.2 });
+		pin(l, x2);
+		pin(l, x1);
+		expect(rankOpen(l, l.now()).map((i) => i.workloadId).slice(0, 2)).toEqual([x1, x2]);
+		expect(preempt(l, 3).paused).toEqual({ laneId: lc, workloadId: c, forWl: x1 });
+		expect(preempt(l, 3).paused).toEqual({ laneId: lb, workloadId: b, forWl: x2 });
+		expect(preempt(l, 3).paused).toBeNull();
+		expect([stops(l, a), stops(l, b), stops(l, c)]).toEqual([[], [priorityStop(lb, x2)], [priorityStop(lc, x1)]]);
+		expect(la).toBe(laneIdOf(a, 1));
+	});
+
+	test("nothing written: below cap, a Jev-only higher X, explicit show or parallel, X itself running", () => {
+		const { l, open } = world();
+		const lw = open("L, running, low", { unblocks: 0.1 });
+		live(l, lw);
+		const x = open("X, Jev ranks it high, not ruled", { unblocks: 0.9 });
+		expect(preempt(l, 2).paused).toBeNull();
+		expect(preempt(l, 1)).toEqual({ paused: null, reason: "no ruled workload waiting" });
+		pin(l, x);
+		expect(preempt(l, 1, SHOW)).toEqual({ paused: null, reason: "jevRank mode show: priority pause is off" });
+		expect(preempt(l, 1, parallel(1_000)).paused).toBeNull();
+		live(l, x);
+		expect(preempt(l, 1).paused).toBeNull();
+		expect([stops(l, lw), stops(l, x)]).toEqual([[], []]);
+	});
+
+	test("never chosen: an interactive lane, a workload ruled above X, a lane with no lane-ready:, a lane with a pending ceiling or Jo stop", () => {
+		const { l, open } = world();
+		const top = open("ruled above X, running", { unblocks: 0.5 });
+		const hand = open("interactive, lowest", { unblocks: 0.0, mode: "user-driven" });
+		running(l, hand);
+		const x = open("X", { unblocks: 0.1 });
+		pin(l, x);
+		pin(l, top);
+		live(l, top);
+		// cap 1: the one autonomous lane is ruled above X; the interactive lane is never a victim
+		expect(preempt(l, 1)).toEqual({ paused: null, reason: `no running lane ranked below ${x} to pause` });
+		const starting = open("starting, no lane-ready:", { unblocks: 0.05 });
+		running(l, starting);
+		const ceiling = open("ceiling stop accepted", { unblocks: 0.04 });
+		const lc = live(l, ceiling);
+		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: ceiling, kind: "assumption", body: laneStopAcceptedBody(lc, "ceiling") });
+		const jo = open("Jo's stop pending", { unblocks: 0.03 });
+		const lj = live(l, jo);
+		l.recordEntry({ by: SURFACE_BY, workloadId: jo, kind: "assumption", body: laneStopRequestBody(lj, "by-hand", "jo") });
+		expect(preempt(l, 4).paused).toBeNull();
+		for (const wl of [top, hand, starting]) expect(stops(l, wl)).toEqual([]);
+		expect(stops(l, ceiling)).toHaveLength(1);
+		expect(stops(l, jo)).toHaveLength(1);
+	});
+
+	test("triggerLaunch on X refused only by the cap writes the stop and prints the priority-pausing line; under explicit show it writes nothing", async () => {
+		for (const [yaml, writes] of [[ORDER_YAML, true], [null, true], [SHOW_YAML, false], ["jevRank:\n  mode: parallel\n  parallelBudgetUsd: 1000\n", false]] as const) {
+			const { l, open } = world();
+			const lw = open("L, running", { unblocks: 0.9 });
+			const laneL = live(l, lw);
+			const x = open("X, ruled", { unblocks: 0.1 });
+			pin(l, x);
+			const env = { ...homeWith(yaml), AGENT_SYSTEM_MAX_LANES: "1" };
+			const f = fakePi(undefined, { exec: true });
+			const out = await triggerLaunch(f.pi, l, env, x, "open");
+			const queued = `${x} queued behind ${laneL} on ${lw} (cap 1); the tick launches it when a slot frees`;
+			expect({ yaml, out }).toEqual({ yaml, out: { attempted: false, code: null, line: writes ? `${queued}; priority-pausing ${laneL} on ${lw} for ${x}` : queued } });
+			expect({ yaml, stops: stops(l, lw) }).toEqual({ yaml, stops: writes ? [priorityStop(laneL, x)] : [] });
+			expect(f.execs.calls).toEqual([]);
+		}
+	});
+
+	test("the wake tick runs preemptFor once per poll and tells it as a tick line; the next poll writes nothing more; explicit show writes nothing", async () => {
+		for (const [yaml, writes] of [[ORDER_YAML, true], [SHOW_YAML, false]] as const) {
+			const w = wakeWorld(yaml, 1);
+			const { l } = w;
+			const lw = w.open("L, running", 0.9);
+			const laneL = live(l, lw);
+			const x = w.open("X, ruled");
+			pin(l, x);
+			const { tick, told } = await w.start();
+			await tick();
+			await tick();
+			expect({ yaml, stops: stops(l, lw) }).toEqual({ yaml, stops: writes ? [priorityStop(laneL, x)] : [] });
+			const pausing = (await told()).filter((t) => t.startsWith("- tick: priority-pausing"));
+			expect({ yaml, told: pausing }).toEqual({ yaml, told: writes ? [`- tick: priority-pausing ${laneL} on ${lw} for ${x}`] : [] });
+			expect(w.f.execs.calls.filter((c) => c.args[1] === "launch")).toEqual([]);
+			l.close();
+		}
+	});
+});
+
+// ---- T6 at the ledger: who takes the slot a priority pause frees ---------------------------------------------------
+
+/**
+ * The rows `wl`'s runner writes when it takes the priority stop for `x` (surface/scripts/lane.ts: `stop` records the
+ * acceptance naming the request, `finish` releases and records the exit, outcome stop reason priority-for-<x>); returns
+ * the exit's entry id.
+ */
+function takesPriorityStop(l: Ledger, wl: string, laneId: string, x: string): string {
+	const req = l.entries(wl, "assumption").find((e) => e.body === `lane-stop: ${laneId} requested ${PRIORITY_REASON_PREFIX}${x} by rank`);
+	if (!req) throw new Error(`no priority stop on ${laneId}`);
+	l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneStopAcceptedBody(laneId, req.id) });
+	l.releaseWorkload(wl, { by: LANE_RUNNER_BY, holder: laneId });
+	return l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(laneId, { code: 0, signal: null, outcome: "stop", reason: `${PRIORITY_REASON_PREFIX}${x}` }) });
+}
+
+describe("T6 at the ledger: who takes the slot a priority pause frees (cap 1, order)", () => {
+	test("freed slot: Jo's request on C wins it (cause request), ruled X is refused cap and stays waiting; the next preemptFor pauses C and X takes the slot C frees", () => {
+		const { l, open } = world();
+		const lw = open("L, running, unruled", { unblocks: 0.9 });
+		const laneL = live(l, lw);
+		const x = open("X, ruled by Jo", { unblocks: 0.1 });
+		pin(l, x);
+		const c = open("C, unruled, Jo asked for it", { unblocks: 0.5 });
+		const req = request(l, c);
+		expect(preempt(l, 1).paused).toEqual({ laneId: laneL, workloadId: lw, forWl: x });
+		expect(preempt(l, 1)).toEqual({ paused: null, reason: "1 priority stop(s) already on their way for 1 ruled workload(s)" });
+
+		// L's runner takes the stop: L is priority-paused for X and the slot is free
+		const exitL = takesPriorityStop(l, lw, laneL, x);
+		expect(priorityPausedOf(controlEntries(l.entries(lw, "assumption")))).toEqual({ laneId: laneL, forWl: x, exitId: exitL });
+		// Jo's starter reaches the freed slot first: C is admitted below ruled X on its request
+		const laneC = laneIdOf(c, 1);
+		expect(withCap(1, () => reserve(l, c, ORDER))).toEqual({ ok: true, laneId: laneC, cause: `request ${req}` });
+		// X's starter comes second: refused at the cap, X still waiting with nothing written, not lost
+		expect(withCap(1, () => reserve(l, x, ORDER))).toEqual({ ok: false, reason: "cap" });
+		expect(launches(l, x)).toEqual([]);
+		expect(verdictOf(l.launchRows(x, 1)!)).toEqual({ launch: false, reason: "cap" });
+
+		// C's runner reports ready; L's stop has exited, so none is on its way and preemptFor pauses C for X
+		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: c, kind: "assumption", body: laneReadyBody(laneC, l.now()) });
+		expect(preempt(l, 1).paused).toEqual({ laneId: laneC, workloadId: c, forWl: x });
+		expect(stops(l, c)).toEqual([priorityStop(laneC, x)]);
+		expect(stops(l, lw).map((s) => s.replace(/en-\S+$/, "en-…"))).toEqual([priorityStop(laneL, x), `${LANE_RUNNER_BY} lane-stop: ${laneL} accepted en-…`]);
+		takesPriorityStop(l, c, laneC, x);
+		expect(withCap(1, () => reserve(l, x, ORDER))).toEqual({ ok: true, laneId: laneIdOf(x, 1), cause: "first" });
+		expect(launches(l, x)).toEqual([`launch: ${laneIdOf(x, 1)} cause first requested-by test`]);
+	});
+});
+
+// ---- T5 the gate on a priority-paused workload ----------------------------------------------------------------------
+
+describe("T5 a priority-paused workload relaunches by the rank, cause priority <exit>", () => {
+	/** `wl` ran, was asked to stop for `x`, accepted it, released and exited outcome stop reason priority-for-x; returns the exit id. */
+	function paused(l: Ledger, wl: string, x: string): string {
+		const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", decide: () => ({ launch: true, cause: "first" }) });
+		if (!res.ok) throw new Error(res.reason);
+		const req = l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: laneStopRequestBody(res.laneId, `${PRIORITY_REASON_PREFIX}${x}`, "rank") });
+		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneStopAcceptedBody(res.laneId, req) });
+		l.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: res.laneId });
+		return l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(res.laneId, { code: 0, signal: null, outcome: "stop", reason: `${PRIORITY_REASON_PREFIX}${x}` }) });
+	}
+	test("held while a higher-ranked workload is launchable; admitted with cause priority <exit> once it runs; then the cause is spent", () => {
+		const { l, open } = world();
+		const p = open("P, paused", { unblocks: 0.1 });
+		const exitId = paused(l, p, "wl-x");
+		const hi = open("hi", { unblocks: 0.9 });
+		expect(verdictOf(l.launchRows(p, 3)!)).toEqual({ launch: true, cause: { kind: "priority", exitId } });
+		expect(reserve(l, p, ORDER)).toEqual({ ok: false, reason: `ranked: below ${hi}` });
+		running(l, hi);
+		expect(reserve(l, p, ORDER)).toEqual({ ok: true, laneId: laneIdOf(p, 2), cause: `priority ${exitId}` });
+		expect(launches(l, p)).toEqual([`launch: ${laneIdOf(p, 1)} cause first requested-by test`, `launch: ${laneIdOf(p, 2)} cause priority ${exitId} requested-by test`]);
+		l.releaseWorkload(p, { by: LANE_STARTER_BY, holder: laneIdOf(p, 2) });
+		expect(verdictOf(l.launchRows(p, 3)!)).toEqual({ launch: false, reason: "died-not-relaunched" });
+	});
 });
 
 // ---- T16 -----------------------------------------------------------------------------------------------------------

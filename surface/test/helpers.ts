@@ -72,7 +72,7 @@ export function fakePi(tools = ["read", "bash", "ask", "task", "yield"], o: { ex
 		appendEntry: (type: string, data?: unknown) => entries.push({ type, data }),
 		registerTool: (t: FakeTool) => registered.set(t.name, t),
 		sendMessage: (message: Sent["message"], options?: unknown) => sent.push({ message, options }),
-		zod: { object: schema, string: schema, array: schema, enum: schema },
+		zod: { object: schema, string: schema, array: schema, enum: schema, union: schema },
 	};
 	/** pi.exec, opt-in (`fakePi(tools, { exec: true })`): recorded, answered by `execs.answer` (default: exit 0, empty output). */
 	const exec = async (command: string, args: string[], options?: unknown) => {

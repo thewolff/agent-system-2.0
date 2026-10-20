@@ -14,11 +14,14 @@
 // pick`, PLAN wl-mv8k039gvogt8g D6) before the request. The pre-check applies Jev ranking's gate
 // (`rankGate`, D7) as the starter's reservation does, so in `order` / `parallel` a workload ranked
 // below a launchable one is reported queued behind it and no starter runs; in `show` it is `verdictOf`.
+// At cap it runs `preemptFor` (PLAN wl-mv8wzytml878b4 D3): in `order`, a Jo-ruled workload waiting at
+// cap gets a priority stop written on the lowest-ranked running lane below it, told as
+// `priority-pausing <lane> on <wl> for <X>`.
 import type { Ledger } from "../../ledger/src/index";
 import {
 	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, type LaunchVerdict, launchRequestedBody, modelProblem, STARTER_EXIT,
 } from "../src/launch";
-import { rankGate, readRankConfig, writePickSnapshot } from "../src/rank-launch";
+import { preemptFor, rankGate, readRankConfig, writePickSnapshot } from "../src/rank-launch";
 import { surfaceSession } from "../src/session";
 import { DUE_PREFIX, LAUNCH_LANE_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult } from "../src/types";
 
@@ -27,6 +30,9 @@ const inactive = text("This session is not the orchestrator surface; nothing was
 /** The open and tick line for a workload the rank gate queues behind a higher-ranked launchable one. */
 const queuedLine = (workloadId: string, above: string): string =>
 	`${workloadId} queued behind ${above} (Jev rank); it launches once nothing ranked above it is launchable`;
+/** The open and tick line for a priority stop `preemptFor` wrote (PLAN wl-mv8wzytml878b4 D4). */
+export const priorityPausingLine = (p: { laneId: string; workloadId: string; forWl: string }): string =>
+	`priority-pausing ${p.laneId} on ${p.workloadId} for ${p.forWl}`;
 
 export interface LaunchOutcome {
 	/** The predicate said launch and the starter was run. */
@@ -44,7 +50,8 @@ export interface LaunchOutcome {
 export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, workloadId: string, who: string): Promise<LaunchOutcome> {
 	const rows = ledger.launchRows(workloadId, laneCap(env));
 	if (!rows) return { attempted: false, code: null, line: `no workload ${workloadId}` };
-	const verdict = rankGate(ledger, rows, readRankConfig(env));
+	const config = readRankConfig(env);
+	const verdict = rankGate(ledger, rows, config);
 	if (!verdict.launch) {
 		switch (verdict.reason) {
 			case "standing":
@@ -56,7 +63,13 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 				return { attempted: false, code: null, line: `${workloadId} is held by ${rows.workload.holder} (lease until ${rows.workload.holder_lease_until ?? "none"}); nothing launched` };
 			case "cap": {
 				const live = ledger.liveLaneHolders(rows.now).map((l) => `${l.holder} on ${l.workloadId}`);
-				return { attempted: false, code: null, line: `${workloadId} queued behind ${live.join(", ")} (cap ${rows.cap}); the tick launches it when a slot frees` };
+				const queued = `${workloadId} queued behind ${live.join(", ")} (cap ${rows.cap}); the tick launches it when a slot frees`;
+				try {
+					const { paused } = preemptFor(ledger, rows.now, rows.cap, config, SURFACE_BY);
+					return { attempted: false, code: null, line: paused ? `${queued}; ${priorityPausingLine(paused)}` : queued };
+				} catch (err) {
+					return { attempted: false, code: null, line: `${queued}; the priority pause check failed: ${String(err)}` };
+				}
 			}
 			case "awaiting-close":
 				return { attempted: false, code: null, line: `${workloadId} is finished and awaiting close: its holder wrote done-because:; nothing launched` };

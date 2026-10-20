@@ -5,14 +5,21 @@
 // read-only `as2 rank` (surface/scripts/rank.ts). None exists before this slice, so this file fails on its imports until
 // the build. Ledgers are real temp ledgers on the real clock (the surface opens its own handle, as in production); the
 // judge is a fake that answers the rank questions from the brief's words, as OMP's judge answers on the wire (`noul`).
+//
+// wl-mv8wzytml878b4 (PLAN rev 5 § 2 D1, D3, D4; § 3 T7–T8 there): Jo's ruled list (`first: [A, B, C]`), the priority
+// pause `as2_rank first` writes at cap, and the table's `ruled #k` / `priority-paused` / `priority-pausing` marks. Launch
+// order is `order` by default now; the show-only wording is checked on an explicit `jevRank.mode: show` profile.
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { Ledger } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { ensureStandingWorkload } from "../src/identity";
+import { laneExitBody, laneReadyBody } from "../src/launch";
 import { rankLines, renderWake } from "../src/render";
 import { readingBody } from "../src/orchestrator-question";
 import { briefHash, goalsHash, livePins, parseShown, rankOpen, SEED_GOALS, type Shown } from "../src/rank";
+import { readRankConfig } from "../src/rank-launch";
 import { surfaceSession } from "../src/session";
 import { RANK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, sh, tempLedger, tmp } from "./helpers";
@@ -67,11 +74,24 @@ function fakeJudge(o: { during?: () => void } = {}): FakeJudge {
 
 type Role = "orchestrator" | "lane" | "hand";
 
-/** One ledger and a session of `role` over it with `judge` wired; `call` runs as2_rank. */
-function world(role: Role = "orchestrator", judgeOf: FakeJudge = fakeJudge()) {
+/** A HOME whose installed profile config (`installedConfigPath`) sets `jevRank.mode`. */
+function profileHome(mode: "show" | "order"): string {
+	const home = tmp("home");
+	const dir = join(home, ".omp", "profiles", "agent-system-2", "agent");
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "config.yml"), `setupVersion: 2\njevRank:\n  mode: ${mode}\n`);
+	return home;
+}
+
+/**
+ * One ledger and a session of `role` over it with `judge` wired; `call` runs as2_rank. With no `mode` the HOME has no
+ * profile (the default launch order); `mode` writes an installed profile with that `jevRank.mode`; `cap` sets the lane cap.
+ */
+function world(role: Role = "orchestrator", judgeOf: FakeJudge = fakeJudge(), o: { mode?: "show" | "order"; cap?: number } = {}) {
 	const { ledger, path } = tempLedger();
 	ensureStandingWorkload(ledger);
-	const env: Record<string, string> = { AGENT_SYSTEM_ROLE: role === "orchestrator" ? "orchestrator" : "lane", AGENT_SYSTEM_LEDGER_DB: path, HOME: "/nonexistent-home" };
+	const env: Record<string, string> = { AGENT_SYSTEM_ROLE: role === "orchestrator" ? "orchestrator" : "lane", AGENT_SYSTEM_LEDGER_DB: path, HOME: o.mode ? profileHome(o.mode) : "/nonexistent-home" };
+	if (o.cap !== undefined) env.AGENT_SYSTEM_MAX_LANES = String(o.cap);
 	if (role === "lane") Object.assign(env, { AGENT_SYSTEM_LANE_ID: "lane-r-1" });
 	const f = fakePi(undefined, { exec: false });
 	orchestratorSurface(f.pi, env, { judge: judgeOf.judge, askTimeoutMs: 2_000 });
@@ -79,7 +99,7 @@ function world(role: Role = "orchestrator", judgeOf: FakeJudge = fakeJudge()) {
 	if (role === "hand") Object.assign(ctx.sessionManager, { getSessionFile: () => "/sessions/artifacts/StrongRankHand.jsonl" });
 	const call = async (params: Record<string, unknown> = {}) => {
 		const r = await f.tool("as2_rank").execute("1", params, undefined, undefined, ctx);
-		return { text: r.content[0]!.text, details: r.details as { items: string[]; shown: string } | undefined };
+		return { text: r.content[0]!.text, details: r.details as { items: string[]; shown: string; dropped: string[]; paused: { laneId: string; workloadId: string; forWl: string } | null } | undefined };
 	};
 	const open = (brief: string) => ledger.openWorkload({ by: SURFACE_BY, brief, stakes: "normal", mode: "autonomous" });
 	/** An input row of Jo's words, as the surface writes it. */
@@ -110,14 +130,16 @@ describe("T7 fill", () => {
 		expect(first.details!.items).toEqual(order(w.ledger));
 		expect(w.bodies(high, "priority-signal: ")).toHaveLength(1);
 		expect(w.bodies(high, "priority-signal: ")[0]).toContain(`brief ${briefHash(w.ledger.workload(high)!.brief)} goals ${goalsHash([])}`);
-		// the table: the rows in that order, every term column, the goals line, the weights, the parallel read, show-only
+		// the table: the rows in that order, every term column, the goals line, the weights, the parallel read, and the
+		// launch order: `order` with no profile (the default), so no show-only line
 		const lines = first.text.split("\n");
 		const rowsOf = lines.filter((l) => /^\d+ · wl-/.test(l));
 		expect(rowsOf.map((l) => l.split(" · ")[1])).toEqual([high, mid, low]);
 		expect(first.text).toContain("goals: none");
 		expect(first.text).toContain("weights: goal_max 0.3 · unblocks_jo 0.2 · fixes_breakage 0.15 · urgency 0.2 · cuts_spend 0.15");
 		expect(first.text).toContain("parallel read");
-		expect(first.text).toContain("show-only: launch order is unchanged (as2 rank-mode)");
+		expect(lines.at(-1)).toBe("launch order: order (as2 rank-mode)");
+		expect(first.text).not.toContain("show-only");
 
 		await w.call();
 		expect(w.judge.asks).toHaveLength(3);
@@ -129,6 +151,13 @@ describe("T7 fill", () => {
 		// refresh re-asks every item
 		await w.call({ refresh: "yes" });
 		expect(w.judge.asks).toHaveLength(8);
+	});
+
+	test("on an explicit jevRank.mode: show profile the table's last line is the show-only line", async () => {
+		const w = world("orchestrator", fakeJudge(), { mode: "show" });
+		w.open("Tidy the README wording");
+		const r = await w.call();
+		expect(r.text.split("\n").at(-1)).toBe("show-only: launch order is unchanged (as2 rank-mode)");
 	});
 
 	test("the third failure on a (brief, goals) pair stops asks for it; the item is listed unscored as jev failed", async () => {
@@ -239,7 +268,9 @@ describe("T8 Jo receipt", () => {
 		});
 		const r = await w.call({ goals: ["Ship the ranking work"], first: b, inputId });
 		expect(r.text).toContain(`Jo's input ${inputId} spent`);
-		expect(new Set(landed)).toEqual(new Set([outer]));
+		// every row in one outer transaction (the priority-pause check after it opens its own and, below cap, writes nothing)
+		expect(new Set(landed).size).toBe(1);
+		expect(landed[0]).toBeGreaterThan(0);
 		const control = w.ledger.entries(STANDING_WORKLOAD_ID, "assumption").map((e) => e.body.split(":")[0]);
 		expect(control.slice(-5)).toEqual(["rank-goals", "rank-shown", "rank-override", "rank-shown", "reading"]);
 		expect(w.bodies(a, "priority-signal: ")).toHaveLength(1);
@@ -288,7 +319,7 @@ describe("T8b pins", () => {
 		const pinIn = w.input(`${low} first`);
 		const r = await w.call({ first: low, inputId: pinIn });
 		expect(r.details!.items).toEqual([low, high, mid]);
-		expect(r.text.split("\n").find((l) => l.startsWith("1 · "))).toContain(`${low} · autonomous/waiting · pinned (Jo, ${pinIn})`);
+		expect(r.text.split("\n").find((l) => l.startsWith("1 · "))).toContain(`${low} · autonomous/waiting · ruled #1 (Jo, ${pinIn})`);
 		expect(order(w.ledger)).toEqual([low, high, mid]);
 		const [pick, mine] = w.shown().slice(-2);
 		expect(pick!.by).toBe("pick");
@@ -329,7 +360,7 @@ describe("T9 registration", () => {
 });
 
 describe("T10 wake line and CLI", () => {
-	test("the wake line and as2 rank show the tool's top 3 over one fixture ledger; neither asks a judge nor writes", async () => {
+	test("the wake line and as2 rank show the tool's top 3 over one fixture ledger in the default order mode; neither asks a judge nor writes", async () => {
 		const w = world();
 		const wls = [w.open("Tidy the README wording"), w.open("HIGH: stop Jo pasting lane ids by hand"), w.open("MID: the wake render crashes"), w.open("HIGH MID: both at once")];
 		const r = await w.call();
@@ -342,19 +373,26 @@ describe("T10 wake line and CLI", () => {
 		const rankBefore = rankRows();
 
 		const now = new Date().toISOString();
-		const [line] = rankLines(w.ledger, now);
-		expect(line).toStartWith("Rank (Jev, show-only): 1 ");
+		// no profile: the launch order is `order`, so neither the wake line nor the CLI says show-only
+		expect(readRankConfig(w.env).mode).toBe("order");
+		const [line] = rankLines(w.ledger, now, readRankConfig(w.env).mode);
+		expect(line).toStartWith("Rank (Jev, ");
+		expect(line).not.toContain("show-only");
 		expect([...line!.matchAll(/\b(\d) (wl-\S+)/g)].map((m) => m[2])).toEqual(top3);
 		expect(line).toContain("; 0 unscored; goals none; as2_rank for the table");
-		expect(renderWake(w.ledger, { holdHours: 24, now }).text).toContain(line!);
+		expect(renderWake(w.ledger, { holdHours: 24, now, rankMode: "order" }).text).toContain(line!);
 
-		const home = tmp("home");
-		const cli = sh(["bun", join(REPO, "surface", "scripts", "rank.ts"), "--top", "3"], REPO, { PATH: process.env.PATH ?? "", HOME: home, AGENT_SYSTEM_LEDGER_DB: w.path });
+		const cliIn = (home: string) => sh(["bun", join(REPO, "surface", "scripts", "rank.ts"), "--top", "3"], REPO, { PATH: process.env.PATH ?? "", HOME: home, AGENT_SYSTEM_LEDGER_DB: w.path });
+		const cli = cliIn(tmp("home"));
 		expect(cli.code).toBe(0);
 		const cliRows = cli.out.split("\n").filter((l) => /^\d+ · wl-/.test(l)).map((l) => l.split(" · ")[1]);
 		expect(cliRows).toEqual(top3);
 		expect(cli.out).toContain("fill: none (read-only");
-		expect(cli.out).toContain("show-only: launch order is unchanged (as2 rank-mode)");
+		expect(cli.out.split("\n").at(-1)).toBe("launch order: order (as2 rank-mode)");
+		expect(cli.out).not.toContain("show-only");
+		// an explicit jevRank.mode: show profile keeps the show-only wording, in the CLI and in the wake line
+		expect(cliIn(profileHome("show")).out.split("\n").at(-1)).toBe("show-only: launch order is unchanged (as2 rank-mode)");
+		expect(rankLines(w.ledger, now, "show")[0]).toStartWith("Rank (Jev, show-only): 1 ");
 		expect(w.rows()).toEqual(before);
 
 		// the orchestrator's own wake carries the same line
@@ -372,11 +410,142 @@ describe("T10 wake line and CLI", () => {
 		const w = world();
 		const wl = w.open("Never asked");
 		const now = new Date().toISOString();
-		expect(rankLines(w.ledger, now)).toEqual([`Rank (Jev, show-only): 1 ${wl} Never asked (unscored); 1 unscored; goals none; as2_rank for the table`]);
+		expect(rankLines(w.ledger, now, "show")).toEqual([`Rank (Jev, show-only): 1 ${wl} Never asked (unscored); 1 unscored; goals none; as2_rank for the table`]);
 		const cli = sh(["bun", join(REPO, "surface", "scripts", "rank.ts")], REPO, { PATH: process.env.PATH ?? "", HOME: tmp("home"), AGENT_SYSTEM_LEDGER_DB: w.path });
 		expect(cli.code).toBe(0);
 		expect(cli.out).toContain(`unscored: ${wl} (no signal)`);
 		expect(sh(["bun", join(REPO, "surface", "scripts", "rank.ts"), "--top", "x"], REPO, { PATH: process.env.PATH ?? "", HOME: tmp("home"), AGENT_SYSTEM_LEDGER_DB: w.path }).code).toBe(1);
+	});
+});
+
+/** The cells of the table row (tool or CLI) for `wl`: `[n, wl, mode/state, ruled, score, …]`. */
+const rowOf = (table: string, wl: string): string[] => table.split("\n").find((l) => /^\d+ · wl-/.test(l) && l.split(" · ")[1] === wl)!.split(" · ");
+
+describe("wl-mv8wzytml878b4 T7 ruled list (D1)", () => {
+	test("first: [A, B, C] with one input puts A, B, C at #1–#3 above Jev's order, one override per item with its pos; the input is spent once", async () => {
+		const w = world();
+		const high = w.open("HIGH: stop Jo pasting lane ids by hand");
+		const mid = w.open("MID: the wake render crashes");
+		const low = w.open("Tidy the README wording");
+		const both = w.open("HIGH MID: both at once");
+		await w.call();
+		expect(order(w.ledger)).toEqual([both, high, mid, low]);
+		const inputId = w.input(`${low}, then ${mid}, then ${high}`);
+		const r = await w.call({ first: [low, mid, high], inputId });
+		expect(r.details!.items).toEqual([low, mid, high, both]);
+		expect(order(w.ledger)).toEqual([low, mid, high, both]);
+		expect([low, mid, high, both].map((wl) => rowOf(r.text, wl).slice(0, 4))).toEqual([
+			["1", low, "autonomous/waiting", `ruled #1 (Jo, ${inputId})`],
+			["2", mid, "autonomous/waiting", `ruled #2 (Jo, ${inputId})`],
+			["3", high, "autonomous/waiting", `ruled #3 (Jo, ${inputId})`],
+			["4", both, "autonomous/waiting", "-"],
+		]);
+		const pick = w.shown().at(-2)!;
+		expect(pick.by).toBe("pick");
+		expect(w.bodies(STANDING_WORKLOAD_ID, "rank-override: ")).toEqual([low, mid, high].map((wl, k) => `rank-override: ${wl} input ${inputId} shown ${pick.id} pos ${k + 1}`));
+		expect(w.bodies(STANDING_WORKLOAD_ID, "rank-unpin: ")).toEqual([]);
+		expect(w.bodies(STANDING_WORKLOAD_ID, "reading: ").filter((x) => x.includes(inputId))).toEqual([readingBody(`as2_rank ruled order ${low} > ${mid} > ${high} (pins #1-#3)`, inputId, low)]);
+		// spent: a second ruling on the same input is refused with nothing written
+		const before = w.rows();
+		expect((await w.call({ first: [high, low], inputId })).text).toContain(`${inputId} already instructed ${low}`);
+		expect(w.rows()).toEqual(before);
+		expect(order(w.ledger)).toEqual([low, mid, high, both]);
+	});
+
+	test("a later list replaces the ruling (the dropped are unpinned in the same call); a single first without pos sits above it", async () => {
+		const w = world();
+		for (const t of ["A work", "B work", "C work", "D work"]) w.open(t);
+		await w.call();
+		// equal scores: Jev's order is age, then id, and the opens may share a millisecond, so name them by that order
+		const [a, b, c, d] = order(w.ledger) as [string, string, string, string];
+		await w.call({ first: [c, b, a], inputId: w.input("c, b, a") });
+		expect(order(w.ledger)).toEqual([c, b, a, d]);
+		const second = w.input("d then c");
+		const r = await w.call({ first: [d, c], inputId: second });
+		expect(r.details!.items).toEqual([d, c, a, b]);
+		expect(r.details!.dropped).toEqual([b, a]);
+		expect(w.bodies(STANDING_WORKLOAD_ID, "rank-unpin: ")).toEqual([`rank-unpin: ${b} input ${second}`, `rank-unpin: ${a} input ${second}`]);
+		expect(livePins(w.ledger).map((p) => [p.workloadId, p.pos])).toEqual([[d, 1], [c, 2]]);
+		expect(w.bodies(STANDING_WORKLOAD_ID, "reading: ").filter((x) => x.includes(second))).toEqual([readingBody(`as2_rank ruled order ${d} > ${c} (pins #1-#2; dropped the pins on ${b}, ${a})`, second, d)]);
+		// a single first: no pos, no unpin, above the standing list
+		const single = w.input("b first");
+		const s = await w.call({ first: b, inputId: single });
+		expect(s.details!.items).toEqual([b, d, c, a]);
+		expect(w.bodies(STANDING_WORKLOAD_ID, "rank-override: ").at(-1)).toMatch(new RegExp(`^rank-override: ${b} input ${single} shown en-\\S+$`));
+		expect(w.bodies(STANDING_WORKLOAD_ID, "rank-unpin: ")).toHaveLength(2);
+		expect([b, d, c, a].map((wl) => rowOf(s.text, wl)[3])).toEqual([`ruled #1 (Jo, ${single})`, `ruled #2 (Jo, ${second})`, `ruled #3 (Jo, ${second})`, "-"]);
+	});
+
+	test("an empty list, a repeated item, a blank item, a closed workload, or a list with unpin: refused, nothing written, no judge call", async () => {
+		const w = world();
+		const a = w.open("A work");
+		const b = w.open("B work");
+		const closed = w.open("Closed work");
+		w.ledger.closeWorkload(closed, { by: SURFACE_BY });
+		const inputId = w.input("the order");
+		const before = w.rows();
+		const cases: [Record<string, unknown>, string][] = [
+			[{ first: [], inputId }, "Refused: first is an empty list"],
+			[{ first: [a, b, a], inputId }, `Refused: ${a} is listed twice in first`],
+			[{ first: [a, " "], inputId }, "Refused: first's item 2 is not a workload id"],
+			[{ first: [a, closed], inputId }, `Refused: ${closed} is closed`],
+			[{ first: [a, b], unpin: a, inputId }, "Refused: one call pins or unpins, not both"],
+		];
+		for (const [params, why] of cases) expect((await w.call(params)).text).toStartWith(why);
+		expect(w.rows()).toEqual(before);
+		expect(w.judge.asks).toEqual([]);
+	});
+});
+
+describe("wl-mv8wzytml878b4 T8 priority pause from as2_rank, and the table marks (D3, D4)", () => {
+	/** `lane` runs `wl`: its `launch:`, a live claim, and the runner's `lane-ready:`. */
+	const runLane = (ledger: Ledger, wl: string, lane: string) => {
+		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: `launch: ${lane} cause first requested-by test` });
+		expect(ledger.claimWorkload(wl, { by: LANE_STARTER_BY, holder: lane, leaseMs: 600_000 }).won).toBe(true);
+		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneReadyBody(lane, ledger.now()) });
+	};
+	/** `as2 rank` over the world's ledger, with its HOME (and so its installed profile). */
+	const cli = (w: { env: Record<string, string>; path: string }) => sh(["bun", join(REPO, "surface", "scripts", "rank.ts")], REPO, { PATH: process.env.PATH ?? "", HOME: w.env.HOME!, AGENT_SYSTEM_LEDGER_DB: w.path });
+
+	test("order mode, cap 1: first on a workload refused only by cap writes the priority stop in the same call; the table and as2 rank show priority-pausing, then priority-paused", async () => {
+		const w = world("orchestrator", fakeJudge(), { mode: "order", cap: 1 });
+		const low = w.open("Tidy the README wording");
+		const lane = "lane-low-1";
+		runLane(w.ledger, low, lane);
+		const x = w.open("MID: the wake render crashes");
+		const inputId = w.input(`${x} first`);
+		const r = await w.call({ first: x, inputId });
+		const stop = `lane-stop: ${lane} requested priority-for-${x} by rank`;
+		expect(w.bodies(low, "lane-stop: ")).toEqual([stop]);
+		expect(r.details!.paused).toEqual({ laneId: lane, workloadId: low, forWl: x });
+		expect(r.text.split("\n").at(-1)).toBe(`priority-pausing ${lane} on ${low} for ${x}`);
+		expect(rowOf(r.text, x).slice(0, 4)).toEqual(["1", x, "autonomous/waiting", `ruled #1 (Jo, ${inputId})`]);
+		expect(rowOf(r.text, low).slice(2, 4)).toEqual([`autonomous/running; priority-pausing for ${x}`, "-"]);
+		expect(rowOf(cli(w).out, low)[2]).toBe(`autonomous/running; priority-pausing for ${x}`);
+
+		// the runner accepts the stop and exits with its reason, then releases: priority-paused, in the tool and in as2 rank
+		const request = w.ledger.entries(low, "assumption").find((e) => e.body === stop)!;
+		w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: low, kind: "assumption", body: `lane-stop: ${lane} accepted ${request.id}` });
+		w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: low, kind: "assumption", body: laneExitBody(lane, { code: 0, signal: null, outcome: "stop", reason: `priority-for-${x}` }) });
+		w.ledger.releaseWorkload(low, { by: LANE_RUNNER_BY, holder: lane });
+		const after = await w.call();
+		expect(after.details!.paused).toBeNull();
+		expect(rowOf(after.text, low).slice(2, 4)).toEqual([`autonomous/waiting; priority-paused for ${x}`, "-"]);
+		const out = cli(w).out;
+		expect(rowOf(out, low)[2]).toBe(`autonomous/waiting; priority-paused for ${x}`);
+		expect(rowOf(out, x)[3]).toBe(`ruled #1 (Jo, ${inputId})`);
+	});
+
+	test("below cap, or on an explicit jevRank.mode: show profile at cap, the same first writes no stop and the reply names no pause", async () => {
+		for (const o of [{ mode: "order" as const, cap: 2 }, { mode: "show" as const, cap: 1 }]) {
+			const w = world("orchestrator", fakeJudge(), o);
+			const low = w.open("Tidy the README wording");
+			runLane(w.ledger, low, "lane-low-1");
+			const x = w.open("MID: the wake render crashes");
+			const r = await w.call({ first: x, inputId: w.input(`${x} first`) });
+			expect({ o, stops: w.bodies(low, "lane-stop: "), paused: r.details!.paused }).toEqual({ o, stops: [], paused: null });
+			expect(r.text).not.toContain("priority-paus");
+		}
 	});
 });
 
