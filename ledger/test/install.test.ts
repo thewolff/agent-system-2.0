@@ -10,6 +10,9 @@
 // ledger path, and writes nothing else; and it fails closed (review r2, openai #3): only exit 113
 // with "Could not find service" counts as absent, and a missing launchctl, any other print failure
 // or a failed bootout exits 1 with the plist kept.
+// And --daily-report (wl-mvbcjageg7o2yo R14), against the same fake launchctl: the job's plist lints, runs
+// surface/scripts/daily-report.ts at 07:00 with the profile in its environment and is bootstrapped; its =off form
+// boots it out and deletes the plist before any install step and writes nothing else.
 import { beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -537,6 +540,84 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		const home = join(root, "home-train-tick-refused");
 		mkdirSync(home, { recursive: true });
 		for (const args of [["--train-tick=off", "--scratch-sweep"], ["--train-tick", "--train-tick=off"]]) {
+			const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), ...args], { env: { PATH: systemPath, HOME: home }, stdout: "pipe", stderr: "pipe" });
+			expect(r.exitCode).toBe(2);
+		}
+		expect(tree(home)).toEqual([]);
+	});
+
+	// The daily self-heal report's job (PLAN wl-mvbcjageg7o2yo § 2.6, R14), copied from the --train-tick=off cases above.
+	const reportLabel = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(readFileSync(join(REPO, "install", "com.agent-system-2.daily-report.plist"), "utf8"))?.[1] ?? "";
+	const reportService = `gui/${process.getuid?.() ?? 0}/${reportLabel}`;
+
+	test.if(process.platform === "darwin")("--daily-report writes a plist that lints, runs daily-report.ts at 07:00 with the profile in its environment, and bootstraps it", () => {
+		expect(reportLabel).toBe("com.agent-system-2.daily-report");
+		const home = join(root, "home-daily-report-on");
+		mkdirSync(home, { recursive: true });
+		const plist = join(home, "Library", "LaunchAgents", `${reportLabel}.plist`);
+		const launchctl = fakeLaunchctl("daily-report-on", false);
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--daily-report"], {
+			env: { PATH: `${launchctl.bin}:${process.env.PATH ?? ""}`, HOME: home, AGENT_SYSTEM_PROFILE: "as2-report-test" }, stdout: "pipe", stderr: "pipe",
+		});
+		const out = r.stdout.toString() + r.stderr.toString();
+		expect(out).toContain("daily report loaded: runs daily at 07:00 local time");
+		expect(r.exitCode).toBe(0);
+		expect(Bun.spawnSync(["/usr/bin/plutil", "-lint", plist]).exitCode).toBe(0);
+		const job = JSON.parse(Bun.spawnSync(["/usr/bin/plutil", "-convert", "json", "-o", "-", plist]).stdout.toString());
+		const log = join(home, "agent-scratch", "agent-system-2.0", "self-heal", "launchd.log");
+		expect(job).toEqual({
+			Label: reportLabel,
+			ProgramArguments: [Bun.which("bun"), join(copy, "surface", "scripts", "daily-report.ts")],
+			EnvironmentVariables: { AGENT_SYSTEM_LEDGER_DB: join(home, ".agent-system-2", "ledger.db"), AGENT_SYSTEM_PROFILE: "as2-report-test", HOME: home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+			WorkingDirectory: copy,
+			StartCalendarInterval: { Hour: 7, Minute: 0 },
+			ProcessType: "Background",
+			StandardOutPath: log,
+			StandardErrorPath: log,
+		});
+		expect(existsSync(dirname(log))).toBe(true);
+		expect(launchctl.calls()).toEqual([`print ${reportService}`, `bootstrap gui/${process.getuid?.() ?? 0} ${plist}`]);
+	});
+
+	test("--daily-report=off boots the job out and deletes its plist before any install step, with no bun on PATH, and writes nothing else", () => {
+		const home = join(root, "home-daily-report-off");
+		const plist = join(home, "Library", "LaunchAgents", `${reportLabel}.plist`);
+		mkdirSync(dirname(plist), { recursive: true });
+		writeFileSync(plist, "<plist/>\n");
+		const launchctl = fakeLaunchctl("daily-report-off", true);
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--daily-report=off"], {
+			env: { PATH: `${launchctl.bin}:${systemPath}`, HOME: home }, stdout: "pipe", stderr: "pipe",
+		});
+		const out = r.stdout.toString() + r.stderr.toString();
+		expect(out).toContain(`daily report booted out: ${reportService}`);
+		expect(out).toContain(`daily report removed: ${plist}`);
+		expect(out).toContain("nothing else was run or written");
+		expect(out).not.toContain("bun not found");
+		expect(out).not.toContain("reading manifest");
+		expect(r.exitCode).toBe(0);
+		expect(launchctl.calls()).toEqual([`print ${reportService}`, `bootout ${reportService}`]);
+		expect(tree(home)).toEqual(["Library", join("Library", "LaunchAgents")]);
+	});
+
+	test("--daily-report=off with another =off form removes both jobs in one run", () => {
+		const home = join(root, "home-daily-report-off-both");
+		const agents = join(home, "Library", "LaunchAgents");
+		mkdirSync(agents, { recursive: true });
+		writeFileSync(join(agents, `${reportLabel}.plist`), "<plist/>\n");
+		writeFileSync(join(agents, "com.agent-system-2.scratch-sweep.plist"), "<plist/>\n");
+		const launchctl = fakeLaunchctl("daily-report-off-both", false);
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--daily-report=off", "--scratch-sweep=off"], {
+			env: { PATH: `${launchctl.bin}:${systemPath}`, HOME: home }, stdout: "pipe", stderr: "pipe",
+		});
+		expect(r.exitCode).toBe(0);
+		expect(launchctl.calls()).toEqual([`print ${reportService}`, `print gui/${process.getuid?.() ?? 0}/com.agent-system-2.scratch-sweep`]);
+		expect(tree(home)).toEqual(["Library", join("Library", "LaunchAgents")]);
+	});
+
+	test("--daily-report=off with an installing flag, --daily-report with an =off form, or the flag twice, is refused with exit 2 and writes nothing", () => {
+		const home = join(root, "home-daily-report-refused");
+		mkdirSync(home, { recursive: true });
+		for (const args of [["--daily-report=off", "--scratch-sweep"], ["--daily-report", "--train-tick=off"], ["--daily-report", "--daily-report=off"], ["--daily-report=on"]]) {
 			const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), ...args], { env: { PATH: systemPath, HOME: home }, stdout: "pipe", stderr: "pipe" });
 			expect(r.exitCode).toBe(2);
 		}

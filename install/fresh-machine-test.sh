@@ -45,6 +45,10 @@
 # the plist; both flags in one run load both jobs and both =off forms remove both; an unknown form,
 # a flag given twice and an =off form with an installing flag are refused with exit 2 and nothing
 # written. No real launchctl runs.
+# And the daily self-heal report job (macOS, step 15, wl-mvbcjageg7o2yo), the same way as step 14:
+# --daily-report writes a plist that lints, runs surface/scripts/daily-report.ts at 07:00 with absolute
+# paths, the ledger and the profile install wrote and the system PATH, logging under
+# ~/agent-scratch/agent-system-2.0/self-heal, and bootstraps it; =off boots it out and deletes it.
 #
 # Usage:   bash install/fresh-machine-test.sh
 # Env:     FRESH_TEST_ROOT  where the temp clone and temp HOME go (default: ${TMPDIR:-/tmp})
@@ -878,6 +882,69 @@ else
 	mkdir -p "$REFUSED_HOME"
 	rm -f "$LAUNCHCTL_LOG"
 	for args in "--scratch-sweep=on" "--scratch-sweep --scratch-sweep" "--scratch-sweep --chaos-nightly=off" "--scratch-sweep=off --chaos-nightly"; do
+		set +e
+		# shellcheck disable=SC2086 # each case is a list of flags
+		out="$(env -i PATH="$FAKE_BIN:$PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" $args 2>&1)"
+		status=$?
+		set -e
+		printf '%s -> exit %s: %s\n' "$args" "$status" "$out"
+		[ "$status" -eq 2 ] || die "install $args exited $status, expected 2"
+	done
+	[ -z "$(find "$REFUSED_HOME" -mindepth 1)" ] || die "a refused flag still wrote under $REFUSED_HOME: $(find "$REFUSED_HOME" -mindepth 1)"
+	[ -z "$(launchctl_calls)" ] || die "a refused flag ran launchctl: $(launchctl_calls)"
+	ok "an unknown form, a flag given twice and an =off form with an installing flag are each refused with exit 2; nothing written, no launchctl call"
+fi
+
+step "15. the daily self-heal report: --daily-report writes and loads it, =off boots it out and deletes it, no flag writes none"
+if [ "$(uname -s)" != Darwin ]; then
+	ok "not macOS: --daily-report is refused there (no launchd); skipped"
+else
+	# Step 13's fake launchctl (one flag file per label) and its log, chaos_install and launchctl_calls.
+	REPORT_PLIST="$FAKE_HOME/Library/LaunchAgents/com.agent-system-2.daily-report.plist"
+	REPORT_LABEL="gui/$(id -u)/com.agent-system-2.daily-report"
+	REPORT_LOG="$FAKE_HOME/agent-scratch/agent-system-2.0/self-heal/launchd.log"
+	[ ! -e "$REPORT_PLIST" ] || die "the installs above, none with --daily-report, wrote $REPORT_PLIST"
+	ok "no flag: no daily report plist under $FAKE_HOME/Library/LaunchAgents"
+
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --daily-report || die "install --daily-report exited $?"
+	[ -f "$REPORT_PLIST" ] || die "install --daily-report wrote no plist at $REPORT_PLIST"
+	/usr/bin/plutil -lint "$REPORT_PLIST" || die "the daily report plist does not lint"
+	/usr/bin/plutil -convert json -o "$WORK/report-job.json" "$REPORT_PLIST"
+	printf 'daily report job: %s\n' "$(cat "$WORK/report-job.json")"
+	bun -e '
+		const [file, bun, repo, home, ledger, log] = process.argv.slice(1);
+		const job = JSON.parse(await Bun.file(file).text());
+		const want = {
+			Label: "com.agent-system-2.daily-report",
+			ProgramArguments: [bun, `${repo}/surface/scripts/daily-report.ts`],
+			EnvironmentVariables: { AGENT_SYSTEM_LEDGER_DB: ledger, AGENT_SYSTEM_PROFILE: "agent-system-2", HOME: home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+			WorkingDirectory: repo,
+			StartCalendarInterval: { Hour: 7, Minute: 0 },
+			ProcessType: "Background",
+			StandardOutPath: log,
+			StandardErrorPath: log,
+		};
+		const canon = (v) => Array.isArray(v) ? v.map(canon) : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon(v[k])])) : v;
+		if (JSON.stringify(canon(job)) !== JSON.stringify(canon(want))) { console.error(`daily report job differs; want ${JSON.stringify(want)}`); process.exit(1); }
+	' "$WORK/report-job.json" "$(type -P bun)" "$CLONE" "$FAKE_HOME" "$FAKE_HOME/.agent-system-2/ledger.db" "$REPORT_LOG" \
+		|| die "the daily report plist is not the expected job"
+	[ -d "$(dirname "$REPORT_LOG")" ] || die "install did not create the log directory $(dirname "$REPORT_LOG")"
+	CALLS_WANT="$(printf '%s\n' "print $REPORT_LABEL" "bootstrap gui/$(id -u) $REPORT_PLIST")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	ok "plist lints; StartCalendarInterval 07:00; absolute bun, daily-report.ts, WorkingDirectory, HOME, ledger, profile and log; system PATH; bootstrapped into gui/$(id -u)"
+
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --daily-report=off || die "install --daily-report=off exited $?"
+	[ ! -e "$REPORT_PLIST" ] || die "--daily-report=off left $REPORT_PLIST"
+	CALLS_WANT="$(printf '%s\n' "print $REPORT_LABEL" "bootout $REPORT_LABEL")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "=off launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	ok "=off booted the job out of $REPORT_LABEL and deleted the plist"
+
+	REFUSED_HOME="$WORK/report-refused-home"
+	mkdir -p "$REFUSED_HOME"
+	rm -f "$LAUNCHCTL_LOG"
+	for args in "--daily-report=on" "--daily-report --daily-report" "--daily-report --scratch-sweep=off" "--daily-report=off --train-tick"; do
 		set +e
 		# shellcheck disable=SC2086 # each case is a list of flags
 		out="$(env -i PATH="$FAKE_BIN:$PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" $args 2>&1)"

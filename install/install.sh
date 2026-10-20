@@ -54,8 +54,17 @@
 # may be given together; an =off form with an installing flag is refused. Without a flag nothing
 # about its job is written, read or run.
 #
+# --daily-report (macOS only, PLAN wl-mvbcjageg7o2yo § 2.6) writes the daily self-heal report job the same way as
+# --scratch-sweep: install/com.agent-system-2.daily-report.plist filled with this checkout, the absolute bun
+# path, $HOME, the ledger path and the profile name, written to
+# $HOME/Library/LaunchAgents/com.agent-system-2.daily-report.plist and loaded; it runs
+# surface/scripts/daily-report.ts at 07:00 local time, logging to
+# $HOME/agent-scratch/agent-system-2.0/self-heal/launchd.log. --daily-report=off is an =off form like the
+# others: it only boots the job out and deletes its plist, before any install step, and writes nothing else.
+#
 # Usage:   bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off]
 #                                  [--train-tick | --train-tick=off]
+#                                  [--daily-report | --daily-report=off]
 # Env:     AGENT_SYSTEM_LEDGER_DB   ledger file (default: $HOME/.agent-system-2/ledger.db)
 #          AGENT_SYSTEM_PROFILE     OMP profile name (default: agent-system-2); the profile lives at
 #                                   $HOME/.omp/profiles/<profile>/agent (omp://config-usage.md § Profiles)
@@ -67,6 +76,7 @@
 #            an =off form with an installing flag), --chaos-nightly refused: not macOS, or omp or git
 #            not on PATH, or --scratch-sweep refused: not macOS, or --train-tick refused: not macOS, gh,
 #            bun, omp, git or osascript not on PATH, or `gh auth status` failed (nothing written)
+#            (or --daily-report refused: not macOS, or bun not on PATH; nothing written)
 #          3 ledger path refused as synced or network folder (nothing written)
 #          4 the ledger file exists at a schema version other than the supported one (5), e.g. a
 #            version-1 to -4 ledger from before schema v5 (nothing written; no upgrade exists:
@@ -100,7 +110,9 @@ fail() { printf 'install: FAIL: %s\n' "$1" >&2; exit "${2:-1}"; }
 CHAOS=""
 SWEEP=""
 TICK=""
+REPORT=""
 USAGE="usage: bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off] [--train-tick | --train-tick=off]"
+USAGE="$USAGE [--daily-report | --daily-report=off]"
 for arg in "$@"; do
 	case "$arg" in
 		--chaos-nightly | --chaos-nightly=off)
@@ -112,12 +124,19 @@ for arg in "$@"; do
 		--train-tick | --train-tick=off)
 			[ -z "$TICK" ] || fail "$USAGE; the train-tick flag is given twice: $*" 2
 			if [ "$arg" = --train-tick ]; then TICK=on; else TICK=off; fi ;;
+		--daily-report | --daily-report=off)
+			[ -z "$REPORT" ] || fail "$USAGE; the daily-report flag is given twice: $*" 2
+			if [ "$arg" = --daily-report ]; then REPORT=on; else REPORT=off; fi ;;
 		*) fail "$USAGE; got: $*" 2 ;;
 	esac
 done
 # An =off form stops its job and exits before any install step, so it cannot share a run with a flag
 # that installs one.
 if { [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ]; } && { [ "$CHAOS" = on ] || [ "$SWEEP" = on ] || [ "$TICK" = on ]; }; then
+	fail "$USAGE; an =off form stops a job and exits, so it cannot be combined with a flag that installs one; got: $*" 2
+fi
+if { [ "$REPORT" = off ] && { [ "$CHAOS" = on ] || [ "$SWEEP" = on ] || [ "$TICK" = on ]; }; } \
+	|| { [ "$REPORT" = on ] && { [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ]; }; }; then
 	fail "$USAGE; an =off form stops a job and exits, so it cannot be combined with a flag that installs one; got: $*" 2
 fi
 
@@ -133,6 +152,10 @@ TICK_LABEL="com.agent-system-2.train-tick"
 TICK_TEMPLATE="$REPO/install/$TICK_LABEL.plist"
 TICK_PLIST="$LAUNCH_AGENTS/$TICK_LABEL.plist"
 TICK_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/train-tick"
+REPORT_LABEL="com.agent-system-2.daily-report"
+REPORT_TEMPLATE="$REPO/install/$REPORT_LABEL.plist"
+REPORT_PLIST="$LAUNCH_AGENTS/$REPORT_LABEL.plist"
+REPORT_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/self-heal"
 
 # An =off form: stop the job and delete its plist (job_off NAME LABEL PLIST), then exit, before anything
 # else runs. It reads no manifest, needs no bun, and writes nothing but the plist removal. It fails
@@ -164,6 +187,13 @@ job_off() {
 	fi
 	step "$name off: no job loaded, no plist"
 }
+if [ "$REPORT" = off ]; then
+	job_off "daily report" "$REPORT_LABEL" "$REPORT_PLIST"
+	if [ "$CHAOS" != off ] && [ "$SWEEP" != off ] && [ "$TICK" != off ]; then
+		step "nothing else was run or written"
+		exit 0
+	fi
+fi
 if [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ]; then
 	if [ "$CHAOS" = off ]; then job_off "chaos nightly" "$CHAOS_LABEL" "$CHAOS_PLIST"; fi
 	if [ "$SWEEP" = off ]; then job_off "scratch sweep" "$SWEEP_LABEL" "$SWEEP_PLIST"; fi
@@ -238,6 +268,15 @@ if [ "$SWEEP" = on ]; then
 	[ -f "$SWEEP_TEMPLATE" ] || fail "--scratch-sweep: no template at $SWEEP_TEMPLATE" 2
 	SWEEP_BUN="$(type -P bun)" || fail "--scratch-sweep: bun not found on PATH" 2
 	case "$SWEEP_BUN" in /*) ;; *) SWEEP_BUN="$PWD/$SWEEP_BUN" ;; esac
+fi
+
+# --daily-report is checked here too, before anything is written: launchd is macOS only. The job runs bun (absolute)
+# and reads files only, so it needs no omp, git or gh.
+if [ "$REPORT" = on ]; then
+	[ "$(uname -s)" = Darwin ] || fail "--daily-report is a launchd job; this is not macOS" 2
+	[ -f "$REPORT_TEMPLATE" ] || fail "--daily-report: no template at $REPORT_TEMPLATE" 2
+	REPORT_BUN="$(type -P bun)" || fail "--daily-report: bun not found on PATH" 2
+	case "$REPORT_BUN" in /*) ;; *) REPORT_BUN="$PWD/$REPORT_BUN" ;; esac
 fi
 
 # --train-tick is checked here too, before anything is written (PLAN wl-mv8s8srodefytc rev 17.1 D10 F15): the tick runs gh,
@@ -615,6 +654,15 @@ if [ "$TICK" = on ]; then
 	load_job "train tick" "$TICK_LABEL" "$TICK_TEMPLATE" "$TICK_PLIST" "$TICK_LOG_DIR" \
 		"BUN=$TICK_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS" "PROFILE=$PROFILE_NAME" "PATH=$TICK_PATH"
 	step "train tick loaded: runs every 5 minutes; log $TICK_LOG_DIR/launchd.log; turn off with: bash install/install.sh --train-tick=off"
+fi
+
+# ---- 6d3. the daily self-heal report (--daily-report only) ---------------------------------------
+# Only with the flag, the same way as 6c. The job carries the ledger this install wrote and the profile it rendered, so the
+# report reads that ledger and that profile's sessions. Reversal: bash install/install.sh --daily-report=off.
+if [ "$REPORT" = on ]; then
+	load_job "daily report" "$REPORT_LABEL" "$REPORT_TEMPLATE" "$REPORT_PLIST" "$REPORT_LOG_DIR" \
+		"BUN=$REPORT_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS" "PROFILE=$PROFILE_NAME"
+	step "daily report loaded: runs daily at 07:00 local time; reports and log in $REPORT_LOG_DIR; turn off with: bash install/install.sh --daily-report=off"
 fi
 
 # ---- 6e. Phoenix, on by default (wl-mv65t5d34lts00 PLAN.md § 8.1) ------------------------------------

@@ -1,0 +1,165 @@
+{
+	"source": "live ledger, 2026-10-14 (openai lanes that ran Anthropic build hands)",
+	"rows": [
+		{
+			"t": "entry",
+			"id": "en-mv7gich0e4k3r4",
+			"workloadId": "wl-mv65nllu5g181s",
+			"sliceId": null,
+			"kind": "assumption",
+			"by": "lane-mv65nllu5g181s-5",
+			"at": "2026-10-14T01:54:15.588Z",
+			"body": "builder-lab: openai lane lane-mv65nllu5g181s-5 model openai-codex/gpt-6.1-sol"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv7gicng0jzw1s",
+			"workloadId": "wl-mv6uqrx6d1tjb4",
+			"sliceId": null,
+			"kind": "assumption",
+			"by": "lane-mv6uqrx6d1tjb4-4",
+			"at": "2026-10-14T01:54:15.820Z",
+			"body": "builder-lab: openai lane lane-mv6uqrx6d1tjb4-4 model openai-codex/gpt-6.1-sol"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv7gidamk1yo74",
+			"workloadId": "wl-mv66q5b148uznk",
+			"sliceId": null,
+			"kind": "assumption",
+			"by": "lane-mv66q5b148uznk-3",
+			"at": "2026-10-14T01:54:16.654Z",
+			"body": "builder-lab: openai lane lane-mv66q5b148uznk-3 model openai-codex/gpt-6.1-sol"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv7gidpushx4hs",
+			"workloadId": "wl-mv66ylg1op3wg0",
+			"sliceId": null,
+			"kind": "assumption",
+			"by": "lane-mv66ylg1op3wg0-3",
+			"at": "2026-10-14T01:54:17.202Z",
+			"body": "builder-lab: openai lane lane-mv66ylg1op3wg0-3 model openai-codex/gpt-6.1-sol"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv7gm78fbw7qww",
+			"workloadId": "wl-mv66q5b148uznk",
+			"sliceId": "sl-links-docs",
+			"kind": "assumption",
+			"by": "lane-mv66q5b148uznk-3",
+			"at": "2026-10-14T01:57:15.423Z",
+			"body": "hand-spawn: dt-mv7gm77gbf6bd96e session /Users/jowolff/.agent-system-2/lanes/wl-mv66q5b148uznk/sessions/2026-10-14T01-54-08-084Z_01a1381d-ee54-7000-98cd-57b3d8339894 spawn sl-links-docs review no group dg-mv7gm77g87e18183 row anthropic/claude-opus-5-5,openai-codex/gpt-6-sol,moonshot/kimi-k2.7-code"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv7gq05hox8f7k",
+			"workloadId": "wl-mv6uqrx6d1tjb4",
+			"sliceId": "sl-audhd-build",
+			"kind": "assumption",
+			"by": "lane-mv6uqrx6d1tjb4-4",
+			"at": "2026-10-14T02:00:12.869Z",
+			"body": "hand-spawn: dt-mv7gq04q9261ac48 session /Users/jowolff/.agent-system-2/lanes/wl-mv6uqrx6d1tjb4/sessions/2026-10-14T01-54-08-585Z_01a1381d-f049-7000-ae1e-ae0540032cf7 spawn sl-audhd-build review no group dg-mv7gq04q47bbca58 row anthropic/claude-opus-5-5,openai-codex/gpt-6-sol,moonshot/kimi-k2.7-code"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv7gqtd7tug0sg",
+			"workloadId": "wl-mv65nllu5g181s",
+			"sliceId": "sl-fifo-main-refresh",
+			"kind": "assumption",
+			"by": "lane-mv65nllu5g181s-5",
+			"at": "2026-10-14T02:00:50.731Z",
+			"body": "hand-spawn: dt-mv7gqtcb4482e634 session /Users/jowolff/.agent-system-2/lanes/wl-mv65nllu5g181s/sessions/2026-10-14T01-54-07-887Z_01a1381d-ed8f-7000-9468-70ec8f8b97ea spawn sl-fifo-main-refresh review no group dg-mv7gqtcb7aa6a1ca row anthropic/claude-opus-5-5,openai-codex/gpt-6-sol,moonshot/kimi-k2.7-code"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv7i0gfbmx569s",
+			"workloadId": "wl-mv66ylg1op3wg0",
+			"sliceId": "sl-sendline-reviewfix",
+			"kind": "assumption",
+			"by": "lane-mv66ylg1op3wg0-3",
+			"at": "2026-10-14T02:36:20.135Z",
+			"body": "hand-spawn: dt-mv7i0geq18babe1b session /Users/jowolff/.agent-system-2/lanes/wl-mv66ylg1op3wg0/sessions/2026-10-14T01-54-08-381Z_01a1381d-ef7d-7000-b131-15b308685642 spawn sl-sendline-reviewfix review no group dg-mv7i0geq1ef44146 row anthropic/claude-opus-5-5,openai-codex/gpt-6-sol,moonshot/kimi-k2.7-code"
+		},
+		{
+			"t": "routing",
+			"id": "rt-mv7gpebny1ya2o",
+			"workloadId": "wl-mv66q5b148uznk",
+			"sliceId": "sl-links-docs",
+			"spawnKey": "sl-links-docs",
+			"sessionRoot": "/Users/jowolff/.agent-system-2/lanes/wl-mv66q5b148uznk/sessions/2026-10-14T01-54-08-084Z_01a1381d-ee54-7000-98cd-57b3d8339894",
+			"agentId": "sl-links-docs",
+			"kind": "change-large",
+			"outcome": "ran",
+			"models": [
+				"anthropic/claude-opus-5-5",
+				"openai-codex/gpt-6-sol",
+				"moonshot/kimi-k2.7-code"
+			],
+			"ranModels": [
+				"anthropic/claude-opus-5-5"
+			],
+			"at": "2026-10-14T01:59:44.579Z"
+		},
+		{
+			"t": "routing",
+			"id": "rt-mv7guob979bls0",
+			"workloadId": "wl-mv65nllu5g181s",
+			"sliceId": "sl-fifo-main-refresh",
+			"spawnKey": "sl-fifo-main-refresh",
+			"sessionRoot": "/Users/jowolff/.agent-system-2/lanes/wl-mv65nllu5g181s/sessions/2026-10-14T01-54-07-887Z_01a1381d-ed8f-7000-9468-70ec8f8b97ea",
+			"agentId": "sl-fifo-main-refresh",
+			"kind": "change-large",
+			"outcome": "ran",
+			"models": [
+				"anthropic/claude-opus-5-5",
+				"openai-codex/gpt-6-sol",
+				"moonshot/kimi-k2.7-code"
+			],
+			"ranModels": [
+				"anthropic/claude-opus-5-5"
+			],
+			"at": "2026-10-14T02:03:50.805Z"
+		},
+		{
+			"t": "routing",
+			"id": "rt-mv7hcosdhzk54w",
+			"workloadId": "wl-mv6uqrx6d1tjb4",
+			"sliceId": "sl-audhd-build",
+			"spawnKey": "sl-audhd-build",
+			"sessionRoot": "/Users/jowolff/.agent-system-2/lanes/wl-mv6uqrx6d1tjb4/sessions/2026-10-14T01-54-08-585Z_01a1381d-f049-7000-ae1e-ae0540032cf7",
+			"agentId": "sl-audhd-build",
+			"kind": "change-large",
+			"outcome": "ran",
+			"models": [
+				"anthropic/claude-opus-5-5",
+				"openai-codex/gpt-6-sol",
+				"moonshot/kimi-k2.7-code"
+			],
+			"ranModels": [
+				"anthropic/claude-opus-5-5"
+			],
+			"at": "2026-10-14T02:17:51.229Z"
+		},
+		{
+			"t": "routing",
+			"id": "rt-mv7iikenlltv5s",
+			"workloadId": "wl-mv66ylg1op3wg0",
+			"sliceId": "sl-sendline-reviewfix",
+			"spawnKey": "sl-sendline-reviewfix",
+			"sessionRoot": "/Users/jowolff/.agent-system-2/lanes/wl-mv66ylg1op3wg0/sessions/2026-10-14T01-54-08-381Z_01a1381d-ef7d-7000-b131-15b308685642",
+			"agentId": "sl-sendline-reviewfix",
+			"kind": "change-large",
+			"outcome": "ran",
+			"models": [
+				"anthropic/claude-opus-5-5",
+				"openai-codex/gpt-6-sol",
+				"moonshot/kimi-k2.7-code"
+			],
+			"ranModels": [
+				"anthropic/claude-opus-5-5"
+			],
+			"at": "2026-10-14T02:50:25.103Z"
+		}
+	]
+}

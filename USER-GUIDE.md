@@ -113,6 +113,15 @@ With one open workload the word applies to it. With several, add the id: `produc
   - `order`: automatic starts follow the ranking (pins first); a lower one waits, shown as "queued behind <wl> (Jev rank)". Your launch word and `as2 lane` are never held.
   - `parallel`: `order`, plus a second lane may start beside a running one only when the two are in different git repositories, the remaining ceilings fit in `--budget` (0 or unset: no parallel start) and the merge order is clear. Anything unclear holds. Work in the same repository stays serial, because nothing yet declares and enforces which files a lane may write.
 
+### Daily self-heal report (`install.sh --daily-report`)
+
+- At 07:00 local time a launchd job runs `surface/scripts/daily-report.ts`. It only detects and reports: nothing is repaired.
+- It looks for seven known failures since the last report: a compaction loop, a build hand off its lane's lab, a dropped paste, a wall-led ceiling, a flaky test, a jetsam event, and a lane started on the wrong model.
+- It also counts lane deaths by cause, lapsed leases, messages still held on closed workloads, and lane runs (wall, dollars by model, peak RSS).
+- The full report goes to `~/agent-scratch/agent-system-2.0/self-heal/<date>-<time>-<pid>.md`. Under *needs you* it shows as one line, `daily self-heal report <date> window … findings <n> (…) deaths <d> lapsed <l> held-closed <h> — <path>`, for 30 hours. The next day's report replaces it.
+- `daily self-heal report missed: the newest is <date> (<age> h); check com.agent-system-2.daily-report` means no report has run for 30 hours while the job is installed. After 7 days the line stops.
+- Turn it on with `bash install/install.sh --daily-report` and off with `bash install/install.sh --daily-report=off`. Off writes nothing else, and with the job off the missed line never shows. `bun surface/scripts/daily-report.ts --dry-run` prints a report and writes nothing.
+
 ### Notes from other agents (the agent channel)
 
 - Other agents can message Ilex through one channel. In phase 1 the only sender is Plumb, and Plumb's authority is notes and proposals. A note is information from Plumb, never your word: it is recorded with sender `plumb` (created_by `channel:plumb`), never as you, and nothing it says is applied until you type the word yourself.

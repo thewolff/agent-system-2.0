@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  agent-system 2.0: the daily self-heal report (PLAN wl-mvbcjageg7o2yo § 2.6), as a launchd user agent.
+  TEMPLATE: install/install.sh with its daily-report flag fills the upper-case placeholder values
+  (XML-escaped), writes the result to $HOME/Library/LaunchAgents/com.agent-system-2.daily-report.plist
+  and loads it with launchctl bootstrap; the flag's =off form boots it out and deletes that file.
+  Without the flag install.sh never writes it. (An XML comment cannot hold a double hyphen, so the
+  flags are not spelled out here; install/install.sh's header has them.) launchd runs
+  surface/scripts/daily-report.ts once a day at 07:00 local time (a sleeping Mac runs it at wake),
+  outside the fence: it reads the ledger and the profile's session files, writes one report file under
+  $HOME/agent-scratch/agent-system-2.0/self-heal and one daily-report entry on the standing workload.
+  The ledger and profile variables name what install wrote. PATH holds only the system directories.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.agent-system-2.daily-report</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@BUN@</string>
+		<string>@REPO@/surface/scripts/daily-report.ts</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>AGENT_SYSTEM_LEDGER_DB</key>
+		<string>@LEDGER_DB@</string>
+		<key>AGENT_SYSTEM_PROFILE</key>
+		<string>@PROFILE@</string>
+		<key>HOME</key>
+		<string>@HOME@</string>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>@REPO@</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>7</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>@HOME@/agent-scratch/agent-system-2.0/self-heal/launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/agent-scratch/agent-system-2.0/self-heal/launchd.log</string>
+</dict>
+</plist>

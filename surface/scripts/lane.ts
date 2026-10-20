@@ -8,7 +8,7 @@
 //                                        system prompt, spawn `run` detached; prints `lane <laneId> runner <pid>`
 //   run <wl> <laneId>                    the runner: one `omp --mode rpc --no-ui` child, the first prompt and
 //                                        up to CONTINUE_LIMIT continue prompts on it, lane-started:/lane-ready:/
-//                                        lane-exit:, the turn-end decision once omp is settled (src/turn-end.ts),
+//                                        lane-metrics:/lane-exit:, the turn-end decision once omp is settled (src/turn-end.ts),
 //                                        stop requests, its own deadline and the ceiling meter (spend:, the 80 %
 //                                        question, the 100 % stop) polled every STOP_POLL_MS. It first takes the
 //                                        lane id's run lock (takeRunnerLock, one owner per lane id) and then checks
@@ -78,6 +78,7 @@ import {
 	type TurnEndInput, unsettledHandsOf,
 } from "../src/turn-end";
 import { waitingReserved } from "../src/errors";
+import { laneMetrics, laneMetricsBody, psSampler, RSS_SAMPLE_MS, rssMeter } from "../src/metrics";
 import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
 import { PAIR_OPTION, type PairSignalId, pairOffer, pairOfferBody, readPairSuggestConfig } from "../src/pair-suggest";
 import { decideRanked, drainOrder, type RankConfig, rankShadowLine, readRankConfig, writePickSnapshot } from "../src/rank-launch";
@@ -100,6 +101,8 @@ const READY_MS = msEnv("AGENT_SYSTEM_LANE_READY_MS", PRECLAIM_LEASE_MS);
 const READY_POLL_MS = 1_000;
 /** After `abort` and stdin EOF, the wait before SIGKILL (§ 3 stop path). */
 const END_GRACE_MS = msEnv("AGENT_SYSTEM_LANE_END_GRACE_MS", 30_000);
+/** The least time between two RSS samples of the omp tree (PLAN wl-mvbcjageg7o2yo § 2.2); the fake-omp tests shorten it. */
+const RSS_SAMPLE_INTERVAL_MS = msEnv("AGENT_SYSTEM_LANE_RSS_SAMPLE_MS", RSS_SAMPLE_MS);
 /** The settle wait with no omp activity that makes a session idle (PLAN wl-mv5i3lulwwbbi8 D6); the fake-omp tests shorten it. */
 const SETTLE_IDLE = msEnv("AGENT_SYSTEM_LANE_SETTLE_IDLE_MS", SETTLE_IDLE_MS);
 const PROFILE = process.env.AGENT_SYSTEM_PROFILE || process.env.OMP_PROFILE || "agent-system-2";
@@ -1254,6 +1257,10 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		if (sessionsDir !== null) tally = scanSpend(sessionsDir, offsets, tally);
 		return { ...tally, wallMin: wallMinutes(control, Date.now(), runStart) };
 	};
+	/** This run's spend baseline, measured once right after the spawn record: lane-metrics: reports the final measure minus it. */
+	let baseline: Spend | null = null;
+	/** The omp tree's peak RSS, sampled on the stop poll (PLAN wl-mvbcjageg7o2yo § 2.2). */
+	const rss = rssMeter(psSampler, RSS_SAMPLE_INTERVAL_MS);
 	/**
 	 * One meter poll: raise at 80 % once per ceiling value, stop at 100 % through the stop path (acceptance `ceiling`, outcome stop,
 	 * no lane-died:). A failure is logged, never fatal; a stop the step called for is taken even when its writes failed. Returns
@@ -1320,6 +1327,18 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				if (runStart !== null) spend = measure(control);
 			} catch (err) {
 				process.stderr.write(`runner: the final spend scan failed: ${String(err)}\n`);
+			}
+			// This run's metrics (PLAN wl-mvbcjageg7o2yo § 2.2) in a write of their own before the finalization's, so a failure
+			// here never rolls back the release, spend: or lane-exit: below.
+			if (runStart !== null) {
+				try {
+					const metrics = laneMetrics({
+						runStartMs: runStart, runEndMs: Date.now(), final: spend, baseline, model, ranModel, prompts, continues, outcome: final, peakRssMb: rss.peakMb, rssSamples: rss.samples,
+					});
+					writeAsOwner(ledger, lock, () => record(laneMetricsBody(laneId, metrics)));
+				} catch (err) {
+					process.stderr.write(`runner: the lane-metrics: entry could not be written: ${String(err)}\n`);
+				}
 			}
 			let drained = false;
 			const owned = writeAsOwner(ledger, lock, () => {
@@ -1536,6 +1555,11 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			lostLock = true;
 			throw new Fail("run", `${laneId} not started: lost the run lock ${lock.path} before the spawn (${now}); no omp spawned, nothing recorded or released`, STARTER_EXIT.held!);
 		}
+		try {
+			baseline = measure(controlNow().control);
+		} catch (err) {
+			process.stderr.write(`runner: the baseline spend scan failed: ${String(err)}\n`);
+		}
 		send({ id: STATE_ID, type: "get_state" });
 
 		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it. Every lane also
@@ -1628,6 +1652,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 
 		const stopPoll = setInterval(() => {
 			if (finished) return;
+			if (omp.exitCode === null && omp.signalCode === null) void rss.tick(omp.pid, Date.now());
 			try {
 				const { workload: cur, control } = controlNow();
 				const req = pendingStop(control, laneId);

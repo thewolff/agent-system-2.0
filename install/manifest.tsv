@@ -1324,3 +1324,34 @@ plugins/i-have-audhd/triggers/batch-heading.mjs	module	-
 plugins/i-have-audhd/triggers/conclusion-first.mjs	module	-
 plugins/i-have-audhd/triggers/todo-unfinished.mjs	module	-
 plugins/test/loader.test.ts	test	-
+# Self-heal Phase 1, detect and report (wl-mvbcjageg7o2yo, migration/items/self-heal-phase1-report.md): the shared types,
+# the runner's lane metrics, held messages delivered at close, the counts and the daily report with its launchd job.
+surface/src/selfheal/types.ts	module	-
+surface/src/metrics.ts	module	-
+surface/test/lane-metrics.test.ts	test	-
+surface/test/close-held.test.ts	test	-
+surface/src/selfheal/counts.ts	module	-
+surface/scripts/daily-report.ts	module	-
+surface/test/daily-report.test.ts	test	-
+install/com.agent-system-2.daily-report.plist	install	-
+surface/src/selfheal/detectors.ts	module	-
+surface/src/selfheal/read.ts	module	-
+surface/test/selfheal-detectors.test.ts	test	-
+surface/test/fixtures/selfheal/README.md	doc	-
+surface/test/fixtures/selfheal/compaction-loop.jsonl	test	-
+surface/test/fixtures/selfheal/compaction-loop-jp-build.jsonl	test	-
+surface/test/fixtures/selfheal/compaction-loop-clean.jsonl	test	-
+surface/test/fixtures/selfheal/paste-drop.jsonl	test	-
+surface/test/fixtures/selfheal/paste-drop-clean.jsonl	test	-
+surface/test/fixtures/selfheal/paste-drop-smoke.jsonl	test	-
+surface/test/fixtures/selfheal/hand-lab.json	test	-
+surface/test/fixtures/selfheal/hand-lab-clean.json	test	-
+surface/test/fixtures/selfheal/ceiling-wall.json	test	-
+surface/test/fixtures/selfheal/ceiling-wall-clean.json	test	-
+surface/test/fixtures/selfheal/flaky-test.json	test	-
+surface/test/fixtures/selfheal/flaky-test-clean.json	test	-
+surface/test/fixtures/selfheal/model-start.json	test	-
+surface/test/fixtures/selfheal/model-start-clean.json	test	-
+surface/test/fixtures/selfheal/jetsam/JetsamEvent-2026-10-13-124141.ips	test	-
+surface/test/fixtures/selfheal/jetsam/JetsamEvent-2026-10-14-053054.ips	test	-
+surface/test/fixtures/selfheal/jetsam/JetsamEvent-2026-10-16-053539.ips	test	-

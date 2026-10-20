@@ -129,7 +129,7 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		// lane-decided: before EOF (item 40, wl-mv049108m8whds), the final spend: before the exit
 		// (the ctx index's entries follow the exit from a detached worker; the ctx index scenario below orders them)
 		const order = snap.control.filter((c) => c.laneId === laneId && c.prefix !== "ctx-index").map((c) => c.prefix);
-		expect(order).toEqual(["launch", "lane-started", "lane-started", "lane-ready", "lane-decided", "spend", "lane-exit"]);
+		expect(order).toEqual(["launch", "lane-started", "lane-started", "lane-ready", "lane-decided", "lane-metrics", "spend", "lane-exit"]);
 		expect(eventsOf(r, rec!.pid)).toEqual(["prompt", "eof"]);
 		expect(readFileSync(rec!.session!, "utf8")).toContain(`You are lane ${laneId} on workload ${wl}.`);
 		expect(snap.bodies).toContain(`${laneId} done-because: the probe is done`);
@@ -450,7 +450,7 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const stops = snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === laneId);
 		expect(stops.map((s) => s.createdBy)).toEqual([LANE_STARTER_BY, LANE_RUNNER_BY]);
 		expect(stops[1]!.rest).toBe(`accepted ${stops[0]!.id}`);
-		expect(snap.control.filter((c) => c.prefix !== "ctx-index").map((c) => c.prefix).slice(-4)).toEqual(["lane-stop", "lane-stop", "spend", "lane-exit"]);
+		expect(snap.control.filter((c) => c.prefix !== "ctx-index").map((c) => c.prefix).slice(-5)).toEqual(["lane-stop", "lane-stop", "lane-metrics", "spend", "lane-exit"]);
 		// abort, then EOF, then the kill: omp saw both frames and outlived them until the grace ran out
 		expect(eventsOf(r, started.pid)).toEqual(["prompt", "abort", "eof"]);
 		expect(ms).toBeGreaterThanOrEqual(1500);

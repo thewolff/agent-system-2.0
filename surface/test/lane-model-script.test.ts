@@ -107,7 +107,7 @@ describe("T1–T3: the runner starts on Jo's model and keeps the session only on
 		expect(starts[0]).toMatchObject({ model: X, ranModel: null, resumeSkipped: null });
 		expect(starts[1]).toMatchObject({ model: X, ranModel: X, resumeSkipped: null });
 		const order = laneSnapshot(r, wl).control.filter((c) => c.laneId === lane1 && c.prefix !== "ctx-index").map((c) => c.prefix);
-		expect(order).toEqual(["launch", "lane-started", "lane-started", "lane-ready", "lane-decided", "spend", "lane-exit"]);
+		expect(order).toEqual(["launch", "lane-started", "lane-started", "lane-ready", "lane-decided", "lane-metrics", "spend", "lane-exit"]);
 		expect(eventsOf(r, rec.pid)).toEqual(["prompt", "eof"]);
 	}, 60_000);
 

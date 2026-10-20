@@ -1,0 +1,19 @@
+{
+	"source": "live ledger, wl-mv8fb0xnlc0b28 ceiling question (253 % $, 441 % min)",
+	"rows": [
+		{
+			"t": "question",
+			"id": "q-mv8fgrl4x8ve9s",
+			"workloadId": "wl-mv8fb0xnlc0b28",
+			"sliceId": "sl-ceiling-mv8fb0xnlc0b28-1",
+			"by": "lane-runner",
+			"at": "2026-10-14T18:12:48.424Z",
+			"options": [
+				"stop",
+				"extend",
+				"split"
+			],
+			"body": "wl-mv8fb0xnlc0b28 has used $2.54 of its $1 ceiling (253 %) and 4 of 1 minutes (441 %), normal stakes; 4443376 tokens."
+		}
+	]
+}

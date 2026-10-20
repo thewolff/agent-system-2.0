@@ -1,0 +1,47 @@
+{
+	"source": "live ledger, wall-led ceiling questions of 2026-10-13 16:30Z",
+	"rows": [
+		{
+			"t": "question",
+			"id": "q-mv6wdkhahpcyrk",
+			"workloadId": "wl-mv60mkkt1ohg5c",
+			"sliceId": "sl-ceiling-mv60mkkt1ohg5c-1",
+			"by": "lane-runner",
+			"at": "2026-10-13T16:30:40.366Z",
+			"options": [
+				"stop",
+				"extend",
+				"split"
+			],
+			"body": "wl-mv60mkkt1ohg5c has used $39.57 of its $150 ceiling (26 %) and 101 of 51 minutes (197 %), production stakes; 76912835 tokens."
+		},
+		{
+			"t": "question",
+			"id": "q-mv6wdvfe1ikv0g",
+			"workloadId": "wl-mv65nllu5g181s",
+			"sliceId": "sl-ceiling-mv65nllu5g181s-2",
+			"by": "lane-runner",
+			"at": "2026-10-13T16:30:54.554Z",
+			"options": [
+				"stop",
+				"extend",
+				"split"
+			],
+			"body": "wl-mv65nllu5g181s has used $30.38 of its $300 ceiling (10 %) and 748 of 730 minutes (102 %), production stakes; 52476747 tokens."
+		},
+		{
+			"t": "question",
+			"id": "q-mv6wdvqfmnudq8",
+			"workloadId": "wl-mv66q5b148uznk",
+			"sliceId": "sl-ceiling-mv66q5b148uznk-1",
+			"by": "lane-runner",
+			"at": "2026-10-13T16:30:54.951Z",
+			"options": [
+				"stop",
+				"extend",
+				"split"
+			],
+			"body": "wl-mv66q5b148uznk has used $24.38 of its $150 ceiling (16 %) and 718 of 60 minutes (1197 %), normal stakes; 48944374 tokens."
+		}
+	]
+}

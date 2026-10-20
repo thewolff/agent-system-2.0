@@ -1,0 +1,103 @@
+{
+	"source": "live ledger, wl-mv6zl15365nf9c lane-3 (sl-pd-* hands)",
+	"rows": [
+		{
+			"t": "entry",
+			"id": "en-mv7g4siapccagw",
+			"workloadId": "wl-mv6zl15365nf9c",
+			"sliceId": null,
+			"kind": "assumption",
+			"by": "lane-mv6zl15365nf9c-3",
+			"at": "2026-10-14T01:43:43.186Z",
+			"body": "builder-lab: anthropic lane lane-mv6zl15365nf9c-3 model anthropic/claude-opus-5-5"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv7g875x4ghgxs",
+			"workloadId": "wl-mv6zl15365nf9c",
+			"sliceId": "sl-pd-resolver",
+			"kind": "assumption",
+			"by": "lane-mv6zl15365nf9c-3",
+			"at": "2026-10-14T01:46:22.149Z",
+			"body": "hand-spawn: dt-mv7g8750ee8b5d10 session /Users/jowolff/.agent-system-2/lanes/wl-mv6zl15365nf9c/sessions/2026-10-13T18-00-30-344Z_01a1366c-4f88-7000-8c5e-49da50bebd41 spawn sl-pd-resolver review no group dg-mv7g87507fc80434 row anthropic/claude-opus-5-5,openai-codex/gpt-6-sol,moonshot/kimi-k2.7-code"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv7g875yrn0dmo",
+			"workloadId": "wl-mv6zl15365nf9c",
+			"sliceId": "sl-pd-docs",
+			"kind": "assumption",
+			"by": "lane-mv6zl15365nf9c-3",
+			"at": "2026-10-14T01:46:22.150Z",
+			"body": "hand-spawn: dt-mv7g8750e4f08e00 session /Users/jowolff/.agent-system-2/lanes/wl-mv6zl15365nf9c/sessions/2026-10-13T18-00-30-344Z_01a1366c-4f88-7000-8c5e-49da50bebd41 spawn sl-pd-docs review no group dg-mv7g8750a3f33955 row anthropic/claude-opus-5-5,openai-codex/gpt-6-sol,moonshot/kimi-k2.7-code"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv7hms5m9ax0qo",
+			"workloadId": "wl-mv6zl15365nf9c",
+			"sliceId": "sl-pd-omp-plan",
+			"kind": "assumption",
+			"by": "lane-mv6zl15365nf9c-3",
+			"at": "2026-10-14T02:25:42.154Z",
+			"body": "hand-spawn: dt-mv7hms4717eee7fc session /Users/jowolff/.agent-system-2/lanes/wl-mv6zl15365nf9c/sessions/2026-10-13T18-00-30-344Z_01a1366c-4f88-7000-8c5e-49da50bebd41 spawn sl-pd-omp-plan--openai review yes group fg-mv7hms475a83e15f row openai-codex/gpt-6-sol"
+		},
+		{
+			"t": "routing",
+			"id": "rt-mv7gglzgm97a4g",
+			"workloadId": "wl-mv6zl15365nf9c",
+			"sliceId": "sl-pd-resolver",
+			"spawnKey": "sl-pd-resolver",
+			"sessionRoot": "/Users/jowolff/.agent-system-2/lanes/wl-mv6zl15365nf9c/sessions/2026-10-13T18-00-30-344Z_01a1366c-4f88-7000-8c5e-49da50bebd41",
+			"agentId": "sl-pd-resolver",
+			"kind": "change-large",
+			"outcome": "ran",
+			"models": [
+				"anthropic/claude-opus-5-5",
+				"openai-codex/gpt-6-sol",
+				"moonshot/kimi-k2.7-code"
+			],
+			"ranModels": [
+				"anthropic/claude-opus-5-5"
+			],
+			"at": "2026-10-14T01:52:54.604Z"
+		},
+		{
+			"t": "routing",
+			"id": "rt-mv7giw5rhay7eo",
+			"workloadId": "wl-mv6zl15365nf9c",
+			"sliceId": "sl-pd-docs",
+			"spawnKey": "sl-pd-docs",
+			"sessionRoot": "/Users/jowolff/.agent-system-2/lanes/wl-mv6zl15365nf9c/sessions/2026-10-13T18-00-30-344Z_01a1366c-4f88-7000-8c5e-49da50bebd41",
+			"agentId": "sl-pd-docs",
+			"kind": "change-large",
+			"outcome": "ran",
+			"models": [
+				"anthropic/claude-opus-5-5",
+				"openai-codex/gpt-6-sol",
+				"moonshot/kimi-k2.7-code"
+			],
+			"ranModels": [
+				"anthropic/claude-opus-5-5"
+			],
+			"at": "2026-10-14T01:54:41.103Z"
+		},
+		{
+			"t": "routing",
+			"id": "rt-mv7htab4ca4lj4",
+			"workloadId": "wl-mv6zl15365nf9c",
+			"sliceId": "sl-pd-omp-plan",
+			"spawnKey": "sl-pd-omp-plan--openai",
+			"sessionRoot": "/Users/jowolff/.agent-system-2/lanes/wl-mv6zl15365nf9c/sessions/2026-10-13T18-00-30-344Z_01a1366c-4f88-7000-8c5e-49da50bebd41",
+			"agentId": "sl-pd-omp-plan--openai",
+			"kind": "judge",
+			"outcome": "ran",
+			"models": [
+				"openai-codex/gpt-6-sol"
+			],
+			"ranModels": [
+				"openai-codex/gpt-6-sol"
+			],
+			"at": "2026-10-14T02:30:45.616Z"
+		}
+	]
+}
