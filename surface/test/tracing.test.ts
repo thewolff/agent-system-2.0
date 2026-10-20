@@ -303,12 +303,14 @@ describe("bin/as2: the orchestrator's tracing env", () => {
 
 	test("a failing reader (bun pointed at a missing script): inherited OTEL_* unset, OTEL_SDK_DISABLED=true, and one line saying so", () => {
 		// bin/as2 copied into a tree with no surface/scripts/tracing.ts: <repo> is its parent, so the reader is missing.
-		// The base-prompt renderer is linked in (bun follows the link, so its sources resolve in the real repo).
+		// The base-prompt renderer and the plugin-registry check are linked in (bun follows the link, so their sources
+		// resolve in the real repo).
 		const tree = realpathSync(root("no-reader"));
 		mkdirSync(join(tree, "bin"));
 		copyFileSync(AS2, join(tree, "bin", "as2"));
 		mkdirSync(join(tree, "surface", "scripts"), { recursive: true });
 		symlinkSync(join(REPO, "surface", "scripts", "orchestrator-prompt.ts"), join(tree, "surface", "scripts", "orchestrator-prompt.ts"));
+		symlinkSync(join(REPO, "surface", "scripts", "plugin-registries.ts"), join(tree, "surface", "scripts", "plugin-registries.ts"));
 		const { home } = profileHome("no-reader-home", templateWith("all"));
 		for (const shell of SHELLS) {
 			const r = as2(shell, join(tree, "bin", "as2"), ["--print"], shellEnv({ HOME: home, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://evil:1/v1/traces" }));

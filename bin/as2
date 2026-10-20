@@ -14,7 +14,9 @@
 #                              hooks are dropped (gates/src/shell-start.ts):
 #                                env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 ...
 #                              The OTEL_* words are the tracing switch's, below: every inherited OTEL_* name
-#                              unset, then OTEL_SDK_DISABLED=true, or the otel map when observability.phoenix is `all`
+#                              unset, then OTEL_SDK_DISABLED=true, or the otel map when observability.phoenix is `all`.
+#                              Before <prompt> is rendered, the plugin-registry check runs (as2 plugins, below);
+#                              a disagreement stops the launch with its status and nothing starts
 #          as2 install         run <repo>/install/install.sh (ledger, profile, this launcher); its
 #                              last line names the providers to log in to once per profile
 #                              (/login inside the session; OMP's first-launch wizard is skipped)
@@ -45,15 +47,23 @@
 #                              set jevRank in the installed profile's config.yml (D7): show (launch
 #                              order unchanged), order, or parallel; prints the old and new value,
 #                              never starts omp: bun surface/scripts/rank-mode.ts
+#          as2 plugins         the plugin-registry check alone (PLAN wl-mv8k0fby51uakg D7, jo-issues#51):
+#                              env OMP_PROFILE=<profile> bun surface/scripts/plugin-registries.ts check --cwd <repo>;
+#                              exit 1 when an OMP registry (the default profile's, <profile>'s, or <repo>'s project
+#                              one) gives a plugin a version other than an active Claude Code entry's, printing each
+#                              plugin, both versions and paths, and the fix commands; exit 2 on a malformed registry.
+#                              Lane launches do not run it
 #          as2 lane <wl>       run workload <wl> by hand as a lane in this terminal (user-driven mode;
 #                              DESIGN-lane-launcher.md decision 14): bun surface/scripts/lane.ts interactive <wl>
 #          as2 lane stop|cleanup|log <wl>
 #                              stop the workload's lane (requested through the ledger; signals omp only
 #                              when its pid still matches), remove a clean pushed worktree, tail the runner log
-#          as2 --print [args]  render <prompt>, then print the omp command line `as2 [args]` would run, without running it
+#          as2 --print [args]  run the plugin-registry check, render <prompt>, then print the omp command line
+#                              `as2 [args]` would run, without running it
 #          as2 -h | --help     this text
 # Env:     AGENT_SYSTEM_PROFILE  OMP profile name (default: agent-system-2), as install/install.sh
-# Exit:    omp's (or install.sh's) own status when launching · 0 ok · 1 failure
+# Exit:    omp's (or install.sh's) own status when launching · 0 ok · 1 failure (a plugin-registry disagreement
+#          included) · 2 a malformed plugin registry
 #
 # <repo> is this script's real directory's parent (bin/..), resolved through any symbolic link,
 # so the link install.sh places at $HOME/.local/bin/as2 finds the checkout it points into.
@@ -80,6 +90,12 @@ PROMPT="$HOME/.agent-system-2/orchestrator/system.md"
 # so a launch never passes one (the script names the missing source on stderr).
 render_prompt() {
 	bun "$REPO/surface/scripts/orchestrator-prompt.ts" "$PROMPT" || exit 1
+}
+
+# The plugin-registry check (surface/scripts/plugin-registries.ts; PLAN wl-mv8k0fby51uakg D7), for the orchestrator's
+# profile and <repo>, the cwd omp starts in: any status but 0 stops the caller with that status, the reasons on stderr.
+check_plugins() {
+	env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/plugin-registries.ts" check --cwd "$REPO" || exit "$?"
 }
 
 usage() {
@@ -321,8 +337,14 @@ case "${1-}" in
 		shift
 		exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/rank-mode.ts" "$@"
 		;;
+	plugins)
+		shift
+		[ "$#" -eq 0 ] || { printf 'as2 plugins: takes no arguments\n' >&2; exit 1; }
+		check_plugins
+		;;
 	--print)
 		shift
+		check_plugins
 		render_prompt
 		words="$(orchestrator_words)"
 		eval "set -- $words OMP_PROFILE=\"\$PROFILE_NAME\" AGENT_SYSTEM_ROLE=orchestrator omp --cwd \"\$REPO\" --append-system-prompt \"\$PROMPT\" \"\$@\""
@@ -331,6 +353,7 @@ case "${1-}" in
 		printf '%s\n' "$line"
 		;;
 	*)
+		check_plugins
 		render_prompt
 		words="$(orchestrator_words)"
 		eval "set -- $words OMP_PROFILE=\"\$PROFILE_NAME\" AGENT_SYSTEM_ROLE=orchestrator omp --cwd \"\$REPO\" --append-system-prompt \"\$PROMPT\" \"\$@\""

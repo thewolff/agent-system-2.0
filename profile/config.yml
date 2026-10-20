@@ -108,13 +108,17 @@ extensions:
   # Reversal: delete the line (and the two plugin skill dirs and names below).
   - "{repo}/plugins/index.ts"
 
-# The same two plugins installed through `omp plugin install` (Jo's default profile, 2026-10-14) live
-# in OMP's root plugin dir, ~/.omp/plugins, which every profile reads (pi-utils dirs.ts getPluginsDir:
-# rootSubdir, not the profile's), so without this they load into every as2 session, lanes
-# included, unpinned and beside plugins/index.ts (VENDOR.md clash C11). OMP skips a discovered
-# extension whose `extension-module:<file name>` is listed here (extensibility/extensions/loader.ts
-# discoverExtensionPaths isDisabledName); configured paths above are not filtered by it.
-# Reversal: delete these two entries (the marketplace copies then load in every as2 session again).
+# A guard that is inert today. The same two plugins installed through `omp plugin install` live in the
+# OMP plugin registry of the profile that ran the install (Jo's default profile, 2026-10-14:
+# ~/.omp/plugins). That registry is per profile: getPluginsDir resolves through rootSubdir, which is
+# the active profile's root (pi-utils@18.8.6 src/dirs.ts `getPluginsDir`, `rootSubdir`), so an as2
+# session reads ~/.omp/profiles/<profile>/plugins, which no install has created, and loads neither
+# marketplace copy (profile/OMP-RUNTIME.md § Plugin registry precedence; VENDOR.md clash C11). These
+# entries matter only if someone runs `omp plugin install` under the as2 profile: OMP then skips a
+# discovered extension whose `extension-module:<file name>` is listed here
+# (pi-coding-agent@18.8.6 src/extensibility/extensions/loader.ts discoverExtensionPaths
+# isDisabledName); configured paths above are not filtered by it.
+# Reversal: delete these two entries (nothing loads differently until such an install exists).
 disabledExtensions:
   - "extension-module:i-have-audhd-omp"
   - "extension-module:ask-graham-omp"

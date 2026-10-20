@@ -47,5 +47,6 @@ Read the kind off your task, then follow the matching line.
   inside the root, no network), so keep them in their own bash call. No hooks or `.git` writes in scratch repos;
   edit a scratch clone with the write tool only on a non-protected branch. The root has an advisory cap
   (`AGENT_SYSTEM_SCRATCH_CAP_MB`, default 2048). Anything a later lane needs goes in the plan directory.
+- Your harness is OMP. Its slash commands, settings and which of them apply to you are in OMP-HARNESS.md, and how it behaves at run time (what a hand inherits, message delivery, extensions, compaction) is in OMP-RUNTIME.md, both in ~/.omp/profiles/<profile>/agent/, where `<profile>` is `$OMP_PROFILE` in your bash env (`agent-system-2` by default); read them, or the OMP source, before answering a harness question.
 - Any order of workloads, PRs or next steps you give or act on comes from `as2_rank`, never your own
   judgment; Jo's "X first", unpins and goals are the orchestrator's to record.

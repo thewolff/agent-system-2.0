@@ -9,11 +9,14 @@ as2 was built for one user on one Mac. This page lists what you can change today
 | `profile/config.yml` | `~/.omp/profiles/<profile>/agent/config.yml`, rendered with `{repo}` filled in | Extensions, skills, tier → model rows, the judge, the fence switch, the test runner, compaction, display |
 | `profile/models.yml` | Beside `config.yml` | The pinned judge model's definition on the `typesafe` provider |
 | `profile/mcp.json` | Beside `config.yml` | The profile's MCP servers. The installer refuses a file without an `mcpServers.ctx` entry that has a `command` |
+| `profile/AGENTS.md` | Beside `config.yml`, rendered with `{repo}` filled in | The OMP harness card. OMP loads it into every orchestrator (Ilex) and lane session of the as2 profile as native user context (`pi-coding-agent@18.8.6 src/discovery/builtin.ts` `loadContextFiles`); OMP strips it from subagents (`pi-coding-agent@18.8.6 src/task/structured-subagent.ts` `buildExecutorOptions`, the `contextFiles` filter on `agents.md`), so hands never see it |
+| `profile/OMP-HARNESS.md` | Linked beside `config.yml` | The full OMP harness guide: every slash command, launch flag and setting with its verdict for Ilex, lanes and seats. OMP does not load it: the native context-file provider reads only `AGENTS.md` from the agent dir (`pi-coding-agent@18.8.6 src/discovery/builtin.ts` `loadContextFiles`), so agents read the guide on demand. Hands are pointed to it by a line in their tier file. A link, so edits are live without a re-install |
+| `profile/OMP-RUNTIME.md` | Linked beside `config.yml` | The OMP runtime guide, companion to `OMP-HARNESS.md`: how OMP behaves while it runs (profile scoping, plugin registries, extension load order and event failure modes, message delivery, compaction, session leases, the rpc protocol, MCP sources, credentials, logs, tool approval, what a hand inherits), one section per subsystem with a verdict for Ilex, lanes, hands and seats. OMP does not load it; agents read it on demand, and hands are pointed to it by the same tier-file line. A link, so edits are live without a re-install |
 | `tiers/*.md` | Linked into `agents/` | The six role prompts (orchestrator, lane, four hand tiers). Links, so edits are live without a re-install |
 | `voice/VOICE.md` | Read in place | The voice the orchestrator writes in; rendered into its system prompt at each `as2` launch |
 | `contract/output-types.md` | Read in place | The output-types contract injected into every session |
 
-Edit the files in the checkout and re-run `bash install/install.sh`. The installer overwrites the installed `config.yml`, `models.yml` and `mcp.json` on every run, so edits made directly in `~/.omp/profiles/` are lost at the next install. The one exception is `as2 on` / `as2 off`, which flips `gates.fence.enabled` in the installed file until the next install.
+Edit the files in the checkout and re-run `bash install/install.sh`. The installer overwrites the installed `config.yml`, `models.yml`, `mcp.json` and `AGENTS.md` on every run, so edits made directly in `~/.omp/profiles/` are lost at the next install. The one exception is `as2 on` / `as2 off`, which flips `gates.fence.enabled` in the installed file until the next install.
 
 ### `profile/config.yml` keys
 
@@ -79,7 +82,7 @@ Each item names where it lives, so a change starts in the right file.
 ### Platform
 
 - **macOS only.** The write fence is a Seatbelt profile run through `/usr/bin/sandbox-exec` (`gates/src/fence.ts`), and every bash call is refused when `sandbox-exec` is missing unless the fence is off. The `_as2test` user is created with `dscl` (`install/as2test-setup.sh`). The ledger backup and the nightly chaos run are launchd agents; off macOS the installer skips the backup job and refuses `--chaos-nightly`. No Linux fence, test-runner setup or scheduler exists.
-- **OMP 18.8.** `VERIFIED_HOST` in `gates/src/host.ts` refuses any other major.minor, and `setupVersion` in `profile/config.yml` matches one OMP release's first-launch wizard. After an OMP upgrade, `gates/test/host.test.ts` and `install/fresh-machine-test.sh` say whether the pin still holds.
+- **OMP 18.8.** `VERIFIED_HOST` in `gates/src/host.ts` refuses any other major.minor, and `setupVersion` in `profile/config.yml` matches one OMP release's first-launch wizard. After an OMP upgrade, `gates/test/host.test.ts` and `install/fresh-machine-test.sh` say whether the pin still holds. The guides `profile/OMP-HARNESS.md` and `profile/OMP-RUNTIME.md` and the card `profile/AGENTS.md` are snapshots: line 1 of each reads `snapshot of OMP <x.y.z>, <date>; drift will occur`, and `ledger/test/omp-harness.test.ts` fails when that version differs from `MEASURED_HOST` in `gates/src/shell-start.ts`. Re-verify all three on any OMP upgrade and bump the snapshot lines.
 - **HerdR and moshi** are not used by as2's machinery. Planned seat integrations are optional ([MIGRATION.md](../MIGRATION.md) items 93 and 98).
 
 ## Ticket systems

@@ -18,6 +18,7 @@ ledger/scripts/backup.ts	ledger-backup	-
 ledger/test/facts.test.ts	test	-
 ledger/test/install.test.ts	test	-
 ledger/test/ledger.test.ts	test	-
+ledger/test/omp-harness.test.ts	test	-
 ledger/test/raw-sqlite.test.ts	test	-
 install/manifest.tsv	install	-
 install/install.sh	install	-
@@ -27,6 +28,9 @@ install/com.agent-system-2.ledger-backup.plist	ledger-backup-agent	{launch_agent
 # data, and the 2.0 profile template (config.yml + models.yml, the judge pin). All used in place:
 # the profile names the extension entry points by repo path. `profile` rows are the template the
 # profile rendering is owned by M6 (MIGRATION.md; corrected 2026-09-29 from "M8"); models.yml must land beside config.yml.
+# The OMP harness card profile/AGENTS.md is rendered with {repo} filled in beside config.yml, and the guide
+# profile/OMP-HARNESS.md and its runtime companion profile/OMP-RUNTIME.md are linked there (wl-mv8k0fby51uakg);
+# exactly one row each, like config.yml, models.yml, mcp.json.
 classifier/calibration.json	data	-
 classifier/extension.ts	extension	-
 classifier/kind-question.json	data	-
@@ -166,6 +170,9 @@ gates/extensions/r18-typed-wrapper.ts	extension	-
 gates/src/rows/r18-typed-wrapper.ts	module	-
 gates/test/r18-typed-wrapper.test.ts	test	-
 gates/test/r18-typed-wrapper-exec.test.ts	test	-
+profile/AGENTS.md	profile	{profile}/agent/AGENTS.md
+profile/OMP-HARNESS.md	profile	{profile}/agent/OMP-HARNESS.md
+profile/OMP-RUNTIME.md	profile	{profile}/agent/OMP-RUNTIME.md
 gates/src/shell-start.ts	module	-
 gates/test/shell-start.test.ts	test	-
 gates/test/shell-start-bash.test.ts	test	-
@@ -1252,6 +1259,14 @@ surface/test/linked-api.test.ts	test	-
 install/herdr-file-links/herdr-plugin.toml	install	-
 install/herdr-file-links/open-file.sh	install	-
 ledger/test/file-links-install.test.ts	test	-
+# Stale OMP docs (wl-mv8k0fby51uakg, PLAN D8): the OMP-doc rule and snapshot parser, the gates row that notices a stale doc, its test.
+gates/src/omp-docs.ts	module	-
+gates/extensions/omp-docs-stale.ts	extension	-
+gates/test/omp-docs-stale.test.ts	test	-
+# P-11 row 19, OMP questions read OMP first (wl-mv8k0fby51uakg, PLAN D9): the rule, the gates row, its test.
+gates/src/rows/r19-omp-docs-first.ts	module	-
+gates/extensions/r19-omp-docs-first.ts	extension	-
+gates/test/r19-omp-docs-first.test.ts	test	-
 # Jev ranking, show-only first (migration/items/jev-ranking.md): the ranking, the as2_rank tool, the audit, the launch gate, the CLIs.
 surface/src/rank.ts	module	-
 surface/src/rank-audit.ts	module	-
@@ -1274,6 +1289,11 @@ surface/src/tracing.ts	module	-
 surface/scripts/tracing.ts	module	-
 surface/test/tracing.test.ts	test	-
 surface/test/phoenix-run.test.ts	test	-
+# Plugin-registry check (wl-mv8k0fby51uakg PLAN D7, jo-issues#51): bin/as2 refuses to start the orchestrator when an OMP
+# registry's effective plugin version differs from an active Claude Code entry's; `as2 plugins` runs it alone.
+surface/src/plugin-registries.ts	module	-
+surface/scripts/plugin-registries.ts	module	-
+surface/test/plugin-registries.test.ts	test	-
 # Agent channel, phase 1 (migration/items/agent-channel.md): Plumb sends Ilex notes and proposals through
 # the OMP seat mailbox; never authored as Jo. Loaded by surface/index.ts for the orchestrator only.
 surface/src/channel.ts	module	-

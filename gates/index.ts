@@ -13,14 +13,24 @@
 //   (the orchestrator does no lane work) registers right after ask, before any row that reads the
 //   ledger, so a lane's tool on the orchestrator gets the role refusal, not a lane row's. Row 18 (a
 //   typed copy of the fence's wrapper) registers right after row 15 and before row 7: it reads no
-//   ledger, and it reads `input.command` as typed, which every handler before the fence sees.
-// - session_stop runs row 3's receipt flags before row 7 or row 1 can block the stop.
+//   ledger, and it reads `input.command` as typed, which every handler before the fence sees. Row 19
+//   (Ilex's and lanes' outward tools, a hand's yield) registers after the tool_call rows, before row 1.
+// - session_stop runs row 3's receipt flags before row 7, row 19 or row 1 can block the stop. Row 19
+//   runs before row 1 on assistant_message and session_stop: OMP hands each assistant_message handler
+//   the previous rewrite and returns the first session_stop result, so row 1 never judges (or cites
+//   the QUESTION rows of) a reply row 19 holds, and judges the rewrite once row 19 lets it through
+//   (gates/extensions/r19-omp-docs-first.ts).
 // - before_agent_start sets the mode before row 7 renders its wake message.
+// - Row 19 needs OMP's judge (hostJudge below). OMP loads this entry with `pi` alone, so `env` is the
+//   process's own and the host judge is wired in; a caller handing in its own env hands in its own judge,
+//   and without one the row is not registered, the way the host notices below need the host's settings.
 // - The M4b OS fence (src/fence.ts) registers last: every handler gets the original event and the
 //   last non-block result is what runs (runner.ts emitToolCall), so it wraps only a bash call every
 //   row allowed, its revision never reaches a row (row 18 reads the typed command), and its
 //   tool_result cleanup runs after rows 3 and 8 read the original command.
+import type { JudgmentJudge } from "../classifier/src/judge-ask";
 import openLinks from "./extensions/open-links";
+import ompDocsStaleRow from "./extensions/omp-docs-stale";
 import { linkedApi } from "./src/links";
 import askPolicyRow from "./extensions/r14-ask-policy";
 import briefFieldsRow from "./extensions/r05-brief-fields";
@@ -37,10 +47,11 @@ import spawnRateRow from "./extensions/r17-spawn-rate";
 import tierNameRow from "./extensions/r04-tier-name";
 import turnShapeRow from "./extensions/r01-turn-shape";
 import typedWrapperRow from "./extensions/r18-typed-wrapper";
+import ompDocsFirstRow, { type OmpJudge } from "./extensions/r19-omp-docs-first";
 import wakeReadRow from "./extensions/r07-wake-read";
 import { type CleanShellCheck, type CleanShellRead, cleanShellFromHost } from "./src/clean-shell";
 import { type FenceSettings, fenceSettingsFrom, registerFence, type ShellStartCheck } from "./src/fence";
-import { checkHostVersion, type HostModules } from "./src/host";
+import { checkHostVersion, type HostModules, hostSettings } from "./src/host";
 import type { Ctx, GatesAPI } from "./src/session";
 import { captureGateLoadEnviron, type ShellStart, type ShellStartHost, shellStart } from "./src/shell-start";
 
@@ -107,6 +118,18 @@ async function hostCleanShell(): Promise<CleanShellRead> {
 }
 
 /**
+ * OMP's `judge` role for row 19, resolved through the host's own modules the way surface/index.ts hostJudge
+ * and classifier/extension.ts resolve theirs; imported here for the reason hostModules gives. A host with
+ * no judge configured fails the call, which row 19 counts as a question about OMP (fail closed).
+ */
+async function hostJudge(ctx: Ctx): Promise<JudgmentJudge> {
+	const [host, { resolveJudge }] = await Promise.all([hostModules(), import("@oh-my-pi/pi-coding-agent/judgment/index")]);
+	const settings = await hostSettings(host, ctx.cwd);
+	const registry = (ctx as Ctx & { modelRegistry?: unknown }).modelRegistry;
+	return resolveJudge({ settings: settings as never, registry: registry as never }) as unknown as JudgmentJudge;
+}
+
+/**
  * Said once at session start, not only at the first refused bash call: a host whose version is not
  * the pinned one (Jo ran `omp update` mid-session on 2026-09-30 and every bash call was refused with
  * nothing naming the cause). The fence still refuses each call on its own read; this is the notice.
@@ -131,6 +154,7 @@ export default function p11Gates(
 	fenceSettings: (ctx: Ctx) => Promise<FenceSettings> = hostFenceSettings,
 	startCheck: ShellStartCheck = hostShellStart,
 	cleanShell: CleanShellCheck | undefined = fenceSettings === hostFenceSettings ? hostCleanShell : undefined,
+	judge: OmpJudge | undefined = env === process.env ? hostJudge : undefined,
 ): void {
 	openLinks(pi);
 	const ledgerPi = linkedApi(pi, undefined, undefined, "ledger");
@@ -149,9 +173,14 @@ export default function p11Gates(
 	reservedRow(pi, env);
 	protectedEditRow(pi, env);
 	pushRebaseRow(pi, env);
+	if (judge) ompDocsFirstRow(pi, env, { judge });
 	turnShapeRow(pi, env);
 	joInstructionRow(pi, env);
 	registerFence(pi, env, fenceSettings, startCheck, cleanShell);
-	// The notice reads the host; a test handing in its own reader has no host to read.
-	if (fenceSettings === hostFenceSettings) hostVersionNotice(pi);
+	// The notices read the host; a test handing in its own reader has no host to read. The stale-docs
+	// row registers its `context` handler from session_start, so it runs after the fence's history view.
+	if (fenceSettings === hostFenceSettings) {
+		hostVersionNotice(pi);
+		ompDocsStaleRow(pi);
+	}
 }

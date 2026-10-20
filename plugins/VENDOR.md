@@ -48,18 +48,21 @@ and `install/fresh-machine-test.sh`.
   `skill` row at `plugins/<p>/skills/<n>/SKILL.md`, and refuses a render whose customDirectories
   is not `<repo>/skills` followed by each plugin skills dir that holds a `skill` row, or where two
   skill rows share a name.
-- **Not the marketplace copies.** Marketplace registries are per profile
+- **Not the marketplace copies.** Marketplace registries and installed plugins are both per profile
   (`OMP_PROFILE=agent-system-2 omp plugin marketplace list` printed "No marketplaces configured" on
-  2026-10-14), but installed plugins are not: `omp plugin install` puts them in OMP's root plugin
-  dir, `~/.omp/plugins`, which every profile loads from (pi-utils `dirs.ts` `getPluginsDir`). The
-  install smoke on 2026-10-14 showed the agent-system-2 profile loading
-  `~/.omp/plugins/node_modules/i-have-audhd/omp/i-have-audhd-omp.ts` and `…/ask-graham/omp/ask-graham-omp.ts`
-  before surface/. profile/config.yml's `disabledExtensions` therefore names
-  `extension-module:i-have-audhd-omp` and `extension-module:ask-graham-omp`, so as2 sessions run only
-  this pinned copy, through `plugins/index.ts` (clash C11). A marketplace update of those two
-  plugins does not reach as2: re-pin here instead. Two loaded copies would inject twice and check
-  every stop twice (plugins/i-have-audhd/omp/REGISTRATION.md, "Do not combine this with the
-  marketplace install").
+  2026-10-14). `omp plugin install` writes the registry of the profile it runs under:
+  `getPluginsDir()` resolves through `rootSubdir`, the active profile's root (pi-utils@18.8.6
+  `src/dirs.ts` `getPluginsDir`, `rootSubdir`), so Jo's default-profile install sits in
+  `~/.omp/plugins` and the as2 profile's registry, `~/.omp/profiles/agent-system-2/plugins`, does not
+  exist. Claude Code's registry does not reach as2 either: its user-scope roots load only when the
+  `claude` source is enabled (pi-coding-agent@18.8.6 `src/capability/index.ts` `isUserSourceEnabled`;
+  `src/discovery/helpers.ts` `listClaudePluginRoots`), and the as2 profile enables none. So as2
+  sessions run only this pinned copy, through `plugins/index.ts` (clash C11). profile/config.yml's
+  `disabledExtensions` still names `extension-module:i-have-audhd-omp` and
+  `extension-module:ask-graham-omp`, a guard that matters only if someone runs `omp plugin install`
+  under the as2 profile. A marketplace update of those two plugins does not reach as2: re-pin here
+  instead. Two loaded copies would inject twice and check every stop twice
+  (plugins/i-have-audhd/omp/REGISTRATION.md, "Do not combine this with the marketplace install").
 - **State and settings stay Jo's.** i-have-audhd reads `~/.claude/i-have-audhd.json` and writes
   `~/.claude/.i-have-audhd-state/`. ask-graham reads `.ask-graham` in the working directory or
   any directory above it, then `${XDG_CONFIG_HOME:-~/.config}/ask-graham/config`. All are shared
@@ -82,4 +85,4 @@ tiers/orchestrator.md on 2026-10-14. Anchors are file plus symbol or heading.
 | C8 | The classifier routes hands, which are subagents. Neither plugin has a `tool_call` or `task` handler. | Handler lists of both adapters | **no clash.** The fence order in profile/config.yml does not change, since the fence is a tool_call concern. |
 | C9 | The inject tells the model to "Load the full `i-have-audhd` skill", and the as2 skill allowlist would hide that skill. | `profile/config.yml` `skills.includeSkills` | **resolved:** both plugin skills are listed and load from their plugin dirs. |
 | C10 | Installer and discovery invariant: each includeSkills name must resolve under exactly one listed customDirectory, and discovery must find each skill at its manifest row's file. | `install/install.sh` § 2b (profile render); `install/fresh-machine-test.sh` step 3b (skill listing) | **resolved:** the render maps each `skill` row to its own dir and requires that dir to be listed. fresh-machine-test compares each discovered skill's file with its manifest row. |
-| C11 | The marketplace copies Jo installed in the default profile (93c1a75, older than this pin) load into every as2 session, lanes included, because OMP's installed-plugin dir is root-level, not per profile. That makes C1/C2 live already, and with `plugins/index.ts` the orchestrator would load each plugin twice. | pi-utils `dirs.ts` `getPluginsDir` (`rootSubdir("plugins")`); install smoke extension listing (SMOKE.log, 2026-10-14) | **resolved:** profile/config.yml `disabledExtensions` lists both adapters' `extension-module:` names. OMP's `discoverExtensionPaths` skips discovered plugin extensions with those names and never filters configured paths. install/fresh-machine-test.sh step 3c seeds installed copies plus a control plugin and checks that only the control and `plugins/index.ts` load. Found after plan approval and recorded on the workload. |
+| C11 | Recorded 2026-10-14: the marketplace copies Jo installed in the default profile (93c1a75, older than this pin) were taken to load into every as2 session, lanes included, on the reading that OMP's installed-plugin dir is root-level, not per profile. **Corrected 2026-10-20:** on OMP 18.8.6 the plugin registry is per profile, so the as2 profile loads neither marketplace copy and the orchestrator loads each plugin once, through `plugins/index.ts`. | pi-utils@18.8.6 `src/dirs.ts` `getPluginsDir` and `rootSubdir` (the active profile's root); pi-coding-agent@18.8.6 `src/discovery/helpers.ts` `listClaudePluginRoots` and `src/capability/index.ts` `isUserSourceEnabled` (Claude user roots off without the `claude` source); profile/OMP-RUNTIME.md § Plugin registry precedence | **resolved:** nothing loads twice today. profile/config.yml `disabledExtensions` keeps both adapters' `extension-module:` names as an inert guard against a future `omp plugin install` under the as2 profile; OMP's `discoverExtensionPaths` skips discovered plugin extensions with those names and never filters configured paths. install/fresh-machine-test.sh step 3c seeds installed copies plus a control plugin and checks that only the control and `plugins/index.ts` load. `as2` start refuses while the default-profile OMP registry and Claude's disagree on a plugin's version (`surface/scripts/plugin-registries.ts`; `as2 plugins`). |
