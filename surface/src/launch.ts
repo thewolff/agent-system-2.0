@@ -14,13 +14,15 @@ import {
 	type EntryRow, homeDir, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type ReserveRows, type ReserveVerdict,
 	type SliceRow, TEST_RUNNER_BY, type WorkloadRow,
 } from "../../ledger/src/index";
+import { joAuthority } from "../../ledger/src/authority";
+import { joForgeryAnswer, reversedRowIds, surfaceMarks } from "../../ledger/src/jo-channel";
 import { type CleanShellRead, cleanShellOn } from "../../gates/src/clean-shell";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_CAP_ENV, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
 import { labOf } from "../../classifier/src/lab";
 import {
-	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
+	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, FORGERY_CHECK_BY, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
 } from "./types";
 
 // ---- knobs -------------------------------------------------------------------------------------
@@ -88,6 +90,7 @@ export const CONTROL_PREFIXES = [
 	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-notice", "train-autoboard",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
+	"forgery", "forgery-confirmed", "forgery-reversed", "mode-compensation",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -167,6 +170,13 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * Jev ranking's rows (PLAN wl-mv8k039gvogt8g D3, surface/src/rank.ts): `priority-signal:` / `priority-signal-failed:` (on the
  * ranked workload) and `rank-shown:` (on the standing workload) are the ranking machinery's (RANK_BY), whichever session ranked;
  * `rank-goals:`, `rank-override:`, `rank-unpin:` (Jo's words, bound to an input) and `rank-audit:` (the wake tick) are the surface's.
+ * The forgery rows (PLAN wl-mvfxw3c4zqfzls D3-D5, surface/src/forgery-hold.ts): `forgery: hit <row id> <rule>` (on the flagged row's
+ * open workload) or `forgery: hit <wl> <row id> <rule>` (on the standing workload, for a closed one) is the forgery check's
+ * (FORGERY_CHECK_BY: the train tick's pass, the launcher's reserve), and so is its `lane-stop: <lane> requested forgery-hold by
+ * forgery-check` (`validWriter`); Jo's answers `forgery-confirmed: <row id> by <in-…>` and `forgery-reversed: <row id> by <in-…>`
+ * are the surface's, and so is a reversal's compensating mode flip's `mode-compensation: <flip id> reverses <row id>`
+ * (surface/src/forgery-words.ts). `controlEntries` drops every entry a surface `forgery-reversed:` of the same workload names,
+ * except the forgery check's own (FORGERY_CHECK_BY): a reversal never voids a hit record or the hold's stop request.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -181,7 +191,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"lane-ready": [LANE_RUNNER_BY, LANE_STARTER_BY],
 	"lane-parked": [LANE_RUNNER_BY],
 	"lane-exit": [LANE_RUNNER_BY, LANE_STARTER_BY],
-	"lane-stop": [SURFACE_BY, LANE_STARTER_BY, LANE_RUNNER_BY],
+	"lane-stop": [SURFACE_BY, LANE_STARTER_BY, LANE_RUNNER_BY, FORGERY_CHECK_BY],
 	"lane-decided": [LANE_RUNNER_BY],
 	"done-because": [],
 	ceiling: [SURFACE_BY],
@@ -222,6 +232,10 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"rank-override": [SURFACE_BY],
 	"rank-unpin": [SURFACE_BY],
 	"rank-audit": [SURFACE_BY],
+	forgery: [FORGERY_CHECK_BY],
+	"forgery-confirmed": [SURFACE_BY],
+	"forgery-reversed": [SURFACE_BY],
+	"mode-compensation": [SURFACE_BY],
 };
 
 export interface ControlEntry {
@@ -254,7 +268,7 @@ function validWriter(prefix: ControlPrefix, rest: string, createdBy: string, hol
 	if (prefix === "released-open") return laneId === createdBy && holders.includes(createdBy);
 	if (prefix === "lane-stop") {
 		if (/^accepted\b/.test(rest)) return createdBy === LANE_RUNNER_BY || createdBy === LANE_STARTER_BY;
-		if (/^requested\b/.test(rest)) return createdBy === SURFACE_BY || createdBy === LANE_STARTER_BY;
+		if (/^requested\b/.test(rest)) return createdBy === SURFACE_BY || createdBy === LANE_STARTER_BY || (createdBy === FORGERY_CHECK_BY && /^requested forgery-hold\b/.test(rest));
 		return false;
 	}
 	return WRITERS[prefix].includes(createdBy);
@@ -282,12 +296,18 @@ export function holdersOf(entries: readonly EntryRow[], current: string | null, 
  * writer, and a parsable body. `holders` are the writers of `done-because:` (`holdersOf`); omit it
  * when the reader does not care about that prefix. Everything else — a lane note shaped like a
  * control line, a `launch-requested:` from a lane, a `plan: approved` from anyone but the surface —
- * is dropped here, so no reader sees it.
+ * is dropped here, so no reader sees it. So is an entry Jo reversed: one an effective surface `forgery-reversed:`
+ * among `entries` names (PLAN wl-mvfxw3c4zqfzls D5; ledger/src/jo-channel.ts `reversedRowIds`). A reversal a later
+ * effective reversal names voids nothing and is itself dropped, so the entry it named comes back. A reversal never voids
+ * an entry the forgery check wrote (FORGERY_CHECK_BY: its `forgery: hit …` records and its forgery-hold `lane-stop:`
+ * request): Jo's `reverse` answers a flagged row, which is never the check's own, so only a forged reversal names one, and
+ * hiding the hit would lift the hold that contains the forgery (surface/src/forgery-hold.ts and every reader built here).
  */
 export function controlEntries(entries: readonly EntryRow[], holders: readonly string[] = []): ControlEntry[] {
 	const out: ControlEntry[] = [];
+	const reversed = reversedRowIds(entries);
 	for (const e of entries) {
-		if (e.kind !== "assumption") continue;
+		if (e.kind !== "assumption" || (reversed.has(e.id) && e.created_by !== FORGERY_CHECK_BY)) continue;
 		const m = PREFIXED.exec(e.body.trim());
 		if (!m || !(CONTROL_PREFIXES as readonly string[]).includes(m[1]!)) continue;
 		const prefix = m[1] as ControlPrefix;
@@ -303,6 +323,27 @@ export function controlEntries(entries: readonly EntryRow[], holders: readonly s
 		out.push({ id: e.id, prefix, laneId, rest, createdBy: e.created_by, createdAt: e.created_at, body: e.body });
 	}
 	return out;
+}
+
+/**
+ * The prefix of a control line `controlEntries` parses but drops because `validWriter` rejects its writer, else
+ * null (not a control line, unparsable, or a valid writer). The forgery check's F5 (surface/src/forgery.ts) makes
+ * that silent drop loud; the parse is `controlEntries`' own, line for line.
+ */
+export function controlWriterRejected(e: EntryRow, holders: readonly string[] = []): ControlPrefix | null {
+	if (e.kind !== "assumption") return null;
+	const m = PREFIXED.exec(e.body.trim());
+	if (!m || !(CONTROL_PREFIXES as readonly string[]).includes(m[1]!)) return null;
+	const prefix = m[1] as ControlPrefix;
+	let rest = (m[2] ?? "").trim();
+	let laneId: string | null = null;
+	if (LANE_SCOPED[prefix]) {
+		const lane = /^(lane-\S+)(?:\s+([\s\S]*))?$/.exec(rest);
+		if (!lane) return null;
+		laneId = lane[1]!;
+		rest = (lane[2] ?? "").trim();
+	}
+	return validWriter(prefix, rest, e.created_by, holders, laneId) ? null : prefix;
 }
 
 // ---- attempts and causes -----------------------------------------------------------------------
@@ -438,7 +479,7 @@ export function instructionLine(i: InstructionRow): string {
  * higher-ranked workload is launchable now, `parallel: <reason>` when the parallel rule holds. `launchable` never returns them.
  */
 export type RankRefusal = `ranked: below ${string}` | `parallel: ${string}`;
-export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched" | RankRefusal;
+export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "forgery-hold" | "awaiting-close" | "cap" | "died-not-relaunched" | RankRefusal;
 export type LaunchVerdict = { launch: true; cause: Cause } | { launch: false; reason: LaunchReason };
 
 /** A holder under a lease that is null or not yet lapsed at `now`. */
@@ -451,16 +492,20 @@ export function heldLive(w: { holder: string | null; holder_lease_until: string 
  * surface to decide whether to exec the starter and again by `reserveLane` inside its transaction,
  * the run that binds. `receipt` is the holder's standing `done-because:` (`doneBecause`), or null:
  * a finished workload is awaiting close, not a lane's next launch, unless Jo's unconsumed
- * `launch-requested:` says otherwise (Jo's word to relaunch wins over the tick's close).
+ * `launch-requested:` says otherwise (Jo's word to relaunch wins over the tick's close). A recorded
+ * forgery hit Jo has not answered (`forgeryHeld`, PLAN wl-mvfxw3c4zqfzls D4) holds every launch: `forgery-hold`.
+ * `marked` is the workload's surface-marked entry ids (ledger/src/jo-channel.ts `surfaceMarks`): only a marked answer is Jo's.
  */
 export function launchable(
 	w: WorkloadRow, control: readonly ControlEntry[], receipt: string | null, resolved: readonly Resolution[], now: string, liveLanes: number, cap: number,
+	marked: ReadonlySet<string>,
 ): LaunchVerdict {
 	if (w.status !== "open") return { launch: false, reason: "closed" };
 	if (w.id === STANDING_WORKLOAD_ID) return { launch: false, reason: "standing" };
 	if (w.brief.startsWith(DUE_PREFIX)) return { launch: false, reason: "due" };
 	if (w.mode !== "autonomous") return { launch: false, reason: "user-driven" };
 	if (heldLive(w, now)) return { launch: false, reason: "held" };
+	if (forgeryHeld(control, marked).length > 0) return { launch: false, reason: "forgery-hold" };
 	const tried = attempts(control);
 	const consumed = consumedIds(tried);
 	const req = control.find((c) => c.prefix === "launch-requested" && !consumed.has(c.id));
@@ -477,7 +522,10 @@ export function launchable(
 export function verdictOf(rows: ReserveRows): LaunchVerdict {
 	const holders = holdersOf(rows.entries, rows.workload.holder, rows.holders);
 	const control = controlEntries(rows.entries, holders);
-	return launchable(rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap);
+	return launchable(
+		rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap,
+		surfaceMarks(rows.provenance, "entries"),
+	);
 }
 
 /** `reserveLane`'s policy for an autonomous launch: the predicate over the rows the transaction read. */
@@ -1048,7 +1096,7 @@ export function supersededBy(entries: readonly EntryRow[], instructions: readonl
 		const on = entries.find((e) => e.id === c.id)?.workload_id;
 		if (!m || on === undefined) continue;
 		const ins = instructions.find((x) => x.id === m[2]);
-		if (ins && ins.workload_id === on && ins.kind === "instruction" && ins.author === "jo" && ins.created_by === SURFACE_BY && ins.body === supersedeInstructionBody(on, m[1]!)) {
+		if (ins && ins.workload_id === on && ins.kind === "instruction" && joAuthority(ins) && ins.body === supersedeInstructionBody(on, m[1]!)) {
 			return { by: m[1]!, instructionId: ins.id };
 		}
 	}
@@ -1109,7 +1157,7 @@ export function prBindings(entries: readonly EntryRow[], instructions: readonly 
 		if (instructionId === undefined || on === undefined || tokens.length === 0 || !tokens.every((t) => /^[1-9]\d*$/.test(t))) continue;
 		const prs = tokens.map(Number);
 		const ins = instructions.find((x) => x.id === instructionId);
-		if (!ins || ins.workload_id !== on || ins.kind !== "instruction" || ins.author !== "jo" || ins.created_by !== SURFACE_BY || ins.body !== prBindingInstructionBody(word, on, prs)) continue;
+		if (!ins || ins.workload_id !== on || ins.kind !== "instruction" || !joAuthority(ins) || ins.body !== prBindingInstructionBody(word, on, prs)) continue;
 		out.push({ word, prs, instructionId, entryId: c.id, createdAt: c.createdAt });
 	}
 	return out;
@@ -1253,6 +1301,64 @@ export function laneStopRequestBody(laneId: string, reason: string, who: string)
 }
 export function laneStopAcceptedBody(laneId: string, ref: string): string {
 	return `lane-stop: ${laneId} accepted ${ref}`;
+}
+
+// ---- forgery rows (PLAN wl-mvfxw3c4zqfzls D4, D5) ------------------------------------------------
+
+/** The two words Jo answers a forgery hit with: the row was his (`confirm`), or it was not (`reverse`). */
+export type ForgeryWord = "confirm" | "reverse";
+/** A stop request's reason when the forgery hold stops a workload's autonomous lane (the tick, as FORGERY_CHECK_BY). */
+export const FORGERY_HOLD_REASON = "forgery-hold";
+/**
+ * `forgery: hit <row id> <rule>`, the forgery check's row on the flagged row's open workload; with `closedWorkload`,
+ * `forgery: hit <wl> <row id> <rule>`, its row on the standing workload for a closed one (a closed workload takes no entry).
+ */
+export function forgeryHitBody(rowId: string, rule: string, closedWorkload: string | null = null): string {
+	return `forgery: hit ${closedWorkload === null ? "" : `${closedWorkload} `}${rowId} ${rule}`;
+}
+const FORGERY_HIT_RE = /^hit (?:(wl-[a-z0-9]+) )?((?:in|en|q)-[a-z0-9]+) (F[1-5])$/;
+/** A `forgery:` entry's rest (`hit [<wl> ]<row id> <rule>`), parsed; `workloadId` null for the own-workload form. */
+export function parseForgeryHit(rest: string): { workloadId: string | null; rowId: string; rule: string } | null {
+	const m = FORGERY_HIT_RE.exec(rest);
+	return m ? { workloadId: m[1] ?? null, rowId: m[2]!, rule: m[3]! } : null;
+}
+/** Jo's `confirm <row id>`: `forgery-confirmed: <row id> by <in-…>`, the instruction carrying his word. */
+export function forgeryConfirmedBody(rowId: string, inputId: string): string {
+	return `forgery-confirmed: ${rowId} by ${inputId}`;
+}
+const FORGERY_ANSWER_RE = /^(\S+)\s+by\s+(in-\S+)$/;
+/** A `forgery-confirmed:` or `forgery-reversed:` entry's rest (`<row id> by <in-…>`), parsed. */
+export function parseForgeryAnswer(rest: string): { rowId: string; by: string } | null {
+	const m = FORGERY_ANSWER_RE.exec(rest);
+	return m ? { rowId: m[1]!, by: m[2]! } : null;
+}
+/**
+ * The row ids Jo answered among `control`: each `forgery-confirmed:` and `forgery-reversed:` that is Jo's answer by the one trust
+ * rule (ledger/src/jo-channel.ts `joForgeryAnswer`; `marked` the surface-marked entry ids of the workloads `control` comes from).
+ */
+export function forgeryAnswered(control: readonly ControlEntry[], marked: ReadonlySet<string>): Set<string> {
+	const out = new Set<string>();
+	for (const c of control) {
+		if (c.prefix !== "forgery-confirmed" && c.prefix !== "forgery-reversed") continue;
+		const a = joForgeryAnswer({ id: c.id, kind: "assumption", body: c.body, created_by: c.createdBy }, marked);
+		if (a) out.add(a.rowId);
+	}
+	return out;
+}
+/**
+ * The forgery hold on a workload from its own control entries (D4): every valid own-workload `forgery: hit <row id> <rule>`
+ * whose row id no answer of Jo's names (`forgeryAnswered`), one per row id, oldest first.
+ */
+export function forgeryHeld(control: readonly ControlEntry[], marked: ReadonlySet<string>): { entryId: string; rowId: string; rule: string }[] {
+	const answered = forgeryAnswered(control, marked);
+	const out: { entryId: string; rowId: string; rule: string }[] = [];
+	for (const c of control) {
+		if (c.prefix !== "forgery") continue;
+		const h = parseForgeryHit(c.rest);
+		if (h === null || h.workloadId !== null || answered.has(h.rowId) || out.some((x) => x.rowId === h.rowId)) continue;
+		out.push({ entryId: c.id, rowId: h.rowId, rule: h.rule });
+	}
+	return out;
 }
 /** `lane-decided: <laneId> <outcome>`: the runner's intended decision, recorded before EOF (`exitClass`). */
 export function laneDecidedBody(laneId: string, outcome: LaneOutcome): string {

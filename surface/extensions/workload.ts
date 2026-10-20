@@ -21,6 +21,7 @@ import { decisionLogContext, lastWorkloadOn, recordRepo, repoOf } from "../src/d
 import { identityOf, recordIdentity } from "../src/identity";
 import { ceilingBody, sizeFor } from "../src/ceiling";
 import { controlEntries, doneBecause, doneBody, doneLine, holdersOf, laneModelBody, modelProblem, planFirstBody, supersededBy } from "../src/launch";
+import { forgeryHoldLine } from "../src/forgery-hold";
 import { stakesSource } from "../src/input";
 import { answerOrchestratorQuestion, inputSpent, joInput, type OrchestratorAnswer, questionSubject, readingBody } from "../src/orchestrator-question";
 import { oneLiner } from "../src/render";
@@ -89,6 +90,9 @@ export async function closeWorkloadWithEntry(
 	if (w.open_slices > 0 || w.paused_slices > 0 || w.open_questions > 0) {
 		return refused(`${id} cannot close: ${w.open_slices} open slice(s), ${w.paused_slices} paused, ${w.open_questions} open question(s). Settle them first.`);
 	}
+	// PLAN wl-mvfxw3c4zqfzls D4: a recorded forgery hit Jo has not answered holds the close (the train tick's pass records hits).
+	const forged = forgeryHoldLine(ledger, id, { fresh: false });
+	if (forged !== null) return refused(`${id} cannot close: ${forged}`);
 	const scheduled = w.brief.startsWith(DUE_PREFIX);
 	let done: string | null = null;
 	// PLAN wl-mv5i3lulwwbbi8 D2: Jo's `supersede <A> <B>` stands in for the holder's receipt (G3) and swaps the close check for supersededFreshness.

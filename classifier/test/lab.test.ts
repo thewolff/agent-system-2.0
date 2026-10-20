@@ -459,10 +459,11 @@ describe("reviewRow: Jo's OpenAI-reviewer rule (in-mv5qdfvskukmbk, in-mv5qfm8910
 
 describe("D6: reading Jo's answer", () => {
 	const parks = [entry("review-park: q-1 slice sl-x", "sl-x")];
-	const answer = (over: Partial<{ id: string; kind: "answer" | "withdrawal" | "instruction"; author: string; question_id: string | null; body: string }>) => ({
+	const answer = (over: Partial<{ id: string; kind: "answer" | "withdrawal" | "instruction"; author: string; created_by: string; question_id: string | null; body: string }>) => ({
 		id: "in-1",
 		kind: "answer" as const,
 		author: "jo",
+		created_by: SURFACE_BY,
 		question_id: "q-1",
 		body: "same-lab",
 		...over,
@@ -474,6 +475,7 @@ describe("D6: reading Jo's answer", () => {
 		expect(unspentGrant(parks, [answer({ body: "wait" })], "sl-x")).toBeNull();
 		expect(unspentGrant(parks, [answer({ kind: "withdrawal" })], "sl-x")).toBeNull();
 		expect(unspentGrant(parks, [answer({ author: "lane-a" })], "sl-x")).toBeNull();
+		expect(unspentGrant(parks, [answer({ created_by: "lane-mv0-1" })], "sl-x")).toBeNull();
 		expect(unspentGrant(parks, [answer({ question_id: "q-other" })], "sl-x")).toBeNull();
 		expect(unspentGrant([...parks, entry("review-same-lab: in-1 token dt-1", "sl-x")], [answer({})], "sl-x")).toBeNull();
 	});

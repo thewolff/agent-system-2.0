@@ -21,6 +21,7 @@
 import { parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
 import { meter } from "./rank-launch";
 import { type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, launchRequestedBody, type OwnerTrainTask, parseTrainBoard, parseTrainFix, planFirst, prBindingInstructionBody, prBindings, supersededBy, type TrainBinding, trainBindings, trainBoardBody, type TrainFix, trainFixBody } from "./launch";
+import { closedReversals, REVERSED_AFTER_CLOSE, unansweredHits } from "./forgery-hold";
 import { CLASSIFIER_BY, type EntryRow, type InstructionRow, type Ledger, newId, type QuestionRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
 import { canonicalPath } from "../../ledger/src/locality";
 import { DEFAULT_BRANCH } from "./merge-train-stack";
@@ -174,7 +175,7 @@ export interface PrStakes {
 }
 
 /** A same-repo workload branch: `wl/<workload id>`; group 1 is the id. */
-const WORKLOAD_BRANCH_RE = /^wl\/(wl-[a-z0-9]+)$/;
+export const WORKLOAD_BRANCH_RE = /^wl\/(wl-[a-z0-9]+)$/;
 
 /** The GitHub `owner/repo` of a checkout's origin (`git -C <path> config --get remote.origin.url`, then `ownerRepoOf`), or null. */
 export function checkoutOwnerRepo(path: string): string | null {
@@ -330,7 +331,8 @@ export const HOLD_PREFIX = "hold: main protection unverified";
  * first PR's slice ids, and the codified procedure, numbered, with the real slice ids of this train and the resolver's command.
  * Step 0 reads the train's members from `merge-train.ts list` (Jo's PRs and the tick's boards alike), and the lane records its
  * notes with lane_record_entry: the train sends Jo nothing but its questions. Steps 1 and 7b read `stakes --hold-ok`: a `hold:`
- * (main's protection unverified) or a second exit 2 is a `train-error:` pass-over with no question and no merge; `production:`
+ * (main's protection unverified, or a forgery hit Jo has not answered, PLAN wl-mvfxw3c4zqfzls D4) or a second exit 2 is a
+ * `train-error:` pass-over with no question and no merge; `production:`
  * keeps Jo's merged / skip / stop question. Step 6 takes a green, or a `red-main` (every failure also fails on main: the lane
  * files or finds the `main-red` issue, records `main-red:`, and goes on). Step 7 lands a green PR: one readiness check for both
  * stakes (the tested head, mergeable, main contained), the stakes read again, then a normal PR merges itself (merge with
@@ -370,9 +372,12 @@ export function trainBrief(wl: string, prs: readonly number[], source: TrainSour
 			`it, and that later pass tests it on its open \`${full}\`. Then the next PR. Stakes: ` +
 			`\`${RESOLVE_COMMAND} stakes --hold-ok --repo <owner/repo of this workload's origin> --pr <n>\` prints \`normal\` (a same-repo \`wl/<id>\` ` +
 			`branch whose workload is on this repository at normal stakes, and main's protection verified), \`${HOLD_PREFIX} (<gap>)\` ` +
-			"(the PR's own stakes are normal, but main's protection is not verified) or `production: <reason>` (anything else); exit 2 " +
-			"(usage or a gh failure): run it once more. On `hold`, or on a second exit 2: " +
-			`${LANE_RECORD_ENTRY_TOOL} \`train-error: pr <n> protection <gap>\` (or \`train-error: pr <n> stakes <the second run's message>\`) and pass the PR ` +
+			"(the PR's own stakes are normal, but main's protection is not verified), `hold: forgery <row id> …` (a ledger row on the PR's " +
+			"workload or this train's that the forgery check flagged and Jo has not answered, or reversed after the workload's close; whatever " +
+			"the stakes) or `production: <reason>` " +
+			"(anything else); exit 2 (usage or a gh failure): run it once more. On `hold`, or on a second exit 2: " +
+			`${LANE_RECORD_ENTRY_TOOL} \`train-error: pr <n> protection <gap>\` (\`train-error: pr <n> forgery <row ids>\` on a forgery hold; ` +
+			`\`train-error: pr <n> stakes <the second run's message>\` on exit 2) and pass the PR ` +
 			"over: no question to Jo, no merge; the tick retries it. Step 7 runs it again before it decides. Before step 2: every dependency of n must " +
 			"be MERGED, then a base-branch stack is retargeted (Stacked PRs, below); otherwise n is passed over as that rule says.",
 		`2. \`git fetch origin\`; a PR worktree on a new branch at the PR's current head, new each time this step runs: \`${TRAIN_PREPARE.replace("<k>", k)}\`, ` +
@@ -1485,6 +1490,12 @@ export function landingReady(ledger: Ledger, wl: string, ctx: LandingContext): L
 	if (w.status !== "closed" || w.closed_at === null) return no("the workload is open");
 	if (w.mode !== "autonomous") return no(`the workload is ${w.mode}`);
 	if (w.stakes !== "normal") return no(`stakes ${w.stakes}`);
+	// PLAN wl-mvfxw3c4zqfzls D4: a recorded forgery hit Jo has not answered (on W, or on the standing workload since the close) holds the landing;
+	// D5's last row: one Jo reversed after the close refuses it for good.
+	const forged = unansweredHits(ledger, wl);
+	if (forged.length > 0) return no(`forgery hold: ${forged.map((h) => `${h.rowId} ${h.rule}`).join(", ")} unanswered`);
+	const reversed = closedReversals(ledger, wl);
+	if (reversed.length > 0) return no(`forgery reversal: ${reversed.map((h) => `${h.rowId} ${h.rule}`).join(", ")} ${REVERSED_AFTER_CLOSE}; boarding stays refused`);
 	const entries = ledger.entries(wl);
 	const instructions = ledger.instructions(wl);
 	const runs = testRuns(entries);
@@ -1556,6 +1567,10 @@ export function boardLanding(
 	return ledger.write(() => {
 		const w = ledger.workload(l.workloadId);
 		if (!w || w.status !== "closed") return no(`${l.workloadId} is not closed`);
+		const forged = unansweredHits(ledger, l.workloadId);
+		if (forged.length > 0) return no(`forgery hold on ${l.workloadId}: ${forged.map((h) => h.rowId).join(", ")} unanswered`);
+		const reversed = closedReversals(ledger, l.workloadId);
+		if (reversed.length > 0) return no(`forgery reversal on ${l.workloadId}: ${reversed.map((h) => h.rowId).join(", ")} ${REVERSED_AFTER_CLOSE}; boarding stays refused`);
 		const cutover = autoboardCutover(ledger);
 		if (cutover === null) return no("no train-autoboard cutover yet");
 		const trains = everyTrain(ledger).filter((t) => {

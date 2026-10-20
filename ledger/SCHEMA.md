@@ -315,6 +315,29 @@ Module: `recordEntry({ workloadId, sliceId?, kind, body, by })` returns the id;
 | `action` | `insert` \| `update` |
 | `detail` | e.g. `held->delivered`, `status open->closed holder lane-1->-`, `withdrawal q-… then cancel` |
 
+**Jo-channel marks** (`ledger/src/jo-channel.ts`). A process that declares itself a Jo channel
+with `declareJoChannel` (the orchestrator's surface session, or the `as2 lane` launcher in Jo's
+terminal) gets TEMP AFTER INSERT triggers on every connection it opens. For each Jo-authority row
+it inserts, they add one `provenance` row in the same transaction:
+
+| column | value |
+|---|---|
+| `at` | the marked row's `created_at` (not the time of the trigger) |
+| `workload_id` | the marked row's workload |
+| `lane_instance` | `jo-channel` |
+| `tbl`, `row_id` | the marked row: `instructions` or `entries`, and its id |
+| `action` | `insert` |
+| `detail` | `surface` or `launcher`: which kind of channel |
+
+Marked rows: every `instructions` insert authored `jo`, and every `entries` insert stamped
+`orchestrator-surface` whose body opens with a jo-only control prefix (`AUTHORITY` in
+`ledger/src/authority.ts`). A launcher marks only rows of its own workload. The marks need no schema
+change: they are ordinary append-only `provenance` rows. On an agent connection to a live ledger
+(where `installBoundary` runs), an insert of a `provenance` row with `lane_instance = 'jo-channel'`
+is refused, and `declareJoChannel` throws. The forgery check (`surface/src/forgery.ts`) reads the
+marks by `tbl` and `row_id`, and the earliest mark of each `detail` (`Ledger.joChannelCutovers()`)
+is that kind's cutover.
+
 ### View `workload_status`
 
 Every `workloads` column plus `last_activity_at`, `open_slices`, `paused_slices`,

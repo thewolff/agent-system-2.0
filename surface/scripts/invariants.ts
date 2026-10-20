@@ -68,6 +68,7 @@ import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from
 import { dirname, join, resolve } from "node:path";
 import { builderLabs, describeBuilders, excludedLabs, parseHandSpawn } from "../../classifier/src/lab";
 import { BACKUP_DEFAULTS, BACKUP_NAME, backupNamespace, copyProblem, processAlive } from "../../ledger/src/index";
+import { REVERSAL_ENTRIES_SQL, reversedRowIds } from "../../ledger/src/jo-channel";
 import type { EntryKind, EntryRow, InstructionRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { assertNotLiveLedgerUnderTest, canonicalPath, defaultLedgerPath, homeDir } from "../../ledger/src/locality";
 import { type ReservedLedgerView, reservedStates } from "../src/errors";
@@ -168,15 +169,23 @@ const ORCH_SQL = `SELECT id, created_at FROM entries WHERE workload_id = :wl AND
 const REVIEW_SQL = `SELECT id, workload_id, created_at, body FROM entries
   WHERE (body LIKE 'hand-spawn:% review yes %' OR body LIKE 'hand-settled: %') AND created_at <= :asOf ORDER BY created_at, rowid`;
 
-/** The ledger reads `reservedStates` needs, over a read-only connection (the same SQL as `Ledger`'s own). */
-export function reservedView(db: Database): ReservedLedgerView {
+/**
+ * The ledger reads `reservedStates` needs, over a read-only connection (the same SQL as `Ledger`'s own). Its
+ * `instructions` leaves out a row an effective surface `forgery-reversed:` names (PLAN wl-mvfxw3c4zqfzls D5;
+ * jo-channel.ts reversedRowIds), counting only reversals written at or before `asOf` (every reversal when omitted), so an
+ * `--as-of` replay keeps history: a reversal of a reversal after `asOf` does not yet restore the row.
+ */
+export function reservedView(db: Database, asOf?: string): ReservedLedgerView {
 	return {
 		entries: (workloadId: string, kind?: EntryKind) =>
 			kind === undefined
 				? db.query<EntryRow, [string]>("SELECT * FROM entries WHERE workload_id = ? ORDER BY created_at, rowid").all(workloadId)
 				: db.query<EntryRow, [string, string]>("SELECT * FROM entries WHERE workload_id = ? AND kind = ? ORDER BY created_at, rowid").all(workloadId, kind),
-		instructions: (workloadId: string) =>
-			db.query<InstructionRow, [string]>("SELECT * FROM instructions WHERE workload_id = ? ORDER BY created_at, rowid").all(workloadId),
+		instructions: (workloadId: string) => {
+			const reversed = reversedRowIds(db.query<Pick<EntryRow, "id" | "kind" | "body" | "created_by" | "created_at">, [string]>(REVERSAL_ENTRIES_SQL).all(workloadId), asOf);
+			return db.query<InstructionRow, [string]>("SELECT * FROM instructions WHERE workload_id = ? ORDER BY created_at, rowid").all(workloadId)
+				.filter((i) => !reversed.has(i.id));
+		},
 		workload: (id: string) => db.query<WorkloadStatusRow, [string]>("SELECT * FROM workload_status WHERE id = ?").get(id),
 		holders: (workloadId: string) => {
 			const rows = db.query<{ detail: string | null }, [string]>(
@@ -426,7 +435,7 @@ export function check(input: Input): Report {
 	// not stale: the lane that would act on an approval is gone. Jo's decision and a withdrawal carry a
 	// time and count only when they landed by as-of; lane-stopped and superseded are read as they are now.
 	const reservedRows = run<Entry>(RESERVED_SQL, { ":cutoff": ago(30 * MIN) });
-	const view = reservedView(db);
+	const view = reservedView(db, asOf);
 	for (const wl of new Set(reservedRows.rows.map(r => r.workload_id))) {
 		for (const r of reservedStates(view, wl)) {
 			if (r.created_at > ago(30 * MIN)) continue;

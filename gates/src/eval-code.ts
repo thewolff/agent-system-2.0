@@ -3,6 +3,7 @@
 // constant concatenations, literal argv arrays — and fails closed where the code spawns a process
 // or writes a file with arguments it cannot read (astra review B1, B2).
 
+import { boundaryEnvName } from "../../ledger/src/authority";
 import type { CodeFamily } from "./exec";
 
 /** One string literal's value per match; template literals only when they have no `${…}`. */
@@ -540,6 +541,121 @@ export function opaqueSpawn(facts: CodeFacts, family?: CodeFamily): string | nul
 		const rest = args.replace(/\{[^{}]*\}/g, "").replace(/(["'`])\1/g, "").replace(/[\s,[\]()]/g, "");
 		if (rest !== "") return `a ${m[0].slice(0, -1).trim()}(…) call whose arguments are computed (${args.trim().slice(0, 80)})`;
 	}
+	return null;
+}
+
+// ---- the Jo-only boundary, layer 2 (PLAN wl-mv654hoqwpfhmo § 6.3 item 2; ledger/src/authority.ts) -----------
+
+/** A module specifier naming the ledger module or any file in it (`../ledger/src/index.ts`, `./ledger/src/locality`, `…/ledger/src`). */
+const LEDGER_MODULE_SPEC = /(?:^|\/)ledger\/src(?:\/|$)/;
+/** Module specifiers: `… from "x"`, a bare `import "x"`, `import("x")`, `require("x")`. */
+const IMPORT_SPEC = /(?<![\w$.])(?:from|import|require)\s*\(?\s*(["'`])([^"'`\n]*)\1/g;
+
+/** A match at `at` in `folded` that is code, not text inside a literal or a comment. */
+const isCode = (facts: CodeFacts, at: number) => facts.uncommented[at] === facts.folded[at];
+
+/** The first module specifier, outside comments and literals, that loads the ledger module, or null. */
+export function ledgerModuleImport(facts: CodeFacts): string | null {
+	for (const m of facts.folded.matchAll(IMPORT_SPEC)) {
+		if (isCode(facts, m.index!) && LEDGER_MODULE_SPEC.test(m[2]!)) return m[2]!;
+	}
+	return null;
+}
+
+/** `import(` or `require(` whose first argument is not one plain string literal (masked to `"___"`; more arguments may follow). */
+const DYNAMIC_LOAD = /(?<![\w$.])(?:import|require)\s*\(\s*(?!(["'`])_*\1\s*[,)])/;
+/** `require` as a value (aliased or passed on): not called, not a member read (`require.resolve`), not an object key. */
+const REQUIRE_VALUE = /(?<![\w$.])require(?![\w$])(?!\s*[(.:])/g;
+/** A declaration binding `require` itself, or `typeof require`: names, not a load. */
+const REQUIRE_NAMED = /(?:\b(?:const|let|var|function|typeof)\s+)$/;
+/** A name bound to `createRequire(…)`: a require function under another name. */
+const REQUIRE_FACTORY = /(?<![\w$.])(?:const|let|var)\s+([\w$]+)\s*=\s*(?:[\w$]+\s*\.\s*)?createRequire\s*\(/g;
+
+/**
+ * `code` with the static text of each template literal that has `${…}` masked to `_`, its substitutions kept as
+ * code, so text such as `` `run require(${x})` `` is not read as a load (G1 review round 1). codeFacts leaves such a
+ * template unmasked. A template the scan cannot pair (a nested template, a `}` with no `${`) is left as it is.
+ * Lengths are kept, so an index into the result is an index into `folded`.
+ */
+function maskTemplateText(code: string): string {
+	return code.replace(/`((?:\\.|[^`\\])*)`/g, (t) => {
+		let out = "`";
+		let depth = 0;
+		for (let i = 1; i < t.length - 1; i++) {
+			const c = t[i]!;
+			if (depth === 0 && c === "\\") {
+				out += "__";
+				i++;
+			} else if (c === "$" && t[i + 1] === "{") {
+				depth++;
+				out += "${";
+				i++;
+			} else if (depth > 0 && c === "{") {
+				depth++;
+				out += c;
+			} else if (c === "}") {
+				if (depth === 0) return t;
+				depth--;
+				out += c;
+			} else out += depth > 0 ? c : "_";
+		}
+		return depth === 0 ? `${out}\`` : t;
+	});
+}
+
+/**
+ * The first module acquisition in JS code whose specifier the gate cannot read, or null (G1, scratch
+ * auth-forgery AUDIT.md § (a)): an `import()` or `require()` whose first argument is not one literal string,
+ * `require` taken as a value (`const r = require; r(p)`), or a `createRequire` result called with a computed
+ * argument. The specifier may name the ledger module (`["…", "ledger", "src", "index"].join("/")`), so the gate
+ * refuses what it cannot name. Read on `uncommented` (string bodies masked, comments blanked) with the static
+ * text of `${…}` templates masked too (maskTemplateText).
+ */
+export function computedModuleLoad(facts: CodeFacts): string | null {
+	const code = maskTemplateText(facts.uncommented);
+	const show = (at: number) => facts.folded.slice(at, at + 60).split("\n")[0]!.trim();
+	const load = DYNAMIC_LOAD.exec(code);
+	if (load) return show(load.index);
+	for (const m of code.matchAll(REQUIRE_VALUE)) {
+		if (!REQUIRE_NAMED.test(code.slice(Math.max(0, m.index! - 20), m.index!))) return show(m.index!);
+	}
+	for (const f of code.matchAll(REQUIRE_FACTORY)) {
+		const call = new RegExp(String.raw`(?<![\w$.])${f[1]!.replaceAll("$", "\\$")}\s*\(\s*(?!(["'\`])_*\1\s*[,)])`).exec(code);
+		if (call) return show(call.index);
+	}
+	return null;
+}
+
+/** The process environment as a receiver: `process.env`, `Bun.env`, Python's `os.environ` or a bare `environ`. */
+const ENV = String.raw`(?:(?<![\w$.])(?:process|Bun)\s*\.\s*env|(?<![\w$.])(?:os\s*\.\s*)?environ)`;
+/** Writes to one variable; group 1 is its name. Bracket keys are already member names (`dotAccess`). */
+const ENV_NAME_WRITES: readonly [RegExp, string][] = [
+	[new RegExp(String.raw`${ENV}\s*\.\s*([A-Za-z_]\w*)\s*(?:\?\?|\|\||&&|[-+*/%&|^])?=(?!=)`, "g"), "sets"],
+	[new RegExp(String.raw`(?<![\w$.])(?:delete|del)\s+${ENV}\s*\.\s*([A-Za-z_]\w*)`, "g"), "unsets"],
+	[new RegExp(String.raw`${ENV}\s*\.\s*(?:pop|setdefault|__setitem__|__delitem__)\s*\(\s*["'\`]([A-Za-z_]\w*)["'\`]`, "g"), "sets or unsets"],
+	[new RegExp(String.raw`(?<![\w$.])(?:os\s*\.\s*)?(?:putenv|unsetenv)\s*\(\s*["'\`]([A-Za-z_]\w*)["'\`]`, "g"), "sets or unsets"],
+	[new RegExp(String.raw`(?<![\w$.])(?:Reflect\s*\.\s*(?:set|deleteProperty|defineProperty)|Object\s*\.\s*defineProperty)\s*\(\s*${ENV}\s*,\s*["'\`]([A-Za-z_]\w*)["'\`]`, "g"), "sets or unsets"],
+];
+/** Writes to the whole environment: replacing or clearing it drops every agent-context tag. */
+const ENV_REPLACE = new RegExp(String.raw`${ENV}\s*=(?!=)|${ENV}\s*\.\s*clear\s*\(`);
+/** Bulk writes, which reach the names their arguments carry. */
+const ENV_BULK = new RegExp(String.raw`(?<![\w$.])Object\s*\.\s*assign\s*\(\s*${ENV}\s*,|${ENV}\s*\.\s*update\s*\(`);
+
+/**
+ * Why eval code sets, unsets or overrides a name only Jo's machinery sets (the agent-context tags,
+ * AGENT_SYSTEM_LEDGER_DB, AS2_TEST_*: `boundaryEnvName`), or null. Reading the environment stays allowed.
+ */
+export function boundaryEnvWrite(facts: CodeFacts): string | null {
+	for (const [re, verb] of ENV_NAME_WRITES) {
+		for (const m of facts.folded.matchAll(re)) {
+			if (isCode(facts, m.index!) && boundaryEnvName(m[1]!)) return `code that ${verb} ${m[1]} (${m[0].trim().slice(0, 60)})`;
+		}
+	}
+	const replace = ENV_REPLACE.exec(facts.uncommented);
+	if (replace) return `code that replaces or clears the whole environment (${replace[0].trim()}), the agent-context tags included`;
+	const bulk = ENV_BULK.exec(facts.uncommented);
+	const named = bulk ? /(?<![\w$])(?:AGENT_SYSTEM_\w+|AS2_TEST_\w*)/.exec(facts.folded) : null;
+	if (named && boundaryEnvName(named[0])) return `code that writes ${named[0]} into the environment (${bulk![0].trim()})`;
 	return null;
 }
 

@@ -29,12 +29,12 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { countRounds, parseReviewRound, type RoundCount } from "../../classifier/src/rounds";
+import { joAuthority } from "../../ledger/src/authority";
 import {
 	CLASSIFIER_BY, type EntryRow, type InstructionRow, LANE_RUNNER_BY, type Ledger, type SliceRow, type WorkloadRow,
 } from "../../ledger/src/index";
 import { homeDir } from "../../ledger/src/locality";
 import { byHandLine, controlEntries, holdersOf, isPlanQuestionIn } from "./launch";
-import { SURFACE_BY } from "./types";
 
 export const PAIR_OPTION = "pair";
 export type PairSite = "round-limit" | "ceiling";
@@ -231,7 +231,7 @@ const RELAY = /^Jo\b[^"]*"([\s\S]*)"\s+—\s+reading\b/;
 /** B's count: Jo's long steers since open. */
 function longSteers(rows: Rows): number {
 	return rows.instructions.filter((i) => {
-		if (i.kind !== "instruction" || i.author !== "jo" || i.channel !== "surface" || i.created_by !== SURFACE_BY) return false;
+		if (i.kind !== "instruction" || !joAuthority(i) || i.channel !== "surface") return false;
 		const words = RELAY.exec(i.body)?.[1] ?? i.body;
 		return words.trim().length > LONG_STEER_CHARS;
 	}).length;
@@ -241,7 +241,7 @@ function longSteers(rows: Rows): number {
 function planRevises(rows: Rows): number {
 	const control = controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder, rows.holders));
 	return rows.instructions.filter((i) =>
-		i.kind === "answer" && i.author === "jo" && i.question_id !== null && i.body.trim().split(/\s+/)[0]?.toLowerCase() === "revise"
+		i.kind === "answer" && joAuthority(i) && i.question_id !== null && i.body.trim().split(/\s+/)[0]?.toLowerCase() === "revise"
 		&& isPlanQuestionIn(control, { id: i.question_id })).length;
 }
 

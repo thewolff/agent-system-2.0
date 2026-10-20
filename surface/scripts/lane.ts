@@ -51,6 +51,7 @@ import { fenceTargets } from "../../gates/src/fence";
 import { SCRATCH_ENV } from "../../gates/src/scratch";
 import { ensureScratchRoot } from "../src/scratch-root";
 import { canonicalPath, homeDir } from "../../ledger/src/locality";
+import { declareJoChannel } from "../../ledger/src/jo-channel";
 import {
 	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type ReserveResult, type SliceRow, type Stakes, type WorkloadRow,
 } from "../../ledger/src/index";
@@ -67,7 +68,11 @@ import {
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, scratchCapMb, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
+	FORGERY_HOLD_REASON,
 } from "../src/launch";
+import { type ForgeryHit } from "../src/forgery";
+import { type ForgeryAlarm, forgeryHoldLine, holdState, raiseAlarm, recordHits } from "../src/forgery-hold";
+import { notify, speak } from "../src/notify";
 import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continueCounter, continuePrompt, deadRunPrompt, type DeadTestRun, deadTestRuns, enqueueRunnerDeath, exitOutcome, heldOpenBody, IDLE_CHECK, IDLE_LIMIT, idleActivity,
 	idlePrompt, liveTestRuns, type PromptError, promptErrorOf, releasedOpen, SETTLE_CHECK, SETTLE_IDLE_MS, settleIdle, sliceCounts, STATE_ID, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
@@ -330,16 +335,38 @@ class Refused extends Error {
 	}
 }
 
+/** `launchable`'s refusals that come before its forgery hold (surface/src/launch.ts): a reserve refused for one of them runs no check. */
+const BEFORE_FORGERY_HOLD: Readonly<Record<string, true>> = { closed: true, standing: true, due: true, "user-driven": true, held: true };
+
 /**
  * The reservation (decision 8) under the policy for the path. Autonomous: `decideLaunch` with Jev ranking's gate composed
  * (`decideRanked`, PLAN wl-mv8k039gvogt8g D7; `config` is the profile's `jevRank`, read fresh here), inside
  * `reserveLane`'s one transaction, so the drain, the open tool and the wake tick are gated alike; in `show` it is
- * `decideLaunch` exactly. Interactive: `decideInteractive`, never gated; an admit writes Jo's pick snapshot
+ * `decideLaunch` exactly. Then the forgery check (PLAN wl-mvfxw3c4zqfzls D3): a hit no pass has recorded yet and Jo has not
+ * answered (`holdState`) refuses the launch with `forgery-hold`, as `launchable` refuses a recorded one; after the refused
+ * reserve, its own write records the hit rows (`recordHits`, stamped forgery-check) and raises `alarm` (none: no alarm).
+ * Interactive: `decideInteractive`, never gated; an admit writes Jo's pick snapshot
  * (`rank-shown: … by pick`, D6) in the same transaction, before `launch: … cause interactive`, and a refusal writes neither.
  */
-export function reserve(ledger: Ledger, wl: string, who: string, interactive: boolean, config: RankConfig = readRankConfig()): ReserveResult {
+export function reserve(ledger: Ledger, wl: string, who: string, interactive: boolean, config: RankConfig = readRankConfig(), alarm: ForgeryAlarm | null = null): ReserveResult {
 	const input = { by: LANE_STARTER_BY, cap: laneCap(process.env), leaseMs: PRECLAIM_LEASE_MS, requestedBy: who };
-	if (!interactive) return ledger.reserveLane(wl, { ...input, decide: (rows) => decideRanked(ledger, rows, config) });
+	if (!interactive) {
+		let fresh: ForgeryHit[] = [];
+		const r = ledger.reserveLane(wl, {
+			...input,
+			decide: (rows) => {
+				const v = decideRanked(ledger, rows, config);
+				if (!v.launch && BEFORE_FORGERY_HOLD[v.reason] === true) return v;
+				fresh = holdState(ledger, wl).fresh;
+				return fresh.length > 0 ? { launch: false, reason: FORGERY_HOLD_REASON } : v;
+			},
+		});
+		if (!r.ok && fresh.length > 0) {
+			const hits = recordHits(ledger, wl, fresh);
+			if (alarm !== null) for (const f of raiseAlarm(alarm, hits)) process.stderr.write(`lane: forgery alarm: ${f}\n`);
+		}
+		return r;
+	}
 	try {
 		return ledger.write(() => {
 			const r = ledger.reserveLane(wl, {
@@ -359,8 +386,9 @@ export function reserve(ledger: Ledger, wl: string, who: string, interactive: bo
 	}
 }
 
+/** The reservation or a Fail with the starter's exit code; an autonomous launch's forgery alarm is the real one (surface/src/notify.ts). */
 function reserveOrExit(ledger: Ledger, wl: string, who: string, interactive: boolean): string {
-	const r = reserve(ledger, wl, who, interactive);
+	const r = reserve(ledger, wl, who, interactive, undefined, interactive ? null : { notify, speak });
 	if (r.ok) return r.laneId;
 	const code = /^cap\b/.test(r.reason) ? STARTER_EXIT.cap! : /^held\b/.test(r.reason) ? STARTER_EXIT.held! : /^closed\b/.test(r.reason) ? STARTER_EXIT.closed! : STARTER_EXIT["not-launchable"]!;
 	throw new Fail("reserve", `${wl} not launched: ${r.reason}`, code);
@@ -1738,9 +1766,15 @@ async function terminate(child: Pick<Subprocess, "kill" | "exited" | "exitCode" 
 }
 
 async function cmdInteractive(wl: string): Promise<number> {
+	// The by-hand launcher in Jo's terminal is a Jo channel (PLAN wl-mvfxw3c4zqfzls D1), declared before any connection:
+	// every connection this process opens, a relay's included, marks the Jo-authority rows it writes on `wl`.
+	declareJoChannel({ kind: "launcher", workload: wl });
 	const ledger = openLedger();
 	const w = ledger.workload(wl);
 	if (!w) throw new Fail("interactive", `no workload ${wl}`, STARTER_EXIT.unknown!);
+	// PLAN wl-mvfxw3c4zqfzls D4: Jo's own terminal is not refused on a forgery hold; it is told, at start.
+	const hold = forgeryHoldLine(ledger, wl);
+	if (hold !== null) line(hold);
 	const laneId = reserveOrExit(ledger, wl, "jo", true);
 	// Held across the catch: a failure after the spawn terminates and reaps omp before the release (Codex review 2, R3).
 	let omp: Subprocess<"inherit", "inherit", "inherit"> | null = null;

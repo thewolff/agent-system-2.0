@@ -6,6 +6,11 @@
 //
 // Every run recomputes from the ledger ($AGENT_SYSTEM_LEDGER_DB, else ~/.agent-system-2/ledger.db) and GitHub, so no one-shot
 // event is lost. The logic is in surface/src/merge-train.ts; this script does the effects, in order:
+//  0. Forgery (PLAN wl-mvfxw3c4zqfzls D3, D4; surface/src/forgery-hold.ts `forgeryPass`), before anything boards. The check over
+//     every open workload and every workload closed within AUTOBOARD_WINDOW_MS; each new hit gets `forgery: hit …` (stamped
+//     forgery-check, once per row id, on the workload or, once closed, on the standing one), and a held workload's live
+//     autonomous lane gets `lane-stop: <lane> requested forgery-hold by forgery-check`. A pass with new hits raises one alarm:
+//     a notification with sound and one spoken line (`as2 forgery alert. <n> rows on <workloads>`, surface/src/notify.ts).
 //  1. Facts. Per open train, `gh pr view <n> -R <repo> --json <TASK_VIEW_FIELDS>,state,body,mergedAt` for each PR whose disposition
 //     slice is not done or cancelled, and `gh pr view <d> --json state,mergedAt` for each `Depends-on: #d` not already read. For
 //     each PR with an unsettled task, the pushes to its head branch from GitHub's repository activity (`trainActivityArgs`, every
@@ -59,8 +64,10 @@
 import { defaultLedgerPath, Ledger } from "../../ledger/src/index";
 import { loadTestRunnerConfig } from "../src/close-entry";
 import { attempts, consumedIds, controlEntries, heldLive, holdersOf, LANE_SCRIPT, launchRequestedBody } from "../src/launch";
+import { forgeryPass, raiseAlarm } from "../src/forgery-hold";
+import { notify, type Notify, type Speak, speak } from "../src/notify";
 import {
-	actionable, type AlertAction, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, checkoutOwnerRepo, forkOf, forkTaskAlert,
+	actionable, type AlertAction, AUTOBOARD_WINDOW_MS, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, checkoutOwnerRepo, forkOf, forkTaskAlert,
 	isTrainOrFix, type Landing, landingReady, mainRedNoticeBody, mainRedNotices, mainRedRows, openTrainFix, openTrains, ownerDeliveries, PROTECTION_UNKNOWN_RAISE_MS,
 	protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState, protectionPassOvers, prStakes, raiseTwiceFailed, settleTasks, TASK_VIEW_FIELDS,
 	type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertActions, trainAlertBody,
@@ -84,8 +91,10 @@ export interface TickDeps {
 	gh: (args: string[]) => GhResult;
 	/** `lane.ts launch <wl> --requested-by merge-train`: its exit code and last line. */
 	launch: (wl: string) => { code: number; line: string };
-	/** A macOS notification with sound; false when it could not be shown. */
-	notify: (title: string, text: string) => boolean;
+	/** A macOS notification with sound; false when it could not be shown (surface/src/notify.ts `notify`). */
+	notify: Notify;
+	/** The forgery alarm's spoken line; false when it could not be said (surface/src/notify.ts `speak`). Absent: nothing is said. */
+	speak?: Speak;
 	/** The test runner's served repositories (`testRunner.repos`, profile/config.yml): only their PRs board (D1); none, nothing boards. */
 	config?: Pick<TestRunnerConfig, "repos">;
 	log?: (line: string) => void;
@@ -156,6 +165,16 @@ export function tick(d: TickDeps): string[] {
 		say(`${wl}: launch (${reason}): exit ${r.code}: ${r.line}`);
 		return r.code;
 	};
+
+	// 0. Forgery (PLAN wl-mvfxw3c4zqfzls D3, D4): first, so a forged row is held before anything boards or launches.
+	try {
+		const pass = forgeryPass(ledger, AUTOBOARD_WINDOW_MS);
+		for (const h of pass.hits) say(`${h.workloadId}: forgery hit ${h.rowId} ${h.rule} (${h.entryId})`);
+		for (const s of pass.stops) say(`${s.workloadId}: forgery hold: stop requested of ${s.laneId} (${s.entryId})`);
+		for (const f of raiseAlarm({ notify: d.notify, speak: d.speak ?? (() => false) }, pass.hits)) say(`forgery alarm: ${f}`);
+	} catch (err) {
+		say(`forgery pass failed: ${err instanceof Error ? err.message : String(err)}`);
+	}
 
 	// 1-2. Facts and settles, per train.
 	const trains: TrainFacts[] = [];
@@ -718,13 +737,6 @@ function realLaunch(wl: string): { code: number; line: string } {
 	return { code: r.exitCode ?? 1, line: lines.at(-1) ?? (r.exitedDueToTimeout ? "timed out" : "no output") };
 }
 
-/** `osascript -e 'display notification … sound name "Glass"'`. */
-function realNotify(title: string, text: string): boolean {
-	const str = (s: string) => `"${s.replace(/[\\"]/g, (c) => `\\${c}`)}"`;
-	const r = Bun.spawnSync(["osascript", "-e", `display notification ${str(text)} with title ${str(title)} sound name "Glass"`], { stdout: "pipe", stderr: "pipe", timeout: 10_000 });
-	return r.exitCode === 0;
-}
-
 function main(argv: string[]): number {
 	if (argv.length > 0) {
 		process.stderr.write("usage: bun surface/scripts/train-tick.ts\n");
@@ -742,7 +754,7 @@ function main(argv: string[]): number {
 		// D1 boards only on the repositories the test runner serves, read as its starter reads them.
 		const cfg = loadTestRunnerConfig(process.env);
 		if (!cfg.ok) log(`testRunner config unreadable (${cfg.error}): nothing boards this pass`);
-		tick({ ledger, gh: realGh, launch: realLaunch, notify: realNotify, log, ...(cfg.ok ? { config: cfg.config } : {}) });
+		tick({ ledger, gh: realGh, launch: realLaunch, notify, speak, log, ...(cfg.ok ? { config: cfg.config } : {}) });
 		return 0;
 	} finally {
 		ledger.close();

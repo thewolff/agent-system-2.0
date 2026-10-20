@@ -135,6 +135,15 @@ channel:
     - { id: plumb, transport: omp-mailbox, authority: notes }
 ```
 
+### Forgery alarm (`confirm`, `reverse`)
+
+- Every 5 minutes, and before a lane launch or a train merge, a check looks for rows that carry your authority but did not come from you. Only two processes write your rows: the surface, and `as2 lane wl-…` in your terminal (your typed answers there pass). It also flags a lane that answers its own question, a question withdrawn by anything but you (the runner withdrawing its own ceiling question is fine), and a Jo-only entry from a writer that may not write it.
+- A hit raises one macOS notification and one spoken line, `as2 forgery alert. <n> rows on <workloads>`, per pass, however many rows. Under *needs you* each flagged row gets a LOUD line: the row id, the rule, what it led to, and the two words.
+- Until you answer, the workload is held: no autonomous launch (a running one is asked to stop), no train boarding or merge, no close. `as2 lane wl-…` by hand still starts and prints the hold.
+- `confirm <row id>`: the row was yours. It is never flagged again. When the last hit is confirmed and the hold had stopped a lane, the lane is relaunched.
+- `reverse <row id>`: the row was not yours. Every reader then ignores it; a reversed answer's question is asked again on the same slice, and a reversed mode flip is flipped back. The reply names what cannot be undone: a cancelled slice (re-cut it), a launch, commits, pushes, spend or a merge the row led to, and anything on a closed workload.
+- An orchestrator started from a checkout without this check writes unmarked rows. Once a surface with the check has written a row, each of those rows is flagged; `confirm` clears it. Start as2 from an up-to-date checkout.
+
 ## 4. Read the screen
 
 - **Wake block:** `# Ledger at <time> (wake: <why>)`, then `you are <name> (<pronouns>)`, then `## needs you`, then the `Rank (Jev, show-only): …` line (section 3, Jev ranking), then `## open workloads` with one line per open workload: id, the brief's first line, the one-liner, the lane, slice counts, its `#n` needs-you numbers, open question ids and unread message count. A workload's full block comes from `orchestrator_ledger` with `workload: wl-…` (with no workload it renders every block).
@@ -178,7 +187,7 @@ Restart as2 after merges that change surface or lane code; a running session kee
 - **You took pair:** the lane stops and the workload is user-driven. Run the `as2 lane wl-…` line from the receipt or from *needs you* in another terminal.
 - **Held 4h:** a workload with no lane and no activity. Flip to `autonomous`, or run it by hand with `as2 lane <wl>`.
 - **Blocked on a prompt:** answer it in that lane's session, or end the session.
-- **Cannot close:** open slices, paused slices or open questions remain, or a lane still holds the lease (`as2 lane stop <wl>`).
+- **Cannot close:** open slices, paused slices or open questions remain, a lane still holds the lease (`as2 lane stop <wl>`), or a forgery hit is unanswered (section 3, Forgery alarm).
 - **"which one?":** the word fit several lines or, for a stakes, mode or `ceiling` word, several open workloads. Answer by number, or add the `wl-…` id it lists.
 - **A word did nothing:** a bare stakes, mode or `ceiling` word with several open workloads gets "which one?" instead. It does nothing only when its `wl-…` id is not an open workload, or the `ceiling` figures do not parse. Check the id or the figures.
 - **Stakes raised mid-run:** a review slice is not added automatically. Ask Ilex for one.

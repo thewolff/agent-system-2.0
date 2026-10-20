@@ -5,6 +5,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
+import { declareJoChannel } from "../../ledger/src/jo-channel";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import { Delivered } from "./delivery";
 import { Numbering } from "./numbering";
@@ -142,6 +143,9 @@ export class SurfaceSession {
 	) {
 		const top = !(!ctx.hasUI && ctx.sessionManager.getHeader()?.parentSession);
 		this.active = top && env[ROLE_ENV] === "orchestrator";
+		// The surface is a Jo channel (PLAN wl-mvfxw3c4zqfzls D1): from here every ledger connection this process opens
+		// marks the Jo-authority rows it writes (ledger/src/jo-channel.ts).
+		if (this.active) declareJoChannel({ kind: "surface" }, env);
 	}
 
 	ledger(): Ledger {

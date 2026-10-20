@@ -23,6 +23,7 @@
 // — go through `answerOrchestratorQuestion`. A withdrawal on the standing slice always replans
 // (`apply`): a `cancel` would cancel the slice (schema.sql questions_resolution_settles_slice) and
 // no orchestrator question could be raised again.
+import { joAuthority } from "../../ledger/src/authority";
 import type { InstructionRow, Ledger } from "../../ledger/src/index";
 import { ensureStandingWorkload, standingSlice } from "./identity";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
@@ -61,9 +62,9 @@ export function questionSubject(ledger: Ledger, questionId: string): string | nu
 	return null;
 }
 
-/** A Jo-input row on the standing workload (surface/extensions/surface-input.ts): by the surface, Jo's words, a plain instruction naming no question. */
+/** A Jo-input row on the standing workload (surface/extensions/surface-input.ts): Jo's words with Jo's authority (ledger/src/authority.ts joAuthority), a plain surface instruction naming no question. */
 export const isJoInput = (i: InstructionRow): boolean =>
-	i.workload_id === STANDING_WORKLOAD_ID && i.kind === "instruction" && i.author === "jo" && i.channel === "surface" && i.created_by === SURFACE_BY && i.question_id === null;
+	i.workload_id === STANDING_WORKLOAD_ID && i.kind === "instruction" && joAuthority(i) && i.channel === "surface" && i.question_id === null;
 
 /** The Jo-input row `inputId` on the standing workload, or null. */
 export const joInput = (ledger: Ledger, inputId: string): InstructionRow | null => ledger.instructions(STANDING_WORKLOAD_ID).find((i) => i.id === inputId && isJoInput(i)) ?? null;

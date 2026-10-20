@@ -301,6 +301,7 @@ export function proposalOf(ledger: Ledger, line: string): { target: string; word
 /** First words of Jo's surface commands and answers, for the command-shaped mark (D3, D5). */
 const COMMAND_WORDS = new Set<string>([
 	...STAKES_WORDS, ...MODE_WORDS, "approve", "deny", "withdraw", "ceiling", "rounds", "stop-reviews", "cancel-slice", "supersede", "test-pr", "train", "extend", "pair",
+	"confirm", "reverse",
 ]);
 
 /**

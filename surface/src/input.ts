@@ -59,6 +59,13 @@
 // the plan question's), and refuse with the reason rather than pass as prose. An `approve` answering
 // a question that is not the plan question while `plan: first` stands says so in its receipt (D4).
 //
+// The forgery words (PLAN wl-mvfxw3c4zqfzls D5, surface/src/forgery-words.ts): `confirm <row id>` (the flagged row was Jo's)
+// and `reverse <row id>` (it was not) answer a recorded forgery hit: Jo's instruction, then the surface's
+// `forgery-confirmed:` / `forgery-reversed:` naming it, on the flagged row's workload (the standing one once it is closed).
+// The last confirm relaunches a lane the hold stopped; a reverse undoes what D5's table can and names the rest. With an
+// instruction or entry id they are the command or `refused` (a row id no recorded hit names, a hit already answered),
+// never prose; the word alone or with a question id is an option word like any other.
+//
 // The pair trigger (PLAN wl-mv67564rdkfvnk D7, surface/src/pair-suggest.ts): `pair` answers a round-limit or ceiling
 // question only when that question's raiser offered it (a `pair-offer:` with the site's stamp names it). It settles the
 // question as `stop` does, flips the workload to user-driven as Jo, writes `pair-taken:`, and asks a live lane holder to
@@ -106,6 +113,7 @@ import {
 	attempts, byHandLine, type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, planApprovedBody, planFirst,
 	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody, waivePrBody, waivePrInstructionBody,
 } from "./launch";
+import { applyForgeryWord, type ForgeryWordCommand, forgeryWordCommand } from "./forgery-words";
 import { onOtherTrain, TRAIN_DONE, trainBody, trainBrief, trainHold, trainInstructionBody, trainPrs, trainSlicePr } from "./merge-train";
 import type { Numbering, Target } from "./numbering";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
@@ -143,7 +151,9 @@ export type Command =
 	/** A bare word that fits more than one row or workload: refused, never applied. */
 	| { kind: "ambiguous"; word: string; candidates: Candidate[] }
 	/** A command naming a row it cannot take (`deny en-…` for a request no longer waiting): refused with `why`, never applied and never prose. */
-	| { kind: "refused"; why: string };
+	| { kind: "refused"; why: string }
+	/** `confirm <row id>` / `reverse <row id>`: Jo's answer to a recorded forgery hit (PLAN wl-mvfxw3c4zqfzls D5, surface/src/forgery-words.ts). */
+	| ForgeryWordCommand;
 
 /** Workloads Jo's words apply to: the open workloads other than the standing one, oldest first. */
 export function workloadsInView(ledger: Ledger): string[] {
@@ -197,6 +207,10 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 		const c = trainCommand(ledger, words.slice(1));
 		if (c) return c;
 	}
+	// `confirm <row id>` / `reverse <row id>` (D5): the command or `refused` at any length once an instruction or entry id
+	// follows; the word alone and `confirm q-…` fall through to the answer path, since a question may offer either word.
+	const forgery = forgeryWordCommand(ledger, word, words.slice(1));
+	if (forgery) return forgery;
 	if (words.length === 0 || words.length > 2) return null;
 	const arg = words[1];
 	const target = (): string | null => (arg && view.includes(arg) ? arg : view.length === 1 ? view[0]! : null);
@@ -471,6 +485,9 @@ function resolves(cmd: Command): string | null {
 			return cmd.sliceId;
 		case "supersede":
 			return cmd.workloadId;
+		case "forgery-confirm":
+		case "forgery-reverse":
+			return cmd.rowId;
 		default:
 			return null;
 	}
@@ -1291,6 +1308,9 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 				return `added ${cmd.prs.map((n) => `#${n}`).join(", ")} to merge train ${cmd.workloadId} (instruction ${id}); order ${trainPrs(ledger.entries(cmd.workloadId), ledger.instructions(cmd.workloadId)).join(", ")}${relaunch}`;
 			});
 		}
+		case "forgery-confirm":
+		case "forgery-reverse":
+			return applyForgeryWord(ledger, cmd);
 		case "ambiguous":
 			throw new Error(`"${cmd.word}" fits ${cmd.candidates.length} rows; an ambiguous word is refused, never applied`);
 		case "refused":

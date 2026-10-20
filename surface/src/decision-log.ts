@@ -10,6 +10,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { Ledger } from "../../ledger/src/index";
+import { reversedRowIds } from "../../ledger/src/jo-channel";
 import { reservedStates } from "./errors";
 import { type Identity, authorSlug } from "./identity";
 import { controlEntries, doneBecause, doneLine, holdersOf, reservedPrefix } from "./launch";
@@ -223,12 +224,16 @@ export function decisionLogContext(dir: string, opts: ContextOptions = {}): stri
 
 /**
  * The repo an open workload is on, from its `repo:` entry — the surface's, or the train tick's on a fix workload it opened
- * (PLAN wl-mv8s8srodefytc D8); never a lane's (Codex review B7: a lane's note never routes git).
+ * (PLAN wl-mv8s8srodefytc D8); never a lane's (Codex review B7: a lane's note never routes git). An entry Jo reversed
+ * (an effective surface `forgery-reversed:` of the workload naming it, PLAN wl-mvfxw3c4zqfzls D5; jo-channel.ts
+ * `reversedRowIds`) is skipped; one whose reversal was itself reversed counts again.
  */
 export function repoOf(ledger: Ledger, workloadId: string): string | null {
 	const rows = ledger.entries(workloadId, "assumption");
+	const reversed = reversedRowIds(rows);
 	for (let i = rows.length - 1; i >= 0; i--) {
 		const e = rows[i]!;
+		if (reversed.has(e.id)) continue;
 		if ((e.created_by === SURFACE_BY || e.created_by === MERGE_TRAIN_BY) && e.body.startsWith(REPO_PREFIX)) return e.body.slice(REPO_PREFIX.length).trim();
 	}
 	return null;
@@ -281,7 +286,8 @@ export function renderClose(ledger: Ledger, workloadId: string, dir: string, ide
 		"SELECT id, task, state, artifact, done_condition FROM slices WHERE workload_id = ? ORDER BY created_at, id").all(workloadId);
 	const questions = ledger.db.query<{ id: string; slice_id: string; body: string; state: string; options: string }, [string]>(
 		"SELECT id, slice_id, body, state, options FROM questions WHERE workload_id = ? ORDER BY created_at, id").all(workloadId);
-	const instructions = ledger.instructions(workloadId);
+	// The record keeps every row, a reversed one included (PLAN wl-mvfxw3c4zqfzls D5); the reversal entry says why.
+	const instructions = ledger.instructions(workloadId, { withReversed: true });
 	const entries = ledger.entries(workloadId);
 	const held = ledger.db.query<{ id: string; body: string; state: string }, [string]>(
 		"SELECT id, body, state FROM messages WHERE workload_id = ? AND state <> 'acted-on' ORDER BY created_at, id").all(workloadId);

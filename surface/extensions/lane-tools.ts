@@ -44,6 +44,7 @@ import {
 } from "../../classifier/src/lab";
 import { countRounds, parseReviewLimit } from "../../classifier/src/rounds";
 import { gateSession } from "../../gates/src/session";
+import { joAuthority } from "../../ledger/src/authority";
 import type { EntryRow, Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { repoOf } from "../src/decision-log";
 import { reservedStates } from "../src/errors";
@@ -118,7 +119,7 @@ export function planReviewed(ledger: Ledger, workloadId: string, planId: string)
 	});
 	const acceptedLimit = (q: QuestionRow) => {
 		const a = q.state === "answered" && q.resolved_by !== null ? instructions.get(q.resolved_by) : undefined;
-		return limitAt.has(q.id) && a?.kind === "answer" && a.author === JO_HOLDER && a.body.trim().toLowerCase() === "accept";
+		return limitAt.has(q.id) && a?.kind === "answer" && joAuthority(a) && a.body.trim().toLowerCase() === "accept";
 	};
 	const questions = ledger.questions(workloadId).filter((q) => q.slice_id === planId);
 	const last = questions.filter((q) => !acceptedLimit(q)).at(-1);
@@ -137,7 +138,7 @@ export function planReviewed(ledger: Ledger, workloadId: string, planId: string)
 	const parks = parkQuestions(entries, planId);
 	const granted = sameLabTokens(entries, planId, (grant) => {
 		const i = instructions.get(grant);
-		return i?.kind === "answer" && i.author === JO_HOLDER && i.question_id !== null && parks.has(i.question_id) && i.body === "same-lab";
+		return i?.kind === "answer" && joAuthority(i) && i.question_id !== null && parks.has(i.question_id) && i.body === "same-lab";
 	});
 	const withheld = withheldTokens(entries);
 	const builders = builderLabs(ledger, workloadId);

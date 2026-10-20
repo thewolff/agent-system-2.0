@@ -4,7 +4,8 @@
 // a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), `cancel-slice <sl-…>` and
 // `supersede <wl-A> <wl-B>` (PLAN wl-mv5i3lulwwbbi8 D1, D2), `test-pr <wl-…> <N> [<N> …]`
 // (any length, never read as a batch; PLAN wl-mv5qdfvv82ivwg § 2.1), `train [<wl-…>] <N> [<N> …]`
-// (any length, never read as a batch, refused inside one; PLAN wl-mv8s8srodefytc § 1), or a numbered batch
+// (any length, never read as a batch, refused inside one; PLAN wl-mv8s8srodefytc § 1), `confirm <row id>` /
+// `reverse <row id>` on a recorded forgery hit (PLAN wl-mvfxw3c4zqfzls D5, surface/src/forgery-words.ts), or a numbered batch
 // answering needs-you lines by their session number ("1 approve, 2 deny", or one per line;
 // MIGRATION.md § M7 follow-ups item 1). Read
 // from the turn's prompt in `before_agent_start` rather than from the `input` event, because
@@ -109,9 +110,16 @@ import { triggerLaunch } from "./launch";
 const resumes = (cmd: Command): string | null =>
 	cmd.kind === "answer" || cmd.kind === "withdraw" || cmd.kind === "stop-reviews" || cmd.kind === "cancel-slice" ? cmd.workloadId : null;
 
-/** The workload the launch trigger runs for after `cmd`: one a resolution resumes, one a flip to autonomous hands to a lane, or a merge train Jo added to; else null. */
+/**
+ * The workload the launch trigger runs for after `cmd`: one a resolution resumes, one a flip to autonomous hands to a lane, a merge
+ * train Jo added to, or an open workload Jo answered a forgery hit on (the hold may lift; the last confirm requests the relaunch of
+ * a lane the hold stopped, a reversed mode-flip may flip back to autonomous, PLAN wl-mvfxw3c4zqfzls D5); else null.
+ */
 const launches = (cmd: Command): string | null =>
-	resumes(cmd) ?? ((cmd.kind === "mode" && cmd.mode === "autonomous") || cmd.kind === "train-append" ? cmd.workloadId : null);
+	resumes(cmd) ??
+	((cmd.kind === "mode" && cmd.mode === "autonomous") || cmd.kind === "train-append" ? cmd.workloadId
+		: (cmd.kind === "forgery-confirm" || cmd.kind === "forgery-reverse") && cmd.on === cmd.workloadId ? cmd.workloadId
+		: null);
 
 /** The workload of a `pair` answer (its receipt carries the by-hand command, PLAN wl-mvb9mw00ycfjeo D6), else null. */
 const pairOf = (cmd: Command): string | null => (cmd.kind === "answer" && cmd.answer.toLowerCase() === PAIR_OPTION ? cmd.workloadId : null);

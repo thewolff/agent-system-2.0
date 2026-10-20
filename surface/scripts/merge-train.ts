@@ -31,6 +31,11 @@
 //          unverified (<why>)` when a read fails, the rule is missing or bypassable (`protectionGap`); exit 0 either way.
 //          With --hold-ok (PLAN wl-mvbjiettjrfpxc D5, the brief of every train opened since), a PR whose own stakes are
 //          normal prints `hold: main protection unverified (<why>)` instead, and the train passes it over with no question.
+//          With --hold-ok the forgery check (PLAN wl-mvfxw3c4zqfzls D4, surface/src/forgery-hold.ts) runs first, read-only,
+//          before the production answer: over the PR's workload (its head branch wl/<id>) and, when AGENT_SYSTEM_WORKLOAD_ID
+//          names one (the train lane's env), the train's own; any hit Jo has not answered, recorded by the train tick or not
+//          yet, prints `hold: forgery <row id> <rule> on <wl>[, …]`, and a hit Jo reversed after its workload closed prints
+//          `hold: forgery <row id> <rule> on <wl> reversed after the close` (D5: boarding stays refused).
 // list     the train's members (`trainMembers`: Jo's `train:` and the train tick's `train-board:`, PLAN wl-mvbjiettjrfpxc
 //          D5) from the ledger opened read-only, in membership order, one line each: `<n> jo` or `<n> board`. No gh.
 //
@@ -39,7 +44,8 @@
 // MIGRATION.md, install/manifest.tsv and migration/items/*; 4 a conflict it cannot fix without losing an edit.
 // Nothing is written on 2, 3 or 4. No push, no ledger write; only order and stakes read the network (gh), and they write nothing.
 import { assertNotLiveLedgerUnderTest, defaultLedgerPath, Ledger } from "../../ledger/src/index";
-import { HOLD_PREFIX, type PrStakes, prStakes, protectionGap, type StakesView, trainMembers } from "../src/merge-train";
+import { forgeryStakesHold } from "../src/forgery-hold";
+import { HOLD_PREFIX, type PrStakes, prStakes, protectionGap, type StakesView, trainMembers, WORKLOAD_BRANCH_RE } from "../src/merge-train";
 import { checkItems, convertItems, EXIT_USAGE, type Outcome, resolveMerge, TrainExit, WORKLOAD_RE } from "../src/merge-train-resolve";
 import { DEFAULT_BRANCH, headsByBranch, type OpenHead, orderReport, prDeps, type StackPr } from "../src/merge-train-stack";
 
@@ -155,7 +161,9 @@ function openReadOnly(): Ledger {
 /**
  * `stakes` (D1, D2): the PR's head, read once from gh, against the ledger opened read-only, then, for a normal PR, main's
  * protection; `normal`, or `production: <reason>` (`production: main protection unverified (<why>)` when it does not hold).
- * With `holdOk` (PLAN wl-mvbjiettjrfpxc D5) the unverified protection of a normal PR is `hold: main protection unverified (<why>)`.
+ * With `holdOk` (PLAN wl-mvbjiettjrfpxc D5) the unverified protection of a normal PR is `hold: main protection unverified (<why>)`,
+ * and first of all a forgery hit Jo has not answered, or reversed after its workload's close, on the PR's workload or the train's
+ * own is `hold: forgery …` (PLAN wl-mvfxw3c4zqfzls D4, D5, `forgeryStakesHold`), whatever the PR's stakes.
  */
 function stakes(repo: string, n: number, holdOk: boolean): Outcome {
 	const args = ["pr", "view", String(n), "-R", repo, "--json", "number,headRefName,isCrossRepository,headRepository,headRepositoryOwner"];
@@ -168,6 +176,12 @@ function stakes(repo: string, n: number, holdOk: boolean): Outcome {
 	const ledger = openReadOnly();
 	let s: PrStakes;
 	try {
+		if (holdOk) {
+			const own = process.env.AGENT_SYSTEM_WORKLOAD_ID;
+			const prWorkload = WORKLOAD_BRANCH_RE.exec(v.headRefName as string)?.[1];
+			const forged = forgeryStakesHold(ledger, [...(prWorkload ? [prWorkload] : []), ...(own ? [own] : [])]);
+			if (forged !== null) return { out: [forged], err: [] };
+		}
 		s = prStakes({ ...v, headRepository: v.headRepository ?? null, headRepositoryOwner: v.headRepositoryOwner ?? null } as StakesView, repo, ledger);
 	} finally {
 		ledger.close();

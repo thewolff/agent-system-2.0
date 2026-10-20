@@ -372,18 +372,23 @@ export function printfOutput(args: string[]): string | null {
  * What a short option letter does to the words after it, per interpreter family:
  * - `code`: its program text is the rest of the cluster, or else the next word;
  * - `valueNext`: it takes a value, the rest of the cluster or else the next word (not code);
+ * - `load`: as `valueNext`, and the value is a module file loaded before the program (node/bun `-r`, ruby `-r`);
+ * - `cwd`: as `valueNext`, and the value is the directory the program runs from (ruby `-C`);
  * - `valueAttached`: it takes a value only from the rest of its cluster, so the next word is free;
  * - `module`: a module runs (python `-m`), so the program is not read from stdin.
  * A letter not listed is a flag with no value. Sources: `node --help`, `bun --help`, `python3
  * --help`, perlrun(1), `ruby --help`, `php --help`, osascript(1).
  */
-type OptRole = "code" | "valueNext" | "valueAttached" | "module";
+type OptRole = "code" | "valueNext" | "load" | "cwd" | "valueAttached" | "module";
 const INTERPRETER_SHORT_OPTS: Record<CodeFamily, Record<string, OptRole>> = {
 	js: {
 		e: "code", // node/bun -e <script>
 		p: "code", // -p <script>: evaluate and print
-		r: "valueNext", // -r <module>: preload
+		r: "load", // -r <module>: preload
 		C: "valueNext", // -C <condition>: export conditions
+		F: "valueNext", // bun -F <pattern>: workspace filter
+		d: "valueNext", // bun -d <K:V>: define
+		l: "valueNext", // bun -l <.ext:loader>
 	},
 	python: {
 		c: "code", // -c <command>
@@ -409,9 +414,9 @@ const INTERPRETER_SHORT_OPTS: Record<CodeFamily, Record<string, OptRole>> = {
 	},
 	ruby: {
 		e: "code", // -e <line>
-		r: "valueNext", // -r <library>
+		r: "load", // -r <library>
 		I: "valueNext", // -I <directory>
-		C: "valueNext", // -C <directory>: cd first
+		C: "cwd", // -C <directory>: cd first
 		E: "valueNext", // -E <ext:int>: encodings
 		F: "valueNext", // -F <pattern>: split separator
 		K: "valueAttached", // -K<kcode>
@@ -439,60 +444,142 @@ const INTERPRETER_SHORT_OPTS: Record<CodeFamily, Record<string, OptRole>> = {
 	},
 };
 
-/** What an interpreter's argv runs as program text: inline code words, and whether it reads its program from stdin. */
-interface InterpreterArgs {
-	code: Word[];
-	stdin: boolean;
-	/** An argument the gate cannot read where it could be a code flag. */
-	unknown: boolean;
+/** Deno's short options (`deno run --help`, deno 2.9.4): `-r` is `--reload`, a flag, not a preload. */
+const DENO_SHORT_OPTS: Record<string, OptRole> = { c: "valueNext", L: "valueNext" };
+
+/** How an interpreter's long options read the words after them. A long option not matched is a flag with no value. */
+interface LongOpts {
+	/** Its program text is the next word (`--eval code`), or the text after `=`. */
+	code: RegExp;
+	/** It takes the next word as a value (`--title x`); `--name=value` takes none. */
+	value: RegExp;
+	/** Its value is a module file loaded before the program (`--preload f`, `--import=f`). */
+	load: RegExp;
+	/** Its value is the directory the program runs from (bun `--cwd`). */
+	cwd: RegExp;
 }
 
-function interpreterArgs(family: CodeFamily, name: string, args: Word[]): InterpreterArgs {
-	const out: InterpreterArgs = { code: [], stdin: false, unknown: false };
+/**
+ * The long options that take a separate value word: node's (`node --help`, v24.13.0) and bun's (`bun --help`, `bun run
+ * --help`, 1.3.14) that print as `--name=…` / `--name=<val>`, and python's `--check-hash-based-pycs`. bun's
+ * `--config`/`-c` and `--inspect*` take a value only after `=` (live, bun 1.3.14, 2026-10-19: `bun --config a.ts b.ts`
+ * runs a.ts), so they are flags here.
+ */
+const LONG_VALUE = new RegExp(
+	`^--(?:${[
+		"input-type conditions env-file env-file-if-exists title port console-depth define tsconfig-override install shell filter elide-lines",
+		"cpu-prof-name cpu-prof-dir cpu-prof-interval heap-prof-name heap-prof-dir heap-prof-interval fetch-preconnect max-http-header-size",
+		"dns-result-order unhandled-rejections user-agent cron-title cron-period main-fields extension-order drop feature jsx-factory",
+		"jsx-fragment jsx-import-source jsx-runtime run allow-fs-read allow-fs-write build-snapshot-config diagnostic-dir disable-proto",
+		"disable-warning experimental-config-file experimental-sea-config heapsnapshot-near-heap-limit heapsnapshot-signal icu-data-dir",
+		"inspect-publish-uid localstorage-file max-old-space-size-percentage network-family-autoselection-attempt-timeout openssl-config",
+		"redirect-warnings report-filename report-signal secure-heap secure-heap-min snapshot-blob test-concurrency test-coverage-branches",
+		"test-coverage-exclude test-coverage-functions test-coverage-include test-coverage-lines test-global-setup test-name-pattern",
+		"test-reporter test-reporter-destination test-rerun-failures test-shard test-skip-pattern test-timeout tls-cipher-list tls-keylog",
+		"trace-event-categories trace-event-file-pattern trace-require-module use-largepages watch-kill-signal watch-path check-hash-based-pycs",
+	]
+		.join(" ")
+		.split(" ")
+		.join("|")})$`,
+);
+const INTERPRETER_LONG_OPTS: LongOpts = { code: /^--(?:eval|print)$/, value: LONG_VALUE, load: /^--(?:require|import|preload|loader|experimental-loader)$/, cwd: /^--cwd$/ };
+/** Deno's long options with a value (`deno run --help`, deno 2.9.4); `--env-file`, `--reload`, `--inspect*` take one only after `=`. */
+const DENO_LONG_OPTS: LongOpts = {
+	code: /^$/,
+	value: /^--(?:cert|conditions|config|cpu-prof-dir|cpu-prof-interval|cpu-prof-name|ext|location|minimum-dependency-age|seed|import-map|log-level)$/,
+	load: /^--(?:preload|require)$/,
+	cwd: /^$/,
+};
+/** Deno's subcommands other than `run`, `serve` and `watch` (`deno --help`, deno 2.9.4): none runs a file the gate reads. */
+const DENO_SUBCOMMANDS: Record<string, true> = Object.fromEntries(
+	"task repl eval add bump-version install ci uninstall outdated list approve-scripts remove link unlink publish why bench check clean compile coverage deploy doc fmt info jupyter lint init test pack upgrade completions types help vendor cache bundle x"
+		.split(" ")
+		.map((n) => [n, true]),
+);
+
+/** What an interpreter's argv runs as program text: inline code words, whether it reads its program from stdin, and the file it runs. */
+export interface InterpreterArgs {
+	code: Word[];
+	stdin: boolean;
+	/** An argument the gate cannot read where it could be a code flag or the program. */
+	unknown: boolean;
+	/**
+	 * Where the program file sits in `args`: the first operand, or the word after `--`, when no inline code, stdin or
+	 * module (python `-m`) runs instead; -1 otherwise. For bun it may name a subcommand (`run`, `test`, `x`).
+	 */
+	operand: number;
+	/** Module files an option loads before the program (`-r`, `--require`, `--import`, `--preload`, `--loader`, …). */
+	loads: Word[];
+	/** The directory an option runs the program from (bun `--cwd`, ruby `-C`); the last one wins. */
+	cwd: Word | null;
+}
+
+export function interpreterArgs(family: CodeFamily, name: string, args: Word[]): InterpreterArgs {
+	const out: InterpreterArgs = { code: [], stdin: false, unknown: false, operand: -1, loads: [], cwd: null };
 	if (name === "deno") {
-		if (args[0]?.text === "eval") {
+		const sub = args[0]?.text;
+		if (sub === "eval") {
 			const code = args.slice(1).find((w) => unknown(w) || !w.text.startsWith("-"));
 			if (!code || unknown(code)) out.unknown = true;
 			else out.code.push(code);
-		} else if (args[0]?.text === "run" && args.some((w) => w.text === "-")) out.stdin = true;
+			return out;
+		}
+		// `deno run|serve|watch [options] <file>`, or Deno 2's `deno [options] <file>`; another subcommand runs no file the gate reads.
+		const start = sub === "run" || sub === "serve" || sub === "watch" ? 1 : 0;
+		if (start === 0 && sub !== undefined && !unknown(args[0]) && Object.hasOwn(DENO_SUBCOMMANDS, sub)) return out;
+		scanOptions(DENO_SHORT_OPTS, DENO_LONG_OPTS, family, args, start, out);
+		out.stdin = sub === "run" && args.some((w) => w.text === "-");
 		return out;
 	}
-	const s = INTERPRETER_SHORT_OPTS[family];
-	const longCode = family === "js" ? /^--(eval|print)$/ : /^$/;
-	const longValue = /^--(require|import|loader|experimental-loader|conditions|preload|config|cwd|env-file|input-type|check-hash-based-pycs)$/;
-	for (let i = 0; i < args.length; i++) {
+	scanOptions(INTERPRETER_SHORT_OPTS[family], INTERPRETER_LONG_OPTS, family, args, 0, out);
+	return out;
+}
+
+/** Read `args` from `start` as an interpreter's options, up to its program (interpreterArgs). */
+function scanOptions(short: Record<string, OptRole>, long: LongOpts, family: CodeFamily, args: Word[], start: number, out: InterpreterArgs): void {
+	for (let i = start; i < args.length; i++) {
 		const w = args[i]!;
 		if (unknown(w)) {
 			out.unknown = true;
-			return out;
+			return;
 		}
 		const t = w.text;
 		if (t === "-") {
 			out.stdin = out.code.length === 0;
-			return out;
+			return;
 		}
 		if (t === "--") {
-			if (out.code.length === 0 && i + 1 >= args.length) out.stdin = true;
-			return out;
+			if (out.code.length === 0) {
+				if (i + 1 >= args.length) out.stdin = true;
+				else out.operand = i + 1;
+			}
+			return;
 		}
-		if (longCode.test(t)) {
+		if (family === "js" && long.code.test(t)) {
 			const code = args[++i];
 			if (unknown(code)) out.unknown = true;
 			else out.code.push(code!);
 			continue;
 		}
-		if (family === "js" && /^--(eval|print)=/.test(t)) {
+		if (family === "js" && /^--(eval|print)=/.test(t) && long.code.test(t.slice(0, t.indexOf("=")))) {
 			out.code.push({ text: t.slice(t.indexOf("=") + 1), opaque: false });
 			continue;
 		}
 		if (t.startsWith("--")) {
-			if (longValue.test(t)) i++;
+			const eq = t.indexOf("=");
+			const opt = eq < 0 ? t : t.slice(0, eq);
+			const isLoad = long.load.test(opt);
+			const isCwd = long.cwd.test(opt);
+			if (!isLoad && !isCwd && !long.value.test(opt)) continue;
+			const value = eq < 0 ? args[++i] : { text: t.slice(eq + 1), opaque: false };
+			if (value && isLoad) out.loads.push(value);
+			if (value && isCwd) out.cwd = value;
 			continue;
 		}
 		if (t.startsWith("-")) {
 			for (let k = 1; k < t.length; k++) {
 				const c = t[k]!;
-				const role = s[c];
+				const role = short[c];
 				if (role === "code") {
 					const attached = t.slice(k + 1);
 					if (attached !== "") out.code.push({ text: attached, opaque: false });
@@ -503,22 +590,24 @@ function interpreterArgs(family: CodeFamily, name: string, args: Word[]): Interp
 					}
 					break;
 				}
-				if (role === "module") return out; // python -m: a module runs, not stdin
-				if (role === "valueNext") {
-					if (k + 1 >= t.length) i++;
+				if (role === "module") return; // python -m: a module runs, not stdin
+				if (role === "valueNext" || role === "load" || role === "cwd") {
+					const value = k + 1 >= t.length ? args[++i] : { text: t.slice(k + 1), opaque: false };
+					if (value && role === "load") out.loads.push(value);
+					if (value && role === "cwd") out.cwd = value;
 					break;
 				}
 				if (role === "valueAttached") break;
 			}
 			// python's -c ends option parsing: what follows is the program's argv.
-			if (family === "python" && out.code.length > 0) return out;
+			if (family === "python" && out.code.length > 0) return;
 			continue;
 		}
 		// The first operand: a script (or bun subcommand) when there is no inline code, else the code's argv.
-		return out;
+		if (out.code.length === 0) out.operand = i;
+		return;
 	}
 	if (out.code.length === 0) out.stdin = true;
-	return out;
 }
 
 class Expander {

@@ -68,8 +68,9 @@ export class InstructionRecorder {
 			}
 			try {
 				const ledger = this.ledger();
+				// Raw rows (PLAN wl-mvfxw3c4zqfzls D5): a landed row Jo since reversed still landed, and is not written again.
 				const landed = ledger
-					.instructions(this.workloadId)
+					.instructions(this.workloadId, { withReversed: true })
 					.find((i) => i.kind === "instruction" && i.body === item.body && i.created_by === this.laneId && i.created_at >= item.since);
 				ids.push(landed ? landed.id : ledger.recordInstruction({ by: this.laneId, workloadId: this.workloadId, body: item.body, author: "jo", channel: "direct" }));
 			} catch (err) {

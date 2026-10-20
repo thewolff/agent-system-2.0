@@ -15,6 +15,7 @@
  * - `KIMI_OUT_RULE`: Jo's standing rule that a review parked only because Kimi is out runs same-lab
  *   (PLAN wl-mv5xay6bjp0268); `builderRoles` orders a same-lab hand least-involved builder lab first.
  */
+import { joAuthority } from "../../ledger/src/authority";
 import { type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type RoutingRow } from "../../ledger/src/index";
 import { SURFACE_BY } from "../../surface/src/types";
 import { type HandSessionModels, handSessionModels } from "./hand-session";
@@ -373,19 +374,19 @@ export function spentGrants(entries: readonly Entry[]): Map<string, string> {
 }
 
 /**
- * The oldest unspent same-lab grant for `sliceId`: an `answer` instruction by `jo` to one of this
- * slice's `review-park:` questions whose body is exactly `same-lab`, not yet named by a
+ * The oldest unspent same-lab grant for `sliceId`: an `answer` instruction with Jo's authority (ledger/src/authority.ts
+ * joAuthority) to one of this slice's `review-park:` questions whose body is exactly `same-lab`, not yet named by a
  * `review-same-lab:` entry. `wait`, a withdrawal, or any other body grants nothing.
  */
 export function unspentGrant(
 	entries: readonly Entry[],
-	instructions: readonly Pick<InstructionRow, "id" | "kind" | "author" | "question_id" | "body">[],
+	instructions: readonly Pick<InstructionRow, "id" | "kind" | "author" | "created_by" | "question_id" | "body">[],
 	sliceId: string,
 ): string | null {
 	const parks = parkQuestions(entries, sliceId);
 	const spent = spentGrants(entries);
 	return (
-		instructions.find(i => i.kind === "answer" && i.author === "jo" && i.question_id !== null && parks.has(i.question_id) && i.body === "same-lab" && !spent.has(i.id))
+		instructions.find(i => i.kind === "answer" && joAuthority(i) && i.question_id !== null && parks.has(i.question_id) && i.body === "same-lab" && !spent.has(i.id))
 			?.id ?? null
 	);
 }

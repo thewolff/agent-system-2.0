@@ -49,7 +49,7 @@ describe("launch predicate matrix (§ 3 states)", () => {
 	for (const [name, w, entries, resolved, live, want] of rows) {
 		test(name, () => {
 			const c = control(entries, w.holder);
-			const v = launchable(w, c, null, resolved, NOW, live, 3);
+			const v = launchable(w, c, null, resolved, NOW, live, 3, new Set());
 			if (typeof want === "object" && want !== null && "cause" in want && (want as { cause: { kind: string; id?: string } }).cause.kind === "request") {
 				expect(v).toMatchObject({ launch: true, cause: { kind: "request" } });
 				expect((v as { cause: { id: string } }).cause.id).toMatch(/^e-\d+$/);
@@ -59,13 +59,13 @@ describe("launch predicate matrix (§ 3 states)", () => {
 	test("the request-consumed row consumes by the request entry's real id", () => {
 		const req = entry(SURFACE_BY, `launch-requested: by jo at ${NOW}`);
 		const c = control([launch("lane-m-1", "first"), req, launch("lane-m-2", `request ${req.id}`)]);
-		expect(launchable(workload(), c, null, [], NOW, 0, 3)).toEqual({ launch: false, reason: "died-not-relaunched" });
+		expect(launchable(workload(), c, null, [], NOW, 0, 3, new Set())).toEqual({ launch: false, reason: "died-not-relaunched" });
 	});
 });
 
 describe("awaiting close: the holder's done-because: stands (L1, the by-hand wasted launch)", () => {
 	const rows = (w: WorkloadRow, entries: EntryRow[], holders: string[] = []): ReserveRows => ({
-		workload: w, entries, questions: [], instructions: [], slices: [], holders, liveLanes: 0, cap: 3, now: NOW,
+		workload: w, entries, questions: [], instructions: [], slices: [], holders, provenance: [], liveLanes: 0, cap: 3, now: NOW,
 	});
 	const done = (by: string) => entry(by, "done-because: all five slices done");
 	test("a by-hand holder's receipt, no launch: history: the ledger's recorded holder makes it the holder's; nothing launches", () => {

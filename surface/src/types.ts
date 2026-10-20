@@ -115,6 +115,11 @@ export const TRAIN_TASK_FAILED_PREFIX = "train-task-failed:";
  * `priority-signal-failed:` and `rank-shown:`, written by whichever session ranks (the orchestrator, a lane, a hand).
  */
 export const RANK_BY = "as2-rank";
+/**
+ * The forgery check's machinery stamp (PLAN wl-mvfxw3c4zqfzls D3, D4; surface/src/forgery-hold.ts): the train tick's pass and the
+ * lane launcher's reserve write `forgery: hit …` rows as this, and the tick's `lane-stop: <lane> requested forgery-hold by forgery-check`.
+ */
+export const FORGERY_CHECK_BY = "forgery-check";
 
 /**
  * The orchestrator's standing workload: the one open workload that carries rows belonging to no

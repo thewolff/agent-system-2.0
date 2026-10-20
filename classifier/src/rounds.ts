@@ -7,6 +7,7 @@
  * import, no I/O: callers read the rows and hand them in; the classifier and the surface both
  * import it, so they cannot disagree on a count.
  */
+import { joAuthority } from "../../ledger/src/authority";
 import type { EntryRow, InstructionRow } from "../../ledger/src/index";
 import { JO_HOLDER } from "../../surface/src/launch";
 import { SURFACE_BY } from "../../surface/src/types";
@@ -498,7 +499,7 @@ export function effectiveRoundLimit(entries: readonly EntryInput[], instructions
 		if (end && end.slice === slice) extends_ = new Map();
 	}
 	const flip = instructions
-		.filter((i) => i.author === JO_HOLDER && i.created_by === SURFACE_BY && i.body.startsWith("stakes: "))
+		.filter((i) => joAuthority(i) && i.body.startsWith("stakes: "))
 		.reduce<string | null>((at, i) => (at === null || i.created_at > at ? i.created_at : at), null);
 	const workload = cur !== null && (flip === null || cur.at >= flip) ? cur.rounds : REVIEW_ROUND_DEFAULTS[stakes];
 	const extend = [...extends_.values()].reduce((a, b) => a + b, 0);

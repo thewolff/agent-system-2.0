@@ -68,11 +68,17 @@
 // after the answerable line of the target it names and carrying that target's number (numbering.ts's second pass), never
 // one of its own; a proposal whose target no longer waits has no target line, so it is not shown. Each recent
 // `channel-refused:` is one unnumbered line after the scratch lines (it takes no word).
+// Forgery (PLAN wl-mvfxw3c4zqfzls D4, D5; surface/src/forgery-hold.ts): first of all, one LOUD line per recorded forgery hit Jo has
+// answered neither way (`allUnansweredHits`): the row, its rule, what it led to (`consequences`: the `launch:` attempts whose cause
+// names it, the `train-board:` rows that cite it or boarded its workload after it) and the two words, `confirm <row id>` / `reverse
+// <row id>`; gone once Jo answers. After them, one LOUD line per reversed cancel withdrawal the schema will still apply
+// (`deferredCancels`): resolving the slice's other open question cancels the slice, so Jo re-cuts it. Neither line is numbered.
 import { type EntryRow, type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import { CHANNEL_REFUSED_SHOWN_HOURS, channelInForce, channelProposals, channelRefusals } from "./channel";
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { isCeilingQuestion, openPairOffer } from "./input";
 import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
+import { allUnansweredHits, consequences, deferredCancels, FORGERY_RULE_NAMES, forgeryWords } from "./forgery-hold";
 import { mainRedNotices, protectionEpisodes, type TaskWindow, TRAIN_ALERT_LADDER, trainAlertLevel, trainMembers, trainTaskWindows } from "./merge-train";
 import { questionSubject } from "./orchestrator-question";
 import { answerable } from "./numbering";
@@ -81,7 +87,7 @@ import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "
 import { parseTestRunFailed, testRuns } from "./test-run";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
 
-export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "train" | "pair" | "proposal" | "channel-refused";
+export type ErrorKind = "forgery" | "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "train" | "pair" | "proposal" | "channel-refused";
 
 /**
  * The open one of a pair of scratch control entries (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): the newest of `control`
@@ -401,7 +407,7 @@ function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: reado
 	};
 }
 
-/** Every line owed right now, in § B3 order (1–3), the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the train notices, the due rows, then the scratch lines, then the channel refusals; each channel proposal directly after its target. */
+/** Every line owed right now: the forgery lines first, then § B3 order (1–3), the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the train notices, the due rows, then the scratch lines, then the channel refusals; each channel proposal directly after its target. */
 export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger.inFlight(), opts: ErrorOptions = {}): ErrorLine[] {
 	const now = opts.now ?? ledger.now();
 	const holdHours = opts.holdHours ?? HOLD_HOURS;
@@ -520,7 +526,25 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			if (over) scratch.push({ kind: "scratch", workloadId: wl, rowId: over.id, line: `scratch of ${label} over its cap: ${over.rest} (advisory: nothing is refused; ${over.createdBy} was told)` });
 		}
 	}
-	const all = [...reserved, ...held, ...artifact, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch];
+	const forgery: ErrorLine[] = [];
+	for (const h of allUnansweredHits(ledger)) {
+		const led = consequences(ledger, h);
+		const where = h.on === h.workloadId ? "" : `, recorded on ${h.on} after the close`;
+		forgery.push({
+			kind: "forgery", workloadId: h.workloadId, rowId: h.rowId, state: `${h.entryId} ${led.length}`,
+			line: `LOUD: forgery check flagged ${h.rowId} on ${h.workloadId} (${h.rule}, ${FORGERY_RULE_NAMES[h.rule] ?? "unknown rule"}${where}): ` +
+				`${led.length > 0 ? `it led to ${led.join("; ")}` : "nothing cites it yet"}; ${h.workloadId} is held: no launch, no boarding, no close — ` +
+				`answer ${forgeryWords(h.rowId)}`,
+		});
+	}
+	for (const d of deferredCancels(ledger)) {
+		forgery.push({
+			kind: "forgery", workloadId: d.workloadId, rowId: d.rowId, state: `deferred-cancel ${d.questionIds.join(" ")}`,
+			line: `LOUD: reversed ${d.rowId} was a cancel the ledger still applies: resolving ${d.questionIds.join(" or ")} on ${d.sliceId} cancels ` +
+				`${d.sliceId} (ledger/schema.sql questions_resolution_settles_slice); re-cut the slice to keep its work`,
+		});
+	}
+	const all = [...forgery, ...reserved, ...held, ...artifact, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch];
 	const channel = channelInForce(ledger);
 	if (!channel) return all;
 	const proposals = channelProposals(ledger, channel);

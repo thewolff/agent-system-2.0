@@ -5,9 +5,8 @@
  * classifier reads the entry and refuses a further review round on a stopped loop. No OMP import,
  * no I/O: the surface writes the bodies, the classifier reads them back through `reviewStopOn`.
  */
+import { joAuthority } from "../../ledger/src/authority";
 import type { EntryRow, InstructionRow } from "../../ledger/src/index";
-import { JO_HOLDER } from "../../surface/src/launch";
-import { SURFACE_BY } from "../../surface/src/types";
 
 /** What a stop names: a whole workload (`wl-…`) or one slice's loop (`sl-…`). */
 const TARGET = /^(?:wl|sl)-\S+$/;
@@ -45,7 +44,7 @@ export function reviewStopOn(
 		if (e.kind !== "assumption") continue;
 		const s = parseReviewStop(e.body);
 		if (!s || (s.target !== workloadId && s.target !== sliceId)) continue;
-		const i = instructions.find((x) => x.id === s.by && x.author === JO_HOLDER && x.created_by === SURFACE_BY);
+		const i = instructions.find((x) => x.id === s.by && joAuthority(x));
 		if (i && i.body.trim() === stopReviewsInstructionBody(s.target)) return s.by;
 	}
 	return null;

@@ -86,7 +86,7 @@ function passwdHome(): string {
 	return home;
 }
 
-/** Every live ledger root under test (PLAN wl-mv4yf3zgf9lm2o § 2 item 4), as written. */
+/** Every live ledger root (PLAN wl-mv4yf3zgf9lm2o § 2 item 4), as written: the test guard's, and the Jo-only boundary's outside test too (PLAN wl-mv654hoqwpfhmo § 6.3 item 1). */
 function liveRoots(): string[] {
 	const env = process.env;
 	const roots = [join(passwdHome(), ".agent-system-2")];
@@ -121,6 +121,16 @@ function comparablePath(path: string): string {
 	return process.platform === "darwin" ? p.toLowerCase() : p;
 }
 
+/** The live root `path` (canonicalised) is inside (each root canonicalised), or null. Throws when the passwd home cannot be looked up. */
+function liveRootOf(path: string): string | null {
+	const real = comparablePath(path);
+	for (const root of liveRoots()) {
+		const canon = comparablePath(root);
+		if (real === canon || real.startsWith(canon + sep)) return root;
+	}
+	return null;
+}
+
 /**
  * Under test, throws LiveLedgerUnderTestError when `path` (canonicalised) is inside a live ledger
  * root (canonicalised). Outside a test process it returns at once: no lookup, no spawn.
@@ -128,11 +138,18 @@ function comparablePath(path: string): string {
 export function assertNotLiveLedgerUnderTest(path: string): void {
 	// Active in a `bun test` process (NODE_ENV=test) or one the preload isolated.
 	if (process.env.NODE_ENV !== "test" && !process.env[TEST_ISOLATED_ENV]) return;
-	const real = comparablePath(path);
-	for (const root of liveRoots()) {
-		const canon = comparablePath(root);
-		if (real === canon || real.startsWith(canon + sep)) throw new LiveLedgerUnderTestError(resolve(path), root);
-	}
+	const root = liveRootOf(path);
+	if (root !== null) throw new LiveLedgerUnderTestError(resolve(path), root);
+}
+
+/**
+ * Is `path` inside a live ledger root, in a test process or not? The Jo-only boundary
+ * (ledger/src/authority.ts) puts its triggers on an agent's connection to such a file. In a test process the
+ * preload's isolation applies (its temp HOME and ledger are not live); elsewhere HOME's and
+ * AGENT_SYSTEM_LEDGER_DB's roots are. Throws when the passwd home cannot be looked up.
+ */
+export function inLiveRoot(path: string): boolean {
+	return liveRootOf(path) !== null;
 }
 
 /**
