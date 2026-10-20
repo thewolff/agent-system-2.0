@@ -1,8 +1,10 @@
 // The per-workload ceiling's pure half (DESIGN-workload-ceiling.md § 2, § 4): the stakes-sized
 // ceiling, the `ceiling:` and `spend:` control bodies, the effective ceiling with the raise-needs-Jo
 // rule, the spend scan over the workload's session files, wall time from the lane lifecycle
-// entries, the threshold check and the question Jo answers. Nothing here opens the ledger: callers
-// read the rows and hand them in, as with launch.ts. `scanSpend` reads session files and nothing else.
+// entries, the threshold check and the notices Jo is told (PLAN wl-mvfkv7llkp7nk0 § 4), and a by-hand (paired) lane's
+// spend report (§ 4.1), which never stops it. Nothing here
+// opens the ledger: callers read the rows and hand them in, as with launch.ts. `scanSpend` reads
+// session files and nothing else.
 //
 // Units (§ 1 C, § 2 item 3): dollars are nominal list price as OMP computes it
 // (`usage.cost.total` on each assistant message); tokens are counted beside them and never
@@ -10,7 +12,7 @@
 import { closeSync, type Dirent, fstatSync, openSync, readdirSync, readSync } from "node:fs";
 import { join } from "node:path";
 import type { InstructionRow, RoutingKind, Stakes } from "../../ledger/src/index";
-import { type ControlEntry, JO_HOLDER } from "./launch";
+import { attempts, type ControlEntry, heldLive, JO_HOLDER } from "./launch";
 import { SURFACE_BY } from "./types";
 
 export interface Ceiling {
@@ -54,6 +56,9 @@ export function ceilingBody(c: Ceiling, source: string, byInstruction?: string):
 	return `ceiling: usd ${c.usd} wall ${c.wallMin} source ${source.replace(/\s+/g, " ").trim()}${byInstruction ? ` by ${byInstruction}` : ""}`;
 }
 
+/** The `source` of the `ceiling:` entry a one-block raise writes: Jo's `extend <wl>` word, and before it the extend answer to the runner's ceiling question. */
+export const EXTEND_SOURCE = "extend one block";
+
 const CEILING_REST = /^usd\s+(\S+)\s+wall\s+(\S+)\s+source\s+(.+?)(?:\s+by\s+(in-\S+))?$/;
 
 /** A `ceiling:` entry's `rest` (the body after the prefix), parsed; null when either half is not a positive number or the source is missing. */
@@ -68,9 +73,10 @@ export function parseCeiling(rest: string): CeilingEntry | null {
 
 /**
  * The Jo instructions the surface writes to license a raise (surface/src/input.ts): the stakes word
- * (`stakes: <s>`), the `ceiling` word (`ceiling: <usd> <hours>`), and the *extend* answer to the
- * runner's ceiling question (an `answer` whose body is `extend`). Any other surface-written
- * author-jo row — an `orchestrator_record_instruction` row, whose text the model composes — is not one.
+ * (`stakes: <s>`), the `ceiling` and `extend` words (both `ceiling: <usd> <hours>`), and the *extend*
+ * answer to the runner's former ceiling question (an `answer` whose body is `extend`), which raised
+ * ceilings written before PLAN wl-mvfkv7llkp7nk0 § 4 still name. Any other surface-written author-jo
+ * row — an `orchestrator_record_instruction` row, whose text the model composes — is not one.
  */
 export function isRaiseInstruction(i: Pick<InstructionRow, "kind" | "body">): boolean {
 	return i.body.startsWith("ceiling: ") || i.body.startsWith("stakes: ") || (i.kind === "answer" && i.body === "extend");
@@ -255,21 +261,94 @@ export function ceilingStopped(control: readonly ControlEntry[], instructions: r
 	return crossed(spend, ceiling) === 100 ? { spend, ceiling } : null;
 }
 
-// ---- the question ------------------------------------------------------------------------------
+// ---- the notices -------------------------------------------------------------------------------
 
-/** The ceiling question's answers (§ 2 items 4, 5); stop is the default. */
-export const CEILING_OPTIONS = ["stop", "extend", "split"] as const;
-export type CeilingOption = (typeof CEILING_OPTIONS)[number];
+/** The meter's two notice levels (PLAN wl-mvfkv7llkp7nk0 § 4): 80 % of either half, and the stop at 100 %. */
+export type CeilingNoticeLevel = 80 | 100;
 
-/** The body of the question raised at 80 % (§ 2 item 4): where the spend stands, stop as the default, and what each answer does. */
-export function ceilingQuestionBody(wl: string, s: Spend, c: Ceiling, stakes: Stakes): string {
+/** A ceiling value as the meter keys it: an extend, a `ceiling` word or a lowering is a new value, which may notify again. */
+export const ceilingKey = (c: Ceiling): string => `usd ${c.usd} wall ${c.wallMin}`;
+
+/**
+ * The text of the runner's ceiling notice (surface/src/notice.ts adds `notice: `). Its first line names the level and
+ * the ceiling value it was sent for (`parseCeilingNotice` reads them back, so the runner sends one per level per value),
+ * then where the spend stands; the second line says what happens and Jo's words: `extend <wl>` (one more block) and
+ * `ceiling <usd> [<hours>] <wl>`, and at 100 % `user-driven <wl>` too. Nothing is asked and nothing extends on its own.
+ */
+export function ceilingNoticeBody(level: CeilingNoticeLevel, wl: string, s: Spend, c: Ceiling, stakes: Stakes): string {
 	const pct = (a: number, b: number) => Math.floor((a / b) * 100);
+	const raise = `\`extend ${wl}\` (one more block of its own size) or \`ceiling <usd> [<hours>] ${wl}\``;
 	return [
-		`${wl} has used $${s.usd.toFixed(2)} of its $${c.usd} ceiling (${pct(s.usd, c.usd)} %) and ${Math.round(s.wallMin)} of ${c.wallMin} minutes (${pct(s.wallMin, c.wallMin)} %), ${stakes} stakes; ${s.tokens} tokens.`,
-		`stop (the default): the lane keeps working and is stopped at the ceiling; nothing relaunches.`,
-		`extend: the ceiling grows by one more block of this workload's own size and the lane goes on (a stopped lane relaunches); for an exact figure say \`ceiling <usd> [<hours>] ${wl}\` instead.`,
-		`split: the lane is stopped at the ceiling like stop, and the remaining work is split into a new workload; nothing relaunches here.`,
+		`ceiling ${level} % at ${ceilingKey(c)} on ${wl}: $${s.usd.toFixed(2)} of $${c.usd} (${pct(s.usd, c.usd)} %) and ${Math.round(s.wallMin)} of ${c.wallMin} minutes (${pct(s.wallMin, c.wallMin)} %), ${stakes} stakes; ${Math.round(s.tokens)} tokens.`,
+		level === 80
+			? `The lane goes on and is stopped at 100 %. For more room: ${raise}.`
+			: `The lane is stopped at the ceiling and nothing relaunches on its own. To go on: ${raise}; either relaunches it. To drive it yourself: \`user-driven ${wl}\`.`,
 	].join("\n");
+}
+
+const CEILING_NOTICE = /^notice: ceiling (80|100) % at (usd \S+ wall \S+) on (\S+):/;
+
+/** A ceiling notice's message body (with its `notice: ` prefix) read back: its level, ceiling value (`ceilingKey`) and workload; null for any other body. */
+export function parseCeilingNotice(body: string): { level: CeilingNoticeLevel; key: string; workloadId: string } | null {
+	const m = CEILING_NOTICE.exec(body);
+	return m ? { level: Number(m[1]) as CeilingNoticeLevel, key: m[2]!, workloadId: m[3]! } : null;
+}
+
+// ---- paired: a by-hand lane (PLAN wl-mvfkv7llkp7nk0 § 4.1, Jo's ruling in-mvfo7nphl9xn28) --------------------------
+
+/** A by-hand lane: its `launch:` entry says `cause interactive` (`as2 lane <wl>`, surface/scripts/lane.ts cmdInteractive). */
+export function isByHandLane(control: readonly ControlEntry[], laneId: string): boolean {
+	return attempts(control).some((a) => a.laneId === laneId && a.cause?.kind === "interactive");
+}
+
+/**
+ * A paired workload: its holder is a live by-hand lane (§ 4.1). A user-driven workload with no by-hand lane running is
+ * not paired by itself: nothing spends and nobody is in a pane to tell.
+ */
+export function isPaired(w: { holder: string | null; holder_lease_until: string | null }, control: readonly ControlEntry[], now: string): boolean {
+	return w.holder !== null && heldLive(w, now) && isByHandLane(control, w.holder);
+}
+
+/** The original ceiling (§ 4.1): the workload's first valid `ceiling:` entry; with none, the effective ceiling (the stakes size). */
+export function originalCeiling(control: readonly ControlEntry[], instructions: readonly InstructionRow[], stakes: Stakes): Ceiling {
+	for (const c of control) {
+		if (c.prefix !== "ceiling") continue;
+		const p = parseCeiling(c.rest);
+		if (p !== null) return { usd: p.usd, wallMin: p.wallMin };
+	}
+	return effectiveCeiling(control, instructions, stakes);
+}
+
+/** The paired pane's memory in one lane session: the 25 % marks already accounted for, null before the first measure. */
+export interface PairedState {
+	shown: number | null;
+}
+
+/**
+ * One measure of a by-hand lane's spend, pure (§ 4.1 (b)): one pane line for each 25 % mark of the original ceiling's
+ * dollars reached since the last measure (37.50, 75, 112.50, 150, 187.50 … for $150), past 100 % without end. The
+ * session's first measure only records where the spend stands: marks reached before this lane started are not "further".
+ */
+export function pairedSpendStep(state: PairedState, wl: string, s: Spend, original: Ceiling): { state: PairedState; lines: string[] } {
+	// The 25 % marks of the original dollars reached; ×4 against the dollars keeps an exact mark exact.
+	const at = Math.floor((s.usd * 4) / original.usd);
+	if (state.shown === null) return { state: { shown: at }, lines: [] };
+	if (at <= state.shown) return { state, lines: [] };
+	const lines: string[] = [];
+	for (let k = state.shown + 1; k <= at; k++) {
+		lines.push(`spend on ${wl}: $${s.usd.toFixed(2)}, past $${((k * original.usd) / 4).toFixed(2)} (${k * 25} % of the original $${original.usd} ceiling), ${Math.round(s.wallMin)} min; paired: not stopped at the ceiling`);
+	}
+	return { state: { shown: at }, lines };
+}
+
+/** The context message a by-hand lane gets at every turn start (§ 4.1 (a)), against the ceiling in force. */
+export function pairedSpendMessage(s: Spend, c: Ceiling): string {
+	return `spend: $${s.usd.toFixed(2)} of $${c.usd} ceiling (${Math.floor((s.usd / c.usd) * 100)} %), ${Math.round(s.wallMin)} min; paired: not stopped at the ceiling`;
+}
+
+/** The by-hand first prompt's ceiling line (§ 4.1): the ceiling in force, the spend so far, and that the lane is never stopped at it. */
+export function pairedCeilingPromptLine(c: Ceiling, original: Ceiling, s: Spend): string {
+	return `ceiling: $${c.usd} / ${c.wallMin} min for the workload; spent so far $${s.usd.toFixed(2)} / ${Math.round(s.wallMin)} min (${Math.round(s.tokens)} tokens); you are paired with Jo; you are never stopped at the ceiling; the extension tells Jo the spend in the pane at every 25 % of the original ceiling ($${original.usd}, so every $${(original.usd / 4).toFixed(2)}).`;
 }
 
 // ---- helpers -----------------------------------------------------------------------------------

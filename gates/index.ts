@@ -16,10 +16,10 @@
 //   ledger, and it reads `input.command` as typed, which every handler before the fence sees.
 // - session_stop runs row 3's receipt flags before row 7 or row 1 can block the stop.
 // - before_agent_start sets the mode before row 7 renders its wake message.
-// - The M4b OS fence (src/fence.ts) registers last: every handler gets the original event and the
-//   last non-block result is what runs (runner.ts emitToolCall), so it wraps only a bash call every
-//   row allowed, its revision never reaches a row (row 18 reads the typed command), and its
-//   tool_result cleanup runs after rows 3 and 8 read the original command.
+// - The M4b OS fence (src/fence.ts) wraps after every rejecting gate. Row 6's admission handler
+//   registers after the fence, reads originalInput, and never revises the fence's result. Thus a
+//   later refusal cannot orphan an admission or consume approval for a call that never runs.
+//   tool_result cleanup still runs after rows 3 and 8 read the original command.
 import openLinks from "./extensions/open-links";
 import { linkedApi } from "./src/links";
 import askPolicyRow from "./extensions/r14-ask-policy";
@@ -43,6 +43,9 @@ import { type FenceSettings, fenceSettingsFrom, registerFence, type ShellStartCh
 import { checkHostVersion, type HostModules } from "./src/host";
 import type { Ctx, GatesAPI } from "./src/session";
 import { captureGateLoadEnviron, type ShellStart, type ShellStartHost, shellStart } from "./src/shell-start";
+import type { Ledger } from "../ledger/src/index";
+import type { DeployFacts } from "./src/deploy-risk";
+import type { MergeView } from "./src/rows/r06-reserved";
 
 // E0 (PLAN.md § 2.2 item 5, wl-mv5lrh0drbg0zk): this process's C environ when the gates are first
 // evaluated, before any bash call can build a Shell. A call whose environ differs is refused.
@@ -131,6 +134,7 @@ export default function p11Gates(
 	fenceSettings: (ctx: Ctx) => Promise<FenceSettings> = hostFenceSettings,
 	startCheck: ShellStartCheck = hostShellStart,
 	cleanShell: CleanShellCheck | undefined = fenceSettings === hostFenceSettings ? hostCleanShell : undefined,
+	deploy: { facts?: (ledger: Ledger) => DeployFacts; mergeView?: MergeView; timeoutMs?: number } = {},
 ): void {
 	openLinks(pi);
 	const ledgerPi = linkedApi(pi, undefined, undefined, "ledger");
@@ -146,12 +150,13 @@ export default function p11Gates(
 	questionRow(pi, env);
 	spawnRateRow(pi, env);
 	rawLedgerRow(pi, env);
-	reservedRow(pi, env);
+	const registerAdmission = reservedRow(pi, env, deploy.facts, deploy.mergeView, { deferAdmission: true, timeoutMs: deploy.timeoutMs });
 	protectedEditRow(pi, env);
 	pushRebaseRow(pi, env);
 	turnShapeRow(pi, env);
 	joInstructionRow(pi, env);
 	registerFence(pi, env, fenceSettings, startCheck, cleanShell);
+	registerAdmission();
 	// The notice reads the host; a test handing in its own reader has no host to read.
 	if (fenceSettings === hostFenceSettings) hostVersionNotice(pi);
 }

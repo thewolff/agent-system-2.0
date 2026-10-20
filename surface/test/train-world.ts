@@ -283,10 +283,12 @@ export function boardWorld() {
 	run();
 	c.plusHours(0.01);
 	let seq = 0;
-	const landing = (pr: number, o: { stakes?: "normal" | "production" } = {}): string => {
+	/** `o.entries`: assumption entries written on W right after its `repo:`, while it is open (a `plan:` row, say). */
+	const landing = (pr: number, o: { stakes?: "normal" | "production"; entries?: { by: string; body: string }[] } = {}): string => {
 		const holder = `lane-l-${++seq}`;
 		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: `Fix the header (#${pr})`, stakes: o.stakes ?? "normal", mode: "autonomous" });
 		recordRepo(ledger, wl, repo);
+		for (const e of o.entries ?? []) ledger.recordEntry({ by: e.by, workloadId: wl, kind: "assumption", body: e.body });
 		expect(ledger.claimWorkload(wl, { by: LANE_STARTER_BY, holder, leaseMs: 600_000 }).won).toBe(true);
 		const sl = ledger.addSlice({ by: holder, workloadId: wl, task: "change", doneCondition: "tests pass", inputs: "src" });
 		const runId = makeRunId(Date.parse(c.now()) + seq, "abcd");

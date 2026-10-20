@@ -13,7 +13,7 @@ import type { Subprocess } from "bun";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { Ledger, LiveLedgerUnderTestError, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { renderExecWrapper } from "../src/as2test";
 import { recordRepo } from "../src/decision-log";
@@ -90,8 +90,12 @@ test("hangs", async () => {
 const EXITS = `import { test } from "bun:test";
 test("exits before the report", () => { process.exit(0); });
 `;
+// A failing security test (surface/src/test-run.ts SECURITY_TEST_PATHS): a gate test the PR breaks (fix round 1, F4).
+const GATE_RED = `import { test } from "bun:test";
+test("refuses a forged approve", () => { throw new Error("the gate let it through"); });
+`;
 
-const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7 } as const;
+const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7, gate: 8 } as const;
 type PrName = keyof typeof PR;
 const PR_FILES: Record<PrName, Record<string, string>> = {
 	green: { "a.test.ts": PASS("a") },
@@ -102,6 +106,7 @@ const PR_FILES: Record<PrName, Record<string, string>> = {
 	exit: { "exits.test.ts": EXITS },
 	// git lists ` a.test.ts` first (a space sorts before `a`); trimmed, it would name its sibling.
 	space: { " a.test.ts": PASS("space a"), "a.test.ts": PASS("a") },
+	gate: { "gates/test/gate.test.ts": GATE_RED },
 };
 
 interface Fixture {
@@ -128,7 +133,10 @@ beforeAll(() => {
 	const head = {} as Record<PrName, string>;
 	for (const name of Object.keys(PR) as PrName[]) {
 		g(work, "checkout", "-q", "--detach", main);
-		for (const [f, text] of Object.entries(PR_FILES[name])) writeFileSync(join(work, f), text);
+		for (const [f, text] of Object.entries(PR_FILES[name])) {
+			mkdirSync(dirname(join(work, f)), { recursive: true });
+			writeFileSync(join(work, f), text);
+		}
 		g(work, "add", "-A");
 		g(work, "commit", "-q", "-m", `pr ${name}`);
 		head[name] = g(work, "rev-parse", "HEAD");
@@ -844,6 +852,21 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(heldMessages(w, wl)).toEqual([]);
 	});
 
+	test("fix round 1 (F4): a run failing a gates/test/ test while a lane holds the workload under a live lease sends exactly one security-red: and no test-run-failed:", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		w.ledger.claimWorkload(wl, { by: LANE, holder: LANE, leaseMs: 600_000 });
+		expect(w.ledger.liveLaneHolders().some((h) => h.workloadId === wl)).toBe(true);
+		const runId = request(w, wl, slice, PR.gate, fx.head.gate);
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run.verdict).toBe("red");
+		expect(run.failures.map((f) => [f.part, f.name])).toEqual([["full", "gates/test/gate.test.ts > refuses a forged approve"], ["./gates/test/gate.test.ts", "gates/test/gate.test.ts > refuses a forged approve"]]);
+		expect(heldMessages(w, wl)).toEqual([{
+			body: `security-red: ${wl} ${slice} ${runId} ${fx.head.gate} 2 gates/test/gate.test.ts > refuses a forged approve`, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, state: "held",
+		}]);
+	});
+
 	// PLAN wl-mv8s8srodefytc rev 17.1 D2: every PR's run, train or not, posts `as2/full-suite` on exactly its sha; branch protection reads it.
 	test("the as2/full-suite status: only a terminal state on the sha the fetch confirmed (success, failure, error), none for stale; a failed post is logged and the verdict stands", async () => {
 		const w = world();
@@ -1077,14 +1100,17 @@ test("passes alone", () => { if (me > 1) throw new Error("the other file of the 
 const TOUCHED = "// touched by the PR\n";
 
 /**
- * The world's GitHub with a red main: main gains broken.test.ts (one failing test) and the ALONE pair, then each PR is one
- * commit on that main at refs/pull/<N>/head, its files written over main's.
+ * The world's GitHub with a red main: main gains broken.test.ts (one failing test), the ALONE pair and `mainFiles`, then each PR
+ * is one commit on that main at refs/pull/<N>/head, its files written over main's.
  */
-function redMain(w: World, prs: Record<number, Record<string, string>>): { main: string; head: Record<number, string> } {
+function redMain(w: World, prs: Record<number, Record<string, string>>, mainFiles: Record<string, string> = {}): { main: string; head: Record<number, string> } {
 	const work = join(w.root, "red-main");
 	g(w.root, "clone", "-q", w.origin, work);
-	const files: Record<string, string> = { "broken.test.ts": BROKEN, "alone_a.test.ts": ALONE, "alone_b.test.ts": ALONE };
-	for (const [f, text] of Object.entries(files)) writeFileSync(join(work, f), text);
+	const files: Record<string, string> = { "broken.test.ts": BROKEN, "alone_a.test.ts": ALONE, "alone_b.test.ts": ALONE, ...mainFiles };
+	for (const [f, text] of Object.entries(files)) {
+		mkdirSync(dirname(join(work, f)), { recursive: true });
+		writeFileSync(join(work, f), text);
+	}
 	g(work, "add", "-A");
 	g(work, "commit", "-q", "-m", "main goes red");
 	const main = g(work, "rev-parse", "HEAD");
@@ -1145,6 +1171,22 @@ describe("red main: each failing part rerun on base (PLAN wl-mv8s8srodefytc rev 
 		expect(subsOf(w, second)).not.toContain("base-full");
 		expect(cached(w, r.main, "./broken.test.ts")).toBe(true);
 		expect(statusPosts(w)).toEqual([`success ${r.head[21]}`, `success ${r.head[22]}`]);
+	});
+
+	test("fix round 1 (F4): a gates/test/ test that fails on base too is red-main, and still sends exactly one security-red: (no test-run-failed:)", async () => {
+		const w = world();
+		const gate = "gates/test/gate.test.ts";
+		const r = redMain(w, { 23: { [gate]: GATE_RED + TOUCHED } }, { [gate]: GATE_RED });
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, 23, r.head[23]!);
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run).toMatchObject({ verdict: "red-main", base: r.main });
+		const security = run.failures.filter((f) => f.name.startsWith(`${gate} > `));
+		expect(security.map((f) => f.part)).toEqual(["full", `./${gate}`]);
+		expect(heldMessages(w, wl)).toEqual([{
+			body: `security-red: ${wl} ${slice} ${runId} ${r.head[23]} 2 ${gate} > refuses a forged approve`, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, state: "held",
+		}]);
 	});
 
 	test("one failure base does not have gives red; a base part that errored gives red and is not cached; neither posts success", async () => {

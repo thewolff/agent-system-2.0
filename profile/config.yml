@@ -345,3 +345,19 @@ jevRank:
 channel:
   senders:
     - { id: plumb, transport: omp-mailbox, authority: notes }
+
+# ── Routine deploys (SPEC-2.0.md § A4, Amended 2026-10-20; docs/deploy-risk.md; gates/src/deploy-risk.ts) ──
+# A lane's deploy is routine only for a target declared here and accepted by Jo's `deploy-policy <sha12>`
+# word, which hashes this section. No targets ship: every deploy stays reserved until Jo declares one and
+# accepts the hash; any edit to the section voids the acceptance. `deploy-policy off` turns it off.
+# Thresholds and window hours are defaults no source gives numbers for (docs/deploy-risk.md). A target is
+# { name, repo, command (gh workflow run <file> --ref <default branch> -R <owner/repo>, plus fixed -f pairs),
+#   workflowBlob, deployJob, requiredChecks: [{ name, app }], rollback, health: { url, status },
+#   migrations: [], sensitive: [] }. Reversal: `deploy-policy off`, or delete the block.
+deploy:
+  window: { tz: America/Los_Angeles, mon-thu: "09:00-16:00", fri: "09:00-12:00" }   # D1: outside it a deploy waits for Jo's window
+  lines: { warn: 400, escalate: 1500 }    # W3 above warn, E9 above escalate (additions + deletions)
+  dirs: { warn: 5 }                       # W4: top-level directories touched
+  order: []                               # groups of target names, each deployed before the next (O1)
+  mergeTriggered: []                      # repos whose merge to the default branch deploys; added to the code constant (M1)
+  targets: []

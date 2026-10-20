@@ -19,8 +19,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CLASSIFIER_BY, Ledger } from "../../ledger/src/index";
-import { CEILING_OPTIONS } from "../../surface/src/ceiling";
-import { raiseCeilingQuestion } from "../../surface/scripts/lane";
+import { pairOffer, readPairSuggestConfig } from "../../surface/src/pair-suggest";
 import { askChoices, askJudgment, JEV_USD_PER_INPUT_TOKEN, type JudgmentQuestions } from "../src/judge-ask";
 import { tierTableFromConfig } from "../src/tier-table";
 import { extensionHost, fakeRegistry } from "./helpers";
@@ -305,15 +304,13 @@ const BRIEF = "Restyle the settings modal: match the new token scale and spacing
 const SUCCESS = "pair-signal: taste yes 0.91 ambiguous no 0.85 judge typesafe/jev-1.13.0 tokens unknown cost 0.0001";
 let seq = 0;
 
-/** A fresh ledger with one autonomous normal-stakes workload (a unique id: the attempt map is per workload) and one done slice. */
+/** A fresh ledger with one autonomous normal-stakes workload (a unique id: the attempt map is per workload). */
 function workload(): { ledger: Ledger; wl: string } {
 	const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "judge-ask-"));
 	dirs.push(dir);
 	const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backup: false });
 	const wl = `wl-jask${++seq}${Date.now().toString(36)}`;
 	ledger.openWorkload({ id: wl, brief: BRIEF, stakes: "normal", mode: "autonomous", by: "orch-test" });
-	const sl = ledger.addSlice({ by: "lane-test", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
-	ledger.completeSlice(sl, { by: "lane-test", artifact: "bun test → exit 0" });
 	return { ledger, wl };
 }
 
@@ -338,13 +335,8 @@ function host(ledger: Ledger, wl: string, judge: { judge(req: { state: string })
 
 const pairEntries = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => /^pair-signal(-failed)?:/.test(e.body)).map((e) => [e.created_by, e.body]);
 
-function ceilingRaise(ledger: Ledger, wl: string): { options: string[]; offers: number } {
-	const { questionId } = raiseCeilingQuestion(ledger, { workloadId: wl, laneId: "lane-test", spend: { usd: 40, tokens: 1000, wallMin: 30 }, ceiling: { usd: 50, wallMin: 360 }, stakes: "normal" });
-	return {
-		options: JSON.parse(ledger.question(questionId)!.options) as string[],
-		offers: ledger.entries(wl).filter((e) => e.body.startsWith(`pair-offer: ${questionId} `)).length,
-	};
-}
+/** The pair offer the round-limit raise would make now (classifier/extension.ts reads it the same way), with no stalled count: the signals, or null. */
+const raiseOffer = (ledger: Ledger, wl: string) => pairOffer(ledger, wl, { config: readPairSuggestConfig() });
 
 describe("the background pair-signal attempt (D4)", () => {
 	test("switch off: no judge call on any event", async () => {
@@ -437,7 +429,7 @@ describe("the background pair-signal attempt (D4)", () => {
 		}
 	});
 
-	test("switched on mid-session: the next tool result writes pair-signal:, and the next ceiling raise offers pair on E alone", async () => {
+	test("switched on mid-session: the next tool result writes pair-signal:, and the next round-limit raise offers pair on E alone", async () => {
 		pairSuggest("off");
 		const { ledger, wl } = workload();
 		const j = pairJudge(async () => reply(GOOD, 0.0001));
@@ -449,13 +441,10 @@ describe("the background pair-signal attempt (D4)", () => {
 		h.otherToolResult("read", {});
 		await flush();
 		expect(pairEntries(ledger, wl)).toEqual([[CLASSIFIER_BY, SUCCESS]]);
-		const raised = ceilingRaise(ledger, wl);
-		expect(raised).toEqual({ options: [...CEILING_OPTIONS, "pair"], offers: 1 });
-		const offer = ledger.entries(wl).find((e) => e.body.startsWith("pair-offer:"))!.body;
-		expect(offer).toMatch(/ signals e$/i);
+		expect(raiseOffer(ledger, wl)).toEqual({ signals: ["e"] });
 	});
 
-	test("a raise while the attempt is pending offers nothing and writes nothing that blocks the later raise, which offers on E", async () => {
+	test("a raise while the attempt is pending offers nothing, and the later raise offers on E", async () => {
 		pairSuggest("all");
 		const { ledger, wl } = workload();
 		const d = Promise.withResolvers<unknown>();
@@ -464,11 +453,11 @@ describe("the background pair-signal attempt (D4)", () => {
 		await h.turnEnd();
 		await flush();
 		expect(j.calls.length).toBe(1);
-		expect(ceilingRaise(ledger, wl)).toEqual({ options: [...CEILING_OPTIONS], offers: 0 });
+		expect(raiseOffer(ledger, wl)).toBeNull();
 		d.resolve(reply(GOOD, 0.0001));
 		await flush();
 		expect(pairEntries(ledger, wl)).toEqual([[CLASSIFIER_BY, SUCCESS]]);
-		expect(ceilingRaise(ledger, wl)).toEqual({ options: [...CEILING_OPTIONS, "pair"], offers: 1 });
+		expect(raiseOffer(ledger, wl)).toEqual({ signals: ["e"] });
 	});
 
 	test("the 0.70 cut is on the judge's own confidence: taste yes 0.69996 is written unrounded and offers nothing; 0.70 offers pair on E", async () => {
@@ -479,17 +468,17 @@ describe("the background pair-signal attempt (D4)", () => {
 			const h = host(ledger, wl, pairJudge(async () => reply(answers, 0.0001)).judge);
 			await h.turnEnd();
 			await flush();
-			return { signal: pairEntries(ledger, wl).map(([, body]) => body), raised: ceilingRaise(ledger, wl) };
+			return { signal: pairEntries(ledger, wl).map(([, body]) => body), raised: raiseOffer(ledger, wl) };
 		};
 		const below = await run(0.69996);
-		expect(below.raised).toEqual({ options: [...CEILING_OPTIONS], offers: 0 });
+		expect(below.raised).toBeNull();
 		expect(below.signal).toEqual(["pair-signal: taste yes 0.69996 ambiguous no 0.85 judge typesafe/jev-1.13.0 tokens unknown cost 0.0001"]);
 		const at = await run(0.7);
 		expect(at.signal).toEqual(["pair-signal: taste yes 0.7 ambiguous no 0.85 judge typesafe/jev-1.13.0 tokens unknown cost 0.0001"]);
-		expect(at.raised).toEqual({ options: [...CEILING_OPTIONS, "pair"], offers: 1 });
+		expect(at.raised).toEqual({ signals: ["e"] });
 		const whole = await run(1);
 		expect(whole.signal).toEqual(["pair-signal: taste yes 1 ambiguous no 0.85 judge typesafe/jev-1.13.0 tokens unknown cost 0.0001"]);
-		expect(whole.raised).toEqual({ options: [...CEILING_OPTIONS, "pair"], offers: 1 });
+		expect(whole.raised).toEqual({ signals: ["e"] });
 	});
 
 	// Review round 2: a lane's own record that the switch covered it, independent of the per-workload jev attempt.

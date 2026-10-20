@@ -458,6 +458,14 @@ status=$?
 set -e
 [ "$status" -eq 0 ] || fail "profile render refused (tracing switch carry exited $status)" 2
 
+# Declared deploy targets/order must survive reinstall, including while a deploy is unsettled.
+# Carry validates the section and verifies its canonical hash and every other rendered section.
+set +e
+RENDERED="$(printf '%s\n' "$RENDERED" | bun "$REPO/surface/scripts/deploy-config.ts" carry "$PROFILE_DIR/config.yml")"
+status=$?
+set -e
+[ "$status" -eq 0 ] || fail "profile render refused (deploy policy carry exited $status)" 2
+
 # The providers this profile routes to, for the login line printed after a successful install
 # (section 7): every model named in the rendered task.agentModelOverrides and modelRoles, in that
 # order, so the line follows the tier table rather than a second copy of it. Read here, before

@@ -45,6 +45,9 @@
 #                              set jevRank in the installed profile's config.yml (D7): show (launch
 #                              order unchanged), order, or parallel; prints the old and new value,
 #                              never starts omp: bun surface/scripts/rank-mode.ts
+#          as2 deploy settle <dp-id>
+#                              settle a deploy from its GitHub run and health evidence; sends one
+#                              notice, never dispatches a deploy or executes a rollback
 #          as2 lane <wl>       run workload <wl> by hand as a lane in this terminal (user-driven mode;
 #                              DESIGN-lane-launcher.md decision 14): bun surface/scripts/lane.ts interactive <wl>
 #          as2 lane stop|cleanup|log <wl>
@@ -312,6 +315,10 @@ case "${1-}" in
 	pair-suggest)
 		shift
 		pair_suggest "$@"
+		;;
+	deploy)
+		shift
+		exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/deploy.ts" "$@"
 		;;
 	rank)
 		shift

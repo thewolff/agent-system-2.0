@@ -57,7 +57,7 @@ export interface UnsettledHand {
 	job: string;
 }
 
-/** The lane's own slices, the runner's ceiling slice left out: `open`, `paused` (on a question), `done`. */
+/** The lane's slices by state: `open`, `paused` (on a question), `done`. */
 export interface SliceCounts {
 	open: number;
 	paused: number;
@@ -280,14 +280,10 @@ export function enqueueRunnerDeath(ledger: Ledger, r: { workloadId: string; lane
 	});
 }
 
-/** The slice the runner's ceiling meter adds (surface/scripts/lane.ts raiseCeilingQuestion): not the lane's work. */
-export const isRunnerCeilingSlice = (s: Pick<SliceRow, "id" | "created_by">): boolean => s.id.startsWith("sl-ceiling-") && s.created_by === LANE_RUNNER_BY;
-
-/** The lane's own slices by state, the runner's ceiling slice left out. */
-export function sliceCounts(slices: readonly Pick<SliceRow, "id" | "created_by" | "state">[]): SliceCounts {
+/** The lane's slices by state. */
+export function sliceCounts(slices: readonly Pick<SliceRow, "state">[]): SliceCounts {
 	const out: SliceCounts = { open: 0, paused: 0, done: 0 };
 	for (const s of slices) {
-		if (isRunnerCeilingSlice(s)) continue;
 		if (s.state === "open") out.open += 1;
 		else if (s.state === "paused") out.paused += 1;
 		else if (s.state === "done") out.done += 1;

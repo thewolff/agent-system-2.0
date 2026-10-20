@@ -19,7 +19,7 @@ import {
 const FIXTURES = join(import.meta.dir, "fixtures", "guard-replay");
 const SCRIPT = join(import.meta.dir, "..", "scripts", "guard-replay.ts");
 /** The fixture's call count: a CLI run that parses fewer has lost calls, not passed. */
-const CORPUS_CALLS = 41;
+const CORPUS_CALLS = 42;
 
 const corpus = () => collectCalls([FIXTURES], 0);
 

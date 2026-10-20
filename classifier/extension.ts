@@ -89,19 +89,22 @@
  * are refused, and a repository fingerprint (classifier/src/fingerprint.ts) taken at its spawn and
  * its settle withholds its output when they differ (`review-withheld:`), which `recover()` honours.
  *
- * Jo's Kimi-out rule (input in-mv5xafhywe3w8w, PLAN wl-mv5xay6bjp0268; `KIMI_OUT_RULE` in
- * classifier/src/lab.ts, until the end of 2026-10-31 PDT). A review whose plan is a park runs
- * same-lab with no question when the rule is active (R1), the builders are known and Kimi is not one
+ * Jo's Kimi-out rule (input in-mv5xafhywe3w8w, PLAN wl-mv5xay6bjp0268; the `kimi-out` record of
+ * gates/src/rulings.ts `STANDING_RULINGS`, dated by `KIMI_OUT_RULE` in classifier/src/lab.ts, until the
+ * end of 2026-10-31 PDT or Jo's `end-ruling kimi-out`). A review whose plan is a park runs
+ * same-lab with no question when the rule is active (R1, `rulingActive`), the builders are known and Kimi is not one
  * (R2), every row entry has a lab (R3), Kimi is out (R4: every kimi entry of the row skipped, counting
  * only `provider-refused:` entries a real hand's settle wrote, or no kimi entry in the row under
  * `rowOmission`), and a same-lab hand can run (R5). The spawn alone decides it and writes
  * `review-same-lab-rule:` immediately before the hand's `hand-spawn:` in one transaction, re-checking
- * the clock there; a same-lab hand tries the least-involved builder lab first (`builderRoles`). A
+ * the rule there; a same-lab hand tries the least-involved builder lab first (`builderRoles`). A
  * production dispatch whose plan parks on those terms is published as one hand and writes nothing;
  * a production fan-out whose kimi member's provider refused on its token, with every kimi entry of
  * the review row skipped by `usableRow` on the live registry at the group's end, ends with no park
  * question and writes nothing, so the re-dispatch reaches the spawn. A single review hand with no
- * answering model still parks: silence is not Kimi-specific.
+ * answering model still parks: silence is not Kimi-specific. Every park and round-limit question goes
+ * through `askJo` (PLAN wl-mvfkv7llkp7nk0 § 1): a park passes the R1–R5 verdict, which is false
+ * wherever a park is reached, so the record asks exactly as before.
  *
  * Review round limit and stop (PLAN wl-mupu0sx2o046io D9/D10, MIGRATION.md follow-up 33; the pure
  * half is classifier/src/rounds.ts and classifier/src/review-stop.ts). Every review item's brief
@@ -140,6 +143,7 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { LANE_ENV, WORKLOAD_ENV } from "../gates/src/types";
+import { askJo, decidedText, raisedId, rulingActive } from "../gates/src/rulings";
 import { type HostModules, hostSettings, readSetting } from "../gates/src/host";
 import { CLASSIFIER_BY, type EntryRow, Ledger, type QuestionRow, type RoutingOutcome, type Stakes } from "../ledger/src/index";
 import { defaultLedgerPath } from "../ledger/src/locality";
@@ -261,7 +265,7 @@ import { controlEntries, holdersOf, type LaneStarted, laneStarted, planFirst, pl
 import { ompPidState, type PidState } from "../surface/src/omp-probe";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../surface/src/types";
 import {
-	PAIR_OPTION, type PairLedger, type PairSignalId, pairExposureBody, pairOffer, pairOfferBody, pairOfferStamp, pairSignalBody, pairSignalFailedBody, pairSuggestOn,
+	PAIR_OPTION, type PairLedger, type PairSignalId, pairExposureBody, pairOffer, pairOfferBody, pairSignalBody, pairSignalFailedBody, pairSuggestOn,
 	parsePairSignal, parsePairSignalFailed, readPairSuggestConfig,
 } from "../surface/src/pair-suggest";
 
@@ -426,8 +430,8 @@ interface FanOut {
 	loop: number | null;
 }
 
-/** A park (D6): its question and whether this call raised it; null when the review's loop had ended, so nothing parked. */
-type Parked = { questionId: string; raised: boolean } | null;
+/** A park (D6): its question and whether this call raised it, a standing ruling's decision, or null when the review's loop had ended, so nothing parked. */
+type Parked = { questionId: string; raised: boolean } | { ruling: string; text: string } | null;
 
 /** A settled hand: its `routings` outcome, and why its output is withheld when it is. */
 interface Verdict {
@@ -1120,7 +1124,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	function roundLimitPairOffer(ledger: RoutingLedger, workloadId: string, count: RoundCount, log: (line: string) => void): { signals: PairSignalId[] } | null {
 		try {
 			// deps.ledger() is the ledger module's Ledger at run time; the port (src/ledger-port.ts) names only what routing calls.
-			return pairOffer(ledger as unknown as PairLedger, workloadId, "round-limit", { config: readPairSuggestConfig(), count });
+			return pairOffer(ledger as unknown as PairLedger, workloadId, { config: readPairSuggestConfig(), count });
 		} catch (error) {
 			log(`agent-system-2 classifier: the pair offer on ${workloadId} could not be computed (${message(error)}); the round-limit question is raised without it`);
 			return null;
@@ -1152,7 +1156,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		spawnKey: string | null,
 	): Promise<{ plan: Extract<ReviewPlan, { kind: "single" }>; labs: Lab[]; evidence: string } | null> {
 		const now = clock();
-		if (!kimiOutRuleActive(now)) return null;
+		if (!rulingActive(deps.ledger(), "kimi-out", now)) return null;
 		const entries = deps.ledger().entries(workloadId);
 		const evidence = await kimiOutEvidence(input.row, tier, input.builders, registry, disabled, entries, now, spawnKey);
 		if (evidence === null) return null;
@@ -1176,7 +1180,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 */
 	function kimiOutAtGroupEnd(workloadId: string, entries: readonly EntryRow[], group: string, tier: Tier | null): { token: string; kimi: string[] } | null {
 		const now = clock();
-		if (tier === null || !kimiOutRuleActive(now)) return null;
+		if (tier === null || !rulingActive(deps.ledger(), "kimi-out", now)) return null;
 		const builders = buildersOf(workloadId);
 		if (builders.unknown.length > 0 || builders.labs.includes("kimi")) return null;
 		const row = reviewRow(deps.tierTable(), tier);
@@ -1208,11 +1212,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 
 	/**
 	 * D6: park the review of `sliceId`. One ledger write transaction checks for an open park question
-	 * on the slice (one per slice), raises the question (which pauses the slice) and writes the
-	 * `review-park:` entry that marks it as the classifier's. `loop`: the review's (`Pending.loop`);
+	 * on the slice (one per slice), asks Jo through the standing rulings (`askJo`, which pauses the slice
+	 * when it raises) and writes the `review-park:` entry that marks it as the classifier's. `loop`: the review's (`Pending.loop`);
 	 * when the slice's loop has moved on since (another round passed, read in the same transaction,
 	 * REVIEW-r4), the review belongs to an ended loop: nothing parks and null is returned. Null `loop`:
-	 * a dispatch being classified now, in the current loop by definition.
+	 * a dispatch being classified now, in the current loop by definition. The R1–R5 verdict passed is
+	 * false: every park is reached only where Kimi-out did not decide the spawn (or, for a silent hand,
+	 * does not apply), so no ruling decides it today; a decision would be returned, with nothing parked.
 	 */
 	function park(workloadId: string, sliceId: string, reasons: readonly string[], loop: number | null): Parked {
 		const ledger = deps.ledger();
@@ -1222,19 +1228,19 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			if (loop !== null && loop !== reviewLoop(entries, sliceId)) return null;
 			const open = openParkQuestion(entries, ledger.questions(workloadId), sliceId);
 			if (open) return { questionId: open, raised: false };
-			const questionId = ledger.raiseQuestion({
-				by: deps.laneId,
-				workloadId,
-				sliceId,
-				body: parkQuestionBody(sliceId, builders, reasons),
-				options: [...PARK_OPTIONS],
-			});
-			ledger.recordEntry({ by: deps.laneId, workloadId, sliceId, kind: "assumption", body: reviewParkBody(questionId, sliceId) });
-			return { questionId, raised: true };
+			const asked = askJo(
+				ledger,
+				{ by: deps.laneId, workloadId, sliceId, body: parkQuestionBody(sliceId, builders, reasons), options: [...PARK_OPTIONS] },
+				{ asker: "classifier", kimiOut: false, now: clock() },
+			);
+			if ("decided" in asked) return { ruling: asked.decided.ruling, text: decidedText(asked.decided) };
+			ledger.recordEntry({ by: deps.laneId, workloadId, sliceId, kind: "assumption", body: reviewParkBody(asked.raised, sliceId) });
+			return { questionId: asked.raised, raised: true };
 		});
 	}
 
 	function parkedLine(sliceId: string, parked: Parked): string {
+		if (parked && "ruling" in parked) return `the review of ${sliceId} is ${parked.text}`;
 		return parked
 			? `the review of ${sliceId} is parked on question ${parked.questionId} (review-park:; options same-lab / wait${parked.raised ? "" : "; that question was already open"}). Jo answers it; do not re-dispatch the review until then`
 			: `the review loop of ${sliceId} it was dispatched in has ended since (review-loop-end:), so nothing parks and no question is raised`;
@@ -1499,15 +1505,22 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const limit = effectiveRoundLimit(entries, instructions, stakes, sliceId);
 				if (count.failed < limit.total || openLimitQuestion(entries, ledger.questions(workloadId), sliceId)) return null;
 				const offer = roundLimitPairOffer(ledger, workloadId, count, log);
-				const questionId = ledger.raiseQuestion({
-					by: deps.laneId,
-					workloadId,
-					sliceId,
-					body: roundLimitQuestionBody(sliceId, count, limit, stakes),
-					options: offer ? [...ROUND_LIMIT_OPTIONS, PAIR_OPTION] : [...ROUND_LIMIT_OPTIONS],
-				});
+				const questionId = raisedId(
+					askJo(
+						ledger,
+						{
+							by: deps.laneId,
+							workloadId,
+							sliceId,
+							body: roundLimitQuestionBody(sliceId, count, limit, stakes),
+							options: offer ? [...ROUND_LIMIT_OPTIONS, PAIR_OPTION] : [...ROUND_LIMIT_OPTIONS],
+						},
+						{ asker: "classifier", now: clock() },
+					),
+					`the round-limit question of ${sliceId}`,
+				);
 				entry(reviewLimitBody(questionId, sliceId));
-				if (offer) ledger.recordEntry({ by: pairOfferStamp("round-limit"), workloadId, kind: "assumption", body: pairOfferBody(questionId, "round-limit", offer.signals) });
+				if (offer) ledger.recordEntry({ by: CLASSIFIER_BY, workloadId, kind: "assumption", body: pairOfferBody(questionId, "round-limit", offer.signals) });
 				return `review round ${round.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total}); question ${questionId} (review-limit:; extend / accept / stop${offer ? " / pair" : ""}) is raised`;
 			});
 			if (settledLost.length > 0) {
@@ -2710,7 +2723,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						const entries = ledger.entries(hand.workloadId);
 						const entry = (body: string) => ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body });
 						if (grant && spentGrants(entries).has(grant)) return "spent";
-						if (rule && !kimiOutRuleActive(clock())) return "expired";
+						if (rule && !rulingActive(ledger, "kimi-out", clock())) return "expired";
 						if (grant) entry(reviewSameLabBody(grant, hand.token));
 						if (rule) entry(reviewSameLabRuleBody({ slice: hand.sliceId, token: hand.token, labs: rule.labs, kimi: rule.kimi }));
 						headroomSkips(hand.token, entry);

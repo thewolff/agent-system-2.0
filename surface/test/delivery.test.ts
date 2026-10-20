@@ -7,9 +7,11 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
-import { CEILING_OPTIONS } from "../src/ceiling";
 import { Delivered, consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
+import { ceilingNoticeBody } from "../src/ceiling";
+import { sendNotice } from "../src/notice";
+import { Numbering } from "../src/numbering";
 import { laneExitBody, planFirstBody } from "../src/launch";
 import { surfaceSession } from "../src/session";
 import { laneDiedShutdownBody } from "../src/signals";
@@ -84,36 +86,68 @@ describe("consumption: held orchestrator-bound rows behind a delivered line move
 	});
 });
 
-describe("the ceiling question's stop at 100 % is a new state of its line (PLAN wl-mv5msri070p0qo D3)", () => {
-	test("state `stopped` and the stop text once the newest lane-stop: is accepted ceiling, written at or after the question; Delivered takes it again", () => {
-		const c = clock("2026-10-12T19:00:00.000Z");
+describe("a notice (PLAN wl-mvfkv7llkp7nk0 § 2, R14): a message row shown as an unanswerable needs-you line until delivered once", () => {
+	const questionRows = (ledger: Ledger) => ledger.db.query<{ n: number }, []>("SELECT count(*) AS n FROM questions").get()!.n;
+
+	test("sendNotice writes a held notice: message to the orchestrator and no question row; its line is unnumbered and goes once consumed", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const id = sendNotice(ledger, { by: LANE_RUNNER_BY, workloadId: wl, body: `80 % of the ceiling; \`extend ${wl}\` adds one block` });
+		expect(ledger.message(id)).toMatchObject({ workload_id: wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, state: "held", body: `notice: 80 % of the ceiling; \`extend ${wl}\` adds one block` });
+		expect(questionRows(ledger)).toBe(0);
+		const lines = new Numbering().assign(errorLines(ledger));
+		expect(lines).toEqual([{ kind: "notice", workloadId: wl, rowId: id, messageIds: [id], line: `notice on ${wl} (nothing to answer): 80 % of the ceiling; \`extend ${wl}\` adds one block` }]);
+		expect(consumeLines(ledger, lines)).toBe(1);
+		expect(ledger.message(id)!.state).toBe("delivered");
+		expect(errorLines(ledger)).toEqual([]);
+		expect(consumeLines(ledger, lines)).toBe(0);
+		expect(questionRows(ledger)).toBe(0);
+	});
+
+	test("a wake's consumption delivers it too: the render showed it, the next read does not", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const id = sendNotice(ledger, { by: LANE_RUNNER_BY, workloadId: wl, body: "line one\nline two" });
+		expect(errorLines(ledger).map((l) => l.line)).toEqual([`notice on ${wl} (nothing to answer): line one\n  line two`]);
+		expect(consumeAllToOrchestrator(ledger)).toBe(1);
+		expect(ledger.message(id)!.state).toBe("delivered");
+		expect(errorLines(ledger)).toEqual([]);
+	});
+
+	test("a `notice:` a lane that held the workload wrote is its own message, not a notice line", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		expect(ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 }).won).toBe(true);
+		ledger.enqueue({ by: "lane-a", workloadId: wl, sender: "lane-a", recipient: ORCHESTRATOR_RECIPIENT, body: "notice: the plan started on its own" });
+		expect(errorLines(ledger)).toEqual([]);
+	});
+
+	test("PLAN § 4.1 (review r5 minor): the runner's queued ceiling notices are not shown while a live by-hand lane holds the workload; an autonomous holder's are, and the by-hand ones show again once its lease lapses", () => {
+		const c = clock();
 		const { ledger } = tempLedger(c.now);
-		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "Move the header offset into a token", stakes: "normal", mode: "autonomous" });
-		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-t-1 cause first requested-by test" });
-		// an earlier lane's accepted ceiling, before the question: not this question's stop
-		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: "lane-stop: lane-t-0 accepted ceiling" });
-		c.plusHours(1);
-		const sl = ledger.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: "sl-ceiling-1", task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
-		const q = ledger.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body: "80 % of the ceiling", options: [...CEILING_OPTIONS] });
-		const d = new Delivered();
-		const at80 = errorLines(ledger).find((l) => l.rowId === q)!;
-		expect(at80.state).toBeUndefined();
-		expect(at80.line).not.toContain("stopped at the ceiling");
-		expect(d.take([at80])).toHaveLength(1);
-		// a stop for another reason changes nothing
-		c.plusHours(1);
-		const req = ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: "lane-stop: lane-t-1 requested mode-flip by jo" });
-		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: `lane-stop: lane-t-1 accepted ${req}` });
-		expect(errorLines(ledger).find((l) => l.rowId === q)!.state).toBeUndefined();
-		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: "lane-stop: lane-t-1 accepted ceiling" });
-		const at100 = errorLines(ledger).find((l) => l.rowId === q)!;
-		expect(at100.state).toBe("stopped");
-		expect(at100.line.endsWith("(or `withdraw`); the lane stopped at the ceiling")).toBe(true);
-		expect(d.take([at100])).toEqual([at100]);
-		expect(d.take([at100])).toEqual([]);
-		// any other question on the workload keeps its state
-		const other = ledger.raiseQuestion({ by: "lane-t-1", workloadId: wl, sliceId: sl, body: "Unrelated?", options: ["yes", "no"] });
-		expect(errorLines(ledger).find((l) => l.rowId === other)!.state).toBeUndefined();
+		const ceilingNotice = (wl: string, level: 80 | 100) =>
+			sendNotice(ledger, { by: LANE_RUNNER_BY, workloadId: wl, body: ceilingNoticeBody(level, wl, { usd: level === 80 ? 40 : 50, tokens: 1000, wallMin: 10 }, { usd: 50, wallMin: 360 }, "normal") });
+		const hold = (wl: string, laneId: string, cause: "interactive" | "first") => {
+			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: `launch: ${laneId} cause ${cause} requested-by jo` });
+			expect(ledger.claimWorkload(wl, { by: laneId, holder: laneId, leaseMs: 3_600_000 }).won).toBe(true);
+		};
+		const shown = () => new Set(errorLines(ledger).filter((l) => l.kind === "notice").map((l) => l.rowId));
+		// An autonomous lane's 80 % and stop notices, undelivered when Jo pairs and a by-hand lane takes the workload.
+		const { wl } = workloadWithSlice(ledger, { mode: "user-driven" });
+		const n80 = ceilingNotice(wl, 80);
+		const n100 = ceilingNotice(wl, 100);
+		const other = sendNotice(ledger, { by: LANE_RUNNER_BY, workloadId: wl, body: "the plan started on its own" });
+		hold(wl, "lane-h", "interactive");
+		expect(shown()).toEqual(new Set([other]));
+		expect([n80, n100].map((id) => ledger.message(id)!.state)).toEqual(["held", "held"]);
+		// An autonomous holder's ceiling notice shows.
+		const auto = workloadWithSlice(ledger).wl;
+		const a80 = ceilingNotice(auto, 80);
+		hold(auto, "lane-r", "first");
+		expect(shown()).toEqual(new Set([other, a80]));
+		// The by-hand lease lapses: no live by-hand lane holds it, so its queued notices show.
+		c.plusHours(2);
+		expect(shown()).toEqual(new Set([n80, n100, other, a80]));
 	});
 });
 

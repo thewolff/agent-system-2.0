@@ -266,6 +266,50 @@ now ruled). Enforcement is P-11's: each item is a tool call a gate must recognis
 evasions — browser writes are not tool calls, shell inside `eval` reaches the gate as one opaque
 string — are build requirements on the gate, not list items.
 
+**Amended 2026-10-20 — routine deploys, escalated only on a named risk condition**
+(`migration/items/routine-deploy-risk-conditions.md`; Jo, ledger inputs `in-mvgor1imswhbsw` (the opening brief: routine
+deploys run without Jo, and a deploy escalates only on a written, research-cited condition) and `in-mvgpe7k1np4xkw`
+(*"doesn't mean it has to"*: a lane may deploy but need not after every merge; order across repos matters; build on
+escalation phase 2); plan `~/agent-scratch/agent-system-2.0/wl-mvgorfqqbuyyo0/PLAN.md` rev 9; built in
+wl-mvgorfqqbuyyo0). Deploy
+stays reserved, with one exception: a `workflow_dispatch` run of a Jo-accepted workflow, issued by a lane (not a hand,
+the orchestrator or a train lane), whose bash command equals one declared target's command byte for byte. Every deploy
+CLI, `infrastructure change`, `publishes a package`, `gh release`, every secret rule and any `gh workflow run` that
+matches no target stay reserved with their refusal text unchanged. Jo accepts the profile's `deploy:` section with the
+word `deploy-policy <sha12>`; only the newest `deploy-policy:` row counts, and `deploy-policy off` or any other hash
+means no target is routine. A lane may deploy, but it never must: no merge, close, settle or tick deploys anything, and
+a lane deploys only when its workload calls for it. Every fact is a `gh api` read, a ledger read, the clock or the
+gate's own HTTPS GET; a declared command is never run. The code (`gates/src/deploy-risk.ts`) decides one of four
+outcomes, and every condition that holds is named:
+
+- **Hold**: a plain refusal, no reserved request, nothing reaches Jo, never overridden by an approval. `O1` the
+  predecessor target in `deploy.order` has merged work not yet deployed (cross-repo order: deploy the predecessor first);
+  `U1` a deploy of the target has no settle row (run `as2 deploy settle <dp-…>`); `U2` (on `gh pr merge`) a deploy of
+  the repo is unsettled; `U3` a merge of the repo started or finished while the facts were read (re-evaluate).
+- **Escalate**: a reserved request `deploy (<target>, escalated: <ids>) …` that is NOW under escalation phase 2. `E0` the
+  policy is not authenticated, has a bad shape, the workflow blob moved, a fact could not be read, or the compare is
+  capped; `E1` the workload's stakes are production; `E2` a required check is missing, not green, or any check at the
+  commit failed; `E3` the default branch moved while facts were read, an open PR has auto-merge, or a merge queue is on;
+  `E4` migration or data-shape files changed; `E5` auth, payment, secret, infra or pipeline files changed; `E6` no
+  known-good release to return to (first deploy, no rollback text, or no successful run of the previous commit); `E7` a
+  workflow run of a declared target that is not byte-equal to its command; `E8` the target's newest settle failed with
+  no later ok; `E9` the change is over the high line count; `E10` the target's health probe fails before the deploy;
+  `E11` an as2 merge of the repo is unresolved; `M1` a `gh pr merge` on a repo whose push to the default branch deploys.
+- **Defer**: `D1` now is outside the deploy window; a reserved request `off-hours deploy (<target>) …` that waits for
+  Jo's window instead of pinging.
+- **Warn**, never blocks, rides the `deploy:` row and the notice: `W1` a direct dependency's major version changed;
+  `W2` a required check passed only on a re-run, or an optional one was skipped; `W3` the change is over the low line
+  count; `W4` the change touches many top-level directories.
+
+**Approval binding.** The request records each condition as its id plus the facts that made it hold, in sorted form,
+with their sha256. Jo's `approve` admits that exact command once, at that commit, within 24 hours, only when every
+condition holding at admission is one the request named and no hold applies; a second call, a moved branch, a withdrawn
+request or a new instance (another stalled PR, a new failing check, another matched path) needs a new approval. A
+merge-triggered repo's approved merge is admitted once and only with `--match-head-commit` equal to the recorded head.
+After a dispatch the lane runs `gh run watch` and `as2 deploy settle <dp-…>`, which binds the run, checks the shipped
+commit and the health probe, writes `deploy-settled:` and sends one notice; a lane cannot release or hand off with a
+deploy unsettled. The research behind each condition, with its source and passage, is in `docs/deploy-risk.md`.
+
 **Amended 2026-10-08 — no process from eval** (MIGRATION.md item 58; Jo: *"standing rule: deny
 any reserved request that launches a command from eval or a subprocess, without asking me, and tell
 the lane to use bash"*; to Ilex's "refuse outright?": *"yes, open it"*; built in
@@ -486,6 +530,54 @@ template and `ask` is unavailable to autonomous lanes and hands; reserved action
 A4 gate (item 1); a material non-reserved choice goes through a `question` row that suspends only
 dependent work (item 5). Those two are the only human waits a lane can hit; item 5's prompt-event
 trigger is the safety net if a blocking prompt leaks anyway.
+
+**Amended 2026-10-19 — standing rulings are checked before a question; notices** (`migration/items/escalation-policy.md`;
+Jo, ledger input `in-mvfkupc4p9nt34` opening the escalation-policy work, and the policy draft's § 4: *"a ruling comes only
+from Jo's words … The ruling check has to be code"*; plan `~/agent-scratch/agent-system-2.0/wl-mvfkv7llkp7nk0/PLAN.md`
+rev 5 §§ 1–2, approved by Jo; built in wl-mvfkv7llkp7nk0). Two changes to item 5's question trigger. **Rulings
+first:** `askJo` (`gates/src/rulings.ts`) is the only production path to `Ledger.raiseQuestion`. It reads the question's
+kind from its option set (`questionKind`: `review-park`, `open-workload`, `merge`, `stakes`, and for a question whose
+every option is a `provider/model` id the `subject` its asker declares, `lane-model` or `review-model`, refused when
+missing) and checks Jo's standing rulings (`STANDING_RULINGS`): `kimi-out` (in-mv5xafhywe3w8w, ends
+2026-11-01T00:00-07:00), `flow-repair` (in-mvfiyyv2kuha80), `merges` (in-mv91wdhs446ark), `models` (in-mv5qagioc4en0g,
+in-mvfiu1uyldnksg) and `gates-stakes` (in-mv0novd17fre9s), each with the scope, exceptions and end its source gives.
+When an active ruling covers the question, no question row is written and nothing pauses; the asker records
+`ruling-applied: <ruling> kind <k> slice <sl> answer <a>`, and the lane and orchestrator tools return the ruling and
+its action instead of a question id. Every other question, of kind `other` (round limit, merge train, plan, safety) or
+outside a ruling's scope, is raised as before. A ruling is added only by a code change from Jo's words, and Jo's
+`end-ruling <id>` ends one at once. The invariant report's `ruling-miss` lists a question raised since the ledger's
+first `ruling-applied:` entry (the check's activation) that an active ruling would have decided, the runtime check for
+a raise path that bypasses `askJo`. **Notices:**
+something Jo is told and does not answer (a ceiling at 80 %, a ceiling stop, a plan that started on its own,
+§ B6 and § B11 *Amended 2026-10-19*) is a `notice:` message to the orchestrator written by trusted tool code
+(`sendNotice`, `surface/src/notice.ts`), never a `questions` row. It shows after every other needs-you line as
+`notice on <workload> (nothing to answer): …`, unnumbered and not answerable, until delivery marks it delivered once.
+The two ceiling notices are on fire for the batch; every other notice waits for the window. A `notice:` written by a
+lane that holds or held the workload shows only as that lane's message.
+
+**Amended 2026-10-20 — escalation phase 2, wave 1: now questions, repeats, ruling conflicts, NOW reserved requests,
+security-red** (`migration/items/escalation-policy-phase2.md`; Jo, `split` on q-mvg1l5vvo94ow0 and ledger input
+`in-mvg1vdxhuwgt8g` (*"open phase 2"*), the policy draft's §§ 1 and 3; plan
+`~/agent-scratch/agent-system-2.0/wl-mvg1vs0rhnu3gg/PLAN.md` rev 5 §§ 1.0–1.3, 1.9, 3.3, 3.5, approved by Jo with its
+recommendations on open questions 1, 2 and 5; built in wl-mvg1vs0rhnu3gg). Item 5 gains a second speed. **Now:**
+`lane_raise_question` and `orchestrator_raise_question` take an optional `now`, one of `integrity`, `security`,
+`incident`, `guard`, `boundary`, `irreversible`, `money` (the draft's three now triggers); any other word is refused and
+nothing is asked. `askJo` raises such a question past every standing ruling (and a lane's plan question past auto-start,
+its review and shape checks still run) and, in the same write, records `now: <q-…> <category>`, a control entry only
+`escalation` writes. The needs-you line is tagged `NOW (<category>): ` and is on fire; `ruling-miss` skips a question with
+a valid mark. When to pass `now` is the asker's judgment. **Repeats:** an ask whose workload, slice, body and options,
+and for the orchestrator its `about` workload, equal an open question's raises nothing and returns that id, writing
+nothing but one `now:` mark when the repeat carries `now` and the open one has none; a question whose options are all
+model ids is never a repeat. **Relays:** `orchestrator_raise_question` refuses a body naming an open question of another
+workload, writing nothing. **Conflicts:** two or more active rulings that decide one question with different answers
+decide nothing; the question is raised with `escalation`'s `ruling-conflict: <q-…> <ruling ids>`. Item 1: a waiting
+reserved request whose action is in row 6's `NOW_RESERVED` (`gates/src/rows/r06-reserved.ts`: guard bypasses and
+irreversible or shared-state rules) is tagged `NOW (guard): ` or `NOW (irreversible): ` and is on fire; every other
+waits for the window. **Security red:** a full-suite run of any verdict but `superseded` with a failing test under
+`gates/test/` (as2's security tests) makes the test runner send `security-red: <wl> <slice> <run id> <sha> <n> <first>`,
+whatever holds the workload; it shows as its own on-fire needs-you line, past a live lane and a train task's routing,
+while the ordinary test-run line keeps its suppression. A lane asks Jo before it changes such a test. The daily sweep's
+`scratch-disk` line is on fire too.
 
 ### B4 · Stakes → tier cap, and review as a stakes property (P-9, P-8a, A4 "approved")
 
@@ -818,6 +910,35 @@ checked: that a locator exists (a test the plan will write does not exist yet) o
 enforces its requirement; Jo judges that from the plan, the cross-lab plan review reads it, and the
 code review checks it in the diff.
 
+**Amended 2026-10-19 — a normal plan that passes cross-lab review starts on its own, and stops before merge**
+(`migration/items/escalation-policy.md`; Jo, 2026-10-19: *"yes to auto-start, stop at 100%"*, deciding the escalation
+draft's decision 1, *"A normal-stakes plan that passes cross-lab review starts without Jo's `approve`. Jo gets a notice
+and can stop it before merge. It never opens new work while the flow-repair gate is up."*; plan rev 5 § 3; built in
+wl-mvfkv7llkp7nk0). When a lane raises the plan question (an `approve` question on the plan slice while `plan: first`
+stands), `lane_raise_question` raises no question when all of these hold (`planAutoStartRound`,
+`surface/extensions/lane-tools.ts`): (a) the workload is at normal stakes; (b) the passing round is the latest review
+state, meaning the newest `review-loop-end:` on the plan slice is `reason pass` and no `hand-spawn: … review yes` and
+no review routing on the slice came after it; the round it closes was created after the slice's last question was
+resolved; and every member of that round ran, was not withheld, carries no same-lab token (no Jo grant, no Kimi-out
+rule token) and answered only on labs outside the builders. Jo's `accept` at a round limit, a mixed round and any
+later review all fail (b). (c) The body passes the plan-question shape check above. (d) The workload was never
+halted. (e) The `flow-repair` ruling is not active (§ B3, *Amended 2026-10-19*). Then, in one write, the fixed writer
+`escalation` (`ESCALATION_BY`) records `plan: approved auto <round group>`, a form valid only from that writer, which
+every reader of plan approval accepts and no lane can write, and sends Jo a notice carrying the plan body: *"plan
+started without your approve on <wl> (normal stakes, cross-lab review passed); it will not merge until 4 h after your
+next message here; `halt <wl>` stops it"*. The lane is told to add its change slices. Auto-start never opens a
+workload and never launches a lane. Production plans, and every plan while flow repair is up, still go to Jo as above.
+**Stop before merge:** for such a workload `prStakes` (`surface/src/merge-train.ts`) answers `hold: <reason> until
+<time|jo>`. The hold lasts until 4 h (`HOLD_HOURS`) after Jo's first typed surface message created after the notice
+was delivered (the standing-workload instruction `joInputRow` writes; mirrors on other workloads do not count), and
+until Jo when there is none. The train records `train-hold: pr <N> head <sha> until <…>`, leaves the PR's slices open
+and moves on. The tick's `hold-expired` reason wakes it once per hold (its own `train-wake:` consumes it), and the
+train re-reads `prStakes` just before `gh pr merge`. Not caught: a `halt` written in the seconds between that read and
+the merge. **`halt <wl>`** writes Jo's instruction, the surface's `plan: halted <instruction>` and a `lane-stop:`
+request to a live holder. `planFirst` then reads the workload as unapproved, so change slices are refused. The train
+holds its PRs with no end, auto-start never fires on it again, and Jo's `approve` on its next plan question approves
+it as before.
+
 ### B7 · Wake: the ledger rendered, never a hand's prose (P-17)
 
 **Ruled 2026-09-23.** Jo: *"i think we should refer to a ledger over an agent's prose pretty
@@ -927,6 +1048,21 @@ unchanged. The profile table still spreads every tier across the three providers
 inventory each lab's lanes take their own entries from and each review takes the other labs'
 entries from. Rate-limit exhaustion still stays inside the lane (B3) under the four-hour rule
 (A3).
+
+**Amended 2026-10-19 — the workload ceiling stops and tells; paired lanes are never stopped**
+(`DESIGN-workload-ceiling.md` § 2, *Amended 2026-10-19*; `migration/items/escalation-policy.md`; Jo, 2026-10-19: *"yes
+to auto-start, stop at 100%"*, deciding the escalation draft's decision 2, *"At 100% of a ceiling, as2 stops and sends a
+notice. Jo can extend with one word. There is no automatic extension."*; Jo's paired-workload amendment
+in-mvfo7nphl9xn28; plan rev 5 §§ 4–4.1; built in wl-mvfkv7llkp7nk0). The lane runner's meter raises no question at any
+level. At 80 % of either half of the workload ceiling it sends Jo one notice per ceiling value, and the lane goes on.
+At 100 % the lane stops (`lane-stop: … accepted ceiling`, outcome `stop`) and Jo gets one stop notice per ceiling
+value (§ B3, *Amended 2026-10-19*). No ceiling extends on its own, at any stakes. Raising stays Jo's (§ B12.1 item 2).
+`extend <wl>` adds one more block of the workload's own size; `ceiling <usd> [<hours>] <wl>` sets a figure. Each
+writes Jo's instruction and then the `ceiling:` entry naming it. Either word relaunches an autonomous lane the ceiling
+stopped, when that lane's spend is under the new value and no relaunch is already waiting. A workload whose holder is a
+live by-hand lane (`as2 lane <wl>`, `launch:` cause `interactive`) is never stopped at its ceiling and puts nothing
+about it on the needs-you list. That lane gets its spend against the ceiling at every turn start, and Jo gets a line
+in its pane at every further 25 % of the original ceiling's dollars, past 100 % too.
 
 ### B12 · Two decisions held since the triple-check (P-7b, P-16/P-15)
 

@@ -82,6 +82,8 @@ Reserved actions are irreversible actions outside the repository ([SPEC-2.0.md](
 
 P-11 row 6 (`gates/src/rows/r06-reserved.ts`) refuses a reserved command and writes a `reserved-request` entry; it appears under *needs you* and you answer `approve` or `deny`. A process started from the `eval` tool is refused outright and the lane is told to use `bash`, where the gate can read the command.
 
+Deploy has one routine shape: a lane's `gh workflow run` of a workflow you accepted, whose command equals a declared target's command exactly. You declare targets in the profile's `deploy:` section and accept them with `deploy-policy <sha12>`; none are declared by default. A lane may deploy, but nothing deploys because a merge happened. The gate reads the facts and names any condition that holds: a hold (deploy the earlier repo first, settle the open deploy) is a plain refusal that never reaches you; an escalation (production stakes, a failing or missing check, a migration or auth or infra file, no rollback, a failed health probe, and the rest) is a reserved request that `approve` admits once, for that commit; outside the deploy window the request waits for your window. Every other deploy command stays reserved as above. The conditions and their sources are in [deploy-risk.md](deploy-risk.md).
+
 The gates guard against a lane doing a reserved thing by mistake or over-eager judgment. Deliberate evasion by the lane is out of scope ([SPEC-2.0.md](../SPEC-2.0.md) § A4, "Threat model"); the write fence is the layer a parser gap cannot talk past.
 
 ## The write fence

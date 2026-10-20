@@ -23,6 +23,14 @@ install/manifest.tsv	install	-
 install/install.sh	install	-
 install/fresh-machine-test.sh	install	-
 install/com.agent-system-2.ledger-backup.plist	ledger-backup-agent	{launch_agents}/com.agent-system-2.ledger-backup.plist
+# Routine deploy risk conditions (wl-mvgorfqqbuyyo0): evaluated in row 6 and settled by the CLI.
+gates/src/deploy-risk.ts	module	-
+gates/test/deploy-risk.test.ts	test	-
+gates/test/r06-deploy.test.ts	test	-
+surface/scripts/deploy.ts	module	-
+surface/test/deploy-settle.test.ts	test	-
+surface/scripts/deploy-config.ts	module	-
+surface/test/deploy-config.test.ts	test	-
 # M3/M4 (2026-09-29): tier files, the classifier and gates extensions with their modules, tests and
 # data, and the 2.0 profile template (config.yml + models.yml, the judge pin). All used in place:
 # the profile names the extension entry points by repo path. `profile` rows are the template the
@@ -113,6 +121,7 @@ gates/src/rows/r09-protected-edit.ts	module	-
 gates/src/rows/r10-raw-ledger.ts	module	-
 gates/src/rows/r11-jo-instruction.ts	module	-
 gates/src/rows/r14-ask-policy.ts	module	-
+gates/src/rulings.ts	module	-
 gates/src/session.ts	module	-
 gates/src/shell-parse.ts	module	-
 gates/src/targets.ts	module	-
@@ -121,6 +130,8 @@ gates/src/test-run.ts	module	-
 gates/src/git-model.ts	module	-
 gates/src/fence.ts	module	-
 gates/test/case-and-noexec.test.ts	test	-
+gates/test/rulings.test.ts	test	-
+gates/test/r06-reserved.test.ts	test	-
 gates/test/extension.test.ts	test	-
 gates/test/helpers.ts	test	-
 gates/test/known-fragment.test.ts	test	-
@@ -1216,6 +1227,7 @@ ledger/test/live-ledger-guard.test.ts	test	-
 ledger/test/fixtures/live-guard/reach.fixture.ts	test	-
 surface/src/pending.ts	module	-
 surface/src/batch.ts	module	-
+surface/src/notice.ts	module	-
 surface/test/pending.test.ts	test	-
 surface/test/batch.test.ts	test	-
 # Migration items one file each (wl-mv5mvvs64ahq0w): the numbering tool .github/workflows/migration-number.yml runs.
@@ -1231,7 +1243,6 @@ surface/scripts/pair-suggest.ts	module	-
 classifier/test/judge-ask.test.ts	test	-
 classifier/test/pair-suggest-raise.test.ts	test	-
 surface/test/pair-suggest-answer.test.ts	test	-
-surface/test/pair-suggest-ceiling.test.ts	test	-
 surface/test/pair-suggest-forgery.test.ts	test	-
 surface/test/pair-suggest-module.test.ts	test	-
 surface/test/pair-suggest-switch.test.ts	test	-

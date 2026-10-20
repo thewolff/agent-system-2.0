@@ -10,8 +10,8 @@
 // Lanes: every `lane-started:` written in the last N days (default 30), each in a group by `pairLaneExposure`
 // (surface/src/pair-suggest.ts). While the switch covers a workload (stakes not throwaway, mode autonomous), each lane's
 // classifier writes one `pair-exposure: <laneId> on` per lane session, and only then does the classifier attempt the jev
-// signal or a raise site offer pair. A lane is `on` when it has its own `pair-exposure:` row, or a classifier-stamped
-// `pair-signal:` / `pair-signal-failed:` or a raise site's `pair-offer:` falls within its own span (`lane-started:` to
+// signal or the round-limit raise offer pair. A lane is `on` when it has its own `pair-exposure:` row, or a
+// classifier-stamped `pair-signal:`, `pair-signal-failed:` or `pair-offer:` falls within its own span (`lane-started:` to
 // `lane-exit:`, or now); `off` otherwise, a lane from before the switch existed included.
 //
 // Compared across the groups (monitoring § 5.3 wants 5 or more lanes per group): `post-signal-failed-rounds`, better
@@ -22,9 +22,9 @@
 //
 // On-only diagnostics, not compared, over rows written in the window on workloads with an `on` lane: take-rate
 // (`pair-taken:` / `pair-offer:`), false alarms (an offered question answered with another word, after which the next
-// review round to complete — on the question's slice at the round limit, on any slice at the ceiling — passed), the
+// review round to complete on the question's slice passed), the
 // signals the offers fired, and the jev cost: the sum of the known costs plus the count of attempts with none.
-import { assertNotLiveLedgerUnderTest, CLASSIFIER_BY, defaultLedgerPath, LANE_RUNNER_BY, Ledger } from "../../ledger/src/index";
+import { assertNotLiveLedgerUnderTest, CLASSIFIER_BY, defaultLedgerPath, Ledger } from "../../ledger/src/index";
 import { controlEntries } from "../src/launch";
 import {
 	completedRounds, PAIR_OPTION, PAIR_SIGNALS, type PairExposure, pairLaneExposure, pairSuggestLane, parsePairOffer, parsePairSignal,
@@ -96,7 +96,7 @@ export function report(ledger: Ledger, days: number): string {
 				knownCost += attempt.cost;
 				knownAttempts++;
 			}
-			const offer = e.created_by === CLASSIFIER_BY || e.created_by === LANE_RUNNER_BY ? parsePairOffer(e.body) : null;
+			const offer = e.created_by === CLASSIFIER_BY ? parsePairOffer(e.body) : null;
 			if (!offer) continue;
 			offers++;
 			for (const s of offer.signals) fired.set(s, (fired.get(s) ?? 0) + 1);
@@ -104,7 +104,7 @@ export function report(ledger: Ledger, days: number): string {
 			const answer = q?.state === "answered" ? instructions.find((x) => x.id === q.resolved_by) : undefined;
 			if (!q || !answer || answer.body.trim().split(/\s+/)[0]?.toLowerCase() === PAIR_OPTION) continue;
 			declined++;
-			const next = rounds.find((r) => r.at > answer.created_at && (offer.site === "ceiling" || r.slice === q.slice_id));
+			const next = rounds.find((r) => r.at > answer.created_at && r.slice === q.slice_id);
 			if (next?.passed) falseAlarms++;
 		}
 		taken += controlEntries(entries).filter((c) => c.prefix === "pair-taken" && c.createdBy === SURFACE_BY && c.createdAt >= since).length;

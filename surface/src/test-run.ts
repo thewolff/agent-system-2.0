@@ -7,7 +7,7 @@
 //
 // What lives here:
 // - the bodies of `test-requested:`, `test-run:`, `push-dest:` (control entries, launch.ts WRITERS)
-//   and `test-run-failed:` (a pushed signal to the orchestrator), each formatted and parsed exactly;
+//   and `test-run-failed:` and `security-red:` (pushed signals to the orchestrator), each formatted and parsed exactly;
 // - the profile's `testRunner:` block and the origin → `owner/repo` mapping every `gh -R` names;
 // - the junit report (Bun's `--reporter=junit`) and the console log beside it, read into a part result;
 // - the changed-test-file filter on Bun's discovery names;
@@ -408,6 +408,64 @@ export function testRunFailedOf(workloadId: string, slice: string, run: TestRun)
 	if (run.verdict === "green" || run.verdict === "red-main" || run.verdict === "superseded") return null;
 	const counted = (run.full?.fail ?? 0) + run.solo.reduce((n, s) => n + s.fail, 0);
 	return { workloadId, slice, verdict: run.verdict, sha: run.sha, failing: Math.max(counted, run.failures.length), first: run.failures[0]?.name ?? null };
+}
+
+// ---- bodies: security-red: (a pushed signal, PLAN wl-mvg1vs0rhnu3gg § 3.3) ---------------------------
+
+/** The security tests: as2 has no auth, so its security tests are the gate tests (P-11 rows, fence, reserved actions). */
+export const SECURITY_TEST_PATHS: readonly string[] = ["gates/test/"];
+/** Body prefix of the runner's message to the orchestrator for a run with a failing security test. */
+export const SECURITY_RED_PREFIX = "security-red:";
+
+export interface SecurityRed {
+	workloadId: string;
+	slice: string;
+	runId: string;
+	sha: string;
+	/** The run's failures under a security path, a test failing in two parts counted in each. */
+	failing: number;
+	/** The first such failure's name, folded to one line. */
+	first: string;
+}
+
+/**
+ * The run's failures in a security test, in run order: those whose part (a solo `./<path>`) or whose name's file part
+ * (`file > describe > name`, the file repo-relative with no `./`, as Bun 1.3.14's junit `file` attribute gives it) starts
+ * with an entry of SECURITY_TEST_PATHS. Every verdict but `superseded` counts, `red-main` included: main failing the same
+ * test does not make a broken gate safe.
+ */
+export function securityFailuresOf(run: TestRun): Failure[] {
+	if (run.verdict === "superseded") return [];
+	return run.failures.filter((f) => [f.part, f.name.split(" > ")[0]!].some((path) => SECURITY_TEST_PATHS.some((p) => path.replace(/^\.\//, "").startsWith(p))));
+}
+
+/** `security-red: <wl> <slice> <run id> <sha> <n> <first name>`; the name is folded to one line. */
+export function securityRedBody(s: SecurityRed): string {
+	need(/^wl-\S+$/.test(s.workloadId), `${s.workloadId} is not a workload id`);
+	need(/^sl-\S+$/.test(s.slice), `${s.slice} is not a slice id`);
+	need(isRunId(s.runId), `${s.runId} is not a run id`);
+	need(isSha(s.sha), `${s.sha} is not a full sha`);
+	need(nat(s.failing) && s.failing > 0, `${s.failing} is not a positive count`);
+	const first = s.first.replace(/\s+/g, " ").trim();
+	need(first !== "", "the first failure has no name");
+	return `${SECURITY_RED_PREFIX} ${s.workloadId} ${s.slice} ${s.runId} ${s.sha} ${s.failing} ${first}`;
+}
+
+const SECURITY_RED_RE = /^security-red: (wl-\S+) (sl-\S+) (tr-[a-z0-9]+) ([0-9a-f]{40}) ([1-9]\d*) (\S.*)$/;
+
+export function parseSecurityRed(body: string): SecurityRed | null {
+	const m = SECURITY_RED_RE.exec(body.trim());
+	if (!m) return null;
+	const failing = Number(m[5]);
+	if (!nat(failing)) return null;
+	return { workloadId: m[1]!, slice: m[2]!, runId: m[3]!, sha: m[4]!, failing, first: m[6]! };
+}
+
+/** The signal for a finished run with a failing security test (`securityFailuresOf`), or null when it has none. */
+export function securityRedOf(workloadId: string, slice: string, run: TestRun): SecurityRed | null {
+	const failures = securityFailuresOf(run);
+	if (failures.length === 0) return null;
+	return { workloadId, slice, runId: run.runId, sha: run.sha, failing: failures.length, first: failures[0]!.name };
 }
 
 // ---- bodies: push-dest: --------------------------------------------------------------------------

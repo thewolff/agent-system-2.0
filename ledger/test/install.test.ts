@@ -14,6 +14,7 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { authenticatePolicy, policyHash, readPolicySection } from "../../gates/src/deploy-risk";
 
 const REPO = join(import.meta.dir, "..", "..");
 const T = "\t";
@@ -122,6 +123,29 @@ describe("install: the tracing switch (wl-mv65t5d34lts00 PLAN.md § 8.1)", () =>
 			expect({ word, code: r.exitCode, err: r.stderr.toString() }).toEqual({ word, code: 2, err: expect.stringContaining(`HOME (${home}) is not this user's home directory`) });
 		}
 		expect(readdirSync(home)).toEqual([]);
+	});
+});
+
+describe("install: deploy declarations survive render without changing acceptance", () => {
+	test("fresh targets empty; custom targets/order/hash survive reinstall, with newest off still authoritative", () => {
+		const first = install("deploy-carry");
+		expect(first.exitCode).toBe(0);
+		const config = join(first.home, ".omp", "profiles", "agent-system-2", "agent", "config.yml");
+		const doc = Bun.YAML.parse(readFileSync(config, "utf8"));
+		expect(doc.deploy.targets).toEqual([]);
+		const target = (name: string) => ({ name, repo: `Example/${name}`, command: `gh workflow run ship.yml --ref main -R Example/${name}`, workflowBlob: "a".repeat(40), deployJob: "publish", requiredChecks: [{ name: "tests", app: "github-actions" }], rollback: "restore prior image", health: { url: `https://${name}.example.test/health`, status: 200 } });
+		doc.deploy = { ...doc.deploy, targets: [target("api"), target("web")], order: [["api"], ["web"]], mergeTriggered: ["Example/worker"] };
+		writeFileSync(config, Bun.YAML.stringify(doc, null, 2));
+		const hash = policyHash(doc.deploy);
+		const again = install("deploy-carry");
+		expect(again.exitCode).toBe(0);
+		const read = readPolicySection(readFileSync(config, "utf8"));
+		expect(read.ok && read.hash).toBe(hash);
+		expect(read.ok && read.section).toEqual(doc.deploy);
+		const acceptance = { id: "en-accept", rowid: 1, workloadId: "wl-orchestrator", createdBy: "surface", createdAt: "", body: `deploy-policy: sha256 ${hash} in-accept` };
+		expect(authenticatePolicy(read, acceptance).authenticated).toBe(true);
+		expect(authenticatePolicy(read, { ...acceptance, body: "deploy-policy: off in-off" }).authenticated).toBe(false);
+		expect(authenticatePolicy(read, { ...acceptance, body: `deploy-policy: sha256 ${"b".repeat(64)} in-newest` }).authenticated).toBe(false);
 	});
 });
 

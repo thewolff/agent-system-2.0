@@ -20,8 +20,9 @@ import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_CAP_ENV, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
 import { labOf } from "../../classifier/src/lab";
 import {
-	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
+	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, ESCALATION_BY, HOLD_HOURS, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
 } from "./types";
+import { DEPLOY_BY } from "./types";
 
 // ---- knobs -------------------------------------------------------------------------------------
 
@@ -88,6 +89,8 @@ export const CONTROL_PREFIXES = [
 	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-notice", "train-autoboard",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
+	"now", "ruling-conflict",
+	"deploy", "deploy-run", "deploy-settled", "deploy-merge", "merge-inflight", "merge-done", "deploy-policy",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -99,7 +102,7 @@ const LANE_SCOPED: Record<string, true> = {
 /** The daily scratch sweep's `created_by` (surface/scripts/scratch-sweep.ts). */
 export const SCRATCH_SWEEP_BY = "scratch-sweep";
 /**
- * Fixed writers per prefix (§ 5). `lane-stop` and `done-because` are refined in `validWriter`. The
+ * Fixed writers per prefix (§ 5). `lane-stop`, `plan` and `done-because` are refined in `validWriter`. The
  * starter writes `lane-started:` / `lane-exit:` for the interactive lane it runs in Jo's terminal
  * (decision 8) and for the by-hand `lane.ts stop`; the runner writes them for an autonomous lane.
  * `launch-failed:` comes from the starter (a failure before the spawn) and from the runner (a lane
@@ -107,6 +110,9 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * `repo:` is the open tool's record of the repository (decision-log.ts); a lane's note never routes git.
  * `ceiling:` is the surface's alone (open, Jo's words, the lowering tool) and `spend:` the runner's
  * alone (DESIGN-workload-ceiling.md § 2 item 1); the raise-needs-Jo rule lives in `effectiveCeiling`.
+ * `plan:` is the surface's (`first <trigger>` at open, `approved <instruction>` on Jo's approve, `halted <instruction>` on
+ * Jo's `halt`), except `approved auto <round group>`, which only ESCALATION_BY writes (the plan auto-start in
+ * `lane_raise_question`, PLAN wl-mvfkv7llkp7nk0 § 3) and the surface never does.
  * `artifact-tree:` is reserved so the lane tools refuse it; the lane's own artifact observer writes it
  * (surface/extensions/lane.ts) and `artifactTrees` (signals.ts) reads it, never as a lifecycle line here.
  * `reserved-withdrawn: <entry id>[ <reason>]` is written only by `lane_withdraw_reserved`, as the lane
@@ -122,10 +128,12 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * `lane-decided: <laneId> <outcome>` is the runner's alone: it records an intended decision (`isIntendedOutcome`)
  * before it closes OMP's stdin, so the lane row's shutdown handler reads the end as intended through `exitClass`
  * (MIGRATION.md item 40, decision 14); a death outcome never writes one, its record is its `lane-died:` line (D5).
- * `plan-question: <question id>` is written only by `lane_raise_question`, as the lane holding the
+ * `plan-question: <question id>[ plan-sha256 <hex> verdict-sha256 <hex>]` is written only by `lane_raise_question`, as the lane holding the
  * workload, in the question's own transaction, when the question offers `approve` on the plan slice
  * while `plan: first` stands (PLAN wl-muq22rnjcfrrpc D9 part two); like `reserved-withdrawn:` its
- * writer is a holder (`validWriter`), and `isPlanQuestionIn` reads it as the plan question's role.
+ * writer is a holder (`validWriter`), and `isPlanQuestionIn` reads it as the plan question's role. The two hashes
+ * (`planQuestionBinding`) are the plan file and the verdict file as the raise checked them: a repeat of the open question
+ * skips the plan checks only while both files still hash the same (PLAN wl-mvg1vs0rhnu3gg fix round 1, F1).
  * `test-requested:` and `test-run:` are the test runner's alone (MIGRATION.md item 24; surface/src/test-run.ts):
  * a lane asks through `lane_full_test`, never by writing either. `push-dest: <remote> <branch> <sha>` is
  * row 8's record of a push it let through, written as the lane holding the workload, so like
@@ -167,6 +175,9 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * Jev ranking's rows (PLAN wl-mv8k039gvogt8g D3, surface/src/rank.ts): `priority-signal:` / `priority-signal-failed:` (on the
  * ranked workload) and `rank-shown:` (on the standing workload) are the ranking machinery's (RANK_BY), whichever session ranked;
  * `rank-goals:`, `rank-override:`, `rank-unpin:` (Jo's words, bound to an input) and `rank-audit:` (the wake tick) are the surface's.
+ * The escalation lines (PLAN wl-mvg1vs0rhnu3gg § 1.0, § 1.9; gates/src/rulings.ts `askJo`) are ESCALATION_BY's alone, written on the
+ * question's workload and slice in the raise's transaction: `now: <q-…> <category>` marks a question Jo hears at once (or upgrades a
+ * reused open one), and `ruling-conflict: <q-…> <ruling id> <ruling id>…` records the active rulings that disagreed on it, so it was raised.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -174,7 +185,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	worktree: [LANE_STARTER_BY],
 	branch: [LANE_STARTER_BY],
 	"launch-requested": [SURFACE_BY, MERGE_TRAIN_BY],
-	plan: [SURFACE_BY],
+	plan: [SURFACE_BY, ESCALATION_BY],
 	done: [SURFACE_BY, MERGE_TRAIN_BY],
 	repo: [SURFACE_BY, MERGE_TRAIN_BY],
 	"lane-started": [LANE_RUNNER_BY, LANE_STARTER_BY],
@@ -222,6 +233,15 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"rank-override": [SURFACE_BY],
 	"rank-unpin": [SURFACE_BY],
 	"rank-audit": [SURFACE_BY],
+	now: [ESCALATION_BY],
+	"ruling-conflict": [ESCALATION_BY],
+	deploy: [DEPLOY_BY],
+	"deploy-run": [DEPLOY_BY],
+	"deploy-settled": [DEPLOY_BY],
+	"deploy-merge": [DEPLOY_BY],
+	"merge-inflight": [DEPLOY_BY],
+	"merge-done": [DEPLOY_BY],
+	"deploy-policy": [SURFACE_BY],
 };
 
 export interface ControlEntry {
@@ -252,6 +272,7 @@ function validWriter(prefix: ControlPrefix, rest: string, createdBy: string, hol
 		return holders.includes(createdBy);
 	}
 	if (prefix === "released-open") return laneId === createdBy && holders.includes(createdBy);
+	if (prefix === "plan") return /^approved auto\b/.test(rest) ? createdBy === ESCALATION_BY : createdBy === SURFACE_BY;
 	if (prefix === "lane-stop") {
 		if (/^accepted\b/.test(rest)) return createdBy === LANE_RUNNER_BY || createdBy === LANE_STARTER_BY;
 		if (/^requested\b/.test(rest)) return createdBy === SURFACE_BY || createdBy === LANE_STARTER_BY;
@@ -281,7 +302,8 @@ export function holdersOf(entries: readonly EntryRow[], current: string | null, 
  * The valid control entries among a workload's entries, oldest first: reserved prefix, the prefix's
  * writer, and a parsable body. `holders` are the writers of `done-because:` (`holdersOf`); omit it
  * when the reader does not care about that prefix. Everything else — a lane note shaped like a
- * control line, a `launch-requested:` from a lane, a `plan: approved` from anyone but the surface —
+ * control line, a `launch-requested:` from a lane, a `plan: approved` from anyone but the surface (or, for
+ * `approved auto`, anyone but ESCALATION_BY) —
  * is dropped here, so no reader sees it.
  */
 export function controlEntries(entries: readonly EntryRow[], holders: readonly string[] = []): ControlEntry[] {
@@ -743,16 +765,27 @@ export function laneExit(control: readonly ControlEntry[], laneId: string): { co
 	return null;
 }
 
-/** The `plan: first <trigger>` standing on a workload with no `plan: approved` after it, or null. */
+/**
+ * The `plan: first <trigger>` standing on a workload with no `plan: approved` (Jo's, or the auto-start's `approved auto`)
+ * after it, or null. Jo's `plan: halted <instruction>` stands it again (PLAN wl-mvfkv7llkp7nk0 § 3): a halted workload
+ * reads as plan-first and unapproved, its trigger naming the halt, until a later `plan: approved`.
+ */
 export function planFirst(control: readonly ControlEntry[]): { trigger: string; entryId: string } | null {
 	let flag: { trigger: string; entryId: string } | null = null;
 	for (const c of control) {
 		if (c.prefix !== "plan") continue;
 		const first = /^first\s+([\s\S]+)$/.exec(c.rest);
+		const halted = /^halted\s+(\S+)/.exec(c.rest);
 		if (first) flag = { trigger: first[1]!.trim(), entryId: c.id };
+		else if (halted) flag = { trigger: `halted by Jo (instruction ${halted[1]!})`, entryId: c.id };
 		else if (/^approved\b/.test(c.rest)) flag = null;
 	}
 	return flag;
+}
+
+/** Has Jo halted the workload (`plan: halted`, PLAN wl-mvfkv7llkp7nk0 § 3) at any time? Auto-start never fires on it again. */
+export function planHalted(control: readonly ControlEntry[]): boolean {
+	return control.some((c) => c.prefix === "plan" && /^halted\b/.test(c.rest));
 }
 
 /**
@@ -988,8 +1021,8 @@ export function doneLine(control: readonly ControlEntry[]): string | null {
  * (`doneBecause`), and `lane_record_entry` refuses a body opening with any of them (surface/extensions/lane-tools.ts,
  * PLAN wl-mv64rsqw2fcs1s D5). A closed list: any other line, prefixed or not, still does. The pair
  * trigger's `pair-signal:` / `pair-signal-failed:` (the classifier's jev attempt), `pair-exposure:` (the lane's
- * classifier reading the switch on) and `pair-offer:` (stamped by the classifier at the round limit, by the lane runner
- * at the ceiling) are listed here so no lane can forge them (PLAN wl-mv67564rdkfvnk D9, surface/src/pair-suggest.ts).
+ * classifier reading the switch on) and `pair-offer:` (stamped by the classifier at the round limit) are listed here so
+ * no lane can forge them (PLAN wl-mv67564rdkfvnk D9, surface/src/pair-suggest.ts).
  * `headroom-skip: <selector> token <dt> <reason>` is the classifier's record of a tier-row entry it skipped as projected out of
  * quota (PLAN wl-mv71x5rwdu7eo0 § 3, classifier/src/headroom.ts), written beside `provider-refused:`.
  */
@@ -1276,8 +1309,47 @@ export function planFirstBody(trigger: string): string {
 export function planApprovedBody(instructionId: string): string {
 	return `plan: approved ${instructionId}`;
 }
-export function planQuestionBody(questionId: string): string {
-	return `plan-question: ${questionId}`;
+/** The auto-start's approval (PLAN wl-mvfkv7llkp7nk0 § 3), written by ESCALATION_BY only: the passing review round's dispatch group. */
+export function planAutoApprovedBody(group: string): string {
+	return `plan: approved auto ${group}`;
+}
+/** Jo's `halt <wl>` (PLAN wl-mvfkv7llkp7nk0 § 3), written by the surface naming Jo's instruction. */
+export function planHaltedBody(instructionId: string): string {
+	return `plan: halted ${instructionId}`;
+}
+/** The opening of the auto-start's notice text (after `notice: `), by which `prStakes` finds the notice whose delivery starts the hold. */
+export const PLAN_AUTO_STARTED = "plan started without your approve";
+/** The auto-start's notice (PLAN wl-mvfkv7llkp7nk0 § 3): the § 3 wording on `wl`, then the plan question's body. */
+export function planAutoStartNoticeBody(wl: string, planBody: string): string {
+	return `${PLAN_AUTO_STARTED} on ${wl} (normal stakes, cross-lab review passed); it will not merge until ${HOLD_HOURS} h after your next message here; \`halt ${wl}\` stops it\n${planBody}`;
+}
+/**
+ * The plan file and the review verdict file a plan question was checked on, each as its sha256 in hex (PLAN wl-mvg1vs0rhnu3gg
+ * fix round 1, F1): the plan file's hash is of the bytes `planQuestionProblem` judged, the verdict file's of its bytes then.
+ */
+export interface PlanBinding {
+	plan: string;
+	verdict: string;
+}
+/** `plan-question: <id>`, with the binding's two hashes when the raise has them. */
+export function planQuestionBody(questionId: string, binding?: PlanBinding): string {
+	return binding ? `plan-question: ${questionId} plan-sha256 ${binding.plan} verdict-sha256 ${binding.verdict}` : `plan-question: ${questionId}`;
+}
+const PLAN_BINDING_RE = /^(\S+) plan-sha256 ([0-9a-f]{64}) verdict-sha256 ([0-9a-f]{64})$/;
+/** The binding a `plan-question:` entry's rest carries for `questionId`; null when it names another question or carries none. */
+export function planQuestionBinding(rest: string, questionId: string): PlanBinding | null {
+	const m = PLAN_BINDING_RE.exec(rest);
+	return m !== null && m[1] === questionId ? { plan: m[2]!, verdict: m[3]! } : null;
+}
+/**
+ * The plan file and the verdict file a plan question's body names, read as `planQuestionProblem` reads them: line 1, trimmed,
+ * and the last comma-separated field of the `review:` line, trimmed. Null when the body has no review line.
+ */
+export function planQuestionFiles(body: string): { plan: string; verdict: string } | null {
+	const lines = body.split("\n");
+	const review = lines.find((l, i) => i > 0 && /^review:/.test(l));
+	if (review === undefined) return null;
+	return { plan: lines[0]!.trim(), verdict: review.slice("review:".length).split(",").map((p) => p.trim()).at(-1) ?? "" };
 }
 export function doneBody(sentence: string): string {
 	return `done: ${oneLine(sentence)}`;
@@ -1467,7 +1539,9 @@ export function firstPrompt(p: PromptInput): string {
 		// PLAN wl-mv8vwb04cy18n4 D4: the requirements grammar reaches plan-first lanes only, from the one constant.
 		out.push(`The plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section that names, for each requirement, its enforcer or why it is prompt-only, in this grammar; a plan file without it, or with a line the check cannot parse, is refused:`);
 		out.push(PLAN_REQUIREMENTS_SHAPE);
-		out.push("Change slices are refused until Jo approves.");
+		out.push(
+			"Change slices are refused until Jo approves. At normal stakes a plan that passes cross-lab review starts on its own unless flow repair is up: when the latest review round on the plan slice passed wholly on labs other than the builder's, `lane_raise_question` approves the plan instead of asking, Jo gets a notice, and you add your change slices.",
+		);
 	}
 	const shown = new Set(p.resolved.map((r) => r.instructionId));
 	const owed = p.instructions.filter((i) => !shown.has(i.id));

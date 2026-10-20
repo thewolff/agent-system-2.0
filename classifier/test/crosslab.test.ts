@@ -2025,6 +2025,19 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 		asksAsToday(crossing);
 	});
 
+	test("T5b Jo's `end-ruling kimi-out` ends the rule at once: in the window, the park asks as today and no rule entry is written", async () => {
+		const control = world();
+		await ruleRuns(control, await built(control));
+		const w = world();
+		const h = await built(w);
+		// What the surface writes for Jo's word (surface/src/input.ts `end-ruling`): Jo's instruction on the standing workload.
+		w.ledger.openWorkload({ by: SURFACE_BY, id: "wl-orchestrator", brief: "standing", stakes: "normal", mode: "user-driven" });
+		w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: "wl-orchestrator", body: "end-ruling kimi-out", author: "jo", channel: "surface" });
+		down(w, KIMI);
+		expect((await reviewSpawn(h, w))?.block).toBe(true);
+		asksAsToday(w);
+	});
+
 	/** The control the review-time guards share: builders anthropic and openai, kimi uncredentialed → the rule's same-lab hand. */
 	async function ruleRuns(w: World, h: Lane) {
 		down(w, KIMI);

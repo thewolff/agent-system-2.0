@@ -191,7 +191,8 @@ describe("F5: reserved refusal with no workload bound (§ B3 item 1)", () => {
 			const reserved = wake.lines.filter((l) => l.kind === "reserved");
 			expect(reserved).toHaveLength(1);
 			expect(reserved[0]!.workloadId).toBe(STANDING_WORKLOAD_ID);
-			expect(reserved[0]!.line).toMatch(/^reserved action waiting on you \(orchestrator\): .*git push --force origin main.* — `approve en-.*` or `deny en-.*`$/);
+			// A force-push is a history rewrite, so the line carries the NOW (irreversible) tag (PLAN wl-mvg1vs0rhnu3gg § 1.3).
+			expect(reserved[0]!.line).toMatch(/^NOW \(irreversible\): reserved action waiting on you \(orchestrator\): .*git push --force origin main.* — `approve en-.*` or `deny en-.*`$/);
 			expect(wake.text).toContain("## needs you");
 			expect(wake.text).toContain(reserved[0]!.line);
 			ledger.close();

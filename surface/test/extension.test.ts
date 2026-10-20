@@ -10,7 +10,6 @@ import { join } from "node:path";
 import { reviewLimitBody, ROUND_LIMIT_OPTIONS } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
-import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
 import { ceilingOf } from "../src/input";
 import { planFirstBody } from "../src/launch";
@@ -197,7 +196,7 @@ describe("surface extension adapter", () => {
 		l.close();
 	});
 
-	test("the pending block of a reserved request, a plan question, a ceiling question and a free-form question, pasted whole, applies four answers in one transaction (PLAN wl-mv5msri070p0qo § 3)", async () => {
+	test("the pending block of a reserved request, a plan question, a marked-default question and a free-form question, pasted whole, applies four answers in one transaction (PLAN wl-mv5msri070p0qo § 3)", async () => {
 		const f = fakePi();
 		const e = env();
 		const l = open(e);
@@ -217,12 +216,10 @@ describe("surface extension adapter", () => {
 			l.recordEntry({ by: "lane-p", workloadId: p, sliceId: sp, kind: "assumption", body: `plan-question: ${id}` });
 			return id;
 		});
-		// the runner's ceiling question
+		// a lane question whose body marks its default
 		const c = l.openWorkload({ by: SURFACE, brief: "Move the header offset into a token", stakes: "normal", mode: "autonomous" });
-		l.recordEntry({ by: SURFACE, workloadId: c, kind: "assumption", body: "ceiling: usd 50 wall 360 source stakes normal" });
-		l.recordEntry({ by: LANE_STARTER_BY, workloadId: c, kind: "assumption", body: "launch: lane-t-1 cause first requested-by test" });
-		const sc = l.addSlice({ by: LANE_RUNNER_BY, workloadId: c, id: "sl-ceiling-1", task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
-		const ceiling = l.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: c, sliceId: sc, body: "80 % of the ceiling", options: [...CEILING_OPTIONS] });
+		const sc = l.addSlice({ by: "lane-t-1", workloadId: c, task: "t", doneCondition: "d", inputs: "c.ts" });
+		const ceiling = l.raiseQuestion({ by: "lane-t-1", workloadId: c, sliceId: sc, body: "Keep going?\nstop (the default): park here.", options: ["extend", "stop", "split"] });
 		orchestratorSurface(f.pi, e);
 		const ctx = ctxOf();
 		notices.length = 0;

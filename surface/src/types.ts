@@ -115,6 +115,18 @@ export const TRAIN_TASK_FAILED_PREFIX = "train-task-failed:";
  * `priority-signal-failed:` and `rank-shown:`, written by whichever session ranks (the orchestrator, a lane, a hand).
  */
 export const RANK_BY = "as2-rank";
+/**
+ * The escalation policy's machinery stamp (PLAN wl-mvfkv7llkp7nk0 § 3): `lane_raise_question`'s auto-start of a
+ * cross-lab-passed normal-stakes plan writes `plan: approved auto <round group>` and its notice as this, never as the lane.
+ * The one `plan:` form it may write is `approved auto …` (surface/src/launch.ts `validWriter`).
+ */
+export const ESCALATION_BY = "escalation";
+/**
+ * The routine-deploy machinery's stamp (PLAN wl-mvgorfqqbuyyo0 § 2.2, § 3.2-3.4): row 6 writes `deploy:`, `deploy-run:`,
+ * `deploy-merge:`, `merge-inflight:` and `merge-done:`, and `as2 deploy settle` writes `deploy-settled:`, as this, never
+ * as the lane, so a lane cannot forge a deploy record (surface/src/launch.ts WRITERS).
+ */
+export const DEPLOY_BY = "deploy-gate";
 
 /**
  * The orchestrator's standing workload: the one open workload that carries rows belonging to no
