@@ -17,7 +17,7 @@ import {
 	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, type RangeCommit,
 	recordLive, reportCapBytes, reservation, resultJson, type RunFacts, runDirOf, runLive, runnerDiedRun, runsRoot, servedRepo, settleArtifact, stageDirOf, pushDestBody,
 	TEST_RUNNER_DEFAULTS, type TestRequested, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf, testRunnerConfig,
-	TestRunShapeError, testRuns, WRAPPER_EXIT, wrapperArgv, workDirOf,
+	TestRunShapeError, testRuns, WRAPPER_EXIT, wrapperArgv, workDirOf, failuresOf, parseSecurityRed, securityFailuresOf, securityRedBody, securityRedOf,
 } from "../src/test-run";
 import { tmp } from "./helpers";
 
@@ -161,6 +161,40 @@ Received: 1
  5 fail
 Ran 5 tests across 1 file. [57.00ms]
 `;
+/**
+ * Bun 1.3.14 from a repo root holding `gates/test/sec.test.ts` (one failing test in `describe("row 3")`, one passing) and
+ * `surface/test/plain.test.ts` (one failing test): the full suite, then `bun test ./gates/test/sec.test.ts` alone. The
+ * `file` attribute is repo-relative with no `./` in both, so a failure's name starts `gates/test/…`; only the solo part is `./…`.
+ */
+const JUNIT_GATES_FULL = `<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="3" assertions="2" failures="2" skipped="0" time="0.014538">
+  <testsuite name="gates/test/sec.test.ts" file="gates/test/sec.test.ts" tests="2" assertions="1" failures="1" skipped="0" time="0" hostname="h">
+    <testsuite name="row 3" file="gates/test/sec.test.ts" line="2" tests="1" assertions="1" failures="1" skipped="0" time="0.001" hostname="h">
+      <testcase name="fails" classname="row 3" time="0.001342" file="gates/test/sec.test.ts" line="2" assertions="1">
+        <failure type="AssertionError" />
+      </testcase>
+    </testsuite>
+    <testcase name="ok" classname="" time="0.000025" file="gates/test/sec.test.ts" line="3" assertions="0" />
+  </testsuite>
+  <testsuite name="surface/test/plain.test.ts" file="surface/test/plain.test.ts" tests="1" assertions="1" failures="1" skipped="0" time="0" hostname="h">
+    <testcase name="plain fails" classname="" time="0.000055" file="surface/test/plain.test.ts" line="2" assertions="1">
+      <failure type="AssertionError" />
+    </testcase>
+  </testsuite>
+</testsuites>
+`;
+const JUNIT_GATES_SOLO = `<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="2" assertions="1" failures="1" skipped="0" time="0.006601">
+  <testsuite name="gates/test/sec.test.ts" file="gates/test/sec.test.ts" tests="2" assertions="1" failures="1" skipped="0" time="0" hostname="h">
+    <testsuite name="row 3" file="gates/test/sec.test.ts" line="2" tests="1" assertions="1" failures="1" skipped="0" time="0" hostname="h">
+      <testcase name="fails" classname="row 3" time="0.000133" file="gates/test/sec.test.ts" line="2" assertions="1">
+        <failure type="AssertionError" />
+      </testcase>
+    </testsuite>
+    <testcase name="ok" classname="" time="0.000004" file="gates/test/sec.test.ts" line="3" assertions="0" />
+  </testsuite>
+</testsuites>
+`;
 
 /** A junit report with `n` failing cases, each with its own message, for the >20 failures case. */
 function manyFailures(n: number): string {
@@ -239,6 +273,44 @@ describe("bodies: format and parse round-trip exactly; malformed bodies are reje
 		expect(testRunFailedOf("wl-t", "sl-full-t-1", run(r, "red"))).toEqual({ workloadId: "wl-t", slice: "sl-full-t-1", verdict: "red", sha: A, failing: 1, first: "x.test.ts > broken" });
 		expect(testRunFailedOf("wl-t", "sl-full-t-1", run(r, "green"))).toBeNull();
 		expect(testRunFailedOf("wl-t", "sl-full-t-1", run(r, "superseded"))).toBeNull();
+	});
+	test("security-red: securityFailuresOf takes a real junit report's gates/test/ failures for red and red-main, none for a non-gates failure", () => {
+		const r = request("tr-0abc12", 17, A);
+		const full = partResult({ junit: JUNIT_GATES_FULL, log: null, exit: 1, ms: 10 });
+		const solo = [{ file: "./gates/test/sec.test.ts", ...partResult({ junit: JUNIT_GATES_SOLO, log: null, exit: 1, ms: 5 }) }];
+		const failures = failuresOf(full, solo);
+		const SEC = "gates/test/sec.test.ts > row 3 > fails";
+		expect(failures.map((f) => [f.part, f.name])).toEqual([["full", SEC], ["full", "surface/test/plain.test.ts > plain fails"], ["./gates/test/sec.test.ts", SEC]]);
+		const security = [failures[0], failures[2]];
+		const red = run(r, "red", { failures });
+		expect(securityFailuresOf(red)).toEqual(security);
+		const redMain = run(r, "red-main", { failures, baseCompare: { sha: C, parts: [{ part: "full", failing: [SEC, failures[1]!.name], baseFailing: [SEC, failures[1]!.name], baseError: null }] } });
+		expect(securityFailuresOf(redMain)).toEqual(security);
+		for (const v of ["stale", "error", "green"] as const) expect(securityFailuresOf(run(r, v, { failures }))).toEqual(security);
+		expect(securityFailuresOf(run(r, "superseded", { failures }))).toEqual([]);
+		// a non-gates failure is none, in any part; a path that only contains or resembles gates/test/ is none
+		expect(securityFailuresOf(run(r, "red", { failures: [failures[1]!] }))).toEqual([]);
+		const near = [{ part: "full", name: "src/gates/test/x.test.ts > a", firstError: "e" }, { part: "./gates/testing/x.test.ts", name: "gates/testing/x.test.ts > a", firstError: "e" }];
+		expect(securityFailuresOf(run(r, "red", { failures: near }))).toEqual([]);
+		// the solo part alone is enough
+		const byPart = { part: "./gates/test/y.test.ts", name: "y.test.ts > a", firstError: "e" };
+		expect(securityFailuresOf(run(r, "red", { failures: [byPart] }))).toEqual([byPart]);
+		// the signal: run id, sha, the count and the first name; none without a security failure
+		expect(securityRedOf("wl-t", "sl-full-t-1", redMain)).toEqual({ workloadId: "wl-t", slice: "sl-full-t-1", runId: "tr-0abc12", sha: A, failing: 2, first: SEC });
+		expect(securityRedOf("wl-t", "sl-full-t-1", run(r, "red", { failures: [failures[1]!] }))).toBeNull();
+		expect(securityRedOf("wl-t", "sl-full-t-1", run(r, "superseded", { failures }))).toBeNull();
+		// the ordinary signal still ignores red-main
+		expect(testRunFailedOf("wl-t", "sl-full-t-1", redMain)).toBeNull();
+	});
+	test("security-red: (a pushed signal) formats and parses exactly; malformed bodies are rejected", () => {
+		const s = { workloadId: "wl-mvg1vs0rhnu3gg", slice: "sl-full-mvg1vs0rhnu3gg-1", runId: "tr-0abc12", sha: A, failing: 2, first: "gates/test/sec.test.ts > row 3 > fails" };
+		const body = securityRedBody(s);
+		expect(body).toBe(`security-red: wl-mvg1vs0rhnu3gg sl-full-mvg1vs0rhnu3gg-1 tr-0abc12 ${A} 2 gates/test/sec.test.ts > row 3 > fails`);
+		expect(parseSecurityRed(body)).toEqual(s);
+		expect(securityRedBody({ ...s, first: "a\n  b" }).endsWith(" 2 a b")).toBe(true);
+		for (const bad of [body.replace(" 2 ", " 0 "), body.replace(" 2 ", " x "), body.replace("tr-0abc12", "tr-X"), body.replace(A, "abc"), body.replace("wl-", "w-"), body.slice(0, body.lastIndexOf(" 2 ") + 2)])
+			expect(parseSecurityRed(bad)).toBeNull();
+		for (const over of [{ failing: 0 }, { runId: "run-1" }, { sha: "nope" }, { first: "  " }]) expect(() => securityRedBody({ ...s, ...over })).toThrow(TestRunShapeError);
 	});
 	test("push-dest:", () => {
 		const d = { remote: "origin", branch: "wl/wl-other", sha: A };

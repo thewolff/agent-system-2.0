@@ -16,13 +16,23 @@
 // (surface/src/orchestrator-question.ts). surface/scripts/invariants.ts `ruling-miss` replays the
 // same check over question rows to catch a raise path that bypassed it.
 //
+// Phase 2 (PLAN wl-mvg1vs0rhnu3gg § 1.0, § 1.9, § 3.5): before the rulings, an ask whose identity (workload, slice,
+// body, options and, for the orchestrator, the `about` workload of the open question's `question-about:` entry) equals
+// an open question's is not raised again: it returns that id as reused and writes nothing, except one `now:` mark when
+// the repeat carries `now` and the open one has none. A model-subject question is never deduplicated (no row records
+// its subject). An ask with `now` (one of `NOW_CATEGORIES`) skips every ruling and is raised with ESCALATION_BY's
+// `now: <q-…> <category>` in the same write. Two or more active rulings that decide one question with different
+// answers decide nothing: the question is raised with ESCALATION_BY's `ruling-conflict: <q-…> <ruling ids…>`.
+// Both lines are control entries (surface/src/launch.ts), so a look-alike by anyone else is no mark.
+//
 // No import of surface/src/orchestrator-question.ts or surface/src/merge-train.ts: both call `askJo`,
 // and gates/src/rows already imports the former.
-import type { InstructionRow, Ledger } from "../../ledger/src/index";
+import type { EntryRow, InstructionRow, Ledger } from "../../ledger/src/index";
 import { type Builders, KIMI_OUT_RULE, labOf, reviewRow } from "../../classifier/src/lab";
 import { loadTierTable, modelIdentity } from "../../classifier/src/tier-table";
+import { controlEntries } from "../../surface/src/launch";
 import { installedConfigPath } from "../../surface/src/pair-suggest";
-import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../../surface/src/types";
+import { ESCALATION_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../../surface/src/types";
 
 export type RulingId = "kimi-out" | "flow-repair" | "merges" | "models" | "gates-stakes";
 
@@ -227,20 +237,48 @@ export function rulingActive(view: RulingsView, id: RulingId, now: number): bool
 	return (ruling.ends.at === null || now < ruling.ends.at) && !endedRulings(view.instructions(STANDING_WORKLOAD_ID)).has(id);
 }
 
+/** What the active rulings say about a question: one decision (every ruling that decides agrees), a conflict (two or more decide with different answers), or null (none decides). */
+export type RulingOutcome = { decided: Decision } | { conflict: RulingId[] } | null;
+
 /**
- * The decision of the first active ruling that covers `q`, or null when the question goes to Jo. `state` is the clock
- * and the rulings Jo has ended (`endedRulings`); the live check reads them now, `ruling-miss` as of the question's raise.
+ * Every active ruling of `rulings` (`STANDING_RULINGS` unless a test injects others) that covers `q`, checked together:
+ * when all that decide give one answer, the first one's decision; when two or more answer differently, a conflict that
+ * decides nothing (PLAN wl-mvg1vs0rhnu3gg § 1.9); none, null. `state` is the clock and the rulings Jo has ended
+ * (`endedRulings`).
  */
-export function checkRulings(q: RulingQuestion, facts: RulingFacts, state: { now: number; ended: ReadonlySet<RulingId> }): Decision | null {
+export function rulingOutcome(
+	q: RulingQuestion,
+	facts: RulingFacts,
+	state: { now: number; ended: ReadonlySet<RulingId> },
+	rulings: readonly Ruling[] = STANDING_RULINGS,
+): RulingOutcome {
 	const kind = questionKind(q.options, q.subject);
 	if (kind === "other") return null;
-	for (const r of STANDING_RULINGS) {
+	const decisions: Decision[] = [];
+	for (const r of rulings) {
 		if (!r.kinds.includes(kind) || state.ended.has(r.id) || (r.ends.at !== null && state.now >= r.ends.at)) continue;
 		if (!r.scope(q, kind, facts)) continue;
 		const answer = r.answer(q, kind, facts);
-		return { ruling: r.id, answer, action: r.action(q, kind, facts, answer) };
+		decisions.push({ ruling: r.id, answer, action: r.action(q, kind, facts, answer) });
 	}
-	return null;
+	const first = decisions[0];
+	if (first === undefined) return null;
+	if (decisions.some((d) => d.answer !== first.answer)) return { conflict: decisions.map((d) => d.ruling) };
+	return { decided: first };
+}
+
+/**
+ * The decision the active rulings agree on for `q`, or null when the question goes to Jo (none decides, or they
+ * conflict: `rulingOutcome`). The live check reads `state` now, `ruling-miss` as of the question's raise.
+ */
+export function checkRulings(
+	q: RulingQuestion,
+	facts: RulingFacts,
+	state: { now: number; ended: ReadonlySet<RulingId> },
+	rulings: readonly Ruling[] = STANDING_RULINGS,
+): Decision | null {
+	const outcome = rulingOutcome(q, facts, state, rulings);
+	return outcome !== null && "decided" in outcome ? outcome.decided : null;
 }
 
 /** The asker's record of a decided question: `ruling-applied: <ruling> kind <k> slice <sl> answer <a>`. */
@@ -248,8 +286,37 @@ export const RULING_APPLIED_PREFIX = "ruling-applied";
 export const rulingAppliedBody = (d: Decision, kind: QuestionKind, sliceId: string): string =>
 	`${RULING_APPLIED_PREFIX}: ${d.ruling} kind ${kind} slice ${sliceId} answer ${d.answer}`;
 
+/** ESCALATION_BY's record of rulings that disagreed on a question it then raised: `ruling-conflict: <q-…> <ruling id> <ruling id>…`. */
+export const RULING_CONFLICT_PREFIX = "ruling-conflict";
+export const rulingConflictBody = (questionId: string, rulings: readonly RulingId[]): string =>
+	`${RULING_CONFLICT_PREFIX}: ${questionId} ${rulings.join(" ")}`;
+
+/** DRAFT §1's three now bullets as words: a question asked with one reaches Jo at once, past every ruling (PLAN wl-mvg1vs0rhnu3gg § 1.0). */
+export const NOW_CATEGORIES = ["integrity", "security", "incident", "guard", "boundary", "irreversible", "money"] as const;
+export type NowCategory = (typeof NOW_CATEGORIES)[number];
+export const isNowCategory = (word: string): word is NowCategory => (NOW_CATEGORIES as readonly string[]).includes(word);
+
+/** ESCALATION_BY's mark of a NOW question, written in the raise's (or the upgrade's) transaction: `now: <q-…> <category>`. */
+export const NOW_PREFIX = "now";
+export const nowBody = (questionId: string, category: NowCategory): string => `${NOW_PREFIX}: ${questionId} ${category}`;
+const NOW_REST = /^(q-[a-z0-9]+) ([a-z]+)$/;
+
+/**
+ * The NOW category of each question a valid `now:` control entry among `entries` names (surface/src/launch.ts
+ * `controlEntries`: ESCALATION_BY's alone, so a look-alike by anyone else marks nothing); a question's first mark wins.
+ */
+export function nowMarks(entries: readonly EntryRow[]): Map<string, NowCategory> {
+	const out = new Map<string, NowCategory>();
+	for (const c of controlEntries(entries)) {
+		if (c.prefix !== NOW_PREFIX) continue;
+		const m = NOW_REST.exec(c.rest);
+		if (m && isNowCategory(m[2]!) && !out.has(m[1]!)) out.set(m[1]!, m[2]);
+	}
+	return out;
+}
+
 /** The ledger calls `askJo` makes; `Ledger` and the classifier's `RoutingLedger` satisfy it. */
-export type AskLedger = Pick<Ledger, "write" | "raiseQuestion" | "recordEntry" | "instructions">;
+export type AskLedger = Pick<Ledger, "write" | "raiseQuestion" | "recordEntry" | "instructions" | "questions" | "entries">;
 
 export interface AskInput {
 	by: string;
@@ -258,28 +325,85 @@ export interface AskInput {
 	body: string;
 	options: string[];
 	subject?: ModelSubject | null;
+	/** Jo hears it at once: one of `NOW_CATEGORIES`; any other word is refused and nothing is asked. */
+	now?: NowCategory | null;
 }
 
-export type AskResult = { raised: string } | { decided: Decision };
+/** A raised question, the open one an identical ask reused (nothing raised again), or a ruling's decision. */
+export type AskResult = { raised: string } | { raised: string; reused: true } | { decided: Decision };
 
 /**
- * Ask Jo, unless a standing ruling already answered: in one write, the rulings are checked; a decided question writes
- * no question row and records `ruling-applied:` as the asker on the question's workload and slice; otherwise the
- * question is raised (which pauses its slice). Throws when the declared subject does not fit the options.
+ * The orchestrator's subject entry, as surface/src/orchestrator-question.ts `questionSubjectBody` writes it (the surface,
+ * on the standing workload, in the raise's transaction); read here because that module imports this one.
  */
-export function askJo(ledger: AskLedger, input: AskInput, facts: RulingFacts): AskResult {
+const QUESTION_ABOUT = /^question-about: (q-[a-z0-9]+) (wl-[a-z0-9]+)$/;
+function questionAbout(entries: readonly EntryRow[], questionId: string): string | null {
+	for (const e of entries) {
+		if (e.created_by !== SURFACE_BY) continue;
+		const m = QUESTION_ABOUT.exec(e.body);
+		if (m && m[1] === questionId) return m[2]!;
+	}
+	return null;
+}
+
+/**
+ * The open question `input` repeats, or null: same workload, slice, body and options and, for the orchestrator, the same
+ * `about` workload as the open question's subject entry (PLAN wl-mvg1vs0rhnu3gg § 3.5). A model-subject ask never
+ * repeats one: the subject is not stored, so equality cannot be checked.
+ */
+function openRepeat(ledger: AskLedger, input: AskInput, facts: RulingFacts): string | null {
+	if (input.subject != null) return null;
+	const options = JSON.stringify(input.options);
+	let entries: EntryRow[] | null = null;
+	for (const q of ledger.questions(input.workloadId)) {
+		if (q.state !== "open" || q.slice_id !== input.sliceId || q.body !== input.body || q.options !== options) continue;
+		if (facts.asker === "orchestrator") {
+			entries ??= ledger.entries(input.workloadId, "assumption");
+			if (questionAbout(entries, q.id) !== (facts.about ?? null)) continue;
+		}
+		return q.id;
+	}
+	return null;
+}
+
+/**
+ * Ask Jo, unless the question is already open or a standing ruling already answered, in one write:
+ * - an ask repeating an open question (`openRepeat`) returns its id as reused and writes nothing, except ESCALATION_BY's
+ *   `now:` mark for that id when the ask carries `now` and the open one has no valid mark (queue → NOW);
+ * - an ask with `now` skips the rulings and is raised with ESCALATION_BY's `now:` mark;
+ * - otherwise the rulings are checked: a decided question writes no question row and records `ruling-applied:` as the
+ *   asker on the question's workload and slice; rulings in conflict decide nothing, and the question is raised with
+ *   ESCALATION_BY's `ruling-conflict:`; with none deciding the question is raised (which pauses its slice).
+ * Throws, asking nothing, when the declared subject does not fit the options or `now` is not one of `NOW_CATEGORIES`.
+ * `rulings` is `STANDING_RULINGS` except where a test injects others.
+ */
+export function askJo(ledger: AskLedger, input: AskInput, facts: RulingFacts, rulings: readonly Ruling[] = STANDING_RULINGS): AskResult {
 	const problem = subjectProblem(input.options, input.subject);
 	if (problem !== null) throw new Error(`${problem}; nothing was asked`);
+	const now = input.now ?? null;
+	if (now !== null && !isNowCategory(now)) throw new Error(`now is one of ${NOW_CATEGORIES.join(", ")}, not ${now}; nothing was asked`);
+	const escalation = (body: string) =>
+		ledger.recordEntry({ by: ESCALATION_BY, workloadId: input.workloadId, sliceId: input.sliceId, kind: "assumption", body });
 	return ledger.write(() => {
-		const q = { body: input.body, options: input.options, subject: input.subject ?? null };
-		const decided = checkRulings(q, facts, { now: facts.now ?? Date.now(), ended: endedRulings(ledger.instructions(STANDING_WORKLOAD_ID)) });
-		if (decided !== null) {
-			const kind = questionKind(q.options, q.subject);
-			ledger.recordEntry({ by: input.by, workloadId: input.workloadId, sliceId: input.sliceId, kind: "assumption", body: rulingAppliedBody(decided, kind, input.sliceId) });
-			return { decided };
+		const open = openRepeat(ledger, input, facts);
+		if (open !== null) {
+			if (now !== null && !nowMarks(ledger.entries(input.workloadId, "assumption")).has(open)) escalation(nowBody(open, now));
+			return { raised: open, reused: true as const };
 		}
-		const { subject: _subject, ...raise } = input;
-		return { raised: ledger.raiseQuestion(raise) };
+		const q = { body: input.body, options: input.options, subject: input.subject ?? null };
+		const outcome =
+			now === null
+				? rulingOutcome(q, facts, { now: facts.now ?? Date.now(), ended: endedRulings(ledger.instructions(STANDING_WORKLOAD_ID)) }, rulings)
+				: null;
+		if (outcome !== null && "decided" in outcome) {
+			const kind = questionKind(q.options, q.subject);
+			ledger.recordEntry({ by: input.by, workloadId: input.workloadId, sliceId: input.sliceId, kind: "assumption", body: rulingAppliedBody(outcome.decided, kind, input.sliceId) });
+			return { decided: outcome.decided };
+		}
+		const raised = ledger.raiseQuestion({ by: input.by, workloadId: input.workloadId, sliceId: input.sliceId, body: input.body, options: input.options });
+		if (now !== null) escalation(nowBody(raised, now));
+		if (outcome !== null) escalation(rulingConflictBody(raised, outcome.conflict));
+		return { raised };
 	});
 }
 

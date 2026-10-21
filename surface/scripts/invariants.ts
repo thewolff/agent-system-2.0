@@ -35,7 +35,7 @@
 // | no-independent-lab | the classifier's own `builderLabs` (classifier/src/lab.ts) excludes all three labs; review tokens held by a live spawning lane are passed as `liveReviews`, as the classifier does | `no-independent-lab:<wl>` |
 // | stale-reserved | a `reserved-request` entry older than 30 min that `reservedStates` (surface/src/errors.ts) still finds `waiting`: no `approve <id>` / `deny <id>` instruction, no `reserved-withdrawn: <id>`, its raising lane still holds the workload (a `lane-stopped` request is closed, not stale), and no later request repeats it | `stale-reserved:<entry>` |
 // | stuck-question | a question open for more than 30 min | `stuck-question:<q>` |
-// | ruling-miss | a question open as of as-of, raised at or after the ledger's first `ruling-applied:` entry landed by as-of (the activation receipt: only `askJo`, gates/src/rulings.ts, writes one; with none, nothing is selected), that an active standing ruling would have decided (`checkRulings` replayed as of its raise: its asker read from its writer — the orchestrator surface on the standing workload with its `question-about:` subject, the merge train, the classifier for a question its `review-park:` / `review-limit:` entry names, else the lane — with the workload's builders, stakes and train flag then, and Jo's `end-ruling` words by then): a raise path that bypassed `askJo`. A question whose every option is a `provider/model` id is never one: its row does not carry the declared subject | `ruling-miss:<q>` |
+// | ruling-miss | a question open as of as-of, raised at or after the ledger's first `ruling-applied:` entry landed by as-of (the activation receipt: only `askJo`, gates/src/rulings.ts, writes one; with none, nothing is selected), that an active standing ruling would have decided (`checkRulings` replayed as of its raise: its asker read from its writer — the orchestrator surface on the standing workload with its `question-about:` subject, the merge train, the classifier for a question its `review-park:` / `review-limit:` entry names, else the lane — with the workload's builders, stakes and train flag then, and Jo's `end-ruling` words by then): a raise path that bypassed `askJo`. A question whose every option is a `provider/model` id is never one: its row does not carry the declared subject. Nor is a NOW question, one a valid `now:` control entry (ESCALATION_BY's, `nowMarks`) names: it skips the rulings by design, and a look-alike by anyone else exempts nothing | `ruling-miss:<q>` |
 // | stuck-review | a `hand-spawn: … review yes` with no `hand-settled:` after 45 min while any lane on the workload is alive | `stuck-review:<token>` |
 // | provider-refusal-loop | 2+ `lane-exit:` on one workload within 30 min, each with refusal evidence (`usage polic`, `non-retryable`, `refusal`) in ledger entries/messages from 2 min before to 5 min after the exit (never past as-of), or, for `outcome error`, in the final `prompt_result` of the lane's rpc log `lane-<n>.jsonl` (read as it is now) | `provider-refusal-loop:<wl>:<first lane>` |
 // | silent-orchestrator | no `wl-orchestrator` entry for 2 h while any lane process is alive; the train tick's rows there (MERGE_TRAIN_BY: its boards' skips, notices and cutover, PLAN wl-mvbjiettjrfpxc D10) are not the orchestrator's | `silent-orchestrator:<last entry id>` |
@@ -69,7 +69,7 @@ import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from
 import { dirname, join, resolve } from "node:path";
 import { builderLabs, describeBuilders, excludedLabs, parseHandSpawn } from "../../classifier/src/lab";
 import { parseReviewLimit } from "../../classifier/src/rounds";
-import { checkRulings, endedRulings, type RulingFacts } from "../../gates/src/rulings";
+import { checkRulings, endedRulings, nowMarks, type RulingFacts } from "../../gates/src/rulings";
 import { BACKUP_DEFAULTS, BACKUP_NAME, backupNamespace, copyProblem, processAlive } from "../../ledger/src/index";
 import type { EntryKind, EntryRow, InstructionRow, RoutingRow, Stakes, WorkloadStatusRow } from "../../ledger/src/index";
 import { assertNotLiveLedgerUnderTest, canonicalPath, defaultLedgerPath, homeDir } from "../../ledger/src/locality";
@@ -489,6 +489,8 @@ export function check(input: Input): Report {
 			.query("SELECT * FROM entries WHERE workload_id = :wl AND created_at <= :asOf ORDER BY created_at, rowid")
 			.all({ ":wl": q.workload_id, ":asOf": asOf } as never) as EntryRow[];
 		const names = (e: EntryRow) => e.created_by === q.created_by && (e.body.startsWith(`review-park: ${q.id} slice `) || parseReviewLimit(e.body)?.questionId === q.id);
+		// A NOW question skips every ruling by design (askJo, PLAN wl-mvg1vs0rhnu3gg § 1.0): only ESCALATION_BY's valid `now:` mark, written in its raise's (or upgrade's) transaction, exempts it.
+		if (nowMarks(marks).has(q.id)) continue;
 		let facts: RulingFacts;
 		if (q.workload_id === STANDING_WORKLOAD_ID && q.created_by === SURFACE_BY) {
 			const about = marks.find((e) => e.created_by === SURFACE_BY && e.body.startsWith(`question-about: ${q.id} `))?.body.split(" ")[2] ?? null;

@@ -511,6 +511,30 @@ something Jo is told and does not answer (a ceiling at 80 %, a ceiling stop, a p
 The two ceiling notices are on fire for the batch; every other notice waits for the window. A `notice:` written by a
 lane that holds or held the workload shows only as that lane's message.
 
+**Amended 2026-10-20 — escalation phase 2, wave 1: now questions, repeats, ruling conflicts, NOW reserved requests,
+security-red** (`migration/items/escalation-policy-phase2.md`; Jo, `split` on q-mvg1l5vvo94ow0 and ledger input
+`in-mvg1vdxhuwgt8g` (*"open phase 2"*), the policy draft's §§ 1 and 3; plan
+`~/agent-scratch/agent-system-2.0/wl-mvg1vs0rhnu3gg/PLAN.md` rev 5 §§ 1.0–1.3, 1.9, 3.3, 3.5, approved by Jo with its
+recommendations on open questions 1, 2 and 5; built in wl-mvg1vs0rhnu3gg). Item 5 gains a second speed. **Now:**
+`lane_raise_question` and `orchestrator_raise_question` take an optional `now`, one of `integrity`, `security`,
+`incident`, `guard`, `boundary`, `irreversible`, `money` (the draft's three now triggers); any other word is refused and
+nothing is asked. `askJo` raises such a question past every standing ruling (and a lane's plan question past auto-start,
+its review and shape checks still run) and, in the same write, records `now: <q-…> <category>`, a control entry only
+`escalation` writes. The needs-you line is tagged `NOW (<category>): ` and is on fire; `ruling-miss` skips a question with
+a valid mark. When to pass `now` is the asker's judgment. **Repeats:** an ask whose workload, slice, body and options,
+and for the orchestrator its `about` workload, equal an open question's raises nothing and returns that id, writing
+nothing but one `now:` mark when the repeat carries `now` and the open one has none; a question whose options are all
+model ids is never a repeat. **Relays:** `orchestrator_raise_question` refuses a body naming an open question of another
+workload, writing nothing. **Conflicts:** two or more active rulings that decide one question with different answers
+decide nothing; the question is raised with `escalation`'s `ruling-conflict: <q-…> <ruling ids>`. Item 1: a waiting
+reserved request whose action is in row 6's `NOW_RESERVED` (`gates/src/rows/r06-reserved.ts`: guard bypasses and
+irreversible or shared-state rules) is tagged `NOW (guard): ` or `NOW (irreversible): ` and is on fire; every other
+waits for the window. **Security red:** a full-suite run of any verdict but `superseded` with a failing test under
+`gates/test/` (as2's security tests) makes the test runner send `security-red: <wl> <slice> <run id> <sha> <n> <first>`,
+whatever holds the workload; it shows as its own on-fire needs-you line, past a live lane and a train task's routing,
+while the ordinary test-run line keeps its suppression. A lane asks Jo before it changes such a test. The daily sweep's
+`scratch-disk` line is on fire too.
+
 ### B4 · Stakes → tier cap, and review as a stakes property (P-9, P-8a, A4 "approved")
 
 **Ruled 2026-09-23.** Jo: *"yes to your reccos"*, after *"so would every normal workload cost

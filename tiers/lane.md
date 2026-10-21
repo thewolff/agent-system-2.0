@@ -67,6 +67,8 @@ Your workload's ledger is written only through these tools, never a CLI: `ledger
 
 Jo's standing rulings are checked before any question you raise (SPEC-2.0.md § B3, *Amended 2026-10-19*). When one already answers it, `lane_raise_question` writes no question and returns `decided by Jo's ruling <id>: <action>`; do what the action says, and publish no QUESTION block. A notice is something Jo is told and does not answer (a ceiling at 80 %, a ceiling stop, a plan that started on its own); only the machinery sends one. Your first prompt names the workload's ceiling: at 80 % Jo gets a notice, and at 100 % an autonomous lane is stopped and Jo is told, with no question to you or to Jo. A lane Jo runs by hand is never stopped at the ceiling; it gets its spend figure at every turn start.
 
+Pass `now` to `lane_raise_question` (`integrity`, `security`, `incident`, `guard`, `boundary`, `irreversible` or `money`) only when Jo must hear it at once: a credible data-integrity or security risk or an urgent incident, a change that weakens a guard or crosses a boundary Jo stated, or an irreversible effect or money commitment the plan does not authorize (SPEC-2.0.md § B3, *Amended 2026-10-20*). It skips the rulings and auto-start and reaches Jo on fire. Asking an open question again returns its id and raises nothing. Ask Jo before you change a failing test under `gates/test/`: those are the security tests.
+
 Any order of workloads, PRs or next steps you give Jo or act on comes from `as2_rank`, never your own judgment; Jo's "X first", unpins and goals are the orchestrator's to record.
 
 ## Git shape and completion (decision 11)

@@ -4,8 +4,9 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
-import { askJo, checkRulings, endedRulings, questionKind, type RulingFacts, type RulingId, STANDING_RULINGS, subjectProblem } from "../src/rulings";
-import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../../surface/src/types";
+import { askJo, checkRulings, endedRulings, questionKind, type Ruling, type RulingFacts, type RulingId, STANDING_RULINGS, subjectProblem } from "../src/rulings";
+import { raiseOrchestratorQuestion } from "../../surface/src/orchestrator-question";
+import { ESCALATION_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../../surface/src/types";
 import { tmp } from "./helpers";
 
 const IN_WINDOW = Date.parse("2026-10-20T12:00:00-07:00");
@@ -179,5 +180,123 @@ describe("endedRulings: only Jo's word through the surface, for a ruling held he
 		expect([...endedRulings(l.instructions(STANDING_WORKLOAD_ID))]).toEqual([]);
 		endRuling(l, "merges");
 		expect([...endedRulings(l.instructions(STANDING_WORKLOAD_ID))]).toEqual(["merges"]);
+	});
+});
+
+describe("phase 2 (PLAN wl-mvg1vs0rhnu3gg § 1.0, § 1.9, § 3.5): now, duplicates, ruling conflicts", () => {
+	const escalations = (l: Ledger, wl: string) =>
+		l.entries(wl).filter((e) => /^(now|ruling-conflict): /.test(e.body)).map((e) => [e.body, e.created_by, e.slice_id]);
+
+	test("R1: now skips a covering ruling: the question is raised with ESCALATION_BY's now: mark in its write, for each of the seven words; any other word is refused with nothing written", () => {
+		const { l, wl, sl } = ledger();
+		const open = { by: "lane-a", workloadId: wl, sliceId: sl, body: "Open the docs workload now or later?", options: ["open", "later"] };
+		expect(() => askJo(l, { ...open, now: "urgent" as never }, { asker: "lane", now: IN_WINDOW })).toThrow("nothing was asked");
+		expect(l.questions(wl)).toEqual([]);
+		expect(l.entries(wl)).toEqual([]);
+		const r = askJo(l, { ...open, now: "security" }, { asker: "lane", now: IN_WINDOW });
+		if (!("raised" in r)) throw new Error("expected the now question raised past flow-repair");
+		expect(l.questions(wl).map((q) => [q.id, q.state])).toEqual([[r.raised, "open"]]);
+		expect(l.slice(sl)!.state).toBe("paused");
+		expect(escalations(l, wl)).toEqual([[`now: ${r.raised} security`, ESCALATION_BY, sl]]);
+		expect(l.entries(wl).some((e) => e.body.startsWith("ruling-applied:"))).toBe(false);
+		for (const word of ["integrity", "incident", "guard", "boundary", "irreversible", "money"] as const) {
+			const other = l.addSlice({ by: "lane-a", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+			const asked = askJo(l, { ...open, sliceId: other, now: word }, { asker: "lane", now: IN_WINDOW });
+			if (!("raised" in asked)) throw new Error(`expected the ${word} question raised`);
+			expect(escalations(l, wl).at(-1)).toEqual([`now: ${asked.raised} ${word}`, ESCALATION_BY, other]);
+		}
+		expect(l.entries(wl).some((e) => e.body.startsWith("ruling-applied:"))).toBe(false);
+	});
+
+	test("R7: a duplicate of an open question returns the open id marked reused and writes nothing", () => {
+		const { l, wl, sl } = ledger();
+		const ask = { by: "lane-a", workloadId: wl, sliceId: sl, body: "Ship it?", options: ["ship", "hold"] };
+		const first = askJo(l, ask, { asker: "lane", now: IN_WINDOW });
+		if (!("raised" in first)) throw new Error("expected a raised question");
+		const entries = l.entries(wl).length;
+		expect(askJo(l, ask, { asker: "lane", now: IN_WINDOW })).toEqual({ raised: first.raised, reused: true });
+		expect(l.questions(wl).map((q) => q.id)).toEqual([first.raised]);
+		expect(l.entries(wl).length).toBe(entries);
+		// A revised body, or other options, is a new question.
+		const revised = askJo(l, { ...ask, body: "Ship it now?" }, { asker: "lane", now: IN_WINDOW });
+		expect(revised).not.toHaveProperty("reused");
+		expect(l.questions(wl).length).toBe(2);
+	});
+
+	test("R7: the same orchestrator body about two workloads raises two questions; a repeat about the first reuses its id", () => {
+		const { l } = ledger();
+		const a = l.openWorkload({ by: SURFACE_BY, brief: "A", stakes: "normal", mode: "autonomous" });
+		const b = l.openWorkload({ by: SURFACE_BY, brief: "B", stakes: "normal", mode: "autonomous" });
+		const ask = (about: string) => raiseOrchestratorQuestion(l, { body: "Keep the lane running?", options: ["keep", "stop"], about });
+		const qa = ask(a);
+		const qb = ask(b);
+		if (!("raised" in qa) || !("raised" in qb)) throw new Error("expected two raised questions");
+		expect(qb.raised).not.toBe(qa.raised);
+		expect(qb).not.toHaveProperty("reused");
+		expect(l.questions(STANDING_WORKLOAD_ID).filter((q) => q.state === "open").map((q) => q.id).sort()).toEqual([qa.raised, qb.raised].sort());
+		expect(ask(a)).toEqual({ raised: qa.raised, reused: true });
+		expect(l.questions(STANDING_WORKLOAD_ID).length).toBe(2);
+	});
+
+	test("R7: a repeated model-subject question raises again, while the same repeat of a plain question is reused", () => {
+		const { l, wl, sl } = ledger();
+		const plain = { by: "lane-a", workloadId: wl, sliceId: sl, body: "Ship it?", options: ["ship", "hold"] };
+		const p1 = askJo(l, plain, { asker: "lane", now: IN_WINDOW });
+		expect(askJo(l, plain, { asker: "lane", now: IN_WINDOW })).toEqual({ ...p1, reused: true });
+		const model = { by: "lane-a", workloadId: wl, sliceId: sl, body: "Which model?", options: [SOL, ASTRA], subject: "lane-model" as const };
+		const m1 = askJo(l, model, lane({ now: IN_WINDOW }));
+		const m2 = askJo(l, model, lane({ now: IN_WINDOW }));
+		if (!("raised" in m1) || !("raised" in m2)) throw new Error("expected both model questions raised");
+		expect(m2.raised).not.toBe(m1.raised);
+		expect(m2).not.toHaveProperty("reused");
+		expect(l.questions(wl).length).toBe(3);
+	});
+
+	test("R7: a queued duplicate asked with now gains one now: mark for the open id; an already-NOW one gains none", () => {
+		const { l, wl, sl } = ledger();
+		const ask = { by: "lane-a", workloadId: wl, sliceId: sl, body: "Ship it?", options: ["ship", "hold"] };
+		const first = askJo(l, ask, { asker: "lane", now: IN_WINDOW });
+		if (!("raised" in first)) throw new Error("expected a raised question");
+		expect(escalations(l, wl)).toEqual([]);
+		expect(askJo(l, { ...ask, now: "guard" }, { asker: "lane", now: IN_WINDOW })).toEqual({ raised: first.raised, reused: true });
+		expect(escalations(l, wl)).toEqual([[`now: ${first.raised} guard`, ESCALATION_BY, sl]]);
+		const entries = l.entries(wl).length;
+		expect(askJo(l, { ...ask, now: "money" }, { asker: "lane", now: IN_WINDOW })).toEqual({ raised: first.raised, reused: true });
+		expect(l.entries(wl).length).toBe(entries);
+		expect(l.questions(wl).length).toBe(1);
+	});
+
+	const injected = (id: RulingId, answer: string): Ruling => ({
+		id,
+		sources: ["in-test"],
+		kinds: ["merge"],
+		scope: () => true,
+		answer: () => answer,
+		action: (_q, _k, _f, a) => `${id} says ${a}`,
+		exceptions: "none",
+		ends: { at: null, event: "the test" },
+	});
+
+	test("R9: two active rulings that decide one question with different answers decide nothing: it is raised with ESCALATION_BY's ruling-conflict:", () => {
+		const { l, wl, sl } = ledger();
+		const rulings = [injected("merges", "merge"), injected("flow-repair", "wait")];
+		const q = { body: "Merge PR #9?", options: ["merge", "wait"] };
+		expect(checkRulings({ ...q, subject: null }, lane(), none, rulings)).toBeNull();
+		const r = askJo(l, { by: "lane-a", workloadId: wl, sliceId: sl, ...q }, lane({ now: IN_WINDOW }), rulings);
+		if (!("raised" in r)) throw new Error("expected the conflicted question raised");
+		expect(l.questions(wl).map((x) => x.id)).toEqual([r.raised]);
+		expect(escalations(l, wl)).toEqual([[`ruling-conflict: ${r.raised} merges flow-repair`, ESCALATION_BY, sl]]);
+		expect(l.entries(wl).some((e) => e.body.startsWith("ruling-applied:"))).toBe(false);
+	});
+
+	test("R9: active rulings that agree still decide, as the first of them", () => {
+		const { l, wl, sl } = ledger();
+		const rulings = [injected("merges", "merge"), injected("flow-repair", "merge")];
+		const q = { body: "Merge PR #9?", options: ["merge", "wait"] };
+		const r = askJo(l, { by: SURFACE_BY, workloadId: wl, sliceId: sl, ...q }, { asker: "orchestrator", now: IN_WINDOW }, rulings);
+		expect(r).toEqual({ decided: { ruling: "merges", answer: "merge", action: "merges says merge" } });
+		expect(l.questions(wl)).toEqual([]);
+		expect(escalations(l, wl)).toEqual([]);
+		expect(l.entries(wl).map((e) => e.body)).toEqual([`ruling-applied: merges kind merge slice ${sl} answer merge`]);
 	});
 });

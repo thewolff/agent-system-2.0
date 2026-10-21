@@ -71,7 +71,7 @@ import {
 	AS2TEST_ROOT, AS2TEST_USER, baseParts, boundBranches, buildTestRun, changedTestFiles, decideRun, fullSuiteSlice, HEARTBEAT_EVERY_MS,
 	heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
 	type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, reportCapBytes, reservation, resultJson, RUN_ID_RE, type RunFacts, runDirOf, runnerDiedRun, type RunRecord,
-	runsDbOf, runsRoot, servedRepo, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict,
+	runsDbOf, runsRoot, securityRedBody, securityRedOf, servedRepo, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict,
 	type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
 import { ORCHESTRATOR_RECIPIENT } from "../src/types";
@@ -1145,7 +1145,8 @@ class Runner {
 	 * The result (§ 2.3 steps 6–8): with the runs.db row held in a BEGIN IMMEDIATE transaction (so no
 	 * takeover lands in between), one ledger transaction checks ownership and the slice's state,
 	 * decides, writes `test-run:`, settles (completes the slice) when the decision says so and, for a
-	 * run that is not green on a workload no lane holds, writes the `test-run-failed:` message. The
+	 * run that is not green on a workload no lane holds, writes the `test-run-failed:` message, and for a run with a failing
+	 * security test, whoever holds the workload, the `security-red:` message. The
 	 * settle commits with the check it rests on: no successor request, pause or cancel lands between
 	 * them, and a slice that is not open is never touched. Then `result.json`.
 	 */
@@ -1177,6 +1178,11 @@ class Runner {
 			const failed = notifiesOrchestrator(run.verdict, heldLive) ? testRunFailedOf(this.wl, this.request.slice, run) : null;
 			if (failed) {
 				this.ledger.enqueue({ by: TEST_RUNNER_BY, workloadId: this.wl, sliceId: this.request.slice, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: testRunFailedBody(failed) });
+			}
+			// PLAN wl-mvg1vs0rhnu3gg § 3.3: a failing security test reaches Jo whatever holds the workload, so this ignores heldLive.
+			const security = securityRedOf(this.wl, this.request.slice, run);
+			if (security) {
+				this.ledger.enqueue({ by: TEST_RUNNER_BY, workloadId: this.wl, sliceId: this.request.slice, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: securityRedBody(security) });
 			}
 			return { run, settled };
 		}).immediate();

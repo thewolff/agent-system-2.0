@@ -126,6 +126,7 @@ gates/src/git-model.ts	module	-
 gates/src/fence.ts	module	-
 gates/test/case-and-noexec.test.ts	test	-
 gates/test/rulings.test.ts	test	-
+gates/test/r06-reserved.test.ts	test	-
 gates/test/extension.test.ts	test	-
 gates/test/helpers.ts	test	-
 gates/test/known-fragment.test.ts	test	-

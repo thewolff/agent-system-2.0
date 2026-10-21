@@ -88,6 +88,7 @@ export const CONTROL_PREFIXES = [
 	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-notice", "train-autoboard",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
+	"now", "ruling-conflict",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -125,10 +126,12 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * `lane-decided: <laneId> <outcome>` is the runner's alone: it records an intended decision (`isIntendedOutcome`)
  * before it closes OMP's stdin, so the lane row's shutdown handler reads the end as intended through `exitClass`
  * (MIGRATION.md item 40, decision 14); a death outcome never writes one, its record is its `lane-died:` line (D5).
- * `plan-question: <question id>` is written only by `lane_raise_question`, as the lane holding the
+ * `plan-question: <question id>[ plan-sha256 <hex> verdict-sha256 <hex>]` is written only by `lane_raise_question`, as the lane holding the
  * workload, in the question's own transaction, when the question offers `approve` on the plan slice
  * while `plan: first` stands (PLAN wl-muq22rnjcfrrpc D9 part two); like `reserved-withdrawn:` its
- * writer is a holder (`validWriter`), and `isPlanQuestionIn` reads it as the plan question's role.
+ * writer is a holder (`validWriter`), and `isPlanQuestionIn` reads it as the plan question's role. The two hashes
+ * (`planQuestionBinding`) are the plan file and the verdict file as the raise checked them: a repeat of the open question
+ * skips the plan checks only while both files still hash the same (PLAN wl-mvg1vs0rhnu3gg fix round 1, F1).
  * `test-requested:` and `test-run:` are the test runner's alone (MIGRATION.md item 24; surface/src/test-run.ts):
  * a lane asks through `lane_full_test`, never by writing either. `push-dest: <remote> <branch> <sha>` is
  * row 8's record of a push it let through, written as the lane holding the workload, so like
@@ -170,6 +173,9 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * Jev ranking's rows (PLAN wl-mv8k039gvogt8g D3, surface/src/rank.ts): `priority-signal:` / `priority-signal-failed:` (on the
  * ranked workload) and `rank-shown:` (on the standing workload) are the ranking machinery's (RANK_BY), whichever session ranked;
  * `rank-goals:`, `rank-override:`, `rank-unpin:` (Jo's words, bound to an input) and `rank-audit:` (the wake tick) are the surface's.
+ * The escalation lines (PLAN wl-mvg1vs0rhnu3gg § 1.0, § 1.9; gates/src/rulings.ts `askJo`) are ESCALATION_BY's alone, written on the
+ * question's workload and slice in the raise's transaction: `now: <q-…> <category>` marks a question Jo hears at once (or upgrades a
+ * reused open one), and `ruling-conflict: <q-…> <ruling id> <ruling id>…` records the active rulings that disagreed on it, so it was raised.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -225,6 +231,8 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"rank-override": [SURFACE_BY],
 	"rank-unpin": [SURFACE_BY],
 	"rank-audit": [SURFACE_BY],
+	now: [ESCALATION_BY],
+	"ruling-conflict": [ESCALATION_BY],
 };
 
 export interface ControlEntry {
@@ -1306,8 +1314,33 @@ export const PLAN_AUTO_STARTED = "plan started without your approve";
 export function planAutoStartNoticeBody(wl: string, planBody: string): string {
 	return `${PLAN_AUTO_STARTED} on ${wl} (normal stakes, cross-lab review passed); it will not merge until ${HOLD_HOURS} h after your next message here; \`halt ${wl}\` stops it\n${planBody}`;
 }
-export function planQuestionBody(questionId: string): string {
-	return `plan-question: ${questionId}`;
+/**
+ * The plan file and the review verdict file a plan question was checked on, each as its sha256 in hex (PLAN wl-mvg1vs0rhnu3gg
+ * fix round 1, F1): the plan file's hash is of the bytes `planQuestionProblem` judged, the verdict file's of its bytes then.
+ */
+export interface PlanBinding {
+	plan: string;
+	verdict: string;
+}
+/** `plan-question: <id>`, with the binding's two hashes when the raise has them. */
+export function planQuestionBody(questionId: string, binding?: PlanBinding): string {
+	return binding ? `plan-question: ${questionId} plan-sha256 ${binding.plan} verdict-sha256 ${binding.verdict}` : `plan-question: ${questionId}`;
+}
+const PLAN_BINDING_RE = /^(\S+) plan-sha256 ([0-9a-f]{64}) verdict-sha256 ([0-9a-f]{64})$/;
+/** The binding a `plan-question:` entry's rest carries for `questionId`; null when it names another question or carries none. */
+export function planQuestionBinding(rest: string, questionId: string): PlanBinding | null {
+	const m = PLAN_BINDING_RE.exec(rest);
+	return m !== null && m[1] === questionId ? { plan: m[2]!, verdict: m[3]! } : null;
+}
+/**
+ * The plan file and the verdict file a plan question's body names, read as `planQuestionProblem` reads them: line 1, trimmed,
+ * and the last comma-separated field of the `review:` line, trimmed. Null when the body has no review line.
+ */
+export function planQuestionFiles(body: string): { plan: string; verdict: string } | null {
+	const lines = body.split("\n");
+	const review = lines.find((l, i) => i > 0 && /^review:/.test(l));
+	if (review === undefined) return null;
+	return { plan: lines[0]!.trim(), verdict: review.slice("review:".length).split(",").map((p) => p.trim()).at(-1) ?? "" };
 }
 export function doneBody(sentence: string): string {
 	return `done: ${oneLine(sentence)}`;

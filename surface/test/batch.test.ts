@@ -6,17 +6,26 @@ import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { recordRepo } from "../src/decision-log";
+import { consumeLines } from "../src/delivery";
+import { applyTrain, interpret } from "../src/input";
+import { recordTrainTask } from "../src/merge-train";
 import orchestratorSurface from "../index";
 import { onFire } from "../src/batch";
 import { ceilingNoticeBody } from "../src/ceiling";
 import { errorLines } from "../src/errors";
-import { laneExitBody } from "../src/launch";
+import { laneExitBody, SCRATCH_SWEEP_BY } from "../src/launch";
 import { sendNotice } from "../src/notice";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { surfaceSession } from "../src/session";
 import { laneDiedShutdownBody } from "../src/signals";
-import { testRunFailedBody } from "../src/test-run";
-import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
+import {
+	type Failure, makeRunId, notifiesOrchestrator, securityRedBody, securityRedOf, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf,
+} from "../src/test-run";
+import { ensureStandingWorkload, standingSlice } from "../src/identity";
+import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { SCRATCH_ENTRY } from "../../gates/src/scratch";
+import { askJo, nowBody } from "../../gates/src/rulings";
 import { clock, ctxOf, fakePi, loadTestText, notices, type Sent, tempLedger, timers, tmp, workloadWithSlice } from "./helpers";
 
 const NEEDS = "## needs you (new since your last turn)";
@@ -126,6 +135,250 @@ describe("onFire: the kinds that go out on their own poll", () => {
 		expect(fire("idle", stopped)).toBe(true);
 		expect(fire("idle", parked)).toBe(false);
 		expect(fire("test-run", red)).toBe(true);
+	});
+});
+
+describe("NOW (PLAN wl-mvg1vs0rhnu3gg § 1.0–1.3): a marked question, a NOW_RESERVED request and the scratch disk are on fire", () => {
+	/** The `errorLines` line of `kind` about `rowId`, which must exist. */
+	const lineOf = (l: Ledger, kind: string, rowId: string) => {
+		const line = errorLines(l).find((x) => x.kind === kind && x.rowId === rowId);
+		expect(line).toBeDefined();
+		return line!;
+	};
+	/** Row 6's `reserved-request` body for an action and the call it refused (gates/src/rows/r06-reserved.ts reservedRequestBody). */
+	const request = (l: Ledger, wl: string, sl: string, action: string, call: string) =>
+		l.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: `${action}: ${call} (P-11 row 6 refused tool call c1)` });
+
+	test("a lane question askJo raised with now is tagged NOW (<category>) with state now and on fire; a plain question is neither", () => {
+		const { ledger: l } = tempLedger();
+		const { wl, sl } = workloadWithSlice(l);
+		const hot = askJo(l, { by: "lane-a", workloadId: wl, sliceId: sl, body: "The token leaks into logs: rotate now?", options: ["rotate", "hold"], now: "security" }, { asker: "lane" });
+		const cold = ask(l, wl, sl, "Which header token?");
+		if (!("raised" in hot)) throw new Error("not raised");
+		const now = lineOf(l, "question", hot.raised);
+		expect(now.state).toBe("now");
+		expect(now.line.startsWith(`NOW (security): lane on ${wl} is waiting on you (${hot.raised}, slice ${sl}): The token leaks into logs: rotate now?`)).toBe(true);
+		expect(onFire(l, now)).toBe(true);
+		const plain = lineOf(l, "question", cold);
+		expect(plain.state).toBeUndefined();
+		expect(plain.line.startsWith(`lane on ${wl} is waiting on you (${cold}`)).toBe(true);
+		expect(onFire(l, plain)).toBe(false);
+	});
+
+	test("the orchestrator's own question askJo raised with now is tagged and on fire", () => {
+		const { ledger: l } = tempLedger();
+		ensureStandingWorkload(l);
+		const slice = standingSlice(l)!;
+		const hot = askJo(l, { by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: slice.id, body: "The disk under the ledger is failing: stop every lane?", options: ["stop", "wait"], now: "incident" }, { asker: "orchestrator", about: null });
+		if (!("raised" in hot)) throw new Error("not raised");
+		const line = lineOf(l, "question", hot.raised);
+		expect(line.state).toBe("now");
+		expect(line.line.startsWith(`NOW (incident): the orchestrator asked you (${hot.raised}): The disk under the ledger is failing`)).toBe(true);
+		expect(onFire(l, line)).toBe(true);
+	});
+
+	test("a lane-written now: look-alike tags nothing and is not on fire, beside ESCALATION_BY's mark on the same workload, which does", () => {
+		const { ledger: l } = tempLedger();
+		const { wl, sl } = workloadWithSlice(l);
+		expect(l.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 }).won).toBe(true);
+		const q = ask(l, wl, sl, "Merge it?");
+		l.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "assumption", body: nowBody(q, "security") });
+		const forged = lineOf(l, "question", q);
+		expect(forged.state).toBeUndefined();
+		expect(forged.line).not.toContain("NOW");
+		expect(onFire(l, forged)).toBe(false);
+		const real = askJo(l, { by: "lane-a", workloadId: wl, sliceId: sl, body: "This drops the guard on row 9: go ahead?", options: ["go", "stop"], now: "guard" }, { asker: "lane" });
+		if (!("raised" in real)) throw new Error("not raised");
+		const marked = lineOf(l, "question", real.raised);
+		expect(marked.state).toBe("now");
+		expect(marked.line.startsWith(`NOW (guard): lane on ${wl} is waiting on you (${real.raised}`)).toBe(true);
+		expect(onFire(l, marked)).toBe(true);
+		// the forged mark still counts for nothing once a valid one is on the workload
+		expect(lineOf(l, "question", q).state).toBeUndefined();
+	});
+
+	test("a waiting reserved request whose rule is in NOW_RESERVED is tagged and on fire; a blind one and rm are not", () => {
+		const { ledger: l } = tempLedger();
+		const { wl, sl } = workloadWithSlice(l);
+		const admin = request(l, wl, sl, "gh pr merge --admin bypasses branch protection", "gh pr merge 5 --admin");
+		const force = request(l, wl, sl, "force-push", "git push --force origin topic");
+		const deploy = request(l, wl, sl, "deploy (fly)", "fly deploy");
+		const blind = request(l, wl, sl, "bun with a subcommand or target not known until it runs", "bun $X");
+		const rm = request(l, wl, sl, "rm -rf (recursive force-delete)", "rm -rf build");
+		for (const [en, category] of [[admin, "guard"], [force, "irreversible"], [deploy, "irreversible"]] as const) {
+			const line = lineOf(l, "reserved", en);
+			expect(line.state).toBe("now");
+			expect(line.line.startsWith(`NOW (${category}): reserved action waiting on you (${wl}): `)).toBe(true);
+			expect(onFire(l, line)).toBe(true);
+		}
+		for (const en of [blind, rm]) {
+			const line = lineOf(l, "reserved", en);
+			expect(line.state).toBeUndefined();
+			expect(line.line.startsWith(`reserved action waiting on you (${wl}): `)).toBe(true);
+			expect(onFire(l, line)).toBe(false);
+		}
+	});
+
+	test("the sweep's scratch-disk line is on fire; a lane's over-cap line is not", () => {
+		const { ledger: l } = tempLedger();
+		ensureStandingWorkload(l);
+		const disk = l.recordEntry({ by: SCRATCH_SWEEP_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `${SCRATCH_ENTRY.disk} 12000.5 MiB under /h passes 10240 MiB (AGENT_SYSTEM_SCRATCH_TOTAL_MB); report /r.md` });
+		expect(onFire(l, lineOf(l, "scratch", disk))).toBe(true);
+		const { wl } = workloadWithSlice(l);
+		expect(l.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 }).won).toBe(true);
+		const over = l.recordEntry({ by: "lane-a", workloadId: wl, kind: "assumption", body: `${SCRATCH_ENTRY.overCap} 3000.0 MiB over the 2048 MiB cap at /h/s/${wl}` });
+		expect(onFire(l, lineOf(l, "scratch", over))).toBe(false);
+	});
+});
+
+describe("security-red (PLAN wl-mvg1vs0rhnu3gg § 3.3): a failing gate test is on fire whatever holds the workload or routes its run", () => {
+	const SHA = "b".repeat(40);
+	const SEC: Failure = { part: "full", name: "gates/test/rows.test.ts > row 3 > refuses", firstError: "error: expected a refusal" };
+	const PLAIN: Failure = { part: "full", name: "surface/test/x.test.ts > broken", firstError: "error: nope" };
+	let seq = 0;
+	/**
+	 * The runner's finish (surface/scripts/test-runner.ts): the request and its red `test-run:` on `wl`, then the messages it
+	 * enqueues to the orchestrator, decided as it decides them. Returns the two message ids (null for one not sent).
+	 */
+	function finish(l: Ledger, wl: string, sl: string, pr: number, failures: Failure[]) {
+		const runId = makeRunId(Date.parse(l.now()) + ++seq, "abcd");
+		l.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody({ runId, pr, sha: SHA, slice: sl, by: "lane-a" }) });
+		const run: TestRun = {
+			runId, verdict: "red", sha: SHA, pr, reason: null, headAtEnd: SHA, base: null, mergeBase: null,
+			full: { pass: 1, fail: failures.length, skip: 0, exit: 1, ms: 10, error: null }, solo: [], failures, runDir: `/runs/${runId}`, preflight: null,
+		};
+		l.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRunBody(run) });
+		const heldLive = l.liveLaneHolders().some((h) => h.workloadId === wl);
+		const failed = notifiesOrchestrator(run.verdict, heldLive) ? testRunFailedOf(wl, sl, run) : null;
+		const security = securityRedOf(wl, sl, run);
+		const [ordinary = null, secure = null] = [failed && testRunFailedBody(failed), security && securityRedBody(security)]
+			.map((body) => (body ? l.enqueue({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body }) : null));
+		return { runId, ordinary, security: secure };
+	}
+
+	test("while a lane holds the workload live: the security red is shown and on fire, an ordinary red shows nothing", () => {
+		const c = clock();
+		const { ledger: l } = tempLedger(c.now);
+		const { wl, sl } = workloadWithSlice(l);
+		const lines = () => errorLines(l, undefined, { now: c.now() }).filter((x) => x.workloadId === wl);
+		// with no lane, the ordinary red is the test-run line
+		const before = finish(l, wl, sl, 17, [PLAIN]);
+		expect(before.security).toBeNull();
+		expect(lines().map((x) => [x.kind, x.rowId])).toEqual([["test-run", before.ordinary]]);
+		c.plusHours(0.1);
+		expect(l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: "lane-a-1", leaseMs: 3_600_000 }).won).toBe(true);
+		expect(l.liveLaneHolders().some((h) => h.workloadId === wl)).toBe(true);
+		// the lane is live: the ordinary red already sent and a new one both show nothing
+		c.plusHours(0.1);
+		expect(finish(l, wl, sl, 17, [PLAIN])).toMatchObject({ ordinary: null, security: null });
+		expect(lines()).toEqual([]);
+		// a run failing a gate test: the runner sends the security red alone, and it is shown and on fire
+		c.plusHours(0.1);
+		const sec = finish(l, wl, sl, 17, [PLAIN, SEC]);
+		expect(sec.ordinary).toBeNull();
+		expect(sec.security).not.toBeNull();
+		const shown = lines();
+		expect(shown).toEqual([{
+			kind: "security-red", workloadId: wl, rowId: sec.security!, messageIds: [sec.security!],
+			line: `security tests red on ${wl}: run ${sec.runId} at bbbbbbb (slice ${sl}) has 1 failing under gates/test/, first ${SEC.name} — a lane asks you before it changes such a test`,
+		}]);
+		expect(onFire(l, shown[0]!)).toBe(true);
+		// delivery consumes it
+		expect(consumeLines(l, shown)).toBe(1);
+		expect(lines()).toEqual([]);
+	});
+
+	test("while the run is routed to a train task: the security red is shown and on fire, an ordinary red shows nothing", () => {
+		const c = clock();
+		const { ledger: l } = tempLedger(c.now);
+		const url = "https://github.com/thewolff/product.git";
+		const checkout = () => {
+			const dir = tmp("security-red-repo");
+			for (const args of [["init", "-q"], ["config", "remote.origin.url", url]]) expect(Bun.spawnSync(["git", "-C", dir, ...args]).exitCode).toBe(0);
+			return dir;
+		};
+		const cmd = interpret(l, "train 101");
+		if (cmd?.kind !== "train") throw new Error("not a train");
+		const train = applyTrain(l, cmd, checkout()).workloadId;
+		expect(l.claimWorkload(train, { by: LANE_STARTER_BY, holder: "lane-train-1", leaseMs: 600_000 }).won).toBe(true);
+		const owner = l.openWorkload({ by: SURFACE_BY, brief: "Fix the feed header", stakes: "normal", mode: "autonomous" });
+		recordRepo(l, owner, checkout());
+		const view = { number: 101, headRefName: `wl/${owner}`, headRefOid: SHA, isCrossRepository: false, headRepository: { name: "product" }, headRepositoryOwner: { login: "thewolff" } };
+		const task = recordTrainTask(l, { train, by: "lane-train-1", pr: 101, kind: "red", detail: `run tr-x red at ${SHA}\nsrc/x.test.ts > case 1: boom`, view, trainRepo: "thewolff/product" });
+		expect(task.ok).toBe(true);
+		c.plusHours(0.1);
+		const sl = l.addSlice({ by: "lane-owner-1", workloadId: owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		const lines = () => errorLines(l, undefined, { now: c.now() }).filter((x) => x.workloadId === owner);
+		// no lane holds the owner, so the runner sends the ordinary red; the task routes it off needs-you
+		const plain = finish(l, owner, sl, 101, [PLAIN]);
+		expect(plain.ordinary).not.toBeNull();
+		expect(plain.security).toBeNull();
+		expect(lines()).toEqual([]);
+		// a run failing a gate test: its ordinary red is routed too, its security red is shown and on fire
+		c.plusHours(0.1);
+		const sec = finish(l, owner, sl, 101, [SEC]);
+		expect(sec.ordinary).not.toBeNull();
+		const shown = lines();
+		expect(shown).toEqual([{
+			kind: "security-red", workloadId: owner, rowId: sec.security!, messageIds: [sec.security!],
+			line: `security tests red on ${owner}: run ${sec.runId} at bbbbbbb (slice ${sl}) has 1 failing under gates/test/, first ${SEC.name} — a lane asks you before it changes such a test`,
+		}]);
+		expect(onFire(l, shown[0]!)).toBe(true);
+	});
+
+	test("fix round 1 (F3): a security red whose workload closes before delivery still shows, on fire, and delivery consumes it exactly once", () => {
+		const c = clock();
+		const { ledger: l } = tempLedger(c.now);
+		const { wl, sl } = workloadWithSlice(l);
+		expect(l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: "lane-a-1", leaseMs: 3_600_000 }).won).toBe(true);
+		const sec = finish(l, wl, sl, 17, [SEC]);
+		expect(sec.security).not.toBeNull();
+		// The lane fixes it, completes its slice and lets go; the workload closes with the alert still held.
+		c.plusHours(0.1);
+		l.completeSlice(sl, { by: "lane-a-1", artifact: "fixed" });
+		l.releaseWorkload(wl, { by: "lane-a-1", holder: "lane-a-1" });
+		l.closeWorkload(wl, { by: SURFACE_BY });
+		expect(l.workload(wl)!.status).toBe("closed");
+		expect(l.inFlight().some((w) => w.workload.id === wl)).toBe(false);
+		expect(l.message(sec.security!)!.state).toBe("held");
+		const lines = () => errorLines(l, undefined, { now: c.now() }).filter((x) => x.workloadId === wl);
+		const shown = lines();
+		expect(shown).toEqual([{
+			kind: "security-red", workloadId: wl, rowId: sec.security!, messageIds: [sec.security!],
+			line: `security tests red on ${wl}: run ${sec.runId} at bbbbbbb (slice ${sl}) has 1 failing under gates/test/, first ${SEC.name} — a lane asks you before it changes such a test`,
+		}]);
+		expect(onFire(l, shown[0]!)).toBe(true);
+		expect(consumeLines(l, shown)).toBe(1);
+		expect(l.message(sec.security!)!.state).toBe("delivered");
+		expect(lines()).toEqual([]);
+		expect(consumeLines(l, shown)).toBe(0);
+	});
+
+	test("fix round 1 (F3): a security red on a workload closed before delivery is rendered and consumed at a wake exactly once, and nothing shows it at the next render; other held messages on the closed workload are left alone", async () => {
+		const t = await surface();
+		const l = t.lane;
+		const { wl, sl } = workloadWithSlice(l);
+		expect(l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: "lane-a-1", leaseMs: 3_600_000 }).won).toBe(true);
+		const sec = finish(l, wl, sl, 17, [SEC]);
+		expect(sec.security).not.toBeNull();
+		// Two held messages on the same workload that are not the runner's security red: a death, and a lane's look-alike.
+		const died = death(l, wl, 0);
+		const forged = l.enqueue({ by: "lane-a-1", workloadId: wl, sender: "lane-a-1", recipient: ORCHESTRATOR_RECIPIENT, body: l.message(sec.security!)!.body });
+		l.completeSlice(sl, { by: "lane-a-1", artifact: "fixed" });
+		l.releaseWorkload(wl, { by: "lane-a-1", holder: "lane-a-1" });
+		l.closeWorkload(wl, { by: SURFACE_BY });
+		const needle = `security tests red on ${wl}: run ${sec.runId}`;
+		await t.f.emit("session_compact", { type: "session_compact" }, t.ctx);
+		const wake = await t.jo("go on");
+		expect(wake.split(needle)).toHaveLength(2);
+		expect(l.message(sec.security!)!.state).toBe("delivered");
+		expect([l.message(died)!.state, l.message(forged)!.state]).toEqual(["held", "held"]);
+		await t.f.tool("orchestrator_wake_read").execute("2", { body: "resuming" }, undefined, undefined, t.ctx);
+		const read = (await t.f.tool("orchestrator_ledger").execute("1", {}, undefined, undefined, t.ctx)).content[0]!.text;
+		expect(read).not.toContain(needle);
+		t.minutes(10);
+		t.poll();
+		expect(t.needsYou().some((x) => x.message.content.includes(needle))).toBe(false);
 	});
 });
 

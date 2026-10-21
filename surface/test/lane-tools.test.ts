@@ -5,7 +5,8 @@
 // (PLAN wl-mupu0sx2o046io D8, and its D9 round-limit exception), and the terminal pair ending the
 // lane without a death.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { rmSync, truncateSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { readFileSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	handSettledBody, handSpawnBody, laneBuilderBody, PARK_OPTIONS, reviewParkBody, reviewSameLabBody, reviewWithheldBody,
@@ -77,6 +78,14 @@ const PROMPT_ONLY_LINES = [
 ];
 /** A plan-question body on `path`: one slice line, `promptOnly` lines, one tradeoff, the review line. */
 const bodyOn = (path: string, promptOnly: string[]) => [path, "- sl-1: slice 1, one line", ...promptOnly, "tradeoff: tradeoff 1", REVIEW_LINE].join("\n");
+/**
+ * The holder's `plan-question:` entry for `id` as lane_raise_question writes it (fix round 1, F1): the sha256 of the plan file
+ * and of the verdict file it was checked on. Hashed here with node:crypto, so this file loads on the baseline.
+ */
+const boundPlanQuestion = (id: string, plan = PLAN_FILE, verdict = VERDICT_FILE) => {
+	const sha = (p: string) => createHash("sha256").update(readFileSync(p)).digest("hex");
+	return `plan-question: ${id} plan-sha256 ${sha(plan)} verdict-sha256 ${sha(verdict)}`;
+};
 
 function laneFixture(over: { planFirst?: boolean; mode?: "autonomous" | "user-driven"; exec?: boolean; stakes?: "normal" | "production" } = {}) {
 	const { ledger, path } = tempLedger();
@@ -675,7 +684,11 @@ describe("plan review (PLAN D8): the plan question waits for a review by another
 		expect(await ask()).toContain("Raised question");
 		const first = ledger.questions(wl)[0]!.id;
 		seedReview(ledger, wl, planId);
-		expect(await ask()).toContain(planReviewRefusal(planId)); // the previous question is still open
+		// The previous question is still open: the same plan question asked again is that open question, reused (PLAN wl-mvg1vs0rhnu3gg § 1.0).
+		expect(await ask()).toBe(`Question ${first} on ${planId} is already open with this body and options; nothing new was raised. The slice stays paused until Jo answers ${first}.`);
+		expect(ledger.questions(wl)).toHaveLength(1);
+		// A changed plan question while the first is open is refused: it keeps every plan check.
+		expect(await ask(undefined, planId, planBody(3))).toContain(planReviewRefusal(planId));
 		jo(ledger, first, "revise");
 		expect(await ask()).toContain(planReviewRefusal(planId));
 		seedReview(ledger, wl, planId);
@@ -837,7 +850,7 @@ describe("the plan question's shape (PLAN wl-muq22rnjcfrrpc D7)", () => {
 		const q = ledger.questions(wl)[0]!;
 		expect(q.body).toBe(body);
 		const marker = ledger.entries(wl).at(-1)!;
-		expect([marker.kind, marker.created_by, marker.slice_id, marker.body, marker.created_at]).toEqual(["assumption", "lane-t-1", planId, `plan-question: ${q.id}`, q.created_at]);
+		expect([marker.kind, marker.created_by, marker.slice_id, marker.body, marker.created_at]).toEqual(["assumption", "lane-t-1", planId, boundPlanQuestion(q.id), q.created_at]);
 	});
 
 	test("control: a plan-slice question without approve is not shape-checked, gets no plan-question: entry, and is cut at 120 on the needs-you line", async () => {
@@ -1041,7 +1054,7 @@ describe("the plan slice moves past a closed one (PLAN wl-muq22rnjcfrrpc D9)", (
 		seedReview(ledger, wl, planId);
 		expect(await ask()).toContain("Raised question");
 		const planQ = ledger.questions(wl).find((q) => q.slice_id === planId)!;
-		expect(ledger.entries(wl).filter((e) => e.body.startsWith("plan-question:")).map((e) => e.body)).toEqual([`plan-question: ${planQ.id}`]);
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith("plan-question:")).map((e) => e.body)).toEqual([boundPlanQuestion(planQ.id)]);
 	});
 
 	test("D4 control: once the plan is approved, an approve question on another slice is ordinary: raised, no plan-question:, no plan receipt", async () => {
@@ -1466,4 +1479,148 @@ describe("plan auto-start (PLAN wl-mvfkv7llkp7nk0 § 3, R7, R8)", () => {
 			}
 		});
 	}
+
+	test("PLAN wl-mvg1vs0rhnu3gg § 1.0 (R1): an auto-start-eligible plan asked with now: guard goes to Jo tagged NOW and writes no plan: approved auto; the same plan without now starts", async () => {
+		for (const now of ["guard", null]) {
+			const { ledger, wl, planId, call } = await planFixture();
+			endFlowRepair(ledger);
+			passedRound(ledger, wl, planId);
+			tick();
+			const reply = await call("lane_raise_question", { slice: planId, body: PLAN_BODY, options: [...PLAN_OPTIONS], ...(now === null ? {} : { now }) });
+			if (now === null) {
+				expect(reply).toContain("The plan is approved");
+				expect(autoEntries(ledger, wl)).toHaveLength(1);
+				expect(ledger.questions(wl)).toHaveLength(0);
+				continue;
+			}
+			const questions = ledger.questions(wl);
+			expect(questions).toHaveLength(1);
+			const id = questions[0]!.id;
+			expect(reply).toBe(`Raised question ${id} on ${planId} (approve / revise / cancel); the slice is paused until Jo answers. It reaches Jo at once, marked NOW (guard).`);
+			expect(nowEntries(ledger, wl)).toEqual([[`now: ${id} guard`, ESCALATION_BY]]);
+			expect(planQuestions(ledger, wl)).toEqual([boundPlanQuestion(id)]);
+			expect(autoEntries(ledger, wl)).toHaveLength(0);
+			expect(noticesOf(ledger, wl)).toHaveLength(0);
+		}
+	});
+});
+
+/** The `now:` marks on `wl` as [body, writer]; a literal prefix, so this file loads on the baseline. */
+const nowEntries = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => e.body.startsWith("now: ")).map((e) => [e.body, e.created_by]);
+/** The holder's `plan-question:` entries on `wl`. */
+const planQuestions = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => e.body.startsWith("plan-question: ")).map((e) => e.body);
+/** The reply to an ask that repeats the open question `id` on `slice`. */
+const reusedReply = (id: string, slice: string, now?: string) =>
+	`Question ${id} on ${slice} is already open with this body and options; nothing new was raised.${now ? ` It reaches Jo at once, marked NOW (${now}).` : ""} The slice stays paused until Jo answers ${id}.`;
+
+describe("escalation phase 2 through the lane tools (PLAN wl-mvg1vs0rhnu3gg § 1.0, § 3.3, § 3.5; R1, R7)", () => {
+	test("an unknown now word is refused and nothing is written", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const before = ledger.entries(wl).length;
+		expect(await call("lane_raise_question", { slice: sl, body: "Which header keeps the offset?", options: ["left", "right"], now: "urgent" })).toBe(
+			"`now` is one of integrity, security, incident, guard, boundary, irreversible, money, not urgent; nothing was asked.",
+		);
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.entries(wl)).toHaveLength(before);
+		expect(ledger.slice(sl)!.state).toBe("open");
+	});
+
+	test("now: security raises a normal-stakes merge question past the merges ruling, with ESCALATION_BY's now: mark and no ruling-applied", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const reply = await call("lane_raise_question", { slice: sl, body: "PR #4 is green; merge it?", options: ["merge", "wait"], now: "security" });
+		const questions = ledger.questions(wl);
+		expect(questions).toHaveLength(1);
+		const id = questions[0]!.id;
+		expect(reply).toBe(`Raised question ${id} on ${sl} (merge / wait); the slice is paused until Jo answers. It reaches Jo at once, marked NOW (security).`);
+		expect(nowEntries(ledger, wl)).toEqual([[`now: ${id} security`, ESCALATION_BY]]);
+		expect(ledger.entries(wl).some((e) => e.body.startsWith("ruling-applied:"))).toBe(false);
+		expect(ledger.slice(sl)!.state).toBe("paused");
+	});
+
+	test("a plan question with now still needs its review: unreviewed, it is refused with nothing written", async () => {
+		const { ledger, wl, planId, call } = await planFixture();
+		const before = ledger.entries(wl).length;
+		expect(await call("lane_raise_question", { slice: planId, body: PLAN_BODY, options: [...PLAN_OPTIONS], now: "guard" })).toContain(planReviewRefusal(planId));
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.entries(wl)).toHaveLength(before);
+	});
+
+	test("an unchanged plan question asked twice is the open one, reused: no second question row and no second plan-question:", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		expect(await ask()).toContain("Raised question");
+		const id = ledger.questions(wl)[0]!.id;
+		expect(await ask()).toBe(reusedReply(id, planId));
+		expect(ledger.questions(wl).map((q) => q.id)).toEqual([id]);
+		expect(planQuestions(ledger, wl)).toEqual([boundPlanQuestion(id)]);
+	});
+
+	test("a reviewed production plan: repeated unchanged with no new review it is the same id; repeated with now: guard it gains one trusted now: mark; a changed plan with no fresh review is refused", async () => {
+		const { ledger, wl, planId, ask, call } = await planFixture("production");
+		seedReview(ledger, wl, planId);
+		const raised = await ask();
+		const id = ledger.questions(wl)[0]!.id;
+		expect(raised).toBe(`Raised question ${id} on ${planId} (approve / revise / cancel); the slice is paused until Jo answers.`);
+		expect(await ask()).toBe(reusedReply(id, planId));
+		expect(nowEntries(ledger, wl)).toEqual([]);
+		for (let i = 0; i < 2; i++) {
+			tick();
+			expect(await call("lane_raise_question", { slice: planId, body: PLAN_BODY, options: [...PLAN_OPTIONS], now: "guard" })).toBe(reusedReply(id, planId, "guard"));
+		}
+		expect(ledger.questions(wl).map((q) => q.id)).toEqual([id]);
+		expect(nowEntries(ledger, wl)).toEqual([[`now: ${id} guard`, ESCALATION_BY]]);
+		expect(planQuestions(ledger, wl)).toEqual([boundPlanQuestion(id)]);
+		expect(ledger.entries(wl).some((e) => e.body.startsWith("plan: approved auto"))).toBe(false);
+		// Changed: one more slice line. No review ran since the open question, so it keeps every check.
+		expect(await ask(undefined, planId, planBody(3))).toContain(planReviewRefusal(planId));
+		expect(await call("lane_raise_question", { slice: planId, body: planBody(3), options: [...PLAN_OPTIONS], now: "guard" })).toContain(planReviewRefusal(planId));
+		expect(ledger.questions(wl).map((q) => q.id)).toEqual([id]);
+		expect(nowEntries(ledger, wl)).toHaveLength(1);
+	});
+
+	test("fix round 1 (F1): a reviewed plan whose PLAN.md is edited after the raise (R2 made prompt-only), its question bytes unchanged, is refused on repeat with and without now: guard; no now: mark, no new row", async () => {
+		const { ledger, wl, planId, ask, call } = await planFixture("production");
+		const lines = ["# PLAN", "", "## Requirements", "", "- R1: the header offset lives in one token => test surface/test/tokens.test.ts", "- R2: the old constant is gone => test surface/test/tokens.test.ts"];
+		const path = planFile("PLAN-edited.md", lines);
+		const body = bodyOn(path, [NONE_LINE]);
+		seedReview(ledger, wl, planId);
+		expect(await ask(undefined, planId, body)).toContain("Raised question");
+		const id = ledger.questions(wl)[0]!.id;
+		// Unchanged: the repeat is the open question.
+		expect(await ask(undefined, planId, body)).toBe(reusedReply(id, planId));
+		const entries = ledger.entries(wl).length;
+		// The plan file changes under the same path: R2 is now prompt-only, which the body's `prompt-only: none` no longer matches.
+		planFile("PLAN-edited.md", [...lines.slice(0, -1), "- R2: the old constant is gone => prompt-only: no test can see a deleted name"]);
+		expect(await ask(undefined, planId, body)).toContain(planReviewRefusal(planId));
+		tick();
+		expect(await call("lane_raise_question", { slice: planId, body, options: [...PLAN_OPTIONS], now: "guard" })).toContain(planReviewRefusal(planId));
+		expect(ledger.questions(wl).map((q) => q.id)).toEqual([id]);
+		expect(nowEntries(ledger, wl)).toEqual([]);
+		expect(ledger.entries(wl)).toHaveLength(entries);
+		// The verdict file changing alone is refused the same way, once the plan file is back as it was.
+		planFile("PLAN-edited.md", lines);
+		expect(await ask(undefined, planId, body)).toBe(reusedReply(id, planId));
+		writeFileSync(VERDICT_FILE, "verdict: revise\n");
+		try {
+			tick();
+			expect(await call("lane_raise_question", { slice: planId, body, options: [...PLAN_OPTIONS], now: "guard" })).toContain(planReviewRefusal(planId));
+		} finally {
+			writeFileSync(VERDICT_FILE, "verdict: approve-as-is\n");
+		}
+		expect(nowEntries(ledger, wl)).toEqual([]);
+		expect(ledger.entries(wl)).toHaveLength(entries);
+		// The question's holder entry carries the two hashes the raise checked (the plan file is back as it was then).
+		expect(planQuestions(ledger, wl)).toEqual([boundPlanQuestion(id, path)]);
+	});
+
+	test("a lane message opening with security-red: (the test runner's signal) is refused and nothing is sent", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const held = ledger.workload(wl)!.held_messages;
+		expect(await call("lane_message", { body: `security-red: ${wl} sl-x tr-0abc1234wxyz ${"a".repeat(40)} 1 gates/test/r06-reserved.test.ts > refuses a deploy` })).toBe(
+			"A message opening with `security-red:` is a signal the machinery pushes to Jo; a lane's words must not read as one. Nothing was sent.",
+		);
+		expect(ledger.workload(wl)!.held_messages).toBe(held);
+	});
 });

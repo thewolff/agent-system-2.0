@@ -25,8 +25,11 @@
 // no orchestrator question could be raised again.
 //
 // The raise goes through Jo's standing rulings (gates/src/rulings.ts `askJo`, PLAN wl-mvfkv7llkp7nk0 § 1): a question a
-// ruling decides writes no row and no subject entry, only the surface's `ruling-applied:` on the standing slice.
-import { type AskResult, askJo, type ModelSubject } from "../../gates/src/rulings";
+// ruling decides writes no row and no subject entry, only the surface's `ruling-applied:` on the standing slice. An ask
+// with `now` (PLAN wl-mvg1vs0rhnu3gg § 1.0) skips the rulings; an ask repeating an open one returns its id as reused and
+// writes no second subject entry (§ 3.5). The tool refuses a relay, a body naming another workload's open question
+// (`relayedQuestion`): that question is already on Jo's needs-you list.
+import { type AskResult, askJo, type ModelSubject, type NowCategory } from "../../gates/src/rulings";
 import type { InstructionRow, Ledger } from "../../ledger/src/index";
 import { ensureStandingWorkload, standingSlice } from "./identity";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
@@ -41,14 +44,27 @@ export const reservedQuestionBody = (body: string): boolean => RESERVED_PREFIX.t
 export const questionSubjectBody = (questionId: string, about: string): string => `question-about: ${questionId} ${about}`;
 const SUBJECT = /^question-about: (q-[a-z0-9]+) (wl-[a-z0-9]+)$/;
 
+/** An id of an open question on a workload other than the standing one that `body` names, or null (PLAN wl-mvg1vs0rhnu3gg § 3.5). */
+export function relayedQuestion(ledger: Ledger, body: string): string | null {
+	for (const [id] of body.matchAll(/\bq-[a-z0-9]+\b/g)) {
+		const q = ledger.question(id);
+		if (q !== null && q.state === "open" && q.workload_id !== STANDING_WORKLOAD_ID) return id;
+	}
+	return null;
+}
+
+/** The tool's refusal of a relay; nothing is written. */
+export const relayRefusal = (questionId: string): string => `${questionId} is already on Jo's needs-you list; do not relay it. Nothing was asked.`;
+
 /**
  * Raise the orchestrator's question on the standing slice through the standing rulings: the row, and when it is about
- * a workload, the subject entry naming it, in one transaction; or a ruling's decision with neither. Validation is the
- * tool's; `reviewModel` reads the review row's OpenAI model for a review-model question.
+ * a workload, the subject entry naming it, in one transaction; or a ruling's decision with neither; or, for an ask
+ * repeating an open question about the same workload, that id as reused with no second subject entry. Validation is
+ * the tool's; `reviewModel` reads the review row's OpenAI model for a review-model question.
  */
 export function raiseOrchestratorQuestion(
 	ledger: Ledger,
-	input: { body: string; options: string[]; about: string | null; subject?: ModelSubject | null },
+	input: { body: string; options: string[]; about: string | null; subject?: ModelSubject | null; now?: NowCategory | null },
 	reviewModel?: () => string | null,
 ): AskResult {
 	return ledger.write(() => {
@@ -56,10 +72,10 @@ export function raiseOrchestratorQuestion(
 		const slice = standingSlice(ledger)!;
 		const asked = askJo(
 			ledger,
-			{ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: slice.id, body: input.body, options: input.options, subject: input.subject ?? null },
+			{ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: slice.id, body: input.body, options: input.options, subject: input.subject ?? null, now: input.now ?? null },
 			{ asker: "orchestrator", about: input.about, reviewModel },
 		);
-		if ("raised" in asked && input.about) {
+		if ("raised" in asked && !("reused" in asked) && input.about) {
 			ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: slice.id, kind: "assumption", body: questionSubjectBody(asked.raised, input.about) });
 		}
 		return asked;

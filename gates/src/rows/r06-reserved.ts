@@ -94,6 +94,86 @@ const RULES: Rule[] = [
 	{ re: new RegExp(`${GH}api\\b[^\\n]*(?:-X[=\\s]*|--method[=\\s]+)(POST|PUT|PATCH|DELETE)(?![\\w-])`, "i"), why: "gh api with a mutating method" },
 ];
 
+/**
+ * The reserved actions that interrupt Jo (PLAN wl-mvg1vs0rhnu3gg § 1.2, § 1.3, open question 1 (b)): the `why`
+ * strings of the guard bypasses and the irreversible or shared-state rules — destructive SQL, a production database,
+ * infrastructure teardown, secret rotation, deploy, publish, workflow run, release, the `--admin` merge, push to a
+ * protected branch, remote ref deletion and history rewrite (force-push included). surface/src/errors.ts gives a
+ * waiting reserved request whose body opens with one of them `state: "now"`, and surface/src/batch.ts `onFire` pushes
+ * it at once. Blind "not known until it runs" requests, `rm`, local discards and local branch or tag deletion are not
+ * here: they wait for the window. Each string occurs literally in RULES, gitModel's tables (src/git-model.ts) or
+ * checkPush; gates/test/r06-reserved.test.ts fails when a rule is renamed out from under this list.
+ */
+export const NOW_RESERVED: readonly string[] = [
+	// destructive SQL
+	"destructive SQL (DROP)",
+	"destructive SQL (TRUNCATE)",
+	// production database (psql's own why extends this one)
+	"a database client against a production target",
+	"writes, resets or deletes a Supabase database",
+	// infrastructure teardown
+	"deletes a DigitalOcean resource",
+	"kubectl delete",
+	"infrastructure teardown (destroy)",
+	"deletes AWS resources",
+	"deletes a Google Cloud resource",
+	"destroys a Fly app",
+	"destroys a Heroku app",
+	"removes a docker volume (data loss)",
+	"gh repo delete/archive/rename",
+	"formats a filesystem",
+	"dd onto a block device",
+	// secret rotation
+	"sets or deletes a GitHub Actions secret",
+	"adds or deletes a deploy key",
+	"rotates or rewrites an AWS secret",
+	"rotates a Google Cloud secret",
+	"writes or deletes a Vault secret",
+	"rotates a platform secret",
+	"rewrites a deploy environment secret",
+	// deploy (the bare "deploy" also opens every "deploy (…)")
+	"deploy",
+	"infrastructure change (apply/up)",
+	// publish, workflow run, release
+	"publishes a package",
+	"gh workflow run triggers a workflow (deploy path)",
+	"gh release publishes or destroys a release",
+	// guard bypass: the --admin merge and a push to a protected branch (barePushOfProtected extends the latter)
+	"gh pr merge --admin bypasses branch protection",
+	"push to a protected branch",
+	"git push --all (pushes every branch, protected ones included)",
+	"git push --branches (pushes every branch, protected ones included)",
+	// remote ref deletion
+	"remote ref deletion (git push --delete / -d)",
+	"remote ref deletion (git push :ref)",
+	"git push --mirror (force-updates and deletes every remote ref)",
+	"git push --prune (deletes remote branches)",
+	// history rewrite
+	"force-push",
+	"git update-ref moves or deletes a ref directly (a history rewrite)",
+	"git filter-branch rewrites history",
+	"git replace substitutes objects (a history rewrite)",
+];
+
+/** The NOW_RESERVED entries that bypass a guard (§ 1.2): NOW (guard). Every other entry is NOW (irreversible) (§ 1.3). */
+const NOW_RESERVED_GUARD: Record<string, true> = {
+	"gh pr merge --admin bypasses branch protection": true,
+	"push to a protected branch": true,
+	"git push --all (pushes every branch, protected ones included)": true,
+	"git push --branches (pushes every branch, protected ones included)": true,
+};
+
+/**
+ * The NOW_RESERVED entry a reserved action (or a `reserved-request` body, `<action>: <call> (P-11 row 6 …)`) opens
+ * with and its NOW category (a word of gates/src/rulings.ts NOW_CATEGORIES), or null. An entry counts only whole: the
+ * text is it, or goes on with `:` or ` (` (`deploy (vercel)`, `push to a protected branch (current branch main)`,
+ * `force-push (+refspec)`), never a longer word or phrase.
+ */
+export function nowReserved(text: string): { why: string; category: "guard" | "irreversible" } | null {
+	const why = NOW_RESERVED.find((s) => text === s || text.startsWith(`${s}:`) || text.startsWith(`${s} (`));
+	return why === undefined ? null : { why, category: NOW_RESERVED_GUARD[why] ? "guard" : "irreversible" };
+}
+
 // The merge gate (PLAN wl-mv8s8srodefytc rev 17.1 D2): main's branch protection requires the `as2/full-suite` status only the test
 // runner posts, outside the fence. A lane that wrote a commit status, a check run or a check suite could forge that green, so ghApiModel
 // reads every `gh api` call, in the raw pass (quote-blind words) and the parsed pass (expanded words), where RULES would read a spelling.
