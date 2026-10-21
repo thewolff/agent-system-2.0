@@ -26,8 +26,8 @@ Edit the files in the checkout and re-run `bash install/install.sh`. The install
 | `testRunner.repos` | `thewolff/agent-system-2.0` with `bun test` | The GitHub `owner/repo` origins the test runner serves, each with its test command. Replace it with your own repositories |
 | `testRunner.fullCapMin` / `soloCapMin` / `reportCapMb` / `queueMaxMin` | 20 / 10 / 50 / 60 | Per-run caps for the full suite, each changed file alone, report size, and lock wait |
 | `compaction.thresholdPercent` | 25 | When the orchestrator and lanes compact their context |
-| `skills.includeSkills` | 22 skills | Must equal the manifest's `skill` rows exactly, or the install is refused. Adding a skill means adding `skills/<name>/SKILL.md` with a frontmatter `description` and a manifest row |
-| `extensions` | surface, gates, classifier | Order matters: the surface must load before the gates, and the gates before the classifier |
+| `skills.includeSkills` | 24 skills: 22 from `skills/`, plus `ask-graham` and `i-have-audhd` from the vendored plugins | Must equal the manifest's `skill` rows exactly, and `skills.customDirectories` must be `<repo>/skills` followed by each vendored plugin's `skills/` directory, or the install is refused. Adding a skill means adding `skills/<name>/SKILL.md` with a frontmatter `description` and a manifest row |
+| `extensions` | surface, gates, classifier, plugins (`plugins/index.ts`, which loads the vendored `i-have-audhd` and `ask-graham` adapters in the orchestrator session only) | Order matters: the surface must load before the gates, and the gates before the classifier; the plugins entry is last |
 | `symbolPreset`, `composer`, `theme`, `display`, `tui`, `hideThinkingBlock` | The author's OMP display settings | Display only; nothing in as2 reads them |
 
 ### Environment variables
