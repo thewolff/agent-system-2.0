@@ -151,6 +151,31 @@ describe("lease + reclaim", () => {
 		expect(l.workload(w)).toMatchObject({ holder: "jo", holder_lease_until: null });
 		l.close();
 	});
+
+	test("renewLease (PLAN wl-mvidsu83epvpj4 D2b): extends only the named holder's lease; an unheld or otherwise-held workload is left as it is, with no holder change written", () => {
+		const l = fresh("renew");
+		const w = l.openWorkload({ brief: "b", stakes: "normal", mode: "autonomous", by: "orch-1" });
+		expect(l.claimWorkload(w, { holder: "lane-A", leaseMs: 1_000, by: "lane-A" })).toEqual({ won: true });
+		const before = l.workload(w)!.holder_lease_until!;
+		expect(l.renewLease(w, { by: "lane-runner", holder: "lane-A", leaseMs: 3_600_000 })).toBe(true);
+		expect(Date.parse(l.workload(w)!.holder_lease_until!)).toBeGreaterThan(Date.parse(before));
+		expect(l.workload(w)!.holder).toBe("lane-A");
+		// another holder's name renews nothing
+		expect(l.renewLease(w, { by: "lane-runner", holder: "lane-B", leaseMs: 60_000 })).toBe(false);
+		expect(l.workload(w)!.holder).toBe("lane-A");
+		// the lane's own release, then the runner's renewal: still released, and the newest holder change is the lane's own
+		expect(l.releaseWorkload(w, { by: "lane-A", holder: "lane-A" })).toEqual({ released: true });
+		const rev = l.workload(w)!.rev;
+		expect(l.renewLease(w, { by: "lane-runner", holder: "lane-A", leaseMs: 60_000 })).toBe(false);
+		expect(l.workload(w)).toMatchObject({ holder: null, holder_lease_until: null, rev });
+		expect(l.holderChanges(w).map((c) => [c.from, c.to, c.by])).toEqual([[null, "lane-A", "lane-A"], ["lane-A", null, "lane-A"]]);
+		// a workload held by someone else (Jo) is not taken either
+		expect(l.claimWorkload(w, { holder: "jo", leaseMs: null, by: "orch-1" })).toEqual({ won: true });
+		expect(l.renewLease(w, { by: "lane-runner", holder: "lane-A", leaseMs: 60_000 })).toBe(false);
+		expect(l.workload(w)).toMatchObject({ holder: "jo", holder_lease_until: null });
+		expect(l.holderChanges(w).map((c) => [c.from, c.to, c.by])).toEqual([[null, "lane-A", "lane-A"], ["lane-A", null, "lane-A"], [null, "jo", "orch-1"]]);
+		l.close();
+	});
 });
 
 describe("provenance cannot be omitted", () => {

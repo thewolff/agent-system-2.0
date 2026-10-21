@@ -10,8 +10,8 @@
 // (`liveTestRuns` holds like a hand; `deadTestRuns` asks once for a new run), as pure helpers the
 // runner feeds from omp's frames, the ledger and the runs' heartbeat files.
 import { parseHandSpawn, settledTokens } from "../../classifier/src/lab";
-import { type EntryRow, LANE_RUNNER_BY, type Ledger, type RoutingRow, type SliceRow } from "../../ledger/src/index";
-import { type ControlEntry } from "./launch";
+import { type EntryRow, type HolderChange, LANE_RUNNER_BY, type Ledger, type RoutingRow, type SliceRow } from "../../ledger/src/index";
+import { type ControlEntry, JO_HOLDER } from "./launch";
 import { laneDeaths } from "./signals";
 import { ownsRequest, type RunRecord, runLive } from "./test-run";
 import { LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, ORCHESTRATOR_RECIPIENT } from "./types";
@@ -20,7 +20,11 @@ import { LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, ORCHESTRATOR_RECIPIENT } from ".
 export const CONTINUE_LIMIT = 2;
 /** Idle prompts one runner sends an idle session in one idle episode before it surfaces open work (PLAN wl-mv5i3lulwwbbi8 D6). */
 export const IDLE_LIMIT = 2;
-/** The settle wait this long with no omp frame but the replies to the runner's own get_state is idle (D6); the runner's AGENT_SYSTEM_LANE_SETTLE_IDLE_MS overrides it. */
+/**
+ * The settle wait this long with no omp frame but the replies to the runner's own get_state is idle (D6); the runner's
+ * AGENT_SYSTEM_LANE_SETTLE_IDLE_MS overrides it. It bounds only a lane that neither released itself nor recorded its
+ * receipt: either one decides at once, with no settle wait (PLAN wl-mvidsu83epvpj4 D2).
+ */
 export const SETTLE_IDLE_MS = 15 * 60_000;
 /** Appended to a runner death written while omp still reported background work (D3). */
 export const BACKGROUND_SUFFIX = "; background work was in flight";
@@ -30,7 +34,8 @@ export const SETTLE_CHECK = "settle-check";
 export const IDLE_CHECK = "idle-check";
 
 /**
- * - `wait`: omp reported background work; nothing until `session_settled` (D1), unless the session is idle (D6).
+ * - `wait`: omp reported background work; nothing until `session_settled` (D1), unless the session is idle (D6), the lane
+ *   released itself, or a holder's receipt stands (PLAN wl-mvidsu83epvpj4 D2).
  * - `continue`: send a continue prompt on the same omp (D2 step 6, D6 step 0); `TurnEnd.continued` says which.
  * - `hold`: a hand of this lane is unsettled, or a test run of the workload is live, and the continue prompts are spent,
  *   or an idle session has a reserved request waiting on Jo: keep omp, poll the ledger (D6; PLAN wl-mv5i3lulwwbbi8 D6, D8).
@@ -87,8 +92,13 @@ export interface TurnEndInput {
 	handedOff: boolean;
 	/** The open-slice count this lane's `released-open:` marker names, or null when it wrote none (D4). */
 	releasedOpen: number | null;
-	/** A holder's `done-because:` stands. */
+	/** A holder's `done-because:` stands: it skips the settle wait (PLAN wl-mvidsu83epvpj4 D2); the rest of the ladder applies. */
 	receipt: boolean;
+	/**
+	 * The lane released itself (`selfReleased`: lane_release or lane_handoff; PLAN wl-mvidsu83epvpj4 D2): its tools refuse from
+	 * here on, so neither a settle wait, a continue prompt for hands, runs or a dead run, nor a hold can do anything.
+	 */
+	selfReleased: boolean;
 	slices: SliceCounts;
 	/** Continue prompts sent so far in this run (hands, live runs, open work; never a dead run's or an idle one). */
 	continues: number;
@@ -135,15 +145,19 @@ export interface TurnEnd {
  * runs the ladder instead of waiting (D6); after the hands, a dead test run is asked about once, uncounted, and live test
  * runs continue then hold like hands (D8); only the last step differs for an idle unsettled session: a reserved request
  * waiting on Jo holds, else up to `IDLE_LIMIT` idle prompts, then open work. A settled session's ladder is otherwise unchanged.
+ * PLAN wl-mvidsu83epvpj4 D2: a lane that released itself skips the wait, the hands, the dead run and the live runs, and
+ * lands on released / its prompt's death / the park / open-work or completed; a standing receipt skips only the wait.
  */
 export function turnEnd(i: TurnEndInput): TurnEnd {
 	const decided = (decision: TurnEndDecision): TurnEnd => ({ decision, parkError: null });
 	const resume = (continued: Continued): TurnEnd => ({ decision: "continue", parkError: null, continued });
-	if (!i.settled && !i.idle) return decided("wait");
-	if (i.unsettledHands.length > 0) return i.continues < i.limit ? resume({ kind: "hands" }) : decided("hold");
-	const dead = i.deadTestRuns[0];
-	if (dead !== undefined) return resume({ kind: "dead-run", run: dead });
-	if (i.liveTestRuns.length > 0) return i.continues < i.limit ? resume({ kind: "runs" }) : decided("hold");
+	if (!i.settled && !i.idle && !i.selfReleased && !i.receipt) return decided("wait");
+	if (!i.selfReleased) {
+		if (i.unsettledHands.length > 0) return i.continues < i.limit ? resume({ kind: "hands" }) : decided("hold");
+		const dead = i.deadTestRuns[0];
+		if (dead !== undefined) return resume({ kind: "dead-run", run: dead });
+		if (i.liveTestRuns.length > 0) return i.continues < i.limit ? resume({ kind: "runs" }) : decided("hold");
+	}
 	if (i.handedOff) return decided("released");
 	if (i.status !== "completed") return decided(i.status);
 	let park: { parked: false } | { parked: true; open: number };
@@ -304,6 +318,22 @@ export function releasedOpen(control: readonly ControlEntry[], laneId: string): 
 		if (m) return Number(m[1]);
 	}
 	return null;
+}
+
+/**
+ * PLAN wl-mvidsu83epvpj4 D1, pure: whether `laneId` released itself, read from the workload's holder history alone (`Ledger.holderChanges`,
+ * oldest first). The newest change naming `laneId` on either side must be `laneId → none` or `laneId → jo`, written by `laneId`
+ * (lane_release; lane_handoff's release before its claim for Jo). No entry is read, so a re-recorded `lane-started:` cannot flip
+ * it back; a later claim by the same lane id is a newer change naming it. A lapsed lease writes no change, and a holder taken
+ * over, or a release by the runner or the starter, is written by someone else: none of these is a self-release.
+ */
+export function selfReleased(changes: readonly Pick<HolderChange, "from" | "to" | "by">[], laneId: string): boolean {
+	for (let i = changes.length - 1; i >= 0; i--) {
+		const c = changes[i]!;
+		if (c.from !== laneId && c.to !== laneId) continue;
+		return c.from === laneId && (c.to === null || c.to === JO_HOLDER) && c.by === laneId;
+	}
+	return false;
 }
 
 /**

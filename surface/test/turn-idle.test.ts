@@ -121,7 +121,7 @@ describe("the counter a continue spends and the texts (D6, D8)", () => {
 
 	test("an idle open-work death names the idle prompts; a settled one keeps the continue prompts' line", () => {
 		const base = {
-			status: "completed" as const, unsettledHands: [], liveTestRuns: [], deadTestRuns: [], pendingReserved: false, held: true, handedOff: false, releasedOpen: null, receipt: false,
+			status: "completed" as const, unsettledHands: [], liveTestRuns: [], deadTestRuns: [], pendingReserved: false, held: true, handedOff: false, releasedOpen: null, receipt: false, selfReleased: false,
 			slices: { open: 1, paused: 0, done: 0 }, continues: 2, idleContinues: 2, limit: CONTINUE_LIMIT, park: () => ({ parked: false as const }),
 		};
 		const idle = { ...base, settled: false, idle: true };

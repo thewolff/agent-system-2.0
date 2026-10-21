@@ -5,7 +5,7 @@
 // really is, on a temp HOME, a temp ledger and a temp git repo. The Codex-review regressions the
 // runner owns are here: readiness is the lane's own claim (B1), the runner finalizes once on any
 // exit including a thrown exception after the reservation (B3), a stop persists its acceptance
-// then abort → stdin EOF → bounded SIGKILL (B4), and every exit is classified with a requested stop
+// then abort → stdin EOF → SIGTERM after the shutdown grace → bounded SIGKILL (B4; PLAN wl-mvidsu83epvpj4 D3), and every exit is classified with a requested stop
 // never writing lane-died:.
 import { afterAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
@@ -428,10 +428,10 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(snap.bodies.filter((b) => b.startsWith(`${LANE_STARTER_BY} launch: `)).map((b) => b.split(" ")[4])).toEqual(["first", "request"]);
 	}, 40_000);
 
-	test("B4 stop from the ledger: acceptance persisted, then abort → stdin EOF → SIGKILL after the grace when omp ignores both; outcome stop, no lane-died:, released", async () => {
+	test("B4 stop from the ledger: acceptance persisted, then abort → stdin EOF → SIGTERM after the shutdown grace → SIGKILL after the end grace when omp ignores all three; outcome stop, no lane-died:, released", async () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r, { slice: true });
-		setScript(r, { steps: [{ hang: true }], ignoreAbort: true, ignoreEof: true });
+		setScript(r, { steps: [{ hang: true }], ignoreAbort: true, ignoreEof: true, ignoreTerm: true });
 		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
 		const laneId = laneIdOf(wl, 1);
 		await readyOf(r, wl, laneId);
@@ -453,9 +453,9 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(stops.map((s) => s.createdBy)).toEqual([LANE_STARTER_BY, LANE_RUNNER_BY]);
 		expect(stops[1]!.rest).toBe(`accepted ${stops[0]!.id}`);
 		expect(snap.control.filter((c) => c.prefix !== "ctx-index").map((c) => c.prefix).slice(-4)).toEqual(["lane-stop", "lane-stop", "spend", "lane-exit"]);
-		// abort, then EOF, then the kill: omp saw both frames and outlived them until the grace ran out
-		expect(eventsOf(r, started.pid)).toEqual(["prompt", "abort", "eof"]);
-		expect(ms).toBeGreaterThanOrEqual(1500);
+		// abort, then EOF, then SIGTERM after the shutdown grace (1.5 s), then the kill after the end grace (1.5 s): omp saw each and outlived it
+		expect(eventsOf(r, started.pid)).toEqual(["prompt", "abort", "eof", "sigterm"]);
+		expect(ms).toBeGreaterThanOrEqual(3000);
 		expect(ms).toBeLessThan(20_000);
 		expect(alive(started.pid)).toBe(false);
 	}, 40_000);

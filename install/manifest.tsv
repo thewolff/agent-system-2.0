@@ -1104,6 +1104,7 @@ surface/test/fake-omp.ts	test	-
 surface/test/launch.test.ts	test	-
 surface/test/lane-script.test.ts	test	-
 surface/test/lane-live-lane.test.ts	test	-
+surface/test/lane-release-exit.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-
 surface/test/lane-model.test.ts	test	-
 surface/test/lane-model-script.test.ts	test	-
