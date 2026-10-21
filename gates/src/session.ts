@@ -159,6 +159,12 @@ export class GateSession {
 	) {
 		this.role = roleOf(ctx, env);
 		this.workloadId = env[WORKLOAD_ENV] || null;
+		// The `lane-<pid>` fallback never stamps a launched lane's row-11 write: both lane spawn sites (surface/scripts/
+		// lane.ts, the runner's and `as2 lane`'s, through laneSpawnEnv → surface/src/launch.ts laneEnv) set
+		// AGENT_SYSTEM_LANE_ID next to the workload id. A bound session without it is one started by hand outside
+		// them; the ledger connection's G3 trigger (ledger/src/authority.ts installBoundary, from the same process
+		// env) then holds no lane id and refuses its row-11 write, so row 11 fails closed (InstructionRecorder holds
+		// the input) rather than writing under a stamp the trigger does not know.
 		this.laneId = env[LANE_ENV] || `lane-${process.pid}`;
 		const bound = this.bound;
 		this.wake = bound ? new WakeRead(this.workloadId!, this.laneId, () => this.ledger()) : null;

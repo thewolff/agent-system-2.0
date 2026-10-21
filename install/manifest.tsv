@@ -16,12 +16,14 @@ ledger/SCHEMA.md	doc	-
 ledger/schema.sql	ledger-schema	{ledger_db}
 ledger/src/index.ts	ledger-module	-
 ledger/src/locality.ts	ledger-module	-
+ledger/src/authority.ts	ledger-module	-
 ledger/scripts/init.ts	ledger-init	-
 ledger/scripts/backup.ts	ledger-backup	-
 ledger/test/facts.test.ts	test	-
 ledger/test/install.test.ts	test	-
 ledger/test/ledger.test.ts	test	-
 ledger/test/raw-sqlite.test.ts	test	-
+ledger/test/authority.test.ts	test	-
 install/manifest.tsv	install	-
 install/install.sh	install	-
 install/fresh-machine-test.sh	install	-
@@ -82,6 +84,7 @@ classifier/test/review-round1.test.ts	test	-
 classifier/test/review-round2.test.ts	test	-
 classifier/test/review-stop.test.ts	test	-
 classifier/test/rounds.test.ts	test	-
+classifier/test/authority-readers.test.ts	test	-
 classifier/test/snapshot-settle.test.ts	test	-
 classifier/test/route.test.ts	test	-
 classifier/test/tier-files.test.ts	test	-
@@ -145,6 +148,7 @@ gates/test/review-round7-env.test.ts	test	-
 gates/test/review-round7-eval.test.ts	test	-
 gates/test/review-round7-git.test.ts	test	-
 gates/test/review-round8-env.test.ts	test	-
+gates/test/authority-gate.test.ts	test	-
 gates/test/review-round8-eval.test.ts	test	-
 gates/test/fence.test.ts	test	-
 gates/test/r06-eval-literals.test.ts	test	-

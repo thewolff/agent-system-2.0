@@ -20,6 +20,21 @@ const FIXTURES = join(import.meta.dir, "fixtures", "guard-replay");
 const SCRIPT = join(import.meta.dir, "..", "scripts", "guard-replay.ts");
 /** The fixture's call count: a CLI run that parses fewer has lost calls, not passed. */
 const CORPUS_CALLS = 41;
+/**
+ * The intended NEW-CATCHes, by corpus line. Line 2 runs `bun test "$f"` over a `for` loop's values: row 6 refused
+ * it live and still does, and G1 review round 2 (finding 1) reads every test file `bun test` runs, so row 10 now
+ * refuses an argument it cannot read too (the gate does not model loop values). Line 62's eval loads the ledger
+ * module and writes a scratch ledger stamped orchestrator-surface; it passed live, and the Jo-only boundary (PLAN
+ * wl-mv654hoqwpfhmo § 6.3 item 2) refuses it. Lines 64 and 66 load `${R}/surface/scripts/lane.ts` by a template
+ * specifier computed at run time (line 64 then writes the runner's `lane-runner` rows); G1 (scratch auth-forgery
+ * AUDIT.md § (e)) refuses a computed import() whatever it names.
+ */
+const BOUNDARY_NEW_CATCH = [
+	{ line: 2, reason: "`bun test` with an argument not known until it runs" },
+	{ line: 62, reason: "code loading the ledger module" },
+	{ line: 64, reason: "specifier is computed" },
+	{ line: 66, reason: "specifier is computed" },
+];
 
 const corpus = () => collectCalls([FIXTURES], 0);
 
@@ -50,8 +65,12 @@ describe("the fixture corpus on the rows as they are now", () => {
 		expect(report.errors).toBe(0);
 		expect(report.ambiguous).toBe(0);
 		expect(report.lost).toBe(0);
-		const newCatches = report.calls.filter((c) => c.outcomes.some((o) => o.kind === "new-catch")).map((c) => `${c.line}: ${c.nowReason}`);
-		expect(newCatches).toEqual([]);
+		const newCatches = report.calls.filter((c) => c.outcomes.some((o) => o.kind === "new-catch"));
+		expect(newCatches.map((c) => c.line)).toEqual(BOUNDARY_NEW_CATCH.map((n) => n.line));
+		for (const [i, n] of BOUNDARY_NEW_CATCH.entries()) {
+			expect(newCatches[i]!.nowReason).toContain("Jo-only boundary");
+			expect(newCatches[i]!.nowReason).toContain(n.reason);
+		}
 		// The corpus covers the replayable rows with live refusals and the state-bound ones too.
 		for (const row of ["r06-reserved", "r10-raw-ledger", "r05-brief-fields"]) expect(report.rows[row]!.unchanged).toBeGreaterThan(0);
 		for (const row of ["r08-push-rebase", "question", "fence", "r18-typed-wrapper"]) expect(report.rows[row]!.stateBound).toBeGreaterThan(0);
@@ -95,7 +114,7 @@ describe("the fixture corpus on the rows as they are now", () => {
 		const stricter: Check = (c, ctx, deps) => checkToolCall(c, ctx, deps) ?? (c.toolName === "read" ? { block: true, reason: "P-11 row 10 refused this: reads too" } : null);
 		const report = replay(corpus(), stricter);
 		expect(report.lost).toBe(0);
-		expect(report.rows["r10-raw-ledger"]!.newCatch).toBe(corpus().filter((c) => c.tool === "read").length);
+		expect(report.rows["r10-raw-ledger"]!.newCatch).toBe(corpus().filter((c) => c.tool === "read").length + BOUNDARY_NEW_CATCH.length);
 		expect(exitCode(report)).toBe(0);
 	});
 
