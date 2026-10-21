@@ -143,7 +143,7 @@ function wrapperFor(b: Box, name: string, opts: { sweepLockWaitMs?: number }): s
 /** The caller's env carries credentials; the wrapper's `env -i` must drop them. */
 const callerEnv = (b: Box) => ({
 	PATH: `${b.bin}:${SYS_PATH}`, HOME: "/nonexistent-home", GH_TOKEN: "ghp_secret", ANTHROPIC_API_KEY: "sk-ant", OPENAI_API_KEY: "sk-oai", MOONSHOT_API_KEY: "ms",
-	SSH_AUTH_SOCK: "/tmp/agent.sock", OMP_TOKEN: "omp", AGENT_SYSTEM_TEST_RUNS: "/tmp/runs", AGENT_SYSTEM_LEDGER_DB: "/tmp/ledger.db", LANG: "C",
+	SSH_AUTH_SOCK: "/tmp/agent.sock", OMP_TOKEN: "omp", AGENT_SYSTEM_TEST_RUNS: "/tmp/runs", AGENT_SYSTEM_LEDGER_DB: "/tmp/ledger.db", TMPDIR: "/nonexistent-caller-tmp", LANG: "C",
 });
 
 interface Ran {
@@ -261,6 +261,117 @@ describe("fencing on <stage>/current", () => {
 		}
 		rmSync(join(b.root, "stage", "current"));
 		expect(call(b, { sub: "full", runId: "tr-mine" }).exit).toBe(WRAPPER_EXIT.fenced);
+	});
+});
+
+describe("wrapper startup TMPDIR", () => {
+	test("the rendered env-i command supplies an existing private per-run temp before starting Bun, and cleanup removes only the old run", () => {
+		// The stand-in inspects TMPDIR at executable entry, before any Bun or JS initialization.
+		const b = box("startup-tmp");
+		const fakeBun = join(b.root, "..", "bun-at-entry");
+		writeFileSync(fakeBun, "#!/bin/sh\n[ -d \"$TMPDIR\" ] && [ ! -L \"$TMPDIR\" ] || exit 90\n[ -z \"$GH_TOKEN\" ] && [ -z \"$HOME\" ] || exit 91\n: > \"$TMPDIR/native-at-startup\"\nprintf '%s\\n' \"$TMPDIR\"\n", { mode: 0o755 });
+		const exec = join(b.root, "..", "exec-at-entry");
+		writeFileSync(exec, renderExecWrapper({ root: b.root, bun: fakeBun, script: SCRIPT, sweepScope: "groups" }), { mode: 0o755 });
+		for (const id of ["tr-first", "tr-second"]) {
+			setCurrent(b, id);
+			const r = raw(b, ["sweep", id], exec);
+			expect(r.exit).toBe(0);
+			const temp = join(workOf(b, id), ".wrapper-tmp");
+			expect(r.stdout.trim()).toBe(temp);
+			expect(realpathSync(temp)).toBe(temp);
+			expect(statSync(temp).mode & 0o777).toBe(0o700);
+			expect(readFileSync(join(temp, "native-at-startup"), "utf8")).toBe("");
+		}
+		// A startup-only run from pre-prepare sweep remains preparable, exactly once.
+		expect(call(b, { sub: "sweep", runId: "tr-second" }).exit).toBe(WRAPPER_EXIT.ok);
+		const sha = stageRepo(b, "tr-second", { "a.test.ts": OK_TEST });
+		expect(call(b, { sub: "prepare", runId: "tr-second", sha }).exit).toBe(WRAPPER_EXIT.ok);
+		expect(statSync(join(workOf(b, "tr-second"), ".wrapper-tmp")).mode & 0o777).toBe(0o700);
+		expect(call(b, { sub: "prepare", runId: "tr-second", sha }).exit).toBe(WRAPPER_EXIT.refused);
+		expect(call(b, { sub: "full", runId: "tr-second" }).exit).toBe(0);
+		expect(call(b, { sub: "cleanup", runId: "tr-second", oldRunId: "tr-first" }).exit).toBe(0);
+		expect(existsSync(workOf(b, "tr-first"))).toBe(false);
+		expect(existsSync(join(workOf(b, "tr-second"), ".wrapper-tmp", "native-at-startup"))).toBe(true);
+	});
+
+	test("a real Bun process reached through the rendered wrapper sees only its run's startup TMPDIR", () => {
+		const source = join(dir("startup-source"), "entry.ts");
+		writeFileSync(source, `import { statSync, writeFileSync } from "node:fs";\nimport { tmpdir } from "node:os";\nconst tmp = process.env.TMPDIR!;\nwriteFileSync(tmp + "/loaded-by-bun", "yes");\nconsole.log(JSON.stringify({ tmp, osTmp: tmpdir(), mode: statSync(tmp).mode & 0o777, token: process.env.GH_TOKEN ?? null }));\n`);
+		const b = box("startup-real-bun", { script: source });
+		for (const id of ["tr-reala", "tr-realb"]) {
+			setCurrent(b, id);
+			const r = call(b, { sub: "sweep", runId: id });
+			expect(r.exit).toBe(0);
+			const tmp = join(workOf(b, id), ".wrapper-tmp");
+			expect(JSON.parse(r.stdout)).toEqual({ tmp, osTmp: tmp, mode: 0o700, token: null });
+			expect(readFileSync(join(tmp, "loaded-by-bun"), "utf8")).toBe("yes");
+		}
+	});
+
+	test("invalid and fenced bootstrap calls create no run directory", () => {
+		const b = box("bootstrap-fenced");
+		setCurrent(b, "tr-current");
+		for (const args of [["full", "tr-BAD"], ["prepare", "tr-current", "bad"], ["cleanup", "tr-current", "../bad"], ["solo", "tr-current", "../bad.test.ts"], ["probe", "tr-current", "relative"]]) {
+			expect(raw(b, args).exit).toBe(WRAPPER_EXIT.refused);
+			expect(readdirSync(join(b.root, "runs"))).toEqual([]);
+		}
+		for (const sub of ["sweep", "full"]) expect(raw(b, [sub, "tr-other"]).exit).toBe(WRAPPER_EXIT.fenced);
+		rmSync(join(b.root, "stage", "current"));
+		expect(raw(b, ["sweep", "tr-current"]).exit).toBe(WRAPPER_EXIT.fenced);
+		expect(readdirSync(join(b.root, "runs"))).toEqual([]);
+		setCurrent(b, "tr-current");
+		expect(raw(b, ["prepare", "tr-current", "a".repeat(40)]).exit).toBe(WRAPPER_EXIT.failed);
+		expect(readdirSync(join(b.root, "runs"))).toEqual([]);
+	});
+
+	test("bootstrap refuses run, temp and area symlinks without touching their targets, including dangling links", () => {
+		for (const target of ["run", "temp", "runs", "stage", "locks", "dangling"]) {
+			const b = box(`bootstrap-link-${target}`);
+			const outside = dir(`bootstrap-outside-${target}`);
+			setCurrent(b, "tr-link");
+			if (target === "run" || target === "dangling") symlinkSync(target === "run" ? outside : join(outside, "absent"), workOf(b, "tr-link"));
+			else if (target === "temp") {
+				mkdirSync(workOf(b, "tr-link"));
+				symlinkSync(outside, join(workOf(b, "tr-link"), ".wrapper-tmp"));
+			} else {
+				rmSync(join(b.root, target), { recursive: true });
+				symlinkSync(outside, join(b.root, target));
+			}
+			expect(call(b, { sub: "sweep", runId: "tr-link" }).exit).toBe(WRAPPER_EXIT.refused);
+			expect(readdirSync(outside)).toEqual([]);
+		}
+	});
+
+	test("bootstrap refuses a non-private existing temp instead of repairing or using it", () => {
+		const b = box("bootstrap-permissions");
+		setCurrent(b, "tr-public");
+		const tmp = join(workOf(b, "tr-public"), ".wrapper-tmp");
+		mkdirSync(tmp, { recursive: true, mode: 0o755 });
+		chmodSync(tmp, 0o755);
+		expect(call(b, { sub: "sweep", runId: "tr-public" }).exit).toBe(WRAPPER_EXIT.refused);
+		expect(statSync(tmp).mode & 0o777).toBe(0o755);
+		expect(readdirSync(tmp)).toEqual([]);
+	});
+
+	test("prepare refuses an existing non-bootstrap run without adding files, and direct prepare retains exclusive creation", () => {
+		const b = box("bootstrap-existing");
+		const sha = stageRepo(b, "tr-existing", { "a.test.ts": OK_TEST });
+		setCurrent(b, "tr-existing");
+		mkdirSync(workOf(b, "tr-existing"));
+		writeFileSync(join(workOf(b, "tr-existing"), "keep"), "untouched");
+		expect(call(b, { sub: "prepare", runId: "tr-existing", sha }).exit).toBe(WRAPPER_EXIT.refused);
+		expect(readdirSync(workOf(b, "tr-existing"))).toEqual(["keep"]);
+		const emptySha = stageRepo(b, "tr-empty", { "a.test.ts": OK_TEST });
+		setCurrent(b, "tr-empty");
+		mkdirSync(workOf(b, "tr-empty"));
+		expect(call(b, { sub: "prepare", runId: "tr-empty", sha: emptySha }).exit).toBe(WRAPPER_EXIT.refused);
+		expect(readdirSync(workOf(b, "tr-empty"))).toEqual([]);
+		const directSha = stageRepo(b, "tr-direct", { "a.test.ts": OK_TEST });
+		setCurrent(b, "tr-direct");
+		const args = [BUN, SCRIPT, "prepare", "tr-direct", directSha];
+		const env = { PATH: SYS_PATH, TMPDIR: dir("direct-runtime"), AS2TEST_EXEC_CONFIG: JSON.stringify(execConfigOf({ root: b.root, bun: BUN, script: SCRIPT, sweepScope: "groups" })) };
+		expect(Bun.spawnSync(args, { env, stderr: "pipe" }).exitCode).toBe(WRAPPER_EXIT.ok);
+		expect(Bun.spawnSync(args, { env, stderr: "pipe" }).exitCode).toBe(WRAPPER_EXIT.refused);
 	});
 });
 
@@ -595,6 +706,23 @@ describe("cleanup", () => {
 		expect(readdirSync(runs).sort()).toEqual(["tr-link", "tr-n1", "tr-sib"]);
 		expect(readFileSync(join(outside, "keep"), "utf8")).toBe("x");
 		expect(readFileSync(join(runs, "tr-sib", "keep"), "utf8")).toBe("x");
+	});
+
+	test("cleanup unlinks a swapped old startup TMPDIR but preserves its target and the current run's temp", () => {
+		const b = box("cleanup-startup-link");
+		prepared(b, "tr-oldtmp", { "a.test.ts": OK_TEST });
+		const outside = dir("cleanup-startup-target");
+		writeFileSync(join(outside, "keep"), "private");
+		const oldTmp = join(workOf(b, "tr-oldtmp"), ".wrapper-tmp");
+		rmSync(oldTmp, { recursive: true });
+		symlinkSync(outside, oldTmp);
+		prepared(b, "tr-newtmp", { "a.test.ts": OK_TEST });
+		const newTmp = join(workOf(b, "tr-newtmp"), ".wrapper-tmp");
+		writeFileSync(join(newTmp, "keep"), "current");
+		expect(call(b, { sub: "cleanup", runId: "tr-newtmp", oldRunId: "tr-oldtmp" }).exit).toBe(WRAPPER_EXIT.ok);
+		expect(existsSync(workOf(b, "tr-oldtmp"))).toBe(false);
+		expect(readFileSync(join(outside, "keep"), "utf8")).toBe("private");
+		expect(readFileSync(join(newTmp, "keep"), "utf8")).toBe("current");
 	});
 });
 

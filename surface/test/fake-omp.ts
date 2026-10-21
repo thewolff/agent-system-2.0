@@ -63,7 +63,8 @@ import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import orchestratorSurface from "../index";
-import { ctxOf, type FakeScript, type FakeStep, fakePi } from "./helpers";
+import { ctxOf, fakePi, loadTestText } from "./helpers";
+import type { FakeScript, FakeStep } from "./helpers";
 
 const script: FakeScript = process.env.FAKE_OMP_SCRIPT && existsSync(process.env.FAKE_OMP_SCRIPT) ? (JSON.parse(readFileSync(process.env.FAKE_OMP_SCRIPT, "utf8")) as FakeScript) : { steps: [] };
 const argv = process.argv.slice(2);
@@ -134,7 +135,7 @@ const durationMs = (d: string | null): number | null => {
 };
 
 const f = fakePi();
-orchestratorSurface(f.pi, process.env, {});
+await orchestratorSurface(f.pi, process.env, { loadText: loadTestText });
 const ctx = ctxOf({ cwd: process.cwd() });
 let shutDown = false;
 const shutdown = async (): Promise<void> => {

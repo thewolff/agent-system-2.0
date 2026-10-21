@@ -917,7 +917,6 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(run.reason).toContain("nothing was tested");
 		expect(marks(w, runId, "spawn-prepare")).toEqual([]);
 		expect(marks(w, runId, "spawn-full")).toEqual([]);
-		expect(existsSync(workDirOf(runId, w.as2))).toBe(false);
 		expect(w.ledger.slice(slice)!.state).toBe("open");
 	});
 

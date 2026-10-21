@@ -32,6 +32,7 @@ import {
 import { constants as osConstants } from "node:os";
 import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { type ExecConfig, probeAnswerLine, REAL_GIT, UID_SWEEP } from "../src/as2test";
+import { sweepLegacyNativeTemps } from "../src/as2test-temp";
 import {
 	AS2TEST_USER, childEnv, childGitconfigText, childLayout, gitShimText, isBunTestFile, RUN_ID_RE, SHA_RE, WRAPPER_EXIT,
 } from "../src/test-run";
@@ -208,8 +209,26 @@ function prepare(cfg: Config, a: Areas, runId: string, sha: string, side: Side):
 	// Base clones beside the PR's clone, after it: the run's work dir and its groups file already exist.
 	const runWork = side === "pr" ? join(a.runs, runId) : workDir(a, runId);
 	const work = side === "pr" ? runWork : join(runWork, "base");
+	if (side === "pr" && existsSync(work)) {
+		// The shell must make TMPDIR before Bun starts, including a sweep/probe before prepare.
+		// Only that bootstrap layout may preexist; claim preparation exclusively before any other write.
+		workDir(a, runId);
+		const tmp = join(work, ".wrapper-tmp");
+		const entries = readdirSync(work);
+		if (entries.length !== 1 || entries[0] !== ".wrapper-tmp") refuse(`${work} already exists`);
+		const st = lstatSync(tmp);
+		if (!st.isDirectory() || realpathSync(tmp) !== tmp || st.uid !== process.getuid?.() || (st.mode & 0o777) !== 0o700) refuse(`${tmp} is not an owned private plain directory`);
+	} else {
+		try {
+			mkdirSync(work, { mode: 0o755 });
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code === "EEXIST") refuse(`${work} already exists`);
+			throw e;
+		}
+	}
+	// A failed/interrupted prepare is not reusable, nor can two prepare processes share a run.
 	try {
-		mkdirSync(work, { mode: 0o755 });
+		mkdirSync(join(work, ".prepare"), { mode: 0o700 });
 	} catch (e) {
 		if ((e as NodeJS.ErrnoException).code === "EEXIST") refuse(`${work} already exists`);
 		throw e;
@@ -225,7 +244,9 @@ function prepare(cfg: Config, a: Areas, runId: string, sha: string, side: Side):
 	git(["clone", "--quiet", "--no-checkout", realpathSync(bundle), join(work, "repo")], env, work);
 	git(["checkout", "--quiet", "--detach", sha], env, join(work, "repo"));
 	git(["remote", "remove", "origin"], env, join(work, "repo"));
-	openUp(work);
+	chmodSync(work, 0o755);
+	// Native extraction artifacts in the wrapper's private startup TMPDIR stay private.
+	for (const name of readdirSync(work)) if (name !== ".wrapper-tmp") openUp(join(work, name));
 	process.stdout.write(`prepared ${join(work, "repo")} at ${sha}\n`);
 }
 
@@ -404,13 +425,22 @@ async function sweep(cfg: Config, a: Areas, runId: string): Promise<number> {
 		}
 		return [...new Set(text.split("\n").filter((s) => /^[1-9]\d*$/.test(s)).map(Number))].filter((g) => g !== process.pid);
 	};
+	// Resolve the actual account, not an argv/config UID. Refuse before signaling or touching /private/tmp
+	// unless this is really that user's process. Groups fixtures never resolve the account or sweep temp.
+	let ownerUid: number | null = null;
+	if (cfg.sweep !== "groups") {
+		const id = spawnSync("/usr/bin/id", ["-u", AS2TEST_USER], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+		const uid = /^\d+\s*$/.test(id.stdout ?? "") ? Number(id.stdout.trim()) : NaN;
+		if (id.status !== 0 || !Number.isSafeInteger(uid) || uid <= 0 || process.getuid?.() !== uid) refuse(`uid sweep must run as ${AS2TEST_USER}`);
+		ownerUid = uid;
+	}
 	const signal = (sig: "TERM" | "KILL"): void => {
 		if (cfg.sweep === "groups") for (const g of groups()) signalGroup(g, `SIG${sig}`);
-		else spawnSync("/usr/bin/pkill", [`-${sig}`, "-U", AS2TEST_USER], { stdio: "ignore" });
+		else spawnSync("/usr/bin/pkill", [`-${sig}`, "-U", String(ownerUid)], { stdio: "ignore" });
 	};
 	const anyLeft = (): boolean => {
 		if (cfg.sweep === "groups") return groups().some(groupAlive);
-		return spawnSync("/usr/bin/pgrep", ["-U", AS2TEST_USER], { stdio: "ignore" }).status === 0;
+		return spawnSync("/usr/bin/pgrep", ["-U", String(ownerUid)], { stdio: "ignore" }).status === 0;
 	};
 
 	signal("TERM");
@@ -420,6 +450,13 @@ async function sweep(cfg: Config, a: Areas, runId: string): Promise<number> {
 	await hook(cfg, runId, "sweep-read2");
 	signal("KILL");
 	if (cfg.sweep === "groups" && existsSync(groupsFile(work))) writeFileSync(groupsFile(work), groups().filter(groupAlive).map((g) => `${g}\n`).join(""));
+	if (ownerUid !== null) {
+		for (const removal of sweepLegacyNativeTemps("/private/tmp", ownerUid)) {
+			const line = `native-temp: ${JSON.stringify(removal)}\n`;
+			if (removal.kind === "removed") process.stdout.write(line);
+			else process.stderr.write(line);
+		}
+	}
 	db.run("COMMIT");
 	db.close();
 	process.stdout.write(`swept ${runId} (${cfg.sweep === "groups" ? "groups" : `uid ${AS2TEST_USER}`})\n`);
