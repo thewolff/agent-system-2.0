@@ -1107,6 +1107,7 @@ surface/test/lane-live-lane.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-
 surface/test/lane-model.test.ts	test	-
 surface/test/lane-model-script.test.ts	test	-
+surface/test/lane-resume-script.test.ts	test	-
 surface/test/by-hand-context.test.ts	test	-
 surface/test/lane-headroom-script.test.ts	test	-
 surface/src/ctx-index.ts	module	-

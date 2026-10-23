@@ -73,6 +73,11 @@ const flag = (name: string): string | null => {
 };
 const sessionDir = flag("--session-dir") ?? join(process.cwd(), "sessions");
 const resumed = flag("--resume");
+// jo-issues #206: OMP refuses a missing --resume instead of silently creating a session.
+if (resumed !== null && !existsSync(resumed)) {
+	process.stderr.write(`Error: Session "${resumed}" not found.\n`);
+	process.exit(1);
+}
 /** `--model provider/id` as omp reports it in get_state (measured on 18.8.6: `openai-codex/gpt-6-sol` → provider `openai-codex`, id `gpt-6-sol`). */
 const named = flag("--model");
 /** The model get_state reports: the script's override, else `--model`'s, else `{ id: "fake" }`; a `set_model` frame replaces it. */
@@ -121,6 +126,23 @@ if (script.holdStdoutUntil) {
 	Bun.spawn(["sh", "-c", 'i=0; while [ ! -e "$1" ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i+1)); done', "sh", script.holdStdoutUntil], {
 		stdin: "ignore", stdout: "inherit", stderr: "ignore",
 	}).unref();
+}
+if (script.holdStderrUntil) {
+	Bun.spawn(["sh", "-c", 'i=0; while [ ! -e "$1" ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i+1)); done', "sh", script.holdStderrUntil], {
+		stdin: "ignore", stdout: "ignore", stderr: "inherit",
+	}).unref();
+}
+if (script.startup) {
+	for (const chunk of script.startup.chunks ?? []) {
+		await Bun.write(Bun.stderr, chunk);
+		await Bun.sleep(5);
+	}
+	if (script.startup.delayMs) await Bun.sleep(script.startup.delayMs);
+	if (script.startup.signal) {
+		process.kill(process.pid, script.startup.signal);
+		await Bun.sleep(1000);
+	}
+	process.exit(script.startup.code ?? 1);
 }
 
 const emit = (frame: Record<string, unknown>): void => {

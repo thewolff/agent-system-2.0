@@ -267,6 +267,10 @@ export interface FakeScript {
 	shutdownOnTerm?: boolean;
 	/** A helper holds the fake's stdout open until this file exists (≤ 30 s): the runner's finish() waits past omp's death for the test. */
 	holdStdoutUntil?: string;
+	/** Exit before RPC ready; writes chunks verbatim (including a final fragment) before exiting or self-signalling. */
+	startup?: { chunks?: string[]; code?: number; signal?: "SIGTERM"; delayMs?: number };
+	/** A helper holds only stderr open until this gate exists (≤ 30 s). */
+	holdStderrUntil?: string;
 }
 
 export const sh = (cmd: string[], cwd: string, env?: Record<string, string>) => {
@@ -295,10 +299,11 @@ export function tempRepo(): string {
  * does not exist, so the runner's guard is open and never reads the real quota-watch polls (PLAN wl-mv71x5rwdu7eo0 § 4); a
  * headroom test passes its own fixture in `over`. `tag` names the temp root (`surface-<tag>-…`): one with spaces puts spaces in
  * every path beneath it (HOME, the lane dir and its prompt.md, the repo and its worktree).
+ * `rootBase` confines all fixture files to an existing caller-owned scratch directory; omitted, the OS temp directory is used.
  */
-export function laneRoot(over: Record<string, string> = {}, tag = "lane-root"): LaneRoot {
+export function laneRoot(over: Record<string, string> = {}, tag = "lane-root", rootBase = tmpdir()): LaneRoot {
 	// git rev-parse --show-toplevel reports the canonical path and the worktree is derived from it: the root is canonical too.
-	const root = realpathSync(tmp(tag));
+	const root = realpathSync(mkdtempSync(join(rootBase, `surface-${tag}-`)));
 	const home = join(root, "home");
 	const profile = join(home, ".omp", "profiles", "agent-system-2", "agent");
 	mkdirSync(profile, { recursive: true });

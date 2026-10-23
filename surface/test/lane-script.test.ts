@@ -464,7 +464,8 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const r = makeRoot();
 		const { wl } = openWorkload(r, { slice: true });
 		setScript(r, { steps: [{ hang: true }] });
-		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const launched = lane(r, ["launch", wl, "--requested-by", "test"]);
+		expect({ code: launched.code, err: launched.err }).toMatchObject({ code: STARTER_EXIT.ok });
 		const laneId = laneIdOf(wl, 1);
 		await readyOf(r, wl, laneId);
 		const started = (await startedOf(r, wl, laneId))!;

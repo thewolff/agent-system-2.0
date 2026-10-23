@@ -159,16 +159,50 @@ launchable(w, control, receipt, resolutions, now, liveLanes, cap):
   → "died-not-relaunched"
 ```
 
+Session selection and startup pseudocode (the runner recomputes the resume choice for each spawn):
+
+```
+start = resumeOf(ledger, workload, laneId)     # recomputed at each spawn
+model = newest valid lane-model: or null (profile default)
+origin = resumeOrigin(control, laneId, unconsumedResolutions)
+if origin is absent or its recorded session is an existing regular file:
+    resume = resumePlan(control, laneId, unconsumedResolutions, model)
+else:
+    # A recorded path that disappeared is not itself a readiness timeout.
+    candidates = regular .jsonl files immediately inside this workload's sessions directory
+    newest = greatest mtime; equal mtimes choose lexicographically greatest absolute path
+    provenance = newest session-bearing started/parked entry whose session realpath
+                 matches newest's realpath; use that origin lane's lane-started.model
+    if no candidate or provenance model is unknown/incompatible with model:
+        start fresh; record resumeSkipped and the reason
+    else:
+        resume newest; record recovery and actual argv to runner stderr
+# Never search older candidates after the newest candidate fails provenance/model guard.
+child = spawn(omp, argv, { cwd: worktree, env, stdin: pipe, stdout: pipe, stderr: pipe })
+stderrCapture = drain child.stderr immediately; forward every chunk and retain only last 8192 bytes
+record lane-started: (pid, start time, session path, argv, model, ranModel, resumeSkipped)
+readiness = wait ≤ 3 min for workload.changed_by == laneId and, with a named model, get_state's provider/id == it
+            else fail at readiness (no claim timeout) or model (model mismatch/no answer)
+on child exit before readiness with no decided failure/stop: stage startup, outcome never-ready, context = bounded captured stderr
+meter at 100 % → stop before lane-ready: (no prompt); else record lane-ready:, send prompt p1
+```
+
+The `startup` stage is reserved for an observed OMP exit before readiness when no explicit failure or stop has been
+decided. Runner read-loop failures keep their actual stage/cause before terminating OMP; model/headroom failures,
+elapsed readiness timeouts and accepted stops also retain precedence. Startup is distinct from a live process that
+never claims before the readiness deadline (`readiness`) or fails the model check (`model`). The runner owns OMP's
+stderr pipe, drains it while OMP runs, and forwards chunks to runner stderr. It retains a fixed 8192-byte tail,
+then normalizes whitespace and reports at most the final 1000 characters (with a truncation marker), or `no stderr`.
+After exit, settling waits for EOF or 250 ms, then cancels the reader without awaiting cancellation. A runner crash
+may lose undecided diagnostics; the bounded tail is context, not a crash parser, and a long stack-only tail may omit
+the first diagnostic. No retry/race repair is attempted for a session that vanishes during discovery or after
+selection. Captured stderr is bounded, not redacted: diagnostic text may persist in ledger bodies and committed
+decision logs, including any sensitive text OMP emitted. Descendant stderr retention is not guaranteed after the
+runner closes its pipe; no particular descendant error, signal or shutdown behavior is claimed.
+
 Runner signal handling pseudocode (≤ 30 lines in the original; *amended 2026-10-08, MIGRATION.md item 40, workload `wl-muq1v31q5ly7ls`*: the turn end waits for a settled omp, may send up to two continue prompts on the same omp, holds for the lane's own unsettled hands, and writes every death it decides before EOF; the decision is `turnEnd` in `surface/src/turn-end.ts`):
 
 ```
-child = spawn(omp, argv, { cwd: worktree, env, stdin: pipe, stdout: pipe, stderr: log })
-    -- item 85: argv adds --model <sel> when Jo's newest lane-model: names one (never --model default), and --resume only when
-    -- the chosen session's origin lane ran on that same model (its lane-started: model; legacy = default; none = unknown → fresh)
-record lane-started: (pid, start time via the startTime(pid) helper stop uses, session path, argv, model, ranModel, resumeSkipped)
-readiness = wait ≤ 3 min for workload.changed_by == laneId and, with a named model, get_state's provider/id == it
-            else  fail("never ready") at stage readiness (no claim) or model (mismatch, no model, get_state failed, no answer)
-meter at 100 % → stop before lane-ready: (no prompt); else record lane-ready:, send prompt p1
 on stdout frame: append to lane-<n>.jsonl
     prompt_result for the current p<n>, outcome null:
         if aborted and deadline passed       → conclude("deadline")
@@ -242,12 +276,13 @@ Every failure the refuters raised. "Jo sees" means the § B3 line as the poll pu
 | `omp` binary missing | Starter preflight, after the reservation: `omp` not on PATH (exit 2) | `launch-failed: <laneId>: preflight: omp not on PATH`, message `lane-died: <laneId>: launch failed at preflight: omp not on PATH`; pre-claim released | Tool result line at open, and the lane-died line within one poll | Install OMP; `orchestrator_launch_lane <wl>` |
 | `git worktree add` fails (path exists and is not a worktree, base ref missing, disk) | Starter exit 5 with git's stderr | `launch-failed: … worktree: <stderr line>` + `lane-died:` message; pre-claim released | Same | Fix the path or branch by hand (`as2 lane cleanup <wl>` when it is a stale worktree); relaunch on Jo's word |
 | Fence denies the worktree path (a lane whose worktree resolved under `~/.agent-system-2/`, e.g. a symlinked repo parent) | Starter preflight compares `canonical(worktree)` against `fenceTargets` for a no-op command in that dir (`gates/src/fence.ts:199-204`); any target that is a prefix of the worktree is exit 4 | `launch-failed: … worktree inside a fenced path <p>` + `lane-died:` message | Same | Move the checkout or set `AGENT_SYSTEM_LEDGER_DB` elsewhere; relaunch |
-| Lane never writes (readiness timeout) | Runner: `workload.changed_by != laneId` after 3 min (the pre-claim lease length) | Runner SIGKILLs `omp` through its child handle, releases the pre-claim, writes `launch-failed: … never ready in 3m` and `lane-died: <laneId>: launch failed at readiness: no claim in 3m`, `lane-exit:` | lane-died line within one poll; runner log path in the entry | Read `~/.agent-system-2/lanes/<wl>/runner.log` (extension load errors land there); relaunch on Jo's word |
+| OMP exits before readiness (startup failure, not a readiness timeout) | Runner child-exit event before claim/model readiness, with no already-decided failure or accepted stop | `launch-failed: <laneId>: startup: omp exit code <code> signal <signal> before ready; <bounded stderr context>` and `lane-died: <laneId>: launch failed at startup: …`; release pre-claim and write `lane-exit:` | lane-died line within one poll; runner log path in entry | Inspect runner log and stderr context; correct startup cause, then relaunch on Jo's word |
+| OMP remains alive but does not claim before the readiness deadline | Runner: no `workload.changed_by == laneId` within 3 min | Runner SIGKILLs `omp`, releases pre-claim, writes `launch-failed: … never ready in 3m` and `lane-died: <laneId>: launch failed at readiness: no claim in 3m`, `lane-exit:` | lane-died line within one poll; runner log path in entry | Read `~/.agent-system-2/lanes/<wl>/runner.log`; fix the readiness cause and relaunch on Jo's word |
 | Named model not confirmed (*added 2026-10-09, MIGRATION.md item 85*): OMP's first `get_state` reports another `provider/id`, no model, `success: false`, or no answer within the readiness window | Runner, before `lane-ready:`: `stateModelCheck` on the first `get_state` response; the readiness poll for the timeout | Runner SIGKILLs `omp` before any prompt, releases, writes exactly one `launch-failed: <laneId> model: named <X>, omp started <Y> (…)` (or `… get_state reported no provider/id model`, `… get_state failed: <e>`, `… no get_state model within 3m`), `lane-died: <laneId>: launch failed at model: …`, `lane-exit: … outcome never-ready` | lane-died line within one poll | Fix the selector or the profile's auth for that provider, then relaunch with `model`; `model: "default"` returns to the profile default and resumes the newest session only if it ran on the default |
 | Relaunch on another model than the recorded session (*added 2026-10-09, item 85*) | Runner at spawn: `resumePlan` compares the session's origin lane's `lane-started:` `model` with the named one (legacy entry: default; no `lane-started:`: unknown) | No `--resume`: OMP starts a fresh session in the same session dir; `lane-started:` records `resumeSkipped: "<session> ran on <model>"` and `runner.log` says so | Nothing pushed; the first prompt carries the brief and the workload's ledger state, not the old conversation | None. Naming the old model again resumes only the session the normal origin rule (`resumeOrigin`) picks at that spawn, and only when its origin lane ran on that model; older sessions are never searched, so once a lane on the other model has recorded a session the switch back starts fresh too |
 | Prompt ends `error` with OMP's error (a refusal, an auth failure) (*added 2026-10-09, item 85*) | Runner: `prompt_result` status `error` carrying `error` (`RpcPromptError`) | `lane-died: <laneId>: prompt ended error: <provider>/<model>: <message, one line, ≤ 200 chars> (retryable <bool>)` | lane-died line naming the provider's own words | Relaunch, on another model when the provider refused |
 | Lease lapses (lane alive but not renewing: hung extension timer, ledger locked for 15 min) | Surface poll: `recordLapsedLeases` (`wake.ts:29`) writes `lane-died: <holder>: lease lapsed <until>` | That message | lane-died line; the lane may still be running | `as2 lane stop <wl>` (the runner sees `lane-stop:` and aborts); relaunch on Jo's word. A lane that recovers and renews reclaims as "already held by holder" (`ledger/src/index.ts:449-452`) — the death was surfaced once, as § B3 item 4 wants |
-| Runner dies, `omp` lives | `omp` itself: the runner held the only write end of `omp`'s stdin, so its death (any signal, SIGKILL included) closes the pipe; `omp`'s frame reader ends at EOF (`modes/rpc/rpc-input.ts:52`, `for await (const line of readLines(input))`), then `omp` drains accepted work — the in-flight prompt included — and disposes the session, which emits `session_shutdown` (`rpc-mode.ts:1760-1774`, "stdin closed — RPC client is gone" … `await inputDispatcher.drain()` … `return disposeAndExit()`; `:1725`, "dispose() also emits `session_shutdown`"). The EOF path is read in the source, not yet run; the chaos test (§ 8) proves it | The lane row's shutdown handler writes `lane-died: <laneId>: …` when slices are open, then releases (`surface/extensions/lane.ts:127-144`, `pi.on("session_shutdown", …)` … `ledger.releaseWorkload(w.id, …)`); `lane-exit:` is not written, since only the runner writes it. *Amended 2026-10-08 (item 40):* unless the runner had recorded `lane-decided:` for an intended outcome: then no death, and only `lane-exit:` is missing | The lane-died line within one poll after the in-flight prompt ends — at prompt end, bounded by `--max-time`, not in seconds; with no slice open, nothing until the four-hour hold on an unheld open workload (`surface/src/errors.ts:11-15`, source 2) | Relaunch on Jo's word with `--resume <session path>` from `lane-started:`; nothing to stop |
+| Runner dies while OMP may still live | The runner no longer observes the child; its child stdin/stdout/stderr pipes close with the runner, but this design does not claim what OMP does after stdin EOF or that it drains/settles work | No runner finalization is guaranteed; the runner-owned stderr tail and undecided crash diagnostics may be lost. Do not infer `session_shutdown`, release, `lane-died:`, or prompt completion from pipe closure alone | No guaranteed immediate signal; the next surface poll can only report ledger state it actually observes | Inspect ledger and process state; stop or relaunch on Jo's word after determining whether OMP remains alive |
 | `omp` dies, runner lives (crash, OOM, SIGKILL from outside) | Runner's child-exit event, immediately | `lane-exit: … signal SIGKILL` and `lane-died: <laneId>: killed (signal SIGKILL)`; release if holder still the lane | lane-died line within one poll (seconds after the death, not the 15-minute lapse) | Relaunch on Jo's word with `--resume <session path>` from the `lane-started:` entry |
 | Cap reached (three live) | `reserveLane` inside the transaction (exit 6) | Nothing: a refusal writes no entry and no message; it is neither an attempt nor a death | Tool result at open ("queued behind <ids>"); the refusal left the predicate's inputs unchanged, so when a lane's runner exits, the drain it spawns launches the queued workloads, oldest first, until the cap refuses again (`launch: … requested-by lane-runner`; *amended 2026-10-09, MIGRATION.md item 71*), and the tick launches it when a slot frees with no runner's exit (a by-hand lane, a stop with no runner alive, a runner killed before its finalization); if no slot frees, the four-hour hold surfaces it (`errors.ts:13-15`) | None needed; or `as2 lane stop` one of the three |
 | Duplicate launch race (two starts for one workload: open-time exec and the tick, or two orchestrators; or a second start delayed past the first's failed and released attempt) | `reserveLane`'s in-transaction predicate: the second sees the winner's live pre-claim (`held`) or, once the winner failed and released, finds the cause the winner consumed already named (`died-not-relaunched`) | The loser writes nothing; the winner's `launch:` was written in its reservation transaction | Nothing; the loser's tool result says "already launching as <laneId>" or names the refusal | None |

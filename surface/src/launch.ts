@@ -611,7 +611,7 @@ export function sessionOrigin(control: readonly ControlEntry[], laneId?: string)
  * answer; for a request, a first launch after a death, or the interactive `as2 lane <wl>`, the newest
  * session on the workload. `resumePlan` decides whether it is resumed.
  */
-function resumeOrigin(control: readonly ControlEntry[], laneId: string, resolved: readonly Resolution[]): { session: string; laneId: string } | null {
+export function resumeOrigin(control: readonly ControlEntry[], laneId: string, resolved: readonly Resolution[]): { session: string; laneId: string } | null {
 	const cause = attempts(control).find((a) => a.laneId === laneId)?.cause ?? null;
 	if (cause?.kind === "resume") {
 		const raised = new Set(resolved.filter((r) => cause.ids.includes(r.instructionId)).map((r) => r.laneId));
