@@ -238,6 +238,75 @@ describe("laneEnd (§ 1.1): every class, in its order", () => {
 		}
 	});
 
+	for (const outcome of ["completed", "parked", "resume-pending", "released", "interactive", "stop"]) {
+		test(`r3 F2: ${outcome} exit survives a late accepted signal, before or after its exit row`, () => {
+			for (const signalAfterExit of [false, true]) {
+				const x = launched();
+				x.entry(LANE_RUNNER_BY, `lane-decided: ${lane(1)} ${outcome}`);
+				if (!signalAfterExit) x.accept(1, "signal");
+				x.exit(1, outcome, outcome === "stop" ? "by-hand" : null);
+				if (signalAfterExit) x.accept(1, "signal");
+				expect(x.end(1)).toEqual({ kind: "intended" });
+				expect(x.deaths).toEqual([]);
+				expect(x.state()).toEqual({ kind: "none" });
+				// A new train task can take on this intended end; it is not an unrecorded death.
+				const req = x.request("train");
+				expect(x.verdict()).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+			}
+		});
+	}
+
+	test("r3 F2: an explicit signal-stop exit remains a death, with or without its acceptance", () => {
+		for (const accepted of [false, true]) {
+			const x = launched();
+			if (accepted) x.accept(1, "signal");
+			x.exit(1, "stop", "signal");
+			expect(x.end(1)).toEqual({ kind: "died" });
+			expect(x.state()).toEqual({ kind: "unrecorded", lane: lane(1), n: 1 });
+			x.died(1);
+			expect(x.state()).toEqual({ kind: "due", lane: lane(1), n: 1 });
+			expect(x.verdict()).toEqual({ launch: true, cause: { kind: "relaunch", lane: lane(1), n: 1 } });
+		}
+	});
+
+	test("r3 F2: accepted signal before an exit is live under lease, then a restart death until an intended exit lands", () => {
+		for (const decided of [false, true]) {
+			const x = launched();
+			if (decided) x.entry(LANE_RUNNER_BY, `lane-decided: ${lane(1)} resume-pending`);
+			x.accept(1, "signal");
+			expect(x.end(1)).toEqual({ kind: "live" });
+			x.lapse();
+			expect(x.end(1)).toEqual({ kind: "died" });
+			expect(x.state()).toEqual({ kind: "unrecorded", lane: lane(1), n: 1 });
+			x.died(1);
+			expect(x.verdict()).toEqual({ launch: true, cause: { kind: "relaunch", lane: lane(1), n: 1 } });
+			x.release();
+			expect(x.end(1)).toEqual({ kind: "died" });
+			// If finalization does land, its explicit intended outcome takes precedence.
+			x.exit(1, "resume-pending");
+			expect(x.end(1)).toEqual({ kind: "intended" });
+			expect(x.state()).toEqual({ kind: "none" });
+		}
+	});
+
+	test("r3 F2: Jo and ceiling vetoes precede accepted signals and explicit intended or signal-stop exits", () => {
+		for (const veto of ["jo", "ceiling"]) {
+			for (const outcome of ["completed", "parked", "resume-pending", "stop"]) {
+				for (const vetoAfterExit of [false, true]) {
+					const x = launched();
+					const before = vetoAfterExit ? null : veto === "jo" ? x.stop(1) : x.accept(1, "ceiling");
+					x.accept(1, "signal");
+					x.exit(1, outcome, outcome === "stop" ? "signal" : null);
+					const stop = before ?? (veto === "jo" ? x.stop(1) : x.accept(1, "ceiling"));
+					expect(x.end(1)).toEqual({ kind: "stopped", entryId: stop.id, createdAt: stop.created_at });
+					expect(x.state()).toEqual({ kind: "none" });
+					x.request("train");
+					expect(x.verdict()).toEqual({ launch: false, reason: "stopped" });
+				}
+			}
+		}
+	});
+
 	test("stopped (the veto) wins over every death: Jo's request accepted or not, before or after the exit, and the ceiling's acceptance", () => {
 		const before = launched();
 		const req = before.stop(1);

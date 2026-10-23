@@ -43,7 +43,9 @@ export function laneEnd(w: ReserveRows["workload"], control: readonly ControlEnt
 	if (mine.some((c) => c.prefix === "launch-failed")) return { kind: "died" };
 	const exit = laneExit(control, laneId);
 	if (exit !== null && (!isIntendedOutcome(exit.outcome) || (exit.outcome === "stop" && exit.reason === "signal"))) return { kind: "died" };
-	if (mine.some((c) => c.prefix === "lane-stop" && /^accepted\s+signal\b/.test(c.rest))) return { kind: "died" };
+	// stop() preserves an already-decided intended outcome when a late signal is accepted. Only a signal with no
+	// final exit needs the restart fallback; an explicit signal-stop exit is a death above.
+	if (exit === null && mine.some((c) => c.prefix === "lane-stop" && /^accepted\s+signal\b/.test(c.rest))) return { kind: "died" };
 	if (exit === null && (w.holder === laneId || w.holder === null)) {
 		const marked = mine.some((c) =>
 			c.prefix === "lane-parked" || (c.prefix === "lane-decided" && isIntendedOutcome(c.rest)) || (c.prefix === "lane-stop" && /^accepted\b/.test(c.rest)));
