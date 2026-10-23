@@ -44,6 +44,33 @@ describe("settles and deliveries (D8, D10)", () => {
 		expect(w.launches).not.toContain(w.train);
 	});
 
+	test("a voided Jo request does not suppress the train's new owner request after a later lane parks", () => {
+		const w = world();
+		const reservation = { by: LANE_STARTER_BY, cap: 10, leaseMs: 60_000, requestedBy: SURFACE_BY, decide: decideLaunch };
+		const first = w.ledger.reserveLane(w.owner, reservation);
+		if (!first.ok) throw new Error(first.reason);
+		w.c.plusHours(0.01);
+		const old = w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.owner, kind: "assumption", body: launchRequestedBody("jo", w.c.now()) });
+		w.c.plusHours(0.01);
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.owner, kind: "assumption", body: `lane-stop: ${first.laneId} requested as2-lane-stop by jo` });
+		w.ledger.releaseWorkload(w.owner, { by: first.laneId, holder: first.laneId });
+		w.c.plusHours(0.01);
+		const fresh = w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.owner, kind: "assumption", body: launchRequestedBody("jo", w.c.now()) });
+		const second = w.ledger.reserveLane(w.owner, reservation);
+		expect(second).toMatchObject({ ok: true, cause: `request ${fresh}` });
+		if (!second.ok) throw new Error(second.reason);
+		w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.owner, kind: "assumption", body: laneExitBody(second.laneId, { code: 0, signal: null, outcome: "parked" }) });
+		w.ledger.releaseWorkload(w.owner, { by: second.laneId, holder: second.laneId });
+		w.c.plusHours(0.01);
+		w.task(101);
+		w.run();
+		const requests = controlEntries(w.ledger.entries(w.owner)).filter((c) => c.prefix === "launch-requested" && c.createdBy === MERGE_TRAIN_BY);
+		expect(requests).toHaveLength(1);
+		const newest = controlEntries(w.ledger.entries(w.owner)).filter((c) => c.prefix === "launch").at(-1)!;
+		expect(newest.rest).toContain(`cause request ${requests[0]!.id}`);
+		expect(newest.rest).not.toContain(old);
+	});
+
 	test("an actionable train no lane holds live is woken", () => {
 		const w = world();
 		w.task(101);

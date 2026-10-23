@@ -19,7 +19,12 @@
 //    messages on one slice since its last `artifact-passed:` (surface/src/signals.ts; writers: the
 //    lane's artifact observer in surface/extensions/lane.ts and P-11 row 8 for a refused push).
 // 4. a lane died: a `lane-died:` message still `held` (not yet surfaced once), or a lapsed lease no
-//    such row records yet (the surface records it before rendering).
+//    such row records yet (the surface records it before rendering). Hidden while the death is the machinery's (PLAN
+//    wl-mvfqvd5hy8zv28 § 1.6, `machineryDeath` in surface/src/relaunch-surface.ts): its relaunch is due or waiting out the
+//    backoff, a later attempt names the lane in a `relaunch` cause, or, for good, an incident keyed to the lane exists. An
+//    item-68 idle line (6.) is hidden by the same rule. The death rows stay; hiding never reads a message's delivery state.
+//    Incident (§ 1.5): each held `incident:` message the surface wrote (the pre-read step, surface/extensions/wake.ts) is
+//    one line, unnumbered, naming Jo's choices; delivery consumes it, so it shows once.
 // 5. a lane waiting on a human: every open `question`, with its options (a stored `pair` left out, PLAN
 //    wl-mvb9mw00ycfjeo D2); and every unresolved
 //    `prompt-wait:` (a leaked blocking prompt, § B3 item 5 first trigger). A question is cut at 120
@@ -74,19 +79,25 @@
 import { type EntryRow, type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import { CHANNEL_REFUSED_SHOWN_HOURS, channelInForce, channelProposals, channelRefusals } from "./channel";
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
+import { INCIDENT_PREFIX, parseIncident } from "./incident";
 import { openPairOffer } from "./input";
 import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
 import { mainRedNotices, protectionEpisodes, type TaskWindow, TRAIN_ALERT_LADDER, trainAlertLevel, trainMembers, trainTaskWindows } from "./merge-train";
 import { questionSubject } from "./orchestrator-question";
 import { answerable } from "./numbering";
 import { pairOfferLine, pairTakenLine, pairTakenQuestion, shownOptions } from "./pair-suggest";
+import { machineryDeath, type RelaunchView, relaunchView } from "./relaunch-surface";
+import type { ProbeFor } from "./runner-probe";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { parseTestRunFailed, testRuns } from "./test-run";
 import { NOTICE_PREFIX } from "./notice";
 import { isPaired, parseCeilingNotice } from "./ceiling";
-import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
+import {
+	ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, LAUNCH_LANE_TOOL, MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY,
+	TEST_RUN_FAILED_PREFIX,
+} from "./types";
 
-export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "train" | "pair" | "notice" | "proposal" | "channel-refused";
+export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "incident" | "question" | "due" | "idle" | "scratch" | "train" | "pair" | "notice" | "proposal" | "channel-refused";
 
 /**
  * The open one of a pair of scratch control entries (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): the newest of `control`
@@ -125,6 +136,8 @@ export interface ErrorLine {
 export interface ErrorOptions {
 	now?: string;
 	holdHours?: number;
+	/** How a lapsed lane's recorded pids are probed (`laneRunning`); ps by default, a fake in tests. */
+	probeFor?: ProbeFor;
 }
 
 const short = (s: string, n = 90): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
@@ -451,14 +464,26 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		}
 		const run = testRunLine(ledger, workload, pendingMessages, now, windows);
 		if (run) testRun.push(run);
+		// § 1.6: read once per workload, only when a death or an idle line could be shown.
+		let view: RelaunchView | null = null;
+		const machinery = (lane: string): boolean => wl !== STANDING_WORKLOAD_ID && machineryDeath((view ??= relaunchView(ledger, wl, now, opts.probeFor)), lane);
 		const deaths = laneDeaths(ledger, wl);
 		const deathTimes = deaths.map((d) => d.created_at);
 		for (const d of deaths) {
-			if (d.state !== "held" || trainRouted(windows, d.created_at, deathTimes)) continue;
+			if (d.state !== "held" || trainRouted(windows, d.created_at, deathTimes) || machinery(d.holder)) continue;
 			died.push({ kind: "lane-died", workloadId: wl, rowId: d.id, messageIds: [d.id], line: `lane ${d.holder} on ${label} died: ${d.body.slice(d.body.indexOf(":", 11) + 1).trim()}, ${workload.open_slices} open slice(s)${workload.holder && workload.holder !== d.holder ? `; ${workload.holder} holds it now` : ""}` });
 		}
-		if (unrecordedLapse(ledger, workload, now) && !trainRouted(windows, workload.holder_lease_until!, deathTimes)) {
+		if (unrecordedLapse(ledger, workload, now, opts.probeFor) && !trainRouted(windows, workload.holder_lease_until!, deathTimes) && !machinery(workload.holder!)) {
 			died.push({ kind: "lane-died", workloadId: wl, rowId: wl, state: `${workload.holder}@${workload.holder_lease_until}`, line: `lane ${workload.holder} on ${label} died: lease lapsed ${workload.holder_lease_until}, ${workload.open_slices} open slice(s)` });
+		}
+		for (const m of pendingMessages) {
+			if (m.state !== "held" || m.recipient !== ORCHESTRATOR_RECIPIENT || m.created_by !== SURFACE_BY || !m.body.startsWith(INCIDENT_PREFIX)) continue;
+			const i = parseIncident(m.body);
+			if (i === null || i.workloadId !== wl) continue;
+			died.push({
+				kind: "incident", workloadId: wl, rowId: m.id, messageIds: [m.id],
+				line: `incident on ${label}: ${i.kind} of ${i.key} stopped after ${i.count}/${i.limit} retries without progress: ${i.detail} — relaunch with \`${LAUNCH_LANE_TOOL}\`, close, or instruct`,
+			});
 		}
 		// D5: a taken pair, whatever else is open, while the workload is user-driven and no lane holds it under a live lease.
 		const laneLive = workload.holder?.startsWith("lane-") === true && (workload.holder_lease_until === null || workload.holder_lease_until >= now);
@@ -475,7 +500,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			// A user-driven workload has no relaunch: the line names the by-hand command (PLAN wl-mvb9mw00ycfjeo D5).
 			const ended = idleExit(controlEntries(ledger.entries(wl)));
 			const next = workload.mode === "user-driven" ? `continue it with ${byHandLine(wl)}, close, or instruct` : "relaunch, close, or instruct";
-			if (ended && !trainRouted(windows, ended.createdAt) && !isTrain()) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; ${next}` });
+			if (ended && !trainRouted(windows, ended.createdAt) && !isTrain() && !machinery(ended.laneId)) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; ${next}` });
 		}
 		for (const q of openQuestions) {
 			if (wl === STANDING_WORKLOAD_ID) {

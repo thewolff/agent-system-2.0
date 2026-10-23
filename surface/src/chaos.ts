@@ -398,8 +398,8 @@ export function sameStart(a: string | null | undefined, b: string | null | undef
 }
 
 /**
- * A lane runner chaos may signal: a `lane.ts run <wl> <laneId>` command (`isRunner`: lane.ts `isRunnerCommand`, passed in so
- * this file does not import a script) whose path to lane.ts lies in the scratch repo `repo`.
+ * A lane runner chaos may signal: a `lane.ts run <wl> <laneId>` command (`isRunner`: `isRunnerCommand`, surface/src/runner-probe.ts,
+ * passed in) whose path to lane.ts lies in the scratch repo `repo`.
  */
 export function isScratchRunner(command: string, repo: string, wl: string, laneId: string, isRunner: (command: string, wl: string, laneId: string) => boolean): boolean {
 	return namesPath(command, repo) && isRunner(command, wl, laneId);

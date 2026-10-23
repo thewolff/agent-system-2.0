@@ -10,6 +10,7 @@ import { ensureStandingWorkload } from "../src/identity";
 import { controlEntries, doneBody, laneExitBody, laneStartedBody, launchRequestedBody, PRECLAIM_LEASE_MS, STARTER_EXIT } from "../src/launch";
 import type { PidState } from "../src/omp-probe";
 import type { RankConfig } from "../src/rank-launch";
+import type { RunnerProbe } from "../src/runner-probe";
 import { releasedOpenBody } from "../src/turn-end";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 // A namespace import, as lane-script.test.ts does: a name lane.ts does not export fails only the test that calls it.
@@ -24,7 +25,7 @@ const runnerPid = (n: number) => 4000 + n;
 /** A fake probe factory: each call answers `answer` for its kind and records the lane, the pid and whether the ledger was inside a transaction. */
 function fakeProbe(l: Ledger, answer: { omp: PidState; runner: PidState }) {
 	const calls: { laneId: string; what: "omp" | "runner"; pid: number; inTransaction: boolean }[] = [];
-	const probeFor = (laneId: string): laneScript.RunnerProbe => ({
+	const probeFor = (laneId: string): RunnerProbe => ({
 		omp: (pid) => {
 			calls.push({ laneId, what: "omp", pid, inTransaction: l.db.inTransaction });
 			return answer.omp;

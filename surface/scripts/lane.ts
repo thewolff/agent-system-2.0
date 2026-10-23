@@ -70,7 +70,7 @@ import { factsBlock } from "../src/facts";
 import { loadTestRunnerConfig } from "../src/close-entry";
 import { checkoutOwnerRepo, isTrainOrFix, ownerTasks } from "../src/merge-train";
 import {
-	branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
+	attempts, branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, scratchCapMb, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
@@ -81,11 +81,12 @@ import {
 	type TurnEndInput, unsettledHandsOf,
 } from "../src/turn-end";
 import { waitingReserved } from "../src/errors";
-import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
+import { type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
+import { liveRunnerOf, type LiveRunner, type RunnerProbe, runnerProbe } from "../src/runner-probe";
 import { sendNotice } from "../src/notice";
 import { decideRanked, drainOrder, type RankConfig, rankShadowLine, readRankConfig, writePickSnapshot } from "../src/rank-launch";
 import { renderWorkload } from "../src/render";
-import { laneDeaths } from "../src/signals";
+import { laneDeaths, laneDiedSignalBody } from "../src/signals";
 import { readTracingSetting, tracingEnv } from "../src/tracing";
 import { parseHeartbeat, runDirOf, runsRoot, testRuns } from "../src/test-run";
 import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV } from "../src/types";
@@ -715,74 +716,6 @@ export function ceilingPromptLine(c: Ceiling, s: Spend): string {
 	return `ceiling: $${c.usd} / ${c.wallMin} min for the workload; spent so far $${s.usd.toFixed(2)} / ${Math.round(s.wallMin)} min (${Math.round(s.tokens)} tokens); set each brief's ceiling-share from the remainder, $${usd.toFixed(2)} / ${Math.round(wall)} min. At 80 % Jo gets a notice; at 100 % this lane is stopped and Jo is told.`;
 }
 
-// ---- the run guard: one runner per lane id ---------------------------------------------------------
-
-/** How the guard asks the machine about a `lane-started:` entry's two pids; the tests pass a fake. */
-export interface RunnerProbe {
-	/** The omp pid against the start time the entry recorded; with none recorded, `unknown` while the pid is alive (`gone` once it is not). */
-	omp(pid: number, start: string): PidState;
-	/** The runner pid, whose start time no entry records: `same` only while its command line is still `lane.ts run <wl> <laneId>` (`isRunnerCommand`). */
-	runner(pid: number): PidState;
-}
-
-/**
- * The process a second `lane.ts run` on the same lane id would collide with: alive and this lane's, (`uninspected`) one
- * ps could not answer for, or (`unverified`) a live omp pid with no recorded start time.
- */
-export interface LiveRunner {
-	what: "omp" | "runner";
-	pid: number;
-	/** The probe answered `failed`: the pid may be this lane's live process, and the run is refused as retryable, not as running. */
-	uninspected?: true;
-	/** The probe answered `unknown`: a live pid no start time can tell from this lane's omp, refused as retryable until it exits. */
-	unverified?: true;
-}
-
-/**
- * The live process of a lane id already running, or null when `lane.ts run` may start it (pure; the probe is the only
- * outside read). Every `lane-started:` for `laneId` after its newest `lane-exit:` is checked, newest first, so a pid that
- * a later start record superseded but that is still alive refuses too: a lane id with a live omp is running whichever
- * entry named it. An entry refuses when its omp pid is `same` (alive, and its start time matches the recorded one), or
- * when its runner pid is not `selfPid` and is `same` (still running `lane.ts run` on this workload and lane id: no start
- * time is recorded for the runner, so its command line is the identity check). `gone` and `other` (the pid was reused)
- * never refuse. `unknown` (the omp pid is alive and no start time was recorded for it) refuses as `unverified`: it cannot
- * be told apart from this lane's omp, so it is never permission to start (openai review r2 #1). `failed` (ps could not
- * answer for a recorded pid) refuses as `uninspected`: the owner was not shown gone, so a second runner could be a
- * duplicate and its finalizer could release the first one's workload (openai review r1 #4).
- * `selfPid` skips only the runner check, since this process matches its own command; an omp that entry names still counts.
- *
- * This is the second check, not the exclusion: `cmdRun` runs it while holding the lane id's run lock (`takeRunnerLock`),
- * which is what keeps two `run` calls on one lane id from both spawning omp. This check catches what the lock cannot
- * see: an omp still alive after its runner died (the lock was taken over from a dead pid), and a lane id an interactive
- * lane or a runner that predates the lock started.
- */
-export function liveRunnerOf(control: readonly ControlEntry[], laneId: string, selfPid: number, probe: RunnerProbe): LiveRunner | null {
-	const checked = new Set<string>();
-	for (let i = control.length - 1; i >= 0; i--) {
-		const c = control[i]!;
-		if (c.laneId !== laneId) continue;
-		if (c.prefix === "lane-exit") return null;
-		if (c.prefix !== "lane-started") continue;
-		const s = laneStarted([c], laneId);
-		if (s === null) continue;
-		// The runner re-records lane-started: once omp names its model and session; the pids repeat, so each pair is probed once.
-		const key = `${s.pid} ${s.start} ${s.runnerPid}`;
-		if (checked.has(key)) continue;
-		checked.add(key);
-		if (s.pid > 0) {
-			const omp = probe.omp(s.pid, s.start);
-			if (omp === "same") return { what: "omp", pid: s.pid };
-			if (omp === "unknown") return { what: "omp", pid: s.pid, unverified: true };
-			if (omp === "failed") return { what: "omp", pid: s.pid, uninspected: true };
-		}
-		if (s.runnerPid > 0 && s.runnerPid !== selfPid) {
-			const runner = probe.runner(s.runnerPid);
-			if (runner === "same") return { what: "runner", pid: s.runnerPid };
-			if (runner === "failed") return { what: "runner", pid: s.runnerPid, uninspected: true };
-		}
-	}
-	return null;
-}
 
 /**
  * The first live lane on a workload (PLAN wl-mvgn310dpi5gcg D2), or null: every lane id with a `lane-started:` after its newest
@@ -823,38 +756,6 @@ export function spawnIfReserved<C>(ledger: Pick<Ledger, "workload">, wl: string,
 		throw new Fail("reserve", `${laneId} not started: held: ${wl} is held by ${w?.holder ?? "no one"}, not ${laneId}; another starter reserved it after this reservation's pre-claim lapsed; no omp spawned`, STARTER_EXIT.held!);
 	}
 	return spawnChild();
-}
-
-/** Whether a `ps -o command=` line is `lane.ts run <wl> <laneId>` (how `cmdLaunch` and chaos start a runner), whatever the path to lane.ts. */
-export function isRunnerCommand(command: string, wl: string, laneId: string): boolean {
-	const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	return new RegExp(`(?:^|[\\s/])lane\\.ts run ${esc(wl)} ${esc(laneId)}(?:\\s|$)`).test(command);
-}
-
-/**
- * The machine's probe for `liveRunnerOf`, over `run` (ps; the tests pass a fake). The omp pid is read by the shared
- * strict reader (`ompPidState`, surface/src/omp-probe.ts); the runner pid by its command line. A ps that cannot be
- * spawned or answers anything but a clean line or a clean "no such process" reads `failed`, its reason kept in
- * `failure` for the refusal.
- */
-export function runnerProbe(wl: string, laneId: string, run: PsRun = runPs): RunnerProbe & { failure: string | null } {
-	const p = {
-		failure: null as string | null,
-		omp: (pid: number, start: string): PidState =>
-			ompPidState(pid, start, run, (reason) => {
-				p.failure = reason;
-			}),
-		runner: (pid: number): PidState => {
-			try {
-				const command = psAnswer(run, pid, "command=");
-				return command === null ? "gone" : isRunnerCommand(command, wl, laneId) ? "same" : "other";
-			} catch (err) {
-				p.failure = err instanceof Error ? err.message : String(err);
-				return "failed";
-			}
-		},
-	};
-	return p;
 }
 
 // ---- the run lock: one owner per lane id -----------------------------------------------------------
@@ -1110,6 +1011,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	let outcome: LaneOutcome | null = null;
 	/** The accepted stop's reason for `lane-exit: … outcome stop reason <r>` (decision 6; Codex review 2, R6). */
 	let stopReason: string | null = null;
+	/** The signal (SIGTERM / SIGINT) whose stop ended the lane: a restart, recorded as a death (PLAN wl-mvfqvd5hy8zv28 § 1.2). */
+	let stopSignal: NodeJS.Signals | null = null;
 	/** The death line conclude() (with its background suffix) or failModel() decided, retried first in finish() whatever the holder. */
 	let decidedDeath: string | null = null;
 	let ready = false;
@@ -1294,6 +1197,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			}
 			let drained = false;
 			const owned = writeAsOwner(ledger, lock, () => {
+				// A restart death whose write in stop() failed lands here; a no-op when it is there, or once a successor's launch: is newer.
+				if (stopSignal !== null) restartDeath(stopSignal);
 				if (exit?.death) enqueueRunnerDeath(ledger, { workloadId: wl, laneId, body: exit.death });
 				if (held && !intended && !laneDeaths(ledger, wl).some((d) => d.holder === laneId)) {
 					const body = final === "never-ready"
@@ -1323,22 +1228,39 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	};
 
 	/**
+	 * A restart's canonical death (PLAN wl-mvfqvd5hy8zv28 § 1.2), inside the caller's owner write: `lane-died: … stopped by signal`,
+	 * only while this lane is the workload's newest attempt and the workload is open, at most once per lane (enqueueRunnerDeath).
+	 */
+	const restartDeath = (sig: NodeJS.Signals): void => {
+		const cur = ledger.workload(wl);
+		if (cur === null || cur.status !== "open") return;
+		if (attempts(controlEntries(ledger.entries(wl))).at(-1)?.laneId !== laneId) return;
+		enqueueRunnerDeath(ledger, { workloadId: wl, laneId, body: laneDiedSignalBody(laneId, sig, cur.open_slices + cur.paused_slices) });
+	};
+
+	/**
 	 * A stop, from the ledger or a signal: acceptance persisted first, then abort and end (decision 14). A stop after the
 	 * runner decided the outcome (and enqueued its death) is accepted and recorded, and the decided outcome stands (D3).
-	 * `accepted`: the acceptance is already on the ledger (the meter's ceiling stop, `meterPoll`).
+	 * A signal stop (`sig`, a restart) writes its acceptance and, when it ends the lane, its death in one owner write
+	 * before abort reaches omp (PLAN wl-mvfqvd5hy8zv28 § 1.2), before a successor's launch.
+	 * `accepted`: the meter's ceiling stop already wrote its acceptance in its transaction.
 	 */
-	const stop = (ref: string, reason: string, accepted = false): void => {
+	const stop = (ref: string, reason: string, accepted = false, sig: NodeJS.Signals | null = null): void => {
 		if (outcome === "stop" || finished) return;
-		if (!accepted) {
-			try {
-				record(laneStopAcceptedBody(laneId, ref));
-			} catch (err) {
-				process.stderr.write(`runner: the stop acceptance could not be written: ${String(err)}\n`);
-			}
+		try {
+			if (sig !== null) {
+				if (!writeAsOwner(ledger, lock, () => {
+					record(laneStopAcceptedBody(laneId, ref));
+					if (outcome === null) restartDeath(sig);
+				})) process.stderr.write(`runner: ${lock.path} names another runner or none; the signal stop was not recorded\n`);
+			} else if (!accepted) record(laneStopAcceptedBody(laneId, ref));
+		} catch (err) {
+			process.stderr.write(`runner: the stop acceptance could not be written: ${String(err)}\n`);
 		}
 		if (outcome === null) {
 			outcome = "stop";
 			stopReason = reason;
+			stopSignal = sig;
 			send({ id: "abort", type: "abort" });
 		}
 		end();
@@ -1439,8 +1361,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			conclude("error", turnEndFailedDeathBody(laneId, String(err)));
 		}
 	};
-	process.on("SIGTERM", () => stop("signal", "signal"));
-	process.on("SIGINT", () => stop("signal", "signal"));
+	process.on("SIGTERM", () => stop("signal", "signal", false, "SIGTERM"));
+	process.on("SIGINT", () => stop("signal", "signal", false, "SIGINT"));
 	process.on("SIGHUP", () => undefined);
 
 	try {

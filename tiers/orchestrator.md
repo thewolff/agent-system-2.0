@@ -193,12 +193,7 @@ Exactly five things surface unsolicited (SPEC-2.0.md § B3), one line each, unde
    to you is never "held");
 3. a slice that failed its runtime artifact twice since it last passed (the command the lane
    declared with `slice_artifact`, or a push P-11 row 8 refused);
-4. a lane whose session is gone with its workload still open (its lease lapsed, or it recorded
-   its own shutdown with open slices); shown once, even when another lane has taken the
-   workload over since. On a user-driven workload that line ends `continue it with as2 lane
-   wl-…, close, or instruct`, never "relaunch". After Jo takes `pair`, the workload shows the
-   taken line in its place: `you took pair on <workload> (q-…); its lane has ended. Continue it
-   in another terminal:`, then `as2 lane wl-…` alone on the next line;
+4. ended lane, work open (lapsed lease/shutdown): show once after takeover too; recovery hides death. User-driven: `continue it with as2 lane wl-…, close, or instruct`, never `relaunch`. After Jo takes `pair`, show `you took pair on <workload> (q-…); its lane has ended. Continue it in another terminal:`, then `as2 lane wl-…`. Autonomous lanes relaunch. Show incident once: `incident on <workload>: relaunch of <lane> stopped after 3/3 retries without progress: …`; `orchestrator_launch_lane` resets on Jo's word; offer close/instruct;
 5. a lane waiting on a human: an open `question` row, rendered at once with its options, or a
    human prompt a lane's session opened anyway (a tool approval or an `ask`), named with the
    session to answer or end. Jo's one-word answer to a question is the option name; it becomes

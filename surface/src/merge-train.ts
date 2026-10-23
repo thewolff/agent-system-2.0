@@ -26,7 +26,9 @@ import {
 import { CLASSIFIER_BY, type EntryRow, type InstructionRow, type Ledger, type MessageRow, newId, type QuestionRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
 import { askJo, raisedId } from "../../gates/src/rulings";
 import { canonicalPath } from "../../ledger/src/locality";
+import { incidentsOn } from "./incident";
 import { DEFAULT_BRANCH } from "./merge-train-stack";
+import { laneEnd, RELAUNCH_INCIDENT } from "./relaunch";
 import { NOTICE_PREFIX } from "./notice";
 import { ownerRepoOf, pushDestBody, SETTLING_VERDICTS, SHA_RE, type TestRunnerConfig, testRuns } from "./test-run";
 import {
@@ -844,6 +846,26 @@ interface SettleEvent {
 	evidence: string;
 }
 
+/** A stretch in which an owner's relaunch incident holds a task's no-push rule (§ 1.7): from the incident to Jo's word launch, or open. */
+interface IncidentHold {
+	from: string;
+	to: string | null;
+}
+
+/**
+ * The holds owner `o`'s relaunch incidents put on a task created at `t0` (PLAN wl-mvfqvd5hy8zv28 § 1.7): each `incident: relaunch`
+ * message the surface wrote on `o` holds from its creation to the first `launch-requested: by jo` on `o` after it, or stays
+ * open while there is none. An incident written before the task holds it too while it still stands at t0 (review r1 m6): the
+ * owner is as dead for the new task as for the old one. One that Jo's word ended by t0 holds nothing. `control` is `o`'s
+ * control entries, oldest first.
+ */
+function incidentHolds(ledger: Ledger, o: string, control: readonly ControlEntry[], t0: string): IncidentHold[] {
+	const joWords = control.filter((c) => c.prefix === "launch-requested" && c.createdBy === SURFACE_BY && /^by jo(?:\s|$)/.test(c.rest)).map((c) => c.createdAt);
+	return incidentsOn(ledger, SURFACE_BY, RELAUNCH_INCIDENT, o)
+		.map((i) => ({ from: i.createdAt, to: joWords.find((at) => at > i.createdAt) ?? null }))
+		.filter((h) => h.to === null || h.to > t0);
+}
+
 /**
  * Task `t`'s first terminal event among its owners' rows, or null while none has happened (D8). `pushes` is GitHub's record of
  * pushes to the PR's head branch (`SettleFacts.pushes`), undefined when this pass could not read it.
@@ -876,24 +898,39 @@ function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], he
 	const since = known ? pushes.filter((p) => p.sha !== t.head && p.at >= t0s).map((p) => p.at).sort() : null;
 	const failedBody = new RegExp(`^${TRAIN_TASK_FAILED_PREFIX}\\s+${t.id}(?:\\s|$)`);
 	const exits: string[] = [];
+	const holds: IncidentHold[] = [];
 	for (const o of owners) {
 		const entries = ledger.entries(o);
-		const holders = holdersOf(entries, ledger.workload(o)?.holder ?? null, ledger.holders(o));
+		const w = ledger.workload(o);
+		const holders = holdersOf(entries, w?.holder ?? null, ledger.holders(o));
 		const gaveUp = entries.find((e) => e.kind === "assumption" && holders.includes(e.created_by) && failedBody.test(e.body.trim()));
 		if (gaveUp) events.push({ at: gaveUp.created_at, outcome: "failed", evidence: `owner ${o} wrote ${gaveUp.id}: ${gaveUp.body.trim()}` });
 		const control = controlEntries(entries, holders);
-		exits.push(...control.filter((c) => c.prefix === "lane-exit" && c.createdAt > t0).map((c) => c.createdAt));
-		const exit = since === null ? undefined : control.find((c) => c.prefix === "lane-exit" && c.createdAt > t0 && !since.some((p) => p <= c.createdAt));
+		// PLAN wl-mvfqvd5hy8zv28 § 1.7: an owner lane that died by § 1.1 (`laneEnd`: an unintended outcome, a stop on signal; never
+		// when Jo or the ceiling stopped it) is the relaunch's to retry, not a train attempt, so its exit settles nothing and the task
+		// stays the owner's; an intended exit with no push since the task still fails it. The exit itself says the lane is over, so
+		// the reading ignores whoever holds the workload now (a relaunched successor's live lease included).
+		const ended = control.filter((c) => c.prefix === "lane-exit" && c.createdAt > t0
+			&& !(w !== null && laneEnd({ ...w, holder: null, holder_lease_until: null }, control, c.laneId!, now).kind === "died"));
+		exits.push(...ended.map((c) => c.createdAt));
+		const exit = since === null ? undefined : ended.find((c) => !since.some((p) => p <= c.createdAt));
 		if (exit) events.push({ at: exit.createdAt, outcome: "failed", evidence: `lane ${exit.laneId} on ${o} exited (${exit.rest}) with no push since the task` });
+		holds.push(...incidentHolds(ledger, o, control, t0));
 	}
-	// The first stretch of 2 h with no push, from t0 or a push to the next push (or now), fails the task at its 2 h mark, even
-	// when a later push came: a tick that ran late does not erase a deadline that passed.
-	const marks = since === null ? [] : [t0, ...since];
-	for (let i = 0; i < marks.length; i++) {
-		const quiet = new Date(Date.parse(marks[i]!) + TRAIN_NO_PUSH_MS).toISOString();
-		if (quiet <= (marks[i + 1] ?? now)) {
-			events.push({ at: quiet, outcome: "failed", evidence: `no push for 2 h since ${marks[i]}` });
-			break;
+	// The first stretch of 2 h with no push fails the task at its 2 h mark, even when a later push came: a tick that ran late does
+	// not erase a deadline that passed. A stretch starts at t0, at a push, or at Jo's word launch that ends an incident hold
+	// (§ 1.7), and ends at the next push, the next incident, or now; no stretch runs inside a hold, so the deaths the incident
+	// reports never fail the task.
+	if (since !== null) {
+		const stops = [...since, ...holds.map((h) => h.from)];
+		const starts = [t0, ...since, ...holds.flatMap((h) => (h.to === null ? [] : [h.to]))]
+			.filter((s) => !holds.some((h) => h.from <= s && (h.to === null || s < h.to))).sort();
+		for (const s of starts) {
+			const quiet = new Date(Date.parse(s) + TRAIN_NO_PUSH_MS).toISOString();
+			if (quiet <= [now, ...stops.filter((p) => p > s)].sort()[0]!) {
+				events.push({ at: quiet, outcome: "failed", evidence: `no push for 2 h since ${s}` });
+				break;
+			}
 		}
 	}
 	const first = events.sort((a, b) => a.at.localeCompare(b.at))[0] ?? null;
@@ -910,7 +947,9 @@ function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], he
  * The settles the tick writes now on train `facts.train` (D8): the `train-task-settled:` bodies, one per unsettled task whose
  * first terminal event has happened. fixed: the first non-error runner result requested after t0 on the owner is green at a
  * head other than H0 that is the PR's current head. failed: that result is red; the owner's holder wrote
- * `train-task-failed: <id>`; an owner lane exited with no push before it; or some stretch of 2 h since t0 had no push. A push
+ * `train-task-failed: <id>`; an owner lane exited as intended with no push before it; or some stretch of 2 h with no push had
+ * passed. An owner lane that died (PLAN wl-mvfqvd5hy8zv28 § 1.7) settles nothing: the relaunch retries it with the same task, and
+ * while a relaunch incident on an owner stands (until Jo's word launch) no 2 h stretch runs. A push
  * is one GitHub records on the head branch (`facts.pushes`, at GitHub's time), never a runner request or row 8's `push-dest:`;
  * with no record this pass, or one that does not name the PR's current head, the two push rules wait. An `error` result never
  * settles and is never an attempt. A settled task is never settled again.
@@ -1186,6 +1225,16 @@ export function ownerTasks(ledger: Ledger, wl: string): OwnerTrainTask[] {
 	return openTrains(ledger).flatMap((train) => unsettledTasks(ledger, train)
 		.filter((t) => taskOwners(ledger, t, fixes).includes(wl))
 		.map((t) => ({ id: t.id, train, pr: t.pr, attempt: t.attempt, kind: t.kind, head: t.head, detail: t.detail, slice: openFullSlice(ledger, wl, t.pr) })));
+}
+
+/** The train PRs whose unsettled task workload `wl` holds (`ownerTasks`), ascending: what a relaunch incident on `wl` names (PLAN wl-mvfqvd5hy8zv28 § 1.7). */
+export function heldTrainPrs(ledger: Ledger, wl: string): number[] {
+	return [...new Set(ownerTasks(ledger, wl).map((t) => t.pr))].sort((a, b) => a - b);
+}
+
+/** `train #<n> held, …` for `heldTrainPrs`' list, the incident detail's part (PLAN wl-mvfqvd5hy8zv28 § 1.7); empty for none. */
+export function trainHeldDetail(prs: readonly number[]): string {
+	return prs.map((n) => `train #${n} held`).join(", ");
 }
 
 /** When a workload owned a task (D9 F16): from t0 to the settle, or open-ended while unsettled. */

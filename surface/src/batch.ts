@@ -4,7 +4,8 @@
 // (surface/src/session.ts) and the poll and Jo's turn drive it (surface/extensions/wake.ts).
 //
 // On fire (D3), a line pushes at once on the poll that finds it:
-// 1. `lane-died` on a workload that still has open or paused slices;
+// 1. `lane-died` on a workload that still has open or paused slices; `incident` (PLAN wl-mvfqvd5hy8zv28 § 1.5), the one
+//    line a spent relaunch budget writes in place of the death it hides, always;
 // 2. a `notice` that is the runner's ceiling notice (`parseCeilingNotice`, written by the lane runner): spend at
 //    80 %, or the stop at 100 % (PLAN wl-mvfkv7llkp7nk0 § 4);
 // 3. `idle` whose `lane-exit:` is `outcome stop reason ceiling`: a ceiling stop;
@@ -54,6 +55,7 @@ export function onFire(ledger: Ledger, line: ErrorLine): boolean {
 			return parsed !== null && parsed.outcome === "stop" && parsed.reason === "ceiling";
 		}
 		case "test-run":
+		case "incident":
 			return true;
 		default:
 			return false;

@@ -10,11 +10,11 @@ import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { apply, ceilingOf, interpret, interpretPaste } from "../src/input";
-import { controlEntries, laneExitBody } from "../src/launch";
+import { controlEntries, isJoRequest, laneExitBody, launchRequestedBody, pendingRequests, verdictOf } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { oneLiner, renderWorkload } from "../src/render";
-import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
+import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { clock, ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
 
 function env(): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
@@ -210,6 +210,50 @@ describe("the relaunch both raise words share (R13)", () => {
 		expect(apply(l, interpret(l, `ceiling 80 ${wl}`)!)).toContain(`ceiling on ${wl} → $80 / 6h (instruction `);
 		expect(requests(l, wl).map((r) => r.body)).toEqual([expect.stringMatching(/\(ceiling word\)$/)]);
 	});
+
+	for (const prior of ["machinery", "jo"] as const) for (const word of ["extend", "ceiling"] as const) for (const exited of [true, false]) {
+		test(`ceiling stop does not reuse ${prior}'s old request: ${word}, lane ${exited ? "exited" : "stopping"}`, () => {
+			const c = clock();
+			const { ledger: l } = tempLedger(c.now);
+			try {
+				const { wl } = withLane(l);
+				expect(l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: "lane-t-1", leaseMs: 3_600_000 }).won).toBe(true);
+				c.at("2026-10-01T10:01:00.000Z");
+				const old = l.recordEntry({
+					by: prior === "jo" ? SURFACE_BY : MERGE_TRAIN_BY, workloadId: wl, kind: "assumption",
+					body: launchRequestedBody(prior === "jo" ? "jo" : MERGE_TRAIN_BY, l.now(), prior === "jo" ? "mode-flip" : "owner task"),
+				});
+				c.at("2026-10-01T10:02:00.000Z");
+				stopAtCeiling(l, wl, { exited });
+				if (exited) l.releaseWorkload(wl, { by: LANE_RUNNER_BY, holder: "lane-t-1" });
+				expect(verdictOf(l.launchRows(wl, 3)!)).toEqual({ launch: false, reason: exited ? "stopped" : "held" });
+				c.at("2026-10-01T10:03:00.000Z");
+				const words = word === "extend" ? `extend ${wl}` : `ceiling 100 12 ${wl}`;
+				expect(apply(l, interpret(l, words)!)).toContain("so a relaunch is requested");
+				const all = requests(l, wl);
+				expect(all).toHaveLength(2);
+				expect(all[0]!.id).toBe(old);
+				const fresh = all[1]!;
+				expect(isJoRequest(fresh)).toBe(true);
+				expect(fresh.body).toEndWith(word === "extend" ? "(ceiling extend)" : "(ceiling word)");
+				expect(pendingRequests(controlEntries(l.entries(wl))).filter(isJoRequest).map((r) => r.id)).toEqual([fresh.id]);
+				expect(verdictOf(l.launchRows(wl, 3)!)).toEqual(exited
+					? { launch: true, cause: { kind: "request", id: fresh.id } }
+					: { launch: false, reason: "held" });
+				c.at("2026-10-01T10:04:00.000Z");
+				expect(apply(l, interpret(l, words)!)).toContain("a relaunch is already requested");
+				expect(requests(l, wl).map((r) => r.id)).toEqual([old, fresh.id]);
+				if (!exited) {
+					expect(verdictOf(l.launchRows(wl, 3)!)).toEqual({ launch: false, reason: "held" });
+					l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody("lane-t-1", { code: 0, signal: null, outcome: "stop", reason: "ceiling" }) });
+					l.releaseWorkload(wl, { by: LANE_RUNNER_BY, holder: "lane-t-1" });
+				}
+				expect(verdictOf(l.launchRows(wl, 3)!)).toEqual({ launch: true, cause: { kind: "request", id: fresh.id } });
+			} finally {
+				l.close();
+			}
+		});
+	}
 
 	test("a second raise while the first relaunch request waits writes no second request", () => {
 		const { ledger: l } = tempLedger();

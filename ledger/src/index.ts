@@ -215,6 +215,11 @@ export interface ReserveRows {
 	slices: SliceRow[];
 	/** Every holder the workload ever had, oldest first (`holders`). */
 	holders: string[];
+	/**
+	 * The workload's `lane-died:` messages (any state, any sender), oldest first, as the lane each names and its
+	 * `created_at`: the relaunch backoff's one death time (surface/src/relaunch.ts, PLAN wl-mvfqvd5hy8zv28 § 1.4a).
+	 */
+	deaths: { laneId: string; createdAt: string }[];
 	/** Open autonomous workloads held by a `lane-*` holder whose lease is null or not yet lapsed at `now`. */
 	liveLanes: number;
 	cap: number;
@@ -561,8 +566,8 @@ export class Ledger {
 
 	/**
 	 * What a launch decision reads (the surface's own predicate run, and `reserveLane` inside its
-	 * transaction): the workload row, its entries, questions, instructions and slices, and the
-	 * live-lane count at `now`. Null when there is no such workload.
+	 * transaction): the workload row, its entries, questions, instructions, slices and `lane-died:`
+	 * messages, and the live-lane count at `now`. Null when there is no such workload.
 	 */
 	launchRows(workloadId: string, cap: number): ReserveRows | null {
 		const now = this.now();
@@ -575,10 +580,23 @@ export class Ledger {
 			instructions: this.instructions(workloadId),
 			slices: this.slices(workloadId),
 			holders: this.holders(workloadId),
+			deaths: this.laneDiedTimes(workloadId),
 			liveLanes: this.liveLaneHolders(now).length,
 			cap,
 			now,
 		};
+	}
+
+	/** The workload's `lane-died: <lane>: …` messages, oldest first, as `{ laneId, createdAt }`; a body naming no lane is skipped. */
+	private laneDiedTimes(workloadId: string): { laneId: string; createdAt: string }[] {
+		const rows = this.db.query<{ body: string; created_at: string }, [string]>(
+			"SELECT body, created_at FROM messages WHERE workload_id = ? AND body LIKE 'lane-died:%' ORDER BY created_at, rowid").all(workloadId);
+		const out: { laneId: string; createdAt: string }[] = [];
+		for (const r of rows) {
+			const m = /^lane-died:\s*(\S+?):\s/.exec(r.body);
+			if (m) out.push({ laneId: m[1]!, createdAt: r.created_at });
+		}
+		return out;
 	}
 
 	/** The `lane-*` holders of open autonomous workloads under a lease that is null or not yet lapsed at `now`, with their workload ids. */

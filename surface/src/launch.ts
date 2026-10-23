@@ -22,6 +22,8 @@ import { labOf } from "../../classifier/src/lab";
 import {
 	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, ESCALATION_BY, HOLD_HOURS, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
 } from "./types";
+import { isVetoStop, type RelaunchRead, relaunchRead } from "./relaunch";
+import { type ProbeFor, psProbe } from "./runner-probe";
 
 // ---- knobs -------------------------------------------------------------------------------------
 
@@ -312,10 +314,16 @@ export function controlEntries(entries: readonly EntryRow[], holders: readonly s
 
 // ---- attempts and causes -----------------------------------------------------------------------
 
+/**
+ * A launch's cause. `relaunch` is the machinery's relaunch of the dead lane `lane` (PLAN wl-mvfqvd5hy8zv28 § 1.3): `n` is
+ * this relaunch's own number, the retry counter as written, and `request` the train's `launch-requested:` it folds in and
+ * consumes, when one was pending.
+ */
 export type Cause =
 	| { kind: "first" }
 	| { kind: "request"; id: string }
 	| { kind: "resume"; ids: string[] }
+	| { kind: "relaunch"; lane: string; n: number; request?: string }
 	| { kind: "interactive" };
 
 export interface Attempt {
@@ -333,6 +341,7 @@ export function causeText(cause: Cause): string {
 		case "interactive": return "interactive";
 		case "request": return `request ${cause.id}`;
 		case "resume": return `resume ${cause.ids.join(" ")}`;
+		case "relaunch": return `relaunch ${cause.lane} ${cause.n}${cause.request === undefined ? "" : ` ${cause.request}`}`;
 	}
 }
 
@@ -342,6 +351,9 @@ function parseCause(tokens: string[]): Cause | null {
 	if (kind === "interactive" && ids.length === 0) return { kind: "interactive" };
 	if (kind === "request" && ids.length === 1) return { kind: "request", id: ids[0]! };
 	if (kind === "resume" && ids.length >= 1) return { kind: "resume", ids };
+	if (kind === "relaunch" && (ids.length === 2 || ids.length === 3) && /^lane-\S+$/.test(ids[0]!) && /^[1-9]\d*$/.test(ids[1]!)) {
+		return ids.length === 3 ? { kind: "relaunch", lane: ids[0]!, n: Number(ids[1]), request: ids[2]! } : { kind: "relaunch", lane: ids[0]!, n: Number(ids[1]) };
+	}
 	return null;
 }
 
@@ -363,8 +375,27 @@ export function consumedIds(list: readonly Attempt[]): Set<string> {
 	for (const a of list) {
 		if (a.cause?.kind === "request") out.add(a.cause.id);
 		if (a.cause?.kind === "resume") for (const id of a.cause.ids) out.add(id);
+		if (a.cause?.kind === "relaunch" && a.cause.request !== undefined) out.add(a.cause.request);
 	}
 	return out;
+}
+
+/** Jo's `launch-requested: by jo …`, the surface's; any other is the machinery's (the merge train's). */
+export function isJoRequest(c: ControlEntry): boolean {
+	return c.prefix === "launch-requested" && c.createdBy === SURFACE_BY && /^by jo(?:\s|$)/.test(c.rest);
+}
+
+/**
+ * The `launch-requested:` entries still pending, oldest first: named by no attempt (`consumedIds`, decision 7) and, for Jo's
+ * (`isJoRequest`), not older than the newest stop by Jo or the ceiling (`isVetoStop`), whichever lane that stop named: the
+ * stop answered it, so it never launches and never counts as pending again (review r1 m1). A machinery request is not voided
+ * by a stop; `launchable` holds it while the newest lane's stop stands. The one pending rule every reader shares (review r2
+ * R2-1): `launchable`, the rank gate's `pendingRequest`, and the merge-train tick's request writer and owner check.
+ */
+export function pendingRequests(control: readonly ControlEntry[]): ControlEntry[] {
+	const consumed = consumedIds(attempts(control));
+	const lastStop = control.findLastIndex(isVetoStop);
+	return control.filter((c, i) => c.prefix === "launch-requested" && !consumed.has(c.id) && !(isJoRequest(c) && i < lastStop));
 }
 
 // ---- resolutions -------------------------------------------------------------------------------
@@ -443,7 +474,14 @@ export function instructionLine(i: InstructionRow): string {
  * higher-ranked workload is launchable now, `parallel: <reason>` when the parallel rule holds. `launchable` never returns them.
  */
 export type RankRefusal = `ranked: below ${string}` | `parallel: ${string}`;
-export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched" | RankRefusal;
+/**
+ * Why `launchable` refuses. The relaunch's (PLAN wl-mvfqvd5hy8zv28 § 1.3): `stopped`, the newest lane was stopped by Jo or
+ * the ceiling and no word of Jo's is newer than the stop; `relaunch-exhausted`, its retry budget is spent (the incident's
+ * state); `relaunch-backoff`, the next relaunch waits out its gap (`relaunchState` `waiting`).
+ */
+export type LaunchReason =
+	| "closed" | "standing" | "due" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched"
+	| "stopped" | "relaunch-exhausted" | "relaunch-backoff" | RankRefusal;
 export type LaunchVerdict = { launch: true; cause: Cause } | { launch: false; reason: LaunchReason };
 
 /** A holder under a lease that is null or not yet lapsed at `now`. */
@@ -455,11 +493,23 @@ export function heldLive(w: { holder: string | null; holder_lease_until: string 
  * The launch predicate (§ 4 pseudocode): plain values in, a cause or a reason out. Run by the
  * surface to decide whether to exec the starter and again by `reserveLane` inside its transaction,
  * the run that binds. `receipt` is the holder's standing `done-because:` (`doneBecause`), or null:
- * a finished workload is awaiting close, not a lane's next launch, unless Jo's unconsumed
- * `launch-requested:` says otherwise (Jo's word to relaunch wins over the tick's close).
+ * a finished workload is awaiting close, not a lane's next launch, unless an unconsumed
+ * `launch-requested:` says otherwise (Jo's word to relaunch wins over the tick's close). `relaunch`
+ * is the newest attempt's reading (`relaunchRead`, surface/src/relaunch.ts).
+ *
+ * After `held` and `awaiting-close`, in this order (PLAN wl-mvfqvd5hy8zv28 § 1.3): a stop by Jo or the ceiling on the newest
+ * lane refuses every cause but Jo's word written after it (`stopped`); with no word of Jo's pending, a spent retry budget
+ * refuses before the cap (`relaunch-exhausted`); the cap; `first`, Jo's request, a resume; `held` while the newest lane is
+ * live past its lapsed lease (its lane still running, `laneRunning`, review r1 M2, r2 R2-4); the relaunch when due (folding
+ * in and consuming a pending machinery request), or `relaunch-backoff` while it waits; a machinery request when the
+ * relaunch owes the newest lane nothing (`relaunchState` none: a lane that ended as intended, the merge train's (§ 1.8), or
+ * a dead lane the relaunch does not take on, review r1 M1); otherwise `died-not-relaunched`. Jo's word older than the
+ * newest stop by Jo or the ceiling, whichever lane the stop named, was answered by that stop and is never pending again:
+ * a `launch-requested: by jo` (`pendingRequests`, review r1 m1, r2 R2-1) and an answer or replan alike (review r2 R2-2).
  */
 export function launchable(
 	w: WorkloadRow, control: readonly ControlEntry[], receipt: string | null, resolved: readonly Resolution[], now: string, liveLanes: number, cap: number,
+	relaunch: RelaunchRead,
 ): LaunchVerdict {
 	if (w.status !== "open") return { launch: false, reason: "closed" };
 	if (w.id === STANDING_WORKLOAD_ID) return { launch: false, reason: "standing" };
@@ -468,26 +518,51 @@ export function launchable(
 	if (heldLive(w, now)) return { launch: false, reason: "held" };
 	const tried = attempts(control);
 	const consumed = consumedIds(tried);
-	const req = control.find((c) => c.prefix === "launch-requested" && !consumed.has(c.id));
-	if (receipt !== null && !req) return { launch: false, reason: "awaiting-close" };
+	const requests = pendingRequests(control);
+	if (receipt !== null && requests.length === 0) return { launch: false, reason: "awaiting-close" };
+	// The veto (§ 1.1 step 2, review r2 F1): while a stop stands, only Jo's word written after it counts; `requests` and `res`
+	// hold no word of Jo's older than the newest stop.
+	const stop = relaunch.end?.kind === "stopped" ? relaunch.end : null;
+	const joRequest = requests.find(isJoRequest);
+	const machineRequest = stop === null ? requests.find((c) => !isJoRequest(c)) : undefined;
+	const lastStopAt = control.findLast(isVetoStop)?.createdAt;
+	const res = resolved.filter((r) => !consumed.has(r.instructionId) && (lastStopAt === undefined || r.createdAt > lastStopAt));
+	const joPending = joRequest !== undefined || res.length > 0;
+	if (stop !== null && !joPending) return { launch: false, reason: "stopped" };
+	if (!joPending && relaunch.state.kind === "exhausted") return { launch: false, reason: "relaunch-exhausted" };
 	if (liveLanes >= cap) return { launch: false, reason: "cap" };
 	if (tried.length === 0) return { launch: true, cause: { kind: "first" } };
-	if (req) return { launch: true, cause: { kind: "request", id: req.id } };
-	const res = resolved.filter((r) => !consumed.has(r.instructionId));
+	if (joRequest) return { launch: true, cause: { kind: "request", id: joRequest.id } };
 	if (res.length > 0) return { launch: true, cause: { kind: "resume", ids: res.map((r) => r.instructionId) } };
+	if (relaunch.end?.kind === "live") return { launch: false, reason: "held" };
+	const s = relaunch.state;
+	if (s.kind === "due") {
+		return { launch: true, cause: machineRequest ? { kind: "relaunch", lane: s.lane, n: s.n, request: machineRequest.id } : { kind: "relaunch", lane: s.lane, n: s.n } };
+	}
+	if (s.kind === "waiting") return { launch: false, reason: "relaunch-backoff" };
+	// Step 7: a machinery request the relaunch owes nothing to (a train task for a parked, finished or dead-but-not-taken-on
+	// lane, or any on the merge-train workload, § 1.8) launches as a request, as before; an unrecorded lapse never does (§ 1.4a).
+	if (machineRequest && s.kind === "none") return { launch: true, cause: { kind: "request", id: machineRequest.id } };
 	return { launch: false, reason: "died-not-relaunched" };
 }
 
-/** The predicate over the rows a launch decision reads (`Ledger.launchRows`): the surface's run and `reserveLane`'s. */
-export function verdictOf(rows: ReserveRows): LaunchVerdict {
+/**
+ * The predicate over the rows a launch decision reads (`Ledger.launchRows`): the surface's run and `reserveLane`'s.
+ * `probeFor` probes the newest lane's recorded pids past a lapsed lease (`laneEnd`); tests pass a fake.
+ */
+export function verdictOf(rows: ReserveRows, probeFor: ProbeFor = psProbe): LaunchVerdict {
 	const holders = holdersOf(rows.entries, rows.workload.holder, rows.holders);
 	const control = controlEntries(rows.entries, holders);
-	return launchable(rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap);
+	const receipt = doneBecause(rows.entries, holders);
+	return launchable(
+		rows.workload, control, receipt, resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap,
+		relaunchRead(rows, { holders, control, receipt }, probeFor),
+	);
 }
 
 /** `reserveLane`'s policy for an autonomous launch: the predicate over the rows the transaction read. */
-export function decideLaunch(rows: ReserveRows): ReserveVerdict {
-	const v = verdictOf(rows);
+export function decideLaunch(rows: ReserveRows, probeFor: ProbeFor = psProbe): ReserveVerdict {
+	const v = verdictOf(rows, probeFor);
 	return v.launch ? { launch: true, cause: causeText(v.cause) } : v;
 }
 

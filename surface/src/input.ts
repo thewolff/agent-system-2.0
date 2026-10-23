@@ -114,7 +114,7 @@ import { type Ceiling, ceilingBody, crossed, effectiveCeiling, EXTEND_SOURCE, pa
 import { recordRepo, repoOf } from "./decision-log";
 import { closedReservedRefusal, waitingReserved, wordsOf } from "./errors";
 import {
-	attempts, byHandLine, consumedIds, type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, planApprovedBody, planFirst, planHaltedBody,
+	attempts, byHandLine, type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, isJoRequest, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, pendingRequests, planApprovedBody, planFirst, planHaltedBody,
 	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody, waivePrBody, waivePrInstructionBody,
 } from "./launch";
 import { onOtherTrain, TRAIN_DONE, trainBody, trainBrief, trainHold, trainInstructionBody, trainPrs, trainSlicePr } from "./merge-train";
@@ -1086,8 +1086,10 @@ function ceilingInstructionBody(c: Ceiling): string {
  * rule both words share. Jo's `launch-requested:` (the body the launch tool writes, cause `why`) is written when the
  * workload's newest lane was stopped at the ceiling (its `lane-stop: <lane> accepted ceiling`, whether it is still
  * stopping or gone), the workload is autonomous, the lane's last `spend:` is under `next` in both halves, and no
- * unconsumed request already waits; so that lane relaunches once its lease is gone. Otherwise nothing is requested: a
- * live holder not stopped at the ceiling reads the new value at its next poll and goes on, and a request written with
+ * pending Jo request already waits (`pendingRequests` and `isJoRequest`): a pre-stop Jo request is void, and a machinery
+ * request cannot authorize a launch through the ceiling stop. A valid post-stop Jo request deduplicates the raise, so that
+ * lane relaunches once its lease is gone. Otherwise nothing is requested: a live holder not stopped at the ceiling reads
+ * the new value at its next poll and goes on, and a request written with
  * no lane stopped at the ceiling would outlive the raise and relaunch a finished workload. The runner reads the ceiling
  * and accepts its ceiling stop in one transaction (surface/scripts/lane.ts `meterPoll`) and this check runs in the
  * caller's, so a raise either lands first and the lane goes on, or sees the accepted stop here. Returns the receipt tail,
@@ -1110,8 +1112,7 @@ function raiseCeiling(ledger: Ledger, wl: string, next: Ceiling, source: string,
 	if (spent && crossed(spent, next) === 100) {
 		return `; ${stopped} and its spend ($${spent.usd.toFixed(2)} / ${Math.round(spent.wallMin)} min) still reaches ${ceilingText(next)}, so nothing relaunches`;
 	}
-	const consumed = consumedIds(tried);
-	if (control.some((c) => c.prefix === "launch-requested" && !consumed.has(c.id))) return `; ${stopped} and a relaunch is already requested`;
+	if (pendingRequests(control).some(isJoRequest)) return `; ${stopped} and a relaunch is already requested`;
 	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), why) });
 	return `; ${stopped}, so a relaunch is requested`;
 }

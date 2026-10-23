@@ -18,7 +18,9 @@ import type { Ledger } from "../../ledger/src/index";
 import {
 	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, type LaunchVerdict, launchRequestedBody, modelProblem, STARTER_EXIT,
 } from "../src/launch";
+import { RETRY_LIMIT } from "../src/incident";
 import { rankGate, readRankConfig, writePickSnapshot } from "../src/rank-launch";
+import { relaunchState } from "../src/relaunch";
 import { surfaceSession } from "../src/session";
 import { DUE_PREFIX, LAUNCH_LANE_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult } from "../src/types";
 
@@ -62,6 +64,15 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 				return { attempted: false, code: null, line: `${workloadId} is finished and awaiting close: its holder wrote done-because:; nothing launched` };
 			case "died-not-relaunched":
 				return { attempted: false, code: null, line: `${workloadId} has had a lane and no new cause: relaunch on your word with ${LAUNCH_LANE_TOOL}` };
+			case "stopped":
+				return { attempted: false, code: null, line: `${workloadId}'s lane was stopped by you or the ceiling: nothing relaunches it until your word with ${LAUNCH_LANE_TOOL}` };
+			case "relaunch-exhausted":
+				return { attempted: false, code: null, line: `${workloadId}'s lanes died ${RETRY_LIMIT} relaunches in a row without progress: nothing relaunches it until your word with ${LAUNCH_LANE_TOOL}, close, or instruct` };
+			case "relaunch-backoff": {
+				const s = relaunchState(rows);
+				const when = s.kind === "waiting" ? `relaunch ${s.n} of ${s.lane} waits until ${s.until}` : "its relaunch waits out the backoff";
+				return { attempted: false, code: null, line: `${workloadId}: its lane died; ${when}, then the tick relaunches it` };
+			}
 			case "closed":
 				return { attempted: false, code: null, line: `${workloadId} is closed; nothing launched` };
 			default: {

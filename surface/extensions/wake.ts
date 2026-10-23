@@ -24,9 +24,10 @@
 // the session context's timer (OMP ExtensionContext.setInterval, cleared at session_shutdown)
 // re-reads the ledger so a question written by a lane, a lane's death, a lane that ended on purpose
 // with work open and nobody holding it (MIGRATION.md item 68), or a hold crossing four hours with
-// nobody typing is pushed as an aside. Each read first records lapsed leases as lane-died rows
-// (surface/src/signals.ts) and each delivery consumes the held orchestrator-bound
-// messages behind its lines (surface/src/delivery.ts), so a line is delivered once until its
+// nobody typing is pushed as an aside. Each read runs in one ledger write transaction (PLAN wl-mvfqvd5hy8zv28 § 1.5,
+// `surfaceRead`): lapsed leases recorded as lane-died rows (surface/src/signals.ts), then the relaunch incident of every
+// workload whose retry budget is spent (surface/src/relaunch-surface.ts), then the lines; each delivery consumes the held
+// orchestrator-bound messages behind its lines (surface/src/delivery.ts), so a line is delivered once until its
 // state changes. The tick's catch-up lines go to their own queue (`tickNotices`) and are pushed as
 // `surface-notices` asides with the same confirmation, resends and fallback as a wake; while a wake
 // is pending or in flight they wait and ride it. Jo's word echoes (`notices`) are never pushed.
@@ -57,6 +58,7 @@
 // `rankLines`, stored rows only, labelled with the rank mode in force), and every tick tries the weekly audit
 // (surface/src/rank-audit.ts `runAudit`), which never throws out of the tick.
 import { CONTRACT_MARKER, contractPath, injectContract } from "../../gates/src/rows/r02-contract";
+import type { Ledger } from "../../ledger/src/index";
 import { BACK_HEADING, countLine, lineKey, NEEDS_YOU_HEADING, onFire, pendingText, present, QUIET_HEADING, surfaceWord } from "../src/batch";
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
@@ -67,8 +69,8 @@ import { renderWake } from "../src/render";
 import { trainMembers } from "../src/merge-train";
 import { RANK_AUDIT_DIR, runAudit } from "../src/rank-audit";
 import { readRankConfig } from "../src/rank-launch";
+import { recordBeforeRead } from "../src/relaunch-surface";
 import { type SurfaceSession, surfaceSession, voiceInPrompt, voiceSection, type WakeTrigger } from "../src/session";
-import { recordLapsedLeases } from "../src/signals";
 import type { ResultTextConstructor, ResultTextLoader } from "../src/types";
 import { type Ctx, HOLD_HOURS, type HostMessage, LEDGER_TOOL, PUSH_TRIES, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
 import { launchVerdict, triggerLaunch } from "./launch";
@@ -90,18 +92,30 @@ function tick(s: SurfaceSession, ctx: Ctx, line: string): void {
 	s.tickNotices.push(planned(s, ctx, line));
 }
 
-/** The lines owed now, after this read's own writes (lapsed leases persisted as lane-died rows), numbered with the session's numbering. */
-function readLines(s: SurfaceSession): ErrorLine[] {
-	const ledger = s.ledger();
-	const now = s.now();
-	recordLapsedLeases(ledger, SURFACE_BY, now);
-	return s.numbering.assign(errorLines(ledger, ledger.inFlight(), { now, holdHours: HOLD_HOURS }));
-}
-
 /** Empty the hold and close its window. */
 function dropHold(s: SurfaceSession): void {
 	s.heldNeedsYou.clear();
 	s.holdSince = null;
+}
+
+/**
+ * One surface read (PLAN wl-mvfqvd5hy8zv28 § 1.5, review r6 F1): a single IMMEDIATE ledger transaction runs the pre-read
+ * step — lapsed leases recorded as lane-died rows, then the incident of every workload whose relaunch budget is spent —
+ * and then `read`, so no runner can commit a death between the incident check and the lines, and no read shows an
+ * exhausted death without its incident. Launch execs, host messages and delivery marks stay outside the transaction.
+ */
+function surfaceRead<T>(ledger: Ledger, now: string, read: () => T): T {
+	return ledger.write(() => {
+		recordBeforeRead(ledger, SURFACE_BY, now);
+		return read();
+	});
+}
+
+/** The lines owed now, after this read's own writes (lapsed leases, relaunch incidents), numbered with the session's numbering. */
+function readLines(s: SurfaceSession): ErrorLine[] {
+	const ledger = s.ledger();
+	const now = s.now();
+	return s.numbering.assign(surfaceRead(ledger, now, () => errorLines(ledger, ledger.inFlight(), { now, holdHours: HOLD_HOURS })));
 }
 
 /** Take `shown` (lines a render put in front of the orchestrator) out of the hold; an emptied hold closes its window. */
@@ -171,8 +185,8 @@ function renderWakeTurn(s: SurfaceSession, ctx: Ctx, trigger: WakeTrigger, ticks
 		const ledger = s.ledger();
 		ensureStandingWorkload(ledger);
 		const now = s.now();
-		recordLapsedLeases(ledger, SURFACE_BY, now);
-		const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now, numbering: s.numbering, rankMode: readRankConfig(s.env).mode });
+		const rankMode = readRankConfig(s.env).mode;
+		const rendered = surfaceRead(ledger, now, () => renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now, numbering: s.numbering, rankMode }));
 		text = planned(s, ctx, rendered.text);
 		s.delivered.take(rendered.lines);
 		dropHold(s);
@@ -274,8 +288,9 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				return { content: [{ type: "text", text: w ? `${wl} is ${w.status}${w.closed_at ? ` (closed ${w.closed_at})` : ""}; only open workloads are rendered.` : `No workload ${wl}.` }] };
 			}
 			const now = s.now();
-			recordLapsedLeases(ledger, SURFACE_BY, now);
-			const rendered = renderWake(ledger, { heading: `read on demand${wl ? `: ${wl}` : ""}`, holdHours: HOLD_HOURS, now, workloadId: wl, numbering: s.numbering, rankMode: readRankConfig(s.env).mode });
+			const rankMode = readRankConfig(s.env).mode;
+			const rendered = surfaceRead(ledger, now, () =>
+				renderWake(ledger, { heading: `read on demand${wl ? `: ${wl}` : ""}`, holdHours: HOLD_HOURS, now, workloadId: wl, numbering: s.numbering, rankMode }));
 			s.delivered.take(rendered.lines);
 			unhold(s, rendered.lines);
 			if (wl) consumeLines(ledger, rendered.lines);
@@ -390,15 +405,20 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	 * slice or an open question is told once as "finished but cannot close", again only when its
 	 * counts change (`s.stuckFinished`). A refused close (the fail-closed close check refuses a served
 	 * repo's workload until its PR is green) is retried every poll but told once per refusal text
-	 * (`s.refusedClose`), cleared when the workload closes or stops being ready to close. Runs after
-	 * the poll persisted lapsed leases; one catch-up at a time; a line per attempt goes to the tick's
-	 * queue, pushed when the catch-up ends. The session's `cwd` is the close tool's fallback repository.
+	 * (`s.refusedClose`), cleared when the workload closes or stops being ready to close. Runs the
+	 * pre-read step (lapsed leases, relaunch incidents) in its own transaction before any verdict; one
+	 * catch-up at a time; a line per attempt goes to the tick's queue, pushed when the catch-up ends; a
+	 * dead lane's relaunch is one more launch verdict here (PLAN wl-mvfqvd5hy8zv28 § 1.3). The session's
+	 * `cwd` is the close tool's fallback repository.
 	 */
 	const catchUp = async (s: SurfaceSession, ctx: Ctx): Promise<void> => {
 		if (s.launching || !pi.exec) return;
 		s.launching = true;
 		try {
 			const ledger = s.ledger();
+			// The pre-read step before any verdict, whatever the cap (PLAN wl-mvfqvd5hy8zv28 § 1.4a, § 1.5): a lapse the poll did
+			// not reach is recorded (its lane-died: time is the backoff's), and a spent budget gets its incident, not a launch.
+			ledger.write(() => recordBeforeRead(ledger, SURFACE_BY, s.now()));
 			for (const w of ledger.inFlight()) {
 				const id = w.workload.id;
 				if (id === STANDING_WORKLOAD_ID) continue;
