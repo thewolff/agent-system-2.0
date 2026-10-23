@@ -237,6 +237,9 @@ describe("the relaunch both raise words share (R13)", () => {
 				expect(isJoRequest(fresh)).toBe(true);
 				expect(fresh.body).toEndWith(word === "extend" ? "(ceiling extend)" : "(ceiling word)");
 				expect(pendingRequests(controlEntries(l.entries(wl))).filter(isJoRequest).map((r) => r.id)).toEqual([fresh.id]);
+				expect(verdictOf(l.launchRows(wl, 3)!)).toEqual(exited
+					? { launch: true, cause: { kind: "request", id: fresh.id } }
+					: { launch: false, reason: "held" });
 				c.at("2026-10-01T10:04:00.000Z");
 				expect(apply(l, interpret(l, words)!)).toContain("a relaunch is already requested");
 				expect(requests(l, wl).map((r) => r.id)).toEqual([old, fresh.id]);
