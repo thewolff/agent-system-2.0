@@ -2,7 +2,7 @@
 title: A dead lane is relaunched by the machinery, three times at most without progress, then one incident line
 status: building
 workload: wl-mvfqvd5hy8zv28
-pr: https://github.com/thewolff/agent-system-2.0/pull/308
+pr: 308
 ---
 **Built on branch `wl/wl-mvfqvd5hy8zv28`.** Workload `wl-mvfqvd5hy8zv28` (normal stakes, plan revision 8 at `~/agent-scratch/agent-system-2.0/wl-mvfqvd5hy8zv28/PLAN.md`, approved by Jo). Flow fix 2 of the flow-repair ruling `in-mvfiztvfi7ez28`; the backoff and the one line per train-owned death are Jo's steer `in-mvfrxewspo835s`. It amends SPEC-2.0.md § B3 item 4 (*Amended 2026-10-19 — dead lanes relaunch*).
 
@@ -10,6 +10,6 @@ pr: https://github.com/thewolff/agent-system-2.0/pull/308
 
 **Files.** New: `surface/src/relaunch.ts` (`laneEnd`, `relaunchState`), `surface/src/incident.ts` (`RETRY_LIMIT`, `RELAUNCH_BACKOFF_MS`, `nextRetry`, `progressAfter`, `recordIncidentOnce`), `surface/src/relaunch-surface.ts` (the pre-read step and `machineryDeath`), `surface/test/relaunch.test.ts`, `surface/test/relaunch-tick.test.ts`. Changed: `surface/src/launch.ts` (the `relaunch` cause, `launchable`), `surface/extensions/launch.ts`, `surface/src/rank-launch.ts`, `surface/scripts/lane.ts` (the restart death), `surface/src/signals.ts`, `surface/extensions/wake.ts` (one-transaction pre-read), `surface/src/errors.ts` (the incident line, hiding), `surface/src/batch.ts`, `surface/src/merge-train.ts`, `ledger/src/index.ts` (`launchRows` deaths), their tests, `install/manifest.tsv`, USER-GUIDE.md § 6, `tiers/orchestrator.md` (error line 4), SPEC-2.0.md § B3.
 
-**Review corrections.** Pending requests have one shared consumption-and-stop rule in `pendingRequests`, used by the launcher, rank gate and train tick; an answer older than the newest stop is voided too. A lapsed lease is neither recorded nor shown as a death while the recorded lane still runs. The shared `surface/src/runner-probe.ts` identifies omp by its recorded start time and the runner by its workload/lane command, rather than accepting any process reusing its pid. An uninspectable process conservatively holds the lane.
+**Review corrections.** Pending requests have one shared consumption-and-stop rule in `pendingRequests`, used by the launcher, rank gate and train tick; an answer older than the newest stop is voided too. A lapsed lease is neither recorded nor shown as a death while the recorded lane still runs. The shared `surface/src/runner-probe.ts` identifies the recorded omp session and runner by shared identity, rather than accepting a reused pid. An uninspectable process conservatively holds the lane.
 
 **Merge order.** This PR lands after PRs #244 (self-heal phase 1) and #248 (flow signal); their overlap is the `ErrorKind` union and the needs-you return array, a union merge. Escalation phase 2 lands after this PR and imports `surface/src/incident.ts` (`RETRY_LIMIT`, `nextRetry`, `recordIncidentOnce`, with its own `kind`) rather than defining a counter or incident of its own.
