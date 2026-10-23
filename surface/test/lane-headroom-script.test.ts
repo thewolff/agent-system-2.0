@@ -1,21 +1,21 @@
-// The quota guard at the real RPC runner spawn (PLAN wl-mv71x5rwdu7eo0 § 4; Jo's in-mv8p5m2t005tts and in-mv8qzqym1ihmv4):
-// the real runner against the fake omp, with a fresh polls fixture in AS2_HEADROOM_POLLS (classifier/src/headroom.ts reads it).
-// Jo's named model projected out spawns no omp and fails the launch at `headroom` as the runner; an unnamed lane whose first
-// get_state model is out is moved by `set_model` to the strong row's first entry not out (the profile's row, copied into the
-// root's installed profile), confirmed by get_state before its first prompt, and recorded as `lane-headroom:`; a lane whose
-// lab is not out runs as before. These spawn processes, so they run in the full suite outside the fence.
+// The quota guard at the real RPC runner spawn: named and unnamed sources may retain a mature week-only
+// overrun against the installed strong row's faster-burning counterfactual budget, without changing the model.
+// Otherwise named models refuse before omp; unnamed models move only to base-in-quota strong-row entries,
+// confirmed by get_state before the first prompt. These process tests run outside the fence.
 import { afterAll, describe, expect, test } from "bun:test";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadTierTable } from "../../classifier/src/tier-table";
 import { LANE_RUNNER_BY, Ledger } from "../../ledger/src/index";
 import { recordRepo } from "../src/decision-log";
-import { doneBody, laneExit, laneModelBody, laneStarted } from "../src/launch";
+import { doneBody, laneDir, laneExit, laneModelBody, laneStarted } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
-import { type FakeScript, type FakeStep, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh, until } from "./helpers";
+import type { FakeScript, FakeStep, LaneRoot } from "./helpers";
+import { fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, laneSnapshot, setScript, settleDrains, sh, until } from "./helpers";
 
 const A = "anthropic/claude-opus-5-5";
 const SOL = "openai-codex/gpt-6.1-sol";
+const K = "moonshot/kimi-k2.7-code";
 const REASON = "anthropic 5h 0.85 used > 0.80";
 const DONE: FakeStep[] = [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }];
 const PROFILE_CONFIG = join(import.meta.dir, "..", "..", "profile", "config.yml");
@@ -28,7 +28,7 @@ afterAll(async () => {
 }, 120_000);
 
 /** One fresh poll line in watch.py's shape (`t` epoch seconds, `resetsAt` epoch ms): each provider's 5h use as given,
- * 6 min into the window (under PACE_MIN), so only the 80 % rule speaks. */
+ * 6 min into the window (under the projection warm-up), so only the 80 % rule speaks. */
 function writePolls(r: LaneRoot, used: Record<string, number>): void {
 	const now = Date.now();
 	const limits = Object.entries(used).map(([provider, usedFraction]) => ({ provider, windowId: "5h", tier: null, resetsAt: now + 4.9 * 3_600_000, usedFraction }));
@@ -39,9 +39,12 @@ function writePolls(r: LaneRoot, used: Record<string, number>): void {
 }
 
 /** The root's installed profile carries the repo profile's tier table (the runner reads the strong row from there). */
-function installTierTable(r: LaneRoot): void {
-	const config = Bun.YAML.parse(readFileSync(PROFILE_CONFIG, "utf8")) as { task?: { agentModelOverrides?: unknown } };
-	writeFileSync(join(r.home, ".omp", "profiles", "agent-system-2", "agent", "config.yml"), JSON.stringify({ setupVersion: 2, task: { agentModelOverrides: config.task?.agentModelOverrides } }));
+function installTierTable(r: LaneRoot, strong?: readonly string[]): void {
+	const config = Bun.YAML.parse(readFileSync(PROFILE_CONFIG, "utf8")) as { task?: { agentModelOverrides?: Record<string, unknown> } };
+	const overrides = config.task?.agentModelOverrides;
+	writeFileSync(join(r.home, ".omp", "profiles", "agent-system-2", "agent", "config.yml"), JSON.stringify({
+		setupVersion: 2, task: { agentModelOverrides: strong === undefined ? overrides : { ...overrides, strong } },
+	}));
 }
 
 const makeRoot = (used: Record<string, number>): LaneRoot => {
@@ -51,6 +54,36 @@ const makeRoot = (used: Record<string, number>): LaneRoot => {
 	installTierTable(r);
 	return r;
 };
+
+/** Mature OpenAI week overrun (projected 1.05), with one common 26-minute sample for both budgets.
+ * Claude's 5h meter is 90 minutes old: .18 is base-in, .34 pace-out, .87 hard-out. */
+function writeComparisonPolls(r: LaneRoot, claudeUsed: number, options: { claudeBefore?: number; sourceHard?: boolean; moonshotUsed?: number } = {}): void {
+	const now = Math.floor(Date.now() / 1000) * 1000;
+	const weekReset = now + (10080 - 2016) * 60_000;
+	const shortReset = now + (300 - 90) * 60_000;
+	const poll = (t: number, sourceUsed: number, claude: number, moonshot: number) => {
+		const limits = [
+			{ provider: "openai-codex", windowId: "7d", tier: null, resetsAt: weekReset, usedFraction: sourceUsed },
+			{ provider: "anthropic", windowId: "5h", tier: null, resetsAt: shortReset, usedFraction: claude },
+		];
+		if (options.sourceHard) limits.push({ provider: "openai-codex", windowId: "5h", tier: null, resetsAt: shortReset, usedFraction: 0.87 });
+		if (options.moonshotUsed !== undefined) limits.push({ provider: "moonshot", windowId: "5h", tier: null, resetsAt: shortReset, usedFraction: moonshot });
+		return { t: t / 1000, rows: Object.fromEntries(limits.map((l) => [`${l.provider}/${l.windowId}`, l.usedFraction])), limits };
+	};
+	const path = join(r.root, "polls.jsonl");
+	writeFileSync(path, [
+		poll(now - 26 * 60_000, 0.20, options.claudeBefore ?? 0.04, 0.04),
+		poll(now, 0.21, claudeUsed, options.moonshotUsed ?? 0),
+	].map((p) => JSON.stringify(p)).join("\n") + "\n");
+	r.env.AS2_HEADROOM_POLLS = path;
+}
+
+/** A syntactically valid installed profile with no readable tier table. */
+function removeTierTable(r: LaneRoot): void {
+	writeFileSync(join(r.home, ".omp", "profiles", "agent-system-2", "agent", "config.yml"), JSON.stringify({ setupVersion: 2 }));
+}
+
+const runnerLog = (r: LaneRoot, wl: string) => readFileSync(join(laneDir(wl, r.home), "runner.log"), "utf8");
 const ledgerOf = (r: LaneRoot) => Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
 /** An autonomous workload with its done: line and one open slice, and Jo's `lane-model:` when `model` is given. */
 function openWorkload(r: LaneRoot, model: string | null): string {
@@ -157,5 +190,149 @@ describe("PLAN wl-mv71x5rwdu7eo0 § 4: the quota guard at the runner's spawn", (
 		const snap = laneSnapshot(r, wl);
 		expect(snap.control.some((c) => c.prefix === "lane-headroom")).toBe(false);
 		expect(laneStarted(snap.control, lane1)).toMatchObject({ model: null, ranModel: A });
+	}, 60_000);
+});
+
+describe("mature week-only runner admission against configured budget alternatives", () => {
+	for (const named of [true, false]) {
+		for (const claudeUsed of [0.18, 0.34, 0.87]) {
+			test(`${named ? "named" : "unnamed"} OpenAI stays on its mature .21 week meter against faster Claude at ${claudeUsed}, with a stderr explanation and no model change`, async () => {
+				const r = makeRoot({});
+				writeComparisonPolls(r, claudeUsed);
+				const wl = openWorkload(r, named ? SOL : null);
+				launch(r, wl, { steps: DONE, stateModel: { provider: "openai-codex", id: "gpt-6.1-sol" } });
+				const lane1 = laneIdOf(wl, 1);
+				await endOf(r, wl, lane1);
+				const snap = laneSnapshot(r, wl);
+				expect(laneExit(snap.control, lane1)).toMatchObject({ outcome: "completed" });
+				expect(laneStarted(snap.control, lane1)).toMatchObject({ model: named ? SOL : null, ranModel: SOL });
+				expect(commandsOf(r, 1).slice(0, 2)).toEqual(["get_state", "prompt"]);
+				expect(commandsOf(r, 1).some((c) => c.startsWith("set_model"))).toBe(false);
+				const argv = spawns(r)[0]!.argv!;
+				if (named) expect(argv[argv.indexOf("--model") + 1]).toBe(SOL);
+				else expect(argv).not.toContain("--model");
+				expect(snap.control.filter((c) => c.prefix === "lane-model").length).toBe(named ? 1 : 0);
+				expect(snap.control.filter((c) => c.prefix === "lane-headroom" || c.prefix === "launch-failed")).toEqual([]);
+				expect(snap.deaths).toEqual([]);
+				const log = runnerLog(r, wl);
+				expect(log).toContain(`retained ${SOL}: openai-codex 7d`);
+				expect(log).toContain(`${A} recent pressure ${((claudeUsed - 0.04) * 100 * 60 / 26).toFixed(2)} pts/h`);
+				expect(log).toContain("> source 2.31 pts/h over 26 min");
+			}, 60_000);
+		}
+
+		test(`${named ? "named" : "unnamed"} mature OpenAI is refused or actually moved when the first alternative burns more slowly`, async () => {
+			const r = makeRoot({});
+			writeComparisonPolls(r, 0.18, { claudeBefore: 0.18 });
+			const wl = openWorkload(r, named ? SOL : null);
+			launch(r, wl, { steps: DONE, stateModel: { provider: "openai-codex", id: "gpt-6.1-sol" } });
+			const lane1 = laneIdOf(wl, 1);
+			await endOf(r, wl, lane1);
+			const snap = laneSnapshot(r, wl);
+			if (named) {
+				expect(spawns(r)).toEqual([]);
+				expect(snap.control.find((c) => c.prefix === "launch-failed")?.rest).toStartWith(`headroom: named ${SOL}, openai-codex 7d`);
+				expect(snap.control.some((c) => c.prefix === "lane-ready")).toBe(false);
+				expect(snap.deaths).toHaveLength(1);
+			} else {
+				expect(laneExit(snap.control, lane1)).toMatchObject({ outcome: "completed" });
+				expect(commandsOf(r, 1).slice(0, 4)).toEqual(["get_state", `set_model ${A}`, "get_state", "prompt"]);
+				expect(laneStarted(snap.control, lane1)).toMatchObject({ model: null, ranModel: A });
+				expect(snap.control.find((c) => c.prefix === "lane-headroom")?.rest).toStartWith(`${SOL} -> ${A} (openai-codex 7d`);
+				expect(snap.deaths).toEqual([]);
+			}
+		}, 60_000);
+
+		test(`${named ? "named" : "unnamed"} source 5h hard ceiling cannot be waived by a faster budget alternative`, async () => {
+			const r = makeRoot({});
+			writeComparisonPolls(r, 0.34, { sourceHard: true });
+			const wl = openWorkload(r, named ? SOL : null);
+			launch(r, wl, { steps: DONE, stateModel: { provider: "openai-codex", id: "gpt-6.1-sol" } });
+			const lane1 = laneIdOf(wl, 1);
+			await endOf(r, wl, lane1);
+			const snap = laneSnapshot(r, wl);
+			if (named) {
+				expect(spawns(r)).toEqual([]);
+				expect(snap.control.find((c) => c.prefix === "launch-failed")?.rest).toStartWith(`headroom: named ${SOL}, `);
+				expect(snap.control.some((c) => c.prefix === "lane-ready")).toBe(false);
+			} else {
+				// Claude is itself pace-out at .34; the actual move skips it and the hard-out source.
+				expect(laneExit(snap.control, lane1)).toMatchObject({ outcome: "completed" });
+				expect(commandsOf(r, 1).slice(0, 4)).toEqual(["get_state", `set_model ${K}`, "get_state", "prompt"]);
+				expect(laneStarted(snap.control, lane1)).toMatchObject({ model: null, ranModel: K });
+			}
+		}, 60_000);
+
+		test(`${named ? "named" : "unnamed"} out source gets no comparative exception when the installed strong row is unreadable`, async () => {
+			const r = makeRoot({});
+			writeComparisonPolls(r, 0.34);
+			removeTierTable(r);
+			const wl = openWorkload(r, named ? SOL : null);
+			launch(r, wl, { steps: DONE, stateModel: { provider: "openai-codex", id: "gpt-6.1-sol" } });
+			const lane1 = laneIdOf(wl, 1);
+			await endOf(r, wl, lane1);
+			const snap = laneSnapshot(r, wl);
+			const failure = snap.control.find((c) => c.prefix === "launch-failed");
+			expect(failure?.rest).toStartWith(`headroom: ${named ? `named ${SOL},` : `${SOL} is out`}`);
+			expect(snap.control.some((c) => c.prefix === "lane-ready" || c.prefix === "lane-headroom")).toBe(false);
+			expect(snap.deaths).toHaveLength(1);
+			expect(snap.workload!.holder).toBeNull();
+			if (named) expect(runnerLog(r, wl)).toContain("quota guard comparison unavailable: the strong row could not be read:");
+			if (named) expect(spawns(r)).toEqual([]);
+			else {
+				expect(failure?.rest).toContain("the strong row could not be read");
+				expect(commandsOf(r, 1).some((c) => c.startsWith("set_model") || c === "prompt")).toBe(false);
+				expect(laneExit(snap.control, lane1)).toMatchObject({ outcome: "never-ready" });
+			}
+		}, 60_000);
+	}
+
+	test("an unreadable strong row still admits a named source that is ordinarily in quota", async () => {
+		const r = makeRoot({ anthropic: 0.1 });
+		removeTierTable(r);
+		const wl = openWorkload(r, A);
+		launch(r, wl, { steps: DONE, stateModel: { provider: "anthropic", id: "claude-opus-5-5" } });
+		const lane1 = laneIdOf(wl, 1);
+		await endOf(r, wl, lane1);
+		const snap = laneSnapshot(r, wl);
+		expect(laneExit(snap.control, lane1)).toMatchObject({ outcome: "completed" });
+		expect(laneStarted(snap.control, lane1)).toMatchObject({ model: A, ranModel: A });
+		expect(commandsOf(r, 1).slice(0, 2)).toEqual(["get_state", "prompt"]);
+		expect(commandsOf(r, 1).some((c) => c.startsWith("set_model"))).toBe(false);
+		expect(snap.control.some((c) => c.prefix === "lane-headroom")).toBe(false);
+		expect(runnerLog(r, wl)).toContain("quota guard comparison unavailable: the strong row could not be read:");
+		expect(snap.deaths).toEqual([]);
+	}, 60_000);
+
+	test("the installed strong row's first other-lab budget controls retention, not a faster later alternative", async () => {
+		const r = makeRoot({});
+		installTierTable(r, [`${K}:high`, A, SOL]);
+		writeComparisonPolls(r, 0.34, { moonshotUsed: 0.04 });
+		const wl = openWorkload(r, SOL);
+		launch(r, wl, { steps: DONE });
+		const lane1 = laneIdOf(wl, 1);
+		await endOf(r, wl, lane1);
+		expect(spawns(r)).toEqual([]);
+		const snap = laneSnapshot(r, wl);
+		expect(snap.control.find((c) => c.prefix === "launch-failed")?.rest).toStartWith(`headroom: named ${SOL}, openai-codex 7d`);
+		expect(snap.control.some((c) => c.prefix === "lane-ready")).toBe(false);
+	}, 60_000);
+
+	test("actual move destinations use base quota: skip a week-out candidate even when a later hotter budget could retain it", async () => {
+		const r = makeRoot({});
+		installTierTable(r, [`${SOL}:high`, K, A]);
+		writeComparisonPolls(r, 0.87, { moonshotUsed: 0.18 });
+		const wl = openWorkload(r, null);
+		launch(r, wl, { steps: DONE, stateModel: { provider: "anthropic", id: "claude-opus-5-5" } });
+		const lane1 = laneIdOf(wl, 1);
+		await endOf(r, wl, lane1);
+		const snap = laneSnapshot(r, wl);
+		expect(laneExit(snap.control, lane1)).toMatchObject({ outcome: "completed" });
+		expect(commandsOf(r, 1).slice(0, 4)).toEqual(["get_state", `set_model ${K}`, "get_state", "prompt"]);
+		expect(laneStarted(snap.control, lane1)).toMatchObject({ model: null, ranModel: K });
+		const order = snap.control.filter((c) => c.laneId === lane1).map((c) => c.prefix);
+		expect(order.indexOf("lane-headroom")).toBeLessThan(order.indexOf("lane-ready"));
+		expect(snap.control.some((c) => c.prefix === "lane-model")).toBe(false);
+		expect(snap.deaths).toEqual([]);
 	}, 60_000);
 });

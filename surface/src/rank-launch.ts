@@ -148,7 +148,7 @@ export function repoIdentity(ledger: Ledger, workloadId: string): { identity: st
 }
 
 /** The ceiling now in force and the newest metered `spend:` (the runner's running total; zero when none). */
-function meter(ledger: Ledger, workloadId: string): { ceiling: Ceiling; spend: Spend } {
+export function meter(ledger: Ledger, workloadId: string): { ceiling: Ceiling; spend: Spend } {
 	const w = ledger.workload(workloadId)!;
 	const control = controlEntries(ledger.entries(workloadId, "assumption"));
 	const ceiling = effectiveCeiling(control, ledger.instructions(workloadId), w.stakes);
@@ -184,7 +184,7 @@ const usd = (x: number): string => `$${Number(x.toFixed(2))}`;
  * Whether `workloadId` may start beside every other `lane-*` holder under a live lease (either mode), D7:
  * - files: a different canonical repository from each of them; equal, missing or unresolvable holds;
  * - budget: the sum of (ceiling − metered spend) over them and the candidate within `parallelBudgetUsd` (0 holds), and
- *   the candidate under its 80 % ceiling question;
+ *   the candidate under 80 % of its ceiling;
  * - merge order: rank order, clear when no two unpinned ones score within `MERGE_TIE` (an unscored one has no order)
  *   and no higher-ranked brief names a lower-ranked one's id or PR.
  * With no other lane running it starts.

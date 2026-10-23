@@ -4,6 +4,8 @@ Workload `wl-muolz8qtp6ylfk`, plan slice `sl-ceiling-plan`, lane `lane-muolz8qtp
 
 **done:** Every workload carries a stakes-sized ceiling in its ledger row, the lane runner counts tokens and wall time against it, and crossing 80 % raises a question row to Jo defaulting to stop at the ceiling, proven by a run against a real lane.
 
+**Amended 2026-10-19 — escalation policy** (workload wl-mvfkv7llkp7nk0, plan `~/agent-scratch/agent-system-2.0/wl-mvfkv7llkp7nk0/PLAN.md` rev 5 § 4 and § 4.1; Jo, 2026-10-19: *"yes to auto-start, stop at 100%"*, and the paired-workload amendment in-mvfo7nphl9xn28; `migration/items/escalation-policy.md`). The 80 % question in the done line above no longer exists. At 80 % Jo gets a notice and the lane goes on; at 100 % an autonomous runner lane stops and Jo gets a second notice. No question is raised at any level, nothing extends on its own at any stakes, and a lane Jo runs by hand is never stopped. § 2 items 2, 4 and 5 and "Not covered" describe the mechanism as it is now. §§ 3, 4 and 6 record the 2026-09-30 build, and each marks what the amendment replaced.
+
 ## 1. Jo's rulings this revision carries
 
 **CLAIM**
@@ -12,7 +14,7 @@ Jo's words on this workload, instruction row of 2026-09-30T21:30:15Z, followed b
 - **A.** Schema stays v5 and the ledger module is untouched. The ceiling is a reserved control entry, `ceiling: usd <x> wall <min> source <why>`, written in the open transaction by `orchestrator-surface`, the same way `done:` and `plan: first` are written today (`surface/extensions/workload.ts:208-215`). That entry is the workload's ceiling in its ledger row set.
 - **B.** The size is the stakes size, ×3 when the open-time classifier judged the brief change-large (the `brief-judged:` result the open tool already computes). **GUESS(inference):** a workload that is plan-first only because of production stakes or Jo's "plan it", and was not judged change-large, stays ×1. My reading is that Jo's "plan-first" here names the change-large trigger. If Jo meant every plan-first workload, the fix is a one-line change in the sizing function.
 - **C.** $5 / 1 h (throwaway), $50 / 6 h (normal), $150 / 12 h (production). Dollars are nominal list price as OMP computes them; hours are lane run time.
-- **D.** *extend* adds one more block of the workload's own size. An exact figure goes through Jo's surface word `ceiling <usd> [<hours>] [wl-…]`.
+- **D.** Jo's word `extend wl-…` adds one more block of the workload's own size; until 2026-10-19 this was the *extend* answer to the ceiling question. An exact figure goes through Jo's surface word `ceiling <usd> [<hours>] [wl-…]`.
 
 ## 2. Mechanism
 
@@ -20,7 +22,7 @@ Jo's words on this workload, instruction row of 2026-09-30T21:30:15Z, followed b
 - OMP's `message_end` rpc frame carries `message.usage.totalTokens` and `message.usage.cost.total`. Read from this lane's frames at `/Users/jowolff/.agent-system-2/lanes/wl-muolz8qtp6ylfk/lane-1.jsonl`: first assistant message `totalTokens 40647`, `cost.total 0.189`.
 - A hand's session file is `<artifactsDir>/<id>.jsonl` (`/Users/jowolff/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/src/task/executor.ts:3520-3521`). Summing assistant `usage` over every `.jsonl` under `~/.agent-system-2/lanes/<wl>/sessions/` therefore counts the lane and all of its hands, sync and async.
 - Reserved control prefixes, their fixed writers and the writer check live in one place: `CONTROL_PREFIXES`, `CONTROL_WRITERS` and `validWriter` (`/Users/jowolff/code/agent-system-2.0-lanes/wl-muolz8qtp6ylfk/surface/src/launch.ts:68-128`).
-- `questions.slice_id` is `NOT NULL` (`/Users/jowolff/code/agent-system-2.0-lanes/wl-muolz8qtp6ylfk/ledger/schema.sql:128`), so the ceiling question gets a slice of its own.
+- `questions.slice_id` is `NOT NULL` (`/Users/jowolff/code/agent-system-2.0-lanes/wl-muolz8qtp6ylfk/ledger/schema.sql:128`), so the ceiling question got a slice of its own. Since 2026-10-19 there is no ceiling question and no ceiling slice.
 
 **GUESS(inference)** — the design, not yet built:
 1. **Entry and authority.** Two new reserved prefixes go in `launch.ts`:
@@ -31,24 +33,27 @@ Jo's words on this workload, instruction row of 2026-09-30T21:30:15Z, followed b
 2. **Writers, all surface.**
    - The open tool writes the first entry (`source stakes <s>` or `source stakes <s> x3 change-large`).
    - Jo's stakes word re-sizes to the new stakes. The instruction is written first, so the raise can name it.
-   - The *extend* answer and the `ceiling` word record Jo's instruction, then the raising entry that names it.
+   - Jo's `extend wl-…` and `ceiling` words record Jo's instruction (`ceiling: <usd> <hours>` for both), then the raising entry that names it.
    - A new `orchestrator_lower_ceiling { workloadId, usd?, wallMinutes? }` refuses any value above the current one.
 3. **Spend.** The unit is nominal dollars (§ B11). Tokens are counted and recorded beside it but never compared. Spend is the sum over the workload's session files, so it is cumulative across relaunches and `--resume`. **Wall** is the sum of `lane-started:` → `lane-exit:` intervals plus the current run. Time parked on Jo is not counted.
 4. **Runner.** On the existing 5-second poll it meters incrementally (byte offsets per file). It writes `spend: <laneId> usd <x> tokens <n> wall <min>` at each threshold and at `lane-exit:`.
-   - **At 80 %** of either half, in one `ledger.write`: `addSlice` `sl-ceiling-<n>` ("Jo decides the ceiling overrun"), then `raiseQuestion`. Options are `stop / extend / split`, with stop named as the default. It is raised once per effective ceiling, and the lane keeps working.
-   - **At 100 %**, with the question open or answered stop or split: `lane-stop: <laneId> accepted ceiling`, then abort, outcome `stop`. That path writes no `lane-died:` (`exitClass`), so Jo sees § B3 line 5, the open question.
-   - A lane finishing under the ceiling withdraws its open ceiling question (`then: cancel`), so the close is not blocked.
+   - **At 80 %** of either half, one notice per ceiling value (*Amended 2026-10-19*): `notice: ceiling 80 % at usd <x> wall <min> on <wl>: …`, a `lane-runner` message to the orchestrator written in one `ledger.write` with the `spend:` entry it reports (`sendCeilingNotice`, `surface/scripts/lane.ts`; the text is `ceilingNoticeBody`, `surface/src/ceiling.ts`). It says the lane goes on and is stopped at 100 %, and names `extend <wl>` and `ceiling <usd> [<hours>] <wl>`. The lane keeps working. A raised or lowered ceiling is a new value, which may notify again at its own 80 % and 100 %.
+   - **At 100 %**: `lane-stop: <laneId> accepted ceiling`, then abort, outcome `stop`, every time, and one stop notice per ceiling value (`notice: ceiling 100 % …`). It says the lane is stopped and nothing relaunches on its own, and names `extend <wl>`, `ceiling <usd> [<hours>] <wl>` (either relaunches it) and `user-driven <wl>`. A poll that jumps from under 80 % straight to 100 % sends only the stop notice. That path writes no `lane-died:` (`exitClass`); Jo sees the notice and the idle line of a lane that stopped at its ceiling. Both notices and that idle line are on fire for the batch (`onFire`, `surface/src/batch.ts`).
+   - Once per value is read from the ledger's notices for that value (`ceilingNoticesSent`) and the run's own memory (`meterStep`), so a relaunch on the same value sends nothing again. No question row is written at any level, and there is no automatic extension at any stakes.
    - `--max-time` = remaining wall plus 10 minutes, a backstop behind the runner's own stop.
-   - The first prompt carries the ceiling and the spend so far, so the lane sets § B9's ceiling share from real numbers.
-5. **Surface on the answer.** *extend* raises the ceiling as in 2, completes the ceiling slice, and writes `launch-requested:`, so a stopped lane relaunches with `--resume`. *stop* and *split* complete the slice and relaunch nothing. The one-liner and the render show `ceiling $50 / 6h` and the newest `spend:` against it.
+   - The first prompt carries the ceiling and the spend so far, so the lane sets § B9's ceiling share from real numbers, and says what happens at the ceiling: "At 80 % Jo gets a notice; at 100 % this lane is stopped and Jo is told." (`ceilingPromptLine`).
+5. **Surface on Jo's word** (*Amended 2026-10-19*). `extend wl-…` raises the ceiling by one block of the workload's own size (`sizeFor` at its stakes, ×3 when judged change-large) on the value in force; `ceiling <usd> [<hours>] [wl-…]` sets Jo's figure. Both run one shared helper (`raiseCeiling`, `surface/src/input.ts`): the `ceiling:` entry naming Jo's instruction, then the relaunch rule. Jo's `launch-requested:` is written when the workload's newest lane was stopped at the ceiling (its `lane-stop: … accepted ceiling`, still stopping or gone), the workload is autonomous, that lane's last `spend:` is under the new value in both halves, and no unconsumed request already waits; so a stopped lane relaunches with `--resume`. Otherwise nothing is requested, and the receipt names the case. The one-liner and the render show `ceiling $50 / 6h` and the newest `spend:` against it.
 
-**Not covered, on purpose:**
-- Interactive `as2 lane` sessions have no runner, so they are not metered. That is Jo at the keyboard.
+**Not covered, on purpose, and paired workloads** (*Amended 2026-10-19*, Jo's ruling in-mvfo7nphl9xn28, PLAN wl-mvfkv7llkp7nk0 § 4.1):
+- A paired workload, one whose holder is a live by-hand lane (`as2 lane <wl>`, a `launch:` entry with `cause interactive`; `isPaired`, `surface/src/ceiling.ts`), is never stopped at its ceiling and raises no question and no notice about it. The meter, its notices and the 100 % stop run only in the autonomous runner (`cmdRun`); `cmdInteractive` stays unmetered, now as Jo's ruling rather than a gap. A user-driven workload with no by-hand lane running is not paired by itself: nothing spends, and nobody is in a pane to tell. The rule is keyed on the lane kind, not the mode, so the future paired mode (jo-issues #139) falls under it as soon as its lanes start through the interactive path.
+- What a by-hand lane gets instead is the cost, from the lane extension (`surface/extensions/lane.ts`). At every turn start it receives a context message against the ceiling in force: `spend: $X of $Y ceiling (Z %), N min; paired: not stopped at the ceiling` (`pairedSpendMessage`). Each time the dollar spend crosses another 25 % of the original ceiling (the workload's first `ceiling:` entry: 37.50, 75, 112.50, 150, 187.50 … for $150), one line is written in Jo's pane with `ctx.ui.notify`, past 100 % without end (`pairedSpendStep`). Marks passed before the session's first measure are not shown. Its first prompt carries `pairedCeilingPromptLine` instead of the autonomous ceiling line.
 - TypeSafe `judge()` calls are not in session files and cost fractions of a cent (§ B11).
 
 ## 3. Slices
 
 The file clusters are disjoint across slices. S1 is the shared pure module, and it goes first. S2 and S3 then run in one batch against S1's exports (§ 4). L2 is not open (Jo), so `workload.ts` is in S3.
+
+*Amended 2026-10-19:* this table is the 2026-09-30 build. The 80 % question, its slice and the *stop* / *extend* / *split* answers it proves were replaced by the notices and Jo's `extend` word (§ 2 items 4 and 5); `surface/test/ceiling-meter.test.ts` and `surface/test/ceiling-surface.test.ts` now prove those.
 
 | Slice | Kind / tier | Files (read and write) | Done condition | Proving command |
 |---|---|---|---|---|
@@ -73,8 +78,11 @@ export function spendBody(laneId: string, s: Spend): string; // Spend = { usd, t
 export function scanSpend(sessionsDir: string, offsets: Map<string, number>, acc: Spend): Spend; // incremental
 export function wallMinutes(control: readonly ControlEntry[], now: number, currentStart: number | null): number;
 export function crossed(s: Spend, c: Ceiling): 0 | 80 | 100;
-export const CEILING_OPTIONS = ["stop", "extend", "split"] as const;
-export function ceilingQuestionBody(wl: string, s: Spend, c: Ceiling, stakes: Stakes): string;
+// Replaced 2026-10-19 (§ 2 item 4): CEILING_OPTIONS and ceilingQuestionBody are gone. The notices:
+export type CeilingNoticeLevel = 80 | 100;
+export const ceilingKey: (c: Ceiling) => string; // "usd 50 wall 360": one notice per level per value
+export function ceilingNoticeBody(level: CeilingNoticeLevel, wl: string, s: Spend, c: Ceiling, stakes: Stakes): string;
+export function parseCeilingNotice(body: string): { level: CeilingNoticeLevel; key: string; workloadId: string } | null;
 ```
 
 ## 5. Risks
@@ -87,6 +95,7 @@ export function ceilingQuestionBody(wl: string, s: Spend, c: Ceiling, stakes: St
 
 **CLAIM**
 Deltas from § 2 after the build and fix round 1 (review `sl-ceiling-review`, fixes `sl-ceiling-fix-1`), each cited by the function that carries it:
+*Amended 2026-10-19:* the slice id, the jump rule, the withdrawn rule, the extend relaunch rule and withdraw = cancel below describe the removed ceiling question (`raiseCeilingQuestion`, `ceilingQuestionState`, `settleCeiling` and the withdraw special case are deleted). What replaced each is in § 2 items 4 and 5: a jump from under 80 % to 100 % sends only the stop notice; once per value is read from the notices; the relaunch rule is `raiseCeiling`, shared by `extend` and `ceiling`; `withdraw` on a ceiling question left open from before keeps the ordinary `then: replan`. An `answer` whose body is `extend` still counts as a raise shape, for entries written before.
 - **Slice id.** The ceiling slice is `sl-ceiling-<wl without wl->-<n>`, not `sl-ceiling-<n>`: slice ids are ledger-wide, so the workload is in the id (`raiseCeilingQuestion`, `surface/scripts/lane.ts`).
 - **A jump past 80 % raises and stops together.** When the spend goes from under 80 % to 100 % between polls, or reaches 100 % with no question open or answered for the ceiling value, the question is raised with the stop, so a ceiling stop always leaves Jo an open question (`meterStep`).
 - **Withdrawn does not count as asked.** A withdrawn ceiling question, the runner's own cancel at a clean finish or Jo's withdraw, reads as never raised (`ceilingQuestionState`), so a relaunch at 85 % raises afresh. Within one run, a question Jo withdrew is not asked again before 100 %.

@@ -7,7 +7,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../../surface/index";
-import { STANDING_WORKLOAD_ID, SURFACE_TOOLS } from "../../surface/src/types";
+import { LANE_TOOLS, STANDING_WORKLOAD_ID, SURFACE_TOOLS } from "../../surface/src/types";
 import { ctxOf, fakePi } from "../../surface/test/helpers";
 import turnShapeRow from "../extensions/r01-turn-shape";
 import orchestratorRoleRow from "../extensions/r15-orchestrator-role";
@@ -228,6 +228,20 @@ describe("P-11 row 15: the orchestrator does no lane work", () => {
 		test(`a ${kind} session is untouched by every call the orchestrator is refused or allowed`, async () => {
 			const call = session(kind);
 			for (const c of [...REFUSED, ...ALLOWED]) expect(await call(...c)).toBeUndefined();
+		});
+	}
+});
+
+// PLAN wl-mv8vx7wdj5nx1c D4 (T12): Ilex's agent-channel tools are surface tools, so row 15 admits them on the
+// orchestrator by name and as their `xd://` devices, and they are never lane tools.
+describe("P-11 row 15: the agent channel's reply tools (PLAN wl-mv8vx7wdj5nx1c T12)", () => {
+	for (const tool of ["orchestrator_reply", "orchestrator_channel_done"]) {
+		test(`${tool} is a surface tool the orchestrator may call, by name and as xd://${tool}, and not a lane tool`, async () => {
+			expect(SURFACE_TOOLS).toContain(tool);
+			expect(LANE_TOOLS).not.toContain(tool);
+			const call = session("orchestrator");
+			expect(await call(tool, { to: "plumb", body: "x", re: ["msg-ch-1-a"] })).toBeUndefined();
+			expect(await call("write", { path: `xd://${tool}`, content: JSON.stringify({ re: ["msg-ch-1-a"] }) })).toBeUndefined();
 		});
 	}
 });

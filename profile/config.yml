@@ -99,33 +99,36 @@ extensions:
   # M3: pre-dispatch classifier — brief → kind → tier → cap → model (SPEC-2.0.md § A1.3).
   - "{repo}/classifier/extension.ts"
 
-  # Jo's i-have-audhd and ask-graham plugins, vendored from jo-wolff-plugins at a pin
-  # (plugins/VENDOR.md, which carries the clash check). plugins/index.ts loads both OMP adapters only
-  # when AGENT_SYSTEM_ROLE=orchestrator: lane prompts arrive as rpc `input`, which would get
-  # ask-graham's every-idea nudge, and a lane's reader is the orchestrator, not Jo. Last in the list:
-  # OMP returns the first session_stop block, so the surface's and the gates' blocks run first, and
-  # neither plugin has a tool_call handler, so the fence order above is unaffected.
-  # Reversal: delete the line (and the two plugin skill dirs and names below).
+  # Jo's i-have-audhd, ask-graham and paired-coding plugins, vendored from jo-wolff-plugins at one pin
+  # (plugins/VENDOR.md, which carries the clash check). plugins/index.ts loads i-have-audhd and
+  # ask-graham in the orchestrator and in every lane, and paired-coding only in a by-hand lane
+  # (AGENT_SYSTEM_ROLE=lane with AGENT_SYSTEM_BY_HAND=1). A hand runs none of them: OMP rebinds this
+  # extension into a subagent with the parent's env still set, so the loader decides by session
+  # context at session_start (ctx.agent.kind "sub", or the gates' parent-session check). Last in the
+  # list: OMP returns the first session_stop block, so the surface's and the gates' blocks run first,
+  # and the gates' tool_call checks run before paired-coding's.
+  # Reversal: delete the line (and the three plugin skill dirs and names below).
   - "{repo}/plugins/index.ts"
 
-# The same two plugins installed through `omp plugin install` (Jo's default profile, 2026-10-14) live
-# in OMP's root plugin dir, ~/.omp/plugins, which every profile reads (pi-utils dirs.ts getPluginsDir:
-# rootSubdir, not the profile's), so without this they load into every as2 session, lanes
+# The same three plugins installed through `omp plugin install` (Jo's default profile) live in OMP's
+# root plugin dir, ~/.omp/plugins, which every profile reads (pi-utils dirs.ts getPluginsDir:
+# rootSubdir, not the profile's), so without this they load into every as2 session, lanes and hands
 # included, unpinned and beside plugins/index.ts (VENDOR.md clash C11). OMP skips a discovered
 # extension whose `extension-module:<file name>` is listed here (extensibility/extensions/loader.ts
 # discoverExtensionPaths isDisabledName); configured paths above are not filtered by it.
-# Reversal: delete these two entries (the marketplace copies then load in every as2 session again).
+# Reversal: delete these entries (the marketplace copies then load in every as2 session again).
 disabledExtensions:
   - "extension-module:i-have-audhd-omp"
   - "extension-module:ask-graham-omp"
+  - "extension-module:paired-coding-omp"
 
 
-# ── Skills (DESIGN-2.0.md § C6.1: 22 rows; MIGRATION.md M6; skills/VENDOR.md; plus the 2 vendored
+# ── Skills (DESIGN-2.0.md § C6.1: 22 rows; MIGRATION.md M6; skills/VENDOR.md; plus the 3 vendored
 #    plugin skills, plugins/VENDOR.md) ──
 # The checkout's skills/ and the vendored plugins' skills/ dirs are the only skill sources: the
 # providers that would pull skills from ~/.claude, ~/.codex, ~/.agents, the profile's own
 # agent/skills, or the working directory are off (extensibility/skills.ts loadSkills
-# isSourceEnabled), and includeSkills names the 24 manifest `skill` rows exactly (omp://skills.md:
+# isSourceEnabled), and includeSkills names the 25 manifest `skill` rows exactly (omp://skills.md:
 # includeSkills is an allowlist; empty means all). The installer refuses a render whose list differs
 # from the manifest's `skill` rows, or whose customDirectories is not <repo>/skills followed by the
 # plugin skill dirs that hold a `skill` row. Reversal: an empty includeSkills with the providers back
@@ -143,6 +146,7 @@ skills:
     - "{repo}/skills"
     - "{repo}/plugins/ask-graham/skills"
     - "{repo}/plugins/i-have-audhd/skills"
+    - "{repo}/plugins/paired-coding/skills"
   includeSkills:
     - accessibility
     - api-and-interface-design
@@ -160,6 +164,7 @@ skills:
     - impeccable
     - interview-me
     - observability-and-instrumentation
+    - paired-coding
     - performance-optimization
     - research
     - resolving-merge-conflicts
@@ -283,6 +288,11 @@ testRunner:
   soloCapMin: 10
   reportCapMb: 50
   queueMaxMin: 60
+  # Workers for the PR's full part (workload wl-mvg2kzuvwngdmo): over 1, test-exec runs it as
+  # `bun test --parallel=<n>` (an integer of 1 or more; absent means 1). Base reruns (`base-full`)
+  # stay serial whatever this says. surface/scripts/test-run-waits.ts reads each run's `full workers`
+  # line and wait back per day. Reversal: `fullWorkers: 1`.
+  fullWorkers: 6
 
 # ── Tracing switch (wl-mv65t5d34lts00 PLAN.md §§ 2, 8; surface/src/tracing.ts) ──
 # Which omp processes export their spans to the local Phoenix (install/phoenix-agent.sh): all (the
@@ -328,3 +338,15 @@ pairSuggest: all
 jevRank:
   mode: show
   parallelBudgetUsd: 0
+
+# ── The agent channel to Ilex (PLAN wl-mv8vx7wdj5nx1c D1; surface/src/channel.ts readChannelConfig) ──
+# The other agents that may message Ilex, the orchestrator surface, each with its transport and authority.
+# omp-mailbox: the OMP seat mailbox ($OMP_PERSISTENT_SEAT_MAILBOX_ROOT, else ~/.omp/agent/seat-mailboxes), drained
+# from inbox/ilex/ at session start and every 2 s. notes: the only authority this phase builds; a message is a note
+# Ilex reads, or a proposal Jo may take by typing his own word, and nothing in it is ever applied or authored as Jo.
+# Read at the orchestrator's session start: an unknown key, transport or authority refuses the whole block with a
+# notice, and the channel is off for that session. OMP has no registration for the key and keeps it in the raw layer.
+# Reversal: delete the block (no block, no channel).
+channel:
+  senders:
+    - { id: plumb, transport: omp-mailbox, authority: notes }

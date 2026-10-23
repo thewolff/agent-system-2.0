@@ -35,9 +35,10 @@
 // | no-independent-lab | the classifier's own `builderLabs` (classifier/src/lab.ts) excludes all three labs; review tokens held by a live spawning lane are passed as `liveReviews`, as the classifier does | `no-independent-lab:<wl>` |
 // | stale-reserved | a `reserved-request` entry older than 30 min that `reservedStates` (surface/src/errors.ts) still finds `waiting`: no `approve <id>` / `deny <id>` instruction, no `reserved-withdrawn: <id>`, its raising lane still holds the workload (a `lane-stopped` request is closed, not stale), and no later request repeats it | `stale-reserved:<entry>` |
 // | stuck-question | a question open for more than 30 min | `stuck-question:<q>` |
+// | ruling-miss | a question open as of as-of, raised at or after the ledger's first `ruling-applied:` entry landed by as-of (the activation receipt: only `askJo`, gates/src/rulings.ts, writes one; with none, nothing is selected), that an active standing ruling would have decided (`checkRulings` replayed as of its raise: its asker read from its writer — the orchestrator surface on the standing workload with its `question-about:` subject, the merge train, the classifier for a question its `review-park:` / `review-limit:` entry names, else the lane — with the workload's builders, stakes and train flag then, and Jo's `end-ruling` words by then): a raise path that bypassed `askJo`. A question whose every option is a `provider/model` id is never one: its row does not carry the declared subject | `ruling-miss:<q>` |
 // | stuck-review | a `hand-spawn: … review yes` with no `hand-settled:` after 45 min while any lane on the workload is alive | `stuck-review:<token>` |
 // | provider-refusal-loop | 2+ `lane-exit:` on one workload within 30 min, each with refusal evidence (`usage polic`, `non-retryable`, `refusal`) in ledger entries/messages from 2 min before to 5 min after the exit (never past as-of), or, for `outcome error`, in the final `prompt_result` of the lane's rpc log `lane-<n>.jsonl` (read as it is now) | `provider-refusal-loop:<wl>:<first lane>` |
-// | silent-orchestrator | no `wl-orchestrator` entry for 2 h while any lane process is alive | `silent-orchestrator:<last entry id>` |
+// | silent-orchestrator | no `wl-orchestrator` entry for 2 h while any lane process is alive; the train tick's rows there (MERGE_TRAIN_BY: its boards' skips, notices and cutover, PLAN wl-mvbjiettjrfpxc D10) are not the orchestrator's | `silent-orchestrator:<last entry id>` |
 // | checkout-behind-main | `git rev-parse HEAD` differs from `origin/main` in the checkout. Behind (HEAD is an ancestor of origin/main): `behind origin/main by <n>; fast-forward at a lull` (or `fast-forward would refuse` with the modified tracked files, or `git status failed` when cleanliness could not be read). Diverged (neither is an ancestor of the other): `DIVERGED … needs a person`. Ahead only (origin/main is an ancestor of HEAD: local commits not yet on main) is not a finding. It never fetches, so origin/main is whatever the checkout already has. | `checkout-behind-main:<head12>:<origin12>` (`…:diverged:…` when diverged) |
 // | process-older-than-head | an `omp --cwd <checkout>` process (not a persistent seat: commands naming `/seat-sessions/` are skipped) started before HEAD arrived, where "arrived" is the later of HEAD's commit time and its newest reflog entry | `process-older-than-head:<pid>:<head12>` |
 // | ff-lull | checkout-behind-main with tracked files clean (`git status --porcelain --untracked-files=no` succeeded and printed nothing) AND zero review hands in flight. In flight = a `hand-spawn: … review yes` token with no `hand-settled: <token>` whose spawning lane has a live `lane.ts run` process: the `liveReviews` set the classifier passes to `builderLabs`. Unsettled review hands whose lane is gone are listed, not counted. The text cites the fingerprint rule (classifier/src/fingerprint.ts header: a review's fingerprint covers its lane's worktree only) rather than asserting the fast-forward is safe. | `ff-lull:<origin12>:<id of the newest review hand-settled entry>`, so one notice per lull |
@@ -67,15 +68,18 @@ import { Database } from "bun:sqlite";
 import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { builderLabs, describeBuilders, excludedLabs, parseHandSpawn } from "../../classifier/src/lab";
+import { parseReviewLimit } from "../../classifier/src/rounds";
+import { checkRulings, endedRulings, type RulingFacts } from "../../gates/src/rulings";
 import { BACKUP_DEFAULTS, BACKUP_NAME, backupNamespace, copyProblem, processAlive } from "../../ledger/src/index";
-import type { EntryKind, EntryRow, InstructionRow, WorkloadStatusRow } from "../../ledger/src/index";
+import type { EntryKind, EntryRow, InstructionRow, RoutingRow, Stakes, WorkloadStatusRow } from "../../ledger/src/index";
 import { assertNotLiveLedgerUnderTest, canonicalPath, defaultLedgerPath, homeDir } from "../../ledger/src/locality";
 import { type ReservedLedgerView, reservedStates } from "../src/errors";
 import { laneDir } from "../src/launch";
-import { STANDING_WORKLOAD_ID } from "../src/types";
+import { trainPrs } from "../src/merge-train";
+import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 
 export const INVARIANTS = [
-	"dead-lane", "silent-lane", "orphan-hand", "no-independent-lab", "stale-reserved", "stuck-question", "stuck-review",
+	"dead-lane", "silent-lane", "orphan-hand", "no-independent-lab", "stale-reserved", "stuck-question", "ruling-miss", "stuck-review",
 	"provider-refusal-loop", "silent-orchestrator", "checkout-behind-main", "process-older-than-head", "ff-lull", "stale-backup",
 ] as const;
 export type Invariant = (typeof INVARIANTS)[number];
@@ -162,9 +166,20 @@ const QUESTION_SQL = `SELECT q.id, q.workload_id, q.created_at, q.body FROM ques
   WHERE q.created_at <= :cutoff
     AND (q.state = 'open' OR (SELECT i.created_at FROM instructions i WHERE i.id = q.resolved_by) > :asOf)
   ORDER BY q.created_at`;
+/**
+ * ruling-miss: questions open as of :asOf and raised at or after the rulings check went live, with their workload's stakes.
+ * The ledger's activation receipt is its first `ruling-applied:` entry landed by :asOf (only `askJo`, gates/src/rulings.ts,
+ * writes one; a lane cannot, surface/extensions/lane-tools.ts): questions raised before it went to Jo by design, and with
+ * none there is nothing to compare against, so nothing is selected.
+ */
+const RULING_MISS_SQL = `SELECT q.id, q.workload_id, q.body, q.options, q.created_by, q.created_at, w.stakes FROM questions q JOIN workloads w ON w.id = q.workload_id
+  WHERE q.created_at <= :asOf
+    AND q.created_at >= (SELECT min(a.created_at) FROM entries a WHERE a.body LIKE 'ruling-applied: %' AND a.created_at <= :asOf)
+    AND (q.state = 'open' OR (SELECT i.created_at FROM instructions i WHERE i.id = q.resolved_by) > :asOf)
+  ORDER BY q.created_at`;
 const NEAR_SQL = `SELECT body FROM entries WHERE workload_id = :wl AND created_at BETWEEN :from AND :to
   UNION ALL SELECT body FROM messages WHERE workload_id = :wl AND created_at BETWEEN :from AND :to`;
-const ORCH_SQL = `SELECT id, created_at FROM entries WHERE workload_id = :wl AND created_at <= :asOf ORDER BY created_at DESC LIMIT 1`;
+const ORCH_SQL = `SELECT id, created_at FROM entries WHERE workload_id = :wl AND created_by <> :tick AND created_at <= :asOf ORDER BY created_at DESC LIMIT 1`;
 const REVIEW_SQL = `SELECT id, workload_id, created_at, body FROM entries
   WHERE (body LIKE 'hand-spawn:% review yes %' OR body LIKE 'hand-settled: %') AND created_at <= :asOf ORDER BY created_at, rowid`;
 
@@ -457,6 +472,50 @@ export function check(input: Input): Report {
 		});
 	}
 
+	// ---- 5b. ruling-miss (gates/src/rulings.ts checkRulings, replayed as of each raise) ----------
+	const misses = run<{ id: string; workload_id: string; body: string; options: string; created_by: string; created_at: string; stakes: Stakes }>(RULING_MISS_SQL, {
+		":asOf": asOf,
+	});
+	for (const q of misses.rows) {
+		const t = q.created_at;
+		const p = { ":wl": q.workload_id, ":t": t };
+		const entries = db.query("SELECT * FROM entries WHERE workload_id = :wl AND created_at <= :t ORDER BY created_at, rowid").all(p as never) as EntryRow[];
+		const instructions = db.query("SELECT * FROM instructions WHERE workload_id = :wl AND created_at <= :t ORDER BY created_at, rowid").all(p as never) as InstructionRow[];
+		const standing = db
+			.query("SELECT * FROM instructions WHERE workload_id = :wl AND created_at <= :t ORDER BY created_at, rowid")
+			.all({ ":wl": STANDING_WORKLOAD_ID, ":t": t } as never) as InstructionRow[];
+		// The raise's own marks (`review-park:`, `review-limit:`, `question-about:`) are written in its transaction, after the row: read up to as-of.
+		const marks = db
+			.query("SELECT * FROM entries WHERE workload_id = :wl AND created_at <= :asOf ORDER BY created_at, rowid")
+			.all({ ":wl": q.workload_id, ":asOf": asOf } as never) as EntryRow[];
+		const names = (e: EntryRow) => e.created_by === q.created_by && (e.body.startsWith(`review-park: ${q.id} slice `) || parseReviewLimit(e.body)?.questionId === q.id);
+		let facts: RulingFacts;
+		if (q.workload_id === STANDING_WORKLOAD_ID && q.created_by === SURFACE_BY) {
+			const about = marks.find((e) => e.created_by === SURFACE_BY && e.body.startsWith(`question-about: ${q.id} `))?.body.split(" ")[2] ?? null;
+			facts = { asker: "orchestrator", about };
+		} else if (q.created_by === MERGE_TRAIN_BY) facts = { asker: "train" };
+		else if (marks.some(names)) facts = { asker: "classifier", kimiOut: false };
+		else {
+			const routings = db.query("SELECT * FROM routings WHERE workload_id = :wl AND created_at <= :t ORDER BY created_at").all(p as never) as RoutingRow[];
+			facts = {
+				asker: "lane",
+				builders: builderLabs({ entries: () => entries, routings: () => routings }, q.workload_id),
+				stakes: q.stakes,
+				train: trainPrs(entries, instructions).length > 0,
+			};
+		}
+		const decided = checkRulings({ body: q.body, options: JSON.parse(q.options) as string[], subject: null }, facts, { now: Date.parse(t), ended: endedRulings(standing) });
+		if (decided === null) continue;
+		findings.push({
+			key: `ruling-miss:${q.id}`,
+			invariant: "ruling-miss",
+			workload: q.workload_id,
+			since: t,
+			text: `question ${q.id} (raised by ${q.created_by}, ${facts.asker}) went to Jo though Jo's ruling ${decided.ruling} answers it (${decided.answer}: ${decided.action}): a raise path bypassed askJo (gates/src/rulings.ts). ${q.body.replace(/\s+/g, " ").slice(0, 100)}`,
+			query: `${misses.shown} -- then gates/src/rulings.ts checkRulings over the workload's entries, routings and instructions up to the question's created_at`,
+		});
+	}
+
 	// ---- 7. provider-refusal-loop ---------------------------------------------------------------
 	for (const [wl, entries] of byWorkload) {
 		const refusals: { lane: string; at: string; why: string }[] = [];
@@ -496,7 +555,7 @@ export function check(input: Input): Report {
 	}
 
 	// ---- 8. silent-orchestrator -----------------------------------------------------------------
-	const orch = run<{ id: string; created_at: string }>(ORCH_SQL, { ":wl": STANDING_WORKLOAD_ID, ":asOf": asOf });
+	const orch = run<{ id: string; created_at: string }>(ORCH_SQL, { ":wl": STANDING_WORKLOAD_ID, ":tick": MERGE_TRAIN_BY, ":asOf": asOf });
 	const lastOrch = orch.rows[0];
 	if (!liveLanes) skip("silent-orchestrator", NO_PGREP);
 	else if (liveLanes.size > 0 && (!lastOrch || lastOrch.created_at < ago(120 * MIN))) {

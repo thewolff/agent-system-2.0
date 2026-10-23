@@ -10,7 +10,7 @@ import orchestratorSurface from "../index";
 import { recordRepo, repoOf } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { apply, applyTrain, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, TRAIN_IN_BATCH } from "../src/input";
-import { boundPrs, controlEntries, planFirst } from "../src/launch";
+import { boundPrs, controlEntries, planAutoApprovedBody, planAutoStartNoticeBody, planFirst, planHaltedBody, trainBoardBody } from "../src/launch";
 import {
 	KNOWN_FLAKES, prStakes, RESOLVE_COMMAND, type StakesView, TRAIN_DONE, TRAIN_PREPARE, TRAIN_PUSH, trainBody, trainBrief, trainFullSliceId, trainHold, trainInstructionBody,
 	trainPrs, trainSkippedOf, trainSliceId, trainSlicePr,
@@ -18,7 +18,8 @@ import {
 import { Numbering } from "../src/numbering";
 import { errorLines } from "../src/errors";
 import { type ClosePr, closeFreshness, makeRunId, runnerDiedRun, testRequestedBody, testRunBody } from "../src/test-run";
-import { LANE_TRAIN_RETURN_TOOL, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { sendNotice } from "../src/notice";
+import { ESCALATION_BY, LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, ctxOf, fakePi, notices, tempLedger, tmp, workloadWithSlice } from "./helpers";
 
 const LANE = "lane-train-1";
@@ -86,7 +87,7 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		expect(i).toMatchObject({ kind: "instruction", body: trainInstructionBody(wl, [101, 106]), author: "jo", channel: "surface", created_by: SURFACE_BY });
 		expect(i!.body).toBe(`train ${wl} 101 106`);
 		expect(control.filter((c) => c.prefix === "train").map((c) => c.body)).toEqual([trainBody([101, 106], i!.id)]);
-		expect(boundPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([{ pr: 101, instructionId: i!.id }, { pr: 106, instructionId: i!.id }]);
+		expect(boundPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([{ pr: 101, by: i!.id }, { pr: 106, by: i!.id }]);
 		expect(trainPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([101, 106]);
 		expect(line).toBe(`opened merge train ${wl} for #101, #106 (instruction ${i!.id})`);
 		// apply never opens one: the open needs the surface's repo
@@ -118,14 +119,15 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		expect(trainSlicePr("sl-train-mv8s8srodefytc-101-full-", wl)).toBeNull();
 	});
 
-	test("the brief carries step 0 (the order command) before step 1 and the § 1b stacked-PR rules; sl-mt-stack's markers are gone", () => {
+	test("the brief carries step 0 (list, then the order command) before step 1 and the § 1b stacked-PR rules; sl-mt-stack's markers are gone", () => {
 		const wl = "wl-mv8s8srodefytc";
 		const lines = trainBrief(wl, [106, 101]).split("\n");
-		const step0 = lines.findIndex((l) => l.startsWith(`0. \`${RESOLVE_COMMAND} order --repo <owner/repo`));
+		const step0 = lines.findIndex((l) => l.startsWith(`0. \`${RESOLVE_COMMAND} list --workload ${wl}\``));
 		expect(step0).toBeGreaterThan(-1);
+		expect(lines[step0]).toContain(`\`${RESOLVE_COMMAND} order --repo <owner/repo of this workload's origin> --prs <every PR list printed`);
 		expect(lines[step0 + 1]!.startsWith("1. ")).toBe(true);
 		expect(lines[step0]).toContain("at train start and again before each PR");
-		expect(lines[step0]).toContain("lane_message");
+		expect(lines[step0]).toContain("Record the chain line with lane_record_entry");
 		expect(lines[step0]).toContain("gh pr edit B --body-file");
 		const rules = lines.find((l) => l.startsWith("Stacked PRs: "))!;
 		for (const s of ["done-because", "chain: #101 → **#106** → #107", "gh pr edit B --base main", "kind `stack`", "without Jo's word"]) {
@@ -152,8 +154,8 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		// the readiness check reads the head, mergeability and ancestry after a fetch
 		for (const s of ["git fetch origin", "headRefOid", "`MERGEABLE`", "git merge-base --is-ancestor origin/main <head>"]) expect(lines[ready]).toContain(s);
 		// stakes come from step 1's command, and step 7 runs it again
-		expect(lines[step(1)]).toContain(`\`${RESOLVE_COMMAND} stakes --repo <owner/repo of this workload's origin> --pr <n>\``);
-		expect(lines[stakes]).toContain(`${RESOLVE_COMMAND} stakes`);
+		expect(lines[step(1)]).toContain(`\`${RESOLVE_COMMAND} stakes --hold-ok --repo <owner/repo of this workload's origin> --pr <n>\``);
+		expect(lines[stakes]).toContain(`${RESOLVE_COMMAND} stakes --hold-ok`);
 		// a moved head routes to step 2, which makes a new worktree at the PR's current head
 		expect(lines[ready]).toMatch(/\bstep 2\b/);
 		// on a new branch (gates/test/r08-push-dest.test.ts runs both commands through row 8), never a detached HEAD
@@ -187,6 +189,32 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		}
 		expect(controlEntries(ledger.entries(wl))).toEqual([]);
 	});
+
+	test("R16: the brief sends no lane_message, reads its members from list, re-reads list before done-because, and passes a hold over with no question", () => {
+		const wl = "wl-mv8s8srodefytc";
+		for (const source of ["jo", "board"] as const) {
+			const brief = trainBrief(wl, [101], source);
+			expect(brief).not.toContain("lane_message");
+			expect(brief.split("\n")[0]).toBe(source === "jo" ? "merge train (Jo's word): #101" : "merge train (auto-boarded by the train tick): #101");
+			const lines = brief.split("\n");
+			const step = (k: number) => lines.findIndex((l) => l.startsWith(`${k}. `));
+			// the live-owner note is an entry, and a hold or a second exit 2 is a train-error: pass-over, never a question or a merge
+			expect(lines[step(1)]).toContain("lane_record_entry `train-error: pr <n> live lane <id>`");
+			for (const s of ["`hold: main protection unverified (<gap>)`", "`train-error: pr <n> protection <gap>`", "`train-error: pr <n> stakes <the second run's message>`", "no question to Jo, no merge"]) {
+				expect(lines[step(1)]).toContain(s);
+			}
+			const b = lines.findIndex((l) => l.startsWith("   b. "));
+			// main's protection hold is named whole: a plan's `hold: <reason> until <time|jo>` (PLAN wl-mvfkv7llkp7nk0 § 3) is a train-hold:, not a train-error:
+			expect(lines[b]).toContain("`hold: main protection unverified (<gap>)`, or a second exit 2 → record step 1's `train-error:` and pass the PR over, no question and no merge");
+			expect(lines[b]).toContain("`production: <reason>` → Production stakes");
+			// before done-because, list once more; "nothing runnable" is an entry
+			const terminal = lines.find((l) => l.startsWith("Terminal outcomes: "))!;
+			const relist = terminal.indexOf(`run \`${RESOLVE_COMMAND} list --workload ${wl}\` once more`);
+			expect(relist).toBeGreaterThan(-1);
+			expect(relist).toBeLessThan(terminal.indexOf("done-because when every PR"));
+			expect(terminal).toContain("lane_record_entry one entry listing each PR that is not terminal");
+		}
+	});
 });
 
 /** A git checkout at a temp path whose origin is `url`, the `repo:` a workload is on. */
@@ -200,8 +228,8 @@ function checkout(url: string): string {
 }
 
 /** A temp ledger with three workloads on checkouts: normal on the train repo, production on it, normal on another repo; and one with no repo:. */
-function stakesWorld() {
-	const { ledger, path } = tempLedger();
+function stakesWorld(now?: () => string) {
+	const { ledger, path } = tempLedger(now);
 	const on = checkout("git@github.com:TheWolff/agent-system-2.0.git");
 	const elsewhere = checkout("https://github.com/thewolff/newdle-web.git");
 	const normal = workloadWithSlice(ledger).wl;
@@ -248,6 +276,53 @@ describe("prStakes (rev 17.1 D1): normal only for a same-repo wl/<id> branch who
 	});
 });
 
+describe("prStakes hold (PLAN wl-mvfkv7llkp7nk0 § 3, R10): an auto-started or halted plan holds its PRs", () => {
+	test("auto-start holds until jo while its notice is held and until Jo types; then HOLD_HOURS after Jo's first typed message; then normal", () => {
+		const c = clock();
+		const w = stakesWorld(c.now);
+		const of = () => prStakes(view({ headRefName: `wl/${w.normal}` }), REPO, w.ledger);
+		w.ledger.recordEntry({ by: ESCALATION_BY, workloadId: w.normal, kind: "assumption", body: planAutoApprovedBody("dg-1") });
+		const notice = sendNotice(w.ledger, { by: ESCALATION_BY, workloadId: w.normal, body: planAutoStartNoticeBody(w.normal, "/plans/PLAN.md") });
+		ensureStandingWorkload(w.ledger);
+		const typed = (at: string, over: Partial<{ workloadId: string; author: string; by: string }> = {}) => {
+			c.at(at);
+			return w.ledger.recordInstruction({ by: over.by ?? SURFACE_BY, workloadId: over.workloadId ?? STANDING_WORKLOAD_ID, body: "what's up", author: over.author ?? "jo", channel: "surface" });
+		};
+		// Jo typing before the notice reached the orchestrator starts nothing.
+		typed("2026-10-01T10:30:00.000Z");
+		expect(of()).toMatchObject({ stakes: "hold", until: "jo" });
+		c.at("2026-10-01T11:00:00.000Z");
+		w.ledger.advanceMessage(notice, "delivered", { by: SURFACE_BY });
+		expect(of()).toMatchObject({ stakes: "hold", until: "jo" });
+		// An instruction mirrored onto the workload, or one not Jo's surface words, is not Jo's typed message.
+		typed("2026-10-01T11:10:00.000Z", { workloadId: w.normal });
+		typed("2026-10-01T11:20:00.000Z", { by: "orchestrator" });
+		expect(of()).toMatchObject({ stakes: "hold", until: "jo" });
+		const first = typed("2026-10-01T12:00:00.000Z");
+		typed("2026-10-01T13:00:00.000Z");
+		expect(of()).toEqual({ stakes: "hold", until: "2026-10-01T16:00:00.000Z", reason: expect.stringContaining(first) });
+		c.at("2026-10-01T15:59:59.000Z");
+		expect(of().stakes).toBe("hold");
+		c.at("2026-10-01T16:00:00.000Z");
+		expect(of()).toEqual({ stakes: "normal", reason: `${w.normal} on ${REPO}, stakes normal` });
+	});
+
+	test("Jo's halt holds until jo with no end; a later approve, or no plan: line at all, holds nothing; a forged auto approval holds nothing", () => {
+		const w = stakesWorld();
+		const of = () => prStakes(view({ headRefName: `wl/${w.normal}` }), REPO, w.ledger);
+		expect(of().stakes).toBe("normal");
+		w.ledger.recordEntry({ by: LANE, workloadId: w.normal, kind: "assumption", body: planAutoApprovedBody("dg-1") });
+		expect(of().stakes).toBe("normal");
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.normal, kind: "assumption", body: planHaltedBody("in-1") });
+		expect(of()).toMatchObject({ stakes: "hold", until: "jo" });
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.normal, kind: "assumption", body: "plan: approved in-2" });
+		expect(of().stakes).toBe("normal");
+		// Production stays production: a hold never lowers it.
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.prod, kind: "assumption", body: planHaltedBody("in-3") });
+		expect(prStakes(view({ headRefName: `wl/${w.prod}` }), REPO, w.ledger).stakes).toBe("production");
+	});
+});
+
 describe("the stakes script, with a fake gh and a temp ledger", () => {
 	const CLI = join(import.meta.dir, "..", "scripts", "merge-train.ts");
 	// `gh api` answers main's rules from rules.json and a ruleset from rulesets/<id>.json, or GitHub's 404 when the test wrote none.
@@ -271,6 +346,8 @@ exit 1
 	const PROTECTED = rules(true, ["as2/full-suite"]);
 	/** Ruleset 1 as `gh api repos/<repo>/rulesets/1` returns it to an account that can never bypass it. */
 	const NEVER = { 1: { id: 1, enforcement: "active", current_user_can_bypass: "never" } };
+	/** One CLI run: a fresh Bun process each time, so a test making five or more runs takes the 30 s timeout, not bun's 5 s
+	 * default (R9's twelve took 3 s alone and 5.45 s under the full suite, tr-0mvg482h33pjjhy). */
 	function run(ledgerPath: string, views: StakesView[], args: string[], mainRules?: unknown, rulesets: Record<number, unknown> = NEVER) {
 		const root = tmp("train-stakes");
 		mkdirSync(join(root, "bin"));
@@ -316,7 +393,7 @@ exit 1
 			expect(r.out.startsWith(unverified)).toBe(true);
 		}
 		expect(run(w.path, views, ["stakes", "--repo", REPO, "--pr", "101"]).out).toContain("HTTP 404");
-	});
+	}, 30_000);
 
 	test("D2 bypass: a qualifying rule counts only when the merging account can never bypass its ruleset, and only with no integration_id", () => {
 		const w = stakesWorld();
@@ -340,7 +417,7 @@ exit 1
 		// a ruleset the account can never bypass makes main protected even beside one it can bypass
 		const two = [...rules(true, ["as2/full-suite"]), { ...rules(true, ["as2/full-suite"])[0]!, ruleset_id: 2 }];
 		expect(stakes(two, { 1: { current_user_can_bypass: "always" }, 2: { current_user_can_bypass: "never" } }).out).toBe("normal\n");
-	});
+	}, 30_000);
 
 	test("exit 2 on a usage error or a gh failure", () => {
 		const w = stakesWorld();
@@ -350,6 +427,61 @@ exit 1
 		const gone = run(w.path, [], ["stakes", "--repo", REPO, "--pr", "999"]);
 		expect(gone.code).toBe(2);
 		expect(gone.err).toContain("no pull requests found");
+	});
+
+	test("a halted workload's PR prints `hold: <reason> until jo`, exit 0, before main's protection is read (PLAN wl-mvfkv7llkp7nk0 § 3)", () => {
+		const w = stakesWorld();
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.normal, kind: "assumption", body: planHaltedBody("in-1") });
+		const r = run(w.path, [view({ number: 101, headRefName: `wl/${w.normal}` })], ["stakes", "--repo", REPO, "--pr", "101"], PROTECTED);
+		expect(r.code).toBe(0);
+		expect(r.out).toMatch(new RegExp(`^hold: ${w.normal} is halted by Jo .* until jo\\n$`));
+		expect(r.calls()).toHaveLength(1);
+		// with --hold-ok and main's protection unverified, the plan's hold is still the line: it is printed before protection is read
+		const held = run(w.path, [view({ number: 101, headRefName: `wl/${w.normal}` })], ["stakes", "--hold-ok", "--repo", REPO, "--pr", "101"]);
+		expect(held.code).toBe(0);
+		expect(held.out).toMatch(new RegExp(`^hold: ${w.normal} is halted by Jo .* until jo\\n$`));
+		expect(held.calls()).toHaveLength(1);
+	});
+
+	test("R9: --hold-ok turns a normal PR's unverified protection into `hold:`, keeps production and verified normal, and leaves the plain output unchanged", () => {
+		const w = stakesWorld();
+		const views = [view({ number: 101, headRefName: `wl/${w.normal}` }), view({ number: 102, headRefName: `wl/${w.prod}` })];
+		for (const mainRules of [undefined, rules(false, ["as2/full-suite"]), []]) {
+			const held = run(w.path, views, ["stakes", "--hold-ok", "--repo", REPO, "--pr", "101"], mainRules);
+			expect(held.code).toBe(0);
+			expect(held.out.startsWith("hold: main protection unverified (")).toBe(true);
+			expect(held.out.endsWith(")\n")).toBe(true);
+			// the flag may come anywhere; the gap text is the plain run's
+			const after = run(w.path, views, ["stakes", "--repo", REPO, "--pr", "101", "--hold-ok"], mainRules);
+			const plain = run(w.path, views, ["stakes", "--repo", REPO, "--pr", "101"], mainRules);
+			expect(after.out).toBe(held.out);
+			expect(plain.out).toBe(held.out.replace(/^hold: /, "production: "));
+		}
+		expect(run(w.path, views, ["stakes", "--hold-ok", "--repo", REPO, "--pr", "101"], PROTECTED).out).toBe("normal\n");
+		// a PR whose own stakes are production keeps Jo's question, flag or not, and is never a hold
+		const prod = run(w.path, views, ["stakes", "--hold-ok", "--repo", REPO, "--pr", "102"]);
+		expect([prod.code, prod.out]).toEqual([0, `production: ${w.prod}'s stakes are production\n`]);
+		expect(run(w.path, [], ["stakes", "--hold-ok", "--repo", REPO, "--pr", "999"]).code).toBe(2);
+	}, 30_000);
+
+	test("list: the train's members in membership order, `<n> jo` or `<n> board`, read-only, no gh; exit 2 for no such workload", () => {
+		const w = stakesWorld();
+		const opened = interpret(w.ledger, "train 106 101");
+		if (opened?.kind !== "train") throw new Error("not a train");
+		const t = applyTrain(w.ledger, opened, w.on).workloadId;
+		const board = (pr: number) => trainBoardBody({ pr, workload: w.normal, head: SHA_A, run: "tr-x1", review: "en-x1" });
+		w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: t, kind: "assumption", body: board(139) });
+		w.ledger.recordEntry({ by: LANE, workloadId: t, kind: "assumption", body: board(140) });
+		w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: t, kind: "assumption", body: board(101) });
+		expect(apply(w.ledger, interpret(w.ledger, `train ${t} 150`)!)).toContain("#150");
+		const before = w.ledger.entries(t).length;
+		const r = run(w.path, [], ["list", "--workload", t]);
+		expect([r.code, r.out, r.err]).toEqual([0, "106 jo\n101 jo\n139 board\n150 jo\n", ""]);
+		expect(w.ledger.entries(t).length).toBe(before);
+		expect(run(w.path, [], ["list", "--workload", w.bare]).out).toBe("");
+		const none = run(w.path, [], ["list", "--workload", "wl-nosuch"]);
+		expect([none.code, none.err.trim()]).toEqual([2, "no workload wl-nosuch"]);
+		expect(run(w.path, [], ["list"]).code).toBe(2);
 	});
 });
 
@@ -382,7 +514,7 @@ describe("train <wl-…> <N…> adds to a train; parsing and refusals (§ 1)", (
 		ledger.closeWorkload(closed, { by: SURFACE_BY });
 		const usage = "train <N> [<N> …] opens a merge train; train <wl-…> <N> [<N> …] adds PRs to one";
 		const cases: [string, string][] = [
-			[`train ${plain} 139`, `${plain} is not a merge train (no train: entry from Jo's train word); open one with train <N> [<N> …]`],
+			[`train ${plain} 139`, `${plain} is not a merge train (no train: or train-board: entry); open one with train <N> [<N> …]`],
 			[`train ${STANDING_WORKLOAD_ID} 139`, "the standing workload is never a merge train"],
 			[`train ${closed} 139`, `${closed} is closed: only an open merge train takes PRs`],
 			["train wl-nope 139", "no workload wl-nope"],
@@ -547,6 +679,49 @@ describe("the train hold (§ 1 D4), on a temp ledger", () => {
 		expect(append2!.body).toBe(`train ${held.wl} 139`);
 		expect(stop2!.created_at).toBe(append2!.created_at);
 		expect(holdOf(held.ledger, held.wl)).toBe(`merge train stopped by Jo at #101 (${q2}); \`train ${held.wl} <N…>\` resumes it`);
+	});
+
+	test("R4: Jo's stop holds a board-only train; a later board does not resume it, Jo's train word does, and on the held train it may re-name a PR already on it", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const repo = tmp("board-train-repo");
+		const wl = ledger.write(() => {
+			const id = ledger.openWorkload({ by: MERGE_TRAIN_BY, brief: trainBrief("wl-x", [101], "board"), stakes: "normal", mode: "autonomous" });
+			ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: id, kind: "assumption", body: `repo: ${repo}` });
+			return id;
+		});
+		const board = (pr: number) => ledger.recordEntry({
+			by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainBoardBody({ pr, workload: "wl-lane1", head: SHA_A, run: "tr-r1", review: "en-v1" }),
+		});
+		board(101);
+		c.plusHours(0.01);
+		expect(trainPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([101]);
+		expect(holdOf(ledger, wl)).toBeNull();
+		// a board-only train is not a duplicate-free zone: re-naming 101 while it runs is refused, as on Jo's train
+		expect(interpret(ledger, `train ${wl} 101`)).toEqual({ kind: "refused", why: `#101 is already on train ${wl}; a skipped PR gets a new train: \`train 101\`` });
+		const q = ask(ledger, wl, trainSliceId(wl, 101), ["merged", "skip", "stop"]);
+		ledger.answerQuestion(q, { ...JO, answer: "stop" });
+		c.plusHours(0.01);
+		const stopped = `merge train stopped by Jo at #101 (${q}); \`train ${wl} <N…>\` resumes it`;
+		expect(holdOf(ledger, wl)).toBe(stopped);
+		// the tick boarding another PR after the stop never resumes the train
+		board(106);
+		c.plusHours(0.01);
+		expect(trainPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([101, 106]);
+		expect(holdOf(ledger, wl)).toBe(stopped);
+		// a lane-written board is no member and no resume
+		ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body: trainBoardBody({ pr: 120, workload: "wl-lane2", head: SHA_B, run: null, review: null }) });
+		expect(trainPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([101, 106]);
+		expect(holdOf(ledger, wl)).toBe(stopped);
+		// Jo's word naming PRs already on the held train is the resume, not a duplicate
+		const resume = interpret(ledger, `train ${wl} 101 106`);
+		expect(resume).toEqual({ kind: "train-append", workloadId: wl, prs: [101, 106] });
+		apply(ledger, resume!);
+		c.plusHours(0.01);
+		expect(holdOf(ledger, wl)).toBeNull();
+		expect(trainPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([101, 106]);
+		// resumed, the train is no longer held, so re-naming is a duplicate again
+		expect(interpret(ledger, `train ${wl} 106`)?.kind).toBe("refused");
 	});
 
 	test("a non-train workload is never held; train A's stop does not hold train B", () => {

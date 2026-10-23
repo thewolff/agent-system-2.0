@@ -19,10 +19,14 @@
 //     with `launch-requested: by merge-train` once per task and again only after a runner result newer than its last launch, so
 //     an owner waiting on its run is not relaunched.
 //  4. Wakes (D10 step 1). A train `actionable` (a new `train:`, a settle, an unworked PR, a dependency merged on GitHub since the
-//     last lane exit, Jo's answer to an alert, a passed-over PR whose retry wait has passed, or a returned PR's head the train
-//     has not worked, from step 1's views) and not held live gets `launch-requested: by merge-train` and the launcher. A head's wake is
-//     recorded (`train-head-woken:`) when the launcher started a lane; the head stays due under the pass-over backoff until the
-//     train works it (`trainRetries`). An open question never stops the tick: every pass settles, delivers and wakes on every PR.
+//     last lane exit, Jo's answer to an alert, a passed-over PR whose retry wait has passed, a returned PR's head the train
+//     has not worked, from step 1's views, or a held PR whose hold has ended, `hold-expired`, PLAN wl-mvfkv7llkp7nk0 § 3) and not
+//     held live gets `launch-requested: by merge-train` and the launcher. A head's wake is recorded (`train-head-woken:`) when the
+//     tick requested a lane for it (wrote the request, or its launcher served a pending one), once per request, whichever starter
+//     serves it; the head stays due under the pass-over backoff until the train works it (`trainRetries`). An ended hold's wake
+//     is recorded at the same request boundary (`train-wake: pr <n> hold <entry id>`), which consumes that hold's expiry.
+//     An open question never stops the tick: every pass settles, delivers and wakes on every PR.
+//     Steps 3 and 4 request nothing for a workload stopped at its ceiling (`ceilingStopped`): no row, no launcher, a log line only.
 //  5. Alerts (D9). Each question on a train slice is an alert: the production merge question the lane raises and the failed-twice
 //     question of step 2. The send ladder (`trainAlertActions`): level 1 files an issue on TRAIN_ALERT_REPO labelled as2-train;
 //     4 h and 8 h after it, while the question is open and the issue is not closed, a comment mentioning @thewolff, the `loud`
@@ -34,21 +38,43 @@
 //     or withdrawal closes the issue (`closed`), found by its marker when level 1 was begun and its url never recorded. The marker
 //     lookup reads every as2-train issue (`ISSUE_LIST_ARGS`, every page); a lookup that fails or reads an unexpected shape throws,
 //     so nothing is created and no `closed` is written on a partial answer: the action stays due for the next pass.
+// 3b. Boarding (PLAN wl-mvbjiettjrfpxc D1, D3, D4). The first pass writes the cutover, `train-autoboard: on <iso>`, once on the
+//     standing workload. Then every workload closed within 14 days on a repository the test runner serves (`autoboardCandidates`,
+//     newest close first; a train, a fix workload, a W a board still covers and a W whose PR ended are not read) gets `landingReady`,
+//     and a ready one the live half: `gh pr view <n> --json <TASK_VIEW_FIELDS>,state,baseRefName,isDraft` (OPEN, no draft, base
+//     main, head branch exactly wl/<W> on the same repository, `prStakes` normal) and, when the head is not the green sha G,
+//     `gh api repos/<r>/compare/<G>...<head>` and `gh api repos/<r>/commits/<sha>` per commit: each commit touches only
+//     .ai/decision-log/ (never the net diff). The ready PRs board (`boardLanding`) oldest close first; the board makes the train
+//     actionable, so step 4 launches it. A W that cannot board gets `train-board-skip:` once per head and reason; a PR GitHub
+//     shows MERGED or CLOSED gets an `ended:` one, and its W is never read again.
+// 3c. Protection (D6). Per repository with an open train holding a non-terminal PR, a boardable PR or an open episode, main's
+//     protection is read live (`protectionGap`): `train-notice: protection <owner/repo> ok|gap|unknown <text>` on each change,
+//     `raised` (the needs-you line, surface/src/errors.ts) on a gap or on an unknown that is the newest read and 10 min old, one
+//     jo-issues issue (`filed`), and on `ok` the issue closed with a comment, `cleared`, and every train that passed a PR over for
+//     protection woken. While an episode is open, protection pass-overs get no backoff wake.
+// 3d. Red main (D7). Each holder `main-red: <url> run <id>` on a train open or closed within 24 h whose url is an issue on that
+//     train's repository: `train-notice: main-red <url> raised run <id>` once per url, one jo-issues issue (`filed`), and
+//     `cleared` (the jo-issues issue closed) once `gh issue view` shows that issue CLOSED. Any other url is logged only.
 //
 // A gh failure is logged on the train as `train-error: tick <reason>` (written again only when the reason changes) and retried
-// next run; Jo is not alerted. The launcher is `bun surface/scripts/lane.ts launch <wl> --requested-by merge-train`.
-// Exit: 0 the pass ran (logged errors included), 1 the ledger could not be opened, 2 an argument was given.
+// next run; Jo is not alerted (a boarding or notice failure is logged in the tick's log only). The launcher is
+// `bun surface/scripts/lane.ts launch <wl> --requested-by merge-train`. Steps 3b-3d need the standing workload; without it they
+// are skipped and logged. Exit: 0 the pass ran (logged errors included), 1 the ledger could not be opened, 2 an argument was given.
 import { defaultLedgerPath, Ledger } from "../../ledger/src/index";
+import { ceilingStopped } from "../src/ceiling";
+import { loadTestRunnerConfig } from "../src/close-entry";
 import { attempts, controlEntries, heldLive, holdersOf, LANE_SCRIPT, launchRequestedBody, pendingRequests } from "../src/launch";
 import {
-	actionable, type AlertAction, checkoutOwnerRepo, forkOf, forkTaskAlert, openTrainFix, openTrains, ownerDeliveries, prStakes, raiseTwiceFailed, settleTasks, TASK_VIEW_FIELDS,
+	actionable, type AlertAction, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, checkoutOwnerRepo, expiredHolds, forkOf, forkTaskAlert,
+	isTrainOrFix, type Landing, landingReady, mainRedNoticeBody, mainRedNotices, mainRedRows, openTrainFix, openTrains, ownerDeliveries, PROTECTION_UNKNOWN_RAISE_MS,
+	protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState, protectionPassOvers, prStakes, raiseTwiceFailed, settleTasks, TASK_VIEW_FIELDS,
 	type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertActions, trainAlertBody,
-	trainAlertEndBody, trainAlertMarker, trainCheckout, trainHeadWokenBody, trainPrs, trainPushesOf, trainRetries, trainSliceId, type TrainPush, type TrainTask, twiceFailed,
-	unsettledTasks,
+	trainAlertEndBody, trainAlertMarker, trainAutoboardBody, trainBoardSkipBody, trainCheckout, trainHeadWokenBody, trainPrs, trainPushesOf, trainRetries, trainSliceId,
+	type TrainPush, type TrainTask, trainWakeBody, twiceFailed, unsettledTasks,
 } from "../src/merge-train";
-import { bodyDeps } from "../src/merge-train-stack";
-import { testRuns } from "../src/test-run";
-import { MERGE_TRAIN_BY } from "../src/types";
+import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
+import { DECISION_LOG_DIR, SHA_RE, type TestRunnerConfig, testRuns } from "../src/test-run";
+import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID } from "../src/types";
 
 /** One gh process: its exit code and output. */
 export interface GhResult {
@@ -65,6 +91,8 @@ export interface TickDeps {
 	launch: (wl: string) => { code: number; line: string };
 	/** A macOS notification with sound; false when it could not be shown. */
 	notify: (title: string, text: string) => boolean;
+	/** The test runner's served repositories (`testRunner.repos`, profile/config.yml): only their PRs board (D1); none, nothing boards. */
+	config?: Pick<TestRunnerConfig, "repos">;
 	log?: (line: string) => void;
 }
 
@@ -121,15 +149,25 @@ export function tick(d: TickDeps): string[] {
 		if (last?.body !== body) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body });
 		say(`${wl}: ${body}`);
 	};
-	/** Write `launch-requested: by merge-train` unless one is pending already (`pendingRequests`), then run the launcher; its exit code. */
-	const request = (wl: string, reason: string): number => {
+	/**
+	 * Write `launch-requested: by merge-train` unless one is pending already (`pendingRequests`), then run the launcher: its exit
+	 * code, whether this call wrote the request, and the id now pending. Null, with no request or launcher, when stopped at the
+	 * ceiling (`ceilingStopped`, PLAN wl-mvgn310dpi5gcg D3).
+	 */
+	const request = (wl: string, reason: string): { code: number; wrote: boolean; requestId: string } | null => {
 		const entries = ledger.entries(wl);
-		if (pendingRequests(controlEntries(entries, holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl)))).length === 0) {
-			ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody(MERGE_TRAIN_BY, ledger.now(), reason) });
+		const w = ledger.workload(wl);
+		const control = controlEntries(entries, holdersOf(entries, w?.holder ?? null, ledger.holders(wl)));
+		const stopped = w ? ceilingStopped(control, ledger.instructions(wl), w.stakes) : null;
+		if (stopped) {
+			say(`${wl}: launch (${reason}) not requested: stopped at its ceiling usd ${stopped.spend.usd} of ${stopped.ceiling.usd}`);
+			return null;
 		}
+		const pending = pendingRequests(control)[0];
+		const requestId = pending?.id ?? ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody(MERGE_TRAIN_BY, ledger.now(), reason) });
 		const r = d.launch(wl);
 		say(`${wl}: launch (${reason}): exit ${r.code}: ${r.line}`);
-		return r.code;
+		return { code: r.code, wrote: pending === undefined, requestId };
 	};
 
 	// 1-2. Facts and settles, per train.
@@ -221,7 +259,8 @@ export function tick(d: TickDeps): string[] {
 				say(`${t.train}: #${t.pr} task ${t.id}: head on a fork, settled failed${q ? `, alert question ${q}` : ""}`);
 				continue;
 			}
-			const r = openTrainFix(ledger, { task: t, repo: facts.repo, checkout: facts.checkout, view, stakes: prStakes(view, facts.repo, ledger).stakes });
+			const s = prStakes(view, facts.repo, ledger);
+			const r = openTrainFix(ledger, { task: t, repo: facts.repo, checkout: facts.checkout, view, stakes: s.stakes === "production" ? "production" : "normal" });
 			say(`${t.train}: #${t.pr} task ${t.id}: fix workload ${r.workloadId} ${r.opened ? "opened" : "reused"}`);
 		} catch (err) {
 			trainError(t.train, err);
@@ -234,19 +273,75 @@ export function tick(d: TickDeps): string[] {
 		request(del.owner, `train task ${del.task.id} on #${del.task.pr}`);
 	}
 
+	// 3b-3d. Boarding, main's protection, red main: rows on the standing workload, so none runs without it.
+	/** A train's repository as lowercase `owner/repo` (step 1's, else its checkout's origin); null when it has none. */
+	const repos = new Map<string, string | null>();
+	const repoOf = (wl: string): string | null => {
+		if (!repos.has(wl)) {
+			const checkout = factsOf(wl)?.checkout ?? trainCheckout(ledger, wl);
+			const repo = factsOf(wl)?.repo ?? (checkout === null ? null : checkoutOwnerRepo(checkout));
+			repos.set(wl, repo?.toLowerCase() ?? null);
+		}
+		return repos.get(wl)!;
+	};
+	let notices: { wake: Map<string, string>; open: Set<string> } = { wake: new Map(), open: new Set() };
+	if (!ledger.workload(STANDING_WORKLOAD_ID)) say(`${STANDING_WORKLOAD_ID}: no standing workload: boarding, protection and red-main notices skipped`);
+	else {
+		if (autoboardCutover(ledger) === null) {
+			const body = trainAutoboardBody(ledger.now());
+			ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+			say(`${STANDING_WORKLOAD_ID}: ${body}`);
+		}
+		const boardable = boardingPass(d, ghJson, say);
+		const ops = issueOps(d, ghJson);
+		// D6's read set: a repo with an open train holding a non-terminal PR, a boardable PR, or an open episode (protectionPass).
+		const read = new Set(boardable.map((b) => b.l.repo.toLowerCase()));
+		for (const wl of openTrains(ledger)) {
+			const repo = repoOf(wl);
+			const pending = trainPrs(ledger.entries(wl), ledger.instructions(wl)).some((n) => {
+				const sl = ledger.slice(trainSliceId(wl, n));
+				return !(sl && (sl.state === "done" || sl.state === "cancelled"));
+			});
+			if (repo !== null && pending) read.add(repo);
+		}
+		notices = protectionPass(d, ghJson, ops, say, read, repoOf);
+		mainRedPass(d, ghJson, ops, say);
+	}
+
 	// 4. Wakes.
 	for (const wl of openTrains(ledger)) {
 		const w = ledger.workload(wl);
 		if (!w || heldLive(w, ledger.now())) continue;
 		const facts = factsOf(wl);
 		const heads = new Map([...(facts?.views ?? [])].map(([n, v]) => [n, v.headRefOid]));
+		// An `until jo` hold ends when the PR's stakes, read now, no longer hold it until Jo (`expiredHolds`); no view, no answer.
+		const stakesOf = (n: number) => {
+			const v = facts?.views.get(n);
+			return facts && v ? prStakes(v, facts.repo, ledger) : null;
+		};
 		const untested = trainRetries(ledger, wl, heads).untested;
-		const why = actionable(ledger, wl, facts?.mergedDeps ?? [], heads);
-		// A head the train has not worked: its wake is recorded only when the launcher started a lane, so a failed launch is
-		// retried next pass, and a started lane that ends without working the head is retried under the backoff (`trainRetries`).
-		if (why.length > 0 && request(wl, why.join("; ")) === 0) {
-			for (const h of untested) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainHeadWokenBody(h.pr, h.sha) });
+		const expired = expiredHolds(ledger, wl, stakesOf);
+		// D6: while the repo's protection episode is open, a PR passed over for protection waits; its clearing wakes the train.
+		const held = notices.open.has(repoOf(wl) ?? "") ? protectionPassOvers(ledger, wl) : new Set<number>();
+		const why = actionable(ledger, wl, facts?.mergedDeps ?? [], heads, held, stakesOf);
+		const cleared = notices.wake.get(wl);
+		if (cleared !== undefined) why.push(cleared);
+		// A head the train has not worked: one wake per request the tick made for it, whichever starter serves the request, so a
+		// request refused here and served by another starter still counts. A request still pending when the head is due again is
+		// the same wake, not a second (PLAN wl-mvgn310dpi5gcg D1); the head stays retried under the backoff (`trainRetries`).
+		// An expired hold is consumed by a new or pending request, even if the capped launcher leaves it for the drain to serve.
+		// A ceiling refusal writes no request and consumes neither a head wake nor a hold's expiry.
+		const r = why.length > 0 ? request(wl, why.join("; ")) : null;
+		if (r && (r.wrote || r.code === 0)) {
+			const after = ledger.entries(wl);
+			const from = after.findIndex((e) => e.id === r.requestId);
+			for (const h of untested) {
+				const body = trainHeadWokenBody(h.pr, h.sha);
+				if (after.some((e, i) => i >= from && e.created_by === MERGE_TRAIN_BY && e.kind === "assumption" && e.body === body)) continue;
+				ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body });
+			}
 		}
+		if (r) for (const h of expired) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainWakeBody(h.pr, h.holdId) });
 	}
 
 	// 5. Alerts.
@@ -283,53 +378,294 @@ function issueNumber(url: string): string {
 	return m[1]!;
 }
 
-/** One alert action's effects (D9's send ladder, or the close after Jo's answer). */
-function alert(d: TickDeps, facts: TrainFacts, a: AlertAction, ghJson: (args: string[]) => unknown, say: (line: string) => void): void {
+/** A candidate that passed both halves of D1 this pass: its landing and the live head it boards at. */
+interface Boardable {
+	l: Extract<Landing, { ready: true }>;
+	head: string;
+}
+
+/**
+ * Step 3b (D1, D3, D4): scan the candidates, newest close first, through `landingReady` and the live half (`liveHalf`), then board
+ * the ready ones oldest close first (`boardLanding`). A candidate that cannot board gets `train-board-skip:` once per (W, pr, head,
+ * reason); a gh failure is logged only (retried next pass). Returns the PRs that passed both halves, boarded or not.
+ */
+function boardingPass(d: TickDeps, ghJson: (args: string[]) => unknown, say: (line: string) => void): Boardable[] {
 	const { ledger } = d;
-	const { q, pr, reason, options, record } = a.alert;
-	const write = (body: string) => ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: facts.wl, kind: "assumption", body });
-	const failed = (args: string[], r: GhResult) =>
-		new GhError(`gh ${args.slice(0, 3).join(" ")} exited ${r.code}: ${(r.stderr.trim() || r.stdout.trim()).split("\n").at(-1) ?? ""}`);
-	const run = (args: string[]): string => {
-		const r = d.gh(args);
-		if (r.code !== 0) throw failed(args, r);
-		return r.stdout;
+	const served = d.config?.repos ?? [];
+	const { bodies, ended } = boardSkips(ledger);
+	const skip = (wl: string, pr: number | null, head: string | null, reason: string) => {
+		const body = trainBoardSkipBody(wl, pr, head, reason);
+		if (bodies.has(body)) return;
+		bodies.add(body);
+		ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+		say(`${STANDING_WORKLOAD_ID}: ${body}`);
 	};
+	// No served repository (the config unread): nothing to scan, and no skip row that would only say so.
+	if (served.length === 0) return [];
+	const covered = boardedWorkloads(ledger);
+	const origins = new Map<string, string | null>();
+	const ownerRepo = (checkout: string) => {
+		if (!origins.has(checkout)) origins.set(checkout, checkoutOwnerRepo(checkout));
+		return origins.get(checkout)!;
+	};
+	const ready: Boardable[] = [];
+	for (const wl of autoboardCandidates(ledger)) {
+		// A train or fix workload is no landing; a W a board covers, or whose PR ended, is not read again (D1).
+		if (ended.has(wl) || covered.has(wl) || isTrainOrFix(ledger.entries(wl), ledger.instructions(wl))) continue;
+		const l = landingReady(ledger, wl, { config: { repos: served }, ownerRepo });
+		if (!l.ready) {
+			skip(wl, l.pr, l.sha, l.reason);
+			continue;
+		}
+		try {
+			const live = liveHalf(ledger, l, ghJson);
+			if (live.ok) ready.push({ l, head: live.head });
+			else skip(wl, l.pr, live.head, live.reason);
+		} catch (err) {
+			say(`${wl}: board #${l.pr}: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+	ready.sort((a, b) => a.l.closedAt.localeCompare(b.l.closedAt) || a.l.workloadId.localeCompare(b.l.workloadId));
+	for (const b of ready) {
+		const r = boardLanding(ledger, b.l, { head: b.head });
+		if (r.boarded) say(`${r.train}: #${b.l.pr} of ${b.l.workloadId} boarded at ${b.head}${r.opened ? ", train opened" : ""} (${r.entryId})`);
+		else skip(b.l.workloadId, b.l.pr, b.head, r.reason);
+	}
+	return ready;
+}
+
+/** GitHub's get-a-commit lists at most this many files across its pages (300 a page): a commit listing this many may have more. */
+const COMMIT_FILES_CAP = 3000;
+
+/**
+ * D1's live half for ready landing `l`: `gh pr view <n> --json <TASK_VIEW_FIELDS>,state,baseRefName,isDraft` shows it OPEN, no
+ * draft, based on main, its head branch exactly `wl/<W>` with `prStakes` normal (same repository, no fork); and its head is the
+ * green sha G, or ahead of G (`gh api repos/<r>/compare/<G>...<head>`) only by commits each touching only .ai/decision-log/
+ * (`gh api repos/<r>/commits/<sha> --paginate --slurp`, each commit's own files over every page, never the net diff; a rename's
+ * `previous_filename` too, review wl-mvbjiettjrfpxc r1 #2). A commit listing COMMIT_FILES_CAP files may have more GitHub does not
+ * list, so it never boards. A failed or unreadable gh call throws.
+ */
+function liveHalf(ledger: Ledger, l: Extract<Landing, { ready: true }>, ghJson: (args: string[]) => unknown): { ok: true; head: string } | { ok: false; head: string | null; reason: string } {
+	const v = ghJson(["pr", "view", String(l.pr), "-R", l.repo, "--json", `${TASK_VIEW_FIELDS},state,baseRefName,isDraft`]);
+	const view = taskViewOf(v);
+	const [state, base, draft] = [field(v, "state"), field(v, "baseRefName"), field(v, "isDraft")];
+	if (!view || view.number !== l.pr || typeof state !== "string" || typeof base !== "string" || typeof draft !== "boolean") {
+		throw new GhError(`gh pr view ${l.pr} returned an unexpected shape`);
+	}
+	const head = view.headRefOid;
+	const no = (reason: string) => ({ ok: false as const, head, reason });
+	if (state === "MERGED" || state === "CLOSED") return no(`${BOARD_ENDED} #${l.pr} is ${state} on GitHub`);
+	if (state !== "OPEN") return no(`#${l.pr} is ${state}`);
+	if (draft) return no(`#${l.pr} is a draft`);
+	if (base !== DEFAULT_BRANCH) return no(`#${l.pr}'s base is ${base}, not ${DEFAULT_BRANCH}`);
+	if (view.headRefName !== `wl/${l.workloadId}`) return no(`#${l.pr}'s head branch ${view.headRefName} is not wl/${l.workloadId}`);
+	const stakes = prStakes(view, l.repo, ledger);
+	// A PR its workload's plan holds (PLAN wl-mvfkv7llkp7nk0 § 3) does not board; a later pass boards it once the hold has ended.
+	if (stakes.stakes === "hold") return no(`#${l.pr} is held: ${stakes.reason} until ${stakes.until}`);
+	if (stakes.stakes !== "normal") return no(`#${l.pr} is production: ${stakes.reason}`);
+	if (head === l.sha) return { ok: true, head };
+	const cmp = ghJson(["api", `repos/${l.repo}/compare/${l.sha}...${head}`]);
+	const [status, commits, total] = [field(cmp, "status"), field(cmp, "commits"), field(cmp, "total_commits")];
+	if (typeof status !== "string" || !Array.isArray(commits) || typeof total !== "number") throw new GhError(`gh api repos/${l.repo}/compare returned an unexpected shape`);
+	if (status !== "ahead") return no(`head ${head} is not ahead of the green sha ${l.sha} (compare: ${status})`);
+	if (commits.length !== total) return no(`head ${head} is ${total} commits ahead of ${l.sha}, more than the compare lists (${commits.length})`);
+	for (const c of commits as unknown[]) {
+		const sha = field(c, "sha");
+		if (typeof sha !== "string" || !SHA_RE.test(sha)) throw new GhError(`gh api repos/${l.repo}/compare listed a commit with no sha`);
+		// Every page of the commit's files: an array of pages, each the commit object with its share of `files`.
+		const pages = ghJson(["api", `repos/${l.repo}/commits/${sha}`, "--paginate", "--slurp"]);
+		const files = Array.isArray(pages) && pages.length > 0 ? (pages as unknown[]).map((p) => field(p, "files")) : null;
+		if (files === null || !files.every(Array.isArray)) throw new GhError(`gh api repos/${l.repo}/commits/${sha} returned an unexpected shape`);
+		const entries = (files as unknown[][]).flat();
+		if (entries.length >= COMMIT_FILES_CAP) return no(`commit ${sha} after the green sha lists ${entries.length} files, the most GitHub lists; its other files cannot be read`);
+		for (const f of entries) {
+			// A rename touches the path it left as well as the one it made; a rename that names no previous path fails closed.
+			const prev = field(f, "previous_filename");
+			const paths = [field(f, "filename"), ...(prev !== undefined || field(f, "status") === "renamed" ? [prev] : [])];
+			const i = paths.findIndex((p) => typeof p !== "string" || !p.startsWith(DECISION_LOG_DIR));
+			if (i >= 0) return no(`commit ${sha} after the green sha touches ${String(paths[i])}, not only ${DECISION_LOG_DIR}`);
+		}
+	}
+	return { ok: true, head };
+}
+
+/**
+ * Step 3c (D6): main's protection per repository in `read` and per repository with an open episode, read live; the episode's
+ * rows, issue and clearing. Returns the trains to wake (a cleared episode's protection pass-overs) and the repositories whose
+ * episode is still open (their protection pass-overs get no backoff wake).
+ */
+function protectionPass(
+	d: TickDeps, ghJson: (args: string[]) => unknown, ops: IssueOps, say: (line: string) => void, read: Set<string>, repoOf: (wl: string) => string | null,
+): { wake: Map<string, string>; open: Set<string> } {
+	const { ledger } = d;
+	const write = (repo: string, state: ProtectionNoticeState, text: string) => {
+		const body = protectionNoticeBody(repo, state, text);
+		ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+		say(`${STANDING_WORKLOAD_ID}: ${body}`);
+	};
+	const marker = (repo: string, raised: string) => `<!-- train-notice protection ${repo} ${raised} -->`;
+	for (const ep of protectionEpisodes(ledger).values()) if (ep.raised) read.add(ep.repo);
+	const wake = new Map<string, string>();
+	for (const repo of [...read].sort()) {
+		try {
+			const p = protectionGap(repo, ghJson);
+			const text = (p.state === "ok" ? "verified" : p.text).replace(/\s+/g, " ").trim();
+			const last = protectionEpisodes(ledger).get(repo)?.read ?? null;
+			// One row per change among ok, unknown and gap; a gap whose text changed is a new gap row.
+			if (last === null || last.state !== p.state || (p.state === "gap" && last.text !== text)) write(repo, p.state, text);
+			let ep = protectionEpisodes(ledger).get(repo)!;
+			if (p.state === "ok") {
+				if (ep.raised === null) continue;
+				const url = ep.issue ?? ops.marked(marker(repo, ep.raised.id));
+				if (url !== null) closeNotice(ops, ghJson, url, `Main's protection on ${repo} verifies again; the merge train goes on (as2).`);
+				write(repo, "cleared", `verified again${url === null ? "" : `; ${url} closed`}`);
+				for (const t of openTrains(ledger)) {
+					if (repoOf(t) === repo && protectionPassOvers(ledger, t).size > 0) wake.set(t, `main protection on ${repo} verified again`);
+				}
+				continue;
+			}
+			if (ep.raised === null) {
+				if (ep.read!.state === "unknown" && Date.parse(ledger.now()) - Date.parse(ep.read!.createdAt) < PROTECTION_UNKNOWN_RAISE_MS) continue;
+				write(repo, "raised", text);
+				ep = protectionEpisodes(ledger).get(repo)!;
+			}
+			if (ep.issue === null) {
+				const url = fileNotice(ops, marker(repo, ep.raised!.id), `merge train: main protection on ${repo} is unverified`, [
+					`Main's protection on ${repo} could not be verified (${ep.read!.state}): ${ep.text}`,
+					"",
+					"The merge train passes its normal-stakes PRs over (no merge, no question) until it verifies; the train tick reads it every pass.",
+					"This issue closes itself when the protection verifies again.",
+				].join("\n"));
+				write(repo, "filed", url);
+			}
+		} catch (err) {
+			say(`${STANDING_WORKLOAD_ID}: protection ${repo}: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+	return { wake, open: new Set([...protectionEpisodes(ledger).values()].filter((e) => e.raised !== null).map((e) => e.repo)) };
+}
+
+/**
+ * Step 3d (D7): each valid holder `main-red:` row raises once per url (`raised`, the needs-you line), its jo-issues issue is filed
+ * once (`filed`), and once the main-red issue is CLOSED the jo-issues issue is closed and `cleared` written. A url that is no
+ * issue on the train's own repository is logged only.
+ */
+function mainRedPass(d: TickDeps, ghJson: (args: string[]) => unknown, ops: IssueOps, say: (line: string) => void): void {
+	const { ledger } = d;
+	const write = (url: string, state: "raised" | "filed" | "cleared", text: string) => {
+		const body = mainRedNoticeBody(url, state, text);
+		ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+		say(`${STANDING_WORKLOAD_ID}: ${body}`);
+	};
+	const seen = new Set(mainRedNotices(ledger).keys());
+	for (const r of mainRedRows(ledger)) {
+		if (!r.valid) {
+			say(`${r.train}: main-red ${r.url} (${r.entryId}) is not an issue on ${r.repo ?? "the train's repository"}: not raised`);
+			continue;
+		}
+		if (seen.has(r.url)) continue;
+		seen.add(r.url);
+		write(r.url, "raised", `run ${r.run}`);
+	}
+	for (const n of mainRedNotices(ledger).values()) {
+		if (n.cleared !== null) continue;
+		try {
+			const [, repo, num] = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/issues\/(\d+)$/.exec(n.url)!;
+			let issue = n.issue;
+			if (issue === null) {
+				issue = fileNotice(ops, `<!-- train-notice main-red ${n.url} -->`, `merge train: main is red on ${repo}`, [
+					`Main is red on ${repo}: ${n.url} (merge train run ${n.run}).`,
+					"",
+					"The merge train keeps merging PRs that add no failure (red-main); this issue closes itself when that issue closes.",
+				].join("\n"));
+				write(n.url, "filed", issue);
+			}
+			if (field(ghJson(["issue", "view", num!, "-R", repo!, "--json", "state"]), "state") !== "CLOSED") continue;
+			closeNotice(ops, ghJson, issue, `${n.url} is closed (as2).`);
+			write(n.url, "cleared", `${n.url} closed`);
+		} catch (err) {
+			say(`${STANDING_WORKLOAD_ID}: main-red ${n.url}: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+}
+
+/** The jo-issues helpers the alerts (D9) and the notices (D6, D7) share. */
+interface IssueOps {
+	/** A gh call that must succeed; its stdout. */
+	run: (args: string[]) => string;
 	/**
 	 * The url of the issue the train filed whose body carries `marker`, any state; null only when the whole listing has none. A
 	 * failed or unreadable listing throws: the caller writes nothing durable and the next pass looks again.
 	 */
-	const marked = (marker: string): string | null => {
-		const pages = ghJson(ISSUE_LIST_ARGS);
-		if (!Array.isArray(pages) || !pages.every(Array.isArray)) throw new GhError(`gh api repos/${TRAIN_ALERT_REPO}/issues returned an unexpected shape`);
-		for (const i of pages.flat() as unknown[]) {
-			if (typeof i !== "object" || i === null) throw new GhError(`gh api repos/${TRAIN_ALERT_REPO}/issues returned an unexpected shape`);
-			const body = field(i, "body");
-			if (typeof body !== "string" || !body.includes(marker)) continue;
-			const url = field(i, "html_url");
-			if (typeof url !== "string" || url === "") throw new GhError(`gh api repos/${TRAIN_ALERT_REPO}/issues: the issue carrying ${marker} has no html_url`);
-			return url;
-		}
-		return null;
-	};
+	marked: (marker: string) => string | null;
 	/**
 	 * A gh call that adds labels; its stdout. A failure is retried once, and only when gh says one of `labels` is missing
 	 * (`'<label>' not found`), after each label is created (one that exists already fails harmlessly). `took`, when given, is
 	 * asked after every failure whether the call took effect anyway (an issue create whose reply was lost): its answer is
 	 * returned and nothing is retried.
 	 */
-	const labelled = (args: string[], labels: readonly string[], took?: () => string | null): string => {
-		let r = d.gh(args);
-		for (let retried = false; r.code !== 0; retried = true) {
-			const done = took?.() ?? null;
-			if (done !== null) return done;
-			const text = `${r.stderr}\n${r.stdout}`;
-			if (retried || !labels.some((l) => text.includes(`'${l}' not found`))) throw failed(args, r);
-			for (const l of labels) d.gh(["label", "create", l, "-R", TRAIN_ALERT_REPO, "--description", "filed by the as2 merge train"]);
-			r = d.gh(args);
-		}
-		return r.stdout;
+	labelled: (args: string[], labels: readonly string[], took?: () => string | null) => string;
+}
+
+function issueOps(d: TickDeps, ghJson: (args: string[]) => unknown): IssueOps {
+	const failed = (args: string[], r: GhResult) =>
+		new GhError(`gh ${args.slice(0, 3).join(" ")} exited ${r.code}: ${(r.stderr.trim() || r.stdout.trim()).split("\n").at(-1) ?? ""}`);
+	return {
+		run: (args) => {
+			const r = d.gh(args);
+			if (r.code !== 0) throw failed(args, r);
+			return r.stdout;
+		},
+		marked: (marker) => {
+			const pages = ghJson(ISSUE_LIST_ARGS);
+			if (!Array.isArray(pages) || !pages.every(Array.isArray)) throw new GhError(`gh api repos/${TRAIN_ALERT_REPO}/issues returned an unexpected shape`);
+			for (const i of pages.flat() as unknown[]) {
+				if (typeof i !== "object" || i === null) throw new GhError(`gh api repos/${TRAIN_ALERT_REPO}/issues returned an unexpected shape`);
+				const body = field(i, "body");
+				if (typeof body !== "string" || !body.includes(marker)) continue;
+				const url = field(i, "html_url");
+				if (typeof url !== "string" || url === "") throw new GhError(`gh api repos/${TRAIN_ALERT_REPO}/issues: the issue carrying ${marker} has no html_url`);
+				return url;
+			}
+			return null;
+		},
+		labelled: (args, labels, took) => {
+			let r = d.gh(args);
+			for (let retried = false; r.code !== 0; retried = true) {
+				const done = took?.() ?? null;
+				if (done !== null) return done;
+				const text = `${r.stderr}\n${r.stdout}`;
+				if (retried || !labels.some((l) => text.includes(`'${l}' not found`))) throw failed(args, r);
+				for (const l of labels) d.gh(["label", "create", l, "-R", TRAIN_ALERT_REPO, "--description", "filed by the as2 merge train"]);
+				r = d.gh(args);
+			}
+			return r.stdout;
+		},
 	};
+}
+
+/** A notice's jo-issues issue (D6, D7): the one carrying `marker` in any state, else one created with the as2-train label; its url. */
+function fileNotice(ops: IssueOps, marker: string, title: string, body: string): string {
+	const found = ops.marked(marker);
+	if (found !== null) return found;
+	const args = ["issue", "create", "-R", TRAIN_ALERT_REPO, "--label", TRAIN_ALERT_LABEL, "--title", title, "--body", `${marker}\n${body}`];
+	const url = ops.labelled(args, [TRAIN_ALERT_LABEL], () => ops.marked(marker)).trim().split("\n").filter(Boolean).at(-1) ?? "";
+	issueNumber(url);
+	return url;
+}
+
+/** Close a notice's jo-issues issue with `comment`, unless it is closed already. */
+function closeNotice(ops: IssueOps, ghJson: (args: string[]) => unknown, url: string, comment: string): void {
+	const n = issueNumber(url);
+	if (field(ghJson(["issue", "view", n, "-R", TRAIN_ALERT_REPO, "--json", "state"]), "state") !== "CLOSED") ops.run(["issue", "close", n, "-R", TRAIN_ALERT_REPO, "--comment", comment]);
+}
+
+/** One alert action's effects (D9's send ladder, or the close after Jo's answer). */
+function alert(d: TickDeps, facts: TrainFacts, a: AlertAction, ghJson: (args: string[]) => unknown, say: (line: string) => void): void {
+	const { ledger } = d;
+	const { q, pr, reason, options, record } = a.alert;
+	const write = (body: string) => ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: facts.wl, kind: "assumption", body });
+	const { run, marked, labelled } = issueOps(d, ghJson);
 	if (a.kind === "close") {
 		const answer = q.resolved_by ? ledger.instructions(facts.wl).find((i) => i.id === q.resolved_by)?.body.trim() : undefined;
 		const why = q.state === "answered" ? `Jo answered ${answer ?? "it"}` : `Jo ${q.state} it`;
@@ -433,8 +769,11 @@ function main(argv: string[]): number {
 		return 1;
 	}
 	try {
-		const stamp = () => new Date().toISOString();
-		tick({ ledger, gh: realGh, launch: realLaunch, notify: realNotify, log: (l) => process.stdout.write(`${stamp()} ${l}\n`) });
+		const log = (l: string) => process.stdout.write(`${new Date().toISOString()} ${l}\n`);
+		// D1 boards only on the repositories the test runner serves, read as its starter reads them.
+		const cfg = loadTestRunnerConfig(process.env);
+		if (!cfg.ok) log(`testRunner config unreadable (${cfg.error}): nothing boards this pass`);
+		tick({ ledger, gh: realGh, launch: realLaunch, notify: realNotify, log, ...(cfg.ok ? { config: cfg.config } : {}) });
 		return 0;
 	} finally {
 		ledger.close();

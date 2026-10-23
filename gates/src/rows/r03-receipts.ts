@@ -19,6 +19,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { SURFACE_READ_TOOLS, SURFACE_TOOLS } from "../../../surface/src/types";
 import { bashCommand } from "../exec";
+import { linkedPaths } from "../links";
 import { WRITE_TOOLS } from "../targets";
 import { TEST_RUN } from "../test-run";
 import { readOnlyBash } from "./r15-orchestrator-role";
@@ -113,8 +114,11 @@ export function checkReceipts(message: string, history: HistoryEvent[], cwd: str
 	// that the lines were read (astra review S2).
 	for (const b of bs) {
 		if (b.label === "CLAIM") {
-			for (const m of b.text.matchAll(/(\/[^\s`'":]+):(\d+)(?:-(\d+))?/g)) {
-				const [, path, from, to] = m;
+			const receipts=linkedPaths(b.text,true);
+			for (const [index, { path, line, end:receiptEnd }] of receipts.entries()) {
+				if (!line) continue;
+				const [position, to] = line.split("-");
+				const from = position!.split(":")[0]!;
 				if (!existsSync(path!) || !statSync(path!).isFile()) {
 					flags.push(`CLAIM cites ${path}:${from}, which does not exist on disk`);
 					continue;
@@ -124,8 +128,8 @@ export function checkReceipts(message: string, history: HistoryEvent[], cwd: str
 				const end = to ? Number(to) : start;
 				if (start < 1 || end > fileLines.length) flags.push(`CLAIM cites ${path}:${from}${to ? `-${to}` : ""}, past the file's ${fileLines.length} lines`);
 				if (!readPaths.has(path!)) flags.push(`CLAIM cites ${path}, which was not read this session`);
-				const after = b.text.slice(m.index! + m[0].length);
-				const quote = /`([^`\n]{8,})`|"([^"\n]{8,})"/.exec(after.split(/\/[^\s`'":]+:\d+/)[0]!);
+				const after = b.text.slice(receiptEnd,receipts[index+1]?.start ?? b.text.length);
+				const quote = /`([^`\n]{8,})`|"([^"\n]{8,})"/.exec(after);
 				if (quote) {
 					const want = norm(quote[1] ?? quote[2]!);
 					const window = norm(fileLines.slice(Math.max(0, start - 4), end + 3).join("\n"));

@@ -9,7 +9,7 @@ import {
 import { INCIDENT_DETAIL_MAX, incidentBody, nextRetry, parseIncident, progressAfter, recordIncidentOnce, RELAUNCH_BACKOFF_MS, RETRY_LIMIT } from "../src/incident";
 import {
 	causeText, consumedIds, attempts, controlEntries, decideLaunch, holdersOf, laneDiedExitBody, laneExitBody, laneStartedBody, launchFailedBody, launchRequestedBody,
-	laneStopAcceptedBody, laneStopRequestBody, prBindingInstructionBody, verdictOf,
+	laneStopAcceptedBody, laneStopRequestBody, prBindingInstructionBody, trainBoardBody, verdictOf,
 } from "../src/launch";
 import { briefHash, formatSignal, goalsHash, rankDay, type SignalAnswers } from "../src/rank";
 import { pendingRequest, type RankConfig, rankGate } from "../src/rank-launch";
@@ -269,7 +269,7 @@ describe("relaunch due (§ 1.3): a died lane with an open slice, no open questio
 		expect(x.verdict()).toEqual({ launch: false, reason: "held" });
 	});
 
-	test("not relaunched: paused-only slices, the runner's ceiling slice alone, an open question, a receipt, user-driven, closed", () => {
+	test("not relaunched: paused-only slices, an open question, a receipt, user-driven, closed", () => {
 		const paused = world();
 		paused.slice("paused");
 		paused.launch(1, "first");
@@ -277,13 +277,6 @@ describe("relaunch due (§ 1.3): a died lane with an open slice, no open questio
 		paused.died(1);
 		expect(paused.state()).toEqual({ kind: "none" });
 		expect(paused.verdict()).toEqual({ launch: false, reason: "died-not-relaunched" });
-
-		const ceiling = world();
-		ceiling.slice("open", { id: "sl-ceiling-1", created_by: LANE_RUNNER_BY });
-		ceiling.launch(1, "first");
-		ceiling.exit(1, "error");
-		ceiling.died(1);
-		expect(ceiling.state()).toEqual({ kind: "none" });
 
 		const asked = launched();
 		asked.question(lane(1), asked.slices[0]!.id, "open");
@@ -864,6 +857,18 @@ describe("the merge-train workload is outside the relaunch (§ 1.8)", () => {
 		x.exit(1, "open-work");
 		x.died(1);
 		expect(x.end(1)).toEqual({ kind: "died" });
+		expect(x.state()).toEqual({ kind: "none" });
+		expect(x.verdict()).toEqual({ launch: false, reason: "died-not-relaunched" });
+		const req = x.request("train");
+		expect(x.verdict()).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+	});
+	test("a board-only train also stays outside automatic dead-lane retries", () => {
+		const x = world();
+		x.entry(MERGE_TRAIN_BY, trainBoardBody({ pr: 12, workload: "wl-owner", head: "a".repeat(40), run: null, review: null }));
+		x.slice("open");
+		x.launch(1, "first");
+		x.exit(1, "open-work");
+		x.died(1);
 		expect(x.state()).toEqual({ kind: "none" });
 		expect(x.verdict()).toEqual({ launch: false, reason: "died-not-relaunched" });
 		const req = x.request("train");

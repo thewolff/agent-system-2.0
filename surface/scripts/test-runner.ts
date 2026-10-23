@@ -13,7 +13,8 @@
 //       ` bound-by <instruction id>` when only Jo's binding admitted the PR, exit 0. A refusal is one
 //       stderr line `test-runner start: <reason>` and exit 2; a failure the same, exit 3; usage exit 1.
 //   run <run id>
-//       the detached run: heartbeat at once, the runs.db lock (queued while another run holds it), `current` published
+//       the detached run: heartbeat at once, the runs.db lock (queued while another run holds it; queued runs take it oldest
+//       request first, by their `test-requested:` entry's time in runs.db's `queue` table, skipping dead waiters), `current` published
 //       in the acquiring transaction, the install check (a drifted bundle is refreshed once through `sudo -n
 //       <libexec>/refresh`), sweep, probe, retention, the trusted clone and bundle, then every untrusted step through
 //       `sudo -n -u _as2test <exec> …`, a sweep after each part, then each failing part rerun on base when every part reported
@@ -23,6 +24,11 @@
 //       that sha for any PR (green and red-main success, red failure, error error; stale and superseded post none; PLAN
 //       wl-mv8s8srodefytc rev 17.1 D2, D8), and the lock released. No `pending` is posted: a missing status already blocks a
 //       protected merge. A failed status post is logged and never changes the verdict.
+//
+//       Parallel files (workload wl-mvg2kzuvwngdmo): the trusted phase writes the profile's `testRunner.fullWorkers` into
+//       caps.json beside the caps, and the run logs `<ts> full workers <n>` right before the PR full part; test-exec runs that
+//       part with `bun test --parallel=<n>` when n is over 1. Base reruns (`base-full`) stay serial whatever n is.
+//       surface/scripts/test-run-waits.ts reads the waits, the `full workers` lines and the results back per day.
 //
 // Stamps: everything is written as `test-runner` (TEST_RUNNER_BY).
 //
@@ -36,6 +42,7 @@
 //                                           install the preflight checks instead of the real one (`installSpec`)
 //   AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS   the heartbeat period (default 15 s)
 //   AGENT_SYSTEM_TEST_RUNNER_POLL_MS        the lock wait's poll (default 2 s)
+//   AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS    shared post-sweep head/result/publication deadline (default 150 s)
 //   AGENT_SYSTEM_TEST_RUNNER_BUSY_MS        runs.db busy_timeout (default 5 s)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS    the refresh helper's cap (default REFRESH_CAP_S plus a minute, 15 min)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS  its SIGTERM-to-SIGKILL grace (default 10 s)
@@ -46,9 +53,10 @@
 import { spawn, spawnSync, type Subprocess } from "bun";
 import { Database } from "bun:sqlite";
 import {
-	appendFileSync, chmodSync, closeSync, constants as FS, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync,
+	appendFileSync, chmodSync, closeSync, constants as FS, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, renameSync,
 	rmSync, type Stats, writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { assertNotLiveLedgerUnderTest, defaultLedgerPath, Ledger, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import {
@@ -62,8 +70,8 @@ import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
 	AS2TEST_ROOT, AS2TEST_USER, baseParts, boundBranches, buildTestRun, changedTestFiles, decideRun, fullSuiteSlice, HEARTBEAT_EVERY_MS,
 	heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
-	type PrView, pruneRuns, queuedTooLong, reportCapBytes, reservation, resultJson, RUN_ID_RE, type RunFacts, runDirOf, runnerDiedRun, runsDbOf, runsRoot,
-	servedRepo, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict,
+	type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, reportCapBytes, reservation, resultJson, RUN_ID_RE, type RunFacts, runDirOf, runnerDiedRun, type RunRecord,
+	runsDbOf, runsRoot, servedRepo, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict,
 	type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
 import { ORCHESTRATOR_RECIPIENT } from "../src/types";
@@ -211,11 +219,14 @@ function hookSync(runId: string, point: string, info: Record<string, unknown> = 
 	while (!existsSync(`${h.base}.go`)) Bun.sleepSync(25);
 	hookResume(h.base);
 }
-async function hook(runId: string, point: string, info: Record<string, unknown> = {}): Promise<void> {
+async function hook(runId: string, point: string, info: Record<string, unknown> = {}, deadline = Infinity): Promise<void> {
 	const h = hookMark(runId, point, info);
 	if (!h || !existsSync(`${h.base}.pause`)) return;
 	writeFileSync(`${h.base}.reached`, JSON.stringify({ pid: process.pid, at: Date.now(), ...info }));
-	while (!existsSync(`${h.base}.go`)) await Bun.sleep(25);
+	while (!existsSync(`${h.base}.go`)) {
+		if (Date.now() >= deadline) throw new Stop(`post-sweep deadline exceeded at ${point}`);
+		await Bun.sleep(25);
+	}
 	hookResume(h.base);
 }
 
@@ -229,7 +240,10 @@ export interface LockRow {
 	heartbeatAt: number;
 }
 
-/** `<root>/runs.db` with its one-row lock table; busy_timeout first. */
+/**
+ * `<root>/runs.db` with its one-row lock table and the `queue` table of the runs waiting for it (each waiter's request
+ * `created_at` in ms, `requestedAt`: the order they take the lock in); busy_timeout first.
+ */
 export function openLockDb(root: string, busyMs: number = msEnv("AGENT_SYSTEM_TEST_RUNNER_BUSY_MS", 5_000)): Database {
 	// Under test, a runs root or a runs.db (a symlink included) inside a live ledger root is refused before anything is created there.
 	assertNotLiveLedgerUnderTest(root);
@@ -240,6 +254,7 @@ export function openLockDb(root: string, busyMs: number = msEnv("AGENT_SYSTEM_TE
 	busyLoop(() => db.exec(
 		"CREATE TABLE IF NOT EXISTS lock (id INTEGER PRIMARY KEY CHECK (id = 1), runId TEXT NOT NULL, pid INTEGER NOT NULL, pgid INTEGER NOT NULL, runDir TEXT NOT NULL, heartbeatAt INTEGER NOT NULL)",
 	));
+	busyLoop(() => db.exec("CREATE TABLE IF NOT EXISTS queue (runId TEXT PRIMARY KEY, workloadId TEXT NOT NULL, requestedAt INTEGER NOT NULL)"));
 	return db;
 }
 
@@ -432,15 +447,16 @@ function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): 
 	const entries = ledger.entries(wl);
 	const instructions = ledger.instructions(wl);
 	const bound = boundBranches(wl, entries, holdersOf(entries, w.holder, ledger.holders(wl)));
-	// A fix workload's `train-fix:` binds its PR through the train's own `train:` entry (PLAN wl-mv8s8srodefytc rev 17.1 D8).
-	const jo = boundPrs(entries, instructions, ledger);
-	const admissible = prAdmissible(view, bound, jo.map((b) => b.pr));
+	// A train member is bound by Jo's `train:` or the tick's `train-board:` (PLAN wl-mvbjiettjrfpxc D2); a fix workload's
+	// `train-fix:` binds its PR through that membership entry on the train (PLAN wl-mv8s8srodefytc rev 17.1 D8).
+	const bindings = boundPrs(entries, instructions, ledger);
+	const admissible = prAdmissible(view, bound, bindings.map((b) => b.pr));
 	if (!admissible.ok) throw new Fail(admissible.reason, START_EXIT.refused);
 	// A merge train lands dependencies first (§ 1b): checked on gh before the reservation; off a train nothing changes.
 	const stacked = trainPrs(entries, instructions).length > 0 ? stackRefusal(ownerRepo, view) : null;
 	if (stacked !== null) throw new Fail(stacked, START_EXIT.refused);
-	// Admitted only through Jo's `test-pr` binding: the starter's line names the instruction, so every such run is traceable to it.
-	const boundBy = bound.includes(view.headRefName) ? null : (jo.find((b) => b.pr === view.number)?.instructionId ?? null);
+	// Admitted only through a binding: the starter's line names it (Jo's instruction, or the train's board entry), so every such run is traceable to it.
+	const boundBy = bound.includes(view.headRefName) ? null : (bindings.find((b) => b.pr === view.number)?.by ?? null);
 
 	const root = runsRoot(process.env);
 	mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -520,14 +536,43 @@ const NO_HOOKS = ["-c", "core.hooksPath=/dev/null"];
 /** The network commands' extra settings (§ 2.3 step 2): no template, and only the keychain helper. */
 const NETWORK = [...NO_HOOKS, "-c", "init.templateDir=", "-c", "credential.helper=", "-c", "credential.helper=osxkeychain"];
 
-/** One command, stdout verbatim: never trimmed, since NUL-delimited output (`git diff -z`) may begin or end with a path's own whitespace. */
-async function run(cmd: string[], o: { cwd: string; env: Record<string, string>; timeoutMs: number }): Promise<{ code: number | null; out: string; err: string }> {
-	const p = spawn(cmd, { cwd: o.cwd, env: o.env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-	const timer = setTimeout(() => p.kill("SIGKILL"), o.timeoutMs);
-	const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
-	await p.exited;
-	clearTimeout(timer);
-	return { code: p.exitCode, out, err: err.trim() };
+/**
+ * File-backed output cannot wait for EOF held by a grandchild. Poll the exit status with a
+ * deadline as well: signalling a process does not bound an unresolved stream/exited promise.
+ * Each caller owns its private output directory; no output is trimmed except stderr.
+ */
+export async function run(cmd: string[], o: {
+	cwd: string; env: Record<string, string | undefined>; timeoutMs: number; inheritStderr?: boolean;
+	onSpawn?: (pid: number) => void;
+}): Promise<{ code: number | null; signal: string | null; out: string; err: string }> {
+	const dir = mkdtempSync(join(tmpdir(), "as2-runner-command-"));
+	const outPath = join(dir, "stdout");
+	const errPath = join(dir, "stderr");
+	const outFd = openSync(outPath, "w", 0o600);
+	const errFd = openSync(errPath, "w", 0o600);
+	let p: Subprocess | undefined;
+	try {
+		try {
+			p = spawn(cmd, { cwd: o.cwd, env: o.env, stdin: "ignore", stdout: outFd, stderr: o.inheritStderr ? "inherit" : errFd });
+		} finally {
+			closeSync(outFd);
+			closeSync(errFd);
+		}
+		o.onSpawn?.(p.pid);
+		const deadline = Date.now() + o.timeoutMs;
+		while (p.exitCode === null && p.signalCode === null) {
+			if (Date.now() >= deadline) {
+				// Release the wait even if signalling is refused or Bun never reports completion.
+				try { p.kill("SIGKILL"); } catch { /* the deadline still applies */ }
+				throw new Stop(`command timed out after ${o.timeoutMs} ms: ${cmd.join(" ")}`);
+			}
+			await Bun.sleep(Math.min(25, Math.max(1, deadline - Date.now())));
+		}
+		return { code: p.exitCode, signal: p.signalCode ?? null, out: readFileSync(outPath, "utf8"), err: readFileSync(errPath, "utf8").trim() };
+	} finally {
+		p?.unref();
+		rmSync(dir, { recursive: true, force: true });
+	}
 }
 
 type Wrapped = { code: number | null; signal: string | null; out: string };
@@ -550,11 +595,14 @@ class Runner {
 	/** The run learnt it no longer holds the row (heartbeat or checkpoint) or its request. */
 	private superseded: string | null = null;
 	private soloCalls = 0;
+	private postSweepDeadline = Infinity;
 	private baseSoloCalls = 0;
 	private basePrepared = false;
 	private url = "";
 	/** The served repo's `owner/repo` (`servedOf`), every status post's target; empty until the run resolves it. */
 	private ownerRepo = "";
+	/** The run's place in the lock queue: its `test-requested:` entry's created_at in ms, read once at start. */
+	readonly requestedAt: number;
 	private readonly f: RunFacts & { base: string | null; mergeBase: string | null; preflight: string | null };
 
 	constructor(readonly ledger: Ledger, readonly wl: string, readonly request: TestRequested, readonly config: TestRunnerConfig) {
@@ -562,6 +610,9 @@ class Runner {
 		this.stageRoot = join(this.as2root, "stage");
 		this.stage = stageDirOf(request.runId, this.as2root);
 		this.workDir = workDirOf(request.runId, this.as2root);
+		const rec = testRuns(ledger.entries(wl)).find((r) => r.request.runId === request.runId);
+		if (!rec) throw new Fail(`no test-requested: record for ${request.runId} on ${wl}`, START_EXIT.failed);
+		this.requestedAt = Date.parse(rec.request.createdAt);
 		this.lockDb = openLockDb(this.root);
 		this.capBytes = reportCapBytes(config);
 		this.f = {
@@ -606,37 +657,80 @@ class Runner {
 		}
 	}
 
-	/** Wait for the lock (queued), take it clean or from a stale holder, and publish `current` in that same transaction. */
+	/**
+	 * Wait for the lock (queued, oldest request first), take it clean or from a stale holder, and publish `current` in that same
+	 * transaction. Every attempt is one BEGIN IMMEDIATE transaction: register in `queue` (a no-op once registered; a row pruned
+	 * while this run was suspended comes back with the same requestedAt), prune the dead waiters ahead and find the first live
+	 * one, then the holder check; a live holder or a live waiter ahead keeps the run queued. Taking the lock removes the run's row.
+	 */
 	async acquire(): Promise<void> {
 		const waitStart = Date.now();
 		const pollMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_POLL_MS", 2_000);
 		mkdirSync(this.stageRoot, { recursive: true });
-		for (;;) {
-			let took: { displaced: string | null } | null = null;
-			try {
-				took = this.lockDb.transaction(() => {
-					const row = lockRow(this.lockDb);
-					if (row && row.runId !== this.id && !lockHolderStale(row.heartbeatAt, Date.now())) return null;
-					this.lockDb.query("INSERT OR REPLACE INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, ?, ?, ?, ?, ?)")
-						.run(this.id, process.pid, process.pid, this.runDir, Date.now());
-					writeCurrent(this.stageRoot, this.id);
-					hookSync(this.id, "acquire-tx");
-					return { displaced: row && row.runId !== this.id ? row.runId : null };
-				}).immediate();
-			} catch (e) {
-				if (!isBusy(e)) throw e;
-				hookMark(this.id, "acquire-busy");
+		try {
+			for (;;) {
+				let took: { displaced: string | null } | null = null;
+				try {
+					took = this.lockDb.transaction(() => {
+						this.lockDb.query("INSERT OR IGNORE INTO queue (runId, workloadId, requestedAt) VALUES (?, ?, ?)").run(this.id, this.wl, this.requestedAt);
+						const blocker = this.queueBlocker();
+						const row = lockRow(this.lockDb);
+						if (row && row.runId !== this.id && !lockHolderStale(row.heartbeatAt, Date.now())) return null;
+						if (blocker !== null) return null;
+						this.lockDb.query("INSERT OR REPLACE INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, ?, ?, ?, ?, ?)")
+							.run(this.id, process.pid, process.pid, this.runDir, Date.now());
+						this.lockDb.query("DELETE FROM queue WHERE runId = ?").run(this.id);
+						writeCurrent(this.stageRoot, this.id);
+						hookSync(this.id, "acquire-tx");
+						return { displaced: row && row.runId !== this.id ? row.runId : null };
+					}).immediate();
+				} catch (e) {
+					if (!isBusy(e)) throw e;
+					hookMark(this.id, "acquire-busy");
+				}
+				if (took) {
+					this.held = true;
+					hookMark(this.id, "acquired", took);
+					this.log(took.displaced ? `took the lock from the stale holder ${took.displaced}` : "took the lock");
+					this.beat();
+					return;
+				}
+				if (queuedTooLong(waitStart, Date.now(), this.config)) throw new Stop("queued too long");
+				hookMark(this.id, "queued");
+				await Bun.sleep(pollMs);
 			}
-			if (took) {
-				this.held = true;
-				hookMark(this.id, "acquired", took);
-				this.log(took.displaced ? `took the lock from the stale holder ${took.displaced}` : "took the lock");
-				this.beat();
-				return;
-			}
-			if (queuedTooLong(waitStart, Date.now(), this.config)) throw new Stop("queued too long");
-			hookMark(this.id, "queued");
-			await Bun.sleep(pollMs);
+		} catch (e) {
+			this.leaveQueue();
+			throw e;
+		}
+	}
+
+	/**
+	 * Inside the acquiring transaction, after this run registered: the first live waiter ahead of it in (requestedAt, run id)
+	 * order, or null. Each waiter ahead is judged on its ledger record and heartbeat file (`queueWaiterLive`, one entries read
+	 * per workload); the dead ones before the first live one are deleted.
+	 */
+	private queueBlocker(): string | null {
+		const rows = this.lockDb.query<QueueRow, []>("SELECT runId, workloadId, requestedAt FROM queue ORDER BY requestedAt, runId").all();
+		const records = new Map<string, RunRecord[]>();
+		const now = Date.now();
+		const { blocker, dead } = queueAhead(rows, this.id, (q) => {
+			let recs = records.get(q.workloadId);
+			if (!recs) records.set(q.workloadId, (recs = testRuns(this.ledger.entries(q.workloadId))));
+			return queueWaiterLive(recs.find((r) => r.request.runId === q.runId), heartbeatOf(this.root, q.runId), now);
+		});
+		const prune = this.lockDb.query("DELETE FROM queue WHERE runId = ?");
+		for (const runId of dead) prune.run(runId);
+		if (dead.length > 0) this.log(`pruned the dead waiters ${dead.join(", ")} from the lock queue`);
+		return blocker;
+	}
+
+	/** Leave the lock queue (best effort): when acquire ends without the lock, and at the end of the run. */
+	private leaveQueue(): void {
+		try {
+			busyLoop(() => this.lockDb.query("DELETE FROM queue WHERE runId = ?").run(this.id));
+		} catch (e) {
+			this.log(`the lock queue row was not removed: ${errText(e)}`);
 		}
 	}
 
@@ -656,19 +750,27 @@ class Runner {
 	 */
 	async wrap(call: WrapperCall, capMs: number | null = null): Promise<Wrapped> {
 		const argv = wrapperArgv(call, this.exec);
-		const p = spawn(argv, { cwd: this.as2root, env: process.env, stdin: "ignore", stdout: "pipe", stderr: "inherit" });
-		hookMark(this.id, `spawn-${call.sub}`, { pid: p.pid });
 		let outlived = false;
 		const watchdog = capMs === null ? null : setTimeout(() => {
 			outlived = true;
 			this.log(`${call.sub} outlived its cap by ${OUTLIVE_MS / 1000} s; sweeping`);
 			void this.wrap({ sub: "sweep", runId: this.id }).catch((e) => this.log(`the outlive sweep failed: ${errText(e)}`));
 		}, capMs + OUTLIVE_MS);
-		const out = await new Response(p.stdout).text();
-		await p.exited;
-		clearTimeout(watchdog ?? undefined);
+		let r: Wrapped;
+		try {
+			r = await run(argv, {
+				cwd: this.as2root, env: process.env,
+				timeoutMs: (capMs ?? 0) + OUTLIVE_MS + 120_000, inheritStderr: true,
+				onSpawn: (pid) => {
+					hookMark(this.id, `spawn-${call.sub}`, { pid });
+					this.log(`${argv.slice(4).join(" ")}: started pid ${pid}`);
+				},
+			});
+		} finally {
+			clearTimeout(watchdog ?? undefined);
+		}
+		const { out } = r;
 		if (out.trim()) process.stdout.write(out.endsWith("\n") ? out : `${out}\n`);
-		const r = { code: p.exitCode, signal: p.signalCode ?? null, out };
 		this.log(`${argv.slice(4).join(" ")} → ${r.signal ?? `exit ${r.code}`}${outlived ? " (after the outlive sweep)" : ""}`);
 		return r;
 	}
@@ -901,7 +1003,7 @@ class Runner {
 		await git([...NO_HOOKS, "bundle", "create", "-q", bundle, "--all"], "git bundle create");
 		chmodSync(bundle, 0o640);
 		const caps = join(this.stage, "caps.json");
-		writeFileSync(caps, `${JSON.stringify({ fullCapMin: this.config.fullCapMin, soloCapMin: this.config.soloCapMin })}\n`, { mode: 0o640 });
+		writeFileSync(caps, `${JSON.stringify({ fullCapMin: this.config.fullCapMin, soloCapMin: this.config.soloCapMin, fullWorkers: this.config.fullWorkers })}\n`, { mode: 0o640 });
 		chmodSync(caps, 0o640);
 		chmodSync(this.stage, 0o750);
 		this.log(`trusted phase: ${q.sha} on base ${this.f.base}, merge-base ${this.f.mergeBase}; changed test files: ${changed.join(" ") || "none"}`);
@@ -978,10 +1080,10 @@ class Runner {
 	}
 
 	/** `git ls-remote <origin> refs/pull/<N>/head` with the trusted settings (§ 2.3 step 5); null when it cannot answer. */
-	async headNow(): Promise<string | null> {
+	async headNow(timeoutMs = 120_000): Promise<string | null> {
 		const pr = this.request.pr;
 		const r = await run(["git", ...NETWORK, "ls-remote", this.url, `refs/pull/${pr}/head`], {
-			cwd: this.runDir, env: trustedEnv(join(this.runDir, "trusted.gitconfig")), timeoutMs: 120_000,
+			cwd: this.runDir, env: trustedEnv(join(this.runDir, "trusted.gitconfig")), timeoutMs,
 		});
 		if (r.code !== 0) {
 			this.log(`ls-remote failed: ${r.err.split("\n").at(-1) || `exit ${r.code}`}`);
@@ -1014,7 +1116,7 @@ class Runner {
 		}
 	}
 
-	/** Steps in the plan's order: lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare → parts with a sweep after each → head re-check. */
+	/** Steps in the plan's order: lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare → parts with a sweep after each → base runs → post-sweep finalization deadline → head re-check. */
 	async body(): Promise<void> {
 		({ url: this.url, repo: this.repo, ownerRepo: this.ownerRepo } = servedOf(this.ledger, this.wl, this.config));
 		await this.acquire();
@@ -1025,6 +1127,7 @@ class Runner {
 		const changed = await this.trusted();
 		if (changed === null) return;
 		await this.prepare();
+		this.log(`full workers ${this.config.fullWorkers}`);
 		this.f.full = await this.part({ sub: "full" });
 		await this.sweep("full");
 		for (const file of changed) {
@@ -1032,8 +1135,10 @@ class Runner {
 			await this.sweep(file);
 		}
 		await this.baseRuns();
-		await hook(this.id, "head-recheck");
-		this.f.headAtEnd = await this.headNow();
+		this.postSweepDeadline = Date.now() + msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", 150_000);
+		this.log(`post-sweep finalization started; deadline ${new Date(this.postSweepDeadline).toISOString()}`);
+		await hook(this.id, "head-recheck", {}, this.postSweepDeadline);
+		this.f.headAtEnd = await this.headNow(Math.max(1, this.postSweepDeadline - Date.now()));
 	}
 
 	/**
@@ -1045,7 +1150,9 @@ class Runner {
 	 * them, and a slice that is not open is never touched. Then `result.json`.
 	 */
 	finish(): TestRun {
-		const write = (lockMine: boolean) => this.ledger.write(() => {
+		// Acquire BEGIN outside ledger.write's retry policy: once held, recordEntry/completeSlice
+		// use nested savepoints. Only the publication loop below retries either database.
+		const write = (lockMine: boolean) => this.ledger.db.transaction(() => {
 			const owner = lockMine && !this.superseded && ownsRequest(testRuns(this.ledger.entries(this.wl)), this.id);
 			const facts: RunFacts = { ...this.f, owner, sliceState: this.ledger.slice(this.request.slice)?.state ?? null };
 			const decided = decideRun(facts);
@@ -1072,19 +1179,42 @@ class Runner {
 				this.ledger.enqueue({ by: TEST_RUNNER_BY, workloadId: this.wl, sliceId: this.request.slice, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: testRunFailedBody(failed) });
 			}
 			return { run, settled };
-		});
-		const { run, settled } = this.held
-			? busyLoop(() => this.lockDb.transaction(() => write(lockRow(this.lockDb)?.runId === this.id)).immediate())
-			: write(true);
+		}).immediate();
+		let published: { run: TestRun; settled: { ok: true } | { ok: false; reason: string } | null };
+		for (;;) {
+			try {
+				// Even an expired head/result guard gets one nonblocking attempt to record its error.
+				published = this.held
+					? this.lockDb.transaction(() => write(lockRow(this.lockDb)?.runId === this.id)).immediate()
+					: write(true);
+				break;
+			} catch (e) {
+				if (!isBusy(e)) throw e;
+				hookMark(this.id, "publication-busy");
+				const remaining = this.postSweepDeadline - Date.now();
+				if (remaining <= 0) throw new Stop("post-sweep deadline exceeded during publication");
+				Bun.sleepSync(Math.min(50, remaining));
+				if (Date.now() >= this.postSweepDeadline) throw new Stop("post-sweep deadline exceeded during publication");
+			}
+		}
+		const { run, settled } = published;
 		this.log(`test-run ${run.verdict}${run.reason ? `: ${run.reason}` : ""}`);
 		if (settled?.ok) this.log(`settled ${this.request.slice}`);
 		else if (settled) this.log(`the settle of ${this.request.slice} was refused: ${settled.reason}`);
+		this.writeResult(run);
+		return run;
+	}
+
+	private writeResult(run: TestRun): void {
+		const tmp = join(this.runDir, `.result.${process.pid}.json`);
 		try {
-			writeFileSync(join(this.runDir, "result.json"), resultJson(run), { mode: 0o600 });
+			writeFileSync(tmp, resultJson(run), { mode: 0o600 });
+			renameSync(tmp, join(this.runDir, "result.json"));
 		} catch (e) {
 			this.log(`result.json not written: ${errText(e)}`);
+		} finally {
+			rmSync(tmp, { force: true });
 		}
-		return run;
 	}
 
 	async main(): Promise<number> {
@@ -1101,9 +1231,34 @@ class Runner {
 				else this.f.error = `the runner failed: ${errText(e)}`;
 				if (!(e instanceof Superseded)) this.log(`stopped: ${this.f.error}`);
 			}
-			await hook(this.id, "result");
-			const run = this.finish();
+			if (!Number.isFinite(this.postSweepDeadline)) this.postSweepDeadline = Date.now() + msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", 150_000);
+			try {
+				await hook(this.id, "result", {}, this.postSweepDeadline);
+				if (Date.now() >= this.postSweepDeadline) throw new Stop("post-sweep deadline exceeded before publication");
+			} catch (e) {
+				this.f.error = errText(e);
+				this.log(`stopped: ${this.f.error}`);
+			}
+			// Synchronous SQLite waits cannot be interrupted by JS timers. Publication retries
+			// nonblocking BEGINs against the shared deadline, not nested fixed retry budgets.
+			this.lockDb.exec("PRAGMA busy_timeout = 0");
+			this.ledger.db.exec("PRAGMA busy_timeout = 0");
+			let run: TestRun;
+			try {
+				run = this.finish();
+			} catch (e) {
+				// A locked/unavailable ledger cannot accept a transaction. Preserve a local
+				// error verdict instead of silently leaving no artifact; never settle here.
+				const reason = `result publication failed: ${errText(e)}${this.f.error ? `; ${this.f.error}` : ""}`;
+				const run = buildTestRun(this.request, this.f, { verdict: "error", outcome: "error", reason, settle: false }, {
+					base: this.f.base, mergeBase: this.f.mergeBase, runDir: this.runDir, preflight: this.f.preflight,
+				});
+				this.log(`test-run error: ${reason}`);
+				this.writeResult(run);
+				return START_EXIT.failed;
+			}
 			// Only a terminal state, and only on the sha the fetch confirmed this run tested (trusted's sha check).
+			// postStatus never throws and kills gh after 15 s.
 			const state = this.f.fetchedSha === run.sha ? FULL_SUITE_STATE[run.verdict] : undefined;
 			if (state) await this.postStatus(state, run.sha, `full suite ${run.verdict}, run ${run.runId}`);
 			return 0;
@@ -1113,12 +1268,14 @@ class Runner {
 			// releasing it proves nothing about that helper. Refreshes are serialised by the helper's own lockf lock
 			// on refresh.d/lock, which the next run's refresh waits on (exit 69, lock, while the old helper holds it).
 			if (this.held) {
+				this.lockDb.exec("PRAGMA busy_timeout = 100");
 				try {
 					busyLoop(() => this.lockDb.query("DELETE FROM lock WHERE runId = ?").run(this.id));
 				} catch (e) {
 					this.log(`the lock was not released: ${errText(e)}`);
 				}
 			}
+			this.leaveQueue();
 			this.lockDb.close();
 		}
 	}

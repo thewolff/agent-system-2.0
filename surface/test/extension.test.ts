@@ -10,13 +10,12 @@ import { join } from "node:path";
 import { reviewLimitBody, ROUND_LIMIT_OPTIONS } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
-import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
 import { ceilingOf } from "../src/input";
 import { planFirstBody } from "../src/launch";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { STANDING_WORKLOAD_ID, SURFACE_BY as SURFACE } from "../src/types";
-import { clock, ctxOf, fakePi, notices, timers, tmp } from "./helpers";
+import { clock, ctxOf, fakePi, loadTestText, notices, timers, tmp } from "./helpers";
 
 function env(over: Record<string, string> = {}): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
@@ -62,7 +61,7 @@ describe("surface extension adapter", () => {
 		orchestratorSurface(f.pi, e);
 		expect(f.registered().sort()).toEqual([
 			"as2_rank", "lane_add_slice", "lane_complete_slice", "lane_full_test", "lane_handoff", "lane_message", "lane_raise_question", "lane_read_facts", "lane_record_entry", "lane_release", "lane_train_return", "lane_withdraw_reserved",
-			"orchestrator_close_workload", "orchestrator_identity", "orchestrator_launch_lane", "orchestrator_ledger", "orchestrator_lower_ceiling", "orchestrator_open_workload", "orchestrator_raise_question", "orchestrator_record_instruction", "orchestrator_schedule", "orchestrator_wake_read", "slice_artifact",
+			"orchestrator_channel_done", "orchestrator_close_workload", "orchestrator_identity", "orchestrator_launch_lane", "orchestrator_ledger", "orchestrator_lower_ceiling", "orchestrator_open_workload", "orchestrator_raise_question", "orchestrator_record_instruction", "orchestrator_reply", "orchestrator_schedule", "orchestrator_wake_read", "slice_artifact",
 		]);
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
@@ -197,7 +196,7 @@ describe("surface extension adapter", () => {
 		l.close();
 	});
 
-	test("the pending block of a reserved request, a plan question, a ceiling question and a free-form question, pasted whole, applies four answers in one transaction (PLAN wl-mv5msri070p0qo § 3)", async () => {
+	test("the pending block of a reserved request, a plan question, a marked-default question and a free-form question, pasted whole, applies four answers in one transaction (PLAN wl-mv5msri070p0qo § 3)", async () => {
 		const f = fakePi();
 		const e = env();
 		const l = open(e);
@@ -217,12 +216,10 @@ describe("surface extension adapter", () => {
 			l.recordEntry({ by: "lane-p", workloadId: p, sliceId: sp, kind: "assumption", body: `plan-question: ${id}` });
 			return id;
 		});
-		// the runner's ceiling question
+		// a lane question whose body marks its default
 		const c = l.openWorkload({ by: SURFACE, brief: "Move the header offset into a token", stakes: "normal", mode: "autonomous" });
-		l.recordEntry({ by: SURFACE, workloadId: c, kind: "assumption", body: "ceiling: usd 50 wall 360 source stakes normal" });
-		l.recordEntry({ by: LANE_STARTER_BY, workloadId: c, kind: "assumption", body: "launch: lane-t-1 cause first requested-by test" });
-		const sc = l.addSlice({ by: LANE_RUNNER_BY, workloadId: c, id: "sl-ceiling-1", task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
-		const ceiling = l.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: c, sliceId: sc, body: "80 % of the ceiling", options: [...CEILING_OPTIONS] });
+		const sc = l.addSlice({ by: "lane-t-1", workloadId: c, task: "t", doneCondition: "d", inputs: "c.ts" });
+		const ceiling = l.raiseQuestion({ by: "lane-t-1", workloadId: c, sliceId: sc, body: "Keep going?\nstop (the default): park here.", options: ["extend", "stop", "split"] });
 		orchestratorSurface(f.pi, e);
 		const ctx = ctxOf();
 		notices.length = 0;
@@ -612,7 +609,7 @@ describe("surface extension adapter", () => {
 		const wl = seed.openWorkload({ by: "lane-a", brief: "Add a line to the README", stakes: "normal", mode: "autonomous" });
 		const sl = seed.addSlice({ by: "lane-a", workloadId: wl, task: "write the line", doneCondition: "README.md has it", inputs: "README.md" });
 		seed.close();
-		orchestratorSurface(f.pi, e);
+		await orchestratorSurface(f.pi, e, { loadText: loadTestText });
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		const wake = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as Started;

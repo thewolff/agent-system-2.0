@@ -84,9 +84,11 @@ export interface TestRunnerConfig {
 	soloCapMin: number;
 	reportCapMb: number;
 	queueMaxMin: number;
+	/** Workers for the PR's full part (`bun test --parallel=<n>` when over 1, written into caps.json); base reruns stay serial. */
+	fullWorkers: number;
 }
 /** The plan's defaults (§ 2.2 step 4, § 2.3 steps 1 and 3), used for a key the block leaves out. */
-export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 60 };
+export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 60, fullWorkers: 1 };
 
 /**
  * The `testRunner:` block of a parsed profile config (`Bun.YAML.parse` of profile/config.yml). No
@@ -115,6 +117,11 @@ export function testRunnerConfig(doc: unknown): { ok: true; config: TestRunnerCo
 		if (v === undefined) continue;
 		if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return { ok: false, error: `testRunner.${key} is not a positive number` };
 		out[key] = v;
+	}
+	if (b.fullWorkers !== undefined) {
+		const v = b.fullWorkers;
+		if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 1) return { ok: false, error: "testRunner.fullWorkers is not an integer of 1 or more" };
+		out.fullWorkers = v;
 	}
 	return { ok: true, config: out };
 }
@@ -541,6 +548,38 @@ export function reservation(
 /** A run that has waited for the lock past `queueMaxMin` ends `error queued too long` (§ 2.3 step 1). */
 export function queuedTooLong(waitStartMs: number, nowMs: number, config: Pick<TestRunnerConfig, "queueMaxMin">): boolean {
 	return nowMs - waitStartMs > config.queueMaxMin * 60_000;
+}
+
+/** A waiter's row in runs.db's `queue` table: its run, its workload, and its place, the request's `created_at` in ms. */
+export interface QueueRow {
+	runId: string;
+	workloadId: string;
+	requestedAt: number;
+}
+
+/**
+ * A queued waiter blocks the runs behind it while its run is live (`recordLive`: not settled, and a heartbeat under 60 s old,
+ * or none yet inside the startup lease). A row whose request the ledger does not hold is dead.
+ */
+export function queueWaiterLive(rec: RunRecord | undefined, heartbeatAtMs: number | null, nowMs: number): boolean {
+	return rec !== undefined && recordLive(rec, heartbeatAtMs, nowMs);
+}
+
+/**
+ * The waiters ahead of `selfId`, oldest request first (requestedAt, then run id): every dead one before the first live one is
+ * reported for pruning, and that first live one is the blocker. Rows behind `selfId` are never judged. `selfId` must be among
+ * the rows (the runner registers in the same transaction).
+ */
+export function queueAhead(rows: readonly QueueRow[], selfId: string, live: (row: QueueRow) => boolean): { blocker: string | null; dead: string[] } {
+	need(rows.some((r) => r.runId === selfId), `${selfId} is not in the queue`);
+	const ordered = [...rows].sort((a, b) => a.requestedAt - b.requestedAt || (a.runId < b.runId ? -1 : a.runId > b.runId ? 1 : 0));
+	const dead: string[] = [];
+	for (const row of ordered) {
+		if (row.runId === selfId) break;
+		if (live(row)) return { blocker: row.runId, dead };
+		dead.push(row.runId);
+	}
+	return { blocker: null, dead };
 }
 
 // ---- the full-suite slice ------------------------------------------------------------------------

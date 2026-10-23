@@ -25,6 +25,10 @@
 # does not start is reported and does not fail the install. The last line names the providers the rendered profile
 # routes to and says each needs a /login once per profile (the profile's setupVersion skips OMP's
 # first-launch sign-in scene).
+# File links also install in the default OMP profile (persistent seats do not use the as2 profile):
+# ~/.omp/agent/extensions/as2-open-links.ts points into this checkout. If herdr is on PATH, its
+# as2.file-links plugin is linked from install/herdr-file-links; without herdr one notice is printed.
+# Reversal: herdr plugin unlink as2.file-links; remove the default-profile extension symlink.
 #
 # Three flags (macOS only), each optional and usable together. --chaos-nightly also writes the nightly
 # chaos job: the template install/com.agent-system-2.chaos.plist filled with this checkout, the
@@ -260,10 +264,15 @@ fi
 # ---- 1. read and validate the manifest ------------------------------------------------------
 step "reading manifest $MANIFEST"
 [ -f "$MANIFEST" ] || fail "no manifest at $MANIFEST" 2
-# [[ == ]] honours nocasematch (BASH_ENV can set it); the membership checks below must be exact.
+# Case patterns below must not inherit nocasematch from BASH_ENV.
 shopt -u nocasematch
-# One path per line, wrapped in newlines, so membership is a builtin [[ ]] match: no process per row.
-paths=$'\n'
+# Find the first duplicate with exact string keys, not a scan of a growing path string per row.
+# Leave reporting in the validation loop so an earlier invalid row still wins.
+duplicate_line="$(LC_ALL=C awk -F '\t' '
+	substr($0, 1, 1) == "#" || $0 == "" { next }
+	!header_seen++ { next }
+	++seen["p" $1] == 2 { print NR; exit }
+' "$MANIFEST")"
 rows=0
 header_seen=0
 line_no=0
@@ -286,7 +295,9 @@ while IFS= read -r line || [ -n "$line" ]; do
 		continue
 	fi
 	IFS=$'\t' read -r path kind dest extra <<<"$line"
+	# read collapses TAB whitespace; require the original row to match its three fields exactly.
 	[ -n "${path:-}" ] && [ -n "${kind:-}" ] && [ -n "${dest:-}" ] && [ -z "${extra:-}" ] \
+		&& [ "$line" = "$path"$'\t'"$kind"$'\t'"$dest" ] \
 		|| fail "manifest line $line_no: need exactly three TAB-separated fields: $line" 2
 	[ -f "$REPO/$path" ] || fail "manifest line $line_no: $path does not exist in the repo" 2
 	[ ! -L "$REPO/$path" ] || fail "manifest line $line_no: $path is a symbolic link; machinery artifacts are regular files" 2
@@ -339,8 +350,7 @@ while IFS= read -r line || [ -n "$line" ]; do
 		ledger-module | module | extension | data | test | doc | install) [ "$dest" = "-" ] || fail "manifest line $line_no: kind $kind is used in place; destination must be -" 2 ;;
 		*) fail "manifest line $line_no: unknown kind '$kind' (this installer knows ledger-schema, ledger-module, ledger-init, ledger-backup, ledger-backup-agent, module, extension, tier, profile, skill, skill-asset, launcher, data, test, doc, install)" 2 ;;
 	esac
-	if [[ $paths == *$'\n'"$path"$'\n'* ]]; then fail "manifest line $line_no: duplicate row for $path" 2; fi
-	paths="$paths$path"$'\n'
+	[ "$line_no" != "$duplicate_line" ] || fail "manifest line $line_no: duplicate row for $path" 2
 	rows=$((rows + 1))
 done <"$MANIFEST"
 [ "$header_seen" -eq 1 ] || fail "manifest has no header row" 2
@@ -373,10 +383,19 @@ missing=""
 links=""
 for dir in "${MACHINERY_DIRS[@]}"; do
 	[ -e "$REPO/$dir" ] || [ -L "$REPO/$dir" ] || continue
-	while IFS= read -r file; do
-		rel="${file#"$REPO"/}"
-		[[ $paths == *$'\n'"$rel"$'\n'* ]] || missing="$missing  $rel"$'\n'
-	done < <(find "$REPO/$dir" -type f ! -name '.DS_Store' ! -path '*/node_modules/*' | LC_ALL=C sort)
+	unmanifested="$(find "$REPO/$dir" -type f ! -name '.DS_Store' ! -path '*/node_modules/*' | LC_ALL=C sort |
+		INSTALL_REPO="$REPO" LC_ALL=C awk -F '\t' '
+			FNR == NR { paths["p" $1] = 1; next }
+			{
+				rel = substr($0, length(ENVIRON["INSTALL_REPO"]) + 2)
+				if (!(("p" rel) in paths)) print rel
+			}
+		' "$MANIFEST" -)" || fail "could not check manifest coverage under $dir" 2
+	if [ -n "$unmanifested" ]; then
+		while IFS= read -r rel; do
+			missing="$missing  $rel"$'\n'
+		done <<<"$unmanifested"
+	fi
 	while IFS= read -r link; do
 		links="$links  ${link#"$REPO"/} -> $(readlink "$link")"$'\n'
 	done < <(find "$REPO/$dir" -type l ! -path '*/node_modules/*' | LC_ALL=C sort)
@@ -535,6 +554,21 @@ while IFS= read -r tier; do
 	step "tier linked: $PROFILE_DIR/agents/${tier##*/} -> $REPO/$tier"
 done <<<"$tier_rows"
 step "profile ready: omp --profile $PROFILE_NAME (or OMP_PROFILE=$PROFILE_NAME); skills load from $REPO/skills"
+
+# ---- 5b. file links in default-profile seats and herdr -------------------------------------------
+# The default profile auto-discovers this extension; as2 itself loads it through gates/index.ts.
+# Like tier links, this points at the checkout that `as2 install` runs from, never a lane copy
+# unless somebody explicitly runs install there. No herdr command runs without a herdr on PATH.
+DEFAULT_EXTENSIONS="$HOME/.omp/agent/extensions"
+mkdir -p "$DEFAULT_EXTENSIONS"
+ln -sfn "$REPO/gates/extensions/open-links.ts" "$DEFAULT_EXTENSIONS/as2-open-links.ts"
+step "default-profile extension linked: $DEFAULT_EXTENSIONS/as2-open-links.ts -> $REPO/gates/extensions/open-links.ts"
+if command -v herdr >/dev/null 2>&1; then
+	herdr plugin link "$REPO/install/herdr-file-links" || fail "herdr plugin link exited $?" 1
+	step "herdr file-link handler linked: as2.file-links"
+else
+	step "note: herdr is not on PATH; file-link handler not registered (install herdr, then re-run this script)"
+fi
 
 # ---- 6. the launcher (launcher rows) ------------------------------------------------------------
 # A symbolic link into the checkout, like the tier files: the script resolves its own real path to

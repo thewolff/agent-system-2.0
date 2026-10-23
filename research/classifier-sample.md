@@ -240,3 +240,96 @@ The four briefs whose choice changed: `ResearchSelfImprove` understand 0.93 → 
 - `classifier/test/fixtures/classifier-sample-2026-09-28.jsonl` — 32 recorded rows (meta line carries the question sha256 and job ids); the offline replay (`classifier/test/replay.test.ts`) answers from it
 - `classifier/calibration.json` — now names this question, judge, and sample; the 09-23 record is kept under `superseded`
 - `/Users/jowolff/agent-scratch/agent-system-2.0/migration/M3/recalibrate/results.jsonl` — 32 raw rows as drained (job, batch, cumulative batch cost, model, raw answer)
+
+## § Re-measurement 2026-10-20
+
+Written 2026-10-20 by hand `sl-rs-docs` of workload `wl-mvg2ntsbcm6fwg` (right-size build hands; plan approved by Jo). Status: **complete**, with one shortfall Jo accepted (§ Held-out). The 09-23 and 09-28 sections above are unchanged and describe superseded questions. Plan directory: `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mvg2ntsbcm6fwg/` (`PLAN.md`, `DEFINE.md`, `HELDOUT-A-v3.md`, `HELDOUT-B-v4f3.md`, `OPEN-IMPACT.md`, `audit-briefs.jsonl`, `HOLDOUT-A.jsonl`, `HOLDOUT-B.jsonl`, `probe-2026-10-20.json`).
+
+### Why
+
+**CLAIM**
+The 09-28 question keyed the two change kinds on file count and a mechanical check: change-small "write to a single file, where a test or a diff mechanically checks the result", change-large "write to more than one file, or write anything that no test or diff can mechanically check". Every multi-file write and every prose write therefore went to change-large and the strong tier. The hand-size audit of 2026-10-19 (`/Users/jowolff/code/agent-system-2.0/.tmp/hand-size-audit.md`, § Sample) read 20 of that day's change-large hands and found 8 firm over-sizes (6 docs-only slices whose text a plan dictated, rows 1 5 9 13 16 20; 2 smoke runs that write no repository file, rows 10 17), 3 soft (rows 3 11 14: one function to an exact spec, tests only for fully specified behaviour, a mechanical mirror of an existing word) and 9 correct (rows 2 4 6 7 8 12 15 18 19).
+
+**GUESS**
+The audit's over/correct calls are its author's reading of difficulty from the brief text; it did not run any brief on the standard tier (the audit's own note under its table). The labels below inherit that.
+
+### Method
+
+**CLAIM**
+Question under measurement: the new `classifier/kind-question.json`, text "v4f3" (instructions and keys unchanged; only the five criteria strings differ). Identity as `classify.ts` computes it (`questionSha256`, sha256 of canonical JSON): `2c0d088658c5318797d72b0a71f0011fa3694f688cc094c206ee9493b37d3f89`; the file's own sha256 is `5b74aa66f35fc25e2b3fb1b408cbb1637a05a3cc251a8e7334592e8c57e96e83`. The 09-28 question was `5a72c35c…`.
+
+**ACTION**
+Classifier: OMP's `judge_batch` from the eval tool, live on `typesafe/jev-1.13.0`, one batch per candidate text, `questions` = the question file's object with only `criteria` replaced, `state` = the brief text. Routing reimplements `classifier/src/route.ts`: the kind's tier, the 0.55 inclusive pull-up to the higher tier of the two most probable kinds, then the stakes cap of each brief's routing row. Every batch reported cost 0 and 0 failed items (`DEFINE.md`, round 1 four batches, round 2 fifteen).
+
+**CLAIM**
+Briefs: (1) the audit's 20, each the hand's dispatched `task` text, its first user message minus OMP's `Complete assignment thoroughly:\n\n` prefix (`audit-briefs.jsonl`); (2) the 32 rows of the 09-28 sample with their 09-28 labels, except `AddTwoFileMechanical` (a constant renamed in `route.ts` and its test) and `AddOneFileUncheckable` (a tier file's opening paragraph rewritten), both relabelled change-small before any draw; (3) two held-out sets drawn from change-large routings outside the audit's 20 and labelled blind by a separate hand from the brief text only, before any answer under a new text existed (`PLAN.md` § 3, sl-rs-holdout): `over` (standard would do) or `correct` (strong needed). Set A has 20 briefs (14 correct, 6 over), set B 10 (7 correct, 3 over), no brief in both. The audit 20 take the label the audit implies: firm docs and soft → change-small, firm smoke → understand, correct → change-large.
+
+**CLAIM**
+Fidelity: the 09-28 question, re-judged live on the audit corpus, answered change-large on all 20, matching the 20 ledger routing rows within 0.05 confidence (`PLAN.md` § 2). The plan's first review matched all 20 corpus texts to the lanes' original `task` tool arguments. Three held-out texts end with a paragraph beginning "Findings block (agent-system 2.0 review round limit)" that `classifier/extension.ts` appends after `classify()`; it was cut before judging, so the judged text is the text the classifier saw.
+
+**CLAIM**
+Bars per draw (`DEFINE.md` § Bars): the 8 firm route standard or lower with their stakes; the 6 docs rows answer change-small and the 2 smoke rows understand or locate; the 9 correct route strong; on the 32 no brief routes below its label's tier, `ReaderLoadTrace`, `ScoutSeatHomes` and `ScoutSkills` answer locate, and `AddTwoFileMechanical` answers change-small and routes standard. Held-out: every `correct` brief routes strong (R12), and at least two thirds of the `over` briefs route standard or lower (R14).
+
+### Criteria, old → new
+
+**CLAIM**
+What each criterion now says, against the 09-28 text:
+
+- **locate** — was "find where something is"; now also "list what exists", and names an inventory table written to a report file as a locate deliverable.
+- **understand** — still "read and report on a surface without writing to it"; now says a smoke run or check that executes things but writes no repository file, only scratch files or its report, is understand.
+- **change-small** — was one file plus a mechanical check. Now keyed on whether the brief already specifies the change, so the worker carries it out rather than works it out: a rename or contained edit to one module and its own tests; a new self-contained pure function nothing calls yet, in its own new file, whose signature and rules the brief or a named plan spells out, plus its own test file; a mechanical mirror of an existing pattern; or a docs-only edit to any number of prose files whose content the brief or a named plan dictates.
+- **change-large** — was more than one file, or anything no test or diff checks. Now keyed on code whose design or correctness the worker must work out, even when the brief lists the steps: new behaviour across several source modules or a new module existing modules call or render; a shared format or schema and every reader of it; tests that fix an interface others build to; a new committed end-to-end test file that boots real installed programs; deciding case by case what tests should prove; or any fix to concurrency, timing (time windows, clocks, timeouts, retries), process handling, security or authority enforcement, performance, or replay and identity logic, however few files it touches.
+- **judge** — now also names a report that critiques a document, design or decision for what it breaks, contradicts or leaves undefined.
+
+### Texts tried
+
+**CLAIM**
+Round 1 (`DEFINE.md`): probe draft v2 failed (`ScoutSkills` drifted to understand 0.41; `LensAbolishedSeat`, labelled judge, answered understand 0.76 and routed standard). v3 passed every tuning bar on three draws, then failed held-out set A: R12 14/14, R14 3/6 against a bar of 4/6 (`HELDOUT-A-v3.md`; misses `sl-kimi-parse` change-large 0.57, `sl-queue-surface` change-large 0.47, `sl-fd-check` change-large 0.82). Set A became tuning data under the plan's rule, and the held-out bars moved to sealed set B. Round 2 tried twelve texts (v4a–v4g2) changing only change-small and change-large; seven passed both the tuning bars and set A. v4f3 was chosen as the only one, besides v4g1, on which every audit correct row answers change-large above 0.55, and over v4g1 for its wider margins and shorter change-small (`DEFINE.md` § Choice of v4f3).
+
+### Results
+
+**CLAIM**
+Audit 20 under v4f3 (`DEFINE.md`, v4f3 draw 1 `jdgb-15ad2062e4bda035`): 8/8 firm route standard (the 6 docs rows answer change-small, the 2 smoke rows understand); 9/9 correct route strong, each answering change-large above 0.55 (lowest 0.61, rows 2 and 15); 3/3 soft route standard.
+
+**CLAIM**
+The 32 against their labels (the 09-28 labels, two additions relabelled change-small): **27/32** agree. The five misses: `ReaderAuthorityDiff` understand → judge 0.31, `T3TypeSafeJudge` understand → judge 0.81, `T1CtxPiRoot` change-small → understand 0.92, `T2Phoenix` change-small → understand 1.00, `ExtSqliteTest` change-small → understand 0.71. Choices: understand 16, judge 6, change-small 5, locate 4, change-large 1. At 0.55 inclusive, 4 are flagged low-confidence (`ReaderAuthorityDiff`, `Phase5Agenda` change-small 0.33, `LedgerThirdParty` judge 0.42, `LedgerLifecycle` change-large 0.39); only `LedgerLifecycle` is pulled up, strong → deep (`route()` sets `pullUp` only when the tier changes); none routes below its label's tier, and 3 route above it (`ReaderAuthorityDiff` and `T3TypeSafeJudge` to deep, `LedgerLifecycle` to deep). Computed from the v4f3 table in `DEFINE.md`. v4f3 changes no choice on the audit 20 or the 32 relative to v3.
+
+**CLAIM**
+Held-out set A under v4f3 (tuning data by then): R12 14/14, R14 4/6. Sealed set B, opened only after v4f3 was frozen (`HELDOUT-B-v4f3.md`, batch `jdgb-15ad2108e53da03a`): R12 **7/7** correct route strong; R14 **0/3** over route standard, against a bar of 2/3. The three misses are dictated code-plus-own-test briefs that still route strong: `sl-kimi-tests` change-large 0.59 (a read-only audit plus one parser test file, every assertion dictated), `sl-byhand-context` change-large 0.70 (a launcher argv/env change the plan dictates, plus its own test file), `sl-queue-fix-r1` change-large 0.91 (a review fix whose design the brief dictates). v3 on set B, for comparison only, routes the same three strong.
+
+**CLAIM**
+Jo accepted this shortfall on 2026-10-20 (question `q-mvg42w7vgege0w`): on set B, 0 of 3 `over` briefs reach standard, and all 7 `correct` stay strong.
+
+**GUESS**
+Getting those briefs to standard pulls correct briefs down with them: the round-2 change-small clauses aimed at them (red tests, one function, docs alongside a small code change) flipped correct set-A briefs to standard (`DEFINE.md` § Set-A label notes). No wording tried reached 5 of set A's 6 `over` briefs while keeping every audit correct row above 0.55.
+
+### Threshold
+
+**CLAIM**
+Not re-swept: every bar was measured at 0.55 inclusive, the value `route.ts` uses, and at that value no brief on the 32, the audit 20 or either held-out set routes below its label's tier. The threshold stays 0.55.
+
+### Jev determinism
+
+**CLAIM**
+Repeat draws of the same text returned identical answers on every row, every time: v3 draws 2–4, v4f3 draws 1–3, and the three v3 draws on set A, where draws 2 and 3 added trailing whitespace to defeat TypeSafe's cache (`DEFINE.md` § Draws; `HELDOUT-A-v3.md`). The plan's "three consecutive draws" therefore measures no draw-to-draw variance; one draw is the measurement.
+
+### Workload-open impact
+
+**CLAIM**
+The same question judges workload briefs at open (`surface/extensions/workload.ts`, `classify(brief, …, loadKindQuestion())`): at normal stakes plan-first is skipped only for change-small ≥ 0.9, and the ×3 ceiling follows change-large > 0.55. `OPEN-IMPACT.md` replayed the stored `workloads.brief` of the 124 normal and throwaway workloads opened since 2026-10-05 (109 normal, 15 throwaway) under the 09-28 and the new question, one draw each (batches `jdgb-15ad216455bda042`, `jdgb-15ad21645b3da043`). Plan-first: 104 → 102, two normal workloads newly skip it (`wl-mv669tp6yous5c` change-small 0.46 → 1.00; `wl-mvbjieaki04kcg` change-large 0.60 → change-small 0.97); none newly plans. ×3 ceiling: 62 → 45 (29 lose it, 12 gain it). 42 workloads flip at least one of the two, all at normal stakes.
+
+**CLAIM**
+Jo answered **keep** for the two plan-first flips (question `q-mvg45v0ez6f1mo`).
+
+**CLAIM**
+The replay is not a replay of recorded open decisions: of the workloads with a parseable recorded `brief-judged:` entry, 57 differ from the 09-28 question's answer today (4 in kind, 53 in confidence only) (`OPEN-IMPACT.md` § Fidelity check).
+
+**GUESS**
+Those differences most likely come from whichever question text was live at each open rather than from judge noise, given the determinism above; `OPEN-IMPACT.md` did not test it.
+
+### Files
+
+- `classifier/test/fixtures/kind-question-2026-10-20.json` — the measured question, byte-for-byte
+- `classifier/test/fixtures/classifier-sample-2026-10-20.jsonl` — 82 recorded rows from one batch, `jdgb-15ad234df0d18da7` (meta line carries the question sha256, the file sha256, judge model and batch id): the 32, the audit 20 with their audit class, routing id and stakes, and held-out sets A (20) and B (10) with their blind labels; the offline replay (`classifier/test/replay.test.ts`) answers from it
+- `classifier/calibration.json` — now names this question, judge and sample; the 09-28 record moves under `superseded`
+- `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mvg2ntsbcm6fwg/DEFINE.md`, `HELDOUT-A-v3.md`, `HELDOUT-B-v4f3.md`, `OPEN-IMPACT.md` — every text tried, per-draw tables, batch ids

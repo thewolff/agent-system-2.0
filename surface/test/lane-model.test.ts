@@ -101,7 +101,7 @@ describe("T3/T8: the session is resumed only on the model it ran on", () => {
 		expect(resumePlan(c, "lane-m-2", [], X)).toEqual({ resume: null, skipped: `/one ran on ${A}` });
 		expect(resumePlan(c, "lane-m-2", [], A)).toEqual({ resume: "/one", skipped: null });
 		expect(resumePlan(c, "lane-m-2", [], null)).toEqual({ resume: null, skipped: `/one ran on ${A}` });
-		expect(interactiveArgv({ ...SPEC, model: X, resume: null })).toEqual(["--cwd", "/w", "--session-dir", "/s", "--append-system-prompt", "/p", "--model", X]);
+		expect(interactiveArgv({ ...SPEC, model: X, resume: null, firstPromptPath: "/l/prompt.md" })).toEqual(["--cwd", "/w", "--session-dir", "/s", "--append-system-prompt", "/p", "--model", X, "@/l/prompt.md"]);
 	});
 
 	test("T3b: a session only lane-parked: recorded keeps its lane's model; with no lane-started: at all it is unknown", () => {
@@ -140,7 +140,7 @@ describe("T3/T8: the session is resumed only on the model it ran on", () => {
 		expect(argv).not.toContain("--model");
 		expect(argv).not.toContain("--resume");
 		expect(argv).not.toContain("default");
-		expect(interactiveArgv({ ...SPEC, model, resume: plan.resume })).toEqual(["--cwd", "/w", "--session-dir", "/s", "--append-system-prompt", "/p"]);
+		expect(interactiveArgv({ ...SPEC, model, resume: plan.resume, firstPromptPath: "/l/prompt.md" })).toEqual(["--cwd", "/w", "--session-dir", "/s", "--append-system-prompt", "/p", "@/l/prompt.md"]);
 	});
 
 	test("T8b: named then cleared, the X launch failing before a session: default resumes the default-era s1", () => {

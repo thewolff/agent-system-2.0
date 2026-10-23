@@ -6,10 +6,9 @@
 import type { ReserveRows } from "../../ledger/src/index";
 import { nextRetry, progressAfter, RELAUNCH_BACKOFF_MS, RETRY_LIMIT } from "./incident";
 import {
-	type Attempt, attempts, type ControlEntry, controlEntries, doneBecause, heldLive, holdersOf, isIntendedOutcome, laneExit, prBindings,
+	type Attempt, attempts, type ControlEntry, controlEntries, doneBecause, heldLive, holdersOf, isIntendedOutcome, laneExit, trainBindings,
 } from "./launch";
 import { type ProbeFor, laneRunning, psProbe } from "./runner-probe";
-import { isRunnerCeilingSlice } from "./turn-end";
 
 /** The incident kind of a dead lane's spent relaunch budget (§ 1.5); its key is the dead lane. */
 export const RELAUNCH_INCIDENT = "relaunch";
@@ -58,7 +57,7 @@ export function laneEnd(w: ReserveRows["workload"], control: readonly ControlEnt
  * `due` now; `waiting` for the backoff to end at `until`; `exhausted` when n is past `RETRY_LIMIT` (the incident's
  * state); `unrecorded` when L died but no `lane-died:` message names it yet (never relaunched, § 1.4a); `none` otherwise.
  * Every outcome but `none` needs: an open autonomous workload, no holder `done-because:`, no valid `train:` entry (§ 1.8),
- * L `died`, at least one open slice (the runner's ceiling slice excepted) and no open question.
+ * L `died`, at least one open slice and no open question.
  */
 export type RelaunchState =
 	| { kind: "none" }
@@ -90,7 +89,7 @@ export function relaunchRead(rows: ReserveRows, parsed?: ParsedRows, probeFor: P
 	const holders = parsed?.holders ?? holdersOf(rows.entries, rows.workload.holder, rows.holders);
 	const control = parsed?.control ?? controlEntries(rows.entries, holders);
 	const receipt = parsed === undefined ? doneBecause(rows.entries, holders) : parsed.receipt;
-	const train = prBindings(rows.entries, rows.instructions, ["train"]).length > 0;
+	const train = trainBindings(rows.entries, rows.instructions).length > 0;
 	const last = attempts(control).at(-1);
 	if (last === undefined) return { lane: null, end: null, train, state: { kind: "none" } };
 	const end = laneEnd(rows.workload, control, last.laneId, rows.now, probeFor);
@@ -106,7 +105,7 @@ function stateOf(rows: ReserveRows, holders: readonly string[], control: readonl
 	const w = rows.workload;
 	if (w.status !== "open" || w.mode !== "autonomous" || receipt !== null || end.kind !== "died") return { kind: "none" };
 	// § 1.8: the merge-train workload (`train`) never reaches here.
-	const slices = rows.slices.filter((s) => !isRunnerCeilingSlice(s));
+	const slices = rows.slices;
 	if (!slices.some((s) => s.state === "open") || rows.questions.some((q) => q.state === "open")) return { kind: "none" };
 	const lane = last.laneId;
 	const n = nextRetry(

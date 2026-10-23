@@ -38,8 +38,8 @@ import { type EntryRow, homeDir, type InstructionRow, type Ledger, type Question
 import { renderClose, repoOf } from "./decision-log";
 import { ensureStandingWorkload, identityOf } from "./identity";
 import { fileIdentity, removeChild } from "./scratch-remove";
-import { branchName, controlEntries, holdersOf, prBindings, waivedPrs } from "./launch";
-import { checkoutOwnerRepo, trainSkippedOf } from "./merge-train";
+import { branchName, controlEntries, holdersOf, waivedPrs } from "./launch";
+import { checkoutOwnerRepo, trainPrs, trainSkippedOf } from "./merge-train";
 import { REPO_ROOT } from "./session";
 import {
 	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, decisionLogFault, mergedNeedsCover,
@@ -789,20 +789,20 @@ function runnerGreensOn(ledger: Ledger, ownerRepo: string): RunnerGreen[] {
 }
 
 /**
- * Every PR on a merge train of GitHub repository `ownerRepo` (PLAN wl-mv8s8srodefytc rev 17.1 D8): the PRs a valid `train:` entry
- * (`prBindings`, so bound to Jo's own `train` word) lists, on any workload, open or closed, whose `repo:` checkout's origin is
- * `ownerRepo` (`checkoutOwnerRepo`, compared without case as GitHub does), whatever checkout or directory the train was opened
- * from. A `red-main` result passes the close check only on such a PR (`closeFreshness`).
+ * Every PR on a merge train of GitHub repository `ownerRepo` (PLAN wl-mv8s8srodefytc rev 17.1 D8): every member
+ * (`trainMembers`: Jo's own `train` word, or the train tick's `train-board:`, PLAN wl-mvbjiettjrfpxc D2), on any workload, open or
+ * closed, whose `repo:` checkout's origin is `ownerRepo` (`checkoutOwnerRepo`, compared without case as GitHub does), whatever
+ * checkout or directory the train was opened from. A `red-main` result passes the close check only on such a PR (`closeFreshness`).
  */
 export function trainPrsOn(ledger: Ledger, ownerRepo: string): Set<number> {
 	const out = new Set<number>();
 	const want = ownerRepo.toLowerCase();
-	const ids = ledger.db.query<{ workload_id: string }, [string]>(
-		"SELECT DISTINCT workload_id FROM entries WHERE kind = 'assumption' AND body LIKE ? ORDER BY workload_id").all("train: %");
+	const ids = ledger.db.query<{ workload_id: string }, [string, string]>(
+		"SELECT DISTINCT workload_id FROM entries WHERE kind = 'assumption' AND (body LIKE ? OR body LIKE ?) ORDER BY workload_id").all("train: %", "train-board: %");
 	for (const { workload_id: wl } of ids) {
 		const on = repoOf(ledger, wl);
 		if (on === null || checkoutOwnerRepo(on)?.toLowerCase() !== want) continue;
-		for (const b of prBindings(ledger.entries(wl), ledger.instructions(wl), ["train"])) for (const n of b.prs) out.add(n);
+		for (const n of trainPrs(ledger.entries(wl), ledger.instructions(wl))) out.add(n);
 	}
 	return out;
 }

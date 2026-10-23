@@ -20,7 +20,7 @@ import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_CAP_ENV, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
 import { labOf } from "../../classifier/src/lab";
 import {
-	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
+	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, ESCALATION_BY, HOLD_HOURS, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
 } from "./types";
 import { isVetoStop, type RelaunchRead, relaunchRead } from "./relaunch";
 import { type ProbeFor, psProbe } from "./runner-probe";
@@ -87,7 +87,7 @@ export const CONTROL_PREFIXES = [
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
 	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr", "waive-pr", "train",
-	"train-task", "train-task-settled", "train-fix", "train-alert",
+	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-notice", "train-autoboard",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
 ] as const;
@@ -101,7 +101,7 @@ const LANE_SCOPED: Record<string, true> = {
 /** The daily scratch sweep's `created_by` (surface/scripts/scratch-sweep.ts). */
 export const SCRATCH_SWEEP_BY = "scratch-sweep";
 /**
- * Fixed writers per prefix (§ 5). `lane-stop` and `done-because` are refined in `validWriter`. The
+ * Fixed writers per prefix (§ 5). `lane-stop`, `plan` and `done-because` are refined in `validWriter`. The
  * starter writes `lane-started:` / `lane-exit:` for the interactive lane it runs in Jo's terminal
  * (decision 8) and for the by-hand `lane.ts stop`; the runner writes them for an autonomous lane.
  * `launch-failed:` comes from the starter (a failure before the spawn) and from the runner (a lane
@@ -109,6 +109,9 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * `repo:` is the open tool's record of the repository (decision-log.ts); a lane's note never routes git.
  * `ceiling:` is the surface's alone (open, Jo's words, the lowering tool) and `spend:` the runner's
  * alone (DESIGN-workload-ceiling.md § 2 item 1); the raise-needs-Jo rule lives in `effectiveCeiling`.
+ * `plan:` is the surface's (`first <trigger>` at open, `approved <instruction>` on Jo's approve, `halted <instruction>` on
+ * Jo's `halt`), except `approved auto <round group>`, which only ESCALATION_BY writes (the plan auto-start in
+ * `lane_raise_question`, PLAN wl-mvfkv7llkp7nk0 § 3) and the surface never does.
  * `artifact-tree:` is reserved so the lane tools refuse it; the lane's own artifact observer writes it
  * (surface/extensions/lane.ts) and `artifactTrees` (signals.ts) reads it, never as a lifecycle line here.
  * `reserved-withdrawn: <entry id>[ <reason>]` is written only by `lane_withdraw_reserved`, as the lane
@@ -158,6 +161,10 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * valid `train:` on that train listing n. The tick also writes a fix workload's `repo:` and `done:` and `launch-requested:` as MERGE_TRAIN_BY.
  * `train-alert: <q> level <n> sending|notified|sent [<url>]` and `train-alert: <q> acked|closed <why>` are the train tick's alone
  * (MERGE_TRAIN_BY, PLAN rev 17.1 D9): its send ladder for an alert question; surface/src/errors.ts reads them for the LOUD line.
+ * The auto-boarding rows (PLAN wl-mvbjiettjrfpxc D1-D3, D6, surface/src/merge-train.ts) are the train tick's alone too (MERGE_TRAIN_BY):
+ * `train-board: pr <n> workload <W> head <sha> run <tr-…|none> review <en-…|none>` on a train makes PR n a member as Jo's
+ * `train:` does (`trainBindings`; `boundPrs` admits it); `train-board-skip:`, `train-notice:` and `train-autoboard: on <iso>`
+ * (the cutover) are its records on the standing workload. A lane-written copy of any of them is dropped here.
  * The scratch lines (PLAN wl-mv5oikd5jtquww § 1.5, gates/src/scratch.ts SCRATCH_ENTRY) are machinery's alone, so a lane cannot
  * hide its own over-cap line with a forged `scratch-under-cap:`: `scratch-over-cap:` / `scratch-under-cap:` are the lane row's
  * turn-end measure, written as the lane holding the workload (a holder, `validWriter`); `scratch-disk:` / `scratch-disk-ok:` the
@@ -172,7 +179,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	worktree: [LANE_STARTER_BY],
 	branch: [LANE_STARTER_BY],
 	"launch-requested": [SURFACE_BY, MERGE_TRAIN_BY],
-	plan: [SURFACE_BY],
+	plan: [SURFACE_BY, ESCALATION_BY],
 	done: [SURFACE_BY, MERGE_TRAIN_BY],
 	repo: [SURFACE_BY, MERGE_TRAIN_BY],
 	"lane-started": [LANE_RUNNER_BY, LANE_STARTER_BY],
@@ -203,6 +210,10 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"train-task-settled": [MERGE_TRAIN_BY],
 	"train-fix": [MERGE_TRAIN_BY],
 	"train-alert": [MERGE_TRAIN_BY],
+	"train-board": [MERGE_TRAIN_BY],
+	"train-board-skip": [MERGE_TRAIN_BY],
+	"train-notice": [MERGE_TRAIN_BY],
+	"train-autoboard": [MERGE_TRAIN_BY],
 	"scratch-over-cap": [],
 	"scratch-under-cap": [],
 	"scratch-disk": [SCRATCH_SWEEP_BY],
@@ -246,6 +257,7 @@ function validWriter(prefix: ControlPrefix, rest: string, createdBy: string, hol
 		return holders.includes(createdBy);
 	}
 	if (prefix === "released-open") return laneId === createdBy && holders.includes(createdBy);
+	if (prefix === "plan") return /^approved auto\b/.test(rest) ? createdBy === ESCALATION_BY : createdBy === SURFACE_BY;
 	if (prefix === "lane-stop") {
 		if (/^accepted\b/.test(rest)) return createdBy === LANE_RUNNER_BY || createdBy === LANE_STARTER_BY;
 		if (/^requested\b/.test(rest)) return createdBy === SURFACE_BY || createdBy === LANE_STARTER_BY;
@@ -275,7 +287,8 @@ export function holdersOf(entries: readonly EntryRow[], current: string | null, 
  * The valid control entries among a workload's entries, oldest first: reserved prefix, the prefix's
  * writer, and a parsable body. `holders` are the writers of `done-because:` (`holdersOf`); omit it
  * when the reader does not care about that prefix. Everything else — a lane note shaped like a
- * control line, a `launch-requested:` from a lane, a `plan: approved` from anyone but the surface —
+ * control line, a `launch-requested:` from a lane, a `plan: approved` from anyone but the surface (or, for
+ * `approved auto`, anyone but ESCALATION_BY) —
  * is dropped here, so no reader sees it.
  */
 export function controlEntries(entries: readonly EntryRow[], holders: readonly string[] = []): ControlEntry[] {
@@ -810,16 +823,27 @@ export function laneExit(control: readonly ControlEntry[], laneId: string): { co
 	return null;
 }
 
-/** The `plan: first <trigger>` standing on a workload with no `plan: approved` after it, or null. */
+/**
+ * The `plan: first <trigger>` standing on a workload with no `plan: approved` (Jo's, or the auto-start's `approved auto`)
+ * after it, or null. Jo's `plan: halted <instruction>` stands it again (PLAN wl-mvfkv7llkp7nk0 § 3): a halted workload
+ * reads as plan-first and unapproved, its trigger naming the halt, until a later `plan: approved`.
+ */
 export function planFirst(control: readonly ControlEntry[]): { trigger: string; entryId: string } | null {
 	let flag: { trigger: string; entryId: string } | null = null;
 	for (const c of control) {
 		if (c.prefix !== "plan") continue;
 		const first = /^first\s+([\s\S]+)$/.exec(c.rest);
+		const halted = /^halted\s+(\S+)/.exec(c.rest);
 		if (first) flag = { trigger: first[1]!.trim(), entryId: c.id };
+		else if (halted) flag = { trigger: `halted by Jo (instruction ${halted[1]!})`, entryId: c.id };
 		else if (/^approved\b/.test(c.rest)) flag = null;
 	}
 	return flag;
+}
+
+/** Has Jo halted the workload (`plan: halted`, PLAN wl-mvfkv7llkp7nk0 § 3) at any time? Auto-start never fires on it again. */
+export function planHalted(control: readonly ControlEntry[]): boolean {
+	return control.some((c) => c.prefix === "plan" && /^halted\b/.test(c.rest));
 }
 
 /**
@@ -1055,8 +1079,8 @@ export function doneLine(control: readonly ControlEntry[]): string | null {
  * (`doneBecause`), and `lane_record_entry` refuses a body opening with any of them (surface/extensions/lane-tools.ts,
  * PLAN wl-mv64rsqw2fcs1s D5). A closed list: any other line, prefixed or not, still does. The pair
  * trigger's `pair-signal:` / `pair-signal-failed:` (the classifier's jev attempt), `pair-exposure:` (the lane's
- * classifier reading the switch on) and `pair-offer:` (stamped by the classifier at the round limit, by the lane runner
- * at the ceiling) are listed here so no lane can forge them (PLAN wl-mv67564rdkfvnk D9, surface/src/pair-suggest.ts).
+ * classifier reading the switch on) and `pair-offer:` (stamped by the classifier at the round limit) are listed here so
+ * no lane can forge them (PLAN wl-mv67564rdkfvnk D9, surface/src/pair-suggest.ts).
  * `headroom-skip: <selector> token <dt> <reason>` is the classifier's record of a tier-row entry it skipped as projected out of
  * quota (PLAN wl-mv71x5rwdu7eo0 § 3, classifier/src/headroom.ts), written beside `provider-refused:`.
  */
@@ -1182,7 +1206,10 @@ export function prBindings(entries: readonly EntryRow[], instructions: readonly 
 	return out;
 }
 
-/** A fix workload's binding (PLAN wl-mv8s8srodefytc rev 17.1 D8): the train's repository, the PR, the train and the `train:` entry listing it. */
+/**
+ * A fix workload's binding (PLAN wl-mv8s8srodefytc rev 17.1 D8): the train's repository, the PR, the train and the membership
+ * entry listing the PR there (Jo's `train:` or the tick's `train-board:`, PLAN wl-mvbjiettjrfpxc D2).
+ */
 export interface TrainFix {
 	repo: string;
 	pr: number;
@@ -1200,27 +1227,75 @@ export function parseTrainFix(rest: string): TrainFix | null {
 	return m ? { repo: m[1]!, pr: Number(m[2]), train: m[3]!, trainEntry: m[4]! } : null;
 }
 
+/** A board (PLAN wl-mvbjiettjrfpxc D2): the train tick put PR `pr` of lane workload `workload` on a train, at head `head`, green in run `run`, reviewed by entry `review`. */
+export interface TrainBoard {
+	pr: number;
+	workload: string;
+	head: string;
+	run: string | null;
+	review: string | null;
+}
+/** `train-board: pr <n> workload <W> head <sha> run <tr-…|none> review <en-…|none>`, the train tick's alone (MERGE_TRAIN_BY). */
+export function trainBoardBody(b: TrainBoard): string {
+	return `train-board: pr ${b.pr} workload ${b.workload} head ${b.head} run ${b.run ?? "none"} review ${b.review ?? "none"}`;
+}
+const TRAIN_BOARD_RE = /^pr ([1-9]\d*) workload (wl-[a-z0-9]+) head ([0-9a-f]{40}) run (tr-[a-z0-9]+|none) review (en-[a-z0-9]+|none)$/;
+/** A valid `train-board:` entry's rest, parsed; null when it is not that shape. */
+export function parseTrainBoard(rest: string): TrainBoard | null {
+	const m = TRAIN_BOARD_RE.exec(rest);
+	return m ? { pr: Number(m[1]), workload: m[2]!, head: m[3]!, run: m[4] === "none" ? null : m[4]!, review: m[5] === "none" ? null : m[5]! } : null;
+}
+
 /**
- * The PR numbers Jo bound to this workload for a run with no push (PLAN wl-mv5qdfvv82ivwg § 2.2), each
- * with the instruction that binds it: every valid `test-pr:` binding and, on a merge train (PLAN
- * wl-mv8s8srodefytc § 1), every valid `train:` binding (`prBindings`). Bindings accumulate, oldest first;
- * a number bound twice keeps its first instruction. Pass the workload's entries and its instructions.
+ * One membership entry of a merge train (PLAN wl-mvbjiettjrfpxc D2): Jo's valid `train:` binding (`prBindings`, its PRs in Jo's
+ * order, `by` Jo's instruction) or the tick's valid `train-board:` (one PR, `by` the board entry itself, `board` parsed).
+ */
+export interface TrainBinding {
+	source: "jo" | "board";
+	prs: number[];
+	by: string;
+	entryId: string;
+	createdAt: string;
+	board: TrainBoard | null;
+}
+
+/** Every membership entry on a workload, in entry order, none deduplicated: what `trainMembers` (surface/src/merge-train.ts) reads. */
+export function trainBindings(entries: readonly EntryRow[], instructions: readonly InstructionRow[]): TrainBinding[] {
+	const jo = new Map(prBindings(entries, instructions, ["train"]).map((b) => [b.entryId, b]));
+	const out: TrainBinding[] = [];
+	for (const c of controlEntries(entries)) {
+		const b = c.prefix === "train" ? jo.get(c.id) : undefined;
+		if (b) out.push({ source: "jo", prs: b.prs, by: b.instructionId, entryId: c.id, createdAt: c.createdAt, board: null });
+		const board = c.prefix === "train-board" ? parseTrainBoard(c.rest) : null;
+		if (board) out.push({ source: "board", prs: [board.pr], by: c.id, entryId: c.id, createdAt: c.createdAt, board });
+	}
+	return out;
+}
+
+/**
+ * The PR numbers bound to this workload for a run with no push (PLAN wl-mv5qdfvv82ivwg § 2.2), each with what binds it (`by`):
+ * every valid `test-pr:` binding (Jo's instruction) and, on a merge train (PLAN wl-mv8s8srodefytc § 1), every member
+ * (`trainBindings`: Jo's `train:` names his instruction, the tick's `train-board:` itself, PLAN wl-mvbjiettjrfpxc D2). Bindings
+ * accumulate in entry order; a number bound twice keeps its first. Pass the workload's entries and its instructions.
  * With `trains` (the ledger), a fix workload's `train-fix:` binds its PR too (rev 17.1 D8), but only when the entry it names is a
- * valid `train:` binding on that train listing the PR; it carries that entry's instruction, Jo's own `train` word.
+ * membership entry on that train listing the PR; it carries that entry's `by`.
  */
 export function boundPrs(
 	entries: readonly EntryRow[], instructions: readonly InstructionRow[], trains?: { entries(id: string): EntryRow[]; instructions(id: string): InstructionRow[] },
-): { pr: number; instructionId: string }[] {
-	const out: { pr: number; instructionId: string }[] = [];
-	for (const b of prBindings(entries, instructions, ["test-pr", "train"])) {
-		for (const pr of b.prs) if (!out.some((x) => x.pr === pr)) out.push({ pr, instructionId: b.instructionId });
-	}
+): { pr: number; by: string }[] {
+	const order = new Map(entries.map((e, i) => [e.id, i]));
+	const bindings = [
+		...prBindings(entries, instructions, ["test-pr"]).map((b) => ({ entryId: b.entryId, prs: b.prs, by: b.instructionId })),
+		...trainBindings(entries, instructions),
+	].sort((a, b) => order.get(a.entryId)! - order.get(b.entryId)!);
+	const out: { pr: number; by: string }[] = [];
+	for (const b of bindings) for (const pr of b.prs) if (!out.some((x) => x.pr === pr)) out.push({ pr, by: b.by });
 	if (trains === undefined) return out;
 	for (const c of controlEntries(entries)) {
 		const f = c.prefix === "train-fix" ? parseTrainFix(c.rest) : null;
 		if (f === null || out.some((x) => x.pr === f.pr)) continue;
-		const b = prBindings(trains.entries(f.train), trains.instructions(f.train), ["train"]).find((x) => x.entryId === f.trainEntry);
-		if (b?.prs.includes(f.pr)) out.push({ pr: f.pr, instructionId: b.instructionId });
+		const b = trainBindings(trains.entries(f.train), trains.instructions(f.train)).find((x) => x.entryId === f.trainEntry);
+		if (b?.prs.includes(f.pr)) out.push({ pr: f.pr, by: b.by });
 	}
 	return out;
 }
@@ -1292,6 +1367,20 @@ export function planFirstBody(trigger: string): string {
 export function planApprovedBody(instructionId: string): string {
 	return `plan: approved ${instructionId}`;
 }
+/** The auto-start's approval (PLAN wl-mvfkv7llkp7nk0 § 3), written by ESCALATION_BY only: the passing review round's dispatch group. */
+export function planAutoApprovedBody(group: string): string {
+	return `plan: approved auto ${group}`;
+}
+/** Jo's `halt <wl>` (PLAN wl-mvfkv7llkp7nk0 § 3), written by the surface naming Jo's instruction. */
+export function planHaltedBody(instructionId: string): string {
+	return `plan: halted ${instructionId}`;
+}
+/** The opening of the auto-start's notice text (after `notice: `), by which `prStakes` finds the notice whose delivery starts the hold. */
+export const PLAN_AUTO_STARTED = "plan started without your approve";
+/** The auto-start's notice (PLAN wl-mvfkv7llkp7nk0 § 3): the § 3 wording on `wl`, then the plan question's body. */
+export function planAutoStartNoticeBody(wl: string, planBody: string): string {
+	return `${PLAN_AUTO_STARTED} on ${wl} (normal stakes, cross-lab review passed); it will not merge until ${HOLD_HOURS} h after your next message here; \`halt ${wl}\` stops it\n${planBody}`;
+}
 export function planQuestionBody(questionId: string): string {
 	return `plan-question: ${questionId}`;
 }
@@ -1351,13 +1440,21 @@ export function laneArgv(spec: LaunchSpec): string[] {
 	return argv;
 }
 
-/** OMP's argv for `as2 lane <wl>` in the TUI: `--cwd … --session-dir … --append-system-prompt … [--model …] [--resume …]` (§ 8). */
-export function interactiveArgv(spec: Pick<LaunchSpec, "worktree" | "sessionDir" | "systemPromptPath" | "resume" | "model">): string[] {
+/**
+ * OMP's argv for `as2 lane <wl>` in the TUI: `--cwd … --session-dir … --append-system-prompt … [--model …] [--resume …] @<first prompt>`
+ * (§ 8). The last argument is OMP's native `@file` initial message (PLAN wl-mvb9mw00ycfjeo PLAN-2 D1): one argv element, so a
+ * path with spaces needs no quoting; OMP reads the file and sends it as the session's first user message, on a resume too (D2).
+ */
+export function interactiveArgv(spec: Pick<LaunchSpec, "worktree" | "sessionDir" | "systemPromptPath" | "resume" | "model"> & { firstPromptPath: string }): string[] {
 	const argv = ["--cwd", spec.worktree, "--session-dir", spec.sessionDir, "--append-system-prompt", spec.systemPromptPath];
 	if (spec.model != null) argv.push("--model", spec.model);
 	if (spec.resume !== null) argv.push("--resume", spec.resume);
+	argv.push(`@${spec.firstPromptPath}`);
 	return argv;
 }
+
+/** Set to `1` in a by-hand lane's env (`as2 lane <wl>`, PLAN-2 D4); `laneEnv` drops an inherited value, so no autonomous lane carries it. */
+export const BY_HAND_ENV = "AGENT_SYSTEM_BY_HAND";
 
 /**
  * The lane's environment: the starter's, with the binding written over it (decision 11), and the workload's scratch root as
@@ -1365,12 +1462,13 @@ export function interactiveArgv(spec: Pick<LaunchSpec, "worktree" | "sessionDir"
  * process env, so their bash calls see it too. `OMP_PROFILE` and the ledger path pass through. Where the clean-shell switch
  * `cleanShell` (the installed profile's, read by the caller) is on for this workload, the shell-start hooks are dropped, as
  * bin/as2 does for the orchestrator under "all": the lane's bash calls are refused otherwise (gates/src/shell-start.ts).
- * Off, unreadable or malformed, nothing is dropped: the env is main's.
+ * Off, unreadable or malformed, nothing is dropped: the env is main's. An inherited `BY_HAND_ENV` is always dropped: only the
+ * by-hand launcher sets it, after this (PLAN-2 D4).
  */
 export function laneEnv(base: Record<string, string | undefined>, binding: { workloadId: string; laneId: string }, cleanShell: CleanShellRead): Record<string, string> {
 	const out: Record<string, string> = {};
 	const hooks: readonly string[] = cleanShellOn(cleanShell, binding.workloadId) ? SHELL_START_HOOK_NAMES : [];
-	for (const [k, v] of Object.entries(base)) if (v !== undefined && !hooks.includes(k)) out[k] = v;
+	for (const [k, v] of Object.entries(base)) if (v !== undefined && !hooks.includes(k) && k !== BY_HAND_ENV) out[k] = v;
 	out[ROLE_ENV] = "lane";
 	out[WORKLOAD_ENV] = binding.workloadId;
 	out[LANE_ENV] = binding.laneId;
@@ -1401,6 +1499,10 @@ export interface PromptInput {
 	scratch?: { root: string; capMb: number };
 	/** The unsettled merge-train tasks this workload owns (PLAN wl-mv8s8srodefytc rev 17.1 D7; surface/src/merge-train.ts `ownerTasks`), oldest first. */
 	trainTasks?: readonly OwnerTrainTask[];
+	/** The test runner serves this repository (`testRunner.repos`, surface/src/test-run.ts `servedRepo`); surface/scripts/lane.ts reads it at launch. */
+	runnerServed?: boolean;
+	/** This workload is a merge train or a train's fix workload (surface/src/merge-train.ts `isTrainOrFix`). */
+	trainOrFix?: boolean;
 }
 
 /** A merge-train task as its owner lane reads it (D7): the task, its detail, and the PR's open full-suite slice on the owner, if any. */
@@ -1434,8 +1536,17 @@ export function trainTaskLines(t: OwnerTrainTask): string[] {
 	];
 }
 
-/** Decision 11's completion policy: Jo integrates this machinery repo; a product repo merges per SPEC-2.0.md § stakes. */
+/** The merge line of a lane whose PR the merge train lands (PLAN wl-mvbjiettjrfpxc D10): it never sends the PR to Jo. */
+export const TRAIN_LANDS_LINE =
+	`never merge it yourself and never hand it to Jo: a cross-lab review slice is required before the PR is done; once the PR is green at its head in a full suite (\`${LANE_FULL_TEST_TOOL}\`) and that review has passed, record done-because and release. The surface closes the workload and the merge train lands the PR.`;
+
+/**
+ * Decision 11's completion policy: an autonomous normal-stakes lane on a repo the test runner serves, other than a merge
+ * train or a fix workload, hands its green reviewed PR to the merge train (PLAN wl-mvbjiettjrfpxc D10, `TRAIN_LANDS_LINE`);
+ * otherwise Jo integrates this machinery repo, and a product repo merges per SPEC-2.0.md § stakes.
+ */
 function mergeLine(p: PromptInput): string {
+	if (p.runnerServed === true && p.trainOrFix !== true && p.workload.mode === "autonomous" && p.workload.stakes === "normal") return TRAIN_LANDS_LINE;
 	if (p.machinery) return "never merge on this repo: Jo integrates it. A merge-train lane merges other PRs only as its brief's self-merge step allows, never its own branch.";
 	if (p.workload.stakes === "production") return "the merge is Jo's: a judge slice, then Jo approves the merge.";
 	if (p.workload.stakes === "normal") return "merge proceeds on a judge slice's pass; tell Jo in one line after the merge.";
@@ -1470,7 +1581,9 @@ export function firstPrompt(p: PromptInput): string {
 		// PLAN wl-mv8vwb04cy18n4 D4: the requirements grammar reaches plan-first lanes only, from the one constant.
 		out.push(`The plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section that names, for each requirement, its enforcer or why it is prompt-only, in this grammar; a plan file without it, or with a line the check cannot parse, is refused:`);
 		out.push(PLAN_REQUIREMENTS_SHAPE);
-		out.push("Change slices are refused until Jo approves.");
+		out.push(
+			"Change slices are refused until Jo approves. At normal stakes a plan that passes cross-lab review starts on its own unless flow repair is up: when the latest review round on the plan slice passed wholly on labs other than the builder's, `lane_raise_question` approves the plan instead of asking, Jo gets a notice, and you add your change slices.",
+		);
 	}
 	const shown = new Set(p.resolved.map((r) => r.instructionId));
 	const owed = p.instructions.filter((i) => !shown.has(i.id));

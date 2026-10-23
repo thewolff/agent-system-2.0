@@ -13,6 +13,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { launchVerdict } from "../extensions/launch";
 import orchestratorSurface from "../index";
@@ -257,8 +258,10 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		const [notice] = await until("the tick's notice", () => (pushedNotices().length > 0 ? pushedNotices() : null));
 		const applied = notice!.message.content.split(APPLIED)[1]!.split("\n");
 		expect(applied).toHaveLength(1);
-		expect(applied[0]).toStartWith(`- tick: closed ${wl}: README.md carries a verify line — Decision-log entry `);
-		expect(applied[0]).toEndWith(` committed on ${branchName(wl)}; pushed to origin; PR opened: ${PR_URL}.`);
+		expect(applied[0]).toStartWith(`- tick: closed ${wl}:`);
+		expect(applied[0]).toContain(`](${pathToFileURL(join(r.repo, "README.md")).href})`);
+		expect(applied[0]).toContain(`<${PR_URL}>`);
+		expect(f.execs.calls.filter((c) => c.command === "bun")).toEqual([]);
 	}, 120_000);
 
 	test("the tick's close names a publish failure in its one notice line: gh failing leaves the entry committed and pushed, the close done, and Jo told there is no PR and why", async () => {
@@ -271,12 +274,21 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		await awake();
 		timers[0]!.fn();
 		await until("the tick's close", () => laneSnapshot(r, wl).workload?.status === "closed");
+		expect(git(r.repo, ["log", "--oneline", branchName(wl)]).out.split("\n")).toHaveLength(2);
+		expect(git(r.repo, ["log", "-1", "--format=%s", branchName(wl)]).out).toMatch(new RegExp(`^docs: decision-log entry .* \\(workload ${wl}\\)$`));
+		expect(git(r.repo, ["log", "--oneline", "main"]).out.split("\n")).toHaveLength(1);
 		expect(git(r.repo, ["ls-remote", "origin", `refs/heads/${branchName(wl)}`]).out.split(/\s/)[0]).toBe(git(r.repo, ["rev-parse", branchName(wl)]).out);
 		const [notice] = await until("the tick's notice", () => (pushedNotices().length > 0 ? pushedNotices() : null));
 		const applied = notice!.message.content.split(APPLIED)[1]!.split("\n");
 		expect(applied).toHaveLength(1);
-		expect(applied[0]).toStartWith(`- tick: closed ${wl}: README.md carries a verify line — Decision-log entry `);
-		expect(applied[0]).toEndWith(` committed on ${branchName(wl)}; pushed to origin; no PR: gh pr list exited 1: gh: not logged in; open one from ${branchName(wl)}.`);
+		expect(applied[0]).toStartWith(`- tick: closed ${wl}:`);
+		expect(applied[0]).toContain(`](${pathToFileURL(join(r.repo, "README.md")).href})`);
+		expect(applied[0]).toContain("no PR:");
+		expect(applied[0]).toContain("gh pr list exited 1");
+		expect(applied[0]).toContain("gh: not logged in");
+		expect(applied[0]).not.toContain(`<${PR_URL}>`);
+		expect(f.execs.calls.filter((c) => c.command === "gh").map((c) => c.args.slice(0, 2))).toEqual([["pr", "list"]]);
+		expect(f.execs.calls.filter((c) => c.command === "bun")).toEqual([]);
 	}, 120_000);
 
 	test("the tick does not close a workload awaiting close while a slice is open, and says so once per state: one notice after two ticks, again when the slice count changes", async () => {

@@ -244,17 +244,20 @@ function hookFix(name: string, environ: ReadonlyMap<string, string>, shellEnv: R
 	return "remove it from where OMP's non-interactive env takes it";
 }
 
-/** The hook refusals of `cert.env` (PLAN.md § 2.2 item 5), naming each name, never a value. */
-function hookReasons(cert: ReadonlyMap<string, string>, environ: ReadonlyMap<string, string>, shellEnv: Record<string, string>): string[] {
+/**
+ * The start-hook refusals of an env a `/bin/bash` or `/bin/sh` starts with (PLAN.md § 2.2 item 5), naming
+ * each name, never a value; `fix` says where a name came from. The bash tool's certificate reads `cert.env`
+ * through it, and pair_run (src/pair-call.ts) the env its own `/bin/sh` is spawned with.
+ */
+export function envHookReasons(env: Iterable<readonly [string, string]>, fix: (name: string) => string): string[] {
 	const out: string[] = [];
 	// An array lookup, not an object one: env names include `__proto__` and `constructor`.
 	const hooks: readonly string[] = SHELL_START_HOOK_NAMES;
-	for (const [name, value] of cert) {
-		const fix = hookFix(name, environ, shellEnv);
-		if (hooks.includes(name)) out.push(`the env carries ${name}, which /bin/bash or /bin/sh reads at start: ${fix}`);
-		else if (name.startsWith(FUNC_PREFIX)) out.push(`the env carries ${JSON.stringify(name)}, a ${FUNC_PREFIX} exported function /bin/bash imports at start: ${fix}`);
-		else if (!IDENT.test(name)) out.push(`the env carries the name ${JSON.stringify(name)}, which is not a shell identifier: ${fix}`);
-		else if (value.startsWith(FUNC_VALUE)) out.push(`the env's ${name} holds a value starting \`${FUNC_VALUE}\`, which bash may import as a function: ${fix}`);
+	for (const [name, value] of env) {
+		if (hooks.includes(name)) out.push(`the env carries ${name}, which /bin/bash or /bin/sh reads at start: ${fix(name)}`);
+		else if (name.startsWith(FUNC_PREFIX)) out.push(`the env carries ${JSON.stringify(name)}, a ${FUNC_PREFIX} exported function /bin/bash imports at start: ${fix(name)}`);
+		else if (!IDENT.test(name)) out.push(`the env carries the name ${JSON.stringify(name)}, which is not a shell identifier: ${fix(name)}`);
+		else if (value.startsWith(FUNC_VALUE)) out.push(`the env's ${name} holds a value starting \`${FUNC_VALUE}\`, which bash may import as a function: ${fix(name)}`);
 	}
 	return out;
 }
@@ -339,7 +342,8 @@ export async function shellStart(host: ShellStartHost, ctx: Ctx, input: Record<s
 		cert = new Map(e.env);
 		for (const [k, v] of Object.entries(shellEnv)) cert.set(k, v);
 		for (const [k, v] of Object.entries(nonInteractive)) cert.set(k, String(v));
-		reasons.push(...hookReasons(cert, e.env, shellEnv));
+		const [environ, shell] = [e.env, shellEnv];
+		reasons.push(...envHookReasons(cert, (name) => hookFix(name, environ, shell)));
 	}
 
 	if (reasons.length > 0 || cert === null) return { certified: false, reasons };

@@ -2,16 +2,22 @@
 // extension API: role detection, row 2 injection in hands, row 3 flagging a hand's yield without
 // blocking it, row 1 at session_stop, row 11 on input (including a failed write), row 7's wake cycle
 // with its recovery tool and its stop check, and `ask` removed for an autonomous lane.
-import { describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { describe, expect, spyOn, test } from "bun:test";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { parseFindings } from "../../classifier/src/rounds";
+import receiptsRow from "../extensions/r03-receipts";
 import { errorLines } from "../../surface/src/errors";
 import { artifactTreeBody } from "../../surface/src/signals";
-import { STANDING_WORKLOAD_ID } from "../../surface/src/types";
+import { STANDING_SLICE_TASK, STANDING_WORKLOAD_ID } from "../../surface/src/types";
 import pushRebaseRow from "../extensions/r08-push-rebase";
 import reservedRow from "../extensions/r06-reserved";
 import p11Gates, { type GatesAPI } from "../index";
+import { DISPLAY_LINKS } from "../extensions/open-links";
 import { CONTRACT_MARKER } from "../src/rows/r02-contract";
+import { prepareLinkSession, sessionLinkOptions, setLinkRouter } from "../src/links";
 import { brief, commit, git, repoWithOrigin, tempLedger, testRecord, tmp } from "./helpers";
 
 type AnyHandler = (event: unknown, ctx: unknown) => unknown;
@@ -27,7 +33,7 @@ const schema = (): unknown => ({ describe: () => schema(), optional: () => schem
  * A fake OMP extension API whose emit follows the runner's chaining (runner.ts emitToolCall,
  * emitBeforeAgentStart, emit for session_stop, input): tool_call stops at the first block and
  * otherwise returns the last result; before_agent_start threads the system prompt and collects
- * messages; session_stop stops at the first block; input stops at the first `handled`.
+ * messages; context threads replacement messages; session_stop stops at the first block; input stops at the first `handled`.
  */
 function fakePi(tools = ["read", "bash", "ask", "task", "yield"]) {
 	const handlers = new Map<string, AnyHandler[]>();
@@ -59,8 +65,15 @@ function fakePi(tools = ["read", "bash", "ask", "task", "yield"]) {
 		}
 		let last: unknown;
 		for (const h of hs) {
-			const r = (await h(event, ctx)) as { block?: boolean; decision?: string; handled?: boolean } | undefined;
+			const r = (await h(event, ctx)) as { block?: boolean; decision?: string; handled?: boolean; messages?: unknown[] } | undefined;
 			if (!r) continue;
+			if (name === "context") {
+				if (!r.messages) continue;
+				event = { ...event, messages: r.messages };
+			}
+			if (name === "assistant_message" && "content" in r) {
+				event = { ...event, message: { ...(event.message as object), content: r.content } };
+			}
 			last = r;
 			if (r.block || r.decision === "block" || r.handled) return r;
 		}
@@ -156,6 +169,32 @@ describe("gates extension adapter", () => {
 
 		const dispatch = { toolName: "task", input: { tasks: [{ agent: "builder", task: brief() }] } };
 		expect(((await f.emit("tool_call", dispatch, ctx)) as { block: boolean }).block).toBe(true);
+	});
+
+	test("row 7 ledger questions never resolve legacy local handles in the waking lane", async () => {
+		const { ledger, wl, f, ctx } = await boundLane();
+		const root = tmp("wake-local");
+		const plan = join(root, "PLAN.md");
+		writeFileSync(plan, "unrelated waking lane plan");
+		Object.assign(ctx, { localProtocolOptions: { getArtifactsDir: () => root } });
+		const sl = ledger.slices(wl)[0]!.id;
+		ledger.raiseQuestion({ by: "old-lane", workloadId: wl, sliceId: sl, body: `Read local://PLAN.md or ${plan}`, options: ["yes", "no"] });
+		let locates = 0;
+		setLinkRouter({
+			async locate() { locates++; return plan; },
+			locateSync() { locates++; return plan; },
+		});
+		try {
+			const start = await f.emit("before_agent_start", { prompt: "go", systemPrompt: [] }, ctx) as { messages: { customType: string; content: string }[] };
+			const text = start.messages.find((m) => m.customType === "p11-wake")!.content;
+			expect(text).toContain("Read local://PLAN.md");
+			expect(text).not.toContain("[local://");
+			expect(text).toContain(`[${plan}](${pathToFileURL(plan).href})`);
+			expect(locates).toBe(0);
+		} finally {
+			setLinkRouter(undefined);
+			ledger.close();
+		}
 	});
 
 	test("row 7: a second turn with no tool calls is refused at its stop (astra review B3)", async () => {
@@ -331,5 +370,187 @@ describe("gates extension adapter", () => {
 		commit(work, "g.txt", "g\n");
 		expect(reasonOf(await f.emit("tool_call", push("p4"), ctx))).toContain("P-11 row 8");
 		expect(failures()).toHaveLength(3);
+	});
+});
+
+// T2/T3 intentionally import only pre-existing entry points: the unpacked baseline reaches
+// behavioral assertions rather than failing to import the new links module.
+describe("T2 settled links through the gates entry", () => {
+	const root = mkdtempSync(join(process.env.AS2_SCRATCH ?? tmpdir(), "openlinks-entry-"));
+	mkdirSync(join(root, "My Docs"));
+	const path = join(root, "My Docs/x.ts");
+	writeFileSync(path, "one\ntwo\nthree");
+	const url = pathToFileURL(path).href;
+	const linked = `[${path.replace(/[\\`*_\[\]<>~&$]/g, "\\$&")}](${url})`;
+	const env = { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_CONTRACT: "/nonexistent", HOME: "/nonexistent-home" };
+	const message = (text: string, tool = false) => ({ role: "assistant", content: [{ type: "text", text }, ...(tool ? [{ type: "toolCall", id: "c1", name: "read", arguments: {} }] : [])] });
+	test("context is a no-op without link asides and composes filtering with a later extension", async () => {
+		const f = fakePi();
+		p11Gates(f.pi, env);
+		const ctx = ctxOf({ hasUI: true, cwd: root });
+		const kept = { role: "custom", customType: "other-extension", content: "keep" };
+		expect(await f.emit("context", { type: "context", messages: [kept] }, ctx)).toBeUndefined();
+		const appended = { role: "user", content: "later extension" };
+		let seen: unknown;
+		f.pi.on("context", (event) => {
+			seen = event.messages;
+			return { messages: [...event.messages, appended] };
+		});
+		const aside = { role: "custom", customType: DISPLAY_LINKS, content: "display only" };
+		const messages = [aside, kept];
+		expect(await f.emit("context", { type: "context", messages }, ctx)).toEqual({ messages: [kept, appended] });
+		expect(seen).toEqual([kept]);
+		expect(messages).toEqual([aside, kept]);
+	});
+	test("rewrites ordinary text and tool-call messages, while row 1 still holds handed-over commands", async () => {
+		const f = fakePi();
+		p11Gates(f.pi, env);
+		const ctx = ctxOf({ hasUI: true, cwd: root });
+		const original = message(`**PMDW**\nOpen ${path}.`);
+		const normal = (await f.emit("assistant_message", { message: original }, ctx) ?? original) as { content: { text: string }[] };
+		expect(normal.content[0]!.text).toContain(linked);
+		expect(await f.emit("session_stop", { last_assistant_message: { content: normal.content } }, ctx)).toBeUndefined();
+		const tool = (await f.emit("assistant_message", { message: message(path, true) }, ctx) ?? message(path, true)) as { content: { type: string; text?: string }[] };
+		expect(tool.content[0]!.text).toBe(linked);
+		expect(tool.content[1]!.type).toBe("toolCall");
+		const held = await f.emit("assistant_message", { message: message("**ACTION**\nbash ~/x.sh") }, ctx) as { content: { text: string }[] };
+		expect(held.content[0]!.text).toContain("Reply held");
+		expect((await f.emit("session_stop", { last_assistant_message: { content: held.content } }, ctx) as { reason: string }).reason).toContain("P-11 row 1");
+	});
+	test("row 15 binds the QUESTION row despite a linked path in its body", async () => {
+		const { ledger, path: db } = tempLedger();
+		ledger.openWorkload({ id: STANDING_WORKLOAD_ID, by: "orch", brief: "standing", stakes: "normal", mode: "autonomous" });
+		const slice = ledger.addSlice({ by: "orch", workloadId: STANDING_WORKLOAD_ID, task: STANDING_SLICE_TASK, doneCondition: "d", inputs: "i", id: "sl-orchestrator-standing" });
+		const q = ledger.raiseQuestion({ by: "orch", workloadId: STANDING_WORKLOAD_ID, sliceId: slice, body: `Open ${path}?`, options: ["yes", "no"] });
+		const f = fakePi();
+		p11Gates(f.pi, { ...env, AGENT_SYSTEM_LEDGER_DB: db });
+		const ctx = ctxOf({ hasUI: true, cwd: root });
+		const original = message(`**QUESTION**\n(${q}) Open ${path}? Options: yes / no`);
+		const result = (await f.emit("assistant_message", { message: original }, ctx) ?? original) as { content: { text: string }[] };
+		expect(result.content[0]!.text).toContain(linked);
+		expect(result.content[0]!.text).not.toContain("Reply held");
+		expect(ledger.entries(STANDING_WORKLOAD_ID, "assumption").some(e => e.body.includes(`question-published: ${q}`))).toBe(true);
+	});
+	test("a hand's fenced review-findings still parses", async () => {
+		const f = fakePi();
+		p11Gates(f.pi, env);
+		const block = '```review-findings\n{"findings":[]}\n```';
+		const text = `${path}\n${block}`;
+		const r = (await f.emit("assistant_message", { message: message(text) }, ctxOf({ hasUI: false, parent: "/sessions/lane.jsonl", cwd: root })) ?? message(text)) as { content: { text: string }[] };
+		expect(r.content[0]!.text).toContain(linked);
+		expect(r.content[0]!.text).toContain(block);
+		expect(parseFindings(r.content[0]!.text)).toEqual(parseFindings(block));
+	});
+});
+
+describe("T3 receipt checks through existing receipts adapter", () => {
+	const root = mkdtempSync(join(process.env.AS2_SCRATCH ?? tmpdir(), "linked-receipts-"));
+	mkdirSync(join(root, "My Docs"));
+	const path = join(root, "My Docs/x.ts");
+	writeFileSync(path, "one\ntwo\nthree");
+	async function reportFlags(report: string, reads: string[], hand: boolean): Promise<string> {
+		const f=fakePi();
+		receiptsRow(f.pi, { AGENT_SYSTEM_ROLE: "orchestrator" });
+		const ctx=ctxOf({hasUI:!hand,...(hand ? {parent:"/lane.jsonl"} : {}),cwd:root});
+		for (const path of reads) await f.emit("tool_result",{toolName:"read",input:{path},details:{resolvedPath:path},isError:false},ctx);
+		if (hand) {
+			const result=await f.emit("tool_call",{toolName:"yield",input:{data:{report}}},ctx) as {input?:{data:{report:string}}}|undefined;
+			return result?.input?.data.report.slice(report.length) ?? "";
+		}
+		await f.emit("session_stop",{last_assistant_message:{content:report}},ctx);
+		return f.entries.map(e=>JSON.stringify(e.data)).join("\n");
+	}
+	for (const hand of [false,true]) {
+		test(`prose slash and clock are not receipts in ${hand ? "hand yield" : "session stop"}`, async () => {
+			expect(await reportFlags(`**CLAIM**\nthe timer and/or the retry fires at 10:30, see ${path}:3`,[path],hand)).toBe("");
+		});
+		for (const linked of [false,true]) {
+			test(`each ${linked ? "linked" : "bare"} receipt owns its quote in ${hand ? "hand yield" : "session stop"}`, async () => {
+				const a=join(root,"a.ts"), b=join(root,"b.ts");
+				writeFileSync(a,Array.from({length:40},(_,i)=>i === 2 || i === 29 ? "first file evidence" : "first filler").join("\n"));
+				writeFileSync(b,"one\ntwo\nsecond file evidence\n");
+				const receipt=(p:string,line:number)=>linked ? `[${p}:${line}](${pathToFileURL(p).href})` : `${p}:${line}`;
+				for (const firstLine of [3,30]) {
+					const report=`**CLAIM**\n${receipt(a,firstLine)} — \`first file evidence\`; ${receipt(b,3)} — \`second file evidence\``;
+					expect(await reportFlags(report,[a,b],hand)).toBe("");
+					const wrong=report.replace("`second file evidence`","`wrong second evidence`");
+					const flags=await reportFlags(wrong,[a,b],hand);
+					expect(flags).toContain(`does not match ${b} near line 3`);
+					expect(flags).not.toContain(`does not match ${a}`);
+				}
+				// A quote after another receipt must not be borrowed by a preceding unquoted receipt.
+				expect(await reportFlags(`**CLAIM**\n${receipt(a,3)}; ${receipt(b,3)} — "second file evidence"`,[a,b],hand)).toBe("");
+			});
+		}
+	}
+	for (const linked of [false, true]) for (const hand of [false, true]) {
+		test(`${linked ? "linked" : "bare"} CLAIM in ${hand ? "hand yield" : "session stop"}`, async () => {
+			const f = fakePi();
+			receiptsRow(f.pi, { AGENT_SYSTEM_ROLE: "orchestrator" });
+			const ctx = ctxOf({ hasUI: !hand, ...(hand ? { parent: "/lane.jsonl" } : {}), cwd: root });
+			const report = (line: number) => `**CLAIM**\n${linked ? `[${path}:${line}](${pathToFileURL(path).href})` : `${path}:${line}`}`;
+			const flags = async (line: number): Promise<string> => {
+				if (hand) {
+					const r = await f.emit("tool_call", { toolName: "yield", input: { data: { report: report(line) } } }, ctx) as { input?: { data: { report: string } } } | undefined;
+					return r?.input?.data.report ?? "";
+				}
+				f.entries.length = 0;
+				await f.emit("session_stop", { last_assistant_message: { content: report(line) } }, ctx);
+				return JSON.stringify(f.entries);
+			};
+			expect(await flags(3)).toContain("not read this session");
+			await f.emit("tool_result", { toolName: "read", input: { path }, details: { resolvedPath: path }, isError: false }, ctx);
+			expect(await flags(3)).not.toContain("not read this session");
+			expect(await flags(9)).toContain("past the file's 3 lines");
+		});
+	}
+});
+
+describe("T7 bounded repository discovery", () => {
+	test("gh and fallback git receive real execution timeouts within one shared budget", async () => {
+		const ctx=ctxOf({hasUI:true});
+		const calls:{command:string;timeout:number;signal:AbortSignal}[]=[];
+		let now=1000;
+		const clock=spyOn(Date,"now").mockImplementation(()=>now);
+		try {
+			const pi={exec:async(command:string,_args:string[],options:{cwd:string;timeout:number;signal:AbortSignal})=>{
+				calls.push({command,timeout:options.timeout,signal:options.signal});
+				if(command === "gh") { now+=1750; return {code:1,stdout:""}; }
+				return {code:0,stdout:"git@ghe.co:owner/repo.git\n"};
+			}};
+			await Promise.all([prepareLinkSession(pi,ctx),prepareLinkSession(pi,ctx)]);
+			expect(calls.map(c=>[c.command,c.timeout])).toEqual([["gh",1000],["git",250]]);
+			expect(calls[0]!.signal).toBe(calls[1]!.signal);
+			expect(sessionLinkOptions(ctx).repo).toEqual({host:"ghe.co",slug:"owner/repo"});
+		} finally { clock.mockRestore(); }
+	});
+	for(const stalled of ["gh","git"]) test(`an uncooperative ${stalled} cannot hold the session beyond its total deadline`, async () => {
+		const ctx=ctxOf({hasUI:true});
+		const timers:{callback:()=>void;delay:number}[]=[];
+		const calls:{command:string;timeout:number;signal:AbortSignal}[]=[];
+		const late=Promise.withResolvers<{code:number;stdout:string}>();
+		const timer=spyOn(globalThis,"setTimeout").mockImplementation(((callback:()=>void,delay:number)=>{
+			timers.push({callback,delay}); return 1;
+		}) as unknown as typeof setTimeout);
+		const clear=spyOn(globalThis,"clearTimeout").mockImplementation(()=>{});
+		try {
+			const pi={exec:(command:string,_args:string[],options:{cwd:string;timeout:number;signal:AbortSignal})=>{
+				calls.push({command,timeout:options.timeout,signal:options.signal});
+				return command === stalled ? late.promise : Promise.resolve({code:1,stdout:""});
+			}};
+			const pending=prepareLinkSession(pi,ctx);
+			await Promise.resolve(); // failed gh has reached its git fallback before the deadline fires
+			expect(calls.map(c=>[c.command,c.timeout])).toEqual(stalled === "gh" ? [["gh",1000]] : [["gh",1000],["git",1000]]);
+			expect(timers.map(t=>t.delay)).toEqual([2000]);
+			timers[0]!.callback();
+			await pending;
+			await prepareLinkSession(pi,ctx);
+			expect(calls).toHaveLength(stalled === "gh" ? 1 : 2);
+			expect(calls.every(c=>c.signal.aborted)).toBe(true);
+			late.resolve({code:0,stdout:stalled === "gh" ? JSON.stringify({nameWithOwner:"late/repo",url:"https://github.com/late/repo"}) : "git@github.com:late/repo.git"});
+			await Promise.resolve();
+			expect(sessionLinkOptions(ctx).repo).toBeNull();
+			expect(calls).toHaveLength(stalled === "gh" ? 1 : 2);
+		} finally { timer.mockRestore(); clear.mockRestore(); }
 	});
 });

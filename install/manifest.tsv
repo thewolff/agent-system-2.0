@@ -3,6 +3,9 @@
 # install/install.sh fails when a file under a machinery directory has no row here, or when any
 # symbolic link sits under one. Exactly one ledger-schema row (ledger/schema.sql, the file the
 # module applies), one ledger-init row, one ledger-backup row and one ledger-backup-agent row.
+# Paths are case-sensitive literals, not globs, including spaces and backslashes. Duplicate and
+# coverage checks use keyed lookups rather than rescanning a growing path list for every artifact;
+# filesystem and symbolic-link checks still run before any installed state is written.
 # destination: "-" = used in place from the checkout, nothing is copied or linked;
 #              "{ledger_db}" = the ledger file ($AGENT_SYSTEM_LEDGER_DB, default $HOME/.agent-system-2/ledger.db);
 #              "{launch_agents}/<name>" = $HOME/Library/LaunchAgents/<name>, written filled in on macOS
@@ -49,9 +52,11 @@ classifier/test/crosslab.test.ts	test	-
 classifier/test/extension.test.ts	test	-
 classifier/test/fingerprint.test.ts	test	-
 classifier/test/fixtures/classifier-sample-2026-09-28.jsonl	test	-
+classifier/test/fixtures/classifier-sample-2026-10-20.jsonl	test	-
 classifier/test/fixtures/classifier-sample-30.jsonl	test	-
 classifier/test/fixtures/kind-question-2026-09-23.json	test	-
 classifier/test/fixtures/kind-question-2026-09-28.json	test	-
+classifier/test/fixtures/kind-question-2026-10-20.json	test	-
 classifier/test/fixtures/ledger-replay/backup-2026-10-01T16-05-55.407Z.db.gz	test	-
 classifier/test/fixtures/ledger-replay/backup-2026-10-02T16-24-10.088Z.db.gz	test	-
 classifier/test/fixtures/ledger-replay/backup-2026-10-07T16-37-10.733Z.db.gz	test	-
@@ -111,6 +116,7 @@ gates/src/rows/r09-protected-edit.ts	module	-
 gates/src/rows/r10-raw-ledger.ts	module	-
 gates/src/rows/r11-jo-instruction.ts	module	-
 gates/src/rows/r14-ask-policy.ts	module	-
+gates/src/rulings.ts	module	-
 gates/src/session.ts	module	-
 gates/src/shell-parse.ts	module	-
 gates/src/targets.ts	module	-
@@ -119,6 +125,7 @@ gates/src/test-run.ts	module	-
 gates/src/git-model.ts	module	-
 gates/src/fence.ts	module	-
 gates/test/case-and-noexec.test.ts	test	-
+gates/test/rulings.test.ts	test	-
 gates/test/extension.test.ts	test	-
 gates/test/helpers.ts	test	-
 gates/test/known-fragment.test.ts	test	-
@@ -1096,9 +1103,11 @@ ledger/test/lane.test.ts	test	-
 surface/test/fake-omp.ts	test	-
 surface/test/launch.test.ts	test	-
 surface/test/lane-script.test.ts	test	-
+surface/test/lane-live-lane.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-
 surface/test/lane-model.test.ts	test	-
 surface/test/lane-model-script.test.ts	test	-
+surface/test/by-hand-context.test.ts	test	-
 surface/test/lane-headroom-script.test.ts	test	-
 surface/src/ctx-index.ts	module	-
 surface/test/ctx-index.test.ts	test	-
@@ -1120,6 +1129,8 @@ surface/src/test-run.ts	module	-
 surface/test/test-run.test.ts	test	-
 surface/scripts/test-runner.ts	module	-
 surface/test/test-runner.test.ts	test	-
+surface/scripts/test-run-waits.ts	module	-
+surface/test/test-run-waits.test.ts	test	-
 surface/src/merge-train.ts	module	-
 surface/src/merge-train-resolve.ts	module	-
 surface/src/merge-train-stack.ts	module	-
@@ -1128,8 +1139,11 @@ surface/test/merge-train-resolve.test.ts	test	-
 surface/test/train-word.test.ts	test	-
 surface/test/merge-train-stack.test.ts	test	-
 surface/test/train-return.test.ts	test	-
+surface/test/train-board.test.ts	test	-
 surface/scripts/train-tick.ts	module	-
 surface/test/train-tick.test.ts	test	-
+surface/test/train-world.ts	test	-
+surface/test/train-escalation.test.ts	test	-
 install/com.agent-system-2.train-tick.plist	install	-
 surface/scripts/test-exec.ts	module	-
 surface/src/as2test.ts	module	-
@@ -1208,6 +1222,7 @@ ledger/test/live-ledger-guard.test.ts	test	-
 ledger/test/fixtures/live-guard/reach.fixture.ts	test	-
 surface/src/pending.ts	module	-
 surface/src/batch.ts	module	-
+surface/src/notice.ts	module	-
 surface/test/pending.test.ts	test	-
 surface/test/batch.test.ts	test	-
 # Migration items one file each (wl-mv5mvvs64ahq0w): the numbering tool .github/workflows/migration-number.yml runs.
@@ -1223,7 +1238,6 @@ surface/scripts/pair-suggest.ts	module	-
 classifier/test/judge-ask.test.ts	test	-
 classifier/test/pair-suggest-raise.test.ts	test	-
 surface/test/pair-suggest-answer.test.ts	test	-
-surface/test/pair-suggest-ceiling.test.ts	test	-
 surface/test/pair-suggest-forgery.test.ts	test	-
 surface/test/pair-suggest-module.test.ts	test	-
 surface/test/pair-suggest-switch.test.ts	test	-
@@ -1234,6 +1248,16 @@ surface/scripts/orchestrator-prompt.ts	module	-
 surface/test/base-prompt.test.ts	test	-
 # Test runner self-refresh (migration/items/test-runner-self-refresh.md): row 6 pins for the refresh helper's sudo forms.
 gates/test/as2test-refresh-pins.test.ts	test	-
+# Openable links (migration/items/openable-links.md): render-only linking and the local herdr action.
+gates/src/links.ts	module	-
+gates/extensions/open-links.ts	extension	-
+gates/test/links.test.ts	test	-
+gates/test/open-links.test.ts	test	-
+surface/src/linked-api.ts	module	-
+surface/test/linked-api.test.ts	test	-
+install/herdr-file-links/herdr-plugin.toml	install	-
+install/herdr-file-links/open-file.sh	install	-
+ledger/test/file-links-install.test.ts	test	-
 # Jev ranking, show-only first (migration/items/jev-ranking.md): the ranking, the as2_rank tool, the audit, the launch gate, the CLIs.
 surface/src/rank.ts	module	-
 surface/src/rank-audit.ts	module	-
@@ -1264,47 +1288,102 @@ surface/src/tracing.ts	module	-
 surface/scripts/tracing.ts	module	-
 surface/test/tracing.test.ts	test	-
 surface/test/phoenix-run.test.ts	test	-
-# Jo's plugins (wl-mv8r90k9nci4qo, 2026-10-14): i-have-audhd and ask-graham vendored from
-# jo-wolff-plugins at the pin in plugins/VENDOR.md, upstream *.test.mjs left out. All used in place:
-# profile/config.yml loads plugins/index.ts (orchestrator only) and lists each plugins/<p>/skills dir.
+# Agent channel, phase 1 (migration/items/agent-channel.md): Plumb sends Ilex notes and proposals through
+# the OMP seat mailbox; never authored as Jo. Loaded by surface/index.ts for the orchestrator only.
+surface/src/channel.ts	module	-
+surface/extensions/agent-channel.ts	module	-
+surface/test/channel.test.ts	test	-
+surface/test/channel-reply.test.ts	test	-
+# Jo's plugins (wl-mv8r90k9nci4qo, 2026-10-14; re-pinned with paired-coding added, wl-mvb9mw00ycfjeo,
+# 2026-10-19): i-have-audhd, ask-graham and paired-coding vendored from jo-wolff-plugins at the one pin in
+# plugins/VENDOR.md, upstream *.test.mjs left out. All used in place: profile/config.yml loads
+# plugins/index.ts (AuDHD and Graham in the orchestrator and lanes, paired-coding in by-hand lanes, none in
+# hands) and lists each plugins/<p>/skills dir. plugins/paired-as2.ts is as2's seam to the paired adapter.
 plugins/VENDOR.md	doc	-
 plugins/index.ts	extension	-
+plugins/paired-as2.ts	module	-
 plugins/ask-graham/.claude-plugin/plugin.json	data	-
 plugins/ask-graham/.omp-plugin/plugin.json	data	-
+plugins/ask-graham/README.md	doc	-
+plugins/ask-graham/fixtures/transcripts.mjs	module	-
 plugins/ask-graham/hooks/ask-graham-hook.mjs	module	-
+plugins/ask-graham/hooks/ask-graham-stop.mjs	module	-
 plugins/ask-graham/hooks/hooks.json	data	-
 plugins/ask-graham/omp/ask-graham-omp.ts	extension	-
 plugins/ask-graham/package.json	data	-
-plugins/ask-graham/README.md	doc	-
 plugins/ask-graham/skills/ask-graham/SKILL.md	skill	-
+plugins/ask-graham/skills/ask-graham/references/comparables-criteria.md	skill-asset	-
 plugins/ask-graham/skills/ask-graham/references/graham-answers.md	skill-asset	-
 plugins/ask-graham/skills/ask-graham/scripts/intensity.mjs	skill-asset	-
+plugins/ask-graham/skills/ask-graham/scripts/verdict.mjs	skill-asset	-
 plugins/i-have-audhd/.claude-plugin/plugin.json	data	-
 plugins/i-have-audhd/.omp-plugin/plugin.json	data	-
+plugins/i-have-audhd/README.md	doc	-
 plugins/i-have-audhd/checks/closing-ask-last.mjs	module	-
 plugins/i-have-audhd/checks/lines.mjs	module	-
 plugins/i-have-audhd/checks/name-the-artifact.mjs	module	-
 plugins/i-have-audhd/checks/needs-you-first.mjs	module	-
 plugins/i-have-audhd/checks/plural-back-reference.mjs	module	-
+plugins/i-have-audhd/checks/sections.mjs	module	-
 plugins/i-have-audhd/example.i-have-audhd.json	data	-
 plugins/i-have-audhd/hooks/hooks.json	data	-
 plugins/i-have-audhd/hooks/i-have-audhd-inject.mjs	module	-
+plugins/i-have-audhd/hooks/i-have-audhd-prompt.mjs	module	-
 plugins/i-have-audhd/hooks/i-have-audhd-stop.mjs	module	-
 plugins/i-have-audhd/judge/ask.mjs	module	-
 plugins/i-have-audhd/lib/config.mjs	module	-
+plugins/i-have-audhd/lib/judge-setup.mjs	module	-
+plugins/i-have-audhd/lib/pending.mjs	module	-
 plugins/i-have-audhd/lib/state.mjs	module	-
-plugins/i-have-audhd/omp/i-have-audhd-omp.ts	extension	-
 plugins/i-have-audhd/omp/REGISTRATION.md	doc	-
+plugins/i-have-audhd/omp/i-have-audhd-omp.ts	extension	-
 plugins/i-have-audhd/package.json	data	-
-plugins/i-have-audhd/README.md	doc	-
 plugins/i-have-audhd/skills/i-have-audhd/SKILL.md	skill	-
 plugins/i-have-audhd/skills/i-have-audhd/reference.md	skill-asset	-
 plugins/i-have-audhd/skills/i-have-audhd/references/comparison.md	skill-asset	-
 plugins/i-have-audhd/skills/i-have-audhd/references/rationale.md	skill-asset	-
 plugins/i-have-audhd/skills/i-have-audhd/references/sources.md	skill-asset	-
+plugins/i-have-audhd/tools/setup.mjs	module	-
 plugins/i-have-audhd/tools/upgrade-from-communication-rules.mjs	module	-
 plugins/i-have-audhd/triggers/bad-news-lexicon.mjs	module	-
 plugins/i-have-audhd/triggers/batch-heading.mjs	module	-
 plugins/i-have-audhd/triggers/conclusion-first.mjs	module	-
+plugins/i-have-audhd/triggers/fixtures/omp-todo-edit-sequence.mjs	module	-
+plugins/i-have-audhd/triggers/fixtures/omp-todo-fragment.mjs	module	-
 plugins/i-have-audhd/triggers/todo-unfinished.mjs	module	-
+plugins/paired-coding/.claude-plugin/plugin.json	data	-
+plugins/paired-coding/.mcp.json	data	-
+plugins/paired-coding/.omp-plugin/plugin.json	data	-
+plugins/paired-coding/README.md	doc	-
+plugins/paired-coding/core/gate.mjs	module	-
+plugins/paired-coding/hooks/hooks.json	data	-
+plugins/paired-coding/hooks/paired-coding-hook.mjs	module	-
+plugins/paired-coding/landlock/Cargo.lock	data	-
+plugins/paired-coding/landlock/Cargo.toml	data	-
+plugins/paired-coding/landlock/README.md	doc	-
+plugins/paired-coding/landlock/SHA256SUMS	data	-
+plugins/paired-coding/landlock/bin/pair-landlock-aarch64-linux	data	-
+plugins/paired-coding/landlock/bin/pair-landlock-x86_64-linux	data	-
+plugins/paired-coding/landlock/build.sh	data	-
+plugins/paired-coding/landlock/src/main.rs	data	-
+plugins/paired-coding/landlock/test/docker.sh	data	-
+plugins/paired-coding/landlock/test/enosys-landlock.json	data	-
+plugins/paired-coding/landlock/test/live.sh	data	-
+plugins/paired-coding/lib/bwrap.mjs	module	-
+plugins/paired-coding/lib/host-io.mjs	module	-
+plugins/paired-coding/lib/landlock.mjs	module	-
+plugins/paired-coding/lib/verbs.mjs	module	-
+plugins/paired-coding/omp/REGISTRATION.md	doc	-
+plugins/paired-coding/omp/paired-coding-omp.ts	extension	-
+plugins/paired-coding/package.json	data	-
+plugins/paired-coding/server/binding.mjs	module	-
+plugins/paired-coding/server/pair-server.mjs	module	-
+plugins/paired-coding/skills/paired-coding/SKILL.md	skill	-
+plugins/test/by-hand-session.test.ts	test	-
 plugins/test/loader.test.ts	test	-
+plugins/test/omp-host.ts	test	-
+plugins/test/paired-coding.test.ts	test	-
+# The P-11 bridge for the paired adapter's pair_write, pair_edit and pair_run (wl-mvb9mw00ycfjeo PLAN-2 D5,
+# 2026-10-19): the canonical write/edit/bash view the rows and observers read, and its tests.
+gates/src/pair-call.ts	module	-
+gates/test/paired-coding.test.ts	test	-

@@ -4,7 +4,9 @@
 // keeps its number from the first time it is numbered; a row new to it gets the next number above
 // the highest ever given; a number is never reused, so a stale number on screen can never land on a
 // different row. Prompt-wait lines (kind "question", no options) and idle lines (kind "idle", MIGRATION.md
-// item 68: a lane ended on purpose with work open) take no one-word answer and are not numbered.
+// item 68: a lane ended on purpose with work open) take no one-word answer and are not numbered. A channel
+// proposal line (kind "proposal", PLAN wl-mv8vx7wdj5nx1c D5) is not answerable either: a second pass gives it
+// its target's number, never a number of its own, so no second number ever points at a target.
 import type { ErrorLine } from "./errors";
 
 export interface Target {
@@ -23,7 +25,10 @@ export class Numbering {
 	#byNumber = new Map<number, Target>();
 	#max = 0;
 
-	/** Sets `n` on every answerable line; a row keeps its number for this object's life; rows new to it get max-given+1 in line order; a number is never reused, even after its row stops appearing. Returns the same lines. */
+	/**
+	 * Sets `n` on every answerable line; a row keeps its number for this object's life; rows new to it get max-given+1 in line order; a number is never reused, even after its row stops appearing.
+	 * Then a second pass sets each proposal line's `n` to its target's number (`proposes`), assigning none. Returns the same lines.
+	 */
 	assign(lines: ErrorLine[]): ErrorLine[] {
 		for (const l of lines) {
 			if (!answerable(l)) continue;
@@ -34,6 +39,12 @@ export class Numbering {
 				this.#byNumber.set(n, { kind: l.kind as Target["kind"], workloadId: l.workloadId, rowId: l.rowId });
 			}
 			l.n = n;
+		}
+		for (const l of lines) {
+			if (l.kind !== "proposal" || l.proposes === undefined) continue;
+			const n = this.#byRow.get(l.proposes);
+			if (n === undefined) delete l.n;
+			else l.n = n;
 		}
 		return lines;
 	}

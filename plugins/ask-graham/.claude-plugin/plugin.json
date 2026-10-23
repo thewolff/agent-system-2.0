@@ -1,9 +1,9 @@
 {
   "name": "ask-graham",
-  "description": "Answer \"should we build X?\" with Graham's stated judgment — his gate questions, the 2-minute rule, fewer lines wins — and one verdict: do it now, backlog, backlog and prioritize now, or don't build. Runs when asked, or on every new idea if you turn it up.",
-  "version": "0.2.0",
+  "description": "Answer \"should we build X?\" with Graham's stated judgment — his gate questions, the 2-minute rule, fewer lines wins — and one verdict: do it now, start now, later, or don't build. Runs when asked, or on every new idea if you turn it up.",
+  "version": "0.5.0",
   "author": { "name": "Jo Wolff" },
   "license": "MIT",
   "repository": "https://github.com/thewolff/jo-wolff-plugins",
-  "keywords": ["agents", "planning", "prioritization", "backlog", "yagni"]
+  "keywords": ["agents", "planning", "prioritization", "yagni"]
 }

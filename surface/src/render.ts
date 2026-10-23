@@ -9,8 +9,11 @@
 // regardless of the last-N window), pending messages with their P-7c states, the last N ledger
 // entries (instructions, answers, assumptions, wake reads, slice completions and cancellations, and
 // hand-backs the orchestrator has acted on — § B7 names hand-backs as recent history, Codex S5) —
-// is the on-demand read's (LEDGER_TOOL), for one workload or all of them.
+// is the on-demand read's (LEDGER_TOOL), for one workload or all of them. While an agent channel runs on the ledger
+// handle (PLAN wl-mv8vx7wdj5nx1c D3), every render carries the `## from other agents` block after the needs-you lines:
+// the channel's notes, which are Ilex's to read and not Jo's to answer (surface/src/channel.ts `fromOtherAgents`).
 import type { InFlightWorkload, InstructionRow, Ledger, MessageRow, SliceRow, WorkloadStatusRow } from "../../ledger/src/index";
+import { channelInForce, fromOtherAgents } from "./channel";
 import { needsYouBullet } from "./delivery";
 import { type ErrorLine, errorLines, parseDue, wordsOf } from "./errors";
 import { type Identity, identityOf } from "./identity";
@@ -165,7 +168,8 @@ export function workloadLine(ledger: Ledger, w: InFlightWorkload, lines: readonl
 	const states = new Map<string, number>();
 	for (const s of slices) states.set(s.state, (states.get(s.state) ?? 0) + 1);
 	parts.push(`slices: ${states.size === 0 ? "none open" : [...states].map(([state, n]) => `${n} ${state}`).join(", ")}`);
-	const mine = lines.filter((l) => l.workloadId === workload.id);
+	// A channel proposal carries its target's number: the target line already lists it.
+	const mine = lines.filter((l) => l.workloadId === workload.id && l.kind !== "proposal");
 	if (mine.length > 0) parts.push(`needs you: ${mine.map((l) => (l.n === undefined ? l.kind : `#${l.n}`)).join(", ")}`);
 	if (openQuestions.length > 0) parts.push(`open questions: ${openQuestions.map((q) => q.id).join(", ")}`);
 	if (pendingMessages.length > 0) parts.push(`${pendingMessages.length} message(s) not yet acted on`);
@@ -216,6 +220,8 @@ export function renderWake(ledger: Ledger, opts: RenderOptions = {}): Rendered {
 	if (lines.length === 0) out.push("nothing: no reserved action waiting, nothing held past the threshold, no slice failed twice, no lane died, no lane left work idle, no lane waiting on you, nothing scheduled past due");
 	for (const l of lines) out.push(needsYouBullet(l));
 	if (!opts.workloadId) out.push(...rankLines(ledger, now, opts.rankMode));
+	const channel = channelInForce(ledger);
+	if (channel) out.push("", ...fromOtherAgents(ledger, channel, now));
 	const work = inFlight.filter((w) => w.workload.id !== STANDING_WORKLOAD_ID && (!opts.workloadId || w.workload.id === opts.workloadId));
 	const compact = opts.compact ?? (opts.trigger !== undefined && !opts.workloadId);
 	out.push("");

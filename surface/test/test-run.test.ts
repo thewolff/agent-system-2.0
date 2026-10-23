@@ -14,8 +14,8 @@ import {
 	AS2TEST_EXEC, authoritativeRun, baseCompareFor, baseParts, boundBranches, buildTestRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
 	type ClosePr, closeFreshness, decideRun, decisionLogFault, decisionLogOnly, fullSuiteSlice, gitShimText, heartbeatText, isBunTestFile, KEEP_RUNS, lockHolderStale,
 	logFirstErrors, mainRed, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseJunit, parsePushDest, parseTestRequested,
-	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queuedTooLong, type RangeCommit, recordLive, reportCapBytes,
-	reservation, resultJson, type RunFacts, runDirOf, runLive, runnerDiedRun, runsRoot, servedRepo, settleArtifact, stageDirOf, pushDestBody,
+	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, type RangeCommit,
+	recordLive, reportCapBytes, reservation, resultJson, type RunFacts, runDirOf, runLive, runnerDiedRun, runsRoot, servedRepo, settleArtifact, stageDirOf, pushDestBody,
 	TEST_RUNNER_DEFAULTS, type TestRequested, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf, testRunnerConfig,
 	TestRunShapeError, testRuns, WRAPPER_EXIT, wrapperArgv, workDirOf,
 } from "../src/test-run";
@@ -263,7 +263,7 @@ describe("profile: the testRunner block", () => {
 	test("the checkout's profile/config.yml serves agent-system-2.0 with bun test and the plan's caps", () => {
 		const doc = Bun.YAML.parse(readFileSync(join(REPO, "profile", "config.yml"), "utf8"));
 		const c = testRunnerConfig(doc);
-		expect(c).toEqual({ ok: true, config: { repos: [{ origin: "thewolff/agent-system-2.0", command: "bun test" }], fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 60 } });
+		expect(c).toEqual({ ok: true, config: { repos: [{ origin: "thewolff/agent-system-2.0", command: "bun test" }], fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 60, fullWorkers: 6 } });
 		if (!c.ok) throw new Error(c.error);
 		const config = c.config;
 		for (const url of ["https://github.com/thewolff/agent-system-2.0.git", "git@github.com:thewolff/agent-system-2.0.git", "ssh://git@github.com/TheWolff/agent-system-2.0", "thewolff/agent-system-2.0"]) {
@@ -280,6 +280,24 @@ describe("profile: the testRunner block", () => {
 			expect(testRunnerConfig(bad).ok).toBe(false);
 		}
 		expect(ownerRepoOf("https://gitlab.com/o/r.git")).toBeNull();
+	});
+	test("fullWorkers: an integer of 1 or more, 1 when absent; 0, 2.5, \"6\", negatives and non-numbers are refused", () => {
+		const repos = [{ origin: "o/r", command: "bun test" }];
+		const parsed = (v: unknown) => testRunnerConfig({ testRunner: { repos, fullWorkers: v } });
+		expect(TEST_RUNNER_DEFAULTS.fullWorkers).toBe(1);
+		const absent = testRunnerConfig({ testRunner: { repos } });
+		expect(absent.ok && absent.config.fullWorkers).toBe(1);
+		for (const n of [1, 6, 32]) {
+			const c = parsed(n);
+			expect(c.ok && c.config.fullWorkers).toBe(n);
+		}
+		for (const bad of [0, 2.5, "6", -1, -6, null, true, Number.NaN, Number.POSITIVE_INFINITY, [6]]) {
+			expect({ bad, c: parsed(bad) }).toEqual({ bad, c: { ok: false, error: "testRunner.fullWorkers is not an integer of 1 or more" } });
+		}
+		// The yml form: the parse reads it as the profile is read.
+		const yml = testRunnerConfig(Bun.YAML.parse("testRunner:\n  fullWorkers: 4\n"));
+		expect(yml.ok && yml.config.fullWorkers).toBe(4);
+		expect(testRunnerConfig(Bun.YAML.parse('testRunner:\n  fullWorkers: "4"\n')).ok).toBe(false);
 	});
 	test("the runs root: the override, else test-runs beside the resolved ledger; run, work and stage dirs", () => {
 		expect(runsRoot({ HOME: "/h", AGENT_SYSTEM_TEST_RUNS: "/tmp/runs" })).toBe("/tmp/runs");
@@ -617,7 +635,7 @@ describe("boundPrs: Jo's test-pr binding (PLAN wl-mv5qdfvv82ivwg § 2.2, § 2.3)
 	});
 	test("a surface entry naming Jo's surface instruction with the same numbers binds them, with that instruction", () => {
 		const { ins, ent } = bind([79, 70]);
-		expect(boundPrs([ent], [ins])).toEqual([{ pr: 79, instructionId: ins.id }, { pr: 70, instructionId: ins.id }]);
+		expect(boundPrs([ent], [ins])).toEqual([{ pr: 79, by: ins.id }, { pr: 70, by: ins.id }]);
 	});
 	test("a lane-written entry binds nothing, even naming Jo's real instruction", () => {
 		const { ins } = bind([79]);
@@ -653,7 +671,7 @@ describe("boundPrs: Jo's test-pr binding (PLAN wl-mv5qdfvv82ivwg § 2.2, § 2.3)
 		const one = bind([79, 70]);
 		const two = bind([73, 79]);
 		expect(boundPrs([one.ent, two.ent], [one.ins, two.ins])).toEqual([
-			{ pr: 79, instructionId: one.ins.id }, { pr: 70, instructionId: one.ins.id }, { pr: 73, instructionId: two.ins.id },
+			{ pr: 79, by: one.ins.id }, { pr: 70, by: one.ins.id }, { pr: 73, by: two.ins.id },
 		]);
 	});
 });
@@ -755,6 +773,42 @@ describe("liveness from the heartbeat", () => {
 	test("the full-suite slice the starter adds", () => {
 		expect(fullSuiteSlice("wl-muraerdsgw7gn4", 17, [])).toEqual({ id: "sl-full-muraerdsgw7gn4-1", task: "full suite outside the fence at PR #17", doneCondition: "a green test-run at the PR head" });
 		expect(fullSuiteSlice("wl-m", 3, ["sl-full-m-1", "sl-full-m-4", "sl-full-mx-9", "sl-other"]).id).toBe("sl-full-m-5");
+	});
+	test("T4: a queued waiter is live on its own record: none or settled is dead; a fresh heartbeat keeps an old request live; no heartbeat lives only in the startup lease", () => {
+		const r1 = request("tr-1", 17, A);
+		const rec = testRuns([reqEntry(r1)])[0]!;
+		const requestedAt = Date.parse(rec.request.createdAt);
+		expect(queueWaiterLive(undefined, requestedAt, requestedAt + 1_000)).toBe(false);
+		const settled = testRuns([reqEntry(r1), runEntry(runnerDiedRun(r1))])[0]!;
+		expect(queueWaiterLive(settled, requestedAt + 1_000, requestedAt + 2_000)).toBe(false);
+		expect(queueWaiterLive(rec, requestedAt + 599_000, requestedAt + 600_000)).toBe(true);
+		expect(queueWaiterLive(rec, requestedAt + 539_000, requestedAt + 600_000)).toBe(false);
+		expect(queueWaiterLive(rec, null, requestedAt + 5_000)).toBe(true);
+		expect(queueWaiterLive(rec, null, requestedAt + 121_000)).toBe(false);
+	});
+	test("T4: queueAhead orders by requestedAt then run id, reports the dead rows ahead, stops at the first live one, never judges rows behind", () => {
+		const row = (runId: string, requestedAt: number): QueueRow => ({ runId, workloadId: "wl-t", requestedAt });
+		const rows = [row("tr-c", 30), row("tr-self", 20), row("tr-b", 10), row("tr-a", 10), row("tr-z", 5)];
+		const judged: string[] = [];
+		const liveSet = (live: string[]) => (q: QueueRow) => {
+			judged.push(q.runId);
+			return live.includes(q.runId);
+		};
+		expect(queueAhead(rows, "tr-self", liveSet([]))).toEqual({ blocker: null, dead: ["tr-z", "tr-a", "tr-b"] });
+		expect(judged).toEqual(["tr-z", "tr-a", "tr-b"]);
+		judged.length = 0;
+		expect(queueAhead(rows, "tr-self", liveSet(["tr-b", "tr-c"]))).toEqual({ blocker: "tr-b", dead: ["tr-z", "tr-a"] });
+		judged.length = 0;
+		expect(queueAhead(rows, "tr-self", liveSet(["tr-z", "tr-a"]))).toEqual({ blocker: "tr-z", dead: [] });
+		expect(judged).toEqual(["tr-z"]);
+		// the oldest waiter has no one ahead; rows behind it, live or not, are never judged
+		judged.length = 0;
+		expect(queueAhead(rows, "tr-z", liveSet(["tr-a", "tr-c"]))).toEqual({ blocker: null, dead: [] });
+		expect(judged).toEqual([]);
+		// a tie on requestedAt goes by run id: tr-a is ahead of tr-b
+		expect(queueAhead(rows, "tr-b", liveSet(["tr-a"]))).toEqual({ blocker: "tr-a", dead: ["tr-z"] });
+		expect(queueAhead(rows, "tr-a", liveSet(["tr-b"]))).toEqual({ blocker: null, dead: ["tr-z"] });
+		expect(() => queueAhead(rows, "tr-missing", liveSet([]))).toThrow(TestRunShapeError);
 	});
 });
 

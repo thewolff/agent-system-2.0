@@ -8,7 +8,7 @@
 // Nothing here imports the new modules statically: test 9 loads surface/src/plan-paths.ts only after
 // its route assertions.
 import { describe, expect, test } from "bun:test";
-import { existsSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { launchVerdict } from "../extensions/launch";
@@ -19,7 +19,7 @@ import { raiseOrchestratorQuestion } from "../src/orchestrator-question";
 import type { withPlanPaths as WithPlanPaths } from "../src/plan-paths";
 import { surfaceSession } from "../src/session";
 import { SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, notices, type Sent, timeouts, timers, tmp, workloadWithSlice } from "./helpers";
+import { ctxOf, fakePi, loadTestText, notices, type Sent, timeouts, timers, tmp, workloadWithSlice } from "./helpers";
 
 const PLAN_PATH = "surface-plan-path";
 const APPLIED = "## Applied from the surface since your last turn";
@@ -66,7 +66,7 @@ async function start(e: Record<string, string>, o: { exec?: boolean } = {}) {
 	timeouts.length = 0;
 	notices.length = 0;
 	const f = fakePi(undefined, { exec: o.exec ?? false });
-	orchestratorSurface(f.pi, e, {});
+	await orchestratorSurface(f.pi, e, { loadText: loadTestText });
 	let idle = true;
 	const ctx = Object.assign(ctxOf(), { isIdle: () => idle });
 	await f.emit("session_start", { type: "session_start" }, ctx);
@@ -147,6 +147,53 @@ async function settle(s: { launching: boolean }): Promise<void> {
 }
 
 describe("the orchestrator's own message (D3)", () => {
+	test("T4: preloaded renderer paints restored results before a fresh ledger execution", async () => {
+		const f = fakePi();
+		const P = join(tmp("restored-ledger"), "PLAN with spaces.md");
+		writeFileSync(P, "# Plan\n");
+		await orchestratorSurface(f.pi, env(), { loadText: loadTestText });
+		const tool = f.tool("orchestrator_ledger");
+		const renderer = (tool as typeof tool & {
+			renderResult?: (result: unknown, options: { expanded: boolean; isPartial: boolean }, theme: unknown) => { render(width: number): readonly string[] };
+		}).renderResult;
+		expect(typeof renderer).toBe("function");
+		const target = new URL(`file://${P}`).href;
+		const rendered = renderer!({ content: [{ type: "text", text: `[${P}](${target})` }] }, { expanded: true, isPartial: false }, {}).render(500).join("\n");
+		expect(rendered).toContain(`\x1b]8;;${target}\x07${P}\x1b]8;;\x07`);
+	});
+
+	test("T4: existing entry links a space-bearing plan path in wake, Applied and relayed messages, and renders ledger OSC8", async () => {
+		const e = env();
+		const l = open(e);
+		const P = join(tmp("linked-plan"), "PLAN with spaces.md");
+		writeFileSync(P, "# Plan\n");
+		const target = new URL(`file://${P}`).href;
+		const linked = `[${P}](${target})`;
+		const { wl, sl, q } = seedPlan(l, P);
+		l.enqueue({ by: "lane-a", workloadId: wl, sliceId: sl, sender: "lane-a", recipient: "orchestrator", body: `Reviewed ${P}` });
+		l.close();
+		const x = await start(e);
+		expect(x.wake).toContain(linked);
+		x.s.notices.push(`Applied ${P}`);
+		const applied = (await x.jo("next")).messages.map((m) => m.content).join("\n");
+		expect(applied).toContain(`${APPLIED}\n- Applied ${linked}`);
+		await x.idleTurn([assistant(`Review ${q}.`)]);
+		expect(x.of(PLAN_PATH).at(-1)!.message.content).toBe(`plan for ${q}: ${linked}`);
+		const l2 = open(e);
+		l2.enqueue({ by: "lane-a", workloadId: wl, sliceId: sl, sender: "lane-a", recipient: "orchestrator", body: `Relay ${P}` });
+		l2.close();
+		const tool = x.f.tool("orchestrator_ledger");
+		const result = await tool.execute("1", {}, undefined, undefined, x.ctx);
+		expect(result.content.map((c) => c.text).join("\n")).toContain(`Relay ${linked}`);
+		const renderer = (tool as typeof tool & {
+			renderResult?: (result: unknown, options: { expanded: boolean; isPartial: boolean }, theme: unknown) => { render(width: number): readonly string[] };
+		}).renderResult;
+		expect(typeof renderer).toBe("function");
+		const painted = renderer!(result, { expanded: true, isPartial: false }, {}).render(500).join("\n");
+		expect(painted).toContain(`\x1b]8;;${target}\x07${P}\x1b]8;;\x07`);
+		expect(painted).toContain(`\x1b]8;;${target}\x07${target}\x1b]8;;\x07`);
+	});
+
 	test("1: a message naming the plan question by #N or q- id, without the path, gets a surface-plan-path message after idle, uncut, in message order; the assistant message is unchanged", async () => {
 		const e = env();
 		const l = open(e);
@@ -294,7 +341,7 @@ describe("nothing for what is not an open plan question (guards)", () => {
 		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
 		expect(l.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: null }).won).toBe(true);
 		const park = l.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "/tmp/plan-park/PLAN.md\nreview-park: the reviewer's lab is down; same-lab or wait?", options: ["same-lab", "wait"] });
-		const orch = raiseOrchestratorQuestion(l, { body: "/tmp/plan-orch/PLAN.md is the one to keep?", options: ["yes", "no"], about: null });
+		const orch = raiseOrchestratorQuestion(l, { body: "/tmp/plan-orch/PLAN.md is the one to keep?", options: ["yes", "no"], about: null }).raised;
 		const reserved = seedReserved(l);
 		l.close();
 		const x = await start(e);
@@ -366,7 +413,7 @@ describe("surface lines (D2)", () => {
 		expect(needs).not.toContain("plan for");
 
 		const l2 = open(e);
-		const oq = raiseOrchestratorQuestion(l2, { body: `Is ${q} the plan to approve tonight?`, options: ["yes", "no"], about: null });
+		const oq = raiseOrchestratorQuestion(l2, { body: `Is ${q} the plan to approve tonight?`, options: ["yes", "no"], about: null }).raised;
 		l2.close();
 		x.f.sent.length = 0;
 		timers[0]!.fn();
@@ -434,8 +481,10 @@ describe("surface lines (D2)", () => {
 		const e = env();
 		const l = open(e);
 		const long = seedPlan(l, LONG_PATH);
-		// A path with Markdown-special characters: the surface-plan-path line escapes them, so none is lost on screen.
-		const P2 = "/Users/jo/agent-scratch/_x_/*y*/tick`mark/[z]/PLAN.md";
+		// A real path with Markdown-special characters: the shared linkifier escapes its visible label.
+		const P2 = join(tmp("special-plan"), "_x_", "*y*", "tick`mark", "[z]", "PLAN.md");
+		mkdirSync(dirname(P2), { recursive: true });
+		writeFileSync(P2, "# Special plan\n");
 		const special = seedPlan(l, P2, "lane-b");
 		l.close();
 		const x = await start(e);

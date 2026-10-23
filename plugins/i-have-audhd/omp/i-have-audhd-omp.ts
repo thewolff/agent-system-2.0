@@ -1,13 +1,22 @@
 // i-have-audhd-omp.ts — OMP adapter for the i-have-audhd plugin.
 //
 // WHY: OMP does not run a plugin's hooks/hooks.json; it loads TS extension modules. This file
-// bridges the plugin's two Claude Code hooks to OMP events without copying their policy:
-// both hooks are stdin-JSON CLIs, spawned here, never imported.
+// bridges the plugin's three Claude Code hooks to OMP events without copying their policy:
+// all three are stdin-JSON CLIs, spawned here, never imported.
 //
 //   hooks/i-have-audhd-inject.mjs   session_start / session_switch / session_compact →
 //                                   additionalContext, offered through before_agent_start as
 //                                   a hidden custom message until a context event carries it
 //   hooks/i-have-audhd-stop.mjs     session_stop → the CLI's verdict as a session_stop block
+//   hooks/i-have-audhd-prompt.mjs   right after each stop (Claude Code runs it on
+//                                   UserPromptSubmit) → the pending warning, queued for the
+//                                   next turn
+//
+// WARNINGS. A warn finding is no block, so session_stop has nothing to return for it; the core
+// leaves it pending (lib/pending.mjs) and this file delivers it: sendMessage with deliverAs
+// "nextTurn" and no triggerTurn, which OMP keeps in its next-turn queue and adds to the next
+// prompt as context (pi-coding-agent session/agent-session.ts, #pendingNextTurnMessages), the
+// way the receipts audit reaches a seat. The person gets the summary as a UI warning notice.
 //
 // REGISTRATION: package.json `omp.extensions` declares this file, so `omp plugin install
 // i-have-audhd@jo-wolff-plugins` loads it. REGISTRATION.md beside this file carries the
@@ -103,7 +112,9 @@ import { fileURLToPath } from "node:url";
 const DEFAULT_PLUGIN_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const CLI_TIMEOUT_MS = 25_000;
 const INJECT_TIMEOUT_MS = 10_000;
+const PROMPT_TIMEOUT_MS = 3_000;
 const CONTEXT_MESSAGE_TYPE = "i-have-audhd-session-start";
+const WARNING_MESSAGE_TYPE = "i-have-audhd-warning";
 
 type StopEvent = {
   session_id?: unknown;
@@ -112,15 +123,24 @@ type StopEvent = {
   last_assistant_message?: unknown;
 };
 
-// What either hook CLI prints: the stop core's verdict, or the inject hook's SessionStart output.
-type CliOutput = { decision?: unknown; reason?: unknown; hookSpecificOutput?: unknown };
+// What a hook CLI prints: the stop core's verdict, the inject hook's SessionStart output, or the
+// prompt hook's pending warning (systemMessage plus hookSpecificOutput.additionalContext).
+type CliOutput = { decision?: unknown; reason?: unknown; hookSpecificOutput?: unknown; systemMessage?: unknown };
 
 type RunCli = (payload: string, cwd: string, timeoutMs: number) => Promise<CliOutput | undefined>;
+
+// A warn finding on its way to the agent's next turn: the notice for the agent, the one-line
+// summary for the person (lib/pending.mjs renders both).
+export type Warning = { notice: string; summary: string };
 
 type HandlerDeps = {
   runCli?: RunCli;
   stateDir?: string;
   timeoutMs?: number;
+  // Consumes the session's pending warning; defaults to spawning hooks/i-have-audhd-prompt.mjs.
+  takeWarning?: (sessionId: unknown, cwd: string) => Promise<Warning | undefined>;
+  // Hands a consumed warning to the host; the registration wires it to sendMessage + notify.
+  deliver?: (warning: Warning, ctx: Ctx) => void;
 };
 
 // The Claude Code SessionStart sources the inject hook understands.
@@ -131,6 +151,8 @@ type Ctx = {
   cwd: string;
   agent?: { kind?: unknown };
   sessionManager?: { getSessionId?: () => unknown; getEntries?: () => unknown };
+  hasUI?: boolean;
+  ui?: { notify?: (message: string, type?: "info" | "warning" | "error") => void };
 };
 
 // Stable session ids (see managerSessionId) whose most recent result from this handler was a
@@ -160,6 +182,10 @@ type PiLike = {
   on(name: "session_switch", handler: (event: { reason?: unknown }, ctx: Ctx) => unknown): void;
   on(name: "before_agent_start", handler: (event: unknown, ctx: Ctx) => unknown): void;
   on(name: "context", handler: (event: { messages?: unknown }, ctx: Ctx) => unknown): void;
+  sendMessage?: (
+    message: { customType: string; content: string; display: boolean; details?: unknown },
+    options?: { deliverAs?: "nextTurn" },
+  ) => void;
 };
 
 // Whitespace collapsed, trimmed, capped — the shape every log line shares (appendLog
@@ -267,10 +293,48 @@ function spawnHook(hook: string, payload: string, cwd: string, timeoutMs: number
   return promise;
 }
 
+// The prompt CLI's output as a Warning, or undefined when nothing was pending.
+function asWarning(out: CliOutput | undefined): Warning | undefined {
+  const hso = out?.hookSpecificOutput;
+  const notice = hso && typeof hso === "object" && "additionalContext" in hso ? hso.additionalContext : undefined;
+  if (typeof notice !== "string" || !notice) return undefined;
+  return { notice, summary: typeof out?.systemMessage === "string" ? out.systemMessage : "" };
+}
+
+// After every stop the core ran, the warn findings it left pending (lib/pending.mjs) go to the
+// agent's next turn. Consumption is the prompt CLI's — the Claude Code UserPromptSubmit hook —
+// spawned here, so both hosts read one file one way. A host with no delivery (no sendMessage)
+// leaves the file alone: the next checked stop replaces it, and warnings.log has the line.
+// Fail-open like the stop: one errors.log line.
+async function deliverPendingWarning(sessionId: unknown, ctx: Ctx, deps: HandlerDeps | undefined, stateDir: string): Promise<void> {
+  const deliver = deps?.deliver;
+  if (!deliver) return;
+  try {
+    const take =
+      deps?.takeWarning ??
+      (async (sid: unknown, cwd: string) =>
+        asWarning(
+          await spawnHook(
+            "i-have-audhd-prompt.mjs",
+            JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: sid }),
+            cwd,
+            PROMPT_TIMEOUT_MS,
+          ),
+        ));
+    const warning = await take(sessionId, ctx.cwd);
+    if (warning) deliver(warning, ctx);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    appendLog(stateDir, "errors.log", `omp-adapter fail-open (warning delivery): ${detail}`);
+  }
+}
+
 // The whole gate. deps exists so node --test can inject a fake runCli, a temp stateDir, and a
 // tight timeoutMs; the default spawn runs under node too, so the real path is tested as well.
 // The session id the core and the own-block record see is the manager's (see the header's
 // ONE SESSION ID); the payload's provider id stands in only when the manager id is unreadable.
+// Once the core has answered, any warning it left pending is delivered (WARNINGS, header),
+// whether or not this stop also blocks.
 export async function sessionStopHandler(
   event: StopEvent,
   ctx: Ctx,
@@ -281,20 +345,23 @@ export async function sessionStopHandler(
   const key = typeof sessionId === "string" ? sessionId : "";
   const followsOwnBlock = !!event.stop_hook_active && blockedLastStop.has(key);
   blockedLastStop.delete(key); // re-added below only if this call blocks
+  let result: { decision: "block"; reason: string } | undefined;
   try {
     const runCli: RunCli = deps?.runCli ?? ((p, cwd, ms) => spawnHook("i-have-audhd-stop.mjs", p, cwd, ms));
     const payload = buildStopPayload({ ...event, session_id: sessionId, stop_hook_active: followsOwnBlock }, ctx.cwd);
     const verdict = await runCli(payload, ctx.cwd, deps?.timeoutMs ?? CLI_TIMEOUT_MS);
     if (verdict?.decision === "block" && typeof verdict.reason === "string" && verdict.reason) {
       blockedLastStop.add(key);
-      return { decision: "block", reason: verdict.reason };
+      result = { decision: "block", reason: verdict.reason };
     }
-    return undefined; // quiet or non-block verdict: nothing to gate, nothing to log
+    // quiet or non-block verdict: nothing to gate, nothing to log
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     appendLog(stateDir, "errors.log", `omp-adapter fail-open: ${detail}`);
     return undefined;
   }
+  await deliverPendingWarning(sessionId, ctx, deps, stateDir);
+  return result;
 }
 
 // session_start's source: resume when OMP loaded an existing session that already holds
@@ -323,7 +390,9 @@ export function buildStartPayload(source: StartSource, ctx: Ctx): string {
 
 // One session-start crossing: spawn the inject hook and return its additionalContext, or
 // undefined when it emitted none (I_HAVE_AUDHD_INJECT=off) or failed (one errors.log line).
-// Subagent sessions are skipped before any spawn: no context, no resume marker.
+// A systemMessage from the hook (the one-time no-judge notice) is shown to the person as a UI
+// notice, the way Claude Code shows it; with no UI the same text still rides in the context.
+// Subagent sessions are skipped before any spawn: no context, no resume marker, no notice.
 export async function sessionStartHandler(
   source: StartSource,
   ctx: Ctx,
@@ -338,6 +407,9 @@ export async function sessionStartHandler(
     const hso = out.hookSpecificOutput;
     const context = hso && typeof hso === "object" && "additionalContext" in hso ? hso.additionalContext : undefined;
     if (typeof context !== "string") throw new Error("omp-adapter: inject CLI output carries no additionalContext");
+    if (ctx.hasUI && typeof out.systemMessage === "string" && out.systemMessage) {
+      ctx.ui?.notify?.(out.systemMessage, "warning");
+    }
     return context || undefined;
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
@@ -387,5 +459,18 @@ export default function iHaveAudhdOmp(pi: PiLike): void {
     if (carried) pending = undefined;
     return undefined;
   });
-  pi.on("session_stop", (event, ctx) => sessionStopHandler(event, ctx));
+  // A warning goes to the agent's next turn the way the receipts audit sends its flags:
+  // sendMessage with deliverAs "nextTurn" and no triggerTurn queues it for the next prompt and
+  // starts no turn. The person sees the one-line summary as a UI notice when a UI is attached.
+  const deliver =
+    typeof pi.sendMessage === "function"
+      ? (warning: Warning, ctx: Ctx): void => {
+          pi.sendMessage!(
+            { customType: WARNING_MESSAGE_TYPE, content: warning.notice, display: true },
+            { deliverAs: "nextTurn" },
+          );
+          if (ctx.hasUI && warning.summary) ctx.ui?.notify?.(warning.summary, "warning");
+        }
+      : undefined;
+  pi.on("session_stop", (event, ctx) => sessionStopHandler(event, ctx, { deliver }));
 }

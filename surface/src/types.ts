@@ -65,12 +65,22 @@ export interface ExecResult {
 	killed: boolean;
 }
 
+/** Host-owned Text layout, injected by the entry so row modules never bare-import OMP. */
+export interface ResultText {
+	render(width: number): readonly string[];
+	invalidate(): void;
+}
+export type ResultTextConstructor = new (text: string, paddingX?: number, paddingY?: number) => ResultText;
+export type ResultTextLoader = () => Promise<ResultTextConstructor>;
+
 /** The extension API as the surface rows see it: the gates' slice plus the lane-boundary events and the push action. */
 export type SurfaceAPI = GatesAPI<Ctx> & {
 	on(event: "tool_approval_requested", h: Handler<{ sessionId: string; toolCallId: string; toolName: string; reason?: string }>): void;
 	on(event: "tool_approval_resolved", h: Handler<{ sessionId: string; toolCallId: string; toolName: string; approved: boolean; reason?: string }>): void;
 	on(event: "tool_execution_end", h: Handler<{ toolCallId: string; toolName: string; result: unknown; isError: boolean }>): void;
 	on(event: "session_shutdown", h: Handler<{ type: "session_shutdown" }>): void;
+	/** A turn starts (ExtensionAPI.on "agent_start"): the agent channel's observed-turn receipt (surface/extensions/agent-channel.ts). */
+	on(event: "agent_start", h: Handler<{ type: "agent_start" }>): void;
 	/** OMP 18.4.4 types.ts:1267-1271: the turn's message may carry `details` (agent-session.ts:7306-7318 keeps them). */
 	on(event: "before_agent_start", h: Handler<{ prompt: string; systemPrompt: string[] }, { systemPrompt?: string[]; message?: SurfaceMessage } | undefined>): void;
 	/** Fires for a turn's input messages (pi-agent-core agent-loop.ts emitInputMessages) and for an aside folded into context (agent-session.ts:1178-1181). */
@@ -105,6 +115,12 @@ export const TRAIN_TASK_FAILED_PREFIX = "train-task-failed:";
  * `priority-signal-failed:` and `rank-shown:`, written by whichever session ranks (the orchestrator, a lane, a hand).
  */
 export const RANK_BY = "as2-rank";
+/**
+ * The escalation policy's machinery stamp (PLAN wl-mvfkv7llkp7nk0 § 3): `lane_raise_question`'s auto-start of a
+ * cross-lab-passed normal-stakes plan writes `plan: approved auto <round group>` and its notice as this, never as the lane.
+ * The one `plan:` form it may write is `approved auto …` (surface/src/launch.ts `validWriter`).
+ */
+export const ESCALATION_BY = "escalation";
 
 /**
  * The orchestrator's standing workload: the one open workload that carries rows belonging to no
@@ -201,7 +217,13 @@ export const LAUNCH_LANE_TOOL = "orchestrator_launch_lane";
 export const LOWER_CEILING_TOOL = "orchestrator_lower_ceiling";
 /** Ask Jo a question as a `questions` row on the standing slice, before the QUESTION block names its id (MIGRATION.md item 105; surface/extensions/question.ts). */
 export const RAISE_QUESTION_TOOL = "orchestrator_raise_question";
-export const SURFACE_TOOLS = [WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, RECORD_INSTRUCTION_TOOL, LEDGER_TOOL, LAUNCH_LANE_TOOL, LOWER_CEILING_TOOL, RAISE_QUESTION_TOOL] as const;
+/** Reply to another agent's channel message, and mark channel messages acted on (PLAN wl-mv8vx7wdj5nx1c D4; surface/extensions/agent-channel.ts). */
+export const CHANNEL_REPLY_TOOL = "orchestrator_reply";
+export const CHANNEL_DONE_TOOL = "orchestrator_channel_done";
+export const SURFACE_TOOLS = [
+	WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, RECORD_INSTRUCTION_TOOL, LEDGER_TOOL, LAUNCH_LANE_TOOL, LOWER_CEILING_TOOL, RAISE_QUESTION_TOOL,
+	CHANNEL_REPLY_TOOL, CHANNEL_DONE_TOOL,
+] as const;
 /** Surface tools that read rather than work (P-11 row 3's working-call test): the wake read records only that it read. */
 export const SURFACE_READ_TOOLS = [WAKE_READ_TOOL, LEDGER_TOOL] as const;
 /**

@@ -230,8 +230,10 @@ describe("B3: every kind that can land on a tier gets guidance in that tier's pr
 });
 
 describe("S1: the replay replays what was measured; an uncalibrated question refuses dispatch", () => {
-	test("the calibration record names the question the sample was recorded with", () => {
-		expect(loadCalibration().questionSha256).toBe(loadSample().questionSha256);
+	test("the calibration record names the question and judge the sample was recorded with", () => {
+		const sample = loadSample();
+		expect(loadCalibration().questionSha256).toBe(sample.questionSha256);
+		expect(sample.judgeModel).toBe(loadCalibration().judgeModel);
 	});
 
 	test("the live question is the re-measured one, so the calibration gate lets it route", async () => {

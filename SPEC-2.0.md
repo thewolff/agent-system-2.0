@@ -33,9 +33,9 @@ The work-kind rule is keyed on the **shape of the task**, read off the slice bri
 | Kind | What the slice does | Tier (to be named in A1.3) |
 |---|---|---|
 | locate | find where something is; no interpretation | lowest |
-| understand | read and report on a surface; no writes | mid |
-| change-small | write, single file, checkable by a test or diff | mid |
-| change-large | write, multi-file or with no mechanical check | mid-high |
+| understand | read and report on a surface; no repository writes (a smoke run or check that writes only scratch files and its report is understand) | mid |
+| change-small | write a change the brief already specifies, carried out rather than worked out: one module and its own tests, a new uncalled pure function in its own file with its test, a mechanical mirror of an existing pattern, or a docs-only edit of any size whose content is dictated | mid |
+| change-large | write code whose design or correctness the worker must work out: new behaviour across modules, a shared format and its readers, interface-fixing tests, end-to-end tests of real programs, or any concurrency, timing, process, security or authority, performance or replay/identity fix, however few files | mid-high |
 | judge | design, review, decide; anything whose output is a ruling rather than an artifact | top |
 
 Consequence (blast radius, reversibility) is **not** in the taxonomy: it is carried by the
@@ -156,6 +156,7 @@ model's reading, not Jo's; 1.x-style prompts, not B9 six-field briefs (productio
 expected higher, so 0.55 errs safe). Re-measured after the first real month from ledger pull-ups
 versus gate failures (P-16).
 **Re-measured 2026-09-28** with the S1-corrected question (sha256 `5a72c35c…`; `research/classifier-sample.md` § Re-measurement 2026-09-28): the same 30 briefs plus two review additions, `typesafe/jev-1.13.0`, $0.00101 total. Agreement 21/30 (70.0%) on the original thirty against the unchanged 09-23 hand labels, 2/2 on the additions (both change-large); two of the nine misses are two-file edits the old labels call change-small and the ruled taxonomy calls change-large. **Threshold stays 0.55, inclusive** (ruled 2026-09-29 after the M3 gate run, Jo: *"let's follow your recco"* — a brief answered at exactly 0.55 was under-served in one of two live draws; the sweeps below were computed strictly-below, the code flags at or below): it is the lowest value that routes no brief below its hand label's tier (0.50 leaves a judge brief on standard); the count knee is 0.60, which routes all 32 identically. The corrected question costs precision — 7 of 32 flagged, 5 of them false flags, over-served briefs 3 → 10 of 30 — because it lowers confidence on correct locate and change-small answers.
+**Re-measured 2026-10-20** with the right-sizing question (`questionSha256` `2c0d0886…`, file sha256 `5b74aa66…`; `research/classifier-sample.md` § Re-measurement 2026-10-20), `typesafe/jev-1.13.0`, after the 2026-10-19 hand-size audit found 8 firm over-sizes among 20 change-large hands. § A1.1's understand, change-small and change-large rows follow it: change-small is a change the brief already specifies, change-large one whose design or correctness the worker must work out. On the audit's 20 the 8 firm route standard and the 9 correct stay strong; 27/32 on the 09-28 sample against its labels (two additions relabelled change-small), none routed below its label's tier at 0.55 inclusive, which stays the threshold (not re-swept). Sealed held-out set B: 7/7 correct strong, 0/3 over on standard — dictated code-plus-own-test changes still route strong, a shortfall Jo accepted 2026-10-20 (`q-mvg42w7vgege0w`). At workload open, 2 of 124 replayed briefs newly skip plan-first (Jo: keep, `q-mvg45v0ez6f1mo`) and the ×3 ceiling applies to 45 instead of 62.
 
 **Named local fallback — Laya (ruled 2026-09-28, Jo: *"let's go with your recco"*).** ConvAI's
 `laya` (Apache-2.0, self-hosted, TypeSafe-wire-compatible) is the exit if TypeSafe's terms, price,
@@ -461,8 +462,10 @@ complexity). Exactly four things surface unsolicited, one line each in the singl
    again until Jo's word. The count resets on progress and on Jo's word. Parked (a paused slice or an
    open question), done (`done-because:`), Jo-stopped (`lane-stop … by jo`, or the runner's `accepted
    ceiling`) and user-driven workloads are never relaunched, and the merge-train workload is excluded.
-   A lapsed lease whose recorded runner process is still alive is not a death, and nothing but Jo's
-   word launches over it.
+   A lapsed lease whose recorded omp start time or runner command line still identifies the lane
+   is not a death (`surface/src/runner-probe.ts`, shared with the one-live-lane guard). Uninspectable
+   processes also block a successor; reused pids and zombies do not. Reservation refuses every
+   cause while an earlier lane is still running, including Jo's request.
    While a relaunch takes a death on (due, waiting out the backoff, or named by a later `relaunch`
    cause), its death and idle lines are hidden; the incident is then the line this item surfaces. A
    death the relaunch does not take on is surfaced once, as above. The limit, the counting rule and the
@@ -505,6 +508,30 @@ A4 gate (item 1); a material non-reserved choice goes through a `question` row t
 dependent work (item 5). Those two are the only human waits a lane can hit; item 5's prompt-event
 trigger is the safety net if a blocking prompt leaks anyway.
 
+**Amended 2026-10-19 — standing rulings are checked before a question; notices** (`migration/items/escalation-policy.md`;
+Jo, ledger input `in-mvfkupc4p9nt34` opening the escalation-policy work, and the policy draft's § 4: *"a ruling comes only
+from Jo's words … The ruling check has to be code"*; plan `~/agent-scratch/agent-system-2.0/wl-mvfkv7llkp7nk0/PLAN.md`
+rev 5 §§ 1–2, approved by Jo; built in wl-mvfkv7llkp7nk0). Two changes to item 5's question trigger. **Rulings
+first:** `askJo` (`gates/src/rulings.ts`) is the only production path to `Ledger.raiseQuestion`. It reads the question's
+kind from its option set (`questionKind`: `review-park`, `open-workload`, `merge`, `stakes`, and for a question whose
+every option is a `provider/model` id the `subject` its asker declares, `lane-model` or `review-model`, refused when
+missing) and checks Jo's standing rulings (`STANDING_RULINGS`): `kimi-out` (in-mv5xafhywe3w8w, ends
+2026-11-01T00:00-07:00), `flow-repair` (in-mvfiyyv2kuha80), `merges` (in-mv91wdhs446ark), `models` (in-mv5qagioc4en0g,
+in-mvfiu1uyldnksg) and `gates-stakes` (in-mv0novd17fre9s), each with the scope, exceptions and end its source gives.
+When an active ruling covers the question, no question row is written and nothing pauses; the asker records
+`ruling-applied: <ruling> kind <k> slice <sl> answer <a>`, and the lane and orchestrator tools return the ruling and
+its action instead of a question id. Every other question, of kind `other` (round limit, merge train, plan, safety) or
+outside a ruling's scope, is raised as before. A ruling is added only by a code change from Jo's words, and Jo's
+`end-ruling <id>` ends one at once. The invariant report's `ruling-miss` lists a question raised since the ledger's
+first `ruling-applied:` entry (the check's activation) that an active ruling would have decided, the runtime check for
+a raise path that bypasses `askJo`. **Notices:**
+something Jo is told and does not answer (a ceiling at 80 %, a ceiling stop, a plan that started on its own,
+§ B6 and § B11 *Amended 2026-10-19*) is a `notice:` message to the orchestrator written by trusted tool code
+(`sendNotice`, `surface/src/notice.ts`), never a `questions` row. It shows after every other needs-you line as
+`notice on <workload> (nothing to answer): …`, unnumbered and not answerable, until delivery marks it delivered once.
+The two ceiling notices are on fire for the batch; every other notice waits for the window. A `notice:` written by a
+lane that holds or held the workload shows only as that lane's message.
+
 ### B4 · Stakes → tier cap, and review as a stakes property (P-9, P-8a, A4 "approved")
 
 **Ruled 2026-09-23.** Jo: *"yes to your reccos"*, after *"so would every normal workload cost
@@ -529,6 +556,25 @@ mandatory above a stakes level — P-12 stays optional).
 Hole this closed, for the record: before this ruling nothing in `REQUIREMENTS.md` defined a
 review process for workload output (`grep review|approv` 2026-09-23: no requirement), and A4's
 "approved" was undefined.
+
+**Amended 2026-10-19 — the merge train lands a normal lane's PR** (`migration/items/merge-train-auto-board.md`;
+jo-issues #132; Jo, ledger input `in-mvbjiylsgdtqf4`: "it is of the utmost importance to me that agents can
+merge autonomsly"; built in wl-mvbjiettjrfpxc, plan revision 6). This amends the normal row above and the
+completion rule of `DESIGN-lane-launcher.md` decision 11 (on this repository a lane never merges: Jo
+integrates). An autonomous normal-stakes lane on a repository the test runner serves
+(`testRunner.repos`), a merge train or train fix lane excepted, never asks Jo to integrate. A
+cross-lab review slice must pass before the PR is done. Once the PR is green at its head with that
+review passed, the lane records `done-because:` and releases, the surface closes the workload, and
+the merge train boards and lands the PR; a done line's "merged on main" is met by that hand-off. The
+train tick boards a PR only when its workload is closed, was autonomous at normal stakes, carries a
+holder `done-because:` newer than the tick's `train-autoboard: on` cutover row, has its newest
+full-suite run green at the PR's head (a head ahead of it only by `.ai/decision-log/` commits
+counts), and has its cross-lab review passed. A PR that fails a test gets a `train-board-skip:`
+ledger row, no line to Jo, and Jo's `train <N>` still lands it. For these PRs the normal row's "told
+in one line after the merge" no longer holds: Jo hears only of a production-stakes merge, a
+conflict the owner fails twice, a red main (once per `main-red` issue), or a main protection the
+tick cannot verify (named once per episode). Production-stakes and user-driven lanes keep the rule
+above unchanged; production auto-boarding is a non-goal.
 
 **Amended 2026-10-01 — cross-lab review** (MIGRATION.md item 23; Jo: *"any review should happen
 via a model from a lab that did not build it. if the agent building it was anthropic? we use openai
@@ -705,6 +751,26 @@ code manually at some point?"*
   (`.ai/plumb-seat-charter.md:67-70`). If it happens anyway, the runtime records the foreign
   diff as a ledger entry and the next slice's brief includes it; that is mitigation, not a mode.
 
+**Amended 2026-10-19 — inbound agent channel** (`migration/items/agent-channel.md`; Jo, answering
+q-mv8wcymfkx3y0w: *"notes"*, ledger input `in-mv8yzvhuwz9jwg`; plan
+`/Users/jowolff/agent-scratch/agent-system-2.0/wl-mv8vx7wdj5nx1c/PLAN.md` rev 6; built in
+wl-mv8vx7wdj5nx1c). Other agents reach the orchestrator through one inbound channel, never
+through Jo's steering path. Each sender is configured in `profile/config.yml` under
+`channel.senders[]` with an `id`, a `transport` and an `authority`; the authority belongs to the
+sender, not to anything a message says. Phase 1 has one sender, `{ id: plumb, transport:
+omp-mailbox, authority: notes }`, and `notes` (notes and proposals) is the only authority built.
+A message is never authored as Jo: it is a `messages` row on `wl-orchestrator` with sender
+`plumb`, created_by `channel:plumb` and the body prefix `channel-note from plumb:`, and the
+channel writes no instruction, answer, stakes or mode flip, or ceiling change. The orchestrator
+reads it as information from that sender, and replies with `orchestrator_reply` or closes it
+with `orchestrator_channel_done`. A line that names a waiting needs-you row and a word that
+answers it is a proposal: it renders as `#n plumb proposes <word> <target>` and carries the
+target's own number, never one of its own, and only Jo's typed `n <word>` (or another word that
+fits the row) applies, as Jo's ordinary row. Flip and ceiling words from a sender answer no
+numbered row, so they stay notes. A sender's `from` is self-claimed, so a spoof costs a
+misattributed note, never an action. Grant words wait for a phase with sender proof; phase 2
+(Juno, remote, notes only) starts only after Jo's go is recorded as an instruction.
+
 ### B6 · Spec-and-plan option is offered inside the lane (P-12)
 
 **Ruled 2026-09-23.** Jo: *"inside the lane"*. The orchestrator opens the workload and lane as
@@ -796,6 +862,35 @@ before; a plan-first lane started before the merge keeps the old check for its s
 checked: that a locator exists (a test the plan will write does not exist yet) or that it really
 enforces its requirement; Jo judges that from the plan, the cross-lab plan review reads it, and the
 code review checks it in the diff.
+
+**Amended 2026-10-19 — a normal plan that passes cross-lab review starts on its own, and stops before merge**
+(`migration/items/escalation-policy.md`; Jo, 2026-10-19: *"yes to auto-start, stop at 100%"*, deciding the escalation
+draft's decision 1, *"A normal-stakes plan that passes cross-lab review starts without Jo's `approve`. Jo gets a notice
+and can stop it before merge. It never opens new work while the flow-repair gate is up."*; plan rev 5 § 3; built in
+wl-mvfkv7llkp7nk0). When a lane raises the plan question (an `approve` question on the plan slice while `plan: first`
+stands), `lane_raise_question` raises no question when all of these hold (`planAutoStartRound`,
+`surface/extensions/lane-tools.ts`): (a) the workload is at normal stakes; (b) the passing round is the latest review
+state, meaning the newest `review-loop-end:` on the plan slice is `reason pass` and no `hand-spawn: … review yes` and
+no review routing on the slice came after it; the round it closes was created after the slice's last question was
+resolved; and every member of that round ran, was not withheld, carries no same-lab token (no Jo grant, no Kimi-out
+rule token) and answered only on labs outside the builders. Jo's `accept` at a round limit, a mixed round and any
+later review all fail (b). (c) The body passes the plan-question shape check above. (d) The workload was never
+halted. (e) The `flow-repair` ruling is not active (§ B3, *Amended 2026-10-19*). Then, in one write, the fixed writer
+`escalation` (`ESCALATION_BY`) records `plan: approved auto <round group>`, a form valid only from that writer, which
+every reader of plan approval accepts and no lane can write, and sends Jo a notice carrying the plan body: *"plan
+started without your approve on <wl> (normal stakes, cross-lab review passed); it will not merge until 4 h after your
+next message here; `halt <wl>` stops it"*. The lane is told to add its change slices. Auto-start never opens a
+workload and never launches a lane. Production plans, and every plan while flow repair is up, still go to Jo as above.
+**Stop before merge:** for such a workload `prStakes` (`surface/src/merge-train.ts`) answers `hold: <reason> until
+<time|jo>`. The hold lasts until 4 h (`HOLD_HOURS`) after Jo's first typed surface message created after the notice
+was delivered (the standing-workload instruction `joInputRow` writes; mirrors on other workloads do not count), and
+until Jo when there is none. The train records `train-hold: pr <N> head <sha> until <…>`, leaves the PR's slices open
+and moves on. The tick's `hold-expired` reason wakes it once per hold (its own `train-wake:` consumes it), and the
+train re-reads `prStakes` just before `gh pr merge`. Not caught: a `halt` written in the seconds between that read and
+the merge. **`halt <wl>`** writes Jo's instruction, the surface's `plan: halted <instruction>` and a `lane-stop:`
+request to a live holder. `planFirst` then reads the workload as unapproved, so change slices are refused. The train
+holds its PRs with no end, auto-start never fires on it again, and Jo's `approve` on its next plan question approves
+it as before.
 
 ### B7 · Wake: the ledger rendered, never a hand's prose (P-17)
 
@@ -906,6 +1001,21 @@ unchanged. The profile table still spreads every tier across the three providers
 inventory each lab's lanes take their own entries from and each review takes the other labs'
 entries from. Rate-limit exhaustion still stays inside the lane (B3) under the four-hour rule
 (A3).
+
+**Amended 2026-10-19 — the workload ceiling stops and tells; paired lanes are never stopped**
+(`DESIGN-workload-ceiling.md` § 2, *Amended 2026-10-19*; `migration/items/escalation-policy.md`; Jo, 2026-10-19: *"yes
+to auto-start, stop at 100%"*, deciding the escalation draft's decision 2, *"At 100% of a ceiling, as2 stops and sends a
+notice. Jo can extend with one word. There is no automatic extension."*; Jo's paired-workload amendment
+in-mvfo7nphl9xn28; plan rev 5 §§ 4–4.1; built in wl-mvfkv7llkp7nk0). The lane runner's meter raises no question at any
+level. At 80 % of either half of the workload ceiling it sends Jo one notice per ceiling value, and the lane goes on.
+At 100 % the lane stops (`lane-stop: … accepted ceiling`, outcome `stop`) and Jo gets one stop notice per ceiling
+value (§ B3, *Amended 2026-10-19*). No ceiling extends on its own, at any stakes. Raising stays Jo's (§ B12.1 item 2).
+`extend <wl>` adds one more block of the workload's own size; `ceiling <usd> [<hours>] <wl>` sets a figure. Each
+writes Jo's instruction and then the `ceiling:` entry naming it. Either word relaunches an autonomous lane the ceiling
+stopped, when that lane's spend is under the new value and no relaunch is already waiting. A workload whose holder is a
+live by-hand lane (`as2 lane <wl>`, `launch:` cause `interactive`) is never stopped at its ceiling and puts nothing
+about it on the needs-you list. That lane gets its spend against the ceiling at every turn start, and Jo gets a line
+in its pane at every further 25 % of the original ceiling's dollars, past 100 % too.
 
 ### B12 · Two decisions held since the triple-check (P-7b, P-16/P-15)
 

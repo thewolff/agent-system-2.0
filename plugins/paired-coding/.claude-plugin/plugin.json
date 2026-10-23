@@ -1,0 +1,9 @@
+{
+  "name": "paired-coding",
+  "description": "Pair with an agent one change set at a time: it proposes a card naming the decision inside the change, you agree in conversation, and only then does it write.",
+  "version": "1.3.2",
+  "author": { "name": "Jo Wolff" },
+  "license": "MIT",
+  "repository": "https://github.com/thewolff/jo-wolff-plugins",
+  "keywords": ["agents", "pairing", "pair-programming", "code-review", "gate"]
+}

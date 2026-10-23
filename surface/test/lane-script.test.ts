@@ -12,8 +12,10 @@ import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { handSpawnBody } from "../../classifier/src/lab";
-import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, type QuestionRow, TEST_RUNNER_BY } from "../../ledger/src/index";
-import { ceilingBody, CEILING_OPTIONS, parseSpend } from "../src/ceiling";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { ceilingBody, parseCeilingNotice, parseSpend } from "../src/ceiling";
+import { apply, interpret } from "../src/input";
+import { errorLines } from "../src/errors";
 import { recordRepo } from "../src/decision-log";
 import { branchName, type ControlEntry, doneBody, laneCap, laneDir, laneEnv, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, verdictOf, worktreePath } from "../src/launch";
 import { errorLines } from "../src/errors";
@@ -1409,10 +1411,23 @@ function tinyCeiling(r: LaneRoot, wl: string, usd: number): void {
 	}
 }
 const spendsOf = (control: readonly ControlEntry[], laneId: string) => control.filter((c) => c.prefix === "spend" && c.laneId === laneId).map((c) => parseSpend(c.rest)!);
-const ceilingQuestionsOf = (questions: readonly QuestionRow[]) => questions.filter((q) => q.slice_id.startsWith("sl-ceiling-") && q.created_by === LANE_RUNNER_BY);
+/** The runner's ceiling notices on `wl`, oldest first, read back (`parseCeilingNotice`): level, ceiling value and workload. */
+function ceilingNoticesOf(r: LaneRoot, wl: string) {
+	const l = ledgerOf(r);
+	try {
+		return l.db.query<{ body: string; created_by: string }, [string]>("SELECT body, created_by FROM messages WHERE workload_id = ? ORDER BY created_at, id").all(wl)
+			.flatMap((m) => {
+				const n = m.created_by === LANE_RUNNER_BY ? parseCeilingNotice(m.body) : null;
+				return n ? [n] : [];
+			});
+	} finally {
+		l.close();
+	}
+}
+const TINY = "usd 1 wall 60";
 
-describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4)", () => {
-	test("80 %: one question over two polls, the lane goes on and completes; finishing under the ceiling withdraws it (then cancel); the prompt carries the ceiling; the final spend: counts everything", async () => {
+describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4; PLAN wl-mvfkv7llkp7nk0 § 4)", () => {
+	test("R11 80 %: one notice over two polls and no question, the lane goes on and completes; the prompt carries the ceiling; the final spend: counts everything", async () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r);
 		tinyCeiling(r, wl, 1);
@@ -1427,11 +1442,8 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 		expect(exit).toMatchObject({ outcome: "completed" });
 		const snap = laneSnapshot(r, wl);
 		expect(snap.deaths).toEqual([]);
-		const qs = ceilingQuestionsOf(snap.questions);
-		expect(qs).toHaveLength(1);
-		expect(JSON.parse(qs[0]!.options)).toEqual([...CEILING_OPTIONS]);
-		expect(qs[0]!.state).toBe("withdrawn");
-		expect(snap.slices.find((s) => s.id === qs[0]!.slice_id)!.state).toBe("cancelled");
+		expect(ceilingNoticesOf(r, wl)).toEqual([{ level: 80, key: TINY, workloadId: wl }]);
+		expect(snap.questions).toEqual([]);
 		const spends = spendsOf(snap.control, laneId);
 		expect(spends).toHaveLength(2);
 		expect(spends[0]!.usd).toBeCloseTo(0.85, 4);
@@ -1442,7 +1454,7 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 		expect(readFileSync(rec!.session!, "utf8")).toContain("ceiling: $1 / 60 min for the workload; spent so far $0.00");
 	}, 60_000);
 
-	test("100 % unanswered (a jump past 80 % between polls): the question is raised with the stop, lane-stop: accepted ceiling, outcome stop reason ceiling, no lane-died: though a slice is open, released", async () => {
+	test("R12 100 % (a jump past 80 % between polls): the stop notice alone and no question, lane-stop: accepted ceiling, outcome stop reason ceiling, no lane-died: though a slice is open, released, the ceiling not raised", async () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r, { slice: true });
 		tinyCeiling(r, wl, 1);
@@ -1456,8 +1468,9 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 		expect(snap.workload!.holder).toBeNull();
 		const stops = snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === laneId);
 		expect(stops.map((s) => [s.createdBy, s.rest])).toEqual([[LANE_RUNNER_BY, "accepted ceiling"]]);
-		const qs = ceilingQuestionsOf(snap.questions);
-		expect(qs.map((q) => q.state)).toEqual(["open"]);
+		expect(ceilingNoticesOf(r, wl)).toEqual([{ level: 100, key: TINY, workloadId: wl }]);
+		expect(snap.questions).toEqual([]);
+		expect(snap.control.filter((c) => c.prefix === "ceiling").map((c) => c.rest)).toEqual(["usd 1 wall 60 source test tiny ceiling"]);
 		expect(spendsOf(snap.control, laneId).at(-1)).toMatchObject({ usd: 1.2, tokens: 5000 });
 		const [rec] = fakeRecords(r);
 		expect(eventsOf(r, rec!.pid)).toEqual(["prompt", "abort", "eof"]);
@@ -1481,7 +1494,7 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 		expect(last.tokens).toBe(30);
 	}, 60_000);
 
-	test("a relaunch already past 100 % (Jo answered stop, then a relaunch is requested): the runner meters before the first prompt and stops without sending it, no second question, no lane-died:", async () => {
+	test("R12 a relaunch on the same ceiling value (Jo's plain relaunch, no raise): the runner meters before the first prompt and stops without sending it, no second stop notice, no lane-died:", async () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r, { slice: true });
 		tinyCeiling(r, wl, 1);
@@ -1490,9 +1503,6 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 		expect(await exitOf(r, wl, laneIdOf(wl, 1))).toMatchObject({ outcome: "stop", reason: "ceiling" });
 		await drainSettled(r, laneIdOf(wl, 1));
 		const l = ledgerOf(r);
-		const [q] = ceilingQuestionsOf(l.questions(wl));
-		const answer = l.answerQuestion(q!.id, { by: SURFACE_BY, answer: "stop", author: "jo", channel: "surface" });
-		l.completeSlice(q!.slice_id, { by: SURFACE_BY, artifact: `answered stop ${answer}` });
 		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: `launch-requested: by jo at ${l.now()}` });
 		l.close();
 		setMeterScript(r, [{ usage: { usd: 0.1, tokens: 10 } }, { hang: true }]);
@@ -1503,12 +1513,101 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 		expect(snap.deaths).toEqual([]);
 		expect(snap.workload!.holder).toBeNull();
 		expect(snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === lane2).map((c) => c.rest)).toEqual(["accepted ceiling"]);
-		expect(ceilingQuestionsOf(snap.questions)).toHaveLength(1);
+		expect(ceilingNoticesOf(r, wl)).toEqual([{ level: 100, key: TINY, workloadId: wl }]);
+		expect(snap.questions).toEqual([]);
 		expect(spendsOf(snap.control, lane2).at(-1)).toMatchObject({ usd: 1.2, tokens: 5000 });
 		const starts = fakeRecords(r).filter((x) => x.argv !== undefined);
 		expect(starts).toHaveLength(2);
 		expect(eventsOf(r, starts[1]!.pid)).toEqual(["abort", "eof"]);
 	}, 60_000);
+
+	for (const word of ["extend", "ceiling"] as const) {
+		test(`R13 Jo's \`${word}\` word on a lane stopped at the ceiling requests the relaunch, and the relaunched lane works under the raised value`, async () => {
+			const r = makeRoot();
+			const { wl } = openWorkload(r, { slice: true });
+			tinyCeiling(r, wl, 1);
+			setMeterScript(r, [{ usage: { usd: 1.2, tokens: 5000 } }, { hang: true }]);
+			expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+			expect(await exitOf(r, wl, laneIdOf(wl, 1))).toMatchObject({ outcome: "stop", reason: "ceiling" });
+			await drainSettled(r, laneIdOf(wl, 1));
+			const l = ledgerOf(r);
+			const receipt = apply(l, interpret(l, word === "extend" ? `extend ${wl}` : `ceiling 20 ${wl}`)!);
+			l.close();
+			expect(receipt).toContain(`${laneIdOf(wl, 1)} stopped at the ceiling, so a relaunch is requested`);
+			setMeterScript(r, [{ usage: { usd: 0.1, tokens: 10 } }, { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }]);
+			expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+			const lane2 = laneIdOf(wl, 2);
+			expect(await exitOf(r, wl, lane2)).toMatchObject({ outcome: "completed" });
+			const snap = laneSnapshot(r, wl);
+			expect(snap.deaths).toEqual([]);
+			expect(snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === lane2)).toEqual([]);
+			expect(ceilingNoticesOf(r, wl)).toEqual([{ level: 100, key: TINY, workloadId: wl }]);
+			const starts = fakeRecords(r).filter((x) => x.argv !== undefined);
+			expect(starts).toHaveLength(2);
+			expect(eventsOf(r, starts[1]!.pid)).toEqual(["prompt", "eof"]);
+		}, 60_000);
+	}
+
+	test("R16 a by-hand (paired) lane past 100 %: after an autonomous lane's 80 % notice, the by-hand lane keeps running, is not stopped or relaunched, and adds no question or ceiling notice; the queued notice is not shown while it runs", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r);
+		tinyCeiling(r, wl, 1);
+		// The autonomous lane: 85 % of the $1 ceiling, a meter poll (STOP_POLL_MS 5 s) inside the sleep, then its receipt.
+		setMeterScript(r, [{ usage: { usd: 0.85, tokens: 1000 } }, { sleepMs: 6_000 }, { tool: "lane_record_entry", args: { body: "done-because: the autonomous part is done" } }]);
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const lane1 = laneIdOf(wl, 1);
+		expect(await exitOf(r, wl, lane1)).toMatchObject({ outcome: "completed" });
+		await drainSettled(r, lane1);
+		expect(ceilingNoticesOf(r, wl)).toEqual([{ level: 80, key: TINY, workloadId: wl }]);
+		// Jo pairs: the workload goes user-driven and Jo starts the by-hand lane, whose turn spends past the ceiling.
+		const l = ledgerOf(r);
+		apply(l, interpret(l, `user-driven ${wl}`)!);
+		l.close();
+		setScript(r, { steps: [{ usage: { usd: 0.5, tokens: 500 } }, { hang: true }] });
+		const tui = Bun.spawn(["bun", LANE_SCRIPT, "interactive", wl], { cwd: r.repo, env: r.env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+		const lane2 = laneIdOf(wl, 2);
+		const started = (await startedOf(r, wl, lane2))!;
+		await until("the lane's own claim", () => laneSnapshot(r, wl).workload?.changed_by === lane2);
+		const prompt = readFileSync(join(laneDir(wl, r.home), "prompt.md"), "utf8");
+		expect(prompt).toContain("ceiling: $1 / 60 min for the workload; spent so far $0.85");
+		expect(prompt).toContain("you are paired with Jo; you are never stopped at the ceiling");
+		tui.stdin.write(`${JSON.stringify({ type: "prompt", id: "p1", message: "go on" })}\n`);
+		tui.stdin.flush();
+		const session = (await until("the by-hand lane's session file", () => fakeRecords(r).find((x) => x.pid === started.pid && x.session)?.session))!;
+		await until("the by-hand turn's usage", () => readFileSync(session, "utf8").includes('"total":0.5') || null);
+		// A real wait, longer than a runner's meter poll (STOP_POLL_MS 5 s): the absence of a stop has no event to await, and
+		// the wrapper and the fake omp are separate processes no fake clock reaches.
+		await Bun.sleep(7_000);
+		expect(alive(started.pid)).toBe(true);
+		const snap = laneSnapshot(r, wl);
+		expect(snap.workload!.holder).toBe(lane2);
+		expect(laneExit(snap.control, lane2)).toBeNull();
+		expect(snap.control.filter((c) => c.prefix === "lane-stop")).toEqual([]);
+		expect(snap.control.filter((c) => c.prefix === "launch").map((c) => c.laneId)).toEqual([lane1, lane2]);
+		expect(snap.questions).toEqual([]);
+		expect(snap.deaths).toEqual([]);
+		expect(ceilingNoticesOf(r, wl)).toEqual([{ level: 80, key: TINY, workloadId: wl }]);
+		const v = ledgerOf(r);
+		try {
+			expect(errorLines(v).filter((e) => e.workloadId === wl).map((e) => e.kind)).toEqual([]);
+		} finally {
+			v.close();
+		}
+		// Jo ends the session: an interactive exit, no death; with no by-hand lane holding it, the queued notice shows again.
+		process.kill(started.pid, "SIGTERM");
+		expect(await tui.exited).toBe(0);
+		tui.stdin.end();
+		const after = laneSnapshot(r, wl);
+		expect(laneExit(after.control, lane2)).toMatchObject({ outcome: "interactive" });
+		expect(after.deaths).toEqual([]);
+		expect(after.control.filter((c) => c.prefix === "launch").map((c) => c.laneId)).toEqual([lane1, lane2]);
+		const w = ledgerOf(r);
+		try {
+			expect(errorLines(w).filter((e) => e.workloadId === wl).map((e) => e.kind)).toEqual(["notice"]);
+		} finally {
+			w.close();
+		}
+	}, 90_000);
 });
 
 describe("item 71: a queued launch starts when a lane slot frees (the runner's drain)", () => {
