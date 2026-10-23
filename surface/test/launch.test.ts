@@ -6,10 +6,10 @@ import { handBuilderBody, handSettledBody, handSpawnBody, laneBuilderBody, revie
 import { reviewGroupBody, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type InstructionRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
 import {
-	boundPrs, CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv, launchable, maxTimeMs,
-	PLAN_FILE_MAX_BYTES, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_SHAPE, planAutoApprovedBody, planFirst, planFirstBody, planHaltedBody, planQuestionProblem, requirementsProblem, reservedPrefix,
-	supersededBody, supersededBy, supersedeInstructionBody,
-	testPrBody, testPrInstructionBody, type Resolution, resumePlan, resumeSession, TRAIN_LANDS_LINE, verdictOf, waivedPrs, waivePrBody, waivePrInstructionBody,
+	boundPrs, CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv, laneExitBody, launchable, laneStopAcceptedBody,
+	laneStopRequestBody, maxTimeMs, PLAN_FILE_MAX_BYTES, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_SHAPE, planAutoApprovedBody, planFirst, planFirstBody, planHaltedBody, planQuestionProblem, PRIORITY_REASON_PREFIX, priorityPausedOf, priorityPausingOf,
+	requirementsProblem, reservedPrefix, resumePlan, supersededBody, supersededBy, supersedeInstructionBody,
+	testPrBody, testPrInstructionBody, type Resolution, resumeSession, TRAIN_LANDS_LINE, verdictOf, waivedPrs, waivePrBody, waivePrInstructionBody,
 } from "../src/launch";
 import type { CleanShellRead } from "../../gates/src/clean-shell";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
@@ -765,5 +765,94 @@ describe("plan approval by the auto-start's fixed writer (PLAN wl-mvfkv7llkp7nk0
 		expect(planFirst(control(rows))).toEqual({ trigger: "halted by Jo (instruction in-9)", entryId: halted.id });
 		expect(planFirst(control([...rows, entry(SURFACE_BY, "plan: approved in-10")]))).toBeNull();
 		expect(planFirst(control([first(), entry("lane-m-1", planHaltedBody("in-9"))]))).toMatchObject({ trigger: "your word" });
+	});
+});
+
+describe("priority pause: the state and its cause (PLAN wl-mv8wzytml878b4 D3, T4, T5)", () => {
+	const X = "wl-x";
+	const prio = `${PRIORITY_REASON_PREFIX}${X}`;
+	const stopReq = (lane: string, reason: string, by = "rank") => entry(SURFACE_BY, laneStopRequestBody(lane, reason, by));
+	const accept = (lane: string, ref: string) => entry(LANE_RUNNER_BY, laneStopAcceptedBody(lane, ref));
+	const exit = (lane: string, outcome: string, reason: string | null) => entry(LANE_RUNNER_BY, laneExitBody(lane, { code: 0, signal: null, outcome, reason }));
+	/** L ran (cause first, session s-1), was asked to stop for X, accepted, and exited outcome stop reason priority-for-X. */
+	const paused = (lane = "lane-m-1", cause = "first") => {
+		const req = stopReq(lane, prio);
+		const ex = exit(lane, "stop", prio);
+		return { rows: [launch(lane, cause), started(lane, `s-${lane}`), req, accept(lane, req.id), ex], req, ex };
+	};
+	const verdict = (rows: EntryRow[], over: Partial<WorkloadRow> = {}, live = 0, resolved: Resolution[] = []) =>
+		launchable(workload(over), control(rows, over.holder ?? null), null, resolved, NOW, live, 3);
+
+	test("T4: the accepted priority stop and its lane-exit reason priority-for-X make the workload priority-paused", () => {
+		const { rows, ex } = paused();
+		expect(priorityPausedOf(control(rows))).toEqual({ laneId: "lane-m-1", forWl: X, exitId: ex.id });
+		expect(priorityPausingOf(control(rows))).toBeNull();
+	});
+
+	test("T4: while the request is pending (accepted or not, no exit yet) it is priority-pausing, not paused", () => {
+		const req = stopReq("lane-m-1", prio);
+		const pending = [launch("lane-m-1", "first"), started("lane-m-1", "s-1"), req];
+		expect(priorityPausingOf(control(pending))).toEqual({ laneId: "lane-m-1", forWl: X, requestId: req.id });
+		expect(priorityPausedOf(control(pending))).toBeNull();
+		const acceptedOnly = [...pending, accept("lane-m-1", req.id)];
+		expect(priorityPausingOf(control(acceptedOnly))).toEqual({ laneId: "lane-m-1", forWl: X, requestId: req.id });
+		expect(priorityPausedOf(control(acceptedOnly))).toBeNull();
+	});
+
+	test("T4: not paused after a ceiling stop, Jo's as2 lane stop (by-hand), a death, or a death before a late acceptance", () => {
+		const base = [launch("lane-m-1", "first"), started("lane-m-1", "s-1")];
+		const ceiling = [...base, accept("lane-m-1", "ceiling"), exit("lane-m-1", "stop", "ceiling")];
+		const jo = stopReq("lane-m-1", "by-hand", "jo");
+		const byHand = [...base, jo, accept("lane-m-1", jo.id), exit("lane-m-1", "stop", "by-hand")];
+		const death = [...base, exit("lane-m-1", "died", null)];
+		const req = stopReq("lane-m-1", prio);
+		const lateAccept = [...base, req, exit("lane-m-1", "died", null), accept("lane-m-1", req.id)];
+		for (const rows of [ceiling, byHand, death, lateAccept]) expect(priorityPausedOf(control(rows))).toBeNull();
+		for (const rows of [ceiling, byHand, death, lateAccept]) expect(verdict(rows)).toEqual({ launch: false, reason: "died-not-relaunched" });
+		expect(priorityPausingOf(control(lateAccept))).toBeNull();
+	});
+
+	test("T4: an exit reason priority-for-X counts only with the accepted request naming the same X, by a valid writer", () => {
+		const other = stopReq("lane-m-1", `${PRIORITY_REASON_PREFIX}wl-y`);
+		const mismatch = [launch("lane-m-1", "first"), other, accept("lane-m-1", other.id), exit("lane-m-1", "stop", prio)];
+		expect(priorityPausedOf(control(mismatch))).toBeNull();
+		const forged = entry("lane-m-1", laneStopRequestBody("lane-m-1", prio, "rank"));
+		const lane = [launch("lane-m-1", "first"), forged, accept("lane-m-1", forged.id), exit("lane-m-1", "stop", prio)];
+		expect(priorityPausedOf(control(lane))).toBeNull();
+	});
+
+	test("T5: a priority-paused workload launches with cause priority <exit id>, resuming the paused lane's own session", () => {
+		const { rows, ex } = paused();
+		expect(verdict(rows)).toEqual({ launch: true, cause: { kind: "priority", exitId: ex.id } });
+		const relaunched = [...rows, launch("lane-m-2", `priority ${ex.id}`)];
+		expect(resumePlan(control(relaunched), "lane-m-2", [], null)).toEqual({ resume: "s-lane-m-1", skipped: null });
+	});
+
+	test("T5: after one launch, whatever its cause (priority, Jo's request, an answered question), no priority cause is left", () => {
+		const { rows, ex } = paused();
+		expect(verdict([...rows, launch("lane-m-2", `priority ${ex.id}`)])).toEqual({ launch: false, reason: "died-not-relaunched" });
+		const req = entry(SURFACE_BY, `launch-requested: by jo at ${NOW}`);
+		expect(verdict([...rows, req, launch("lane-m-2", `request ${req.id}`)])).toEqual({ launch: false, reason: "died-not-relaunched" });
+		const answered = [...rows, launch("lane-m-2", "resume in-1")];
+		expect(verdict(answered, {}, 0, [resolution("in-1", "lane-m-1")])).toEqual({ launch: false, reason: "died-not-relaunched" });
+	});
+
+	test("T5: precedence: a pending request is the cause taken; a done-because: gives awaiting-close; a live holder held; cap before it", () => {
+		const { rows } = paused();
+		const req = entry(SURFACE_BY, `launch-requested: by jo at ${NOW}`);
+		expect(verdict([...rows, req])).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+		const withReceipt = [...rows, entry("lane-m-1", "done-because: all done")];
+		const reserve: ReserveRows = { workload: workload(), entries: withReceipt, questions: [], instructions: [], slices: [], holders: [], liveLanes: 0, cap: 3, now: NOW };
+		expect(verdictOf(reserve)).toEqual({ launch: false, reason: "awaiting-close" });
+		expect(verdict(rows, { holder: "lane-m-2", holder_lease_until: "2026-10-01T10:05:00.000Z" })).toEqual({ launch: false, reason: "held" });
+		expect(verdict(rows, {}, 3)).toEqual({ launch: false, reason: "cap" });
+	});
+
+	test("T5: a second pause after the priority relaunch stands again, with its own exit id", () => {
+		const first = paused();
+		const second = paused("lane-m-2", `priority ${first.ex.id}`);
+		const rows = [...first.rows, ...second.rows];
+		expect(priorityPausedOf(control(rows))).toEqual({ laneId: "lane-m-2", forWl: X, exitId: second.ex.id });
+		expect(verdict(rows)).toEqual({ launch: true, cause: { kind: "priority", exitId: second.ex.id } });
 	});
 });

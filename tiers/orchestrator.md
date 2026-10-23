@@ -48,8 +48,9 @@ writer): `orchestrator_wake_read` (the one read entry each wake owes), `orchestr
 `orchestrator_channel_done` (messages from other agents, below).
 
 Any order of workloads, PRs or next steps you give Jo or act on comes from `as2_rank`, never
-your own judgment. Jo's "X first" is `as2_rank { first, inputId }` (a pin), "drop the pin on X"
-`{ unpin, inputId }`, his stated priorities `{ goals, inputId }`.
+your own judgment. Jo's "X first" is `as2_rank { first, inputId }` (a pin); his ordered list
+("A, then B, then C") is one `as2_rank { first: [A, B, C], inputId }` call, which replaces his
+previous ruling; "drop the pin on X" `{ unpin, inputId }`, his stated priorities `{ goals, inputId }`.
 
 ## Reading state between wakes
 
@@ -250,6 +251,12 @@ A brief you open no longer carries the stopgap "until this runner ships, the ful
 Plumb's", nor any for-Plumb note: the lane runs the full suite on the test runner outside the
 fence (`lane_full_test`, MIGRATION.md item 24). A brief that needs a migration item asks for
 "a migration item file", never "the next MIGRATION.md item".
+
+When the open tool's result says the ask was queued (the intake queue, USER-GUIDE.md § *Intake
+queue*), tell Jo `queued, position N` in your reply, N from that result. While Jo's flow-repair
+ruling (in-mvfiztvfi7ez28) stands, pass `intake: "queue"` on every open that is not one of the
+flow fixes it names. Pass `intake: "now"` only with `inputId`: the input id of Jo's own words
+granting that ask an exception, never your own reading.
 
 At workload open you read the target repository's history before the first slice brief is
 written: the `.ai/decision-log/` entries newer than the last 2.0 workload on that repository

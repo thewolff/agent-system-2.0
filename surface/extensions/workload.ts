@@ -20,9 +20,10 @@ import { closeCheck, closeScratchRoot, commitCloseEntry, type EntryPublish, logD
 import { decisionLogContext, lastWorkloadOn, recordRepo, repoOf } from "../src/decision-log";
 import { identityOf, recordIdentity } from "../src/identity";
 import { ceilingBody, sizeFor } from "../src/ceiling";
-import { controlEntries, doneBecause, doneBody, doneLine, holdersOf, laneModelBody, modelProblem, planFirstBody, supersededBy } from "../src/launch";
+import { attempts, controlEntries, doneBecause, doneBody, doneLine, holdersOf, laneCap, laneModelBody, modelProblem, planFirstBody, queuedBody, supersededBy } from "../src/launch";
 import { stakesSource } from "../src/input";
 import { answerOrchestratorQuestion, inputSpent, joInput, type OrchestratorAnswer, questionSubject, readingBody } from "../src/orchestrator-question";
+import { queuePosition, startedIdle } from "../src/rank-launch";
 import { oneLiner } from "../src/render";
 import { surfaceSession } from "../src/session";
 import { inferMode, inferStakes, type JudgedSize, judgedLarge, planFirstTrigger, saidNoPlan, saidPlanIt } from "../src/stakes";
@@ -31,15 +32,17 @@ import {
 	STAKES_WORDS, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult,
 } from "../src/types";
 import { triggerLaunch } from "./launch";
-import { askAtOpen } from "./rank";
+import { askAtOpen, RANK_ASK_TIMEOUT_MS } from "./rank";
 
 const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text: t }], details });
 const inactive = text("This session is not the orchestrator surface; nothing was written.");
+/** Jo's input was spent by another call between the open's check and its transaction (PLAN wl-mvbcjadqgblr7k D3). */
+class InputSpent extends Error {}
 
 export interface WorkloadDeps {
 	/** The judge that sizes a workload brief for plan-first (decision 15) and asks the new workload's Jev rank signal (PLAN wl-mv8k039gvogt8g D4): OMP's `judge` role, wired in surface/index.ts. Absent in tests that do not size. */
 	judge?(ctx: Ctx): Promise<KindJudge>;
-	/** The open-time rank ask's limit (surface/extensions/rank.ts RANK_ASK_TIMEOUT_MS unless a test sets it). */
+	/** The open-time rank ask's limit (surface/extensions/rank.ts RANK_ASK_TIMEOUT_MS unless a test sets it); also the one overall deadline a queued open waits for that ask (PLAN wl-mvbcjadqgblr7k D4). */
 	askTimeoutMs?: number;
 }
 
@@ -198,6 +201,8 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			"Production stakes are always plan-first; Jo's 'plan it' (or `plan: \"first\"`) sets it and wins over no plan; at throwaway stakes only a brief judged a large change is plan-first. " +
 			"An autonomous workload's lane is launched here; a user-driven one gets its by-hand command. " +
 			"`model` (Jo's word only) names the model the workload's lanes run on, kept across relaunches: an exact `provider/model` (e.g. `openai-codex/gpt-6-sol`) on a provider with a known lab, no `:level` suffix; a bad value opens nothing. " +
+			"Intake queue: while started-but-idle workloads outnumber the lane slots the ask is opened queued and the result says `queued, position N of M` (Jev rank order among queued asks); tell Jo that position. " +
+			"`intake: \"queue\"` queues the ask whatever the count; `intake: \"now\"` with `inputId` (Jo's unspent input row) opens past the cap and spends that input, and without one opens nothing. " +
 			"Returns the id, the one-liner, the launch line, and the repository's decision-log entries newer than the last 2.0 workload on it.",
 		parameters: z.object({
 			brief: z.string().describe("What Jo said, as the workload brief."),
@@ -209,6 +214,8 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			mode: z.string().optional().describe("Override: autonomous | user-driven."),
 			plan: z.string().optional().describe("'first' to require a plan slice before any change slice (Jo's word); 'none' when Jo said no plan (not at production stakes)."),
 			model: z.string().optional().describe("Jo's named model for the lanes: exact provider/model (e.g. openai-codex/gpt-6-sol), no :level. Omit for the profile default."),
+			intake: z.string().optional().describe("'queue' to put the ask in the intake queue whatever the count; 'now' (Jo's word, with inputId) to open past the intake cap. Omit for the cap rule."),
+			inputId: z.string().optional().describe("With intake 'now': the input row (in-…) the surface named for Jo's words; spent once."),
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -223,6 +230,21 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			const model = typeof params.model === "string" ? params.model.trim() : null;
 			const problem = model === null ? null : modelProblem(model);
 			if (problem !== null) return text(`Refused: ${problem}. Nothing was opened.`);
+			// The intake queue (PLAN wl-mvbcjadqgblr7k D3): `queue` queues whatever the count; `now` opens past the cap only on Jo's unspent input.
+			const intake = typeof params.intake === "string" ? params.intake.trim().toLowerCase() : "";
+			const inputId = typeof params.inputId === "string" ? params.inputId.trim() : "";
+			if (intake !== "" && intake !== "queue" && intake !== "now") return text(`Refused: intake is queue or now, not ${intake}. Nothing was opened.`);
+			if (inputId && intake !== "now") return text("Refused: inputId spends Jo's input on intake now, and intake now was not given. Nothing was opened.");
+			const ledger = s.ledger();
+			let inputSlice: string | null = null;
+			if (intake === "now") {
+				if (!inputId) return text("Refused: intake now opens past the intake cap on Jo's word: pass inputId, the input row the surface named for his words (`Jo's words above are input in-…`). Nothing was opened.");
+				const input = joInput(ledger, inputId);
+				if (!input) return text(`Refused: ${inputId} is not an input Jo typed at the surface. Nothing was opened.`);
+				const spent = inputSpent(ledger, inputId);
+				if (spent) return text(`Refused: ${inputId} already ${spent.startsWith("q-") ? "answered" : "instructed"} ${spent}, and one input is recorded once. Nothing was opened.`);
+				inputSlice = input.slice_id;
+			}
 			const repo = typeof params.repo === "string" && params.repo ? params.repo : ctx.cwd;
 			const stakes = inferStakes({ said: brief, repo, branch: typeof params.branch === "string" ? params.branch : null, reservedTarget: /^(yes|true|1)$/i.test(String(params.reservedTarget ?? "")) });
 			const mode = inferMode(brief);
@@ -237,25 +259,77 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			const noPlan = saidNoPlan(brief) ? "brief" : planWord === "none" ? "argument" : null;
 			const plan = planFirstTrigger({ stakes: finalStakes, saidPlan, noPlan, judged: sized?.judged ?? null });
 			const judgedKind = judgedLarge(sized?.judged ?? null) ? "change-large" : null;
-			const ledger = s.ledger();
-			const id = ledger.write(() => {
-				const wl = ledger.openWorkload({ by: SURFACE_BY, brief, stakes: finalStakes, mode: modeOverride ?? mode.value });
-				recordRepo(ledger, wl, repo);
-				ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody(done) });
-				if (plan.trigger !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody(plan.trigger) });
-				if (sized?.entry) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: sized.entry });
-				ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: ceilingBody(sizeFor(finalStakes, judgedKind), stakesSource(finalStakes, judgedKind)) });
-				if (model !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: laneModelBody(model, s.now()) });
-				return wl;
-			});
+			let opened: { id: string; queued: string | null };
+			try {
+				opened = ledger.write(() => {
+					if (intake === "now") {
+						const spentNow = inputSpent(ledger, inputId);
+						if (spentNow) throw new InputSpent(`${inputId} was spent on ${spentNow} meanwhile`);
+					}
+					// D2: counted inside the open's own transaction, so two opens never both read the count before either writes.
+					const cap = laneCap(env);
+					const idle = intake === "" ? startedIdle(ledger, ledger.now()).length : 0;
+					const queued = intake === "queue" ? "intake queue" : idle > cap ? `${idle} started-idle workloads over ${cap} lane slots` : null;
+					const wl = ledger.openWorkload({ by: SURFACE_BY, brief, stakes: finalStakes, mode: modeOverride ?? mode.value });
+					recordRepo(ledger, wl, repo);
+					ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody(done) });
+					if (plan.trigger !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody(plan.trigger) });
+					if (sized?.entry) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: sized.entry });
+					ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: ceilingBody(sizeFor(finalStakes, judgedKind), stakesSource(finalStakes, judgedKind)) });
+					if (model !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: laneModelBody(model, s.now()) });
+					if (queued !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: queuedBody(queued) });
+					if (intake === "now") {
+						ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: inputSlice, kind: "assumption", body: readingBody("open past the intake cap", inputId, wl) });
+					}
+					return { id: wl, queued };
+				});
+			} catch (err) {
+				if (err instanceof InputSpent) return text(`Refused: ${err.message}, and one input is recorded once. Nothing was opened.`);
+				throw err;
+			}
+			const id = opened.id;
 			const since = lastWorkloadOn(ledger, repo);
 			const context = decisionLogContext(logDirOf(env, repo), { since });
 			const row = ledger.workload(id)!;
-			// Jev rank (PLAN wl-mv8k039gvogt8g D4): the new workload's signal is asked in the background and written on its own; a throwing or hanging judge never fails or delays the open.
-			void askAtOpen(ledger, id, deps, ctx, (line) => process.stderr.write(`surface: ${line}\n`));
-			const launch = await triggerLaunch(pi, ledger, env, id, "open");
+			// Jev rank (PLAN wl-mv8k039gvogt8g D4): the new workload's signal is asked in the background and written on its own; a throwing or hanging judge never fails the open.
+			let asked = false;
+			const ask = askAtOpen(ledger, id, deps, ctx, (line) => process.stderr.write(`surface: ${line}\n`)).then(() => {
+				asked = true;
+			});
+			// A queued ask (PLAN wl-mvbcjadqgblr7k D4) waits for that signal under one overall deadline, judge resolution included,
+			// so its position is by rank; at the deadline the ask keeps running in the background. N is read after the wait and
+			// before the launch trigger runs; a launch attempt made during the wait (a drain or the tick) ends the queued state.
+			const intakeLines: string[] = [];
+			let intakeDetail: { position: number; of: number } | { started: string } | null = null;
+			if (opened.queued !== null) {
+				const deadline = deps.askTimeoutMs ?? RANK_ASK_TIMEOUT_MS;
+				let timer: Timer | undefined;
+				await Promise.race([ask, new Promise<void>((resolve) => (timer = setTimeout(resolve, deadline)))]);
+				clearTimeout(timer);
+				const control = controlEntries(ledger.entries(id, "assumption"));
+				const attempt = attempts(control).at(-1);
+				if (attempt !== undefined) {
+					const started = control.find((c) => c.id === attempt.entryId)!.body;
+					intakeDetail = { started };
+					intakeLines.push(`queued, then started at once: ${started}`);
+				} else {
+					const pos = queuePosition(ledger, id, ledger.now());
+					if (pos !== null) {
+						intakeDetail = { position: pos.position, of: pos.of };
+						intakeLines.push(`queued, position ${pos.position} of ${pos.of} (rank order; moves as ranks change)`);
+						if (pos.item.unscored !== undefined) {
+							intakeLines.push(asked
+								? `rank: unscored (${pos.item.unscored}); the position is unscored oldest-first among the queued asks.`
+								: `rank: still unscored: the open-time Jev ask did not land within ${deadline / 1000}s; it keeps running and the position moves when it lands.`);
+						}
+					}
+				}
+			}
+			const launch = intakeDetail !== null && "started" in intakeDetail ? { attempted: false, code: null, line: null } : await triggerLaunch(pi, ledger, env, id, "open");
+			if (intakeDetail !== null && "position" in intakeDetail && launch.code === 0) intakeLines[0] += "; started at once into a free slot";
 			const lines = [
 				`Opened ${id} on ${repo}.`,
+				...intakeLines,
 				`done: ${done}`,
 				oneLiner(ledger, row),
 				`stakes ${stakesOverride ? `overridden to ${stakesOverride}` : `inferred ${stakes.value}: ${stakes.reason}`}; mode ${modeOverride ? `overridden to ${modeOverride}` : `inferred ${mode.value}: ${mode.reason}`}.`,
@@ -266,8 +340,8 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 				"",
 				context || `No decision-log entries to carry (${since ? `none newer than ${since}` : `none in ${logDirOf(env, repo)} from the last 14 days`}).`,
 			];
-			pi.appendEntry("surface-open", { id, repo, stakes: row.stakes, mode: row.mode, planFirst: plan.trigger, launch: launch.line });
-			return text(lines.join("\n"), { id, stakes: row.stakes, mode: row.mode, since, context, planFirst: plan.trigger, launch });
+			pi.appendEntry("surface-open", { id, repo, stakes: row.stakes, mode: row.mode, planFirst: plan.trigger, launch: launch.line, intake: intakeDetail });
+			return text(lines.join("\n"), { id, stakes: row.stakes, mode: row.mode, since, context, planFirst: plan.trigger, launch, intake: intakeDetail, queued: opened.queued });
 		},
 	});
 

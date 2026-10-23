@@ -15,6 +15,9 @@
 //   orchestrator.md  263 lines  18407 bytes
 // and again after merging origin/main 479186d, whose lane.md (15219 bytes) plus the rank rule filled the old 15248:
 //   lane.md           73 lines  15399 bytes
+// and again 2026-10-22 on wl/wl-mvifaz8r8dieps (base f2db8f2, main's orchestrator.md at 23005 bytes against a 23009
+// bound), after the rank-ordered launch list rule (PR #158) and the intake-queue rule (PLAN wl-mvbcjadqgblr7k D8) filled it:
+//   orchestrator.md  329 lines  23572 bytes
 //
 // Bound per file and per measure = max(ceil(measured × 1.25), floor). The floor is rootstock's own
 // budget: 200 lines, and 2,000 tokens taken as 8,000 bytes at roughly four bytes per token for
@@ -32,7 +35,7 @@ const TIER_DIR = join(import.meta.dir, "..");
 const WARN_AT = 0.85;
 
 const BOUNDS: Record<string, { lines: number; bytes: number }> = {
-	"orchestrator.md": { lines: 329, bytes: 23009 },
+	"orchestrator.md": { lines: 412, bytes: 29465 },
 	"lane.md": { lines: 200, bytes: 19249 },
 	"fast.md": { lines: 200, bytes: 8000 },
 	"standard.md": { lines: 200, bytes: 8000 },

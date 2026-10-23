@@ -14,7 +14,8 @@
 //    message to the orchestrator is consumed by the surface at read, so it is never "held with no
 //    live lane"), older than HOLD_HOURS; or an open workload — sliced or not (§ A3: "the workload
 //    itself open with no lane and no activity"; the standing workload excepted) — with no holder and
-//    no activity for HOLD_HOURS, compared unrounded (Codex S2).
+//    no activity for HOLD_HOURS, compared unrounded (Codex S2), unless it is in the intake queue
+//    (`queuedOf`, PLAN wl-mvbcjadqgblr7k D8: it waits for a slot by design; its held messages still surface).
 // 3. a slice that failed its runtime artifact twice: ARTIFACT_FAILURES_SURFACED `artifact-failed:`
 //    messages on one slice since its last `artifact-passed:` (surface/src/signals.ts; writers: the
 //    lane's artifact observer in surface/extensions/lane.ts and P-11 row 8 for a refused push).
@@ -75,7 +76,7 @@ import { type EntryRow, type InFlightWorkload, type Ledger, type MessageRow, TES
 import { CHANNEL_REFUSED_SHOWN_HOURS, channelInForce, channelProposals, channelRefusals } from "./channel";
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { openPairOffer } from "./input";
-import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
+import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit, queuedOf } from "./launch";
 import { mainRedNotices, protectionEpisodes, type TaskWindow, TRAIN_ALERT_LADDER, trainAlertLevel, trainMembers, trainTaskWindows } from "./merge-train";
 import { questionSubject } from "./orchestrator-question";
 import { answerable } from "./numbering";
@@ -438,7 +439,9 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		const oldest = pendingMessages.find((m) => m.state === "held" && m.recipient !== ORCHESTRATOR_RECIPIENT);
 		if (oldest && hoursElapsed(oldest.created_at, now) >= holdHours) {
 			if (!isTrain()) held.push({ kind: "held", workloadId: wl, rowId: oldest.id, line: `held ${hoursBetween(oldest.created_at, now)}h on ${label}: message ${oldest.id} (${oldest.sender} → ${oldest.recipient}) has had no live lane since ${oldest.created_at}` });
-		} else if (wl !== STANDING_WORKLOAD_ID && !scheduled && !workload.holder && hoursElapsed(workload.last_activity_at, now) >= holdHours && !isTrain()) {
+		} else if (wl !== STANDING_WORKLOAD_ID && !scheduled && !workload.holder && hoursElapsed(workload.last_activity_at, now) >= holdHours && !isTrain()
+			// PLAN wl-mvbcjadqgblr7k D8: a queued workload waits for a slot by design; a held message on it still surfaces above.
+			&& queuedOf(controlEntries(ledger.entries(wl, "assumption"))) === null) {
 			// Fable F2d: an open workload with no slices yet and no lane is held too. The standing workload and a
 			// scheduled row (M11 `due:` brief) are not a lane's work: neither ever has a lane, both are excluded.
 			held.push({ kind: "held", workloadId: wl, rowId: wl, line: `held ${hoursBetween(workload.last_activity_at, now)}h on ${label}: ${workload.open_slices} open slice(s), no lane, no activity since ${workload.last_activity_at}` });

@@ -12,7 +12,7 @@ Where it shows:
 - Wake line under the needs-you block: `Rank (Jev, show-only): 1 … · 2 … · 3 …`, from stored rows only, no Jev call.
 - `as2 rank [--top N]` in a terminal (`surface/scripts/rank.ts`): the ledger opened read-only, the same table without asking Jev, nothing written.
 
-Show-only is the default. Launch order does not change: the drain, the open tool and the wake tick admit exactly what they admitted before, and the drain only appends a `rank-shadow` line to drain.log saying what the ranking would have picked. Needs-you order is not ranked.
+Show-only is the default. Launch order does not change: the drain, the open tool and the wake tick admit exactly what they admitted before, and the drain only appends a `rank-shadow` line to drain.log saying what the ranking would have picked. Needs-you order is not ranked. `migration/items/rank-ordered-launch.md` (workload wl-mv8wzytml878b4, merging after this PR) changes the default to `order` and adds Jo's ruled list and priority pause.
 
 Jo's words, through Ilex (each needs Jo's unspent input; a lane or hand cannot set them):
 - Goals: Jo states the priorities in plain words; Ilex records them with `as2_rank { goals, inputId }` as a `rank-goals:` row (1 to 6 lines). With no goals, or goals older than 7 days, only the seed goal is asked and weighs, and every view says `goals: none` or `goals: stale since <date>`. There is no goals file.

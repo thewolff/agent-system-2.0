@@ -1548,10 +1548,8 @@ describe("item 71: a queued launch starts when a lane slot frees (the runner's d
 		const recB = fakeRecords(r).find((x) => x.env?.AGENT_SYSTEM_WORKLOAD_ID === b)!;
 		expect(recB.env).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: b, AGENT_SYSTEM_LANE_ID: laneB });
 		const pid = await drainSettled(r, laneA);
-		// show (no jevRank in the profile): the pick is today's, and the drain logs what `order` would have tried (PLAN wl-mv8k039gvogt8g D7)
-		expect(drainLinesOf(r, pid).map((l) => l.replace(/: .*$/, ""))).toEqual([
-			`start ${pid} after ${a}`, `rank-shadow ${pid} picked ${b} ranked-would ${b} parallel start`, `attempt ${pid} ${b} exit 0`, `end ${pid} attempts 1`,
-		]);
+		// order (no jevRank in the profile reads order since PLAN wl-mv8wzytml878b4 D2): the drain walks the rank and logs no rank-shadow line
+		expect(drainLinesOf(r, pid).map((l) => l.replace(/: .*$/, ""))).toEqual([`start ${pid} after ${a}`, `attempt ${pid} ${b} exit 0`, `end ${pid} attempts 1`]);
 	}, 60_000);
 
 	test("control, cap 1: C has an earlier attempt and no cause; A's lane exits and C is not launched", async () => {

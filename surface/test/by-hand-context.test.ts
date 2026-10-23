@@ -107,8 +107,8 @@ async function byHand(r: LaneRoot, wl: string, n: number, env: Record<string, st
 
 /**
  * What every launch's prompt carries, whatever the window of recent rows: this lane's identity, the done: line and the
- * multiline brief, then the workload block with the seeded slice (paused by the open question on it) and that question.
- * Returns the `## Workload state now` section.
+ * multiline brief, then the workload block (its header carries `rank #1`, the only ranked workload, PLAN wl-mv8wzytml878b4 D4)
+ * with the seeded slice (paused by the open question on it) and that question. Returns the `## Workload state now` section.
  */
 function expectContext(prompt: string, s: { wl: string; sl: string; q: string }, laneId: string): string {
 	expect(prompt).toStartWith(`You are lane ${laneId} on workload ${s.wl}.\n`);
@@ -119,7 +119,7 @@ function expectContext(prompt: string, s: { wl: string; sl: string; q: string },
 	expect(prompt).toContain(" min (1250 tokens); you are paired with Jo; you are never stopped at the ceiling; the extension tells Jo the spend in the pane at every 25 % of the original ceiling ($1, so every $0.25).\n");
 	expect(prompt.match(/\n## Workload state now\n/g)).toHaveLength(1);
 	const state = prompt.split("\n## Workload state now\n\n")[1]!;
-	expect(state).toStartWith(`## ${s.wl}\nbrief: ${BRIEF}\ndone: ${DONE}\n`);
+	expect(state).toStartWith(`## ${s.wl} · rank #1\nbrief: ${BRIEF}\ndone: ${DONE}\n`);
 	expect(state).toContain(`\n- ${s.sl} [paused] ${TASK} — done when: ${SLICE_DONE}; inputs: src/header.css\n`);
 	expect(state).toContain(`\n- ${s.q} on ${s.sl}: ${QUESTION.split("\n").join("\n  ")} — options: tokens / theme\n`);
 	return state;

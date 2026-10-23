@@ -19,10 +19,11 @@ import { type ErrorLine, errorLines, parseDue, wordsOf } from "./errors";
 import { type Identity, identityOf } from "./identity";
 import { parseSpend } from "./ceiling";
 import { ceilingOf, ceilingText, openPairOffer } from "./input";
-import { byHandLine, controlEntries, doneLine, holdersOf, isPlanQuestionIn, planFirst } from "./launch";
+import { byHandLine, type ControlEntry, controlEntries, doneLine, holdersOf, isPlanQuestionIn, planFirst, priorityPausedOf, priorityPausingOf, queuedOf } from "./launch";
 import { pairOfferLine, shownOptions } from "./pair-suggest";
 import { Numbering } from "./numbering";
-import { currentGoals, parseAudit, rankDay, rankOpen } from "./rank";
+import { currentGoals, livePins, parseAudit, rankDay, rankOpen, rankPosition } from "./rank";
+import { queuePosition } from "./rank-launch";
 import { LAST_N, LEDGER_TOOL, STANDING_WORKLOAD_ID } from "./types";
 
 export interface RenderOptions {
@@ -55,6 +56,7 @@ export interface Rendered {
 
 /**
  * `stakes: normal (default …) · mode: autonomous` — one line, both halves flippable in one word; `plan first: …` when the flag stands (decision 15);
+ * `queued #N of M` while the workload is in the intake queue (PLAN wl-mvbcjadqgblr7k D8, N from `queuePosition`);
  * the effective ceiling last (DESIGN-workload-ceiling.md § 2 item 5).
  */
 export function oneLiner(ledger: Ledger, workload: WorkloadStatusRow): string {
@@ -62,7 +64,7 @@ export function oneLiner(ledger: Ledger, workload: WorkloadStatusRow): string {
 	return `${p.state} — flip either with one word: throwaway / normal / production, autonomous / user-driven · ceiling ${p.ceiling}`;
 }
 
-/** The one-liner without its flip hint: `stakes: X · mode: Y[ · plan first: …] · ceiling $A / Bh` (a "which one?" candidate, surface/extensions/surface-input.ts). */
+/** The one-liner without its flip hint: `stakes: X · mode: Y[ · plan first: …][ · queued #N of M] · ceiling $A / Bh` (the wake line's core, and a "which one?" candidate, surface/extensions/surface-input.ts). */
 export function oneLinerCore(ledger: Ledger, workload: WorkloadStatusRow): string {
 	const p = oneLinerParts(ledger, workload);
 	return `${p.state} · ceiling ${p.ceiling}`;
@@ -75,9 +77,13 @@ function oneLinerParts(ledger: Ledger, workload: WorkloadStatusRow): { state: st
 	const lastEffective = effective[effective.length - 1];
 	const pending = lastFlip && lastFlip.body === workload.mode && !(lastEffective && lastEffective.body === workload.mode && lastEffective.created_at >= lastFlip.created_at);
 	const mode = pending ? `${workload.mode} (flip pending until the lane's tool policy matches)` : workload.mode;
-	const plan = planFirst(controlEntries(ledger.entries(workload.id, "assumption")));
+	const control = controlEntries(ledger.entries(workload.id, "assumption"));
+	const plan = planFirst(control);
 	const planPart = plan ? ` · plan first: ${plan.trigger}` : "";
-	return { state: `stakes: ${workload.stakes} · mode: ${mode}${planPart}`, ceiling: ceilingText(ceilingOf(ledger, workload.id)) };
+	// D8: the queue tag ends with the first launch attempt (`queuedOf`); never a needs-you line, a queued ask waits by design.
+	const queued = queuedOf(control) !== null ? queuePosition(ledger, workload.id, ledger.now()) : null;
+	const queuedPart = queued ? ` · queued #${queued.position} of ${queued.of}` : "";
+	return { state: `stakes: ${workload.stakes} · mode: ${mode}${planPart}${queuedPart}`, ceiling: ceilingText(ceilingOf(ledger, workload.id)) };
 }
 
 const when = (iso: string): string => iso.replace(/\.\d{3}Z$/, "Z");
@@ -92,12 +98,37 @@ function instructionLine(i: InstructionRow): string {
 	}
 }
 
-/** One workload's block. */
-export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: number = LAST_N): string {
+/** Every ranked workload's place for the render (PLAN wl-mv8wzytml878b4 D4): `rankPosition` and Jo's pins, read once per render. */
+export interface RankMarks {
+	positions: ReadonlyMap<string, number>;
+	ruled: ReadonlySet<string>;
+}
+
+export function rankMarks(ledger: Ledger, now: string): RankMarks {
+	return { positions: rankPosition(ledger, now), ruled: new Set(livePins(ledger).map((p) => p.workloadId)) };
+}
+
+/** `rank #n`, then ` ruled` for Jo's item; null for a row `rankOpen` never ranks (a `due:` row, the standing workload). */
+function rankMark(workloadId: string, marks: RankMarks): string | null {
+	const n = marks.positions.get(workloadId);
+	return n === undefined ? null : `rank #${n}${marks.ruled.has(workloadId) ? " ruled" : ""}`;
+}
+
+/** Beside the lane (D4): `priority-paused for <X> (relaunches when a slot reaches it)`, `priority-pausing for <X>` while the stop is pending, else null. */
+function priorityMark(control: readonly ControlEntry[]): string | null {
+	const paused = priorityPausedOf(control);
+	if (paused) return `priority-paused for ${paused.forWl} (relaunches when a slot reaches it)`;
+	const pausing = priorityPausingOf(control);
+	return pausing ? `priority-pausing for ${pausing.forWl}` : null;
+}
+
+/** One workload's block; `marks` from `rankMarks`, read once by `renderWake`. */
+export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: number = LAST_N, marks: RankMarks = rankMarks(ledger, ledger.now())): string {
 	const { workload, slices, openQuestions, pendingMessages } = w;
 	const out: string[] = [];
 	const due = parseDue(workload.brief);
-	out.push(`## ${workload.id}${due ? ` (scheduled, due ${due.due})` : ""}`);
+	const rank = rankMark(workload.id, marks);
+	out.push(`## ${workload.id}${due ? ` (scheduled, due ${due.due})` : ""}${rank ? ` · ${rank}` : ""}`);
 	out.push(`brief: ${workload.brief}`);
 	const control = controlEntries(ledger.entries(workload.id, "assumption"));
 	const done = doneLine(control);
@@ -113,7 +144,8 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 		out.push(`spent $${Number(spend.usd.toFixed(2))} of $${Number(c.usd.toFixed(2))} · ${Number(spend.wallMin.toFixed(1))} of ${c.wallMin} min`);
 	}
 	const lane = workload.holder ? `${workload.holder} (lease until ${workload.holder_lease_until ?? "none"})` : "none";
-	out.push(`opened ${when(workload.created_at)} by ${workload.created_by}; last activity ${when(workload.last_activity_at)}; lane: ${lane}`);
+	const priority = priorityMark(control);
+	out.push(`opened ${when(workload.created_at)} by ${workload.created_by}; last activity ${when(workload.last_activity_at)}; lane: ${lane}${priority ? ` · ${priority}` : ""}`);
 	if (workload.mode === "user-driven" && !due && !workload.holder) out.push(`by hand: \`${byHandLine(workload.id)}\``);
 	out.push(`slices: ${slices.length === 0 ? "none open" : ""}`);
 	for (const s of slices) out.push(`- ${s.id} [${s.state}] ${s.task} — done when: ${s.done_condition}; inputs: ${s.inputs}`);
@@ -157,14 +189,19 @@ function title(brief: string): string {
 }
 
 /**
- * One open workload on one line, for the wake: `- <id>: <title> · <one-liner core> · lane: … · slices: …`, then the
- * needs-you lines that are about it (their `#n`, else their kind), its open question ids and its pending message
+ * One open workload on one line, for the wake: `- <id>: <title> · <one-liner core> · rank #n[ ruled] · lane: …[ · priority-…] · slices: …`,
+ * then the needs-you lines that are about it (their `#n`, else their kind), its open question ids and its pending message
  * count when there are any. The block is the on-demand read's (`renderWorkload`).
  */
-export function workloadLine(ledger: Ledger, w: InFlightWorkload, lines: readonly ErrorLine[]): string {
+export function workloadLine(ledger: Ledger, w: InFlightWorkload, lines: readonly ErrorLine[], marks: RankMarks = rankMarks(ledger, ledger.now())): string {
 	const { workload, slices, openQuestions, pendingMessages } = w;
 	const due = parseDue(workload.brief);
-	const parts = [`- ${workload.id}${due ? ` (scheduled, due ${due.due})` : ""}: ${title(workload.brief)}`, oneLinerCore(ledger, workload), `lane: ${workload.holder ?? "none"}`];
+	const parts = [`- ${workload.id}${due ? ` (scheduled, due ${due.due})` : ""}: ${title(workload.brief)}`, oneLinerCore(ledger, workload)];
+	const rank = rankMark(workload.id, marks);
+	if (rank) parts.push(rank);
+	parts.push(`lane: ${workload.holder ?? "none"}`);
+	const priority = priorityMark(controlEntries(ledger.entries(workload.id, "assumption")));
+	if (priority) parts.push(priority);
 	const states = new Map<string, number>();
 	for (const s of slices) states.set(s.state, (states.get(s.state) ?? 0) + 1);
 	parts.push(`slices: ${states.size === 0 ? "none open" : [...states].map(([state, n]) => `${n} ${state}`).join(", ")}`);
@@ -193,7 +230,7 @@ export function rankLines(ledger: Ledger, now: string, mode = "show"): string[] 
 			return `${n + 1} ${i.workloadId} ${t.length > 40 ? `${t.slice(0, 39)}…` : t}${i.pinned ? " (pinned)" : i.score === undefined ? " (unscored)" : ""}`;
 		});
 		const goals = currentGoals(ledger, now);
-		const label = mode === "show" ? "Jev, show-only" : `Jev, launch order ${mode}`;
+		const label = mode === "show" ? "Jev, show-only" : mode === "order" ? "Jev, launch order" : `Jev, launch order ${mode}`;
 		out.push(`Rank (${label}): ${top.join(" · ")}; ${items.filter((i) => i.score === undefined).length} unscored; goals ${goals.state === "set" && goals.setAt ? `set ${rankDay(goals.setAt)}` : goals.state}; as2_rank for the table`);
 	}
 	const audits = controlEntries(ledger.entries(STANDING_WORKLOAD_ID, "assumption")).filter((c) => c.prefix === "rank-audit");
@@ -224,14 +261,15 @@ export function renderWake(ledger: Ledger, opts: RenderOptions = {}): Rendered {
 	if (channel) out.push("", ...fromOtherAgents(ledger, channel, now));
 	const work = inFlight.filter((w) => w.workload.id !== STANDING_WORKLOAD_ID && (!opts.workloadId || w.workload.id === opts.workloadId));
 	const compact = opts.compact ?? (opts.trigger !== undefined && !opts.workloadId);
+	const marks = rankMarks(ledger, now);
 	out.push("");
 	if (work.length === 0) out.push("## open workloads\nnone");
 	else if (compact) {
 		out.push(`## open workloads (one line each; one workload's slices, questions with options, messages and recent entries: ${LEDGER_TOOL} with workload: <wl-…>)`);
-		for (const w of work) out.push(workloadLine(ledger, w, lines));
+		for (const w of work) out.push(workloadLine(ledger, w, lines, marks));
 	} else {
 		for (const w of work) {
-			out.push(renderWorkload(ledger, w, opts.lastN));
+			out.push(renderWorkload(ledger, w, opts.lastN, marks));
 			out.push("");
 		}
 	}

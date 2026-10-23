@@ -390,8 +390,11 @@ describe("close check: a served repo's close needs a green at every PR head and 
 		expect(calls[2]!.startsWith(`pr create -R ${OWNER_REPO} --head ${x.branch} --base main --title `)).toBe(true);
 	});
 
-	test("a merged PR is checked at its final head, fetched through refs/pull/<N>/head when the clone lacks it", async () => {
-		for (const [file, closes] of [[".ai/decision-log/2026-10-08--0930--lane--merged.md", true], ["d.txt", false]] as const) {
+	for (const [label, file, closes] of [
+		["metadata-only changes", ".ai/decision-log/2026-10-08--0930--lane--merged.md", true],
+		["code changes", "d.txt", false],
+	] as const) {
+		test(`a merged PR with ${label} is checked at its final head, fetched through refs/pull/<N>/head when the clone lacks it`, async () => {
 			const w = world();
 			withOrigin(w);
 			const x = closable(w);
@@ -416,8 +419,8 @@ describe("close check: a served repo's close needs a green at every PR head and 
 				expectRefused(w, x, r, uncoveredReason(x, 7, m, m), s);
 			}
 			expect(sh(w, w.work, ["git", "cat-file", "-e", `${m}^{commit}`]).code).toBe(0);
-		}
-	});
+		});
+	}
 
 	test("an untested local commit refuses", async () => {
 		const w = world();
