@@ -1379,3 +1379,7 @@ plugins/test/paired-coding.test.ts	test	-
 # 2026-10-19): the canonical write/edit/bash view the rows and observers read, and its tests.
 gates/src/pair-call.ts	module	-
 gates/test/paired-coding.test.ts	test	-
+# OMP package alignment and the narrowly confined `as2 repair` mode.
+gates/extensions/self-repair.ts	extension	-
+gates/src/self-repair.ts	module	-
+gates/test/self-repair.test.ts	test	-

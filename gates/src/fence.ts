@@ -72,6 +72,7 @@ import { type CleanShellCheck, type CleanShellRead, cleanShellOn, CLEAN_SHELL_KE
 import { copiedWrapper, expandShell, gitCall, nestedSandboxExec } from "./exec";
 import { HostError, type HostModules, hostSettings, readSetting, unknownSetting } from "./host";
 import { ownScratchRoot } from "./scratch";
+import { selfRepairOn, selfRepairRoots } from "./self-repair";
 import { type BranchEntry, type ContextMessage, type Ctx, type GatesAPI, gateSession, isConfined, releaseConfined } from "./session";
 import type { ShellStart } from "./shell-start";
 import { WORKLOAD_ENV } from "./types";
@@ -243,16 +244,15 @@ function sbplString(path: string): string {
 }
 
 /**
- * The Seatbelt profile: allow everything, deny file writes to each target. With `confinedRoot` (a
- * call a scratch-root rule let through, PLAN wl-mv5oikd5jtquww § 1.3): every write is denied but those
- * inside the root and to /dev/null, /dev/tty and /dev/fd/*, and outbound network is denied; the
- * targets' denies come after, so they still hold inside the root (Seatbelt: the last matching rule wins).
+ * The Seatbelt profile. Scratch confinement allows writes only in one scratch root and denies
+ * outbound network. Self-repair confinement allows writes only in the AS2 repository and install
+ * roots while retaining network access for package and source repair. Target denies come last.
  */
-export function fenceProfile(targets: FenceTarget[], confinedRoot?: string): string {
+export function fenceProfile(targets: FenceTarget[], confinedRoots: readonly string[] = [], denyNetwork = false): string {
 	const confined =
-		confinedRoot === undefined
+		confinedRoots.length === 0
 			? ""
-			: `(deny file-write*)(allow file-write* (subpath ${sbplString(confinedRoot)}) (literal "/dev/null") (literal "/dev/tty") (regex #"^/dev/fd/"))(deny network-outbound (remote ip))`;
+			: `(deny file-write*)(allow file-write* ${confinedRoots.map((root) => `(subpath ${sbplString(root)})`).join(" ")} (literal "/dev/null") (literal "/dev/tty") (regex #"^/dev/fd/"))${denyNetwork ? "(deny network-outbound (remote ip))" : ""}`;
 	return `(version 1)(allow default)${confined}${targets.map((t) => `(deny file-write* (${t.kind} ${sbplString(t.path)}))`).join("")}`;
 }
 
@@ -678,7 +678,9 @@ export function registerFence(
 			// review B1), and `sandbox-exec` as data is not refused. Row 6 refuses it by name already, and
 			// row 18 a leading one; this is the fence's own line.
 			if (nestedSandboxExec(command, cwd, env, event.input.env)) return { block: true, reason: ALREADY_WRAPPED_REASON };
-			profile = fenceProfile(fenceTargets(command, cwd, env, event.input.env), confined ? confinedRootOf(env) : undefined);
+			const roots = confined ? [confinedRootOf(env)] : selfRepairOn(env) ? selfRepairRoots(env).map((root) => canonical(root, "a self-repair root")) : [];
+			if (selfRepairOn(env) && roots.length === 0) throw new FenceError("self-repair is on but AGENT_SYSTEM_SELF_REPAIR_ROOTS names no allowed directory");
+			profile = fenceProfile(fenceTargets(command, cwd, env, event.input.env), roots, confined);
 		} catch (err) {
 			return refuse(err instanceof FenceError ? err.message : `the fenced paths could not be computed (${String(err)})`);
 		}

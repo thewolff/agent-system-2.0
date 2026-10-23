@@ -26,11 +26,13 @@
 //   to execute, bound to the arguments it was judged with.
 import openLinks from "./extensions/open-links";
 import { linkedApi } from "./src/links";
+import { selfRepairOn } from "./src/self-repair";
 import askPolicyRow from "./extensions/r14-ask-policy";
 import briefFieldsRow from "./extensions/r05-brief-fields";
 import contractRow from "./extensions/r02-contract";
 import joInstructionRow from "./extensions/r11-jo-instruction";
 import orchestratorRoleRow from "./extensions/r15-orchestrator-role";
+import selfRepairRow from "./extensions/self-repair";
 import protectedEditRow from "./extensions/r09-protected-edit";
 import pushRebaseRow from "./extensions/r08-push-rebase";
 import questionRow from "./extensions/question";
@@ -142,11 +144,13 @@ export default function p11Gates(
 	pi = linkedApi(pi);
 	contractRow(pi, env);
 	receiptsRow(pi, env);
-	askPolicyRow(pi, env);
+	const repairing = selfRepairOn(env);
+	const repairFenceSettings = (): Promise<FenceSettings> => Promise.resolve({ enabled: true, autoBackground: true });
 	orchestratorRoleRow(pi, env);
+	selfRepairRow(pi, env);
 	typedWrapperRow(pi);
 	wakeReadRow(ledgerPi, env);
-	tierNameRow(pi);
+	tierNameRow(pi, env);
 	briefFieldsRow(pi, env);
 	questionRow(pi, env);
 	spawnRateRow(pi, env);
@@ -156,8 +160,9 @@ export default function p11Gates(
 	pushRebaseRow(pi, env);
 	turnShapeRow(pi, env);
 	joInstructionRow(pi, env);
-	registerFence(pi, env, fenceSettings, startCheck, cleanShell);
-	registerPairCalls(pi, env, fenceSettings, cleanShell);
-	// The notice reads the host; a test handing in its own reader has no host to read.
-	if (fenceSettings === hostFenceSettings) hostVersionNotice(pi);
+	registerFence(pi, env, repairing ? repairFenceSettings : fenceSettings, startCheck, repairing ? undefined : cleanShell);
+	registerPairCalls(pi, env, repairing ? repairFenceSettings : fenceSettings, repairing ? undefined : cleanShell);
+	// The notice reads the host; a test handing in its own reader has no host to read. Repair mode's
+	// exact package version was checked by install and does not import the broken host to report it.
+	if (!repairing && fenceSettings === hostFenceSettings) hostVersionNotice(pi);
 }

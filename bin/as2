@@ -16,8 +16,7 @@
 #                              The OTEL_* words are the tracing switch's, below: every inherited OTEL_* name
 #                              unset, then OTEL_SDK_DISABLED=true, or the otel map when observability.phoenix is `all`
 #          as2 install         run <repo>/install/install.sh (ledger, profile, this launcher); its
-#                              last line names the providers to log in to once per profile
-#                              (/login inside the session; OMP's first-launch wizard is skipped)
+#                              last line names the providers served by OMP's shared loopback auth broker
 #          as2 on | off        set gates.fence.enabled to true | false in the installed profile's
 #                              config.yml, printing the old and new value (a re-install resets it
 #                              to the template's value)
@@ -51,6 +50,10 @@
 #                              stop the workload's lane (requested through the ledger; signals omp only
 #                              when its pid still matches), remove a clean pushed worktree, tail the runner log
 #          as2 --print [args]  render <prompt>, then print the omp command line `as2 [args]` would run, without running it
+#          as2 repair         start one repair session in this checkout. Normal orchestrator/lane
+#                              restrictions stay in force elsewhere; this session may dispatch only
+#                              the dedicated self-repair project agent and write only inside the checkout,
+#                              its installed profile and its AS2 state directory
 #          as2 -h | --help     this text
 # Env:     AGENT_SYSTEM_PROFILE  OMP profile name (default: agent-system-2), as install/install.sh
 # Exit:    omp's (or install.sh's) own status when launching · 0 ok · 1 failure
@@ -72,6 +75,7 @@ while [ -L "$self" ]; do
 	esac
 done
 REPO="$(cd -P "$(dirname "$self")/.." && pwd -P)"
+SELF_REPAIR_ROOTS="$REPO:$HOME/.omp/profiles/$PROFILE_NAME:$HOME/.agent-system-2"
 AGENT_DIR="$HOME/.omp/profiles/$PROFILE_NAME/agent"
 CONFIG="$AGENT_DIR/config.yml"
 PROMPT="$HOME/.agent-system-2/orchestrator/system.md"
@@ -284,6 +288,13 @@ case "${1-}" in
 	install)
 		shift
 		exec bash "$REPO/install/install.sh" "$@"
+		;;
+	repair)
+		shift
+		render_prompt
+		words="$(orchestrator_words)"
+		eval "set -- $words OMP_PROFILE=\"\$PROFILE_NAME\" AGENT_SYSTEM_ROLE=orchestrator AGENT_SYSTEM_SELF_REPAIR=1 AGENT_SYSTEM_SELF_REPAIR_ROOTS=\"\$SELF_REPAIR_ROOTS\" omp --cwd \"\$REPO\" --append-system-prompt \"\$PROMPT\" \"\$@\""
+		exec env "$@"
 		;;
 	on) fence true ;;
 	clean-shell)
