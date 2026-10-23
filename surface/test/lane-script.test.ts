@@ -86,14 +86,16 @@ const ctxIndexOf = (r: LaneRoot, wl: string, laneId: string, n = 2) =>
 		return rows.length >= n ? rows : null;
 	});
 /** The workload's lane-died messages, oldest first, with their times. */
-const deathRows = (r: LaneRoot, wl: string) => {
+const deathRows = (r: LaneRoot, wl: string, laneId?: string) => {
 	const l = ledgerOf(r);
 	try {
-		return laneDeaths(l, wl);
+		return laneDeaths(l, wl).filter((d) => laneId === undefined || d.holder === laneId);
 	} finally {
 		l.close();
 	}
 };
+/** A successor may already have died by the predecessor's exit; only count the lane under test. */
+const deathsOf = (r: LaneRoot, wl: string, laneId: string) => deathRows(r, wl, laneId).map((d) => d.body);
 
 describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 	test("launch reserves and prints the lane and runner; the runner records start (twice: null then the session), ready after the lane's own claim, the prompt, completion, release and lane-exit: completed; a second launch while held is refused with nothing written", async () => {
@@ -378,8 +380,8 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const exit = await exitOf(r, wl, laneId);
 		expect(exit).toMatchObject({ signal: "SIGKILL", outcome: "died" });
 		const snap = laneSnapshot(r, wl);
-		expect(snap.workload!.holder).toBeNull();
-		expect(snap.deaths).toEqual([`lane-died: ${laneId}: died (signal SIGKILL)`]);
+		expect(snap.workload!.holder).not.toBe(laneId);
+		expect(deathsOf(r, wl, laneId)).toEqual([`lane-died: ${laneId}: died (signal SIGKILL)`]);
 		expect(snap.control.filter((c) => c.prefix === "lane-exit" && c.laneId === laneId)).toHaveLength(1);
 		await until("runner gone", () => !alive(started.runnerPid), 10_000);
 		expect(alive(started.pid)).toBe(false);
@@ -396,9 +398,10 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const exit = await until(`lane-exit: of ${laneId}`, () => laneExit(laneSnapshot(r, wl).control, laneId), 15_000);
 		expect(exit).toMatchObject({ signal: "SIGKILL", outcome: "never-ready" });
 		const snap = laneSnapshot(r, wl);
-		expect(snap.workload!.holder).toBeNull();
-		expect(snap.deaths).toHaveLength(1);
-		expect(snap.deaths[0]).toMatch(new RegExp(`^lane-died: ${laneId}: launch failed at readiness: .*injected ready write failure`));
+		expect(snap.workload!.holder).not.toBe(laneId);
+		const deaths = deathsOf(r, wl, laneId);
+		expect(deaths).toHaveLength(1);
+		expect(deaths[0]).toMatch(new RegExp(`^lane-died: ${laneId}: launch failed at readiness: .*injected ready write failure`));
 		const failed = snap.control.filter((c) => c.prefix === "launch-failed" && c.laneId === laneId);
 		expect(failed).toHaveLength(1);
 		expect(failed[0]!.rest).toMatch(/^readiness: .*injected ready write failure/);
@@ -416,8 +419,8 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const lane1 = laneIdOf(wl, 1);
 		const exit1 = await exitOf(r, wl, lane1);
 		expect(exit1).toMatchObject({ code: "3", signal: "-", outcome: "died" });
-		expect(laneSnapshot(r, wl).deaths).toEqual([`lane-died: ${lane1}: died (exit 3)`]);
-		expect(laneSnapshot(r, wl).workload!.holder).toBeNull();
+		expect(deathsOf(r, wl, lane1)).toEqual([`lane-died: ${lane1}: died (exit 3)`]);
+		expect(laneSnapshot(r, wl).workload!.holder).not.toBe(lane1);
 		await drainSettled(r, lane1);
 		// The drain lane 1's exit spawned relaunches it at once (PLAN wl-mvfqvd5hy8zv28 § 1.3): lane 2 re-reads the script and
 		// dies the same way; its drain finds relaunch 2 in its backoff and launches nothing, so Jo's request below is lane 3's.
@@ -500,12 +503,12 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const exit = await exitOf(r, wl, laneId);
 		expect(exit).toMatchObject({ code: "0", signal: "-", outcome: "stop", reason: "signal" });
 		const snap = laneSnapshot(r, wl);
-		expect(snap.deaths).toEqual([laneDiedSignalBody(laneId, "SIGTERM", 1)]);
-		expect(snap.workload!.holder).toBeNull();
+		expect(deathsOf(r, wl, laneId)).toEqual([laneDiedSignalBody(laneId, "SIGTERM", 1)]);
+		expect(snap.workload!.holder).not.toBe(laneId);
 		expect(snap.bodies).toContain(`${LANE_RUNNER_BY} lane-stop: ${laneId} accepted signal`);
 		// the death is written with the acceptance, before the exit
 		const accepted = snap.control.find((c) => c.prefix === "lane-stop" && c.laneId === laneId)!;
-		const death = deathRows(r, wl)[0]!;
+		const death = deathRows(r, wl, laneId)[0]!;
 		const exitAt = snap.control.find((c) => c.prefix === "lane-exit" && c.laneId === laneId)!.createdAt;
 		expect(death.created_at >= accepted.createdAt && death.created_at <= exitAt).toBe(true);
 		expect(eventsOf(r, started.pid)).toEqual(["prompt", "abort", "eof"]);
@@ -513,6 +516,7 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(await exitOf(r, wl, lane2)).toMatchObject({ code: "3", outcome: "died" });
 		expect(laneSnapshot(r, wl).bodies).toContainEqual(expect.stringMatching(new RegExp(`^${LANE_STARTER_BY} launch: ${lane2} cause relaunch ${laneId} 1(?: |$)`)));
 		await drainSettled(r, lane2);
+		expect(deathsOf(r, wl, laneId)).toEqual([laneDiedSignalBody(laneId, "SIGTERM", 1)]);
 	}, 30_000);
 
 	test("restart sequence (PLAN wl-mvfqvd5hy8zv28 sl-rl-runner): acceptance → the lane's shutdown release → a catch-up reservation → the runner's late finish gives one lane-died:, the signal one, before the successor's launch:, and no second", async () => {
@@ -859,9 +863,10 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const exit = await exitOf(r, wl, laneId);
 		expect(exit).toMatchObject({ code: "0", signal: "-", outcome: "deadline" });
 		const snap = laneSnapshot(r, wl);
-		expect(snap.workload!.holder).toBeNull();
-		expect(snap.deaths).toHaveLength(1);
-		expect(snap.deaths[0]).toMatch(new RegExp(`^lane-died: ${laneId}: (deadline 2s with 1 open slice\\(s\\)|session shutdown at .* with 1 open slice\\(s\\))$`));
+		expect(snap.workload!.holder).not.toBe(laneId);
+		const deaths = deathsOf(r, wl, laneId);
+		expect(deaths).toHaveLength(1);
+		expect(deaths[0]).toMatch(new RegExp(`^lane-died: ${laneId}: (deadline 2s with 1 open slice\\(s\\)|session shutdown at .* with 1 open slice\\(s\\))$`));
 		const [rec] = fakeRecords(r);
 		expect(rec!.argv!.slice(-2)).toEqual(["--max-time", "2s"]);
 	}, 30_000);
@@ -876,8 +881,10 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 			const exit = await exitOf(r, wl, laneId);
 			expect(exit).toMatchObject({ code: "0", signal: "-", outcome: status });
 			const snap = laneSnapshot(r, wl);
-			expect(snap.workload!.holder).toBeNull();
-			expect(snap.deaths).toEqual([`lane-died: ${laneId}: prompt ended ${status}`]);
+			expect(snap.workload!.holder).not.toBe(laneId);
+			expect(deathsOf(r, wl, laneId)).toEqual([`lane-died: ${laneId}: prompt ended ${status}`]);
+			await settleDrains(r);
+			expect(deathsOf(r, wl, laneId)).toEqual([`lane-died: ${laneId}: prompt ended ${status}`]);
 		}, 30_000);
 	}
 
@@ -894,14 +901,20 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const exit = await exitOf(r, wl, laneId);
 		expect(exit.outcome).toBe("released");
 		const snap = laneSnapshot(r, wl);
-		expect(snap.deaths).toHaveLength(1);
-		expect(snap.deaths[0]).toMatch(new RegExp(`^lane-died: ${laneId}: session shutdown at .* with 1 open slice\\(s\\)$`));
-		expect(snap.workload!.holder).toBeNull();
+		const deaths = deathsOf(r, wl, laneId);
+		expect(deaths).toHaveLength(1);
+		expect(deaths[0]).toMatch(new RegExp(`^lane-died: ${laneId}: session shutdown at .* with 1 open slice\\(s\\)$`));
+		expect(snap.workload!.holder).not.toBe(laneId);
 	}, 30_000);
 });
 
 describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 are in turn-end.test.ts and lane-tools.test.ts)", () => {
-	const promptsOf = (r: LaneRoot) => fakeRecords(r).filter((x) => x.event === "prompt");
+	// Every scenario here asserts the first lane's turns, not the automatic successor's turns.
+	const promptsOf = (r: LaneRoot) => {
+		const records = fakeRecords(r);
+		const pid = records.find((x) => x.argv)?.pid;
+		return records.filter((x) => x.pid === pid && x.event === "prompt");
+	};
 	const messagesOf = (r: LaneRoot, wl: string): string[] => {
 		const l = ledgerOf(r);
 		try {
@@ -959,7 +972,7 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		const laneId = launched(r, wl);
 		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "open-work" });
 		expect(promptsOf(r).map((p) => p.id)).toEqual(["p1", "p2", "p3"]);
-		expect(laneSnapshot(r, wl).deaths).toEqual([openWork(laneId)]);
+		expect(deathsOf(r, wl, laneId)).toEqual([openWork(laneId)]);
 	}, 60_000);
 
 	test("T1c: no slice cut because the only slice was cancelled; every prompt stops → three prompts, open-work, one lane-died:", async () => {
@@ -974,7 +987,7 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		const ps = promptsOf(r);
 		expect(ps.map((p) => p.id)).toEqual(["p1", "p2", "p3"]);
 		expect(ps[2]!.message).toContain("with no slice cut");
-		expect(laneSnapshot(r, wl).deaths).toEqual([openWork(laneId)]);
+		expect(deathsOf(r, wl, laneId)).toEqual([openWork(laneId)]);
 	}, 60_000);
 
 	test("T1d (control): every slice done, no receipt, nothing parked → completed after one prompt, no lane-died:", async () => {
@@ -1000,8 +1013,12 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		expect(ps.map((p) => p.id)).toEqual(["p1", "p2", "p3"]);
 		expect(ps[2]!.message).toEndWith("(continue 2 of 2)");
 		const snap = laneSnapshot(r, wl);
-		expect(snap.deaths).toEqual([openWork(laneId)]);
-		expect(snap.workload!.holder).toBeNull();
+		expect(deathsOf(r, wl, laneId)).toEqual([openWork(laneId)]);
+		expect(snap.workload!.holder).not.toBe(laneId);
+		await settleDrains(r);
+		const successor = laneIdOf(wl, 2);
+		expect(laneSnapshot(r, wl).bodies).toContainEqual(expect.stringMatching(new RegExp(`^${LANE_STARTER_BY} launch: ${successor} cause relaunch ${laneId} 1(?: |$)`)));
+		expect(deathsOf(r, wl, laneId)).toEqual([openWork(laneId)]);
 	}, 60_000);
 
 	test("T3: occurrence 2, a background job with a slice open: the runner waits for session_settled, the woken turn completes, writes done-because and releases → no EOF before background-done, no lane-died:", async () => {
@@ -1097,8 +1114,8 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		const laneId = launched(r, wl);
 		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "open-work" });
 		const snap = laneSnapshot(r, wl);
-		expect(snap.control.filter((c) => c.prefix === "released-open").map((c) => [c.createdBy, c.body])).toEqual([[laneId, `released-open: ${laneId} slices 1`]]);
-		expect(snap.deaths).toEqual([`lane-died: ${laneId}: released with 1 open slice(s), no done-because`]);
+		expect(snap.control.filter((c) => c.prefix === "released-open" && c.laneId === laneId).map((c) => [c.createdBy, c.body])).toEqual([[laneId, `released-open: ${laneId} slices 1`]]);
+		expect(deathsOf(r, wl, laneId)).toEqual([`lane-died: ${laneId}: released with 1 open slice(s), no done-because`]);
 		expect(promptsOf(r)).toHaveLength(1);
 	}, 60_000);
 
@@ -1113,7 +1130,7 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "open-work" });
 		const snap = laneSnapshot(r, wl);
 		expect(snap.bodies).toContain(`${laneId} released-open: ${laneId} slices 1`);
-		expect(snap.deaths).toEqual([`lane-died: ${laneId}: released with 1 open slice(s), no done-because`]);
+		expect(deathsOf(r, wl, laneId)).toEqual([`lane-died: ${laneId}: released with 1 open slice(s), no done-because`]);
 	}, 60_000);
 
 	for (const asked of [false, true]) {
@@ -1137,7 +1154,7 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		setScript(r, { prompts: [[{ background: "never" }]] });
 		const laneId = launched(r, wl);
 		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "deadline" });
-		expect(laneSnapshot(r, wl).deaths).toEqual([`lane-died: ${laneId}: deadline 2s with 1 open slice(s); background work was in flight`]);
+		expect(deathsOf(r, wl, laneId)).toEqual([`lane-died: ${laneId}: deadline 2s with 1 open slice(s); background work was in flight`]);
 		expect(eventsOf(r, promptsOf(r)[0]!.pid)).toContain("background-killed");
 	}, 60_000);
 
@@ -1165,8 +1182,8 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		const laneId = launched(r, wl);
 		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "deadline" });
 		expect(promptsOf(r).map((p) => p.id)).toEqual(["p1", "p2", "p3"]);
-		expect(messagesOf(r, wl).filter((m) => m.includes("is held open"))).toEqual([`lane ${laneId} is held open: hand(s) dt-t9 unsettled after 2 continue prompts; it ends at a stop, the ceiling or the deadline`]);
-		expect(laneSnapshot(r, wl).deaths).toEqual([`lane-died: ${laneId}: deadline 4s with 1 open slice(s)`]);
+		expect(messagesOf(r, wl).filter((m) => m.startsWith(`lane ${laneId} is held open`))).toEqual([`lane ${laneId} is held open: hand(s) dt-t9 unsettled after 2 continue prompts; it ends at a stop, the ceiling or the deadline`]);
+		expect(deathsOf(r, wl, laneId)).toEqual([`lane-died: ${laneId}: deadline 4s with 1 open slice(s)`]);
 	}, 60_000);
 
 	test("T10: D3/D6 precedence, a prompt ends error with the lane's hand unsettled → no EOF and no release before the settle, then outcome error (never completed)", async () => {
@@ -1182,7 +1199,7 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		const exitAt = snap.bodies.findIndex((b) => b.startsWith(`${LANE_RUNNER_BY} lane-exit: ${laneId}`));
 		expect(settledAt).toBeGreaterThan(0);
 		expect(exitAt).toBeGreaterThan(settledAt);
-		expect(snap.deaths).toEqual([`lane-died: ${laneId}: prompt ended error`]);
+		expect(deathsOf(r, wl, laneId)).toEqual([`lane-died: ${laneId}: prompt ended error`]);
 	}, 60_000);
 
 	for (const [row, steps, outcome, death] of [
@@ -1195,11 +1212,11 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 			setScript(r, { steps: [...steps], eofDelayMs: 1000 });
 			const laneId = launched(r, wl);
 			const started = (await startedOf(r, wl, laneId))!;
-			await until("the runner's death line", () => laneSnapshot(r, wl).deaths.length > 0, 30_000);
+			await until("the runner's death line", () => deathsOf(r, wl, laneId).length > 0, 30_000);
 			process.kill(started.runnerPid, "SIGTERM");
 			expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome });
 			const snap = laneSnapshot(r, wl);
-			expect(snap.deaths).toEqual([`lane-died: ${laneId}: ${death}`]);
+			expect(deathsOf(r, wl, laneId)).toEqual([`lane-died: ${laneId}: ${death}`]);
 			expect(snap.bodies).toContain(`${LANE_RUNNER_BY} lane-stop: ${laneId} accepted signal`);
 		}, 60_000);
 	}
@@ -1211,8 +1228,8 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		const laneId = launched(r, wl);
 		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "open-work" });
 		const snap = laneSnapshot(r, wl);
-		expect(snap.control.filter((c) => c.prefix === "released-open").map((c) => c.body)).toEqual([`released-open: ${laneId} slices 1`]);
-		expect(snap.deaths).toEqual([`lane-died: ${laneId}: released with 1 open slice(s), no done-because`]);
+		expect(snap.control.filter((c) => c.prefix === "released-open" && c.laneId === laneId).map((c) => c.body)).toEqual([`released-open: ${laneId} slices 1`]);
+		expect(deathsOf(r, wl, laneId)).toEqual([`lane-died: ${laneId}: released with 1 open slice(s), no done-because`]);
 		expect(promptsOf(r)).toHaveLength(1);
 		expect(eventsOf(r, promptsOf(r)[0]!.pid)).toContain("background-done");
 	}, 60_000);
