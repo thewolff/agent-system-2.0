@@ -8,17 +8,13 @@ omp plugin marketplace add thewolff/jo-wolff-plugins
 omp plugin install i-have-audhd@jo-wolff-plugins
 ```
 
-That one module does two jobs for the main session (see its header for the event mapping):
+That one module activates in the main session after an explicit request:
 
-- **Session start.** On `session_start`, `session_switch` and `session_compact` it spawns
-  `hooks/i-have-audhd-inject.mjs` and offers the returned `additionalContext` to every
-  `before_agent_start` as a hidden custom message (`customType` `i-have-audhd-session-start`,
-  a fresh delivery id in `details`), so a re-run of that chain for the same prompt still
-  carries it. A `context` event whose messages hold that delivery ends the offer; a later
-  prompt gets nothing until the next crossing. Subagent sessions are skipped.
-- **Stop.** On `session_stop` it spawns `hooks/i-have-audhd-stop.mjs` with
-  `I_HAVE_AUDHD_HARNESS=omp` and returns the core's verdict. Every rule warns by default, and
-  the core caps any block to warn on OMP unless the profile sets `enforcement.armOmp: true`.
+- **Activation.** `before_agent_start` accepts a direct request for the AuDHD rules, spawns
+  `hooks/i-have-audhd-inject.mjs`, and offers its context as a hidden message. Active compaction
+  reloads it; a new session clears it. Bare mentions and unrelated prompts load nothing.
+- **Stop.** Only active sessions spawn `hooks/i-have-audhd-stop.mjs`. Every rule warns by default,
+  and the core caps blocks to warnings unless `enforcement.armOmp` is true.
 - **Inside OMP's 30s handler budget.** OMP drops a `session_stop` handler's result after
   30s. Under the `omp` tag each judge call gets 20s (Claude Code keeps 30s), and the adapter
   kills a core still running at 25s and logs one `omp-adapter fail-open` line. A hung judge
@@ -124,10 +120,9 @@ With `HOME="$PROBE_HOME"`, the plugin's own state lands in `$PROBE_HOME/.claude/
 The throwaway observer (written under the scratch dir, never committed) makes every check
 deterministic rather than dependent on what the model writes:
 
-- **First turn carries the core.** A `context` handler finds the
-  `i-have-audhd-session-start` custom message in the first request's messages and asserts it
-  carries the skill's inject span (between `<!-- inject:start -->` and `<!-- inject:end -->`
-  in `skills/i-have-audhd/SKILL.md`) and every rule heading.
+- **Explicit request carries the core.** The probe prompt requests the AuDHD rules. A `context`
+  handler finds one `i-have-audhd-session-start` message carrying the inject span from
+  `skills/i-have-audhd/instructions.md` and every rule heading.
 - **The real Stop warns.** An `assistant_message` handler returns `{ content }` replacing the
   final text with a message over 300 characters whose substantive prose precedes its
   `## Needs you` marker, keeping the original text blocks' count and positions (OMP requires

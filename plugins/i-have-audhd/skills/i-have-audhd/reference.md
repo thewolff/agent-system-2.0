@@ -1,9 +1,8 @@
 # i-have-audhd — reference
 
-What the plugin's hooks do with the rules in [`SKILL.md`](SKILL.md): the enforcement
-scoreboard, every check's and trigger's contract, the judge machinery, the session-start
-injection, and the operator-profile schema including `enforcement`. Rule numbers below are
-the skill's.
+What the plugin's hooks do with the rules in [`instructions.md`](instructions.md): the enforcement
+scoreboard, every check's and trigger's contract, the judge machinery, the injection, and the
+operator-profile schema including `enforcement`. Rule numbers below are the skill's.
 
 ## The scoreboard
 
@@ -87,28 +86,20 @@ stay on the measuring machine for the same reason as the first corpus.
 optionally `reason`). stdout: one `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"…"}}`
 object. Exit 0 on every path.
 
-`additionalContext` is, in order: one hook-owned line saying the person in this session
-installed these rules and that they apply to every message to that person; the span of
-`SKILL.md` between `<!-- inject:start -->` and `<!-- inject:end -->` (the first-turn core
-and every rule heading); the profile's `reader` and `traits`, when set; and one line
-pointing at this file and the kill switch. The span is read from the skill file each time,
-so there is one copy of the core and it cannot drift. `I_HAVE_AUDHD_INJECT=off` silences the
-emission (the resume marker below is still written).
+`additionalContext` is, in order: one hook-owned activation line; the span of `instructions.md`
+between the inject markers; the profile's `reader` and `traits`, when set; and one pointer line.
+The span is read from the instructions file each time, so there is one copy of the core.
+`I_HAVE_AUDHD_INJECT=off` silences emission (the resume marker below is still written).
 
 When `source` is `resume` or `compact` (or `clear` with a reason mentioning compact, an
 assumed shape), the injector writes the one-shot resume marker the Stop hook consumes for
 rule 8.
 
-**Delivery per host.** Claude Code runs the hook from `hooks/hooks.json` on every
-SessionStart source (startup, resume, clear, compact). OMP does not run `hooks.json`; the
-plugin's OMP extension, `omp/i-have-audhd-omp.ts`, spawns the same hook on the main
-session's `session_start` (source `startup`, or `resume` when the session already holds
-messages), on `session_switch` (`new` → `clear`, `resume`/`fork` → `resume`) and on
-`session_compact` (`compact`). It offers the returned `additionalContext` to every
-`before_agent_start` as a hidden custom message tagged with a per-crossing delivery id, so a
-re-run of the preparation chain for the same prompt keeps it, and stops offering it once a
-`context` event shows a model request carried that delivery. Subagent sessions get neither
-the injection nor the Stop hook.
+**Delivery per host.** Claude Code runs the hook from `hooks/hooks.json` on every SessionStart
+source. OMP does not run `hooks.json`; its adapter waits for an explicit AuDHD request, then spawns
+the hook for that prompt and active compactions. It offers `additionalContext` through
+`before_agent_start` until a `context` event confirms delivery. A new session clears activation.
+Subagent sessions get neither injection nor Stop checks.
 
 ## The Stop hook
 

@@ -1,17 +1,12 @@
 #!/usr/bin/env node
-// i-have-audhd-inject.mjs — SessionStart injection of the i-have-audhd first-turn core, plus
-// any reader traits the operator declared locally.
+// i-have-audhd-inject.mjs — explicit AuDHD activation context plus any reader traits the
+// operator declared locally.
 //
-// WHY THIS HOOK EXISTS
-//   The rules govern the shape of a message, and the first message of a session is often the
-//   first turn. A skill fires in response to something; that is one beat too late for a contract
-//   about the very first thing said. This closes that window. The skill carries the fuller
-//   contract and the reference for when it loads.
-//
-// WHY IT READS THE SKILL INSTEAD OF CARRYING TEXT
-//   Two copies of one contract drift and nothing detects it. The injected text lives inside
-//   skills/i-have-audhd/SKILL.md between `<!-- inject:start -->` and `<!-- inject:end -->`,
-//   and this file emits exactly that span. Editing the skill IS editing what sessions receive.
+// WHY IT READS THE INSTRUCTIONS FILE
+//   SKILL.md is intentionally only a short trigger gate. The complete contract lives in
+//   skills/i-have-audhd/instructions.md, and this hook emits that file's marked activation span
+//   only after the OMP adapter sees an explicit AuDHD request. One source means the activation
+//   context and the instructions cannot drift.
 //
 // WHY THE READER TRAITS ARE NOT IN THIS REPOSITORY
 //   A trait sentence is information about a real person. It is attributable to whoever owns the
@@ -43,22 +38,21 @@ import { fileURLToPath } from "node:url";
 import { stateDir, resumeMarkerPath, judgeNoticeMarkerPath, appendLog } from "../lib/state.mjs";
 import { judgeChoiceState, judgeNotice } from "../lib/judge-setup.mjs";
 
-const SKILL_PATH = fileURLToPath(
-  new URL("../skills/i-have-audhd/SKILL.md", import.meta.url),
+const INSTRUCTIONS_PATH = fileURLToPath(
+  new URL("../skills/i-have-audhd/instructions.md", import.meta.url),
 );
 
-// Line-anchored: the skill's own prose names the markers, and must not match.
+// Line-anchored: prose may name the markers, and must not match.
 const START = "\n<!-- inject:start -->\n";
 const END = "\n<!-- inject:end -->";
 
 const INTRO =
-  "The person you are talking to installed the i-have-audhd rules below so that agents write " +
-  "to them this way. Apply them to every message you write to that person.\n\n";
+  "The user explicitly requested the i-have-audhd writing rules. Apply them to every later " +
+  "message in this session.\n\n";
 
 const POINTER =
-  "\nThe Stop hook's checks, the operator-profile schema, and every check's contract are in the " +
-  "`i-have-audhd` skill's reference.md. The Stop hook warns by default; a flag file at " +
-  "~/.claude/.i-have-audhd-off disables it within one turn.";
+  "\nThe complete rules and the Stop hook contract are in " +
+  "`skill://i-have-audhd/instructions.md` and `skill://i-have-audhd/reference.md`.";
 
 // systemMessage is shown to the person (Claude Code); the OMP adapter shows it as a UI notice.
 function emit(text, systemMessage) {
@@ -181,11 +175,11 @@ try {
 
   if (String(process.env.I_HAVE_AUDHD_INJECT || "").toLowerCase() === "off") process.exit(0);
 
-  const md = readFileSync(SKILL_PATH, "utf8");
+  const md = readFileSync(INSTRUCTIONS_PATH, "utf8");
   const start = md.indexOf(START);
   const end = start === -1 ? -1 : md.indexOf(END, start + START.length);
   if (start === -1 || end === -1) {
-    emit("The i-have-audhd core could not load: its markers are missing from the skill file.");
+    emit("The i-have-audhd core could not load: its markers are missing from the instructions file.");
   }
 
   const core = md.slice(start + START.length, end).trim();

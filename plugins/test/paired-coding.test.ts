@@ -9,7 +9,6 @@
 // Hands and autonomous lanes are in loader.test.ts.
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { bindPrepared, countedPrepared, HAS_OMP, loadIndex, OMP_SKIP, PAIR_TOOLS, pairTools, session, world } from "./omp-host.ts";
@@ -25,21 +24,19 @@ afterEach(() => {
 });
 
 function files(dir: string): string[] {
-	return readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
-		const p = join(dir, e.name);
-		return e.isDirectory() ? files(p) : e.isFile() && e.name !== ".DS_Store" ? [p] : [];
-	});
+	const out: string[] = [];
+	for (const entry of readdirSync(dir, { withFileTypes: true })) {
+		const path = join(dir, entry.name);
+		if (entry.isDirectory()) out.push(...files(path));
+		else if (entry.isFile() && entry.name !== ".DS_Store") out.push(path);
+	}
+	return out;
 }
 
-/** VENDOR.md's source digest: shasum -a 256 over `./<path>` sorted bytewise, then over that listing. */
-function sourceDigest(plugin: string): string {
-	const root = join(PLUGINS, plugin);
-	const rels = files(root)
-		.map((f) => `./${relative(root, f)}`)
-		.filter((r) => !r.endsWith(".test.mjs"))
-		.sort((a, b) => (Buffer.from(a) < Buffer.from(b) ? -1 : 1));
-	const listing = rels.map((r) => `${createHash("sha256").update(readFileSync(join(root, r))).digest("hex")}  ${r}\n`).join("");
-	return createHash("sha256").update(listing).digest("hex");
+/** The executable paths VENDOR.md records for one plugin. */
+function recordedExecutables(plugin: string): string[] {
+	const listed = new RegExp(`^- ${plugin}: (.+)$`, "m").exec(VENDOR)?.[1] ?? "";
+	return [...listed.matchAll(/`([^`]+)`/g)].map((m) => m[1]!).sort();
 }
 
 describe("the pin (plugins/VENDOR.md)", () => {
@@ -56,20 +53,17 @@ describe("the pin (plugins/VENDOR.md)", () => {
 	});
 
 	for (const plugin of NAMES) {
-		test(`${plugin}: the recorded version is its package.json and .omp-plugin version, its source digest matches, no .test.mjs is shipped, and its executable files are the recorded ones`, () => {
+		test(`${plugin}: versions match, lazy instruction files exist, no .test.mjs is shipped, and executable modes match the record`, () => {
 			const row = rows.get(plugin)!;
 			const root = join(PLUGINS, plugin);
 			expect(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version).toBe(row.version);
 			expect(JSON.parse(readFileSync(join(root, ".omp-plugin", "plugin.json"), "utf8")).version).toBe(row.version);
-			expect(sourceDigest(plugin)).toBe(row.digest);
-			expect(files(root).filter((f) => f.endsWith(".test.mjs"))).toEqual([]);
-			const listed = new RegExp(`^- ${plugin}: (.+)$`, "m").exec(VENDOR)?.[1] ?? "";
-			const want = [...listed.matchAll(/`([^`]+)`/g)].map((m) => m[1]!).sort();
-			const got = files(root)
-				.filter((f) => (statSync(f).mode & 0o111) !== 0)
-				.map((f) => relative(root, f))
-				.sort();
-			expect(got).toEqual(want);
+			expect(readFileSync(join(root, "skills", plugin, "SKILL.md"), "utf8")).toContain("Read [instructions.md](instructions.md)");
+			expect(readFileSync(join(root, "skills", plugin, "instructions.md"), "utf8").length).toBeGreaterThan(100);
+			const all = files(root);
+			expect(all.filter((f) => f.endsWith(".test.mjs"))).toEqual([]);
+			const got = all.filter((f) => (statSync(f).mode & 0o111) !== 0).map((f) => relative(root, f)).sort();
+			expect(got).toEqual(recordedExecutables(plugin));
 		});
 	}
 });

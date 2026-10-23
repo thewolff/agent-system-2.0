@@ -1,17 +1,9 @@
-// plugins/index.ts under the installed OMP's own loader and runner (plugins/test/omp-host.ts), against the
-// real vendored adapters (plugins/VENDOR.md, PLAN-2 D4):
-//   - the orchestrator and every lane run i-have-audhd and ask-graham, and no lane but a by-hand one gets
-//     a pair_* tool (paired-coding.test.ts covers the by-hand lane);
-//   - a hand, which OMP builds by re-binding the parent's prepared factories into a child session with the
-//     parent's env still set, runs no adapter callback and holds no pair_* tool, whether its session file
-//     names a parent or it has no header at all;
-//   - installed marketplace copies of all three adapters stay unloaded beside plugins/index.ts while a
-//     control plugin seeded the same way loads;
-//   - the real adapters read and write only the world's HOME (omp-host.ts world()): the startup hook's
-//     child process and the adapter's in-process fail-open log both land there, and the real home's
-//     ~/.claude/.i-have-audhd-state keeps its existence and mtime.
-// i-have-audhd's session-start core comes from its hooks/*.mjs, which the adapter spawns with `sh -lc
-// 'node …'`; with no node there the adapter fails open and the expected messages say so.
+// plugins/index.ts under OMP's loader and runner, against the real vendored adapters:
+//   - orchestrators and lanes bind i-have-audhd and ask-graham, while only by-hand lanes get
+//     paired-coding tools;
+//   - i-have-audhd stays context-free on unrelated prompts and activates on an explicit request;
+//   - hands run no adapter callback and installed marketplace copies stay disabled;
+//   - adapter state remains inside the scratch HOME.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
@@ -19,8 +11,8 @@ import { join } from "node:path";
 import { bindPrepared, countedPrepared, discoverWithSeededPlugins, HAS_OMP, INDEX, loadIndex, OMP_SKIP, pairTools, REAL_HOME, type SessionKind, session, stamp, world } from "./omp-host.ts";
 
 const NO_NODE = Bun.spawnSync(["sh", "-lc", "command -v node"]).exitCode !== 0;
-/** The hidden messages a prompt carries after session_start: i-have-audhd's core (when node runs its hook), then ask-graham's nudge. */
-const STARTED = NO_NODE ? ["ask-graham"] : ["i-have-audhd-session-start", "ask-graham"];
+/** Hidden messages after an unrelated prompt: ask-graham only at every-idea intensity. */
+const STARTED = ["ask-graham"];
 
 let dispose: (() => void) | undefined;
 afterEach(() => {
@@ -34,7 +26,7 @@ describe("plugins/index.ts loaded by OMP into a top-level session", () => {
 		["the orchestrator, even with AGENT_SYSTEM_BY_HAND=1", { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_BY_HAND: "1" }],
 		["an autonomous lane", { AGENT_SYSTEM_ROLE: "lane" }],
 	] as const) {
-		test.skipIf(!HAS_OMP)(`${label}: nothing runs before session_start; after it a prompt carries i-have-audhd's core and ask-graham's nudge, and no pair_* tool exists${OMP_SKIP}`, async () => {
+		test.skipIf(!HAS_OMP)(`${label}: unrelated prompts carry no AuDHD instructions and no pair_* tool exists${OMP_SKIP}`, async () => {
 			const w = world(env);
 			dispose = w.dispose;
 			const s = await session(await loadIndex(w.cwd), w.cwd, "main", w.root);
@@ -47,6 +39,18 @@ describe("plugins/index.ts loaded by OMP into a top-level session", () => {
 			expect(s.registrations).toEqual([]);
 		}, 30_000);
 	}
+
+	test.skipIf(!HAS_OMP || NO_NODE)(`an explicit AuDHD request loads the rules while unrelated startup does not${OMP_SKIP}`, async () => {
+		const w = world({ AGENT_SYSTEM_ROLE: "orchestrator" });
+		dispose = w.dispose;
+		const s = await session(await loadIndex(w.cwd), w.cwd, "main", w.root);
+		await s.start();
+		expect((await s.beforeAgentStart("Please use the i-have-audhd writing rules.")).map((m) => m.customType)).toEqual([
+			"i-have-audhd-session-start",
+			"ask-graham",
+		]);
+		expect((await s.beforeAgentStart("continue")).map((m) => m.customType)).toEqual(["i-have-audhd-session-start", "ask-graham"]); // preparation re-entry before a context event
+	}, 30_000);
 
 	for (const [label, env] of [
 		["no role (a plain omp on this profile)", {}],
@@ -119,13 +123,13 @@ describe("a hand: the parent's prepared plugins/index.ts re-bound into a child s
 describe("the developer's HOME (the world's HOME stands in for it)", () => {
 	const realState = join(REAL_HOME, ".claude", ".i-have-audhd-state");
 
-	test.skipIf(!HAS_OMP || NO_NODE)(`the startup hook, a child process, reads no profile and leaves its judge notice marker under the world's HOME; the real state dir is untouched${OMP_SKIP}`, async () => {
+	test.skipIf(!HAS_OMP || NO_NODE)(`an explicit request reads the scratch profile and leaves its judge notice marker under the world's HOME${OMP_SKIP}`, async () => {
 		const w = world({ AGENT_SYSTEM_ROLE: "orchestrator" });
 		dispose = w.dispose;
 		const s = await session(await loadIndex(w.cwd), w.cwd, "main", w.root);
 		const before = stamp(realState);
 		await s.start();
-		const messages = await s.beforeAgentStart("what if we built a dashboard");
+		const messages = await s.beforeAgentStart("I have AuDHD; apply the writing rules.");
 		expect(stamp(realState)).toEqual(before);
 		const core = messages.find((m) => m.customType === "i-have-audhd-session-start")?.content ?? "";
 		expect(core).toContain("No reader profile is configured");

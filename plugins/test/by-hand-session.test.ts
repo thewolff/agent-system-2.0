@@ -47,16 +47,8 @@ const HAND_MARK = "hand-mark-5525";
 const ORCH_MARK = "orchestrator-mark-5526";
 const SL_HAND = "sl-by-hand-probe";
 const VERDICT = "**Verdict:** later";
-
-/** The i-have-audhd core: its SKILL.md between the inject markers, which the session-start hook sends verbatim. */
-const AUDHD_CORE = (() => {
-	const skill = readFileSync(join(REPO, "plugins", "i-have-audhd", "skills", "i-have-audhd", "SKILL.md"), "utf8");
-	const start = "\n<!-- inject:start -->\n";
-	const from = skill.indexOf(start);
-	const to = skill.indexOf("\n<!-- inject:end -->");
-	if (from < 0 || to < from) throw new Error("plugins/i-have-audhd/skills/i-have-audhd/SKILL.md has no inject markers");
-	return skill.slice(from + start.length, to).trim();
-})();
+/** A marker from the full AuDHD instructions, which unrelated sessions must never receive. */
+const AUDHD_BODY_MARKER = "The user is ADHD and autistic.";
 
 /** The manifest's skill names (install/manifest.tsv `skill` rows), sorted. */
 const MANIFEST_SKILLS = readFileSync(join(REPO, "install", "manifest.tsv"), "utf8")
@@ -194,10 +186,13 @@ beforeAll(async () => {
 	const brief = (): string =>
 		`slice: ${SL_HAND}\nworkload: ${byHandWl}\ntask: report the first line of README.md (${HAND_MARK})\ndone-condition: the line is reported\ninputs: README.md in the lane worktree\nstakes: normal\nceiling-share: 1`;
 	const tool = (name: string, input: Record<string, unknown>): StubTurn => ({ text: name, tool: { name, input } });
-	/** The by-hand lane's turns, by the number of tool results so far: wake read, the three skills, a slice, its hand, the wait. */
+	/** The by-hand lane's turns: wake read, the applicable Graham and pairing gates plus their instructions, a slice, its hand, the wait. */
 	const byHandSteps = (): StubTurn[] => [
-		tool("ledger_wake_read", { body: "by-hand session test: seeded workload, nothing done yet; next: read the vendored skills.", i: "Recording the wake read" }),
-		...VENDORED.map((s) => tool("read", { path: `skill://${s}`, i: `Reading the ${s} skill` })),
+		tool("ledger_wake_read", { body: "by-hand session test: seeded workload, nothing done yet; next: read the applicable skill instructions.", i: "Recording the wake read" }),
+		tool("read", { path: "skill://ask-graham", i: "Reading the Graham gate" }),
+		tool("read", { path: "skill://ask-graham/instructions.md", i: "Reading the Graham instructions" }),
+		tool("read", { path: "skill://paired-coding", i: "Reading the pairing gate" }),
+		tool("read", { path: "skill://paired-coding/instructions.md", i: "Reading the pairing instructions" }),
 		tool("lane_add_slice", { id: SL_HAND, kind: "locate", task: "report the first line of README.md", doneCondition: "the line is reported", inputs: "README.md", i: "Adding the hand's slice" }),
 		tool("task", { i: "Dispatching the hand", context: "# Goal\nby-hand session test", tasks: [{ name: SL_HAND, agent: "fast", solutionSpace: "one read, given", task: brief() }] }),
 		tool("wait", { i: "Waiting for the hand" }),
@@ -337,12 +332,16 @@ describe.skipIf(!HAS_OMP)(`a by-hand lane started by \`as2 lane <wl>\` under the
 		expect(textOf(users[0]?.message?.content)).toContain(supplied);
 	});
 
-	test("the skill listing is the manifest's skill rows, and paired-coding, i-have-audhd and ask-graham load from their vendored paths", () => {
+	test("the skill listing is the manifest's skill rows, and only applicable gates and instructions are read", () => {
 		const system = firstPayload("by-hand").system;
 		const listing = system.slice(system.indexOf("<skills>"), system.indexOf("</skills>"));
 		expect([...listing.matchAll(/^- ([a-z0-9-]+): /gm)].map((m) => m[1]).sort()).toEqual(MANIFEST_SKILLS);
-		const reads = new Map(world().requests["by-hand"].at(-1)!.results.filter((r) => r.name === "read").map((r) => [r.text.split("\n")[0], r.isError]));
-		for (const s of VENDORED) expect(reads.get(`[Skill file: ${join(REPO, "plugins", s, "skills", s, "SKILL.md")}]`)).toBe(false);
+		const reads = world().requests["by-hand"].at(-1)!.results.filter((r) => r.name === "read").map((r) => r.text.split("\n")[0]);
+		expect(reads).toContain(`[Skill file: ${join(REPO, "plugins", "ask-graham", "skills", "ask-graham", "SKILL.md")}]`);
+		expect(reads).toContain(`[Skill file: ${join(REPO, "plugins", "ask-graham", "skills", "ask-graham", "instructions.md")}]`);
+		expect(reads).toContain(`[Skill file: ${join(REPO, "plugins", "paired-coding", "skills", "paired-coding", "SKILL.md")}]`);
+		expect(reads).toContain(`[Skill file: ${join(REPO, "plugins", "paired-coding", "skills", "paired-coding", "instructions.md")}]`);
+		expect(reads.some((line) => line.includes("i-have-audhd"))).toBe(false);
 	});
 
 	test("pair_start and the other seven pair tools are offered once each, as tools and nowhere else", () => {
@@ -354,14 +353,12 @@ describe.skipIf(!HAS_OMP)(`a by-hand lane started by \`as2 lane <wl>\` under the
 		for (const r of world().requests["by-hand"]) expect(pairNames(r.tools).sort()).toEqual([...PAIR_TOOLS].sort());
 	});
 
-	test("the lane gets i-have-audhd's core and ask-graham's nudge, both hidden, in its first request", () => {
+	test("an unrelated lane gets no AuDHD body while ask-graham's nudge remains hidden", () => {
 		const first = allText(firstPayload("by-hand"));
-		expect(first).toContain(JSON.stringify(AUDHD_CORE).slice(1, -1));
+		expect(first).not.toContain(AUDHD_BODY_MARKER);
 		expect(first).toContain(JSON.stringify(NUDGE).slice(1, -1));
 		const custom = sessionLines().filter((l) => l.type === "custom_message");
-		const audhd = custom.find((l) => l.customType === "i-have-audhd-session-start");
-		expect(audhd?.display).toBe(false);
-		expect(textOf(audhd?.content)).toContain(AUDHD_CORE);
+		expect(custom.some((l) => l.customType === "i-have-audhd-session-start")).toBe(false);
 		expect(custom.find((l) => l.customType === "ask-graham")).toMatchObject({ content: NUDGE, display: false });
 	});
 
@@ -376,30 +373,30 @@ describe.skipIf(!HAS_OMP)(`a by-hand lane started by \`as2 lane <wl>\` under the
 });
 
 describe.skipIf(!HAS_OMP)(`the sessions that get no pair tool${OMP_SKIP}`, () => {
-	test("a hand of the by-hand lane, with the lane's AGENT_SYSTEM_BY_HAND=1 still set, has no pair tool, no AuDHD core and no nudge", () => {
+	test("a hand of the by-hand lane has no pair tool, AuDHD body or nudge", () => {
 		const hand = firstPayload("hand");
 		const started = laneStarted(control(world().ledgerPath, world().byHandWl).control);
 		expect(started?.argv?.at(-1)).toBe(`@${join(laneDir(world().byHandWl, world().home), "prompt.md")}`);
 		expect(hand.tools.length).toBeGreaterThan(0);
 		expect(pairNames(hand.tools)).toEqual([]);
 		expect(allText(hand)).not.toContain(JSON.stringify(NUDGE).slice(1, -1));
-		expect(allText(hand)).not.toContain(JSON.stringify(AUDHD_CORE).slice(1, -1));
-		expect(hand.system).not.toContain(AUDHD_CORE);
+		expect(allText(hand)).not.toContain(AUDHD_BODY_MARKER);
+		expect(hand.system).not.toContain(AUDHD_BODY_MARKER);
 	});
 
-	test("an autonomous lane has the lane tools, i-have-audhd's core and ask-graham's nudge, and no pair tool", () => {
+	test("an unrelated autonomous lane has lane tools and the Graham nudge, but no AuDHD body or pair tool", () => {
 		const auto = firstPayload("autonomous");
 		expect(auto.tools).toContain("lane_add_slice");
 		expect(pairNames(auto.tools)).toEqual([]);
-		expect(allText(auto)).toContain(JSON.stringify(AUDHD_CORE).slice(1, -1));
+		expect(allText(auto)).not.toContain(AUDHD_BODY_MARKER);
 		expect(allText(auto)).toContain(JSON.stringify(NUDGE).slice(1, -1));
 	});
 
-	test("the orchestrator has i-have-audhd's core and ask-graham's nudge, and no pair tool", () => {
+	test("an unrelated orchestrator has its tools and the Graham nudge, but no AuDHD body or pair tool", () => {
 		const orch = firstPayload("orchestrator");
 		expect(orch.tools).toContain("orchestrator_wake_read");
 		expect(pairNames(orch.tools)).toEqual([]);
-		expect(allText(orch)).toContain(JSON.stringify(AUDHD_CORE).slice(1, -1));
+		expect(allText(orch)).not.toContain(AUDHD_BODY_MARKER);
 		expect(allText(orch)).toContain(JSON.stringify(NUDGE).slice(1, -1));
 	});
 });
