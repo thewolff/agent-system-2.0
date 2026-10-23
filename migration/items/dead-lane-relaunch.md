@@ -2,7 +2,7 @@
 title: A dead lane is relaunched by the machinery, three times at most without progress, then one incident line
 status: building
 workload: wl-mvfqvd5hy8zv28
-pr: none
+pr: https://github.com/thewolff/agent-system-2.0/pull/308
 ---
 **Built on branch `wl/wl-mvfqvd5hy8zv28`.** Workload `wl-mvfqvd5hy8zv28` (normal stakes, plan revision 8 at `~/agent-scratch/agent-system-2.0/wl-mvfqvd5hy8zv28/PLAN.md`, approved by Jo). Flow fix 2 of the flow-repair ruling `in-mvfiztvfi7ez28`; the backoff and the one line per train-owned death are Jo's steer `in-mvfrxewspo835s`. It amends SPEC-2.0.md § B3 item 4 (*Amended 2026-10-19 — dead lanes relaunch*).
 
