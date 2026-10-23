@@ -9,7 +9,7 @@ The installer checks only for `bun`. Everything else below is needed at run time
 | Need | Why | Notes |
 |---|---|---|
 | **macOS** | The write fence runs every bash call under `/usr/bin/sandbox-exec` (`gates/src/fence.ts`); the test-runner setup uses `dscl`; the backup job is a launchd agent | No Linux support. On a non-macOS host the installer skips the backup job, and the fence has no equivalent |
-| **OMP (oh-my-pi) 18.8.x** | as2 is a set of OMP extensions, tier files and a profile | The gates refuse to run on an OMP whose major.minor is not `VERIFIED_HOST` in `gates/src/host.ts` (`18.8` today). The author's OMP is the `@oh-my-pi/pi-coding-agent` package installed globally with Bun |
+| **OMP (oh-my-pi) 18.12.6** | as2 is a set of OMP extensions, tier files and a profile | `package.json` and `bun.lock` pin the inspectable OMP modules to the executable version. The installer refuses a mismatch. Run `bun install --frozen-lockfile` after cloning or updating the lock |
 | **Bun** | The ledger module uses `bun:sqlite`; every script and test runs on Bun | The repository's GitHub workflow pins Bun 1.3.14 |
 | **git** | Lanes work in git worktrees and push branches | |
 | **GitHub CLI (`gh`), logged in** | A workload close pushes the lane branch and makes sure a PR exists through `gh`; the test runner reads PRs with `gh pr list -R <owner/repo>` | Not checked anywhere ([MIGRATION.md](../MIGRATION.md) item 17). Lanes push to the repository's `origin`, so work on repositories you can push to |
@@ -38,6 +38,7 @@ Clone anywhere outside a synced folder, then run the installer from the checkout
 ```sh
 git clone https://github.com/thewolff/agent-system-2.0.git
 cd agent-system-2.0
+bun install --frozen-lockfile
 bash install/install.sh
 ```
 

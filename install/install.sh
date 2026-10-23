@@ -494,6 +494,13 @@ bun -e '
 	if (!doc?.mcpServers?.ctx?.command) { console.error(`install: profile: ${process.argv[1]} has no mcpServers.ctx with a command`); process.exit(1); }
 ' "$REPO/$MCP_ROW" || fail "profile mcp.json refused" 2
 
+command -v omp >/dev/null 2>&1 || fail "omp not found on PATH" 2
+OMP_EXEC_VERSION="$(omp --version 2>/dev/null | awk -F/ 'NR == 1 { print $2 }')"
+OMP_PACKAGE_VERSION="$(bun -e 'const p = await Bun.file(process.argv[1]).json(); const v = p?.dependencies?.["@oh-my-pi/pi-coding-agent"]; if (typeof v === "string") process.stdout.write(v)' "$REPO/package.json" 2>/dev/null || true)"
+[ -n "$OMP_EXEC_VERSION" ] && [ "$OMP_EXEC_VERSION" = "$OMP_PACKAGE_VERSION" ] \
+	|| fail "OMP executable ${OMP_EXEC_VERSION:-unknown} does not match the AS2 package lock ${OMP_PACKAGE_VERSION:-unavailable}; update package.json to the installed omp version, run bun install --save-text-lockfile, then re-run install" 2
+step "OMP aligned: executable and AS2 package pin are $OMP_EXEC_VERSION"
+
 # ---- 3. install the ledger ---------------------------------------------------------------------
 # ledger-init creates or verifies the ledger from the ledger-schema row. It refuses a schema file
 # other than the module's (exit 2) and a synced or network folder (exit 3, ledger/src/locality.ts),
