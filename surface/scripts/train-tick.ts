@@ -39,7 +39,7 @@
 // next run; Jo is not alerted. The launcher is `bun surface/scripts/lane.ts launch <wl> --requested-by merge-train`.
 // Exit: 0 the pass ran (logged errors included), 1 the ledger could not be opened, 2 an argument was given.
 import { defaultLedgerPath, Ledger } from "../../ledger/src/index";
-import { attempts, consumedIds, controlEntries, heldLive, holdersOf, LANE_SCRIPT, launchRequestedBody } from "../src/launch";
+import { attempts, controlEntries, heldLive, holdersOf, LANE_SCRIPT, launchRequestedBody, pendingRequests } from "../src/launch";
 import {
 	actionable, type AlertAction, checkoutOwnerRepo, forkOf, forkTaskAlert, openTrainFix, openTrains, ownerDeliveries, prStakes, raiseTwiceFailed, settleTasks, TASK_VIEW_FIELDS,
 	type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertActions, trainAlertBody,
@@ -121,12 +121,10 @@ export function tick(d: TickDeps): string[] {
 		if (last?.body !== body) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body });
 		say(`${wl}: ${body}`);
 	};
-	/** Write `launch-requested: by merge-train` unless one is unconsumed already, then run the launcher; its exit code. */
+	/** Write `launch-requested: by merge-train` unless one is pending already (`pendingRequests`), then run the launcher; its exit code. */
 	const request = (wl: string, reason: string): number => {
 		const entries = ledger.entries(wl);
-		const control = controlEntries(entries, holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl)));
-		const consumed = consumedIds(attempts(control));
-		if (!control.some((c) => c.prefix === "launch-requested" && !consumed.has(c.id))) {
+		if (pendingRequests(controlEntries(entries, holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl)))).length === 0) {
 			ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody(MERGE_TRAIN_BY, ledger.now(), reason) });
 		}
 		const r = d.launch(wl);
@@ -265,17 +263,15 @@ export function tick(d: TickDeps): string[] {
 }
 
 /**
- * Whether owner `owner` is launched for task `t` now: an unconsumed `launch-requested:` is waiting (the fix workload's own,
- * or one a failed launch left); or no lane was launched on it since the task; or a runner result on the PR came after its
- * last launch (the run the lane waited for has answered).
+ * Whether owner `owner` is launched for task `t` now: a `launch-requested:` is pending (`pendingRequests`: the fix workload's
+ * own, or one a failed launch left); or no lane was launched on it since the task; or a runner result on the PR came after
+ * its last launch (the run the lane waited for has answered).
  */
 function ownerLaunchDue(ledger: Ledger, owner: string, t: TrainTask): boolean {
 	const entries = ledger.entries(owner);
 	const control = controlEntries(entries, holdersOf(entries, ledger.workload(owner)?.holder ?? null, ledger.holders(owner)));
-	const tried = attempts(control);
-	const consumed = consumedIds(tried);
-	if (control.some((c) => c.prefix === "launch-requested" && !consumed.has(c.id))) return true;
-	const last = tried.at(-1)?.createdAt;
+	if (pendingRequests(control).length > 0) return true;
+	const last = attempts(control).at(-1)?.createdAt;
 	if (last === undefined || last < t.createdAt) return true;
 	return testRuns(entries).some((r) => r.request.pr === t.pr && r.result !== null && r.result.createdAt > last);
 }

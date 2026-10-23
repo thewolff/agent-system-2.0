@@ -17,7 +17,7 @@ import { type Ceiling, crossed, effectiveCeiling, parseSpend, type Spend } from 
 import { repoOf } from "./decision-log";
 import { ensureStandingWorkload } from "./identity";
 import {
-	attempts, boundPrs, causeText, consumedIds, controlEntries, decideLaunch, holdersOf, type LaunchVerdict, verdictOf,
+	boundPrs, causeText, controlEntries, decideLaunch, holdersOf, type LaunchVerdict, pendingRequests, verdictOf,
 } from "./launch";
 import { readPairSuggestConfig } from "./pair-suggest";
 import { currentGoals, formatShown, rankOpen, type RankItem, rankPick } from "./rank";
@@ -61,11 +61,9 @@ export function readRankConfig(env: Record<string, string | undefined> = process
 
 // ---- the gate (D7) -------------------------------------------------------------------------------------------------
 
-/** The `launch-requested:` on the workload that no `launch:` attempt names yet (the consumption rule `launchable` uses), or null. */
+/** The oldest `launch-requested:` on the workload still pending (`pendingRequests`, the rule `launchable` uses), or null. */
 export function pendingRequest(rows: ReserveRows): string | null {
-	const control = controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder, rows.holders));
-	const consumed = consumedIds(attempts(control));
-	return control.find((c) => c.prefix === "launch-requested" && !consumed.has(c.id))?.id ?? null;
+	return pendingRequests(controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder, rows.holders)))[0]?.id ?? null;
 }
 
 /**

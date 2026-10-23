@@ -73,6 +73,7 @@ import { type TaskWindow, TRAIN_ALERT_LADDER, trainAlertLevel, trainTaskWindows 
 import { questionSubject } from "./orchestrator-question";
 import { pairOfferLine, pairTakenLine, pairTakenQuestion, shownOptions } from "./pair-suggest";
 import { machineryDeath, type RelaunchView, relaunchView } from "./relaunch-surface";
+import type { ProbeFor } from "./runner-probe";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { parseTestRunFailed, testRuns } from "./test-run";
 import {
@@ -117,6 +118,8 @@ export interface ErrorLine {
 export interface ErrorOptions {
 	now?: string;
 	holdHours?: number;
+	/** How a lapsed lane's recorded pids are probed (`laneRunning`); ps by default, a fake in tests. */
+	probeFor?: ProbeFor;
 }
 
 const short = (s: string, n = 90): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
@@ -440,14 +443,14 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		if (run) testRun.push(run);
 		// § 1.6: read once per workload, only when a death or an idle line could be shown.
 		let view: RelaunchView | null = null;
-		const machinery = (lane: string): boolean => wl !== STANDING_WORKLOAD_ID && machineryDeath((view ??= relaunchView(ledger, wl, now)), lane);
+		const machinery = (lane: string): boolean => wl !== STANDING_WORKLOAD_ID && machineryDeath((view ??= relaunchView(ledger, wl, now, opts.probeFor)), lane);
 		const deaths = laneDeaths(ledger, wl);
 		const deathTimes = deaths.map((d) => d.created_at);
 		for (const d of deaths) {
 			if (d.state !== "held" || trainRouted(windows, d.created_at, deathTimes) || machinery(d.holder)) continue;
 			died.push({ kind: "lane-died", workloadId: wl, rowId: d.id, messageIds: [d.id], line: `lane ${d.holder} on ${label} died: ${d.body.slice(d.body.indexOf(":", 11) + 1).trim()}, ${workload.open_slices} open slice(s)${workload.holder && workload.holder !== d.holder ? `; ${workload.holder} holds it now` : ""}` });
 		}
-		if (unrecordedLapse(ledger, workload, now) && !trainRouted(windows, workload.holder_lease_until!, deathTimes) && !machinery(workload.holder!)) {
+		if (unrecordedLapse(ledger, workload, now, opts.probeFor) && !trainRouted(windows, workload.holder_lease_until!, deathTimes) && !machinery(workload.holder!)) {
 			died.push({ kind: "lane-died", workloadId: wl, rowId: wl, state: `${workload.holder}@${workload.holder_lease_until}`, line: `lane ${workload.holder} on ${label} died: lease lapsed ${workload.holder_lease_until}, ${workload.open_slices} open slice(s)` });
 		}
 		for (const m of pendingMessages) {

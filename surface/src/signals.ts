@@ -22,6 +22,8 @@
 //   exited 0 and the working tree (surface/src/wtree.ts) was the same before and after the run; the
 //   evidence for a push (P-11 row 8). JSON, because a repository path can hold spaces.
 import type { Ledger, MessageRow, WorkloadStatusRow } from "../../ledger/src/index";
+import { controlEntries, holdersOf } from "./launch";
+import { laneRunning, type ProbeFor, psProbe } from "./runner-probe";
 import {
 	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, ARTIFACT_TREE_PREFIX, LANE_DIED_PREFIX, ORCHESTRATOR_RECIPIENT,
 	PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX,
@@ -71,26 +73,31 @@ export function laneDeaths(ledger: Ledger, workloadId: string): LaneDeath[] {
  * Persist the death of `workload`'s holder whose lease has lapsed, once per lane (the guard `enqueueRunnerDeath` keeps,
  * PLAN wl-mvfqvd5hy8zv28 § 1.2): the same lapse observed by the surface and by a reclaiming lane lands one row, and a lane
  * whose death is already recorded (its runner's restart death, its own shutdown) gets no second one, so each lane has one
- * death row and one death time. Returns the message id, or null when the lease is live, there is no holder, or a
- * lane-died message already names the holder.
+ * death row and one death time. Returns the message id, or null when the lease is live, there is no holder, a lane-died
+ * message already names the holder, or the holder's lane is still running (`unrecordedLapse`).
  */
-export function recordLapsedLease(ledger: Ledger, workload: WorkloadStatusRow, by: string, now: string = ledger.now()): string | null {
-	if (workload.status !== "open" || !workload.holder || !workload.holder_lease_until || workload.holder_lease_until >= now) return null;
-	if (laneDeaths(ledger, workload.id).some((d) => d.holder === workload.holder)) return null;
-	return ledger.enqueue({ by, workloadId: workload.id, sender: by, recipient: ORCHESTRATOR_RECIPIENT, body: laneDiedLapsedBody(workload.holder, workload.holder_lease_until) });
+export function recordLapsedLease(ledger: Ledger, workload: WorkloadStatusRow, by: string, now: string = ledger.now(), probeFor: ProbeFor = psProbe): string | null {
+	if (workload.status !== "open" || !unrecordedLapse(ledger, workload, now, probeFor)) return null;
+	return ledger.enqueue({ by, workloadId: workload.id, sender: by, recipient: ORCHESTRATOR_RECIPIENT, body: laneDiedLapsedBody(workload.holder!, workload.holder_lease_until!) });
 }
 
-/** A lapsed lease whose holder no lane-died row names yet (the surface writes it before rendering; pure readers see it here). */
-export function unrecordedLapse(ledger: Ledger, workload: WorkloadStatusRow, now: string): boolean {
+/**
+ * A lapsed lease whose holder no lane-died row names yet (the surface writes it before rendering; pure readers see it here),
+ * and whose lane is not still running (`laneRunning` over `probeFor`, the check the relaunch's `laneEnd` makes): a runner
+ * that outlived its lease (a sleeping Mac) renews on wake, so its lapse is neither recorded nor shown as a death (review r2 R2-3).
+ */
+export function unrecordedLapse(ledger: Ledger, workload: WorkloadStatusRow, now: string, probeFor: ProbeFor = psProbe): boolean {
 	if (!workload.holder || !workload.holder_lease_until || workload.holder_lease_until >= now) return false;
-	return !laneDeaths(ledger, workload.id).some((d) => d.holder === workload.holder);
+	if (laneDeaths(ledger, workload.id).some((d) => d.holder === workload.holder)) return false;
+	const entries = ledger.entries(workload.id);
+	return !laneRunning(controlEntries(entries, holdersOf(entries, workload.holder, ledger.holders(workload.id))), workload.id, workload.holder, probeFor);
 }
 
 /** `recordLapsedLease` over every open workload; the ids written. The surface calls this before every read. */
-export function recordLapsedLeases(ledger: Ledger, by: string, now: string = ledger.now()): string[] {
+export function recordLapsedLeases(ledger: Ledger, by: string, now: string = ledger.now(), probeFor: ProbeFor = psProbe): string[] {
 	const out: string[] = [];
 	for (const { workload } of ledger.inFlight()) {
-		const id = recordLapsedLease(ledger, workload, by, now);
+		const id = recordLapsedLease(ledger, workload, by, now, probeFor);
 		if (id) out.push(id);
 	}
 	return out;

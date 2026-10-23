@@ -1250,6 +1250,7 @@ surface/test/rank-launch.test.ts	test	-
 surface/src/relaunch.ts	module	-
 surface/src/incident.ts	module	-
 surface/src/relaunch-surface.ts	module	-
+surface/src/runner-probe.ts	module	-
 surface/test/relaunch.test.ts	test	-
 surface/test/relaunch-tick.test.ts	test	-
 # Phoenix tracing (wl-mv65t5d34lts00): the tracing switch (reader, word, tests) and the Phoenix LaunchAgent,

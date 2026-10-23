@@ -12,8 +12,12 @@ import {
 	laneStopAcceptedBody, laneStopRequestBody, prBindingInstructionBody, verdictOf,
 } from "../src/launch";
 import { briefHash, formatSignal, goalsHash, rankDay, type SignalAnswers } from "../src/rank";
-import { type RankConfig, rankGate } from "../src/rank-launch";
-import { laneEnd, type PidAlive, pidAlive, relaunchRead, relaunchState } from "../src/relaunch";
+import { pendingRequest, type RankConfig, rankGate } from "../src/rank-launch";
+import { laneEnd, relaunchRead, relaunchState } from "../src/relaunch";
+import type { PsRun } from "../src/omp-probe";
+import { type ProbeFor, psProbe, runnerProbe } from "../src/runner-probe";
+import { errorLines } from "../src/errors";
+import { laneDeaths, recordLapsedLeases } from "../src/signals";
 import { fullSuiteSlice, makeRunId, testRequestedBody } from "../src/test-run";
 import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, RANK_BY, SURFACE_BY } from "../src/types";
 import { triggerLaunch } from "../extensions/launch";
@@ -24,6 +28,35 @@ const T0 = Date.parse("2026-10-19T10:00:00.000Z");
 const iso = (ms: number) => new Date(ms).toISOString();
 const WL = "wl-r";
 const lane = (n: number) => `lane-r-${n}`;
+/** The start time a `lane-started:` records for its omp (`started`). */
+const OMP_START = "Mon Oct 19 09:59:00 2026";
+/** The command line `lane.ts launch` starts lane `laneId`'s runner with on workload `wl`. */
+const runnerCommand = (wl: string, laneId: string) => `bun /repo/surface/scripts/lane.ts run ${wl} ${laneId}`;
+
+/** One process as `ps -p <pid> -o <fields>` reports it. */
+interface FakeProc {
+	stat?: string;
+	lstart?: string;
+	command?: string;
+}
+/**
+ * A ps over a table of processes by pid (`procs()` is read at each call, so a test can change it): a listed pid answers its
+ * fields in the order asked, any other pid is ps's clean "no such process" (exit 1, nothing printed); `"fail"` is a ps that
+ * cannot be spawned (a throw, as `runPs` throws).
+ */
+function fakePs(procs: () => Record<number, FakeProc> | "fail"): PsRun {
+	return (args) => {
+		const table = procs();
+		if (table === "fail") throw new Error("EPERM: posix_spawn '/bin/ps'");
+		const p = table[Number(args[args.indexOf("-p") + 1])];
+		if (p === undefined) return { exitCode: 1, stdout: "", stderr: "" };
+		const fields = args[args.indexOf("-o") + 1]!.split(",").map((f) => f.replace(/=$/, ""));
+		const value = (f: string) => (f === "stat" ? p.stat ?? "S" : f === "lstart" ? p.lstart ?? "" : p.command ?? "");
+		return { exitCode: 0, stdout: `${fields.map(value).join(" ")}\n`, stderr: "" };
+	};
+}
+/** The relaunch's probe (`runnerProbe`, the run guard's) over `fakePs(procs)`. */
+const probeOver = (procs: () => Record<number, FakeProc> | "fail"): ProbeFor => (wl, laneId) => runnerProbe(wl, laneId, fakePs(procs));
 
 /**
  * One workload's rows built in ledger order under a clock that moves one second per write unless told otherwise: the
@@ -116,14 +149,14 @@ function world(over: Partial<WorkloadRow> = {}) {
 		/** `as2 lane stop`'s request (the starter writes it), and an acceptance naming `ref`. */
 		stop: (n: number) => entry(LANE_STARTER_BY, laneStopRequestBody(lane(n), "as2-lane-stop", "jo")),
 		accept: (n: number, ref: string) => entry(LANE_RUNNER_BY, laneStopAcceptedBody(lane(n), ref)),
-		/** The runner's `lane-started:` for lane n, naming its own pid `runnerPid`. */
-		started: (n: number, runnerPid: number) => entry(LANE_RUNNER_BY, laneStartedBody(lane(n), { pid: runnerPid + 1, start: "x", session: null, argv: [], runnerPid })),
+		/** The runner's `lane-started:` for lane n, naming its own pid `runnerPid` and its omp `runnerPid + 1` started at `OMP_START`. */
+		started: (n: number, runnerPid: number) => entry(LANE_RUNNER_BY, laneStartedBody(lane(n), { pid: runnerPid + 1, start: OMP_START, session: null, argv: [], runnerPid })),
 		rows,
-		verdict: (liveLanes = 0, cap = 3, alive: PidAlive = pidAlive) => verdictOf(rows(liveLanes, cap), alive),
-		state: (alive: PidAlive = pidAlive) => relaunchState(rows(), alive),
-		end: (n: number, alive: PidAlive = pidAlive) => {
+		verdict: (liveLanes = 0, cap = 3, probeFor: ProbeFor = psProbe) => verdictOf(rows(liveLanes, cap), probeFor),
+		state: (probeFor: ProbeFor = psProbe) => relaunchState(rows(), probeFor),
+		end: (n: number, probeFor: ProbeFor = psProbe) => {
 			const r = rows();
-			return laneEnd(r.workload, controlEntries(r.entries, holdersOf(r.entries, r.workload.holder)), lane(n), r.now, alive);
+			return laneEnd(r.workload, controlEntries(r.entries, holdersOf(r.entries, r.workload.holder)), lane(n), r.now, probeFor);
 		},
 	};
 	return api;
@@ -308,10 +341,11 @@ describe("relaunch due (§ 1.3): a died lane with an open slice, no open questio
 	});
 });
 
-describe("a lapsed lease whose runner is alive is not a death (review r1 M2)", () => {
+describe("a lapsed lease whose lane is still running is not a death (review r1 M2, r2 R2-3, R2-4)", () => {
 	const RUNNER = 4242;
-	const runnerAlive: PidAlive = (pid) => pid === RUNNER;
-	const runnerGone: PidAlive = () => false;
+	const OMP = RUNNER + 1;
+	const runnerAlive = probeOver(() => ({ [RUNNER]: { command: runnerCommand(WL, lane(1)) } }));
+	const runnerGone = probeOver(() => ({}));
 	/** Lane 1 with its runner's lane-started:, its lease lapsed and the surface's lane-died: for the lapse recorded. */
 	function lapsed() {
 		const x = launched();
@@ -338,43 +372,78 @@ describe("a lapsed lease whose runner is alive is not a death (review r1 M2)", (
 		expect(x.verdict(0, 3, runnerGone)).toEqual({ launch: true, cause: { kind: "relaunch", lane: lane(1), n: 1 } });
 	});
 
-	test("the default probe asks the kernel: this test process is alive, an exited child is gone; 0 and negatives name no process", () => {
-		const child = Bun.spawnSync(["true"]);
-		expect(child.exitCode).toBe(0);
-		expect(pidAlive(process.pid)).toBe(true);
-		expect(pidAlive(child.pid)).toBe(false);
-		expect(pidAlive(0)).toBe(false);
-		expect(pidAlive(-1)).toBe(false);
-		const alive = launched();
-		alive.started(1, process.pid);
-		alive.lapse();
-		alive.died(1);
-		expect(alive.verdict()).toEqual({ launch: false, reason: "held" });
-		const gone = launched();
-		gone.started(1, child.pid);
-		gone.lapse();
-		gone.died(1);
-		expect(gone.verdict()).toEqual({ launch: true, cause: { kind: "relaunch", lane: lane(1), n: 1 } });
+	test("R2-4: the recorded pids are identified, not merely alive: another user's process (EPERM), a reused pid or a zombie is not this lane's runner", () => {
+		const dead = { kind: "died" } as const;
+		const relaunch = { launch: true, cause: { kind: "relaunch", lane: lane(1), n: 1 } } as const;
+		const cases: Record<string, Record<number, FakeProc>> = {
+			// process.kill(pid, 0) answers EPERM for a process of another user; ps still names it, and it is not `lane.ts run`
+			"another user's process": { [RUNNER]: { command: "/sbin/launchd" } },
+			// both pids now name other processes: the runner's another command, the omp's another start time
+			"a reused pid": { [RUNNER]: { command: runnerCommand("wl-other", "lane-other-1") }, [OMP]: { lstart: "Mon Oct 19 11:30:00 2026", command: "omp" } },
+			"a zombie": { [RUNNER]: { stat: "Z", command: "<defunct>" }, [OMP]: { stat: "Z", lstart: OMP_START, command: "<defunct>" } },
+		};
+		for (const [name, table] of Object.entries(cases)) {
+			const x = lapsed();
+			const probe = probeOver(() => table);
+			expect({ name, end: x.end(1, probe) }).toEqual({ name, end: dead });
+			expect({ name, verdict: x.verdict(0, 3, probe) }).toEqual({ name, verdict: relaunch });
+		}
+	});
+
+	test("R2-4: the omp alive at its recorded start time is the lane running, the runner gone or not; a ps that cannot answer is never permission to relaunch", () => {
+		for (const table of [{ [OMP]: { lstart: OMP_START, command: "omp" } }, "fail" as const]) {
+			const x = lapsed();
+			const probe = probeOver(() => table);
+			expect(x.end(1, probe)).toEqual({ kind: "live" });
+			expect(x.verdict(0, 3, probe)).toEqual({ launch: false, reason: "held" });
+		}
 	});
 
 	test("reserveLane on a real ledger: no successor is reserved over a live runner, one is once it is gone", () => {
 		let t = T0;
 		const { ledger: l } = tempLedger(() => iso(t));
 		const wl = l.openWorkload({ by: SURFACE_BY, brief: "fix it", stakes: "normal", mode: "autonomous" });
-		let alive = true;
-		const probe: PidAlive = (pid) => alive && pid === RUNNER;
+		let procs: Record<number, FakeProc> = {};
+		const probe = probeOver(() => procs);
 		const reserve = () => l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 3 * MIN, requestedBy: "tick", decide: (r) => decideLaunch(r, probe) });
 		const first = reserve();
 		if (!first.ok) throw new Error(first.reason);
+		procs = { [RUNNER]: { command: runnerCommand(wl, first.laneId) } };
 		t += 1000;
 		l.addSlice({ by: first.laneId, workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
-		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(first.laneId, { pid: RUNNER + 1, start: "x", session: null, argv: [], runnerPid: RUNNER }) });
+		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(first.laneId, { pid: OMP, start: OMP_START, session: null, argv: [], runnerPid: RUNNER }) });
 		l.enqueue({ by: SURFACE_BY, workloadId: wl, sender: SURFACE_BY, recipient: ORCHESTRATOR_RECIPIENT, body: `lane-died: ${first.laneId}: lease lapsed` });
 		t += 10 * MIN;
 		expect(reserve()).toEqual({ ok: false, reason: "held" });
 		expect(l.workload(wl)!.holder).toBe(first.laneId);
-		alive = false;
+		procs = {};
 		expect(reserve()).toMatchObject({ ok: true, cause: `relaunch ${first.laneId} 1` });
+		l.close();
+	});
+
+	test("R2-3: a lapse whose runner is running writes no lane-died: and shows no death line; once the runner is gone, the message and the line as before", () => {
+		let t = T0;
+		const { ledger: l } = tempLedger(() => iso(t));
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "fix it", stakes: "normal", mode: "autonomous" });
+		let procs: Record<number, FakeProc> = {};
+		const probe = probeOver(() => procs);
+		const first = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 3 * MIN, requestedBy: "tick", decide: (r) => decideLaunch(r, probe) });
+		if (!first.ok) throw new Error(first.reason);
+		procs = { [RUNNER]: { command: runnerCommand(wl, first.laneId) } };
+		t += 1000;
+		l.addSlice({ by: first.laneId, workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(first.laneId, { pid: OMP, start: OMP_START, session: null, argv: [], runnerPid: RUNNER }) });
+		t += 20 * MIN;
+		const now = iso(t);
+		const deathLines = () => errorLines(l, l.inFlight(), { now, probeFor: probe }).filter((x) => x.kind === "lane-died" && x.workloadId === wl).map((x) => x.line);
+		expect(deathLines()).toEqual([]);
+		expect(recordLapsedLeases(l, SURFACE_BY, now, probe)).toEqual([]);
+		expect(laneDeaths(l, wl)).toEqual([]);
+		procs = {};
+		const lapsedAt = l.workload(wl)!.holder_lease_until;
+		expect(deathLines()).toEqual([`lane ${first.laneId} on ${wl} died: lease lapsed ${lapsedAt}, 1 open slice(s)`]);
+		expect(recordLapsedLeases(l, SURFACE_BY, now, probe)).toHaveLength(1);
+		expect(laneDeaths(l, wl).map((d) => d.body)).toEqual([`lane-died: ${first.laneId}: lease lapsed ${lapsedAt}`]);
 		l.close();
 	});
 });
@@ -471,6 +540,43 @@ describe("Jo's stop vetoes every cause until Jo's word newer than the stop (revi
 		x.entry(lane(2), "done-because: the work is done");
 		x.exit(2, "completed");
 		expect(x.verdict()).toEqual({ launch: false, reason: "awaiting-close" });
+	});
+	test("r2 R2-1: a Jo request voided by a stop is pending nowhere: the rank gate's pending request skips it, and the train's own request launches", () => {
+		// the review's probe: a Jo request, Jo's stop of lane 1, a newer Jo request, lane 2 launched on it, lane 2 parks
+		const x = launched();
+		const older = x.request("jo");
+		const req = x.stop(1);
+		x.accept(1, req.id);
+		x.exit(1, "stop");
+		const newer = x.request("jo");
+		expect(x.verdict()).toEqual({ launch: true, cause: { kind: "request", id: newer.id } });
+		x.launch(2, `request ${newer.id}`);
+		x.exit(2, "parked");
+		const control = controlEntries(x.entries, holdersOf(x.entries, null));
+		expect(consumedIds(attempts(control)).has(older.id)).toBe(false);
+		expect(pendingRequest(x.rows())).toBeNull();
+		expect(x.verdict()).toEqual({ launch: false, reason: "died-not-relaunched" });
+		// the train, seeing nothing pending, writes its own request: it is the pending one, and it launches as a request
+		const train = x.request("train");
+		expect(pendingRequest(x.rows())).toBe(train.id);
+		expect(x.verdict()).toEqual({ launch: true, cause: { kind: "request", id: train.id } });
+	});
+	test("r2 R2-2: an answer older than a stop on an older lane is answered by that stop, as a Jo request is: the later lane's death relaunches it", () => {
+		// the review's probe: lane 1's question answered, lane 1 dies, Jo stops lane 1, a newer Jo request launches lane 2, lane 2 dies
+		const x = launched();
+		const q = x.question(lane(1), x.slices[0]!.id, "answered");
+		const ans = x.instruction("answer", "yes", q.id);
+		q.resolved_by = ans.id;
+		x.exit(1, "error");
+		x.died(1);
+		x.stop(1);
+		const newer = x.request("jo");
+		expect(x.verdict()).toEqual({ launch: true, cause: { kind: "request", id: newer.id } });
+		x.launch(2, `request ${newer.id}`);
+		x.exit(2, "error");
+		x.died(2);
+		expect(x.verdict()).toEqual({ launch: true, cause: { kind: "relaunch", lane: lane(2), n: 1 } });
+		expect(decideLaunch(x.rows())).toEqual({ launch: true, cause: `relaunch ${lane(2)} 1` });
 	});
 });
 

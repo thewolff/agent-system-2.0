@@ -15,6 +15,7 @@ import { incidentsOn, recordIncidentOnce, RETRY_LIMIT } from "./incident";
 import { attempts, controlEntries, holdersOf, laneExit } from "./launch";
 import { heldTrainPrs, trainHeldDetail } from "./merge-train";
 import { RELAUNCH_INCIDENT, type RelaunchState, relaunchRead } from "./relaunch";
+import type { ProbeFor } from "./runner-probe";
 import { laneDeaths, recordLapsedLeases } from "./signals";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
@@ -77,11 +78,11 @@ export interface RelaunchView {
 	incidents: ReadonlySet<string>;
 }
 
-/** The relaunch view of one workload at `now`. */
-export function relaunchView(ledger: Ledger, workloadId: string, now: string): RelaunchView {
+/** The relaunch view of one workload at `now`; `probeFor` probes a lapsed lane's recorded pids (ps when omitted). */
+export function relaunchView(ledger: Ledger, workloadId: string, now: string, probeFor?: ProbeFor): RelaunchView {
 	const rows = ledger.launchRows(workloadId, 0);
 	if (!rows) return { state: { kind: "none" }, relaunched: new Set(), incidents: new Set() };
-	const read = relaunchRead({ ...rows, now });
+	const read = relaunchRead({ ...rows, now }, undefined, probeFor);
 	const control = controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder, rows.holders));
 	const relaunched = new Set(attempts(control).flatMap((a) => (a.cause?.kind === "relaunch" ? [a.cause.lane] : [])));
 	const incidents = new Set(incidentsOn(ledger, SURFACE_BY, RELAUNCH_INCIDENT, workloadId).map((i) => i.incident.key));

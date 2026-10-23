@@ -12,7 +12,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync
 import { dirname, join } from "node:path";
 import { handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
-import { isRunnerCommand } from "../scripts/lane";
+import { isRunnerCommand } from "../src/runner-probe";
 import {
 	copyIntoScratch, daysSinceEpoch, END_RECEIPT_SKEW_MS, emptySeen, type Evidence, type EvidenceItem, FAULT_EVIDENCE, FAULTS, type FaultName, firstHolder, HarnessError, ISOLATION_LIMIT,
 	isolationDiff, type IsolationSnapshot, isolationSnapshot, isScratchRunner, judgePoll, killRefusal, killTargets, laneStarts, liveActorsOf, newStarts, nightlyDue, nightlyFault, type Poll, type ProcRow, PS_SHIM,

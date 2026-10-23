@@ -22,7 +22,8 @@ import { labOf } from "../../classifier/src/lab";
 import {
 	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
 } from "./types";
-import { isVetoStop, type PidAlive, pidAlive, type RelaunchRead, relaunchRead } from "./relaunch";
+import { isVetoStop, type RelaunchRead, relaunchRead } from "./relaunch";
+import { type ProbeFor, psProbe } from "./runner-probe";
 
 // ---- knobs -------------------------------------------------------------------------------------
 
@@ -366,6 +367,24 @@ export function consumedIds(list: readonly Attempt[]): Set<string> {
 	return out;
 }
 
+/** Jo's `launch-requested: by jo …`, the surface's; any other is the machinery's (the merge train's). */
+export function isJoRequest(c: ControlEntry): boolean {
+	return c.prefix === "launch-requested" && c.createdBy === SURFACE_BY && /^by jo(?:\s|$)/.test(c.rest);
+}
+
+/**
+ * The `launch-requested:` entries still pending, oldest first: named by no attempt (`consumedIds`, decision 7) and, for Jo's
+ * (`isJoRequest`), not older than the newest stop by Jo or the ceiling (`isVetoStop`), whichever lane that stop named: the
+ * stop answered it, so it never launches and never counts as pending again (review r1 m1). A machinery request is not voided
+ * by a stop; `launchable` holds it while the newest lane's stop stands. The one pending rule every reader shares (review r2
+ * R2-1): `launchable`, the rank gate's `pendingRequest`, and the merge-train tick's request writer and owner check.
+ */
+export function pendingRequests(control: readonly ControlEntry[]): ControlEntry[] {
+	const consumed = consumedIds(attempts(control));
+	const lastStop = control.findLastIndex(isVetoStop);
+	return control.filter((c, i) => c.prefix === "launch-requested" && !consumed.has(c.id) && !(isJoRequest(c) && i < lastStop));
+}
+
 // ---- resolutions -------------------------------------------------------------------------------
 
 export interface Resolution {
@@ -468,11 +487,12 @@ export function heldLive(w: { holder: string | null; holder_lease_until: string 
  * After `held` and `awaiting-close`, in this order (PLAN wl-mvfqvd5hy8zv28 § 1.3): a stop by Jo or the ceiling on the newest
  * lane refuses every cause but Jo's word written after it (`stopped`); with no word of Jo's pending, a spent retry budget
  * refuses before the cap (`relaunch-exhausted`); the cap; `first`, Jo's request, a resume; `held` while the newest lane is
- * live past its lapsed lease (its runner's pid alive, review r1 M2); the relaunch when due (folding in and consuming a pending
- * machinery request), or `relaunch-backoff` while it waits; a machinery request when the relaunch owes the newest lane
- * nothing (`relaunchState` none: a lane that ended as intended, the merge train's (§ 1.8), or a dead lane the relaunch does
- * not take on, review r1 M1); otherwise `died-not-relaunched`. A `launch-requested: by jo` older than any stop by Jo or the
- * ceiling was answered by that stop and is never pending again, whichever lane the stop named (review r1 m1).
+ * live past its lapsed lease (its lane still running, `laneRunning`, review r1 M2, r2 R2-4); the relaunch when due (folding
+ * in and consuming a pending machinery request), or `relaunch-backoff` while it waits; a machinery request when the
+ * relaunch owes the newest lane nothing (`relaunchState` none: a lane that ended as intended, the merge train's (§ 1.8), or
+ * a dead lane the relaunch does not take on, review r1 M1); otherwise `died-not-relaunched`. Jo's word older than the
+ * newest stop by Jo or the ceiling, whichever lane the stop named, was answered by that stop and is never pending again:
+ * a `launch-requested: by jo` (`pendingRequests`, review r1 m1, r2 R2-1) and an answer or replan alike (review r2 R2-2).
  */
 export function launchable(
 	w: WorkloadRow, control: readonly ControlEntry[], receipt: string | null, resolved: readonly Resolution[], now: string, liveLanes: number, cap: number,
@@ -485,16 +505,15 @@ export function launchable(
 	if (heldLive(w, now)) return { launch: false, reason: "held" };
 	const tried = attempts(control);
 	const consumed = consumedIds(tried);
-	const byJo = (c: ControlEntry): boolean => c.createdBy === SURFACE_BY && /^by jo(?:\s|$)/.test(c.rest);
-	const lastStop = control.findLastIndex(isVetoStop);
-	const requests = control.filter((c, i) => c.prefix === "launch-requested" && !consumed.has(c.id) && !(byJo(c) && i < lastStop));
+	const requests = pendingRequests(control);
 	if (receipt !== null && requests.length === 0) return { launch: false, reason: "awaiting-close" };
-	// The veto (§ 1.1 step 2, review r2 F1): while a stop stands, only Jo's word written after it counts; `requests` holds no
-	// word of Jo's older than the newest stop.
+	// The veto (§ 1.1 step 2, review r2 F1): while a stop stands, only Jo's word written after it counts; `requests` and `res`
+	// hold no word of Jo's older than the newest stop.
 	const stop = relaunch.end?.kind === "stopped" ? relaunch.end : null;
-	const joRequest = requests.find(byJo);
-	const machineRequest = stop === null ? requests.find((c) => !byJo(c)) : undefined;
-	const res = resolved.filter((r) => !consumed.has(r.instructionId) && (stop === null || r.createdAt > stop.createdAt));
+	const joRequest = requests.find(isJoRequest);
+	const machineRequest = stop === null ? requests.find((c) => !isJoRequest(c)) : undefined;
+	const lastStopAt = control.findLast(isVetoStop)?.createdAt;
+	const res = resolved.filter((r) => !consumed.has(r.instructionId) && (lastStopAt === undefined || r.createdAt > lastStopAt));
 	const joPending = joRequest !== undefined || res.length > 0;
 	if (stop !== null && !joPending) return { launch: false, reason: "stopped" };
 	if (!joPending && relaunch.state.kind === "exhausted") return { launch: false, reason: "relaunch-exhausted" };
@@ -515,22 +534,22 @@ export function launchable(
 }
 
 /**
- * The predicate over the rows a launch decision reads (`Ledger.launchRows`): the surface's run and `reserveLane`'s. `alive`
- * probes the newest lane's recorded runner pid past a lapsed lease (`laneEnd`); tests pass a fake.
+ * The predicate over the rows a launch decision reads (`Ledger.launchRows`): the surface's run and `reserveLane`'s.
+ * `probeFor` probes the newest lane's recorded pids past a lapsed lease (`laneEnd`); tests pass a fake.
  */
-export function verdictOf(rows: ReserveRows, alive: PidAlive = pidAlive): LaunchVerdict {
+export function verdictOf(rows: ReserveRows, probeFor: ProbeFor = psProbe): LaunchVerdict {
 	const holders = holdersOf(rows.entries, rows.workload.holder, rows.holders);
 	const control = controlEntries(rows.entries, holders);
 	const receipt = doneBecause(rows.entries, holders);
 	return launchable(
 		rows.workload, control, receipt, resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap,
-		relaunchRead(rows, { holders, control, receipt }, alive),
+		relaunchRead(rows, { holders, control, receipt }, probeFor),
 	);
 }
 
 /** `reserveLane`'s policy for an autonomous launch: the predicate over the rows the transaction read. */
-export function decideLaunch(rows: ReserveRows, alive: PidAlive = pidAlive): ReserveVerdict {
-	const v = verdictOf(rows, alive);
+export function decideLaunch(rows: ReserveRows, probeFor: ProbeFor = psProbe): ReserveVerdict {
+	const v = verdictOf(rows, probeFor);
 	return v.launch ? { launch: true, cause: causeText(v.cause) } : v;
 }
 
