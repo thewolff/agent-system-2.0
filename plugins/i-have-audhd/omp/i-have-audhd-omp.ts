@@ -1,16 +1,12 @@
-// i-have-audhd-omp.ts — OMP adapter for the i-have-audhd plugin.
+// i-have-audhd-omp.ts — explicit-request activation and Stop checking for OMP.
 //
-// WHY: OMP does not run a plugin's hooks/hooks.json; it loads TS extension modules. This file
-// bridges the plugin's three Claude Code hooks to OMP events without copying their policy:
-// all three are stdin-JSON CLIs, spawned here, never imported.
+// The adapter stays inert until a direct user prompt explicitly requests the AuDHD rules. On that
+// prompt it loads the marked core from skills/i-have-audhd/instructions.md, keeps the rules active
+// for the session, and starts the Stop check. Unrelated prompts receive no AuDHD context or checks.
 //
-//   hooks/i-have-audhd-inject.mjs   session_start / session_switch / session_compact →
-//                                   additionalContext, offered through before_agent_start as
-//                                   a hidden custom message until a context event carries it
-//   hooks/i-have-audhd-stop.mjs     session_stop → the CLI's verdict as a session_stop block
-//   hooks/i-have-audhd-prompt.mjs   right after each stop (Claude Code runs it on
-//                                   UserPromptSubmit) → the pending warning, queued for the
-//                                   next turn
+//   hooks/i-have-audhd-inject.mjs   first explicit request, then active compactions → context
+//   hooks/i-have-audhd-stop.mjs     active session_stop → verdict
+//   hooks/i-have-audhd-prompt.mjs   active stop → pending warning for the next turn
 //
 // WARNINGS. A warn finding is no block, so session_stop has nothing to return for it; the core
 // leaves it pending (lib/pending.mjs) and this file delivers it: sendMessage with deliverAs
@@ -174,19 +170,31 @@ function managerSessionId(ctx: Ctx): string | undefined {
   }
 }
 
+type BeforeAgentStartEvent = { prompt?: unknown };
+
 // Structural stand-in for the host's extension API: the events this adapter registers.
 // Deliberately local — importing @oh-my-pi would couple the plugin to one host build.
 type PiLike = {
   on(name: "session_stop", handler: (event: StopEvent, ctx: Ctx) => unknown): void;
   on(name: "session_start" | "session_compact", handler: (event: unknown, ctx: Ctx) => unknown): void;
   on(name: "session_switch", handler: (event: { reason?: unknown }, ctx: Ctx) => unknown): void;
-  on(name: "before_agent_start", handler: (event: unknown, ctx: Ctx) => unknown): void;
+  on(name: "before_agent_start", handler: (event: BeforeAgentStartEvent, ctx: Ctx) => unknown): void;
   on(name: "context", handler: (event: { messages?: unknown }, ctx: Ctx) => unknown): void;
   sendMessage?: (
     message: { customType: string; content: string; display: boolean; details?: unknown },
     options?: { deliverAs?: "nextTurn" },
   ) => void;
 };
+
+/** True only for direct requests to apply the AuDHD writing rules, never a bare mention. */
+export function explicitAudhdRequest(prompt: unknown): boolean {
+  if (typeof prompt !== "string") return false;
+  const text = prompt.trim();
+  if (/\/skill:(?:[^\s/]+\/)?i-have-audhd(?:\s|$)/i.test(text)) return true;
+  if (/\b(?:i\s+have|i(?:'m|\s+am))\s+audhd\b/i.test(text)) return true;
+  if (/\bi(?:'m|\s+am)\s+adhd\s+(?:and|&)\s+autistic\b/i.test(text)) return true;
+  return /\b(?:use|apply|load|enable|follow)\b[^\n.?!]{0,48}\b(?:i-have-audhd|audhd)\b[^\n.?!]{0,24}\b(?:rules?|skill|writing)\b/i.test(text);
+}
 
 // Whitespace collapsed, trimmed, capped — the shape every log line shares (appendLog
 // collapses again; that pass is idempotent).
@@ -418,28 +426,36 @@ export async function sessionStartHandler(
   }
 }
 
-// Registration entry point; package.json `omp.extensions` names this file. OMP calls it once
-// per session (subagents included), so `pending` is per session. Each crossing replaces it
-// with that crossing's context and a fresh delivery id (undefined when skipped, switched off,
-// or failed). before_agent_start offers it as a hidden custom message — the delivery
-// newdle-hooks.ts uses for its SessionStart output — on every run, re-entry included, and a
-// context event carrying that delivery id clears it (see the header's DELIVERY).
+// Registration entry point. The gate is prompt-scoped first, then session-scoped: no hook process
+// starts and no Stop check runs until explicitAudhdRequest accepts a direct user prompt.
 export default function iHaveAudhdOmp(pi: PiLike): void {
+  let active = false;
   let pending: { content: string; delivery: string } | undefined;
-  const cross = async (source: StartSource, ctx: Ctx): Promise<void> => {
+  const cross = async (source: StartSource, ctx: Ctx): Promise<boolean> => {
     const content = await sessionStartHandler(source, ctx);
     pending = content ? { content, delivery: randomUUID() } : undefined;
+    return Boolean(content);
   };
-  pi.on("session_start", (_event, ctx) => cross(startSource(ctx), ctx));
-  // A new session is a clear; resume and fork carry an existing conversation forward.
-  pi.on("session_switch", (event, ctx) => cross(event?.reason === "new" ? "clear" : "resume", ctx));
-  pi.on("session_compact", (_event, ctx) => cross("compact", ctx));
-  pi.on("before_agent_start", () => {
-    if (!pending) return undefined;
+
+  pi.on("session_start", () => {
+    active = false;
+    pending = undefined;
+  });
+  pi.on("session_switch", (event) => {
+    if (event?.reason === "new") {
+      active = false;
+      pending = undefined;
+    }
+  });
+  pi.on("session_compact", (_event, ctx) => (active ? cross("compact", ctx) : undefined));
+  pi.on("before_agent_start", async (event, ctx) => {
+    if (!active && explicitAudhdRequest(event?.prompt)) {
+      active = await cross(startSource(ctx), ctx);
+    }
+    if (!active || !pending) return undefined;
     const { content, delivery } = pending;
     return { message: { customType: CONTEXT_MESSAGE_TYPE, content, display: false, details: { delivery } } };
   });
-  // Observes only: returns nothing, so the messages OMP sends are never rewritten.
   pi.on("context", (event) => {
     const messages = event?.messages;
     if (!pending || !Array.isArray(messages)) return undefined;
@@ -459,9 +475,6 @@ export default function iHaveAudhdOmp(pi: PiLike): void {
     if (carried) pending = undefined;
     return undefined;
   });
-  // A warning goes to the agent's next turn the way the receipts audit sends its flags:
-  // sendMessage with deliverAs "nextTurn" and no triggerTurn queues it for the next prompt and
-  // starts no turn. The person sees the one-line summary as a UI notice when a UI is attached.
   const deliver =
     typeof pi.sendMessage === "function"
       ? (warning: Warning, ctx: Ctx): void => {
@@ -472,5 +485,5 @@ export default function iHaveAudhdOmp(pi: PiLike): void {
           if (ctx.hasUI && warning.summary) ctx.ui?.notify?.(warning.summary, "warning");
         }
       : undefined;
-  pi.on("session_stop", (event, ctx) => sessionStopHandler(event, ctx, { deliver }));
+  pi.on("session_stop", (event, ctx) => (active ? sessionStopHandler(event, ctx, { deliver }) : undefined));
 }

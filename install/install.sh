@@ -450,18 +450,23 @@ RENDERED="$(bun -e '
 	if (missing.length || extra.length) fail(`skills.includeSkills differs from the manifest skill rows; missing from config: [${missing}] not in manifest: [${extra}]`);
 	for (const r of rows) {
 		const path = `${repo}/${r.dir}/SKILL.md`;
-		const head = (await Bun.file(path).text()).match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+		const markdown = await Bun.file(path).text();
+		const head = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
 		let fm;
 		try { fm = head ? Bun.YAML.parse(head[1]) : null; } catch (e) { fail(`${path}: frontmatter is not YAML: ${e.message}`); }
 		if (!fm || typeof fm !== "object" || typeof fm.description !== "string" || !fm.description.trim()) fail(`${path}: frontmatter has no description (omp://skills.md requires one)`);
 		if (fm.name !== undefined && fm.name !== r.name) fail(`${path}: frontmatter name ${JSON.stringify(fm.name)} differs from its directory ${r.name}`);
+		const body = head ? markdown.slice(head[0].length).trim() : "";
+		if (!body.includes("Read [instructions.md](instructions.md) before applying this skill.")) fail(`${path}: entrypoint is not the short instructions.md gate`);
+		const instructions = `${repo}/${r.dir}/instructions.md`;
+		if (!(await Bun.file(instructions).exists())) fail(`${path}: gate target is missing at ${instructions}`);
 	}
 	process.stdout.write(text.endsWith("\n") ? text : text + "\n");
 ' "$REPO/$CONFIG_ROW" "$REPO" $skill_names)"
 status=$?
 set -e
 [ "$status" -eq 0 ] || fail "profile render refused" 2
-step "profile ok: includeSkills matches the $(printf '%s' "$skill_names" | grep -c .) skill rows; every skill has a description"
+step "profile ok: includeSkills matches the $(printf '%s' "$skill_names" | grep -c .) skill rows; every skill has a short gate and instructions.md"
 
 # The tracing switch survives a re-install (wl-mv65t5d34lts00 PLAN.md § 8.1): the installed profile's
 # observability.phoenix, as written, replaces the template's in the render, so `as2 phoenix off` stays off and

@@ -3,7 +3,7 @@
 How to write to someone who is ADHD and autistic: the rules, the research behind each one,
 and a Stop hook that warns when a message buries what the reader needs.
 
-The skill (`skills/i-have-audhd/SKILL.md`) carries eleven rules. The two halves of AuDHD
+The short gate is `skills/i-have-audhd/SKILL.md`; its eleven rules are in `skills/i-have-audhd/instructions.md`. The two halves of AuDHD
 pull opposite ways — ADHD wants short and new, autism wants complete and exact — and the
 rules resolve that by ordering, never by cutting content: what the reader must know goes
 first, what they must choose goes last, and every reference survives without scrolling. The
@@ -11,10 +11,9 @@ reasons and sources per rule are in `skills/i-have-audhd/references/`.
 
 The plugin delivers the rules in two ways:
 
-- **At session start**, a hook injects the skill's first-turn core (the message skeleton, the
-  options rule, reference survival, commands, and three machinery anchors) plus every rule
-  heading, so the model has the shape before its first message and knows the full skill
-  exists.
+- **After an explicit OMP request**, the adapter injects the first-turn core (the message skeleton,
+  options, references, commands, machinery anchors, and every rule heading). A bare mention or
+  unrelated prompt injects nothing. Claude Code retains the plugin's SessionStart behavior.
 - **At every stop**, a hook checks the finished message against nine checks. A warn finding
   reaches the agent with its next turn (and you, as a one-line notice), and is logged to
   `warnings.log`. Every check warns by default; nothing blocks until you arm it.
@@ -128,24 +127,17 @@ while any harness or OMP profile still has the plugin installed.
    failure leaves one such line (`omp/i-have-audhd-omp.ts`, the fail-open contract comment);
    a count that grows each turn means the adapter is installed but failing.
 
-## What happens at session start
+## What happens when the rules load
 
-`hooks/i-have-audhd-inject.mjs` returns `hookSpecificOutput.additionalContext`: one line
-saying the person in the session installed these rules, the span of `SKILL.md` between
-`<!-- inject:start -->` and `<!-- inject:end -->`, and any reader traits from your profile.
-Editing the skill is editing what sessions receive; there is one copy of the text.
+`hooks/i-have-audhd-inject.mjs` returns `hookSpecificOutput.additionalContext`: one activation line,
+the span of `instructions.md` between the inject markers, and any local reader traits.
 
-On Claude Code this runs on every SessionStart source. On OMP the adapter runs it on the
-main session's start, on a session switch, and after a compaction, and attaches the context to
-the next prompt as a hidden message. It stays attached until a model request has carried it,
-so OMP re-running its prompt preparation does not lose it, and later prompts do not repeat
-it (when a prompt is aborted before any model request, the next prompt carries it again).
-Subagent sessions get no injection on OMP.
+Claude Code runs this on every SessionStart source. OMP runs it only after an explicit AuDHD request,
+then again after active compaction. OMP attaches the context to the next prompt as a hidden message;
+subagents get no injection. A new OMP session clears activation.
 
-When the session's source is `resume` or `compact`, the injector also writes a one-shot
-marker that arms the restate-the-resumed-thread check for the Stop hook. On OMP both hooks
-key that marker on the session manager's id, so it survives OMP rotating the provider
-session id under a fresh-session or context reset.
+When the active source is `resume` or `compact`, the injector writes a one-shot marker for the
+restate-the-resumed-thread check. Both OMP hooks key it on the session manager id.
 
 It fails open and says so: every path exits 0, and each failure emits one short line instead
 of nothing. To turn the injection off without uninstalling: `I_HAVE_AUDHD_INJECT=off`.
