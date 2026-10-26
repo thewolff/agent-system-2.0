@@ -319,9 +319,11 @@ describe("surface extension adapter", () => {
 			`approve ${e1}`,
 			`deny ${e2}`,
 			`approve ${e3}`,
-			`Jo: "revise" — answers ${q}: Which?`,
+			"revise",
 		]);
 		expect(ledger.question(q)!.state).toBe("answered");
+		const answer = ledger.instructions(wl).find((i) => i.kind === "answer" && i.question_id === q)!;
+		expect(ledger.question(q)!.resolved_by).toBe(answer.id);
 		ledger.close();
 	});
 
