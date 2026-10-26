@@ -305,10 +305,13 @@ describe("surface extension adapter", () => {
 		expect(ledger.instructions(wl)).toHaveLength(2);
 		expect(ledger.question(q)!.state).toBe("open");
 		ledger.close();
-		// prose that starts with a number is not a batch and passes through untouched
-		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: "2 things to fix", systemPrompt: [] }, ctx);
-		expect(notices).toEqual([]);
+		// Prose beginning with a number remains Jo's exact input, not a command batch.
+		await submitTyped(f, { prompt: "2 things to fix", systemPrompt: [] }, ctx);
+		ledger = open(e);
+		expect(ledger.instructions(STANDING_WORKLOAD_ID).map((i) => i.body)).toEqual(["2 things to fix"]);
+		expect(ledger.question(q)!.state).toBe("open");
+		expect(ledger.instructions(wl).map((i) => i.kind)).toEqual(["instruction", "instruction"]);
+		ledger.close();
 		// the numbers answer them: the question's answer goes through the launch trigger, the echo stays one line per answer
 		await submitTyped(f, { prompt: "3 approve, 4 revise", systemPrompt: [] }, ctx);
 		expect(notices).toEqual([expect.stringContaining(`#3 → approved reserved request ${e3}`), expect.stringContaining(`#4 → answered ${q} with "revise"`)]);
@@ -372,10 +375,13 @@ describe("surface extension adapter", () => {
 		expect(ledger.workload(wl)!.stakes).toBe("production");
 		expect(ceilingOf(ledger, wl)).toEqual({ usd: 120, wallMin: 720 });
 		ledger.close();
-		// a multi-line brief with no command line passes through untouched
-		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: "new workload, normal stakes:\nmove the header offset into a token\nthen drop the old class", systemPrompt: [] }, ctx);
-		expect(notices).toEqual([]);
+		// A typed multi-line brief remains exact Jo prose and does not alter command state.
+		await submitTyped(f, { prompt: "new workload, normal stakes:\nmove the header offset into a token\nthen drop the old class", systemPrompt: [] }, ctx);
+		ledger = open(e);
+		expect(ledger.instructions(STANDING_WORKLOAD_ID).map((i) => i.body)).toEqual(["new workload, normal stakes:\nmove the header offset into a token\nthen drop the old class"]);
+		expect(ledger.workload(wl)!.stakes).toBe("production");
+		expect(ledger.instructions(wl).map((i) => i.kind)).toEqual(["instruction", "instruction", "instruction", "instruction"]);
+		ledger.close();
 	});
 
 	test("a paste's command naming an id that does not resolve, or a row answered twice, applies nothing and launches nothing; two-word prose stays prose (Codex review of PR #30)", async () => {
@@ -434,12 +440,16 @@ describe("surface extension adapter", () => {
 		await submitTyped(f, { prompt: "1 left\n1 right", systemPrompt: [] }, ctx);
 		expect(notices).toEqual(['line 1 "1 left": #1 appears more than once in this batch', 'line 2 "1 right": #1 appears more than once in this batch', "nothing applied: fix line 1 and paste all of it again"]);
 		unchanged();
-		// Probe B `prose-only`: an ordinary paragraph is prose, stakes words and mode words alike; nothing is applied and nothing is handed on
-		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: "The build is\nproduction ready", systemPrompt: [] }, ctx);
-		await f.emit("before_agent_start", { prompt: "Go on\nautonomous now", systemPrompt: [] }, ctx);
-		expect(notices).toEqual([]);
-		expect(f.entries.filter((x) => x.type === "surface-input")).toHaveLength(8);
+		// Ordinary paragraphs containing command words are recorded as Jo's exact prose, not commands.
+		await submitTyped(f, { prompt: "The build is\nproduction ready", systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: "Go on\nautonomous now", systemPrompt: [] }, ctx);
+		ledger = open(e);
+		expect(ledger.instructions(STANDING_WORKLOAD_ID).map((i) => i.body)).toEqual(["The build is\nproduction ready", "Go on\nautonomous now"]);
+		expect(ledger.question(q)!.state).toBe("open");
+		expect(ledger.workload(wl)).toMatchObject({ stakes: "normal", mode: "autonomous" });
+		expect(ledger.instructions(wl)).toEqual([]);
+		ledger.close();
+		expect(f.execs.calls).toEqual([]);
 		unchanged();
 		// Probe B `answer-with-prose`: the answer lands and launches once; the prose is handed on, not recorded by the surface
 		notices.length = 0;
@@ -534,10 +544,15 @@ describe("surface extension adapter", () => {
 			`review-stop: ${b} by ${ledger.instructions(b)[1]!.id}`,
 		]);
 		ledger.close();
-		// four words is prose, not the command
-		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `rounds 5 ${b} please`, systemPrompt: [] }, ctx);
-		expect(notices).toEqual([]);
+		// Four words are exact prose, not the three-word command.
+		await submitTyped(f, { prompt: `rounds 5 ${b} please`, systemPrompt: [] }, ctx);
+		ledger = open(e);
+		expect(ledger.instructions(STANDING_WORKLOAD_ID).map((i) => i.body)).toEqual([`rounds 5 ${b} please`]);
+		expect(ledger.instructions(a).map((i) => i.body)).toEqual(["stakes: production"]);
+		expect(ledger.instructions(b).map((i) => i.body)).toEqual(["rounds: 5", `stop-reviews: ${b}`]);
+		expect(ledger.workload(a)!.stakes).toBe("production");
+		expect(ledger.workload(b)!.stakes).toBe("normal");
+		ledger.close();
 	});
 
 	test("identity, open (stakes inferred, decision log carried), schedule, close (decision log rendered)", async () => {
