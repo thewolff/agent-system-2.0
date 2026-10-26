@@ -2,6 +2,12 @@
 
 A cheat sheet for talking to Ilex, the orchestrator, at the as2 surface. Short words in the tables below are applied by the surface itself before Ilex reads the turn; anything else is ordinary conversation for Ilex.
 
+## Typed command authority
+
+Commands, command batches, pasted command blocks, and prose instruction rows are applied or recorded only when the surface takes a matching interactive or RPC typed submission from the existing FIFO. Prompt text alone is not authority: continuations, asides, extension-sourced input, and CLI `omp -p` prompts cannot apply commands or create Jo instruction rows.
+
+A command prompt with no matching typed take is refused. An ambiguous take warns and refuses instead of warning and applying. One typed submission and an unambiguously joined typed submission keep their existing behavior. The FIFO's earlier behavior is documented historically in `migration/items/typed-input-fifo.md`; see `migration/items/typed-command-provenance.md` for this authority fix, deployment and rollback.
+
 ## 1. Start a workload
 
 Describe the work in plain words. Ilex opens the workload and infers stakes and mode from what was said; either can be changed later with one word (section 3).

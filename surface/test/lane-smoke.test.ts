@@ -20,7 +20,7 @@ import orchestratorSurface from "../index";
 import { recordRepo } from "../src/decision-log";
 import { branchName, doneBody, laneExit, laneStarted, worktreePath } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
-import { ctxOf, drainSettled, fakePi, fakeRecords, git, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, notices, setScript, settleDrains, sh, timers, until } from "./helpers";
+import { ctxOf, drainSettled, fakePi, fakeRecords, git, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, notices, setScript, settleDrains, sh, submitTyped, timers, until } from "./helpers";
 
 const roots: LaneRoot[] = [];
 // A root is removed only after settleDrains is done with it: every runner's drain (MIGRATION.md item 71) and every
@@ -106,7 +106,7 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 			],
 		});
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: "yes", systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: "yes", systemPrompt: [] }, ctx);
 		const lane2 = laneIdOf(wl, 2);
 		expect(notices[0]).toContain(`answered ${q.id} with "yes"`);
 		expect(notices[0]).toMatch(new RegExp(`${wl}: lane ${lane2} runner \\d+`));

@@ -19,7 +19,7 @@ import { raiseOrchestratorQuestion } from "../src/orchestrator-question";
 import type { withPlanPaths as WithPlanPaths } from "../src/plan-paths";
 import { surfaceSession } from "../src/session";
 import { SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, loadTestText, notices, type Sent, timeouts, timers, tmp, workloadWithSlice } from "./helpers";
+import { ctxOf, fakePi, loadTestText, notices, type Sent, submitTyped, timeouts, timers, tmp, workloadWithSlice } from "./helpers";
 
 const PLAN_PATH = "surface-plan-path";
 const APPLIED = "## Applied from the surface since your last turn";
@@ -95,7 +95,7 @@ async function start(e: Record<string, string>, o: { exec?: boolean } = {}) {
 		n: (rowId: string) => s.numbering.numberOf(rowId)!,
 		/** The messages sent as one customType. */
 		of: (customType: string) => f.sent.filter((x) => x.message.customType === customType),
-		jo: async (prompt: string) => (await f.emit("before_agent_start", { prompt, systemPrompt: [] }, ctx)) as Turn,
+		jo: async (prompt: string) => (await submitTyped(f, { prompt, systemPrompt: [] }, ctx)) as Turn,
 		ledgerTool: async () => (await f.tool("orchestrator_ledger").execute("1", {}, undefined, undefined, ctx)).content[0]!.text,
 		turn,
 		fireFrom,
@@ -175,7 +175,7 @@ describe("the orchestrator's own message (D3)", () => {
 		const x = await start(e);
 		expect(x.wake).toContain(linked);
 		x.s.notices.push(`Applied ${P}`);
-		const applied = (await x.jo("next")).messages.map((m) => m.content).join("\n");
+		const applied = ((await x.f.emit("before_agent_start", { prompt: "next", systemPrompt: [] }, x.ctx)) as Turn).messages.map((m) => m.content).join("\n");
 		expect(applied).toContain(`${APPLIED}\n- Applied ${linked}`);
 		await x.idleTurn([assistant(`Review ${q}.`)]);
 		expect(x.of(PLAN_PATH).at(-1)!.message.content).toBe(`plan for ${q}: ${linked}`);
