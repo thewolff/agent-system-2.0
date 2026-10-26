@@ -314,9 +314,13 @@ describe("surface extension adapter", () => {
 		ledger.close();
 		// the numbers answer them: the question's answer goes through the launch trigger, the echo stays one line per answer
 		await submitTyped(f, { prompt: "3 approve, 4 revise", systemPrompt: [] }, ctx);
-		expect(notices).toEqual([expect.stringContaining(`#3 → approved reserved request ${e3}`), expect.stringContaining(`#4 → answered ${q} with "revise"`)]);
 		ledger = open(e);
-		expect(ledger.instructions(wl).map((i) => i.kind)).toEqual(["instruction", "instruction", "instruction", "answer"]);
+		expect(ledger.instructions(wl).map((i) => i.body)).toEqual([
+			`approve ${e1}`,
+			`deny ${e2}`,
+			`approve ${e3}`,
+			`Jo: "revise" — answers ${q}: Which?`,
+		]);
 		expect(ledger.question(q)!.state).toBe("answered");
 		ledger.close();
 	});

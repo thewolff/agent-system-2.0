@@ -400,10 +400,12 @@ describe("escalation phase 2 through orchestrator_raise_question (PLAN wl-mvg1vs
 		expect(standing.filter((e) => e.body.startsWith("question-about: ")).map((e) => e.body).sort()).toEqual([questionSubjectBody(qa, a), questionSubjectBody(qb, b)].sort());
 		expect(standing.filter((e) => e.body.startsWith("now: ")).map((e) => [e.body, e.created_by])).toEqual([[`now: ${qa} guard`, ESCALATION_BY]]);
 		expect(s.f.entries.filter((e) => e.type === "surface-question").map((e) => e.data)).toEqual([{ id: qa, about: a }, { id: qb, about: b }]);
-		await s.say(`keep ${qa}`);
-		await s.say(`stop ${qb}`);
+		await s.submit(`keep ${qa}`);
+		await s.submit(`stop ${qb}`);
 		expect(ledger.instructions(a).map((i) => i.body)).toEqual([`Jo: "keep" — answers ${qa}: Keep the lane running?`]);
 		expect(ledger.instructions(b).map((i) => i.body)).toEqual([`Jo: "stop" — answers ${qb}: Keep the lane running?`]);
+		expect(ledger.question(qa)!.state).toBe("answered");
+		expect(ledger.question(qb)!.state).toBe("answered");
 	});
 
 	test("fix round 1 (F2): a repeat of a question an earlier reply published says it is in front of Jo and asks for no new QUESTION block, with and without now; the reply that follows passes row 15", async () => {
