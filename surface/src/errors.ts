@@ -56,6 +56,9 @@
 // is an over-cap one, and the standing workload whose newest `scratch-disk:` / `scratch-disk-ok:` by the daily sweep
 // (surface/scripts/scratch-sweep.ts) is a `scratch-disk:`. Advisory: nothing is refused for size; keyed by the entry,
 // so delivered once per crossing, and gone when the clearing entry is written.
+// Flow (PLAN wl-mv654hoqwpfhmo § 3a): the standing workload's `flow-signals:` line for the current Pacific date (the noon
+// line the invariant timer or the fallback job writes, surface/src/flow.ts), one line keyed by its entry, so delivered once a
+// day and gone at the next Pacific midnight.
 // Train-aware routing (PLAN wl-mv8s8srodefytc rev 17.1 D9 F16): on a workload that owns a train task (surface/src/merge-train.ts
 // `trainTaskWindows`), the first lane death inside a task's window (from the `train-task:` to its settle, or still open) and an
 // intended exit inside one are not shown: the task counts them (D8) and the train tick relaunches the owner (`trainRouted`). The
@@ -93,11 +96,12 @@ import { answerable } from "./numbering";
 import { pairOfferLine, pairTakenLine, pairTakenQuestion, shownOptions } from "./pair-suggest";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { parseSecurityRed, parseTestRunFailed, SECURITY_RED_PREFIX, SECURITY_TEST_PATHS, testRuns } from "./test-run";
+import { pacificDate } from "./flow";
 import { NOTICE_PREFIX } from "./notice";
 import { isPaired, parseCeilingNotice } from "./ceiling";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
 
-export type ErrorKind = "reserved" | "held" | "artifact" | "security-red" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "train" | "pair" | "notice" | "proposal" | "channel-refused";
+export type ErrorKind = "reserved" | "held" | "artifact" | "security-red" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "train" | "pair" | "flow" | "notice" | "proposal" | "channel-refused";
 
 /**
  * The open one of a pair of scratch control entries (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): the newest of `control`
@@ -435,7 +439,7 @@ function securityRedLines(ledger: Ledger): ErrorLine[] {
 	});
 }
 
-/** Every line owed right now, in § B3 order (1–3), the security-red lines, the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the train notices, the due rows, then the scratch lines, then the notices, then the channel refusals; each channel proposal directly after its target. */
+/** Every line owed right now, in § B3 order (1–3), the security-red lines, the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the train notices, the due rows, then the scratch lines, then today's flow-signals line, then the notices, then the channel refusals; each channel proposal directly after its target. */
 export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger.inFlight(), opts: ErrorOptions = {}): ErrorLine[] {
 	const now = opts.now ?? ledger.now();
 	const holdHours = opts.holdHours ?? HOLD_HOURS;
@@ -449,6 +453,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 	const questions: ErrorLine[] = [];
 	const due: ErrorLine[] = [];
 	const scratch: ErrorLine[] = [];
+	const flow: ErrorLine[] = [];
 	const notice: ErrorLine[] = [];
 	const train: ErrorLine[] = [];
 	const taskWindows = trainTaskWindows(ledger);
@@ -547,8 +552,12 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			due.push({ kind: "due", workloadId: wl, rowId: wl, line: `scheduled and past due (${scheduled.due}): ${short(scheduled.text, 120)} — close ${wl} with a receipt when done` });
 		}
 		if (wl === STANDING_WORKLOAD_ID) {
-			const disk = openScratchEntry(controlEntries(ledger.entries(wl, "assumption")), "scratch-disk", "scratch-disk-ok");
+			const control = controlEntries(ledger.entries(wl, "assumption"));
+			const disk = openScratchEntry(control, "scratch-disk", "scratch-disk-ok");
 			if (disk) scratch.push({ kind: "scratch", workloadId: wl, rowId: disk.id, line: `scratch disk: ${disk.rest} — the daily sweep clears this line once the total is back under` });
+			const today = pacificDate(now);
+			const signals = control.findLast((c) => c.prefix === "flow-signals" && c.rest.startsWith(`${today} `));
+			if (signals) flow.push({ kind: "flow", workloadId: wl, rowId: signals.id, line: `flow signals (ROOT-CAUSE § 5) for ${signals.rest}` });
 			for (const ep of protectionEpisodes(ledger).values()) {
 				if (ep.raised) train.push({ kind: "train", workloadId: wl, rowId: ep.raised.id, line: `merge train: main's protection on ${ep.repo} is unverified: ${short(ep.text, 160)} — its normal PRs wait (no merge, no question) until it verifies; the line clears itself then` });
 			}
@@ -576,7 +585,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			notice.push({ kind: "notice", workloadId: wl, rowId: m.id, messageIds: [m.id], line: `notice on ${label} (nothing to answer): ${text}` });
 		}
 	}
-	const all = [...reserved, ...held, ...artifact, ...securityRed, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch, ...notice];
+	const all = [...reserved, ...held, ...artifact, ...securityRed, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch, ...flow, ...notice];
 	const channel = channelInForce(ledger);
 	if (!channel) return all;
 	const proposals = channelProposals(ledger, channel);

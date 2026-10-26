@@ -1158,6 +1158,8 @@ surface/scripts/invariants.ts	module	-
 surface/test/invariants.test.ts	test	-
 surface/test/fixtures/invariants/build.ts	test	-
 surface/test/fixtures/invariants/ledger.db	test	-
+surface/src/invariant-watch.ts	module	-
+surface/test/invariant-timer.test.ts	test	-
 surface/src/facts.ts	module	-
 surface/test/facts.test.ts	test	-
 surface/src/orchestrator-question.ts	module	-
@@ -1380,3 +1382,9 @@ plugins/test/paired-coding.test.ts	test	-
 # 2026-10-19): the canonical write/edit/bash view the rows and observers read, and its tests.
 gates/src/pair-call.ts	module	-
 gates/test/paired-coding.test.ts	test	-
+# Flow signals (PLAN wl-mv654hoqwpfhmo § 3a, migration/items/flow-signals.md): ROOT-CAUSE § 5's five signals, the noon
+# flow-signals: line the invariant timer writes, and its fallback job (install.sh --flow-signals).
+surface/src/flow.ts	module	-
+surface/scripts/flow-signals.ts	module	-
+surface/test/flow-signals.test.ts	test	-
+install/com.agent-system-2.flow-signals.plist	install	-

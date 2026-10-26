@@ -197,7 +197,7 @@ describe("between wakes: a line written by another connection after the wake rea
 		// busy: the poll cannot push the pending wake (an idle one would; surface/test/wake-push.test.ts), and pushes nothing else while it is pending
 		const ctx = ctxOf({ idle: false });
 		await f.emit("session_start", { type: "session_start" }, ctx);
-		expect(timers).toHaveLength(1);
+		expect(timers).toHaveLength(2); // the poll, then the invariant timer (MIGRATION.md item 104)
 		expect(timers[0]!.ms).toBe(1234);
 		const poll = timers[0]!.fn;
 		// wake pending on a busy session: the poll stays quiet (the wake carries everything)

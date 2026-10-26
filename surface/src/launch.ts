@@ -40,9 +40,17 @@ export const STOP_POLL_MS = 5_000;
 /** The holder a `lane_handoff` transfers to (§ B5). */
 export const JO_HOLDER = "jo";
 
-export function laneCap(env: Record<string, string | undefined>): number {
+/** The lane cap and where it came from: `env` when AGENT_SYSTEM_MAX_LANES holds a cap it accepts, else `default` (the noon flow-signals line records the source). */
+function laneCapOf(env: Record<string, string | undefined>): { cap: number; source: "env" | "default" } {
 	const n = Number(env[LANE_CAP_ENV]);
-	return Number.isInteger(n) && n > 0 ? n : DEFAULT_LANE_CAP;
+	return Number.isInteger(n) && n > 0 ? { cap: n, source: "env" } : { cap: DEFAULT_LANE_CAP, source: "default" };
+}
+export function laneCap(env: Record<string, string | undefined>): number {
+	return laneCapOf(env).cap;
+}
+/** Where `laneCap(env)` came from (see laneCapOf). */
+export function laneCapSource(env: Record<string, string | undefined>): "env" | "default" {
+	return laneCapOf(env).source;
 }
 /** The advisory size cap of a workload's scratch root, in MiB (PLAN wl-mv5oikd5jtquww § 1.5): `AGENT_SYSTEM_SCRATCH_CAP_MB`, else the default. */
 export function scratchCapMb(env: Record<string, string | undefined>): number {
@@ -88,7 +96,7 @@ export const CONTROL_PREFIXES = [
 	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-notice", "train-autoboard",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
-	"now", "ruling-conflict",
+	"now", "ruling-conflict", "flow-signals",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -99,6 +107,11 @@ const LANE_SCOPED: Record<string, true> = {
 };
 /** The daily scratch sweep's `created_by` (surface/scripts/scratch-sweep.ts). */
 export const SCRATCH_SWEEP_BY = "scratch-sweep";
+/**
+ * The noon `flow-signals:` line's `created_by` (PLAN wl-mv654hoqwpfhmo § 3a, surface/src/flow.ts): the orchestrator's invariant
+ * timer (surface/extensions/wake.ts) and the fallback job (surface/scripts/flow-signals.ts) both write as this one writer.
+ */
+export const FLOW_SIGNALS_BY = "flow-signals";
 /**
  * Fixed writers per prefix (§ 5). `lane-stop`, `plan` and `done-because` are refined in `validWriter`. The
  * starter writes `lane-started:` / `lane-exit:` for the interactive lane it runs in Jo's terminal
@@ -173,6 +186,8 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * Jev ranking's rows (PLAN wl-mv8k039gvogt8g D3, surface/src/rank.ts): `priority-signal:` / `priority-signal-failed:` (on the
  * ranked workload) and `rank-shown:` (on the standing workload) are the ranking machinery's (RANK_BY), whichever session ranked;
  * `rank-goals:`, `rank-override:`, `rank-unpin:` (Jo's words, bound to an input) and `rank-audit:` (the wake tick) are the surface's.
+ * `flow-signals: <Pacific date> …` (PLAN wl-mv654hoqwpfhmo § 3a) is FLOW_SIGNALS_BY's alone, on the standing workload: the noon line
+ * the invariant timer or the fallback job writes, once per date (surface/src/flow.ts writeFlowSignals).
  * The escalation lines (PLAN wl-mvg1vs0rhnu3gg § 1.0, § 1.9; gates/src/rulings.ts `askJo`) are ESCALATION_BY's alone, written on the
  * question's workload and slice in the raise's transaction: `now: <q-…> <category>` marks a question Jo hears at once (or upgrades a
  * reused open one), and `ruling-conflict: <q-…> <ruling id> <ruling id>…` records the active rulings that disagreed on it, so it was raised.
@@ -231,6 +246,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"rank-override": [SURFACE_BY],
 	"rank-unpin": [SURFACE_BY],
 	"rank-audit": [SURFACE_BY],
+	"flow-signals": [FLOW_SIGNALS_BY],
 	now: [ESCALATION_BY],
 	"ruling-conflict": [ESCALATION_BY],
 };

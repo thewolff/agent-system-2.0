@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  agent-system 2.0: the fallback writer of the noon flow-signals line (PLAN wl-mv654hoqwpfhmo § 3a), as a launchd
+  user agent. TEMPLATE: install/install.sh with its flow-signals flag fills the upper-case placeholder values
+  (XML-escaped), writes the result to $HOME/Library/LaunchAgents/com.agent-system-2.flow-signals.plist and loads
+  it with launchctl bootstrap; the flag's =off form boots it out and deletes that file. Without the flag install.sh
+  never writes it. (An XML comment cannot hold a double hyphen, so the flags are not spelled out here;
+  install/install.sh's header has them.) launchd runs surface/scripts/flow-signals.ts every 1800 s: an interval,
+  not a calendar time, so no machine zone is involved; the script computes 12:30 America/Los_Angeles itself and
+  writes the line only past it on a date with none (the orchestrator's timer writes it first when it is up).
+  The ledger variable names the ledger install wrote. No AGENT_SYSTEM_MAX_LANES here: the script copies the cap
+  from the orchestrator's newest line. PATH holds only the system directories: the script runs no tools.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.agent-system-2.flow-signals</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@BUN@</string>
+		<string>@REPO@/surface/scripts/flow-signals.ts</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>AGENT_SYSTEM_LEDGER_DB</key>
+		<string>@LEDGER_DB@</string>
+		<key>HOME</key>
+		<string>@HOME@</string>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>@REPO@</string>
+	<key>StartInterval</key>
+	<integer>1800</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>@HOME@/agent-scratch/agent-system-2.0/flow-signals/launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/agent-scratch/agent-system-2.0/flow-signals/launchd.log</string>
+</dict>
+</plist>

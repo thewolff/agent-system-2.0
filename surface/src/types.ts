@@ -142,6 +142,13 @@ export const STANDING_SLICE_TASK = "orchestrator questions to Jo: the standing s
 
 /** Body prefix of the identity entry (kind `assumption`): `identity: <name> (<pronouns>)`. */
 export const IDENTITY_PREFIX = "identity:";
+/**
+ * Body prefix of the `assumption` entry the surface writes on the standing workload for each
+ * invariant finding (or persistent skip) it surfaced to Jo: `invariant-surfaced: <key>`. Read back
+ * (created_by SURFACE_BY only) as the set of keys already told, so a restart does not re-announce
+ * them (surface/src/invariant-watch.ts; MIGRATION.md item 104).
+ */
+export const INVARIANT_SURFACED_PREFIX = "invariant-surfaced:";
 /** Brief prefix of a scheduled row (M11): `due:<ISO date> <what to do>`; a workload of its own. */
 export const DUE_PREFIX = "due:";
 /** Body prefix of a lane→orchestrator message reporting a failed runtime artifact (§ B3 item 3). */
@@ -198,6 +205,9 @@ export const BATCH_MS = 300_000;
 /** A Jo turn this long after his previous typed input carries the complete pending list once (ms); default QUIET_MS. */
 export const QUIET_MS_ENV = "AGENT_SYSTEM_SURFACE_QUIET_MS";
 export const QUIET_MS = 1_800_000;
+/** How often the surface runs the invariant report (surface/scripts/invariants.ts check) in-process (ms); default INVARIANT_MS (MIGRATION.md item 104). */
+export const INVARIANT_MS_ENV = "AGENT_SYSTEM_SURFACE_INVARIANT_MS";
+export const INVARIANT_MS = 10 * 60_000;
 /** How many times an unconfirmed wake or notice batch is sent before it falls back to Jo's next turn. */
 export const PUSH_TRIES = 3;
 
