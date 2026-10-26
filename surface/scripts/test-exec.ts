@@ -3,10 +3,13 @@
 // `bun build --target=bun` bundle beside the wrapper; a test runs this file directly.
 //
 //   exec prepare <run id> <sha>        clone <stage>/<run id>/repo.bundle into runs/<run id>/repo, detached at <sha>
-//   exec full    <run id>              bun test, junit to runs/<run id>/full.xml, console to full.log, under the full cap
+//   exec full    <run id>              bun test, junit to runs/<run id>/full.xml, console to full.log, under the full cap;
+//                                      with `--parallel=<n>` when caps.json carries `fullWorkers` over 1 (profile/config.yml
+//                                      `testRunner.fullWorkers`; no key runs serially)
 //   exec solo    <run id> ./<file>     bun test ./<file> alone, to solo-<i>.xml/.log, under the solo cap
 //   exec base-prepare <run id> <sha>   the same bundle cloned into runs/<run id>/base/repo at base's <sha> (PLAN wl-mv8s8srodefytc D8)
-//   exec base-full <run id>            `full` in the base clone, to base-full.xml/.log
+//   exec base-full <run id>            `full` in the base clone, to base-full.xml/.log; always serial, whatever fullWorkers says,
+//                                      so the base cache holds only serial results
 //   exec base-solo <run id> ./<file>   `solo` in the base clone, to base-solo-<i>.xml/.log
 //   exec sweep   <run id>              SIGTERM, then SIGKILL, to the run's processes, holding locks/sweep.db
 //   exec cleanup <run id> <old run id> delete runs/<old run id>
@@ -16,6 +19,10 @@
 // only the subcommand and its operands. Every subcommand is fenced: it refuses unless
 // <root>/stage/current names its run. Exit codes are test-run.ts WRAPPER_EXIT; `full`, `solo` and their base forms
 // otherwise pass bun's own exit through (128 + the signal number when bun died by a signal).
+//
+// Parallel files (workload wl-mvg2kzuvwngdmo): the worker count rides in caps.json, never in argv, so `full <run id>`
+// keeps its operand count and the installed wrapper needs no change. The runner logs `full workers <n>` before the PR
+// full part; surface/scripts/test-run-waits.ts reads it back per run. The reversal is `fullWorkers: 1` in the profile.
 import { Database } from "bun:sqlite";
 import { spawn, spawnSync } from "node:child_process";
 import {
@@ -224,7 +231,8 @@ function prepare(cfg: Config, a: Areas, runId: string, sha: string, side: Side):
 
 // ---- full and solo ---------------------------------------------------------------------------------
 
-function capMs(a: Areas, runId: string, key: "fullCapMin" | "soloCapMin"): number {
+/** `<stage>/<run id>/caps.json`, written by the runner in its trusted phase before any part. */
+function caps(a: Areas, runId: string): { path: string; v: Record<string, unknown> } {
 	const path = join(a.stage, runId, "caps.json");
 	let v: unknown;
 	try {
@@ -232,9 +240,23 @@ function capMs(a: Areas, runId: string, key: "fullCapMin" | "soloCapMin"): numbe
 	} catch {
 		return refuse(`${path} is missing or not json (the runner writes the caps before a part)`);
 	}
-	const n = v && typeof v === "object" && key in v ? (v as Record<string, unknown>)[key] : undefined;
+	return { path, v: v !== null && typeof v === "object" ? (v as Record<string, unknown>) : {} };
+}
+
+function capMs(a: Areas, runId: string, key: "fullCapMin" | "soloCapMin"): number {
+	const { path, v } = caps(a, runId);
+	const n = v[key];
 	if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return refuse(`${path} has no positive ${key}`);
 	return Math.round(n * 60_000);
+}
+
+/** The PR full part's workers: caps.json `fullWorkers`, 1 (serial) when the key is absent; anything but an integer of 1 or more is refused. */
+function fullWorkers(a: Areas, runId: string): number {
+	const { path, v } = caps(a, runId);
+	const n = v.fullWorkers;
+	if (n === undefined) return 1;
+	if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 1) return refuse(`${path} has a fullWorkers that is not an integer of 1 or more`);
+	return n;
 }
 
 /** Remove a stale report so a part that writes none is read as missing, never as an earlier one. */
@@ -276,11 +298,13 @@ async function full(cfg: Config, a: Areas, runId: string, side: Side): Promise<n
 	const work = workDir(a, runId);
 	const dir = sideDir(a, runId, side);
 	const cap = capMs(a, runId, "fullCapMin");
+	// Only the PR side runs in parallel: base reruns stay serial, so the base cache only ever holds serial results.
+	const workers = side === "pr" ? fullWorkers(a, runId) : 1;
 	const xml = join(work, `${REPORT_PREFIX[side]}full.xml`);
 	const log = join(work, `${REPORT_PREFIX[side]}full.log`);
 	unlinkIfPresent(xml);
 	unlinkIfPresent(log);
-	return part(cfg, work, dir, ["test", "--reporter=junit", `--reporter-outfile=${xml}`], log, cap);
+	return part(cfg, work, dir, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, ...(workers > 1 ? [`--parallel=${workers}`] : [])], log, cap);
 }
 
 async function solo(cfg: Config, a: Areas, runId: string, file: string, side: Side): Promise<number> {

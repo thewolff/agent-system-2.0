@@ -13,7 +13,8 @@
 //       ` bound-by <instruction id>` when only Jo's binding admitted the PR, exit 0. A refusal is one
 //       stderr line `test-runner start: <reason>` and exit 2; a failure the same, exit 3; usage exit 1.
 //   run <run id>
-//       the detached run: heartbeat at once, the runs.db lock (queued while another run holds it), `current` published
+//       the detached run: heartbeat at once, the runs.db lock (queued while another run holds it; queued runs take it oldest
+//       request first, by their `test-requested:` entry's time in runs.db's `queue` table, skipping dead waiters), `current` published
 //       in the acquiring transaction, the install check (a drifted bundle is refreshed once through `sudo -n
 //       <libexec>/refresh`), sweep, probe, retention, the trusted clone and bundle, then every untrusted step through
 //       `sudo -n -u _as2test <exec> …`, a sweep after each part, then each failing part rerun on base when every part reported
@@ -23,6 +24,11 @@
 //       that sha for any PR (green and red-main success, red failure, error error; stale and superseded post none; PLAN
 //       wl-mv8s8srodefytc rev 17.1 D2, D8), and the lock released. No `pending` is posted: a missing status already blocks a
 //       protected merge. A failed status post is logged and never changes the verdict.
+//
+//       Parallel files (workload wl-mvg2kzuvwngdmo): the trusted phase writes the profile's `testRunner.fullWorkers` into
+//       caps.json beside the caps, and the run logs `<ts> full workers <n>` right before the PR full part; test-exec runs that
+//       part with `bun test --parallel=<n>` when n is over 1. Base reruns (`base-full`) stay serial whatever n is.
+//       surface/scripts/test-run-waits.ts reads the waits, the `full workers` lines and the results back per day.
 //
 // Stamps: everything is written as `test-runner` (TEST_RUNNER_BY).
 //
@@ -36,7 +42,7 @@
 //                                           install the preflight checks instead of the real one (`installSpec`)
 //   AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS   the heartbeat period (default 15 s)
 //   AGENT_SYSTEM_TEST_RUNNER_POLL_MS        the lock wait's poll (default 2 s)
-//   AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS    post-sweep async deadline (default 150 s; SQLite retries add a finite grace)
+//   AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS    shared post-sweep head/result/publication deadline (default 150 s)
 //   AGENT_SYSTEM_TEST_RUNNER_BUSY_MS        runs.db busy_timeout (default 5 s)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS    the refresh helper's cap (default REFRESH_CAP_S plus a minute, 15 min)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS  its SIGTERM-to-SIGKILL grace (default 10 s)
@@ -64,8 +70,8 @@ import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
 	AS2TEST_ROOT, AS2TEST_USER, baseParts, boundBranches, buildTestRun, changedTestFiles, decideRun, fullSuiteSlice, HEARTBEAT_EVERY_MS,
 	heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
-	type PrView, pruneRuns, queuedTooLong, reportCapBytes, reservation, resultJson, RUN_ID_RE, type RunFacts, runDirOf, runnerDiedRun, runsDbOf, runsRoot,
-	servedRepo, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict,
+	type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, reportCapBytes, reservation, resultJson, RUN_ID_RE, type RunFacts, runDirOf, runnerDiedRun, type RunRecord,
+	runsDbOf, runsRoot, securityRedBody, securityRedOf, servedRepo, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict,
 	type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
 import { ORCHESTRATOR_RECIPIENT } from "../src/types";
@@ -234,7 +240,10 @@ export interface LockRow {
 	heartbeatAt: number;
 }
 
-/** `<root>/runs.db` with its one-row lock table; busy_timeout first. */
+/**
+ * `<root>/runs.db` with its one-row lock table and the `queue` table of the runs waiting for it (each waiter's request
+ * `created_at` in ms, `requestedAt`: the order they take the lock in); busy_timeout first.
+ */
 export function openLockDb(root: string, busyMs: number = msEnv("AGENT_SYSTEM_TEST_RUNNER_BUSY_MS", 5_000)): Database {
 	// Under test, a runs root or a runs.db (a symlink included) inside a live ledger root is refused before anything is created there.
 	assertNotLiveLedgerUnderTest(root);
@@ -245,6 +254,7 @@ export function openLockDb(root: string, busyMs: number = msEnv("AGENT_SYSTEM_TE
 	busyLoop(() => db.exec(
 		"CREATE TABLE IF NOT EXISTS lock (id INTEGER PRIMARY KEY CHECK (id = 1), runId TEXT NOT NULL, pid INTEGER NOT NULL, pgid INTEGER NOT NULL, runDir TEXT NOT NULL, heartbeatAt INTEGER NOT NULL)",
 	));
+	busyLoop(() => db.exec("CREATE TABLE IF NOT EXISTS queue (runId TEXT PRIMARY KEY, workloadId TEXT NOT NULL, requestedAt INTEGER NOT NULL)"));
 	return db;
 }
 
@@ -591,6 +601,8 @@ class Runner {
 	private url = "";
 	/** The served repo's `owner/repo` (`servedOf`), every status post's target; empty until the run resolves it. */
 	private ownerRepo = "";
+	/** The run's place in the lock queue: its `test-requested:` entry's created_at in ms, read once at start. */
+	readonly requestedAt: number;
 	private readonly f: RunFacts & { base: string | null; mergeBase: string | null; preflight: string | null };
 
 	constructor(readonly ledger: Ledger, readonly wl: string, readonly request: TestRequested, readonly config: TestRunnerConfig) {
@@ -598,6 +610,9 @@ class Runner {
 		this.stageRoot = join(this.as2root, "stage");
 		this.stage = stageDirOf(request.runId, this.as2root);
 		this.workDir = workDirOf(request.runId, this.as2root);
+		const rec = testRuns(ledger.entries(wl)).find((r) => r.request.runId === request.runId);
+		if (!rec) throw new Fail(`no test-requested: record for ${request.runId} on ${wl}`, START_EXIT.failed);
+		this.requestedAt = Date.parse(rec.request.createdAt);
 		this.lockDb = openLockDb(this.root);
 		this.capBytes = reportCapBytes(config);
 		this.f = {
@@ -642,37 +657,80 @@ class Runner {
 		}
 	}
 
-	/** Wait for the lock (queued), take it clean or from a stale holder, and publish `current` in that same transaction. */
+	/**
+	 * Wait for the lock (queued, oldest request first), take it clean or from a stale holder, and publish `current` in that same
+	 * transaction. Every attempt is one BEGIN IMMEDIATE transaction: register in `queue` (a no-op once registered; a row pruned
+	 * while this run was suspended comes back with the same requestedAt), prune the dead waiters ahead and find the first live
+	 * one, then the holder check; a live holder or a live waiter ahead keeps the run queued. Taking the lock removes the run's row.
+	 */
 	async acquire(): Promise<void> {
 		const waitStart = Date.now();
 		const pollMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_POLL_MS", 2_000);
 		mkdirSync(this.stageRoot, { recursive: true });
-		for (;;) {
-			let took: { displaced: string | null } | null = null;
-			try {
-				took = this.lockDb.transaction(() => {
-					const row = lockRow(this.lockDb);
-					if (row && row.runId !== this.id && !lockHolderStale(row.heartbeatAt, Date.now())) return null;
-					this.lockDb.query("INSERT OR REPLACE INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, ?, ?, ?, ?, ?)")
-						.run(this.id, process.pid, process.pid, this.runDir, Date.now());
-					writeCurrent(this.stageRoot, this.id);
-					hookSync(this.id, "acquire-tx");
-					return { displaced: row && row.runId !== this.id ? row.runId : null };
-				}).immediate();
-			} catch (e) {
-				if (!isBusy(e)) throw e;
-				hookMark(this.id, "acquire-busy");
+		try {
+			for (;;) {
+				let took: { displaced: string | null } | null = null;
+				try {
+					took = this.lockDb.transaction(() => {
+						this.lockDb.query("INSERT OR IGNORE INTO queue (runId, workloadId, requestedAt) VALUES (?, ?, ?)").run(this.id, this.wl, this.requestedAt);
+						const blocker = this.queueBlocker();
+						const row = lockRow(this.lockDb);
+						if (row && row.runId !== this.id && !lockHolderStale(row.heartbeatAt, Date.now())) return null;
+						if (blocker !== null) return null;
+						this.lockDb.query("INSERT OR REPLACE INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, ?, ?, ?, ?, ?)")
+							.run(this.id, process.pid, process.pid, this.runDir, Date.now());
+						this.lockDb.query("DELETE FROM queue WHERE runId = ?").run(this.id);
+						writeCurrent(this.stageRoot, this.id);
+						hookSync(this.id, "acquire-tx");
+						return { displaced: row && row.runId !== this.id ? row.runId : null };
+					}).immediate();
+				} catch (e) {
+					if (!isBusy(e)) throw e;
+					hookMark(this.id, "acquire-busy");
+				}
+				if (took) {
+					this.held = true;
+					hookMark(this.id, "acquired", took);
+					this.log(took.displaced ? `took the lock from the stale holder ${took.displaced}` : "took the lock");
+					this.beat();
+					return;
+				}
+				if (queuedTooLong(waitStart, Date.now(), this.config)) throw new Stop("queued too long");
+				hookMark(this.id, "queued");
+				await Bun.sleep(pollMs);
 			}
-			if (took) {
-				this.held = true;
-				hookMark(this.id, "acquired", took);
-				this.log(took.displaced ? `took the lock from the stale holder ${took.displaced}` : "took the lock");
-				this.beat();
-				return;
-			}
-			if (queuedTooLong(waitStart, Date.now(), this.config)) throw new Stop("queued too long");
-			hookMark(this.id, "queued");
-			await Bun.sleep(pollMs);
+		} catch (e) {
+			this.leaveQueue();
+			throw e;
+		}
+	}
+
+	/**
+	 * Inside the acquiring transaction, after this run registered: the first live waiter ahead of it in (requestedAt, run id)
+	 * order, or null. Each waiter ahead is judged on its ledger record and heartbeat file (`queueWaiterLive`, one entries read
+	 * per workload); the dead ones before the first live one are deleted.
+	 */
+	private queueBlocker(): string | null {
+		const rows = this.lockDb.query<QueueRow, []>("SELECT runId, workloadId, requestedAt FROM queue ORDER BY requestedAt, runId").all();
+		const records = new Map<string, RunRecord[]>();
+		const now = Date.now();
+		const { blocker, dead } = queueAhead(rows, this.id, (q) => {
+			let recs = records.get(q.workloadId);
+			if (!recs) records.set(q.workloadId, (recs = testRuns(this.ledger.entries(q.workloadId))));
+			return queueWaiterLive(recs.find((r) => r.request.runId === q.runId), heartbeatOf(this.root, q.runId), now);
+		});
+		const prune = this.lockDb.query("DELETE FROM queue WHERE runId = ?");
+		for (const runId of dead) prune.run(runId);
+		if (dead.length > 0) this.log(`pruned the dead waiters ${dead.join(", ")} from the lock queue`);
+		return blocker;
+	}
+
+	/** Leave the lock queue (best effort): when acquire ends without the lock, and at the end of the run. */
+	private leaveQueue(): void {
+		try {
+			busyLoop(() => this.lockDb.query("DELETE FROM queue WHERE runId = ?").run(this.id));
+		} catch (e) {
+			this.log(`the lock queue row was not removed: ${errText(e)}`);
 		}
 	}
 
@@ -945,7 +1003,7 @@ class Runner {
 		await git([...NO_HOOKS, "bundle", "create", "-q", bundle, "--all"], "git bundle create");
 		chmodSync(bundle, 0o640);
 		const caps = join(this.stage, "caps.json");
-		writeFileSync(caps, `${JSON.stringify({ fullCapMin: this.config.fullCapMin, soloCapMin: this.config.soloCapMin })}\n`, { mode: 0o640 });
+		writeFileSync(caps, `${JSON.stringify({ fullCapMin: this.config.fullCapMin, soloCapMin: this.config.soloCapMin, fullWorkers: this.config.fullWorkers })}\n`, { mode: 0o640 });
 		chmodSync(caps, 0o640);
 		chmodSync(this.stage, 0o750);
 		this.log(`trusted phase: ${q.sha} on base ${this.f.base}, merge-base ${this.f.mergeBase}; changed test files: ${changed.join(" ") || "none"}`);
@@ -1069,6 +1127,7 @@ class Runner {
 		const changed = await this.trusted();
 		if (changed === null) return;
 		await this.prepare();
+		this.log(`full workers ${this.config.fullWorkers}`);
 		this.f.full = await this.part({ sub: "full" });
 		await this.sweep("full");
 		for (const file of changed) {
@@ -1086,12 +1145,15 @@ class Runner {
 	 * The result (§ 2.3 steps 6–8): with the runs.db row held in a BEGIN IMMEDIATE transaction (so no
 	 * takeover lands in between), one ledger transaction checks ownership and the slice's state,
 	 * decides, writes `test-run:`, settles (completes the slice) when the decision says so and, for a
-	 * run that is not green on a workload no lane holds, writes the `test-run-failed:` message. The
+	 * run that is not green on a workload no lane holds, writes the `test-run-failed:` message, and for a run with a failing
+	 * security test, whoever holds the workload, the `security-red:` message. The
 	 * settle commits with the check it rests on: no successor request, pause or cancel lands between
 	 * them, and a slice that is not open is never touched. Then `result.json`.
 	 */
 	finish(): TestRun {
-		const write = (lockMine: boolean) => this.ledger.write(() => {
+		// Acquire BEGIN outside ledger.write's retry policy: once held, recordEntry/completeSlice
+		// use nested savepoints. Only the publication loop below retries either database.
+		const write = (lockMine: boolean) => this.ledger.db.transaction(() => {
 			const owner = lockMine && !this.superseded && ownsRequest(testRuns(this.ledger.entries(this.wl)), this.id);
 			const facts: RunFacts = { ...this.f, owner, sliceState: this.ledger.slice(this.request.slice)?.state ?? null };
 			const decided = decideRun(facts);
@@ -1117,11 +1179,31 @@ class Runner {
 			if (failed) {
 				this.ledger.enqueue({ by: TEST_RUNNER_BY, workloadId: this.wl, sliceId: this.request.slice, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: testRunFailedBody(failed) });
 			}
+			// PLAN wl-mvg1vs0rhnu3gg § 3.3: a failing security test reaches Jo whatever holds the workload, so this ignores heldLive.
+			const security = securityRedOf(this.wl, this.request.slice, run);
+			if (security) {
+				this.ledger.enqueue({ by: TEST_RUNNER_BY, workloadId: this.wl, sliceId: this.request.slice, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: securityRedBody(security) });
+			}
 			return { run, settled };
-		});
-		const { run, settled } = this.held
-			? busyLoop(() => this.lockDb.transaction(() => write(lockRow(this.lockDb)?.runId === this.id)).immediate())
-			: write(true);
+		}).immediate();
+		let published: { run: TestRun; settled: { ok: true } | { ok: false; reason: string } | null };
+		for (;;) {
+			try {
+				// Even an expired head/result guard gets one nonblocking attempt to record its error.
+				published = this.held
+					? this.lockDb.transaction(() => write(lockRow(this.lockDb)?.runId === this.id)).immediate()
+					: write(true);
+				break;
+			} catch (e) {
+				if (!isBusy(e)) throw e;
+				hookMark(this.id, "publication-busy");
+				const remaining = this.postSweepDeadline - Date.now();
+				if (remaining <= 0) throw new Stop("post-sweep deadline exceeded during publication");
+				Bun.sleepSync(Math.min(50, remaining));
+				if (Date.now() >= this.postSweepDeadline) throw new Stop("post-sweep deadline exceeded during publication");
+			}
+		}
+		const { run, settled } = published;
 		this.log(`test-run ${run.verdict}${run.reason ? `: ${run.reason}` : ""}`);
 		if (settled?.ok) this.log(`settled ${this.request.slice}`);
 		else if (settled) this.log(`the settle of ${this.request.slice} was refused: ${settled.reason}`);
@@ -1163,10 +1245,10 @@ class Runner {
 				this.f.error = errText(e);
 				this.log(`stopped: ${this.f.error}`);
 			}
-			// Bound synchronous SQLite waits too; JS timers cannot interrupt them. The retry
-			// counts are finite (runs: 12; ledger: 6), including the finally's release.
-			this.lockDb.exec("PRAGMA busy_timeout = 100");
-			this.ledger.db.exec("PRAGMA busy_timeout = 100");
+			// Synchronous SQLite waits cannot be interrupted by JS timers. Publication retries
+			// nonblocking BEGINs against the shared deadline, not nested fixed retry budgets.
+			this.lockDb.exec("PRAGMA busy_timeout = 0");
+			this.ledger.db.exec("PRAGMA busy_timeout = 0");
 			let run: TestRun;
 			try {
 				run = this.finish();
@@ -1192,12 +1274,14 @@ class Runner {
 			// releasing it proves nothing about that helper. Refreshes are serialised by the helper's own lockf lock
 			// on refresh.d/lock, which the next run's refresh waits on (exit 69, lock, while the old helper holds it).
 			if (this.held) {
+				this.lockDb.exec("PRAGMA busy_timeout = 100");
 				try {
 					busyLoop(() => this.lockDb.query("DELETE FROM lock WHERE runId = ?").run(this.id));
 				} catch (e) {
 					this.log(`the lock was not released: ${errText(e)}`);
 				}
 			}
+			this.leaveQueue();
 			this.lockDb.close();
 		}
 	}

@@ -9,7 +9,9 @@
 //    on its workload whose body is exactly `approve <id>` / `deny <id>` — Jo's word at the surface
 //    (surface-input.ts; a clarification that merely mentions the id is not a decision, Codex S1) —
 //    no `reserved-withdrawn:` by a holder, its raising lane still holds the workload, and no later
-//    request repeats it (MIGRATION.md item 31). A repeat names the earliest call it repeats.
+//    request repeats it (MIGRATION.md item 31). A repeat names the earliest call it repeats. One whose
+//    action is a NOW_RESERVED rule (gates/src/rows/r06-reserved.ts `nowReserved`, PLAN wl-mvg1vs0rhnu3gg
+//    § 1.2, § 1.3) is tagged `NOW (guard): ` or `NOW (irreversible): ` and has state `now`.
 // 2. held past § A3: the oldest `held` message per open workload that is addressed to a lane (a
 //    message to the orchestrator is consumed by the surface at read, so it is never "held with no
 //    live lane"), older than HOLD_HOURS; or an open workload — sliced or not (§ A3: "the workload
@@ -25,10 +27,10 @@
 //    `prompt-wait:` (a leaked blocking prompt, § B3 item 5 first trigger). A question is cut at 120
 //    characters, except the plan question (`isPlanQuestionIn`, PLAN wl-muq22rnjcfrrpc D8): it shows
 //    whole, its body starting on the line beneath the q- id (the plan path directly beneath the line
-//    naming the question, PLAN wl-mv61a8dh4aeneo D2) and every body line indented two spaces. The
-//    runner's ceiling question takes the state `stopped` once the workload's newest `lane-stop:` is
-//    `accepted ceiling`, written at or after it (PLAN wl-mv5msri070p0qo D3), so the stop at 100 %
-//    reaches the surface again though the question surfaced at 80 %.
+//    naming the question, PLAN wl-mv61a8dh4aeneo D2) and every body line indented two spaces. A question
+//    a valid `now: <q-…> <category>` control entry names (gates/src/rulings.ts `nowMarks`: ESCALATION_BY's
+//    alone, so a look-alike by a lane tags nothing; PLAN wl-mvg1vs0rhnu3gg § 1.0) is tagged
+//    `NOW (<category>): ` and has state `now`, on the orchestrator's own asks too.
 // 6. a lane that ended leaving work idle (MIGRATION.md item 68): an open workload (the standing one
 //    excepted) with open slices, no holder, no open question and no waiting reserved request, whose
 //    newest lane lifecycle entry is a `lane-exit:` with an intended outcome (`isIntendedOutcome`): the
@@ -44,6 +46,10 @@
 // Test run: the newest held `test-run-failed:` the test runner sent about a workload no lane holds
 // under a live lease (MIGRATION.md item 24, PLAN § 2.5), shown once: delivery consumes it, a lane
 // taking the workload hides it, a `test-run:` green written after it clears it.
+// Security red (PLAN wl-mvg1vs0rhnu3gg § 3.3): every held `security-red:` the test runner sent about a workload, one line
+// each in the order written, before the test-run lines. A live lane holder, a train task's routing and a later green hide
+// none of them: a failing security test reaches Jo whatever is fixing it. They are read from the messages table, not from
+// the open workloads, so closing the workload before delivery drops none (fix round 1, F3). Delivery consumes each.
 // Due: an open workload whose brief starts `due:<date> ` with date <= now by instant (Codex S4).
 // Scratch (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): an open workload whose newest valid `scratch-over-cap:` /
 // `scratch-under-cap:` control entry (a holder's: the lane extension's turn-end measure, surface/extensions/lane.ts)
@@ -59,6 +65,12 @@
 // test runner's no-live-lane `test-run-failed:` is not shown only when it is a run of the task's own PR while the task is
 // unsettled, or the red run its settle counted (`trainRoutedRun`); any other failure is shown. Jo hears of the PR only through D9's two alerts. An alert question whose send ladder
 // the tick has taken to level 2 or 3 (`train-alert:`, surface/scripts/train-tick.ts) shows as a LOUD line, a new state each level.
+// Notice (PLAN wl-mvfkv7llkp7nk0 § 2, surface/src/notice.ts): every held orchestrator-bound `notice:` message, one line
+// each, in the order written. Not answerable, so never numbered, and routine for batching (surface/src/batch.ts onFire);
+// a delivery consumes it, after which it no longer shows. A `notice:` written by a lane that holds or held the workload
+// (lane_message refuses the prefix; a lane's message written another way still opens with it) is a lane's own words, not a
+// notice: it shows only as that lane's message. While a live by-hand lane holds the workload (paired, PLAN § 4.1), the
+// runner's ceiling notices on it are not shown; they stay held.
 // Merge trains (PLAN wl-mvbjiettjrfpxc D6, D7, D10): a train workload (`trainMembers`) shows no idle line and no § A3 held line (its
 // Jo-facing outputs are its questions and the notices; a train lane's death still shows). Train lines, on the standing workload,
 // from the train tick's `train-notice:` rows: an open protection episode (keyed by its `raised` row, so delivered once, showing
@@ -74,18 +86,22 @@
 import { type EntryRow, type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import { CHANNEL_REFUSED_SHOWN_HOURS, channelInForce, channelProposals, channelRefusals } from "./channel";
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
-import { isCeilingQuestion, openPairOffer } from "./input";
+import { type NowCategory, nowMarks } from "../../gates/src/rulings";
+import { nowReserved } from "../../gates/src/rows/r06-reserved";
+import { openPairOffer } from "./input";
 import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
 import { mainRedNotices, protectionEpisodes, type TaskWindow, TRAIN_ALERT_LADDER, trainAlertLevel, trainMembers, trainTaskWindows } from "./merge-train";
 import { questionSubject } from "./orchestrator-question";
 import { answerable } from "./numbering";
 import { pairOfferLine, pairTakenLine, pairTakenQuestion, shownOptions } from "./pair-suggest";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
-import { parseTestRunFailed, testRuns } from "./test-run";
+import { parseSecurityRed, parseTestRunFailed, SECURITY_RED_PREFIX, SECURITY_TEST_PATHS, testRuns } from "./test-run";
 import { pacificDate } from "./flow";
+import { NOTICE_PREFIX } from "./notice";
+import { isPaired, parseCeilingNotice } from "./ceiling";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
 
-export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "train" | "pair" | "flow" | "proposal" | "channel-refused";
+export type ErrorKind = "reserved" | "held" | "artifact" | "security-red" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "train" | "pair" | "flow" | "notice" | "proposal" | "channel-refused";
 
 /**
  * The open one of a pair of scratch control entries (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): the newest of `control`
@@ -405,13 +421,32 @@ function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: reado
 	};
 }
 
-/** Every line owed right now, in § B3 order (1–3), the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the train notices, the due rows, then the scratch lines, then today's flow-signals line, then the channel refusals; each channel proposal directly after its target. */
+/**
+ * The § 3.3 lines: each held `security-red:` the test runner sent, in the order written, whatever holds its workload, routes its
+ * runs, or whether the workload is open or closed (fix round 1, F3). A body naming another workload than its message row is ignored.
+ */
+function securityRedLines(ledger: Ledger): ErrorLine[] {
+	const held = ledger.db.query<MessageRow, [string, string, string]>(
+		"SELECT * FROM messages WHERE state = 'held' AND recipient = ?1 AND created_by = ?2 AND instr(body, ?3) = 1 ORDER BY created_at, id",
+	).all(ORCHESTRATOR_RECIPIENT, TEST_RUNNER_BY, SECURITY_RED_PREFIX);
+	return held.flatMap((m) => {
+		const s = parseSecurityRed(m.body);
+		if (!s || s.workloadId !== m.workload_id) return [];
+		return [{
+			kind: "security-red" as const, workloadId: s.workloadId, rowId: m.id, messageIds: [m.id],
+			line: `security tests red on ${s.workloadId}: run ${s.runId} at ${s.sha.slice(0, 7)} (slice ${s.slice}) has ${s.failing} failing under ${SECURITY_TEST_PATHS.join(", ")}, first ${s.first} — a lane asks you before it changes such a test`,
+		}];
+	});
+}
+
+/** Every line owed right now, in § B3 order (1–3), the security-red lines, the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the train notices, the due rows, then the scratch lines, then today's flow-signals line, then the notices, then the channel refusals; each channel proposal directly after its target. */
 export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger.inFlight(), opts: ErrorOptions = {}): ErrorLine[] {
 	const now = opts.now ?? ledger.now();
 	const holdHours = opts.holdHours ?? HOLD_HOURS;
 	const reserved: ErrorLine[] = [];
 	const held: ErrorLine[] = [];
 	const artifact: ErrorLine[] = [];
+	const securityRed = securityRedLines(ledger);
 	const testRun: ErrorLine[] = [];
 	const died: ErrorLine[] = [];
 	const idle: ErrorLine[] = [];
@@ -419,6 +454,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 	const due: ErrorLine[] = [];
 	const scratch: ErrorLine[] = [];
 	const flow: ErrorLine[] = [];
+	const notice: ErrorLine[] = [];
 	const train: ErrorLine[] = [];
 	const taskWindows = trainTaskWindows(ledger);
 	for (const { workload, slices, openQuestions, pendingMessages } of inFlight) {
@@ -432,7 +468,12 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		const requests = reservedStates(ledger, wl);
 		for (const r of requests) {
 			if (r.state.kind !== "waiting") continue;
-			reserved.push({ kind: "reserved", workloadId: wl, rowId: r.id, line: `reserved action waiting on you (${label}): ${short(r.body)}${repeatNote(r, requests)} — \`approve ${r.id}\` or \`deny ${r.id}\`` });
+			// § 1.2, § 1.3: a guard bypass or an irreversible or shared-state rule (gates/src/rows/r06-reserved.ts NOW_RESERVED) is NOW.
+			const hot = nowReserved(r.body);
+			reserved.push({
+				kind: "reserved", workloadId: wl, rowId: r.id, ...(hot ? { state: "now" } : {}),
+				line: `${hot ? `NOW (${hot.category}): ` : ""}reserved action waiting on you (${label}): ${short(r.body)}${repeatNote(r, requests)} — \`approve ${r.id}\` or \`deny ${r.id}\``,
+			});
 		}
 		const oldest = pendingMessages.find((m) => m.state === "held" && m.recipient !== ORCHESTRATOR_RECIPIENT);
 		if (oldest && hoursElapsed(oldest.created_at, now) >= holdHours) {
@@ -464,9 +505,12 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		const taken = wl !== STANDING_WORKLOAD_ID && workload.mode === "user-driven" && !laneLive ? takenPair(ledger.entries(wl, "assumption")) : null;
 		if (taken) idle.push({ kind: "pair", workloadId: wl, rowId: taken.questionId, state: "taken", line: pairTakenLine(wordsOf(ledger, wl), taken.questionId, wl) });
 		let control: ControlEntry[] = [];
+		/** § 1.0: the NOW category of each open question a valid `now:` control entry (ESCALATION_BY's alone) names. */
+		let marks = new Map<string, NowCategory>();
 		if (openQuestions.length > 0) {
 			const entries = ledger.entries(wl);
 			control = controlEntries(entries, holdersOf(entries, workload.holder, ledger.holders(wl)));
+			marks = nowMarks(entries);
 		} else if (!taken && wl !== STANDING_WORKLOAD_ID && workload.open_slices > 0 && !workload.holder && !requests.some((r) => r.state.kind === "waiting")) {
 			// Item 68: no holder, no question, no reserved request — only an intended lane-exit: as the newest
 			// lifecycle entry says the lane ended on purpose and left the work to nobody. A lapsed holder is
@@ -477,28 +521,28 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			if (ended && !trainRouted(windows, ended.createdAt) && !isTrain()) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; ${next}` });
 		}
 		for (const q of openQuestions) {
+			const hot = marks.get(q.id);
+			const nowTag = hot ? `NOW (${hot}): ` : "";
 			if (wl === STANDING_WORKLOAD_ID) {
 				// The orchestrator's own ask to Jo (MIGRATION.md item 105), its subject workload from the surface's subject entry.
 				const about = questionSubject(ledger, q.id);
-				questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `the orchestrator asked you (${q.id}${about ? `, about ${about}` : ""}): ${short(q.body, 120)} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
+				questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(hot ? { state: "now" } : {}), line: `${nowTag}the orchestrator asked you (${q.id}${about ? `, about ${about}` : ""}): ${short(q.body, 120)} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
 				continue;
 			}
 			// D4: a valid pair offer is its own line, right before its question's; the question lists its options less `pair` (D2).
 			const offer = openPairOffer(ledger, q);
 			if (offer) questions.push({ kind: "pair", workloadId: wl, rowId: q.id, state: "offer", line: pairOfferLine(wordsOf(ledger, wl, control), q.id, wl, offer.signals) });
 			const body = isPlanQuestionIn(control, q) ? `\n  ${q.body.split("\n").join("\n  ")}` : ` ${short(q.body, 120)}`;
-			// The stop at 100 % (PLAN wl-mv5msri070p0qo D3): the workload's newest lane-stop: accepted the ceiling at or after the question; a new state, so it is delivered again.
-			const stop = control.filter((c) => c.prefix === "lane-stop").at(-1);
-			const stopped = stop !== undefined && /^accepted ceiling\b/.test(stop.rest) && stop.createdAt >= q.created_at && isCeilingQuestion(q, slices.find((s) => s.id === q.slice_id) ?? ledger.slice(q.slice_id));
 			// D9's re-send: level 2 or 3 of the train tick's ladder makes the line LOUD, each level a new state.
 			const loud = trainAlertLevel(control, q.id);
 			const step = loud >= 2 ? TRAIN_ALERT_LADDER.find((s) => s.level === loud) : undefined;
-			const tag = step ? `LOUD${step.labels.includes("critical") ? ", critical" : ""} (unacknowledged ${step.afterMs / 3_600_000} h): ` : "";
+			const tag = `${nowTag}${step ? `LOUD${step.labels.includes("critical") ? ", critical" : ""} (unacknowledged ${step.afterMs / 3_600_000} h): ` : ""}`;
 			const asker = q.created_by === MERGE_TRAIN_BY ? `merge train ${label} needs you` : `lane on ${label} is waiting on you`;
-			const state = stopped ? "stopped" : step ? `loud-${loud}` : null;
+			// A NOW question is on fire from its first poll (batch.ts onFire), so its state stays `now` whatever the ladder's level.
+			const state = hot ? "now" : step ? `loud-${loud}` : null;
 			questions.push({
 				kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(state ? { state } : {}),
-				line: `${tag}${asker} (${q.id}, slice ${q.slice_id}):${body} — answer with one word: ${shownOptions(q.options).join(" / ")} (or \`withdraw\`)${stopped ? "; the lane stopped at the ceiling" : ""}`,
+				line: `${tag}${asker} (${q.id}, slice ${q.slice_id}):${body} — answer with one word: ${shownOptions(q.options).join(" / ")} (or \`withdraw\`)`,
 			});
 		}
 		for (const w of openPromptWaits(ledger, wl)) {
@@ -528,8 +572,20 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 				: null;
 			if (over) scratch.push({ kind: "scratch", workloadId: wl, rowId: over.id, line: `scratch of ${label} over its cap: ${over.rest} (advisory: nothing is refused; ${over.createdBy} was told)` });
 		}
+		const notes = pendingMessages.filter((m) => m.state === "held" && m.recipient === ORCHESTRATOR_RECIPIENT && m.body.startsWith(NOTICE_PREFIX));
+		// The holders are read only when there is a notice to check.
+		const lanes = notes.length > 0 ? ledger.holders(wl) : [];
+		// PLAN wl-mvfkv7llkp7nk0 § 4.1 (review r5 minor): while a live by-hand lane holds the workload, Jo is paired and gets the
+		// spend in the pane, so a ceiling notice the runner queued before the pairing is not shown. It stays held: it shows
+		// again once no by-hand lane holds the workload live.
+		const paired = notes.some((m) => parseCeilingNotice(m.body) !== null) && isPaired(workload, controlEntries(ledger.entries(wl, "assumption")), now);
+		for (const m of notes) {
+			if (lanes.includes(m.created_by) || (paired && parseCeilingNotice(m.body) !== null)) continue;
+			const text = m.body.slice(NOTICE_PREFIX.length).trim().split("\n").join("\n  ");
+			notice.push({ kind: "notice", workloadId: wl, rowId: m.id, messageIds: [m.id], line: `notice on ${label} (nothing to answer): ${text}` });
+		}
 	}
-	const all = [...reserved, ...held, ...artifact, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch, ...flow];
+	const all = [...reserved, ...held, ...artifact, ...securityRed, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch, ...flow, ...notice];
 	const channel = channelInForce(ledger);
 	if (!channel) return all;
 	const proposals = channelProposals(ledger, channel);

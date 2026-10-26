@@ -102,17 +102,16 @@ Every **QUESTION** block you send Jo is a `questions` row first (MIGRATION.md it
 `orchestrator_raise_question` with the question, its one-word options, and the open workload it
 is about, then name the `q-…` id it returns in the QUESTION block (`**QUESTION**\n(q-…) Should
 …? Options: a / b`). Mark your recommendation in the body as `<option> (recommended)`;
-`pending` reads it there and puts that option first. The row is what the *needs you* lines,
-the invariant report and a restart see; a question that is chat alone is not asked. The
+`pending` reads it there and puts that option first. A question that is chat alone is not asked. The
 machinery (P-11 row 15) binds the block to
 its rows when the reply goes out and again when the turn ends: every id it names must be an open
 row you raised that no earlier reply already asked; a block naming none, an unknown id, a resolved
 row or a row already asked is held like a row 1 refusal, and a row is asked once (raise it again
-for a new ask). It also refuses your next working call (open, close, schedule, launch, and
+for a new ask; an open one asked again gives its id). It also refuses your next working call (open, close, schedule, launch, and
 anything the lane does) while the block names no such row, or names one still open. Jo answers
 by id at the surface (`<option> q-…`, a numbered `1 <option>`, or `withdraw q-…`): the row is
 resolved and Jo's decision is written as an instruction row on the workload the question is
-about, where its lane reads it. When Jo answers in prose instead, the surface has already written
+about, where its lane reads it, not in your chat. When Jo answers in prose instead, the surface has already written
 Jo's words as an input row and told you its id (`Jo's words above are input in-…`): record the
 answer with `orchestrator_record_instruction` naming the `questionId` and that `inputId`, plus
 your one-line reading with the referent restored ("use the drafted README line: <the line>");
@@ -124,8 +123,14 @@ a message the surface gave no input id for has no receipt and records nothing, a
 or instructs by a word at the surface. You judge whether the message is an answer or an
 instruction: a question about your question, or a message about something else, records nothing
 and gets words. A subject workload that is closed when Jo answers refuses the answer and the
-question stays open; the surface says so. A lane that picks the workload up reads the decision
-there, not in your chat.
+question stays open.
+
+Jo's standing rulings precede any question row (SPEC-2.0.md § B3, *Amended 2026-10-19*): when one
+answers your ask, `orchestrator_raise_question` writes no row and returns `decided by Jo's ruling
+<id>: <action>`: do it and send no QUESTION (`flow-repair`: tell Jo `queued, position N`).
+All-model-id options need `subject`. Jo ends one with `end-ruling <id>`. `now` (only for what Jo
+must hear at once) skips rulings and goes on fire. Never relay another workload's open question
+(refused).
 
 ## Messages from other agents
 
@@ -166,10 +171,15 @@ said plus the target repository and branch and whether a reserved target is name
 normal, and shown as an inference, never asked. Either half flips in one word from Jo
 (`throwaway`, `normal`, `production`, `autonomous`, `user-driven`); the flip is a ledgered
 instruction, not a mental note.
-The one-liner ends with the workload's ceiling (`ceiling $50 / 6h`). Lowering it is yours, with
-`orchestrator_lower_ceiling`; raising it is Jo's, by the word `ceiling <usd> [<hours>]` or by
-answering `extend` on the ceiling question. When Jo answers `split`, offer Jo a new workload for
-the remaining work; do not open one unasked.
+The one-liner ends with the workload's ceiling (`ceiling $50 / 6h`). Lowering it is yours
+(`orchestrator_lower_ceiling`); raising it is Jo's (`ceiling <usd> [<hours>] [wl-…]`, or `extend wl-…`
+for one block) and relaunches a lane the ceiling stopped. 80 % sends a notice; 100 % stops an
+autonomous lane with one (SPEC-2.0.md § B11). Nothing auto-extends; a by-hand lane never stops.
+
+A notice (`notice on <workload> (nothing to answer): …`: ceiling 80 % or stop, or a normal plan
+auto-started on a cross-lab pass) is unnumbered and shows until it reaches you once; pass it on,
+never as a question. `halt wl-…` stops an auto-started plan; its PRs wait 4 h after Jo's next
+plain-words message.
 
 ## The five error lines
 
@@ -193,7 +203,7 @@ Exactly five things surface unsolicited (SPEC-2.0.md § B3), one line each, unde
    human prompt a lane's session opened anyway (a tool approval or an `ask`), named with the
    session to answer or end. Jo's one-word answer to a question is the option name; it becomes
    the `answer` row and the slice resumes. `withdraw` withdraws it; the slice is then replanned,
-   not executed. A round-limit or ceiling question that offers pair has its own `pair` line
+   not executed. A round-limit question that offers pair has its own `pair` line
    just above it: `pair offer on <workload> (q-…): <reasons>. Answer pair q-… to stop the lane
    and drive it yourself (as2 lane wl-…).` The question's options do not list `pair`. Jo's
    `pair q-…` settles the question as `stop` does, flips the workload to `user-driven` and asks
@@ -202,8 +212,8 @@ Exactly five things surface unsolicited (SPEC-2.0.md § B3), one line each, unde
 Between wakes these lines reach you batched: the first new line opens a fixed 5-minute window
 (`AGENT_SYSTEM_SURFACE_BATCH_MS`), and at its end the lines still standing arrive as one push
 that wakes an idle session; a turn of Jo's takes them sooner, unless Jo said `brb`. On-fire
-lines go at once: a lane death with work open, the ceiling question or a ceiling stop, and a
-red full-suite run. Each push carries the `open answer lines:` figure. Each line arrives once
+lines go at once: a lane death with work open, a ceiling notice or stop, a red full-suite run,
+`security tests red` and a NOW line. Each push carries the `open answer lines:` figure. Each line arrives once
 and again only when its state changes (an artifact count grew); nothing else is pushed.
 
 Anything else stays inside the lane. You do not summarise lane progress on your own
@@ -236,10 +246,9 @@ goes in your reply on its own line.
 
 ## Workload open and close
 
-A brief you open no longer carries the stopgap "until this runner ships, the full bun test is
-Plumb's", nor any for-Plumb note: the lane runs the full suite on the test runner outside the
-fence (`lane_full_test`, MIGRATION.md item 24). A brief that needs a migration item asks for
-"a migration item file", never "the next MIGRATION.md item".
+A brief you open carries no for-Plumb note: the lane runs the full suite itself
+(`lane_full_test`). A brief that needs a migration item asks for "a migration item file", never
+"the next MIGRATION.md item".
 
 At workload open you read the target repository's history before the first slice brief is
 written: the `.ai/decision-log/` entries newer than the last 2.0 workload on that repository

@@ -21,7 +21,7 @@ import {
 	bundleInputs, CREDENTIAL_PATHS, execArgv, execConfigOf, type InstallVerdict, installDecision, installLayout, parseSource, preflightDecision, preflightProbes,
 	probeCall, probeDecision, readInstall, renderExecWrapper, type SweepScope, UID_SWEEP, WrapperRenderError,
 } from "../src/as2test";
-import { AS2TEST_USER, CHILD_ENV_ALLOWLIST, childEnv, WRAPPER_EXIT, type WrapperCall } from "../src/test-run";
+import { AS2TEST_USER, CHILD_ENV_ALLOWLIST, childEnv, partResult, WRAPPER_EXIT, type WrapperCall } from "../src/test-run";
 import { tmp } from "./helpers";
 
 /**
@@ -169,7 +169,7 @@ const setCurrent = (b: Box, runId: string) => writeFileSync(join(b.root, "stage"
 const workOf = (b: Box, runId: string) => join(b.root, "runs", runId);
 
 /** A fixture repo bundled into `<stage>/<run id>/repo.bundle`, with caps; returns the head sha. */
-function stageRepo(b: Box, runId: string, files: Record<string, string>, caps = { fullCapMin: 1, soloCapMin: 1 }): string {
+function stageRepo(b: Box, runId: string, files: Record<string, string>, caps: Record<string, unknown> = { fullCapMin: 1, soloCapMin: 1 }): string {
 	const src = join(b.root, "..", `src-${runId}`);
 	mkdirSync(src, { recursive: true });
 	git(src, "init", "-q", "-b", "main");
@@ -195,7 +195,7 @@ const ORPHAN_TEST = `import { test } from "bun:test";\ntest("orphan", () => {\n\
 const STUBBORN_TEST = `import { test } from "bun:test";\ntest("stubborn", () => {\n\tBun.spawnSync(["/bin/sh", "-c", "(trap '' TERM; exec /bin/sleep 300) >/dev/null 2>&1 & echo $! > ../orphan.pid"]);\n});\n`;
 
 /** prepare a fresh run: stage the repo, publish current, clone. */
-function prepared(b: Box, runId: string, files: Record<string, string>, caps?: { fullCapMin: number; soloCapMin: number }): string {
+function prepared(b: Box, runId: string, files: Record<string, string>, caps?: Record<string, unknown>): string {
 	const sha = stageRepo(b, runId, files, caps);
 	setCurrent(b, runId);
 	const r = call(b, { sub: "prepare", runId, sha });
@@ -385,6 +385,86 @@ describe("prepare, full and solo", () => {
 		expect(call(b, { sub: "full", runId: "tr-k1" }).exit).toBe(WRAPPER_EXIT.refused);
 		expect(call(b, { sub: "solo", runId: "tr-k1", file: "./a.test.ts" }).exit).toBe(WRAPPER_EXIT.refused);
 	});
+});
+
+// ---- parallel files: caps.json fullWorkers (workload wl-mvg2kzuvwngdmo) -------------------------------------------
+
+/**
+ * A test file that records the pid of the bun process running it as `../pid-<name>`, sleeps `ms`, then passes or fails.
+ * The sleep is real on purpose: the fixture runs in a separate bun process, and the claim under test is wall time across
+ * worker processes, which no fake clock in this process can stand in for.
+ */
+const sleeper = (name: string, ms: number, pass = true) =>
+	`import { expect, test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("sleeps ${name}", async () => {\n\twriteFileSync("../pid-${name}", String(process.pid));\n\tawait Bun.sleep(${ms});\n\texpect(${pass}).toBe(true);\n}, 60_000);\n`;
+/** The distinct bun processes that ran a side's sleeper files: one when serial, one per worker under `--parallel`. */
+const runners = (sideDir: string): Set<number> =>
+	new Set(readdirSync(sideDir).filter((n) => n.startsWith("pid-")).map((n) => Number(readFileSync(join(sideDir, n), "utf8"))));
+
+describe("fullWorkers: the PR full part runs its files at once; base and a keyless caps.json stay serial", () => {
+	test("fullWorkers 4 over four 1.5 s files: wall below the serial sum, and the merged junit reads through partResult to the failing test", () => {
+		const b = box("par");
+		const SLEEP = 1_500;
+		const files = { "s1.test.ts": sleeper("1", SLEEP), "s2.test.ts": sleeper("2", SLEEP), "s3.test.ts": sleeper("3", SLEEP, false), "s4.test.ts": sleeper("4", SLEEP) };
+		prepared(b, "tr-par1", files, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 4 });
+		const t0 = Date.now();
+		const r = call(b, { sub: "full", runId: "tr-par1" });
+		const wall = Date.now() - t0;
+		expect(r.exit).toBe(1);
+		expect(wall).toBeLessThan(4 * SLEEP);
+		const work = workOf(b, "tr-par1");
+		expect(runners(work).size).toBeGreaterThan(1);
+		const result = partResult({ junit: readFileSync(join(work, "full.xml"), "utf8"), log: readFileSync(join(work, "full.log"), "utf8"), exit: r.exit, ms: wall });
+		expect(result).toMatchObject({ pass: 3, fail: 1, skip: 0, exit: 1, error: null });
+		expect(result.failures.map((f) => f.name)).toEqual(["s3.test.ts > sleeps 3"]);
+	}, 60_000);
+
+	test("with fullWorkers 3 the PR full part uses several workers and base-full one; no key, or 1, runs on one; a malformed value is refused", () => {
+		const b = box("ser");
+		const files = { "q1.test.ts": sleeper("1", 300), "q2.test.ts": sleeper("2", 300), "q3.test.ts": sleeper("3", 300) };
+		const sha = prepared(b, "tr-ser1", files, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 3 });
+		const work = workOf(b, "tr-ser1");
+		expect(call(b, { sub: "full", runId: "tr-ser1" }).exit).toBe(0);
+		expect(runners(work).size).toBeGreaterThan(1);
+		expect(call(b, { sub: "base-prepare", runId: "tr-ser1", sha }).exit).toBe(WRAPPER_EXIT.ok);
+		expect(call(b, { sub: "base-full", runId: "tr-ser1" }).exit).toBe(0);
+		expect(runners(join(work, "base")).size).toBe(1);
+		expect(readFileSync(join(work, "base-full.xml"), "utf8")).toContain('name="sleeps 3"');
+
+		for (const [runId, caps] of [["tr-ser2", undefined], ["tr-ser3", { fullCapMin: 1, soloCapMin: 1, fullWorkers: 1 }]] as const) {
+			prepared(b, runId, files, caps);
+			expect(call(b, { sub: "full", runId }).exit).toBe(0);
+			expect({ runId, runners: runners(workOf(b, runId)).size }).toEqual({ runId, runners: 1 });
+		}
+
+		for (const [i, bad] of [0, 2.5, "3", -2, null].entries()) {
+			const runId = `tr-bad${i}`;
+			prepared(b, runId, files, { fullCapMin: 1, soloCapMin: 1, fullWorkers: bad });
+			const r = call(b, { sub: "full", runId });
+			expect({ bad, exit: r.exit }).toEqual({ bad, exit: WRAPPER_EXIT.refused });
+			expect(r.stderr).toContain("fullWorkers");
+		}
+	}, 120_000);
+
+	test("a parallel full part past its cap exits timeout, and after the sweep no worker and no worker's child is alive", async () => {
+		const b = box("parcap");
+		const hang = (name: string) =>
+			`import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("hangs ${name}", async () => {\n\twriteFileSync("../pid-${name}", String(process.pid));\n\tconst c = Bun.spawn(["/bin/sleep", "300"]);\n\twriteFileSync("../child-${name}", String(c.pid));\n\tawait new Promise(() => {});\n}, 600_000);\n`;
+		prepared(b, "tr-pc1", { "h1.test.ts": hang("1"), "h2.test.ts": hang("2"), "h3.test.ts": hang("3") }, { fullCapMin: 0.08, soloCapMin: 0.08, fullWorkers: 3 });
+		const r = call(b, { sub: "full", runId: "tr-pc1" });
+		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
+		expect(r.stderr).toContain("timeout");
+		const work = workOf(b, "tr-pc1");
+		const workers = [...runners(work)];
+		const children = readdirSync(work).filter((n) => n.startsWith("child-")).map((n) => Number(readFileSync(join(work, n), "utf8")));
+		pids.push(...workers, ...children);
+		// Every file had started on its own worker before the cap fired.
+		expect(workers).toHaveLength(3);
+		expect(children).toHaveLength(3);
+		const s = call(b, { sub: "sweep", runId: "tr-pc1" });
+		expect(s.stderr).toBe("");
+		expect(s.exit).toBe(WRAPPER_EXIT.ok);
+		expect(await until(() => [...workers, ...children].every((pid) => !alive(pid)), 3_000)).toBe(true);
+	}, 60_000);
 });
 
 // ---- sweep --------------------------------------------------------------------------------------------------

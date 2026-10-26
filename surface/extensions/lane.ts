@@ -23,7 +23,9 @@
 // - Runtime artifact (§ B3 item 3; SPEC-2.0.md:409-410): the lane declares each slice's artifact
 //   command with the `slice_artifact` tool (an `assumption` entry, `artifact-command: …`); every
 //   bash result whose command is a declared one writes that slice's `artifact-failed:` or
-//   `artifact-passed:` outcome. A refused push is P-11 row 8's own writer, unchanged.
+//   `artifact-passed:` outcome. A refused push is P-11 row 8's own writer, unchanged. A pair_run that
+//   ran is read as its bash equivalent (gates/src/pair-call.ts canonicalResult; PLAN-2
+//   wl-mvb9mw00ycfjeo D5), so a declared artifact run through the pairing tools records the same outcomes.
 // - Artifact tree (wl-muptjioqjtvthc PLAN.md § 1): a declared artifact that exits 0 with the same
 //   working tree (surface/src/wtree.ts) at its tool_call and its tool_result writes `artifact-tree:`.
 //   The declarations of open, paused and done slices count (surface/src/signals.ts
@@ -48,15 +50,22 @@
 //   (surface/src/merge-train.ts `ownerTasks`) is handed over once per session: the lane script builds the open ones into
 //   the first prompt, before_agent_start counts those the prompt names as handed over, and the poll and each tool result
 //   push the rest as an aside. By-hand sessions included: a user-driven owner hears of its task only here.
+// - Paired spend (PLAN wl-mvfkv7llkp7nk0 § 4.1, Jo's ruling in-mvfo7nphl9xn28): a by-hand lane (`launch:` cause
+//   `interactive`) is never metered or stopped at the ceiling. At every turn start it gets its spend against the ceiling
+//   in force as a context message, and at turn start and each final turn end Jo gets one pane line (ctx.ui.notify) per
+//   further 25 % of the original ceiling (surface/src/ceiling.ts pairedSpendStep), past 100 % too. The session-file
+//   offsets live in this session's state, so each measure reads only what OMP wrote since the last one.
 import { spawnSync } from "node:child_process";
 import { lstatSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homeDir, type InstructionRow, type Ledger, type SliceRow } from "../../ledger/src/index";
+import { canonicalCall, canonicalResult } from "../../gates/src/pair-call";
 import { SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { gateSession } from "../../gates/src/session";
+import { effectiveCeiling, isByHandLane, originalCeiling, type PairedState, pairedSpendMessage, pairedSpendStep, scanSpend, type Spend, wallMinutes } from "../src/ceiling";
 import { openScratchEntry } from "../src/errors";
 import { ensureScratchRoot } from "../src/scratch-root";
-import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor, scratchCapMb, trainTaskLines } from "../src/launch";
+import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor, laneDir, scratchCapMb, trainTaskLines } from "../src/launch";
 import { ownerTasks } from "../src/merge-train";
 import {
 	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, laneDeaths, laneDiedShutdownBody,
@@ -95,6 +104,8 @@ interface LaneState {
 	scratchMeasuredAt: number | null;
 	/** The scratch notice the lane gets at the start of its next turn, once. */
 	scratchNotice: string | null;
+	/** The paired spend meter: null until the first measure reads the lane's `launch:` entry, false for a lane not started by hand. */
+	paired: { offsets: Map<string, number>; tally: Spend; pane: PairedState } | false | null;
 }
 const STORE = Symbol.for("agent-system-2.0/surface/lane-state");
 type Store = WeakMap<object, LaneState>;
@@ -106,7 +117,7 @@ function laneState(ctx: Ctx): LaneState {
 		st = {
 			waits: new Map(), renewing: false, released: false, timer: null, delivered: new Set(), primed: false, pollTimer: null, trees: new Map(), testRuns: new Set(), deadRuns: new Set(),
 			trainTasks: new Set(),
-			scratchMeasuredAt: null, scratchNotice: null,
+			scratchMeasuredAt: null, scratchNotice: null, paired: null,
 		};
 		store.set(ctx.sessionManager, st);
 	}
@@ -126,6 +137,8 @@ const ASIDE_FAILURES = 10;
 const DEAD_RUNNER_MS = STARTUP_LEASE_MS;
 /** The customType of the scratch-cap notice a lane gets at the start of its next turn. */
 const SCRATCH_TYPE = "lane-scratch";
+/** The customType of a by-hand lane's turn-start spend message (PLAN wl-mvfkv7llkp7nk0 § 4.1). */
+const SPEND_TYPE = "lane-spend";
 /** A lane measures its scratch root at most this often (PLAN wl-mv5oikd5jtquww § 1.5). */
 export const SCRATCH_MEASURE_MS = 5 * 60_000;
 /** The bound on one `du -sk`; past it du is killed and nothing is written. */
@@ -471,12 +484,59 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 		}
 	};
 
+	/**
+	 * One paired measure (PLAN wl-mvfkv7llkp7nk0 § 4.1) of a bound, unreleased by-hand lane: the workload's spend (every
+	 * session file under its lane dir, read from this session's offsets, and the lane run time, as the runner's meter counts
+	 * them), Jo's pane lines for the further 25 % marks of the original ceiling, and the turn-start message against the
+	 * ceiling in force, returned. Null for any other lane, which the first measure caches.
+	 */
+	const measurePaired = (ctx: Ctx, what: string): string | null => {
+		const s = gateSession(ctx, env);
+		const st = laneState(ctx);
+		if (!s.bound || st.released || st.paired === false) return null;
+		try {
+			const ledger = s.ledger();
+			const w = ledger.workload(s.workloadId!);
+			if (!w) return null;
+			const entries = ledger.entries(w.id);
+			const control = controlEntries(entries, holdersOf(entries, w.holder));
+			if (st.paired === null) {
+				if (!isByHandLane(control, s.laneId)) {
+					st.paired = false;
+					return null;
+				}
+				st.paired = { offsets: new Map(), tally: { usd: 0, tokens: 0, wallMin: 0 }, pane: { shown: null } };
+			}
+			const m = st.paired;
+			m.tally = scanSpend(join(laneDir(w.id, homeDir(env)), "sessions"), m.offsets, m.tally);
+			// The run in progress is this lane's since its first lane-started:, until its lane-exit: is written (wallMinutes).
+			const started = control.find((c) => c.prefix === "lane-started" && c.laneId === s.laneId);
+			const running = started !== undefined && !control.some((c) => c.prefix === "lane-exit" && c.laneId === s.laneId);
+			const spend: Spend = { ...m.tally, wallMin: wallMinutes(control, Date.parse(ledger.now()), running ? Date.parse(started.createdAt) : null) };
+			const instructions = ledger.instructions(w.id);
+			const step = pairedSpendStep(m.pane, w.id, spend, originalCeiling(control, instructions, w.stakes));
+			m.pane = step.state;
+			for (const line of step.lines) ctx.ui.notify(line, "info");
+			return pairedSpendMessage(spend, effectiveCeiling(control, instructions, w.stakes));
+		} catch (err) {
+			ctx.ui.notify(`${what}: the paired spend could not be read: ${String(err)}`, "warning");
+			return null;
+		}
+	};
+
 	pi.on("agent_end", (event, ctx) => {
 		if (!event.willContinue) {
 			claim(ctx, "turn end");
 			measureScratch(ctx);
+			measurePaired(ctx, "turn end");
 		}
 		return undefined;
+	});
+
+	// A by-hand lane's spend at every turn start (§ 4.1 (a)), for the lane: Jo's figure is the pane line.
+	pi.on("before_agent_start", (_event, ctx) => {
+		const content = measurePaired(ctx, "agent start");
+		return content === null ? undefined : { message: { customType: SPEND_TYPE, content, display: false } };
 	});
 
 	// The scratch-cap notice, once, at the start of the lane's next turn.
@@ -564,7 +624,8 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 
 	// The tree a declared artifact runs on, taken before it runs. Surface loads before the gates, so the
 	// command here is still the model's; originalInput also covers a fence that ran first.
-	pi.on("tool_call", (event, ctx) => {
+	pi.on("tool_call", (typed, ctx) => {
+		const event = canonicalCall(typed, ctx.cwd);
 		if (event.toolName !== "bash" || !event.toolCallId) return undefined;
 		const s = laneSide(ctx);
 		if (!s) return undefined;
@@ -581,8 +642,9 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 		return undefined;
 	});
 
-	pi.on("tool_result", (event, ctx) => {
+	pi.on("tool_result", (result, ctx) => {
 		pushAsides(ctx, "tool result");
+		const event = canonicalResult(result, ctx.cwd);
 		if (event.toolName !== "bash") return undefined;
 		const st = laneState(ctx);
 		const before = event.toolCallId ? st.trees.get(event.toolCallId) : undefined;

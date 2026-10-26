@@ -8,22 +8,23 @@
 //       `config` is the parsed installed profile config; its `pairSuggest` key is `off` | `all` | a list of workload
 //       ids. Missing or malformed reads as off (D2).
 //   mechanicalEligibility(ledger: Ledger, workloadId: string, at: string): { eligible: boolean; signals: string[] }
-//       Ungated, no jev, no switch: A (from the workload's review rounds), B (with D2's +1), C only with another, over
-//       the rows written at or before `at` (D8).
-//   pairOffer(ledger: Ledger, workloadId: string, site: "round-limit" | "ceiling", ctx: { config: unknown; count?: RoundCount }):
-//       { signals: string[] } | null
-//       Gated by the switch, throwaway stakes and the autonomous mode; A from `ctx.count` at the round-limit site only;
-//       E / D1 from classifier-stamped `pair-signal:` entries at 0.70; D5's caps over `pair-offer:` entries. The offer
-//       carries no text since PLAN wl-mvb9mw00ycfjeo D1: the surface renders it from the `pair-offer:` entry.
+//       Ungated, no jev, no switch: A (from the workload's review rounds) and B (with D2's +1), over the rows written at
+//       or before `at` (D8).
+//   pairOffer(ledger: Ledger, workloadId: string, ctx: { config: unknown; count?: RoundCount }): { signals: string[] } | null
+//       The round-limit raise's offer (the one raise site since PLAN wl-mvfkv7llkp7nk0 § 4). Gated by the switch,
+//       throwaway stakes and the autonomous mode; A from `ctx.count` only; E / D1 from classifier-stamped `pair-signal:`
+//       entries at 0.70; D5's caps over classifier-stamped `pair-offer:` entries. The offer carries no text since PLAN
+//       wl-mvb9mw00ycfjeo D1: the surface renders it from the `pair-offer:` entry.
 //   pairSuggestHealth(ledger: Ledger, laneId: string): number
-//       D8's `post-signal-failed-rounds`: failed review rounds plus ceiling `extend` answers on the lane's workload
-//       between its `lane-started:` and `lane-exit:`, after the lane's first mechanical eligibility moment; 0 with none.
-// Signal ids are lower-case `a`, `b`, `c`, `d1`, `d2`, `e`, compared sorted.
+//       D8's `post-signal-failed-rounds`: failed review rounds plus Jo's one-block raises (`extend <wl>`, a `ceiling:`
+//       entry with source `extend one block`) on the lane's workload between its `lane-started:` and `lane-exit:`, after
+//       the lane's first mechanical eligibility moment; 0 with none.
+// Signal ids are lower-case `a`, `b`, `d1`, `d2`, `e`, compared sorted.
 import { describe, expect, test } from "bun:test";
 import { countRounds, type FindingsOrUnknown, type ReviewVerdict, reviewRoundBody, ROUND_LIMIT_OPTIONS } from "../../classifier/src/rounds";
 import { CLASSIFIER_BY, LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
 import { report } from "../scripts/pair-suggest";
-import { CEILING_OPTIONS } from "../src/ceiling";
+import { apply, interpret } from "../src/input";
 import { laneExitBody, laneStartedBody, PLAN_OPTIONS, planFirstBody, planQuestionBody } from "../src/launch";
 import { mechanicalEligibility, pairLaneExposure, pairOffer, pairSuggestHealth, pairSuggestOn } from "../src/pair-suggest";
 import { SURFACE_BY } from "../src/types";
@@ -72,7 +73,7 @@ describe("pairSuggestOn: the switch's one reader (D2)", () => {
 	});
 });
 
-describe("mechanicalEligibility: ungated A, B (+D2), C-with-another (D3, D8)", () => {
+describe("mechanicalEligibility: ungated A and B (+D2) (D3, D8)", () => {
 	test("B: three long steers from Jo at the surface; two are not enough; short quotes, other authors and direct channel never count", () => {
 		const { ledger } = tempLedger();
 		const { wl } = workloadWithSlice(ledger);
@@ -125,7 +126,7 @@ describe("mechanicalEligibility: ungated A, B (+D2), C-with-another (D3, D8)", (
 		expect(mechanicalEligibility(ledger, falling.wl, ledger.now())).toEqual({ eligible: false, signals: [] });
 	});
 
-	test("C (no done slice) never alone; jev signals never count here", () => {
+	test("jev signals never count here", () => {
 		const { ledger } = tempLedger();
 		const { wl } = workloadWithSlice(ledger);
 		TASTE("0.99")(ledger, wl);
@@ -159,22 +160,21 @@ describe("pairOffer: gates, signals and the D6 line", () => {
 			return wl;
 		};
 		const wl = mk();
-		expect(pairOffer(ledger, wl, "ceiling", { config: ON })).not.toBeNull();
-		expect(pairOffer(ledger, wl, "ceiling", { config: { pairSuggest: "off" } })).toBeNull();
-		expect(pairOffer(ledger, wl, "ceiling", { config: { pairSuggest: ["wl-other"] } })).toBeNull();
-		expect(pairOffer(ledger, wl, "ceiling", { config: { pairSuggest: [wl] } })).not.toBeNull();
-		expect(pairOffer(ledger, wl, "ceiling", { config: null })).toBeNull();
-		expect(pairOffer(ledger, mk({ stakes: "throwaway" }), "ceiling", { config: ON })).toBeNull();
-		expect(pairOffer(ledger, mk({ mode: "user-driven" }), "ceiling", { config: ON })).toBeNull();
+		expect(pairOffer(ledger, wl, { config: ON })).not.toBeNull();
+		expect(pairOffer(ledger, wl, { config: { pairSuggest: "off" } })).toBeNull();
+		expect(pairOffer(ledger, wl, { config: { pairSuggest: ["wl-other"] } })).toBeNull();
+		expect(pairOffer(ledger, wl, { config: { pairSuggest: [wl] } })).not.toBeNull();
+		expect(pairOffer(ledger, wl, { config: null })).toBeNull();
+		expect(pairOffer(ledger, mk({ stakes: "throwaway" }), { config: ON })).toBeNull();
+		expect(pairOffer(ledger, mk({ mode: "user-driven" }), { config: ON })).toBeNull();
 	});
 
 	test("E: taste yes at 0.70 fires and 0.69 does not; taste no, a lane-stamped signal and a failed attempt never fire", () => {
 		const { ledger } = tempLedger();
 		const at = (f: (l: Ledger, wl: string) => void) => {
-			const { wl, sl } = workloadWithSlice(ledger);
-			ledger.completeSlice(sl, { by: "lane-a", artifact: "bun test → exit 0" });
+			const { wl } = workloadWithSlice(ledger);
 			f(ledger, wl);
-			return pairOffer(ledger, wl, "ceiling", { config: ON });
+			return pairOffer(ledger, wl, { config: ON });
 		};
 		expect(sorted(at(TASTE("0.70")))).toEqual(["e"]);
 		expect(at(TASTE("0.69"))).toBeNull();
@@ -186,138 +186,100 @@ describe("pairOffer: gates, signals and the D6 line", () => {
 
 	test("D1: ambiguous yes at 0.70 or above fires on its own", () => {
 		const { ledger } = tempLedger();
-		const { wl, sl } = workloadWithSlice(ledger);
-		ledger.completeSlice(sl, { by: "lane-a", artifact: "bun test → exit 0" });
+		const { wl } = workloadWithSlice(ledger);
 		entry(ledger, wl, CLASSIFIER_BY, "pair-signal: taste no 0.90 ambiguous yes 0.85 judge typesafe/jev-1.13.0 cost 0.0001");
-		const o = pairOffer(ledger, wl, "ceiling", { config: ON });
+		const o = pairOffer(ledger, wl, { config: ON });
 		expect(sorted(o)).toEqual(["d1"]);
 	});
 
-	test("the offer is its signals alone: E at the ceiling, B at the ceiling, A at the round limit", () => {
+	test("the offer is its signals alone: E, B, and A from the raise's round count", () => {
 		const { ledger } = tempLedger();
 		const e = workloadWithSlice(ledger);
-		ledger.completeSlice(e.sl, { by: "lane-a", artifact: "bun test → exit 0" });
 		TASTE("0.91")(ledger, e.wl);
-		expect(pairOffer(ledger, e.wl, "ceiling", { config: ON })).toEqual({ signals: ["e"] });
+		expect(pairOffer(ledger, e.wl, { config: ON })).toEqual({ signals: ["e"] });
 
 		const b = workloadWithSlice(ledger);
-		ledger.completeSlice(b.sl, { by: "lane-a", artifact: "bun test → exit 0" });
 		for (let i = 0; i < 4; i++) steer(ledger, b.wl);
-		expect(pairOffer(ledger, b.wl, "ceiling", { config: ON })).toEqual({ signals: ["b"] });
+		expect(pairOffer(ledger, b.wl, { config: ON })).toEqual({ signals: ["b"] });
 
 		const a = workloadWithSlice(ledger);
 		for (let n = 1; n <= 3; n++) round(ledger, a.wl, a.sl, n, 2);
 		const count = countRounds(ledger.entries(a.wl), a.sl);
-		const o = pairOffer(ledger, a.wl, "round-limit", { config: ON, count });
+		const o = pairOffer(ledger, a.wl, { config: ON, count });
 		expect(o).toEqual({ signals: ["a"] });
 	});
 
-	test("A only at the round-limit site and only from a stalled count; a falling count offers nothing", () => {
+	test("A only from the raise's round count and only from a stalled count; a falling count offers nothing", () => {
 		const { ledger } = tempLedger();
 		const stalled = workloadWithSlice(ledger);
-		ledger.addSlice({ by: "lane-a", workloadId: stalled.wl, task: "t", doneCondition: "d", inputs: "i" });
-		ledger.completeSlice(stalled.sl, { by: "lane-a", artifact: "bun test → exit 0" });
 		round(ledger, stalled.wl, stalled.sl, 1, 1);
 		round(ledger, stalled.wl, stalled.sl, 2, 1);
-		expect(pairOffer(ledger, stalled.wl, "ceiling", { config: ON })).toBeNull();
+		expect(pairOffer(ledger, stalled.wl, { config: ON })).toBeNull();
+		expect(pairOffer(ledger, stalled.wl, { config: ON, count: countRounds(ledger.entries(stalled.wl), stalled.sl) })).toEqual({ signals: ["a"] });
 
 		const falling = workloadWithSlice(ledger);
 		round(ledger, falling.wl, falling.sl, 1, 3);
 		round(ledger, falling.wl, falling.sl, 2, 1);
-		expect(pairOffer(ledger, falling.wl, "round-limit", { config: ON, count: countRounds(ledger.entries(falling.wl), falling.sl) })).toBeNull();
-	});
-
-	test("C: never alone; with B at the ceiling; a done slice removes it; never at the round-limit site", () => {
-		const { ledger } = tempLedger();
-		const alone = workloadWithSlice(ledger);
-		steer(ledger, alone.wl);
-		steer(ledger, alone.wl);
-		expect(pairOffer(ledger, alone.wl, "ceiling", { config: ON })).toBeNull();
-
-		const withB = workloadWithSlice(ledger);
-		for (let i = 0; i < 3; i++) steer(ledger, withB.wl);
-		const o = pairOffer(ledger, withB.wl, "ceiling", { config: ON });
-		expect(sorted(o)).toEqual(["b", "c"]);
-		expect(sorted(pairOffer(ledger, withB.wl, "round-limit", { config: ON, count: countRounds(ledger.entries(withB.wl), withB.sl) }))).toEqual(["b"]);
-		ledger.completeSlice(withB.sl, { by: "lane-a", artifact: "bun test → exit 0" });
-		expect(sorted(pairOffer(ledger, withB.wl, "ceiling", { config: ON }))).toEqual(["b"]);
+		expect(pairOffer(ledger, falling.wl, { config: ON, count: countRounds(ledger.entries(falling.wl), falling.sl) })).toBeNull();
 	});
 });
 
 describe("pairOffer: D5 caps", () => {
-	/** A ceiling question the runner raised earlier with an offer on `signals`, as the ceiling site writes it. */
-	function priorOffer(ledger: Ledger, wl: string, n: number, signals: string[]): string {
-		const sl = ledger.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: `sl-ceiling-${wl.slice(3)}-${n}`, task: "ceiling", doneCondition: "Jo answers stop, extend or split", inputs: "spend" });
-		const q = ledger.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body: "Ceiling.", options: [...CEILING_OPTIONS, "pair"] });
-		entry(ledger, wl, LANE_RUNNER_BY, `pair-offer: ${q} site ceiling signals ${signals.join(",")}`);
+	/** A round-limit question raised earlier with the classifier's offer on `signals`, as the round-limit site writes it. */
+	function priorOffer(ledger: Ledger, wl: string, sl: string, signals: string[]): string {
+		const q = ledger.raiseQuestion({ by: LANE, workloadId: wl, sliceId: sl, body: "Round limit.", options: [...ROUND_LIMIT_OPTIONS, "pair"] });
+		entry(ledger, wl, CLASSIFIER_BY, `pair-offer: ${q} site round-limit signals ${signals.join(",")}`);
 		return q;
 	}
 
-	function bWorkload(ledger: Ledger): string {
-		const { wl, sl } = workloadWithSlice(ledger);
-		ledger.completeSlice(sl, { by: "lane-a", artifact: "bun test → exit 0" });
-		for (let i = 0; i < 3; i++) steer(ledger, wl);
-		return wl;
+	function bWorkload(ledger: Ledger): { wl: string; sl: string } {
+		const w = workloadWithSlice(ledger);
+		for (let i = 0; i < 3; i++) steer(ledger, w.wl);
+		return w;
 	}
 
 	test("at most two offers per workload", () => {
 		const c = clock();
 		const { ledger } = tempLedger(c.now);
-		const wl = bWorkload(ledger);
-		priorOffer(ledger, wl, 1, ["b"]);
+		const { wl, sl } = bWorkload(ledger);
+		priorOffer(ledger, wl, sl, ["b"]);
 		c.plusHours(2);
-		expect(pairOffer(ledger, wl, "ceiling", { config: ON })).not.toBeNull();
-		priorOffer(ledger, wl, 2, ["b"]);
+		expect(pairOffer(ledger, wl, { config: ON })).not.toBeNull();
+		priorOffer(ledger, wl, sl, ["b"]);
 		c.plusHours(2);
 		TASTE("0.95")(ledger, wl);
-		expect(pairOffer(ledger, wl, "ceiling", { config: ON })).toBeNull();
+		expect(pairOffer(ledger, wl, { config: ON })).toBeNull();
 	});
 
 	test("none within 60 minutes of the last offer", () => {
 		const c = clock();
 		const { ledger } = tempLedger(c.now);
-		const wl = bWorkload(ledger);
-		priorOffer(ledger, wl, 1, ["b"]);
+		const { wl, sl } = bWorkload(ledger);
+		priorOffer(ledger, wl, sl, ["b"]);
 		c.plusHours(0.5);
-		expect(pairOffer(ledger, wl, "ceiling", { config: ON })).toBeNull();
+		expect(pairOffer(ledger, wl, { config: ON })).toBeNull();
 		c.plusHours(0.55);
-		expect(sorted(pairOffer(ledger, wl, "ceiling", { config: ON }))).toEqual(["b"]);
+		expect(sorted(pairOffer(ledger, wl, { config: ON }))).toEqual(["b"]);
 	});
 
 	test("after Jo answers a non-pair option on an offered question: none, until a signal not in that offer fires", () => {
 		const c = clock();
 		const { ledger } = tempLedger(c.now);
-		const wl = bWorkload(ledger);
-		const q = priorOffer(ledger, wl, 1, ["b"]);
+		const { wl, sl } = bWorkload(ledger);
+		const q = priorOffer(ledger, wl, sl, ["b"]);
 		ledger.answerQuestion(q, { by: SURFACE_BY, answer: "extend", author: "jo", channel: "surface" });
 		c.plusHours(2);
 		steer(ledger, wl);
-		expect(pairOffer(ledger, wl, "ceiling", { config: ON })).toBeNull();
+		expect(pairOffer(ledger, wl, { config: ON })).toBeNull();
 		TASTE("0.91")(ledger, wl);
-		expect(sorted(pairOffer(ledger, wl, "ceiling", { config: ON }))).toContain("e");
-	});
-
-	test("the then-set reads slices as they were when Jo answered: a slice done after the declined offer does not make C, or anything, new (review fix 3)", () => {
-		const c = clock();
-		const { ledger } = tempLedger(c.now);
-		const { wl, sl } = workloadWithSlice(ledger);
-		for (let i = 0; i < 3; i++) steer(ledger, wl);
-		const q = priorOffer(ledger, wl, 1, ["b", "c"]);
-		ledger.answerQuestion(q, { by: SURFACE_BY, answer: "extend", author: "jo", channel: "surface" });
-		c.plusHours(0.5);
-		ledger.completeSlice(sl, { by: "lane-a", artifact: "bun test → exit 0" });
-		c.plusHours(2);
-		steer(ledger, wl);
-		expect(pairOffer(ledger, wl, "ceiling", { config: ON })).toBeNull();
-		TASTE("0.91")(ledger, wl);
-		expect(sorted(pairOffer(ledger, wl, "ceiling", { config: ON }))).toEqual(["b", "e"]);
+		expect(sorted(pairOffer(ledger, wl, { config: ON }))).toContain("e");
 	});
 });
 
 describe("pairSuggestHealth: D8's per-lane number, in both groups", () => {
 	/**
 	 * One lane's span on a fresh workload: `lane-started:`, then (when `eligible`) three long steers, then rounds falling
-	 * 5 → 3 → 1 → 0-withheld (all failed, never stalled, so A never fires), one ceiling `extend`, `lane-exit:`, and one
+	 * 5 → 3 → 1 → 0-withheld (all failed, never stalled, so A never fires), Jo's `extend <wl>`, `lane-exit:`, and one
 	 * more failed round after the exit. Rounds and the extend all land after the eligibility moment, except round 1.
 	 */
 	function laneSpan(ledger: Ledger, c: { plusHours: (h: number) => void }, opts: { eligible: boolean; switchOn: boolean }): string {
@@ -334,9 +296,7 @@ describe("pairSuggestHealth: D8's per-lane number, in both groups", () => {
 		c.plusHours(0.1);
 		round(ledger, wl, sl, 3, 1);
 		c.plusHours(0.1);
-		const csl = ledger.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: `sl-ceiling-${wl.slice(3)}-1`, task: "ceiling", doneCondition: "Jo answers stop, extend or split", inputs: "spend" });
-		const q = ledger.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: csl, body: "Ceiling.", options: [...CEILING_OPTIONS] });
-		ledger.answerQuestion(q, { by: SURFACE_BY, answer: "extend", author: "jo", channel: "surface" });
+		apply(ledger, interpret(ledger, `extend ${wl}`)!);
 		c.plusHours(0.1);
 		entry(ledger, wl, LANE_RUNNER_BY, laneExitBody(lane, { code: 0, signal: null, outcome: "completed" }));
 		c.plusHours(0.1);
@@ -344,7 +304,7 @@ describe("pairSuggestHealth: D8's per-lane number, in both groups", () => {
 		return lane;
 	}
 
-	test("on-lane and off-lane with an eligibility moment: failed rounds after it plus extend answers, within the lane's span", () => {
+	test("on-lane and off-lane with an eligibility moment: failed rounds after it plus Jo's extend raises, within the lane's span", () => {
 		const c = clock();
 		const { ledger } = tempLedger(c.now);
 		expect(pairSuggestHealth(ledger, laneSpan(ledger, c, { eligible: true, switchOn: true }))).toBe(3);
@@ -380,7 +340,7 @@ describe("the report's switch groups: a lane is on by its own pair-exposure: row
 		entry(ledger, wl, CLASSIFIER_BY, `pair-exposure: ${lane1} on`);
 		TASTE("0.95")(ledger, wl);
 		c.plusHours(0.1);
-		entry(ledger, wl, LANE_RUNNER_BY, `pair-offer: q-x site ceiling signals e`);
+		entry(ledger, wl, CLASSIFIER_BY, `pair-offer: q-x site round-limit signals e`);
 		c.plusHours(0.1);
 		exited(ledger, wl, lane1);
 		c.plusHours(1); // the switch is turned off here: lane 2's classifier writes no pair-exposure:
@@ -405,7 +365,7 @@ describe("the report's switch groups: a lane is on by its own pair-exposure: row
 		entry(ledger, wl, CLASSIFIER_BY, `pair-exposure: ${lane1} on`);
 		TASTE("0.95")(ledger, wl);
 		c.plusHours(0.1);
-		entry(ledger, wl, LANE_RUNNER_BY, `pair-offer: q-x site ceiling signals e`);
+		entry(ledger, wl, CLASSIFIER_BY, `pair-offer: q-x site round-limit signals e`);
 		c.plusHours(0.1);
 		exited(ledger, wl, lane1);
 		c.plusHours(1);
@@ -454,7 +414,7 @@ describe("the report's switch groups: a lane is on by its own pair-exposure: row
 		const never = workloadWithSlice(ledger).wl;
 		const offLane = span(never, 1, (wl) => {
 			TASTE("0.95", LANE)(ledger, wl);
-			entry(ledger, wl, SURFACE_BY, "pair-offer: q-x site ceiling signals b");
+			entry(ledger, wl, SURFACE_BY, "pair-offer: q-x site round-limit signals b");
 		});
 		// a switch row after the lane's end is not the lane's
 		entry(ledger, never, CLASSIFIER_BY, "pair-offer: q-y site round-limit signals a");
@@ -465,9 +425,8 @@ describe("the report's switch groups: a lane is on by its own pair-exposure: row
 	});
 });
 
-describe("D1: pair is appended per question, never to the option constants", () => {
-	test("ROUND_LIMIT_OPTIONS and CEILING_OPTIONS are unchanged", () => {
+describe("D1: pair is appended per question, never to the option constant", () => {
+	test("ROUND_LIMIT_OPTIONS is unchanged", () => {
 		expect([...ROUND_LIMIT_OPTIONS]).toEqual(["extend", "accept", "stop"]);
-		expect([...CEILING_OPTIONS]).toEqual(["stop", "extend", "split"]);
 	});
 });

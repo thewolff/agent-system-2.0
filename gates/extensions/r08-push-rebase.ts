@@ -12,6 +12,7 @@
 import { artifactTrees } from "../../surface/src/signals";
 import { type PushDest, pushDestBody } from "../../surface/src/test-run";
 import { bashCommand } from "../src/exec";
+import { canonicalCall, canonicalResult } from "../src/pair-call";
 import { blockingSuccess, judgePush, pushChecked } from "../src/rows/r08-push-rebase";
 import { type GateSession, type GatesAPI, gateSession } from "../src/session";
 import type { Refusal } from "../src/types";
@@ -39,7 +40,9 @@ function recordDestinations(s: GateSession, dests: PushDest[], cmd: string): Ref
 }
 
 export default function pushRebaseRow(pi: GatesAPI, env: Record<string, string | undefined> = process.env): void {
-	pi.on("tool_result", (event, ctx) => {
+	// A pair_run is judged, and its outcome counted, as its bash equivalent (src/pair-call.ts).
+	pi.on("tool_result", (result, ctx) => {
+		const event = canonicalResult(result, ctx.cwd);
 		if (event.toolName !== "bash") return undefined;
 		const s = gateSession(ctx, env);
 		const original = String(s.originalInput(event).command ?? "");
@@ -59,7 +62,8 @@ export default function pushRebaseRow(pi: GatesAPI, env: Record<string, string |
 		return undefined;
 	});
 
-	pi.on("tool_call", (event, ctx) => {
+	pi.on("tool_call", (typed, ctx) => {
+		const event = canonicalCall(typed, ctx.cwd);
 		const s = gateSession(ctx, env);
 		const callCtx = { role: s.role, cwd: ctx.cwd, env, mode: s.mode?.mode };
 		const workloadId = s.workloadId;

@@ -20,6 +20,10 @@
 //   last non-block result is what runs (runner.ts emitToolCall), so it wraps only a bash call every
 //   row allowed, its revision never reaches a row (row 18 reads the typed command), and its
 //   tool_result cleanup runs after rows 3 and 8 read the original command.
+// - The fence's half for the paired-coding adapter's pair_write, pair_edit and pair_run (src/pair-call.ts,
+//   PLAN-2 wl-mvb9mw00ycfjeo D5) registers after the fence: the rows judge those calls as their write,
+//   edit and bash equivalents, and only a call every row allowed is authorized for plugins/paired-as2.ts
+//   to execute, bound to the arguments it was judged with.
 import openLinks from "./extensions/open-links";
 import { linkedApi } from "./src/links";
 import askPolicyRow from "./extensions/r14-ask-policy";
@@ -41,6 +45,7 @@ import wakeReadRow from "./extensions/r07-wake-read";
 import { type CleanShellCheck, type CleanShellRead, cleanShellFromHost } from "./src/clean-shell";
 import { type FenceSettings, fenceSettingsFrom, registerFence, type ShellStartCheck } from "./src/fence";
 import { checkHostVersion, type HostModules } from "./src/host";
+import { registerPairCalls } from "./src/pair-call";
 import type { Ctx, GatesAPI } from "./src/session";
 import { captureGateLoadEnviron, type ShellStart, type ShellStartHost, shellStart } from "./src/shell-start";
 
@@ -152,6 +157,7 @@ export default function p11Gates(
 	turnShapeRow(pi, env);
 	joInstructionRow(pi, env);
 	registerFence(pi, env, fenceSettings, startCheck, cleanShell);
+	registerPairCalls(pi, env, fenceSettings, cleanShell);
 	// The notice reads the host; a test handing in its own reader has no host to read.
 	if (fenceSettings === hostFenceSettings) hostVersionNotice(pi);
 }

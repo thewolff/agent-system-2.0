@@ -4,8 +4,8 @@
 //
 // What it covers, in errorLines' order (surface/src/errors.ts): every waiting reserved request
 // (`waitingReserved`, the standing workload's included), then every open question on an open
-// workload: lanes' questions, the runner's ceiling and round-limit questions, the classifier's
-// park questions, and the orchestrator's own questions on the standing workload.
+// workload: lanes' questions, the classifier's round-limit and park questions, and the orchestrator's own questions on
+// the standing workload.
 //
 // Each answerable row is one line inside the fence, a whole exact answer:
 //   <word> <id>  # <subject> — on <workload words> · <recommended (where) | no recommendation recorded> · also: <others>[ / withdraw]
@@ -23,7 +23,7 @@
 // input row leaves out of a prompt with no command (`withoutPairOffers`, R3).
 import type { Ledger } from "../../ledger/src/index";
 import { clip, controlOf, plain, sameCall, waitingReserved, wordsOf } from "./errors";
-import { isCeilingQuestion, openPairOffer } from "./input";
+import { openPairOffer } from "./input";
 import { isPlanQuestionIn } from "./launch";
 import { questionSubject } from "./orchestrator-question";
 import { pairPendingLine, shownOptions } from "./pair-suggest";
@@ -89,18 +89,13 @@ function marked(body: string, options: readonly string[]): { option: string; whe
 /**
  * The recorded recommendation (D1), in order: the plan question recommends `approve` only when its
  * `review:` verdict starts with approve or accept (any other verdict: none, nothing else consulted);
- * the runner's ceiling question recommends `stop`, which its body records as the default; a mark in
- * the body; otherwise none. Never inferred from the question's type alone.
+ * a mark in the body; otherwise none. Never inferred from the question's type alone.
  */
-function recommendation(q: { body: string; options: string[] }, plan: boolean, ceiling: boolean): { option: string; where: string } | null {
+function recommendation(q: { body: string; options: string[] }, plan: boolean): { option: string; where: string } | null {
 	if (plan) {
 		const verdict = reviewVerdict(q.body);
 		const approve = optionOf(q.options, "approve");
 		return verdict && approve && /^(approve|accept)/i.test(verdict) ? { option: approve, where: `review: ${verdict}` } : null;
-	}
-	if (ceiling) {
-		const stop = optionOf(q.options, "stop");
-		if (stop) return { option: stop, where: "the default" };
 	}
 	return marked(q.body, q.options);
 }
@@ -122,8 +117,7 @@ export function pendingItems(ledger: Ledger): PendingItem[] {
 		}
 		for (const q of openQuestions) {
 			const plan = !standing && isPlanQuestionIn(control, q);
-			const ceiling = !standing && isCeilingQuestion(q, ledger.slice(q.slice_id));
-			const rec = recommendation(q, plan, ceiling);
+			const rec = recommendation(q, plan);
 			const oneWord = q.options.length > 0 && q.options.every((o) => !/\s/.test(o));
 			const firstLine = clip(plain(q.body.split("\n")[0] ?? ""), SUBJECT_MAX) || "a question";
 			let workloadWords = words;

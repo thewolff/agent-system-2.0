@@ -1,20 +1,16 @@
-// The workload ceiling at the surface (DESIGN-workload-ceiling.md § 1 B and D, § 2 items 2 and 5),
-// driven through the ledger module and the fake extension API: the open tool writes the stakes-sized
-// `ceiling:` (×3 when the brief was judged change-large), Jo's stakes word re-sizes it after writing
-// its instruction, Jo's `ceiling` word sets an exact figure, an answer to the runner's ceiling
-// question settles it (*extend* raises by one block, completes the slice and requests one relaunch;
-// *stop* and *split* only complete the slice; numbered on the needs-you list it answers as a batch
-// piece the same way, and `<n> withdraw` cancels it like a bare withdraw), the orchestrator's tool
-// only lowers, and the one-liner and the render show the ceiling and the spend against it.
+// The workload ceiling at the surface (DESIGN-workload-ceiling.md § 1 B and D, § 2 items 2 and 5; PLAN
+// wl-mvfkv7llkp7nk0 § 4, R13), driven through the ledger module and the fake extension API: the open tool writes the
+// stakes-sized `ceiling:` (×3 when the brief was judged change-large), Jo's stakes word re-sizes it after writing its
+// instruction, Jo's `ceiling` word sets an exact figure and Jo's `extend` word raises by one block of the workload's own
+// size, both naming Jo's instruction and both relaunching a lane the runner stopped at the ceiling through one rule; the
+// orchestrator's tool only lowers, and the one-liner and the render show the ceiling and the spend against it.
 import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
-import { CEILING_OPTIONS } from "../src/ceiling";
-import { errorLines } from "../src/errors";
-import { apply, ceilingOf, interpret, interpretBatch, isCeilingQuestion } from "../src/input";
-import { controlEntries } from "../src/launch";
+import { apply, ceilingOf, interpret, interpretPaste } from "../src/input";
+import { controlEntries, laneExitBody } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { oneLiner, renderWorkload } from "../src/render";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
@@ -40,15 +36,23 @@ const judge = async () => ({
 
 const ceilingBodies = (l: Ledger, wl: string) => controlEntries(l.entries(wl, "assumption")).filter((c) => c.prefix === "ceiling").map((c) => c.body);
 
-/** A normal workload opened by the surface with its ceiling entry, a lane launched on it once, and the runner's ceiling question raised. */
-function withCeilingQuestion(l: Ledger) {
-	const wl = l.openWorkload({ by: SURFACE_BY, brief: "Move the header offset into a token", stakes: "normal", mode: "autonomous" });
+/** A normal workload opened by the surface with its ceiling entry ($50 / 6h) and a lane launched on it once. */
+function withLane(l: Ledger, mode: "autonomous" | "user-driven" = "autonomous") {
+	const wl = l.openWorkload({ by: SURFACE_BY, brief: "Move the header offset into a token", stakes: "normal", mode });
 	l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: "ceiling: usd 50 wall 360 source stakes normal" });
 	l.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-t-1 cause first requested-by test" });
-	const sl = l.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: "sl-ceiling-1", task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
-	const q = l.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body: "80 % of the ceiling", options: [...CEILING_OPTIONS] });
-	return { wl, sl, q };
+	l.addSlice({ by: "lane-t-1", workloadId: wl, task: "Move the offset", doneCondition: "bun test passes", inputs: "src/header.css" });
+	return { wl };
 }
+
+/** The runner's stop of lane-t-1 at 100 % of $50: its accepted ceiling stop, the spend it read, and (once it is gone) its exit. */
+function stopAtCeiling(l: Ledger, wl: string, o: { exited: boolean } = { exited: true }) {
+	l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: "spend: lane-t-1 usd 50.2 tokens 1000 wall 40" });
+	l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: "lane-stop: lane-t-1 accepted ceiling" });
+	if (o.exited) l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody("lane-t-1", { code: 0, signal: null, outcome: "stop", reason: "ceiling" }) });
+}
+
+const requests = (l: Ledger, wl: string) => controlEntries(l.entries(wl, "assumption")).filter((c) => c.prefix === "launch-requested");
 
 describe("ceiling at open and on Jo's stakes word", () => {
 	test("open writes the stakes size, ×3 only when judged change-large; the stakes word writes its instruction first, then re-sizes naming it", async () => {
@@ -94,7 +98,7 @@ describe("ceiling at open and on Jo's stakes word", () => {
 describe("Jo's ceiling word", () => {
 	test("records the instruction, then the entry naming it; omitted hours keep the wall; the workload is the only one in view or the named one, several in view and none named is ambiguous", () => {
 		const { ledger: l } = tempLedger();
-		const { wl } = withCeilingQuestion(l);
+		const { wl } = withLane(l);
 		const cmd = interpret(l, "ceiling 80");
 		expect(cmd).toEqual({ kind: "ceiling", workloadId: wl, usd: 80, wallMin: null });
 		expect(apply(l, cmd!)).toContain(`ceiling on ${wl} → $80 / 6h`);
@@ -137,175 +141,123 @@ describe("Jo's ceiling word", () => {
 	});
 });
 
-describe("answering the runner's ceiling question", () => {
-	test("the ceiling question is the runner's, on an sl-ceiling- slice", () => {
+describe("Jo's extend word (R13)", () => {
+	test("`extend <wl>` records Jo's instruction `ceiling: <usd> <hours>` at the value in force plus one block, then the entry naming it", () => {
 		const { ledger: l } = tempLedger();
-		const { q, sl } = withCeilingQuestion(l);
-		const row = l.question(q)!;
-		expect(isCeilingQuestion(row, l.slice(sl))).toBe(true);
-		expect(isCeilingQuestion({ ...row, created_by: "lane-t-1" }, l.slice(sl))).toBe(false);
-		expect(isCeilingQuestion({ ...row, slice_id: "sl-other" }, { id: "sl-other" })).toBe(false);
+		const { wl } = withLane(l);
+		apply(l, interpret(l, `ceiling 70 ${wl}`)!);
+		const cmd = interpret(l, `extend ${wl}`);
+		expect(cmd).toEqual({ kind: "extend", workloadId: wl });
+		expect(apply(l, cmd!)).toContain(`ceiling on ${wl} extended by $50 / 6h → $120 / 12h (instruction `);
+		const ins = l.instructions(wl).at(-1)!;
+		expect(ins).toMatchObject({ kind: "instruction", body: "ceiling: 120 12", author: "jo", channel: "surface", created_by: SURFACE_BY });
+		expect(ceilingBodies(l, wl).at(-1)).toBe(`ceiling: usd 120 wall 720 source extend one block by ${ins.id}`);
+		expect(ceilingOf(l, wl)).toEqual({ usd: 120, wallMin: 720 });
+		expect(l.questions(wl)).toEqual([]);
 	});
 
-	test("extend raises by one block naming the answer, completes the slice, requests the relaunch; the input row launches once", async () => {
-		const f = fakePi(undefined, { exec: true });
+	test("the block is the workload's own size: ×3 for a brief judged change-large, the stakes size of production", () => {
+		const { ledger: l } = tempLedger();
+		const large = l.openWorkload({ by: SURFACE_BY, brief: "build the billing subsystem", stakes: "normal", mode: "autonomous" });
+		l.recordEntry({ by: SURFACE_BY, workloadId: large, kind: "assumption", body: "brief-judged: change-large confidence 0.9" });
+		l.recordEntry({ by: SURFACE_BY, workloadId: large, kind: "assumption", body: "ceiling: usd 150 wall 1080 source stakes normal x3 change-large" });
+		apply(l, interpret(l, `extend ${large}`)!);
+		expect(ceilingOf(l, large)).toEqual({ usd: 300, wallMin: 2160 });
+		const prod = l.openWorkload({ by: SURFACE_BY, brief: "ship it", stakes: "production", mode: "autonomous" });
+		l.recordEntry({ by: SURFACE_BY, workloadId: prod, kind: "assumption", body: "ceiling: usd 150 wall 720 source stakes production" });
+		apply(l, interpret(l, `extend ${prod}`)!);
+		expect(ceilingOf(l, prod)).toEqual({ usd: 300, wallMin: 1440 });
+	});
+
+	test("`extend` names an open workload: an unknown or closed one is refused, never prose; `extend` alone with nothing to answer is prose", () => {
+		const { ledger: l } = tempLedger();
+		const { wl } = withLane(l);
+		expect(interpret(l, "extend wl-nope")).toEqual({ kind: "refused", why: "wl-nope is not an open workload" });
+		expect(interpret(l, `extend ${STANDING_WORKLOAD_ID}`)).toMatchObject({ kind: "refused" });
+		expect(interpret(l, "extend")).toBeNull();
+		expect(interpretPaste(l, new Numbering(), `extend ${wl}\nproduction ${wl}`)).toMatchObject({ ok: true });
+		expect(interpretPaste(l, new Numbering(), `extend wl-nope\nproduction ${wl}`)).toMatchObject({ ok: false });
+		const done = l.openWorkload({ by: SURFACE_BY, brief: "done", stakes: "normal", mode: "autonomous" });
+		l.closeWorkload(done, { by: SURFACE_BY });
+		expect(interpret(l, `extend ${done}`)).toMatchObject({ kind: "refused" });
+	});
+
+	test("through the surface, on a lane the runner stopped at the ceiling: the receipt says so and Jo's launch-requested: is written", async () => {
+		const f = fakePi();
 		const e = env();
 		const seed = open(e);
-		const { wl, sl, q } = withCeilingQuestion(seed);
-		// a reserved request waiting elsewhere does not take the option words
-		seed.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "reserved-request", body: "push main" });
-		expect(interpret(seed, "extend")).toMatchObject({ kind: "answer", questionId: q, answer: "extend" });
+		const { wl } = withLane(seed);
+		stopAtCeiling(seed, wl);
 		seed.close();
 		orchestratorSurface(f.pi, e, {});
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: "extend", systemPrompt: [] }, ctxOf());
-		expect(notices[0]).toContain(`answered ${q} with "extend"`);
-		expect(notices[0]).toContain("ceiling raised to $100 / 12h; no lane holds it live, so a relaunch is requested");
-		expect(f.execs.calls).toHaveLength(1);
-		expect(f.execs.calls[0]!.args.slice(1)).toEqual(["launch", wl, "--requested-by", "jo"]);
+		await f.emit("before_agent_start", { prompt: `extend ${wl}`, systemPrompt: [] }, ctxOf());
+		expect(notices[0]).toContain(`→ $100 / 12h`);
+		expect(notices[0]).toContain("lane-t-1 stopped at the ceiling, so a relaunch is requested");
 		const l = open(e);
-		const answer = l.question(q)!.resolved_by!;
-		expect(ceilingBodies(l, wl).at(-1)).toBe(`ceiling: usd 100 wall 720 source extend one block by ${answer}`);
-		expect(ceilingOf(l, wl)).toEqual({ usd: 100, wallMin: 720 });
-		expect(l.slice(sl)).toMatchObject({ state: "done", artifact: `answered extend ${answer}` });
-		const requests = controlEntries(l.entries(wl, "assumption")).filter((c) => c.prefix === "launch-requested");
-		expect(requests.map((r) => r.body)).toEqual([expect.stringMatching(/^launch-requested: by jo at \S+ \(ceiling extend\)$/)]);
+		expect(requests(l, wl).map((r) => r.body)).toEqual([expect.stringMatching(/^launch-requested: by jo at \S+ \(ceiling extend\)$/)]);
 		l.close();
-	});
-
-	test("extend while a lane still holds the workload raises and completes but requests no relaunch", () => {
-		const { ledger: l } = tempLedger();
-		const { wl, sl, q } = withCeilingQuestion(l);
-		expect(l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: "lane-t-1", leaseMs: 60_000 }).won).toBe(true);
-		expect(apply(l, interpret(l, "extend")!)).toContain("lane-t-1 still holds it");
-		expect(ceilingOf(l, wl)).toEqual({ usd: 100, wallMin: 720 });
-		expect(l.slice(sl)!.state).toBe("done");
-		expect(l.question(q)!.state).toBe("answered");
-		expect(controlEntries(l.entries(wl, "assumption")).some((c) => c.prefix === "launch-requested")).toBe(false);
-	});
-
-	test("extend while the holder is stopping at the ceiling (its newest lane-stop: is accepted ceiling) requests the relaunch and says why", () => {
-		const { ledger: l } = tempLedger();
-		const { wl } = withCeilingQuestion(l);
-		expect(l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: "lane-t-1", leaseMs: 60_000 }).won).toBe(true);
-		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: "lane-stop: lane-t-1 accepted ceiling" });
-		expect(apply(l, interpret(l, "extend")!)).toContain("ceiling raised to $100 / 12h; lane-t-1 is stopping at the ceiling, so a relaunch is requested");
-		expect(controlEntries(l.entries(wl, "assumption")).filter((c) => c.prefix === "launch-requested")).toHaveLength(1);
-	});
-
-	test("extend while the holder stops for another reason still counts it as going on: only a ceiling stop requests the relaunch", () => {
-		const { ledger: l } = tempLedger();
-		const { wl } = withCeilingQuestion(l);
-		expect(l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: "lane-t-1", leaseMs: 60_000 }).won).toBe(true);
-		const req = l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: "lane-stop: lane-t-1 requested mode-flip by jo" });
-		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: `lane-stop: lane-t-1 accepted ${req}` });
-		expect(apply(l, interpret(l, "extend")!)).toContain("lane-t-1 still holds it and goes on under it");
-		expect(controlEntries(l.entries(wl, "assumption")).some((c) => c.prefix === "launch-requested")).toBe(false);
-	});
-
-	test("withdraw on the ceiling question cancels its slice (the stop default), and the workload can close; another question's withdraw still replans", () => {
-		const { ledger: l } = tempLedger();
-		const { wl, sl, q } = withCeilingQuestion(l);
-		const cmd = interpret(l, "withdraw");
-		expect(cmd).toEqual({ kind: "withdraw", workloadId: wl, questionId: q, then: "cancel" });
-		expect(apply(l, cmd!)).toContain(`slice ${sl} is cancelled: cancelled; the lane stops at the ceiling as the default`);
-		expect(l.question(q)!.state).toBe("withdrawn");
-		expect(l.instructions(wl).at(-1)).toMatchObject({ kind: "withdrawal", disposition: "cancel", author: "jo", channel: "surface" });
-		expect(l.workload(wl)).toMatchObject({ open_slices: 0, paused_slices: 0, open_questions: 0 });
-		l.closeWorkload(wl, { by: SURFACE_BY });
-		expect(l.workload(wl)!.status).toBe("closed");
-
-		const other = l.openWorkload({ by: SURFACE_BY, brief: "another", stakes: "normal", mode: "autonomous" });
-		const osl = l.addSlice({ by: "lane-o-1", workloadId: other, task: "t", doneCondition: "d", inputs: "i" });
-		const oq = l.raiseQuestion({ by: "lane-o-1", workloadId: other, sliceId: osl, body: "which?", options: ["a", "b"] });
-		expect(interpret(l, "withdraw")).toEqual({ kind: "withdraw", workloadId: other, questionId: oq, then: "replan" });
-	});
-
-	test("stop and split only complete the slice: no new ceiling, no launch request, nothing launched", async () => {
-		for (const word of ["stop", "split"]) {
-			const f = fakePi(undefined, { exec: true });
-			const e = env();
-			const seed = open(e);
-			const { wl, sl, q } = withCeilingQuestion(seed);
-			seed.close();
-			orchestratorSurface(f.pi, e, {});
-			await f.emit("before_agent_start", { prompt: word, systemPrompt: [] }, ctxOf());
-			expect(f.execs.calls).toHaveLength(0);
-			const l = open(e);
-			const answer = l.question(q)!.resolved_by!;
-			expect(l.slice(sl)).toMatchObject({ state: "done", artifact: `answered ${word} ${answer}` });
-			expect(ceilingBodies(l, wl)).toEqual(["ceiling: usd 50 wall 360 source stakes normal"]);
-			expect(controlEntries(l.entries(wl, "assumption")).some((c) => c.prefix === "launch-requested")).toBe(false);
-			l.close();
-		}
 	});
 });
 
-describe("the runner's ceiling question as a numbered needs-you line", () => {
-	/** The ceiling question numbered the way the surface numbers the needs-you list. */
-	function numberedCeiling(l: Ledger) {
-		const r = withCeilingQuestion(l);
-		const numbering = new Numbering();
-		const line = numbering.assign(errorLines(l)).find((x) => x.rowId === r.q)!;
-		return { ...r, numbering, line, n: line.n! };
-	}
-
-	test("the line carries a #n and the options stop / extend / split; `<n> extend` raises one block and completes the ceiling slice", () => {
+describe("the relaunch both raise words share (R13)", () => {
+	test("`ceiling <usd>` relaunches a lane stopped at the ceiling too; a value the stop's spend still reaches relaunches nothing", () => {
 		const { ledger: l } = tempLedger();
-		const { wl, sl, q, numbering, line, n } = numberedCeiling(l);
-		expect(line).toMatchObject({ kind: "question", n: expect.any(Number), options: ["stop", "extend", "split"] });
-		const r = interpretBatch(l, numbering, `${n} extend`);
-		expect(r).toEqual({ ok: true, items: [{ n, cmd: { kind: "answer", workloadId: wl, questionId: q, answer: "extend" } }] });
-		if (!r?.ok) throw new Error("not accepted");
-		const [receipt] = l.write(() => r.items.map((i) => apply(l, i.cmd)));
-		expect(receipt).toContain("ceiling raised to $100 / 12h");
-		const answer = l.question(q)!.resolved_by!;
-		expect(ceilingBodies(l, wl).at(-1)).toBe(`ceiling: usd 100 wall 720 source extend one block by ${answer}`);
+		const { wl } = withLane(l);
+		stopAtCeiling(l, wl);
+		expect(apply(l, interpret(l, `ceiling 40 ${wl}`)!)).toContain("lane-t-1 stopped at the ceiling and its spend ($50.20 / 40 min) still reaches $40 / 6h, so nothing relaunches");
+		expect(requests(l, wl)).toEqual([]);
+		expect(apply(l, interpret(l, `ceiling 80 ${wl}`)!)).toContain(`ceiling on ${wl} → $80 / 6h (instruction `);
+		expect(requests(l, wl).map((r) => r.body)).toEqual([expect.stringMatching(/\(ceiling word\)$/)]);
+	});
+
+	test("a second raise while the first relaunch request waits writes no second request", () => {
+		const { ledger: l } = tempLedger();
+		const { wl } = withLane(l);
+		stopAtCeiling(l, wl);
+		apply(l, interpret(l, `extend ${wl}`)!);
+		expect(apply(l, interpret(l, `ceiling 200 ${wl}`)!)).toContain("lane-t-1 stopped at the ceiling and a relaunch is already requested");
+		expect(requests(l, wl)).toHaveLength(1);
+	});
+
+	test("while the holder is stopping at the ceiling (its lease live, its stop accepted) the relaunch is requested and the receipt says so", () => {
+		const { ledger: l } = tempLedger();
+		const { wl } = withLane(l);
+		expect(l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: "lane-t-1", leaseMs: 60_000 }).won).toBe(true);
+		stopAtCeiling(l, wl, { exited: false });
+		expect(apply(l, interpret(l, `extend ${wl}`)!)).toContain("lane-t-1 is stopping at the ceiling, so a relaunch is requested");
+		expect(requests(l, wl)).toHaveLength(1);
+	});
+
+	test("no relaunch for a lane not stopped at the ceiling: a live holder goes on under the raise, a stop for another reason, a lane that finished, a newer lane", () => {
+		const { ledger: l } = tempLedger();
+		const live = withLane(l).wl;
+		expect(l.claimWorkload(live, { by: LANE_STARTER_BY, holder: "lane-t-1", leaseMs: 60_000 }).won).toBe(true);
+		expect(apply(l, interpret(l, `extend ${live}`)!)).toContain("lane-t-1 still holds it and goes on under it");
+		const req = l.recordEntry({ by: SURFACE_BY, workloadId: live, kind: "assumption", body: "lane-stop: lane-t-1 requested mode-flip by jo" });
+		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: live, kind: "assumption", body: `lane-stop: lane-t-1 accepted ${req}` });
+		expect(apply(l, interpret(l, `ceiling 300 ${live}`)!)).toContain("lane-t-1 still holds it and goes on under it");
+		expect(requests(l, live)).toEqual([]);
+
+		const finished = withLane(l).wl;
+		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: finished, kind: "assumption", body: laneExitBody("lane-t-1", { code: 0, signal: null, outcome: "completed" }) });
+		expect(apply(l, interpret(l, `extend ${finished}`)!)).not.toContain("relaunch");
+		expect(requests(l, finished)).toEqual([]);
+
+		const relaunched = withLane(l).wl;
+		stopAtCeiling(l, relaunched);
+		l.recordEntry({ by: LANE_STARTER_BY, workloadId: relaunched, kind: "assumption", body: "launch: lane-t-2 cause first requested-by test" });
+		apply(l, interpret(l, `extend ${relaunched}`)!);
+		expect(requests(l, relaunched)).toEqual([]);
+	});
+
+	test("a user-driven workload stopped at the ceiling is raised but not relaunched", () => {
+		const { ledger: l } = tempLedger();
+		const { wl } = withLane(l, "user-driven");
+		stopAtCeiling(l, wl);
+		expect(apply(l, interpret(l, `extend ${wl}`)!)).toContain(`lane-t-1 stopped at the ceiling and ${wl} is user-driven, so nothing relaunches`);
 		expect(ceilingOf(l, wl)).toEqual({ usd: 100, wallMin: 720 });
-		expect(l.slice(sl)).toMatchObject({ state: "done", artifact: `answered extend ${answer}` });
-	});
-
-	test("`<n> withdraw` withdraws it with then cancel, the same as a bare withdraw", () => {
-		const { ledger: l } = tempLedger();
-		const { wl, sl, q, numbering, n } = numberedCeiling(l);
-		const r = interpretBatch(l, numbering, `${n} withdraw`);
-		expect(r).toEqual({ ok: true, items: [{ n, cmd: { kind: "withdraw", workloadId: wl, questionId: q, then: "cancel" } }] });
-		if (!r?.ok) throw new Error("not accepted");
-		l.write(() => r.items.map((i) => apply(l, i.cmd)));
-		expect(l.question(q)!.state).toBe("withdrawn");
-		expect(l.instructions(wl).at(-1)).toMatchObject({ kind: "withdrawal", disposition: "cancel" });
-		expect(l.slice(sl)!.state).toBe("cancelled");
-	});
-
-	test("`<n> stop` is accepted and only completes the slice", () => {
-		const { ledger: l } = tempLedger();
-		const { wl, sl, q, numbering, n } = numberedCeiling(l);
-		const r = interpretBatch(l, numbering, `${n} stop`);
-		expect(r).toEqual({ ok: true, items: [{ n, cmd: { kind: "answer", workloadId: wl, questionId: q, answer: "stop" } }] });
-		if (!r?.ok) throw new Error("not accepted");
-		l.write(() => r.items.map((i) => apply(l, i.cmd)));
-		expect(l.slice(sl)).toMatchObject({ state: "done", artifact: `answered stop ${l.question(q)!.resolved_by!}` });
-		expect(ceilingBodies(l, wl)).toEqual(["ceiling: usd 50 wall 360 source stakes normal"]);
-	});
-
-	test("a bare extend with two ceiling questions open is ambiguous, never applied to the first", () => {
-		const { ledger: l } = tempLedger();
-		const a = withCeilingQuestion(l);
-		const wl = l.openWorkload({ by: SURFACE_BY, brief: "second", stakes: "normal", mode: "autonomous" });
-		const sl = l.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: "sl-ceiling-2", task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
-		const q = l.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body: "80 % of the ceiling", options: [...CEILING_OPTIONS] });
-		// Both workloads can open in the same ms, so the in-flight order (and with it the candidates' order) is not fixed: compare as a set.
-		const cmd = interpret(l, "extend");
-		expect(cmd).toMatchObject({ kind: "ambiguous", word: "extend" });
-		if (cmd?.kind !== "ambiguous") throw new Error("not ambiguous");
-		expect(cmd.candidates).toHaveLength(2);
-		expect(cmd.candidates).toEqual(
-			expect.arrayContaining([
-				{ kind: "question", workloadId: a.wl, rowId: a.q },
-				{ kind: "question", workloadId: wl, rowId: q },
-			]),
-		);
-		expect(interpret(l, `extend ${q}`)).toMatchObject({ kind: "answer", questionId: q, answer: "extend" });
+		expect(requests(l, wl)).toEqual([]);
 	});
 });
 
@@ -314,7 +266,7 @@ describe("the orchestrator's lowering tool", () => {
 		const f = fakePi();
 		const e = env();
 		const seed = open(e);
-		const { wl } = withCeilingQuestion(seed);
+		const { wl } = withLane(seed);
 		const closed = seed.openWorkload({ by: SURFACE_BY, brief: "old", stakes: "normal", mode: "autonomous" });
 		seed.closeWorkload(closed, { by: SURFACE_BY });
 		seed.close();
@@ -346,7 +298,7 @@ describe("the orchestrator's lowering tool", () => {
 describe("the one-liner and the render", () => {
 	test("the one-liner carries the effective ceiling; the block shows the newest spend against it", () => {
 		const { ledger: l } = tempLedger();
-		const { wl } = withCeilingQuestion(l);
+		const { wl } = withLane(l);
 		expect(oneLiner(l, l.workload(wl)!)).toMatch(/ · ceiling \$50 \/ 6h$/);
 		const block = () => renderWorkload(l, l.inFlight().find((w) => w.workload.id === wl)!);
 		expect(block()).not.toContain("spent $");

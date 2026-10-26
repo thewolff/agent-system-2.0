@@ -1,123 +1,159 @@
-// plugins/index.ts drives the real vendored adapters (plugins/VENDOR.md): in the orchestrator session
-// ask-graham's every-idea nudge and i-have-audhd's session-start core reach the turn, and the Stop
-// settles without a block; in a lane or with no role nothing registers and nothing is sent.
-// The i-have-audhd half spawns the vendored hooks/*.mjs under the temp HOME the test preload sets,
-// the way the adapter does (`sh -lc 'node …'`); with no node there (the test runner's account), the
-// adapter fails open and those two tests skip, visibly, rather than pass on nothing.
+// plugins/index.ts under the installed OMP's own loader and runner (plugins/test/omp-host.ts), against the
+// real vendored adapters (plugins/VENDOR.md, PLAN-2 D4):
+//   - the orchestrator and every lane run i-have-audhd and ask-graham, and no lane but a by-hand one gets
+//     a pair_* tool (paired-coding.test.ts covers the by-hand lane);
+//   - a hand, which OMP builds by re-binding the parent's prepared factories into a child session with the
+//     parent's env still set, runs no adapter callback and holds no pair_* tool, whether its session file
+//     names a parent or it has no header at all;
+//   - installed marketplace copies of all three adapters stay unloaded beside plugins/index.ts while a
+//     control plugin seeded the same way loads;
+//   - the real adapters read and write only the world's HOME (omp-host.ts world()): the startup hook's
+//     child process and the adapter's in-process fail-open log both land there, and the real home's
+//     ~/.claude/.i-have-audhd-state keeps its existence and mtime.
+// i-have-audhd's session-start core comes from its hooks/*.mjs, which the adapter spawns with `sh -lc
+// 'node …'`; with no node there the adapter fails open and the expected messages say so.
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import pluginsLoader from "../index.ts";
+import { bindPrepared, countedPrepared, discoverWithSeededPlugins, HAS_OMP, INDEX, loadIndex, OMP_SKIP, pairTools, REAL_HOME, type SessionKind, session, stamp, world } from "./omp-host.ts";
 
 const NO_NODE = Bun.spawnSync(["sh", "-lc", "command -v node"]).exitCode !== 0;
-const NODE_SKIP = NO_NODE ? " [skipped: no node from `sh -lc`, which the i-have-audhd adapter spawns its hooks with]" : "";
+/** The hidden messages a prompt carries after session_start: i-have-audhd's core (when node runs its hook), then ask-graham's nudge. */
+const STARTED = NO_NODE ? ["ask-graham"] : ["i-have-audhd-session-start", "ask-graham"];
 
-type Handler = (event: unknown, ctx: unknown) => unknown;
-
-function fakePi() {
-	const handlers = new Map<string, Handler[]>();
-	const sent: { message: { customType: string; content: string; display: boolean }; options: { deliverAs: string } }[] = [];
-	return {
-		handlers,
-		sent,
-		on(name: string, handler: Handler) {
-			handlers.set(name, [...(handlers.get(name) ?? []), handler]);
-		},
-		sendMessage(message: { customType: string; content: string; display: boolean }, options: { deliverAs: string }) {
-			sent.push({ message, options });
-		},
-		async emit(name: string, event: unknown, ctx: unknown): Promise<unknown[]> {
-			const out: unknown[] = [];
-			for (const h of handlers.get(name) ?? []) out.push(await h(event, ctx));
-			return out;
-		},
-	};
-}
-
-const SKILL = readFileSync(join(import.meta.dir, "..", "i-have-audhd", "skills", "i-have-audhd", "SKILL.md"), "utf8");
-const INJECT_SPAN = SKILL.slice(SKILL.indexOf("<!-- inject:start -->") + "<!-- inject:start -->".length, SKILL.indexOf("<!-- inject:end -->")).trim();
-
-let home: string;
-let cwd: string;
-let ctx: { cwd: string; sessionManager: { getSessionId: () => string; getEntries: () => unknown[] } };
-
-beforeAll(() => {
-	home = mkdtempSync(join(tmpdir(), "plugins-loader-home-"));
-	cwd = mkdtempSync(join(tmpdir(), "plugins-loader-cwd-"));
-	mkdirSync(join(home, ".config", "ask-graham"), { recursive: true });
-	writeFileSync(join(home, ".config", "ask-graham", "config"), "intensity=every-idea\n");
-	ctx = { cwd, sessionManager: { getSessionId: () => "plugins-loader-test", getEntries: () => [] } };
-});
-afterAll(() => {
-	rmSync(home, { recursive: true, force: true });
-	rmSync(cwd, { recursive: true, force: true });
+let dispose: (() => void) | undefined;
+afterEach(() => {
+	dispose?.();
+	dispose = undefined;
 });
 
-describe("plugins/index.ts in the orchestrator session", () => {
-	test("ask-graham at every-idea queues one hidden nextTurn nudge for an rpc or interactive input, none for extension text", async () => {
-		const pi = fakePi();
-		pluginsLoader(pi, { env: { AGENT_SYSTEM_ROLE: "orchestrator" }, home });
-		await pi.emit("input", { text: "what if we built a dashboard", source: "rpc" }, ctx);
-		await pi.emit("input", { text: "injected", source: "extension" }, ctx);
-		await pi.emit("input", { text: "or a CLI", source: "interactive" }, ctx);
-		expect(pi.sent.map((s) => [s.message.customType, s.message.display, s.options.deliverAs])).toEqual([
-			["ask-graham", false, "nextTurn"],
-			["ask-graham", false, "nextTurn"],
-		]);
-	});
+describe("plugins/index.ts loaded by OMP into a top-level session", () => {
+	for (const [label, env] of [
+		["the orchestrator", { AGENT_SYSTEM_ROLE: "orchestrator" }],
+		["the orchestrator, even with AGENT_SYSTEM_BY_HAND=1", { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_BY_HAND: "1" }],
+		["an autonomous lane", { AGENT_SYSTEM_ROLE: "lane" }],
+	] as const) {
+		test.skipIf(!HAS_OMP)(`${label}: nothing runs before session_start; after it a prompt carries i-have-audhd's core and ask-graham's nudge, and no pair_* tool exists${OMP_SKIP}`, async () => {
+			const w = world(env);
+			dispose = w.dispose;
+			const s = await session(await loadIndex(w.cwd), w.cwd, "main", w.root);
+			expect(await s.beforeAgentStart("what if we built a dashboard")).toEqual([]);
+			await s.start();
+			const messages = await s.beforeAgentStart("what if we built a dashboard");
+			expect(messages.map((m) => m.customType)).toEqual(STARTED);
+			expect(messages.every((m) => m.display === false)).toBe(true);
+			expect(pairTools(s.tools())).toEqual([]);
+			expect(s.registrations).toEqual([]);
+		}, 30_000);
+	}
 
-	test("ask-graham at the default level (no config) sends nothing", async () => {
-		const pi = fakePi();
-		const bare = mkdtempSync(join(tmpdir(), "plugins-loader-bare-"));
-		try {
-			pluginsLoader(pi, { env: { AGENT_SYSTEM_ROLE: "orchestrator" }, home: bare });
-			await pi.emit("input", { text: "what if we built a dashboard", source: "rpc" }, ctx);
-			expect(pi.sent).toEqual([]);
-		} finally {
-			rmSync(bare, { recursive: true, force: true });
+	for (const [label, env] of [
+		["no role (a plain omp on this profile)", {}],
+		["no role with AGENT_SYSTEM_BY_HAND=1", { AGENT_SYSTEM_BY_HAND: "1" }],
+	] as const) {
+		test.skipIf(!HAS_OMP)(`${label}: the extension registers no handler and no tool${OMP_SKIP}`, async () => {
+			const w = world(env);
+			dispose = w.dispose;
+			const s = await session(await loadIndex(w.cwd), w.cwd, "main", w.root);
+			for (const event of ["session_start", "before_agent_start", "session_stop", "tool_call", "input"]) expect(s.runner.hasHandlers(event)).toBe(false);
+			await s.start();
+			expect(await s.beforeAgentStart("what if we built a dashboard")).toEqual([]);
+			expect(s.tools()).toEqual([]);
+		});
+	}
+});
+
+describe("a hand: the parent's prepared plugins/index.ts re-bound into a child session, the parent's env still set", () => {
+	const parents = [
+		["an orchestrator", { AGENT_SYSTEM_ROLE: "orchestrator" }],
+		["an autonomous lane", { AGENT_SYSTEM_ROLE: "lane" }],
+		["a by-hand lane", { AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_BY_HAND: "1" }],
+	] as const;
+	const children: [string, SessionKind][] = [
+		["a persisted child (its header names the parent session)", "persisted-child"],
+		["a headerless in-memory child", "headerless-child"],
+	];
+	for (const [parent, env] of parents) {
+		for (const [child, kind] of children) {
+			test.skipIf(!HAS_OMP)(`${parent}'s hand, ${child}: no adapter callback runs and no pair_* tool is registered${OMP_SKIP}`, async () => {
+				const w = world(env);
+				dispose = w.dispose;
+				// The plain production factory, as the parent prepared it.
+				const parentLoad = await loadIndex(w.cwd);
+				const plain = await session(await bindPrepared(parentLoad.preparedExtensions, w.cwd), w.cwd, kind, w.root);
+				await plain.start();
+				await plain.start();
+				expect(await plain.beforeAgentStart("what if we built a dashboard")).toEqual([]);
+				expect(pairTools(plain.tools())).toEqual([]);
+				expect(plain.registrations).toEqual([]);
+
+				// The same factory with every adapter handler counted when OMP calls it.
+				const calls: string[] = [];
+				const s = await session(await bindPrepared([countedPrepared(calls)], w.cwd), w.cwd, kind, w.root);
+				await s.start();
+				await s.beforeAgentStart("what if we built a dashboard");
+				await s.runner.emit({ type: "input", text: "pair with me", source: "interactive" });
+				await s.runner.emitToolCall({ type: "tool_call", toolName: "write", toolCallId: "c1", input: { path: join(w.cwd, "x"), content: "x" } });
+				await s.runner.emitSessionStop({ signal: new AbortController().signal, session_id: "hand", last_assistant_message: { role: "assistant", content: [{ type: "text", text: "Done." }] } });
+				await s.start();
+				expect(calls).toEqual([]);
+				expect(pairTools(s.tools())).toEqual([]);
+				expect(s.registrations).toEqual([]);
+			});
 		}
-	});
+	}
 
-	test.skipIf(NO_NODE)(`i-have-audhd: after session_start the next turn carries the SKILL.md core as one hidden message, until a context shows it delivered${NODE_SKIP}`, async () => {
-		const pi = fakePi();
-		pluginsLoader(pi, { env: { AGENT_SYSTEM_ROLE: "orchestrator" }, home });
-		expect(await pi.emit("before_agent_start", { prompt: "hi" }, ctx)).not.toContainEqual(expect.objectContaining({ message: expect.anything() }));
-		await pi.emit("session_start", {}, ctx);
-		const offered = (await pi.emit("before_agent_start", { prompt: "hi" }, ctx)).filter(Boolean) as {
-			message: { customType: string; content: string; display: boolean; details: { delivery: string } };
-		}[];
-		expect(offered).toHaveLength(1);
-		const { message } = offered[0]!;
-		expect(message.customType).toBe("i-have-audhd-session-start");
-		expect(message.display).toBe(false);
-		expect(message.content).toContain(INJECT_SPAN.split("\n")[0]!);
-		expect(message.content).toContain("- 11. Machinery anchors");
-		await pi.emit("context", { messages: [message] }, ctx);
-		expect((await pi.emit("before_agent_start", { prompt: "next" }, ctx)).filter(Boolean)).toEqual([]);
-	}, 20_000);
-
-	test.skipIf(NO_NODE)(`i-have-audhd: a session_stop on a short reply settles without a block${NODE_SKIP}`, async () => {
-		const pi = fakePi();
-		pluginsLoader(pi, { env: { AGENT_SYSTEM_ROLE: "orchestrator" }, home });
-		const results = await pi.emit("session_stop", { session_id: "p", last_assistant_message: { role: "assistant", content: [{ type: "text", text: "Done." }] } }, ctx);
-		expect(results).toEqual([undefined]);
+	test.skipIf(!HAS_OMP)(`control: the same counted factory in the by-hand lane's own session does reach the adapters${OMP_SKIP}`, async () => {
+		const w = world({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_BY_HAND: "1" });
+		dispose = w.dispose;
+		const calls: string[] = [];
+		const s = await session(await bindPrepared([countedPrepared(calls)], w.cwd), w.cwd, "main", w.root);
+		await s.start();
+		await s.beforeAgentStart("what if we built a dashboard");
+		expect(calls).toEqual(["i-have-audhd session_start", "i-have-audhd before_agent_start", "ask-graham before_agent_start"]);
+		expect(pairTools(s.tools()).length).toBe(8);
 	}, 30_000);
 });
 
-describe("plugins/index.ts outside the orchestrator session", () => {
-	for (const [label, env] of [
-		["a lane (AGENT_SYSTEM_ROLE=lane)", { AGENT_SYSTEM_ROLE: "lane" }],
-		["no role (a hand or a plain omp)", {}],
-	] as const) {
-		test(`${label}: no handler registers, so an rpc input and a session_start send nothing`, async () => {
-			const pi = fakePi();
-			pluginsLoader(pi, { env, home });
-			expect([...pi.handlers.keys()]).toEqual([]);
-			await pi.emit("input", { text: "what if we built a dashboard", source: "rpc" }, ctx);
-			await pi.emit("session_start", {}, ctx);
-			expect(pi.sent).toEqual([]);
-		});
-	}
+describe("the developer's HOME (the world's HOME stands in for it)", () => {
+	const realState = join(REAL_HOME, ".claude", ".i-have-audhd-state");
+
+	test.skipIf(!HAS_OMP || NO_NODE)(`the startup hook, a child process, reads no profile and leaves its judge notice marker under the world's HOME; the real state dir is untouched${OMP_SKIP}`, async () => {
+		const w = world({ AGENT_SYSTEM_ROLE: "orchestrator" });
+		dispose = w.dispose;
+		const s = await session(await loadIndex(w.cwd), w.cwd, "main", w.root);
+		const before = stamp(realState);
+		await s.start();
+		const messages = await s.beforeAgentStart("what if we built a dashboard");
+		expect(stamp(realState)).toEqual(before);
+		const core = messages.find((m) => m.customType === "i-have-audhd-session-start")?.content ?? "";
+		expect(core).toContain("No reader profile is configured");
+		expect(existsSync(join(w.home, ".claude", ".i-have-audhd-state", "judge-notice-shown"))).toBe(true);
+	}, 30_000);
+
+	test.skipIf(!HAS_OMP)(`a startup hook that fails is logged by the adapter in-process under the world's HOME; the real state dir is untouched${OMP_SKIP}`, async () => {
+		const w = world({ AGENT_SYSTEM_ROLE: "orchestrator" });
+		dispose = w.dispose;
+		process.env.I_HAVE_AUDHD_PLUGIN_ROOT = join(w.root, "no-such-plugin");
+		const s = await session(await loadIndex(w.cwd), w.cwd, "main", w.root);
+		const before = stamp(realState);
+		await s.start();
+		const messages = await s.beforeAgentStart("what if we built a dashboard");
+		expect(stamp(realState)).toEqual(before);
+		expect(messages.map((m) => m.customType)).toEqual(["ask-graham"]);
+		expect(readFileSync(join(w.home, ".claude", ".i-have-audhd-state", "errors.log"), "utf8")).toContain("omp-adapter fail-open: omp-adapter: CLI exited");
+	}, 30_000);
+});
+
+describe("marketplace copies of the three adapters (VENDOR.md clash C11)", () => {
+	test.skipIf(!HAS_OMP)(`OMP's discovery under profile/config.yml's disabledExtensions skips installed i-have-audhd, ask-graham and paired-coding while a control plugin and plugins/index.ts load${OMP_SKIP}`, () => {
+		const w = world({});
+		dispose = w.dispose;
+		const { loaded, errors } = discoverWithSeededPlugins(w.root, ["i-have-audhd", "ask-graham", "paired-coding", "decoy-control"]);
+		expect(errors).toEqual([]);
+		expect(loaded.filter((p) => p.endsWith("/decoy-control/omp/decoy-control-omp.ts"))).toHaveLength(1);
+		expect(loaded.filter((p) => /\/(i-have-audhd|ask-graham|paired-coding)\/omp\/[a-z-]+-omp\.ts$/.test(p))).toEqual([]);
+		expect(loaded.filter((p) => p === INDEX)).toHaveLength(1);
+	}, 30_000);
 });

@@ -341,7 +341,7 @@ describe("nothing for what is not an open plan question (guards)", () => {
 		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
 		expect(l.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: null }).won).toBe(true);
 		const park = l.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "/tmp/plan-park/PLAN.md\nreview-park: the reviewer's lab is down; same-lab or wait?", options: ["same-lab", "wait"] });
-		const orch = raiseOrchestratorQuestion(l, { body: "/tmp/plan-orch/PLAN.md is the one to keep?", options: ["yes", "no"], about: null });
+		const orch = raiseOrchestratorQuestion(l, { body: "/tmp/plan-orch/PLAN.md is the one to keep?", options: ["yes", "no"], about: null }).raised;
 		const reserved = seedReserved(l);
 		l.close();
 		const x = await start(e);
@@ -413,7 +413,7 @@ describe("surface lines (D2)", () => {
 		expect(needs).not.toContain("plan for");
 
 		const l2 = open(e);
-		const oq = raiseOrchestratorQuestion(l2, { body: `Is ${q} the plan to approve tonight?`, options: ["yes", "no"], about: null });
+		const oq = raiseOrchestratorQuestion(l2, { body: `Is ${q} the plan to approve tonight?`, options: ["yes", "no"], about: null }).raised;
 		l2.close();
 		x.f.sent.length = 0;
 		timers[0]!.fn();

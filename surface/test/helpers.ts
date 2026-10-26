@@ -232,6 +232,8 @@ export interface FakeRecord {
 	/** On a `prompt` event: the frame's id and message. */
 	id?: string;
 	message?: string;
+	/** On a `prompt` event: the `@file` initial message (an interactive launch's first turn), not an rpc frame. */
+	initial?: boolean;
 	/** One per rpc command frame the fake received, in arrival order (`set_model` carries its provider and modelId). */
 	command?: string;
 	provider?: string;
@@ -291,11 +293,12 @@ export function tempRepo(): string {
  * window and the SIGKILL grace are shortened through the runner's two test knobs; `over` adds or
  * replaces environment variables. The quota polls (`AS2_HEADROOM_POLLS`, classifier/src/headroom.ts) point at a file that
  * does not exist, so the runner's guard is open and never reads the real quota-watch polls (PLAN wl-mv71x5rwdu7eo0 § 4); a
- * headroom test passes its own fixture in `over`.
+ * headroom test passes its own fixture in `over`. `tag` names the temp root (`surface-<tag>-…`): one with spaces puts spaces in
+ * every path beneath it (HOME, the lane dir and its prompt.md, the repo and its worktree).
  */
-export function laneRoot(over: Record<string, string> = {}): LaneRoot {
+export function laneRoot(over: Record<string, string> = {}, tag = "lane-root"): LaneRoot {
 	// git rev-parse --show-toplevel reports the canonical path and the worktree is derived from it: the root is canonical too.
-	const root = realpathSync(tmp("lane-root"));
+	const root = realpathSync(tmp(tag));
 	const home = join(root, "home");
 	const profile = join(home, ".omp", "profiles", "agent-system-2", "agent");
 	mkdirSync(profile, { recursive: true });

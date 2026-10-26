@@ -5,17 +5,20 @@
 //
 // On fire (D3), a line pushes at once on the poll that finds it:
 // 1. `lane-died` on a workload that still has open or paused slices;
-// 2. a `question` that is the runner's ceiling question (`isCeilingQuestion`): spend at 80 %, and the
-//    stop at 100 % through the line's `stopped` state (surface/src/errors.ts);
-// 3. `idle` whose `lane-exit:` is `outcome stop reason ceiling`: a ceiling stop after the question
-//    was answered or withdrawn;
+// 2. a `notice` that is the runner's ceiling notice (`parseCeilingNotice`, written by the lane runner): spend at
+//    80 %, or the stop at 100 % (PLAN wl-mvfkv7llkp7nk0 § 4);
+// 3. `idle` whose `lane-exit:` is `outcome stop reason ceiling`: a ceiling stop;
 // 4. `test-run`: a red or error full-suite run at a PR head;
-// 5. `pair` (PLAN wl-mvb9mw00ycfjeo D4): a taken line always, and an offer line whenever its question is
-//    on fire (2. above: the ceiling question's offer).
-// Everything else waits for the window.
-import type { Ledger } from "../../ledger/src/index";
+// 5. `pair` (PLAN wl-mvb9mw00ycfjeo D4): a taken line;
+// 6. `security-red` (PLAN wl-mvg1vs0rhnu3gg § 3.3): a run with a failing security test, whatever holds the workload;
+// 7. a `question` or `reserved` line with state `now` (PLAN wl-mvg1vs0rhnu3gg § 1.0–1.3, surface/src/errors.ts): a
+//    question a valid `now:` control entry marks, or a reserved request whose rule is in NOW_RESERVED;
+// 8. `scratch` for the daily sweep's `scratch-disk:` (§ 1.1: a full disk); a lane's over-cap line is not.
+// Everything else waits for the window: every other `notice` line (surface/src/notice.ts), and every other question and
+// reserved request (a blind "not known until it runs" one among them).
+import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
+import { parseCeilingNotice } from "./ceiling";
 import type { ErrorLine } from "./errors";
-import { isCeilingQuestion } from "./input";
 import { controlEntries, laneExit } from "./launch";
 import { pendingBlock, pendingItems, pendingWaits } from "./pending";
 
@@ -37,29 +40,34 @@ export function surfaceWord(text: string): "pending" | "brb" | "back" | null {
 	return w === "pending" || w === "brb" || w === "back" ? w : null;
 }
 
-/**
- * Whether `line` goes out on its own poll rather than waiting for the window (the kinds below). A `pair` line (PLAN
- * wl-mvb9mw00ycfjeo D4): a taken line always; an offer line whenever its question is (the ceiling question).
- */
+/** Whether `line` goes out on its own poll rather than waiting for the window (the kinds above). */
 export function onFire(ledger: Ledger, line: ErrorLine): boolean {
 	switch (line.kind) {
 		case "lane-died": {
 			const w = ledger.workload(line.workloadId);
 			return w !== null && (w.open_slices > 0 || w.paused_slices > 0);
 		}
-		case "question":
-		case "pair": {
-			if (line.kind === "pair" && line.state === "taken") return true;
-			const q = ledger.question(line.rowId);
-			return q !== null && isCeilingQuestion(q, ledger.slice(q.slice_id));
+		case "notice": {
+			const m = ledger.message(line.rowId);
+			return m !== null && m.created_by === LANE_RUNNER_BY && parseCeilingNotice(m.body) !== null;
 		}
+		case "pair":
+			return line.state === "taken";
 		case "idle": {
 			const exit = controlEntries(ledger.entries(line.workloadId, "assumption")).find((c) => c.id === line.rowId);
 			const parsed = exit?.prefix === "lane-exit" && exit.laneId !== null ? laneExit([exit], exit.laneId) : null;
 			return parsed !== null && parsed.outcome === "stop" && parsed.reason === "ceiling";
 		}
 		case "test-run":
+		case "security-red":
 			return true;
+		case "question":
+		case "reserved":
+			return line.state === "now";
+		case "scratch": {
+			const entry = controlEntries(ledger.entries(line.workloadId, "assumption")).find((c) => c.id === line.rowId);
+			return entry?.prefix === "scratch-disk";
+		}
 		default:
 			return false;
 	}
