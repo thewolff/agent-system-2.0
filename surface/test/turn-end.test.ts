@@ -12,6 +12,8 @@ import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, openWorkDeathBody, parkFailedDeathBody, releasedOpen, releasedOpenBody, sliceCounts, turnEnd,
 	turnEndDeathBody, type TurnEndInput, unsettledHands,
 } from "../src/turn-end";
+// A namespace import for the helper PLAN wl-mvidsu83epvpj4 adds: a name turn-end.ts does not export fails only the test that calls it.
+import * as turnEndModule from "../src/turn-end";
 import { recordDecision } from "../scripts/lane";
 import { SURFACE_BY } from "../src/types";
 import { tempLedger } from "./helpers";
@@ -24,6 +26,7 @@ function input(over: Partial<TurnEndInput> = {}, parkResult: { parked: false } |
 	const calls: number[] = [];
 	const i: TurnEndInput = {
 		settled: true, idle: false, status: "completed", unsettledHands: [], liveTestRuns: [], deadTestRuns: [], pendingReserved: false, held: true, handedOff: false, releasedOpen: null, receipt: false,
+		selfReleased: false,
 		slices: { open: 1, paused: 0, done: 0 }, continues: 0, idleContinues: 0, limit: CONTINUE_LIMIT,
 		park: () => {
 			calls.push(1);
@@ -331,5 +334,84 @@ describe("recordDecision: the runner's decided outcome on the ledger before EOF 
 		expect(ledger.question(q)!.state).toBe("open");
 		expect(markers()).toEqual([[LANE_RUNNER_BY, `lane-decided: ${LANE} parked`]]);
 		expect(deaths()).toEqual([]);
+	});
+});
+
+// PLAN wl-mvidsu83epvpj4 D1, D2 (R1, R2, R4): a lane that released itself decides at once, a standing receipt skips only the
+// settle wait. Through turnEnd's existing export for the ladder (origin/main ignores the new field and answers `wait`), and the
+// namespace import for the new helper.
+describe("turn end: a self-released lane and a standing receipt (PLAN wl-mvidsu83epvpj4 D2)", () => {
+	const RUN = { runId: "tr-0dead2", pr: 18, slice: "sl-full" };
+	/** omp unsettled (a background job pending), not idle: today's `wait`, the lane released (holder none) unless `over` says otherwise. */
+	const released = (over: Partial<TurnEndInput> = {}, parkResult?: { parked: false } | { parked: true; open: number }) =>
+		input({ settled: false, selfReleased: true, held: false, ...over }, parkResult);
+
+	test("self-released, unsettled: no wait; hands, live runs and a dead run never continue or hold; completed without a marker", () => {
+		for (const over of [{}, { unsettledHands: [HAND] }, { liveTestRuns: ["tr-live1"] }, { deadTestRuns: [RUN] }, { unsettledHands: [HAND], continues: 2 }]) {
+			const { i, calls } = released(over);
+			expect(turnEnd(i).decision).toBe("completed");
+			expect(calls).toHaveLength(1);
+		}
+	});
+
+	test("self-released with its released-open marker: open-work with the release's death line; handed off: released, before the park", () => {
+		const marked = released({ releasedOpen: 2, unsettledHands: [HAND] }).i;
+		const t = turnEnd(marked);
+		expect(t.decision).toBe("open-work");
+		expect(turnEndDeathBody(LANE, t, marked)).toBe(`lane-died: ${LANE}: released with 2 open slice(s), no done-because`);
+		const handoff = released({ handedOff: true, liveTestRuns: ["tr-live1"] }, { parked: true, open: 1 });
+		expect(turnEnd(handoff.i).decision).toBe("released");
+		expect(handoff.calls).toHaveLength(0);
+	});
+
+	test("self-released after an error or aborted prompt: that death; a parked question still parks", () => {
+		for (const status of ["error", "aborted"] as const) expect(turnEnd(released({ status, unsettledHands: [HAND] }).i).decision).toBe(status);
+		expect(turnEnd(released({}, { parked: true, open: 1 }).i).decision).toBe("parked");
+	});
+
+	test("a receipt alone skips only the wait: completed while held, and hands still continue then hold", () => {
+		expect(turnEnd(input({ settled: false, receipt: true }).i).decision).toBe("completed");
+		expect(turnEnd(input({ settled: false, receipt: true, held: false }).i).decision).toBe("completed");
+		expect(turnEnd(input({ settled: false, receipt: true, unsettledHands: [HAND] }).i).decision).toBe("continue");
+		expect(turnEnd(input({ settled: false, receipt: true, unsettledHands: [HAND], continues: 2 }).i).decision).toBe("hold");
+		expect(turnEnd(input({ settled: false, receipt: true, liveTestRuns: ["tr-live1"], continues: 2 }).i).decision).toBe("hold");
+	});
+
+	test("neither: an unsettled session still waits; a settled one decides as before", () => {
+		expect(turnEnd(input({ settled: false, unsettledHands: [HAND] }).i).decision).toBe("wait");
+		expect(turnEnd(input({ unsettledHands: [HAND] }).i).decision).toBe("continue");
+		expect(turnEnd(input({ held: false }).i).decision).toBe("completed");
+	});
+
+	test("selfReleased: the newest holder change naming the lane is its own release (to none or to jo); a lapse, a takeover, another writer's release or a later claim is not", () => {
+		const self = turnEndModule.selfReleased;
+		const claim = { from: null, to: LANE, by: LANE };
+		expect(self([claim, { from: LANE, to: null, by: LANE }], LANE)).toBe(true);
+		// lane_handoff: its own release, then Jo's claim (a change that does not name the lane)
+		expect(self([claim, { from: LANE, to: null, by: LANE }, { from: null, to: "jo", by: "jo" }], LANE)).toBe(true);
+		expect(self([claim, { from: LANE, to: "jo", by: LANE }], LANE)).toBe(true);
+		// a lease lapse writes no change
+		expect(self([claim], LANE)).toBe(false);
+		// taken over by another holder after the lapse, and released by them
+		expect(self([claim, { from: LANE, to: "lane-t-2", by: "lane-t-2" }, { from: "lane-t-2", to: null, by: "lane-t-2" }], LANE)).toBe(false);
+		// released by the runner (finish) or the starter (a stop with no runner)
+		expect(self([claim, { from: LANE, to: null, by: LANE_RUNNER_BY }], LANE)).toBe(false);
+		expect(self([claim, { from: LANE, to: null, by: "lane-starter" }], LANE)).toBe(false);
+		// released, then claimed again by the same lane id
+		expect(self([claim, { from: LANE, to: null, by: LANE }, { from: null, to: LANE, by: LANE }], LANE)).toBe(false);
+		// another lane's self-release says nothing about this one
+		expect(self([{ from: null, to: "lane-t-2", by: "lane-t-2" }, { from: "lane-t-2", to: null, by: "lane-t-2" }], LANE)).toBe(false);
+		expect(self([], LANE)).toBe(false);
+	});
+
+	test("selfReleased over a real ledger's holder history: release, then the runner's renewal, still released", () => {
+		const { ledger: l } = tempLedger();
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "b", stakes: "normal", mode: "autonomous" });
+		l.claimWorkload(wl, { by: LANE, holder: LANE, leaseMs: 60_000 });
+		expect(turnEndModule.selfReleased(l.holderChanges(wl), LANE)).toBe(false);
+		l.releaseWorkload(wl, { by: LANE, holder: LANE });
+		l.renewLease(wl, { by: LANE_RUNNER_BY, holder: LANE, leaseMs: 60_000 });
+		expect(turnEndModule.selfReleased(l.holderChanges(wl), LANE)).toBe(true);
+		l.close();
 	});
 });

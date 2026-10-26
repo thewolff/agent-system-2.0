@@ -196,7 +196,7 @@ describe("T6: the prompt's error rides the death line", () => {
 		const promptError = promptErrorOf(frame);
 		expect(promptError).toEqual({ message: "Refusal (cyber):\n the request was declined", provider: "anthropic", model: "claude-opus-5-5", retryable: false });
 		const input: TurnEndInput = {
-			settled: true, idle: false, status: "error", unsettledHands: [], liveTestRuns: [], deadTestRuns: [], pendingReserved: false, held: true, handedOff: false, releasedOpen: null, receipt: false,
+			settled: true, idle: false, status: "error", unsettledHands: [], liveTestRuns: [], deadTestRuns: [], pendingReserved: false, held: true, handedOff: false, releasedOpen: null, receipt: false, selfReleased: false,
 			slices: { open: 1, paused: 0, done: 0 }, continues: 0, idleContinues: 0, limit: 2, park: () => ({ parked: false }), promptError,
 		};
 		const t = turnEnd(input);
