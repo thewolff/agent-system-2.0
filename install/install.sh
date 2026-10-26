@@ -264,10 +264,15 @@ fi
 # ---- 1. read and validate the manifest ------------------------------------------------------
 step "reading manifest $MANIFEST"
 [ -f "$MANIFEST" ] || fail "no manifest at $MANIFEST" 2
-# [[ == ]] honours nocasematch (BASH_ENV can set it); the membership checks below must be exact.
+# Case patterns below must not inherit nocasematch from BASH_ENV.
 shopt -u nocasematch
-# One path per line, wrapped in newlines, so membership is a builtin [[ ]] match: no process per row.
-paths=$'\n'
+# Find the first duplicate with exact string keys, not a scan of a growing path string per row.
+# Leave reporting in the validation loop so an earlier invalid row still wins.
+duplicate_line="$(LC_ALL=C awk -F '\t' '
+	substr($0, 1, 1) == "#" || $0 == "" { next }
+	!header_seen++ { next }
+	++seen["p" $1] == 2 { print NR; exit }
+' "$MANIFEST")"
 rows=0
 header_seen=0
 line_no=0
@@ -290,7 +295,9 @@ while IFS= read -r line || [ -n "$line" ]; do
 		continue
 	fi
 	IFS=$'\t' read -r path kind dest extra <<<"$line"
+	# read collapses TAB whitespace; require the original row to match its three fields exactly.
 	[ -n "${path:-}" ] && [ -n "${kind:-}" ] && [ -n "${dest:-}" ] && [ -z "${extra:-}" ] \
+		&& [ "$line" = "$path"$'\t'"$kind"$'\t'"$dest" ] \
 		|| fail "manifest line $line_no: need exactly three TAB-separated fields: $line" 2
 	[ -f "$REPO/$path" ] || fail "manifest line $line_no: $path does not exist in the repo" 2
 	[ ! -L "$REPO/$path" ] || fail "manifest line $line_no: $path is a symbolic link; machinery artifacts are regular files" 2
@@ -343,8 +350,7 @@ while IFS= read -r line || [ -n "$line" ]; do
 		ledger-module | module | extension | data | test | doc | install) [ "$dest" = "-" ] || fail "manifest line $line_no: kind $kind is used in place; destination must be -" 2 ;;
 		*) fail "manifest line $line_no: unknown kind '$kind' (this installer knows ledger-schema, ledger-module, ledger-init, ledger-backup, ledger-backup-agent, module, extension, tier, profile, skill, skill-asset, launcher, data, test, doc, install)" 2 ;;
 	esac
-	if [[ $paths == *$'\n'"$path"$'\n'* ]]; then fail "manifest line $line_no: duplicate row for $path" 2; fi
-	paths="$paths$path"$'\n'
+	[ "$line_no" != "$duplicate_line" ] || fail "manifest line $line_no: duplicate row for $path" 2
 	rows=$((rows + 1))
 done <"$MANIFEST"
 [ "$header_seen" -eq 1 ] || fail "manifest has no header row" 2
@@ -377,10 +383,19 @@ missing=""
 links=""
 for dir in "${MACHINERY_DIRS[@]}"; do
 	[ -e "$REPO/$dir" ] || [ -L "$REPO/$dir" ] || continue
-	while IFS= read -r file; do
-		rel="${file#"$REPO"/}"
-		[[ $paths == *$'\n'"$rel"$'\n'* ]] || missing="$missing  $rel"$'\n'
-	done < <(find "$REPO/$dir" -type f ! -name '.DS_Store' ! -path '*/node_modules/*' | LC_ALL=C sort)
+	unmanifested="$(find "$REPO/$dir" -type f ! -name '.DS_Store' ! -path '*/node_modules/*' | LC_ALL=C sort |
+		INSTALL_REPO="$REPO" LC_ALL=C awk -F '\t' '
+			FNR == NR { paths["p" $1] = 1; next }
+			{
+				rel = substr($0, length(ENVIRON["INSTALL_REPO"]) + 2)
+				if (!(("p" rel) in paths)) print rel
+			}
+		' "$MANIFEST" -)" || fail "could not check manifest coverage under $dir" 2
+	if [ -n "$unmanifested" ]; then
+		while IFS= read -r rel; do
+			missing="$missing  $rel"$'\n'
+		done <<<"$unmanifested"
+	fi
 	while IFS= read -r link; do
 		links="$links  ${link#"$REPO"/} -> $(readlink "$link")"$'\n'
 	done < <(find "$REPO/$dir" -type l ! -path '*/node_modules/*' | LC_ALL=C sort)

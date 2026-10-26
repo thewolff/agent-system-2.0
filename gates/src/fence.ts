@@ -373,6 +373,38 @@ function fenceState(ctx: Ctx): FenceState {
 	return s;
 }
 
+/** The refusal every fenced call of this session gets once a later handler bypassed the fence, or null. */
+export function fenceBypassRefusal(ctx: Ctx): { block: true; reason: string } | null {
+	const bypassed = fenceState(ctx).bypassed;
+	return bypassed === null ? null : { block: true, reason: bypassReason(bypassed) };
+}
+
+/**
+ * Whether the clean-shell switch is on for a session, read per call through `cleanShell` (none: off);
+ * a read that fails is off, said once per reason. The fence and pair_run (src/pair-call.ts) each hold one.
+ */
+export function cleanShellSwitch(env: Record<string, string | undefined>, cleanShell?: CleanShellCheck): (ctx: Ctx) => Promise<boolean> {
+	const noticed = new Set<string>();
+	return async (ctx) => {
+		if (!cleanShell) return false;
+		let read: CleanShellRead;
+		try {
+			read = await cleanShell();
+		} catch (err) {
+			read = { ok: false, error: err instanceof Error ? err.message : String(err) };
+		}
+		if (!read.ok && !noticed.has(read.error)) {
+			noticed.add(read.error);
+			try {
+				ctx.ui.notify(`M4b OS fence: ${CLEAN_SHELL_KEY} could not be read (${read.error}), so the clean shell is off for this session and bash runs as before it; fix the value, or run \`as2 clean-shell off\``, "warning");
+			} catch {
+				// A notice is a display aid: a session without a UI still runs the call.
+			}
+		}
+		return cleanShellOn(read, env[WORKLOAD_ENV]);
+	};
+}
+
 /**
  * The session entry the fence appends when a bash call starts as exactly its own wrapper: `data` is
  * `{ toolCallId, sha256 }`, the hash of that wrapper (wrapperHash). An OMP custom entry is persisted
@@ -599,32 +631,13 @@ export function registerFence(
 	cleanShell?: CleanShellCheck,
 ): void {
 	const sandboxExec = sandboxExecPath(env);
-	const noticed = new Set<string>();
-
-	/** Whether the switch is on for this session; a read that fails is off, said once. */
-	const cleanShellOnHere = async (ctx: Ctx): Promise<boolean> => {
-		if (!cleanShell) return false;
-		let read: CleanShellRead;
-		try {
-			read = await cleanShell();
-		} catch (err) {
-			read = { ok: false, error: err instanceof Error ? err.message : String(err) };
-		}
-		if (!read.ok && !noticed.has(read.error)) {
-			noticed.add(read.error);
-			try {
-				ctx.ui.notify(`M4b OS fence: ${CLEAN_SHELL_KEY} could not be read (${read.error}), so the clean shell is off for this session and bash runs as before it; fix the value, or run \`as2 clean-shell off\``, "warning");
-			} catch {
-				// A notice is a display aid: a session without a UI still runs the call.
-			}
-		}
-		return cleanShellOn(read, env[WORKLOAD_ENV]);
-	};
+	const cleanShellOnHere = cleanShellSwitch(env, cleanShell);
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "bash") return undefined;
 		const state = fenceState(ctx);
-		if (state.bypassed !== null) return { block: true, reason: bypassReason(state.bypassed) };
+		const bypassed = fenceBypassRefusal(ctx);
+		if (bypassed) return bypassed;
 		let settings: FenceSettings;
 		try {
 			if (!loadSettings) throw new FenceError("no host settings reader was handed to the fence (gates/index.ts passes OMP's live Settings; a caller registering the fence directly passes its own)");

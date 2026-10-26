@@ -1,5 +1,5 @@
 // PLAN wl-mvb9mw00ycfjeo (Jo's issue 53): every pair offer is its own line, never an option hidden inside a review-limit
-// or ceiling question, and a taken pair hands Jo `as2 lane <workload-id>` on a line of its own.
+// question, and a taken pair hands Jo `as2 lane <workload-id>` on a line of its own.
 //   R2  an offered question lists no `pair` among its shown options, and the offer is its own line in needs-you, the
 //       pending block (under its answer line, and under its overflow sentence), the ledger render, and the `#n takes:`
 //       and `(q-… takes:)` refusals.
@@ -11,7 +11,7 @@
 //   R7  a taken pair with no lane holding the workload shows the taken line, the command on its own line, whatever else
 //       is open, and no relaunch idle line; the stopped lane's own late `lane-started:` does not hide it.
 //   R12 the idle line on a user-driven workload offers `as2 lane <wl>` and never says relaunch.
-//   R13 a needs-you pair line is on fire whenever its question is, a taken line always.
+//   R13 a taken pair line is on fire; an offer line waits for the window as its round-limit question does.
 //   R14 the receipt's wait-for-the-lane prefix shows only when a lane stop was requested.
 //   R15 chaos counts a taken line as covering the workload's unheld open slices and ignores offer lines in its one-line check.
 import { describe, expect, test } from "bun:test";
@@ -19,7 +19,6 @@ import { reviewLimitBody, reviewRoundBody, ROUND_LIMIT_OPTIONS } from "../../cla
 import { CLASSIFIER_BY, LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
 import surfaceInputRow, { type Copier, pbcopyCopier } from "../extensions/surface-input";
 import { onFire, pendingText } from "../src/batch";
-import { CEILING_OPTIONS } from "../src/ceiling";
 import { emptySeen, judgePoll } from "../src/chaos";
 import { errorLines } from "../src/errors";
 import { apply, interpret, interpretBatch, interpretPaste } from "../src/input";
@@ -58,23 +57,9 @@ function roundLimitQuestion(ledger: Ledger, o: { held: boolean }): { wl: string;
 	return { wl, sl, q };
 }
 
-/** The runner's ceiling question on its sl-ceiling slice, offered on signals B and C. */
-function ceilingQuestion(ledger: Ledger, o: { held: boolean }): { wl: string; sl: string; q: string } {
-	const wl = workload(ledger, o.held);
-	const sl = ledger.addSlice({
-		by: LANE_RUNNER_BY, workloadId: wl, id: `sl-ceiling-${wl.slice(3)}-1`, task: "Jo decides the ceiling overrun",
-		doneCondition: "Jo answers stop, extend or split for the ceiling usd 50 wall 360", inputs: "ceiling",
-	});
-	const q = ledger.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body: "80 % of the ceiling", options: [...CEILING_OPTIONS, "pair"] });
-	ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: `pair-offer: ${q} site ceiling signals b,c` });
-	return { wl, sl, q };
-}
-
 /** The needs-you offer line Jo reads for each fixture. */
 const roundLimitOffer = (wl: string, q: string) =>
 	`pair offer on ${BRIEF} (${q}): it reads as UI or taste work. Answer pair ${q} to stop the lane and drive it yourself (as2 lane ${wl}).`;
-const ceilingOffer = (wl: string, q: string) =>
-	`pair offer on ${BRIEF} (${q}): you sent several long steers; no slice done yet. Answer pair ${q} to stop the lane and drive it yourself (as2 lane ${wl}).`;
 /** The pending block's offer line for the round-limit fixture. */
 const pendingOffer = (wl: string, q: string) =>
 	`  ↳ pair offer: it reads as UI or taste work. Answer pair ${q} instead to stop the lane and drive it yourself (as2 lane ${wl}).`;
@@ -104,15 +89,15 @@ describe("R2: the offer is its own line, and pair is never a shown option", () =
 		expect(lines[1]!.line).toBe(`lane on ${wl} is waiting on you (${q}, slice ${sl}): The review of ${sl} reached its round limit: 1 failed round of 1 allowed (normal stakes). — answer with one word: ${listed(ROUND_LIMIT_OPTIONS)} (or \`withdraw\`)`);
 	});
 
-	test("the wake render's needs-you list carries the offer line before the question; a ceiling offer names its own reasons", () => {
+	test("the wake render's needs-you list carries the offer line before the question, whose options leave pair out", () => {
 		const { ledger } = tempLedger();
-		const { wl, q } = ceilingQuestion(ledger, { held: true });
+		const { wl, q } = roundLimitQuestion(ledger, { held: true });
 		const text = renderWake(ledger).text;
-		const offerAt = text.indexOf(ceilingOffer(wl, q));
+		const offerAt = text.indexOf(roundLimitOffer(wl, q));
 		expect(offerAt).toBeGreaterThan(-1);
 		expect(text.indexOf(`waiting on you (${q},`)).toBeGreaterThan(offerAt);
-		expect(text).toContain(`answer with one word: ${listed(CEILING_OPTIONS)} (or \`withdraw\`)`);
-		expect(text).not.toContain("stop / extend / split / pair");
+		expect(text).toContain(`answer with one word: ${listed(ROUND_LIMIT_OPTIONS)} (or \`withdraw\`)`);
+		expect(text).not.toContain("extend / accept / stop / pair");
 	});
 
 	test("the pending block: the offer line is right under its question's answer line, whose `also:` list leaves pair out", () => {
@@ -281,7 +266,7 @@ describe("R5, R6: the pair echo through the surface-input extension, with an inj
 
 	test("a copier that says why not: `(not copied: <why>)` on its own line, and the answer stands", async () => {
 		const { ledger, path: db } = tempLedger();
-		const { wl, q } = ceilingQuestion(ledger, { held: false });
+		const { wl, q } = roundLimitQuestion(ledger, { held: false });
 		const echoes = await surface(db, copierOf("pbcopy exited 1").copier).prompt(`pair ${q}`);
 		expect(echoes.at(-1)!.slice(-2)).toEqual([`as2 lane ${wl}`, "(not copied: pbcopy exited 1)"]);
 		expect(ledger.question(q)!.state).toBe("answered");
@@ -324,7 +309,7 @@ describe("R5, R6: the pair echo through the surface-input extension, with an inj
 		test(`${path} with two pair answers on two offered questions: the copier is called once, with the last pair answer's command`, async () => {
 			const { ledger, path: db } = tempLedger();
 			const first = roundLimitQuestion(ledger, { held: false });
-			const last = ceilingQuestion(ledger, { held: false });
+			const last = roundLimitQuestion(ledger, { held: false });
 			const c = copierOf(null);
 			const echoes = await surface(db, c.copier).prompt(words(ledger, first.q, last.q));
 			expect(c.copied).toEqual([`as2 lane ${last.wl}`]);
@@ -423,17 +408,15 @@ describe("R12: the idle line on a user-driven workload", () => {
 });
 
 describe("R13: on fire", () => {
-	test("an offer line is on fire exactly when its question's line is; a taken line always", () => {
+	test("an offer line waits for the window, as its round-limit question does; a taken line is on fire", () => {
 		const { ledger } = tempLedger();
-		const ceiling = ceilingQuestion(ledger, { held: true });
-		const limit = roundLimitQuestion(ledger, { held: false });
+		const { wl, q } = roundLimitQuestion(ledger, { held: false });
 		const lines = errorLines(ledger);
-		const fire = (wl: string, kind: string) => onFire(ledger, lines.find((l) => l.workloadId === wl && l.kind === kind)!);
-		expect([fire(ceiling.wl, "pair"), fire(ceiling.wl, "question")]).toEqual([true, true]);
-		expect([fire(limit.wl, "pair"), fire(limit.wl, "question")]).toEqual([false, false]);
-		pairTyped(ledger, limit.q);
+		const fire = (kind: string) => onFire(ledger, lines.find((l) => l.workloadId === wl && l.kind === kind)!);
+		expect([fire("pair"), fire("question")]).toEqual([false, false]);
+		pairTyped(ledger, q);
 		const taken = errorLines(ledger).find((l) => l.kind === "pair" && l.state === "taken")!;
-		expect(taken.workloadId).toBe(limit.wl);
+		expect(taken.workloadId).toBe(wl);
 		expect(onFire(ledger, taken)).toBe(true);
 	});
 });
@@ -443,7 +426,7 @@ describe("R14: the receipt's wait-for-the-lane prefix", () => {
 		const { ledger } = tempLedger();
 		const held = roundLimitQuestion(ledger, { held: true });
 		expect(pairTyped(ledger, held.q).split("\n").slice(-2)).toEqual(["when the lane has stopped (a few seconds), in another terminal:", `as2 lane ${held.wl}`]);
-		const free = ceilingQuestion(ledger, { held: false });
+		const free = roundLimitQuestion(ledger, { held: false });
 		const receipt = pairTyped(ledger, free.q);
 		expect(receipt.split("\n").slice(-2)).toEqual(["in another terminal:", `as2 lane ${free.wl}`]);
 		expect(receipt).not.toContain("when the lane has stopped");

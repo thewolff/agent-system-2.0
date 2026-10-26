@@ -21,7 +21,7 @@ import {
 	bundleInputs, CREDENTIAL_PATHS, execArgv, execConfigOf, type InstallVerdict, installDecision, installLayout, parseSource, preflightDecision, preflightProbes,
 	probeCall, probeDecision, readInstall, renderExecWrapper, type SweepScope, UID_SWEEP, WrapperRenderError,
 } from "../src/as2test";
-import { AS2TEST_USER, CHILD_ENV_ALLOWLIST, childEnv, WRAPPER_EXIT, type WrapperCall } from "../src/test-run";
+import { AS2TEST_USER, CHILD_ENV_ALLOWLIST, childEnv, partResult, WRAPPER_EXIT, type WrapperCall } from "../src/test-run";
 import { tmp } from "./helpers";
 
 /**
@@ -143,7 +143,7 @@ function wrapperFor(b: Box, name: string, opts: { sweepLockWaitMs?: number }): s
 /** The caller's env carries credentials; the wrapper's `env -i` must drop them. */
 const callerEnv = (b: Box) => ({
 	PATH: `${b.bin}:${SYS_PATH}`, HOME: "/nonexistent-home", GH_TOKEN: "ghp_secret", ANTHROPIC_API_KEY: "sk-ant", OPENAI_API_KEY: "sk-oai", MOONSHOT_API_KEY: "ms",
-	SSH_AUTH_SOCK: "/tmp/agent.sock", OMP_TOKEN: "omp", AGENT_SYSTEM_TEST_RUNS: "/tmp/runs", AGENT_SYSTEM_LEDGER_DB: "/tmp/ledger.db", LANG: "C",
+	SSH_AUTH_SOCK: "/tmp/agent.sock", OMP_TOKEN: "omp", AGENT_SYSTEM_TEST_RUNS: "/tmp/runs", AGENT_SYSTEM_LEDGER_DB: "/tmp/ledger.db", TMPDIR: "/nonexistent-caller-tmp", LANG: "C",
 });
 
 interface Ran {
@@ -169,7 +169,7 @@ const setCurrent = (b: Box, runId: string) => writeFileSync(join(b.root, "stage"
 const workOf = (b: Box, runId: string) => join(b.root, "runs", runId);
 
 /** A fixture repo bundled into `<stage>/<run id>/repo.bundle`, with caps; returns the head sha. */
-function stageRepo(b: Box, runId: string, files: Record<string, string>, caps = { fullCapMin: 1, soloCapMin: 1 }): string {
+function stageRepo(b: Box, runId: string, files: Record<string, string>, caps: Record<string, unknown> = { fullCapMin: 1, soloCapMin: 1 }): string {
 	const src = join(b.root, "..", `src-${runId}`);
 	mkdirSync(src, { recursive: true });
 	git(src, "init", "-q", "-b", "main");
@@ -195,7 +195,7 @@ const ORPHAN_TEST = `import { test } from "bun:test";\ntest("orphan", () => {\n\
 const STUBBORN_TEST = `import { test } from "bun:test";\ntest("stubborn", () => {\n\tBun.spawnSync(["/bin/sh", "-c", "(trap '' TERM; exec /bin/sleep 300) >/dev/null 2>&1 & echo $! > ../orphan.pid"]);\n});\n`;
 
 /** prepare a fresh run: stage the repo, publish current, clone. */
-function prepared(b: Box, runId: string, files: Record<string, string>, caps?: { fullCapMin: number; soloCapMin: number }): string {
+function prepared(b: Box, runId: string, files: Record<string, string>, caps?: Record<string, unknown>): string {
 	const sha = stageRepo(b, runId, files, caps);
 	setCurrent(b, runId);
 	const r = call(b, { sub: "prepare", runId, sha });
@@ -261,6 +261,117 @@ describe("fencing on <stage>/current", () => {
 		}
 		rmSync(join(b.root, "stage", "current"));
 		expect(call(b, { sub: "full", runId: "tr-mine" }).exit).toBe(WRAPPER_EXIT.fenced);
+	});
+});
+
+describe("wrapper startup TMPDIR", () => {
+	test("the rendered env-i command supplies an existing private per-run temp before starting Bun, and cleanup removes only the old run", () => {
+		// The stand-in inspects TMPDIR at executable entry, before any Bun or JS initialization.
+		const b = box("startup-tmp");
+		const fakeBun = join(b.root, "..", "bun-at-entry");
+		writeFileSync(fakeBun, "#!/bin/sh\n[ -d \"$TMPDIR\" ] && [ ! -L \"$TMPDIR\" ] || exit 90\n[ -z \"$GH_TOKEN\" ] && [ -z \"$HOME\" ] || exit 91\n: > \"$TMPDIR/native-at-startup\"\nprintf '%s\\n' \"$TMPDIR\"\n", { mode: 0o755 });
+		const exec = join(b.root, "..", "exec-at-entry");
+		writeFileSync(exec, renderExecWrapper({ root: b.root, bun: fakeBun, script: SCRIPT, sweepScope: "groups" }), { mode: 0o755 });
+		for (const id of ["tr-first", "tr-second"]) {
+			setCurrent(b, id);
+			const r = raw(b, ["sweep", id], exec);
+			expect(r.exit).toBe(0);
+			const temp = join(workOf(b, id), ".wrapper-tmp");
+			expect(r.stdout.trim()).toBe(temp);
+			expect(realpathSync(temp)).toBe(temp);
+			expect(statSync(temp).mode & 0o777).toBe(0o700);
+			expect(readFileSync(join(temp, "native-at-startup"), "utf8")).toBe("");
+		}
+		// A startup-only run from pre-prepare sweep remains preparable, exactly once.
+		expect(call(b, { sub: "sweep", runId: "tr-second" }).exit).toBe(WRAPPER_EXIT.ok);
+		const sha = stageRepo(b, "tr-second", { "a.test.ts": OK_TEST });
+		expect(call(b, { sub: "prepare", runId: "tr-second", sha }).exit).toBe(WRAPPER_EXIT.ok);
+		expect(statSync(join(workOf(b, "tr-second"), ".wrapper-tmp")).mode & 0o777).toBe(0o700);
+		expect(call(b, { sub: "prepare", runId: "tr-second", sha }).exit).toBe(WRAPPER_EXIT.refused);
+		expect(call(b, { sub: "full", runId: "tr-second" }).exit).toBe(0);
+		expect(call(b, { sub: "cleanup", runId: "tr-second", oldRunId: "tr-first" }).exit).toBe(0);
+		expect(existsSync(workOf(b, "tr-first"))).toBe(false);
+		expect(existsSync(join(workOf(b, "tr-second"), ".wrapper-tmp", "native-at-startup"))).toBe(true);
+	});
+
+	test("a real Bun process reached through the rendered wrapper sees only its run's startup TMPDIR", () => {
+		const source = join(dir("startup-source"), "entry.ts");
+		writeFileSync(source, `import { statSync, writeFileSync } from "node:fs";\nimport { tmpdir } from "node:os";\nconst tmp = process.env.TMPDIR!;\nwriteFileSync(tmp + "/loaded-by-bun", "yes");\nconsole.log(JSON.stringify({ tmp, osTmp: tmpdir(), mode: statSync(tmp).mode & 0o777, token: process.env.GH_TOKEN ?? null }));\n`);
+		const b = box("startup-real-bun", { script: source });
+		for (const id of ["tr-reala", "tr-realb"]) {
+			setCurrent(b, id);
+			const r = call(b, { sub: "sweep", runId: id });
+			expect(r.exit).toBe(0);
+			const tmp = join(workOf(b, id), ".wrapper-tmp");
+			expect(JSON.parse(r.stdout)).toEqual({ tmp, osTmp: tmp, mode: 0o700, token: null });
+			expect(readFileSync(join(tmp, "loaded-by-bun"), "utf8")).toBe("yes");
+		}
+	});
+
+	test("invalid and fenced bootstrap calls create no run directory", () => {
+		const b = box("bootstrap-fenced");
+		setCurrent(b, "tr-current");
+		for (const args of [["full", "tr-BAD"], ["prepare", "tr-current", "bad"], ["cleanup", "tr-current", "../bad"], ["solo", "tr-current", "../bad.test.ts"], ["probe", "tr-current", "relative"]]) {
+			expect(raw(b, args).exit).toBe(WRAPPER_EXIT.refused);
+			expect(readdirSync(join(b.root, "runs"))).toEqual([]);
+		}
+		for (const sub of ["sweep", "full"]) expect(raw(b, [sub, "tr-other"]).exit).toBe(WRAPPER_EXIT.fenced);
+		rmSync(join(b.root, "stage", "current"));
+		expect(raw(b, ["sweep", "tr-current"]).exit).toBe(WRAPPER_EXIT.fenced);
+		expect(readdirSync(join(b.root, "runs"))).toEqual([]);
+		setCurrent(b, "tr-current");
+		expect(raw(b, ["prepare", "tr-current", "a".repeat(40)]).exit).toBe(WRAPPER_EXIT.failed);
+		expect(readdirSync(join(b.root, "runs"))).toEqual([]);
+	});
+
+	test("bootstrap refuses run, temp and area symlinks without touching their targets, including dangling links", () => {
+		for (const target of ["run", "temp", "runs", "stage", "locks", "dangling"]) {
+			const b = box(`bootstrap-link-${target}`);
+			const outside = dir(`bootstrap-outside-${target}`);
+			setCurrent(b, "tr-link");
+			if (target === "run" || target === "dangling") symlinkSync(target === "run" ? outside : join(outside, "absent"), workOf(b, "tr-link"));
+			else if (target === "temp") {
+				mkdirSync(workOf(b, "tr-link"));
+				symlinkSync(outside, join(workOf(b, "tr-link"), ".wrapper-tmp"));
+			} else {
+				rmSync(join(b.root, target), { recursive: true });
+				symlinkSync(outside, join(b.root, target));
+			}
+			expect(call(b, { sub: "sweep", runId: "tr-link" }).exit).toBe(WRAPPER_EXIT.refused);
+			expect(readdirSync(outside)).toEqual([]);
+		}
+	});
+
+	test("bootstrap refuses a non-private existing temp instead of repairing or using it", () => {
+		const b = box("bootstrap-permissions");
+		setCurrent(b, "tr-public");
+		const tmp = join(workOf(b, "tr-public"), ".wrapper-tmp");
+		mkdirSync(tmp, { recursive: true, mode: 0o755 });
+		chmodSync(tmp, 0o755);
+		expect(call(b, { sub: "sweep", runId: "tr-public" }).exit).toBe(WRAPPER_EXIT.refused);
+		expect(statSync(tmp).mode & 0o777).toBe(0o755);
+		expect(readdirSync(tmp)).toEqual([]);
+	});
+
+	test("prepare refuses an existing non-bootstrap run without adding files, and direct prepare retains exclusive creation", () => {
+		const b = box("bootstrap-existing");
+		const sha = stageRepo(b, "tr-existing", { "a.test.ts": OK_TEST });
+		setCurrent(b, "tr-existing");
+		mkdirSync(workOf(b, "tr-existing"));
+		writeFileSync(join(workOf(b, "tr-existing"), "keep"), "untouched");
+		expect(call(b, { sub: "prepare", runId: "tr-existing", sha }).exit).toBe(WRAPPER_EXIT.refused);
+		expect(readdirSync(workOf(b, "tr-existing"))).toEqual(["keep"]);
+		const emptySha = stageRepo(b, "tr-empty", { "a.test.ts": OK_TEST });
+		setCurrent(b, "tr-empty");
+		mkdirSync(workOf(b, "tr-empty"));
+		expect(call(b, { sub: "prepare", runId: "tr-empty", sha: emptySha }).exit).toBe(WRAPPER_EXIT.refused);
+		expect(readdirSync(workOf(b, "tr-empty"))).toEqual([]);
+		const directSha = stageRepo(b, "tr-direct", { "a.test.ts": OK_TEST });
+		setCurrent(b, "tr-direct");
+		const args = [BUN, SCRIPT, "prepare", "tr-direct", directSha];
+		const env = { PATH: SYS_PATH, TMPDIR: dir("direct-runtime"), AS2TEST_EXEC_CONFIG: JSON.stringify(execConfigOf({ root: b.root, bun: BUN, script: SCRIPT, sweepScope: "groups" })) };
+		expect(Bun.spawnSync(args, { env, stderr: "pipe" }).exitCode).toBe(WRAPPER_EXIT.ok);
+		expect(Bun.spawnSync(args, { env, stderr: "pipe" }).exitCode).toBe(WRAPPER_EXIT.refused);
 	});
 });
 
@@ -385,6 +496,86 @@ describe("prepare, full and solo", () => {
 		expect(call(b, { sub: "full", runId: "tr-k1" }).exit).toBe(WRAPPER_EXIT.refused);
 		expect(call(b, { sub: "solo", runId: "tr-k1", file: "./a.test.ts" }).exit).toBe(WRAPPER_EXIT.refused);
 	});
+});
+
+// ---- parallel files: caps.json fullWorkers (workload wl-mvg2kzuvwngdmo) -------------------------------------------
+
+/**
+ * A test file that records the pid of the bun process running it as `../pid-<name>`, sleeps `ms`, then passes or fails.
+ * The sleep is real on purpose: the fixture runs in a separate bun process, and the claim under test is wall time across
+ * worker processes, which no fake clock in this process can stand in for.
+ */
+const sleeper = (name: string, ms: number, pass = true) =>
+	`import { expect, test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("sleeps ${name}", async () => {\n\twriteFileSync("../pid-${name}", String(process.pid));\n\tawait Bun.sleep(${ms});\n\texpect(${pass}).toBe(true);\n}, 60_000);\n`;
+/** The distinct bun processes that ran a side's sleeper files: one when serial, one per worker under `--parallel`. */
+const runners = (sideDir: string): Set<number> =>
+	new Set(readdirSync(sideDir).filter((n) => n.startsWith("pid-")).map((n) => Number(readFileSync(join(sideDir, n), "utf8"))));
+
+describe("fullWorkers: the PR full part runs its files at once; base and a keyless caps.json stay serial", () => {
+	test("fullWorkers 4 over four 1.5 s files: wall below the serial sum, and the merged junit reads through partResult to the failing test", () => {
+		const b = box("par");
+		const SLEEP = 1_500;
+		const files = { "s1.test.ts": sleeper("1", SLEEP), "s2.test.ts": sleeper("2", SLEEP), "s3.test.ts": sleeper("3", SLEEP, false), "s4.test.ts": sleeper("4", SLEEP) };
+		prepared(b, "tr-par1", files, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 4 });
+		const t0 = Date.now();
+		const r = call(b, { sub: "full", runId: "tr-par1" });
+		const wall = Date.now() - t0;
+		expect(r.exit).toBe(1);
+		expect(wall).toBeLessThan(4 * SLEEP);
+		const work = workOf(b, "tr-par1");
+		expect(runners(work).size).toBeGreaterThan(1);
+		const result = partResult({ junit: readFileSync(join(work, "full.xml"), "utf8"), log: readFileSync(join(work, "full.log"), "utf8"), exit: r.exit, ms: wall });
+		expect(result).toMatchObject({ pass: 3, fail: 1, skip: 0, exit: 1, error: null });
+		expect(result.failures.map((f) => f.name)).toEqual(["s3.test.ts > sleeps 3"]);
+	}, 60_000);
+
+	test("with fullWorkers 3 the PR full part uses several workers and base-full one; no key, or 1, runs on one; a malformed value is refused", () => {
+		const b = box("ser");
+		const files = { "q1.test.ts": sleeper("1", 300), "q2.test.ts": sleeper("2", 300), "q3.test.ts": sleeper("3", 300) };
+		const sha = prepared(b, "tr-ser1", files, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 3 });
+		const work = workOf(b, "tr-ser1");
+		expect(call(b, { sub: "full", runId: "tr-ser1" }).exit).toBe(0);
+		expect(runners(work).size).toBeGreaterThan(1);
+		expect(call(b, { sub: "base-prepare", runId: "tr-ser1", sha }).exit).toBe(WRAPPER_EXIT.ok);
+		expect(call(b, { sub: "base-full", runId: "tr-ser1" }).exit).toBe(0);
+		expect(runners(join(work, "base")).size).toBe(1);
+		expect(readFileSync(join(work, "base-full.xml"), "utf8")).toContain('name="sleeps 3"');
+
+		for (const [runId, caps] of [["tr-ser2", undefined], ["tr-ser3", { fullCapMin: 1, soloCapMin: 1, fullWorkers: 1 }]] as const) {
+			prepared(b, runId, files, caps);
+			expect(call(b, { sub: "full", runId }).exit).toBe(0);
+			expect({ runId, runners: runners(workOf(b, runId)).size }).toEqual({ runId, runners: 1 });
+		}
+
+		for (const [i, bad] of [0, 2.5, "3", -2, null].entries()) {
+			const runId = `tr-bad${i}`;
+			prepared(b, runId, files, { fullCapMin: 1, soloCapMin: 1, fullWorkers: bad });
+			const r = call(b, { sub: "full", runId });
+			expect({ bad, exit: r.exit }).toEqual({ bad, exit: WRAPPER_EXIT.refused });
+			expect(r.stderr).toContain("fullWorkers");
+		}
+	}, 120_000);
+
+	test("a parallel full part past its cap exits timeout, and after the sweep no worker and no worker's child is alive", async () => {
+		const b = box("parcap");
+		const hang = (name: string) =>
+			`import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("hangs ${name}", async () => {\n\twriteFileSync("../pid-${name}", String(process.pid));\n\tconst c = Bun.spawn(["/bin/sleep", "300"]);\n\twriteFileSync("../child-${name}", String(c.pid));\n\tawait new Promise(() => {});\n}, 600_000);\n`;
+		prepared(b, "tr-pc1", { "h1.test.ts": hang("1"), "h2.test.ts": hang("2"), "h3.test.ts": hang("3") }, { fullCapMin: 0.08, soloCapMin: 0.08, fullWorkers: 3 });
+		const r = call(b, { sub: "full", runId: "tr-pc1" });
+		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
+		expect(r.stderr).toContain("timeout");
+		const work = workOf(b, "tr-pc1");
+		const workers = [...runners(work)];
+		const children = readdirSync(work).filter((n) => n.startsWith("child-")).map((n) => Number(readFileSync(join(work, n), "utf8")));
+		pids.push(...workers, ...children);
+		// Every file had started on its own worker before the cap fired.
+		expect(workers).toHaveLength(3);
+		expect(children).toHaveLength(3);
+		const s = call(b, { sub: "sweep", runId: "tr-pc1" });
+		expect(s.stderr).toBe("");
+		expect(s.exit).toBe(WRAPPER_EXIT.ok);
+		expect(await until(() => [...workers, ...children].every((pid) => !alive(pid)), 3_000)).toBe(true);
+	}, 60_000);
 });
 
 // ---- sweep --------------------------------------------------------------------------------------------------
@@ -515,6 +706,23 @@ describe("cleanup", () => {
 		expect(readdirSync(runs).sort()).toEqual(["tr-link", "tr-n1", "tr-sib"]);
 		expect(readFileSync(join(outside, "keep"), "utf8")).toBe("x");
 		expect(readFileSync(join(runs, "tr-sib", "keep"), "utf8")).toBe("x");
+	});
+
+	test("cleanup unlinks a swapped old startup TMPDIR but preserves its target and the current run's temp", () => {
+		const b = box("cleanup-startup-link");
+		prepared(b, "tr-oldtmp", { "a.test.ts": OK_TEST });
+		const outside = dir("cleanup-startup-target");
+		writeFileSync(join(outside, "keep"), "private");
+		const oldTmp = join(workOf(b, "tr-oldtmp"), ".wrapper-tmp");
+		rmSync(oldTmp, { recursive: true });
+		symlinkSync(outside, oldTmp);
+		prepared(b, "tr-newtmp", { "a.test.ts": OK_TEST });
+		const newTmp = join(workOf(b, "tr-newtmp"), ".wrapper-tmp");
+		writeFileSync(join(newTmp, "keep"), "current");
+		expect(call(b, { sub: "cleanup", runId: "tr-newtmp", oldRunId: "tr-oldtmp" }).exit).toBe(WRAPPER_EXIT.ok);
+		expect(existsSync(workOf(b, "tr-oldtmp"))).toBe(false);
+		expect(readFileSync(join(outside, "keep"), "utf8")).toBe("private");
+		expect(readFileSync(join(newTmp, "keep"), "utf8")).toBe("current");
 	});
 });
 

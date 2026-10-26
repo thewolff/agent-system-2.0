@@ -232,6 +232,8 @@ export interface FakeRecord {
 	/** On a `prompt` event: the frame's id and message. */
 	id?: string;
 	message?: string;
+	/** On a `prompt` event: the `@file` initial message (an interactive launch's first turn), not an rpc frame. */
+	initial?: boolean;
 	/** One per rpc command frame the fake received, in arrival order (`set_model` carries its provider and modelId). */
 	command?: string;
 	provider?: string;
@@ -291,12 +293,16 @@ export function tempRepo(): string {
  * window and the SIGKILL grace are shortened through the runner's two test knobs; `over` adds or
  * replaces environment variables. The quota polls (`AS2_HEADROOM_POLLS`, classifier/src/headroom.ts) point at a file that
  * does not exist, so the runner's guard is open and never reads the real quota-watch polls (PLAN wl-mv71x5rwdu7eo0 § 4); a
- * headroom test passes its own fixture in `over`.
+ * headroom test passes its own fixture in `over`. `tag` names the temp root (`surface-<tag>-…`): one with spaces puts spaces in
+ * every path beneath it (HOME, the lane dir and its prompt.md, the repo and its worktree).
  */
-export function laneRoot(over: Record<string, string> = {}): LaneRoot {
+export function laneRoot(over: Record<string, string> = {}, tag = "lane-root"): LaneRoot {
 	// git rev-parse --show-toplevel reports the canonical path and the worktree is derived from it: the root is canonical too.
-	const root = realpathSync(tmp("lane-root"));
+	const root = realpathSync(tmp(tag));
 	const home = join(root, "home");
+	const temp = join(root, "tmp");
+	const bunCache = join(root, "bun-cache");
+	for (const path of [temp, bunCache]) mkdirSync(path, { mode: 0o700 });
 	const profile = join(home, ".omp", "profiles", "agent-system-2", "agent");
 	mkdirSync(profile, { recursive: true });
 	writeFileSync(join(profile, "config.yml"), "setupVersion: 2\n");
@@ -305,7 +311,7 @@ export function laneRoot(over: Record<string, string> = {}): LaneRoot {
 	Ledger.open(ledgerPath, { create: true, backup: false, backupOnOpen: false }).close();
 	const bin = join(root, "bin");
 	mkdirSync(bin);
-	writeFileSync(join(bin, "omp"), `#!/bin/sh\nexec bun ${FAKE_OMP} "$@"\n`);
+	writeFileSync(join(bin, "omp"), `#!/bin/sh\nexec bun --no-install ${FAKE_OMP} "$@"\n`);
 	chmodSync(join(bin, "omp"), 0o755);
 	const repo = join(root, "repo");
 	mkdirSync(join(repo, ".ai", "decision-log"), { recursive: true });
@@ -323,6 +329,7 @@ export function laneRoot(over: Record<string, string> = {}): LaneRoot {
 	const script = join(root, "omp-script.json");
 	const env: Record<string, string> = {
 		PATH: `${bin}:${process.env.PATH ?? ""}`, HOME: home, AGENT_SYSTEM_LEDGER_DB: ledgerPath, FAKE_OMP_RECORD: record, FAKE_OMP_SCRIPT: script,
+		TMPDIR: temp, BUN_INSTALL_CACHE_DIR: bunCache,
 		AGENT_SYSTEM_LANE_READY_MS: "4000", AGENT_SYSTEM_LANE_END_GRACE_MS: "1500", AGENT_SYSTEM_LEASE_MS: "60000", AS2_HEADROOM_POLLS: join(root, "no-headroom-polls.jsonl"), ...over,
 	};
 	return { root, home, repo, remote, ledgerPath, record, script, env };

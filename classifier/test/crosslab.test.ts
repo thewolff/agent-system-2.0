@@ -890,7 +890,9 @@ describe("Round limit (D9), wired", () => {
 
 	test("a passing round ends the loop with no question, and the next review starts a fresh loop with the full allowance", async () => {
 		const w = world();
-		const h = lane(w);
+		// This exercises loop accounting; read-only reviews above cover real git fingerprints.
+		// Avoid twelve synchronous snapshots (sixty git processes) across the six rounds here.
+		const h = lane(w, { fingerprint: () => "unchanged" });
 		h.laneMessage(OPUS);
 		await reviewRound(h, w, "rev-1", blocking("a"));
 		await reviewRound(h, w, "rev-2", blocking("b"));
@@ -2023,6 +2025,19 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 		expect(spawn?.block).toBe(true);
 		expect(spawn?.reason).toContain("parked on question");
 		asksAsToday(crossing);
+	});
+
+	test("T5b Jo's `end-ruling kimi-out` ends the rule at once: in the window, the park asks as today and no rule entry is written", async () => {
+		const control = world();
+		await ruleRuns(control, await built(control));
+		const w = world();
+		const h = await built(w);
+		// What the surface writes for Jo's word (surface/src/input.ts `end-ruling`): Jo's instruction on the standing workload.
+		w.ledger.openWorkload({ by: SURFACE_BY, id: "wl-orchestrator", brief: "standing", stakes: "normal", mode: "user-driven" });
+		w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: "wl-orchestrator", body: "end-ruling kimi-out", author: "jo", channel: "surface" });
+		down(w, KIMI);
+		expect((await reviewSpawn(h, w))?.block).toBe(true);
+		asksAsToday(w);
 	});
 
 	/** The control the review-time guards share: builders anthropic and openai, kimi uncredentialed → the rule's same-lab hand. */

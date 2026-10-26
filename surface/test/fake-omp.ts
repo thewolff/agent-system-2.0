@@ -51,8 +51,9 @@
 //                                (SIGKILL included) until the test opens the gate: a window the test controls
 // Record (JSONL appended at $FAKE_OMP_RECORD): { pid, argv, cwd, env: { AGENT_SYSTEM_*, OMP_PROFILE }, hooks: [the
 // SHELL_START_HOOK_NAMES its env carries, names only], session, resumed }
-// at start, then { pid, event } for each frame or signal seen: prompt (with its id and message), abort, eof, sigterm,
-// sigint, background-done / background-killed, and wake; and { pid, command, id, provider?, modelId? } for every rpc
+// at start, then { pid, event } for each frame or signal seen: prompt (with its id and message; the `@file` initial
+// message as { event: "prompt", initial: true, message }, run as the first turn), abort, eof, sigterm, sigint,
+// background-done / background-killed, and wake; and { pid, command, id, provider?, modelId? } for every rpc
 // command frame received, in arrival order (a test asserts `set_model` and its `get_state` came before `prompt`).
 // A new session file opens as OMP's does: a `title` line, then `{"type":"session","id":"<uuid>",…}` (the
 // header surface/src/ctx-index.ts reads), and get_state's sessionId is that id; a resumed file keeps its own header.
@@ -62,7 +63,8 @@ import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import orchestratorSurface from "../index";
-import { ctxOf, type FakeScript, type FakeStep, fakePi } from "./helpers";
+import { ctxOf, fakePi, loadTestText } from "./helpers";
+import type { FakeScript, FakeStep } from "./helpers";
 
 const script: FakeScript = process.env.FAKE_OMP_SCRIPT && existsSync(process.env.FAKE_OMP_SCRIPT) ? (JSON.parse(readFileSync(process.env.FAKE_OMP_SCRIPT, "utf8")) as FakeScript) : { steps: [] };
 const argv = process.argv.slice(2);
@@ -78,6 +80,22 @@ const named = flag("--model");
 let stateModel: { provider?: string; id?: string } | null =
 	script.stateModel !== undefined ? script.stateModel : named ? { provider: named.slice(0, named.indexOf("/")), id: named.slice(named.indexOf("/") + 1) } : { id: "fake" };
 const maxTime = flag("--max-time");
+// `@<path>` (interactive mode only: OMP refuses it under `--mode rpc` and exits 1, as it does for a missing file): OMP reads
+// each file as `<file name="<absolute path>">\n<text>\n</file>\n` and sends the text as the session's first user message
+// (@oh-my-pi/pi-coding-agent 18.8.6 src/cli/args.ts, file-processor.ts, initial-message.ts; main.ts session.prompt).
+const fileArgs = argv.filter((a) => a.startsWith("@")).map((a) => a.slice(1));
+if (fileArgs.length > 0 && flag("--mode") === "rpc") {
+	process.stderr.write("Error: @file arguments are not supported in RPC mode\n");
+	process.exit(1);
+}
+let initialMessage: string | null = null;
+for (const file of fileArgs) {
+	if (!existsSync(file)) {
+		process.stderr.write(`Error: File not found: ${file}\n`);
+		process.exit(1);
+	}
+	initialMessage = `${initialMessage ?? ""}<file name="${file}">\n${readFileSync(file, "utf8")}\n</file>\n`;
+}
 mkdirSync(sessionDir, { recursive: true });
 // `--resume <path>` appends to that same file, as OMP 18.4.4 does (`SessionManager.open(path, sessionDir)`): on workload
 // wl-muolz8qtp6ylfk, relaunched lanes 2–5 each reported lane 1's sessionFile in get_state (their lane-started: entries),
@@ -117,7 +135,7 @@ const durationMs = (d: string | null): number | null => {
 };
 
 const f = fakePi();
-orchestratorSurface(f.pi, process.env, {});
+await orchestratorSurface(f.pi, process.env, { loadText: loadTestText });
 const ctx = ctxOf({ cwd: process.cwd() });
 let shutDown = false;
 const shutdown = async (): Promise<void> => {
@@ -288,6 +306,12 @@ process.on("SIGINT", () => {
 	recordLine({ event: "sigint" });
 	void shutdown();
 });
+
+// The `@file` text is the first user message, after session_start, as OMP prompts it (no `input` event: it is not typed).
+if (initialMessage !== null) {
+	recordLine({ event: "prompt", initial: true, message: initialMessage });
+	void runPrompt(initialMessage);
+}
 
 const reader = Bun.stdin.stream().getReader();
 const decoder = new TextDecoder();

@@ -1,154 +1,145 @@
-// The runner's ceiling meter (DESIGN-workload-ceiling.md § 2 item 4, § 6) without spawning anything:
-// the pure step over the 80 / 100 thresholds and the ceiling question's state, and the ledger side
-// of a raise (slice, question and spend: in one write), of the question's state per ceiling value,
-// of the withdrawal at a clean finish, and of a relaunch that keeps the cumulative total, on a temp ledger.
+// The runner's ceiling meter (DESIGN-workload-ceiling.md § 2 item 4; PLAN wl-mvfkv7llkp7nk0 § 4, R11 and R12) without
+// spawning anything: the pure step over the 80 / 100 thresholds and the notices already sent, and the ledger side of a
+// notice (the held notice and its spend: in one write), of the notices per ceiling value, and of a relaunch that keeps
+// the cumulative total, on a temp ledger. No level asks Jo anything and nothing extends the ceiling.
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { LANE_RUNNER_BY } from "../../ledger/src/index";
-import { type Ceiling, CEILING_OPTIONS, ceilingQuestionBody, parseSpend, scanSpend, type Spend, wallMinutes } from "../src/ceiling";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, type Stakes } from "../../ledger/src/index";
+import { type Ceiling, ceilingKey, effectiveCeiling, parseCeilingNotice, parseSpend, scanSpend, type Spend, wallMinutes } from "../src/ceiling";
 import { controlEntries, laneExitBody, laneStartedBody } from "../src/launch";
-import { SURFACE_BY } from "../src/types";
-import { ceilingKey, ceilingQuestionState, type CeilingQuestionState, type MeterState, meterStep, raiseCeilingQuestion, withdrawCeilingQuestions } from "../scripts/lane";
+import { apply, interpret } from "../src/input";
+import { sendNotice } from "../src/notice";
+import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
+import { ceilingNoticesSent, type MeterState, meterPoll, meterStep, sendCeilingNotice } from "../scripts/lane";
 import { clock, tempLedger, tmp, workloadWithSlice } from "./helpers";
 
 const NORMAL: Ceiling = { usd: 50, wallMin: 360 };
 const EXTENDED: Ceiling = { usd: 100, wallMin: 720 };
 const spent = (usd: number, wallMin = 0): Spend => ({ usd, tokens: 1000, wallMin });
-const fresh: MeterState = { raised: [] };
-const step = (state: MeterState, ceiling: Ceiling, spend: Spend, question: CeilingQuestionState) => meterStep(state, { ceiling, spend, question });
+const fresh: MeterState = { sent: [] };
+const step = (state: MeterState, ceiling: Ceiling, spend: Spend, sent: readonly (80 | 100)[] = []) => meterStep(state, { ceiling, spend, sent });
 
 describe("meterStep: the step matrix", () => {
 	test("below 80 % of both halves: nothing", () => {
-		expect(step(fresh, NORMAL, spent(39.99, 287), "none")).toEqual({ state: fresh, level: 0, raise: false, stop: false });
+		expect(step(fresh, NORMAL, spent(39.99, 287))).toEqual({ state: fresh, level: 0, notice: null, stop: false });
 	});
 
-	test("exactly 80 % raises once and the lane keeps working; a second poll at 85 % does not raise again, from the ledger's open question or from the runner's own memory", () => {
-		const first = step(fresh, NORMAL, spent(40), "none");
-		expect(first).toMatchObject({ level: 80, raise: true, stop: false });
-		expect(first.state.raised).toEqual([ceilingKey(NORMAL)]);
-		expect(step(first.state, NORMAL, spent(42.5), "open")).toMatchObject({ level: 80, raise: false, stop: false });
-		// the raise this runner wrote is not in the rows it read (or they were read before the write): memory holds
-		expect(step(first.state, NORMAL, spent(42.5), "none")).toMatchObject({ raise: false, stop: false });
-		// a relaunched runner has no memory; the ledger's question is enough
-		expect(step(fresh, NORMAL, spent(42.5), "open")).toMatchObject({ raise: false, stop: false });
+	test("R11 exactly 80 % sends the 80 % notice once and the lane keeps working; a second poll at 85 % sends nothing, from the ledger's notice or from the runner's own memory", () => {
+		const first = step(fresh, NORMAL, spent(40));
+		expect(first).toMatchObject({ level: 80, notice: 80, stop: false });
+		expect(first.state.sent).toEqual([`80 ${ceilingKey(NORMAL)}`]);
+		expect(step(first.state, NORMAL, spent(42.5), [80])).toMatchObject({ level: 80, notice: null, stop: false });
+		// the notice this runner wrote is not in the rows it read (or they were read before the write): memory holds
+		expect(step(first.state, NORMAL, spent(42.5))).toMatchObject({ notice: null, stop: false });
+		// a relaunched runner has no memory; the ledger's notice is enough
+		expect(step(fresh, NORMAL, spent(42.5), [80])).toMatchObject({ notice: null, stop: false });
 	});
 
 	test("the wall half alone crosses 80 % and 100 %", () => {
-		expect(step(fresh, NORMAL, spent(1, 288), "none")).toMatchObject({ level: 80, raise: true, stop: false });
-		expect(step(fresh, NORMAL, spent(1, 360), "open")).toMatchObject({ level: 100, raise: false, stop: true });
+		expect(step(fresh, NORMAL, spent(1, 288))).toMatchObject({ level: 80, notice: 80, stop: false });
+		expect(step(fresh, NORMAL, spent(1, 360), [80])).toMatchObject({ level: 100, notice: 100, stop: true });
 	});
 
-	test("100 % with the question open stops, without a second question", () => {
-		const raised = step(fresh, NORMAL, spent(40), "none").state;
-		expect(step(raised, NORMAL, spent(50), "open")).toMatchObject({ level: 100, raise: false, stop: true });
+	test("R12 100 % stops and sends the stop notice once per ceiling value; every later poll at 100 % stops with no second notice", () => {
+		const warned = step(fresh, NORMAL, spent(40)).state;
+		const stopped = step(warned, NORMAL, spent(50), [80]);
+		expect(stopped).toMatchObject({ level: 100, notice: 100, stop: true });
+		expect(stopped.state.sent).toEqual([`80 ${ceilingKey(NORMAL)}`, `100 ${ceilingKey(NORMAL)}`]);
+		expect(step(stopped.state, NORMAL, spent(51), [80])).toMatchObject({ level: 100, notice: null, stop: true });
+		expect(step(fresh, NORMAL, spent(51), [80, 100])).toMatchObject({ level: 100, notice: null, stop: true });
 	});
 
-	test("100 % answered stop or split stops, without a second question", () => {
-		for (const q of ["stop", "split"] as const) expect(step(fresh, NORMAL, spent(51), q)).toMatchObject({ level: 100, raise: false, stop: true });
+	test("R12 a jump from 50 % to 100 % between polls stops and sends only the stop notice", () => {
+		expect(step(fresh, NORMAL, spent(25))).toMatchObject({ level: 0, notice: null, stop: false });
+		const jumped = step(fresh, NORMAL, spent(50));
+		expect(jumped).toMatchObject({ level: 100, notice: 100, stop: true });
+		expect(jumped.state.sent).toEqual([`100 ${ceilingKey(NORMAL)}`]);
 	});
 
-	test("100 % with no question open or answered for the value raises with the stop, even when this run raised it at 80 % and Jo withdrew it", () => {
-		const raised = step(fresh, NORMAL, spent(40), "none").state;
-		// Jo withdrew it at 85 %: this run does not ask again before 100 %
-		expect(step(raised, NORMAL, spent(42.5), "none")).toMatchObject({ level: 80, raise: false, stop: false });
-		const stopped = step(raised, NORMAL, spent(50), "none");
-		expect(stopped).toMatchObject({ level: 100, raise: true, stop: true });
-		expect(stopped.state.raised).toEqual([ceilingKey(NORMAL)]);
-	});
-
-	test("answered extend: the raised ceiling is the new value, so the lane at the old 100 % continues; an extend whose raise has not landed still stops at the old value", () => {
-		const raised = step(fresh, NORMAL, spent(40), "none").state;
-		expect(step(raised, EXTENDED, spent(50, 100), "none")).toMatchObject({ level: 0, raise: false, stop: false });
-		expect(step(raised, NORMAL, spent(50), "extend")).toMatchObject({ level: 100, raise: false, stop: true });
-	});
-
-	test("a jump from 50 % to 100 % between polls stops, and raises the question with the stop so Jo has the answers", () => {
-		expect(step(fresh, NORMAL, spent(25), "none")).toMatchObject({ level: 0, raise: false, stop: false });
-		const jumped = step(fresh, NORMAL, spent(50), "none");
-		expect(jumped).toMatchObject({ level: 100, raise: true, stop: true });
-		expect(jumped.state.raised).toEqual([ceilingKey(NORMAL)]);
-	});
-
-	test("a new ceiling after extend raises again at its own 80 %, once", () => {
-		const raised = step(fresh, NORMAL, spent(40), "none").state;
-		expect(step(raised, EXTENDED, spent(79.99), "none")).toMatchObject({ raise: false, stop: false });
-		const again = step(raised, EXTENDED, spent(80), "none");
-		expect(again).toMatchObject({ level: 80, raise: true, stop: false });
-		expect(again.state.raised).toEqual([ceilingKey(NORMAL), ceilingKey(EXTENDED)]);
-		expect(step(again.state, EXTENDED, spent(90), "none")).toMatchObject({ raise: false, stop: false });
+	test("a raised ceiling is a new value: the lane at the old 100 % goes on, and the new value notifies again at its own 80 % and 100 %, once each", () => {
+		const stopped = step(step(fresh, NORMAL, spent(40)).state, NORMAL, spent(50)).state;
+		expect(step(stopped, EXTENDED, spent(50, 100))).toMatchObject({ level: 0, notice: null, stop: false });
+		const again = step(stopped, EXTENDED, spent(80));
+		expect(again).toMatchObject({ level: 80, notice: 80, stop: false });
+		expect(step(again.state, EXTENDED, spent(90))).toMatchObject({ notice: null, stop: false });
+		expect(step(again.state, EXTENDED, spent(100))).toMatchObject({ level: 100, notice: 100, stop: true });
 	});
 });
 
 describe("the ledger side of the meter", () => {
-	test("a raise is one write stamped lane-runner: the ceiling slice (paused by its question), the question with stop / extend / split, the spend: entry", () => {
+	const notices = (ledger: Ledger, wl: string) =>
+		ledger.db.query<{ id: string; body: string; state: string; created_by: string; sender: string; recipient: string }, [string]>(
+			"SELECT * FROM messages WHERE workload_id = ? ORDER BY created_at, id",
+		).all(wl);
+
+	test("R11: the 80 % notice is one write stamped lane-runner, a held notice to the orchestrator naming `extend <wl>` and `ceiling <usd> [<hours>] <wl>`, and the spend: entry; no question, no slice", () => {
 		const c = clock();
 		const { ledger } = tempLedger(c.now);
 		const { wl } = workloadWithSlice(ledger);
+		const slices = ledger.slices(wl).length;
 		const laneId = `lane-${wl.slice(3)}-1`;
 		const spend: Spend = { usd: 40.5, tokens: 123456, wallMin: 12.34 };
-		const { sliceId, questionId } = raiseCeilingQuestion(ledger, { workloadId: wl, laneId, spend, ceiling: NORMAL, stakes: "normal" });
-		expect(sliceId).toBe(`sl-ceiling-${wl.slice(3)}-1`);
-		const slice = ledger.slice(sliceId)!;
-		expect(slice).toMatchObject({ workload_id: wl, task: "Jo decides the ceiling overrun", inputs: "ceiling", state: "paused", created_by: LANE_RUNNER_BY });
-		const q = ledger.question(questionId)!;
-		expect(q).toMatchObject({ slice_id: sliceId, state: "open", created_by: LANE_RUNNER_BY, body: ceilingQuestionBody(wl, spend, NORMAL, "normal") });
-		expect(JSON.parse(q.options)).toEqual([...CEILING_OPTIONS]);
+		const id = sendCeilingNotice(ledger, { workloadId: wl, laneId, level: 80, spend, ceiling: NORMAL, stakes: "normal" });
+		const m = ledger.message(id)!;
+		expect(m).toMatchObject({ created_by: LANE_RUNNER_BY, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, state: "held" });
+		expect(parseCeilingNotice(m.body)).toEqual({ level: 80, key: ceilingKey(NORMAL), workloadId: wl });
+		expect(m.body).toContain(`\`extend ${wl}\``);
+		expect(m.body).toContain(`\`ceiling <usd> [<hours>] ${wl}\``);
+		expect(m.body).not.toContain("user-driven");
 		const spends = controlEntries(ledger.entries(wl)).filter((e) => e.prefix === "spend");
 		expect(spends).toHaveLength(1);
 		expect(spends[0]).toMatchObject({ laneId, createdBy: LANE_RUNNER_BY });
 		expect(parseSpend(spends[0]!.rest)).toEqual({ usd: 40.5, tokens: 123456, wallMin: 12.3 });
-		expect(ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), ledger.instructions(wl), NORMAL)).toBe("open");
-		// a second ceiling question on the workload gets the next id
-		expect(raiseCeilingQuestion(ledger, { workloadId: wl, laneId, spend, ceiling: EXTENDED, stakes: "normal" }).sliceId).toBe(`sl-ceiling-${wl.slice(3)}-2`);
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.slices(wl)).toHaveLength(slices);
+		expect(ceilingNoticesSent(ledger, wl, NORMAL)).toEqual([80]);
 	});
 
-	test("a raise whose spend: write fails leaves neither the slice nor the question", () => {
+	test("R12: at every stakes, the stop notice names `extend`, `ceiling` and `user-driven <wl>`, asks nothing and leaves the ceiling where it was", () => {
+		for (const stakes of ["throwaway", "normal", "production"] as const satisfies readonly Stakes[]) {
+			const c = clock();
+			const { ledger } = tempLedger(c.now);
+			const { wl } = workloadWithSlice(ledger, { stakes });
+			const before = effectiveCeiling(controlEntries(ledger.entries(wl)), ledger.instructions(wl), stakes);
+			const id = sendCeilingNotice(ledger, { workloadId: wl, laneId: `lane-${wl.slice(3)}-1`, level: 100, spend: spent(before.usd), ceiling: before, stakes });
+			const body = ledger.message(id)!.body;
+			expect(parseCeilingNotice(body)).toEqual({ level: 100, key: ceilingKey(before), workloadId: wl });
+			for (const word of [`\`extend ${wl}\``, `\`ceiling <usd> [<hours>] ${wl}\``, `\`user-driven ${wl}\``]) expect(body).toContain(word);
+			expect(ledger.questions(wl)).toEqual([]);
+			expect(controlEntries(ledger.entries(wl)).filter((e) => e.prefix === "ceiling" && e.createdBy === LANE_RUNNER_BY)).toEqual([]);
+			expect(effectiveCeiling(controlEntries(ledger.entries(wl)), ledger.instructions(wl), stakes)).toEqual(before);
+		}
+	});
+
+	test("a notice whose spend: write fails leaves no notice", () => {
 		const { ledger, path } = tempLedger();
 		const { wl } = workloadWithSlice(ledger);
 		const db = new Database(path);
 		db.exec("CREATE TRIGGER fail_spend BEFORE INSERT ON entries WHEN NEW.body LIKE 'spend:%' BEGIN SELECT RAISE(ABORT, 'injected spend failure'); END;");
 		db.close();
-		expect(() => raiseCeilingQuestion(ledger, { workloadId: wl, laneId: `lane-${wl.slice(3)}-1`, spend: spent(40), ceiling: NORMAL, stakes: "normal" })).toThrow(/injected spend failure/);
-		expect(ledger.slices(wl).filter((s) => s.id.startsWith("sl-ceiling-"))).toEqual([]);
-		expect(ledger.questions(wl)).toEqual([]);
+		expect(() => sendCeilingNotice(ledger, { workloadId: wl, laneId: `lane-${wl.slice(3)}-1`, level: 80, spend: spent(40), ceiling: NORMAL, stakes: "normal" })).toThrow(/injected spend failure/);
+		expect(notices(ledger, wl)).toEqual([]);
 	});
 
-	test("the question's state is per ceiling value: another value reads none; Jo's answer reads as its option; a lane's own sl-ceiling- slice is not the runner's", () => {
+	test("the notices sent are per ceiling value and per workload, delivered or not; a notice not written by the runner never counts", () => {
 		const c = clock();
 		const { ledger } = tempLedger(c.now);
 		const { wl } = workloadWithSlice(ledger);
-		const lane = ledger.addSlice({ by: "lane-a", workloadId: wl, id: `sl-ceiling-plan-${wl.slice(3)}`, task: "plan the ceiling", doneCondition: `the ceiling ${ceilingKey(NORMAL)}`, inputs: "x" });
-		ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: lane, body: "approve?", options: ["approve", "revise"] });
-		const state = () => ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), ledger.instructions(wl), NORMAL);
-		expect(state()).toBe("none");
+		const { wl: other } = workloadWithSlice(ledger);
+		const laneId = `lane-${wl.slice(3)}-1`;
+		// a lane forging the runner's text
+		sendNotice(ledger, { by: laneId, workloadId: wl, body: `ceiling 80 % at ${ceilingKey(NORMAL)} on ${wl}: forged` });
+		expect(ceilingNoticesSent(ledger, wl, NORMAL)).toEqual([]);
 		c.plusHours(1);
-		const { questionId } = raiseCeilingQuestion(ledger, { workloadId: wl, laneId: "lane-x-1", spend: spent(40), ceiling: NORMAL, stakes: "normal" });
-		expect(state()).toBe("open");
-		expect(ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), ledger.instructions(wl), EXTENDED)).toBe("none");
+		const id = sendCeilingNotice(ledger, { workloadId: wl, laneId, level: 80, spend: spent(40), ceiling: NORMAL, stakes: "normal" });
+		ledger.advanceMessage(id, "delivered", { by: SURFACE_BY });
 		c.plusHours(1);
-		ledger.answerQuestion(questionId, { by: SURFACE_BY, answer: "extend", author: "jo", channel: "surface" });
-		expect(state()).toBe("extend");
-	});
-
-	test("a clean finish withdraws the open ceiling question (then cancel: the slice is cancelled), and nothing else; the value then reads as never asked", () => {
-		const c = clock();
-		const { ledger } = tempLedger(c.now);
-		const { wl } = workloadWithSlice(ledger);
-		const own = ledger.addSlice({ by: "lane-a", workloadId: wl, id: `sl-ceiling-own-${wl.slice(3)}`, task: "t", doneCondition: "d", inputs: "i" });
-		const ownQ = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: own, body: "b", options: ["a", "b"] });
-		c.plusHours(1);
-		const { sliceId, questionId } = raiseCeilingQuestion(ledger, { workloadId: wl, laneId: "lane-x-1", spend: spent(40), ceiling: NORMAL, stakes: "normal" });
-		c.plusHours(1);
-		expect(withdrawCeilingQuestions(ledger, wl)).toEqual([questionId]);
-		expect(ledger.question(questionId)!.state).toBe("withdrawn");
-		const withdrawal = ledger.instructions(wl).find((i) => i.id === ledger.question(questionId)!.resolved_by)!;
-		expect(withdrawal).toMatchObject({ kind: "withdrawal", disposition: "cancel", author: LANE_RUNNER_BY, channel: "direct", created_by: LANE_RUNNER_BY, body: "finished under the ceiling" });
-		expect(ledger.slice(sliceId)!.state).toBe("cancelled");
-		expect(ledger.question(ownQ)!.state).toBe("open");
-		expect(withdrawCeilingQuestions(ledger, wl)).toEqual([]);
-		expect(ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), ledger.instructions(wl), NORMAL)).toBe("none");
+		sendCeilingNotice(ledger, { workloadId: other, laneId: `lane-${other.slice(3)}-1`, level: 100, spend: spent(50), ceiling: NORMAL, stakes: "normal" });
+		expect(ceilingNoticesSent(ledger, wl, NORMAL)).toEqual([80]);
+		expect(ceilingNoticesSent(ledger, wl, EXTENDED)).toEqual([]);
+		expect(ceilingNoticesSent(ledger, other, NORMAL)).toEqual([100]);
 	});
 });
 
@@ -160,7 +151,7 @@ describe("a relaunch on the same ceiling (§ 2 items 3, 4)", () => {
 	const assistant = (cost: number) => `${JSON.stringify({ type: "message", message: { role: "assistant", usage: { totalTokens: 1000, cost: { total: cost } } } })}\n`;
 	const started = (laneId: string) => laneStartedBody(laneId, { pid: 1, start: "x", session: null, argv: [], runnerPid: 2 });
 
-	test("keeps the cumulative total: a fresh runner's scan counts every run's session files, its wall counts the earlier run, and 85 % raises afresh after the clean finish withdrew the first question", () => {
+	test("keeps the cumulative total: a fresh runner's scan counts every run's session files, its wall counts the earlier run, and the 80 % notice is not sent twice for the same value", () => {
 		const c = clock("2026-10-01T10:00:00.000Z");
 		const { ledger } = tempLedger(c.now);
 		const { wl } = workloadWithSlice(ledger);
@@ -170,7 +161,7 @@ describe("a relaunch on the same ceiling (§ 2 items 3, 4)", () => {
 		roots.push(dir);
 		const laneFile = join(dir, "2026_lane.jsonl");
 
-		// Run 1: an hour, $30 on the lane and $10 on a hand; 80 % raises, then the clean finish withdraws it.
+		// Run 1: an hour, $30 on the lane and $10 on a hand; 80 % notifies.
 		const lane1 = `lane-${wl.slice(3)}-1`;
 		record(started(lane1));
 		const start1 = Date.parse(c.now());
@@ -180,10 +171,9 @@ describe("a relaunch on the same ceiling (§ 2 items 3, 4)", () => {
 		c.at("2026-10-01T11:00:00.000Z");
 		const run1: Spend = { ...scanSpend(dir, new Map(), { usd: 0, tokens: 0, wallMin: 0 }), wallMin: wallMinutes(control(), Date.parse(c.now()), start1) };
 		expect(run1).toEqual({ usd: 40, tokens: 2000, wallMin: 60 });
-		const first = step(fresh, NORMAL, run1, ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), ledger.instructions(wl), NORMAL));
-		expect(first).toMatchObject({ level: 80, raise: true, stop: false });
-		raiseCeilingQuestion(ledger, { workloadId: wl, laneId: lane1, spend: run1, ceiling: NORMAL, stakes: "normal" });
-		expect(withdrawCeilingQuestions(ledger, wl)).toHaveLength(1);
+		const first = step(fresh, NORMAL, run1, ceilingNoticesSent(ledger, wl, NORMAL));
+		expect(first).toMatchObject({ level: 80, notice: 80, stop: false });
+		sendCeilingNotice(ledger, { workloadId: wl, laneId: lane1, level: 80, spend: run1, ceiling: NORMAL, stakes: "normal" });
 		record(laneExitBody(lane1, { code: 0, signal: null, outcome: "completed" }));
 
 		// Parked on Jo for two hours, then run 2 resumes the lane session (--resume appends to the same file) with a fresh runner.
@@ -195,21 +185,79 @@ describe("a relaunch on the same ceiling (§ 2 items 3, 4)", () => {
 		c.at("2026-10-01T13:30:00.000Z");
 		const run2: Spend = { ...scanSpend(dir, new Map(), { usd: 0, tokens: 0, wallMin: 0 }), wallMin: wallMinutes(control(), Date.parse(c.now()), start2) };
 		expect(run2).toEqual({ usd: 42.5, tokens: 3000, wallMin: 90 });
-		const state = () => ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), ledger.instructions(wl), NORMAL);
-		expect(state()).toBe("none");
-		expect(step({ raised: [] }, NORMAL, run2, state())).toMatchObject({ level: 80, raise: true, stop: false });
-		raiseCeilingQuestion(ledger, { workloadId: wl, laneId: lane2, spend: run2, ceiling: NORMAL, stakes: "normal" });
-		expect(state()).toBe("open");
-		expect(ledger.questions(wl).filter((q) => q.state === "open")).toHaveLength(1);
+		expect(step(fresh, NORMAL, run2, ceilingNoticesSent(ledger, wl, NORMAL))).toMatchObject({ level: 80, notice: null, stop: false });
+		// and at 100 % the relaunched runner stops with the stop notice, which the ledger did not hold
+		expect(step(fresh, NORMAL, { ...run2, usd: 50 }, ceilingNoticesSent(ledger, wl, NORMAL))).toMatchObject({ level: 100, notice: 100, stop: true });
+		expect(ledger.questions(wl)).toEqual([]);
+	});
+});
+
+describe("a raise racing the 100 % stop (meterPoll)", () => {
+	/** An autonomous normal workload at $50 / 6h, lane-t-1 launched on it and holding it under a live lease. */
+	function held(l: Ledger) {
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "Move the header offset into a token", stakes: "normal", mode: "autonomous" });
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: "ceiling: usd 50 wall 360 source stakes normal" });
+		l.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-t-1 cause first requested-by test" });
+		expect(l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: "lane-t-1", leaseMs: 60_000 }).won).toBe(true);
+		return wl;
+	}
+	/** `ledger` with `raise` run once, at the first transaction the caller opens: the moment between the runner's poll snapshot and its first write. */
+	function raisingAtFirstWrite(ledger: Ledger, raise: () => void): Ledger {
+		let fired = false;
+		return new Proxy(ledger, {
+			get(target, key) {
+				const v = Reflect.get(target, key, target);
+				if (key === "write") {
+					return <T>(fn: () => T): T => {
+						if (!fired) {
+							fired = true;
+							raise();
+						}
+						return target.write(fn);
+					};
+				}
+				return typeof v === "function" ? v.bind(target) : v;
+			},
+		});
+	}
+	const atCeiling: Spend = { usd: 50.2, tokens: 1000, wallMin: 40 };
+	const control = (l: Ledger, wl: string) => controlEntries(l.entries(wl));
+	const stops = (l: Ledger, wl: string) => control(l, wl).filter((c) => c.prefix === "lane-stop").map((c) => c.body);
+	const requests = (l: Ledger, wl: string) => control(l, wl).filter((c) => c.prefix === "launch-requested");
+
+	test("a raise landing after the poll measured 100 % of the old value and before its write: the runner reads the new value and goes on, nothing stops, no relaunch is needed", () => {
+		const { ledger } = tempLedger();
+		const wl = held(ledger);
+		let receipt = "";
+		const polled = meterPoll(raisingAtFirstWrite(ledger, () => {
+			receipt = apply(ledger, interpret(ledger, `extend ${wl}`)!);
+		}), { workloadId: wl, laneId: "lane-t-1", spend: atCeiling, state: fresh });
+		expect(receipt).toContain("lane-t-1 still holds it and goes on under it");
+		expect(polled).toMatchObject({ stop: false, accepted: false, notice: null });
+		expect(stops(ledger, wl)).toEqual([]);
+		expect(ceilingNoticesSent(ledger, wl, NORMAL)).toEqual([]);
+		expect(requests(ledger, wl)).toEqual([]);
 	});
 
-	test("a relaunch that jumps straight past 100 % after a withdrawn question raises with the stop, so the stop leaves Jo an open question", () => {
-		const c = clock();
-		const { ledger } = tempLedger(c.now);
-		const { wl } = workloadWithSlice(ledger);
-		raiseCeilingQuestion(ledger, { workloadId: wl, laneId: `lane-${wl.slice(3)}-1`, spend: spent(40), ceiling: NORMAL, stakes: "normal" });
-		withdrawCeilingQuestions(ledger, wl);
-		const state = ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), ledger.instructions(wl), NORMAL);
-		expect(step(fresh, NORMAL, spent(55), state)).toMatchObject({ level: 100, raise: true, stop: true });
+	test("a raise landing after the poll's write sees the accepted ceiling stop and requests the relaunch", () => {
+		const { ledger } = tempLedger();
+		const wl = held(ledger);
+		const polled = meterPoll(ledger, { workloadId: wl, laneId: "lane-t-1", spend: atCeiling, state: fresh });
+		expect(polled).toMatchObject({ stop: true, accepted: true, notice: 100 });
+		expect(stops(ledger, wl)).toEqual(["lane-stop: lane-t-1 accepted ceiling"]);
+		expect(apply(ledger, interpret(ledger, `extend ${wl}`)!)).toContain("lane-t-1 is stopping at the ceiling, so a relaunch is requested");
+		expect(requests(ledger, wl)).toHaveLength(1);
+	});
+
+	test("a stop whose writes fail still stands, unaccepted, and leaves nothing half-written", () => {
+		const { ledger, path } = tempLedger();
+		const wl = held(ledger);
+		const db = new Database(path);
+		db.exec("CREATE TRIGGER fail_stop BEFORE INSERT ON entries WHEN NEW.body LIKE 'lane-stop:%' BEGIN SELECT RAISE(ABORT, 'injected stop failure'); END;");
+		db.close();
+		const polled = meterPoll(ledger, { workloadId: wl, laneId: "lane-t-1", spend: atCeiling, state: fresh });
+		expect(polled).toMatchObject({ stop: true, accepted: false, notice: 100, state: fresh });
+		expect(ceilingNoticesSent(ledger, wl, NORMAL)).toEqual([]);
+		expect(control(ledger, wl).filter((c) => c.prefix === "spend")).toEqual([]);
 	});
 });

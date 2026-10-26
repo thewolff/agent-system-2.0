@@ -1,7 +1,7 @@
 ---
 name: ask-graham
-description: Answers an explicit "should we build X?" with Graham's stated judgment (his gate questions, the 2-minute rule, fewer lines wins) and a verdict of do it now, backlog, backlog prioritize now, or don't build. Use only when the user asks outright whether something is worth building ("should we build this?", "is it worth building?"), when an ask-graham nudge says a message proposes a new idea, or on /ask-graham. Not for tickets, bug fixes, tasks inside an already-decided project, or continuing existing work.
-argument-hint: "[the thing to build] | intensity [every-idea|ask] [--here]"
+description: Answers an explicit "should we build X?" with Graham's stated judgment (his gate questions, the 2-minute rule, fewer lines wins) and a verdict of do it now, start now, later, or don't build. Use only when the user asks outright whether something is worth building ("should we build this?", "is it worth building?"), when an ask-graham nudge says a message proposes a new idea, or on /ask-graham. Not for tickets, bug fixes, tasks inside an already-decided project, or continuing existing work.
+argument-hint: "[the thing to build] | intensity [every-idea|ask] [--here] | stop-check [on|off] [--here]"
 license: MIT
 ---
 
@@ -27,25 +27,29 @@ The level comes from the first of these that exists:
 2. `${XDG_CONFIG_HOME:-$HOME/.config}/ask-graham/config` (the user's level);
 3. the default, `ask`.
 
-Either file holds one line, `intensity=ask` or `intensity=every-idea`. A file that exists but names neither counts as `ask`.
+Either file holds `intensity=ask` or `intensity=every-idea`, and optionally `stop-check=on` or `stop-check=off` on its own line. Each setting is resolved separately in the order above: a file without a line for one setting falls through to the next file for it. A file that exists but names neither setting counts as `ask` and `on`.
 
-### `/ask-graham intensity`
+`stop-check=off` turns off the Stop check (a turn that read this skill and ended without a `**Verdict:**` line is blocked once); the default is `on`. (Skill)
 
-When the argument starts with `intensity`, change or show the level and do not run the check. Run the script beside this file, from the user's working directory:
+### `/ask-graham intensity` and `/ask-graham stop-check`
+
+When the argument starts with `intensity` or `stop-check`, change or show the settings and do not run the check. Run the script beside this file, from the user's working directory:
 
 ```sh
-node <this skill's directory>/scripts/intensity.mjs                         # show the level and where it came from
-node <this skill's directory>/scripts/intensity.mjs every-idea|ask          # set the user level
-node <this skill's directory>/scripts/intensity.mjs every-idea|ask --here   # set the override at this git repository's root
+node <this skill's directory>/scripts/intensity.mjs                              # show both settings and where each came from
+node <this skill's directory>/scripts/intensity.mjs every-idea|ask               # set the user level
+node <this skill's directory>/scripts/intensity.mjs every-idea|ask --here        # set the level override at this git repository's root
+node <this skill's directory>/scripts/intensity.mjs stop-check on|off            # turn the Stop check on or off for the user
+node <this skill's directory>/scripts/intensity.mjs stop-check on|off --here     # the same, for this git repository only
 ```
 
-Print its output to the user as it is. If the script cannot be run, write the file yourself in the format above and say which file you wrote. A `.ask-graham` file is in the repo's working tree: tell the user it is untracked, and that adding `.ask-graham` to `.git/info/exclude` keeps it out of commits if they do not want to share it.
+Print its output to the user as it is. If the script cannot be run, write the file yourself in the format above, keeping any line for the other setting, and say which file you wrote. A `.ask-graham` file is in the repo's working tree: tell the user it is untracked, and that adding `.ask-graham` to `.git/info/exclude` keeps it out of commits if they do not want to share it.
 
 ## Standing rules
 
 - **Delegate the search.** When the "does something else already exist?" search spans more than one repo, or needs more than three searches, hand it to a subagent (or a background read) and keep working on the other gate questions while it runs. (Skill)
 - **Using types is never a cost.** Using a type system, types, or typed code is never counted against an ask, flagged, or weighed as complexity. Graham listed "type systems" as something he would kill or defer (Graham #3); Jo disagrees and overrides it: "this skill should NOT be questioning use of a type system". (Jo)
-- **Answer from evidence, not by asking.** The gate questions are the agent's to answer from the repo, the open-work sources in step 2, and the conversation. Put a question to the user only for what no tool can settle: who will own it, or which why matters to them. (Skill)
+- **Answer from evidence, not by asking.** The gate questions are the agent's to answer from the repo, the open-work sources in step 2, and the conversation. Always ask the comparables question in step 2 (Jo), as an explicit exception. Otherwise put a question to the user only for what no tool can settle: who will own it, or which why matters to them. (Skill)
 - **Recommend, then stop arguing.** Once the user has decided ("build it", "park it"), record the decision and do what they said. (Skill)
 
 ## Steps
@@ -58,20 +62,28 @@ Done when: one sentence a stranger could act on.
 
 ### 2. Search for what already exists
 
-Graham's third gate question is "Something else already exists?" (Graham #1). How to answer it is the skill's own (Skill). Check every source below that applies, and record each one as *found*, *nothing found*, or *unreachable*:
+Graham's third gate question is "Something else already exists?" (Graham #1). How to answer it is the skill's own (Skill).
+
+Every run, before any internet search, ask exactly: "Do you want me to research and see if something comparable exists?" Ask at either intensity, on `/ask-graham`, an explicit should-we-build question, or an every-idea nudge. This always-asked question is Jo's rule, not Graham's. Settings invocations still only change or show settings. (Jo)
+
+- **No:** check the local sources below only; do not search the web. Read locally available issue or work records; mark remote-only sources *unreachable* for this run. (Jo)
+- **Yes:** also search the internet for comparable open-source and commercial software: libraries, CLIs, apps, AI skills, plugins, MCP servers, and SaaS where relevant. Before evaluating candidates, read [`references/comparables-criteria.md`](references/comparables-criteria.md). Apply its gates first, rank survivors without a weighted total, and show options with pros, cons, and the measured stats, each dated and sourced. Stars, repo age, forks, and followers are context only, never scored. This method is the skill's, based on the sources in that reference. (Skill)
+- **No answer yet:** ask, then carry on with the local search and other gate questions. Leave web research pending until the user says yes; silence is not consent. If the turn must end while waiting, put the exact question alone on the final line, without quotes or a verdict. The Stop check allows that waiting reply on both harnesses. When the answer arrives, reload this skill through the host’s Skill or Read tool, then resume step 2 for the same ask. (Skill)
+
+For the local search, check every source below that applies, and record each one as *found*, *nothing found*, or *unreachable*:
 
 - **The current repo or workspace.** Grep for the feature's nouns and verbs, its likely command or file names, and the existing words and commands nearby. Read any hit you would cite.
 - **Prior sessions**, if the agent has a way to search them. Has someone asked for this, half-built it, or researched it already?
 - **Skills and tools already installed.** The session's own skill list, the user's skills directory (`~/.claude/skills/` on Claude Code), the repo's `skills/` directory if it has one.
 - **Where open work lives**, read-only and nothing else:
   - the repo's issue tracker (for a GitHub repo, `gh issue list --search "<noun>"` and `gh pr list --search "<noun>"`);
-  - any backlog, roadmap, TODO, or task file the project's `AGENTS.md` or `CLAUDE.md` names;
+  - any to-do, roadmap or task file the project's `AGENTS.md` or `CLAUDE.md` names;
   - the user's own sources file, if it exists: `${XDG_CONFIG_HOME:-$HOME/.config}/ask-graham/sources.md`. It lists extra places to check, in the user's words: a work database and the read-only query that lists open items, a held-decisions file, a planning folder. Read it, then check each source it lists the way it says to. A missing file is not an error; record the source as *not configured* and move on.
 
   For each, narrow to the ask's key nouns rather than reading everything.
 - **For an established external tool or library** that does the job (a schema validator, a scheduler, a vendor API's own enum), one check of what the repo already depends on (`package.json`, lockfile) before anything is built by hand.
 
-Done when: every applicable source has one of the three marks, and every *found* names the file, command, issue, work item, or session that overlaps, plus how much it covers (all of the ask, part of it, or a neighbour that would collide with it).
+Done when: the user has answered the comparables question, any approved web research is complete (or marked *unreachable* with its missing evidence), every applicable source has one of the three marks, and every *found* names the file, command, issue, work item, or session that overlaps, plus how much it covers (all of the ask, part of it, or a neighbour that would collide with it).
 
 ### 3. Answer the gate questions
 
@@ -79,7 +91,7 @@ Graham's questions before a yes, in his order (Graham #1):
 
 1. **Why?** A valid why is more than "Its cool". In Graham's words: "personal productivity is fine, profitability is fine. 'Rising Tide' is great." (Graham #2) Name which one applies, with the evidence. If the only why is novelty, that is the no.
 2. **How long lived?** A one-off, something that runs for weeks, or something permanent. Longer-lived means more maintenance to price in.
-3. **Something else already exists?** The step 2 result, in one line.
+3. **Something else already exists?** The local search and Comparables result from step 2, in one line. If research was declined or unreachable, state that limit rather than claiming nothing exists.
 4. **In scope?** Is this the asker's to build, in this repo and this workstream, or does it belong to another repo, team, or owner?
 5. **Who owns it when it's done, or how will it be maintained?** Graham splits this "depending on if corp. or personal work" (Graham #1). Name the owner: the asker personally, a team, an agent, or a scheduled job. "Nobody" is an answer, and it counts against the ask.
 
@@ -106,9 +118,9 @@ Size first, with Graham's 2-minute rule from GTD: "if we can do it in under 2 mi
 
 | Verdict | When | Source |
 |---|---|---|
-| **do it now (under 2 min)** | It takes under two minutes and the gate questions pass. | Graham #4 |
-| **backlog** | Bigger than two minutes, the gate questions pass, and nothing gets worse while it waits. | Graham #4 |
-| **backlog, prioritize now** | Bigger than two minutes, the gate questions pass, and waiting has a named cost: something is blocked, something piles up, or a deadline exists. | Graham #4 for the option; the cost-of-waiting test is the skill's (Skill) |
+| **do it now** | It takes under two minutes and the gate questions pass. | Graham #4 |
+| **start now** | Bigger than two minutes, the gate questions pass, and waiting has a named cost: something is blocked, something piles up, or a deadline exists. | Graham #4 for the option; the cost-of-waiting test is the skill's (Skill) |
+| **later** | Bigger than two minutes, the gate questions pass, and nothing gets worse while it waits. | Graham #4 |
 | **don't build** | The why is only "it's cool", something existing already covers it, it is out of scope, or nobody would own it. | Mapping is the skill's (Skill), from Graham #1 and #2 |
 
 When two designs, or two asks, both pass: "fewer lines of code? less complexity means less to maintain. Future functionality is often YAGNI" (Graham #5). Pick the smaller one and name what it leaves out. Type annotations never count as lines or complexity here (Jo).
@@ -120,8 +132,8 @@ Done when: exactly one verdict, with a one-line why that names the gate answer o
 "Case by case. The bigger the task the larger breakdown." (Graham #6)
 
 - **do it now / don't build**: no breakdown.
-- **backlog, small** (a single task of hours to a couple of days): one task with acceptance criteria.
-- **backlog, bigger**: break it down fractally, "onion skin": **High Level Design (HLD) → Epics → Stories → Tasks | Acceptance criteria**. "Tasks should be measured in hours or a few days at the most." (Graham #6) Go only as deep as the size needs.
+- **start now or later, small** (a single task of hours to a couple of days): one task with acceptance criteria.
+- **start now or later, bigger**: break it down fractally, "onion skin": **High Level Design (HLD) → Epics → Stories → Tasks | Acceptance criteria**. "Tasks should be measured in hours or a few days at the most." (Graham #6) Go only as deep as the size needs.
 
 Every work item states the requirement and how to tell it is met. Never write untested implementation into a work item as a requirement: "implementation is for the dev." (Graham #6) Naming the existing file or command that the work touches is context, which is fine; prescribing the code is not.
 
@@ -129,10 +141,10 @@ Done when: every task has acceptance criteria a reviewer could check, and no tas
 
 ## Output
 
-The same shape every time. Conclusion first; the reader can stop after the verdict line and still act.
+While the comparables answer is pending, report local findings if useful and end with the exact question from step 2; omit the verdict and closing ask. After the user answers, use the completed-check template below.
 
 ```
-**Verdict:** <one of the four verdicts>. <one-line why>
+**Verdict:** <one of the four verdicts: do it now, start now, later, don't build>. <one-line why>
 
 **Needs you:** <only what no tool could answer: owner, which why matters, a collision to rule on. Omit the line when there is nothing.>
 
@@ -143,6 +155,16 @@ The same shape every time. Conclusion first; the reader can stop after the verdi
 - In scope: <answer>
 - Owner / maintenance: <answer>
 
+**Comparables** (Skill criteria; research choice: Jo)
+<If research was declined, write "not researched (user said no)" and omit the options table. Keep local build sizing in the verdict and breakdown. Otherwise use the options table below, using the default columns in references/comparables-criteria.md. If approved research is unreachable, say so and name the missing evidence.>
+
+| Name and link / version or plan | Gate result + confidence | Measured stats (date, source, window) | Pros | Cons |
+|---|---|---|---|---|
+| <Confirmed survivors only, in rank order> | <pass + confidence> | <kind-specific evidence> | <fit> | <limits> |
+| build our own | <same essential requirements, or unknown> | <estimated effort and upkeep, with basis; unknown where unmeasured> | <control / fit> | <cost / maintenance> |
+
+<List unknown-gate candidates separately with their missing essential evidence; list disqualified candidates separately with their failed gate and evidence. Say when none meets the requirements. Include the build our own row as a baseline in approved comparisons.>
+
 **Red flags:** <the flags that fired, each with its source; or "none fired"; or "not a technical ask">
 
 **Breakdown:** <omitted for do it now / don't build; HLD → Epics → Stories → Tasks with acceptance criteria otherwise>
@@ -150,7 +172,7 @@ The same shape every time. Conclusion first; the reader can stop after the verdi
 **Closing ask:** <one decision, restating its full subject, with a recommendation>
 ```
 
-The closing ask names the thing in full ("Put the CSV export for the billing page in the backlog and start it next, or park it?"), never a back-reference like "do you want that?".
+The closing ask names the thing in full ("Start the CSV export for the billing page now, or leave it for later?"), never a back-reference like "do you want that?".
 
 ## The sources file
 

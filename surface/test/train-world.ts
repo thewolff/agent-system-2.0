@@ -185,12 +185,12 @@ export function protectedRules(strict = true): unknown[] {
 	return [{ type: "required_status_checks", ruleset_id: 1, parameters: { strict_required_status_checks_policy: strict, required_status_checks: [{ context: "as2/full-suite" }] } }];
 }
 
-/** A train on #101 and #106 held by TRAIN_LANE, the autonomous owner of #101, a fake gh and launcher, on one ledger with a settable clock. */
-export function world() {
+/** A train on `prs` (#101 and #106 by default) held by TRAIN_LANE, the autonomous owner of #101, a fake gh and launcher, on one ledger with a settable clock. */
+export function world(prs: readonly number[] = [101, 106]) {
 	const c = clock();
 	const { ledger } = tempLedger(c.now);
 	const trainCheckout = checkout();
-	const cmd = interpret(ledger, "train 101 106");
+	const cmd = interpret(ledger, `train ${prs.join(" ")}`);
 	if (cmd?.kind !== "train") throw new Error("not a train");
 	const train = applyTrain(ledger, cmd, trainCheckout).workloadId;
 	expect(ledger.claimWorkload(train, { by: LANE_STARTER_BY, holder: TRAIN_LANE, leaseMs: 600_000 }).won).toBe(true);
@@ -283,10 +283,12 @@ export function boardWorld() {
 	run();
 	c.plusHours(0.01);
 	let seq = 0;
-	const landing = (pr: number, o: { stakes?: "normal" | "production" } = {}): string => {
+	/** `o.entries`: assumption entries written on W right after its `repo:`, while it is open (a `plan:` row, say). */
+	const landing = (pr: number, o: { stakes?: "normal" | "production"; entries?: { by: string; body: string }[] } = {}): string => {
 		const holder = `lane-l-${++seq}`;
 		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: `Fix the header (#${pr})`, stakes: o.stakes ?? "normal", mode: "autonomous" });
 		recordRepo(ledger, wl, repo);
+		for (const e of o.entries ?? []) ledger.recordEntry({ by: e.by, workloadId: wl, kind: "assumption", body: e.body });
 		expect(ledger.claimWorkload(wl, { by: LANE_STARTER_BY, holder, leaseMs: 600_000 }).won).toBe(true);
 		const sl = ledger.addSlice({ by: holder, workloadId: wl, task: "change", doneCondition: "tests pass", inputs: "src" });
 		const runId = makeRunId(Date.parse(c.now()) + seq, "abcd");
