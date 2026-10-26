@@ -75,6 +75,15 @@ REPO="$(cd -P "$(dirname "$self")/.." && pwd -P)"
 AGENT_DIR="$HOME/.omp/profiles/$PROFILE_NAME/agent"
 CONFIG="$AGENT_DIR/config.yml"
 PROMPT="$HOME/.agent-system-2/orchestrator/system.md"
+LOCAL_CONFIG_DIR="$HOME/.agent-system-2/local-overlays"
+
+config_words() {
+	[ -f "$REPO/install/local-overlays.ts" ] || return 0
+	value="$(bun "$REPO/install/local-overlays.ts" snapshot-config "$LOCAL_CONFIG_DIR")" || exit 2
+	[ -n "$value" ] || return 0
+	[ -z "${PI_CONFIG_FILES-}" ] || value="$PI_CONFIG_FILES:$value"
+	printf 'PI_CONFIG_FILES=%s ' "$(quote "$value")"
+}
 
 # Render <prompt>, or stop: omp reads a missing --append-system-prompt path as literal prompt text,
 # so a launch never passes one (the script names the missing source on stderr).
@@ -324,7 +333,7 @@ case "${1-}" in
 	--print)
 		shift
 		render_prompt
-		words="$(orchestrator_words)"
+		words="$(orchestrator_words)$(config_words)"
 		eval "set -- $words OMP_PROFILE=\"\$PROFILE_NAME\" AGENT_SYSTEM_ROLE=orchestrator omp --cwd \"\$REPO\" --append-system-prompt \"\$PROMPT\" \"\$@\""
 		line="env"
 		for arg in "$@"; do line="$line $(quote "$arg")"; done
@@ -332,7 +341,7 @@ case "${1-}" in
 		;;
 	*)
 		render_prompt
-		words="$(orchestrator_words)"
+		words="$(orchestrator_words)$(config_words)"
 		eval "set -- $words OMP_PROFILE=\"\$PROFILE_NAME\" AGENT_SYSTEM_ROLE=orchestrator omp --cwd \"\$REPO\" --append-system-prompt \"\$PROMPT\" \"\$@\""
 		exec env "$@"
 		;;

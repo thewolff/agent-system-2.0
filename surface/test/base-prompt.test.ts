@@ -128,12 +128,18 @@ describe("bin/as2 renders the file before omp and refuses to launch without a so
 		const agentDir = join(home, ".omp", "profiles", "agent-system-2", "agent");
 		mkdirSync(agentDir, { recursive: true });
 		copyFileSync(join(import.meta.dir, "..", "..", "profile", "config.yml"), join(agentDir, "config.yml"));
+		if (over.PI_CONFIG_FILES) {
+			const local = join(home, ".as2", "config.yml");
+			mkdirSync(dirname(local), { recursive: true });
+			writeFileSync(local, "modelRoles: {}\n", { mode: 0o600 });
+		}
 		const bin = tmp("bin");
 		const argvFile = join(home, "omp-argv");
-		writeFileSync(join(bin, "omp"), `#!/bin/sh\nprintf '%s\\n' "$@" > '${argvFile}'\n`);
+		const envFile = join(home, "omp-env");
+		writeFileSync(join(bin, "omp"), `#!/bin/sh\nprintf '%s\\n' "\${PI_CONFIG_FILES-}" > '${envFile}'\nprintf '%s\\n' "$@" > '${argvFile}'\n`);
 		chmodSync(join(bin, "omp"), 0o755);
 		const r = Bun.spawnSync(["sh", AS2, ...args], {
-			env: { PATH: `${bin}:${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, AGENT_SYSTEM_VOICE: e.AGENT_SYSTEM_VOICE!, AGENT_SYSTEM_CONTRACT: e.AGENT_SYSTEM_CONTRACT! },
+			env: { PATH: `${bin}:${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, AGENT_SYSTEM_VOICE: e.AGENT_SYSTEM_VOICE!, AGENT_SYSTEM_CONTRACT: e.AGENT_SYSTEM_CONTRACT!, ...(over.PI_CONFIG_FILES ? { PI_CONFIG_FILES: over.PI_CONFIG_FILES } : {}) },
 		});
 		const prompt = join(home, ".agent-system-2", "orchestrator", "system.md");
 		return {
@@ -143,6 +149,7 @@ describe("bin/as2 renders the file before omp and refuses to launch without a so
 			stderr: r.stderr.toString(),
 			prompt,
 			ompArgv: () => (existsSync(argvFile) ? readFileSync(argvFile, "utf8").trimEnd().split("\n") : null),
+			ompEnv: () => (existsSync(envFile) ? readFileSync(envFile, "utf8").trimEnd() : null),
 		};
 	}
 
@@ -154,6 +161,12 @@ describe("bin/as2 renders the file before omp and refuses to launch without a so
 		const argv = r.ompArgv()!;
 		expect(argv.slice(0, 2)).toEqual(["--cwd", join(import.meta.dir, "..", "..")]);
 		expect(argv.slice(2)).toEqual(["--append-system-prompt", r.prompt, "--resume", "x"]);
+	});
+
+	test("a secure local settings overlay reaches omp after an existing overlay", () => {
+		const launched = as2([], { PI_CONFIG_FILES: "/existing.yml" });
+		expect(launched.ompEnv()).toEndWith("/.agent-system-2/local-overlays/config.yml");
+		expect(launched.ompEnv()).toStartWith("/existing.yml:");
 	});
 
 	test("--print renders the file and names it in the printed command", () => {

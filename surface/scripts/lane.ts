@@ -53,6 +53,7 @@ import { dirname, join, resolve } from "node:path";
 import { headroom } from "../../classifier/src/headroom";
 import { loadTierTable, modelIdentity } from "../../classifier/src/tier-table";
 import { fenceTargets } from "../../gates/src/fence";
+import { snapshotConfig, validateLocalOverlays } from "../../install/local-overlays";
 import { SCRATCH_ENV } from "../../gates/src/scratch";
 import { ensureScratchRoot } from "../src/scratch-root";
 import { canonicalPath, homeDir } from "../../ledger/src/locality";
@@ -131,8 +132,11 @@ const MOVED_STATE_ID = "headroom-state";
  * the launch; `notes` says why, for the caller to log.
  */
 export function laneSpawnEnv(base: Record<string, string | undefined>, configPath: string, binding: { workloadId: string; laneId: string }): { env: Record<string, string>; notes: string[] } {
+	validateLocalOverlays(base);
+	const overlay = snapshotConfig(join(base.HOME || homeDir(), ".agent-system-2", "local-overlays"), base);
+	const withOverlay = overlay === null ? base : { ...base, PI_CONFIG_FILES: base.PI_CONFIG_FILES ? `${base.PI_CONFIG_FILES}:${overlay}` : overlay };
 	const r = readTracingSetting(configPath);
-	return { env: tracingEnv(laneEnv(base, binding, readCleanShell(dirname(configPath))), r.setting, { role: "lane", ...binding }), notes: r.notes };
+	return { env: tracingEnv(laneEnv(withOverlay, binding, readCleanShell(dirname(configPath))), r.setting, { role: "lane", ...binding }), notes: r.notes };
 }
 
 class Fail extends Error {

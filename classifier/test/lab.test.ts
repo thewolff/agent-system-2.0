@@ -111,7 +111,7 @@ describe("D3: who built the work, from the ledger", () => {
 	test("a review withheld for changing the work is a builder; a model on an unmapped provider is every lab", () => {
 		expect(builderLabs(view([...LANE, entry("builder-lab: openai hand dt-9 model openai-codex/gpt-6-sol")]), "wl").labs).toEqual(["anthropic", "openai"]);
 		const mystery = builderLabs(view(LANE, [routing({ ran_models: JSON.stringify(["mystery/model-x"]) })]), "wl");
-		expect(mystery.unknown).toEqual(["a change-large hand ran on mystery/model-x: unknown lab for provider mystery; add it to classifier/src/lab.ts"]);
+		expect(mystery.unknown).toEqual(["a change-large hand ran on mystery/model-x: unknown lab for provider mystery; add it to classifier/src/lab.ts or the user-local provider-labs.yml"]);
 	});
 
 	test("T15: a surface builder-lab-void drops that hand's marks; from a lane, for another hand, or against a lane mark it drops nothing", () => {
@@ -318,7 +318,7 @@ describe("T3: which entries kill a hand", () => {
 		const claims = [routing({ kind: "judge", session_root: "/s/lane", agent_id: "sl-x-2" }), routing({ kind: "judge", session_root: "/s/other", agent_id: "sl-x" })];
 		const killed = builderLabs(view([...LANE, hand, exit("lane-a", LANE_RUNNER_BY)], claims), "wl", new Set(), reader);
 		expect(asked).toEqual([{ root: "/s/lane", key: "sl-x", claimed: new Set(["sl-x-2"]), from: AT, until: null }]);
-		expect(killed.unknown).toEqual(["dead hand dt-1 ran on mystery/model-x: unknown lab for provider mystery; add it to classifier/src/lab.ts"]);
+		expect(killed.unknown).toEqual(["dead hand dt-1 ran on mystery/model-x: unknown lab for provider mystery; add it to classifier/src/lab.ts or the user-local provider-labs.yml"]);
 		asked.length = 0;
 		const successor = [started("lane-b", 5), entry("builder-lab: anthropic lane lane-b model anthropic/claude-opus-5-5", null, "lane-b", t(6)), spawned("lane-b", "dt-2", { root: "/s/lane", key: "sl-y", m: 7 }), settledBy("lane-b", "dt-2", "rt-2", 8)];
 		builderLabs(view([...LANE, hand, ...successor]), "wl", new Set(), reader);
@@ -385,7 +385,7 @@ describe("D4–D6: reviewPlan", () => {
 		const mystery = ["anthropic/claude-opus-5-5", "mystery/model-x"];
 		expect(reviewPlan({ row: mystery, usable: mystery, builders: anthropic, stakes: "normal", grant: false })).toMatchObject({
 			kind: "park",
-			reasons: ["anthropic/claude-opus-5-5 (builder lab anthropic)", "mystery/model-x (unknown lab for provider mystery; add it to classifier/src/lab.ts)"],
+			reasons: ["anthropic/claude-opus-5-5 (builder lab anthropic)", "mystery/model-x (unknown lab for provider mystery; add it to classifier/src/lab.ts or the user-local provider-labs.yml)"],
 		});
 	});
 
@@ -393,7 +393,7 @@ describe("D4–D6: reviewPlan", () => {
 		const row = ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "mystery/model-x"];
 		for (const stakes of ["normal", "production"] as const) {
 			const plan = reviewPlan({ row, usable: row, builders: anthropic, stakes, grant: false });
-			expect({ stakes, plan }).toMatchObject({ stakes, plan: { kind: "park", reasons: expect.arrayContaining(["mystery/model-x (unknown lab for provider mystery; add it to classifier/src/lab.ts)"]) } });
+			expect({ stakes, plan }).toMatchObject({ stakes, plan: { kind: "park", reasons: expect.arrayContaining(["mystery/model-x (unknown lab for provider mystery; add it to classifier/src/lab.ts or the user-local provider-labs.yml)"]) } });
 		}
 	});
 

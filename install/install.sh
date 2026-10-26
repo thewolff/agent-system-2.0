@@ -173,6 +173,7 @@ if [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ]; then
 fi
 
 command -v bun >/dev/null 2>&1 || fail "bun not found on PATH (the ledger module runs on bun:sqlite)"
+bun "$REPO/install/local-overlays.ts" validate || fail "user-local overlay validation failed" 2
 
 # One pass over a launchd template: each @NAME@ in the template is replaced by its value from the
 # NAME=value arguments, XML-escaped; substituted text is never scanned again, so a value may contain
@@ -545,9 +546,10 @@ step "profile: $PROFILE_DIR"
 mkdir -p "$PROFILE_DIR/agents"
 printf '%s' "$RENDERED" >"$PROFILE_DIR/config.yml.tmp.$$" || { rm -f "$PROFILE_DIR/config.yml.tmp.$$"; fail "could not write $PROFILE_DIR/config.yml" 1; }
 mv -f "$PROFILE_DIR/config.yml.tmp.$$" "$PROFILE_DIR/config.yml"
-cp -f "$REPO/$MODELS_ROW" "$PROFILE_DIR/models.yml"
+overlay_result="$(bun "$REPO/install/local-overlays.ts" install-models "$REPO/$MODELS_ROW" "$PROFILE_DIR/models.yml")" \
+	|| fail "user-local model overlay installation failed" 2
 cp -f "$REPO/$MCP_ROW" "$PROFILE_DIR/mcp.json"
-step "profile written: config.yml (rendered from $CONFIG_ROW), models.yml (from $MODELS_ROW), mcp.json (from $MCP_ROW)"
+step "profile written: config.yml (rendered from $CONFIG_ROW), models.yml (from $MODELS_ROW; local overlay: $overlay_result), mcp.json (from $MCP_ROW)"
 while IFS= read -r tier; do
 	[ -n "$tier" ] || continue
 	ln -sfn "$REPO/$tier" "$PROFILE_DIR/agents/${tier##*/}"

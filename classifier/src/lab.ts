@@ -20,6 +20,7 @@ import { SURFACE_BY } from "../../surface/src/types";
 import { type HandSessionModels, handSessionModels } from "./hand-session";
 import { type Kind, type Routing, type Stakes, type Tier, topTwoKinds } from "./route";
 import { modelIdentity, type TierTable } from "./tier-table";
+import { localProviderLabs } from "./local-provider-labs";
 
 export type Lab = "anthropic" | "openai" | "kimi";
 /** Every lab, in the order the tier rows list them. */
@@ -40,13 +41,15 @@ export function providerOf(selector: string): string {
 	return selector.trim().split("/")[0]!;
 }
 
-/** The lab of a `provider/model` selector; `null` for a provider the map does not name. */
+/** The provider's lab; built-ins win, then the secure user-local additions. */
 export function labOf(selector: string): Lab | null {
 	const provider = providerOf(selector);
-	return Object.hasOwn(PROVIDER_LAB, provider) ? PROVIDER_LAB[provider]! : null;
+	if (Object.hasOwn(PROVIDER_LAB, provider)) return PROVIDER_LAB[provider]!;
+	const local = localProviderLabs();
+	return Object.hasOwn(local, provider) ? local[provider]! : null;
 }
 
-export const unknownLabReason = (provider: string) => `unknown lab for provider ${provider}; add it to classifier/src/lab.ts`;
+export const unknownLabReason = (provider: string) => `unknown lab for provider ${provider}; add it to classifier/src/lab.ts or the user-local provider-labs.yml`;
 
 // ---- D2: which dispatches are reviews -------------------------------------------------------
 

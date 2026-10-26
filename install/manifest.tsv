@@ -24,6 +24,9 @@ ledger/test/ledger.test.ts	test	-
 ledger/test/raw-sqlite.test.ts	test	-
 install/manifest.tsv	install	-
 install/install.sh	install	-
+install/local-overlays.ts	install	-
+install/local-overlays.test.ts	test	-
+install/privacy.test.ts	test	-
 install/fresh-machine-test.sh	install	-
 install/com.agent-system-2.ledger-backup.plist	ledger-backup-agent	{launch_agents}/com.agent-system-2.ledger-backup.plist
 # M3/M4 (2026-09-29): tier files, the classifier and gates extensions with their modules, tests and
@@ -41,6 +44,7 @@ classifier/src/fingerprint.ts	module	-
 classifier/src/hand-session.ts	module	-
 classifier/src/headroom.ts	module	-
 classifier/src/lab.ts	module	-
+classifier/src/local-provider-labs.ts	module	-
 classifier/src/ledger-port.ts	module	-
 classifier/src/panel.ts	module	-
 classifier/src/review-stop.ts	module	-
@@ -1382,3 +1386,4 @@ plugins/test/paired-coding.test.ts	test	-
 # 2026-10-19): the canonical write/edit/bash view the rows and observers read, and its tests.
 gates/src/pair-call.ts	module	-
 gates/test/paired-coding.test.ts	test	-
+classifier/test/local-provider-labs.test.ts	test	-

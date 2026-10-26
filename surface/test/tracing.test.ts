@@ -4,7 +4,7 @@
 // `as2 phoenix` word's edit of the installed profile's config.yml.
 import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, copyFileSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 // A namespace import, not named ones: a name lane.ts stops exporting fails only the test that calls it, not the module load.
 import * as laneScript from "../scripts/lane";
 import { carry } from "../scripts/tracing";
@@ -210,6 +210,17 @@ describe("the lane spawn env: lane.ts laneSpawnEnv(process env, config path, bin
 		const other = laneScript.laneSpawnEnv(BASE, config, { workloadId: "wl-b", laneId: "lane-b-1" });
 		expect(otelOf(other.env)).toEqual(OFF);
 		expect(other.env).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: "wl-b", AGENT_SYSTEM_LANE_ID: "lane-b-1" });
+	});
+
+	test("a secure local settings file is appended to an existing overlay list", () => {
+		const home = root("lane-overlay");
+		const local = join(home, ".as2", "config.yml");
+		mkdirSync(dirname(local), { recursive: true });
+		writeFileSync(local, "modelRoles:\n  default: private-gateway/private-model\n", { mode: 0o600 });
+		const config = join(home, "config.yml");
+		writeFileSync(config, SWITCHED_OFF);
+		const got = laneScript.laneSpawnEnv({ ...BASE, HOME: home, PI_CONFIG_FILES: "/existing.yml" }, config, { workloadId: "wl-a", laneId: "lane-a-1" });
+		expect(got.env.PI_CONFIG_FILES).toBe(`/existing.yml:${join(home, ".agent-system-2", "local-overlays", "config.yml")}`);
 	});
 
 	test("the template switched off, a malformed block and a missing file are the off env; malformed and missing say why", () => {
