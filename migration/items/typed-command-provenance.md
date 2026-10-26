@@ -2,7 +2,7 @@
 title: Typed FIFO provenance is required before command-shaped prompts can act
 status: building
 workload: wl-mvh6d1orqmwg74
-pr: none
+pr: 315
 ---
 
 Issue: https://github.com/thewolff/jo-issues/issues/187
