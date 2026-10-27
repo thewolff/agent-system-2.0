@@ -1426,3 +1426,6 @@ gates/test/paired-coding.test.ts	test	-
 # (wl-mvpwkpqobyp20w PLAN D5, 2026-10-26).
 surface/test/fixtures/train-carry-305/compare.json	test	-
 surface/test/fixtures/train-carry-305/commit-cde03460.json	test	-
+gates/src/dispositions.ts	module	-
+gates/test/execution-handoff.test.ts	test	-
+gates/test/handoff-extension.test.ts	test	-

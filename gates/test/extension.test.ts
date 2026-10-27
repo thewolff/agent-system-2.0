@@ -299,6 +299,9 @@ describe("gates extension adapter", () => {
 		const unread = { toolName: "bash", toolCallId: "call-unread", input: { command: "git -c alias.p=push p" } };
 		expect(reasonOf(await f.emit("tool_call", unread, ctx))).toContain("P-11 row 6");
 		expect(ledger.entries(wl, "reserved-request")).toHaveLength(1);
+		const repeat = { ...force, toolCallId: "call-force-repeat" };
+		expect(reasonOf(await f.emit("tool_call", repeat, ctx))).toContain("§ A4 reserved list");
+		expect(ledger.entries(wl, "reserved-request")).toHaveLength(1);
 
 		// No workload (the orchestrator itself): the refusal lands on the standing workload, where the surface reads it, and is kept as a session entry too.
 		const u = fakePi();
@@ -309,6 +312,9 @@ describe("gates extension adapter", () => {
 		const standing = ledger.entries(STANDING_WORKLOAD_ID, "reserved-request");
 		expect(standing).toHaveLength(1);
 		expect(standing[0]!.slice_id).toBeNull();
+		await u.emit("tool_call", { ...force, toolCallId: "call-force-repeat" }, ctxOf({ hasUI: true }));
+		expect(u.entries).toHaveLength(1);
+		expect(ledger.entries(STANDING_WORKLOAD_ID, "reserved-request")).toHaveLength(1);
 		const orchestratorLines = errorLines(ledger).filter((l) => l.kind === "reserved" && l.workloadId === STANDING_WORKLOAD_ID);
 		expect(orchestratorLines).toHaveLength(1);
 		expect(orchestratorLines[0]!.line).toContain(`approve ${standing[0]!.id}`);
@@ -413,9 +419,9 @@ describe("T2 settled links through the gates entry", () => {
 		const tool = (await f.emit("assistant_message", { message: message(path, true) }, ctx) ?? message(path, true)) as { content: { type: string; text?: string }[] };
 		expect(tool.content[0]!.text).toBe(linked);
 		expect(tool.content[1]!.type).toBe("toolCall");
-		const held = await f.emit("assistant_message", { message: message("**ACTION**\nbash ~/x.sh") }, ctx) as { content: { text: string }[] };
-		expect(held.content[0]!.text).toContain("Reply held");
-		expect((await f.emit("session_stop", { last_assistant_message: { content: held.content } }, ctx) as { reason: string }).reason).toContain("P-11 row 1");
+		const handed = (await f.emit("assistant_message", { message: message("**ACTION**\nbash ~/x.sh") }, ctx) ?? message("**ACTION**\nbash ~/x.sh")) as { content: { text: string }[] };
+		expect(handed.content[0]!.text).toBe("**ACTION**\nbash ~/x.sh");
+		expect(notices.at(-1)).toContain("P-11 row 1 warning: command presentation is missing");
 	});
 	test("row 15 binds the QUESTION row despite a linked path in its body", async () => {
 		const { ledger, path: db } = tempLedger();

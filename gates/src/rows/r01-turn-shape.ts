@@ -1,18 +1,10 @@
-// P-11 row 1 (DESIGN-2.0.md:338; C2.1; SPEC-2.0.md § B16 items 1-2): a message addressed to Jo
-// carries at most one ask/QUESTION, hands Jo a command only as a script path, and puts the needs-you
-// block first and the closing ask last. On the orchestrator session it hands Jo no command at all,
-// not even a script path: a lane runs it, or the ask is one word (tiers/orchestrator.md § What you
-// never do). One named exception (2026-10-17, migration/items/pair-offer-own-line.md, the exception
-// MIGRATION.md item 52 asked for): the by-hand `as2 lane wl-…` line that continues a user-driven
-// workload, in plain text or inline code, never inside a shell fence. The row needs no code for it:
-// `as2` is not a command head and not a script line, so it passes in prose and inline code, and a
-// shell fence refuses every non-comment line. Refused, not warned. Runs on a top-level session's
-// stop (hands never talk to Jo; OMP never fires session_stop for subagents,
-// omp://extensions.md:349). On the orchestrator it also runs
-// on the turn's finalized reply: a refused reply becomes one fixed marker line that quotes nothing
-// from the draft and is rewritten, so the history Jo keeps holds the marker and the rewrite; the
-// draft may show while it streams, because OMP does not retract streamed text
-// (gates/extensions/r01-turn-shape.ts).
+// P-11 row 1: a message addressed to Jo carries at most one ask/QUESTION and puts needs-you first
+// and the closing ask last. Command execution policy belongs to tool-call gates; presenting a
+// command is warning-only and checked for an explicit completion status, impact and reversal.
+// Runs on a top-level session's stop (hands never talk to Jo; OMP never fires session_stop for
+// subagents). On the orchestrator it also runs on the finalized reply: hard-stop defects are held
+// for correction, while command-presentation defects reach Jo with a warning.
+import { dispositionOf } from "../dispositions";
 import type { Refusal } from "../types";
 
 /**
@@ -232,10 +224,7 @@ function orchestratorHandOver(lines: string[], fences: Fence[]): string | null {
 	return null;
 }
 
-/**
- * Row 1 over the final text of a turn addressed to Jo. `role` is the session speaking: a lane may
- * hand Jo a script path; the orchestrator hands over no command at all.
- */
+/** Row 1 hard stops over the final text of a turn addressed to Jo. */
 export function checkTurnShape(message: string, role: "orchestrator" | "lane" = "lane"): Refusal {
 	const text = message.replace(ENVELOPE, "").trimEnd();
 	const { lines, fences } = structure(text);
@@ -322,30 +311,8 @@ export function checkTurnShape(message: string, role: "orchestrator" | "lane" = 
 		}
 	}
 
-	// (b) commands handed to Jo. A lane hands over script paths, never bare commands. A shell fence:
-	// every line is a command. Any other fence that is not code or data: every command-shaped line is.
-	// Every fence spelling counts: `~~~bash` and four-backtick fences too (astra-5 R5-S2).
-	//
-	// The orchestrator hands over no command at all (tiers/orchestrator.md § What you never do): the
-	// same fences with no script-path exemption, plus a script line in its own prose or as a whole
-	// inline-code span. Inline code holding any other command is a receipt (`git status`), not a
-	// hand-over, and stays allowed. The by-hand `as2 lane wl-…` line passes in prose and inline code
-	// and is refused in a shell fence, which is the named exception of 2026-10-17
-	// (migration/items/pair-offer-own-line.md, MIGRATION.md item 52).
-	if (role === "orchestrator") {
-		const handed = orchestratorHandOver(lines, fences);
-		if (handed) problems.push(`it hands Jo a command (\`${handed}\`); a lane runs it, or ask Jo for one word`);
-	} else {
-		for (const f of fences) {
-			if (CODE_FENCE.test(f.lang)) continue;
-			const shell = SHELL_FENCE.test(f.lang);
-			const bare = f.lines.map((l) => l.trim()).filter((l) => l && !l.startsWith("#") && !SCRIPT_LINE.test(l) && (shell || COMMAND_LINE.test(l)));
-			if (bare.length > 0) {
-				problems.push(`it hands Jo a bare command (\`${bare[0]}\`); write it to a script under ~/agent-scratch/<repo>/ and hand over the one line \`zsh <path>\``);
-				break;
-			}
-		}
-	}
+	// Command execution is not message execution. Presentation defects are reported by
+	// turnShapeWarnings and never added to this hard-stop list.
 
 	// (c) needs-you block first: nothing substantive above a "Needs you" heading.
 	const needsIdx = lines.findIndex((l) => NEEDS_YOU.test(l));
@@ -378,4 +345,30 @@ export function checkTurnShape(message: string, role: "orchestrator" | "lane" = 
 			`P-11 row 1 refused this turn to Jo: ${problems.join("; ")}. ` +
 			`Shape: needs-you first, body, one closing ask last (SPEC-2.0.md § B16). Rewrite the message and send it again.`,
 	};
+}
+
+/** Warning-only command-presentation defects. Execution gates remain hard stops. */
+export function turnShapeWarnings(message: string, role: "orchestrator" | "lane" = "lane"): string[] {
+	if (dispositionOf("command-presentation") !== "warn") return [];
+	const text = message.replace(ENVELOPE, "").trimEnd();
+	const { lines, fences } = structure(text);
+	let command = orchestratorHandOver(lines, fences);
+	if (role === "lane") {
+		command = null;
+		for (const f of fences) {
+			if (CODE_FENCE.test(f.lang)) continue;
+			const shell = SHELL_FENCE.test(f.lang);
+			command = f.lines.map((l) => l.trim()).find((l) => l && !l.startsWith("#") && !SCRIPT_LINE.test(l) && (shell || COMMAND_LINE.test(l))) ?? null;
+			if (command) break;
+		}
+	}
+	if (!command) return [];
+	const missing = [
+		/\bexecution status\s*:/i.test(text) ? null : "execution status",
+		/\bimpact\s*:/i.test(text) ? null : "impact",
+		/\breversal\s*:/i.test(text) ? null : "reversal",
+	].filter((x): x is string => x !== null);
+	return missing.length === 0
+		? []
+		: [`command presentation is missing ${missing.join(missing.length === 2 ? " and " : ", ").replace(/, ([^,]+)$/, ", and $1")}; the command may still be shown, but say whether execution completed and state its impact and reversal`];
 }

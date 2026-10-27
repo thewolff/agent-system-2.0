@@ -16,6 +16,7 @@
 // :1224-1237; runner.ts emitAssistantMessage).
 import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
+import type { CommandFallback, FallbackAuthorization } from "./dispositions";
 import { bashCommand } from "./exec";
 import type { HistoryEvent } from "./rows/r03-receipts";
 import { WakeRead } from "./rows/r07-wake-read";
@@ -151,6 +152,10 @@ export class GateSession {
 	fenceOffRecorded = false;
 	/** The orchestrator's reply withheld this turn (r01-turn-shape), until its `session_stop`; row 15 refuses work while it stands. */
 	heldReply: { original: string; reason: string } | null = null;
+	/** Jo's trusted either/or authorization, bound to concrete requested paths. */
+	commandFallbackAuthorization: FallbackAuthorization | null = null;
+	/** Host-owned fallback rendered directly after a reserved execution refusal. */
+	pendingCommandFallback: { fallback: CommandFallback; blocker: string } | null = null;
 	#ledger: Ledger | null = null;
 
 	constructor(

@@ -2,7 +2,7 @@
 import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { checkTurnShape, questionBlocks } from "../src/rows/r01-turn-shape";
+import { checkTurnShape, questionBlocks, turnShapeWarnings } from "../src/rows/r01-turn-shape";
 import { CONTRACT_MARKER, injectContract } from "../src/rows/r02-contract";
 import { checkReceipts, type HistoryEvent, historyEvent, workCall } from "../src/rows/r03-receipts";
 import { tmp } from "./helpers";
@@ -33,29 +33,30 @@ describe("row 1: turn shape to Jo", () => {
 		const r = checkTurnShape("**QUESTION**\nA or B?\n\n**QUESTION**\nC or D?");
 		expect(r?.reason).toContain("2 QUESTIONs");
 	});
-	test("refuses a bare command handed to Jo", () => {
-		const r = checkTurnShape("**ACTION**\nRun this:\n```bash\ngit push origin feat\n```");
-		expect(r?.reason).toContain("bare command (`git push origin feat`)");
-	});
-	// tiers/orchestrator.md § What you never do: the orchestrator hands Jo no command at all, not
-	// even the lane's one `zsh <path>` line.
-	const ORCH_REFUSAL = "a lane runs it, or ask Jo for one word";
-	test("orchestrator: a bare command fence is refused", () => {
-		const r = checkTurnShape("**ACTION**\nRun this:\n```bash\ngit push origin feat\n```", "orchestrator");
-		expect(r?.reason).toContain(ORCH_REFUSAL);
-		expect(r?.reason).toContain("it hands Jo a command (`git push origin feat`)");
-	});
-	test("orchestrator: a script-path fence line is refused; the same text passes as a lane", () => {
-		const msg = "**ACTION**\nRun it with:\n```bash\nzsh ~/agent-scratch/x/run.sh\n```";
-		expect(checkTurnShape(msg, "orchestrator")?.reason).toContain(`it hands Jo a command (\`zsh ~/agent-scratch/x/run.sh\`); ${ORCH_REFUSAL}`);
+	test("warns on an incomplete bare command handoff without blocking it", () => {
+		const msg = "**ACTION**\nRun this:\n```bash\ngit push origin feat\n```";
 		expect(checkTurnShape(msg)).toBeNull();
-		expect(checkTurnShape(msg, "lane")).toBeNull();
-		expect(checkTurnShape(good)).toBeNull();
-		expect(checkTurnShape(good, "orchestrator")?.reason).toContain(ORCH_REFUSAL);
+		expect(turnShapeWarnings(msg)).toEqual([expect.stringContaining("command presentation is missing")]);
 	});
-	test("orchestrator: a script line in prose or in inline code is refused", () => {
-		expect(checkTurnShape("**ACTION**\nRun it:\nzsh ~/agent-scratch/x/run.sh", "orchestrator")?.reason).toContain(ORCH_REFUSAL);
-		expect(checkTurnShape("**ACTION**\nRun it: `zsh ~/agent-scratch/x/run.sh`", "orchestrator")?.reason).toContain(ORCH_REFUSAL);
+	const COMMAND_WARNING = "command presentation is missing";
+	test("orchestrator: a bare command fence warns instead of blocking", () => {
+		const msg = "**ACTION**\nRun this:\n```bash\ngit push origin feat\n```";
+		expect(checkTurnShape(msg, "orchestrator")).toBeNull();
+		expect(turnShapeWarnings(msg, "orchestrator")).toEqual([expect.stringContaining(COMMAND_WARNING)]);
+	});
+	test("orchestrator: script-path handoffs are advisory for both roles", () => {
+		const msg = "**ACTION**\nRun it with:\n```bash\nzsh ~/agent-scratch/x/run.sh\n```";
+		expect(checkTurnShape(msg, "orchestrator")).toBeNull();
+		expect(checkTurnShape(msg, "lane")).toBeNull();
+		expect(turnShapeWarnings(msg, "orchestrator")).toEqual([expect.stringContaining(COMMAND_WARNING)]);
+		expect(turnShapeWarnings(msg, "lane")).toEqual([]);
+		expect(checkTurnShape(good, "orchestrator")).toBeNull();
+	});
+	test("orchestrator: a script line in prose or inline code warns", () => {
+		for (const msg of ["**ACTION**\nRun it:\nzsh ~/agent-scratch/x/run.sh", "**ACTION**\nRun it: `zsh ~/agent-scratch/x/run.sh`"]) {
+			expect(checkTurnShape(msg, "orchestrator")).toBeNull();
+			expect(turnShapeWarnings(msg, "orchestrator")).toEqual([expect.stringContaining(COMMAND_WARNING)]);
+		}
 	});
 	test("orchestrator: a code fence and an inline command receipt are not hand-overs", () => {
 		expect(checkTurnShape("**CLAIM**\n```ts\nconst x = 1;\n```", "orchestrator")).toBeNull();
@@ -64,14 +65,15 @@ describe("row 1: turn shape to Jo", () => {
 	// PLAN wl-mvb9mw00ycfjeo D7 (2026-10-17; migration/items/pair-offer-own-line.md, MIGRATION.md item
 	// 52): the one command the orchestrator may give Jo is the by-hand `as2 lane wl-…` line, in prose
 	// or inline code, on its own line before the closing ask. Inside a shell fence it is still refused.
-	test("orchestrator: `as2 lane wl-x` passes in prose and inline code, and is refused in a shell fence", () => {
+	test("orchestrator: `as2 lane wl-x` stays allowed in prose; a shell fence is advisory", () => {
 		const lead = "**CLAIM**\nYou took pair on the login page (q-x); its lane has ended. Continue it in another terminal:";
 		const ask = "**QUESTION**\nShould I close it when you are done? Recommend yes.";
 		expect(checkTurnShape(`${lead}\nas2 lane wl-x\n\n${ask}`, "orchestrator")).toBeNull();
 		expect(checkTurnShape(`${lead}\n\`as2 lane wl-x\`\n\n${ask}`, "orchestrator")).toBeNull();
 		for (const fence of ["bash", "sh", "zsh", "shell", "console"]) {
-			const r = checkTurnShape(`${lead}\n\`\`\`${fence}\nas2 lane wl-x\n\`\`\`\n\n${ask}`, "orchestrator");
-			expect(r?.reason).toContain(`it hands Jo a command (\`as2 lane wl-x\`); ${ORCH_REFUSAL}`);
+			const msg = `${lead}\n\`\`\`${fence}\nas2 lane wl-x\n\`\`\`\n\n${ask}`;
+			expect(checkTurnShape(msg, "orchestrator")).toBeNull();
+			expect(turnShapeWarnings(msg, "orchestrator")).toEqual([expect.stringContaining(COMMAND_WARNING)]);
 		}
 	});
 	test("refuses a needs-you block that is not first, and an ask that is not last", () => {

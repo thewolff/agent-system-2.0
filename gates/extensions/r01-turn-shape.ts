@@ -27,7 +27,8 @@
 // never opens the ledger, and a ledger that cannot be read still refuses a reply that names one.
 // The hold is kept on the session (`heldReply`) past the stop's block, until a reply passes or Jo's
 // next `input`: row 15 refuses working calls under it, since the session file carries only the marker.
-import { checkTurnShape } from "../src/rows/r01-turn-shape";
+import { affirmativeDeleteRequest, fallbackAuthorization } from "../src/dispositions";
+import { checkTurnShape, turnShapeWarnings } from "../src/rows/r01-turn-shape";
 import { checkQuestionPublication, recordPublication } from "../src/rows/r15-orchestrator-role";
 import { type GatesAPI, type GateSession, gateSession, messageText } from "../src/session";
 
@@ -59,22 +60,53 @@ function orchestratorReply(s: GateSession, text: string): string | null {
 }
 
 export default function turnShapeRow(pi: GatesAPI, env: Record<string, string | undefined> = process.env): void {
-	pi.on("input", (_event, ctx) => {
+	const trustedAction = new WeakMap<GateSession, string>();
+	pi.on("input", (event, ctx) => {
 		const s = gateSession(ctx, env);
 		markerShown.delete(s);
 		s.heldReply = null;
+		if (event.source === "interactive") {
+			const prior = trustedAction.get(s);
+			const direct = fallbackAuthorization(event.text);
+			const inherited = prior ? fallbackAuthorization(event.text, prior) : null;
+			s.commandFallbackAuthorization = direct ?? inherited;
+			if (affirmativeDeleteRequest(event.text)) trustedAction.set(s, event.text);
+			else trustedAction.delete(s);
+		} else {
+			s.commandFallbackAuthorization = null;
+			trustedAction.delete(s);
+		}
+		s.pendingCommandFallback = null;
 		return undefined;
 	});
 
 	pi.on("assistant_message", (event, ctx) => {
 		const s = gateSession(ctx, env);
 		const content = event.message.content;
+		if (s.pendingCommandFallback && Array.isArray(content) && !content.some((p) => p.type === "toolCall")) {
+			const { fallback, blocker } = s.pendingCommandFallback;
+			s.pendingCommandFallback = null;
+			const longest = Math.max(2, ...[...fallback.command.matchAll(/`+/g)].map((m) => m[0].length));
+			const fence = "`".repeat(longest + 1);
+			const rendered = [
+				`Execution blocker: ${blocker}`,
+				`Execution status: ${fallback.status}.`,
+				`Impact: ${fallback.impact}`,
+				`Reversal: ${fallback.reversal}`,
+				`${fence}bash`,
+				fallback.command,
+				fence,
+			].join("\n");
+			const first = content.findIndex((p) => p.type === "text");
+			return { content: content.map((p, i) => (p.type !== "text" ? p : { ...p, text: i === first ? rendered : "" })) };
+		}
 		if (s.role !== "orchestrator" || !Array.isArray(content) || content.some((p) => p.type === "toolCall")) return undefined;
 		const original = messageText(event.message);
 		const reason = orchestratorReply(s, original);
 		if (!reason) {
 			s.heldReply = null;
 			markerShown.delete(s);
+			for (const warning of turnShapeWarnings(original, "orchestrator")) ctx.ui.notify(`P-11 row 1 warning: ${warning}`, "warning");
 			return undefined;
 		}
 		s.heldReply = { original, reason };
@@ -93,9 +125,13 @@ export default function turnShapeRow(pi: GatesAPI, env: Record<string, string | 
 			return { decision: "block", reason: `${withheld.reason}\n\nYour held reply was:\n\n${withheld.original}` };
 		}
 		const text = messageText(event.last_assistant_message);
-		const refusal = checkTurnShape(text, s.role === "orchestrator" ? "orchestrator" : "lane");
+		const role = s.role === "orchestrator" ? "orchestrator" : "lane";
+		const refusal = checkTurnShape(text, role);
 		if (refusal) return { decision: "block", reason: refusal.reason };
-		if (s.role !== "orchestrator") return undefined;
+		if (s.role !== "orchestrator") {
+			for (const warning of turnShapeWarnings(text, "lane")) ctx.ui.notify(`P-11 row 1 warning: ${warning}`, "warning");
+			return undefined;
+		}
 		try {
 			const bound = checkQuestionPublication(text, () => s.ledger(), true);
 			return bound.ok ? undefined : { decision: "block", reason: bound.reason };
