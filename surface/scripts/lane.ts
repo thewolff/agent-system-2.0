@@ -51,8 +51,11 @@ import { type Subprocess, spawn, spawnSync } from "bun";
 import { appendFileSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { headroom } from "../../classifier/src/headroom";
+import { countRounds, parseReviewRound } from "../../classifier/src/rounds";
 import { loadTierTable, modelIdentity } from "../../classifier/src/tier-table";
 import { fenceTargets } from "../../gates/src/fence";
+import { askJo, raisedId } from "../../gates/src/rulings";
+import { alarmFilePath, CEILING_ALARM_KIND, describeOff, routineState } from "../../gates/src/routine-switch";
 import { SCRATCH_ENV } from "../../gates/src/scratch";
 import { ensureScratchRoot } from "../src/scratch-root";
 import { canonicalPath, homeDir } from "../../ledger/src/locality";
@@ -61,8 +64,9 @@ import {
 	type WorkloadRow,
 } from "../../ledger/src/index";
 import {
-	type Ceiling, ceilingKey, type CeilingNoticeLevel, ceilingNoticeBody, crossed, effectiveCeiling, originalCeiling, pairedCeilingPromptLine, parseCeilingNotice, scanSpend, type Spend,
-	spendBody, wallMinutes,
+	AUTO_RAISE_SOURCE, autoRaiseUsed, type Ceiling, ceilingBody, ceilingInForce, ceilingKey, type CeilingMark, ceilingMarkBody, type CeilingNoticeLevel, ceilingNoticeBody, ceilingQuestionBody,
+	ceilingRaisedNoticeBody, CEILING_QUESTION_OPTIONS, crossed, effectiveCeiling, halfRaise, originalCeiling, pairedCeilingPromptLine, parseCeilingMark, parseCeilingNotice, parseCeilingQuestion, scanSpend,
+	type Spend, spendBody, wallMinutes,
 } from "../src/ceiling";
 import { newLaneSession, runCtxIndex, topLevelSessions } from "../src/ctx-index";
 import { decisionLogContext, repoOf } from "../src/decision-log";
@@ -72,8 +76,9 @@ import { checkoutOwnerRepo, isTrainOrFix, openTrains, ownerTasks, TRAIN_LAUNCH_L
 import {
 	attempts, branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, heldLive, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
-	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
-	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeOrigin, resumePlan, scratchCapMb, sessionOrigin, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, worktreeBody, worktreePath,
+	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody,
+	launchRequestedBody, doneLine, maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeOrigin, resumePlan, scratchCapMb, sessionOrigin, STARTER_EXIT, stateModelCheck, stateModelOf,
+	STOP_POLL_MS, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continueCounter, continuePrompt, deadRunPrompt, type DeadTestRun, deadTestRuns, enqueueRunnerDeath, exitOutcome, heldOpenBody, IDLE_CHECK, IDLE_LIMIT, idleActivity,
@@ -90,7 +95,7 @@ import {
 import { renderWorkload } from "../src/render";
 import { laneDeaths } from "../src/signals";
 import { readTracingSetting, tracingEnv } from "../src/tracing";
-import { parseHeartbeat, runDirOf, runsRoot, testRuns } from "../src/test-run";
+import { parseHeartbeat, parsePushDest, runDirOf, runsRoot, testRuns } from "../src/test-run";
 import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV } from "../src/types";
 import { readCleanShell } from "../../gates/src/clean-shell";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
@@ -763,16 +768,26 @@ export function meterStep(state: MeterState, inputs: MeterInputs): MeterResult {
 	return { state: notice === null ? state : { sent: [...state.sent, key] }, level, notice, stop: level === 100 };
 }
 
-/** The levels of the runner's ceiling notices on the workload for `ceiling`'s value (`parseCeilingNotice`), whatever their delivery state. */
+/**
+ * The levels the workload already holds a ceiling notice for at `ceiling`'s value (`parseCeilingNotice`), whatever their
+ * delivery state, plus 100 when the runner already asked Jo at that value (`parseCeilingQuestion`: the question that
+ * takes the stop notice's place at a 100 % hit it did not raise, PLAN wl-mvqwn80onq9hq8 D12), so a relaunch on the same
+ * value asks nothing again.
+ */
 export function ceilingNoticesSent(ledger: Ledger, workloadId: string, ceiling: Ceiling): CeilingNoticeLevel[] {
 	const key = ceilingKey(ceiling);
 	const rows = ledger.db.query<{ body: string }, [string, string]>(
 		"SELECT body FROM messages WHERE workload_id = ? AND created_by = ? AND body LIKE 'notice: ceiling %' ORDER BY created_at, id",
 	).all(workloadId, LANE_RUNNER_BY);
-	return rows.flatMap((m) => {
+	const levels = rows.flatMap((m) => {
 		const n = parseCeilingNotice(m.body);
 		return n !== null && n.key === key && n.workloadId === workloadId ? [n.level] : [];
 	});
+	const asked = ledger.questions(workloadId).some((q) => {
+		const c = q.created_by === LANE_RUNNER_BY ? parseCeilingQuestion(q.body) : null;
+		return c !== null && c.key === key && c.workloadId === workloadId;
+	});
+	return asked ? [...levels, 100] : levels;
 }
 
 /** The notice for `level`, in one write stamped `lane-runner` with the `spend:` entry: the notice (surface/src/notice.ts) and the spend it reports. Returns the message id. */
@@ -786,9 +801,276 @@ export function sendCeilingNotice(
 	});
 }
 
-/** One meter poll's outcome: the step, and whether its ceiling stop's `lane-stop: <lane> accepted ceiling` is already on the ledger. */
+// ---- the hit at 100 %: progress, the one raise by half, or Jo asked (PLAN wl-mvqwn80onq9hq8 D12) ----------------------
+
+/** A workload branch whose remote head the progress test reads: `(origin, wl/<wl>)` and every `push-dest:` `(remote, branch)`. */
+export interface PushBranch {
+	remote: string;
+	branch: string;
+}
+
+/** A branch's remote head as read now: the mark's fields, plus why the URL or the head is `unknown` (null when both were read). */
+export interface HeadRead extends CeilingMark {
+	error: string | null;
+}
+
+/** One branch's verdict at the hit: a commit the window's mark lacked is on the remote, nothing new is, or it cannot be told. */
+export type PushCheck = { kind: "pushed"; sha: string } | { kind: "none" } | { kind: "unknown"; error: string };
+
+/** The git reads of the progress test, against the workload's worktree; a test passes a fake or a probe on scratch repositories. */
+export interface PushProbe {
+	/** `git remote get-url --push <remote>`, then `git ls-remote --exit-code <url> refs/heads/<branch>`: one try each, 15 s. */
+	read(b: PushBranch): HeadRead;
+	/**
+	 * Whether `head` carries a commit `base` lacks (`git merge-base --is-ancestor <head> <base>` exits 1), false when it exits
+	 * 0, else the reason it cannot be told: a shallow repository, or a test that fails even after one fetch of a missing head.
+	 */
+	carries(url: string, branch: string, head: string, base: string): boolean | string;
+}
+
+/** The bound on each remote read of the progress test (D12): `get-url` and `ls-remote`. */
+export const REMOTE_READ_MS = 15_000;
+/** The bound on the one fetch of a head object missing locally (D12). */
+export const OBJECT_FETCH_MS = 30_000;
+
+const SHA = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+
+/** The probe the runner uses: plain git in `worktree`, no terminal prompt (a credential prompt fails the read instead of hanging it). */
+export function gitPushProbe(worktree: string): PushProbe {
+	const run = (args: string[], timeoutMs: number) => {
+		const r = spawnSync(["git", "-C", worktree, ...args], { stdout: "pipe", stderr: "pipe", timeout: timeoutMs, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } });
+		const timedOut = r.exitedDueToTimeout === true;
+		const code = r.exitCode ?? -1;
+		const err = r.stderr.toString().replace(/\s+/g, " ").trim();
+		const why = `\`git ${args.join(" ")}\` in ${worktree} ${timedOut ? `timed out after ${timeoutMs / 1000} s` : `exited ${code}${err === "" ? "" : `: ${err}`}`}`;
+		return { code: timedOut ? -1 : code, out: r.stdout.toString().trim(), why };
+	};
+	return {
+		read(b) {
+			const u = run(["remote", "get-url", "--push", b.remote], REMOTE_READ_MS);
+			const url = u.out.split("\n")[0]!.trim();
+			if (u.code !== 0 || url === "") return { ...b, url: "unknown", head: "unknown", error: u.code === 0 ? `${u.why} with no URL` : u.why };
+			if (/\s/.test(url)) return { ...b, url: "unknown", head: "unknown", error: `the push URL of ${b.remote} holds whitespace, which a ceiling-mark cannot record` };
+			const ref = `refs/heads/${b.branch}`;
+			const ls = run(["ls-remote", "--exit-code", url, ref], REMOTE_READ_MS);
+			if (ls.code === 2) return { ...b, url, head: "none", error: null };
+			if (ls.code !== 0) return { ...b, url, head: "unknown", error: ls.why };
+			const line = ls.out.split("\n").map((l) => l.split("\t")).find((p) => p[1] === ref);
+			if (line === undefined) return { ...b, url, head: "none", error: null };
+			return SHA.test(line[0]!) ? { ...b, url, head: line[0]!, error: null } : { ...b, url, head: "unknown", error: `${ls.why} printed ${line[0]} for ${ref}, not a sha` };
+		},
+		carries(url, branch, head, base) {
+			const shallow = run(["rev-parse", "--is-shallow-repository"], REMOTE_READ_MS);
+			if (shallow.code !== 0) return shallow.why;
+			if (shallow.out === "true") return "shallow clone";
+			if (run(["cat-file", "-e", `${head}^{commit}`], REMOTE_READ_MS).code !== 0) {
+				const f = run(["fetch", "--no-write-fetch-head", url, `refs/heads/${branch}`], OBJECT_FETCH_MS);
+				if (f.code !== 0) return f.why;
+			}
+			const a = run(["merge-base", "--is-ancestor", head, base], REMOTE_READ_MS);
+			return a.code === 1 ? true : a.code === 0 ? false : a.why;
+		},
+	};
+}
+
+/** The progress test of one branch at the hit (D12): its head read now against the window's mark. */
+export function pushCheck(b: PushBranch, mark: CeilingMark | undefined, now: HeadRead | undefined, probe: PushProbe): PushCheck {
+	const unknown = (error: string): PushCheck => ({ kind: "unknown", error });
+	if (now === undefined) return unknown("the remote was not read before the deciding write");
+	if (mark === undefined) return unknown("no ceiling-mark in the window");
+	if (now.url === "unknown") return unknown(now.error ?? "the push URL could not be read");
+	if (mark.url === "unknown") return unknown("the mark's push URL is unknown");
+	if (now.url !== mark.url) return unknown("push URL changed");
+	if (mark.head === "unknown") return unknown("the mark's head is unknown");
+	if (now.head === "unknown") return unknown(now.error ?? "the head could not be read");
+	// A deletion, an unchanged head (a dry run, an up-to-date push) and a head moved back are never a pushed commit.
+	if (now.head === "none" || now.head === mark.head) return { kind: "none" };
+	if (mark.head === "none") return { kind: "pushed", sha: now.head };
+	const c = probe.carries(now.url, b.branch, now.head, mark.head);
+	return c === true ? { kind: "pushed", sha: now.head } : c === false ? { kind: "none" } : unknown(c);
+}
+
+/** `(origin, wl/<wl>)`, then every `(remote, branch)` the workload's `push-dest:` rows name, once each. */
+export function ceilingBranches(workloadId: string, control: readonly ControlEntry[]): PushBranch[] {
+	const out: PushBranch[] = [{ remote: "origin", branch: branchName(workloadId) }];
+	for (const c of control) {
+		const d = c.prefix === "push-dest" ? parsePushDest(c.body) : null;
+		if (d !== null && !out.some((b) => b.remote === d.remote && b.branch === d.branch)) out.push({ remote: d.remote, branch: d.branch });
+	}
+	return out;
+}
+
+const branchKey = (b: PushBranch): string => `${b.remote} ${b.branch}`;
+
+/** What one meter poll reads off the ledger, before its write and again inside it. */
+interface MeterView {
+	w: WorkloadRow;
+	control: ControlEntry[];
+	ceiling: Ceiling;
+	step: MeterResult;
+	/** Where the progress window opens: the newest 80 or 100 % ceiling notice, else the `ceiling:` row in force; null with neither. */
+	start: string | null;
+	branches: PushBranch[];
+	/** Per `branchKey`, the window's mark: the branch's oldest `ceiling-mark:` at or after `start`. */
+	marks: Map<string, CeilingMark>;
+}
+
+function meterView(ledger: Ledger, r: { workloadId: string; spend: Spend; state: MeterState }): MeterView {
+	const w = ledger.workload(r.workloadId);
+	if (!w) throw new Error(`no workload ${r.workloadId}`);
+	const es = ledger.entries(r.workloadId);
+	const control = controlEntries(es, holdersOf(es, w.holder, ledger.holders(r.workloadId)));
+	const inForce = ceilingInForce(control, ledger.instructions(r.workloadId), w.stakes);
+	const step = meterStep(r.state, { ceiling: inForce.ceiling, spend: r.spend, sent: ceilingNoticesSent(ledger, r.workloadId, inForce.ceiling) });
+	const notices = ledger.db.query<{ body: string; created_at: string }, [string, string]>(
+		"SELECT body, created_at FROM messages WHERE workload_id = ? AND created_by = ? AND body LIKE 'notice: ceiling %' ORDER BY created_at DESC, id DESC",
+	).all(r.workloadId, LANE_RUNNER_BY);
+	const start = notices.find((m) => parseCeilingNotice(m.body)?.workloadId === r.workloadId)?.created_at ?? inForce.at;
+	const marks = new Map<string, CeilingMark>();
+	for (const c of control) {
+		const m = c.prefix === "ceiling-mark" && (start === null || c.createdAt >= start) ? parseCeilingMark(c.rest) : null;
+		if (m !== null && !marks.has(branchKey(m))) marks.set(branchKey(m), m);
+	}
+	return { w, control, ceiling: inForce.ceiling, step, start, branches: ceilingBranches(r.workloadId, control), marks };
+}
+
+/**
+ * The progress inside the window (D12), mechanical: a slice of the workload moved to done; a branch whose remote head
+ * carries a commit its mark lacked (`pushes`, read before the write); a complete review round settled in the window whose
+ * known blocking count is below the previous complete round of the same loop. `found` is the first, as `<kind> <evidence>`;
+ * `unknown` is every branch that could not be told, as `push check failed: <remote> <branch>: <error>`.
+ */
+function progressOf(ledger: Ledger, v: MeterView, pushes: ReadonlyMap<string, PushCheck> | null): { found: string | null; unknown: string[] } {
+	const wl = v.w.id;
+	const inWindow = (t: string) => v.start === null || t >= v.start;
+	const found: string[] = [];
+	const unknown: string[] = [];
+	const slices = ledger.slices(wl);
+	const done = slices.find((s) => s.state === "done" && inWindow(s.changed_at));
+	if (done) found.push(`slice-closed ${done.id}`);
+	for (const b of v.branches) {
+		const p = pushes?.get(branchKey(b)) ?? { kind: "unknown", error: "the remote was not read before the deciding write" };
+		if (p.kind === "pushed") found.push(`commit-pushed ${b.remote} ${b.branch} ${p.sha}`);
+		else if (p.kind === "unknown") unknown.push(`push check failed: ${b.remote} ${b.branch}: ${p.error}`);
+	}
+	const entries = ledger.entries(wl, "assumption");
+	for (const s of slices) {
+		const rounds = countRounds(entries, s.id).rounds.filter((x) => x.complete);
+		for (let i = 1; i < rounds.length; i++) {
+			const prev = rounds[i - 1]!;
+			const cur = rounds[i]!;
+			if (prev.blocking === null || cur.blocking === null || cur.blocking >= prev.blocking) continue;
+			const settled = entries.filter((e) => {
+				const rr = parseReviewRound(e.body);
+				return rr !== null && rr.slice === s.id && rr.group === cur.group;
+			}).map((e) => e.created_at).reduce((a, b) => (b > a ? b : a), "");
+			if (settled !== "" && inWindow(settled)) found.push(`blocking-fell ${s.id} ${prev.blocking}→${cur.blocking}`);
+		}
+	}
+	return { found: found[0] ?? null, unknown };
+}
+
+/** The ceiling question's raise failed: `raiseError` (null when no raise was tried) and `questionError` both, for the alarm line. */
+class CeilingAskError extends Error {
+	constructor(readonly raiseError: string | null, readonly questionError: string) {
+		super(raiseError === null ? `the ceiling question failed: ${questionError}` : `the ceiling raise failed: ${raiseError}; the ceiling question failed too: ${questionError}`);
+	}
+}
+
+/**
+ * Ask Jo at the hit (D12), inside the caller's write, through `askJo`: on the workload's newest slice still open (running
+ * or paused), else on a new `sl-ceiling-<n>` slice ("decide the ceiling") the same write adds. Options `extend` / `stop`.
+ */
+function raiseCeilingQuestion(ledger: Ledger, r: { workloadId: string; spend: Spend }, v: MeterView, first: string, progress: string | null): string {
+	const wl = r.workloadId;
+	let sl = ledger.slices(wl).findLast((s) => s.state === "open" || s.state === "paused")?.id;
+	if (sl === undefined) {
+		let n = 1;
+		while (ledger.slice(`sl-ceiling-${n}`) !== null) n++;
+		sl = ledger.addSlice({
+			by: LANE_RUNNER_BY, workloadId: wl, id: `sl-ceiling-${n}`, task: "decide the ceiling",
+			doneCondition: `Jo answered the runner's ceiling question on ${wl} (extend or stop)`, inputs: `the runner's ceiling question on ${wl}`,
+		});
+	}
+	const body = ceilingQuestionBody(first, wl, r.spend, v.ceiling, v.w.stakes, progress);
+	const asked = askJo(ledger, { by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body, options: [...CEILING_QUESTION_OPTIONS] }, { asker: "lane", now: Date.parse(ledger.now()) });
+	return raisedId(asked, `the ceiling question of ${wl}`);
+}
+
+/** What a 100 % hit of an autonomous lane did instead of the stop notice (D12). */
+export type CeilingHit =
+	| { kind: "raised"; ceiling: Ceiling; progress: string }
+	| { kind: "asked"; questionId: string; first: string }
+	/** Every write failed: the stop stands unaccepted and a `ceiling` alarm line names the errors. */
+	| { kind: "alarm"; error: string };
+
+/**
+ * The hit at 100 % of an autonomous lane (D12), inside the meter's write. Eligible (progress in the window, no earlier
+ * `auto-raise half` row, auto-apply on): one nested write of the runner's `ceiling:` at `halfRaise`, its
+ * `launch-requested:` and the one-line raise notice. Not eligible, or `halfRaise` null, or that write thrown (rolled back
+ * whole): Jo is asked, the reason on the question's first line. A question that cannot be written throws
+ * `CeilingAskError` naming every error.
+ */
+function ceilingHit(ledger: Ledger, r: { workloadId: string; spend: Spend }, v: MeterView, pushes: ReadonlyMap<string, PushCheck> | null, alarmFile: () => string): CeilingHit {
+	const wl = r.workloadId;
+	const ask = (first: string, progress: string | null, raiseError: string | null = null): CeilingHit => {
+		try {
+			return { kind: "asked", questionId: raiseCeilingQuestion(ledger, r, v, first, progress), first };
+		} catch (err) {
+			throw new CeilingAskError(raiseError, oneLine(err));
+		}
+	};
+	if (autoRaiseUsed(v.control)) return ask(`ceiling reached on ${wl}: auto-raise already used`, null);
+	let routine: ReturnType<typeof routineState>;
+	try {
+		routine = routineState(ledger, Date.parse(ledger.now()), { alarmFile: alarmFile() });
+	} catch (err) {
+		// routineState throws rather than default to on (D1): the hit asks Jo, naming why.
+		return ask(`ceiling reached on ${wl}: auto-apply state unreadable: ${oneLine(err)}`, null);
+	}
+	if (!routine.on) {
+		const off = routine.offs.at(-1);
+		const why = off?.by === "ask-all" ? "ask-all"
+			: routine.rulingEndedBy !== null ? `auto-apply off: ruling routine-calls ended by ${routine.rulingEndedBy}`
+			: off !== undefined ? `auto-apply off: ${describeOff(off)}`
+			: routine.latches.length > 0 ? `auto-apply off: ${describeOff(routine.latches[0]!)}`
+			: "auto-apply off";
+		return ask(`ceiling reached on ${wl}: ${why}`, null);
+	}
+	const p = progressOf(ledger, v, pushes);
+	if (p.found === null) return ask(`ceiling reached on ${wl}: ${p.unknown.length > 0 ? p.unknown.join("; ") : `no progress since ${v.start ?? v.w.created_at}`}`, null);
+	const progress = [p.found, ...p.unknown].join("; ");
+	const next = halfRaise(v.ceiling);
+	if (next === null) return ask(`ceiling auto-raise failed: half of $${v.ceiling.usd} / ${v.ceiling.wallMin} min rounds to no raise`, progress);
+	try {
+		ledger.write(() => {
+			ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: ceilingBody(next, `${AUTO_RAISE_SOURCE} progress ${progress}`) });
+			ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody(LANE_RUNNER_BY, ledger.now(), "ceiling auto-raise") });
+			sendNotice(ledger, { by: LANE_RUNNER_BY, workloadId: wl, body: ceilingRaisedNoticeBody(wl, v.ceiling, next, progress) });
+		});
+		return { kind: "raised", ceiling: next, progress };
+	} catch (err) {
+		const raiseError = oneLine(err);
+		return ask(`ceiling auto-raise failed: ${raiseError}`, progress, raiseError);
+	}
+}
+
+/** Append D12's `kind: "ceiling"` alarm line (the `CEILING ALARM <wl>` needs-you line); a failed append is named on stderr with the errors it carried. */
+function appendCeilingAlarm(alarmFile: () => string, line: { workload: string; error: string; raiseError: string | null; questionError: string | null }): void {
+	let file = "the alarm file";
+	try {
+		file = alarmFile();
+		mkdirSync(dirname(file), { recursive: true });
+		appendFileSync(file, `${JSON.stringify({ kind: CEILING_ALARM_KIND, at: new Date().toISOString(), ...line })}\n`);
+	} catch (err) {
+		process.stderr.write(`runner: the ceiling alarm line could not be appended to ${file}: ${oneLine(err)}; it carried: ${line.error}\n`);
+	}
+}
+
+/** One meter poll's outcome: the step, whether its ceiling stop's `lane-stop: <lane> accepted ceiling` is on the ledger, and what a 100 % hit did. */
 export interface MeterPoll extends MeterResult {
 	accepted: boolean;
+	hit: CeilingHit | null;
 }
 
 /**
@@ -796,31 +1078,58 @@ export interface MeterPoll extends MeterResult {
  * instructions and its stakes), the step over `spend`, the notice or the stop's `spend:` entry, and on a stop the
  * `lane-stop: <lane> accepted ceiling`. A raise (surface/src/input.ts `raiseCeiling`, also one transaction) therefore
  * lands either before it, and the lane goes on under the new value, or after it, and sees the accepted stop and requests
- * the relaunch; never between a stop decided on the old value and its acceptance. When the writes fail after a stop was
- * decided, the stop still stands (`accepted` false: the caller accepts it on its own) and the state is unchanged;
- * any other failure throws.
+ * the relaunch; never between a stop decided on the old value and its acceptance.
+ *
+ * PLAN wl-mvqwn80onq9hq8 D12: the first 100 % hit at a ceiling value of an autonomous lane sends no stop notice; the same
+ * write rises once by half or asks Jo (`ceilingHit`). The remote heads are read before the write, never inside it
+ * (`probe`, at most 15 s a read): every branch at a notice or a hit, and a branch with no mark in the window at any poll.
+ * Each such read is written as a `ceiling-mark:` in the write. When the writes fail after a stop was decided, the stop
+ * still stands (`accepted` false: the caller accepts it on its own) and the state is unchanged; when that write was a
+ * hit's, a `ceiling` alarm line in `alarmFile` names every error. Any other failure throws.
  */
-export function meterPoll(ledger: Ledger, r: { workloadId: string; laneId: string; spend: Spend; state: MeterState }): MeterPoll {
+export function meterPoll(
+	ledger: Ledger, r: { workloadId: string; laneId: string; spend: Spend; state: MeterState; probe: PushProbe; alarmFile?: string },
+): MeterPoll {
+	const alarmFile = () => r.alarmFile ?? alarmFilePath(process.env);
+	const pre = meterView(ledger, r);
+	const read = pre.step.notice !== null ? pre.branches : pre.branches.filter((b) => !pre.marks.has(branchKey(b)));
+	const heads = new Map(read.map((b) => [branchKey(b), r.probe.read(b)] as const));
+	const pushes = pre.step.notice === 100 && pre.w.mode === "autonomous" && !autoRaiseUsed(pre.control)
+		? new Map(pre.branches.map((b) => [branchKey(b), pushCheck(b, pre.marks.get(branchKey(b)), heads.get(branchKey(b)), r.probe)] as const))
+		: null;
 	let decided = null as MeterResult | null;
+	let hitTried = false as boolean;
 	try {
-		const step = ledger.write(() => {
+		const out = ledger.write(() => {
 			decided = null;
-			const w = ledger.workload(r.workloadId);
-			if (!w) throw new Error(`no workload ${r.workloadId}`);
-			const es = ledger.entries(r.workloadId);
-			const ceiling = effectiveCeiling(controlEntries(es, holdersOf(es, w.holder)), ledger.instructions(r.workloadId), w.stakes);
-			const s = meterStep(r.state, { ceiling, spend: r.spend, sent: ceilingNoticesSent(ledger, r.workloadId, ceiling) });
+			hitTried = false;
+			const v = meterView(ledger, r);
+			const s = v.step;
 			decided = s;
-			if (s.notice !== null) sendCeilingNotice(ledger, { workloadId: r.workloadId, laneId: r.laneId, level: s.notice, spend: r.spend, ceiling, stakes: w.stakes });
-			else if (s.stop) ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: spendBody(r.laneId, r.spend) });
-			if (s.stop) ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: laneStopAcceptedBody(r.laneId, "ceiling") });
-			return s;
+			const entry = (body: string) => ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body });
+			for (const b of s.notice !== null ? v.branches : v.branches.filter((x) => !v.marks.has(branchKey(x)))) {
+				const h = heads.get(branchKey(b));
+				if (h !== undefined) entry(ceilingMarkBody(h));
+			}
+			let hit: CeilingHit | null = null;
+			if (s.notice === 100 && v.w.mode === "autonomous") {
+				hitTried = true;
+				entry(spendBody(r.laneId, r.spend));
+				hit = ceilingHit(ledger, r, v, pushes, alarmFile);
+			} else if (s.notice !== null) sendCeilingNotice(ledger, { workloadId: r.workloadId, laneId: r.laneId, level: s.notice, spend: r.spend, ceiling: v.ceiling, stakes: v.w.stakes });
+			else if (s.stop) entry(spendBody(r.laneId, r.spend));
+			if (s.stop) entry(laneStopAcceptedBody(r.laneId, "ceiling"));
+			return { s, hit };
 		});
-		return { ...step, accepted: step.stop };
+		return { ...out.s, accepted: out.s.stop, hit: out.hit };
 	} catch (err) {
 		if (decided === null || !decided.stop) throw err;
-		process.stderr.write(`runner: the ceiling stop's writes failed: ${String(err)}\n`);
-		return { ...decided, state: r.state, accepted: false };
+		process.stderr.write(`runner: the ceiling stop's writes failed: ${oneLine(err)}\n`);
+		if (!hitTried) return { ...decided, state: r.state, accepted: false, hit: null };
+		const ask = err instanceof CeilingAskError ? err : null;
+		const error = ask?.message ?? `the ceiling hit's write failed: ${oneLine(err)}`;
+		appendCeilingAlarm(alarmFile, { workload: r.workloadId, error, raiseError: ask?.raiseError ?? null, questionError: ask?.questionError ?? null });
+		return { ...decided, state: r.state, accepted: false, hit: { kind: "alarm", error } };
 	}
 }
 
@@ -867,7 +1176,7 @@ export function recordDecision(
 export function ceilingPromptLine(c: Ceiling, s: Spend): string {
 	const usd = Math.max(0, c.usd - s.usd);
 	const wall = Math.max(0, c.wallMin - s.wallMin);
-	return `ceiling: $${c.usd} / ${c.wallMin} min for the workload; spent so far $${s.usd.toFixed(2)} / ${Math.round(s.wallMin)} min (${Math.round(s.tokens)} tokens); set each brief's ceiling-share from the remainder, $${usd.toFixed(2)} / ${Math.round(wall)} min. At 80 % Jo gets a notice; at 100 % this lane is stopped and Jo is told.`;
+	return `ceiling: $${c.usd} / ${c.wallMin} min for the workload; spent so far $${s.usd.toFixed(2)} / ${Math.round(s.wallMin)} min (${Math.round(s.tokens)} tokens); set each brief's ceiling-share from the remainder, $${usd.toFixed(2)} / ${Math.round(wall)} min. At 80 % Jo gets a notice; at 100 % the ceiling rises once by half when the work made progress since the last ceiling notice; otherwise this lane stops and Jo is asked.`;
 }
 
 // ---- the run guard: one runner per lane id ---------------------------------------------------------
@@ -1388,6 +1697,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	let tally: Spend = { usd: 0, tokens: 0, wallMin: 0 };
 	let meterState: MeterState = { sent: [] };
 	let sessionsDir: string | null = null;
+	/** The progress test's git reads (D12), in the worktree once `prepare` gave it. */
+	let pushProbe: PushProbe | null = null;
 	let runStart: number | null = null;
 	const measure = (control: readonly ControlEntry[]): Spend => {
 		if (sessionsDir !== null) tally = scanSpend(sessionsDir, offsets, tally);
@@ -1398,16 +1709,22 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	/** The omp tree's peak RSS, sampled on the stop poll (PLAN wl-mvbcjageg7o2yo § 2.2). */
 	const rss = rssMeter(psSampler, RSS_SAMPLE_INTERVAL_MS);
 	/**
-	 * One meter poll (`meterPoll`): the 80 % notice once per ceiling value; at 100 % the stop notice once per ceiling value
-	 * and the stop through the stop path (acceptance `ceiling`, outcome stop, no lane-died:), the ceiling read and the
-	 * acceptance in one transaction. `control` is the poll's snapshot, for the wall only. A failure is logged, never fatal; a
-	 * stop the step called for is taken even when its writes failed. Returns whether it stopped the lane.
+	 * One meter poll (`meterPoll`): the 80 % notice once per ceiling value; at 100 % the stop through the stop path
+	 * (acceptance `ceiling`, outcome stop, no lane-died:), the ceiling read and the acceptance in one transaction, and in
+	 * the same write, once per ceiling value, the one raise by half with its relaunch request or Jo's question (PLAN
+	 * wl-mvqwn80onq9hq8 D12). `control` is the poll's snapshot, for the wall only. A failure is logged, never fatal; a stop
+	 * the step called for is taken even when its writes failed. Returns whether it stopped the lane.
 	 */
 	const meter = (control: readonly ControlEntry[]): boolean => {
 		let stopping = false;
 		let accepted = false;
 		try {
-			const polled = meterPoll(ledger, { workloadId: wl, laneId, spend: measure(control), state: meterState });
+			const probe: PushProbe = pushProbe ?? {
+				read: (b) => ({ ...b, url: "unknown", head: "unknown", error: `the runner of ${laneId} has no worktree yet` }),
+				carries: () => `the runner of ${laneId} has no worktree yet`,
+			};
+			const polled = meterPoll(ledger, { workloadId: wl, laneId, spend: measure(control), state: meterState, probe });
+			if (polled.hit !== null) process.stderr.write(`runner: ceiling hit on ${wl}: ${JSON.stringify(polled.hit)}\n`);
 			stopping = polled.stop;
 			accepted = polled.accepted;
 			meterState = polled.state;
@@ -1630,6 +1947,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	try {
 		const p = prepare(ledger, wl, false);
 		sessionsDir = p.sessionDir;
+		pushProbe = gitPushProbe(p.worktree);
 		{
 			const { workload: cur, control } = controlNow();
 			const ceiling = effectiveCeiling(control, ledger.instructions(wl), cur?.stakes ?? w.stakes);

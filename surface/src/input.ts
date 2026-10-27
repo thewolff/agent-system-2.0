@@ -129,8 +129,8 @@ import {
 	severityLine, UNKNOWN,
 } from "../../classifier/src/rounds";
 import { LOW_CONFIDENCE_THRESHOLD } from "../../classifier/src/route";
-import { CLASSIFIER_BY, type Ledger, type Mode, newId, type QuestionRow, type RoutingKind, type Stakes } from "../../ledger/src/index";
-import { type Ceiling, ceilingBody, crossed, effectiveCeiling, EXTEND_SOURCE, parseSpend, sizeFor } from "./ceiling";
+import { CLASSIFIER_BY, LANE_RUNNER_BY, type Ledger, type Mode, newId, type QuestionRow, type RoutingKind, type Stakes } from "../../ledger/src/index";
+import { type Ceiling, ceilingBody, crossed, effectiveCeiling, EXTEND_SOURCE, parseCeilingQuestion, parseSpend, sizeFor } from "./ceiling";
 import { recordRepo, repoOf } from "./decision-log";
 import { closedReservedRefusal, waitingReserved, wordsOf } from "./errors";
 import {
@@ -1170,8 +1170,9 @@ function ceilingInstructionBody(c: Ceiling): string {
 
 /**
  * Raise the ceiling to `next` on Jo's instruction `instructionId` (the `ceiling` and `extend` words, PLAN
- * wl-mvfkv7llkp7nk0 § 4), inside the caller's transaction: the `ceiling:` entry naming the instruction, then the relaunch
- * rule both words share. Jo's `launch-requested:` (the body the launch tool writes, cause `why`) is written when the
+ * wl-mvfkv7llkp7nk0 § 4), inside the caller's transaction: the `ceiling:` entry naming the instruction, every open
+ * runner ceiling question on the workload withdrawn (PLAN wl-mvqwn80onq9hq8 D12: no stale question remains), then the
+ * relaunch rule both words share. Jo's `launch-requested:` (the body the launch tool writes, cause `why`) is written when the
  * workload's newest lane was stopped at the ceiling (its `lane-stop: <lane> accepted ceiling`, whether it is still
  * stopping or gone), the workload is autonomous, the lane's last `spend:` is under `next` in both halves, and no
  * unconsumed request already waits; so that lane relaunches once its lease is gone. Otherwise nothing is requested: a
@@ -1183,6 +1184,28 @@ function ceilingInstructionBody(c: Ceiling): string {
  */
 function raiseCeiling(ledger: Ledger, wl: string, next: Ceiling, source: string, instructionId: string, why: string): string {
 	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: ceilingBody(next, source, instructionId) });
+	const withdrawn = ledger.questions(wl).filter((q) => q.state === "open" && isRunnerCeilingQuestion(q)).map((q) => {
+		const id = ledger.withdrawQuestion(q.id, { by: SURFACE_BY, author: "jo", channel: "surface", reason: `ceiling raised (instruction ${instructionId})`, then: "replan" });
+		return `; withdrew the ceiling question ${q.id} (withdrawal ${id})`;
+	}).join("");
+	return withdrawn + relaunchAfterRaise(ledger, wl, next, why);
+}
+
+/** A runner's ceiling question (PLAN wl-mvqwn80onq9hq8 D12): raised by the lane runner, its body the shape `parseCeilingQuestion` reads, on its own workload. */
+export function isRunnerCeilingQuestion(q: Pick<QuestionRow, "created_by" | "body" | "workload_id">): boolean {
+	return q.created_by === LANE_RUNNER_BY && parseCeilingQuestion(q.body)?.workloadId === q.workload_id;
+}
+
+/** One more block of the workload's own size (its stakes size, ×3 when judged change-large) on the value in force: Jo's `extend <wl>` and the `extend` answer to the runner's ceiling question. */
+function extendedCeiling(ledger: Ledger, wl: string): { block: Ceiling; next: Ceiling } {
+	const w = ledger.workload(wl)!;
+	const block = sizeFor(w.stakes, judgedKindOf(ledger, wl));
+	const cur = ceilingOf(ledger, wl);
+	return { block, next: { usd: cur.usd + block.usd, wallMin: cur.wallMin + block.wallMin } };
+}
+
+/** `raiseCeiling`'s relaunch rule, inside the caller's transaction; returns the receipt tail. */
+function relaunchAfterRaise(ledger: Ledger, wl: string, next: Ceiling, why: string): string {
 	const w = ledger.workload(wl)!;
 	const live = w.holder !== null && heldLive(w, ledger.now());
 	const control = controlOf(ledger, wl) ?? [];
@@ -1327,13 +1350,20 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 			// D4: *approve* on any other question while `plan: first` stands unapproved approves nothing, and the receipt says so.
 			const notPlan = !plan && word === "approve" && planFirst(controlOf(ledger, q0.workload_id) ?? []) !== null;
 			const roundLimit = (ROUND_LIMIT_OPTIONS as readonly string[]).includes(word) && isReviewLimitQuestion(ledger, q0);
+			// D12: `extend` on the runner's ceiling question is Jo's `extend <wl>` named by the answer (stored as the bare word, the
+			// raise shape `isRaiseInstruction` reads); `stop` leaves the stop standing.
+			const ceilingExtend = word === "extend" && isRunnerCeilingQuestion(q0);
 			if (plan && word === "cancel") {
 				const id = ledger.withdrawQuestion(cmd.questionId, { ...stamp, reason: "plan cancelled from the surface", then: "cancel" });
 				return `cancelled the plan: withdrew ${cmd.questionId} (withdrawal ${id}); slice ${q0.slice_id} is ${ledger.slice(q0.slice_id)?.state ?? "unknown"}`;
 			}
 			let tail = "";
 			const id = ledger.write(() => {
-				const answerId = ledger.answerQuestion(cmd.questionId, { ...stamp, answer: cmd.answer });
+				const answerId = ledger.answerQuestion(cmd.questionId, { ...stamp, answer: ceilingExtend ? word : cmd.answer });
+				if (ceilingExtend) {
+					const { block, next } = extendedCeiling(ledger, q0.workload_id);
+					tail = `; ceiling on ${q0.workload_id} extended by ${ceilingText(block)} → ${ceilingText(next)}${raiseCeiling(ledger, q0.workload_id, next, EXTEND_SOURCE, answerId, "ceiling extend")}`;
+				}
 				if (plan && word === "approve") ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: planApprovedBody(answerId) });
 				if (roundLimit) tail = settleReviewLimit(ledger, q0, word as RoundLimitOption, answerId);
 				if (word === "skip") tail += trainSkipClose(ledger, q0, answerId, heartbeatOf);
@@ -1367,10 +1397,7 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 		case "extend": {
 			// One more block of the workload's own size on the value in force (PLAN wl-mvfkv7llkp7nk0 § 4), shaped like the ceiling word.
 			return ledger.write(() => {
-				const w = ledger.workload(cmd.workloadId)!;
-				const block = sizeFor(w.stakes, judgedKindOf(ledger, cmd.workloadId));
-				const cur = ceilingOf(ledger, cmd.workloadId);
-				const next = { usd: cur.usd + block.usd, wallMin: cur.wallMin + block.wallMin };
+				const { block, next } = extendedCeiling(ledger, cmd.workloadId);
 				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: ceilingInstructionBody(next) });
 				const tail = raiseCeiling(ledger, cmd.workloadId, next, EXTEND_SOURCE, id, "ceiling extend");
 				return `ceiling on ${cmd.workloadId} extended by ${ceilingText(block)} → ${ceilingText(next)} (instruction ${id})${tail}`;

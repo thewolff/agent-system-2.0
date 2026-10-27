@@ -11,7 +11,7 @@
 // compared; wall is lane run time in minutes.
 import { closeSync, type Dirent, fstatSync, openSync, readdirSync, readSync } from "node:fs";
 import { join } from "node:path";
-import type { InstructionRow, RoutingKind, Stakes } from "../../ledger/src/index";
+import { type InstructionRow, LANE_RUNNER_BY, type RoutingKind, type Stakes } from "../../ledger/src/index";
 import { attempts, type ControlEntry, heldLive, JO_HOLDER } from "./launch";
 import { SURFACE_BY } from "./types";
 
@@ -82,28 +82,66 @@ export function isRaiseInstruction(i: Pick<InstructionRow, "kind" | "body">): bo
 	return i.body.startsWith("ceiling: ") || i.body.startsWith("stakes: ") || (i.kind === "answer" && i.body === "extend");
 }
 
+/** The `source` the runner's one raise by half starts with (PLAN wl-mvqwn80onq9hq8 D12): `auto-raise half progress <kind> <evidence>…`. */
+export const AUTO_RAISE_SOURCE = "auto-raise half";
+
 /**
- * The workload's effective ceiling (§ 2 item 1). The valid `ceiling:` entries, oldest first: the
- * first sets it; a later entry that raises neither half applies; one that raises either half applies
- * only when its `by <in-id>` names a Jo-authored instruction the surface wrote (every raise path is
- * a surface path, so a lane's "author jo" row never counts), in one of the raise shapes
- * (`isRaiseInstruction`), at or after the entry now in force; else it is ignored. `control` must come
- * from `controlEntries`, which already dropped every `ceiling:` not written by the surface. No entry
- * (a workload opened before the ceiling): the stakes size ×1.
+ * The runner's one raise by half (D12), rounded down and never above 150 %: dollars to the cent, `floor(usd × 150) / 100`, and
+ * wall to the minute, `floor(wall × 1.5)`. $0.10 → $0.15, $5 → $7.50, 61 → 91 min. Null unless both halves come out strictly
+ * above `c` ($0.001 → $0, $0.01 → $0.01, 1 → 1 min): a null is a failed raise, never announced as one. The arithmetic runs on
+ * integer micro-dollars and milli-minutes, so binary noise (0.7 × 150 = 104.99…) never moves a cent or a minute either way.
+ */
+export function halfRaise(c: Ceiling): Ceiling | null {
+	const usd = Math.floor((Math.round(c.usd * 1e6) * 3) / 20_000) / 100;
+	const wallMin = Math.floor((Math.round(c.wallMin * 1e3) * 3) / 2_000);
+	return usd > c.usd && wallMin > c.wallMin ? { usd, wallMin } : null;
+}
+
+/** Whether the runner ever wrote a `ceiling:` row with source `auto-raise half` on the workload (D12: at most once), applied or not. */
+export function autoRaiseUsed(control: readonly ControlEntry[]): boolean {
+	return control.some((c) => c.prefix === "ceiling" && c.createdBy === LANE_RUNNER_BY && /(?:^|\s)source auto-raise half(?:\s|$)/.test(c.rest));
+}
+
+/**
+ * The workload's effective ceiling (§ 2 item 1): `ceilingInForce`'s value.
  */
 export function effectiveCeiling(control: readonly ControlEntry[], instructions: readonly InstructionRow[], stakes: Stakes): Ceiling {
+	return ceilingInForce(control, instructions, stakes).ceiling;
+}
+
+/**
+ * The workload's effective ceiling (§ 2 item 1) and the `ceiling:` entry in force's time (null with none). The valid
+ * `ceiling:` entries, oldest first: the first sets it; a later entry that raises neither half applies; one that raises
+ * either half applies only when its `by <in-id>` names a Jo-authored instruction the surface wrote (every Jo raise path is
+ * a surface path, so a lane's "author jo" row never counts), in one of the raise shapes (`isRaiseInstruction`), at or
+ * after the entry now in force; else it is ignored. A `ceiling:` written by the lane runner (PLAN wl-mvqwn80onq9hq8 D12)
+ * applies only when its source starts `auto-raise half`, its two values equal `halfRaise` of the ceiling then in force,
+ * and no earlier such row exists on the workload; any other runner row is ignored. `control` must come from
+ * `controlEntries`, which already dropped every `ceiling:` not written by the surface or the runner. No entry (a workload
+ * opened before the ceiling): the stakes size ×1.
+ */
+export function ceilingInForce(control: readonly ControlEntry[], instructions: readonly InstructionRow[], stakes: Stakes): { ceiling: Ceiling; at: string | null } {
 	let cur: (Ceiling & { at: string }) | null = null;
+	let autoRaised = false;
 	for (const c of control) {
 		if (c.prefix !== "ceiling") continue;
 		const p = parseCeiling(c.rest);
 		if (p === null) continue;
+		if (c.createdBy === LANE_RUNNER_BY) {
+			if (p.source !== AUTO_RAISE_SOURCE && !p.source.startsWith(`${AUTO_RAISE_SOURCE} `)) continue;
+			const first = !autoRaised;
+			autoRaised = true;
+			const half = halfRaise(cur ?? sizeFor(stakes, null));
+			if (first && half !== null && p.usd === half.usd && p.wallMin === half.wallMin) cur = { usd: p.usd, wallMin: p.wallMin, at: c.createdAt };
+			continue;
+		}
 		if (cur !== null && (p.usd > cur.usd || p.wallMin > cur.wallMin)) {
 			const since = cur.at;
 			if (!instructions.some((i) => i.id === p.by && i.author === JO_HOLDER && i.created_by === SURFACE_BY && i.created_at >= since && isRaiseInstruction(i))) continue;
 		}
 		cur = { usd: p.usd, wallMin: p.wallMin, at: c.createdAt };
 	}
-	return cur === null ? sizeFor(stakes, null) : { usd: cur.usd, wallMin: cur.wallMin };
+	return cur === null ? { ceiling: sizeFor(stakes, null), at: null } : { ceiling: { usd: cur.usd, wallMin: cur.wallMin }, at: cur.at };
 }
 
 // ---- spend: ------------------------------------------------------------------------------------
@@ -294,6 +332,60 @@ export function parseCeilingNotice(body: string): { level: CeilingNoticeLevel; k
 	return m ? { level: Number(m[1]) as CeilingNoticeLevel, key: m[2]!, workloadId: m[3]! } : null;
 }
 
+// ---- the hit at 100 % (PLAN wl-mvqwn80onq9hq8 D12) -------------------------------------------------------------
+
+/** The one-line notice of the runner's raise by half: old and new value, the progress that earned it, and Jo's words. */
+export function ceilingRaisedNoticeBody(wl: string, old: Ceiling, next: Ceiling, progress: string): string {
+	return `ceiling raised once by half on ${wl}: $${old.usd}→$${next.usd}, ${old.wallMin}→${next.wallMin} min; progress: ${progress}. Next hit asks; \`ceiling <usd> [<hours>] ${wl}\` sets another figure, \`halt ${wl}\` stops it.`;
+}
+
+/** The two answers to the runner's ceiling question: `extend` (one block of the workload's own size and a relaunch) and `stop`. */
+export const CEILING_QUESTION_OPTIONS = ["extend", "stop"] as const;
+
+/**
+ * The runner's question at a 100 % hit it did not raise (D12): `first` (`ceiling reached on <wl>: <why>` or `ceiling
+ * auto-raise failed: <error>`), then the stop notice's first line (the spend and the ceiling, which `parseCeilingQuestion`
+ * reads back), the progress found when there is any, and what each answer does.
+ */
+export function ceilingQuestionBody(first: string, wl: string, s: Spend, c: Ceiling, stakes: Stakes, progress: string | null): string {
+	return [
+		first.replace(/\s+/g, " ").trim(),
+		ceilingNoticeBody(100, wl, s, c, stakes).split("\n")[0]!,
+		...(progress === null ? [] : [`progress: ${progress}`]),
+		`The lane is stopped. \`extend\`: one more block of ${wl}'s own size and a relaunch; \`stop\`: the stop stands and nothing relaunches.`,
+	].join("\n");
+}
+
+const CEILING_QUESTION_FIRST = /^(?:ceiling reached on \S+: |ceiling auto-raise failed: )/;
+const CEILING_STOP_LINE = /^ceiling 100 % at (usd \S+ wall \S+) on (\S+):/m;
+
+/** A runner ceiling question's body read back: the ceiling value (`ceilingKey`) and workload of its stop line; null for any other body. */
+export function parseCeilingQuestion(body: string): { key: string; workloadId: string } | null {
+	if (!CEILING_QUESTION_FIRST.test(body)) return null;
+	const m = CEILING_STOP_LINE.exec(body);
+	return m ? { key: m[1]!, workloadId: m[2]! } : null;
+}
+
+/** A branch head as a ceiling mark records it: a sha, `none` (no such branch) or `unknown` (the read failed). */
+export interface CeilingMark {
+	remote: string;
+	branch: string;
+	/** The remote's push URL when the mark was taken, or `unknown`. */
+	url: string;
+	head: string;
+}
+
+/** `ceiling-mark: <remote> <branch> <push url> <sha|none|unknown>`: the runner's record of one workload branch's remote head (D12). */
+export function ceilingMarkBody(m: CeilingMark): string {
+	return `ceiling-mark: ${m.remote} ${m.branch} ${m.url} ${m.head}`;
+}
+
+/** A `ceiling-mark:` entry's `rest`, parsed; null unless it is exactly four tokens. */
+export function parseCeilingMark(rest: string): CeilingMark | null {
+	const t = rest.trim().split(/\s+/);
+	return t.length === 4 ? { remote: t[0]!, branch: t[1]!, url: t[2]!, head: t[3]! } : null;
+}
+
 // ---- paired: a by-hand lane (PLAN wl-mvfkv7llkp7nk0 § 4.1, Jo's ruling in-mvfo7nphl9xn28) --------------------------
 
 /** A by-hand lane: its `launch:` entry says `cause interactive` (`as2 lane <wl>`, surface/scripts/lane.ts cmdInteractive). */
@@ -309,10 +401,10 @@ export function isPaired(w: { holder: string | null; holder_lease_until: string 
 	return w.holder !== null && heldLive(w, now) && isByHandLane(control, w.holder);
 }
 
-/** The original ceiling (§ 4.1): the workload's first valid `ceiling:` entry; with none, the effective ceiling (the stakes size). */
+/** The original ceiling (§ 4.1): the workload's first valid `ceiling:` entry not written by the runner's auto-raise (D12); with none, the effective ceiling (the stakes size). */
 export function originalCeiling(control: readonly ControlEntry[], instructions: readonly InstructionRow[], stakes: Stakes): Ceiling {
 	for (const c of control) {
-		if (c.prefix !== "ceiling") continue;
+		if (c.prefix !== "ceiling" || c.createdBy === LANE_RUNNER_BY) continue;
 		const p = parseCeiling(c.rest);
 		if (p !== null) return { usd: p.usd, wallMin: p.wallMin };
 	}

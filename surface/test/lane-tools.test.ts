@@ -318,7 +318,7 @@ describe("lane_raise_question through Jo's standing rulings (PLAN wl-mvfkv7llkp7
 		expect(applied(ledger, wl)).toEqual([[`ruling-applied: flow-repair kind open-workload slice ${sl} answer later`, "lane-t-1"]]);
 	});
 
-	test("merges: a normal-stakes lane's merge question is decided; a production lane's is raised", async () => {
+	test("merges: a lane's merge question is decided at normal and at production stakes (D11, in-mvqyt4a8gezvgg)", async () => {
 		const normal = laneFixture();
 		const sl = normal.ledger.addSlice({ by: "lane-t-1", workloadId: normal.wl, task: "t", doneCondition: "d", inputs: "i" });
 		expect(await normal.call("lane_raise_question", { slice: sl, body: "PR #4 is green; merge it?", options: ["merge", "wait"] })).toContain("decided by Jo's ruling merges");
@@ -327,8 +327,8 @@ describe("lane_raise_question through Jo's standing rulings (PLAN wl-mvfkv7llkp7
 		const prod = laneFixture();
 		prod.ledger.setStakes(prod.wl, { by: SURFACE_BY, stakes: "production" });
 		const sp = prod.ledger.addSlice({ by: "lane-t-1", workloadId: prod.wl, task: "t", doneCondition: "d", inputs: "i" });
-		expect(await prod.call("lane_raise_question", { slice: sp, body: "PR #4 is green; merge it?", options: ["merge", "wait"] })).toContain("Raised question");
-		expect(applied(prod.ledger, prod.wl)).toEqual([]);
+		expect(await prod.call("lane_raise_question", { slice: sp, body: "PR #4 is green; merge it?", options: ["merge", "wait"] })).toContain("decided by Jo's ruling merges");
+		expect(prod.ledger.questions(prod.wl)).toEqual([]);
 	});
 
 	test("kimi-out: a same-lab question is decided in the window when the builders are known and exclude Kimi; with a Kimi builder it is raised", async () => {

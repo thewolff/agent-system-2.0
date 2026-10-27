@@ -175,12 +175,15 @@ describe("control writers (Codex review 2, R4)", () => {
 		expect(control([entry(LANE_RUNNER_BY, body)]).map((c) => [c.prefix, c.laneId, c.createdBy])).toEqual([["launch-failed", lane, LANE_RUNNER_BY]]);
 		expect(control([entry(lane, body)], lane)).toEqual([]);
 	});
-	test("ceiling: is the surface's alone and spend: the runner's alone; the lane tools' refusal sees both as reserved", () => {
+	test("ceiling: is the surface's and the runner's (D12's auto-raise), ceiling-mark: and spend: the runner's alone; the lane tools' refusal sees all three as reserved", () => {
 		const ceiling = "ceiling: usd 50 wall 360 source stakes normal";
 		const spend = "spend: lane-m-1 usd 1 tokens 10 wall 2";
-		expect(control([entry(SURFACE_BY, ceiling), entry(LANE_RUNNER_BY, spend)]).map((c) => [c.prefix, c.laneId])).toEqual([["ceiling", null], ["spend", "lane-m-1"]]);
-		expect(control([entry(LANE_RUNNER_BY, ceiling), entry("lane-m-1", ceiling), entry(SURFACE_BY, spend), entry("lane-m-1", spend)], "lane-m-1")).toEqual([]);
-		expect([reservedPrefix(ceiling), reservedPrefix(spend)]).toEqual(["ceiling", "spend"]);
+		const mark = `ceiling-mark: origin wl/wl-m file:///r.git ${"a".repeat(40)}`;
+		expect(control([entry(SURFACE_BY, ceiling), entry(LANE_RUNNER_BY, ceiling), entry(LANE_RUNNER_BY, spend), entry(LANE_RUNNER_BY, mark)]).map((c) => [c.prefix, c.laneId, c.createdBy])).toEqual([
+			["ceiling", null, SURFACE_BY], ["ceiling", null, LANE_RUNNER_BY], ["spend", "lane-m-1", LANE_RUNNER_BY], ["ceiling-mark", null, LANE_RUNNER_BY],
+		]);
+		expect(control([entry("lane-m-1", ceiling), entry(SURFACE_BY, spend), entry("lane-m-1", spend), entry(SURFACE_BY, mark), entry("lane-m-1", mark)], "lane-m-1")).toEqual([]);
+		expect([reservedPrefix(ceiling), reservedPrefix(spend), reservedPrefix(mark)]).toEqual(["ceiling", "spend", "ceiling-mark"]);
 	});
 	test("released-open: (MIGRATION.md item 40) is honoured only from a holder writing about itself; the lane tools' refusal sees it as reserved", () => {
 		const lane = "lane-m-1";

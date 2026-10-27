@@ -83,7 +83,7 @@ export const LANE_SCRIPT = join(import.meta.dir, "..", "scripts", "lane.ts");
 
 export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
-	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
+	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "ceiling-mark", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
 	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr", "waive-pr", "train",
 	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-notice", "train-autoboard",
@@ -113,8 +113,12 @@ export const DAILY_REPORT_BY = "daily-report";
  * `launch-failed:` comes from the starter (a failure before the spawn) and from the runner (a lane
  * that never became ready, or a readiness step that failed; Codex review 2, R4). A lane never writes it.
  * `repo:` is the open tool's record of the repository (decision-log.ts); a lane's note never routes git.
- * `ceiling:` is the surface's alone (open, Jo's words, the lowering tool) and `spend:` the runner's
- * alone (DESIGN-workload-ceiling.md § 2 item 1); the raise-needs-Jo rule lives in `effectiveCeiling`.
+ * `ceiling:` is the surface's (open, Jo's words, the lowering tool) and the runner's (PLAN wl-mvqwn80onq9hq8 D12: its one raise
+ * by half at a 100 % hit with progress, applied only in that exact shape by `ceilingInForce`), and `spend:` the runner's
+ * alone (DESIGN-workload-ceiling.md § 2 item 1); the raise-needs-Jo rule lives in `effectiveCeiling`. `ceiling-mark: <remote>
+ * <branch> <push url> <sha|none|unknown>` is the runner's alone (D12): a workload branch's remote head when a ceiling window
+ * opens, which the progress test at the hit reads. `launch-requested:` is the surface's (Jo's), the merge train's and the
+ * runner's (`by lane-runner … (ceiling auto-raise)`, written with that raise).
  * `plan:` is the surface's (`first <trigger>` at open, `approved <instruction>` on Jo's approve, `halted <instruction>` on
  * Jo's `halt`), except `approved auto <round group>`, which only ESCALATION_BY writes (the plan auto-start in
  * `lane_raise_question`, PLAN wl-mvfkv7llkp7nk0 § 3) and the surface never does.
@@ -200,7 +204,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"launch-failed": [LANE_STARTER_BY, LANE_RUNNER_BY],
 	worktree: [LANE_STARTER_BY],
 	branch: [LANE_STARTER_BY],
-	"launch-requested": [SURFACE_BY, MERGE_TRAIN_BY],
+	"launch-requested": [SURFACE_BY, MERGE_TRAIN_BY, LANE_RUNNER_BY],
 	plan: [SURFACE_BY, ESCALATION_BY],
 	done: [SURFACE_BY, MERGE_TRAIN_BY],
 	repo: [SURFACE_BY, MERGE_TRAIN_BY],
@@ -211,7 +215,8 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"lane-stop": [SURFACE_BY, LANE_STARTER_BY, LANE_RUNNER_BY],
 	"lane-decided": [LANE_RUNNER_BY],
 	"done-because": [],
-	ceiling: [SURFACE_BY],
+	ceiling: [SURFACE_BY, LANE_RUNNER_BY],
+	"ceiling-mark": [LANE_RUNNER_BY],
 	spend: [LANE_RUNNER_BY],
 	"artifact-tree": [],
 	"reserved-withdrawn": [],

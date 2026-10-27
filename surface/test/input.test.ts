@@ -8,10 +8,11 @@ import { describe, expect, test } from "bun:test";
 import { appendFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { handSpawnBody, reviewParkBody } from "../../classifier/src/lab";
-import { askJo, checkRulings } from "../../gates/src/rulings";
+import { askJo, checkRulings, raisedId } from "../../gates/src/rulings";
 import { ALARM_FILE_NAME, routineOn, routineState } from "../../gates/src/routine-switch";
 import { reviewStopOn } from "../../classifier/src/review-stop";
 import { countRounds, effectiveRoundLimit, type Findings, reviewLimitBody, reviewRoundBody, ROUND_LIMIT_OPTIONS } from "../../classifier/src/rounds";
+import { ceilingQuestionBody, effectiveCeiling } from "../src/ceiling";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { LEDGER_DB_ENV } from "../../ledger/src/locality";
 import { errorLines } from "../src/errors";
@@ -1259,6 +1260,53 @@ describe("ask-all / auto-routine: Jo's one-word auto-apply switch (PLAN wl-mvqwn
 			expect(routineOn(ledger, Date.parse(c.now()), { alarmFile })).toBe(true);
 			expect(interpret(ledger, "ask-all")).toEqual({ kind: "routine-switch", word: "ask-all" });
 		});
+	});
+});
+
+describe("the runner's ceiling question (PLAN wl-mvqwn80onq9hq8 D12, R31)", () => {
+	const LANE = "lane-c-1";
+	/** An autonomous normal workload at $50 / 6h whose lane stopped at the ceiling and whose runner asked Jo; `other` is a lane's question on the same slice. */
+	function asked() {
+		const c = clock("2026-10-27T10:00:00.000Z");
+		const { ledger } = tempLedger(c.now);
+		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "Move the header offset", stakes: "normal", mode: "autonomous" });
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: "ceiling: usd 50 wall 360 source stakes normal" });
+		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: `launch: ${LANE} cause first requested-by test` });
+		expect(ledger.claimWorkload(wl, { by: LANE_STARTER_BY, holder: LANE, leaseMs: 3_600_000 }).won).toBe(true);
+		const sl = ledger.addSlice({ by: LANE, workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: `spend: ${LANE} usd 50.2 wall 30 tokens 10` });
+		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: `lane-stop: ${LANE} accepted ceiling` });
+		const body = ceilingQuestionBody(`ceiling reached on ${wl}: no progress since 2026-10-27T09:00:00.000Z`, wl, { usd: 50.2, wallMin: 30, tokens: 10 }, { usd: 50, wallMin: 360 }, "normal", null);
+		const q = raisedId(askJo(ledger, { by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body, options: ["extend", "stop"] }, { asker: "lane", now: Date.parse(c.now()) }), "the test's ceiling question");
+		const ceiling = () => effectiveCeiling(controlEntries(ledger.entries(wl)), ledger.instructions(wl), "normal");
+		return { c, ledger, wl, sl, q, body, ceiling };
+	}
+
+	test("R31 Jo's `ceiling <usd> <wl>` withdraws the open runner ceiling question in the raise's write; a lane's question of the same shape stays", () => {
+		const a = asked();
+		const lanes = a.ledger.raiseQuestion({ by: LANE, workloadId: a.wl, sliceId: a.sl, body: a.body, options: ["extend", "stop"] });
+		const receipt = apply(a.ledger, interpret(a.ledger, `ceiling 80 8 ${a.wl}`)!);
+		expect(receipt).toContain(`withdrew the ceiling question ${a.q}`);
+		expect(a.ledger.question(a.q)!.state).toBe("withdrawn");
+		expect(a.ledger.question(lanes)!.state).toBe("open");
+		expect(a.ceiling()).toEqual({ usd: 80, wallMin: 480 });
+	});
+
+	test("R31 the answer `extend` raises one block of the workload's own size, naming the answer, withdraws nothing else and requests the relaunch; `stop` leaves the stop", () => {
+		const a = asked();
+		const receipt = apply(a.ledger, interpret(a.ledger, `extend ${a.q}`)!);
+		expect(a.ledger.question(a.q)!.state).toBe("answered");
+		expect(receipt).toContain(`ceiling on ${a.wl} extended by`);
+		expect(receipt).toContain("a relaunch is requested");
+		expect(a.ceiling()).toEqual({ usd: 100, wallMin: 720 });
+		const [answer] = a.ledger.instructions(a.wl).filter((i) => i.kind === "answer");
+		expect(controlEntries(a.ledger.entries(a.wl)).filter((x) => x.prefix === "ceiling").at(-1)!.body).toBe(`ceiling: usd 100 wall 720 source extend one block by ${answer!.id}`);
+
+		const b = asked();
+		apply(b.ledger, interpret(b.ledger, `stop ${b.q}`)!);
+		expect(b.ledger.question(b.q)!.state).toBe("answered");
+		expect(b.ceiling()).toEqual({ usd: 50, wallMin: 360 });
+		expect(controlEntries(b.ledger.entries(b.wl)).filter((x) => x.prefix === "launch-requested")).toEqual([]);
 	});
 });
 
