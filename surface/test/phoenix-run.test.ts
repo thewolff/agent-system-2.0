@@ -38,8 +38,19 @@ writeFileSync(
 );
 chmodSync(fakePython, 0o755);
 
-/** Runs the wrapper on two free ports until its log matches `until` or it exits; then stops it with TERM. */
-async function runWrapper(until: RegExp, extraEnv: Record<string, string> = {}, timeoutMs = 20_000) {
+/**
+ * Runs the wrapper on two free ports. `mode` names the test's subject:
+ * - `{ term }`: the subject is TERM (143). Reads the log until it matches `term` (or the wrapper exits), then sends TERM.
+ * - `self-exit`: the subject is the wrapper's own exit (fail-closed 78, over-cap 75). No signal is ever sent: a TERM
+ *   racing the wrapper's last log line and its `exit` would run its trap and turn the exit into 143. Past the
+ *   deadline the wrapper and its children get SIGKILL and the call throws `wrapper did not exit on its own`.
+ * Returns whether the helper signalled, so self-exit tests can assert it did not.
+ */
+async function runWrapper(
+	mode: { term: RegExp } | "self-exit",
+	extraEnv: Record<string, string> = {},
+	timeoutMs = 20_000,
+) {
 	const [port, grpc] = [0, 0].map(() => {
 		const s = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
 		const free = s.port;
@@ -57,46 +68,93 @@ async function runWrapper(until: RegExp, extraEnv: Record<string, string> = {}, 
 	const reader = proc.stdout.getReader();
 	const decoder = new TextDecoder();
 	const deadline = Date.now() + timeoutMs;
+	// A deadline against a real child process: fake timers cannot drive the wrapper's clock, so each wait races it.
+	const expired = () => Bun.sleep(Math.max(0, deadline - Date.now())).then(() => "deadline" as const);
+	let signalled = false;
+
+	if (mode === "self-exit") {
+		const drained = (async () => {
+			for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) log += decoder.decode(chunk.value);
+		})();
+		const exit = await Promise.race([proc.exited, expired()]);
+		if (exit === "deadline") {
+			// Its children (Phoenix, a sampler) are listed before the wrapper dies, so none outlives the test unnamed.
+			const listed = Bun.spawnSync(["/usr/bin/pgrep", "-P", String(proc.pid)]);
+			const children = listed.stdout.toString().split("\n").filter(Boolean).map(Number);
+			proc.kill("SIGKILL");
+			await proc.exited;
+			// A child that exited on its own meanwhile (a sampler) gives ESRCH; each outcome is named, none dropped.
+			const outcomes = children.map((pid) => {
+				try {
+					process.kill(pid, "SIGKILL");
+					return `${pid} SIGKILLed`;
+				} catch (e) {
+					return `${pid} not killed (${(e as NodeJS.ErrnoException).code ?? String(e)})`;
+				}
+			});
+			const childNote =
+				listed.exitCode === 0 || listed.exitCode === 1
+					? `its children: [${outcomes.join(", ")}]`
+					: `listing its children failed (pgrep -P ${proc.pid} exit ${listed.exitCode}: ${listed.stderr.toString().trim()}), so any child was left running`;
+			throw new Error(`wrapper did not exit on its own: ${RUN} still running ${timeoutMs} ms after start; sent SIGKILL; ${childNote}. Log so far:\n${log}`);
+		}
+		// The wrapper has exited; its stdout closes once Phoenix (SIGKILLed by the wrapper) is gone too.
+		if ((await Promise.race([drained, expired()])) === "deadline") {
+			throw new Error(`wrapper exited ${exit} but its stdout did not close within ${timeoutMs} ms of start (${RUN}): a child still holds it. Log so far:\n${log}`);
+		}
+		return { port, grpc, log, exit, signalled };
+	}
+
 	let next = reader.read();
-	while (!until.test(log) && Date.now() < deadline) {
+	while (!mode.term.test(log) && Date.now() < deadline) {
 		// A real-process wait: the wrapper's log is the only signal, so each read races the deadline, never a fixed sleep.
-		const chunk = await Promise.race([next, Bun.sleep(deadline - Date.now()).then(() => null)]);
+		const chunk = await Promise.race([next, expired().then(() => null)]);
 		if (chunk === null || chunk.done) break;
 		log += decoder.decode(chunk.value);
 		next = reader.read();
 	}
-	if (proc.exitCode === null) proc.kill("SIGTERM");
+	if (proc.exitCode === null) {
+		proc.kill("SIGTERM");
+		signalled = true;
+	}
 	for (let chunk = await next; !chunk.done; chunk = await reader.read()) log += decoder.decode(chunk.value);
-	return { port, grpc, log, exit: await proc.exited };
+	return { port, grpc, log, exit: await proc.exited, signalled };
 }
 
 test("both listeners on 127.0.0.1, side by side in lsof's list, count as bound; TERM stops it with 143", async () => {
-	const r = await runWrapper(/phoenix-run\[\d+\]: bound:/);
+	const r = await runWrapper({ term: /phoenix-run\[\d+\]: bound:/ });
 	expect(r.log).toMatch(new RegExp(`bound: (127\\.0\\.0\\.1:${r.port} 127\\.0\\.0\\.1:${r.grpc}|127\\.0\\.0\\.1:${r.grpc} 127\\.0\\.0\\.1:${r.port})\\n`));
 	expect(r.log).not.toContain("bind check:");
 	expect(r.log).not.toContain("memory cap:");
+	expect(r.signalled).toBe(true);
 	expect(r.exit).toBe(143);
 }, 30_000);
 
 test("a gRPC listener on every address is refused: Phoenix killed, exit 78", async () => {
-	const r = await runWrapper(/bind check: Phoenix killed; exit 78/, { FAKE_GRPC_HOST: "0.0.0.0" });
+	const r = await runWrapper("self-exit", { FAKE_GRPC_HOST: "0.0.0.0" });
+	expect(r.signalled).toBe(false);
 	expect(r.log).toMatch(new RegExp(`listens on \\*:${r.grpc}, not 127\\.0\\.0\\.1`));
 	expect(r.log).not.toContain("bound:");
 	expect(r.exit).toBe(78);
 }, 30_000);
 
 test("a footprint sample over the cap: Phoenix killed at once, exit 75; one at the cap is not over", async () => {
-	const at = await runWrapper(/phoenix-run\[\d+\]: bound:/, { PHOENIX_MEM_CAP_MB: "2", FAKE_FOOTPRINT: "2048" });
+	const at = await runWrapper({ term: /phoenix-run\[\d+\]: bound:/ }, { PHOENIX_MEM_CAP_MB: "2", FAKE_FOOTPRINT: "2048" });
 	expect(at.log).not.toContain("memory cap:");
+	expect(at.signalled).toBe(true);
 	expect(at.exit).toBe(143);
-	const over = await runWrapper(/memory cap: Phoenix killed; exit 75/, { PHOENIX_MEM_CAP_MB: "2", FAKE_FOOTPRINT: "2049" });
+	const over = await runWrapper("self-exit", { PHOENIX_MEM_CAP_MB: "2", FAKE_FOOTPRINT: "2049" });
+	expect(over.signalled).toBe(false);
 	expect(over.log).toMatch(/memory cap: footprint sample 2049 KiB > cap 2048 KiB \(2 MiB\); SIGKILL Phoenix pid \d+\n/);
+	expect(over.log).toContain("memory cap: Phoenix killed; exit 75\n");
 	expect(over.exit).toBe(75);
 }, 30_000);
 
 test("a footprint the sampler cannot give fails closed: Phoenix killed, exit 78", async () => {
-	const r = await runWrapper(/memory cap: Phoenix killed; exit 78/, { FAKE_FOOTPRINT: "proc_pid_rusage(1) failed: errno 1 (Operation not permitted)" });
+	const r = await runWrapper("self-exit", { FAKE_FOOTPRINT: "proc_pid_rusage(1) failed: errno 1 (Operation not permitted)" });
+	expect(r.signalled).toBe(false);
 	expect(r.log).toMatch(/memory cap: cannot sample Phoenix pid \d+'s footprint \(sampler said: proc_pid_rusage\(1\) failed: errno 1 \(Operation not permitted\)\); the cap cannot be enforced; SIGKILL\n/);
+	expect(r.log).toContain("memory cap: Phoenix killed; exit 78\n");
 	expect(r.exit).toBe(78);
 }, 30_000);
 
