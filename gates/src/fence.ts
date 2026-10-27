@@ -72,7 +72,7 @@ import { type CleanShellCheck, type CleanShellRead, cleanShellOn, CLEAN_SHELL_KE
 import { copiedWrapper, expandShell, gitCall, nestedSandboxExec } from "./exec";
 import { HostError, type HostModules, hostSettings, readSetting, unknownSetting } from "./host";
 import { ownScratchRoot } from "./scratch";
-import { type BranchEntry, type ContextMessage, type Ctx, type GatesAPI, gateSession, isConfined, releaseConfined } from "./session";
+import { type BranchEntry, type CallMark, type ContextMessage, type Ctx, type GatesAPI, callMark, gateSession, releaseConfined } from "./session";
 import type { ShellStart } from "./shell-start";
 import { WORKLOAD_ENV } from "./types";
 
@@ -243,17 +243,48 @@ function sbplString(path: string): string {
 }
 
 /**
- * The Seatbelt profile: allow everything, deny file writes to each target. With `confinedRoot` (a
- * call a scratch-root rule let through, PLAN wl-mv5oikd5jtquww § 1.3): every write is denied but those
- * inside the root and to /dev/null, /dev/tty and /dev/fd/*, and outbound network is denied; the
- * targets' denies come after, so they still hold inside the root (Seatbelt: the last matching rule wins).
+ * How a marked call (session.ts CallMark) is fenced beyond the targets' denies, with its paths resolved:
+ * - `confined` (a scratch-root rule, PLAN wl-mv5oikd5jtquww § 1.3; or the auto-apply gate's rule `scratch`, PLAN
+ *   wl-mvqwn80onq9hq8 D2b): writes only inside the root, no outbound network;
+ * - `worktree` (rule `worktree`, D2b): writes only to `allow` (the worktree, its per-worktree gitdir and, for a reset on the
+ *   own branch, that branch's ref, lock and reflog), then `deny` (the worktree's `.git` file, the gitdir's `commondir`,
+ *   `gitdir` and `config.worktree`) over them, no outbound network;
+ * - `read-only` (rule `read-only`, D4): no file writes; no outbound network unless `network`, and then no program starts
+ *   but those `execAllow` names (D2a (iv)).
  */
-export function fenceProfile(targets: FenceTarget[], confinedRoot?: string): string {
-	const confined =
-		confinedRoot === undefined
-			? ""
-			: `(deny file-write*)(allow file-write* (subpath ${sbplString(confinedRoot)}) (literal "/dev/null") (literal "/dev/tty") (regex #"^/dev/fd/"))(deny network-outbound (remote ip))`;
-	return `(version 1)(allow default)${confined}${targets.map((t) => `(deny file-write* (${t.kind} ${sbplString(t.path)}))`).join("")}`;
+export type FenceMode =
+	| { kind: "confined"; root: string }
+	| { kind: "worktree"; allow: FenceTarget[]; deny: FenceTarget[] }
+	| { kind: "read-only"; network: boolean; execAllow: string[] };
+
+/** The writes every narrowed profile keeps: the null device, the terminal and the fd paths. */
+const DEV_WRITES = `(literal "/dev/null") (literal "/dev/tty") (regex #"^/dev/fd/")`;
+const NO_NETWORK = "(deny network-outbound (remote ip))";
+const sbplFilter = (t: FenceTarget): string => `(${t.kind} ${sbplString(t.path)})`;
+
+/**
+ * The Seatbelt profile: allow everything, deny file writes to each target. With a mode (a string is a `confined` root,
+ * the scratch-root rules' form) every write is first denied but those the mode allows (FenceMode), and the targets'
+ * denies come after, so they still hold inside an allowed root (Seatbelt: the last matching rule wins). The network
+ * read-only mode denies every program start, then allows each `execAllow` path literally, the form Apple's own profiles
+ * use (/System/Library/Sandbox/Profiles/com.apple.accessoryupdaterd.sb, `process-exec*` with `literal` filters).
+ */
+export function fenceProfile(targets: FenceTarget[], mode?: string | FenceMode): string {
+	const m: FenceMode | undefined = typeof mode === "string" ? { kind: "confined", root: mode } : mode;
+	let narrow = "";
+	if (m?.kind === "confined") narrow = `(deny file-write*)(allow file-write* (subpath ${sbplString(m.root)}) ${DEV_WRITES})${NO_NETWORK}`;
+	else if (m?.kind === "worktree") {
+		if (m.allow.length === 0 || m.deny.length === 0) throw new FenceError("the worktree profile was built with no allowed or no denied path");
+		narrow = `(deny file-write*)(allow file-write* ${m.allow.map(sbplFilter).join(" ")} ${DEV_WRITES})(deny file-write* ${m.deny.map(sbplFilter).join(" ")})${NO_NETWORK}`;
+	} else if (m?.kind === "read-only") {
+		narrow = `(deny file-write*)(allow file-write* ${DEV_WRITES})`;
+		if (!m.network) narrow += NO_NETWORK;
+		else {
+			if (!m.execAllow.includes("/bin/bash")) throw new FenceError("the network read-only profile's exec allow-list lacks /bin/bash, the shell the wrapper starts");
+			narrow += `(deny process-exec*)(allow process-exec* ${m.execAllow.map((p) => `(literal ${sbplString(p)})`).join(" ")})`;
+		}
+	}
+	return `(version 1)(allow default)${narrow}${targets.map((t) => `(deny file-write* ${sbplFilter(t)})`).join("")}`;
 }
 
 /** The confined profile's root: the own scratch root, canonical; FenceError when it is gone. */
@@ -261,6 +292,135 @@ function confinedRootOf(env: Record<string, string | undefined>): string {
 	const root = ownScratchRoot(env);
 	if (root === null) throw new FenceError("this call was let through by a scratch-root rule, and the own scratch root ($HOME/agent-scratch/agent-system-2.0/scratch/<workload id>) cannot be found to confine it to");
 	return canonical(root, "the own scratch root");
+}
+
+/**
+ * The environment the wrapper sets for a read-only call granted the network (D4, D5): git never fetches a missing object
+ * lazily from a promisor remote (`GIT_NO_LAZY_FETCH`, git(1) "tells Git not to lazily fetch missing objects"), never
+ * prompts, and gh logs every HTTP request it sends to stderr (`GH_DEBUG=api`: `> <METHOD> <path> HTTP/1.1`), which the
+ * gate's detector reads at the result. Set as assignments in front of the wrapper: OMP's bash tool takes no `env`.
+ */
+export const NETWORK_ENV_PREFIX = "GH_DEBUG=api GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 ";
+
+/** A recorded wrapper without NETWORK_ENV_PREFIX in front, so the history unwrap (copiedWrapper) reads it like any other. */
+const withoutNetworkEnv = (command: string): string => (command.startsWith(NETWORK_ENV_PREFIX) ? command.slice(NETWORK_ENV_PREFIX.length) : command);
+
+/** git's macOS shim chain: `/usr/bin/git` is an xcrun shim that runs the developer directory's own git. */
+const XCODE_SELECT_LINK = "/var/db/xcode_select_link";
+const COMMAND_LINE_TOOLS = "/Library/Developer/CommandLineTools";
+
+/**
+ * The programs a read-only call granted the network may start (D2a (iv), D4): `/bin/bash` (the wrapper's shell), gh, git's
+ * real exec chain (gh runs git to read the repository; on macOS `/usr/bin/git` is the xcrun shim, which runs
+ * `<developer dir>/usr/bin/git`: the dir is `DEVELOPER_DIR`, else xcode-select's link, and the Command Line Tools path is
+ * always listed), and each plain reader the call names. Each is resolved in-process from the call's `PATH` (no spawn),
+ * by the path found and its canonical path. A name not on PATH (a shell builtin such as `echo` or `test`) adds nothing:
+ * a start of it would be denied, and the denial trips (D5 (b)).
+ */
+export function execAllowList(readers: readonly string[], env: Record<string, string | undefined>): string[] {
+	const out = new Set<string>(["/bin/bash"]);
+	for (const name of ["gh", "git", ...readers]) {
+		const found = Bun.which(name, { PATH: env.PATH ?? "" });
+		if (found === null) continue;
+		out.add(found);
+		out.add(canonical(found, `the ${name} program`));
+	}
+	if (out.has("/usr/bin/git")) {
+		out.add("/usr/bin/xcrun");
+		const devs = [COMMAND_LINE_TOOLS];
+		if (env.DEVELOPER_DIR) devs.push(env.DEVELOPER_DIR);
+		if (existsSync(XCODE_SELECT_LINK)) devs.push(canonical(XCODE_SELECT_LINK, "xcode-select's developer directory link"));
+		for (const dev of devs) {
+			const git = join(dev, "usr", "bin", "git");
+			if (existsSync(git)) out.add(canonical(git, "the developer directory's git"));
+		}
+	}
+	return [...out];
+}
+
+/** What `worktreeFence` validated: the worktree, its per-worktree gitdir, the common dir, its checked-out branch, and the writes. */
+export interface WorktreeFence {
+	root: string;
+	gitDir: string;
+	commonDir: string;
+	/** The branch HEAD is attached to, or null when detached. */
+	branch: string | null;
+	allow: FenceTarget[];
+	deny: FenceTarget[];
+}
+
+/** A small control file's text, or a FenceError naming it. */
+function controlFile(path: string, what: string): string {
+	try {
+		return readFileSync(path, "utf8");
+	} catch (err) {
+		throw new FenceError(`${what} (${path}) cannot be read: ${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
+/**
+ * The worktree fence of PLAN wl-mvqwn80onq9hq8 D2b, validated before the call; FenceError names the check that failed.
+ * `worktree` must be a linked worktree: its `.git` is a regular file naming a gitdir that sits at
+ * `<commondir>/worktrees/<name>` (by the gitdir's own `commondir` file) and whose `gitdir` file names the worktree's `.git`
+ * back. The profile allows writes to the worktree and that gitdir, and denies over them the worktree's `.git` file and
+ * the gitdir's `commondir`, `gitdir` and `config.worktree`. With `reset` (the call runs `git reset --merge|--keep`), HEAD
+ * must be attached to `wl/<workloadId>`, and that branch's ref, its `.lock` and its reflog in the common dir are allowed
+ * too; nothing else in the common dir is.
+ */
+export function worktreeFence(worktree: string, workloadId: string | null, reset: boolean): WorktreeFence {
+	const root = canonical(worktree, "the own worktree");
+	const dotGit = join(root, ".git");
+	let st;
+	try {
+		st = lstatSync(dotGit);
+	} catch (err) {
+		throw new FenceError(`the own worktree ${root} has no .git entry (${err instanceof Error ? err.message : String(err)})`);
+	}
+	if (!st.isFile()) throw new FenceError(`${dotGit} is not a regular file, so ${root} is not a linked worktree`);
+	const named = /^gitdir: *(.+?)\s*$/m.exec(controlFile(dotGit, "the worktree's .git file"));
+	if (!named) throw new FenceError(`${dotGit} has no \`gitdir:\` line`);
+	const gitDir = canonical(resolve(root, named[1]!), `the gitdir ${dotGit} names`);
+	const commonDir = canonical(resolve(gitDir, controlFile(join(gitDir, "commondir"), "the gitdir's commondir file").trim()), `the common dir ${gitDir}/commondir names`);
+	if (dirname(gitDir) !== join(commonDir, "worktrees")) throw new FenceError(`the gitdir ${gitDir} is not under ${join(commonDir, "worktrees")}`);
+	const back = canonical(resolve(gitDir, controlFile(join(gitDir, "gitdir"), "the gitdir's gitdir file").trim()), `the worktree ${gitDir}/gitdir names`);
+	if (back !== dotGit) throw new FenceError(`${gitDir}/gitdir names ${back}, not this worktree's ${dotGit}`);
+	const head = /^ref: *refs\/heads\/(\S+)\s*$/.exec(controlFile(join(gitDir, "HEAD"), "the worktree's HEAD"));
+	const branch = head ? head[1]! : null;
+	const allow: FenceTarget[] = [
+		{ kind: "subpath", path: root },
+		{ kind: "subpath", path: gitDir },
+	];
+	if (reset) {
+		const own = workloadId ? `wl/${workloadId}` : null;
+		if (own === null || branch !== own) throw new FenceError(`git reset --merge/--keep in the worktree on ${branch ? `branch ${branch}` : "a detached HEAD"}, not the workload's own ${own ?? "branch"}`);
+		// Joined onto the canonical common dir, so a ref that is still packed or a reflog not yet written is named too.
+		const ref = join(commonDir, "refs", "heads", branch);
+		allow.push({ kind: "literal", path: ref }, { kind: "literal", path: `${ref}.lock` }, { kind: "literal", path: join(commonDir, "logs", "refs", "heads", branch) });
+	}
+	const deny: FenceTarget[] = [dotGit, join(gitDir, "commondir"), join(gitDir, "gitdir"), join(gitDir, "config.worktree")].map((path) => ({ kind: "literal", path }));
+	return { root, gitDir, commonDir, branch, allow, deny };
+}
+
+/** Whether `command` run from `cwd` runs `git reset --merge` or `--keep` anywhere the expander sees (the worktree fence's ref allowance). */
+export function resetsBranch(command: string, cwd: string, env: Record<string, string | undefined>): boolean {
+	return expandShell(command, cwd, env).commands.some((e) => {
+		const g = gitCall(e);
+		return g?.sub === "reset" && g.args.some((a) => a.text === "--merge" || a.text === "--keep");
+	});
+}
+
+/** The FenceMode for a call carrying `mark`, its paths resolved now; FenceError when they cannot be. */
+function markMode(mark: CallMark, command: string, cwd: string, env: Record<string, string | undefined>): FenceMode {
+	switch (mark.kind) {
+		case "confined":
+			return { kind: "confined", root: mark.root === null ? confinedRootOf(env) : canonical(mark.root, "the root the call is confined to") };
+		case "worktree": {
+			const w = worktreeFence(mark.root, env[WORKLOAD_ENV] ?? null, resetsBranch(command, cwd, env));
+			return { kind: "worktree", allow: w.allow, deny: w.deny };
+		}
+		case "read-only":
+			return { kind: "read-only", network: mark.network, execAllow: mark.network ? execAllowList(mark.readers, env) : [] };
+	}
 }
 
 /** `s` as one POSIX single-quoted shell word. */
@@ -291,6 +451,28 @@ export const CLEAN_SHELL_NEEDS_FENCE = `the clean shell is on for this session (
 /** The refusal of a confined call the fence cannot confine (§ 1.3 fail closed): no way around it but another spelling. */
 export const CONFINED_UNFENCED_REASON =
 	"M4b OS fence: a scratch-root rule let this call through, and that rule holds only when the call runs confined to the own scratch root (writes only there, no network); the fence is off for this profile, so it is refused rather than run unconfined. Spell the targets outside the scratch rules, or turn the fence back on.";
+
+/** The refusal of a read-only-marked call the fence cannot fence (PLAN wl-mvqwn80onq9hq8 D4, fail closed, as CONFINED_UNFENCED_REASON). */
+export const READ_ONLY_UNFENCED_REASON =
+	"M4b OS fence: the auto-apply gate let this call through as read-only, and that rule holds only when the call runs under the read-only profile (no file writes, network only for gh); the fence is off for this profile, so it is refused rather than run unfenced. Turn the fence back on, or let Jo decide the reserved request.";
+
+const SETTINGS_READER = Symbol.for("agent-system-2.0/p11-gates/fence-settings-reader");
+
+/**
+ * Whether the fence is on for this session (PLAN wl-mvqwn80onq9hq8 D3 step 1): `gates.fence.enabled` through the same
+ * settings reader the fence registered with (registerFence keeps it process-wide, like the call marks), so the gate and
+ * the fence read one setting one way. Throws FenceError when no fence registered a reader (the row loaded without the
+ * fence) or the read fails: the caller then asks Jo, never auto-applies.
+ */
+export async function fenceEnabled(ctx: Ctx): Promise<boolean> {
+	const read = (globalThis as { [SETTINGS_READER]?: (ctx: Ctx) => Promise<FenceSettings> })[SETTINGS_READER];
+	if (!read) throw new FenceError("no fence is registered in this process (gates/index.ts registers it with the host's settings reader), so nothing would fence an auto-applied call");
+	try {
+		return (await read(ctx)).enabled;
+	} catch (err) {
+		throw new FenceError(`the fence's settings could not be read (${err instanceof Error ? err.message : String(err)})`);
+	}
+}
 
 /**
  * The fence's settings from the host (gates/src/host.ts): the effective `bash.autoBackground.enabled`
@@ -487,8 +669,8 @@ export function fenceRevisedCalls(branch: readonly BranchEntry[]): Set<string> {
 	return revised;
 }
 
-/** A background job label that starts as the fence's wrapper does (`'<…>/sandbox-exec' -p '(version 1)`). */
-const FENCE_LABEL = /^'(?:[^']*\/)?sandbox-exec' -p '\(version 1\)/;
+/** A background job label that starts as the fence's wrapper does (`'<…>/sandbox-exec' -p '(version 1)`, the network env in front or not; the prefix holds no regex metacharacter). */
+const FENCE_LABEL = new RegExp(`^(?:${NETWORK_ENV_PREFIX})?'(?:[^']*/)?sandbox-exec' -p '\\(version 1\\)`);
 
 /**
  * Where job `jobId`'s header is in a batch's `text`, or null when it cannot be located unambiguously:
@@ -526,7 +708,7 @@ function unwrapCalls(message: ContextMessage, content: unknown[], revised: Reado
 		if (!isBashCall(b)) continue;
 		const command = b.arguments.command;
 		// Only a command naming sandbox-exec can be in `revised` (fenceRevisedCalls), so no other is hashed.
-		const parts = revised.size > 0 && command.includes("sandbox-exec") && revised.has(occurrenceKey(message.timestamp, b.id, wrapperHash(command))) ? copiedWrapper(stripOuterBlanks(command)) : null;
+		const parts = revised.size > 0 && command.includes("sandbox-exec") && revised.has(occurrenceKey(message.timestamp, b.id, wrapperHash(command))) ? copiedWrapper(withoutNetworkEnv(stripOuterBlanks(command))) : null;
 		calls.set(b.id, parts?.command ?? null);
 		if (parts) (blocks ??= [...content])[j] = { ...b, arguments: { ...b.arguments, command: parts.command } };
 	}
@@ -632,6 +814,8 @@ export function registerFence(
 ): void {
 	const sandboxExec = sandboxExecPath(env);
 	const cleanShellOnHere = cleanShellSwitch(env, cleanShell);
+	// The auto-apply gate reads `gates.fence.enabled` through this same reader (fenceEnabled).
+	if (loadSettings) (globalThis as { [SETTINGS_READER]?: (ctx: Ctx) => Promise<FenceSettings> })[SETTINGS_READER] = loadSettings;
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "bash") return undefined;
@@ -647,9 +831,9 @@ export function registerFence(
 			return refuse(`the settings that switch it could not be read (${err instanceof Error ? err.message : String(err)})`);
 		}
 		const s = gateSession(ctx, env);
-		const confined = typeof event.toolCallId === "string" && isConfined(event.toolCallId);
+		const mark = typeof event.toolCallId === "string" ? callMark(event.toolCallId) : undefined;
 		if (!settings.enabled) {
-			if (confined) return { block: true, reason: CONFINED_UNFENCED_REASON };
+			if (mark) return { block: true, reason: mark.kind === "read-only" ? READ_ONLY_UNFENCED_REASON : CONFINED_UNFENCED_REASON };
 			if (!s.fenceOffRecorded) {
 				try {
 					if (s.bound) s.ledger().recordEntry({ workloadId: s.workloadId!, kind: "assumption", body: FENCE_OFF_BODY, by: s.laneId });
@@ -678,7 +862,7 @@ export function registerFence(
 			// review B1), and `sandbox-exec` as data is not refused. Row 6 refuses it by name already, and
 			// row 18 a leading one; this is the fence's own line.
 			if (nestedSandboxExec(command, cwd, env, event.input.env)) return { block: true, reason: ALREADY_WRAPPED_REASON };
-			profile = fenceProfile(fenceTargets(command, cwd, env, event.input.env), confined ? confinedRootOf(env) : undefined);
+			profile = fenceProfile(fenceTargets(command, cwd, env, event.input.env), mark ? markMode(mark, command, cwd, env) : undefined);
 		} catch (err) {
 			return refuse(err instanceof FenceError ? err.message : `the fenced paths could not be computed (${String(err)})`);
 		}
@@ -694,7 +878,7 @@ export function registerFence(
 			}
 			if (!start.certified) return { block: true, reason: shellStartReason(start.reasons) };
 		}
-		const wrapped = wrapCommand(sandboxExec, profile, command);
+		const wrapped = (mark?.kind === "read-only" && mark.network ? NETWORK_ENV_PREFIX : "") + wrapCommand(sandboxExec, profile, command);
 		s.bashOriginals.set(event.toolCallId, command);
 		state.expected.set(event.toolCallId, wrapped);
 		// An explicit cwd goes back as the absolute directory the targets were found from, so bash runs
