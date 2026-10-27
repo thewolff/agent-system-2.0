@@ -829,10 +829,7 @@ function withdraw(x: Closable, o: { entryBy?: string; author?: string } = {}): s
 
 describe("PLAN wl-mv8s939084z1ts D5: a withdrawn workload closes with no open PR and no unmerged commit, its entry naming the withdrawal", () => {
 	test("every PR merged and no commit outside main: closes without a receipt; the entry and the close receipt say withdrawn", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const s = merged(w, x);
+		const { w, x, sha: s } = merged();
 		withDone(x);
 		const ins = withdraw(x);
 
@@ -849,10 +846,7 @@ describe("PLAN wl-mv8s939084z1ts D5: a withdrawn workload closes with no open PR
 	});
 
 	test("an open PR from wl/<id> refuses, naming the withdrawal", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const s = merged(w, x, "OPEN");
+		const { w, x, sha: s } = merged("OPEN");
 		withDone(x);
 		const ins = withdraw(x);
 
@@ -861,10 +855,7 @@ describe("PLAN wl-mv8s939084z1ts D5: a withdrawn workload closes with no open PR
 	});
 
 	test("an unmerged commit on wl/<id> refuses", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { sha: s } = laneWithCode(w, x);
+		const { w, x, sha: s } = fixture("origin", { lane: true });
 		withDone(x);
 		const ins = withdraw(x);
 
@@ -872,10 +863,7 @@ describe("PLAN wl-mv8s939084z1ts D5: a withdrawn workload closes with no open PR
 	});
 
 	test("superseded and withdrawn both standing: superseded wins, the refusal and the receipt name the successor", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const s = merged(w, x, "OPEN");
+		const { w, x, sha: s } = merged("OPEN");
 		withDone(x);
 		withdraw(x);
 		const by = supersede(x);
@@ -885,10 +873,7 @@ describe("PLAN wl-mv8s939084z1ts D5: a withdrawn workload closes with no open PR
 
 	test("a withdrawn: entry a lane wrote, or one naming an instruction not Jo's, counts for nothing; G3 still asks for the receipt", async () => {
 		for (const o of [{ entryBy: "lane-a" }, { author: "orchestrator" }]) {
-			const w = world();
-			withOrigin(w);
-			const x = closable(w);
-			const s = merged(w, x);
+			const { w, x, sha: s } = merged();
 			withDone(x);
 			withdraw(x, o);
 
