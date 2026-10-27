@@ -265,6 +265,8 @@ export interface TestRun {
 	preflight: string | null;
 	/** The base comparison (D8), present only on a run whose failing parts were rerun on base. */
 	baseCompare?: BaseCompare;
+	/** The host load at the start and end of every part (E1, PLAN wl-mvqu69tjvpy96o), in part order; present on every run the runner made. */
+	load?: PartLoad[];
 }
 
 const nat = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
@@ -305,6 +307,24 @@ function baseCompareOf(v: unknown): BaseCompare | null {
 	}
 	return { sha: b.sha, parts };
 }
+/** A LoadReading from untrusted fields, or null. */
+function loadReadingOf(v: unknown): LoadReading | null {
+	if (v === null || typeof v !== "object") return null;
+	const r = v as Record<string, unknown>;
+	const avg = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0;
+	if (typeof r.at !== "string" || Number.isNaN(Date.parse(r.at)) || !avg(r.load1) || !avg(r.load5) || !avg(r.load15)) return null;
+	if (!nat(r.cores) || r.cores === 0) return null;
+	return { at: r.at, load1: r.load1, load5: r.load5, load15: r.load15, cores: r.cores };
+}
+/** A PartLoad from untrusted fields, or null. */
+function partLoadOf(v: unknown): PartLoad | null {
+	if (v === null || typeof v !== "object") return null;
+	const p = v as Record<string, unknown>;
+	const start = loadReadingOf(p.start);
+	const end = loadReadingOf(p.end);
+	if (typeof p.part !== "string" || p.part === "" || !strOrNull(p.file) || start === null || end === null || !strOrNull(p.snapshot)) return null;
+	return { part: p.part, file: p.file, start, end, snapshot: p.snapshot };
+}
 
 /** The canonical TestRun built from untrusted fields, or null: the one shape both the formatter and the parser accept. */
 function canonicalRun(head: { runId: unknown; verdict: unknown; sha: unknown; pr: unknown }, v: Record<string, unknown>): TestRun | null {
@@ -322,24 +342,33 @@ function canonicalRun(head: { runId: unknown; verdict: unknown; sha: unknown; pr
 	const baseCompare = v.baseCompare === undefined || v.baseCompare === null ? null : baseCompareOf(v.baseCompare);
 	if (v.baseCompare !== undefined && v.baseCompare !== null && baseCompare === null) return null;
 	if (head.verdict === "red-main" && baseCompare === null) return null;
+	// A record written before E1 (PLAN wl-mvqu69tjvpy96o) has no load; one that has it carries a valid reading per part.
+	let load: PartLoad[] | null = null;
+	if (v.load !== undefined) {
+		if (!Array.isArray(v.load)) return null;
+		const parts = v.load.map(partLoadOf);
+		if (parts.some((p) => p === null)) return null;
+		load = parts as PartLoad[];
+	}
 	return {
 		runId: head.runId, verdict: head.verdict as TestVerdict, sha: head.sha, pr: head.pr, reason: v.reason, headAtEnd: v.headAtEnd,
 		base: v.base, mergeBase: v.mergeBase, full, solo: solo as SoloCounts[], failures: failures as Failure[], runDir: v.runDir, preflight: v.preflight,
-		...(baseCompare === null ? {} : { baseCompare }),
+		...(baseCompare === null ? {} : { baseCompare }), ...(load === null ? {} : { load }),
 	};
 }
 
 /**
  * `test-run: <run id> <verdict> sha=<sha> pr=<N> {json}` (§ 2.3 step 6). The json repeats sha and pr
  * and carries reason, headAtEnd, base, mergeBase, full, solo, failures (every one), runDir and
- * preflight, plus baseCompare when the run has one (D8), on one line. The same object goes to `result.json`.
+ * preflight, plus baseCompare when the run has one (D8) and load when the runner recorded it (E1), on one line.
+ * The same object goes to `result.json`.
  */
 export function testRunBody(run: TestRun): string {
 	const c = canonicalRun(run, run as unknown as Record<string, unknown>);
 	need(c !== null, `test-run ${run.runId} does not have the shape its body carries`);
 	const json = JSON.stringify({
 		sha: c!.sha, pr: c!.pr, reason: c!.reason, headAtEnd: c!.headAtEnd, base: c!.base, mergeBase: c!.mergeBase, full: c!.full, solo: c!.solo,
-		failures: c!.failures, runDir: c!.runDir, preflight: c!.preflight, ...(c!.baseCompare ? { baseCompare: c!.baseCompare } : {}),
+		failures: c!.failures, runDir: c!.runDir, preflight: c!.preflight, ...(c!.baseCompare ? { baseCompare: c!.baseCompare } : {}), ...(c!.load ? { load: c!.load } : {}),
 	});
 	return `${TEST_RUN_PREFIX} ${c!.runId} ${c!.verdict} sha=${c!.sha} pr=${c!.pr} ${json}`;
 }
@@ -1069,21 +1098,23 @@ export interface PartInput {
 	importError?: string | null;
 	/** The report cap in bytes (reportCapBytes). */
 	maxBytes?: number;
+	/** The wrapper's cleanup report on its stderr (`cleanupReportOf`, PLAN wl-mvqu69tjvpy96o C9): survivors or a failed lookup; null when none. */
+	cleanup?: string | null;
 }
 export interface PartResult extends PartCounts {
 	failures: { name: string; firstError: string }[];
 }
 
 /**
- * One part's result (§ 2.3 step 6). A timeout, a refused import, a missing or unparsable junit, or a non-zero exit with no failing
- * test makes the part `error`. A timeout comes first (PLAN wl-mvq4edh02r5z40 D0): its error is `timeout`, or `timeout; <the import
- * refusal or the report's error>`. A junit that was imported and parses keeps its counts and failing tests whatever else went wrong
- * (the log refused, a timeout); each failing test keeps its name and the first error line (the report's own message, else the
- * log's line, else the failure type).
+ * One part's result (§ 2.3 step 6). A timeout, survivors the wrapper's cleanup left, a refused import, a missing or unparsable junit,
+ * or a non-zero exit with no failing test makes the part `error`. A timeout comes first (PLAN wl-mvq4edh02r5z40 D0): its error is
+ * `timeout`, or `timeout; <cleanup left N alive: <pids>; the import refusal or the report's error>`. A junit that was imported and
+ * parses keeps its counts and failing tests whatever else went wrong (the log refused, a timeout); each failing test keeps its name
+ * and the first error line (the report's own message, else the log's line, else the failure type).
  */
 export function partResult(p: PartInput): PartResult {
 	const base = { exit: p.exit, ms: Math.max(0, Math.round(p.ms)) };
-	const errors = [...(p.timedOut ? ["timeout"] : []), ...(p.importError ? [`report import refused: ${p.importError}`] : [])];
+	const errors = [...(p.timedOut ? ["timeout"] : []), ...(p.cleanup ? [p.cleanup] : []), ...(p.importError ? [`report import refused: ${p.importError}`] : [])];
 	const errored = (error: string, counts = { pass: 0, fail: 0, skip: 0 }, failures: PartResult["failures"] = []): PartResult => ({ ...counts, ...base, error, failures });
 	if (p.junit === null) return errored(errors.length > 0 ? errors.join("; ") : "junit report missing");
 	const report = parseJunit(p.junit, { maxBytes: p.maxBytes });
@@ -1104,6 +1135,82 @@ export function partResult(p: PartInput): PartResult {
 /** A wrapper call timed out (PLAN wl-mvq4edh02r5z40 D0): it exited 124, or the runner's outlive sweep fired on it, whatever its later exit. */
 export function callTimedOut(r: { code: number | null; outlived: boolean }): boolean {
 	return r.code === WRAPPER_EXIT.timeout || r.outlived;
+}
+
+// ---- the wrapper's cleanup report (PLAN wl-mvqu69tjvpy96o C9) ---------------------------------------------
+
+/**
+ * The cleanup report in a part's wrapper stderr, which surface/scripts/test-exec.ts adds to the timeout line on the cap path and
+ * writes alone off it (with its error exit): `cleanup left <N> alive[: <pids>]`, or `cleanup could not look up session <sid>: <why>`
+ * when ownership could not be established; null when the part's cleanup reported neither.
+ */
+export function cleanupReportOf(stderr: string): string | null {
+	return /cleanup (?:left \d+ alive(?::[^\n]*)?|could not look up session[^\n]*)/.exec(stderr)?.[0].trim() ?? null;
+}
+
+/**
+ * Why a sweep was not ok, from its stderr: the survivor line `sweep: <N> alive after KILL: <pids>`, else the first non-empty
+ * line (a failed process lookup, say); null when the sweep wrote no stderr.
+ */
+export function sweepFailureOf(stderr: string): string | null {
+	const survivors = /sweep: \d+ alive after KILL:[^\n]*/.exec(stderr)?.[0].trim();
+	return survivors ?? stderr.split("\n").map((l) => l.trim()).find((l) => l !== "") ?? null;
+}
+
+// ---- host load (E1, PLAN wl-mvqu69tjvpy96o) ---------------------------------------------------------------
+
+/** One host load reading: the load averages over 1, 5 and 15 minutes and the core count, at `at` (ISO). */
+export interface LoadReading {
+	at: string;
+	load1: number;
+	load5: number;
+	load15: number;
+	cores: number;
+}
+/** One part's host load: its report stem (`full`, `solo-<i>`, `base-solo-<i>`), its file (null for `full`), the readings at its start and end, and its process snapshot file in the run dir (null when none was written). */
+export interface PartLoad {
+	part: string;
+	file: string | null;
+	start: LoadReading;
+	end: LoadReading;
+	snapshot: string | null;
+}
+/** A reading is overloaded when its 1-minute load passes this many times the core count. */
+export const OVERLOAD_PER_CORE = 2;
+/** The rows an overloaded part's process snapshot (`<part>.load.log`) keeps, the busiest by CPU first. */
+export const LOAD_SNAPSHOT_ROWS = 25;
+
+export const loadOver = (r: LoadReading): boolean => r.load1 > OVERLOAD_PER_CORE * r.cores;
+
+/**
+ * The sentence a red or error run's reason carries when a part started or ended overloaded (announce-only: the verdict never moves):
+ * `host overloaded (1-minute load over 2 × cores): <part> <start> at start, <end> at end on <cores> cores[, processes in <file>]; …`,
+ * or null when no part was overloaded.
+ */
+export function overloadNote(load: readonly PartLoad[]): string | null {
+	const over = load.filter((p) => loadOver(p.start) || loadOver(p.end));
+	if (over.length === 0) return null;
+	const parts = over.map((p) => {
+		const label = p.file === null ? p.part : `${p.part} ${p.file}`;
+		const where = p.snapshot === null ? "no process snapshot" : `processes in ${p.snapshot}`;
+		return `${label} ${p.start.load1.toFixed(2)} at start, ${p.end.load1.toFixed(2)} at end on ${p.end.cores} cores, ${where}`;
+	});
+	return `host overloaded (1-minute load over ${OVERLOAD_PER_CORE} × cores): ${parts.join("; ")}`;
+}
+
+/**
+ * `ps -Ao pid,user,nice,pcpu,etime,comm`'s output cut to its header and the `rows` busiest processes by %CPU (the fourth column),
+ * highest first; a row whose %CPU does not parse sorts last.
+ */
+export function topByCpu(ps: string, rows: number = LOAD_SNAPSHOT_ROWS): string[] {
+	const lines = ps.split("\n").filter((l) => l.trim() !== "");
+	if (lines.length === 0) return [];
+	const cpu = (l: string): number => {
+		const n = Number(l.trim().split(/\s+/)[3]);
+		return Number.isFinite(n) ? n : -1;
+	};
+	const body = lines.slice(1).map((l) => ({ l, c: cpu(l) })).sort((a, b) => b.c - a.c).slice(0, rows).map((x) => x.l);
+	return [lines[0]!, ...body];
 }
 
 // ---- verdict and settle ----------------------------------------------------------------------------
@@ -1135,6 +1242,8 @@ export interface RunFacts {
 	 * the trusted phase fetched it); null when no file was rerun on base (`baseParts` named none, or the run stopped first).
 	 */
 	baseRuns: { sha: string; parts: Readonly<Record<string, PartResult>> } | null;
+	/** The host load of every part the run made (E1, PLAN wl-mvqu69tjvpy96o); a red or error reason names an overloaded part, the verdict never moves. */
+	load?: PartLoad[];
 }
 export interface RunDecision {
 	/** What the entry records: `superseded` for a run that lost ownership. */
@@ -1245,8 +1354,9 @@ export function mainRed(c: BaseCompare): boolean {
  * `red`, or `red-main` (D3) when every PR part reported cleanly, no failure is in a security test, each full-part failure of a
  * file fails again in that file's solo part (a multiset cover) and base's solo runs fail every failure of every failing solo
  * part too (`mainRed`); a part that errored is `error`; otherwise `green`. A failing file that passed alone never moves the
- * verdict: a `red` names it in its reason (`failing in the full part; passed alone: <files>`). A run that does not own its
- * request records `superseded` and settles nothing.
+ * verdict: a `red` names it in its reason (`failing in the full part; passed alone: <files>`). A `red` or `error` run with a part
+ * that started or ended overloaded (`overloadNote`, E1) names the overload in its reason, and the verdict stays what the counts
+ * say. A run that does not own its request records `superseded` and settles nothing.
  */
 export function decideRun(f: RunFacts): RunDecision {
 	const outcome = ((): { outcome: RunDecision["outcome"]; reason: string | null } => {
@@ -1282,6 +1392,8 @@ export function decideRun(f: RunFacts): RunDecision {
 		if (broken) return { outcome: "error", reason: `${broken.label}: ${broken.p.error ?? `exit ${broken.p.exit}`}` };
 		return { outcome: "green", reason: null };
 	})();
+	const overload = (outcome.outcome === "red" || outcome.outcome === "error") && f.load ? overloadNote(f.load) : null;
+	if (overload !== null) outcome.reason = outcome.reason === null ? overload : `${outcome.reason}; ${overload}`;
 	if (!f.owner) {
 		return { verdict: "superseded", outcome: outcome.outcome, reason: `lost ownership of the request; the run found ${outcome.outcome}${outcome.reason ? ` (${outcome.reason})` : ""}`, settle: false };
 	}
@@ -1308,7 +1420,7 @@ export function buildTestRun(
 		full: facts.full ? { pass: facts.full.pass, fail: facts.full.fail, skip: facts.full.skip, exit: facts.full.exit, ms: facts.full.ms, error: facts.full.error } : null,
 		solo: facts.solo.map((s) => ({ file: s.file, pass: s.pass, fail: s.fail, skip: s.skip, exit: s.exit, ms: s.ms, error: s.error })),
 		failures: failuresOf(facts.full, facts.solo), runDir: extra.runDir, preflight: extra.preflight,
-		...(baseCompare === null ? {} : { baseCompare }),
+		...(baseCompare === null ? {} : { baseCompare }), ...(facts.load ? { load: facts.load } : {}),
 	};
 }
 

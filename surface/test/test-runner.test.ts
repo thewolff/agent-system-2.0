@@ -19,12 +19,12 @@ import { renderExecWrapper } from "../src/as2test";
 import { recordRepo } from "../src/decision-log";
 import { trainFixBody } from "../src/launch";
 import {
-	childLayout, heartbeatText, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, runnerDiedRun, type TestRun, testRequestedBody, testRunBody, testRuns, workDirOf,
-	WRAPPER_EXIT, type WrapperCall, wrapperArgv,
+	childLayout, cleanupReportOf, heartbeatText, makeRunId, overloadNote, parseHeartbeat, parseTestRun, partResult, pushDestBody, resultJson, runnerDiedRun, runsDbOf, sweepFailureOf,
+	type TestRun, testRequestedBody, testRunBody, testRuns, topByCpu, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
 import { trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
 import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
-import { importPart, importReport, lockRow, openLockDb, publishIfOwner, run, START_EXIT } from "../scripts/test-runner";
+import { hostLoad, importPart, importReport, type LockRow, lockRow, openLockDb, publishIfOwner, run, START_EXIT } from "../scripts/test-runner";
 import { alive, tmp, until } from "./helpers";
 import { carry305 } from "./train-world";
 
@@ -186,7 +186,8 @@ const statusPosts = (w: World): string[] => {
 		return `${m[3]} ${m[2]}`;
 	});
 };
-// Every call is logged to sudo.log, one line each: `refresh`, or the wrapper subcommand and its run id.
+// Every call is logged to sudo.log, one line each: `refresh`, or the wrapper subcommand and its run id. A test's fake wrapper for
+// one subcommand, `<root>/fake-<sub>` (`fakeWrapper`), runs in the real wrapper's place with the same argv.
 const SUDO = `#!/bin/sh
 log="$(dirname "$0")/../sudo.log"
 if [ "$#" = 2 ] && [ "$1" = -n ]; then
@@ -203,6 +204,8 @@ if [ "$2" = probe ]; then
 	printf '%s\\n' "$out" | sed -e 's/"read":true/"read":false/g' -e 's/"write":true/"write":false/g'
 	exit 0
 fi
+fake="$(dirname "$0")/../fake-$2"
+if [ -x "$fake" ]; then exec "$fake" "$@"; fi
 exec "$@"
 `;
 /** The installed refresh helper's stand-in until a test arms one (`setRefresh`): a run that calls it fails loudly. */
@@ -331,6 +334,8 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 		AGENT_SYSTEM_TEST_RUNNER_ROOT: as2,
 		AGENT_SYSTEM_TEST_RUNNER_INSTALL: JSON.stringify({ libexec, sudoers, ids: { root: uid, wheel: gid, jo: uid }, account: { uid, gid } }),
 		AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS: "500", AGENT_SYSTEM_TEST_RUNNER_POLL_MS: "200", AGENT_SYSTEM_TEST_RUNNER_BUSY_MS: "300", AGENT_SYSTEM_TEST_HOOKS: hooks,
+		// A calm host for every run unless a test sets another (E1): a reason never depends on this machine's own load.
+		AGENT_SYSTEM_TEST_RUNNER_LOADAVG: "0.5 0.4 0.3 8",
 		// Credentials in Jo's env: none may reach the code under test (plan § 3).
 		GH_TOKEN: "secret-gh", ANTHROPIC_API_KEY: "secret-anthropic", OPENAI_API_KEY: "secret-openai", MOONSHOT_API_KEY: "secret-moonshot",
 		SSH_AUTH_SOCK: "/tmp/secret-agent.sock", OMP_SESSION_TOKEN: "secret-omp", AGENT_SYSTEM_SECRET: "secret-as",
@@ -420,17 +425,35 @@ function marks(w: World, runId: string, point: string): Record<string, unknown>[
 const current = (w: World): string => readFileSync(join(w.as2, "stage", "current"), "utf8").trim();
 const heldMessages = (w: World, wl: string) =>
 	w.ledger.db.query<{ body: string; sender: string; recipient: string; state: string }, [string]>("SELECT body, sender, recipient, state FROM messages WHERE workload_id = ? ORDER BY rowid").all(wl);
-/** The world's runs.db, with no busy wait: a write while another connection holds a transaction fails at once. */
-const lockDbOf = (w: World): Database => openLockDb(w.runs, 0);
-/** The lock row's heartbeat moved two minutes back: its holder is stale to every waiter. */
-function staleRow(w: World): void {
-	const db = lockDbOf(w);
+/**
+ * The world's runs.db with no busy wait: a read or write while another connection commits fails at once with SQLITE_BUSY. Only for
+ * a test whose subject is that failing fast; a test reading runs.db while a runner is live uses `runsDb` (PLAN wl-mvqu69tjvpy96o C8).
+ */
+const noWaitLockDb = (w: World): Database => openLockDb(w.runs, 0);
+/** `fn` on the world's runs.db, waiting up to 2 s for a runner's transaction (the product's own wait discipline); a longer hold fails with SQLITE_BUSY. */
+function runsDb<T>(w: World, fn: (db: Database) => T): T {
+	const db = openLockDb(w.runs, 2_000);
 	try {
-		db.query("UPDATE lock SET heartbeatAt = ?").run(Date.now() - 120_000);
+		return fn(db);
 	} finally {
 		db.close();
 	}
 }
+/** The lock row now, read through `runsDb`; a missing row fails naming the runs.db and why it was read. */
+function lockHolder(w: World, why: string): LockRow {
+	const row = runsDb(w, lockRow);
+	if (row === null) throw new Error(`${runsDbOf(w.runs)} has no lock row when ${why}`);
+	return row;
+}
+/** The lock row's heartbeat moved two minutes back: its holder is stale to every waiter. A missing row fails naming the runs.db. */
+function staleRow(w: World): void {
+	const changes = runsDb(w, (db) => db.query("UPDATE lock SET heartbeatAt = ?").run(Date.now() - 120_000).changes);
+	if (changes !== 1) throw new Error(`${runsDbOf(w.runs)} has no lock row to make stale (the UPDATE changed ${changes} rows)`);
+}
+/** Another run holds the lock with a heartbeat ten minutes ahead: live for the whole test, until the test changes it. */
+const holdLock = (w: World): void => {
+	runsDb(w, (db) => db.query("INSERT INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, 'tr-otherholder', 1, 1, '/nowhere', ?)").run(Date.now() + 600_000));
+};
 
 // ---- the starter -------------------------------------------------------------------------------------
 
@@ -679,8 +702,7 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 		setPr(w, A, { sha: fx.head.green, headRefName: `plumb/${A}` });
 		joTrains(w, wl, [A]);
 		const capMs = 0.01 * 60_000;
-		const db = lockDbOf(w);
-		db.query("INSERT INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, 'tr-otherholder', 1, 1, '/nowhere', ?)").run(Date.now() + 600_000);
+		holdLock(w);
 		const kids: Child[] = [];
 		try {
 			// Requested at a sha the PR head is not, so once it holds the lock it ends stale quickly.
@@ -696,8 +718,8 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 			});
 			expect(testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.results).toEqual([]);
 			expect(queueRows(w).map((q) => q.runId)).toEqual([runId]);
-			expect(lockRow(db)!.runId).toBe("tr-otherholder");
-			db.query("DELETE FROM lock").run();
+			expect(lockHolder(w, "the train run has waited three caps").runId).toBe("tr-otherholder");
+			runsDb(w, (db) => db.query("DELETE FROM lock").run());
 			const run = await resultOf(w, wl, runId);
 			expect(run.reason).not.toBe("queued too long");
 			expect(run.verdict).toBe("stale");
@@ -705,7 +727,6 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 			await child.exited;
 		} finally {
 			await reap(kids);
-			db.close();
 		}
 	});
 });
@@ -975,44 +996,34 @@ describe("start: the reservation (§ 2.2 step 3)", () => {
 		const w = world();
 		const { wl, slice } = workload(w);
 		setPr(w, PR.green, { sha: fx.head.green, headRefName: `wl/${wl}` });
-		const db = lockDbOf(w);
 		// Another run holds the lock with a heartbeat ten minutes ahead: fresh for the whole test, with no timer to keep it so.
-		db.query("INSERT INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, 'tr-otherholder', 1, 1, '/nowhere', ?)").run(Date.now() + 600_000);
-		try {
-			// The request is 200 s old (past the startup lease); requested sha ≠ the PR head, so once it runs it ends quickly as stale.
-			const queued = request(w, wl, slice, PR.green, fx.main, 200_000);
-			const child = spawnRun(w, queued);
-			await until("two queued polls", () => marks(w, queued, "queued").length >= 2);
-			const first = parseHeartbeat(readFileSync(join(w.runs, queued, "heartbeat"), "utf8"), queued)!;
-			await until("a later heartbeat", () => (parseHeartbeat(readFileSync(join(w.runs, queued, "heartbeat"), "utf8"), queued) ?? 0) > first);
-			const r = start(w, wl, PR.green, ["--slice", slice]);
-			expect(r.code).toBe(START_EXIT.refused);
-			expect(r.err).toContain(`run ${queued} `);
-			expect(testRuns(w.ledger.entries(wl))).toHaveLength(1);
-			db.query("DELETE FROM lock").run();
-			expect((await resultOf(w, wl, queued)).verdict).toBe("stale");
-			await child.exited;
-		} finally {
-			db.close();
-		}
+		holdLock(w);
+		// The request is 200 s old (past the startup lease); requested sha ≠ the PR head, so once it runs it ends quickly as stale.
+		const queued = request(w, wl, slice, PR.green, fx.main, 200_000);
+		const child = spawnRun(w, queued);
+		await until("two queued polls", () => marks(w, queued, "queued").length >= 2);
+		const first = parseHeartbeat(readFileSync(join(w.runs, queued, "heartbeat"), "utf8"), queued)!;
+		await until("a later heartbeat", () => (parseHeartbeat(readFileSync(join(w.runs, queued, "heartbeat"), "utf8"), queued) ?? 0) > first);
+		const r = start(w, wl, PR.green, ["--slice", slice]);
+		expect(r.code).toBe(START_EXIT.refused);
+		expect(r.err).toContain(`run ${queued} `);
+		expect(testRuns(w.ledger.entries(wl))).toHaveLength(1);
+		runsDb(w, (db) => db.query("DELETE FROM lock").run());
+		expect((await resultOf(w, wl, queued)).verdict).toBe("stale");
+		await child.exited;
 	});
 
 	test("a run that waits past queueMaxMin ends error queued too long, without touching the holder's lock or current", async () => {
 		const w = world({ queueMaxMin: 0.01 });
 		const { wl, slice } = workload(w);
-		const db = lockDbOf(w);
-		db.query("INSERT INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, 'tr-otherholder', 1, 1, '/nowhere', ?)").run(Date.now() + 600_000);
-		try {
-			const runId = request(w, wl, slice, PR.green, fx.head.green);
-			await spawnRun(w, runId).exited;
-			const run = await resultOf(w, wl, runId);
-			expect(run).toMatchObject({ verdict: "error", reason: "queued too long", full: null });
-			expect(lockRow(db)!.runId).toBe("tr-otherholder");
-			expect(existsSync(join(w.as2, "stage", "current"))).toBe(false);
-			expect(heldMessages(w, wl).map((m) => m.body)).toEqual([`test-run-failed: ${wl} ${slice} error at ${fx.head.green}: 0 failing`]);
-		} finally {
-			db.close();
-		}
+		holdLock(w);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run).toMatchObject({ verdict: "error", reason: "queued too long", full: null });
+		expect(lockHolder(w, "the queued run has ended").runId).toBe("tr-otherholder");
+		expect(existsSync(join(w.as2, "stage", "current"))).toBe(false);
+		expect(heldMessages(w, wl).map((m) => m.body)).toEqual([`test-run-failed: ${wl} ${slice} error at ${fx.head.green}: 0 failing`]);
 	});
 });
 
@@ -1063,9 +1074,7 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		// The trusted base for `migration-items check`: beside the tested-commit branch, the only ref in the clone, at origin/main.
 		expect(g(clone, "for-each-ref", "--format=%(refname) %(objectname)").split("\n")).toEqual([`refs/heads/as2-tested-pr-${PR.green} ${fx.head.green}`, `refs/tags/as2-trusted-main ${fx.main}`]);
 		// The lock is released and `current` still names the last run.
-		const db = lockDbOf(w);
-		expect(lockRow(db)).toBeNull();
-		db.close();
+		expect(runsDb(w, lockRow)).toBeNull();
 		expect(current(w)).toBe(runId!);
 		// Control: a plain clone under the same HOME does run the filter, so the fixture was armed for the runner too.
 		const control = Bun.spawnSync(["git", "clone", "-q", w.origin, join(w.root, "control")], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: w.home, GIT_CONFIG_NOSYSTEM: "1" }, stderr: "pipe" });
@@ -1419,7 +1428,7 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 			const id = makeRunId(Date.now() - (20 - i) * 60_000, `old${i}`);
 			old.push(id);
 			mkdirSync(join(w.runs, id));
-			for (const f of ["runner.log", "full.xml", "full.log", "result.json", "heartbeat", "runner.json", "trusted.gitconfig"]) writeFileSync(join(w.runs, id, f), "x\n");
+			for (const f of ["runner.log", "full.xml", "full.log", "full.load.log", "full.cleanup.log", "result.json", "heartbeat", "runner.json", "trusted.gitconfig"]) writeFileSync(join(w.runs, id, f), "x\n");
 			mkdirSync(join(w.as2, "stage", id, "repo"), { recursive: true });
 			mkdirSync(join(w.as2, "runs", id, "repo"), { recursive: true });
 		}
@@ -1431,7 +1440,7 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		for (const id of old.slice(0, 2)) {
 			expect(existsSync(join(w.as2, "stage", id))).toBe(false);
 			expect(existsSync(join(w.as2, "runs", id))).toBe(false);
-			expect(readdirSync(join(w.runs, id)).sort()).toEqual(["full.log", "full.xml", "result.json", "runner.log"]);
+			expect(readdirSync(join(w.runs, id)).sort()).toEqual(["full.cleanup.log", "full.load.log", "full.log", "full.xml", "result.json", "runner.log"]);
 		}
 		for (const id of old.slice(2)) {
 			expect(existsSync(join(w.as2, "stage", id))).toBe(true);
@@ -1439,6 +1448,196 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 			expect(existsSync(join(w.runs, id, "heartbeat"))).toBe(true);
 		}
 		expect(marks(w, runId, "spawn-cleanup")).toHaveLength(2);
+	});
+});
+
+// ---- host load and the wrapper's cleanup report (PLAN wl-mvqu69tjvpy96o E1, C9) ----------------------------------------
+
+/** A fake for wrapper subcommand `sub`: `<root>/fake-<sub>`, which the fake sudo runs in the real wrapper's place with its argv. */
+function fakeWrapper(w: World, sub: string, script: string): void {
+	const path = join(w.root, `fake-${sub}`);
+	writeFileSync(path, `#!/bin/sh\n${script}`);
+	chmodSync(path, 0o755);
+}
+/** A fake `ps` first on the runner's PATH (the wrapper's own PATH is fixed, so it never sees it). */
+function fakePs(w: World, script: string): void {
+	const path = join(w.root, "bin", "ps");
+	writeFileSync(path, `#!/bin/sh\n${script}`);
+	chmodSync(path, 0o755);
+}
+/** `ps -Ao pid,user,nice,pcpu,etime,comm` with a header and 30 rows: pid 1000+i at i % 7 * 10 + i / 10 %CPU, out of order. */
+const PS_ROWS = Array.from({ length: 30 }, (_, i) => ({ pid: 1000 + i, cpu: (i % 7) * 10 + i / 10 }));
+const PS_OUT = ["  PID USER   NI  %CPU     ELAPSED COMM", ...PS_ROWS.map((r) => `${r.pid} jo      0 ${r.cpu.toFixed(1)}    01:00 /bin/burn-${r.pid}`)].join("\n");
+const resultFile = (w: World, runId: string): Record<string, unknown> => JSON.parse(readFileSync(join(w.runs, runId, "result.json"), "utf8")) as Record<string, unknown>;
+const ghLog = (w: World): string => (existsSync(join(w.root, "gh.log")) ? readFileSync(join(w.root, "gh.log"), "utf8") : "");
+
+describe("host load and the wrapper's cleanup report (PLAN wl-mvqu69tjvpy96o E1, C9)", () => {
+	const at = "2026-10-27T00:00:00.000Z";
+	const reading = (load1: number, cores = 4) => ({ at, load1, load5: load1, load15: load1, cores });
+
+	test("E1 unit: hostLoad reads os.loadavg and the core count, or the knob; a malformed knob throws naming it; overloadNote names only parts over 2 × cores; topByCpu keeps the header and the 25 busiest", () => {
+		const real = hostLoad({}, Date.parse(at));
+		expect(real.at).toBe(at);
+		for (const n of [real.load1, real.load5, real.load15]) expect(Number.isFinite(n) && n >= 0).toBe(true);
+		expect(Number.isSafeInteger(real.cores) && real.cores >= 1).toBe(true);
+		expect(hostLoad({ AGENT_SYSTEM_TEST_RUNNER_LOADAVG: "8.126 4 2 4" }, Date.parse(at))).toEqual({ at, load1: 8.13, load5: 4, load15: 2, cores: 4 });
+		for (const bad of ["1 2 3", "1 2 3 0", "1 2 3 2.5", "a 2 3 4", "-1 2 3 4"]) {
+			expect(() => hostLoad({ AGENT_SYSTEM_TEST_RUNNER_LOADAVG: bad })).toThrow(`AGENT_SYSTEM_TEST_RUNNER_LOADAVG must be "<1m> <5m> <15m> <cores>"`);
+		}
+		expect(overloadNote([{ part: "full", file: null, start: reading(8), end: reading(8), snapshot: null }])).toBeNull();
+		expect(overloadNote([
+			{ part: "full", file: null, start: reading(8.01), end: reading(3), snapshot: "full.load.log" },
+			{ part: "solo-1", file: "a.test.ts", start: reading(1), end: reading(1), snapshot: null },
+			{ part: "solo-2", file: "b.test.ts", start: reading(1), end: reading(9), snapshot: null },
+		])).toBe("host overloaded (1-minute load over 2 × cores): full 8.01 at start, 3.00 at end on 4 cores, processes in full.load.log; solo-2 b.test.ts 1.00 at start, 9.00 at end on 4 cores, no process snapshot");
+		const top = topByCpu(PS_OUT);
+		expect(top).toHaveLength(26);
+		expect(top[0]).toContain("%CPU");
+		const cpus = top.slice(1).map((l) => Number(l.trim().split(/\s+/)[3]));
+		expect(cpus).toEqual([...PS_ROWS.map((r) => Number(r.cpu.toFixed(1)))].sort((a, b) => b - a).slice(0, 25));
+		expect(topByCpu("")).toEqual([]);
+	});
+
+	test("E1 unit: a run's load survives its body and result.json; a run without one has none; a malformed load is refused", () => {
+		const sha = "a".repeat(40);
+		const base = runnerDiedRun({ runId: newRunId(), pr: 1, sha, slice: "sl-x", by: LANE });
+		expect(parseTestRun(testRunBody(base))).not.toHaveProperty("load");
+		const load = [{ part: "full", file: null, start: reading(1), end: reading(9), snapshot: "full.load.log" }];
+		const withLoad = { ...base, load };
+		expect(parseTestRun(testRunBody(withLoad))!.load).toEqual(load);
+		expect(JSON.parse(resultJson(withLoad)).load).toEqual(load);
+		const body = testRunBody(withLoad);
+		expect(parseTestRun(body.replace(`"cores":4`, `"cores":0`))).toBeNull();
+		expect(parseTestRun(body.replace(`"part":"full"`, `"part":""`))).toBeNull();
+	});
+
+	test("C9 unit: the part's cleanup line and the sweep's failure line are read off the wrapper's stderr; a part's error names the timeout first, then the survivors", () => {
+		expect(cleanupReportOf("as2test: full timed out at its 2 min cap; cleanup left 2 alive: 4242 4343\n")).toBe("cleanup left 2 alive: 4242 4343");
+		expect(cleanupReportOf("as2test: cleanup could not look up session 4242: ps: Operation not permitted")).toBe("cleanup could not look up session 4242: ps: Operation not permitted");
+		expect(cleanupReportOf("as2test: full timed out at its 2 min cap")).toBeNull();
+		expect(sweepFailureOf("as2test: sweeping\nsweep: 2 alive after KILL: 4242 4343\n")).toBe("sweep: 2 alive after KILL: 4242 4343");
+		expect(sweepFailureOf("\nas2test: the process list failed: EPERM\nmore\n")).toBe("as2test: the process list failed: EPERM");
+		expect(sweepFailureOf("")).toBeNull();
+		expect(partResult({ junit: null, log: null, exit: WRAPPER_EXIT.timeout, ms: 1, timedOut: true, cleanup: "cleanup left 2 alive: 4242 4343" }).error)
+			.toBe("timeout; cleanup left 2 alive: 4242 4343");
+	});
+
+	test("E1: a calm run records every part's load in runner.log and result.json, writes no process snapshot, and its reason is untouched", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run).toMatchObject({ verdict: "green", reason: null });
+		const calm = { load1: 0.5, load5: 0.4, load15: 0.3, cores: 8 };
+		expect(run.load).toEqual([{ part: "full", file: null, start: expect.objectContaining(calm), end: expect.objectContaining(calm), snapshot: null }]);
+		expect(resultFile(w, runId).load).toEqual(run.load);
+		const log = runnerLog(w, runId);
+		expect(log).toContain("load full start: 0.5 0.4 0.3 (1, 5, 15 min) on 8 cores\n");
+		expect(log).toContain("load full end: 0.5 0.4 0.3 (1, 5, 15 min) on 8 cores\n");
+		expect(readdirSync(join(w.runs, runId)).filter((f) => f.endsWith(".load.log"))).toEqual([]);
+	});
+
+	test("E1: an overloaded green run keeps its verdict and reason, and writes one bounded process snapshot per part, the 25 busiest first", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		fakePs(w, `cat <<'EOF'\n${PS_OUT}\nEOF\n`);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		await spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_LOADAVG: "40 30 20 4" }).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run).toMatchObject({ verdict: "green", reason: null });
+		expect(run.load!.map((p) => [p.part, p.start.load1, p.end.cores, p.snapshot])).toEqual([["full", 40, 4, "full.load.log"]]);
+		const snap = readFileSync(join(w.runs, runId, "full.load.log"), "utf8").split("\n");
+		expect(snap[0]).toMatch(/^full at its start, \S+: load 40 30 20 \(1, 5, 15 min\) on 4 cores, over 2 × the cores$/);
+		expect(snap[1]).toBe("ps -Ao pid,user,nice,pcpu,etime,comm, the 25 busiest by %CPU (cap 5000 ms):");
+		expect(snap.slice(2, 3)).toEqual([PS_OUT.split("\n")[0]]);
+		expect(snap.slice(3).filter(Boolean)).toEqual(topByCpu(PS_OUT).slice(1));
+		expect(runnerLog(w, runId)).toContain("load full start: 40 30 20 (1, 5, 15 min) on 4 cores; over 2 × 4 cores\n");
+		expect(statusPosts(w)).toEqual([`success ${fx.head.green}`]);
+		expect(ghLog(w)).not.toContain("host overloaded");
+	});
+
+	test("E1: an overloaded red run stays red, its reason and status name the overload, and a ps past its cap is written into the snapshot", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		fakePs(w, "exec /bin/sleep 30\n");
+		const runId = request(w, wl, slice, PR.red, fx.head.red);
+		await spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_LOADAVG: "40 30 20 4", AGENT_SYSTEM_TEST_RUNNER_PS_MS: "300" }).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run.verdict).toBe("red");
+		expect(run.reason).toContain("host overloaded (1-minute load over 2 × cores): full 40.00 at start, 40.00 at end on 4 cores, processes in full.load.log");
+		expect(resultFile(w, runId).reason).toBe(run.reason);
+		for (const p of run.load!) expect(existsSync(join(w.runs, runId, p.snapshot!))).toBe(true);
+		expect(readFileSync(join(w.runs, runId, "full.load.log"), "utf8")).toContain("ps failed: command timed out after 300 ms: ps -Ao pid,user,nice,pcpu,etime,comm\n");
+		expect(statusPosts(w)).toEqual([`failure ${fx.head.red}`]);
+		expect(ghLog(w)).toContain(`description=full suite red, run ${runId}; host overloaded (see its load)`);
+	});
+
+	test("C9: a full part past its cap whose cleanup left survivors stays a timeout; its error names the cap and the survivors; full.cleanup.log is in the run dir", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		const work = workDirOf(runId, w.as2);
+		fakeWrapper(w, "full", [
+			`printf 'pid 4242 pgid 4242 bun test --parallel (worker)\\npid 4343 pgid 4242 sleep 300\\n' > '${work}/full.cleanup.log'`,
+			`printf 'stuck\\n' > '${work}/full.stuck.log'`,
+			"echo 'as2test: full timed out at its 2 min cap; cleanup left 2 alive: 4242 4343' >&2",
+			`exit ${WRAPPER_EXIT.timeout}`,
+			"",
+		].join("\n"));
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run).toMatchObject({ verdict: "error", reason: "full: timeout; cleanup left 2 alive: 4242 4343" });
+		expect(run.full).toMatchObject({ exit: WRAPPER_EXIT.timeout, error: "timeout; cleanup left 2 alive: 4242 4343" });
+		expect(run.solo).toEqual([]);
+		const log = runnerLog(w, runId);
+		expect(log).toContain("full part timed out: no solo or base parts");
+		expect(log).toContain("as2test: full timed out at its 2 min cap; cleanup left 2 alive: 4242 4343\n");
+		expect(log).toContain("full.cleanup.log imported");
+		expect(readFileSync(join(w.runs, runId, "full.cleanup.log"), "utf8")).toBe("pid 4242 pgid 4242 bun test --parallel (worker)\npid 4343 pgid 4242 sleep 300\n");
+		expect(readFileSync(join(w.runs, runId, "full.stuck.log"), "utf8")).toBe("stuck\n");
+	});
+
+	test("C9: a full part whose cleanup lookup failed is an error naming the wrapper and the lookup; full.cleanup.log is in the run dir", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		const work = workDirOf(runId, w.as2);
+		fakeWrapper(w, "full", [
+			`printf 'session 4242: ps: Operation not permitted\\n' > '${work}/full.cleanup.log'`,
+			"echo 'as2test: cleanup could not look up session 4242: ps: Operation not permitted' >&2",
+			`exit ${WRAPPER_EXIT.failed}`,
+			"",
+		].join("\n"));
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run.verdict).toBe("error");
+		expect(run.full!.error).toBe(`the wrapper failed full (exit ${WRAPPER_EXIT.failed}); cleanup could not look up session 4242: ps: Operation not permitted`);
+		expect(run.reason).toContain("cleanup could not look up session 4242");
+		expect(readFileSync(join(w.runs, runId, "full.cleanup.log"), "utf8")).toBe("session 4242: ps: Operation not permitted\n");
+	});
+
+	test("C9: a part that passed still has its cleanup report imported; no stderr line, so the result is untouched", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		const work = workDirOf(runId, w.as2);
+		fakeWrapper(w, "full", [`"$@"`, "code=$?", `printf 'pid 4242 pgid 4242 sleep 300\\n' > '${work}/full.cleanup.log' || exit 99`, 'exit "$code"', ""].join("\n"));
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run).toMatchObject({ verdict: "green", reason: null });
+		expect(run.full).toMatchObject({ exit: 0, error: null });
+		expect(readFileSync(join(w.runs, runId, "full.cleanup.log"), "utf8")).toBe("pid 4242 pgid 4242 sleep 300\n");
+	});
+
+	test("C9: a sweep that is not ok puts its survivor line in the run's error, not only its exit code", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		fakeWrapper(w, "sweep", `echo 'as2test: sweeping the run user'\necho 'sweep: 2 alive after KILL: 4242 4343' >&2\nexit ${WRAPPER_EXIT.failed}\n`);
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run).toMatchObject({ verdict: "error", reason: `the sweep after publish failed: exit ${WRAPPER_EXIT.failed}: sweep: 2 alive after KILL: 4242 4343` });
 	});
 });
 
@@ -1888,7 +2087,8 @@ describe("the runs lock and current", () => {
 		await reached(w, A, "acquire-tx");
 		// Inside A's open transaction: current already names A, the row is not yet visible, and no other writer gets in.
 		expect(current(w)).toBe(A);
-		const probe = lockDbOf(w);
+		// Busy 0 is the subject here: A's open transaction refuses another writer at once, with no wait.
+		const probe = noWaitLockDb(w);
 		expect(lockRow(probe)).toBeNull();
 		expect(() => probe.exec("BEGIN IMMEDIATE")).toThrow();
 		probe.close();
@@ -1911,9 +2111,7 @@ describe("the runs lock and current", () => {
 
 	test("two waiters on one stale lock row, SQLITE_BUSY retried: exactly one takes it over", async () => {
 		const w = world();
-		const db = lockDbOf(w);
-		db.query("INSERT INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, 'tr-staleholder', 1, 1, '/nowhere', ?)").run(Date.now() - 120_000);
-		db.close();
+		runsDb(w, (db) => db.query("INSERT INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, 'tr-staleholder', 1, 1, '/nowhere', ?)").run(Date.now() - 120_000));
 		const a = workload(w);
 		const b = workload(w);
 		const A = request(w, a.wl, a.slice, PR.green, fx.main);
@@ -1950,9 +2148,7 @@ describe("the runs lock and current", () => {
 		expect(marks(w, B, "acquired")[0]).toMatchObject({ displaced: A });
 		expect(current(w)).toBe(B);
 		// The guarded publication itself: A's id no longer holds the row, so nothing is written.
-		const db = lockDbOf(w);
-		expect(publishIfOwner(db, join(w.as2, "stage"), A)).toBe(false);
-		db.close();
+		expect(runsDb(w, (db) => publishIfOwner(db, join(w.as2, "stage"), A))).toBe(false);
 		expect(current(w)).toBe(B);
 		// (f) Each subcommand for A's run id is refused by the fence while current names B.
 		const calls: WrapperCall[] = [
@@ -1989,15 +2185,8 @@ describe("the runs lock and current", () => {
 		staleRow(w);
 		const cb = spawnRun(w, B);
 		await until("B took over", () => marks(w, B, "acquired").length === 1);
-		const before = (() => {
-			const db = lockDbOf(w);
-			try {
-				return lockRow(db)!;
-			} finally {
-				db.close();
-			}
-		})();
-		expect(before.runId).toBe(B);
+		// B is live and commits its heartbeat: the read waits for the commit, as every product handle does (PLAN wl-mvqu69tjvpy96o C8).
+		expect(lockHolder(w, "B took over").runId).toBe(B);
 		const frozenUntil = Date.now();
 		go(w, A, "heartbeat-update");
 		await until("A's heartbeat after the takeover", () => marks(w, A, "heartbeat").some((m) => (m.at as number) >= frozenUntil));
@@ -2035,21 +2224,6 @@ function requestsCBA(w: World): { A: Waiter; B: Waiter; C: Waiter } {
 	expect([A.id, B.id, C.id].toSorted()).toEqual([C.id, B.id, A.id]);
 	return { A, B, C };
 }
-
-/** `fn` on the world's runs.db, waiting up to 2 s for a runner's transaction. */
-function runsDb<T>(w: World, fn: (db: Database) => T): T {
-	const db = openLockDb(w.runs, 2_000);
-	try {
-		return fn(db);
-	} finally {
-		db.close();
-	}
-}
-
-/** Another run holds the lock with a heartbeat ten minutes ahead: live for the whole test, until the test changes it. */
-const holdLock = (w: World): void => {
-	runsDb(w, (db) => db.query("INSERT INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, 'tr-otherholder', 1, 1, '/nowhere', ?)").run(Date.now() + 600_000));
-};
 
 const queueRows = (w: World) =>
 	runsDb(w, (db) => db.query<{ runId: string; workloadId: string; requestedAt: number }, []>("SELECT runId, workloadId, requestedAt FROM queue ORDER BY requestedAt, runId").all());
@@ -2418,8 +2592,7 @@ for (const point of ["head-recheck", "result"]) {
 			expect(child.exitCode).toBe(0);
 			expect(JSON.parse(readFileSync(join(w.runs, runId, "result.json"), "utf8"))).toMatchObject({ verdict: "error" });
 			expect(w.ledger.slice(slice)!.state).toBe("open");
-			const db = lockDbOf(w);
-			try { expect(lockRow(db)).toBeNull(); } finally { db.close(); }
+			expect(runsDb(w, lockRow)).toBeNull();
 			// Resuming an expired hook must never publish a late green result.
 			go(w, runId, point);
 			expect(testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.results).toHaveLength(1);
@@ -2455,8 +2628,7 @@ test("publication contention leaves a local error verdict and releases the run l
 		expect(result.verdict).toBe("error");
 		expect(result.reason).toContain("result publication failed:");
 		expect(result.reason).toContain("post-sweep deadline exceeded during publication");
-		const db = lockDbOf(w);
-		try { expect(lockRow(db)).toBeNull(); } finally { db.close(); }
+		expect(runsDb(w, lockRow)).toBeNull();
 	} finally {
 		w.ledger.db.exec("ROLLBACK");
 		go(w, runId, "result");
@@ -2491,8 +2663,7 @@ test("publication retries a transient ledger lock within the post-sweep deadline
 		expect(results[0]!.verdict).toBe("green");
 		expect(w.ledger.slice(slice)!.state).toBe("done");
 		expect(JSON.parse(readFileSync(join(w.runs, runId, "result.json"), "utf8"))).toMatchObject({ verdict: "green" });
-		const db = lockDbOf(w);
-		try { expect(lockRow(db)).toBeNull(); } finally { db.close(); }
+		expect(runsDb(w, lockRow)).toBeNull();
 	} finally {
 		go(w, runId, "result");
 		await child.exited;
