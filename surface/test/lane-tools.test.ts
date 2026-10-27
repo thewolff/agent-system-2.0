@@ -30,7 +30,7 @@ import { releasedOpen } from "../src/turn-end";
 import { recordRepo, renderClose } from "../src/decision-log";
 import { openPlanPath } from "../src/plan-paths";
 import { ESCALATION_BY, LANE_FULL_TEST_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
+import { ctxOf, fakePi, notices, submitTyped, tempLedger, tmp } from "./helpers";
 
 const LANE_MODEL = "anthropic/claude-opus-5-5";
 const OTHER_LAB = "openai-codex/gpt-6-astra";
@@ -1317,7 +1317,7 @@ describe("mode flip at the surface", () => {
 		orchestratorSurface(f.pi, env, {});
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
-		await f.emit("before_agent_start", { prompt: "user-driven", systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: "user-driven", systemPrompt: [] }, ctx);
 		const stop = ledger.entries(wl).find((e) => e.body.startsWith("lane-stop:"));
 		expect(stop?.body).toBe("lane-stop: lane-t-1 requested mode-flip by jo");
 		expect(stop?.created_by).toBe(SURFACE_BY);

@@ -19,7 +19,7 @@ import { ensureStandingWorkload, standingSlice } from "../src/identity";
 import { apply, interpret } from "../src/input";
 import { answerOrchestratorQuestion, questionSubject, questionSubjectBody } from "../src/orchestrator-question";
 import { ESCALATION_BY, STANDING_BRIEF, STANDING_SLICE_ID, STANDING_SLICE_TASK, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
+import { ctxOf, fakePi, notices, submitTyped, tempLedger, tmp } from "./helpers";
 
 type Started = { systemPrompt: string[]; messages: { customType: string; content: string }[] };
 
@@ -47,7 +47,12 @@ function surface(db: string) {
 		await f.emit("before_agent_start", { prompt, systemPrompt: [] }, ctx);
 		return [...notices];
 	};
-	return { f, ctx, raise, idOf, wake, say };
+	const submit = async (prompt: string): Promise<string[]> => {
+		notices.length = 0;
+		await submitTyped(f, { prompt, systemPrompt: [] }, ctx);
+		return [...notices];
+	};
+	return { f, ctx, raise, idOf, wake, say, submit };
 }
 
 describe("the standing slice", () => {
@@ -193,7 +198,7 @@ describe("Jo's answer", () => {
 		const q = s.idOf(await s.raise({ body: "Open the fix workload now, or later?", options: ["now", "later"], about: wl }));
 		const cmd = interpret(ledger, `later ${q}`);
 		expect(cmd).toEqual({ kind: "answer", workloadId: STANDING_WORKLOAD_ID, questionId: q, answer: "later" });
-		const lines = await s.say(`later ${q}`);
+		const lines = await s.submit(`later ${q}`);
 		expect(lines).toHaveLength(1);
 		expect(lines[0]).toMatch(new RegExp(`^answered the orchestrator's ${q} with "later" \\(answer in-\\S+\\); recorded on ${wl} as instruction in-\\S+$`));
 		const row = ledger.question(q)!;
@@ -211,7 +216,7 @@ describe("Jo's answer", () => {
 		const q = s.idOf(await s.raise({ body: "Now or later?", options: ["now", "later"], about: wl }));
 		expect(interpret(ledger, "now")).toEqual({ kind: "answer", workloadId: STANDING_WORKLOAD_ID, questionId: q, answer: "now" });
 		await s.wake(); // numbers the needs-you lines
-		const lines = await s.say("1 now");
+		const lines = await s.submit("1 now");
 		expect(lines[0]).toContain(`#1 → answered the orchestrator's ${q} with "now"`);
 		expect(ledger.instructions(wl).map((i) => i.body)).toEqual([`Jo: "now" — answers ${q}: Now or later?`]);
 	});
@@ -226,12 +231,12 @@ describe("Jo's answer", () => {
 		expect(ledger.question(q)!.state).toBe("open");
 		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
 		expect(ledger.instructions(wl)).toEqual([]);
-		const typed = await s.say(`now ${q}`);
+		const typed = await s.submit(`now ${q}`);
 		expect(typed).toHaveLength(1);
 		expect(typed[0]).toContain(`could not apply "now ${q}": ${q} is about ${wl}, which is closed`);
 		expect(typed[0]).toContain(`${q} stays open`);
 		await s.wake();
-		const batch = await s.say("1 now");
+		const batch = await s.submit("1 now");
 		expect(batch.join("\n")).toContain(`${q} is about ${wl}, which is closed`);
 		expect(ledger.question(q)!.state).toBe("open");
 		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
@@ -261,7 +266,7 @@ describe("Jo's answer", () => {
 		expect(ledger.instructions(wl)).toEqual([]);
 		const q2 = s.idOf(await s.raise({ body: "Again?", options: ["yes", "no"], about: wl }));
 		expect(ledger.question(q2)).toMatchObject({ state: "open", slice_id: STANDING_SLICE_ID });
-		expect((await s.say(`withdraw ${q2}`))[0]).toContain("the standing slice stays open");
+		expect((await s.submit(`withdraw ${q2}`))[0]).toContain("the standing slice stays open");
 		expect(ledger.slice(STANDING_SLICE_ID)!.state).toBe("open");
 	});
 });
@@ -395,10 +400,12 @@ describe("escalation phase 2 through orchestrator_raise_question (PLAN wl-mvg1vs
 		expect(standing.filter((e) => e.body.startsWith("question-about: ")).map((e) => e.body).sort()).toEqual([questionSubjectBody(qa, a), questionSubjectBody(qb, b)].sort());
 		expect(standing.filter((e) => e.body.startsWith("now: ")).map((e) => [e.body, e.created_by])).toEqual([[`now: ${qa} guard`, ESCALATION_BY]]);
 		expect(s.f.entries.filter((e) => e.type === "surface-question").map((e) => e.data)).toEqual([{ id: qa, about: a }, { id: qb, about: b }]);
-		await s.say(`keep ${qa}`);
-		await s.say(`stop ${qb}`);
+		await s.submit(`keep ${qa}`);
+		await s.submit(`stop ${qb}`);
 		expect(ledger.instructions(a).map((i) => i.body)).toEqual([`Jo: "keep" — answers ${qa}: Keep the lane running?`]);
 		expect(ledger.instructions(b).map((i) => i.body)).toEqual([`Jo: "stop" — answers ${qb}: Keep the lane running?`]);
+		expect(ledger.question(qa)!.state).toBe("answered");
+		expect(ledger.question(qb)!.state).toBe("answered");
 	});
 
 	test("fix round 1 (F2): a repeat of a question an earlier reply published says it is in front of Jo and asks for no new QUESTION block, with and without now; the reply that follows passes row 15", async () => {

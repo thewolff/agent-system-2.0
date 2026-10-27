@@ -155,7 +155,7 @@ function surface(path: string, copier: Copier) {
 	const f = fakePi();
 	surfaceInputRow(f.pi, { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: path, HOME: "/nonexistent-home" }, copier);
 	const ctx = ctxOf();
-	/** Jo's prompt as a turn: the notices it raised, each split into its lines. */
+	/** A raw turn start after `say` has emitted Jo's input: the notices it raised, each split into its lines. */
 	const prompt = async (text: string): Promise<string[][]> => {
 		notices.length = 0;
 		await f.emit("before_agent_start", { prompt: text, systemPrompt: [] }, ctx);
@@ -168,7 +168,7 @@ function surface(path: string, copier: Copier) {
 		if (r?.handled) return notices.map((n) => n.split("\n"));
 		return prompt(text);
 	};
-	return { prompt, say, f };
+	return { say, f };
 }
 /** A copier that records what it was handed and answers `why` (null: copied), or throws it. */
 function copierOf(why: string | null | Error): { copier: Copier; copied: string[] } {
@@ -254,7 +254,7 @@ describe("R5, R6: the pair echo through the surface-input extension, with an inj
 			const { ledger, path: db } = tempLedger();
 			const { wl, q } = roundLimitQuestion(ledger, { held: false });
 			const c = copierOf(null);
-			const echoes = await surface(db, c.copier).prompt(words(q));
+			const echoes = await surface(db, c.copier).say(words(q));
 			const last = echoes.at(-1)!;
 			expect(last[0]).toContain(`answered ${q} with "pair"`);
 			expect(last.slice(-3)).toEqual(["in another terminal:", `as2 lane ${wl}`, "(copied to the clipboard)"]);
@@ -267,7 +267,7 @@ describe("R5, R6: the pair echo through the surface-input extension, with an inj
 	test("a copier that says why not: `(not copied: <why>)` on its own line, and the answer stands", async () => {
 		const { ledger, path: db } = tempLedger();
 		const { wl, q } = roundLimitQuestion(ledger, { held: false });
-		const echoes = await surface(db, copierOf("pbcopy exited 1").copier).prompt(`pair ${q}`);
+		const echoes = await surface(db, copierOf("pbcopy exited 1").copier).say(`pair ${q}`);
 		expect(echoes.at(-1)!.slice(-2)).toEqual([`as2 lane ${wl}`, "(not copied: pbcopy exited 1)"]);
 		expect(ledger.question(q)!.state).toBe("answered");
 		expect(ledger.workload(wl)!.mode).toBe("user-driven");
@@ -276,7 +276,7 @@ describe("R5, R6: the pair echo through the surface-input extension, with an inj
 	test("a copier that throws: `(not copied: <message>)`, and the answer stands", async () => {
 		const { ledger, path: db } = tempLedger();
 		const { wl, q } = roundLimitQuestion(ledger, { held: false });
-		const echoes = await surface(db, copierOf(new Error("clipboard locked")).copier).prompt("1 pair");
+		const echoes = await surface(db, copierOf(new Error("clipboard locked")).copier).say("1 pair");
 		expect(echoes.at(-1)!.slice(-2)).toEqual([`as2 lane ${wl}`, "(not copied: clipboard locked)"]);
 		expect(ledger.question(q)!.state).toBe("answered");
 		expect(ledger.workload(wl)!.mode).toBe("user-driven");
@@ -293,7 +293,7 @@ describe("R5, R6: the pair echo through the surface-input extension, with an inj
 		const plain = ledger.raiseQuestion({ by: LANE, workloadId: other, sliceId: sl, body: "Which?", options: ["left", "right"] });
 		const [np, nq] = [numberOf(ledger, plain), numberOf(ledger, q)];
 		const c = copierOf(null);
-		const echoes = await surface(db, c.copier).prompt(`${nq} pair, ${np} left`);
+		const echoes = await surface(db, c.copier).say(`${nq} pair, ${np} left`);
 		expect(echoes.map((e) => e[0]!.split(" → ")[0])).toEqual([`#${np}`, `#${nq}`]);
 		expect(echoes[0]![0]).toContain(`answered ${plain} with "left"`);
 		expect(echoes.at(-1)![0]).toContain(`answered ${q} with "pair"`);
@@ -311,7 +311,7 @@ describe("R5, R6: the pair echo through the surface-input extension, with an inj
 			const first = roundLimitQuestion(ledger, { held: false });
 			const last = roundLimitQuestion(ledger, { held: false });
 			const c = copierOf(null);
-			const echoes = await surface(db, c.copier).prompt(words(ledger, first.q, last.q));
+			const echoes = await surface(db, c.copier).say(words(ledger, first.q, last.q));
 			expect(c.copied).toEqual([`as2 lane ${last.wl}`]);
 			expect(echoes.at(-1)![0]).toContain(`answered ${last.q} with "pair"`);
 			expect(echoes.at(-1)!.slice(-2)).toEqual([`as2 lane ${last.wl}`, "(copied to the clipboard)"]);
@@ -326,7 +326,7 @@ describe("R5, R6: the pair echo through the surface-input extension, with an inj
 		const { ledger, path: db } = tempLedger();
 		const { q } = roundLimitQuestion(ledger, { held: false });
 		const c = copierOf(null);
-		const echoes = await surface(db, c.copier).prompt(`accept ${q}`);
+		const echoes = await surface(db, c.copier).say(`accept ${q}`);
 		expect(echoes.flat().some((l) => l.includes("copied"))).toBe(false);
 		expect(c.copied).toEqual([]);
 	});

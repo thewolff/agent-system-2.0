@@ -7,11 +7,12 @@
 // (any length, never read as a batch, refused inside one; PLAN wl-mv8s8srodefytc § 1), or a numbered batch
 // answering needs-you lines by their session number ("1 approve, 2 deny", or one per line;
 // MIGRATION.md § M7 follow-ups item 1). Read
-// from the turn's prompt in `before_agent_start` rather than from the `input` event, because
-// OMP emits `input` from the interactive TUI and rpc only (input-controller.ts, rpc-mode.ts), never
-// for `omp -p`, and the surface has to behave the same from the TUI,
-// an rpc front-end and `omp -p`. Every current answerable line is numbered first (the session's
-// Numbering, surface/src/numbering.ts), so a number or a "which one?" refusal always names the row
+// from the turn's prompt in `before_agent_start`, but dispatch only when that prompt takes one
+// entry or a joined run from Jo's typed FIFO. OMP emits `input` from the interactive TUI and rpc
+// only (input-controller.ts, rpc-mode.ts), never for `omp -p`: CLI prompts and other unmatched or
+// ambiguous prompts may reach the model as context, but cannot apply commands or write Jo's rows.
+// Every current answerable line is numbered first (the session's Numbering, surface/src/numbering.ts),
+// so a number or a "which one?" refusal always names the row
 // Jo sees. A batch of any length is checked whole and applied all-or-nothing in one transaction,
 // one ledger row and one echo line per answer; a refused batch writes nothing and echoes one line
 // per piece. A single word or word pair is applied as before, except that a bare answer word
@@ -57,14 +58,15 @@
 // contiguous run whose "\n\n" join is the prompt (OMP's steeringMode `all` delivers queued messages
 // joined that way, agent-session.ts #prepareQueuedUserMessages). A prose take of a run writes one
 // row and one echo per typed message, never one merged row; a joined prompt on a command path
-// writes none and warns; a prompt that matches more than one way takes nothing and warns. An entry
+// writes none and warns; a prompt that matches more than one way takes nothing, warns and applies
+// no command. An entry
 // no turn takes is removed at the first prose take of a newer entry, or by the sweep once the
 // session is idle with nothing queued (at a deferred agent_end and at the top of the next `input`),
 // and judged: a TUI `!cmd` / `$ code` silently (OMP ran it locally), a `/…` with an info line that
 // names only the command, never its arguments, anything else with a warning to Jo and the model;
 // the same words arriving later get no row and one more warning. A prompt Jo did not type, or one
-// no entry matches, writes no row (fail closed): the model then has no receipt, and Jo answers by
-// `<option> q-…` or instructs by a lane's word instead.
+// no entry matches, writes no row and applies no command (fail closed): the model has no receipt,
+// and Jo must type an answer or instruction through the TUI or rpc instead.
 //
 // Lane launcher (DESIGN-lane-launcher.md decisions 7 and 9): an answer or a withdrawal is a
 // resolution a parked lane resumes on, so the launch trigger runs after it (once per workload for
@@ -576,6 +578,10 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			}
 			joInputRow(s, ctx, text, joTyped, ledger);
 		};
+		if (take === null || take.kind === "ambiguous") {
+			asProse(null);
+			return undefined;
+		}
 		try {
 			return await turn(s, ctx, text, asProse);
 		} finally {

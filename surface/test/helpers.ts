@@ -117,6 +117,22 @@ export function fakePi(tools = ["read", "bash", "ask", "task", "yield"], o: { ex
 	return { pi: pi as unknown as SurfaceAPI, emit, entries, sent, execs, active: () => active, tool, registered: () => [...registered.keys()], admit, context };
 }
 
+export interface FakeEmitter {
+	emit(name: string, event: Record<string, unknown>, ctx: unknown): Promise<unknown>;
+}
+
+/** Jo explicitly submits a prompt through `input`, then starts its turn on the same session unless handled. Raw `emit` never implies typing. */
+export async function submitTyped(
+	f: FakeEmitter,
+	event: { prompt: string; systemPrompt: string[] },
+	ctx: unknown,
+	source: "interactive" | "rpc" = "interactive",
+): Promise<unknown> {
+	const input = (await f.emit("input", { text: event.prompt, source }, ctx)) as { handled?: boolean } | undefined;
+	if (input?.handled) return input;
+	return f.emit("before_agent_start", event, ctx);
+}
+
 export const notices: string[] = [];
 /** The same notifications as `notices`, with the level each was notified at. */
 export const notified: { message: string; type?: string }[] = [];

@@ -15,7 +15,7 @@ import { ceilingOf } from "../src/input";
 import { planFirstBody } from "../src/launch";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { STANDING_WORKLOAD_ID, SURFACE_BY as SURFACE } from "../src/types";
-import { clock, ctxOf, fakePi, loadTestText, notices, timers, tmp } from "./helpers";
+import { clock, ctxOf, fakePi, loadTestText, notices, submitTyped, timers, tmp } from "./helpers";
 
 function env(over: Record<string, string> = {}): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
@@ -140,13 +140,13 @@ describe("surface extension adapter", () => {
 		expect(chat.messages[0]!.content).toContain(`${q}, slice ${sl}): Which?`);
 		expect(notices).toEqual([]);
 		expect(texts(await f.emit("before_agent_start", { prompt: "still thinking", systemPrompt: [] }, ctx))).toEqual([count(1)]);
-		const answered = (await f.emit("before_agent_start", { prompt: "right", systemPrompt: [] }, ctx)) as Started;
+		const answered = (await submitTyped(f, { prompt: "right", systemPrompt: [] }, ctx)) as Started;
 		expect(notices).toHaveLength(1);
 		expect(notices[0]).toContain(`answered ${q} with "right"`);
 		expect(notices[0]).toContain(`slice ${sl} is open`);
 		expect(answered.messages[0]!.content).toContain("## Applied from the surface since your last turn");
 		expect(answered.messages[0]!.content).toContain(`answered ${q} with "right"`);
-		const flipped = (await f.emit("before_agent_start", { prompt: "production", systemPrompt: [] }, ctx)) as Started;
+		const flipped = (await submitTyped(f, { prompt: "production", systemPrompt: [] }, ctx)) as Started;
 		expect(flipped.messages[0]!.content).toContain(`stakes on ${wl} → production`);
 		expect(f.entries.filter((x) => x.type === "surface-input")).toHaveLength(2);
 		// the receipt is shown once: the next turn carries no stale notice
@@ -232,7 +232,7 @@ describe("surface extension adapter", () => {
 		expect(fenced.filter((x) => !x.startsWith("  plan for ")).map((x) => x.split("  # ")[0]).sort()).toEqual([`approve ${en}`, `approve ${plan}`, `left ${free}`, `stop ${ceiling}`].sort());
 		// all or nothing: the same block with one line naming a question that does not exist applies none of the four
 		const broken = block.replace(`stop ${ceiling}`, "stop q-nope");
-		await f.emit("before_agent_start", { prompt: broken, systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: broken, systemPrompt: [] }, ctx);
 		expect(notices.some((n) => n.startsWith("nothing applied"))).toBe(true);
 		expect(pendingItems(l)).toHaveLength(4);
 		// Jo pastes it back untouched as his turn: one transaction applies all four
@@ -266,7 +266,7 @@ describe("surface extension adapter", () => {
 		orchestratorSurface(f.pi, e);
 		const ctx = ctxOf();
 		notices.length = 0;
-		const batch = (await f.emit("before_agent_start", { prompt: "1 approve, 2 deny", systemPrompt: [] }, ctx)) as Started;
+		const batch = (await submitTyped(f, { prompt: "1 approve, 2 deny", systemPrompt: [] }, ctx)) as Started;
 		expect(notices).toEqual([`#1 → approved reserved request ${e1}`, `#2 → denied reserved request ${e2}`].map((n) => expect.stringContaining(n)));
 		const context = batch.messages[0]!.content;
 		expect(context).toContain("## Applied from the surface since your last turn");
@@ -284,7 +284,7 @@ describe("surface extension adapter", () => {
 		ledger.close();
 		notices.length = 0;
 		// one per line is a paste (item 48): the refusal names each line by number and text, then the one to fix
-		const refused = (await f.emit("before_agent_start", { prompt: "3 approve\n2 deny\n4 revise\n9 deny", systemPrompt: [] }, ctx)) as Started;
+		const refused = (await submitTyped(f, { prompt: "3 approve\n2 deny\n4 revise\n9 deny", systemPrompt: [] }, ctx)) as Started;
 		expect(notices).toEqual([
 			'line 1 "3 approve": ok, not applied',
 			`line 2 "2 deny": #2 (${e2}) is no longer waiting`,
@@ -295,26 +295,35 @@ describe("surface extension adapter", () => {
 		expect(refused.messages[0]!.content).toContain(`- line 2 "2 deny": #2 (${e2}) is no longer waiting`);
 		// the comma form on one line keeps item 1's per-piece lines
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: "3 approve, 9 deny", systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: "3 approve, 9 deny", systemPrompt: [] }, ctx);
 		expect(notices).toEqual(["#3 ok, not applied", "#9 is not on the needs-you list"]);
 		notices.length = 0;
-		const which = (await f.emit("before_agent_start", { prompt: "approve", systemPrompt: [] }, ctx)) as Started;
+		const which = (await submitTyped(f, { prompt: "approve", systemPrompt: [] }, ctx)) as Started;
 		expect(notices).toEqual([`which one? "approve" fits #3 (reserved ${e3}: tag the release), #4 (${q} on ${sl}) — answer with the number, e.g. "3 approve"`]);
 		expect(which.messages[0]!.content).toContain("which one?");
 		ledger = open(e);
 		expect(ledger.instructions(wl)).toHaveLength(2);
 		expect(ledger.question(q)!.state).toBe("open");
 		ledger.close();
-		// prose that starts with a number is not a batch and passes through untouched
-		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: "2 things to fix", systemPrompt: [] }, ctx);
-		expect(notices).toEqual([]);
-		// the numbers answer them: the question's answer goes through the launch trigger, the echo stays one line per answer
-		await f.emit("before_agent_start", { prompt: "3 approve, 4 revise", systemPrompt: [] }, ctx);
-		expect(notices).toEqual([expect.stringContaining(`#3 → approved reserved request ${e3}`), expect.stringContaining(`#4 → answered ${q} with "revise"`)]);
+		// Prose beginning with a number remains Jo's exact input, not a command batch.
+		await submitTyped(f, { prompt: "2 things to fix", systemPrompt: [] }, ctx);
 		ledger = open(e);
-		expect(ledger.instructions(wl).map((i) => i.kind)).toEqual(["instruction", "instruction", "instruction", "answer"]);
+		expect(ledger.instructions(STANDING_WORKLOAD_ID).map((i) => i.body)).toEqual(["2 things to fix"]);
+		expect(ledger.question(q)!.state).toBe("open");
+		expect(ledger.instructions(wl).map((i) => i.kind)).toEqual(["instruction", "instruction"]);
+		ledger.close();
+		// the numbers answer them: the question's answer goes through the launch trigger, the echo stays one line per answer
+		await submitTyped(f, { prompt: "3 approve, 4 revise", systemPrompt: [] }, ctx);
+		ledger = open(e);
+		expect(ledger.instructions(wl).map((i) => i.body)).toEqual([
+			`approve ${e1}`,
+			`deny ${e2}`,
+			`approve ${e3}`,
+			"revise",
+		]);
 		expect(ledger.question(q)!.state).toBe("answered");
+		const answer = ledger.instructions(wl).find((i) => i.kind === "answer" && i.question_id === q)!;
+		expect(ledger.question(q)!.resolved_by).toBe(answer.id);
 		ledger.close();
 	});
 
@@ -331,7 +340,7 @@ describe("surface extension adapter", () => {
 		const ctx = ctxOf();
 		// a bad second line: nothing applied, one verdict per command line by number and text, the instruction held
 		notices.length = 0;
-		const refused = (await f.emit("before_agent_start", { prompt: `production ${wl}\n9 deny\nRelaunch the classifier fix now.`, systemPrompt: [] }, ctx)) as Started;
+		const refused = (await submitTyped(f, { prompt: `production ${wl}\n9 deny\nRelaunch the classifier fix now.`, systemPrompt: [] }, ctx)) as Started;
 		expect(notices).toEqual([
 			`line 1 "production ${wl}": ok, not applied`,
 			'line 2 "9 deny": #9 is not on the needs-you list',
@@ -345,13 +354,13 @@ describe("surface extension adapter", () => {
 		ledger.close();
 		// an ambiguous line gets the "which one?" wording, with its line number and text
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `approve\nproduction ${wl}`, systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: `approve\nproduction ${wl}`, systemPrompt: [] }, ctx);
 		expect(notices[0]).toBe(`line 1 "approve": which one? "approve" fits #1 (reserved ${e1}: push main), #2 (reserved ${e2}: deploy) — answer with the number, e.g. "1 approve"`);
 		expect(notices.at(-1)).toBe("nothing applied: fix line 1 and paste all of it again");
 		// the good paste: a numbered batch line, a stakes word then an exact ceiling on the same workload, and two plain-words paragraphs as one instruction
 		notices.length = 0;
 		const text = ["1 approve, 2 deny", `production ${wl}`, `ceiling 120 ${wl}`, "Relaunch the classifier fix now.", "", "Use the same plan."].join("\n");
-		const applied = (await f.emit("before_agent_start", { prompt: text, systemPrompt: [] }, ctx)) as Started;
+		const applied = (await submitTyped(f, { prompt: text, systemPrompt: [] }, ctx)) as Started;
 		expect(notices).toEqual([
 			expect.stringContaining(`#1 → approved reserved request ${e1}`),
 			expect.stringContaining(`#2 → denied reserved request ${e2}`),
@@ -372,10 +381,13 @@ describe("surface extension adapter", () => {
 		expect(ledger.workload(wl)!.stakes).toBe("production");
 		expect(ceilingOf(ledger, wl)).toEqual({ usd: 120, wallMin: 720 });
 		ledger.close();
-		// a multi-line brief with no command line passes through untouched
-		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: "new workload, normal stakes:\nmove the header offset into a token\nthen drop the old class", systemPrompt: [] }, ctx);
-		expect(notices).toEqual([]);
+		// A typed multi-line brief remains exact Jo prose and does not alter command state.
+		await submitTyped(f, { prompt: "new workload, normal stakes:\nmove the header offset into a token\nthen drop the old class", systemPrompt: [] }, ctx);
+		ledger = open(e);
+		expect(ledger.instructions(STANDING_WORKLOAD_ID).map((i) => i.body)).toEqual(["new workload, normal stakes:\nmove the header offset into a token\nthen drop the old class"]);
+		expect(ledger.workload(wl)!.stakes).toBe("production");
+		expect(ledger.instructions(wl).map((i) => i.kind)).toEqual(["instruction", "instruction", "instruction", "instruction"]);
+		ledger.close();
 	});
 
 	test("a paste's command naming an id that does not resolve, or a row answered twice, applies nothing and launches nothing; two-word prose stays prose (Codex review of PR #30)", async () => {
@@ -398,52 +410,56 @@ describe("surface extension adapter", () => {
 		};
 		// Probe A `bad-id`: the stakes line is not applied, the typo is named, nothing is handed on
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `production ${wl}\napprove en-nope`, systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: `production ${wl}\napprove en-nope`, systemPrompt: [] }, ctx);
 		expect(notices).toEqual([`line 1 "production ${wl}": ok, not applied`, 'line 2 "approve en-nope": no entry en-nope on the needs-you list', "nothing applied: fix line 2 and paste all of it again"]);
 		unchanged();
 		// Probe A `answer-then-invalid`: the answer is not written and no launch runs
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `left ${q}\napprove en-nope`, systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: `left ${q}\napprove en-nope`, systemPrompt: [] }, ctx);
 		expect(notices).toEqual([`line 1 "left ${q}": ok, not applied`, 'line 2 "approve en-nope": no entry en-nope on the needs-you list', "nothing applied: fix line 2 and paste all of it again"]);
 		unchanged();
 		// Probe A `unknown-workload`: the named workload must be open; the sole workload in view is not taken instead
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `normal ${wl}\nproduction wl-nope`, systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: `normal ${wl}\nproduction wl-nope`, systemPrompt: [] }, ctx);
 		expect(notices).toEqual([`line 1 "normal ${wl}": ok, not applied`, 'line 2 "production wl-nope": wl-nope is not an open workload', "nothing applied: fix line 2 and paste all of it again"]);
 		unchanged();
 		// Codex round 2: a bare `wl-` is an id that does not resolve, not the sole workload; a bare `en-` is not prose: the answer is not written and nothing launches
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `left ${q}\nproduction wl-`, systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: `left ${q}\nproduction wl-`, systemPrompt: [] }, ctx);
 		expect(notices).toEqual([`line 1 "left ${q}": ok, not applied`, 'line 2 "production wl-": wl- is not an open workload', "nothing applied: fix line 2 and paste all of it again"]);
 		unchanged();
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `left ${q}\napprove en-`, systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: `left ${q}\napprove en-`, systemPrompt: [] }, ctx);
 		expect(notices).toEqual([`line 1 "left ${q}": ok, not applied`, 'line 2 "approve en-": no entry en- on the needs-you list', "nothing applied: fix line 2 and paste all of it again"]);
 		unchanged();
 		// S1: the same question answered on two lines, in two forms
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `1 left\nright ${q}`, systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: `1 left\nright ${q}`, systemPrompt: [] }, ctx);
 		expect(notices).toEqual([`line 1 "1 left": ok, not applied`, `line 2 "right ${q}": ${q} is already answered on line 1 (#1); once per row`, "nothing applied: fix line 2 and paste all of it again"]);
 		unchanged();
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `left ${q}\nright ${q}`, systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: `left ${q}\nright ${q}`, systemPrompt: [] }, ctx);
 		expect(notices).toEqual([`line 1 "left ${q}": ok, not applied`, `line 2 "right ${q}": ${q} is already answered on line 1; once per row`, "nothing applied: fix line 2 and paste all of it again"]);
 		unchanged();
 		// N1: a numbered batch one per line names its lines too
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: "1 left\n1 right", systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: "1 left\n1 right", systemPrompt: [] }, ctx);
 		expect(notices).toEqual(['line 1 "1 left": #1 appears more than once in this batch', 'line 2 "1 right": #1 appears more than once in this batch', "nothing applied: fix line 1 and paste all of it again"]);
 		unchanged();
-		// Probe B `prose-only`: an ordinary paragraph is prose, stakes words and mode words alike; nothing is applied and nothing is handed on
-		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: "The build is\nproduction ready", systemPrompt: [] }, ctx);
-		await f.emit("before_agent_start", { prompt: "Go on\nautonomous now", systemPrompt: [] }, ctx);
-		expect(notices).toEqual([]);
-		expect(f.entries.filter((x) => x.type === "surface-input")).toHaveLength(8);
+		// Ordinary paragraphs containing command words are recorded as Jo's exact prose, not commands.
+		await submitTyped(f, { prompt: "The build is\nproduction ready", systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: "Go on\nautonomous now", systemPrompt: [] }, ctx);
+		ledger = open(e);
+		expect(ledger.instructions(STANDING_WORKLOAD_ID).map((i) => i.body)).toEqual(["The build is\nproduction ready", "Go on\nautonomous now"]);
+		expect(ledger.question(q)!.state).toBe("open");
+		expect(ledger.workload(wl)).toMatchObject({ stakes: "normal", mode: "autonomous" });
+		expect(ledger.instructions(wl)).toEqual([]);
+		ledger.close();
+		expect(f.execs.calls).toEqual([]);
 		unchanged();
 		// Probe B `answer-with-prose`: the answer lands and launches once; the prose is handed on, not recorded by the surface
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `left ${q}\nUse the same plan.\nKeep the existing tests.`, systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: `left ${q}\nUse the same plan.\nKeep the existing tests.`, systemPrompt: [] }, ctx);
 		expect(notices).toEqual([expect.stringContaining(`answered ${q} with "left"`), 'lines 2–3 → an instruction for you, one row: "Use the same plan. Keep the existing tests."']);
 		expect(f.execs.calls).toHaveLength(1);
 		ledger = open(e);
@@ -467,7 +483,7 @@ describe("surface extension adapter", () => {
 		orchestratorSurface(f.pi, e);
 		const ctx = ctxOf();
 		notices.length = 0;
-		const refused = (await f.emit("before_agent_start", { prompt: `stop-reviews ${sl}\nextend ${q}`, systemPrompt: [] }, ctx)) as Started;
+		const refused = (await submitTyped(f, { prompt: `stop-reviews ${sl}\nextend ${q}`, systemPrompt: [] }, ctx)) as Started;
 		expect(notices).toEqual([
 			`line 1 "stop-reviews ${sl}": ok, not applied`,
 			expect.stringMatching(new RegExp(`^line 2 "extend ${q}": .*must name an open question`)),
@@ -497,7 +513,7 @@ describe("surface extension adapter", () => {
 		const ctx = ctxOf();
 		for (const word of ["production", "user-driven", "ceiling 80 4", "rounds 5", "stop-reviews"]) {
 			notices.length = 0;
-			await f.emit("before_agent_start", { prompt: word, systemPrompt: [] }, ctx);
+			await submitTyped(f, { prompt: word, systemPrompt: [] }, ctx);
 			expect(notices).toHaveLength(1);
 			const line = notices[0]!;
 			expect(line.startsWith(`which one? "${word}" fits ${a} (`)).toBe(true);
@@ -513,7 +529,7 @@ describe("surface extension adapter", () => {
 			ledger.close();
 		}
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `production ${a}`, systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: `production ${a}`, systemPrompt: [] }, ctx);
 		expect(notices).toEqual([expect.stringMatching(new RegExp(`^stakes on ${a} → production \\(instruction \\S+\\); ceiling `))]);
 		ledger = open(e);
 		expect(ledger.workload(a)!.stakes).toBe("production");
@@ -521,8 +537,8 @@ describe("surface extension adapter", () => {
 		ledger.close();
 		// `rounds <n> wl-…` is three words: the hook admits it (never as a batch); `stop-reviews wl-…` names the workload
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `rounds 5 ${b}`, systemPrompt: [] }, ctx);
-		await f.emit("before_agent_start", { prompt: `stop-reviews ${b}`, systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: `rounds 5 ${b}`, systemPrompt: [] }, ctx);
+		await submitTyped(f, { prompt: `stop-reviews ${b}`, systemPrompt: [] }, ctx);
 		expect(notices).toEqual([
 			expect.stringMatching(new RegExp(`^review round limit on ${b} → 5 failed rounds per review loop \\(instruction \\S+\\)$`)),
 			expect.stringMatching(new RegExp(`^stopped every review loop on ${b} \\(instruction \\S+\\); no review loop is open`)),
@@ -534,10 +550,15 @@ describe("surface extension adapter", () => {
 			`review-stop: ${b} by ${ledger.instructions(b)[1]!.id}`,
 		]);
 		ledger.close();
-		// four words is prose, not the command
-		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `rounds 5 ${b} please`, systemPrompt: [] }, ctx);
-		expect(notices).toEqual([]);
+		// Four words are exact prose, not the three-word command.
+		await submitTyped(f, { prompt: `rounds 5 ${b} please`, systemPrompt: [] }, ctx);
+		ledger = open(e);
+		expect(ledger.instructions(STANDING_WORKLOAD_ID).map((i) => i.body)).toEqual([`rounds 5 ${b} please`]);
+		expect(ledger.instructions(a).map((i) => i.body)).toEqual(["stakes: production"]);
+		expect(ledger.instructions(b).map((i) => i.body)).toEqual(["rounds: 5", `stop-reviews: ${b}`]);
+		expect(ledger.workload(a)!.stakes).toBe("production");
+		expect(ledger.workload(b)!.stakes).toBe("normal");
+		ledger.close();
 	});
 
 	test("identity, open (stakes inferred, decision log carried), schedule, close (decision log rendered)", async () => {
@@ -687,7 +708,7 @@ describe("cancel-slice at the surface (PLAN wl-mv5i3lulwwbbi8 D1)", () => {
 		seed.close();
 		orchestratorSurface(f.pi, e, {});
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `cancel-slice ${sl}`, systemPrompt: [] }, ctxOf());
+		await submitTyped(f, { prompt: `cancel-slice ${sl}`, systemPrompt: [] }, ctxOf());
 		const shown = notices.join("\n");
 		expect(shown).toContain(`cancelled slice ${sl} on ${wl}`);
 		expect(shown).toContain(`withdrew ${q}`);

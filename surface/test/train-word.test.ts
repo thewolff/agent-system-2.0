@@ -20,7 +20,7 @@ import { errorLines } from "../src/errors";
 import { type ClosePr, closeFreshness, makeRunId, runnerDiedRun, testRequestedBody, testRunBody } from "../src/test-run";
 import { sendNotice } from "../src/notice";
 import { ESCALATION_BY, LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { clock, ctxOf, fakePi, notices, tempLedger, tmp, workloadWithSlice } from "./helpers";
+import { clock, ctxOf, fakePi, notices, submitTyped, tempLedger, tmp, workloadWithSlice } from "./helpers";
 
 const LANE = "lane-train-1";
 const JO = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
@@ -573,7 +573,7 @@ describe("the surface routes launch the new train and a stopped train on Jo's ap
 		orchestratorSurface(f.pi, e, {});
 		notices.length = 0;
 		const cwd = tmp("train-cwd");
-		await f.emit("before_agent_start", { prompt: "train 101, #106", systemPrompt: [] }, ctxOf({ cwd }));
+		await submitTyped(f, { prompt: "train 101, #106", systemPrompt: [] }, ctxOf({ cwd }));
 		const l = open(e);
 		const [w] = l.inFlight().map((x) => x.workload).filter((x) => x.id !== STANDING_WORKLOAD_ID);
 		expect(w!.brief).toBe(trainBrief(w!.id, [101, 106]));
@@ -589,7 +589,7 @@ describe("the surface routes launch the new train and a stopped train on Jo's ap
 		const e = env();
 		orchestratorSurface(f.pi, e, {});
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: "train 139 140\nmerge them in that order", systemPrompt: [] }, ctxOf());
+		await submitTyped(f, { prompt: "train 139 140\nmerge them in that order", systemPrompt: [] }, ctxOf());
 		const l = open(e);
 		const [w] = l.inFlight().map((x) => x.workload).filter((x) => x.id !== STANDING_WORKLOAD_ID);
 		expect(trainPrs(l.entries(w!.id), l.instructions(w!.id))).toEqual([139, 140]);
@@ -611,7 +611,7 @@ describe("the surface routes launch the new train and a stopped train on Jo's ap
 		seed.releaseWorkload(wl, { by: LANE, holder: LANE });
 		seed.close();
 		orchestratorSurface(f.pi, e, {});
-		await f.emit("before_agent_start", { prompt: `train ${wl} 139`, systemPrompt: [] }, ctxOf());
+		await submitTyped(f, { prompt: `train ${wl} 139`, systemPrompt: [] }, ctxOf());
 		const l = open(e);
 		const requests = controlEntries(l.entries(wl)).filter((c) => c.prefix === "launch-requested");
 		expect(requests.map((r) => r.body)).toEqual([expect.stringMatching(/^launch-requested: by jo at \S+ \(train append\)$/)]);
