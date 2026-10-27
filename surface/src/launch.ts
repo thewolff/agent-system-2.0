@@ -1681,12 +1681,23 @@ export const TRAIN_LANDS_LINE =
 	`never merge it yourself and never hand it to Jo: a cross-lab review slice is required before the PR is done; once the PR is green at its head in a full suite (\`${LANE_FULL_TEST_TOOL}\`) and that review has passed, record done-because and release. The surface closes the workload and the merge train lands the PR.`;
 
 /**
- * Decision 11's completion policy: an autonomous normal-stakes lane on a repo the test runner serves, other than a merge
- * train or a fix workload, hands its green reviewed PR to the merge train (PLAN wl-mvbjiettjrfpxc D10, `TRAIN_LANDS_LINE`);
- * otherwise Jo integrates this machinery repo, and a product repo merges per SPEC-2.0.md § stakes.
+ * The production lane's merge line (PLAN wl-mvqwn80onq9hq8 D11): the train merges a green, reviewed production PR once the
+ * plan is approved, with no question to Jo; Jo's halt and the auto-start hold keep it off main while they stand.
+ */
+export const TRAIN_LANDS_PRODUCTION_LINE =
+	`${TRAIN_LANDS_LINE} At production stakes the merge train merges a green, reviewed PR whose plan is approved, with no question to Jo; while Jo's halt or the plan auto-start's hold stands, the train holds it.`;
+
+/**
+ * Decision 11's completion policy: an autonomous normal- or production-stakes lane on a repo the test runner serves, other than
+ * a merge train or a fix workload, hands its green reviewed PR to the merge train (PLAN wl-mvbjiettjrfpxc D10,
+ * `TRAIN_LANDS_LINE`; production since PLAN wl-mvqwn80onq9hq8 D11, `TRAIN_LANDS_PRODUCTION_LINE`), on this machinery repo too:
+ * the train branch is checked first. Otherwise Jo integrates this machinery repo, and a product repo merges per SPEC-2.0.md § stakes.
  */
 function mergeLine(p: PromptInput): string {
-	if (p.runnerServed === true && p.trainOrFix !== true && p.workload.mode === "autonomous" && p.workload.stakes === "normal") return TRAIN_LANDS_LINE;
+	if (p.runnerServed === true && p.trainOrFix !== true && p.workload.mode === "autonomous") {
+		if (p.workload.stakes === "normal") return TRAIN_LANDS_LINE;
+		if (p.workload.stakes === "production") return TRAIN_LANDS_PRODUCTION_LINE;
+	}
 	if (p.machinery) return "never merge on this repo: Jo integrates it. A merge-train lane merges other PRs only as its brief's self-merge step allows, never its own branch.";
 	if (p.workload.stakes === "production") return "the merge is Jo's: a judge slice, then Jo approves the merge.";
 	if (p.workload.stakes === "normal") return "merge proceeds on a judge slice's pass; tell Jo in one line after the merge.";

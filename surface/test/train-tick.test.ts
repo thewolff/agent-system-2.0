@@ -8,6 +8,7 @@
 // Temp ledgers, temp git checkouts with a fake GitHub origin, a fake gh, a fake launcher and a fake notification only
 // (surface/test/train-world.ts).
 import { describe, expect, test } from "bun:test";
+import { reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { type GhResult, tick } from "../scripts/train-tick";
 import { type Ceiling, ceilingBody, type Spend, spendBody } from "../src/ceiling";
@@ -18,7 +19,7 @@ import {
 	controlEntries, decideLaunch, laneExitBody, laneReadyBody, launchFailedBody, launchRequestedBody, planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody,
 } from "../src/launch";
 import {
-	actionable, fixBindings, mainRedNotices, protectionEpisodes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertBody, trainAlertMarker,
+	actionable, fixBindings, mainRedNotices, protectionEpisodes, prStakes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertBody, trainAlertMarker,
 	trainHeadWokenBody, trainHoldBody, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody,
 } from "../src/merge-train";
 import { trainMergedNoticeBody } from "../src/notice";
@@ -78,6 +79,28 @@ describe("settles and deliveries (D8, D10)", () => {
 		expect(fixes.map((f) => f.pr)).toEqual([101]);
 		expect(w.ledger.workload(fixes[0]!.workloadId)).toMatchObject({ status: "open", created_by: MERGE_TRAIN_BY });
 		expect(w.launches).toContain(fixes[0]!.workloadId);
+	});
+
+	test("PLAN wl-mvqwn80onq9hq8 D11: a production PR's fix workload opens at production, though prStakes reads the green, reviewed PR as normal", () => {
+		const w = world();
+		w.ledger.setStakes(w.owner, { by: SURFACE_BY, stakes: "production" });
+		for (const body of ["plan: first production", planApprovedBody("in-approve")]) w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.owner, kind: "assumption", body });
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "change", doneCondition: "tests pass", inputs: "src" });
+		w.ledger.recordEntry({ by: OWNER_LANE, workloadId: w.owner, sliceId: sl, kind: "assumption", body: reviewRoundBody({ slice: sl, round: 1, token: "dt-1", group: "dg-1", verdict: "accepted", findings: UNKNOWN }) });
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.owner, sliceId: sl, kind: "assumption", body: reviewLoopEndBody(sl, "accept") });
+		w.ledger.completeSlice(sl, { by: OWNER_LANE, artifact: "done" });
+		const view = { number: 101, headRefName: `wl/${w.owner}`, isCrossRepository: false, headRepository: { name: "product" }, headRepositoryOwner: { login: "thewolff" } };
+		expect(prStakes(view, REPO, w.ledger).stakes).toBe("normal");
+		w.task(101);
+		w.ledger.closeWorkload(w.owner, { by: SURFACE_BY });
+		w.run();
+		w.c.plusHours(2.1); // no push for 2 h: attempt 1 settles failed, and the ownerless task gets a fix workload
+		w.run();
+		w.task(101);
+		w.run();
+		const fixes = fixBindings(w.ledger);
+		expect(fixes.map((f) => f.pr)).toEqual([101]);
+		expect(w.ledger.workload(fixes[0]!.workloadId)).toMatchObject({ stakes: "production", created_by: MERGE_TRAIN_BY });
 	});
 
 	test("the 2 h rule reads GitHub's push activity on the head branch, and waits while that listing cannot be read (review gtb-r2 F2)", () => {
@@ -764,7 +787,7 @@ describe("auto-boarding, the live half (PLAN wl-mvbjiettjrfpxc D1, D3, D4)", () 
 		expect(w.boards()).toEqual([expect.objectContaining({ pr: 118, workload: wl, head: H2 })]);
 	});
 
-	test("R2: no board when the live half fails (a later commit touching code, a head behind G, base not main, a branch not wl/<W>, a fork) or the ledger half does (production); each leaves its reason", () => {
+	test("R2: no board when the live half fails (a later commit touching code, a head behind G, base not main, a branch not wl/<W>, a fork, a production PR with no approved plan); each leaves its reason", () => {
 		const w = boardWorld();
 		const code = w.landing(120);
 		w.g.prs.get(120)!.head = H1;
@@ -789,8 +812,25 @@ describe("auto-boarding, the live half (PLAN wl-mvbjiettjrfpxc D1, D3, D4)", () 
 		expect(skipsOf(base)).toEqual([`train-board-skip: workload ${base} pr 122 head ${H0} #122's base is release, not main`]);
 		expect(skipsOf(branch)).toEqual([`train-board-skip: workload ${branch} pr 123 head ${H0} #123's head branch feature/header is not wl/${branch}`]);
 		expect(skipsOf(fork)).toEqual([expect.stringMatching(new RegExp(`^train-board-skip: workload ${fork} pr 124 head ${H0} #124 is production: `))]);
-		expect(skipsOf(production)).toEqual([`train-board-skip: workload ${production} pr none head none stakes production`]);
-		expect(w.views(125)).toBe(0);
+		expect(skipsOf(production)).toEqual([
+			`train-board-skip: workload ${production} pr 125 head ${H0} #125 is production: ${production}'s stakes are production and it has no approved plan (no plan: approved entry)`,
+		]);
+		expect(w.views(125)).toBe(1);
+	});
+
+	test("R27 (PLAN wl-mvqwn80onq9hq8 D11): a green, reviewed production PR whose plan is approved boards and the train is launched; Jo's halt keeps it off", () => {
+		const w = boardWorld();
+		const plan = (approved: boolean) => [
+			{ by: SURFACE_BY, body: "plan: first production" },
+			...(approved ? [{ by: SURFACE_BY, body: planApprovedBody("in-approve") }] : []),
+		];
+		const prod = w.landing(130, { stakes: "production", entries: plan(true) });
+		const halted = w.landing(131, { stakes: "production", entries: [...plan(true), { by: SURFACE_BY, body: planHaltedBody("in-halt") }] });
+		w.run();
+		const b = w.boards();
+		expect(b).toEqual([expect.objectContaining({ pr: 130, workload: prod, head: H0 })]);
+		expect(w.launches).toEqual([b[0]!.train]);
+		expect(w.skips().filter((s) => s.includes(`workload ${halted} `))).toEqual([expect.stringMatching(/^train-board-skip: .* cancelled: its plan was never approved$/)]);
 	});
 
 	/** A boarding world with landing `pr` whose head `head` is one commit ahead of G, that commit's files `files` as GitHub lists them. */

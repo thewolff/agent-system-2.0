@@ -1162,8 +1162,8 @@ describe("end-ruling (PLAN wl-mvfkv7llkp7nk0 § 1, R1)", () => {
 	test("an unknown ruling id, or no id, is refused with nothing written", () => {
 		const { ledger } = tempLedger();
 		ensureStandingWorkload(ledger);
-		expect(interpret(ledger, "end-ruling nope")).toEqual({ kind: "refused", why: "nope is no standing ruling (kimi-out, flow-repair, merges, models, gates-stakes, train-signoff)" });
-		expect(interpret(ledger, "end-ruling")).toEqual({ kind: "refused", why: "end-ruling names one ruling: end-ruling <kimi-out | flow-repair | merges | models | gates-stakes | train-signoff>" });
+		expect(interpret(ledger, "end-ruling nope")).toEqual({ kind: "refused", why: "nope is no standing ruling (kimi-out, flow-repair, merges, models, gates-stakes, train-signoff, routine-calls, review-auto-extend)" });
+		expect(interpret(ledger, "end-ruling")).toEqual({ kind: "refused", why: "end-ruling names one ruling: end-ruling <kimi-out | flow-repair | merges | models | gates-stakes | train-signoff | routine-calls | review-auto-extend>" });
 		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
 	});
 });

@@ -84,7 +84,7 @@ import {
 	ownerDeliveries, PROTECTION_UNKNOWN_RAISE_MS, protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState, protectionPassOvers, prStakes, raiseLaunchLimit,
 	raiseTwiceFailed, settleTasks, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, trainActivityArgs,
 	trainAlertActions, trainAlertBody, trainAlertEndBody, trainAlertMarker, trainAutoboardBody, trainBoardSkipBody, trainCheckout, trainHeadWokenBody, TRAIN_LAUNCH_LIMIT,
-	trainLaunchFailures, trainPrs, trainPushesOf, trainRetries, trainSliceId, trainSlicePr, type TrainPush, type TrainTask, trainWakeBody, twiceFailed, unsettledTasks,
+	trainFixStakes, trainLaunchFailures, trainPrs, trainPushesOf, trainRetries, trainSliceId, trainSlicePr, type TrainPush, type TrainTask, trainWakeBody, twiceFailed, unsettledTasks,
 } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import { sendNotice, TRAIN_SIGNOFF_APPLIED_PREFIX, trainMergedEntryBody, trainMergedNoticeBody } from "../src/notice";
@@ -309,8 +309,8 @@ export function tick(d: TickDeps): string[] {
 				say(`${t.train}: #${t.pr} task ${t.id}: head on a fork, settled failed${q ? `, alert question ${q}` : ""}`);
 				continue;
 			}
-			const s = prStakes(view, facts.repo, ledger);
-			const r = openTrainFix(ledger, { task: t, repo: facts.repo, checkout: facts.checkout, view, stakes: s.stakes === "production" ? "production" : "normal" });
+			// The PR workload's own stakes (PLAN wl-mvqwn80onq9hq8 D11), not prStakes: a green, reviewed production PR reads normal there.
+			const r = openTrainFix(ledger, { task: t, repo: facts.repo, checkout: facts.checkout, view, stakes: trainFixStakes(view, facts.repo, ledger) });
 			say(`${t.train}: #${t.pr} task ${t.id}: fix workload ${r.workloadId} ${r.opened ? "opened" : "reused"}`);
 		} catch (err) {
 			trainError(t.train, err);

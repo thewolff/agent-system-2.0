@@ -1145,6 +1145,7 @@ surface/src/merge-train-resolve.ts	module	-
 surface/src/merge-train-stack.ts	module	-
 surface/scripts/merge-train.ts	module	-
 surface/test/merge-train-resolve.test.ts	test	-
+surface/test/merge-train.test.ts	test	-
 surface/test/train-word.test.ts	test	-
 surface/test/merge-train-stack.test.ts	test	-
 surface/test/train-return.test.ts	test	-

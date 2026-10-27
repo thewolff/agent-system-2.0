@@ -1,9 +1,10 @@
 // The merge-train workload kind (PLAN wl-mv8s8srodefytc rev 17.1 § 1, part 1): Jo's `train <N> [<N> …]` opens a
 // workload that takes green PRs one at a time, merges main in without rebasing, lets the resolver
 // (surface/scripts/merge-train.ts) fix the conflicts it knows, runs the full suite, then merges a normal-stakes PR
-// itself and asks Jo about a production-stakes one, unless Jo's ruling train-signoff decides that question (his train word
-// is the sign-off, PLAN wl-mvg8itbt0rz3ls D1-D3: `trainSignoff`), when it merges it as a normal one; a PR it cannot land
-// goes back to its owner as a task (part 2).
+// itself, and a production-stakes one too once its plan is approved and its newest review passed (PLAN wl-mvqwn80onq9hq8
+// D11, `prStakes`); any other production PR it asks Jo about, unless Jo's ruling train-signoff decides that question (his
+// train word is the sign-off, PLAN wl-mvg8itbt0rz3ls D1-D3: `trainSignoff`), when it merges it as a normal one; a PR it
+// cannot land goes back to its owner as a task (part 2).
 // This module holds the procedure text the lane reads as its brief (`trainBrief`), a PR's stakes (`prStakes`, D1; it
 // reads the ledger and the `repo:` checkout's origin), the check on main's protection (`mainProtectionGap`, D2), the
 // bodies of Jo's instruction and the surface's `train:` entry, the train's PR order (`trainPrs`), the slice id rule
@@ -178,7 +179,8 @@ export interface StakesView {
 
 /**
  * A PR's stakes on a merge train (D1): `normal` merges itself, `production` asks Jo, `hold` neither merges nor asks until
- * `until` (an ISO time, or `jo` for no end while Jo has not acted; PLAN wl-mvfkv7llkp7nk0 § 3); `reason` says why.
+ * `until` (an ISO time, or `jo` for no end while Jo has not acted; PLAN wl-mvfkv7llkp7nk0 § 3); `reason` says why. A
+ * production workload's PR whose plan is approved and whose newest review passed is `normal` (PLAN wl-mvqwn80onq9hq8 D11).
  */
 export type PrStakes = { stakes: "normal" | "production"; reason: string } | { stakes: "hold"; reason: string; until: string };
 
@@ -222,17 +224,50 @@ function branchWorkload(view: StakesView, trainRepo: string, ledger: Pick<Ledger
  * PR `view`'s stakes on the train whose repository is `trainRepo` (`owner/repo`; D1). Production unless all hold: the PR
  * is no fork (`isCrossRepository` false), its head repository is `trainRepo`, its head branch is `wl/<id>`, `<id>` is a
  * ledger workload whose `repo:` entry (the surface's, read as `controlEntries` reads it) is a checkout whose origin is
- * `trainRepo`, and that workload's stakes are normal. `owner/repo` compares without case, as GitHub does (`servedRepo`).
- * Such a PR is then held (PLAN wl-mvfkv7llkp7nk0 § 3) while its workload's newest valid `plan:` entry is Jo's `halted`
- * (until `jo`, no end), or the auto-start's `approved auto` (`planHold`), and normal otherwise.
+ * `trainRepo`, and that workload's stakes are normal or production. `owner/repo` compares without case, as GitHub does
+ * (`servedRepo`). Such a PR is then held (PLAN wl-mvfkv7llkp7nk0 § 3) while its workload's newest valid `plan:` entry is
+ * Jo's `halted` (until `jo`, no end), or the auto-start's `approved auto` (`planHold`). Past the hold a normal workload's PR
+ * is normal; a production workload's PR is normal too (PLAN wl-mvqwn80onq9hq8 D11: the train merges a green, reviewed
+ * production PR) when its plan is approved (`productionPlanApproved`) and its newest review passed (`reviewSettledPassed`),
+ * and production, Jo's question, otherwise.
  */
 export function prStakes(view: StakesView, trainRepo: string, ledger: Ledger): PrStakes {
 	const b = branchWorkload(view, trainRepo, ledger);
 	if (!b.ok) return { stakes: "production", reason: b.reason };
-	if (b.w.stakes !== "normal") return { stakes: "production", reason: `${b.id}'s stakes are ${b.w.stakes}` };
+	if (b.w.stakes !== "normal" && b.w.stakes !== "production") return { stakes: "production", reason: `${b.id}'s stakes are ${b.w.stakes}` };
 	const hold = planHold(ledger, b.id);
 	if (hold !== null) return { stakes: "hold", ...hold };
-	return { stakes: "normal", reason: `${b.id} on ${trainRepo}, stakes normal` };
+	if (b.w.stakes === "normal") return { stakes: "normal", reason: `${b.id} on ${trainRepo}, stakes normal` };
+	const plan = productionPlanApproved(ledger, b.id, b.w);
+	if (!plan.ok) return { stakes: "production", reason: `${b.id}'s stakes are production and ${plan.reason}` };
+	const review = reviewSettledPassed(ledger, b.id);
+	if (!review.ok) return { stakes: "production", reason: `${b.id}'s stakes are production and ${review.reason}` };
+	return { stakes: "normal", reason: `${b.id} on ${trainRepo}, stakes production, plan approved and review passed` };
+}
+
+/**
+ * PLAN wl-mvqwn80onq9hq8 D11: a production workload's plan is approved when a valid `plan: approved …` entry (Jo's, or the
+ * auto-start's `approved auto`, whose hold `planHold` reads) stands and no `plan: first` or Jo's `plan: halted` came after it
+ * (`planFirst`). A workload with no `plan:` line at all (stakes raised to production after it opened, say) has no approved
+ * plan, so its PR stays Jo's question.
+ */
+function productionPlanApproved(ledger: Ledger, id: string, w: WorkloadStatusRow): { ok: true } | { ok: false; reason: string } {
+	const entries = ledger.entries(id);
+	const control = controlEntries(entries, holdersOf(entries, w.holder, ledger.holders(id)));
+	const pending = planFirst(control);
+	if (pending !== null) return { ok: false, reason: `its plan is not approved (plan: first ${pending.trigger})` };
+	if (!control.some((c) => c.prefix === "plan" && /^approved\b/.test(c.rest))) return { ok: false, reason: "it has no approved plan (no plan: approved entry)" };
+	return { ok: true };
+}
+
+/**
+ * The stakes a train-fix workload for PR `view` opens at (PLAN wl-mvqwn80onq9hq8 D11): normal only when the PR's own workload
+ * (`branchWorkload`, D1's lookup) is at normal stakes; production for a production workload, whatever `prStakes` reads now
+ * (a green, reviewed production PR reads `normal` there), and for a PR with no such workload, as before.
+ */
+export function trainFixStakes(view: StakesView, trainRepo: string, ledger: Ledger): "normal" | "production" {
+	const b = branchWorkload(view, trainRepo, ledger);
+	return b.ok && b.w.stakes === "normal" ? "normal" : "production";
 }
 
 /**
@@ -419,9 +454,10 @@ export function trainBrief(wl: string, prs: readonly number[], source: TrainSour
 			`leave its slices open and ${LANE_RECORD_ENTRY_TOOL} \`train-error: pr <n> live lane <id>\`; the tick retries ` +
 			`it, and that later pass tests it on its open \`${full}\`. Then the next PR. Stakes: ` +
 			`\`${RESOLVE_COMMAND} stakes --hold-ok --repo <owner/repo of this workload's origin> --pr <n>\` prints \`normal\` (a same-repo \`wl/<id>\` ` +
-			`branch whose workload is on this repository at normal stakes, and main's protection verified), \`${HOLD_PREFIX} (<gap>)\` ` +
-			"(the PR's own stakes are normal, but main's protection is not verified), `hold: <reason> until <time|jo>` (a normal " +
-			"workload whose plan started without Jo's approve, held until <time>, or one Jo halted or has not answered yet, held until " +
+			"branch whose workload is on this repository at normal stakes, or at production stakes with its plan approved and its newest " +
+			`review passed, and main's protection verified), \`${HOLD_PREFIX} (<gap>)\` ` +
+			"(the PR's own stakes are normal, but main's protection is not verified), `hold: <reason> until <time|jo>` (a normal or " +
+			"production workload whose plan started without Jo's approve, held until <time>, or one Jo halted or has not answered yet, held until " +
 			"`jo`) or `production: <reason>` (anything else); exit 2 (usage or a gh failure): run it once more. On " +
 			`\`${HOLD_PREFIX} (<gap>)\`, or on a second exit 2: ` +
 			`${LANE_RECORD_ENTRY_TOOL} \`train-error: pr <n> protection <gap>\` (or \`train-error: pr <n> stakes <the second run's message>\`) and pass the PR ` +
@@ -1776,11 +1812,13 @@ function reviewPassed(ledger: Ledger, wl: string, entries: readonly EntryRow[], 
 }
 
 /**
- * D1's ledger half for workload `wl`: ready when W is closed (within AUTOBOARD_WINDOW_MS), autonomous, at normal stakes, neither
+ * D1's ledger half for workload `wl`: ready when W is closed (within AUTOBOARD_WINDOW_MS), autonomous, at normal or production
+ * stakes (production since PLAN wl-mvqwn80onq9hq8 D11; throwaway never boards), neither
  * the standing workload nor a merge train nor a fix workload (`isTrainOrFix`), not superseded (`supersededBy`) and not cancelled
  * (a `plan: first` never approved), on a repository the test runner serves; its holder's `done-because:` stands (`doneBecause`)
  * and is newer than the tick's `train-autoboard:` cutover; the newest full-suite run (`testRuns`) names PR n and is green at sha G;
- * and the review rule holds (`reviewPassed`). Otherwise the first failing rule, as a reason. The tick adds the live half (gh).
+ * and the review rule holds (`reviewPassed`). Otherwise the first failing rule, as a reason. The tick adds the live half (gh),
+ * where `prStakes` keeps Jo's halt and the auto-start hold, and a production PR's plan and review rule, from boarding.
  */
 export function landingReady(ledger: Ledger, wl: string, ctx: LandingContext): Landing {
 	let pr: number | null = null;
@@ -1791,7 +1829,7 @@ export function landingReady(ledger: Ledger, wl: string, ctx: LandingContext): L
 	if (wl === STANDING_WORKLOAD_ID) return no("the standing workload");
 	if (w.status !== "closed" || w.closed_at === null) return no("the workload is open");
 	if (w.mode !== "autonomous") return no(`the workload is ${w.mode}`);
-	if (w.stakes !== "normal") return no(`stakes ${w.stakes}`);
+	if (w.stakes !== "normal" && w.stakes !== "production") return no(`stakes ${w.stakes}`);
 	const entries = ledger.entries(wl);
 	const instructions = ledger.instructions(wl);
 	const runs = testRuns(entries);

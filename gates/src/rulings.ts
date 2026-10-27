@@ -273,10 +273,12 @@ export const STANDING_RULINGS: readonly Ruling[] = [
 		id: "merges",
 		sources: ["in-mv91wdhs446ark"],
 		kinds: ["merge"],
-		scope: (_q, _k, f) => f.asker === "lane" && f.stakes === "normal" && f.train === false,
+		// PLAN wl-mvqwn80onq9hq8 D11: no stakes scope. A production lane's green, reviewed PR goes to the train too, which merges it
+		// once its plan is approved and its newest review passed (surface/src/merge-train.ts `prStakes`) and holds it on Jo's halt.
+		scope: (_q, _k, f) => f.asker === "lane" && f.train === false,
 		answer: () => "train",
 		action: () => "send lane_message that PR #N is green at <sha> and ready for the merge train, then release (lane_release)",
-		exceptions: "Production-stakes workloads and merge-train workloads ask.",
+		exceptions: "Merge-train workloads ask.",
 		ends: { at: null, event: "Jo's word" },
 	},
 	{

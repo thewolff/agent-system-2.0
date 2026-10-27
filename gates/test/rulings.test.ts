@@ -104,14 +104,24 @@ describe("R3: flow-repair, merges, models, gates-stakes, each in its scope until
 		expect(check(["open", "later"], { asker: "orchestrator" }, { ended: ["flow-repair"] })).toBeNull();
 	});
 
-	test("merges decides a lane's merge question on a normal-stakes workload that is no merge train, and nothing else", () => {
+	test("merges decides a lane's merge question on a workload that is no merge train, and nothing else", () => {
 		const d = check(["merge", "wait"], lane());
 		expect(d).toMatchObject({ ruling: "merges", answer: "train" });
 		expect(d!.action).toContain("merge train");
-		expect(check(["merge", "wait"], lane({ stakes: "production" }))).toBeNull();
 		expect(check(["merge", "wait"], lane({ train: true }))).toBeNull();
 		expect(check(["merge", "wait"], { asker: "orchestrator" })).toBeNull();
 		expect(check(["merge", "wait"], lane(), { ended: ["merges"] })).toBeNull();
+	});
+
+	test("R27 (PLAN wl-mvqwn80onq9hq8 D11): merges drops its normal-stakes scope; a production lane's merge question goes to the train with no question to Jo", () => {
+		const d = check(["merge", "wait"], lane({ stakes: "production" }));
+		expect(d).toMatchObject({ ruling: "merges", answer: "train" });
+		expect(d!.action).toContain("ready for the merge train");
+		expect(STANDING_RULINGS.find((r) => r.id === "merges")!.exceptions).toBe("Merge-train workloads ask.");
+		// a production merge train still asks: merges never covers a train, and train-signoff needs its fact
+		expect(check(["merge", "wait"], lane({ stakes: "production", train: true }))).toBeNull();
+		// the train-signoff ruling stays for a production question raised before this landed
+		expect(STANDING_RULINGS.some((r) => r.id === "train-signoff")).toBe(true);
 	});
 
 	test("models: a lane-model question takes claude-opus-5-5 when offered and no provider refusal is cited", () => {
@@ -204,9 +214,9 @@ describe("train-signoff (PLAN wl-mvg8itbt0rz3ls D1; R3, R4): Jo's train word on 
 		expect(check(MERGE, trainLane())).toMatchObject({ ruling: "train-signoff", answer: "merge" });
 		expect(check(MERGE, trainLane({ trainSignoff: { ok: false, reason: "no green at its head" } }))).toBeNull();
 		expect(check(MERGE, trainLane({ trainSignoff: undefined }))).toBeNull();
-		// no train: never train-signoff (a normal-stakes lane's merge question is the merges ruling's)
+		// no train: never train-signoff (a lane's merge question, production included since D11, is the merges ruling's)
 		expect(check(MERGE, trainLane({ train: false }))?.ruling).toBe("merges");
-		expect(check(MERGE, trainLane({ train: false, stakes: "production" }))).toBeNull();
+		expect(check(MERGE, trainLane({ train: false, stakes: "production" }))?.ruling).toBe("merges");
 		expect(check(MERGE, trainLane({ train: undefined, stakes: "production" }))).toBeNull();
 		for (const asker of ["orchestrator", "classifier", "train"] as const) expect(check(MERGE, { asker, train: true, trainSignoff: OK })).toBeNull();
 		// a train's other questions are never merge questions

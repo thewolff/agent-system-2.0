@@ -12,7 +12,7 @@ import {
 	laneExitBody, laneReadyBody, launchable, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, launchRequestedBody, maxTimeMs,
 	PLAN_FILE_MAX_BYTES, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_SHAPE, planAutoApprovedBody, planFirst, planFirstBody, planHaltedBody, planQuestionProblem, prBindingInstructionBody,
 	PRIORITY_REASON_PREFIX, priorityPausedOf, priorityPausingOf, requirementsProblem, reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
-	testPrBody, testPrInstructionBody, type Resolution, resumePlan, resumeSession, TRAIN_LANDS_LINE, verdictOf, waivedPrs, waivePrBody, waivePrInstructionBody,
+	testPrBody, testPrInstructionBody, type Resolution, resumePlan, resumeSession, TRAIN_LANDS_LINE, TRAIN_LANDS_PRODUCTION_LINE, verdictOf, waivedPrs, waivePrBody, waivePrInstructionBody,
 	withdrawInstructionBody, withdrawnBody, withdrawnBy,
 } from "../src/launch";
 import { consumedByReady, TRAIN_LAUNCH_LIMIT, TRAIN_LAUNCH_OPTIONS, trainLaunchFailures, type TrainLaunchRows } from "../src/merge-train";
@@ -431,16 +431,41 @@ describe("first prompt merge line (decision 11, Codex review S7)", () => {
 			expect(served).not.toContain("tell Jo");
 			for (const s of ["cross-lab review", "green at its head", "record done-because and release", "the merge train lands the PR"]) expect(served).toContain(s);
 		}
-		// everyone else keeps the current text: a repo the runner does not serve, a train or fix lane, other stakes, a user-driven lane
+		// everyone else keeps the current text: a repo the runner does not serve, a train or fix lane, throwaway stakes, a user-driven lane
 		expect(line(lane({}, false, false))).toContain("never merge on this repo: Jo integrates it.");
 		expect(line(lane({}, false, false, false))).toContain("merge proceeds on a judge slice's pass");
 		expect(line(lane({}, true, true))).toContain("never merge on this repo: Jo integrates it.");
 		expect(line(lane({}, true, true, false))).toContain("merge proceeds on a judge slice's pass");
-		expect(line(lane({ stakes: "production" }, true, false, false))).toContain("the merge is Jo's");
+		expect(line(lane({ stakes: "production" }, false, false, false))).toContain("the merge is Jo's");
 		expect(line(lane({ stakes: "throwaway" }, true, false, false))).toContain("merge when green");
 		expect(line(lane({ mode: "user-driven" }, true, false))).toContain("never merge on this repo: Jo integrates it.");
-		for (const text of [lane({}, false, false), lane({}, true, true), lane({ stakes: "production" }, true, false), lane({ mode: "user-driven" }, true, false)]) {
+		for (const text of [lane({}, false, false), lane({}, true, true), lane({ stakes: "throwaway" }, true, false), lane({ mode: "user-driven" }, true, false)]) {
 			expect(line(text)).not.toContain(TRAIN_LANDS_LINE);
+		}
+	});
+
+	test("R27 (PLAN wl-mvqwn80onq9hq8 D11): an autonomous, runner-served, production machinery lane is told the train merges its green, reviewed PR, never that Jo integrates it", () => {
+		const lane = (over: Partial<WorkloadRow>, runnerServed: boolean, trainOrFix: boolean, machinery = true) => firstPrompt({
+			workload: workload({ stakes: "production", mode: "autonomous", ...over }), laneId: "lane-m-1", repo: "/r", worktree: "/r-lanes/wl-m", branch: "wl/wl-m", done: "it works",
+			planFirst: null, decisionLog: "", facts: "", resolved: [], instructions: [], machinery, tools: ["lane_release"], runnerServed, trainOrFix,
+		});
+		const line = (text: string) => text.split("\n").find((l) => l.startsWith("worktree: "))!;
+		for (const machinery of [true, false]) {
+			const served = line(lane({}, true, false, machinery));
+			expect(served).toEndWith(TRAIN_LANDS_PRODUCTION_LINE);
+			expect(served).not.toContain("Jo integrates");
+			expect(served).not.toContain("the merge is Jo's");
+			for (const s of ["cross-lab review", "record done-because and release", "the merge train merges a green, reviewed PR", "with no question to Jo", "Jo's halt"]) {
+				expect(served).toContain(s);
+			}
+		}
+		// the train branch is checked before the machinery branch only for a served, autonomous, non-train production lane
+		expect(line(lane({}, false, false))).toContain("never merge on this repo: Jo integrates it.");
+		expect(line(lane({}, true, true))).toContain("never merge on this repo: Jo integrates it.");
+		expect(line(lane({ mode: "user-driven" }, true, false))).toContain("never merge on this repo: Jo integrates it.");
+		expect(line(lane({}, true, true, false))).toContain("the merge is Jo's");
+		for (const text of [lane({}, false, false), lane({}, true, true), lane({ mode: "user-driven" }, true, false)]) {
+			expect(line(text)).not.toContain(TRAIN_LANDS_PRODUCTION_LINE);
 		}
 	});
 });
