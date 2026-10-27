@@ -57,6 +57,8 @@
 // command frame received, in arrival order (a test asserts `set_model` and its `get_state` came before `prompt`).
 // A new session file opens as OMP's does: a `title` line, then `{"type":"session","id":"<uuid>",…}` (the
 // header surface/src/ctx-index.ts reads), and get_state's sessionId is that id; a resumed file keeps its own header.
+// Env knobs beside the script: FAKE_OMP_START_DELAY_MS (ms) and FAKE_OMP_READY_AT_MS (epoch ms) delay the `ready` frame,
+// a slow omp start (the runner's startup phase, PLAN wl-mvqu69tjvpy96o § 2 sl-flaky-ready).
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
@@ -168,6 +170,20 @@ const shutdown = async (): Promise<void> => {
 	process.exit(0);
 };
 
+// A slow start before the `ready` frame (PLAN wl-mvqu69tjvpy96o § 2 sl-flaky-ready): the startup phase the runner bounds by
+// the reservation's lease expiry, not by its claim window. FAKE_OMP_START_DELAY_MS waits that long; FAKE_OMP_READY_AT_MS waits
+// until that epoch ms (a test that places `ready` against the reservation's expiry). Get_state and every other frame wait too.
+const envMs = (name: string): number | null => {
+	const raw = process.env[name];
+	if (raw === undefined || raw === "") return null;
+	const n = Number(raw);
+	if (!Number.isFinite(n) || n < 0) throw new Error(`fake-omp: ${name}=${JSON.stringify(raw)} is not a non-negative number of ms`);
+	return n;
+};
+const startDelayMs = envMs("FAKE_OMP_START_DELAY_MS");
+if (startDelayMs !== null) await Bun.sleep(startDelayMs);
+const readyAtMs = envMs("FAKE_OMP_READY_AT_MS");
+if (readyAtMs !== null && readyAtMs > Date.now()) await Bun.sleep(readyAtMs - Date.now());
 emit({ type: "ready", protocolVersion: 1, fake: true });
 if (script.claim !== false) await f.emit("session_start", { type: "session_start" }, ctx);
 

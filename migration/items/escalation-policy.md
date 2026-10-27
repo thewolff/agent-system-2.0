@@ -29,8 +29,12 @@ The train tick needs no reinstall: it runs `surface/scripts/train-tick.ts` from 
 
 ## PR 267 train repair
 
-The runner's claim/model readiness window and runtime deadline start at the child spawn,
-not before repository/profile preparation. Preparation may block on git before OMP exists;
+The runner's readiness has two phases, both counted from the child spawn and not before
+repository/profile preparation: startup, from the spawn to OMP's `ready` frame, bounded by the
+reservation's lease expiry (`workloads.holder_lease_until`), and claim, from the `ready` frame
+for `READY_MS`, cut at that expiry. A stall exits as `never-ready (startup)` or
+`never-ready (claim)`; a missing or unreadable expiry is refused before any OMP spawns, never
+defaulted. Preparation may block on git before OMP exists;
 it must not consume the child's readiness allowance. Ceiling thresholds and the pre-prompt
 ceiling check are unchanged. `surface/test/lane-model-script.test.ts`, under
 `T5c: lane-ready: only just before the first prompt`, covers delayed preparation followed by
