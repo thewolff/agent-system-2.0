@@ -1,0 +1,60 @@
+# THROWAWAY PROBE (plumb/linux-probe): runs as2's full test suite on ubuntu-latest to measure what
+# breaks without macOS. Never merge. Reversal:
+#   git push origin --delete plumb/linux-probe && git -C /Users/jowolff/code/agent-system-2.0 worktree remove .tmp/linux-probe-wt
+name: linux-probe
+on:
+  push:
+    branches: [plumb/linux-probe]
+permissions:
+  contents: read
+jobs:
+  full-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Environment facts
+        run: |
+          uname -a; nproc; bun --version; git --version; which git
+      # The runner's child env (surface/src/test-run.ts childEnv): an emptied env plus PATH/LANG/USER/LOGNAME/SHELL/TERM,
+      # a throwaway HOME, TMPDIR, XDG dirs, bun cache, ledger path, a git shim first on PATH and a user-only gitconfig.
+      # The repo is a detached checkout with no origin, as test-exec `prepare` leaves it. No _as2test sandbox wrapper.
+      - name: Prepare runner-like child layout
+        run: |
+          W="$RUNNER_TEMP/as2work"
+          mkdir -p "$W/home/tmp" "$W/home/.config" "$W/home/.cache" "$W/home/.local/share" "$W/home/.bun/install/cache" "$W/home/.agent-system-2" "$W/shim" "$W/out"
+          printf '[user]\n\tname = as2 test runner\n\temail = as2-test-runner@localhost\n' > "$W/home/.gitconfig"
+          REAL_GIT="$(command -v git)"
+          printf '#!/bin/sh\nGIT_CONFIG_NOSYSTEM=1\nGIT_TERMINAL_PROMPT=0\nGIT_ASKPASS=/usr/bin/false\nexport GIT_CONFIG_NOSYSTEM GIT_TERMINAL_PROMPT GIT_ASKPASS\nexec %s -c credential.helper= "$@"\n' "'$REAL_GIT'" > "$W/shim/git"
+          chmod 755 "$W/shim/git"
+          git checkout --quiet --detach HEAD
+          git remote remove origin
+          echo "W=$W" >> "$GITHUB_ENV"
+      - name: Full part (bun test --parallel=6, as profile testRunner.fullWorkers)
+        id: full
+        continue-on-error: true
+        run: |
+          start=$(date +%s)
+          set +e
+          env -i PATH="$W/shim:$PATH" LANG="${LANG:-C.UTF-8}" USER="$USER" LOGNAME="${LOGNAME:-$USER}" SHELL="${SHELL:-/bin/bash}" TERM="${TERM:-dumb}" \
+            HOME="$W/home" TMPDIR="$W/home/tmp" XDG_CONFIG_HOME="$W/home/.config" XDG_CACHE_HOME="$W/home/.cache" XDG_DATA_HOME="$W/home/.local/share" \
+            BUN_INSTALL_CACHE_DIR="$W/home/.bun/install/cache" AGENT_SYSTEM_LEDGER_DB="$W/home/.agent-system-2/ledger.db" \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$W/home/.gitconfig" GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false \
+            bun test --reporter=junit --reporter-outfile="$W/out/full.xml" --parallel=6 > "$W/out/full.log" 2>&1
+          code=$?
+          end=$(date +%s)
+          echo "full part exit $code, wall $((end-start)) s" | tee "$W/out/full.summary"
+          tail -n 40 "$W/out/full.log"
+          exit $code
+      - name: Upload raw output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-probe-output
+          path: ${{ runner.temp }}/as2work/out
+          if-no-files-found: warn
