@@ -88,9 +88,16 @@ export interface TestRunnerConfig {
 	queueMaxMin: number;
 	/** Workers for the PR's full part (`bun test --parallel=<n>` when over 1, written into caps.json); base runs are single files. */
 	fullWorkers: number;
+	/**
+	 * The stuck-worker detector's mode (PLAN wl-mvq8x4pkjmx69s D4), written into caps.json beside `fullWorkers`: `shadow` (the
+	 * default) logs a match and never stops a part; `enforce` stops the part and arms the runner's backstop.
+	 */
+	stuckStop: StuckStop;
 }
+/** The detector's modes (`testRunner.stuckStop`). */
+export type StuckStop = "shadow" | "enforce";
 /** The plan's defaults (§ 2.2 step 4, § 2.3 steps 1 and 3), used for a key the block leaves out. */
-export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 1440, fullWorkers: 1 };
+export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 1440, fullWorkers: 1, stuckStop: "shadow" };
 
 /**
  * The `testRunner:` block of a parsed profile config (`Bun.YAML.parse` of profile/config.yml). No
@@ -124,6 +131,10 @@ export function testRunnerConfig(doc: unknown): { ok: true; config: TestRunnerCo
 		const v = b.fullWorkers;
 		if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 1) return { ok: false, error: "testRunner.fullWorkers is not an integer of 1 or more" };
 		out.fullWorkers = v;
+	}
+	if (b.stuckStop !== undefined) {
+		if (b.stuckStop !== "shadow" && b.stuckStop !== "enforce") return { ok: false, error: "testRunner.stuckStop is not shadow or enforce" };
+		out.stuckStop = b.stuckStop;
 	}
 	return { ok: true, config: out };
 }
@@ -1213,6 +1224,86 @@ export function topByCpu(ps: string, rows: number = LOAD_SNAPSHOT_ROWS): string[
 	return [lines[0]!, ...body];
 }
 
+// ---- the stuck-worker detector's facts (PLAN wl-mvq8x4pkjmx69s D4) ---------------------------------------
+
+/** One detector line of a part's stdout (the executor's `stuck-signature`, `stuck-cleared` and `stuck-stop`), keyed by worker and zombie. */
+const STUCK_LINE_RE = /^(stuck-signature|stuck-cleared|stuck-stop) (\S+) part \S+ worker (\d+) zombie (\d+)(?: |$)/;
+const STUCK_STOP_RE = /^stuck-stop \S+ part \S+ worker (\d+) zombie (\d+)(?: |$)/m;
+
+/**
+ * The stuck fact of a wrapper call (PLAN wl-mvq8x4pkjmx69s D4): it exited WRAPPER_EXIT.stuck, or its stdout has a `stuck-stop`
+ * line, however the call ended (a signal, another exit, the backstop's abandonment, an early refusal), as `callTimedOut`.
+ */
+export function callStuck(r: { code: number | null; out: string }): boolean {
+	return r.code === WRAPPER_EXIT.stuck || STUCK_STOP_RE.test(r.out);
+}
+
+/**
+ * A stuck part's error, always starting `stuck:`: the executor's own `stuck: …` stderr line when it wrote one, else one built from
+ * its stop line. A call the runner's backstop abandoned after the stop line adds `executor did not finish the stop`.
+ */
+export function stuckReason(r: { code: number | null; out: string; err: string; abandoned: boolean }): string {
+	const own = [...r.err.matchAll(/^stuck: .+$/gm)].at(-1)?.[0] ?? null;
+	const stop = STUCK_STOP_RE.exec(r.out);
+	const base = own ?? (stop ? `stuck: worker ${stop[1]} spun in Bun.spawnSync with unreaped child ${stop[2]}` : `stuck: the executor exited ${r.code} with no stop line`);
+	return r.abandoned ? `${base}; executor did not finish the stop` : base;
+}
+
+/** The executor-stalled reason (D4): the backstop fired on a signature with no `stuck-stop` line, so the worker was a candidate only. */
+export function executorStalledReason(worker: number): string {
+	return `executor stalled during stuck detection; worker ${worker} was a candidate, not confirmed`;
+}
+
+/** An open enforce signature: its worker, zombie and the time the backstop abandons the call over it. */
+export interface BackstopSignature {
+	worker: number;
+	zombie: number;
+	deadline: number;
+}
+
+/**
+ * The runner's backstop over one enforce part's stdout (D4). Each `stuck-signature` line, keyed by worker and zombie, opens a
+ * deadline at the line's own time plus `backstopMs`; a `stuck-cleared` line closes only its own key's deadline, and only while no
+ * `stuck-stop` line has been seen; from the first `stuck-stop` line on the deadline is terminal (never disarmed or extended), and a
+ * stop line whose key is not open opens it at its own time. The call's deadline is the earliest open one. A line whose time does
+ * not parse counts from when it was read. Pure: the caller reads the file and the clock.
+ */
+export class StuckWatch {
+	private consumed = 0;
+	private readonly open = new Map<string, BackstopSignature>();
+	/** A `stuck-stop` line was read: the part is stuck, and the deadline is terminal. */
+	stopSeen = false;
+
+	constructor(readonly backstopMs: number) {}
+
+	/** Read `text`, the whole stdout so far: each complete line not read before, in order. */
+	feed(text: string, nowMs: number): void {
+		const end = text.lastIndexOf("\n") + 1;
+		if (end <= this.consumed) return;
+		for (const line of text.slice(this.consumed, end).split("\n")) {
+			const m = STUCK_LINE_RE.exec(line);
+			if (!m) continue;
+			const [, kind, iso, worker, zombie] = m as unknown as [string, string, string, string, string];
+			const key = `${worker} ${zombie}`;
+			if (kind === "stuck-cleared") {
+				if (!this.stopSeen) this.open.delete(key);
+				continue;
+			}
+			if (kind === "stuck-stop") this.stopSeen = true;
+			const at = Date.parse(iso);
+			if (!this.open.has(key)) this.open.set(key, { worker: Number(worker), zombie: Number(zombie), deadline: (Number.isNaN(at) ? nowMs : at) + this.backstopMs });
+		}
+		this.consumed = end;
+	}
+
+	/** The open signature with the earliest deadline, or null when none is open (the backstop is disarmed). */
+	first(): BackstopSignature | null {
+		let best: BackstopSignature | null = null;
+		for (const s of this.open.values()) if (best === null || s.deadline < best.deadline) best = s;
+		return best;
+	}
+}
+
 // ---- verdict and settle ----------------------------------------------------------------------------
 
 export interface RunFacts {
@@ -1244,6 +1335,17 @@ export interface RunFacts {
 	baseRuns: { sha: string; parts: Readonly<Record<string, PartResult>> } | null;
 	/** The host load of every part the run made (E1, PLAN wl-mvqu69tjvpy96o); a red or error reason names an overloaded part, the verdict never moves. */
 	load?: PartLoad[];
+	/**
+	 * A part of this run was stuck (PLAN wl-mvq8x4pkjmx69s D4, `callStuck`): `<part>: <its stuck: reason>`, with `; containment
+	 * failed: …` when the runner could not confirm its processes gone; null when no part was. It ends the run.
+	 */
+	stuck: string | null;
+	/**
+	 * The runner's backstop abandoned a part's call on a signature with no stop line (D4): `<part>: executor stalled during stuck
+	 * detection; worker <pid> was a candidate, not confirmed`, an infrastructure error of the executor, never a stuck verdict; null
+	 * when it did not happen. It ends the run.
+	 */
+	executorStalled: string | null;
 }
 export interface RunDecision {
 	/** What the entry records: `superseded` for a run that lost ownership. */
@@ -1271,17 +1373,18 @@ function soloArgOf(file: string): string | null {
 export type SoloPlan = { stop: true } | { stop: false; files: string[] };
 
 /**
- * The solo policy (PLAN wl-mvq4edh02r5z40 D1), from the full part, whether its call timed out (`RunFacts.fullTimedOut`), the
- * changed test files (`./<path>`, changedTestFiles) and the files its junit ran a test of (executedFiles):
- * - a timed-out full part stops the run: no solo and no base part;
+ * The solo policy (PLAN wl-mvq4edh02r5z40 D1), from the full part, whether its call timed out (`RunFacts.fullTimedOut`), whether it
+ * was stuck or its executor stalled (`halted`, PLAN wl-mvq8x4pkjmx69s D4), the changed test files (`./<path>`, changedTestFiles)
+ * and the files its junit ran a test of (executedFiles):
+ * - a timed-out, stuck or stalled full part stops the run: no solo and no base part;
  * - an all-pass full part (no error, exit 0, no failing test) runs alone only the changed files it ran no test of;
  * - a full part that reported failing tests cleanly (no error) runs alone each failing file that can run alone and is not a
  *   security path, in report order (a rerun is diagnostic only and never touches a security failure);
  * - any other full part (an error that is not a timeout) runs every changed file alone, but never a security-path file that
  *   failed in the full part.
  */
-export function soloPlan(p: { full: PartResult; timedOut: boolean; changed: readonly string[]; executed: readonly string[] }): SoloPlan {
-	if (p.timedOut) return { stop: true };
+export function soloPlan(p: { full: PartResult; timedOut: boolean; halted?: boolean; changed: readonly string[]; executed: readonly string[] }): SoloPlan {
+	if (p.timedOut || p.halted) return { stop: true };
 	const { full } = p;
 	if (full.error === null && full.exit === 0 && full.fail === 0) {
 		const ran = new Set(p.executed.map(repoRel));
@@ -1349,21 +1452,31 @@ export function mainRed(c: BaseCompare): boolean {
 /**
  * The verdict (§ 2.3 step 6, § 2.4) and whether to settle (§ 2.2 step 5, § 2.3 step 7), in this order:
  * a fetched head that is not the requested sha is `stale` before any test; a run-level failure is
- * `error`; a head that moved by the end is `stale` whatever the counts; a timed-out full part (`fullTimedOut`) is `error`
+ * `error`; a stuck part or a stalled executor (PLAN wl-mvq8x4pkjmx69s D4: `stuck`, `executorStalled`) is `error` with its reason,
+ * which leads a run-level failure's reason when both hold, and gives way only to a head that moved by the end; a head that moved
+ * by the end is `stale` whatever the counts; a timed-out full part (`fullTimedOut`) is `error`
  * naming the timeout, whatever failures its partial junit kept (PLAN wl-mvq4edh02r5z40 D2); any failing test in any part is
  * `red`, or `red-main` (D3) when every PR part reported cleanly, no failure is in a security test, each full-part failure of a
  * file fails again in that file's solo part (a multiset cover) and base's solo runs fail every failure of every failing solo
  * part too (`mainRed`); a part that errored is `error`; otherwise `green`. A failing file that passed alone never moves the
  * verdict: a `red` names it in its reason (`failing in the full part; passed alone: <files>`). A `red` or `error` run with a part
  * that started or ended overloaded (`overloadNote`, E1) names the overload in its reason, and the verdict stays what the counts
- * say. A run that does not own its request records `superseded` and settles nothing.
+ * say. A run that does not own its request records `superseded` and settles nothing. A stuck run's failures stay in its record;
+ * it is never green or red-main.
  */
 export function decideRun(f: RunFacts): RunDecision {
 	const outcome = ((): { outcome: RunDecision["outcome"]; reason: string | null } => {
 		if (f.fetchedSha !== null && f.fetchedSha !== f.requestedSha) {
 			return { outcome: "stale", reason: `requested ${sha7(f.requestedSha)} but the PR head was ${sha7(f.fetchedSha)}; nothing was tested` };
 		}
-		if (f.error !== null) return { outcome: "error", reason: f.error };
+		const halted = f.stuck ?? f.executorStalled;
+		if (f.error !== null) return { outcome: "error", reason: halted === null ? f.error : `${halted}; ${f.error}` };
+		if (halted !== null) {
+			if (f.headAtEnd !== null && (f.headAtStart !== f.requestedSha || f.headAtEnd !== f.headAtStart)) {
+				return { outcome: "stale", reason: `the PR head moved to ${sha7(f.headAtEnd)} during the run of ${sha7(f.requestedSha)}` };
+			}
+			return { outcome: "error", reason: halted };
+		}
 		if (f.fetchedSha === null) return { outcome: "error", reason: "the PR head was never fetched" };
 		if (f.full === null) return { outcome: "error", reason: "the full suite did not run" };
 		if (f.headAtEnd === null) return { outcome: "error", reason: "the PR head could not be re-read at the end" };
@@ -1787,9 +1900,10 @@ export const AS2TEST_ROOT = "/Users/Shared/as2test";
 export const AS2TEST_EXEC = "/usr/local/libexec/as2test/exec";
 /**
  * The wrapper's exit codes. For `full` and `solo` any other code is bun's own exit, passed through.
- * `probeReachable` is `probe`'s answer when a path it was given opens.
+ * `probeReachable` is `probe`'s answer when a path it was given opens. `stuck` is a part the detector stopped in enforce mode
+ * (PLAN wl-mvq8x4pkjmx69s D3, D4).
  */
-export const WRAPPER_EXIT = { ok: 0, probeReachable: 65, failed: 70, sweepLockHeld: 75, refused: 64, fenced: 77, timeout: 124 } as const;
+export const WRAPPER_EXIT = { ok: 0, probeReachable: 65, failed: 70, sweepLockHeld: 75, refused: 64, fenced: 77, timeout: 124, stuck: 125 } as const;
 
 /** `<root>/runs/<run id>`, where `_as2test` clones and runs the tests. */
 export function workDirOf(runId: string, root: string = AS2TEST_ROOT): string {

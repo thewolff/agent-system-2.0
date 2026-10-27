@@ -10,6 +10,7 @@
 // runs with fake dscl, sudo and visudo under AS2TEST_SETUP_TEST_PREFIX; real sudo is never called.
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
+import * as childProcess from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
 	chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync,
@@ -21,6 +22,7 @@ import {
 	bundleInputs, CAPTURE_MS, CREDENTIAL_PATHS, execArgv, execConfigOf, type InstallVerdict, installDecision, installLayout, parseSource, preflightDecision,
 	preflightProbes, probeCall, probeDecision, readInstall, renderExecWrapper, type SweepScope, UID_SWEEP, WrapperRenderError,
 } from "../src/as2test";
+import { STUCK_DEFAULTS } from "../src/stuck-detect";
 import { AS2TEST_USER, CHILD_ENV_ALLOWLIST, childEnv, partResult, WRAPPER_EXIT, type WrapperCall } from "../src/test-run";
 import { tmp } from "./helpers";
 
@@ -117,8 +119,17 @@ interface Box {
 	hooks: string;
 }
 
+/** The detector's test-only knobs a box's wrapper may carry (PLAN wl-mvq8x4pkjmx69s D3). */
+interface DetectKnobs {
+	detectTickMs?: number;
+	detectPersistMs?: number;
+	signatureCaptureMs?: number;
+	stopGraceMs?: number;
+	detectTrace?: boolean;
+}
+
 /** A tmp as2test root with a groups-scope wrapper and a fake sudo on PATH (§ 6 S4b). */
-function box(tag: string, opts: { killGraceMs?: number; sweepLockWaitMs?: number; captureMs?: number; script?: string } = {}): Box {
+function box(tag: string, opts: { killGraceMs?: number; sweepLockWaitMs?: number; captureMs?: number; script?: string } & DetectKnobs = {}): Box {
 	const base = dir(tag);
 	const root = join(base, "root");
 	for (const d of ["stage", "runs", "locks"]) mkdirSync(join(root, d), { recursive: true });
@@ -129,7 +140,8 @@ function box(tag: string, opts: { killGraceMs?: number; sweepLockWaitMs?: number
 	mkdirSync(bin);
 	writeFileSync(join(bin, "sudo"), FAKE_SUDO, { mode: 0o755 });
 	const exec = join(base, "exec");
-	writeFileSync(exec, renderExecWrapper({ root, bun: BUN, script: opts.script ?? SCRIPT, sweepScope: "groups", hooks, killGraceMs: opts.killGraceMs ?? 500, sweepLockWaitMs: opts.sweepLockWaitMs, captureMs: opts.captureMs }), { mode: 0o755 });
+	const { script, killGraceMs, ...limits } = opts;
+	writeFileSync(exec, renderExecWrapper({ root, bun: BUN, script: script ?? SCRIPT, sweepScope: "groups", hooks, killGraceMs: killGraceMs ?? 500, ...limits }), { mode: 0o755 });
 	return { root, exec, bin, hooks };
 }
 
@@ -498,8 +510,9 @@ describe("prepare, full and solo", () => {
 		// The wrapper fixes PATH, LANG, TERM and SHELL, and takes USER and LOGNAME from `id -un`, never from the caller.
 		const me = userInfo().username;
 		const expected = childEnv({ PATH: SYS_PATH, LANG: "en_US.UTF-8", USER: me, LOGNAME: me, SHELL: "/bin/sh", TERM: "dumb" }, work);
-		// bun test sets NODE_ENV for its own tests; everything else is ours.
-		expect(Object.keys(env).filter((k) => !(k in expected)).sort()).toEqual(Object.keys(env).filter((k) => k === "NODE_ENV"));
+		// bun test sets NODE_ENV for its own tests; the executor adds the part's marker dir (PLAN wl-mvq8x4pkjmx69s D3); everything else is ours.
+		expect(Object.keys(env).filter((k) => !(k in expected)).sort()).toEqual(Object.keys(env).filter((k) => k === "NODE_ENV" || k === "AS2TEST_STUCK_MARKERS").sort());
+		expect(env.AS2TEST_STUCK_MARKERS).toBe(join(work, "stuck-markers-full"));
 		for (const k of ["GH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "MOONSHOT_API_KEY", "SSH_AUTH_SOCK", "OMP_TOKEN", "AGENT_SYSTEM_TEST_RUNS"]) expect(env[k]).toBeUndefined();
 		for (const k of CHILD_ENV_ALLOWLIST) expect(env[k]).toBe(expected[k]!);
 		expect(env.PATH).toBe(expected.PATH);
@@ -780,6 +793,915 @@ describe("the stuck capture at the cap: bounded, safe reads, never blocks the ki
 	}, 60_000);
 });
 
+// ---- the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3) ---------------------------------------
+
+/** The test knobs the plan names for these fixtures (sl-sd-exec): 250 ms ticks, a 2 s persistence, the trace on. */
+const DETECT = { detectTickMs: 250, detectPersistMs: 2_000, detectTrace: true } as const;
+
+type TraceMarker = { pid: number; since: number; command: string };
+/** One `<part>.stuck-trace.jsonl` row: what one tick observed. */
+interface TraceRow {
+	at: number;
+	snap: string;
+	markers: TraceMarker[] | { denied: string };
+	candidates: { pid: number; cpuNs: number | null }[];
+	tree: { pid: number; ppid: number; pgid: number; comm: string }[];
+	zombies: { pid: number; ppid: number; startUs: number; comm: string }[];
+	signatures: { worker: number; zombie: number; since: number; command: string }[];
+}
+const traceOf = (work: string, stem = "full"): TraceRow[] =>
+	readFileSync(join(work, `${stem}.stuck-trace.jsonl`), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as TraceRow);
+/** The markers a tick saw active (a denied marker dir counts as none). */
+const activeAt = (row: TraceRow): TraceMarker[] => (Array.isArray(row.markers) ? row.markers : []);
+
+/** The detector's stdout lines (CONTRACT.md), each split into keyword, ISO time, part and the rest. */
+function detectorLines(stdout: string): { keyword: string; iso: string; part: string; rest: string; line: string }[] {
+	return [...stdout.matchAll(/^(stuck-[a-z-]+) (\S+) part (\S+) (.*)$/gm)].map((m) => ({ keyword: m[1]!, iso: m[2]!, part: m[3]!, rest: m[4]!, line: m[0] }));
+}
+const keywordsOf = (stdout: string): string[] => detectorLines(stdout).map((l) => l.keyword);
+type DetectorLine = ReturnType<typeof detectorLines>[number];
+/**
+ * An enforce stop's stdout: the last four lines are stuck-signature, stuck-stop, stuck-captured and stuck-killed for this worker
+ * and zombie. Before them only flaps of the same signature may come (a stuck-signature then a `stuck-cleared … matched no`, a
+ * tick on which the spinning worker fell under the hot share on a loaded machine); every line is the contract's shape.
+ */
+function enforceLines(stdout: string, worker: number, zombie: number): { first: DetectorLine; sig: DetectorLine; stop: DetectorLine; captured: DetectorLine; killed: DetectorLine } {
+	const lines = detectorLines(stdout);
+	expect(lines.length).toBeGreaterThanOrEqual(4);
+	for (const l of lines) {
+		expect(new Date(l.iso).toISOString()).toBe(l.iso);
+		expect(l.part).toBe("full");
+	}
+	const flaps = lines.slice(0, -4);
+	expect(flaps.length % 2).toBe(0);
+	for (let i = 0; i < flaps.length; i += 2) {
+		expect(flaps[i]!.keyword).toBe("stuck-signature");
+		expect(flaps[i]!.rest).toStartWith(`worker ${worker} zombie ${zombie} since `);
+		expect(flaps[i + 1]!.rest).toMatch(new RegExp(`^worker ${worker} zombie ${zombie} held \\d+ matched no$`));
+		expect(flaps[i + 1]!.keyword).toBe("stuck-cleared");
+	}
+	const [sig, stop, captured, killed] = lines.slice(-4) as [DetectorLine, DetectorLine, DetectorLine, DetectorLine];
+	expect([sig.keyword, stop.keyword, captured.keyword, killed.keyword]).toEqual(["stuck-signature", "stuck-stop", "stuck-captured", "stuck-killed"]);
+	expect(sig.rest).toStartWith(`worker ${worker} zombie ${zombie} since `);
+	expect(stop.rest).toBe(`worker ${worker} zombie ${zombie}`);
+	return { first: lines[0]!, sig, stop, captured, killed };
+}
+/** `<part>.signature.log` split at its `== <n>. … ==` headings, as the stuck capture's. */
+const signatureSections = stuckSections;
+
+/**
+ * When AS2TEST_STUCK_REPORT names a file, a fixture's measured figures are appended there as one JSON line (the lane's
+ * acceptance report reads them); unset, nothing is written.
+ */
+function report(row: Record<string, unknown>): void {
+	const to = process.env.AS2TEST_STUCK_REPORT;
+	if (to) writeFileSync(to, `${JSON.stringify(row)}\n`, { flag: "a" });
+}
+
+/** The lines a positive spin fixture's test file starts with: flock from libSystem, as the preload binds it. */
+const SPIN_HEAD = `import { test } from "bun:test";
+import { dlopen, FFIType } from "bun:ffi";
+import { spawn } from "node:child_process";
+import { closeSync, constants, ftruncateSync, openSync, writeFileSync, writeSync } from "node:fs";
+const flock = dlopen("/usr/lib/libSystem.B.dylib", { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } }).symbols.flock;
+/** Hold this process's marker exactly as the preload does: O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, LOCK_EX|LOCK_NB, then the D1 content. */
+function holdMarker(command) {
+	const fd = openSync(process.env.AS2TEST_STUCK_MARKERS + "/" + process.pid, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW | 0x1000000, 0o600);
+	if (flock(fd, 2 | 4) !== 0) throw new Error("the marker's flock was not granted");
+	ftruncateSync(fd, 0);
+	const since = Date.now();
+	writeSync(fd, since + "\\t" + command + "\\n", 0);
+	return fd;
+}
+`;
+/**
+ * A detached helper (its own process group) the spinning worker starts first: once the signature capture's file exists it
+ * starts a second detached group (`sleep 300`) and records it in ../late.pid, then stays alive as its parent.
+ */
+const LATE_HELPER = `const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+fs.writeFileSync("../helper.pid", String(process.pid));
+const t = setInterval(() => {
+	if (!fs.existsSync("../full.signature.log")) return;
+	clearInterval(t);
+	const s = spawn("/bin/sleep", ["300"], { detached: true, stdio: "ignore" });
+	fs.writeFileSync("../late.pid", String(s.pid));
+}, 25);
+`;
+/**
+ * The positive fixture (PLAN sl-sd-exec): the observable lost-reap state built by hand. The test holds its own marker for
+ * `true`, spawns /usr/bin/true asynchronously at once, then spins forever: marker active, the worker hot, the child an
+ * unreaped zombie. With `late`, a detached helper group is started first (LATE_HELPER).
+ */
+const spinTest = (late: boolean) => `${SPIN_HEAD}test("spins", () => {
+	writeFileSync("../spin.pid", String(process.pid));
+${late ? `\tspawn(process.execPath, ["-e", ${JSON.stringify(LATE_HELPER)}], { detached: true, stdio: "ignore" });\n` : ""}	holdMarker("true");
+	const z = Bun.spawn(["/usr/bin/true"]);
+	writeFileSync("../zombie.pid", String(z.pid));
+	for (;;) {}
+}, 600_000);
+`;
+
+/** The pid a fixture wrote to `<work>/<name>`, added to the pids afterAll kills. */
+function fixturePid(work: string, name: string): number {
+	const pid = Number(readFileSync(join(work, name), "utf8"));
+	pids.push(pid);
+	return pid;
+}
+
+/**
+ * Every Bun.spawnSync and node sync child_process call shape the qualification compares: run once inside the wrapped fixture
+ * and once here (no preload), the two results must be equal. Its source is copied into the fixture, so it names no import.
+ * The accessor, proxy and nested shapes count how often test-owned code runs: the wrapper must run none of it itself.
+ */
+function callFields(cp: typeof childProcess) {
+	const bunFields = (r: ReturnType<typeof Bun.spawnSync>) => ({
+		exitCode: r.exitCode, success: r.success, signalCode: r.signalCode ?? null, stdout: r.stdout?.toString() ?? null, stderr: r.stderr?.toString() ?? null,
+	});
+	const errorFields = (e: unknown) => {
+		const x = e as NodeJS.ErrnoException & { status?: number };
+		return { threw: true, name: x?.name ?? null, code: x?.code ?? null, errno: x?.errno ?? null, syscall: x?.syscall ?? null, path: x?.path ?? null, status: x?.status ?? null, message: String(x?.message) };
+	};
+	const thrown = (f: () => unknown) => {
+		try {
+			f();
+			return { threw: false };
+		} catch (e) {
+			return errorFields(e);
+		}
+	};
+	const node = (r: ReturnType<typeof cp.spawnSync>) => ({ status: r.status, signal: r.signal, stdout: r.stdout?.toString() ?? null, stderr: r.stderr?.toString() ?? null, error: (r.error as NodeJS.ErrnoException | undefined)?.code ?? null });
+	// f's result or error, and how many times test-owned code (each hit()) ran during it.
+	const counted = (f: (hit: () => void) => unknown) => {
+		let hits = 0;
+		const hit = () => {
+			hits++;
+		};
+		try {
+			return { out: f(hit), hits };
+		} catch (e) {
+			return { out: errorFields(e), hits };
+		}
+	};
+	const withGetter = (base: string[], i: number, get: () => unknown) => {
+		const a = [...base];
+		Object.defineProperty(a, i, { get, enumerable: true, configurable: true });
+		return a;
+	};
+	// A getter that throws on its first read only: a wrapper that read and swallowed it would change what the call does.
+	const once = (hit: () => void, value: unknown) => {
+		let first = true;
+		return () => {
+			hit();
+			if (first) {
+				first = false;
+				throw new Error("as2test one-shot getter");
+			}
+			return value;
+		};
+	};
+	const counting = <T extends object>(target: T, hit: () => void) =>
+		new Proxy(target, {
+			get: (t, k, r) => (hit(), Reflect.get(t, k, r)),
+			has: (t, k) => (hit(), Reflect.has(t, k)),
+			ownKeys: (t) => (hit(), Reflect.ownKeys(t)),
+			getOwnPropertyDescriptor: (t, k) => (hit(), Reflect.getOwnPropertyDescriptor(t, k)),
+			getPrototypeOf: (t) => (hit(), Reflect.getPrototypeOf(t)),
+		});
+	return {
+		echo: bunFields(Bun.spawnSync(["/bin/echo", "hi"])),
+		exit3: bunFields(Bun.spawnSync(["/bin/sh", "-c", "echo out; echo err >&2; exit 3"])),
+		object: bunFields(Bun.spawnSync({ cmd: ["/bin/echo", "obj"] })),
+		nodeSpawnSync: node(cp.spawnSync("/bin/sh", ["-c", "echo a; echo b >&2; exit 2"])),
+		execSync: cp.execSync("echo x").toString(),
+		execFileSync: cp.execFileSync("/bin/echo", ["y"]).toString(),
+		execSyncFails: thrown(() => cp.execSync("exit 4", { stdio: "pipe" })),
+		missingBun: thrown(() => Bun.spawnSync(["/nonexistent/as2test-missing-binary"])),
+		missingNodeSpawnSync: node(cp.spawnSync("/nonexistent/as2test-missing-binary")),
+		missingExecFileSync: thrown(() => cp.execFileSync("/nonexistent/as2test-missing-binary")),
+		argv0Getter: counted((hit) => bunFields(Bun.spawnSync(withGetter(["/bin/echo", "a0"], 0, () => (hit(), "/bin/echo"))))),
+		cmdGetter: counted((hit) => bunFields(Bun.spawnSync({ get cmd() {
+			hit();
+			return ["/bin/echo", "cmd"];
+		} }))),
+		argv0Throws: counted((hit) => bunFields(Bun.spawnSync(withGetter(["/bin/echo", "t0"], 0, once(hit, "/bin/echo"))))),
+		cmdThrows: counted((hit) => {
+			const o = {};
+			Object.defineProperty(o, "cmd", { get: once(hit, ["/bin/echo", "tc"]), enumerable: true });
+			return bunFields(Bun.spawnSync(o as { cmd: string[] }));
+		}),
+		argv0NotString: counted((hit) => bunFields(Bun.spawnSync([{ toString: () => (hit(), "/bin/echo") } as unknown as string, "ns"]))),
+		proxyArgv: counted((hit) => bunFields(Bun.spawnSync(counting(["/bin/echo", "pa"], hit)))),
+		proxyOptions: counted((hit) => bunFields(Bun.spawnSync(counting({ cmd: ["/bin/echo", "po"] }, hit)))),
+		nestedBun: counted((hit) =>
+			bunFields(Bun.spawnSync(withGetter(["/bin/echo", "outer"], 0, () => (hit(), Bun.spawnSync(["/bin/echo", "/bin/echo"]).stdout.toString().trim())))),
+		),
+		nestedNode: counted((hit) => cp.execFileSync("/bin/echo", withGetter(["n0", "n1"], 1, () => (hit(), Bun.spawnSync(["/bin/echo", "deep"]).stdout.toString().trim()))).toString()),
+		// Test code the original itself runs: a later argv element, an option and an env value as getters, a holey argv
+		// (its hole is read through Array.prototype), and a function option.
+		laterArgvGetter: counted((hit) => bunFields(Bun.spawnSync(withGetter(["/bin/echo", "l0", "l1"], 2, () => (hit(), "l2"))))),
+		cwdGetter: counted((hit) => bunFields(Bun.spawnSync(["/bin/pwd"], { get cwd() {
+			hit();
+			return "/";
+		} }))),
+		envGetter: counted((hit) => bunFields(Bun.spawnSync(["/usr/bin/env"], { env: { get AS2TEST_E() {
+			hit();
+			return "e";
+		} } }))),
+		holeyArgv: counted(() => {
+			const a = ["/bin/echo", "h0"];
+			a.length = 3;
+			return bunFields(Bun.spawnSync(a));
+		}),
+		functionOption: counted((hit) => bunFields(Bun.spawnSync(["/bin/echo", "f"], { onExit: () => hit() }))),
+		// Review r3: an accessor on Object.prototype under a {} options object, and an env array with an enumerable named getter
+		// (bun enumerates an env object's own keys and gets each value, so this one runs).
+		protoCwdGetter: counted((hit) => {
+			Object.defineProperty(Object.prototype, "cwd", { configurable: true, get: () => (hit(), "/") });
+			try {
+				return bunFields(Bun.spawnSync(["/usr/bin/true"], {}));
+			} finally {
+				delete (Object.prototype as Record<string, unknown>).cwd;
+			}
+		}),
+		envArrayGetter: counted((hit) => {
+			const env: string[] = [];
+			Object.defineProperty(env, "AS2TEST_E", { enumerable: true, get: () => (hit(), "e") });
+			return bunFields(Bun.spawnSync(["/usr/bin/env"], { env: env as unknown as Record<string, string> }));
+		}),
+		plainOptions: bunFields(Bun.spawnSync(["/bin/cat"], { cwd: "/", env: { PATH: "/bin" }, stdin: Buffer.from("in"), stdout: "pipe", stderr: "pipe" })),
+	};
+}
+
+/**
+ * Review r3's two getter shapes outside the options' own data, each running onGet inside its getter: "proto-cwd" defines a `cwd`
+ * accessor on Object.prototype (removed before this returns) and calls Bun.spawnSync(argv, {}); "env-array" passes an env that is
+ * an array with an enumerable named getter. Returns the call's exit and how often the getter ran. Its source is copied into
+ * fixtures, so it names no import.
+ */
+function r3GetterCall(shape: "proto-cwd" | "env-array", argv: string[], onGet: () => void) {
+	let hits = 0;
+	const get = () => {
+		hits++;
+		onGet();
+		return shape === "proto-cwd" ? "/" : "e";
+	};
+	if (shape === "env-array") {
+		const env: string[] = [];
+		Object.defineProperty(env, "AS2TEST_E", { enumerable: true, get });
+		const r = Bun.spawnSync(argv, { env: env as unknown as Record<string, string> });
+		return { exitCode: r.exitCode, hits };
+	}
+	Object.defineProperty(Object.prototype, "cwd", { configurable: true, get });
+	try {
+		const r = Bun.spawnSync(argv, {});
+		return { exitCode: r.exitCode, hits };
+	} finally {
+		delete (Object.prototype as Record<string, unknown>).cwd;
+	}
+}
+
+/**
+ * Review r4's byte containers: a Buffer whose Symbol.asyncIterator getter runs onGet and returns undefined, which bun 1.3.14's
+ * stdio extract looks up (ReadableStream.fromJS) before it takes the bytes. "own" defines the getter on the Buffer itself and
+ * passes it as Bun.spawnSync's stdin; "inherited" defines it on a Buffer subclass's prototype and passes an instance as stdin;
+ * "node-input" passes an "own" Buffer as cp.execFileSync's input (node puts it in the stdio array). Returns the call's exit and
+ * how often the getter ran. Its source is copied into fixtures, so it names no import.
+ */
+function byteGetterCall(cp: typeof childProcess, shape: "own" | "inherited" | "node-input", argv: string[], onGet: () => void) {
+	let hits = 0;
+	const hook = { configurable: true, get: () => {
+		hits++;
+		onGet();
+		return undefined;
+	} };
+	let bytes: Uint8Array = Buffer.from("x");
+	if (shape === "inherited") {
+		class SubBuffer extends Uint8Array {}
+		Object.setPrototypeOf(SubBuffer.prototype, Buffer.prototype);
+		Object.defineProperty(SubBuffer.prototype, Symbol.asyncIterator, hook);
+		bytes = new SubBuffer([120]);
+	} else Object.defineProperty(bytes, Symbol.asyncIterator, hook);
+	if (shape === "node-input") {
+		cp.execFileSync(argv[0]!, argv.slice(1), { input: bytes });
+		return { exitCode: 0, hits };
+	}
+	return { exitCode: Bun.spawnSync(argv, { stdin: bytes }).exitCode, hits };
+}
+
+/**
+ * The real preload's qualification fixture (PLAN sl-sd-exec). Each phase logs its window to ../qual.jsonl and idles 1 s after,
+ * so the trace's 250 ms ticks see the marker during the call and its absence after. A phase whose command is "" must run with
+ * no marker of this worker active at all: the call's arguments ran test code, so it is unpublished.
+ */
+const QUAL_TEST = `import { test } from "bun:test";
+import * as cp from "node:child_process";
+import { appendFileSync } from "node:fs";
+const callFields = ${callFields.toString()};
+const r3GetterCall = ${r3GetterCall.toString()};
+const byteGetterCall = ${byteGetterCall.toString()};
+const log = (o) => appendFileSync("../qual.jsonl", JSON.stringify(o) + "\\n");
+const idle = (ms = 2_000) => Bun.sleep(ms);
+// A real hot computation on the real clock: the detector samples this process's CPU over real 250 ms ticks, so no fake time.
+const spin = (ms) => {
+	const end = Date.now() + ms;
+	while (Date.now() < end) {}
+};
+async function phase(name, command, f) {
+	const start = Date.now();
+	const out = f();
+	const end = Date.now();
+	log({ name, command, start, end, out });
+	await idle();
+}
+test("qualifies", async () => {
+	const marker = process.env.AS2TEST_STUCK_MARKERS + "/" + process.pid;
+	log({ name: "start", pid: process.pid, preloadGlobal: globalThis.__fixturePreload ?? null, wrapped: Bun.spawnSync[Symbol.for("as2test.stuck-marker")] === true });
+	await idle();
+	await phase("bun", "sleep", () => Bun.spawnSync(["/bin/sleep", "2"]).exitCode);
+	// Plain data in every option (helpers.ts's sh shape, a spread of process.env): published. process.env itself is not plain
+	// data in bun (TZ and the proxy variables are accessors), so a call given it runs unpublished.
+	await phase("bun-options-no-bytes", "sleep", () => Bun.spawnSync(["/bin/sleep", "2"], { cwd: "/", env: { ...process.env }, stdin: "ignore", stdout: "pipe", stderr: "pipe" }).exitCode);
+	// Review r4: bytes in any option (here a Buffer stdin) run unpublished, since bun looks up a byte container's
+	// Symbol.asyncIterator, own or inherited, before it takes the bytes.
+	await phase("bun-options", "", () => Bun.spawnSync(["/bin/sleep", "2"], { cwd: "/", env: { ...process.env }, stdin: Buffer.from("x"), stdout: "pipe", stderr: "pipe" }).exitCode);
+	await phase("node-spawnSync", "sleep", () => cp.spawnSync("/bin/sleep", ["2"]).status);
+	await phase("node-execSync", "sh", () => cp.execSync("/bin/sleep 2; echo slept").toString());
+	await phase("node-execFileSync", "sleep", () => cp.execFileSync("/bin/sleep", ["2"]).toString());
+	// node's own options object with cwd, env, timeout and no input: published.
+	await phase("node-options-no-input", "sleep", () => cp.spawnSync("/bin/sleep", ["2"], { cwd: "/", env: { PATH: "/bin" }, timeout: 30_000, encoding: "utf8" }).status);
+	// The same with input (node puts a Buffer in its stdio array): unpublished (review r4).
+	await phase("node-options", "", () => cp.spawnSync("/bin/sleep", ["2"], { cwd: "/", env: { PATH: "/bin" }, input: "x", timeout: 30_000, encoding: "utf8" }).status);
+	// Review r4: a hot 1.2 s Symbol.asyncIterator getter on a Buffer stdin (own, then inherited from a subclass prototype) and on
+	// node's execFileSync input, which bun runs before it takes the bytes, then the 1 s sleep itself: all unpublished.
+	await phase("byte-own-getter", "", () => byteGetterCall(cp, "own", ["/bin/sleep", "1"], () => spin(1_200)));
+	await phase("byte-inherited-getter", "", () => byteGetterCall(cp, "inherited", ["/bin/sleep", "1"], () => spin(1_200)));
+	await phase("byte-node-input-getter", "", () => byteGetterCall(cp, "node-input", ["/bin/sleep", "1"], () => spin(1_200)));
+	// Test code the original runs while it reads its arguments: a hot 1.2 s getter, then the 1 s sleep itself, all unpublished.
+	await phase("argv-getter", "", () => {
+		const argv = ["/bin/sleep"];
+		Object.defineProperty(argv, 1, { enumerable: true, get() {
+			spin(1_200);
+			return "1";
+		} });
+		return Bun.spawnSync(argv).exitCode;
+	});
+	await phase("cwd-getter", "", () => Bun.spawnSync(["/bin/sleep", "1"], { get cwd() {
+		spin(1_200);
+		return "/";
+	} }).exitCode);
+	await phase("env-getter", "", () => Bun.spawnSync(["/bin/sleep", "1"], { env: { get PATH() {
+		spin(1_200);
+		return "/bin";
+	} } }).exitCode);
+	// Review r3: an env array with an enumerable named getter (bun runs it), and an Object.prototype accessor beside a {} options
+	// object (bun 1.3.14 stops its option lookups before Object.prototype, so this getter does not run: the call is unpublished
+	// because Object.prototype is not clean): both unpublished throughout.
+	await phase("env-array-getter", "", () => r3GetterCall("env-array", ["/bin/sleep", "1"], () => spin(1_200)));
+	await phase("proto-cwd-getter", "", () => r3GetterCall("proto-cwd", ["/bin/sleep", "2"], () => spin(1_200)));
+	await phase("fields", null, () => callFields(cp));
+	// A nested call from inside the call's own argv accessor (read by spawnSync itself): neither the outer head nor the nested
+	// sh publishes, so both read the same, earlier marker line.
+	await phase("nested-accessor", "", () => {
+		let inner = null;
+		const argv = ["/usr/bin/head", "-c", "200"];
+		Object.defineProperty(argv, 3, { enumerable: true, get() {
+			inner = Bun.spawnSync(["/bin/sh", "-c", 'cat "$0"; exec /bin/sleep 2', marker]);
+			return marker;
+		} });
+		const r = Bun.spawnSync(argv);
+		return { outer: r.stdout.toString(), outerExit: r.exitCode, inner: inner.stdout.toString(), innerExit: inner.exitCode };
+	});
+	// The node path reads its args before it reaches Bun.spawnSync, so a call from that accessor is the outermost one then.
+	await phase("nested-node", null, () => {
+		let inner = null;
+		const args = ["-c", "200"];
+		Object.defineProperty(args, 2, { enumerable: true, get() {
+			inner = Bun.spawnSync(["/bin/cat", marker]).stdout.toString();
+			return marker;
+		} });
+		return { outer: cp.execFileSync("/usr/bin/head", args).toString(), inner };
+	});
+	const uchg = Bun.spawnSync(["/usr/bin/chflags", "uchg", marker]).exitCode;
+	await idle();
+	try {
+		await phase("immutable", null, () => ({ uchg, sleep: Bun.spawnSync(["/bin/sleep", "2"]).exitCode, node: cp.spawnSync("/bin/sleep", ["1"]).status, fields: callFields(cp) }));
+	} finally {
+		log({ name: "nouchg", out: Bun.spawnSync(["/usr/bin/chflags", "nouchg", marker]).exitCode });
+	}
+	await idle();
+	const start = Date.now();
+	const child = Number(Bun.spawnSync(["/bin/sh", "-c", "/bin/sleep 4 >/dev/null 2>&1 & echo $!"]).stdout.toString().trim());
+	const end = Date.now();
+	await idle(1_500);
+	const lsof = Bun.spawnSync(["/usr/sbin/lsof", "-nP", "-p", String(child)]);
+	let alive = true;
+	try {
+		process.kill(child, 0);
+	} catch {
+		alive = false;
+	}
+	log({ name: "inherit", command: null, start, end, out: { child, alive, lsofExit: lsof.exitCode, holdsMarker: lsof.stdout.toString().includes(marker), lsofHasSleep: lsof.stdout.toString().includes("sleep") } });
+}, 240_000);
+`;
+
+describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)", () => {
+	test("the real preload: a bunfig preload still runs beside it; Bun.spawnSync and node's spawnSync, execSync and execFileSync publish a marker during the call and none after, plain-data options included, return and throw what they would unwrapped, run test-owned accessors and proxy traps exactly as often as unwrapped (a throwing one included), run a call whose argv or options hold a getter (an env array's included) or that meets an Object.prototype accessor unpublished (during the getter and the call), run a call carrying bytes (a Buffer stdin, node's input) unpublished, an own or inherited Symbol.asyncIterator getter on them included, publish no call nested in such a getter, an immutable marker only stops publication, and the marker fd is not inherited", () => {
+		const b = box("stuck-qual", DETECT);
+		prepared(b, "tr-sq1", {
+			"bunfig.toml": `[test]\npreload = ["./setup.ts"]\n`,
+			"setup.ts": "(globalThis as Record<string, unknown>).__fixturePreload = 1;\n",
+			"qual.test.ts": QUAL_TEST,
+			"a.test.ts": OK_TEST,
+		}, { fullCapMin: 5, soloCapMin: 5, fullWorkers: 2, stuckStop: "enforce" });
+		const r = call(b, { sub: "full", runId: "tr-sq1" });
+		const work = workOf(b, "tr-sq1");
+		expect(r.stderr).toBe("");
+		expect(r.exit).toBe(0);
+		// No signature ever forms: the worker blocks in each call (never hot) and no child is left unreaped.
+		expect(keywordsOf(r.stdout)).toEqual([]);
+		const rows = readFileSync(join(work, "qual.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as { name: string; command: string | null; start: number; end: number; out: unknown; pid?: number; preloadGlobal?: unknown; wrapped?: boolean });
+		const byName = Object.fromEntries(rows.map((x) => [x.name, x]));
+		expect(byName.start).toMatchObject({ preloadGlobal: 1, wrapped: true });
+		const w = byName.start!.pid!;
+		// A worker of --parallel=2, not the leader.
+		expect(w).not.toBe(Number(readFileSync(join(work, "groups"), "utf8").split("\n")[0]));
+		const trace = traceOf(work);
+		expect(trace.every((t) => t.snap === "ok")).toBe(true);
+		const mine = (t: TraceRow) => activeAt(t).filter((m) => m.pid === w);
+		const ticks = (from: number, to: number) => trace.filter((t) => t.at > from && t.at < to);
+		const phases = rows.filter((x) => typeof x.start === "number");
+		for (const [i, p] of phases.entries()) {
+			const next = phases[i + 1]?.start ?? p.end + 2_000;
+			const during = ticks(p.start + 300, p.end - 300);
+			if (p.command !== null) {
+				expect({ phase: p.name, during: during.length }).toEqual({ phase: p.name, during: expect.any(Number) });
+				expect(during.length).toBeGreaterThanOrEqual(3);
+				for (const t of during) {
+					expect({ phase: p.name, at: t.at, markers: mine(t).map((m) => m.command) }).toEqual({ phase: p.name, at: t.at, markers: p.command === "" ? [] : [p.command] });
+					if (p.command === "") continue;
+					expect(mine(t)[0]!.since).toBeGreaterThanOrEqual(p.start);
+					expect(mine(t)[0]!.since).toBeLessThanOrEqual(p.end);
+				}
+			}
+			// Each phase idles 2 s after its call, so a loaded machine's late 250 ms ticks still land in this window.
+			const after = ticks(p.end + 300, Math.min(p.end + 2_000, next) - 50);
+			expect(after.length).toBeGreaterThanOrEqual(1);
+			for (const t of after) expect({ phase: p.name, at: t.at, markers: mine(t) }).toEqual({ phase: p.name, at: t.at, markers: [] });
+		}
+		expect(byName.bun!.out).toBe(0);
+		expect([byName["bun-options-no-bytes"]!.out, byName["bun-options"]!.out]).toEqual([0, 0]);
+		expect([byName["node-options-no-input"]!.out, byName["node-options"]!.out]).toEqual([0, 0]);
+		// Review r4: each byte getter ran once, as unwrapped, and the call did what it does unwrapped.
+		const byteShapes = ["own", "inherited", "node-input"] as const;
+		const nativeBytes = byteShapes.map((s) => byteGetterCall(childProcess, s, ["/usr/bin/true"], () => {}));
+		expect(nativeBytes.map((n) => n.hits)).toEqual([1, 1, 1]);
+		expect(byteShapes.map((s) => byName[`byte-${s}-getter`]!.out)).toEqual(nativeBytes);
+		expect([byName["argv-getter"]!.out, byName["cwd-getter"]!.out, byName["env-getter"]!.out]).toEqual([0, 0, 0]);
+		// The same exit and getter count as the unwrapped shapes here (bun runs the env array's getter once, never the inherited one).
+		expect([byName["proto-cwd-getter"]!.out, byName["env-array-getter"]!.out]).toEqual([r3GetterCall("proto-cwd", ["/usr/bin/true"], () => {}), r3GetterCall("env-array", ["/usr/bin/true"], () => {})]);
+		expect(byName["node-spawnSync"]!.out).toBe(0);
+		expect(byName["node-execSync"]!.out).toBe("slept\n");
+		expect(byName["node-execFileSync"]!.out).toBe("");
+		// The same fields, and the same thrown errors (a missing binary included), as the unwrapped calls in this process.
+		const plain = JSON.parse(JSON.stringify(callFields(childProcess)));
+		expect(byName.fields!.out).toEqual(plain);
+		expect(plain.missingBun.threw).toBe(true);
+		expect(plain.missingExecFileSync.threw).toBe(true);
+		// The accessor, proxy and nested shapes really ran test code (once per getter, a one-shot throw surfacing), so equality
+		// above means the wrapper invoked none of it itself and swallowed none of its errors.
+		expect([plain.argv0Getter.hits, plain.cmdGetter.hits, plain.argv0Throws.hits, plain.cmdThrows.hits, plain.nestedBun.hits, plain.nestedNode.hits]).toEqual([1, 1, 1, 1, 1, 1]);
+		expect([plain.laterArgvGetter.hits, plain.cwdGetter.hits, plain.envGetter.hits, plain.envArrayGetter.hits]).toEqual([1, 1, 1, 1]);
+		expect([plain.envArrayGetter.out.stdout, plain.protoCwdGetter.out.exitCode]).toEqual(["AS2TEST_E=e\n", 0]);
+		expect([plain.laterArgvGetter.out.stdout, plain.cwdGetter.out.stdout, plain.envGetter.out.stdout, plain.plainOptions.stdout]).toEqual(["l0 l2\n", "/\n", "AS2TEST_E=e\n", "in"]);
+		expect([plain.argv0Throws.out.message, plain.cmdThrows.out.message]).toEqual(["as2test one-shot getter", "as2test one-shot getter"]);
+		expect(plain.proxyOptions.hits).toBeGreaterThan(0);
+		expect(plain.nestedNode.out).toBe("n0 deep\n");
+		// Nested inside a call's own argv accessor: neither the outer head nor the nested sh published (the generic window check
+		// above saw no marker), so both read the same marker line, written before the phase began.
+		const nested = byName["nested-accessor"]!;
+		const nestedOut = nested.out as { outer: string; outerExit: number; inner: string; innerExit: number };
+		expect(nestedOut).toMatchObject({ outerExit: 0, innerExit: 0 });
+		expect(nestedOut.outer).toMatch(/^\d+\t[^\t\n]+\n$/);
+		expect(nestedOut.inner).toBe(nestedOut.outer);
+		expect(Number(nestedOut.outer.split("\t")[0])).toBeLessThan(nested.start);
+		// From the node path's accessor, before node reaches Bun.spawnSync: the cat was the outermost call then and published
+		// itself, and the head after it published its own, later line.
+		const viaNode = byName["nested-node"]!.out as { outer: string; inner: string };
+		expect(viaNode.inner).toMatch(/^\d+\tcat\n$/);
+		expect(viaNode.outer).toMatch(/^\d+\thead\n$/);
+		expect(Number(viaNode.outer.split("\t")[0])).toBeGreaterThanOrEqual(Number(viaNode.inner.split("\t")[0]));
+		// Immutable marker: chflags worked, every call still returned what it would, and no marker was active in its window.
+		const imm = byName.immutable!;
+		expect(imm.out).toEqual({ uchg: 0, sleep: 0, node: 0, fields: plain });
+		const immTicks = ticks(imm.start + 100, imm.end - 100);
+		expect(immTicks.length).toBeGreaterThanOrEqual(3);
+		for (const t of immTicks) expect(mine(t)).toEqual([]);
+		expect(byName.nouchg!.out).toBe(0);
+		// Not inherited: the backgrounded sleep outlived the call, holds no marker fd, and the marker was inactive meanwhile.
+		expect(byName.inherit!.out).toMatchObject({ alive: true, lsofExit: 0, holdsMarker: false, lsofHasSleep: true });
+		// The part's marker dir and preload are gone; the trace and nothing else of the detector's is left.
+		expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
+		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
+	}, 360_000);
+
+	test("enforce: the spin fixture gets a signature line, stuck-stop, a signature capture, a teardown of every owned group (a group created during the capture included) and exit 125 within persist + capture + teardown + slack; capture tools, marker dir and preload are gone", async () => {
+		// A capture budget past the default, so the held hook and a loaded machine's slow sample still leave all five sections
+		// (the cut at the budget is the stuck-cut test's).
+		const knobs = { ...DETECT, signatureCaptureMs: 10_000 };
+		const b = box("stuck-enforce", knobs);
+		prepared(b, "tr-se1", { "spin.test.ts": spinTest(true), "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
+		const work = workOf(b, "tr-se1");
+		const hook = join(b.hooks, "tr-se1.signature-capture");
+		writeFileSync(`${hook}.pause`, "");
+		const p = spawnCall(b, { sub: "full", runId: "tr-se1" });
+		try {
+			// Hold the capture until the helper has made its second group: that group is new during the capture.
+			expect(await until(() => existsSync(`${hook}.reached`), 30_000)).toBe(true);
+			expect(await until(() => existsSync(join(work, "late.pid")), 2_000)).toBe(true);
+		} finally {
+			writeFileSync(`${hook}.go`, "");
+		}
+		const code = await p.exited;
+		const exitedAt = Date.now();
+		const stdout = await new Response(p.stdout).text();
+		const stderr = await new Response(p.stderr).text();
+		const worker = fixturePid(work, "spin.pid");
+		const zombie = fixturePid(work, "zombie.pid");
+		const helper = fixturePid(work, "helper.pid");
+		const late = fixturePid(work, "late.pid");
+		const leader = Number(readFileSync(join(work, "groups"), "utf8").split("\n")[0]);
+		report({ fixture: "enforce", exit: code, stdout, stderr });
+		expect(worker).not.toBe(leader);
+		expect(code).toBe(WRAPPER_EXIT.stuck);
+		const { first, sig, stop, captured, killed } = enforceLines(stdout, worker, zombie);
+		expect(sig.rest).toMatch(new RegExp(`^worker ${worker} zombie ${zombie} since \\d+ mode enforce bun ${Bun.version.replaceAll(".", "\\.")} ${Bun.revision}$`));
+		expect(captured.rest).toMatch(/^file full\.signature\.log ms \d+$/);
+		const k = /^pgids ([\d,]+) ms (\d+) contained$/.exec(killed.rest);
+		expect(k).not.toBeNull();
+		const stopSet = k![1]!.split(",").map(Number);
+		// The leader's group (the worker's too), the helper's and the one made during the capture.
+		expect(stopSet).toEqual(expect.arrayContaining([leader, helper, late]));
+		expect(stderr).toMatch(new RegExp(`^stuck: worker ${worker} spun \\d+ ms in Bun\\.spawnSync with unreaped child ${zombie}; ${stopSet.length} process groups killed, containment contained\\n$`));
+		const spun = Number(/ spun (\d+) ms /.exec(stderr)![1]);
+		expect(spun).toBeGreaterThanOrEqual(DETECT.detectPersistMs);
+		expect(Date.parse(stop.iso) - Date.parse(sig.iso)).toBeGreaterThanOrEqual(DETECT.detectPersistMs - 50);
+		// The budget runs from the matching signature's first tick (PLAN § Budget).
+		const signatureToExit = exitedAt - Date.parse(sig.iso);
+		expect(signatureToExit).toBeLessThan(DETECT.detectPersistMs + knobs.signatureCaptureMs + STUCK_DEFAULTS.stopGraceMs + STUCK_DEFAULTS.verifyMs + 3_000);
+		report({ fixture: "enforce", signatureToExitMs: signatureToExit, firstSignatureToExitMs: exitedAt - Date.parse(first.iso), stopToExitMs: exitedAt - Date.parse(stop.iso) });
+		// Every owned process and group is gone, with no sweep.
+		for (const pid of [leader, worker, helper, late]) expect({ pid, alive: alive(pid) }).toEqual({ pid, alive: false });
+		for (const g of stopSet) expect({ g, alive: alive(-g) }).toEqual({ g, alive: false });
+		const groups = readFileSync(join(work, "groups"), "utf8").split("\n").filter(Boolean).map(Number);
+		expect(groups).toEqual(expect.arrayContaining(stopSet));
+		// The signature capture: tree, marker, sample, lsof, log tail; its tools are gone and its cap dir cleared.
+		const text = readFileSync(join(work, "full.signature.log"), "utf8");
+		expect(text).toContain(`signature capture of full: worker ${worker} spun `);
+		const s = signatureSections(text);
+		expect(Object.keys(s)).toEqual(["1", "2", "3", "4", "5"]);
+		expect(s["1"]).toContain(`${worker} `);
+		expect(s["1"]).toContain("<- worker");
+		expect(s["1"]).toContain("<- unreaped child");
+		expect(s["2"]).toMatch(/observed: since \d+ \(.+\) command true\n/);
+		expect(s["3"]).toContain(`$ /usr/bin/sample ${worker} 1 -mayDie -file `);
+		expect(s["4"]).toContain(`$ /usr/sbin/lsof -nP -p ${worker} `);
+		expect(s["5"]).toContain("bun test v");
+		expect(text).not.toContain("capture cut");
+		const tools = capturePids(text);
+		expect(tools.length).toBeGreaterThan(0);
+		expect(tools.filter(alive)).toEqual([]);
+		expect(readdirSync(work).filter((n) => n.startsWith("full.signature-"))).toEqual([]);
+		expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
+		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
+	}, 90_000);
+
+	test("shadow (caps.json without stuckStop): the spin fixture gets stuck-would-stop and a signature capture, nothing is stopped, and the part runs on to its cap and exits 124 as before", async () => {
+		const b = box("stuck-shadow", DETECT);
+		prepared(b, "tr-ss1", { "spin.test.ts": spinTest(false), "a.test.ts": OK_TEST }, { fullCapMin: 0.15, soloCapMin: 0.15, fullWorkers: 2 });
+		const t0 = Date.now();
+		const r = call(b, { sub: "full", runId: "tr-ss1" });
+		const work = workOf(b, "tr-ss1");
+		const worker = fixturePid(work, "spin.pid");
+		const zombie = fixturePid(work, "zombie.pid");
+		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
+		expect(r.stderr).toBe("as2test: timeout: the part passed its cap of 9000 ms; its session was killed\n");
+		expect(Date.now() - t0).toBeGreaterThanOrEqual(9_000);
+		expect(Date.now() - t0).toBeLessThan(9_000 + CAPTURE_MS + 500 + 5_000);
+		const lines = detectorLines(r.stdout);
+		// Only this signature's lines; a flap (a tick under the hot share on a loaded machine) may clear and restart it.
+		for (const l of lines) {
+			expect(["stuck-signature", "stuck-cleared", "stuck-would-stop", "stuck-captured"]).toContain(l.keyword);
+			expect(new Date(l.iso).toISOString()).toBe(l.iso);
+			if (l.keyword !== "stuck-captured") expect(l.rest).toStartWith(`worker ${worker} zombie ${zombie}`);
+		}
+		const would = lines.findIndex((l) => l.keyword === "stuck-would-stop");
+		expect(would).toBeGreaterThan(0);
+		const sig = lines[would - 1]!;
+		expect(sig.keyword).toBe("stuck-signature");
+		expect(sig.rest).toMatch(new RegExp(`^worker ${worker} zombie ${zombie} since \\d+ mode shadow bun `));
+		expect(lines[would]!.rest).toBe(`worker ${worker} zombie ${zombie}`);
+		expect(lines.filter((l) => l.keyword === "stuck-captured").map((l) => l.rest)).toEqual([expect.stringMatching(/^file full\.signature\.log ms \d+$/)]);
+		// The would-stop came at the persistence, long before the cap: the part ran on untouched.
+		expect(Date.parse(lines[would]!.iso) - Date.parse(sig.iso)).toBeGreaterThanOrEqual(DETECT.detectPersistMs - 50);
+		expect(Date.parse(lines[would]!.iso) - t0).toBeLessThan(9_000 - 2_000);
+		report({ fixture: "shadow", stdout: r.stdout, stderr: r.stderr });
+		expect(Object.keys(signatureSections(readFileSync(join(work, "full.signature.log"), "utf8")))).toEqual(["1", "2", "3", "4", "5"]);
+		// The merged D5 cap path captures, then kills the whole part session, including the parallel worker's own group.
+		expect(Object.keys(stuckSections(readFileSync(join(work, "full.stuck.log"), "utf8")))).toEqual(["1", "2", "3", "4"]);
+		expect(await until(() => !alive(worker), 3_000)).toBe(true);
+		expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
+		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
+	}, 90_000);
+
+	test("a signature capture whose tools are still running at its deadline is cut there: every capture group is SIGKILLed, the file says so, and the stop still exits 125 within the bound", async () => {
+		const signatureCaptureMs = 600;
+		const b = box("stuck-cut", { ...DETECT, signatureCaptureMs });
+		prepared(b, "tr-sk1", { "spin.test.ts": spinTest(false), "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
+		const work = workOf(b, "tr-sk1");
+		// Never released: sample (1 s) cannot finish inside 600 ms either.
+		const hook = join(b.hooks, "tr-sk1.signature-capture");
+		writeFileSync(`${hook}.pause`, "");
+		const p = spawnCall(b, { sub: "full", runId: "tr-sk1" });
+		try {
+			const code = await p.exited;
+			const exitedAt = Date.now();
+			const stdout = await new Response(p.stdout).text();
+			const worker = fixturePid(work, "spin.pid");
+			const zombie = fixturePid(work, "zombie.pid");
+			expect(code).toBe(WRAPPER_EXIT.stuck);
+			expect(existsSync(`${hook}.reached`)).toBe(true);
+			const { sig } = enforceLines(stdout, worker, zombie);
+			expect(exitedAt - Date.parse(sig.iso)).toBeLessThan(DETECT.detectPersistMs + signatureCaptureMs + STUCK_DEFAULTS.stopGraceMs + STUCK_DEFAULTS.verifyMs + 3_000);
+			const text = readFileSync(join(work, "full.signature.log"), "utf8");
+			const cutAt = Number(/^capture cut at (\d+) ms$/m.exec(text)?.[1]);
+			expect(cutAt).toBeGreaterThanOrEqual(signatureCaptureMs);
+			expect(cutAt).toBeLessThan(signatureCaptureMs + 1_000);
+			expect(Object.keys(signatureSections(text))).toEqual(["1", "2"]);
+			const killed = /^killed capture groups: (.*)$/m.exec(text)?.[1] ?? "";
+			expect(killed).toMatch(/^\d+( \d+)*$/);
+			const tools = capturePids(text);
+			expect(await until(() => tools.every((t) => !alive(t)), 2_000)).toBe(true);
+			expect(readdirSync(work).filter((n) => n.startsWith("full.signature-"))).toEqual([]);
+		} finally {
+			writeFileSync(`${hook}.go`, "");
+		}
+	}, 90_000);
+
+	test("a caps.json stuckStop other than shadow or enforce is refused for full and solo", () => {
+		for (const bad of ["on", true, null, 1]) {
+			const b = box("stuck-bad");
+			prepared(b, "tr-sb1", { "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, stuckStop: bad });
+			for (const c of [{ sub: "full", runId: "tr-sb1" }, { sub: "solo", runId: "tr-sb1", file: "./a.test.ts" }] as WrapperCall[]) {
+				const r = call(b, c);
+				expect(r.exit).toBe(WRAPPER_EXIT.refused);
+				expect(r.stderr).toContain("stuckStop");
+			}
+		}
+	});
+
+	describe("negative controls: each part ends normally with no signature and no decision (enforce, --parallel=2)", () => {
+		/** One test file per control; `<name>.pid` is the worker's pid. Each runs about 6 s. */
+		const LOOP = "const end = Date.now() + 6_000;\n\twhile (Date.now() < end) {}";
+		/**
+		 * The getter controls' hot computation: as long as LOOP, well past the persistence, so a loaded machine whose late
+		 * executor ticks miss part of it still sees the unmarked zombie over MEANINGFUL_SPAN_MS.
+		 */
+		const GETTER_HOT_MS = 6_000;
+		const fixtures: Record<string, Record<string, string>> = {
+			"zombie-no-marker": {
+				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tBun.spawn(["/usr/bin/true"]);\n\t${LOOP}\n}, 60_000);\n`,
+			},
+			"returned-call-then-zombie": {
+				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tBun.spawnSync(["/usr/bin/true"]);\n\tBun.spawn(["/usr/bin/true"]);\n\t${LOOP}\n}, 60_000);\n`,
+			},
+			"immutable-marker": {
+				"c.test.ts": `import { test } from "bun:test";
+import { dlopen, FFIType } from "bun:ffi";
+import { writeFileSync } from "node:fs";
+const { chflags } = dlopen("/usr/lib/libSystem.B.dylib", { chflags: { args: [FFIType.cstring, FFIType.u32], returns: FFIType.i32 } }).symbols;
+test("c", () => {
+	writeFileSync("../w.pid", String(process.pid));
+	const marker = Buffer.from(process.env.AS2TEST_STUCK_MARKERS + "/" + process.pid + "\\0");
+	// UF_IMMUTABLE, as chflags uchg; cleared again so the executor can remove the dir.
+	if (chflags(marker, 2) !== 0) throw new Error("chflags uchg failed");
+	try {
+		Bun.spawnSync(["/usr/bin/true"]);
+		Bun.spawn(["/usr/bin/true"]);
+		${LOOP}
+	} finally {
+		chflags(marker, 0);
+	}
+}, 60_000);
+`,
+			},
+			"long-async": {
+				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", async () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tawait Bun.sleep(6_000);\n}, 60_000);\n`,
+			},
+			"sync-sleep": {
+				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tBun.spawnSync(["/bin/sleep", "3"]);\n}, 60_000);\n`,
+			},
+			"printer-beside-idle": {
+				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("prints", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tconst end = Date.now() + 6_000;\n\twhile (Date.now() < end) console.log("x".repeat(100));\n}, 60_000);\n`,
+				"d.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("idles", async () => {\n\twriteFileSync("../idle.pid", String(process.pid));\n\tawait Bun.sleep(6_000);\n}, 60_000);\n`,
+			},
+			// The positive fixture but for the zombie's parent: a sleeping process of the fixture, not the hot marked worker.
+			"zombie-of-a-sleeper": {
+				"c.test.ts": `${SPIN_HEAD}test("c", () => {
+	writeFileSync("../w.pid", String(process.pid));
+	const fd = holdMarker("true");
+	Bun.spawn(["/bin/sh", "-c", "/usr/bin/true & exec /bin/sleep 8"]);
+	${LOOP}
+	closeSync(fd);
+}, 60_000);
+`,
+			},
+			// Review r2 finding 1: healthy test code inside the call's own argv getter (an async /usr/bin/true born at once, then a
+			// hot computation past the persistence) while the original Bun.spawnSync(["/usr/bin/true", …]) reads its arguments.
+			"argv-getter": {
+				"c.test.ts": `import { test } from "bun:test";
+import { writeFileSync } from "node:fs";
+test("c", () => {
+	writeFileSync("../w.pid", String(process.pid));
+	const argv = ["/usr/bin/true"];
+	Object.defineProperty(argv, 1, { enumerable: true, get() {
+		Bun.spawn(["/usr/bin/true"]);
+		const end = Date.now() + ${GETTER_HOT_MS};
+		while (Date.now() < end) {}
+		return "x";
+	} });
+	if (Bun.spawnSync(argv).exitCode !== 0) throw new Error("true failed");
+}, 60_000);
+`,
+			},
+			// Review r3: the same healthy getter outside the options' own data, run through r3GetterCall with argv ["/usr/bin/true"]:
+			// a `cwd` accessor on Object.prototype under a {} options object, and an env array with an enumerable named getter. A
+			// real 3 s idle after the call keeps the part alive for the trace's 10 real-clock ticks when the getter does not run (the
+			// detector samples the real process over real 250 ms ticks, so fake timers cannot stand in).
+			...Object.fromEntries((["proto-cwd", "env-array"] as const).map((shape) => [`${shape}-getter`, {
+				"c.test.ts": `import { test } from "bun:test";
+import { writeFileSync } from "node:fs";
+const r3GetterCall = ${r3GetterCall.toString()};
+test("c", async () => {
+	writeFileSync("../w.pid", String(process.pid));
+	const out = r3GetterCall("${shape}", ["/usr/bin/true"], () => {
+		Bun.spawn(["/usr/bin/true"]);
+		const end = Date.now() + ${GETTER_HOT_MS};
+		while (Date.now() < end) {}
+	});
+	writeFileSync("../out.json", JSON.stringify(out));
+	await Bun.sleep(3_000);
+}, 60_000);
+`,
+			}])),
+			// Review r4: the same healthy getter as a Symbol.asyncIterator getter on a Buffer stdin, which bun looks up before it
+			// takes the bytes, run through byteGetterCall("own") with argv ["/usr/bin/true"]; the same real 3 s idle after (the
+			// detector samples the real process over real 250 ms ticks, so fake timers cannot stand in).
+			"byte-stdin-getter": {
+				"c.test.ts": `import { test } from "bun:test";
+import * as cp from "node:child_process";
+import { writeFileSync } from "node:fs";
+const byteGetterCall = ${byteGetterCall.toString()};
+test("c", async () => {
+	writeFileSync("../w.pid", String(process.pid));
+	const out = byteGetterCall(cp, "own", ["/usr/bin/true"], () => {
+		Bun.spawn(["/usr/bin/true"]);
+		const end = Date.now() + ${GETTER_HOT_MS};
+		while (Date.now() < end) {}
+	});
+	writeFileSync("../out.json", JSON.stringify(out));
+	await Bun.sleep(3_000);
+}, 60_000);
+`,
+			},
+		};
+		type Done = { b: Box; work: string; exit: number | null; stdout: string; stderr: string };
+		let all: Promise<Record<string, Done>> | null = null;
+		/**
+		 * Three controls at a time (each in its own box), started by the first test that needs them: most of them spin a worker
+		 * hot for 6 s, and all at once they starved the rest of the full suite of CPU.
+		 */
+		const CONTROLS_AT_ONCE = 3;
+		/** Every test here may be the first to wait for all the controls. */
+		const CONTROL_TEST_MS = 240_000;
+		const runControl = async ([name, files]: [string, Record<string, string>], i: number): Promise<[string, Done]> => {
+			const b = box(`stuck-neg-${name}`, DETECT);
+			const runId = `tr-sn${i}`;
+			prepared(b, runId, { "a.test.ts": OK_TEST, ...files }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
+			const p = spawnCall(b, { sub: "full", runId });
+			const exit = await p.exited;
+			return [name, { b, work: workOf(b, runId), exit, stdout: await new Response(p.stdout).text(), stderr: await new Response(p.stderr).text() }];
+		};
+		const results = (): Promise<Record<string, Done>> =>
+			(all ??= (async () => {
+				const entries = Object.entries(fixtures);
+				const done: [string, Done][] = [];
+				let next = 0;
+				const worker = async (): Promise<void> => {
+					while (next < entries.length) {
+						const i = next++;
+						done.push(await runControl(entries[i]!, i));
+					}
+				};
+				await Promise.all(Array.from({ length: CONTROLS_AT_ONCE }, worker));
+				return Object.fromEntries(done);
+			})());
+		/** The control ended normally, with no detector line at all; returns its trace and worker pid. */
+		async function settled(name: string): Promise<{ trace: TraceRow[]; w: number; work: string }> {
+			const d = (await results())[name]!;
+			expect({ name, exit: d.exit, stderr: d.stderr, lines: keywordsOf(d.stdout) }).toEqual({ name, exit: 0, stderr: "", lines: [] });
+			const trace = traceOf(d.work);
+			expect(trace.length).toBeGreaterThanOrEqual(10);
+			expect(trace.every((t) => t.snap === "ok" && t.signatures.length === 0)).toBe(true);
+			expect(existsSync(join(d.work, "stuck-markers-full"))).toBe(false);
+			return { trace, w: fixturePid(d.work, "w.pid"), work: d.work };
+		}
+		const zombieOf = (trace: TraceRow[], ppid: number) => trace.some((t) => t.zombies.some((z) => z.ppid === ppid && z.comm === "true"));
+		/**
+		 * Whether the control meant something: ticks saw the worker's `true` zombie over at least a second (four ticks' worth)
+		 * without the worker's marker. A span, not a tick count: under a loaded machine the executor's ticks come late and few,
+		 * while the zombie still stands through the getter's whole hot computation.
+		 */
+		const unmarkedZombieSpanMs = (trace: TraceRow[], w: number): number => {
+			const at = trace.filter((t) => t.zombies.some((z) => z.ppid === w && z.comm === "true") && !activeAt(t).some((m) => m.pid === w)).map((t) => t.at);
+			return at.length < 2 ? 0 : at[at.length - 1]! - at[0]!;
+		};
+		const MEANINGFUL_SPAN_MS = 4 * DETECT.detectTickMs;
+
+		test("a 6 s sync loop holding a zombie child, with no marker", async () => {
+			const { trace, w } = await settled("zombie-no-marker");
+			expect(zombieOf(trace, w)).toBe(true);
+			expect(trace.every((t) => activeAt(t).length === 0)).toBe(true);
+		}, CONTROL_TEST_MS);
+
+		test("a real Bun.spawnSync(['/usr/bin/true']) that returns, then an async /usr/bin/true born at once and a 6 s sync loop: the marker is inactive", async () => {
+			const { trace, w } = await settled("returned-call-then-zombie");
+			expect(zombieOf(trace, w)).toBe(true);
+			expect(trace.filter((t) => t.zombies.length > 0).every((t) => activeAt(t).length === 0)).toBe(true);
+		}, CONTROL_TEST_MS);
+
+		test("the same with the marker file made immutable before the first call: no marker ever becomes active", async () => {
+			const { trace, w } = await settled("immutable-marker");
+			expect(zombieOf(trace, w)).toBe(true);
+			expect(trace.every((t) => activeAt(t).length === 0)).toBe(true);
+		}, CONTROL_TEST_MS);
+
+		test("Bun.spawnSync(['/usr/bin/true', <getter>]) whose getter starts an async /usr/bin/true and computes past the persistence: the call runs unpublished, so the hot worker's zombie never meets a marker", async () => {
+			const { trace, w } = await settled("argv-getter");
+			expect(unmarkedZombieSpanMs(trace, w)).toBeGreaterThanOrEqual(MEANINGFUL_SPAN_MS);
+		}, CONTROL_TEST_MS);
+
+		for (const shape of ["proto-cwd", "env-array"] as const) {
+			const what = shape === "proto-cwd" ? "Bun.spawnSync(['/usr/bin/true'], {}) beside an Object.prototype cwd getter" : "Bun.spawnSync(['/usr/bin/true'], { env: <array with an enumerable named getter> })";
+			test(`${what} whose getter starts an async /usr/bin/true and computes past the persistence: the call runs unpublished and does what it does unwrapped, so the hot worker's zombie never meets a marker`, async () => {
+				const { trace, w, work } = await settled(`${shape}-getter`);
+				const out = JSON.parse(readFileSync(join(work, "out.json"), "utf8")) as { exitCode: number; hits: number };
+				expect(out).toEqual(r3GetterCall(shape, ["/usr/bin/true"], () => {}));
+				const zombieTicks = trace.filter((t) => t.zombies.some((z) => z.ppid === w && z.comm === "true"));
+				expect(zombieTicks.filter((t) => activeAt(t).some((m) => m.pid === w))).toEqual([]);
+				// bun 1.3.14 runs the env array's getter; it stops its option lookups before Object.prototype, so the inherited
+				// getter runs only if a later bun reads it, and then it must meet no marker either.
+				expect(unmarkedZombieSpanMs(trace, w)).toBeGreaterThanOrEqual(out.hits > 0 ? MEANINGFUL_SPAN_MS : 0);
+			}, CONTROL_TEST_MS);
+		}
+
+		test("Bun.spawnSync(['/usr/bin/true'], { stdin: <Buffer with an own Symbol.asyncIterator getter> }) whose getter starts an async /usr/bin/true and computes past the persistence: the call runs unpublished and does what it does unwrapped, so the hot worker's zombie never meets a marker", async () => {
+			const { trace, w, work } = await settled("byte-stdin-getter");
+			const native = byteGetterCall(childProcess, "own", ["/usr/bin/true"], () => {});
+			expect(native).toEqual({ exitCode: 0, hits: 1 });
+			const out: unknown = JSON.parse(readFileSync(join(work, "out.json"), "utf8"));
+			expect(out).toEqual(native);
+			// bun runs the getter before it takes the bytes, so the zombie is there throughout the hot computation, unmarked.
+			const zombieTicks = trace.filter((t) => t.zombies.some((z) => z.ppid === w && z.comm === "true"));
+			expect(unmarkedZombieSpanMs(trace, w)).toBeGreaterThanOrEqual(MEANINGFUL_SPAN_MS);
+			expect(zombieTicks.filter((t) => activeAt(t).some((m) => m.pid === w))).toEqual([]);
+		}, CONTROL_TEST_MS);
+
+		test("a long async test", async () => {
+			const { trace, w } = await settled("long-async");
+			expect(trace.some((t) => t.tree.some((p) => p.pid === w))).toBe(true);
+		}, CONTROL_TEST_MS);
+
+		test("a real Bun.spawnSync(['/bin/sleep', '3']): the marker is active with a live child, and the worker is not hot", async () => {
+			const { trace, w } = await settled("sync-sleep");
+			expect(trace.some((t) => activeAt(t).some((m) => m.pid === w && m.command === "sleep") && t.tree.some((p) => p.ppid === w && p.comm === "sleep"))).toBe(true);
+		}, CONTROL_TEST_MS);
+
+		test("another worker printing continuously beside an idle one", async () => {
+			const { trace, w, work } = await settled("printer-beside-idle");
+			const idle = fixturePid(work, "idle.pid");
+			expect(idle).not.toBe(w);
+			expect(trace.some((t) => t.tree.some((p) => p.pid === w) && t.tree.some((p) => p.pid === idle))).toBe(true);
+		}, CONTROL_TEST_MS);
+
+		test("a zombie whose parent is a sleeping fixture process, beside a hot worker holding a marker", async () => {
+			const { trace, w } = await settled("zombie-of-a-sleeper");
+			expect(trace.some((t) => activeAt(t).some((m) => m.pid === w && m.command === "true") && t.zombies.some((z) => z.comm === "true" && z.ppid !== w))).toBe(true);
+			expect(zombieOf(trace, w)).toBe(false);
+		}, CONTROL_TEST_MS);
+	});
+});
+
 // ---- sweep --------------------------------------------------------------------------------------------------
 
 describe("sweep", () => {
@@ -870,13 +1792,22 @@ describe("sweep", () => {
 		const argvUses = text.split("\n").flatMap((l, i) => (/"\$@"/.test(l) ? [i] : []));
 		expect(argvUses).toEqual([execLine + 2]);
 		expect(text).toContain(`'/usr/local/libexec/as2test/bun' '/usr/local/libexec/as2test/test-exec.js' "$@"`);
-		for (const extra of [{ hooks: "/tmp/h" }, { killGraceMs: 1 }, { sweepLockWaitMs: 1 }, { captureMs: 1 }]) {
+		const knobs = [{ hooks: "/tmp/h" }, { killGraceMs: 1 }, { sweepLockWaitMs: 1 }, { captureMs: 1 }, { detectTickMs: 1 }, { detectPersistMs: 1 }, { signatureCaptureMs: 1 }, { stopGraceMs: 1 }, { detectTrace: true }, { detectTrace: false }];
+		for (const extra of knobs) {
 			expect(() => renderExecWrapper({ root: "/r", bun: "/b", script: "/s", sweepScope: "uid", ...extra })).toThrow(WrapperRenderError);
 		}
 		expect(() => renderExecWrapper({ root: "r", bun: "/b", script: "/s", sweepScope: "uid" })).toThrow(WrapperRenderError);
 		expect(() => renderExecWrapper({ root: "/r", bun: "/b", script: "/s", sweepScope: "all" as SweepScope })).toThrow(WrapperRenderError);
-		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "uid" })).toMatchObject({ killGraceMs: 10_000, sweepLockWaitMs: 60_000, captureMs: 20_000, hooks: null });
+		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "uid" })).toMatchObject({
+			killGraceMs: 10_000, sweepLockWaitMs: 60_000, captureMs: 20_000, hooks: null,
+			detectTickMs: STUCK_DEFAULTS.tickMs, detectPersistMs: STUCK_DEFAULTS.persistMs, signatureCaptureMs: STUCK_DEFAULTS.signatureCaptureMs, stopGraceMs: STUCK_DEFAULTS.stopGraceMs, detectTrace: false,
+		});
 		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", captureMs: 1_500 }).captureMs).toBe(1_500);
+		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", detectTickMs: 50, detectPersistMs: 400, signatureCaptureMs: 900, stopGraceMs: 300, detectTrace: true }))
+			.toMatchObject({ detectTickMs: 50, detectPersistMs: 400, signatureCaptureMs: 900, stopGraceMs: 300, detectTrace: true });
+		for (const bad of [{ detectTickMs: 0 }, { detectPersistMs: -1 }, { stopGraceMs: 1.5 }, { detectTrace: "yes" as unknown as boolean }]) {
+			expect(() => execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", ...bad })).toThrow(WrapperRenderError);
+		}
 	});
 });
 
@@ -982,6 +1913,9 @@ describe("the part owns its session: the cap and a groups sweep kill every proce
 		const own = pidIn(work, "own.pid");
 		expect(readFileSync(join(work, "full.cleanup.log"), "utf8")).toMatch(/^lookup failed: session \d+: failed by the test hook /m);
 		expect(existsSync(join(work, "full.stuck.log"))).toBe(true);
+		// Merge integration: the detector can have recorded this worker's group beside the part's session.
+		// That entry must not bypass a failed lookup by signalling the worker before ownership is inspected.
+		writeFileSync(join(work, "groups"), `${own}\n`, { flag: "a" });
 		const s = call(b, { sub: "sweep", runId: "tr-s5" });
 		expect(s.exit).toBe(WRAPPER_EXIT.failed);
 		expect(s.stderr).toContain("sweep: session lookup failed: session ");
@@ -1004,6 +1938,9 @@ describe("the part owns its session: the cap and a groups sweep kill every proce
 		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
 		expect(r.stderr).toContain(`${TIMEOUT_LINE}; cleanup left 1 alive: ${own}`);
 		expect(readFileSync(join(work, "full.cleanup.log"), "utf8")).toContain(`\n${own} ${own} /bin/sleep\n`);
+		// A detector-recorded group and the part's session overlap: the survivor is counted once, and the member-kill
+		// refusal still applies to it even when both ownership entries name it.
+		writeFileSync(join(work, "groups"), `${own}\n`, { flag: "a" });
 		const s = call(b, { sub: "sweep", runId: "tr-s6" });
 		expect(s.exit).toBe(WRAPPER_EXIT.failed);
 		expect(s.stderr).toContain(`sweep: 1 alive after KILL: ${own}`);

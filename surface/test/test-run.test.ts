@@ -11,13 +11,13 @@ import { type EntryRow, type InstructionRow, TEST_RUNNER_BY } from "../../ledger
 import { boundPrs, holdersOf, testPrBody, testPrInstructionBody } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
 import {
-	AS2TEST_EXEC, authoritativeRun, baseCompareFor, baseParts, boundBranches, buildTestRun, callTimedOut, carriedRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
+	AS2TEST_EXEC, authoritativeRun, baseCompareFor, baseParts, boundBranches, buildTestRun, callStuck, callTimedOut, carriedRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
 	type ClosePr, closeFreshness, decideRun, decisionLogFault, decisionLogOnly, executedFiles, fullSuiteSlice, gitShimText, heartbeatText, isBunTestFile, isSecurityPath, KEEP_RUNS, lockHolderStale,
 	logFirstErrors, mainRed, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseJunit, parsePushDest, parseTestRequested,
 	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, type RangeCommit,
 	recordLive, reportCapBytes, reservation, resultJson, type RunFacts, runDirOf, runLive, runnerDiedRun, runsRoot, servedRepo, settleArtifact, soloPlan, stageDirOf, pushDestBody,
 	TEST_RUNNER_DEFAULTS, type TestRequested, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf, testRunnerConfig,
-	TestRunShapeError, testRuns, WRAPPER_EXIT, wrapperArgv, workDirOf, failuresOf, parseSecurityRed, securityFailuresOf, securityRedBody, securityRedOf,
+	TestRunShapeError, testRuns, WRAPPER_EXIT, wrapperArgv, workDirOf, failuresOf, parseSecurityRed, securityFailuresOf, securityRedBody, securityRedOf, executorStalledReason, StuckWatch, stuckReason,
 } from "../src/test-run";
 import { tmp } from "./helpers";
 
@@ -399,6 +399,21 @@ describe("profile: the testRunner block", () => {
 		expect(yml.ok && yml.config.fullWorkers).toBe(4);
 		expect(testRunnerConfig(Bun.YAML.parse('testRunner:\n  fullWorkers: "4"\n')).ok).toBe(false);
 	});
+	test("stuckStop (PLAN wl-mvq8x4pkjmx69s D4): shadow when absent, shadow or enforce as written, anything else refused", () => {
+		const repos = [{ origin: "o/r", command: "bun test" }];
+		expect(TEST_RUNNER_DEFAULTS.stuckStop).toBe("shadow");
+		const absent = testRunnerConfig({ testRunner: { repos } });
+		expect(absent.ok && absent.config.stuckStop).toBe("shadow");
+		for (const v of ["shadow", "enforce"] as const) {
+			const c = testRunnerConfig({ testRunner: { repos, stuckStop: v } });
+			expect(c.ok && c.config.stuckStop).toBe(v);
+		}
+		for (const bad of ["Enforce", "off", "", null, true, 1, ["enforce"]]) {
+			expect({ bad, c: testRunnerConfig({ testRunner: { repos, stuckStop: bad } }) }).toEqual({ bad, c: { ok: false, error: "testRunner.stuckStop is not shadow or enforce" } });
+		}
+		const yml = testRunnerConfig(Bun.YAML.parse("testRunner:\n  stuckStop: enforce\n"));
+		expect(yml.ok && yml.config.stuckStop).toBe("enforce");
+	});
 	test("the runs root: the override, else test-runs beside the resolved ledger; run, work and stage dirs", () => {
 		expect(runsRoot({ HOME: "/h", AGENT_SYSTEM_TEST_RUNS: "/tmp/runs" })).toBe("/tmp/runs");
 		expect(runsRoot({ HOME: "/h" })).toBe("/h/.agent-system-2/test-runs");
@@ -494,6 +509,77 @@ describe("junit: counts and failing names with their first error line; anything 
 		for (const code of [0, 1, WRAPPER_EXIT.failed, WRAPPER_EXIT.refused, null]) expect(callTimedOut({ code, outlived: true })).toBe(true);
 		for (const code of [0, 1, WRAPPER_EXIT.failed, WRAPPER_EXIT.refused, null]) expect(callTimedOut({ code, outlived: false })).toBe(false);
 	});
+	test("PLAN wl-mvq8x4pkjmx69s D4: a call is stuck when it exited 125 or its stdout has a stuck-stop line, however it ended", () => {
+		expect(WRAPPER_EXIT.stuck).toBe(125);
+		const stop = "part full\nstuck-signature 2026-10-27T05:00:00.000Z part full worker 41 zombie 42 since 5000 mode enforce bun 1.3.14 abc\nstuck-stop 2026-10-27T05:00:05.000Z part full worker 41 zombie 42\n";
+		expect(callStuck({ code: WRAPPER_EXIT.stuck, out: "" })).toBe(true);
+		// a stop line then a signal exit, another exit, the backstop's abandonment (no exit) or an early refusal: still stuck
+		for (const code of [null, 0, 1, WRAPPER_EXIT.timeout, WRAPPER_EXIT.failed, WRAPPER_EXIT.refused]) expect(callStuck({ code, out: stop })).toBe(true);
+		// a signature alone, a shadow `stuck-would-stop`, a cleared signature: not stuck
+		const shadow = "stuck-signature 2026-10-27T05:00:00.000Z part full worker 41 zombie 42 since 5000 mode shadow bun 1.3.14 abc\nstuck-would-stop 2026-10-27T05:00:05.000Z part full worker 41 zombie 42\n";
+		for (const out of ["", shadow, "a log line mentioning stuck-stop part full worker 1 zombie 2\n"]) expect(callStuck({ code: 0, out })).toBe(false);
+	});
+	test("D4: a stuck part's reason starts `stuck:`: the exec's own line, else one built from the stop line; an abandoned stop says so", () => {
+		const stop = "stuck-stop 2026-10-27T05:00:05.000Z part full worker 41 zombie 42\n";
+		const own = "stuck: worker 41 spun 5200 ms in Bun.spawnSync with unreaped child 42; 2 process groups killed, containment contained";
+		expect(stuckReason({ code: 125, out: stop, err: `noise\n${own}`, abandoned: false })).toBe(own);
+		expect(stuckReason({ code: null, out: stop, err: "", abandoned: false })).toBe("stuck: worker 41 spun in Bun.spawnSync with unreaped child 42");
+		expect(stuckReason({ code: null, out: stop, err: "", abandoned: true })).toBe("stuck: worker 41 spun in Bun.spawnSync with unreaped child 42; executor did not finish the stop");
+		expect(stuckReason({ code: 125, out: "", err: "", abandoned: false })).toBe("stuck: the executor exited 125 with no stop line");
+	});
+	describe("D4: the enforce backstop over a part's stdout", () => {
+		const t0 = Date.parse("2026-10-27T05:00:00.000Z");
+		const at = (ms: number) => new Date(t0 + ms).toISOString();
+		const sig = (ms: number, w: number, z: number) => `stuck-signature ${at(ms)} part full worker ${w} zombie ${z} since 5000 mode enforce bun 1.3.14 abc\n`;
+		const cleared = (ms: number, w: number, z: number) => `stuck-cleared ${at(ms)} part full worker ${w} zombie ${z} held 800 matched no\n`;
+		const stopLine = (ms: number, w: number, z: number) => `stuck-stop ${at(ms)} part full worker ${w} zombie ${z}\n`;
+		test("a signature opens a deadline at its own time plus the backstop; nothing else does", () => {
+			const s = new StuckWatch(16_500);
+			s.feed("part full\nsome output\n", t0);
+			expect(s.first()).toBeNull();
+			s.feed(`part full\nsome output\n${sig(1000, 41, 42)}`, t0 + 9_000);
+			expect(s.first()).toEqual({ worker: 41, zombie: 42, deadline: t0 + 1000 + 16_500 });
+			// an incomplete line is read once it ends
+			const partial = `part full\nsome output\n${sig(1000, 41, 42)}stuck-cleared ${at(2000)} part full worker 41`;
+			s.feed(partial, t0 + 9_500);
+			expect(s.first()?.worker).toBe(41);
+			s.feed(`${partial} zombie 42 held 1000 matched no\n`, t0 + 9_600);
+			expect(s.first()).toBeNull();
+		});
+		test("a signature then stuck-cleared: the backstop is disarmed and the part runs on", () => {
+			const s = new StuckWatch(1_000);
+			s.feed(sig(0, 41, 42) + cleared(500, 41, 42), t0 + 600);
+			expect(s.first()).toBeNull();
+			expect(s.stopSeen).toBe(false);
+		});
+		test("overlapping signatures A and B, A cleared: B's deadline still fires", () => {
+			const s = new StuckWatch(16_500);
+			s.feed(sig(0, 41, 42) + sig(2000, 51, 52) + cleared(3000, 41, 42), t0 + 3000);
+			expect(s.first()).toEqual({ worker: 51, zombie: 52, deadline: t0 + 2000 + 16_500 });
+			// a clear of another key closes only its own
+			s.feed(sig(0, 41, 42) + sig(2000, 51, 52) + cleared(3000, 41, 42) + cleared(3500, 41, 99), t0 + 3500);
+			expect(s.first()?.worker).toBe(51);
+		});
+		test("the earliest open deadline is the call's", () => {
+			const s = new StuckWatch(16_500);
+			s.feed(sig(2000, 51, 52) + sig(0, 41, 42), t0 + 2000);
+			expect(s.first()?.worker).toBe(41);
+		});
+		test("a stop line makes the deadline terminal: a later stuck-cleared neither disarms nor extends it", () => {
+			const s = new StuckWatch(16_500);
+			s.feed(sig(0, 41, 42) + stopLine(5000, 41, 42) + cleared(6000, 41, 42) + sig(7000, 41, 42), t0 + 7000);
+			expect(s.stopSeen).toBe(true);
+			expect(s.first()).toEqual({ worker: 41, zombie: 42, deadline: t0 + 16_500 });
+		});
+		test("a stop line with no signature opens its own deadline; an unparsable time counts from the read", () => {
+			const s = new StuckWatch(1_000);
+			s.feed(stopLine(5000, 41, 42), t0 + 5100);
+			expect(s.first()).toEqual({ worker: 41, zombie: 42, deadline: t0 + 6000 });
+			const u = new StuckWatch(1_000);
+			u.feed("stuck-signature not-a-time part full worker 41 zombie 42 since 5000 mode enforce bun 1 x\n", t0);
+			expect(u.first()?.deadline).toBe(t0 + 1_000);
+		});
+	});
 	test("the installed bun's own report and log parse the same way (format drift fails here)", () => {
 		const dir = tmp("junit-live");
 		mkdirSync(join(dir, "sub"));
@@ -562,7 +648,8 @@ describe("verdict and settle", () => {
 		pass: 10, fail, skip: 0, exit: fail > 0 ? 1 : 0, ms: 5, error: null, failures: Array.from({ length: fail }, (_, i) => ({ name: `f > t${i}`, firstError: `error: e${i}` })), ...over,
 	});
 	const facts = (over: Partial<RunFacts> = {}): RunFacts => ({
-		requestedSha: A, fetchedSha: A, error: null, full: part(), fullTimedOut: false, solo: [{ file: "./x.test.ts", ...part() }], headAtStart: A, headAtEnd: A, owner: true, sliceState: "open", baseRuns: null, ...over,
+		requestedSha: A, fetchedSha: A, error: null, full: part(), fullTimedOut: false, solo: [{ file: "./x.test.ts", ...part() }], headAtStart: A, headAtEnd: A, owner: true, sliceState: "open", baseRuns: null,
+		stuck: null, executorStalled: null, ...over,
 	});
 	test("green at an unchanged head settles an open slice, and only an open one", () => {
 		expect(decideRun(facts())).toEqual({ verdict: "green", outcome: "green", reason: null, settle: true });
@@ -739,6 +826,37 @@ describe("verdict and settle", () => {
 		// a stale head still outranks it
 		expect(decideRun(facts({ full, fullTimedOut: true, solo: [], headAtEnd: B })).verdict).toBe("stale");
 	});
+	test("a stuck part (PLAN wl-mvq8x4pkjmx69s D4) is error with its reason, over failures and a timeout; failures stay; never green or red-main", () => {
+		const reason = "full: stuck: worker 41 spun 5200 ms in Bun.spawnSync with unreaped child 42; 2 process groups killed, containment contained";
+		const sec = "gates/test/g.test.ts > gate";
+		const full = named(["x.test.ts > t1", sec], { error: "stuck: worker 41 …", exit: 125 });
+		const f = facts({ full, solo: [], stuck: reason });
+		const d = decideRun(f);
+		expect(d).toEqual({ verdict: "error", outcome: "error", reason, settle: false });
+		const t = buildTestRun(request("tr-0abc12", 17, A), f, d, { base: C, mergeBase: B, runDir: "/r", preflight: "ok" });
+		expect(t.failures.map((x) => x.name)).toEqual(["x.test.ts > t1", sec]);
+		expect(securityFailuresOf(t).map((x) => x.name)).toEqual([sec]);
+		// over a timeout
+		expect(decideRun(facts({ full, fullTimedOut: true, solo: [], stuck: reason })).reason).toBe(reason);
+		// a stuck solo or base part in a run whose every part would be green, or red-main, is still error
+		expect(decideRun(facts({ stuck: "./x.test.ts: stuck: worker 1 spun in Bun.spawnSync with unreaped child 2" }))).toMatchObject({ verdict: "error", reason: "./x.test.ts: stuck: worker 1 spun in Bun.spawnSync with unreaped child 2" });
+		const mainRedFacts = facts({ full: named(["x.test.ts > t1"]), solo: [solo("./x.test.ts", named(["x.test.ts > t1"]))], baseRuns: onBase({ "./x.test.ts": named(["x.test.ts > t1"]) }) });
+		expect(decideRun(mainRedFacts).verdict).toBe("red-main");
+		expect(decideRun({ ...mainRedFacts, stuck: "base ./x.test.ts: stuck: x" })).toMatchObject({ verdict: "error", reason: "base ./x.test.ts: stuck: x" });
+		// a run-level error rides after it; a fetched head that is not the request, or a head that moved, is still stale
+		expect(decideRun(facts({ stuck: reason, error: "post-sweep deadline exceeded before publication" })).reason).toBe(`${reason}; post-sweep deadline exceeded before publication`);
+		expect(decideRun(facts({ stuck: reason, fetchedSha: B })).verdict).toBe("stale");
+		expect(decideRun(facts({ stuck: reason, headAtEnd: B })).verdict).toBe("stale");
+		// a head re-check that could not answer leaves the stuck reason
+		expect(decideRun(facts({ stuck: reason, headAtEnd: null }))).toMatchObject({ verdict: "error", reason });
+	});
+	test("a stalled executor (D4) is error with its own reason, never a stuck one", () => {
+		const reason = `full: ${executorStalledReason(41)}`;
+		expect(reason).toBe("full: executor stalled during stuck detection; worker 41 was a candidate, not confirmed");
+		const d = decideRun(facts({ full: part(0, { error: executorStalledReason(41), exit: null }), solo: [], executorStalled: reason }));
+		expect(d).toEqual({ verdict: "error", outcome: "error", reason, settle: false });
+		expect(d.reason).not.toContain("stuck:");
+	});
 	test("red-main: the entry carries base's sha and both failure sets, round-trips, settles with an artifact naming base, and signals no failure", () => {
 		const r = request("tr-0abc12", 17, A);
 		const f = facts({ full: named(["x.test.ts > t1"]), solo: [solo("./x.test.ts", named(["x.test.ts > t1"]))], baseRuns: onBase({ "./x.test.ts": named(["x.test.ts > t1", "x.test.ts > other"]) }) });
@@ -765,6 +883,10 @@ describe("the solo policy (PLAN wl-mvq4edh02r5z40 D1)", () => {
 		expect(soloPlan({ full: ok({ error: "timeout", exit: 124 }), timedOut: true, changed, executed: [] })).toEqual({ stop: true });
 		// the outlive path: a part that looks clean but whose call timed out still stops
 		expect(soloPlan({ full: ok(), timedOut: true, changed, executed: [] })).toEqual({ stop: true });
+	});
+	test("a stuck or stalled full part (PLAN wl-mvq8x4pkjmx69s D4) stops the run, whatever it reported", () => {
+		expect(soloPlan({ full: failing(["a.test.ts > t"], { error: "stuck: worker 1" }), timedOut: false, halted: true, changed, executed: ["a.test.ts"] })).toEqual({ stop: true });
+		expect(soloPlan({ full: ok(), timedOut: false, halted: true, changed, executed: [] })).toEqual({ stop: true });
 	});
 	test("an all-pass full part runs alone only the changed files it ran no test of, a security file among them (a first run, not a rerun)", () => {
 		expect(soloPlan({ full: ok(), timedOut: false, changed, executed: ["a.test.ts", "sub/b_spec.ts", "gates/test/g.test.ts", "other.test.ts"] })).toEqual({ stop: false, files: [] });
@@ -1228,6 +1350,6 @@ describe("the _as2test wrapper's argv contract", () => {
 			// base never runs the full suite (PLAN wl-mvq4edh02r5z40 D3): `base-full` is no wrapper subcommand
 			{ sub: "base-full", runId: "tr-1" },
 		] as Parameters<typeof wrapperArgv>[0][]) expect(() => wrapperArgv(bad)).toThrow(TestRunShapeError);
-		expect(WRAPPER_EXIT).toEqual({ ok: 0, probeReachable: 65, failed: 70, sweepLockHeld: 75, refused: 64, fenced: 77, timeout: 124 });
+		expect(WRAPPER_EXIT).toEqual({ ok: 0, probeReachable: 65, failed: 70, sweepLockHeld: 75, refused: 64, fenced: 77, timeout: 124, stuck: 125 });
 	});
 });

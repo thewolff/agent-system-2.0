@@ -22,6 +22,7 @@ import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { defaultLedgerPath } from "../../ledger/src/locality";
+import { STUCK_DEFAULTS } from "./stuck-detect";
 import { AS2TEST_EXEC, AS2TEST_ROOT, AS2TEST_USER, WRAPPER_EXIT, type WrapperCall, runsDbOf, wrapperArgv } from "./test-run";
 
 // ---- the wrapper ---------------------------------------------------------------------------------
@@ -66,6 +67,16 @@ export interface ExecWrapperOptions {
 	sweepLockWaitMs?: number;
 	/** Test-only, `groups` renders only: the stuck capture's deadline at a part's cap (default 20 s). */
 	captureMs?: number;
+	/** Test-only, `groups` renders only: the stuck-worker detector's tick (PLAN wl-mvq8x4pkjmx69s D2; default 1 s). */
+	detectTickMs?: number;
+	/** Test-only, `groups` renders only: how long a signature must hold to match (D2; default 5 s). */
+	detectPersistMs?: number;
+	/** Test-only, `groups` renders only: the signature capture's deadline on a match (D3; default 3 s). */
+	signatureCaptureMs?: number;
+	/** Test-only, `groups` renders only: the enforce stop's SIGTERM → SIGKILL grace (D3; default 1.5 s). */
+	stopGraceMs?: number;
+	/** Test-only, `groups` renders only: append each detector tick's observation to `<work>/<part>.stuck-trace.jsonl` (D3). */
+	detectTrace?: boolean;
 }
 
 /** What the wrapper hands test-exec in `AS2TEST_EXEC_CONFIG`; test-exec validates it again. */
@@ -78,6 +89,11 @@ export interface ExecConfig {
 	killGraceMs: number;
 	sweepLockWaitMs: number;
 	captureMs: number;
+	detectTickMs: number;
+	detectPersistMs: number;
+	signatureCaptureMs: number;
+	stopGraceMs: number;
+	detectTrace: boolean;
 }
 
 export class WrapperRenderError extends Error {}
@@ -91,18 +107,27 @@ export function execConfigOf(o: ExecWrapperOptions): ExecConfig {
 		if (typeof v !== "string" || !plainAbs(v)) throw new WrapperRenderError(`${k} must be a normalized absolute path: ${String(v)}`);
 	}
 	if (o.sweepScope !== "uid" && o.sweepScope !== "groups") throw new WrapperRenderError(`sweepScope must be uid or groups: ${String(o.sweepScope)}`);
-	const testOnly = o.hooks !== undefined || o.killGraceMs !== undefined || o.sweepLockWaitMs !== undefined || o.captureMs !== undefined;
-	if (testOnly && o.sweepScope !== "groups") throw new WrapperRenderError("hooks, killGraceMs, sweepLockWaitMs and captureMs are test-only: a uid render carries none");
+	const testOnly = o.hooks !== undefined || o.killGraceMs !== undefined || o.sweepLockWaitMs !== undefined || o.captureMs !== undefined
+		|| o.detectTickMs !== undefined || o.detectPersistMs !== undefined || o.signatureCaptureMs !== undefined || o.stopGraceMs !== undefined || o.detectTrace !== undefined;
+	if (testOnly && o.sweepScope !== "groups") {
+		throw new WrapperRenderError("hooks, killGraceMs, sweepLockWaitMs, captureMs, detectTickMs, detectPersistMs, signatureCaptureMs, stopGraceMs and detectTrace are test-only: a uid render carries none");
+	}
 	if (o.hooks !== undefined && !plainAbs(o.hooks)) throw new WrapperRenderError(`hooks must be a normalized absolute path: ${o.hooks}`);
+	if (o.detectTrace !== undefined && typeof o.detectTrace !== "boolean") throw new WrapperRenderError("detectTrace must be a boolean");
 	const ms = (v: number | undefined, d: number, k: string): number => {
 		if (v === undefined) return d;
 		if (!Number.isSafeInteger(v) || v < 0) throw new WrapperRenderError(`${k} must be a whole number of ms`);
 		return v;
 	};
+	const detectTickMs = ms(o.detectTickMs, STUCK_DEFAULTS.tickMs, "detectTickMs");
+	if (detectTickMs < 1) throw new WrapperRenderError("detectTickMs must be 1 ms or more");
 	return {
 		root: o.root, bun: o.bun, sweep: o.sweepScope === "uid" ? UID_SWEEP : "groups", hooks: o.hooks ?? null,
 		killGraceMs: ms(o.killGraceMs, KILL_GRACE_MS, "killGraceMs"), sweepLockWaitMs: ms(o.sweepLockWaitMs, SWEEP_LOCK_WAIT_MS, "sweepLockWaitMs"),
 		captureMs: ms(o.captureMs, CAPTURE_MS, "captureMs"),
+		detectTickMs, detectPersistMs: ms(o.detectPersistMs, STUCK_DEFAULTS.persistMs, "detectPersistMs"),
+		signatureCaptureMs: ms(o.signatureCaptureMs, STUCK_DEFAULTS.signatureCaptureMs, "signatureCaptureMs"),
+		stopGraceMs: ms(o.stopGraceMs, STUCK_DEFAULTS.stopGraceMs, "stopGraceMs"), detectTrace: o.detectTrace ?? false,
 	};
 }
 

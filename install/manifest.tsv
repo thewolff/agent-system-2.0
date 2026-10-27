@@ -1157,6 +1157,10 @@ surface/src/as2test.ts	module	-
 surface/src/as2test-temp.ts	module	-
 surface/test/as2test.test.ts	test	-
 surface/test/as2test-temp.test.ts	test	-
+surface/src/stuck-detect.ts	module	-
+surface/test/stuck-detect.test.ts	test	-
+surface/scripts/stuck-report.ts	module	-
+surface/test/stuck-report.test.ts	test	-
 install/as2test-setup.sh	install	-
 gates/test/r08-push-dest.test.ts	test	-
 surface/test/close-fresh.test.ts	test	-
