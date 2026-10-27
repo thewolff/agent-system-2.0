@@ -7,8 +7,14 @@
 // fetch and push stays local), a fake `gh` first on PATH that records its argv and answers
 // `pr list --state all` per head branch from `prs/<branch>.json`, and a testRunner config through
 // `$AGENT_SYSTEM_TEST_RUNNER_CONFIG`.
-import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+//
+// Each git world is built once per file, in `beforeAll`: a template per shape (the bare origin and the clone, the lane's
+// change, a train's or a merge's commits on a second clone), none of whose commits name a workload id. A test copies
+// its template's directory (no process) and starts at most FIXTURE_SPAWNS git processes of its own fixture: the lane
+// worktree on wl/<id> and its push. `fixture` counts every process started while it builds and asserts the bound in
+// every test, so the file keeps bun's default 5 s per test (PLAN wl-mvqu69tjvpy96o § 2 C7, R7).
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { closeWorkloadWithEntry } from "../extensions/workload";
@@ -19,10 +25,6 @@ import { branchName, worktreePath } from "../src/launch";
 import { testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
 import { SURFACE_BY, type SurfaceAPI } from "../src/types";
 import { clock, tempLedger, tmp } from "./helpers";
-
-// Every test spawns real git and the fake gh many times (3-4 s idle); on a loaded runner the 5 s
-// bun default killed them mid-check (tr-0mvqeuifhqv87ca: 4 timeouts, the close check reading -1).
-setDefaultTimeout(30_000);
 
 const roots: string[] = [];
 afterAll(() => {
@@ -62,25 +64,46 @@ interface World {
 	env: Record<string, string>;
 }
 
-/** A canonical scratch root with the fake `gh`, a served config, and git isolated from the machine's config. */
-function world(served = OWNER_REPO): World {
-	const root = realpathSync(tmp("close-fresh"));
-	roots.push(root);
+/** The world rooted at `root`: git isolated from the machine's config, the fake `gh` first on PATH. */
+function worldAt(root: string): World {
 	const bin = join(root, "bin");
-	mkdirSync(join(bin, "prs"), { recursive: true });
-	writeFileSync(join(bin, "gh"), GH);
-	chmodSync(join(bin, "gh"), 0o755);
-	const origin = join(root, "origin.git");
-	writeFileSync(join(root, "gitconfig"), `[url "${origin}"]\n\tinsteadOf = ${ORIGIN_URL}\n`);
-	const config = join(root, "config.yml");
-	writeFileSync(config, `setupVersion: 2\ntestRunner:\n  repos:\n    - origin: ${served}\n      command: bun test\n`);
 	const env: Record<string, string> = {
 		...(process.env as Record<string, string>),
 		PATH: `${bin}:${process.env.PATH ?? ""}`,
 		GIT_CONFIG_GLOBAL: join(root, "gitconfig"), GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0",
 		GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid",
 	};
-	return { root, work: join(root, "work"), origin, bin, config, env };
+	return { root, work: join(root, "work"), origin: join(root, "origin.git"), bin, config: join(root, "config.yml"), env };
+}
+/** A new canonical scratch root, removed after the file. */
+function scratchRoot(tag: string): string {
+	const root = realpathSync(tmp(tag));
+	roots.push(root);
+	return root;
+}
+/** The world's gitconfig: the served GitHub URL resolves to this world's own bare origin. */
+function writeGitconfig(w: World): void {
+	writeFileSync(join(w.root, "gitconfig"), `[url "${w.origin}"]\n\tinsteadOf = ${ORIGIN_URL}\n`);
+}
+/** A template's start: a canonical scratch root with the fake `gh` and the gitconfig, no repository yet. */
+function blankWorld(): World {
+	const w = worldAt(scratchRoot("close-fresh-template"));
+	mkdirSync(join(w.bin, "prs"), { recursive: true });
+	writeFileSync(join(w.bin, "gh"), GH);
+	chmodSync(join(w.bin, "gh"), 0o755);
+	writeGitconfig(w);
+	return w;
+}
+/**
+ * A copy of world `t` in a new root, made with no process: the gitconfig re-pointed at the copy's own origin (the
+ * clones' origin URL is the served GitHub URL, so nothing else in them names a path), and a served testRunner config.
+ */
+function copyOf(t: World, tag: string, served = OWNER_REPO): World {
+	const w = worldAt(scratchRoot(tag));
+	cpSync(t.root, w.root, { recursive: true });
+	writeGitconfig(w);
+	writeFileSync(w.config, `setupVersion: 2\ntestRunner:\n  repos:\n    - origin: ${served}\n      command: bun test\n`);
+	return w;
 }
 
 function sh(w: World, cwd: string, cmd: string[]): { code: number; out: string; err: string } {
@@ -148,13 +171,79 @@ function removeFile(w: World, cwd: string, file: string, msg: string): string {
 	return g(w, cwd, "rev-parse", "HEAD");
 }
 
-/** The lane's worktree on wl/<id>, cut from origin/main, with one code commit pushed. */
-function laneWithCode(w: World, x: Closable): { lane: string; sha: string } {
-	const lane = worktreePath(w.work, x.wl);
-	g(w, w.work, "worktree", "add", "-q", "-b", x.branch, lane, "origin/main");
-	const sha = commitFile(w, lane, "b.txt", "the lane's change");
-	g(w, lane, "push", "-q", "-u", "origin", x.branch);
-	return { lane, sha };
+// ---- the templates: each built once per file in a beforeAll, copied by every test --------------------------------
+
+/** The processes a test's fixture may start (R7): the lane worktree on wl/<id> and its push. */
+const FIXTURE_SPAWNS = 2;
+/** Holds the lane's change in the template clone: outside refs/heads/ and refs/remotes/, so no listing, fetch or push of branches sees it. */
+const LANE_REF = "refs/fixture/lane";
+type Shape = "origin" | "merged" | "pastGreen" | "train-OPEN" | "train-MERGED";
+/** Each shape's template world, and the commit a test's wl/<id> starts at (null: the shape has no lane). */
+const templates: Partial<Record<Shape, { w: World; lane: string | null }>> = {};
+/** The templates' commits: s the lane's change; mergedPastGreen's o, h and m; trainShape's b1, b2 and p. */
+const T = { s: "", o: "", h: "", m: "", b1: "", b2: "", p: "" };
+
+// origin: the bare origin and the clone on main, with the lane's change s (b.txt on origin/main) held by LANE_REF alone.
+// merged: the same with s fast-forwarded onto origin's main, as the lane's PR merging does.
+beforeAll(() => {
+	const w = blankWorld();
+	withOrigin(w);
+	g(w, w.work, "checkout", "-q", "--detach");
+	T.s = commitFile(w, w.work, "b.txt", "the lane's change");
+	g(w, w.work, "update-ref", LANE_REF, T.s);
+	g(w, w.work, "checkout", "-q", "main");
+	templates.origin = { w, lane: T.s };
+	const m = copyOf(w, "close-fresh-template");
+	g(m, m.work, "push", "-q", "origin", `${T.s}:main`);
+	templates.merged = { w: m, lane: T.s };
+});
+
+function template(shape: Shape): { w: World; lane: string | null } {
+	const t = templates[shape];
+	if (!t) throw new Error(`close-fresh: no ${shape} template; the beforeAll that builds it (in this test's describe, or at the top of the file) did not run`);
+	return t;
+}
+function argvOf(a: unknown): string {
+	if (Array.isArray(a)) return a.join(" ");
+	if (a && typeof a === "object" && "cmd" in a && Array.isArray(a.cmd)) return a.cmd.join(" ");
+	return String(a);
+}
+
+interface Fixture {
+	w: World;
+	x: Closable;
+	/** The lane's worktree path (created only with `lane`). */
+	lane: string;
+	/** The commit wl/<id> is at ("" without `lane`). */
+	sha: string;
+}
+/**
+ * A test's world: a copy of the `shape` template (no process) and a closable workload on it; with `lane`, the lane's
+ * worktree on wl/<id> at the template's lane commit, pushed with its upstream (the two processes). Every process
+ * started while it builds is counted (Bun.spawnSync and Bun.spawn), and more than FIXTURE_SPAWNS fails the test,
+ * naming each one (PLAN wl-mvqu69tjvpy96o R7: on a loaded runner a bigger fixture outran bun's 5 s).
+ */
+function fixture(shape: Shape, o: { lane?: boolean; served?: string } = {}): Fixture {
+	const t = template(shape);
+	const at = o.lane ? t.lane : "";
+	if (at === null) throw new Error(`close-fresh: the ${shape} template has no lane commit, so it cannot give a test a lane`);
+	const spawnSync = spyOn(Bun, "spawnSync");
+	const spawn = spyOn(Bun, "spawn");
+	try {
+		const w = copyOf(t.w, "close-fresh", o.served);
+		const x = closable(w);
+		const lane = worktreePath(w.work, x.wl);
+		if (o.lane) {
+			g(w, w.work, "worktree", "add", "-q", "-b", x.branch, lane, at);
+			g(w, lane, "push", "-q", "-u", "origin", x.branch);
+		}
+		const started = [...spawnSync.mock.calls, ...spawn.mock.calls].map(([cmd]) => argvOf(cmd));
+		expect({ shape, started }).toEqual({ shape, started: started.slice(0, FIXTURE_SPAWNS) });
+		return { w, x, lane, sha: at };
+	} finally {
+		spawnSync.mockRestore();
+		spawn.mockRestore();
+	}
 }
 
 /** What `gh pr list -R example/repo --head <branch> --state all` prints; a merged PR's merge commit is its head (a fast-forward) unless given. */
@@ -216,10 +305,7 @@ function expectPublishedOn(w: World, x: Closable, c: string): string {
 
 describe("close check: a served repo's close needs a green at every PR head and on the candidate (PLAN § 2.4 item 4)", () => {
 	test("green at head closes: D is committed on the pinned C and pushed by sha; every gh call names the repo", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { sha: s } = laneWithCode(w, x);
+		const { w, x, sha: s } = fixture("origin", { lane: true });
 		prs(w, x.branch, [{ number: 7, state: "OPEN", headRefOid: s }]);
 		writeFileSync(join(w.bin, "open-pr"), PR_URL);
 		requested(x, "tr-1", 7, s);
@@ -236,10 +322,7 @@ describe("close check: a served repo's close needs a green at every PR head and 
 	});
 
 	test("head ahead of the green only by .ai/decision-log/ closes", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { lane, sha: s } = laneWithCode(w, x);
+		const { w, x, lane, sha: s } = fixture("origin", { lane: true });
 		requested(x, "tr-1", 7, s);
 		ran(x, "tr-1", 7, s, "green");
 		const y = commitFile(w, lane, ".ai/decision-log/2026-10-08--0900--lane--note.md", "a decision-log note");
@@ -254,10 +337,7 @@ describe("close check: a served repo's close needs a green at every PR head and 
 	});
 
 	test("head ahead of the green by code refuses, naming the file", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { lane, sha: s } = laneWithCode(w, x);
+		const { w, x, lane, sha: s } = fixture("origin", { lane: true });
 		requested(x, "tr-1", 7, s);
 		ran(x, "tr-1", 7, s, "green");
 		const z = commitFile(w, lane, "c.txt", "more code after the green");
@@ -271,10 +351,7 @@ describe("close check: a served repo's close needs a green at every PR head and 
 	});
 
 	test("review r1 B3: a code commit and its revert after the green refuse, though the head's tree equals the green's", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { lane, sha: s } = laneWithCode(w, x);
+		const { w, x, lane, sha: s } = fixture("origin", { lane: true });
 		requested(x, "tr-1", 7, s);
 		ran(x, "tr-1", 7, s, "green");
 		commitFile(w, lane, "c.txt", "code after the green");
@@ -291,10 +368,7 @@ describe("close check: a served repo's close needs a green at every PR head and 
 	});
 
 	test("review r1 B3: the same revert pair on the local candidate only is an untested commit", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { lane, sha: s } = laneWithCode(w, x);
+		const { w, x, lane, sha: s } = fixture("origin", { lane: true });
 		prs(w, x.branch, [{ number: 7, state: "OPEN", headRefOid: s }]);
 		requested(x, "tr-1", 7, s);
 		ran(x, "tr-1", 7, s, "green");
@@ -306,10 +380,7 @@ describe("close check: a served repo's close needs a green at every PR head and 
 	});
 
 	test("a chain of decision-log-only commits after the green closes, an empty commit included; the entry carries the receipt", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { lane, sha: s } = laneWithCode(w, x);
+		const { w, x, lane, sha: s } = fixture("origin", { lane: true });
 		requested(x, "tr-1", 7, s);
 		ran(x, "tr-1", 7, s, "green");
 		commitFile(w, lane, ".ai/decision-log/2026-10-08--0900--lane--one.md", "a decision-log note");
@@ -328,10 +399,7 @@ describe("close check: a served repo's close needs a green at every PR head and 
 	});
 
 	test("a newer red supersedes an older green", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { sha: s } = laneWithCode(w, x);
+		const { w, x, sha: s } = fixture("origin", { lane: true });
 		prs(w, x.branch, [{ number: 7, state: "OPEN", headRefOid: s }]);
 		requested(x, "tr-1", 7, s);
 		ran(x, "tr-1", 7, s, "green");
@@ -342,10 +410,7 @@ describe("close check: a served repo's close needs a green at every PR head and 
 	});
 
 	test("a late superseded from a displaced run does not override the newer green", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { sha: s } = laneWithCode(w, x);
+		const { w, x, sha: s } = fixture("origin", { lane: true });
 		prs(w, x.branch, [{ number: 7, state: "OPEN", headRefOid: s }]);
 		requested(x, "tr-1", 7, s);
 		requested(x, "tr-2", 7, s);
@@ -359,29 +424,21 @@ describe("close check: a served repo's close needs a green at every PR head and 
 	});
 
 	test("no PR with a code delta refuses", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { sha: s } = laneWithCode(w, x);
+		const { w, x, sha: s } = fixture("origin", { lane: true });
 
 		expectRefused(w, x, await close(w, x), `${x.branch} changes b.txt but has no PR: push and open the PR, then lane_full_test`, s);
 		expect(ghCalls(w)).toEqual([listAll(x.branch)]);
 	});
 
 	test("a PR closed without merge, with a code delta, refuses", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { sha: s } = laneWithCode(w, x);
+		const { w, x, sha: s } = fixture("origin", { lane: true });
 		prs(w, x.branch, [{ number: 7, state: "CLOSED", headRefOid: s }]);
 
 		expectRefused(w, x, await close(w, x), "PR #7 is closed; reopen it, or reset the branch", s);
 	});
 
 	test("an empty PR set with no code delta closes (an investigation): the branch is cut from origin/main and D pushed on it", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
+		const { w, x } = fixture("origin");
 		const main = g(w, w.work, "rev-parse", "origin/main");
 
 		const r = await close(w, x);
@@ -399,10 +456,7 @@ describe("close check: a served repo's close needs a green at every PR head and 
 		["code changes", "d.txt", false],
 	] as const) {
 		test(`a merged PR with ${label} is checked at its final head, fetched through refs/pull/<N>/head when the clone lacks it`, async () => {
-			const w = world();
-			withOrigin(w);
-			const x = closable(w);
-			const { sha: s } = laneWithCode(w, x);
+			const { w, x, sha: s } = fixture("origin", { lane: true });
 			requested(x, "tr-1", 7, s);
 			ran(x, "tr-1", 7, s, "green");
 			// the final head exists only on GitHub's PR ref: made in another clone, pushed to refs/pull/7/head alone
@@ -427,10 +481,7 @@ describe("close check: a served repo's close needs a green at every PR head and 
 	}
 
 	test("an untested local commit refuses", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { lane, sha: s } = laneWithCode(w, x);
+		const { w, x, lane, sha: s } = fixture("origin", { lane: true });
 		prs(w, x.branch, [{ number: 7, state: "OPEN", headRefOid: s }]);
 		requested(x, "tr-1", 7, s);
 		ran(x, "tr-1", 7, s, "green");
@@ -441,10 +492,7 @@ describe("close check: a served repo's close needs a green at every PR head and 
 	});
 
 	test("a branch moved after the check refuses the commit: nothing rendered on it, nothing pushed, the row stays open", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { lane, sha: s } = laneWithCode(w, x);
+		const { w, x, lane, sha: s } = fixture("origin", { lane: true });
 		prs(w, x.branch, [{ number: 7, state: "OPEN", headRefOid: s }]);
 		requested(x, "tr-1", 7, s);
 		ran(x, "tr-1", 7, s, "green");
@@ -466,10 +514,7 @@ describe("close check: a served repo's close needs a green at every PR head and 
 	});
 
 	test("review r1, kimi note 2: under the pin a failed entry commit refuses, with no receipt and nothing published, never an untracked close", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { sha: s } = laneWithCode(w, x);
+		const { w, x, sha: s } = fixture("origin", { lane: true });
 		prs(w, x.branch, [{ number: 7, state: "OPEN", headRefOid: s }]);
 		requested(x, "tr-1", 7, s);
 		ran(x, "tr-1", 7, s, "green");
@@ -491,19 +536,14 @@ describe("close check: a served repo's close needs a green at every PR head and 
 	});
 
 	test("gh failing refuses: the check fails closed", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { sha: s } = laneWithCode(w, x);
+		const { w, x, sha: s } = fixture("origin", { lane: true });
 		writeFileSync(join(w.bin, "fail"), "");
 
 		expectRefused(w, x, await close(w, x), `the close check could not answer: gh pr list --head ${x.branch} exited 1: gh: not logged in`, s);
 	});
 
 	test("the set takes in a push-dest: branch of a holder and a PR a test-requested: names, found with gh pr view", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
+		const { w, x } = fixture("origin");
 		const main = g(w, w.work, "rev-parse", "origin/main");
 		expect(x.ledger.claimWorkload(x.wl, { by: "lane-a", holder: "lane-a", leaseMs: 60_000 }).won).toBe(true);
 		x.ledger.recordEntry({ by: "lane-a", workloadId: x.wl, kind: "assumption", body: `push-dest: origin feature-x ${main}` });
@@ -527,18 +567,13 @@ describe("close check: a served repo's close needs a green at every PR head and 
 	});
 
 	test("a host with no exec cannot run the check in a git checkout: refused", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
+		const { w, x } = fixture("origin");
 
 		expectRefused(w, x, await close(w, x, piOf(w, { exec: false })), `the close check could not answer: the host has no exec for extensions, so git cannot say whether ${w.work} is a repo the test runner serves`, null);
 	});
 
 	test("a repo the runner does not serve is not checked: a code delta with no PR closes as before", async () => {
-		const w = world("someone/else");
-		withOrigin(w);
-		const x = closable(w);
-		const { sha: s } = laneWithCode(w, x);
+		const { w, x, sha: s } = fixture("origin", { lane: true, served: "someone/else" });
 
 		const r = await close(w, x);
 
@@ -556,12 +591,11 @@ const SLICE = "sl-full-1";
 const mergedRed = (x: Closable, n: number, merge: string) =>
 	`: a merged PR passes only on Jo's \`waive\` answering a question that offers waive on the run's slice, asked after the result; it also passes ${waysThrough(x, n, merge)}`;
 
-/** The lane's change on origin/main (merged by fast-forward), and PR #7 from wl/<id> MERGED at that head. */
-function merged(w: World, x: Closable, state: "OPEN" | "MERGED" = "MERGED"): string {
-	const { lane, sha } = laneWithCode(w, x);
-	g(w, lane, "push", "-q", "origin", `${sha}:main`);
-	prs(w, x.branch, [{ number: 7, state, headRefOid: sha }]);
-	return sha;
+/** The lane's change on origin/main (merged by fast-forward: the merged template), and PR #7 from wl/<id> MERGED (or `state`) at that head. */
+function merged(state: "OPEN" | "MERGED" = "MERGED"): Fixture {
+	const f = fixture("merged", { lane: true });
+	prs(f.w, f.x.branch, [{ number: 7, state, headRefOid: f.sha }]);
+	return f;
 }
 /** The full-suite slice the runner's requests name. */
 function fullSlice(x: Closable): void {
@@ -584,11 +618,8 @@ const settled = (x: Closable) => x.ledger.cancelSlice(SLICE, { by: SURFACE_BY })
 describe("PLAN wl-mv5i3lulwwbbi8 D3: a merged PR's red run Jo waived passes the close check; nothing else does", () => {
 	test("Tinker's shape: red on a merged PR, Jo's surface `waive` on its slice after the result → closes; the same on an open PR refuses", async () => {
 		for (const state of ["MERGED", "OPEN"] as const) {
-			const w = world();
-			withOrigin(w);
-			const x = closable(w);
+			const { w, x, sha: s } = merged(state);
 			fullSlice(x);
-			const s = merged(w, x, state);
 			requested(x, "tr-1", 7, s);
 			ran(x, "tr-1", 7, s, "red");
 			answer(x, ask(x));
@@ -620,11 +651,8 @@ describe("PLAN wl-mv5i3lulwwbbi8 D3: a merged PR's red run Jo waived passes the 
 			},
 		];
 		for (const shape of shapes) {
-			const w = world();
-			withOrigin(w);
-			const x = closable(w);
+			const { w, x, sha: s } = merged();
 			fullSlice(x);
-			const s = merged(w, x);
 			shape.run(x, s);
 			settled(x);
 
@@ -637,9 +665,7 @@ describe("PLAN wl-mv5i3lulwwbbi8 D3: a merged PR's red run Jo waived passes the 
 	}, 60_000);
 
 	test("two red runs on one slice (PR #9, then PR #8), one waived question: only the newest, #8's, is waived; #9 still refuses", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
+		const { w, x } = fixture("origin");
 		fullSlice(x);
 		const main = g(w, w.work, "rev-parse", "origin/main");
 		writeFileSync(join(w.bin, "view-9.json"), JSON.stringify({ number: 9, state: "MERGED", headRefOid: main, headRefName: "feature-a", mergeCommit: { oid: main } }));
@@ -669,10 +695,7 @@ function withDone(x: Closable): void {
 describe("PLAN wl-mv8s8srodefytc rev 17.1 D8: a red-main result passes the close check only on a merged PR a merge train of this repo lists", () => {
 	test("red-main at the merged head: refused off a train and on another repo's train; closes once Jo's train on this repo lists the PR", async () => {
 		for (const on of ["no train", "another repo", "this repo"] as const) {
-			const w = world();
-			withOrigin(w);
-			const x = closable(w);
-			const s = merged(w, x);
+			const { w, x, sha: s } = merged();
 			requested(x, "tr-1", 7, s);
 			ran(x, "tr-1", 7, s, "red-main");
 			if (on !== "no train") applyTrain(x.ledger, { kind: "train", prs: [7] }, on === "this repo" ? w.work : join(w.root, "elsewhere"));
@@ -692,10 +715,7 @@ describe("PLAN wl-mv8s8srodefytc rev 17.1 D8: a red-main result passes the close
 
 	test("red-main at the merged head: a train opened from a subdirectory or another checkout of this GitHub repository lists the PR", async () => {
 		for (const from of ["subdirectory", "another checkout"] as const) {
-			const w = world();
-			withOrigin(w);
-			const x = closable(w);
-			const s = merged(w, x);
+			const { w, x, sha: s } = merged();
 			requested(x, "tr-1", 7, s);
 			ran(x, "tr-1", 7, s, "red-main");
 			let where = join(w.work, "surface");
@@ -726,10 +746,7 @@ function supersede(x: Closable, o: { entryBy?: string; author?: string } = {}): 
 
 describe("PLAN wl-mv5i3lulwwbbi8 D2: a superseded workload closes with no open PR and no unmerged commit, its entry naming the successor", () => {
 	test("every PR merged and no commit outside main: closes without a receipt; the entry and the close receipt name the successor", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const s = merged(w, x);
+		const { w, x, sha: s } = merged();
 		withDone(x);
 		const by = supersede(x);
 
@@ -744,10 +761,7 @@ describe("PLAN wl-mv5i3lulwwbbi8 D2: a superseded workload closes with no open P
 	});
 
 	test("an open PR from wl/<id> refuses", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const s = merged(w, x, "OPEN");
+		const { w, x, sha: s } = merged("OPEN");
 		withDone(x);
 		const by = supersede(x);
 
@@ -756,9 +770,7 @@ describe("PLAN wl-mv5i3lulwwbbi8 D2: a superseded workload closes with no open P
 	});
 
 	test("an open PR from a holder's push-dest: branch refuses", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
+		const { w, x } = fixture("origin");
 		const main = g(w, w.work, "rev-parse", "origin/main");
 		expect(x.ledger.claimWorkload(x.wl, { by: "lane-a", holder: "lane-a", leaseMs: 60_000 }).won).toBe(true);
 		x.ledger.recordEntry({ by: "lane-a", workloadId: x.wl, kind: "assumption", body: `push-dest: origin feature-x ${main}` });
@@ -772,19 +784,14 @@ describe("PLAN wl-mv5i3lulwwbbi8 D2: a superseded workload closes with no open P
 
 	test("an unmerged commit on wl/<id>, or on a push-dest: branch only on origin, refuses", async () => {
 		{
-			const w = world();
-			withOrigin(w);
-			const x = closable(w);
-			const { sha: s } = laneWithCode(w, x);
+			const { w, x, sha: s } = fixture("origin", { lane: true });
 			withDone(x);
 			const by = supersede(x);
 
 			expectRefused(w, x, await close(w, x), `${by}, but refs/heads/${x.branch} has 1 commit(s) not in origin/main, first ${s7(s)}: merge them, or delete the branch`, s);
 		}
 		{
-			const w = world();
-			withOrigin(w);
-			const x = closable(w);
+			const { w, x } = fixture("origin");
 			const other = join(w.root, "other");
 			g(w, w.root, "clone", "-q", ORIGIN_URL, other);
 			const y = commitFile(w, other, "y.txt", "work left on a push-dest branch");
@@ -801,10 +808,7 @@ describe("PLAN wl-mv5i3lulwwbbi8 D2: a superseded workload closes with no open P
 
 	test("a superseded: entry a lane wrote, or one naming an instruction not Jo's, counts for nothing; with none, G3 still asks for the receipt", async () => {
 		for (const o of [{ entryBy: "lane-a" }, { author: "orchestrator" }, null]) {
-			const w = world();
-			withOrigin(w);
-			const x = closable(w);
-			const s = merged(w, x);
+			const { w, x, sha: s } = merged();
 			withDone(x);
 			if (o) supersede(x, o);
 
@@ -852,54 +856,69 @@ function otherClone(w: World): string {
 /**
  * Issue #223's shape on the shared branch: #156 (b1) and #220 (b2), another workload's PRs merged before the train pushed, each
  * green only on that workload `y`; then the train's push p, PR #221, merged too. Every merge is a fast-forward of main. `state` is #221's.
+ * The commits are the train-<state> template's (buildTrain); the PR list and y's greens are the test's own.
  */
-function trainShape(w: World, x: Closable, state: "OPEN" | "MERGED" = "MERGED"): { b1: string; b2: string; p: string; y: string } {
-	const other = otherClone(w);
-	g(w, other, "checkout", "-q", "-b", SHARED);
-	const b1 = commitFile(w, other, "f156.txt", "PR #156");
-	g(w, other, "push", "-q", "origin", `${SHARED}:${SHARED}`, `${b1}:main`);
-	const b2 = commitFile(w, other, "f220.txt", "PR #220");
-	g(w, other, "push", "-q", "origin", `${SHARED}:${SHARED}`, `${b2}:main`);
-	const p = commitFile(w, other, "f221.txt", "the train's PR #221");
-	g(w, other, "push", "-q", "origin", `${SHARED}:${SHARED}`, `${p}:refs/pull/221/head`, ...(state === "MERGED" ? [`${p}:main`] : []));
-	prs(w, SHARED, [{ number: 156, state: "MERGED", headRefOid: b1 }, { number: 220, state: "MERGED", headRefOid: b2 }, { number: 221, state, headRefOid: p }]);
-	const y = foreignGreen(w, x, "tr-156", 156, b1);
-	requested(x, "tr-220", 220, b2, { wl: y });
-	ran(x, "tr-220", 220, b2, "green", { wl: y });
-	return { b1, b2, p, y };
+function trainShape(state: "OPEN" | "MERGED" = "MERGED"): Fixture & { b1: string; b2: string; p: string; y: string } {
+	const f = fixture(`train-${state}`);
+	const { w, x } = f;
+	prs(w, SHARED, [{ number: 156, state: "MERGED", headRefOid: T.b1 }, { number: 220, state: "MERGED", headRefOid: T.b2 }, { number: 221, state, headRefOid: T.p }]);
+	const y = foreignGreen(w, x, "tr-156", 156, T.b1);
+	requested(x, "tr-220", 220, T.b2, { wl: y });
+	ran(x, "tr-220", 220, T.b2, "green", { wl: y });
+	return { ...f, b1: T.b1, b2: T.b2, p: T.p, y };
+}
+/** The train-OPEN template: a second clone ("other") pushes b1 and b2 to the shared branch and main, then p to the shared branch and refs/pull/221/head; train-MERGED also merges p into main. */
+function buildTrain(): void {
+	const t = copyOf(template("origin").w, "close-fresh-template");
+	const other = otherClone(t);
+	g(t, other, "checkout", "-q", "-b", SHARED);
+	T.b1 = commitFile(t, other, "f156.txt", "PR #156");
+	g(t, other, "push", "-q", "origin", `${SHARED}:${SHARED}`, `${T.b1}:main`);
+	T.b2 = commitFile(t, other, "f220.txt", "PR #220");
+	g(t, other, "push", "-q", "origin", `${SHARED}:${SHARED}`, `${T.b2}:main`);
+	T.p = commitFile(t, other, "f221.txt", "the train's PR #221");
+	g(t, other, "push", "-q", "origin", `${SHARED}:${SHARED}`, `${T.p}:refs/pull/221/head`);
+	templates["train-OPEN"] = { w: t, lane: null };
+	const m = copyOf(t, "close-fresh-template");
+	g(m, join(m.root, "other"), "push", "-q", "origin", `${T.p}:main`);
+	templates["train-MERGED"] = { w: m, lane: null };
 }
 
 /**
  * Bindfix's shape (PR #104): the lane's commit s, green on this workload; main moves on (o); Jo's side merges main into wl/<id>
  * (h, a merge) and PR #7 merges at h through merge commit m (--no-ff). The lane's local branch follows to h, so there is no code delta.
+ * The commits are the pastGreen template's (buildPastGreen); the fixture puts wl/<id> at h, here and on origin.
  */
-function mergedPastGreen(w: World, x: Closable): { s: string; o: string; h: string; m: string; other: string } {
-	const { lane, sha: s } = laneWithCode(w, x);
-	requested(x, "tr-1", 7, s);
-	ran(x, "tr-1", 7, s, "green");
-	const other = otherClone(w);
-	const o = commitFile(w, other, "o.txt", "main moves on");
-	g(w, other, "push", "-q", "origin", "main");
-	g(w, other, "checkout", "-q", "-b", "jo-merge", s);
-	g(w, other, "merge", "-q", "--no-ff", "--no-edit", "main");
-	const h = g(w, other, "rev-parse", "HEAD");
-	g(w, other, "push", "-q", "origin", `${h}:refs/heads/${x.branch}`);
-	g(w, other, "checkout", "-q", "main");
-	g(w, other, "merge", "-q", "--no-ff", "--no-edit", h);
-	const m = g(w, other, "rev-parse", "HEAD");
-	g(w, other, "push", "-q", "origin", "main");
-	g(w, w.work, "fetch", "-q", "origin");
-	g(w, lane, "merge", "-q", "--ff-only", h);
-	prs(w, x.branch, [{ number: 7, state: "MERGED", headRefOid: h, mergeCommit: m }]);
-	return { s, o, h, m, other };
+function mergedPastGreen(): Fixture & { s: string; o: string; h: string; m: string; other: string } {
+	const f = fixture("pastGreen", { lane: true });
+	requested(f.x, "tr-1", 7, T.s);
+	ran(f.x, "tr-1", 7, T.s, "green");
+	prs(f.w, f.x.branch, [{ number: 7, state: "MERGED", headRefOid: T.h, mergeCommit: T.m }]);
+	return { ...f, s: T.s, o: T.o, h: T.h, m: T.m, other: join(f.w.root, "other") };
+}
+/** The pastGreen template: in a second clone ("other"), o on main, h merging main into s, m merging h into main (pushed); the clone fetched. */
+function buildPastGreen(): void {
+	const t = copyOf(template("origin").w, "close-fresh-template");
+	const other = otherClone(t);
+	g(t, other, "fetch", "-q", t.work, LANE_REF);
+	T.o = commitFile(t, other, "o.txt", "main moves on");
+	g(t, other, "push", "-q", "origin", "main");
+	g(t, other, "checkout", "-q", "-b", "jo-merge", T.s);
+	g(t, other, "merge", "-q", "--no-ff", "--no-edit", "main");
+	T.h = g(t, other, "rev-parse", "HEAD");
+	g(t, other, "checkout", "-q", "main");
+	g(t, other, "merge", "-q", "--no-ff", "--no-edit", T.h);
+	T.m = g(t, other, "rev-parse", "HEAD");
+	g(t, other, "push", "-q", "origin", "main");
+	g(t, t.work, "fetch", "-q", "origin");
+	templates.pastGreen = { w: t, lane: T.h };
 }
 
 describe("PLAN wl-mvfjen3q5mqi2o D1: a push-dest: branch's PR is in the close set only when its head carries this workload's push (issue #223)", () => {
+	beforeAll(buildTrain);
+
 	test("(a) #223: two older merged PRs on the shared branch, green only on another workload, stay out; the train's PR on its own green closes", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { p } = trainShape(w, x);
+		const { w, x, p } = trainShape();
 		pushDest(x, "origin", SHARED, p);
 		requested(x, "tr-1", 221, p);
 		ran(x, "tr-1", 221, p, "green");
@@ -913,10 +932,7 @@ describe("PLAN wl-mvfjen3q5mqi2o D1: a push-dest: branch's PR is in the close se
 	}, 20_000);
 
 	test("(b) a push recorded through another remote name (`push-dest: upstream …`) still keeps its PR, which needs its green", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { p } = trainShape(w, x, "OPEN");
+		const { w, x, p } = trainShape("OPEN");
 		pushDest(x, "upstream", SHARED, p);
 
 		expectRefused(w, x, await close(w, x), "PR #221 has no test-run result: call lane_full_test", null);
@@ -930,10 +946,7 @@ describe("PLAN wl-mvfjen3q5mqi2o D1: a push-dest: branch's PR is in the close se
 	}, 20_000);
 
 	test("(b) a pushed sha the full clone lacks even after fetching refs/pull/<N>/head is an answered no: every PR on the branch drops", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		trainShape(w, x, "OPEN");
+		const { w, x } = trainShape("OPEN");
 		g(w, join(w.root, "other"), "push", "-q", "origin", `${SHARED}~2:refs/pull/156/head`, `${SHARED}~1:refs/pull/220/head`);
 		pushDest(x, "origin", SHARED, "e".repeat(40));
 		const calls: string[] = [];
@@ -948,10 +961,7 @@ describe("PLAN wl-mvfjen3q5mqi2o D1: a push-dest: branch's PR is in the close se
 	}, 20_000);
 
 	test("(b) in a shallow clone a pushed sha that is missing cannot be answered: the close refuses (fails closed)", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		trainShape(w, x, "OPEN");
+		const { w, x } = trainShape("OPEN");
 		const other = join(w.root, "other");
 		g(w, other, "push", "-q", "origin", `${SHARED}~2:refs/pull/156/head`);
 		writeFileSync(join(w.work, ".git", "shallow"), `${g(w, w.work, "rev-list", "--max-parents=0", "HEAD")}\n`);
@@ -962,11 +972,8 @@ describe("PLAN wl-mvfjen3q5mqi2o D1: a push-dest: branch's PR is in the close se
 	}, 20_000);
 
 	test("(b) in a shallow clone a no from merge-base is not an answer either: a boundary between the pushed sha and a PR head refuses", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
+		const { w, x, b1, b2 } = trainShape("OPEN");
 		// This workload pushed b1; #220 (b2) and #221 (p) both descend from it. A shallow boundary at b2 hides that from git.
-		const { b1, b2 } = trainShape(w, x, "OPEN");
 		pushDest(x, "origin", SHARED, b1);
 		g(w, w.work, "fetch", "-q", "origin", SHARED);
 		writeFileSync(join(w.work, ".git", "shallow"), `${b2}\n`);
@@ -976,10 +983,7 @@ describe("PLAN wl-mvfjen3q5mqi2o D1: a push-dest: branch's PR is in the close se
 	}, 20_000);
 
 	test("(d) a push-dest PR that carries the pushed sha is in the set and still needs its own green; a test-requested: still brings in a dropped PR", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { b1, b2, p, y } = trainShape(w, x, "OPEN");
+		const { w, x, b1, b2, p, y } = trainShape("OPEN");
 		pushDest(x, "origin", SHARED, p);
 
 		expectRefused(w, x, await close(w, x), "PR #221 has no test-run result: call lane_full_test", null);
@@ -1002,11 +1006,10 @@ describe("PLAN wl-mvfjen3q5mqi2o D1: a push-dest: branch's PR is in the close se
 });
 
 describe("PLAN wl-mvfjen3q5mqi2o D2-D4: a merged PR no green of its own holds passes on a runner green on main that contains it, or on Jo's waive-pr", () => {
+	beforeAll(buildPastGreen);
+
 	test("(c) merged-never-run refuses with the D4 text, naming the merge commit, and no longer says lane_full_test", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { h, m } = mergedPastGreen(w, x);
+		const { w, x, h, m } = mergedPastGreen();
 
 		const r = await close(w, x);
 
@@ -1037,10 +1040,8 @@ describe("PLAN wl-mvfjen3q5mqi2o D2-D4: a merged PR no green of its own holds pa
 			},
 		];
 		for (const shape of shapes) {
-			const w = world();
-			withOrigin(w);
-			const x = closable(w);
-			const k = mergedPastGreen(w, x);
+			const k = mergedPastGreen();
+			const { w, x } = k;
 			const sha = shape.at(w, k);
 			const y = foreignGreen(w, x, "tr-9", 8, sha);
 
@@ -1053,10 +1054,7 @@ describe("PLAN wl-mvfjen3q5mqi2o D2-D4: a merged PR no green of its own holds pa
 	}, 60_000);
 
 	test("(c) it passes on Jo's surface-written waive-pr, named in the why", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const { h } = mergedPastGreen(w, x);
+		const { w, x, h } = mergedPastGreen();
 		const ins = waivePr(x, [7]);
 
 		const r = await close(w, x);
@@ -1084,10 +1082,8 @@ describe("PLAN wl-mvfjen3q5mqi2o D2-D4: a merged PR no green of its own holds pa
 			{ name: "a lane-written waive-pr", make: (_w, x) => void waivePr(x, [7], "lane-a") },
 		];
 		for (const shape of shapes) {
-			const w = world();
-			withOrigin(w);
-			const x = closable(w);
-			const k = mergedPastGreen(w, x);
+			const k = mergedPastGreen();
+			const { w, x } = k;
 			shape.make(w, x, k);
 
 			const r = await close(w, x);
@@ -1098,9 +1094,7 @@ describe("PLAN wl-mvfjen3q5mqi2o D2-D4: a merged PR no green of its own holds pa
 	}, 90_000);
 
 	test("D2: two merged PRs and one green on main that contains only one merge commit: only that PR is covered", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
+		const { w, x } = fixture("origin");
 		const other = otherClone(w);
 		const c1 = commitFile(w, other, "c1.txt", "PR #7, merged");
 		const c2 = commitFile(w, other, "c2.txt", "another workload's PR, merged");
@@ -1122,10 +1116,7 @@ describe("PLAN wl-mvfjen3q5mqi2o D2-D4: a merged PR no green of its own holds pa
 	}, 20_000);
 
 	test("(d) an open PR never passes on another workload's green or on Jo's waive-pr", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const s = merged(w, x, "OPEN");
+		const { w, x, sha: s } = merged("OPEN");
 		foreignGreen(w, x, "tr-9", 8, s);
 		waivePr(x, [7]);
 
@@ -1134,10 +1125,7 @@ describe("PLAN wl-mvfjen3q5mqi2o D2-D4: a merged PR no green of its own holds pa
 
 	test("(e) a merged PR whose own newest run is red, error or red-main off a train passes on another workload's runner green on main that contains its merge commit", async () => {
 		for (const verdict of ["red", "error", "red-main"] as const) {
-			const w = world();
-			withOrigin(w);
-			const x = closable(w);
-			const s = merged(w, x);
+			const { w, x, sha: s } = merged();
 			requested(x, "tr-1", 7, s);
 			ran(x, "tr-1", 7, s, verdict);
 			const n = onMain(w, otherClone(w));
@@ -1152,10 +1140,7 @@ describe("PLAN wl-mvfjen3q5mqi2o D2-D4: a merged PR no green of its own holds pa
 	}, 30_000);
 
 	test("(e) a merged PR whose own newest run is red passes on Jo's surface-written waive-pr, named in the why", async () => {
-		const w = world();
-		withOrigin(w);
-		const x = closable(w);
-		const s = merged(w, x);
+		const { w, x, sha: s } = merged();
 		requested(x, "tr-1", 7, s);
 		ran(x, "tr-1", 7, s, "red");
 		const ins = waivePr(x, [7]);
@@ -1189,10 +1174,7 @@ describe("PLAN wl-mvfjen3q5mqi2o D2-D4: a merged PR no green of its own holds pa
 			},
 		];
 		for (const shape of shapes) {
-			const w = world();
-			withOrigin(w);
-			const x = closable(w);
-			const s = merged(w, x, shape.state);
+			const { w, x, sha: s } = merged(shape.state);
 			requested(x, "tr-1", 7, s);
 			ran(x, "tr-1", 7, s, shape.verdict);
 			shape.make?.(w, x, s);
