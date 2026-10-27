@@ -614,6 +614,110 @@ describe("fullWorkers: the PR full part runs its files at once; base and a keyle
 		}
 	}, 120_000);
 
+	test("timeout cleanup kills a TERM-resistant detached descendant group even when the stuck capture is cut, without killing a sibling", async () => {
+		const b = box("detached-cap", { captureMs: 0 });
+		const detached = `
+			const { writeFileSync } = require("node:fs");
+			process.on("SIGTERM", () => {});
+			const child = Bun.spawn(["/bin/sh", "-c", "trap '' TERM; exec /bin/sleep 300"]);
+			writeFileSync("../detached.json", JSON.stringify({ group: process.pid, child: child.pid }));
+			await child.exited;
+		`;
+		const fixture = `import { test } from "bun:test";
+			test("detached group", async () => {
+				// Reparented into the same session, but no longer in the part's descendant tree at cleanup time.
+				Bun.spawnSync(["/bin/sh", "-c", "set -m; /bin/sleep 300 >/dev/null 2>&1 & echo $! > ../own.pid"]);
+				Bun.spawn([process.execPath, "-e", ${JSON.stringify(detached)}], { detached: true, stdout: "ignore", stderr: "ignore" });
+				await Promise.withResolvers().promise;
+			}, 600_000);
+		`;
+		prepared(b, "tr-dc1", { "detached.test.ts": fixture }, { fullCapMin: 0.04, soloCapMin: 0.04 });
+		const sibling = Bun.spawn(["/bin/sleep", "300"]);
+		pids.push(sibling.pid);
+		try {
+			const r = call(b, { sub: "full", runId: "tr-dc1" });
+			const work = workOf(b, "tr-dc1");
+			const { group, child } = JSON.parse(readFileSync(join(work, "detached.json"), "utf8")) as { group: number; child: number };
+			pids.push(group, child);
+			const own = Number(readFileSync(join(work, "own.pid"), "utf8"));
+			pids.push(own);
+			expect(r.exit).toBe(WRAPPER_EXIT.timeout);
+			expect(r.stderr).toContain("timeout: the part passed its cap of 2400 ms");
+			// The leader cannot reap this detached group, and neither it nor its child cooperates with TERM.
+			expect(readFileSync(join(work, "groups"), "utf8").split("\n").map(Number)).toContain(group);
+			expect(readFileSync(join(work, "full.stuck.log"), "utf8")).toContain("capture cut");
+			// Neither cleanup half can substitute for the other: both ownership forms must be gone before the sweep.
+			expect(await until(() => [own, group, child].every((pid) => !alive(pid)), 3_000)).toBe(true);
+			const s = call(b, { sub: "sweep", runId: "tr-dc1" });
+			expect(s.stderr).toBe("");
+			expect(s.exit).toBe(WRAPPER_EXIT.ok);
+			expect(await until(() => !alive(group) && !alive(child), 3_000)).toBe(true);
+			expect(alive(sibling.pid)).toBe(true);
+		} finally {
+			sibling.kill("SIGKILL");
+			await sibling.exited;
+		}
+	}, 30_000);
+
+	for (const how of ["fifo", "symlink"] as const) {
+		// Real processes and the wrapper's platform-clock cap are under test; fake timers cannot drive either.
+		test(`timeout cleanup refuses a ${how} groups file without blocking or redirecting writes, and still kills every known detached descendant`, async () => {
+			const b = box(`groups-${how}`, { captureMs: 0 });
+			const runId = how === "fifo" ? "tr-gf1" : "tr-gs1";
+			const detached = `
+				const { writeFileSync } = require("node:fs");
+				process.on("SIGTERM", () => {});
+				const child = Bun.spawn(["/bin/sh", "-c", "trap '' TERM; exec /bin/sleep 300"]);
+				writeFileSync("../detached.json", JSON.stringify({ group: process.pid, child: child.pid }));
+				await child.exited;
+			`;
+			const swap = how === "fifo"
+				? `const r = Bun.spawnSync(["/usr/bin/mkfifo", "../groups"], { timeout: 1_000 }); if (r.exitCode !== 0) throw new Error("mkfifo groups: " + r.stderr.toString());`
+				: `symlinkSync("groups-target", "../groups");`;
+			const fixture = `import { test } from "bun:test";
+				import { existsSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+				test("hostile groups persistence", async () => {
+					Bun.spawn([process.execPath, "-e", ${JSON.stringify(detached)}], { detached: true, stdout: "ignore", stderr: "ignore" });
+					const deadline = Date.now() + 1_500;
+					while (!existsSync("../detached.json") && Date.now() < deadline) await Bun.sleep(10);
+					if (!existsSync("../detached.json")) throw new Error("detached descendant did not become ready");
+					if (!readFileSync("../groups", "utf8").split("\\n").includes(String(process.pid))) throw new Error("part leader not recorded");
+					writeFileSync("../leader.pid", String(process.pid));
+					unlinkSync("../groups");
+					${swap}
+					writeFileSync("../groups-swapped", "");
+					await Promise.withResolvers().promise;
+				}, 600_000);
+			`;
+			prepared(b, runId, { "hostile.test.ts": fixture }, { fullCapMin: 0.04, soloCapMin: 0.04 });
+			const work = workOf(b, runId);
+			const target = join(work, "groups-target");
+			writeFileSync(target, "UNCHANGED\n");
+			const p = spawnCall(b, { sub: "full", runId });
+			try {
+				const completed = await until(() => p.exitCode !== null, 2_400 + 2_000 + 500 + 5_000);
+				const { group, child } = JSON.parse(readFileSync(join(work, "detached.json"), "utf8")) as { group: number; child: number };
+				const leader = Number(readFileSync(join(work, "leader.pid"), "utf8"));
+				pids.push(leader, group, child);
+				expect(existsSync(join(work, "groups-swapped"))).toBe(true);
+				expect(completed).toBe(true);
+				expect(p.exitCode).toBe(WRAPPER_EXIT.timeout);
+				const stderr = await new Response(p.stderr).text();
+				expect(stderr).toContain("timeout: the part passed its cap of 2400 ms; its session was killed");
+				expect(stderr).toContain(`timeout cleanup: cannot persist descendant groups to ${join(work, "groups")}`);
+				expect(stderr).toContain("open failed:");
+				expect(readFileSync(join(work, "full.cleanup.log"), "utf8")).toContain(`timeout cleanup: cannot persist descendant groups to ${join(work, "groups")}: open failed:`);
+				expect(lstatSync(join(work, "groups"))[how === "fifo" ? "isFIFO" : "isSymbolicLink"]()).toBe(true);
+				expect(readFileSync(target, "utf8")).toBe("UNCHANGED\n");
+				// Do not sweep: its existing pathname read is unsafe for this deliberately hostile groups file.
+				expect(await until(() => [leader, group, child].every((pid) => !alive(pid)), 3_000)).toBe(true);
+			} finally {
+				if (p.exitCode === null) p.kill("SIGKILL");
+				await p.exited;
+			}
+		}, 30_000);
+	}
+
 	test("a parallel full part past its cap exits timeout with every worker in its stuck capture's tree, and after the sweep no worker and no worker's child is alive", async () => {
 		const b = box("parcap");
 		const hang = (name: string) =>
@@ -1375,6 +1479,57 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
 		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
 	}, 90_000);
+
+	for (const how of ["fifo", "symlink"] as const) {
+		test(`enforce: refuses a ${how} groups file after the stop decision, still kills every owned group and preserves the stuck cause with unconfirmed cleanup`, async () => {
+			const signatureCaptureMs = 10_000;
+			const b = box(`stuck-groups-${how}`, { ...DETECT, signatureCaptureMs });
+			const runId = how === "fifo" ? "tr-sef1" : "tr-ses1";
+			prepared(b, runId, { "spin.test.ts": spinTest(true), "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
+			const work = workOf(b, runId);
+			const hook = join(b.hooks, `${runId}.signature-capture`);
+			const target = join(work, "groups-target");
+			writeFileSync(target, "UNCHANGED\n");
+			writeFileSync(`${hook}.pause`, "");
+			const p = spawnCall(b, { sub: "full", runId });
+			try {
+				// The watch has stopped: only enforce teardown will persist after this replacement.
+				expect(await until(() => existsSync(`${hook}.reached`), 30_000)).toBe(true);
+				expect(await until(() => existsSync(join(work, "late.pid")), 2_000)).toBe(true);
+				const worker = fixturePid(work, "spin.pid");
+				const zombie = fixturePid(work, "zombie.pid");
+				const helper = fixturePid(work, "helper.pid");
+				const late = fixturePid(work, "late.pid");
+				const leader = Number(readFileSync(join(work, "groups"), "utf8").split("\n")[0]);
+				pids.push(leader);
+				rmSync(join(work, "groups"));
+				if (how === "fifo") expect(Bun.spawnSync(["/usr/bin/mkfifo", join(work, "groups")], { timeout: 1_000 }).exitCode).toBe(0);
+				else symlinkSync(target, join(work, "groups"));
+				writeFileSync(`${hook}.go`, "");
+				expect(await until(() => p.exitCode !== null, signatureCaptureMs + STUCK_DEFAULTS.stopGraceMs + STUCK_DEFAULTS.verifyMs + 3_000)).toBe(true);
+				expect(p.exitCode).toBe(WRAPPER_EXIT.stuck);
+				const stdout = await new Response(p.stdout).text();
+				const stderr = await new Response(p.stderr).text();
+				const { killed } = enforceLines(stdout, worker, zombie);
+				const k = /^pgids ([\d,]+) ms \d+ unconfirmed cleanup-failed$/.exec(killed.rest);
+				expect(k).not.toBeNull();
+				const stopSet = k![1]!.split(",").map(Number);
+				expect(stopSet).toEqual(expect.arrayContaining([leader, helper, late]));
+				expect(stderr).toContain(`stuck: worker ${worker} spun `);
+				expect(stderr).toContain(`in Bun.spawnSync with unreaped child ${zombie};`);
+				expect(stderr).toContain("containment unconfirmed:");
+				expect(stderr).toContain(`timeout cleanup: cannot persist descendant groups to ${join(work, "groups")}: open failed:`);
+				expect(lstatSync(join(work, "groups"))[how === "fifo" ? "isFIFO" : "isSymbolicLink"]()).toBe(true);
+				expect(readFileSync(target, "utf8")).toBe("UNCHANGED\n");
+				// Do not sweep a hostile groups path; teardown must contain the processes itself.
+				expect(await until(() => [leader, worker, helper, late].every((pid) => !alive(pid)) && stopSet.every((g) => !alive(-g)), 3_000)).toBe(true);
+			} finally {
+				writeFileSync(`${hook}.go`, "");
+				if (p.exitCode === null) p.kill("SIGKILL");
+				await p.exited;
+			}
+		}, 60_000);
+	}
 
 	test("shadow (caps.json without stuckStop): the spin fixture gets stuck-would-stop and a signature capture, nothing is stopped, and the part runs on to its cap and exits 124 as before", async () => {
 		const b = box("stuck-shadow", DETECT);

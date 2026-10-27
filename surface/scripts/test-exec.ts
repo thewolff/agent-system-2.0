@@ -43,7 +43,7 @@ import { dlopen, FFIType, type Pointer, ptr, read } from "bun:ffi";
 import { Database } from "bun:sqlite";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import {
-	accessSync, appendFileSync, chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync,
+	accessSync, chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync,
 	readFileSync, readSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync, writeSync,
 } from "node:fs";
 import { constants as osConstants } from "node:os";
@@ -297,8 +297,10 @@ interface SessionEnd {
 	unconfirmed: Set<number>;
 	/** A KILL the kernel refused other than ESRCH, as `kill -KILL <pid>: <code>`. */
 	refused: Set<string>;
+	/** Discovery or persistence failures: cleanup still signals every target already known. */
+	errors: string[];
 }
-const sessionOk = (end: SessionEnd): boolean => end.survivors.length === 0 && end.failures.length === 0;
+const sessionOk = (end: SessionEnd): boolean => end.survivors.length === 0 && end.failures.length === 0 && end.errors.length === 0;
 
 /**
  * Signal a recorded session's main group before member lookup. A live worker group whose leader belongs to another session
@@ -336,7 +338,7 @@ async function killSessions(cfg: Config, runId: string, sids: number[]): Promise
 				for (const m of l.members) found.set(m.pid, m);
 			}
 		}
-		if (found.size === 0 || Date.now() >= deadline) return { survivors: [...found.values()], failures, unconfirmed: new Set([...failed, ...busy]), refused };
+		if (found.size === 0 || Date.now() >= deadline) return { survivors: [...found.values()], failures, unconfirmed: new Set([...failed, ...busy]), refused, errors: [] };
 		for (const m of skipKill ? [] : found.values()) {
 			try {
 				process.kill(m.pid, "SIGKILL");
@@ -348,24 +350,47 @@ async function killSessions(cfg: Config, runId: string, sids: number[]): Promise
 	}
 }
 
-/** The cap (§ 2.3 step 3): SIGTERM the part's main group, wait up to the grace for it to empty, then killSessions on its session. */
-async function killSession(cfg: Config, runId: string, sid: number): Promise<SessionEnd> {
-	signalGroup(sid, "SIGTERM");
+/**
+ * Before TERM can orphan a detached descendant, discover its group from a spawn-free snapshot and persist it for a later
+ * sweep. The session lookup remains authoritative for same-session workers, including reparented ones. Discovery or
+ * persistence failure never skips TERM/KILL of known targets, and confirmation covers both the session and detached groups.
+ */
+async function killSession(cfg: Config, runId: string, sid: number, work: string): Promise<SessionEnd> {
+	const groups = new Set([sid]);
+	const errors: string[] = [];
+	const fresh = snapshot(process.getuid!());
+	if (fresh.kind !== "ok") errors.push(`timeout cleanup: cannot discover descendants of session ${sid}: ${fresh.why}`);
+	else {
+		const roots = fresh.procs.filter((p) => p.pid === sid || p.pgid === sid);
+		const self = fresh.procs.find((p) => p.pid === process.pid)?.pgid;
+		for (const p of liveOwned(fresh, roots)) if (p.pgid > 1 && p.pgid !== self) groups.add(p.pgid);
+	}
+	try {
+		const descendants = [...groups].filter((g) => g !== sid);
+		if (descendants.length > 0) persistGroups(work, descendants);
+	} catch (e) {
+		errors.push(e instanceof Error ? e.message : String(e));
+	}
+	const targets = [...groups];
+	for (const g of targets) signalMainGroup(g, "SIGTERM");
 	const until = Date.now() + cfg.killGraceMs;
-	while (groupAlive(sid) && Date.now() < until) await Bun.sleep(50);
-	return killSessions(cfg, runId, [sid]);
+	while (targets.some(groupAlive) && Date.now() < until) await Bun.sleep(50);
+	const end = await killSessions(cfg, runId, targets);
+	end.errors.push(...errors);
+	return end;
 }
 
 /** What a part's error or timeout line adds when its cleanup is not ok: the survivors, then each failed lookup. */
 function cleanupSuffix(end: SessionEnd): string {
 	const parts = end.survivors.length > 0 ? [`cleanup left ${end.survivors.length} alive: ${end.survivors.map((m) => m.pid).join(" ")}`] : [];
 	for (const f of end.failures) parts.push(`cleanup could not look up ${f}`);
+	for (const e of end.errors) parts.push(`cleanup failed: ${e}`);
 	return parts.map((p) => `; ${p}`).join("");
 }
 
 /** The survivors' table and every failure, the body of `<part>.cleanup.log` and of a failed sweep's stderr. */
 function cleanupDetail(end: SessionEnd): string {
-	const lines = [...end.failures.map((f) => `lookup failed: ${f}`), ...end.refused];
+	const lines = [...end.failures.map((f) => `lookup failed: ${f}`), ...end.errors, ...end.refused];
 	if (end.survivors.length > 0) lines.push("PID PGID COMMAND", ...end.survivors.map((m) => `${m.pid} ${m.pgid} ${m.command}`));
 	return `${lines.join("\n")}\n`;
 }
@@ -391,6 +416,35 @@ function writeCleanupLog(work: string, stem: string, sid: number, end: SessionEn
 	} finally {
 		closeSync(fd);
 	}
+}
+
+/** Append once through a validated descriptor: a child may have replaced this pathname while it ran. */
+function persistGroups(work: string, groups: number[]): void {
+	const path = groupsFile(work);
+	const text = groups.map((g) => `${g}\n`).join("");
+	const errors: string[] = [];
+	let fd: number | undefined;
+	let operation = "open";
+	try {
+		fd = openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+		operation = "validate";
+		const st = fstatSync(fd);
+		if (!st.isFile()) throw new Error("not a regular file");
+		operation = "append";
+		const n = writeSync(fd, text);
+		if (n !== text.length) throw new Error(`short write: ${n} of ${text.length} bytes`);
+	} catch (e) {
+		errors.push(`${operation} failed: ${errText(e)}`);
+	} finally {
+		if (fd !== undefined) {
+			try {
+				closeSync(fd);
+			} catch (e) {
+				errors.push(`close failed: ${errText(e)}`);
+			}
+		}
+	}
+	if (errors.length > 0) failed(`timeout cleanup: cannot persist descendant groups to ${path}: ${errors.join("; ")}`);
 }
 
 // ---- the stuck capture (PLAN wl-mvq4edh02r5z40 revision 3, D5) -------------------------------------------
@@ -560,7 +614,8 @@ class Capture {
 	}
 
 	/**
-	 * After killSession has killed the part's session: remove a cap dir `clearCapDir` left, without following a link in it
+	 * After killSession has killed the part's session and discovered detached groups: remove a cap dir `clearCapDir` left,
+	 * without following a link in it
 	 * (removeTree; a just-killed sample may still be closing, so a few tries), then close the stuck log. Never throws.
 	 */
 	async afterKill(): Promise<void> {
@@ -1249,7 +1304,7 @@ class StuckWatch {
 				this.shadowCapture ??= this.capture({ sig: m, spunMs, snap: obs.snap, owned: r.owned }).then((c) => c?.afterKill());
 			}
 		} catch (e) {
-			this.line("stuck-detector-off", `reason detector failed: ${errText(e)}`);
+			this.line("stuck-detector-off", `reason detector failed: ${e instanceof Error ? e.message : errText(e)}`);
 			this.end();
 		}
 	}
@@ -1261,7 +1316,7 @@ class StuckWatch {
 	private recordGroups(owned: readonly Seen[]): void {
 		const fresh = [...new Set(owned.map((p) => p.pgid))].filter((g) => g > 1 && g !== this.p.leader && !this.recordedGroups.has(g));
 		if (fresh.length === 0) return;
-		appendFileSync(groupsFile(this.p.work), fresh.map((g) => `${g}\n`).join(""));
+		persistGroups(this.p.work, fresh);
 		for (const g of fresh) this.recordedGroups.add(g);
 	}
 
@@ -1346,7 +1401,7 @@ async function signatureSections(cfg: Config, runId: string, c: Capture, d: Stop
 interface Teardown {
 	pgids: number[];
 	ms: number;
-	/** null when contained; else the `stuck-killed` token (`<pid,pid>` or `inspection-denied`) and the stderr reason. */
+	/** null when contained; else the `stuck-killed` token (`<pid,pid>`, `inspection-denied` or `cleanup-failed`) and stderr reason. */
 	unconfirmed: { token: string; why: string } | null;
 }
 
@@ -1355,7 +1410,7 @@ interface Teardown {
  * every live descendant of one in a fresh snapshot (new during the capture included). The stop set is the pgids with a live
  * owned member, matched by pid and start; it joins the groups file. SIGTERM each, wait ≤ stopGraceMs for the owned processes to
  * go, SIGKILL each, then poll ≤ verifyMs until no owned identity is alive (a zombie is dead). A denied fresh snapshot signals
- * nothing from stale data. Signal errors other than ESRCH go to stderr.
+ * nothing from stale data. Persistence refusal never skips the kill; it and signal errors leave containment unconfirmed.
  */
 async function teardown(cfg: Config, work: string, owned: Seen[]): Promise<Teardown> {
 	const uid = process.getuid!();
@@ -1365,14 +1420,18 @@ async function teardown(cfg: Config, work: string, owned: Seen[]): Promise<Teard
 	const live = liveOwned(fresh, owned);
 	const self = fresh.procs.find((p) => p.pid === process.pid)?.pgid;
 	const pgids = [...new Set(live.map((p) => p.pgid))].filter((g) => g > 1 && g !== self);
-	if (pgids.length > 0) appendFileSync(groupsFile(work), pgids.map((g) => `${g}\n`).join(""));
+	const errors: string[] = [];
+	try {
+		if (pgids.length > 0) persistGroups(work, pgids);
+	} catch (e) {
+		errors.push(e instanceof Error ? e.message : String(e));
+	}
 	const tracked = [...owned, ...live];
 	/** The owned processes still alive, or null when the snapshot is denied. */
 	const left = (): Seen[] | null => {
 		const s = snapshot(uid);
 		return s.kind === "ok" ? liveOwned(s, tracked) : null;
 	};
-	const errors: string[] = [];
 	const signal = (sig: NodeJS.Signals) => {
 		for (const g of pgids) {
 			try {
@@ -1390,14 +1449,17 @@ async function teardown(cfg: Config, work: string, owned: Seen[]): Promise<Teard
 		now = left();
 		for (const until = Date.now() + STUCK_DEFAULTS.verifyMs; (now === null || now.length > 0) && Date.now() < until; now = left()) await Bun.sleep(50);
 	}
-	for (const e of errors) process.stderr.write(`as2test: stuck stop: ${e}\n`);
 	const ms = Date.now() - t0;
-	if (now === null) return { pgids, ms, unconfirmed: { token: "inspection-denied", why: "inspection denied after the kill" } };
-	if (now.length > 0) {
-		const pids = now.map((p) => p.pid).join(",");
-		return { pgids, ms, unconfirmed: { token: pids, why: `${pids} still alive ${STUCK_DEFAULTS.verifyMs} ms after SIGKILL` } };
+	let token = "cleanup-failed";
+	if (now === null) {
+		token = "inspection-denied";
+		errors.push("inspection denied after the kill");
+	} else if (now.length > 0) {
+		token = now.map((p) => p.pid).join(",");
+		errors.push(`${token} still alive ${STUCK_DEFAULTS.verifyMs} ms after SIGKILL`);
 	}
-	return { pgids, ms, unconfirmed: null };
+	for (const e of errors) process.stderr.write(`as2test: stuck stop: ${e}\n`);
+	return { pgids, ms, unconfirmed: errors.length > 0 ? { token, why: errors.join("; ") } : null };
 }
 
 /**
@@ -1443,10 +1505,9 @@ async function part(cfg: Config, runId: string, work: string, dir: string, argv:
 		try {
 			const s = sessionOf(sid);
 			if (s !== null && s !== sid) throw new Error(typeof s === "object" ? s.why : `getsid(${sid}) answered ${s}: bun does not lead its own session`);
-			appendFileSync(groupsFile(work), `${sid}\n`);
+			persistGroups(work, [sid]);
 		} catch (e) {
-			child.kill("SIGKILL");
-			const end = await killSession(cfg, runId, sid);
+			const end = await killSession(cfg, runId, sid, work);
 			if (!sessionOk(end)) writeCleanupLog(work, stem, sid, end);
 			return failed(`the part's session ${sid} was not recorded: ${errText(e)}; bun was killed${cleanupSuffix(end)}`);
 		}
@@ -1472,10 +1533,14 @@ async function part(cfg: Config, runId: string, work: string, dir: string, argv:
 			}
 			let end: SessionEnd;
 			try {
-				end = await killSession(cfg, runId, sid);
+				end = await killSession(cfg, runId, sid, work);
 			} finally {
 				// Off the kill path: clear a capture's leftover cap dir only after the part's session is dead.
-				await capture?.afterKill();
+				try {
+					await capture?.afterKill();
+				} catch (e) {
+					process.stderr.write(`as2test: stuck capture finalization failed: ${e instanceof Error ? e.message : String(e)}\n`);
+				}
 			}
 			if (sessionOk(end)) await done.promise;
 			else writeCleanupLog(work, stem, sid, end);
