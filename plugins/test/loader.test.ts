@@ -10,15 +10,17 @@
 //   - the real adapters read and write only the world's HOME (omp-host.ts world()): the startup hook's
 //     child process and the adapter's in-process fail-open log both land there, and the real home's
 //     ~/.claude/.i-have-audhd-state keeps its existence and mtime.
-// i-have-audhd's session-start core comes from its hooks/*.mjs, which the adapter spawns with `sh -lc
-// 'node …'`; with no node there the adapter fails open and the expected messages say so.
+// i-have-audhd's session-start core comes from its hooks/*.mjs, which the adapter spawns under an
+// absolute node: under Bun, the first `node` on the host's PATH, then $HOME/.local/bin,
+// /opt/homebrew/bin, /usr/local/bin, /usr/bin (its header "WHICH NODE"); with none the adapter fails
+// open and the expected messages say so.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { bindPrepared, countedPrepared, discoverWithSeededPlugins, HAS_OMP, INDEX, loadIndex, OMP_SKIP, pairTools, REAL_HOME, type SessionKind, session, stamp, world } from "./omp-host.ts";
 
-const NO_NODE = Bun.spawnSync(["sh", "-lc", "command -v node"]).exitCode !== 0;
+const NO_NODE = !Bun.which("node") && !["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"].some((p) => existsSync(p));
 /** The hidden messages a prompt carries after session_start: i-have-audhd's core (when node runs its hook), then ask-graham's nudge. */
 const STARTED = NO_NODE ? ["ask-graham"] : ["i-have-audhd-session-start", "ask-graham"];
 
@@ -142,7 +144,9 @@ describe("the developer's HOME (the world's HOME stands in for it)", () => {
 		const messages = await s.beforeAgentStart("what if we built a dashboard");
 		expect(stamp(realState)).toEqual(before);
 		expect(messages.map((m) => m.customType)).toEqual(["ask-graham"]);
-		expect(readFileSync(join(w.home, ".claude", ".i-have-audhd-state", "errors.log"), "utf8")).toContain("omp-adapter fail-open: omp-adapter: CLI exited");
+		expect(readFileSync(join(w.home, ".claude", ".i-have-audhd-state", "errors.log"), "utf8")).toContain(
+			`omp-adapter fail-open (i-have-audhd-inject.mjs): omp-adapter: ${NO_NODE ? "no usable node" : "CLI exited"}`,
+		);
 	}, 30_000);
 });
 

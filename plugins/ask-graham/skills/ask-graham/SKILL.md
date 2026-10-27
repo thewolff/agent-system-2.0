@@ -66,8 +66,8 @@ Graham's third gate question is "Something else already exists?" (Graham #1). Ho
 
 Every run, before any internet search, ask exactly: "Do you want me to research and see if something comparable exists?" Ask at either intensity, on `/ask-graham`, an explicit should-we-build question, or an every-idea nudge. This always-asked question is Jo's rule, not Graham's. Settings invocations still only change or show settings. (Jo)
 
-- **No:** check the local sources below only; do not search the web. Read locally available issue or work records; mark remote-only sources *unreachable* for this run. (Jo)
-- **Yes:** also search the internet for comparable open-source and commercial software: libraries, CLIs, apps, AI skills, plugins, MCP servers, and SaaS where relevant. Before evaluating candidates, read [`references/comparables-criteria.md`](references/comparables-criteria.md). Apply its gates first, rank survivors without a weighted total, and show options with pros, cons, and the measured stats, each dated and sourced. Stars, repo age, forks, and followers are context only, never scored. This method is the skill's, based on the sources in that reference. (Skill)
+- **No:** check the local sources below only; do not search the web. Read locally available issue or work records; mark remote-only sources *unreachable* for this run. For every recommended package or tool, still complete the upkeep receipt using local evidence and installed-runtime discovery; unavailable remote evidence is explicitly *unknown* because research was declined. Do not fetch around the user's no. Follow [`references/upkeep.md`](references/upkeep.md) in either research path. (Jo)
+- **Yes:** also search the internet for comparable open-source and commercial software: libraries, CLIs, apps, AI skills, plugins, MCP servers, and SaaS where relevant. Before evaluating candidates, read [`references/comparables-criteria.md`](references/comparables-criteria.md). Apply its gates first, rank survivors without a weighted total, and show options with pros, cons, measured stats, and an upkeep receipt for every recommended package/tool, each dated and sourced. Stars, repo age, forks, and followers are context only, never scored. This method is the skill's, based on the sources in that reference. (Skill)
 - **No answer yet:** ask, then carry on with the local search and other gate questions. Leave web research pending until the user says yes; silence is not consent. If the turn must end while waiting, put the exact question alone on the final line, without quotes or a verdict. The Stop check allows that waiting reply on both harnesses. When the answer arrives, reload this skill through the host’s Skill or Read tool, then resume step 2 for the same ask. (Skill)
 
 For the local search, check every source below that applies, and record each one as *found*, *nothing found*, or *unreachable*:
@@ -83,7 +83,7 @@ For the local search, check every source below that applies, and record each one
   For each, narrow to the ask's key nouns rather than reading everything.
 - **For an established external tool or library** that does the job (a schema validator, a scheduler, a vendor API's own enum), one check of what the repo already depends on (`package.json`, lockfile) before anything is built by hand.
 
-Done when: the user has answered the comparables question, any approved web research is complete (or marked *unreachable* with its missing evidence), every applicable source has one of the three marks, and every *found* names the file, command, issue, work item, or session that overlaps, plus how much it covers (all of the ask, part of it, or a neighbour that would collide with it).
+Done when: the user has answered the comparables question, any approved web research is complete (or marked *unreachable* with its missing evidence), every applicable source has one of the three marks, every recommended package/tool has the upkeep receipt required by [`references/upkeep.md`](references/upkeep.md), and every *found* names the file, command, issue, work item, or session that overlaps, plus how much it covers (all of the ask, part of it, or a neighbour that would collide with it).
 
 ### 3. Answer the gate questions
 
@@ -156,12 +156,15 @@ While the comparables answer is pending, report local findings if useful and end
 - Owner / maintenance: <answer>
 
 **Comparables** (Skill criteria; research choice: Jo)
-<If research was declined, write "not researched (user said no)" and omit the options table. Keep local build sizing in the verdict and breakdown. Otherwise use the options table below, using the default columns in references/comparables-criteria.md. If approved research is unreachable, say so and name the missing evidence.>
+<If research was declined, write "not researched (user said no)" and omit the options table. Keep local build sizing in the verdict and breakdown. Otherwise use the options table below, using the default columns in references/comparables-criteria.md. If approved research is unreachable, say so and name the missing evidence. For every recommended package/tool—including local-only recommendations—include the five-field upkeep receipt from references/upkeep.md.>
 
 | Name and link / version or plan | Gate result + confidence | Measured stats (date, source, window) | Pros | Cons |
 |---|---|---|---|---|
 | <Confirmed survivors only, in rank order> | <pass + confidence> | <kind-specific evidence> | <fit> | <limits> |
 | build our own | <same essential requirements, or unknown> | <estimated effort and upkeep, with basis; unknown where unmeasured> | <control / fit> | <cost / maintenance> |
+
+**Upkeep** (Jo's requirement; collection recipe: [`references/upkeep.md`](references/upkeep.md))
+<For every recommended package/tool, include its generated or faithfully transcribed upkeep line. If no recommendation exists, omit this field.>
 
 <List unknown-gate candidates separately with their missing essential evidence; list disqualified candidates separately with their failed gate and evidence. Say when none meets the requirements. Include the build our own row as a baseline in approved comparisons.>
 

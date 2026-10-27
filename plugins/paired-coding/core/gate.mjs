@@ -50,6 +50,7 @@
  * @property {string} [whyNow]
  * @property {string} [decision]
  * @property {string} [currentCode]
+ * @property {string} [proposedCode]
  * @property {string} [effect]
  * @property {string[]} [checks]
  * @property {string[]} [openPoints]
@@ -1088,7 +1089,7 @@ export function pairNote(state, args, io) {
  * card remembers the latest trusted-input sequence number, so only a turn typed after this
  * card can agree to it. Changes found between change sets ride on the card for the user.
  * @param {State} state
- * @param {{ boundary: string[], whyNow?: string, decision?: string, currentCode?: string, effect?: string, checks?: string[], openPoints?: string[] }} card
+ * @param {{ boundary: string[], whyNow?: string, decision?: string, currentCode?: string, proposedCode?: string, effect?: string, checks?: string[], openPoints?: string[] }} card
  * @param {Io} io
  * @returns {Result & { card?: Card }}
  */
@@ -1115,6 +1116,7 @@ export function pairPropose(state, card, io) {
     whyNow: card.whyNow,
     decision: card.decision,
     currentCode: card.currentCode,
+    proposedCode: card.proposedCode,
     effect: card.effect,
     boundary: [...card.boundary],
     checks: card.checks ? [...card.checks] : [],

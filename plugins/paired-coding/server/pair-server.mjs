@@ -60,6 +60,7 @@ export const TOOLS = [
         whyNow: str("One line tying it to the roadmap."),
         decision: str("The choice inside it your partner might disagree with."),
         currentCode: str("The smallest excerpt of what it touches."),
+        proposedCode: str("The planned code: the whole new or changed function, or a diff. Show it on the card before asking for agreement."),
         effect: str("What behaves differently afterward."),
         checks: strs("The checks it will run."),
         openPoints: strs("Anything your partner must settle first. A card with open points cannot be agreed."),

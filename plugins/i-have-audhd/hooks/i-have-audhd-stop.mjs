@@ -40,8 +40,8 @@
 //      a skipped check must be inspectable, never silently dead. conclusion-first and
 //      bad-news-first run per unit (checks/sections.mjs): each block-labeled section of a
 //      labeled message, or the whole message when it has none. One judge job per qualifying
-//      unit, one finding per rule naming every violating section; a judge error fails open
-//      for its own section only.
+//      unit, one finding per rule naming every violating section; a judge that cannot answer
+//      is never a pass for its section (JUDGE UNAVAILABLE below).
 //   8. Harness cap — only when I_HAVE_AUDHD_HARNESS=omp (set by the OMP adapter on its
 //      child, never by Claude Code): harnessCapsBlocks in lib/config.mjs turns every
 //      block-mode finding into a warn one when the profile does not set enforcement.armOmp,
@@ -62,8 +62,20 @@
 // FAIL-OPEN EVERYWHERE
 //   Any thrown error → exit 0, nothing on stdout, one line in errors.log. Carried from the
 //   session-start hook's contract: fail-open, but not fail-silent.
+//
+// JUDGE UNAVAILABLE
+//   A judge that times out, exits non-zero, cannot start, or answers unparseably gave no
+//   verdict, so its rule was not checked; counting that as a pass would make a dead judge look
+//   like a clean message. Instead each such rule becomes a "Judge unavailable" finding in the
+//   rule's own mode (warn by default; block mode blocks once, and a revision of that block only
+//   warns, since nothing in the message can bring the judge back). The person is told through
+//   systemMessage, loud once per rule and error, again hourly while it keeps failing, and at
+//   once after the rule was judged fine and then failed again (lib/alerts.mjs). The judge's
+//   stderr is in judge-failures.log (judge/ask.mjs).
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { checkClosingAskLast } from "../checks/closing-ask-last.mjs";
 import { checkNeedsYouFirst } from "../checks/needs-you-first.mjs";
 import { checkNamesArtifact } from "../checks/name-the-artifact.mjs";
@@ -72,6 +84,7 @@ import { splitLabeledSections, openingWords, OPENING_WORDS } from "../checks/sec
 import { loadEnforcement, effectiveMode, harnessCapsBlocks } from "../lib/config.mjs";
 import { stateDir, killSwitchPath, lastBlockedPath, resumeMarkerPath, sha256hex, appendLog } from "../lib/state.mjs";
 import { writePending } from "../lib/pending.mjs";
+import { dueAlerts, clearAlerts } from "../lib/alerts.mjs";
 import { findTrailingBatchSection, batchByLabelQuestion, batchJudgeContext } from "../triggers/batch-heading.mjs";
 import { conclusionFirstApplicable, conclusionFirstQuestion } from "../triggers/conclusion-first.mjs";
 import { lastIncompleteTodos, reportQuestion, todoJudgeContext } from "../triggers/todo-unfinished.mjs";
@@ -340,6 +353,40 @@ function judgeReason(hits) {
       return { text: `${cite(job.rule, job.rule)} — judge: ${verdict.reason}.`, paste: paste("lines") };
   }
 }
+
+// The command that re-tests the judge, named in every judge-unavailable message.
+const SETUP_COMMAND = `node ${fileURLToPath(new URL("../tools/setup.mjs", import.meta.url))}`;
+
+// The finding for a rule whose judge gave no verdict for `misses` (its unavailable jobs, each
+// with its result). It names the rule, the error(s), the unchecked sections, the evidence and the
+// next step, and says outright that this is not a pass.
+function unavailableFinding(rule, misses) {
+  const errors = [...new Set(misses.map((m) => m.verdict.error))].join(", ");
+  const sections = misses.filter((m) => m.job.unit).map((m) => sectionName(m.job.unit));
+  const where = sections.length ? ` for ${sections.join("; ")}` : "";
+  return {
+    text:
+      `Judge unavailable (${rule}) — the judge gave no verdict${where} (${errors}), so this rule was not checked; ` +
+      `that is not a pass. The judge's stderr is in ${join(stateDir(), "judge-failures.log")}; ` +
+      `\`${SETUP_COMMAND}\` re-tests the judge command.`,
+    paste: "Nothing in the message can bring the judge back; a revision is only warned.",
+  };
+}
+
+// The person-facing systemMessage for the judge-unavailable alerts due now ({key, since} from
+// lib/alerts.mjs, key "judge-unavailable:<rule>:<error>"); "" when none is due.
+function unavailableAlert(due) {
+  if (!due.length) return "";
+  const parts = due.map(({ key, since }) => {
+    const [, rule, ...rest] = key.split(":");
+    return `${rule} (${rest.join(":")}${since ? `, still failing since ${since}` : ""})`;
+  });
+  return (
+    `i-have-audhd: judge unavailable for ${parts.join("; ")}. Those rules were not checked, ` +
+    `which is not a pass. Evidence: ${join(stateDir(), "judge-failures.log")}. ` +
+    `Next step: \`${SETUP_COMMAND}\` re-tests the judge command.`
+  );
+}
 function recordBlock(sessionId, textHash, rules) {
   try {
     mkdirSync(stateDir(), { recursive: true });
@@ -461,6 +508,7 @@ async function main() {
   if (effectiveMode(config, "bad-news-first") !== "off") {
     judgeJobs.push(...unitJobs("bad-news-first", badNewsQuestion, units, badNewsGate));
   }
+  let judgeAlert = "";
   if (judgeJobs.length) {
     if (!config.judgeCommand) {
       for (const job of judgeJobs) {
@@ -470,20 +518,36 @@ async function main() {
       const verdicts = await Promise.all(
         judgeJobs.map((job) => askJudge(job.rule, job.question, job.contextText, config)),
       );
-      // One finding per rule: a rule judged per section collects every violating section.
+      // One finding per rule: a rule judged per section collects every violating section, and
+      // every section its judge could not answer for (JUDGE UNAVAILABLE in the header).
       const hitsByRule = new Map();
+      const missesByRule = new Map();
+      const answered = new Set();
       for (let i = 0; i < judgeJobs.length; i++) {
         const v = verdicts[i];
-        if (v.error) continue; // already in judge-failures.log; fail open for this job only
-        if (v.violation) {
-          const rule = judgeJobs[i].rule;
-          if (!hitsByRule.has(rule)) hitsByRule.set(rule, []);
-          hitsByRule.get(rule).push({ job: judgeJobs[i], verdict: v });
-        }
+        const rule = judgeJobs[i].rule;
+        const into = v.unavailable ? missesByRule : v.violation ? hitsByRule : null;
+        if (!v.unavailable) answered.add(rule);
+        if (!into) continue;
+        if (!into.has(rule)) into.set(rule, []);
+        into.get(rule).push({ job: judgeJobs[i], verdict: v });
       }
       for (const [rule, hits] of hitsByRule) {
         findings.push({ rule, mode: effectiveMode(config, rule), ...judgeReason(hits) });
       }
+      const failing = [];
+      for (const [rule, misses] of missesByRule) {
+        const mode = effectiveMode(config, rule);
+        // A dead judge blocks once; the revision of that block is only warned.
+        const capped = mode === "block" && payload.stop_hook_active === true ? "warn" : mode;
+        findings.push({ rule, mode: capped, unavailable: true, ...unavailableFinding(rule, misses) });
+        for (const error of new Set(misses.map((m) => m.verdict.error))) failing.push(`judge-unavailable:${rule}:${error}`);
+      }
+      // A rule whose judge answered and did not also fail this stop has healed.
+      for (const rule of answered) {
+        if (!missesByRule.has(rule)) clearAlerts(`judge-unavailable:${rule}:`);
+      }
+      judgeAlert = unavailableAlert(dueAlerts(failing));
     }
   }
 
@@ -503,12 +567,16 @@ async function main() {
   for (const f of warns) appendLog("warnings.log", `rule=${f.rule} ${f.text}`);
   writePending(sessionId, warns);
   const blocks = findings.filter((f) => f.mode === "block");
+  const out = {};
   if (blocks.length) {
     recordBlock(sessionId, textHash, blocks.map((b) => b.rule).join(","));
-    process.stdout.write(
-      JSON.stringify({ decision: "block", reason: blocks.map((b) => `${b.text} ${b.paste ?? ""}`.trim()).join("\n\n") }),
-    );
+    out.decision = "block";
+    out.reason = blocks.map((b) => `${b.text} ${b.paste ?? ""}`.trim()).join("\n\n");
   }
+  // The person hears about a dead judge here, once per key (lib/alerts.mjs); the agent hears
+  // through the warn notice or the block reason above.
+  if (judgeAlert) out.systemMessage = judgeAlert;
+  if (Object.keys(out).length) process.stdout.write(JSON.stringify(out));
 }
 
 const invokedDirectly =

@@ -28,10 +28,14 @@
 //   verdict itself must be strictly {"violation": <boolean>, "reason": <string>}; anything
 //   else is a failure.
 //
-// FAILURE IS OPEN AND LOUD
-//   Timeout, non-zero exit, or unparseable output each return {violation: false, error: …} —
-//   the hook never blocks on a judge that could not speak — and append one line to
-//   judge-failures.log naming the rule and the error.
+// FAILURE IS OPEN AND LOUD, AND NEVER A PASS
+//   Timeout, non-zero exit, a judge that cannot start, or unparseable output each return
+//   {unavailable: true, error: …} and no verdict at all: no `violation` field, so no caller can
+//   read a judge that could not speak as a pass. Each appends one line to judge-failures.log
+//   naming the rule, the error, and the last STDERR_LOGGED characters of the judge's stderr
+//   (judge CLIs print why they failed there: not logged in, rate limited, unknown flag). The
+//   Stop hook turns an unavailable judge into a "judge unavailable" finding for its rule and
+//   tells the person (i-have-audhd-stop.mjs, JUDGE UNAVAILABLE).
 //
 // THE TIMEOUT follows the harness tag the stop core already runs under; there is no setting.
 //   Untagged (Claude Code): 30s. I_HAVE_AUDHD_HARNESS=omp (set only by the OMP adapter on the
@@ -146,19 +150,25 @@ export function parseVerdict(stdout) {
   return null;
 }
 
+// How much of the judge's stderr is held (the tail, where the reason is) and how much of that
+// reaches judge-failures.log.
+const STDERR_KEPT = 4_000;
+const STDERR_LOGGED = 300;
+
 function runCommand(cmdLine, promptText, timeoutMs) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn("/bin/sh", ["-c", cmdLine], { detached: true, stdio: ["pipe", "pipe", "ignore"] });
+      child = spawn("/bin/sh", ["-c", cmdLine], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
     } catch (err) {
-      resolve({ ok: false, error: `judge-spawn-${err.code || err.message}` });
+      resolve({ ok: false, error: `judge-spawn-${err.code || err.message}`, stderr: "" });
       return;
     }
     let stdout = "";
+    let stderr = "";
     let settled = false;
     // Every exit path, once: stop the timer, reap the judge's process group, release the pipes
-    // (see the header's CLEANUP).
+    // (see the header's CLEANUP). Whatever stderr arrived so far rides every result.
     const settle = (result) => {
       if (settled) return;
       settled = true;
@@ -170,12 +180,16 @@ function runCommand(cmdLine, promptText, timeoutMs) {
       }
       child.stdin.destroy();
       child.stdout.destroy();
-      resolve(result);
+      child.stderr.destroy();
+      resolve({ ...result, stderr });
     };
     const timer = setTimeout(() => settle({ ok: false, error: "judge-timeout" }), timeoutMs);
 
     child.stdout.on("data", (chunk) => {
       if (stdout.length < 2_000_000) stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr = (stderr + chunk.toString("utf8")).slice(-STDERR_KEPT);
     });
     child.on("error", (err) => settle({ ok: false, error: `judge-spawn-${err.code || err.message}` }));
     child.on("close", (code) => settle({ ok: code === 0, code, stdout }));
@@ -183,6 +197,13 @@ function runCommand(cmdLine, promptText, timeoutMs) {
     child.stdin.on("error", () => {});
     child.stdin.end(cmdLine.includes("{prompt}") ? undefined : promptText);
   });
+}
+
+// The judge-failures.log line, and the result every failure returns: no verdict.
+function unavailable(log, rule, error, stderr) {
+  const tail = String(stderr ?? "").replace(/\s+/g, " ").trim().slice(-STDERR_LOGGED);
+  log("judge-failures.log", `rule=${rule} error=${error}${tail ? ` stderr=${JSON.stringify(tail)}` : ""}`);
+  return { unavailable: true, error, ...(tail ? { stderr: tail } : {}) };
 }
 
 // askJudge(rule, question, contextText, config, options?)
@@ -194,7 +215,7 @@ export async function askJudge(rule, question, contextText, config, options = {}
   const log = (file, text) => appendLog(file, text, dir ?? undefined);
   const timeoutMs = Math.max(1, Number(options.timeoutMs) || harnessTimeoutMs());
   const command = config && typeof config.judgeCommand === "string" ? config.judgeCommand : "";
-  if (!command.trim()) return { violation: false, error: "no-judge-command" };
+  if (!command.trim()) return { unavailable: true, error: "no-judge-command" };
 
   const promptText = buildPrompt(rule, question, contextText);
 
@@ -215,17 +236,10 @@ export async function askJudge(rule, question, contextText, config, options = {}
     : command;
   const run = await runCommand(cmdLine, promptText, timeoutMs);
 
-  if (!run.ok) {
-    const error = run.error ?? `judge-exit-${run.code}`;
-    log("judge-failures.log", `rule=${rule} error=${error}`);
-    return { violation: false, error };
-  }
+  if (!run.ok) return unavailable(log, rule, run.error ?? `judge-exit-${run.code}`, run.stderr);
 
   const verdict = parseVerdict(run.stdout);
-  if (!verdict) {
-    log("judge-failures.log", `rule=${rule} error=judge-unparseable`);
-    return { violation: false, error: "judge-unparseable" };
-  }
+  if (!verdict) return unavailable(log, rule, "judge-unparseable", run.stderr);
 
   try {
     mkdirSync(cacheDir, { recursive: true });

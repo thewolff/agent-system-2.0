@@ -250,18 +250,46 @@ they are and apply again if you reinstall. The Stop check's records in
 `~/.local/state/ask-graham/blocked/` (or under `XDG_STATE_HOME`) stay too. Delete them by hand if
 you want them gone.
 
+## Upkeep evidence
+
+For every recommended package or tool, include an upkeep line with five fields: last commit,
+last release, issue activity and human response, active human maintainers, and runtime
+compatibility. Each field needs a receipt (the fetched source and observed result, or the exact
+command and its output) or an explicit unknown. The line records the collection date and activity
+window. If the evidence is missing or incomplete, say so rather than treating it as healthy.
+
+The helper is a report formatter, not a collector: it does not fetch evidence, execute runtimes
+or candidates, install software, decide eligibility, or calculate a recommendation. With a
+complete evidence JSON file, run it offline as:
+
+```
+node <skill dir>/scripts/upkeep.mjs <evidence.json>
+```
+
+The evidence format and output contract are in
+`skills/ask-graham/scripts/upkeep.mjs` and
+`skills/ask-graham/scripts/upkeep.test.mjs`. Warnings name the risk and an exit path; they affect
+ranking and caution only, never eligibility. Stars and repository age are context, not evidence
+of fit or upkeep. For compatibility, discover the relevant runtimes actually installed on the
+machine, record the detection command and output, and compare the selected installed version
+with support evidence. If a runtime cannot be detected or its version's support is unverified,
+report it as unknown rather than guessing.
+
 ## Tests
 
-```
-cd plugins/ask-graham
-node --test
-```
+Run `node --test` from this directory. Tests exercise the consumer-visible upkeep report and
+warnings, verdict behavior on hand-built transcripts in both Claude Code and OMP shapes
+(`verdict.test.mjs`, fixtures in `fixtures/transcripts.mjs`), intensity resolution and CLI, both
+hosts' hooks/extensions, and manifest version parity. CI runs the same command on Ubuntu and
+macOS with Node 24 (`.github/workflows/ask-graham.yml`).
 
-The suites cover the intensity resolver and CLI, the Claude Code hooks, the OMP extension, the
-Stop check on hand-built transcripts in both the Claude Code and the OMP shape
-(`verdict.test.mjs`, fixtures in `fixtures/transcripts.mjs`), the verdict vocabulary across the
-skill, README, manifests and marketplace entries, and the manifests. CI runs the same command on
-Ubuntu and macOS with Node 24 (`.github/workflows/ask-graham.yml`).
+## Release notes
+
+### 2026-10-20 — 0.6.0
+
+Adds receipted upkeep evidence and risk/exit-path warnings for evaluating recommendations.
+Warnings inform ranking without becoming gates; missing evidence and runtime compatibility stay
+explicitly unknown.
 
 ## License
 

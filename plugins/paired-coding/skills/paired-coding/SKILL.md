@@ -119,12 +119,20 @@ tests or artifacts, whose effect can be checked on its own.
 
 ## The card
 
-Short by default. When your partner says "show more", expand any field.
+Every card shows the planned code before your partner agrees, unprompted: never wait for them
+to ask. The first card of a change set always carries it, and so does every revision. Keep the
+prose fields to a line or two; the code is what your partner reviews. Show the code whole up to
+about 80 lines; past that, show the parts the decision rests on and say what you left out. When
+your partner says "show more", expand any field.
 
 - **Why now:** one line tying it to the roadmap.
 - **The decision inside it:** the choice your partner might disagree with, stated plainly. This
   line is why pairing exists; write it first and make it specific.
-- **Current code:** the smallest excerpt of what the change set touches.
+- **Current code:** the smallest excerpt of what the change set touches, as code, not a
+  description of it.
+- **Planned code:** the code you will write: the whole new or changed function, or a diff
+  against the current code. Pass it as `pair_propose`'s `proposedCode` and show it on the card
+  in a code block.
 - **Proposed effect:** what behaves differently afterward.
 - **Boundary:** the exact files it will write, as worktree-relative paths, globs, or `dir/` for
   a whole subtree, and the checks it will run.

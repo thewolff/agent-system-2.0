@@ -23,8 +23,8 @@ Renamed from `communication-rules` in 1.0.0 (see "Changes").
 
 ## Install
 
-It needs `node` on your `PATH`: Claude Code runs the hooks as `node <hook>.mjs`, and OMP runs
-them through a login shell (`sh -lc`), so on OMP `node` has to be on a login shell's `PATH`.
+It needs `node`: Claude Code runs the hooks as `node <hook>.mjs` from your `PATH`, and the OMP
+adapter runs them under node resolved to an absolute path (`I_HAVE_AUDHD_NODE` pins one).
 
 1. **Install.** Claude Code:
 
@@ -125,8 +125,11 @@ while any harness or OMP profile still has the plugin installed.
    an "i-have-audhd warned on the agent's last message" notice and the agent receives the fix.
 3. On OMP, count adapter failures:
    `grep -c 'omp-adapter fail-open' ~/.claude/.i-have-audhd-state/errors.log`. Every adapter
-   failure leaves one such line (`omp/i-have-audhd-omp.ts`, the fail-open contract comment);
-   a count that grows each turn means the adapter is installed but failing.
+   failure leaves one such line naming the hook and carrying the tail of its stderr
+   (`omp/i-have-audhd-omp.ts`, the fail-open contract comment); a count that grows each turn
+   means the adapter is installed but failing. The OMP UI also shows an error notice for each
+   kind of failure, once, then hourly while it lasts. The hooks run under node resolved to an
+   absolute path; set `I_HAVE_AUDHD_NODE` to pin one.
 
 ## What happens at session start
 
@@ -186,7 +189,8 @@ also caps every block to warn unless the profile sets `enforcement.armOmp: true`
 
 **Kill switch:** `touch ~/.claude/.i-have-audhd-off` disables the Stop hook within one turn.
 `I_HAVE_AUDHD_ENFORCE=off` is a secondary switch that needs a host relaunch to change.
-Everything fails open: a broken hook exits 0 with one line in `errors.log`.
+Everything fails open: a broken hook exits 0 with one line in `errors.log`. A judge that cannot
+answer is never a pass: see the judge contract below.
 
 ## Configuring a profile
 
@@ -216,8 +220,13 @@ Codex CLI is installed and signed in; it is an example, not a requirement.
 piped to its stdin. It has to exit 0 within 30s (20s under OMP) and print, on stdout, a JSON
 object `{"violation": <boolean>, "reason": "<string>"}`. Banner lines before it are fine; the
 last such object wins, and one `{"result": "<json string>"}` envelope (what
-`claude -p --output-format json` prints) is unwrapped. Anything else is a judge failure: the
-check passes and `judge-failures.log` gets a line. A judge that is itself a Claude Code or OMP
+`claude -p --output-format json` prints) is unwrapped. Anything else is a judge failure, and a
+failed judge is never counted as a pass: `judge-failures.log` gets a line with the tail of the
+judge's stderr, and the rule becomes a "Judge unavailable" finding in the rule's own mode (a
+warning by default; in block mode it blocks once, and the revision is only warned). You are told
+once per rule and error, through the hook's `systemMessage` (a UI warning on OMP), again hourly
+while it keeps failing, and at once if it fails again after a stop where the judge answered.
+A judge that is itself a Claude Code or OMP
 session should run with `I_HAVE_AUDHD_ENFORCE=off I_HAVE_AUDHD_INJECT=off` in front, so this
 plugin's hooks do not run inside the judge's own session; the setup tool's choices do.
 
@@ -286,6 +295,18 @@ file and a replaced one are kept.
 Exit 0 means every item is done or had nothing to do, 1 means one was refused or failed.
 
 ## Changes
+
+### 1.4.0
+
+- A judge that times out, exits non-zero, cannot start, or prints no verdict is reported as
+  "judge unavailable" for its rule, never counted as a pass. The rule's finding follows its
+  mode (warn by default), `judge-failures.log` keeps the tail of the judge's stderr, and the
+  person is told once per rule and error, then hourly while it lasts (`lib/alerts.mjs`).
+- The OMP adapter runs the hooks under an absolute node path instead of `sh -lc node`, which
+  exited 127 wherever the login profile has no node. It resolves the running node, or under
+  Bun the first `node` on PATH and then fixed fallbacks; `I_HAVE_AUDHD_NODE` overrides.
+- Every OMP adapter failure line names its hook and keeps the tail of the hook's stderr, and
+  each kind of failure raises one UI error notice, then one an hour while it lasts.
 
 ### 1.3.0
 

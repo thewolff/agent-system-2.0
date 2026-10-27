@@ -1318,7 +1318,9 @@ plugins/ask-graham/package.json	data	-
 plugins/ask-graham/skills/ask-graham/SKILL.md	skill	-
 plugins/ask-graham/skills/ask-graham/references/comparables-criteria.md	skill-asset	-
 plugins/ask-graham/skills/ask-graham/references/graham-answers.md	skill-asset	-
+plugins/ask-graham/skills/ask-graham/references/upkeep.md	skill-asset	-
 plugins/ask-graham/skills/ask-graham/scripts/intensity.mjs	skill-asset	-
+plugins/ask-graham/skills/ask-graham/scripts/upkeep.mjs	skill-asset	-
 plugins/ask-graham/skills/ask-graham/scripts/verdict.mjs	skill-asset	-
 plugins/i-have-audhd/.claude-plugin/plugin.json	data	-
 plugins/i-have-audhd/.omp-plugin/plugin.json	data	-
@@ -1335,6 +1337,7 @@ plugins/i-have-audhd/hooks/i-have-audhd-inject.mjs	module	-
 plugins/i-have-audhd/hooks/i-have-audhd-prompt.mjs	module	-
 plugins/i-have-audhd/hooks/i-have-audhd-stop.mjs	module	-
 plugins/i-have-audhd/judge/ask.mjs	module	-
+plugins/i-have-audhd/lib/alerts.mjs	module	-
 plugins/i-have-audhd/lib/config.mjs	module	-
 plugins/i-have-audhd/lib/judge-setup.mjs	module	-
 plugins/i-have-audhd/lib/pending.mjs	module	-

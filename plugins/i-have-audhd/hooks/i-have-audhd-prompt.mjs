@@ -38,7 +38,8 @@ function main() {
   if (!pending) return;
   process.stdout.write(
     JSON.stringify({
-      systemMessage: pending.summary,
+      // No line for the person when every finding is a judge-unavailable one (lib/pending.mjs).
+      ...(pending.summary ? { systemMessage: pending.summary } : {}),
       hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: pending.notice },
     }),
   );
