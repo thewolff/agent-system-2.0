@@ -235,10 +235,12 @@ function ghApiArgs<T extends { text: string }>(argv: T[]): T[] | null {
  * value. A graphql request is refused for a status or check mutation in any decoded word or in what it
  * reads on stdin, and for a query or body read from a file, or from stdin the gate cannot see. `stdin` is the
  * heredoc or here-string text the command reads, null when it reads a pipe or a file; the raw pass,
- * which cannot see heredoc bodies, omits it and the parsed pass judges stdin.
+ * which cannot see heredoc bodies, omits it and the parsed pass judges stdin. `tolerateUnread` (the
+ * routine classifier's read-only rule, PLAN wl-mvqwn80onq9hq8 D2a (i)) skips the unread-word refusal
+ * only; the classifier then judges the unread word itself.
  */
-function ghApiModel(args: GhApiArg[], stdin?: string | null): string | null {
-	if (args.some((a) => a.unread)) return `gh api with a word not known until it runs, which could be a status or check-run endpoint or a method that writes one ${GH_API_WHY}`;
+function ghApiModel(args: GhApiArg[], stdin?: string | null, tolerateUnread = false): string | null {
+	if (!tolerateUnread && args.some((a) => a.unread)) return `gh api with a word not known until it runs, which could be a status or check-run endpoint or a method that writes one ${GH_API_WHY}`;
 	let method: string | null | undefined;
 	let writes = false;
 	let input: string | undefined;
@@ -404,12 +406,13 @@ const RM_SHORT = /^-[dfiIPRrvWx]+$/;
  */
 const TEMP_PATH = /^(?:\/private)?\/tmp\/[^/]|^(?:\/private)?\/var\/folders\/[^/]|^"?\$\{?TMPDIR\}?"?\/[^/]/;
 
-/** One rm argument: its text, whether its value is unknown until it runs, and whether it is a path inside the own scratch root (scratchPath). */
+/** One rm argument: its text, whether its value is unknown until it runs, and whether it is a path inside the own scratch root (scratchPath) or the own worktree (treePath). */
 export interface RmArg {
 	text: string;
 	unread: boolean;
 	glob?: boolean;
 	inside?: boolean;
+	tree?: boolean;
 }
 
 /**
@@ -417,9 +420,10 @@ export interface RmArg {
  * rules (`--recu` is `--recursive`), an unknown or ambiguous one refused as unmodeled; recursive plus
  * force on any path outside the temp directories is the § A4 reserved `rm -rf`. An operand inside the
  * own scratch root (`inside`, PLAN wl-mv5oikd5jtquww § 1.2 rule 1) is exempt too; when that exemption
- * is what lets the rm through, "rm" goes into `used`.
+ * is what lets the rm through, "rm" goes into `used`. An operand inside the own worktree (`tree`, the
+ * routine classifier's rule, PLAN wl-mvqwn80onq9hq8 D2b) is exempt the same way and records into `treeUsed`.
  */
-export function rmModel(args: RmArg[], used?: Set<string>): { reserved: boolean; why: string } | null {
+export function rmModel(args: RmArg[], used?: Set<string>, treeUsed?: Set<string>): { reserved: boolean; why: string } | null {
 	let r = false;
 	let f = false;
 	let dashdash = false;
@@ -450,8 +454,9 @@ export function rmModel(args: RmArg[], used?: Set<string>): { reserved: boolean;
 	}
 	if (!r || !f) return null;
 	const notTemp = (o: RmArg): boolean => o.unread || !TEMP_PATH.test(o.text) || o.text.split("/").includes("..");
-	if (operands.some((o) => !o.inside && notTemp(o))) return { reserved: true, why: "rm -rf (recursive force-delete) of a path outside the temp directories" };
+	if (operands.some((o) => !o.inside && !o.tree && notTemp(o))) return { reserved: true, why: "rm -rf (recursive force-delete) of a path outside the temp directories" };
 	if (operands.some((o) => o.inside && notTemp(o))) used?.add("rm");
+	if (operands.some((o) => o.tree && notTemp(o))) treeUsed?.add("rm");
 	return null;
 }
 
@@ -478,18 +483,25 @@ export function isRecursiveForceRm(seg: string, scratch?: Scratch): boolean {
 	return false;
 }
 
+/** What the routine classifier's options (ReservedOptions) change in the raw pass. */
+interface RawOptions {
+	/** Skip the `rm` check: the parsed pass judges every `rm` on its argv (a clean parse in a confining mode). */
+	skipRm: boolean;
+	tolerateUnread: boolean;
+}
+
 /**
  * The reserved action a shell command text reaches, or null. Quote-blind; runs per `;`/`&`/`|`/newline
  * segment. `skipPrinters` passes segments that start with `echo`/`printf`: the caller has checked
  * their output reaches nothing that runs it (astra review round 2 false positive, `printf "git reset --hard\n"`).
  */
-export function reservedInShell(cmd: string, skipPrinters = false, scratch?: Scratch): string | null {
+export function reservedInShell(cmd: string, skipPrinters = false, scratch?: Scratch, raw?: RawOptions): string | null {
 	const c = cmd.replace(/\r\n?/g, "\n").replace(/[ \t]+/g, " ").trim();
 	if (/:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/.test(c)) return "fork bomb";
 	for (const seg of c.split(/[;&|\n]+/).map((s) => s.trim()).filter(Boolean)) {
 		if (skipPrinters && /^(echo|printf)(\s|$)/.test(seg)) continue;
-		if (isRecursiveForceRm(seg, scratch)) return "rm -rf (recursive force-delete)";
-		const gh = ghApiInText(seg);
+		if (!raw?.skipRm && isRecursiveForceRm(seg, scratch)) return "rm -rf (recursive force-delete)";
+		const gh = ghApiInText(seg, raw?.tolerateUnread === true);
 		if (gh) return gh;
 		for (const { re, why } of RULES) if (re.test(seg)) return why;
 	}
@@ -500,14 +512,14 @@ export function reservedInShell(cmd: string, skipPrinters = false, scratch?: Scr
  * ghApiModel over each `gh … api` in a raw segment: its words split on spaces, quote-blind, with the
  * quotes off a word quoted whole, and a word holding a substitution unread (isRecursiveForceRm's reading).
  */
-function ghApiInText(seg: string): string | null {
+function ghApiInText(seg: string, tolerateUnread: boolean): string | null {
 	for (const m of seg.matchAll(new RegExp(`${GH}api(?=\\s|$)`, "gi"))) {
 		const args = seg
 			.slice(m.index + m[0].length)
 			.split(" ")
 			.filter(Boolean)
 			.map((t) => ({ text: t.replace(/^(['"])(.*)\1$/, "$2"), unread: /`|\$\(/.test(t) }));
-		const why = ghApiModel(args);
+		const why = ghApiModel(args, undefined, tolerateUnread);
 		if (why) return why;
 	}
 	return null;
@@ -643,18 +655,104 @@ function scratchWords(e: Exec, s: Scratch): ScratchWords | undefined {
 
 /**
  * Rules 2 and 3 for one git command: the command with its lexical directory (exec.ts dirLexical) when
- * git's own is unknown and the lexical one is inside the root, and the lifts that hold for it.
+ * git's own is unknown and the lexical one is inside the root, and the lifts that hold for it. In a
+ * routine mode (`mode`): with `relative`, the scratch lifts hold only for a directory reached through
+ * trusted `cd` hops (trustedDir); with `tree`, the own-worktree lift holds when the repository git
+ * works on is the own worktree (treeRepo), reached the same way. Null when no lift can hold.
  */
-function scratchGit(git: GitCall, s: Scratch): { call: GitCall; lift: ScratchLift } {
-	const lexical = git.dir === "" && git.dirLexical !== "" && insideRoot(s.root, git.dirLexical);
+function scratchGit(git: GitCall, e: Exec, s: Scratch | undefined, mode?: Mode): { call: GitCall; lift: ScratchLift } | null {
+	if (!s) {
+		if (!mode?.tree) return null;
+		const tree = git.dir !== "" && trustedDir(e, mode.source, undefined) && treeRepo(mode.tree.root, git.dir);
+		return { call: git, lift: { repo: false, push: false, used: [], ...(tree ? { worktree: [] } : {}) } };
+	}
+	const trusted = !mode?.relative || trustedDir(e, s.source, s.root);
+	const lexical = git.dir === "" && git.dirLexical !== "" && insideRoot(s.root, git.dirLexical) && trusted;
 	const call = lexical ? { ...git, dir: git.dirLexical } : git;
 	if (lexical) s.used.add("dirLexical");
-	return { call, lift: { repo: call.dir !== "" && repoInside(s.root, call.dir), push: call.dir !== "" && pushToScratch(git, s), used: [] } };
+	const lift: ScratchLift = { repo: call.dir !== "" && trusted && repoInside(s.root, call.dir), push: call.dir !== "" && pushToScratch(git, s), used: [] };
+	if (mode?.tree && call.dir !== "" && trustedDir(e, mode.source, s.root) && treeRepo(mode.tree.root, call.dir)) lift.worktree = [];
+	return { call, lift };
 }
 
-/** `lift`'s verdicts set aside, recorded on the call. */
-function recordLifts(lift: ScratchLift | undefined, s: Scratch | undefined): void {
+/** `lift`'s verdicts set aside, recorded on the call: the scratch lifts in `s.used`, the own-worktree lift in `tree.used`. */
+function recordLifts(lift: ScratchLift | undefined, s: Scratch | undefined, tree?: Worktree): void {
 	if (lift && s) for (const why of lift.used) s.used.add(`git: ${why}`);
+	if (lift?.worktree && tree) for (const why of lift.worktree) tree.used.add(`git: ${why}`);
+}
+
+/** The workload's own worktree for the routine classifier (ReservedOptions.worktreeRoot): its physical root, and each rule that changed a verdict. */
+interface Worktree {
+	root: string;
+	used: Set<string>;
+}
+
+/** The routine classifier's options for one bash call (ReservedOptions), resolved. */
+interface Mode {
+	tolerateUnread: boolean;
+	/** scratchRelative: an rm operand reached through trusted `cd` hops counts inside the scratch root. */
+	relative: boolean;
+	tree?: Worktree;
+	/** The command text the words' spans index. */
+	source: string;
+}
+
+/**
+ * The own worktree from `root`, or undefined (then nothing is confined to it): an absolute path to a
+ * directory that exists, taken at its physical path (scratch.ts insideRoot compares physical paths).
+ */
+function worktreeFor(root: string | undefined): Worktree | undefined {
+	if (!root || !root.startsWith("/") || root === "/" || !existsSync(root)) return undefined;
+	return { root: physicalPath(resolve(root)), used: new Set() };
+}
+
+/**
+ * Whether a command's directory can be trusted for a relative path (PLAN wl-mvqwn80onq9hq8 D2b): it is
+ * known, and every `cd` hop that set it (SimpleCommand.hops) is literal text or a `"$AS2_SCRATCH/…"`
+ * spelling of the scratch root (through the word's span in `source`), with no `..` component, which
+ * chdir(2) takes from wherever a symlink before it led.
+ */
+function trustedDir(e: Exec, source: string, scratchRoot: string | undefined): boolean {
+	if (!e.dirKnown) return false;
+	return e.source.hops.every((h) => !h.opaque && !h.glob && !h.text.split("/").includes("..") && (!h.expanded || spelledInScratch(h, source, scratchRoot)));
+}
+
+function spelledInScratch(w: Word, source: string, scratchRoot: string | undefined): boolean {
+	return w.span !== undefined && scratchRoot !== undefined && scratchSpelling(source.slice(w.span[0], w.span[1]), scratchRoot) !== null;
+}
+
+/**
+ * The path an operand names when it is confined to `root` (D2b): neither opaque nor a glob, no `..`
+ * component, literal text or a `"$AS2_SCRATCH/…"` spelling, relative only from a trusted directory
+ * (trustedDir), and strictly below `root` physically (scratch.ts insideRoot). Null otherwise.
+ */
+function confinedOperand(root: string, e: Exec, w: Word, source: string, scratchRoot: string | undefined): string | null {
+	if (w.opaque || w.glob || w.text === "" || w.text.split("/").includes("..")) return null;
+	if (w.expanded && !spelledInScratch(w, source, scratchRoot)) return null;
+	if (!w.text.startsWith("/") && !trustedDir(e, source, scratchRoot)) return null;
+	const path = resolve(e.dir, w.text);
+	return insideRoot(root, path) ? path : null;
+}
+
+/** An rm operand confined to the own worktree: confinedOperand, and no `.git` component in its spelled or physical path (the worktree's `.git` file and anything a link reaches inside a gitdir). */
+function treePath(tree: Worktree, e: Exec, w: Word, source: string, scratchRoot: string | undefined): boolean {
+	const path = confinedOperand(tree.root, e, w, source, scratchRoot);
+	return path !== null && !insideDotGit(path) && !insideDotGit(physicalPath(path));
+}
+
+/**
+ * Whether the repository git works on from `dir` is the own worktree: `dir` is the worktree root or
+ * strictly below it (no `.git` component), and the first repository found walking up from it is the
+ * worktree root's own (a nested repository inside the worktree is not).
+ */
+function treeRepo(root: string, dir: string): boolean {
+	const start = physicalPath(dir);
+	if (start !== root && !insideRoot(root, dir)) return false;
+	if (insideDotGit(start.slice(root.length))) return false;
+	for (let p = start; ; p = dirname(p)) {
+		if (gitDirAt(p) !== null) return p === root;
+		if (p === root || p === "/") return false;
+	}
 }
 
 /**
@@ -806,13 +904,18 @@ function dataWords(cmd: string, x: Expansion, cwd: string, env: Record<string, s
 /**
  * The reserved action one parsed command reaches, or null. `data` are words left out of the final
  * rules match (dataWords). `scratch` turns on the scratch rules 1–3 for a bash call (scratchFor).
+ * `mode` carries the routine classifier's options (ReservedOptions, PLAN wl-mvqwn80onq9hq8 D2a, D2b).
  */
-function reservedInExec(e: Exec, data?: Set<Word>, scratch?: Scratch): string | null {
+function reservedInExec(e: Exec, data?: Set<Word>, scratch?: Scratch, mode?: Mode): string | null {
 	const name = basename(e.argv[0]!.text);
 	// A word the shell expands when it runs (a substitution or a glob): its value is not known here.
 	const unread = (w: Word): boolean => w.opaque || w.glob === true;
 	if (name === "rm") {
-		const rm = rmModel(e.argv.slice(1).map((w) => ({ text: w.text, unread: w.opaque, glob: w.glob, inside: scratch !== undefined && scratchPath(w, scratch) !== null })), scratch?.used);
+		const inside = (w: Word): boolean =>
+			scratch !== undefined && (scratchPath(w, scratch) !== null || (mode?.relative === true && confinedOperand(scratch.root, e, w, scratch.source, scratch.root) !== null));
+		const tree = mode?.tree;
+		const args = e.argv.slice(1).map((w) => ({ text: w.text, unread: w.opaque, glob: w.glob, inside: inside(w), ...(tree ? { tree: treePath(tree, e, w, mode!.source, scratch?.root) } : {}) }));
+		const rm = rmModel(args, scratch?.used, tree?.used);
 		if (rm?.reserved) return rm.why;
 	}
 	if (name === "psql") {
@@ -821,20 +924,20 @@ function reservedInExec(e: Exec, data?: Set<Word>, scratch?: Scratch): string | 
 	}
 	if (name === "gh") {
 		const api = ghApiArgs(e.argv);
-		const why = api ? ghApiModel(api.map((w) => ({ text: w.text, unread: unread(w) })), stdinText(e)) : null;
+		const why = api ? ghApiModel(api.map((w) => ({ text: w.text, unread: unread(w) })), stdinText(e), mode?.tolerateUnread === true) : null;
 		if (why) return why;
 	}
 	const git = gitCall(e);
 	if (git) {
 		if (git.sub === null) return "git with a subcommand not known until it runs";
-		if (GIT_ARG_SENSITIVE[git.sub] && git.args.some(unread)) return `git ${git.sub} with an argument not known until it runs`;
-		const sg = scratch ? scratchGit(git, scratch) : null;
+		if (GIT_ARG_SENSITIVE[git.sub] && git.args.some(unread) && !mode?.tolerateUnread) return `git ${git.sub} with an argument not known until it runs`;
+		const sg = scratchGit(git, e, scratch, mode);
 		const call = sg?.call ?? git;
 		if (call.sub === "push" && call.dir === "") return "git push from a directory not known until it runs";
 		const v = gitModel(call, sg?.lift);
 		if (v?.reserved) return v.why;
-		recordLifts(sg?.lift, scratch);
-	} else if (HEAD_SENSITIVE[name] && e.argv.slice(1, 4).some(unread)) {
+		recordLifts(sg?.lift, scratch, mode?.tree);
+	} else if (HEAD_SENSITIVE[name] && e.argv.slice(1, 4).some(unread) && !mode?.tolerateUnread) {
 		return `${name} with a subcommand or target not known until it runs`;
 	}
 	// An infrastructure CLI's verb past its global options (astra-8 B3); an unknown one is refused as unmodeled.
@@ -923,7 +1026,7 @@ const GIT_FORM_SPELLING =
  * (M4 fix round 3: the default inverts, Jo 2026-09-29). The command may be harmless; the gate
  * cannot tell, so it refuses and names what it can read. `scratch`: the scratch rules (scratchFor).
  */
-function unmodeledInExec(e: Exec, assigned: Map<string, Word[]>, env: Record<string, string | undefined>, scratch?: Scratch): { what: string; spelling: string } | null {
+function unmodeledInExec(e: Exec, assigned: Map<string, Word[]>, env: Record<string, string | undefined>, scratch?: Scratch, mode?: Mode): { what: string; spelling: string } | null {
 	const head = e.argv[0]!;
 	const name = basename(head.text);
 	if (/[^\x00-\x7f]/.test(head.text)) return { what: `the command name \`${head.text}\` has characters outside ASCII`, spelling: "the command name in plain ASCII" };
@@ -987,9 +1090,9 @@ function unmodeledInExec(e: Exec, assigned: Map<string, Word[]>, env: Record<str
 	const git = gitUnmodeled(e, assigned, scratch ? scratchWords(e, scratch) : undefined);
 	if (git) return { what: `${git}: a git form the gate does not model`, spelling: GIT_FORM_SPELLING };
 	const call = gitCall(e);
-	const sg = call && scratch ? scratchGit(call, scratch) : null;
+	const sg = call ? scratchGit(call, e, scratch, mode) : null;
 	const model = call ? gitModel(sg?.call ?? call, sg?.lift) : null;
-	recordLifts(sg?.lift, scratch);
+	recordLifts(sg?.lift, scratch, mode?.tree);
 	if (model && !model.reserved) return { what: `${model.why}: a git form the gate does not model`, spelling: model.spelling ?? GIT_FORM_SPELLING };
 	if (name === "rm") {
 		if (e.argv.slice(1).some((w) => NON_ASCII_DASH.test(w.text))) return { what: "rm with an operand that starts with a dash look-alike outside ASCII", spelling: "rm with ASCII flags" };
@@ -1351,70 +1454,116 @@ const INTERPRETER_ENV_SPELLING =
 	"the command without that variable: code in a script or `-e` the gate reads, NODE_OPTIONS/BUN_OPTIONS of reporting and memory options only, and a warnings file only as a literal absolute path";
 
 /**
- * Row 6 over one tool call. A bash call the scratch rules (scratchFor) let through is marked confined
- * for the fence (session.ts markConfined).
+ * The routine classifier's options for row 6 (PLAN wl-mvqwn80onq9hq8 D2a (i), D2b). Without them row 6
+ * judges a call as it always has.
  */
-export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
+export interface ReservedOptions {
+	/**
+	 * Skip exactly three whys, in the raw and the parsed pass: ghApiModel's "word not known until it runs",
+	 * `<name> with a subcommand or target not known until it runs` and `git <sub> with an argument not
+	 * known until it runs`. The classifier then judges every unread word itself.
+	 */
+	tolerateUnread?: boolean;
+	/**
+	 * In the parsed pass, an rm operand relative to a directory reached through trusted `cd` hops counts
+	 * inside the own scratch root when it is (confinedOperand), and the scratch git lifts need those hops
+	 * too (scratchGit). The raw pass's rm check is skipped when the parse is clean (empty `x.blind`), so
+	 * every rm is judged on its argv.
+	 */
+	scratchRelative?: boolean;
+	/**
+	 * The workload's own worktree (its `worktree:` control entry): an rm operand confined to it (treePath)
+	 * and git's work-tree discards on it (git-model.ts ScratchLift.worktree) are set aside, recorded in
+	 * ReservedVerdict.worktree. The raw pass's rm check is skipped as for scratchRelative.
+	 */
+	worktreeRoot?: string;
+}
+
+/** Row 6's verdict with what let it through: each scratch rule (`scratch`) and each own-worktree rule (`worktree`) that changed a verdict. */
+export interface ReservedVerdict {
+	refusal: Refusal;
+	scratch: string[];
+	worktree: string[];
+}
+
+/**
+ * Row 6 over one tool call. A bash call the scratch rules (scratchFor) let through is marked confined
+ * for the fence (session.ts markConfined). With `opts` (the routine classifier's options) nothing is
+ * marked: the classifier reads reservedVerdict, and the gate marks the call after it records the
+ * auto-apply (PLAN wl-mvqwn80onq9hq8 D3).
+ */
+export function checkReserved(call: ToolCall, ctx: CallContext, opts?: ReservedOptions): Refusal {
+	const v = reservedVerdict(call, ctx, opts);
+	if (!opts && v.refusal === null && v.scratch.length > 0) markConfined(call);
+	return v.refusal;
+}
+
+/** checkReserved's judgement, without marking the call: the refusal, and the scratch and own-worktree rules that changed a verdict. */
+export function reservedVerdict(call: ToolCall, ctx: CallContext, opts?: ReservedOptions): ReservedVerdict {
 	const { toolName, input } = call;
+	const none = (refusal: Refusal): ReservedVerdict => ({ refusal, scratch: [], worktree: [] });
 	if (toolName === "bash") {
 		const cmd = bashCommand(input);
 		const cwd = typeof input.cwd === "string" ? resolve(ctx.cwd, input.cwd) : ctx.cwd;
 		const x = expandShell(cmd, cwd, ctx.env, input.env);
 		const scratch = scratchFor(ctx, cmd, x, input.env) ?? undefined;
+		const tree = worktreeFor(opts?.worktreeRoot);
+		const mode: Mode | undefined = opts && { tolerateUnread: opts.tolerateUnread === true, relative: opts.scratchRelative === true, ...(tree ? { tree } : {}), source: cmd };
+		const bash = (refusal: Refusal): ReservedVerdict => ({ refusal, scratch: [...(scratch?.used ?? [])], worktree: [...(tree?.used ?? [])] });
 		const data = dataWords(cmd, x, cwd, ctx.env);
-		const raw = reservedInShell(data?.masked ?? cmd, printersOnlyPrint(cmd, cwd, ctx.env), scratch);
-		if (raw) return refuse(raw, `Command: ${cmd}`);
+		const rawOpts = mode && { skipRm: (mode.relative || tree !== undefined) && x.blind.length === 0, tolerateUnread: mode.tolerateUnread };
+		const raw = reservedInShell(data?.masked ?? cmd, printersOnlyPrint(cmd, cwd, ctx.env), scratch, rawOpts);
+		if (raw) return bash(refuse(raw, `Command: ${cmd}`));
 		for (const e of x.commands) {
-			const why = reservedInExec(e, data?.words, scratch) ?? barePushOfProtected(e, scratch);
-			if (why) return refuse(why, `Command: ${cmd}`);
+			const why = reservedInExec(e, data?.words, scratch, mode) ?? barePushOfProtected(e, scratch);
+			if (why) return bash(refuse(why, `Command: ${cmd}`));
 		}
 		// Files an interpreter writes because of its environment (astra-7 B3): none inside .git.
 		const ienv = interpreterEnv(x, cwd);
 		for (const w of ienv.writes) {
-			if (insideDotGit(resolve(cwd, w.text))) return refuse("an interpreter told by its environment to write inside a .git directory (a ref move, or config and hooks git runs later)", `Command: ${cmd}`);
+			if (insideDotGit(resolve(cwd, w.text))) return bash(refuse("an interpreter told by its environment to write inside a .git directory (a ref move, or config and hooks git runs later)", `Command: ${cmd}`));
 		}
 		if (definesFunction(cmd)) {
-			return refuseUnmodeled({ what: "a shell function definition (its body runs later under the function's name, which the gate does not follow)", spelling: "the commands typed out where they run, without a function" }, `Command: ${cmd}`);
+			return bash(refuseUnmodeled({ what: "a shell function definition (its body runs later under the function's name, which the gate does not follow)", spelling: "the commands typed out where they run, without a function" }, `Command: ${cmd}`));
 		}
 		// Item 81 (PLAN wl-mv0n5r9cbafe9s § 2): every alias definition, then every switch that turns alias expansion on.
 		const alias = definesAlias(cmd, x) ?? namesAliasSwitch(cmd, input.env, x);
-		if (alias) return refuseUnmodeled(alias, `Command: ${cmd}`);
+		if (alias) return bash(refuseUnmodeled(alias, `Command: ${cmd}`));
 		for (const e of x.commands) {
-			const u = unmodeledInExec(e, x.assigned, ctx.env, scratch);
-			if (u) return refuseUnmodeled(u, `Command: ${cmd}`);
+			const u = unmodeledInExec(e, x.assigned, ctx.env, scratch, mode);
+			if (u) return bash(refuseUnmodeled(u, `Command: ${cmd}`));
 		}
-		if (ienv.unmodeled) return refuseUnmodeled({ what: `${ienv.unmodeled} (an interpreter or loader setting)`, spelling: INTERPRETER_ENV_SPELLING }, `Command: ${cmd}`);
+		if (ienv.unmodeled) return bash(refuseUnmodeled({ what: `${ienv.unmodeled} (an interpreter or loader setting)`, spelling: INTERPRETER_ENV_SPELLING }, `Command: ${cmd}`));
 		for (const c of x.code) {
 			const hit = reservedInCode(c.text, c.family, c.dir, ctx.env);
 			if (!hit) continue;
 			const detail = `${hit.detail} Command: ${cmd}`;
 			// An unreadable launch in inline code is a respelling, not Jo's call (PLAN wl-muzs0ytnaet1v4 D2).
-			return hit.unmodeled ? refuseUnmodeled(hit.unmodeled, detail) : hit.respell ? refuseRespell(hit.why, detail) : refuse(hit.why, detail);
+			return bash(hit.unmodeled ? refuseUnmodeled(hit.unmodeled, detail) : hit.respell ? refuseRespell(hit.why, detail) : refuse(hit.why, detail));
 		}
 		if (x.blind.length > 0) {
-			return refuseRespell("a command the gate cannot read to the end", `${x.blind[0]}. The gate refuses what it cannot see rather than pass it; spell the command out literally. Command: ${cmd}`);
+			return bash(refuseRespell("a command the gate cannot read to the end", `${x.blind[0]}. The gate refuses what it cannot see rather than pass it; spell the command out literally. Command: ${cmd}`));
 		}
-		if (scratch && scratch.used.size > 0) markConfined(call);
-		return null;
+		return bash(null);
 	}
 	if (toolName === "eval") {
 		// The eval tool runs JavaScript or Python. Its `language` picks the comment syntax, as in row 10,
 		// so a comment is never a command (astra-9 R1).
 		const lang = input.language;
 		const family = lang === "py" || lang === "python" ? "python" : lang === "js" || lang === "ts" ? "js" : undefined;
-		return checkEvalCode(String(input.code ?? input.cell ?? ""), family, ctx, false);
+		return none(checkEvalCode(String(input.code ?? input.cell ?? ""), family, ctx, false));
 	}
 	if (toolName === "browser" || toolName.startsWith("mcp__chrome_devtools_") || toolName.startsWith("mcp__playwright")) {
 		const action = String(input.action ?? toolName.replace(/^mcp__(chrome_devtools|playwright)_+/, ""));
-		if (BROWSER_WRITE_ACTION.test(action)) return refuse(`a browser write (${action})`, `Tool: ${toolName}.`);
-		return null;
+		if (BROWSER_WRITE_ACTION.test(action)) return none(refuse(`a browser write (${action})`, `Tool: ${toolName}.`));
+		return none(null);
 	}
 	if (toolName === "write" || toolName === "edit" || toolName === "ast_edit") {
 		// git's own files (refs, HEAD, config, hooks) written directly skip every git spelling above.
 		for (const p of [input.path, ...(Array.isArray(input.paths) ? input.paths : [])]) {
-			if (typeof p === "string" && insideDotGit(resolve(ctx.cwd, p))) return refuse("writing inside a .git directory (a ref move, or config and hooks git runs later)", `Path: ${p}`);
+			if (typeof p === "string" && insideDotGit(resolve(ctx.cwd, p))) return none(refuse("writing inside a .git directory (a ref move, or config and hooks git runs later)", `Path: ${p}`));
 		}
-		return null;
+		return none(null);
 	}
-	return null;
+	return none(null);
 }

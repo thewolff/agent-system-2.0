@@ -265,11 +265,16 @@ const RESERVED_OPTS: Record<string, Record<string, string>> = {
  * decides: `repo` when the repository the command works on is inside the own scratch root (rule 2),
  * `push` when every push destination is a path inside it (rule 3). A lifted reserved verdict is set
  * aside and the model goes on judging the rest of the command; `used` collects each one set aside.
+ * `worktree` (the routine classifier's own-worktree rule, PLAN wl-mvqwn80onq9hq8 D2b) is present when
+ * the repository is the workload's own worktree: the work-tree discards (WORKTREE_OPTS and the
+ * clean/restore/checkout-path verdicts) are set aside into it, never `reset --hard`, branch or tag
+ * deletion or a push.
  */
 export interface ScratchLift {
 	repo: boolean;
 	push: boolean;
 	used: string[];
+	worktree?: string[];
 }
 
 /**
@@ -284,11 +289,25 @@ const SCRATCH_OPTS: Record<string, { lift: "repo" | "push"; keys: Record<string,
 	push: { lift: "push", keys: { force: true, "force-with-lease": true, "force-if-includes": true, delete: true } },
 };
 
-/** Whether `lift` sets aside every reserved option `p` carries for `sub` (one outside SCRATCH_OPTS keeps the verdict). */
-function liftsOpts(sub: string, p: Parsed, lift: ScratchLift | undefined): lift is ScratchLift {
+/** The RESERVED_OPTS the own-worktree lift sets aside (ScratchLift.worktree): the work-tree discards only, never `reset --hard`. */
+const WORKTREE_OPTS: Record<string, Record<string, true>> = {
+	reset: { merge: true, keep: true },
+	checkout: { force: true, patch: true },
+	switch: { "discard-changes": true, force: true },
+};
+
+/**
+ * Where the verdicts `p` reserves for `sub` are set aside: `lift.used` when the scratch lift covers
+ * every reserved option it carries, `lift.worktree` when the own-worktree lift does; null when neither
+ * covers them all (one outside both keeps the verdict).
+ */
+function liftsOpts(sub: string, p: Parsed, lift: ScratchLift | undefined): string[] | null {
+	const reservedKeys = p.opts.filter((o) => RESERVED_OPTS[sub]![o.key] !== undefined).map((o) => o.key);
 	const s = SCRATCH_OPTS[sub];
-	if (!s || !lift?.[s.lift]) return false;
-	return p.opts.every((o) => RESERVED_OPTS[sub]![o.key] === undefined || s.keys[o.key] === true);
+	if (s && lift?.[s.lift] && reservedKeys.every((k) => s.keys[k] === true)) return lift.used;
+	const w = WORKTREE_OPTS[sub];
+	if (w && lift?.worktree && reservedKeys.every((k) => w[k] === true)) return lift.worktree;
+	return null;
 }
 
 /** Options per subcommand the gate does not model (not reserved, but not safe to pass unread). */
@@ -676,8 +695,9 @@ const ACTION_SPELLING: Record<string, string> = {
 
 /**
  * Why a `git` command (already a modeled form per gitUnmodeled: literal words, builtin subcommand)
- * is refused by the positive model, or null. `lift` (row 6's scratch rules only) sets aside the
- * reserved verdicts its conditions cover and records each in `lift.used`.
+ * is refused by the positive model, or null. `lift` (row 6's scratch rules and the own-worktree rule
+ * only) sets aside the reserved verdicts its conditions cover and records each in `lift.used`, or in
+ * `lift.worktree` for one the own-worktree lift sets aside.
  */
 export function gitModel(g: GitCall, lift?: ScratchLift): GitVerdict | null {
 	const sub = g.sub;
@@ -761,8 +781,9 @@ export function gitModel(g: GitCall, lift?: ScratchLift): GitVerdict | null {
 	if (program) return unmodeled(RUNS_PROGRAM[sub]![program]!, spelling);
 	const res = firstOf(p, RESERVED_OPTS[sub] ?? {});
 	if (res) {
-		if (!liftsOpts(sub, p, lift)) return reserved(RESERVED_OPTS[sub]![res]!);
-		lift.used.push(RESERVED_OPTS[sub]![res]!);
+		const into = liftsOpts(sub, p, lift);
+		if (!into) return reserved(RESERVED_OPTS[sub]![res]!);
+		into.push(RESERVED_OPTS[sub]![res]!);
 	}
 	const unm = firstOf(p, UNMODELED_OPTS[sub] ?? {});
 	if (unm) return unmodeled(UNMODELED_OPTS[sub]![unm]!, spelling);
@@ -772,10 +793,12 @@ export function gitModel(g: GitCall, lift?: ScratchLift): GitVerdict | null {
 	}
 
 	// A reserved verdict a scratch lift of `kind` sets aside (rule 2: the repository is inside the own
-	// scratch root; rule 3: every push destination is), else the verdict.
+	// scratch root; rule 3: every push destination is), or the own-worktree lift sets aside (a `repo`
+	// verdict on the workload's own worktree), else the verdict.
 	const liftable = (kind: "repo" | "push", v: GitVerdict): GitVerdict | null => {
-		if (!lift?.[kind]) return v;
-		lift.used.push(v.why);
+		const into = lift?.[kind] ? lift.used : kind === "repo" ? lift?.worktree : undefined;
+		if (!into) return v;
+		into.push(v.why);
 		return null;
 	};
 	switch (sub) {
