@@ -18,12 +18,20 @@
 // <root>/stage/current names its run. Exit codes are test-run.ts WRAPPER_EXIT; `full`, `solo` and `base-solo`
 // otherwise pass bun's own exit through (128 + the signal number when bun died by a signal).
 //
-// At a part's cap, before its group is killed, a bounded stuck capture (process tree, `sample` per bun process, `lsof` per
+// At a part's cap, before its session is killed, a bounded stuck capture (process tree, `sample` per bun process, `lsof` per
 // process, the log's last 200 lines) goes to `<part stem>.stuck.log` beside the part's log (PLAN wl-mvq4edh02r5z40 D5).
+//
+// A part owns its session (PLAN wl-mvqu69tjvpy96o § 2, C9): bun starts detached, so it leads a session of its own, and
+// `bun test --parallel` workers that lead their own process groups, their children and anything re-parented or started
+// under `env -i` stay in it. The cap's kill and a groups sweep KILL every process of this user in that session and confirm
+// it empty by a fresh lookup; survivors, or a lookup that fails, make the result non-ok and are named (`<part
+// stem>.cleanup.log` and the timeout line at a cap, the sweep's stderr). A process that calls setsid leaves the session:
+// that is how a nested part starts, owned by its own sweep; the live runner's uid sweep stays the backstop.
 //
 // Parallel files (workload wl-mvg2kzuvwngdmo): the worker count rides in caps.json, never in argv, so `full <run id>`
 // keeps its operand count and the installed wrapper needs no change. The runner logs `full workers <n>` before the PR
 // full part; surface/scripts/test-run-waits.ts reads it back per run. The reversal is `fullWorkers: 1` in the profile.
+import { dlopen, FFIType, type Pointer, ptr, read } from "bun:ffi";
 import { Database } from "bun:sqlite";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import {
@@ -130,7 +138,9 @@ function workDir(a: Areas, runId: string): string {
 
 /**
  * A test's pause point: when `<hooks>/<run>.<point>.pause` exists, write `.reached` (this pid, the time and `info`) and wait for
- * `.go`, or until `stop` says so (the stuck capture's hooks stop at its deadline).
+ * `.go`, or until `stop` says so (the stuck capture's hooks stop at its deadline). Two points are not pauses:
+ * `<hooks>/<run>.session-lookup.fail` makes every session lookup of the run fail (sessionMembers), and
+ * `<hooks>/<run>.session-kill.skip` keeps killSessions from KILLing members past the main group, so they survive the confirm.
  */
 async function hook(cfg: Config, runId: string, point: string, o: { stop?: () => boolean; info?: Record<string, unknown> } = {}): Promise<void> {
 	if (!cfg.hooks) return;
@@ -140,8 +150,9 @@ async function hook(cfg: Config, runId: string, point: string, o: { stop?: () =>
 	while (!existsSync(`${base}.go`) && !o.stop?.()) await Bun.sleep(25);
 }
 
-// ---- process groups --------------------------------------------------------------------------------
+// ---- the part's session (PLAN wl-mvqu69tjvpy96o § 2, C9) ---------------------------------------------------
 
+/** One line per part: its session id, which is its bun's pid and the id of bun's own process group (bun starts detached). */
 const groupsFile = (work: string) => join(work, "groups");
 
 /** Whether process group `pgid` still has a member this user can signal. */
@@ -158,16 +169,202 @@ function signalGroup(pgid: number, sig: NodeJS.Signals): void {
 	try {
 		process.kill(-pgid, sig);
 	} catch {
-		// gone, or not ours
+		// gone, or not ours: the session lookup after the KILL is what proves the part's processes are gone
 	}
 }
 
-/** SIGTERM the group, wait up to the grace for it to empty, then SIGKILL it (the cap, § 2.3 step 3). */
-async function killGroup(cfg: Config, pgid: number): Promise<void> {
-	signalGroup(pgid, "SIGTERM");
+// The lookup reads the kernel in process through bun:ffi (libSystem, macOS, as is the rest of this file): nothing is
+// spawned (oven-sh/bun#46488), and a sandbox that refuses ps does not blind it. proc_listpids(PROC_RUID_ONLY) lists this
+// user's processes by real uid, as `pkill -U` matches; getsid(2) answers for any of them, in any session. A zombie answers
+// ESRCH: it runs nothing and goes once its parent (launchd, for an orphan) reaps it.
+const LIBSYSTEM = "/usr/lib/libSystem.B.dylib";
+const PROC_RUID_ONLY = 5;
+const PROC_PIDPATHINFO_MAXSIZE = 4096;
+const ESRCH = 3;
+/** After the KILL, how long fresh lookups get to find the session empty before what is left is named as survivors. */
+const SESSION_CONFIRM_MS = 5_000;
+
+const LIBSYSTEM_SYMBOLS = {
+	getsid: { args: [FFIType.i32], returns: FFIType.i32 },
+	getpgid: { args: [FFIType.i32], returns: FFIType.i32 },
+	proc_listpids: { args: [FFIType.u32, FFIType.u32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+	proc_pidpath: { args: [FFIType.i32, FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
+	__error: { args: [], returns: FFIType.ptr },
+} as const;
+/** The bound symbols, as this file calls them. */
+interface Libsystem {
+	getsid: (pid: number) => number;
+	getpgid: (pid: number) => number;
+	proc_listpids: (type: number, typeinfo: number, buffer: Pointer | null, size: number) => number;
+	proc_pidpath: (pid: number, buffer: Pointer, size: number) => number;
+	__error: () => Pointer | null;
+}
+type Loaded = { ok: true; fns: Libsystem } | { ok: false; why: string };
+let libsystem: Loaded | undefined;
+
+/** libSystem, opened on first use; a failure is kept and returned on every call, never retried. */
+function libc(): Loaded {
+	if (libsystem === undefined) {
+		try {
+			// bun:ffi types each symbol from LIBSYSTEM_SYMBOLS; Libsystem restates those same signatures by name for the callers.
+			libsystem = { ok: true, fns: dlopen(LIBSYSTEM, LIBSYSTEM_SYMBOLS).symbols as unknown as Libsystem };
+		} catch (e) {
+			libsystem = { ok: false, why: `dlopen ${LIBSYSTEM}: ${errText(e)}` };
+		}
+	}
+	return libsystem;
+}
+
+interface Member {
+	pid: number;
+	pgid: number;
+	/** The executable's path (proc_pidpath), or why it could not be read. */
+	command: string;
+}
+type Lookup = { ok: true; members: Member[] } | { ok: false; why: string };
+
+/** getsid(2) of `pid`: its session id, null when it is gone (ESRCH, a zombie included), or why the call failed. */
+function sessionOf(pid: number): number | null | { why: string } {
+	const l = libc();
+	if (!l.ok) return { why: l.why };
+	const sid = l.fns.getsid(pid);
+	if (sid !== -1) return sid;
+	const errno = read.i32(l.fns.__error() as Pointer);
+	return errno === ESRCH ? null : { why: `getsid(${pid}) failed: errno ${errno}` };
+}
+
+/**
+ * Every process of this user whose session is `sid`, from one fresh read of the kernel. Any failure (the library, the pid
+ * list, a getsid that errs other than ESRCH) is a failed lookup, never an empty session.
+ */
+function sessionMembers(cfg: Config, runId: string, sid: number): Lookup {
+	if (cfg.hooks) {
+		const forced = join(cfg.hooks, `${runId}.session-lookup.fail`);
+		if (existsSync(forced)) return { ok: false, why: `failed by the test hook ${forced}` };
+	}
+	const l = libc();
+	if (!l.ok) return l;
+	const { getpgid, proc_listpids, proc_pidpath, __error } = l.fns;
+	const uid = process.getuid!();
+	const errno = () => read.i32(__error() as Pointer);
+	const sized = proc_listpids(PROC_RUID_ONLY, uid, null, 0);
+	if (sized <= 0) return { ok: false, why: `proc_listpids(PROC_RUID_ONLY, ${uid}) sizing returned ${sized}, errno ${errno()}` };
+	const pids = new Int32Array(Math.ceil(sized / 4) + 1_024);
+	const got = proc_listpids(PROC_RUID_ONLY, uid, ptr(pids), pids.byteLength);
+	if (got <= 0) return { ok: false, why: `proc_listpids(PROC_RUID_ONLY, ${uid}) returned ${got}, errno ${errno()}` };
+	if (got >= pids.byteLength) return { ok: false, why: `proc_listpids(PROC_RUID_ONLY, ${uid}) filled its ${pids.length}-pid buffer: the list may be cut` };
+	const members: Member[] = [];
+	const path = new Uint8Array(PROC_PIDPATHINFO_MAXSIZE);
+	for (const pid of pids.subarray(0, got / 4)) {
+		if (pid <= 0 || pid === process.pid) continue;
+		const s = sessionOf(pid);
+		if (s === null) continue;
+		if (typeof s === "object") return { ok: false, why: s.why };
+		if (s !== sid) continue;
+		const pgid = getpgid(pid);
+		if (pgid === -1) {
+			const e = errno();
+			if (e === ESRCH) continue;
+			return { ok: false, why: `getpgid(${pid}) failed: errno ${e}` };
+		}
+		const n = proc_pidpath(pid, ptr(path), path.length);
+		members.push({ pid, pgid, command: n > 0 ? Buffer.from(path.subarray(0, n)).toString() : `(path unreadable: errno ${errno()})` });
+	}
+	return { ok: true, members };
+}
+
+/** What the KILL left: the members still found when the confirm deadline passed, and every lookup that failed. */
+interface SessionEnd {
+	survivors: Member[];
+	failures: string[];
+	/** The sessions not confirmed empty: a survivor's, or one whose lookup failed. */
+	unconfirmed: Set<number>;
+	/** A KILL the kernel refused other than ESRCH, as `kill -KILL <pid>: <code>`. */
+	refused: Set<string>;
+}
+const sessionOk = (end: SessionEnd): boolean => end.survivors.length === 0 && end.failures.length === 0;
+
+/**
+ * SIGKILL each session's main group, then every member a fresh lookup finds, until a lookup finds every session empty or
+ * SESSION_CONFIRM_MS passes. The main groups are signalled before any lookup, so a lookup that fails never stops that KILL; a
+ * failed lookup ends the confirmation for its session and is reported, never read as empty.
+ */
+async function killSessions(cfg: Config, runId: string, sids: number[]): Promise<SessionEnd> {
+	for (const sid of sids) signalGroup(sid, "SIGKILL");
+	const deadline = Date.now() + SESSION_CONFIRM_MS;
+	const failures: string[] = [];
+	const failed = new Set<number>();
+	const refused = new Set<string>();
+	const skipKill = cfg.hooks !== null && existsSync(join(cfg.hooks, `${runId}.session-kill.skip`));
+	for (;;) {
+		const found: Member[] = [];
+		const busy = new Set<number>();
+		for (const sid of sids) {
+			if (failed.has(sid)) continue;
+			const l = sessionMembers(cfg, runId, sid);
+			if (!l.ok) {
+				failed.add(sid);
+				failures.push(`session ${sid}: ${l.why}`);
+			} else if (l.members.length > 0) {
+				busy.add(sid);
+				found.push(...l.members);
+			}
+		}
+		if (found.length === 0 || Date.now() >= deadline) return { survivors: found, failures, unconfirmed: new Set([...failed, ...busy]), refused };
+		for (const m of skipKill ? [] : found) {
+			try {
+				process.kill(m.pid, "SIGKILL");
+			} catch (e) {
+				if ((e as NodeJS.ErrnoException).code !== "ESRCH") refused.add(`kill -KILL ${m.pid}: ${errText(e)}`);
+			}
+		}
+		await Bun.sleep(50);
+	}
+}
+
+/** The cap (§ 2.3 step 3): SIGTERM the part's main group, wait up to the grace for it to empty, then killSessions on its session. */
+async function killSession(cfg: Config, runId: string, sid: number): Promise<SessionEnd> {
+	signalGroup(sid, "SIGTERM");
 	const until = Date.now() + cfg.killGraceMs;
-	while (groupAlive(pgid) && Date.now() < until) await Bun.sleep(50);
-	signalGroup(pgid, "SIGKILL");
+	while (groupAlive(sid) && Date.now() < until) await Bun.sleep(50);
+	return killSessions(cfg, runId, [sid]);
+}
+
+/** What a part's error or timeout line adds when its cleanup is not ok: the survivors, then each failed lookup. */
+function cleanupSuffix(end: SessionEnd): string {
+	const parts = end.survivors.length > 0 ? [`cleanup left ${end.survivors.length} alive: ${end.survivors.map((m) => m.pid).join(" ")}`] : [];
+	for (const f of end.failures) parts.push(`cleanup could not look up ${f}`);
+	return parts.map((p) => `; ${p}`).join("");
+}
+
+/** The survivors' table and every failure, the body of `<part>.cleanup.log` and of a failed sweep's stderr. */
+function cleanupDetail(end: SessionEnd): string {
+	const lines = [...end.failures.map((f) => `lookup failed: ${f}`), ...end.refused];
+	if (end.survivors.length > 0) lines.push("PID PGID COMMAND", ...end.survivors.map((m) => `${m.pid} ${m.pgid} ${m.command}`));
+	return `${lines.join("\n")}\n`;
+}
+
+/**
+ * `<part stem>.cleanup.log` beside the part's log when its cleanup is not ok, opened O_EXCL|O_NOFOLLOW like the stuck capture's
+ * file. When it cannot be written, one stderr line says so; the timeout or error line names the survivors either way.
+ */
+function writeCleanupLog(work: string, stem: string, sid: number, end: SessionEnd): void {
+	const path = join(work, `${stem}.cleanup.log`);
+	let fd: number;
+	try {
+		fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
+	} catch (e) {
+		process.stderr.write(`as2test: cleanup log not written: cannot create ${path}: ${errText(e)}\n`);
+		return;
+	}
+	try {
+		const head = `cleanup of ${stem} (session ${sid}) at ${new Date().toISOString()}: ${end.survivors.length} alive after KILL (confirm deadline ${SESSION_CONFIRM_MS} ms), ${end.failures.length} lookup failure(s)\n`;
+		writeSync(fd, head + cleanupDetail(end));
+	} catch (e) {
+		process.stderr.write(`as2test: cleanup log ${path}: write failed: ${errText(e)}\n`);
+	} finally {
+		closeSync(fd);
+	}
 }
 
 // ---- the stuck capture (PLAN wl-mvq4edh02r5z40 revision 3, D5) -------------------------------------------
@@ -337,7 +534,7 @@ class Capture {
 	}
 
 	/**
-	 * After killGroup has killed the part's group: remove a cap dir `clearCapDir` left, without following a link in it
+	 * After killSession has killed the part's session: remove a cap dir `clearCapDir` left, without following a link in it
 	 * (removeTree; a just-killed sample may still be closing, so a few tries), then close the stuck log. Never throws.
 	 */
 	async afterKill(): Promise<void> {
@@ -510,7 +707,7 @@ async function captureSections(cfg: Config, runId: string, c: Capture, pgid: num
  * O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW; when that open fails the capture is skipped with one stderr line and null comes back.
  * One deadline (cfg.captureMs) owns it: at the deadline every capture group still running is SIGKILLed, its readers are
  * abandoned, the cap dir is cleared with bounded work only (`clearCapDir`) and the file says `capture cut at <ms> ms`.
- * The caller kills the part's group, then calls the returned capture's `afterKill` (a leftover cap dir goes, the file
+ * The caller kills the part's session, then calls the returned capture's `afterKill` (a leftover cap dir goes, the file
  * closes). Never throws; nothing it does changes the part's exit.
  */
 async function stuckCapture(cfg: Config, runId: string, work: string, pgid: number, logPath: string, cap: number): Promise<Capture | null> {
@@ -672,32 +869,59 @@ function unlinkIfPresent(path: string): void {
 }
 
 /**
- * Run `bun test …` in `<dir>/repo` with `<dir>`'s child env, in its own process group under the cap; the group is recorded in the
- * run's groups file for a `groups` sweep. At the cap, the stuck capture (D5) runs, bounded by its own deadline, before the kill.
+ * Run `bun test …` in `<dir>/repo` with `<dir>`'s child env, detached under the cap: bun leads a session of its own, recorded
+ * in the run's groups file before any signal, for a `groups` sweep. At the cap, the stuck capture (D5) runs, bounded by its
+ * own deadline, then the session is killed whatever the capture did; the part exits timeout, and when the kill leaves a
+ * survivor or a lookup fails, `<part stem>.cleanup.log` and the timeout line name them.
  */
 async function part(cfg: Config, runId: string, work: string, dir: string, argv: string[], logPath: string, cap: number): Promise<number> {
+	const stem = basename(logPath, ".log");
 	const log = openSync(logPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
 	const child = spawn(cfg.bun, argv, { cwd: join(dir, "repo"), env: childEnv(process.env, dir), stdio: ["ignore", log, log], detached: true });
 	closeSync(log);
-	const pgid = child.pid;
-	if (pgid === undefined) return failed(`bun did not start`);
-	appendFileSync(groupsFile(work), `${pgid}\n`);
-	const done = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => child.on("exit", (code, signal) => r({ code, signal })));
+	const sid = child.pid;
+	if (sid === undefined) return failed(`bun did not start`);
+	const done = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+	child.on("exit", (code, signal) => done.resolve({ code, signal }));
+	// Ownership before any signal: bun leads its session (getsid answers its own pid; ESRCH once it already exited, its session
+	// id is still that pid), and the session is in the groups file. Either failing kills what bun started and fails the part.
+	try {
+		const s = sessionOf(sid);
+		if (s !== null && s !== sid) throw new Error(typeof s === "object" ? s.why : `getsid(${sid}) answered ${s}: bun does not lead its own session`);
+		appendFileSync(groupsFile(work), `${sid}\n`);
+	} catch (e) {
+		child.kill("SIGKILL");
+		const end = await killSession(cfg, runId, sid);
+		if (!sessionOk(end)) writeCleanupLog(work, stem, sid, end);
+		return failed(`the part's session ${sid} was not recorded: ${errText(e)}; bun was killed${cleanupSuffix(end)}`);
+	}
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const capped = new Promise<"cap">((r) => {
 		timer = setTimeout(() => r("cap"), cap);
 	});
-	const first = await Promise.race([done, capped]);
+	const first = await Promise.race([done.promise, capped]);
 	clearTimeout(timer);
 	if (first === "cap") {
-		const capture = await stuckCapture(cfg, runId, work, pgid, logPath, cap);
-		await killGroup(cfg, pgid);
-		// Off the kill path: a cap dir the capture could not clear with bounded work goes now that the group is dead.
-		await capture?.afterKill();
-		await done;
-		throw new Exit(WRAPPER_EXIT.timeout, `timeout: the part passed its cap of ${cap} ms; its group was killed`);
+		let capture: Capture | null = null;
+		try {
+			capture = await stuckCapture(cfg, runId, work, sid, logPath, cap);
+		} catch (e) {
+			// stuckCapture never throws by its contract; if it does, the kill below still runs and the failure is named here.
+			process.stderr.write(`as2test: stuck capture failed: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}\n`);
+		}
+		let end: SessionEnd;
+		try {
+			end = await killSession(cfg, runId, sid);
+		} finally {
+			// Off the kill path: a cap dir the capture could not clear with bounded work goes now that the session is dead.
+			await capture?.afterKill();
+		}
+		// A leader confirmed gone exits once it is reaped; one that survived is named instead of waited on.
+		if (sessionOk(end)) await done.promise;
+		else writeCleanupLog(work, stem, sid, end);
+		throw new Exit(WRAPPER_EXIT.timeout, `timeout: the part passed its cap of ${cap} ms; its session was killed${cleanupSuffix(end)}`);
 	}
-	// Anything the part left behind in its group is the sweep's (§ 2.3 step 4): the runner sweeps after every part.
+	// Anything the part left behind in its session is the sweep's (§ 2.3 step 4): the runner sweeps after every part.
 	if (first.code !== null) return first.code;
 	return 128 + (first.signal ? (osConstants.signals[first.signal] ?? 0) : 0);
 }
@@ -712,6 +936,7 @@ async function full(cfg: Config, a: Areas, runId: string): Promise<number> {
 	unlinkIfPresent(xml);
 	unlinkIfPresent(log);
 	unlinkIfPresent(join(work, "full.stuck.log"));
+	unlinkIfPresent(join(work, "full.cleanup.log"));
 	return part(cfg, runId, work, work, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, ...(workers > 1 ? [`--parallel=${workers}`] : [])], log, cap);
 }
 
@@ -750,6 +975,7 @@ async function solo(cfg: Config, a: Areas, runId: string, file: string, side: Si
 	const xml = join(work, `${stem}-${i}.xml`);
 	unlinkIfPresent(xml);
 	unlinkIfPresent(join(work, `${stem}-${i}.stuck.log`));
+	unlinkIfPresent(join(work, `${stem}-${i}.cleanup.log`));
 	process.stdout.write(`part ${stem}-${i}\n`);
 	return part(cfg, runId, work, dir, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, `./${rel}`], log, cap);
 }
@@ -765,7 +991,10 @@ function isBusy(e: unknown): boolean {
  * The sweep (§ 2.3 steps 1 and 3): hold `BEGIN EXCLUSIVE` on `locks/sweep.db` (journal in memory, so
  * no file is ever created beside it) for the whole sweep, in this process, which also sends every
  * signal. With the lock held: `current` must name this run; SIGTERM; wait out the grace; read
- * `current` again and abort if it changed; SIGKILL. The lock goes when the process exits.
+ * `current` again and abort if it changed; SIGKILL. The lock goes when the process exits. A groups
+ * sweep TERMs each recorded part's main group and KILLs every process in its session (killSessions);
+ * a session not confirmed empty (a survivor, or a lookup that failed) stays in the groups file and
+ * ends the sweep non-ok, `sweep: <n> alive after KILL: <pids>` its first stderr line.
  */
 async function sweep(cfg: Config, a: Areas, runId: string): Promise<number> {
 	fence(a, runId);
@@ -803,13 +1032,14 @@ async function sweep(cfg: Config, a: Areas, runId: string): Promise<number> {
 	await hook(cfg, runId, "sweep-read1");
 
 	const work = join(a.runs, runId);
-	const groups = (): number[] => {
+	const sessions = (): number[] => {
 		if (cfg.sweep !== "groups") return [];
-		let text = "";
+		let text: string;
 		try {
 			text = readFileSync(groupsFile(work), "utf8");
-		} catch {
-			return [];
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+			return failed(`cannot read ${groupsFile(work)}: ${errText(e)}`);
 		}
 		return [...new Set(text.split("\n").filter((s) => /^[1-9]\d*$/.test(s)).map(Number))].filter((g) => g !== process.pid);
 	};
@@ -822,22 +1052,22 @@ async function sweep(cfg: Config, a: Areas, runId: string): Promise<number> {
 		if (id.status !== 0 || !Number.isSafeInteger(uid) || uid <= 0 || process.getuid?.() !== uid) refuse(`uid sweep must run as ${AS2TEST_USER}`);
 		ownerUid = uid;
 	}
-	const signal = (sig: "TERM" | "KILL"): void => {
-		if (cfg.sweep === "groups") for (const g of groups()) signalGroup(g, `SIG${sig}`);
-		else spawnSync("/usr/bin/pkill", [`-${sig}`, "-U", String(ownerUid)], { stdio: "ignore" });
-	};
 	const anyLeft = (): boolean => {
-		if (cfg.sweep === "groups") return groups().some(groupAlive);
+		if (cfg.sweep === "groups") return sessions().some(groupAlive);
 		return spawnSync("/usr/bin/pgrep", ["-U", String(ownerUid)], { stdio: "ignore" }).status === 0;
 	};
 
-	signal("TERM");
+	if (cfg.sweep === "groups") for (const sid of sessions()) signalGroup(sid, "SIGTERM");
+	else spawnSync("/usr/bin/pkill", ["-TERM", "-U", String(ownerUid)], { stdio: "ignore" });
 	const until = Date.now() + cfg.killGraceMs;
 	while (anyLeft() && Date.now() < until) await Bun.sleep(50);
 	if (readCurrent(a) !== runId) throw new Exit(WRAPPER_EXIT.fenced, `fenced: current changed during the sweep; aborted before SIGKILL`);
 	await hook(cfg, runId, "sweep-read2");
-	signal("KILL");
-	if (cfg.sweep === "groups" && existsSync(groupsFile(work))) writeFileSync(groupsFile(work), groups().filter(groupAlive).map((g) => `${g}\n`).join(""));
+	let end: SessionEnd | null = null;
+	if (cfg.sweep === "groups") {
+		end = await killSessions(cfg, runId, sessions());
+		if (existsSync(groupsFile(work))) writeFileSync(groupsFile(work), [...end.unconfirmed].map((sid) => `${sid}\n`).join(""));
+	} else spawnSync("/usr/bin/pkill", ["-KILL", "-U", String(ownerUid)], { stdio: "ignore" });
 	if (ownerUid !== null) {
 		for (const removal of sweepLegacyNativeTemps("/private/tmp", ownerUid)) {
 			const line = `native-temp: ${JSON.stringify(removal)}\n`;
@@ -847,6 +1077,12 @@ async function sweep(cfg: Config, a: Areas, runId: string): Promise<number> {
 	}
 	db.run("COMMIT");
 	db.close();
+	if (end !== null && !sessionOk(end)) {
+		const head = end.survivors.length > 0
+			? `sweep: ${end.survivors.length} alive after KILL: ${end.survivors.map((m) => m.pid).join(" ")}`
+			: `sweep: session lookup failed: ${end.failures[0]}`;
+		throw new Exit(WRAPPER_EXIT.failed, `${head}\n${cleanupDetail(end).trimEnd()}`);
+	}
 	process.stdout.write(`swept ${runId} (${cfg.sweep === "groups" ? "groups" : `uid ${AS2TEST_USER}`})\n`);
 	return WRAPPER_EXIT.ok;
 }
