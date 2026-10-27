@@ -122,6 +122,7 @@ gates/src/rows/r14-ask-policy.ts	module	-
 gates/src/rulings.ts	module	-
 gates/src/routine.ts	module	-
 gates/src/routine-switch.ts	module	-
+gates/src/routine-worker.ts	module	-
 gates/src/session.ts	module	-
 gates/src/shell-parse.ts	module	-
 gates/src/targets.ts	module	-
@@ -134,6 +135,8 @@ gates/test/rulings.test.ts	test	-
 gates/test/routine.test.ts	test	-
 gates/test/routine-switch.test.ts	test	-
 gates/test/r06-reserved.test.ts	test	-
+gates/test/r06-floor.test.ts	test	-
+gates/test/routine-gate.test.ts	test	-
 gates/test/extension.test.ts	test	-
 gates/test/helpers.ts	test	-
 gates/test/known-fragment.test.ts	test	-
@@ -1089,6 +1092,7 @@ surface/test/input.test.ts	test	-
 surface/test/numbering.test.ts	test	-
 surface/test/decision-log.test.ts	test	-
 surface/test/extension.test.ts	test	-
+surface/test/errors.test.ts	test	-
 surface/src/signals.ts	module	-
 surface/src/delivery.ts	module	-
 surface/extensions/lane.ts	module	-

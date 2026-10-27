@@ -91,18 +91,19 @@ const RULES: Rule[] = [
 	{ re: new RegExp(`${GH}workflow\\s+(run|enable|disable)(?![\\w-])`, "i"), why: "gh workflow run triggers a workflow (deploy path)" },
 	{ re: new RegExp(`${GH}release\\s+(create|delete|edit)(?![\\w-])`, "i"), why: "gh release publishes or destroys a release" },
 	{ re: new RegExp(`${GH}pr\\s+merge(?![\\w-])[^\\n]*--admin\\b`, "i"), why: "gh pr merge --admin bypasses branch protection" },
-	{ re: new RegExp(`${GH}api\\b[^\\n]*(?:-X[=\\s]*|--method[=\\s]+)(POST|PUT|PATCH|DELETE)(?![\\w-])`, "i"), why: "gh api with a mutating method" },
+	// `gh api` writes are judged by ghApiModel on the method and endpoint together (PLAN wl-mvqwn80onq9hq8 D11).
 ];
 
 /**
  * The reserved actions that interrupt Jo (PLAN wl-mvg1vs0rhnu3gg § 1.2, § 1.3, open question 1 (b)): the `why`
  * strings of the guard bypasses and the irreversible or shared-state rules — destructive SQL, a production database,
  * infrastructure teardown, secret rotation, deploy, publish, workflow run, release, the `--admin` merge, push to a
- * protected branch, remote ref deletion and history rewrite (force-push included). surface/src/errors.ts gives a
+ * protected branch, remote ref deletion and force-push. surface/src/errors.ts gives a
  * waiting reserved request whose body opens with one of them `state: "now"`, and surface/src/batch.ts `onFire` pushes
  * it at once. Blind "not known until it runs" requests, `rm`, local discards and local branch or tag deletion are not
- * here: they wait for the window. Each string occurs literally in RULES, gitModel's tables (src/git-model.ts) or
- * checkPush; gates/test/r06-reserved.test.ts fails when a rule is renamed out from under this list.
+ * here: they wait for the window. A guard-class hold (FLOOR) writes no request, so none is here. Each string occurs
+ * literally in RULES, gitModel's tables (src/git-model.ts) or checkPush; gates/test/r06-reserved.test.ts fails when a
+ * rule is renamed out from under this list.
  */
 export const NOW_RESERVED: readonly string[] = [
 	// destructive SQL
@@ -119,7 +120,6 @@ export const NOW_RESERVED: readonly string[] = [
 	"deletes a Google Cloud resource",
 	"destroys a Fly app",
 	"destroys a Heroku app",
-	"removes a docker volume (data loss)",
 	"gh repo delete/archive/rename",
 	"formats a filesystem",
 	"dd onto a block device",
@@ -150,9 +150,6 @@ export const NOW_RESERVED: readonly string[] = [
 	"git push --prune (deletes remote branches)",
 	// history rewrite
 	"force-push",
-	"git update-ref moves or deletes a ref directly (a history rewrite)",
-	"git filter-branch rewrites history",
-	"git replace substitutes objects (a history rewrite)",
 ];
 
 /** The NOW_RESERVED entries that bypass a guard (§ 1.2): NOW (guard). Every other entry is NOW (irreversible) (§ 1.3). */
@@ -174,16 +171,198 @@ export function nowReserved(text: string): { why: string; category: "guard" | "i
 	return why === undefined ? null : { why, category: NOW_RESERVED_GUARD[why] ? "guard" : "irreversible" };
 }
 
+/**
+ * Jo's floor (PLAN wl-mvqwn80onq9hq8 D11): every row 6 hold and git-model reservation is in exactly one class.
+ * - `A4`: a § A4 reserved action (or a form the gate cannot read, which fails closed under § A4's threat model):
+ *   refused with a reserved request to Jo, as before the floor.
+ * - `deploy`: § A4's "plus deploy", and publishing: today's verdict byte for byte (wl-mvgorfqqbuyyo0 owns these rules).
+ * - `own-root`: a work-tree discard in the own worktree or a scratch repository. Row 6 still holds it with a reserved
+ *   request; the routine classifier's case 2 (src/routine.ts, D2b) auto-applies it.
+ * - `guard`: not on § A4 and not Jo's call: refused outright, with no reserved request and nothing to Jo; the refusal
+ *   names the owner and the spelling to use instead.
+ * The `ordinary` class holds nothing, so it has no row here: the gh api allow-list (ORDINARY_GH_API, ORDINARY_GRAPHQL),
+ * non-admin `gh pr create|edit|comment|merge`, `gh issue` writes and feature-branch pushes run. Class precedence is
+ * guard, deploy, ordinary, then A4 (pickHit): a guard hold anywhere in a call wins, so a call holding one writes no
+ * request; deploy and A4 holds both write a request, named by the first hit as before the floor. Each row's `match`
+ * reads a hold's `why` (the string RULES, gitModel, checkPush, rmModel, ghApiModel or the .git checks name);
+ * gates/test/r06-floor.test.ts fails when a hold matches no row or more than one.
+ */
+export type FloorClass = "A4" | "deploy" | "own-root" | "guard";
+
+export interface FloorRow {
+	class: FloorClass;
+	/** The SPEC-2.0.md § A4 item the row stands on (for a guard row: why it is off the list). */
+	a4: string;
+	match: RegExp;
+	/** Guard rows: who owns what the call would change. */
+	owner?: string;
+	/** Guard rows: the spelling to use instead. */
+	instead?: string;
+}
+
+/** The guard-class name of a work-tree discard outside the own worktree and every scratch repository (D11). */
+const OTHER_CHECKOUT = "in a checkout that is neither the own worktree nor a scratch repository";
+const DOT_GIT_WRITE = "writing inside a .git directory (a ref move, or config and hooks git runs later)";
+const DOT_GIT_ENV_WRITE = "an interpreter told by its environment to write inside a .git directory (a ref move, or config and hooks git runs later)";
+const DISCARD = String.raw`git (?:reset --merge|reset --keep|checkout --force|checkout --patch|switch --discard-changes|switch --force|clean|restore of the work tree|checkout -- <path>|checkout <commit> <path>|checkout \S+ \(a path: discards working changes\))`;
+
+export const FLOOR: readonly FloorRow[] = [
+	// guard
+	{
+		class: "guard",
+		a4: "§ A4: not on the list; the merge gate's required as2/full-suite status (SPEC-2.0.md § B4) is the test runner's",
+		match: /^gh api (?:graphql with a mutation that )?writes a commit status, a check run or a check suite/,
+		owner: "the test runner (it alone posts as2/full-suite)",
+		instead: "push the branch and let the runner post its result; read statuses and checks with a GET (`gh api repos/<o>/<r>/commits/<sha>/status`, `gh pr checks`)",
+	},
+	{
+		class: "guard",
+		a4: "§ A4: not on the list; main's branch protection and rulesets are the merge gate's",
+		match: /^gh api (?:graphql with a mutation that )?writes branch protection or a ruleset/,
+		owner: "the merge gate (main's branch protection and rulesets)",
+		instead: "leave protection and rulesets as they are; read them with a GET (`gh api repos/<o>/<r>/branches/main/protection`)",
+	},
+	{
+		class: "guard",
+		a4: "§ A4: not on the list (no ref deleted, nothing pushed); a local ref rewrite of the shared repository",
+		match: /^git (?:update-ref moves a ref directly|symbolic-ref writing or deleting HEAD|filter-branch rewrites history|replace substitutes objects|pull --force)/,
+		owner: "the shared repository's refs",
+		instead: "commit on your branch instead (`git commit`, `git switch -c <branch>`, `git pull` without --force)",
+	},
+	{
+		class: "guard",
+		a4: "§ A4: not on the list; git's own files are written only through git commands the gate models",
+		match: /^(?:writing inside|an interpreter told by its environment to write inside) a \.git directory/,
+		owner: "git (its refs, config and hooks)",
+		instead: "the git command that makes the change (`git commit`, `git branch <name>`, `git switch`), run with the bash tool",
+	},
+	{
+		class: "guard",
+		a4: "§ A4: not on the list; a docker volume holds another service's data",
+		match: /^removes a docker volume/,
+		owner: "the service whose data the volume holds",
+		instead: "stop or remove the container only (`docker stop`, `docker rm`), and leave the volume",
+	},
+	{
+		class: "guard",
+		a4: "§ A4: not on the list; another checkout's changes are its owner's",
+		match: new RegExp(`^${DISCARD}.*, ${OTHER_CHECKOUT}$`),
+		owner: "that checkout's owner (another checkout's changes are its owner's)",
+		instead: 'the same command in your own worktree, or in a scratch clone under "$AS2_SCRATCH/…"',
+	},
+	// deploy
+	{ class: "deploy", a4: "§ A4 plus deploy", match: /^deploy(?: \(|$)/ },
+	{ class: "deploy", a4: "§ A4 plus deploy (publishing a package)", match: /^publishes a package$/ },
+	{ class: "deploy", a4: "§ A4 plus deploy (a workflow run is the deploy path)", match: /^gh workflow run triggers a workflow/ },
+	{ class: "deploy", a4: "§ A4 plus deploy (a release publishes)", match: /^gh release publishes or destroys a release$/ },
+	{ class: "deploy", a4: "§ A4 plus deploy (an infrastructure apply deploys it)", match: /^infrastructure change \(apply\/up\)$/ },
+	// own-root
+	{ class: "own-root", a4: "§ A4: hard reset family; case 2 auto-applies it in the own worktree or a scratch repository (D2b)", match: new RegExp(`^${DISCARD}(?!.*, ${OTHER_CHECKOUT}$)`) },
+	// A4
+	{ class: "A4", a4: "§ A4 rm -rf", match: /^rm (?:-rf|with )/ },
+	{ class: "A4", a4: "§ A4 DROP / TRUNCATE", match: /^destructive SQL/ },
+	{ class: "A4", a4: "§ A4 production database writes", match: /^(?:a database client against a production target|writes, resets or deletes a Supabase database)/ },
+	{
+		class: "A4",
+		a4: "§ A4 infrastructure teardown",
+		match: /^(?:deletes a DigitalOcean resource|kubectl delete|infrastructure teardown \(destroy\)|deletes AWS resources|deletes a Google Cloud resource|destroys a (?:Fly|Heroku) app|gh repo delete\/archive\/rename|formats a filesystem|dd onto a block device|fork bomb)$/,
+	},
+	{
+		class: "A4",
+		a4: "§ A4 secret rotation",
+		match: /^(?:sets or deletes a GitHub Actions secret|adds or deletes a deploy key|rotates or rewrites an AWS secret|rotates a Google Cloud secret|writes or deletes a Vault secret|rotates a platform secret|rewrites a deploy environment secret)$/,
+	},
+	{ class: "A4", a4: "§ A4 hard reset", match: /^git reset --hard$/ },
+	{ class: "A4", a4: "§ A4 branch or tag deletion", match: /^(?:branch deletion|tag deletion|git update-ref -d |git update-ref --stdin )/ },
+	{ class: "A4", a4: "§ A4 force-push", match: /^(?:force-push|git push --mirror )/ },
+	{ class: "A4", a4: "§ A4 force-push (remote ref deletion)", match: /^(?:remote ref deletion|git push --prune )/ },
+	{ class: "A4", a4: "§ A4 push to a protected branch", match: /^(?:push to a protected branch|git push --(?:all|branches) )/ },
+	{ class: "A4", a4: "§ A4 push to a protected branch (bypassing its protection)", match: /^gh pr merge --admin bypasses branch protection$/ },
+	{
+		class: "A4",
+		a4: "§ A4 (an unmodeled gh api write asks: it may delete a ref, rotate a secret or deploy)",
+		match: /^gh api (?:with a mutating method|with a word (?:not known until it runs|whose percent-encoding does not decode)|graphql with a (?:body the gate cannot read|mutation not on the ordinary allow-list|query read from a file|word whose percent-encoding does not decode))/,
+	},
+	{
+		class: "A4",
+		a4: "§ A4 threat model (ruled 2026-09-29): a form not known until it runs fails closed",
+		match: /^(?:git with a subcommand not known until it runs|git \S+ with an argument not known until it runs|git push from a directory not known until it runs|\S+ with a subcommand or target not known until it runs)$/,
+	},
+	{ class: "A4", a4: "§ A4 build requirement: browser writes", match: /^a browser write \(/ },
+];
+
+/** The FLOOR row a hold's `why` falls in; a why no row matches is the A4 catch-all (a hold the table does not name asks). */
+export function floorRow(why: string): FloorRow | null {
+	return FLOOR.find((r) => r.match.test(why)) ?? null;
+}
+
+/** The hold row 6 names for a call (D11 precedence): the first guard-class hit, else the first hit; null for none. */
+function pickHit(hits: readonly string[]): string | null {
+	return hits.find((h) => floorRow(h)?.class === "guard") ?? hits[0] ?? null;
+}
+
 // The merge gate (PLAN wl-mv8s8srodefytc rev 17.1 D2): main's branch protection requires the `as2/full-suite` status only the test
 // runner posts, outside the fence. A lane that wrote a commit status, a check run or a check suite could forge that green, so ghApiModel
 // reads every `gh api` call, in the raw pass (quote-blind words) and the parsed pass (expanded words), where RULES would read a spelling.
+// Jo's floor (PLAN wl-mvqwn80onq9hq8 D11): a status, check, branch-protection or ruleset write is the guard class (refused, no request);
+// a write on the ordinary allow-list (ORDINARY_GH_API, ORDINARY_GRAPHQL) runs; every other write is § A4 (a reserved request).
 const GH_API_WHY = "(the merge gate's as2/full-suite is the test runner's alone)";
+const GH_API_PROTECTION_WHY = "(main's branch protection and rulesets are the merge gate's)";
 /** gh api's options that take a value, short and long (https://cli.github.com/manual/gh_api, Options, read 2026-10-14); `-i` and `-h` take none. */
 const GH_API_SHORT_VALUE = "XfFHqtp";
 const GH_API_LONG_VALUE = ["method", "raw-field", "field", "header", "jq", "template", "preview", "input", "cache", "hostname"];
 const GH_API_SHORT_LONG: Record<string, string> = { X: "method", f: "raw-field", F: "field", H: "header", q: "jq", t: "template", p: "preview" };
 const STATUS_ENDPOINT = /statuses|check-runs|check-suites/;
 const STATUS_MUTATION = /createCommitStatus|createCheckRun|updateCheckRun|createCheckSuite|rerequestCheckSuite/i;
+const PROTECTION_ENDPOINT = /branches\/.*\/protection|rulesets/;
+const PROTECTION_MUTATION = /(?:create|update|delete)BranchProtectionRule|(?:create|update|delete)RepositoryRuleset/i;
+
+/**
+ * The ordinary `gh api` REST writes (D11, an allow-list): a method and an endpoint under a literal
+ * `repos/<owner>/<repo>/` (`<n>` and `<id>` are digits, `<name>` one plain path segment), and `POST
+ * markdown` outside `repos/`. Exported for gates/test/r06-floor.test.ts, which walks each line.
+ */
+export const ORDINARY_GH_API: readonly (readonly [string, string])[] = [
+	["POST", "issues"],
+	["PATCH", "issues/<n>"],
+	["POST", "issues/<n>/comments"],
+	["PATCH|DELETE", "issues/comments/<id>"],
+	["POST", "issues/<n>/labels"],
+	["DELETE", "issues/<n>/labels/<name>"],
+	["POST", "labels"],
+	["PATCH|DELETE", "labels/<name>"],
+	["POST", "pulls"],
+	["PATCH", "pulls/<n>"],
+	["POST", "pulls/<n>/comments"],
+	["PATCH|DELETE", "pulls/comments/<id>"],
+	["POST", "pulls/<n>/reviews"],
+	["POST|DELETE", "pulls/<n>/requested_reviewers"],
+	["PUT", "pulls/<n>/merge"],
+];
+/** The GraphQL mutations a readable body may run (D11), and only those. */
+export const ORDINARY_GRAPHQL: readonly string[] = [
+	"addComment", "updateIssueComment", "deleteIssueComment", "createPullRequest", "updatePullRequest", "addLabelsToLabelable",
+	"removeLabelsFromLabelable", "requestReviews", "addPullRequestReview", "submitPullRequestReview", "mergePullRequest",
+];
+/** One plain path segment: no encoding, never `.` or `..`, nothing GitHub or gh would read as more than a name. */
+const SEGMENT = String.raw`(?!\.\.?(?:/|$))[a-z0-9._-]+`;
+/** An owner or repository segment, gh's `{owner}`/`{repo}` placeholders included. */
+const REPO_SEGMENT = String.raw`(?!\.\.?/)[a-z0-9._{}-]+`;
+const ORDINARY_REST: readonly { methods: string[]; re: RegExp }[] = ORDINARY_GH_API.map(([methods, path]) => ({
+	methods: methods.split("|"),
+	re: new RegExp(`^repos/${REPO_SEGMENT}/${REPO_SEGMENT}/${path.replace(/<n>|<id>/g, "[0-9]+").replace(/<name>/g, SEGMENT)}$`),
+}));
+
+/**
+ * Whether a REST write is on the ordinary list: the endpoint word is plain (no percent-encoding, query or
+ * fragment, which could spell another path), read without a scheme and host and a leading `/`.
+ */
+function ordinaryRest(method: string, endpoint: string): boolean {
+	if (/[%?#\\]/.test(endpoint)) return false;
+	const ep = ghApiWord(endpoint)?.replace(/^\/+/, "");
+	if (method === "POST" && ep === "markdown") return true;
+	return ep !== undefined && ORDINARY_REST.some((r) => r.methods.includes(method) && r.re.test(ep));
+}
 
 /**
  * A gh api word as GitHub reads it in a path: percent-decoded until stable (`%2573` is `%73` is `s`),
@@ -226,25 +405,30 @@ function ghApiArgs<T extends { text: string }>(argv: T[]): T[] | null {
 }
 
 /**
- * The status-write model over gh api's arguments, or null. The effective method is the last explicit
- * -X/--method; without one, a field or --input makes it POST, as gh does, and otherwise it is GET. Any
- * method but GET writes to an endpoint holding `statuses`, `check-runs` or `check-suites` in any word,
- * each word read as GitHub reads a path (ghApiWord), and a word that does not decode is refused.
- * An unread word is refused outright: the expander does not record whether it was quoted, so it may
- * split into several words and be the endpoint, a method, or shift a literal endpoint into an option's
- * value. A graphql request is refused for a status or check mutation in any decoded word or in what it
- * reads on stdin, and for a query or body read from a file, or from stdin the gate cannot see. `stdin` is the
- * heredoc or here-string text the command reads, null when it reads a pipe or a file; the raw pass,
- * which cannot see heredoc bodies, omits it and the parsed pass judges stdin. `tolerateUnread` (the
- * routine classifier's read-only rule, PLAN wl-mvqwn80onq9hq8 D2a (i)) skips the unread-word refusal
- * only; the classifier then judges the unread word itself.
+ * The write model over gh api's arguments (D11), or null when the call reads or is an ordinary write.
+ * The effective method is the last explicit -X/--method; without one, a field or --input makes it POST,
+ * as gh does, and otherwise it is GET. An unread word is § A4 outright: the expander does not record
+ * whether it was quoted, so it may split into several words and be the endpoint, a method, or shift a
+ * literal endpoint into an option's value. In class order (guard, then ordinary, then § A4):
+ * - guard: any method but GET with `statuses`, `check-runs` or `check-suites`, or `branches/…/protection` or
+ *   `rulesets`, in any word read as GitHub reads a path (ghApiWord); a graphql request with a status, check,
+ *   branch-protection or ruleset mutation in any word or in what it reads on stdin.
+ * - § A4: a graphql query or body read from a file, or from stdin the gate cannot see; a graphql body the
+ *   gate cannot read, or one with a mutation off ORDINARY_GRAPHQL; a REST write off ORDINARY_GH_API.
+ * `stdin` is the heredoc or here-string text the command reads, null when it reads a pipe or a file. The
+ * raw pass (`raw`) reads quote-blind words, where a quoted body splits into pieces: it applies the guard
+ * and unread checks and leaves the ordinary-or-§ A4 decision to the parsed pass, which every bash call
+ * also gets. `tolerateUnread` (the routine classifier's read-only rule, PLAN wl-mvqwn80onq9hq8 D2a (i))
+ * skips the unread-word refusal, and with an unread word the ordinary-or-§ A4 decision too (the guard
+ * checks still run); the classifier then judges the call itself, and passes only a GET.
  */
-function ghApiModel(args: GhApiArg[], stdin?: string | null, tolerateUnread = false): string | null {
+function ghApiModel(args: GhApiArg[], stdin?: string | null, tolerateUnread = false, raw = false): string | null {
 	if (!tolerateUnread && args.some((a) => a.unread)) return `gh api with a word not known until it runs, which could be a status or check-run endpoint or a method that writes one ${GH_API_WHY}`;
 	let method: string | null | undefined;
 	let writes = false;
 	let input: string | undefined;
 	const files: string[] = [];
+	const queries: string[] = [];
 	const positionals: string[] = [];
 	const apply = (name: string, value: string | undefined): void => {
 		if (name === "method") method = value ?? null;
@@ -252,6 +436,7 @@ function ghApiModel(args: GhApiArg[], stdin?: string | null, tolerateUnread = fa
 			writes = true;
 			const at = value === undefined ? -1 : value.indexOf("=@");
 			if (name === "field" && at >= 0 && value!.slice(0, at) === "query") files.push(value!.slice(at + 2));
+			else if (value?.startsWith("query=")) queries.push(value.slice("query=".length));
 		} else if (name === "input") {
 			writes = true;
 			input = value ?? "";
@@ -277,20 +462,175 @@ function ghApiModel(args: GhApiArg[], stdin?: string | null, tolerateUnread = fa
 		}
 	}
 	const effective = method !== undefined ? method : writes ? "POST" : "GET";
+	const verb = effective === null ? "a method not given" : effective.toUpperCase();
 	const words = args.map((a) => ghApiWord(a.text));
-	if (effective?.toUpperCase() !== "GET") {
+	if (verb !== "GET") {
+		if (words.some((w) => w !== null && STATUS_ENDPOINT.test(w))) return `gh api writes a commit status, a check run or a check suite ${GH_API_WHY}`;
+		if (words.some((w) => w !== null && PROTECTION_ENDPOINT.test(w))) return `gh api writes branch protection or a ruleset ${GH_API_PROTECTION_WHY}`;
 		if (words.includes(null)) return `gh api with a word whose percent-encoding does not decode, which could spell a status or check-run endpoint ${GH_API_WHY}`;
-		if (words.some((w) => STATUS_ENDPOINT.test(w!))) return `gh api writes a commit status, a check run or a check suite ${GH_API_WHY}`;
 	}
-	if (!positionals.some((p) => /graphql/i.test(p))) return null;
-	const scanned = [...words, ghApiWord(stdin ?? "")];
-	if (scanned.includes(null)) return `gh api graphql with a word whose percent-encoding does not decode, which could hide a status or check mutation ${GH_API_WHY}`;
-	if (scanned.some((w) => STATUS_MUTATION.test(w!))) return `gh api graphql with a mutation that writes a commit status, a check run or a check suite ${GH_API_WHY}`;
-	const reads = input !== undefined ? [...files, input] : files;
-	if (reads.some((f) => f !== "-") || (stdin === null && reads.includes("-"))) {
-		return `gh api graphql with a query read from a file or stdin the gate cannot see, which could write a commit status or a check run ${GH_API_WHY}`;
+	if (positionals.some((p) => /graphql/i.test(p))) {
+		const scanned = [...words, ghApiWord(stdin ?? "")];
+		if (scanned.some((w) => w !== null && STATUS_MUTATION.test(w))) return `gh api graphql with a mutation that writes a commit status, a check run or a check suite ${GH_API_WHY}`;
+		if (scanned.some((w) => w !== null && PROTECTION_MUTATION.test(w))) return `gh api graphql with a mutation that writes branch protection or a ruleset ${GH_API_PROTECTION_WHY}`;
+		if (scanned.includes(null)) return `gh api graphql with a word whose percent-encoding does not decode, which could hide a status or check mutation ${GH_API_WHY}`;
+		const reads = input !== undefined ? [...files, input] : files;
+		if (reads.some((f) => f !== "-") || (stdin === null && reads.includes("-"))) {
+			return `gh api graphql with a query read from a file or stdin the gate cannot see, which could write a commit status or a check run ${GH_API_WHY}`;
+		}
+	}
+	if (raw || (tolerateUnread && args.some((a) => a.unread))) return null;
+	if (positionals.length === 1 && ghApiWord(positionals[0]!)?.replace(/^\/+/, "") === "graphql") return graphqlVerdict(queries, files, input, stdin);
+	if (verb === "GET") return null;
+	if (positionals.length !== 1) return `gh api with a mutating method (${verb} with ${positionals.length} endpoint words, not one the gate can read)`;
+	return ordinaryRest(verb, positionals[0]!) ? null : `gh api with a mutating method (${verb} ${positionals[0]} is not on the ordinary allow-list)`;
+}
+
+/**
+ * A graphql request's § A4 verdict once its status and protection checks passed (D11): null when every body
+ * it sends reads or runs only ORDINARY_GRAPHQL mutations. The bodies are the `query=` fields, a `-F
+ * query=@-` stdin text, and the `query` of an `--input -` JSON body on stdin; anything else unreadable asks.
+ */
+function graphqlVerdict(queries: string[], files: string[], input: string | undefined, stdin: string | null | undefined): string | null {
+	const bodies = [...queries];
+	if (files.includes("-")) bodies.push(stdin ?? "");
+	if (input === "-") {
+		let body: unknown;
+		try {
+			body = JSON.parse(stdin ?? "");
+		} catch (err) {
+			return `gh api graphql with a body the gate cannot read (the --input stdin is not JSON: ${err instanceof Error ? err.message : String(err)})`;
+		}
+		const query = body !== null && typeof body === "object" && "query" in body ? body.query : undefined;
+		if (typeof query !== "string") return "gh api graphql with a body the gate cannot read (the --input JSON has no string query)";
+		bodies.push(query);
+	}
+	for (const body of bodies) {
+		const fields = graphqlMutationFields(body);
+		if (fields === null) return "gh api graphql with a body the gate cannot read (a query that does not parse as plain operations)";
+		const off = fields.find((f) => !ORDINARY_GRAPHQL.includes(f));
+		if (off !== undefined) return `gh api graphql with a mutation not on the ordinary allow-list (${off})`;
 	}
 	return null;
+}
+
+const GRAPHQL_NAME = /^[_A-Za-z][_0-9A-Za-z]*$/;
+
+/**
+ * A GraphQL document's tokens (spec § 2.1: punctuators, names, numbers, strings and block strings; blanks,
+ * commas and comments dropped, every string one `""` token), or null on a character the lexer does not take.
+ */
+function graphqlTokens(s: string): string[] | null {
+	const out: string[] = [];
+	const name = /[_A-Za-z][_0-9A-Za-z]*/y;
+	const num = /-?[0-9][0-9.eE+-]*/y;
+	let i = 0;
+	while (i < s.length) {
+		const c = s[i]!;
+		if (/[\s,\ufeff]/.test(c)) i++;
+		else if (c === "#") while (i < s.length && s[i] !== "\n" && s[i] !== "\r") i++;
+		else if (s.startsWith('"""', i)) {
+			let j = i + 3;
+			while (j < s.length && !(s.startsWith('"""', j) && s[j - 1] !== "\\")) j++;
+			if (j >= s.length) return null;
+			out.push('""');
+			i = j + 3;
+		} else if (c === '"') {
+			let j = i + 1;
+			while (j < s.length && s[j] !== '"' && s[j] !== "\n") j += s[j] === "\\" ? 2 : 1;
+			if (j >= s.length || s[j] !== '"') return null;
+			out.push('""');
+			i = j + 1;
+		} else if (s.startsWith("...", i)) {
+			out.push("...");
+			i += 3;
+		} else if ("{}()[]:=!$@|&".includes(c)) {
+			out.push(c);
+			i++;
+		} else {
+			name.lastIndex = i;
+			num.lastIndex = i;
+			const m = name.exec(s) ?? num.exec(s);
+			if (!m) return null;
+			out.push(m[0]);
+			i += m[0].length;
+		}
+	}
+	return out;
+}
+
+/**
+ * The root fields of every mutation in a GraphQL document (aliases resolved), [] when it holds only queries,
+ * subscriptions and fragments, or null when it does not read as plain operations: a fragment spread or
+ * inline fragment in a mutation's root selection (whose fields the gate would have to resolve), an
+ * unbalanced bracket, or a token out of place.
+ */
+function graphqlMutationFields(body: string): string[] | null {
+	const t = graphqlTokens(body);
+	if (t === null) return null;
+	const fields: string[] = [];
+	let i = 0;
+	/** Past the bracket group opening at `t[i]`; false when it never closes. */
+	const skip = (open: string, close: string): boolean => {
+		for (let depth = 0; i < t.length; i++) {
+			if (t[i] === open) depth++;
+			else if (t[i] === close && --depth === 0) {
+				i++;
+				return true;
+			}
+		}
+		return false;
+	};
+	/** Past an operation's or fragment's header (name, variables, type condition, directives) to its `{`. */
+	const header = (): boolean => {
+		while (i < t.length && t[i] !== "{") {
+			if (t[i] === "(") {
+				if (!skip("(", ")")) return false;
+			} else i++;
+		}
+		return t[i] === "{";
+	};
+	while (i < t.length) {
+		const word = t[i]!;
+		if (word === "{") {
+			if (!skip("{", "}")) return null;
+			continue;
+		}
+		if (word !== "query" && word !== "subscription" && word !== "fragment" && word !== "mutation") return null;
+		i++;
+		if (!header()) return null;
+		if (word !== "mutation") {
+			if (!skip("{", "}")) return null;
+			continue;
+		}
+		i++;
+		for (;;) {
+			const f = t[i];
+			if (f === undefined) return null;
+			if (f === "}") {
+				i++;
+				break;
+			}
+			if (!GRAPHQL_NAME.test(f)) return null;
+			i++;
+			let field = f;
+			if (t[i] === ":") {
+				const real = t[i + 1];
+				if (real === undefined || !GRAPHQL_NAME.test(real)) return null;
+				field = real;
+				i += 2;
+			}
+			fields.push(field);
+			if (t[i] === "(" && !skip("(", ")")) return null;
+			while (t[i] === "@") {
+				if (!GRAPHQL_NAME.test(t[i + 1] ?? "")) return null;
+				i += 2;
+				if (t[i] === "(" && !skip("(", ")")) return null;
+			}
+			if (t[i] === "{" && !skip("{", "}")) return null;
+		}
+	}
+	return fields;
 }
 
 /** The heredoc and here-string text a parsed command reads on stdin; null when it reads a pipe, a file, or a body not known until it runs. */
@@ -400,11 +740,6 @@ function infraArgs(e: Exec): { rest: Word[] } | { unknown: string } | null {
 const RM_LONG = ["force", "interactive", "one-file-system", "no-preserve-root", "preserve-root", "recursive", "dir", "verbose", "help", "version"];
 /** Short options across GNU rm and BSD rm (macOS rm(1): -d -f -i -I -P -R -r -v -W -x). */
 const RM_SHORT = /^-[dfiIPRrvWx]+$/;
-/**
- * Temp paths § A4 exempts from the rm -rf reservation: something under /tmp, $TMPDIR (macOS keeps it
- * under /var/folders) or their /private spellings, with no `..` climbing back out.
- */
-const TEMP_PATH = /^(?:\/private)?\/tmp\/[^/]|^(?:\/private)?\/var\/folders\/[^/]|^"?\$\{?TMPDIR\}?"?\/[^/]/;
 
 /** One rm argument: its text, whether its value is unknown until it runs, and whether it is a path inside the own scratch root (scratchPath) or the own worktree (treePath). */
 export interface RmArg {
@@ -418,10 +753,11 @@ export interface RmArg {
 /**
  * The rm model (M4 fix round 5): options only from rm's own lists, long ones resolved by GNU prefix
  * rules (`--recu` is `--recursive`), an unknown or ambiguous one refused as unmodeled; recursive plus
- * force on any path outside the temp directories is the § A4 reserved `rm -rf`. An operand inside the
- * own scratch root (`inside`, PLAN wl-mv5oikd5jtquww § 1.2 rule 1) is exempt too; when that exemption
- * is what lets the rm through, "rm" goes into `used`. An operand inside the own worktree (`tree`, the
- * routine classifier's rule, PLAN wl-mvqwn80onq9hq8 D2b) is exempt the same way and records into `treeUsed`.
+ * force on any path is the § A4 reserved `rm -rf`. The only exemptions are the owned roots (Jo,
+ * in-mvqyt4a8gezvgg; PLAN wl-mvqwn80onq9hq8 D11 removed the temp-directory one): an operand inside the
+ * own scratch root (`inside`, PLAN wl-mv5oikd5jtquww § 1.2 rule 1), and when that exemption is what lets
+ * the rm through, "rm" goes into `used`; an operand inside the own worktree (`tree`, the routine
+ * classifier's rule, PLAN wl-mvqwn80onq9hq8 D2b), which records into `treeUsed`.
  */
 export function rmModel(args: RmArg[], used?: Set<string>, treeUsed?: Set<string>): { reserved: boolean; why: string } | null {
 	let r = false;
@@ -453,10 +789,9 @@ export function rmModel(args: RmArg[], used?: Set<string>, treeUsed?: Set<string
 		if (a.text.includes("f")) f = true;
 	}
 	if (!r || !f) return null;
-	const notTemp = (o: RmArg): boolean => o.unread || !TEMP_PATH.test(o.text) || o.text.split("/").includes("..");
-	if (operands.some((o) => !o.inside && !o.tree && notTemp(o))) return { reserved: true, why: "rm -rf (recursive force-delete) of a path outside the temp directories" };
-	if (operands.some((o) => o.inside && notTemp(o))) used?.add("rm");
-	if (operands.some((o) => o.tree && notTemp(o))) treeUsed?.add("rm");
+	if (operands.some((o) => !o.inside && !o.tree)) return { reserved: true, why: "rm -rf (recursive force-delete) of a path outside the own scratch root" };
+	if (operands.some((o) => o.inside)) used?.add("rm");
+	if (operands.some((o) => o.tree)) treeUsed?.add("rm");
 	return null;
 }
 
@@ -491,26 +826,34 @@ interface RawOptions {
 }
 
 /**
- * The reserved action a shell command text reaches, or null. Quote-blind; runs per `;`/`&`/`|`/newline
- * segment. `skipPrinters` passes segments that start with `echo`/`printf`: the caller has checked
- * their output reaches nothing that runs it (astra review round 2 false positive, `printf "git reset --hard\n"`).
+ * The hold a shell command text reaches, or null: shellHits' pick under the floor's precedence (pickHit). Quote-blind; runs per
+ * `;`/`&`/`|`/newline segment. `skipPrinters` passes segments that start with `echo`/`printf`: the
+ * caller has checked their output reaches nothing that runs it (astra review round 2 false positive,
+ * `printf "git reset --hard\n"`).
  */
 export function reservedInShell(cmd: string, skipPrinters = false, scratch?: Scratch, raw?: RawOptions): string | null {
+	return pickHit(shellHits(cmd, skipPrinters, scratch, raw));
+}
+
+/** Every row 6 hold in a shell command text, in text order (a segment's rm, then its gh api, then each RULES match), for the class precedence (pickHit). */
+function shellHits(cmd: string, skipPrinters = false, scratch?: Scratch, raw?: RawOptions): string[] {
+	const hits: string[] = [];
 	const c = cmd.replace(/\r\n?/g, "\n").replace(/[ \t]+/g, " ").trim();
-	if (/:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/.test(c)) return "fork bomb";
+	if (/:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/.test(c)) hits.push("fork bomb");
 	for (const seg of c.split(/[;&|\n]+/).map((s) => s.trim()).filter(Boolean)) {
 		if (skipPrinters && /^(echo|printf)(\s|$)/.test(seg)) continue;
-		if (!raw?.skipRm && isRecursiveForceRm(seg, scratch)) return "rm -rf (recursive force-delete)";
+		if (!raw?.skipRm && isRecursiveForceRm(seg, scratch)) hits.push("rm -rf (recursive force-delete)");
 		const gh = ghApiInText(seg, raw?.tolerateUnread === true);
-		if (gh) return gh;
-		for (const { re, why } of RULES) if (re.test(seg)) return why;
+		if (gh) hits.push(gh);
+		for (const { re, why } of RULES) if (re.test(seg)) hits.push(why);
 	}
-	return null;
+	return hits;
 }
 
 /**
- * ghApiModel over each `gh … api` in a raw segment: its words split on spaces, quote-blind, with the
- * quotes off a word quoted whole, and a word holding a substitution unread (isRecursiveForceRm's reading).
+ * ghApiModel's raw reading (`raw`: guard and unread checks only) over each `gh … api` in a raw segment:
+ * its words split on spaces, quote-blind, with the quotes off a word quoted whole, and a word holding a
+ * substitution unread (isRecursiveForceRm's reading).
  */
 function ghApiInText(seg: string, tolerateUnread: boolean): string | null {
 	for (const m of seg.matchAll(new RegExp(`${GH}api(?=\\s|$)`, "gi"))) {
@@ -519,7 +862,7 @@ function ghApiInText(seg: string, tolerateUnread: boolean): string | null {
 			.split(" ")
 			.filter(Boolean)
 			.map((t) => ({ text: t.replace(/^(['"])(.*)\1$/, "$2"), unread: /`|\$\(/.test(t) }));
-		const why = ghApiModel(args, undefined, tolerateUnread);
+		const why = ghApiModel(args, undefined, tolerateUnread, true);
 		if (why) return why;
 	}
 	return null;
@@ -670,7 +1013,8 @@ function scratchGit(git: GitCall, e: Exec, s: Scratch | undefined, mode?: Mode):
 	const lexical = git.dir === "" && git.dirLexical !== "" && insideRoot(s.root, git.dirLexical) && trusted;
 	const call = lexical ? { ...git, dir: git.dirLexical } : git;
 	if (lexical) s.used.add("dirLexical");
-	const lift: ScratchLift = { repo: call.dir !== "" && trusted && repoInside(s.root, call.dir), push: call.dir !== "" && pushToScratch(git, s), used: [] };
+	// D11 own-root: in a routine mode the repo lift also sets aside reset --merge|--keep, checkout --force|--patch and switch --force|--discard-changes.
+	const lift: ScratchLift = { repo: call.dir !== "" && trusted && repoInside(s.root, call.dir), push: call.dir !== "" && pushToScratch(git, s), used: [], ...(mode ? { discards: true } : {}) };
 	if (mode?.tree && call.dir !== "" && trustedDir(e, mode.source, s.root) && treeRepo(mode.tree.root, call.dir)) lift.worktree = [];
 	return { call, lift };
 }
@@ -902,11 +1246,15 @@ function dataWords(cmd: string, x: Expansion, cwd: string, env: Record<string, s
 }
 
 /**
- * The reserved action one parsed command reaches, or null. `data` are words left out of the final
- * rules match (dataWords). `scratch` turns on the scratch rules 1–3 for a bash call (scratchFor).
- * `mode` carries the routine classifier's options (ReservedOptions, PLAN wl-mvqwn80onq9hq8 D2a, D2b).
+ * Every hold one parsed command reaches, in today's order (its first is what row 6 named before the
+ * floor's class precedence, pickHit). `data` are words left out of the final rules match (dataWords).
+ * `scratch` turns on the scratch rules 1–3 for a bash call (scratchFor). `mode` carries the routine
+ * classifier's options (ReservedOptions, PLAN wl-mvqwn80onq9hq8 D2a, D2b). `owned` says whether a
+ * repository directory is the own worktree or a scratch repository: a work-tree discard anywhere else is
+ * named with OTHER_CHECKOUT, the guard class (D11).
  */
-function reservedInExec(e: Exec, data?: Set<Word>, scratch?: Scratch, mode?: Mode): string | null {
+function reservedInExec(e: Exec, owned: (dir: string) => boolean, data?: Set<Word>, scratch?: Scratch, mode?: Mode): string[] {
+	const hits: string[] = [];
 	const name = basename(e.argv[0]!.text);
 	// A word the shell expands when it runs (a substitution or a glob): its value is not known here.
 	const unread = (w: Word): boolean => w.opaque || w.glob === true;
@@ -916,35 +1264,29 @@ function reservedInExec(e: Exec, data?: Set<Word>, scratch?: Scratch, mode?: Mod
 		const tree = mode?.tree;
 		const args = e.argv.slice(1).map((w) => ({ text: w.text, unread: w.opaque, glob: w.glob, inside: inside(w), ...(tree ? { tree: treePath(tree, e, w, mode!.source, scratch?.root) } : {}) }));
 		const rm = rmModel(args, scratch?.used, tree?.used);
-		if (rm?.reserved) return rm.why;
+		if (rm?.reserved) hits.push(rm.why);
 	}
 	if (name === "psql") {
 		const why = checkProductionPsql(e);
-		if (why) return why;
+		if (why) hits.push(why);
 	}
 	if (name === "gh") {
 		const api = ghApiArgs(e.argv);
 		const why = api ? ghApiModel(api.map((w) => ({ text: w.text, unread: unread(w) })), stdinText(e), mode?.tolerateUnread === true) : null;
-		if (why) return why;
+		if (why) hits.push(why);
 	}
 	const git = gitCall(e);
 	if (git) {
-		if (git.sub === null) return "git with a subcommand not known until it runs";
-		if (GIT_ARG_SENSITIVE[git.sub] && git.args.some(unread) && !mode?.tolerateUnread) return `git ${git.sub} with an argument not known until it runs`;
-		const sg = scratchGit(git, e, scratch, mode);
-		const call = sg?.call ?? git;
-		if (call.sub === "push" && call.dir === "") return "git push from a directory not known until it runs";
-		const v = gitModel(call, sg?.lift);
-		if (v?.reserved) return v.why;
-		recordLifts(sg?.lift, scratch, mode?.tree);
+		const why = gitHold(git, e, owned, scratch, mode);
+		if (why) hits.push(why);
 	} else if (HEAD_SENSITIVE[name] && e.argv.slice(1, 4).some(unread) && !mode?.tolerateUnread) {
-		return `${name} with a subcommand or target not known until it runs`;
+		hits.push(`${name} with a subcommand or target not known until it runs`);
 	}
 	// An infrastructure CLI's verb past its global options (astra-8 B3); an unknown one is refused as unmodeled.
 	const infra = infraArgs(e);
 	if (infra && "rest" in infra) {
 		const bare = execText({ ...e, argv: [e.argv[0]!, ...infra.rest] }).replace(/\n/g, " ");
-		for (const { re, why } of RULES) if (re.test(bare)) return why;
+		for (const { re, why } of RULES) if (re.test(bare)) hits.push(why);
 	}
 	// git's own files (refs, packed-refs, HEAD, config, hooks) under any case spelling: a write there
 	// moves a ref or installs a program git runs later, past every git spelling (M4 fix round 5). A
@@ -955,13 +1297,26 @@ function reservedInExec(e: Exec, data?: Set<Word>, scratch?: Scratch, mode?: Mod
 			insideDotGit(resolve(e.dir, w.text)) ||
 			(w.candidates ?? []).some((c) => insideDotGit(resolve(e.dir, c))) ||
 			(w.fragments ?? []).some((f) => insideDotGit(f.head) || insideDotGit(f.tail));
-		if (dotGit) return "writing inside a .git directory (a ref move, or config and hooks git runs later)";
+		if (dotGit) hits.push(DOT_GIT_WRITE);
 	}
 	// A printer's arguments are text. What it feeds (a pipe, a file) the raw pass over the whole
 	// command still reads, and a shell reading its output is expanded on its own (src/exec.ts).
-	if (OUTPUT_ONLY[name]) return null;
+	if (OUTPUT_ONLY[name]) return hits;
 	const text = execText(data ? { ...e, argv: e.argv.filter((w) => !data.has(w)) } : e).replace(/\n/g, " ");
-	for (const { re, why } of RULES) if (re.test(text)) return why;
+	for (const { re, why } of RULES) if (re.test(text)) hits.push(why);
+	return hits;
+}
+
+/** The hold one git command reaches (gitModel over the scratch lifts), or null; a discard outside every owned repository carries OTHER_CHECKOUT. */
+function gitHold(git: GitCall, e: Exec, owned: (dir: string) => boolean, scratch?: Scratch, mode?: Mode): string | null {
+	if (git.sub === null) return "git with a subcommand not known until it runs";
+	if (GIT_ARG_SENSITIVE[git.sub] && git.args.some((w) => w.opaque || w.glob === true) && !mode?.tolerateUnread) return `git ${git.sub} with an argument not known until it runs`;
+	const sg = scratchGit(git, e, scratch, mode);
+	const call = sg?.call ?? git;
+	if (call.sub === "push" && call.dir === "") return "git push from a directory not known until it runs";
+	const v = gitModel(call, sg?.lift);
+	if (v?.reserved) return v.discard && !owned(call.dir) ? `${v.why}, ${OTHER_CHECKOUT}` : v.why;
+	recordLifts(sg?.lift, scratch, mode?.tree);
 	return null;
 }
 
@@ -1131,16 +1486,16 @@ interface CodeHit {
 
 /**
  * Reserved actions in eval (or inline interpreter) code: its literal text, its literal argv lists, and
- * what it spawns. With `spawns` false (the eval tool, once D1 found no process start), only the
+ * what it spawns. With `processes` null (the eval tool, once D1 found no process start), only the
  * quote-blind phrase pass and the browser pass run: no process pass can raise a request for eval.
+ * Otherwise `processes` is reservedInExec's `owned` (a work-tree discard outside it is guard class, D11).
  */
-function reservedInCode(code: string, family: CodeFamily | undefined, cwd: string, env: Record<string, string | undefined>, spawns = true): CodeHit | null {
+function reservedInCode(code: string, family: CodeFamily | undefined, cwd: string, env: Record<string, string | undefined>, processes: ((dir: string) => boolean) | null): CodeHit | null {
 	const facts = codeFacts(code, family);
-	for (const t of [facts.folded, facts.folded.replace(/["'`]\s*,\s*["'`]/g, " "), ...facts.literals, ...facts.argvLists]) {
-		const why = reservedInShell(t);
-		if (why) return { why, detail: "Reached through eval code; eval runs shell and subprocesses the bash gate would otherwise miss." };
-	}
-	const hit = spawns ? reservedInProcesses(code, facts, family, cwd, env) : null;
+	const texts = [facts.folded, facts.folded.replace(/["'`]\s*,\s*["'`]/g, " "), ...facts.literals, ...facts.argvLists];
+	const why = pickHit(texts.map((t) => reservedInShell(t)).filter((w): w is string => w !== null));
+	if (why) return { why, detail: "Reached through eval code; eval runs shell and subprocesses the bash gate would otherwise miss." };
+	const hit = processes ? reservedInProcesses(code, facts, family, cwd, env, processes) : null;
 	if (hit) return hit;
 	const bw = BROWSER_WRITE_CALL.exec(code);
 	if (bw) return { why: `a browser write (${bw[1]})`, detail: "Reached through eval's browser API." };
@@ -1148,24 +1503,21 @@ function reservedInCode(code: string, family: CodeFamily | undefined, cwd: strin
 }
 
 /** reservedInCode's process passes: the commands the code's processes run, their environment, and their readability. */
-function reservedInProcesses(code: string, facts: CodeFacts, family: CodeFamily | undefined, cwd: string, env: Record<string, string | undefined>): CodeHit | null {
+function reservedInProcesses(code: string, facts: CodeFacts, family: CodeFamily | undefined, cwd: string, env: Record<string, string | undefined>, owned: (dir: string) => boolean): CodeHit | null {
 	// Literal text that is shell, read the way the shell reads it (`Bun.$\`git "reset" --hard\``), only
 	// where the code starts a process: code that starts none cannot run a literal, and a literal that is
 	// a file path was being opened and parsed as a script (a MIGRATION.md quoting `kubectl --context X
 	// delete` held a read-only eval, MIGRATION.md follow-up 29). The quote-blind pass above still reads it.
 	const commands = codeCommands(facts, family);
 	const shells = commands === null ? [] : [...facts.literals, ...facts.argvLists].map((t) => ({ t, x: expandShell(t, cwd, env) }));
-	for (const { t, x } of shells) {
-		for (const e of x.commands) {
-			const why = reservedInExec(e);
-			if (why) return { why, detail: `Reached through eval code (the string ${JSON.stringify(t.slice(0, 120))}).` };
-		}
-	}
+	const found = shells.flatMap(({ t, x }) => x.commands.flatMap((e) => reservedInExec(e, owned).map((why) => ({ why, t }))));
+	const why = pickHit(found.map((f) => f.why));
+	if (why) return { why, detail: `Reached through eval code (the string ${JSON.stringify(found.find((f) => f.why === why)!.t.slice(0, 120))}).` };
 	// The environment the code gives the processes it starts (astra-8 B2), judged as the bash branch
 	// judges it, before the per-literal forms below so its reason names the variable.
 	const ienv = codeInterpreterEnv(code, family, cwd, env);
 	for (const w of ienv.writes) {
-		if (insideDotGit(resolve(cwd, w.text))) return { why: "an interpreter told by its environment to write inside a .git directory (a ref move, or config and hooks git runs later)", detail: "Reached through eval code: a process it starts." };
+		if (insideDotGit(resolve(cwd, w.text))) return { why: DOT_GIT_ENV_WRITE, detail: "Reached through eval code: a process it starts." };
 	}
 	if (ienv.unmodeled) {
 		const u = { what: `${ienv.unmodeled} (an interpreter or loader setting)`, spelling: INTERPRETER_ENV_SPELLING };
@@ -1204,12 +1556,22 @@ function reservedInProcesses(code: string, facts: CodeFacts, family: CodeFamily 
 /** Browser actions that change state outside the machine (A4 build requirement: browser writes). */
 const BROWSER_WRITE_ACTION = /^(click|dblclick|type|fill|fill_form|press|press_key|type_text|select|select_option|check|uncheck|upload|upload_file|drag|submit|handle_dialog|evaluate|evaluate_script|run)$/i;
 
-/** Refusals that name a § A4 reserved action, with the action: what a `reserved-request` entry records. */
+/** Refusals that name a reserved action (FLOOR classes A4, deploy, own-root), with the action: what a `reserved-request` entry records. */
 const RESERVED_ACTION = new WeakMap<object, string>();
+/** Guard-class refusals (FLOOR), with the hold they name: no reserved request. */
+const GUARD_HOLD = new WeakMap<object, string>();
 
-/** The § A4 reserved action a row 6 refusal names; null for an unmodeled form, an unreadable command or a process started from eval (respell, not Jo's call). */
+/** The reserved action a row 6 refusal names; null for a guard-class hold (D11), an unmodeled form, an unreadable command or a process started from eval (respell, not Jo's call). */
 export function reservedAction(r: Refusal): string | null {
 	return (r && RESERVED_ACTION.get(r)) ?? null;
+}
+
+/** The FLOOR class of a row 6 refusal's hold, or null when it names none (an unmodeled form, a respelling, no refusal). */
+export function refusalClass(r: Refusal): FloorClass | null {
+	if (!r) return null;
+	if (GUARD_HOLD.has(r)) return "guard";
+	const why = RESERVED_ACTION.get(r);
+	return why === undefined ? null : (floorRow(why)?.class ?? "A4");
 }
 
 /** The refused call, as a `reserved-request` entry body names it: its command, code, browser action or path. */
@@ -1226,8 +1588,23 @@ export function reservedRequestBody(call: ToolCall, action: string, toolCallId: 
 	return `${action}: ${refusedVerb(call).trim()} (P-11 row 6 refused tool call ${toolCallId ?? "unknown"})`;
 }
 
-/** A refusal naming a § A4 reserved action: always reserved, so it becomes a `reserved-request` for Jo. */
+/**
+ * A refusal naming a hold. A guard-class hold (FLOOR, D11) is refused outright: no reserved request, nothing to Jo,
+ * and the reason names the owner and the spelling to use instead. Any other is a § A4 reserved action, which
+ * becomes a `reserved-request` for Jo, worded as before the floor.
+ */
 function refuse(why: string, detail: string): Refusal {
+	const row = floorRow(why);
+	if (row?.class === "guard") {
+		const g = {
+			block: true as const,
+			reason:
+				`P-11 row 6 refused this: ${why}. It is guarded for ${row.owner} (Jo's floor, PLAN wl-mvqwn80onq9hq8 D11; ${row.a4}): ` +
+				`it is not a reserved action, so no request is written and nothing is raised to Jo. Use instead: ${row.instead}. ${detail}`,
+		};
+		GUARD_HOLD.set(g, why);
+		return g;
+	}
 	const r = {
 		block: true as const,
 		reason:
@@ -1280,7 +1657,7 @@ function checkEvalCode(code: string, family: CodeFamily | undefined, ctx: CallCo
 		const r = checkEvalCode(text, family, ctx, true);
 		if (r) return r;
 	}
-	const hit = reservedInCode(code, family, ctx.cwd, ctx.env, false);
+	const hit = reservedInCode(code, family, ctx.cwd, ctx.env, null);
 	if (!hit) return null;
 	return hit.unmodeled ? refuseUnmodeled(hit.unmodeled, hit.detail) : refuse(hit.why, hit.detail);
 }
@@ -1487,19 +1864,42 @@ export interface ReservedVerdict {
 }
 
 /**
+ * Row 6's call context: the session's, plus the workload's own worktree (its `worktree:` control entry, lanes only),
+ * which classes a work-tree discard there as own-root rather than guard (FLOOR, D11).
+ */
+export interface ReservedContext extends CallContext {
+	worktreeRoot?: string;
+}
+
+/**
+ * Whether a repository directory is owned (D11): the own worktree (treeRepo) or a repository inside the own scratch
+ * root (repoInside, the scratch root from scratchFor or, for a lane or hand, ownScratchRoot). An unknown directory
+ * ("") is not: a discard there is refused as guard, and the agent can spell the directory.
+ */
+function ownedRepos(ctx: ReservedContext, worktreeRoot: string | undefined, scratch: Scratch | undefined): (dir: string) => boolean {
+	const tree = worktreeFor(worktreeRoot);
+	const root = scratch?.root ?? (ctx.role === "lane" || ctx.role === "hand" ? ownScratchRoot(ctx.env) : null);
+	return (dir) => dir !== "" && ((tree !== undefined && treeRepo(tree.root, dir)) || (root !== null && repoInside(root, dir)));
+}
+
+/**
  * Row 6 over one tool call. A bash call the scratch rules (scratchFor) let through is marked confined
  * for the fence (session.ts markConfined). With `opts` (the routine classifier's options) nothing is
  * marked: the classifier reads reservedVerdict, and the gate marks the call after it records the
  * auto-apply (PLAN wl-mvqwn80onq9hq8 D3).
  */
-export function checkReserved(call: ToolCall, ctx: CallContext, opts?: ReservedOptions): Refusal {
+export function checkReserved(call: ToolCall, ctx: ReservedContext, opts?: ReservedOptions): Refusal {
 	const v = reservedVerdict(call, ctx, opts);
 	if (!opts && v.refusal === null && v.scratch.length > 0) markConfined(call);
 	return v.refusal;
 }
 
-/** checkReserved's judgement, without marking the call: the refusal, and the scratch and own-worktree rules that changed a verdict. */
-export function reservedVerdict(call: ToolCall, ctx: CallContext, opts?: ReservedOptions): ReservedVerdict {
+/**
+ * checkReserved's judgement, without marking the call: the refusal, and the scratch and own-worktree rules that
+ * changed a verdict. The bash branch collects every hold of the raw pass, the parsed pass and the interpreter
+ * environment, and names one by the floor's precedence (pickHit).
+ */
+export function reservedVerdict(call: ToolCall, ctx: ReservedContext, opts?: ReservedOptions): ReservedVerdict {
 	const { toolName, input } = call;
 	const none = (refusal: Refusal): ReservedVerdict => ({ refusal, scratch: [], worktree: [] });
 	if (toolName === "bash") {
@@ -1510,19 +1910,20 @@ export function reservedVerdict(call: ToolCall, ctx: CallContext, opts?: Reserve
 		const tree = worktreeFor(opts?.worktreeRoot);
 		const mode: Mode | undefined = opts && { tolerateUnread: opts.tolerateUnread === true, relative: opts.scratchRelative === true, ...(tree ? { tree } : {}), source: cmd };
 		const bash = (refusal: Refusal): ReservedVerdict => ({ refusal, scratch: [...(scratch?.used ?? [])], worktree: [...(tree?.used ?? [])] });
+		const owned = ownedRepos(ctx, opts?.worktreeRoot ?? ctx.worktreeRoot, scratch);
 		const data = dataWords(cmd, x, cwd, ctx.env);
 		const rawOpts = mode && { skipRm: (mode.relative || tree !== undefined) && x.blind.length === 0, tolerateUnread: mode.tolerateUnread };
-		const raw = reservedInShell(data?.masked ?? cmd, printersOnlyPrint(cmd, cwd, ctx.env), scratch, rawOpts);
-		if (raw) return bash(refuse(raw, `Command: ${cmd}`));
+		const hits = shellHits(data?.masked ?? cmd, printersOnlyPrint(cmd, cwd, ctx.env), scratch, rawOpts);
 		for (const e of x.commands) {
-			const why = reservedInExec(e, data?.words, scratch, mode) ?? barePushOfProtected(e, scratch);
-			if (why) return bash(refuse(why, `Command: ${cmd}`));
+			const exec = reservedInExec(e, owned, data?.words, scratch, mode);
+			const bare = barePushOfProtected(e, scratch);
+			hits.push(...exec, ...(bare ? [bare] : []));
 		}
 		// Files an interpreter writes because of its environment (astra-7 B3): none inside .git.
 		const ienv = interpreterEnv(x, cwd);
-		for (const w of ienv.writes) {
-			if (insideDotGit(resolve(cwd, w.text))) return bash(refuse("an interpreter told by its environment to write inside a .git directory (a ref move, or config and hooks git runs later)", `Command: ${cmd}`));
-		}
+		if (ienv.writes.some((w) => insideDotGit(resolve(cwd, w.text)))) hits.push(DOT_GIT_ENV_WRITE);
+		const held = pickHit(hits);
+		if (held) return bash(refuse(held, `Command: ${cmd}`));
 		if (definesFunction(cmd)) {
 			return bash(refuseUnmodeled({ what: "a shell function definition (its body runs later under the function's name, which the gate does not follow)", spelling: "the commands typed out where they run, without a function" }, `Command: ${cmd}`));
 		}
@@ -1535,7 +1936,7 @@ export function reservedVerdict(call: ToolCall, ctx: CallContext, opts?: Reserve
 		}
 		if (ienv.unmodeled) return bash(refuseUnmodeled({ what: `${ienv.unmodeled} (an interpreter or loader setting)`, spelling: INTERPRETER_ENV_SPELLING }, `Command: ${cmd}`));
 		for (const c of x.code) {
-			const hit = reservedInCode(c.text, c.family, c.dir, ctx.env);
+			const hit = reservedInCode(c.text, c.family, c.dir, ctx.env, owned);
 			if (!hit) continue;
 			const detail = `${hit.detail} Command: ${cmd}`;
 			// An unreadable launch in inline code is a respelling, not Jo's call (PLAN wl-muzs0ytnaet1v4 D2).
@@ -1561,7 +1962,7 @@ export function reservedVerdict(call: ToolCall, ctx: CallContext, opts?: Reserve
 	if (toolName === "write" || toolName === "edit" || toolName === "ast_edit") {
 		// git's own files (refs, HEAD, config, hooks) written directly skip every git spelling above.
 		for (const p of [input.path, ...(Array.isArray(input.paths) ? input.paths : [])]) {
-			if (typeof p === "string" && insideDotGit(resolve(ctx.cwd, p))) return none(refuse("writing inside a .git directory (a ref move, or config and hooks git runs later)", `Path: ${p}`));
+			if (typeof p === "string" && insideDotGit(resolve(ctx.cwd, p))) return none(refuse(DOT_GIT_WRITE, `Path: ${p}`));
 		}
 		return none(null);
 	}
