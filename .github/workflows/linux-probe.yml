@@ -26,12 +26,16 @@ jobs:
       # The repo is a detached checkout with no origin, as test-exec `prepare` leaves it. No _as2test sandbox wrapper.
       - name: Prepare runner-like child layout
         run: |
-          W="$RUNNER_TEMP/as2work"
+          # /tmp, not $RUNNER_TEMP: attempt 1 showed the `_` in /home/runner/work/_temp is Markdown-escaped by link tests.
+          W="/tmp/as2work"
           mkdir -p "$W/home/tmp" "$W/home/.config" "$W/home/.cache" "$W/home/.local/share" "$W/home/.bun/install/cache" "$W/home/.agent-system-2" "$W/shim" "$W/out"
           printf '[user]\n\tname = as2 test runner\n\temail = as2-test-runner@localhost\n' > "$W/home/.gitconfig"
           REAL_GIT="$(command -v git)"
           printf '#!/bin/sh\nGIT_CONFIG_NOSYSTEM=1\nGIT_TERMINAL_PROMPT=0\nGIT_ASKPASS=/usr/bin/false\nexport GIT_CONFIG_NOSYSTEM GIT_TERMINAL_PROMPT GIT_ASKPASS\nexec %s -c credential.helper= "$@"\n' "'$REAL_GIT'" > "$W/shim/git"
           chmod 755 "$W/shim/git"
+          # The runner's bundle carries main's published record (refs/heads/main, refs/tags/as2-trusted-main); recreate both.
+          git branch -f main origin/main
+          git tag -f as2-trusted-main origin/main
           git checkout --quiet --detach HEAD
           git remote remove origin
           echo "W=$W" >> "$GITHUB_ENV"
@@ -56,5 +60,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-probe-output
-          path: ${{ runner.temp }}/as2work/out
+          path: /tmp/as2work/out
           if-no-files-found: warn
