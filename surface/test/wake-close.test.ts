@@ -14,7 +14,7 @@ import { launchVerdict } from "../extensions/launch";
 import orchestratorSurface from "../index";
 import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { recordRepo } from "../src/decision-log";
-import { doneBody, trainBoardBody } from "../src/launch";
+import { doneBody, launchRequestedBody, trainBoardBody, withdrawInstructionBody, withdrawnBody } from "../src/launch";
 import { surfaceSession } from "../src/session";
 import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, timers, tmp } from "./helpers";
@@ -292,5 +292,101 @@ describe("the tick's catch-up runs when the poll throws (MIGRATION.md item 71)",
 		const line = `tick: ${wl}: the starter exited 0 without a line`;
 		expect(s.tickNotices).toEqual([line]);
 		expect(s.noticesInFlight?.lines).toEqual([line]);
+	});
+});
+
+describe("PLAN wl-mv8s939084z1ts D6: the tick finishes the close of a workload Jo withdrew, in either mode", () => {
+	/** A released workload with a done: line, a cancelled slice and no receipt, then Jo's `withdraw <wl>` as the surface writes it. */
+	function withdrawn(e: Record<string, string>, repo: string, mode: "autonomous" | "user-driven", requested: boolean): { wl: string; ins: string } {
+		const l = open(e);
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "Prototype the data-viz panel", stakes: "normal", mode });
+		recordRepo(l, wl, repo);
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the panel renders the feed") });
+		expect(l.claimWorkload(wl, { by: HAND, holder: HAND, leaseMs: 60_000 }).won).toBe(true);
+		const sl = l.addSlice({ by: HAND, workloadId: wl, task: "draw the panel", doneCondition: "it renders", inputs: "the feed" });
+		l.releaseWorkload(wl, { by: HAND, holder: HAND });
+		l.cancelSlice(sl, { by: SURFACE_BY });
+		// cancel-slice's own launch-requested: (a lane's question withdrawn while nobody held it), never consumed.
+		if (requested) l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody("jo", l.now(), "cancel-slice") });
+		const ins = l.recordInstruction({ by: SURFACE_BY, workloadId: wl, body: withdrawInstructionBody(wl), author: "jo", channel: "surface" });
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: withdrawnBody(ins) });
+		expect(launchVerdict(l, e, wl)).toEqual({ launch: false, reason: "withdrawn" });
+		l.close();
+		return { wl, ins };
+	}
+	/** The surface on the fake exec (served origin whose `git rev-parse` fails while `git.origin`; unserved after), with one-poll and applied-block helpers. */
+	async function surface(e: Record<string, string>, repo: string) {
+		const git = { origin: true };
+		const f = fakePi(undefined, { exec: true });
+		f.execs.answer = (command, args) => {
+			if (command === "git" && args[2] === "config") return git.origin ? { stdout: `${ORIGIN_URL}\n`, stderr: "", code: 0, killed: false } : { stdout: "", stderr: "", code: 1, killed: false };
+			if (command === "git" && args[2] === "rev-parse" && args[3] === "--show-toplevel") return { stdout: "", stderr: "fatal: no", code: 128, killed: false };
+			return { stdout: "", stderr: "", code: 0, killed: false };
+		};
+		orchestratorSurface(f.pi, e, {});
+		const ctx = ctxOf({ cwd: repo });
+		const s = surfaceSession(ctx, e);
+		const applied = async (): Promise<string[]> => {
+			const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
+			const text = turn.messages[0]?.content ?? "";
+			const heading = "## Applied from the surface since your last turn";
+			return text.includes(heading) ? text.split(heading)[1]!.trim().split("\n\n")[0]!.split("\n") : [];
+		};
+		const tick = async () => {
+			timers[0]!.fn();
+			while (s.launching) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				setImmediate(resolve);
+				await promise;
+			}
+		};
+		timers.length = 0;
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		expect(timers).toHaveLength(1);
+		return { f, git, tick, applied };
+	}
+	const said = (ins: string) => `withdrawn by Jo (${ins}): closed with no done-because: receipt`;
+
+	test("autonomous with an unconsumed launch-requested: the tick closes it and launches nothing", async () => {
+		const e = env();
+		const repo = tmp("repo");
+		const { wl, ins } = withdrawn(e, repo, "autonomous", true);
+		const h = await surface(e, repo);
+		h.git.origin = false;
+
+		await h.tick();
+
+		const closed = await h.applied();
+		expect(closed).toHaveLength(1);
+		expect(closed[0]).toStartWith(`- tick: closed ${wl}: ${said(ins)} — Decision-log entry rendered at [${join(repo, ".ai", "decision-log")}/`);
+		expect(h.f.execs.calls.filter((c) => c.command === "bun")).toEqual([]);
+		const after = open(e);
+		expect(after.workload(wl)!.status).toBe("closed");
+		expect(after.instructions(wl).map((i) => i.body)).toContain(`close receipt: ${said(ins)}`);
+		after.close();
+	});
+
+	test("user-driven: the first tick's close is refused (served, the check cannot answer) and told once; a later tick closes it", async () => {
+		const e = env();
+		const repo = tmp("repo");
+		const { wl, ins } = withdrawn(e, repo, "user-driven", false);
+		const h = await surface(e, repo);
+		await h.tick();
+		await h.tick();
+		expect(h.f.execs.calls.filter((c) => c.command === "git" && c.args[2] === "config")).toHaveLength(2);
+		expect(await h.applied()).toEqual([`- tick: ${wl} cannot close: the close check could not answer: [${repo}](${pathToFileURL(repo).href}) is not a git checkout (git rev-parse exited 128: fatal: no)`]);
+		const still = open(e);
+		expect(still.workload(wl)!.status).toBe("open");
+		still.close();
+
+		h.git.origin = false;
+		await h.tick();
+		const closed = await h.applied();
+		expect(closed).toHaveLength(1);
+		expect(closed[0]).toStartWith(`- tick: closed ${wl}: ${said(ins)} — `);
+		expect(h.f.execs.calls.filter((c) => c.command === "bun")).toEqual([]);
+		const after = open(e);
+		expect(after.workload(wl)!.status).toBe("closed");
+		after.close();
 	});
 });

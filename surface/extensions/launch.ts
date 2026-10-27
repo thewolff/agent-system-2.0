@@ -61,6 +61,8 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 			case "standing":
 			case "due":
 				return { attempted: false, code: null, line: null };
+			case "withdrawn":
+				return { attempted: false, code: null, line: `${workloadId} was withdrawn by Jo and is awaiting close; nothing launched` };
 			case "user-driven":
 				return { attempted: false, code: null, line: `${workloadId} is user-driven: no lane launches by itself; run it by hand with \`${byHandLine(workloadId)}\`` };
 			case "held":
@@ -111,9 +113,9 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 
 /**
  * The verdict alone, for the tick: whether a launch would be attempted now (the rank gate applied,
- * as `triggerLaunch` applies it), or the workload is awaiting close (the tick closes it). The tick
- * execs only on a launch verdict, so a refused workload — a queued one included — costs one read per
- * poll and no process. Null when there is no such workload.
+ * as `triggerLaunch` applies it), or the workload is awaiting close or withdrawn (the tick closes it).
+ * The tick execs only on a launch verdict, so a refused workload — a queued one included — costs one
+ * read per poll and no process. Null when there is no such workload.
  */
 export function launchVerdict(ledger: Ledger, env: Record<string, string | undefined>, workloadId: string): LaunchVerdict | null {
 	const rows = launchRowsFor(ledger, workloadId, laneCap(env));

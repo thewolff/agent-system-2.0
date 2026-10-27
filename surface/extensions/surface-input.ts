@@ -4,7 +4,8 @@
 // a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), `cancel-slice <sl-…>` and
 // `supersede <wl-A> <wl-B>` (PLAN wl-mv5i3lulwwbbi8 D1, D2), `test-pr <wl-…> <N> [<N> …]`
 // (any length, never read as a batch; PLAN wl-mv5qdfvv82ivwg § 2.1), `train [<wl-…>] <N> [<N> …]`
-// (any length, never read as a batch, refused inside one; PLAN wl-mv8s8srodefytc § 1), or a numbered batch
+// (any length, never read as a batch, refused inside one; PLAN wl-mv8s8srodefytc § 1), `withdraw <wl-…>`
+// (any length, never read as a batch; PLAN wl-mv8s939084z1ts D1), or a numbered batch
 // answering needs-you lines by their session number ("1 approve, 2 deny", or one per line;
 // MIGRATION.md § M7 follow-ups item 1). Read
 // from the turn's prompt in `before_agent_start` rather than from the `input` event, because
@@ -76,6 +77,16 @@
 // runs the trigger on the new id, taken from `applyTrain`'s result; `train <wl-…> <N…>` adds to one,
 // writing Jo's `launch-requested:` when no lane holds it live, and runs the trigger too.
 //
+// Closing a withdrawn workload (PLAN wl-mv8s939084z1ts D4): after the transaction that applied a
+// `withdraw <wl-…>` commits, on the single word and the paste path (never on a refused paste or a
+// rolled-back transaction), `closeAfter` closes each withdrawn workload through
+// `closeWorkloadWithEntry` (the close tool's body, no receipt: the withdrawal stands in for it) and
+// appends its line to that command's echo: `Closed <wl>.` with the decision-log entry, or `<wl> stays
+// open: <refusal>; the tick retries the close`. A close that throws is named the same way (`withdrawn,
+// but the close failed: …`), never as "could not apply", since the withdrawal is committed; the wake
+// tick finishes a close the word could not (surface/extensions/wake.ts `catchUp`). A withdrawal is
+// no resolution a lane resumes on, so it runs no launch trigger.
+//
 // Surface words (PLAN wl-mv5msri070p0qo D1, D4), each only as the whole trimmed input: `pending`
 // and `brb` are read from the `input` event and handled there, so OMP drops them and no turn starts
 // (`pending` shows the block of every open answer line as a `surface-pending` message, queued for
@@ -104,6 +115,7 @@ import { oneLinerCore } from "../src/render";
 import { DISCARDED_KEPT, type SurfaceSession, surfaceSession, type TypedEntry } from "../src/session";
 import { type Ctx, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY } from "../src/types";
 import { triggerLaunch } from "./launch";
+import { closeWorkloadWithEntry } from "./workload";
 
 /** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null; `stop-reviews` and `cancel-slice` withdraw questions too. */
 const resumes = (cmd: Command): string | null =>
@@ -116,11 +128,15 @@ const launches = (cmd: Command): string | null =>
 /** The workload of a `pair` answer (its receipt carries the by-hand command, PLAN wl-mvb9mw00ycfjeo D6), else null. */
 const pairOf = (cmd: Command): string | null => (cmd.kind === "answer" && cmd.answer.toLowerCase() === PAIR_OPTION ? cmd.workloadId : null);
 
-/** One applied command's echo: its receipt, the workload the launch trigger runs for, and the workload of a `pair` answer. */
+/**
+ * One applied command's echo: its receipt, the workload the launch trigger runs for, the workload of a `pair` answer, and
+ * `closes`, the workload a `withdraw <wl-…>` closes after its transaction commits (PLAN wl-mv8s939084z1ts D4).
+ */
 interface Echo {
 	wl: string | null;
 	line: string;
 	pair?: string | null;
+	closes?: string;
 }
 
 /** Copies `text` to Jo's clipboard: null when it was copied, else why not, in a few words. */
@@ -151,7 +167,8 @@ const span = (i: PasteInstruction): string => (i.from === i.to ? `line ${i.from}
  * `lane-stop:` request the runner accepts. Jo's `pair` answer writes its own inside `apply` (PLAN wl-mv67564rdkfvnk D7).
  * `heartbeatOf` is the reader the command was interpreted with, so `cancel-slice` re-checks its live run against the same files.
  * A train-open goes through `applyTrain` with `repo` (the surface's cwd) and launches the id it opened; every other
- * command launches `launches(cmd)`. Returns the echo and the workload the launch trigger runs for.
+ * command launches `launches(cmd)`. Returns the echo and the workload the launch trigger runs for; a `withdraw <wl-…>`
+ * echo names the workload `closeAfter` closes.
  */
 function applyOne(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf, repo: string): Echo {
 	if (cmd.kind === "train") {
@@ -159,7 +176,10 @@ function applyOne(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf, repo: 
 		return { wl: r.workloadId, line: r.line };
 	}
 	const r = apply(ledger, cmd, heartbeatOf);
-	return { wl: launches(cmd), line: cmd.kind === "mode" ? r + modeFlipControl(ledger, cmd.workloadId, cmd.mode) : r, pair: pairOf(cmd) };
+	return {
+		wl: launches(cmd), line: cmd.kind === "mode" ? r + modeFlipControl(ledger, cmd.workloadId, cmd.mode) : r, pair: pairOf(cmd),
+		closes: cmd.kind === "withdraw-workload" ? cmd.workloadId : undefined,
+	};
 }
 
 /** A ledger refusal inside a paste's transaction, carrying the line it happened on. */
@@ -414,6 +434,23 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 	};
 
 	/**
+	 * PLAN wl-mv8s939084z1ts D4: close each workload a committed `withdraw <wl-…>` withdrew, appending the close's line to that
+	 * command's echo: its text when closed, else the refusal and that the tick retries; a close that throws is named there too, never
+	 * as "could not apply", the withdrawal being committed already.
+	 */
+	const closeAfter = async (ledger: Ledger, ctx: Ctx, s: SurfaceSession, echoes: Echo[]): Promise<void> => {
+		for (const e of echoes) {
+			if (e.closes === undefined) continue;
+			try {
+				const r = await closeWorkloadWithEntry(pi, ledger, env, e.closes, { now: s.now(), cwd: ctx.cwd, receipt: null });
+				e.line += r.closed ? `; ${r.text}` : `; ${e.closes} stays open: ${r.text}; the tick retries the close`;
+			} catch (err) {
+				e.line += `; withdrawn, but the close failed: ${reason(err)}; the tick retries`;
+			}
+		}
+	};
+
+	/**
 	 * D6, after the commit: copy the by-hand command of the last pair answer in `echoes`, put whether it was copied on a
 	 * line of its own at the end of that receipt, and move that receipt last. A copier that throws is a copy not made.
 	 */
@@ -497,6 +534,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				return undefined;
 			}
 			await launchAfter(ledger, echoes);
+			await closeAfter(ledger, ctx, s, echoes);
 			echo(s, ctx, text, (await copyPair(ctx, echoes)).map((e) => e.line), "info");
 			return undefined;
 		}
@@ -539,6 +577,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			}
 			const echoes = [ledger.write(() => applyOne(ledger, cmd, heartbeatOf, ctx.cwd))];
 			await launchAfter(ledger, echoes);
+			await closeAfter(ledger, ctx, s, echoes);
 			receipt = (await copyPair(ctx, echoes))[0]!.line;
 		} catch (err) {
 			receipt = `could not apply "${text}": ${reason(err)}`;

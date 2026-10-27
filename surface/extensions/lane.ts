@@ -65,7 +65,7 @@ import { gateSession } from "../../gates/src/session";
 import { effectiveCeiling, isByHandLane, originalCeiling, type PairedState, pairedSpendMessage, pairedSpendStep, scanSpend, type Spend, wallMinutes } from "../src/ceiling";
 import { openScratchEntry } from "../src/errors";
 import { ensureScratchRoot } from "../src/scratch-root";
-import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor, laneDir, scratchCapMb, trainTaskLines } from "../src/launch";
+import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor, laneDir, scratchCapMb, trainTaskLines, withdrawnBy } from "../src/launch";
 import { ownerTasks } from "../src/merge-train";
 import {
 	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, laneDeaths, laneDiedShutdownBody,
@@ -277,18 +277,31 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 		}
 	};
 
-	/** Claim (or renew) the workload for this lane; a previous holder's lapsed lease is persisted first. */
+	/**
+	 * Claim (or renew) the workload for this lane; a previous holder's lapsed lease is persisted first. A workload Jo withdrew
+	 * (`withdraw <wl-…>`, PLAN wl-mv8s939084z1ts D6) is never claimed: a lane whose lease lapsed before the word would otherwise
+	 * renew it and hold off the close. The withdrawal read and the claim run in one write transaction, so the word's own
+	 * transaction lands wholly before (the claim is skipped) or wholly after (the word refuses the live lease).
+	 */
 	const claim = (ctx: Ctx, what: string): void => {
 		const s = gateSession(ctx, env);
 		if (!s.bound || laneState(ctx).released) return;
 		try {
 			const ledger = s.ledger();
-			const w = ledger.workload(s.workloadId!);
-			if (!w || w.status !== "open") return;
-			if (w.holder && w.holder !== s.laneId) recordLapsedLease(ledger, w, s.laneId);
-			const r = ledger.claimWorkload(w.id, { by: s.laneId, holder: s.laneId, leaseMs: leaseMs() });
-			if (!r.won) ctx.ui.notify(`${what}: workload ${w.id} is held by ${r.holder ?? "nobody"} under a live lease; this lane (${s.laneId}) does not hold it.`, "warning");
-			else keepScratchRoot(ctx, what, w.id);
+			const out = ledger.write(() => {
+				const w = ledger.workload(s.workloadId!);
+				if (!w || w.status !== "open") return null;
+				const withdrawn = withdrawnBy(ledger.entries(w.id), ledger.instructions(w.id));
+				if (withdrawn) return { id: w.id, withdrawn: withdrawn.instructionId } as const;
+				if (w.holder && w.holder !== s.laneId) recordLapsedLease(ledger, w, s.laneId);
+				return { id: w.id, claim: ledger.claimWorkload(w.id, { by: s.laneId, holder: s.laneId, leaseMs: leaseMs() }) } as const;
+			});
+			if (out === null) return;
+			if ("withdrawn" in out) {
+				ctx.ui.notify(`${what}: workload ${out.id} was withdrawn by Jo (instruction ${out.withdrawn}); this lane (${s.laneId}) does not claim it. Release with lane_release.`, "warning");
+			} else if (!out.claim.won) {
+				ctx.ui.notify(`${what}: workload ${out.id} is held by ${out.claim.holder ?? "nobody"} under a live lease; this lane (${s.laneId}) does not hold it.`, "warning");
+			} else keepScratchRoot(ctx, what, out.id);
 		} catch (err) {
 			warn(ctx, `${what}: the workload claim`, err);
 		}
