@@ -1235,7 +1235,8 @@ class Runner {
 				await this.recordLoad(name, call.sub === "full" ? null : call.file, label, start, startSnapshot);
 			} finally {
 				// The wrapper's reports reach the run dir on every outcome, a throwing call included (retention may delete the work dir); importWrapperReport logs its own failure and never throws, so an error in flight stays the one that propagates.
-				if (r !== null && callTimedOut(r)) this.importWrapperReport(`${name}.stuck.log`, true);
+				// A call that threw (r null) may have timed out; its stuck report is imported if it exists, and only a known timeout announces a missing one.
+				this.importWrapperReport(`${name}.stuck.log`, r !== null && callTimedOut(r));
 				this.importWrapperReport(`${name}.cleanup.log`, false);
 			}
 		}
