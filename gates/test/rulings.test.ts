@@ -5,7 +5,8 @@ import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import {
-	askJo, checkRulings, endedRulings, questionKind, type Ruling, type RulingFacts, type RulingId, STANDING_RULINGS, subjectProblem, type TrainSignoffFact, trainSignoffAction,
+	askJo, checkRulings, endedRulings, machineOptionSpelling, questionKind, RECORD_ANNOUNCE_OPTION, routineScreen, type Ruling, type RulingFacts, type RulingId, STANDING_RULINGS, subjectProblem,
+	type TrainSignoffFact, trainSignoffAction,
 } from "../src/rulings";
 import { raiseOrchestratorQuestion } from "../../surface/src/orchestrator-question";
 import { ESCALATION_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../../surface/src/types";
@@ -227,6 +228,126 @@ describe("train-signoff (PLAN wl-mvg8itbt0rz3ls D1; R3, R4): Jo's train word on 
 		const r = ask();
 		expect("raised" in r).toBe(true);
 		expect(l.questions(wl).map((q) => q.state)).toEqual(["open"]);
+	});
+});
+
+describe("routine-calls (PLAN wl-mvqwn80onq9hq8 D6; R10, R11): a lane's routine call is recorded and announced, nothing more", () => {
+	const OPTIONS = ["keep", "move", RECORD_ANNOUNCE_OPTION];
+	const RECORD = "keep the offset where it is";
+	const routine = (over: Partial<RulingFacts> = {}): RulingFacts => lane({ onPlanSlice: false, routineOn: () => true, ...over });
+	const decide = (facts: RulingFacts, o: { body?: string; record?: string; options?: string[]; recommend?: string | null; ended?: RulingId[] } = {}) =>
+		checkRulings(
+			{ body: o.body ?? "Leave the offset?", options: o.options ?? OPTIONS, subject: null, recommend: o.recommend === undefined ? RECORD_ANNOUNCE_OPTION : o.recommend, record: o.record ?? RECORD },
+			facts,
+			{ now: IN_WINDOW, ended: new Set(o.ended ?? []) },
+		);
+
+	test("the ruling is held: its source is Jo's in-mvqwmr95k54feo, its kind record-announce, ended by Jo's word only", () => {
+		const r = STANDING_RULINGS.find((x) => x.id === "routine-calls")!;
+		expect({ sources: r.sources, kinds: r.kinds, at: r.ends.at }).toEqual({ sources: ["in-mvqwmr95k54feo"], kinds: ["record-announce"], at: null });
+		const { l } = ledger();
+		endRuling(l, "routine-calls");
+		expect([...endedRulings(l.instructions(STANDING_WORKLOAD_ID))]).toEqual(["routine-calls"]);
+	});
+
+	test("record-announce is the kind only when the machinery recommends the option and the lane offered one of its own", () => {
+		expect(questionKind(OPTIONS, null, RECORD_ANNOUNCE_OPTION)).toBe("record-announce");
+		expect(questionKind(OPTIONS)).toBe("other");
+		expect(questionKind([RECORD_ANNOUNCE_OPTION], null, RECORD_ANNOUNCE_OPTION)).toBe("other");
+		expect(questionKind(["keep", "move"], null, RECORD_ANNOUNCE_OPTION)).toBe("other");
+		// a plan or merge question stays its own kind even with the option appended
+		expect(questionKind(["approve", "revise", RECORD_ANNOUNCE_OPTION], null, RECORD_ANNOUNCE_OPTION)).toBe("other");
+		expect(questionKind(["merged", "wait", RECORD_ANNOUNCE_OPTION], null, RECORD_ANNOUNCE_OPTION)).toBe("merge");
+	});
+
+	test("R10: decides record-and-announce for a lane off the plan slice while auto-apply is on, with an action that changes nothing", () => {
+		const d = decide(routine());
+		expect(d).toMatchObject({ ruling: "routine-calls", answer: RECORD_ANNOUNCE_OPTION });
+		expect(d!.action).toContain("change nothing");
+	});
+
+	test("R11: asked on the plan slice, from any asker but a lane, with auto-apply off or unread, without the machinery's recommend, or after Jo's end-ruling", () => {
+		expect(decide(routine({ onPlanSlice: true }))).toBeNull();
+		expect(decide(routine({ onPlanSlice: undefined }))).toBeNull();
+		expect(decide(routine({ routineOn: () => false }))).toBeNull();
+		expect(decide(routine({ routineOn: undefined }))).toBeNull();
+		for (const asker of ["orchestrator", "classifier", "train"] as const) expect(decide({ ...routine(), asker })).toBeNull();
+		expect(decide(routine(), { recommend: null })).toBeNull();
+		expect(decide(routine(), { ended: ["routine-calls"] })).toBeNull();
+	});
+
+	test("R11: the screen sends to Jo a body or record line naming a § A4 action, in either field", () => {
+		const named: [string, string][] = [
+			["force-push", "force-push the rebased branch"],
+			["force-push", "git push --force origin wl/x"],
+			["reset --hard", "git reset --hard HEAD~1"],
+			["branch or tag deletion", "git branch -D wl/old"],
+			["branch or tag deletion", "delete the stale branch"],
+			["branch or tag deletion", "git tag -d v1"],
+			["rm -rf", "rm -rf node_modules"],
+			["DROP", "DROP TABLE users"],
+			["DROP", "drop the cache table"],
+			["TRUNCATE", "TRUNCATE entries"],
+			["production database", "query the production database"],
+			["production database", "copy prod db rows"],
+			["teardown", "tear down the preview stack"],
+			["teardown", "teardown of the old env"],
+			["destroy", "destroy the bucket"],
+			["secret", "store the secret in the env file"],
+			["rotate", "rotate the token"],
+			["protected branch", "change the protected branch rule"],
+		];
+		for (const [action, text] of named) {
+			expect({ text, screen: routineScreen(text) }).toEqual({ text, screen: action });
+			expect({ text, body: decide(routine(), { body: text }), record: decide(routine(), { record: text }) }).toEqual({ text, body: null, record: null });
+		}
+		for (const text of ["keep the offset where it is", "drop the idea and keep the header", "leave the comment in place", "the branch name stays wl/x"]) {
+			expect({ text, screen: routineScreen(text) }).toEqual({ text, screen: null });
+		}
+	});
+
+	test("machineOptionSpelling catches the three machine options in any case or with any separators, and nothing else", () => {
+		for (const o of ["record-and-announce", "RECORD_AND_ANNOUNCE", "record and announce", "announce-only", "AnnounceOnly", "record.only"]) expect({ o, m: machineOptionSpelling(o) }).toEqual({ o, m: true });
+		for (const o of ["record", "announce", "keep", "record-and-move"]) expect({ o, m: machineOptionSpelling(o) }).toEqual({ o, m: false });
+	});
+
+	test("askJo: decided writes routine-recorded:, ruling-applied: and one notice in one write; no question or instruction", () => {
+		const { l, wl, sl } = ledger();
+		const r = askJo(l, { by: "lane-a", workloadId: wl, sliceId: sl, body: "Leave the offset?", options: OPTIONS, routine: { record: RECORD } }, { ...routine(), now: IN_WINDOW });
+		expect(r).toMatchObject({ decided: { ruling: "routine-calls", answer: RECORD_ANNOUNCE_OPTION } });
+		const entries = l.entries(wl);
+		expect(entries.map((e) => [e.body, e.created_by])).toEqual([
+			[`routine-recorded: ${sl} ${RECORD}`, ESCALATION_BY],
+			[`ruling-applied: routine-calls kind record-announce slice ${sl} answer ${RECORD_ANNOUNCE_OPTION}`, "lane-a"],
+		]);
+		expect("recorded" in r && r.recorded).toEqual({ entry: entries[0]!.id, notice: expect.stringMatching(/^msg-/) });
+		const notices = l.db.query<{ body: string }, [string]>("SELECT body FROM messages WHERE workload_id = ?1").all(wl);
+		expect(notices.map((n) => n.body)).toEqual([`notice: auto-answered ${sl} ${RECORD_ANNOUNCE_OPTION} (ruling routine-calls): ${RECORD}`]);
+		expect(l.questions(wl)).toEqual([]);
+		expect(l.instructions(wl)).toEqual([]);
+	});
+
+	test("askJo: the switch is read inside the write, and a record line over 120 characters is cut in the notice", () => {
+		const { l, wl, sl } = ledger();
+		let reads = 0;
+		const long = `${"x".repeat(150)}`;
+		askJo(l, { by: "lane-a", workloadId: wl, sliceId: sl, body: "Leave it?", options: OPTIONS, routine: { record: long } }, {
+			...routine({ routineOn: () => (reads++, true) }),
+			now: IN_WINDOW,
+		});
+		expect(reads).toBe(1);
+		const notice = l.db.query<{ body: string }, [string]>("SELECT body FROM messages WHERE workload_id = ?1").get(wl)!.body;
+		expect(notice).toBe(`notice: auto-answered ${sl} ${RECORD_ANNOUNCE_OPTION} (ruling routine-calls): ${"x".repeat(119)}…`);
+	});
+
+	test("askJo refuses a routine ask whose options lack the machinery's option or whose record line is not one line; nothing is written", () => {
+		const { l, wl, sl } = ledger();
+		const ask = (options: string[], record: string) => () => askJo(l, { by: "lane-a", workloadId: wl, sliceId: sl, body: "b", options, routine: { record } }, routine());
+		expect(ask(["keep", "move"], RECORD)).toThrow(`a routine ask carries the option ${RECORD_ANNOUNCE_OPTION}`);
+		expect(ask(OPTIONS, "a\nb")).toThrow("it has a line break; nothing was asked");
+		expect(ask(OPTIONS, "")).toThrow("it is empty; nothing was asked");
+		expect(l.entries(wl)).toEqual([]);
+		expect(l.questions(wl)).toEqual([]);
 	});
 });
 

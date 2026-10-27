@@ -1488,9 +1488,13 @@ export function planHaltedBody(instructionId: string): string {
 }
 /** The opening of the auto-start's notice text (after `notice: `), by which `prStakes` finds the notice whose delivery starts the hold. */
 export const PLAN_AUTO_STARTED = "plan started without your approve";
-/** The auto-start's notice (PLAN wl-mvfkv7llkp7nk0 § 3): the § 3 wording on `wl`, then the plan question's body. */
+/**
+ * The auto-start's notice (PLAN wl-mvfkv7llkp7nk0 § 3, PLAN wl-mvqwn80onq9hq8 D9): the § 3 wording on `wl` with both off
+ * words, `halt <wl>` for this plan and `ask-all` for every auto-start, then the plan question's body. A normal- or
+ * production-stakes plan starts this way, so the notice names neither.
+ */
 export function planAutoStartNoticeBody(wl: string, planBody: string): string {
-	return `${PLAN_AUTO_STARTED} on ${wl} (normal stakes, cross-lab review passed); it will not merge until ${HOLD_HOURS} h after your next message here; \`halt ${wl}\` stops it\n${planBody}`;
+	return `${PLAN_AUTO_STARTED} on ${wl} (cross-lab review passed); it will not merge until ${HOLD_HOURS} h after your next message here; \`halt ${wl}\` stops it; \`ask-all\` stops all auto-starts\n${planBody}`;
 }
 /**
  * The plan file and the review verdict file a plan question was checked on, each as its sha256 in hex (PLAN wl-mvg1vs0rhnu3gg
