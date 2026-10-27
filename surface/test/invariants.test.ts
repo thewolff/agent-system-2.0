@@ -5,18 +5,22 @@
 // silent 3 h (fires with a lane alive, not without); replay semantics; a hung lane with and without a
 // process; refusal evidence landing after as-of; failed process probes (a skip, never a dead lane or
 // a lull); the git invariants over a real temp checkout behind, ahead of, level with and diverged from
-// its origin; and the CLI (--json, --reviews, a bad argument, the checked-in fixture from the repo).
+// its origin; the CLI (--json, --reviews, a bad argument, the checked-in fixture from the repo); and auto-apply-audit (PLAN
+// wl-mvqwn80onq9hq8 D7): a missing result, a trip, a row today's classifier asks for, a torn row, a scratch root gone.
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
+import { routineVerdict } from "../../gates/src/routine";
 import { askJo } from "../../gates/src/rulings";
+import { scratchRootFor } from "../../gates/src/scratch";
 import { backupNamespace, copyProblem, Ledger } from "../../ledger/src/index";
 import { canonicalPath } from "../../ledger/src/locality";
 import { laneExitBody } from "../src/launch";
-import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
+import { ESCALATION_BY, MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
+import { ensureStandingWorkload } from "../src/identity";
 import { reservedStates } from "../src/errors";
 import { BACKUP_GAP_MS, check, gitIn, type Git, type Input, jsonLines, newestWrite, orchestratorsFromPs, parseArgs, type Probe, type PsDeps, renderTable, type Report, reservedView, reviewsLine, type Run } from "../scripts/invariants";
 import { AS_OF, buildFixture, LANE_RUNNER } from "./fixtures/invariants/build";
@@ -50,7 +54,7 @@ const noGit: Pick<Input, "repo" | "git" | "orchestrators"> = { repo: "/nonexiste
 function run(over: Partial<Input> = {}): Report {
 	return check({
 		db, asOf: AS_OF, replay: true, liveLanes: live(`${fixture.waiting.wl} ${fixture.waiting.lane}`), lanesDirOf: () => "/nonexistent/lanes", ...noGit,
-		backups: { dir: freshBackups, gapMs: BACKUP_GAP_MS }, ...over,
+		backups: { dir: freshBackups, gapMs: BACKUP_GAP_MS }, env: { HOME: "/nonexistent/home" }, ...over,
 	});
 }
 const keys = (r: Report) => r.findings.map((f) => f.key);
@@ -618,7 +622,7 @@ describe("ruling-miss (PLAN wl-mvfkv7llkp7nk0 § 1, R5)", () => {
 		const db = new Database(path, { readonly: true });
 		const noProbe: Probe<never> = { skipped: "not run" };
 		const misses = (asOf: string) =>
-			check({ db, asOf, replay: true, liveLanes: { found: new Set<string>() }, lanesDirOf: () => "/nonexistent", repo: "/nonexistent", git: null, orchestrators: () => noProbe, backups: { dir: "/nonexistent", gapMs: 30 * 60 * 60_000 } })
+			check({ db, asOf, replay: true, liveLanes: { found: new Set<string>() }, lanesDirOf: () => "/nonexistent", repo: "/nonexistent", git: null, orchestrators: () => noProbe, backups: { dir: "/nonexistent", gapMs: 30 * 60 * 60_000 }, env: { HOME: "/nonexistent" } })
 				.findings.filter((f) => f.invariant === "ruling-miss");
 		const after = misses("2026-10-20T12:05:00.000Z");
 		expect(after.map((f) => [f.key, f.workload])).toEqual([[`ruling-miss:${missed}`, wl]]);
@@ -648,10 +652,101 @@ describe("ruling-miss (PLAN wl-mvfkv7llkp7nk0 § 1, R5)", () => {
 		ledger.close();
 		const db = new Database(path, { readonly: true });
 		const noProbe: Probe<never> = { skipped: "not run" };
-		const misses = check({ db, asOf: "2026-10-20T12:05:00.000Z", replay: true, liveLanes: { found: new Set<string>() }, lanesDirOf: () => "/nonexistent", repo: "/nonexistent", git: null, orchestrators: () => noProbe, backups: { dir: "/nonexistent", gapMs: 30 * 60 * 60_000 } })
+		const misses = check({ db, asOf: "2026-10-20T12:05:00.000Z", replay: true, liveLanes: { found: new Set<string>() }, lanesDirOf: () => "/nonexistent", repo: "/nonexistent", git: null, orchestrators: () => noProbe, backups: { dir: "/nonexistent", gapMs: 30 * 60 * 60_000 }, env: { HOME: "/nonexistent" } })
 			.findings.filter((f) => f.invariant === "ruling-miss");
 		expect(misses.map((f) => f.key).sort()).toEqual([`ruling-miss:${forged}`, `ruling-miss:${unmarked}`].sort());
 		expect(misses.some((f) => f.key === `ruling-miss:${asked.raised}`)).toBe(false);
 		db.close();
+	});
+});
+
+describe("auto-apply-audit (PLAN wl-mvqwn80onq9hq8 D7, R16)", () => {
+	// A real HOME with the workload's scratch root, so today's routineVerdict re-runs each row's command as the gate did.
+	const home = realpathSync(mkdtempSync(join(tmpdir(), "inv-auto-home-")));
+	const env = { HOME: home, PATH: process.env.PATH };
+	let now = "2026-10-27T10:00:00.000Z";
+	const path = join(mkdtempSync(join(tmpdir(), "inv-auto-")), "ledger.db");
+	const ledger = Ledger.open(path, { create: true, backup: false, backupOnOpen: false, clock: () => now });
+	ensureStandingWorkload(ledger);
+	const open = () => ledger.openWorkload({ by: SURFACE_BY, brief: "w", stakes: "normal", mode: "autonomous" });
+	const wl = open();
+	const gone = open();
+	const closed = open();
+	mkdirSync(join(scratchRootFor(home, wl), "r"), { recursive: true });
+	const esc = (workloadId: string, body: string) => ledger.recordEntry({ by: ESCALATION_BY, workloadId, kind: "assumption", body });
+	const CONFINED = 'cd "$AS2_SCRATCH/r" && rm -rf build';
+	const applied = (workloadId: string, tc: string, command = CONFINED) => esc(workloadId, `auto-applied: scratch ${tc} by lane-a-1 cwd ${home} net no: ${command}`);
+	const ok = applied(wl, "tc-ok");
+	esc(wl, "auto-applied-result: tc-ok exit 0");
+	const lost = applied(wl, "tc-lost");
+	const tripped = applied(wl, "tc-trip");
+	esc(wl, "auto-applied-result: tc-trip exit 1");
+	const trip = esc("wl-orchestrator", "auto-apply-tripped: tc-trip seatbelt deny(1) file-write /etc/x");
+	const ghost = esc("wl-orchestrator", "auto-apply-tripped: tc-ghost write > PATCH /repos/o/r/issues/1 HTTP/1.1");
+	// Applied before a classifier tightening: today rm -rf of a path outside the scratch root asks.
+	const wide = applied(wl, "tc-wide", "rm -rf build");
+	esc(wl, "auto-applied-result: tc-wide exit 0");
+	const torn = esc(wl, "auto-applied: scratch tc-torn by lane-a-1 cwd");
+	// A lane's look-alike is no row of the gate's: never read, even with no result.
+	const forged = ledger.recordEntry({ by: "lane-a-1", workloadId: wl, kind: "assumption", body: `auto-applied: scratch tc-forged by lane-a-1 cwd ${home} net no: rm -rf /` });
+	// A workload whose scratch root is gone: (c) cannot be re-run there, and says so; a closed workload is not read.
+	const unjudged = applied(gone, "tc-gone");
+	esc(gone, "auto-applied-result: tc-gone exit 0");
+	applied(closed, "tc-closed");
+	ledger.closeWorkload(closed, { by: SURFACE_BY });
+	now = "2026-10-27T10:15:00.000Z";
+	const pending = applied(wl, "tc-new");
+	ledger.close();
+	const db = new Database(path, { readonly: true });
+	afterAll(() => db.close());
+	const audit = (asOf: string) =>
+		check({ db, asOf, replay: true, liveLanes: { found: new Set<string>() }, lanesDirOf: () => "/nonexistent", repo: "/nonexistent", git: null, orchestrators: () => noProbe, backups: { dir: "/nonexistent", gapMs: 30 * 60 * 60_000 }, env });
+	const r = audit("2026-10-27T10:20:00.000Z");
+	const found = (id: string) => r.findings.find((f) => f.key === `auto-apply-audit:${id}`);
+
+	test("the fixture's premise: today's classifier lets the confined command through and asks for the wide one", () => {
+		const ctx = { role: "lane" as const, cwd: home, env: { ...env, AGENT_SYSTEM_WORKLOAD_ID: wl, AS2_SCRATCH: scratchRootFor(home, wl) } };
+		expect(routineVerdict({ toolName: "bash", input: { command: CONFINED } }, ctx)).toMatchObject({ rule: "scratch" });
+		expect(routineVerdict({ toolName: "bash", input: { command: "rm -rf build" } }, ctx)).toHaveProperty("ask");
+	});
+
+	test("(a) a row with no result after 10 minutes is a finding; one with its result, or younger than 10 minutes, is not", () => {
+		const f = found(lost)!;
+		expect(f).toMatchObject({ invariant: "auto-apply-audit", workload: wl, since: "2026-10-27T10:00:00.000Z" });
+		expect(f.text).toContain("(a) no auto-applied-result: for tool call tc-lost after 20 min");
+		expect(f.text).toContain(`auto-applied ${lost} (scratch, tool call tc-lost, by lane-a-1, cwd ${home}, net no): ${CONFINED}`);
+		expect(f.query).toContain("routineVerdict");
+		expect(found(ok)).toBeUndefined();
+		expect(found(pending)).toBeUndefined();
+		// Replayed before the result's 10 minutes ran out, the row is not yet missing.
+		expect(audit("2026-10-27T10:09:00.000Z").findings.some((x) => x.key === `auto-apply-audit:${lost}`)).toBe(false);
+	});
+
+	test("(b) a row its trip names is a finding with the trip's evidence; a trip naming no row is one of its own", () => {
+		expect(found(tripped)!.text).toContain(`(b) tripped: ${trip} at 2026-10-27T10:00:00.000Z: tc-trip seatbelt deny(1) file-write /etc/x`);
+		expect(found(tripped)!.text).not.toContain("(a)");
+		expect(found(ghost)).toMatchObject({ workload: "wl-orchestrator", text: `trip ${ghost} names tool call tc-ghost, which no auto-applied: row records: tc-ghost write > PATCH /repos/o/r/issues/1 HTTP/1.1` });
+	});
+
+	test("(c) a row today's routineVerdict asks for is a finding naming the reason", () => {
+		const f = found(wide)!;
+		expect(f.text).toContain("(c) today's routineVerdict asks:");
+		expect(f.text).not.toContain("(a)");
+	});
+
+	test("a row that does not parse is a finding; a look-alike by a lane and a row on a closed workload are not read", () => {
+		expect(found(torn)!.text).toContain("does not parse as `auto-applied: <rule> <toolCallId> by <id> cwd <cwd> net <yes|no>: <command>`");
+		expect(found(forged)).toBeUndefined();
+		expect(r.findings.filter((f) => f.invariant === "auto-apply-audit").map((f) => f.workload).every((w) => w === wl || w === "wl-orchestrator")).toBe(true);
+	});
+
+	test("a workload whose scratch root is gone is skipped for (c), naming the rows, never a finding", () => {
+		expect(found(unjudged)).toBeUndefined();
+		expect(skipsOf(r, "auto-apply-audit")).toEqual([`(c) not re-run on ${gone}: its scratch root ${scratchRootFor(home, gone)} is not a directory now; rows ${unjudged}`]);
+	});
+
+	test("the table counts the invariant", () => {
+		expect(r.findings.filter((f) => f.invariant === "auto-apply-audit").map((f) => f.key).sort()).toEqual([lost, tripped, ghost, wide, torn].map((id) => `auto-apply-audit:${id}`).sort());
+		expect(renderTable(r)).toContain("ruling-miss=0 auto-apply-audit=5 stuck-review=0");
 	});
 });

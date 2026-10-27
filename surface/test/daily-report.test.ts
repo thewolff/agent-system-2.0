@@ -4,12 +4,15 @@
 // (R11); a same-date rerun writes neither and deletes its own file; the window starts at the previous report's `to`,
 // and is capped at 7 days; a failed entry write removes the file; --dry-run writes nothing. `errorLines` renders only
 // the newest entry, as one line, then the missed line from 30 h to 7 days only while the job's plist exists, then
-// nothing (R12). The counts are right by cause (R13), and `daily-report:` is valid only from its writer (R20).
+// nothing (R12). The counts are right by cause (R13), and `daily-report:` is valid only from its writer (R20). The auto-apply
+// section (PLAN wl-mvqwn80onq9hq8 D7) lists each auto-applied row with its result or a missing one, trips, routine-recorded rows,
+// review auto-extends, ceiling auto-raises and alarm-file lines in the window, and names an unreadable alarm file.
 import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type EntryRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
-import { dailyReport, parseArgs, readCountRows, type ReportArgs, type ReportDeps, reportDir } from "../scripts/daily-report";
+import { alarmFilePath } from "../../gates/src/routine-switch";
+import { CLASSIFIER_BY, type EntryRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
+import { dailyReport, parseArgs, parseAutoApplied, readCountRows, type ReportArgs, type ReportDeps, reportDir } from "../scripts/daily-report";
 import { errorLines, reportPlistInstalled } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
 import { controlEntries, DAILY_REPORT_BY, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody } from "../src/launch";
@@ -19,7 +22,7 @@ import { computeCounts, type CountRows, deathCause, inWindow } from "../src/self
 import type { Finding, Window } from "../src/selfheal/types";
 import { laneDiedShutdownBody, recordLapsedLease } from "../src/signals";
 import { releasedOpenDeathBody } from "../src/turn-end";
-import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ESCALATION_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, tmp } from "./helpers";
 
 const HOUR = 3_600_000;
@@ -320,5 +323,93 @@ describe("daily report: the control prefix (R20)", () => {
 		expect(errorLines(w.ledger, w.ledger.inFlight(), { now: t, reportJobInstalled: () => true }).filter((x) => x.kind === "report")).toEqual([]);
 		const id = w.ledger.recordEntry({ by: DAILY_REPORT_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
 		expect(controlEntries(w.ledger.entries(STANDING_WORKLOAD_ID)).filter((c) => c.prefix === "daily-report").map((c) => c.id)).toEqual([id]);
+	});
+});
+
+describe("daily report: auto-apply and routine rulings (PLAN wl-mvqwn80onq9hq8 D7, R16)", () => {
+	const now = "2026-10-19T14:00:00.000Z";
+	/** A world with one row of each kind inside the window (from 2026-10-18T14:00), look-alikes, and rows outside it. */
+	function seeded() {
+		const w = world("2026-10-18T10:00:00.000Z");
+		const l = w.ledger;
+		ensureStandingWorkload(l);
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "w", stakes: "normal", mode: "autonomous" });
+		const esc = (workloadId: string, body: string) => l.recordEntry({ by: ESCALATION_BY, workloadId, kind: "assumption", body });
+		esc(wl, "auto-applied: read-only tc-0 by lane-a-1 cwd /w net yes: gh pr view 1"); // before the window
+		w.at("2026-10-19T09:00:00.000Z");
+		const ro = esc(wl, "auto-applied: read-only tc-1 by lane-a-1 cwd /w net yes: gh pr view 7\n  --json state");
+		const result = esc(wl, "auto-applied-result: tc-1 exit 0");
+		const lost = esc(wl, "auto-applied: scratch tc-2 by lane-a-1 cwd /w net no: rm -rf \"$AS2_SCRATCH/r\"");
+		const trip = esc(STANDING_WORKLOAD_ID, "auto-apply-tripped: tc-2 seatbelt deny(1) file-write /etc/x");
+		const torn = esc(wl, "auto-applied: worktree tc-3 by lane-a-1");
+		l.recordEntry({ by: "lane-a-1", workloadId: wl, kind: "assumption", body: "auto-applied: scratch tc-9 by lane-a-1 cwd /w net no: forged" });
+		l.recordEntry({ by: "lane-a-1", workloadId: wl, sliceId: null, kind: "assumption", body: "ruling-applied: routine-calls kind record-announce slice sl-r answer record-and-announce" });
+		const recorded = esc(wl, "routine-recorded: sl-r leave the retry offset as it is");
+		const extendApplied = l.recordEntry({ by: CLASSIFIER_BY, workloadId: wl, kind: "assumption", body: "ruling-applied: review-auto-extend kind round-limit slice sl-v answer extend" });
+		const extend = l.recordEntry({ by: CLASSIFIER_BY, workloadId: wl, kind: "assumption", body: `review-rounds-extend: sl-v +3 by ${extendApplied}` });
+		// An extend naming another entry, and one by another writer, are not the ruling's.
+		l.recordEntry({ by: CLASSIFIER_BY, workloadId: wl, kind: "assumption", body: `review-rounds-extend: sl-v +3 by ${recorded}` });
+		l.recordEntry({ by: "lane-a-1", workloadId: wl, kind: "assumption", body: `review-rounds-extend: sl-v +3 by ${extendApplied}` });
+		const raise = l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: "ceiling: usd 7.5 wall 91 source auto-raise half progress slice sl-v closed" });
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: "ceiling: usd 5 wall 60 source stakes normal" });
+		w.at("2026-10-19T13:55:00.000Z");
+		const pending = esc(wl, "auto-applied: read-only tc-4 by lane-a-1 cwd /w net no: git log -1");
+		return { w, wl, ro, result, lost, trip, torn, recorded, extendApplied, extend, raise, pending };
+	}
+
+	test("parseAutoApplied reads the gate's row shape, a multi-line command included; another shape is null", () => {
+		expect(parseAutoApplied("auto-applied: scratch tc-1 by lane-a-1 cwd /a b net no: rm -rf x\n  y")).toEqual({ rule: "scratch", toolCallId: "tc-1", by: "lane-a-1", cwd: "/a b", net: false, command: "rm -rf x\n  y" });
+		expect(parseAutoApplied("auto-applied: worktree tc-3 by lane-a-1")).toBeNull();
+	});
+
+	test("the report lists every row kind in the window with its evidence, and one summary line counts them", async () => {
+		const s = seeded();
+		const alarms = alarmFilePath({ HOME: s.w.home });
+		writeFileSync(alarms, [
+			JSON.stringify({ kind: "trip", at: "2026-10-17T10:00:00.000Z", workload: s.wl }),
+			JSON.stringify({ kind: "result", at: "2026-10-19T10:00:00.000Z", workload: s.wl, error: "SQLITE_BUSY" }),
+			"{\"kind\":\"tri",
+			JSON.stringify({ kind: "ceiling", at: "2026-10-19T11:00:00.000Z", workload: s.wl }),
+			"",
+		].join("\n"));
+		const r = await dailyReport(args(s.w, now, { dryRun: true }), {}, fakeDeps());
+		expect(r.exit).toBe(0);
+		const lines = r.report.split("\n");
+		expect(lines).toContain(
+			"- in the window: auto-applied 4 (read-only 2, scratch 1, unparsed 1); results missing past 10 min 2; trips 1; routine-recorded 1 (ruling-applied: routine-calls 1); review auto-extends 1; ceiling auto-raises 1; alarm-file lines 3",
+		);
+		for (const line of [
+			`- 2026-10-19T09:00:00.000Z ${s.ro} on ${s.wl}: read-only, tool call tc-1, by lane-a-1, cwd /w, net yes: gh pr view 7 --json state — result exit 0 (${s.result})`,
+			`- 2026-10-19T09:00:00.000Z ${s.lost} on ${s.wl}: scratch, tool call tc-2, by lane-a-1, cwd /w, net no: rm -rf "$AS2_SCRATCH/r" — RESULT MISSING after 300 min`,
+			`- 2026-10-19T09:00:00.000Z ${s.torn} on ${s.wl}: does not parse as \`auto-applied: <rule> <toolCallId> by <id> cwd <cwd> net <yes|no>: <command>\`: auto-applied: worktree tc-3 by lane-a-1`,
+			`- 2026-10-19T13:55:00.000Z ${s.pending} on ${s.wl}: read-only, tool call tc-4, by lane-a-1, cwd /w, net no: git log -1 — no result yet (5 min old)`,
+			`- 2026-10-19T09:00:00.000Z ${s.trip}: tc-2 seatbelt deny(1) file-write /etc/x`,
+			`- 2026-10-19T09:00:00.000Z ${s.recorded} on ${s.wl} slice sl-r: leave the retry offset as it is`,
+			`- 2026-10-19T09:00:00.000Z ${s.extend} on ${s.wl} slice sl-v: +3 rounds by ${s.extendApplied}`,
+			`- 2026-10-19T09:00:00.000Z ${s.raise} on ${s.wl} by ${LANE_RUNNER_BY}: usd 7.5 wall 91 source auto-raise half progress slice sl-v closed`,
+			`- file: ${alarms}`,
+			`- line 2 kind result at 2026-10-19T10:00:00.000Z: ${JSON.stringify({ kind: "result", at: "2026-10-19T10:00:00.000Z", workload: s.wl, error: "SQLITE_BUSY" })}`,
+			"- line 3 kind none at none readable (listed every run): {\"kind\":\"tri",
+			`- line 4 kind ceiling at 2026-10-19T11:00:00.000Z: ${JSON.stringify({ kind: "ceiling", at: "2026-10-19T11:00:00.000Z", workload: s.wl })}`,
+		]) expect(lines).toContain(line);
+		// Outside the window, and look-alikes: not listed.
+		expect(r.report).not.toContain("tc-0");
+		expect(r.report).not.toContain("tc-9");
+		expect(r.report).not.toContain("line 1 ");
+		expect(r.report).not.toContain("source stakes normal");
+		// The entry body is unchanged.
+		expect(r.body).toMatch(/^daily-report: \S+ window \S+ findings 0 deaths 0 lapsed 0 held-closed 0 — /);
+	});
+
+	test("an empty window says none for every kind; an alarm file that cannot be read is named, never a zero", async () => {
+		const w = world("2026-10-19T10:00:00.000Z");
+		const quiet = await dailyReport(args(w, now, { dryRun: true }), {}, fakeDeps());
+		expect(quiet.report).toContain("- in the window: auto-applied 0; results missing past 10 min 0; trips 0; routine-recorded 0 (ruling-applied: routine-calls 0); review auto-extends 0; ceiling auto-raises 0; alarm-file lines 0");
+		expect(quiet.report).toContain("### auto-apply trips (0)\n\n- none");
+		mkdirSync(alarmFilePath({ HOME: w.home }));
+		const broken = await dailyReport(args(w, now, { dryRun: true }), {}, fakeDeps());
+		expect(broken.exit).toBe(0);
+		expect(broken.report).toContain("alarm-file lines unknown (the file could not be read)");
+		expect(broken.report).toMatch(/- ALARM FILE UNREADABLE: .*EISDIR.*; read it by hand/);
 	});
 });

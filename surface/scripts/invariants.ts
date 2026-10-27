@@ -36,6 +36,7 @@
 // | stale-reserved | a `reserved-request` entry older than 30 min that `reservedStates` (surface/src/errors.ts) still finds `waiting`: no `approve <id>` / `deny <id>` instruction, no `reserved-withdrawn: <id>`, its raising lane still holds the workload (a `lane-stopped` request is closed, not stale), and no later request repeats it | `stale-reserved:<entry>` |
 // | stuck-question | a question open for more than 30 min | `stuck-question:<q>` |
 // | ruling-miss | a question open as of as-of, raised at or after the ledger's first `ruling-applied:` entry landed by as-of (the activation receipt: only `askJo`, gates/src/rulings.ts, writes one; with none, nothing is selected), that an active standing ruling would have decided (`checkRulings` replayed as of its raise: its asker read from its writer — the orchestrator surface on the standing workload with its `question-about:` subject, the merge train, the classifier for a question its `review-park:` / `review-limit:` entry names, else the lane — with the workload's builders, stakes and train flag then, and Jo's `end-ruling` words by then): a raise path that bypassed `askJo`. A question whose every option is a `provider/model` id is never one: its row does not carry the declared subject. Nor is a NOW question, one a valid `now:` control entry (ESCALATION_BY's, `nowMarks`) names: it skips the rulings by design, and a look-alike by anyone else exempts nothing | `ruling-miss:<q>` |
+// | auto-apply-audit | PLAN wl-mvqwn80onq9hq8 D7: an ESCALATION_BY `auto-applied:` row on an open workload where (a) no `auto-applied-result:` for its tool call landed within 10 min, (b) an `auto-apply-tripped:` names its tool call, or (c) its command, re-run through today's `routineVerdict` (gates/src/routine.ts) with the row's cwd, its writer's role (`lane-…` a lane, else a hand), the workload's scratch root under HOME (read as it is now, also in replay) and, for a lane, the workload's `worktree:` entry, now asks (a classifier tightened since); also a row that does not parse, and a trip naming no `auto-applied:` row at all. Escaped writes are (b)'s, never (c)'s. (c) is skipped, naming the rows, for a workload whose scratch root is gone | `auto-apply-audit:<auto-applied entry>` (`auto-apply-audit:<trip entry>` for a trip with no row) |
 // | stuck-review | a `hand-spawn: … review yes` with no `hand-settled:` after 45 min while any lane on the workload is alive | `stuck-review:<token>` |
 // | provider-refusal-loop | 2+ `lane-exit:` on one workload within 30 min, each with refusal evidence (`usage polic`, `non-retryable`, `refusal`) in ledger entries/messages from 2 min before to 5 min after the exit (never past as-of), or, for `outcome error`, in the final `prompt_result` of the lane's rpc log `lane-<n>.jsonl` (read as it is now) | `provider-refusal-loop:<wl>:<first lane>` |
 // | silent-orchestrator | no `wl-orchestrator` entry for 2 h while any lane process is alive; the train tick's rows there (MERGE_TRAIN_BY: its boards' skips, notices and cutover, PLAN wl-mvbjiettjrfpxc D10) are not the orchestrator's | `silent-orchestrator:<last entry id>` |
@@ -73,13 +74,18 @@ import { checkRulings, endedRulings, nowMarks, type RulingFacts } from "../../ga
 import { BACKUP_DEFAULTS, BACKUP_NAME, backupNamespace, copyProblem, processAlive } from "../../ledger/src/index";
 import type { EntryKind, EntryRow, InstructionRow, RoutingRow, Stakes, WorkloadStatusRow } from "../../ledger/src/index";
 import { assertNotLiveLedgerUnderTest, canonicalPath, defaultLedgerPath, homeDir } from "../../ledger/src/locality";
+import { routineVerdict } from "../../gates/src/routine";
+import { MISSING_RESULT_MS } from "../../gates/src/routine-switch";
+import { ownScratchRoot, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
+import { LANE_ENV, ROLE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { type ReservedLedgerView, reservedStates } from "../src/errors";
-import { laneDir } from "../src/launch";
+import { type ControlEntry, controlEntries, laneDir } from "../src/launch";
 import { trainPrs } from "../src/merge-train";
-import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ESCALATION_BY, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { type AutoApplied, parseAutoApplied } from "./daily-report";
 
 export const INVARIANTS = [
-	"dead-lane", "silent-lane", "orphan-hand", "no-independent-lab", "stale-reserved", "stuck-question", "ruling-miss", "stuck-review",
+	"dead-lane", "silent-lane", "orphan-hand", "no-independent-lab", "stale-reserved", "stuck-question", "ruling-miss", "auto-apply-audit", "stuck-review",
 	"provider-refusal-loop", "silent-orchestrator", "checkout-behind-main", "process-older-than-head", "ff-lull", "stale-backup",
 ] as const;
 export type Invariant = (typeof INVARIANTS)[number];
@@ -137,6 +143,11 @@ export interface Input {
 	orchestrators: () => Probe<OrchestratorProcess[]>;
 	/** The ledger's scheduled-copy directory, and how far the newest write may run ahead of the newest copy. */
 	backups: { dir: string; gapMs: number };
+	/**
+	 * The environment auto-apply-audit (c) re-runs a row's command in, as `laneEnv` builds a lane's from the starter's: its
+	 * HOME places the workload's scratch root, and the role, workload, lane and `AS2_SCRATCH` are written over it per row.
+	 */
+	env: Record<string, string | undefined>;
 }
 
 const MIN = 60_000;
@@ -177,6 +188,11 @@ const RULING_MISS_SQL = `SELECT q.id, q.workload_id, q.body, q.options, q.create
     AND q.created_at >= (SELECT min(a.created_at) FROM entries a WHERE a.body LIKE 'ruling-applied: %' AND a.created_at <= :asOf)
     AND (q.state = 'open' OR (SELECT i.created_at FROM instructions i WHERE i.id = q.resolved_by) > :asOf)
   ORDER BY q.created_at`;
+/** auto-apply-audit: ESCALATION_BY's auto-apply rows on every workload (trips sit on the standing one), with each row's workload status. */
+const AUTO_APPLY_SQL = `SELECT e.id, e.workload_id, e.slice_id, e.kind, e.body, e.created_by, e.created_at, w.status FROM entries e JOIN workloads w ON w.id = e.workload_id
+  WHERE e.kind = 'assumption' AND e.created_by = :writer AND e.created_at <= :asOf
+    AND (substr(e.body, 1, 13) = 'auto-applied:' OR substr(e.body, 1, 20) = 'auto-applied-result:' OR substr(e.body, 1, 19) = 'auto-apply-tripped:')
+  ORDER BY e.created_at, e.rowid`;
 const NEAR_SQL = `SELECT body FROM entries WHERE workload_id = :wl AND created_at BETWEEN :from AND :to
   UNION ALL SELECT body FROM messages WHERE workload_id = :wl AND created_at BETWEEN :from AND :to`;
 const ORCH_SQL = `SELECT id, created_at FROM entries WHERE workload_id = :wl AND created_by <> :tick AND created_at <= :asOf ORDER BY created_at DESC LIMIT 1`;
@@ -517,6 +533,86 @@ export function check(input: Input): Report {
 			query: `${misses.shown} -- then gates/src/rulings.ts checkRulings over the workload's entries, routings and instructions up to the question's created_at`,
 		});
 	}
+
+	// ---- 5c. auto-apply-audit (PLAN wl-mvqwn80onq9hq8 D7) ------------------------------------------------
+	// Each ESCALATION_BY `auto-applied:` row on an open workload: (a) its result landed within MISSING_RESULT_MS, (b) no trip
+	// names its tool call, and (c) today's classifier, re-run on its command, still lets it through. A trip naming no row is a
+	// finding of its own. Rows and trips are matched by tool call id; look-alikes by any other writer are not read.
+	const auto = run<Entry & { status: string }>(AUTO_APPLY_SQL, { ":writer": ESCALATION_BY, ":asOf": asOf });
+	const autoStatus = new Map(auto.rows.map(r => [r.id, r]));
+	const autoControl = controlEntries(auto.rows as EntryRow[]);
+	const callOf = (c: ControlEntry) => c.rest.split(/\s+/)[0] ?? "";
+	const resultFor = new Map<string, ControlEntry>();
+	const tripsFor = new Map<string, ControlEntry[]>();
+	const appliedCalls = new Set<string>();
+	for (const c of autoControl) {
+		if (c.prefix === "auto-applied-result") {
+			if (!resultFor.has(callOf(c))) resultFor.set(callOf(c), c);
+		} else if (c.prefix === "auto-apply-tripped") tripsFor.set(callOf(c), [...(tripsFor.get(callOf(c)) ?? []), c]);
+		else if (c.prefix === "auto-applied") {
+			const a = parseAutoApplied(c.body);
+			if (a) appliedCalls.add(a.toolCallId);
+		}
+	}
+	const autoQuery = `${auto.shown} -- then: per auto-applied row, its tool call's auto-applied-result: and auto-apply-tripped:, and gates/src/routine.ts routineVerdict on its command`;
+	const cut = (s: string, n = 120) => {
+		const t = s.replace(/\s+/g, " ").trim();
+		return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+	};
+	/** (c): today's verdict on a row's command in the env a lane or hand of `wl` has, or why it cannot be re-run here. */
+	const reverdict = (wl: string, a: AutoApplied): { ask: string } | { ok: true } | { unjudged: string } => {
+		const lane = a.by.startsWith("lane-");
+		const env: Record<string, string | undefined> = { ...input.env, [ROLE_ENV]: lane ? "lane" : "hand", [WORKLOAD_ENV]: wl, [LANE_ENV]: lane ? a.by : undefined };
+		try {
+			env[SCRATCH_ENV] = scratchRootFor(homeDir(input.env), wl);
+		} catch (e) {
+			return { unjudged: `no scratch root can be named (${e instanceof Error ? e.message : String(e)})` };
+		}
+		if (ownScratchRoot(env) === null) return { unjudged: `its scratch root ${env[SCRATCH_ENV]} is not a directory now` };
+		const worktree = lane ? controlEntries((byWorkload.get(wl) ?? []) as EntryRow[]).findLast(c => c.prefix === "worktree")?.rest : undefined;
+		const v = routineVerdict({ toolName: "bash", input: { command: a.command } }, { role: lane ? "lane" : "hand", cwd: a.cwd, env, ...(worktree ? { worktreeRoot: worktree } : {}) });
+		return "ask" in v ? { ask: v.ask } : { ok: true };
+	};
+	const unjudged = new Map<string, { why: string; ids: string[] }>();
+	for (const c of autoControl) {
+		if (c.prefix !== "auto-applied") continue;
+		const row = autoStatus.get(c.id)!;
+		if (row.status !== "open") continue;
+		const a = parseAutoApplied(c.body);
+		if (!a) {
+			findings.push({
+				key: `auto-apply-audit:${c.id}`, invariant: "auto-apply-audit", workload: row.workload_id, since: c.createdAt,
+				text: `auto-applied ${c.id} does not parse as \`auto-applied: <rule> <toolCallId> by <id> cwd <cwd> net <yes|no>: <command>\`, so its result, trips and today's verdict cannot be matched: ${cut(c.body)}`,
+				query: autoQuery,
+			});
+			continue;
+		}
+		const why: string[] = [];
+		if (!resultFor.has(a.toolCallId) && c.createdAt <= ago(MISSING_RESULT_MS)) why.push(`(a) no auto-applied-result: for tool call ${a.toolCallId} after ${age(c.createdAt)}`);
+		for (const t of tripsFor.get(a.toolCallId) ?? []) why.push(`(b) tripped: ${t.id} at ${t.createdAt}: ${cut(t.rest)}`);
+		const v = reverdict(row.workload_id, a);
+		if ("ask" in v) why.push(`(c) today's routineVerdict asks: ${v.ask}`);
+		else if ("unjudged" in v) {
+			const u = unjudged.get(row.workload_id) ?? { why: v.unjudged, ids: [] };
+			u.ids.push(c.id);
+			unjudged.set(row.workload_id, u);
+		}
+		if (why.length === 0) continue;
+		findings.push({
+			key: `auto-apply-audit:${c.id}`, invariant: "auto-apply-audit", workload: row.workload_id, since: c.createdAt,
+			text: `auto-applied ${c.id} (${a.rule}, tool call ${a.toolCallId}, by ${a.by}, cwd ${a.cwd}, net ${a.net ? "yes" : "no"}): ${cut(a.command)} — ${why.join("; ")}.`,
+			query: autoQuery,
+		});
+	}
+	for (const c of autoControl) {
+		if (c.prefix !== "auto-apply-tripped" || appliedCalls.has(callOf(c))) continue;
+		findings.push({
+			key: `auto-apply-audit:${c.id}`, invariant: "auto-apply-audit", workload: autoStatus.get(c.id)!.workload_id, since: c.createdAt,
+			text: `trip ${c.id} names tool call ${callOf(c) || "(none)"}, which no auto-applied: row records: ${cut(c.rest)}`,
+			query: autoQuery,
+		});
+	}
+	for (const [wl, u] of unjudged) skip("auto-apply-audit", `(c) not re-run on ${wl}: ${u.why}; rows ${u.ids.join(", ")}`);
 
 	// ---- 7. provider-refusal-loop ---------------------------------------------------------------
 	for (const [wl, entries] of byWorkload) {
@@ -932,6 +1028,7 @@ export function main(argv: string[]): number {
 			git: available("git") ? gitIn(args.repo) : null,
 			orchestrators: () => orchestratorsFromPs(args.repo),
 			backups: { dir: join(dirname(canonical), "backups", backupNamespace(canonical)), gapMs: args.backupGapMs },
+			env: process.env,
 		});
 		if (args.reviews) console.log(reviewsLine(report));
 		else if (args.json) {
