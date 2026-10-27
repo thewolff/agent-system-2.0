@@ -1674,6 +1674,9 @@ describe("lane script: readiness in two phases, both capped by the reservation's
 		expect(laneScript.readyWindow(clock(null))).toEqual({ phase: "startup", deadline: T + 180_000, cut: false });
 		expect(laneScript.readyWindow(clock(T + 60_000))).toEqual({ phase: "claim", deadline: T + 64_000, cut: false });
 		expect(laneScript.readyWindow(clock(T + 178_500))).toEqual({ phase: "claim", deadline: T + 180_000, cut: true });
+		// the boundary: a claim window that ends exactly at the expiry is whole; one millisecond later it is cut there
+		expect(laneScript.readyWindow(clock(T + 176_000))).toEqual({ phase: "claim", deadline: T + 180_000, cut: false });
+		expect(laneScript.readyWindow(clock(T + 176_001))).toEqual({ phase: "claim", deadline: T + 180_000, cut: true });
 		// a delayed prepare moves the spawn, never the expiry: the startup window is the expiry minus the spawn
 		expect(laneScript.readyStallReason({ ...clock(null, 10_000), spawnedAt: T + 3_250 })).toBe(
 			`never-ready (startup): no ready frame from omp by the reservation's lease expiry 2026-10-27T10:00:10.000Z, 6750 ms after the spawn at 2026-10-27T10:00:03.250Z`,
@@ -1688,16 +1691,52 @@ describe("lane script: readiness in two phases, both capped by the reservation's
 	});
 
 	test("readyStep: the claim is accepted only before the expiry, checked at acceptance; a stall is the window's deadline passing without it", () => {
+		// a cut claim window: nothing in waits until the expiry, never killed before it, and stalls at it
 		const c = clock(T + 178_500);
 		expect(laneScript.readyStep(c, T + 179_999, true, true)).toBe("ready");
 		expect(laneScript.readyStep(c, T + 180_000, true, true)).toBe("expired");
 		expect(laneScript.readyStep(c, T + 185_000, true, true)).toBe("expired");
 		expect(laneScript.readyStep(c, T + 179_999, true, false)).toBe("wait");
+		expect(laneScript.readyStep(c, T + 179_999, false, false)).toBe("wait");
 		expect(laneScript.readyStep(c, T + 180_000, true, false)).toBe("stalled");
 		expect(laneScript.readyStep(c, T + 180_000, false, false)).toBe("stalled");
+		// an uncut claim window: the stall is READY_MS after the ready frame, well before the expiry
+		const u = clock(T + 60_000);
+		expect(laneScript.readyStep(u, T + 63_999, false, false)).toBe("wait");
+		expect(laneScript.readyStep(u, T + 63_999, true, false)).toBe("wait");
+		expect(laneScript.readyStep(u, T + 64_000, false, false)).toBe("stalled");
+		expect(laneScript.readyStep(u, T + 64_000, true, false)).toBe("stalled");
+		expect(laneScript.readyStep(u, T + 63_999, true, true)).toBe("ready");
+		// a claim and model check that are in are accepted while the reservation's lease holds, even past the claim window
+		// (the expiry is the acceptance bound; the claim window only times the stall)
+		expect(laneScript.readyStep(u, T + 64_000, true, true)).toBe("ready");
+		expect(laneScript.readyStep(u, T + 179_999, true, true)).toBe("ready");
+		expect(laneScript.readyStep(u, T + 180_000, true, true)).toBe("expired");
 		// startup: a slow start past READY_MS from the spawn still waits until the expiry
 		expect(laneScript.readyStep(clock(null), T + 60_000, false, false)).toBe("wait");
+		expect(laneScript.readyStep(clock(null), T + 179_999, false, false)).toBe("wait");
 		expect(laneScript.readyStep(clock(null), T + 180_000, false, false)).toBe("stalled");
+		// a claim in at the expiry with no ready frame read is refused too, not accepted
+		expect(laneScript.readyStep(clock(null), T + 179_999, true, true)).toBe("ready");
+		expect(laneScript.readyStep(clock(null), T + 180_000, true, true)).toBe("expired");
+	});
+
+	test("claim cut at the expiry: `ready` 2 s before the reservation's lease expiry leaves a claim window cut there, not the 4 s one (explicit clocks, no wall-clock race)", () => {
+		const expiryAt = T + 10_000;
+		const readyFrameAt = expiryAt - 2000;
+		const c = { expiryAt, readyFrameAt, readyMs: 4000 };
+		expect(laneScript.readyWindow(c)).toEqual({ phase: "claim", deadline: expiryAt, cut: true });
+		// the kill is never before the expiry and is at it
+		expect(laneScript.readyStep(c, expiryAt - 1, false, false)).toBe("wait");
+		expect(laneScript.readyStep(c, expiryAt, false, false)).toBe("stalled");
+		const reason = laneScript.readyStallReason({ ...c, spawnedAt: T });
+		const m = /^never-ready \(claim\): no claim by the reservation's lease expiry (\S+), (\d+) ms after omp's ready frame at (\S+) \(the 4s claim window cut at the expiry\)$/.exec(reason);
+		if (m === null) throw new Error(`not a cut claim stall: ${reason}`);
+		expect(m[1]).toBe(new Date(expiryAt).toISOString());
+		expect(m[3]).toBe(new Date(readyFrameAt).toISOString());
+		expect(Number(m[2])).toBe(expiryAt - readyFrameAt);
+		expect(Number(m[2])).toBeLessThan(4000);
+		expect(laneScript.readyWindowText(c)).toBe(`within 2000 ms, the 4s claim window cut at the reservation's lease expiry ${new Date(expiryAt).toISOString()}`);
 	});
 
 	test("reservationExpiry: a missing or unreadable holder_lease_until is refused naming the row, never defaulted", () => {
@@ -1763,25 +1802,6 @@ describe("lane script: readiness in two phases, both capped by the reservation's
 		const prepareMs = Date.parse(m[3]!) - reservedAt;
 		expect(prepareMs).toBeGreaterThanOrEqual(3000);
 		expect(Number(m[2])).toBe(leaseMs - prepareMs);
-		expect(Date.parse(exit.createdAt)).toBeGreaterThanOrEqual(Date.parse(expiry));
-	}, 60_000);
-
-	test("claim cut at the expiry: `ready` 2 s before the reservation's lease expiry leaves a claim window cut there, not the 4 s one", async () => {
-		const r = makeRoot();
-		const { wl } = openWorkload(r);
-		setScript(r, { claim: false, steps: [] });
-		const { laneId, expiry } = reserveWithLease(r, wl, 10_000);
-		r.env.FAKE_OMP_READY_AT_MS = String(Date.parse(expiry) - 2000);
-		await runLane(r, wl, laneId);
-		const { reason, exit } = stallOf(r, wl, laneId);
-		expect(exit.rest).toMatch(/^code \S+ signal SIGKILL outcome never-ready \(claim\)$/);
-		const m = /^never-ready \(claim\): no claim by the reservation's lease expiry (\S+), (\d+) ms after omp's ready frame at (\S+) \(the 4s claim window cut at the expiry\)$/.exec(reason);
-		if (m === null) throw new Error(`not a cut claim stall: ${reason}`);
-		expect(m[1]).toBe(expiry);
-		const readyAt = Date.parse(m[3]!);
-		expect(readyAt).toBeGreaterThanOrEqual(Date.parse(expiry) - 2000);
-		expect(Number(m[2])).toBe(Date.parse(expiry) - readyAt);
-		expect(Number(m[2])).toBeLessThan(4000);
 		expect(Date.parse(exit.createdAt)).toBeGreaterThanOrEqual(Date.parse(expiry));
 	}, 60_000);
 

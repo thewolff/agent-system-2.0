@@ -29,13 +29,15 @@ The train tick needs no reinstall: it runs `surface/scripts/train-tick.ts` from 
 
 ## PR 267 train repair
 
-The runner's readiness has two phases, both counted from the child spawn and not before
-repository/profile preparation: startup, from the spawn to OMP's `ready` frame, bounded by the
-reservation's lease expiry (`workloads.holder_lease_until`), and claim, from the `ready` frame
-for `READY_MS`, cut at that expiry. A stall exits as `never-ready (startup)` or
-`never-ready (claim)`; a missing or unreadable expiry is refused before any OMP spawns, never
-defaulted. Preparation may block on git before OMP exists;
-it must not consume the child's readiness allowance. Ceiling thresholds and the pre-prompt
+The runner's readiness has two phases, both bounded by the reservation's lease expiry
+(`workloads.holder_lease_until`), which the reservation sets before repository/profile
+preparation and the runner reads once at the spawn: startup, from the spawn to OMP's `ready`
+frame, bounded only by that expiry, and claim, from the `ready` frame for `READY_MS`, cut at
+that expiry. Because the expiry is fixed, slow preparation (git blocking before OMP exists)
+shortens the startup phase; it never moves the claim window, which starts at the `ready`
+frame. A stall exits as `never-ready (startup)` or `never-ready (claim)`; a claim seen at or
+past the expiry is refused. A missing or unreadable expiry, or one already past at the spawn,
+is refused before any OMP spawns, never defaulted. Ceiling thresholds and the pre-prompt
 ceiling check are unchanged. `surface/test/lane-model-script.test.ts`, under
 `T5c: lane-ready: only just before the first prompt`, covers delayed preparation followed by
 a delayed model reply and retains the at-ceiling relaunch's no-readiness/no-prompt checks.

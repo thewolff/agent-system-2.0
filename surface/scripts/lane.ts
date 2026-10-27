@@ -1070,8 +1070,10 @@ export function readyStallReason(c: ReadyClock & { spawnedAt: number }): string 
 
 /**
  * One readiness poll's verdict at `now`: `ready` when the lane's claim and the model check are both in and the reservation's
- * lease expiry has not passed (checked here, at acceptance, not only in the kill branch); `expired` when they are in only at
- * or past it; `stalled` once the current window's deadline (`readyWindow`) passed without them; else `wait`.
+ * lease expiry has not passed (checked here, at acceptance, not only in the kill branch; the poll samples `now` after its
+ * ledger read). A claim that is in is accepted before the expiry even past the claim window: the expiry bounds acceptance,
+ * the window times the stall. `expired` when they are in only at or past the expiry; `stalled` once the current window's
+ * deadline (`readyWindow`) passed without them; else `wait`.
  */
 export function readyStep(c: ReadyClock, now: number, claimed: boolean, modelChecked: boolean): "ready" | "expired" | "stalled" | "wait" {
 	if (claimed && modelChecked) return now < c.expiryAt ? "ready" : "expired";
@@ -1843,9 +1845,11 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		const readyPoll = setInterval(() => {
 			if (ready || finished || childExited || outcome !== null || fatal !== null) return;
 			try {
-				const now = Date.now();
 				const cur = ledger.workload(wl);
 				const claimed = cur !== null && cur.holder === laneId && cur.changed_by === laneId;
+				// Acceptance time (review r1 F1): sampled after the ledger read that establishes `claimed` (and after `modelChecked`,
+				// set by the stdout reader before this tick), so a claim the read returned is judged against the expiry as of now.
+				const now = Date.now();
 				const step = readyStep(readyClock(), now, claimed, modelChecked);
 				if (step === "expired") {
 					const iso = (ms: number): string => new Date(ms).toISOString();
