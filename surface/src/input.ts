@@ -94,6 +94,14 @@
 // ruling's kind goes to Jo again. One token, never an option word; an id `STANDING_RULINGS` does not hold, or a ruling
 // already ended, is `refused` with the reason, never prose.
 //
+// The auto-apply switch (PLAN wl-mvqwn80onq9hq8 D1, gates/src/routine-switch.ts): `ask-all` and `auto-routine` are one
+// word each and write Jo's instruction of that word on the standing workload, as `end-ruling` does; `routineState` reads
+// them. `ask-all` turns auto-apply off for every lane (reserved actions, routine questions, plan auto-start, review
+// auto-extend, the ceiling's auto-raise); `auto-routine` turns it back on and clears every trip and latch older than it.
+// A repeat of the current state (the full switch, latches included) is `refused` and writes nothing, so `auto-routine`
+// is accepted whenever any off condition holds; with any further word the line is `refused`. Each replies with the state
+// it leaves, and `auto-routine` also names what it cleared, by row id or alarm-file line number.
+//
 // Halting a plan (PLAN wl-mvfkv7llkp7nk0 § 3): `halt <wl-…>` writes Jo's instruction `halt <wl>` on that workload, the
 // surface's `plan: halted <instruction>` (so `planFirst` reads it unapproved again, change slices are refused, the plan
 // never starts on its own again, and `prStakes` holds its PRs), and a `lane-stop:` request when a lane holds it live.
@@ -113,6 +121,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parkQuestions } from "../../classifier/src/lab";
 import { END_RULING_WORD, endedRulings, endRulingBody, isRulingId, type RulingId, STANDING_RULINGS } from "../../gates/src/rulings";
+import { ASK_ALL_WORD, AUTO_ROUTINE_WORD, describeOff, offReasons, type RoutineState, routineState, type RoutineWord } from "../../gates/src/routine-switch";
 import { reviewStopBody, stopReviewsInstructionBody } from "../../classifier/src/review-stop";
 import {
 	countRounds, effectiveRoundLimit, type FindingKind, type Findings, parseReviewLimit, REVIEW_ROUND_DEFAULTS, reviewLoopEndBody,
@@ -167,6 +176,8 @@ export type Command =
 	| { kind: "train-append"; workloadId: string; prs: number[] }
 	/** `end-ruling <ruling-id>`: Jo ends one standing ruling at once (gates/src/rulings.ts). */
 	| { kind: "end-ruling"; ruling: RulingId }
+	/** `ask-all` / `auto-routine`: Jo turns auto-apply off, or back on clearing every older trip and latch (gates/src/routine-switch.ts). */
+	| { kind: "routine-switch"; word: RoutineWord }
 	/** `halt <wl-…>`: Jo stops a workload's plan (PLAN wl-mvfkv7llkp7nk0 § 3): plan-first again, its live lane stopped, its PRs held. */
 	| { kind: "halt"; workloadId: string }
 	/** `withdraw <wl-…>`: Jo withdraws the workload, closed with no done-because: receipt (PLAN wl-mv8s939084z1ts D1). */
@@ -224,6 +235,7 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 	if (word === "cancel-slice") return cancelSliceCommand(ledger, words.slice(1), heartbeatOf);
 	if (word === "supersede") return supersedeCommand(ledger, words.slice(1));
 	if (word === END_RULING_WORD) return endRulingCommand(ledger, words.slice(1));
+	if (word === ASK_ALL_WORD || word === AUTO_ROUTINE_WORD) return routineSwitchCommand(ledger, word, words.slice(1));
 	// `halt <wl-…>` is the command or `refused`; `halt` alone or naming no workload falls through, so an option named "halt" still answers.
 	if (word === HALT_WORD && words.length === 2 && /^wl-/i.test(words[1]!)) return haltCommand(ledger, words[1]!);
 	// `extend <wl-…>` likewise; `extend` alone or `extend <q-…>` falls through, so the round-limit question's `extend` still answers.
@@ -510,6 +522,8 @@ function resolves(cmd: Command): string | null {
 			return cmd.workloadId;
 		case "end-ruling":
 			return cmd.ruling;
+		case "routine-switch":
+			return "the auto-apply switch";
 		case "halt":
 			return `${HALT_WORD} ${cmd.workloadId}`;
 		default:
@@ -597,7 +611,7 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 		if (first[id] !== undefined) {
 			const done =
 				cmd.kind === "reserved" ? "decided" : cmd.kind === "cancel-slice" ? "cancelled" : cmd.kind === "supersede" ? "superseded" : cmd.kind === "withdraw-workload" ? "withdrawn"
-				: cmd.kind === "end-ruling" ? "ended" : cmd.kind === "halt" ? "halted" : "answered";
+				: cmd.kind === "end-ruling" ? "ended" : cmd.kind === "halt" ? "halted" : cmd.kind === "routine-switch" ? "switched" : "answered";
 			return `${id} is already ${done} on ${first[id]}; once per row`;
 		}
 		first[id] = where;
@@ -904,6 +918,27 @@ function endRulingCommand(ledger: Ledger, rest: readonly string[]): Command {
 	const id = rest[0]!.toLowerCase();
 	const why = endRulingRefusal(ledger, id);
 	return why === null ? { kind: "end-ruling", ruling: id as RulingId } : { kind: "refused", why };
+}
+
+/** Why Jo's switch word cannot apply, or null: it would repeat the current state (`routineState`, latches included). `apply` checks it again. */
+function routineSwitchRefusal(ledger: Ledger, word: RoutineWord): string | null {
+	const s = routineState(ledger, Date.parse(ledger.now()));
+	if (word === ASK_ALL_WORD && !s.on) return `auto-apply is already off (${offReasons(s).join("; ")}); nothing written`;
+	if (word === AUTO_ROUTINE_WORD && s.on) return "auto-apply is already on; nothing written";
+	return null;
+}
+
+/** `ask-all` / `auto-routine` after the word: nothing more, and `routineSwitchRefusal` clear; anything else is `refused`, never prose. */
+function routineSwitchCommand(ledger: Ledger, word: RoutineWord, rest: readonly string[]): Command {
+	if (rest.length > 0) return { kind: "refused", why: `${word} is one word: send \`${word}\` alone` };
+	const why = routineSwitchRefusal(ledger, word);
+	return why === null ? { kind: "routine-switch", word } : { kind: "refused", why };
+}
+
+/** What `auto-routine` cleared: every off and latch of `before` that no longer counts in `after`, by row id or alarm-file line. */
+function clearedBy(before: RoutineState, after: RoutineState): string[] {
+	const still = new Set([...after.offs, ...after.latches].map(describeOff));
+	return [...before.offs, ...before.latches].map(describeOff).filter((d) => !still.has(d));
 }
 
 /** Jo's word that halts a workload's plan (PLAN wl-mvfkv7llkp7nk0 § 3). */
@@ -1411,6 +1446,23 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 				ensureStandingWorkload(ledger);
 				const id = ledger.recordInstruction({ ...stamp, workloadId: STANDING_WORKLOAD_ID, body: endRulingBody(cmd.ruling) });
 				return `Jo's ruling ${cmd.ruling} is ended (instruction ${id}); its questions go to you again`;
+			});
+		}
+		case "routine-switch": {
+			// Jo's instruction on the standing workload is the switch (`routineState`); nothing else is written.
+			return ledger.write(() => {
+				const why = routineSwitchRefusal(ledger, cmd.word);
+				if (why !== null) throw new Error(why);
+				ensureStandingWorkload(ledger);
+				const before = routineState(ledger, Date.parse(ledger.now()));
+				const id = ledger.recordInstruction({ ...stamp, workloadId: STANDING_WORKLOAD_ID, body: cmd.word });
+				const after = routineState(ledger, Date.parse(ledger.now()));
+				const state = after.on ? "auto-apply is now on" : `auto-apply is off: ${offReasons(after).join("; ")}`;
+				if (cmd.word === ASK_ALL_WORD) {
+					return `ask-all recorded (instruction ${id}); ${state}. Reserved actions, routine questions, plan auto-start, review auto-extend and the ceiling's auto-raise ask you again until your \`auto-routine\``;
+				}
+				const cleared = clearedBy(before, after);
+				return `auto-routine recorded (instruction ${id}); cleared: ${cleared.length === 0 ? "nothing" : cleared.join("; ")}; ${state}`;
 			});
 		}
 		case "halt": {

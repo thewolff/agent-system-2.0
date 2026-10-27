@@ -93,6 +93,7 @@ export const CONTROL_PREFIXES = [
 	"queued",
 	"lane-metrics", "daily-report",
 	"now", "ruling-conflict",
+	"auto-applied", "auto-applied-result", "auto-apply-tripped", "routine-recorded", "ruling-notice-failed",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -187,6 +188,12 @@ export const DAILY_REPORT_BY = "daily-report";
  * The escalation lines (PLAN wl-mvg1vs0rhnu3gg § 1.0, § 1.9; gates/src/rulings.ts `askJo`) are ESCALATION_BY's alone, written on the
  * question's workload and slice in the raise's transaction: `now: <q-…> <category>` marks a question Jo hears at once (or upgrades a
  * reused open one), and `ruling-conflict: <q-…> <ruling id> <ruling id>…` records the active rulings that disagreed on it, so it was raised.
+ * The auto-apply lines (PLAN wl-mvqwn80onq9hq8 D1, D3, D5, D6; gates/src/routine-switch.ts) are ESCALATION_BY's alone too:
+ * `auto-applied: <rule> <toolCallId> by <lane or hand> cwd <cwd> net <yes|no>: <command>` records a reserved action the gate applied
+ * by itself, `auto-applied-result: <toolCallId> exit <code|unknown|refused>` its result, `auto-apply-tripped: <toolCallId> <signal>
+ * <evidence>` (on the standing workload) a trip that turns auto-apply off until Jo's `auto-routine`, `routine-recorded: <slice> <record
+ * line>` a record-and-announce question ruling `routine-calls` decided, and `ruling-notice-failed: <q-…> <error>` a decided question
+ * whose notice failed, so it was raised. `routineOn` reads the first three; a look-alike by anyone else is no control entry.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -248,6 +255,11 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"daily-report": [DAILY_REPORT_BY],
 	now: [ESCALATION_BY],
 	"ruling-conflict": [ESCALATION_BY],
+	"auto-applied": [ESCALATION_BY],
+	"auto-applied-result": [ESCALATION_BY],
+	"auto-apply-tripped": [ESCALATION_BY],
+	"routine-recorded": [ESCALATION_BY],
+	"ruling-notice-failed": [ESCALATION_BY],
 };
 
 export interface ControlEntry {
