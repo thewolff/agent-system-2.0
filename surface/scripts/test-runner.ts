@@ -1231,12 +1231,16 @@ class Runner {
 				this.baseSoloCalls++;
 				name = /^part (base-solo-\d+)$/m.exec(out)?.[1] ?? `base-solo-${this.baseSoloCalls}`;
 			}
-			await this.recordLoad(name, call.sub === "full" ? null : call.file, label, start, startSnapshot);
+			try {
+				await this.recordLoad(name, call.sub === "full" ? null : call.file, label, start, startSnapshot);
+			} finally {
+				// The wrapper's reports reach the run dir on every outcome, a throwing call included (retention may delete the work dir); importWrapperReport logs its own failure and never throws, so an error in flight stays the one that propagates.
+				if (r !== null && callTimedOut(r)) this.importWrapperReport(`${name}.stuck.log`, true);
+				this.importWrapperReport(`${name}.cleanup.log`, false);
+			}
 		}
 		if (r.code === WRAPPER_EXIT.fenced) await this.fenced(call.sub);
 		const timedOut = callTimedOut(r);
-		if (timedOut) this.importWrapperReport(`${name}.stuck.log`, true);
-		this.importWrapperReport(`${name}.cleanup.log`, false);
 		const cleanup = cleanupReportOf(r.err);
 		if (r.code === WRAPPER_EXIT.refused || r.code === WRAPPER_EXIT.failed) {
 			const wrapper = `the wrapper ${r.code === WRAPPER_EXIT.refused ? "refused" : "failed"} ${call.sub} (exit ${r.code})`;

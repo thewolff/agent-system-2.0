@@ -1630,6 +1630,26 @@ describe("host load and the wrapper's cleanup report (PLAN wl-mvqu69tjvpy96o E1,
 		expect(readFileSync(join(w.runs, runId, "full.cleanup.log"), "utf8")).toBe("pid 4242 pgid 4242 sleep 300\n");
 	});
 
+	test("C9: a wrapper call that throws still has its cleanup report imported into the run dir; the call's own error stays the run's error", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		const work = workDirOf(runId, w.as2);
+		// The report is already in the work dir when the full call starts (the real prepare makes the dir, then the fake leaves the report).
+		fakeWrapper(w, "prepare", [`"$@" || exit $?`, `printf 'pid 4242 pgid 4242 sleep 300\\n' > '${work}/full.cleanup.log' || exit 99`, "exit 0", ""].join("\n"));
+		fakeWrapper(w, "full", "exit 0\n");
+		// The full call's spawn mark cannot be appended, so the runner's wrapper call throws right after the spawn.
+		mkdirSync(`${hookBase(w, runId, "spawn-full")}.marks`);
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run.verdict).toBe("error");
+		expect(run.reason).toContain("the runner failed:");
+		expect(run.reason).toContain("EISDIR");
+		const log = runnerLog(w, runId);
+		expect(log).toContain("full.cleanup.log imported");
+		expect(readFileSync(join(w.runs, runId, "full.cleanup.log"), "utf8")).toBe("pid 4242 pgid 4242 sleep 300\n");
+	});
+
 	test("C9: a sweep that is not ok puts its survivor line in the run's error, not only its exit code", async () => {
 		const w = world();
 		const { wl, slice } = workload(w);
