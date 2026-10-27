@@ -143,7 +143,8 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { LANE_ENV, WORKLOAD_ENV } from "../gates/src/types";
-import { askJo, decidedText, raisedId, rulingActive } from "../gates/src/rulings";
+import { type AskResult, askJo, decidedText, raisedId, rulingActive, STANDING_RULINGS } from "../gates/src/rulings";
+import { routineOn } from "../gates/src/routine-switch";
 import { type HostModules, hostSettings, readSetting } from "../gates/src/host";
 import { CLASSIFIER_BY, type EntryRow, Ledger, type QuestionRow, type RoutingOutcome, type Stakes } from "../ledger/src/index";
 import { defaultLedgerPath } from "../ledger/src/locality";
@@ -234,8 +235,10 @@ import {
 } from "./src/panel";
 import { reviewStopOn } from "./src/review-stop";
 import {
+	autoExtendNoticeBody,
 	countRounds,
 	effectiveRoundLimit,
+	fellEveryRound,
 	FINDING_KINDS,
 	type Findings,
 	type FindingsOrUnknown,
@@ -250,6 +253,7 @@ import {
 	reviewLimitBody,
 	reviewLoop,
 	reviewLoopEndBody,
+	reviewRoundsExtendBody,
 	reviewRoundBody,
 	type ReviewVerdict,
 	ROUND_LIMIT_OPTIONS,
@@ -263,6 +267,7 @@ import { isTier, route, STAKES, type Routing, type Tier } from "./src/route";
 import { identity, loadTierTable, modelIdentity, type TierTable } from "./src/tier-table";
 import { controlEntries, holdersOf, type LaneStarted, laneStarted, planFirst, planSlice } from "../surface/src/launch";
 import { ompPidState, type PidState } from "../surface/src/omp-probe";
+import { NOTICE_PREFIX } from "../surface/src/notice";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../surface/src/types";
 import {
 	PAIR_OPTION, type PairLedger, type PairSignalId, pairExposureBody, pairOffer, pairOfferBody, pairSignalBody, pairSignalFailedBody, pairSuggestOn,
@@ -273,6 +278,8 @@ import {
 export const PAIR_SIGNAL_TIMEOUT_MS = 10_000;
 /** D4: attempts per workload, counted from the ledger's classifier-stamped `pair-signal-failed:` entries, so a restarted lane does not get three more. */
 export const PAIR_SIGNAL_ATTEMPTS = 3;
+/** PLAN wl-mvqwn80onq9hq8 D10: the one ruling that answers the round-limit question (`extend`, once per loop). */
+const AUTO_EXTEND_RULING = "review-auto-extend";
 
 /** The slice of OMP's model registry the spawn check reads (config/model-registry.ts). */
 export interface ModelAvailability {
@@ -1505,23 +1512,58 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const limit = effectiveRoundLimit(entries, instructions, stakes, sliceId);
 				if (count.failed < limit.total || openLimitQuestion(entries, ledger.questions(workloadId), sliceId)) return null;
 				const offer = roundLimitPairOffer(ledger, workloadId, count, log);
-				const questionId = raisedId(
-					askJo(
-						ledger,
-						{
-							by: deps.laneId,
-							workloadId,
-							sliceId,
-							body: roundLimitQuestionBody(sliceId, count, limit, stakes),
-							options: offer ? [...ROUND_LIMIT_OPTIONS, PAIR_OPTION] : [...ROUND_LIMIT_OPTIONS],
-						},
-						{ asker: "classifier", now: clock() },
-					),
-					`the round-limit question of ${sliceId}`,
-				);
+				const body = roundLimitQuestionBody(sliceId, count, limit, stakes);
+				const options = offer ? [...ROUND_LIMIT_OPTIONS, PAIR_OPTION] : [...ROUND_LIMIT_OPTIONS];
+				const reached = `review round ${round.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total})`;
+				// PLAN wl-mvqwn80onq9hq8 D10: ruling review-auto-extend may answer `extend` (falling count, no extend yet, auto-apply
+				// on). Its `ruling-applied:`, the extend and the notice are one nested write; when the extend or notice throws, all
+				// three roll back and the question is raised to Jo in a second write, its body naming the failure.
+				let extending = false;
+				let asked: AskResult;
+				let autoFailed: string | null = null;
+				try {
+					asked = ledger.write(() => {
+						extending = false; // a busy-retried transaction runs this body again
+						const r = askJo(
+							ledger,
+							{ by: deps.laneId, workloadId, sliceId, body, options },
+							{
+								asker: "classifier",
+								stakes,
+								fell: fellEveryRound(count),
+								extended: limit.extend > 0,
+								routineOn: () => routineOn(ledger, clock()),
+								now: clock(),
+							},
+						);
+						if (!("decided" in r)) return r;
+						if (r.decided.ruling !== AUTO_EXTEND_RULING) throw new Error(`Jo's ruling ${r.decided.ruling} decided the round-limit question of ${sliceId}; only ${AUTO_EXTEND_RULING} answers it`);
+						extending = true;
+						ledger.recordEntry({ by: CLASSIFIER_BY, workloadId, sliceId, kind: "assumption", body: reviewRoundsExtendBody(sliceId, limit.workload, r.applied) });
+						ledger.enqueue({ by: CLASSIFIER_BY, workloadId, sliceId, sender: CLASSIFIER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: `${NOTICE_PREFIX} ${autoExtendNoticeBody(sliceId, workloadId, count)}` });
+						return r;
+					});
+				} catch (error) {
+					if (!extending) throw error;
+					autoFailed = message(error).replace(/\s+/g, " ").trim();
+					try {
+						asked = askJo(
+							ledger,
+							{ by: deps.laneId, workloadId, sliceId, body: `${body}\n\nauto-extend failed: ${autoFailed}`, options },
+							{ asker: "classifier", now: clock() },
+							STANDING_RULINGS.filter(r => r.id !== AUTO_EXTEND_RULING),
+						);
+					} catch (raise) {
+						throw new Error(`ruling ${AUTO_EXTEND_RULING} decided the round-limit question of ${sliceId}, but writing its extend and notice failed (${autoFailed}), and raising the question to Jo failed too (${message(raise)})`, { cause: raise });
+					}
+				}
+				if ("decided" in asked) {
+					return `${reached}; Jo's ruling ${AUTO_EXTEND_RULING} extended it by ${limit.workload} rounds (review-rounds-extend: by ${asked.applied}) and Jo has a notice; the next limit in this loop asks`;
+				}
+				const questionId = raisedId(asked, `the round-limit question of ${sliceId}`);
 				entry(reviewLimitBody(questionId, sliceId));
 				if (offer) ledger.recordEntry({ by: CLASSIFIER_BY, workloadId, kind: "assumption", body: pairOfferBody(questionId, "round-limit", offer.signals) });
-				return `review round ${round.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total}); question ${questionId} (review-limit:; extend / accept / stop${offer ? " / pair" : ""}) is raised`;
+				return `${reached}; question ${questionId} (review-limit:; extend / accept / stop${offer ? " / pair" : ""}) is raised${autoFailed === null ? "" : ` because ruling ${AUTO_EXTEND_RULING}'s extend could not be written (${autoFailed})`}`;
 			});
 			if (settledLost.length > 0) {
 				log(`agent-system-2 classifier: review hand(s) ${settledLost.join(", ")} of ${sliceId} settled as failed dispatches: no process the ledger records can still run them (lost-hand settle, written as ${CLASSIFIER_BY})`);

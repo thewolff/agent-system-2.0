@@ -40,10 +40,10 @@ describe("R1: askJo is the check before any question row", () => {
 	test("a decided question writes no question row, leaves the slice open, and records the asker's ruling-applied entry; the result is the ruling, answer and action", () => {
 		const { l, wl, sl } = ledger();
 		const r = askJo(l, { by: "lane-a", workloadId: wl, sliceId: sl, body: "Open the docs workload now or later?", options: ["open", "later"] }, { asker: "lane", now: IN_WINDOW });
-		expect(r).toEqual({ decided: { ruling: "flow-repair", answer: "later", action: STANDING_RULINGS.find((x) => x.id === "flow-repair")!.action({ body: "", options: [] }, "open-workload", { asker: "lane" }, "later") } });
+		const applied = l.entries(wl).filter((e) => e.body.startsWith("ruling-applied:"));
+		expect(r).toEqual({ decided: { ruling: "flow-repair", answer: "later", action: STANDING_RULINGS.find((x) => x.id === "flow-repair")!.action({ body: "", options: [] }, "open-workload", { asker: "lane" }, "later") }, applied: applied[0]!.id });
 		expect(l.questions(wl)).toEqual([]);
 		expect(l.slice(sl)!.state).toBe("open");
-		const applied = l.entries(wl).filter((e) => e.body.startsWith("ruling-applied:"));
 		expect(applied.map((e) => [e.body, e.created_by, e.slice_id])).toEqual([[`ruling-applied: flow-repair kind open-workload slice ${sl} answer later`, "lane-a", sl]]);
 	});
 
@@ -147,17 +147,25 @@ describe("R3: flow-repair, merges, models, gates-stakes, each in its scope until
 });
 
 describe("R4: a ruling decides only its own kind", () => {
-	test("round-limit, ceiling, train, plan, safety and any other option set is `other` and always asks", () => {
+	test("ceiling, train, plan, safety and any other option set is `other` and always asks", () => {
 		const sets = [
-			["extend", "accept", "stop"],
-			["extend", "accept", "stop", "pair"],
 			["retry", "skip", "stop"],
 			["approve", "revise", "cancel"],
 			["approve", "merge"],
 			["revert", "keep"],
+			["extend", "accept", "stop", "retry"],
 		];
 		for (const options of sets) {
 			expect(questionKind(options)).toBe("other");
+			for (const facts of [lane(), { asker: "orchestrator" } as RulingFacts, { asker: "train" } as RulingFacts, { asker: "classifier", kimiOut: true } as RulingFacts]) {
+				expect(check(options, facts)).toBeNull();
+			}
+		}
+	});
+
+	test("the round-limit set (extend / accept / stop, with or without pair) is `round-limit`, and without the classifier's D10 facts it asks", () => {
+		for (const options of [["extend", "accept", "stop"], ["extend", "accept", "stop", "pair"], ["stop", "extend", "accept"]]) {
+			expect(questionKind(options)).toBe("round-limit");
 			for (const facts of [lane(), { asker: "orchestrator" } as RulingFacts, { asker: "train" } as RulingFacts, { asker: "classifier", kimiOut: true } as RulingFacts]) {
 				expect(check(options, facts)).toBeNull();
 			}
@@ -351,6 +359,47 @@ describe("routine-calls (PLAN wl-mvqwn80onq9hq8 D6; R10, R11): a lane's routine 
 	});
 });
 
+describe("review-auto-extend (PLAN wl-mvqwn80onq9hq8 D10; R23, R24): a falling review loop extends once by itself", () => {
+	const LIMIT = ["extend", "accept", "stop"];
+	const falling = (over: Partial<RulingFacts> = {}): RulingFacts => ({ asker: "classifier", stakes: "normal", fell: true, extended: false, routineOn: () => true, ...over });
+
+	test("decides the classifier's round-limit question with extend at normal or production stakes, a falling count, no extend yet and auto-apply on", () => {
+		for (const stakes of ["normal", "production"] as const) {
+			expect(check(LIMIT, falling({ stakes }))).toMatchObject({ ruling: "review-auto-extend", answer: "extend" });
+			expect(check([...LIMIT, "pair"], falling({ stakes }))).toMatchObject({ ruling: "review-auto-extend", answer: "extend" });
+		}
+		const ruling = STANDING_RULINGS.find((x) => x.id === "review-auto-extend")!;
+		expect(ruling.sources).toEqual(["in-mvqyknri0dy4g0"]);
+		expect(ruling.kinds).toEqual(["round-limit"]);
+	});
+
+	test("asks at throwaway stakes, with a flat, rising or unknown count, an extend already, auto-apply off, another asker, or Jo's end-ruling", () => {
+		expect(check(LIMIT, falling({ stakes: "throwaway" }))).toBeNull();
+		expect(check(LIMIT, falling({ stakes: undefined }))).toBeNull();
+		expect(check(LIMIT, falling({ fell: false }))).toBeNull();
+		expect(check(LIMIT, falling({ fell: undefined }))).toBeNull();
+		expect(check(LIMIT, falling({ extended: true }))).toBeNull();
+		expect(check(LIMIT, falling({ extended: undefined }))).toBeNull();
+		expect(check(LIMIT, falling({ routineOn: () => false }))).toBeNull();
+		expect(check(LIMIT, falling({ routineOn: undefined }))).toBeNull();
+		for (const asker of ["lane", "orchestrator", "train"] as const) expect(check(LIMIT, { ...falling(), asker })).toBeNull();
+		expect(check(LIMIT, falling(), { ended: ["review-auto-extend"] })).toBeNull();
+		// Not a round-limit option set: the ruling never reaches it.
+		expect(check(["retry", "skip", "stop"], falling())).toBeNull();
+	});
+
+	test("askJo: a decided round-limit question raises no row, writes the asker's ruling-applied entry and returns its id; `now` skips the ruling", () => {
+		const { l, wl, sl } = ledger();
+		const r = askJo(l, { by: "lane-a", workloadId: wl, sliceId: sl, body: "The review reached its round limit.", options: LIMIT }, { ...falling(), now: IN_WINDOW });
+		if (!("decided" in r)) throw new Error("expected the ruling to decide");
+		expect(r.decided.ruling).toBe("review-auto-extend");
+		expect(l.questions(wl)).toEqual([]);
+		expect(l.entry(r.applied)?.body).toBe(`ruling-applied: review-auto-extend kind round-limit slice ${sl} answer extend`);
+		const raised = askJo(l, { by: "lane-a", workloadId: wl, sliceId: sl, body: "The review reached its round limit again.", options: LIMIT, now: "incident" }, { ...falling(), now: IN_WINDOW });
+		expect("raised" in raised).toBe(true);
+	});
+});
+
 describe("phase 2 (PLAN wl-mvg1vs0rhnu3gg § 1.0, § 1.9, § 3.5): now, duplicates, ruling conflicts", () => {
 	const escalations = (l: Ledger, wl: string) =>
 		l.entries(wl).filter((e) => /^(now|ruling-conflict): /.test(e.body)).map((e) => [e.body, e.created_by, e.slice_id]);
@@ -462,7 +511,8 @@ describe("phase 2 (PLAN wl-mvg1vs0rhnu3gg § 1.0, § 1.9, § 3.5): now, duplicat
 		const rulings = [injected("merges", "merge"), injected("flow-repair", "merge")];
 		const q = { body: "Merge PR #9?", options: ["merge", "wait"] };
 		const r = askJo(l, { by: SURFACE_BY, workloadId: wl, sliceId: sl, ...q }, { asker: "orchestrator", now: IN_WINDOW }, rulings);
-		expect(r).toEqual({ decided: { ruling: "merges", answer: "merge", action: "merges says merge" } });
+		const applied = l.entries(wl).find((e) => e.body.startsWith("ruling-applied:"))!.id;
+		expect(r).toEqual({ decided: { ruling: "merges", answer: "merge", action: "merges says merge" }, applied });
 		expect(l.questions(wl)).toEqual([]);
 		expect(escalations(l, wl)).toEqual([]);
 		expect(l.entries(wl).map((e) => e.body)).toEqual([`ruling-applied: merges kind merge slice ${sl} answer merge`]);
