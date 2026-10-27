@@ -6,7 +6,8 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { assertLocalPath, assertNotLiveLedgerUnderTest, defaultLedgerPath, LiveLedgerUnderTestError } from "./locality";
+import { agentContext, installBoundary } from "./authority";
+import { assertLocalPath, assertNotLiveLedgerUnderTest, defaultLedgerPath, inLiveRoot, LiveLedgerUnderTestError } from "./locality";
 
 export {
 	assertLocalPath,
@@ -165,6 +166,15 @@ function ensureWal(db: Database): void {
 	const set = db.query<{ journal_mode: string }, []>("PRAGMA journal_mode = WAL").get()!.journal_mode;
 	// SQLite reports the unchanged mode instead of an error when another connection blocks the switch.
 	if (set !== "wal") throw Object.assign(new Error(`could not switch journal_mode to wal (still ${set})`), { code: "SQLITE_BUSY" });
+}
+
+/** inLiveRoot, with a root set that cannot be read (the passwd lookup failed) counted as live: the boundary fails closed. */
+function liveOrUnknown(path: string): boolean {
+	try {
+		return inLiveRoot(path);
+	} catch {
+		return true;
+	}
 }
 
 export type Stakes = "throwaway" | "normal" | "production";
@@ -407,6 +417,12 @@ export interface OpenOptions {
 	 * write method then fails at SQLite (SQLITE_READONLY). Refused together with `create`. Default false.
 	 */
 	readonly?: boolean;
+	/**
+	 * `"enforce"`: give this connection the Jo-only boundary's triggers (ledger/src/authority.ts) when the
+	 * process is an agent context, as a connection to a file in a live root always gets them. It only adds the
+	 * triggers; no option removes them. The boundary's own tests use it on a scratch file.
+	 */
+	authority?: "enforce";
 }
 
 const ID_PREFIX = { workload: "wl", slice: "sl", message: "msg", question: "q", instruction: "in", routing: "rt", entry: "en" } as const;
@@ -475,6 +491,10 @@ export class Ledger {
 			const v = retryBusy(retries, version);
 			if (v !== SCHEMA_VERSION) throw new LedgerSchemaVersionError(target, v);
 			if (!opts.readonly) retryBusy(retries, () => ensureWal(db));
+			// The Jo-only boundary, layer 1 (PLAN wl-mv654hoqwpfhmo § 6.3 item 1): an agent's connection to a live
+			// ledger, or one opened with `authority: "enforce"`, refuses surface-stamped rows, Jo-authored rows outside
+			// row 11's shape under this process's own lane id, and every answer (authority.ts installBoundary).
+			if (!opts.readonly && agentContext() && (opts.authority === "enforce" || liveOrUnknown(target))) installBoundary(db);
 		} catch (e) {
 			db.close();
 			throw e;
