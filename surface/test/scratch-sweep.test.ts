@@ -1,15 +1,18 @@
 // The daily scratch sweep (PLAN wl-mv5oikd5jtquww § 1.6), driven through its CLI
 // (surface/scripts/scratch-sweep.ts) against a fake HOME, a temp ledger under it, and a fake /tmp:
-// closed, unknown and idle-unheld (no holder, or a lapsed lease) roots are removed; a held root and a
-// root with anything changed in 3 days are kept; a symlinked child and a plain file are refused and
-// left alone, and a link inside a removed root is never followed. The report names every root, the
-// remaining total and the legacy places, which are sized and never deleted. Over the threshold one
-// `scratch-disk:` entry lands on the standing workload, once while open; under it, `scratch-disk-ok:`.
+// closed, unknown and idle-unheld (no holder, or a lapsed lease) roots are archived and then removed; a held
+// root and a root with anything changed in 3 days are kept; a symlinked child and a plain file are refused and
+// left alone, and a link inside a removed root is never followed. A root whose archive fails is kept. Archives
+// past scratchArchive.expireDays are expired (with requireOffsite, only those with an `.offsite` marker). The
+// report names every root, the archives, the remaining total, the free space and the legacy places, which are
+// sized and never deleted. Over the threshold, or under scratchArchive.minFreeGib free, one `scratch-disk:`
+// entry lands on the standing workload, once while open; back within bounds, `scratch-disk-ok:`.
 // --dry-run removes and writes nothing; a missing ledger or a bad threshold removes nothing.
 import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SCRATCH_ENTRY, scratchBase } from "../../gates/src/scratch";
+import { DEFAULT_SCRATCH_ARCHIVE, type ScratchArchiveConfig, scratchArchiveBase } from "../src/scratch-archive";
 import { Ledger } from "../../ledger/src/index";
 import { reportDir, sweep as runSweep } from "../scripts/scratch-sweep";
 import { SCRATCH_SWEEP_BY } from "../src/launch";
@@ -30,6 +33,8 @@ interface World {
 	legacyTmp: string;
 	ledgerPath: string;
 	ledger: Ledger;
+	/** The `scratchArchive:` config the CLI reads ($AGENT_SYSTEM_SCRATCH_CONFIG): no disk guard, so the machine's free space never decides a test. */
+	config: string;
 }
 
 function world(): World {
@@ -41,8 +46,13 @@ function world(): World {
 	mkdirSync(base, { recursive: true });
 	const ledgerPath = join(home, ".agent-system-2", "ledger.db");
 	const ledger = Ledger.open(ledgerPath, { create: true, backup: false, backupOnOpen: false });
-	return { home, base, outside, legacyTmp, ledgerPath, ledger };
+	const config = join(home, "sweep-config.yml");
+	writeFileSync(config, "scratchArchive:\n  expireDays: 14\n  requireOffsite: false\n  minFreeGib: 0\n");
+	return { home, base, outside, legacyTmp, ledgerPath, ledger, config };
 }
+
+/** Direct-call args: the defaults but no disk guard (see World.config). */
+const argsOf = (w: World, archive: Partial<ScratchArchiveConfig> = {}) => ({ dryRun: false, home: w.home, legacyTmp: w.legacyTmp, archive: { ...DEFAULT_SCRATCH_ARCHIVE, minFreeGib: 0, ...archive }, configNotes: [] });
 
 /** A root with one file (and a nested one) under the base. */
 function root(w: World, name: string): string {
@@ -67,7 +77,7 @@ function age(path: string, days: number): void {
 }
 
 function sweep(w: World, args: string[] = [], env: Record<string, string | undefined> = {}) {
-	const merged: Record<string, string | undefined> = { ...process.env, AGENT_SYSTEM_SCRATCH_TOTAL_MB: undefined, ...env, AGENT_SYSTEM_LEDGER_DB: w.ledgerPath };
+	const merged: Record<string, string | undefined> = { ...process.env, AGENT_SYSTEM_SCRATCH_TOTAL_MB: undefined, AGENT_SYSTEM_SCRATCH_CONFIG: w.config, ...env, AGENT_SYSTEM_LEDGER_DB: w.ledgerPath };
 	const clean: Record<string, string> = {};
 	for (const [k, v] of Object.entries(merged)) if (v !== undefined) clean[k] = v;
 	return sh([process.execPath, SCRIPT, "--home", w.home, "--legacy-tmp", w.legacyTmp, ...args], w.home, clean);
@@ -139,6 +149,20 @@ describe("scratch sweep: which roots go", () => {
 		expect([existsSync(join(w.legacyTmp, "wl-oldcopy", "f")), existsSync(join(w.home, ".agent-system-2", "test-runs", "run-1", "log"))]).toEqual([true, true]);
 	});
 
+	test("each removed root was archived first, outside the base, and recorded as scratch-archived: on the standing workload", () => {
+		const archives = readdirSync(scratchArchiveBase(w.home)).flatMap((day) => readdirSync(join(scratchArchiveBase(w.home), day)).map((n) => join(scratchArchiveBase(w.home), day, n)));
+		expect(archives.map((p) => p.split("/").at(-1)!).sort()).toEqual([closed, unknown, idle, lapsed].map((n) => `${n}.tar.gz`).sort());
+		const recorded = w.ledger.entries(STANDING_WORKLOAD_ID, "assumption").filter((e) => e.body.startsWith(SCRATCH_ENTRY.archived));
+		expect(recorded.map((e) => e.created_by)).toEqual([SCRATCH_SWEEP_BY, SCRATCH_SWEEP_BY, SCRATCH_SWEEP_BY, SCRATCH_SWEEP_BY]);
+		for (const p of archives) expect(recorded.some((e) => e.body.includes(` ${p} `))).toBe(true);
+		const closedArchive = archives.find((p) => p.endsWith(`/${closed}.tar.gz`))!;
+		const listed = Bun.spawnSync(["tar", "-tzf", closedArchive], { stdout: "pipe" }).stdout.toString();
+		expect(listed).toContain(`${closed}/repo/src/a.ts`);
+		expect(listed).toContain(`${closed}/escape`);
+		// the link inside was archived as a link: the file it points at is not in the archive
+		expect(listed).not.toContain("secret");
+	});
+
 	test("the report names every root with its size and action, the remaining total and the legacy places", () => {
 		// The sweep names its report by the date in its own process's zone; bun test runs in UTC, so read what it wrote.
 		const reports = readdirSync(reportDir(w.home)).filter((n) => n.endsWith(".md"));
@@ -198,6 +222,7 @@ describe("scratch sweep: what it never does", () => {
 		expect(r.out).toContain("would remove");
 		expect(existsSync(reportDir(w.home))).toBe(false);
 		expect(w.ledger.workload(STANDING_WORKLOAD_ID)).toBeNull();
+		expect(existsSync(scratchArchiveBase(w.home))).toBe(false);
 	});
 
 	test("an unreadable ledger removes nothing: no root's fate is guessed", () => {
@@ -224,7 +249,7 @@ describe("scratch sweep: what it never does", () => {
 		const w = world();
 		const wl = open(w);
 		age(root(w, wl), 4);
-		const r = runSweep({ dryRun: false, home: w.home, legacyTmp: w.legacyTmp }, { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, new Date(), {
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, new Date(), {
 			beforeRemove: (name) => {
 				if (name === wl) w.ledger.claimWorkload(wl, { by: "lane-r", holder: "lane-r", leaseMs: 3_600_000 });
 			},
@@ -245,7 +270,7 @@ describe("scratch sweep: what it never does", () => {
 		const claim = () => lane.claimWorkload(wl, { by: "lane-r", holder: "lane-r", leaseMs: 3_600_000 });
 		let during = "the seam was not reached";
 		try {
-			const r = runSweep({ dryRun: false, home: w.home, legacyTmp: w.legacyTmp }, { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, new Date(), {
+			const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, new Date(), {
 				inLock: (name) => {
 					if (name !== wl) return;
 					try {
@@ -280,5 +305,98 @@ describe("scratch sweep: what it never does", () => {
 		expect(readdirSync(w.base)).toEqual([".removing-wl-busy-fedcba9876543210"]);
 		expect(r.out).toMatch(/\| \.removing-wl-gone-0123456789abcdef \| \d+ \| removed \| a removal leftover, nothing changed since .* \(over 3 days\) \|/);
 		expect(r.out).toMatch(/\| \.removing-wl-busy-fedcba9876543210 \| \d+ \| kept \| a removal leftover or in progress, changed within 3 days /);
+	});
+});
+
+describe("scratch sweep: archives (expiry, offsite gate, failures) and the disk guard", () => {
+	/** A fixed run time: every age below is set relative to it, never to the wall clock. */
+	const NOW = new Date("2026-10-28T04:30:00.000Z");
+	/** An archive file `days` days older than NOW, under the archive base's date directory `day`. */
+	function archiveAt(w: World, day: string, name: string, days: number): string {
+		const dir = join(scratchArchiveBase(w.home), day);
+		mkdirSync(dir, { recursive: true });
+		const p = join(dir, name);
+		writeFileSync(p, "gz");
+		const t = new Date(NOW.getTime() - days * DAY_MS);
+		utimesSync(p, t, t);
+		return p;
+	}
+	const expiredEntries = (w: World): string[] =>
+		w.ledger.workload(STANDING_WORKLOAD_ID) ? w.ledger.entries(STANDING_WORKLOAD_ID, "assumption").filter((e) => e.body.startsWith(SCRATCH_ENTRY.archiveExpired)).map((e) => `${e.created_by} ${e.body}`) : [];
+
+	test("expiry removes only archives older than expireDays, records each, and removes a date directory it emptied", () => {
+		const w = world();
+		const old1 = archiveAt(w, "2026-10-01", "wl-aaold.tar.gz", 27);
+		const old2 = archiveAt(w, "2026-10-13", "wl-bbold.tar.gz", 15);
+		const young = archiveAt(w, "2026-10-13", "wl-ccyoung.tar.gz", 13);
+		const today = archiveAt(w, "2026-10-28", "wl-ddtoday.tar.gz", 0);
+		const stray = archiveAt(w, "2026-10-01", "notes.txt", 40);
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW);
+		expect(r.exit).toBe(0);
+		expect([existsSync(old1), existsSync(old2), existsSync(young), existsSync(today), existsSync(stray)]).toEqual([false, false, true, true, true]);
+		expect(r.expired.filter((l) => l.action === "expired").map((l) => l.path)).toEqual([old1, old2]);
+		expect(expiredEntries(w)).toEqual([`${SCRATCH_SWEEP_BY} ${SCRATCH_ENTRY.archiveExpired} ${old1} 2`, `${SCRATCH_SWEEP_BY} ${SCRATCH_ENTRY.archiveExpired} ${old2} 2`]);
+		// 2026-10-01 still holds the stray file (never an archive, never touched); 2026-10-13 still holds the young one.
+		expect(readdirSync(scratchArchiveBase(w.home)).sort()).toEqual(["2026-10-01", "2026-10-13", "2026-10-28"]);
+		expect(r.report).toMatch(new RegExp(`\\| ${old1.replace(/[.]/g, "\\.")} \\| 2 \\| expired \\| 27\\.0 days old, over 14 \\|`));
+		// A shorter expireDays reaches the younger ones; an emptied date directory goes.
+		const again = runSweep(argsOf(w, { expireDays: 10 }), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW);
+		expect(again.expired.filter((l) => l.action === "expired").map((l) => l.path)).toEqual([young]);
+		expect(readdirSync(scratchArchiveBase(w.home)).sort()).toEqual(["2026-10-01", "2026-10-28"]);
+	});
+
+	test("requireOffsite: an old archive without its .offsite marker is kept; one with it is expired with its marker", () => {
+		const w = world();
+		const unconfirmed = archiveAt(w, "2026-10-01", "wl-aanomark.tar.gz", 27);
+		const confirmed = archiveAt(w, "2026-10-01", "wl-bbmark.tar.gz", 27);
+		writeFileSync(`${confirmed}.offsite`, "drive:/as2/wl-bbmark.tar.gz");
+		const r = runSweep(argsOf(w, { requireOffsite: true }), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW);
+		expect(r.exit).toBe(0);
+		expect([existsSync(unconfirmed), existsSync(confirmed), existsSync(`${confirmed}.offsite`)]).toEqual([true, false, false]);
+		expect(r.expired.find((l) => l.path === unconfirmed)?.why).toContain("no .offsite marker (requireOffsite)");
+		expect(expiredEntries(w)).toEqual([`${SCRATCH_SWEEP_BY} ${SCRATCH_ENTRY.archiveExpired} ${confirmed} 2`]);
+		// Off (the default), plain age expiry takes the unconfirmed one too.
+		runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW);
+		expect(existsSync(unconfirmed)).toBe(false);
+	});
+
+	test("a root whose archive fails is kept, whole, and the run exits 1", () => {
+		const w = world();
+		const closed = open(w);
+		w.ledger.closeWorkload(closed, { by: "orchestrator-surface" });
+		root(w, closed);
+		writeFileSync(scratchArchiveBase(w.home), "not a directory");
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW);
+		expect(r.exit).toBe(1);
+		expect(existsSync(join(w.base, closed, "repo", "src", "a.ts"))).toBe(true);
+		const line = r.roots.find((x) => x.name === closed)!;
+		expect(line.action).toBe("archive failed");
+		expect(line.why).toMatch(/^workload closed at .*; not archived \(.+\); kept$/);
+		expect(r.archived).toEqual([]);
+	});
+
+	test("the disk guard: free space under minFreeGib opens one scratch-disk: naming it; back over, scratch-disk-ok: clears it", () => {
+		const w = world();
+		const GIB = 1024 ** 3;
+		const low = runSweep(argsOf(w, { minFreeGib: 20 }), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW, { freeBytes: () => 5 * GIB });
+		expect(low.exit).toBe(0);
+		expect(diskEntries(w)).toHaveLength(1);
+		expect(diskEntries(w)[0]!).toMatch(new RegExp(`^scratch-disk: 5\\.0 GiB free on the volume of ${w.base}, under 20 GiB \\(scratchArchive\\.minFreeGib\\); report \\S+\\.md$`));
+		expect(low.report).toContain("- free on the scratch volume: 5.0 GiB, under 20 GiB");
+		runSweep(argsOf(w, { minFreeGib: 20 }), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW, { freeBytes: () => 6 * GIB });
+		expect(diskEntries(w)).toHaveLength(1);
+		const ok = runSweep(argsOf(w, { minFreeGib: 20 }), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW, { freeBytes: () => 25 * GIB });
+		expect(ok.exit).toBe(0);
+		expect(diskEntries(w)).toHaveLength(2);
+		expect(diskEntries(w)[1]!).toStartWith("scratch-disk-ok: ");
+	});
+
+	test("the CLI reads scratchArchive from $AGENT_SYSTEM_SCRATCH_CONFIG; a malformed key falls back to its default with a report note", () => {
+		const w = world();
+		writeFileSync(w.config, "scratchArchive:\n  expireDays: soon\n  minFreeGib: 0\n");
+		const r = sweep(w);
+		expect(r.code).toBe(0);
+		expect(r.out).toContain('- note: scratchArchive.expireDays "soon" is not a non-negative number; 14 used');
+		expect(r.out).toContain(`- archives: ${scratchArchiveBase(w.home)}; expire after 14 days; disk guard under 0 GiB free`);
 	});
 });

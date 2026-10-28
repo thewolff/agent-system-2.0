@@ -2,9 +2,10 @@
 // AS2_SCRATCH, the lane script creates the root before omp starts and names it in the first prompt,
 // the lane extension measures it at turn end against the advisory cap and tells the lane, errorLines
 // renders an open over-cap (and the daily sweep's disk entry) under needs-you, and the close tool
-// removes the root once the row has closed, refusing a root that is a symlink.
+// archives the root once the row has closed and only then removes it, keeping a root whose archive
+// fails and refusing a root that is a symlink.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { Ledger } from "../../ledger/src/index";
@@ -14,6 +15,7 @@ import * as laneRow from "../extensions/lane";
 import * as laneScript from "../scripts/lane";
 import { errorLines } from "../src/errors";
 import { closeScratchRoot } from "../src/close-entry";
+import { archivePathFor, scratchArchiveBase } from "../src/scratch-archive";
 import { ensureStandingWorkload } from "../src/identity";
 import { ensureScratchRoot } from "../src/scratch-root";
 import * as launch from "../src/launch";
@@ -211,7 +213,7 @@ describe("needs-you kind `scratch` (§ 1.5, § 1.6)", () => {
 		expect(scratchLines(ledger)).toEqual([
 			{
 				kind: "scratch", workloadId: STANDING_WORKLOAD_ID, rowId: en,
-				line: "scratch disk: 12000.5 MiB under /h passes 10240 MiB (AGENT_SYSTEM_SCRATCH_TOTAL_MB); report /r.md — the daily sweep clears this line once the total is back under",
+				line: "scratch disk: 12000.5 MiB under /h passes 10240 MiB (AGENT_SYSTEM_SCRATCH_TOTAL_MB); report /r.md — the daily sweep clears this line once the total is back under and the free space back over",
 			},
 		]);
 		disk("lane-x", `${SCRATCH_ENTRY.diskOk} 1.0 MiB under /h, at or under 10240 MiB; report /forged.md`);
@@ -221,7 +223,23 @@ describe("needs-you kind `scratch` (§ 1.5, § 1.6)", () => {
 	});
 });
 
-describe("orchestrator_close_workload removes the root after the close (§ 1.5)", () => {
+/** The members `tar -tzf` lists in `archive`, sorted. */
+function members(archive: string): string[] {
+	const r = Bun.spawnSync(["tar", "-tzf", archive], { stdout: "pipe", stderr: "pipe" });
+	expect(r.exitCode).toBe(0);
+	return r.stdout.toString().split("\n").filter((l) => l !== "").map((l) => l.replace(/\/$/, "")).sort();
+}
+
+/** The one archive under the archive base, or null when there is none (asserts there is at most one). */
+function onlyArchive(home: string): string | null {
+	const base = scratchArchiveBase(home);
+	if (!existsSync(base)) return null;
+	const found = readdirSync(base).flatMap((day) => readdirSync(join(base, day)).map((n) => join(base, day, n)));
+	expect(found.length).toBeLessThanOrEqual(1);
+	return found[0] ?? null;
+}
+
+describe("orchestrator_close_workload archives the root, then removes it, after the close (§ 1.5 as amended 2026-10-28)", () => {
 	function closing() {
 		const voice = join(tmp("voice"), "VOICE.md");
 		writeFileSync(voice, "VOICE DOC BODY");
@@ -239,21 +257,109 @@ describe("orchestrator_close_workload removes the root after the close (§ 1.5)"
 		return { home, ledger, wl, close, scratchEntries };
 	}
 
-	test("the root goes, a symlink inside it is removed as a link (its target stays), and scratch-removed: is recorded on the standing workload", async () => {
+	test("the root is archived (listed back, hashed) and only then removed; a symlink inside is archived and removed as a link (its target stays); scratch-archived: then scratch-removed: are recorded", async () => {
 		const { home, ledger, wl, close, scratchEntries } = closing();
 		const root = scratchRootFor(home, wl);
 		mkdirSync(root, { recursive: true });
 		mkdirSync(join(root, "clone", "deep"), { recursive: true });
 		writeFileSync(join(root, "clone", "deep", "f.txt"), "x");
+		writeFileSync(join(root, "REPORT.md"), "the deliverable");
 		const outside = tmp("scratch-outside");
 		writeFileSync(join(outside, "keep.txt"), "keep");
 		symlinkSync(outside, join(root, "link"));
 		const text = await close();
-		expect(text).toStartWith(`Closed ${wl}. Scratch root ${root} removed (entry en-`);
+		const archive = onlyArchive(home);
+		expect(archive).not.toBeNull();
+		expect(archive!.startsWith(`${scratchArchiveBase(home)}/`)).toBe(true);
+		expect(archive!).toEndWith(`/${wl}.tar.gz`);
+		const bytes = lstatSync(archive!).size;
+		const sha = new Bun.CryptoHasher("sha256").update(readFileSync(archive!)).digest("hex");
+		expect(text).toStartWith(`Closed ${wl}. Scratch root ${root} archived to ${archive} (${bytes} bytes, sha256 ${sha}) and removed (entries en-`);
 		expect(ledger.workload(wl)!.status).toBe("closed");
 		expect(existsSync(root)).toBe(false);
 		expect(readFileSync(join(outside, "keep.txt"), "utf8")).toBe("keep");
-		expect(scratchEntries().map((x) => [x.created_by, x.body])).toEqual([[SURFACE_BY, `${SCRATCH_ENTRY.removed} ${wl} ${root}`]]);
+		expect(members(archive!)).toEqual([wl, `${wl}/REPORT.md`, `${wl}/clone`, `${wl}/clone/deep`, `${wl}/clone/deep/f.txt`, `${wl}/link`].sort());
+		// The archive holds the files themselves: unpacked, the deliverable reads back and the link is still a link.
+		const out = tmp("scratch-unpack");
+		expect(Bun.spawnSync(["tar", "-xzf", archive!, "-C", out]).exitCode).toBe(0);
+		expect(readFileSync(join(out, wl, "REPORT.md"), "utf8")).toBe("the deliverable");
+		expect(lstatSync(join(out, wl, "link")).isSymbolicLink()).toBe(true);
+		expect(scratchEntries().map((x) => [x.created_by, x.body])).toEqual([
+			[SURFACE_BY, `${SCRATCH_ENTRY.archived} ${wl} ${archive} ${bytes} ${sha}`],
+			[SURFACE_BY, `${SCRATCH_ENTRY.removed} ${wl} ${root}`],
+		]);
+		ledger.close();
+	});
+
+	test("an archive that cannot be written keeps the root, whole: the close still goes through and scratch-remove-failed: says it was not archived", async () => {
+		const { home, ledger, wl, close, scratchEntries } = closing();
+		const root = scratchRootFor(home, wl);
+		mkdirSync(join(root, "evidence"), { recursive: true });
+		writeFileSync(join(root, "REPORT.md"), "the deliverable");
+		writeFileSync(join(root, "evidence", "run.log"), "log");
+		// The archive base is a plain file, so no archive directory can be made under it.
+		mkdirSync(join(scratchArchiveBase(home), ".."), { recursive: true });
+		writeFileSync(scratchArchiveBase(home), "not a directory");
+		const text = await close();
+		expect(text).toStartWith(`Closed ${wl}. Scratch root ${root} kept: not archived: `);
+		expect(ledger.workload(wl)!.status).toBe("closed");
+		expect(readFileSync(join(root, "REPORT.md"), "utf8")).toBe("the deliverable");
+		expect(readFileSync(join(root, "evidence", "run.log"), "utf8")).toBe("log");
+		expect(readdirSync(join(root, "..")).filter((n) => n.startsWith(".removing-"))).toEqual([]);
+		const entries = scratchEntries().map((x) => [x.created_by, x.body]);
+		expect(entries).toHaveLength(1);
+		expect(entries[0]![0]).toBe(SURFACE_BY);
+		expect(entries[0]![1]).toStartWith(`${SCRATCH_ENTRY.removeFailed} ${wl} ${root}: not archived (`);
+		expect(entries[0]![1]).toEndWith("); the root is kept");
+		ledger.close();
+	});
+
+	test("a done-because naming a path inside the root: the close result names the archive that holds it", async () => {
+		const { home, ledger, wl, close } = closing();
+		const root = scratchRootFor(home, wl);
+		mkdirSync(join(root, "replay"), { recursive: true });
+		writeFileSync(join(root, "replay", "REPORT.md"), "the deliverable");
+		// The holder's receipt (decision 16): launched on the workload, holds it, records done-because, releases.
+		ledger.recordEntry({ by: "lane-starter", workloadId: wl, kind: "assumption", body: "launch: lane-a cause first requested-by test" });
+		expect(ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 60_000 }).won).toBe(true);
+		ledger.recordEntry({ by: "lane-a", workloadId: wl, kind: "assumption", body: `done-because: the replay's verdict is in ${root}/replay/REPORT.md.` });
+		ledger.releaseWorkload(wl, { by: "lane-a", holder: "lane-a" });
+		const text = await close();
+		const archive = onlyArchive(home);
+		expect(archive).not.toBeNull();
+		expect(text).toContain(`The done-because names ${root}/replay/REPORT.md, inside the scratch root: it is in the archive ${archive} as ${wl}/replay/REPORT.md.`);
+		expect(existsSync(root)).toBe(false);
+		expect(members(archive!)).toContain(`${wl}/replay/REPORT.md`);
+		ledger.close();
+	});
+
+	test("closeScratchRoot: a done-because path spelled through $AS2_SCRATCH or ~ is found; one inside a kept root says it is kept", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const home = tmp("scratch-home");
+		const root = scratchRootFor(home, wl);
+		mkdirSync(root, { recursive: true });
+		writeFileSync(join(root, "notes.md"), "n");
+		const now = new Date("2026-10-28T22:17:00.000Z");
+		const archive = archivePathFor(home, wl, now);
+		const said = closeScratchRoot(ledger, { HOME: home }, wl, { doneBecause: "see $AS2_SCRATCH/notes.md and ~/agent-scratch/agent-system-2.0/scratch/" + wl + "/notes.md", now });
+		expect(said).toContain(`archived to ${archive} (`);
+		expect(said).toContain(`The done-because names $AS2_SCRATCH/notes.md, inside the scratch root: it is in the archive ${archive} as ${wl}/notes.md.`);
+		expect(said).toContain(`The done-because names ~/agent-scratch/agent-system-2.0/scratch/${wl}/notes.md, inside the scratch root: it is in the archive ${archive} as ${wl}/notes.md.`);
+
+		const { wl: wl2 } = workloadWithSlice(ledger);
+		const root2 = scratchRootFor(home, wl2);
+		mkdirSync(root2, { recursive: true });
+		writeFileSync(join(root2, "REPORT.md"), "r");
+		rmSync(scratchArchiveBase(home), { recursive: true });
+		writeFileSync(scratchArchiveBase(home), "not a directory");
+		const kept = closeScratchRoot(ledger, { HOME: home }, wl2, { doneBecause: `report at ${root2}/REPORT.md`, now });
+		expect(kept).toContain(`Scratch root ${root2} kept: not archived: `);
+		expect(kept).toContain(`The done-because names ${root2}/REPORT.md, inside the scratch root, which is kept at ${root2}.`);
+		expect(existsSync(join(root2, "REPORT.md"))).toBe(true);
+		// A path that only shares the root's prefix (another workload's id) is not inside it.
+		const { wl: wl3 } = workloadWithSlice(ledger);
+		expect(closeScratchRoot(ledger, { HOME: home }, wl3, { doneBecause: `${root2}x/REPORT.md`, now })).toBe("");
 		ledger.close();
 	});
 
@@ -273,7 +379,7 @@ describe("orchestrator_close_workload removes the root after the close (§ 1.5)"
 		ledger.close();
 	});
 
-	test("a base reached through a symlink still removes exactly <realpath(base)>/<id>; a missing root is a no-op with no entry", async () => {
+	test("a base reached through a symlink still archives and removes exactly <realpath(base)>/<id>, and the archive lands beside the HOME-form base; a missing root is a no-op with no entry", async () => {
 		const a = closing();
 		const real = tmp("scratch-real-base");
 		mkdirSync(join(a.home, "agent-scratch", "agent-system-2.0"), { recursive: true });
@@ -282,7 +388,10 @@ describe("orchestrator_close_workload removes the root after the close (§ 1.5)"
 		writeFileSync(join(real, a.wl, "f.txt"), "x");
 		const sibling = join(real, "wl-other");
 		mkdirSync(sibling);
-		expect(await a.close()).toContain(`Scratch root ${scratchRootFor(a.home, a.wl)} removed`);
+		const said = await a.close();
+		expect(said).toContain(`Scratch root ${scratchRootFor(a.home, a.wl)} archived to ${scratchArchiveBase(a.home)}/`);
+		expect(said).toContain(") and removed (entries ");
+		expect(members(onlyArchive(a.home)!)).toEqual([a.wl, `${a.wl}/f.txt`]);
 		expect(existsSync(join(real, a.wl))).toBe(false);
 		expect(existsSync(sibling)).toBe(true);
 		expect(realpathSync(real)).toBe(realpathSync(join(a.home, "agent-scratch", "agent-system-2.0", "scratch")));

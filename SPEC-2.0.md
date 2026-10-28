@@ -534,7 +534,9 @@ waits for the window. **Security red:** a full-suite run of any verdict but `sup
 `gates/test/` (as2's security tests) makes the test runner send `security-red: <wl> <slice> <run id> <sha> <n> <first>`,
 whatever holds the workload; it shows as its own on-fire needs-you line, past a live lane and a train task's routing,
 while the ordinary test-run line keeps its suppression. A lane asks Jo before it changes such a test. The daily sweep's
-`scratch-disk` line is on fire too.
+`scratch-disk` line (scratch total over `AGENT_SYSTEM_SCRATCH_TOTAL_MB`, or free space on the scratch volume under
+`scratchArchive.minFreeGib`) is on fire too. Scratch roots are archived before they are removed, at close and by the
+sweep, and a root whose archive fails is kept (`migration/items/close-archives-scratch.md`).
 
 ### B4 · Stakes → tier cap, and review as a stakes property (P-9, P-8a, A4 "approved")
 

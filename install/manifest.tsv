@@ -1218,6 +1218,7 @@ surface/scripts/scratch-sweep.ts	module	-
 surface/scripts/scratch-audit.ts	module	-
 surface/scripts/scratch-smoke.ts	module	-
 surface/src/scratch-remove.ts	module	-
+surface/src/scratch-archive.ts	module	-
 surface/src/scratch-root.ts	module	-
 surface/test/scratch-sweep.test.ts	test	-
 surface/test/scratch-audit.test.ts	test	-

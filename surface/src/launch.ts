@@ -89,6 +89,7 @@ export const CONTROL_PREFIXES = [
 	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-notice", "train-autoboard",
 	"withdrawn",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
+	"scratch-archived", "scratch-archive-expired",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
 	"queued",
 	"lane-metrics", "daily-report",
@@ -180,7 +181,9 @@ export const DAILY_REPORT_BY = "daily-report";
  * The scratch lines (PLAN wl-mv5oikd5jtquww § 1.5, gates/src/scratch.ts SCRATCH_ENTRY) are machinery's alone, so a lane cannot
  * hide its own over-cap line with a forged `scratch-under-cap:`: `scratch-over-cap:` / `scratch-under-cap:` are the lane row's
  * turn-end measure, written as the lane holding the workload (a holder, `validWriter`); `scratch-disk:` / `scratch-disk-ok:` the
- * daily sweep's (SCRATCH_SWEEP_BY, on the standing workload); `scratch-removed:` / `scratch-remove-failed:` the close's (the surface).
+ * daily sweep's (SCRATCH_SWEEP_BY, on the standing workload); `scratch-removed:` / `scratch-remove-failed:` the close's (the surface);
+ * `scratch-archived:` (an archive written and verified before a root is removed) the close's and the daily sweep's, and
+ * `scratch-archive-expired:` (an archive past `scratchArchive.expireDays` removed) the daily sweep's.
  * Jev ranking's rows (PLAN wl-mv8k039gvogt8g D3, surface/src/rank.ts): `priority-signal:` / `priority-signal-failed:` (on the
  * ranked workload) and `rank-shown:` (on the standing workload) are the ranking machinery's (RANK_BY), whichever session ranked;
  * `rank-goals:`, `rank-override:`, `rank-unpin:` (Jo's words, bound to an input) and `rank-audit:` (the wake tick) are the surface's.
@@ -247,6 +250,8 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"scratch-disk-ok": [SCRATCH_SWEEP_BY],
 	"scratch-removed": [SURFACE_BY],
 	"scratch-remove-failed": [SURFACE_BY],
+	"scratch-archived": [SURFACE_BY, SCRATCH_SWEEP_BY],
+	"scratch-archive-expired": [SCRATCH_SWEEP_BY],
 	"priority-signal": [RANK_BY],
 	"priority-signal-failed": [RANK_BY],
 	"rank-shown": [RANK_BY],

@@ -9,7 +9,7 @@
   flags are not spelled out here; install/install.sh's header has them.) launchd runs
   surface/scripts/scratch-sweep.ts once a day at 04:30 local time (a sleeping Mac runs it at wake).
   The ledger variable names the ledger install wrote, so the sweep reads the workload state of that
-  ledger and writes its disk entry there. PATH holds only the system directories: the sweep runs du.
+  ledger and writes its disk entry there. PATH holds only the system directories: the sweep runs du and tar.
 -->
 <plist version="1.0">
 <dict>

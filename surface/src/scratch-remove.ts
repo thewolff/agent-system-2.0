@@ -1,5 +1,5 @@
 // The one removal every scratch cleanup goes through (PLAN wl-mv5oikd5jtquww § 1.5–1.7): the close's
-// removeScratchRoot (surface/src/close-entry.ts), the daily sweep (surface/scripts/scratch-sweep.ts) and the audit's
+// archiveScratchRoot (surface/src/close-entry.ts), the daily sweep (surface/scripts/scratch-sweep.ts) and the audit's
 // `delete` of a quarantine stamp (surface/scripts/scratch-audit.ts). A path checked and then removed by name can be
 // redirected between the two: a same-user process renames an ancestor away and puts a symlink in its place, and the
 // recursive remove lands in another directory's child of the same name. So a child is removed only through

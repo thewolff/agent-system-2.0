@@ -410,3 +410,18 @@ jevRank:
 channel:
   senders:
     - { id: plumb, transport: omp-mailbox, authority: notes }
+
+# ── Scratch archives (surface/src/scratch-archive.ts readScratchArchiveConfig) ──
+# A closed workload's scratch root, and every root the daily sweep (surface/scripts/scratch-sweep.ts) removes,
+# is first written to one verified .tar.gz under ~/agent-scratch/agent-system-2.0/scratch-archive/<UTC date>/;
+# a root whose archive fails is kept. The per-root and total size caps stay in AGENT_SYSTEM_SCRATCH_CAP_MB and
+# AGENT_SYSTEM_SCRATCH_TOTAL_MB. expireDays: the daily sweep removes archives older than this (days, by mtime).
+# requireOffsite: when true, an archive expires only once an offsite copy job has written `<archive>.offsite`
+# beside it; false is plain age expiry. minFreeGib: the sweep's `scratch-disk:` needs-you line also opens when
+# free space on the scratch volume is under this many GiB. Read by the sweep at each run; a missing block or a
+# malformed key is its default (14, false, 20). OMP has no registration for the key and keeps it in the raw layer.
+# Reversal: delete the block (the defaults apply).
+scratchArchive:
+  expireDays: 14
+  requireOffsite: false
+  minFreeGib: 20
