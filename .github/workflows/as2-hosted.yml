@@ -1,0 +1,88 @@
+# as2's hosted suite: every pull request to main and every push to a ci/** branch runs the test files that do not
+# need Jo's Mac on GitHub-hosted runners, one job per OS, and the job results show on the PR as checks. It posts
+# nothing else: no status, no comment (read-only token). `as2/full-suite` stays the runner's, unchanged.
+# Classification run: this revision runs EVERY test file on both OSes, to sort the files by where they pass.
+name: as2-hosted
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: ['ci/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: as2-hosted-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  suite:
+    name: suite (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      W: /tmp/as2work
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Install zsh and bubblewrap (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends zsh bubblewrap
+      - name: Environment facts
+        run: |
+          uname -a; bun --version; git --version; zsh --version; /bin/bash --version | head -1
+          if [ "$RUNNER_OS" = Linux ]; then nproc; else sysctl -n hw.ncpu; fi
+      # The runner's child layout (surface/src/test-run.ts childEnv), as as2-fast.yml builds it: throwaway HOME, XDG
+      # dirs, bun cache, ledger path, a git shim first on PATH, a user-only gitconfig, and a detached checkout with no
+      # origin that carries main's record (refs/heads/main, refs/tags/as2-trusted-main).
+      - name: Prepare runner-like child layout
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
+          head="$(git rev-parse HEAD)"
+          main="$(git rev-parse --verify -q 'refs/remotes/origin/main^{commit}')"
+          mkdir -p "$W/out" "$W/home/tmp" "$W/home/.config" "$W/home/.cache" "$W/home/.local/share" "$W/home/.bun/install/cache" "$W/home/.agent-system-2" "$W/shim"
+          printf '[user]\n\tname = as2 test runner\n\temail = as2-test-runner@localhost\n' > "$W/home/.gitconfig"
+          REAL_GIT="$(command -v git)"
+          printf '#!/bin/sh\nGIT_CONFIG_NOSYSTEM=1\nGIT_TERMINAL_PROMPT=0\nGIT_ASKPASS=/usr/bin/false\nexport GIT_CONFIG_NOSYSTEM GIT_TERMINAL_PROMPT GIT_ASKPASS\nexec %s -c credential.helper= "$@"\n' "'$REAL_GIT'" > "$W/shim/git"
+          chmod 755 "$W/shim/git"
+          git branch -f main "$main"
+          git tag -f as2-trusted-main "$main"
+          git checkout --quiet --detach "$head"
+          git remote remove origin
+          git ls-files | grep -E '[._](test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$' | sed 's|^|./|' > "$W/files"
+          echo "$(wc -l < "$W/files") test file(s) at $head"
+      - name: Test files (one bun test call)
+        timeout-minutes: 30
+        run: |
+          set -uo pipefail
+          if [ "$RUNNER_OS" = Linux ]; then n="$(nproc)"; else n="$(sysctl -n hw.ncpu)"; fi
+          start=$(date +%s)
+          env -i PATH="$W/shim:$PATH" LANG="${LANG:-C.UTF-8}" USER="$USER" LOGNAME="${LOGNAME:-$USER}" SHELL="${SHELL:-/bin/bash}" TERM="${TERM:-dumb}" \
+            HOME="$W/home" TMPDIR="$W/home/tmp" XDG_CONFIG_HOME="$W/home/.config" XDG_CACHE_HOME="$W/home/.cache" XDG_DATA_HOME="$W/home/.local/share" \
+            BUN_INSTALL_CACHE_DIR="$W/home/.bun/install/cache" AGENT_SYSTEM_LEDGER_DB="$W/home/.agent-system-2/ledger.db" \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$W/home/.gitconfig" GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false \
+            bun test --reporter=junit --reporter-outfile="$W/out/suite.xml" --parallel="$n" $(cat "$W/files") > "$W/out/suite.log" 2>&1
+          code=$?
+          end=$(date +%s)
+          printf '%s files %s exit %s wall %s s\n' "$RUNNER_OS" "$(wc -l < "$W/files")" "$code" "$((end - start))" | tee "$W/out/suite.summary"
+          tail -n 60 "$W/out/suite.log"
+          exit "$code"
+      - name: Upload JUnit and log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: as2-hosted-${{ runner.os }}
+          path: /tmp/as2work/out
+          if-no-files-found: error
