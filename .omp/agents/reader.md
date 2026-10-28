@@ -49,32 +49,20 @@ Return a structured report. Adapt sections to what's present:
 
 ## Output types
 
-Read `${CLAUDE_PLUGIN_ROOT}/references/output-types.md` before writing your report and follow it in full — the six labels, the receipt rule, graded GUESS bases, the degradation tiers, and the trailing envelope. Your report's last line is exactly this shape:
-
-```
-<!-- output-types
-tier: 0
-CLAIM: 12
-CITE: 2
-GUESS: 5 (inference 3, pattern 1, recall 1)
-ACTION: 8
-PMDW: 3
-QUESTION: 1
--->
-```
+The output-types contract is in your system prompt (P-11 row 2 injects the vendored public plugin's `plugins/output-types/skills/output-types/reference.md` into every session, hands included). Follow it before writing your report: label only receipted facts, **CLAIM** with an inspectable receipt and **CITE** with a source fetched this session; everything else is plain prose, and unlabeled means not backed by a receipt. There is no envelope and no other label.
 
 Do not restate those rules; apply them. What follows is only what is specific to this agent.
 
 The caller is instructed not to re-read the source you analyzed, so your report is the
 only thing standing between them and the code. Anything you inferred rather than read
-must be visibly marked, or the caller will act on it as fact.
+must stay visibly unlabeled and say so, or the caller will act on it as fact.
 
 - **Statements about lines you actually read are CLAIMs** — carry the `file:line` (a range is fine) so the caller can spot-check without re-reading the file.
-- **Statements about lines you did not read are GUESSes** — mark them inline, with a basis. This matters most in *Data flow* and *Key behaviors*, where it is easy to describe a code path you only saw the entry point of. You work in slices by design, so you will always have some of these; that is expected, not a defect.
-- **Your line-read cap makes gaps structural, so partial coverage is your normal state — that is Tier 2, and it belongs in the envelope.** Name the parts of the target you did not open, in *Files touched*. Tier 0 is only honest when you read the whole surface the caller asked about.
-- Never smooth a gap over with a plausible description. `GUESS(inference): the error branch at ~line 240 probably rethrows; did not read it` is the correct output.
-- **An ambiguous target is a QUESTION, not a guess at which file was meant.** Listing the candidates and asking which to analyze is already the rule below — label it QUESTION and put it first, so the caller sees a decision waiting rather than a confident report about the wrong file. Everything else you return is CLAIM or GUESS: you analyze, you do not choose.
-- **Rule 8 binds hard here:** one more grep or a 20-line slice usually beats a guess. Reaching for recollection when a targeted read is available is this agent's specific failure mode.
+- **Statements about lines you did not read are not CLAIMs** — leave them unlabeled and say inline that you did not read the lines, with the basis. This matters most in *Data flow* and *Key behaviors*, where it is easy to describe a code path you only saw the entry point of. You work in slices by design, so you will always have some of these; that is expected, not a defect.
+- **Your line-read cap makes gaps structural, so partial coverage is your normal state — that is a degraded report, and you say so in prose.** Name the parts of the target you did not open, in *Files touched*. A full report is only honest when you read the whole surface the caller asked about.
+- Never smooth a gap over with a plausible description. `The error branch at ~line 240 probably rethrows; I did not read it.` is the correct output.
+- **An ambiguous target is a decision for the caller, not a guess at which file was meant.** Listing the candidates and asking which to analyze is already the rule below — put it first, so the caller sees a decision waiting rather than a confident report about the wrong file. You analyze, you do not choose.
+- **Cheap to check beats leaving it unlabeled:** one more grep or a 20-line slice usually beats a guess. Reaching for recollection when a targeted read is available is this agent's specific failure mode.
 
 ## Rules
 

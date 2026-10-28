@@ -92,7 +92,7 @@ To let the runner serve your own repository, add it under `testRunner.repos` in 
 as2
 ```
 
-`as2` renders the orchestrator's system prompt to `~/.agent-system-2/orchestrator/system.md` from `voice/VOICE.md` and `contract/output-types.md`, then runs:
+`as2` renders the orchestrator's system prompt to `~/.agent-system-2/orchestrator/system.md` from `voice/VOICE.md` and the output-types contract (`plugins/output-types/skills/output-types/reference.md`), then runs:
 
 ```sh
 env <OTEL_…=…> OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd <checkout> --append-system-prompt ~/.agent-system-2/orchestrator/system.md

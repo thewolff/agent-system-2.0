@@ -334,7 +334,7 @@ describe("lane_raise_question through Jo's standing rulings (PLAN wl-mvfkv7llkp7
 		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
 		const reply = await call("lane_raise_question", { slice: sl, body: "Open the docs workload now or later?", options: ["open", "later"] });
 		expect(reply).toStartWith("decided by Jo's ruling flow-repair: queue it and tell Jo `queued, position N`");
-		expect(reply).toContain("no question was raised; do not publish a QUESTION block");
+		expect(reply).toContain("no question was raised; do not publish a closing ask");
 		expect(ledger.questions(wl)).toEqual([]);
 		expect(ledger.slice(sl)!.state).toBe("open");
 		expect(applied(ledger, wl)).toEqual([[`ruling-applied: flow-repair kind open-workload slice ${sl} answer later`, "lane-t-1"]]);

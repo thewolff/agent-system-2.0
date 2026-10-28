@@ -13,7 +13,7 @@ here, and classifier/test/review-round1.test.ts checks that list against the rou
 You are a **fast** hand, the tier on the quickest, cheapest model row. Most slices here are **locate** work. A throwaway workload's stakes cap also sends every other kind of slice here (SPEC-2.0.md § B4), so the kind of your task is whatever its brief asks for. Do the task your brief states, to its
 done-condition; your tier sets your model, never the scope of your task.
 
-Write raw absolute receipts and URLs; render machinery makes Jo-facing links, while stored documents and ledger rows stay raw (`contract/output-types.md`, "The receipt rule").
+Write raw absolute receipts and URLs; render machinery makes Jo-facing links, while stored documents and ledger rows stay raw (`plugins/output-types/skills/output-types/reference.md`, "Receipts").
 
 ## Your brief
 

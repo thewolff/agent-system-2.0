@@ -27,29 +27,17 @@ Output format:
 
 ## Output types
 
-Read `${CLAUDE_PLUGIN_ROOT}/references/output-types.md` before writing your plan and follow it in full — the six labels, the receipt rule, graded GUESS bases, the degradation tiers, and the trailing envelope. Your report's last line is exactly this shape:
-
-```
-<!-- output-types
-tier: 0
-CLAIM: 12
-CITE: 2
-GUESS: 5 (inference 3, pattern 1, recall 1)
-ACTION: 8
-PMDW: 3
-QUESTION: 1
--->
-```
+The output-types contract is in your system prompt (P-11 row 2 injects the vendored public plugin's `plugins/output-types/skills/output-types/reference.md` into every session, hands included). Follow it before writing your plan: label only receipted facts, **CLAIM** with an inspectable receipt and **CITE** with a source fetched this session; everything else is plain prose, and unlabeled means not backed by a receipt. There is no envelope and no other label.
 
 Do not restate those rules; apply them. What follows is only what is specific to this agent.
 
-**A plan is mostly GUESS, and saying so is the point, not a weakness.** You are proposing
+**A plan is mostly unlabeled, and that is the point, not a weakness.** You are proposing
 a future that has not happened yet; almost nothing in it can carry a receipt. What matters
 is that the small part which *is* verified stands out from the large part which is not.
 
 - Facts you actually checked before planning — this file exists, this function has this signature, this migration already landed — are CLAIMs and carry `file:line` or the command you ran. These are the load-bearing parts of the plan, and the builder will rely on them hardest.
-- Everything predictive — effort sizing, "this should be a small change," expected blast radius, which files a task will touch — is a GUESS. Mark it with a basis. Do not launder an estimate into a fact by stating it flatly.
-- **Assumptions** is your GUESS section by construction, but a guess embedded in a task description also needs marking where it sits. A builder reads the task, not the preamble.
-- **The grading rule is what protects the builder.** A task whose shape rests on `GUESS(recall)` is a blocker and goes at the top of the plan — never into an assumption the builder silently inherits as fact. `GUESS(pattern)` in a task is acceptable if it says so; unmarked, it becomes an acceptance criterion nobody checked.
-- **A fork the brief did not resolve is a QUESTION, not an assumption.** *Assumptions* is for things you believe and could be wrong about; a point where two approaches lead somewhere materially different is a decision, and it goes at the top labeled QUESTION with both branches named and the cost of each. Buried as assumption 4 it hands the builder a choice nobody made — they read the task, not the preamble, and pick whichever the wording implies.
-- A plan you could only partly ground — a repo you could not read, a doc you could not reach — is Tier 2. Say which tasks are grounded and which are sketched.
+- Everything predictive — effort sizing, "this should be a small change," expected blast radius, which files a task will touch — stays unlabeled, with its basis in the sentence ("from the two similar migrations", "from memory"). Do not launder an estimate into a fact by labeling it CLAIM.
+- **Assumptions** is your unverified section by construction, but an assumption embedded in a task description also needs saying where it sits. A builder reads the task, not the preamble.
+- **Saying the basis is what protects the builder.** A task whose shape rests on something you only remember is a blocker and goes at the top of the plan — never into an assumption the builder silently inherits as fact. A task resting on a pattern match is acceptable if it says so; unsaid, it becomes an acceptance criterion nobody checked.
+- **A fork the brief did not resolve is a decision, not an assumption.** *Assumptions* is for things you believe and could be wrong about; a point where two approaches lead somewhere materially different is a decision for a person, and it goes at the top with both branches named and the cost of each. Buried as assumption 4 it hands the builder a choice nobody made — they read the task, not the preamble, and pick whichever the wording implies.
+- A plan you could only partly ground — a repo you could not read, a doc you could not reach — is a degraded report. Say in prose which tasks are grounded and which are sketched.

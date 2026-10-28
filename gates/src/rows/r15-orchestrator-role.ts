@@ -26,26 +26,27 @@
 // which row 15 does not refuse.
 //
 // Answer first (M7 fix round 2, finding B; Jo's design via Main, 2026-09-30; MIGRATION.md item 105):
-// Ilex asked Jo a QUESTION about an open workload, Jo answered "use your draft", and nothing reached
+// Ilex asked Jo a question about an open workload, Jo answered "use your draft", and nothing reached
 // the ledger, so the lane that picked the workload up had to reconstruct the decision from chat. Row
 // 11 records Jo's input only on a lane bound to a workload; the orchestrator is bound to none, so it
 // never fired here, and it records every input, which is wrong at the surface: Jo's next message may
 // be a question about the question. Item 105 then found the asks themselves missing: the orchestrator's
-// QUESTIONs were chat alone, invisible to the needs-you render, the invariant report and a restart.
+// questions were chat alone, invisible to the needs-you render, the invariant report and a restart.
 // So every ask is a `questions` row first: the orchestrator raises it with orchestrator_raise_question
 // (a row on its standing slice, surface/src/orchestrator-question.ts) and names the `q-…` id in the
-// QUESTION block. The ask is bound to its rows at two points (Codex review of PR #55, B2 and B3):
+// closing ask (row 1's `Closing ask` section, closingAsks). The ask is bound to its rows at two
+// points (Codex review of PR #55, B2 and B3):
 //
 // - At publication (`checkQuestionPublication`, run by gates/extensions/r01-turn-shape.ts on the
 //   orchestrator's final reply, which it withholds on a refusal, and again at session_stop): every
-//   `q-…` id the reply's QUESTION blocks name must be a row on the standing slice, still open, and
+//   `q-…` id the reply's closing ask names must be a row on the standing slice, still open, and
 //   cited by no earlier published reply; a block naming none, an unknown id, a lane's row, a row off
 //   the standing slice, a resolved row or a re-cited row refuses the reply (an ask with no row is not
 //   asked). The rows a passing reply cites are recorded as one `assumption` entry on the standing
 //   workload (`question-published: q-…`), so a later reply cannot cite them again. No wall-clock
 //   comparison between the message and the row: ordering is the citation, not a timestamp.
-// - At the next working call (`unansweredQuestion`): the latest assistant message carrying a real
-//   **QUESTION** block (row 1's reading, questionBlocks) is *unrecorded* while any id it names is no
+// - At the next working call (`unansweredQuestion`): the latest assistant message carrying a
+//   closing ask (row 1's reading, closingAsks) is *unrecorded* while any id it names is no
 //   row on the standing slice, or names a resolved row never published (fail closed), and *open*
 //   while any such row is still open; a reply the gates withheld (`GateSession.heldReply`) is *held*
 //   with its reason, since the session file carries only its marker. Any of these refuses the call:
@@ -56,7 +57,7 @@
 //   orchestrator_record_instruction naming the question and Jo's input row, which does the same.
 //   Reads, the wake read, the ledger read, the question tool and the recorder stay allowed.
 // - Item 72 (the launch tool refused a relaunch over an answered question): its two causes were a
-//   QUESTION naming several workloads and two clocks compared (the session entry's against the
+//   question naming several workloads and two clocks compared (the session entry's against the
 //   ledger row's). Here the row's state is the order — the recorder answers the row in the same call
 //   that produces its result, so the session's entries are not read for the answer and no clock is
 //   compared — and a launch or a close that names exactly one workload (a non-empty string
@@ -74,7 +75,7 @@ import { gitReads } from "../git-model";
 import { type AgentMessageLike, messageText } from "../session";
 import { WRITE_TOOLS } from "../targets";
 import type { CallContext, Refusal, ToolCall } from "../types";
-import { questionBlocks } from "./r01-turn-shape";
+import { closingAsks } from "./r01-turn-shape";
 
 export const ORCHESTRATOR_ROLE_REFUSAL = "the orchestrator opens workloads; a lane does this — open one with orchestrator_open_workload";
 
@@ -104,11 +105,11 @@ const record = (v: unknown): Record<string, unknown> | null => (v !== null && ty
 /** A workload id as the surface tools read it (`String(…).trim()`), or null when it is not a non-empty string: fail closed. */
 const workloadIdOf = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v.trim() : null);
 
-/** The orchestrator's latest QUESTION to Jo as the ledger sees it: no row for it, rows still open, or a reply held unpublished. */
+/** The orchestrator's latest closing ask to Jo as the ledger sees it: no row for it, rows still open, or a reply held unpublished. */
 export type Unanswered =
-	/** The QUESTION block names no `q-…` row on the standing slice, or one never published: the ask was never recorded. */
+	/** The closing ask names no `q-…` row on the standing slice, or one never published: the ask was never recorded. */
 	| { kind: "unrecorded" }
-	/** The block's rows that are still open, in the block's order, each with its subject workload (null: an ask with no subject, which scopes to nothing). */
+	/** The ask's rows that are still open, in the ask's order, each with its subject workload (null: an ask with no subject, which scopes to nothing). */
 	| { kind: "open"; questionIds: string[]; subjects: (string | null)[] }
 	/** The session's last reply was withheld (r01-turn-shape) for `reason`: nothing works until a reply passes. */
 	| { kind: "held"; reason: string };
@@ -136,10 +137,10 @@ export function publishedQuestionIds(ledger: Ledger): Set<string> {
 	return out;
 }
 
-/** The `q-…` ids `text`'s QUESTION blocks name, in order, once each; null when it carries no QUESTION block. */
+/** The `q-…` ids `text`'s closing ask names, in order, once each; null when it carries no closing ask. */
 export function questionIdsOf(text: string): string[] | null {
-	const blocks = questionBlocks(text);
-	return blocks.length === 0 ? null : [...new Set(blocks.join("\n").match(Q_ID) ?? [])];
+	const asks = closingAsks(text);
+	return asks.length === 0 ? null : [...new Set(asks.join("\n").match(Q_ID) ?? [])];
 }
 
 /** The row `id`, when it is a question on the standing slice; null for an unknown id, a lane's row, or a row off the standing slice. */
@@ -150,7 +151,7 @@ function standingRow(ledger: Ledger, id: string): QuestionRow | null {
 }
 
 /**
- * The latest QUESTION the orchestrator sent Jo, when the ledger does not show it answered: no row
+ * The latest closing ask the orchestrator sent Jo, when the ledger does not show it answered: no row
  * for it (`unrecorded`), or a row still open. The ledger is opened only when there is a question.
  */
 export function unansweredQuestion(entries: readonly EntryLike[], openLedger: () => Ledger): Unanswered | null {
@@ -172,17 +173,17 @@ export function unansweredQuestion(entries: readonly EntryLike[], openLedger: ()
 	return null;
 }
 
-/** The one line refusing a working call, or the reply itself, while the orchestrator's QUESTION has no ledger row. */
+/** The one line refusing a working call, or the reply itself, while the orchestrator's closing ask has no ledger row. */
 export const UNRECORDED_QUESTION_REFUSAL =
-	`your QUESTION to Jo is not in the ledger: raise it with ${RAISE_QUESTION_TOOL} first and name the q-… id it returns in the QUESTION block, so Jo can answer it by id; a question with no row is not asked`;
+	`your closing ask to Jo is not in the ledger: raise it with ${RAISE_QUESTION_TOOL} first and name the q-… id it returns in the closing ask, so Jo can answer it by id; a question with no row is not asked`;
 
-/** The one line refusing a reply whose QUESTION names a row that was already resolved or already asked. */
+/** The one line refusing a reply whose closing ask names a row that was already resolved or already asked. */
 export const reusedQuestionRefusal = (id: string, why: "answered" | "withdrawn" | "published"): string =>
-	`your QUESTION to Jo names ${id}, ${why === "published" ? "which an earlier reply already asked" : `a row already ${why}`}: raise the ask again with ${RAISE_QUESTION_TOOL} and name the id it returns; a row is asked once`;
+	`your closing ask to Jo names ${id}, ${why === "published" ? "which an earlier reply already asked" : `a row already ${why}`}: raise the ask again with ${RAISE_QUESTION_TOOL} and name the id it returns; a row is asked once`;
 
 /** The one line refusing a working call while Jo's answer to the orchestrator's question is unrecorded. */
 export const answerFirstRefusal = (ids: readonly string[]): string =>
-	`your QUESTION to Jo (${ids.join(", ")}) is open in the ledger: if Jo's reply answers it, record it with ${RECORD_INSTRUCTION_TOOL} naming questionId ${ids[0]} and the inputId the surface named for Jo's words before any working call (Jo's own \`<option> ${ids[0]}\` at the surface does the same); a reply that does not answer it gets words, not work`;
+	`your question to Jo (${ids.join(", ")}) is open in the ledger: if Jo's reply answers it, record it with ${RECORD_INSTRUCTION_TOOL} naming questionId ${ids[0]} and the inputId the surface named for Jo's words before any working call (Jo's own \`<option> ${ids[0]}\` at the surface does the same); a reply that does not answer it gets words, not work`;
 
 /** The refusal for an `Unanswered`. */
 export const unansweredRefusal = (q: Unanswered): string => (q.kind === "unrecorded" ? UNRECORDED_QUESTION_REFUSAL : q.kind === "held" ? q.reason : answerFirstRefusal(q.questionIds));
@@ -191,9 +192,9 @@ export const unansweredRefusal = (q: Unanswered): string => (q.kind === "unrecor
 export type Publication = { ok: true; questionIds: string[] } | { ok: false; reason: string };
 
 /**
- * Bind a reply's QUESTION blocks to their rows at publication: every id named is a row on the
+ * Bind a reply's closing ask to its rows at publication: every id named is a row on the
  * standing slice, open, and cited by no earlier published reply. `ok` with no ids when the reply
- * carries no QUESTION block (the ledger is not opened). The caller records the citation
+ * carries no closing ask (the ledger is not opened). The caller records the citation
  * (`recordPublication`) once the reply is out; at `session_stop` (`published: true`) the reply's
  * own citation already exists, so a cited row passes there and only an uncited one is refused.
  */

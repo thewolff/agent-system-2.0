@@ -1,0 +1,9 @@
+{
+  "name": "output-types",
+  "description": "Label receipted facts, and only those: CLAIM with a first-party receipt, CITE with a fetched source. Unlabeled means unreceipted, so a reader can tell what was checked from what was assumed.",
+  "version": "0.2.0",
+  "author": { "name": "Jo Wolff" },
+  "license": "MIT",
+  "repository": "https://github.com/thewolff/jo-wolff-plugins",
+  "keywords": ["agents", "verification", "reporting", "receipts"]
+}

@@ -101,7 +101,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="$REPO/install/manifest.tsv"
 # Directories whose every file must have a manifest row. Listed ahead of the steps that create
 # them so a new directory cannot slip in unchecked.
-MACHINERY_DIRS=(ledger install extensions agents profile skills plugins tiers classifier gates bin surface contract voice)
+MACHINERY_DIRS=(ledger install extensions agents profile skills plugins tiers classifier gates bin surface voice)
 # The one schema file the ledger module applies (ledger/src/index.ts SCHEMA_PATH). The manifest's
 # ledger-schema row must name exactly this file; the init script re-checks it against the module.
 CANONICAL_SCHEMA="ledger/schema.sql"

@@ -1,6 +1,6 @@
 // orchestrator-prompt: the orchestrator's launch-time system-prompt addition, which `bin/as2` passes
-// to omp as `--append-system-prompt <file>`. It holds the voice section and the owned output-types
-// contract as the exact strings a turn would append (surface/src/session.ts `voiceSection`,
+// to omp as `--append-system-prompt <file>`. It holds the voice section and the output-types
+// contract (the vendored public plugin's reference, plugins/VENDOR.md) as the exact strings a turn would append (surface/src/session.ts `voiceSection`,
 // gates/src/rows/r02-contract.ts `injectContract`), so both extensions find them in the base prompt
 // and leave every turn's system prompt unchanged. OMP runs `before_agent_start` only on a turn Jo
 // types, never on an aside-started one (a wake push, a needs-you, a notice); with the two sections in
@@ -10,7 +10,7 @@
 //   bun surface/scripts/orchestrator-prompt.ts <out-file>
 //
 // The paths are the ones the extensions read: AGENT_SYSTEM_VOICE or voice/VOICE.md, and
-// AGENT_SYSTEM_CONTRACT or contract/output-types.md, in this checkout. Edits to either file reach the
+// AGENT_SYSTEM_CONTRACT or plugins/output-types/skills/output-types/reference.md, in this checkout. Edits to either file reach the
 // orchestrator at its next launch.
 // Exit: 0 written · 1 a source file is missing, named on stderr (omp reads a missing path as literal
 // prompt text, so as2 refuses to launch rather than pass one) · 2 usage

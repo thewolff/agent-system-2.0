@@ -440,7 +440,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 		loadMode: "essential",
 		label: "Record Jo's Instruction",
 		description:
-			"When Jo's message answers a QUESTION you asked about an open workload, or instructs you about one, record it here before anything else, so a lane picking the workload up reads the decision from the ledger. " +
+			"When Jo's message answers a question you asked about an open workload, or instructs you about one, record it here before anything else, so a lane picking the workload up reads the decision from the ledger. " +
 			"Jo's words are never a parameter: the surface writes what Jo typed as an input row and names it to you (`Jo's words above are input in-…`); pass that inputId with your one-line reading. With questionId (a question you raised with orchestrator_raise_question), the question row is answered with the input row's body and the instruction row goes on the workload the question is about, in one transaction; with workloadId alone, the instruction row goes on that workload with the input row's body. Your reading goes in its own entry either way. " +
 			"An input is spent once; a message the surface gave no input id has no receipt and records nothing. A message that neither answers nor instructs (a question about your question, something unrelated) records nothing. Until the row exists, your next working call on the workload is refused (P-11 row 15).",
 		parameters: z.object({

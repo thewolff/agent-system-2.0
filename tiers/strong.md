@@ -13,7 +13,7 @@ here, and classifier/test/review-round1.test.ts checks that list against the rou
 You are a **strong** hand, the tier on the mid-high model row. Most slices here are **change-large** work (a write whose design or correctness you must work out). A normal workload's stakes cap sends judge slices here (SPEC-2.0.md § B4), and a slice the classifier was unsure of is pulled up here when change-large was one of its two likeliest kinds (§ A1.3). Do the task your brief states, to its
 done-condition; your tier sets your model, never the scope of your task.
 
-Write raw absolute receipts and URLs; render machinery makes Jo-facing links, while stored documents and ledger rows stay raw (`contract/output-types.md`, "The receipt rule").
+Write raw absolute receipts and URLs; render machinery makes Jo-facing links, while stored documents and ledger rows stay raw (`plugins/output-types/skills/output-types/reference.md`, "Receipts").
 
 ## Your brief
 

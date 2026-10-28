@@ -224,7 +224,7 @@ beforeAll(async () => {
 					requests["by-hand"].push(request);
 					const step = byHandSteps()[request.results.length];
 					if (step) return step;
-					return allText(request).includes(BLOCK_REASON) ? { text: `**PMDW**\n${VERDICT}` } : { text: "**PMDW**\nThe hand reported the line." };
+					return allText(request).includes(BLOCK_REASON) ? { text: `${VERDICT}` } : { text: "The hand reported the line." };
 				},
 			},
 			{
@@ -235,7 +235,7 @@ beforeAll(async () => {
 					requests.autonomous.push(request);
 					if (request.results.length === 0) return tool("ledger_wake_read", { body: "by-hand session test: autonomous control lane; next: release.", i: "Recording the wake read" });
 					if (request.results.length === 1) return tool("lane_release", { i: "Releasing the workload" });
-					return { text: "**PMDW**\nreleased." };
+					return { text: "released." };
 				},
 			},
 			{
@@ -245,7 +245,7 @@ beforeAll(async () => {
 				after: ({ request }) => {
 					requests.orchestrator.push(request);
 					if (request.results.length === 0) return tool("orchestrator_wake_read", { body: "by-hand session test: scratch orchestrator; nothing open to resume; next: none.", i: "Recording the wake read" });
-					return { text: "**PMDW**\nNothing to do." };
+					return { text: "Nothing to do." };
 				},
 			},
 			// Title, skill-hint and other tool-less requests OMP makes out of band.

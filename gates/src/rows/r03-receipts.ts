@@ -1,20 +1,24 @@
-// P-11 row 3 (DESIGN-2.0.md:340; C4.7; SPEC-2.0.md § B15 item 5): receipts verified — a CLAIM's
+// P-11 row 3 (DESIGN-2.0.md:340; C4.7; SPEC-2.0.md § B15 item 5): receipts verified. A CLAIM's
 // file:line was read this session and its quote matches disk; a CITE's URL was fetched with no
-// redirect; an ACTION's exit code matches the recorded run; "tests pass" has a test run after the
-// last edit; the envelope's counts are computed, not self-reported. Informational: returns flags,
-// never blocks. Label syntax ported from 1.x `output-types-guard.mjs` (LABEL_RE / ANCHOR_RE).
+// redirect; a command reported with its exit code (`cmd` → exit N, in plain prose: the contract
+// reports actions unlabeled) matches the recorded run; "tests pass" has a test run after the last
+// edit. Informational: returns flags, never blocks. Label syntax ported from 1.x
+// `output-types-guard.mjs` (LABEL_RE / ANCHOR_RE), narrowed to the contract's two labels
+// (plugins/output-types/skills/output-types/reference.md): CLAIM and CITE. Unlabeled prose is
+// not backed by a receipt and is not checked.
 //
-// Zero labels (contract/output-types.md § Parent-side handling: a zero-label report is Tier 3) is
-// flagged on a top-level turn's reply, with one carve-out, the trivial-ask path (SPEC-2.0.md § B15,
-// amended 2026-09-30; tiers/orchestrator.md § Trivial asks). Mechanical criterion: a reply with no
-// block-leading label is NOT flagged when its turn made no working call (workCall): no `task` or
-// `eval`, no file write or edit, no `bash` that row 15's read tables do not call read-only
-// (r15-orchestrator-role.ts readOnlyBash), and no surface ledger tool but the two reads (the wake read and orchestrator_ledger), whether
-// called by name or written as its `xd://` device. Opening a workload is such a call
-// (orchestrator_open_workload), so "no working call" covers "opened no workload". Reads — `read`,
-// `grep`, `find`, a read-only command — stay trivial. The turn runs from `before_agent_start` to
-// `session_stop` (gates/extensions/r03-receipts.ts). A hand's yield carries no turn record and is
-// never checked for zero labels: the lane reads it, and every string field of it would flag.
+// Zero labels (contract § Degraded reports, Parent-side: a report of findings with no CLAIM or CITE
+// is unverified) is flagged on a top-level turn's reply, with one carve-out, the trivial-ask path
+// (SPEC-2.0.md § B15, amended 2026-09-30; tiers/orchestrator.md § Trivial asks). Mechanical
+// criterion: a reply with no block-leading CLAIM or CITE is NOT flagged when its turn made no
+// working call (workCall): no `task` or `eval`, no file write or edit, no `bash` that row 15's read
+// tables do not call read-only (r15-orchestrator-role.ts readOnlyBash), and no surface ledger tool
+// but the two reads (the wake read and orchestrator_ledger), whether called by name or written as
+// its `xd://` device. Opening a workload is such a call (orchestrator_open_workload), so "no working
+// call" covers "opened no workload". Reads — `read`, `grep`, `find`, a read-only command — stay
+// trivial. The turn runs from `before_agent_start` to `session_stop`
+// (gates/extensions/r03-receipts.ts). A hand's yield carries no turn record and is never checked
+// for zero labels: the lane reads it, and every string field of it would flag.
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { SURFACE_READ_TOOLS, SURFACE_TOOLS } from "../../../surface/src/types";
@@ -49,8 +53,8 @@ export type HistoryEvent =
 	| { kind: "bash"; command: string; exitCode: number }
 	| { kind: "write"; path: string };
 
-const LABELS = ["CLAIM", "CITE", "GUESS", "ACTION", "QUESTION", "PMDW"] as const;
-const ANCHOR = /^\*\*(CLAIM|CITE|GUESS|ACTION|QUESTION|PMDW)\*\*\s*$/;
+/** A block-leading label, `**CLAIM**` or `**CITE**`, alone on its line. */
+const ANCHOR = /^\*\*(CLAIM|CITE)\*\*\s*$/;
 const TESTS_PASS = /\b(?:tests?\s+(?:all\s+)?pass(?:ed|es|ing)?|all\s+(?:tests\s+)?green|\d+\s+pass\b)/i;
 
 /** One history event from an OMP `tool_result` (field names: pi-tui src/tools/{read,bash}.ts, fetch details). */
@@ -76,7 +80,7 @@ export function historyEvent(toolName: string, input: Record<string, unknown>, d
 }
 
 interface Block {
-	label: (typeof LABELS)[number];
+	label: "CLAIM" | "CITE";
 	text: string;
 }
 
@@ -105,7 +109,7 @@ export function checkReceipts(message: string, history: HistoryEvent[], cwd: str
 	const bs = blocks(message);
 	if (work && work.length > 0 && bs.length === 0 && message.trim()) {
 		flags.push(
-			`the reply carries zero labels after ${work.length} working call${work.length === 1 ? "" : "s"} this turn (${[...new Set(work)].join(", ")}): treated as Tier 3 (contract § Parent-side handling); ` +
+			`the reply carries no CLAIM or CITE after ${work.length} working call${work.length === 1 ? "" : "s"} this turn (${[...new Set(work)].join(", ")}): nothing in it is backed by a receipt (contract § Degraded reports, Parent-side); ` +
 				`a plain reply is the trivial-ask path only when the turn made no working call`,
 		);
 	}
@@ -144,15 +148,15 @@ export function checkReceipts(message: string, history: HistoryEvent[], cwd: str
 				if (!hit || hit.kind !== "fetch") flags.push(`CITE ${url} was not fetched this session`);
 				else if (hit.url.replace(/\/$/, "") !== hit.finalUrl.replace(/\/$/, "")) flags.push(`CITE ${url} redirected to ${hit.finalUrl}; cite what was actually read`);
 			}
-		} else if (b.label === "ACTION") {
-			for (const m of b.text.matchAll(/`([^`\n]+)`\s*(?:→|->)\s*exit\s+(\d+)/g)) {
-				const cmd = m[1]!.trim();
-				const said = Number(m[2]);
-				const run = [...history].reverse().find((h) => h.kind === "bash" && h.command.includes(cmd));
-				if (!run || run.kind !== "bash") flags.push(`ACTION \`${cmd}\` → exit ${said}: no such run recorded this session`);
-				else if (run.exitCode !== said) flags.push(`ACTION \`${cmd}\` reports exit ${said}; the recorded run exited ${run.exitCode}`);
-			}
 		}
+	}
+	// A reported exit code, wherever it sits in the prose.
+	for (const m of message.matchAll(/`([^`\n]+)`\s*(?:→|->)\s*exit\s+(\d+)/g)) {
+		const cmd = m[1]!.trim();
+		const said = Number(m[2]);
+		const run = [...history].reverse().find((h) => h.kind === "bash" && h.command.includes(cmd));
+		if (!run || run.kind !== "bash") flags.push(`\`${cmd}\` → exit ${said}: no such run recorded this session`);
+		else if (run.exitCode !== said) flags.push(`\`${cmd}\` reports exit ${said}; the recorded run exited ${run.exitCode}`);
 	}
 
 	if (TESTS_PASS.test(message)) {
@@ -162,16 +166,6 @@ export function checkReceipts(message: string, history: HistoryEvent[], cwd: str
 		else {
 			const last = runs[runs.length - 1]!.h;
 			if (last.kind === "bash" && last.exitCode !== 0) flags.push(`the report says tests pass; the last test run after the last edit exited ${last.exitCode}`);
-		}
-	}
-
-	const envelope = /<!--\s*output-types([\s\S]*?)-->/.exec(message);
-	if (envelope) {
-		for (const label of LABELS) {
-			const said = new RegExp(`^\\s*${label}:\\s*(\\d+)`, "m").exec(envelope[1]!);
-			if (!said) continue;
-			const counted = bs.filter((b) => b.label === label).length;
-			if (Number(said[1]) !== counted) flags.push(`envelope says ${label}: ${said[1]}; the message has ${counted} block-leading ${label} labels`);
 		}
 	}
 	return flags;
