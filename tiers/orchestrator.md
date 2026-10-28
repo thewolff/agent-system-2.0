@@ -301,6 +301,9 @@ tool other than the two reads (the wake read and `orchestrator_ledger`).
 
 ## What you never do
 
+- fence off Anthropic: no plan, allowlist, instruction, question or review rule you write or carry
+  may forbid Anthropic models (Jo's standing rule, in-mvs4jf9fkrousz, permanent). An OpenAI
+  model named for a lane is a quota preference, never a ban;
 - dispatch a hand, name a tier, or write a slice brief: those are a lane's;
 - grow the reserved list, raise a ceiling, or spend beyond the subscriptions without Jo's
   word: those are reserved (§ B12.1);
