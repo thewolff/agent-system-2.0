@@ -6,7 +6,7 @@
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
-import { counts, type Finding, lex, parseBaseline, PATTERNS, ratchet, scan } from "../src/timing-lint";
+import { counts, type Finding, lex, parseBaseline, PATTERNS, ratchet, scan, shrinkOnly } from "../src/timing-lint";
 
 const REPO = join(import.meta.dir, "..", "..");
 const FIXTURES = join(import.meta.dir, "fixtures", "timing-lint");
@@ -113,6 +113,21 @@ describe("the ratchet logic", () => {
 			"fixed incidental timing: b.test.ts has 0 timer finding(s), the baseline still allows 1; delete its row in surface/test/timing-baseline.tsv",
 		]);
 	});
+
+	test("the baseline only shrinks: a new row, a raised row and a row moved to another file fail; lowering and deleting pass", () => {
+		const was = base("a.test.ts\tsleep\t2\nb.test.ts\ttimer\t1\nc.test.ts\trace\t3\n").rows;
+		expect(shrinkOnly(was, was)).toEqual([]);
+		expect(shrinkOnly(was, base("a.test.ts\tsleep\t1\nc.test.ts\trace\t3\n").rows)).toEqual([]);
+		expect(shrinkOnly(was, base("a.test.ts\tsleep\t3\nb.test.ts\ttimer\t1\nc.test.ts\trace\t1\n").rows)).toEqual([
+			"baseline grew: surface/test/timing-baseline.tsv line 3 raises a.test.ts sleep from 2 to 3; fix the timing or opt it out, never raise a row",
+		]);
+		expect(shrinkOnly(was, base("a.test.ts\tsleep\t2\nb.test.ts\ttimer\t1\nc.test.ts\trace\t3\nd.test.ts\ttimer\t1\n").rows)).toEqual([
+			"baseline grew: surface/test/timing-baseline.tsv line 6 adds d.test.ts timer 1, which main's baseline does not allow; fix the timing or opt it out, never add a row",
+		]);
+		expect(shrinkOnly(was, base("a.test.ts\tsleep\t2\nc.test.ts\trace\t3\ne.test.ts\ttimer\t1\n").rows)).toEqual([
+			"baseline grew: surface/test/timing-baseline.tsv line 5 adds e.test.ts timer 1, which main's baseline does not allow; fix the timing or opt it out, never add a row",
+		]);
+	});
 });
 
 /** Every *.test.ts under the repository, skipping dot-directories (.git, .tmp, .omp) and node_modules. */
@@ -123,6 +138,15 @@ function testFiles(dir: string): string[] {
 		if (e.isDirectory()) return testFiles(p);
 		return e.isFile() && e.name.endsWith(".test.ts") ? [p] : [];
 	});
+}
+
+/** The refs tried for main, in order: origin/main, main, then the tag the runners write at origin/main's sha (as in surface/scripts/migration-items.ts). */
+const BASE_REFS = ["refs/remotes/origin/main", "refs/heads/main", "refs/tags/as2-trusted-main"];
+const BASELINE_PATH = "surface/test/timing-baseline.tsv";
+
+function git(args: string[]): { code: number; out: string; err: string } {
+	const r = Bun.spawnSync(["git", "-C", REPO, ...args], { stdout: "pipe", stderr: "pipe" });
+	return { code: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString() };
 }
 
 describe("the repository's test files (the ratchet)", () => {
@@ -151,5 +175,20 @@ describe("the repository's test files (the ratchet)", () => {
 			return (byFile.get(file) ?? []).filter((f) => f.pattern === pattern).map((f) => `${file}:${f.line} ${f.text}`).join("; ");
 		};
 		expect(ratchet(counts(byFile), baseline.rows, where)).toEqual([]);
+	});
+
+	test("the baseline only shrinks against main's baseline at the merge base: no row added, raised or moved", () => {
+		const ref = BASE_REFS.find((r) => git(["rev-parse", "--verify", "-q", `${r}^{commit}`]).code === 0);
+		if (ref === undefined) throw new Error(`no base: none of ${BASE_REFS.join(", ")} resolves, so the baseline cannot be checked against main's`);
+		const mb = git(["merge-base", "HEAD", ref]);
+		if (mb.code !== 0) throw new Error(`git merge-base HEAD ${ref} exited ${mb.code}: ${mb.err.trim()}`);
+		const sha = mb.out.trim();
+		const listed = git(["ls-tree", "--name-only", sha, "--", BASELINE_PATH]);
+		if (listed.code !== 0) throw new Error(`git ls-tree ${sha} exited ${listed.code}: ${listed.err.trim()}`);
+		// Absent at the merge base only on the branch that introduces the baseline, which BASELINE_CEILING bounds.
+		if (listed.out.trim() === "") return;
+		const shown = git(["show", `${sha}:${BASELINE_PATH}`]);
+		if (shown.code !== 0) throw new Error(`git show ${sha}:${BASELINE_PATH} exited ${shown.code}: ${shown.err.trim()}`);
+		expect(shrinkOnly(parseBaseline(shown.out).rows, baseline.rows)).toEqual([]);
 	});
 });

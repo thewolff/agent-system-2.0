@@ -1,6 +1,7 @@
 # The incidental-timing ratchet (surface/test/timing-lint.test.ts; patterns in surface/src/timing-lint.ts).
 # One row per test file and pattern that depended on timing when the rule was made (2026-10-28, origin/main 4c1a6e5):
-# the count of findings the check allows there. Rows only shrink. A fix lowers its row to the new count, or deletes it at
+# the count of findings the check allows there. Rows only shrink, checked against main's baseline at the merge base: a
+# row added, raised or moved to another file fails. A fix lowers its row to the new count, or deletes it at
 # zero, in the same commit; the check fails until it does. A new finding anywhere fails the check: wait on the real
 # event or call the logic directly, or, when timing is the subject, drive it with a fake clock and mark it
 # `// timing-under-test: <what> (fake clock: <name>)`. Sorted by file then pattern; one TAB between columns.

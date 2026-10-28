@@ -562,3 +562,19 @@ export function ratchet(found: Map<string, number>, baseline: BaselineRow[], whe
 	}
 	return out;
 }
+
+/**
+ * The baseline only shrinks: every row of `head` that is new to `base` (the baseline at the branch's merge base with
+ * main) or allows more than base did, worded with the fix. Lowering and deleting rows are allowed. A row that moves to
+ * another file (a rename) is a new row, so a renamed offender is fixed or opted out rather than carried.
+ */
+export function shrinkOnly(base: BaselineRow[], head: BaselineRow[]): string[] {
+	const was = new Map(base.map((r) => [`${r.file}\t${r.pattern}`, r.count]));
+	const out: string[] = [];
+	for (const r of head) {
+		const before = was.get(`${r.file}\t${r.pattern}`);
+		if (before === undefined) out.push(`baseline grew: surface/test/timing-baseline.tsv line ${r.line} adds ${r.file} ${r.pattern} ${r.count}, which main's baseline does not allow; fix the timing or opt it out, never add a row`);
+		else if (r.count > before) out.push(`baseline grew: surface/test/timing-baseline.tsv line ${r.line} raises ${r.file} ${r.pattern} from ${before} to ${r.count}; fix the timing or opt it out, never raise a row`);
+	}
+	return out;
+}
