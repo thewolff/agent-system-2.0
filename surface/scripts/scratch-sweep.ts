@@ -22,8 +22,9 @@
 //     (the claiming side re-creates the root). After the lock is released the detached tree is archived and verified
 //     (surface/src/scratch-archive.ts archiveDetached: one `.tar.gz` under the archive base, scratchArchiveBase(<home>),
 //     a sibling of the scratch base; capacity checked first, the extraction compared entry by entry with the tree, the
-//     tree read again after), and only a verified archive lets the recursive remove (purgeDetached) run. A tree whose
-//     archive fails is renamed back and kept ("archive failed"). One root's failure never stops the others; every one is
+//     tree read again after, with lsof first showing nothing open in it), and only a verified archive lets the recursive
+//     remove (purgeDetached) run. A tree whose archive fails, or that a process still has a file open in (or lsof cannot
+//     say), is renamed back and kept ("archive failed"). One root's failure never stops the others; every one is
 //     reported. Outside the base only expired archives (step 3) are removed.
 //  3. Archives under the archive base older than `scratchArchive.expireDays` (profile config, default 14) are removed,
 //     with their `<archive>.offsite` marker and the offsite job's `.attempts` / `.stuck` sidecars; with
@@ -176,6 +177,8 @@ export interface SweepHooks {
 	/** Replaces the statfs read of free bytes on the scratch volume. */
 	freeBytes?: (path: string) => number | null;
 	archive?: (name: string) => ArchiveSeams;
+	/** Replaces the unlink the archive expiry uses. */
+	expiryUnlink?: (path: string) => void;
 }
 
 export interface SweepResult {
@@ -320,7 +323,7 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 	// Archive expiry (step 3): only with a readable ledger, so each removal can be recorded.
 	let expired: ExpiryLine[] = [];
 	if (ledger) {
-		const x = expireArchives(args.home, args.archive, now, args.dryRun);
+		const x = expireArchives(args.home, args.archive, now, args.dryRun, hooks.expiryUnlink ? { unlink: hooks.expiryUnlink } : {});
 		expired = x.lines;
 		notes.push(...x.notes);
 		if (expired.some((l) => l.action === "expire failed")) failed = true;

@@ -257,8 +257,9 @@ export type ScratchClose =
  * id)`, refused when that path is a symlink or its realpath is not exactly `<realpath(base)>/<id>`. The root is first renamed
  * aside (./scratch-remove detachChild: same dev/ino as judged, renamed to `.removing-*`, checked again), so nothing writing by
  * its path reaches the tree; the detached tree is archived and verified (./scratch-archive archiveDetached: manifest, capacity,
- * tar, extraction compared entry by entry, hash, the tree read again) to `archivePathFor(home, id, now)`; only then is it
- * removed (purgeDetached). An archive that fails renames the tree back (restoreDetached) and keeps it. A missing root is a
+ * tar, extraction compared entry by entry, hash, lsof showing nothing open in the tree, the tree read again) to
+ * `archivePathFor(home, id, now)`; only then is it removed (purgeDetached). An archive that fails, or a tree a process still
+ * has a file open in (or that lsof cannot clear), renames the tree back (restoreDetached) and keeps it. A missing root is a
  * no-op. Never throws.
  */
 export function archiveScratchRoot(home: string, id: string, now: Date, seams: ArchiveSeams = {}): ScratchClose {

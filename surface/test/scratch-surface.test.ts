@@ -5,7 +5,7 @@
 // archives the root once the row has closed and only then removes it, keeping a root whose archive
 // fails and refusing a root that is a symlink.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { Ledger } from "../../ledger/src/index";
@@ -482,6 +482,36 @@ describe("orchestrator_close_workload archives the root, then removes it, after 
 			expect(tarRan).toBe(false);
 			expect(said).toContain(`Scratch root ${root} kept: not archived: 0.0 GiB free on `);
 			expect(said).toContain("so the archive was not started");
+			expect(readFileSync(join(root, "REPORT.md"), "utf8")).toBe("aaaa");
+			expect(leftovers()).toEqual([]);
+			ledger.close();
+		});
+
+		test("a descriptor held open across the archive and its verification keeps the root: the archive is dropped, the root renamed back, and a write through it after the close lands in the kept root", () => {
+			const { ledger, wl, home, root, leftovers } = setUp();
+			// Opened before the close, as a lane's still-running child would have it: the rename aside does not reach it.
+			const fd = openSync(join(root, "REPORT.md"), "r+");
+			let said: string;
+			try {
+				said = closeScratchRoot(ledger, { HOME: home }, wl, { now });
+				writeSync(fd, "bbbb", 0);
+			} finally {
+				closeSync(fd);
+			}
+			expect(said).toContain(`Scratch root ${root} kept: not archived: `);
+			expect(said).toContain(`is not proven quiet: a process still has files open in it (pid ${process.pid} has `);
+			expect(said).toContain("/REPORT.md open), so it could still be written; the archive ");
+			expect(said).toContain("was dropped");
+			expect(readFileSync(join(root, "REPORT.md"), "utf8")).toBe("bbbb");
+			expect(leftovers()).toEqual([]);
+			ledger.close();
+		});
+
+		test("when lsof cannot say whether anything is open (missing, failing, timed out), the root is kept", () => {
+			const { ledger, wl, home, root, leftovers } = setUp();
+			const said = closeScratchRoot(ledger, { HOME: home }, wl, { now, seams: { openFiles: () => ({ kind: "unknown", reason: "lsof could not be run (ENOENT)" }) } });
+			expect(said).toContain(`Scratch root ${root} kept: not archived: `);
+			expect(said).toContain("is not proven quiet: no writer could be ruled out: lsof could not be run (ENOENT); the archive ");
 			expect(readFileSync(join(root, "REPORT.md"), "utf8")).toBe("aaaa");
 			expect(leftovers()).toEqual([]);
 			ledger.close();

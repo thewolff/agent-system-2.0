@@ -9,7 +9,7 @@
 // entry lands on the standing workload, once while open; back within bounds, `scratch-disk-ok:`.
 // --dry-run removes and writes nothing; a missing ledger or a bad threshold removes nothing.
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SCRATCH_ENTRY, scratchBase } from "../../gates/src/scratch";
 import { DEFAULT_SCRATCH_ARCHIVE, type ScratchArchiveConfig, scratchArchiveBase } from "../src/scratch-archive";
@@ -421,6 +421,37 @@ describe("scratch sweep: archives (expiry, offsite gate, failures) and the disk 
 		expect(existsSync(orphan)).toBe(true);
 	});
 
+	test("a sidecar that cannot be removed does not undo the expiry: the archive is recorded expired, each other sidecar still goes, and the failure is reported", () => {
+		const w = world();
+		const a = archiveAt(w, "2026-10-01", "wl-aa.tar.gz", 27);
+		for (const s of [".offsite", ".attempts", ".stuck"]) writeFileSync(`${a}${s}`, "x");
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW, {
+			expiryUnlink: (p) => {
+				if (p.endsWith(".attempts")) throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" });
+				rmSync(p);
+			},
+		});
+		expect(r.exit).toBe(0);
+		expect(readdirSync(join(scratchArchiveBase(w.home), "2026-10-01"))).toEqual(["wl-aa.tar.gz.attempts"]);
+		const line = r.expired.find((l) => l.path === a)!;
+		expect(line.action).toBe("expired");
+		expect(line.why).toContain("its .attempts could not be removed (EPERM: operation not permitted)");
+		expect(expiredEntries(w)).toEqual([`${SCRATCH_SWEEP_BY} ${SCRATCH_ENTRY.archiveExpired} ${a} 2`]);
+		expect(r.report).toContain(`${a} expired, but its .attempts could not be removed`);
+	});
+
+	test("a new archive never takes a name an old archive's sidecar still holds, so it cannot inherit that .offsite", () => {
+		const w = world();
+		const closed = open(w);
+		w.ledger.closeWorkload(closed, { by: "orchestrator-surface" });
+		root(w, closed);
+		const day = join(scratchArchiveBase(w.home), "2026-10-28");
+		mkdirSync(day, { recursive: true });
+		writeFileSync(join(day, `${closed}.tar.gz.offsite`), "drive:/as2/old");
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW);
+		expect(r.archived.map((x) => x.archive.path)).toEqual([join(day, `${closed}.2.tar.gz`)]);
+	});
+
 	test("a verification copy left behind is reported, never removed by expiry", () => {
 		const w = world();
 		const copy = join(scratchArchiveBase(w.home), "2026-10-01", ".verify-0123456789abcdef");
@@ -442,6 +473,31 @@ describe("scratch sweep: archives (expiry, offsite gate, failures) and the disk 
 		expect(line.action).toBe("archive failed");
 		expect(line.why).toContain("so the archive was not started");
 		expect(existsSync(join(w.base, closed, "repo", "src", "a.ts"))).toBe(true);
+	});
+
+	test("a descriptor held open into a root across its archive keeps the root (archive failed, renamed back, exit 1); the other roots still go", () => {
+		const w = world();
+		const held = open(w);
+		const other = open(w);
+		w.ledger.closeWorkload(held, { by: "orchestrator-surface" });
+		w.ledger.closeWorkload(other, { by: "orchestrator-surface" });
+		root(w, held);
+		root(w, other);
+		const fd = openSync(join(w.base, held, "repo", "src", "a.ts"), "r");
+		let r: ReturnType<typeof runSweep>;
+		try {
+			r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW);
+		} finally {
+			closeSync(fd);
+		}
+		expect(r.exit).toBe(1);
+		const line = r.roots.find((x) => x.name === held)!;
+		expect(line.action).toBe("archive failed");
+		expect(line.why).toContain(`is not proven quiet: a process still has files open in it (pid ${process.pid} has `);
+		expect(line.why).toContain(`kept, renamed back to ${join(w.base, held)}`);
+		expect(existsSync(join(w.base, held, "repo", "src", "a.ts"))).toBe(true);
+		expect(existsSync(join(w.base, other))).toBe(false);
+		expect(r.archived.map((x) => x.name)).toEqual([other]);
 	});
 
 	test("requireOffsite: an old archive without its .offsite marker is kept; one with it is expired with its marker", () => {

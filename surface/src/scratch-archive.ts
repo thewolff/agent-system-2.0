@@ -11,10 +11,13 @@
 //   4. extracts it into a private `.verify-*` directory beside it and compares that copy's manifest with the tree's,
 //      entry by entry (path, type, size, permission bits, content hash, link target); any difference fails;
 //   5. hashes the archive and links it to its final name (a link never replaces a name);
-//   6. reads the tree's manifest again and compares identities (inode, size, mtime and ctime in nanoseconds, link
-//      target): a write anywhere in the tree since step 1 changes the ctime of the entry written, so it fails, and the
-//      archive is dropped.
-// Only then may the caller remove the tree. Any failure leaves the tree as it is and says why.
+//   6. runs lsof over the tree (`stillOpen`): a write through a descriptor opened before the rename aside changes no
+//      path, so it could land after any check; a file still open, or a missing, failing or timed-out lsof, fails;
+//   7. reads the tree's manifest again and compares identities (inode, size, mtime and ctime in nanoseconds, link
+//      target): a write anywhere in the tree since step 1 changes the ctime of the entry written, so it fails. On a
+//      failure in 6 or 7 the archive is dropped.
+// Only then may the caller remove the tree: nothing had a file open in it at step 6, so a later write needs a new open
+// by a path that no longer exists. Any failure leaves the tree as it is and says why.
 // The daily sweep (surface/scripts/scratch-sweep.ts) expires archives older than `scratchArchive.expireDays`, and, when
 // `scratchArchive.requireOffsite` is on, only those with an `<archive>.offsite` marker beside them (written by an offsite
 // copy job once its copy is confirmed).
@@ -247,6 +250,52 @@ export interface ArchiveSeams {
 	afterTar?: () => void;
 	/** Runs after the archive is verified, hashed and linked, before the tree is read again. */
 	beforeFinalCheck?: () => void;
+	/** Replaces the lsof read of what is open under a tree (`openFilesUnder`). */
+	openFiles?: (dir: string) => OpenFiles;
+}
+
+/** What lsof shows open under a directory: nothing, these files, or that it could not be shown. */
+export type OpenFiles = { kind: "none" } | { kind: "open"; holders: string[] } | { kind: "unknown"; reason: string };
+
+const LSOF_TIMEOUT_MS = 30_000;
+
+/**
+ * Every file any process this user can see has open under `dir` (`lsof -n -P -F pn +D <dir>`, bounded by LSOF_TIMEOUT_MS).
+ * macOS lsof exits 1 whether or not it found anything, so the answer is read from its output: `n` lines are open files,
+ * no output and no complaint is "none", and anything else (no lsof, a timeout, a signal, an error or warning) is "unknown".
+ * Never throws.
+ */
+export function openFilesUnder(dir: string): OpenFiles {
+	let r: ReturnType<typeof Bun.spawnSync>;
+	try {
+		r = Bun.spawnSync(["lsof", "-n", "-P", "-F", "pn", "+D", dir], { stdout: "pipe", stderr: "pipe", timeout: LSOF_TIMEOUT_MS });
+	} catch (e) {
+		return { kind: "unknown", reason: `lsof could not be run (${message(e)})` };
+	}
+	const out = r.stdout?.toString() ?? "";
+	const err = (r.stderr?.toString() ?? "").trim();
+	const holders: string[] = [];
+	let pid = "?";
+	for (const line of out.split("\n")) {
+		if (line.startsWith("p")) pid = line.slice(1);
+		else if (line.startsWith("n")) holders.push(`pid ${pid} has ${line.slice(1)} open`);
+	}
+	if (holders.length > 0) return { kind: "open", holders };
+	if (r.signalCode || r.exitCode === null) return { kind: "unknown", reason: `lsof did not finish (${r.signalCode ?? "no exit code"}; limit ${LSOF_TIMEOUT_MS / 1000} s)` };
+	if ((r.exitCode !== 0 && r.exitCode !== 1) || err !== "" || out.trim() !== "") return { kind: "unknown", reason: `lsof exited ${r.exitCode}: ${err.split("\n")[0] || out.trim().split("\n")[0] || "no message"}` };
+	return { kind: "none" };
+}
+
+/**
+ * Why the tree `dir` must not be removed yet: a process still has a file open under it (a write through a descriptor
+ * opened before the rename aside would reach the tree after its last check), or that could not be ruled out. Null only
+ * when lsof showed nothing open. Never throws.
+ */
+export function stillOpen(dir: string, seams: ArchiveSeams = {}): string | null {
+	const o = (seams.openFiles ?? openFilesUnder)(dir);
+	if (o.kind === "none") return null;
+	if (o.kind === "open") return `a process still has files open in it (${o.holders.slice(0, 3).join("; ")}${o.holders.length > 3 ? `; ${o.holders.length - 3} more` : ""}), so it could still be written`;
+	return `no writer could be ruled out: ${o.reason}`;
 }
 
 /** SHA-256 of the file at `path`, read in 1 MiB chunks. */
@@ -266,17 +315,25 @@ function sha256File(path: string): string {
 	return hash.digest("hex");
 }
 
-/** `<dir>/<id>.tar.gz`, else `<id>.2.tar.gz`, `<id>.3.tar.gz`, …: the first name nothing holds yet. */
+/**
+ * `<dir>/<id>.tar.gz`, else `<id>.2.tar.gz`, `<id>.3.tar.gz`, …: the first name that neither an archive nor an offsite
+ * sidecar (`.offsite`, `.attempts`, `.stuck`, which can outlive their archive) holds, so a new archive never inherits an
+ * old one's offsite marker.
+ */
 function freeName(dest: string): string {
 	const stem = dest.endsWith(ARCHIVE_SUFFIX) ? dest.slice(0, -ARCHIVE_SUFFIX.length) : dest;
-	for (let n = 1; ; n++) {
-		const p = n === 1 ? dest : `${stem}.${n}${ARCHIVE_SUFFIX}`;
+	const held = (p: string): boolean => {
 		try {
 			lstatSync(p);
+			return true;
 		} catch (e) {
-			if ((e as NodeJS.ErrnoException).code === "ENOENT") return p;
+			if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
 			throw e;
 		}
+	};
+	for (let n = 1; ; n++) {
+		const p = n === 1 ? dest : `${stem}.${n}${ARCHIVE_SUFFIX}`;
+		if (![p, ...[OFFSITE_SUFFIX, ...OFFSITE_SIDECARS].map((s) => `${p}${s}`)].some(held)) return p;
 	}
 }
 
@@ -367,16 +424,20 @@ export function archiveDetached(dir: string, dest: string, seams: ArchiveSeams =
 		unlinkSync(partial);
 		partial = null;
 		seams.beforeFinalCheck?.();
-		const changed = identityDiff(before, readManifest(dir, false));
-		if (changed.length > 0) {
-			let dropped = `the archive ${final} was dropped`;
+		const drop = (): string => {
 			try {
 				unlinkSync(final);
+				return `the archive ${final} was dropped`;
 			} catch (e) {
-				dropped = `the archive ${final} could not be dropped (${message(e)})`;
+				return `the archive ${final} could not be dropped (${message(e)})`;
 			}
-			return fail(`${dir} changed while it was archived: ${changed.join("; ")}; ${dropped}`);
-		}
+		};
+		// Writers first, then identities: once lsof shows nothing open, a later write needs a new open by a path that no
+		// longer exists, and any write before it shows in the identities read after it.
+		const open = stillOpen(dir, seams);
+		if (open) return fail(`${dir} is not proven quiet: ${open}; ${drop()}`);
+		const changed = identityDiff(before, readManifest(dir, false));
+		if (changed.length > 0) return fail(`${dir} changed while it was archived: ${changed.join("; ")}; ${drop()}`);
 		return { kind: "archived", path: final, bytes: size, sha256, entries: before.size, members: before, warnings };
 	} catch (e) {
 		return fail(message(e));
@@ -409,7 +470,8 @@ export function archiveNameKind(name: string): "final" | "partial" | null {
  * other files, symlinks) is never touched. A date directory left empty is removed (rmdir, never recursive). `dryRun` removes
  * nothing. Never throws.
  */
-export function expireArchives(home: string, config: ScratchArchiveConfig, now: Date, dryRun: boolean): { lines: ExpiryLine[]; notes: string[] } {
+export function expireArchives(home: string, config: ScratchArchiveConfig, now: Date, dryRun: boolean, seams: { unlink?: (path: string) => void } = {}): { lines: ExpiryLine[]; notes: string[] } {
+	const unlink = seams.unlink ?? unlinkSync;
 	const base = scratchArchiveBase(home);
 	const lines: ExpiryLine[] = [];
 	const notes: string[] = [];
@@ -472,24 +534,25 @@ export function expireArchives(home: string, config: ScratchArchiveConfig, now: 
 				continue;
 			}
 			try {
-				unlinkSync(path);
-				if (kind === "final") {
-					if (hasMarker) unlinkSync(marker);
-					for (const s of OFFSITE_SIDECARS) {
-						const side = `${path}${s}`;
-						let isFile = false;
-						try {
-							isFile = lstatSync(side).isFile();
-						} catch (e) {
-							if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-						}
-						if (isFile) unlinkSync(side);
-					}
-				}
-				lines.push({ path, bytes: st.size, action: "expired", why });
+				unlink(path);
 			} catch (e) {
 				lines.push({ path, bytes: st.size, action: "expire failed", why: `${why}; ${message(e)}` });
+				continue;
 			}
+			// The archive is gone: the expiry stands whatever becomes of its sidecars, each tried on its own.
+			const left: string[] = [];
+			if (kind === "final") {
+				for (const s of [OFFSITE_SUFFIX, ...OFFSITE_SIDECARS]) {
+					const side = `${path}${s}`;
+					try {
+						if (lstatSync(side).isFile()) unlink(side);
+					} catch (e) {
+						if ((e as NodeJS.ErrnoException).code !== "ENOENT") left.push(`its ${s} could not be removed (${message(e)})`);
+					}
+				}
+			}
+			lines.push({ path, bytes: st.size, action: "expired", why: left.length ? `${why}; ${left.join("; ")}` : why });
+			for (const l of left) notes.push(`${path} expired, but ${l}`);
 		}
 		if (!dryRun) {
 			try {
