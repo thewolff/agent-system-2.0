@@ -63,22 +63,13 @@ jobs:
           git remote remove origin
           git ls-files | grep -E '[._](test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$' | sed 's|^|./|' > "$W/files"
           echo "$(wc -l < "$W/files") test file(s) at $head"
-      - name: Test files (one bun test call)
+      # One bun process per file (.github/as2-hosted/run-files.sh): a hung file costs only itself, and each file
+      # reports its own exit code and wall time.
+      - name: Test files (one bun process per file)
         timeout-minutes: 30
         run: |
-          set -uo pipefail
-          if [ "$RUNNER_OS" = Linux ]; then n="$(nproc)"; else n="$(sysctl -n hw.ncpu)"; fi
-          start=$(date +%s)
-          env -i PATH="$W/shim:$PATH" LANG="${LANG:-C.UTF-8}" USER="$USER" LOGNAME="${LOGNAME:-$USER}" SHELL="${SHELL:-/bin/bash}" TERM="${TERM:-dumb}" \
-            HOME="$W/home" TMPDIR="$W/home/tmp" XDG_CONFIG_HOME="$W/home/.config" XDG_CACHE_HOME="$W/home/.cache" XDG_DATA_HOME="$W/home/.local/share" \
-            BUN_INSTALL_CACHE_DIR="$W/home/.bun/install/cache" AGENT_SYSTEM_LEDGER_DB="$W/home/.agent-system-2/ledger.db" \
-            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$W/home/.gitconfig" GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false \
-            bun test --reporter=junit --reporter-outfile="$W/out/suite.xml" --parallel="$n" $(cat "$W/files") > "$W/out/suite.log" 2>&1
-          code=$?
-          end=$(date +%s)
-          printf '%s files %s exit %s wall %s s\n' "$RUNNER_OS" "$(wc -l < "$W/files")" "$code" "$((end - start))" | tee "$W/out/suite.summary"
-          tail -n 60 "$W/out/suite.log"
-          exit "$code"
+          if [ "$RUNNER_OS" = Linux ]; then JOBS="$(nproc)"; else JOBS="$(sysctl -n hw.ncpu)"; fi
+          JOBS="$JOBS" FILE_CAP_S=300 bash .github/as2-hosted/run-files.sh
       - name: Upload JUnit and log
         if: always()
         uses: actions/upload-artifact@v4
