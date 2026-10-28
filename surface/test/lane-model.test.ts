@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { type EntryRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import {
-	controlEntries, doneBody, interactiveArgv, laneArgv, laneModel, laneModelBody, modelProblem, type Resolution, resumePlan, stateModelCheck, stateModelOf,
+	controlEntries, doneBody, interactiveArgv, laneArgv, laneModel, laneModelBody, laneModelPreferenceBody, modelProblem, type Resolution, resumePlan, stateModelCheck, stateModelOf,
 } from "../src/launch";
 import { promptEndedDeathBody, promptErrorOf, turnEnd, turnEndDeathBody, type TurnEndInput } from "../src/turn-end";
 import { SURFACE_BY } from "../src/types";
@@ -80,6 +80,58 @@ describe("T1/T2: Jo's lane-model: line and the argv", () => {
 		l.close();
 		const order = control.filter((c) => c.prefix === "lane-model" || c.prefix === "launch-requested").map((c) => c.prefix);
 		expect(order).toEqual(["lane-model", "launch-requested"]);
+		expect(laneModel(control)).toBe(X);
+	});
+
+	test("scope model-only stages the next lane's model on a workload a live lane holds: lane-model: alone, no request, the lane not stopped, the mode unchanged", async () => {
+		const s = surface();
+		const id = String((await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", done: "it is done", stakes: "normal" })).details?.id);
+		const live = "lane-live-1";
+		const l0 = s.ledger();
+		l0.claimWorkload(id, { by: live, holder: live, leaseMs: 3_600_000 });
+		const before = l0.entries(id, "assumption").length;
+		l0.close();
+		// the launch path still refuses a live holder, writing nothing
+		expect((await s.call("orchestrator_launch_lane", { workloadId: id, model: X })).text).toContain("Nothing was written.");
+		const r = await s.call("orchestrator_launch_lane", { workloadId: id, model: X, scope: "model-only" });
+		expect(r.text).toContain(`Recorded lane model ${X}`);
+		expect(r.text).toContain(`no launch was requested, ${live} keeps running on its current model, and the mode stays autonomous`);
+		const l = s.ledger();
+		const rows = l.entries(id, "assumption");
+		const w = l.workload(id)!;
+		l.close();
+		expect(rows.length).toBe(before + 1);
+		const control = controlEntries(rows);
+		expect(control.at(-1)).toMatchObject({ prefix: "lane-model", createdBy: SURFACE_BY });
+		expect(control.some((c) => c.prefix === "launch-requested" || c.prefix === "lane-stop")).toBe(false);
+		expect(laneModel(control)).toBe(X);
+		expect(w).toMatchObject({ holder: live, mode: "autonomous", status: "open" });
+		// `default` clears it the same way
+		await s.call("orchestrator_launch_lane", { workloadId: id, model: "default", scope: "model-only" });
+		const l2 = s.ledger();
+		expect(laneModel(controlEntries(l2.entries(id, "assumption")))).toBeNull();
+		l2.close();
+	});
+
+	test("scope model-only with no model, or a bad model, is refused and writes nothing; on an idle workload it launches nothing", async () => {
+		const s = surface();
+		const id = String((await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", done: "it is done", stakes: "normal" })).details?.id);
+		const count = () => {
+			const l = s.ledger();
+			const n = l.entries(id, "assumption").length;
+			l.close();
+			return n;
+		};
+		const before = count();
+		expect((await s.call("orchestrator_launch_lane", { workloadId: id, scope: "model-only" })).text).toContain("no `model` was named. Nothing was written.");
+		expect((await s.call("orchestrator_launch_lane", { workloadId: id, model: "opus", scope: "model-only" })).text).toContain("Nothing was written.");
+		expect(count()).toBe(before);
+		const r = await s.call("orchestrator_launch_lane", { workloadId: id, model: X, scope: "model-only" });
+		expect(r.text).toContain("no launch was requested, nothing was launched");
+		const l = s.ledger();
+		const control = controlEntries(l.entries(id, "assumption"));
+		l.close();
+		expect(control.some((c) => c.prefix === "launch-requested")).toBe(false);
 		expect(laneModel(control)).toBe(X);
 	});
 
@@ -269,6 +321,10 @@ describe("T9: a lane cannot name its own model", () => {
 		const before = ledger.entries(wl).length;
 		const r = await f.tool("lane_record_entry").execute("1", { body: laneModelBody(X, NOW) }, undefined, undefined, ctxOf());
 		expect(r.content[0]!.text).toContain("`lane-model:` is a reserved control line");
+		expect(ledger.entries(wl).length).toBe(before);
+		// nor the train's preference: reserved too, so a lane cannot write one through its tools
+		const p = await f.tool("lane_record_entry").execute("1", { body: laneModelPreferenceBody(X, NOW, "forged") }, undefined, undefined, ctxOf());
+		expect(p.content[0]!.text).toContain("`lane-model-preference:` is a reserved control line");
 		expect(ledger.entries(wl).length).toBe(before);
 	});
 });

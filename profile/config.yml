@@ -399,6 +399,16 @@ jevRank:
   mode: order
   parallelBudgetUsd: 0
 
+# ── Train-fix lane model (surface/src/merge-train.ts trainFixModelOf, openTrainFix) ──
+# The model a merge-train fix workload's lanes prefer: an exact provider/model (no :level suffix) on a provider with a known
+# lab. The train tick reads it from the checkout's copy of this file at every pass, and openTrainFix writes it as
+# `lane-model-preference:` (by merge-train) in the transaction that opens the fix workload, so the first lane starts on it.
+# It is a quota preference, never a ban on any lab: Jo's own `lane-model:` on the workload always wins, and when the quota
+# guard refuses the preferred model the lane falls back to ordinary routing instead of failing its launch. Workloads already
+# open keep the preference they were opened with. Absent, null, empty or `default` writes nothing (ordinary routing); an
+# invalid value is logged and writes nothing. OMP has no registration for the key and keeps it in the raw layer.
+# Reversal: delete the key.
+
 # ── The agent channel to Ilex (PLAN wl-mv8vx7wdj5nx1c D1; surface/src/channel.ts readChannelConfig) ──
 # The other agents that may message Ilex, the orchestrator surface, each with its transport and authority.
 # omp-mailbox: the OMP seat mailbox ($OMP_PERSISTENT_SEAT_MAILBOX_ROOT, else ~/.omp/agent/seat-mailboxes), drained

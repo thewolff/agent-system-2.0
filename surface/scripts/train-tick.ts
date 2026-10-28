@@ -74,13 +74,13 @@
 // next run; Jo is not alerted (a boarding or notice failure is logged in the tick's log only). The launcher is
 // `bun surface/scripts/lane.ts launch <wl> --requested-by merge-train`. Steps 3b-3e need the standing workload; without it they
 // are skipped and logged. Exit: 0 the pass ran (logged errors included), 1 the ledger could not be opened, 2 an argument was given.
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { defaultLedgerPath, Ledger } from "../../ledger/src/index";
 import { AS2_VERIFIED_TAG } from "../src/as2test";
 import { ceilingStopped } from "../src/ceiling";
-import { loadTestRunnerConfig } from "../src/close-entry";
+import { checkoutConfigPath, loadTestRunnerConfig } from "../src/close-entry";
 import {
 	attempts, consumedIds, controlEntries, heldLive, holdersOf, LANE_SCRIPT, laneCap, landFirstOffBody, landFirstOffPending, landFirstOn, launchRequestedBody, launchRowsFor, mainRetries, sameRepo, trainBindings, verdictOf,
 } from "../src/launch";
@@ -93,7 +93,7 @@ import {
 	raiseTwiceFailed, REPAIR_FAIL_MS, REVOKE_ATTEMPTS, settleTasks, stopEpisode, stopSummary, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER,
 	TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertActions, trainAlertBody, trainAlertEndBody, trainAlertMarker, trainAutoboardBody, trainBoardSkipBody, trainCheckout,
 	trainHeadWokenBody, TRAIN_LAUNCH_LIMIT, trainLaunchFailures, trainPrs, trainPushesOf, trainReconciledBody, trainRetries, trainSliceId, trainSlicePr, type TrainPush, type TrainTask,
-	trainWakeBody, twiceFailed, unsettledTasks,
+	trainFixModelOf, trainWakeBody, twiceFailed, unsettledTasks,
 } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import { sendNotice, TRAIN_SIGNOFF_APPLIED_PREFIX, trainMergedEntryBody, trainMergedNoticeBody } from "../src/notice";
@@ -135,6 +135,8 @@ export interface TickDeps {
 	config?: Pick<TestRunnerConfig, "repos">;
 	/** Land-first's seams; without them the main-run pass (step 3f) is skipped with one log line. `main()` always passes them. */
 	land?: LandDeps;
+	/** The profile's `trainFixModel:` (`trainFixModelOf`): the lane-model preference a newly opened fix workload carries; absent or null, none. */
+	trainFixModel?: string | null;
 	log?: (line: string) => void;
 }
 
@@ -361,7 +363,9 @@ export function tick(d: TickDeps): string[] {
 				continue;
 			}
 			const s = prStakes(view, facts.repo, ledger);
-			const r = openTrainFix(ledger, { task: t, repo: facts.repo, checkout: facts.checkout, view, stakes: s.stakes === "production" ? "production" : "normal" });
+			const r = openTrainFix(ledger, {
+				task: t, repo: facts.repo, checkout: facts.checkout, view, stakes: s.stakes === "production" ? "production" : "normal", preferredModel: d.trainFixModel ?? null,
+			});
 			say(`${t.train}: #${t.pr} task ${t.id}: fix workload ${r.workloadId} ${r.opened ? "opened" : "reused"}`);
 		} catch (err) {
 			trainError(t.train, err);
@@ -1543,7 +1547,19 @@ function main(argv: string[]): number {
 		// D1 boards only on the repositories the test runner serves, read as its starter reads them.
 		const cfg = loadTestRunnerConfig(process.env);
 		if (!cfg.ok) log(`testRunner config unreadable (${cfg.error}): nothing boards this pass`);
-		tick({ ledger, gh: realGh, launch: realLaunch, notify: realNotify, land: { runner: realRunner, root: realRoot, runsRoot: runsRoot(process.env) }, log, ...(cfg.ok ? { config: cfg.config } : {}) });
+		// A new fix workload's lane-model preference, read from the same file; unreadable or unset is none (today's routing).
+		let trainFixModel: string | null = null;
+		try {
+			const pref = trainFixModelOf(Bun.YAML.parse(readFileSync(checkoutConfigPath(process.env), "utf8")));
+			if (pref.problem !== null) log(pref.problem);
+			trainFixModel = pref.model;
+		} catch (err) {
+			log(`trainFixModel unreadable (${String(err instanceof Error ? err.message : err).split("\n")[0]}): no train-fix model preference`);
+		}
+		tick({
+			ledger, gh: realGh, launch: realLaunch, notify: realNotify, land: { runner: realRunner, root: realRoot, runsRoot: runsRoot(process.env) }, log, trainFixModel,
+			...(cfg.ok ? { config: cfg.config } : {}),
+		});
 		return 0;
 	} finally {
 		ledger.close();
