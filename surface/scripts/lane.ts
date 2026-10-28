@@ -22,9 +22,7 @@
 //                                        (classifier/src/headroom.ts) is here only: configured budget comparisons may
 //                                        retain a week-only out source without changing its model. Otherwise Jo's
 //                                        named model refuses before omp (launch-failed: … headroom); an unnamed lane
-//                                        moves to a base-in-quota strong-row model before its first prompt (lane-headroom:);
-//                                        until 2026-11-02T18:03Z an unnamed lane never stays on or moves onto OpenAI
-//                                        (Jo's in-mvro2xb4w0918v, classifier/src/lab.ts OPENAI_REVIEWS_ONLY_RULE)
+//                                        moves to a base-in-quota strong-row model before its first prompt (lane-headroom:)
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy (after the same
 //                                        live-lane check), then omp in the TUI in the foreground (--model when Jo
 //                                        named one, --resume when recorded on that same model), spawned in one write
@@ -1300,12 +1298,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	 * `provider/id` (`stateModelCheck`); an unnamed lane's model, when still out after budget comparison, must first be moved (`move`).
 	 */
 	let modelChecked = false;
-	/**
-	 * The quota signal, read once before the spawn (classifier/src/headroom.ts; `AS2_HEADROOM_POLLS` names the polls in tests).
-	 * Jo's dated OpenAI-reviews-only rule is read on `AGENT_SYSTEM_LANE_RULE_CLOCK_MS` (epoch ms) when set: the process tests
-	 * pin it, since their polls must stay fresh on the real clock.
-	 */
-	const room = headroom({ ruleNow: msEnv("AGENT_SYSTEM_LANE_RULE_CLOCK_MS", Date.now()) });
+	/** The quota signal, read once before the spawn (classifier/src/headroom.ts; `AS2_HEADROOM_POLLS` names the polls in tests). */
+	const room = headroom();
 	// Installed strong-row order is counterfactual budget evidence, not verified spawn availability or permission to replace a pin.
 	// A broken table disables only comparison; ordinary admission remains possible and moveOff reports the existing failure.
 	let strongRow: string[] = [];
@@ -1794,8 +1788,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		/**
 		 * An unnamed lane whose first get_state model `from` remains out (`reason`) after budget comparison moves, before its
 		 * first prompt, to the first base-in-quota entry of the installed strong row (`:level` dropped), in row order.
-		 * Destination decisions never use comparators: retention protects the source, not another out destination. Source and
-		 * destination are both decided as `unnamed-lane`, so Jo's OpenAI-reviews-only rule keeps the lane off OpenAI.
+		 * Destination decisions never use comparators: retention protects the source, not another out destination.
 		 * `set_model`, then a get_state must report it. An unreadable tier table or every entry out is never-ready at `headroom`.
 		 */
 		const moveOff = (from: string, reason: string): void => {
@@ -1803,9 +1796,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				failModel(`${from} is out (${reason}); the strong row could not be read: ${strongRowFailure}`, HEADROOM_STAGE);
 				return;
 			}
-			const to = strongRow.find((s) => room.decisionFor(s, [], "unnamed-lane").out === null);
+			const to = strongRow.find((s) => room.decisionFor(s).out === null);
 			if (to === undefined) {
-				failModel(`${from} is out (${reason}); every strong-row entry is out: ${strongRow.map((s) => `${s} (${room.decisionFor(s, [], "unnamed-lane").out})`).join("; ")}`, HEADROOM_STAGE);
+				failModel(`${from} is out (${reason}); every strong-row entry is out: ${strongRow.map((s) => `${s} (${room.decisionFor(s).out})`).join("; ")}`, HEADROOM_STAGE);
 				return;
 			}
 			move = { from, to, reason };
@@ -1890,7 +1883,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					} else {
 						if (ranModel === null) modelChecked = true;
 						else {
-							const decision = room.decisionFor(ranModel, strongRow, "unnamed-lane");
+							const decision = room.decisionFor(ranModel, strongRow);
 							if (decision.retained !== null) process.stderr.write(`runner: ${laneId} ${decision.retained}\n`);
 							if (decision.out === null) modelChecked = true;
 							else moveOff(ranModel, decision.out);

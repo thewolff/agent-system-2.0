@@ -27,7 +27,7 @@ import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_B
 import { admitMain, citedRuns, importPart, importReport, lockRow, openLockDb, postGate, postStatus, promoteMain, publishIfOwner, reap as reapRequests, retentionPrune, revokeOpen, run, START_EXIT, verifiedPreflight, type Gh } from "../scripts/test-runner";
 import { bootstrapRefusal, mainResults, mainVerdicts, parseRunnerPreflight, SUSPECT_MAX_MS } from "../src/main-state";
 import { type Proc, snapshot, STUCK_DEFAULTS } from "../src/stuck-detect";
-import { alive, tmp, until } from "./helpers";
+import { alive, tmp, unreapedTrue, until } from "./helpers";
 import { carry305, landFirst, mainRun } from "./train-world";
 
 setDefaultTimeout(180_000);
@@ -129,7 +129,7 @@ function holdMarker(command) {
 test("spins", () => {
 	writeFileSync("../spin.pid", String(process.pid));
 	holdMarker("true");
-	const z = Bun.spawn(["/usr/bin/true"]);
+	const z = ${unreapedTrue()};
 	writeFileSync("../zombie.pid", String(z.pid));
 	for (;;) {}
 }, 600_000);

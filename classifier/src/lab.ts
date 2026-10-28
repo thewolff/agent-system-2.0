@@ -469,21 +469,6 @@ export function isKimiQuotaRefusal(provider: string, status: number | null, mess
 	return kimiOutRuleActive(now) && status === 429 && labOf(provider) === "kimi" && KIMI_QUOTA_MESSAGE.test(message ?? "");
 }
 
-// ---- Jo's OpenAI-reviews-only rule ------------------------------------------------------------
-
-/**
- * Jo's standing ruling (input in-mvro2xb4w0918v, 2026-10-27 22:22 PDT): until OpenAI's weekly reset, 2026-11-02T18:03Z
- * (10:03 AM PST), OpenAI is for reviews only. Applied by classifier/src/headroom.ts `decisionFor`'s `use`:
- * - `review`: an OpenAI week-pace projection alone never skips a review hand. Hard limits still refuse: a used-up
- *   limit, an exhausted week, the 5h ceiling, and any non-week pace projection.
- * - `unnamed-lane`: an unnamed builder lane is never retained on, and never moves onto, an OpenAI model
- *   (surface/scripts/lane.ts); one that starts there, on a resumed session, is moved before its first prompt. A lane
- *   whose model Jo named, and every build hand (which follows its lane's lab), are left alone.
- * Dated alone, with no ledger: at `endsAt` both halves stop and admission is exactly as before. Ending it earlier is a
- * code change.
- */
-export const OPENAI_REVIEWS_ONLY_RULE = { input: "in-mvro2xb4w0918v", lab: "openai", endsAt: Date.parse("2026-11-02T18:03:00Z") } as const;
-
 // ---- D4–D6: the routing decision -------------------------------------------------------------
 
 export interface ReviewPlanInput {
