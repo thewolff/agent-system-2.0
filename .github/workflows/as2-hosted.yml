@@ -26,9 +26,9 @@ jobs:
       matrix:
         include:
           # Linux: /tmp, as as2-fast.yml uses it ($RUNNER_TEMP's `_` gets Markdown-escaped by tests). macOS: the local
-          # runner's own shape, /Users/Shared/as2test/runs/<18-character run id>. Not /tmp, whose new files inherit
-          # group wheel where as2's install checks expect the user's group. Same length as the runner's: decision-log's
-          # 1,000-entry budget test fails for a TMPDIR of 7 to 44 characters (measured 2026-10-28), and passes at 54.
+          # runner's own shape and length, /Users/Shared/as2test/runs/<18-character run id>, made by the step below
+          # with the runner's group. decision-log's 1,000-entry budget test fails for a TMPDIR of 7 to 44 characters
+          # (measured 2026-10-28) and passes at the runner's 54.
           - set: linux
             os: ubuntu-latest
             work: /tmp/as2work
@@ -61,6 +61,12 @@ jobs:
         run: |
           uname -a; bun --version; git --version; zsh --version; /bin/bash --version | head -1
           if [ "$RUNNER_OS" = Linux ]; then nproc; bwrap --version; else sysctl -n hw.ncpu; fi
+      # /Users/Shared is root:wheel and macOS gives a new directory its parent's group, so the work root is made here
+      # with the runner's own uid and primary group; everything the tests create under it then carries that group, as
+      # as2's install checks expect (surface/test/as2test.test.ts: "owned 501:0, expected 501:20").
+      - name: Create the work root (macOS)
+        if: runner.os == 'macOS'
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" /Users/Shared/as2test /Users/Shared/as2test/runs "$W"
       - name: Select the ${{ matrix.set }} set
         run: |
           set -euo pipefail
