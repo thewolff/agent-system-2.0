@@ -12,7 +12,7 @@ durable: true
 Jo, 2026-10-28, morning PDT, approved this outcome: as2's "production stakes" is replaced by a spec for how much Jo is involved in a workload. The spec covers three things: what decides the level, the machinery that enforces it, and a loop that improves the criteria. The spec is `DESIGN-involvement.md`. Its scratch copy is at `/Users/jowolff/agent-scratch/agent-system-2.0/involvement/SPEC.md`.
 
 1. **The scope is whole workloads, not only who merges a PR.** Six checkpoints run across a workload: it opens, the plan is written, each slice during work, before an irreversible command, at merge, and at deploy or after merge. Each checkpoint has a code check that can't be talked past, a recorded agent judgment, or both.
-2. **Three involvement levels.** With Jo from the start. Escalate, where the agent asks when it hits a named criterion. Solo, where the agent proceeds, merges itself and Jo gets a notice. Jo rejected the name "reserved", and says "production stakes" misleads because most of Jo's work goes to production. The field's name is open.
+2. **Three involvement levels:** `with-operator`, where the operator (Jo today) is in from the start; `escalate`, where the agent asks when it hits a named criterion; and `solo`, where the agent proceeds, merges itself and Jo gets a notice. Jo rejected the name "reserved", and says "production stakes" misleads because most of Jo's work goes to production. **The field is `operatorInvolvement`, ledger column `operator_involvement`.** Jo decided the name on 2026-10-28; `date` read 09:51 PDT when it was recorded. Jo's words: "how about operator involvement?", then "i like it - with-operator". The reason: as2 is public and runs wherever OMP runs, so the schema doesn't hard-code Jo's name. Also considered: `involvement` with `with-jo`, `oversight`, and `autonomy`.
 3. **"Big fix" is replaced by checkable stand-ins.** The main one is the as2-machinery changed-path list. It replaces the branch-name rule in `surface/src/merge-train.ts` (`prStakes`) and the question-text-only `gates-stakes` ruling in `gates/src/rulings.ts`. #369 merged machinery changes without Jo because of that gap.
 4. **A self-improving loop.** It has four parts: a Recorder, a Labeler, an Eval and an Improver. Jo's words: "never say it never makes improvements on its own. we'd probably want me approving the improvements based on the reports and etc for the first month to make sure it's working right. but at some point I'd like the agents to take this over too." In month one, Jo approves each change. After that, agents apply changes that score better on both numbers (unnecessary asks and missed asks), and Jo gets the report. The code checks for irreversible commands and the machinery path list stay outside what the improver can loosen.
 5. **Approvals are made on recommendation.** Jo, 2026-10-28, morning PDT: "keep in mind I have SO many things to approve that I'm not reading them. I just ask you if it's a good idea and if you say so I send approve". So the labeler doesn't read an approve as Jo judging an ask, and every proposed improvement gets an independent cross-lab review before Plumb recommends it.
@@ -36,9 +36,8 @@ Jo, 2026-10-28, morning PDT, approved this outcome: as2's "production stakes" is
 
 ## Open
 
-1. The field's name. Recommended: `involvement`, with the values `with-jo` / `escalate` / `solo`.
-2. The graduation gates from Jo-approves to agent-applied. The proposed thresholds are in the spec's § 7.5 (G1–G6, failing closed on missing data).
-3. Held until slice B10: which hosted model the improver may send ledger text to. No local model runtime is installed. Recommended: Anthropic.
+1. The graduation gates from Jo-approves to agent-applied. The proposed thresholds are in the spec's § 7.5 (G1–G6, failing closed on missing data).
+2. Held until slice B10: which hosted model the improver may send ledger text to. No local model runtime is installed. Recommended: Anthropic.
 
 ## Review
 
