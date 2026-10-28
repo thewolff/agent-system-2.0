@@ -25,14 +25,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux: /tmp, as as2-fast.yml uses it ($RUNNER_TEMP's `_` gets Markdown-escaped by tests). macOS: not /tmp,
-          # whose new files inherit group wheel, where as2's install checks expect the user's own group.
+          # Linux: /tmp, as as2-fast.yml uses it ($RUNNER_TEMP's `_` gets Markdown-escaped by tests). macOS: the local
+          # runner's own shape, /Users/Shared/as2test/runs/<18-character run id>. Not /tmp, whose new files inherit
+          # group wheel where as2's install checks expect the user's group. Same length as the runner's: decision-log's
+          # 1,000-entry budget test fails for a TMPDIR of 7 to 44 characters (measured 2026-10-28), and passes at 54.
           - set: linux
             os: ubuntu-latest
             work: /tmp/as2work
           - set: macos
             os: macos-latest
-            work: /Users/runner/as2work
+            work: /Users/Shared/as2test/runs/tr-0hostedrunner00
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
