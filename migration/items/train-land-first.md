@@ -25,6 +25,8 @@ The strict `as2/full-suite` ruleset is unchanged. `lane_full_test` keeps its nam
 
 Activation is a ledger word, not a profile flag. After this workflow lands, keep land-first off and run shadow mode until a real green believable main verdict establishes verified commit G and the `as2-verified` tag; retain the main-run receipt. **Only then** Jo reruns `install/as2test-setup.sh` and runs `install/install.sh --control-root=verified`. A setup rerun before the tag exists breaks the refresh sequence. Never infer that live setup ran from a documentation change.
 
+Believable counts the tree's test files minus `testRunner.mainSkip` in `profile/config.yml`: the 10 files that need an installed OMP skip every test under `_as2test`, so with them counted no main run could reach 95 % of files (185 of 195 is 94.9 %). Each listed file still runs in every full suite and still turns a run red when it fails; it only stops counting toward the 95 %.
+
 Before Jo says `land-first agent-system-2.0 on`, complete the proof deferred from the build by Jo's `in-mvr66z3o61b7qe`:
 - Dispatch the real hosted fast workflow against a real PR head through the verified ref, retain its run URL and artifact, and judge its JUnit against the selected Linux set.
 - Measure the fast sets for the last 20 code landings and retain their actual Linux execution seconds. A changed-path replay on the current graph or selection milliseconds is not Linux runtime evidence.

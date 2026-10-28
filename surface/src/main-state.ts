@@ -45,7 +45,8 @@ export interface ChainCommit {
 
 /**
  * Believable (§ 2 Main state): executed tests in at least 95 % of the tree's Bun test files, and an executed-test count at
- * least 80 % of the last green main run's (no baseline before the first green). No exec counts, or a tree with no test
+ * least 80 % of the last green main run's (no baseline before the first green). The tree's files leave out
+ * `testRunner.mainSkip` (countedTestFiles), the files `_as2test` can never run. No exec counts, or a tree with no test
  * files, is never believable.
  */
 export function believable(exec: ExecCounts | null, lastGreenTests: number | null): boolean {

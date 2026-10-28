@@ -138,9 +138,9 @@ import {
 import { type ControlRoot, controlRootRefusal, FULL_SUITE_STATUS, fixBindings, fixBinds, ghCompare, type LandFirstRow, landFirstRows, stopEpisode, trainHold, trainPrs } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
-	AS2TEST_ROOT, AS2TEST_USER, authoritativeRun, baseParts, boundBranches, buildTestRun, callStuck, callTimedOut, carriedRun, changedTestFiles, decideRun, decisionLogFault, type ExecCounts, execOf, executedFiles, executorStalledReason,
+	AS2TEST_ROOT, AS2TEST_USER, authoritativeRun, baseParts, boundBranches, buildTestRun, callStuck, callTimedOut, carriedRun, changedTestFiles, countedTestFiles, decideRun, decisionLogFault, type ExecCounts, execOf, executedFiles, executorStalledReason,
 	type FastPlan, type FastSetPlan, fastPlanBody, fastPlanOf, withFullSuitePublication,
-	fullSuiteSlice, HEARTBEAT_EVERY_MS, HEARTBEAT_STALE_MS, heartbeatText, isBunTestFile, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult,
+	fullSuiteSlice, HEARTBEAT_EVERY_MS, HEARTBEAT_STALE_MS, heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult,
 	partResult, prAdmissible, type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, recordLive, reportCapBytes, reservation, type ResultRecord, resultJson, RUN_ID_RE, type RunDecision, type RunFacts, runDirOf,
 	runnerDiedRun, type RunRecord, runsDbOf, runsRoot, securityRedBody, securityRedOf, servedRepo, settleArtifact, stageDirOf, StuckWatch, stuckReason, type TestHost, type TestRequested, type TestRun, testRequestedBody,
 	testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict, soloPlan, type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
@@ -2761,7 +2761,7 @@ class Runner {
 		this.f.full = full.result;
 		this.f.fullTimedOut = full.timedOut;
 		if (this.request.main !== undefined && full.junit !== null) {
-			const counted = execOf(full.junit, this.mainTree!.files.filter(isBunTestFile));
+			const counted = execOf(full.junit, countedTestFiles(this.mainTree!.files, this.config.mainSkip));
 			if (counted.ok) this.mainExec = counted.exec;
 			else this.f.error = `main executed counts could not be read from full.xml: ${counted.error}`;
 		}
