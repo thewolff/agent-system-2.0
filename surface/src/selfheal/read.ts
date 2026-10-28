@@ -1,5 +1,5 @@
 /**
- * The self-heal detectors' readers (PLAN wl-mvbcjageg7o2yo § 2.3): every piece of I/O the seven
+ * The self-heal detectors' readers (PLAN wl-mvbcjageg7o2yo § 2.3): every piece of I/O the eight
  * detectors need, so `detectors.ts` stays pure. Nothing here writes.
  *
  * - The ledger is queried read-only (the caller opens it `{ readonly: true }`); control lines go
@@ -10,6 +10,9 @@
  *   with lines up to 465,389 chars, and a whole-corpus reader was failure 6 itself.
  * - Jetsam reports are small (≤ 2 MB) and read whole; a directory or report that cannot be read
  *   is returned as unreadable, never as zero events.
+ * - The profile's OMP logs (`<home>/.omp/profiles/<profile>/logs/omp.*.log`, one JSON object a
+ *   line) are streamed like session files, mtime at or after the window start, prefiltered on
+ *   `MCP tool load failed`. A profile with no logs directory yet has had no session, so no failure.
  */
 import { accessSync, constants, createReadStream, type Dirent, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
@@ -19,7 +22,7 @@ import { controlEntries, laneStarted, modelProblem } from "../launch";
 import { parseTestRun } from "../test-run";
 import {
 	type BuilderLab, COMPACTION_LOOP, type CompactionSession, type DetectorInputs, type HandRouting, type HandSpawn, type JetsamReport,
-	type LaneModelSet, type LaneStart, type OrchestratorSession, type SessionEvent, type TestRunVerdict,
+	type LaneModelSet, type LaneStart, type McpLoadFailure, type OrchestratorSession, type SessionEvent, type TestRunVerdict,
 } from "./detectors";
 import type { Window } from "./types";
 
@@ -55,6 +58,7 @@ export async function readDetectorInputs(opts: ReadOptions): Promise<DetectorInp
 		testRuns: readTestRuns(ledger, to),
 		...readLaneStartsAndModels(ledger, to),
 		jetsam: readJetsam(opts.jetsamDir ?? JETSAM_DIR, fromMs),
+		mcpLoad: { profile: opts.profile, failures: await readMcpLoadFailures(join(opts.home, ".omp", "profiles", opts.profile, "logs"), fromMs, toMs) },
 	};
 }
 
@@ -339,4 +343,37 @@ function jetsamTime(s: string): string | null {
 	const offset = (m[8] === "-" ? -1 : 1) * (Number(m[9]) * 60 + Number(m[10]));
 	const t = Date.UTC(y, mo - 1, d, h, mi, sec, frac) - offset * 60_000;
 	return Number.isFinite(t) ? new Date(t).toISOString() : null;
+}
+
+// ---- OMP logs ------------------------------------------------------------------------------------
+
+const MCP_LOAD_FAILED = "MCP tool load failed";
+const OMP_LOG_NAME = /^omp\..*\.log$/;
+
+/** Every `MCP tool load failed` line in `[sinceMs, toMs)` from the `omp.*.log` files in `dir` (name order) whose mtime is at or after `sinceMs`. */
+export async function readMcpLoadFailures(dir: string, sinceMs: number, toMs: number): Promise<McpLoadFailure[]> {
+	let names: string[];
+	try {
+		names = readdirSync(dir).filter((n) => OMP_LOG_NAME.test(n)).sort();
+	} catch {
+		return [];
+	}
+	const out: McpLoadFailure[] = [];
+	for (const name of names) {
+		const path = join(dir, name);
+		try {
+			if (statSync(path).mtimeMs < sinceMs) continue;
+		} catch {
+			continue;
+		}
+		await eachLine(path, (text, line) => {
+			if (!text.includes(MCP_LOAD_FAILED)) return;
+			const o = parse(text);
+			if (o === null || o.message !== MCP_LOAD_FAILED || typeof o.timestamp !== "string" || typeof o.path !== "string") return;
+			const t = Date.parse(o.timestamp);
+			if (!Number.isFinite(t) || t < sinceMs || t >= toMs) return;
+			out.push({ path, line, at: new Date(t).toISOString(), server: o.path.replace(/^mcp:/, ""), error: typeof o.error === "string" ? o.error : String(o.error) });
+		});
+	}
+	return out;
 }

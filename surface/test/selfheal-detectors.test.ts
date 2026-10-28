@@ -1,10 +1,10 @@
-// The seven self-heal detectors (PLAN wl-mvbcjageg7o2yo § 2.3, R3–R10) on fixtures cut from the
+// The eight self-heal detectors (PLAN wl-mvbcjageg7o2yo § 2.3, R3–R10) on fixtures cut from the
 // recorded failures (fixtures/selfheal/README.md says where each was cut from). Every case goes
 // through the real readers: a temp ledger seeded with the cut rows (reopened read-only), a temp
-// home holding the orchestrator sessions, a temp lanes dir holding the lane sessions, and a temp
-// Jetsam directory; then `runDetectors` over a window.
+// home holding the orchestrator sessions and the profile's OMP logs, a temp lanes dir holding the
+// lane sessions, and a temp Jetsam directory; then `runDetectors` over a window.
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, utimesSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { handLab, JETSAM_UNREADABLE, runDetectors } from "../src/selfheal/detectors";
@@ -46,7 +46,7 @@ afterAll(() => {
 });
 
 /** A world: a ledger seeded with `ledgerFixtures`' rows, sessions copied under a temp home and lanes dir, a Jetsam dir. */
-function world(o: { ledgerFixtures?: string[]; orchestrator?: string[]; lanes?: { fixture: string; path: string }[]; jetsam?: string[] } = {}) {
+function world(o: { ledgerFixtures?: string[]; orchestrator?: string[]; lanes?: { fixture: string; path: string }[]; jetsam?: string[]; ompLogs?: Record<string, string[]> } = {}) {
 	const c = clock("2026-10-01T00:00:00.000Z");
 	const { ledger, path } = tempLedger(c.now);
 	cleanup.push(dirname(path));
@@ -96,6 +96,11 @@ function world(o: { ledgerFixtures?: string[]; orchestrator?: string[]; lanes?: 
 	const jetsamDir = join(root, "DiagnosticReports");
 	mkdirSync(jetsamDir);
 	for (const f of o.jetsam ?? []) copyFileSync(join(FIXTURES, "jetsam", f), join(jetsamDir, f));
+	const logsDir = join(home, ".omp", "profiles", PROFILE, "logs");
+	for (const [name, lines] of Object.entries(o.ompLogs ?? {})) {
+		mkdirSync(logsDir, { recursive: true });
+		writeFileSync(join(logsDir, name), `${lines.join("\n")}\n`);
+	}
 	return {
 		root, home, lanesDir, sessions, jetsamDir,
 		async run(window: Window, over: { jetsamDir?: string } = {}): Promise<Finding[]> {
@@ -356,5 +361,47 @@ describe("window boundary (R10)", () => {
 		const windows = await Promise.all(cuts.slice(0, -1).map((from, i) => x.run(w(from, cuts[i + 1]!))));
 		expect(windows.map((fs) => fs.map((f) => f.detector))).toEqual([[], ["flaky-test", "flaky-test"], ["model-start", "flaky-test"]]);
 		expect(windows[1]![0]!.summary).toContain("e27bbc0");
+	});
+});
+
+// ---- mcp-load ------------------------------------------------------------------------------------
+
+// Lines cut from ~/.omp/profiles/agent-system-2/logs on 2026-10-26 and 2026-10-28 (OMP redacts the bearer itself);
+// the ctx line is from 2026-10-27. Timestamps carry the -07:00 offset OMP writes.
+const LINEAR_401 = (ts: string, pid: number) =>
+	JSON.stringify({ timestamp: ts, level: "error", pid, message: "MCP tool load failed", path: "mcp:linear", error: "HTTP 401:  [WWW-Authenticate: Bearer [redacted], resource_metadata=\"https://mcp.linear.app/.well-known/oauth-protected-resource/mcp\", scope=\"read write\"]" });
+const POSTHOG_401 = JSON.stringify({ timestamp: "2026-10-28T16:39:20.297-07:00", level: "error", pid: 38384, message: "MCP tool load failed", path: "mcp:posthog", error: "HTTP 401: No token provided, please provide a valid API token." });
+const CTX_MISSING = JSON.stringify({ timestamp: "2026-10-27T09:12:03.004-07:00", level: "error", pid: 63928, message: "MCP tool load failed", path: "mcp:ctx", error: "Executable not found in $PATH: \"ctx\"" });
+const NOISE = JSON.stringify({ timestamp: "2026-10-26T12:36:01.000-07:00", level: "info", pid: 28363, message: "agent_end maintenance routing" });
+
+describe("mcp-load", () => {
+	const logs = {
+		"omp.2026-10-26.28363.log": [LINEAR_401("2026-10-26T12:36:00.611-07:00", 28363), NOISE],
+		"omp.2026-10-26.70041.log": [LINEAR_401("2026-10-26T16:31:00.358-07:00", 70041)],
+		"omp.2026-10-27.63928.log": [CTX_MISSING, "not json MCP tool load failed"],
+		"omp.2026-10-28.38384.log": [LINEAR_401("2026-10-28T16:39:20.269-07:00", 38384), POSTHOG_401],
+	};
+
+	test("one finding per server and failure, at its last failure, counting the window's failures; a 401 names the profile's login command", async () => {
+		const x = world({ ompLogs: logs });
+		const fs = of(await x.run(w("2026-10-26T00:00:00.000Z", "2026-10-29T00:00:00.000Z")), "mcp-load");
+		expect(fs.map((f) => [f.at, f.summary])).toEqual([
+			["2026-10-27T16:12:03.004Z", "mcp-load: ctx failed to load 1 time(s) in profile agent-system-2: Executable not found in $PATH: \"ctx\""],
+			["2026-10-28T23:39:20.269Z", "mcp-load: linear failed to load 3 time(s) in profile agent-system-2: HTTP 401; a missing or expired login: run `OMP_PROFILE=agent-system-2 omp`, then `/mcp reauth linear`"],
+			["2026-10-28T23:39:20.297Z", "mcp-load: posthog failed to load 1 time(s) in profile agent-system-2: HTTP 401; a missing or expired login: run `OMP_PROFILE=agent-system-2 omp`, then `/mcp reauth posthog`"],
+		]);
+		const linear = fs.find((f) => f.summary.includes("linear"))!;
+		expect(linear.evidence).toBe(`${join(x.home, ".omp", "profiles", PROFILE, "logs", "omp.2026-10-26.28363.log")}:1 .. ${join(x.home, ".omp", "profiles", PROFILE, "logs", "omp.2026-10-28.38384.log")}:1`);
+	});
+
+	test("only the window's failures count", async () => {
+		const x = world({ ompLogs: logs });
+		const fs = await x.run(w("2026-10-26T20:00:00.000Z", "2026-10-27T00:00:00.000Z"));
+		expect(fs.map((f) => f.summary)).toEqual(["mcp-load: linear failed to load 1 time(s) in profile agent-system-2: HTTP 401; a missing or expired login: run `OMP_PROFILE=agent-system-2 omp`, then `/mcp reauth linear`"]);
+	});
+
+	test("quiet when the profile has no logs directory, and when no line in the window failed", async () => {
+		expect(await world().run(w("2026-10-26T00:00:00.000Z", "2026-10-29T00:00:00.000Z"))).toEqual([]);
+		expect(await world({ ompLogs: { "omp.2026-10-26.28363.log": [NOISE] } }).run(w("2026-10-26T00:00:00.000Z", "2026-10-29T00:00:00.000Z"))).toEqual([]);
 	});
 });

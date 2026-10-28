@@ -1,5 +1,5 @@
 /**
- * The seven self-heal detectors (PLAN wl-mvbcjageg7o2yo § 2.3), pure: each one reads inputs
+ * The eight self-heal detectors (PLAN wl-mvbcjageg7o2yo § 2.3), pure: each one reads inputs
  * `read.ts` has already gathered and returns findings; nothing here touches a file, the ledger
  * or the clock. The thresholds are this plan's choice and every summary states the one it used.
  *
@@ -10,7 +10,7 @@
  *   pair straddling `from` is reported once, in the window holding its second event.
  * - One finding per subject: per burst (compaction-loop), per routing (hand-lab), per message
  *   (paste-drop), per question (ceiling-wall), per sha (flaky-test), per report (jetsam), per lane
- *   (model-start).
+ *   (model-start), per server and failure (mcp-load).
  */
 import { labOf } from "../../../classifier/src/lab";
 import type { DetectorId, Finding, Window } from "./types";
@@ -126,6 +126,17 @@ export interface JetsamReport {
 	largest: { name: string; pages: number } | null;
 }
 
+/** One `MCP tool load failed` line from an OMP log of the profile: the server it names and its error. */
+export interface McpLoadFailure {
+	/** The log file and its 1-based line. */
+	path: string;
+	line: number;
+	at: string;
+	/** The server name, `mcp:` stripped. */
+	server: string;
+	error: string;
+}
+
 export interface DetectorInputs {
 	compactionSessions: CompactionSession[];
 	orchestratorSessions: OrchestratorSession[];
@@ -138,6 +149,8 @@ export interface DetectorInputs {
 	laneModels: LaneModelSet[];
 	/** `unreadable`: the directory or the report files that could not be read (each counted, never as zero events). */
 	jetsam: { reports: JetsamReport[]; unreadable: string[] };
+	/** `profile`: the OMP profile whose logs were read. */
+	mcpLoad: { profile: string; failures: McpLoadFailure[] };
 }
 
 // ---- the detectors -----------------------------------------------------------------------------
@@ -326,6 +339,47 @@ export function modelStart(starts: readonly LaneStart[], models: readonly LaneMo
 	return out;
 }
 
+/** The failure an MCP load error names: `HTTP <status>` when it carries one, else its first 80 characters. */
+export function mcpFailureKind(error: string): string {
+	const http = /^HTTP (\d{3})\b/.exec(error);
+	if (http) return `HTTP ${http[1]}`;
+	const line = error.split("\n")[0]!.trim();
+	return line.length > 80 ? `${line.slice(0, 79)}…` : line;
+}
+
+/**
+ * mcp-load: a server OMP could not load in the profile, so its tools were missing from every session
+ * that started then. One finding per server and failure kind, at its last failure in the window,
+ * counting the failures in the window. An HTTP 401 or 403 is a missing or expired login, and the
+ * summary names the profile and the login command that recovers it.
+ */
+export function mcpLoad(input: DetectorInputs["mcpLoad"], w: Window): Finding[] {
+	const from = ms(w.from);
+	const to = ms(w.to);
+	const groups = new Map<string, McpLoadFailure[]>();
+	for (const f of input.failures) {
+		if (ms(f.at) < from || ms(f.at) >= to) continue;
+		const key = `${f.server}\u0000${mcpFailureKind(f.error)}`;
+		const list = groups.get(key);
+		if (list) list.push(f);
+		else groups.set(key, [f]);
+	}
+	const out: Finding[] = [];
+	for (const list of groups.values()) {
+		const sorted = [...list].sort((a, b) => ms(a.at) - ms(b.at));
+		const first = sorted[0]!;
+		const last = sorted[sorted.length - 1]!;
+		const kind = mcpFailureKind(last.error);
+		const login = kind === "HTTP 401" || kind === "HTTP 403"
+			? `; a missing or expired login: run \`OMP_PROFILE=${input.profile} omp\`, then \`/mcp reauth ${last.server}\``
+			: "";
+		out.push(finding("mcp-load", last.at, null, null,
+			`mcp-load: ${last.server} failed to load ${sorted.length} time(s) in profile ${input.profile}: ${kind}${login}`,
+			sorted.length === 1 ? `${first.path}:${first.line}` : `${first.path}:${first.line} .. ${last.path}:${last.line}`));
+	}
+	return out;
+}
+
 /** Every detector over `inputs`, the findings outside `[from, to)` dropped, oldest first. */
 export function runDetectors(inputs: DetectorInputs, window: Window): Finding[] {
 	const all = [
@@ -336,6 +390,7 @@ export function runDetectors(inputs: DetectorInputs, window: Window): Finding[] 
 		...flakyTest(inputs.testRuns),
 		...jetsam(inputs.jetsam, window),
 		...modelStart(inputs.laneStarts, inputs.laneModels),
+		...mcpLoad(inputs.mcpLoad, window),
 	];
 	const from = ms(window.from);
 	const to = ms(window.to);
