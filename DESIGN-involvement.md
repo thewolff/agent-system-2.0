@@ -22,8 +22,11 @@ The default starting level is **escalate**. A workload starts **with-operator** 
 **Decided: graduation is Jo's switch.** The improver moves from "Jo approves each change" to "agents apply changes" only when Jo says so. Jo's word is recorded in the ledger as an `instructions` row. Nothing graduates automatically. Jo decided this on 2026-10-28; `date` read 10:08 PDT when the decision was recorded. Jo's words: "i think the weekly criteria runs without me after i say it does, and we use ther checks as written as guidance. but *I* am the one who flips the switch".
 - **The six gates (G1–G6, § 7.5) are guidance.** Every weekly report computes each gate and shows pass, fail or `insufficient data`, with the reason for each fail. The report never permits or blocks graduation on its own.
 - **Jo may flip the switch while a gate is failing.** The flip is then recorded with the list of gates failing at that moment.
-- **Suspension stays automatic** (§ 7.6). An overdue or failed weekly audit, missing live data, a missed ask on a protected criterion (C2, C4–C8, C10), or the tripwire each drop the improver back to "Jo approves". A missed ask on a protected criterion also reverts the last change.
-- **Returning to "agents apply" needs Jo's word again.** Suspension was not part of Jo's ruling. Plumb's reading is to keep it automatic, because it only returns control to Jo. Jo can overrule that reading.
+- **A failure after the switch notifies Jo loudly and waits for Jo's call** (§ 7.6). This covers an overdue or failed weekly audit, missing live data, a missed ask on a protected criterion (C2, C4–C8, C10), and the tripwire.
+  - Jo gets one immediate needs-you notice naming the failure and its evidence, sent loudly through as2's existing alert channels.
+  - The rewriter keeps its current authority until Jo rules. Nothing drops back, and nothing is reverted, on its own.
+  - Jo's call (keep running, suspend, or suspend and revert the last change) is recorded in the ledger like the switch.
+  - Jo decided this on 2026-10-28; `date` read 10:58 PDT when the decision was recorded. Jo was asked "if the weekly criteria-rewriter fails a check after you've turned it loose, should it drop back automatically… or should a failure only notify you and wait for your call?". Jo's words: "notify and wait for my call", then "but notify me LOUDLY".
 
 **Held until slice B10: which hosted model the improver may send ledger text to.** No local model runtime is installed, so any optimizer run sends criteria wording and ledger answers to a hosted provider (§ 6.4). Recommended: Anthropic, which already receives every lane transcript. This is held, not asked now. It blocks only B10.
 
@@ -258,7 +261,7 @@ GEPA learns from a scored metric with written feedback. https://dspy.ai/current/
 | **Enforcement code** | The checkpoint checks, the protection check, the exception check, the trusted scorer, and how each is invoked and configured | Jo only (S1 `involvement` group) |
 
 **The exception (machine-checked).** An improver PR may merge without Jo only when **all** of these hold:
-1. Jo has flipped the switch, recorded as an `instructions` row in main's ledger that no later suspension or tripwire has superseded, and **its authority is current** (§ 7.6): a passing weekly audit within the last 8 days, and live comparison data available.
+1. Jo has flipped the switch, recorded as an `instructions` row in main's ledger, and no later Jo call has suspended it (§ 7.6). An open failure notice does not remove authority; only Jo's recorded call does.
 2. The diff touches the criteria-wording file and nothing else.
 3. Every changed entry is one of the enumerated judgment questions.
 4. The PR adds no entries, removes no entries and renames no entries.
@@ -324,7 +327,7 @@ The labeler and adjudicator must agree on at least **26 of 30**, and on **every*
 - 6 asks and 6 non-asks, drawn at random, blinded
 - at least 4 of the 6 non-asks drawn from decisions with no message and `no signal`, which is where silent under-asking hides
 
-Agreement must stay at or above 10 of 12 per week. A `missed` found here is a missed ask for every metric. A weekly audit is **due** 7 days after the previous one closed, and **overdue** after 8. Missing, overdue or failed audits suspend agent-apply authority (§ 7.6).
+Agreement must stay at or above 10 of 12 per week. A `missed` found here is a missed ask for every metric. A weekly audit is **due** 7 days after the previous one closed, and **overdue** after 8. After Jo flips the switch, a missing, overdue or failed audit sends Jo a loud notice and waits for Jo's call (§ 7.6). It does not suspend anything on its own.
 
 **Coverage floor.** For G3 (§ 7.5), each protected criterion (C2, C4, C5, C6, C7, C8, C10) needs at least 3 audited cases, counting asks and non-asks. Where too few real cases exist, the shortfall is listed and G3 reports fail.
 
@@ -392,29 +395,44 @@ If any gate fails at the end of month one, the report names the failed gate and 
 5. The fresh set needs the same support as § 6.3: both denominators at least 20, and every protected criterion with at least 3 audited cases. If the pool falls short, G4 reports `insufficient data` while more cases mature and are audited, and nothing is evaluated.
 6. Once the set is frozen, the next weekly report re-checks G1–G6. G4 is one evaluation of the frozen month-start wording against the frozen current wording, on the fresh set. The result goes to Jo as guidance.
 
-The same procedure builds the fresh test that informs Jo's decision after a suspension or tripwire (§ 7.6).
+The same procedure builds the fresh test that informs Jo's call after a failure notice (§ 7.6).
 
-### 7.6 After Jo flips the switch: current authority, suspension and tripwire
+### 7.6 After Jo flips the switch: failure notices and Jo's call
 
-Agent-apply authority is only valid while Jo's switch record stands and its evidence is **current**:
-- a weekly audit (§ 7.1) passing at 10 of 12 or better, closed within the last 8 days, and
-- live comparison data available: a § 7.4 baseline, and no revert left unadjudicated for more than 7 days.
+Agent-apply authority holds while Jo's switch record stands and no later Jo call has suspended it. The exception check (§ 6.5, condition 1) reads both from main's ledger before every autonomous application.
 
-The exception check (§ 6.5, condition 1) reads this from main's ledger state before every autonomous application.
+**Failures that notify Jo:**
+- **Evidence missing or failing:** an overdue weekly audit, an audit below 10 of 12, or live comparison data unavailable (no § 7.4 baseline, or a revert unadjudicated for more than 7 days).
+- **Confirmed regression (tripwire):** any adjudicated or audited missed ask on a protected criterion (C2, C4, C5, C6, C7, C8, C10), or a live missed-ask rate per 100 decisions above baseline over an equal-length window.
 
-**Suspension: the evidence is missing or failing, but no regression is confirmed.** Triggers: an overdue audit, an audit below 10 of 12, or live comparison data unavailable. Effects:
-- The improver switches to "Jo approves" automatically, and Jo gets a notice naming the trigger.
-- Changes already applied stay in place; suspension is not a rollback.
-- Weekly PRs keep opening, but each one waits for Jo's word.
-- **Agent-apply authority returns only on Jo's word**, recorded as a new `instructions` row. The weekly report shows whether the trigger has cleared, plus G1–G6, as guidance. A later passing audit never restores authority on its own.
+**What a failure does:** it notifies, then waits. Jo's ruling, 2026-10-28: "notify and wait for my call", "but notify me LOUDLY".
+- The improver raises **one** needs-you question per failure. It names the failure, the evidence (audit score and date, the missed case and its criterion, or the rate against baseline) and the last applied change.
+- The answer words are `keep` (authority unchanged), `suspend` (back to Jo approving each change), and `revert` (suspend, and revert the last applied change).
+- A second failure of the same kind while the question is open adds its evidence to that question rather than raising another.
+- **Until Jo answers, nothing changes.** The rewriter keeps its authority, applied changes stay in place, and nothing is reverted automatically. The tripwire's revert is one of Jo's options, not an automatic step; that is the spec's reading of "wait for my call".
+- Jo's answer is recorded as an `instructions` row, the same way as the switch, with the failure it answers.
+- After `suspend` or `revert`, weekly PRs keep opening and each one waits for Jo's word. Agent-apply returns only on a new switch instruction from Jo. The weekly report gives G1–G6 (on a fresh sealed test after a tripwire, § 7.5 re-check procedure) as guidance.
 
-**Tripwire: a confirmed regression.** Triggers:
-- any adjudicated or audited missed ask on a protected criterion (C2, C4, C5, C6, C7, C8, C10), or
-- a live missed-ask rate per 100 decisions above baseline over an equal-length window.
+**How the notice is loud.** It uses only alert channels as2 already has:
 
-Effects: the last applied change is reverted, and the improver switches back to "Jo approves". It returns to "agents apply" only on Jo's word. The report gives Jo G1–G6 on a fresh sealed test (§ 7.5 re-check procedure) as guidance.
+| Channel | What exists today | Receipt |
+|---|---|---|
+| **Needs-you list, on fire** | A question named by a `now: <q-…> <category>` control entry from the escalation author is tagged `NOW (<category>): ` with state `now`. A `now` question goes out on its own poll rather than waiting for the batch window, and it still comes through while Jo is away (`brb`). The notice uses category `guard`. | `/Users/jowolff/agent-scratch/agent-system-2.0/involvement-spec/gates/src/rulings.ts:333` (`NOW_CATEGORIES`), `/Users/jowolff/agent-scratch/agent-system-2.0/involvement-spec/surface/src/errors.ts:653-654` (the tag), `/Users/jowolff/agent-scratch/agent-system-2.0/involvement-spec/surface/src/batch.ts:64-66` (`onFire`), `/Users/jowolff/agent-scratch/agent-system-2.0/involvement-spec/surface/src/batch.ts:32` (`AWAY_NOTICE`: "on-fire items still come through") |
+| **macOS notification with sound** | `osascript -e 'display notification … sound name "Glass"'` | `/Users/jowolff/agent-scratch/agent-system-2.0/involvement-spec/surface/scripts/train-tick.ts:1522-1527` (`realNotify`) |
+| **Issue on Jo's issues repo, mentioning Jo** | An issue on `thewolff/jo-issues` with label `as2-train`. Re-sends comment `@thewolff` and add the labels `loud`, then `critical`. | `/Users/jowolff/agent-scratch/agent-system-2.0/involvement-spec/surface/src/merge-train.ts:1623-1627` |
+| **LOUD needs-you line** | At ladder levels 2 and 3 the line is prefixed `LOUD` (then `LOUD, critical`) with how long it has gone unacknowledged | `/Users/jowolff/agent-scratch/agent-system-2.0/involvement-spec/surface/src/errors.ts:665-671` |
+| **Repeats** | The send ladder: level 1 at raise, level 2 after 4 h, level 3 after 8 h. "Nothing is sent after level 3." Closing the issue acknowledges it and stops re-sends. | `/Users/jowolff/agent-scratch/agent-system-2.0/involvement-spec/surface/src/merge-train.ts:1630-1639` (`TRAIN_ALERT_LADDER`) |
 
-**Why suspension stays automatic, when graduation needs Jo.** Jo ruled on graduation. Suspension was not discussed. Plumb's reading is that suspension stays automatic because it only returns control to Jo. Jo can overrule that reading.
+**What the involvement notice uses:**
+1. A `NOW (guard)` needs-you question, on fire from its first poll.
+2. At raise, all three of: the jo-issues issue mentioning Jo, the macOS notification with sound, and the needs-you question.
+3. Re-sends on the existing ladder's 4 h and 8 h schedule, with the LOUD line.
+
+**What doesn't exist today, and is built in B11:**
+- **The ladder is train-only.** It runs on merge-train questions (`trainAlertActions`, `merge-train.ts:1730`), so B11 generalizes it to involvement notices.
+- **No macOS notification at raise.** The ladder sends the macOS notification only at levels 2 and 3 (`train-tick.ts:41-42`). B11 adds it at level 1 for involvement notices, because Jo asked for loud.
+- **Nothing sorts a NOW line to the top of the needs-you list.** `grep -rnE 'state === "now"'` over `surface/src` finds only the on-fire check in `batch.ts:66`; no rule orders NOW lines first. B11 adds that ordering.
+- **No repeat after 8 hours.** The ladder stops at level 3. B11 repeats level 3 every 8 hours until Jo's call is recorded. That interval is this spec's proposal.
 
 ---
 
@@ -468,7 +486,7 @@ Each slice is one workload slice with its own done-condition. B1 goes first, bec
 | **B8 Label audits** (§ 7.1) | The blinded start audit, the weekly 12-case audit and the coverage report, on a one-word-per-case page for Jo. | (1) Jo's page never shows the agent's label or the recommendation made at the time. (2) The samples are drawn per § 7.1, including `none` and `no signal` non-asks. (3) The eval refuses labels until the start audit passes. (4) Coverage is reported per protected criterion, and shortfalls are listed. |
 | **B9 Eval, data sets and scorer** (§ 6.3, § 7.2, § 7.4) | The Phoenix dataset, the training, selection and sealed sets, the trusted scorer with denominators and maturity, and the shadow baseline. | (1) The current wording gets baseline numbers, or `insufficient data`. (2) The same input yields the same scores twice. (3) The proposer process can't read the selection or sealed sets. (4) The 17th selection evaluation is refused until the set is replaced. (5) A candidate where C8 gains one missed ask and another criterion loses one, leaving the overall rate unchanged, is rejected. |
 | **B10 Improver, Jo-approves mode** (§ 6.4–6.5) | The weekly launchd job on DSPy with GEPA, with the § 6.4 conditions met. Cross-lab OpenAI review, a PR with a one-line summary, and the protection and exception checks run from main. **Prerequisite:** Jo's approval of the model destination. | (1) The weekly PR carries both numbers, the protected-criterion counts, the reviewer's verdict and Plumb's recommendation. (2) A candidate that edits the policy file, changes a level, adds a wording entry, or disables the protection check is refused, and the refusal comes from main's copy of the check. (3) Nothing is applied without Jo's word. (4) DSPy's cache is in restricted-pickle mode. |
-| **B11 Checking loop, graduation guidance, Jo's switch, suspension and tripwire** (§ 7.3–7.6) | The missed-ask floor, the weekly G1–G6 guidance report with one sealed-test evaluation, the append-only exposure history and the unassigned fresh pool, the fresh-test re-check, Jo's switch as a ledger `instructions` row (recording the gates failing at flip time), the agent-apply path through the § 6.5 exception, current-authority checks, automatic suspension, prospective confirmation, and the automatic revert to Jo-approves. | (1) Every weekly report lists G1–G6 with pass, fail or `insufficient data`, and the reason for each fail. (2) With all six gates passing and no Jo switch instruction, the improver stays in Jo-approves. (3) With a Jo switch instruction while G4 fails, the improver moves to agents-apply, and the switch record lists G4 as failing. (4) A simulated missed ask on C7 or C8 after the switch reverts the last change and switches back. (5) The sealed test is evaluated once and then locked. A failed evaluation builds a fresh sealed set only from workloads with no exposure-history entry, or reports `insufficient data` if support is short. (6) A workload that was assigned to training, then removed from training, is rejected as a sealed-test candidate, and its history entry can't be deleted. (7) After the switch, with no confirmed missed ask, an overdue weekly audit, or one scoring 9 of 12, suspends authority. The next improver PR waits for Jo, and already-applied changes stay in place. A later passing audit does not restore agents-apply; only a new Jo instruction does. |
+| **B11 Checking loop, graduation guidance, Jo's switch, failure notices and tripwire** (§ 7.3–7.6) | The missed-ask floor, the weekly G1–G6 guidance report with one sealed-test evaluation, the append-only exposure history and the unassigned fresh pool, the fresh-test re-check, Jo's switch as a ledger `instructions` row (recording the gates failing at flip time), the agent-apply path through the § 6.5 exception, prospective confirmation, and the failure notice with Jo's call (`keep` / `suspend` / `revert`) recorded as an `instructions` row. **Loud-notice build items (§ 7.6):** generalize the train's send ladder to involvement notices; send the macOS notification at level 1; sort NOW lines to the top of the needs-you list; repeat level 3 every 8 h until Jo's call is recorded. | (1) Every weekly report lists G1–G6 with pass, fail or `insufficient data`, and the reason for each fail. (2) With all six gates passing and no Jo switch instruction, the improver stays in Jo-approves. (3) With a Jo switch instruction while G4 fails, the improver moves to agents-apply, and the switch record lists G4 as failing. (4) A simulated missed ask on C7 or C8 after the switch raises one `NOW (guard)` question with the evidence, and nothing is reverted until Jo answers `revert`. (5) The sealed test is evaluated once and then locked. A failed evaluation builds a fresh sealed set only from workloads with no exposure-history entry, or reports `insufficient data` if support is short. (6) A workload that was assigned to training, then removed from training, is rejected as a sealed-test candidate, and its history entry can't be deleted. (7) After the switch, an overdue weekly audit, or one scoring 9 of 12, sends exactly one notice. Authority is unchanged, and the next improver change still applies, until Jo's recorded call. Jo's `suspend` moves the improver to Jo-approves. (8) At raise, the notice produces a jo-issues issue mentioning `@thewolff`, a macOS notification with sound, and a NOW line at the top of the needs-you list. Without an answer, it re-sends at 4 h and 8 h and then every 8 h, and stops once Jo's call is recorded. |
 
 ---
 
@@ -485,7 +503,7 @@ Source: `/Users/jowolff/agent-scratch/agent-system-2.0/involvement/REVIEW-openai
 | # | Finding | Resolved in |
 |---|---|---|
 | 1 | Solo didn't preserve every reserved item. Phase closure had no action-time check, and C10 at solo was contradictory. | § 3.1 precedence rule. C4 `phase.*` operations and C10 at all levels with N7 allowed. B3 (3), B4 (3). |
-| 2 | The counter-metric couldn't see silent under-asking | § 6.2 (no signal is not evidence), § 7.1 blinded recurring non-ask audits and coverage floor, § 6.6 (follow rate generates candidates only). Round 2: authority depends on current passing audits, with suspension (§ 7.6, § 6.5 condition 1, B11 (7)). |
+| 2 | The counter-metric couldn't see silent under-asking | § 6.2 (no signal is not evidence), § 7.1 blinded recurring non-ask audits and coverage floor, § 6.6 (follow rate generates candidates only). Round 2: a missing or failed audit is acted on (§ 7.6, B11 (7)). After round 3, Jo ruled that it notifies Jo loudly and waits for Jo's call instead of suspending automatically. |
 | 3 | The held-out core was reused for selection | § 7.2: three sets, a capped and retired selection set, a sealed one-time graduation test, prospective confirmation |
 | 4 | Gates weren't computable | § 6.3 unit, maturity, denominators, fail-closed. § 7.4 baseline. § 7.5 G1–G6 with fail conditions, "equal is allowed" for missed asks. Round 2: C8 restored to the protected set (§ 6.3, G4, G5, § 7.6, B9 (5)). The fresh-test re-check is defined (§ 7.5). After round 3, Jo made graduation Jo's switch, so the gates are computed weekly as guidance (§ 7.5). |
 | 5 | Graduated edits collided with C7 | § 6.5: wording, policy and enforcement are separate, with a machine-checked exception run from main. S1 `involvement` group. B10 (2). |
@@ -494,7 +512,7 @@ Source: `/Users/jowolff/agent-scratch/agent-system-2.0/involvement/REVIEW-openai
 | 8 | Attribution missed asks that never happened | § 6.1 decision-row targets, multiple candidates, `unresolved`. B1 (7). |
 | 9 | No merge-time coverage for rule documents | S7, C2 at CP3/CP5 over N2. § 8 last row. B2 (4). |
 | 10 | S4 count | S1 group keys defined. #369 is S4 = 4. |
-| R2-B1 | Graduated authority survived a missing or failed audit | § 7.6 current authority and automatic suspension (kept apart from the tripwire rollback). § 6.5 condition 1. B11 (7). After round 3: a return to agents-apply needs Jo's word. |
+| R2-B1 | Graduated authority survived a missing or failed audit | § 7.6: a missing or failed audit raises a loud failure notice. B11 (7). After round 3, Jo ruled "notify and wait for my call", so authority changes only on Jo's recorded call, not automatically. |
 | R2-B2 | C8 dropped from the protected floor | § 6.3 protected list names C8. § 7.1 coverage, G4, G5, § 7.6 tripwire. B9 (5), B11 (4). |
 | R2 clarification | Sealed-test retry after a failed attempt | § 7.5 re-check procedure, § 7.2 table. B11 (5). After round 3, the re-check feeds Jo's decision; it no longer graduates anything by itself. |
 | R3-B1 | Retry sealed set could include workloads the proposer trained on | § 7.2 append-only exposure history and unassigned fresh pool. § 7.5 re-check steps 1, 3–5 draw only from never-exposed workloads, and report `insufficient data` when support is short. B11 (5), (6). |

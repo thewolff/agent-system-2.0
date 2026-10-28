@@ -21,13 +21,18 @@ Jo, 2026-10-28, morning PDT, approved this outcome: as2's "production stakes" is
    - The improver moves from Jo-approves to agents-apply only on Jo's word, recorded in the ledger as an `instructions` row. Nothing graduates automatically.
    - The gates G1–G6 (spec § 7.5) stay as written, but they are guidance. Every weekly report computes each one and shows pass, fail or `insufficient data`, with the reason for each fail. The report never permits or blocks graduation on its own.
    - If Jo flips the switch while a gate is failing, the switch record lists the gates failing at that moment.
-   - **Plumb's reading, not Jo's ruling:** Jo ruled on graduation, and suspension was not discussed. Suspension is kept automatic because it only returns control to Jo: an overdue or failed weekly audit, missing live data, a missed ask on a protected criterion, or the tripwire each drop the improver back to Jo-approves. Going back to agents-apply after any of these again needs Jo's word. Jo can overrule this reading.
+   - **A failure after the switch notifies Jo loudly and waits for Jo's call.** Jo was asked "if the weekly criteria-rewriter fails a check after you've turned it loose, should it drop back automatically… or should a failure only notify you and wait for your call?". Jo's words: "notify and wait for my call", then "but notify me LOUDLY". Jo decided this on 2026-10-28; `date` read 10:58 PDT when the decision was recorded.
+     - An overdue or failed weekly audit, missing live data, a missed ask on a protected criterion, or the tripwire each send Jo one immediate needs-you notice naming the failure and its evidence.
+     - The notice goes through as2's existing alert channels (spec § 7.6): a `NOW (guard)` needs-you question that goes out on fire, an issue on `thewolff/jo-issues` mentioning `@thewolff`, a macOS notification with sound, and the train's send ladder re-sending at 4 h and 8 h with a LOUD line. Spec slice B11 builds what is missing today: the ladder only runs for the merge train, there is no sound at raise, nothing sorts NOW lines to the top, and nothing repeats after 8 h.
+     - The rewriter keeps its current authority until Jo rules. Nothing drops back, and nothing is reverted, on its own.
+     - Jo's call is `keep`, `suspend` (back to Jo approving each change) or `revert` (suspend, and revert the last change). It is recorded in the ledger as an `instructions` row, like the switch.
+     - Putting the tripwire's revert among Jo's options, rather than making it automatic, is the spec's reading of "wait for my call".
 
 ## Amendments
 
 - **P-16** ("the system proposes and never applies") and **P-7b item 4** ("changes to the system's own rules or machinery" are Jo's) are amended **for this feature only, and only for the criteria-wording file** (spec § 6.5). That file holds the text of the enumerated judgment questions and nothing else: no levels, no routing, no thresholds, no path lists. Jo approves each change in month one, and agents apply changes after Jo flips the switch (item 7).
 - **Machine-checked exception.** After Jo flips the switch, an improver PR merges without Jo only when all of these hold. The checks run from main's copy of the exception check and scorer, never the candidate's.
-  - Jo's switch instruction stands in main's ledger, with no later suspension or tripwire, and authority is current: a passing blinded weekly audit within the last 8 days, and live comparison data available. A missing, overdue or failed audit suspends authority back to Jo-approves automatically (spec § 7.6).
+  - Jo's switch instruction stands in main's ledger, and no later Jo call has suspended it. An open failure notice does not remove authority; only Jo's recorded call does (spec § 7.6).
   - The diff touches only the criteria-wording file.
   - It edits existing enumerated entries only, with none added, removed or renamed.
   - The trusted scorer rates it acceptable.
