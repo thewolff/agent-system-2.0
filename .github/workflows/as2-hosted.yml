@@ -1,9 +1,9 @@
 # as2's hosted suite: on every pull request to main and every push to main, the test files that do not need Jo's
 # machine run on GitHub-hosted runners, and each job shows on the PR as a check.
-#   linux (ubuntu-latest): every Bun test file minus testRunner.macOnly and .github/as2-hosted/jo-machine-only.yml
+#   linux (ubuntu-latest): every Bun test file minus testRunner.macOnly and testRunner.mainSkip
 #   macos (macos-latest):  testRunner.macOnly
-# The sets come from .github/as2-hosted/sets.ts, which fails on a stale list. Files in jo-machine-only.yml (they need
-# OMP) run only in the local runner's suite. This workflow posts nothing else (no status, no comment) and its token is
+# The sets come from .github/as2-hosted/sets.ts, which fails on a stale list. testRunner.mainSkip's files need OMP
+# and run only in the local runner's suite. This workflow posts nothing else (no status, no comment) and its token is
 # read-only; `as2/full-suite` stays the local runner's, unchanged. `pull_request`, never `pull_request_target`: a fork's
 # PR gets a read-only token and no secrets, so its code runs on a throwaway VM with nothing to take.
 name: as2-hosted
