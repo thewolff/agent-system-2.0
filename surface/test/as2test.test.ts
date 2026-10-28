@@ -527,7 +527,7 @@ describe("prepare, full and solo", () => {
 		const t0 = Date.now();
 		const r = call(b, { sub: "full", runId: "tr-c1" });
 		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
-		expect(r.stderr).toContain("timeout: the part passed its cap of 2400 ms; its group was killed");
+		expect(r.stderr).toContain("timeout: the part passed its cap of 2400 ms; its session was killed");
 		expect(Date.now() - t0).toBeLessThan(2_400 + CAPTURE_MS + 500 + 5_000);
 		const work = workOf(b, "tr-c1");
 		const pid = Number(readFileSync(join(work, "slow.pid"), "utf8"));
@@ -625,6 +625,8 @@ describe("fullWorkers: the PR full part runs its files at once; base and a keyle
 		`;
 		const fixture = `import { test } from "bun:test";
 			test("detached group", async () => {
+				// Reparented into the same session, but no longer in the part's descendant tree at cleanup time.
+				Bun.spawnSync(["/bin/sh", "-c", "set -m; /bin/sleep 300 >/dev/null 2>&1 & echo $! > ../own.pid"]);
 				Bun.spawn([process.execPath, "-e", ${JSON.stringify(detached)}], { detached: true, stdout: "ignore", stderr: "ignore" });
 				await Promise.withResolvers().promise;
 			}, 600_000);
@@ -637,11 +639,15 @@ describe("fullWorkers: the PR full part runs its files at once; base and a keyle
 			const work = workOf(b, "tr-dc1");
 			const { group, child } = JSON.parse(readFileSync(join(work, "detached.json"), "utf8")) as { group: number; child: number };
 			pids.push(group, child);
+			const own = Number(readFileSync(join(work, "own.pid"), "utf8"));
+			pids.push(own);
 			expect(r.exit).toBe(WRAPPER_EXIT.timeout);
 			expect(r.stderr).toContain("timeout: the part passed its cap of 2400 ms");
 			// The leader cannot reap this detached group, and neither it nor its child cooperates with TERM.
 			expect(readFileSync(join(work, "groups"), "utf8").split("\n").map(Number)).toContain(group);
 			expect(readFileSync(join(work, "full.stuck.log"), "utf8")).toContain("capture cut");
+			// Neither cleanup half can substitute for the other: both ownership forms must be gone before the sweep.
+			expect(await until(() => [own, group, child].every((pid) => !alive(pid)), 3_000)).toBe(true);
 			const s = call(b, { sub: "sweep", runId: "tr-dc1" });
 			expect(s.stderr).toBe("");
 			expect(s.exit).toBe(WRAPPER_EXIT.ok);
@@ -695,11 +701,12 @@ describe("fullWorkers: the PR full part runs its files at once; base and a keyle
 				pids.push(leader, group, child);
 				expect(existsSync(join(work, "groups-swapped"))).toBe(true);
 				expect(completed).toBe(true);
-				expect(p.exitCode).toBe(WRAPPER_EXIT.failed);
+				expect(p.exitCode).toBe(WRAPPER_EXIT.timeout);
 				const stderr = await new Response(p.stderr).text();
-				expect(stderr).toContain("timeout: the part passed its cap of 2400 ms; its group was killed");
+				expect(stderr).toContain("timeout: the part passed its cap of 2400 ms; its session was killed");
 				expect(stderr).toContain(`timeout cleanup: cannot persist descendant groups to ${join(work, "groups")}`);
 				expect(stderr).toContain("open failed:");
+				expect(readFileSync(join(work, "full.cleanup.log"), "utf8")).toContain(`timeout cleanup: cannot persist descendant groups to ${join(work, "groups")}: open failed:`);
 				expect(lstatSync(join(work, "groups"))[how === "fifo" ? "isFIFO" : "isSymbolicLink"]()).toBe(true);
 				expect(readFileSync(target, "utf8")).toBe("UNCHANGED\n");
 				// Do not sweep: its existing pathname read is unsafe for this deliberately hostile groups file.
@@ -740,7 +747,7 @@ describe("fullWorkers: the PR full part runs its files at once; base and a keyle
 
 describe("the stuck capture at the cap: bounded, safe reads, never blocks the kill", () => {
 	const CAPS = { fullCapMin: 0.04, soloCapMin: 0.04 };
-	const TIMEOUT_LINE = "timeout: the part passed its cap of 2400 ms; its group was killed";
+	const TIMEOUT_LINE = "timeout: the part passed its cap of 2400 ms; its session was killed";
 	/** A test file that runs `body`, records its pid in ../slow.pid, then hangs past any cap. */
 	const hangAfter = (body: string) =>
 		`import { test } from "bun:test";\nimport { symlinkSync, unlinkSync, writeFileSync } from "node:fs";\ntest("hangs", async () => {\n\t${body}\n\twriteFileSync("../slow.pid", String(process.pid));\n\tawait new Promise(() => {});\n}, 600_000);\n`;
@@ -1533,7 +1540,7 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		const worker = fixturePid(work, "spin.pid");
 		const zombie = fixturePid(work, "zombie.pid");
 		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
-		expect(r.stderr).toBe("as2test: timeout: the part passed its cap of 9000 ms; its group was killed\n");
+		expect(r.stderr).toBe("as2test: timeout: the part passed its cap of 9000 ms; its session was killed\n");
 		expect(Date.now() - t0).toBeGreaterThanOrEqual(9_000);
 		expect(Date.now() - t0).toBeLessThan(9_000 + CAPTURE_MS + 500 + 5_000);
 		const lines = detectorLines(r.stdout);
@@ -1555,16 +1562,8 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		expect(Date.parse(lines[would]!.iso) - t0).toBeLessThan(9_000 - 2_000);
 		report({ fixture: "shadow", stdout: r.stdout, stderr: r.stderr });
 		expect(Object.keys(signatureSections(readFileSync(join(work, "full.signature.log"), "utf8")))).toEqual(["1", "2", "3", "4", "5"]);
-		// D5's cap path is unchanged: its stuck capture, then the group's kill.
+		// The merged D5 cap path captures, then kills the whole part session, including the parallel worker's own group.
 		expect(Object.keys(stuckSections(readFileSync(join(work, "full.stuck.log"), "utf8")))).toEqual(["1", "2", "3", "4"]);
-		// The cap kills the leader's group as before. A --parallel worker has its own group, which a groups sweep does not
-		// know; a spinning one usually outlives its leader, so the test ends it here. It may already have gone (observed under
-		// a concurrent load): whether it survives the leader is bun's, not the detector's, so ESRCH is fine here.
-		try {
-			process.kill(worker, "SIGKILL");
-		} catch (e) {
-			if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e;
-		}
 		expect(await until(() => !alive(worker), 3_000)).toBe(true);
 		expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
 		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
@@ -1965,6 +1964,148 @@ describe("sweep", () => {
 			expect(() => execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", ...bad })).toThrow(WrapperRenderError);
 		}
 	});
+});
+
+// ---- the part's session (PLAN wl-mvqu69tjvpy96o § 2, C9) ------------------------------------------------------------
+
+describe("the part owns its session: the cap and a groups sweep kill every process in it and confirm it empty", () => {
+	const CAPS = { fullCapMin: 0.04, soloCapMin: 0.04 };
+	const TIMEOUT_LINE = "timeout: the part passed its cap of 2400 ms; its session was killed";
+	/** A shell job-control child: `set -m` puts the sleep in a process group of its own (setpgid), still in the part's session. */
+	const ownGroup = (pidFile: string, envReset = false) =>
+		`Bun.spawnSync([${envReset ? `"/usr/bin/env", "-i", ` : ""}"/bin/sh", "-c", "set -m; /bin/sleep 300 >/dev/null 2>&1 & echo $! > ${pidFile}"]);`;
+	/**
+	 * A test that starts an own-group sleep, records its own pid in ../slow.pid and the pgids of both (getpgid through bun:ffi; ps
+	 * is refused in the fence) in ../pgids.json, runs `extra`, then hangs past any cap.
+	 */
+	const hangWithOwnGroup = (extra = "") =>
+		`import { test } from "bun:test";\nimport { dlopen, FFIType } from "bun:ffi";\nimport { readFileSync, writeFileSync } from "node:fs";\ntest("hangs", async () => {\n\t${extra}\n\t${ownGroup("../own.pid")}\n\tconst { getpgid } = dlopen("/usr/lib/libSystem.B.dylib", { getpgid: { args: [FFIType.i32], returns: FFIType.i32 } }).symbols;\n\tconst own = Number(readFileSync("../own.pid", "utf8"));\n\twriteFileSync("../pgids.json", JSON.stringify({ main: getpgid(process.pid), own: getpgid(own) }));\n\twriteFileSync("../slow.pid", String(process.pid));\n\tawait new Promise(() => {});\n}, 600_000);\n`;
+	const pass = (body: string) => `import { test } from "bun:test";\ntest("leaves a worker", () => {\n\t${body}\n});\n`;
+	const pidIn = (work: string, name: string): number => {
+		const pid = Number(readFileSync(join(work, name), "utf8"));
+		pids.push(pid);
+		return pid;
+	};
+	/** The fixture's sleep leads a group of its own, apart from the main bun's group (whose id is the part's session id). */
+	const expectOwnGroupApart = (work: string, own: number, main: number): void => {
+		expect(JSON.parse(readFileSync(join(work, "pgids.json"), "utf8"))).toEqual({ main, own });
+	};
+	const sibling = () => {
+		const s = Bun.spawn(["/bin/sleep", "300"]);
+		pids.push(s.pid);
+		return s;
+	};
+
+	test("a main that exits on TERM at the cap while its own-group worker lives: the worker is found and killed before the part exits timeout, and an unrelated process survives", async () => {
+		const b = box("sess-term");
+		const other = sibling();
+		prepared(b, "tr-s1", { "h.test.ts": hangWithOwnGroup() }, CAPS);
+		const r = call(b, { sub: "full", runId: "tr-s1" });
+		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
+		expect(r.stderr).toContain(TIMEOUT_LINE);
+		expect(r.stderr).not.toContain("cleanup");
+		const work = workOf(b, "tr-s1");
+		const own = pidIn(work, "own.pid");
+		const main = pidIn(work, "slow.pid");
+		expectOwnGroupApart(work, own, main);
+		expect(await until(() => !alive(own) && !alive(main), 2_000)).toBe(true);
+		expect(existsSync(join(work, "full.cleanup.log"))).toBe(false);
+		expect(alive(other.pid)).toBe(true);
+		other.kill("SIGKILL");
+	}, 60_000);
+
+	test("a main that ignores TERM: after the grace the KILL takes main and its own-group worker, and the part exits timeout naming no survivor", async () => {
+		const b = box("sess-ign");
+		prepared(b, "tr-s2", { "h.test.ts": hangWithOwnGroup(`process.on("SIGTERM", () => {});`) }, CAPS);
+		const t0 = Date.now();
+		const r = call(b, { sub: "full", runId: "tr-s2" });
+		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
+		expect(r.stderr).toContain(TIMEOUT_LINE);
+		expect(r.stderr).not.toContain("cleanup");
+		// cap + captureMs + grace + the confirm, with slack for a loaded host
+		expect(Date.now() - t0).toBeLessThan(2_400 + CAPTURE_MS + 500 + 5_000 + 5_000);
+		const work = workOf(b, "tr-s2");
+		const own = pidIn(work, "own.pid");
+		const main = pidIn(work, "slow.pid");
+		expect(await until(() => !alive(own) && !alive(main), 2_000)).toBe(true);
+	}, 60_000);
+
+	test("a main that exits normally right after starting an own-group worker: the part passes, the worker outlives it, and the groups sweep kills it while an unrelated process survives", async () => {
+		const b = box("sess-norm");
+		const other = sibling();
+		prepared(b, "tr-s3", { "w.test.ts": pass(ownGroup("../own.pid")) });
+		expect(call(b, { sub: "full", runId: "tr-s3" }).exit).toBe(0);
+		const own = pidIn(workOf(b, "tr-s3"), "own.pid");
+		expect(alive(own)).toBe(true);
+		const s = call(b, { sub: "sweep", runId: "tr-s3" });
+		expect(s.stderr).toBe("");
+		expect(s.exit).toBe(WRAPPER_EXIT.ok);
+		expect(await until(() => !alive(own), 2_000)).toBe(true);
+		expect(alive(other.pid)).toBe(true);
+		other.kill("SIGKILL");
+	}, 30_000);
+
+	test("a worker started under `env -i` in a group of its own is still the part's: the groups sweep kills it", async () => {
+		const b = box("sess-envi");
+		prepared(b, "tr-s4", { "w.test.ts": pass(ownGroup("../envi.pid", true)) });
+		expect(call(b, { sub: "full", runId: "tr-s4" }).exit).toBe(0);
+		const envi = pidIn(workOf(b, "tr-s4"), "envi.pid");
+		expect(alive(envi)).toBe(true);
+		const s = call(b, { sub: "sweep", runId: "tr-s4" });
+		expect(s.stderr).toBe("");
+		expect(s.exit).toBe(WRAPPER_EXIT.ok);
+		expect(await until(() => !alive(envi), 2_000)).toBe(true);
+	}, 30_000);
+
+	test("a session lookup that fails is non-ok, never an empty session: the cap keeps exit 124 and names it with full.cleanup.log, the sweep exits failed; with the lookup back the sweep kills the worker", async () => {
+		const b = box("sess-fail");
+		prepared(b, "tr-s5", { "h.test.ts": hangWithOwnGroup() }, CAPS);
+		writeFileSync(join(b.hooks, "tr-s5.session-lookup.fail"), "");
+		const r = call(b, { sub: "full", runId: "tr-s5" });
+		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
+		expect(r.stderr).toMatch(/timeout: the part passed its cap of 2400 ms; its session was killed; cleanup could not look up session \d+: failed by the test hook /);
+		const work = workOf(b, "tr-s5");
+		const own = pidIn(work, "own.pid");
+		expect(readFileSync(join(work, "full.cleanup.log"), "utf8")).toMatch(/^lookup failed: session \d+: failed by the test hook /m);
+		expect(existsSync(join(work, "full.stuck.log"))).toBe(true);
+		// Merge integration: the detector can have recorded this worker's group beside the part's session.
+		// That entry must not bypass a failed lookup by signalling the worker before ownership is inspected.
+		writeFileSync(join(work, "groups"), `${own}\n`, { flag: "a" });
+		const s = call(b, { sub: "sweep", runId: "tr-s5" });
+		expect(s.exit).toBe(WRAPPER_EXIT.failed);
+		expect(s.stderr).toContain("sweep: session lookup failed: session ");
+		expect(alive(own)).toBe(true);
+		rmSync(join(b.hooks, "tr-s5.session-lookup.fail"));
+		const again = call(b, { sub: "sweep", runId: "tr-s5" });
+		expect(again.stderr).toBe("");
+		expect(again.exit).toBe(WRAPPER_EXIT.ok);
+		expect(await until(() => !alive(own), 2_000)).toBe(true);
+	}, 60_000);
+
+	test("a survivor of the KILL is named: the cap's timeout line and full.cleanup.log carry its pid, group and command, the sweep exits failed `sweep: 1 alive after KILL: <pid>`", async () => {
+		const b = box("sess-left");
+		prepared(b, "tr-s6", { "h.test.ts": hangWithOwnGroup() }, CAPS);
+		writeFileSync(join(b.hooks, "tr-s6.session-kill.skip"), "");
+		const r = call(b, { sub: "full", runId: "tr-s6" });
+		const work = workOf(b, "tr-s6");
+		const own = pidIn(work, "own.pid");
+		expectOwnGroupApart(work, own, pidIn(work, "slow.pid"));
+		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
+		expect(r.stderr).toContain(`${TIMEOUT_LINE}; cleanup left 1 alive: ${own}`);
+		expect(readFileSync(join(work, "full.cleanup.log"), "utf8")).toContain(`\n${own} ${own} /bin/sleep\n`);
+		// A detector-recorded group and the part's session overlap: the survivor is counted once, and the member-kill
+		// refusal still applies to it even when both ownership entries name it.
+		writeFileSync(join(work, "groups"), `${own}\n`, { flag: "a" });
+		const s = call(b, { sub: "sweep", runId: "tr-s6" });
+		expect(s.exit).toBe(WRAPPER_EXIT.failed);
+		expect(s.stderr).toContain(`sweep: 1 alive after KILL: ${own}`);
+		expect(alive(own)).toBe(true);
+		rmSync(join(b.hooks, "tr-s6.session-kill.skip"));
+		const again = call(b, { sub: "sweep", runId: "tr-s6" });
+		expect(again.stderr).toBe("");
+		expect(again.exit).toBe(WRAPPER_EXIT.ok);
+		expect(await until(() => !alive(own), 2_000)).toBe(true);
+	}, 60_000);
 });
 
 // ---- cleanup -------------------------------------------------------------------------------------------------
@@ -2370,13 +2511,18 @@ describe("the refresh helper", () => {
 		walk(root);
 		return out;
 	}
-	const buildDirs = () => readdirSync("/private/tmp").filter((n) => n.startsWith("as2test-refresh."));
-
+	/** The stderr line naming the build dir a cleanup left at the 2 s bound, in `r`'s build parent; [1] is the dir's name. */
+	const leftAtBound = (r: HelperRig, stderr: string) =>
+		new RegExp(`as2test-refresh: left the build dir ${r.buildParent.replace(/[.*+?^$()|[\]\\{}]/g, "\\$&")}/(as2test-refresh\\.[A-Za-z0-9]{6}): its removal did not end within the 2 s cleanup bound\\n`).exec(stderr);
 	interface HelperRig {
 		base: string;
 		libexec: string;
 		root: string;
 		state: string;
+		/** This rig's own build parent (the test-only `buildParent`), so its build-dir checks see no other process's dirs. */
+		buildParent: string;
+		/** The `as2test-refresh.*` dirs in this rig's build parent. */
+		buildDirs: () => string[];
 		facts: Record<string, unknown>;
 		/** The test render's options, with overrides. */
 		options: (o?: Record<string, unknown>) => Record<string, unknown>;
@@ -2395,7 +2541,9 @@ describe("the refresh helper", () => {
 		const root = join(base, "root");
 		const sudoers = join(base, "sudoers.d", "as2test");
 		const state = join(libexec, "refresh.d");
+		const buildParent = join(base, "build-parent");
 		mkdirSync(state, { recursive: true });
+		mkdirSync(buildParent);
 		mkdirSync(dirname(sudoers));
 		for (const d of ["stage", "runs", "locks"]) mkdirSync(join(root, d), { recursive: true });
 		writeFileSync(join(root, "locks", "sweep.db"), "");
@@ -2403,7 +2551,7 @@ describe("the refresh helper", () => {
 		writeFileSync(join(libexec, "bun"), "stand-in for the installed bun\n");
 		const facts = { bunVersion: Bun.version, user: AS2TEST_USER, uid: me.uid, gid: me.gid, jo: userInfo().username, joUid: me.uid, created: ["user", "group", libexec, root, sudoers] };
 		const options = (o: Record<string, unknown> = {}) => ({
-			origin: from?.bare ?? join(base, "no-origin.git"), libexec, root, bun: BUN, facts, buildUser: null, asRoot: false, allowFileProtocol: true, ...o,
+			origin: from?.bare ?? join(base, "no-origin.git"), libexec, root, bun: BUN, facts, buildUser: null, asRoot: false, allowFileProtocol: true, buildParent, ...o,
 		});
 		const place = (o: Record<string, unknown> = {}) => {
 			writeFileSync(join(libexec, "refresh"), render(options(o)));
@@ -2422,7 +2570,8 @@ describe("the refresh helper", () => {
 			return { exit, stdout, stderr };
 		};
 		const decide = (checkout: string) => installDecision(readInstall({ checkout, libexec, root, sudoers, dscl: fakeDscl }), ids);
-		return { base, libexec, root, state, facts, options, place, run, spawn, decide };
+		const buildDirs = () => readdirSync(buildParent).filter((n) => n.startsWith("as2test-refresh."));
+		return { base, libexec, root, state, buildParent, buildDirs, facts, options, place, run, spawn, decide };
 	}
 	const sourceOf = (libexec: string) => {
 		const s = parseSource(readFileSync(join(libexec, "SOURCE"), "utf8"));
@@ -2460,7 +2609,7 @@ describe("the refresh helper", () => {
 		for (const tool of ["git-fetch", "git-upload-pack", "git-remote-file", "git-remote-https", "git-remote-http", "git-index-pack", "git-archive", "git-cat-file", "git-rev-parse"]) {
 			writeFileSync(join(hostileExec, tool), `#!/bin/sh\necho "${tool} $*" >> '${marker}'\nexit 1\n`, { mode: 0o755 });
 		}
-		const before = buildDirs();
+		expect(r.buildDirs()).toEqual([]);
 		const out = r.run([], {
 			cwd: o.work,
 			env: {
@@ -2488,7 +2637,7 @@ describe("the refresh helper", () => {
 		);
 		expect(statSync(join(r.libexec, "test-exec.js")).size).toBeGreaterThan(0);
 		expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
-		expect(buildDirs().filter((d) => !before.includes(d))).toEqual([]);
+		expect(r.buildDirs()).toEqual([]);
 
 		// The runner's checkout at main passes; the same checkout on feature is input drift on the file feature changed.
 		git(o.work, "checkout", "-q", "main");
@@ -2537,7 +2686,7 @@ describe("the refresh helper", () => {
 
 		const origin = loose.AS2TEST_ORIGIN;
 		expect(origin).toBe("https://github.com/thewolff/agent-system-2.0.git");
-		r.place({ origin, asRoot: true, buildUser: "nobody", allowFileProtocol: false });
+		r.place({ origin, asRoot: true, buildUser: "nobody", allowFileProtocol: false, buildParent: undefined });
 		const asRoot = tree(r.libexec);
 		const out = r.run();
 		expect({ exit: out.exit, stdout: out.stdout }).toEqual({ exit: 77, stdout: "" });
@@ -2659,7 +2808,7 @@ describe("the refresh helper", () => {
 
 		// A TERM to the helper: Jo's own signal to its own process, as a test render runs.
 		const installed = tree(r.libexec, ["refresh.d"]);
-		const before = buildDirs();
+		expect(r.buildDirs()).toEqual([]);
 		const p = Bun.spawn([join(r.libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: r.base, stdout: "pipe", stderr: "pipe" });
 		pids.push(p.pid);
 		expect(await until(() => existsSync(started) && readFileSync(started, "utf8") !== "", 90_000)).toBe(true);
@@ -2672,7 +2821,7 @@ describe("the refresh helper", () => {
 		expect(stderr).toContain("as2test-refresh: ended by a signal; nothing was installed");
 		expect(Date.now() - t0).toBeLessThan(10_000);
 		expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
-		expect(buildDirs().filter((d) => !before.includes(d))).toEqual([]);
+		expect(r.buildDirs()).toEqual([]);
 		expect(tree(r.libexec, ["refresh.d"])).toEqual(installed);
 
 		// The helper's own cap, with no signal from outside.
@@ -2686,7 +2835,7 @@ describe("the refresh helper", () => {
 		expect(Date.now() - t1).toBeLessThan(15_000);
 		if (existsSync(started)) children.push(Number(readFileSync(started, "utf8")));
 		expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
-		expect(buildDirs().filter((d) => !before.includes(d))).toEqual([]);
+		expect(r.buildDirs()).toEqual([]);
 		expect(tree(r.libexec, ["refresh.d"])).toEqual(placed);
 
 		// The TERM-proof bundle-inputs of each run is gone.
@@ -2710,20 +2859,20 @@ describe("the refresh helper", () => {
 		// Each staging install sleeps 30 s once its .new copy is written; a second helper waits 1 s for the lock.
 		r.place({ stallS: 30, lockWaitS: 1 });
 		const installed = tree(r.libexec, ["refresh.d"]);
-		const before = buildDirs();
+		expect(r.buildDirs()).toEqual([]);
 		const p = Bun.spawn([join(r.libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: r.base, stdout: "pipe", stderr: "pipe" });
 		pids.push(p.pid);
 		const stdout = new Response(p.stdout).text();
 		const stderr = new Response(p.stderr).text();
 		expect(await until(() => existsSync(join(r.libexec, ".exec.new")), 90_000)).toBe(true);
-		expect(buildDirs().filter((d) => !before.includes(d))).toHaveLength(1);
+		expect(r.buildDirs()).toHaveLength(1);
 
 		// While it holds refresh.d/lock, another refresh (the next run's, after the runner gave up on this one) gets 69 and touches nothing.
 		const second = r.run();
 		expect({ exit: second.exit, stdout: second.stdout }).toEqual({ exit: 69, stdout: "" });
 		expect(second.stderr).toContain("another refresh holds");
 		expect(existsSync(join(r.libexec, ".exec.new"))).toBe(true);
-		expect(buildDirs().filter((d) => !before.includes(d))).toHaveLength(1);
+		expect(r.buildDirs()).toHaveLength(1);
 
 		const t0 = Date.now();
 		process.kill(p.pid, "SIGTERM");
@@ -2732,8 +2881,30 @@ describe("the refresh helper", () => {
 		expect(await stderr).toContain("as2test-refresh: ended by a signal; nothing was installed");
 		expect(Date.now() - t0).toBeLessThan(10_000);
 		expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
-		expect(buildDirs().filter((d) => !before.includes(d))).toEqual([]);
+		expect(r.buildDirs()).toEqual([]);
 		expect(tree(r.libexec, ["refresh.d"])).toEqual(installed);
+	}, 120_000);
+
+	test("T6: a TERM after the build dir is made but before BUILD= is set leaves no build dir: its name was in the stage before the dir existed", async () => {
+		const o = fixtureOrigin("t6-name");
+		const r = helperRig("t6-name", o);
+		// The window held open: the helper's own exclusive mkdir, then a mark, then a sleep before the helper's next line.
+		const mkdirLine = `run /dev/null /bin/mkdir -m 0700 "$_n" ||`;
+		const text = readFileSync(join(r.libexec, "refresh"), "utf8");
+		expect(text.split(mkdirLine)).toHaveLength(2);
+		const window = join(r.base, "window");
+		writeFileSync(join(r.libexec, "refresh"), text.replace(mkdirLine, `run /dev/null /bin/sh -c '/bin/mkdir -m 0700 "$1" && : > "$2" && /bin/sleep 60' as2test-window "$_n" '${window}' ||`));
+		const p = Bun.spawn([join(r.libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: r.base, stdout: "pipe", stderr: "pipe" });
+		pids.push(p.pid);
+		const output = Promise.all([p.exited, new Response(p.stdout).text(), new Response(p.stderr).text()]);
+		expect(await until(() => existsSync(window), 90_000)).toBe(true);
+		const made = r.buildDirs();
+		expect(made).toHaveLength(1);
+		expect(readFileSync(join(r.state, "stage", "build"), "utf8")).toBe(`${join(r.buildParent, made[0]!)}\n`);
+		process.kill(p.pid, "SIGTERM");
+		const [exit, stdout, stderr] = await output;
+		expect({ exit, stdout, stderr }).toEqual({ exit: 71, stdout: "", stderr: "as2test-refresh: ended by a signal; nothing was installed\n" });
+		expect(r.buildDirs()).toEqual([]);
 	}, 120_000);
 
 	test("T6: a stalled cleanup removal is killed at the cleanup bound: the helper exits within it, names the build dir it left and frees the lock, and the next run removes that dir", async () => {
@@ -2743,7 +2914,7 @@ describe("the refresh helper", () => {
 		o.commit({ [TEST_EXEC]: "export const broken = ;\n" }, "does not compile");
 		// The build user's removal of the build dir's src and out sleeps 30 s first; the cleanup bound is 2 s.
 		r.place({ cleanupStallS: 30, cleanupS: 2 });
-		const before = buildDirs();
+		expect(r.buildDirs()).toEqual([]);
 		const p = Bun.spawn([join(r.libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: r.base, stdout: "pipe", stderr: "pipe" });
 		pids.push(p.pid);
 		const stdout = new Response(p.stdout).text();
@@ -2763,19 +2934,18 @@ describe("the refresh helper", () => {
 		expect({ exit, stdout: await stdout }).toEqual({ exit: 71, stdout: "" });
 		expect(failedAt).toBeGreaterThan(0);
 		expect(exitedAt - failedAt).toBeLessThan(2_000 + 3_000);
-		// The dir it left is the one this run made: named on stderr, new since the run began, still there.
-		const named = /as2test-refresh: left the build dir \/private\/tmp\/(as2test-refresh\.[A-Za-z0-9]{6}): its removal did not end within the 2 s cleanup bound\n/.exec(stderr);
+		// The dir it left is the one this run made: named on stderr, the only one in the rig's build parent, still there.
+		const named = leftAtBound(r, stderr);
 		expect(named?.[1]).toBeString();
 		const left = named![1]!;
-		expect(before).not.toContain(left);
-		expect(buildDirs()).toContain(left);
+		expect(r.buildDirs()).toEqual([left]);
 
 		// The lock is free: the next run takes it at once (lockWaitS 1, else 69), removes the dir left, and builds main.
 		const fixed = o.commit({ [TEST_EXEC]: original }, "compiles again");
 		r.place({ lockWaitS: 1 });
 		const next = r.run();
 		expect({ exit: next.exit, stdout: next.stdout, stderr: next.exit === 0 ? "" : next.stderr }).toEqual({ exit: 0, stdout: `refreshed none..${sha12(fixed)}\n`, stderr: "" });
-		expect(existsSync(join("/private/tmp", left))).toBe(false);
+		expect(r.buildDirs()).toEqual([]);
 	}, 120_000);
 
 	test("T6: a left build dir whose removal fails at once (a file in it made immutable) stops the next run with 71, keeping the dir and its name in the stage; once the file is freed the run after removes it and builds", async () => {
@@ -2787,9 +2957,9 @@ describe("the refresh helper", () => {
 		r.place({ cleanupStallS: 30, cleanupS: 2 });
 		const first = await r.spawn();
 		expect({ exit: first.exit, stdout: first.stdout }).toEqual({ exit: 71, stdout: "" });
-		const named = /as2test-refresh: left the build dir \/private\/tmp\/(as2test-refresh\.[A-Za-z0-9]{6}): its removal did not end within the 2 s cleanup bound\n/.exec(first.stderr);
+		const named = leftAtBound(r, first.stderr);
 		expect(named?.[1]).toBeString();
-		const left = join("/private/tmp", named![1]!);
+		const left = join(r.buildParent, named![1]!);
 		const stageBuild = join(r.state, "stage", "build");
 		expect(readFileSync(stageBuild, "utf8")).toBe(`${left}\n`);
 		const locked = join(left, "src", TEST_EXEC);
@@ -2942,6 +3112,12 @@ describe("the refresh helper", () => {
 		expect(loose.REFRESH_CLEANUP_S).toBe(30);
 		expect(text).toContain(`set -m; "$@" </dev/null 9>&- & _b=$!; set +m`);
 		expect(text).toContain("its removal did not end within the 30 s cleanup bound");
+		// The build dir: named in $MADE first, in /private/tmp, then made by an exclusive mkdir; never by mktemp -d.
+		const named = `/usr/bin/mktemp -u '/private/tmp'/as2test-refresh.XXXXXX > "$MADE"`;
+		expect(text).toContain(named);
+		expect(text).not.toContain("mktemp -d");
+		expect(text.indexOf(`/bin/mkdir -m 0700 "$_n"`)).toBeGreaterThan(text.indexOf(named));
+		expect(render({ ...real, buildParent: "/private/tmp" })).toBe(text);
 
 		for (const wrong of [
 			{ origin: "https://example.com/other.git" },
@@ -2954,6 +3130,8 @@ describe("the refresh helper", () => {
 			{ stallS: 5 },
 			{ cleanupS: 5 },
 			{ cleanupStallS: 5 },
+			{ buildParent: "/private/tmp/elsewhere" },
+			{ buildParent: "relative", origin: "/tmp/origin.git", asRoot: false, buildUser: null, allowFileProtocol: true },
 			{ libexec: "relative" },
 			{ facts: { ...facts, created: ["relative"] } },
 			{ facts: { ...facts, jo: "jo smith" } },

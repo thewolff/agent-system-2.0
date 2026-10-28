@@ -31,8 +31,14 @@
 //       green nor drops it. Then, when every part reported cleanly (`baseParts`, D3), each failing file rerun alone is run alone
 //       on base too (`base-solo` in a clone at base's sha, cached per base sha and `./<file>` under <runs root>/base-cache; the
 //       full suite never runs on base). After a call that timed out, the wrapper's stuck capture `<part>.stuck.log` is imported
-//       into the run dir under the report checks; a missing or refused capture is one runner.log line and changes nothing. Then
-//       the head re-check, one `test-run:` entry and the settle
+//       into the run dir under the report checks; a missing or refused capture is one runner.log line and changes nothing. After
+//       every part, whatever its outcome, the wrapper's cleanup report `<part>.cleanup.log` (survivors of the part's session, or a
+//       failed lookup; PLAN wl-mvqu69tjvpy96o C9) is imported the same way, and the cleanup line on the wrapper's stderr joins the
+//       part's error (a timed-out part stays a timeout); a sweep that is not ok names its stderr's survivor line in the run's error.
+//       Host load (E1, announce-only): runner.log and result.json's `load` carry os.loadavg() and the core count at the start and
+//       end of every part; a part over OVERLOAD_PER_CORE × the cores at either gets `<part>.load.log`, one `ps` snapshot of the
+//       busiest processes (bounded, its failure written into the file), and a red or error run's reason and status name the
+//       overload. Load never changes a verdict. Then the head re-check, one `test-run:` entry and the settle
 //       in one ledger transaction; then the lock released (`<ts> lock released`; a release that ends with the row still held logs
 //       `the lock was not released` and the run exits 3, START_EXIT.failed) and, when the fetch confirmed the requested
 //       sha, the `as2/full-suite` commit status on
@@ -80,6 +86,8 @@
 //   AGENT_SYSTEM_TEST_RUNNER_OUTLIVE_MS     how long a part's wrapper may outlive its cap before the runner sweeps (default 60 s)
 //   AGENT_SYSTEM_TEST_RUNNER_BUSY_MS        runs.db busy_timeout (default 5 s); a stuck run's halt, its publication and its release use 0
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS    the refresh helper's cap (default REFRESH_CAP_S plus a minute, 15 min)
+//   AGENT_SYSTEM_TEST_RUNNER_LOADAVG        `<1m> <5m> <15m> <cores>`: the host load every reading returns instead of os.loadavg()
+//   AGENT_SYSTEM_TEST_RUNNER_PS_MS          the overload snapshot's `ps` cap (default 5 s)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS  its SIGTERM-to-SIGKILL grace (default 10 s)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_REAP_MS   how long it then waits for sudo to exit (default 30 s)
 //   AGENT_SYSTEM_TEST_HOOKS                 a directory of pause/mark files at named boundaries (`hook`), and the
@@ -91,7 +99,7 @@ import {
 	appendFileSync, chmodSync, closeSync, constants as FS, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, renameSync,
 	rmSync, type Stats, writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { availableParallelism, loadavg, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { assertNotLiveLedgerUnderTest, defaultLedgerPath, type EntryRow, Ledger, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import {
@@ -103,11 +111,13 @@ import { boundPrs, holdersOf, worktreePath } from "../src/launch";
 import { FULL_SUITE_STATUS, fixBindings, fixBinds, ghCompare, trainHold, trainPrs } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
-	AS2TEST_ROOT, AS2TEST_USER, authoritativeRun, baseParts, boundBranches, buildTestRun, callStuck, callTimedOut, carriedRun, changedTestFiles, decideRun, decisionLogFault, executedFiles, executorStalledReason,
-	fullSuiteSlice, HEARTBEAT_EVERY_MS, HEARTBEAT_STALE_MS, heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult,
-	partResult, prAdmissible, type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, reportCapBytes, reservation, type ResultRecord, resultJson, RUN_ID_RE, type RunFacts, runDirOf,
-	runnerDiedRun, type RunRecord, runsDbOf, runsRoot, securityRedBody, securityRedOf, servedRepo, settleArtifact, stageDirOf, StuckWatch, stuckReason, type TestRequested, type TestRun, testRequestedBody,
-	testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict, soloPlan, type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
+	AS2TEST_ROOT, AS2TEST_USER, authoritativeRun, baseParts, boundBranches, buildTestRun, callTimedOut, carriedRun, changedTestFiles, cleanupReportOf, decideRun, decisionLogFault, executedFiles,
+	fullSuiteSlice, HEARTBEAT_EVERY_MS, heartbeatText, KEEP_RUNS, LOAD_SNAPSHOT_ROWS, type LoadReading, loadOver, lockHolderStale, makeRunId, notifiesOrchestrator, OVERLOAD_PER_CORE, overloadNote,
+	ownerRepoOf, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartLoad, type PartResult, partResult, prAdmissible,
+	type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, reportCapBytes, reservation, type ResultRecord, resultJson, RUN_ID_RE, type RunFacts, runDirOf, runnerDiedRun, type RunRecord,
+	runsDbOf, runsRoot, securityRedBody, securityRedOf, servedRepo, settleArtifact, stageDirOf, sweepFailureOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf,
+	type TestVerdict, soloPlan, topByCpu, type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
+	callStuck, executorStalledReason, HEARTBEAT_STALE_MS, StuckWatch, stuckReason,
 } from "../src/test-run";
 import { liveProcs, snapshot, STUCK_DEFAULTS } from "../src/stuck-detect";
 import { ORCHESTRATOR_RECIPIENT } from "../src/types";
@@ -250,6 +260,29 @@ export function heartbeatOf(root: string, runId: string): number | null {
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * The host load now (E1, PLAN wl-mvqu69tjvpy96o): os.loadavg() and the core count, read in process with no spawn, each average
+ * to two decimals; or the test knob AGENT_SYSTEM_TEST_RUNNER_LOADAVG (`<1m> <5m> <15m> <cores>`), which throws when malformed.
+ */
+export function hostLoad(env: Record<string, string | undefined> = process.env, now: number = Date.now()): LoadReading {
+	const knob = env.AGENT_SYSTEM_TEST_RUNNER_LOADAVG;
+	let avg: number[];
+	let cores: number;
+	if (knob !== undefined) {
+		const n = knob.trim().split(/\s+/).map(Number);
+		if (n.length !== 4 || n.some((x) => !Number.isFinite(x) || x < 0) || !Number.isSafeInteger(n[3]) || n[3]! < 1) {
+			throw new Error(`AGENT_SYSTEM_TEST_RUNNER_LOADAVG must be "<1m> <5m> <15m> <cores>" (three loads, a whole core count over 0), not ${JSON.stringify(knob)}`);
+		}
+		avg = n.slice(0, 3);
+		cores = n[3]!;
+	} else {
+		avg = loadavg();
+		cores = availableParallelism();
+	}
+	const [load1, load5, load15] = avg.map((x) => Math.round(x * 100) / 100) as [number, number, number];
+	return { at: new Date(now).toISOString(), load1, load5, load15, cores };
 }
 
 // ---- test hooks ---------------------------------------------------------------------------------
@@ -712,13 +745,16 @@ const NETWORK = [...NO_HOOKS, "-c", "init.templateDir=", "-c", "credential.helpe
 /**
  * File-backed output cannot wait for EOF held by a grandchild. Poll the exit status with a
  * deadline as well: signalling a process does not bound an unresolved stream/exited promise.
- * Each caller owns its private output directory; no output is trimmed except stderr.
+ * Each caller owns its private output directory; no output is trimmed except stderr. With `echoStderr`, the stderr file is
+ * also copied onto this process's stderr (runner.log) as it grows, on every poll and once more at the end, so a caller both
+ * reads the command's stderr and logs it live.
+ *
  * `watch` (the stuck backstop, PLAN wl-mvq8x4pkjmx69s D4) reads the stdout so far every `everyMs` and answers the time to abandon
  * the call at (Infinity for none; it may move, never past the timeout); at that time the stdout is read once more, and when the
  * answer still holds the child gets SIGKILL and the call returns at once, `abandoned`, with no exit of its own.
  */
 export async function run(cmd: string[], o: {
-	cwd: string; env: Record<string, string | undefined>; timeoutMs: number; inheritStderr?: boolean;
+	cwd: string; env: Record<string, string | undefined>; timeoutMs: number; echoStderr?: boolean;
 	onSpawn?: (pid: number) => void;
 	watch?: { everyMs: number; abandonAt: (out: string, nowMs: number) => number };
 }): Promise<{ code: number | null; signal: string | null; out: string; err: string; abandoned: boolean }> {
@@ -728,9 +764,20 @@ export async function run(cmd: string[], o: {
 	const outFd = openSync(outPath, "w", 0o600);
 	const errFd = openSync(errPath, "w", 0o600);
 	let p: Subprocess | undefined;
+	let echoFd: number | null = null;
+	let echoed = 0;
+	const echo = (): void => {
+		if (echoFd === null) return;
+		const buf = Buffer.alloc(64 * 1024);
+		for (let k = readSync(echoFd, buf, 0, buf.length, echoed); k > 0; k = readSync(echoFd, buf, 0, buf.length, echoed)) {
+			process.stderr.write(buf.subarray(0, k));
+			echoed += k;
+		}
+	};
 	try {
 		try {
-			p = spawn(cmd, { cwd: o.cwd, env: o.env, stdin: "ignore", stdout: outFd, stderr: o.inheritStderr ? "inherit" : errFd });
+			if (o.echoStderr) echoFd = openSync(errPath, "r");
+			p = spawn(cmd, { cwd: o.cwd, env: o.env, stdin: "ignore", stdout: outFd, stderr: errFd });
 		} finally {
 			closeSync(outFd);
 			closeSync(errFd);
@@ -740,6 +787,7 @@ export async function run(cmd: string[], o: {
 		let abandonAt = Infinity;
 		let nextRead = 0;
 		while (p.exitCode === null && p.signalCode === null) {
+			echo();
 			const now = Date.now();
 			if (now >= deadline) {
 				// Release the wait even if signalling is refused or Bun never reports completion.
@@ -759,6 +807,15 @@ export async function run(cmd: string[], o: {
 		return { code: p.exitCode, signal: p.signalCode ?? null, out: readFileSync(outPath, "utf8"), err: readFileSync(errPath, "utf8").trim(), abandoned: false };
 	} finally {
 		p?.unref();
+		if (echoFd !== null) {
+			try {
+				echo();
+			} catch (e) {
+				process.stderr.write(`the stderr of ${cmd.join(" ")} was not all copied to this log: ${errText(e)}\n`);
+			} finally {
+				closeSync(echoFd);
+			}
+		}
 		rmSync(dir, { recursive: true, force: true });
 	}
 }
@@ -806,7 +863,7 @@ class Runner {
 	private ownerRepo = "";
 	/** The run's place in the lock queue: its `test-requested:` entry's created_at in ms, read once at start. */
 	readonly requestedAt: number;
-	private readonly f: RunFacts & { base: string | null; mergeBase: string | null; preflight: string | null };
+	private readonly f: RunFacts & { load: PartLoad[]; base: string | null; mergeBase: string | null; preflight: string | null };
 	/** `_as2test`'s uid as the install check read it (dscl), for the spawn-free containment check; null until then or when unknown. */
 	private as2testUid: number | null = null;
 
@@ -822,7 +879,7 @@ class Runner {
 		this.capBytes = reportCapBytes(config);
 		this.f = {
 			requestedSha: request.sha, fetchedSha: null, error: null, full: null, fullTimedOut: false, solo: [], headAtStart: request.sha, headAtEnd: null, owner: true, sliceState: null, baseRuns: null,
-			stuck: null, executorStalled: null, base: null, mergeBase: null, preflight: null,
+			load: [], stuck: null, executorStalled: null, base: null, mergeBase: null, preflight: null,
 		};
 	}
 
@@ -1010,9 +1067,9 @@ class Runner {
 	}
 
 	/**
-	 * One wrapper call: `sudo -n -u _as2test <exec> <sub> <run id> …` (wrapperArgv). Its stderr goes to runner.log (a part's after the
-	 * call, so its `stuck:` reason can be read); stdout is captured and echoed there. It starts in the as2test root, which `_as2test`
-	 * can read: the run dir is Jo's 0700 dir, and a cwd the child cannot read kills bun on getcwd. `timeoutMs` bounds a call that has
+	 * One wrapper call: `sudo -n -u _as2test <exec> <sub> <run id> …` (wrapperArgv). Its stdout and stderr are captured, returned
+	 * and echoed to runner.log (stderr live). It starts in the as2test root, which `_as2test` can read: the run dir is Jo's
+	 * 0700 dir, and a cwd the child cannot read kills bun on getcwd. `timeoutMs` bounds a call that has
 	 * no cap (a stuck run's sweep, D4): past it the call is abandoned and the Stop thrown. A part under `testRunner.stuckStop:
 	 * enforce` carries the stuck backstop (`StuckWatch`, PLAN wl-mvq8x4pkjmx69s D4); shadow never arms it.
 	 */
@@ -1028,7 +1085,7 @@ class Runner {
 		const backstop = capMs !== null && this.config.stuckStop === "enforce" ? new StuckWatch(msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_BACKSTOP_MS", STUCK_BACKSTOP_MS)) : null;
 		const r = await run(argv, {
 			cwd: this.as2root, env: process.env,
-			timeoutMs: timeoutMs ?? (capMs ?? 0) + outliveMs + 120_000, inheritStderr: capMs === null,
+			timeoutMs: timeoutMs ?? (capMs ?? 0) + outliveMs + 120_000, echoStderr: true,
 			onSpawn: (pid) => {
 				hookMark(this.id, `spawn-${call.sub}`, { pid });
 				this.log(`${argv.slice(4).join(" ")}: started pid ${pid}`);
@@ -1045,7 +1102,6 @@ class Runner {
 		}).finally(() => clearTimeout(watchdog ?? undefined));
 		const { out, err } = r;
 		if (out.trim()) process.stdout.write(out.endsWith("\n") ? out : `${out}\n`);
-		if (capMs !== null && err) process.stderr.write(`${err}\n`);
 		const ended = r.abandoned ? "exit null (abandoned by the stuck backstop)" : `${r.signal ?? `exit ${r.code}`}${outlived ? " (after the outlive sweep)" : ""}`;
 		this.log(`${argv.slice(4).join(" ")} → ${ended}`);
 		return { code: r.code, signal: r.signal, out, outlived, err, abandoned: r.abandoned, candidate: r.abandoned ? (backstop?.first()?.worker ?? null) : null };
@@ -1076,9 +1132,11 @@ class Runner {
 				continue;
 			}
 			if (r.code === WRAPPER_EXIT.sweepLockHeld) throw new Stop("sweep lock held");
+			// A sweep that is not ok names why in the run's error: its survivor line (PLAN wl-mvqu69tjvpy96o C9), else its first stderr line.
+			const why = r.signal === null ? sweepFailureOf(r.err) : null;
 			throw new Stop(r.signal !== null
 				? `the sweep after ${after} ended by ${r.signal} ${attempt + 1} times; its ${SWEEP_RETRIES} retries are spent`
-				: `the sweep after ${after} failed: exit ${r.code}`);
+				: `the sweep after ${after} failed: exit ${r.code}${why === null ? "" : `: ${why}`}`);
 		}
 	}
 
@@ -1439,7 +1497,10 @@ class Runner {
 	 * One part through the wrapper, then its junit and log imported into the run dir and read into a result, with the junit's text
 	 * (executedFiles reads it) and whether the call timed out (`callTimedOut`: exit 124 or the outlive sweep, PLAN wl-mvq4edh02r5z40
 	 * D0). After a timed-out call the wrapper's stuck capture `<part>.stuck.log` (D5) is imported too; a missing or refused capture
-	 * is one runner.log line and never changes the result. `base-solo` runs the file in the base clone (D8), reports `base-solo-<i>.*`.
+	 * is one runner.log line and never changes the result. After every call, whatever its outcome, the wrapper's cleanup report
+	 * `<part>.cleanup.log` is imported the same way (PLAN wl-mvqu69tjvpy96o C9), and the cleanup line on its stderr (`cleanupReportOf`)
+	 * joins the part's error after the timeout, so a timed-out part names both its cap and its survivors. The host load is read at the
+	 * part's start and end (`recordLoad`, E1). `base-solo` runs the file in the base clone (D8), reports `base-solo-<i>.*`.
 	 * The stuck-worker detector (PLAN wl-mvq8x4pkjmx69s D4): after a part whose stdout has `stuck-captured`, its `<part>.signature.log`
 	 * is imported the same way. A stuck call (`callStuck`, however it ended) or one the backstop abandoned with no stop line (the
 	 * executor stalled) gets its `stuck:` or `executor stalled` error over any other, never a timeout, sets the run's `stuck` or
@@ -1450,58 +1511,129 @@ class Runner {
 	async part(call: { sub: "full" } | { sub: "solo" | "base-solo"; file: string }): Promise<{ result: PartResult; junit: string | null; timedOut: boolean; halted: boolean }> {
 		await this.checkpoint(call.sub);
 		const capMs = (call.sub === "full" ? this.config.fullCapMin : this.config.soloCapMin) * 60_000;
+		const label = call.sub === "full" ? "full" : `${call.sub} ${call.file}`;
+		const start = this.loadAt(label, "start");
+		// A part that starts overloaded gets its process snapshot beside it (bounded by the snapshot's own cap), awaited after the part.
+		const startSnapshot = loadOver(start) ? this.loadSnapshot(label, "start", start) : null;
 		const started = Date.now();
-		const r = await this.wrap(call.sub === "full" ? { sub: call.sub, runId: this.id } : { sub: call.sub, runId: this.id, file: call.file }, capMs);
-		const ms = Date.now() - started;
-		if (r.code === WRAPPER_EXIT.fenced) await this.fenced(call.sub);
+		let r: Wrapped | null = null;
+		let ms = 0;
 		let name: string = call.sub;
-		if (call.sub === "solo") {
-			this.soloCalls++;
-			name = /^part (solo-\d+)$/m.exec(r.out)?.[1] ?? `solo-${this.soloCalls}`;
-		} else if (call.sub === "base-solo") {
-			this.baseSoloCalls++;
-			name = /^part (base-solo-\d+)$/m.exec(r.out)?.[1] ?? `base-solo-${this.baseSoloCalls}`;
+		try {
+			r = await this.wrap(call.sub === "full" ? { sub: call.sub, runId: this.id } : { sub: call.sub, runId: this.id, file: call.file }, capMs);
+			ms = Date.now() - started;
+		} finally {
+			const out = r?.out ?? "";
+			if (call.sub === "solo") {
+				this.soloCalls++;
+				name = /^part (solo-\d+)$/m.exec(out)?.[1] ?? `solo-${this.soloCalls}`;
+			} else if (call.sub === "base-solo") {
+				this.baseSoloCalls++;
+				name = /^part (base-solo-\d+)$/m.exec(out)?.[1] ?? `base-solo-${this.baseSoloCalls}`;
+			}
+			try {
+				await this.recordLoad(name, call.sub === "full" ? null : call.file, label, start, startSnapshot);
+			} finally {
+				// The wrapper's reports reach the run dir on every outcome, a throwing call included (retention may delete the work dir); importWrapperReport logs its own failure and never throws, so an error in flight stays the one that propagates.
+				// A call that threw (r null) may have timed out; its stuck report is imported if it exists, and only a known timeout announces a missing one.
+				this.importWrapperReport(`${name}.stuck.log`, r !== null && !callStuck(r) && !r.abandoned && callTimedOut(r));
+				this.importWrapperReport(`${name}.cleanup.log`, false);
+				if (/^stuck-captured /m.test(out)) this.importWrapperReport(`${name}.signature.log`, true);
+			}
 		}
 		const stuck = callStuck(r);
 		const stalled = !stuck && r.abandoned;
 		const halt = stuck ? stuckReason(r) : stalled ? executorStalledReason(r.candidate ?? 0) : null;
+		if (halt === null && r.code === WRAPPER_EXIT.fenced) await this.fenced(call.sub);
 		const timedOut = halt === null && callTimedOut(r);
-		if (timedOut) this.importCapture(`${name}.stuck.log`);
-		if (/^stuck-captured /m.test(r.out)) this.importCapture(`${name}.signature.log`);
+		const cleanup = cleanupReportOf(r.err);
 		let out: { result: PartResult; junit: string | null };
 		if (halt === null && (r.code === WRAPPER_EXIT.refused || r.code === WRAPPER_EXIT.failed)) {
 			const wrapper = `the wrapper ${r.code === WRAPPER_EXIT.refused ? "refused" : "failed"} ${call.sub} (exit ${r.code})`;
-			out = { result: { ...partResult({ junit: null, log: null, exit: r.code, ms }), error: timedOut ? `timeout; ${wrapper}` : wrapper }, junit: null };
+			const error = [...(timedOut ? ["timeout"] : []), wrapper, ...(cleanup === null ? [] : [cleanup])].join("; ");
+			out = { result: { ...partResult({ junit: null, log: null, exit: r.code, ms }), error }, junit: null };
 		} else {
 			const imported = importPart(this.workDir, this.runDir, name, this.capBytes);
-			out = { result: partResult({ ...imported, exit: r.signal !== null ? null : r.code, ms, timedOut, maxBytes: this.capBytes }), junit: imported.junit };
+			out = { result: partResult({ ...imported, exit: r.signal !== null ? null : r.code, ms, timedOut, cleanup, maxBytes: this.capBytes }), junit: imported.junit };
 		}
 		if (halt === null) return { ...out, timedOut, halted: false };
 		const at = Date.now();
-		out.result = { ...out.result, error: halt };
+		out.result = { ...out.result, error: cleanup === null ? halt : `${halt}; ${cleanup}` };
 		// The verdict's part label (`full`, a solo's `./<file>`, `base ./<file>`); runner.log's lines name the stem, as the exec's do.
-		const label = call.sub === "full" ? "full" : call.sub === "solo" ? call.file : `base ${call.file}`;
-		if (stuck) this.f.stuck = `${label}: ${halt}`;
+		const partLabel = call.sub === "full" ? "full" : call.sub === "solo" ? call.file : `base ${call.file}`;
+		if (stuck) this.f.stuck = `${partLabel}: ${out.result.error}`;
 		else {
-			this.f.executorStalled = `${label}: ${halt}`;
+			this.f.executorStalled = `${partLabel}: ${out.result.error}`;
 			this.log(`executor-stalled part ${name} worker ${r.candidate ?? 0}`);
 		}
-		this.log(`${name}: ${halt}; no further part`);
+		this.log(`${name}: ${out.result.error}; no further part`);
 		await this.halt(name, at);
 		return { ...out, timedOut, halted: true };
 	}
 
 	/**
-	 * A capture of the wrapper's into the run dir under importReport's checks: a timed-out part's `<part>.stuck.log` (PLAN
-	 * wl-mvq4edh02r5z40 D5), a detector match's `<part>.signature.log` (PLAN wl-mvq8x4pkjmx69s D3); logged, never thrown.
+	 * One wrapper report (`<part>.stuck.log`, D5; `<part>.cleanup.log`, C9; `<part>.signature.log`, D3) into the run dir under
+	 * importReport's checks; logged, never thrown. A missing file is logged only when `expected`: a timeout capture or a
+	 * detector's `stuck-captured` line. Cleanup reports exist only when cleanup left survivors or could not look them up.
 	 */
-	private importCapture(file: string): void {
+	private importWrapperReport(file: string, expected: boolean): void {
 		try {
 			const r = importReport(this.workDir, this.runDir, file, this.capBytes);
-			this.log(r.error !== null ? `${file} not imported: ${r.error}` : r.text === null ? `${file} not imported: the wrapper wrote none` : `${file} imported`);
+			if (r.error !== null) this.log(`${file} not imported: ${r.error}`);
+			else if (r.text !== null) this.log(`${file} imported`);
+			else if (expected) this.log(`${file} not imported: the wrapper wrote none`);
 		} catch (e) {
 			this.log(`${file} not imported: ${errText(e)}`);
 		}
+	}
+
+	/** The host load now (`hostLoad`), logged as `load <part> <start|end>: …`, with the overload named when it is over the threshold. */
+	private loadAt(label: string, when: "start" | "end"): LoadReading {
+		const r = hostLoad();
+		const over = loadOver(r) ? `; over ${OVERLOAD_PER_CORE} × ${r.cores} cores` : "";
+		this.log(`load ${label} ${when}: ${r.load1} ${r.load5} ${r.load15} (1, 5, 15 min) on ${r.cores} cores${over}`);
+		return r;
+	}
+
+	/**
+	 * One bounded process snapshot of an overloaded host (E1): `ps -Ao pid,user,nice,pcpu,etime,comm`, async and killed at its cap
+	 * (5 s; AGENT_SYSTEM_TEST_RUNNER_PS_MS in tests), cut to the LOAD_SNAPSHOT_ROWS busiest by %CPU. Never rejects: a ps that fails,
+	 * is refused or runs past its cap is written into the text it returns.
+	 */
+	private async loadSnapshot(label: string, when: "start" | "end", at: LoadReading): Promise<string> {
+		const argv = ["ps", "-Ao", "pid,user,nice,pcpu,etime,comm"];
+		const capMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_PS_MS", 5_000);
+		const head = `${label} at its ${when}, ${at.at}: load ${at.load1} ${at.load5} ${at.load15} (1, 5, 15 min) on ${at.cores} cores, over ${OVERLOAD_PER_CORE} × the cores\n`
+			+ `${argv.join(" ")}, the ${LOAD_SNAPSHOT_ROWS} busiest by %CPU (cap ${capMs} ms):\n`;
+		try {
+			const r = await run(argv, { cwd: this.runDir, env: process.env, timeoutMs: capMs });
+			const rows = topByCpu(r.out);
+			const failed = r.code === 0 ? "" : `ps failed: ${r.signal ?? `exit ${r.code}`}: ${r.err || "no stderr"}\n`;
+			return `${head}${failed}${rows.length > 0 ? `${rows.join("\n")}\n` : "ps printed no process\n"}`;
+		} catch (e) {
+			return `${head}ps failed: ${errText(e)}\n`;
+		}
+	}
+
+	/**
+	 * The part's end reading, its snapshot (the start's, else one taken now when the end is overloaded) written to `<part>.load.log`
+	 * in the run dir, and its `load` entry (E1). Logged, never thrown: load never changes a result.
+	 */
+	private async recordLoad(name: string, file: string | null, label: string, start: LoadReading, startSnapshot: Promise<string> | null): Promise<void> {
+		const end = this.loadAt(label, "end");
+		const pending = startSnapshot ?? (loadOver(end) ? this.loadSnapshot(label, "end", end) : null);
+		let snapshot: string | null = null;
+		if (pending !== null) {
+			const out = `${name}.load.log`;
+			try {
+				writeFileSync(join(this.runDir, out), await pending, { mode: 0o600 });
+				snapshot = out;
+				this.log(`${out} written: the host was overloaded during ${label}`);
+			} catch (e) {
+				this.log(`${out} not written: ${errText(e)}`);
+			}
+		}
+		this.f.load.push({ part: name, file, start, end, snapshot });
 	}
 
 	/**
@@ -1731,8 +1863,11 @@ class Runner {
 			// Only a terminal state, and only on the sha the fetch confirmed this run tested (trusted's sha check).
 			// postFullSuite never throws and kills gh after 15 s. A run whose containment failed says so in the description.
 			const state = this.f.fetchedSha === run.sha ? FULL_SUITE_STATE[run.verdict] : undefined;
+			// Host load is announce-only; containment failure and a failed lock release retain main's policy.
+			const overloaded = (run.verdict === "red" || run.verdict === "error") && overloadNote(this.f.load) !== null;
 			const contained = /; containment failed: /.test(`${this.f.stuck ?? ""}${this.f.executorStalled ?? ""}`) ? ", containment failed" : "";
-			if (state) await postFullSuite(this.ownerRepo, state, run.sha, `full suite ${run.verdict}, run ${run.runId}${contained}`, (s) => this.log(s));
+			const description = `full suite ${run.verdict}, run ${run.runId}${contained}${overloaded ? "; host overloaded (see its load)" : ""}`;
+			if (state) await postFullSuite(this.ownerRepo, state, run.sha, description, (s) => this.log(s));
 			return released ? 0 : START_EXIT.failed;
 		} finally {
 			clearInterval(this.timer);

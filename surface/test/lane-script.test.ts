@@ -315,7 +315,7 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 });
 
 describe("lane script: every exit is classified (decision 14; Codex review B1, B2, B3, B4)", () => {
-	test("B1 never-claims: valid rpc frames without the lane's claim → SIGKILL at the readiness window, launch-failed: + lane-died:, lease released, no prompt sent", async () => {
+	test("B1 never-claims (C4 claim phase): valid rpc frames without the lane's claim → SIGKILL 4 s after omp's ready frame, launch-failed: + lane-died: naming never-ready (claim), lane-exit: outcome never-ready (claim), lease released, no prompt sent", async () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r);
 		setScript(r, { claim: false, steps: [] });
@@ -327,8 +327,16 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(exit).toMatchObject({ signal: "SIGKILL", outcome: "never-ready" });
 		const snap = laneSnapshot(r, wl);
 		expect(snap.workload!.holder).toBeNull();
-		expect(snap.deaths).toEqual([`lane-died: ${laneId}: launch failed at readiness: no claim in 4s`]);
-		expect(snap.bodies.some((b) => b.startsWith(`${LANE_RUNNER_BY} launch-failed: ${laneId} readiness: never ready in 4s`))).toBe(true);
+		const exitRow = snap.control.find((c) => c.prefix === "lane-exit" && c.laneId === laneId)!;
+		expect(exitRow.rest).toMatch(/^code \S+ signal SIGKILL outcome never-ready \(claim\)$/);
+		expect(snap.deaths).toHaveLength(1);
+		const died = new RegExp(`^lane-died: ${laneId}: launch failed at readiness: never-ready \\(claim\\): no claim within 4s of omp's ready frame at (\\S+)$`).exec(snap.deaths[0]!);
+		expect(died).not.toBeNull();
+		const readyFrame = died![1]!;
+		// the claim window counts from omp's ready frame, not from the spawn
+		expect(Date.parse(exitRow.createdAt) - Date.parse(readyFrame)).toBeGreaterThanOrEqual(4000);
+		const failed = snap.control.filter((c) => c.prefix === "launch-failed" && c.laneId === laneId);
+		expect(failed.map((c) => c.rest)).toEqual([expect.stringMatching(new RegExp(`^readiness: never-ready \\(claim\\): no claim within 4s of omp's ready frame at ${readyFrame} \\(omp exit code \\S+ signal SIGKILL\\)$`))]);
 		// Codex review 2 R4: the runner's readiness failure is a valid control entry, not only a raw body
 		expect(snap.control.filter((c) => c.prefix === "launch-failed" && c.laneId === laneId).map((c) => c.createdBy)).toEqual([LANE_RUNNER_BY]);
 		expect(snap.control.some((c) => c.prefix === "lane-ready")).toBe(false);
@@ -1600,4 +1608,233 @@ describe("item 71: a queued launch starts when a lane slot frees (the runner's d
 		const drainB1 = await drainSettled(r, laneB1);
 		expect(drainLinesOf(r, drainB1).filter((l) => l.startsWith("attempt ")).map((l) => l.replace(/: .*$/, ""))).toEqual([`attempt ${drainB1} ${b2} exit 0`]);
 	}, 90_000);
+});
+
+// ---- readiness in two phases (PLAN wl-mvqu69tjvpy96o § 2 sl-flaky-ready, cause C4) -----------------------------------
+
+/** A reservation the test makes itself, through the launcher's own lease input (`reserveLane`'s `leaseMs`): its lane id and the expiry it wrote. */
+function reserveWithLease(r: LaneRoot, wl: string, leaseMs: number): { laneId: string; expiry: string } {
+	const l = ledgerOf(r);
+	try {
+		const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs, requestedBy: "test", decide: () => ({ launch: true, cause: "first" }) });
+		if (!res.ok) throw new Error(`reserveLane ${wl} refused: ${res.reason}`);
+		const expiry = l.workload(wl)?.holder_lease_until;
+		if (!expiry) throw new Error(`reserveLane ${wl} left no holder_lease_until`);
+		return { laneId: res.laneId, expiry };
+	} finally {
+		l.close();
+	}
+}
+
+/** `lane.ts run` as its own process, awaited under a deadline: past it the runner is SIGKILLed and the test fails naming it. */
+async function runLane(r: LaneRoot, wl: string, laneId: string, deadlineMs = 45_000): Promise<{ code: number; err: string }> {
+	const p = Bun.spawn(["bun", LANE_SCRIPT, "run", wl, laneId], { cwd: r.repo, env: r.env, stdin: "ignore", stdout: "ignore", stderr: "pipe" });
+	let killed = false;
+	const timer = setTimeout(() => {
+		killed = true;
+		p.kill("SIGKILL");
+	}, deadlineMs);
+	const [code, err] = await Promise.all([p.exited, new Response(p.stderr).text()]);
+	clearTimeout(timer);
+	if (killed) throw new Error(`lane.ts run ${wl} ${laneId} did not exit within ${deadlineMs} ms and was SIGKILLed; its stderr: ${err}`);
+	return { code, err };
+}
+
+/** A `git` shim first on the root's PATH that sleeps `ms` before any fetch: the starter's prepare (chooseBase) is that much slower. */
+function slowFetch(r: LaneRoot, ms: number): string {
+	const real = Bun.which("git");
+	if (real === null) throw new Error("slowFetch: no git on the test's PATH to wrap");
+	const log = join(r.root, "slow-fetch.log");
+	writeFileSync(join(r.root, "bin", "git"), `#!/bin/sh\nfor a in "$@"; do if [ "$a" = fetch ]; then echo "$*" >> '${log}'; sleep ${ms / 1000}; break; fi; done\nexec '${real}' "$@"\n`);
+	chmodSync(join(r.root, "bin", "git"), 0o755);
+	return log;
+}
+
+/** A runner's never-ready stall: its one launch-failed: (stage readiness) and its one lane-died: carry the same reason; the lane-exit: row. */
+function stallOf(r: LaneRoot, wl: string, laneId: string): { reason: string; exit: ControlEntry; snap: ReturnType<typeof laneSnapshot> } {
+	const snap = laneSnapshot(r, wl);
+	const failed = snap.control.filter((c) => c.prefix === "launch-failed" && c.laneId === laneId);
+	expect(failed.map((c) => c.createdBy)).toEqual([LANE_RUNNER_BY]);
+	const m = /^readiness: (.*) \(omp exit code \S+ signal SIGKILL\)$/.exec(failed[0]!.rest);
+	if (m === null) throw new Error(`launch-failed: of ${laneId} is not a readiness stall: ${failed[0]!.rest}`);
+	expect(snap.deaths).toEqual([`lane-died: ${laneId}: launch failed at readiness: ${m[1]}`]);
+	const exit = snap.control.find((c) => c.prefix === "lane-exit" && c.laneId === laneId);
+	if (exit === undefined) throw new Error(`no lane-exit: of ${laneId}`);
+	expect(snap.workload!.holder).toBeNull();
+	expect(snap.control.some((c) => c.prefix === "lane-ready" && c.laneId === laneId)).toBe(false);
+	return { reason: m[1]!, exit, snap };
+}
+const STARTUP_STALL = /^never-ready \(startup\): no ready frame from omp by the reservation's lease expiry (\S+), (\d+) ms after the spawn at (\S+)$/;
+
+describe("lane script: readiness in two phases, both capped by the reservation's lease expiry (C4)", () => {
+	const T = Date.parse("2026-10-27T10:00:00.000Z");
+	const clock = (readyFrameAt: number | null, expiryIn = 180_000) => ({ expiryAt: T + expiryIn, readyFrameAt, readyMs: 4000 });
+
+	test("readyWindow: startup runs to the expiry; claim is READY_MS from the ready frame, cut at the expiry", () => {
+		expect(laneScript.readyWindow(clock(null))).toEqual({ phase: "startup", deadline: T + 180_000, cut: false });
+		expect(laneScript.readyWindow(clock(T + 60_000))).toEqual({ phase: "claim", deadline: T + 64_000, cut: false });
+		expect(laneScript.readyWindow(clock(T + 178_500))).toEqual({ phase: "claim", deadline: T + 180_000, cut: true });
+		// the boundary: a claim window that ends exactly at the expiry is whole; one millisecond later it is cut there
+		expect(laneScript.readyWindow(clock(T + 176_000))).toEqual({ phase: "claim", deadline: T + 180_000, cut: false });
+		expect(laneScript.readyWindow(clock(T + 176_001))).toEqual({ phase: "claim", deadline: T + 180_000, cut: true });
+		// a delayed prepare moves the spawn, never the expiry: the startup window is the expiry minus the spawn
+		expect(laneScript.readyStallReason({ ...clock(null, 10_000), spawnedAt: T + 3_250 })).toBe(
+			`never-ready (startup): no ready frame from omp by the reservation's lease expiry 2026-10-27T10:00:10.000Z, 6750 ms after the spawn at 2026-10-27T10:00:03.250Z`,
+		);
+		expect(laneScript.readyStallReason({ ...clock(T + 1_000), spawnedAt: T })).toBe(`never-ready (claim): no claim within 4s of omp's ready frame at 2026-10-27T10:00:01.000Z`);
+		expect(laneScript.readyStallReason({ ...clock(T + 178_500), spawnedAt: T })).toBe(
+			`never-ready (claim): no claim by the reservation's lease expiry 2026-10-27T10:03:00.000Z, 1500 ms after omp's ready frame at 2026-10-27T10:02:58.500Z (the 4s claim window cut at the expiry)`,
+		);
+		expect(laneScript.readyWindowText(clock(T + 1_000))).toBe("within 4s");
+		expect(laneScript.readyWindowText(clock(T + 178_500))).toBe("within 1500 ms, the 4s claim window cut at the reservation's lease expiry 2026-10-27T10:03:00.000Z");
+		expect(laneScript.readyWindowText(clock(null))).toBe("by the reservation's lease expiry 2026-10-27T10:03:00.000Z (no ready frame from omp)");
+	});
+
+	test("readyStep: the claim is accepted only before the expiry, checked at acceptance; a stall is the window's deadline passing without it", () => {
+		// a cut claim window: nothing in waits until the expiry, never killed before it, and stalls at it
+		const c = clock(T + 178_500);
+		expect(laneScript.readyStep(c, T + 179_999, true, true)).toBe("ready");
+		expect(laneScript.readyStep(c, T + 180_000, true, true)).toBe("expired");
+		expect(laneScript.readyStep(c, T + 185_000, true, true)).toBe("expired");
+		expect(laneScript.readyStep(c, T + 179_999, true, false)).toBe("wait");
+		expect(laneScript.readyStep(c, T + 179_999, false, false)).toBe("wait");
+		expect(laneScript.readyStep(c, T + 180_000, true, false)).toBe("stalled");
+		expect(laneScript.readyStep(c, T + 180_000, false, false)).toBe("stalled");
+		// an uncut claim window: the stall is READY_MS after the ready frame, well before the expiry
+		const u = clock(T + 60_000);
+		expect(laneScript.readyStep(u, T + 63_999, false, false)).toBe("wait");
+		expect(laneScript.readyStep(u, T + 63_999, true, false)).toBe("wait");
+		expect(laneScript.readyStep(u, T + 64_000, false, false)).toBe("stalled");
+		expect(laneScript.readyStep(u, T + 64_000, true, false)).toBe("stalled");
+		expect(laneScript.readyStep(u, T + 63_999, true, true)).toBe("ready");
+		// a claim and model check that are in are accepted while the reservation's lease holds, even past the claim window
+		// (the expiry is the acceptance bound; the claim window only times the stall)
+		expect(laneScript.readyStep(u, T + 64_000, true, true)).toBe("ready");
+		expect(laneScript.readyStep(u, T + 179_999, true, true)).toBe("ready");
+		expect(laneScript.readyStep(u, T + 180_000, true, true)).toBe("expired");
+		// startup: a slow start past READY_MS from the spawn still waits until the expiry
+		expect(laneScript.readyStep(clock(null), T + 60_000, false, false)).toBe("wait");
+		expect(laneScript.readyStep(clock(null), T + 179_999, false, false)).toBe("wait");
+		expect(laneScript.readyStep(clock(null), T + 180_000, false, false)).toBe("stalled");
+		// a claim in at the expiry with no ready frame read is refused too, not accepted
+		expect(laneScript.readyStep(clock(null), T + 179_999, true, true)).toBe("ready");
+		expect(laneScript.readyStep(clock(null), T + 180_000, true, true)).toBe("expired");
+	});
+
+	test("claim cut at the expiry: `ready` 2 s before the reservation's lease expiry leaves a claim window cut there, not the 4 s one (explicit clocks, no wall-clock race)", () => {
+		const expiryAt = T + 10_000;
+		const readyFrameAt = expiryAt - 2000;
+		const c = { expiryAt, readyFrameAt, readyMs: 4000 };
+		expect(laneScript.readyWindow(c)).toEqual({ phase: "claim", deadline: expiryAt, cut: true });
+		// the kill is never before the expiry and is at it
+		expect(laneScript.readyStep(c, expiryAt - 1, false, false)).toBe("wait");
+		expect(laneScript.readyStep(c, expiryAt, false, false)).toBe("stalled");
+		const reason = laneScript.readyStallReason({ ...c, spawnedAt: T });
+		const m = /^never-ready \(claim\): no claim by the reservation's lease expiry (\S+), (\d+) ms after omp's ready frame at (\S+) \(the 4s claim window cut at the expiry\)$/.exec(reason);
+		if (m === null) throw new Error(`not a cut claim stall: ${reason}`);
+		expect(m[1]).toBe(new Date(expiryAt).toISOString());
+		expect(m[3]).toBe(new Date(readyFrameAt).toISOString());
+		expect(Number(m[2])).toBe(expiryAt - readyFrameAt);
+		expect(Number(m[2])).toBeLessThan(4000);
+		expect(laneScript.readyWindowText(c)).toBe(`within 2000 ms, the 4s claim window cut at the reservation's lease expiry ${new Date(expiryAt).toISOString()}`);
+	});
+
+	test("reservationExpiry: a missing or unreadable holder_lease_until is refused naming the row, never defaulted", () => {
+		expect(laneScript.reservationExpiry({ holder_lease_until: "2026-10-27T10:03:00.000Z" }, "wl-x", "lane-x-1")).toBe(T + 180_000);
+		expect(() => laneScript.reservationExpiry({ holder_lease_until: null }, "wl-x", "lane-x-1")).toThrow(
+			"lane-x-1 not started: the reservation's lease expiry (workloads.holder_lease_until of wl-x) is missing, so readiness has no bound; no omp spawned",
+		);
+		expect(() => laneScript.reservationExpiry(null, "wl-x", "lane-x-1")).toThrow("is missing");
+		expect(() => laneScript.reservationExpiry({ holder_lease_until: "soon" }, "wl-x", "lane-x-1")).toThrow(
+			`lane-x-1 not started: the reservation's lease expiry (workloads.holder_lease_until of wl-x) is unreadable: "soon"; no omp spawned`,
+		);
+	});
+
+	test("slow start: a fake omp 5 s slow to send `ready` (past the 4 s claim window) still claims and parks", async () => {
+		const r = makeRoot({ FAKE_OMP_START_DELAY_MS: "5000" });
+		const { wl, sl } = openWorkload(r, { slice: true });
+		setScript(r, { steps: [{ tool: "lane_raise_question", args: { slice: sl, body: "push now?", options: ["yes", "no"] } }] });
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ code: "0", signal: "-", outcome: "parked" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.deaths).toEqual([]);
+		expect(snap.control.filter((c) => c.prefix === "launch-failed")).toEqual([]);
+		expect(snap.control.some((c) => c.prefix === "lane-parked" && c.laneId === laneId)).toBe(true);
+	}, 60_000);
+
+	test("startup: a fake that never sends `ready` is killed never-ready (startup) at the reservation's lease expiry, not READY_MS (1 s here) after the spawn", async () => {
+		const r = makeRoot({ FAKE_OMP_START_DELAY_MS: "600000", AGENT_SYSTEM_LANE_READY_MS: "1000" });
+		const { wl } = openWorkload(r);
+		setScript(r, { steps: [] });
+		const { laneId, expiry } = reserveWithLease(r, wl, 10_000);
+		const run = await runLane(r, wl, laneId);
+		expect(run.err).toContain(`runner: ${laneId} readiness: startup until omp's ready frame, by the reservation's lease expiry ${expiry} (`);
+		const { reason, exit } = stallOf(r, wl, laneId);
+		expect(exit.rest).toMatch(/^code \S+ signal SIGKILL outcome never-ready \(startup\)$/);
+		const m = STARTUP_STALL.exec(reason);
+		if (m === null) throw new Error(`not a startup stall: ${reason}`);
+		expect(m[1]).toBe(expiry);
+		expect(Date.parse(expiry) - Date.parse(m[3]!)).toBe(Number(m[2]));
+		// the startup window outlived the claim window: one wall-clock window from the spawn would have killed it at 1 s
+		expect(Number(m[2])).toBeGreaterThan(1000);
+		expect(Date.parse(exit.createdAt)).toBeGreaterThanOrEqual(Date.parse(expiry));
+		const spawned = fakeRecords(r).filter((x) => x.argv);
+		expect(spawned).toHaveLength(1);
+		expect(eventsOf(r, spawned[0]!.pid)).toEqual([]);
+	}, 60_000);
+
+	test("startup: a delayed prepare (a 3 s git fetch) shortens the startup phase by exactly the prepare time", async () => {
+		const r = makeRoot({ FAKE_OMP_START_DELAY_MS: "600000" });
+		const fetchLog = slowFetch(r, 3000);
+		const { wl } = openWorkload(r);
+		setScript(r, { steps: [] });
+		const leaseMs = 10_000;
+		const { laneId, expiry } = reserveWithLease(r, wl, leaseMs);
+		await runLane(r, wl, laneId);
+		expect(readFileSync(fetchLog, "utf8")).toContain("fetch");
+		const { reason, exit } = stallOf(r, wl, laneId);
+		expect(exit.rest).toMatch(/^code \S+ signal SIGKILL outcome never-ready \(startup\)$/);
+		const m = STARTUP_STALL.exec(reason);
+		if (m === null) throw new Error(`not a startup stall: ${reason}`);
+		expect(m[1]).toBe(expiry);
+		const reservedAt = Date.parse(expiry) - leaseMs;
+		const prepareMs = Date.parse(m[3]!) - reservedAt;
+		expect(prepareMs).toBeGreaterThanOrEqual(3000);
+		expect(Number(m[2])).toBe(leaseMs - prepareMs);
+		expect(Date.parse(exit.createdAt)).toBeGreaterThanOrEqual(Date.parse(expiry));
+	}, 60_000);
+
+	test("a reservation with no lease expiry is refused before any omp (launch-failed: lease naming the row, lane-died:, released); one already past at the spawn is refused never-ready (startup)", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r);
+		const { laneId } = reserveWithLease(r, wl, 60_000);
+		const l = ledgerOf(r);
+		try {
+			const unbounded = l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: laneId, leaseMs: null });
+			expect(unbounded).toEqual({ won: true });
+			expect(l.workload(wl)!.holder_lease_until).toBeNull();
+		} finally {
+			l.close();
+		}
+		const run = await runLane(r, wl, laneId);
+		expect(run.code).toBe(STARTER_EXIT.unknown);
+		const reason = `${laneId} not started: the reservation's lease expiry (workloads.holder_lease_until of ${wl}) is missing, so readiness has no bound; no omp spawned`;
+		let snap = laneSnapshot(r, wl);
+		expect(snap.bodies).toContain(`${LANE_STARTER_BY} launch-failed: ${laneId} lease: ${reason}`);
+		expect(snap.deaths).toEqual([`lane-died: ${laneId}: launch failed at lease: ${reason}`]);
+		expect(snap.workload!.holder).toBeNull();
+		expect(fakeRecords(r)).toEqual([]);
+
+		const late = reserveWithLease(r, wl, 1);
+		await Bun.sleep(5);
+		expect((await runLane(r, wl, late.laneId)).code).toBe(STARTER_EXIT.unknown);
+		snap = laneSnapshot(r, wl);
+		const failed = snap.control.filter((c) => c.prefix === "launch-failed" && c.laneId === late.laneId);
+		expect(failed.map((c) => c.rest)).toEqual([
+			expect.stringMatching(new RegExp(`^readiness: never-ready \\(startup\\): ${late.laneId} not started: the reservation's lease expiry ${late.expiry} passed \\d+ ms before the spawn; no omp spawned$`)),
+		]);
+		expect(snap.workload!.holder).toBeNull();
+		expect(fakeRecords(r)).toEqual([]);
+	}, 60_000);
 });

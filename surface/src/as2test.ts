@@ -681,13 +681,18 @@ export interface RefreshHelperOptions {
 	 * for a stalled removal, so a test can see the cleanup bound end it; an asRoot render carries none.
 	 */
 	cleanupStallS?: number;
+	/**
+	 * Test-only: the dir the helper makes its build dirs in (default REFRESH_BUILD_PARENT), so a test sees only its own
+	 * rig's build dirs; an asRoot render carries only the default.
+	 */
+	buildParent?: string;
 }
 
 const NAME = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
 const HTTPS_ORIGIN = /^https:\/\/[A-Za-z0-9.-]+(:[0-9]+)?\/[A-Za-z0-9._~/-]+$/;
 
 /** The SOURCE lines the helper writes around `source-sha`; throws WrapperRenderError on an option the helper must not carry. */
-function refreshSourceLines(o: RefreshHelperOptions): { head: string[]; facts: string[]; lockWaitS: number; capS: number; cleanupS: number } {
+function refreshSourceLines(o: RefreshHelperOptions): { head: string[]; facts: string[]; lockWaitS: number; capS: number; cleanupS: number; buildParent: string } {
 	for (const [k, v] of [["libexec", o.libexec], ["root", o.root], ["bun", o.bun]] as const) {
 		if (typeof v !== "string" || !plainAbs(v)) throw new WrapperRenderError(`${k} must be a normalized absolute path: ${String(v)}`);
 	}
@@ -706,6 +711,7 @@ function refreshSourceLines(o: RefreshHelperOptions): { head: string[]; facts: s
 		if (o.stallS !== undefined) throw new WrapperRenderError("stallS is test-only: an asRoot render carries none");
 		if (o.cleanupS !== undefined && o.cleanupS !== REFRESH_CLEANUP_S) throw new WrapperRenderError(`cleanupS is test-only: an asRoot render bounds its cleanup at ${REFRESH_CLEANUP_S} s`);
 		if (o.cleanupStallS !== undefined) throw new WrapperRenderError("cleanupStallS is test-only: an asRoot render carries none");
+		if (o.buildParent !== undefined && o.buildParent !== REFRESH_BUILD_PARENT) throw new WrapperRenderError(`buildParent is test-only: an asRoot render builds in ${REFRESH_BUILD_PARENT}`);
 	}
 	const lockWaitS = o.lockWaitS ?? REFRESH_LOCK_WAIT_S;
 	if (!Number.isSafeInteger(lockWaitS) || lockWaitS < 0) throw new WrapperRenderError("lockWaitS must be a whole number of seconds");
@@ -715,6 +721,8 @@ function refreshSourceLines(o: RefreshHelperOptions): { head: string[]; facts: s
 	const cleanupS = o.cleanupS ?? REFRESH_CLEANUP_S;
 	if (!Number.isSafeInteger(cleanupS) || cleanupS < 1) throw new WrapperRenderError("cleanupS must be a whole number of seconds, at least 1");
 	if (o.cleanupStallS !== undefined && (!Number.isSafeInteger(o.cleanupStallS) || o.cleanupStallS < 1)) throw new WrapperRenderError("cleanupStallS must be a whole number of seconds, at least 1");
+	const buildParent = o.buildParent ?? REFRESH_BUILD_PARENT;
+	if (typeof buildParent !== "string" || !plainAbs(buildParent) || buildParent === "/") throw new WrapperRenderError(`buildParent must be a normalized absolute path below /: ${String(buildParent)}`);
 	const f = o.facts;
 	if (!f || typeof f !== "object") throw new WrapperRenderError("facts are required");
 	for (const [k, v] of [["user", f.user], ["jo", f.jo]] as const) if (typeof v !== "string" || !NAME.test(v)) throw new WrapperRenderError(`facts.${k} must be a user name: ${String(v)}`);
@@ -736,7 +744,7 @@ function refreshSourceLines(o: RefreshHelperOptions): { head: string[]; facts: s
 	const sample = [...head, `source-sha ${"0".repeat(40)}`, ...facts, ...INSTALLED_FILES.map((n) => `file ${n} ${"0".repeat(64)}`), `input x ${"0".repeat(64)}`, ""].join("\n");
 	const parsed = parseSource(sample);
 	if (!parsed.ok) throw new WrapperRenderError(`the helper's SOURCE would not parse: ${parsed.error}`);
-	return { head, facts, lockWaitS, capS, cleanupS };
+	return { head, facts, lockWaitS, capS, cleanupS, buildParent };
 }
 
 /**
@@ -780,7 +788,8 @@ export const REFRESH_STEP_SH = [
  * by `cleanupS`: a removal past it is killed and left, so the helper exits within cap + grace + cleanupS.
  */
 export function renderRefreshHelper(o: RefreshHelperOptions): string {
-	const { head, facts, lockWaitS, capS, cleanupS } = refreshSourceLines(o);
+	const { head, facts, lockWaitS, capS, cleanupS, buildParent } = refreshSourceLines(o);
+	const ownedBy = o.buildUser === null ? '-user "$OWN_U"' : `\\( -user ${shq(o.buildUser)} -o -user "$OWN_U" \\)`;
 	const printLines = (xs: string[]) => `\tprintf '%s\\n' ${xs.map(shq).join(" ")}`;
 	const gitConfig = ["-c core.hooksPath=/dev/null", "-c protocol.allow=never", "-c protocol.https.allow=always", ...(o.allowFileProtocol ? ["-c protocol.file.allow=always"] : [])].join(" ");
 	const asUser = o.buildUser === null ? "" : `/usr/bin/sudo -n -u ${shq(o.buildUser)} `;
@@ -924,13 +933,24 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		'\tbounded "$CLEANUP_BY" "the .new staging files in $LIBEXEC" drop_new',
 		`\tdie ${REFRESH_EXIT.build} "$1; nothing was installed"`,
 		"}",
+		"# is_build_name <path>: a name mktemp's pattern gives in the build parent, nothing else (a cut-short name never is).",
+		`is_build_name() { case "$1" in ${shq(buildParent)}/as2test-refresh.??????) case "\${1##*.}" in *[!A-Za-z0-9]*) return 1 ;; esac ;; *) return 1 ;; esac; }`,
+		"# ours_dir <path>: it is a directory (not a link to one) owned by the build user or by this helper's user.",
+		`ours_dir() { run /dev/null /usr/bin/find "$1" -maxdepth 0 -type d ${ownedBy} > "$STAGE/stale" 2>/dev/null && [ -s "$STAGE/stale" ]; }`,
 		"# cleanup: on EXIT, with signals ignored from here on. The watchdog's group ended; the build dir removed within the",
-		"# cleanup bound (one deadline with stop's removal), found through $MADE when a signal came between mktemp and BUILD=.",
-		"# A build dir left here is named in $MADE, and the next run removes it.",
+		"# cleanup bound (one deadline with stop's removal). The build dir is named in $MADE before it is made, so a signal",
+		"# between the two leaves nothing unnamed: cleanup takes the name from $MADE when BUILD= has not run, and removes",
+		"# the dir if it exists and is ours; a name there that is not a dir of ours is left and said so. A build dir left",
+		"# here is named in $MADE, and the next run removes it.",
 		"cleanup() {",
 		"\ttrap '' HUP INT TERM ALRM",
 		'\t[ -z "$WATCHDOG" ] || { _w=$(step_pids "$WATCHDOG"); [ -z "$_w" ] || /bin/kill -TERM $_w 2>/dev/null; }',
-		'\t[ -n "$BUILD" ] || [ -z "$MADE" ] || [ ! -s "$MADE" ] || IFS= read -r BUILD < "$MADE"',
+		'\tif [ -z "$BUILD" ] && [ -n "$MADE" ] && [ -s "$MADE" ]; then',
+		'\t\t_m=; IFS= read -r _m < "$MADE"',
+		'\t\tif is_build_name "$_m" && { [ -e "$_m" ] || [ -L "$_m" ]; }; then',
+		"\t\t\tif ours_dir \"$_m\"; then BUILD=$_m; else printf 'as2test-refresh: left %s: named for this run, but not a build dir of ours\\n' \"$_m\" >&2; fi",
+		"\t\tfi",
+		"\tfi",
 		'\t[ -n "$BUILD" ] || return 0',
 		'\t[ -n "$CLEANUP_BY" ] || CLEANUP_BY=$(deadline)',
 		'\tremove_build "$CLEANUP_BY" "$BUILD"',
@@ -960,8 +980,8 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		"# stage; if it is left again, the helper stops and the name stays for the next run.",
 		"OLD_BUILD=",
 		'[ ! -s "$STAGE/build" ] || IFS= read -r OLD_BUILD < "$STAGE/build" || OLD_BUILD=',
-		`case "$OLD_BUILD" in ${REFRESH_BUILD_PARENT}/as2test-refresh.??????) case "\${OLD_BUILD##*.}" in *[!A-Za-z0-9]*) OLD_BUILD= ;; esac ;; *) OLD_BUILD= ;; esac`,
-		`if [ -n "$OLD_BUILD" ] && run /dev/null /usr/bin/find "$OLD_BUILD" -maxdepth 0 -type d ${o.buildUser === null ? '-user "$OWN_U"' : `\\( -user ${shq(o.buildUser)} -o -user "$OWN_U" \\)`} > "$STAGE/stale" 2>/dev/null && [ -s "$STAGE/stale" ]; then`,
+		'is_build_name "$OLD_BUILD" || OLD_BUILD=',
+		'if [ -n "$OLD_BUILD" ] && ours_dir "$OLD_BUILD"; then',
 		'\tremove_build "$(deadline)" "$OLD_BUILD"',
 		`\t[ -z "$LEFT" ] || die ${REFRESH_EXIT.build} "cannot remove $OLD_BUILD, the build dir an earlier run left, within ${cleanupS} s"`,
 		"fi",
@@ -988,10 +1008,13 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		`\tif run /dev/null /usr/bin/cmp -s "$STAGE/SOURCE.current" "$LIBEXEC/SOURCE"; then printf 'current %.12s\\n' "$SHA"; exit 0; fi`,
 		"fi",
 		"",
-		`# The build, as ${o.buildUser ?? "the caller"}: main's code never runs as root.`,
+		`# The build, as ${o.buildUser ?? "the caller"}: main's code never runs as root. The build dir's name is chosen and`,
+		"# recorded in $MADE first, then the dir is made with an exclusive mkdir, so no signal leaves a build dir unnamed.",
 		'MADE="$STAGE/build"',
-		`run /dev/null /usr/bin/mktemp -d ${REFRESH_BUILD_PARENT}/as2test-refresh.XXXXXX > "$MADE" || die ${REFRESH_EXIT.build} "cannot make a build directory"`,
-		`IFS= read -r BUILD < "$MADE" || die ${REFRESH_EXIT.build} "cannot make a build directory"`,
+		`run /dev/null /usr/bin/mktemp -u ${shq(buildParent)}/as2test-refresh.XXXXXX > "$MADE" || die ${REFRESH_EXIT.build} "cannot name a build directory"`,
+		`_n=; IFS= read -r _n < "$MADE"; is_build_name "$_n" || die ${REFRESH_EXIT.build} "mktemp -u gave no build directory name: $_n"`,
+		`run /dev/null /bin/mkdir -m 0700 "$_n" || { : > "$MADE"; die ${REFRESH_EXIT.build} "cannot make the build directory $_n"; }`,
+		"BUILD=$_n",
 		`run /dev/null /bin/mkdir "$BUILD/src" "$BUILD/out" || die ${REFRESH_EXIT.build} "cannot make $BUILD/src and $BUILD/out"`,
 		...(o.buildUser === null ? [] : [`run /dev/null /usr/sbin/chown -R ${shq(o.buildUser)} "$BUILD" || die ${REFRESH_EXIT.build} "cannot hand $BUILD to ${o.buildUser}"`]),
 		`run /dev/null g archive --format=tar -o "$STAGE/src.tar" "$SHA" || die ${REFRESH_EXIT.build} "git archive of $SHA failed"`,

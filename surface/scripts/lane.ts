@@ -102,7 +102,11 @@ const msEnv = (name: string, fallback: number): number => {
 	const n = Number(process.env[name]);
 	return Number.isFinite(n) && n > 0 ? n : fallback;
 };
-/** The readiness window: the lane's own claim must land within the pre-claim lease (decisions 8, 14). */
+/**
+ * The claim phase of readiness (PLAN wl-mvqu69tjvpy96o § 2 sl-flaky-ready): from omp's `ready` frame to the lane's own claim
+ * and the model check, never past the reservation's lease expiry (`readyWindow`). Defaults to the pre-claim lease (decisions
+ * 8, 14), so in production the expiry stays the outer bound; the fake-omp tests shorten it.
+ */
 const READY_MS = msEnv("AGENT_SYSTEM_LANE_READY_MS", PRECLAIM_LEASE_MS);
 const READY_POLL_MS = 1_000;
 /** After `abort` and stdin EOF, the wait before SIGKILL (§ 3 stop path). */
@@ -989,6 +993,93 @@ export function spawnIfReserved<C>(
 	return spawnChild();
 }
 
+// ---- readiness phases (PLAN wl-mvqu69tjvpy96o § 2 sl-flaky-ready, cause C4) ----------------------
+
+/** A readiness span as the failure lines name it: whole minutes from a minute up, else whole seconds. */
+export function readySpan(ms: number): string {
+	return ms >= 60_000 ? `${Math.round(ms / 60_000)}m` : `${Math.round(ms / 1000)}s`;
+}
+
+/**
+ * The reservation's own lease expiry: the workload's `holder_lease_until` that `reserveLane` → `claimWorkload` wrote for
+ * `laneId` before prepare and spawn, read by the runner once, at its spawn (the lane's own claim renews the row later). Both
+ * readiness phases are capped by it. A missing or unreadable value is refused as a `lease` failure naming the row, never
+ * defaulted: without it readiness has no bound.
+ */
+export function reservationExpiry(workload: Pick<WorkloadRow, "holder_lease_until"> | null, wl: string, laneId: string): number {
+	const raw = workload?.holder_lease_until ?? null;
+	const row = `workloads.holder_lease_until of ${wl}`;
+	if (raw === null) throw new Fail("lease", `${laneId} not started: the reservation's lease expiry (${row}) is missing, so readiness has no bound; no omp spawned`, STARTER_EXIT.unknown!);
+	const at = Date.parse(raw);
+	if (!Number.isFinite(at)) throw new Fail("lease", `${laneId} not started: the reservation's lease expiry (${row}) is unreadable: ${JSON.stringify(raw)}; no omp spawned`, STARTER_EXIT.unknown!);
+	return at;
+}
+
+/** The readiness phase a never-ready lane stalled in: before omp's `ready` frame (`startup`) or after it (`claim`). */
+export type ReadyPhase = "startup" | "claim";
+/** The never-ready outcome `lane-exit:` and the stall's `launch-failed:` name: `never-ready (startup)` / `never-ready (claim)`. */
+export const neverReadyIn = (phase: ReadyPhase): string => `never-ready (${phase})`;
+
+export interface ReadyClock {
+	/** The reservation's lease expiry (`reservationExpiry`), epoch ms. */
+	expiryAt: number;
+	/** When the runner read omp's `ready` frame, or null before it. */
+	readyFrameAt: number | null;
+	/** The claim phase's own span (READY_MS). */
+	readyMs: number;
+}
+export interface ReadyWindow {
+	phase: ReadyPhase;
+	/** The kill time, epoch ms: the expiry in startup; the ready frame plus `readyMs` in claim, never past the expiry. */
+	deadline: number;
+	/** The claim window was cut at the expiry. */
+	cut: boolean;
+}
+
+/**
+ * The current readiness window. Startup runs from the spawn to omp's `ready` frame, bounded only by the reservation's
+ * expiry, so omp's cold start is charged to the lease and not to the claim. Claim runs from the `ready` frame to the lane's
+ * claim and the model check, bounded by `readyMs` from that frame and cut at the expiry.
+ */
+export function readyWindow(c: ReadyClock): ReadyWindow {
+	if (c.readyFrameAt === null) return { phase: "startup", deadline: c.expiryAt, cut: false };
+	const own = c.readyFrameAt + c.readyMs;
+	return own <= c.expiryAt ? { phase: "claim", deadline: own, cut: false } : { phase: "claim", deadline: c.expiryAt, cut: true };
+}
+
+/** The window as a model failure names it after "no get_state model": `within 4s`, the cut span, or the expiry in startup. */
+export function readyWindowText(c: ReadyClock): string {
+	const w = readyWindow(c);
+	const expiry = new Date(c.expiryAt).toISOString();
+	if (w.phase === "startup") return `by the reservation's lease expiry ${expiry} (no ready frame from omp)`;
+	if (!w.cut) return `within ${readySpan(c.readyMs)}`;
+	return `within ${c.expiryAt - c.readyFrameAt!} ms, the ${readySpan(c.readyMs)} claim window cut at the reservation's lease expiry ${expiry}`;
+}
+
+/** The reason a readiness stall kills omp with, naming its phase; `spawnedAt` dates the startup window. */
+export function readyStallReason(c: ReadyClock & { spawnedAt: number }): string {
+	const w = readyWindow(c);
+	const iso = (ms: number): string => new Date(ms).toISOString();
+	if (w.phase === "startup") {
+		return `${neverReadyIn("startup")}: no ready frame from omp by the reservation's lease expiry ${iso(c.expiryAt)}, ${c.expiryAt - c.spawnedAt} ms after the spawn at ${iso(c.spawnedAt)}`;
+	}
+	const frame = `omp's ready frame at ${iso(c.readyFrameAt!)}`;
+	if (!w.cut) return `${neverReadyIn("claim")}: no claim within ${readySpan(c.readyMs)} of ${frame}`;
+	return `${neverReadyIn("claim")}: no claim by the reservation's lease expiry ${iso(c.expiryAt)}, ${c.expiryAt - c.readyFrameAt!} ms after ${frame} (the ${readySpan(c.readyMs)} claim window cut at the expiry)`;
+}
+
+/**
+ * One readiness poll's verdict at `now`: `ready` when the lane's claim and the model check are both in and the reservation's
+ * lease expiry has not passed (checked here, at acceptance, not only in the kill branch; the poll samples `now` after its
+ * ledger read). A claim that is in is accepted before the expiry even past the claim window: the expiry bounds acceptance,
+ * the window times the stall. `expired` when they are in only at or past the expiry; `stalled` once the current window's
+ * deadline (`readyWindow`) passed without them; else `wait`.
+ */
+export function readyStep(c: ReadyClock, now: number, claimed: boolean, modelChecked: boolean): "ready" | "expired" | "stalled" | "wait" {
+	if (claimed && modelChecked) return now < c.expiryAt ? "ready" : "expired";
+	return now >= readyWindow(c).deadline ? "stalled" : "wait";
+}
+
 /** Whether a `ps -o command=` line is `lane.ts run <wl> <laneId>` (how `cmdLaunch` and chaos start a runner), whatever the path to lane.ts. */
 export function isRunnerCommand(command: string, wl: string, laneId: string): boolean {
 	const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1268,7 +1359,14 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	/** OMP's `--max-time`: the ceiling's remaining wall plus the margin, or AGENT_SYSTEM_LANE_MAX_TIME when that is set and shorter; fixed at the spawn. */
 	let maxTime = laneMaxTime(process.env);
 	let deadlineAt = Number.MAX_SAFE_INTEGER;
-	const readyMinutes = READY_MS >= 60_000 ? `${Math.round(READY_MS / 60_000)}m` : `${Math.round(READY_MS / 1000)}s`;
+	const readyMinutes = readySpan(READY_MS);
+	/**
+	 * The readiness clock (`readyWindow`): the reservation's lease expiry, read at the spawn inside the spawn's write, and when
+	 * omp's `ready` frame arrived (null in the startup phase). A frame read after the outcome is decided changes nothing.
+	 */
+	let expiryAt = 0;
+	let readyFrameAt: number | null = null;
+	const readyClock = (): ReadyClock => ({ expiryAt, readyFrameAt, readyMs: READY_MS });
 
 	let child: Subprocess<"pipe", "pipe", "pipe"> | null = null;
 	let stderrCapture: StderrCapture | null = null;
@@ -1475,20 +1573,25 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				}
 			}
 			let drained = false;
+			// The never-ready phase (C4): `lane-exit:` names it in the outcome, and an unrecorded reason says it was not recorded.
+			const neverReady = neverReadyIn(readyFrameAt === null ? "startup" : "claim");
+			const notRecorded = `${neverReady}: the runner recorded no failure reason`;
 			const owned = writeAsOwner(ledger, lock, () => {
 				if (exit?.death) enqueueRunnerDeath(ledger, { workloadId: wl, laneId, body: exit.death });
 				if (held && !intended && !laneDeaths(ledger, wl).some((d) => d.holder === laneId)) {
 					const body = final === "never-ready"
-						? laneDiedLaunchBody(laneId, readinessStage, readinessFailure ?? `no claim in ${readyMinutes}`)
+						? laneDiedLaunchBody(laneId, readinessStage, readinessFailure ?? notRecorded)
 						: final === "deadline" ? laneDiedDeadlineBody(laneId, maxTime, inFlight) : laneDiedExitBody(laneId, final, code, signal);
 					ledger.enqueue({ by: LANE_RUNNER_BY, workloadId: wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body });
 				}
 				if (final === "never-ready") record(launchFailedBody(laneId, readinessStage, readinessStage === "startup"
 					? readinessFailure!
-					: `${readinessFailure ?? `never ready in ${readyMinutes}`} (omp exit code ${code ?? "-"} signal ${signal ?? "-"})`));
+					: `${readinessFailure ?? notRecorded} (omp exit code ${code ?? "-"} signal ${signal ?? "-"})`));
 				if (held) ledger.releaseWorkload(wl, { by: LANE_RUNNER_BY, holder: laneId });
 				if (spend !== null && laneExit(control, laneId) === null) record(spendBody(laneId, spend));
-				if (laneExit(control, laneId) === null) record(laneExitBody(laneId, { code, signal, outcome: final, reason: final === "stop" ? stopReason : null }));
+				if (laneExit(control, laneId) === null) {
+					record(laneExitBody(laneId, { code, signal, outcome: final === "never-ready" ? neverReady : final, reason: final === "stop" ? stopReason : null }));
+				}
 				// The freed slot starts the queue (MIGRATION.md item 71); once, though a busy retry runs this body again.
 				if (!drained) {
 					drained = true;
@@ -1677,7 +1780,14 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		 */
 		const omp = startAsOwner(ledger, lock, () => {
 			child = spawnIfReserved(ledger, wl, laneId, child, () => {
-				runStart = Date.now();
+				// C4: the reservation's own lease expiry, read in this write (before the lane's claim can renew it), caps both
+				// readiness phases; missing or unreadable refuses the spawn, and an expiry already past leaves startup no time.
+				expiryAt = reservationExpiry(ledger.workload(wl), wl, laneId);
+				const at = Date.now();
+				if (at >= expiryAt) {
+					throw new Fail("readiness", `${neverReadyIn("startup")}: ${laneId} not started: the reservation's lease expiry ${new Date(expiryAt).toISOString()} passed ${at - expiryAt} ms before the spawn; no omp spawned`, STARTER_EXIT.unknown!);
+				}
+				runStart = at;
 				const omp = spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
 				stderrCapture = captureStderr(omp.stderr);
 				return omp;
@@ -1701,10 +1811,11 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		} catch (err) {
 			process.stderr.write(`runner: the baseline spend scan failed: ${String(err)}\n`);
 		}
-		// Preparation can block on git and profile reads. The child's readiness window and
-		// max-time start at its actual spawn, just like the ceiling meter's live wall time.
+		// Preparation can block on git and profile reads. Max-time starts at omp's actual spawn, just like the ceiling meter's
+		// live wall time; readiness is bounded by the reservation's lease expiry, so a slow prepare shortens the startup phase.
 		const spawnedAt = runStart!;
 		deadlineAt = spawnedAt + (maxTimeMs(maxTime) ?? Number.MAX_SAFE_INTEGER);
+		process.stderr.write(`runner: ${laneId} readiness: startup until omp's ready frame, by the reservation's lease expiry ${new Date(expiryAt).toISOString()} (${expiryAt - spawnedAt} ms after the spawn); then claim within ${readyMinutes}, never past that expiry\n`);
 		const exited = omp.exited.then(async (code) => {
 			childExited = true;
 			await stderrCapture?.settle();
@@ -1720,13 +1831,30 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it. Every lane also
 		// waits for OMP's first get_state (PLAN wl-mv71x5rwdu7eo0 § 4): a named model must be exactly that provider/id (item 85), and an
 		// unnamed lane still out after budget comparison is moved first (`moveOff`). Ready means the claim, the model, the lane-ready:
-		// receipt and the prompt all landed; a failure in any of them is fatal (review 2, R2).
+		// receipt and the prompt all landed; a failure in any of them is fatal (review 2, R2). Two phases (C4, `readyWindow`):
+		// startup to omp's `ready` frame, by the reservation's lease expiry; claim from that frame, within READY_MS and never past
+		// the expiry. A stall is killed naming its phase; a claim seen at or past the expiry is refused at acceptance.
+		/** A readiness stall: omp is killed and finish() writes `reason` in launch-failed: and lane-died:. */
+		const stall = (reason: string): void => {
+			clearInterval(readyPoll);
+			readinessFailure = reason;
+			outcome = "never-ready";
+			process.stderr.write(`runner: ${laneId} ${reason}; killing omp\n`);
+			omp.kill("SIGKILL");
+		};
 		const readyPoll = setInterval(() => {
 			if (ready || finished || childExited || outcome !== null || fatal !== null) return;
 			try {
 				const cur = ledger.workload(wl);
 				const claimed = cur !== null && cur.holder === laneId && cur.changed_by === laneId;
-				if (claimed && modelChecked) {
+				// Acceptance time (review r1 F1): sampled after the ledger read that establishes `claimed` (and after `modelChecked`,
+				// set by the stdout reader before this tick), so a claim the read returned is judged against the expiry as of now.
+				const now = Date.now();
+				const step = readyStep(readyClock(), now, claimed, modelChecked);
+				if (step === "expired") {
+					const iso = (ms: number): string => new Date(ms).toISOString();
+					stall(`${neverReadyIn(readyFrameAt === null ? "startup" : "claim")}: the claim and the model check were seen at ${iso(now)}, not before the reservation's lease expiry ${iso(expiryAt)}`);
+				} else if (step === "ready") {
 					clearInterval(readyPoll);
 					const { workload: latest, control } = controlNow();
 					const stakes = latest?.stakes ?? w.stakes;
@@ -1744,16 +1872,14 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					record(laneReadyBody(laneId, readAt));
 					sendPrompt(prompt);
 					ready = true;
-				} else if (Date.now() - spawnedAt >= READY_MS) {
+				} else if (step === "stalled") {
 					if (claimed) {
-						if (move !== null) failModel(`moving ${move.from} -> ${move.to} (${move.reason}): no get_state confirmed ${move.to} within ${readyMinutes}`, HEADROOM_STAGE);
-						else failModel(model !== null ? `named ${model}, no get_state model within ${readyMinutes}` : `no get_state answer within ${readyMinutes}`);
+						const within = readyWindowText(readyClock());
+						if (move !== null) failModel(`moving ${move.from} -> ${move.to} (${move.reason}): no get_state confirmed ${move.to} ${within}`, HEADROOM_STAGE);
+						else failModel(model !== null ? `named ${model}, no get_state model ${within}` : `no get_state answer ${within}`);
 						return;
 					}
-					clearInterval(readyPoll);
-					process.stderr.write(`runner: ${laneId} never claimed ${wl} within ${readyMinutes}; killing omp\n`);
-					outcome = "never-ready";
-					omp.kill("SIGKILL");
+					stall(readyStallReason({ ...readyClock(), spawnedAt }));
 				}
 			} catch (err) {
 				clearInterval(readyPoll);
@@ -1867,6 +1993,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				}
 				// D6: any frame but the replies to the runner's own get_state is activity, so the settle wait is not idle.
 				if (idleActivity(o)) lastFrameAt = Date.now();
+				// C4: omp's `ready` frame ends the startup phase and starts the claim window; once, and only while readiness is undecided.
+				if (o.type === "ready" && readyFrameAt === null && !ready && outcome === null && fatal === null) readyFrameAt = Date.now();
 				const data = "data" in o && typeof o.data === "object" && o.data !== null ? (o.data as Frame) : null;
 				const sessionFile = data && typeof data.sessionFile === "string" ? data.sessionFile : typeof o.sessionFile === "string" ? o.sessionFile : null;
 				let rerecord = false;
