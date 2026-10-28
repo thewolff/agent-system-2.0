@@ -22,7 +22,7 @@ Jo, 2026-10-28 at about 9:20 AM PDT, approved this outcome: as2's "production st
 
 - **P-16** ("the system proposes and never applies") and **P-7b item 4** ("changes to the system's own rules or machinery" are Jo's) are amended **for this feature only, and only for the criteria-wording file** (spec § 6.5). That file holds the text of the enumerated judgment questions and nothing else: no levels, no routing, no thresholds, no path lists. Jo approves each change in month one, and agents apply changes after graduation.
 - **Machine-checked exception.** After graduation, an improver PR merges without Jo only when all of these hold. The checks run from main's copy of the exception check and scorer, never the candidate's.
-  - The improver is in the graduated state.
+  - The improver is in the graduated state, and its authority is current: a passing blinded weekly audit within the last 8 days, and live comparison data available. A missing, overdue or failed audit suspends authority back to Jo-approves automatically (spec § 7.6).
   - The diff touches only the criteria-wording file.
   - It edits existing enumerated entries only, with none added, removed or renamed.
   - The trusted scorer rates it acceptable.
