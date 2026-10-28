@@ -132,6 +132,7 @@ interface DetectKnobs {
 	signatureCaptureMs?: number;
 	stopGraceMs?: number;
 	detectTrace?: boolean;
+	detectCpuClock?: boolean;
 }
 
 /** A tmp as2test root with a groups-scope wrapper and a fake sudo on PATH (§ 6 S4b). */
@@ -1655,38 +1656,46 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 	}
 
 	test("shadow (caps.json without stuckStop): the spin fixture gets stuck-would-stop and a signature capture, nothing is stopped, and the part runs on to its cap and exits 124 as before", async () => {
-		// The enforce tests' capture budget, so a loaded machine's slow sample still leaves all five sections (the cut at the
-		// budget is the stuck-cut test's). Started before 7 s, it ends inside the exit bound below.
-		const b = box("stuck-shadow", { ...DETECT, signatureCaptureMs: 10_000 });
+		// The detector's observation clock advances one tick per tick of the spinner's real CPU (detectCpuClock), so the
+		// signature persists at any CPU share: on a real clock a loaded machine gave the spinner under HOT_SHARE of a core and
+		// no would-stop came before the 9 s cap (22 train runs on 2026-10-28). The cap's pause point holds the cap until the
+		// signature capture has written section 5, so the would-stop and all five sections are in before the cap path runs.
+		// The capture keeps the enforce tests' 10 s budget (the cut at the budget is the stuck-cut test's).
+		const b = box("stuck-shadow", { ...DETECT, signatureCaptureMs: 10_000, detectCpuClock: true });
 		prepared(b, "tr-ss1", { "spin.test.ts": spinTest(false), "a.test.ts": OK_TEST }, { fullCapMin: 0.15, soloCapMin: 0.15, fullWorkers: 2 });
-		const t0 = Date.now();
-		const r = call(b, { sub: "full", runId: "tr-ss1" });
 		const work = workOf(b, "tr-ss1");
+		const hook = join(b.hooks, "tr-ss1.cap");
+		writeFileSync(`${hook}.pause`, "");
+		const t0 = Date.now();
+		const p = spawnCall(b, { sub: "full", runId: "tr-ss1" });
+		try {
+			expect(await until(() => existsSync(`${hook}.reached`), 60_000)).toBe(true);
+			const sectionFive = () => existsSync(join(work, "full.signature.log")) && /^== 5\. /m.test(readFileSync(join(work, "full.signature.log"), "utf8"));
+			expect(await until(sectionFive, 60_000)).toBe(true);
+		} finally {
+			writeFileSync(`${hook}.go`, "");
+		}
+		const exit = await p.exited;
+		const stdout = await new Response(p.stdout).text();
+		const stderr = await new Response(p.stderr).text();
 		const worker = fixturePid(work, "spin.pid");
 		const zombie = fixturePid(work, "zombie.pid");
-		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
-		expect(r.stderr).toBe("as2test: timeout: the part passed its cap of 9000 ms; its group was killed\n");
+		expect(exit).toBe(WRAPPER_EXIT.timeout);
+		expect(stderr).toBe("as2test: timeout: the part passed its cap of 9000 ms; its group was killed\n");
 		expect(Date.now() - t0).toBeGreaterThanOrEqual(9_000);
-		expect(Date.now() - t0).toBeLessThan(9_000 + CAPTURE_MS + 500 + 5_000);
-		const lines = detectorLines(r.stdout);
-		// Only this signature's lines; a flap (a tick under the hot share on a loaded machine) may clear and restart it.
-		for (const l of lines) {
-			expect(["stuck-signature", "stuck-cleared", "stuck-would-stop", "stuck-captured"]).toContain(l.keyword);
-			expect(new Date(l.iso).toISOString()).toBe(l.iso);
-			if (l.keyword !== "stuck-captured") expect(l.rest).toStartWith(`worker ${worker} zombie ${zombie}`);
-		}
-		const would = lines.findIndex((l) => l.keyword === "stuck-would-stop");
-		expect(would).toBeGreaterThan(0);
-		const sig = lines[would - 1]!;
-		expect(sig.keyword).toBe("stuck-signature");
-		expect(sig.rest).toMatch(new RegExp(`^worker ${worker} zombie ${zombie} since \\d+ mode shadow bun `));
-		expect(lines[would]!.rest).toBe(`worker ${worker} zombie ${zombie}`);
-		expect(lines.filter((l) => l.keyword === "stuck-captured").map((l) => l.rest)).toEqual([expect.stringMatching(/^file full\.signature\.log ms \d+$/)]);
-		// The would-stop came at the persistence, long before the cap: the part ran on untouched.
-		expect(Date.parse(lines[would]!.iso) - Date.parse(sig.iso)).toBeGreaterThanOrEqual(DETECT.detectPersistMs - 50);
-		expect(Date.parse(lines[would]!.iso) - t0).toBeLessThan(9_000 - 2_000);
-		report({ fixture: "shadow", stdout: r.stdout, stderr: r.stderr });
-		expect(Object.keys(signatureSections(readFileSync(join(work, "full.signature.log"), "utf8")))).toEqual(["1", "2", "3", "4", "5"]);
+		const lines = detectorLines(stdout);
+		// No flap on this clock: one signature, its would-stop (nothing stopped) and its capture.
+		expect(lines.map((l) => l.keyword)).toEqual(["stuck-signature", "stuck-would-stop", "stuck-captured"]);
+		for (const l of lines) expect(new Date(l.iso).toISOString()).toBe(l.iso);
+		expect(lines[0]!.rest).toMatch(new RegExp(`^worker ${worker} zombie ${zombie} since \\d+ mode shadow bun `));
+		expect(lines[1]!.rest).toBe(`worker ${worker} zombie ${zombie}`);
+		expect(lines[2]!.rest).toMatch(/^file full\.signature\.log ms \d+$/);
+		report({ fixture: "shadow", stdout, stderr });
+		const text = readFileSync(join(work, "full.signature.log"), "utf8");
+		// The would-stop came at the persistence exactly, on the detector's clock.
+		expect(text).toContain(`signature capture of full: worker ${worker} spun ${DETECT.detectPersistMs} ms in Bun.spawnSync `);
+		expect(text).toContain("mode shadow");
+		expect(Object.keys(signatureSections(text))).toEqual(["1", "2", "3", "4", "5"]);
 		// D5's cap path is unchanged: its stuck capture, then the group's kill.
 		expect(Object.keys(stuckSections(readFileSync(join(work, "full.stuck.log"), "utf8")))).toEqual(["1", "2", "3", "4"]);
 		// The cap kills the leader's group as before. A --parallel worker has its own group, which a groups sweep does not
@@ -2080,7 +2089,10 @@ describe("sweep", () => {
 		const argvUses = text.split("\n").flatMap((l, i) => (/"\$@"/.test(l) ? [i] : []));
 		expect(argvUses).toEqual([execLine + 2]);
 		expect(text).toContain(`'/usr/local/libexec/as2test/bun' '/usr/local/libexec/as2test/test-exec.js' "$@"`);
-		const knobs = [{ hooks: "/tmp/h" }, { killGraceMs: 1 }, { sweepLockWaitMs: 1 }, { captureMs: 1 }, { detectTickMs: 1 }, { detectPersistMs: 1 }, { signatureCaptureMs: 1 }, { stopGraceMs: 1 }, { detectTrace: true }, { detectTrace: false }];
+		const knobs = [
+			{ hooks: "/tmp/h" }, { killGraceMs: 1 }, { sweepLockWaitMs: 1 }, { captureMs: 1 }, { detectTickMs: 1 }, { detectPersistMs: 1 }, { signatureCaptureMs: 1 }, { stopGraceMs: 1 }, { detectTrace: true },
+			{ detectTrace: false }, { detectCpuClock: true }, { detectCpuClock: false },
+		];
 		for (const extra of knobs) {
 			expect(() => renderExecWrapper({ root: "/r", bun: "/b", script: "/s", sweepScope: "uid", ...extra })).toThrow(WrapperRenderError);
 		}
@@ -2089,11 +2101,12 @@ describe("sweep", () => {
 		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "uid" })).toMatchObject({
 			killGraceMs: 10_000, sweepLockWaitMs: 60_000, captureMs: 20_000, hooks: null,
 			detectTickMs: STUCK_DEFAULTS.tickMs, detectPersistMs: STUCK_DEFAULTS.persistMs, signatureCaptureMs: STUCK_DEFAULTS.signatureCaptureMs, stopGraceMs: STUCK_DEFAULTS.stopGraceMs, detectTrace: false,
+			detectCpuClock: false,
 		});
 		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", captureMs: 1_500 }).captureMs).toBe(1_500);
-		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", detectTickMs: 50, detectPersistMs: 400, signatureCaptureMs: 900, stopGraceMs: 300, detectTrace: true }))
-			.toMatchObject({ detectTickMs: 50, detectPersistMs: 400, signatureCaptureMs: 900, stopGraceMs: 300, detectTrace: true });
-		for (const bad of [{ detectTickMs: 0 }, { detectPersistMs: -1 }, { stopGraceMs: 1.5 }, { detectTrace: "yes" as unknown as boolean }]) {
+		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", detectTickMs: 50, detectPersistMs: 400, signatureCaptureMs: 900, stopGraceMs: 300, detectTrace: true, detectCpuClock: true }))
+			.toMatchObject({ detectTickMs: 50, detectPersistMs: 400, signatureCaptureMs: 900, stopGraceMs: 300, detectTrace: true, detectCpuClock: true });
+		for (const bad of [{ detectTickMs: 0 }, { detectPersistMs: -1 }, { stopGraceMs: 1.5 }, { detectTrace: "yes" as unknown as boolean }, { detectCpuClock: 1 as unknown as boolean }]) {
 			expect(() => execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", ...bad })).toThrow(WrapperRenderError);
 		}
 	});
