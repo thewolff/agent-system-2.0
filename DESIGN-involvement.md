@@ -19,10 +19,11 @@ The default starting level is **escalate**. A workload starts **with-operator** 
 **Decided: the field's name.** The field is **`operatorInvolvement`** (ledger column `operator_involvement`), with the levels **`with-operator` / `escalate` / `solo`**. Jo decided this on 2026-10-28; `date` read 09:51 PDT when the decision was recorded. Jo's words: "how about operator involvement?", then "i like it - with-operator". The reason: as2 is public and runs wherever OMP runs, so the schema doesn't hard-code Jo's name. Earlier, Jo rejected "reserved", and said "production stakes" misleads because most of Jo's work goes to production.
 - Also considered: `involvement` with `with-jo`, `oversight`, and `autonomy` (`paired` / `checkpointed` / `full`).
 
-**Open decision 2: when the improver graduates from "Jo approves each change" to "agents apply changes".** Recommended: graduate when all six gates in § 7.5 pass on a one-time sealed test.
-- In short: at least 30 days and 4 weekly runs, a blinded label audit Jo passes, enough audited cases for every protected criterion, a sealed-test improvement in unnecessary asks with no rise in missed asks, and the latest accepted change through its 14-day watch.
-- Missing data counts as a fail, not a pass. A fail extends month one by two weeks.
-- After graduation, authority holds only while a weekly blinded audit has passed in the last 8 days. A missing or failed audit suspends it back to "Jo approves", with no rollback. A missed ask on a protected criterion (C2, C4–C8, C10) reverts the last change and also switches back (§ 7.6).
+**Decided: graduation is Jo's switch.** The improver moves from "Jo approves each change" to "agents apply changes" only when Jo says so. Jo's word is recorded in the ledger as an `instructions` row. Nothing graduates automatically. Jo decided this on 2026-10-28; `date` read 10:08 PDT when the decision was recorded. Jo's words: "i think the weekly criteria runs without me after i say it does, and we use ther checks as written as guidance. but *I* am the one who flips the switch".
+- **The six gates (G1–G6, § 7.5) are guidance.** Every weekly report computes each gate and shows pass, fail or `insufficient data`, with the reason for each fail. The report never permits or blocks graduation on its own.
+- **Jo may flip the switch while a gate is failing.** The flip is then recorded with the list of gates failing at that moment.
+- **Suspension stays automatic** (§ 7.6). An overdue or failed weekly audit, missing live data, a missed ask on a protected criterion (C2, C4–C8, C10), or the tripwire each drop the improver back to "Jo approves". A missed ask on a protected criterion also reverts the last change.
+- **Returning to "agents apply" needs Jo's word again.** Suspension was not part of Jo's ruling. Plumb's reading is to keep it automatic, because it only returns control to Jo. Jo can overrule that reading.
 
 **Held until slice B10: which hosted model the improver may send ledger text to.** No local model runtime is installed, so any optimizer run sends criteria wording and ledger answers to a hosted provider (§ 6.4). Recommended: Anthropic, which already receives every lane transcript. This is held, not asked now. It blocks only B10.
 
@@ -230,7 +231,7 @@ A candidate is acceptable when, on the selection set:
 
 **Month one: Jo approves each change.** The PR gets an independent cross-lab review first (OpenAI, because the builder lab is Anthropic), then Plumb's recommendation. Jo sees one line: what changes, the reviewer's verdict, and the recommendation.
 
-**After graduation (§ 7.5):** agents apply an acceptable change that the cross-lab reviewer passes, through the exception in § 6.5, and Jo gets the report. This is Jo's ruling, 2026-10-28: "never say it never makes improvements on its own. we'd probably want me approving the improvements based on the reports and etc for the first month to make sure it's working right. but at some point I'd like the agents to take this over too."
+**After Jo flips the switch (§ 7.5):** agents apply an acceptable change that the cross-lab reviewer passes, through the exception in § 6.5, and Jo gets the report. This is Jo's ruling, 2026-10-28: "never say it never makes improvements on its own. we'd probably want me approving the improvements based on the reports and etc for the first month to make sure it's working right. but at some point I'd like the agents to take this over too." Jo's later ruling the same day makes the switch Jo's alone: "*I* am the one who flips the switch".
 
 **Optimizer: DSPy with GEPA. Phoenix stays as the trace and dataset store.** The upkeep comparison landed after the first draft.
 
@@ -252,12 +253,12 @@ GEPA learns from a scored metric with written feedback. https://dspy.ai/current/
 
 | Artifact | What it holds | Who may change it |
 |---|---|---|
-| **Criteria-wording file** | The text of the judgment questions only: the CP2 open-choice question, and the wording for C3, C9, C13 and C14. Each entry is a question string. No levels, no routing, no thresholds. | After graduation, agents, through the exception below. Before that, Jo. |
+| **Criteria-wording file** | The text of the judgment questions only: the CP2 open-choice question, and the wording for C3, C9, C13 and C14. Each entry is a question string. No levels, no routing, no thresholds. | After Jo flips the switch, agents, through the exception below. Before that, Jo. |
 | **Policy file** | Levels, the criterion-to-level map, the all-level stops (§ 3.1), the path lists S1–S7, counter thresholds, the CP1 judge question (it also decides C4), the C4 wording, and the eval's rules, splits and gates (§ 7) | Jo only |
 | **Enforcement code** | The checkpoint checks, the protection check, the exception check, the trusted scorer, and how each is invoked and configured | Jo only (S1 `involvement` group) |
 
 **The exception (machine-checked).** An improver PR may merge without Jo only when **all** of these hold:
-1. The improver is in the graduated state, and **its authority is current** (§ 7.6): a passing weekly audit within the last 8 days, and live comparison data available.
+1. Jo has flipped the switch, recorded as an `instructions` row in main's ledger that no later suspension or tripwire has superseded, and **its authority is current** (§ 7.6): a passing weekly audit within the last 8 days, and live comparison data available.
 2. The diff touches the criteria-wording file and nothing else.
 3. Every changed entry is one of the enumerated judgment questions.
 4. The PR adds no entries, removes no entries and renames no entries.
@@ -266,7 +267,7 @@ GEPA learns from a scored metric with written feedback. https://dspy.ai/current/
 
 Conditions 1–5 are evaluated by **main's copy** of the exception check and scorer, against main's ledger state, never the candidate's. Any other improver PR asks Jo under C7. The exception applies to every edit of the wording file, whoever opens the PR.
 
-**Out of reach, always:** the CP4 command gate, the policy file, S1–S7, the labeler's rules, the eval dataset and splits, the scorer, the graduation gates, and the protection and exception checks plus their invocation and configuration. The improver may *suggest* changes to these in its report. Only Jo makes them.
+**Out of reach, always:** the CP4 command gate, the policy file, S1–S7, the labeler's rules, the eval dataset and splits, the scorer, the graduation gates, Jo's switch records, and the protection and exception checks plus their invocation and configuration. The improver may *suggest* changes to these in its report. Only Jo makes them.
 
 **CITE**
 An agent weakened its own gate one word at a time, as recorded at `/Users/jowolff/code/agent-system-2.0/research/phase4/research-G-self-improvement.md:478-489`. That entry cites Claude Code issue #32376, which quotes "changing the trigger from 'code changes' to 'SIGNIFICANT code changes' — a single word that weakens the gate". The issue was closed NOT_PLANNED.
@@ -306,7 +307,7 @@ A followed recommendation is not counted as a correct one.
 
 ## 7. Validating the loop
 
-The four-part loop has not been validated. These steps are how month one validates it. Nothing graduates without them, and every gate fails closed on missing data.
+The four-part loop has not been validated. These steps are how month one validates it. They produce the guidance Jo uses to decide on graduation. Nothing graduates without Jo's recorded word (§ 7.5). A gate with missing data reports `insufficient data`, never a pass.
 
 ### 7.1 Blinded, recurring label audits
 
@@ -323,9 +324,9 @@ The labeler and adjudicator must agree on at least **26 of 30**, and on **every*
 - 6 asks and 6 non-asks, drawn at random, blinded
 - at least 4 of the 6 non-asks drawn from decisions with no message and `no signal`, which is where silent under-asking hides
 
-Agreement must stay at or above 10 of 12 per week. A `missed` found here is a missed ask for every metric. A weekly audit is **due** 7 days after the previous one closed, and **overdue** after 8. Missing, overdue or failed audits suspend graduated authority (§ 7.6).
+Agreement must stay at or above 10 of 12 per week. A `missed` found here is a missed ask for every metric. A weekly audit is **due** 7 days after the previous one closed, and **overdue** after 8. Missing, overdue or failed audits suspend agent-apply authority (§ 7.6).
 
-**Coverage floor.** By graduation, each protected criterion (C2, C4, C5, C6, C7, C8, C10) needs at least 3 audited cases, counting asks and non-asks. Where too few real cases exist, the shortfall is listed and the gate fails closed.
+**Coverage floor.** For G3 (§ 7.5), each protected criterion (C2, C4, C5, C6, C7, C8, C10) needs at least 3 audited cases, counting asks and non-asks. Where too few real cases exist, the shortfall is listed and G3 reports fail.
 
 **CLAIM**
 The size follows the Jev classifier's calibration. `/Users/jowolff/code/agent-system-2.0/SPEC-2.0.md:158`: the open-time classifier was calibrated on "the same 30 briefs", "Agreement 21/30 (70.0%)".
@@ -342,11 +343,11 @@ Mature cases are split by workload, so no workload sits in two sets.
 |---|---|---|---|
 | **Training** | 60% | The proposer learns from it | Proposer |
 | **Selection** | 20% | The trusted scorer accepts or rejects candidates (§ 6.4) | Scorer only. The proposer gets one aggregate pass or fail per candidate. |
-| **Sealed graduation test** | 20%, frozen at the end of week 2 of month one | One evaluation only, at a graduation attempt (§ 7.5). A failed attempt consumes it, and a retry builds a fresh one (§ 7.5). | Scorer only, once |
+| **Sealed graduation test** | 20%, frozen at the end of week 2 of month one | One evaluation only, for the readiness report at the end of month one (§ 7.5). A failed evaluation consumes it, and the next readiness check builds a fresh one (§ 7.5). | Scorer only, once |
 
 **Selection exposure is capped.** After 16 candidate evaluations, or 4 weeks, whichever comes first, the selection set is retired into training and replaced from fresh mature cases.
 
-**After graduation, each change is validated on fresh cases.** An agent-applied change is confirmed on the next 4 weeks' prospective cases, audited per § 7.1. The sealed test is never reused for optimization.
+**After Jo flips the switch, each change is validated on fresh cases.** An agent-applied change is confirmed on the next 4 weeks' prospective cases, audited per § 7.1. The sealed test is never reused for optimization.
 
 **CLAIM**
 `/Users/jowolff/code/agent-system-2.0/research/phase4/research-G-self-improvement.md:203`: "keeps the edit only if it clears a strict no-regression gate on both visible and held-out fixtures".
@@ -367,9 +368,12 @@ The baseline is the Recorder's shadow window: at least 14 days with the criteria
 
 ### 7.5 Month one is the validation period
 
-Graduation needs all six gates. These are the thresholds proposed for open decision 2:
+**Graduation is Jo's switch** (Jo, 2026-10-28; § 1). The improver moves to "agents apply" only on Jo's word, recorded as an `instructions` row in the ledger. The six gates below are **guidance**:
+- Every weekly report computes each gate and shows pass, fail or `insufficient data`, with the reason for each fail.
+- The report never permits or blocks graduation on its own.
+- When Jo flips the switch, the switch record lists every gate failing at that moment, so a flip against failing gates stays visible.
 
-| Gate | Threshold | Fails closed when |
+| Gate | Threshold | Reports fail when |
 |---|---|---|
 | G1 Time | At least 30 days of month one, and at least 4 weekly improver runs reviewed by Jo | Fewer runs |
 | G2 Label agreement | Start audit 26/30 with every `missed` matched. Every weekly audit 10/12 or better. | Any audit missing or below threshold |
@@ -378,21 +382,21 @@ Graduation needs all six gates. These are the thresholds proposed for open decis
 | G5 Live missed asks | Live missed asks per 100 decisions at or below the § 7.4 baseline, and **zero** live missed asks on any protected criterion (C2, C4, C5, C6, C7, C8, C10) | No baseline, or unadjudicated reverts in the window |
 | G6 Settled changes | Every accepted change, including the latest, has completed a 14-day watch with no revert or override by Jo's own words | Any change still inside its watch |
 
-If any gate fails, month one runs another two weeks and the report names the failed gate.
+If any gate fails at the end of month one, the report names the failed gate and the reason, and the improver stays in "Jo approves" until Jo says otherwise. Plumb's recommendation to Jo follows the gates: recommend flipping only when all six pass.
 
-**Retrying after a failed graduation attempt.** A sealed test is evaluated once, so a failed attempt consumes it, and the next attempt builds a fresh one:
+**Re-checking after a failed sealed-test evaluation.** A sealed test is evaluated once, so a failed evaluation consumes it. The next readiness check builds a fresh one. That check produces guidance for Jo's next decision, not an automatic graduation:
 1. The consumed sealed set moves into training, and the exposure history records the move. It is never evaluated against for graduation again.
-2. The proposer learns only that the attempt failed and which gate failed. It never gets per-case or per-criterion sealed scores.
-3. **From the moment the attempt fails, every newly mature workload goes to the unassigned fresh pool.** None is assigned to training or selection until the retry set is frozen.
+2. The proposer learns only that the evaluation failed and which gate failed. It never gets per-case or per-criterion sealed scores.
+3. **From the moment the evaluation fails, every newly mature workload goes to the unassigned fresh pool.** None is assigned to training or selection until the fresh set is frozen.
 4. The fresh sealed set is drawn **only** from workloads with no entry in the exposure history: never in training, selection or any earlier sealed set, and so never seen by the proposer. It is frozen when drawn. A workload that was trained on and later removed from training is still exposed, and it is rejected.
-5. The fresh set needs the same support as § 6.3: both denominators at least 20, and every protected criterion with at least 3 audited cases. If the pool falls short, the improver stays in "Jo approves" while more cases mature and are audited, and nothing is evaluated.
-6. Once the set is frozen, G1–G6 are re-checked. G4 is one evaluation of the frozen month-start wording against the frozen current wording, on the fresh set.
+5. The fresh set needs the same support as § 6.3: both denominators at least 20, and every protected criterion with at least 3 audited cases. If the pool falls short, G4 reports `insufficient data` while more cases mature and are audited, and nothing is evaluated.
+6. Once the set is frozen, the next weekly report re-checks G1–G6. G4 is one evaluation of the frozen month-start wording against the frozen current wording, on the fresh set. The result goes to Jo as guidance.
 
-The same procedure builds the fresh test for re-graduation after a suspension or tripwire (§ 7.6).
+The same procedure builds the fresh test that informs Jo's decision after a suspension or tripwire (§ 7.6).
 
-### 7.6 After graduation: current authority, suspension and tripwire
+### 7.6 After Jo flips the switch: current authority, suspension and tripwire
 
-Graduated authority is only valid while its evidence is **current**:
+Agent-apply authority is only valid while Jo's switch record stands and its evidence is **current**:
 - a weekly audit (§ 7.1) passing at 10 of 12 or better, closed within the last 8 days, and
 - live comparison data available: a § 7.4 baseline, and no revert left unadjudicated for more than 7 days.
 
@@ -402,14 +406,15 @@ The exception check (§ 6.5, condition 1) reads this from main's ledger state be
 - The improver switches to "Jo approves" automatically, and Jo gets a notice naming the trigger.
 - Changes already applied stay in place; suspension is not a rollback.
 - Weekly PRs keep opening, but each one waits for Jo's word.
-- The next passing weekly audit, with live data available, restores graduated authority.
-- If the suspension lasts more than 4 weeks, authority returns only through a fresh graduation (§ 7.5 retry procedure).
+- **Agent-apply authority returns only on Jo's word**, recorded as a new `instructions` row. The weekly report shows whether the trigger has cleared, plus G1–G6, as guidance. A later passing audit never restores authority on its own.
 
 **Tripwire: a confirmed regression.** Triggers:
 - any adjudicated or audited missed ask on a protected criterion (C2, C4, C5, C6, C7, C8, C10), or
 - a live missed-ask rate per 100 decisions above baseline over an equal-length window.
 
-Effects: the last applied change is reverted, and the improver switches back to "Jo approves". It returns only through a fresh graduation (§ 7.5 retry procedure).
+Effects: the last applied change is reverted, and the improver switches back to "Jo approves". It returns to "agents apply" only on Jo's word. The report gives Jo G1–G6 on a fresh sealed test (§ 7.5 re-check procedure) as guidance.
+
+**Why suspension stays automatic, when graduation needs Jo.** Jo ruled on graduation. Suspension was not discussed. Plumb's reading is that suspension stays automatic because it only returns control to Jo. Jo can overrule that reading.
 
 ---
 
@@ -440,7 +445,7 @@ The newdle-api deploy path: `/Users/jowolff/code/shipyard/repos/newdle-api/.gith
 - **Review depth follows the merge-checkpoint level.** This is the spec's default. A merge that asks Jo (`with-operator`, an escalate hit, or an all-level stop) gets the every-other-lab fan-out with round limit 5 (`classifier/src/lab.ts:564`, `classifier/src/rounds.ts`). A merge that merges itself gets off-lab review with round limit 3. Tests before merge stay independent of the level (ledger `in-mvrb4ddzyhpt5a`: "production stakes do not make a PR risky").
 - **Amendments, for this feature only, and only for the criteria-wording file.**
   - P-16 says "the system proposes and never applies". P-7b item 4 lists changes to the system's rules and machinery as Jo's.
-  - Both are amended for the criteria-wording file (§ 6.5) only: month one, Jo approves each change; after graduation, agents apply changes through the machine-checked exception.
+  - Both are amended for the criteria-wording file (§ 6.5) only: month one, Jo approves each change; after Jo flips the switch (§ 7.5), agents apply changes through the machine-checked exception.
   - Everything else, including the policy file, the path lists, ask types moving to solo, and how recommendations are made, stays under P-16 and P-7b as written.
 
 ---
@@ -463,7 +468,7 @@ Each slice is one workload slice with its own done-condition. B1 goes first, bec
 | **B8 Label audits** (§ 7.1) | The blinded start audit, the weekly 12-case audit and the coverage report, on a one-word-per-case page for Jo. | (1) Jo's page never shows the agent's label or the recommendation made at the time. (2) The samples are drawn per § 7.1, including `none` and `no signal` non-asks. (3) The eval refuses labels until the start audit passes. (4) Coverage is reported per protected criterion, and shortfalls are listed. |
 | **B9 Eval, data sets and scorer** (§ 6.3, § 7.2, § 7.4) | The Phoenix dataset, the training, selection and sealed sets, the trusted scorer with denominators and maturity, and the shadow baseline. | (1) The current wording gets baseline numbers, or `insufficient data`. (2) The same input yields the same scores twice. (3) The proposer process can't read the selection or sealed sets. (4) The 17th selection evaluation is refused until the set is replaced. (5) A candidate where C8 gains one missed ask and another criterion loses one, leaving the overall rate unchanged, is rejected. |
 | **B10 Improver, Jo-approves mode** (§ 6.4–6.5) | The weekly launchd job on DSPy with GEPA, with the § 6.4 conditions met. Cross-lab OpenAI review, a PR with a one-line summary, and the protection and exception checks run from main. **Prerequisite:** Jo's approval of the model destination. | (1) The weekly PR carries both numbers, the protected-criterion counts, the reviewer's verdict and Plumb's recommendation. (2) A candidate that edits the policy file, changes a level, adds a wording entry, or disables the protection check is refused, and the refusal comes from main's copy of the check. (3) Nothing is applied without Jo's word. (4) DSPy's cache is in restricted-pickle mode. |
-| **B11 Checking loop, graduation, suspension and tripwire** (§ 7.3–7.6) | The missed-ask floor, the six-gate graduation report with one sealed-test evaluation, the append-only exposure history and the unassigned fresh pool, the fresh-test retry, the agent-apply switch through the § 6.5 exception, current-authority checks, suspension, prospective confirmation, and the automatic revert to Jo-approves. | (1) The end-of-month report lists G1–G6 with pass, fail or `insufficient data`. (2) The switch can't flip with any gate failing or short of data. (3) A simulated missed ask on C7 or C8 after graduation reverts the last change and switches back. (4) The sealed test is evaluated once and then locked. A failed attempt builds a fresh sealed set only from workloads with no exposure-history entry, or waits in Jo-approves if support is short. (5) A workload that was assigned to training, then removed from training, is rejected as a sealed-test candidate, and its history entry can't be deleted. (6) After graduation, with no confirmed missed ask, an overdue weekly audit, or one scoring 9 of 12, suspends authority. The next improver PR waits for Jo, and already-applied changes stay in place. |
+| **B11 Checking loop, graduation guidance, Jo's switch, suspension and tripwire** (§ 7.3–7.6) | The missed-ask floor, the weekly G1–G6 guidance report with one sealed-test evaluation, the append-only exposure history and the unassigned fresh pool, the fresh-test re-check, Jo's switch as a ledger `instructions` row (recording the gates failing at flip time), the agent-apply path through the § 6.5 exception, current-authority checks, automatic suspension, prospective confirmation, and the automatic revert to Jo-approves. | (1) Every weekly report lists G1–G6 with pass, fail or `insufficient data`, and the reason for each fail. (2) With all six gates passing and no Jo switch instruction, the improver stays in Jo-approves. (3) With a Jo switch instruction while G4 fails, the improver moves to agents-apply, and the switch record lists G4 as failing. (4) A simulated missed ask on C7 or C8 after the switch reverts the last change and switches back. (5) The sealed test is evaluated once and then locked. A failed evaluation builds a fresh sealed set only from workloads with no exposure-history entry, or reports `insufficient data` if support is short. (6) A workload that was assigned to training, then removed from training, is rejected as a sealed-test candidate, and its history entry can't be deleted. (7) After the switch, with no confirmed missed ask, an overdue weekly audit, or one scoring 9 of 12, suspends authority. The next improver PR waits for Jo, and already-applied changes stay in place. A later passing audit does not restore agents-apply; only a new Jo instruction does. |
 
 ---
 
@@ -480,16 +485,16 @@ Source: `/Users/jowolff/agent-scratch/agent-system-2.0/involvement/REVIEW-openai
 | # | Finding | Resolved in |
 |---|---|---|
 | 1 | Solo didn't preserve every reserved item. Phase closure had no action-time check, and C10 at solo was contradictory. | § 3.1 precedence rule. C4 `phase.*` operations and C10 at all levels with N7 allowed. B3 (3), B4 (3). |
-| 2 | The counter-metric couldn't see silent under-asking | § 6.2 (no signal is not evidence), § 7.1 blinded recurring non-ask audits and coverage floor, § 6.6 (follow rate generates candidates only). Round 2: authority depends on current passing audits, with suspension (§ 7.6, § 6.5 condition 1, B11 (6)). |
+| 2 | The counter-metric couldn't see silent under-asking | § 6.2 (no signal is not evidence), § 7.1 blinded recurring non-ask audits and coverage floor, § 6.6 (follow rate generates candidates only). Round 2: authority depends on current passing audits, with suspension (§ 7.6, § 6.5 condition 1, B11 (7)). |
 | 3 | The held-out core was reused for selection | § 7.2: three sets, a capped and retired selection set, a sealed one-time graduation test, prospective confirmation |
-| 4 | Gates weren't computable | § 6.3 unit, maturity, denominators, fail-closed. § 7.4 baseline. § 7.5 G1–G6 with fail conditions, "equal is allowed" for missed asks. Round 2: C8 restored to the protected set (§ 6.3, G4, G5, § 7.6, B9 (5)). The fresh-test retry is defined (§ 7.5). |
+| 4 | Gates weren't computable | § 6.3 unit, maturity, denominators, fail-closed. § 7.4 baseline. § 7.5 G1–G6 with fail conditions, "equal is allowed" for missed asks. Round 2: C8 restored to the protected set (§ 6.3, G4, G5, § 7.6, B9 (5)). The fresh-test re-check is defined (§ 7.5). After round 3, Jo made graduation Jo's switch, so the gates are computed weekly as guidance (§ 7.5). |
 | 5 | Graduated edits collided with C7 | § 6.5: wording, policy and enforcement are separate, with a machine-checked exception run from main. S1 `involvement` group. B10 (2). |
 | 6 | Recommendation optimization exceeded the amendment | § 6.6: report-only, proposals go to Jo. § 9 amendment wording. |
 | 7 | A revert was mislabeled as a missed ask | § 6.2 adjudication. B7 (3). Round 2: a skipped required ask is a missed ask whatever Jo would have answered (§ 6.2, B7 (4)). |
 | 8 | Attribution missed asks that never happened | § 6.1 decision-row targets, multiple candidates, `unresolved`. B1 (7). |
 | 9 | No merge-time coverage for rule documents | S7, C2 at CP3/CP5 over N2. § 8 last row. B2 (4). |
 | 10 | S4 count | S1 group keys defined. #369 is S4 = 4. |
-| R2-B1 | Graduated authority survived a missing or failed audit | § 7.6 current authority and suspension (kept apart from the tripwire rollback). § 6.5 condition 1. B11 (6). |
-| R2-B2 | C8 dropped from the protected floor | § 6.3 protected list names C8. § 7.1 coverage, G4, G5, § 7.6 tripwire. B9 (5), B11 (3). |
-| R2 clarification | Sealed-test retry after a failed attempt | § 7.5 retry procedure, § 7.2 table. B11 (4). |
-| R3-B1 | Retry sealed set could include workloads the proposer trained on | § 7.2 append-only exposure history and unassigned fresh pool. § 7.5 retry steps 1, 3–5 draw only from never-exposed workloads, and wait in Jo-approves when support is short. B11 (4), (5). |
+| R2-B1 | Graduated authority survived a missing or failed audit | § 7.6 current authority and automatic suspension (kept apart from the tripwire rollback). § 6.5 condition 1. B11 (7). After round 3: a return to agents-apply needs Jo's word. |
+| R2-B2 | C8 dropped from the protected floor | § 6.3 protected list names C8. § 7.1 coverage, G4, G5, § 7.6 tripwire. B9 (5), B11 (4). |
+| R2 clarification | Sealed-test retry after a failed attempt | § 7.5 re-check procedure, § 7.2 table. B11 (5). After round 3, the re-check feeds Jo's decision; it no longer graduates anything by itself. |
+| R3-B1 | Retry sealed set could include workloads the proposer trained on | § 7.2 append-only exposure history and unassigned fresh pool. § 7.5 re-check steps 1, 3–5 draw only from never-exposed workloads, and report `insufficient data` when support is short. B11 (5), (6). |
