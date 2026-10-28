@@ -49,26 +49,37 @@ const VERIFIED_TAG = "as2-verified";
 
 const made: string[] = [];
 /**
- * Removes the fixture dirs named in argv: chmod u+rwx every directory beneath (so a dir a test sealed can be emptied),
- * then rm -r. Run by a detached child, never in the hook: unlinking every fixture file took 9.5 s on a loaded machine
- * and timed out the afterAll (run tr-0mvskhqnl998o93), and the hook's job is only to start it.
+ * Removes the fixture dirs named in argv, each on its own: chmod u+rwx every directory beneath (so a dir a test sealed can
+ * be emptied), then rm -r. One JSON line per dir on stdout: `{ path, ok, rmError, unsealErrors }`, `ok` only when the dir
+ * is gone and rm did not throw. A failure on one dir never stops the rest. Kept as the source of a child process: unlinking
+ * every fixture file took 9.5 s on a loaded machine (run tr-0mvskhqnl998o93), and work done synchronously inside the hook
+ * cannot be bounded, since the hook's timeout cannot fire until it returns. A child can be killed at a deadline.
  */
-const REMOVE_FIXTURES = `const { chmodSync, lstatSync, readdirSync, rmSync } = require("node:fs");
+const REMOVE_FIXTURES = `const { chmodSync, existsSync, lstatSync, readdirSync, rmSync } = require("node:fs");
 const { join } = require("node:path");
-function unseal(p) {
+const msg = (op, p, e) => op + " " + p + ": " + (e && e.message ? e.message : String(e));
+function unseal(p, errors) {
 	let st;
-	try { st = lstatSync(p); } catch { return; }
+	try { st = lstatSync(p); } catch (e) { if (e.code !== "ENOENT") errors.push(msg("lstat", p, e)); return; }
 	if (!st.isDirectory()) return;
-	chmodSync(p, 0o755);
-	for (const n of readdirSync(p)) unseal(join(p, n));
+	try { chmodSync(p, 0o755); } catch (e) { errors.push(msg("chmod", p, e)); }
+	let names = [];
+	try { names = readdirSync(p); } catch (e) { errors.push(msg("readdir", p, e)); }
+	for (const n of names) unseal(join(p, n), errors);
 }
-for (const r of process.argv.slice(1)) {
-	try { unseal(r); } catch {}
-	rmSync(r, { recursive: true, force: true });
+for (const path of process.argv.slice(1)) {
+	const unsealErrors = [];
+	unseal(path, unsealErrors);
+	let rmError = null;
+	try { rmSync(path, { recursive: true, force: true }); } catch (e) { rmError = msg("rm", path, e); }
+	const ok = rmError === null && !existsSync(path);
+	process.stdout.write(JSON.stringify({ path, ok, rmError, unsealErrors }) + "\\n");
 }
 `;
+/** The cleanup child's deadline, inside the afterAll's own timeout below with room to report. */
+const CLEANUP_BUDGET_MS = 45_000;
 const pids: number[] = [];
-afterAll(() => {
+afterAll(async () => {
 	for (const pid of pids) {
 		try {
 			process.kill(pid, "SIGKILL");
@@ -76,8 +87,30 @@ afterAll(() => {
 			// already gone
 		}
 	}
-	if (made.length > 0) Bun.spawn([BUN, "-e", REMOVE_FIXTURES, ...made], { cwd: "/", detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" }).unref();
-});
+	if (made.length === 0) return;
+	const child = Bun.spawn([BUN, "-e", REMOVE_FIXTURES, ...made], { cwd: "/", stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: CLEANUP_BUDGET_MS, killSignal: "SIGKILL" });
+	const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+	const reported = new Map<string, { ok: boolean; rmError: string | null; unsealErrors: string[] }>();
+	for (const line of out.split("\n")) {
+		try {
+			const r = JSON.parse(line) as { path: string; ok: boolean; rmError: string | null; unsealErrors: string[] };
+			reported.set(r.path, r);
+		} catch {
+			// an empty line, or the last line cut by the deadline's kill: that dir counts as unfinished
+		}
+	}
+	const failed = [...reported].filter(([, r]) => !r.ok).map(([p, r]) => `${p}: ${[r.rmError ?? "still present after rm", ...r.unsealErrors].join("; ")}`);
+	const unfinished = made.filter((p) => !reported.has(p));
+	if (failed.length === 0 && unfinished.length === 0 && code === 0) return;
+	throw new Error(
+		[
+			`fixture cleanup failed: child exit ${code}${child.signalCode ? ` (${child.signalCode}${child.signalCode === "SIGKILL" ? `, killed at its ${CLEANUP_BUDGET_MS} ms deadline` : ""})` : ""}`,
+			...failed.map((f) => `failed ${f}`),
+			...unfinished.map((p) => `unfinished ${p}`),
+			...(err.trim() ? [`child stderr: ${err.trim()}`] : []),
+		].join("\n"),
+	);
+}, 60_000);
 const dir = (tag: string): string => {
 	const d = realpathSync(tmp(`as2test-${tag}`));
 	made.push(d);
@@ -1668,47 +1701,73 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		writeFileSync(`${hook}.pause`, "");
 		const t0 = Date.now();
 		const p = spawnCall(b, { sub: "full", runId: "tr-ss1" });
+		const sigLog = join(work, "full.signature.log");
+		// Set by `exited`, not read from exitCode: a wrapper the teardown SIGKILLs keeps exitCode null (only signalCode is set).
+		let exited = false;
+		void p.exited.then(() => {
+			exited = true;
+		});
+		// The failure budget inside the test's 90 s: 40 s for the cap and the capture together, 30 s for the cap path after
+		// `.go`, 3 s for the worker, and 3 s for the teardown below.
+		let failure: unknown = null;
 		try {
-			expect(await until(() => existsSync(`${hook}.reached`), 60_000)).toBe(true);
-			const sectionFive = () => existsSync(join(work, "full.signature.log")) && /^== 5\. /m.test(readFileSync(join(work, "full.signature.log"), "utf8"));
-			expect(await until(sectionFive, 60_000)).toBe(true);
-		} finally {
+			expect(await until(() => existsSync(`${hook}.reached`) && existsSync(sigLog) && /^== 5\. /m.test(readFileSync(sigLog, "utf8")), 40_000)).toBe(true);
 			writeFileSync(`${hook}.go`, "");
-		}
-		const exit = await p.exited;
-		const stdout = await new Response(p.stdout).text();
-		const stderr = await new Response(p.stderr).text();
-		const worker = fixturePid(work, "spin.pid");
-		const zombie = fixturePid(work, "zombie.pid");
-		expect(exit).toBe(WRAPPER_EXIT.timeout);
-		expect(stderr).toBe("as2test: timeout: the part passed its cap of 9000 ms; its group was killed\n");
-		expect(Date.now() - t0).toBeGreaterThanOrEqual(9_000);
-		const lines = detectorLines(stdout);
-		// No flap on this clock: one signature, its would-stop (nothing stopped) and its capture.
-		expect(lines.map((l) => l.keyword)).toEqual(["stuck-signature", "stuck-would-stop", "stuck-captured"]);
-		for (const l of lines) expect(new Date(l.iso).toISOString()).toBe(l.iso);
-		expect(lines[0]!.rest).toMatch(new RegExp(`^worker ${worker} zombie ${zombie} since \\d+ mode shadow bun `));
-		expect(lines[1]!.rest).toBe(`worker ${worker} zombie ${zombie}`);
-		expect(lines[2]!.rest).toMatch(/^file full\.signature\.log ms \d+$/);
-		report({ fixture: "shadow", stdout, stderr });
-		const text = readFileSync(join(work, "full.signature.log"), "utf8");
-		// The would-stop came at the persistence exactly, on the detector's clock.
-		expect(text).toContain(`signature capture of full: worker ${worker} spun ${DETECT.detectPersistMs} ms in Bun.spawnSync `);
-		expect(text).toContain("mode shadow");
-		expect(Object.keys(signatureSections(text))).toEqual(["1", "2", "3", "4", "5"]);
-		// D5's cap path is unchanged: its stuck capture, then the group's kill.
-		expect(Object.keys(stuckSections(readFileSync(join(work, "full.stuck.log"), "utf8")))).toEqual(["1", "2", "3", "4"]);
-		// The cap kills the leader's group as before. A --parallel worker has its own group, which a groups sweep does not
-		// know; a spinning one usually outlives its leader, so the test ends it here. It may already have gone (observed under
-		// a concurrent load): whether it survives the leader is bun's, not the detector's, so ESRCH is fine here.
-		try {
-			process.kill(worker, "SIGKILL");
+			expect(await until(() => exited, 30_000)).toBe(true);
+			const stdout = await new Response(p.stdout).text();
+			const stderr = await new Response(p.stderr).text();
+			const worker = fixturePid(work, "spin.pid");
+			const zombie = fixturePid(work, "zombie.pid");
+			expect(p.exitCode).toBe(WRAPPER_EXIT.timeout);
+			expect(stderr).toBe("as2test: timeout: the part passed its cap of 9000 ms; its group was killed\n");
+			expect(Date.now() - t0).toBeGreaterThanOrEqual(9_000);
+			const lines = detectorLines(stdout);
+			// No flap on this clock: one signature, its would-stop (nothing stopped) and its capture.
+			expect(lines.map((l) => l.keyword)).toEqual(["stuck-signature", "stuck-would-stop", "stuck-captured"]);
+			for (const l of lines) expect(new Date(l.iso).toISOString()).toBe(l.iso);
+			expect(lines[0]!.rest).toMatch(new RegExp(`^worker ${worker} zombie ${zombie} since \\d+ mode shadow bun `));
+			expect(lines[1]!.rest).toBe(`worker ${worker} zombie ${zombie}`);
+			expect(lines[2]!.rest).toMatch(/^file full\.signature\.log ms \d+$/);
+			report({ fixture: "shadow", stdout, stderr });
+			const text = readFileSync(sigLog, "utf8");
+			// The would-stop came at the persistence exactly, on the detector's clock.
+			expect(text).toContain(`signature capture of full: worker ${worker} spun ${DETECT.detectPersistMs} ms in Bun.spawnSync `);
+			expect(text).toContain("mode shadow");
+			expect(Object.keys(signatureSections(text))).toEqual(["1", "2", "3", "4", "5"]);
+			// D5's cap path is unchanged: its stuck capture, then the group's kill.
+			expect(Object.keys(stuckSections(readFileSync(join(work, "full.stuck.log"), "utf8")))).toEqual(["1", "2", "3", "4"]);
+			// The cap kills the leader's group as before. A --parallel worker has its own group, which a groups sweep does not
+			// know; a spinning one usually outlives its leader, so the test ends it here. It may already have gone (observed under
+			// a concurrent load): whether it survives the leader is bun's, not the detector's, so ESRCH is fine here.
+			try {
+				process.kill(worker, "SIGKILL");
+			} catch (e) {
+				if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e;
+			}
+			expect(await until(() => !alive(worker), 3_000)).toBe(true);
+			expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
+			expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
 		} catch (e) {
-			if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e;
+			failure = e;
+			throw e;
+		} finally {
+			// Every path, a failed wait included: release the cap, then SIGKILL the wrapper and the spinning worker if either is
+			// still here, and confirm both are gone. A teardown that cannot confirm it fails the test, beside the first failure.
+			writeFileSync(`${hook}.go`, "");
+			if (!exited) p.kill("SIGKILL");
+			const worker = existsSync(join(work, "spin.pid")) ? fixturePid(work, "spin.pid") : null;
+			if (worker !== null) {
+				try {
+					process.kill(worker, "SIGKILL");
+				} catch (e) {
+					if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e;
+				}
+			}
+			if (!(await until(() => exited && (worker === null || !alive(worker)), 3_000))) {
+				const left = new Error(`shadow teardown: wrapper ${p.pid} exited: ${exited}; worker ${worker} alive: ${worker !== null && alive(worker)}`);
+				throw failure === null ? left : new AggregateError([failure, left], "shadow test failed and its teardown did not finish");
+			}
 		}
-		expect(await until(() => !alive(worker), 3_000)).toBe(true);
-		expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
-		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
 	}, 90_000);
 
 	test("a signature capture whose tools are still running at its deadline is cut there: every capture group is SIGKILLed, the file says so, and the stop still exits 125 within the bound", async () => {
