@@ -20,7 +20,15 @@ Jo, 2026-10-28 at about 9:20 AM PDT, approved this outcome: as2's "production st
 
 ## Amendments
 
-- **P-16** ("the system proposes and never applies") and **P-7b item 4** ("changes to the system's own rules or machinery" are Jo's) are amended **for this feature only**. The amendment covers the wording of the involvement criteria: Jo approves each change in month one, and agents apply changes after graduation. The protected set in the spec's § 6.5 stays Jo's. Everything else under P-16 and P-7b item 4 is unchanged.
+- **P-16** ("the system proposes and never applies") and **P-7b item 4** ("changes to the system's own rules or machinery" are Jo's) are amended **for this feature only, and only for the criteria-wording file** (spec § 6.5). That file holds the text of the enumerated judgment questions and nothing else: no levels, no routing, no thresholds, no path lists. Jo approves each change in month one, and agents apply changes after graduation.
+- **Machine-checked exception.** After graduation, an improver PR merges without Jo only when all of these hold. The checks run from main's copy of the exception check and scorer, never the candidate's.
+  - The improver is in the graduated state.
+  - The diff touches only the criteria-wording file.
+  - It edits existing enumerated entries only, with none added, removed or renamed.
+  - The trusted scorer rates it acceptable.
+  - The cross-lab reviewer passes it.
+- **Unchanged under P-16 and P-7b:** the policy file, the path lists, the command gate, the protection and exception checks, the eval and its gates, moving any ask type to solo, and how recommendations are made. These stay Jo's.
+- **How the spec reads "better on both numbers" (item 4).** The unnecessary-ask rate falls, and the missed-ask rate does not rise, overall or on any protected criterion. "Not higher" rather than "lower" lets a change be accepted when missed asks are already at zero. This is the spec's reading, not a ruling of Jo's.
 
 ## Standing state
 
@@ -29,7 +37,12 @@ Jo, 2026-10-28 at about 9:20 AM PDT, approved this outcome: as2's "production st
 ## Open
 
 1. The field's name. Recommended: `involvement`, with the values `with-jo` / `escalate` / `solo`.
-2. The graduation gates from Jo-approves to agent-applied. The proposed thresholds are in the spec's § 7.4.
+2. The graduation gates from Jo-approves to agent-applied. The proposed thresholds are in the spec's § 7.5 (G1–G6, failing closed on missing data).
+3. Held until slice B10: which hosted model the improver may send ledger text to. No local model runtime is installed. Recommended: Anthropic.
+
+## Review
+
+An independent OpenAI review of commit `422bef49` returned request-changes with ten findings. The spec's § 12 maps each finding to its resolution.
 
 ## Source
 
