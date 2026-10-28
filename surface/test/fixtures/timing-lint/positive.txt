@@ -20,6 +20,12 @@ test("timer waits", async () => {
 	const watchdog = setTimeout(() => child.kill("SIGKILL"), 30_000); //! timer
 	const poll = setInterval(() => check(), 25); //! timer
 	setTimeout(() => sock.end(), 50); //! timer
+	const timer = enabled ? setTimeout(done, 100) : undefined; //! timer
+	const tick = slow ? globalThis.setInterval(poll, 10) : null; //! timer
+	await (retry ? sleep(50) : Promise.resolve()); //! sleep
+	const pick = {
+		wait: fast ? setTimeout(go, 5) : setTimeout(go, 50), //! timer timer
+	};
 });
 
 test("timers that are not failure-only watchdogs", async () => {

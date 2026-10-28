@@ -26,6 +26,22 @@ test("strings are data", () => {
 // A method on another object is not the global timer, and a declaration is not a call.
 type Host = { isIdle(): boolean; setTimeout(callback: () => void, ms: number): unknown };
 const host = { setTimeout(cb: () => void, ms: number): number { return 0; } };
+interface Clock {
+	setTimeout(callback: () => void, ms: number): number;
+	setInterval(callback: () => void, ms: number): number
+}
+class FakeClock {
+	private queue: unknown[] = [];
+	setTimeout(callback: () => void, ms: number): number {
+		return 0;
+	}
+	public setInterval(callback: () => void, ms: number): number {
+		return 0;
+	}
+}
+function setTimeout(callback: () => void, ms: number): number {
+	return 0;
+}
 test("injected timers", () => {
 	ctx.setTimeout(() => api.send("a"), 1);
 	clock.setTimeout(fire, 5_000);

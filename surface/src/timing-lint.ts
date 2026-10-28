@@ -11,9 +11,11 @@
 //                 argument starts with a digit (`await sleep(50)`).
 //   timer         a call to the global `setTimeout(` or `setInterval(` (bare, or on `globalThis.`), which covers
 //                 `await new Promise((r) => setTimeout(r, 50))`, a polling interval and a scheduled event. A method call
-//                 on another object (`ctx.setTimeout(`) is not the global timer, and a declaration (`setTimeout(cb, ms):
-//                 unknown`, a call followed by `:` or `{`) is not a call. A failure-only process watchdog is not a finding
-//                 either: `const|let <name> = setTimeout(<cb>, <N>)` where <cb> is an arrow with no parameters whose whole
+//                 on another object (`ctx.setTimeout(`) is not the global timer, and a declaration is not a call: a call
+//                 followed by `:` or `{` that stands after `{`, `}`, `;`, `,`, a modifier or `function` (`setTimeout(cb,
+//                 ms): unknown`), not one in a conditional's true branch (`on ? setTimeout(f, 9) : u`). A failure-only
+//                 process watchdog is not a finding either: `const|let <name> = setTimeout(<cb>, <N>)` where <cb> is an
+//                 arrow with no parameters whose whole
 //                 body is one or more `<x>.kill(…)` calls, <N> is a number literal of at least the default test timeout
 //                 (5000 ms), and `clearTimeout(<name>)` appears in the same test()/it() call (else the same file). It fires
 //                 only when the child hangs, and the test's result is the real event it waits for, so it is a hang
@@ -223,13 +225,21 @@ function args(code: string, open: number, close: number): string[] {
 	return out.filter((a, idx, all) => !(a === "" && idx === all.length - 1));
 }
 
-/** A call at `open` that is followed by `:` or `{` is a declaration (a method signature or body), not a call. */
-function isDeclaration(code: string, open: number): boolean {
+/**
+ * The call of the name at `at`, parentheses at `open`, is a declaration (a method signature or body, a function), not a
+ * call: it is followed by `:` or `{` and stands where a declaration can, after `{`, `}`, `;`, `,` or the start of the
+ * file, or after a modifier or `function`. A call followed by `:` elsewhere is a call in a conditional's true branch.
+ */
+function isDeclaration(code: string, at: number, open: number): boolean {
 	const close = closeOf(code, open);
 	if (close === -1) return false;
 	let k = close + 1;
 	while (k < code.length && /\s/.test(code[k]!)) k++;
-	return code[k] === ":" || code[k] === "{";
+	if (code[k] !== ":" && code[k] !== "{") return false;
+	let j = at - 1;
+	while (j >= 0 && /\s/.test(code[j]!)) j--;
+	if (j < 0 || "{};,".includes(code[j]!)) return true;
+	return /(?<![\w$])(?:function|async|static|public|private|protected|override|abstract|declare|get|set)\s+$/.test(code.slice(Math.max(0, at - 40), at));
 }
 
 /** True when the name at `at` is a member of something else: the previous non-space character is `.` (`ctx . setTimeout`). */
@@ -282,7 +292,7 @@ export function testCalls(code: string): Span[] {
 			}
 			break;
 		}
-		if (open === -1 || isDeclaration(code, open)) continue;
+		if (open === -1 || isDeclaration(code, m.index, open)) continue;
 		out.push({ start: m.index, end: close, open, close, kind: m[1] === "describe" ? "describe" : "test" });
 	}
 	return out;
@@ -367,11 +377,11 @@ function sites(code: string, lineStarts: number[], calls: Span[]): Site[] {
 	const out: Site[] = [];
 	for (const m of code.matchAll(/(?<![\w$])Bun\s*\.\s*sleep(?:Sync)?\s*\(/g)) if (!isMember(code, m.index)) out.push({ offset: m.index, pattern: "sleep" });
 	for (const m of code.matchAll(/(?<![\w$])(?:sleep|delay|pause|wait)\s*\(\s*\d/g)) {
-		if (!isMember(code, m.index) && !isDeclaration(code, code.indexOf("(", m.index))) out.push({ offset: m.index, pattern: "sleep" });
+		if (!isMember(code, m.index) && !isDeclaration(code, m.index, code.indexOf("(", m.index))) out.push({ offset: m.index, pattern: "sleep" });
 	}
 	for (const m of code.matchAll(/(?<![\w$])(?:globalThis\s*\.\s*)?(?:setTimeout|setInterval)\s*\(/g)) {
 		const open = code.indexOf("(", m.index);
-		if (!isMember(code, m.index) && !isDeclaration(code, open) && !isWatchdog(code, m.index, open, calls)) out.push({ offset: m.index, pattern: "timer" });
+		if (!isMember(code, m.index) && !isDeclaration(code, m.index, open) && !isWatchdog(code, m.index, open, calls)) out.push({ offset: m.index, pattern: "timer" });
 	}
 	for (const m of code.matchAll(/(?<![\w$])Promise\s*\.\s*race\s*\(/g)) {
 		if (isMember(code, m.index)) continue;
