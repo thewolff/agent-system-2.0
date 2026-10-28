@@ -374,14 +374,14 @@ describe("the open tool's intake (D2-D4)", () => {
 // ---- the gate --------------------------------------------------------------------------------------------------------
 
 describe("the queue gate (D5-D7)", () => {
-	test("Jo's launch-requested on a queued workload below the top launches it at once (order: cause request; show: unchanged first), ending its queued state", () => {
+	test("Jo's launch-requested on a queued workload below the top launches it at once (cause request in every mode, so the first launch consumes it), ending its queued state", () => {
 		for (const config of [ORDER, SHOW]) {
 			const { l, open } = world();
 			const top = open("HIGH top", { unblocks: 0.9, queued: true });
 			const low = open("low", { unblocks: 0.1, queued: true });
 			expect(reserve(l, low, config)).toEqual({ ok: false, reason: "queued: position 2" });
 			const req = request(l, low);
-			expect({ mode: config.mode, r: reserve(l, low, config) }).toEqual({ mode: config.mode, r: { ok: true, laneId: laneIdOf(low, 1), cause: config.mode === "order" ? `request ${req}` : "first" } });
+			expect({ mode: config.mode, r: reserve(l, low, config) }).toEqual({ mode: config.mode, r: { ok: true, laneId: laneIdOf(low, 1), cause: `request ${req}` } });
 			expect(isQueuedNow(l, low)).toBe(false);
 			expect(queuePosition(l, top, l.now())).toMatchObject({ position: 1, of: 1 });
 		}

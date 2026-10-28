@@ -7,20 +7,22 @@
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY, type WorkloadRow } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY, type WorkloadRow } from "../../ledger/src/index";
+import * as laneScript from "../scripts/lane";
 import orchestratorSurface from "../index";
 import { recordRepo, repoOf } from "../src/decision-log";
 import { errorLines, trainRouted } from "../src/errors";
 import { applyTrain, interpret } from "../src/input";
-import { controlEntries, firstPrompt, laneExitBody, trainFixBody } from "../src/launch";
+import { controlEntries, firstPrompt, laneExitBody, launchRowsFor, trainFixBody, verdictOf } from "../src/launch";
 import {
 	carryPairs, COMMIT_FILES_CAP, fixBindings, forkOf, forkTaskAlert, ghCompare, nextAttempt, openTrainFix, ownerDeliveries, ownerTasks, recordTrainTask, settleTasks, type TaskView,
 	TRAIN_TASK_KINDS, type TrainPush, type TrainTask, trainPushesOf,
 	trainSliceId, trainTaskWindows, twiceFailed, unsettledTasks,
 } from "../src/merge-train";
+import type { RankConfig } from "../src/rank-launch";
 import { type CompareResult, makeRunId, pushDestBody, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRuns } from "../src/test-run";
 import { INSTRUCTION_POLL_MS, LANE_TOOLS, LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX } from "../src/types";
-import { clock, ctxOf, fakePi, tempLedger, timers, tmp } from "./helpers";
+import { clock, ctxOf, fakePi, laneIdOf, tempLedger, timers, tmp } from "./helpers";
 import { carry305 } from "./train-world";
 
 const REPO = "thewolff/product";
@@ -594,6 +596,25 @@ describe("fix workloads for owner none (D8)", () => {
 		// the fix workload now owns the task: delivery launches it, and its lane is told
 		expect(ownerTasks(w.ledger, fix.id).map((x) => x.id)).toEqual([t.id]);
 		expect(ownerDeliveries(w.ledger)).toEqual([{ kind: "launch", task: expect.objectContaining({ id: t.id }), owner: fix.id }]);
+	});
+
+	test("the fix workload's first launch consumes the train's launch-requested:, so after its done-because: it awaits close and is not relaunched (wl-mvs26z1lkaw6oc)", () => {
+		const w = world();
+		const t = w.task(106, H0, "conflict", "feature/other");
+		const fix = openTrainFix(w.ledger, { task: t, repo: REPO, checkout: w.trainCheckout, view: view(106, H0, "feature/other"), stakes: "production" }).workloadId;
+		const request = controlEntries(w.ledger.entries(fix)).find((c) => c.prefix === "launch-requested")!.id;
+		const show: RankConfig = { mode: "show", parallelBudgetUsd: 0 };
+		const gone = (): laneScript.RunnerProbe => ({ omp: () => "gone", runner: () => "gone" });
+		// the train tick's launch, through the starter's own reservation in the live rank mode (show)
+		const lane1 = laneIdOf(fix, 1);
+		expect(laneScript.reserve(w.ledger, fix, MERGE_TRAIN_BY, false, show, gone, new Set())).toEqual({ ok: true, laneId: lane1, cause: `request ${request}` });
+		// the lane finds its task settled, writes its receipt and releases; its runner records the exit
+		w.ledger.recordEntry({ by: lane1, workloadId: fix, kind: "assumption", body: `done-because: merge-train task ${t.id} on PR #106 is settled failed` });
+		w.ledger.releaseWorkload(fix, { by: lane1, holder: lane1 });
+		w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: fix, kind: "assumption", body: laneExitBody(lane1, { code: 0, signal: null, outcome: "completed" }) });
+		// the tick's next pass: awaiting close, and the starter refuses a second lane
+		expect(verdictOf(launchRowsFor(w.ledger, fix, 3)!)).toEqual({ launch: false, reason: "awaiting-close" });
+		expect(laneScript.reserve(w.ledger, fix, "tick", false, show, gone, new Set())).toMatchObject({ ok: false, reason: "awaiting-close" });
 	});
 
 	test("a train-fix: binding counts only when its train-entry is a train: on that train listing the PR", () => {
