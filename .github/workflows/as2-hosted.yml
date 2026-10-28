@@ -87,9 +87,10 @@ jobs:
           REAL_GIT="$(command -v git)"
           printf '#!/bin/sh\nGIT_CONFIG_NOSYSTEM=1\nGIT_TERMINAL_PROMPT=0\nGIT_ASKPASS=/usr/bin/false\nexport GIT_CONFIG_NOSYSTEM GIT_TERMINAL_PROMPT GIT_ASKPASS\nexec %s -c credential.helper= "$@"\n' "'$REAL_GIT'" > "$W/shim/git"
           chmod 755 "$W/shim/git"
+          # Detach first: on a push to main, checkout leaves main checked out, and git refuses to move a checked-out branch.
+          git checkout --quiet --detach "$head"
           git branch -f main "$main"
           git tag -f as2-trusted-main "$main"
-          git checkout --quiet --detach "$head"
           git remote remove origin
       # One bun test call on the set, as the runner runs its full part (`bun test --parallel=<n>`), JUnit to suite.xml.
       - name: Test the ${{ matrix.set }} set (one bun test call)
