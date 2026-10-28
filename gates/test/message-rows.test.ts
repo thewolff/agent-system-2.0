@@ -140,7 +140,7 @@ describe("row 2: contract injected into every agent's system prompt", () => {
 		expect(path).toBe(resolve(import.meta.dir, "../../plugins/output-types/skills/output-types/reference.md"));
 		const text = readFileSync(path, "utf8");
 		expect(injectContract([], {})[0]).toBe(`${CONTRACT_MARKER}\n${text}`);
-		// The contract labels CLAIM and CITE only (plugins/VENDOR.md, the 37d100e pin).
+		// The contract labels CLAIM and CITE only (plugins/VENDOR.md, the c1c26c8 pin).
 		expect(text).toContain("**CLAIM**");
 		expect(text).toContain("**CITE**");
 		expect(text).not.toContain("**PMDW**");

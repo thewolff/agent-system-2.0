@@ -46,7 +46,7 @@ function sourceDigest(plugin: string): string {
 
 describe("the pin (plugins/VENDOR.md)", () => {
 	const rows = new Map(
-		[...VENDOR.matchAll(/^\| (i-have-audhd|ask-graham|paired-coding|output-types) \| ([^ |]+) \| .+ \| `([0-9a-f]{40})` \((?:origin\/main|output-types-slim)\) \| (\d{4}-\d\d-\d\d) \| `([0-9a-f]{64})` \|$/gm)].map((m) => [
+		[...VENDOR.matchAll(/^\| (i-have-audhd|ask-graham|paired-coding|output-types) \| ([^ |]+) \| .+ \| `([0-9a-f]{40})` \(origin\/main\) \| (\d{4}-\d\d-\d\d) \| `([0-9a-f]{64})` \|$/gm)].map((m) => [
 			m[1]!,
 			{ version: m[2]!, commit: m[3]!, digest: m[5]! },
 		]),
