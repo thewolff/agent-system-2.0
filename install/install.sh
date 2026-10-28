@@ -571,12 +571,31 @@ PROVIDERS="$(printf '%s' "$RENDERED" | bun -e '
 ')" || fail "profile render refused" 2
 
 # The profile's MCP config (profile/mcp.json) must be an MCP config OMP will read: a JSON object
-# whose mcpServers names the ctx server. Checked here, before anything is written.
-bun -e '
-	let doc;
-	try { doc = JSON.parse(await Bun.file(process.argv[1]).text()); } catch (e) { console.error(`install: profile: ${process.argv[1]} is not JSON: ${e.message}`); process.exit(1); }
-	if (!doc?.mcpServers?.ctx?.command) { console.error(`install: profile: ${process.argv[1]} has no mcpServers.ctx with a command`); process.exit(1); }
-' "$REPO/$MCP_ROW" || fail "profile mcp.json refused" 2
+# whose mcpServers names the ctx server. The repo owns only the servers that file names: they are
+# merged into the installed $PROFILE_DIR/mcp.json, replacing an installed server of the same name,
+# and every other installed server and top-level setting is kept (a server added by hand, say).
+# With no installed file the repo's file is the result. Both are checked and the merge is computed
+# here, before anything is written, so an installed file that is not a JSON object stops the install
+# with nothing changed. A server later dropped from profile/mcp.json stays installed until removed by hand.
+set +e
+MCP_MERGED="$(bun -e '
+	const [template, live] = process.argv.slice(1);
+	const fail = (m) => { console.error(`install: profile: ${m}`); process.exit(1); };
+	const read = async (p) => { try { return JSON.parse(await Bun.file(p).text()); } catch (e) { fail(`${p} is not JSON: ${e.message}`); } };
+	const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+	const doc = await read(template);
+	if (!doc?.mcpServers?.ctx?.command) fail(`${template} has no mcpServers.ctx with a command`);
+	let out = doc;
+	if (await Bun.file(live).exists()) {
+		const cur = await read(live);
+		if (!isObject(cur) || (cur.mcpServers !== undefined && !isObject(cur.mcpServers))) fail(`${live} is not a JSON object with an mcpServers object; fix it or move it aside, then re-run`);
+		out = { ...cur, mcpServers: { ...(cur.mcpServers ?? {}), ...doc.mcpServers } };
+	}
+	process.stdout.write(JSON.stringify(out, null, 2));
+' "$REPO/$MCP_ROW" "$PROFILE_DIR/mcp.json")"
+status=$?
+set -e
+[ "$status" -eq 0 ] || fail "profile mcp.json refused" 2
 
 # ---- 3. install the ledger ---------------------------------------------------------------------
 # ledger-init creates or verifies the ledger from the ledger-schema row. It refuses a schema file
@@ -624,14 +643,16 @@ fi
 # ---- 5. the OMP profile (profile + tier rows) ---------------------------------------------------
 # Written last, after the ledger steps, so a refused ledger leaves no half-profile behind. The
 # tier files are symbolic links into the checkout: a tier edit is live without a re-install, and
-# nothing under the profile is a second copy to drift. Re-runs rewrite the same content.
+# nothing under the profile is a second copy to drift. Re-runs rewrite the same content, except
+# mcp.json, which keeps installed servers and settings the repo does not own (step 2).
 step "profile: $PROFILE_DIR"
 mkdir -p "$PROFILE_DIR/agents"
 printf '%s' "$RENDERED" >"$PROFILE_DIR/config.yml.tmp.$$" || { rm -f "$PROFILE_DIR/config.yml.tmp.$$"; fail "could not write $PROFILE_DIR/config.yml" 1; }
 mv -f "$PROFILE_DIR/config.yml.tmp.$$" "$PROFILE_DIR/config.yml"
 cp -f "$REPO/$MODELS_ROW" "$PROFILE_DIR/models.yml"
-cp -f "$REPO/$MCP_ROW" "$PROFILE_DIR/mcp.json"
-step "profile written: config.yml (rendered from $CONFIG_ROW), models.yml (from $MODELS_ROW), mcp.json (from $MCP_ROW)"
+printf '%s\n' "$MCP_MERGED" >"$PROFILE_DIR/mcp.json.tmp.$$" || { rm -f "$PROFILE_DIR/mcp.json.tmp.$$"; fail "could not write $PROFILE_DIR/mcp.json" 1; }
+mv -f "$PROFILE_DIR/mcp.json.tmp.$$" "$PROFILE_DIR/mcp.json"
+step "profile written: config.yml (rendered from $CONFIG_ROW), models.yml (from $MODELS_ROW), mcp.json (the servers of $MCP_ROW merged into the installed file; other installed servers and settings kept)"
 while IFS= read -r tier; do
 	[ -n "$tier" ] || continue
 	ln -sfn "$REPO/$tier" "$PROFILE_DIR/agents/${tier##*/}"

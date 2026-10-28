@@ -362,7 +362,9 @@ diff "$PROFILE/config.yml" <(bun -e "process.stdout.write((await Bun.file('$CLON
 ok "as2 clean-shell adds workload ids to a list once, sets all and off, refuses a bad id, and off leaves the template"
 
 step "3e. the ctx, linear and posthog MCP servers reach the profile through its own mcp.json; its sessions are a ctx history root (M8 ctx wiring)"
-cmp -s "$CLONE/profile/mcp.json" "$PROFILE/mcp.json" || die "mcp.json under the profile differs from profile/mcp.json"
+# A fresh HOME has no installed mcp.json, so the merge's result is profile/mcp.json itself, re-serialized.
+bun -e 'const [a, b] = process.argv.slice(1).map((p) => JSON.stringify(JSON.parse(require("fs").readFileSync(p, "utf8")))); process.exit(a === b ? 0 : 1)' "$CLONE/profile/mcp.json" "$PROFILE/mcp.json" \
+	|| die "mcp.json under the profile is not profile/mcp.json"
 # Decoys where the default profile and Claude Code keep MCP servers: under the as2 profile OMP reads
 # its user MCP config from the profile's agent dir only (discovery/builtin.ts getAgentDir()), and the
 # Claude user source is opt-in (discovery/claude.ts getUserClaude), so neither may appear.
