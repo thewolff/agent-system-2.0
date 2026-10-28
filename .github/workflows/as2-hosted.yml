@@ -11,7 +11,7 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    branches: [main, scratch/as2-hosted-mainpush-sim]
   workflow_dispatch:
 permissions:
   contents: read
@@ -73,6 +73,13 @@ jobs:
           mkdir -p "$W/out"
           bun .github/as2-hosted/sets.ts "$SET" > "$W/files"
           echo "$(wc -l < "$W/files" | tr -d ' ') test file(s) in the $SET set"
+      # SCRATCH ONLY (never for main): put HEAD on a local branch named main at the pushed sha, the state a push to
+      # main leaves actions/checkout in, so the Prepare step below meets a checked-out main.
+      - name: Simulate a push-to-main checkout
+        run: |
+          set -euo pipefail
+          git checkout --quiet -B main "$(git rev-parse HEAD)"
+          echo "HEAD is $(git rev-parse --abbrev-ref HEAD) at $(git rev-parse --short HEAD)"
       # The runner's child layout (surface/src/test-run.ts childEnv), as as2-fast.yml builds it: throwaway HOME, XDG
       # dirs, bun cache, ledger path, a git shim first on PATH, a user-only gitconfig, and a detached checkout with no
       # origin that carries main's record (refs/heads/main, refs/tags/as2-trusted-main).
