@@ -10,9 +10,15 @@
 //   sleep         `Bun.sleep(` or `Bun.sleepSync(`; or a call to a function named sleep, delay, pause or wait whose first
 //                 argument starts with a digit (`await sleep(50)`).
 //   timer         a call to the global `setTimeout(` or `setInterval(` (bare, or on `globalThis.`), which covers
-//                 `await new Promise((r) => setTimeout(r, 50))`, a watchdog `setTimeout(() => p.kill(), 30_000)` and a
-//                 scheduled event. A method call on another object (`ctx.setTimeout(`) is not the global timer, and a
-//                 declaration (`setTimeout(cb, ms): unknown`, a call followed by `:` or `{`) is not a call.
+//                 `await new Promise((r) => setTimeout(r, 50))`, a polling interval and a scheduled event. A method call
+//                 on another object (`ctx.setTimeout(`) is not the global timer, and a declaration (`setTimeout(cb, ms):
+//                 unknown`, a call followed by `:` or `{`) is not a call. A failure-only process watchdog is not a finding
+//                 either: `const|let <name> = setTimeout(<cb>, <N>)` where <cb> is an arrow with no parameters whose whole
+//                 body is one or more `<x>.kill(…)` calls, <N> is a number literal of at least the default test timeout
+//                 (5000 ms), and `clearTimeout(<name>)` appears in the same test()/it() call (else the same file). It fires
+//                 only when the child hangs, and the test's result is the real event it waits for, so it is a hang
+//                 guard like a generous test timeout. A watchdog with a smaller delay, a callback that does anything else
+//                 (resolves, sets a flag the test reads), a delay that is not a literal, or no clearTimeout stays a timer.
 //   race          `Promise.race(` whose arguments name a timer: setTimeout/setInterval, Bun.sleep, a sleep-named call, or
 //                 an identifier containing timeout, deadline, timer, sleep or delay. A race of two real events is not one.
 //   clock-assert  a wall-clock read (`Date.now()`, `performance.now()`, `Bun.nanoseconds()`) on a line that holds
@@ -229,6 +235,24 @@ function isMember(code: string, at: number): boolean {
 	return code[k] === ".";
 }
 
+const KILL = String.raw`[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\.\s*kill\s*\([^()]*\)`;
+const KILL_ONLY = new RegExp(String.raw`^\(\s*\)\s*=>\s*(?:${KILL}|\{\s*(?:${KILL}\s*;?\s*)+\})$`);
+
+/** A failure-only process watchdog (see `timer` in the header) at the setTimeout call starting at `at`, open paren `open`. */
+function isWatchdog(code: string, at: number, open: number, calls: Span[]): boolean {
+	if (!/^(?:globalThis\s*\.\s*)?setTimeout\b/.test(code.slice(at, at + 32))) return false;
+	const bound = /(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*$/.exec(code.slice(Math.max(0, at - 80), at));
+	if (!bound) return false;
+	const close = closeOf(code, open);
+	if (close === -1) return false;
+	const a = args(code, open, close);
+	if (a.length !== 2 || !/^\d[\d_]*$/.test(a[1]!) || Number(a[1]!.replaceAll("_", "")) < DEFAULT_TIMEOUT_MS) return false;
+	if (!KILL_ONLY.test(a[0]!)) return false;
+	const test = calls.filter((s) => s.kind === "test" && s.start <= at && s.end >= at).sort((x, y) => y.start - x.start)[0];
+	const scope = test ? code.slice(test.start, test.end + 1) : code;
+	return new RegExp(String.raw`(?<![\w$.])clearTimeout\s*\(\s*${bound[1]!.replace(/\$/g, "\\$")}\s*\)`).test(scope);
+}
+
 export type Span = { start: number; end: number; open: number; close: number; kind: "test" | "describe" };
 
 /** Every test()/it()/describe() call, with the span of its final argument list (after `.each(…)`, `.if(…)` and the like). */
@@ -317,7 +341,8 @@ function sites(code: string, lineStarts: number[], calls: Span[]): Site[] {
 		if (!isMember(code, m.index) && !isDeclaration(code, code.indexOf("(", m.index))) out.push({ offset: m.index, pattern: "sleep" });
 	}
 	for (const m of code.matchAll(/(?<![\w$])(?:globalThis\s*\.\s*)?(?:setTimeout|setInterval)\s*\(/g)) {
-		if (!isMember(code, m.index) && !isDeclaration(code, code.indexOf("(", m.index))) out.push({ offset: m.index, pattern: "timer" });
+		const open = code.indexOf("(", m.index);
+		if (!isMember(code, m.index) && !isDeclaration(code, open) && !isWatchdog(code, m.index, open, calls)) out.push({ offset: m.index, pattern: "timer" });
 	}
 	for (const m of code.matchAll(/(?<![\w$])Promise\s*\.\s*race\s*\(/g)) {
 		if (isMember(code, m.index)) continue;

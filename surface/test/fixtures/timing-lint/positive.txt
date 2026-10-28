@@ -22,6 +22,21 @@ test("timer waits", async () => {
 	setTimeout(() => sock.end(), 50); //! timer
 });
 
+test("timers that are not failure-only watchdogs", async () => {
+	const tuned = setTimeout(() => child.kill("SIGKILL"), 2_000); //! timer
+	const ready = setTimeout(() => resolve(true), 30_000); //! timer
+	const flagged = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, 30_000); //! timer
+	const untilMs = setTimeout(() => child.kill("SIGKILL"), ms); //! timer
+	try {
+		await child.exited;
+	} finally {
+		clearTimeout(tuned);
+		clearTimeout(ready);
+		clearTimeout(flagged);
+		clearTimeout(untilMs);
+	}
+});
+
 test("deadline races", async () => {
 	const timeout = new Promise<false>((r) => setTimeout(() => r(false), 9_000)); //! timer
 	const finished = await Promise.race([ended, timeout]); //! race

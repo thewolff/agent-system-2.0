@@ -32,6 +32,24 @@ test("injected timers", () => {
 	timers.sleep(10);
 });
 
+// A failure-only process watchdog: a SIGKILL at least the default test timeout away, bound to a name and cleared in the
+// same test once the real event arrives. It fires only on a hang, so the machine's speed cannot change a passing result.
+test("a cleared watchdog", async () => {
+	const p = Bun.spawn(["omp", "--mode", "rpc"]);
+	const timer = setTimeout(() => p.kill("SIGKILL"), 30_000);
+	const guard = globalThis.setTimeout(() => {
+		p.kill("SIGKILL");
+	}, 60_000);
+	try {
+		for await (const chunk of p.stdout) if (seen(chunk)) break;
+	} finally {
+		clearTimeout(timer);
+		clearTimeout(guard);
+		p.kill("SIGKILL");
+	}
+	expect(result).toMatchObject({ status: "error" });
+});
+
 // Fixture timestamps: the wall clock plus or minus a duration places data hours away and measures nothing.
 test("fixture timestamps", () => {
 	const eightDaysAgo = new Date(Date.now() - 8 * 86_400_000).toISOString();

@@ -23,7 +23,7 @@ surface/test/channel-reply.test.ts	clock-assert	1
 surface/test/channel-reply.test.ts	timer	1
 surface/test/chaos-stub.test.ts	clock-deadline	1
 surface/test/chaos-stub.test.ts	sleep	1
-surface/test/chaos-stub.test.ts	timer	2
+surface/test/chaos-stub.test.ts	timer	1
 surface/test/ctx-index.test.ts	clock-assert	3
 surface/test/intake-queue.test.ts	clock-elapsed	1
 surface/test/lane-live-lane.test.ts	clock-assert	1
