@@ -1,0 +1,66 @@
+// Negative fixture for surface/src/timing-lint.ts (read by surface/test/timing-lint.test.ts, never run): nothing here
+// depends on the machine's speed, and the check must find nothing. Each block names the near miss it guards.
+import { expect, setDefaultTimeout, setSystemTime, test } from "bun:test";
+
+// Generous timeouts are hang guards, not races; 0 disables the timeout.
+setDefaultTimeout(60_000);
+test("a generous timeout", async () => {
+	await work();
+}, 60_000);
+test("no timeout", async () => {
+	await work();
+}, 0);
+test("a generous timeout object", () => {}, { timeout: 30_000 });
+test("two arguments only", () => {});
+
+// Timing words inside strings, templates, regexes and comments are not code: Bun.sleep(5), setTimeout(r, 5).
+test("strings are data", () => {
+	const script = "await Bun.sleep(50); setTimeout(() => {}, 10);";
+	const tpl = `while (Date.now() < end) { await Bun.sleep(25) }`;
+	const nested = `${label}: setTimeout(cb, 5) ${render(`Date.now() - t0`)}`;
+	const re = /Bun\.sleep\(|setTimeout\(/;
+	/* Promise.race([a, timeout]) */
+	expect(gate.refuses("sleep 60")).toBe(true);
+});
+
+// A method on another object is not the global timer, and a declaration is not a call.
+type Host = { isIdle(): boolean; setTimeout(callback: () => void, ms: number): unknown };
+const host = { setTimeout(cb: () => void, ms: number): number { return 0; } };
+test("injected timers", () => {
+	ctx.setTimeout(() => api.send("a"), 1);
+	clock.setTimeout(fire, 5_000);
+	timers.sleep(10);
+});
+
+// Fixture timestamps: the wall clock plus or minus a duration places data hours away and measures nothing.
+test("fixture timestamps", () => {
+	const eightDaysAgo = new Date(Date.now() - 8 * 86_400_000).toISOString();
+	const later = new Date(Date.now() + 120_000);
+	const stale = Date.now() - HOUR_MS;
+	const t = new Date(Date.now() - days * DAY_MS);
+	const shifted = new Date(Date.now() - offset).toISOString();
+	const lease = Date.now() + LEASE_MS + 1000;
+	expect(until).toBeLessThanOrEqual(Date.now() + LEASE_MS + 1000);
+	expect(newestChange(dir, Date.now() - HOUR_MS)).toBeGreaterThan(Date.now() - 9 * HOUR_MS);
+	const id = makeRunId(Date.now(), "x");
+	expect(row.at).toEqual(Date.now());
+});
+
+// A race of two real events is not a deadline race.
+test("racing two exits", async () => {
+	const first = await Promise.race([a.exited.then(() => a), b.exited.then(() => b)]);
+	expect(first).toBeDefined();
+});
+
+// A fake clock is not the wall clock.
+test("fake clock", () => {
+	setSystemTime(new Date(T0 + 5 * MIN));
+	expect(isStale(row)).toBe(true);
+});
+
+// Names that merely contain a timing word are not calls to it.
+test("lookalikes", () => {
+	const asleep = mySleep(5);
+	const waitForReady = waiting(3);
+	expect(sleepCount).toBe(0);
+});

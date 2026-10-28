@@ -97,3 +97,7 @@ Jo's seven standing rules (`.ai/decision-log/2026-10-27--0540--plumb--fault-tole
 - **Silence is a failure.** Long work has a deadline that tracks progress; a hung hand, a job that never started, or a dead watcher is an error you report.
 - **Keep the evidence.** Cleanup never deletes a log, trace or file a receipt cites.
 - **One failure never hides another.** Chain or join errors so a cleanup error keeps the original; report every failed check, not only the first.
+
+## Timing in tests
+
+A test may depend on timing only when timing is the thing under test (Jo's standing rule, `.ai/decision-log/2026-10-28--0840--plumb--tests-depend-on-timing-only-when-timing-is-under-test.md`). Otherwise it waits on the real event or condition, or calls the logic directly: no fixed sleeps, no tuned timeouts, no wall-clock races. When timing is the subject (a deadline, a stuck-detector threshold, a lease expiry), the test drives it with an injected or fake clock and is marked `// timing-under-test: <what> (fake clock: <name>)`. `surface/test/timing-lint.test.ts`, on every PR's fast check, fails on a new sleep, timer, timer race, wall-clock measurement or sub-5 s test timeout in any `*.test.ts`, and on a fix that leaves its row in `surface/test/timing-baseline.tsv`, which only shrinks. Put the same rule in every hand brief that writes or changes a test.
