@@ -24,6 +24,8 @@ The orchestrator names itself on its first run; on the author's machine it is ca
 
 ## Quickstart
 
+Before you start you need: a Mac, git, Bun, **OMP 18.8.6** (`bun install -g @oh-my-pi/pi-coding-agent@18.8.6`; the gates refuse any OMP outside 18.8, and an unpinned install gets a newer one), the GitHub CLI logged in, **a TypeSafe API credential** for the judge model (without it every dispatch fails closed), and an account with at least one of Anthropic, OpenAI Codex or Moonshot (two for cross-lab reviews). Phoenix (`uv tool install arize-phoenix==20.3.0`) is optional and on by default. [docs/getting-started.md](docs/getting-started.md) gives the install command and check for each; the installer itself checks only for Bun.
+
 ```sh
 git clone https://github.com/thewolff/agent-system-2.0.git
 cd agent-system-2.0
@@ -31,13 +33,16 @@ bash install/install.sh
 as2
 ```
 
-Then `/login` to each provider the installer names. Read [docs/getting-started.md](docs/getting-started.md) first: the prerequisites, the provider accounts and the optional test-runner setup are not checked by the installer.
+Then `/login` to each provider the installer names, inside the `as2` session. The installer writes the ledger and state under `~/.agent-system-2/`, an OMP profile under `~/.omp/profiles/agent-system-2/`, the launcher link `~/.local/bin/as2`, one link in OMP's default profile, and launchd plists; [docs/getting-started.md](docs/getting-started.md) lists each, how to check the install, and how to undo it.
+
+Having an agent do the install for you? Point it at [docs/agent-install.md](docs/agent-install.md).
 
 ## Documentation map
 
 | Document | What it covers |
 |---|---|
-| [docs/getting-started.md](docs/getting-started.md) | Prerequisites, install, the `_as2test` test-runner user, first launch, first workload |
+| [docs/getting-started.md](docs/getting-started.md) | Prerequisites with install commands, install, checking the install, plugins, the `_as2test` test-runner user, first launch, first workload, uninstall |
+| [docs/agent-install.md](docs/agent-install.md) | The install as a runbook for a coding agent: checks, expected output, stop conditions, and the steps only a person can do |
 | [docs/concepts.md](docs/concepts.md) | Workloads, slices, lanes, hands, stakes, modes, ceilings, reserved actions, review routing, the test runner, the ledger |
 | [docs/configuration.md](docs/configuration.md) | What is configurable and where; what is hardcoded today |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Known failure modes with their fixes |
