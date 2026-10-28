@@ -999,7 +999,7 @@ describe("cancel-slice (PLAN wl-mv5i3lulwwbbi8 D1)", () => {
 		expect(launchRequests(ledger, wl)).toEqual([]);
 	});
 
-	test("a paused slice: its open question withdrawn (then cancel) naming the instruction, the slice cancelled, and a relaunch asked for the parked lane", () => {
+	test("a paused slice: its open question withdrawn (then cancel) naming the instruction, the slice cancelled, and no relaunch asked for the parked lane (jo-issues#258)", () => {
 		const { ledger } = tempLedger();
 		const { wl, sl } = workloadWithSlice(ledger);
 		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-a cause first requested-by test" });
@@ -1009,15 +1009,14 @@ describe("cancel-slice (PLAN wl-mv5i3lulwwbbi8 D1)", () => {
 		expect(cmd).toEqual({ kind: "cancel-slice", workloadId: wl, sliceId: sl });
 		const receipt = apply(ledger, cmd!);
 		const [ins, withdrawal] = ledger.instructions(wl);
-		expect(receipt).toBe(
-			`cancelled slice ${sl} on ${wl} (instruction ${ins!.id}); withdrew ${q} (withdrawal ${withdrawal!.id}, then cancel); no lane holds it live, so a relaunch is requested`,
-		);
+		expect(receipt).toBe(`cancelled slice ${sl} on ${wl} (instruction ${ins!.id}); withdrew ${q} (withdrawal ${withdrawal!.id}, then cancel)`);
 		expect([withdrawal!.kind, withdrawal!.disposition, withdrawal!.question_id, withdrawal!.author, withdrawal!.channel]).toEqual(["withdrawal", "cancel", q, "jo", "surface"]);
 		expect(withdrawal!.body).toBe(`cancel-slice (instruction ${ins!.id})`);
 		expect(ledger.question(q)!.state).toBe("withdrawn");
 		expect(ledger.slice(sl)!.state).toBe("cancelled");
-		expect(launchRequests(ledger, wl)).toEqual([expect.stringMatching(new RegExp(`^launch-requested: by jo at \\S+ \\(cancel-slice ${sl}\\)$`))]);
-		expect(verdictOf(ledger.launchRows(wl, 3)!)).toMatchObject({ launch: true, cause: { kind: "request" } });
+		// cancelling is no launch authority: no request is written, so the lane-less workload stays unlaunched until Jo launches it
+		expect(launchRequests(ledger, wl)).toEqual([]);
+		expect(verdictOf(ledger.launchRows(wl, 3)!)).toMatchObject({ launch: false });
 	});
 
 	test("while a lane holds the workload live, the question is withdrawn and no relaunch is asked", () => {
