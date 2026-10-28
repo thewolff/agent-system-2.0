@@ -95,6 +95,11 @@ export interface TestRunnerConfig {
 	fastSmoke: string[];
 	/** Test files that run only in main runs on the Mac, never in the hosted Linux fast check: repo-relative path → why (§ 2, Jo's in-mvqqucfcxuevb4). */
 	macOnly: Record<string, string>;
+	/**
+	 * Test files a main run's believability leaves out (§ 2 Main state; jo-issues #243): repo-relative path → why.
+	 * They need Jo's own machine (an installed OMP) and skip every test under the `_as2test` user, so they can never count.
+	 */
+	mainSkip: Record<string, string>;
 	/** Basenames whose change takes the full suite before merge (§ 2 Exceptions: dependencies and toolchain). */
 	fullBeforeMerge: string[];
 	/** Wall minutes the hosted fast run's one `bun test` call may take (D3). */
@@ -111,7 +116,8 @@ export const FULL_BEFORE_MERGE_DEFAULT: readonly string[] = Object.freeze(["pack
 /** The plan's defaults (§ 2.2 step 4, § 2.3 steps 1 and 3; PLAN wl-mvq4edbaf13vnk D1), used for a key the block leaves out. */
 export const TEST_RUNNER_DEFAULTS: Readonly<Omit<TestRunnerConfig, "repos">> = Object.freeze({
 	fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 1440, fullWorkers: 1, stuckStop: "shadow",
-	fastSmoke: Object.freeze([]) as unknown as string[], macOnly: Object.freeze({}) as Record<string, string>, fullBeforeMerge: FULL_BEFORE_MERGE_DEFAULT as string[],
+	fastSmoke: Object.freeze([]) as unknown as string[], macOnly: Object.freeze({}) as Record<string, string>, mainSkip: Object.freeze({}) as Record<string, string>,
+	fullBeforeMerge: FULL_BEFORE_MERGE_DEFAULT as string[],
 	fastCapMin: 10, fastWaitMin: 15,
 });
 
@@ -125,7 +131,8 @@ const isRepoRelPath = (s: unknown): s is string => typeof s === "string" && s !=
  */
 export function testRunnerConfig(doc: unknown): { ok: true; config: TestRunnerConfig } | { ok: false; error: string } {
 	const fresh = (repos: TestRunnerRepo[]): TestRunnerConfig => ({
-		repos, ...TEST_RUNNER_DEFAULTS, fastSmoke: [...TEST_RUNNER_DEFAULTS.fastSmoke], macOnly: { ...TEST_RUNNER_DEFAULTS.macOnly }, fullBeforeMerge: [...TEST_RUNNER_DEFAULTS.fullBeforeMerge],
+		repos, ...TEST_RUNNER_DEFAULTS, fastSmoke: [...TEST_RUNNER_DEFAULTS.fastSmoke], macOnly: { ...TEST_RUNNER_DEFAULTS.macOnly }, mainSkip: { ...TEST_RUNNER_DEFAULTS.mainSkip },
+		fullBeforeMerge: [...TEST_RUNNER_DEFAULTS.fullBeforeMerge],
 	});
 	const block = doc !== null && typeof doc === "object" && "testRunner" in doc ? doc.testRunner : undefined;
 	if (block === undefined || block === null) return { ok: true, config: fresh([]) };
@@ -161,13 +168,14 @@ export function testRunnerConfig(doc: unknown): { ok: true; config: TestRunnerCo
 		if (bad !== undefined) return { ok: false, error: `testRunner.fastSmoke names ${JSON.stringify(bad)}, which is not a repo-relative Bun test file path` };
 		out.fastSmoke = [...new Set(v as string[])];
 	}
-	if (b.macOnly !== undefined) {
-		const v = b.macOnly;
-		if (v === null || typeof v !== "object" || Array.isArray(v)) return { ok: false, error: "testRunner.macOnly is not a mapping of path to reason" };
+	for (const key of ["macOnly", "mainSkip"] as const) {
+		const v = b[key];
+		if (v === undefined) continue;
+		if (v === null || typeof v !== "object" || Array.isArray(v)) return { ok: false, error: `testRunner.${key} is not a mapping of path to reason` };
 		for (const [path, why] of Object.entries(v)) {
-			if (!isRepoRelPath(path)) return { ok: false, error: `testRunner.macOnly key ${JSON.stringify(path)} is not a repo-relative path` };
-			if (typeof why !== "string" || why.trim() === "") return { ok: false, error: `testRunner.macOnly.${path} has no reason` };
-			out.macOnly[path] = why.trim();
+			if (!isRepoRelPath(path)) return { ok: false, error: `testRunner.${key} key ${JSON.stringify(path)} is not a repo-relative path` };
+			if (typeof why !== "string" || why.trim() === "") return { ok: false, error: `testRunner.${key}.${path} has no reason` };
+			out[key][path] = why.trim();
 		}
 	}
 	if (b.fullBeforeMerge !== undefined) {
@@ -1260,6 +1268,14 @@ export function execOf(xml: string, treeTestFiles: readonly string[]): { ok: tru
 		if (tree.has(rel)) perFile.set(rel, (perFile.get(rel) ?? 0) + 1);
 	});
 	return { ok: true, exec: { files: perFile.size, tests, treeFiles: tree.size }, perFile };
+}
+
+/**
+ * The tree test files a main run's believability counts (§ 2 Main state): the Bun test files of `treeFiles` minus
+ * `testRunner.mainSkip`. Those files skip every test under `_as2test`, so counting them would hold every main run under 95 %.
+ */
+export function countedTestFiles(treeFiles: readonly string[], mainSkip: Readonly<Record<string, string>>): string[] {
+	return treeFiles.filter((f) => isBunTestFile(f) && !Object.hasOwn(mainSkip, repoRel(f)));
 }
 
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g;

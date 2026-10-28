@@ -13,7 +13,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
-	chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync,
+	chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -24,7 +24,7 @@ import {
 } from "../src/as2test";
 import { STUCK_DEFAULTS } from "../src/stuck-detect";
 import { AS2TEST_USER, CHILD_ENV_ALLOWLIST, childEnv, partResult, WRAPPER_EXIT, type WrapperCall } from "../src/test-run";
-import { tmp } from "./helpers";
+import { tmp, unreapedTrue } from "./helpers";
 
 /**
  * This change's new exports (PLAN wl-mv718fxhwwcn40 § 2), reached loosely so the file still loads
@@ -898,6 +898,12 @@ describe("the stuck capture at the cap: bounded, safe reads, never blocks the ki
 		prepared(b, "tr-fill1", { "slow.test.ts": SLOW_TEST }, CAPS);
 		const hook = join(b.hooks, "tr-fill1.stuck-capture");
 		writeFileSync(`${hook}.pause`, "");
+		// Empty directories: cheap to plant and dear to remove recursively (about 2 s for 20,000), so a recursive removal before
+		// the kill would push the kill past the bound below. They are planted before the run, so the cap dir is filled by one
+		// rename inside the capture window: 20,000 mkdirs there raced the deadline on a loaded host (tr-0mvs6sjezd3t06f).
+		const filled = join(dir("fill-planted"), "planted");
+		mkdirSync(filled);
+		for (let i = 0; i < 20_000; i++) mkdirSync(join(filled, `planted-${i}`));
 		const t0 = Date.now();
 		const p = spawnCall(b, { sub: "full", runId: "tr-fill1" });
 		try {
@@ -910,10 +916,10 @@ describe("the stuck capture at the cap: bounded, safe reads, never blocks the ki
 			const capDirs = readdirSync(work).filter((n) => n.startsWith("full.stuck-"));
 			expect(capDirs).toHaveLength(1);
 			const capDir = join(work, capDirs[0]!);
-			// Empty directories: cheap to plant (under 1 s here) and dear to remove recursively (about 2 s for 20,000),
-			// so a recursive removal before the kill would push the kill past the bound below.
-			for (let i = 0; i < 20_000; i++) mkdirSync(join(capDir, `planted-${i}`));
-			// All planted before the deadline (and before the 3 s sample ends), so the cut meets every entry.
+			// The planted dir takes the cap dir's place while it is still empty (the 3 s sample writes its report at its end),
+			// all before the deadline, so the cut meets every entry.
+			renameSync(filled, capDir);
+			expect(readdirSync(capDir)).toHaveLength(20_000);
 			expect(Date.now()).toBeLessThan(at + captureMs);
 			expect(await until(() => !alive(pid), at + captureMs + 500 + 1_000 - Date.now())).toBe(true);
 			expect(await until(() => p.exitCode !== null, 2_400 + captureMs + 500 + 8_000 - (Date.now() - t0))).toBe(true);
@@ -1110,7 +1116,7 @@ const t = setInterval(() => {
 const spinTest = (late: boolean) => `${SPIN_HEAD}test("spins", () => {
 	writeFileSync("../spin.pid", String(process.pid));
 ${late ? `\tspawn(process.execPath, ["-e", ${JSON.stringify(LATE_HELPER)}], { detached: true, stdio: "ignore" });\n` : ""}	holdMarker("true");
-	const z = Bun.spawn(["/usr/bin/true"]);
+	const z = ${unreapedTrue()};
 	writeFileSync("../zombie.pid", String(z.pid));
 	for (;;) {}
 }, 600_000);
@@ -1408,6 +1414,8 @@ test("qualifies", async () => {
 	const child = Number(Bun.spawnSync(["/bin/sh", "-c", "/bin/sleep 4 >/dev/null 2>&1 & echo $!"]).stdout.toString().trim());
 	const end = Date.now();
 	await idle(1_500);
+	// lsof is itself a published call of this worker; the test's after-window for this phase ends before it starts.
+	const lsofAt = Date.now();
 	const lsof = Bun.spawnSync(["/usr/sbin/lsof", "-nP", "-p", String(child)]);
 	let alive = true;
 	try {
@@ -1415,7 +1423,7 @@ test("qualifies", async () => {
 	} catch {
 		alive = false;
 	}
-	log({ name: "inherit", command: null, start, end, out: { child, alive, lsofExit: lsof.exitCode, holdsMarker: lsof.stdout.toString().includes(marker), lsofHasSleep: lsof.stdout.toString().includes("sleep") } });
+	log({ name: "inherit", command: null, start, end, next: lsofAt, out: { child, alive, lsofExit: lsof.exitCode, holdsMarker: lsof.stdout.toString().includes(marker), lsofHasSleep: lsof.stdout.toString().includes("sleep") } });
 }, 240_000);
 `;
 
@@ -1434,7 +1442,7 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		expect(r.exit).toBe(0);
 		// No signature ever forms: the worker blocks in each call (never hot) and no child is left unreaped.
 		expect(keywordsOf(r.stdout)).toEqual([]);
-		const rows = readFileSync(join(work, "qual.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as { name: string; command: string | null; start: number; end: number; out: unknown; pid?: number; preloadGlobal?: unknown; wrapped?: boolean });
+		const rows = readFileSync(join(work, "qual.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as { name: string; command: string | null; start: number; end: number; next?: number; out: unknown; pid?: number; preloadGlobal?: unknown; wrapped?: boolean });
 		const byName = Object.fromEntries(rows.map((x) => [x.name, x]));
 		expect(byName.start).toMatchObject({ preloadGlobal: 1, wrapped: true });
 		const w = byName.start!.pid!;
@@ -1446,7 +1454,8 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		const ticks = (from: number, to: number) => trace.filter((t) => t.at > from && t.at < to);
 		const phases = rows.filter((x) => typeof x.start === "number");
 		for (const [i, p] of phases.entries()) {
-			const next = phases[i + 1]?.start ?? p.end + 2_000;
+			// The worker's next spawn call: the next phase's, or the one a phase names itself (inherit's lsof).
+			const next = phases[i + 1]?.start ?? p.next ?? p.end + 2_000;
 			const during = ticks(p.start + 300, p.end - 300);
 			if (p.command !== null) {
 				expect({ phase: p.name, during: during.length }).toEqual({ phase: p.name, during: expect.any(Number) });
@@ -1743,10 +1752,10 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		const GETTER_HOT_MS = 6_000;
 		const fixtures: Record<string, Record<string, string>> = {
 			"zombie-no-marker": {
-				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tBun.spawn(["/usr/bin/true"]);\n\t${LOOP}\n}, 60_000);\n`,
+				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\t${unreapedTrue()};\n\t${LOOP}\n}, 60_000);\n`,
 			},
 			"returned-call-then-zombie": {
-				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tBun.spawnSync(["/usr/bin/true"]);\n\tBun.spawn(["/usr/bin/true"]);\n\t${LOOP}\n}, 60_000);\n`,
+				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tBun.spawnSync(["/usr/bin/true"]);\n\t${unreapedTrue()};\n\t${LOOP}\n}, 60_000);\n`,
 			},
 			"immutable-marker": {
 				"c.test.ts": `import { test } from "bun:test";
@@ -1760,7 +1769,7 @@ test("c", () => {
 	if (chflags(marker, 2) !== 0) throw new Error("chflags uchg failed");
 	try {
 		Bun.spawnSync(["/usr/bin/true"]);
-		Bun.spawn(["/usr/bin/true"]);
+		${unreapedTrue()};
 		${LOOP}
 	} finally {
 		chflags(marker, 0);
@@ -1798,7 +1807,7 @@ test("c", () => {
 	writeFileSync("../w.pid", String(process.pid));
 	const argv = ["/usr/bin/true"];
 	Object.defineProperty(argv, 1, { enumerable: true, get() {
-		Bun.spawn(["/usr/bin/true"]);
+		${unreapedTrue()};
 		const end = Date.now() + ${GETTER_HOT_MS};
 		while (Date.now() < end) {}
 		return "x";
@@ -1818,7 +1827,7 @@ const r3GetterCall = ${r3GetterCall.toString()};
 test("c", async () => {
 	writeFileSync("../w.pid", String(process.pid));
 	const out = r3GetterCall("${shape}", ["/usr/bin/true"], () => {
-		Bun.spawn(["/usr/bin/true"]);
+		${unreapedTrue()};
 		const end = Date.now() + ${GETTER_HOT_MS};
 		while (Date.now() < end) {}
 	});
@@ -1838,7 +1847,7 @@ const byteGetterCall = ${byteGetterCall.toString()};
 test("c", async () => {
 	writeFileSync("../w.pid", String(process.pid));
 	const out = byteGetterCall(cp, "own", ["/usr/bin/true"], () => {
-		Bun.spawn(["/usr/bin/true"]);
+		${unreapedTrue()};
 		const end = Date.now() + ${GETTER_HOT_MS};
 		while (Date.now() < end) {}
 	});

@@ -37,8 +37,13 @@
 	<string>@REPO@</string>
 	<key>StartInterval</key>
 	<integer>300</integer>
+	<!--
+	  Standard, not Background: the tick launches merge-train lanes, and those lanes request full-suite
+	  test runs. Background makes darwin throttle the whole tree (priority 4 instead of 31, about 10x
+	  slower), so full runs hit their 20-minute cap (jo-issues 213).
+	-->
 	<key>ProcessType</key>
-	<string>Background</string>
+	<string>Standard</string>
 	<key>StandardOutPath</key>
 	<string>@HOME@/agent-scratch/agent-system-2.0/train-tick/launchd.log</string>
 	<key>StandardErrorPath</key>
