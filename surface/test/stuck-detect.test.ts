@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BIRTH_WINDOW_MS, cpuNs, liveOwned, liveProcs, MARKER_CONTENT_RE, markerContent, observe, procArgv, readMarkers, snapshot, STUCK_DEFAULTS, StuckDetector } from "../src/stuck-detect";
 import type { Marker, Observation, Proc, Signature, Snapshot, TickResult } from "../src/stuck-detect";
+import { unreapedTrue } from "./helpers";
 
 // ---- synthetic observations ----
 
@@ -347,7 +348,7 @@ ftruncateSync(fd, 0);
 const since = Date.now();
 writeSync(fd, process.env.MARKER_CONTENT ?? \`\${since}\\ttrue\\n\`);
 if (process.env.HOLD === "spin") {
-	const kid = Bun.spawn(["/usr/bin/true"], { stdout: "ignore", stderr: "ignore" });
+	const kid = ${unreapedTrue(`{ stdout: "ignore", stderr: "ignore" }`)};
 	writeSync(1, "held " + rc + " " + since + " " + kid.pid + "\\n");
 	for (;;) {}
 }
@@ -503,17 +504,36 @@ describe.skipIf(!LIVE)("live: observe and the classifier end to end", () => {
 		const { p, words } = await holder({ MARKER_DIR: dir, HOLD: "spin" }, ["test"]);
 		const since = Number(words[2]);
 		const zombie = Number(words[3]);
-		const det = new StuckDetector({ tickMs: 250, persistMs: 1_000, bunPath: process.execPath, leaderPid: p.pid });
-		const tick = () => det.tick(observe({ uid, markerDir: dir, candidatesOf: (s) => det.candidatesOf(s), argvOf: (s) => det.argvNeeded(s) }));
+		// The observation clock is fake and the spinner's CPU is real. "Hot" compares a worker's CPU delta with the wall delta
+		// between observations (HOT_SHARE), and a late tick is a gap. Both are scheduler-dependent on a real clock: under load
+		// the spinner got under 80% of a core, or this process woke late, and the signature never persisted
+		// (tr-0mvs9idg2cc61rm, null after 10 s). Here each tick advances the clock one tickMs, and only after the spinner has
+		// really burnt one tickMs of CPU since the last observation, so every tick after the first is hot. The test proves
+		// what it did before (live snapshot, markers, argv and CPU reads feed the classifier, which matches and then clears)
+		// at any CPU share. It also pins the persistence exactly: matched on the tick that reaches persistMs, not before.
+		const tickMs = 100;
+		const det = new StuckDetector({ tickMs, persistMs: 4 * tickMs, bunPath: process.execPath, leaderPid: p.pid });
+		let now = Date.now();
+		let cpuSeen = 0;
+		const tick = () => {
+			const obs = observe({ uid, markerDir: dir, candidatesOf: (s) => det.candidatesOf(s), argvOf: (s) => det.argvNeeded(s) });
+			cpuSeen = obs.cpu.get(p.pid) ?? cpuSeen;
+			now += tickMs;
+			return det.tick({ ...obs, at: now });
+		};
 		expect(activeOf(dir)).toEqual([{ pid: p.pid, since, command: "true" }]);
 		const z = await until("the child to be a zombie", () => procOf(zombie)?.zombie);
 		expect(z).toBe(true);
+		const matchedAt: number[] = [];
 		let matched: Signature | null = null;
-		const deadline = Date.now() + 10_000;
-		while (!matched && Date.now() < deadline) {
-			matched = tick().matched[0] ?? null;
-			await Bun.sleep(250); // the tick timer under test: CPU deltas need real elapsed time
+		for (let i = 1; i <= 8 && !matched; i++) {
+			if (i > 1) await until("the spinner to burn one tick of CPU", () => (cpuNs(p.pid) ?? 0) - cpuSeen >= tickMs * 1e6, 15_000);
+			const r = tick();
+			if (r.matched.length) matchedAt.push(i);
+			matched = r.matched[0] ?? null;
 		}
+		// Tick 1 has no CPU baseline; tick 2 starts the hold; tick 6 is persistMs (4 ticks) after it.
+		expect(matchedAt).toEqual([6]);
 		expect(matched).toMatchObject({ worker: { pid: p.pid }, zombie: { pid: zombie }, since, command: "true" });
 		p.kill("SIGKILL");
 		await p.exited;
@@ -521,5 +541,5 @@ describe.skipIf(!LIVE)("live: observe and the classifier end to end", () => {
 		expect(r.signatures).toEqual([]);
 		expect(r.cleared.map((c) => c.matched)).toEqual([true]);
 		expect(r.owned.map((o) => o.pid).sort()).toEqual([p.pid, zombie].sort());
-	}, 20_000);
+	}, 90_000); // a failure bound only: five 15 s waits for 0.1 s of spinner CPU each, never reached at any normal share
 });

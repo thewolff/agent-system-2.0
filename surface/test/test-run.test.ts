@@ -9,9 +9,10 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type EntryRow, type InstructionRow, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { boundPrs, holdersOf, testPrBody, testPrInstructionBody } from "../src/launch";
+import { believable } from "../src/main-state";
 import { SURFACE_BY } from "../src/types";
 import {
-	AS2TEST_EXEC, authoritativeRun, baseCompareFor, baseParts, boundBranches, buildTestRun, callStuck, callTimedOut, carriedRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
+	AS2TEST_EXEC, authoritativeRun, baseCompareFor, baseParts, boundBranches, buildTestRun, callStuck, callTimedOut, carriedRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout, countedTestFiles,
 	type ClosePr, closeFreshness, decideRun, decisionLogFault, decisionLogOnly, executedFiles, fullSuiteSlice, gitShimText, heartbeatText, isBunTestFile, isSecurityPath, KEEP_RUNS, lockHolderStale,
 	logFirstErrors, mainRed, makeRunId, mergedNeedsCover, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseJunit, parsePushDest, parseTestRequested,
 	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, type RangeCommit,
@@ -1446,34 +1447,56 @@ describe("land-first records and config (PLAN wl-mvq4edbaf13vnk D1, R7)", () => 
 		const repos = [{ origin: "o/r", command: "bun test" }];
 		const c = testRunnerConfig({ testRunner: { repos } });
 		if (!c.ok) throw new Error(c.error);
-		expect(c.config).toMatchObject({ fastSmoke: [], macOnly: {}, fastCapMin: 10, fastWaitMin: 15 });
+		expect(c.config).toMatchObject({ fastSmoke: [], macOnly: {}, mainSkip: {}, fastCapMin: 10, fastWaitMin: 15 });
 		expect(c.config.fullBeforeMerge).toEqual(["package.json", "bun.lock", "bunfig.toml", "tsconfig.json", "Cargo.toml", "Cargo.lock", "build.sh"]);
 		// the parsed config is the caller's: changing it never changes the defaults
 		c.config.fullBeforeMerge.push("x.lock");
 		c.config.macOnly["a.test.ts"] = "why";
 		expect(FULL_BEFORE_MERGE_DEFAULT).not.toContain("x.lock");
+		c.config.mainSkip["b.test.ts"] = "why";
 		expect(TEST_RUNNER_DEFAULTS.macOnly).toEqual({});
+		expect(TEST_RUNNER_DEFAULTS.mainSkip).toEqual({});
 		const set = testRunnerConfig(Bun.YAML.parse([
 			"testRunner:",
 			"  fastSmoke: [surface/test/smoke.test.ts, surface/test/smoke.test.ts]",
 			"  macOnly:",
 			"    gates/test/fence.test.ts: sandbox-exec is macOS only",
+			"  mainSkip:",
+			"    plugins/test/loader.test.ts: needs an installed OMP",
 			"  fullBeforeMerge: [package.json, go.mod]",
 			"  fastCapMin: 8",
 			"  fastWaitMin: 20",
 		].join("\n")));
 		expect(set.ok && set.config).toMatchObject({
-			fastSmoke: ["surface/test/smoke.test.ts"], macOnly: { "gates/test/fence.test.ts": "sandbox-exec is macOS only" }, fullBeforeMerge: ["package.json", "go.mod"],
+			fastSmoke: ["surface/test/smoke.test.ts"], macOnly: { "gates/test/fence.test.ts": "sandbox-exec is macOS only" }, mainSkip: { "plugins/test/loader.test.ts": "needs an installed OMP" },
+			fullBeforeMerge: ["package.json", "go.mod"],
 			fastCapMin: 8, fastWaitMin: 20,
 		});
 		for (const bad of [
 			{ fastSmoke: "surface/test/smoke.test.ts" }, { fastSmoke: ["./surface/test/smoke.test.ts"] }, { fastSmoke: ["surface/src/x.ts"] }, { fastSmoke: ["../x.test.ts"] },
 			{ macOnly: ["gates/test/fence.test.ts"] }, { macOnly: { "gates/test/fence.test.ts": "" } }, { macOnly: { "/abs/x.test.ts": "why" } },
+			{ mainSkip: ["plugins/test/loader.test.ts"] }, { mainSkip: { "plugins/test/loader.test.ts": " " } }, { mainSkip: { "../x.test.ts": "why" } },
 			{ fullBeforeMerge: "package.json" }, { fullBeforeMerge: ["sub/package.json"] }, { fullBeforeMerge: [""] },
 			{ fastCapMin: 0 }, { fastWaitMin: "15" },
 		]) {
 			const r = testRunnerConfig({ testRunner: { repos, ...bad } });
 			expect(r.ok).toBe(false);
 		}
+	});
+
+	test("countedTestFiles: the tree's Bun test files minus mainSkip, matched with or without ./; non-test files never count", () => {
+		const tree = ["a.test.ts", "b/c.test.ts", "b/d.spec.ts", "src/x.ts", "README.md"];
+		expect(countedTestFiles(tree, {})).toEqual(["a.test.ts", "b/c.test.ts", "b/d.spec.ts"]);
+		expect(countedTestFiles(tree, { "b/c.test.ts": "needs OMP", "src/x.ts": "not a test" })).toEqual(["a.test.ts", "b/d.spec.ts"]);
+		expect(countedTestFiles(["./b/c.test.ts", "./a.test.ts"], { "b/c.test.ts": "needs OMP" })).toEqual(["./a.test.ts"]);
+		// the gap the list closes (jo-issues #243): 10 of 195 files never run under _as2test, so 185/195 = 94.9 % fails; 185/185 passes
+		const xml = `<testsuites>${Array.from({ length: 195 }, (_, i) => `<testsuite name="f${i}.test.ts" file="f${i}.test.ts"><testcase name="t" file="f${i}.test.ts"${i < 10 ? "><skipped/></testcase>" : "/>"}</testsuite>`).join("")}</testsuites>`;
+		const files = Array.from({ length: 195 }, (_, i) => `f${i}.test.ts`);
+		const skip = Object.fromEntries(files.slice(0, 10).map((f) => [f, "needs OMP"]));
+		const all = execOf(xml, countedTestFiles(files, {}));
+		const counted = execOf(xml, countedTestFiles(files, skip));
+		if (!all.ok || !counted.ok) throw new Error("execOf failed");
+		expect([all.exec.files, all.exec.treeFiles, believable(all.exec, null)]).toEqual([185, 195, false]);
+		expect([counted.exec.files, counted.exec.treeFiles, believable(counted.exec, null)]).toEqual([185, 185, true]);
 	});
 });

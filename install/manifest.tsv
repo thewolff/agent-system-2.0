@@ -76,7 +76,6 @@ classifier/test/kimi-rule.test.ts	test	-
 classifier/test/lab.test.ts	test	-
 classifier/test/lane-lab.test.ts	test	-
 classifier/test/ledger-replay.test.ts	test	-
-classifier/test/openai-reviews-only.test.ts	test	-
 classifier/test/panel-dispatch.test.ts	test	-
 classifier/test/panel.test.ts	test	-
 classifier/test/review-defects.test.ts	test	-

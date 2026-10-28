@@ -329,6 +329,20 @@ testRunner:
     surface/test/scratch-remove.test.ts: Linux inode reuse affects directory identity check
     surface/test/decision-log.test.ts: Linux directory iteration ordering differs
     surface/test/test-runner.test.ts: Linux timing/signal behavior differs in test T2c
+  # Files a main run's believability leaves out (§ 2 Main state, jo-issues #243): they need Jo's own machine (an
+  # installed OMP) and skip every test under _as2test, so 185 of 195 files is the most a main run can execute and
+  # 95 % of 195 is 185.25. Each still runs in the full suite; it only stops counting toward "believable".
+  mainSkip:
+    gates/test/shell-start-session-env.test.ts: needs an installed OMP (omp on PATH)
+    gates/test/shell-start-session-hooks.test.ts: needs an installed OMP (omp on PATH)
+    gates/test/shell-start-session-named.test.ts: needs an installed OMP (omp on PATH)
+    gates/test/shell-start-session-rc.test.ts: needs an installed OMP (omp on PATH)
+    gates/test/shell-start-session-reuse.test.ts: needs an installed OMP (omp on PATH)
+    gates/test/shell-start-session-switch.test.ts: needs an installed OMP (omp on PATH)
+    gates/test/shell-start-session-work.test.ts: needs an installed OMP (omp on PATH)
+    plugins/test/by-hand-session.test.ts: needs Jo's installed OMP package under ~/.bun (plugins/test/omp-host.ts)
+    plugins/test/loader.test.ts: needs Jo's installed OMP package under ~/.bun (plugins/test/omp-host.ts)
+    surface/test/tool-mount.test.ts: needs an omp binary on PATH
   fullBeforeMerge:
     - package.json
     - bun.lock

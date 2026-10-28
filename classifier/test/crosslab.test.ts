@@ -16,7 +16,7 @@ import { LANE_RUNNER_BY, Ledger, type Stakes } from "../../ledger/src/index";
 import { createClassifierExtension, REVIEW_FINDINGS_PARAGRAPH } from "../extension";
 import { loadCalibration } from "../src/classify";
 import { reviewStopBody, stopReviewsInstructionBody } from "../src/review-stop";
-import { handSpawnBody, OPENAI_REVIEWS_ONLY_RULE } from "../src/lab";
+import { handSpawnBody } from "../src/lab";
 import { countRounds, parseReviewRound, reviewRoundsBody, reviewRoundsExtendBody, roundsInstructionBody } from "../src/rounds";
 import { tierTableFromConfig, type TierTable } from "../src/tier-table";
 import { JO_HOLDER } from "../../surface/src/launch";
@@ -2202,15 +2202,14 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 		process.env.AS2_HEADROOM_POLLS = path;
 	};
 
-	/** Shared 26-minute endpoints: OpenAI's week is mature and projects to 1.05 at the newest poll, on the lane clock `at`. */
-	const comparisonPolls = (opts: { claude?: [number, number]; sourceUsed?: number; sourceHard?: boolean; at?: number } = {}) => {
+	/** Shared 26-minute endpoints: OpenAI's week is mature and projects to 1.05 at the newest poll. */
+	const comparisonPolls = (opts: { claude?: [number, number]; sourceUsed?: number; sourceHard?: boolean } = {}) => {
 		const claude = opts.claude ?? [0.04, 0.34];
-		const at = opts.at ?? RULE_END;
-		const newest = at - MIN;
+		const newest = RULE_END - MIN;
 		const weekReset = newest + (7 * 24 * 60 - 2016) * MIN;
 		return [27, 1].map((ago, index) =>
 			JSON.stringify({
-				t: (at - ago * MIN) / 1000,
+				t: (RULE_END - ago * MIN) / 1000,
 				rows: {},
 				limits: [
 					{ provider: "openai-codex", windowId: "7d", tier: null, resetsAt: weekReset, usedFraction: index === 0 ? 0.2 : (opts.sourceUsed ?? 0.21) },
@@ -2332,12 +2331,10 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 	});
 
 	test("production review compares its configured review row, not a credentialed Claude from another tier", async () => {
-		// After Jo's OpenAI-reviews-only rule ends: before it, OpenAI week pace alone never skips a review (next test).
-		const after = OPENAI_REVIEWS_ONLY_RULE.endsAt;
-		usePolls(...comparisonPolls({ at: after }));
+		usePolls(...comparisonPolls());
 		const w = world({ stakes: "production" });
 		down(w, FABLE); // The deep review's Claude budget is Fable; the still-credentialed Opus cannot stand in.
-		const h = lane(w, { now: () => after });
+		const h = lane(w);
 		h.laneMessage(OPUS);
 		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change", "production") }, "c1");
 		expect(out?.block).toBeUndefined();
@@ -2346,21 +2343,6 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 		expect(spawn?.model).toEqual([K3]);
 		expect(spawn?.note).not.toContain("retained");
 		expect(bodies(w, "headroom-skip:").some(body => body.startsWith(`headroom-skip: ${SOL} `))).toBe(true);
-	});
-
-	test("Jo's OpenAI-reviews-only rule (in-mvro2xb4w0918v): before its end, OpenAI week pace alone does not skip the review's OpenAI leg", async () => {
-		usePolls(...comparisonPolls());
-		const w = world({ stakes: "production" });
-		down(w, FABLE);
-		const h = lane(w);
-		h.laneMessage(OPUS);
-		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change", "production") }, "c1");
-		expect(out?.block).toBeUndefined();
-		expect(out?.input?.tasks.map(item => item.name)).toEqual(["sl-x--openai", "sl-x--kimi"]);
-		const spawn = await h.spawn(out!.input.tasks[0]!.agent, "sl-x--openai");
-		expect(spawn?.model).toEqual([SOL]);
-		expect(spawn?.note).toContain("OpenAI week pace does not hold back a review until 2026-11-02T18:03Z (Jo, in-mvro2xb4w0918v)");
-		expect(bodies(w, "headroom-skip:").some(body => body.startsWith(`headroom-skip: ${SOL} `))).toBe(false);
 	});
 
 	test("panel planning retains its OpenAI leg without substituting another lab at the pinned spawn", async () => {

@@ -1,13 +1,10 @@
 // The quota guard at the real RPC runner spawn: named and unnamed sources may retain a mature week-only
 // overrun against the installed strong row's faster-burning counterfactual budget, without changing the model.
 // Otherwise named models refuse before omp; unnamed models move only to base-in-quota strong-row entries,
-// confirmed by get_state before the first prompt. These process tests run outside the fence. Jo's dated
-// OpenAI-reviews-only rule (classifier/src/lab.ts OPENAI_REVIEWS_ONLY_RULE) is read on a pinned clock: its end, so
-// the guard decides as it will after the rule, except in the describe that pins a time before it.
+// confirmed by get_state before the first prompt. These process tests run outside the fence.
 import { afterAll, describe, expect, test } from "bun:test";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { OPENAI_REVIEWS_ONLY_RULE } from "../../classifier/src/lab";
 import { loadTierTable } from "../../classifier/src/tier-table";
 import { LANE_RUNNER_BY, Ledger } from "../../ledger/src/index";
 import { recordRepo } from "../src/decision-log";
@@ -50,13 +47,9 @@ function installTierTable(r: LaneRoot, strong?: readonly string[]): void {
 	}));
 }
 
-/** The runner's clock for Jo's OpenAI-reviews-only rule (lane.ts `AGENT_SYSTEM_LANE_RULE_CLOCK_MS`). */
-const RULE_CLOCK = "AGENT_SYSTEM_LANE_RULE_CLOCK_MS";
-
-const makeRoot = (used: Record<string, number>, ruleClock = OPENAI_REVIEWS_ONLY_RULE.endsAt): LaneRoot => {
+const makeRoot = (used: Record<string, number>): LaneRoot => {
 	const r = laneRoot();
 	roots.push(r);
-	r.env[RULE_CLOCK] = String(ruleClock);
 	writePolls(r, used);
 	installTierTable(r);
 	return r;
@@ -342,55 +335,5 @@ describe("mature week-only runner admission against configured budget alternativ
 		expect(order.indexOf("lane-headroom")).toBeLessThan(order.indexOf("lane-ready"));
 		expect(snap.control.some((c) => c.prefix === "lane-model")).toBe(false);
 		expect(snap.deaths).toEqual([]);
-	}, 60_000);
-});
-
-describe("Jo's OpenAI-reviews-only rule (in-mvro2xb4w0918v): before 2026-11-02T18:03Z an unnamed lane never runs on OpenAI", () => {
-	const BEFORE = OPENAI_REVIEWS_ONLY_RULE.endsAt - 1;
-	const LANE_OUT = "OpenAI is for reviews only until 2026-11-02T18:03Z (Jo, in-mvro2xb4w0918v)";
-
-	test("an unnamed lane resumed on OpenAI is moved to Anthropic before its first prompt, even when budget comparison would retain it", async () => {
-		const r = makeRoot({}, BEFORE);
-		writeComparisonPolls(r, 0.18);
-		const wl = openWorkload(r, null);
-		launch(r, wl, { steps: DONE, stateModel: { provider: "openai-codex", id: "gpt-6.1-sol" } });
-		const lane1 = laneIdOf(wl, 1);
-		await endOf(r, wl, lane1);
-		const snap = laneSnapshot(r, wl);
-		expect(laneExit(snap.control, lane1)).toMatchObject({ outcome: "completed" });
-		expect(commandsOf(r, 1).slice(0, 4)).toEqual(["get_state", `set_model ${A}`, "get_state", "prompt"]);
-		expect(laneStarted(snap.control, lane1)).toMatchObject({ model: null, ranModel: A });
-		expect(snap.control.find((c) => c.prefix === "lane-headroom")?.rest).toBe(`${SOL} -> ${A} (${LANE_OUT})`);
-		expect(runnerLog(r, wl)).not.toContain(`retained ${SOL}`);
-		expect(snap.deaths).toEqual([]);
-	}, 60_000);
-
-	test("an unnamed lane off out Anthropic never moves onto in-quota OpenAI: never ready at headroom", async () => {
-		const r = makeRoot({ anthropic: 0.85 }, BEFORE);
-		const wl = openWorkload(r, null);
-		launch(r, wl, { steps: DONE, stateModel: { provider: "anthropic", id: "claude-opus-5-5" } });
-		const lane1 = laneIdOf(wl, 1);
-		await endOf(r, wl, lane1);
-		const snap = laneSnapshot(r, wl);
-		expect(laneExit(snap.control, lane1)).toMatchObject({ outcome: "never-ready" });
-		expect(commandsOf(r, 1)).not.toContain("prompt");
-		expect(commandsOf(r, 1).some((c) => c.startsWith("set_model"))).toBe(false);
-		const failed = snap.control.find((c) => c.prefix === "launch-failed")?.rest;
-		expect(failed).toStartWith(`headroom: ${A} is out (${REASON}); every strong-row entry is out: `);
-		expect(failed).toContain(`${SOL} (${LANE_OUT})`);
-	}, 60_000);
-
-	test("a lane Jo named on OpenAI is left on it", async () => {
-		const r = makeRoot({ anthropic: 0.1 }, BEFORE);
-		const wl = openWorkload(r, SOL);
-		launch(r, wl, { steps: DONE, stateModel: { provider: "openai-codex", id: "gpt-6.1-sol" } });
-		const lane1 = laneIdOf(wl, 1);
-		await endOf(r, wl, lane1);
-		const snap = laneSnapshot(r, wl);
-		expect(laneExit(snap.control, lane1)).toMatchObject({ outcome: "completed" });
-		expect(laneStarted(snap.control, lane1)).toMatchObject({ model: SOL, ranModel: SOL });
-		expect(commandsOf(r, 1).slice(0, 2)).toEqual(["get_state", "prompt"]);
-		expect(commandsOf(r, 1).some((c) => c.startsWith("set_model"))).toBe(false);
-		expect(snap.control.some((c) => c.prefix === "lane-headroom" || c.prefix === "launch-failed")).toBe(false);
 	}, 60_000);
 });
