@@ -22,7 +22,7 @@ import {
 	planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody,
 } from "../src/launch";
 import {
-	actionable, type ControlRoot, fixBindings, landFirstNoticeBody, landFirstRows, latestTrainReconciled, mainRedNotices, protectionEpisodes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs,
+	actionable, type ControlRoot, fixBindings, openTrainFix, landFirstNoticeBody, landFirstRows, latestTrainReconciled, mainRedNotices, protectionEpisodes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs,
 	trainAlertBody, trainAlertMarker, trainFullSliceId, trainHeadWokenBody, trainHoldBody, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody, type WakeDeferral,
 } from "../src/merge-train";
 import { trainMergedNoticeBody } from "../src/notice";
@@ -30,7 +30,7 @@ import { fastPlanBody, makeRunId, testRequestedBody, type TestRun, testRunBody, 
 import { ESCALATION_BY, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { releasedOpenBody } from "../src/turn-end";
 import {
-	boardWorld, carry305, COMMIT_FILES_CAP, COMMIT_FILES_PER_PAGE, DECISION_LOG_FILE, type FakeDiffEntry, type FakeIssue, H0, H1, H2, JO, OWNER_LANE, protectedRules, REPO, TRAIN_LANE,
+	boardWorld, carry305, checkout, COMMIT_FILES_CAP, COMMIT_FILES_PER_PAGE, DECISION_LOG_FILE, type FakeDiffEntry, type FakeIssue, H0, H1, H2, JO, OWNER_LANE, protectedRules, REPO, TRAIN_LANE,
 	world,
 } from "./train-world";
 import { tmp } from "./helpers";
@@ -157,6 +157,40 @@ describe("ended full-suite slices: the tick cancels them as merge-train (#378's 
 		w.ledger.completeSlice(disposition, { by: TRAIN_LANE, artifact: "skipped: MERGED (gh pr view 106 → MERGED)" });
 		w.run();
 		expect(w.ledger.slice(full)).toMatchObject({ state: "cancelled", changed_by: MERGE_TRAIN_BY });
+	});
+
+	test("a reused fix workload's red slice outlives a skipped PR's old train while the new train it rides has unsettled work; it is cancelled once that work settles (PR #391 review B1)", () => {
+		const w = world();
+		w.task(106); // owner none: the tick opens a fix workload bound to #106 on train A
+		w.run();
+		const fix = fixBindings(w.ledger).find((f) => f.pr === 106)!.workloadId;
+		w.c.plusHours(0.05);
+		// the fix workload's run on its full-suite slice comes back red: nothing waits on the slice
+		const red = w.ledger.addSlice({ by: TEST_RUNNER_BY, workloadId: fix, id: `sl-full-${fix.slice(3)}-1`, task: "full suite outside the fence at PR #106", doneCondition: "green", inputs: `PR #106 at ${H0}` });
+		runOn(w.ledger, w.c.now(), fix, red, 106, H0, "red");
+		w.c.plusHours(0.05);
+		// Jo skips #106 on train A, which stays open on #101; a new train B carries #106, and its task is the fix workload's too
+		const disposition = w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: trainSliceId(w.train, 106), task: "PR #106", doneCondition: "terminal", inputs: "#106" });
+		const q = w.ledger.raiseQuestion({ by: TRAIN_LANE, workloadId: w.train, sliceId: disposition, body: "#106 production", options: ["merged", "skip", "stop"] });
+		w.ledger.answerQuestion(q, { ...JO, answer: "skip" });
+		const cmd = interpret(w.ledger, "train 106");
+		if (cmd?.kind !== "train") throw new Error("not a train");
+		const trainBCheckout = checkout();
+		const trainB = applyTrain(w.ledger, cmd, trainBCheckout).workloadId;
+		expect(w.ledger.claimWorkload(trainB, { by: LANE_STARTER_BY, holder: "lane-train-2", leaseMs: 600_000 }).won).toBe(true);
+		const p = w.g.prs.get(106)!;
+		const view = { number: 106, headRefName: p.branch, headRefOid: p.head, isCrossRepository: false, headRepository: { name: "product" }, headRepositoryOwner: { login: "thewolff" } };
+		const onB = recordTrainTask(w.ledger, { train: trainB, by: "lane-train-2", pr: 106, kind: "red", detail: `run tr-y red at ${p.head}\nsrc/x.test.ts > case 1: boom`, view, trainRepo: REPO });
+		if (!onB.ok) throw new Error(onB.reason);
+		expect(openTrainFix(w.ledger, { task: onB.task, repo: REPO, checkout: trainBCheckout, view, stakes: "normal" })).toEqual({ workloadId: fix, opened: false });
+		// train A disposes of #106 (its skip cancels the disposition); B's task on the reused workload is unsettled
+		w.ledger.cancelSlice(disposition, { by: TRAIN_LANE });
+		w.run();
+		expect(w.ledger.slice(red)!.state).toBe("open");
+		w.c.plusHours(2.1); // no push for 2 h: B's task settles failed, and the fix workload's train work has ended on every train
+		w.run();
+		expect(w.ledger.entries(trainB).some((e) => e.body.startsWith(`train-task-settled: ${onB.task.id} failed`))).toBe(true);
+		expect(w.ledger.slice(red)).toMatchObject({ state: "cancelled", changed_by: MERGE_TRAIN_BY });
 	});
 });
 
