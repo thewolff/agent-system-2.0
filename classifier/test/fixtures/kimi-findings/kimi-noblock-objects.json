@@ -1,0 +1,65 @@
+{
+  "verdict": "revise",
+  "findings": [
+    {
+      "severity": "blocking",
+      "kind": "security",
+      "title": "B1: row 19's no-fetch diff base (local refs/remotes/*) is forgeable by allowed commands — demonstrated: `git fetch . +HEAD:refs/remotes/origin/<b>` empties the scan range; must fetch/ls-remote or reuse row 8's post-fetch refs; item-83 probe"
+    },
+    {
+      "severity": "major",
+      "kind": "security",
+      "title": "M1: LFS pointer blobs defeat S2–S5 content scans (cat-file reads the pointer); treat pointers in data-file scope as un-scannable like S6; probe P8"
+    },
+    {
+      "severity": "major",
+      "kind": "security",
+      "title": "M2: root-commit guarded-repo detection fails open in shallow clones (demonstrated: boundary commit poses as root) and partial clones break cat-file scans; needs shallow-aware behavior that doesn't refuse product repos"
+    },
+    {
+      "severity": "major",
+      "kind": "security",
+      "title": "M3: gh api mutations without -X (default-POST git-data endpoints) escape every row (r06:92 needs explicit -X); plan must name the boundary, tighten row 6 or record gap + probe"
+    },
+    {
+      "severity": "minor",
+      "kind": "design",
+      "title": "m1: env-name split AS2_PRIVATE_DATA (install) vs AGENT_SYSTEM_PRIVATE_DATA (runtime) undocumented; runtime use of the former silently does nothing"
+    },
+    {
+      "severity": "minor",
+      "kind": "tests",
+      "title": "m2: R1 harness must not push from a protected current branch, else row 6's barePushOfProtected (r06:474-482) fires instead of row 8 passing"
+    },
+    {
+      "severity": "minor",
+      "kind": "design",
+      "title": "m3: pin C's verification site unspecified after the close rewrite (pinnedCommitFault removed; pin now unverified or dead)"
+    },
+    {
+      "severity": "minor",
+      "kind": "docs",
+      "title": "m4: CODEMAP's 104-file decision-log count stale; measured 106 files / 2,755,069 B at 492c3cc — INVENTORY and plan are correct"
+    },
+    {
+      "severity": "minor",
+      "kind": "design",
+      "title": "m5: refusal text's <owner/repo> must not be parsed from the attacker-controlled push URL; source it from config or drop it"
+    },
+    {
+      "severity": "minor",
+      "kind": "docs",
+      "title": "m6: newdle plugin recent-activity.sh SessionStart hook reads in-repo .ai/decision-log; missing from § 7's re-point ask"
+    },
+    {
+      "severity": "minor",
+      "kind": "tests",
+      "title": "m7: S5 (verbatim Jo instruction ≥40 chars) false-positive count on synthetic fixtures unmeasured, deferred to build slice; cheap to measure now"
+    },
+    {
+      "severity": "minor",
+      "kind": "design",
+      "title": "m8: ledger-replay script's ok:false behavior (esp. --refreeze writes) unspecified; should print resolver reason and exit non-zero"
+    }
+  ]
+}

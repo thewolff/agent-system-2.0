@@ -1,0 +1,7 @@
+{
+  "between": "toolCall yield",
+  "parts": [
+    "**CLAIM**\nImplementation matches PLAN rev 4 and both Jo amendments across every named risk, with credible red-before and real-session evidence; the round is **revise** for F1 — a guaranteed `undefined` reason line in the new machine display for a designed-for ledger state, invisible to every existing gate — with F2–F5 as minor follow-ups for the same fix slice.\n\n```review-findings\n{\"findings\":[{\"severity\":\"blocking\",\"kind\":\"correctness\",\"title\":\"KIND_REASON omits the scratch ErrorKind: scratch needs-you lines render \\\"undefined: wl-…\\\" in the needs-Jo list\"},{\"severity\":\"minor\",\"kind\":\"tests\",\"title\":\"triage kinds test hardcodes 8 of 9 ErrorKinds and pins KIND_REASON against itself, enshrining the omission\"},{\"severity\":\"minor\",\"kind\":\"correctness\",\"title\":\"triage cache writes verdicts under the answering model but looks up under primaryModel, so fallback verdicts are never reused\"},{\"severity\":\"minor\",\"kind\":\"other\",\"title\":\"typed=true hand-off to PR #68's apply guard at the new ok/batch call sites is carried only by plan text for the pre-push merge\"},{\"severity\":\"minor\",\"kind\":\"docs\",\"title\":\"MIGRATION.md diff is a stray blank line; the item lives in migration/items/one-message-answers.md\"}]}\n",
+    "```"
+  ]
+}

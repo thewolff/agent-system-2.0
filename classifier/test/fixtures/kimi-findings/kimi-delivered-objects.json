@@ -1,0 +1,58 @@
+{
+  "verdict": "approve-with-changes",
+  "verdictLine": "approve-with-changes: both blocking items are bounded plan-text/derivation fixes, not redesign; requirements, risk honesty, and slice cut otherwise hold against the code",
+  "reviewFindingsJson": {
+    "findings": [
+      {
+        "severity": "blocking",
+        "kind": "security",
+        "title": "Forge surface unacknowledged: eval + Ledger module lets a lane write a fake test-run: green and complete the slice (recordEntry trusts by; validWriter accepts test-runner); §3/§4 must state and accept or close it"
+      },
+      {
+        "severity": "blocking",
+        "kind": "correctness",
+        "title": "Runs-root derivation unspecified: fixed ~/.agent-system-2/test-runs root is unwritable from S2's in-fence tests and self-locks the S8 bootstrap's nested suite run"
+      },
+      {
+        "severity": "major",
+        "kind": "design",
+        "title": "§4.5 say-so refusal only applies after test-requested: exists; a lane that never calls lane_full_test can hand-close its full-suite slice"
+      },
+      {
+        "severity": "major",
+        "kind": "design",
+        "title": "§3 residual table misses run-dir self-reach: test code can poison ../lock (live pid) and stall all later runs to the 60-min error"
+      },
+      {
+        "severity": "minor",
+        "kind": "correctness",
+        "title": "§1 overclaims: nested sandbox-exec exits 71 only when the inner profile is looser (fence.ts:273-276)"
+      },
+      {
+        "severity": "minor",
+        "kind": "correctness",
+        "title": "Starter step 3 checks runner-pid liveness but the test-requested: entry records no pid; storage location unstated"
+      },
+      {
+        "severity": "minor",
+        "kind": "docs",
+        "title": "Brief and plan cite MIGRATION.md item 44, which does not exist (highest is 43)"
+      },
+      {
+        "severity": "minor",
+        "kind": "correctness",
+        "title": "Settle ordering unstated: write test-run: entry before the completeSlice attempt and tolerate the paused-slice schema abort"
+      },
+      {
+        "severity": "minor",
+        "kind": "docs",
+        "title": "Receipt imprecision: fence.ts:44-46 cited for the deny set (text at :1-8); lane.ts:241-244 cited for unref() (at :245)"
+      },
+      {
+        "severity": "minor",
+        "kind": "design",
+        "title": "20/10-min wall caps are bare constants; make them env-tunable so suite growth does not turn green into error: timeout"
+      }
+    ]
+  }
+}

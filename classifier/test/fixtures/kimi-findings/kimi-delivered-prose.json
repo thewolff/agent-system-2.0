@@ -1,0 +1,6 @@
+{
+  "verdict": "revise — one blocking acceptance conflict",
+  "blocking": "Case 5 (`trap 'git push origin main' EXIT`) is already REFUSED on merged origin/main f879e53 (post-PR-#50): probed via checkReserved on a git-archive of main → 'a trap action the gate does not model' (r06-reserved.ts trapActionUnmodeled/TRAP_HEADS, lines 805-908, wired at 960; regression tests r06-alias.test.ts:87-113). The plan's six-case red-before on the post-merge baseline cannot go red for case 5; respecify as five red-before cases plus case 5 as a regression control.",
+  "major": "Plan's trap-action design section predates/conflicts with merged #50 t3 allowlist semantics (empty-env expansion by design); preserving-both-contracts covers only text conflicts, not this semantic overlap.",
+  "minor": "Plan implies all six live and cites probe base e1d7291 vs lane record 0b7ec3a."
+}

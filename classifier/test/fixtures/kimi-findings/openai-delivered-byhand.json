@@ -1,0 +1,4 @@
+{
+  "verdict": "approve",
+  "report": "**GUESS(inference)**\nChoose **approve** over revise: startup now has one dispatch owner, registration is guarded and supported by the installed runtime, and explicit agent identity closes the headerless-child gap. Implementation that fails the specified invocation-count, activation, ordering or inherited-child tests would change this ruling.\n\n```review-findings\n{\"findings\":[]}\n```\n\n---\nP-11 row 3 receipt check (informational, not a refusal; SPEC-2.0.md § B15 item 5):"
+}

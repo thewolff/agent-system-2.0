@@ -1,0 +1,7 @@
+{
+  "between": "toolCall yield",
+  "parts": [
+    "**CLAIM**\nRevise: the plan is sound in structure but its central acceptance proof is broken by PR #50 — five of the six bypasses remain live and exploitable on merged main (probed ALLOW), while case 5 and every trap extension are already refused, so the six-case red-before as written cannot go red.\n\n```review-findings\n{\"findings\":[\n{\"severity\":\"blocking\",\"kind\":\"tests\",\"title\":\"Case 5 trap bypass already REFUSED on post-#50 main: the mandatory six-case red-before is unsatisfiable on the plan's own baseline (probed: cases 1-4 and 6 ALLOW, case 5 REFUSED)\"},\n{\"severity\":\"major\",\"kind\":\"design\",\"title\":\"Trap-action design predates merged PR #50 allowlist model (TRAP_HEADS, empty-env expansion); plan neither rescopes case 5/trap extensions to regression controls nor reconciles with the t3 contract\"},\n{\"severity\":\"minor\",\"kind\":\"docs\",\"title\":\"Plan still implies all six bypasses are live and cites probe base e1d7291 against the lane record's 0b7ec3a, without noting #50 closed the trap class\"}\n]}\n",
+    "```"
+  ]
+}

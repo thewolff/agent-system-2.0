@@ -59,6 +59,18 @@ classifier/test/fixtures/classifier-sample-2026-10-20.jsonl	test	-
 classifier/test/fixtures/classifier-sample-30.jsonl	test	-
 classifier/test/fixtures/kind-question-2026-09-23.json	test	-
 classifier/test/fixtures/kind-question-2026-09-28.json	test	-
+classifier/test/fixtures/kimi-findings/kimi-delivered-bad-escape.json	test	-
+classifier/test/fixtures/kimi-findings/kimi-delivered-objects.json	test	-
+classifier/test/fixtures/kimi-findings/kimi-delivered-pointer.json	test	-
+classifier/test/fixtures/kimi-findings/kimi-delivered-prose.json	test	-
+classifier/test/fixtures/kimi-findings/kimi-noblock-objects.json	test	-
+classifier/test/fixtures/kimi-findings/kimi-split-row6.json	test	-
+classifier/test/fixtures/kimi-findings/kimi-split-sendline.json	test	-
+classifier/test/fixtures/kimi-findings/kimi-transcript-bad-kind.md	test	-
+classifier/test/fixtures/kimi-findings/kimi-transcript-empty.md	test	-
+classifier/test/fixtures/kimi-findings/kimi-transcript-runner.md	test	-
+classifier/test/fixtures/kimi-findings/openai-delivered-byhand.json	test	-
+classifier/test/fixtures/kimi-findings/openai-delivered-snapshot-settle.json	test	-
 classifier/test/fixtures/kind-question-2026-10-20.json	test	-
 classifier/test/fixtures/ledger-replay/backup-2026-10-01T16-05-55.407Z.db.gz	test	-
 classifier/test/fixtures/ledger-replay/backup-2026-10-02T16-24-10.088Z.db.gz	test	-
@@ -72,6 +84,7 @@ classifier/test/fixtures/ledger-replay/manifest.json	test	-
 classifier/test/hand-session.test.ts	test	-
 classifier/test/headroom.test.ts	test	-
 classifier/test/helpers.ts	test	-
+classifier/test/kimi-findings.test.ts	test	-
 classifier/test/kimi-rule.test.ts	test	-
 classifier/test/lab.test.ts	test	-
 classifier/test/lane-lab.test.ts	test	-

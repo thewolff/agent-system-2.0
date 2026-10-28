@@ -1,0 +1,3 @@
+{
+  "report": "**GUESS(inference)**\nBottom line: fix the proc replay bypass and prove the repair closes the whole round before approving implementation.\n\n```review-findings\n{\"findings\":[{\"severity\":\"blocking\",\"kind\":\"security\",\"title\":\"Consumed proc read can replay a refused hand's raw output without snapshot resultText\"},{\"severity\":\"major\",\"kind\":\"correctness\",\"title\":\"Repair does not prove all other review-group members are settled before claiming round 2 is available\"},{\"severity\":\"minor\",\"kind\":\"tests\",\"title\":\"T1 expects round 2 after a passing round has ended its loop\"}]}\n```\n\n---\nP-11 row 3 receipt check (informational, not a refusal; SPEC-2.0.md § B15 item 5):"
+}
