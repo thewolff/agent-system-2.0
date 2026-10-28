@@ -87,7 +87,9 @@ jobs:
       - name: Test the ${{ matrix.set }} set (one bun test call)
         timeout-minutes: 20
         run: |
+          # Actions runs this as `bash -e`; `set +e` lets a failing bun call reach the summary and tail below.
           set -uo pipefail
+          set +e
           if [ "$RUNNER_OS" = Linux ]; then n="$(nproc)"; else n="$(sysctl -n hw.ncpu)"; fi
           start=$(date +%s)
           env -i PATH="$W/shim:$PATH" LANG="${LANG:-C.UTF-8}" USER="$USER" LOGNAME="${LOGNAME:-$USER}" SHELL="${SHELL:-/bin/bash}" TERM="${TERM:-dumb}" \
