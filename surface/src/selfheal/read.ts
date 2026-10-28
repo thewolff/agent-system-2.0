@@ -10,9 +10,10 @@
  *   with lines up to 465,389 chars, and a whole-corpus reader was failure 6 itself.
  * - Jetsam reports are small (≤ 2 MB) and read whole; a directory or report that cannot be read
  *   is returned as unreadable, never as zero events.
- * - The profile's OMP logs (`<home>/.omp/profiles/<profile>/logs/omp.*.log`, one JSON object a
- *   line) are streamed like session files, mtime at or after the window start, prefiltered on
- *   `MCP tool load failed`. A profile with no logs directory yet has had no session, so no failure.
+ * - The profile's OMP logs (`<home>/.omp/profiles/<profile>/logs/omp.*.log` and their size rotations
+ *   `.log.1`, `.log.2`, …; one JSON object a line) are streamed like session files, mtime at or after
+ *   the window start, prefiltered on `MCP tool load failed`. A profile with no logs directory yet has
+ *   had no session, so no failure; a directory or log that cannot be read is returned as unreadable.
  */
 import { accessSync, constants, createReadStream, type Dirent, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
@@ -58,7 +59,7 @@ export async function readDetectorInputs(opts: ReadOptions): Promise<DetectorInp
 		testRuns: readTestRuns(ledger, to),
 		...readLaneStartsAndModels(ledger, to),
 		jetsam: readJetsam(opts.jetsamDir ?? JETSAM_DIR, fromMs),
-		mcpLoad: { profile: opts.profile, failures: await readMcpLoadFailures(join(opts.home, ".omp", "profiles", opts.profile, "logs"), fromMs, toMs) },
+		mcpLoad: { profile: opts.profile, ...(await readMcpLoadFailures(join(opts.home, ".omp", "profiles", opts.profile, "logs"), fromMs, toMs)) },
 	};
 }
 
@@ -348,22 +349,33 @@ function jetsamTime(s: string): string | null {
 // ---- OMP logs ------------------------------------------------------------------------------------
 
 const MCP_LOAD_FAILED = "MCP tool load failed";
-const OMP_LOG_NAME = /^omp\..*\.log$/;
+/** OMP's process logs, `omp.<day>.<pid>.log`, and their size rotations `.log.1`, `.log.2`, … (pi-utils logger/rotating-file.ts). */
+const OMP_LOG_NAME = /^omp\..*\.log(?:\.\d+)?$/;
 
-/** Every `MCP tool load failed` line in `[sinceMs, toMs)` from the `omp.*.log` files in `dir` (name order) whose mtime is at or after `sinceMs`. */
-export async function readMcpLoadFailures(dir: string, sinceMs: number, toMs: number): Promise<McpLoadFailure[]> {
+const isMissing = (e: unknown): boolean => e instanceof Error && "code" in e && e.code === "ENOENT";
+
+/**
+ * Every `MCP tool load failed` line in `[sinceMs, toMs)` from the OMP logs in `dir` (name order), rotations
+ * included, whose mtime is at or after `sinceMs`. A missing `dir` (no session has run under the profile) or a
+ * log that vanished after the listing holds none; a `dir` or a log that cannot be read is listed in
+ * `unreadable`, never read as zero failures.
+ */
+export async function readMcpLoadFailures(dir: string, sinceMs: number, toMs: number): Promise<{ failures: McpLoadFailure[]; unreadable: string[] }> {
 	let names: string[];
 	try {
 		names = readdirSync(dir).filter((n) => OMP_LOG_NAME.test(n)).sort();
-	} catch {
-		return [];
+	} catch (e) {
+		return { failures: [], unreadable: isMissing(e) ? [] : [dir] };
 	}
-	const out: McpLoadFailure[] = [];
+	const failures: McpLoadFailure[] = [];
+	const unreadable: string[] = [];
 	for (const name of names) {
 		const path = join(dir, name);
 		try {
 			if (statSync(path).mtimeMs < sinceMs) continue;
-		} catch {
+			accessSync(path, constants.R_OK);
+		} catch (e) {
+			if (!isMissing(e)) unreadable.push(path);
 			continue;
 		}
 		await eachLine(path, (text, line) => {
@@ -372,8 +384,8 @@ export async function readMcpLoadFailures(dir: string, sinceMs: number, toMs: nu
 			if (o === null || o.message !== MCP_LOAD_FAILED || typeof o.timestamp !== "string" || typeof o.path !== "string") return;
 			const t = Date.parse(o.timestamp);
 			if (!Number.isFinite(t) || t < sinceMs || t >= toMs) return;
-			out.push({ path, line, at: new Date(t).toISOString(), server: o.path.replace(/^mcp:/, ""), error: typeof o.error === "string" ? o.error : String(o.error) });
+			failures.push({ path, line, at: new Date(t).toISOString(), server: o.path.replace(/^mcp:/, ""), error: typeof o.error === "string" ? o.error : String(o.error) });
 		});
 	}
-	return out;
+	return { failures, unreadable };
 }

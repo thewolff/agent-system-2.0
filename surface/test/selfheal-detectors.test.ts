@@ -7,7 +7,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
-import { handLab, JETSAM_UNREADABLE, runDetectors } from "../src/selfheal/detectors";
+import { handLab, JETSAM_UNREADABLE, MCP_LOAD_UNREADABLE, runDetectors } from "../src/selfheal/detectors";
 import { readDetectorInputs } from "../src/selfheal/read";
 import type { DetectorId, Finding, Window } from "../src/selfheal/types";
 import { clock, tempLedger, tmp } from "./helpers";
@@ -375,33 +375,67 @@ const CTX_MISSING = JSON.stringify({ timestamp: "2026-10-27T09:12:03.004-07:00",
 const NOISE = JSON.stringify({ timestamp: "2026-10-26T12:36:01.000-07:00", level: "info", pid: 28363, message: "agent_end maintenance routing" });
 
 describe("mcp-load", () => {
+	// 38384's log is split the way OMP's size rotation splits it: the older half in `.log.1`.
 	const logs = {
 		"omp.2026-10-26.28363.log": [LINEAR_401("2026-10-26T12:36:00.611-07:00", 28363), NOISE],
 		"omp.2026-10-26.70041.log": [LINEAR_401("2026-10-26T16:31:00.358-07:00", 70041)],
 		"omp.2026-10-27.63928.log": [CTX_MISSING, "not json MCP tool load failed"],
-		"omp.2026-10-28.38384.log": [LINEAR_401("2026-10-28T16:39:20.269-07:00", 38384), POSTHOG_401],
+		"omp.2026-10-28.38384.log.1": [LINEAR_401("2026-10-28T16:39:20.269-07:00", 38384)],
+		"omp.2026-10-28.38384.log": [POSTHOG_401],
+		"other.log": [LINEAR_401("2026-10-28T16:40:00.000-07:00", 1)], // not an OMP process log
 	};
+	const logsOf = (home: string, name: string) => join(home, ".omp", "profiles", PROFILE, "logs", name);
+	const LINEAR = (n: number) => `mcp-load: linear failed to load ${n} time(s) in the window in profile agent-system-2: HTTP 401; current login health unknown: check with jo-auth.zsh --check`;
+	const ALL = w("2026-10-26T00:00:00.000Z", "2026-10-29T00:00:00.000Z");
 
-	test("one finding per server and failure, at its last failure, counting the window's failures; a 401 names the profile's login command", async () => {
+	test("one finding per server and failure, at its last failure, counting the window's failures, rotated logs included; a 401 leaves the login's current health open", async () => {
 		const x = world({ ompLogs: logs });
-		const fs = of(await x.run(w("2026-10-26T00:00:00.000Z", "2026-10-29T00:00:00.000Z")), "mcp-load");
+		const fs = of(await x.run(ALL), "mcp-load");
 		expect(fs.map((f) => [f.at, f.summary])).toEqual([
-			["2026-10-27T16:12:03.004Z", "mcp-load: ctx failed to load 1 time(s) in profile agent-system-2: Executable not found in $PATH: \"ctx\""],
-			["2026-10-28T23:39:20.269Z", "mcp-load: linear failed to load 3 time(s) in profile agent-system-2: HTTP 401; a missing or expired login: run `OMP_PROFILE=agent-system-2 omp`, then `/mcp reauth linear`"],
-			["2026-10-28T23:39:20.297Z", "mcp-load: posthog failed to load 1 time(s) in profile agent-system-2: HTTP 401; a missing or expired login: run `OMP_PROFILE=agent-system-2 omp`, then `/mcp reauth posthog`"],
+			["2026-10-27T16:12:03.004Z", "mcp-load: ctx failed to load 1 time(s) in the window in profile agent-system-2: Executable not found in $PATH: \"ctx\""],
+			["2026-10-28T23:39:20.269Z", LINEAR(3)],
+			["2026-10-28T23:39:20.297Z", "mcp-load: posthog failed to load 1 time(s) in the window in profile agent-system-2: HTTP 401; current login health unknown: check with jo-auth.zsh --check"],
 		]);
-		const linear = fs.find((f) => f.summary.includes("linear"))!;
-		expect(linear.evidence).toBe(`${join(x.home, ".omp", "profiles", PROFILE, "logs", "omp.2026-10-26.28363.log")}:1 .. ${join(x.home, ".omp", "profiles", PROFILE, "logs", "omp.2026-10-28.38384.log")}:1`);
+		expect(fs.find((f) => f.summary.includes("linear"))!.evidence).toBe(`${logsOf(x.home, "omp.2026-10-26.28363.log")}:1 .. ${logsOf(x.home, "omp.2026-10-28.38384.log.1")}:1`);
+	});
+
+	test("every rotation suffix is read", async () => {
+		const x = world({ ompLogs: { "omp.2026-10-28.38384.log.4": [LINEAR_401("2026-10-28T16:39:20.269-07:00", 38384)], "omp.2026-10-28.38384.log.12": [POSTHOG_401] } });
+		expect((await x.run(ALL)).map((f) => f.summary.split(" ")[1])).toEqual(["linear", "posthog"]);
 	});
 
 	test("only the window's failures count", async () => {
 		const x = world({ ompLogs: logs });
 		const fs = await x.run(w("2026-10-26T20:00:00.000Z", "2026-10-27T00:00:00.000Z"));
-		expect(fs.map((f) => f.summary)).toEqual(["mcp-load: linear failed to load 1 time(s) in profile agent-system-2: HTTP 401; a missing or expired login: run `OMP_PROFILE=agent-system-2 omp`, then `/mcp reauth linear`"]);
+		expect(fs.map((f) => f.summary)).toEqual([LINEAR(1)]);
 	});
 
 	test("quiet when the profile has no logs directory, and when no line in the window failed", async () => {
-		expect(await world().run(w("2026-10-26T00:00:00.000Z", "2026-10-29T00:00:00.000Z"))).toEqual([]);
-		expect(await world({ ompLogs: { "omp.2026-10-26.28363.log": [NOISE] } }).run(w("2026-10-26T00:00:00.000Z", "2026-10-29T00:00:00.000Z"))).toEqual([]);
+		expect(await world().run(ALL)).toEqual([]);
+		expect(await world({ ompLogs: { "omp.2026-10-26.28363.log": [NOISE] } }).run(ALL)).toEqual([]);
+	});
+
+	test("an unreadable log gives one `mcp-load: OMP logs unreadable` beside the readable logs' findings", async () => {
+		const x = world({ ompLogs: logs });
+		const bad = logsOf(x.home, "omp.2026-10-28.38384.log.1");
+		chmodSync(bad, 0o000);
+		const fs = await x.run(ALL);
+		chmodSync(bad, 0o644);
+		expect(fs.map((f) => [f.at, f.summary])).toEqual([
+			["2026-10-26T00:00:00.000Z", MCP_LOAD_UNREADABLE],
+			["2026-10-26T23:31:00.358Z", LINEAR(2)],
+			["2026-10-27T16:12:03.004Z", "mcp-load: ctx failed to load 1 time(s) in the window in profile agent-system-2: Executable not found in $PATH: \"ctx\""],
+			["2026-10-28T23:39:20.297Z", "mcp-load: posthog failed to load 1 time(s) in the window in profile agent-system-2: HTTP 401; current login health unknown: check with jo-auth.zsh --check"],
+		]);
+		expect(fs[0]!.evidence).toBe(bad);
+	});
+
+	test("an unreadable logs directory gives one `mcp-load: OMP logs unreadable`, never zero failures", async () => {
+		const x = world({ ompLogs: logs });
+		const dir = join(x.home, ".omp", "profiles", PROFILE, "logs");
+		chmodSync(dir, 0o000);
+		const fs = await x.run(ALL);
+		chmodSync(dir, 0o755);
+		expect(fs.map((f) => [f.detector, f.summary, f.evidence])).toEqual([["mcp-load", MCP_LOAD_UNREADABLE, dir]]);
 	});
 });

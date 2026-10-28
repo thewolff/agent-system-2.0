@@ -149,8 +149,8 @@ export interface DetectorInputs {
 	laneModels: LaneModelSet[];
 	/** `unreadable`: the directory or the report files that could not be read (each counted, never as zero events). */
 	jetsam: { reports: JetsamReport[]; unreadable: string[] };
-	/** `profile`: the OMP profile whose logs were read. */
-	mcpLoad: { profile: string; failures: McpLoadFailure[] };
+	/** `profile`: the OMP profile whose logs were read; `unreadable`: its logs directory or the logs that could not be read (never as zero failures). */
+	mcpLoad: { profile: string; failures: McpLoadFailure[]; unreadable: string[] };
 }
 
 // ---- the detectors -----------------------------------------------------------------------------
@@ -347,11 +347,16 @@ export function mcpFailureKind(error: string): string {
 	return line.length > 80 ? `${line.slice(0, 79)}…` : line;
 }
 
+/** The summary of the one finding unreadable OMP logs give. */
+export const MCP_LOAD_UNREADABLE = "mcp-load: OMP logs unreadable";
+
 /**
  * mcp-load: a server OMP could not load in the profile, so its tools were missing from every session
  * that started then. One finding per server and failure kind, at its last failure in the window,
- * counting the failures in the window. An HTTP 401 or 403 is a missing or expired login, and the
- * summary names the profile and the login command that recovers it.
+ * counting the failures in the window. These are past events: a login that failed then may work now
+ * (OMP refreshed it, or it was redone), so an HTTP 401 or 403 says the login's current health is
+ * unknown and points at the check, never at reauthentication. And one `mcp-load: OMP logs unreadable`
+ * when the logs directory or any log could not be read.
  */
 export function mcpLoad(input: DetectorInputs["mcpLoad"], w: Window): Finding[] {
 	const from = ms(w.from);
@@ -370,13 +375,12 @@ export function mcpLoad(input: DetectorInputs["mcpLoad"], w: Window): Finding[] 
 		const first = sorted[0]!;
 		const last = sorted[sorted.length - 1]!;
 		const kind = mcpFailureKind(last.error);
-		const login = kind === "HTTP 401" || kind === "HTTP 403"
-			? `; a missing or expired login: run \`OMP_PROFILE=${input.profile} omp\`, then \`/mcp reauth ${last.server}\``
-			: "";
+		const login = kind === "HTTP 401" || kind === "HTTP 403" ? "; current login health unknown: check with jo-auth.zsh --check" : "";
 		out.push(finding("mcp-load", last.at, null, null,
-			`mcp-load: ${last.server} failed to load ${sorted.length} time(s) in profile ${input.profile}: ${kind}${login}`,
+			`mcp-load: ${last.server} failed to load ${sorted.length} time(s) in the window in profile ${input.profile}: ${kind}${login}`,
 			sorted.length === 1 ? `${first.path}:${first.line}` : `${first.path}:${first.line} .. ${last.path}:${last.line}`));
 	}
+	if (input.unreadable.length > 0) out.push(finding("mcp-load", w.from, null, null, MCP_LOAD_UNREADABLE, input.unreadable.join(", ")));
 	return out;
 }
 
