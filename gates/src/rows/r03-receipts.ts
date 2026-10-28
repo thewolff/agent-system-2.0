@@ -19,6 +19,15 @@
 // trivial. The turn runs from `before_agent_start` to `session_stop`
 // (gates/extensions/r03-receipts.ts). A hand's yield carries no turn record and is never checked
 // for zero labels: the lane reads it, and every string field of it would flag.
+//
+// The flag is for a report of findings, so a second carve-out (review 2026-10-28 S1): a reply made
+// only of actions and proposals, which the contract reports as plain prose (reference.md § What
+// stays unlabeled), is not flagged (actionOrProposalOnly). The shapes are conservative: every
+// sentence must be a `command` → exit N, an outcome count, an undo note, a proposed step opening on
+// an imperative verb, a recommendation, or a closing question, with no "because"-style reason
+// clause. Backticked command text is masked first, so words inside a command are never read as
+// prose. Any other sentence is a finding and keeps the flag; a command → exit line is still
+// checked against the recorded run below.
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { SURFACE_READ_TOOLS, SURFACE_TOOLS } from "../../../surface/src/types";
@@ -56,6 +65,48 @@ export type HistoryEvent =
 /** A block-leading label, `**CLAIM**` or `**CITE**`, alone on its line. */
 const ANCHOR = /^\*\*(CLAIM|CITE)\*\*\s*$/;
 const TESTS_PASS = /\b(?:tests?\s+(?:all\s+)?pass(?:ed|es|ing)?|all\s+(?:tests\s+)?green|\d+\s+pass\b)/i;
+
+// Shapes for actionOrProposalOnly. `C` stands for any masked backticked span.
+const NUM = String.raw`(?:\d+|no|one|two|three|four|five|six|seven|eight|nine|ten)`;
+const COUNTS = String.raw`(?:${NUM}\s+(?:pass(?:ed|es)?|fail(?:ed|s|ures?)?|errors?|warnings?|skip(?:ped|s)?|tests?|files?)\b[\s,]*)+`;
+const ACTION_SEG = new RegExp(String.raw`^(?:(?:ran|re-?ran|running)\s+)?\`C\`\s*(?:→|->)\s*exit\s+\d+(?:\s*[:,]\s*${COUNTS})?$`, "i");
+const COUNT_SEG = new RegExp(String.raw`^${COUNTS}$`, "i");
+const UNDO_SEG = /^(?:nothing to (?:undo|reverse)|(?:undo|reverse|revert)(?:\s+(?:with|by|via))?\s*:?\s*`C`|to (?:undo|reverse|revert)(?: it)?,?\s+(?:run\s+)?`C`|reversible (?:with|by)\s+`C`)$/i;
+const PROPOSAL_SEG =
+	/^(?:(?:I\s+)?(?:propose|suggest)(?:\s+(?:to|that\s+we|we))?\s+|next,?\s+)?(?:add|remove|rename|move|run|re-?run|update|replace|delete|extract|split|write|create|change|drop|keep|introduce|wire|revert|re-?pin|pin|document|migrate|bump|merge|push|open|close|land|hold|ship|test|cover|check|verify|retry|start|stop|restart|install|upgrade|apply|commit|file|ask|wait)\b/i;
+const RECOMMEND_SEG = /^(?:I\s+)?(?:recommend|recommended|recommendation)\b/i;
+const QUESTION_SEG = /^(?:should|shall|do|does|want|which|what|can|could|would|merge|push|ship|hold|proceed|land|start|wait)\b.*\?$/i;
+/** A reason or state clause turns a proposed step into a finding. */
+const FINDING_CLAUSE = /\b(?:because|since|which|currently|already|as it)\b/i;
+const HEADER_LINE = /^(?:#{1,6}\s.*|\*\*closing ask\*\*|(?:proposed\s+)?(?:plan|proposal|next steps?|steps)\s*:)$/i;
+const HEADER_PREFIX = /^(?:proposed\s+)?(?:plan|proposal|next steps?|steps)\s*:\s*/i;
+
+/**
+ * True when every sentence of a zero-label reply is an action (`command` → exit N, an outcome
+ * count, an undo note) or a proposal (an imperative step, a recommendation, a closing question):
+ * nothing in it is a finding the zero-label flag exists for. Conservative by design; an
+ * unrecognized sentence returns false and the reply keeps the flag.
+ */
+export function actionOrProposalOnly(message: string): boolean {
+	let segments = 0;
+	for (const raw of message.split("\n")) {
+		const line = raw
+			.replace(/`[^`\n]+`/g, "`C`")
+			.trim()
+			.replace(/^(?:[-*+]|\d+[.)])\s+/, "");
+		if (!line || HEADER_LINE.test(line)) continue;
+		for (const s of line.replace(HEADER_PREFIX, "").split(/;\s*|(?<=[.!?])\s+/)) {
+			const seg = s.trim().replace(/[.!]+$/, "");
+			if (!seg) continue;
+			segments++;
+			if (ACTION_SEG.test(seg) || COUNT_SEG.test(seg) || UNDO_SEG.test(seg)) continue;
+			if (FINDING_CLAUSE.test(seg)) return false;
+			if (PROPOSAL_SEG.test(seg) || RECOMMEND_SEG.test(seg) || QUESTION_SEG.test(seg)) continue;
+			return false;
+		}
+	}
+	return segments > 0;
+}
 
 /** One history event from an OMP `tool_result` (field names: pi-tui src/tools/{read,bash}.ts, fetch details). */
 export function historyEvent(toolName: string, input: Record<string, unknown>, details: unknown, isError: boolean): HistoryEvent | null {
@@ -107,10 +158,10 @@ const norm = (s: string): string => s.replace(/\s+/g, " ").trim();
 export function checkReceipts(message: string, history: HistoryEvent[], cwd: string, work?: readonly string[]): string[] {
 	const flags: string[] = [];
 	const bs = blocks(message);
-	if (work && work.length > 0 && bs.length === 0 && message.trim()) {
+	if (work && work.length > 0 && bs.length === 0 && message.trim() && !actionOrProposalOnly(message)) {
 		flags.push(
 			`the reply carries no CLAIM or CITE after ${work.length} working call${work.length === 1 ? "" : "s"} this turn (${[...new Set(work)].join(", ")}): nothing in it is backed by a receipt (contract § Degraded reports, Parent-side); ` +
-				`a plain reply is the trivial-ask path only when the turn made no working call`,
+				`a plain reply is the trivial-ask path only when the turn made no working call, and is exempt after work only when it holds nothing but actions and proposals`,
 		);
 	}
 	const readPaths = new Set(history.flatMap((h) => (h.kind === "read" ? [resolve(cwd, h.path)] : [])));

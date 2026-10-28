@@ -258,6 +258,40 @@ describe("trivial ask: row 3 flags a reply with no CLAIM or CITE only when the t
 	});
 });
 
+// Review 2026-10-28 S1 (REVIEW-openai-2026-10-28.md): the contract reports actions and proposals as
+// plain prose (reference.md § What stays unlabeled), so the zero-label flag is for a report of
+// findings. A reply made only of command → exit lines, outcome counts, undo notes, proposed steps
+// and one closing question carries no unreceipted finding; any other sentence keeps the flag.
+describe("row 3: a plain action-only or proposal-only reply after work is not a report of findings", () => {
+	const ran: HistoryEvent[] = [{ kind: "bash", command: "npm test", exitCode: 1 }];
+	test("an action-only report matching the recorded run is not flagged", () => {
+		expect(checkReceipts("Ran `npm test` → exit 1; one failure. Nothing to undo.", ran, "/", ["bash"])).toEqual([]);
+		const log: HistoryEvent[] = [{ kind: "bash", command: "git log --grep=fixed", exitCode: 0 }];
+		expect(checkReceipts("Ran `git log --grep=fixed` → exit 0. Nothing to undo.", log, "/", ["bash"])).toEqual([]);
+		const push: HistoryEvent[] = [{ kind: "bash", command: "git push origin feat", exitCode: 0 }];
+		expect(checkReceipts("- `git push origin feat` → exit 0; undo with `git push origin --delete feat`.", push, "/", ["bash"])).toEqual([]);
+	});
+	test("a proposal-only reply, with one closing question, is not flagged", () => {
+		const plan = ["Proposed plan:", "1. Add a regression covering resolved requests.", "2. Run the retry tests.", "", "**Closing ask**", "Should I start on the regression now? I recommend yes."].join("\n");
+		expect(checkReceipts(plan, [], "/", ["task"])).toEqual([]);
+		expect(checkReceipts("Plan:\n- Add tenantId to the cache key.\n- Re-run `bun test gates`.", [], "/", ["orchestrator_open_workload"])).toEqual([]);
+	});
+	test("a finding mixed into a plan or an action line keeps the flag", () => {
+		const mixedPlan = "Plan:\nThe retry cache key omits tenantId, so tenants share entries.\nAdd tenantId to the key.";
+		expect(checkReceipts(mixedPlan, [], "/", ["task"]).join("\n")).toContain("no CLAIM or CITE");
+		const mixedAction = "Ran `npm test` → exit 1; the retry cache key omits tenantId. Nothing to undo.";
+		expect(checkReceipts(mixedAction, ran, "/", ["bash"]).join("\n")).toContain("no CLAIM or CITE");
+		expect(checkReceipts("Add tenantId to the key, because the cache is shared.", [], "/", ["task"]).join("\n")).toContain("no CLAIM or CITE");
+	});
+	test("an unsupported completion claim keeps the flag", () => {
+		expect(checkReceipts("Everything passed.", [], "/", ["bash"]).join("\n")).toContain("no CLAIM or CITE");
+		expect(checkReceipts("Ran `npm test` → exit 1; the bug is fixed.", ran, "/", ["bash"]).join("\n")).toContain("no CLAIM or CITE");
+	});
+	test("a command line with no recorded run is still flagged by the exit-code check", () => {
+		expect(checkReceipts("Ran `npm test` → exit 0. Nothing to undo.", [], "/", ["bash"]).join("\n")).toContain("no such run recorded");
+	});
+});
+
 describe("trivial ask: row 1 on a plain reply and on one closing ask with options", () => {
 	test("Ilex's two refused closing asks are one decision each (M7 session 2026-09-30)", () => {
 		const ilex1 = [

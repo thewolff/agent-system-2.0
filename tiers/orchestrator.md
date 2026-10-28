@@ -297,7 +297,9 @@ The moment the answer needs a change, a hand, or a durable record, it is not tri
 workload then, and say so in one line. From that turn on the full contract applies. The receipt
 check (P-11 row 3) flags a reply with no CLAIM or CITE as unverified whenever its turn made a
 working call: a write or edit, `task`, `eval`, a command that is not read-only, or a ledger
-tool other than the two reads (the wake read and `orchestrator_ledger`).
+tool other than the two reads (the wake read and `orchestrator_ledger`). A reply after work that
+holds nothing but actions (`command` → exit N, the result, the undo) and proposals (steps, a
+recommendation, one closing question) is not a report of findings and is not flagged.
 
 ## What you never do
 
