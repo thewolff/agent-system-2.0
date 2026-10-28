@@ -48,18 +48,25 @@ const SYS_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
 const VERIFIED_TAG = "as2-verified";
 
 const made: string[] = [];
-/** chmod u+rwx every directory beneath, so rmSync can delete what a test sealed. */
-function unseal(p: string): void {
+/**
+ * Removes the fixture dirs named in argv: chmod u+rwx every directory beneath (so a dir a test sealed can be emptied),
+ * then rm -r. Run by a detached child, never in the hook: unlinking every fixture file took 9.5 s on a loaded machine
+ * and timed out the afterAll (run tr-0mvskhqnl998o93), and the hook's job is only to start it.
+ */
+const REMOVE_FIXTURES = `const { chmodSync, lstatSync, readdirSync, rmSync } = require("node:fs");
+const { join } = require("node:path");
+function unseal(p) {
 	let st;
-	try {
-		st = lstatSync(p);
-	} catch {
-		return;
-	}
+	try { st = lstatSync(p); } catch { return; }
 	if (!st.isDirectory()) return;
 	chmodSync(p, 0o755);
 	for (const n of readdirSync(p)) unseal(join(p, n));
 }
+for (const r of process.argv.slice(1)) {
+	try { unseal(r); } catch {}
+	rmSync(r, { recursive: true, force: true });
+}
+`;
 const pids: number[] = [];
 afterAll(() => {
 	for (const pid of pids) {
@@ -69,10 +76,7 @@ afterAll(() => {
 			// already gone
 		}
 	}
-	for (const r of made) {
-		unseal(r);
-		rmSync(r, { recursive: true, force: true });
-	}
+	if (made.length > 0) Bun.spawn([BUN, "-e", REMOVE_FIXTURES, ...made], { cwd: "/", detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" }).unref();
 });
 const dir = (tag: string): string => {
 	const d = realpathSync(tmp(`as2test-${tag}`));
@@ -1651,7 +1655,9 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 	}
 
 	test("shadow (caps.json without stuckStop): the spin fixture gets stuck-would-stop and a signature capture, nothing is stopped, and the part runs on to its cap and exits 124 as before", async () => {
-		const b = box("stuck-shadow", DETECT);
+		// The enforce tests' capture budget, so a loaded machine's slow sample still leaves all five sections (the cut at the
+		// budget is the stuck-cut test's). Started before 7 s, it ends inside the exit bound below.
+		const b = box("stuck-shadow", { ...DETECT, signatureCaptureMs: 10_000 });
 		prepared(b, "tr-ss1", { "spin.test.ts": spinTest(false), "a.test.ts": OK_TEST }, { fullCapMin: 0.15, soloCapMin: 0.15, fullWorkers: 2 });
 		const t0 = Date.now();
 		const r = call(b, { sub: "full", runId: "tr-ss1" });
