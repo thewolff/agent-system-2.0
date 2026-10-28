@@ -31,6 +31,14 @@ The installer's last line names the providers the rendered profile routes to. Fr
 - **One chat provider works, with a cost in reviews.** At spawn the classifier keeps only the row entries that are in OMP's model registry and have credentials (`usableRow`, `classifier/extension.ts`), so a tier runs on whichever providers you are logged in to. Reviews must run on a lab other than the builder's. With only one lab available, every review parks and asks you `same-lab` or `wait` (see [concepts.md](concepts.md#review-routing-by-lab)).
 - The ceilings are nominal list prices as OMP computes them. The design assumes flat-rate subscriptions for the three chat providers ([SPEC-2.0.md](../SPEC-2.0.md) § B11), so a ceiling bounds a share of subscription capacity, not a bill.
 
+### MCP logins (Linear and PostHog)
+
+`profile/mcp.json` gives every lane the hosted Linear (`https://mcp.linear.app/mcp`) and PostHog (`https://mcp.posthog.com/mcp`) MCP servers, with full read and write access. The file holds definitions only. OMP stores each OAuth login in the profile's own `agent.db`, keyed by profile and server URL, and a login made under your default profile does not reach this one. Log in once per server under the as2 profile: start `OMP_PROFILE=agent-system-2 omp`, then run `/mcp reauth linear` and `/mcp reauth posthog`, and finish each browser sign-in.
+
+- **One login per service, shared by every lane.** Every lane, autonomous or steered, connects with that one login, so every Linear and PostHog change a lane makes appears as the person who logged in.
+- **Expiry hits every lane at once.** When a login expires or is revoked, every lane's calls to that server fail (HTTP 401, logged as `MCP tool load failed` in `~/.omp/profiles/agent-system-2/logs/`) until you log in again under this profile. A lane still starts and its other tools still work.
+- PostHog runs in its CLI mode (`x-posthog-mcp-mode: cli`), which exposes one `exec` tool that finds and calls PostHog's tools on demand instead of mounting all of them.
+
 ## 2. Install
 
 Clone anywhere outside a synced folder, then run the installer from the checkout:

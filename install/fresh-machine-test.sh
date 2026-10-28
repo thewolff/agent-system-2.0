@@ -14,9 +14,10 @@
 # providers the profile routes to with the once-per-profile /login (M7 finding 2); the eleven
 # look-and-feel keys copied from Jo's default profile are in the rendered profile at their values
 # and the installed OMP reads each one back. The profile's mcp.json (profile/mcp.json) lands beside
-# config.yml and OMP's own MCP discovery under that HOME and profile finds exactly the ctx server,
-# from that file, with decoy servers planted in the default profile's mcp.json and ~/.claude.json
-# not among them; and the profile's sessions directory is a named ctx `pi` history root under that
+# config.yml and OMP's own MCP discovery under that HOME and profile finds exactly the ctx, linear and
+# posthog servers, from that file (definitions only; no credential is needed), with decoy servers
+# planted in the default profile's mcp.json and ~/.claude.json not among them; and the profile's
+# sessions directory is a named ctx `pi` history root under that
 # HOME's ctx data root, registered once however often install runs (M8 ctx wiring). And the clone's
 # plugins/test/by-hand-session.test.ts passes: a real `as2 lane` by-hand session under a profile
 # rendered by the clone's installer gets prompt.md, reads the 3 vendored skills from the clone and is
@@ -360,7 +361,7 @@ diff "$PROFILE/config.yml" <(bun -e "process.stdout.write((await Bun.file('$CLON
 	|| die "as2 clean-shell off did not leave the rendered config as the template"
 ok "as2 clean-shell adds workload ids to a list once, sets all and off, refuses a bad id, and off leaves the template"
 
-step "3e. the ctx MCP server reaches the profile through its own mcp.json; its sessions are a ctx history root (M8 ctx wiring)"
+step "3e. the ctx, linear and posthog MCP servers reach the profile through its own mcp.json; its sessions are a ctx history root (M8 ctx wiring)"
 cmp -s "$CLONE/profile/mcp.json" "$PROFILE/mcp.json" || die "mcp.json under the profile differs from profile/mcp.json"
 # Decoys where the default profile and Claude Code keep MCP servers: under the as2 profile OMP reads
 # its user MCP config from the profile's agent dir only (discovery/builtin.ts getAgentDir()), and the
@@ -374,13 +375,13 @@ MCP_LISTING="$WORK/mcp-listing.txt"
 	const { loadAllMCPConfigs } = await import('$OMP_PKG/src/mcp/config.ts');
 	await m.Settings.loadReadOnly({ cwd: process.cwd(), agentDir: m.getAgentDir() });
 	const r = await loadAllMCPConfigs(process.cwd());
-	for (const [name, s] of Object.entries(r.sources)) console.log(name + '\t' + s.provider + '\t' + s.path + '\t' + [r.configs[name].command, ...(r.configs[name].args ?? [])].join(' '));
+	for (const [name, s] of Object.entries(r.sources)) console.log(name + '\t' + s.provider + '\t' + s.path + '\t' + (r.configs[name].url ?? [r.configs[name].command, ...(r.configs[name].args ?? [])].join(' ')));
 	process.exit(0);
 " >"$MCP_LISTING") || die "MCP discovery under $FAKE_HOME exited $?"
 sed 's/^/  /' "$MCP_LISTING"
-MCP_WANT="$(printf 'ctx\tnative\t%s\tctx mcp serve' "$PROFILE/mcp.json")"
-[ "$(cat "$MCP_LISTING")" = "$MCP_WANT" ] || die "OMP's MCP discovery under the profile is not exactly the ctx server from $PROFILE/mcp.json"
-ok "OMP discovers exactly one MCP server under the profile: ctx, from $PROFILE/mcp.json; the default-profile and ~/.claude.json decoys are not read"
+MCP_WANT="$(printf 'ctx\tnative\t%s\tctx mcp serve\nlinear\tnative\t%s\thttps://mcp.linear.app/mcp\nposthog\tnative\t%s\thttps://mcp.posthog.com/mcp' "$PROFILE/mcp.json" "$PROFILE/mcp.json" "$PROFILE/mcp.json")"
+[ "$(cat "$MCP_LISTING")" = "$MCP_WANT" ] || die "OMP's MCP discovery under the profile is not exactly ctx, linear and posthog from $PROFILE/mcp.json"
+ok "OMP discovers exactly three MCP servers under the profile: ctx, linear and posthog, from $PROFILE/mcp.json; the default-profile and ~/.claude.json decoys are not read"
 CTX_ROOT="omp-agent-system-2-sessions"
 if command -v ctx >/dev/null 2>&1; then
 	[ -d "$PROFILE/sessions" ] || die "install did not create $PROFILE/sessions"

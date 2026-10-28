@@ -8,7 +8,7 @@ as2 was built for one user on one Mac. This page lists what you can change today
 |---|---|---|
 | `profile/config.yml` | `~/.omp/profiles/<profile>/agent/config.yml`, rendered with `{repo}` filled in | Extensions, skills, tier → model rows, the judge, the fence switch, the test runner, compaction, display |
 | `profile/models.yml` | Beside `config.yml` | The pinned judge model's definition on the `typesafe` provider |
-| `profile/mcp.json` | Beside `config.yml` | The profile's MCP servers. The installer refuses a file without an `mcpServers.ctx` entry that has a `command` |
+| `profile/mcp.json` | Beside `config.yml` | The profile's MCP servers: ctx, Linear and PostHog (definitions only; the Linear and PostHog logins are per profile, see [getting-started.md](getting-started.md#mcp-logins-linear-and-posthog)). The installer refuses a file without an `mcpServers.ctx` entry that has a `command` |
 | `tiers/*.md` | Linked into `agents/` | The six role prompts (orchestrator, lane, four hand tiers). Links, so edits are live without a re-install |
 | `voice/VOICE.md` | Read in place | The voice the orchestrator writes in; rendered into its system prompt at each `as2` launch |
 | `contract/output-types.md` | Read in place | The output-types contract injected into every session |
