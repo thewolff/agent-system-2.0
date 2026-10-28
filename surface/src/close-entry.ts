@@ -450,9 +450,14 @@ export async function publishEntry(pi: SurfaceAPI, e: EntryCommit, id: string): 
 /** Replaces the checkout's profile/config.yml as the source of the `testRunner:` block (tests; the starter honours the same variable). */
 export const TEST_RUNNER_CONFIG_ENV = "AGENT_SYSTEM_TEST_RUNNER_CONFIG";
 
+/** The checkout's profile/config.yml, or `$AGENT_SYSTEM_TEST_RUNNER_CONFIG` in its place: the file the starter and the train tick read. */
+export function checkoutConfigPath(env: Record<string, string | undefined>): string {
+	return env[TEST_RUNNER_CONFIG_ENV]?.trim() || join(REPO_ROOT, "profile", "config.yml");
+}
+
 /** The `testRunner:` block from the checkout's profile/config.yml (or `$AGENT_SYSTEM_TEST_RUNNER_CONFIG`), as the starter reads it. */
 export function loadTestRunnerConfig(env: Record<string, string | undefined>): { ok: true; config: TestRunnerConfig } | { ok: false; error: string } {
-	const path = env[TEST_RUNNER_CONFIG_ENV]?.trim() || join(REPO_ROOT, "profile", "config.yml");
+	const path = checkoutConfigPath(env);
 	let doc: unknown;
 	try {
 		doc = Bun.YAML.parse(readFileSync(path, "utf8"));

@@ -126,6 +126,13 @@ With one open workload the word applies to it. With several, add the id: `produc
 The merge train's lane does not count against the lane cap. It launches whenever the train has work: a PR on it, a settled task, or an answer to a question the train lane asked. It does so even when the cap is full of other lanes, and it never takes a slot from them. There is never more than one train lane at a time. A train with nothing to do gets no lane. A fix workload that a train opens is an ordinary workload and counts against the cap.
 
 If three launches of the train lane in a row fail before the lane is ready (it never got ready, or it crashed before readiness), nothing launches it again. A lane that got ready and then crashed is not one of those, and a session you run by hand (`as2 lane <wl>`) never counts. The surface asks you a `now` question with the options `relaunch` / `stop`, once per run of failures. `relaunch` starts the train again and resets the count. `stop` leaves it stopped until you send `launch-requested` for it or a `train` word.
+
+### The model a train's fix workload runs on (`trainFixModel`)
+
+`trainFixModel:` in profile/config.yml names the model a newly opened fix workload's lanes prefer, for example `openai-codex/gpt-6.1-sol`. The train tick writes it on the fix workload in the same step that opens it, so the first lane starts on it. It is a quota preference, not a ban on any lab. Your own model word on the workload always wins over it. If the quota guard refuses the preferred model, the lane starts on ordinary routing instead of failing. Delete the key and new fix workloads route as before; fix workloads already open keep the preference they were opened with.
+
+To change the model of a workload whose lane is running, without stopping it or launching another, use the launch tool with `scope: "model-only"` and a `model`. The running lane keeps its model; the next lane starts on the new one.
+
 ### Fast checks before merge; full suite on main after (`migration/items/train-land-first.md`)
 
 Land-first separates the fast hosted PR check from the full Mac suite on main. The runner keeps `as2/full-suite` as the strict, required, up-to-date ruleset status: a fast green alone is not a full-suite result. Before merge, changed-code tests plus the configured smoke tests run on GitHub-hosted Linux; after landing, the full suite runs on main and coalesces to the newest main commit. Main red or unknown stops further landings and raises one loud incident naming the suspects since the last believable green. A red verdict is not retried; exhausted inconclusive infrastructure attempts resume only after Jo says `main-retry <repo>`.

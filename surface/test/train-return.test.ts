@@ -12,10 +12,10 @@ import orchestratorSurface from "../index";
 import { recordRepo, repoOf } from "../src/decision-log";
 import { errorLines, trainRouted } from "../src/errors";
 import { applyTrain, interpret } from "../src/input";
-import { controlEntries, firstPrompt, laneExitBody, trainFixBody } from "../src/launch";
+import { controlEntries, firstPrompt, laneExitBody, laneModel, laneModelBody, laneModelChoice, laneModelPreferenceBody, trainFixBody } from "../src/launch";
 import {
 	carryPairs, COMMIT_FILES_CAP, fixBindings, forkOf, forkTaskAlert, ghCompare, nextAttempt, openTrainFix, ownerDeliveries, ownerTasks, recordTrainTask, settleTasks, type TaskView,
-	TRAIN_TASK_KINDS, type TrainPush, type TrainTask, trainPushesOf,
+	TRAIN_FIX_MODEL_SOURCE, TRAIN_TASK_KINDS, trainFixModelOf, type TrainPush, type TrainTask, trainPushesOf,
 	trainSliceId, trainTaskWindows, twiceFailed, unsettledTasks,
 } from "../src/merge-train";
 import { type CompareResult, makeRunId, pushDestBody, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRuns } from "../src/test-run";
@@ -631,6 +631,77 @@ describe("fix workloads for owner none (D8)", () => {
 		const again = w.ret(106, H0, "conflict", "feature/foo");
 		expect(again.ok).toBe(false);
 		expect(twiceFailed(w.ledger, w.train)).toEqual([]);
+	});
+
+	describe("the train-fix model preference (profile trainFixModel)", () => {
+		const SOL = "openai-codex/gpt-6.1-sol";
+		const A = "anthropic/claude-opus-5-5";
+
+		test("a newly opened fix workload carries lane-model-preference: by merge-train before its launch-requested:, in the opening transaction; it is no lane-model:", () => {
+			const w = world();
+			const t = w.task(106, H0, "conflict", "feature/other");
+			const r = openTrainFix(w.ledger, { task: t, repo: REPO, checkout: w.trainCheckout, view: view(106, H0, "feature/other"), stakes: "normal", preferredModel: SOL });
+			const control = controlEntries(w.ledger.entries(r.workloadId));
+			expect(control.map((c) => c.prefix)).toEqual(["repo", "done", "train-fix", "push-dest", "lane-model-preference", "launch-requested"]);
+			const pref = control.find((c) => c.prefix === "lane-model-preference")!;
+			expect(pref.createdBy).toBe(MERGE_TRAIN_BY);
+			expect(pref.rest).toStartWith(`${SOL} by merge-train at `);
+			expect(pref.rest).toEndWith(`source ${TRAIN_FIX_MODEL_SOURCE}`);
+			expect(laneModelChoice(control)).toEqual({ model: SOL, source: "preference" });
+			// Jo's word is untouched: no lane-model: was written, and laneModel reads Jo's word alone
+			expect(control.some((c) => c.prefix === "lane-model")).toBe(false);
+			expect(laneModel(control)).toBeNull();
+		});
+
+		test("unset (absent, null, empty, default) writes exactly today's opening rows; a reused workload gets no preference", () => {
+			for (const preferredModel of [undefined, null, ""]) {
+				const w = world();
+				const t = w.task(106, H0, "conflict", "feature/other");
+				const input = { task: t, repo: REPO, checkout: w.trainCheckout, view: view(106, H0, "feature/other"), stakes: "normal" as const, ...(preferredModel === undefined ? {} : { preferredModel }) };
+				const r = openTrainFix(w.ledger, input);
+				const control = controlEntries(w.ledger.entries(r.workloadId));
+				expect(control.map((c) => c.prefix)).toEqual(["repo", "done", "train-fix", "push-dest", "launch-requested"]);
+				expect(laneModelChoice(control)).toEqual({ model: null, source: null });
+				// the reuse path writes no model line even when the setting is on now
+				expect(openTrainFix(w.ledger, { ...input, preferredModel: SOL })).toEqual({ workloadId: r.workloadId, opened: false });
+				expect(controlEntries(w.ledger.entries(r.workloadId)).some((c) => c.prefix === "lane-model-preference")).toBe(false);
+			}
+			for (const doc of [{}, { trainFixModel: null }, { trainFixModel: "" }, { trainFixModel: "  " }, { trainFixModel: "default" }, null, "x"]) {
+				expect(trainFixModelOf(doc)).toEqual({ model: null, problem: null });
+			}
+			expect(trainFixModelOf({ trainFixModel: ` ${SOL} ` })).toEqual({ model: SOL, problem: null });
+			for (const bad of ["gpt-6.1-sol", `${SOL}:high`, "nolab/model", 7]) {
+				const p = trainFixModelOf({ trainFixModel: bad });
+				expect(p.model).toBeNull();
+				expect(p.problem).toContain("no train-fix model preference");
+			}
+		});
+
+		test("authority: only merge-train writes a preference, merge-train never writes lane-model:, and Jo's lane-model: (default included) wins whatever its age", () => {
+			const w = world();
+			const wl = w.ledger.openWorkload({ by: MERGE_TRAIN_BY, brief: "fix", stakes: "normal", mode: "autonomous" });
+			const rec = (by: string, body: string) => w.ledger.recordEntry({ by, workloadId: wl, kind: "assumption", body });
+			const choice = () => laneModelChoice(controlEntries(w.ledger.entries(wl)));
+			// a preference by any other writer, and a lane-model: by the train, are dropped
+			rec(SURFACE_BY, laneModelPreferenceBody(A, w.ledger.now(), "forged"));
+			rec(OWNER_LANE, laneModelPreferenceBody(A, w.ledger.now(), "forged"));
+			rec(MERGE_TRAIN_BY, laneModelBody(A, w.ledger.now()));
+			expect(choice()).toEqual({ model: null, source: null });
+			rec(MERGE_TRAIN_BY, laneModelPreferenceBody(SOL, w.ledger.now(), TRAIN_FIX_MODEL_SOURCE));
+			expect(choice()).toEqual({ model: SOL, source: "preference" });
+			// Jo's pin wins, and a newer preference does not displace it
+			rec(SURFACE_BY, laneModelBody(A, w.ledger.now()));
+			expect(choice()).toEqual({ model: A, source: "pin" });
+			rec(MERGE_TRAIN_BY, laneModelPreferenceBody(SOL, w.ledger.now(), TRAIN_FIX_MODEL_SOURCE));
+			expect(choice()).toEqual({ model: A, source: "pin" });
+			// Jo's `default` is Jo's word too: the profile default, not the preference
+			rec(SURFACE_BY, laneModelBody("default", w.ledger.now()));
+			expect(choice()).toEqual({ model: null, source: "pin" });
+			// ignorePreference reads Jo's word alone
+			const fresh = w.ledger.openWorkload({ by: MERGE_TRAIN_BY, brief: "fix 2", stakes: "normal", mode: "autonomous" });
+			w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: fresh, kind: "assumption", body: laneModelPreferenceBody(SOL, w.ledger.now(), TRAIN_FIX_MODEL_SOURCE) });
+			expect(laneModelChoice(controlEntries(w.ledger.entries(fresh)), true)).toEqual({ model: null, source: null });
+		});
 	});
 });
 

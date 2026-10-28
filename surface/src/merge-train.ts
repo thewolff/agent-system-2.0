@@ -24,7 +24,7 @@ import { basename, dirname } from "node:path";
 import { parseHandSpawn } from "../../classifier/src/lab";
 import { parseReviewGroup, parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
 import {
-	attempts, type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, JO_HOLDER, laneExit, landFirstHeld, landFirstOn, launchRequestedBody, type OwnerTrainTask, PLAN_AUTO_STARTED, parseTrainBoard,
+	attempts, type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, JO_HOLDER, laneExit, laneModelPreferenceBody, landFirstHeld, landFirstOn, launchRequestedBody, modelProblem, type OwnerTrainTask, PLAN_AUTO_STARTED, parseTrainBoard,
 	parseTrainFix, planFirst, planSlice, prBindingInstructionBody, prBindings, sameRepo, supersededBy, type TrainBinding, trainBindings, trainBoardBody, type TrainFix, trainFixBody,
 } from "./launch";
 import { CLASSIFIER_BY, type EntryRow, type InstructionRow, type Ledger, type MessageRow, newId, type QuestionRow, type SliceRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
@@ -1521,6 +1521,26 @@ export interface FixInput {
 	view: TaskView;
 	/** D1's stakes for the PR. */
 	stakes: Stakes;
+	/** The profile's `trainFixModel:` (`trainFixModelOf`): a newly opened fix workload's lane-model preference; absent or null, none. */
+	preferredModel?: string | null;
+}
+
+/** Where a fix workload's `lane-model-preference:` comes from, as its `source` names it. */
+export const TRAIN_FIX_MODEL_SOURCE = "profile/config.yml:trainFixModel";
+
+/**
+ * The `trainFixModel:` of a parsed profile config (`Bun.YAML.parse` of profile/config.yml): the model a newly opened fix workload's
+ * lanes prefer, as an exact `provider/model` (`modelProblem`). Absent, null, empty or `default` is no preference (today's routing);
+ * any other value that is not a model Jo could name is no preference with `problem` saying why, so a typo never blocks the train.
+ */
+export function trainFixModelOf(doc: unknown): { model: string | null; problem: string | null } {
+	const v = doc !== null && typeof doc === "object" && "trainFixModel" in doc ? doc.trainFixModel : undefined;
+	if (v === undefined || v === null) return { model: null, problem: null };
+	if (typeof v !== "string") return { model: null, problem: "trainFixModel is not a string; no train-fix model preference" };
+	const sel = v.trim();
+	if (sel === "" || sel === "default") return { model: null, problem: null };
+	const problem = modelProblem(sel);
+	return problem === null ? { model: sel, problem: null } : { model: null, problem: `trainFixModel: ${problem}; no train-fix model preference` };
 }
 
 /**
@@ -1538,7 +1558,9 @@ export function forkOf(view: TaskView, repo: string): string | null {
  * The fix workload for task `input.task` with owner none (D8), in one transaction: at most one open per (repo, PR). An open
  * workload carrying `train-fix: repo <repo> pr <n> …` is reused (given this train's binding when it lacks it); else one is
  * opened autonomous at `stakes`, as MERGE_TRAIN_BY, with the brief, `repo:`, `done:`, the `train-fix:` binding naming the
- * `train:` or `train-board:` entry that lists the PR (`trainBindings`), `push-dest:` at the PR's head branch and `launch-requested: by merge-train`.
+ * `train:` or `train-board:` entry that lists the PR (`trainBindings`), `push-dest:` at the PR's head branch, the `lane-model-preference:`
+ * when `input.preferredModel` names one (so the first lane, which the same tick may launch, already reads it) and `launch-requested: by merge-train`.
+ * A reused workload keeps its own model lines: the preference is written only at open.
  * Throws when no membership entry on the train lists the PR (a binding is only ever derived from Jo's train word or the tick's board),
  * and on a fork's PR (`forkOf`): its fix goes to Jo instead (`forkTaskAlert`).
  */
@@ -1565,6 +1587,7 @@ export function openTrainFix(ledger: Ledger, input: FixInput): { workloadId: str
 			doneBody(TRAIN_FIX_DONE),
 			trainFixBody(fix),
 			pushDestBody({ remote: "origin", branch: view.headRefName, sha: task.head }),
+			...(input.preferredModel ? [laneModelPreferenceBody(input.preferredModel, ledger.now(), TRAIN_FIX_MODEL_SOURCE)] : []),
 			launchRequestedBody(MERGE_TRAIN_BY, ledger.now(), `train fix #${task.pr} on ${task.train}`),
 		]) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body });
 		return { workloadId: wl, opened: true };

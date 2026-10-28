@@ -85,7 +85,7 @@ export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
-	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr", "waive-pr", "train",
+	"test-requested", "test-run", "push-dest", "lane-model", "lane-model-preference", "lane-headroom", "superseded", "pair-taken", "test-pr", "waive-pr", "train",
 	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-notice", "train-autoboard",
 	"withdrawn",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
@@ -147,6 +147,11 @@ export const DAILY_REPORT_BY = "daily-report";
  * `openTrainFix` (MERGE_TRAIN_BY) also writes one on a fix workload it opens, naming the PR's head branch (PLAN wl-mv8s8srodefytc D8).
  * `lane-model: <provider/model|default> by jo at <iso>` is the surface's alone: Jo's `model` on the open or launch tool
  * (MIGRATION.md item 85). It is not lane-scoped; `laneModel` reads the newest, and the runner and `as2 lane` read it at every spawn.
+ * `lane-model-preference: <provider/model> by merge-train at <iso> source <where>` is the train tick's alone (MERGE_TRAIN_BY):
+ * `openTrainFix` writes it in the opening transaction of a fix workload while the profile's `trainFixModel:` names a model. It is
+ * a quota preference, never Jo's word and never a ban: any valid `lane-model:` on the workload (a model or `default`) wins over it
+ * whatever its age (`laneModelChoice`), and the runner drops it for ordinary routing when the quota guard refuses it, where a
+ * `lane-model:` fails the launch. It is a separate prefix, not a `lane-model:` by another writer, so `lane-model:` stays the surface's alone.
  * `lane-headroom: <laneId> <from> -> <to> (<reason>)` is the runner's alone (PLAN wl-mv71x5rwdu7eo0 § 4, Jo's in-mv8p5m2t005tts and
  * in-mv8qzqym1ihmv4): an unnamed lane whose first `get_state` model was projected out of quota was moved by `set_model` to the
  * strong row's first entry that is not, and OMP confirmed it. It is never Jo's word: `laneModel` reads `lane-model:` only.
@@ -226,6 +231,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"test-run": [TEST_RUNNER_BY],
 	"push-dest": [],
 	"lane-model": [SURFACE_BY],
+	"lane-model-preference": [MERGE_TRAIN_BY],
 	"lane-headroom": [LANE_RUNNER_BY],
 	superseded: [SURFACE_BY],
 	"pair-taken": [SURFACE_BY],
@@ -720,17 +726,39 @@ export function resumePlan(
 /**
  * Jo's named model for the workload's lanes (MIGRATION.md item 85): the newest valid `lane-model:` entry
  * (surface-written, `controlEntries` drops any other writer), as a `provider/model` selector, or null for
- * `default` or no entry. A body that does not parse is skipped.
+ * `default` or no entry. A body that does not parse is skipped. A `lane-model-preference:` is never Jo's word: see `laneModelChoice`.
  */
 export function laneModel(control: readonly ControlEntry[]): string | null {
+	return laneModelChoice(control, true).model;
+}
+
+/** Where a spawn's model comes from: Jo's `lane-model:` (`pin`, a model or `default`), the train's `lane-model-preference:`, or neither. */
+export interface LaneModelChoice {
+	model: string | null;
+	source: "pin" | "preference" | null;
+}
+
+/**
+ * The model a spawn starts on: Jo's `lane-model:` whenever a valid one stands, `default` included (`laneModel`); else the newest
+ * valid `lane-model-preference:` (train-written, `controlEntries` drops any other writer); else null on the profile default.
+ * `ignorePreference` reads Jo's word alone: the runner's fallback when the quota guard refuses a preference.
+ */
+export function laneModelChoice(control: readonly ControlEntry[], ignorePreference = false): LaneModelChoice {
 	for (let i = control.length - 1; i >= 0; i--) {
 		const c = control[i]!;
 		if (c.prefix !== "lane-model") continue;
 		const sel = c.rest.split(/\s+/, 1)[0] ?? "";
-		if (sel === "default") return null;
-		if (modelProblem(sel) === null) return sel;
+		if (sel === "default") return { model: null, source: "pin" };
+		if (modelProblem(sel) === null) return { model: sel, source: "pin" };
 	}
-	return null;
+	if (ignorePreference) return { model: null, source: null };
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.prefix !== "lane-model-preference") continue;
+		const sel = c.rest.split(/\s+/, 1)[0] ?? "";
+		if (sel !== "default" && modelProblem(sel) === null) return { model: sel, source: "preference" };
+	}
+	return { model: null, source: null };
 }
 
 const MODEL_SELECTOR = /^[a-z0-9-]+\/[A-Za-z0-9._-]+$/;
@@ -1539,6 +1567,10 @@ export function launchRequestedBody(who: string, at: string, reason?: string): s
 /** `lane-model: <provider/model|default> by jo at <iso>`: Jo's named model for the workload's lanes (MIGRATION.md item 85). */
 export function laneModelBody(selector: string, at: string): string {
 	return `lane-model: ${selector} by jo at ${at}`;
+}
+/** `lane-model-preference: <provider/model> by merge-train at <iso> source <where>`: the train's quota preference for a fix workload's lanes. */
+export function laneModelPreferenceBody(selector: string, at: string, source: string): string {
+	return `lane-model-preference: ${selector} by merge-train at ${at} source ${source}`;
 }
 /** `lane-headroom: <laneId> <from> -> <to> (<reason>)`: the runner moved an unnamed lane off a lab projected out (PLAN wl-mv71x5rwdu7eo0 § 4). */
 export function laneHeadroomBody(laneId: string, from: string, to: string, reason: string): string {
