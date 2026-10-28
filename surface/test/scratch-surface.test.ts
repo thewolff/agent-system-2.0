@@ -5,7 +5,7 @@
 // archives the root once the row has closed and only then removes it, keeping a root whose archive
 // fails and refusing a root that is a symlink.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { Ledger } from "../../ledger/src/index";
@@ -223,11 +223,11 @@ describe("needs-you kind `scratch` (§ 1.5, § 1.6)", () => {
 	});
 });
 
-/** The members `tar -tzf` lists in `archive`, sorted. */
+/** The members `tar -tzf` lists in `archive`, as paths relative to the root ("" for the root itself), sorted. */
 function members(archive: string): string[] {
 	const r = Bun.spawnSync(["tar", "-tzf", archive], { stdout: "pipe", stderr: "pipe" });
 	expect(r.exitCode).toBe(0);
-	return r.stdout.toString().split("\n").filter((l) => l !== "").map((l) => l.replace(/\/$/, "")).sort();
+	return r.stdout.toString().split("\n").filter((l) => l !== "").map((l) => l.replace(/^\.\/?/, "").replace(/\/$/, "")).sort();
 }
 
 /** The one archive under the archive base, or null when there is none (asserts there is at most one). */
@@ -278,12 +278,12 @@ describe("orchestrator_close_workload archives the root, then removes it, after 
 		expect(ledger.workload(wl)!.status).toBe("closed");
 		expect(existsSync(root)).toBe(false);
 		expect(readFileSync(join(outside, "keep.txt"), "utf8")).toBe("keep");
-		expect(members(archive!)).toEqual([wl, `${wl}/REPORT.md`, `${wl}/clone`, `${wl}/clone/deep`, `${wl}/clone/deep/f.txt`, `${wl}/link`].sort());
+		expect(members(archive!)).toEqual(["", "REPORT.md", "clone", "clone/deep", "clone/deep/f.txt", "link"].sort());
 		// The archive holds the files themselves: unpacked, the deliverable reads back and the link is still a link.
 		const out = tmp("scratch-unpack");
 		expect(Bun.spawnSync(["tar", "-xzf", archive!, "-C", out]).exitCode).toBe(0);
-		expect(readFileSync(join(out, wl, "REPORT.md"), "utf8")).toBe("the deliverable");
-		expect(lstatSync(join(out, wl, "link")).isSymbolicLink()).toBe(true);
+		expect(readFileSync(join(out, "REPORT.md"), "utf8")).toBe("the deliverable");
+		expect(lstatSync(join(out, "link")).isSymbolicLink()).toBe(true);
 		expect(scratchEntries().map((x) => [x.created_by, x.body])).toEqual([
 			[SURFACE_BY, `${SCRATCH_ENTRY.archived} ${wl} ${archive} ${bytes} ${sha}`],
 			[SURFACE_BY, `${SCRATCH_ENTRY.removed} ${wl} ${root}`],
@@ -327,25 +327,36 @@ describe("orchestrator_close_workload archives the root, then removes it, after 
 		const text = await close();
 		const archive = onlyArchive(home);
 		expect(archive).not.toBeNull();
-		expect(text).toContain(`The done-because names ${root}/replay/REPORT.md, inside the scratch root: it is in the archive ${archive} as ${wl}/replay/REPORT.md.`);
+		expect(text).toContain(`The done-because names ${root}/replay/REPORT.md, inside the scratch root: in the archive ${archive} as ./replay/REPORT.md.`);
 		expect(existsSync(root)).toBe(false);
-		expect(members(archive!)).toContain(`${wl}/replay/REPORT.md`);
+		expect(members(archive!)).toContain("replay/REPORT.md");
 		ledger.close();
 	});
 
-	test("closeScratchRoot: a done-because path spelled through $AS2_SCRATCH or ~ is found; one inside a kept root says it is kept", () => {
+	test("closeScratchRoot: done-because paths are checked against the archive's members: through $AS2_SCRATCH or ~, missing, `..`, through a link, a link itself; one inside a kept root says it is kept", () => {
 		const { ledger } = tempLedger();
 		const { wl } = workloadWithSlice(ledger);
 		const home = tmp("scratch-home");
 		const root = scratchRootFor(home, wl);
 		mkdirSync(root, { recursive: true });
 		writeFileSync(join(root, "notes.md"), "n");
+		const outside = tmp("scratch-outside");
+		writeFileSync(join(outside, "REPORT.md"), "outside");
+		symlinkSync(outside, join(root, "out"));
 		const now = new Date("2026-10-28T22:17:00.000Z");
 		const archive = archivePathFor(home, wl, now);
-		const said = closeScratchRoot(ledger, { HOME: home }, wl, { doneBecause: "see $AS2_SCRATCH/notes.md and ~/agent-scratch/agent-system-2.0/scratch/" + wl + "/notes.md", now });
+		const said = closeScratchRoot(ledger, { HOME: home }, wl, {
+			doneBecause: `see $AS2_SCRATCH/notes.md and ~/agent-scratch/agent-system-2.0/scratch/${wl}/notes.md; also $AS2_SCRATCH/missing.md, $AS2_SCRATCH/../outside/REPORT.md, $AS2_SCRATCH/out/REPORT.md and $AS2_SCRATCH/out.`,
+			now,
+		});
 		expect(said).toContain(`archived to ${archive} (`);
-		expect(said).toContain(`The done-because names $AS2_SCRATCH/notes.md, inside the scratch root: it is in the archive ${archive} as ${wl}/notes.md.`);
-		expect(said).toContain(`The done-because names ~/agent-scratch/agent-system-2.0/scratch/${wl}/notes.md, inside the scratch root: it is in the archive ${archive} as ${wl}/notes.md.`);
+		expect(said).toContain(`The done-because names $AS2_SCRATCH/notes.md, inside the scratch root: in the archive ${archive} as ./notes.md.`);
+		expect(said).toContain(`The done-because names ~/agent-scratch/agent-system-2.0/scratch/${wl}/notes.md, inside the scratch root: in the archive ${archive} as ./notes.md.`);
+		expect(said).toContain(`The done-because names $AS2_SCRATCH/missing.md, inside the scratch root: not in the archive ${archive}: the root had no ./missing.md at close.`);
+		expect(said).toContain("The done-because names $AS2_SCRATCH/../outside/REPORT.md, inside the scratch root: a path with a `..` component: not checked against the archive, and not known to be in it.");
+		expect(said).toContain(`The done-because names $AS2_SCRATCH/out/REPORT.md, inside the scratch root: reached through the symlink ./out (→ ${outside}): the archive ${archive} holds that link, not what it points to.`);
+		expect(said).toContain(`The done-because names $AS2_SCRATCH/out, inside the scratch root: a symlink (→ ${outside}): the archive ${archive} holds the link as ./out, not its target.`);
+		expect(readFileSync(join(outside, "REPORT.md"), "utf8")).toBe("outside");
 
 		const { wl: wl2 } = workloadWithSlice(ledger);
 		const root2 = scratchRootFor(home, wl2);
@@ -361,6 +372,120 @@ describe("orchestrator_close_workload archives the root, then removes it, after 
 		const { wl: wl3 } = workloadWithSlice(ledger);
 		expect(closeScratchRoot(ledger, { HOME: home }, wl3, { doneBecause: `${root2}x/REPORT.md`, now })).toBe("");
 		ledger.close();
+	});
+
+	describe("archive verification keeps the root on any doubt (closeScratchRoot seams)", () => {
+		const now = new Date("2026-10-28T22:17:00.000Z");
+		/** A root with a deliverable, a newer file that would mask an mtime-only check, and a link; and the detached path finder. */
+		function setUp() {
+			const { ledger } = tempLedger();
+			const { wl } = workloadWithSlice(ledger);
+			const home = tmp("scratch-home");
+			const root = scratchRootFor(home, wl);
+			mkdirSync(root, { recursive: true });
+			writeFileSync(join(root, "REPORT.md"), "aaaa");
+			writeFileSync(join(root, "newer.txt"), "n");
+			const future = new Date(now.getTime() + 365 * 24 * 3600 * 1000);
+			utimesSync(join(root, "newer.txt"), future, future);
+			symlinkSync("REPORT.md", join(root, "link"));
+			const detached = (): string => {
+				const base = join(root, "..");
+				const d = readdirSync(base).filter((n) => n.startsWith(".removing-"));
+				expect(d).toHaveLength(1);
+				return join(base, d[0]!);
+			};
+			const dayDir = join(scratchArchiveBase(home), "2026-10-28");
+			const leftovers = () => (existsSync(dayDir) ? readdirSync(dayDir) : []);
+			return { ledger, wl, home, root, detached, leftovers };
+		}
+
+		test("the root is renamed aside before tar runs: a write by the root's path during archiving never reaches the archived tree", () => {
+			const { ledger, wl, home, root, detached } = setUp();
+			let seenAside = false;
+			const said = closeScratchRoot(ledger, { HOME: home }, wl, {
+				now,
+				seams: {
+					afterTar: () => {
+						seenAside = !existsSync(root) && existsSync(join(detached(), "REPORT.md"));
+					},
+				},
+			});
+			expect(seenAside).toBe(true);
+			expect(said).toContain(") and removed (");
+			expect(existsSync(root)).toBe(false);
+			ledger.close();
+		});
+
+		test("a same-size rewrite during archiving, masked by a newer file, fails the final check: archive dropped, root renamed back whole", () => {
+			const { ledger, wl, home, root, detached, leftovers } = setUp();
+			const said = closeScratchRoot(ledger, { HOME: home }, wl, {
+				now,
+				seams: {
+					beforeFinalCheck: () => {
+						const p = join(detached(), "REPORT.md");
+						const st = lstatSync(p);
+						writeFileSync(p, "bbbb");
+						utimesSync(p, st.atime, st.mtime);
+					},
+				},
+			});
+			expect(said).toContain(`Scratch root ${root} kept: not archived: `);
+			expect(said).toContain("./REPORT.md was written or changed (its mtime or ctime moved)");
+			expect(said).toContain("was dropped");
+			expect(readFileSync(join(root, "REPORT.md"), "utf8")).toBe("bbbb");
+			expect(existsSync(join(root, "newer.txt"))).toBe(true);
+			expect(leftovers()).toEqual([]);
+			ledger.close();
+		});
+
+		test("a changed link target during archiving fails the final check and keeps the root", () => {
+			const { ledger, wl, home, root, detached } = setUp();
+			const said = closeScratchRoot(ledger, { HOME: home }, wl, {
+				now,
+				seams: {
+					beforeFinalCheck: () => {
+						const p = join(detached(), "link");
+						rmSync(p);
+						symlinkSync("newer.txt", p);
+					},
+				},
+			});
+			expect(said).toContain(`Scratch root ${root} kept: not archived: `);
+			expect(readlinkSync(join(root, "link"))).toBe("newer.txt");
+			ledger.close();
+		});
+
+		test("an archive that does not hold the tree (its contents differ once extracted) fails verification and keeps the root", () => {
+			const { ledger, wl, home, root, leftovers } = setUp();
+			const other = tmp("scratch-other");
+			writeFileSync(join(other, "REPORT.md"), "zzzz");
+			const said = closeScratchRoot(ledger, { HOME: home }, wl, {
+				now,
+				seams: {
+					afterTar: () => {
+						const partial = leftovers().find((n) => n.includes(".partial-"))!;
+						const at = join(scratchArchiveBase(home), "2026-10-28", partial);
+						expect(Bun.spawnSync(["tar", "-czf", at, "-C", other, "."], { env: { ...process.env, COPYFILE_DISABLE: "1" } }).exitCode).toBe(0);
+					},
+				},
+			});
+			expect(said).toContain(`Scratch root ${root} kept: not archived: the archive does not hold the tree: `);
+			expect(readFileSync(join(root, "REPORT.md"), "utf8")).toBe("aaaa");
+			expect(leftovers()).toEqual([]);
+			ledger.close();
+		});
+
+		test("too little free space on the archive volume refuses before tar runs and keeps the root", () => {
+			const { ledger, wl, home, root, leftovers } = setUp();
+			let tarRan = false;
+			const said = closeScratchRoot(ledger, { HOME: home }, wl, { now, seams: { freeBytes: () => 1024, afterTar: () => (tarRan = true) } });
+			expect(tarRan).toBe(false);
+			expect(said).toContain(`Scratch root ${root} kept: not archived: 0.0 GiB free on `);
+			expect(said).toContain("so the archive was not started");
+			expect(readFileSync(join(root, "REPORT.md"), "utf8")).toBe("aaaa");
+			expect(leftovers()).toEqual([]);
+			ledger.close();
+		});
 	});
 
 	test("a root that is a symlink is refused: the close still goes through, the target is untouched, scratch-remove-failed: is recorded", async () => {
@@ -391,7 +516,7 @@ describe("orchestrator_close_workload archives the root, then removes it, after 
 		const said = await a.close();
 		expect(said).toContain(`Scratch root ${scratchRootFor(a.home, a.wl)} archived to ${scratchArchiveBase(a.home)}/`);
 		expect(said).toContain(") and removed (entries ");
-		expect(members(onlyArchive(a.home)!)).toEqual([a.wl, `${a.wl}/f.txt`]);
+		expect(members(onlyArchive(a.home)!)).toEqual(["", "f.txt"]);
 		expect(existsSync(join(real, a.wl))).toBe(false);
 		expect(existsSync(sibling)).toBe(true);
 		expect(realpathSync(real)).toBe(realpathSync(join(a.home, "agent-scratch", "agent-system-2.0", "scratch")));

@@ -1,14 +1,25 @@
 // Scratch roots are archived before they are removed (incident 2026-10-28: the close of wl-mvs2x210k5ifkz deleted the
 // review-cost replay's REPORT.md and its evidence seconds after the lane's done-because, en-mvsodoos0xh1rm, named it).
 // One `.tar.gz` per root, under scratchArchiveBase(home)/<UTC YYYY-MM-DD>/, a sibling of the scratch base, so the scratch
-// sweeps never see it. `archiveDir` writes the archive to a `.partial-*` name, lists it back with `tar -tzf` and checks
-// the entry count against an lstat walk of the tree, checks the tree did not change while it was archived (same entry
-// count, byte total and newest mtime before and after), hashes it, and only then links it to its final name. Any
-// failure removes the partial file and says why; the caller keeps the root. The daily sweep (surface/scripts/scratch-sweep.ts)
-// expires archives older than `scratchArchive.expireDays`, and, when `scratchArchive.requireOffsite` is on, only those
-// with an `<archive>.offsite` marker beside them (written by an offsite copy job once its copy is confirmed).
+// sweeps never see it. The caller first renames the root aside (surface/src/scratch-remove.ts detachChild), so nothing
+// that writes by the root's path reaches the tree being archived. `archiveDetached` then:
+//   1. reads the tree's manifest: every entry's relative path, type, size, permission bits, inode, mtime and ctime in
+//      nanoseconds, a regular file's SHA-256 and a link's target (`readManifest`); a socket, FIFO or device refuses;
+//   2. admits the archive only when the destination volume has room for it and for its verification copy, plus
+//      ARCHIVE_MARGIN_BYTES;
+//   3. writes it as `<final>.partial-<12 hex>` with `tar -C <tree> -czf … .` (members `./…`);
+//   4. extracts it into a private `.verify-*` directory beside it and compares that copy's manifest with the tree's,
+//      entry by entry (path, type, size, permission bits, content hash, link target); any difference fails;
+//   5. hashes the archive and links it to its final name (a link never replaces a name);
+//   6. reads the tree's manifest again and compares identities (inode, size, mtime and ctime in nanoseconds, link
+//      target): a write anywhere in the tree since step 1 changes the ctime of the entry written, so it fails, and the
+//      archive is dropped.
+// Only then may the caller remove the tree. Any failure leaves the tree as it is and says why.
+// The daily sweep (surface/scripts/scratch-sweep.ts) expires archives older than `scratchArchive.expireDays`, and, when
+// `scratchArchive.requireOffsite` is on, only those with an `<archive>.offsite` marker beside them (written by an offsite
+// copy job once its copy is confirmed).
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, closeSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmdirSync, type Stats, statfsSync, statSync, unlinkSync } from "node:fs";
+import { type BigIntStats, chmodSync, closeSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, rmdirSync, rmSync, type Stats, statfsSync, statSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { installedConfigPath } from "./pair-suggest";
 
@@ -18,12 +29,21 @@ export const SCRATCH_ARCHIVE_KEY = "scratchArchive";
 export const SCRATCH_CONFIG_ENV = "AGENT_SYSTEM_SCRATCH_CONFIG";
 /** The marker an offsite copy job writes beside an archive once its copy is confirmed: `<archive>.offsite`. */
 export const OFFSITE_SUFFIX = ".offsite";
+/** The offsite copy job's other sidecars (a failed-night count, a stuck flag); removed with their archive when it expires. */
+export const OFFSITE_SIDECARS = [".attempts", ".stuck"] as const;
 export const ARCHIVE_SUFFIX = ".tar.gz";
 const PARTIAL_INFIX = ".partial-";
-/** Upper bound on one `tar` run (create or list). */
+/** Exactly the name `archiveDetached` writes before an archive is verified: `<final>.tar.gz.partial-<12 lowercase hex>`. */
+const PARTIAL_RE = /\.tar\.gz\.partial-[0-9a-f]{12}$/;
+const VERIFY_PREFIX = ".verify-";
+/** Upper bound on one `tar` run (create or extract). */
 const TAR_TIMEOUT_MS = 15 * 60_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const GIB = 1024 ** 3;
+/** Free space an archive must leave on its volume, beyond the archive and its verification copy. */
+export const ARCHIVE_MARGIN_BYTES = GIB;
+/** Room counted per entry for tar's headers (a 512-byte header, and a pax header for long names). */
+const TAR_ENTRY_BYTES = 1536;
 
 export interface ScratchArchiveConfig {
 	/** Archives whose mtime is older than this many days are expired by the daily sweep. */
@@ -46,9 +66,9 @@ export function utcDate(t: Date): string {
 	return t.toISOString().slice(0, 10);
 }
 
-/** The archive path for workload `id` closed at `now` (before any de-duplicating suffix `archiveDir` adds). */
-export function archivePathFor(home: string, id: string, now: Date): string {
-	return join(scratchArchiveBase(home), utcDate(now), `${id}${ARCHIVE_SUFFIX}`);
+/** The archive path for the directory named `name` archived at `now` (before any de-duplicating suffix); a leading `.` is dropped. */
+export function archivePathFor(home: string, name: string, now: Date): string {
+	return join(scratchArchiveBase(home), utcDate(now), `${name.replace(/^\.+/, "")}${ARCHIVE_SUFFIX}`);
 }
 
 const isNonNegative = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x) && x >= 0;
@@ -99,41 +119,135 @@ export function readScratchArchiveConfig(env: Readonly<Record<string, string | u
 	}
 }
 
-/** What a tree is, for "did it change while it was archived": entries (itself included), regular-file bytes, newest lstat mtime. */
-export interface TreeStamp {
-	entries: number;
-	bytes: number;
-	newestMs: number;
+
+const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/** One entry of a tree: what `readManifest` records about it. */
+export interface ManifestEntry {
+	type: "file" | "dir" | "link";
+	/** Bytes of a regular file; 0 otherwise. */
+	size: number;
+	/** Permission bits (mode & 0o7777). */
+	mode: number;
+	/** SHA-256 of a regular file's contents when read with hashes; null otherwise. */
+	sha256: string | null;
+	/** A symlink's target; null otherwise. */
+	target: string | null;
+	dev: bigint;
+	ino: bigint;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
 }
 
-/** An lstat walk of `dir` (links are not followed). Throws when any entry cannot be read. */
-export function treeStamp(dir: string): TreeStamp {
-	const stamp: TreeStamp = { entries: 0, bytes: 0, newestMs: 0 };
-	const stack = [dir];
+/** A tree's entries by path relative to its top ("" for the top itself, "a/b" below it). */
+export type Manifest = Map<string, ManifestEntry>;
+
+/**
+ * Every entry under `dir` (itself included; links are recorded, never followed), with regular files hashed when `hash`.
+ * Throws when an entry cannot be read, or is a socket, FIFO or device (tar cannot be trusted to round-trip one).
+ */
+export function readManifest(dir: string, hash: boolean): Manifest {
+	const out: Manifest = new Map();
+	const stack: string[] = [""];
 	while (stack.length > 0) {
-		const at = stack.pop()!;
-		const st = lstatSync(at);
-		stamp.entries++;
-		stamp.newestMs = Math.max(stamp.newestMs, st.mtimeMs);
-		if (st.isFile()) stamp.bytes += st.size;
-		if (st.isDirectory()) for (const name of readdirSync(at)) stack.push(join(at, name));
+		const rel = stack.pop()!;
+		const abs = rel === "" ? dir : join(dir, rel);
+		const st: BigIntStats = lstatSync(abs, { bigint: true });
+		const type = st.isFile() ? "file" : st.isDirectory() ? "dir" : st.isSymbolicLink() ? "link" : null;
+		if (type === null) throw new Error(`${abs} is a socket, FIFO or device; not archivable`);
+		out.set(rel, {
+			type,
+			size: type === "file" ? Number(st.size) : 0,
+			mode: Number(st.mode & 0o7777n),
+			sha256: type === "file" && hash ? sha256File(abs) : null,
+			target: type === "link" ? readlinkSync(abs) : null,
+			dev: st.dev,
+			ino: st.ino,
+			mtimeNs: st.mtimeNs,
+			ctimeNs: st.ctimeNs,
+		});
+		if (type === "dir") for (const name of readdirSync(abs)) stack.push(rel === "" ? name : `${rel}/${name}`);
 	}
-	return stamp;
+	return out;
 }
 
-/** A written, verified archive: its final path, size, SHA-256, member count, and the tree as it was archived. */
+const shown = (rel: string): string => (rel === "" ? "the top directory" : `./${rel}`);
+
+/** Entries only one side has, then per-entry field differences picked by `fields`, at most `limit` of them. */
+function differences(a: Manifest, b: Manifest, aName: string, bName: string, fields: (x: ManifestEntry, y: ManifestEntry, rel: string) => string | null, limit: number): string[] {
+	const out: string[] = [];
+	const more = (): boolean => out.length < limit;
+	for (const [rel, x] of a) {
+		if (!more()) break;
+		const y = b.get(rel);
+		if (!y) out.push(`${shown(rel)} is in ${aName}, not in ${bName}`);
+		else {
+			const d = fields(x, y, rel);
+			if (d) out.push(`${shown(rel)} ${d}`);
+		}
+	}
+	for (const rel of b.keys()) {
+		if (!more()) break;
+		if (!a.has(rel)) out.push(`${shown(rel)} is in ${bName}, not in ${aName}`);
+	}
+	return out;
+}
+
+/**
+ * What differs in content between two manifests read with hashes: entry set, type, size, permission bits (not of the top
+ * directory, whose mode the extraction directory decides), contents and link targets. Empty when they hold the same tree.
+ */
+export function contentDiff(a: Manifest, b: Manifest, aName = "the tree", bName = "the archive", limit = 3): string[] {
+	return differences(a, b, aName, bName, (x, y, rel) => {
+		if (x.type !== y.type) return `is a ${x.type} in ${aName}, a ${y.type} in ${bName}`;
+		if (x.size !== y.size) return `is ${x.size} bytes in ${aName}, ${y.size} in ${bName}`;
+		if (rel !== "" && (x.mode & 0o777) !== (y.mode & 0o777)) return `has mode ${(x.mode & 0o777).toString(8)} in ${aName}, ${(y.mode & 0o777).toString(8)} in ${bName}`;
+		if (x.sha256 !== y.sha256) return `has other contents in ${bName}`;
+		if (x.target !== y.target) return `points to ${x.target} in ${aName}, ${y.target} in ${bName}`;
+		return null;
+	}, limit);
+}
+
+/**
+ * What changed between two reads of the same tree: entry set, type, inode, size, permission bits, mtime and ctime in
+ * nanoseconds, link target. Any write, rename, chmod or relink of an entry changes its ctime, which no process can set.
+ */
+export function identityDiff(before: Manifest, after: Manifest, limit = 3): string[] {
+	return differences(before, after, "the tree as archived", "the tree now", (x, y) => {
+		if (x.type !== y.type) return `was a ${x.type}, is a ${y.type}`;
+		if (x.dev !== y.dev || x.ino !== y.ino) return "is another file (its inode changed)";
+		if (x.size !== y.size) return `changed size (${x.size} → ${y.size} bytes)`;
+		if (x.target !== y.target) return `was relinked (${x.target} → ${y.target})`;
+		if (x.mode !== y.mode) return "changed mode";
+		if (x.mtimeNs !== y.mtimeNs || x.ctimeNs !== y.ctimeNs) return "was written or changed (its mtime or ctime moved)";
+		return null;
+	}, limit);
+}
+
+/** A written, verified archive: its final path, size, SHA-256, the tree's manifest as archived, and anything to report. */
 export interface Archived {
 	kind: "archived";
 	path: string;
 	bytes: number;
 	sha256: string;
+	/** Entries archived (the top directory included). */
 	entries: number;
-	stamp: TreeStamp;
+	members: Manifest;
+	/** Something that went wrong after the archive was verified (a verification copy left behind); reported, not fatal. */
+	warnings: string[];
 }
 
 export type ArchiveResult = Archived | { kind: "failed"; reason: string };
 
-const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+/** Test and caller seams of `archiveDetached`. */
+export interface ArchiveSeams {
+	/** Replaces the statfs read of free bytes on the archive volume. */
+	freeBytes?: (path: string) => number | null;
+	/** Runs after tar wrote the archive, before it is verified. */
+	afterTar?: () => void;
+	/** Runs after the archive is verified, hashed and linked, before the tree is read again. */
+	beforeFinalCheck?: () => void;
+}
 
 /** SHA-256 of the file at `path`, read in 1 MiB chunks. */
 function sha256File(path: string): string {
@@ -169,51 +283,101 @@ function freeName(dest: string): string {
 const tarEnv = (): Record<string, string> => {
 	const env: Record<string, string> = {};
 	for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
-	// macOS bsdtar would add AppleDouble `._*` members for extended attributes; they would break the entry count.
+	// macOS bsdtar would add AppleDouble `._*` members for extended attributes; they would not be in the tree's manifest.
 	env.COPYFILE_DISABLE = "1";
 	return env;
 };
 
+function tar(args: string[]): string | null {
+	const r = Bun.spawnSync(["tar", ...args], { stdout: "pipe", stderr: "pipe", env: tarEnv(), timeout: TAR_TIMEOUT_MS });
+	if (r.exitCode === 0) return null;
+	return `tar ${args[0]} exited ${r.exitCode ?? r.signalCode ?? "?"}: ${r.stderr.toString().trim().split("\n")[0] || "no message"}`;
+}
+
+/** Remove a verification copy (directories made writable first, so a read-only directory in the tree cannot pin it). */
+function removeCopy(dir: string): string | null {
+	try {
+		const stack = [dir];
+		while (stack.length > 0) {
+			const at = stack.pop()!;
+			const st = lstatSync(at);
+			if (!st.isDirectory()) continue;
+			chmodSync(at, st.mode | 0o700);
+			for (const name of readdirSync(at)) stack.push(join(at, name));
+		}
+		rmSync(dir, { recursive: true });
+		return null;
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+		return `the verification copy ${dir} could not be removed (${message(e)})`;
+	}
+}
+
 /**
- * Archive the directory `name` under `parent` to `dest` (or the first free `.<n>` variant of it) and verify it: tar
- * exits 0, `tar -tzf` lists exactly as many members as the lstat walk found, the tree is unchanged after the archive
- * was written, and the file is not empty. The archive is written as `<final>.partial-<hex>` and linked to its final
- * name only once verified (a link never replaces an existing name). Nothing under `parent` is changed. Never throws.
+ * Archive the detached tree `dir` to `dest` (or the first free `.<n>` variant of it) and verify it (steps 1–6 at the top of
+ * this file). Changes nothing in `dir`. Never throws; on failure nothing is left under the destination but what was there.
  */
-export function archiveDir(parent: string, name: string, dest: string): ArchiveResult {
-	const dir = join(parent, name);
+export function archiveDetached(dir: string, dest: string, seams: ArchiveSeams = {}): ArchiveResult {
 	let partial: string | null = null;
+	let copy: string | null = null;
 	const fail = (reason: string): ArchiveResult => {
+		const also: string[] = [];
+		if (copy) {
+			const r = removeCopy(copy);
+			if (r) also.push(r);
+		}
 		if (partial) {
 			try {
 				unlinkSync(partial);
-			} catch {}
+			} catch (e) {
+				if ((e as NodeJS.ErrnoException).code !== "ENOENT") also.push(`the partial archive ${partial} could not be removed (${message(e)})`);
+			}
 		}
-		return { kind: "failed", reason };
+		return { kind: "failed", reason: also.length ? `${reason}; ${also.join("; ")}` : reason };
 	};
 	try {
-		const before = treeStamp(dir);
-		mkdirSync(dirname(dest), { recursive: true, mode: 0o700 });
+		const before = readManifest(dir, true);
+		let bytes = 0;
+		for (const e of before.values()) bytes += e.size;
+		const at = dirname(dest);
+		mkdirSync(at, { recursive: true, mode: 0o700 });
+		const need = 2 * (bytes + TAR_ENTRY_BYTES * before.size) + ARCHIVE_MARGIN_BYTES;
+		const free = (seams.freeBytes ?? freeBytes)(at);
+		if (free === null) return fail(`the free space on ${at} cannot be read, so the archive was not started`);
+		if (free < need) return fail(`${gib(free)} GiB free on ${at}; the archive and its verification copy need up to ${gib(need)} GiB (${gib(bytes)} GiB in ${before.size} entries, twice, plus a ${gib(ARCHIVE_MARGIN_BYTES)} GiB margin), so the archive was not started`);
 		const final = freeName(dest);
 		partial = `${final}${PARTIAL_INFIX}${randomBytes(6).toString("hex")}`;
-		const made = Bun.spawnSync(["tar", "-C", parent, "-czf", partial, "--", name], { stdout: "pipe", stderr: "pipe", env: tarEnv(), timeout: TAR_TIMEOUT_MS });
-		if (made.exitCode !== 0) return fail(`tar -czf exited ${made.exitCode ?? made.signalCode ?? "?"}: ${made.stderr.toString().trim().split("\n")[0] || "no message"}`);
-		const listed = Bun.spawnSync(["tar", "-tzf", partial], { stdout: "pipe", stderr: "pipe", env: tarEnv(), timeout: TAR_TIMEOUT_MS });
-		if (listed.exitCode !== 0) return fail(`tar -tzf of ${partial} exited ${listed.exitCode ?? listed.signalCode ?? "?"}: ${listed.stderr.toString().trim().split("\n")[0] || "no message"}`);
-		const members = listed.stdout.toString().split("\n").filter((l) => l !== "").length;
-		if (members !== before.entries) return fail(`the archive lists ${members} members, the tree has ${before.entries} entries`);
-		const after = treeStamp(dir);
-		if (before.entries !== after.entries || before.bytes !== after.bytes || before.newestMs !== after.newestMs) {
-			return fail(`${dir} changed while it was archived (${before.entries} → ${after.entries} entries, ${before.bytes} → ${after.bytes} bytes)`);
-		}
-		const bytes = statSync(partial).size;
-		if (bytes === 0) return fail(`${partial} is empty`);
+		const made = tar(["-czf", partial, "-C", dir, "."]);
+		if (made) return fail(made);
+		seams.afterTar?.();
+		copy = join(at, `${VERIFY_PREFIX}${randomBytes(8).toString("hex")}`);
+		mkdirSync(copy, { mode: 0o700 });
+		const out = tar(["-xzpf", partial, "-C", copy]);
+		if (out) return fail(`verifying ${partial}: ${out}`);
+		const diff = contentDiff(before, readManifest(copy, true));
+		if (diff.length > 0) return fail(`the archive does not hold the tree: ${diff.join("; ")}`);
+		const warnings: string[] = [];
+		const left = removeCopy(copy);
+		copy = null;
+		if (left) warnings.push(left);
+		const size = statSync(partial).size;
 		const sha256 = sha256File(partial);
 		chmodSync(partial, 0o600);
 		linkSync(partial, final);
 		unlinkSync(partial);
 		partial = null;
-		return { kind: "archived", path: final, bytes, sha256, entries: members, stamp: before };
+		seams.beforeFinalCheck?.();
+		const changed = identityDiff(before, readManifest(dir, false));
+		if (changed.length > 0) {
+			let dropped = `the archive ${final} was dropped`;
+			try {
+				unlinkSync(final);
+			} catch (e) {
+				dropped = `the archive ${final} could not be dropped (${message(e)})`;
+			}
+			return fail(`${dir} changed while it was archived: ${changed.join("; ")}; ${dropped}`);
+		}
+		return { kind: "archived", path: final, bytes: size, sha256, entries: before.size, members: before, warnings };
 	} catch (e) {
 		return fail(message(e));
 	}
@@ -229,10 +393,21 @@ export interface ExpiryLine {
 }
 
 /**
- * The daily sweep's expiry pass over scratchArchiveBase(home): every regular `*.tar.gz` (and every `*.partial-*` a
- * crashed archive left) under a date directory whose mtime is more than `expireDays` before `now` is removed, with its
- * `.offsite` marker; with `requireOffsite`, an archive with no marker is kept. Symlinks and other entries are never
- * touched. Date directories left empty are removed. `dryRun` removes nothing. Never throws.
+ * What an archive-directory file name is: a final archive (ends in exactly `.tar.gz`; its `.offsite` gate always applies),
+ * a partial `archiveDetached` left (exactly `<…>.tar.gz.partial-<12 hex>`), or anything else (never touched).
+ */
+export function archiveNameKind(name: string): "final" | "partial" | null {
+	if (name.endsWith(ARCHIVE_SUFFIX)) return "final";
+	if (PARTIAL_RE.test(name)) return "partial";
+	return null;
+}
+
+/**
+ * The daily sweep's expiry pass over scratchArchiveBase(home): every regular final archive and partial (archiveNameKind)
+ * under a date directory whose mtime is more than `expireDays` before `now` is removed, a final archive with its `.offsite`
+ * marker; with `requireOffsite`, a final archive with no marker is kept. Anything else (markers alone, verification copies,
+ * other files, symlinks) is never touched. A date directory left empty is removed (rmdir, never recursive). `dryRun` removes
+ * nothing. Never throws.
  */
 export function expireArchives(home: string, config: ScratchArchiveConfig, now: Date, dryRun: boolean): { lines: ExpiryLine[]; notes: string[] } {
 	const base = scratchArchiveBase(home);
@@ -258,9 +433,13 @@ export function expireArchives(home: string, config: ScratchArchiveConfig, now: 
 			continue;
 		}
 		for (const name of names) {
-			const partial = name.includes(`${ARCHIVE_SUFFIX}${PARTIAL_INFIX}`);
-			if (!partial && !name.endsWith(ARCHIVE_SUFFIX)) continue;
 			const path = join(dayDir, name);
+			if (name.startsWith(VERIFY_PREFIX)) {
+				notes.push(`${path} is a verification copy an archive run left behind; not removed (remove it by hand)`);
+				continue;
+			}
+			const kind = archiveNameKind(name);
+			if (kind === null) continue;
 			let st: Stats;
 			try {
 				st = lstatSync(path);
@@ -276,21 +455,37 @@ export function expireArchives(home: string, config: ScratchArchiveConfig, now: 
 			}
 			const marker = `${path}${OFFSITE_SUFFIX}`;
 			let hasMarker = false;
-			try {
-				hasMarker = lstatSync(marker).isFile();
-			} catch {}
-			if (!partial && config.requireOffsite && !hasMarker) {
-				lines.push({ path, bytes: st.size, action: "kept", why: `${ageDays.toFixed(1)} days old, but no ${OFFSITE_SUFFIX} marker (requireOffsite)` });
-				continue;
+			if (kind === "final") {
+				try {
+					hasMarker = lstatSync(marker).isFile();
+				} catch {
+					hasMarker = false;
+				}
+				if (config.requireOffsite && !hasMarker) {
+					lines.push({ path, bytes: st.size, action: "kept", why: `${ageDays.toFixed(1)} days old, but no ${OFFSITE_SUFFIX} marker (requireOffsite)` });
+					continue;
+				}
 			}
-			const why = `${ageDays.toFixed(1)} days old, over ${config.expireDays}${partial ? " (a partial archive)" : hasMarker ? ", offsite copy confirmed" : ""}`;
+			const why = `${ageDays.toFixed(1)} days old, over ${config.expireDays}${kind === "partial" ? " (a partial archive)" : hasMarker ? ", offsite copy confirmed" : ""}`;
 			if (dryRun) {
 				lines.push({ path, bytes: st.size, action: "would expire", why });
 				continue;
 			}
 			try {
 				unlinkSync(path);
-				if (hasMarker) unlinkSync(marker);
+				if (kind === "final") {
+					if (hasMarker) unlinkSync(marker);
+					for (const s of OFFSITE_SIDECARS) {
+						const side = `${path}${s}`;
+						let isFile = false;
+						try {
+							isFile = lstatSync(side).isFile();
+						} catch (e) {
+							if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+						}
+						if (isFile) unlinkSync(side);
+					}
+				}
 				lines.push({ path, bytes: st.size, action: "expired", why });
 			} catch (e) {
 				lines.push({ path, bytes: st.size, action: "expire failed", why: `${why}; ${message(e)}` });
@@ -298,11 +493,10 @@ export function expireArchives(home: string, config: ScratchArchiveConfig, now: 
 		}
 		if (!dryRun) {
 			try {
-				if (readdirSync(dayDir).length === 0) {
-					// rmdir, never recursive: anything that appeared meanwhile keeps the directory.
-					rmdirSync(dayDir);
-				}
-			} catch {}
+				if (readdirSync(dayDir).length === 0) rmdirSync(dayDir);
+			} catch (e) {
+				notes.push(`${dayDir} is empty but could not be removed (${message(e)})`);
+			}
 		}
 	}
 	return { lines, notes };

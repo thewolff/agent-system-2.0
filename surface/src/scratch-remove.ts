@@ -90,7 +90,7 @@ export function detachChild(parent: string, name: string, judged: Identity, hook
 		return { kind: "refused", path: child, reason: `the renamed ${doomed} cannot be checked (${message(e)}); nothing removed` };
 	}
 	if (moved.isSymbolicLink() || !moved.isDirectory() || moved.dev !== judged.dev || moved.ino !== judged.ino) {
-		return { kind: "refused", path: child, reason: `the rename reached a directory that is not the one judged (an ancestor of ${child} was swapped); ${putBack(doomed, child)}; nothing removed` };
+		return { kind: "refused", path: child, reason: `the rename reached a directory that is not the one judged (an ancestor of ${child} was swapped); ${putBack(doomed, child).said}; nothing removed` };
 	}
 	return { kind: "detached", path: child, doomed };
 }
@@ -111,19 +111,27 @@ export function removeChild(parent: string, name: string, judged: Identity, hook
 	return d.kind === "detached" ? purgeDetached(d) : d;
 }
 
+/**
+ * Undo detachChild when the caller keeps the tree (its archive failed): rename it back to its name when nothing took that
+ * name meanwhile. `at` is where the tree is now. Never throws.
+ */
+export function restoreDetached(d: Detached): { at: string; said: string } {
+	return putBack(d.doomed, d.path);
+}
+
 /** Rename `from` back to `to` when nothing took `to` meanwhile (a rename onto an empty directory would replace it); says what became of it. */
-function putBack(from: string, to: string): string {
+function putBack(from: string, to: string): { at: string; said: string } {
 	try {
 		lstatSync(to);
-		return `left at ${from}: ${to} exists again`;
+		return { at: from, said: `left at ${from}: ${to} exists again` };
 	} catch (e) {
-		if ((e as NodeJS.ErrnoException).code !== "ENOENT") return `left at ${from}: ${to} cannot be checked (${message(e)})`;
+		if ((e as NodeJS.ErrnoException).code !== "ENOENT") return { at: from, said: `left at ${from}: ${to} cannot be checked (${message(e)})` };
 	}
 	try {
 		renameSync(from, to);
-		return `renamed back to ${to}`;
+		return { at: to, said: `renamed back to ${to}` };
 	} catch (e) {
-		return `left at ${from}: renaming back failed (${message(e)})`;
+		return { at: from, said: `left at ${from}: renaming back failed (${message(e)})` };
 	}
 }
 

@@ -21,6 +21,12 @@ import { sh, tmp } from "./helpers";
 
 const SCRIPT = join(import.meta.dir, "..", "scripts", "scratch-sweep.ts");
 const DAY_MS = 24 * 60 * 60 * 1000;
+/**
+ * The one clock of this file: the ledger handles write with it, every lease and age is set from it, and every sweep runs at it
+ * (--now, or the `now` argument). Nothing here depends on the wall clock.
+ */
+const FIXTURE_NOW = new Date("2026-10-28T04:30:00.000Z");
+const FIXTURE_ISO = FIXTURE_NOW.toISOString();
 const dirs: string[] = [];
 afterAll(() => {
 	for (const d of dirs) rmSync(d, { recursive: true, force: true });
@@ -45,14 +51,14 @@ function world(): World {
 	const base = scratchBase(home);
 	mkdirSync(base, { recursive: true });
 	const ledgerPath = join(home, ".agent-system-2", "ledger.db");
-	const ledger = Ledger.open(ledgerPath, { create: true, backup: false, backupOnOpen: false });
+	const ledger = Ledger.open(ledgerPath, { create: true, backup: false, backupOnOpen: false, clock: () => FIXTURE_ISO });
 	const config = join(home, "sweep-config.yml");
 	writeFileSync(config, "scratchArchive:\n  expireDays: 14\n  requireOffsite: false\n  minFreeGib: 0\n");
 	return { home, base, outside, legacyTmp, ledgerPath, ledger, config };
 }
 
 /** Direct-call args: the defaults but no disk guard (see World.config). */
-const argsOf = (w: World, archive: Partial<ScratchArchiveConfig> = {}) => ({ dryRun: false, home: w.home, legacyTmp: w.legacyTmp, archive: { ...DEFAULT_SCRATCH_ARCHIVE, minFreeGib: 0, ...archive }, configNotes: [] });
+const argsOf = (w: World, archive: Partial<ScratchArchiveConfig> = {}) => ({ dryRun: false, home: w.home, legacyTmp: w.legacyTmp, archive: { ...DEFAULT_SCRATCH_ARCHIVE, minFreeGib: 0, ...archive }, configNotes: [], now: FIXTURE_NOW });
 
 /** A root with one file (and a nested one) under the base. */
 function root(w: World, name: string): string {
@@ -63,9 +69,9 @@ function root(w: World, name: string): string {
 	return r;
 }
 
-/** Every entry under `path` (itself included) set to `days` days old, deepest first (a directory's mtime moves when a child is written). */
+/** Every entry under `path` (itself included) set to `days` days before FIXTURE_NOW, deepest first (a directory's mtime moves when a child is written). */
 function age(path: string, days: number): void {
-	const t = new Date(Date.now() - days * DAY_MS);
+	const t = new Date(FIXTURE_NOW.getTime() - days * DAY_MS);
 	const walk = (p: string): void => {
 		for (const e of readdirSync(p, { withFileTypes: true })) {
 			if (e.isDirectory()) walk(join(p, e.name));
@@ -80,7 +86,7 @@ function sweep(w: World, args: string[] = [], env: Record<string, string | undef
 	const merged: Record<string, string | undefined> = { ...process.env, AGENT_SYSTEM_SCRATCH_TOTAL_MB: undefined, AGENT_SYSTEM_SCRATCH_CONFIG: w.config, ...env, AGENT_SYSTEM_LEDGER_DB: w.ledgerPath };
 	const clean: Record<string, string> = {};
 	for (const [k, v] of Object.entries(merged)) if (v !== undefined) clean[k] = v;
-	return sh([process.execPath, SCRIPT, "--home", w.home, "--legacy-tmp", w.legacyTmp, ...args], w.home, clean);
+	return sh([process.execPath, SCRIPT, "--home", w.home, "--legacy-tmp", w.legacyTmp, "--now", FIXTURE_ISO, ...args], w.home, clean);
 }
 
 /** The disk entries the sweep wrote on the standing workload, oldest first. */
@@ -119,6 +125,8 @@ describe("scratch sweep: which roots go", () => {
 	const freshRoot = root(w, fresh);
 	age(freshRoot, 10);
 	writeFileSync(join(freshRoot, "repo", "src", "new.ts"), "changed today"); // one deep change keeps the whole root
+	const changed = new Date(FIXTURE_NOW.getTime() - 60 * 60 * 1000);
+	utimesSync(join(freshRoot, "repo", "src", "new.ts"), changed, changed);
 	// A symlinked child (named like a root of a closed workload) and a plain file: refused, left alone.
 	mkdirSync(join(w.outside, "target"));
 	writeFileSync(join(w.outside, "target", "data"), "keep");
@@ -132,8 +140,9 @@ describe("scratch sweep: which roots go", () => {
 	mkdirSync(join(w.home, ".agent-system-2", "test-runs", "run-1"), { recursive: true });
 	writeFileSync(join(w.home, ".agent-system-2", "test-runs", "run-1", "log"), "log");
 
-	test("the lapsed claim's lease ended before the run", () => {
+	test("the lapsed claim's lease ended before the run; the held one's lease runs past it", () => {
 		expect(w.ledger.workload(lapsed)!.holder_lease_until).toBe("2026-01-01T01:00:00.000Z");
+		expect(w.ledger.workload(held)!.holder_lease_until).toBe("2026-10-28T05:30:00.000Z");
 	});
 
 	test("closed, unknown, idle-unheld and lapsed roots are removed; held and fresh kept; symlink and file refused", () => {
@@ -157,8 +166,8 @@ describe("scratch sweep: which roots go", () => {
 		for (const p of archives) expect(recorded.some((e) => e.body.includes(` ${p} `))).toBe(true);
 		const closedArchive = archives.find((p) => p.endsWith(`/${closed}.tar.gz`))!;
 		const listed = Bun.spawnSync(["tar", "-tzf", closedArchive], { stdout: "pipe" }).stdout.toString();
-		expect(listed).toContain(`${closed}/repo/src/a.ts`);
-		expect(listed).toContain(`${closed}/escape`);
+		expect(listed).toContain("./repo/src/a.ts");
+		expect(listed).toContain("./escape");
 		// the link inside was archived as a link: the file it points at is not in the archive
 		expect(listed).not.toContain("secret");
 	});
@@ -249,7 +258,7 @@ describe("scratch sweep: what it never does", () => {
 		const w = world();
 		const wl = open(w);
 		age(root(w, wl), 4);
-		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, new Date(), {
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, FIXTURE_NOW, {
 			beforeRemove: (name) => {
 				if (name === wl) w.ledger.claimWorkload(wl, { by: "lane-r", holder: "lane-r", leaseMs: 3_600_000 });
 			},
@@ -270,7 +279,7 @@ describe("scratch sweep: what it never does", () => {
 		const claim = () => lane.claimWorkload(wl, { by: "lane-r", holder: "lane-r", leaseMs: 3_600_000 });
 		let during = "the seam was not reached";
 		try {
-			const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, new Date(), {
+			const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, FIXTURE_NOW, {
 				inLock: (name) => {
 					if (name !== wl) return;
 					try {
@@ -291,7 +300,7 @@ describe("scratch sweep: what it never does", () => {
 		}
 	});
 
-	test("a leftover .removing-* is removed once idle for 3 days; a fresh one is left alone", () => {
+	test("a leftover .removing-* idle for 3 days is archived like a root (its name proves nothing) and then removed; a fresh one is left alone", () => {
 		const w = world();
 		const oldLeft = join(w.base, ".removing-wl-gone-0123456789abcdef");
 		mkdirSync(join(oldLeft, "deep"), { recursive: true });
@@ -300,17 +309,52 @@ describe("scratch sweep: what it never does", () => {
 		const freshLeft = join(w.base, ".removing-wl-busy-fedcba9876543210");
 		mkdirSync(freshLeft);
 		writeFileSync(join(freshLeft, "f"), "x");
+		age(freshLeft, 0.05);
 		const r = sweep(w);
 		expect({ code: r.code, err: r.err }).toEqual({ code: 0, err: "" });
 		expect(readdirSync(w.base)).toEqual([".removing-wl-busy-fedcba9876543210"]);
 		expect(r.out).toMatch(/\| \.removing-wl-gone-0123456789abcdef \| \d+ \| removed \| a removal leftover, nothing changed since .* \(over 3 days\) \|/);
 		expect(r.out).toMatch(/\| \.removing-wl-busy-fedcba9876543210 \| \d+ \| kept \| a removal leftover or in progress, changed within 3 days /);
+		const archive = join(scratchArchiveBase(w.home), "2026-10-28", "removing-wl-gone-0123456789abcdef.tar.gz");
+		const listed = Bun.spawnSync(["tar", "-tzf", archive], { stdout: "pipe" }).stdout.toString();
+		expect(listed).toContain("./deep/f");
+		expect(w.ledger.entries(STANDING_WORKLOAD_ID, "assumption").some((e) => e.body.startsWith(`${SCRATCH_ENTRY.archived} .removing-wl-gone-0123456789abcdef ${archive} `))).toBe(true);
+	});
+
+	test("a write into the detached tree before the final check fails that root's archive: it is renamed back, kept, and the other roots still go", () => {
+		const w = world();
+		const a = open(w);
+		const b = open(w);
+		w.ledger.closeWorkload(a, { by: "orchestrator-surface" });
+		w.ledger.closeWorkload(b, { by: "orchestrator-surface" });
+		root(w, a);
+		root(w, b);
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, FIXTURE_NOW, {
+			archive: (name) =>
+				name !== a
+					? {}
+					: {
+							beforeFinalCheck: () => {
+								const d = readdirSync(w.base).find((n) => n.startsWith(".removing-"))!;
+								writeFileSync(join(w.base, d, "notes.md"), "NOTES");
+							},
+						},
+		});
+		expect(r.exit).toBe(1);
+		expect(readFileSync(join(w.base, a, "notes.md"), "utf8")).toBe("NOTES");
+		const line = r.roots.find((x) => x.name === a)!;
+		expect(line.action).toBe("archive failed");
+		expect(line.why).toContain("changed while it was archived: ./notes.md ");
+		expect(line.why).toContain(`kept, renamed back to ${join(w.base, a)}`);
+		expect(existsSync(join(w.base, b))).toBe(false);
+		expect(r.roots.find((x) => x.name === b)!.action).toBe("removed");
+		expect(readdirSync(join(scratchArchiveBase(w.home), "2026-10-28"))).toEqual([`${b}.tar.gz`]);
 	});
 });
 
 describe("scratch sweep: archives (expiry, offsite gate, failures) and the disk guard", () => {
-	/** A fixed run time: every age below is set relative to it, never to the wall clock. */
-	const NOW = new Date("2026-10-28T04:30:00.000Z");
+	/** The file's clock: every age below is set relative to it, never to the wall clock. */
+	const NOW = FIXTURE_NOW;
 	/** An archive file `days` days older than NOW, under the archive base's date directory `day`. */
 	function archiveAt(w: World, day: string, name: string, days: number): string {
 		const dir = join(scratchArchiveBase(w.home), day);
@@ -345,6 +389,61 @@ describe("scratch sweep: archives (expiry, offsite gate, failures) and the disk 
 		expect(readdirSync(scratchArchiveBase(w.home)).sort()).toEqual(["2026-10-01", "2026-10-28"]);
 	});
 
+	test("the cutoff: an archive exactly expireDays old is kept, one a second older expires", () => {
+		const w = world();
+		const at = archiveAt(w, "2026-10-14", "wl-aaat.tar.gz", 14);
+		const over = archiveAt(w, "2026-10-14", "wl-bbover.tar.gz", 14 + 1 / 86_400);
+		runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW);
+		expect([existsSync(at), existsSync(over)]).toEqual([true, false]);
+	});
+
+	test("names are classified exactly: a final whose name holds `.tar.gz.partial-` keeps its offsite gate, only the writer's exact partial suffix is a partial, other names are never touched", () => {
+		const w = world();
+		const trickyFinal = archiveAt(w, "2026-10-01", "analysis.tar.gz.partial-notes.tar.gz", 27);
+		const realPartial = archiveAt(w, "2026-10-01", "wl-aa.tar.gz.partial-abcdef012345", 27);
+		const notPartial = archiveAt(w, "2026-10-01", "notes.tar.gz.partial-draft.txt", 27);
+		const upperHex = archiveAt(w, "2026-10-01", "wl-bb.tar.gz.partial-ABCDEF012345", 27);
+		const marker = archiveAt(w, "2026-10-01", "wl-cc.tar.gz.partial-abcdef012345.offsite", 27);
+		const r = runSweep(argsOf(w, { requireOffsite: true }), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW);
+		expect(r.exit).toBe(0);
+		expect([existsSync(trickyFinal), existsSync(realPartial), existsSync(notPartial), existsSync(upperHex), existsSync(marker)]).toEqual([true, false, true, true, true]);
+		expect(r.expired.find((l) => l.path === trickyFinal)?.why).toContain("no .offsite marker (requireOffsite)");
+		expect(r.expired.find((l) => l.path === realPartial)?.why).toContain("(a partial archive)");
+	});
+
+	test("an expired archive takes its offsite sidecars (.offsite, .attempts, .stuck) with it; a sidecar whose archive is gone is never touched", () => {
+		const w = world();
+		const a = archiveAt(w, "2026-10-01", "wl-aa.tar.gz", 27);
+		for (const s of [".offsite", ".attempts", ".stuck"]) writeFileSync(`${a}${s}`, "x");
+		const orphan = archiveAt(w, "2026-10-01", "wl-gone.tar.gz.offsite", 27);
+		runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW);
+		expect(readdirSync(join(scratchArchiveBase(w.home), "2026-10-01"))).toEqual(["wl-gone.tar.gz.offsite"]);
+		expect(existsSync(orphan)).toBe(true);
+	});
+
+	test("a verification copy left behind is reported, never removed by expiry", () => {
+		const w = world();
+		const copy = join(scratchArchiveBase(w.home), "2026-10-01", ".verify-0123456789abcdef");
+		mkdirSync(copy, { recursive: true });
+		writeFileSync(join(copy, "f"), "x");
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW);
+		expect(existsSync(join(copy, "f"))).toBe(true);
+		expect(r.report).toContain(`${copy} is a verification copy an archive run left behind; not removed (remove it by hand)`);
+	});
+
+	test("too little free space for an archive refuses before tar runs: the root is kept, renamed back", () => {
+		const w = world();
+		const closed = open(w);
+		w.ledger.closeWorkload(closed, { by: "orchestrator-surface" });
+		root(w, closed);
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW, { archive: () => ({ freeBytes: () => 1024 }) });
+		expect(r.exit).toBe(1);
+		const line = r.roots.find((x) => x.name === closed)!;
+		expect(line.action).toBe("archive failed");
+		expect(line.why).toContain("so the archive was not started");
+		expect(existsSync(join(w.base, closed, "repo", "src", "a.ts"))).toBe(true);
+	});
+
 	test("requireOffsite: an old archive without its .offsite marker is kept; one with it is expired with its marker", () => {
 		const w = world();
 		const unconfirmed = archiveAt(w, "2026-10-01", "wl-aanomark.tar.gz", 27);
@@ -371,7 +470,7 @@ describe("scratch sweep: archives (expiry, offsite gate, failures) and the disk 
 		expect(existsSync(join(w.base, closed, "repo", "src", "a.ts"))).toBe(true);
 		const line = r.roots.find((x) => x.name === closed)!;
 		expect(line.action).toBe("archive failed");
-		expect(line.why).toMatch(/^workload closed at .*; not archived \(.+\); kept$/);
+		expect(line.why).toMatch(/^workload closed at .*; not archived \(.+\); kept, renamed back to \S+$/);
 		expect(r.archived).toEqual([]);
 	});
 
