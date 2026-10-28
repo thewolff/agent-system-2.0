@@ -29,7 +29,7 @@ The default starting level is **escalate**. A workload starts **with Jo** on Jo'
 Jo approves most of what reaches them on Plumb's word. Jo, 2026-10-28 at about 9:30 AM PDT (relayed verbatim by Plumb): "keep in mind I have SO many things to approve that I'm not reading them. I just ask you if it's a good idea and if you say so I send approve". The ledger shows the same pattern. `/Users/jowolff/agent-scratch/agent-system-2.0/escalation-policy/DRAFT.md:60`: "Jo approved 54 of the 57 such plans they answered."
 
 Three consequences shape this spec:
-1. **An `approve` is not Jo's judgment of the ask.** It usually means Plumb recommended approving. The labeler (§ 6.2) keeps Jo's own words (overrides, reverts, stepping in, unprompted rulings) apart from approve/deny answers given on a recommendation. Only Jo's own words and Jo's hand labels count as evidence of what Jo wanted.
+1. **An `approve` is not Jo's judgment of the ask.** It usually means Plumb recommended approving. **Jo's free-text messages around an ask are the labeler's primary signal** (§ 6.2), for example "I don't understand why you're handing this to me". Approve and deny answers given on a recommendation are weak signals only. Jo, about 9:50 AM PDT: "can we record me sending messages AROUND the labeling. like 'I don't understand why you're handing this to me'".
 2. **The month-one gate is really Plumb's recommendation plus Jo's one word.** So each proposed change gets an independent cross-lab review before Plumb recommends it (§ 6.4). The builder lab is Anthropic, so the reviewer is OpenAI.
 3. **A human gate nobody reads is a rubber stamp.**
 
@@ -136,25 +136,41 @@ Phoenix already runs locally: `lsof -nP -iTCP:6006 -sTCP:LISTEN` shows python on
 
 The Recorder ships first and in **shadow mode**. It records today's stakes decision next to the level this spec would have chosen, and it changes no behaviour. Every day without it loses labeled cases the eval needs.
 
+**Jo's messages around an ask.** The Recorder also captures what Jo writes, because those messages are the labeler's primary signal (§ 6.2).
+
+**CLAIM**
+The surface already records Jo's inputs. `sqlite3 -readonly ~/.agent-system-2/ledger.db "select count(*), min(created_at), max(created_at) from instructions;"` → `3050|2026-09-30T03:11:05.361Z|2026-10-28T16:02:38.923Z`. The columns are id, workload_id, slice_id, kind, question_id, disposition, channel, author, body, created_by and created_at. One row is Jo's verbatim `WHY DO PRODUCTION STAKES STILL ASK ME` (`in-mvqyleul4fb6dc`, 2026-10-27T17:28:09Z, author `jo`, channel `surface`).
+
+- **Gap: Jo's messages to seats are not in the ledger.** That covers Plumb in its OMP session, and most of Jo's reactions happen there. The Recorder adds a seat-side hook that writes each of Jo's messages, plus the ask it answers, into `instructions` with a seat channel. Without the hook, most reactions are lost.
+- **Attribution.** Each message is tied to the nearest open or just-answered ask: by `question_id` where present, otherwise by time window and thread (same workload or seat session). The Recorder stores the link and how it was made (`question_id`, `window` or `thread`), so the label audit can check it.
+
 ### 6.2 Labeler
 
-A scheduled job (launchd, daily) labels each recorded decision from Jo's behaviour. It sorts what Jo did into two kinds, because of the design fact in § 2:
+A scheduled job (launchd, daily) labels each recorded decision. **Jo's free-text messages around an ask are the primary signal.** The Jev judge (`typesafe/jev-1.13.0`) classifies each attributed message into one of three labels, or `none`:
 
-| Jo's behaviour | Kind | Label |
+| Jo's words (examples) | Label | What it feeds |
 |---|---|---|
-| Jo reverted a merge, overrode a decision, stepped in on work that wasn't escalated, or gave an unprompted ruling that covers it | **Jo's own words** (strong) | **missed ask** |
-| Jo said "don't ask me this", or issued a ruling removing that ask | Jo's own words (strong) | **unnecessary ask** |
-| Jo answered with the recommended word | **Answer on a recommendation** (weak) | **followed recommendation**: probably unnecessary, **unconfirmed** |
-| Jo answered against the recommendation | Jo's own words (strong) | **necessary ask** |
-| No reaction within 7 days to a solo or no-ask decision | Silence | **no signal** |
+| "why are you handing this to me", "you could have decided this", "don't ask me this" | **unnecessary ask** | The unnecessary-ask rate |
+| "why didn't you ask me". Also reverting a merge, overriding a decision, stepping in on work that wasn't escalated, or an unprompted ruling that covers it. | **missed ask** | The missed-ask rate |
+| "I don't understand what you're asking" | **unclear ask** | A separate question-quality count. The ask may have been needed but was badly written. That is a different fix (how the question is written), so it is **never** counted as an unnecessary ask. |
+| Anything else | `none` | Nothing |
 
-A "followed recommendation" label never counts as Jo judging an ask necessary or unnecessary. It is a candidate pool. The label audit (§ 7.1) confirms or rejects it, and only confirmed labels feed the eval's numbers.
+"WHY DO PRODUCTION STAKES STILL ASK ME" is the unnecessary-ask label applied to a whole criterion. "Why didn't you ask me" is its inverse.
+
+**Weak signals**, recorded but never a label on their own:
+- An approve or deny given on a recommendation is labeled **followed recommendation**: probably unnecessary, **unconfirmed**. Per § 2, an approve usually means Plumb recommended it, not that Jo judged the ask.
+- An answer against the recommendation is labeled **went against recommendation**. It suggests the ask was needed.
+- No reaction within 7 days to a solo or no-ask decision is labeled **no signal**.
+
+Weak signals are a candidate pool for the label audit (§ 7.1). Only labels from Jo's words, or labels the audit confirms, feed the eval's numbers.
 
 ### 6.3 Eval
 
 A Phoenix dataset of past cases: the brief, plan, paths, counters and transcript excerpt at the checkpoint, plus the label. The dataset is replayed against the current criteria, both the code checks and the judgment prompts. It produces two numbers:
-- **unnecessary-ask rate:** asks the criteria raise on cases labeled unnecessary (strong or audit-confirmed).
+- **unnecessary-ask rate:** asks the criteria raise on cases labeled unnecessary (from Jo's words, or audit-confirmed). Unclear asks are excluded.
 - **missed-ask rate:** cases labeled missed ask where the criteria would not have asked.
+
+The question-quality count (unclear asks) is reported next to the two numbers. It goes to whoever writes the question text, not to the criteria improver.
 
 **CITE**
 Phoenix datasets and experiments support this replay. https://arize.com/docs/phoenix/datasets-and-experiments/overview-datasets (fetched 2026-10-28): "When you run an experiment against a dataset, its associated evaluators run automatically, providing consistent and repeatable quality assessments."
@@ -191,6 +207,36 @@ It may still *suggest* changes to these in its report. Only Jo makes them.
 **CITE**
 An agent weakened its own gate one word at a time, as recorded at `/Users/jowolff/code/agent-system-2.0/research/phase4/research-G-self-improvement.md:478-489`. That entry cites Claude Code issue #32376, which quotes "changing the trigger from 'code changes' to 'SIGNIFICANT code changes' — a single word that weakens the gate". The issue was closed NOT_PLANNED.
 
+### 6.6 Agents following their own recommendations
+
+Jo, 2026-10-28 at about 9:55 AM PDT: "I feel like this work goes hand in hand with making agents better to follow their own recommendations".
+
+**This is a design goal.** An agent sometimes asks Jo, attaches a recommendation, and Jo picks it. Per § 2, Jo mostly approves whatever Plumb recommends. When that happens, the ask was delay, not oversight.
+
+**The follow rate is a solo-candidate signal, per ask type.** An ask type qualifies for a move toward "decide, act, notify" when:
+- its recommendation-follow rate is high,
+- there are no messages from Jo around those asks (§ 6.2), and
+- there are no reverts.
+
+The improver proposes that move like any other criteria change, through the same review, scoring and month-one approval.
+
+**Exception: the protected set.** Some asks are required by the protected set: irreversible actions (C5), as2 machinery (C7) and the P-7b items. These do **not** move to solo on the follow rate alone. Their fix is a better ask, not no ask: one readable line plus a cross-lab review, so that Jo's approve means something.
+
+**CLAIM**
+`/Users/jowolff/code/agent-system-2.0/research/phase4/research-B-osmani.md:687-688` quotes Osmani: "Only people can choose. Only people inherit consequence. Agents can be asked to choose, route, merge, and escalate safely inside a policy, but they cannot inherit the consequences."
+
+**A second improvement target: the recommendations themselves.** If Jo follows the recommendations, their quality is the real decision. So the improver also scores **recommendation quality**, from three signals:
+- cases where Jo went against the recommendation,
+- Jo's messages around the ask, and
+- reverts after the recommended option was taken.
+
+It proposes changes to how recommendations are made the same way it proposes criteria changes, and it reports recommendation quality next to the two numbers.
+
+**Data.** A per-type follow-rate measurement is running. It will write `/Users/jowolff/agent-scratch/agent-system-2.0/recommendation-follow/REPORT.md`, which did not exist when this was written: **pending**.
+
+**CLAIM**
+The measurement has data to work with, but the recommendation itself is not recorded as a field. `sqlite3 -readonly ~/.agent-system-2/ledger.db "select state, count(*) from questions group by state;"` → `answered|769`, `open|6`, `withdrawn|46`. The `questions` columns are id, workload_id, slice_id, body, options, state, resolved_by, created_by, created_at, changed_by, changed_at and rev. `options` is an unmarked array, for example `["retry","skip","stop"]`, and the recommended option appears only in the body text. Slice B1 adds it as a structured field.
+
 ---
 
 ## 7. Validating the loop
@@ -199,19 +245,19 @@ The four-part loop has not been validated. These four steps are how month one va
 
 ### 7.1 Label audit before trusting the labeler
 
-Jo hand-labels **30** past cases before any label drives the eval. The 30 are stratified:
-- 10 asks answered with the recommended word
-- 10 asks answered against it, or met with Jo's own words
-- 10 non-asks (solo merges and no-ask decisions)
+Jo hand-labels **30** past cases before any label drives the eval. The audit draws mainly from Jo's own messages, and it checks two things: the message attribution (§ 6.1) and the Jev message classifier (§ 6.2). The 30 are stratified:
+- 15 of Jo's free-text messages attributed to an ask, with at least 3 each that the classifier labeled unnecessary, missed and unclear
+- 8 asks answered with the recommended word and no message
+- 7 non-asks (solo merges and no-ask decisions)
 
-Jo answers one word per case: `needed`, `noise` or `missed`. The labeler must agree on **26 of 30** or better, and on **every** case Jo marks `missed`, before its labels drive anything. A fresh audit of 15 cases at the end of month one must reach **13 of 15**.
+Jo answers one word per case: `needed`, `noise`, `missed` or `unclear`. For message cases, Jo also confirms the message is tied to the right ask. The labeler must agree on **26 of 30** or better, and on **every** case Jo marks `missed`, before its labels drive anything. A fresh audit of 15 cases at the end of month one must reach **13 of 15**.
 
 The size follows the Jev classifier's calibration.
 
 **CLAIM**
 `/Users/jowolff/code/agent-system-2.0/SPEC-2.0.md:158`: the open-time classifier was calibrated on "the same 30 briefs", "Agreement 21/30 (70.0%)".
 
-**Known risk.** Jo approved 54 of 57 plans (`escalation-policy/DRAFT.md:60`), and per § 2 most of those approvals echo Plumb. A labeler that reads "answered with the recommended word" as "unnecessary" would mark asks Jo still wants as noise. The first 10 cases of the audit measure exactly that.
+**Known risk.** Jo approved 54 of 57 plans (`escalation-policy/DRAFT.md:60`), and per § 2 most of those approvals echo Plumb. A labeler that reads "answered with the recommended word" as "unnecessary" would mark asks Jo still wants as noise. That is why approvals are only a weak signal, and why the 8 no-message cases in the audit measure exactly that.
 
 ### 7.2 Held-out cases
 
@@ -279,14 +325,14 @@ Each slice is one workload slice with its own done-condition. B1 goes first, bec
 
 | Slice | What | Acceptance criteria |
 |---|---|---|
-| **B1 Recorder (shadow)** | A new ledger table (schema version bump), one row per checkpoint decision (§ 6.1), and one Phoenix span with the same id. Computes this spec's level next to today's stakes. Changes no behaviour. | (1) A train merge on a test ledger writes one row with checkpoint `CP5`, the criterion, the paths and the shadow level. (2) A question to Jo writes a row linked to its question ID. (3) The span is visible in Phoenix on 6006 with the row's id. (4) Replaying #331, #343, #369 and #378 gives the shadow levels in § 8. (5) Existing tests pass. Merge behaviour is unchanged. |
+| **B1 Recorder (shadow)** | A new ledger table (schema version bump), one row per checkpoint decision (§ 6.1), and one Phoenix span with the same id. Computes this spec's level next to today's stakes. Changes no behaviour. Also: a seat-side hook that writes Jo's messages to seats (Plumb's OMP session included) into `instructions`, linked to the ask they answer (§ 6.1). And every ask records its **recommended option as a structured field**, not only in the body text (§ 6.6). | (1) A train merge on a test ledger writes one row with checkpoint `CP5`, the criterion, the paths and the shadow level. (2) A question to Jo writes a row linked to its question ID, with its recommended option in its own field. (3) The span is visible in Phoenix on 6006 with the row's id. (4) Replaying #331, #343, #369 and #378 gives the shadow levels in § 8. (5) A message Jo types to Plumb lands in `instructions` with a seat channel and an attribution link (`question_id`, `window` or `thread`). (6) Existing tests pass. Merge behaviour is unchanged. |
 | **B2 Path lists and the merge checkpoint** | S1/S3/S5 lists in one config file, read by CP5 in the style of `fullExceptions`. Replaces the branch-name rule and retires `gates-stakes`. | (1) #331 and #340 merge themselves. #369 and #378 ask. #343 merges itself. (2) A fork PR asks. (3) A PR that changes the list file itself asks (C7). (4) The notice names the matched paths, or says "no criterion". |
 | **B3 Open and plan checkpoints** | CP1: words, repo and the Jev judge set the starting level. CP2: plan paths and the open-choice judgment. | (1) "pair with me on X" starts with Jo. A scratch repo starts solo. A plain brief starts escalate. (2) A plan naming `gates/` is held under escalate. (3) Every decision writes a B1 row with the judge's choice and confidence. |
 | **B4 During-work checkpoint** | Per-slice path re-check. Retry, round and spend counters wired to C10/C11. Judgments for C13/C14. | (1) A slice that adds an S1 path mid-work raises the level and queues one ask. (2) A third failed retry asks once, never twice. (3) The judgments write rows with reasons. |
 | **B5 Command gate wiring, deploy and after-merge checkpoint** | CP4 records to B1. CP6: revert detection, deploy and health status, and the S2/S3 globs for each Newdle repo. | (1) A blocked `gh workflow run … -f deploy=true` writes a C5 row at solo level and asks. (2) A revert commit naming a merged PR writes a C15 row and a notice within one tick. |
 | **B6 Rename and migrate** | The new field name (open decision 1) in the ledger, surfaces, lane prompts (`launch.ts`) and the SPEC table. Review depth per § 9. | (1) No `stakes: production` remains in the code paths that decide involvement. (2) Old workloads read through the § 9 mapping. (3) The USER-GUIDE is updated. |
-| **B7 Labeler** | The daily launchd job. Labels per § 6.2, with strong and weak signals kept separate. | (1) An approve on a recommendation is labeled `followed recommendation`, never `unnecessary`. (2) A revert of a solo merge is labeled `missed ask` within one day. |
-| **B8 Label audit** (§ 7.1) | A 30-case stratified sample, a one-word-per-case page for Jo, and the agreement report. | (1) The sample is drawn per § 7.1. (2) The report gives agreement overall, per stratum and on `missed`. (3) The eval refuses labels until the audit passes. |
+| **B7 Labeler** | The daily launchd job. The Jev judge classifies Jo's attributed messages as unnecessary, missed, unclear or none (§ 6.2). Approve and deny answers are weak signals only. It also computes per-type follow rates and recommendation quality (§ 6.6). | (1) "why are you handing this to me" is labeled `unnecessary ask`, and "I don't understand what you're asking" is labeled `unclear ask` and never counted as unnecessary. (2) An approve on a recommendation is labeled `followed recommendation`, never `unnecessary`. (3) A revert of a solo merge is labeled `missed ask` within one day. (4) An ask type in the protected set is never proposed for solo on follow rate alone. |
+| **B8 Label audit** (§ 7.1) | A 30-case stratified sample drawn mainly from Jo's messages, a one-word-per-case page for Jo, and the agreement report. It covers both the message attribution and the message classifier. | (1) The sample is drawn per § 7.1. (2) The report gives agreement overall, per stratum and on `missed`, plus attribution accuracy. (3) The eval refuses labels until the audit passes. |
 | **B9 Eval and held-out split** (§ 6.3, § 7.2) | The Phoenix dataset, an 80/20 split by workload plus a fixed 20-case core, and the two-number scorer. | (1) The current criteria get baseline numbers. (2) The same input yields the same scores twice. (3) The held-out set is never shown to the improver. |
 | **B10 Improver, Jo-approves mode** (§ 6.4) | The weekly launchd job, Prompt Learning or GEPA (chosen after the upkeep comparison), cross-lab OpenAI review, a PR with a one-line summary, and the § 6.5 protected-set check. | (1) The weekly PR carries the train and held-out scores for both numbers, the reviewer's verdict and Plumb's recommendation. (2) A candidate touching the protected set is refused by the check. (3) Nothing is applied without Jo's word. |
 | **B11 Checking loop, graduation and tripwire** (§ 7.3–7.4) | The missed-ask floor, the five-gate graduation report, the agent-apply switch, and the automatic revert to Jo-approves. | (1) The end-of-month report lists G1–G5 with pass or fail. (2) The switch can't flip with any gate failing. (3) A simulated missed ask on C7 after graduation reverts the last change and switches back. |
