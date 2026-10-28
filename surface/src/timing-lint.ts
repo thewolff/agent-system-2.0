@@ -15,12 +15,12 @@
 //                 followed by `:` or `{` that stands after `{`, `}`, `;`, `,`, a modifier or `function` (`setTimeout(cb,
 //                 ms): unknown`), not one in a conditional's true branch (`on ? setTimeout(f, 9) : u`). A failure-only
 //                 process watchdog is not a finding either: `const|let <name> = setTimeout(<cb>, <N>)` where <cb> is an
-//                 arrow with no parameters whose whole
-//                 body is one or more `<x>.kill(…)` calls, <N> is a number literal of at least the default test timeout
-//                 (5000 ms), and `clearTimeout(<name>)` appears in the same test()/it() call (else the same file). It fires
-//                 only when the child hangs, and the test's result is the real event it waits for, so it is a hang
-//                 guard like a generous test timeout. A watchdog with a smaller delay, a callback that does anything else
-//                 (resolves, sets a flag the test reads), a delay that is not a literal, or no clearTimeout stays a timer.
+//                 arrow with no parameters whose whole body is one or more `<x>.kill(…)` calls, <N> is a number literal
+//                 of at least the default test timeout (5000 ms), and `clearTimeout(<name>)` appears in the same
+//                 test()/it() call (else the same file). It fires only when the child hangs, and the test's result is
+//                 the real event it waits for, so it is a hang guard like a generous test timeout. A watchdog with a
+//                 smaller delay, a callback that does anything else (resolves, sets a flag the test reads), a delay that
+//                 is not a literal, or no clearTimeout stays a timer.
 //   race          `Promise.race(` whose arguments name a timer: setTimeout/setInterval, Bun.sleep, a sleep-named call, or
 //                 an identifier containing timeout, deadline, timer, sleep or delay. A race of two real events is not one.
 //   clock-assert  a wall-clock read (`Date.now()`, `performance.now()`, `Bun.nanoseconds()`) inside an assertion with a
@@ -54,8 +54,9 @@
 // non-blank line, and when that line opens a test(), it() or describe() call, the whole call. The clock is "in use" when
 // <name> appears as code (not in a comment or string) in the covered call, else in the innermost test()/it() call around
 // the covered line, else anywhere in the file. That is a name check, not proof that the clock is fake: the comment names
-// the clock, and review judges it. A malformed opt-out, a real clock named, a clock not found in use, and an opt-out
-// that covers no finding are each a problem the check reports.
+// the clock, and review judges it. A comment is an attempted opt-out only when its text starts with `timing-under-test`;
+// prose that mentions the marker later in a comment is not one. A malformed opt-out, a real clock named, a clock not
+// found in use, and an opt-out that covers no finding are each a problem the check reports.
 
 export const PATTERNS = ["sleep", "timer", "race", "clock-assert", "clock-elapsed", "clock-deadline", "test-timeout"] as const;
 export type Pattern = (typeof PATTERNS)[number];
@@ -71,7 +72,7 @@ const REAL_CLOCKS: Record<string, true> = {
 	Date: true, "Date.now": true, performance: true, "performance.now": true, "Bun.nanoseconds": true, "Bun.sleep": true,
 	"Bun.sleepSync": true, setTimeout: true, setInterval: true, "globalThis.setTimeout": true, "globalThis.setInterval": true,
 };
-const OPT_OUT_MARK = /\btiming-under-test\b/;
+const OPT_OUT_MARK = /^\s*timing-under-test\b/;
 const OPT_OUT = /^\s*timing-under-test:\s*(.*?)\s*\(fake clock:\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\)\s*$/;
 
 type Comment = { line: number; text: string; ownLine: boolean };

@@ -103,3 +103,8 @@ test("lookalikes", () => {
 	const waitForReady = waiting(3);
 	expect(sleepCount).toBe(0);
 });
+
+// Prose about the marker is not an opt-out: the timing-under-test marker is only needed for timing tests.
+test("prose", () => {
+	expect(1).toBe(1); // a trailing note may mention timing-under-test too
+});
