@@ -512,8 +512,11 @@ export function heldLive(w: { holder: string | null; holder_lease_until: string 
  * resolutions are consumed by D2's rule (`consumedByReady`: a ready lane's first prompt carried them),
  * not by a `launch:` attempt naming them.
  * A workload priority-paused (`priorityPausedOf`, PLAN wl-mv8wzytml878b4 D3) relaunches with cause
- * `priority <exit id>`, after first, request and resume; any later launch attempt ends that state, so it
+ * `priority <exit id>`, after request, first and resume; any later launch attempt ends that state, so it
  * is consumed once.
+ * A pending request is named ahead of `first`: a workload whose first launch was requested (the merge train's `openTrainFix`
+ * writes `launch-requested: by merge-train` and then launches; Jo's launch word on a workload no lane has started) consumes
+ * the request with that first attempt. Named `first`, it stayed pending and relaunched the workload once it was finished.
  */
 export function launchable(
 	w: WorkloadRow, control: readonly ControlEntry[], receipt: string | null, resolved: readonly Resolution[], now: string, liveLanes: number, cap: number,
@@ -530,8 +533,8 @@ export function launchable(
 	const req = control.find((c) => c.prefix === "launch-requested" && !consumed.has(c.id));
 	if (receipt !== null && !req) return { launch: false, reason: "awaiting-close" };
 	if (!capExempt && liveLanes >= cap) return { launch: false, reason: "cap" };
-	if (tried.length === 0) return { launch: true, cause: { kind: "first" } };
 	if (req) return { launch: true, cause: { kind: "request", id: req.id } };
+	if (tried.length === 0) return { launch: true, cause: { kind: "first" } };
 	const res = resolved.filter((r) => (capExempt ? !consumedByReady(control, r.createdAt) : !consumed.has(r.instructionId)));
 	if (res.length > 0) return { launch: true, cause: { kind: "resume", ids: res.map((r) => r.instructionId) } };
 	const paused = priorityPausedOf(control);
