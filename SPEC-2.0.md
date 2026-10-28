@@ -825,6 +825,10 @@ previous plan question was resolved, was not withheld, and answered on a lab out
 round valid for this check. Not proven by the check: that the reviewed bytes are the file the
 question names, or that blocking findings were fixed.
 
+**Amended 2026-10-20 — Linux and macOS in every plan** (Jo, input in-mvh3d7fm5l6pkw; built in wl-mvh3e06g74ugow). Every as2 plan and every new feature states how it works on Linux as well as macOS, including features that skip planning (in their change report or PR description). Plan and feature reviewers check both platforms. A plan adding a macOS-only dependency (`sandbox-exec`, `dscl`, `launchd`, `osascript`, `pbcopy`, or similar) without naming its Linux counterpart is not ready for approval: review returns a blocking finding and the lane revises the plan before raising approval. The rule is carried in the lane prompt and every judge-capable tier prompt; counterpart suitability is a semantic review judgment, not a string-matching gate.
+
+Jo's rule takes effect immediately through standing instructions, including the open standing-train plan (jo-issues #174) and parallel test-runner plan (jo-issues #181). For the runner, per-slot sandbox accounts use `dscl` on macOS and `useradd` on Linux. Porting existing macOS-only code remains jo-issues #182, outside this change.
+
 **Amended 2026-10-02 — plan-first by default** (MIGRATION.md item 42; Jo, 2026-10-01: *"flip"*,
 and for the plan question *"yes keep it short"*; the plan-role rule is Jo's instruction
 in-muq3rrz7xmkj5s; built on `wl/wl-muq22rnjcfrrpc`). At normal stakes a workload opens plan-first
