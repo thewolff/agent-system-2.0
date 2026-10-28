@@ -101,7 +101,8 @@ afterAll(async () => {
 	}
 	const failed = [...reported].filter(([, r]) => !r.ok).map(([p, r]) => `${p}: ${[r.rmError ?? "still present after rm", ...r.unsealErrors].join("; ")}`);
 	const unfinished = made.filter((p) => !reported.has(p));
-	if (failed.length === 0 && unfinished.length === 0 && code === 0) return;
+	// Unseal errors alone do not fail a fixture that rm removed; they are reported beside a fixture that is still there.
+	if (failed.length === 0 && unfinished.length === 0 && code === 0 && err.trim() === "") return;
 	throw new Error(
 		[
 			`fixture cleanup failed: child exit ${code}${child.signalCode ? ` (${child.signalCode}${child.signalCode === "SIGKILL" ? `, killed at its ${CLEANUP_BUDGET_MS} ms deadline` : ""})` : ""}`,
