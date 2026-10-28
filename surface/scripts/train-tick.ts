@@ -14,6 +14,9 @@
 //     A PR whose activity could not be read this pass has no push evidence, so neither push rule settles it. Before that write,
 //     each (S, head) pair `carryPairs` lists, a green at S the head may keep, is compared on GitHub (`ghCompare`, PLAN
 //     wl-mvpwkpqobyp20w D2) outside the ledger's transaction; a pair it cannot compare is absent, so that green does not carry.
+//     In the settles' transaction, `endedFullSlices`' open full-suite slices (a PR whose disposition is done or cancelled; on a
+//     fix workload also a PR whose tasks are all settled) are cancelled as MERGE_TRAIN_BY: a red slice no later run will settle
+//     stops holding its workload open.
 //     Then the failed-twice alert question (`raiseTwiceFailed`, options retry / skip / stop) for each PR whose attempt 2 settled failed.
 //  3. Deliveries (D7, D10 step 2). A task with no open owner gets its fix workload (`openTrainFix`: at most one per (repo, PR),
 //     reused when open), except on a fork's PR (`forkOf`): no workload can push there, so the tick settles the task failed
@@ -87,7 +90,7 @@ import {
 import { attemptBlock, type ChainCommit, ghMainChain, INCONCLUSIVE, type MainState, mainResults, mainState, mainVerdicts } from "../src/main-state";
 import {
 	actionable, type AlertAction, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, carryPairs, checkoutOwnerRepo, type ControlRoot,
-	controlRootRefusal, everyTrain, expiredHolds, forkOf, forkTaskAlert, FULL_SUITE_STATUS, ghCompare, isTrainOrFix, type LandFirstEvent, landFirstNoticeBody, landFirstRepos, landFirstRows,
+	controlRootRefusal, endedFullSlices, everyTrain, expiredHolds, forkOf, forkTaskAlert, FULL_SUITE_STATUS, ghCompare, isTrainOrFix, type LandFirstEvent, landFirstNoticeBody, landFirstRepos, landFirstRows,
 	type Landing, landingPassOvers, landingReady, lastReadyExit, MAIN_RED_WINDOW_MS, MAIN_RETRY_MS, mainRedNoticeBody, mainRedNotices, mainRedRows, openTrainFix, openTrains, ownerDeliveries,
 	PROMOTE_ATTEMPTS, PROTECTION_UNKNOWN_RAISE_MS, protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState, protectionPassOvers, prStakes, raiseLaunchLimit,
 	raiseTwiceFailed, REPAIR_FAIL_MS, REVOKE_ATTEMPTS, settleTasks, stopEpisode, stopSummary, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER,
@@ -310,12 +313,17 @@ export function tick(d: TickDeps): string[] {
 					errors.push(err);
 				}
 			}
+			// After the settles, in their transaction: the open full-suite slices whose PR's train work has ended, cancelled as
+			// MERGE_TRAIN_BY (`endedFullSlices`), so a red one no next run will settle stops holding its workload open.
 			const settled = ledger.write(() => {
 				const bodies = settleTasks(ledger, { train: wl, heads, pushes: facts.pushes, compares }, ledger.now());
 				for (const body of bodies) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body });
-				return bodies;
+				const ended = endedFullSlices(ledger, wl);
+				for (const e of ended) ledger.cancelSlice(e.slice, { by: MERGE_TRAIN_BY });
+				return { bodies, ended };
 			});
-			for (const body of settled) say(`${wl}: ${body}`);
+			for (const body of settled.bodies) say(`${wl}: ${body}`);
+			for (const e of settled.ended) say(`${e.workloadId}: cancelled ${e.slice} (#${e.pr}): ${e.why}`);
 			for (const due of twiceFailed(ledger, wl)) {
 				const q = raiseTwiceFailed(ledger, wl, due);
 				if (q) say(`${wl}: #${due.pr} failed twice (${due.task.id}): alert question ${q}`);

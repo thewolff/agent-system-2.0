@@ -22,15 +22,15 @@ import {
 	planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody,
 } from "../src/launch";
 import {
-	actionable, type ControlRoot, fixBindings, landFirstNoticeBody, landFirstRows, latestTrainReconciled, mainRedNotices, protectionEpisodes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs,
-	trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainHoldBody, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody, type WakeDeferral,
+	actionable, type ControlRoot, fixBindings, openTrainFix, landFirstNoticeBody, landFirstRows, latestTrainReconciled, mainRedNotices, protectionEpisodes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs,
+	trainAlertBody, trainAlertMarker, trainFullSliceId, trainHeadWokenBody, trainHoldBody, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody, type WakeDeferral,
 } from "../src/merge-train";
 import { trainMergedNoticeBody } from "../src/notice";
-import { fastPlanBody, makeRunId, testRequestedBody, testRunBody, testRuns, withFullSuitePublication } from "../src/test-run";
+import { fastPlanBody, makeRunId, testRequestedBody, type TestRun, testRunBody, testRuns, withFullSuitePublication } from "../src/test-run";
 import { ESCALATION_BY, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { releasedOpenBody } from "../src/turn-end";
 import {
-	boardWorld, carry305, COMMIT_FILES_CAP, COMMIT_FILES_PER_PAGE, DECISION_LOG_FILE, type FakeDiffEntry, type FakeIssue, H0, H1, H2, JO, OWNER_LANE, protectedRules, REPO, TRAIN_LANE,
+	boardWorld, carry305, checkout, COMMIT_FILES_CAP, COMMIT_FILES_PER_PAGE, DECISION_LOG_FILE, type FakeDiffEntry, type FakeIssue, H0, H1, H2, JO, OWNER_LANE, protectedRules, REPO, TRAIN_LANE,
 	world,
 } from "./train-world";
 import { tmp } from "./helpers";
@@ -107,6 +107,90 @@ describe("settles and deliveries (D8, D10)", () => {
 		w.g.failWhen(null);
 		w.run();
 		expect(w.settles().map((e) => e.body)).toEqual([`train-task-settled: ${t.id} failed no push for 2 h since ${pushedAt}`]);
+	});
+});
+
+describe("ended full-suite slices: the tick cancels them as merge-train (#378's fix workload, #377 merged outside the train)", () => {
+	let seq = 0;
+	/** A runner request on `wl`'s slice `slice` for PR `pr` at `sha` stamped `now`, and its result `verdict`; null leaves the run waiting. */
+	const runOn = (ledger: Ledger, now: string, wl: string, slice: string, pr: number, sha: string, verdict: TestRun["verdict"] | null) => {
+		const runId = makeRunId(Date.parse(now) + ++seq, "abcd");
+		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: slice, kind: "assumption", body: testRequestedBody({ runId, pr, sha, slice, by: "lane-x-1" }) });
+		if (verdict === null) return;
+		ledger.recordEntry({
+			by: TEST_RUNNER_BY, workloadId: wl, sliceId: slice, kind: "assumption",
+			body: testRunBody({
+				runId, verdict, sha, pr, reason: null, headAtEnd: sha, base: null, mergeBase: null,
+				full: { pass: 1, fail: verdict === "red" ? 1 : 0, skip: 0, exit: verdict === "red" ? 1 : 0, ms: 10, error: null },
+				solo: [], failures: verdict === "red" ? [{ part: "full", name: "src/x.test.ts > case 1", firstError: "boom" }] : [], runDir: null, preflight: null,
+			}),
+		});
+	};
+
+	test("a fix workload's red full-suite slice is cancelled once its task settles failed; a slice whose run still waits stays open", () => {
+		const w = world();
+		const t = w.task(106); // #106's head branch is no workload's: owner none, so the tick opens a fix workload
+		w.run();
+		const fix = fixBindings(w.ledger).find((f) => f.pr === 106)!.workloadId;
+		w.c.plusHours(0.05);
+		const red = w.ledger.addSlice({ by: TEST_RUNNER_BY, workloadId: fix, id: `sl-full-${fix.slice(3)}-1`, task: "full suite outside the fence at PR #106", doneCondition: "green", inputs: `PR #106 at ${H0}` });
+		const waiting = w.ledger.addSlice({ by: TEST_RUNNER_BY, workloadId: fix, id: `sl-full-${fix.slice(3)}-2`, task: "full suite outside the fence at PR #106", doneCondition: "green", inputs: `PR #106 at ${H0}` });
+		runOn(w.ledger, w.c.now(), fix, red, 106, H0, "red");
+		runOn(w.ledger, w.c.now(), fix, waiting, 106, H0, null);
+		w.run();
+		expect(w.settles().map((e) => e.body)).toEqual([expect.stringContaining(`train-task-settled: ${t.id} failed`)]);
+		expect(w.ledger.slice(red)).toMatchObject({ state: "cancelled", changed_by: MERGE_TRAIN_BY });
+		expect(w.ledger.slice(waiting)!.state).toBe("open");
+	});
+
+	test("the train's own red full-suite slice outlives a settled task (the next attempt runs on it) and is cancelled once the PR's disposition is done (merged outside the train)", () => {
+		const w = world();
+		const disposition = w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: trainSliceId(w.train, 106), task: "PR #106", doneCondition: "terminal", inputs: "#106" });
+		const full = w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: trainFullSliceId(w.train, 106, 1), task: "suite #106", doneCondition: "green", inputs: "#106" });
+		runOn(w.ledger, w.c.now(), w.train, full, 106, H0, "red");
+		w.task(106);
+		w.run();
+		w.c.plusHours(2.1); // no push for 2 h: the task settles failed
+		w.run();
+		expect(w.settles().map((e) => e.body)).toEqual([expect.stringContaining("failed no push for 2 h")]);
+		expect(w.ledger.slice(full)!.state).toBe("open");
+		w.ledger.completeSlice(disposition, { by: TRAIN_LANE, artifact: "skipped: MERGED (gh pr view 106 → MERGED)" });
+		w.run();
+		expect(w.ledger.slice(full)).toMatchObject({ state: "cancelled", changed_by: MERGE_TRAIN_BY });
+	});
+
+	test("a reused fix workload's red slice outlives a skipped PR's old train while the new train it rides has unsettled work; it is cancelled once that work settles (PR #391 review B1)", () => {
+		const w = world();
+		w.task(106); // owner none: the tick opens a fix workload bound to #106 on train A
+		w.run();
+		const fix = fixBindings(w.ledger).find((f) => f.pr === 106)!.workloadId;
+		w.c.plusHours(0.05);
+		// the fix workload's run on its full-suite slice comes back red: nothing waits on the slice
+		const red = w.ledger.addSlice({ by: TEST_RUNNER_BY, workloadId: fix, id: `sl-full-${fix.slice(3)}-1`, task: "full suite outside the fence at PR #106", doneCondition: "green", inputs: `PR #106 at ${H0}` });
+		runOn(w.ledger, w.c.now(), fix, red, 106, H0, "red");
+		w.c.plusHours(0.05);
+		// Jo skips #106 on train A, which stays open on #101; a new train B carries #106, and its task is the fix workload's too
+		const disposition = w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: trainSliceId(w.train, 106), task: "PR #106", doneCondition: "terminal", inputs: "#106" });
+		const q = w.ledger.raiseQuestion({ by: TRAIN_LANE, workloadId: w.train, sliceId: disposition, body: "#106 production", options: ["merged", "skip", "stop"] });
+		w.ledger.answerQuestion(q, { ...JO, answer: "skip" });
+		const cmd = interpret(w.ledger, "train 106");
+		if (cmd?.kind !== "train") throw new Error("not a train");
+		const trainBCheckout = checkout();
+		const trainB = applyTrain(w.ledger, cmd, trainBCheckout).workloadId;
+		expect(w.ledger.claimWorkload(trainB, { by: LANE_STARTER_BY, holder: "lane-train-2", leaseMs: 600_000 }).won).toBe(true);
+		const p = w.g.prs.get(106)!;
+		const view = { number: 106, headRefName: p.branch, headRefOid: p.head, isCrossRepository: false, headRepository: { name: "product" }, headRepositoryOwner: { login: "thewolff" } };
+		const onB = recordTrainTask(w.ledger, { train: trainB, by: "lane-train-2", pr: 106, kind: "red", detail: `run tr-y red at ${p.head}\nsrc/x.test.ts > case 1: boom`, view, trainRepo: REPO });
+		if (!onB.ok) throw new Error(onB.reason);
+		expect(openTrainFix(w.ledger, { task: onB.task, repo: REPO, checkout: trainBCheckout, view, stakes: "normal" })).toEqual({ workloadId: fix, opened: false });
+		// train A disposes of #106 (its skip cancels the disposition); B's task on the reused workload is unsettled
+		w.ledger.cancelSlice(disposition, { by: TRAIN_LANE });
+		w.run();
+		expect(w.ledger.slice(red)!.state).toBe("open");
+		w.c.plusHours(2.1); // no push for 2 h: B's task settles failed, and the fix workload's train work has ended on every train
+		w.run();
+		expect(w.ledger.entries(trainB).some((e) => e.body.startsWith(`train-task-settled: ${onB.task.id} failed`))).toBe(true);
+		expect(w.ledger.slice(red)).toMatchObject({ state: "cancelled", changed_by: MERGE_TRAIN_BY });
 	});
 });
 

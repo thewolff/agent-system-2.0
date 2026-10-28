@@ -99,6 +99,15 @@ describe("awaiting close: the holder's done-because: stands (L1, the by-hand was
 		// once a lane consumed it, the next receipt stands again
 		expect(verdictOf(rows(workload(), [launch("lane-m-1", "first"), req, launch("lane-m-2", `request ${req.id}`), done("lane-m-2")]))).toEqual({ launch: false, reason: "awaiting-close" });
 	});
+	test("a launch-requested: written before the first launch is consumed by it: the first attempt names it, so the finished workload awaits close and is never relaunched on it", () => {
+		// The merge train's openTrainFix writes `launch-requested: by merge-train` and launches; a first attempt named `first`
+		// left it pending, and after the fix lane's done-because: the tick relaunched the finished workload on it (wl-mvs26z1lkaw6oc).
+		for (const req of [entry(MERGE_TRAIN_BY, `launch-requested: by merge-train at ${NOW} (train fix #378 on wl-train)`), entry(SURFACE_BY, `launch-requested: by jo at ${NOW}`)]) {
+			expect(verdictOf(rows(workload(), [req]))).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+			expect(decideLaunch(rows(workload(), [req]))).toEqual({ launch: true, cause: `request ${req.id}` });
+			expect(verdictOf(rows(workload(), [req, launch("lane-m-1", `request ${req.id}`), done("lane-m-1")]))).toEqual({ launch: false, reason: "awaiting-close" });
+		}
+	});
 	test("user-driven and closed keep their reasons: awaiting-close is only for an autonomous workload the tick would launch", () => {
 		expect(verdictOf(rows(workload({ mode: "user-driven" }), [done("lane-m-1")], ["lane-m-1"]))).toEqual({ launch: false, reason: "user-driven" });
 		expect(verdictOf(rows(workload({ status: "closed" }), [done("lane-m-1")], ["lane-m-1"]))).toEqual({ launch: false, reason: "closed" });
