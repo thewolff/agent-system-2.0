@@ -11,10 +11,10 @@ import { counts, type Finding, lex, parseBaseline, PATTERNS, ratchet, scan } fro
 const REPO = join(import.meta.dir, "..", "..");
 const FIXTURES = join(import.meta.dir, "fixtures", "timing-lint");
 const BASELINE = join(import.meta.dir, "timing-baseline.tsv");
-// The baseline's total when it was cut (2026-10-28, origin/main 4c1a6e5: 93 findings in 43 rows over 24 files). Lower it
-// as rows are fixed; raising it is a deliberate edit with a dated comment, the same discipline as the bounds in
-// tiers/test/size.test.ts.
-const BASELINE_CEILING = 93;
+// The baseline's total when it was cut (2026-10-28, origin/main 4c1a6e5: 93 findings in 43 rows over 24 files), lowered
+// to 91 when main's stuck-detect repair (d7f6d63b) removed one clock-deadline and one sleep. Lower it as rows are fixed;
+// raising it is a deliberate edit with a dated comment, the same discipline as the bounds in tiers/test/size.test.ts.
+const BASELINE_CEILING = 91;
 
 const fixture = (name: string) => readFileSync(join(FIXTURES, name), "utf8");
 

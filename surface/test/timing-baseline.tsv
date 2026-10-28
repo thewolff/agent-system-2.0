@@ -37,9 +37,9 @@ surface/test/phoenix-run.test.ts	race	1
 surface/test/phoenix-run.test.ts	sleep	1
 surface/test/ps-shim.test.ts	clock-deadline	1
 surface/test/ps-shim.test.ts	sleep	1
-surface/test/stuck-detect.test.ts	clock-deadline	2
+surface/test/stuck-detect.test.ts	clock-deadline	1
 surface/test/stuck-detect.test.ts	clock-elapsed	1
-surface/test/stuck-detect.test.ts	sleep	4
+surface/test/stuck-detect.test.ts	sleep	3
 surface/test/test-runner.test.ts	clock-assert	4
 surface/test/test-runner.test.ts	clock-deadline	4
 surface/test/test-runner.test.ts	clock-elapsed	4
