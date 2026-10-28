@@ -62,6 +62,11 @@ test("fixture timestamps", () => {
 	expect(newestChange(dir, Date.now() - HOUR_MS)).toBeGreaterThan(Date.now() - 9 * HOUR_MS);
 	const id = makeRunId(Date.now(), "x");
 	expect(row.at).toEqual(Date.now());
+	const backdateMs = 5 * 60_000;
+	const backdated = new Date(Date.now() - backdateMs);
+	expect(
+		lease,
+	).toBeGreaterThan(Date.now() - backdateMs);
 });
 
 // A race of two real events is not a deadline race.

@@ -21,9 +21,11 @@
 //                 (resolves, sets a flag the test reads), a delay that is not a literal, or no clearTimeout stays a timer.
 //   race          `Promise.race(` whose arguments name a timer: setTimeout/setInterval, Bun.sleep, a sleep-named call, or
 //                 an identifier containing timeout, deadline, timer, sleep or delay. A race of two real events is not one.
-//   clock-assert  a wall-clock read (`Date.now()`, `performance.now()`, `Bun.nanoseconds()`) on a line that holds
-//                 `expect(` and a relational matcher (toBeLessThan, toBeLessThanOrEqual, toBeGreaterThan,
-//                 toBeGreaterThanOrEqual, toBeWithin, toBeCloseTo), unless the read is a fixture timestamp (below).
+//   clock-assert  a wall-clock read (`Date.now()`, `performance.now()`, `Bun.nanoseconds()`) inside an assertion with a
+//                 relational matcher (toBeLessThan, toBeLessThanOrEqual, toBeGreaterThan, toBeGreaterThanOrEqual,
+//                 toBeWithin, toBeCloseTo): in the `expect(…)` argument or the matcher's, across lines, through `.not`,
+//                 `.resolves` or `.rejects`; or on a line that holds `expect(` and such a matcher. Unless the read is a
+//                 fixture timestamp (below).
 //   clock-elapsed a wall-clock read minus a timestamp: `Date.now() - t0`.
 //   clock-deadline a timestamp minus a wall-clock read (`deadline - Date.now()`), or a wall-clock read on either side
 //                 of `<`, `<=`, `>` or `>=` (`while (Date.now() < end)`).
@@ -31,7 +33,9 @@
 //   `Date.now() + LEASE_MS + 1000`): it places a fixture hours away from now and does not measure the machine. An
 //   operand is a duration when it has no lowercase letter (digits, ALL_CAPS names, operators), when it multiplies or
 //   divides at its top level (`days * DAY_MS`), or when it is one name ending in Ms, MS, _ms, Millis, Sec or Offset
-//   (`offsetMs`) or is exactly ms, millis, sec, seconds or offset; any other operand is a timestamp.
+//   (`offsetMs`) or is exactly ms, millis, sec, seconds or offset; any other operand is a timestamp. A name the file
+//   binds to a wall-clock read (`const startedMs = Date.now()`, `let T0: number = performance.now() + 1`) is always a
+//   timestamp, whatever its spelling.
 //   test-timeout  an explicit timeout below Bun's 5000 ms default: the last of three or more arguments to a test()/it()
 //                 call when it is a number literal or `{ timeout: N }`, or `setDefaultTimeout(N)` / `jest.setTimeout(N)`,
 //                 with 0 < N < 5000. A larger timeout is a hang guard; a smaller one is a race with the machine.
@@ -287,10 +291,35 @@ export function testCalls(code: string): Span[] {
 const CLOCK = /(?<![\w$])(?:Date\s*\.\s*now|performance\s*\.\s*now|Bun\s*\.\s*nanoseconds)\s*\(\s*\)/g;
 const SLEEP_CALL = /(?<![\w$.])(?:sleep|delay|pause|wait)\s*\(/;
 const RELATIONAL_MATCHER = /\.(?:toBeLessThan|toBeLessThanOrEqual|toBeGreaterThan|toBeGreaterThanOrEqual|toBeWithin|toBeCloseTo)\s*\(/;
-/** A duration operand (see the header): constant-only, scaled at its top level, or one name ending in a unit. */
-function isDuration(operand: string): boolean {
+const MATCHER_AFTER = /^(?:\s*\.\s*(?:not|resolves|rejects))*\s*\.\s*(?:toBeLessThan|toBeLessThanOrEqual|toBeGreaterThan|toBeGreaterThanOrEqual|toBeWithin|toBeCloseTo)\s*\(/;
+
+/** Names the file binds to a wall-clock read: `const|let|var <name>[: T] = <clock read>…`. */
+function clockBound(code: string): Set<string> {
+	const out = new Set<string>();
+	const re = /(?<![\w$])(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;\n]*)?=\s*(?:Date\s*\.\s*now|performance\s*\.\s*now|Bun\s*\.\s*nanoseconds)\s*\(\s*\)/g;
+	for (const m of code.matchAll(re)) out.add(m[1]!);
+	return out;
+}
+
+/** Spans `expect(` to the close of its relational matcher's argument list, for assertions that have one. */
+function relationalAsserts(code: string): { start: number; end: number }[] {
+	const out: { start: number; end: number }[] = [];
+	for (const m of code.matchAll(/(?<![\w$])expect\s*\(/g)) {
+		if (isMember(code, m.index)) continue;
+		const close = closeOf(code, m.index + m[0].length - 1);
+		if (close === -1) continue;
+		const matcher = MATCHER_AFTER.exec(code.slice(close + 1, close + 160));
+		if (!matcher) continue;
+		const mClose = closeOf(code, close + matcher[0].length);
+		if (mClose !== -1) out.push({ start: m.index, end: mClose });
+	}
+	return out;
+}
+
+/** A duration operand (see the header): constant-only, scaled at its top level, or one name ending in a unit; never a clock-bound name. */
+function isDuration(operand: string, stamps: Set<string>): boolean {
 	const s = operand.trim();
-	if (s === "") return false;
+	if (s === "" || stamps.has(s)) return false;
 	if (!/[a-z]/.test(s)) return true;
 	if (/^(?:[A-Za-z_$][\w$]*(?:Ms|MS|_ms|Millis|Sec|Offset)|ms|millis|sec|seconds|offset)$/.test(s)) return true;
 	let depth = 0;
@@ -353,15 +382,17 @@ function sites(code: string, lineStarts: number[], calls: Span[]): Site[] {
 			out.push({ offset: m.index, pattern: "race" });
 		}
 	}
+	const stamps = clockBound(code);
+	const asserts = relationalAsserts(code);
 	for (const m of code.matchAll(CLOCK)) {
 		const end = m.index + m[0].length;
 		const before = /(?<![-=+])-\s*$/.exec(code.slice(Math.max(0, m.index - 32), m.index));
 		const after = /^\s*([-+])(?![-+=])\s*/.exec(code.slice(end, end + 32));
 		const operand = after ? operandAfter(code, end + after[0].length) : "";
-		if (!before && after && isDuration(operand)) continue; // a fixture timestamp
+		if (!before && after && isDuration(operand, stamps)) continue; // a fixture timestamp
 		const l = lineAt(lineStarts, m.index);
 		const line = code.slice(lineStarts[l - 1]!, lineStarts[l] ?? code.length);
-		if (line.includes("expect(") && RELATIONAL_MATCHER.test(line)) {
+		if ((line.includes("expect(") && RELATIONAL_MATCHER.test(line)) || asserts.some((a) => m.index > a.start && m.index < a.end)) {
 			out.push({ offset: m.index, pattern: "clock-assert" });
 			continue;
 		}
@@ -369,7 +400,7 @@ function sites(code: string, lineStarts: number[], calls: Span[]): Site[] {
 			out.push({ offset: m.index, pattern: "clock-elapsed" });
 			continue;
 		}
-		if (before && !isDuration(operandBefore(code, m.index - before[0].length))) {
+		if (before && !isDuration(operandBefore(code, m.index - before[0].length), stamps)) {
 			out.push({ offset: m.index, pattern: "clock-deadline" });
 			continue;
 		}

@@ -53,6 +53,22 @@ test("wall-clock assertions", () => {
 	expect(Bun.nanoseconds()).toBeGreaterThan(start); //! clock-assert
 });
 
+test("timestamps whose names look like durations", () => {
+	const startedMs = Date.now();
+	const T0 = performance.now();
+	let sinceMs: number = Date.now();
+	work();
+	expect(Date.now() - startedMs).toBeLessThan(10); //! clock-assert
+	expect(performance.now() - T0).toBeLessThan(10); //! clock-assert
+	const tookMs = Date.now() - sinceMs; //! clock-elapsed
+	expect(
+		Date.now() - startedMs, //! clock-assert
+	).toBeLessThan(10);
+	expect(tookMs).not.toBeGreaterThan(
+		Date.now() - sinceMs, //! clock-assert
+	);
+});
+
 test("elapsed and deadlines", async () => {
 	const started = performance.now();
 	const elapsed = performance.now() - started; //! clock-elapsed
