@@ -1,6 +1,6 @@
 # Involvement: how much Jo is in a workload, what decides it, and the loop that tunes it
 
-Spec, 2026-10-28. It replaces as2's "production stakes". Jo approved the outcome on 2026-10-28, morning PDT. The ruling record is `.ai/decision-log/2026-10-28--0920--plumb--involvement-replaces-production-stakes.md`. Nothing here is built yet. Production merges are paused until it is (Jo, 8:15 AM PDT).
+Spec, 2026-10-28. It replaces as2's "production stakes". Jo approved the outcome on 2026-10-28, morning PDT. The ruling record is `.ai/decision-log/2026-10-28--0920--plumb--involvement-replaces-production-stakes.md`. Nothing here is built yet. Production merges are paused until it is (Jo, 2026-10-28, morning PDT).
 
 This revision answers three rounds of an independent OpenAI review at `/Users/jowolff/agent-scratch/agent-system-2.0/involvement/REVIEW-openai.md`. § 12 maps each finding to the section that resolves it.
 
@@ -451,7 +451,7 @@ The newdle-api deploy path: `/Users/jowolff/code/shipyard/repos/newdle-api/.gith
 
 Each slice is one workload slice with its own done-condition. B1 goes first, because waiting loses data. B2 unblocks production merges.
 
-**Proposed:** the 8:15 AM pause lifts when B1 and B2 are on main. Jo confirms or corrects this.
+**Proposed:** Jo's production-merge pause (2026-10-28, morning PDT) lifts when B1 and B2 are on main. Jo confirms or corrects this.
 
 | Slice | What | Acceptance criteria |
 |---|---|---|

@@ -32,7 +32,7 @@ Jo, 2026-10-28, morning PDT, approved this outcome: as2's "production stakes" is
 
 ## Standing state
 
-- **Production merges are paused until this is built** (Jo, 8:15 AM PDT, 2026-10-28). The spec proposes that the pause lifts when slices B1 (Recorder) and B2 (path lists and the merge checkpoint) are on main. Jo has not confirmed that reading.
+- **Production merges are paused until this is built** (Jo, 2026-10-28, morning PDT). The spec proposes that the pause lifts when slices B1 (Recorder) and B2 (path lists and the merge checkpoint) are on main. Jo has not confirmed that reading.
 
 ## Open
 
