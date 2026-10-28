@@ -1,8 +1,8 @@
 # Involvement: how much Jo is in a workload, what decides it, and the loop that tunes it
 
-Spec, 2026-10-28. It replaces as2's "production stakes". Jo approved the outcome at about 9:20 AM PDT. The ruling record is `.ai/decision-log/2026-10-28--0920--plumb--involvement-replaces-production-stakes.md`. Nothing here is built yet. Production merges are paused until it is (Jo, 8:15 AM PDT).
+Spec, 2026-10-28. It replaces as2's "production stakes". Jo approved the outcome on 2026-10-28, morning PDT. The ruling record is `.ai/decision-log/2026-10-28--0920--plumb--involvement-replaces-production-stakes.md`. Nothing here is built yet. Production merges are paused until it is (Jo, 8:15 AM PDT).
 
-This revision answers an independent OpenAI review (request-changes, ten findings) at `/Users/jowolff/agent-scratch/agent-system-2.0/involvement/REVIEW-openai.md`. § 12 maps each finding to the section that resolves it.
+This revision answers three rounds of an independent OpenAI review at `/Users/jowolff/agent-scratch/agent-system-2.0/involvement/REVIEW-openai.md`. § 12 maps each finding to the section that resolves it.
 
 ## 1. Top screen
 
@@ -33,13 +33,13 @@ The default starting level is **escalate**. A workload starts **with Jo** on Jo'
 ## 2. Design facts this spec is built on
 
 **CLAIM**
-Jo approves most of what reaches them on Plumb's word. Jo, 2026-10-28 at about 9:30 AM PDT (relayed verbatim by Plumb): "keep in mind I have SO many things to approve that I'm not reading them. I just ask you if it's a good idea and if you say so I send approve". The ledger agrees. `/Users/jowolff/agent-scratch/agent-system-2.0/escalation-policy/DRAFT.md:60`: "Jo approved 54 of the 57 such plans they answered."
+Jo approves most of what reaches them on Plumb's word. Jo, 2026-10-28, morning PDT (relayed verbatim by Plumb): "keep in mind I have SO many things to approve that I'm not reading them. I just ask you if it's a good idea and if you say so I send approve". The ledger agrees. `/Users/jowolff/agent-scratch/agent-system-2.0/escalation-policy/DRAFT.md:60`: "Jo approved 54 of the 57 such plans they answered."
 
 **CLAIM**
 The surface makes a followed recommendation the zero-effort answer, so a match can be an untouched paste. `/Users/jowolff/agent-scratch/agent-system-2.0/involvement-spec/surface/src/pending.ts:12-13`: "The word is the recorded recommendation, else the row's first option". `/Users/jowolff/agent-scratch/agent-system-2.0/recommendation-follow/REPORT.md:241-242`: the recommendation is the first option in 208 of 226 questions. Answers within 5 seconds of another answer, a proxy for a block paste, followed it 78/91 (86%). Single answers followed it 101/135 (75%).
 
 Four consequences shape this spec:
-1. **An `approve` is not Jo's judgment of the ask.** Jo's free-text messages around a decision are the labeler's primary signal (§ 6.2), for example "I don't understand why you're handing this to me". Approve and deny answers given on a recommendation are weak signals only. Jo, about 9:50 AM PDT: "can we record me sending messages AROUND the labeling. like 'I don't understand why you're handing this to me'".
+1. **An `approve` is not Jo's judgment of the ask.** Jo's free-text messages around a decision are the labeler's primary signal (§ 6.2), for example "I don't understand why you're handing this to me". Approve and deny answers given on a recommendation are weak signals only. Jo, 2026-10-28, morning PDT: "can we record me sending messages AROUND the labeling. like 'I don't understand why you're handing this to me'".
 2. **The month-one gate is really Plumb's recommendation plus Jo's one word.** So each proposed change gets an independent cross-lab review before Plumb recommends it (§ 6.4). The builder lab is Anthropic, so the reviewer is OpenAI.
 3. **Jo's hand labels must be blinded.** The label audit shows Jo the case, not the agent's proposed label (§ 7.1). Otherwise the audit recreates the same recommendation-following it is meant to measure.
 4. **A human gate nobody reads is a rubber stamp.**
@@ -275,7 +275,7 @@ An agent weakened its own gate one word at a time, as recorded at `/Users/jowolf
 
 ### 6.6 Agents following their own recommendations
 
-Jo, 2026-10-28 at about 9:55 AM PDT: "I feel like this work goes hand in hand with making agents better to follow their own recommendations".
+Jo, 2026-10-28, morning PDT: "I feel like this work goes hand in hand with making agents better to follow their own recommendations".
 
 **This is a design goal.** An agent sometimes asks Jo, attaches a recommendation, and Jo picks it. When that happens, the ask was delay, not oversight.
 
@@ -336,7 +336,9 @@ The size follows the Jev classifier's calibration. `/Users/jowolff/code/agent-sy
 
 ### 7.2 Three data sets
 
-Mature cases are split by workload, so no workload sits in two sets:
+Mature cases are split by workload, so no workload sits in two sets.
+
+**Exposure history.** Every assignment of a workload to a set (training, selection or sealed) is written to an **append-only exposure history**: workload, set, date. Entries are never edited or deleted. A workload counts as **exposed** once it has any entry, even after it is moved out of that set. Mature workloads with no entry wait in an **unassigned fresh pool**.
 
 | Set | Share | Used for | Who sees it |
 |---|---|---|---|
@@ -381,11 +383,12 @@ Graduation needs all six gates. These are the thresholds proposed for open decis
 If any gate fails, month one runs another two weeks and the report names the failed gate.
 
 **Retrying after a failed graduation attempt.** A sealed test is evaluated once, so a failed attempt consumes it, and the next attempt builds a fresh one:
-1. The consumed sealed set moves into training. It is never evaluated against for graduation again.
+1. The consumed sealed set moves into training, and the exposure history records the move. It is never evaluated against for graduation again.
 2. The proposer learns only that the attempt failed and which gate failed. It never gets per-case or per-criterion sealed scores.
-3. At the start of the extension, a fresh sealed set is drawn from mature cases in workloads that have never been in any selection or sealed set, and frozen.
-4. The fresh set needs the same support as § 6.3: both denominators at least 20, and every protected criterion with at least 3 audited cases. If it falls short, the extension runs another two weeks while more cases mature, and nothing is evaluated.
-5. At the end of the extension, G1–G6 are re-checked. G4 is one evaluation of the frozen month-start wording against the frozen current wording, on the fresh set.
+3. **From the moment the attempt fails, every newly mature workload goes to the unassigned fresh pool.** None is assigned to training or selection until the retry set is frozen.
+4. The fresh sealed set is drawn **only** from workloads with no entry in the exposure history: never in training, selection or any earlier sealed set, and so never seen by the proposer. It is frozen when drawn. A workload that was trained on and later removed from training is still exposed, and it is rejected.
+5. The fresh set needs the same support as § 6.3: both denominators at least 20, and every protected criterion with at least 3 audited cases. If the pool falls short, the improver stays in "Jo approves" while more cases mature and are audited, and nothing is evaluated.
+6. Once the set is frozen, G1–G6 are re-checked. G4 is one evaluation of the frozen month-start wording against the frozen current wording, on the fresh set.
 
 The same procedure builds the fresh test for re-graduation after a suspension or tripwire (§ 7.6).
 
@@ -462,7 +465,7 @@ Each slice is one workload slice with its own done-condition. B1 goes first, bec
 | **B8 Label audits** (§ 7.1) | The blinded start audit, the weekly 12-case audit and the coverage report, on a one-word-per-case page for Jo. | (1) Jo's page never shows the agent's label or the recommendation made at the time. (2) The samples are drawn per § 7.1, including `none` and `no signal` non-asks. (3) The eval refuses labels until the start audit passes. (4) Coverage is reported per protected criterion, and shortfalls are listed. |
 | **B9 Eval, data sets and scorer** (§ 6.3, § 7.2, § 7.4) | The Phoenix dataset, the training, selection and sealed sets, the trusted scorer with denominators and maturity, and the shadow baseline. | (1) The current wording gets baseline numbers, or `insufficient data`. (2) The same input yields the same scores twice. (3) The proposer process can't read the selection or sealed sets. (4) The 17th selection evaluation is refused until the set is replaced. (5) A candidate where C8 gains one missed ask and another criterion loses one, leaving the overall rate unchanged, is rejected. |
 | **B10 Improver, Jo-approves mode** (§ 6.4–6.5) | The weekly launchd job on DSPy with GEPA, with the § 6.4 conditions met. Cross-lab OpenAI review, a PR with a one-line summary, and the protection and exception checks run from main. **Prerequisite:** Jo's approval of the model destination. | (1) The weekly PR carries both numbers, the protected-criterion counts, the reviewer's verdict and Plumb's recommendation. (2) A candidate that edits the policy file, changes a level, adds a wording entry, or disables the protection check is refused, and the refusal comes from main's copy of the check. (3) Nothing is applied without Jo's word. (4) DSPy's cache is in restricted-pickle mode. |
-| **B11 Checking loop, graduation, suspension and tripwire** (§ 7.3–7.6) | The missed-ask floor, the six-gate graduation report with one sealed-test evaluation, the fresh-test retry, the agent-apply switch through the § 6.5 exception, current-authority checks, suspension, prospective confirmation, and the automatic revert to Jo-approves. | (1) The end-of-month report lists G1–G6 with pass, fail or `insufficient data`. (2) The switch can't flip with any gate failing or short of data. (3) A simulated missed ask on C7 or C8 after graduation reverts the last change and switches back. (4) The sealed test is evaluated once and then locked. A failed attempt builds a fresh sealed set from never-exposed workloads, or waits for more cases if support is short. (5) After graduation, with no confirmed missed ask, an overdue weekly audit, or one scoring 9 of 12, suspends authority. The next improver PR waits for Jo, and already-applied changes stay in place. |
+| **B11 Checking loop, graduation, suspension and tripwire** (§ 7.3–7.6) | The missed-ask floor, the six-gate graduation report with one sealed-test evaluation, the append-only exposure history and the unassigned fresh pool, the fresh-test retry, the agent-apply switch through the § 6.5 exception, current-authority checks, suspension, prospective confirmation, and the automatic revert to Jo-approves. | (1) The end-of-month report lists G1–G6 with pass, fail or `insufficient data`. (2) The switch can't flip with any gate failing or short of data. (3) A simulated missed ask on C7 or C8 after graduation reverts the last change and switches back. (4) The sealed test is evaluated once and then locked. A failed attempt builds a fresh sealed set only from workloads with no exposure-history entry, or waits in Jo-approves if support is short. (5) A workload that was assigned to training, then removed from training, is rejected as a sealed-test candidate, and its history entry can't be deleted. (6) After graduation, with no confirmed missed ask, an overdue weekly audit, or one scoring 9 of 12, suspends authority. The next improver PR waits for Jo, and already-applied changes stay in place. |
 
 ---
 
@@ -474,12 +477,12 @@ The same four parts (Recorder, Labeler, Eval, Improver), plus the validation in 
 
 ## 12. Cross-lab review: findings and resolutions
 
-Source: `/Users/jowolff/agent-scratch/agent-system-2.0/involvement/REVIEW-openai.md`. Round 1 reviewed commit `422bef49`. Round 2, under "## Round 2 (99347881)", reviewed `99347881`. Both returned request-changes. Round 2 resolved findings 1, 3, 5, 6 and 8–10, partly resolved findings 2, 4 and 7, and added the R2 rows below.
+Source: `/Users/jowolff/agent-scratch/agent-system-2.0/involvement/REVIEW-openai.md`. Round 1 reviewed commit `422bef49`. Round 2, under "## Round 2 (99347881)", reviewed `99347881`. Round 3, under "## Round 3 (c84907ae)", reviewed `c84907ae`. All three returned request-changes. Round 2 resolved findings 1, 3, 5, 6 and 8–10, partly resolved findings 2, 4 and 7, and added the R2 rows. Round 3 resolved R2-B1, R2-B2, findings 2 and 4 and the mandatory-ask clarification, and added R3-B1.
 
 | # | Finding | Resolved in |
 |---|---|---|
 | 1 | Solo didn't preserve every reserved item. Phase closure had no action-time check, and C10 at solo was contradictory. | § 3.1 precedence rule. C4 `phase.*` operations and C10 at all levels with N7 allowed. B3 (3), B4 (3). |
-| 2 | The counter-metric couldn't see silent under-asking | § 6.2 (no signal is not evidence), § 7.1 blinded recurring non-ask audits and coverage floor, § 6.6 (follow rate generates candidates only). Round 2: authority depends on current passing audits, with suspension (§ 7.6, § 6.5 condition 1, B11 (5)). |
+| 2 | The counter-metric couldn't see silent under-asking | § 6.2 (no signal is not evidence), § 7.1 blinded recurring non-ask audits and coverage floor, § 6.6 (follow rate generates candidates only). Round 2: authority depends on current passing audits, with suspension (§ 7.6, § 6.5 condition 1, B11 (6)). |
 | 3 | The held-out core was reused for selection | § 7.2: three sets, a capped and retired selection set, a sealed one-time graduation test, prospective confirmation |
 | 4 | Gates weren't computable | § 6.3 unit, maturity, denominators, fail-closed. § 7.4 baseline. § 7.5 G1–G6 with fail conditions, "equal is allowed" for missed asks. Round 2: C8 restored to the protected set (§ 6.3, G4, G5, § 7.6, B9 (5)). The fresh-test retry is defined (§ 7.5). |
 | 5 | Graduated edits collided with C7 | § 6.5: wording, policy and enforcement are separate, with a machine-checked exception run from main. S1 `involvement` group. B10 (2). |
@@ -488,6 +491,7 @@ Source: `/Users/jowolff/agent-scratch/agent-system-2.0/involvement/REVIEW-openai
 | 8 | Attribution missed asks that never happened | § 6.1 decision-row targets, multiple candidates, `unresolved`. B1 (7). |
 | 9 | No merge-time coverage for rule documents | S7, C2 at CP3/CP5 over N2. § 8 last row. B2 (4). |
 | 10 | S4 count | S1 group keys defined. #369 is S4 = 4. |
-| R2-B1 | Graduated authority survived a missing or failed audit | § 7.6 current authority and suspension (kept apart from the tripwire rollback). § 6.5 condition 1. B11 (5). |
+| R2-B1 | Graduated authority survived a missing or failed audit | § 7.6 current authority and suspension (kept apart from the tripwire rollback). § 6.5 condition 1. B11 (6). |
 | R2-B2 | C8 dropped from the protected floor | § 6.3 protected list names C8. § 7.1 coverage, G4, G5, § 7.6 tripwire. B9 (5), B11 (3). |
 | R2 clarification | Sealed-test retry after a failed attempt | § 7.5 retry procedure, § 7.2 table. B11 (4). |
+| R3-B1 | Retry sealed set could include workloads the proposer trained on | § 7.2 append-only exposure history and unassigned fresh pool. § 7.5 retry steps 1, 3–5 draw only from never-exposed workloads, and wait in Jo-approves when support is short. B11 (4), (5). |
