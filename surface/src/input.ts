@@ -1066,9 +1066,10 @@ function cancelSliceRows(ledger: Ledger, wl: string, sl: string, reason: string)
 }
 
 /**
- * After a cancel that settled `questions`: when one was raised by a launched lane and no lane holds `wl` live, Jo's
- * `launch-requested:` (`raiseCeiling`'s request), since a cancelled slice is no resolution a parked lane resumes on
- * (`resolutions`). Returns the receipt tail.
+ * After a train skip that cancelled slices and settled `questions`: when one was raised by a launched lane and no lane holds
+ * `wl` live, Jo's `launch-requested:` (`raiseCeiling`'s request), since a cancelled slice is no resolution a parked lane
+ * resumes on (`resolutions`). Jo's skip answer is the launch authority; a bare `cancel-slice` is none (jo-issues#258).
+ * Returns the receipt tail.
  */
 function relaunchAfterCancel(ledger: Ledger, wl: string, questions: readonly QuestionRow[], reason: string): string {
 	const w = ledger.workload(wl)!;
@@ -1081,8 +1082,9 @@ function relaunchAfterCancel(ledger: Ledger, wl: string, questions: readonly Que
 /**
  * `cancel-slice` applied (D1), inside one transaction: `sliceStateRefusal` and `liveRunRefusal`
  * checked again (each throws, writing nothing), Jo's instruction on the slice, then the slice
- * cancelled with its open questions withdrawn naming the instruction (`cancelSliceRows`), and Jo's
- * `launch-requested:` when a withdrawn question was a launched lane's (`relaunchAfterCancel`).
+ * cancelled with its open questions withdrawn naming the instruction (`cancelSliceRows`). It writes
+ * no `launch-requested:` and the surface runs no launch trigger after it: cancelling is no launch
+ * authority, so a workload no lane holds stays unlaunched until Jo launches it (jo-issues#258).
  * Returns the receipt.
  */
 function cancelSlice(ledger: Ledger, cmd: Extract<Command, { kind: "cancel-slice" }>, heartbeatOf: HeartbeatOf): string {
@@ -1090,17 +1092,16 @@ function cancelSlice(ledger: Ledger, cmd: Extract<Command, { kind: "cancel-slice
 	const why = sliceStateRefusal(ledger, sl) ?? liveRunRefusal(ledger, wl, sl, heartbeatOf);
 	if (why !== null) throw new Error(why);
 	const id = ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: wl, sliceId: sl, body: `cancel-slice ${sl}` });
-	const { withdrawn, lines } = cancelSliceRows(ledger, wl, sl, `cancel-slice (instruction ${id})`);
-	const relaunch = relaunchAfterCancel(ledger, wl, withdrawn, `cancel-slice ${sl}`);
-	return [`cancelled slice ${sl} on ${wl} (instruction ${id})`, ...lines].join("; ") + relaunch;
+	const { lines } = cancelSliceRows(ledger, wl, sl, `cancel-slice (instruction ${id})`);
+	return [`cancelled slice ${sl} on ${wl} (instruction ${id})`, ...lines].join("; ");
 }
 
 /**
  * The skip close (PLAN wl-mv8s8srodefytc § 1), inside the transaction of Jo's answer `answerId` to `q`: when the
  * answer is `skip`, `q` sits on a train slice of PR n (`trainSlicePr`) and its workload carries a valid `train:`
  * entry, every open or paused train slice of n (`sl-train-<k>-<n>`, every `sl-train-<k>-<n>-full-<r>`) is cancelled
- * with cancel-slice's writer, citing the answer, so a skipped red PR leaves nothing open; a lane parked on `q`
- * relaunches as after `cancel-slice`. A slice whose test run is live (`liveRunOn`, cancel-slice's refusal, read with
+ * with cancel-slice's writer, citing the answer, so a skipped red PR leaves nothing open; a lane parked on `q` is
+ * relaunched (`relaunchAfterCancel`). A slice whose test run is live (`liveRunOn`, cancel-slice's refusal, read with
  * `heartbeatOf`) is kept open and named, since its `test-run:` settles it; the skip itself is never refused. Returns
  * the receipt tail; "" (nothing written) on any other question.
  */

@@ -69,8 +69,9 @@
 //
 // Lane launcher (DESIGN-lane-launcher.md decisions 7 and 9): an answer or a withdrawal is a
 // resolution a parked lane resumes on, so the launch trigger runs after it (once per workload for
-// a batch; `stop-reviews` withdraws the open review questions on its loops, and `cancel-slice` the
-// cancelled slice's, so both run it too); a
+// a batch; `stop-reviews` withdraws the open review questions on its loops, so it runs it too).
+// `cancel-slice` withdraws the cancelled slice's questions but is no launch authority, so it runs
+// no trigger (jo-issues#258): a lane-less workload stays unlaunched until Jo launches it; a
 // flip to autonomous writes Jo's `launch-requested:` cause and runs the trigger; a flip
 // to user-driven while an autonomous lane holds the workload writes the `lane-stop:` request the
 // runner accepts. Jo's `train <N…>` opens a merge train (`applyTrain`, the surface's cwd as its repo) and
@@ -117,9 +118,9 @@ import { type Ctx, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, type SurfaceAP
 import { triggerLaunch } from "./launch";
 import { closeWorkloadWithEntry } from "./workload";
 
-/** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null; `stop-reviews` and `cancel-slice` withdraw questions too. */
+/** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null; `stop-reviews` withdraws questions too. `cancel-slice` is no launch authority (jo-issues#258). */
 const resumes = (cmd: Command): string | null =>
-	cmd.kind === "answer" || cmd.kind === "withdraw" || cmd.kind === "stop-reviews" || cmd.kind === "cancel-slice" ? cmd.workloadId : null;
+	cmd.kind === "answer" || cmd.kind === "withdraw" || cmd.kind === "stop-reviews" ? cmd.workloadId : null;
 
 /** The workload the launch trigger runs for after `cmd`: one a resolution resumes, one a flip to autonomous hands to a lane, or a merge train Jo added to; else null. */
 const launches = (cmd: Command): string | null =>
