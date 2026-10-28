@@ -408,6 +408,8 @@ jevRank:
 # open keep the preference they were opened with. Absent, null, empty or `default` writes nothing (ordinary routing); an
 # invalid value is logged and writes nothing. OMP has no registration for the key and keeps it in the raw layer.
 # Reversal: delete the key.
+# Set temporarily on Jo's word while the no-new-work curb is on (in-mvsn4zr3er8i3z); revert this key's commit when it lifts.
+trainFixModel: openai-codex/gpt-6.1-sol
 
 # ── The agent channel to Ilex (PLAN wl-mv8vx7wdj5nx1c D1; surface/src/channel.ts readChannelConfig) ──
 # The other agents that may message Ilex, the orchestrator surface, each with its transport and authority.
