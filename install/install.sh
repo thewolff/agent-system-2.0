@@ -43,7 +43,7 @@
 # $HOME/agent-scratch/agent-system-2.0/scratch-sweep/launchd.log. --train-tick writes the merge train's
 # tick (PLAN wl-mv8s8srodefytc rev 17.1 D10) the same way: install/com.agent-system-2.train-tick.plist
 # filled with this checkout, the absolute bun path, $HOME, the ledger path, the profile name and a PATH
-# of the gh, bun, omp, git and osascript directories, written to
+# of the gh, bun, omp, git, osascript and ctx directories, written to
 # $HOME/Library/LaunchAgents/com.agent-system-2.train-tick.plist and loaded; it runs
 # surface/scripts/train-tick.ts every 300 s, logging to
 # $HOME/agent-scratch/agent-system-2.0/train-tick/launchd.log. Each flag's =off form only boots
@@ -84,7 +84,7 @@
 #          2 manifest or profile check failed, an argument other than the flags (or a flag twice, or
 #            an =off form with an installing flag), --chaos-nightly refused: not macOS, or omp or git
 #            not on PATH, or --scratch-sweep refused: not macOS, or --train-tick refused: not macOS, gh,
-#            bun, omp, git or osascript not on PATH, or `gh auth status` failed (nothing written)
+#            bun, omp, git, osascript or ctx not on PATH, or `gh auth status` failed (nothing written)
 #            (or --daily-report refused: not macOS, or bun not on PATH; nothing written)
 #            (or --control-root=verified refused: no verified root, an extension missing under it, or --train-tick=off)
 #          3 ledger path refused as synced or network folder (nothing written)
@@ -302,13 +302,15 @@ if [ "$REPORT" = on ]; then
 fi
 
 # --train-tick is checked here too, before anything is written (PLAN wl-mv8s8srodefytc rev 17.1 D10 F15): the tick runs gh,
-# launches lanes (bun, omp, git) and notifies (osascript), so its PATH is built from where each is now, the way the chaos
-# job's is; a missing tool, or a gh that is not logged in, refuses the flag rather than writing a tick that cannot act.
+# launches lanes (bun, omp, git) and notifies (osascript), and the lanes it launches inherit its PATH, so their ctx MCP
+# server (profile/mcp.json) and their exit-time ctx index need ctx on it too. Its PATH is built from where each is now, the
+# way the chaos job's is; a missing tool, or a gh that is not logged in, refuses the flag rather than writing a tick that
+# cannot act.
 if [ "$TICK" = on ]; then
 	[ "$(uname -s)" = Darwin ] || fail "--train-tick is a launchd job; this is not macOS" 2
 	[ -f "$TICK_TEMPLATE" ] || fail "--train-tick: no template at $TICK_TEMPLATE" 2
 	TICK_PATH=""
-	for tool in gh bun omp git osascript; do
+	for tool in gh bun omp git osascript ctx; do
 		tool_bin="$(type -P "$tool")" || fail "--train-tick: $tool not found on PATH; the train tick's PATH needs it" 2
 		case "$tool_bin" in /*) ;; *) tool_bin="$PWD/$tool_bin" ;; esac
 		if [ "$tool" = bun ]; then TICK_BUN="$tool_bin"; fi

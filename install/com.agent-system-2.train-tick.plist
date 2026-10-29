@@ -9,8 +9,9 @@
   flags are not spelled out here; install/install.sh's header has them.) launchd runs
   surface/scripts/train-tick.ts every 300 s, outside the fence: it settles train tasks, opens fix
   workloads, launches owners and trains, and files and re-sends Jo's alerts on thewolff/jo-issues.
-  PATH holds the directories of gh, bun, omp, git and osascript as resolved at install (launchd's
-  own PATH lacks them); the profile and ledger variables name what install wrote, so a launch the
+  PATH holds the directories of gh, bun, omp, git, osascript and ctx as resolved at install (launchd's
+  own PATH lacks them; the lanes the tick launches inherit this PATH and need ctx for their ctx MCP
+  server and history index); the profile and ledger variables name what install wrote, so a launch the
   tick makes runs on that profile and the tick reads and writes that ledger.
 -->
 <plist version="1.0">
