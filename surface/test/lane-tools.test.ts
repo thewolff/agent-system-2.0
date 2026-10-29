@@ -32,7 +32,7 @@ import { releasedOpen } from "../src/turn-end";
 import { recordRepo, renderClose } from "../src/decision-log";
 import { openPlanPath } from "../src/plan-paths";
 import { ESCALATION_BY, LANE_FULL_TEST_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, notices, tempLedger, tempRepo, tmp } from "./helpers";
+import { ctxOf, fakePi, HOW_IT_FAILS, notices, tempLedger, tempRepo, tmp } from "./helpers";
 
 /** Jo's `land-first <repo> on|off` as the surface records it: his instruction, then `land-first:` naming it, on the standing workload. */
 function landFirst(ledger: Ledger, repo: string, on: boolean): void {
@@ -64,7 +64,7 @@ const PLAN_DIR = tmp("plan");
 const PLAN_FILE = join(PLAN_DIR, "PLAN.md");
 const VERDICT_FILE = join(PLAN_DIR, "r.md");
 writeFileSync(PLAN_FILE, [
-	"# PLAN", "", "## Design", "", "The header offset moves into one token.", "",
+	"# PLAN", "", "## Design", "", "The header offset moves into one token.", "", HOW_IT_FAILS, "",
 	"## Requirements", "",
 	"- R1: the header offset lives in one token => test surface/test/tokens.test.ts; code src/tokens.ts headerOffset",
 	"- R2: the old constant is gone => test surface/test/tokens.test.ts the constant case",
@@ -90,7 +90,7 @@ const planFile = (name: string, lines: string[], eol = "\n") => {
 };
 /** A plan file whose Requirements section marks R2 and R3 prompt-only (PLAN wl-mv8vwb04cy18n4 D1, D2). */
 const PROMPT_ONLY_FILE = planFile("PLAN-prompt-only.md", [
-	"# PLAN", "", "## Requirements", "",
+	"# PLAN", HOW_IT_FAILS, "", "## Requirements", "",
 	"- R1: the refusal names the grammar => test surface/test/lane-tools.test.ts",
 	"- R2: the SPEC amendment states the rule => prompt-only: human-read prose no code can judge",
 	"- R3: the change reaches main only by Jo's merge => prompt-only: no gate refuses a lane's merge here",
@@ -1077,6 +1077,19 @@ describe("plan requirements name their enforcer (PLAN wl-mv8vwb04cy18n4 D1-D5)",
 		expect(idsIn(second)).toEqual([]);
 	});
 
+	test("issue #334 item 2: a plan file with no How it fails section is refused naming the heading, nothing written; on the n/a line it is raised and the n/a pass recorded", async () => {
+		const none = planFile("PLAN-no-fails.md", ["# PLAN", "", "## Requirements", "", "- R1: x => test surface/test/x.test.ts"]);
+		const reply = await refused(bodyOn(none, [NONE_LINE]));
+		expect(reply).toContain(`the plan file ${none} has no "How it fails" section`);
+		expect(reply).toContain("`## How it fails`");
+		expect(reply).toContain("`How it fails: n/a, <reason>`");
+		const na = planFile("PLAN-na.md", ["# PLAN", "How it fails: n/a, a one-line docs fix", "", "## Requirements", "", "- R1: x => test surface/test/x.test.ts"]);
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		expect(await ask([...PLAN_OPTIONS], planId, bodyOn(na, [NONE_LINE]))).not.toContain("Nothing was asked.");
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith("how-it-fails:")).map((e) => e.body)).toEqual([`how-it-fails: n/a, a one-line docs fix (plan file ${na})`]);
+	});
+
 	test("R2: a section with several defects is refused naming every offender, a bad separator included; a well-formed line beside them is not named", async () => {
 		const path = planFile("PLAN-defects.md", [
 			"# PLAN", "## Requirements",
@@ -1108,7 +1121,7 @@ describe("plan requirements name their enforcer (PLAN wl-mv8vwb04cy18n4 D1-D5)",
 	});
 
 	test("a plan file over PLAN_FILE_MAX_BYTES, a sparse 64 MiB one included, is refused for its size with nothing written; one of exactly PLAN_FILE_MAX_BYTES is raised", async () => {
-		const head = ["# PLAN", "", "## Requirements", "", "- R1: the plan file is read bounded => test surface/test/lane-tools.test.ts", "", "## Slices", ""].join("\n");
+		const head = ["# PLAN", HOW_IT_FAILS, "", "## Requirements", "", "- R1: the plan file is read bounded => test surface/test/lane-tools.test.ts", "", "## Slices", ""].join("\n");
 		const exact = planFile("PLAN-max.md", [head + "x".repeat(PLAN_FILE_MAX_BYTES - Buffer.byteLength(head))]);
 		const over = planFile("PLAN-over.md", [head + "x".repeat(PLAN_FILE_MAX_BYTES + 1 - Buffer.byteLength(head))]);
 		const sparse = planFile("PLAN-sparse.md", [head]);
@@ -1771,7 +1784,7 @@ describe("escalation phase 2 through the lane tools (PLAN wl-mvg1vs0rhnu3gg § 1
 
 	test("fix round 1 (F1): a reviewed plan whose PLAN.md is edited after the raise (R2 made prompt-only), its question bytes unchanged, is refused on repeat with and without now: guard; no now: mark, no new row", async () => {
 		const { ledger, wl, planId, ask, call } = await planFixture("production");
-		const lines = ["# PLAN", "", "## Requirements", "", "- R1: the header offset lives in one token => test surface/test/tokens.test.ts", "- R2: the old constant is gone => test surface/test/tokens.test.ts"];
+		const lines = ["# PLAN", HOW_IT_FAILS, "", "## Requirements", "", "- R1: the header offset lives in one token => test surface/test/tokens.test.ts", "- R2: the old constant is gone => test surface/test/tokens.test.ts"];
 		const path = planFile("PLAN-edited.md", lines);
 		const body = bodyOn(path, [NONE_LINE]);
 		seedReview(ledger, wl, planId);

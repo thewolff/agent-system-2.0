@@ -22,7 +22,7 @@ import { briefHash, goalsHash, livePins, parseShown, rankOpen, SEED_GOALS, type 
 import { readRankConfig } from "../src/rank-launch";
 import { surfaceSession } from "../src/session";
 import { RANK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, sh, tempLedger, tmp } from "./helpers";
+import { ctxOf, fakePi, HOW_IT_FAILS, sh, tempLedger, tmp } from "./helpers";
 
 const REPO = join(import.meta.dir, "..", "..");
 
@@ -550,7 +550,7 @@ describe("wl-mv8wzytml878b4 T8 priority pause from as2_rank, and the table marks
 });
 
 describe("T11 open", () => {
-	const OPEN = { brief: "HIGH: stop Jo pasting lane ids by hand", stakes: "normal", done: "it is done" };
+	const OPEN = { brief: `HIGH: stop Jo pasting lane ids by hand${HOW_IT_FAILS}`, stakes: "normal", done: "it is done" };
 	const KINDS = ["locate", "understand", "change-small", "change-large", "judge"];
 	const SIZED = { answers: { kind: { choice: "change-large", confidence: 0.9, probabilities: Object.fromEntries(KINDS.map((k) => [k, k === "change-large" ? 0.9 : 0.025])) } }, provider: "typesafe", model: "jev" };
 

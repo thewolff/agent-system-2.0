@@ -15,6 +15,7 @@ import {
 	type SliceRow, TEST_RUNNER_BY, type WorkloadRow,
 } from "../../ledger/src/index";
 import { type CleanShellRead, cleanShellOn } from "../../gates/src/clean-shell";
+import { checkHowItFails, HOW_IT_FAILS_HEADING, HOW_IT_FAILS_NA_LINE } from "../../gates/src/how-it-fails";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_CAP_ENV, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
@@ -988,6 +989,15 @@ export const PLAN_REQUIREMENTS_SHAPE = [
 	`(R ids unique; the split is at the last \` => \`; an enforcer is a kind, ${ENFORCER_KINDS.join(" / ")}, exactly one space and a locator that starts with no whitespace and holds no \`;\`, enforcers separated by \`; \`, none twice; a prompt-only part is exactly \`prompt-only: \` then its reason and is never mixed with enforcers; at least one requirement)`,
 ].join("\n");
 
+/**
+ * The plan file's "How it fails" rule as a plan-first lane's first prompt and `lane_raise_question` render it (Jo 2026-10-28,
+ * issue #334 item 2; the matcher is gates/src/how-it-fails.ts): `planQuestionProblem` refuses a plan file without it.
+ */
+export const PLAN_HOW_IT_FAILS_LINE =
+	`The plan file also carries a "How it fails" section: a \`${HOW_IT_FAILS_HEADING}\` heading (any level) with at least one line under it naming the errors the work can hit, ` +
+	`where each one surfaces, the recovery step and the retry bound; for trivial work, the line \`${HOW_IT_FAILS_NA_LINE}\` instead, and that use is recorded. ` +
+	"The plan question is refused while the plan file has neither; fix the file and raise the question again.";
+
 /** The literal start of a prompt-only enforcer part (PLAN wl-mv8vwb04cy18n4 D1): `prompt-only`, a colon and exactly one space. */
 const PROMPT_ONLY_PREFIX = "prompt-only: ";
 
@@ -1091,7 +1101,8 @@ export const PLAN_FILE_MAX_BYTES = 262144;
  * be read. PLAN wl-mv8vwb04cy18n4 D3: the structural problems come first, the first one wins; then an unreadable
  * plan file, or one whose text is over PLAN_FILE_MAX_BYTES bytes (so a longer file, cut at the extra byte, is
  * refused before any of it is parsed); then the plan file's requirements (`requirementsProblem`, every offender
- * named); then the prompt-only ids against the file's (missing, extra and duplicate ids each named), joined with `; `.
+ * named); then the prompt-only ids against the file's (missing, extra and duplicate ids each named); then the plan file's "How it fails"
+ * section (gates/src/how-it-fails.ts, Jo 2026-10-28, issue #334 item 2), all joined with `; `.
  */
 export function planQuestionProblem(body: string, isFile: (path: string) => boolean, readFile: (path: string) => string | null): string | null {
 	const lines = body.split("\n");
@@ -1132,7 +1143,10 @@ export function planQuestionProblem(body: string, isFile: (path: string) => bool
 	if (text === null) return `the plan file could not be read: "${path}"`;
 	if (Buffer.byteLength(text, "utf8") > PLAN_FILE_MAX_BYTES) return `the plan file is over ${PLAN_FILE_MAX_BYTES} bytes`;
 	const req = requirementsProblem(text);
-	if (req.problem !== null) return req.problem;
+	// Issue #334 item 2: the plan file carries a "How it fails" section (or the n/a line); the refusal names the heading it expects,
+	// beside a requirements problem when there is one, so a single resubmission can fix both.
+	const fails = checkHowItFails(text, `the plan file ${path}`);
+	if (req.problem !== null) return fails.ok ? req.problem : `${req.problem}; ${fails.reason}`;
 	// D2: the body's prompt-only ids equal the file's exactly, or the body is exactly PROMPT_ONLY_NONE when the file has none.
 	const want = new Set(req.promptOnly);
 	const problems: string[] = [];
@@ -1146,6 +1160,7 @@ export function planQuestionProblem(body: string, isFile: (path: string) => bool
 	if (extra.length > 0) problems.push(`it has a prompt-only line for ${extra.join(", ")}, which the plan file does not mark prompt-only`);
 	const twice = [...new Set(listed.filter((id, i) => listed.indexOf(id) !== i))];
 	if (twice.length > 0) problems.push(`it has more than one prompt-only line for ${twice.join(", ")}`);
+	if (!fails.ok) problems.push(fails.reason);
 	return problems.length > 0 ? problems.join("; ") : null;
 }
 
@@ -1824,6 +1839,7 @@ export function firstPrompt(p: PromptInput): string {
 		// PLAN wl-mv8vwb04cy18n4 D4: the requirements grammar reaches plan-first lanes only, from the one constant.
 		out.push(`The plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section that names, for each requirement, its enforcer or why it is prompt-only, in this grammar; a plan file without it, or with a line the check cannot parse, is refused:`);
 		out.push(PLAN_REQUIREMENTS_SHAPE);
+		out.push(PLAN_HOW_IT_FAILS_LINE);
 		out.push(
 			"Change slices are refused until Jo approves. At normal stakes a plan that passes cross-lab review starts on its own unless flow repair is up: when the latest review round on the plan slice passed wholly on labs other than the builder's, `lane_raise_question` approves the plan instead of asking, Jo gets a notice, and you add your change slices.",
 		);

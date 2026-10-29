@@ -14,7 +14,7 @@ import { controlEntries, laneExitBody } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { oneLiner, renderWorkload } from "../src/render";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
+import { ctxOf, fakePi, HOW_IT_FAILS, notices, tempLedger, tmp } from "./helpers";
 
 function env(): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
@@ -61,9 +61,9 @@ describe("ceiling at open and on Jo's stakes word", () => {
 		orchestratorSurface(f.pi, e, { judge });
 		const ctx = ctxOf();
 		const openTool = f.tool("orchestrator_open_workload");
-		const small = await openTool.execute("1", { brief: "rename a variable", done: "renamed", stakes: "normal" }, undefined, undefined, ctx);
-		const large = await openTool.execute("1", { brief: "build the billing subsystem", done: "billing runs", stakes: "normal" }, undefined, undefined, ctx);
-		const prod = await openTool.execute("1", { brief: "ship the billing subsystem", done: "shipped", stakes: "production" }, undefined, undefined, ctx);
+		const small = await openTool.execute("1", { brief: `rename a variable${HOW_IT_FAILS}`, done: "renamed", stakes: "normal" }, undefined, undefined, ctx);
+		const large = await openTool.execute("1", { brief: `build the billing subsystem${HOW_IT_FAILS}`, done: "billing runs", stakes: "normal" }, undefined, undefined, ctx);
+		const prod = await openTool.execute("1", { brief: `ship the billing subsystem${HOW_IT_FAILS}`, done: "shipped", stakes: "production" }, undefined, undefined, ctx);
 		const idOf = (r: { details?: unknown }): string => {
 			const d = r.details;
 			if (d && typeof d === "object" && "id" in d && typeof d.id === "string") return d.id;

@@ -735,8 +735,9 @@ export const REVIEW_FINDINGS_PARAGRAPH = [
 	"",
 	"",
 	"Findings block (agent-system 2.0 review round limit): end your final report with one fenced code block whose info string is review-findings, holding JSON",
-	'{"findings":[{"severity":"blocking|major|minor","kind":"correctness|security|tests|design|docs|other","title":"…"}]}',
+	'{"findings":[{"severity":"blocking|major|minor","kind":"correctness|security|tests|design|docs|fault-tolerance|other","title":"…"}]}',
 	"with one entry per finding you report and an empty list when there is none. Only the last such block is read; a missing or malformed block fails the review round.",
+	"A silent failure path is kind fault-tolerance: a swallowed error (an empty or log-less catch, an ignored rejection or exit code), an unannounced fallback, a long-running step with no progress deadline, or cleanup that deletes cited evidence. A fault-tolerance finding is always read as blocking.",
 ].join("\n");
 
 /** A review item's brief with the findings paragraph, appended once. */

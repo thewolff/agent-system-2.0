@@ -84,8 +84,9 @@ const down = (w: World, ...models: string[]) => {
 };
 const up = (w: World, ...models: string[]) => w.creds.push(...models);
 
+/** A six-field brief with its "How it fails" section (issue #334 item 2), so row 5 passes it. */
 const brief = (w: World, task: string, stakes: Stakes = "normal") =>
-	`workload: ${w.wl}\ntask: ${task}\ndone-condition: d\ninputs: i\nstakes: ${stakes}\nceiling-share: 10`;
+	`workload: ${w.wl}\ntask: ${task}\ndone-condition: d\ninputs: i\nstakes: ${stakes}\nceiling-share: 10\n## How it fails\n- the review hand fails: its failure reaches the ledger; redispatch once`;
 
 type Handler = (event: unknown, ctx?: unknown) => unknown;
 /** A rewritten task item, as the tests read it back. */

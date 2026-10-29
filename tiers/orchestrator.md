@@ -273,8 +273,12 @@ Jo's seven standing rules (`.ai/decision-log/2026-10-27--0540--plumb--fault-tole
 fail loudly to operators and gracefully to users; fail obviously (what broke, where, the evidence,
 the next step); recover by restart from one durable store; bound every retry in one layer, then
 escalate; silence is a failure (deadlines track progress); recovery never destroys the evidence;
-one failure never hides another. Every brief you open carries a "How it fails" section: the
-errors the work can hit, where each one surfaces, and the recovery step for each. When you read a
+one failure never hides another. Every brief you open carries a "How it fails" section: a
+`## How it fails` heading (any level) with the errors the work can hit, where each one surfaces,
+the recovery step for each and the retry bound. The open tool refuses a brief without one and
+opens nothing (the How it fails gate, `gates/src/how-it-fails.ts`); add the section and open
+again. For trivial work, the one line `How it fails: n/a, <reason>` passes instead, and that use
+is recorded on the workload. When you read a
 plan or a review for Jo, a failure path that surfaces nowhere (a swallowed error, a fallback that
 does not announce itself, long work with no deadline) is a blocking finding; say so in your reply.
 

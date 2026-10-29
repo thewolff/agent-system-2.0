@@ -6,6 +6,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+	blockingOf,
 	countRounds,
 	type EntryInput,
 	effectiveRoundLimit,
@@ -258,6 +259,33 @@ describe("countRounds", () => {
 			entry(`review-round: ${SL} round 1 token dt-z group dg-z verdict accepted blocking 5 counts ${JSON.stringify(findingsWith(1))}`),
 		];
 		expect(countRounds(entries, SL).rounds).toEqual([]);
+	});
+});
+
+describe("fault-tolerance findings (issue #334 item 1): a silent failure path is blocking", () => {
+	/** A reviewer's report on a diff whose `catch {}` hides the push error, filed at the severity the reviewer chose. */
+	const report = (severity: string) =>
+		[
+			"Reviewed the push helper.",
+			"```ts",
+			"try { await push(branch); } catch {}",
+			"```",
+			"The empty catch hides a failed push: the lane reports done with nothing on the remote.",
+			block([f(severity, "fault-tolerance", "catch {} hides a failed push")]),
+		].join("\n");
+
+	test("a catch {} hiding an error is a blocking fault-tolerance finding, at whatever severity the reviewer wrote", () => {
+		for (const severity of ["blocking", "major", "minor"]) {
+			const p = parsed(report(severity));
+			expect({ severity, counts: p.counts }).toEqual({ severity, counts: { blocking: { "fault-tolerance": 1 }, major: {}, minor: {} } });
+			expect(blockingOf(p)).toBe(1);
+		}
+	});
+
+	test("a stored round naming a non-blocking fault-tolerance count is malformed, not read as a pass", () => {
+		const body = reviewRoundBody({ slice: SL, group: "g1", verdict: "accepted", findings: parsed(report("minor")) } as never);
+		expect(body).toContain("fault-tolerance");
+		expect(parseReviewRound(body.replace("blocking", "minor"))).toBeNull();
 	});
 });
 

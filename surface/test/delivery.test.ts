@@ -96,7 +96,7 @@ describe("a notice (PLAN wl-mvfkv7llkp7nk0 § 2, R14): a message row shown as an
 		expect(ledger.message(id)).toMatchObject({ workload_id: wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, state: "held", body: `notice: 80 % of the ceiling; \`extend ${wl}\` adds one block` });
 		expect(questionRows(ledger)).toBe(0);
 		const lines = new Numbering().assign(errorLines(ledger));
-		expect(lines).toEqual([{ kind: "notice", workloadId: wl, rowId: id, messageIds: [id], line: `notice on ${wl} (nothing to answer): 80 % of the ceiling; \`extend ${wl}\` adds one block` }]);
+		expect(lines).toEqual([{ kind: "notice", workloadId: wl, rowId: id, messageIds: [id], next: "nothing to answer", line: `notice on ${wl} (nothing to answer): 80 % of the ceiling; \`extend ${wl}\` adds one block` }]);
 		expect(consumeLines(ledger, lines)).toBe(1);
 		expect(ledger.message(id)!.state).toBe("delivered");
 		expect(errorLines(ledger)).toEqual([]);
