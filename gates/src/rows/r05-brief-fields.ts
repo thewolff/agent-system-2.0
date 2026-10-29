@@ -34,10 +34,19 @@ export function briefFields(text: string): Partial<Record<BriefField, string>> {
 }
 
 /**
+ * The texts a dispatch item's brief is read from for its "How it fails" section: the batch context and the item's task, each
+ * matched on its own (an empty section at the end of the context is not filled by the task's first line). Row 5 and its n/a
+ * note read the same texts, and so does the classifier's check of its own rewrite.
+ */
+export function briefTexts(context: string, task: string): string[] {
+	return [context, task];
+}
+
+/**
  * Refuses a `task` call any of whose items lacks a field (looked up in the item's task, then the
  * batch context). When the session is bound to a workload (AGENT_SYSTEM_WORKLOAD_ID), a brief whose
- * `workload:` names another one is refused too (M4 fix round 4, S6; triad #7/#12). Each item's task,
- * read with the batch context, carries a "How it fails" section or the n/a line (issue #334 item 2).
+ * `workload:` names another one is refused too (M4 fix round 4, S6; triad #7/#12). Each item carries
+ * a "How it fails" section or the n/a line in its task or the batch context (issue #334 item 2).
  */
 export function checkBriefFields(input: Record<string, unknown>, boundWorkload: string | null = null): Refusal {
 	const context = typeof input.context === "string" ? input.context : "";
@@ -52,7 +61,7 @@ export function checkBriefFields(input: Record<string, unknown>, boundWorkload: 
 			else if (VALUE_CHECK[f] && !VALUE_CHECK[f]!.re.test(v)) problems.push(`item ${i}: "${f}: ${v}" is not ${VALUE_CHECK[f]!.want}`);
 			else if (f === "workload" && boundWorkload && v !== boundWorkload) problems.push(`item ${i}: "workload: ${v}" is not this session's workload ${boundWorkload}`);
 		}
-		const fails = checkHowItFails(`${context}\n${task}`, `item ${i}'s brief`);
+		const fails = checkHowItFails(briefTexts(context, task), `item ${i}'s brief`);
 		if (!fails.ok) problems.push(`item ${i}: ${fails.reason}`);
 	});
 	if (problems.length === 0) return null;
@@ -70,15 +79,15 @@ export function checkBriefFields(input: Record<string, unknown>, boundWorkload: 
 /** The text fields of a `pair_propose` change card (plugins/paired-coding/omp/paired-coding-omp.ts), in the order the card shows them. */
 const CARD_FIELDS = ["whyNow", "decision", "currentCode", "proposedCode", "effect", "checks", "openPoints"] as const;
 
-/** A change card's text, one field per line and a list field's items one per line, for the "How it fails" matcher. */
-export function cardText(input: Record<string, unknown>): string {
+/** A change card's texts, one per field (a list field's items one per line within it), each matched on its own for "How it fails". */
+export function cardTexts(input: Record<string, unknown>): string[] {
 	const out: string[] = [];
 	for (const f of CARD_FIELDS) {
 		const v = input[f];
 		if (typeof v === "string") out.push(v);
-		else if (Array.isArray(v)) out.push(...v.filter((x): x is string => typeof x === "string"));
+		else if (Array.isArray(v)) out.push(v.filter((x): x is string => typeof x === "string").join("\n"));
 	}
-	return out.join("\n");
+	return out;
 }
 
 /**
@@ -87,7 +96,7 @@ export function cardText(input: Record<string, unknown>): string {
  * passes) and the verdict, so the caller can record an n/a or bypass pass.
  */
 export function checkCard(input: Record<string, unknown>): { refusal: Refusal; verdict: HowItFailsVerdict } {
-	const verdict = checkHowItFails(cardText(input), "this change card");
+	const verdict = checkHowItFails(cardTexts(input), "this change card");
 	if (verdict.ok) return { refusal: null, verdict };
 	return {
 		refusal: {

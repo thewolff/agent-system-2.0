@@ -282,10 +282,22 @@ describe("fault-tolerance findings (issue #334 item 1): a silent failure path is
 		}
 	});
 
-	test("a stored round naming a non-blocking fault-tolerance count is malformed, not read as a pass", () => {
-		const body = reviewRoundBody({ slice: SL, group: "g1", verdict: "accepted", findings: parsed(report("minor")) } as never);
-		expect(body).toContain("fault-tolerance");
-		expect(parseReviewRound(body.replace("blocking", "minor"))).toBeNull();
+	test("a stored round whose fault-tolerance count is not blocking is malformed, not read as a pass (review of #405, should-fix 5)", () => {
+		const round = (findings: ReturnType<typeof parsed>) => reviewRoundBody({ slice: SL, round: 1, token: "dt-1", group: "dg-1", verdict: "accepted", findings });
+		// a legacy round (major correctness, minor docs) still round-trips
+		const legacy = round(parsed(block([f("major", "correctness", "off by one"), f("minor", "docs", "typo in readme")])));
+		expect(parseReviewRound(legacy)?.findings).toEqual(parsed(block([f("major", "correctness", "off by one"), f("minor", "docs", "typo in readme")])));
+		// a valid round with a minor docs finding parses; the same body with only that count's kind changed to fault-tolerance does not
+		const valid = round(parsed(block([f("minor", "docs", "typo in readme")])));
+		expect(parseReviewRound(valid)).not.toBeNull();
+		expect(valid).toContain(' blocking 0 counts {"');
+		const minorFaultTolerance = valid.replace('"docs"', '"fault-tolerance"');
+		expect(minorFaultTolerance).toContain('"minor":{"fault-tolerance":1}');
+		expect(parseReviewRound(minorFaultTolerance)).toBeNull();
+		// and a fault-tolerance round written by the parser itself round-trips as blocking
+		const ft = round(parsed(report("minor")));
+		expect(ft).toContain(" blocking 1 counts ");
+		expect(parseReviewRound(ft)?.findings).toEqual(parsed(report("minor")));
 	});
 });
 

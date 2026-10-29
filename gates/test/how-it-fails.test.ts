@@ -3,8 +3,8 @@
 import { describe, expect, test } from "bun:test";
 import briefFieldsRow from "../extensions/r05-brief-fields";
 import { checkToolCall } from "../src/gates";
-import { checkHowItFails, HOW_IT_FAILS_HEADING, HOW_IT_FAILS_NA_LINE, howItFailsNote, matchHowItFails } from "../src/how-it-fails";
-import { cardText, checkBriefFields, checkCard } from "../src/rows/r05-brief-fields";
+import { checkHowItFails, HOW_IT_FAILS_HEADING, HOW_IT_FAILS_NA_LINE, howItFailsLines, howItFailsNote, matchHowItFails } from "../src/how-it-fails";
+import { cardTexts, checkBriefFields, checkCard } from "../src/rows/r05-brief-fields";
 import { LANE_ENV, WORKLOAD_ENV } from "../src/types";
 import { brief as fixtureBrief, HOW_IT_FAILS_FIXTURE, tempLedger } from "./helpers";
 
@@ -38,6 +38,40 @@ describe("matchHowItFails: one matcher for every entry point", () => {
 
 	test("a real section wins over an n/a line in the same text", () => {
 		expect(matchHowItFails(`How it fails: n/a, later\n${SECTION}`)).toEqual({ via: "section" });
+	});
+});
+
+describe("review of #405: fenced code is never the section, and a section may have child headings", () => {
+	test("a heading or n/a line inside a ``` or ~~~ fence is an example, not the section (blocking 2)", () => {
+		for (const text of [
+			"```md\n## How it fails\n```",
+			"~~~\n## How it fails\n- push fails: retry once\n~~~",
+			"````md\n## How it fails\n```\n- still inside the four-tick fence\n````",
+			"```\nHow it fails: n/a, quoted example\n```",
+			"> How it fails: n/a, quoted in a blockquote",
+		]) expect({ text, m: matchHowItFails(text) }).toEqual({ text, m: null });
+	});
+
+	test("fence delimiters and fenced lines are not a section's content: an empty section followed only by a fenced block is refused (blocking 2)", () => {
+		expect(matchHowItFails("## How it fails\n```\n```")).toBeNull();
+		expect(matchHowItFails("## How it fails\n```sh\nexit 1\n```\n## Next\n- a")).toBeNull();
+		expect(matchHowItFails("## How it fails\n~~~\n~~~")).toBeNull();
+	});
+
+	test("a real section may still contain code beside its prose", () => {
+		expect(matchHowItFails("## How it fails\n- the push is refused; retry once:\n```sh\ngit push\n```")).toEqual({ via: "section" });
+	});
+
+	test("a deeper heading inside the section neither ends it nor counts as content (should-fix 4)", () => {
+		expect(matchHowItFails("## How it fails\n### Push fails\nReport stderr; retry once")).toEqual({ via: "section" });
+		expect(matchHowItFails("## How it fails\n### Push fails\n### Tests fail\n## Slices\n- a")).toBeNull();
+		expect(matchHowItFails("## How it fails\n### Push fails\n# Next part\n- a")).toBeNull();
+	});
+
+	test("howItFailsLines returns the whole section, child headings and code included, or the n/a line", () => {
+		expect(howItFailsLines("# Plan\n## How it fails\n### Push\n- retry once\n## Slices\n- a")).toBe("## How it fails\n### Push\n- retry once");
+		expect(howItFailsLines("task: x\nHow it fails: n/a, docs only\nmore")).toBe("How it fails: n/a, docs only");
+		expect(howItFailsLines("no section")).toBeNull();
 	});
 });
 
@@ -90,6 +124,13 @@ describe("row 5: a hand's dispatch brief carries the section", () => {
 		expect(checkBriefFields({ context: SECTION, tasks: [{ agent: "fast", name: "sl-a", task: brief("") }, { agent: "fast", name: "sl-b", task: brief("") }] }, "wl-test1")).toBeNull();
 	});
 
+	test("an empty section at the end of the batch context is not filled by the task's first lines (blocking 1)", () => {
+		const r = checkBriefFields({ context: "## How it fails\n\n", tasks: [{ agent: "fast", name: "sl-a", task: brief("") }] }, "wl-test1");
+		expect(r?.reason).toContain(`item 0's brief has no "How it fails" section`);
+		const flat = checkBriefFields({ agent: "fast", name: "sl-a", context: "## How it fails\n", task: brief("") }, "wl-test1");
+		expect(flat?.reason).toContain('"How it fails"');
+	});
+
 	test("the composed gate refuses the same dispatch", () => {
 		const r = checkToolCall({ toolName: "task", input: { agent: "fast", name: "sl-a", task: brief("") } }, { cwd: "/tmp", role: "lane" } as never);
 		expect(r?.reason).toContain('"How it fails"');
@@ -99,8 +140,14 @@ describe("row 5: a hand's dispatch brief carries the section", () => {
 describe("row 5: a paired lane's change card carries the section", () => {
 	const card = (effect: string) => ({ boundary: ["a.ts"], decision: "rename x", effect, checks: ["bun test a.test.ts"] });
 
-	test("the card's text fields are read in order, list items one per line", () => {
-		expect(cardText({ whyNow: "w", checks: ["c1", "c2"], effect: "e", boundary: ["ignored"] })).toBe("w\ne\nc1\nc2");
+	test("the card's texts are its fields in order, one text per field, a list field's items one per line within it", () => {
+		expect(cardTexts({ whyNow: "w", checks: ["c1", "c2"], effect: "e", boundary: ["ignored"] })).toEqual(["w", "e", "c1\nc2"]);
+	});
+
+	test("an empty section at the end of one field is not filled by the next field (blocking 1)", () => {
+		const r = checkCard({ boundary: ["a.ts"], effect: "new\n## How it fails\n\n", checks: ["bun test"] });
+		expect(r.refusal?.reason).toContain('this change card has no "How it fails" section');
+		expect(checkCard({ boundary: ["a.ts"], effect: "new", checks: ["## How it fails", "- the test fails: rerun once"] }).refusal).toBeNull();
 	});
 
 	test("a card with no section is refused with the heading and where to put it; one with it in `effect`, or the n/a line, passes", () => {

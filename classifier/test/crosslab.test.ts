@@ -11,7 +11,8 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkBriefFields } from "../../gates/src/rows/r05-brief-fields";
+import { checkHowItFails, howItFailsNote } from "../../gates/src/how-it-fails";
+import { briefTexts, checkBriefFields } from "../../gates/src/rows/r05-brief-fields";
 import { LANE_RUNNER_BY, Ledger, type Stakes } from "../../ledger/src/index";
 import { createClassifierExtension, REVIEW_FINDINGS_PARAGRAPH } from "../extension";
 import { loadCalibration } from "../src/classify";
@@ -475,6 +476,40 @@ describe("Production fan-out", () => {
 		expect(JSON.stringify(w.ledger.routings(w.wl))).not.toContain(ASTRA);
 		const groups = bodies(w, "hand-spawn:").map(b => / group (\S+) /.exec(b)![1]);
 		expect(groups[0]).toBe(groups[1]!); // one round
+	});
+
+	describe("the fan-out keeps a How it fails section that lives only in the shared context (review of #405, blocking 3)", () => {
+		const NA = "How it fails: n/a, read-only review";
+		/** The six fields with no section of their own: the section is the context's. */
+		const bare = (w: World) => brief(w, "review the change").replace(/\n## How it fails[\s\S]*$/, "");
+		/** The note row 5 writes for a member brief of `call`, read as the hands get it (the batch context, then the task). */
+		const notes = (call: { context?: string; tasks: { name: string; task: string }[] }) =>
+			call.tasks.map(t => howItFailsNote(checkHowItFails(briefTexts(call.context ?? "", t.task), "the brief"), `dispatch brief ${t.name}`));
+
+		test("a flat dispatch: its context becomes the batch's, not each member's, and every member's brief still carries the n/a line", async () => {
+			const w = world({ stakes: "production" });
+			const h = lane(w);
+			h.laneMessage(OPUS);
+			const input = { agent: "strong", name: "sl-x", context: NA, task: bare(w) };
+			expect(checkBriefFields(input, w.wl)).toBeNull();
+			const out = await h.toolCall(input, "c1");
+			expect(out?.block).toBeUndefined();
+			expect(out!.input.context).toBe(NA);
+			expect(out!.input.tasks.map((t: Record<string, unknown>) => "context" in t)).toEqual([false, false]);
+			expect(checkBriefFields(out!.input, w.wl)).toBeNull();
+			expect(notes(out!.input)).toEqual(["how-it-fails: n/a, read-only review (dispatch brief sl-x--openai)", "how-it-fails: n/a, read-only review (dispatch brief sl-x--kimi)"]);
+		});
+
+		test("a batch dispatch: its shared context is kept, and the members pass row 5 as rewritten", async () => {
+			const w = world({ stakes: "production" });
+			const h = lane(w);
+			h.laneMessage(OPUS);
+			const out = await h.toolCall({ context: NA, tasks: [{ agent: "strong", name: "sl-x", task: bare(w) }] }, "c1");
+			expect(out?.block).toBeUndefined();
+			expect(out!.input.context).toBe(NA);
+			expect(checkBriefFields(out!.input, w.wl)).toBeNull();
+			expect(notes(out!.input).every(n => n?.startsWith("how-it-fails: n/a, read-only review"))).toBe(true);
+		});
 	});
 
 	test("a production review hand that answers on gpt-6-astra is refused out of row at settle (Jo, in-mv5qfm8910ycjk)", async () => {

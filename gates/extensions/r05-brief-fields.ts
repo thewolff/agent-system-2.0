@@ -4,7 +4,7 @@
 // `How it fails: n/a, <reason>` line, or on the gate's error bypass, is recorded on the workload.
 import { checkHowItFails, howItFailsNote } from "../src/how-it-fails";
 import { dispatchItems } from "../src/rows/r04-tier-name";
-import { checkBriefFields, checkCard } from "../src/rows/r05-brief-fields";
+import { briefTexts, checkBriefFields, checkCard } from "../src/rows/r05-brief-fields";
 import { type GateSession, type GatesAPI, gateSession } from "../src/session";
 import type { Refusal } from "../src/types";
 
@@ -42,7 +42,7 @@ export default function briefFieldsRow(pi: GatesAPI, env: Record<string, string 
 		for (const item of dispatchItems(event.input)) {
 			const task = typeof item.task === "string" ? item.task : "";
 			const name = typeof item.name === "string" ? item.name : "?";
-			const note = howItFailsNote(checkHowItFails(`${context}\n${task}`, "the brief"), `dispatch brief ${name}`);
+			const note = howItFailsNote(checkHowItFails(briefTexts(context, task), "the brief"), `dispatch brief ${name}`);
 			if (note !== null) notes.push(note);
 		}
 		return recordPasses(s, notes) ?? undefined;
