@@ -698,6 +698,13 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		expect(existsSync(plist)).toBe(false);
 	});
 
+	test("the train tick's template runs its tree unclamped: ProcessType Interactive, never Background or Standard", () => {
+		// The tick's lanes request the full-suite runs, and the whole tree inherits the job's clamp: Background is priority 4,
+		// Standard is utility (priority 20), where timing tests fail under contention that they pass at 31.
+		const template = readFileSync(join(REPO, "install", "com.agent-system-2.train-tick.plist"), "utf8");
+		expect(/<key>ProcessType<\/key>\s*<string>([^<]+)<\/string>/.exec(template)?.[1]).toBe("Interactive");
+	});
+
 	test("--train-tick=off with an installing flag, or --train-tick twice, is refused with exit 2 and writes nothing", () => {
 		const home = join(root, "home-train-tick-refused");
 		mkdirSync(home, { recursive: true });
