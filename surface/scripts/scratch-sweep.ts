@@ -21,10 +21,11 @@
 //     claim is a write transaction, so it lands either before that transaction (the root is kept) or after the rename
 //     (the claiming side re-creates the root). After the lock is released the detached tree is archived and verified
 //     (surface/src/scratch-archive.ts archiveDetached: one `.tar.gz` under the archive base, scratchArchiveBase(<home>),
-//     a sibling of the scratch base; capacity checked first, the extraction compared entry by entry with the tree, the
-//     tree read again after, with lsof first showing nothing open in it), and only a verified archive lets the recursive
-//     remove (purgeDetached) run. A tree whose archive fails, or that a process still has a file open in (or lsof cannot
-//     say), is renamed back and kept ("archive failed"). One root's failure never stops the others; every one is
+//     a sibling of the scratch base; capacity checked first, the extraction compared entry by entry with the tree, then
+//     the tree frozen (no write bits), lsof showing nothing open in it and the tree read again), and only a verified
+//     archive lets the remove (purgeArchived: entry by entry, only what the freeze recorded) run. A tree whose archive
+//     fails, that a process still has a file open in (or lsof cannot say), or that cannot be frozen, is given its modes
+//     back, renamed back and kept ("archive failed"). One root's failure never stops the others; every one is
 //     reported. Outside the base only expired archives (step 3) are removed.
 //  3. Archives under the archive base older than `scratchArchive.expireDays` (profile config, default 14) are removed,
 //     with their `<archive>.offsite` marker and the offsite job's `.attempts` / `.stuck` sidecars; with
@@ -55,11 +56,11 @@ import { type BigIntStats, lstatSync, mkdirSync, readdirSync, readlinkSync, real
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { SCRATCH_ENTRY, SCRATCH_TOTAL_DEFAULT_MB, SCRATCH_TOTAL_ENV, scratchBase } from "../../gates/src/scratch";
-import { type Archived, type ArchiveSeams, archiveDetached, archivePathFor, DEFAULT_SCRATCH_ARCHIVE, type ExpiryLine, expireArchives, freeBytes, GIB, gib, readScratchArchiveConfig, SCRATCH_ARCHIVE_KEY, type ScratchArchiveConfig, scratchArchiveBase } from "../src/scratch-archive";
+import { type Archived, type ArchiveSeams, archiveDetached, archivePathFor, DEFAULT_SCRATCH_ARCHIVE, type ExpiryLine, expireArchives, freeBytes, GIB, gib, purgeArchived, readScratchArchiveConfig, SCRATCH_ARCHIVE_KEY, type ScratchArchiveConfig, scratchArchiveBase } from "../src/scratch-archive";
 import { defaultLedgerPath, type EntryRow, Ledger, type WorkloadStatusRow } from "../../ledger/src/index";
 import { ensureStandingWorkload } from "../src/identity";
 import { heldLive, SCRATCH_SWEEP_BY } from "../src/launch";
-import { type Detach, detachChild, newestChange, purgeDetached, REMOVING_PREFIX, restoreDetached } from "../src/scratch-remove";
+import { type Detach, detachChild, newestChange, REMOVING_PREFIX, restoreDetached } from "../src/scratch-remove";
 import { STANDING_WORKLOAD_ID } from "../src/types";
 
 /** An open workload's root with no live holder is removed after this long with nothing changed in it. */
@@ -309,7 +310,7 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 				return { name, sizeKib, action: "archive failed", why: `${why}; not archived (${a.reason}); kept, ${back.said}` };
 			}
 			archived.push({ name, archive: a });
-			const r = purgeDetached(d);
+			const r = purgeArchived(d, a);
 			if (r.kind === "removed") return { name, sizeKib, action: "removed", why: a.warnings.length ? `${why}; ${a.warnings.join("; ")}` : why };
 			failed = true;
 			return { name, sizeKib, action: "remove failed", why: `${why}; archived to ${a.path}, then ${r.kind === "refused" ? `refused at removal: ${r.reason}` : r.error}; what is left is at ${d.doomed}` };

@@ -9,7 +9,7 @@
 // entry lands on the standing workload, once while open; back within bounds, `scratch-disk-ok:`.
 // --dry-run removes and writes nothing; a missing ledger or a bad threshold removes nothing.
 import { afterAll, describe, expect, test } from "bun:test";
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SCRATCH_ENTRY, scratchBase } from "../../gates/src/scratch";
 import { DEFAULT_SCRATCH_ARCHIVE, type ScratchArchiveConfig, scratchArchiveBase } from "../src/scratch-archive";
@@ -411,14 +411,17 @@ describe("scratch sweep: archives (expiry, offsite gate, failures) and the disk 
 		expect(r.expired.find((l) => l.path === realPartial)?.why).toContain("(a partial archive)");
 	});
 
-	test("an expired archive takes its offsite sidecars (.offsite, .attempts, .stuck) with it; a sidecar whose archive is gone is never touched", () => {
+	test("an expired archive takes its offsite sidecars (.offsite, .attempts, .stuck) with it; a sidecar whose archive is gone holds its name until it is expireDays old, then goes, with a note and no ledger entry", () => {
 		const w = world();
 		const a = archiveAt(w, "2026-10-01", "wl-aa.tar.gz", 27);
 		for (const s of [".offsite", ".attempts", ".stuck"]) writeFileSync(`${a}${s}`, "x");
-		const orphan = archiveAt(w, "2026-10-01", "wl-gone.tar.gz.offsite", 27);
-		runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW);
-		expect(readdirSync(join(scratchArchiveBase(w.home), "2026-10-01"))).toEqual(["wl-gone.tar.gz.offsite"]);
-		expect(existsSync(orphan)).toBe(true);
+		const oldOrphan = archiveAt(w, "2026-10-01", "wl-gone.tar.gz.attempts", 27);
+		const youngOrphan = archiveAt(w, "2026-10-27", "wl-claimed.tar.gz.offsite", 1);
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW);
+		expect(existsSync(join(scratchArchiveBase(w.home), "2026-10-01"))).toBe(false);
+		expect(existsSync(youngOrphan)).toBe(true);
+		expect(r.report).toContain(`${oldOrphan} removed: its archive is gone and it was 27.0 days old`);
+		expect(expiredEntries(w)).toEqual([`${SCRATCH_SWEEP_BY} ${SCRATCH_ENTRY.archiveExpired} ${a} 2`]);
 	});
 
 	test("a sidecar that cannot be removed does not undo the expiry: the archive is recorded expired, each other sidecar still goes, and the failure is reported", () => {
@@ -473,6 +476,45 @@ describe("scratch sweep: archives (expiry, offsite gate, failures) and the disk 
 		expect(line.action).toBe("archive failed");
 		expect(line.why).toContain("so the archive was not started");
 		expect(existsSync(join(w.base, closed, "repo", "src", "a.ts"))).toBe(true);
+	});
+
+	test("a writable file with a hard link outside its root refuses the freeze: that root is kept with its modes (archive failed, exit 1)", () => {
+		const w = world();
+		const closed = open(w);
+		w.ledger.closeWorkload(closed, { by: "orchestrator-surface" });
+		root(w, closed);
+		const file = join(w.base, closed, "repo", "src", "a.ts");
+		linkSync(file, join(w.home, "alias.ts"));
+		const had = lstatSync(file).mode & 0o7777;
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW);
+		expect(r.exit).toBe(1);
+		const line = r.roots.find((x) => x.name === closed)!;
+		expect(line.action).toBe("archive failed");
+		expect(line.why).toContain("could not be frozen: ./repo/src/a.ts has 2 hard links and is writable");
+		expect(line.why).toContain(`kept, renamed back to ${join(w.base, closed)}`);
+		expect(lstatSync(file).mode & 0o7777).toBe(had);
+	});
+
+	test("after the freeze a writer cannot add to a root the sweep archives: the open is refused and the root goes", () => {
+		const w = world();
+		const closed = open(w);
+		w.ledger.closeWorkload(closed, { by: "orchestrator-surface" });
+		root(w, closed);
+		let code = "written";
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW, {
+			archive: () => ({
+				afterFreeze: (dir) => {
+					try {
+						writeFileSync(join(dir, "repo", "late.md"), "late");
+					} catch (e) {
+						code = (e as NodeJS.ErrnoException).code ?? String(e);
+					}
+				},
+			}),
+		});
+		expect(code).toBe("EACCES");
+		expect(r.roots.find((x) => x.name === closed)!.action).toBe("removed");
+		expect(existsSync(join(w.base, closed))).toBe(false);
 	});
 
 	test("a descriptor held open into a root across its archive keeps the root (archive failed, renamed back, exit 1); the other roots still go", () => {

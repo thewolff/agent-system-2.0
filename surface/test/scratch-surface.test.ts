@@ -5,7 +5,7 @@
 // archives the root once the row has closed and only then removes it, keeping a root whose archive
 // fails and refusing a root that is a symlink.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { Ledger } from "../../ledger/src/index";
@@ -15,7 +15,7 @@ import * as laneRow from "../extensions/lane";
 import * as laneScript from "../scripts/lane";
 import { errorLines } from "../src/errors";
 import { closeScratchRoot } from "../src/close-entry";
-import { archivePathFor, scratchArchiveBase } from "../src/scratch-archive";
+import { archiveDetached, archivePathFor, purgeArchived, scratchArchiveBase } from "../src/scratch-archive";
 import { ensureStandingWorkload } from "../src/identity";
 import { ensureScratchRoot } from "../src/scratch-root";
 import * as launch from "../src/launch";
@@ -507,14 +507,85 @@ describe("orchestrator_close_workload archives the root, then removes it, after 
 			ledger.close();
 		});
 
-		test("when lsof cannot say whether anything is open (missing, failing, timed out), the root is kept", () => {
+		test("when lsof cannot say whether anything is open (missing, failing, timed out), the root is kept with every mode it had", () => {
 			const { ledger, wl, home, root, leftovers } = setUp();
+			const modes = (): number[] => [root, join(root, "REPORT.md"), join(root, "newer.txt")].map((p) => lstatSync(p).mode & 0o7777);
+			const had = modes();
 			const said = closeScratchRoot(ledger, { HOME: home }, wl, { now, seams: { openFiles: () => ({ kind: "unknown", reason: "lsof could not be run (ENOENT)" }) } });
 			expect(said).toContain(`Scratch root ${root} kept: not archived: `);
 			expect(said).toContain("is not proven quiet: no writer could be ruled out: lsof could not be run (ENOENT); the archive ");
 			expect(readFileSync(join(root, "REPORT.md"), "utf8")).toBe("aaaa");
+			expect(modes()).toEqual(had);
 			expect(leftovers()).toEqual([]);
 			ledger.close();
+		});
+
+		test("after the freeze a writer can neither rewrite a file by the detached path nor add one: both opens are refused, and the root goes with exactly what was archived", () => {
+			const { ledger, wl, home, root } = setUp();
+			const refused: string[] = [];
+			const attempt = (f: () => void): void => {
+				try {
+					f();
+					refused.push("written");
+				} catch (e) {
+					refused.push((e as NodeJS.ErrnoException).code ?? String(e));
+				}
+			};
+			const said = closeScratchRoot(ledger, { HOME: home }, wl, {
+				now,
+				seams: {
+					afterFreeze: (dir) => {
+						attempt(() => writeFileSync(join(dir, "REPORT.md"), "bbbb"));
+						attempt(() => writeFileSync(join(dir, "late.md"), "late"));
+					},
+				},
+			});
+			expect(refused).toEqual(["EACCES", "EACCES"]);
+			expect(said).toContain(") and removed (");
+			expect(existsSync(root)).toBe(false);
+			const archive = archivePathFor(home, wl, now);
+			expect(Bun.spawnSync(["tar", "-xzOf", archive, "./REPORT.md"], { stdout: "pipe" }).stdout.toString()).toBe("aaaa");
+			ledger.close();
+		});
+
+		test("a writable file with a hard link outside the root refuses the freeze (a write by that path cannot be excluded): the root is kept with its modes", () => {
+			const { ledger, wl, home, root, leftovers } = setUp();
+			linkSync(join(root, "REPORT.md"), join(home, "alias.md"));
+			const had = [root, join(root, "REPORT.md")].map((p) => lstatSync(p).mode & 0o7777);
+			const said = closeScratchRoot(ledger, { HOME: home }, wl, { now });
+			expect(said).toContain(`Scratch root ${root} kept: not archived: `);
+			expect(said).toContain("could not be frozen: ./REPORT.md has 2 hard links and is writable, so a write by its other path cannot be excluded; the archive ");
+			expect([root, join(root, "REPORT.md")].map((p) => lstatSync(p).mode & 0o7777)).toEqual(had);
+			expect(leftovers()).toEqual([]);
+			ledger.close();
+		});
+
+		test("a read-only file with a hard link outside the root (a git object) is archived and removed; its other link keeps its bytes and mode", () => {
+			const { ledger, wl, home, root } = setUp();
+			writeFileSync(join(root, "obj"), "object", { mode: 0o444 });
+			linkSync(join(root, "obj"), join(home, "obj-alias"));
+			const said = closeScratchRoot(ledger, { HOME: home }, wl, { now });
+			expect(said).toContain(") and removed (");
+			expect(existsSync(root)).toBe(false);
+			expect(readFileSync(join(home, "obj-alias"), "utf8")).toBe("object");
+			expect(lstatSync(join(home, "obj-alias")).mode & 0o7777).toBe(0o444);
+			ledger.close();
+		});
+
+		test("purgeArchived removes only what the freeze recorded: an entry made after it (by a writer that gave the directory its write bit back) is kept, and the result says so", () => {
+			const dir = join(tmp("purge"), ".removing-wl-x-0123456789abcdef");
+			mkdirSync(join(dir, "sub"), { recursive: true, mode: 0o700 });
+			writeFileSync(join(dir, "REPORT.md"), "aaaa");
+			writeFileSync(join(dir, "sub", "f"), "f");
+			const a = archiveDetached(dir, join(tmp("purge-archive"), "wl-x.tar.gz"), { openFiles: () => ({ kind: "none" }) });
+			expect(a.kind).toBe("archived");
+			if (a.kind !== "archived") return;
+			chmodSync(join(dir, "sub"), 0o700);
+			writeFileSync(join(dir, "sub", "late.md"), "late");
+			const r = purgeArchived({ kind: "detached", path: dir, doomed: dir }, a);
+			expect(r).toEqual({ kind: "failed", path: dir, error: `removing ${dir}: 1 entries were not in the archive and were kept (./sub/late.md)` });
+			expect(readdirSync(dir)).toEqual(["sub"]);
+			expect(readdirSync(join(dir, "sub"))).toEqual(["late.md"]);
 		});
 	});
 

@@ -40,8 +40,8 @@ import { SCRATCH_ENTRY, scratchBase, scratchRootFor } from "../../gates/src/scra
 import { type EntryRow, homeDir, type InstructionRow, type Ledger, type QuestionRow, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { renderClose, repoOf } from "./decision-log";
 import { ensureStandingWorkload, identityOf } from "./identity";
-import { type Archived, type ArchiveSeams, archiveDetached, archivePathFor, type Manifest } from "./scratch-archive";
-import { detachChild, fileIdentity, purgeDetached, restoreDetached } from "./scratch-remove";
+import { type Archived, type ArchiveSeams, archiveDetached, archivePathFor, type Manifest, purgeArchived } from "./scratch-archive";
+import { detachChild, fileIdentity, restoreDetached } from "./scratch-remove";
 import { branchName, controlEntries, holdersOf, waivedPrs } from "./launch";
 import { checkoutOwnerRepo, trainPrs, trainSkippedOf } from "./merge-train";
 import { REPO_ROOT } from "./session";
@@ -257,10 +257,10 @@ export type ScratchClose =
  * id)`, refused when that path is a symlink or its realpath is not exactly `<realpath(base)>/<id>`. The root is first renamed
  * aside (./scratch-remove detachChild: same dev/ino as judged, renamed to `.removing-*`, checked again), so nothing writing by
  * its path reaches the tree; the detached tree is archived and verified (./scratch-archive archiveDetached: manifest, capacity,
- * tar, extraction compared entry by entry, hash, lsof showing nothing open in the tree, the tree read again) to
- * `archivePathFor(home, id, now)`; only then is it removed (purgeDetached). An archive that fails, or a tree a process still
- * has a file open in (or that lsof cannot clear), renames the tree back (restoreDetached) and keeps it. A missing root is a
- * no-op. Never throws.
+ * tar, extraction compared entry by entry, hash, the tree frozen with no write bits, lsof showing nothing open in it, the
+ * tree read again) to `archivePathFor(home, id, now)`; only then is it removed (purgeArchived: only what the freeze
+ * recorded). An archive that fails, a tree a process still has a file open in (or that lsof cannot clear), or one that
+ * cannot be frozen, gets its modes back and is renamed back (restoreDetached) and kept. A missing root is a no-op. Never throws.
  */
 export function archiveScratchRoot(home: string, id: string, now: Date, seams: ArchiveSeams = {}): ScratchClose {
 	let root = join(scratchBase(home), id);
@@ -283,7 +283,7 @@ export function archiveScratchRoot(home: string, id: string, now: Date, seams: A
 			const back = restoreDetached(d);
 			return { kind: "archive-failed", root, reason: archive.reason, keptAt: back.at, restore: back.said };
 		}
-		const r = purgeDetached(d);
+		const r = purgeArchived(d, archive);
 		const removal = r.kind === "removed" ? { ok: true as const } : { ok: false as const, reason: r.kind === "refused" ? r.reason : r.error, left: d.doomed };
 		return { kind: "archived", root, physical, archive, removal };
 	} catch (err) {

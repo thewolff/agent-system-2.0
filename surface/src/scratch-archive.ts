@@ -11,13 +11,16 @@
 //   4. extracts it into a private `.verify-*` directory beside it and compares that copy's manifest with the tree's,
 //      entry by entry (path, type, size, permission bits, content hash, link target); any difference fails;
 //   5. hashes the archive and links it to its final name (a link never replaces a name);
-//   6. runs lsof over the tree (`stillOpen`): a write through a descriptor opened before the rename aside changes no
-//      path, so it could land after any check; a file still open, or a missing, failing or timed-out lsof, fails;
-//   7. reads the tree's manifest again and compares identities (inode, size, mtime and ctime in nanoseconds, link
-//      target): a write anywhere in the tree since step 1 changes the ctime of the entry written, so it fails. On a
-//      failure in 6 or 7 the archive is dropped.
-// Only then may the caller remove the tree: nothing had a file open in it at step 6, so a later write needs a new open
-// by a path that no longer exists. Any failure leaves the tree as it is and says why.
+//   6. freezes the tree (`freezeTree`): every directory and file loses its write bits, top down, so no process that does
+//      not chmod can open a file in it for writing or add, rename or remove an entry, by any path, the detached name
+//      and a hard link from outside included (the bits are the inode's; a writable file with another link refuses);
+//   7. runs lsof over the tree (`stillOpen`): a descriptor opened before the freeze can still write; a file still
+//      open, or a missing, failing or timed-out lsof, fails;
+//   8. reads the tree again and compares it with step 1 (entry set, inode, size, link target, mtime; the mode the
+//      freeze set) and with the freeze (every field, ctime included): any write since step 1 shows, so it fails.
+// On a failure after step 5 the archive is dropped, and after step 6 the modes are given back. On success the tree is
+// left frozen, and only `purgeArchived` removes it: entry by entry, only what the freeze recorded. What stays open is a
+// process that chmods the tree back, or one running as root.
 // The daily sweep (surface/scripts/scratch-sweep.ts) expires archives older than `scratchArchive.expireDays`, and, when
 // `scratchArchive.requireOffsite` is on, only those with an `<archive>.offsite` marker beside them (written by an offsite
 // copy job once its copy is confirmed).
@@ -25,6 +28,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { type BigIntStats, chmodSync, closeSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, rmdirSync, rmSync, type Stats, statfsSync, statSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { installedConfigPath } from "./pair-suggest";
+import type { Detached, Removal } from "./scratch-remove";
 
 /** The profile config key of the archive settings (profile/config.yml). */
 export const SCRATCH_ARCHIVE_KEY = "scratchArchive";
@@ -236,6 +240,8 @@ export interface Archived {
 	/** Entries archived (the top directory included). */
 	entries: number;
 	members: Manifest;
+	/** The tree as `freezeTree` left it (no write bits): what `purgeArchived` may remove. */
+	frozen: Manifest;
 	/** Something that went wrong after the archive was verified (a verification copy left behind); reported, not fatal. */
 	warnings: string[];
 }
@@ -248,8 +254,10 @@ export interface ArchiveSeams {
 	freeBytes?: (path: string) => number | null;
 	/** Runs after tar wrote the archive, before it is verified. */
 	afterTar?: () => void;
-	/** Runs after the archive is verified, hashed and linked, before the tree is read again. */
+	/** Runs after the archive is verified, hashed and linked, before the tree is frozen and read again. */
 	beforeFinalCheck?: () => void;
+	/** Runs once the tree is frozen, before lsof and the last read: a writer that comes after the freeze. */
+	afterFreeze?: (dir: string) => void;
 	/** Replaces the lsof read of what is open under a tree (`openFilesUnder`). */
 	openFiles?: (dir: string) => OpenFiles;
 }
@@ -371,24 +379,33 @@ function removeCopy(dir: string): string | null {
 }
 
 /**
- * Archive the detached tree `dir` to `dest` (or the first free `.<n>` variant of it) and verify it (steps 1–6 at the top of
- * this file). Changes nothing in `dir`. Never throws; on failure nothing is left under the destination but what was there.
+ * Archive the detached tree `dir` to `dest` (or the first free `.<n>` variant of it), verify it and freeze the tree (steps
+ * 1–8 at the top of this file). On success the tree is left frozen for `purgeArchived`. Never throws; on failure the tree's
+ * modes are given back and nothing is left under the destination but what was there.
  */
 export function archiveDetached(dir: string, dest: string, seams: ArchiveSeams = {}): ArchiveResult {
 	let partial: string | null = null;
 	let copy: string | null = null;
+	let linked: string | null = null;
+	let thawed: [string, number][] | null = null;
 	const fail = (reason: string): ArchiveResult => {
 		const also: string[] = [];
 		if (copy) {
 			const r = removeCopy(copy);
 			if (r) also.push(r);
 		}
-		if (partial) {
+		for (const [what, p] of [["partial archive", partial], ["archive", linked]] as const) {
+			if (!p) continue;
 			try {
-				unlinkSync(partial);
+				unlinkSync(p);
+				if (what === "archive") also.push(`the archive ${p} was dropped`);
 			} catch (e) {
-				if ((e as NodeJS.ErrnoException).code !== "ENOENT") also.push(`the partial archive ${partial} could not be removed (${message(e)})`);
+				if ((e as NodeJS.ErrnoException).code !== "ENOENT") also.push(`the ${what} ${p} could not be removed (${message(e)})`);
 			}
+		}
+		if (thawed) {
+			const t = thawTree(dir, thawed);
+			if (t) also.push(t);
 		}
 		return { kind: "failed", reason: also.length ? `${reason}; ${also.join("; ")}` : reason };
 	};
@@ -421,27 +438,144 @@ export function archiveDetached(dir: string, dest: string, seams: ArchiveSeams =
 		const sha256 = sha256File(partial);
 		chmodSync(partial, 0o600);
 		linkSync(partial, final);
+		linked = final;
 		unlinkSync(partial);
 		partial = null;
 		seams.beforeFinalCheck?.();
-		const drop = (): string => {
-			try {
-				unlinkSync(final);
-				return `the archive ${final} was dropped`;
-			} catch (e) {
-				return `the archive ${final} could not be dropped (${message(e)})`;
-			}
-		};
-		// Writers first, then identities: once lsof shows nothing open, a later write needs a new open by a path that no
-		// longer exists, and any write before it shows in the identities read after it.
+		// Freeze, then writers, then identities. Once no directory and no file in the tree has a write bit, a process that
+		// does not chmod can neither open a file in it for writing nor make, rename or remove an entry, by any path: the bits
+		// are the inode's, so a hard link from outside is held too (a writable one refuses the freeze). lsof then catches a
+		// descriptor opened before the freeze, and the identities show any write made before it.
+		const frozen = freezeTree(dir);
+		if (frozen.kind === "failed") return fail(`${dir} could not be frozen: ${frozen.reason}`);
+		thawed = frozen.changed;
+		seams.afterFreeze?.(dir);
 		const open = stillOpen(dir, seams);
-		if (open) return fail(`${dir} is not proven quiet: ${open}; ${drop()}`);
-		const changed = identityDiff(before, readManifest(dir, false));
-		if (changed.length > 0) return fail(`${dir} changed while it was archived: ${changed.join("; ")}; ${drop()}`);
-		return { kind: "archived", path: final, bytes: size, sha256, entries: before.size, members: before, warnings };
+		if (open) return fail(`${dir} is not proven quiet: ${open}`);
+		const changed = [...frozenDiff(before, frozen.at, frozen.ctimeBefore), ...identityDiff(frozen.at, readManifest(dir, false))].slice(0, 3);
+		if (changed.length > 0) return fail(`${dir} changed while it was archived: ${changed.join("; ")}`);
+		return { kind: "archived", path: final, bytes: size, sha256, entries: before.size, members: before, frozen: frozen.at, warnings };
 	} catch (e) {
 		return fail(message(e));
 	}
+}
+
+/** The mode `freezeTree` gives an entry: no write bit for anyone; a directory keeps the owner's read and search. */
+const frozenMode = (type: ManifestEntry["type"], mode: number): number => (type === "dir" ? (mode & ~0o222) | 0o500 : mode & ~0o222);
+
+/**
+ * Take every write bit off the tree `dir`, top down (a directory before its entries, so none can be added behind the walk),
+ * and read each entry after: its manifest at the freeze. Symlinks are left as they are. A regular file with another hard
+ * link that is writable refuses (its other path may be the one written); one already without write bits (a git object) is
+ * left untouched. On a refusal or error, the bits already taken are given back. `changed` is every path whose mode was
+ * changed, with its mode before. Never throws.
+ */
+export function freezeTree(dir: string): { kind: "frozen"; at: Manifest; ctimeBefore: Map<string, bigint>; changed: [string, number][] } | { kind: "failed"; reason: string } {
+	const at: Manifest = new Map();
+	const ctimeBefore = new Map<string, bigint>();
+	const changed: [string, number][] = [];
+	const stack: string[] = [""];
+	try {
+		while (stack.length > 0) {
+			const rel = stack.pop()!;
+			const abs = rel === "" ? dir : join(dir, rel);
+			let st: BigIntStats = lstatSync(abs, { bigint: true });
+			const mode = Number(st.mode & 0o7777n);
+			ctimeBefore.set(rel, st.ctimeNs);
+			if (st.isFile() && st.nlink > 1n && (mode & 0o222) !== 0) throw new Error(`${shown(rel)} has ${st.nlink} hard links and is writable, so a write by its other path cannot be excluded`);
+			if (st.isFile() || st.isDirectory()) {
+				const want = frozenMode(st.isDirectory() ? "dir" : "file", mode);
+				if (mode !== want) {
+					chmodSync(abs, want);
+					changed.push([rel, mode]);
+					st = lstatSync(abs, { bigint: true });
+				}
+			}
+			at.set(rel, entryOf(abs, st));
+			if (st.isDirectory()) for (const name of readdirSync(abs)) stack.push(rel === "" ? name : `${rel}/${name}`);
+		}
+	} catch (e) {
+		const t = thawTree(dir, changed);
+		return { kind: "failed", reason: t ? `${message(e)}; ${t}` : message(e) };
+	}
+	return { kind: "frozen", at, ctimeBefore, changed };
+}
+
+/** Give each changed path its mode back. Null when all were; otherwise what could not be. Never throws. */
+export function thawTree(dir: string, changed: [string, number][]): string | null {
+	const bad: string[] = [];
+	for (const [rel, mode] of changed) {
+		try {
+			chmodSync(rel === "" ? dir : join(dir, rel), mode);
+		} catch (e) {
+			bad.push(`${shown(rel)} (${message(e)})`);
+		}
+	}
+	return bad.length ? `the modes of ${bad.length} entries could not be given back: ${bad.slice(0, 3).join("; ")}` : null;
+}
+
+function entryOf(abs: string, st: BigIntStats): ManifestEntry {
+	const type = st.isFile() ? "file" : st.isDirectory() ? "dir" : st.isSymbolicLink() ? "link" : null;
+	if (type === null) throw new Error(`${abs} is a socket, FIFO or device; not archivable`);
+	return { type, size: type === "file" ? Number(st.size) : 0, mode: Number(st.mode & 0o7777n), sha256: null, target: type === "link" ? readlinkSync(abs) : null, dev: st.dev, ino: st.ino, mtimeNs: st.mtimeNs, ctimeNs: st.ctimeNs };
+}
+
+/**
+ * What a write made between the first read of the tree and its freeze changed: the entry set, type, inode, size, link
+ * target, mtime and the ctime read just before the freeze's chmod (the chmod moves only ctime), and a mode that is not the
+ * frozen one.
+ */
+function frozenDiff(before: Manifest, at: Manifest, ctimeBefore: Map<string, bigint>): string[] {
+	return differences(before, at, "the tree as archived", "the tree at its freeze", (x, y, rel) => {
+		if (x.type !== y.type) return `was a ${x.type}, is a ${y.type}`;
+		if (x.dev !== y.dev || x.ino !== y.ino) return "is another file (its inode changed)";
+		if (x.size !== y.size) return `changed size (${x.size} → ${y.size} bytes)`;
+		if (x.target !== y.target) return `was relinked (${x.target} → ${y.target})`;
+		if (x.mtimeNs !== y.mtimeNs || x.ctimeNs !== ctimeBefore.get(rel)) return "was written or changed (its mtime or ctime moved)";
+		if (x.type !== "link" && y.mode !== frozenMode(x.type, x.mode)) return "changed mode";
+		return null;
+	}, 3);
+}
+
+/**
+ * Remove a tree `archiveDetached` archived and froze, entry by entry, bottom up: each directory is made writable, then
+ * listed, and only an entry the freeze recorded (same type and inode; a non-directory with the same ctime) is removed.
+ * Anything else (an entry made after the freeze by a process that gave a directory its write bit back) is left, with every
+ * directory above it, and the result says so. Never throws.
+ */
+export function purgeArchived(d: Detached, a: Archived): Removal {
+	const unexpected: string[] = [];
+	const empty = (rel: string): boolean => {
+		const abs = rel === "" ? d.doomed : join(d.doomed, rel);
+		chmodSync(abs, 0o700);
+		let all = true;
+		for (const name of readdirSync(abs)) {
+			const crel = rel === "" ? name : `${rel}/${name}`;
+			const cabs = join(abs, name);
+			const st = lstatSync(cabs, { bigint: true });
+			const e = a.frozen.get(crel);
+			const type = st.isFile() ? "file" : st.isDirectory() ? "dir" : st.isSymbolicLink() ? "link" : null;
+			if (!e || e.type !== type || e.ino !== st.ino || (type !== "dir" && e.ctimeNs !== st.ctimeNs)) {
+				unexpected.push(crel);
+				all = false;
+				continue;
+			}
+			if (type === "dir") {
+				if (empty(crel)) rmdirSync(cabs);
+				else all = false;
+			} else unlinkSync(cabs);
+		}
+		return all;
+	};
+	try {
+		if (empty("")) {
+			rmdirSync(d.doomed);
+			return { kind: "removed", path: d.path };
+		}
+	} catch (e) {
+		return { kind: "failed", path: d.path, error: `removing ${d.doomed}: ${message(e)}` };
+	}
+	return { kind: "failed", path: d.path, error: `removing ${d.doomed}: ${unexpected.length} entries were not in the archive and were kept (${unexpected.slice(0, 3).map(shown).join(", ")}${unexpected.length > 3 ? ", …" : ""})` };
 }
 
 export type ExpiryAction = "expired" | "would expire" | "kept" | "expire failed";
@@ -466,9 +600,11 @@ export function archiveNameKind(name: string): "final" | "partial" | null {
 /**
  * The daily sweep's expiry pass over scratchArchiveBase(home): every regular final archive and partial (archiveNameKind)
  * under a date directory whose mtime is more than `expireDays` before `now` is removed, a final archive with its `.offsite`
- * marker; with `requireOffsite`, a final archive with no marker is kept. Anything else (markers alone, verification copies,
- * other files, symlinks) is never touched. A date directory left empty is removed (rmdir, never recursive). `dryRun` removes
- * nothing. Never throws.
+ * marker and offsite sidecars; with `requireOffsite`, a final archive with no marker is kept. An offsite sidecar whose
+ * archive is gone (`<name>.tar.gz.offsite`, `.attempts`, `.stuck`; the offsite job claimed the archive) is removed once
+ * it too is older than `expireDays`: until then it holds its name, so no new archive takes it (`freeName`), and a new
+ * archive is never written into a date directory that old. Anything else (verification copies, other files, symlinks) is
+ * never touched. A date directory left empty is removed (rmdir, never recursive). `dryRun` removes nothing. Never throws.
  */
 export function expireArchives(home: string, config: ScratchArchiveConfig, now: Date, dryRun: boolean, seams: { unlink?: (path: string) => void } = {}): { lines: ExpiryLine[]; notes: string[] } {
 	const unlink = seams.unlink ?? unlinkSync;
@@ -498,6 +634,12 @@ export function expireArchives(home: string, config: ScratchArchiveConfig, now: 
 			const path = join(dayDir, name);
 			if (name.startsWith(VERIFY_PREFIX)) {
 				notes.push(`${path} is a verification copy an archive run left behind; not removed (remove it by hand)`);
+				continue;
+			}
+			const sidecar = [OFFSITE_SUFFIX, ...OFFSITE_SIDECARS].find((s) => name.endsWith(`${ARCHIVE_SUFFIX}${s}`));
+			if (sidecar) {
+				const orphan = expireOrphanSidecar(path, path.slice(0, -sidecar.length), cutoff, now, dryRun, unlink);
+				if (orphan) notes.push(orphan);
 				continue;
 			}
 			const kind = archiveNameKind(name);
@@ -563,6 +705,31 @@ export function expireArchives(home: string, config: ScratchArchiveConfig, now: 
 		}
 	}
 	return { lines, notes };
+}
+
+/** Remove the sidecar `path` when its archive `archive` is gone and its mtime is before `cutoff`; what was done, or null. Never throws. */
+function expireOrphanSidecar(path: string, archive: string, cutoff: number, now: Date, dryRun: boolean, unlink: (path: string) => void): string | null {
+	try {
+		lstatSync(archive);
+		return null;
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException).code !== "ENOENT") return null;
+	}
+	let st: Stats;
+	try {
+		st = lstatSync(path);
+	} catch {
+		return null;
+	}
+	if (!st.isFile() || st.mtimeMs >= cutoff) return null;
+	const age = ((now.getTime() - st.mtimeMs) / DAY_MS).toFixed(1);
+	if (dryRun) return `${path} would be removed: its archive is gone and it is ${age} days old`;
+	try {
+		unlink(path);
+		return `${path} removed: its archive is gone and it was ${age} days old`;
+	} catch (e) {
+		return `${path} could not be removed (${message(e)}); its archive is gone`;
+	}
 }
 
 /** Free bytes for an unprivileged writer on the volume holding `path` (statfs bavail × bsize); null when it cannot be read. */
