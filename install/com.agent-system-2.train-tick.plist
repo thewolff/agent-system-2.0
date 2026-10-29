@@ -39,12 +39,16 @@
 	<key>StartInterval</key>
 	<integer>300</integer>
 	<!--
-	  Standard, not Background: the tick launches merge-train lanes, and those lanes request full-suite
-	  test runs. Background makes darwin throttle the whole tree (priority 4 instead of 31, about 10x
-	  slower), so full runs hit their 20-minute cap (jo-issues 213).
+	  Interactive, not Background or Standard: the tick launches merge-train lanes, those lanes request
+	  full-suite test runs, and every process in that tree inherits this job's scheduling clamp
+	  (jo-issues 213). Background clamps the tree to priority 4, about 10x slower, so full runs hit their
+	  20-minute cap. Standard still clamps it to utility, priority 20: in the 2026-10-28 TrainLoadLoop
+	  measurement full parts were green on 5 of 26 runs at base priority 20 and on 4 of 6 at base 31,
+	  and classifier/test/snapshot-settle.test.ts T10c timed out 6 of 6 under taskpolicy -c utility and
+	  passed 6 of 6 at 31. Interactive applies no limits (launchd.plist(5)).
 	-->
 	<key>ProcessType</key>
-	<string>Standard</string>
+	<string>Interactive</string>
 	<key>StandardOutPath</key>
 	<string>@HOME@/agent-scratch/agent-system-2.0/train-tick/launchd.log</string>
 	<key>StandardErrorPath</key>
