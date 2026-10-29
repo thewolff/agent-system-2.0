@@ -306,9 +306,12 @@ testRunner:
   # as2-hosted run of 2026-10-28 (each reason below), stay out of hosted Linux. They run in the post-merge Mac full
   # suite and in .github/workflows/as2-hosted.yml's macos-latest job. Keep zsh and bubblewrap
   # tests in the fast set; the hosted workflow installs both. Activation is a ledger word, not a flag.
+  # timing-lint.test.ts is the incidental-timing ratchet (Jo's rule, 2026-10-28): static, under a second, and it must
+  # run on every PR, since a new offender is a new test file the reach scan would not otherwise pick.
   fastSmoke:
     - surface/test/fast-set.test.ts
     - surface/test/main-state.test.ts
+    - surface/test/timing-lint.test.ts
   macOnly:
     gates/test/fence.test.ts: sandbox-exec macOS OS fence
     gates/test/r18-typed-wrapper.test.ts: requires sandbox-exec on PATH
