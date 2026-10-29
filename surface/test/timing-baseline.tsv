@@ -16,7 +16,7 @@ ledger/test/lane.test.ts	sleep	1
 ledger/test/ledger.test.ts	clock-deadline	1
 ledger/test/ledger.test.ts	sleep	2
 skills/seo-audit/test/units.test.ts	timer	2
-surface/test/as2test.test.ts	clock-assert	10
+surface/test/as2test.test.ts	clock-assert	9
 surface/test/as2test.test.ts	clock-deadline	2
 surface/test/as2test.test.ts	clock-elapsed	3
 surface/test/as2test.test.ts	sleep	2

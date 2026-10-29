@@ -78,13 +78,15 @@ function config(): Config {
 	const abs = (x: unknown): x is string => typeof x === "string" && isAbsolute(x) && normalize(x) === x;
 	const ms = (x: unknown): x is number => typeof x === "number" && Number.isSafeInteger(x) && x >= 0;
 	if (!abs(c.root) || !abs(c.bun) || (c.sweep !== "groups" && c.sweep !== UID_SWEEP) || !(c.hooks === null || abs(c.hooks)) || !ms(c.killGraceMs) || !ms(c.sweepLockWaitMs) || !ms(c.captureMs)
-		|| !ms(c.detectTickMs) || c.detectTickMs < 1 || !ms(c.detectPersistMs) || !ms(c.signatureCaptureMs) || !ms(c.stopGraceMs) || typeof c.detectTrace !== "boolean") {
+		|| !ms(c.detectTickMs) || c.detectTickMs < 1 || !ms(c.detectPersistMs) || !ms(c.signatureCaptureMs) || !ms(c.stopGraceMs) || typeof c.detectTrace !== "boolean"
+		|| typeof c.detectCpuClock !== "boolean") {
 		return refuse("wrapper config is malformed");
 	}
-	if (c.sweep !== "groups" && (c.hooks !== null || c.detectTrace)) return refuse("hooks and detectTrace are for a groups render only");
+	if (c.sweep !== "groups" && (c.hooks !== null || c.detectTrace || c.detectCpuClock)) return refuse("hooks, detectTrace and detectCpuClock are for a groups render only");
 	return {
 		root: c.root, bun: c.bun, sweep: c.sweep, hooks: c.hooks, killGraceMs: c.killGraceMs, sweepLockWaitMs: c.sweepLockWaitMs, captureMs: c.captureMs,
 		detectTickMs: c.detectTickMs, detectPersistMs: c.detectPersistMs, signatureCaptureMs: c.signatureCaptureMs, stopGraceMs: c.stopGraceMs, detectTrace: c.detectTrace,
+		detectCpuClock: c.detectCpuClock,
 	};
 }
 
@@ -1043,6 +1045,8 @@ class StuckWatch {
 	private shadowCapture: Promise<void> | null = null;
 	/** The pgids of owned processes this part already added to the groups file (groups sweep only). */
 	private readonly recordedGroups = new Set<number>();
+	/** detectCpuClock (tests): the fake clock's last classified time and the CPU each worker had then. */
+	private cpuClock: { at: number; cpu: Map<number, number> } | null = null;
 
 	constructor(private readonly p: WatchPart) {
 		this.det = new StuckDetector({ tickMs: p.cfg.detectTickMs, persistMs: p.cfg.detectPersistMs, bunPath: p.cfg.bun, leaderPid: p.leader });
@@ -1072,12 +1076,14 @@ class StuckWatch {
 		if (this.ended) return;
 		const { cfg, mode } = this.p;
 		try {
-			const obs = observe({ uid: this.uid, markerDir: this.p.markerDir, candidatesOf: (s) => this.det.candidatesOf(s), argvOf: (s) => this.det.argvNeeded(s) });
-			if (obs.snap.kind === "unavailable") {
-				this.line("stuck-detector-off", `reason ${obs.snap.why}`);
+			const live = observe({ uid: this.uid, markerDir: this.p.markerDir, candidatesOf: (s) => this.det.candidatesOf(s), argvOf: (s) => this.det.argvNeeded(s) });
+			if (live.snap.kind === "unavailable") {
+				this.line("stuck-detector-off", `reason ${live.snap.why}`);
 				this.end();
 				return;
 			}
+			const obs = cfg.detectCpuClock ? this.onCpuClock(live) : live;
+			if (obs === null) return;
 			const r = this.det.tick(obs);
 			if (cfg.sweep === "groups") this.recordGroups(r.owned);
 			if (cfg.detectTrace) this.trace(obs, r);
@@ -1107,6 +1113,31 @@ class StuckWatch {
 			this.line("stuck-detector-off", `reason detector failed: ${e instanceof Error ? e.message : errText(e)}`);
 			this.end();
 		}
+	}
+
+	/**
+	 * detectCpuClock (tests): the observation re-timed on a fake clock, or null to skip this tick unclassified. A tick is
+	 * classified only once every marker-holding worker the last classified tick measured has burnt one detectTickMs of CPU
+	 * since, and the clock then advances exactly one detectTickMs (whole ms from the first tick's time, so persistence is
+	 * exact). So a spinner is hot on every classified tick and no tick is a gap, at any CPU share and however late the timer
+	 * wakes; a marker holder that is not spinning holds classification until its marker goes.
+	 */
+	private onCpuClock(obs: Observation): Observation | null {
+		const tickNs = this.p.cfg.detectTickMs * 1e6;
+		const last = this.cpuClock;
+		const holders = obs.markers.kind === "ok" ? obs.markers.active.map((m) => m.pid) : [];
+		if (last !== null) {
+			for (const pid of holders) {
+				const now = obs.cpu.get(pid);
+				const then = last.cpu.get(pid);
+				if (now !== null && now !== undefined && then !== undefined && now - then < tickNs) return null;
+			}
+		}
+		const cpu = new Map<number, number>();
+		for (const [pid, ns] of obs.cpu) if (ns !== null) cpu.set(pid, ns);
+		const at = last === null ? Math.floor(obs.at) : last.at + this.p.cfg.detectTickMs;
+		this.cpuClock = { at, cpu };
+		return { ...obs, at };
 	}
 
 	/**
@@ -1306,14 +1337,18 @@ async function part(cfg: Config, runId: string, work: string, dir: string, argv:
 	watch?.start();
 	try {
 		let timer: ReturnType<typeof setTimeout> | undefined;
+		let raced = false;
 		const capped = new Promise<"cap">((r) => {
-			timer = setTimeout(() => {
+			timer = setTimeout(async () => {
+				// A test's pause point: the cap has fired and the detector still ticks until `.go` (or the part ends first).
+				await hook(cfg, runId, "cap", { stop: () => raced || watch?.stopping === true });
 				if (watch?.stopping) return;
 				watch?.end();
 				r("cap");
 			}, cap);
 		});
 		const first = await Promise.race([done, capped, watch?.stopped ?? new Promise<never>(() => {})]);
+		raced = true;
 		clearTimeout(timer);
 		if (first === "cap") {
 			const capture = await stuckCapture(cfg, runId, work, pgid, logPath, cap);
