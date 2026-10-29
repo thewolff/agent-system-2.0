@@ -20,7 +20,7 @@
 // THE STOP CHECK, on `session_stop`: a turn that read the ask-graham skill and ended without a
 // `**Verdict:**` line naming one of the four verdicts is blocked once, with a reason asking for
 // that line (checkStop in skills/ask-graham/scripts/verdict.mjs, shared with the Claude Code Stop
-// hook). A reply ending with the exact comparables question may wait without a verdict. The turn is read from event.session_file; the final text is event.last_assistant_message.
+// hook). A reply ending with the exact comparables question may wait without a verdict, and a structure check (a line starting `**Structure check:**`) needs none. The turn is read from event.session_file; the final text is event.last_assistant_message.
 // OMP fires session_stop only for the main session, never for a subagent.
 //
 // OFF SWITCH: stop-check=off in the nearest .ask-graham or the user config (intensity.mjs,
