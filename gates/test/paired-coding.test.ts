@@ -39,6 +39,8 @@ import { gateSession } from "../src/session";
 import { CERTIFIED, commit, git, tmp } from "./helpers";
 
 const ON: FenceSettings = { enabled: true, autoBackground: true };
+/** The fence off: on Linux the M4b fence refuses every bash call before any other row (no sandbox-exec). */
+const OFF: FenceSettings = { enabled: false, autoBackground: true };
 
 /** Whether this process can apply a Seatbelt profile (not when it already runs under one). */
 const NESTED = spawnSync("/usr/bin/sandbox-exec", ["-p", "(version 1)(allow default)", "/usr/bin/true"]).status === 0;
@@ -99,7 +101,7 @@ afterEach(() => {
  * adapter loaded, its session started. `call` runs one tool as OMP does: tool_call, then (unless refused)
  * the tool's execute with the revision every handler left, then tool_result.
  */
-async function lane(o: { branch?: string; cleanShell?: CleanShellCheck } = {}) {
+async function lane(o: { branch?: string; cleanShell?: CleanShellCheck; fence?: FenceSettings } = {}) {
 	const home = tmp("pair-home");
 	const ledgerDir = join(home, ".agent-system-2");
 	mkdirSync(ledgerDir);
@@ -128,7 +130,7 @@ async function lane(o: { branch?: string; cleanShell?: CleanShellCheck } = {}) {
 	// carries every member the three read.
 	const shared = h.pi as never;
 	orchestratorSurface(shared, env);
-	p11Gates(shared, env, async () => ON, CERTIFIED, o.cleanShell);
+	p11Gates(shared, env, async () => o.fence ?? ON, CERTIFIED, o.cleanShell);
 	bindPairedCoding(shared, { env });
 	const sessionId = `sess-${++sessions}`;
 	const ctx = {
@@ -458,7 +460,8 @@ describe("a pair_run of a declared artifact records its real outcome", () => {
 
 describe("pairing lets the as2 lifecycle tools through (VENDOR.md C8)", () => {
 	test("a lane tool is allowed while pairing; the host's own mutation and an unknown tool stay refused", async () => {
-		const l = await lane();
+		// The fence off, so the refusal asserted is pairing's own on every OS, not the fence's (row order).
+		const l = await lane({ fence: OFF });
 		expect(await l.verdict(LANE_RECORD_ENTRY_TOOL, { body: "an assumption" })).toBeUndefined();
 		const bash = await l.verdict("bash", { command: "echo hi", cwd: l.repo });
 		expect(bash?.reason).toContain("paired coding: bash is the host's own mutating tool");
