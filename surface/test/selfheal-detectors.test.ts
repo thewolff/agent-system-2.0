@@ -7,7 +7,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
-import { handLab, JETSAM_UNREADABLE, MCP_LOAD_UNREADABLE, runDetectors } from "../src/selfheal/detectors";
+import { handLab, JETSAM_UNREADABLE, MCP_LOAD_UNREADABLE, ompLaunch, runDetectors } from "../src/selfheal/detectors";
 import { readDetectorInputs } from "../src/selfheal/read";
 import type { DetectorId, Finding, Window } from "../src/selfheal/types";
 import { clock, tempLedger, tmp } from "./helpers";
@@ -46,7 +46,8 @@ afterAll(() => {
 });
 
 /** A world: a ledger seeded with `ledgerFixtures`' rows, sessions copied under a temp home and lanes dir, a Jetsam dir. */
-function world(o: { ledgerFixtures?: string[]; orchestrator?: string[]; lanes?: { fixture: string; path: string }[]; jetsam?: string[]; ompLogs?: Record<string, string[]> } = {}) {
+function world(o: { ledgerFixtures?: string[]; orchestrator?: string[]; lanes?: { fixture: string; path: string }[]; jetsam?: string[]; ompLogs?: Record<string, string[]>; profile?: string } = {}) {
+	const profile = o.profile ?? PROFILE;
 	const c = clock("2026-10-01T00:00:00.000Z");
 	const { ledger, path } = tempLedger(c.now);
 	cleanup.push(dirname(path));
@@ -96,7 +97,7 @@ function world(o: { ledgerFixtures?: string[]; orchestrator?: string[]; lanes?: 
 	const jetsamDir = join(root, "DiagnosticReports");
 	mkdirSync(jetsamDir);
 	for (const f of o.jetsam ?? []) copyFileSync(join(FIXTURES, "jetsam", f), join(jetsamDir, f));
-	const logsDir = join(home, ".omp", "profiles", PROFILE, "logs");
+	const logsDir = profile === "default" ? join(home, ".omp", "logs") : join(home, ".omp", "profiles", profile, "logs");
 	for (const [name, lines] of Object.entries(o.ompLogs ?? {})) {
 		mkdirSync(logsDir, { recursive: true });
 		writeFileSync(join(logsDir, name), `${lines.join("\n")}\n`);
@@ -106,7 +107,7 @@ function world(o: { ledgerFixtures?: string[]; orchestrator?: string[]; lanes?: 
 		async run(window: Window, over: { jetsamDir?: string } = {}): Promise<Finding[]> {
 			const ro = Ledger.open(path, { readonly: true });
 			try {
-				const inputs = await readDetectorInputs({ ledger: ro, home, profile: PROFILE, window, jetsamDir: over.jetsamDir ?? jetsamDir, lanesDir });
+				const inputs = await readDetectorInputs({ ledger: ro, home, profile, window, jetsamDir: over.jetsamDir ?? jetsamDir, lanesDir });
 				return runDetectors(inputs, window);
 			} finally {
 				ro.close();
@@ -438,5 +439,29 @@ describe("mcp-load", () => {
 		const fs = await x.run(ALL);
 		chmodSync(dir, 0o755);
 		expect(fs.map((f) => [f.detector, f.summary, f.evidence])).toEqual([["mcp-load", MCP_LOAD_UNREADABLE, dir]]);
+	});
+
+	test("the default profile: its logs are read from ~/.omp/logs and a 401 says `env -u OMP_PROFILE omp`", async () => {
+		const x = world({ profile: "default", ompLogs: { "omp.2026-10-28.38384.log": [POSTHOG_401] } });
+		const fs = await x.run(ALL);
+		expect(fs.map((f) => [f.summary, f.evidence])).toEqual([[
+			"mcp-load: posthog failed to load 1 time(s) in the window in profile default: HTTP 401; current login health unknown until a live load: start `env -u OMP_PROFILE omp` and see whether posthog loads",
+			`${join(x.home, ".omp", "logs", "omp.2026-10-28.38384.log")}:1`,
+		]]);
+	});
+
+	test("a named profile: its logs are read from ~/.omp/profiles/<name>/logs and a 401 says `OMP_PROFILE=<name> omp`", async () => {
+		const x = world({ profile: "scratch-lab", ompLogs: { "omp.2026-10-28.38384.log": [POSTHOG_401] } });
+		const fs = await x.run(ALL);
+		expect(fs.map((f) => [f.summary, f.evidence])).toEqual([[
+			"mcp-load: posthog failed to load 1 time(s) in the window in profile scratch-lab: HTTP 401; current login health unknown until a live load: start `OMP_PROFILE=scratch-lab omp` and see whether posthog loads",
+			`${join(x.home, ".omp", "profiles", "scratch-lab", "logs", "omp.2026-10-28.38384.log")}:1`,
+		]]);
+	});
+
+	test("ompLaunch: empty and `default` are the default profile; any other name is set", () => {
+		expect([ompLaunch("default"), ompLaunch(""), ompLaunch(" default "), ompLaunch("agent-system-2")]).toEqual([
+			"env -u OMP_PROFILE omp", "env -u OMP_PROFILE omp", "env -u OMP_PROFILE omp", "OMP_PROFILE=agent-system-2 omp",
+		]);
 	});
 });

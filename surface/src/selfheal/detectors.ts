@@ -347,6 +347,17 @@ export function mcpFailureKind(error: string): string {
 	return line.length > 80 ? `${line.slice(0, 79)}…` : line;
 }
 
+/** OMP's default profile: an empty name or `default` (pi-utils dirs.ts normalizeProfileName), kept in `~/.omp` rather than `~/.omp/profiles/<name>`. */
+export function isDefaultOmpProfile(profile: string): boolean {
+	const p = profile.trim();
+	return p === "" || p === "default";
+}
+
+/** The command that starts OMP in `profile`: the default profile with OMP_PROFILE cleared, any other with it set. */
+export function ompLaunch(profile: string): string {
+	return isDefaultOmpProfile(profile) ? "env -u OMP_PROFILE omp" : `OMP_PROFILE=${profile.trim()} omp`;
+}
+
 /** The summary of the one finding unreadable OMP logs give. */
 export const MCP_LOAD_UNREADABLE = "mcp-load: OMP logs unreadable";
 
@@ -376,7 +387,7 @@ export function mcpLoad(input: DetectorInputs["mcpLoad"], w: Window): Finding[] 
 		const last = sorted[sorted.length - 1]!;
 		const kind = mcpFailureKind(last.error);
 		const login = kind === "HTTP 401" || kind === "HTTP 403"
-			? `; current login health unknown until a live load: start \`OMP_PROFILE=${input.profile} omp\` and see whether ${last.server} loads`
+			? `; current login health unknown until a live load: start \`${ompLaunch(input.profile)}\` and see whether ${last.server} loads`
 			: "";
 		out.push(finding("mcp-load", last.at, null, null,
 			`mcp-load: ${last.server} failed to load ${sorted.length} time(s) in the window in profile ${input.profile}: ${kind}${login}`,

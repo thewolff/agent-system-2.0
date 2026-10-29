@@ -23,7 +23,7 @@ import { controlEntries, laneStarted, modelProblem } from "../launch";
 import { parseTestRun } from "../test-run";
 import {
 	type BuilderLab, COMPACTION_LOOP, type CompactionSession, type DetectorInputs, type HandRouting, type HandSpawn, type JetsamReport,
-	type LaneModelSet, type LaneStart, type McpLoadFailure, type OrchestratorSession, type SessionEvent, type TestRunVerdict,
+	isDefaultOmpProfile, type LaneModelSet, type LaneStart, type McpLoadFailure, type OrchestratorSession, type SessionEvent, type TestRunVerdict,
 } from "./detectors";
 import type { Window } from "./types";
 
@@ -59,7 +59,10 @@ export async function readDetectorInputs(opts: ReadOptions): Promise<DetectorInp
 		testRuns: readTestRuns(ledger, to),
 		...readLaneStartsAndModels(ledger, to),
 		jetsam: readJetsam(opts.jetsamDir ?? JETSAM_DIR, fromMs),
-		mcpLoad: { profile: opts.profile, ...(await readMcpLoadFailures(join(opts.home, ".omp", "profiles", opts.profile, "logs"), fromMs, toMs)) },
+		mcpLoad: {
+			profile: opts.profile,
+			...(await readMcpLoadFailures(join(opts.home, ".omp", ...(isDefaultOmpProfile(opts.profile) ? [] : ["profiles", opts.profile.trim()]), "logs"), fromMs, toMs)),
+		},
 	};
 }
 
