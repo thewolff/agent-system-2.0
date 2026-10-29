@@ -1338,6 +1338,7 @@ plugins/ask-graham/skills/ask-graham/references/upkeep.md	skill-asset	-
 plugins/ask-graham/skills/ask-graham/scripts/intensity.mjs	skill-asset	-
 plugins/ask-graham/skills/ask-graham/scripts/upkeep.mjs	skill-asset	-
 plugins/ask-graham/skills/ask-graham/scripts/verdict.mjs	skill-asset	-
+plugins/ask-graham/skills/ask-graham/structure-check.md	skill-asset	-
 plugins/i-have-audhd/.claude-plugin/plugin.json	data	-
 plugins/i-have-audhd/.omp-plugin/plugin.json	data	-
 plugins/i-have-audhd/README.md	doc	-
