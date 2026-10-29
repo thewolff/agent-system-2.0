@@ -15,7 +15,9 @@
 // boots it out and deletes the plist before any install step and writes nothing else.
 // And --train-tick, against fake gh, omp and ctx in a PATH built by the test: ctx's directory is in the tick's PATH,
 // and without ctx the flag is refused with exit 2 and nothing written.
-import { beforeAll, describe, expect, test } from "bun:test";
+// Installer runs never get the developer PATH (only `installPath`, fake launchctl first where needed), so none can reach a real herdr.
+// The fixture root is removed in afterAll only after every started test body completed; a failed run keeps it and prints its path.
+import { afterAll, beforeAll, describe, expect, test as bunTest } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -61,6 +63,27 @@ function manifestWith(...pairs: [string, string][]): void {
 /** Every top-level directory install/manifest.tsv has rows under (b3e06bb added the M3/M4 ones; M6 added skills/ and bin/). */
 const MANIFEST_DIRS = ["ledger", "install", "profile", "tiers", "classifier", "gates", "skills", "plugins", "bin", "surface", "contract", "voice"];
 
+let ready = false;
+let started = 0;
+let finished = 0;
+
+type Body = () => unknown;
+/** A test body that counts itself: `finished` only advances when the body returns or resolves (a throw, rejection or timeout never reaches it). */
+const counted = (body: Body) => async () => {
+	started += 1;
+	await body();
+	finished += 1;
+};
+const test = Object.assign((name: string, body: Body, timeout?: number) => bunTest(name, counted(body), timeout), {
+	if: (cond: boolean) => (name: string, body: Body, timeout?: number) => bunTest.if(cond)(name, counted(body), timeout),
+	skipIf: (cond: boolean) => (name: string, body: Body, timeout?: number) => bunTest.skipIf(cond)(name, counted(body), timeout),
+});
+
+afterAll(() => {
+	if (ready && started === finished) rmSync(root, { recursive: true, force: true });
+	else console.error(`install.test.ts: fixture kept for inspection: ${root} (${finished}/${started} test bodies completed)`);
+});
+
 beforeAll(() => {
 	root = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "ledger-install-"));
 	// Do not inherit herdr/ctx from the developer's PATH: installer runs must never register a real
@@ -80,6 +103,7 @@ beforeAll(() => {
 	}
 	manifest = join(copy, "install", "manifest.tsv");
 	original = readFileSync(manifest, "utf8");
+	ready = true;
 });
 
 describe("install: the baseline copy installs", () => {
@@ -718,17 +742,18 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		const plist = join(home, "Library", "LaunchAgents", `${reportLabel}.plist`);
 		const launchctl = fakeLaunchctl("daily-report-on", false);
 		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--daily-report"], {
-			env: { PATH: `${launchctl.bin}:${process.env.PATH ?? ""}`, HOME: home, AGENT_SYSTEM_PROFILE: "as2-report-test" }, stdout: "pipe", stderr: "pipe",
+			env: { PATH: `${launchctl.bin}:${installPath}`, HOME: home, AGENT_SYSTEM_PROFILE: "as2-report-test" }, stdout: "pipe", stderr: "pipe",
 		});
 		const out = r.stdout.toString() + r.stderr.toString();
 		expect(out).toContain("daily report loaded: runs daily at 07:00 local time");
+		expect(out).toContain("==> note: herdr is not on PATH; file-link handler not registered");
 		expect(r.exitCode).toBe(0);
 		expect(Bun.spawnSync(["/usr/bin/plutil", "-lint", plist]).exitCode).toBe(0);
 		const job = JSON.parse(Bun.spawnSync(["/usr/bin/plutil", "-convert", "json", "-o", "-", plist]).stdout.toString());
 		const log = join(home, "agent-scratch", "agent-system-2.0", "self-heal", "launchd.log");
 		expect(job).toEqual({
 			Label: reportLabel,
-			ProgramArguments: [Bun.which("bun"), join(copy, "surface", "scripts", "daily-report.ts")],
+			ProgramArguments: [join(root, "bin", "bun"), join(copy, "surface", "scripts", "daily-report.ts")],
 			EnvironmentVariables: { AGENT_SYSTEM_LEDGER_DB: join(home, ".agent-system-2", "ledger.db"), AGENT_SYSTEM_PROFILE: "as2-report-test", HOME: home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
 			WorkingDirectory: copy,
 			StartCalendarInterval: { Hour: 7, Minute: 0 },
