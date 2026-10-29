@@ -385,7 +385,8 @@ describe("mcp-load", () => {
 		"other.log": [LINEAR_401("2026-10-28T16:40:00.000-07:00", 1)], // not an OMP process log
 	};
 	const logsOf = (home: string, name: string) => join(home, ".omp", "profiles", PROFILE, "logs", name);
-	const LINEAR = (n: number) => `mcp-load: linear failed to load ${n} time(s) in the window in profile agent-system-2: HTTP 401; current login health unknown: check with jo-auth.zsh --check`;
+	const HEALTH = (server: string) => `HTTP 401; current login health unknown until a live load: start \`OMP_PROFILE=agent-system-2 omp\` and see whether ${server} loads`;
+	const LINEAR = (n: number) => `mcp-load: linear failed to load ${n} time(s) in the window in profile agent-system-2: ${HEALTH("linear")}`;
 	const ALL = w("2026-10-26T00:00:00.000Z", "2026-10-29T00:00:00.000Z");
 
 	test("one finding per server and failure, at its last failure, counting the window's failures, rotated logs included; a 401 leaves the login's current health open", async () => {
@@ -394,7 +395,7 @@ describe("mcp-load", () => {
 		expect(fs.map((f) => [f.at, f.summary])).toEqual([
 			["2026-10-27T16:12:03.004Z", "mcp-load: ctx failed to load 1 time(s) in the window in profile agent-system-2: Executable not found in $PATH: \"ctx\""],
 			["2026-10-28T23:39:20.269Z", LINEAR(3)],
-			["2026-10-28T23:39:20.297Z", "mcp-load: posthog failed to load 1 time(s) in the window in profile agent-system-2: HTTP 401; current login health unknown: check with jo-auth.zsh --check"],
+			["2026-10-28T23:39:20.297Z", `mcp-load: posthog failed to load 1 time(s) in the window in profile agent-system-2: ${HEALTH("posthog")}`],
 		]);
 		expect(fs.find((f) => f.summary.includes("linear"))!.evidence).toBe(`${logsOf(x.home, "omp.2026-10-26.28363.log")}:1 .. ${logsOf(x.home, "omp.2026-10-28.38384.log.1")}:1`);
 	});
@@ -425,7 +426,7 @@ describe("mcp-load", () => {
 			["2026-10-26T00:00:00.000Z", MCP_LOAD_UNREADABLE],
 			["2026-10-26T23:31:00.358Z", LINEAR(2)],
 			["2026-10-27T16:12:03.004Z", "mcp-load: ctx failed to load 1 time(s) in the window in profile agent-system-2: Executable not found in $PATH: \"ctx\""],
-			["2026-10-28T23:39:20.297Z", "mcp-load: posthog failed to load 1 time(s) in the window in profile agent-system-2: HTTP 401; current login health unknown: check with jo-auth.zsh --check"],
+			["2026-10-28T23:39:20.297Z", `mcp-load: posthog failed to load 1 time(s) in the window in profile agent-system-2: ${HEALTH("posthog")}`],
 		]);
 		expect(fs[0]!.evidence).toBe(bad);
 	});

@@ -375,7 +375,9 @@ export function mcpLoad(input: DetectorInputs["mcpLoad"], w: Window): Finding[] 
 		const first = sorted[0]!;
 		const last = sorted[sorted.length - 1]!;
 		const kind = mcpFailureKind(last.error);
-		const login = kind === "HTTP 401" || kind === "HTTP 403" ? "; current login health unknown: check with jo-auth.zsh --check" : "";
+		const login = kind === "HTTP 401" || kind === "HTTP 403"
+			? `; current login health unknown until a live load: start \`OMP_PROFILE=${input.profile} omp\` and see whether ${last.server} loads`
+			: "";
 		out.push(finding("mcp-load", last.at, null, null,
 			`mcp-load: ${last.server} failed to load ${sorted.length} time(s) in the window in profile ${input.profile}: ${kind}${login}`,
 			sorted.length === 1 ? `${first.path}:${first.line}` : `${first.path}:${first.line} .. ${last.path}:${last.line}`));
