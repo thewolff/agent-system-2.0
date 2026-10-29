@@ -1,10 +1,13 @@
 ---
-status: resolved
+status: superseded
+superseded_by: .ai/decision-log/2026-10-28--1625--plumb--train-tick-runs-at-interactive-priority.md
 author: plumb
 date: 2026-10-28
 ---
 
 # The merge train's tick runs at Standard priority
+
+> Superseded on 2026-10-28 by `2026-10-28--1625--plumb--train-tick-runs-at-interactive-priority.md`: the train tick now runs at `Interactive`, because `Standard` still clamps the tree to utility priority 20. The chaos job's change below still stands.
 
 ## Decision
 
