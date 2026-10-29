@@ -4,7 +4,7 @@
 // home holding the orchestrator sessions and the profile's OMP logs, a temp lanes dir holding the
 // lane sessions, and a temp Jetsam directory; then `runDetectors` over a window.
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { handLab, JETSAM_UNREADABLE, MCP_LOAD_UNREADABLE, ompLaunch, runDetectors } from "../src/selfheal/detectors";
@@ -465,5 +465,31 @@ describe("mcp-load", () => {
 		expect([ompLaunch("default"), ompLaunch(""), ompLaunch(" default "), ompLaunch("agent-system-2")]).toEqual([
 			DEFAULT_LAUNCH, DEFAULT_LAUNCH, DEFAULT_LAUNCH, AS2_LAUNCH,
 		]);
+	});
+
+	// The hint runs as printed, with `omp` swapped for a probe that asks the installed OMP's own profile
+	// resolver (pi-utils dirs.ts) which profile and agent dir it would open. The probe's environment
+	// carries every variable that could pick another profile, as an as2 lane or Plumb's shell might. The
+	// resolver is imported by absolute path inside the child (as in gates/test/host.test.ts): the global OMP
+	// install is absent on a fresh clone, where these two tests skip, and it must run in the env the hint built.
+	const OMP_UTILS = "/Users/jowolff/.bun/install/global/node_modules/@oh-my-pi/pi-utils/src/dirs.ts";
+	const probe = (hint: string, inherited: Record<string, string>): string => {
+		const argv = hint.split(" ");
+		expect(argv.at(-1)).toBe("omp");
+		const r = Bun.spawnSync([...argv.slice(0, -1), process.execPath, "-e",
+			`const d = await import(${JSON.stringify(OMP_UTILS)}); console.log((d.resolveProfileEnv(process.env.OMP_PROFILE, process.env.PI_PROFILE) ?? "default") + " " + (process.env.PI_CODING_AGENT_DIR ?? "-") + " " + (process.env.PI_CONFIG_DIR ?? "-"))`,
+		], { env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "", ...inherited } });
+		expect(r.exitCode).toBe(0);
+		return r.stdout.toString().trim();
+	};
+	const INHERITED = { OMP_PROFILE: "agent-system-2", PI_PROFILE: "agent-system-2", PI_CODING_AGENT_DIR: "/tmp/elsewhere", PI_CONFIG_DIR: ".elsewhere" };
+
+	test.skipIf(!existsSync(OMP_UTILS))("the default-profile hint opens the default profile even with PI_PROFILE=agent-system-2 inherited", () => {
+		expect(probe(ompLaunch("default"), INHERITED)).toBe("default - -");
+		expect(probe(ompLaunch("default"), { PI_PROFILE: "agent-system-2" })).toBe("default - -");
+	});
+
+	test.skipIf(!existsSync(OMP_UTILS))("a named-profile hint opens that profile whatever PI_PROFILE or OMP_PROFILE is inherited", () => {
+		expect(probe(ompLaunch("agent-system-2"), { ...INHERITED, OMP_PROFILE: "other", PI_PROFILE: "other" })).toBe("agent-system-2 - -");
 	});
 });
