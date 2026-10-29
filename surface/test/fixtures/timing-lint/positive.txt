@@ -1,0 +1,103 @@
+// Positive fixture for surface/src/timing-lint.ts (read by surface/test/timing-lint.test.ts, never run). Every line that
+// ends in `//! <pattern>[ <pattern>…]` must give exactly those findings, in that order; every other line gives none.
+import { expect, setDefaultTimeout, test } from "bun:test";
+
+const sleep = (ms: number) => Bun.sleep(ms); //! sleep
+setDefaultTimeout(1_000); //! test-timeout
+jest.setTimeout(250); //! test-timeout
+
+test("fixed sleeps", async () => {
+	await Bun.sleep(50); //! sleep
+	Bun.sleepSync(5); //! sleep
+	await Bun . sleep(1); //! sleep
+	await sleep(200); //! sleep
+	await delay(10); //! sleep
+});
+
+test("timer waits", async () => {
+	await new Promise((r) => setTimeout(r, 50)); //! timer
+	await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 10)); //! timer
+	const watchdog = setTimeout(() => child.kill("SIGKILL"), 30_000); //! timer
+	const poll = setInterval(() => check(), 25); //! timer
+	setTimeout(() => sock.end(), 50); //! timer
+	const timer = enabled ? setTimeout(done, 100) : undefined; //! timer
+	const tick = slow ? globalThis.setInterval(poll, 10) : null; //! timer
+	await (retry ? sleep(50) : Promise.resolve()); //! sleep
+	const pick = {
+		wait: fast ? setTimeout(go, 5) : setTimeout(go, 50), //! timer timer
+	};
+});
+
+test("timers that are not failure-only watchdogs", async () => {
+	const tuned = setTimeout(() => child.kill("SIGKILL"), 2_000); //! timer
+	const ready = setTimeout(() => resolve(true), 30_000); //! timer
+	const flagged = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, 30_000); //! timer
+	const untilMs = setTimeout(() => child.kill("SIGKILL"), ms); //! timer
+	try {
+		await child.exited;
+	} finally {
+		clearTimeout(tuned);
+		clearTimeout(ready);
+		clearTimeout(flagged);
+		clearTimeout(untilMs);
+	}
+});
+
+test("deadline races", async () => {
+	const timeout = new Promise<false>((r) => setTimeout(() => r(false), 9_000)); //! timer
+	const finished = await Promise.race([ended, timeout]); //! race
+	const chunk = await Promise.race([next, Bun.sleep(100).then(() => null)]); //! race sleep
+	await Promise.race([work, deadlineHit]); //! race
+});
+
+test("wall-clock assertions", () => {
+	const t0 = Date.now();
+	run();
+	expect(Date.now() - t0).toBeLessThan(2_000); //! clock-assert
+	expect(performance.now() - t0).toBeGreaterThanOrEqual(900); //! clock-assert
+	expect(Date.parse(lease)).toBeLessThan(Date.now()); //! clock-assert
+	expect(Bun.nanoseconds()).toBeGreaterThan(start); //! clock-assert
+});
+
+test("timestamps whose names look like durations", () => {
+	const startedMs = Date.now();
+	const T0 = performance.now();
+	let sinceMs: number = Date.now();
+	work();
+	expect(Date.now() - startedMs).toBeLessThan(10); //! clock-assert
+	expect(performance.now() - T0).toBeLessThan(10); //! clock-assert
+	const tookMs = Date.now() - sinceMs; //! clock-elapsed
+	expect(
+		Date.now() - startedMs, //! clock-assert
+	).toBeLessThan(10);
+	expect(tookMs).not.toBeGreaterThan(
+		Date.now() - sinceMs, //! clock-assert
+	);
+});
+
+test("elapsed and deadlines", async () => {
+	const started = performance.now();
+	const elapsed = performance.now() - started; //! clock-elapsed
+	const took = Date.now() - (heartbeatAt(w) ?? 0); //! clock-elapsed
+	const end = Date.now() + ms;
+	while (Date.now() < end) { //! clock-deadline
+		if (done()) break;
+	}
+	if (end <= Date.now()) throw new Error("late"); //! clock-deadline
+	const left = deadline - Date.now(); //! clock-deadline
+	return Date.now() - since > quietMs; //! clock-elapsed
+});
+
+test("a small explicit timeout", async () => { //! test-timeout
+	await work();
+}, 1_000);
+
+test("a small timeout object", () => { //! test-timeout
+	work();
+}, { timeout: 250 });
+
+test.each([1, 2])("each %p with a small timeout", (n) => { //! test-timeout
+	expect(n).toBeGreaterThan(0);
+}, 500);
+
+it("an it() with a small timeout", () => {}, 100); //! test-timeout
