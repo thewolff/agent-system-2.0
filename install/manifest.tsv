@@ -1444,3 +1444,12 @@ surface/test/fixtures/train-carry-305/compare.json	test	-
 surface/test/fixtures/train-carry-305/commit-cde03460.json	test	-
 surface/test/fixtures/full-suite-publication-worker.ts	test	-
 surface/test/land-first-off.test.ts	test	-
+# The incidental-timing check (Jo's rule, 2026-10-28: a test depends on timing only when timing is under test): the
+# static checker, its ratchet test, the committed baseline that only shrinks, and the checker's fixtures.
+surface/src/timing-lint.ts	module	-
+surface/test/timing-lint.test.ts	test	-
+surface/test/timing-baseline.tsv	test	-
+surface/test/fixtures/timing-lint/positive.txt	test	-
+surface/test/fixtures/timing-lint/negative.txt	test	-
+surface/test/fixtures/timing-lint/opt-out.txt	test	-
+surface/test/fixtures/timing-lint/opt-out-bad.txt	test	-
