@@ -9,7 +9,7 @@
 // (`buildUser: null`, `asRoot: false`, a local bare origin) into a tmp libexec. The setup script
 // runs with fake dscl, sudo and visudo under AS2TEST_SETUP_TEST_PREFIX; real sudo is never called.
 import { Database } from "bun:sqlite";
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
@@ -25,6 +25,12 @@ import {
 import { STUCK_DEFAULTS } from "../src/stuck-detect";
 import { AS2TEST_USER, CHILD_ENV_ALLOWLIST, childEnv, partResult, WRAPPER_EXIT, type WrapperCall } from "../src/test-run";
 import { tmp, unreapedTrue } from "./helpers";
+
+// Every test here drives real processes (git, sudo, the wrapper, bun parts). Under the full suite's load bun's 5 s default
+// killed them mid-fixture: run tr-0mvsvebzkfar5lr cut `a caps.json stuckStop …` inside its `git commit` at 5000 ms, and the
+// full-part logs hold 35 such timeouts of that test and dozens more of this file's fast tests. Tests with their own
+// timeout keep it.
+setDefaultTimeout(60_000);
 
 /**
  * This change's new exports (PLAN wl-mv718fxhwwcn40 § 2), reached loosely so the file still loads
@@ -1569,8 +1575,9 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 
 	test("enforce: the spin fixture gets a signature line, stuck-stop, a signature capture, a teardown of every owned group (a group created during the capture included) and exit 125 within persist + capture + teardown + slack; capture tools, marker dir and preload are gone", async () => {
 		// A capture budget past the default, so the held hook and a loaded machine's slow sample still leave all five sections
-		// (the cut at the budget is the stuck-cut test's).
-		const knobs = { ...DETECT, signatureCaptureMs: 10_000 };
+		// (the cut at the budget is the stuck-cut test's). The detector runs on the spinner's CPU clock (detectCpuClock, as the
+		// shadow test does): on a real clock a loaded machine gave the spinner under HOT_SHARE and the stop never came.
+		const knobs = { ...DETECT, signatureCaptureMs: 10_000, detectCpuClock: true };
 		const b = box("stuck-enforce", knobs);
 		prepared(b, "tr-se1", { "spin.test.ts": spinTest(true), "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
 		const work = workOf(b, "tr-se1");
@@ -1606,12 +1613,14 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		expect(stopSet).toEqual(expect.arrayContaining([leader, helper, late]));
 		expect(stderr).toMatch(new RegExp(`^stuck: worker ${worker} spun \\d+ ms in Bun\\.spawnSync with unreaped child ${zombie}; ${stopSet.length} process groups killed, containment contained\\n$`));
 		const spun = Number(/ spun (\d+) ms /.exec(stderr)![1]);
-		expect(spun).toBeGreaterThanOrEqual(DETECT.detectPersistMs);
+		// The persistence is on the detector's clock, so it is exact.
+		expect(spun).toBe(DETECT.detectPersistMs);
 		expect(Date.parse(stop.iso) - Date.parse(sig.iso)).toBeGreaterThanOrEqual(DETECT.detectPersistMs - 50);
-		// The budget runs from the matching signature's first tick (PLAN § Budget).
-		const signatureToExit = exitedAt - Date.parse(sig.iso);
-		expect(signatureToExit).toBeLessThan(DETECT.detectPersistMs + knobs.signatureCaptureMs + STUCK_DEFAULTS.stopGraceMs + STUCK_DEFAULTS.verifyMs + 3_000);
-		report({ fixture: "enforce", signatureToExitMs: signatureToExit, firstSignatureToExitMs: exitedAt - Date.parse(first.iso), stopToExitMs: exitedAt - Date.parse(stop.iso) });
+		// The budget runs from the matching signature's first tick (PLAN § Budget): its persistence is `spun` on the detector's
+		// clock, which a loaded machine stretches in wall time, so the wall-clock part is measured from the stop.
+		const stopToExit = exitedAt - Date.parse(stop.iso);
+		expect(stopToExit).toBeLessThan(knobs.signatureCaptureMs + STUCK_DEFAULTS.stopGraceMs + STUCK_DEFAULTS.verifyMs + 3_000);
+		report({ fixture: "enforce", signatureToExitMs: exitedAt - Date.parse(sig.iso), firstSignatureToExitMs: exitedAt - Date.parse(first.iso), stopToExitMs: stopToExit });
 		// Every owned process and group is gone, with no sweep.
 		for (const pid of [leader, worker, helper, late]) expect({ pid, alive: alive(pid) }).toEqual({ pid, alive: false });
 		for (const g of stopSet) expect({ g, alive: alive(-g) }).toEqual({ g, alive: false });
@@ -1641,7 +1650,7 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 	for (const how of ["fifo", "symlink"] as const) {
 		test(`enforce: refuses a ${how} groups file after the stop decision, still kills every owned group and preserves the stuck cause with unconfirmed cleanup`, async () => {
 			const signatureCaptureMs = 10_000;
-			const b = box(`stuck-groups-${how}`, { ...DETECT, signatureCaptureMs });
+			const b = box(`stuck-groups-${how}`, { ...DETECT, signatureCaptureMs, detectCpuClock: true });
 			const runId = how === "fifo" ? "tr-sef1" : "tr-ses1";
 			prepared(b, runId, { "spin.test.ts": spinTest(true), "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
 			const work = workOf(b, runId);
@@ -1773,7 +1782,7 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 
 	test("a signature capture whose tools are still running at its deadline is cut there: every capture group is SIGKILLed, the file says so, and the stop still exits 125 within the bound", async () => {
 		const signatureCaptureMs = 600;
-		const b = box("stuck-cut", { ...DETECT, signatureCaptureMs });
+		const b = box("stuck-cut", { ...DETECT, signatureCaptureMs, detectCpuClock: true });
 		prepared(b, "tr-sk1", { "spin.test.ts": spinTest(false), "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
 		const work = workOf(b, "tr-sk1");
 		// Never released: sample (1 s) cannot finish inside 600 ms either.
@@ -1788,8 +1797,9 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 			const zombie = fixturePid(work, "zombie.pid");
 			expect(code).toBe(WRAPPER_EXIT.stuck);
 			expect(existsSync(`${hook}.reached`)).toBe(true);
-			const { sig } = enforceLines(stdout, worker, zombie);
-			expect(exitedAt - Date.parse(sig.iso)).toBeLessThan(DETECT.detectPersistMs + signatureCaptureMs + STUCK_DEFAULTS.stopGraceMs + STUCK_DEFAULTS.verifyMs + 3_000);
+			const { stop } = enforceLines(stdout, worker, zombie);
+			// From the stop: the persistence before it is on the detector's CPU clock, which load stretches in wall time.
+			expect(exitedAt - Date.parse(stop.iso)).toBeLessThan(signatureCaptureMs + STUCK_DEFAULTS.stopGraceMs + STUCK_DEFAULTS.verifyMs + 3_000);
 			const text = readFileSync(join(work, "full.signature.log"), "utf8");
 			const cutAt = Number(/^capture cut at (\d+) ms$/m.exec(text)?.[1]);
 			expect(cutAt).toBeGreaterThanOrEqual(signatureCaptureMs);
