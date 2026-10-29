@@ -302,8 +302,9 @@ testRunner:
   # Every fast set includes these smoke files. Files in macOnly run only in the full main suite:
   # macOS-specific sandbox, shell, filesystem and process APIs cannot be exercised on Linux;
   # the remaining portability cases depend on Linux filesystem identity/order/timing behavior.
-  # The 13 macOS-only files and four portability files found by the Linux probe (each reason below)
-  # stay out of hosted Linux and run only in the post-merge Mac full suite. Keep zsh and bubblewrap
+  # The 13 macOS-only files and four portability files found by the Linux probe, and test-runner-smoke found by the
+  # as2-hosted run of 2026-10-28 (each reason below), stay out of hosted Linux. They run in the post-merge Mac full
+  # suite and in .github/workflows/as2-hosted.yml's macos-latest job. Keep zsh and bubblewrap
   # tests in the fast set; the hosted workflow installs both. Activation is a ledger word, not a flag.
   # timing-lint.test.ts is the incidental-timing ratchet (Jo's rule, 2026-10-28): static, under a second, and it must
   # run on every PR, since a new offender is a new test file the reach scan would not otherwise pick.
@@ -329,6 +330,7 @@ testRunner:
     surface/test/scratch-remove.test.ts: Linux inode reuse affects directory identity check
     surface/test/decision-log.test.ts: Linux directory iteration ordering differs
     surface/test/test-runner.test.ts: Linux timing/signal behavior differs in test T2c
+    surface/test/test-runner-smoke.test.ts: admission reads the _as2test process snapshot, which Linux cannot inspect (S5b settles as admission refused, inspection denied)
   # Files a main run's believability leaves out (§ 2 Main state, jo-issues #243): they need Jo's own machine (an
   # installed OMP) and skip every test under _as2test, so 185 of 195 files is the most a main run can execute and
   # 95 % of 195 is 185.25. Each still runs in the full suite; it only stops counting toward "believable".
