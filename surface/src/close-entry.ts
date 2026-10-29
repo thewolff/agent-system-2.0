@@ -283,8 +283,10 @@ export function archiveScratchRoot(home: string, id: string, now: Date, seams: A
 			const back = restoreDetached(d);
 			return { kind: "archive-failed", root, reason: archive.reason, keptAt: back.at, restore: back.said };
 		}
-		const r = purgeArchived(d, archive);
-		const removal = r.kind === "removed" ? { ok: true as const } : { ok: false as const, reason: r.kind === "refused" ? r.reason : r.error, left: d.doomed };
+		const r = purgeArchived(d, archive, seams);
+		if (r.kind === "removed") return { kind: "archived", root, physical, archive, removal: { ok: true as const } };
+		const back = restoreDetached(d);
+		const removal = { ok: false as const, reason: `${r.kind === "refused" ? r.reason : r.error}; ${back.said}`, left: back.at };
 		return { kind: "archived", root, physical, archive, removal };
 	} catch (err) {
 		return { kind: "refused", root, reason: String(err instanceof Error ? err.message : err) };

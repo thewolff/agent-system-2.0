@@ -9,7 +9,7 @@
 // entry lands on the standing workload, once while open; back within bounds, `scratch-disk-ok:`.
 // --dry-run removes and writes nothing; a missing ledger or a bad threshold removes nothing.
 import { afterAll, describe, expect, test } from "bun:test";
-import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SCRATCH_ENTRY, scratchBase } from "../../gates/src/scratch";
 import { DEFAULT_SCRATCH_ARCHIVE, type ScratchArchiveConfig, scratchArchiveBase } from "../src/scratch-archive";
@@ -515,6 +515,28 @@ describe("scratch sweep: archives (expiry, offsite gate, failures) and the disk 
 		expect(code).toBe("EACCES");
 		expect(r.roots.find((x) => x.name === closed)!.action).toBe("removed");
 		expect(existsSync(join(w.base, closed))).toBe(false);
+	});
+
+	test("a file replaced during the sweep's purge is never removed: remove failed, the root renamed back with the new file, exit 1", () => {
+		const w = world();
+		const closed = open(w);
+		w.ledger.closeWorkload(closed, { by: "orchestrator-surface" });
+		root(w, closed);
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW, {
+			archive: () => ({
+				beforeStage: (path) => {
+					if (!path.endsWith("/repo/src/a.ts")) return;
+					unlinkSync(path);
+					writeFileSync(path, "rewritten");
+				},
+			}),
+		});
+		expect(r.exit).toBe(1);
+		const line = r.roots.find((x) => x.name === closed)!;
+		expect(line.action).toBe("remove failed");
+		expect(line.why).toContain("./repo/src/a.ts was replaced (another inode); kept, put back; nothing more was removed");
+		expect(line.why).toContain(`renamed back to ${join(w.base, closed)}; what is left is at ${join(w.base, closed)}`);
+		expect(readFileSync(join(w.base, closed, "repo", "src", "a.ts"), "utf8")).toBe("rewritten");
 	});
 
 	test("a descriptor held open into a root across its archive keeps the root (archive failed, renamed back, exit 1); the other roots still go", () => {

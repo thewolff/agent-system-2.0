@@ -5,7 +5,7 @@
 // archives the root once the row has closed and only then removes it, keeping a root whose archive
 // fails and refusing a root that is a symlink.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { chmodSync, closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { Ledger } from "../../ledger/src/index";
@@ -572,7 +572,74 @@ describe("orchestrator_close_workload archives the root, then removes it, after 
 			ledger.close();
 		});
 
-		test("purgeArchived removes only what the freeze recorded: an entry made after it (by a writer that gave the directory its write bit back) is kept, and the result says so", () => {
+		test("a same-size write in the freeze's own stat-to-chmod step that keeps the mtime is caught by the frozen files' hashes: the archive is dropped and the root kept with the new contents and its modes", () => {
+			const { ledger, wl, home, root, leftovers } = setUp();
+			const report = join(root, "REPORT.md");
+			const fixed = new Date("2026-10-28T04:00:00.000Z");
+			utimesSync(report, fixed, fixed);
+			const had = [root, report].map((p) => lstatSync(p).mode & 0o7777);
+			const said = closeScratchRoot(ledger, { HOME: home }, wl, {
+				now,
+				seams: {
+					beforeChmod: (path) => {
+						if (!path.endsWith("/REPORT.md")) return;
+						writeFileSync(path, "bbbb");
+						utimesSync(path, fixed, fixed);
+					},
+				},
+			});
+			expect(said).toContain(`Scratch root ${root} kept: not archived: `);
+			expect(said).toContain("changed while it was archived: ./REPORT.md has other contents than the archive");
+			expect(readFileSync(report, "utf8")).toBe("bbbb");
+			expect([root, report].map((p) => lstatSync(p).mode & 0o7777)).toEqual(had);
+			expect(leftovers()).toEqual([]);
+			ledger.close();
+		});
+
+		test("a file replaced during the purge (unlinked and written again by its path) is never removed: the purge stops, puts it back, gives every mode back and renames the root back", () => {
+			const { ledger, wl, home, root, leftovers } = setUp();
+			const rootMode = lstatSync(root).mode & 0o7777;
+			const said = closeScratchRoot(ledger, { HOME: home }, wl, {
+				now,
+				seams: {
+					beforeStage: (path) => {
+						if (!path.endsWith("/REPORT.md")) return;
+						unlinkSync(path);
+						writeFileSync(path, "bbbb");
+					},
+				},
+			});
+			expect(said).toContain(" but not removed: ");
+			expect(said).toContain("./REPORT.md was replaced (another inode); kept, put back; nothing more was removed; every archived entry left has its mode back; renamed back to ");
+			expect(said).toContain(`what is left is at ${realpathSync(root)}`);
+			expect(readFileSync(join(root, "REPORT.md"), "utf8")).toBe("bbbb");
+			expect(readdirSync(root).filter((n) => n.startsWith(".as2-purge-"))).toEqual([]);
+			expect(lstatSync(root).mode & 0o7777).toBe(rootMode);
+			expect(Bun.spawnSync(["tar", "-xzOf", archivePathFor(home, wl, now), "./REPORT.md"], { stdout: "pipe" }).stdout.toString()).toBe("aaaa");
+			expect(leftovers()).toEqual([`${wl}.tar.gz`]);
+			ledger.close();
+		});
+
+		test("a purge that fails part way (an error, not a writer) gives every archived entry left its mode back and renames the root back", () => {
+			const { ledger, wl, home, root, leftovers } = setUp();
+			const had = [root, join(root, "REPORT.md")].map((p) => lstatSync(p).mode & 0o7777);
+			const said = closeScratchRoot(ledger, { HOME: home }, wl, {
+				now,
+				seams: {
+					beforeStage: (path) => {
+						if (path.endsWith("/REPORT.md")) throw Object.assign(new Error("EIO: i/o error, rename"), { code: "EIO" });
+					},
+				},
+			});
+			expect(said).toContain(" but not removed: ");
+			expect(said).toContain("EIO: i/o error, rename; every archived entry left has its mode back; renamed back to ");
+			expect(readFileSync(join(root, "REPORT.md"), "utf8")).toBe("aaaa");
+			expect([root, join(root, "REPORT.md")].map((p) => lstatSync(p).mode & 0o7777)).toEqual(had);
+			expect(leftovers()).toEqual([`${wl}.tar.gz`]);
+			ledger.close();
+		});
+
+		test("purgeArchived never removes an entry the archive does not hold: one made after the freeze (by a writer that gave the directory its write bit back) stops the purge and is kept", () => {
 			const dir = join(tmp("purge"), ".removing-wl-x-0123456789abcdef");
 			mkdirSync(join(dir, "sub"), { recursive: true, mode: 0o700 });
 			writeFileSync(join(dir, "REPORT.md"), "aaaa");
@@ -583,9 +650,11 @@ describe("orchestrator_close_workload archives the root, then removes it, after 
 			chmodSync(join(dir, "sub"), 0o700);
 			writeFileSync(join(dir, "sub", "late.md"), "late");
 			const r = purgeArchived({ kind: "detached", path: dir, doomed: dir }, a);
-			expect(r).toEqual({ kind: "failed", path: dir, error: `removing ${dir}: 1 entries were not in the archive and were kept (./sub/late.md)` });
-			expect(readdirSync(dir)).toEqual(["sub"]);
-			expect(readdirSync(join(dir, "sub"))).toEqual(["late.md"]);
+			expect(r.kind).toBe("failed");
+			expect(r.kind === "failed" && r.error).toBe(`removing ${dir}: ./sub/late.md is not in the archive; nothing more was removed; every archived entry left has its mode back`);
+			expect(readFileSync(join(dir, "sub", "late.md"), "utf8")).toBe("late");
+			expect(lstatSync(join(dir, "sub")).mode & 0o7777).toBe(0o700);
+			expect(readdirSync(dir).filter((n) => n.startsWith(".as2-purge-"))).toEqual([]);
 		});
 	});
 

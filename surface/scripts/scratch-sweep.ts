@@ -303,17 +303,19 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 				failed = true;
 				return { name, sizeKib, action: "remove failed", why: `${why}; ${d.kind === "refused" ? `refused at removal: ${d.reason}` : d.error}; nothing archived or removed` };
 			}
-			const a = archiveDetached(d.doomed, archivePathFor(args.home, name, now), hooks.archive?.(name) ?? {});
+			const seams = hooks.archive?.(name) ?? {};
+			const a = archiveDetached(d.doomed, archivePathFor(args.home, name, now), seams);
 			if (a.kind === "failed") {
 				failed = true;
 				const back = restoreDetached(d);
 				return { name, sizeKib, action: "archive failed", why: `${why}; not archived (${a.reason}); kept, ${back.said}` };
 			}
 			archived.push({ name, archive: a });
-			const r = purgeArchived(d, a);
+			const r = purgeArchived(d, a, seams);
 			if (r.kind === "removed") return { name, sizeKib, action: "removed", why: a.warnings.length ? `${why}; ${a.warnings.join("; ")}` : why };
 			failed = true;
-			return { name, sizeKib, action: "remove failed", why: `${why}; archived to ${a.path}, then ${r.kind === "refused" ? `refused at removal: ${r.reason}` : r.error}; what is left is at ${d.doomed}` };
+			const back = restoreDetached(d);
+			return { name, sizeKib, action: "remove failed", why: `${why}; archived to ${a.path}, then ${r.kind === "refused" ? `refused at removal: ${r.reason}` : r.error}; ${back.said}; what is left is at ${back.at}` };
 		}
 		if (ledger) state = diskState(ledger.workload(STANDING_WORKLOAD_ID) ? ledger.entries(STANDING_WORKLOAD_ID, "assumption") : []);
 	} finally {
