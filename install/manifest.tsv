@@ -1443,3 +1443,7 @@ surface/test/fixtures/train-carry-305/compare.json	test	-
 surface/test/fixtures/train-carry-305/commit-cde03460.json	test	-
 surface/test/fixtures/full-suite-publication-worker.ts	test	-
 surface/test/land-first-off.test.ts	test	-
+# OMP package alignment and the narrowly confined `as2 repair` mode.
+gates/extensions/self-repair.ts	extension	-
+gates/src/self-repair.ts	module	-
+gates/test/self-repair.test.ts	test	-

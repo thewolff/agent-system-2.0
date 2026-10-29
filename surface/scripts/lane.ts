@@ -628,7 +628,7 @@ function drainLine(text: string): void {
  */
 export function starterEnv(env: Record<string, string | undefined>): Record<string, string> {
 	const out: Record<string, string> = {};
-	for (const [k, v] of Object.entries(env)) if (v !== undefined && k !== ROLE_ENV && k !== WORKLOAD_ENV && k !== LANE_ENV && k !== SCRATCH_ENV && k !== DRAIN_TRIED_ENV) out[k] = v;
+	for (const [k, v] of Object.entries(env)) if (v !== undefined && k !== ROLE_ENV && k !== WORKLOAD_ENV && k !== LANE_ENV && k !== SCRATCH_ENV && k !== DRAIN_TRIED_ENV && k !== "AGENT_SYSTEM_SELF_REPAIR" && k !== "AGENT_SYSTEM_SELF_REPAIR_ROOTS") out[k] = v;
 	return out;
 }
 

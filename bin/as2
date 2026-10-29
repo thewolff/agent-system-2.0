@@ -16,8 +16,7 @@
 #                              The OTEL_* words are the tracing switch's, below: every inherited OTEL_* name
 #                              unset, then OTEL_SDK_DISABLED=true, or the otel map when observability.phoenix is `all`
 #          as2 install         run <repo>/install/install.sh (ledger, profile, this launcher); its
-#                              last line names the providers to log in to once per profile
-#                              (/login inside the session; OMP's first-launch wizard is skipped)
+#                              last line names the providers served by OMP's shared loopback auth broker
 #          as2 on | off        set gates.fence.enabled to true | false in the installed profile's
 #                              config.yml, printing the old and new value (a re-install resets it
 #                              to the template's value)
@@ -51,6 +50,10 @@
 #                              stop the workload's lane (requested through the ledger; signals omp only
 #                              when its pid still matches), remove a clean pushed worktree, tail the runner log
 #          as2 --print [args]  render <prompt>, then print the omp command line `as2 [args]` would run, without running it
+#          as2 repair         create or reuse a dedicated repair worktree, then start one repair
+#                              session there. Normal restrictions stay in force elsewhere; this
+#                              session may dispatch only the self-repair agent and write only in
+#                              that worktree and the installed AS2 profile
 #          as2 -h | --help     this text
 # Env:     AGENT_SYSTEM_PROFILE  OMP profile name (default: agent-system-2), as install/install.sh
 # Exit:    omp's (or install.sh's) own status when launching · 0 ok · 1 failure
@@ -72,6 +75,7 @@ while [ -L "$self" ]; do
 	esac
 done
 REPO="$(cd -P "$(dirname "$self")/.." && pwd -P)"
+REPAIR_REPO="${AGENT_SYSTEM_REPAIR_REPO:-$REPO-repair}"
 AGENT_DIR="$HOME/.omp/profiles/$PROFILE_NAME/agent"
 CONFIG="$AGENT_DIR/config.yml"
 PROMPT="$HOME/.agent-system-2/orchestrator/system.md"
@@ -284,6 +288,23 @@ case "${1-}" in
 	install)
 		shift
 		exec bash "$REPO/install/install.sh" "$@"
+		;;
+	repair)
+		shift
+		if [ ! -e "$REPAIR_REPO" ]; then
+			branch="repair/$(date +%Y%m%d-%H%M%S)"
+			git -C "$REPO" worktree add -b "$branch" "$REPAIR_REPO" HEAD >/dev/null || exit 1
+		elif ! git -C "$REPO" worktree list --porcelain | grep -Fqx "worktree $REPAIR_REPO"; then
+			printf 'as2 repair: %s exists but is not this repository\047s repair worktree\n' "$REPAIR_REPO" >&2
+			exit 1
+		fi
+		SELF_REPAIR_ROOTS="$REPAIR_REPO:$HOME/.omp/profiles/$PROFILE_NAME"
+		REPO="$REPAIR_REPO"
+		PROMPT="$HOME/.agent-system-2/orchestrator/system.md"
+		render_prompt
+		words="$(orchestrator_words)"
+		eval "set -- $words OMP_PROFILE=\"\$PROFILE_NAME\" AGENT_SYSTEM_ROLE=orchestrator AGENT_SYSTEM_SELF_REPAIR=1 AGENT_SYSTEM_SELF_REPAIR_ROOTS=\"\$SELF_REPAIR_ROOTS\" omp --cwd \"\$REPO\" --append-system-prompt \"\$PROMPT\" \"\$@\""
+		exec env "$@"
 		;;
 	on) fence true ;;
 	clean-shell)

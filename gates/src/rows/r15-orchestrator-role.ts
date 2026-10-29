@@ -73,6 +73,7 @@ import { bashCommand, ctxUnmodeled, type Exec, type Expansion, expandShell, gitC
 import { gitReads } from "../git-model";
 import { type AgentMessageLike, messageText } from "../session";
 import { WRITE_TOOLS } from "../targets";
+import { selfRepairDispatchRefusal, selfRepairOn, selfRepairToolRefusal } from "../self-repair";
 import type { CallContext, Refusal, ToolCall } from "../types";
 import { questionBlocks } from "./r01-turn-shape";
 
@@ -289,6 +290,11 @@ function scopedTarget(call: ToolCall): string | null {
  */
 export function checkOrchestratorRole(call: ToolCall, ctx: CallContext, unanswered: () => Unanswered | null = () => null): Refusal {
 	if (ctx.role !== "orchestrator") return null;
+	if (selfRepairOn(ctx.env)) {
+		if (call.toolName === "task") return selfRepairDispatchRefusal(call.input);
+		if (call.toolName === "write" || WRITE_TOOLS[call.toolName] || call.toolName === "eval") return selfRepairToolRefusal(call, ctx.cwd, ctx.env);
+		if (call.toolName === "bash") return null;
+	}
 	const role = roleRefusal(call, ctx);
 	const handsOn = HAND_ON[call.toolName] || (call.toolName === "write" && typeof call.input.path === "string" && HAND_ON[call.input.path]);
 	if (!role && !handsOn) return null;

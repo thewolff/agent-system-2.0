@@ -96,6 +96,16 @@ const ctxOf = (o: { hasUI: boolean; parent?: string; cwd?: string; resumed?: boo
 	ui: { notify: (m: string) => notices.push(m) },
 });
 
+
+test("normal and repair sessions both register ask policy; repair adds only its dedicated handlers", () => {
+	const normal = fakePi();
+	p11Gates(normal.pi, { HOME: "/nonexistent-home" }, async () => ({ enabled: false, autoBackground: true }));
+	const repair = fakePi();
+	p11Gates(repair.pi, { HOME: "/nonexistent-home", AGENT_SYSTEM_SELF_REPAIR: "1", AGENT_SYSTEM_SELF_REPAIR_ROOTS: tmp("repair-root") }, async () => ({ enabled: false, autoBackground: true }));
+	for (const session of [normal, repair]) {
+		expect(session.active()).toContain("ask");
+	}
+});
 describe("gates extension adapter", () => {
 	test("a hand: contract injected, `ask` removed, yield flagged not blocked, no turn-shape gate", async () => {
 		const contract = join(tmp("contract"), "c.md");

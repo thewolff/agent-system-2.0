@@ -144,6 +144,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { LANE_ENV, WORKLOAD_ENV } from "../gates/src/types";
 import { askJo, decidedText, raisedId, rulingActive } from "../gates/src/rulings";
+import { selfRepairOn } from "../gates/src/self-repair";
 import { type HostModules, hostSettings, readSetting } from "../gates/src/host";
 import { CLASSIFIER_BY, type EntryRow, Ledger, type QuestionRow, type RoutingOutcome, type Stakes } from "../ledger/src/index";
 import { defaultLedgerPath } from "../ledger/src/locality";
@@ -2222,6 +2223,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				return undefined;
 			}
 			if (event.toolName !== "task") return undefined;
+			if (selfRepairOn(process.env)) return undefined;
 			liveCtx = ctx;
 			const input = (event.input ?? {}) as TaskInput;
 			const batch = Array.isArray(input.tasks) && input.tasks.length > 0;
@@ -3147,6 +3149,7 @@ function productionExtension(): (pi: ExtensionAPI) => void {
 		},
 	});
 	return pi => {
+		if (selfRepairOn(process.env)) return;
 		// The host serves `@oh-my-pi/pi-utils` as an async module, which `require()` cannot load
 		// (live: `require() async module "omp-legacy-pi-bundled:@oh-my-pi/pi-utils" is unsupported`),
 		// so the agent dir is read once here, awaited before any tool call (modes/runtime-init.ts,

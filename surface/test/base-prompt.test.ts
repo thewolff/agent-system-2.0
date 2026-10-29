@@ -130,10 +130,11 @@ describe("bin/as2 renders the file before omp and refuses to launch without a so
 		copyFileSync(join(import.meta.dir, "..", "..", "profile", "config.yml"), join(agentDir, "config.yml"));
 		const bin = tmp("bin");
 		const argvFile = join(home, "omp-argv");
-		writeFileSync(join(bin, "omp"), `#!/bin/sh\nprintf '%s\\n' "$@" > '${argvFile}'\n`);
+		const envFile = join(home, "omp-env");
+		writeFileSync(join(bin, "omp"), `#!/bin/sh\nprintf '%s\\n' "\${AGENT_SYSTEM_SELF_REPAIR-}" "\${AGENT_SYSTEM_SELF_REPAIR_ROOTS-}" "\${OMP_PROFILE-}" > '${envFile}'\nprintf '%s\\n' "$@" > '${argvFile}'\n`);
 		chmodSync(join(bin, "omp"), 0o755);
 		const r = Bun.spawnSync(["sh", AS2, ...args], {
-			env: { PATH: `${bin}:${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, AGENT_SYSTEM_VOICE: e.AGENT_SYSTEM_VOICE!, AGENT_SYSTEM_CONTRACT: e.AGENT_SYSTEM_CONTRACT! },
+			env: { PATH: `${bin}:${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, AGENT_SYSTEM_VOICE: e.AGENT_SYSTEM_VOICE!, AGENT_SYSTEM_CONTRACT: e.AGENT_SYSTEM_CONTRACT!, AGENT_SYSTEM_REPAIR_REPO: join(home, "repair-worktree") },
 		});
 		const prompt = join(home, ".agent-system-2", "orchestrator", "system.md");
 		return {
@@ -142,7 +143,10 @@ describe("bin/as2 renders the file before omp and refuses to launch without a so
 			stdout: r.stdout.toString(),
 			stderr: r.stderr.toString(),
 			prompt,
+			repairRepo: join(home, "repair-worktree"),
+			profileDir: agentDir,
 			ompArgv: () => (existsSync(argvFile) ? readFileSync(argvFile, "utf8").trimEnd().split("\n") : null),
+			ompEnv: () => (existsSync(envFile) ? readFileSync(envFile, "utf8").trimEnd().split("\n") : null),
 		};
 	}
 
@@ -162,6 +166,15 @@ describe("bin/as2 renders the file before omp and refuses to launch without a so
 		expect(r.stdout.trimEnd()).toEndWith(`--append-system-prompt ${r.prompt}`);
 		expect(readFileSync(r.prompt, "utf8")).toBe(rendered(r.e));
 		expect(r.ompArgv()).toBeNull();
+	});
+
+	test("repair launch creates a feature-branch worktree and confines the session to it and the AS2 profile", () => {
+		const r = as2(["repair", "--resume", "x"]);
+		expect(r.code).toBe(0);
+		const argv = r.ompArgv()!;
+		expect(argv.slice(0, 2)).toEqual(["--cwd", r.repairRepo]);
+		expect(r.ompEnv()).toEqual(["1", `${r.repairRepo}:${r.profileDir.slice(0, -"/agent".length)}`, "agent-system-2"]);
+		expect(argv.slice(-2)).toEqual(["--resume", "x"]);
 	});
 
 	test("a missing voice document stops the launch, naming it; omp never runs and no file is written", () => {

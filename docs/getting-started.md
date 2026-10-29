@@ -113,6 +113,7 @@ Other launcher commands:
 | `as2 lane stop <workload>` | Ask the workload's lane to stop |
 | `as2 lane log <workload>` | Print the path of the lane's runner log and its last 40 lines (once; it does not follow) |
 | `as2 lane cleanup <workload>` | Remove the lane's worktree when it is clean and pushed |
+| `as2 repair` | Create or reuse `<checkout>-repair` on a feature branch and start the confined self-repair agent there. Writes are limited to that worktree and the selected AS2 profile; repair authority is stripped from any lane environment. Requires the OMP/package alignment introduced by PR #310 |
 
 ## 5. First workload
 

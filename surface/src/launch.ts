@@ -1711,7 +1711,7 @@ export const BY_HAND_ENV = "AGENT_SYSTEM_BY_HAND";
 export function laneEnv(base: Record<string, string | undefined>, binding: { workloadId: string; laneId: string }, cleanShell: CleanShellRead): Record<string, string> {
 	const out: Record<string, string> = {};
 	const hooks: readonly string[] = cleanShellOn(cleanShell, binding.workloadId) ? SHELL_START_HOOK_NAMES : [];
-	for (const [k, v] of Object.entries(base)) if (v !== undefined && !hooks.includes(k) && k !== BY_HAND_ENV) out[k] = v;
+	for (const [k, v] of Object.entries(base)) if (v !== undefined && !hooks.includes(k) && k !== BY_HAND_ENV && k !== "AGENT_SYSTEM_SELF_REPAIR" && k !== "AGENT_SYSTEM_SELF_REPAIR_ROOTS") out[k] = v;
 	out[ROLE_ENV] = "lane";
 	out[WORKLOAD_ENV] = binding.workloadId;
 	out[LANE_ENV] = binding.laneId;

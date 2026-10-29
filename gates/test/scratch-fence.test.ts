@@ -124,7 +124,7 @@ async function confined(command: string, cwd = HOME, rowless = false) {
 
 describe("the confined profile text", () => {
 	test("deny every write, allow the root and the terminal devices, deny network, then the targets' denies", () => {
-		expect(fenceProfile([{ kind: "subpath", path: "/x/.agent-system-2" }], ROOT)).toBe(
+		expect(fenceProfile([{ kind: "subpath", path: "/x/.agent-system-2" }], [ROOT], true)).toBe(
 			`(version 1)(allow default)(deny file-write*)(allow file-write* (subpath "${ROOT}") (literal "/dev/null") (literal "/dev/tty") (regex #"^/dev/fd/"))(deny network-outbound (remote ip))(deny file-write* (subpath "/x/.agent-system-2"))`,
 		);
 		expect(fenceProfile([{ kind: "subpath", path: "/x/.agent-system-2" }])).toBe(`(version 1)(allow default)(deny file-write* (subpath "/x/.agent-system-2"))`);

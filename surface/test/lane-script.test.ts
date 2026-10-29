@@ -1527,9 +1527,9 @@ describe("item 71: a queued launch starts when a lane slot frees (the runner's d
 		return { a, laneA };
 	};
 
-	test("starterEnv drops the lane binding laneEnv writes (role, workload, lane id) and keeps every other variable", () => {
+	test("starterEnv drops lane bindings and repair authority, and keeps every other variable", () => {
 		const base = { HOME: "/h", PATH: "/bin", AGENT_SYSTEM_LEDGER_DB: "/h/ledger.db", OMP_PROFILE: "agent-system-2", AGENT_SYSTEM_MAX_LANES: "1" };
-		const bound = laneEnv(base, { workloadId: "wl-a", laneId: "lane-a-1" }, { ok: true, value: "off" });
+		const bound = laneEnv({ ...base, AGENT_SYSTEM_SELF_REPAIR: "1", AGENT_SYSTEM_SELF_REPAIR_ROOTS: "/repo:/profile" }, { workloadId: "wl-a", laneId: "lane-a-1" }, { ok: true, value: "off" });
 		expect(bound).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: "wl-a", AGENT_SYSTEM_LANE_ID: "lane-a-1" });
 		expect(laneScript.starterEnv({ ...bound, UNSET: undefined })).toEqual(base);
 	});

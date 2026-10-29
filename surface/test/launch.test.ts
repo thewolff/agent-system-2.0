@@ -404,6 +404,12 @@ describe("laneEnv drops the shell-start hooks only where the clean-shell switch 
 	test("PI_NO_PTY passes through as the starter has it, or not at all", () => {
 		expect(Object.hasOwn(laneEnv({ HOME: "/h" }, binding, { ok: true, value: "all" }), "PI_NO_PTY")).toBe(false);
 	});
+
+	test("repair authority never passes into a lane", () => {
+		const env = laneEnv({ ...base, AGENT_SYSTEM_SELF_REPAIR: "1", AGENT_SYSTEM_SELF_REPAIR_ROOTS: "/repo:/profile" }, binding, { ok: true, value: "off" });
+		expect(env.AGENT_SYSTEM_SELF_REPAIR).toBeUndefined();
+		expect(env.AGENT_SYSTEM_SELF_REPAIR_ROOTS).toBeUndefined();
+	});
 });
 
 describe("first prompt merge line (decision 11, Codex review S7)", () => {
