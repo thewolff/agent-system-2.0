@@ -386,7 +386,9 @@ describe("mcp-load", () => {
 		"other.log": [LINEAR_401("2026-10-28T16:40:00.000-07:00", 1)], // not an OMP process log
 	};
 	const logsOf = (home: string, name: string) => join(home, ".omp", "profiles", PROFILE, "logs", name);
-	const HEALTH = (server: string) => `HTTP 401; current login health unknown until a live load: start \`OMP_PROFILE=agent-system-2 omp\` and see whether ${server} loads`;
+	const AS2_LAUNCH = "env -u PI_PROFILE -u PI_CODING_AGENT_DIR -u PI_CONFIG_DIR OMP_PROFILE=agent-system-2 omp";
+	const DEFAULT_LAUNCH = "env -u OMP_PROFILE -u PI_PROFILE -u PI_CODING_AGENT_DIR -u PI_CONFIG_DIR omp";
+	const HEALTH = (server: string) => `HTTP 401; current login health unknown until a live load: start \`${AS2_LAUNCH}\` and see whether ${server} loads`;
 	const LINEAR = (n: number) => `mcp-load: linear failed to load ${n} time(s) in the window in profile agent-system-2: ${HEALTH("linear")}`;
 	const ALL = w("2026-10-26T00:00:00.000Z", "2026-10-29T00:00:00.000Z");
 
@@ -441,27 +443,27 @@ describe("mcp-load", () => {
 		expect(fs.map((f) => [f.detector, f.summary, f.evidence])).toEqual([["mcp-load", MCP_LOAD_UNREADABLE, dir]]);
 	});
 
-	test("the default profile: its logs are read from ~/.omp/logs and a 401 says `env -u OMP_PROFILE omp`", async () => {
+	test("the default profile: its logs are read from ~/.omp/logs and a 401 says to start omp with OMP_PROFILE and every fallback cleared", async () => {
 		const x = world({ profile: "default", ompLogs: { "omp.2026-10-28.38384.log": [POSTHOG_401] } });
 		const fs = await x.run(ALL);
 		expect(fs.map((f) => [f.summary, f.evidence])).toEqual([[
-			"mcp-load: posthog failed to load 1 time(s) in the window in profile default: HTTP 401; current login health unknown until a live load: start `env -u OMP_PROFILE omp` and see whether posthog loads",
+			`mcp-load: posthog failed to load 1 time(s) in the window in profile default: HTTP 401; current login health unknown until a live load: start \`${DEFAULT_LAUNCH}\` and see whether posthog loads`,
 			`${join(x.home, ".omp", "logs", "omp.2026-10-28.38384.log")}:1`,
 		]]);
 	});
 
-	test("a named profile: its logs are read from ~/.omp/profiles/<name>/logs and a 401 says `OMP_PROFILE=<name> omp`", async () => {
+	test("a named profile: its logs are read from ~/.omp/profiles/<name>/logs and a 401 says to start omp with OMP_PROFILE=<name> and every fallback cleared", async () => {
 		const x = world({ profile: "scratch-lab", ompLogs: { "omp.2026-10-28.38384.log": [POSTHOG_401] } });
 		const fs = await x.run(ALL);
 		expect(fs.map((f) => [f.summary, f.evidence])).toEqual([[
-			"mcp-load: posthog failed to load 1 time(s) in the window in profile scratch-lab: HTTP 401; current login health unknown until a live load: start `OMP_PROFILE=scratch-lab omp` and see whether posthog loads",
+			"mcp-load: posthog failed to load 1 time(s) in the window in profile scratch-lab: HTTP 401; current login health unknown until a live load: start `env -u PI_PROFILE -u PI_CODING_AGENT_DIR -u PI_CONFIG_DIR OMP_PROFILE=scratch-lab omp` and see whether posthog loads",
 			`${join(x.home, ".omp", "profiles", "scratch-lab", "logs", "omp.2026-10-28.38384.log")}:1`,
 		]]);
 	});
 
 	test("ompLaunch: empty and `default` are the default profile; any other name is set", () => {
 		expect([ompLaunch("default"), ompLaunch(""), ompLaunch(" default "), ompLaunch("agent-system-2")]).toEqual([
-			"env -u OMP_PROFILE omp", "env -u OMP_PROFILE omp", "env -u OMP_PROFILE omp", "OMP_PROFILE=agent-system-2 omp",
+			DEFAULT_LAUNCH, DEFAULT_LAUNCH, DEFAULT_LAUNCH, AS2_LAUNCH,
 		]);
 	});
 });

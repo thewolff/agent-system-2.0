@@ -353,9 +353,14 @@ export function isDefaultOmpProfile(profile: string): boolean {
 	return p === "" || p === "default";
 }
 
-/** The command that starts OMP in `profile`: the default profile with OMP_PROFILE cleared, any other with it set. */
+/** The variables besides OMP_PROFILE that pick OMP's profile or agent dir (pi-utils dirs.ts): PI_PROFILE is OMP_PROFILE's fallback. */
+const OMP_DIR_ENV_CLEARS = "-u PI_PROFILE -u PI_CODING_AGENT_DIR -u PI_CONFIG_DIR";
+
+/** The command that starts OMP in `profile` whatever the caller's environment: OMP_PROFILE cleared for the default profile and set for any other, and every other profile or agent-dir variable cleared. */
 export function ompLaunch(profile: string): string {
-	return isDefaultOmpProfile(profile) ? "env -u OMP_PROFILE omp" : `OMP_PROFILE=${profile.trim()} omp`;
+	return isDefaultOmpProfile(profile)
+		? `env -u OMP_PROFILE ${OMP_DIR_ENV_CLEARS} omp`
+		: `env ${OMP_DIR_ENV_CLEARS} OMP_PROFILE=${profile.trim()} omp`;
 }
 
 /** The summary of the one finding unreadable OMP logs give. */
