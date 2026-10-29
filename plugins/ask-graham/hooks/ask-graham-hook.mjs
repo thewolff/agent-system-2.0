@@ -8,7 +8,9 @@
 // only at every-idea, emits NUDGE as additionalContext. At ask it prints nothing.
 //
 // Whether a message is a new idea is left to the agent: the nudge says what does not count
-// (a ticket, a bug, a task in an existing project) and to ignore it otherwise.
+// (a ticket, a bug, a task in an existing project), that a project task creating a new table, a new
+// column on an existing table, a new top-level module, or a new service gets the structure check
+// instead, and to ignore it otherwise.
 //
 // FAIL-OPEN, BUT NOT FAIL-SILENT. Every path exits 0, so a broken hook never blocks a prompt. An
 // unexpected error says so in one line, because a silent failure reads exactly like level ask.
