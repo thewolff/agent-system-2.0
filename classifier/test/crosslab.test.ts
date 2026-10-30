@@ -2625,7 +2625,7 @@ describe("Anthropic-out reviews on the current OpenAI lane", () => {
 	});
 
 	test("exact expiry restores ordinary Anthropic routing and builds stay lane-lab restricted", async () => {
-		// timing-under-test: date boundary restores ordinary review routing (fake clock: now)
+		// Date-boundary behavior uses the injected now value, never elapsed wall time.
 		for (const now of [END - 1, END, END + 1]) {
 			const w = codexWorld();
 			const h = lane(w, { now: () => now, laneModel: SOL });
@@ -2663,7 +2663,7 @@ describe("Anthropic-out reviews on the current OpenAI lane", () => {
 	});
 
 	test("production preflight before expiry rechecks ordinary policy at spawn", async () => {
-		// timing-under-test: a production preflight crosses expiry before spawn (fake clock: now)
+		// Move the injected now value across expiry between preflight and spawn.
 		let now = ACTIVE;
 		const w = codexWorld("production");
 		const h = lane(w, { now: () => now, laneModel: SOL });
@@ -2701,7 +2701,7 @@ describe("Anthropic-out reviews on the current OpenAI lane", () => {
 	for (const stakes of ["normal", "production"] as const) {
 		for (const boundary of ["credentials-await", "spawn-transaction"] as const) {
 			test(`${stakes}: expiry during ${boundary} refuses stale policy, then a fresh post-expiry dispatch admits Anthropic`, async () => {
-				// timing-under-test: authorization expires during spawn admission (fake clock: now)
+				// Move the injected now value across expiry at the admission boundary.
 				let now = ACTIVE;
 				const w = codexWorld(stakes);
 				const h = lane(w, { now: () => now, laneModel: SOL });

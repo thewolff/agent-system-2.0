@@ -368,7 +368,7 @@ describe("panel dispatch", () => {
 		const saved = process.env.AS2_HEADROOM_POLLS;
 		try {
 			const w = world();
-			// timing-under-test: quota freshness selects the next usable synthesis lab (fake clock: now)
+			// One injected now value drives both quota freshness and the fixture poll.
 			const now = Date.parse("2026-11-01T00:00:00-07:00");
 			const h = lane(w, w.ledger, { now: () => now });
 			h.laneMessage(OPUS); // anthropic built: openai is the first non-builder lab in row order

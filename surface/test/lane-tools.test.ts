@@ -959,7 +959,7 @@ describe("plan review (PLAN D8): the plan question waits for a review by another
 	});
 
 	test("a valid pre-expiry Anthropic-out receipt remains admissible after the rule expires", async () => {
-		// timing-under-test: completed review evidence survives rule expiry (fake clock: setSystemTime)
+		// setSystemTime drives both review instants; no elapsed wall-time dependency.
 		setSystemTime(new Date("2026-10-31T05:59:00-07:00"));
 		const { ledger, wl, planId, ask } = await planFixture();
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: laneBuilderBody("openai", "lane-t-1", OTHER_LAB) });

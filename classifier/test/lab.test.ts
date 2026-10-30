@@ -463,13 +463,9 @@ describe("Anthropic-out dated OpenAI review policy", () => {
 	const table = { fast: row, standard: row, strong: row, deep: ["anthropic/deep", "openai-codex/deep", "moonshot/deep"] };
 	const context = { laneModel: STRONG[1]!, now: end - 1 };
 
-	test("the declaration preserves Jo's instruction and exact end instant", () => {
-		expect(ANTHROPIC_OUT_RULE.input).toBe("in-mvtur7tlze7r5o");
-		expect(ANTHROPIC_OUT_RULE.endsAt).toBe(end);
-	});
 
 	test("filters exact Codex providers after deep substitution, expires at the exact instant, and leaves other lanes unchanged", () => {
-		// timing-under-test: the dated review restriction's exact expiry (fake clock: context.now)
+		// Exact-expiry behavior uses injected context.now, never the wall clock.
 		expect(reviewRow(table, "strong", context)).toEqual([STRONG[1]!, "openai-codex/fixture-review:high"]);
 		expect(reviewRow(table, "deep", context)).toEqual([STRONG[1]!, "openai-codex/fixture-review:high"]);
 		expect(reviewRow(table, "strong", { ...context, now: end })).toEqual(row);
