@@ -14,7 +14,7 @@ The installer checks only for `bun`. Everything else below is needed at run time
 | **git** | Lanes work in git worktrees and push branches | |
 | **GitHub CLI (`gh`), logged in** | A workload close pushes the lane branch and makes sure a PR exists through `gh`; the test runner reads PRs with `gh pr list -R <owner/repo>` | Not checked anywhere ([MIGRATION.md](../MIGRATION.md) item 17). Lanes push to the repository's `origin`, so work on repositories you can push to |
 | **`sqlite3` CLI** | `install/as2test-setup.sh --undo` reads the runner lock with it; `install/fresh-machine-test.sh` inspects the ledger with it | Ships with macOS at `/usr/bin/sqlite3`. The ledger itself is written only through Bun |
-| **ctx** (optional) | A local agent-history search tool. The installer registers the profile's session directory as a ctx history root, and `profile/mcp.json` starts `ctx mcp serve` as an MCP server | Without `ctx` on PATH the installer prints a notice and skips the registration; the rest runs |
+| **ctx** (optional, except for `--train-tick`) | A local agent-history search tool. The installer registers the profile's session directory as a ctx history root, and `profile/mcp.json` starts `ctx mcp serve` as an MCP server | Without `ctx` on PATH the installer prints a notice and skips the registration; the rest runs. `--train-tick` requires it: the lanes the tick launches inherit the tick's PATH and need ctx for that MCP server and their history index, so without ctx the flag is refused with exit 2 |
 
 ### Provider accounts
 
