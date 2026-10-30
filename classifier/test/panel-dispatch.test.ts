@@ -15,9 +15,9 @@ import { createClassifierExtension } from "../extension";
 import { loadCalibration } from "../src/classify";
 import { parseHandSpawn } from "../src/lab";
 import { countRounds } from "../src/rounds";
-import { tierTableFromConfig } from "../src/tier-table";
+import { tierTableFromConfig, type TierTable } from "../src/tier-table";
 import { SURFACE_BY } from "../../surface/src/types";
-import { dist, fakeRegistry, recordedQuestion } from "./helpers";
+import { currentModel, dist, fakeRegistry, recordedQuestion } from "./helpers";
 
 const ROWS = {
 	fast: ["anthropic/claude-haiku-5-5", "openai-codex/gpt-5.6-luna", "moonshot/kimi-k2.7-code-highspeed"],
@@ -113,14 +113,14 @@ type Reply = { block?: boolean; reason?: string; input?: Item & { tasks: Item[];
  * One lane process (crosslab.test.ts `lane`): a fixed fingerprint, since the lane's cwd is no
  * repository here. `ledger`: the ledger this process writes through (default the world's).
  */
-function lane(w: World, ledger: Ledger = w.ledger) {
+function lane(w: World, ledger: Ledger = w.ledger, opts: { laneModel?: string; now?: () => number; table?: TierTable } = {}) {
 	const handlers: Record<string, Handler> = {};
 	const handSession: Record<string, Handler> = {};
 	const starts: Handler[] = [];
 	const logs: string[] = [];
 	const extension = createClassifierExtension({
 		judge: async () => JUDGE as never,
-		tierTable: () => TABLE,
+		tierTable: () => opts.table ?? TABLE,
 		disabledProviders: async () => [],
 		question: recordedQuestion(),
 		calibration: loadCalibration(),
@@ -129,6 +129,7 @@ function lane(w: World, ledger: Ledger = w.ledger) {
 		boundWorkload: () => w.wl,
 		log: line => logs.push(line),
 		fingerprint: () => "same",
+		now: opts.now ?? (() => Date.parse("2026-11-01T00:00:00-07:00")),
 	});
 	extension({
 		on: (name: string, h: Handler) => {
@@ -137,7 +138,7 @@ function lane(w: World, ledger: Ledger = w.ledger) {
 		},
 	} as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
-	const ctx = { cwd: w.dir, modelRegistry: w.registry, sessionManager: { getSessionFile: () => w.laneFile } };
+	const ctx = { cwd: w.dir, modelRegistry: w.registry, model: currentModel(opts.laneModel), sessionManager: { getSessionFile: () => w.laneFile } };
 	const handCtx = (agentId: string) => ({ ...ctx, sessionManager: { getSessionFile: () => `${w.root}/${agentId}.jsonl` } });
 	const assistant = (selector: string) => {
 		const [provider, ...model] = selector.split("/");
@@ -145,6 +146,7 @@ function lane(w: World, ledger: Ledger = w.ledger) {
 	};
 	return {
 		logs,
+		setLaneModel: (selector: string) => void (ctx.model = currentModel(selector)),
 		/** OMP starts (or resumes) the lane's session: every `session_start` handler, in order. */
 		sessionStart: async () => {
 			for (const h of starts) await h({ type: "session_start" }, ctx);
@@ -236,7 +238,8 @@ function legFiles(w: World, agentId: string, reads: string, output: string) {
 async function panel(h: Lane, w: World, run: string, toolCallId = "p1") {
 	const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change", `panel: ${run}`) }, toolCallId);
 	const spawns: Record<string, Reply> = {};
-	for (const t of out?.input?.tasks ?? []) spawns[t.name] = await h.spawn(t.agent, t.name);
+	const items = out?.input ? out.input.tasks ?? [out.input] : [];
+	for (const t of items) spawns[t.name] = await h.spawn(t.agent, t.name);
 	return { out, spawns };
 }
 
@@ -365,13 +368,14 @@ describe("panel dispatch", () => {
 		const saved = process.env.AS2_HEADROOM_POLLS;
 		try {
 			const w = world();
-			const h = lane(w);
+			// timing-under-test: quota freshness selects the next usable synthesis lab (fake clock: now)
+			const now = Date.parse("2026-11-01T00:00:00-07:00");
+			const h = lane(w, w.ledger, { now: () => now });
 			h.laneMessage(OPUS); // anthropic built: openai is the first non-builder lab in row order
 			const run = stagingRun(w);
 			await panel(h, w, run);
 			settleAll(h, w);
 			// The quota watcher's newest poll: openai-codex's 5h window at 0.85 (over the 80 % ceiling), resetting in 4.9 h.
-			const now = Date.now();
 			const limits = [{ provider: "openai-codex", windowId: "5h", tier: null, resetsAt: now + 4.9 * 3_600_000, usedFraction: 0.85 }];
 			const polls = join(w.dir, "polls.jsonl");
 			writeFileSync(polls, `${JSON.stringify({ t: (now - 60_000) / 1000, rows: {}, limits })}\n`);
@@ -533,5 +537,79 @@ describe("panel dispatch", () => {
 		const { w, pg, pdir } = await lostSynthesis(body => /^panel-synth: \S+ \S+ landed /.test(body), "entry");
 		expect(readFileSync(join(pdir, "out", "report.json"), "utf8")).toBe(SYNTH_REPORT); // written, never recorded
 		await resumed(w, pg, pdir);
+	});
+});
+
+describe("Anthropic-out panel consumers", () => {
+	const active = () => Date.parse("2026-10-30T12:00:00-07:00");
+	const nonCodex = "openai/fixture-review";
+	const mixedTable = tierTableFromConfig({ task: { agentModelOverrides: { ...ROWS, strong: [...ROWS.strong, nonCodex] } } });
+
+	test("leg planning and spawn expose only Codex, with excluded labs explicitly missing", async () => {
+		const w = world();
+		w.creds.push(nonCodex);
+		w.registry = fakeRegistry([...ALL, nonCodex], w.creds);
+		const h = lane(w, w.ledger, { laneModel: SOL, now: active, table: mixedTable });
+		h.laneMessage(SOL);
+		const { out, spawns } = await panel(h, w, stagingRun(w));
+		expect(out?.input?.name).toBe("sl-x--openai");
+		expect(spawns["sl-x--openai"]?.model).toEqual([SOL]);
+		const { pg } = group(w);
+		expect(bodies(w, `panel-leg: ${pg} anthropic missing`)).toHaveLength(1);
+		expect(bodies(w, `panel-leg: ${pg} kimi missing`)).toHaveLength(1);
+		h.handMessage("sl-x--openai", nonCodex);
+		expect(h.results("p1", [{ id: "sl-x--openai", agent: "deep", model: nonCodex, output: "{}" }])?.isError).toBe(true);
+		expect(w.ledger.routings(w.wl).at(-1)).toMatchObject({ models: JSON.stringify([SOL]), outcome: "refused-out-of-row" });
+	});
+
+	test("synthesis planning after a lane switch ignores the usable non-Codex labs and records Codex-only spawn and settle allowlist", async () => {
+		const w = world();
+		w.creds.push(nonCodex);
+		w.registry = fakeRegistry([...ALL, nonCodex], w.creds);
+		const h = lane(w, w.ledger, { laneModel: OPUS, now: active, table: mixedTable });
+		h.laneMessage(OPUS);
+		const run = stagingRun(w);
+		await panel(h, w, run);
+		settleAll(h, w);
+		h.setLaneModel(SOL);
+		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review: synthesise the panel", `panel-synth: ${run}`) }, "s1");
+		expect(out?.input?.name).toBe("sl-x--synth");
+		expect((await h.spawn(out!.input!.agent, "sl-x--synth"))?.model).toEqual([SOL]);
+		h.handMessage("sl-x--synth", K3);
+		expect(h.results("s1", [{ id: "sl-x--synth", agent: "deep", model: K3, output: "{}" }])?.isError).toBe(true);
+		expect(w.ledger.routings(w.wl).at(-1)).toMatchObject({ models: JSON.stringify([SOL]), outcome: "refused-out-of-row" });
+	});
+
+	test("Anthropic and Kimi pins published before an OpenAI lane switch refuse instead of substituting Codex", async () => {
+		const w = world();
+		const h = lane(w, w.ledger, { laneModel: OPUS, now: active });
+		h.laneMessage(OPUS);
+		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change", `panel: ${stagingRun(w)}`) });
+		expect(out?.input?.tasks).toHaveLength(3);
+		h.setLaneModel(SOL);
+		for (const lab of ["anthropic", "kimi"]) {
+			const spawn = await h.spawn("deep", `sl-x--${lab}`);
+			expect(spawn?.block).toBe(true);
+			expect(spawn?.reason).toContain("no other lab is substituted");
+		}
+		expect((await h.spawn("deep", "sl-x--openai"))?.model).toEqual([SOL]);
+		expect(w.ledger.questions(w.wl)).toEqual([]);
+	});
+
+	test("a synthesis pin published on Anthropic refuses after switching to OpenAI", async () => {
+		const w = world();
+		const h = lane(w, w.ledger, { laneModel: OPUS, now: active });
+		h.laneMessage(OPUS);
+		const run = stagingRun(w);
+		await panel(h, w, run);
+		settleAll(h, w);
+		down(w, SOL, K3); // synthesis must be published with its Anthropic pin
+		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review: synthesise the panel", `panel-synth: ${run}`) });
+		expect(out?.block).toBeUndefined();
+		w.creds.push(SOL, K3);
+		h.setLaneModel(SOL);
+		const spawn = await h.spawn(out!.input!.agent, "sl-x--synth");
+		expect(spawn?.block).toBe(true);
+		expect(spawn?.reason).toContain("no other lab is substituted");
 	});
 });
