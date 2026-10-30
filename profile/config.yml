@@ -207,8 +207,17 @@ retry:
 # classifier keeps only the usable entries of the classified, capped tier's row whose lab is the lab
 # of the lane's current model, falls back only between those, and refuses the dispatch when none is
 # usable; it never falls to another lab's entry. It refuses a task result from a hand that ran
-# outside the entries it was given (classifier/extension.ts). Reviews still take the other labs'
-# entries of the row, in this order (below, and SPEC-2.0.md § B4).
+# outside the entries it was given (classifier/extension.ts).
+# Reviews normally take other labs' entries of the tier row (below, and SPEC-2.0.md § B4).
+# Temporary dated exception (Jo, 2026-10-29, input in-mvtur7tlze7r5o): until
+# 2026-10-31T06:00:00-07:00 (Saturday, 6 AM PDT), an OpenAI lane's review uses only
+# openai-codex entries from its review row, even when the workload has mixed Anthropic and
+# OpenAI builder history. It runs same-lab; there is no cross-lab park for this exception.
+# If no usable Codex entry remains, refuse visibly rather than widening to another provider.
+# At the exact end instant the exception is inactive and prior review routing resumes
+# automatically; builds continue to follow the lane lab throughout. Running classifier
+# processes must restart to load the code change. Deep review OpenAI substitution remains
+# the strong-row rule below; no tier selector is changed.
 # Row 1 of each tier is the ruled Anthropic pin (SPEC-2.0.md § A1.3; .omp/agents/*.md:4). Rows 2-3
 # (openai-codex, moonshot) are the same tier on the other providers, approved as written by Jo
 # 2026-09-28. Standard's row 1 is anthropic/claude-sonnet-5-5 (Jo, 2026-09-29). Row 3 moved from
@@ -232,11 +241,10 @@ task:
     strong:
       - anthropic/claude-opus-5-5
       - openai-codex/gpt-6.1-sol
-    # deep's OpenAI entry is not used for reviews: classifier/src/lab.ts REVIEW_ROW_FROM sends a
-    # deep review's OpenAI reviewer to the strong row via reviewRow (Jo, 2026-10-12,
-    # in-mv5qfm8910ycjk), until the review-cost framework workload lands or Jo says otherwise. The
-    # strong row's OpenAI entry is gpt-6.1-sol (Jo, 2026-10-14, in-mv8qzqym1ihmv4: it replaced
-    # gpt-6-sol), so those reviews run gpt-6.1-sol.
+    # Deep reviews substitute the OpenAI reviewer from this strong row (Jo, 2026-10-12,
+    # in-mv5qfm8910ycjk), until the review-cost framework workload lands or Jo says otherwise.
+    # The strong-row entry is gpt-6.1-sol (Jo, 2026-10-14, in-mv8qzqym1ihmv4: it replaced
+    # gpt-6-sol). The dated Anthropic-out restriction does not change this substitution.
     # Non-review deep spawns take their lane lab's entry of this row (an OpenAI lane's deep build runs
     # gpt-6-astra). The row itself is unchanged: naming gpt-6.1-sol here would
     # put one model in two tiers, which classifier/src/tier-table.ts refuses (MIGRATION.md item 110).

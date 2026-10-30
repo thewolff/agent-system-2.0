@@ -39,7 +39,7 @@
 //  5. Alerts (D9). Each question on a train slice is an alert: the production merge question the lane raises and the failed-twice
 //     question of step 2. The send ladder (`trainAlertActions`): level 1 files an issue on TRAIN_ALERT_REPO labelled as2-train;
 //     4 h and 8 h after it, while the question is open and the issue is not closed, a comment mentioning @thewolff, the `loud`
-//     (then also `critical`) label, a macOS notification with sound, and the LOUD needs-you line (surface/src/errors.ts). Each send
+//     (then also `critical`) label, a silent macOS notification, and the LOUD needs-you line (surface/src/errors.ts). Each send
 //     writes `train-alert: <q> level <n> sending`, does its effects (the issue body and each comment carry a marker the tick looks
 //     for before creating one, and again after a failed create before anything is retried, adopting an issue the failed call filed;
 //     only a missing label is retried, once, after the label is created; labels are only added, never removed; the notification
@@ -129,7 +129,7 @@ export interface TickDeps {
 	gh: (args: string[], timeoutMs?: number) => GhResult;
 	/** `lane.ts launch <wl> --requested-by merge-train`: its exit code and last line. */
 	launch: (wl: string) => { code: number; line: string };
-	/** A macOS notification with sound; false when it could not be shown. */
+	/** A silent macOS notification; false when it could not be shown. */
 	notify: (title: string, text: string) => boolean;
 	/** The test runner's served repositories (`testRunner.repos`, profile/config.yml): only their PRs board (D1); none, nothing boards. */
 	config?: Pick<TestRunnerConfig, "repos">;
@@ -1519,10 +1519,10 @@ function realRoot(): ControlRoot {
 	return { root, head, modified, current, currentHead: current === null ? null : git(current, ["rev-parse", "HEAD"]), repo: ownerRepoOf(origin)?.toLowerCase() ?? null };
 }
 
-/** `osascript -e 'display notification … sound name "Glass"'`. */
+/** No sound clause: train popups stay silent under Jo's silent-popup alarm rule. */
 function realNotify(title: string, text: string): boolean {
 	const str = (s: string) => `"${s.replace(/[\\"]/g, (c) => `\\${c}`)}"`;
-	const r = Bun.spawnSync(["osascript", "-e", `display notification ${str(text)} with title ${str(title)} sound name "Glass"`], { stdout: "pipe", stderr: "pipe", timeout: 10_000 });
+	const r = Bun.spawnSync(["osascript", "-e", `display notification ${str(text)} with title ${str(title)}`], { stdout: "pipe", stderr: "pipe", timeout: 10_000 });
 	return r.exitCode === 0;
 }
 

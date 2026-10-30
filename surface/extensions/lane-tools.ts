@@ -169,7 +169,7 @@ function planUnchanged(control: readonly ControlEntry[], questionId: string, bod
  * its `hand-settled:` token has no `review-withheld:`, and every model that answered is on a lab
  * outside `builderLabs` computed now (no live set: an in-flight hand counts every lab of its row), or
  * its token ran same-lab (`sameLabTokens`: Jo's same-lab answer to a `review-park:` question of this
- * slice, or Jo's Kimi-out rule); (3) was created after the newest earlier question on the plan slice was
+ * slice, or Jo's Kimi-out or dated Anthropic-out rule); (3) was created after the newest earlier question on the plan slice was
  * raised and resolved (an open one clears nothing). A `review-limit:` question Jo answered `accept`
  * does not reset (3) to its own resolution; when the newest one raised since that resolution
  * exists, the plan clears only on the rows of the round that hit its limit (check 2 still applying)
@@ -230,7 +230,8 @@ const HEADROOM_SKIP = /^headroom-skip: \S+ token (\S+)(?: |$)/;
  * PLAN wl-mv5xay6bjp0268 § 2.6 [r2-M1]: the review tokens on the plan slice `planId` that ran same-lab
  * by right. The entry that lets a token run is either a `review-same-lab: <grant> token <dt>` spend
  * whose grant `joGrant` accepts, or a `review-same-lab-rule: … slice <planId> token <dt> …` entry
- * (Jo's Kimi-out rule); it counts only when the next entry in the workload's order, past an unbroken
+ * (Jo's Kimi-out or dated Anthropic-out rule). The authorization entry itself must be on the plan
+ * slice; it counts only when the next entry in the workload's order, past an unbroken
  * run of that token's `headroom-skip:` rows on the plan slice by the same writer (#228), is that
  * token's `hand-spawn:` on the plan slice by the same writer, what the classifier's `recordSpawn`
  * writes in one transaction. A spend or rule line standing alone, or followed by another writer's
@@ -240,7 +241,7 @@ function sameLabTokens(entries: readonly EntryRow[], planId: string, joGrant: (g
 	const out = new Set<string>();
 	const mine = (x: EntryRow | undefined, e: EntryRow): x is EntryRow => x?.kind === "assumption" && x.created_by === e.created_by && x.slice_id === planId;
 	entries.forEach((e, at) => {
-		if (e.kind !== "assumption") return;
+		if (e.kind !== "assumption" || e.slice_id !== planId) return;
 		const rule = parseReviewSameLabRule(e.body);
 		const spend = rule ? undefined : [...spentGrants([e])][0];
 		const token = rule ? (rule.slice === planId ? rule.token : null) : spend && joGrant(spend[0]) ? spend[1] : null;
