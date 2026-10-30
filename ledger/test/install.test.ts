@@ -13,6 +13,8 @@
 // And --daily-report (wl-mvbcjageg7o2yo R14), against the same fake launchctl: the job's plist lints, runs
 // surface/scripts/daily-report.ts at 07:00 with the profile in its environment and is bootstrapped; its =off form
 // boots it out and deletes the plist before any install step and writes nothing else.
+// And --train-tick, against fake gh, omp and ctx in a PATH built by the test: ctx's directory is in the tick's PATH,
+// and without ctx the flag is refused with exit 2 and nothing written.
 // Installer runs never get the developer PATH (only `installPath`, fake launchctl first where needed), so none can reach a real herdr.
 // The fixture root is removed in afterAll only after every started test body completed; a failed run keeps it and prints its path.
 import { afterAll, beforeAll, describe, expect, test as bunTest } from "bun:test";
@@ -676,6 +678,64 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 			expect(r.exitCode).toBe(2);
 		}
 		expect(tree(home)).toEqual([]);
+	});
+
+	// The lanes the tick launches inherit the plist's PATH, so the ctx MCP server in profile/mcp.json and the
+	// exit-time ctx index find `ctx` only when its directory is on it. Every tool is a fake in a directory of its own,
+	// and the run's PATH is built here, so neither a real ctx nor a real herdr leaks in from the developer's PATH.
+	/** Fakes for gh (logged in), omp and, unless `withCtx` is false, ctx; returns the run's PATH, ctx's directory and the fake launchctl's calls. */
+	function tickTools(name: string, withCtx: boolean): { path: string; ctxDir: string; launchctlCalls: () => string[] } {
+		const dir = join(root, `train-tick-${name}`);
+		const tools = join(dir, "tools");
+		const ctxDir = join(dir, "ctx-bin");
+		mkdirSync(tools, { recursive: true });
+		mkdirSync(ctxDir, { recursive: true });
+		for (const tool of ["gh", "omp"]) {
+			writeFileSync(join(tools, tool), "#!/bin/bash\nexit 0\n");
+			chmodSync(join(tools, tool), 0o755);
+		}
+		if (withCtx) {
+			writeFileSync(join(ctxDir, "ctx"), "#!/bin/bash\nprintf '%s\\n' \"fake ctx $*\"\n");
+			chmodSync(join(ctxDir, "ctx"), 0o755);
+		}
+		const launchctl = fakeLaunchctl(`train-tick-${name}`, false);
+		// bun alone, from the beforeAll's herdr- and ctx-free bin directory.
+		const path = `${launchctl.bin}:${tools}:${join(root, "bin")}:${ctxDir}:/usr/bin:/bin:/usr/sbin:/sbin`;
+		expect(Bun.which("herdr", { PATH: path })).toBeNull();
+		expect(Bun.which("ctx", { PATH: path })).toBe(withCtx ? join(ctxDir, "ctx") : null);
+		return { path, ctxDir, launchctlCalls: launchctl.calls };
+	}
+
+	test.if(process.platform === "darwin")("--train-tick writes ctx's directory, resolved at install, into the tick's PATH", () => {
+		const home = join(root, "home-train-tick-ctx");
+		mkdirSync(home, { recursive: true });
+		const { path, ctxDir } = tickTools("ctx", true);
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--train-tick"], {
+			env: { PATH: path, HOME: home }, stdout: "pipe", stderr: "pipe",
+		});
+		const out = r.stdout.toString() + r.stderr.toString();
+		expect(out).toContain("train tick loaded");
+		expect(r.exitCode).toBe(0);
+		const plist = join(home, "Library", "LaunchAgents", "com.agent-system-2.train-tick.plist");
+		const job = JSON.parse(Bun.spawnSync(["/usr/bin/plutil", "-convert", "json", "-o", "-", plist]).stdout.toString());
+		const tickPath: string = job.EnvironmentVariables.PATH;
+		expect(tickPath.split(":")).toContain(ctxDir);
+		expect(Bun.which("ctx", { PATH: tickPath })).toBe(join(ctxDir, "ctx"));
+		expect(Bun.which("herdr", { PATH: tickPath })).toBeNull();
+	});
+
+	test.if(process.platform === "darwin")("--train-tick with no ctx on PATH is refused with exit 2, names ctx and writes nothing", () => {
+		const home = join(root, "home-train-tick-no-ctx");
+		mkdirSync(home, { recursive: true });
+		const { path, launchctlCalls } = tickTools("no-ctx", false);
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--train-tick"], {
+			env: { PATH: path, HOME: home }, stdout: "pipe", stderr: "pipe",
+		});
+		const out = r.stdout.toString() + r.stderr.toString();
+		expect(out).toContain("--train-tick: ctx not found on PATH; the train tick's PATH needs it");
+		expect(r.exitCode).toBe(2);
+		expect(tree(home)).toEqual([]);
+		expect(launchctlCalls()).toEqual([]);
 	});
 
 	// The daily self-heal report's job (PLAN wl-mvbcjageg7o2yo § 2.6, R14), copied from the --train-tick=off cases above.
