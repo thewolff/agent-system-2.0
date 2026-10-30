@@ -2,7 +2,7 @@
 title: OpenAI-lane reviews use only Codex entries until 6 AM PDT on October 31
 status: building
 workload: wl-mvtusij5mhwtnv
-pr: none
+pr: https://github.com/thewolff/agent-system-2.0/pull/410
 ---
 **The rule (Jo, 2026-10-29, input `in-mvtur7tlze7r5o`).** Until `2026-10-31T06:00:00-07:00` (Saturday, 6 AM PDT), reviews on the current OpenAI lane use only `openai-codex` entries in the review row. The restriction uses the lane's current lab, not the aggregate builder-lab history: it applies even when builders include both OpenAI and Anthropic. Such reviews run same-lab, with no cross-lab park question under this temporary exception. If no Codex entry is usable, refuse visibly; do not widen to Anthropic or another provider.
 
