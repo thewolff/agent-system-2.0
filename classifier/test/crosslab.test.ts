@@ -2512,3 +2512,218 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 		expect([...bodies(w, "headroom-skip:"), ...bodies(v, "headroom-skip:")]).toEqual([]);
 	});
 });
+
+describe("Anthropic-out reviews on the current OpenAI lane", () => {
+	const END = Date.parse("2026-10-31T06:00:00-07:00");
+	const ACTIVE = END - 60_000;
+	const NON_CODEX = "openai/fixture-review";
+	const table = tierTableFromConfig({ task: { agentModelOverrides: { ...ROWS, strong: [...ROWS.strong, NON_CODEX] } } });
+	const mixed = (w: World) => w.ledger.recordEntry({
+		by: "lane-test", workloadId: w.wl, kind: "assumption",
+		body: `builder-lab: anthropic hand dt-earlier-review model ${OPUS}`,
+	});
+	const codexWorld = (stakes: Stakes = "normal") => {
+		const w = world({ stakes, table });
+		w.creds.push(NON_CODEX);
+		w.registry = fakeRegistry([...ALL, NON_CODEX], w.creds);
+		return w;
+	};
+	const dispatch = (h: Lane, w: World, stakes: Stakes, name = "sl-x") =>
+		h.toolCall({ agent: "strong", name, task: brief(w, "review the change", stakes) });
+	const one = (out: Reply) => {
+		expect(out?.block).toBeUndefined();
+		const items = out!.input!.tasks ?? [out!.input!];
+		expect(items).toHaveLength(1);
+		return items[0]!;
+	};
+
+	for (const stakes of ["normal", "production"] as const) {
+		for (const history of ["openai-only", "mixed", "granted"] as const) {
+			test(`${stakes}: ${history} history uses only Codex even with every other provider usable`, async () => {
+				const w = codexWorld(stakes);
+				if (history !== "openai-only") mixed(w);
+				if (history === "granted") {
+					const q = w.ledger.raiseQuestion({ by: "lane-test", workloadId: w.wl, sliceId: "sl-x", body: "Review same-lab?", options: ["same-lab", "wait"] });
+					w.ledger.recordEntry({ by: "lane-test", workloadId: w.wl, sliceId: "sl-x", kind: "assumption", body: `review-park: ${q} slice sl-x` });
+					w.ledger.answerQuestion(q, { by: SURFACE_BY, author: JO_HOLDER, answer: "same-lab", channel: "surface" });
+				}
+				const h = lane(w, { now: () => ACTIVE, laneModel: SOL });
+				const item = one(await dispatch(h, w, stakes));
+				const spawn = await h.spawn(item.agent, item.name);
+				expect(spawn?.model).toEqual([SOL]);
+				expect(spawn?.note).toContain("in-mvtur7tlze7r5o");
+				expect(spawn?.note).not.toContain("kimi leg missing");
+				const entries = w.ledger.entries(w.wl);
+				const at = entries.findIndex(e => e.body.startsWith("review-same-lab-rule: in-mvtur7tlze7r5o"));
+				expect(at).toBeGreaterThanOrEqual(0);
+				expect(entries[at]!.body).toContain("labs openai anthropic-out until 2026-10-31T06:00:00-07:00");
+				expect(entries[at + 1]!.body).toStartWith("hand-spawn:");
+				expect(entries[at + 1]!.created_by).toBe(entries[at]!.created_by);
+				h.handMessage(item.name, SOL);
+				expect(h.results("call-1", [{ id: item.name, agent: item.agent, model: SOL }])?.isError).not.toBe(true);
+				expect(w.ledger.routings(w.wl).at(-1)?.models).toBe(JSON.stringify([SOL]));
+				expect(questions(w).filter(q => q.state === "open")).toEqual([]);
+				expect(bodies(w, "review-same-lab:")).toEqual([]);
+			});
+		}
+
+		for (const unavailable of ["absent-inventory", "absent-row", "credentials", "disabled", "refused", "quota"] as const) {
+			test(`${stakes}: ${unavailable} Codex fails visibly without widening or a cross-lab park`, async () => {
+				const w = codexWorld(stakes);
+				if (unavailable === "absent-inventory") w.registry = fakeRegistry(ALL.filter(m => !m.startsWith("openai-codex/")), w.creds);
+				if (unavailable === "absent-row") w.table = tierTableFromConfig({ task: { agentModelOverrides: { ...ROWS, strong: [OPUS, KIMI, NON_CODEX] } } });
+				if (unavailable === "credentials") down(w, SOL);
+				if (unavailable === "refused") w.ledger.recordEntry({ by: "lane-test", workloadId: w.wl, kind: "assumption", body: "provider-refused: openai-codex status 401 token dt-login" });
+				const saved = process.env.AS2_HEADROOM_POLLS;
+				try {
+					if (unavailable === "quota") {
+						const path = join(w.dir, "polls.jsonl");
+						writeFileSync(path, `${JSON.stringify({ t: (ACTIVE - 60_000) / 1000, rows: {}, limits: [{ provider: "openai-codex", windowId: "5h", tier: null, resetsAt: ACTIVE + 4.9 * 3_600_000, usedFraction: 0.85 }] })}\n`);
+						process.env.AS2_HEADROOM_POLLS = path;
+					}
+					const h = lane(w, { now: () => ACTIVE, laneModel: SOL, disabledProviders: unavailable === "disabled" ? ["openai-codex"] : [] });
+					const out = await dispatch(h, w, stakes);
+					const spawn = out?.block ? out : await h.spawn(one(out).agent, "sl-x");
+					expect(spawn?.block).toBe(true);
+					expect(spawn?.reason).toContain("Anthropic-out");
+					expect(spawn?.reason).toContain("Codex");
+					if (unavailable === "credentials") expect(spawn?.reason).toContain("no credentials");
+					if (unavailable === "disabled") expect(spawn?.reason).toContain("provider disabled");
+					if (unavailable === "refused") expect(spawn?.reason).toContain("status 401");
+					if (unavailable === "quota") expect(spawn?.reason).toContain("projected out");
+					expect(spawn?.model).toBeUndefined();
+					expect(bodies(w, "hand-spawn:")).toEqual([]);
+					expect(bodies(w, "review-same-lab-rule:")).toEqual([]);
+					expect(bodies(w, "review-park:")).toEqual([]);
+					expect(questions(w)).toEqual([]);
+				} finally {
+					if (saved === undefined) delete process.env.AS2_HEADROOM_POLLS;
+					else process.env.AS2_HEADROOM_POLLS = saved;
+				}
+			});
+		}
+	}
+
+	test("the settle allowlist rejects Anthropic and non-Codex OpenAI answers", async () => {
+		for (const rogue of [OPUS, KIMI, NON_CODEX]) {
+			const w = codexWorld();
+			const h = lane(w, { now: () => ACTIVE, laneModel: SOL });
+			expect((await reviewSpawn(h, w))?.model).toEqual([SOL]);
+			h.handMessage("sl-x", rogue);
+			expect(h.results("rev-1", [{ id: "sl-x", agent: "strong", model: rogue }])?.isError).toBe(true);
+			expect(w.ledger.routings(w.wl).at(-1)).toMatchObject({ outcome: "refused-out-of-row", models: JSON.stringify([SOL]) });
+		}
+	});
+
+	test("unknown builder provenance remains fail-closed under the dated rule", async () => {
+		const w = codexWorld();
+		w.ledger.recordEntry({ by: "lane-runner", workloadId: w.wl, kind: "assumption", body: 'lane-started: lane-unknown {"pid":2}' });
+		const h = lane(w, { now: () => ACTIVE, laneModel: SOL });
+		expect((await reviewSpawn(h, w))?.block).toBe(true);
+		expect(bodies(w, "hand-spawn:")).toEqual([]);
+		expect(bodies(w, "review-same-lab-rule:")).toEqual([]);
+	});
+
+	test("exact expiry restores ordinary Anthropic routing and builds stay lane-lab restricted", async () => {
+		// Date-boundary behavior uses the injected now value, never elapsed wall time.
+		for (const now of [END - 1, END, END + 1]) {
+			const w = codexWorld();
+			const h = lane(w, { now: () => now, laneModel: SOL });
+			const spawn = await reviewSpawn(h, w);
+			expect(spawn?.model).toEqual(now < END ? [SOL] : [OPUS, KIMI]);
+		}
+		for (const laneModel of [SOL, OPUS]) {
+			const w = codexWorld();
+			const h = lane(w, { now: () => ACTIVE, laneModel });
+			const out = await h.toolCall({ agent: "strong", name: "sl-work", task: brief(w, "change the code") });
+			expect((await h.spawn(out!.input!.agent, "sl-work"))?.model).toEqual(laneModel === SOL ? [SOL, NON_CODEX] : [OPUS]);
+		}
+	});
+
+	test("current lane scope wins over mixed builder history and model switches before spawn", async () => {
+		for (const switchToOpenai of [true, false]) {
+			const w = codexWorld();
+			mixed(w);
+			const h = lane(w, { now: () => ACTIVE, laneModel: switchToOpenai ? OPUS : SOL });
+			const item = one(await dispatch(h, w, "normal"));
+			h.setLaneModel(switchToOpenai ? SOL : OPUS);
+			expect((await h.spawn(item.agent, item.name))?.model).toEqual(switchToOpenai ? [SOL] : [KIMI]);
+		}
+	});
+
+	test("a production fan-out published on Anthropic cannot reuse its Kimi pin after an OpenAI lane switch", async () => {
+		const w = codexWorld("production");
+		const h = lane(w, { now: () => ACTIVE, laneModel: OPUS });
+		const out = await dispatch(h, w, "production");
+		expect(out!.input!.tasks.map(t => t.name)).toEqual(["sl-x--openai", "sl-x--kimi"]);
+		h.setLaneModel(SOL);
+		expect((await h.spawn("deep", "sl-x--kimi"))?.block).toBe(true);
+		expect((await h.spawn("deep", "sl-x--openai"))?.model).toEqual([SOL]);
+		expect(questions(w)).toEqual([]);
+	});
+
+	test("production preflight before expiry rechecks ordinary policy at spawn", async () => {
+		// Move the injected now value across expiry between preflight and spawn.
+		let now = ACTIVE;
+		const w = codexWorld("production");
+		const h = lane(w, { now: () => now, laneModel: SOL });
+		const item = one(await dispatch(h, w, "production"));
+		now = END;
+		expect((await h.spawn(item.agent, item.name))?.model).toEqual([FABLE, K3]);
+		expect(bodies(w, "review-same-lab-rule:")).toEqual([]);
+	});
+
+	test("dated same-lab authorization preserves read-only tools and fingerprint withholding", async () => {
+		const w = codexWorld();
+		const h = lane(w, { now: () => ACTIVE, laneModel: SOL });
+		expect((await reviewSpawn(h, w))?.model).toEqual([SOL]);
+		for (const tool of ["edit", "write", "ast_edit"]) expect((await h.handTool("sl-x", tool))?.block).toBe(true);
+		expect(await h.handTool("sl-x", "read")).toBeUndefined();
+		writeFileSync(join(w.repo, "a.txt"), "changed by the review\n");
+		h.handMessage("sl-x", SOL);
+		const result = h.results("rev-1", [{ id: "sl-x", agent: "strong", model: SOL }]);
+		expect(result?.isError).toBe(true);
+		expect(result?.content?.[0]?.text).toContain("the review changed the work");
+		expect(bodies(w, "review-withheld:")).toHaveLength(1);
+	});
+
+	test("dated same-lab authorization cannot bypass the review round limit", async () => {
+		const w = codexWorld();
+		roundsLimit(w, 1);
+		const h = lane(w, { now: () => ACTIVE, laneModel: SOL });
+		await reviewRound(h, w, "first", blocking("a blocking correctness finding"));
+		expect(questions(w).filter(q => q.options.includes("extend"))).toHaveLength(1);
+		expect((await dispatch(h, w, "normal"))?.block).toBe(true);
+		expect(bodies(w, "hand-spawn:")).toHaveLength(1);
+		expect(bodies(w, "review-same-lab-rule: in-mvtur7tlze7r5o")).toHaveLength(1);
+	});
+
+	for (const stakes of ["normal", "production"] as const) {
+		for (const boundary of ["credentials-await", "spawn-transaction"] as const) {
+			test(`${stakes}: expiry during ${boundary} refuses stale policy, then a fresh post-expiry dispatch admits Anthropic`, async () => {
+				// Move the injected now value across expiry at the admission boundary.
+				let now = ACTIVE;
+				const w = codexWorld(stakes);
+				const h = lane(w, { now: () => now, laneModel: SOL });
+				const item = one(await dispatch(h, w, stakes));
+				if (boundary === "credentials-await") {
+					const getApiKey = w.registry.getApiKey.bind(w.registry);
+					w.registry.getApiKey = async (m, s) => { now = END; return getApiKey(m, s); };
+				} else {
+					const write = w.ledger.write.bind(w.ledger);
+					w.ledger.write = ((fn: () => unknown) => { now = END; return write(fn); }) as Ledger["write"];
+				}
+				const spawn = await h.spawn(item.agent, item.name);
+				expect(spawn?.block).toBe(true);
+				expect(spawn?.reason).toContain("policy changed");
+				expect(bodies(w, "review-same-lab-rule:")).toEqual([]);
+				expect(bodies(w, "hand-spawn:")).toEqual([]);
+				expect(questions(w)).toEqual([]);
+				const out = await dispatch(h, w, stakes, "sl-y");
+				expect(out?.block).toBeUndefined();
+				const fresh = (out!.input!.tasks ?? [out!.input!])[0]!;
+				expect((await h.spawn(fresh.agent, fresh.name))?.model).toEqual(stakes === "normal" ? [OPUS, KIMI] : [FABLE]);
+			});
+		}
+	}
+});
