@@ -106,6 +106,15 @@
  * through `askJo` (PLAN wl-mvfkv7llkp7nk0 § 1): a park passes the R1–R5 verdict, which is false
  * wherever a park is reached, so the record asks exactly as before.
  *
+ * Anthropic-out (input in-mvtur7tlze7r5o, PLAN wl-mvtusij5mhwtnv): before 2026-10-31T06:00:00-07:00,
+ * reviews issued by a current OpenAI lane use only exact openai-codex review-row entries. This
+ * explicit same-lab authorization does not require Kimi to be down; mixed builder history and
+ * grants cannot widen it. Planning, panels and spawn filter before usability and allowlisting.
+ * Missing usable Codex fails without fallback or cross-lab park; unknown provenance stays fail-closed.
+ * Spawn checks the lane/date again after usability and inside its ledger transaction; changed policy
+ * refuses for redispatch, never writes a stale authorization. The adjacent review-same-lab-rule:
+ * receipt names this instruction and expiry, not Kimi. Builds and plan auto-start rules are unchanged.
+ *
  * Review round limit and stop (PLAN wl-mupu0sx2o046io D9/D10, MIGRATION.md follow-up 33; the pure
  * half is classifier/src/rounds.ts and classifier/src/review-stop.ts). Every review item's brief
  * gains the fixed `review-findings` paragraph. A production fan-out's whole membership is written
@@ -165,6 +174,8 @@ import { type Headroom, headroom } from "./src/headroom";
 import { askChoices, type ChoiceAnswer, type ChoiceJudge, type ChoiceQuestions, loadChoiceQuestions } from "./src/judge-ask";
 import {
 	type Builders,
+	ANTHROPIC_OUT_RULE,
+	anthropicOutRuleActive,
 	builderLabs,
 	builderRoles,
 	handBuilderBody,
@@ -187,6 +198,7 @@ import {
 	parseHandSpawn,
 	reviewParkBody,
 	type ReviewPlan,
+	type ReviewContext,
 	type ReviewPlanInput,
 	reviewPlan,
 	REVIEW_ROW_FROM,
@@ -306,7 +318,7 @@ export interface ClassifierDeps {
 	 * (classifier/src/fingerprint.ts `repoFingerprint` when absent). Throws when it cannot be taken.
 	 */
 	fingerprint?(cwd: string): string;
-	/** The clock Jo's Kimi-out rule is read on (`KIMI_OUT_RULE.endsAt`, ms since the epoch); `Date.now` when absent. */
+	/** Injected clock for dated review policies and quota checks (ms since the epoch); `Date.now` when absent. */
 	now?(): number;
 	/**
 	 * Lost-hand settle (PLAN wl-mv64rsqw2fcs1s D2, `handLost`): a `lane-started:` entry's omp pid against the start
@@ -558,8 +570,8 @@ function routingNote(routing: Pending["routing"] | null, tier: Tier, models: str
  * The routing note of a review whose row `reviewRow` rewrote (Jo, in-mv5qfm8910ycjk): one line per
  * lab whose entries it changed, unless `pin` keeps the hand on another lab.
  */
-function reviewRowNotes(table: TierTable, tier: Tier, pin: Lab | null): string[] {
-	const row = reviewRow(table, tier);
+function reviewRowNotes(table: TierTable, tier: Tier, pin: Lab | null, context?: ReviewContext): string[] {
+	const row = reviewRow(table, tier, context);
 	return (Object.entries(REVIEW_ROW_FROM) as [Lab, Tier][]).flatMap(([lab, from]) => {
 		if (pin !== null && pin !== lab) return [];
 		const of = (r: readonly string[]) => r.filter(s => labOf(s) === lab).join(",");
@@ -1200,7 +1212,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		if (tier === null || !rulingActive(deps.ledger(), "kimi-out", now)) return null;
 		const builders = buildersOf(workloadId);
 		if (builders.unknown.length > 0 || builders.labs.includes("kimi")) return null;
-		const row = reviewRow(deps.tierTable(), tier);
+		const row = reviewRow(deps.tierTable(), tier, { now, laneModel: liveCtx?.model ? `${liveCtx.model.provider}/${liveCtx.model.id}` : undefined });
 		if (row.some(s => labOf(s) === null)) return null;
 		const kimi = row.filter(s => labOf(s) === "kimi");
 		if (kimi.length === 0) return null;
@@ -1354,6 +1366,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			const stop = loopStop(entries, ledger.instructions(workloadId), workloadId, sliceId);
 			if (stop) {
 				log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review on a loop stopped by ${stop}; no park question`);
+				return;
+			}
+			if (anthropicOutRuleActive({ now: clock(), laneModel: liveCtx?.model ? `${liveCtx.model.provider}/${liveCtx.model.id}` : undefined })) {
+				log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review; Anthropic-out rule ${ANTHROPIC_OUT_RULE.input}: no cross-lab park; re-dispatch for the current OpenAI lane`);
 				return;
 			}
 			// Jo's Kimi-out rule (PLAN wl-mv5xay6bjp0268 § 2.2 site 4): no question; the re-dispatch's spawn decides same-lab.
@@ -1765,13 +1781,17 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		// Every panel hand is a review: it plans on `reviewRow` (Jo, in-mv5qfm8910ycjk). The legs and the
 		// synthesis lab are read with the refusals and the quota headroom the spawn applies (PLAN
 		// wl-mv71x5rwdu7eo0 § 3), so a lab the spawn would refuse is not picked when another can run.
-		const row = reviewRow(deps.tierTable(), c.routing.tier);
 		const disabled = new Set(await deps.disabledProviders(ctx));
+		const context = { now: clock(), laneModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined };
+		const row = reviewRow(deps.tierTable(), c.routing.tier, context);
 		live();
 		const now = clock();
 		const registry = ctx.modelRegistry as unknown as ModelAvailability;
 		const { usable, why } = await usableRow(row, registry, disabled, refusedProviders(ledger.entries(c.workloadId), now), null, headroom({ now }));
 		live();
+		if (anthropicOutRuleActive(context) !== anthropicOutRuleActive({ now: clock(), laneModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined })) {
+			return "review policy changed while checking panel usability; dispatch the panel again under the current policy";
+		}
 		const at = { workloadId: c.workloadId, by: deps.laneId };
 		if (field.field === "panel") {
 			const entries = ledger.entries(c.workloadId);
@@ -2454,13 +2474,20 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					// Jo's rule (in-mv5qfm8910ycjk): a review plans on `reviewRow`, not the tier row itself. A lab
 					// projected out of quota is not planned (PLAN wl-mv71x5rwdu7eo0 § 3); each member's spawn logs
 					// its `headroom-skip:` entries by its token, which exists only from publish on.
-					const row = reviewRow(deps.tierTable(), c.routing.tier);
 					const disabled = new Set(await deps.disabledProviders(ctx));
+					const context = { now: clock(), laneModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined };
+					const row = reviewRow(deps.tierTable(), c.routing.tier, context);
 					const registry = ctx.modelRegistry as unknown as ModelAvailability;
 					const { usable, why } = await usableRow(row, registry, disabled, refusedProviders(entries, clock()), null, headroom({ now: clock() }));
 					if (!attempt.live) throw retired();
-					const input = { row, usable, builders: buildersOf(c.workloadId), stakes: "production" as const, skipped: why };
+					if (anthropicOutRuleActive(context) !== anthropicOutRuleActive({ now: clock(), laneModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined })) {
+						return fail(`task ${c.index + 1}: review policy changed while checking usability; re-dispatch under the current policy`);
+					}
+					const input = { row, usable, context, builders: buildersOf(c.workloadId), stakes: "production" as const, skipped: why };
 					const plan = reviewPlan({ ...input, grant: false });
+					if (plan.kind === "park" && anthropicOutRuleActive(context) && input.builders.unknown.length === 0) {
+						return fail(`task ${c.index + 1}: Anthropic-out policy: no usable Codex review for ${c.sliceId}: ${plan.reasons.join(", ")}; no fallback or cross-lab park; re-dispatch after the missing prerequisite changes`);
+					}
 					// Jo's Kimi-out rule (PLAN wl-mv5xay6bjp0268 § 2.2 site 1): one hand, nothing written; its spawn decides same-lab.
 					if (plan.kind === "park" && (await kimiOutPlan(c.workloadId, input, c.routing.tier, registry, disabled, null))) {
 						if (!attempt.live) throw retired();
@@ -2710,9 +2737,14 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const laneModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 				const build = found?.review ? null : buildRow(table, tier, laneModel);
 				if (build && "error" in build) return refuse(refusedRow(`agent-system-2 classifier: ${build.error}`));
-				const row = build ? build.row : reviewRow(table, tier);
+				const context = { now: clock(), laneModel };
+				const outage = anthropicOutRuleActive(context);
+				const row = build ? build.row : reviewRow(table, tier, context);
 				const room = headroom({ now: clock() });
 				const { usable, why, skipped, projected: out, retained } = await usableRow(row, registry, disabled, providerRefused, spawnKey, room, build ? table[tier] : row);
+				if (found?.review && outage !== anthropicOutRuleActive({ now: clock(), laneModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined })) {
+					return refused(refusedRow("agent-system-2 classifier: review policy changed while checking usability; re-dispatch under the current policy"));
+				}
 				const retainedNotes = (models: readonly string[]) => models.flatMap(selector => retained[selector] ? [retained[selector]!] : []);
 				const pin = found?.lab ?? null;
 				projected = Object.entries(out).filter(([selector]) => pin === null || labOf(selector) === pin);
@@ -2757,10 +2789,14 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						if (held) return { held };
 						const entries = ledger.entries(hand.workloadId);
 						const entry = (body: string) => ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body });
+						if (hand.review && outage !== anthropicOutRuleActive({ now: clock(), laneModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined })) {
+							return { held: "review policy changed at spawn transaction; re-dispatch under the current policy" };
+						}
 						if (grant && spentGrants(entries).has(grant)) return "spent";
 						if (rule && !rulingActive(ledger, "kimi-out", clock())) return "expired";
 						if (grant) entry(reviewSameLabBody(grant, hand.token));
-						if (rule) entry(reviewSameLabRuleBody({ slice: hand.sliceId, token: hand.token, labs: rule.labs, kimi: rule.kimi }));
+						if (hand.review && outage) entry(reviewSameLabRuleBody({ slice: hand.sliceId, token: hand.token, labs: ["openai"], anthropicOut: true }));
+						else if (rule) entry(reviewSameLabRuleBody({ slice: hand.sliceId, token: hand.token, labs: rule.labs, kimi: rule.kimi }));
 						headroomSkips(hand.token, entry);
 						entry(handSpawnBody({ token: hand.token, root: root!, spawnKey, review: hand.review, group: hand.group, row: models.map(modelIdentity) }));
 						return "recorded";
@@ -2795,7 +2831,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					}
 					const recorded = recordSpawn(found, pin.models, null, null);
 					if (recorded !== "recorded") {
-						const held = recorded === "spent" ? "its grant was spent" : recorded.held;
+						const held = recorded === "spent" ? "its grant was spent" : recorded === "expired" ? "its rule expired" : recorded.held;
 						panelEnded(found, panel, `held ${held}`, log);
 						return refuse(`agent-system-2 classifier: ${held}`);
 					}
@@ -2818,7 +2854,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const ledger = deps.ledger();
 				const builders = buildersOf(review.workloadId);
 				const roles = builderRoles(ledger, review.workloadId, new Set(hands.filter(h => h.review).map(h => h.token)));
-				const planInput = { row, usable, builders, stakes: null, skipped: why, pin: review.lab ?? undefined };
+				const planInput = { row, usable, context, builders, stakes: null, skipped: why, pin: review.lab ?? undefined };
 				let grant = review.lab ? null : unspentGrant(ledger.entries(review.workloadId), ledger.instructions(review.workloadId), review.sliceId);
 				const parkRefusal = (reasons: readonly string[]) => {
 					let reason = refusedRow(`agent-system-2 classifier: no lab other than the builder's can review ${review.sliceId}`);
@@ -2834,7 +2870,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					let plan = granted?.kind === "single" ? granted : reviewPlan({ ...planInput, grant: false });
 					const reasons = plan.kind === "park" ? plan.reasons : [];
 					let rule: { labs: Lab[]; kimi: string } | null = null;
-					if (plan.kind === "park" && !review.lab) {
+					if (plan.kind === "park" && !review.lab && !outage) {
 						const ruled = await kimiOutPlan(review.workloadId, planInput, tier, registry, disabled, spawnKey);
 						if (ruled) {
 							plan = ruled.plan;
@@ -2842,12 +2878,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						}
 					}
 					if (plan.kind !== "single") {
+						if (outage && builders.unknown.length === 0) return refused(refusedRow(`agent-system-2 classifier: Anthropic-out policy: no usable Codex review for ${review.sliceId}: ${reasons.join(", ")}; no fallback or cross-lab park; re-dispatch after the missing prerequisite changes`));
 						if (review.lab) {
 							return refused(refusedRow(`agent-system-2 classifier: no ${review.lab} model can review ${review.sliceId} at this spawn: ${reasons.join(", ")}`));
 						}
 						return parkRefusal(reasons);
 					}
-					const spend = plan.sameLab && !rule ? grant : null;
+					const spend = plan.sameLab && !rule && !outage ? grant : null;
 					const recorded = recordSpawn(review, plan.models, spend, rule);
 					if (recorded === "spent") {
 						grant = null;
@@ -2866,7 +2903,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					}
 					hands.push({ ...review, root, spawnKey, tier, models: plan.models, row: plan.allow, cwd: ctx.cwd, before });
 					const notes = [
-						...(plan.excluded.length > 0 ? [`review routed off the builder lab${plan.excluded.length > 1 ? "s" : ""} ${plan.excluded.join(", ")}`] : []),
+						...(outage
+							? [`same-lab under Jo's Anthropic-out rule ${ANTHROPIC_OUT_RULE.input} (review-same-lab-rule:), Codex only until ${ANTHROPIC_OUT_RULE.endsAtText}`]
+							: plan.excluded.length > 0 ? [`review routed off the builder lab${plan.excluded.length > 1 ? "s" : ""} ${plan.excluded.join(", ")}`] : []),
 						...(spend ? [`same-lab grant ${spend} spent: the builder's entries follow the other labs'`] : []),
 						...(rule
 							? [
@@ -2875,7 +2914,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 								]
 							: []),
 						...(review.note ? [review.note] : []),
-						...reviewRowNotes(table, tier, review.lab),
+						...reviewRowNotes(table, tier, review.lab, context),
 						...retainedNotes(plan.models),
 					];
 					return { model: plan.models, note: routingNote(review.routing, tier, plan.models, skipped, notes) };

@@ -149,7 +149,7 @@ function seedReview(
 	ledger: Ledger, wl: string, slice: string,
 	over: {
 		ran?: string[]; outcome?: RoutingOutcome; withheld?: boolean; grant?: string; rule?: string; gap?: string; spawnBy?: string; group?: string; round?: number;
-		blocking?: number; between?: (token: string) => { body: string; by?: string }[];
+		blocking?: number; between?: (token: string) => { body: string; by?: string }[]; anthropicOut?: boolean; ruleToken?: string; ruleEntrySlice?: string;
 	} = {},
 ): { token: string; routing: string } {
 	tick();
@@ -158,9 +158,11 @@ function seedReview(
 	const group = over.group ?? `dg-t${n}`;
 	const ran = over.ran ?? [OTHER_LAB];
 	const outcome = over.outcome ?? "ran";
-	const entry = (body: string, by = "lane-t-1") => ledger.recordEntry({ by, workloadId: wl, sliceId: slice, kind: "assumption", body });
+	const entry = (body: string, by = "lane-t-1", sliceId = slice) => ledger.recordEntry({ by, workloadId: wl, sliceId, kind: "assumption", body });
 	if (over.grant) entry(reviewSameLabBody(over.grant, token));
-	if (over.rule) entry(`review-same-lab-rule: in-mv5xafhywe3w8w slice ${over.rule} token ${token} labs anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)`);
+	if (over.rule) entry(over.anthropicOut
+		? `review-same-lab-rule: in-mvtur7tlze7r5o slice ${over.rule} token ${over.ruleToken ?? token} labs openai anthropic-out until 2026-10-31T06:00:00-07:00`
+		: `review-same-lab-rule: in-mv5xafhywe3w8w slice ${over.rule} token ${token} labs anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)`, undefined, over.ruleEntrySlice);
 	if (over.gap) entry(over.gap);
 	for (const b of over.between?.(token) ?? []) entry(b.body, b.by);
 	entry(handSpawnBody({ token, root: "/tmp/lane-t-1", spawnKey: slice, review: true, group, row: ran }), over.spawnBy);
@@ -933,6 +935,40 @@ describe("plan review (PLAN D8): the plan question waits for a review by another
 		expect(await ask()).toContain("Raised question");
 	});
 
+	test("Anthropic-out receipt admits only a successful, non-withheld adjacent same-token/slice/writer review, including headroom skips", async () => {
+		for (const invalid of ["slice", "entry-slice", "token", "writer", "gap", "skip-token", "skip-writer", "withheld", "unsuccessful", null]) {
+			const { ledger, wl, planId, ask } = await planFixture();
+			ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: laneBuilderBody("openai", "lane-t-1", OTHER_LAB) });
+			if (invalid === "entry-slice") {
+				tick();
+				ledger.addSlice({ by: "lane-t-1", workloadId: wl, id: "sl-other", task: "other review", doneCondition: "d", inputs: "i" });
+			}
+			seedReview(ledger, wl, planId, {
+				ran: [OTHER_LAB], anthropicOut: true, rule: invalid === "slice" ? "sl-other" : planId,
+				ruleToken: invalid === "token" ? "dt-wrong" : undefined,
+				ruleEntrySlice: invalid === "entry-slice" ? "sl-other" : undefined,
+				spawnBy: invalid === "writer" ? "lane-x" : undefined,
+				gap: invalid === "gap" ? "unrelated note" : undefined,
+				withheld: invalid === "withheld", outcome: invalid === "unsuccessful" ? "refused-model-unknown" : "ran",
+				between: t => [skip(invalid === "skip-token" ? "dt-wrong" : t, invalid === "skip-writer" ? "lane-x" : undefined), skip(t)],
+			});
+			const reply = await ask();
+			expect(reply).toContain(invalid === null ? "Raised question" : planReviewRefusal(planId));
+			expect(ledger.questions(wl)).toHaveLength(invalid === null ? 1 : 0);
+		}
+	});
+
+	test("a valid pre-expiry Anthropic-out receipt remains admissible after the rule expires", async () => {
+		// setSystemTime drives both review instants; no elapsed wall-time dependency.
+		setSystemTime(new Date("2026-10-31T05:59:00-07:00"));
+		const { ledger, wl, planId, ask } = await planFixture();
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: laneBuilderBody("openai", "lane-t-1", OTHER_LAB) });
+		seedReview(ledger, wl, planId, { ran: [OTHER_LAB], anthropicOut: true, rule: planId });
+		setSystemTime(new Date("2026-10-31T06:01:00-07:00"));
+		expect(ledger.claimWorkload(wl, { by: "lane-t-1", holder: "lane-t-1", leaseMs: 60_000 }).won).toBe(true);
+		expect(await ask()).toContain("Raised question");
+	});
+
 	test("#228: a run of two headroom-skip: rows still counts the rule, and a spent same-lab grant counts across one the same way", async () => {
 		const two = await planFixture();
 		seedReview(two.ledger, two.wl, two.planId, { ran: [LANE_MODEL], rule: two.planId, between: (t) => [skip(t), skip(t)] });
@@ -1560,6 +1596,19 @@ describe("plan auto-start (PLAN wl-mvfkv7llkp7nk0 § 3, R7, R8)", () => {
 		const entries = ledger.entries(wl);
 		expect(planFirst(controlEntries(entries, holdersOf(entries, ledger.workload(wl)!.holder)))).toBeNull();
 		expect(await call("lane_add_slice", { task: "change it", doneCondition: "d", inputs: "i", kind: "change-small" })).toMatch(/^Added slice/);
+	});
+
+	test("Anthropic-out same-lab evidence permits the question but never auto-approves or sends an auto-start notice", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		endFlowRepair(ledger);
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: laneBuilderBody("openai", "lane-t-1", OTHER_LAB) });
+		seedReview(ledger, wl, planId, { ran: [OTHER_LAB], anthropicOut: true, rule: planId, round: 1, group: "dg-pass" });
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewLoopEndBody(planId, "pass") });
+		tick();
+		expect(planAutoStartRound(ledger, wl, planId, Date.now())).toBeNull();
+		expect(await ask()).toContain("Raised question");
+		expect(autoEntries(ledger, wl)).toEqual([]);
+		expect(noticesOf(ledger, wl)).toEqual([]);
 	});
 
 	const toJo: [string, (ledger: Ledger, wl: string, planId: string) => void][] = [
