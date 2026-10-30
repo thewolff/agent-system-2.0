@@ -1519,10 +1519,10 @@ function realRoot(): ControlRoot {
 	return { root, head, modified, current, currentHead: current === null ? null : git(current, ["rev-parse", "HEAD"]), repo: ownerRepoOf(origin)?.toLowerCase() ?? null };
 }
 
-/** `osascript -e 'display notification … sound name "Glass"'`. */
+/** No sound clause: train popups stay silent under Jo's silent-popup alarm rule. */
 function realNotify(title: string, text: string): boolean {
 	const str = (s: string) => `"${s.replace(/[\\"]/g, (c) => `\\${c}`)}"`;
-	const r = Bun.spawnSync(["osascript", "-e", `display notification ${str(text)} with title ${str(title)} sound name "Glass"`], { stdout: "pipe", stderr: "pipe", timeout: 10_000 });
+	const r = Bun.spawnSync(["osascript", "-e", `display notification ${str(text)} with title ${str(title)}`], { stdout: "pipe", stderr: "pipe", timeout: 10_000 });
 	return r.exitCode === 0;
 }
 
