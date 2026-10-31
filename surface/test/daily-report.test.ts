@@ -212,7 +212,7 @@ describe("daily report: the needs-you line (R12)", () => {
 		writeFileSync(plist, "<plist/>\n");
 		expect(installed()).toBe(true);
 		const missed = reportLines(w.ledger, plus(t, 30), installed);
-		expect(missed).toEqual([{ kind: "report", workloadId: STANDING_WORKLOAD_ID, rowId: id, state: "missed", line: "daily self-heal report missed: the newest is 2026-10-19 (30 h); check com.agent-system-2.daily-report" }]);
+		expect(missed).toEqual([{ kind: "report", workloadId: STANDING_WORKLOAD_ID, rowId: id, state: "missed", next: "check com.agent-system-2.daily-report", line: "daily self-heal report missed: the newest is 2026-10-19 (30 h); check com.agent-system-2.daily-report" }]);
 		expect(reportLines(w.ledger, plus(t, 7 * 24 - 0.1), installed)).toHaveLength(1);
 		// 7 days and later: nothing, plist or not.
 		expect(reportLines(w.ledger, plus(t, 7 * 24), installed)).toEqual([]);

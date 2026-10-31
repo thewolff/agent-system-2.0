@@ -36,7 +36,7 @@ import { type FenceSettings, shellStartReason } from "../src/fence";
 import { PAIR_RUN_CONFINED_REASON } from "../src/pair-call";
 import { scratchRootFor } from "../src/scratch";
 import { gateSession } from "../src/session";
-import { CERTIFIED, commit, git, tmp } from "./helpers";
+import { CERTIFIED, commit, git, HOW_IT_FAILS_FIXTURE, tmp } from "./helpers";
 
 const ON: FenceSettings = { enabled: true, autoBackground: true };
 /** The fence off: on Linux the M4b fence refuses every bash call before any other row (no sandbox-exec). */
@@ -164,7 +164,7 @@ async function lane(o: { branch?: string; cleanShell?: CleanShellCheck; fence?: 
 	expect(started.text).toContain("Pairing started.");
 	/** Agree a card on `boundary` and open its change set. */
 	const open = async (boundary: string[]) => {
-		const card = await call("pair_propose", { boundary, whyNow: "the header drifts", decision: "move the offset", currentCode: "a literal", effect: "one token", checks: ["the check passes"], openPoints: [] });
+		const card = await call("pair_propose", { boundary, whyNow: "the header drifts", decision: "move the offset", currentCode: "a literal", effect: `one token\n${HOW_IT_FAILS_FIXTURE}`, checks: ["the check passes"], openPoints: [] });
 		const cardId = /Card (\S+) recorded/.exec(card.text)?.[1];
 		expect(cardId).toBeDefined();
 		await h.emit("input", { type: "input", text: "yes, go ahead with it", source: "interactive" }, ctx);
@@ -173,6 +173,19 @@ async function lane(o: { branch?: string; cleanShell?: CleanShellCheck; fence?: 
 	};
 	return { sessionId, ledger, ledgerDir, ledgerPath, wl, sl, repo, env, home, call, verdict, open, emit: h.emit, tool: h.tool, ctx };
 }
+
+describe("a paired lane's change card carries a How it fails section (issue #334 item 2)", () => {
+	test("a card without it is refused before the plugin records it, naming the heading; the same card with it is recorded", async () => {
+		const l = await lane();
+		const base = { boundary: ["src/a.txt"], whyNow: "the header drifts", decision: "move the offset", currentCode: "a literal", effect: "one token", checks: ["the check passes"], openPoints: [] };
+		const refused = await l.call("pair_propose", base);
+		expect(refused.refused).toContain('this change card has no "How it fails" section');
+		expect(refused.refused).toContain("## How it fails");
+		const recorded = await l.call("pair_propose", { ...base, effect: `one token\n${HOW_IT_FAILS_FIXTURE}` });
+		expect(recorded.refused).toBeNull();
+		expect(recorded.text).toMatch(/Card \S+ recorded/);
+	});
+});
 
 describe("pair_write and pair_edit are judged as the write and edit they are", () => {
 	test("into the ledger file: row 10's refusal of that write, before anything runs", async () => {

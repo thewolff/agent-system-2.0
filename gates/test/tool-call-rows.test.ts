@@ -51,7 +51,7 @@ describe("row 5: all six brief fields", () => {
 	});
 	test("allows fields in the item, in the shared context, bolded and bulleted", () => {
 		expect(checkBriefFields({ tasks: [{ agent: "fast", task: brief() }] })).toBeNull();
-		const shared = "workload: wl-abc\ninputs: gates/\nstakes: production\nceiling-share: 12.5%";
+		const shared = "workload: wl-abc\ninputs: gates/\nstakes: production\nceiling-share: 12.5%\n### How it fails\n- the build breaks: fix and rebuild, once";
 		expect(checkBriefFields({ context: shared, tasks: [{ agent: "fast", task: "- **task:** fix it\n- **done-condition:** tests green" }] })).toBeNull();
 	});
 });

@@ -13,6 +13,9 @@ import type { SurfaceAPI } from "../src/types";
 
 export const tmp = (tag: string): string => mkdtempSync(join(tmpdir(), `surface-${tag}-`));
 
+/** A "How it fails" section a fixture brief or plan ends with, so the open tool and the plan question accept it (issue #334 item 2). */
+export const HOW_IT_FAILS = "\n## How it fails\n- a step fails: it surfaces in that step's output; fix it and retry, once";
+
 /**
  * Fixture source: an expression whose value is a `Bun.spawn(["/usr/bin/true"], <options>)` subprocess still unreaped when the
  * call returns, for fixtures that then block their event loop to hold the child as a zombie. Measured on bun 1.3.14, about a
