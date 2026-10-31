@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { admitResources, boundedTestArgs, parseResourceCosts, parseTimingProof, proofChildEnv, runtimeTreeHash, verifyTrustedPath } from "../src/test-resources";
 import { tmp } from "./helpers";
@@ -78,5 +78,20 @@ describe("proof child boundary", () => {
 	test("operator-owned runtime paths are not a trusted install", () => {
 		const root = fixture();
 		expect(() => verifyTrustedPath(root)).toThrow("root-owned");
+	});
+	test("a writable ancestor is refused unless it is a root-owned sticky directory", () => {
+		const me = process.getuid?.() ?? -1;
+		const root = realpathSync(fixture()); // a trusted path is physical (macOS /var is a symlink)
+		const leaf = join(root, "shared", "libexec");
+		mkdirSync(leaf, { recursive: true });
+		// Under the runner, tmp sits below /Users/Shared (root, 1777): this passing is the root-sticky exception at work.
+		expect(verifyTrustedPath(leaf, [0, me])).toBeUndefined();
+		chmodSync(join(root, "shared"), 0o1777); // sticky, but owned by the test identity, not root
+		expect(() => verifyTrustedPath(leaf, [0, me])).toThrow(`${join(root, "shared")} must be owned by uid 0 or ${me}`);
+		chmodSync(join(root, "shared"), 0o777);
+		expect(() => verifyTrustedPath(leaf, [0, me])).toThrow("not group/world writable");
+		chmodSync(join(root, "shared"), 0o755);
+		chmodSync(leaf, 0o1777); // the install path itself never takes the exception
+		expect(() => verifyTrustedPath(leaf, [0, me])).toThrow(`${leaf} must be owned`);
 	});
 });

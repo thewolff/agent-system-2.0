@@ -110,14 +110,17 @@ export function parseInstalledOmp(v: unknown): InstalledOmp {
 
 /**
  * Every component must be physical, owned by one of `owners` (root alone unless a test install names its own uid) and not
- * group/world writable; caller cannot substitute an ancestor.
+ * group/world writable; caller cannot substitute an ancestor. One exception, ancestors only: a root-owned sticky directory
+ * (such as /Users/Shared or /private/tmp, mode 1777). There no one but root and an entry's owner can rename or remove that
+ * entry, and the next component must itself pass the owner check, so nobody else can swap the path below it.
  */
 export function verifyTrustedPath(path: string, owners: readonly number[] = [0]): void {
 	if (!isAbsolute(path) || normalize(path) !== path) throw new Error(`trusted install: ${path} is not a normalized absolute path`);
 	const owned = owners.length === 1 && owners[0] === 0 ? "root-owned" : `owned by uid ${owners.join(" or ")}`;
 	for (let p = path; ; p = dirname(p)) {
 		const s = lstatSync(p);
-		if (s.isSymbolicLink() || !owners.includes(s.uid) || (s.mode & 0o022) !== 0) throw new Error(`trusted install: ${p} must be ${owned}, physical and not group/world writable; repair provisioning before execution`);
+		const rootSticky = p !== path && s.isDirectory() && s.uid === 0 && (s.mode & 0o1000) !== 0;
+		if (s.isSymbolicLink() || !owners.includes(s.uid) || ((s.mode & 0o022) !== 0 && !rootSticky)) throw new Error(`trusted install: ${p} must be ${owned}, physical and not group/world writable (a root-owned sticky ancestor excepted); repair provisioning before execution`);
 		if (dirname(p) === p) break;
 	}
 	if (realpathSync(path) !== path) throw new Error(`trusted install: ${path} is not a physical path`);
