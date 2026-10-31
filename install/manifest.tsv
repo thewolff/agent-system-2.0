@@ -1098,8 +1098,6 @@ surface/test/delivery.test.ts	test	-
 surface/test/lane.test.ts	test	-
 surface/test/fixtures-fable.test.ts	test	-
 surface/test/tool-mount.test.ts	test	-
-contract/output-types.md	doc	-
-contract/output-types-incidents.md	doc	-
 voice/VOICE.md	doc	-
 voice/agent-collaboration-with-adhd-and-autism.md	doc	-
 surface/src/launch.ts	module	-
@@ -1346,6 +1344,11 @@ surface/test/channel-reply.test.ts	test	-
 # hands) and lists each plugins/<p>/skills dir. plugins/paired-as2.ts is as2's seam to the paired adapter.
 plugins/VENDOR.md	doc	-
 plugins/index.ts	extension	-
+plugins/output-types/.claude-plugin/plugin.json	data	-
+plugins/output-types/hooks/hooks.json	data	-
+plugins/output-types/hooks/output-types-inject.mjs	module	-
+plugins/output-types/skills/output-types/SKILL.md	skill-asset	-
+plugins/output-types/skills/output-types/reference.md	skill-asset	-
 plugins/paired-as2.ts	module	-
 plugins/ask-graham/.claude-plugin/plugin.json	data	-
 plugins/ask-graham/.omp-plugin/plugin.json	data	-

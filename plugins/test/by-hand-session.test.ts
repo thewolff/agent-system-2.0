@@ -19,7 +19,7 @@
 // ctx-index workers included. Inside the agent fence put surface/scripts/ps-shim first on PATH: lane.ts reads process start
 // times with ps.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Ledger } from "../../ledger/src/index";
@@ -224,7 +224,7 @@ beforeAll(async () => {
 					requests["by-hand"].push(request);
 					const step = byHandSteps()[request.results.length];
 					if (step) return step;
-					return allText(request).includes(BLOCK_REASON) ? { text: `**PMDW**\n${VERDICT}` } : { text: "**PMDW**\nThe hand reported the line." };
+					return allText(request).includes(BLOCK_REASON) ? { text: `${VERDICT}` } : { text: "The hand reported the line." };
 				},
 			},
 			{
@@ -235,7 +235,7 @@ beforeAll(async () => {
 					requests.autonomous.push(request);
 					if (request.results.length === 0) return tool("ledger_wake_read", { body: "by-hand session test: autonomous control lane; next: release.", i: "Recording the wake read" });
 					if (request.results.length === 1) return tool("lane_release", { i: "Releasing the workload" });
-					return { text: "**PMDW**\nreleased." };
+					return { text: "released." };
 				},
 			},
 			{
@@ -245,7 +245,7 @@ beforeAll(async () => {
 				after: ({ request }) => {
 					requests.orchestrator.push(request);
 					if (request.results.length === 0) return tool("orchestrator_wake_read", { body: "by-hand session test: scratch orchestrator; nothing open to resume; next: none.", i: "Recording the wake read" });
-					return { text: "**PMDW**\nNothing to do." };
+					return { text: "Nothing to do." };
 				},
 			},
 			// Title, skill-hint and other tool-less requests OMP makes out of band.
@@ -262,7 +262,15 @@ beforeAll(async () => {
 	w = { root, home, repo: join(root, "repo"), ledgerPath: join(home, ".agent-system-2", "ledger.db"), env, stub, byHandWl, autoWl, requests, runs: [] };
 
 	// The profile, as a fresh machine gets it (install/fresh-machine-test.sh run_install), then the stub's routes over it.
-	const install = await run("install.sh", ["bash", join(REPO, "install", "install.sh")], REPO, { PATH: env.PATH!, HOME: home }, "");
+	// The installer never gets the developer PATH (only Bun and system utilities, as ledger/test/install.test.ts does), so it
+	// cannot reach a real herdr or ctx: a real herdr would register its plugin under this scratch HOME, and its socket path
+	// there can exceed sun_path. The session below keeps env.PATH, since it needs the installed OMP.
+	const installBin = join(root, "install-bin");
+	mkdirSync(installBin);
+	symlinkSync(process.execPath, join(installBin, "bun"));
+	const installPath = `${installBin}:/usr/bin:/bin`;
+	for (const bin of ["herdr", "ctx"]) if (Bun.which(bin, { PATH: installPath })) throw new Error(`${bin} is on the installer PATH ${installPath}`);
+	const install = await run("install.sh", ["bash", join(REPO, "install", "install.sh")], REPO, { PATH: installPath, HOME: home }, "");
 	if (install.code !== 0) throw new Error(`install.sh exited ${install.code}: ${install.err.slice(-2000)}`);
 	writeStubProfile(join(home, ".omp", "profiles", "agent-system-2", "agent"), stub.port);
 	// Jo's ask-graham setting (plugins/VENDOR.md): every idea gets the nudge.

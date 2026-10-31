@@ -80,9 +80,9 @@ extensions:
   # one-liner, Jo's one-word flips, decision-log read/render (SPEC-2.0.md § A1.2, § A3, § B3,
   # § B7, § B13.1). Inert unless AGENT_SYSTEM_ROLE=orchestrator on a top-level session. It injects
   # the voice document {repo}/voice/VOICE.md (DESIGN-2.0.md C2.1) into the orchestrator's system
-  # prompt; AGENT_SYSTEM_VOICE overrides the path. The owned output-types contract the gates inject
-  # (row 2) is {repo}/contract/output-types.md. Listed BEFORE the gates: its wake-owed refusal is a
-  # tool_call block, and a block from a handler loaded after the gates lands after the M4b fence
+  # prompt; AGENT_SYSTEM_VOICE overrides the path. The output-types contract the gates inject (row 2)
+  # is the vendored public plugin's {repo}/plugins/output-types/skills/output-types/reference.md
+  # (plugins/VENDOR.md). Listed BEFORE the gates: its wake-owed refusal is a tool_call block, and a block from a handler loaded after the gates lands after the M4b fence
   # has already returned its bash wrapper, which the fence records as a bypass and then refuses
   # every later bash call (gates/src/fence.ts bypassReason). A refusal before the gates ends the
   # chain before the wrapper, as the gates' own rows do.

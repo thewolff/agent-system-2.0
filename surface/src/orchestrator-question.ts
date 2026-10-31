@@ -1,9 +1,9 @@
-// The orchestrator's questions to Jo as ledger rows (MIGRATION.md item 105). Every QUESTION the
+// The orchestrator's questions to Jo as ledger rows (MIGRATION.md item 105). Every question the
 // orchestrator puts to Jo is first a `questions` row on the standing slice (surface/src/identity.ts
 // `standingSlice`), raised by `orchestrator_raise_question` (surface/extensions/question.ts), so the
 // row exists before Jo sees the ask, the needs-you render (surface/src/errors.ts) and the invariant
 // report's `stuck-question` (surface/scripts/invariants.ts) see it, and a restart re-renders it.
-// P-11 row 15 (gates/src/rows/r15-orchestrator-role.ts) refuses the reply that publishes a QUESTION
+// P-11 row 15 (gates/src/rows/r15-orchestrator-role.ts) refuses the reply that publishes a closing ask
 // naming no open row on the standing slice, and the orchestrator's next working call while a named
 // row is still open.
 //

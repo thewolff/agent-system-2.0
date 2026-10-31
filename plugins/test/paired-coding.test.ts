@@ -1,5 +1,5 @@
 // paired-coding in as2 (plugins/VENDOR.md, PLAN-2 D3 and D4):
-//   - the pin: all three vendored trees come from the one commit VENDOR.md names, at the versions it
+//   - the pin: all four vendored trees come from the one commit VENDOR.md names, at the versions it
 //     names, with each tree's source digest and executable files as recorded there;
 //   - a by-hand lane (AGENT_SYSTEM_ROLE=lane, AGENT_SYSTEM_BY_HAND=1) loaded by the installed OMP gets all
 //     three adapters: each of the eight pair_* tools is registered exactly once, at the first
@@ -16,7 +16,9 @@ import { bindPrepared, countedPrepared, HAS_OMP, loadIndex, OMP_SKIP, PAIR_TOOLS
 
 const PLUGINS = join(import.meta.dir, "..");
 const VENDOR = readFileSync(join(PLUGINS, "VENDOR.md"), "utf8");
-const NAMES = ["i-have-audhd", "ask-graham", "paired-coding"] as const;
+const NAMES = ["i-have-audhd", "ask-graham", "paired-coding", "output-types"] as const;
+/** Plugins with an OMP adapter, so an `.omp-plugin` manifest and a `package.json`; output-types ships only its Claude Code manifest. */
+const ADAPTED: readonly string[] = ["i-have-audhd", "ask-graham", "paired-coding"];
 
 let dispose: (() => void) | undefined;
 afterEach(() => {
@@ -44,7 +46,7 @@ function sourceDigest(plugin: string): string {
 
 describe("the pin (plugins/VENDOR.md)", () => {
 	const rows = new Map(
-		[...VENDOR.matchAll(/^\| (i-have-audhd|ask-graham|paired-coding) \| ([^ |]+) \| .+ \| `([0-9a-f]{40})` \(origin\/main\) \| (\d{4}-\d\d-\d\d) \| `([0-9a-f]{64})` \|$/gm)].map((m) => [
+		[...VENDOR.matchAll(/^\| (i-have-audhd|ask-graham|paired-coding|output-types) \| ([^ |]+) \| .+ \| `([0-9a-f]{40})` \(origin\/main\) \| (\d{4}-\d\d-\d\d) \| `([0-9a-f]{64})` \|$/gm)].map((m) => [
 			m[1]!,
 			{ version: m[2]!, commit: m[3]!, digest: m[5]! },
 		]),
@@ -56,14 +58,18 @@ describe("the pin (plugins/VENDOR.md)", () => {
 	});
 
 	for (const plugin of NAMES) {
-		test(`${plugin}: the recorded version is its package.json and .omp-plugin version, its source digest matches, no .test.mjs is shipped, and its executable files are the recorded ones`, () => {
+		test(`${plugin}: the recorded version is its manifests' version, its source digest matches, no .test.mjs is shipped, and its executable files are the recorded ones`, () => {
 			const row = rows.get(plugin)!;
 			const root = join(PLUGINS, plugin);
-			expect(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version).toBe(row.version);
-			expect(JSON.parse(readFileSync(join(root, ".omp-plugin", "plugin.json"), "utf8")).version).toBe(row.version);
+			expect(JSON.parse(readFileSync(join(root, ".claude-plugin", "plugin.json"), "utf8")).version).toBe(row.version);
+			if (ADAPTED.includes(plugin)) {
+				expect(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version).toBe(row.version);
+				expect(JSON.parse(readFileSync(join(root, ".omp-plugin", "plugin.json"), "utf8")).version).toBe(row.version);
+			}
 			expect(sourceDigest(plugin)).toBe(row.digest);
 			expect(files(root).filter((f) => f.endsWith(".test.mjs"))).toEqual([]);
 			const listed = new RegExp(`^- ${plugin}: (.+)$`, "m").exec(VENDOR)?.[1] ?? "";
+			expect(listed).not.toBe("");
 			const want = [...listed.matchAll(/`([^`]+)`/g)].map((m) => m[1]!).sort();
 			const got = files(root)
 				.filter((f) => (statSync(f).mode & 0o111) !== 0)

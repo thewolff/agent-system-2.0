@@ -68,8 +68,8 @@ function tmpLedgerDb(): string {
 const laneEnv = () => ({ HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: tmpLedgerDb() });
 const orchestratorEnv = () => ({ AGENT_SYSTEM_ROLE: "orchestrator", ...laneEnv() });
 
-const MALFORMED = "**PMDW**\nDone. Do you want the PR now, or should I wait for the proof?\nZEBRA-7Q";
-const WELL_FORMED = "**PMDW**\nAll quiet.";
+const MALFORMED = "Done. Do you want the PR now, or should I wait for the proof?\nZEBRA-7Q";
+const WELL_FORMED = "All quiet.";
 const assistant = (...content: Block[]) => ({ role: "assistant", content });
 const text = (t: string): Block => ({ type: "text", text: t });
 
@@ -103,7 +103,7 @@ describe("row 1 withholds a refused orchestrator reply", () => {
 		const f = fakePi();
 		turnShapeRow(f.pi, orchestratorEnv());
 		const ctx = ctxOf();
-		const draft = "**PMDW**\n`zsh /tmp/ops.sh`";
+		const draft = "`zsh /tmp/ops.sh`";
 		expect(checkTurnShape(draft, "orchestrator")).not.toBeNull();
 		const content = await f.emitAssistantMessage(assistant(text(draft)), ctx);
 		expect(content).toBeDefined();
@@ -147,10 +147,10 @@ describe("row 1 withholds a refused orchestrator reply", () => {
 		// One prompt: refused #1 shows the marker, refused retries #2 and #3 show only "…".
 		await f.emit("input", { type: "input", text: "status?", source: "interactive" }, ctx);
 		expectMarker(await refusedThenStop(MALFORMED));
-		expectEllipsis(await refusedThenStop("**PMDW**\nRetry two. Shall I go on?\nZEBRA-8Q"));
+		expectEllipsis(await refusedThenStop("Retry two. Shall I go on?\nZEBRA-8Q"));
 		// A tool-call message between retries is not a reply that passes: no reset.
 		expect(await f.emitAssistantMessage(assistant(text("checking"), { type: "toolCall", id: "c1", name: "read", arguments: { path: "x" } }), ctx)).toBeUndefined();
-		expectEllipsis(await refusedThenStop("**PMDW**\nRetry three. Shall I go on?\nZEBRA-9Q"));
+		expectEllipsis(await refusedThenStop("Retry three. Shall I go on?\nZEBRA-9Q"));
 
 		// Passing retry #4 comes back unchanged, and its stop is not blocked.
 		expect(await f.emitAssistantMessage(assistant(text(WELL_FORMED)), ctx)).toBeUndefined();
@@ -215,7 +215,7 @@ describe("row 1 guards (unchanged before and after withhold)", () => {
 // unreadable ledger still refuses a reply that names a question, at publication and at the stop.
 describe("row 1 with no readable ledger (item 105 fix round 2)", () => {
 	const noLedgerEnv = () => ({ AGENT_SYSTEM_ROLE: "orchestrator", HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: join(tmp("r01-noledger"), "missing", "ledger.db") });
-	const ASKED = "**PMDW**\nSee below.\n\n**QUESTION**\n(q-mv4zzzzzzzzzzz) Today or tomorrow? Options: today / tomorrow";
+	const ASKED = "See below.\n\n**Closing ask**\n(q-mv4zzzzzzzzzzz) Today or tomorrow? Options: today / tomorrow";
 
 	test("U1: a well-formed reply with no QUESTION opens no ledger: it is returned unchanged and its stop is not blocked", async () => {
 		const f = fakePi();
@@ -234,7 +234,7 @@ describe("row 1 with no readable ledger (item 105 fix round 2)", () => {
 		expect(content).toEqual([{ type: "text", text: "(Reply held by P-11 row 1. The corrected reply follows.)" }]);
 		const stop = (await f.emit("session_stop", { last_assistant_message: { role: "assistant", content } }, ctx)) as { decision: string; reason: string };
 		expect(stop?.decision).toBe("block");
-		expect(stop.reason).toContain("could not bind this reply's QUESTION to the ledger");
+		expect(stop.reason).toContain("could not bind this reply's closing ask to the ledger");
 		expect(stop.reason).toContain(`Your held reply was:\n\n${ASKED}`);
 	});
 
@@ -243,7 +243,7 @@ describe("row 1 with no readable ledger (item 105 fix round 2)", () => {
 		turnShapeRow(f.pi, noLedgerEnv());
 		const stop = (await f.emit("session_stop", { last_assistant_message: assistant(text(ASKED)) }, ctxOf())) as { decision: string; reason: string };
 		expect(stop?.decision).toBe("block");
-		expect(stop.reason).toContain("could not bind this reply's QUESTION to the ledger");
+		expect(stop.reason).toContain("could not bind this reply's closing ask to the ledger");
 		expect(stop.reason).toContain("the turn does not end unchecked");
 	});
 });
