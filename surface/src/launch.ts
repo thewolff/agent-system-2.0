@@ -92,7 +92,7 @@ export const CONTROL_PREFIXES = [
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
 	"queued",
-	"lane-metrics", "daily-report",
+	"lane-metrics", "daily-report", "drive-backup",
 	"now", "ruling-conflict",
 	"land-first", "main-retry", "train-reconciled", "runner-preflight", "fast-plan", "fast-fallback", "status-failed",
 	"land-first-off-pending", "land-first-off-complete",
@@ -108,6 +108,8 @@ const LANE_SCOPED: Record<string, true> = {
 export const SCRATCH_SWEEP_BY = "scratch-sweep";
 /** The daily self-heal report's `created_by` (surface/scripts/daily-report.ts), on the standing workload. */
 export const DAILY_REPORT_BY = "daily-report";
+/** The Drive backup jobs' needs-you writer's `created_by` (surface/scripts/drive-backup-notice.ts), on the standing workload. */
+export const DRIVE_BACKUP_BY = "drive-backup";
 /**
  * Fixed writers per prefix (§ 5). `lane-stop`, `plan` and `done-because` are refined in `validWriter`. The
  * starter writes `lane-started:` / `lane-exit:` for the interactive lane it runs in Jo's terminal
@@ -258,6 +260,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	queued: [SURFACE_BY],
 	"lane-metrics": [LANE_RUNNER_BY],
 	"daily-report": [DAILY_REPORT_BY],
+	"drive-backup": [DRIVE_BACKUP_BY],
 	now: [ESCALATION_BY],
 	"ruling-conflict": [ESCALATION_BY],
 	"land-first": [SURFACE_BY],
