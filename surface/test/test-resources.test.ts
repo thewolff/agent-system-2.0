@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, linkSync, lstatSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { admitResources, boundedTestArgs, parseResourceCosts, parseTimingProof, proofChildEnv, runtimeTreeHash, verifyTrustedPath } from "../src/test-resources";
 import { tmp } from "./helpers";
@@ -79,19 +80,33 @@ describe("proof child boundary", () => {
 		const root = fixture();
 		expect(() => verifyTrustedPath(root)).toThrow("root-owned");
 	});
-	test("a writable ancestor is refused unless it is a root-owned sticky directory", () => {
+	test("a writable ancestor is refused unless it is a root-owned sticky directory; a trusted file has one link", () => {
 		const me = process.getuid?.() ?? -1;
 		const root = realpathSync(fixture()); // a trusted path is physical (macOS /var is a symlink)
-		const leaf = join(root, "shared", "libexec");
+		const shared = join(root, "shared");
+		const leaf = join(shared, "libexec");
 		mkdirSync(leaf, { recursive: true });
-		// Under the runner, tmp sits below /Users/Shared (root, 1777): this passing is the root-sticky exception at work.
+		// Under the runner, tmp sits below /Users/Shared (root, 1777): there this passing is the root-sticky exception at work.
 		expect(verifyTrustedPath(leaf, [0, me])).toBeUndefined();
-		chmodSync(join(root, "shared"), 0o1777); // sticky, but owned by the test identity, not root
-		expect(() => verifyTrustedPath(leaf, [0, me])).toThrow(`${join(root, "shared")} must be owned by uid 0 or ${me}`);
-		chmodSync(join(root, "shared"), 0o777);
-		expect(() => verifyTrustedPath(leaf, [0, me])).toThrow("not group/world writable");
-		chmodSync(join(root, "shared"), 0o755);
-		chmodSync(leaf, 0o1777); // the install path itself never takes the exception
-		expect(() => verifyTrustedPath(leaf, [0, me])).toThrow(`${leaf} must be owned`);
+		// Bun's chmodSync drops the sticky bit (review r5 F1), so set it with chmod(1) and check that it took.
+		const sticky = (dir: string): void => {
+			expect(spawnSync("/bin/chmod", ["1777", dir]).status).toBe(0);
+			expect(lstatSync(dir).mode & 0o7777).toBe(0o1777);
+		};
+		sticky(shared); // sticky, but owned by the test identity, not root
+		expect(() => verifyTrustedPath(leaf, [0, me])).toThrow(`${shared} must be owned by uid 0 or ${me}`);
+		chmodSync(shared, 0o777); // root-owned or not, a plain writable ancestor refuses
+		expect(lstatSync(shared).mode & 0o7777).toBe(0o777);
+		expect(() => verifyTrustedPath(leaf, [0, me])).toThrow(`${shared} must be owned by uid 0 or ${me}`);
+		chmodSync(shared, 0o755);
+		// The exception is for ancestors only: a root-owned sticky directory as the path itself refuses.
+		expect(lstatSync("/private/tmp").mode & 0o1000).toBe(0o1000);
+		expect(() => verifyTrustedPath("/private/tmp", [0, me])).toThrow("/private/tmp must be owned");
+		// A hard link could plant a trusted-owned file under a name in a sticky directory (review r5 F3): one link only.
+		const policy = join(leaf, "resources.json");
+		writeFileSync(policy, "{}");
+		expect(verifyTrustedPath(policy, [0, me])).toBeUndefined();
+		linkSync(policy, join(root, "planted.json"));
+		expect(() => verifyTrustedPath(policy, [0, me])).toThrow(`${policy} has 2 hard links`);
 	});
 });

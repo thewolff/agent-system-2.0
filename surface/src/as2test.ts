@@ -555,7 +555,8 @@ export function readInstall(p: { checkout: string; libexec?: string; root?: stri
 		}
 	}
 	// A SOURCE that records the measured resource policy makes it part of the install: root-owned, 0644, a regular file,
-	// on a physical path whose every ancestor is trusted-owned and not group- or world-writable, holding measured costs.
+	// on a physical path whose every ancestor is trusted-owned and not group- or world-writable (verifyTrustedPath's one
+	// exception: a root-owned sticky ancestor directory), holding measured costs.
 	const policyLayout: LayoutItem[] = source.ok && source.source.files[RESOURCE_POLICY] ? [{ path: join(libexec, RESOURCE_POLICY), kind: "file", owner: "root", mode: 0o644 }] : [];
 	const errors: string[] = [];
 	if (policyLayout.length > 0) {
