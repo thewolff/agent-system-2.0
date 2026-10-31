@@ -24,6 +24,7 @@ import { lstatSync, readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import { STUCK_DEFAULTS } from "./stuck-detect";
+import { parseInstalledOmp, parseResourceCosts, readInstalledOmp, runtimeTreeHash, verifyTrustedPath } from "./test-resources";
 import { AS2TEST_EXEC, AS2TEST_ROOT, AS2TEST_USER, WRAPPER_EXIT, type WrapperCall, runsDbOf, wrapperArgv } from "./test-run";
 
 // ---- the wrapper ---------------------------------------------------------------------------------
@@ -58,6 +59,9 @@ export interface ExecWrapperOptions {
 	bun: string;
 	/** test-exec: the installed bundle, or surface/scripts/test-exec.ts in a test. */
 	script: string;
+	/** Trusted, fixed calibration/runtime config paths; never selected by staged proof caps. */
+	resourcesPath?: string;
+	ompRuntimePath?: string;
 	/** `uid` for the installed wrapper; `groups` for a wrapper a test renders (§ 2.3 step 3). */
 	sweepScope: SweepScope;
 	/** Test-only, `groups` renders only: the pause-hook directory (`<dir>/<run>.<point>.pause|reached|go`). */
@@ -84,6 +88,8 @@ export interface ExecWrapperOptions {
 export interface ExecConfig {
 	root: string;
 	bun: string;
+	resourcesPath: string;
+	ompRuntimePath: string;
 	/** `groups`, or exactly UID_SWEEP. */
 	sweep: string;
 	hooks: string | null;
@@ -107,6 +113,9 @@ export function execConfigOf(o: ExecWrapperOptions): ExecConfig {
 	for (const [k, v] of [["root", o.root], ["bun", o.bun], ["script", o.script]] as const) {
 		if (typeof v !== "string" || !plainAbs(v)) throw new WrapperRenderError(`${k} must be a normalized absolute path: ${String(v)}`);
 	}
+	for (const [k, v] of [["resourcesPath", o.resourcesPath], ["ompRuntimePath", o.ompRuntimePath]] as const) {
+		if (v !== undefined && !plainAbs(v)) throw new WrapperRenderError(`${k} must be a normalized absolute path`);
+	}
 	if (o.sweepScope !== "uid" && o.sweepScope !== "groups") throw new WrapperRenderError(`sweepScope must be uid or groups: ${String(o.sweepScope)}`);
 	const testOnly = o.hooks !== undefined || o.killGraceMs !== undefined || o.sweepLockWaitMs !== undefined || o.captureMs !== undefined
 		|| o.detectTickMs !== undefined || o.detectPersistMs !== undefined || o.signatureCaptureMs !== undefined || o.stopGraceMs !== undefined || o.detectTrace !== undefined;
@@ -124,6 +133,7 @@ export function execConfigOf(o: ExecWrapperOptions): ExecConfig {
 	if (detectTickMs < 1) throw new WrapperRenderError("detectTickMs must be 1 ms or more");
 	return {
 		root: o.root, bun: o.bun, sweep: o.sweepScope === "uid" ? UID_SWEEP : "groups", hooks: o.hooks ?? null,
+		resourcesPath: o.resourcesPath ?? join(dirname(o.bun), "resources.json"), ompRuntimePath: o.ompRuntimePath ?? join(dirname(o.bun), "installed-omp.json"),
 		killGraceMs: ms(o.killGraceMs, KILL_GRACE_MS, "killGraceMs"), sweepLockWaitMs: ms(o.sweepLockWaitMs, SWEEP_LOCK_WAIT_MS, "sweepLockWaitMs"),
 		captureMs: ms(o.captureMs, CAPTURE_MS, "captureMs"),
 		detectTickMs, detectPersistMs: ms(o.detectPersistMs, STUCK_DEFAULTS.persistMs, "detectPersistMs"),
@@ -479,6 +489,12 @@ export interface InstallFacts {
 	/** sha-256 of each SOURCE input in the runner's checkout (null when unreadable). */
 	inputHashes: Record<string, string | null>;
 	layout: LayoutItem[];
+	/**
+	 * Trusted installed calibration/runtime validation, when SOURCE records these artifacts: resources.json's trusted path
+	 * (every ancestor) and content (its own owner and mode are a layout item, so the owner ids are installDecision's), and
+	 * the installed-OMP pin and tree.
+	 */
+	executionPolicyError?: string;
 }
 
 const sha256File = (p: string): string | null => {
@@ -508,8 +524,11 @@ const realDscl: DsclRead = (record, key) => {
 	return m ? Number(m[1]) : null;
 };
 
-/** The install facts the preflight decides on, read as Jo (§ 3.1 Preflight). `checkout` is the runner's checkout, whose bundle inputs must match SOURCE. */
-export function readInstall(p: { checkout: string; libexec?: string; root?: string; sudoers?: string; dscl?: DsclRead }): InstallFacts {
+/**
+ * The install facts the preflight decides on, read as Jo (§ 3.1 Preflight). `checkout` is the runner's checkout, whose bundle inputs must match SOURCE.
+ * `trustedOwners` (default root only) are the uids the measured policy's path may be owned by, every ancestor included; a test install adds its own uid.
+ */
+export function readInstall(p: { checkout: string; libexec?: string; root?: string; sudoers?: string; dscl?: DsclRead; trustedOwners?: readonly number[] }): InstallFacts {
 	const libexec = p.libexec ?? AS2TEST_LIBEXEC;
 	const dscl = p.dscl ?? realDscl;
 	const layout = installLayout(p);
@@ -525,6 +544,9 @@ export function readInstall(p: { checkout: string; libexec?: string; root?: stri
 	const account = uid !== null && gid !== null && userGid === gid ? { uid, gid } : null;
 	const fileHashes: Record<string, string | null> = {};
 	for (const f of INSTALLED_FILES) fileHashes[f] = sha256File(join(libexec, f));
+	if (source.ok) for (const name of ["resources.json", "installed-omp.json"]) {
+		if (source.source.files[name]) fileHashes[name] = sha256File(join(libexec, name));
+	}
 	const inputHashes: Record<string, string | null> = {};
 	if (source.ok) {
 		for (const rel of Object.keys(source.source.inputs)) {
@@ -532,7 +554,74 @@ export function readInstall(p: { checkout: string; libexec?: string; root?: stri
 			inputHashes[rel] = relative(p.checkout, abs).startsWith("..") ? null : sha256File(abs);
 		}
 	}
-	return { account, source, stats: layout.map((l) => statFact(l.path)), fileHashes, inputHashes, layout };
+	// A SOURCE that records the measured resource policy makes it part of the install: root-owned, 0644, a regular file,
+	// on a physical path whose every ancestor is trusted-owned and not group- or world-writable (verifyTrustedPath's one
+	// exception: a root-owned sticky ancestor directory), holding measured costs.
+	const policyLayout: LayoutItem[] = source.ok && source.source.files[RESOURCE_POLICY] ? [{ path: join(libexec, RESOURCE_POLICY), kind: "file", owner: "root", mode: 0o644 }] : [];
+	const errors: string[] = [];
+	if (policyLayout.length > 0) {
+		const policy = join(libexec, RESOURCE_POLICY);
+		try {
+			verifyTrustedPath(policy, p.trustedOwners);
+			const why = resourcePolicyContentError(policy);
+			if (why !== null) errors.push(why);
+		} catch (e) {
+			errors.push(e instanceof Error ? e.message : String(e));
+		}
+	}
+	if (source.ok && source.source.files["installed-omp.json"]) {
+		try { readInstalledOmp(join(libexec, "installed-omp.json")); } catch (e) { errors.push(`installed-omp.json: ${e instanceof Error ? e.message : String(e)}`); }
+	}
+	const executionPolicyError = errors.length > 0 ? `trusted execution policy: ${errors.join("; ")}; repair provisioning (${SETUP_RESOURCES}), not wrapper argv` : undefined;
+	const all = [...layout, ...policyLayout];
+	return { account, source, stats: all.map((l) => statFact(l.path)), fileHashes, inputHashes, layout: all, ...(executionPolicyError ? { executionPolicyError } : {}) };
+}
+
+/** The measured resource policy every ordinary and proof part of the executor requires, beside the installed bun (execConfigOf's default). */
+export const RESOURCE_POLICY = "resources.json";
+const SETUP_RESOURCES = "install/as2test-setup.sh --resources=/absolute/measured-policy.json";
+
+/** Why the policy file's content is unusable (unreadable, not JSON, or not measured costs parseResourceCosts admits), or null. */
+function resourcePolicyContentError(path: string): string | null {
+	let text: string;
+	try {
+		text = readFileSync(path, "utf8");
+	} catch (e) {
+		return `${path} cannot be read: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`;
+	}
+	try {
+		parseResourceCosts(JSON.parse(text));
+	} catch (e) {
+		return `${path} is not a measured resource policy: ${(e as Error).message}`;
+	}
+	return null;
+}
+
+/**
+ * Why the executor that `render-exec` renders must not be activated over `path` (review F2), or null. Every refresh helper,
+ * main's installed one included, runs the fetched commit's `render-exec` before it stages anything, so this refusal holds
+ * whatever helper text a host carries: the policy must be a regular file (not a symlink), owned by its directory's owner
+ * (root on a real install, where the preflight and setup hold that directory root-owned), not group- or world-writable, and
+ * measured costs parseResourceCosts admits. The executor checks the whole trusted path again before every part.
+ */
+export function activationPolicyError(path: string): string | null {
+	let s;
+	try {
+		s = lstatSync(path);
+	} catch (e) {
+		const code = (e as NodeJS.ErrnoException).code;
+		return code === "ENOENT" ? `${path} is missing` : `${path} cannot be read: ${code ?? (e as Error).message}`;
+	}
+	if (s.isSymbolicLink() || !s.isFile()) return `${path} is ${s.isSymbolicLink() ? "a symlink" : "not a regular file"}`;
+	let dirUid: number;
+	try {
+		dirUid = lstatSync(dirname(path)).uid;
+	} catch (e) {
+		return `${dirname(path)} cannot be read: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`;
+	}
+	if (s.uid !== dirUid) return `${path} is owned by uid ${s.uid}, not by ${dirname(path)}'s owner ${dirUid}`;
+	if ((s.mode & 0o022) !== 0) return `${path} is group- or world-writable (mode ${(s.mode & 0o7777).toString(8)})`;
+	return resourcePolicyContentError(path);
 }
 
 /** The ids the owner roles stand for: root and wheel are 0 on a real install; a test passes its own. */
@@ -557,8 +646,9 @@ export type InstallVerdict = { ok: true; summary: string } | { ok: false; kind: 
  * The install half of the preflight (§ 3.1 Preflight; PLAN wl-mv718fxhwwcn40 § 1.2). The groups
  * run in order and the first failing one sets the kind:
  * 1. `install`: the account, SOURCE, SOURCE's ids against the account's and Jo's, every layout
- *    item's type, owner and mode (a rebuilt file only when it exists as a regular file), and the
- *    hashes of the files only setup writes (`bun`, `refresh`). The reason says to re-run setup.
+ *    item's type, owner and mode (a rebuilt file only when it exists as a regular file; resources.json, root 0644, when
+ *    SOURCE records it), the trusted execution policy's content and SOURCE hash, and the hashes of the files only setup
+ *    writes (`bun`, `refresh`). The reason says to re-run setup.
  * 2. `file-drift`: a rebuilt file (`exec`, `test-exec.js`) missing, not a regular file, or off its hash.
  * 3. `input-drift`: a SOURCE input differs in the runner's checkout.
  */
@@ -581,6 +671,10 @@ export function installDecision(f: InstallFacts, ids: OwnerIds): InstallVerdict 
 		const [u, g] = want(l.owner);
 		if (s.uid !== u || s.gid !== g) return install(`${l.path} is owned ${s.uid}:${s.gid}, expected ${u}:${g}`);
 		if (s.mode !== l.mode) return install(`${l.path} has mode ${s.mode.toString(8)}, expected ${l.mode.toString(8)}`);
+	}
+	if (f.executionPolicyError) return install(f.executionPolicyError);
+	for (const name of ["resources.json", "installed-omp.json"]) {
+		if (src.files[name] && f.fileHashes[name] !== src.files[name]) return install(`installed ${name} does not match its sha-256 in SOURCE`);
 	}
 	for (const name of INSTALLED_FILES) {
 		if (!rebuilt(name) && f.fileHashes[name] !== src.files[name]) return install(`installed ${name} does not match its sha-256 in SOURCE`);
@@ -789,7 +883,10 @@ export const REFRESH_STEP_SH = [
  * it re-execs itself under `env -i`, takes the lock on `refresh.d/lock` (fd 9, lockf), removes the build
  * dir an earlier run left (within the cleanup bound), fetches the `as2-verified` tag (AS2_VERIFIED_TAG) from the fixed origin
  * into the root-owned mirror `refresh.d/mirror.git`, and answers `current <sha12>` when the installed SOURCE is
- * byte for byte the SOURCE it would write. Otherwise it unpacks the tag's commit into a fresh build dir, runs bun
+ * byte for byte the SOURCE it would write. Before the fetch it refuses (71) unless `<libexec>/resources.json`, the
+ * measured resource policy the executor requires (RESOURCE_POLICY), is a regular file it owns and no group or other can
+ * write; the fetched commit's `render-exec` refuses an absent or invalid one too (activationPolicyError), which holds even
+ * under a helper rendered before this check. Otherwise it unpacks the tag's commit into a fresh build dir, runs bun
  * build, `bundle-inputs` and `render-exec` there as the build
  * user, reads the outputs through the build user into the root-only `refresh.d/stage`, checks the
  * staged copies, and installs `exec`, `test-exec.js` and `SOURCE` (last) through dotted `.new` names
@@ -809,7 +906,8 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		"# § 1.1), rendered by surface/src/as2test.ts renderRefreshHelper. It takes no arguments: every value is",
 		`# fixed here, and it never reads its caller's env, cwd or checkout. It fetches the ${AS2_VERIFIED_TAG} tag from ORIGIN into a`,
 		"# root-owned mirror, builds test-exec as the build user, checks what the build user hands back, and",
-		"# installs exec, test-exec.js and SOURCE (last). It never writes itself or the sudoers file.",
+		"# installs exec, test-exec.js and SOURCE (last). It never writes itself or the sudoers file. Without the measured",
+		"# resources.json the executor requires (a regular file it owns, not group- or world-writable) it fetches nothing.",
 		"# Exit: 0 refreshed or current · 64 usage · 69 lock · 70 fetch · 71 build, check, signal or cap · 72 install · 77 not root.",
 		"# Stdout: one line, `refreshed <old12>..<new12>` or `current <sha12>`.",
 		`# build user: ${o.buildUser ?? "the caller (a test render)"}; ${o.asRoot ? "runs as root only" : "a test render: installs with the caller's ids"}`,
@@ -858,6 +956,12 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		`as_build() { ${asUser}/usr/bin/env -i PATH=${WRAPPER_PATH} HOME="$BUILD" TMPDIR="$BUILD" "$@" 9>&-; }`,
 		"# build_step <stdout file, or - for stderr> <command...>: run as the build user, in $BUILD/src.",
 		`build_step() { as_build /bin/sh -c 'cd -- "$1" || exit 1; o=$2; shift 2; if [ "$o" = - ]; then exec "$@" 1>&2; fi; exec "$@" > "$o"' as2test-build "$BUILD/src" "$@"; }`,
+		"# errto <file> <command...>: the command's stderr reaches the helper's own stderr as it is written (tee), with a copy",
+		"# in <file>, which root opens in the root-only stage; its stdout stays its own. The exit status is the command's, kept",
+		"# in <file>.rc. run's background child does the redirection, so every line the command wrote has already passed on",
+		"# when a signal or the cap ends the step (TOOLS-REVIEW r3 minor 2), and a trap in the foreground shell still writes",
+		"# to the helper's own stderr.",
+		`errto() { _e=$1; shift; { { "$@" 2>&1 >&3 3>&-; echo "$?" > "$_e.rc"; } | /usr/bin/tee "$_e" >&2 3>&- 9>&-; } 3>&1; _rc=; IFS= read -r _rc < "$_e.rc"; case "$_rc" in "" | *[!0-9]*) printf 'as2test-refresh: %s\\n' "no exit status of $1 in $_e.rc; its stderr is above" >&2; return 1 ;; esac; return "$_rc"; }`,
 		"# take <name>: $BUILD/out/<name>, read as the build user, into the root-only stage. Root never opens a path in $BUILD.",
 		`take() { run /dev/null ${asUser}/bin/cat -- "$BUILD/out/$1" > "$STAGE/$1" || die ${REFRESH_EXIT.build} "cannot read the built $1 as the build user"; }`,
 		`h256() { if [ -f "$1" ] && [ ! -L "$1" ]; then /usr/bin/shasum -a 256 < "$1" | /usr/bin/awk '{ print $1 }'; else echo missing; fi; }`,
@@ -873,6 +977,8 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		`\tprintf 'file bun %s\\n' "$(h256 "$LIBEXEC/bun")"`,
 		`\tprintf 'file test-exec.js %s\\n' "$(h256 "$2")"`,
 		`\tprintf 'file refresh %s\\n' "$(h256 "$SELF")"`,
+		`\tprintf 'file ${RESOURCE_POLICY} %s\\n' "$(h256 "$LIBEXEC/${RESOURCE_POLICY}")"`,
+		`\tif [ -e "$LIBEXEC/installed-omp.json" ]; then printf 'file installed-omp.json %s\\n' "$(h256 "$LIBEXEC/installed-omp.json")"; fi`,
 		`\twhile IFS= read -r rel || [ -n "$rel" ]; do printf 'input %s %s\\n' "$rel" "$(blob256 "$rel")"; done < "$3"`,
 		"}",
 		"# check_inputs: every path bundle-inputs listed is a plain relative path and a file at $SHA; it says why not on stderr.",
@@ -985,6 +1091,12 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		"fi",
 		`run /dev/null /bin/rm -rf "$STAGE" && run /dev/null /bin/mkdir -m 0700 "$STAGE" || die ${REFRESH_EXIT.build} "cannot empty $STAGE"`,
 		"",
+		"# The measured resource policy (review F2): every ordinary and proof part of the executor this helper installs",
+		"# requires it, so without it, or with one that is not a regular file this helper's owner owns and no group or other",
+		"# can write, nothing is fetched, built or replaced. The fetched commit's render-exec checks its content as well.",
+		`run /dev/null /usr/bin/find "$LIBEXEC/${RESOURCE_POLICY}" -maxdepth 0 -type f -user "$OWN_U" ! -perm -0020 ! -perm -0002 > "$STAGE/policy" 2>/dev/null`,
+		`[ -s "$STAGE/policy" ] || die ${REFRESH_EXIT.build} "$LIBEXEC/${RESOURCE_POLICY}, the measured resource policy the executor requires, is missing, not a regular file owned by $OWN_U, or group- or world-writable; nothing was fetched or installed: provision it with ${SETUP_RESOURCES}"`,
+		"",
 		`# The fetch: the ${AS2_VERIFIED_TAG} tag only (PLAN wl-mvq4edbaf13vnk § 2: the commit the runner verified), from ORIGIN only,`,
 		"# into the root-owned mirror; its commit (an annotated tag peeled) is what the build checks out. Values a command",
 		"# prints reach the shell through a stage file and read, a builtin, never a foreground $(...).",
@@ -1018,7 +1130,14 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		'run /dev/null /bin/rm -f "$STAGE/src.tar"',
 		`run /dev/null build_step - "$BUN" build --target=bun --outfile="$BUILD/out/test-exec.js" --metafile="$BUILD/out/meta.json" surface/scripts/test-exec.ts || die ${REFRESH_EXIT.build} "bun build of surface/scripts/test-exec.ts at $SHA failed"`,
 		`run /dev/null build_step "$BUILD/out/inputs" "$BUN" surface/src/as2test.ts bundle-inputs "$BUILD/out/meta.json" "$BUILD/src" || die ${REFRESH_EXIT.build} "as2test.ts bundle-inputs at $SHA failed"`,
-		`run /dev/null build_step "$BUILD/out/exec" "$BUN" surface/src/as2test.ts render-exec --root "$ROOT" --bun "$LIBEXEC/bun" --script "$LIBEXEC/test-exec.js" --sweep-scope uid || die ${REFRESH_EXIT.build} "as2test.ts render-exec at $SHA failed"`,
+		"# The runner keeps only the helper's last stderr line (installCheck), so a refusal's die line carries render-exec's cause:",
+		"# its last stderr line that is not blank, a stack frame or the `Bun v<version> (<os> <arch>)` line Bun ends an uncaught",
+		"# error with (TOOLS-REVIEW r3 minor 3). Its whole stderr has already streamed to the helper's stderr.",
+		`RC=0; run /dev/null errto "$STAGE/render-exec.err" build_step "$BUILD/out/exec" "$BUN" surface/src/as2test.ts render-exec --root "$ROOT" --bun "$LIBEXEC/bun" --script "$LIBEXEC/test-exec.js" --sweep-scope uid || RC=$?`,
+		'if [ "$RC" -ne 0 ]; then',
+		`\tWHY=; if run /dev/null /usr/bin/awk '/^Bun v[0-9][0-9.]* [(]/ || /^[[:space:]]*$/ || /^[[:space:]]+at / { next } { last = $0 } END { print last }' "$STAGE/render-exec.err" > "$STAGE/render-exec.last"; then IFS= read -r WHY < "$STAGE/render-exec.last"; else WHY="its stderr in $STAGE/render-exec.err could not be read"; fi`,
+		`\tdie ${REFRESH_EXIT.build} "as2test.ts render-exec at $SHA failed (exit $RC): \${WHY:-it wrote no cause line to stderr}"`,
+		"fi",
 		"take exec",
 		"take test-exec.js",
 		"take inputs",
@@ -1142,9 +1261,30 @@ function cli(argv: string[]): number {
 		return i >= 0 ? rest[i + 1] : undefined;
 	};
 	try {
+		if (cmd === "validate-resources") {
+			process.stdout.write(`${JSON.stringify(parseResourceCosts(JSON.parse(readFileSync(flag("--file") ?? "", "utf8"))))}\n`);
+			return 0;
+		}
+		if (cmd === "render-runtime-config") {
+			const root = flag("--runtime-root") ?? "";
+			const source = flag("--artifact") ?? root;
+			const pin = parseInstalledOmp({ root, treeSha256: runtimeTreeHash(source), version: flag("--version") ?? "" });
+			process.stdout.write(`${JSON.stringify(pin)}\n`);
+			return 0;
+		}
+		if (cmd === "verify-runtime-config") {
+			process.stdout.write(`${JSON.stringify(readInstalledOmp(flag("--file") ?? ""))}\n`);
+			return 0;
+		}
 		if (cmd === "render-exec") {
 			// execConfigOf refuses any scope but uid or groups, and a missing or relative path.
-			process.stdout.write(renderExecWrapper({ root: flag("--root") ?? "", bun: flag("--bun") ?? "", script: flag("--script") ?? "", sweepScope: flag("--sweep-scope") as SweepScope }));
+			const options: ExecWrapperOptions = { root: flag("--root") ?? "", bun: flag("--bun") ?? "", script: flag("--script") ?? "", sweepScope: flag("--sweep-scope") as SweepScope,
+				resourcesPath: flag("--resources-path"), ompRuntimePath: flag("--omp-runtime-path") };
+			// Every refresh helper builds the executor through this command, so this is where activation refuses the executor
+			// its required policy is absent or invalid for, before any helper stages or replaces a file (review F2).
+			const refused = activationPolicyError(execConfigOf(options).resourcesPath);
+			if (refused !== null) throw new Error(`render-exec: refusing to render an executor that cannot admit a test part: ${refused}; nothing was rendered. Provision the measured policy with ${SETUP_RESOURCES}, then refresh`);
+			process.stdout.write(renderExecWrapper(options));
 			return 0;
 		}
 		if (cmd === "render-refresh") {
@@ -1172,6 +1312,9 @@ function cli(argv: string[]): number {
 			"                                  [--created C]... [--origin URL] [--build-user U] [--as-root] [--lock-wait-s N] [--allow-file-protocol]",
 			"       bun surface/src/as2test.ts render-provisional-source <render-refresh's flags> --bun-sha SHA256 --refresh-sha SHA256",
 			"       bun surface/src/as2test.ts bundle-inputs <metafile.json> <checkout>",
+			"       bun surface/src/as2test.ts validate-resources --file <measured-resources.json>",
+			"       bun surface/src/as2test.ts render-runtime-config --artifact <verified-tree> --runtime-root <fixed-install-root> --version <exact-stdout>",
+			"       bun surface/src/as2test.ts verify-runtime-config --file <root-owned-installed-omp.json>",
 			"",
 		].join("\n"),
 	);

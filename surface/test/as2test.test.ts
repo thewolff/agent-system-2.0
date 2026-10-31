@@ -13,7 +13,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
-	chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync,
+	chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -86,6 +86,8 @@ const FAKE_SUDO = `#!/bin/sh
 shift 3
 exec "$@"
 `;
+/** Explicit synthetic resource costs for fixture behavior: never a host measurement or a policy to install for real. */
+const SYNTHETIC_POLICY = JSON.stringify({ workerCpu: 1, workerMemoryBytes: 1, reserveCpu: 0, reserveMemoryBytes: 0, calibration: "synthetic test fixture only; not host calibration" });
 
 const alive = (pid: number): boolean => {
 	try {
@@ -142,15 +144,17 @@ function box(tag: string, opts: { killGraceMs?: number; sweepLockWaitMs?: number
 	mkdirSync(bin);
 	writeFileSync(join(bin, "sudo"), FAKE_SUDO, { mode: 0o755 });
 	const exec = join(base, "exec");
+	const resourcesPath = join(root, "resources.json");
+	writeFileSync(resourcesPath, SYNTHETIC_POLICY);
 	const { script, killGraceMs, ...limits } = opts;
-	writeFileSync(exec, renderExecWrapper({ root, bun: BUN, script: script ?? SCRIPT, sweepScope: "groups", hooks, killGraceMs: killGraceMs ?? 500, ...limits }), { mode: 0o755 });
+	writeFileSync(exec, renderExecWrapper({ root, bun: BUN, script: script ?? SCRIPT, sweepScope: "groups", resourcesPath, hooks, killGraceMs: killGraceMs ?? 500, ...limits }), { mode: 0o755 });
 	return { root, exec, bin, hooks };
 }
 
 /** A second wrapper over the same root with other test limits. */
 function wrapperFor(b: Box, name: string, opts: { sweepLockWaitMs?: number }): string {
 	const exec = join(b.root, "..", name);
-	writeFileSync(exec, renderExecWrapper({ root: b.root, bun: BUN, script: SCRIPT, sweepScope: "groups", hooks: b.hooks, killGraceMs: 500, ...opts }), { mode: 0o755 });
+	writeFileSync(exec, renderExecWrapper({ root: b.root, bun: BUN, script: SCRIPT, sweepScope: "groups", resourcesPath: join(b.root, "resources.json"), hooks: b.hooks, killGraceMs: 500, ...opts }), { mode: 0o755 });
 	return exec;
 }
 
@@ -217,6 +221,62 @@ function prepared(b: Box, runId: string, files: Record<string, string>, caps?: R
 	expect(r.exit).toBe(WRAPPER_EXIT.ok);
 	return sha;
 }
+
+describe("executor resource and proof boundary", () => {
+	test("full launch records admitted capacity and bounds both file workers and concurrent cases", () => {
+		const b = box("resources-full");
+		prepared(b, "tr-resfull", {
+			"ok.test.ts": OK_TEST,
+			"nested.test.ts": `import { expect, test } from "bun:test";\nlet active = 0;\ntest.concurrent.each(["first", "second"])("%s", async () => {\n active++;\n await Promise.resolve();\n expect(active).toBe(1);\n active--;\n});\n`,
+		}, { fullCapMin: 1, fullWorkers: 2 });
+		const r = call(b, { sub: "full", runId: "tr-resfull" });
+		expect(r.exit).toBe(0);
+		const receipt = JSON.parse(readFileSync(join(b.root, "runs/tr-resfull/full.resources.json"), "utf8"));
+		expect(receipt.status).toBe("admitted");
+		expect(receipt.configuredWorkers).toBe(2);
+		expect(receipt.selectedWorkers).toBeGreaterThan(0);
+		expect(receipt.selectedWorkers).toBeLessThanOrEqual(2);
+		expect(receipt.nestedConcurrency).toBe(1);
+		expect(receipt.bun.controls).toContain("--max-concurrency=1");
+		expect(receipt.costs.calibration).toContain("synthetic");
+		expect(receipt.inputs.availableMemoryBytes).toBeLessThanOrEqual(receipt.inputs.totalMemoryBytes);
+	});
+	test("missing calibration fails before child launch and retains an error receipt", () => {
+		const b = box("resources-missing");
+		prepared(b, "tr-resmissing", { "ok.test.ts": OK_TEST });
+		rmSync(join(b.root, "resources.json"));
+		const r = call(b, { sub: "full", runId: "tr-resmissing" });
+		expect(r.exit).toBe(WRAPPER_EXIT.failed);
+		expect(r.stderr).toContain("resource calibration");
+		const work = join(b.root, "runs/tr-resmissing");
+		expect(existsSync(join(work, "full.xml"))).toBe(false);
+		expect(JSON.parse(readFileSync(join(work, "full.resources.json"), "utf8"))).toMatchObject({ status: "error", selectedWorkers: null });
+	});
+	test("proof budget flag reaches only admitted proof children without caller credentials", () => {
+		for (const enabled of [false, true]) {
+			const b = box(`proof-env-${enabled}`);
+			const runId = enabled ? "tr-proofyes" : "tr-proofno";
+			prepared(b, runId, { "env.test.ts": ENV_TEST }, { fullCapMin: 1, timingProof: { productionBudget: enabled, installedOmp: false } });
+			const r = call(b, { sub: "full", runId });
+			expect(r.exit).toBe(0);
+			const env = JSON.parse(readFileSync(join(b.root, "runs", runId, "env.json"), "utf8"));
+			expect(env.AS2_STUCK_BUDGET_PROOF).toBe(enabled ? "1" : undefined);
+			expect(env.GH_TOKEN).toBeUndefined();
+			expect(env.PATH).not.toContain(b.bin);
+			expect(env.HOME).toBe(join(b.root, "runs", runId, "home"));
+		}
+	});
+	test("extra proof fields and operator-user installed OMP are failures, not skipped tests", () => {
+		for (const timingProof of [{ productionBudget: true, installedOmp: false, env: { GH_TOKEN: "bad" } }, { productionBudget: false, installedOmp: true }]) {
+			const b = box("proof-refuse");
+			prepared(b, "tr-proofrefuse", { "ok.test.ts": OK_TEST }, { fullCapMin: 1, timingProof });
+			const r = call(b, { sub: "full", runId: "tr-proofrefuse" });
+			expect(r.exit).toBe(WRAPPER_EXIT.failed);
+			expect(r.stderr).toContain("admission failed");
+			expect(existsSync(join(b.root, "runs/tr-proofrefuse/full.xml"))).toBe(false);
+		}
+	});
+});
 
 // ---- the stuck capture's file (PLAN wl-mvq4edh02r5z40 D5) ----------------------------------------------------
 
@@ -512,8 +572,10 @@ describe("prepare, full and solo", () => {
 		// The wrapper fixes PATH, LANG, TERM and SHELL, and takes USER and LOGNAME from `id -un`, never from the caller.
 		const me = userInfo().username;
 		const expected = childEnv({ PATH: SYS_PATH, LANG: "en_US.UTF-8", USER: me, LOGNAME: me, SHELL: "/bin/sh", TERM: "dumb" }, work);
-		// bun test sets NODE_ENV for its own tests; the executor adds the part's marker dir (PLAN wl-mvq8x4pkjmx69s D3); everything else is ours.
-		expect(Object.keys(env).filter((k) => !(k in expected)).sort()).toEqual(Object.keys(env).filter((k) => k === "NODE_ENV" || k === "AS2TEST_STUCK_MARKERS").sort());
+		// bun test sets NODE_ENV for its own tests, and JEST_WORKER_ID and BUN_TEST_WORKER_ID in each worker the part's explicit
+		// `--parallel=<n>` starts; the executor adds the part's marker dir (PLAN wl-mvq8x4pkjmx69s D3); everything else is ours.
+		const bunSet = ["NODE_ENV", "JEST_WORKER_ID", "BUN_TEST_WORKER_ID", "AS2TEST_STUCK_MARKERS"];
+		expect(Object.keys(env).filter((k) => !(k in expected)).sort()).toEqual(Object.keys(env).filter((k) => bunSet.includes(k)).sort());
 		expect(env.AS2TEST_STUCK_MARKERS).toBe(join(work, "stuck-markers-full"));
 		for (const k of ["GH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "MOONSHOT_API_KEY", "SSH_AUTH_SOCK", "OMP_TOKEN", "AGENT_SYSTEM_TEST_RUNS"]) expect(env[k]).toBeUndefined();
 		for (const k of CHILD_ENV_ALLOWLIST) expect(env[k]).toBe(expected[k]!);
@@ -746,7 +808,7 @@ describe("fast: only the named ./ test files inside the clone, in one bun test c
 	/** test-exec reached without the wrapper, as a caller that skipped the sh checks would. */
 	const direct = (b: Box, args: string[]): Ran => {
 		const r = Bun.spawnSync([BUN, SCRIPT, ...args], {
-			env: { PATH: SYS_PATH, AS2TEST_EXEC_CONFIG: JSON.stringify(execConfigOf({ root: b.root, bun: BUN, script: SCRIPT, sweepScope: "groups" })) }, stdout: "pipe", stderr: "pipe",
+			env: { PATH: SYS_PATH, AS2TEST_EXEC_CONFIG: JSON.stringify(execConfigOf({ root: b.root, bun: BUN, script: SCRIPT, sweepScope: "groups", resourcesPath: join(b.root, "resources.json") })) }, stdout: "pipe", stderr: "pipe",
 		});
 		return { exit: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
 	};
@@ -2250,7 +2312,7 @@ describe("preflight: the install", () => {
 		for (const l of installLayout({ libexec, root, sudoers })) chmodSync(l.path, l.mode);
 		const dscl = (account: { uid: number; gid: number } | null) => (record: string, key: string) =>
 			account === null ? null : record.startsWith("/Users/") ? (key === "UniqueID" ? account.uid : account.gid) : account.gid;
-		const read = (account: { uid: number; gid: number } | null = me) => readInstall({ checkout: REPO, libexec, root, sudoers, dscl: dscl(account) });
+		const read = (account: { uid: number; gid: number } | null = me) => readInstall({ checkout: REPO, libexec, root, sudoers, dscl: dscl(account), trustedOwners: [0, me.uid] });
 		return { libexec, root, sudoers, read };
 	}
 
@@ -2376,6 +2438,68 @@ describe("preflight: the install", () => {
 		const layout = installLayout({ libexec: "/l", root: "/r", sudoers: "/s" });
 		expect(layout).toContainEqual(expect.objectContaining({ path: "/l/refresh", kind: "file", owner: "root", mode: 0o755 }));
 		expect(layout).toContainEqual(expect.objectContaining({ path: "/l/refresh.d", kind: "dir", owner: "root", mode: 0o700 }));
+	});
+
+	test("F2: a SOURCE that records resources.json holds it as an install item (root, 0644, a regular file of measured costs, its SOURCE hash); otherwise it is install, never file-drift", () => {
+		const withPolicy = (tag: string) => {
+			const i = install(tag);
+			const policy = join(i.libexec, "resources.json");
+			writeFileSync(policy, SYNTHETIC_POLICY);
+			chmodSync(policy, 0o644);
+			writeFileSync(join(i.libexec, "SOURCE"), readFileSync(join(i.libexec, "SOURCE"), "utf8").replace(/^(input .*)$/m, `file resources.json ${sha(SYNTHETIC_POLICY)}\n$1`));
+			return { ...i, policy };
+		};
+		expect(installDecision(withPolicy("f2-ok").read(), ids)).toMatchObject({ ok: true });
+		const cases: [string, (policy: string) => void, string][] = [
+			["missing", (p) => rmSync(p), "resources.json is missing, expected a file"],
+			["group-writable", (p) => chmodSync(p, 0o664), "resources.json has mode 664, expected 644"],
+			["a symlink", (p) => { rmSync(p); symlinkSync(join(p, "..", "bun"), p); }, "resources.json is symlink, expected a file"],
+			["not measured costs", (p) => writeFileSync(p, "{}"), "is not a measured resource policy"],
+			["off its SOURCE hash", (p) => writeFileSync(p, SYNTHETIC_POLICY.replace('"workerCpu":1', '"workerCpu":2')), "installed resources.json does not match its sha-256 in SOURCE"],
+			["an ancestor others can write", (p) => chmodSync(join(p, "..", ".."), 0o777), `must be owned by uid 0 or ${me.uid}, physical and not group/world writable`],
+		];
+		for (const [name, breakIt, says] of cases) {
+			const i = withPolicy(`f2-${name.replace(/[^a-z]+/g, "-")}`);
+			breakIt(i.policy);
+			const v = installDecision(i.read(), ids);
+			expect({ name, ok: v.ok, kind: !v.ok && v.kind }).toEqual({ name, ok: false, kind: "install" });
+			expect(!v.ok && v.reason).toContain(says);
+		}
+	});
+
+	test("F2: render-exec, which every refresh helper builds the executor with, refuses an absent or unusable policy and renders nothing", () => {
+		const base = dir("f2-render");
+		const libexec = join(base, "libexec");
+		mkdirSync(libexec);
+		const policy = join(libexec, "resources.json");
+		const render = () => {
+			const r = Bun.spawnSync([BUN, "surface/src/as2test.ts", "render-exec", "--root", join(base, "root"), "--bun", join(libexec, "bun"), "--script", join(libexec, "test-exec.js"), "--sweep-scope", "uid"], {
+				cwd: REPO, stdout: "pipe", stderr: "pipe",
+			});
+			return { exit: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
+		};
+		const refused = "render-exec: refusing to render an executor that cannot admit a test part";
+		const cases: [string, () => void, string][] = [
+			["missing", () => {}, `${policy} is missing`],
+			["a symlink", () => { writeFileSync(join(base, "elsewhere.json"), SYNTHETIC_POLICY); symlinkSync(join(base, "elsewhere.json"), policy); }, `${policy} is a symlink`],
+			["group-writable", () => { writeFileSync(policy, SYNTHETIC_POLICY); chmodSync(policy, 0o664); }, `${policy} is group- or world-writable (mode 664)`],
+			["not JSON", () => { writeFileSync(policy, "not json"); chmodSync(policy, 0o644); }, `${policy} is not a measured resource policy`],
+			["no calibration receipt", () => { writeFileSync(policy, JSON.stringify({ workerCpu: 1, workerMemoryBytes: 1, reserveCpu: 0, reserveMemoryBytes: 0, calibration: "" })); chmodSync(policy, 0o644); }, "needs a measurement receipt"],
+		];
+		for (const [name, make, says] of cases) {
+			rmSync(policy, { force: true });
+			make();
+			const out = render();
+			expect({ name, exit: out.exit, stdout: out.stdout }).toEqual({ name, exit: 1, stdout: "" });
+			expect(out.stderr).toContain(refused);
+			expect(out.stderr).toContain(says);
+		}
+		rmSync(policy, { force: true });
+		writeFileSync(policy, SYNTHETIC_POLICY);
+		chmodSync(policy, 0o644);
+		const ok = render();
+		expect({ exit: ok.exit, stderr: ok.stderr }).toEqual({ exit: 0, stderr: "" });
+		expect(ok.stdout).toBe(renderExecWrapper({ root: join(base, "root"), bun: join(libexec, "bun"), script: join(libexec, "test-exec.js"), sweepScope: "uid" }));
 	});
 
 	test("SOURCE parses strictly", () => {
@@ -2525,7 +2649,10 @@ describe("the refresh helper", () => {
 		/** installDecision over this install, with the test ids, for the runner's checkout `checkout`. */
 		decide: (checkout: string) => InstallVerdict;
 	}
-	/** A tmp install as setup leaves it before the helper's first run: bun, refresh, refresh.d and the root; no exec, test-exec.js or SOURCE. */
+	/**
+	 * A tmp install as setup leaves it before the helper's first run: bun, refresh, refresh.d, the measured resources.json
+	 * (synthetic costs, 0644) and the root; no exec, test-exec.js or SOURCE.
+	 */
 	function helperRig(tag: string, from: FixtureOrigin | null): HelperRig {
 		const render = newExport<RenderRefresh>("renderRefreshHelper");
 		const base = dir(tag);
@@ -2539,6 +2666,8 @@ describe("the refresh helper", () => {
 		writeFileSync(join(root, "locks", "sweep.db"), "");
 		writeFileSync(sudoers, "x");
 		writeFileSync(join(libexec, "bun"), "stand-in for the installed bun\n");
+		writeFileSync(join(libexec, "resources.json"), SYNTHETIC_POLICY);
+		chmodSync(join(libexec, "resources.json"), 0o644);
 		const facts = { bunVersion: Bun.version, user: AS2TEST_USER, uid: me.uid, gid: me.gid, jo: userInfo().username, joUid: me.uid, created: ["user", "group", libexec, root, sudoers] };
 		const options = (o: Record<string, unknown> = {}) => ({
 			origin: from?.bare ?? join(base, "no-origin.git"), libexec, root, bun: BUN, facts, buildUser: null, asRoot: false, allowFileProtocol: true, ...o,
@@ -2559,7 +2688,7 @@ describe("the refresh helper", () => {
 			const [exit, stdout, stderr] = await Promise.all([p.exited, new Response(p.stdout).text(), new Response(p.stderr).text()]);
 			return { exit, stdout, stderr };
 		};
-		const decide = (checkout: string) => installDecision(readInstall({ checkout, libexec, root, sudoers, dscl: fakeDscl }), ids);
+		const decide = (checkout: string) => installDecision(readInstall({ checkout, libexec, root, sudoers, dscl: fakeDscl, trustedOwners: [0, me.uid] }), ids);
 		return { base, libexec, root, state, facts, options, place, run, spawn, decide };
 	}
 	const sourceOf = (libexec: string) => {
@@ -2620,7 +2749,7 @@ describe("the refresh helper", () => {
 		expect(Object.keys(src.inputs)).toContain(INPUT);
 		expect(Object.keys(src.inputs)).toContain(TEST_EXEC);
 		for (const [rel, h] of Object.entries(src.inputs)) expect({ rel, h }).toEqual({ rel, h: sha256(blobAt(o.bare, mainSha, rel)) });
-		const installed = Object.fromEntries(["exec", "bun", "test-exec.js", "refresh"].map((f) => [f, sha256(readFileSync(join(r.libexec, f)))]));
+		const installed = Object.fromEntries(["exec", "bun", "test-exec.js", "refresh", "resources.json"].map((f) => [f, sha256(readFileSync(join(r.libexec, f)))]));
 		expect(src.files).toEqual(installed);
 		expect(readFileSync(join(r.libexec, "exec"), "utf8")).toBe(
 			renderExecWrapper({ root: r.root, bun: join(r.libexec, "bun"), script: join(r.libexec, "test-exec.js"), sweepScope: "uid" }),
@@ -2636,7 +2765,7 @@ describe("the refresh helper", () => {
 		expect(r.decide(o.work)).toEqual({ ok: false, kind: "input-drift", reason: `${INPUT} in this checkout differs from the installed test-exec bundle` });
 	}, 120_000);
 
-	test("T5b: a legacy install (today's setup SOURCE: three file lines, a path in source) at main's sha is rebuilt, and the new installDecision accepts it", () => {
+	test("T5b: a legacy install (today's setup SOURCE: three file lines, a path in source) at main's sha, with the measured policy in place, is rebuilt, and the new installDecision accepts it", () => {
 		const o = fixtureOrigin("t5b");
 		const mainSha = git(o.work, "rev-parse", "HEAD");
 		const r = helperRig("t5b", o);
@@ -2659,10 +2788,65 @@ describe("the refresh helper", () => {
 		expect(src.sourceSha).toBe(mainSha);
 		expect(src.source).toBe(o.bare);
 		expect(src.files.refresh).toBe(h("refresh"));
+		expect(src.files["resources.json"]).toBe(h("resources.json"));
 		expect(src.inputs).toEqual(built.inputs);
 		expect(r.decide(o.work)).toMatchObject({ ok: true });
 		expect(r.run()).toMatchObject({ exit: 0, stdout: `current ${sha12(mainSha)}\n` });
 	}, 120_000);
+
+	test("F2: a legacy install refresh without a usable measured policy (missing, invalid, group-writable, a symlink) exits 71 naming it and leaves the install byte for byte unchanged, under this helper and under one rendered before the check", () => {
+		const o = fixtureOrigin("f2-legacy");
+		const mainSha = git(o.work, "rev-parse", "HEAD");
+		const r = helperRig("f2-legacy", o);
+		expect(r.run()).toMatchObject({ exit: 0 });
+		const built = sourceOf(r.libexec);
+		const h = (f: string) => sha256(readFileSync(join(r.libexec, f)));
+		// The legacy SOURCE (setup's, before the helper and the policy existed) over a working exec and test-exec.js.
+		writeFileSync(join(r.libexec, "SOURCE"), [
+			"version 1", `source ${o.work}`, `source-sha ${mainSha}`, `bun-version ${Bun.version}`, `user ${AS2TEST_USER}`, `uid ${me.uid}`, `gid ${me.gid}`,
+			`jo ${userInfo().username}`, `jo-uid ${me.uid}`, ...(r.facts.created as string[]).map((c) => `created ${c}`),
+			...["exec", "bun", "test-exec.js"].map((f) => `file ${f} ${h(f)}`), ...Object.entries(built.inputs).map(([rel, s]) => `input ${rel} ${s}`), "",
+		].join("\n"));
+		const policy = join(r.libexec, "resources.json");
+		const valid = join(r.base, "valid-policy.json");
+		writeFileSync(valid, SYNTHETIC_POLICY);
+		const cases: [string, () => void, string][] = [
+			["missing", () => {}, "resources.json, the measured resource policy the executor requires, is missing"],
+			["group-writable", () => { writeFileSync(policy, SYNTHETIC_POLICY); chmodSync(policy, 0o664); }, "or group- or world-writable; nothing was fetched or installed"],
+			["a symlink", () => symlinkSync(valid, policy), "not a regular file owned by"],
+			["not measured costs", () => { writeFileSync(policy, "{}"); chmodSync(policy, 0o644); }, "render-exec: refusing to render an executor that cannot admit a test part"],
+		];
+		const checkRefusal = (helper: string) => {
+			for (const [name, make, why] of cases) {
+				rmSync(policy, { force: true });
+				make();
+				const before = tree(r.libexec, ["refresh.d"]);
+				const dirs = buildDirs();
+				const out = r.run();
+				expect({ helper, name, exit: out.exit, stdout: out.stdout }).toEqual({ helper, name, exit: 71, stdout: "" });
+				expect(out.stderr).toContain(why);
+				// The runner keeps only the helper's last stderr line, so that line must name the refusal (review r2 R3).
+				if (name === "not measured costs") expect(out.stderr.trim().split("\n").at(-1)).toMatch(/render-exec at [0-9a-f]+ failed \(exit \d+\): .*is not a measured resource policy/);
+				expect(tree(r.libexec, ["refresh.d"])).toEqual(before);
+				expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
+				expect(buildDirs().filter((d) => !dirs.includes(d))).toEqual([]);
+			}
+		};
+		checkRefusal("this helper");
+		// A helper rendered before the check (its text without the policy gate) builds the fetched commit's render-exec, which refuses.
+		const gated = readFileSync(join(r.libexec, "refresh"), "utf8");
+		const old = gated.split("\n").filter((l) => !l.includes("$STAGE/policy")).join("\n");
+		expect(old).not.toBe(gated);
+		writeFileSync(join(r.libexec, "refresh"), old);
+		cases.splice(0, cases.length, ...cases.map(([n, m]): [string, () => void, string] => [n, m, "render-exec: refusing to render an executor that cannot admit a test part"]));
+		checkRefusal("a pre-F2 helper");
+		// Provisioned, the same legacy install is rebuilt.
+		rmSync(policy, { force: true });
+		writeFileSync(policy, SYNTHETIC_POLICY);
+		chmodSync(policy, 0o644);
+		expect(r.run()).toMatchObject({ exit: 0, stdout: `refreshed ${sha12(mainSha)}..${sha12(mainSha)}\n` });
+		expect(sourceOf(r.libexec).files["resources.json"]).toBe(h("resources.json"));
+	}, 240_000);
 
 	test("R10 (PLAN wl-mvq4edbaf13vnk § 2 The bundle): it builds the as2-verified tag's commit, never main: main moving alone is current, a re-pointed tag (annotated or back to an older commit) rebuilds at its commit, and a tag gone from the origin exits 70 naming it, install unchanged", () => {
 		expect(loose.AS2_VERIFIED_TAG).toBe(VERIFIED_TAG);
@@ -2877,6 +3061,75 @@ describe("the refresh helper", () => {
 			});
 		expect(await until(() => alive().length === 0, 5_000)).toBe(true);
 	}, 240_000);
+
+	// TOOLS-REVIEW r3 minor 2: render-exec's stderr is streamed, not only captured, so a stop mid-render-exec loses none of it.
+	test("F2: render-exec's stderr reaches the refresh helper's stderr as it is written, and a TERM or the cap's ALRM mid-render-exec loses none of it", async () => {
+		const o = fixtureOrigin("f2-live");
+		const r = helperRig("f2-live", o);
+		expect(r.run()).toMatchObject({ exit: 0 });
+		const started = join(r.base, "render-exec.pid");
+		const said = "render-exec probe: written before render-exec stalls";
+		// main's render-exec writes one stderr line, records its pid, then blocks on a wait nothing ends: only the helper's stop ends it.
+		const stall = [
+			'import { writeFileSync as __wf } from "node:fs";',
+			'if (process.argv[2] === "render-exec") {',
+			`\tprocess.stderr.write(${JSON.stringify(`${said}\n`)});`,
+			`\t__wf(${JSON.stringify(started)}, String(process.pid));`,
+			"\tAtomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);",
+			"}",
+			"",
+		].join("\n");
+		o.commit({ [AS2]: stall + fixtureSources().get(AS2)! }, "a render-exec that stalls after one stderr line");
+		const installed = tree(r.libexec, ["refresh.d"]);
+		const before = buildDirs();
+		const children: number[] = [];
+		// SIGALRM is what the helper's cap watchdog sends it: sending it here takes the cap's path without waiting out a cap.
+		for (const [signal, says] of [["SIGTERM", "as2test-refresh: ended by a signal; nothing was installed"], ["SIGALRM", " s cap; nothing was installed"]] as const) {
+			rmSync(started, { force: true });
+			const p = Bun.spawn([join(r.libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: r.base, stdout: "pipe", stderr: "pipe" });
+			pids.push(p.pid);
+			let stderr = "";
+			const decoder = new TextDecoder();
+			const drained = (async () => { for await (const chunk of p.stderr) stderr += decoder.decode(chunk, { stream: true }); })();
+			// Live: the line is on the helper's stderr while render-exec still runs, before any stop.
+			expect(await until(() => stderr.includes(said) && existsSync(started) && readFileSync(started, "utf8") !== "", 90_000)).toBe(true);
+			children.push(Number(readFileSync(started, "utf8")));
+			pids.push(children.at(-1)!);
+			process.kill(p.pid, signal);
+			const [exit, stdout] = await Promise.all([p.exited, new Response(p.stdout).text(), drained]);
+			expect({ signal, exit, stdout }).toEqual({ signal, exit: 71, stdout: "" });
+			const lines = stderr.trim().split("\n");
+			expect(lines.filter((l) => l === said)).toHaveLength(1);
+			const stop = lines.findIndex((l) => l.includes(says));
+			expect(stop).toBeGreaterThan(lines.indexOf(said));
+			expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
+			expect(buildDirs().filter((d) => !before.includes(d))).toEqual([]);
+			expect(tree(r.libexec, ["refresh.d"])).toEqual(installed);
+		}
+		const alive = () => children.filter((pid) => {
+			try { process.kill(pid, 0); return true; }
+			catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; }
+		});
+		expect(await until(() => alive().length === 0, 5_000)).toBe(true);
+	}, 240_000);
+
+	// TOOLS-REVIEW r3 minor 3: an uncaught error ends with Bun's version line, which names no cause.
+	test("F2: render-exec dying uncaught gives the refresh helper's die line its error, never Bun's version line or a stack frame", () => {
+		const o = fixtureOrigin("f2-uncaught");
+		const r = helperRig("f2-uncaught", o);
+		expect(r.run()).toMatchObject({ exit: 0 });
+		const installed = tree(r.libexec, ["refresh.d"]);
+		const cause = "render-exec probe: an uncaught failure names its cause";
+		const sha = o.commit({ [AS2]: `if (process.argv[2] === "render-exec") throw new Error(${JSON.stringify(cause)});\n${fixtureSources().get(AS2)!}` }, "a render-exec that dies uncaught");
+		const out = r.run();
+		expect({ exit: out.exit, stdout: out.stdout }).toEqual({ exit: 71, stdout: "" });
+		const lines = out.stderr.trim().split("\n");
+		// Bun's version line and the stack frame streamed above the die line, which skips both.
+		expect(lines.filter((l) => /^Bun v\d/.test(l))).toHaveLength(1);
+		expect(lines.some((l) => /^\s+at /.test(l))).toBe(true);
+		expect(lines.at(-1)).toBe(`as2test-refresh: as2test.ts render-exec at ${sha} failed (exit 1): error: ${cause}`);
+		expect(tree(r.libexec, ["refresh.d"])).toEqual(installed);
+	}, 180_000);
 
 	test("T6: a TERM during a stalled staging install, a step that once ran in the foreground, exits 71 within seconds with no .new file, no build dir and the install unchanged; a second helper meanwhile waits on the lock and exits 69", async () => {
 		const o = fixtureOrigin("t6-stall");
@@ -3273,14 +3526,30 @@ esac
 		const libexec = join(prefix, "usr", "local", "libexec", "as2test");
 		const root = join(prefix, "Users", "Shared", "as2test");
 		const sudoers = join(prefix, "etc", "sudoers.d", "as2test");
-		return { base, prefix, work, bare, libexec, root, sudoers, run, tree, sudoCalls, owners, account };
+		/** The operator's measured policy, as `--resources` names it: synthetic costs, never a host measurement. */
+		const measured = join(base, "measured-policy.json");
+		writeFileSync(measured, SYNTHETIC_POLICY);
+		const resources = `--resources=${measured}`;
+		/** Every path under the prefix with its type, mode and, for a file, its sha-256 (a symlink, its target): the install byte for byte. */
+		const bytes = (): Record<string, string> =>
+			Object.fromEntries(tree().map((p) => {
+				const s = lstatSync(p);
+				const kind = s.isSymbolicLink() ? `link ${readlinkSync(p)}` : s.isFile() ? `file ${new Bun.CryptoHasher("sha256").update(readFileSync(p)).digest("hex")}` : s.isDirectory() ? "dir" : "other";
+				return [p, `${(s.mode & 0o7777).toString(8)} ${kind}`];
+			}));
+		return { base, prefix, work, bare, libexec, root, sudoers, run, tree, bytes, sudoCalls, owners, account, measured, resources };
 	}
 	const sudoersLines = (libexec: string) => [`${JO} ALL=(_as2test) NOPASSWD: ${join(libexec, "exec")}`, `${JO} ALL=(root) NOPASSWD: ${join(libexec, "refresh")} ""`];
 
 	test("--dry-run prints the dscl and sudoers plan with a free id >= 600, the helper's text and sha, and changes nothing (T8: no sudo call)", () => {
 		const r = rig("setup-dry");
+		const resources = join(r.base, "measured-fixture.json");
+		writeFileSync(resources, JSON.stringify({ workerCpu: 1, workerMemoryBytes: 1, reserveCpu: 0, reserveMemoryBytes: 0, calibration: "synthetic setup fixture only" }));
+		const artifact = join(r.base, "verified-fixture");
+		mkdirSync(join(artifact, "bin"), { recursive: true });
+		for (const exe of ["omp", "bun"]) writeFileSync(join(artifact, "bin", exe), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
 		const before = r.tree();
-		const out = r.run(["--dry-run"]);
+		const out = r.run(["--dry-run", `--resources=${resources}`, `--omp-artifact=${artifact}`, "--omp-version=synthetic-fixture"]);
 		expect(out.stderr).toBe("");
 		expect(out.exit).toBe(0);
 		// 600 is a taken uid and 601 a taken gid: the first id free as both is 602.
@@ -3292,18 +3561,21 @@ esac
 		const [execLine, refreshLine] = sudoersLines(r.libexec);
 		expect(out.stdout).toContain(`  sudoers ${r.sudoers} (root:wheel 0440), two lines:\n    ${execLine}\n    ${refreshLine}\n`);
 		expect(out.stdout).toContain(`checkout ${r.work} at HEAD ${git(r.work, "rev-parse", "HEAD")}; HEAD is on origin/main`);
-		expect(out.stdout).toContain(`fetches main from ${r.bare}`);
+		expect(out.stdout).toContain(`fetches the ${VERIFIED_TAG} tag (refs/tags/${VERIFIED_TAG}) from ${r.bare}`);
 		expect(out.stdout).toMatch(new RegExp(`the refresh helper ${r.libexec}/refresh, sha-256 [0-9a-f]{64}, in full:\\n----- begin ${r.libexec}/refresh -----\\n#!/bin/sh\\n`));
 		expect(out.stdout).toContain(`sudo -n ${r.libexec}/refresh`);
 		expect(out.stdout).toContain("dry run: nothing changed");
+		expect(out.stdout).toContain("synthetic setup fixture only");
+		expect(out.stdout).toContain('"version":"synthetic-fixture"');
+		expect(out.stdout).toContain("installed-omp.json");
 		expect(r.tree()).toEqual(before);
 		expect(r.sudoCalls()).toBe("");
 	}, 60_000);
 
-	test("T8: setup installs bun, the helper and both sudoers lines; its last sudo step runs the helper, which builds an install installDecision accepts; undo removes it all", () => {
+	test("T8: setup installs the measured policy, bun, the helper and both sudoers lines; its last sudo step runs the helper, which builds an install installDecision accepts; undo removes it all", () => {
 		const r = rig("setup-t8");
 		const mainSha = git(r.bare, "rev-parse", `refs/tags/${VERIFIED_TAG}^{commit}`);
-		const out = r.run([], "y\n");
+		const out = r.run([r.resources], "y\n");
 		expect(out.stderr).not.toContain("as2test-setup:");
 		expect(out.exit).toBe(0);
 
@@ -3342,6 +3614,8 @@ esac
 			`install -o 602 -g 602 -m 0600 /dev/null ${R}/locks/sweep.db`,
 			`install -d -o root -g wheel -m 0755 ${L}`,
 			`install -d -o root -g wheel -m 0700 ${L}/refresh.d`,
+			`install -o root -g wheel -m 0644 <tmp>/resources.json ${L}/.resources.json.new`,
+			`mv -f ${L}/.resources.json.new ${L}/resources.json`,
 			`install -o root -g wheel -m 0755 <tmp>/bun ${L}/bun`,
 			`install -o root -g wheel -m 0755 <tmp>/refresh ${L}/refresh`,
 			`install -o root -g wheel -m 0755 <tmp>/SOURCE ${L}/.SOURCE.new`,
@@ -3369,7 +3643,7 @@ esac
 		const layout = installLayout({ libexec: r.libexec, root: r.root, sudoers: r.sudoers });
 		const helperBuilt = ["exec", "test-exec.js"].map((f) => join(r.libexec, f));
 		expect(layout.map((l) => l.path).filter((p) => !own.has(p))).toEqual(helperBuilt);
-		const facts = readInstall({ checkout: r.work, libexec: r.libexec, root: r.root, sudoers: r.sudoers, dscl: () => 602 });
+		const facts = readInstall({ checkout: r.work, libexec: r.libexec, root: r.root, sudoers: r.sudoers, dscl: () => 602, trustedOwners: [0, me.uid] });
 		const owned = { ...facts, stats: facts.stats.map((s) => (own.has(s.path) ? { ...s, uid: own.get(s.path)![0], gid: own.get(s.path)![1] } : s)) };
 		const verdict = installDecision(owned, { root: me.uid, wheel: me.gid, jo: me.uid });
 		expect(verdict).toEqual({ ok: true, summary: expect.stringContaining(`source ${r.bare} at ${mainSha.slice(0, 12)}`) });
@@ -3394,7 +3668,7 @@ esac
 		const gone = join(r.base, "gone.git");
 		git(r.work, "remote", "set-url", "origin", gone);
 		const env = { AS2TEST_SETUP_TEST_ORIGIN: gone };
-		const out = r.run([], "y\n", env);
+		const out = r.run([r.resources], "y\n", env);
 		expect(out.exit).toBe(1);
 		expect(out.stderr).toContain(`fetching the ${VERIFIED_TAG} tag from ${gone} failed`);
 		expect(out.stderr).toContain("the refresh helper failed (its message is above); everything before it is in place, and the provisional SOURCE records it.");
@@ -3406,7 +3680,7 @@ esac
 	/** installDecision over a setup rig's install, with the owners setup asked install for (the fence cannot chown). */
 	function rigVerdict(r: { work: string; libexec: string; root: string; sudoers: string; owners: () => Map<string, [number, number]> }): InstallVerdict {
 		const own = r.owners();
-		const facts = readInstall({ checkout: r.work, libexec: r.libexec, root: r.root, sudoers: r.sudoers, dscl: () => 602 });
+		const facts = readInstall({ checkout: r.work, libexec: r.libexec, root: r.root, sudoers: r.sudoers, dscl: () => 602, trustedOwners: [0, me.uid] });
 		const owned = { ...facts, stats: facts.stats.map((s) => (own.has(s.path) ? { ...s, uid: own.get(s.path)![0], gid: own.get(s.path)![1] } : s)) };
 		return installDecision(owned, { root: me.uid, wheel: me.gid, jo: me.uid });
 	}
@@ -3439,8 +3713,9 @@ esac
 		// (c) installDecision sends the runner's preflight to the helper, not back to setup.
 		expect(rigVerdict(r)).toEqual({ ok: false, kind: "file-drift", reason: "installed exec is missing" });
 
-		// (b) A re-run takes the account it recorded and gets as far as the helper again.
+		// (b) A re-run takes the account it recorded, keeps the measured policy the first run installed, and gets as far as the helper again.
 		const again = r.run([], "y\n", env);
+		expect(again.stdout).toContain(`${join(r.libexec, "resources.json")}: kept (the measured resource policy`);
 		expect(again.stderr).not.toContain("did not record");
 		expect(again.stdout).toContain("group _as2test gid 602: exists (recorded)");
 		expect(again.stdout).toContain("user _as2test uid 602: exists (recorded)");
@@ -3487,11 +3762,11 @@ esac
 		git(r.work, "remote", "add", "origin", r.bare);
 		for (const url of ["git@github.com:thewolff/agent-system-2.0", "git@github.com:thewolff/agent-system-2.0.git", "https://github.com/thewolff/agent-system-2.0", "https://github.com/thewolff/agent-system-2.0.git"]) {
 			git(r.work, "remote", "set-url", "origin", url);
-			const ok = r.run(["--dry-run"], "", real);
+			const ok = r.run(["--dry-run", r.resources], "", real);
 			expect(ok.stderr).toBe("");
 			expect(ok.exit).toBe(0);
 			// The real render: the fixed https origin, built as nobody, root only.
-			expect(ok.stdout).toContain("fetches main from https://github.com/thewolff/agent-system-2.0.git and builds it as nobody, run as root");
+			expect(ok.stdout).toContain(`fetches the ${VERIFIED_TAG} tag (refs/tags/${VERIFIED_TAG}) from https://github.com/thewolff/agent-system-2.0.git and builds that commit as nobody, run as root`);
 			expect(ok.stdout).toContain("/usr/bin/sudo -n -u 'nobody' ");
 			expect(ok.stdout).toContain("must run as root");
 		}
@@ -3500,7 +3775,7 @@ esac
 
 		// An untracked file is not a dirty checkout; a change to a tracked file is.
 		writeFileSync(join(r.work, "untracked.txt"), "x\n");
-		expect(r.run(["--dry-run"]).exit).toBe(0);
+		expect(r.run(["--dry-run", r.resources]).exit).toBe(0);
 		writeFileSync(join(r.work, SETUP_REL), `${readFileSync(join(r.work, SETUP_REL), "utf8")}# local edit\n`);
 		refused(r.run([], "y\n"), `the checkout ${r.work} has uncommitted changes to tracked files`);
 		git(r.work, "checkout", "--", SETUP_REL);
@@ -3523,13 +3798,48 @@ esac
 	test("a visudo check failure aborts before anything is created or moved", () => {
 		const r = rig("setup-visudo", { visudoCf: 1 });
 		const before = r.tree();
-		const out = r.run([], "y\n");
+		const out = r.run([r.resources], "y\n");
 		expect(out.exit).toBe(1);
 		expect(out.stderr).toContain("visudo -cf rejects the drop-in; nothing changed");
 		expect(r.tree()).toEqual(before);
 		// The only privileged calls were the checks; no dscl, install or mv ran.
 		expect(r.sudoCalls().trim().split("\n").map((l) => l.split(" ")[0])).toEqual(["visudo", "grep", "visudo"]);
 	}, 30_000);
+
+	test("F2: over a legacy install, setup with no usable measured policy refuses before the plan, with no sudo call, and leaves the install byte for byte unchanged", () => {
+		const r = rig("setup-legacy-policy", { userUid: 602, groupGid: 602 });
+		// The install setup left before the refresh helper and the measured policy: legacy SOURCE, a working exec, bun and test-exec.js.
+		mkdirSync(r.libexec, { recursive: true });
+		for (const d of ["stage", "runs", "locks"]) mkdirSync(join(r.root, d), { recursive: true });
+		writeFileSync(r.sudoers, `${sudoersLines(r.libexec)[0]}\n`);
+		const files = { exec: "#!/bin/sh\n# the legacy wrapper\n", bun: "legacy bun\n", "test-exec.js": "// the legacy bundle\n" };
+		for (const [f, t] of Object.entries(files)) writeFileSync(join(r.libexec, f), t, { mode: 0o755 });
+		writeFileSync(join(r.libexec, "SOURCE"), [
+			"# as2test SOURCE: written by install/as2test-setup.sh", "version 1", `source ${r.work}`, `source-sha ${git(r.work, "rev-parse", "HEAD")}`, `bun-version ${Bun.version}`,
+			`user ${AS2TEST_USER}`, "uid 602", "gid 602", `jo ${JO}`, `jo-uid ${me.uid}`, "created user", "created group", `created ${r.root}`, `created ${r.libexec}`, `created ${r.sudoers}`,
+			...Object.entries(files).map(([f, t]) => `file ${f} ${new Bun.CryptoHasher("sha256").update(t).digest("hex")}`), `input surface/scripts/test-exec.ts ${"a".repeat(64)}`, "",
+		].join("\n"), { mode: 0o755 });
+		const policy = join(r.libexec, "resources.json");
+		const badArg = join(r.base, "bad-policy.json");
+		const cases: [string, string[], () => void, string][] = [
+			["no policy and no --resources", [], () => {}, "no measured resource policy:"],
+			["an installed policy that is not measured costs", [], () => { writeFileSync(policy, "{}"); chmodSync(policy, 0o644); }, `the installed ${policy} is not a valid measured resource policy`],
+			["an installed policy others can write", [], () => { writeFileSync(policy, SYNTHETIC_POLICY); chmodSync(policy, 0o666); }, `${policy} is group- or world-writable (mode 666)`],
+			["an installed policy that is a symlink", [], () => symlinkSync(r.measured, policy), `${policy} is not a regular file`],
+			["a --resources file that is not measured costs", [`--resources=${badArg}`], () => writeFileSync(badArg, JSON.stringify({ workerCpu: 1 })), "invalid resource calibration"],
+		];
+		for (const [name, args, make, says] of cases) {
+			rmSync(policy, { force: true });
+			make();
+			const before = r.bytes();
+			const out = r.run(args, "y\n");
+			expect({ name, exit: out.exit, stdout: out.stdout }).toEqual({ name, exit: 1, stdout: "" });
+			expect(out.stderr).toContain(says);
+			expect(out.stderr).toContain("Nothing changed");
+			expect(r.sudoCalls()).toBe("");
+			expect(r.bytes()).toEqual(before);
+		}
+	}, 120_000);
 
 	test("--undo refuses while a run holds the runs lock, and plans only what SOURCE recorded once it is free", () => {
 		const r = rig("setup-undo");
