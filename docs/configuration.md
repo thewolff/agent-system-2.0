@@ -8,12 +8,12 @@ as2 was built for one user on one Mac. This page lists what you can change today
 |---|---|---|
 | `profile/config.yml` | `~/.omp/profiles/<profile>/agent/config.yml`, rendered with `{repo}` filled in | Extensions, skills, tier → model rows, the judge, the fence switch, the test runner, compaction, display |
 | `profile/models.yml` | Beside `config.yml` | The pinned judge model's definition on the `typesafe` provider |
-| `profile/mcp.json` | Beside `config.yml` | The profile's MCP servers. The installer refuses a file without an `mcpServers.ctx` entry that has a `command` |
+| `profile/mcp.json` | Merged into `mcp.json` beside `config.yml` | The profile's MCP servers: ctx, Linear and PostHog (definitions only; the Linear and PostHog logins are per profile, see [getting-started.md](getting-started.md#mcp-logins-linear-and-posthog)). The installer refuses a file without an `mcpServers.ctx` entry that has a `command` |
 | `tiers/*.md` | Linked into `agents/` | The six role prompts (orchestrator, lane, four hand tiers). Links, so edits are live without a re-install |
 | `voice/VOICE.md` | Read in place | The voice the orchestrator writes in; rendered into its system prompt at each `as2` launch |
 | `plugins/output-types/skills/output-types/reference.md` | Read in place | The output-types contract injected into every session (the vendored public plugin, plugins/VENDOR.md) |
 
-Edit the files in the checkout and re-run `bash install/install.sh`. The installer overwrites the installed `config.yml`, `models.yml` and `mcp.json` on every run, so edits made directly in `~/.omp/profiles/` are lost at the next install. The one exception is `as2 on` / `as2 off`, which flips `gates.fence.enabled` in the installed file until the next install.
+Edit the files in the checkout and re-run `bash install/install.sh`. The installer overwrites the installed `config.yml` and `models.yml` on every run, so edits made directly in `~/.omp/profiles/` are lost at the next install. `mcp.json` is merged instead: each server named in `profile/mcp.json` replaces the installed server of the same name, and every other installed server and top-level setting is kept. A server removed from `profile/mcp.json` stays installed until you delete it from the installed file, and an installed `mcp.json` that is not a JSON object stops the install (exit 2) before anything is written. The one other exception is `as2 on` / `as2 off`, which flips `gates.fence.enabled` in the installed file until the next install.
 
 ### `profile/config.yml` keys
 

@@ -94,6 +94,13 @@ export const CTX_MCP_TOOLS = ["status", "sources", "search", "show_session", "sh
 /** The `xd://` devices the orchestrator may write: the surface's own ledger tools and ctx's read tools, mounted as devices. */
 const LEDGER_DEVICES: Record<string, true> = Object.fromEntries([...SURFACE_TOOLS, ...CTX_MCP_TOOLS].map((t) => [`xd://${t}`, true]));
 
+/**
+ * The MCP tools the orchestrator may call by name: ctx's reads. With tools.xdev off OMP mounts MCP tools as
+ * direct tools (`mcp__linear_save_issue`) rather than devices, so every other `mcp__` name is refused the
+ * same as its device form, whatever server it belongs to.
+ */
+const CTX_MCP_DIRECT: Record<string, true> = Object.fromEntries(CTX_MCP_TOOLS.map((t) => [t, true]));
+
 /** The surface tools that move a workload on, by name and as their `xd://` devices. */
 const HAND_ON: Record<string, true> = Object.fromEntries(HAND_ON_TOOLS.flatMap((t) => [[t, true], [`xd://${t}`, true]]));
 
@@ -259,6 +266,7 @@ function roleRefusal(call: ToolCall, ctx: CallContext): Refusal {
 	const { toolName, input } = call;
 	const refuse: Refusal = { block: true, reason: ORCHESTRATOR_ROLE_REFUSAL };
 	if (LANE_TOOLS[toolName]) return refuse;
+	if (toolName.startsWith("mcp__")) return CTX_MCP_DIRECT[toolName] ? null : refuse;
 	if (toolName === "write") return typeof input.path === "string" && LEDGER_DEVICES[input.path] ? null : refuse;
 	if (WRITE_TOOLS[toolName]) return refuse;
 	if (toolName === "bash") {
