@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, linkSync, lstatSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { admitResources, boundedTestArgs, parseResourceCosts, parseTimingProof, proofChildEnv, runtimeTreeHash, verifyTrustedPath } from "../src/test-resources";
 import { tmp } from "./helpers";
@@ -80,33 +80,29 @@ describe("proof child boundary", () => {
 		const root = fixture();
 		expect(() => verifyTrustedPath(root)).toThrow("root-owned");
 	});
-	test("a writable ancestor is refused unless it is a root-owned sticky directory; a trusted file has one link", () => {
+	test("a writable ancestor is refused unless it is a root-owned sticky directory above the path's parent", () => {
 		const me = process.getuid?.() ?? -1;
-		const root = realpathSync(fixture()); // a trusted path is physical (macOS /var is a symlink)
-		const shared = join(root, "shared");
-		const leaf = join(shared, "libexec");
-		mkdirSync(leaf, { recursive: true });
-		// Under the runner, tmp sits below /Users/Shared (root, 1777): there this passing is the root-sticky exception at work.
-		expect(verifyTrustedPath(leaf, [0, me])).toBeUndefined();
+		// /tmp is root-owned 1777 on macOS (/private/tmp) and Linux alike; its physical path, since a trusted path is physical.
+		const sharedTmp = realpathSync("/tmp");
+		expect(lstatSync(sharedTmp).uid).toBe(0);
+		expect(lstatSync(sharedTmp).mode & 0o7777).toBe(0o1777);
+		const own = mkdtempSync(join(sharedTmp, "as2-trusted-")); // ours, 0700, directly in the sticky directory
+		roots.push(own);
+		const leaf = join(own, "libexec");
+		mkdirSync(leaf);
+		expect(verifyTrustedPath(leaf, [0, me])).toBeUndefined(); // the sticky directory is an ancestor above the parent
+		// A name directly in the sticky directory refuses: anyone may plant one there (a hard link to an older trusted file).
+		expect(() => verifyTrustedPath(own, [0, me])).toThrow(`${sharedTmp} must be owned by uid 0 or ${me}`);
+		expect(() => verifyTrustedPath(sharedTmp, [0, me])).toThrow(`${sharedTmp} must be owned`); // nor is it the path itself
 		// Bun's chmodSync drops the sticky bit (review r5 F1), so set it with chmod(1) and check that it took.
-		const sticky = (dir: string): void => {
-			expect(spawnSync("/bin/chmod", ["1777", dir]).status).toBe(0);
-			expect(lstatSync(dir).mode & 0o7777).toBe(0o1777);
-		};
-		sticky(shared); // sticky, but owned by the test identity, not root
-		expect(() => verifyTrustedPath(leaf, [0, me])).toThrow(`${shared} must be owned by uid 0 or ${me}`);
-		chmodSync(shared, 0o777); // root-owned or not, a plain writable ancestor refuses
-		expect(lstatSync(shared).mode & 0o7777).toBe(0o777);
-		expect(() => verifyTrustedPath(leaf, [0, me])).toThrow(`${shared} must be owned by uid 0 or ${me}`);
-		chmodSync(shared, 0o755);
-		// The exception is for ancestors only: a root-owned sticky directory as the path itself refuses.
-		expect(lstatSync("/private/tmp").mode & 0o1000).toBe(0o1000);
-		expect(() => verifyTrustedPath("/private/tmp", [0, me])).toThrow("/private/tmp must be owned");
-		// A hard link could plant a trusted-owned file under a name in a sticky directory (review r5 F3): one link only.
-		const policy = join(leaf, "resources.json");
-		writeFileSync(policy, "{}");
-		expect(verifyTrustedPath(policy, [0, me])).toBeUndefined();
-		linkSync(policy, join(root, "planted.json"));
-		expect(() => verifyTrustedPath(policy, [0, me])).toThrow(`${policy} has 2 hard links`);
+		const mid = join(own, "shared");
+		const deep = join(mid, "libexec", "as2test");
+		mkdirSync(deep, { recursive: true });
+		expect(spawnSync("chmod", ["1777", mid]).status).toBe(0);
+		expect(lstatSync(mid).mode & 0o7777).toBe(0o1777);
+		expect(() => verifyTrustedPath(deep, [0, me])).toThrow(`${mid} must be owned by uid 0 or ${me}`); // sticky, not root's
+		chmodSync(mid, 0o777);
+		expect(lstatSync(mid).mode & 0o7777).toBe(0o777);
+		expect(() => verifyTrustedPath(deep, [0, me])).toThrow(`${mid} must be owned by uid 0 or ${me}`);
 	});
 });
