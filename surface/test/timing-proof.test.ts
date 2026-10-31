@@ -4,8 +4,8 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { procArgv, snapshot } from "../src/stuck-detect";
 import {
-	admitProof, executableTree, finishProofIteration, inspectProof, LOAD_EXIT, LOAD_LEASE_MS, type LoadKind, type LoadReceipt, nextProofIteration, openProofSchema,
-	parseProofManifest, type ProofInputs, type ProofManifest, proofEvidence, proofIterations, recoverHistoricLoad, recoverProof, runtimeIdentity, startHistoricLoad,
+	admitProof, executableTree, finishProofIteration, inspectProof, installedRuntimeHashes, LOAD_EXIT, LOAD_LEASE_MS, type LoadKind, type LoadReceipt, nextProofIteration,
+	openProofSchema, parseProofManifest, type ProofInputs, type ProofManifest, proofEvidence, proofIterations, recoverHistoricLoad, recoverProof, runtimeIdentity, startHistoricLoad,
 } from "../src/timing-proof";
 import { tmp, until } from "./helpers";
 
@@ -102,6 +102,50 @@ describe("durable stop-on-red and interruption", () => {
 			admit(db, "tp-runtime", { ...fixture(), candidateSha: "9".repeat(40), diagnosis: "the installed executor changed" }, 6, { exec: "7" });
 			expect(inspectProof(db, "tp-runtime").inputs.runtime.executor.exec).toBe("7".repeat(64));
 		} finally { db.close(); }
+	});
+	// TOOLS-REVIEW r2 R4: the runtime identity covers the measured policy and the OMP pin, never the non-executing refresh helper.
+	test("the runtime identity hashes resources.json and installed-omp.json, not refresh: a changed policy alone is a changed input, unchanged files are refused", () => {
+		const libexec = tmp("proof-runtime");
+		const install = (files: Record<string, string>) => { for (const [name, body] of Object.entries(files)) writeFileSync(join(libexec, name), body); };
+		install({ exec: "exec v1", bun: "bun v1", "test-exec.js": "bundle v1", "resources.json": "policy v1", refresh: "helper v1" });
+		const at = (m: ProofManifest, tree: string): ProofInputs => ({ base: { sha: m.baseSha, tree: "1".repeat(64) }, candidate: { sha: m.candidateSha, tree: tree.repeat(64) },
+			runtime: runtimeIdentity(m.mode, installedRuntimeHashes(libexec, m.mode)) });
+		const db = new Database(":memory:"); try {
+			openProofSchema(db);
+			const first = parseProofManifest(fixture());
+			expect(Object.keys(at(first, "2").runtime.executor)).toEqual(["bun", "exec", "resources.json", "test-exec.js"]);
+			admitProof(db, "tp-red", first, at(first, "2"), 1);
+			finishProofIteration(db, "tp-red", nextProofIteration(db, "tp-red", "tr-red", 2)!.index, { state: "failed", error: "assertion red", artifacts: "/evidence/tr-red" });
+			const again = (sha: string, diagnosis: string) => parseProofManifest({ ...fixture(), candidateSha: sha.repeat(40), diagnosis });
+			// Unchanged installed files, and a refresh helper that changed alone: the same inputs, refused.
+			const same = again("d", "infrastructure only");
+			expect(() => admitProof(db, "tp-same", same, at(same, "2"), 3)).toThrow("executes the same inputs as failed tp-red");
+			install({ refresh: "helper v2" });
+			expect(() => admitProof(db, "tp-helper", same, at(same, "2"), 3)).toThrow("installed runtime (exec, bun, test-exec.js, resources.json, installed-omp.json)");
+			// Only resources.json changed: a different runtime, admitted with its diagnosis.
+			install({ "resources.json": "policy v2" });
+			const policy = again("e", "the measured resource policy changed");
+			admitProof(db, "tp-policy", policy, at(policy, "2"), 4);
+			expect(inspectProof(db, "tp-policy").inputs.runtime.executor["resources.json"]).not.toBe(inspectProof(db, "tp-red").inputs.runtime.executor["resources.json"]);
+			// Installing an OMP pin, or re-pinning it, is a new identity too.
+			const unpinned = at(policy, "2").runtime.identity;
+			install({ "installed-omp.json": "pin v1" });
+			const pinned = at(policy, "2").runtime;
+			expect(Object.keys(pinned.executor)).toContain("installed-omp.json");
+			expect(pinned.identity).not.toBe(unpinned);
+			install({ "installed-omp.json": "pin v2" });
+			expect(at(policy, "2").runtime.identity).not.toBe(pinned.identity);
+		} finally { db.close(); }
+	});
+	test("a missing required runtime file, or an installed-OMP proof without its pin, refuses submission naming every file", () => {
+		const libexec = tmp("proof-runtime-missing");
+		writeFileSync(join(libexec, "exec"), "exec");
+		writeFileSync(join(libexec, "bun"), "bun");
+		expect(() => installedRuntimeHashes(libexec, "isolated")).toThrow(`installed ${join(libexec, "test-exec.js")} is missing; installed ${join(libexec, "resources.json")} is missing; repair the install`);
+		writeFileSync(join(libexec, "test-exec.js"), "bundle");
+		writeFileSync(join(libexec, "resources.json"), "policy");
+		expect(Object.keys(installedRuntimeHashes(libexec, "isolated"))).toEqual(["exec", "bun", "test-exec.js", "resources.json"]);
+		expect(() => installedRuntimeHashes(libexec, "installed-OMP")).toThrow(`installed ${join(libexec, "installed-omp.json")} is missing (an installed-OMP proof runs only on a pinned runtime)`);
 	});
 	test("admission refuses inputs that do not describe the manifest's commits and mode", () => {
 		const db = new Database(":memory:"); try {

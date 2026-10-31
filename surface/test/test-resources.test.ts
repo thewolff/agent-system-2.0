@@ -28,9 +28,21 @@ describe("resource admission", () => {
 		expect(() => admitResources(2, { ...inputs, availableMemoryBytes: 4000 }, costs)).toThrow("totalMemoryBytes");
 	});
 	test("the admitted outer count and serial nested bound reach Bun arguments", () => {
-		expect(boundedTestArgs(["test", "./a.test.ts"], 3)).toEqual(["test", "--max-concurrency=1", "--parallel=3", "./a.test.ts"]);
-		// One worker stays serial in one process: `--parallel` implies --isolate, which would hide a cross-file failure from the full part.
-		expect(boundedTestArgs(["test", "./a.test.ts"], 1)).toEqual(["test", "--max-concurrency=1", "./a.test.ts"]);
+		expect(boundedTestArgs(["test", "./a.test.ts"], 6, 3)).toEqual(["test", "--max-concurrency=1", "--parallel=3", "./a.test.ts"]);
+		// A configured 1 stays serial in one process: `--parallel` implies --isolate, which would hide a cross-file failure from the full part.
+		expect(boundedTestArgs(["test", "./a.test.ts"], 1, 1)).toEqual(["test", "--max-concurrency=1", "./a.test.ts"]);
+		expect(() => boundedTestArgs(["test"], 2, 3)).toThrow("exceeds the configured ceiling 2");
+	});
+	// TOOLS-REVIEW r2 R5: isolation is a function of configuration, never of host load.
+	test("a configured ceiling over 1 isolates even when a busy host admits one worker; a configured 1 never does", () => {
+		const busy = admitResources(6, { ...inputs, availableCpuCount: 4 }, costs);
+		expect(busy.selectedWorkers).toBe(1);
+		expect(boundedTestArgs(["test"], busy.configuredWorkers, busy.selectedWorkers)).toEqual(["test", "--max-concurrency=1", "--parallel=1"]);
+		const idle = admitResources(6, inputs, costs);
+		expect(idle.selectedWorkers).toBeGreaterThan(1);
+		expect(boundedTestArgs(["test"], idle.configuredWorkers, idle.selectedWorkers)).toEqual(["test", "--max-concurrency=1", `--parallel=${idle.selectedWorkers}`]);
+		const serial = admitResources(1, inputs, costs);
+		expect(boundedTestArgs(["test"], serial.configuredWorkers, serial.selectedWorkers)).toEqual(["test", "--max-concurrency=1"]);
 	});
 });
 

@@ -10,6 +10,7 @@ import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { appendFileSync, closeSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { RESOURCE_POLICY } from "./as2test";
 import { procArgv, snapshot } from "./stuck-detect";
 import { HEARTBEAT_STALE_MS, isBunTestFile, junitCases, lockHolderStale, parseHeartbeat, type PartResult, runDirOf, SHA_RE, STARTUP_LEASE_MS } from "./test-run";
 
@@ -179,6 +180,32 @@ export function executableTree(listing: string): string {
 	entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 	return sha256(entries.map((e) => e.line).join("\0"));
 }
+/**
+ * The installed files under the install's libexec a proof's runtime identity hashes (TOOLS-REVIEW r2 R4): what a part runs under
+ * or is admitted by. `exec`, `bun` and `test-exec.js` run it; `resources.json`, which every part requires, decides its workers.
+ * The refresh helper is left out on purpose: it runs no test and only rebuilds `exec` and `test-exec.js`, both hashed here, so a
+ * helper-only change is no changed input and opens no route past a failed series.
+ */
+export const PROOF_RUNTIME_FILES = ["exec", "bun", "test-exec.js", RESOURCE_POLICY] as const;
+/** The pinned OMP runtime (root, tree sha-256, version): hashed whenever installed, so a re-pin is a new identity; an installed-OMP proof requires it. */
+export const PROOF_OMP_PIN = "installed-omp.json";
+/** The sha-256 of each PROOF_RUNTIME_FILES file and, when installed, PROOF_OMP_PIN; every unreadable file is named in one error. */
+export function installedRuntimeHashes(libexec: string, mode: ProofManifest["mode"]): Record<string, string> {
+	const out: Record<string, string> = {};
+	const errors: string[] = [];
+	const hash = (name: string, required: boolean): void => {
+		const path = join(libexec, name);
+		try { out[name] = createHash("sha256").update(readFileSync(path)).digest("hex"); }
+		catch (error) {
+			if (!required && (error as NodeJS.ErrnoException).code === "ENOENT") return;
+			errors.push(`installed ${path} ${(error as NodeJS.ErrnoException).code === "ENOENT" ? `is missing${name === PROOF_OMP_PIN ? " (an installed-OMP proof runs only on a pinned runtime)" : ""}` : `is unreadable: ${errText(error)}`}`);
+		}
+	};
+	for (const name of PROOF_RUNTIME_FILES) hash(name, true);
+	hash(PROOF_OMP_PIN, mode === "installed-OMP");
+	if (errors.length) throw new Error(`timing-proof runtime identity: ${errors.join("; ")}; repair the install with install/as2test-setup.sh before submitting`);
+	return out;
+}
 /** The runtime half of the identity: the proof mode and the sha-256 of each installed executor file it runs under. */
 export function runtimeIdentity(mode: ProofManifest["mode"], executor: Record<string, string>): ProofInputs["runtime"] {
 	const names = Object.keys(executor).sort();
@@ -226,7 +253,7 @@ export function admitProof(db: Database, id: string, manifest: ProofManifest, in
 		if (unchanged) throw new Error(`timing-proof ${id}: failed candidate ${manifest.candidateSha} already observed in ${unchanged.id}; changing budgets, labels, diagnosis or workload is not a fix`);
 		const equivalent = prior.find((p) => p.inputs.candidate.tree === inputs.candidate.tree && p.inputs.runtime.identity === inputs.runtime.identity);
 		if (equivalent) {
-			throw new Error(`timing-proof ${id}: candidate ${manifest.candidateSha} executes the same inputs as failed ${equivalent.id} at ${equivalent.manifest.candidateSha} (executable tree ${inputs.candidate.tree}, runtime ${inputs.runtime.identity}); an empty commit, decision-log churn or a diagnosis is not a fix: change the code, dependencies or installed runtime the failure diagnosed`);
+			throw new Error(`timing-proof ${id}: candidate ${manifest.candidateSha} executes the same inputs as failed ${equivalent.id} at ${equivalent.manifest.candidateSha} (executable tree ${inputs.candidate.tree}, runtime ${inputs.runtime.identity} over ${Object.keys(inputs.runtime.executor).join(", ")}); an empty commit, decision-log churn or a diagnosis is not a fix: change the code, dependencies or installed runtime (${[...PROOF_RUNTIME_FILES, PROOF_OMP_PIN].join(", ")}) the failure diagnosed`);
 		}
 		if (prior.length && !manifest.diagnosis) throw new Error(`timing-proof ${id}: prior red ${prior[0]!.id} requires a diagnosis and changed executable inputs`);
 		db.query("INSERT INTO timing_proofs (id, requestedAt, fingerprint, manifest, inputs, state) VALUES (?, ?, ?, ?, ?, 'admitted')").run(id, at, fingerprint, JSON.stringify(manifest), JSON.stringify(inputs));

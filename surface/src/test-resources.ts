@@ -75,15 +75,18 @@ export function admitResources(configuredWorkers: number, inputs: ResourceInputs
 
 /**
  * Bun 1.3.14 help exposes independent file-worker and concurrent-case controls; executor checks its fixed binary too.
- * `--parallel` is passed only for more than one admitted worker: Bun's help says it "Implies --isolate", so even
- * `--parallel=1` runs each file in a fresh global object and changes what a serial part observes. A serial full part
- * is the evidence the runner's red-main decision rests on (a file that fails in the suite but passes alone is red,
- * never red-main), so one worker keeps the pre-admission serial launch exactly.
+ * Isolation follows the configured ceiling, never the admitted count (TOOLS-REVIEW r2 R5): Bun's help says `--parallel`
+ * "Implies --isolate", so a configured ceiling over 1 always passes `--parallel=<admitted n>`, n = 1 included, and every
+ * file runs in a fresh global object however busy the host is; a configured 1 passes none and keeps the serial launch the
+ * runner's red-main decision rests on (a file that fails in the suite but passes alone is red, never red-main). Keyed on
+ * the admitted count instead, one commit could be red on a busy host (1 admitted, not isolated) and green on an idle one.
  */
-export function boundedTestArgs(argv: string[], workers: number): string[] {
-	whole(workers, "selectedWorkers");
+export function boundedTestArgs(argv: string[], configuredWorkers: number, selectedWorkers: number): string[] {
+	whole(configuredWorkers, "configuredWorkers");
+	whole(selectedWorkers, "selectedWorkers");
+	if (selectedWorkers > configuredWorkers) throw new Error(`resource admission: selectedWorkers ${selectedWorkers} exceeds the configured ceiling ${configuredWorkers}; admission never selects past fullWorkers, so the caller passed the wrong pair`);
 	if (argv[0] !== "test") throw new Error("resource admission: only fixed bun test launches can be bounded");
-	return ["test", "--max-concurrency=1", ...(workers > 1 ? [`--parallel=${workers}`] : []), ...argv.slice(1)];
+	return ["test", "--max-concurrency=1", ...(configuredWorkers > 1 ? [`--parallel=${selectedWorkers}`] : []), ...argv.slice(1)];
 }
 
 export interface TimingProofCaps { productionBudget: boolean; installedOmp: boolean }

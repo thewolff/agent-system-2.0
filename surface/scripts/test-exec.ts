@@ -4,8 +4,9 @@
 //
 //   exec prepare <run id> <sha>        clone <stage>/<run id>/repo.bundle into runs/<run id>/repo, detached at <sha>
 //   exec full    <run id>              bun test, junit to runs/<run id>/full.xml, console to full.log, under the full cap;
-//                                      with resource-admitted `--parallel=<n>` beneath caps.json `fullWorkers`' ceiling when
-//                                      n is over 1 (at one, no `--parallel`: it implies --isolate, and the part stays serial);
+//                                      with resource-admitted `--parallel=<n>` beneath caps.json `fullWorkers`' ceiling whenever
+//                                      that ceiling is over 1, n = 1 included (`--parallel` implies --isolate, so isolation never
+//                                      depends on host load); a ceiling of 1 passes no `--parallel`, and the part stays serial;
 //                                      every part also bounds concurrent cases with `--max-concurrency=1`
 //   exec solo    <run id> ./<file>     bun test ./<file> alone, to solo-<i>.xml/.log, under the solo cap
 //   exec base-prepare <run id> <sha>   the same bundle cloned into runs/<run id>/base/repo at base's <sha> (PLAN wl-mv8s8srodefytc D8)
@@ -1321,8 +1322,8 @@ async function part(cfg: Config, runId: string, work: string, dir: string, argv:
 		};
 		const help = checked(["test", "--help"]);
 		if (!help.includes("--parallel=") || !help.includes("--max-concurrency=")) throw new Error(`${cfg.bun} test --help does not expose --parallel and --max-concurrency; install a supported pinned Bun`);
-		// The receipt's controls are the flags boundedTestArgs adds (no `--parallel` at one worker), never a second spelling of them.
-		bun = { path: cfg.bun, version: checked(["--version"]).trim(), controls: boundedTestArgs(["test"], admission.selectedWorkers).slice(1) };
+		// The receipt's controls are the flags boundedTestArgs adds (`--parallel` iff the configured ceiling is over 1), never a second spelling of them.
+		bun = { path: cfg.bun, version: checked(["--version"]).trim(), controls: boundedTestArgs(["test"], configuredWorkers, admission.selectedWorkers).slice(1) };
 		if (proof?.installedOmp) {
 			if (cfg.sweep === "groups") throw new Error("installed OMP proofs require the actual _as2test uid wrapper; a groups/operator fixture is not admitted");
 			const id = spawnSync("/usr/bin/id", ["-u", AS2TEST_USER], { encoding: "utf8", timeout: 10_000 });
@@ -1333,7 +1334,7 @@ async function part(cfg: Config, runId: string, work: string, dir: string, argv:
 			if (version.error || version.status !== 0 || version.stdout.trim() !== omp.version) throw new Error(`installed OMP ${omp.root}/bin/omp --version does not match ${omp.version}: ${version.error?.message ?? `exit ${version.status} signal ${version.signal}`} stdout=${version.stdout} stderr=${version.stderr}`);
 		}
 		env = proofChildEnv(process.env, dir, proof, omp);
-		bounded = boundedTestArgs(argv, admission.selectedWorkers);
+		bounded = boundedTestArgs(argv, configuredWorkers, admission.selectedWorkers);
 	} catch (e) {
 		const error = `part ${runId}/${stem} admission failed: ${errText(e)}`;
 		try { receipt(error); } catch (writeError) { return failed(`${error}; resource receipt ${resourcesPath} failed: ${errText(writeError)}`); }

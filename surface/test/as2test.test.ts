@@ -2825,6 +2825,8 @@ describe("the refresh helper", () => {
 				const out = r.run();
 				expect({ helper, name, exit: out.exit, stdout: out.stdout }).toEqual({ helper, name, exit: 71, stdout: "" });
 				expect(out.stderr).toContain(why);
+				// The runner keeps only the helper's last stderr line, so that line must name the refusal (review r2 R3).
+				if (name === "not measured costs") expect(out.stderr.trim().split("\n").at(-1)).toMatch(/render-exec at [0-9a-f]+ failed \(exit \d+\): .*is not a measured resource policy/);
 				expect(tree(r.libexec, ["refresh.d"])).toEqual(before);
 				expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
 				expect(buildDirs().filter((d) => !dirs.includes(d))).toEqual([]);

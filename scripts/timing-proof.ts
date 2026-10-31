@@ -3,16 +3,14 @@
 // one exclusive lifecycle (runs.db lock, queue and `current` fence) only through ExclusiveSession, and never executes a test
 // itself: every part runs through the rendered wrapper the session owns.
 import type { Database } from "bun:sqlite";
-import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Ledger, TEST_RUNNER_BY } from "../ledger/src/index";
-import { INSTALLED_FILES } from "../surface/src/as2test";
 import { HEARTBEAT_EVERY_MS, runDirOf, runsRoot, type TestRequested, type TestRunnerConfig } from "../surface/src/test-run";
 import {
 	admitProof, controllerHeartbeatOf, executableTree, type ExclusiveSession, failProof, finishProofIteration, type HistoricLoad, inspectProof, nextProofIteration,
 	parseProofManifest, proofDirectory, proofEvidence, type ProofInputs, type ProofIteration, type ProofManifest, recoverProof, recoverProofSeries, proofProcessLive,
-	runtimeIdentity, startHistoricLoad, validateProofTree,
+	installedRuntimeHashes, runtimeIdentity, startHistoricLoad, validateProofTree,
 } from "../surface/src/timing-proof";
 import {
 	errText, freshRunId, gitSync, hook, importPart, importReport, installSpec, loadConfig, mirrorEnv, mirrorOf, NETWORK, NO_HOOKS, openLedger, openLockDb, Runner,
@@ -24,16 +22,12 @@ const LOAD_HARD_SLACK_MS = 5 * 60_000;
 
 /**
  * The executable identity of a series (F4): each pinned commit's tree fetched from the served origin, minus decision-log churn,
- * and the sha-256 of every installed executor file (`INSTALLED_FILES` under the install's libexec) with the proof mode.
+ * and the sha-256 of every installed runtime file (installedRuntimeHashes: the executor, its Bun, the measured resource policy and
+ * the pinned OMP runtime when installed) with the proof mode.
  */
 export function proofInputs(mirror: string, env: Record<string, string>, m: ProofManifest, libexec: string): ProofInputs {
 	const tree = (sha: string) => ({ sha, tree: executableTree(gitSync(mirror, ["ls-tree", "-r", "-z", "--full-tree", sha], env).toString()) });
-	const executor = Object.fromEntries(INSTALLED_FILES.map((f) => {
-		const path = join(libexec, f);
-		try { return [f, createHash("sha256").update(readFileSync(path)).digest("hex")]; }
-		catch (error) { throw new Error(`timing-proof runtime identity: installed ${path} unreadable: ${errText(error)}; check the install before submitting`); }
-	}));
-	return { base: tree(m.baseSha), candidate: tree(m.candidateSha), runtime: runtimeIdentity(m.mode, executor) };
+	return { base: tree(m.baseSha), candidate: tree(m.candidateSha), runtime: runtimeIdentity(m.mode, installedRuntimeHashes(libexec, m.mode)) };
 }
 
 /** Admission fetches ONLY from the workload's served origin, checks the pinned trees, then records their executable identity. */
