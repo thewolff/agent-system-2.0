@@ -11,8 +11,9 @@
 #   zsh test-alert.zsh        prints PASS/FAIL lines, ends with "RESULT: <n> failure(s)", exits n
 # Deterministic (Jo's timing rule, decision log 2026-10-28--0840): no fixed waits. AS2_ALERT_ACK=0, so the alert does not
 # wait for the popup's result; the suite waits on the popup stub's own log line and result file (wait_for, a failure-only
-# guard). The one deadline test (the writer's 60 s bound) drives the fake clock $T/clock through AS2_CLOCK_CMD and is
-# marked `timing-under-test`. T is left in place for inspection (the bun test wrapper removes its root on a pass).
+# guard). Two deadline tests drive the fake clock $T/clock through AS2_CLOCK_CMD and are marked `timing-under-test`: the
+# writer's 60 s bound, and the popup's acknowledgement window when the popup stub moves the clock before the alert's next
+# clock read (R7-T1). T is left in place for inspection (the bun test wrapper removes its root on a pass).
 emulate -L zsh
 setopt no_unset pipe_fail extended_glob
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -29,7 +30,7 @@ bad() { print -r -- "FAIL: $*"; FAILS+=1 }
 check() { local d=$1; shift; if eval "$*"; then ok "$d"; else bad "$d"; fi }
 # wait_for <what> <condition> [guard seconds, default 30]: polls a real condition every 10 ms; the guard is failure-only.
 wait_for() { local k g=${3:-30}; for k in {1..$(( g * 100 ))}; do eval "$2" && return 0; zselect -t 1; done; print -r -- "guard: $1 did not happen within $g s"; return 1 }
-trap ': > $T/bun.release' EXIT   # a hung writer stub still waiting ends now
+trap ': > $T/bun.release; : > $T/popup-holds.release' EXIT   # a hung writer or held popup stub still waiting ends now
 
 # ---------- stubs ----------
 cat > $T/bun.zsh <<EOF
@@ -204,6 +205,44 @@ popup_done $S/alert.json || bad "the popup stub ran"
 check "the hung write is failed as a timeout (exit 124), then the notification and the popup go" \
   '[[ $(channels) == "NEEDSYOU NOTIFICATION POPUP" && $(st .alert $S) == *"; needs-you failed: "*" exit 124: TIMEOUT: needs-you entry did not finish within 60s"* ]]'
 : > $T/bun.release
+
+print "\n### the popup's acknowledgement window when the popup stub moves the clock first (R7-T1)"
+# timing-under-test: popup acknowledgement window (fake clock: AS2_CLOCK_CMD)
+# Forces the child-first order: the popup stub moves the fake clock 1000 s on (a popup left open) and then holds, and the
+# gated clock makes every read taken after the alert logged its popup as sent (alert-delivery.log) wait until that move
+# is done. An alert that read its 1 s window's end before starting the popup sees the clock past it and returns `sent`;
+# one that read it after the start gets a deadline 1 s past a clock that no longer moves, and waits until the popup is
+# released. The gate's own limit and the suite's wait are failure-only guards.
+print ok > $T/bun.mode; : > $T/calls.log; rm -f $T/popup-holds.advanced $T/popup-holds.release $T/gate.timeout
+print 1000000 > $T/clock
+S=$T/s-ackwin; mkdir -p $S
+cat > $T/popup-holds.zsh <<EOF
+#!/bin/zsh
+zmodload zsh/zselect
+print -r -- "POPUP \$1" >> $T/calls.log
+c=\$(<$T/clock) && print -r -- \$(( c + 1000 )) > $T/clock.tmp && /bin/mv -f -- $T/clock.tmp $T/clock && : > $T/popup-holds.advanced
+for k in {1..6000}; do [[ -e $T/popup-holds.release ]] && break; zselect -t 1; done
+[[ -e $T/popup-holds.release ]] || { print -u2 "popup-holds.zsh: never released ($T/popup-holds.release absent after 60 s)"; exit 3 }
+print "quiet-alarm: choice=Dismiss (no voice)"
+EOF
+cat > $T/gated-clock.zsh <<EOF
+#!/bin/zsh
+zmodload zsh/zselect
+if /usr/bin/grep -q ' alert ' $S/alert-delivery.log 2>/dev/null; then
+  for k in {1..3000}; do [[ -e $T/popup-holds.advanced ]] && break; zselect -t 1; done
+  [[ -e $T/popup-holds.advanced ]] || print -r -- "gated-clock.zsh: the popup stub had not moved the clock 30 s after the alert was sent" >> $T/gate.timeout
+fi
+print -r -- \$(<$T/clock)
+EOF
+alert_in $S run AS2_BUN=$T/bun.zsh AS2_ALERT_CMD=$T/popup-holds.zsh AS2_ALERT_ACK=1 AS2_CLOCK_CMD="/bin/zsh $T/gated-clock.zsh" &
+apid=$!
+wait_for "the alert returning once the moved clock passes its window" '[[ -f $S/alert.json ]]' 15 || bad "the alert returns while the popup is still held, once the moved clock is past its window"
+: > $T/popup-holds.release
+wait $apid
+check "the popup stub moved the clock before the alert's next read, and the gate never hit its limit" \
+  '[[ -f $T/popup-holds.advanced && $(<$T/clock) == 1001000 && ! -e $T/gate.timeout ]]'
+check "the alert's window ended on the moved clock: the popup is sent, its result still awaited" \
+  '[[ $(st .alert $S) == "sent: awaiting the popup'"'"'s result in "*"; notification rc 0; needs-you written: "* ]]'
 
 print "\nRESULT: $FAILS failure(s)"
 exit $FAILS

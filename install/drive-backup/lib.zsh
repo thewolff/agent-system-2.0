@@ -149,21 +149,22 @@ alert() { # <title> <popup> <spoken>
     ALERT_STATUS="failed: cannot create $adir to record the popup's result"
   else
     ALERT_RESULT=$res
+    # Under the test clock (AS2_CLOCK_CMD) the result window's end is read from clock_now before the popup wrapper starts:
+    # a popup stub moves that same clock (a popup left open), and a deadline read after its move would sit past the
+    # clock and never be reached (review R7-T1). A clock that cannot be read leaves ack_end empty: no wait.
+    local ack_end=""
+    [[ -n ${AS2_CLOCK_CMD:-} ]] && clock_now && ack_end=$(( CLOCK_NOW + ${ALERT_ACK:-3} ))
     print -r -- "$(ts) alert $id pid $$: $1" >> "$alog" 2>/dev/null
     /bin/zsh -fc 'zmodload zsh/datetime; o=$(/bin/zsh "$1" "$2" "$3" "$4" 2>&1); rc=$?
       print -r -- "$o" >> "$6"
       print -rl -- "rc=$rc" "at_epoch=$EPOCHSECONDS" "$o" > "$5.tmp" && /bin/mv -f -- "$5.tmp" "$5"' \
       zsh "$ALERT_CMD" "$1" "$2" "$3" "$res" "$alog" </dev/null >/dev/null 2>&1 &!
-    # An immediate failure (no GUI session, osascript error) is known within seconds. Under the test clock
-    # (AS2_CLOCK_CMD) the same ALERT_ACK seconds are read from clock_now, and the wait ends when the result is there.
+    # An immediate failure (no GUI session, osascript error) is known within seconds. Under the test clock the same
+    # ALERT_ACK seconds run to ack_end, read above, and the wait ends when the result is there.
     if [[ -z ${AS2_CLOCK_CMD:-} ]]; then
       zselect -t $(( ${ALERT_ACK:-3} * 100 ))
-    else
-      local ack_end
-      if clock_now; then
-        ack_end=$(( CLOCK_NOW + ${ALERT_ACK:-3} ))
-        while [[ ! -f $res ]] && clock_now && (( CLOCK_NOW < ack_end )); do zselect -t 5; done
-      fi
+    elif [[ -n $ack_end ]]; then
+      while [[ ! -f $res ]] && clock_now && (( CLOCK_NOW < ack_end )); do zselect -t 5; done
     fi
     if [[ -f $res && $(<$res) != rc=0* ]]; then
       ALERT_STATUS="failed: the popup could not be shown ($res)"
