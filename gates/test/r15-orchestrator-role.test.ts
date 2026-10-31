@@ -127,6 +127,14 @@ const REFUSED: [string, Record<string, unknown>][] = [
 	["bash", { command: "ctx search foo > hits.txt" }],
 	["write", { path: "xd://mcp__ctx_x_search", content: "{}" }], // a server named ctx_x, not ctx
 	["write", { path: "xd://mcp__linear_save_issue", content: "{}" }], // another server's device
+	["write", { path: "xd://mcp__linear_list_issues", content: "{}" }], // a Linear read is still not ctx
+	["write", { path: "xd://mcp__posthog_exec", content: "{}" }],
+	// The same tools mounted directly (tools.xdev off): refused by name the same as their devices (PR #400 review S1).
+	["mcp__linear_save_issue", { id: "ENG-1", title: "x" }],
+	["mcp__linear_list_issues", {}],
+	["mcp__posthog_exec", { command: "call feature-flag-update" }],
+	["mcp__posthog_exec", { command: "search insights" }],
+	["mcp__ctx_x_search", { query: "x" }],
 	["bash", { command: "" }],
 ];
 
@@ -196,6 +204,8 @@ const ALLOWED: [string, Record<string, unknown>][] = [
 	["bash", { command: "ctx search foo 2>/dev/null | head -n 20" }],
 	["write", { path: "xd://mcp__ctx_search", content: "{\"query\":\"wl-munn32rmt6ajnk\"}" }],
 	["write", { path: "xd://mcp__ctx_show_session", content: "{}" }],
+	["mcp__ctx_search", { query: "wl-munn32rmt6ajnk" }], // ctx's reads mounted directly
+	["mcp__ctx_show_event", { ctx_event_id: "abc" }],
 	...SURFACE_TOOLS.map((t): [string, Record<string, unknown>] => [t, {}]),
 	...SURFACE_TOOLS.map((t): [string, Record<string, unknown>] => ["write", { path: `xd://${t}`, content: "{}" }]),
 ];

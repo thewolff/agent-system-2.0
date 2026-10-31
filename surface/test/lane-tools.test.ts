@@ -32,7 +32,7 @@ import { releasedOpen } from "../src/turn-end";
 import { recordRepo, renderClose } from "../src/decision-log";
 import { openPlanPath } from "../src/plan-paths";
 import { ESCALATION_BY, LANE_FULL_TEST_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, notices, tempLedger, tempRepo, tmp } from "./helpers";
+import { ctxOf, fakePi, HOW_IT_FAILS, notices, tempLedger, tempRepo, tmp } from "./helpers";
 
 /** Jo's `land-first <repo> on|off` as the surface records it: his instruction, then `land-first:` naming it, on the standing workload. */
 function landFirst(ledger: Ledger, repo: string, on: boolean): void {
@@ -64,7 +64,7 @@ const PLAN_DIR = tmp("plan");
 const PLAN_FILE = join(PLAN_DIR, "PLAN.md");
 const VERDICT_FILE = join(PLAN_DIR, "r.md");
 writeFileSync(PLAN_FILE, [
-	"# PLAN", "", "## Design", "", "The header offset moves into one token.", "",
+	"# PLAN", "", "## Design", "", "The header offset moves into one token.", "", HOW_IT_FAILS, "",
 	"## Requirements", "",
 	"- R1: the header offset lives in one token => test surface/test/tokens.test.ts; code src/tokens.ts headerOffset",
 	"- R2: the old constant is gone => test surface/test/tokens.test.ts the constant case",
@@ -90,7 +90,7 @@ const planFile = (name: string, lines: string[], eol = "\n") => {
 };
 /** A plan file whose Requirements section marks R2 and R3 prompt-only (PLAN wl-mv8vwb04cy18n4 D1, D2). */
 const PROMPT_ONLY_FILE = planFile("PLAN-prompt-only.md", [
-	"# PLAN", "", "## Requirements", "",
+	"# PLAN", HOW_IT_FAILS, "", "## Requirements", "",
 	"- R1: the refusal names the grammar => test surface/test/lane-tools.test.ts",
 	"- R2: the SPEC amendment states the rule => prompt-only: human-read prose no code can judge",
 	"- R3: the change reaches main only by Jo's merge => prompt-only: no gate refuses a lane's merge here",
@@ -149,7 +149,7 @@ function seedReview(
 	ledger: Ledger, wl: string, slice: string,
 	over: {
 		ran?: string[]; outcome?: RoutingOutcome; withheld?: boolean; grant?: string; rule?: string; gap?: string; spawnBy?: string; group?: string; round?: number;
-		blocking?: number; between?: (token: string) => { body: string; by?: string }[];
+		blocking?: number; between?: (token: string) => { body: string; by?: string }[]; anthropicOut?: boolean; ruleToken?: string; ruleEntrySlice?: string;
 	} = {},
 ): { token: string; routing: string } {
 	tick();
@@ -158,9 +158,11 @@ function seedReview(
 	const group = over.group ?? `dg-t${n}`;
 	const ran = over.ran ?? [OTHER_LAB];
 	const outcome = over.outcome ?? "ran";
-	const entry = (body: string, by = "lane-t-1") => ledger.recordEntry({ by, workloadId: wl, sliceId: slice, kind: "assumption", body });
+	const entry = (body: string, by = "lane-t-1", sliceId = slice) => ledger.recordEntry({ by, workloadId: wl, sliceId, kind: "assumption", body });
 	if (over.grant) entry(reviewSameLabBody(over.grant, token));
-	if (over.rule) entry(`review-same-lab-rule: in-mv5xafhywe3w8w slice ${over.rule} token ${token} labs anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)`);
+	if (over.rule) entry(over.anthropicOut
+		? `review-same-lab-rule: in-mvtur7tlze7r5o slice ${over.rule} token ${over.ruleToken ?? token} labs openai anthropic-out until 2026-10-31T06:00:00-07:00`
+		: `review-same-lab-rule: in-mv5xafhywe3w8w slice ${over.rule} token ${token} labs anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)`, undefined, over.ruleEntrySlice);
 	if (over.gap) entry(over.gap);
 	for (const b of over.between?.(token) ?? []) entry(b.body, b.by);
 	entry(handSpawnBody({ token, root: "/tmp/lane-t-1", spawnKey: slice, review: true, group, row: ran }), over.spawnBy);
@@ -933,6 +935,40 @@ describe("plan review (PLAN D8): the plan question waits for a review by another
 		expect(await ask()).toContain("Raised question");
 	});
 
+	test("Anthropic-out receipt admits only a successful, non-withheld adjacent same-token/slice/writer review, including headroom skips", async () => {
+		for (const invalid of ["slice", "entry-slice", "token", "writer", "gap", "skip-token", "skip-writer", "withheld", "unsuccessful", null]) {
+			const { ledger, wl, planId, ask } = await planFixture();
+			ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: laneBuilderBody("openai", "lane-t-1", OTHER_LAB) });
+			if (invalid === "entry-slice") {
+				tick();
+				ledger.addSlice({ by: "lane-t-1", workloadId: wl, id: "sl-other", task: "other review", doneCondition: "d", inputs: "i" });
+			}
+			seedReview(ledger, wl, planId, {
+				ran: [OTHER_LAB], anthropicOut: true, rule: invalid === "slice" ? "sl-other" : planId,
+				ruleToken: invalid === "token" ? "dt-wrong" : undefined,
+				ruleEntrySlice: invalid === "entry-slice" ? "sl-other" : undefined,
+				spawnBy: invalid === "writer" ? "lane-x" : undefined,
+				gap: invalid === "gap" ? "unrelated note" : undefined,
+				withheld: invalid === "withheld", outcome: invalid === "unsuccessful" ? "refused-model-unknown" : "ran",
+				between: t => [skip(invalid === "skip-token" ? "dt-wrong" : t, invalid === "skip-writer" ? "lane-x" : undefined), skip(t)],
+			});
+			const reply = await ask();
+			expect(reply).toContain(invalid === null ? "Raised question" : planReviewRefusal(planId));
+			expect(ledger.questions(wl)).toHaveLength(invalid === null ? 1 : 0);
+		}
+	});
+
+	test("a valid pre-expiry Anthropic-out receipt remains admissible after the rule expires", async () => {
+		// setSystemTime drives both review instants; no elapsed wall-time dependency.
+		setSystemTime(new Date("2026-10-31T05:59:00-07:00"));
+		const { ledger, wl, planId, ask } = await planFixture();
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: laneBuilderBody("openai", "lane-t-1", OTHER_LAB) });
+		seedReview(ledger, wl, planId, { ran: [OTHER_LAB], anthropicOut: true, rule: planId });
+		setSystemTime(new Date("2026-10-31T06:01:00-07:00"));
+		expect(ledger.claimWorkload(wl, { by: "lane-t-1", holder: "lane-t-1", leaseMs: 60_000 }).won).toBe(true);
+		expect(await ask()).toContain("Raised question");
+	});
+
 	test("#228: a run of two headroom-skip: rows still counts the rule, and a spent same-lab grant counts across one the same way", async () => {
 		const two = await planFixture();
 		seedReview(two.ledger, two.wl, two.planId, { ran: [LANE_MODEL], rule: two.planId, between: (t) => [skip(t), skip(t)] });
@@ -1077,6 +1113,19 @@ describe("plan requirements name their enforcer (PLAN wl-mv8vwb04cy18n4 D1-D5)",
 		expect(idsIn(second)).toEqual([]);
 	});
 
+	test("issue #334 item 2: a plan file with no How it fails section is refused naming the heading, nothing written; on the n/a line it is raised and the n/a pass recorded", async () => {
+		const none = planFile("PLAN-no-fails.md", ["# PLAN", "", "## Requirements", "", "- R1: x => test surface/test/x.test.ts"]);
+		const reply = await refused(bodyOn(none, [NONE_LINE]));
+		expect(reply).toContain(`the plan file ${none} has no "How it fails" section`);
+		expect(reply).toContain("`## How it fails`");
+		expect(reply).toContain("`How it fails: n/a, <reason>`");
+		const na = planFile("PLAN-na.md", ["# PLAN", "How it fails: n/a, a one-line docs fix", "", "## Requirements", "", "- R1: x => test surface/test/x.test.ts"]);
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		expect(await ask([...PLAN_OPTIONS], planId, bodyOn(na, [NONE_LINE]))).not.toContain("Nothing was asked.");
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith("how-it-fails:")).map((e) => e.body)).toEqual([`how-it-fails: n/a, a one-line docs fix (plan file ${na})`]);
+	});
+
 	test("R2: a section with several defects is refused naming every offender, a bad separator included; a well-formed line beside them is not named", async () => {
 		const path = planFile("PLAN-defects.md", [
 			"# PLAN", "## Requirements",
@@ -1108,7 +1157,7 @@ describe("plan requirements name their enforcer (PLAN wl-mv8vwb04cy18n4 D1-D5)",
 	});
 
 	test("a plan file over PLAN_FILE_MAX_BYTES, a sparse 64 MiB one included, is refused for its size with nothing written; one of exactly PLAN_FILE_MAX_BYTES is raised", async () => {
-		const head = ["# PLAN", "", "## Requirements", "", "- R1: the plan file is read bounded => test surface/test/lane-tools.test.ts", "", "## Slices", ""].join("\n");
+		const head = ["# PLAN", HOW_IT_FAILS, "", "## Requirements", "", "- R1: the plan file is read bounded => test surface/test/lane-tools.test.ts", "", "## Slices", ""].join("\n");
 		const exact = planFile("PLAN-max.md", [head + "x".repeat(PLAN_FILE_MAX_BYTES - Buffer.byteLength(head))]);
 		const over = planFile("PLAN-over.md", [head + "x".repeat(PLAN_FILE_MAX_BYTES + 1 - Buffer.byteLength(head))]);
 		const sparse = planFile("PLAN-sparse.md", [head]);
@@ -1549,6 +1598,19 @@ describe("plan auto-start (PLAN wl-mvfkv7llkp7nk0 § 3, R7, R8)", () => {
 		expect(await call("lane_add_slice", { task: "change it", doneCondition: "d", inputs: "i", kind: "change-small" })).toMatch(/^Added slice/);
 	});
 
+	test("Anthropic-out same-lab evidence permits the question but never auto-approves or sends an auto-start notice", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		endFlowRepair(ledger);
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: laneBuilderBody("openai", "lane-t-1", OTHER_LAB) });
+		seedReview(ledger, wl, planId, { ran: [OTHER_LAB], anthropicOut: true, rule: planId, round: 1, group: "dg-pass" });
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewLoopEndBody(planId, "pass") });
+		tick();
+		expect(planAutoStartRound(ledger, wl, planId, Date.now())).toBeNull();
+		expect(await ask()).toContain("Raised question");
+		expect(autoEntries(ledger, wl)).toEqual([]);
+		expect(noticesOf(ledger, wl)).toEqual([]);
+	});
+
 	const toJo: [string, (ledger: Ledger, wl: string, planId: string) => void][] = [
 		["flow repair is up (the ruling not ended)", (ledger, wl, planId) => passedRound(ledger, wl, planId)],
 		["the loop ended on Jo's accept at the round limit, not a pass", (ledger, wl, planId) => {
@@ -1771,7 +1833,7 @@ describe("escalation phase 2 through the lane tools (PLAN wl-mvg1vs0rhnu3gg § 1
 
 	test("fix round 1 (F1): a reviewed plan whose PLAN.md is edited after the raise (R2 made prompt-only), its question bytes unchanged, is refused on repeat with and without now: guard; no now: mark, no new row", async () => {
 		const { ledger, wl, planId, ask, call } = await planFixture("production");
-		const lines = ["# PLAN", "", "## Requirements", "", "- R1: the header offset lives in one token => test surface/test/tokens.test.ts", "- R2: the old constant is gone => test surface/test/tokens.test.ts"];
+		const lines = ["# PLAN", HOW_IT_FAILS, "", "## Requirements", "", "- R1: the header offset lives in one token => test surface/test/tokens.test.ts", "- R2: the old constant is gone => test surface/test/tokens.test.ts"];
 		const path = planFile("PLAN-edited.md", lines);
 		const body = bodyOn(path, [NONE_LINE]);
 		seedReview(ledger, wl, planId);

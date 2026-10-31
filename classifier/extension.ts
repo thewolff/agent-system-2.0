@@ -106,6 +106,15 @@
  * through `askJo` (PLAN wl-mvfkv7llkp7nk0 § 1): a park passes the R1–R5 verdict, which is false
  * wherever a park is reached, so the record asks exactly as before.
  *
+ * Anthropic-out (input in-mvtur7tlze7r5o, PLAN wl-mvtusij5mhwtnv): before 2026-10-31T06:00:00-07:00,
+ * reviews issued by a current OpenAI lane use only exact openai-codex review-row entries. This
+ * explicit same-lab authorization does not require Kimi to be down; mixed builder history and
+ * grants cannot widen it. Planning, panels and spawn filter before usability and allowlisting.
+ * Missing usable Codex fails without fallback or cross-lab park; unknown provenance stays fail-closed.
+ * Spawn checks the lane/date again after usability and inside its ledger transaction; changed policy
+ * refuses for redispatch, never writes a stale authorization. The adjacent review-same-lab-rule:
+ * receipt names this instruction and expiry, not Kimi. Builds and plan auto-start rules are unchanged.
+ *
  * Review round limit and stop (PLAN wl-mupu0sx2o046io D9/D10, MIGRATION.md follow-up 33; the pure
  * half is classifier/src/rounds.ts and classifier/src/review-stop.ts). Every review item's brief
  * gains the fixed `review-findings` paragraph. A production fan-out's whole membership is written
@@ -145,6 +154,8 @@ import { basename, dirname, join } from "node:path";
 import { LANE_ENV, WORKLOAD_ENV } from "../gates/src/types";
 import { askJo, decidedText, raisedId, rulingActive } from "../gates/src/rulings";
 import { type HostModules, hostSettings, readSetting } from "../gates/src/host";
+import { checkHowItFails, howItFailsLines, matchHowItFails } from "../gates/src/how-it-fails";
+import { briefTexts } from "../gates/src/rows/r05-brief-fields";
 import { CLASSIFIER_BY, type EntryRow, Ledger, type QuestionRow, type RoutingOutcome, type Stakes } from "../ledger/src/index";
 import { defaultLedgerPath } from "../ledger/src/locality";
 import { briefField, briefPanel, briefSlice, briefStakes, type PanelField, withoutPanelLines } from "./src/brief";
@@ -163,6 +174,8 @@ import { type Headroom, headroom } from "./src/headroom";
 import { askChoices, type ChoiceAnswer, type ChoiceJudge, type ChoiceQuestions, loadChoiceQuestions } from "./src/judge-ask";
 import {
 	type Builders,
+	ANTHROPIC_OUT_RULE,
+	anthropicOutRuleActive,
 	builderLabs,
 	builderRoles,
 	handBuilderBody,
@@ -185,6 +198,7 @@ import {
 	parseHandSpawn,
 	reviewParkBody,
 	type ReviewPlan,
+	type ReviewContext,
 	type ReviewPlanInput,
 	reviewPlan,
 	REVIEW_ROW_FROM,
@@ -304,7 +318,7 @@ export interface ClassifierDeps {
 	 * (classifier/src/fingerprint.ts `repoFingerprint` when absent). Throws when it cannot be taken.
 	 */
 	fingerprint?(cwd: string): string;
-	/** The clock Jo's Kimi-out rule is read on (`KIMI_OUT_RULE.endsAt`, ms since the epoch); `Date.now` when absent. */
+	/** Injected clock for dated review policies and quota checks (ms since the epoch); `Date.now` when absent. */
 	now?(): number;
 	/**
 	 * Lost-hand settle (PLAN wl-mv64rsqw2fcs1s D2, `handLost`): a `lane-started:` entry's omp pid against the start
@@ -468,6 +482,20 @@ type DeliveredJob = { jobId?: string; type?: string; label?: string };
 type TaskItem = { agent?: string; name?: string; task?: string; [key: string]: unknown };
 type TaskInput = TaskItem & { tasks?: TaskItem[]; context?: string };
 
+/** Whether every brief in `call` carries "How it fails", read as row 5 reads it (issue #334 item 2): its task or the batch context. */
+function howItFailsIntact(call: TaskInput): boolean {
+	const context = typeof call.context === "string" ? call.context : "";
+	const items = Array.isArray(call.tasks) && call.tasks.length > 0 ? call.tasks : [call];
+	return items.every(item => checkHowItFails(briefTexts(context, typeof item.task === "string" ? item.task : ""), "a brief").ok);
+}
+
+/** A member task that replaces the lane's (a panel leg, a synthesis) keeps the "How it fails" lines the lane's task carried. */
+function keepHowItFails(original: string | undefined, replacement: string): string {
+	if (matchHowItFails(replacement) !== null) return replacement;
+	const lines = howItFailsLines(original ?? "");
+	return lines === null ? replacement : `${replacement}\n\n${lines}`;
+}
+
 const refuse = (reason: string) => ({ block: true as const, reason });
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
@@ -542,8 +570,8 @@ function routingNote(routing: Pending["routing"] | null, tier: Tier, models: str
  * The routing note of a review whose row `reviewRow` rewrote (Jo, in-mv5qfm8910ycjk): one line per
  * lab whose entries it changed, unless `pin` keeps the hand on another lab.
  */
-function reviewRowNotes(table: TierTable, tier: Tier, pin: Lab | null): string[] {
-	const row = reviewRow(table, tier);
+function reviewRowNotes(table: TierTable, tier: Tier, pin: Lab | null, context?: ReviewContext): string[] {
+	const row = reviewRow(table, tier, context);
 	return (Object.entries(REVIEW_ROW_FROM) as [Lab, Tier][]).flatMap(([lab, from]) => {
 		if (pin !== null && pin !== lab) return [];
 		const of = (r: readonly string[]) => r.filter(s => labOf(s) === lab).join(",");
@@ -735,8 +763,9 @@ export const REVIEW_FINDINGS_PARAGRAPH = [
 	"",
 	"",
 	"Findings block (agent-system 2.0 review round limit): end your final report with one fenced code block whose info string is review-findings, holding JSON",
-	'{"findings":[{"severity":"blocking|major|minor","kind":"correctness|security|tests|design|docs|other","title":"…"}]}',
+	'{"findings":[{"severity":"blocking|major|minor","kind":"correctness|security|tests|design|docs|fault-tolerance|other","title":"…"}]}',
 	"with one entry per finding you report and an empty list when there is none. Only the last such block is read; a missing or malformed block fails the review round.",
+	"A silent failure path is kind fault-tolerance: a swallowed error (an empty or log-less catch, an ignored rejection or exit code), an unannounced fallback, a long-running step with no progress deadline, or cleanup that deletes cited evidence. A fault-tolerance finding is always read as blocking.",
 ].join("\n");
 
 /** A review item's brief with the findings paragraph, appended once. */
@@ -1183,7 +1212,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		if (tier === null || !rulingActive(deps.ledger(), "kimi-out", now)) return null;
 		const builders = buildersOf(workloadId);
 		if (builders.unknown.length > 0 || builders.labs.includes("kimi")) return null;
-		const row = reviewRow(deps.tierTable(), tier);
+		const row = reviewRow(deps.tierTable(), tier, { now, laneModel: liveCtx?.model ? `${liveCtx.model.provider}/${liveCtx.model.id}` : undefined });
 		if (row.some(s => labOf(s) === null)) return null;
 		const kimi = row.filter(s => labOf(s) === "kimi");
 		if (kimi.length === 0) return null;
@@ -1337,6 +1366,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			const stop = loopStop(entries, ledger.instructions(workloadId), workloadId, sliceId);
 			if (stop) {
 				log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review on a loop stopped by ${stop}; no park question`);
+				return;
+			}
+			if (anthropicOutRuleActive({ now: clock(), laneModel: liveCtx?.model ? `${liveCtx.model.provider}/${liveCtx.model.id}` : undefined })) {
+				log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review; Anthropic-out rule ${ANTHROPIC_OUT_RULE.input}: no cross-lab park; re-dispatch for the current OpenAI lane`);
 				return;
 			}
 			// Jo's Kimi-out rule (PLAN wl-mv5xay6bjp0268 § 2.2 site 4): no question; the re-dispatch's spawn decides same-lab.
@@ -1748,13 +1781,17 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		// Every panel hand is a review: it plans on `reviewRow` (Jo, in-mv5qfm8910ycjk). The legs and the
 		// synthesis lab are read with the refusals and the quota headroom the spawn applies (PLAN
 		// wl-mv71x5rwdu7eo0 § 3), so a lab the spawn would refuse is not picked when another can run.
-		const row = reviewRow(deps.tierTable(), c.routing.tier);
 		const disabled = new Set(await deps.disabledProviders(ctx));
+		const context = { now: clock(), laneModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined };
+		const row = reviewRow(deps.tierTable(), c.routing.tier, context);
 		live();
 		const now = clock();
 		const registry = ctx.modelRegistry as unknown as ModelAvailability;
 		const { usable, why } = await usableRow(row, registry, disabled, refusedProviders(ledger.entries(c.workloadId), now), null, headroom({ now }));
 		live();
+		if (anthropicOutRuleActive(context) !== anthropicOutRuleActive({ now: clock(), laneModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined })) {
+			return "review policy changed while checking panel usability; dispatch the panel again under the current policy";
+		}
 		const at = { workloadId: c.workloadId, by: deps.laneId };
 		if (field.field === "panel") {
 			const entries = ledger.entries(c.workloadId);
@@ -2437,13 +2474,20 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					// Jo's rule (in-mv5qfm8910ycjk): a review plans on `reviewRow`, not the tier row itself. A lab
 					// projected out of quota is not planned (PLAN wl-mv71x5rwdu7eo0 § 3); each member's spawn logs
 					// its `headroom-skip:` entries by its token, which exists only from publish on.
-					const row = reviewRow(deps.tierTable(), c.routing.tier);
 					const disabled = new Set(await deps.disabledProviders(ctx));
+					const context = { now: clock(), laneModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined };
+					const row = reviewRow(deps.tierTable(), c.routing.tier, context);
 					const registry = ctx.modelRegistry as unknown as ModelAvailability;
 					const { usable, why } = await usableRow(row, registry, disabled, refusedProviders(entries, clock()), null, headroom({ now: clock() }));
 					if (!attempt.live) throw retired();
-					const input = { row, usable, builders: buildersOf(c.workloadId), stakes: "production" as const, skipped: why };
+					if (anthropicOutRuleActive(context) !== anthropicOutRuleActive({ now: clock(), laneModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined })) {
+						return fail(`task ${c.index + 1}: review policy changed while checking usability; re-dispatch under the current policy`);
+					}
+					const input = { row, usable, context, builders: buildersOf(c.workloadId), stakes: "production" as const, skipped: why };
 					const plan = reviewPlan({ ...input, grant: false });
+					if (plan.kind === "park" && anthropicOutRuleActive(context) && input.builders.unknown.length === 0) {
+						return fail(`task ${c.index + 1}: Anthropic-out policy: no usable Codex review for ${c.sliceId}: ${plan.reasons.join(", ")}; no fallback or cross-lab park; re-dispatch after the missing prerequisite changes`);
+					}
 					// Jo's Kimi-out rule (PLAN wl-mv5xay6bjp0268 § 2.2 site 1): one hand, nothing written; its spawn decides same-lab.
 					if (plan.kind === "park" && (await kimiOutPlan(c.workloadId, input, c.routing.tier, registry, disabled, null))) {
 						if (!attempt.live) throw retired();
@@ -2492,6 +2536,16 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				/** A panel's ledger lines, written in the publish transaction after re-checking what another instance could have written. */
 				const panelLines: (() => void)[] = [];
 				const ledger = classified.some(c => c.review) ? deps.ledger() : null;
+				/**
+				 * The call the hands run. A batch keeps its shared context (its panel lines dropped once a panel is in it); a flat
+				 * call fanned into a batch takes its context to the batch's, not into each member (where OMP never reads it).
+				 */
+				const finalInput = (): TaskInput => {
+					const shared = typeof input.context === "string" && panelLines.length > 0 ? withoutPanelLines(input.context) : input.context;
+					if (batch) return { ...input, ...(shared === undefined ? {} : { context: shared }), tasks: revised };
+					if (revised.length === 1) return revised[0]!;
+					return { context: shared ?? "", tasks: revised.map(({ context: _context, ...member }) => member) };
+				};
 				const publish = () => {
 					items.forEach((item, index) => {
 						const c = byIndex.get(index);
@@ -2508,7 +2562,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 							for (const lab of plan.members) {
 								const token = newToken("dt");
 								members[lab] = token;
-								revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--${lab}`, task: ingested.tasks[lab], outputSchema: ingested.schema });
+								revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--${lab}`, task: keepHowItFails(item.task, ingested.tasks[lab]), outputSchema: ingested.schema });
 								published.push({
 									...base,
 									loop: null,
@@ -2535,7 +2589,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						}
 						if (typeof plan === "object" && plan.kind === "panel-synth") {
 							const token = newToken("dt");
-							revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--synth`, task: plan.task, outputSchema: plan.schema });
+							revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--synth`, task: keepHowItFails(item.task, plan.task), outputSchema: plan.schema });
 							published.push({
 								...base,
 								loop: null,
@@ -2575,6 +2629,16 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 										: null;
 						published.push({ ...base, index: revised.length - 1, dispatchName: c.sliceId, token: newToken("dt"), group: newToken("dg"), lab: null, note });
 					});
+					// Issue #334 item 2: the hands run the rewrite, and row 5 only ever saw the original call (OMP hands each
+					// tool_call handler the original input). A call whose briefs carried "How it fails" must not lose it here;
+					// if it did, refuse inside this transaction, before anything is written, rather than send hands without it.
+					const final = finalInput();
+					if (howItFailsIntact(input) && !howItFailsIntact(final)) {
+						throw new Error(
+							'the classifier\'s rewrite of this dispatch lost a brief\'s "How it fails" section, which row 5 had passed; refused rather than send the hands without it. ' +
+								"Put the section in the batch context and dispatch again (a classifier fault: say so in your report)",
+						);
+					}
 					for (const g of groups) {
 						ledger!.recordEntry({ by: deps.laneId, workloadId: g.workloadId, sliceId: g.sliceId, kind: "assumption", body: reviewGroupBody(g.sliceId, g.group, g.tokens) });
 					}
@@ -2584,9 +2648,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				else publish();
 				for (const g of groups) fanOuts.set(g.group, g);
 				pending.push(...published);
-				// A member's task carries no panel line, and neither does a batch's shared context.
-				const shared = batch && panelLines.length > 0 && typeof input.context === "string" ? { context: withoutPanelLines(input.context) } : {};
-				return { input: batch ? { ...input, ...shared, tasks: revised } : revised.length === 1 ? revised[0]! : { context: "", tasks: revised } };
+				return { input: finalInput() };
 			} catch (error) {
 				// SPEC-2.0.md § A1.3: a dispatch the classifier could not route is refused, not sent on
 				// an unclassified guess. Nothing was published, so late answers have nowhere to land.
@@ -2675,9 +2737,14 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const laneModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 				const build = found?.review ? null : buildRow(table, tier, laneModel);
 				if (build && "error" in build) return refuse(refusedRow(`agent-system-2 classifier: ${build.error}`));
-				const row = build ? build.row : reviewRow(table, tier);
+				const context = { now: clock(), laneModel };
+				const outage = anthropicOutRuleActive(context);
+				const row = build ? build.row : reviewRow(table, tier, context);
 				const room = headroom({ now: clock() });
 				const { usable, why, skipped, projected: out, retained } = await usableRow(row, registry, disabled, providerRefused, spawnKey, room, build ? table[tier] : row);
+				if (found?.review && outage !== anthropicOutRuleActive({ now: clock(), laneModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined })) {
+					return refused(refusedRow("agent-system-2 classifier: review policy changed while checking usability; re-dispatch under the current policy"));
+				}
 				const retainedNotes = (models: readonly string[]) => models.flatMap(selector => retained[selector] ? [retained[selector]!] : []);
 				const pin = found?.lab ?? null;
 				projected = Object.entries(out).filter(([selector]) => pin === null || labOf(selector) === pin);
@@ -2722,10 +2789,14 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						if (held) return { held };
 						const entries = ledger.entries(hand.workloadId);
 						const entry = (body: string) => ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body });
+						if (hand.review && outage !== anthropicOutRuleActive({ now: clock(), laneModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined })) {
+							return { held: "review policy changed at spawn transaction; re-dispatch under the current policy" };
+						}
 						if (grant && spentGrants(entries).has(grant)) return "spent";
 						if (rule && !rulingActive(ledger, "kimi-out", clock())) return "expired";
 						if (grant) entry(reviewSameLabBody(grant, hand.token));
-						if (rule) entry(reviewSameLabRuleBody({ slice: hand.sliceId, token: hand.token, labs: rule.labs, kimi: rule.kimi }));
+						if (hand.review && outage) entry(reviewSameLabRuleBody({ slice: hand.sliceId, token: hand.token, labs: ["openai"], anthropicOut: true }));
+						else if (rule) entry(reviewSameLabRuleBody({ slice: hand.sliceId, token: hand.token, labs: rule.labs, kimi: rule.kimi }));
 						headroomSkips(hand.token, entry);
 						entry(handSpawnBody({ token: hand.token, root: root!, spawnKey, review: hand.review, group: hand.group, row: models.map(modelIdentity) }));
 						return "recorded";
@@ -2760,7 +2831,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					}
 					const recorded = recordSpawn(found, pin.models, null, null);
 					if (recorded !== "recorded") {
-						const held = recorded === "spent" ? "its grant was spent" : recorded.held;
+						const held = recorded === "spent" ? "its grant was spent" : recorded === "expired" ? "its rule expired" : recorded.held;
 						panelEnded(found, panel, `held ${held}`, log);
 						return refuse(`agent-system-2 classifier: ${held}`);
 					}
@@ -2783,7 +2854,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const ledger = deps.ledger();
 				const builders = buildersOf(review.workloadId);
 				const roles = builderRoles(ledger, review.workloadId, new Set(hands.filter(h => h.review).map(h => h.token)));
-				const planInput = { row, usable, builders, stakes: null, skipped: why, pin: review.lab ?? undefined };
+				const planInput = { row, usable, context, builders, stakes: null, skipped: why, pin: review.lab ?? undefined };
 				let grant = review.lab ? null : unspentGrant(ledger.entries(review.workloadId), ledger.instructions(review.workloadId), review.sliceId);
 				const parkRefusal = (reasons: readonly string[]) => {
 					let reason = refusedRow(`agent-system-2 classifier: no lab other than the builder's can review ${review.sliceId}`);
@@ -2799,7 +2870,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					let plan = granted?.kind === "single" ? granted : reviewPlan({ ...planInput, grant: false });
 					const reasons = plan.kind === "park" ? plan.reasons : [];
 					let rule: { labs: Lab[]; kimi: string } | null = null;
-					if (plan.kind === "park" && !review.lab) {
+					if (plan.kind === "park" && !review.lab && !outage) {
 						const ruled = await kimiOutPlan(review.workloadId, planInput, tier, registry, disabled, spawnKey);
 						if (ruled) {
 							plan = ruled.plan;
@@ -2807,12 +2878,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						}
 					}
 					if (plan.kind !== "single") {
+						if (outage && builders.unknown.length === 0) return refused(refusedRow(`agent-system-2 classifier: Anthropic-out policy: no usable Codex review for ${review.sliceId}: ${reasons.join(", ")}; no fallback or cross-lab park; re-dispatch after the missing prerequisite changes`));
 						if (review.lab) {
 							return refused(refusedRow(`agent-system-2 classifier: no ${review.lab} model can review ${review.sliceId} at this spawn: ${reasons.join(", ")}`));
 						}
 						return parkRefusal(reasons);
 					}
-					const spend = plan.sameLab && !rule ? grant : null;
+					const spend = plan.sameLab && !rule && !outage ? grant : null;
 					const recorded = recordSpawn(review, plan.models, spend, rule);
 					if (recorded === "spent") {
 						grant = null;
@@ -2831,7 +2903,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					}
 					hands.push({ ...review, root, spawnKey, tier, models: plan.models, row: plan.allow, cwd: ctx.cwd, before });
 					const notes = [
-						...(plan.excluded.length > 0 ? [`review routed off the builder lab${plan.excluded.length > 1 ? "s" : ""} ${plan.excluded.join(", ")}`] : []),
+						...(outage
+							? [`same-lab under Jo's Anthropic-out rule ${ANTHROPIC_OUT_RULE.input} (review-same-lab-rule:), Codex only until ${ANTHROPIC_OUT_RULE.endsAtText}`]
+							: plan.excluded.length > 0 ? [`review routed off the builder lab${plan.excluded.length > 1 ? "s" : ""} ${plan.excluded.join(", ")}`] : []),
 						...(spend ? [`same-lab grant ${spend} spent: the builder's entries follow the other labs'`] : []),
 						...(rule
 							? [
@@ -2840,7 +2914,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 								]
 							: []),
 						...(review.note ? [review.note] : []),
-						...reviewRowNotes(table, tier, review.lab),
+						...reviewRowNotes(table, tier, review.lab, context),
 						...retainedNotes(plan.models),
 					];
 					return { model: plan.models, note: routingNote(review.routing, tier, plan.models, skipped, notes) };

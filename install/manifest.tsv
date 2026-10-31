@@ -106,6 +106,7 @@ gates/index.ts	extension	-
 gates/src/eval-code.ts	module	-
 gates/src/exec.ts	module	-
 gates/src/gates.ts	module	-
+gates/src/how-it-fails.ts	module	-
 gates/src/rows/question.ts	module	-
 gates/src/rows/r01-turn-shape.ts	module	-
 gates/src/rows/r02-contract.ts	module	-
@@ -133,6 +134,7 @@ gates/test/r06-reserved.test.ts	test	-
 gates/test/r06-land-first.test.ts	test	-
 gates/test/extension.test.ts	test	-
 gates/test/helpers.ts	test	-
+gates/test/how-it-fails.test.ts	test	-
 gates/test/known-fragment.test.ts	test	-
 gates/test/ledger-rows.test.ts	test	-
 gates/test/message-rows.test.ts	test	-
@@ -1081,6 +1083,8 @@ surface/extensions/wake.ts	module	-
 surface/extensions/surface-input.ts	module	-
 surface/extensions/workload.ts	module	-
 surface/test/helpers.ts	test	-
+surface/test/how-it-fails-entry.test.ts	test	-
+surface/test/next-step.test.ts	test	-
 surface/test/render.test.ts	test	-
 surface/test/input.test.ts	test	-
 surface/test/numbering.test.ts	test	-

@@ -59,6 +59,7 @@ import {
 	type AskResult, askJo, decidedText, installedReviewModel, isNowCategory, MODEL_SUBJECTS, type ModelSubject, NOW_CATEGORIES, type NowCategory, nowMarks, questionKind,
 	RULING_APPLIED_PREFIX, rulingActive, subjectProblem, type TrainSignoffFact,
 } from "../../gates/src/rulings";
+import { checkHowItFails, howItFailsNote } from "../../gates/src/how-it-fails";
 import { gateSession } from "../../gates/src/session";
 import { type EntryRow, homeDir, type InstructionRow, type Ledger, type QuestionRow, type RoutingRow, type WorkloadStatusRow } from "../../ledger/src/index";
 import { repoOf } from "../src/decision-log";
@@ -66,7 +67,7 @@ import { reservedStates } from "../src/errors";
 import { readFacts } from "../src/facts";
 import {
 	CLASSIFIER_MACHINERY_PREFIXES, type ControlEntry, controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, landFirstOn, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE,
-	PLAN_REQUIREMENTS_HEADING, PLAN_FILE_MAX_BYTES, PLAN_REQUIREMENTS_SHAPE, type PlanBinding, planAutoApprovedBody, planAutoStartNoticeBody, planFirst, planHalted, planQuestionBinding,
+	PLAN_HOW_IT_FAILS_LINE, PLAN_REQUIREMENTS_HEADING, PLAN_FILE_MAX_BYTES, PLAN_REQUIREMENTS_SHAPE, type PlanBinding, planAutoApprovedBody, planAutoStartNoticeBody, planFirst, planHalted, planQuestionBinding,
 	planQuestionBody, planQuestionFiles, planQuestionProblem, planSlice, reservedPrefix,
 } from "../src/launch";
 import {
@@ -169,7 +170,7 @@ function planUnchanged(control: readonly ControlEntry[], questionId: string, bod
  * its `hand-settled:` token has no `review-withheld:`, and every model that answered is on a lab
  * outside `builderLabs` computed now (no live set: an in-flight hand counts every lab of its row), or
  * its token ran same-lab (`sameLabTokens`: Jo's same-lab answer to a `review-park:` question of this
- * slice, or Jo's Kimi-out rule); (3) was created after the newest earlier question on the plan slice was
+ * slice, or Jo's Kimi-out or dated Anthropic-out rule); (3) was created after the newest earlier question on the plan slice was
  * raised and resolved (an open one clears nothing). A `review-limit:` question Jo answered `accept`
  * does not reset (3) to its own resolution; when the newest one raised since that resolution
  * exists, the plan clears only on the rows of the round that hit its limit (check 2 still applying)
@@ -230,7 +231,8 @@ const HEADROOM_SKIP = /^headroom-skip: \S+ token (\S+)(?: |$)/;
  * PLAN wl-mv5xay6bjp0268 § 2.6 [r2-M1]: the review tokens on the plan slice `planId` that ran same-lab
  * by right. The entry that lets a token run is either a `review-same-lab: <grant> token <dt>` spend
  * whose grant `joGrant` accepts, or a `review-same-lab-rule: … slice <planId> token <dt> …` entry
- * (Jo's Kimi-out rule); it counts only when the next entry in the workload's order, past an unbroken
+ * (Jo's Kimi-out or dated Anthropic-out rule). The authorization entry itself must be on the plan
+ * slice; it counts only when the next entry in the workload's order, past an unbroken
  * run of that token's `headroom-skip:` rows on the plan slice by the same writer (#228), is that
  * token's `hand-spawn:` on the plan slice by the same writer, what the classifier's `recordSpawn`
  * writes in one transaction. A spend or rule line standing alone, or followed by another writer's
@@ -240,7 +242,7 @@ function sameLabTokens(entries: readonly EntryRow[], planId: string, joGrant: (g
 	const out = new Set<string>();
 	const mine = (x: EntryRow | undefined, e: EntryRow): x is EntryRow => x?.kind === "assumption" && x.created_by === e.created_by && x.slice_id === planId;
 	entries.forEach((e, at) => {
-		if (e.kind !== "assumption") return;
+		if (e.kind !== "assumption" || e.slice_id !== planId) return;
 		const rule = parseReviewSameLabRule(e.body);
 		const spend = rule ? undefined : [...spentGrants([e])][0];
 		const token = rule ? (rule.slice === planId ? rule.token : null) : spend && joGrant(spend[0]) ? spend[1] : null;
@@ -599,7 +601,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			`each line at most ${PLAN_QUESTION_LINE_MAX} characters and nothing else: the plan file's absolute path; one \`- <slice id>: <what it does>\` line per slice; ` +
 			"one `prompt-only: <R id>: <the requirement, and why no code reaches it>` line per requirement the plan file marks prompt-only, or exactly `prompt-only: none` when it marks none; " +
 			"1 to 3 `tradeoff: <one line>` lines; one `review: <verdict>, <model>, <absolute path to the verdict file>` line. " +
-			`The plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\n` +
+			`The plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\n${PLAN_HOW_IT_FAILS_LINE}\n` +
 			"A plan question offering approve is refused until a review hand named after the plan slice has reviewed the plan on another lab since the last question, and refused in any other shape. " +
 			"Until the plan is approved, a question offering approve on any other slice is refused. " +
 			"Jo's standing rulings are checked first: a question one of them already answers is not raised, and the tool returns the ruling and what to do instead. " +
@@ -682,9 +684,13 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 				if (problem !== null) {
 					return text(
 						`A plan question offering approve has this shape, one item per line, each line at most ${PLAN_QUESTION_LINE_MAX} characters, nothing else:\n${PLAN_QUESTION_SHAPE}\n` +
-							`Its plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\nThis body does not: ${problem}. Nothing was asked.`,
+							`Its plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\n${PLAN_HOW_IT_FAILS_LINE}\nThis body does not: ${problem}. Nothing was asked.`,
 					);
 				}
+				// Issue #334 item 2: a plan that passed on the `How it fails: n/a, <reason>` line, or on the gate's error bypass, is recorded
+				// here, once per checked raise, before the auto-start or the question, so the skip is visible whichever follows.
+				const failsNote = judged.plan === null ? null : howItFailsNote(checkHowItFails(judged.plan.toString("utf8"), "the plan file"), `plan file ${planQuestionFiles(body)?.plan ?? body.split("\n")[0]!.trim()}`);
+				if (failsNote !== null) ledger.write(() => ledger.recordEntry({ by: o.own.laneId, workloadId, sliceId: slice, kind: "assumption", body: failsNote }));
 				// Fix round 1 (F1): the plan file as judged and the verdict file now, bound to the question if it is raised.
 				const verdict = fileSha(planQuestionFiles(body)?.verdict ?? "");
 				if (judged.plan !== null && verdict !== null) binding = { plan: createHash("sha256").update(judged.plan).digest("hex"), verdict };
