@@ -1454,9 +1454,6 @@ surface/test/fixtures/timing-lint/negative.txt	test	-
 surface/test/fixtures/timing-lint/opt-out.txt	test	-
 surface/test/fixtures/timing-lint/opt-out-bad.txt	test	-
 # Test-timing automation, isolated proof requests and executor-owned resource admission.
-scripts/timing-audit.ts	module	-
-scripts/timing-rewrite.ts	module	-
-scripts/timing-proof.ts	module	-
 surface/src/timing-automation.ts	module	-
 surface/test/timing-automation.test.ts	test	-
 surface/src/timing-proof.ts	module	-
