@@ -69,7 +69,7 @@ function drive(w: World, now: string, installedAt: string | null): { lines: Erro
 	return { lines, plistReads };
 }
 
-const NEXT_MISSED = `run \`launchctl print gui/$(id -u)/${DRIVE_BACKUP_CHECK_LABEL}\`, then reload it with \`AS2_KEEP_LOCAL=<same as installed> bash install/install.sh --drive-backup\``;
+const NEXT_MISSED = `run \`launchctl print gui/$(id -u)/${DRIVE_BACKUP_CHECK_LABEL}\`, then reload it with \`bash install/install.sh --drive-backup\``;
 
 describe("drive backup needs-you line: the missed line (R5)", () => {
 	test("installed, no entry ever: nothing under 30 h after the plist was written, the missed line from 30 h, with no expiry", () => {

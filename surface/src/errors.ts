@@ -194,7 +194,7 @@ export function driveBackupLines(control: readonly ControlEntry[], now: string, 
 	if (!installed) return out;
 	const since = check ? check.createdAt : new Date(installed.mtimeMs).toISOString();
 	if (hoursElapsed(since, now) < DRIVE_BACKUP_MISSED_HOURS) return out;
-	const reload = `run \`launchctl print gui/$(id -u)/${DRIVE_BACKUP_CHECK_LABEL}\`, then reload it with \`AS2_KEEP_LOCAL=<same as installed> bash install/install.sh --drive-backup\``;
+	const reload = `run \`launchctl print gui/$(id -u)/${DRIVE_BACKUP_CHECK_LABEL}\`, then reload it with \`bash install/install.sh --drive-backup\``;
 	const what = check ? `the newest check entry is ${check.date} ${check.result} (${hoursBetween(check.createdAt, now)} h ago)` : `no check entry since the job was installed ${since} (${hoursBetween(since, now)} h ago)`;
 	out.push({
 		kind: "report", workloadId: STANDING_WORKLOAD_ID, rowId: DRIVE_BACKUP_CHECK_LABEL, state: `missed ${check ? check.id : since}`, next: reload,
