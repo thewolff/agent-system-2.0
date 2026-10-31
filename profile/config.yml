@@ -310,8 +310,8 @@ testRunner:
   # Every fast set includes these smoke files. Files in macOnly run only in the full main suite:
   # macOS-specific sandbox, shell, filesystem and process APIs cannot be exercised on Linux;
   # the remaining portability cases depend on Linux filesystem identity/order/timing behavior.
-  # The 13 macOS-only files and four portability files found by the Linux probe, and test-runner-smoke found by the
-  # as2-hosted run of 2026-10-28 (each reason below), stay out of hosted Linux. They run in the post-merge Mac full
+  # The 13 macOS-only files and four portability files found by the Linux probe, test-runner-smoke found by the
+  # as2-hosted run of 2026-10-28, and timing-proof (its historic load needs taskpolicy) (each reason below) stay out of hosted Linux. They run in the post-merge Mac full
   # suite and in .github/workflows/as2-hosted.yml's macos-latest job. Keep zsh and bubblewrap
   # tests in the fast set; the hosted workflow installs both. Activation is a ledger word, not a flag.
   # timing-lint.test.ts is the incidental-timing ratchet (Jo's rule, 2026-10-28): static, under a second, and it must
