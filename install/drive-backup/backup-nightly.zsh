@@ -12,11 +12,17 @@
 #            (rename(2), same volume) into claims/<date>/<name>.d/. Before the rename <name>.attempts is written at
 #            the original path; the producer's freeName treats it as holding the name, so the name is never reused.
 #            From here on only this job touches the file; the producer's sweep never sees it.
-#   upload   sha256, md5 and size of the claimed file; copy it unchanged (no encryption, Jo 2026-10-28) with cp -n to
-#            the unique, never-overwritten Drive path
+#   upload   sha256, md5 and size of the claimed file; record the upload (claims/.../upload: Drive path, sha256, md5,
+#            size) BEFORE the copy, then copy it unchanged (no encryption, Jo 2026-10-28) with cp -n to the unique,
+#            never-overwritten Drive path
 #            My Drive/as2-backup/scratch-archive/<date>/<id>.<sha256 first 16>.<run stamp>.tar.gz
 #   prove    wait (one shared deadline) until Drive for desktop's own metadata records the upload (see prove_once);
 #            write a receipt binding the Drive item id, its head revision id, md5 and size. Nothing is deleted.
+#            Upload identity (OpenAI review round 6, R6-B1): once claims/.../upload exists only a receipt replaces it.
+#            A failed copy, a proof timeout or a proof error keeps it, counts the night, and the next night proves
+#            that same Drive path again (a local pathname that is missing or does not answer is no proof the copy is
+#            not on Drive). At 3 failed nights it goes STUCK naming the Drive path; a person confirms there is no Drive
+#            copy there before deleting claims/.../upload, and only then does a night upload it afresh.
 #   confirm  on a LATER run, at least 20 h after the receipt: prove again against the receipt (same item, same
 #            revision, same md5 and size), read it from Google's servers (server-read.zsh: evict the local copy,
 #            prove none is left, read, check the read downloaded it) and compare its sha256, recheck the claimed
@@ -31,8 +37,11 @@
 # (MANIFEST.tsv, PAD of random bytes, then each archive unchanged as <date>/<name>) at least as large as the
 # threshold, uploaded with cp -n to as2-backup/scratch-archive/<date>/env-<stamp>.<sha16>.<run stamp>.tar, proven,
 # and confirmed exactly like a large archive (receipt, 20 h, re-proof, server read, sha256). Only then is every
-# member re-hashed against its recorded sha256 and deleted, with <original>.offsite naming the envelope and the
-# member. A failing envelope keeps every member and is counted (and goes stuck) as one item.
+# member re-hashed against its recorded sha256 and retired, one member at a time: <original>.offsite naming the
+# envelope and the member, the member deleted, its receipt written, its claim dir moved to receipts/; the envelope
+# moves to receipts/envelopes/ only when every member is retired. A run that stops between any two of these steps is
+# finished by the next run (see confirm_envelope). A failing envelope keeps every member still local and is counted
+# (and goes stuck) as one item.
 # Plus each night the ledger: sqlite3 -readonly .backup, quick_check, gzip, unique Drive path
 #   as2-backup/ledger/<date>/ledger-<run stamp>-<sha256 first 16>.db.gz, proven, receipt appended. Never deleted.
 #
@@ -51,7 +60,9 @@
 #   AS2_SERVER_READ_CMD, AS2_T_SERVER_READ, AS2_TMPDIR, AS2_UNDER_LAUNCHD=1 (plists set it), AS2_ENVELOPE_FLOOR (bytes).
 # Test seams, each a no-op when unset: AS2_RUNSTAMP (the run stamp, YYYYMMDDTHHMMSS, so runs in one second get
 #   distinct names), AS2_PROOF_POLL_HOOK (a command run before each proof pass), AS2_CLOCK_CMD (lib.zsh clock_now: a
-#   command printing the epoch seconds every in-run deadline reads).
+#   command printing the epoch seconds every in-run deadline reads), AS2_CRASH_AFTER=<step>[:<n>] (the run kills
+#   itself with SIGKILL right after the n-th time, default the first, it completes <step>: upload-recorded, marker,
+#   unlink, member-receipt, claim-moved, envelope-moved; see crash_point).
 # Settings: AS2_KEEP_LOCAL=1 (upload and prove, never delete).
 
 emulate -L zsh
@@ -97,6 +108,7 @@ WATCHER_GRACE=$(( 36*3600 ))                 # first run -> watcher heartbeat mu
 T_SHORT=${AS2_T_SHORT:-60}                   # sqlite query, stat, xattr, mkdir, rm
 T_LONG=${AS2_T_LONG:-3600}                   # hash, copy into Drive, read back, ledger .backup
 STUCK_AFTER=3
+ROOT_GRACE=$(( 7*86400 ))   # --verify-restore: no archive receipt is "not applicable" until the root is 7 days old (as the 9 AM check)
 SERVER_READ_CMD=${AS2_SERVER_READ_CMD:-$HERE/server-read.zsh}   # run with /bin/zsh <file> <DriveFS account dir>
 T_SERVER_READ=${AS2_T_SERVER_READ:-$(( T_LONG + 300 ))}   # evict and drain (up to 140 s) plus the read (as T_LONG)
 ENVELOPE_FLOOR=${AS2_ENVELOPE_FLOOR:-16777216}   # 16 MiB: the smallest envelope, and the size under which an archive goes into one
@@ -148,6 +160,18 @@ local -a F_PATH F_STEP F_ERR NEW_STUCK SKIPPED_STUCK
 fail_item() { # <path> <step> <error>  record and keep going
   F_PATH+=( "$1" ); F_STEP+=( "$2" ); F_ERR+=( "$3" )
   info "FAILED [$2] $1: $3"
+}
+# crash_point <step>: the AS2_CRASH_AFTER test seam (a no-op when unset). With AS2_CRASH_AFTER=<step> or <step>:<n>
+# the run kills itself with SIGKILL right after the first (or the n-th) time it completes <step>, so nothing after the
+# step runs: no cleanup, no heartbeat, no alert, exactly as a crash or power loss leaves things. The test suite uses it
+# to prove the next run finishes what the killed run left (test-fake-drive-crash.zsh).
+typeset -A CRASH_SEEN
+crash_point() {
+  [[ -n ${AS2_CRASH_AFTER:-} ]] || return 0
+  CRASH_SEEN[$1]=$(( ${CRASH_SEEN[$1]:-0} + 1 ))
+  [[ $AS2_CRASH_AFTER == $1 || $AS2_CRASH_AFTER == $1:${CRASH_SEEN[$1]} ]] || return 0
+  info "AS2_CRASH_AFTER=$AS2_CRASH_AFTER: killing this run (SIGKILL) right after step '$1' (test seam)"
+  kill -KILL $$
 }
 typeset -A C; C=( seen 0 claimed 0 uploaded 0 proven 0 waiting_reproof 0 deleted 0 kept_local 0 enveloped 0 )
 LEDGER_RESULT=not-run RESULT="" ROOT_STATE=present
@@ -522,7 +546,31 @@ if [[ $MODE == verify ]]; then
       fi
     fi
   fi
-  [[ -z $picked && -z $epicked ]] && fail_item "$RECEIPTS" verify-archive "no archive or envelope receipt with a drive_path and sha256"
+  # The ledger-only period: no archive or envelope receipt is "not applicable" (a note, not a failure) while the
+  # archive root has never existed or first existed under ROOT_GRACE ago (archive-root-seen, the 9 AM check's grace).
+  local -a VNOTES; VNOTES=() ARCHIVE_VERIFY=checked
+  if [[ -z $picked && -z $epicked ]]; then
+    if [[ ! -f $ROOT_SEEN ]]; then
+      ARCHIVE_VERIFY="not applicable: no archive made yet"
+      if [[ $ROOT_STATE == absent-never-seen ]]; then
+        VNOTES+=( "archive root $ARCHIVE_ROOT has never existed (the ledger-only period): no archive or envelope receipt to verify; the ledger is verified" )
+      else
+        VNOTES+=( "archive root $ARCHIVE_ROOT exists but no nightly run has recorded it in $ROOT_SEEN yet: no archive or envelope receipt to verify; the ledger is verified" )
+      fi
+    elif seen=$(<$ROOT_SEEN) && [[ $seen == <-> ]]; then
+      if (( EPOCHSECONDS - seen < ROOT_GRACE )); then
+        ARCHIVE_VERIFY="not applicable: no archive made yet"
+        VNOTES+=( "archive root $ARCHIVE_ROOT first seen $(( (EPOCHSECONDS - seen) / 86400 )) day(s) ago, inside the $(( ROOT_GRACE / 86400 ))-day grace: no archive or envelope receipt to verify yet; the ledger is verified" )
+      else
+        ARCHIVE_VERIFY="no receipt"
+        fail_item "$RECEIPTS" verify-archive "no archive or envelope receipt with a drive_path and sha256; the archive root $ARCHIVE_ROOT was first seen $(( (EPOCHSECONDS - seen) / 86400 )) day(s) ago, past the $(( ROOT_GRACE / 86400 ))-day grace ($ROOT_SEEN)"
+      fi
+    else
+      ARCHIVE_VERIFY="no receipt"
+      fail_item "$ROOT_SEEN" verify-archive "no archive or envelope receipt, and $ROOT_SEEN does not hold an epoch ('${seen:-unreadable}'), so the 7-day grace cannot be applied; fix or delete that file"
+    fi
+    for n in $VNOTES; do info "NOTE: $n"; done
+  fi
   lrow=""; if [[ -f $LEDGER_RECEIPTS ]]; then local -a lrows; lrows=( "${(@f)$(<$LEDGER_RECEIPTS)}" ); lrow=${lrows[-1]:-}; fi
   if [[ -z $lrow ]]; then
     fail_item "$LEDGER_RECEIPTS" verify-ledger "no ledger snapshot receipt recorded yet"
@@ -542,8 +590,9 @@ if [[ $MODE == verify ]]; then
     fi
   fi
   vresult=$( (( ${#F_PATH} )) && print failure || print success )
-  body=$($JQ -n --arg at "$(ts)" --argjson at_epoch $EPOCHSECONDS --arg result $vresult --argjson failures "$(failures_json)" \
-    '{at:$at, at_epoch:$at_epoch, result:$result, failures:$failures}')
+  body=$($JQ -n --arg at "$(ts)" --argjson at_epoch $EPOCHSECONDS --arg result $vresult --arg archive "$ARCHIVE_VERIFY" \
+    --argjson notes "$(json_array $VNOTES)" --argjson failures "$(failures_json)" \
+    '{at:$at, at_epoch:$at_epoch, result:$result, archive:$archive, notes:$notes, failures:$failures}')
   write_file "$VERIFY_BEAT" "$body" || fail_item "$VERIFY_BEAT" verify-state "could not write last-verify.json"
   say_step "verify-restore: $vresult (temp copies removed on exit)"
   (( ${#F_PATH} )) && finish 1 || finish 0
@@ -566,19 +615,27 @@ fi
 
 # ---------- claim bookkeeping ----------
 attempts_of() { [[ -f $1/attempts ]] || { print 0; return }; local -a al; al=( "${(@f)$(<$1/attempts)}" ); [[ ${al[1]:-} == <-> ]] && print ${al[1]} || print 0 }
+# stuck_upload_note <claim or envelope dir>: for an item going stuck with an upload record (R6-B1), the Drive path it
+# names and the one step that allows a fresh upload; empty without a record.
+stuck_upload_note() {
+  [[ -f $1/upload ]] || return 0
+  local up; up=$(kv "$1/upload" drive_path) || up="(no drive_path line in $1/upload)"
+  print -r -- "the upload record names the Drive copy $up and the next nights re-prove only that copy; a person confirms there is no Drive copy at $up before deleting $1/upload to allow a fresh upload"
+}
 claim_failed() { # <claim dir> <step> <error>: record, count the night, mark stuck at the limit
-  local cd=$1 origin=$(<$1/origin)
+  local cd=$1 origin=$(<$1/origin) note
   fail_item "$origin" "$2" "$3 (claimed copy: $cd)"
   [[ $MODE == dry ]] && return 0
   local n=$(( $(attempts_of "$cd") + 1 ))
   write_file "$cd/attempts" "$n"$'\n'"$(ts) $2: $3" || fail_item "$cd" state "cannot write $cd/attempts"
   write_file "$origin.attempts" "$n failed night(s); claimed by as2 drive-backup into $cd" || fail_item "$origin.attempts" state "cannot update"
   if (( n >= STUCK_AFTER )); then
-    write_file "$cd/stuck" "$(ts) stuck after $n failed nights; last: $2: $3. Delete this file to let the next night retry." \
+    note=$(stuck_upload_note "$cd")
+    write_file "$cd/stuck" "$(ts) stuck after $n failed nights; last: $2: $3. ${note:+Upload: $note. }Delete this file to let the next night retry." \
       || fail_item "$cd" state "cannot write $cd/stuck"
     write_file "$origin.stuck" "stuck in as2 drive-backup: see $cd/stuck" || fail_item "$origin.stuck" state "cannot write"
-    NEW_STUCK+=( "$origin" )
-    info "STUCK: $origin ($n failed nights). The next nights skip it until $cd/stuck is deleted."
+    NEW_STUCK+=( "$origin${note:+ ($note)}" )
+    info "STUCK: $origin ($n failed nights). The next nights skip it until $cd/stuck is deleted.${note:+ Upload: $note.}"
   else
     info "failed nights for $origin: $n of $STUCK_AFTER"
   fi
@@ -669,38 +726,79 @@ confirm_and_delete() { # <claim dir>: the deleting step, only on a later run tha
   perl_rename "$cd" "$RECEIPTS/${cd:h:t}/$name" >/dev/null 2>&1 || fail_item "$cd" cleanup "could not move the receipt to $RECEIPTS (the archive is already deleted)"
 }
 
-upload_claim() { # <claim dir>: hash, copy unchanged to a new unique Drive path, queue for proof
+# drive_path_free <new Drive path>: 0 when nothing is at it. Prints the reason and returns 1 when something is there
+# or the check did not answer (a timeout is not "absent"); then nothing is recorded or copied tonight.
+drive_path_free() {
+  local rc=0
+  bounded $T_SHORT "stat $1" /bin/test -e "$1" || rc=$?
+  case $rc in
+    0) print -r -- "$1 already exists; never overwriting" ;;
+    1) return 0 ;;
+    *) print -r -- "cannot tell whether $1 exists (stat exit $rc); not recording or copying an upload tonight" ;;
+  esac
+  return 1
+}
+
+# upload_claim <claim dir>: hash, record the upload, then copy unchanged to a new unique Drive path, queue for proof.
+# The record is written BEFORE the copy and only a receipt replaces it (R6-B1): a copy that fails or a run that stops
+# mid-copy leaves the record, and the next night proves that same Drive path instead of uploading again.
+upload_claim() {
   local cd=$1 origin=$(<$1/origin) name=${$(<$1/origin):t} day=${1:h:t} sha md5 size o dst
   sha=$(sha256_of "$cd/$name") && md5=$(md5_of "$cd/$name") && size=$(size_of "$cd/$name") \
     || { claim_failed "$cd" hash "cannot read the claimed archive: $sha$md5$size"; return }
   info "sha256 $sha md5 $md5 bytes $size"
   dst="$MYDRIVE/as2-backup/scratch-archive/$day/${name%.tar.gz}.${sha[1,16]}.$RUNSTAMP.tar.gz"
-  if bounded $T_SHORT "stat $dst" /bin/test -e "$dst"; then claim_failed "$cd" copy "$dst already exists; never overwriting"; return; fi
+  o=$(drive_path_free "$dst") || { claim_failed "$cd" copy "$o"; return }
   o=$(bounded $T_SHORT "mkdir ${dst:h}" /bin/mkdir -p -- "${dst:h}" 2>&1) || { claim_failed "$cd" copy "mkdir ${dst:h}: $o"; return }
-  o=$(bounded $T_LONG "copy to Drive $name" /bin/cp -n -- "$cd/$name" "$dst" 2>&1) || { claim_failed "$cd" copy "cp to $dst: $o"; return }
   write_file "$cd/upload" "drive_path=$dst"$'\n'"sha256=$sha"$'\n'"md5=$md5"$'\n'"bytes=$size"$'\n'"uploaded_at=$(ts)" \
-    || fail_item "$cd" state "cannot write $cd/upload (the copy is on Drive; tomorrow uploads again under a new name)"
+    || { claim_failed "$cd" state "cannot write $cd/upload before the copy; not copying"; return }
+  crash_point upload-recorded
+  if ! o=$(bounded $T_LONG "copy to Drive $name" /bin/cp -n -- "$cd/$name" "$dst" 2>&1); then
+    claim_failed "$cd" copy "cp to $dst failed: $o; the upload record $cd/upload stays (the copy may still have reached Drive) and the next night proves $dst, never a new upload"
+    return
+  fi
   info "copied to $dst"
   C[uploaded]=$(( C[uploaded] + 1 ))
   add_pending archive "$cd" "$dst" "$md5" "$size" "$sha"
 }
 
-# envelope_failed <envelope dir> <step> <error>: one failure naming the envelope and every member (all kept); the
-# night is counted on the envelope, which goes stuck (with <original>.stuck for each member) at the limit.
+# envelope_member_states <envelope dir>: sorts the members file's originals into ML_LOCAL (archive still in its claim
+# dir), ML_RETIRED (archive gone, <original>.offsite present) and ML_GONE (archive gone, no marker); 1 if malformed.
+envelope_member_states() {
+  ML_LOCAL=() ML_RETIRED=() ML_GONE=()
+  envelope_members "$1" || return 1
+  local i
+  for i in {1..${#M_CD}}; do
+    if [[ -f ${M_CD[$i]}/${M_ORIG[$i]:t} ]]; then ML_LOCAL+=( "${M_ORIG[$i]}" )
+    elif [[ -f ${M_ORIG[$i]}.offsite ]]; then ML_RETIRED+=( "${M_ORIG[$i]}" )
+    else ML_GONE+=( "${M_ORIG[$i]}" ); fi
+  done
+}
+local -a ML_LOCAL ML_RETIRED ML_GONE
+
+# envelope_failed <envelope dir> <step> <error>: one failure naming the envelope, the members still local (kept) and
+# the members already retired (R6-S1); the night is counted on the envelope, which goes stuck (with <original>.stuck
+# for each member still local) at the limit.
 envelope_failed() {
-  local ed=$1 n o; local -a origs
-  envelope_members "$ed" && origs=( "${M_ORIG[@]}" )
-  fail_item "$ed" "$2" "$3 (envelope of ${#origs} small archive(s), all kept: ${(j:, :)origs})"
+  local ed=$1 n o note who
+  if envelope_member_states "$ed"; then
+    who="envelope of ${#M_ORIG} small archive(s); still local, kept: ${${(j:, :)ML_LOCAL}:-none}; already retired (offsite marker present, archive gone): ${${(j:, :)ML_RETIRED}:-none}"
+    (( ${#ML_GONE} )) && who+="; archive gone with no offsite marker: ${(j:, :)ML_GONE}"
+  else
+    who="members unknown: $M_ERR"
+  fi
+  fail_item "$ed" "$2" "$3 ($who)"
   [[ $MODE == dry ]] && return 0
   n=$(( $(attempts_of "$ed") + 1 ))
   write_file "$ed/attempts" "$n"$'\n'"$(ts) $2: $3" || fail_item "$ed" state "cannot write $ed/attempts"
-  for o in $origs; do write_file "$o.attempts" "$n failed night(s); in as2 drive-backup envelope $ed" || fail_item "$o.attempts" state "cannot update"; done
+  for o in $ML_LOCAL; do write_file "$o.attempts" "$n failed night(s); in as2 drive-backup envelope $ed" || fail_item "$o.attempts" state "cannot update"; done
   if (( n >= STUCK_AFTER )); then
-    write_file "$ed/stuck" "$(ts) stuck after $n failed nights; last: $2: $3. Delete this file to let the next night retry." \
+    note=$(stuck_upload_note "$ed")
+    write_file "$ed/stuck" "$(ts) stuck after $n failed nights; last: $2: $3. ${note:+Upload: $note. }Delete this file to let the next night retry." \
       || fail_item "$ed" state "cannot write $ed/stuck"
-    for o in $origs; do write_file "$o.stuck" "stuck in as2 drive-backup: see $ed/stuck" || fail_item "$o.stuck" state "cannot write"; done
-    NEW_STUCK+=( "envelope $ed (${(j:, :)origs})" )
-    info "STUCK: envelope $ed ($n failed nights). The next nights skip it until $ed/stuck is deleted."
+    for o in $ML_LOCAL; do write_file "$o.stuck" "stuck in as2 drive-backup: see $ed/stuck" || fail_item "$o.stuck" state "cannot write"; done
+    NEW_STUCK+=( "envelope $ed ($who${note:+; $note})" )
+    info "STUCK: envelope $ed ($n failed nights). The next nights skip it until $ed/stuck is deleted.${note:+ Upload: $note.}"
   else
     info "failed nights for envelope $ed: $n of $STUCK_AFTER"
   fi
@@ -738,13 +836,16 @@ envelope_upload() {
   done
   sha=$(sha256_of "$env") && md5=$(md5_of "$env") || { envelope_failed "$ed" envelope "cannot hash the built envelope: $sha$md5"; return }
   dst="$MYDRIVE/as2-backup/scratch-archive/$day/$id.${sha[1,16]}.$RUNSTAMP.tar"
-  if bounded $T_SHORT "stat $dst" /bin/test -e "$dst"; then envelope_failed "$ed" copy "$dst already exists; never overwriting"; return; fi
+  o=$(drive_path_free "$dst") || { envelope_failed "$ed" copy "$o"; return }
   o=$(bounded $T_SHORT "mkdir ${dst:h}" /bin/mkdir -p -- "${dst:h}" 2>&1) || { envelope_failed "$ed" copy "mkdir ${dst:h}: $o"; return }
   write_file "$ed/upload" "drive_path=$dst"$'\n'"sha256=$sha"$'\n'"md5=$md5"$'\n'"bytes=$size"$'\n'"uploaded_at=$(ts)" \
     || { envelope_failed "$ed" state "cannot write $ed/upload before the copy; not copying"; return }
+  crash_point upload-recorded
+  # A failed copy keeps the record whatever a stat of $dst says afterwards (R6-B1, review round 6): the copy may have
+  # reached Drive, and a local pathname that is missing or does not answer is no proof it did not.
   if ! o=$(bounded $T_LONG "copy envelope to Drive" /bin/cp -n -- "$env" "$dst" 2>&1); then
-    bounded $T_SHORT "stat $dst" /bin/test -e "$dst" || zf_rm -f -- "$ed/upload"
-    envelope_failed "$ed" copy "cp to $dst: $o"; return
+    envelope_failed "$ed" copy "cp to $dst failed: $o; the upload record $ed/upload stays (the copy may still have reached Drive) and the next night proves $dst, never a new envelope"
+    return
   fi
   info "copied envelope to $dst: $size bytes = ${#mc} member(s) of $total bytes, $pad bytes of padding, tar headers (threshold $ENV_THRESH)"
   C[uploaded]=$(( C[uploaded] + 1 ))
@@ -782,56 +883,115 @@ new_envelope() {
   envelope_upload "$ed"
 }
 
-# confirm_envelope <envelope dir>: the deleting step for an envelope, on a later run than its first proof. Everything
-# is checked before any member is deleted: re-proof, server read sha256 = receipt, every member still on disk with
-# its recorded sha256 and its original path still free, final re-proof.
+# confirm_envelope <envelope dir>: the deleting step for an envelope, on a later run than its first proof.
+# Each member retires in four steps: <original>.offsite naming this envelope (crash point `marker`), the claimed
+# archive deleted (`unlink`), the member receipt written in its claim dir (`member-receipt`), the claim dir moved to
+# receipts/<date>/<name> (`claim-moved`); when every member is finished the envelope dir moves to
+# receipts/envelopes/<date>/ (`envelope-moved`). A run can stop between any two steps; the next run sorts each member
+# into one of these states (OpenAI review round 6, R6-B2):
+#   live      the archive is still in its claim dir (with or without a marker from a stopped run): checked, then all
+#             four steps (the marker is written again)
+#   unlinked  the claim dir is in claims/ without its archive, and <original>.offsite names this envelope (its Drive
+#             path and sha256) and the member's sha256: finished without any Drive check (receipt if absent,
+#             .attempts and .stuck removed, claim dir moved)
+#   finished  the claim dir is gone from claims/ and receipts/<date>/<name>/receipt names this envelope: nothing to do
+# Any other member (archive gone and no marker naming this envelope, or claim dir gone and no matching receipt) is a
+# person-needed failure, named, and nothing is changed. Live members are deleted only after: re-proof against the
+# receipt, server read sha256 = receipt, each live member's recorded sha256, its original path still free, final
+# re-proof. With no live member left nothing more is deleted, so no Drive check is needed.
 confirm_envelope() {
   local ed=$1 r=$1/receipt dst md5 size sha iid rev msg rc got i o
   dst=$(kv $r drive_path) && md5=$(kv $r md5) && size=$(kv $r bytes) && sha=$(kv $r sha256) \
     && iid=$(kv $r drive_item_id) && rev=$(kv $r drive_revision) \
     || { envelope_failed "$ed" confirm "receipt $r is incomplete"; return }
   envelope_members "$ed" || { envelope_failed "$ed" confirm "$M_ERR"; return }
-  local -a mc mm ms mb mo done_
+  local -a mc mm ms mb mo mstate
   mc=( "${M_CD[@]}" ) mm=( "${M_MEM[@]}" ) ms=( "${M_SHA[@]}" ) mb=( "${M_BYTES[@]}" ) mo=( "${M_ORIG[@]}" )
-  rc=0; msg=$(prove_once "$dst" "$md5" "$size" "$iid" "$rev") || rc=$?
-  (( rc == 0 )) || { envelope_failed "$ed" confirm "re-proof against the receipt failed (rc $rc): $msg; nothing deleted"; return }
-  info "envelope re-proven: $msg"
-  got=$(server_sha "$dst" "envelope") || { envelope_failed "$ed" confirm "$got; nothing deleted"; return }
-  [[ $got == $sha ]] || { envelope_failed "$ed" confirm "envelope reads back from the server as sha256 $got, the receipt says $sha; nothing deleted"; return }
-  info "envelope read back from Google's servers (proven server read): sha256 matches the receipt"
+  local fin
   for i in {1..${#mc}}; do
-    done_[$i]=0
-    if [[ ! -e ${mc[$i]}/${mo[$i]:t} ]]; then
-      # a run that stopped part-way through the deletions below: this member is already offsite and deleted
-      if [[ -f ${mo[$i]}.offsite && $(kv "${mo[$i]}.offsite" envelope_drive_path) == $dst ]]; then done_[$i]=1; continue; fi
-      envelope_failed "$ed" confirm "member ${mo[$i]} is missing from ${mc[$i]}; nothing deleted"; return
-    fi
-    got=$(sha256_of "${mc[$i]}/${mo[$i]:t}") || { envelope_failed "$ed" confirm "member ${mo[$i]} unreadable: $got; nothing deleted"; return }
-    [[ $got == ${ms[$i]} ]] || { envelope_failed "$ed" confirm "member ${mo[$i]} sha256 $got != recorded ${ms[$i]}; nothing deleted"; return }
-    if [[ -e ${mo[$i]} || -L ${mo[$i]} ]]; then
-      envelope_failed "$ed" confirm "${mo[$i]} exists again (a different file); not writing a marker beside it; nothing deleted"; return
+    fin=$RECEIPTS/${mc[$i]:h:t}/${mo[$i]:t}
+    if [[ -d ${mc[$i]} ]]; then
+      if [[ -e ${mc[$i]}/${mo[$i]:t} ]]; then mstate[$i]=live
+      elif marker_names_envelope "${mo[$i]}" "$dst" "$sha" "${ms[$i]}"; then mstate[$i]=unlinked; info "member ${mo[$i]}: already deleted by a run that stopped part-way; finishing it"
+      else
+        envelope_failed "$ed" confirm "member ${mo[$i]} is missing from ${mc[$i]} and ${mo[$i]}.offsite does not name this envelope ($dst, sha256 $sha) with the member's sha256 ${ms[$i]}; a person checks where it went; nothing deleted"
+        return
+      fi
+    elif [[ -f $fin/receipt && $(kv "$fin/receipt" envelope_drive_path) == $dst && $(kv "$fin/receipt" sha256) == ${ms[$i]} ]]; then
+      mstate[$i]=finished; info "member ${mo[$i]}: already retired ($fin)"
+    else
+      envelope_failed "$ed" confirm "member ${mo[$i]}: its claim dir ${mc[$i]} is gone and $fin/receipt does not name this envelope ($dst) with the member's sha256 ${ms[$i]}; a person checks where it went; nothing deleted"
+      return
     fi
   done
-  rc=0; msg=$(prove_once "$dst" "$md5" "$size" "$iid" "$rev") || rc=$?
-  (( rc == 0 )) || { envelope_failed "$ed" confirm "final re-proof failed (rc $rc): $msg; nothing deleted"; return }
-  local all=1 name day
+  local all=1
   for i in {1..${#mc}}; do
-    (( done_[$i] )) && continue
-    name=${mo[$i]:t} day=${mc[$i]:h:t}
-    write_file "${mo[$i]}.offsite" "envelope_drive_path=$dst"$'\n'"envelope_item_id=$iid"$'\n'"envelope_revision=$rev"$'\n'"envelope_sha256=$sha"$'\n'"member=${mm[$i]}"$'\n'"sha256=${ms[$i]}"$'\n'"bytes=${mb[$i]}"$'\n'"first_proven_at=$(kv $r proven_at)"$'\n'"reproven_at=$(ts)"$'\n'"server_read_back=envelope sha256 match (server-read.zsh)"$'\n'"restore=tar -xf <envelope_drive_path> -C <dir> ${mm[$i]}"$'\n'"receipt=$RECEIPTS/$day/$name/receipt" \
-      || { fail_item "${mo[$i]}" marker "cannot write ${mo[$i]}.offsite; this member is not deleted (envelope $ed)"; all=0; continue }
-    o=$(bounded $T_SHORT "delete ${mc[$i]}/$name" /bin/rm -f -- "${mc[$i]}/$name" 2>&1) || { fail_item "${mo[$i]}" delete "$o (envelope $ed)"; all=0; continue }
-    info "DELETED claimed archive ${mc[$i]}/$name (from ${mo[$i]}; sha256 ${ms[$i]}; offsite as ${mm[$i]} in envelope $dst item $iid revision $rev)"
-    C[deleted]=$(( C[deleted] + 1 ))
-    zf_rm -f -- "${mo[$i]}.attempts" "${mo[$i]}.stuck" 2>/dev/null || fail_item "${mo[$i]}.attempts" cleanup "could not remove"
-    write_file "${mc[$i]}/receipt" "envelope_drive_path=$dst"$'\n'"envelope_item_id=$iid"$'\n'"envelope_revision=$rev"$'\n'"envelope_sha256=$sha"$'\n'"envelope_receipt=$RECEIPTS/envelopes/${ed:h:t}/${ed:t}/receipt"$'\n'"member=${mm[$i]}"$'\n'"sha256=${ms[$i]}"$'\n'"bytes=${mb[$i]}"$'\n'"deleted_at=$(ts)" \
-      || fail_item "${mc[$i]}" cleanup "could not write the member receipt (the archive is already deleted)"
-    zf_mkdir -p -m 700 -- "$RECEIPTS/$day" 2>/dev/null
-    perl_rename "${mc[$i]}" "$RECEIPTS/$day/$name" >/dev/null 2>&1 || fail_item "${mc[$i]}" cleanup "could not move the member receipt to $RECEIPTS (the archive is already deleted)"
+    [[ ${mstate[$i]} == unlinked ]] || continue
+    finish_member $i "before $(ts) (by a run that stopped part-way)" && mstate[$i]=finished || all=0
   done
-  (( all )) || return
-  zf_mkdir -p -m 700 -- "$RECEIPTS/envelopes/${ed:h:t}" 2>/dev/null
-  perl_rename "$ed" "$RECEIPTS/envelopes/${ed:h:t}/${ed:t}" >/dev/null 2>&1 || fail_item "$ed" cleanup "could not move the envelope receipt to $RECEIPTS/envelopes (its members are already deleted)"
+  if (( ${mstate[(I)live]} )); then
+    rc=0; msg=$(prove_once "$dst" "$md5" "$size" "$iid" "$rev") || rc=$?
+    (( rc == 0 )) || { envelope_failed "$ed" confirm "re-proof against the receipt failed (rc $rc): $msg; nothing deleted"; return }
+    info "envelope re-proven: $msg"
+    got=$(server_sha "$dst" "envelope") || { envelope_failed "$ed" confirm "$got; nothing deleted"; return }
+    [[ $got == $sha ]] || { envelope_failed "$ed" confirm "envelope reads back from the server as sha256 $got, the receipt says $sha; nothing deleted"; return }
+    info "envelope read back from Google's servers (proven server read): sha256 matches the receipt"
+    for i in {1..${#mc}}; do
+      [[ ${mstate[$i]} == live ]] || continue
+      got=$(sha256_of "${mc[$i]}/${mo[$i]:t}") || { envelope_failed "$ed" confirm "member ${mo[$i]} unreadable: $got; nothing deleted"; return }
+      [[ $got == ${ms[$i]} ]] || { envelope_failed "$ed" confirm "member ${mo[$i]} sha256 $got != recorded ${ms[$i]}; nothing deleted"; return }
+      if [[ -e ${mo[$i]} || -L ${mo[$i]} ]]; then
+        envelope_failed "$ed" confirm "${mo[$i]} exists again (a different file); not writing a marker beside it; nothing deleted"; return
+      fi
+    done
+    rc=0; msg=$(prove_once "$dst" "$md5" "$size" "$iid" "$rev") || rc=$?
+    (( rc == 0 )) || { envelope_failed "$ed" confirm "final re-proof failed (rc $rc): $msg; nothing deleted"; return }
+    local name day
+    for i in {1..${#mc}}; do
+      [[ ${mstate[$i]} == live ]] || continue
+      name=${mo[$i]:t} day=${mc[$i]:h:t}
+      write_file "${mo[$i]}.offsite" "envelope_drive_path=$dst"$'\n'"envelope_item_id=$iid"$'\n'"envelope_revision=$rev"$'\n'"envelope_sha256=$sha"$'\n'"member=${mm[$i]}"$'\n'"sha256=${ms[$i]}"$'\n'"bytes=${mb[$i]}"$'\n'"first_proven_at=$(kv $r proven_at)"$'\n'"reproven_at=$(ts)"$'\n'"server_read_back=envelope sha256 match (server-read.zsh)"$'\n'"restore=tar -xf <envelope_drive_path> -C <dir> ${mm[$i]}"$'\n'"receipt=$RECEIPTS/$day/$name/receipt" \
+        || { fail_item "${mo[$i]}" marker "cannot write ${mo[$i]}.offsite; this member is not deleted (envelope $ed)"; all=0; continue }
+      crash_point marker
+      o=$(bounded $T_SHORT "delete ${mc[$i]}/$name" /bin/rm -f -- "${mc[$i]}/$name" 2>&1) || { fail_item "${mo[$i]}" delete "$o (envelope $ed)"; all=0; continue }
+      info "DELETED claimed archive ${mc[$i]}/$name (from ${mo[$i]}; sha256 ${ms[$i]}; offsite as ${mm[$i]} in envelope $dst item $iid revision $rev)"
+      C[deleted]=$(( C[deleted] + 1 ))
+      crash_point unlink
+      finish_member $i "$(ts)" && mstate[$i]=finished || all=0
+    done
+  fi
+  (( all )) || { info "envelope $ed keeps its place in claims/: a member is not finished (the failure above names it); the next run finishes it"; return }
+  local ered=$RECEIPTS/envelopes/${ed:h:t}/${ed:t}
+  zf_mkdir -p -m 700 -- "${ered:h}" 2>/dev/null
+  [[ -e $ered ]] && { fail_item "$ed" cleanup "$ered already exists; not moving the retired envelope over it (a person checks both; every member is retired)"; return }
+  o=$(perl_rename "$ed" "$ered" 2>&1) || { fail_item "$ed" cleanup "could not move the envelope to $ered: $o (every member is retired; the next run moves it)"; return }
+  crash_point envelope-moved
+  info "envelope retired: every member is offsite and deleted; $ered"
+}
+
+# marker_names_envelope <original> <envelope Drive path> <envelope sha256> <member sha256>: <original>.offsite is this
+# envelope's marker for this member
+marker_names_envelope() {
+  [[ -f $1.offsite && $(kv "$1.offsite" envelope_drive_path) == $2 && $(kv "$1.offsite" envelope_sha256) == $3 \
+     && $(kv "$1.offsite" sha256) == $4 ]]
+}
+
+# finish_member <i> <deleted at>: the last steps of member i of the envelope confirm_envelope is retiring (it reads
+# that function's locals: mc mo mm ms mb ed dst iid rev sha). The archive is already deleted and its marker written.
+# Each step is skipped when already done; 1 after a recorded failure (the next run finishes it).
+finish_member() {
+  local i=$1 c=${mc[$1]} name=${mo[$1]:t} day=${mc[$1]:h:t} o
+  local fin=$RECEIPTS/$day/$name
+  if [[ ! -f $c/receipt ]]; then
+    write_file "$c/receipt" "envelope_drive_path=$dst"$'\n'"envelope_item_id=$iid"$'\n'"envelope_revision=$rev"$'\n'"envelope_sha256=$sha"$'\n'"envelope_receipt=$RECEIPTS/envelopes/${ed:h:t}/${ed:t}/receipt"$'\n'"member=${mm[$i]}"$'\n'"sha256=${ms[$i]}"$'\n'"bytes=${mb[$i]}"$'\n'"deleted_at=$2" \
+      || { fail_item "$c" cleanup "cannot write the member receipt $c/receipt (the archive is already deleted; the next run writes it)"; return 1 }
+    crash_point member-receipt
+  fi
+  zf_rm -f -- "${mo[$i]}.attempts" "${mo[$i]}.stuck" 2>/dev/null || { fail_item "${mo[$i]}.attempts" cleanup "could not remove ${mo[$i]}.attempts or .stuck (the archive is already deleted)"; return 1 }
+  zf_mkdir -p -m 700 -- "$RECEIPTS/$day" 2>/dev/null
+  [[ -e $fin ]] && { fail_item "$c" cleanup "$fin already exists; not moving $c over it (the archive is already deleted; a person checks both)"; return 1 }
+  o=$(perl_rename "$c" "$fin" 2>&1) || { fail_item "$c" cleanup "could not move $c to $fin: $o (the archive is already deleted; the next run moves it)"; return 1 }
+  crash_point claim-moved
 }
 
 say_step "phase 1: claimed archives under $CLAIMS"
@@ -840,16 +1000,23 @@ info "${#claims} claimed archive(s)"
 for cd in $claims; do
   if [[ ! -f $cd/origin ]]; then fail_item "$cd" claim "claim dir without an origin file; leaving it for a person"; continue; fi
   origin=$(<$cd/origin); name=${origin:t}
+  # The envelope pointer comes first (R6-B2): a member whose archive is already deleted by a run that stopped
+  # part-way through retiring its envelope is the envelope's to finish (confirm_envelope), not a lost archive.
+  ped=""
+  if [[ -f $cd/envelope ]]; then
+    ped=$(kv $cd/envelope envelope_dir) || ped=""
+    if [[ -n $ped && -d $ped ]]; then info "$origin: in envelope $ped (handled with it)"; continue; fi
+  fi
   if [[ -f $cd/stuck ]]; then SKIPPED_STUCK+=( "$origin" ); info "skip (stuck, needs a person): $origin: $(<$cd/stuck)"; continue; fi
   if (( $(attempts_of "$cd") >= STUCK_AFTER )); then
     info "stuck marker was cleared for $origin; resetting its failed-night count"
     [[ $MODE == dry ]] || { write_file "$cd/attempts" "0"; zf_rm -f -- "$origin.stuck" 2>/dev/null }
   fi
-  if [[ ! -f $cd/$name ]]; then fail_item "$origin" claim "claim dir $cd has no archive file; leaving it for a person"; continue; fi
+  if [[ ! -f $cd/$name ]]; then
+    fail_item "$origin" claim "claim dir $cd has no archive file${ped:+ and the envelope it names ($ped) does not exist}; leaving it for a person"; continue
+  fi
   say_step "claim $cd ($origin)"
   if [[ -f $cd/envelope ]]; then
-    ped=$(kv $cd/envelope envelope_dir) || ped=""
-    if [[ -n $ped && -d $ped ]]; then info "in envelope $ped (handled with it)"; continue; fi
     info "its envelope ${ped:-?} was never finished (a run stopped while building it); it goes into an envelope again"
     [[ $MODE == dry ]] || zf_rm -f -- "$cd/envelope"
   fi
@@ -864,13 +1031,15 @@ for cd in $claims; do
     confirm_and_delete "$cd"; continue
   fi
   if [[ -f $cd/upload ]]; then
+    # Only a receipt replaces an upload record (R6-B1): re-prove the recorded Drive path, never upload again.
     u=$cd/upload
     if dst=$(kv $u drive_path) && m=$(kv $u md5) && s=$(kv $u bytes) && h=$(kv $u sha256); then
       [[ $MODE == dry ]] && { info "DRY RUN: would re-prove the earlier upload $dst"; continue }
       info "re-proving the earlier upload $dst (no new upload)"
       add_pending archive "$cd" "$dst" "$m" "$s" "$h"; continue
     fi
-    info "upload record incomplete; uploading again"
+    claim_failed "$cd" upload "the upload record $u is incomplete (${$(<$u)//$'\n'/; }); not uploading again: a person confirms there is no Drive copy at the path it names before deleting $u to allow a fresh upload"
+    continue
   fi
   s=$(size_of "$cd/$name") || { claim_failed "$cd" hash "cannot stat the claimed archive: $s"; continue }
   if ! envelope_threshold; then claim_failed "$cd" envelope "cannot work out the envelope threshold: $ENV_ERR; kept"; continue; fi
@@ -913,18 +1082,17 @@ for ed in $envs; do
     confirm_envelope "$ed"; continue
   fi
   if [[ -f $ed/upload ]]; then
+    # Only a receipt replaces an upload record (R6-B1, review round 6): the recorded Drive path is proven again, even
+    # when its local pathname is missing or does not answer (that is no proof the copy is not on Drive). A copy
+    # that never happened fails to prove each night and goes STUCK naming the path; a person takes it from there.
     u=$ed/upload
     if dst=$(kv $u drive_path) && m=$(kv $u md5) && s=$(kv $u bytes) && h=$(kv $u sha256); then
-      if bounded $T_SHORT "stat $dst" /bin/test -e "$dst"; then
-        [[ $MODE == dry ]] && { info "DRY RUN: would re-prove the earlier envelope upload $dst"; continue }
-        info "re-proving the earlier envelope upload $dst (no new upload)"
-        add_pending envelope "$ed" "$dst" "$m" "$s" "$h"; continue
-      fi
-      info "the recorded envelope copy $dst is not on Drive (a run stopped before the copy); building the envelope again"
-    else
-      info "envelope upload record incomplete; building the envelope again"
+      [[ $MODE == dry ]] && { info "DRY RUN: would re-prove the earlier envelope upload $dst"; continue }
+      info "re-proving the earlier envelope upload $dst (no new upload)"
+      add_pending envelope "$ed" "$dst" "$m" "$s" "$h"; continue
     fi
-    [[ $MODE == dry ]] || zf_rm -f -- "$u" "$ed/upload_retried"
+    envelope_failed "$ed" upload "the upload record $u is incomplete (${$(<$u)//$'\n'/; }); not building the envelope again: a person confirms there is no Drive copy at the path it names before deleting $u to allow a fresh upload"
+    continue
   fi
   [[ $MODE == dry ]] && { info "DRY RUN: would build this envelope and upload it"; continue }
   envelope_upload "$ed"
@@ -1007,17 +1175,14 @@ if [[ $MODE == run ]] && (( ${#P_KIND} )); then
       continue
     fi
     if [[ $st != proven ]]; then
-      # A proof error: the next night uploads afresh under a new name. A first timeout: the next night re-proves
-      # the same copy (a large upload can outlast the window); a second one: a fresh upload.
-      if [[ $st == failed || -f $cd/upload_retried ]]; then zf_rm -f -- "$cd/upload" "$cd/upload_retried" 2>/dev/null
-      elif [[ $st == timeout ]]; then write_file "$cd/upload_retried" "$(ts)" || true
-      fi
-      if [[ $kind == envelope ]]; then envelope_failed "$cd" prove "not proven ($st): ${P_MSG[$i]}; nothing deleted"
-      else claim_failed "$cd" prove "not proven ($st): ${P_MSG[$i]}; nothing deleted"; fi
+      # A proof timeout or a proof error keeps the upload record (R6-B1): the next night proves the same Drive path
+      # again, and 3 failed nights make the item STUCK naming that path. Never a fresh upload from here.
+      if [[ $kind == envelope ]]; then envelope_failed "$cd" prove "not proven ($st): ${P_MSG[$i]}; nothing deleted; the upload record stays and the next night proves $dst again (no new envelope)"
+      else claim_failed "$cd" prove "not proven ($st): ${P_MSG[$i]}; nothing deleted; the upload record stays and the next night proves $dst again (no new upload)"; fi
       continue
     fi
     if write_file "$cd/receipt" "drive_path=$dst"$'\n'"drive_item_id=${P_ID[$i]}"$'\n'"drive_revision=${P_REV[$i]}"$'\n'"sha256=${P_SHA[$i]}"$'\n'"md5=${P_MD5[$i]}"$'\n'"bytes=${P_SIZE[$i]}"$'\n'"proven_at=$(ts)"$'\n'"proven_epoch=$EPOCHSECONDS"$'\n'"proof=drivefs-metadata v1 (pinned layout; item id, head revision, md5, size)"; then
-      zf_rm -f -- "$cd/upload" "$cd/upload_retried" 2>/dev/null
+      zf_rm -f -- "$cd/upload" 2>/dev/null || fail_item "$cd/upload" state "cannot remove the upload record after the receipt (harmless: the receipt is read first)"
       C[proven]=$(( C[proven] + 1 ))
       zf_rm -f -- "$cd/attempts" 2>/dev/null
       if [[ $kind == envelope ]]; then
