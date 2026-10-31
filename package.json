@@ -1,0 +1,7 @@
+{
+  "name": "agent-system-2",
+  "private": true,
+  "dependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.12.6"
+  }
+}

@@ -74,7 +74,7 @@ export type { GatesAPI } from "./src/session";
  */
 async function hostModules(): Promise<HostModules> {
 	const [{ VERSION }, { Settings }, { lookup }] = await Promise.all([
-		import("@oh-my-pi/pi-utils/dirs"),
+		import("@oh-my-pi/pi-utils"), // OMP compatibility loader; static import would bypass its runtime module binding.
 		import("@oh-my-pi/pi-coding-agent/config/settings"),
 		import("@oh-my-pi/pi-coding-agent/config/registry"),
 	]);
@@ -119,7 +119,7 @@ async function hostCleanShell(): Promise<CleanShellRead> {
 function hostVersionNotice(pi: GatesAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		try {
-			checkHostVersion((await import("@oh-my-pi/pi-utils/dirs")).VERSION);
+			checkHostVersion((await import("@oh-my-pi/pi-utils")).VERSION); // Same runtime compatibility boundary as hostModules.
 		} catch (err) {
 			ctx.ui.notify(`M4b gates: ${err instanceof Error ? err.message : String(err)}; every bash call in this session is refused until the pin is re-verified.`, "error");
 		}

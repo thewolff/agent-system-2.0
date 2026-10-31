@@ -18,6 +18,7 @@ beforeAll(() => {
 	bin = join(root, "bin");
 	mkdirSync(bin);
 	symlinkSync(process.execPath, join(bin, "bun"));
+	executable(join(bin, "omp"), "#!/bin/sh\nprintf 'omp/18.12.6\\n'\n");
 	// Fail before any installer call if the supposedly isolated PATH could find a real plugin host.
 	expect(Bun.which("herdr", { PATH: `${bin}:${SYSTEM_PATH}` })).toBeNull();
 	expect(Bun.which("ctx", { PATH: `${bin}:${SYSTEM_PATH}` })).toBeNull();

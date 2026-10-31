@@ -44,7 +44,15 @@ Reviews must run on a lab other than the builder's. With credentials for one lab
 
 ### Every bash call is refused after an OMP update
 
-The gates read OMP settings through host members verified on one OMP major.minor (`VERIFIED_HOST` in `gates/src/host.ts`, `18.8` today) and refuse every bash call on any other, with a line naming both versions. Go back to an 18.8 release, or re-verify: run `bun test gates/test/host.test.ts` against the new host before bumping the pin.
+The gates read OMP settings through host members verified on one OMP major/minor (`VERIFIED_HOST` in `gates/src/host.ts`, `18.12` today) and refuse every bash call on any other. `package.json` and `bun.lock` pin the inspectable modules to OMP 18.12.6, and install refuses an executable/package mismatch.
+
+If the refusal instead says `Cannot find package '@oh-my-pi/pi-natives' imported from .../pi-utils/src/dirs.ts?mtime=...`, OMP's extension reload query bypassed compatibility rewriting for the `pi-utils/dirs` subpath. AS2 imports `VERSION` through the package-root export for this reason. Reinstalling dependencies alone does not prove the extension-loader path; run a live `as2` bash call.
+
+### Cut over to the pinned OMP version
+
+The version change is one coordinated interruption: stop all running lanes, upgrade the `omp` executable to the version pinned in `package.json`, pull the AS2 change, run `bun install --frozen-lockfile`, run `as2 install`, then restart the orchestrator and lanes. Old sessions keep their already-loaded extensions and must not remain live across the cutover.
+
+The focused host compatibility tests run against the locked dependency tree on the development machine. The isolated full-suite runner does not run `bun install`, so its skips are not evidence for host compatibility; the frozen install plus focused host tests are the release evidence.
 
 ### Every bash call is refused for the rest of a session
 

@@ -46,7 +46,7 @@ const hostText: ResultTextLoader = async () => (await import("@oh-my-pi/pi-tui")
 /** OMP's `judge` role, resolved through the host's own modules (same entry-module rule as classifier/extension.ts). */
 async function hostJudge(ctx: Ctx): Promise<KindJudge> {
 	const [{ VERSION }, { Settings }, { lookup }, { resolveJudge }] = await Promise.all([
-		import("@oh-my-pi/pi-utils/dirs"),
+		import("@oh-my-pi/pi-utils"), // OMP compatibility loader; keep this entry-relative lazy host import.
 		import("@oh-my-pi/pi-coding-agent/config/settings"),
 		import("@oh-my-pi/pi-coding-agent/config/registry"),
 		import("@oh-my-pi/pi-coding-agent/judgment/index"),

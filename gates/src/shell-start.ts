@@ -51,7 +51,7 @@ import { WORKLOAD_ENV } from "./types";
  * major.minor (host.ts VERIFIED_HOST); gates/test/host.test.ts fails when the installed OMP differs
  * from this, so a patch bump is re-measured (gates/test/shell-start-bash.test.ts) before it is trusted.
  */
-export const MEASURED_HOST = "18.8.6";
+export const MEASURED_HOST = "18.12.6";
 
 /**
  * Names `/bin/bash` or `/bin/sh` read at start (PLAN.md § 1.4): a file to source, options, posix mode,

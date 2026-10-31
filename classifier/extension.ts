@@ -3130,7 +3130,7 @@ function productionExtension(): (pi: ExtensionAPI) => void {
 	// a setting is read through its registered handle, and a host off the verified major.minor throws.
 	const host = async (): Promise<HostModules> => {
 		const [{ VERSION }, { Settings }, { lookup }] = await Promise.all([
-			import("@oh-my-pi/pi-utils/dirs"),
+			import("@oh-my-pi/pi-utils"), // OMP compatibility loader: package-root export avoids reload-query subpath failures.
 			import("@oh-my-pi/pi-coding-agent/config/settings"),
 			import("@oh-my-pi/pi-coding-agent/config/registry"),
 		]);

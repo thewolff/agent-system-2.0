@@ -91,11 +91,14 @@ beforeAll(() => {
 	const bin = join(root, "bin");
 	mkdirSync(bin);
 	symlinkSync(process.execPath, join(bin, "bun"));
+	writeFileSync(join(bin, "omp"), "#!/bin/sh\nprintf 'omp/18.12.6\\n'\n");
+	chmodSync(join(bin, "omp"), 0o755);
 	installPath = `${bin}:/usr/bin:/bin`;
 	expect(Bun.which("herdr", { PATH: installPath })).toBeNull();
 	expect(Bun.which("ctx", { PATH: installPath })).toBeNull();
 	copy = join(root, "repo");
 	for (const dir of MANIFEST_DIRS) cpSync(join(REPO, dir), join(copy, dir), { recursive: true });
+	cpSync(join(REPO, "package.json"), join(copy, "package.json"));
 	for (const d of MANIFEST_DIRS) {
 		for (const name of readdirSync(join(copy, d), { recursive: true }) as string[]) {
 			if (name.endsWith(".DS_Store")) rmSync(join(copy, d, name));

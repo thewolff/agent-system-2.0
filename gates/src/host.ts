@@ -1,5 +1,5 @@
 // The OMP host surface this repo's extensions read settings through, pinned to the host version it
-// was verified on (M4b fix 4, 2026-09-30). OMP 18.4.4 removed `Settings.get(key)`: a setting is read
+// was verified on. OMP 18.4.4 removed `Settings.get(key)`: a setting is read
 // through its registered handle (`config/registry.ts lookup(id)` → `Setting.get(settings)`, the
 // host's own runner does `cfgExtensionHandlersToolCallTimeoutMs.get(this.settings)` at
 // extensibility/extensions/runner.ts:1787), and an unknown key such as `gates.fence.enabled` stays in
@@ -17,7 +17,7 @@
 // hand the modules in as a HostModules value.
 
 /** The OMP major.minor the members below were verified on. Bump it after re-running gates/test/host.test.ts on the new host. */
-export const VERIFIED_HOST = "18.8";
+export const VERIFIED_HOST = "18.12";
 
 /** A host member that is missing, differently shaped, or on an unverified host version. */
 export class HostError extends Error {}
