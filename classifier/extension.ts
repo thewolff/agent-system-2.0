@@ -154,6 +154,8 @@ import { basename, dirname, join } from "node:path";
 import { LANE_ENV, WORKLOAD_ENV } from "../gates/src/types";
 import { askJo, decidedText, raisedId, rulingActive } from "../gates/src/rulings";
 import { type HostModules, hostSettings, readSetting } from "../gates/src/host";
+import { checkHowItFails, howItFailsLines, matchHowItFails } from "../gates/src/how-it-fails";
+import { briefTexts } from "../gates/src/rows/r05-brief-fields";
 import { CLASSIFIER_BY, type EntryRow, Ledger, type QuestionRow, type RoutingOutcome, type Stakes } from "../ledger/src/index";
 import { defaultLedgerPath } from "../ledger/src/locality";
 import { briefField, briefPanel, briefSlice, briefStakes, type PanelField, withoutPanelLines } from "./src/brief";
@@ -480,6 +482,20 @@ type DeliveredJob = { jobId?: string; type?: string; label?: string };
 type TaskItem = { agent?: string; name?: string; task?: string; [key: string]: unknown };
 type TaskInput = TaskItem & { tasks?: TaskItem[]; context?: string };
 
+/** Whether every brief in `call` carries "How it fails", read as row 5 reads it (issue #334 item 2): its task or the batch context. */
+function howItFailsIntact(call: TaskInput): boolean {
+	const context = typeof call.context === "string" ? call.context : "";
+	const items = Array.isArray(call.tasks) && call.tasks.length > 0 ? call.tasks : [call];
+	return items.every(item => checkHowItFails(briefTexts(context, typeof item.task === "string" ? item.task : ""), "a brief").ok);
+}
+
+/** A member task that replaces the lane's (a panel leg, a synthesis) keeps the "How it fails" lines the lane's task carried. */
+function keepHowItFails(original: string | undefined, replacement: string): string {
+	if (matchHowItFails(replacement) !== null) return replacement;
+	const lines = howItFailsLines(original ?? "");
+	return lines === null ? replacement : `${replacement}\n\n${lines}`;
+}
+
 const refuse = (reason: string) => ({ block: true as const, reason });
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
@@ -747,8 +763,9 @@ export const REVIEW_FINDINGS_PARAGRAPH = [
 	"",
 	"",
 	"Findings block (agent-system 2.0 review round limit): end your final report with one fenced code block whose info string is review-findings, holding JSON",
-	'{"findings":[{"severity":"blocking|major|minor","kind":"correctness|security|tests|design|docs|other","title":"…"}]}',
+	'{"findings":[{"severity":"blocking|major|minor","kind":"correctness|security|tests|design|docs|fault-tolerance|other","title":"…"}]}',
 	"with one entry per finding you report and an empty list when there is none. Only the last such block is read; a missing or malformed block fails the review round.",
+	"A silent failure path is kind fault-tolerance: a swallowed error (an empty or log-less catch, an ignored rejection or exit code), an unannounced fallback, a long-running step with no progress deadline, or cleanup that deletes cited evidence. A fault-tolerance finding is always read as blocking.",
 ].join("\n");
 
 /** A review item's brief with the findings paragraph, appended once. */
@@ -2519,6 +2536,16 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				/** A panel's ledger lines, written in the publish transaction after re-checking what another instance could have written. */
 				const panelLines: (() => void)[] = [];
 				const ledger = classified.some(c => c.review) ? deps.ledger() : null;
+				/**
+				 * The call the hands run. A batch keeps its shared context (its panel lines dropped once a panel is in it); a flat
+				 * call fanned into a batch takes its context to the batch's, not into each member (where OMP never reads it).
+				 */
+				const finalInput = (): TaskInput => {
+					const shared = typeof input.context === "string" && panelLines.length > 0 ? withoutPanelLines(input.context) : input.context;
+					if (batch) return { ...input, ...(shared === undefined ? {} : { context: shared }), tasks: revised };
+					if (revised.length === 1) return revised[0]!;
+					return { context: shared ?? "", tasks: revised.map(({ context: _context, ...member }) => member) };
+				};
 				const publish = () => {
 					items.forEach((item, index) => {
 						const c = byIndex.get(index);
@@ -2535,7 +2562,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 							for (const lab of plan.members) {
 								const token = newToken("dt");
 								members[lab] = token;
-								revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--${lab}`, task: ingested.tasks[lab], outputSchema: ingested.schema });
+								revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--${lab}`, task: keepHowItFails(item.task, ingested.tasks[lab]), outputSchema: ingested.schema });
 								published.push({
 									...base,
 									loop: null,
@@ -2562,7 +2589,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						}
 						if (typeof plan === "object" && plan.kind === "panel-synth") {
 							const token = newToken("dt");
-							revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--synth`, task: plan.task, outputSchema: plan.schema });
+							revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--synth`, task: keepHowItFails(item.task, plan.task), outputSchema: plan.schema });
 							published.push({
 								...base,
 								loop: null,
@@ -2602,6 +2629,16 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 										: null;
 						published.push({ ...base, index: revised.length - 1, dispatchName: c.sliceId, token: newToken("dt"), group: newToken("dg"), lab: null, note });
 					});
+					// Issue #334 item 2: the hands run the rewrite, and row 5 only ever saw the original call (OMP hands each
+					// tool_call handler the original input). A call whose briefs carried "How it fails" must not lose it here;
+					// if it did, refuse inside this transaction, before anything is written, rather than send hands without it.
+					const final = finalInput();
+					if (howItFailsIntact(input) && !howItFailsIntact(final)) {
+						throw new Error(
+							'the classifier\'s rewrite of this dispatch lost a brief\'s "How it fails" section, which row 5 had passed; refused rather than send the hands without it. ' +
+								"Put the section in the batch context and dispatch again (a classifier fault: say so in your report)",
+						);
+					}
 					for (const g of groups) {
 						ledger!.recordEntry({ by: deps.laneId, workloadId: g.workloadId, sliceId: g.sliceId, kind: "assumption", body: reviewGroupBody(g.sliceId, g.group, g.tokens) });
 					}
@@ -2611,9 +2648,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				else publish();
 				for (const g of groups) fanOuts.set(g.group, g);
 				pending.push(...published);
-				// A member's task carries no panel line, and neither does a batch's shared context.
-				const shared = batch && panelLines.length > 0 && typeof input.context === "string" ? { context: withoutPanelLines(input.context) } : {};
-				return { input: batch ? { ...input, ...shared, tasks: revised } : revised.length === 1 ? revised[0]! : { context: "", tasks: revised } };
+				return { input: finalInput() };
 			} catch (error) {
 				// SPEC-2.0.md § A1.3: a dispatch the classifier could not route is refused, not sent on
 				// an unclassified guess. Nothing was published, so late answers have nowhere to land.

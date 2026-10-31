@@ -123,7 +123,12 @@ export function reportPlistInstalled(home: string = homedir()): boolean {
 	return existsSync(join(home, "Library", "LaunchAgents", `${DAILY_REPORT_LABEL}.plist`));
 }
 
-export type ErrorKind = "reserved" | "held" | "artifact" | "security-red" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "train" | "pair" | "notice" | "proposal" | "channel-refused" | "report";
+/** Every needs-you line kind; ErrorKind is read from this list, so the issue #334 item 3 test covers each kind there is. */
+export const NEEDS_YOU_KINDS = ["reserved", "held", "artifact", "security-red", "test-run", "lane-died", "question", "due", "idle", "scratch", "train", "pair", "notice", "proposal", "channel-refused", "report"] as const;
+export type ErrorKind = (typeof NEEDS_YOU_KINDS)[number];
+
+/** A line's `next` when no next step is known: said explicitly rather than left out (issue #334 item 3). */
+export const NO_NEXT_STEP = "no next step known";
 
 /**
  * The open one of a pair of scratch control entries (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): the newest of `control`
@@ -144,6 +149,12 @@ export interface ErrorLine {
 	/** The row the line is about: entry id, message id, slice id, workload id, question id. */
 	rowId: string;
 	line: string;
+	/**
+	 * Issue #334 item 3 (principle 2: every failure names its next step): what Jo, or the system, does next about this line,
+	 * or exactly NO_NEXT_STEP when none is known. Every kind sets it (NEEDS_YOU_KINDS, the test in surface/test/next-step.test.ts).
+	 * When `line` already says it, `next` is that same text; otherwise needsYouBullet shows it after the line.
+	 */
+	next: string;
 	/** For a question: the options Jo answers with one word. */
 	options?: string[];
 	/**
@@ -440,7 +451,7 @@ function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: reado
 	const runDir = newestOnSlice?.runDir ?? null;
 	const { verdict, sha, failing, first } = newest.f;
 	return {
-		kind: "test-run", workloadId: wl, rowId: newest.m.id, messageIds: failed.map(({ m }) => m.id),
+		kind: "test-run", workloadId: wl, rowId: newest.m.id, messageIds: failed.map(({ m }) => m.id), next: "relaunch to fix",
 		line: `full suite ${verdict} on ${wl} at ${sha.slice(0, 7)}: ${failing} failing${first ? `, first ${first}` : ""} — relaunch to fix (${runDir ?? "no run dir"})`,
 	};
 }
@@ -463,7 +474,7 @@ function landFirstLines(ledger: Ledger, now: string): ErrorLine[] {
 	const results = mainResults(entries);
 	const verdicts = mainVerdicts(results);
 	const out: ErrorLine[] = [];
-	const push = (rowId: string, line: string, state?: string) => out.push({ kind: "train", workloadId: wl, rowId, line, ...(state === undefined ? {} : { state }) });
+	const push = (rowId: string, line: string, next: string, state?: string) => out.push({ kind: "train", workloadId: wl, rowId, line, next, ...(state === undefined ? {} : { state }) });
 	const sha7 = (s: string) => s.slice(0, 7);
 	const prsOf = (suspects: readonly number[]) => (suspects.length === 0 ? "none named" : suspects.map((n) => `#${n}`).join(", "));
 	for (const repo of landFirstRepos(entries, instructions, true)) {
@@ -481,8 +492,9 @@ function landFirstLines(ledger: Ledger, now: string): ErrorLine[] {
 			const latest = passFailure !== undefined && (headFailure === undefined || order.get(passFailure.id)! > order.get(headFailure.entryId)!)
 				? { id: passFailure.id, detail: passFailure.body }
 				: headFailure?.event === "revoke-failed" ? { id: headFailure.entryId, detail: `#${headFailure.pr} head ${headFailure.head}: ${headFailure.error}` } : null;
-			push(marker.id, `land-first off requested for ${repo} (instructions ${pending.join(", ")}): reconciliation pending; normal merges held${latest ? `; latest failure ${latest.id}: ${latest.detail}` : ""} — next: the tick retries remaining fast/tree revocations; check com.agent-system-2.train-tick and its log if no progress`,
-				`off-pending ${pending.join(" ")} failure ${latest?.id ?? "none"}`);
+			const offNext = "the tick retries remaining fast/tree revocations; check com.agent-system-2.train-tick and its log if no progress";
+			push(marker.id, `land-first off requested for ${repo} (instructions ${pending.join(", ")}): reconciliation pending; normal merges held${latest ? `; latest failure ${latest.id}: ${latest.detail}` : ""} — next: ${offNext}`,
+				offNext, `off-pending ${pending.join(" ")} failure ${latest?.id ?? "none"}`);
 			continue;
 		}
 		const mine = rows.filter((r) => r.repo === repo);
@@ -496,23 +508,24 @@ function landFirstLines(ledger: Ledger, now: string): ErrorLine[] {
 					: reconciled?.r.repair
 						? `${sha7(reconciled.r.repair)} admitted`
 						: ep.woken !== null ? `woken ${ep.woken.createdAt} on ${ep.woken.train ?? "no open train"}` : "not woken yet";
-				push(ep.raised.entryId, `main red at ${sha7(s.tip)} since ${ep.raised.createdAt} on ${repo}: ${s.failing ?? "?"} failing; suspects ${prsOf(s.suspects)}; repair ${repair}${ep.filed ? ` — ${ep.filed}` : ""}`, `${s.entryId} ${repair}`);
+				push(ep.raised.entryId, `main red at ${sha7(s.tip)} since ${ep.raised.createdAt} on ${repo}: ${s.failing ?? "?"} failing; suspects ${prsOf(s.suspects)}; repair ${repair}${ep.filed ? ` — ${ep.filed}` : ""}`, NO_NEXT_STEP, `${s.entryId} ${repair}`);
 			} else {
 				const reasons = reconciled !== null && !reconciled.r.open && reconciled.r.tip === s.tip ? reconciled.r.reasons : `${s.kind} stop`;
 				const run = results.findLast((r) => r.sha === s.tip);
 				const phase = run === undefined ? "requested, no result yet" : `${run.runId} ${run.verdict}${run.reason ? ` (${run.reason})` : ""}`;
-				push(ep.raised.entryId, `landing stopped at ${sha7(s.tip)} on ${repo}: ${reasons}; suspects ${prsOf(s.suspects)}; main run ${phase}${ep.filed ? ` — ${ep.filed}` : ""}`, `${s.entryId} ${phase}`);
+				push(ep.raised.entryId, `landing stopped at ${sha7(s.tip)} on ${repo}: ${reasons}; suspects ${prsOf(s.suspects)}; main run ${phase}${ep.filed ? ` — ${ep.filed}` : ""}`, NO_NEXT_STEP, `${s.entryId} ${phase}`);
 			}
 		}
 		if (reconciled === null || Date.parse(now) - Date.parse(reconciled.createdAt) > RECONCILED_STALE_MS) {
-			push(reconciled?.entryId ?? `land-first ${repo}`, `train tick has not reconciled main since ${reconciled?.createdAt ?? "land-first went on"} on ${repo} — lane merges are held; check the tick's job (com.agent-system-2.train-tick) and its log`);
+			const tickNext = "check the tick's job (com.agent-system-2.train-tick) and its log";
+			push(reconciled?.entryId ?? `land-first ${repo}`, `train tick has not reconciled main since ${reconciled?.createdAt ?? "land-first went on"} on ${repo} — lane merges are held; ${tickNext}`, tickNext);
 		}
 		const retries = mainRetries(entries, instructions, repo);
 		const exhausted = new Map<string, Extract<LandFirstRow, { event: "exhausted" }>>();
 		for (const r of mine) if (r.event === "exhausted") exhausted.set(r.sha, r);
 		for (const r of exhausted.values()) {
 			const b = attemptBlock(r.sha, results, retries);
-			if (!verdicts.has(r.sha) && b.exhausted && b.block === r.block) push(r.entryId, `main runs exhausted at ${sha7(r.sha)}: fix the runner, then say main-retry ${repo}`);
+			if (!verdicts.has(r.sha) && b.exhausted && b.block === r.block) push(r.entryId, `main runs exhausted at ${sha7(r.sha)}: fix the runner, then say main-retry ${repo}`, `fix the runner, then say main-retry ${repo}`);
 		}
 		const revocations = new Map<string, Extract<LandFirstRow, { event: "revoke-gave-up" }>>();
 		for (const r of mine) {
@@ -520,16 +533,17 @@ function landFirstLines(ledger: Ledger, now: string): ErrorLine[] {
 			else if (r.event === "revoke-cleared") revocations.delete(`${r.pr} ${r.head}`);
 		}
 		for (const r of revocations.values()) {
-			push(r.entryId, `revocation failed on #${r.pr} (${repo}, head ${sha7(r.head)}): ${short(r.error, 120)} — that head still shows success; it can be merged by hand on GitHub until its head changes`);
+			push(r.entryId, `revocation failed on #${r.pr} (${repo}, head ${sha7(r.head)}): ${short(r.error, 120)} — that head still shows success; it can be merged by hand on GitHub until its head changes`, NO_NEXT_STEP);
 		}
 	}
 	const preflight = controlEntries(entries).findLast((c) => c.prefix === "runner-preflight");
 	const pre = preflight === undefined ? null : parseRunnerPreflight(preflight.body);
-	if (preflight !== undefined && pre !== null && !pre.ok) push(preflight.id, `verifier: the runner's preflight refused: ${short(pre.reason ?? "", 160)} (root ${pre.root})`);
+	if (preflight !== undefined && pre !== null && !pre.ok) push(preflight.id, `verifier: the runner's preflight refused: ${short(pre.reason ?? "", 160)} (root ${pre.root})`, NO_NEXT_STEP);
 	const refused = rows.findLast((r) => r.event === "tick-refused");
 	const newestReconciled = controlEntries(entries).findLast((c) => c.prefix === "train-reconciled");
 	if (refused?.event === "tick-refused" && (newestReconciled === undefined || newestReconciled.createdAt < refused.createdAt)) {
-		push(refused.entryId, `verifier: the train tick refuses to run: ${short(refused.reason, 160)} — reinstall it from verified/current (install/install.sh --control-root=verified)`);
+		const reinstall = "reinstall it from verified/current (install/install.sh --control-root=verified)";
+		push(refused.entryId, `verifier: the train tick refuses to run: ${short(refused.reason, 160)} — ${reinstall}`, reinstall);
 	}
 	const promotions = new Map<string, LandFirstRow>();
 	for (const r of rows) {
@@ -537,12 +551,12 @@ function landFirstLines(ledger: Ledger, now: string): ErrorLine[] {
 		else if (r.event === "promote-ok") promotions.delete(r.repo);
 	}
 	for (const r of promotions.values()) {
-		if (r.event === "promote-gave-up") push(r.entryId, `verifier: promotion of ${sha7(r.g)} on ${r.repo} failed 3 times: ${short(r.error, 120)} — the control plane keeps running from the older verified root`);
+		if (r.event === "promote-gave-up") push(r.entryId, `verifier: promotion of ${sha7(r.g)} on ${r.repo} failed 3 times: ${short(r.error, 120)} — the control plane keeps running from the older verified root`, NO_NEXT_STEP);
 		else if (r.event === "promote-schema") {
 			const recovery = r.g === null
 				? "verified target missing from the retained notice — rerun the train tick to reconcile it before migration or promotion"
 				: `verified target ${r.g} — stop the tick, migrate the live ledger through ${r.g}, run bun surface/scripts/promote-verified.ts ${r.g}, restart`;
-			push(r.entryId, `verifier: promotion waits on Jo: ${sha7(r.sha)} on ${r.repo} changes the ledger schema; ${recovery}${r.issue ? ` (${r.issue})` : ""}`);
+			push(r.entryId, `verifier: promotion waits on Jo: ${sha7(r.sha)} on ${r.repo} changes the ledger schema; ${recovery}${r.issue ? ` (${r.issue})` : ""}`, recovery);
 		}
 	}
 	return out;
@@ -560,7 +574,7 @@ function securityRedLines(ledger: Ledger): ErrorLine[] {
 		const s = parseSecurityRed(m.body);
 		if (!s || s.workloadId !== m.workload_id) return [];
 		return [{
-			kind: "security-red" as const, workloadId: s.workloadId, rowId: m.id, messageIds: [m.id],
+			kind: "security-red" as const, workloadId: s.workloadId, rowId: m.id, messageIds: [m.id], next: "a lane asks you before it changes such a test",
 			line: `security tests red on ${s.workloadId}: run ${s.runId} at ${s.sha.slice(0, 7)} (slice ${s.slice}) has ${s.failing} failing under ${SECURITY_TEST_PATHS.join(", ")}, first ${s.first} — a lane asks you before it changes such a test`,
 		}];
 	});
@@ -593,30 +607,32 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		const isTrain = () => (trainWorkload ??= trainMembers(ledger.entries(wl), ledger.instructions(wl)).length > 0);
 		const scheduled = parseDue(workload.brief);
 		const requests = reservedStates(ledger, wl);
+		// Issue #334 item 3: what Jo does about a workload whose lane is gone (held, died, idle). A user-driven one has no relaunch.
+		const resume = workload.mode === "user-driven" ? `continue it with ${byHandLine(wl)}, close, or instruct` : "relaunch, close, or instruct";
 		for (const r of requests) {
 			if (r.state.kind !== "waiting") continue;
 			// § 1.2, § 1.3: a guard bypass or an irreversible or shared-state rule (gates/src/rows/r06-reserved.ts NOW_RESERVED) is NOW.
 			const hot = nowReserved(r.body);
 			reserved.push({
-				kind: "reserved", workloadId: wl, rowId: r.id, ...(hot ? { state: "now" } : {}),
+				kind: "reserved", workloadId: wl, rowId: r.id, ...(hot ? { state: "now" } : {}), next: `\`approve ${r.id}\` or \`deny ${r.id}\``,
 				line: `${hot ? `NOW (${hot.category}): ` : ""}reserved action waiting on you (${label}): ${short(r.body)}${repeatNote(r, requests)} — \`approve ${r.id}\` or \`deny ${r.id}\``,
 			});
 		}
 		const oldest = pendingMessages.find((m) => m.state === "held" && m.recipient !== ORCHESTRATOR_RECIPIENT);
 		if (oldest && hoursElapsed(oldest.created_at, now) >= holdHours) {
-			if (!isTrain()) held.push({ kind: "held", workloadId: wl, rowId: oldest.id, line: `held ${hoursBetween(oldest.created_at, now)}h on ${label}: message ${oldest.id} (${oldest.sender} → ${oldest.recipient}) has had no live lane since ${oldest.created_at}` });
+			if (!isTrain()) held.push({ kind: "held", workloadId: wl, rowId: oldest.id, next: resume, line: `held ${hoursBetween(oldest.created_at, now)}h on ${label}: message ${oldest.id} (${oldest.sender} → ${oldest.recipient}) has had no live lane since ${oldest.created_at}` });
 		} else if (wl !== STANDING_WORKLOAD_ID && !scheduled && !workload.holder && hoursElapsed(workload.last_activity_at, now) >= holdHours && !isTrain()
 			// PLAN wl-mvbcjadqgblr7k D8: a queued workload waits for a slot by design; a held message on it still surfaces above.
 			&& queuedOf(controlEntries(ledger.entries(wl, "assumption"))) === null) {
 			// Fable F2d: an open workload with no slices yet and no lane is held too. The standing workload and a
 			// scheduled row (M11 `due:` brief) are not a lane's work: neither ever has a lane, both are excluded.
-			held.push({ kind: "held", workloadId: wl, rowId: wl, line: `held ${hoursBetween(workload.last_activity_at, now)}h on ${label}: ${workload.open_slices} open slice(s), no lane, no activity since ${workload.last_activity_at}` });
+			held.push({ kind: "held", workloadId: wl, rowId: wl, next: resume, line: `held ${hoursBetween(workload.last_activity_at, now)}h on ${label}: ${workload.open_slices} open slice(s), no lane, no activity since ${workload.last_activity_at}` });
 		}
 		for (const [sliceId, { n, heldIds }] of artifactFailures(ledger, wl)) {
 			if (n < ARTIFACT_FAILURES_SURFACED) continue;
 			const slice = slices.find((s) => s.id === sliceId) ?? ledger.slice(sliceId);
 			if (!slice || slice.state === "done" || slice.state === "cancelled") continue;
-			artifact.push({ kind: "artifact", workloadId: wl, rowId: sliceId, state: String(n), messageIds: heldIds, line: `slice ${sliceId} (${label}) failed its runtime artifact ${n} times: ${short(slice.task, 70)}` });
+			artifact.push({ kind: "artifact", workloadId: wl, rowId: sliceId, state: String(n), messageIds: heldIds, next: `instruct the lane, or \`cancel-slice ${sliceId}\``, line: `slice ${sliceId} (${label}) failed its runtime artifact ${n} times: ${short(slice.task, 70)}` });
 		}
 		const run = testRunLine(ledger, workload, pendingMessages, now, windows);
 		if (run) testRun.push(run);
@@ -624,15 +640,15 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		const deathTimes = deaths.map((d) => d.created_at);
 		for (const d of deaths) {
 			if (d.state !== "held" || trainRouted(windows, d.created_at, deathTimes)) continue;
-			died.push({ kind: "lane-died", workloadId: wl, rowId: d.id, messageIds: [d.id], line: `lane ${d.holder} on ${label} died: ${d.body.slice(d.body.indexOf(":", 11) + 1).trim()}, ${workload.open_slices} open slice(s)${workload.holder && workload.holder !== d.holder ? `; ${workload.holder} holds it now` : ""}` });
+			died.push({ kind: "lane-died", workloadId: wl, rowId: d.id, messageIds: [d.id], next: resume, line: `lane ${d.holder} on ${label} died: ${d.body.slice(d.body.indexOf(":", 11) + 1).trim()}, ${workload.open_slices} open slice(s)${workload.holder && workload.holder !== d.holder ? `; ${workload.holder} holds it now` : ""}` });
 		}
 		if (unrecordedLapse(ledger, workload, now) && !trainRouted(windows, workload.holder_lease_until!, deathTimes)) {
-			died.push({ kind: "lane-died", workloadId: wl, rowId: wl, state: `${workload.holder}@${workload.holder_lease_until}`, line: `lane ${workload.holder} on ${label} died: lease lapsed ${workload.holder_lease_until}, ${workload.open_slices} open slice(s)` });
+			died.push({ kind: "lane-died", workloadId: wl, rowId: wl, state: `${workload.holder}@${workload.holder_lease_until}`, next: resume, line: `lane ${workload.holder} on ${label} died: lease lapsed ${workload.holder_lease_until}, ${workload.open_slices} open slice(s)` });
 		}
 		// D5: a taken pair, whatever else is open, while the workload is user-driven and no lane holds it under a live lease.
 		const laneLive = workload.holder?.startsWith("lane-") === true && (workload.holder_lease_until === null || workload.holder_lease_until >= now);
 		const taken = wl !== STANDING_WORKLOAD_ID && workload.mode === "user-driven" && !laneLive ? takenPair(ledger.entries(wl, "assumption")) : null;
-		if (taken) idle.push({ kind: "pair", workloadId: wl, rowId: taken.questionId, state: "taken", line: pairTakenLine(wordsOf(ledger, wl), taken.questionId, wl) });
+		if (taken) idle.push({ kind: "pair", workloadId: wl, rowId: taken.questionId, state: "taken", next: byHandLine(wl), line: pairTakenLine(wordsOf(ledger, wl), taken.questionId, wl) });
 		let control: ControlEntry[] = [];
 		/** § 1.0: the NOW category of each open question a valid `now:` control entry (ESCALATION_BY's alone) names. */
 		let marks = new Map<string, NowCategory>();
@@ -646,8 +662,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			// still the holder and is the lane-died line's; `lane-exit:` needs no holder list to validate.
 			// A user-driven workload has no relaunch: the line names the by-hand command (PLAN wl-mvb9mw00ycfjeo D5).
 			const ended = idleExit(controlEntries(ledger.entries(wl)));
-			const next = workload.mode === "user-driven" ? `continue it with ${byHandLine(wl)}, close, or instruct` : "relaunch, close, or instruct";
-			if (ended && !trainRouted(windows, ended.createdAt) && !isTrain()) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; ${next}` });
+			if (ended && !trainRouted(windows, ended.createdAt) && !isTrain()) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, next: resume, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; ${resume}` });
 		}
 		for (const q of openQuestions) {
 			const hot = marks.get(q.id);
@@ -655,12 +670,13 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			if (wl === STANDING_WORKLOAD_ID) {
 				// The orchestrator's own ask to Jo (MIGRATION.md item 105), its subject workload from the surface's subject entry.
 				const about = questionSubject(ledger, q.id);
-				questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(hot ? { state: "now" } : {}), line: `${nowTag}the orchestrator asked you (${q.id}${about ? `, about ${about}` : ""}): ${short(q.body, 120)} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
+				const answer = `answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)`;
+				questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(hot ? { state: "now" } : {}), next: answer, line: `${nowTag}the orchestrator asked you (${q.id}${about ? `, about ${about}` : ""}): ${short(q.body, 120)} — ${answer}` });
 				continue;
 			}
 			// D4: a valid pair offer is its own line, right before its question's; the question lists its options less `pair` (D2).
 			const offer = openPairOffer(ledger, q);
-			if (offer) questions.push({ kind: "pair", workloadId: wl, rowId: q.id, state: "offer", line: pairOfferLine(wordsOf(ledger, wl, control), q.id, wl, offer.signals) });
+			if (offer) questions.push({ kind: "pair", workloadId: wl, rowId: q.id, state: "offer", next: `Answer pair ${q.id}`, line: pairOfferLine(wordsOf(ledger, wl, control), q.id, wl, offer.signals) });
 			const body = isPlanQuestionIn(control, q) ? `\n  ${q.body.split("\n").join("\n  ")}` : ` ${short(q.body, 120)}`;
 			// D9's re-send: level 2 or 3 of the train tick's ladder makes the line LOUD, each level a new state.
 			const loud = trainAlertLevel(control, q.id);
@@ -669,36 +685,37 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			const asker = q.created_by === MERGE_TRAIN_BY ? `merge train ${label} needs you` : `lane on ${label} is waiting on you`;
 			// A NOW question is on fire from its first poll (batch.ts onFire), so its state stays `now` whatever the ladder's level.
 			const state = hot ? "now" : step ? `loud-${loud}` : null;
+			const answer = `answer with one word: ${shownOptions(q.options).join(" / ")} (or \`withdraw\`)`;
 			questions.push({
-				kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(state ? { state } : {}),
-				line: `${tag}${asker} (${q.id}, slice ${q.slice_id}):${body} — answer with one word: ${shownOptions(q.options).join(" / ")} (or \`withdraw\`)`,
+				kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(state ? { state } : {}), next: answer,
+				line: `${tag}${asker} (${q.id}, slice ${q.slice_id}):${body} — ${answer}`,
 			});
 		}
 		for (const w of openPromptWaits(ledger, wl)) {
-			questions.push({ kind: "question", workloadId: wl, rowId: w.id, messageIds: [w.id], line: `lane ${w.lane} on ${label} is blocked on a human prompt it should never open (${w.toolName}, tool call ${w.toolCallId}, since ${w.created_at}): ${short(w.reason, 100)} — answer it in that session or end the session` });
+			questions.push({ kind: "question", workloadId: wl, rowId: w.id, messageIds: [w.id], next: "answer it in that session or end the session", line: `lane ${w.lane} on ${label} is blocked on a human prompt it should never open (${w.toolName}, tool call ${w.toolCallId}, since ${w.created_at}): ${short(w.reason, 100)} — answer it in that session or end the session` });
 		}
 		if (scheduled && Date.parse(scheduled.due) <= Date.parse(now)) {
-			due.push({ kind: "due", workloadId: wl, rowId: wl, line: `scheduled and past due (${scheduled.due}): ${short(scheduled.text, 120)} — close ${wl} with a receipt when done` });
+			due.push({ kind: "due", workloadId: wl, rowId: wl, next: `close ${wl} with a receipt when done`, line: `scheduled and past due (${scheduled.due}): ${short(scheduled.text, 120)} — close ${wl} with a receipt when done` });
 		}
 		if (wl === STANDING_WORKLOAD_ID) {
 			const control = controlEntries(ledger.entries(wl, "assumption"));
 			const disk = openScratchEntry(control, "scratch-disk", "scratch-disk-ok");
-			if (disk) scratch.push({ kind: "scratch", workloadId: wl, rowId: disk.id, line: `scratch disk: ${disk.rest} — the daily sweep clears this line once the total is back under` });
+			if (disk) scratch.push({ kind: "scratch", workloadId: wl, rowId: disk.id, next: "the daily sweep clears this line once the total is back under", line: `scratch disk: ${disk.rest} — the daily sweep clears this line once the total is back under` });
 			const newest = control.findLast((c) => c.prefix === "daily-report" && /^\d{4}-\d{2}-\d{2}\s/.test(c.rest));
 			const age = newest ? hoursElapsed(newest.createdAt, now) : Number.POSITIVE_INFINITY;
 			if (newest && age < REPORT_FRESH_HOURS) {
-				report.push({ kind: "report", workloadId: wl, rowId: newest.id, line: `daily self-heal report ${newest.rest}` });
+				report.push({ kind: "report", workloadId: wl, rowId: newest.id, next: NO_NEXT_STEP, line: `daily self-heal report ${newest.rest}` });
 			} else if (newest && age < REPORT_MISSED_DAYS * 24 && (opts.reportJobInstalled ?? reportPlistInstalled)()) {
 				report.push({
-					kind: "report", workloadId: wl, rowId: newest.id, state: "missed",
+					kind: "report", workloadId: wl, rowId: newest.id, state: "missed", next: `check ${DAILY_REPORT_LABEL}`,
 					line: `daily self-heal report missed: the newest is ${newest.rest.slice(0, 10)} (${hoursBetween(newest.createdAt, now)} h); check ${DAILY_REPORT_LABEL}`,
 				});
 			}
 			for (const ep of protectionEpisodes(ledger).values()) {
-				if (ep.raised) train.push({ kind: "train", workloadId: wl, rowId: ep.raised.id, line: `merge train: main's protection on ${ep.repo} is unverified: ${short(ep.text, 160)} — its normal PRs wait (no merge, no question) until it verifies; the line clears itself then` });
+				if (ep.raised) train.push({ kind: "train", workloadId: wl, rowId: ep.raised.id, next: NO_NEXT_STEP, line: `merge train: main's protection on ${ep.repo} is unverified: ${short(ep.text, 160)} — its normal PRs wait (no merge, no question) until it verifies; the line clears itself then` });
 			}
 			for (const n of mainRedNotices(ledger).values()) {
-				if (!n.cleared) train.push({ kind: "train", workloadId: wl, rowId: n.raised.id, line: `merge train: main is red: ${n.url} (run ${n.run}) — PRs that add no failure still merge; the line clears when that issue closes` });
+				if (!n.cleared) train.push({ kind: "train", workloadId: wl, rowId: n.raised.id, next: NO_NEXT_STEP, line: `merge train: main is red: ${n.url} (run ${n.run}) — PRs that add no failure still merge; the line clears when that issue closes` });
 			}
 			train.push(...landFirstLines(ledger, now));
 		} else {
@@ -707,7 +724,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			const over = entries.some((e) => e.body.startsWith(SCRATCH_ENTRY.overCap))
 				? openScratchEntry(controlEntries(entries, holdersOf(entries, workload.holder, ledger.holders(wl))), "scratch-over-cap", "scratch-under-cap")
 				: null;
-			if (over) scratch.push({ kind: "scratch", workloadId: wl, rowId: over.id, line: `scratch of ${label} over its cap: ${over.rest} (advisory: nothing is refused; ${over.createdBy} was told)` });
+			if (over) scratch.push({ kind: "scratch", workloadId: wl, rowId: over.id, next: "advisory: nothing is refused", line: `scratch of ${label} over its cap: ${over.rest} (advisory: nothing is refused; ${over.createdBy} was told)` });
 		}
 		const notes = pendingMessages.filter((m) => m.state === "held" && m.recipient === ORCHESTRATOR_RECIPIENT && m.body.startsWith(NOTICE_PREFIX));
 		// The holders are read only when there is a notice to check.
@@ -719,7 +736,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		for (const m of notes) {
 			if (lanes.includes(m.created_by) || (paired && parseCeilingNotice(m.body) !== null)) continue;
 			const text = m.body.slice(NOTICE_PREFIX.length).trim().split("\n").join("\n  ");
-			notice.push({ kind: "notice", workloadId: wl, rowId: m.id, messageIds: [m.id], line: `notice on ${label} (nothing to answer): ${text}` });
+			notice.push({ kind: "notice", workloadId: wl, rowId: m.id, messageIds: [m.id], next: "nothing to answer", line: `notice on ${label} (nothing to answer): ${text}` });
 		}
 	}
 	const all = [...reserved, ...held, ...artifact, ...securityRed, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch, ...report, ...notice];
@@ -732,7 +749,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		if (!answerable(l)) continue;
 		for (const p of proposals) {
 			if (p.target !== l.rowId) continue;
-			out.push({ kind: "proposal", workloadId: l.workloadId, rowId: p.entryId, proposes: l.rowId, state: p.msgId, line: `${p.senderId} proposes ${p.word} ${p.target} (${p.msgId})` });
+			out.push({ kind: "proposal", workloadId: l.workloadId, rowId: p.entryId, proposes: l.rowId, state: p.msgId, next: `${p.word} ${p.target}`, line: `${p.senderId} proposes ${p.word} ${p.target} (${p.msgId})` });
 		}
 	}
 	for (const r of channelRefusals(ledger, now)) {
@@ -745,7 +762,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 				: r.reached === "unconfirmed"
 					? `no aside of ${r.msgId} was confirmed (it may have been read in the ledger); it is withdrawn from later renders`
 					: "nothing reached the model";
-		out.push({ kind: "channel-refused", workloadId: STANDING_WORKLOAD_ID, rowId: r.id, line: `agent channel refused an envelope: ${r.rest} — quarantined in inbox/ilex as .invalid, ${fate} (shown ${CHANNEL_REFUSED_SHOWN_HOURS}h; takes no word)` });
+		out.push({ kind: "channel-refused", workloadId: STANDING_WORKLOAD_ID, rowId: r.id, next: "takes no word", line: `agent channel refused an envelope: ${r.rest} — quarantined in inbox/ilex as .invalid, ${fate} (shown ${CHANNEL_REFUSED_SHOWN_HOURS}h; takes no word)` });
 	}
 	return out;
 }

@@ -354,7 +354,7 @@ describe("R7: the taken line", () => {
 		expect(errorLines(ledger).filter((l) => l.kind === "pair")).toEqual([]); // the lane still holds it under a live lease
 		laneEnds(ledger, wl);
 		const lines = errorLines(ledger).filter((l) => l.workloadId === wl);
-		expect(lines).toEqual([{ kind: "pair", workloadId: wl, rowId: q, state: "taken", line: takenLine(wl, q) }]);
+		expect(lines).toEqual([{ kind: "pair", workloadId: wl, rowId: q, state: "taken", next: `as2 lane ${wl}`, line: takenLine(wl, q) }]);
 		expect(lines[0]!.line.split("\n").at(-1)).toBe(`as2 lane ${wl}`);
 		expect(lines.some((l) => l.line.includes("relaunch"))).toBe(false);
 	});

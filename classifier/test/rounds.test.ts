@@ -6,6 +6,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+	blockingOf,
 	countRounds,
 	type EntryInput,
 	effectiveRoundLimit,
@@ -258,6 +259,45 @@ describe("countRounds", () => {
 			entry(`review-round: ${SL} round 1 token dt-z group dg-z verdict accepted blocking 5 counts ${JSON.stringify(findingsWith(1))}`),
 		];
 		expect(countRounds(entries, SL).rounds).toEqual([]);
+	});
+});
+
+describe("fault-tolerance findings (issue #334 item 1): a silent failure path is blocking", () => {
+	/** A reviewer's report on a diff whose `catch {}` hides the push error, filed at the severity the reviewer chose. */
+	const report = (severity: string) =>
+		[
+			"Reviewed the push helper.",
+			"```ts",
+			"try { await push(branch); } catch {}",
+			"```",
+			"The empty catch hides a failed push: the lane reports done with nothing on the remote.",
+			block([f(severity, "fault-tolerance", "catch {} hides a failed push")]),
+		].join("\n");
+
+	test("a catch {} hiding an error is a blocking fault-tolerance finding, at whatever severity the reviewer wrote", () => {
+		for (const severity of ["blocking", "major", "minor"]) {
+			const p = parsed(report(severity));
+			expect({ severity, counts: p.counts }).toEqual({ severity, counts: { blocking: { "fault-tolerance": 1 }, major: {}, minor: {} } });
+			expect(blockingOf(p)).toBe(1);
+		}
+	});
+
+	test("a stored round whose fault-tolerance count is not blocking is malformed, not read as a pass (review of #405, should-fix 5)", () => {
+		const round = (findings: ReturnType<typeof parsed>) => reviewRoundBody({ slice: SL, round: 1, token: "dt-1", group: "dg-1", verdict: "accepted", findings });
+		// a legacy round (major correctness, minor docs) still round-trips
+		const legacy = round(parsed(block([f("major", "correctness", "off by one"), f("minor", "docs", "typo in readme")])));
+		expect(parseReviewRound(legacy)?.findings).toEqual(parsed(block([f("major", "correctness", "off by one"), f("minor", "docs", "typo in readme")])));
+		// a valid round with a minor docs finding parses; the same body with only that count's kind changed to fault-tolerance does not
+		const valid = round(parsed(block([f("minor", "docs", "typo in readme")])));
+		expect(parseReviewRound(valid)).not.toBeNull();
+		expect(valid).toContain(' blocking 0 counts {"');
+		const minorFaultTolerance = valid.replace('"docs"', '"fault-tolerance"');
+		expect(minorFaultTolerance).toContain('"minor":{"fault-tolerance":1}');
+		expect(parseReviewRound(minorFaultTolerance)).toBeNull();
+		// and a fault-tolerance round written by the parser itself round-trips as blocking
+		const ft = round(parsed(report("minor")));
+		expect(ft).toContain(" blocking 1 counts ");
+		expect(parseReviewRound(ft)?.findings).toEqual(parsed(report("minor")));
 	});
 });
 
