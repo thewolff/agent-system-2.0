@@ -1292,6 +1292,15 @@ install/drive-backup/quiet-alarm.zsh	install	-
 install/drive-backup/server-read.zsh	install	-
 install/drive-backup/test-fake-drive.zsh	install	-
 install/drive-backup/test-server-read.zsh	install	-
+install/drive-backup/fake-drive-fixture.zsh	install	-
+install/drive-backup/test-fake-drive-proofs.zsh	install	-
+install/drive-backup/test-fake-drive-envelope.zsh	install	-
+install/drive-backup/test-fake-drive-envelope-stops.zsh	install	-
+install/drive-backup/test-fake-drive-regress.zsh	install	-
+install/drive-backup/test-fake-drive-regress-single.zsh	install	-
+install/drive-backup/test-fake-drive-crash.zsh	install	-
+install/drive-backup/test-fake-drive-crash-late.zsh	install	-
+install/drive-backup/test-fake-drive-jobs.zsh	install	-
 surface/test/drive-backup.test.ts	test	-
 install/drive-backup/test-alert.zsh	install	-
 surface/scripts/drive-backup-notice.ts	module	-
