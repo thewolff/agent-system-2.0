@@ -12,8 +12,9 @@
 // held under a live lease or without the holder's `done-because:` receipt (unless Jo superseded or withdrew it), commits the rendered
 // entry (decision 13) on the workload's lane branch wl/<id>, never on the checkout's current branch,
 // and pushes it to an open PR (surface/src/close-entry.ts), through the extension API's exec, never
-// the bash tool. Once the row has closed, the workload's scratch root is removed in-process
-// (`closeScratchRoot`, PLAN wl-mv5oikd5jtquww § 1.5); a failed removal is an entry, never a failed close.
+// the bash tool. Once the row has closed, the workload's scratch root is archived and then removed in-process
+// (`closeScratchRoot`, PLAN wl-mv5oikd5jtquww § 1.5 as amended 2026-10-28); a failed archive keeps the root, and a failed
+// archive or removal is an entry, never a failed close.
 import { type InstructionRow, type Ledger, type MessageRow, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { classify, type KindJudge, loadKindQuestion } from "../../classifier/src/classify";
 import { closeCheck, closeScratchRoot, commitCloseEntry, type EntryPublish, logDirOf, publishEntry, recordCloseReceipt, type StandIn, standInOf } from "../src/close-entry";
@@ -176,8 +177,9 @@ export async function closeWorkloadWithEntry(
 			details: { id, path: entry?.path ?? null, branch: entry?.branch ?? null, commit, closed: false }, receipt: done,
 		};
 	}
-	// PLAN wl-mv5oikd5jtquww § 1.5: the closed workload's scratch root goes now; a failed removal is an entry, never a failed close.
-	const scratch = closeScratchRoot(ledger, env, id);
+	// PLAN wl-mv5oikd5jtquww § 1.5 (amended 2026-10-28): the closed workload's scratch root is archived, then removed; an archive
+	// that fails keeps the root. The done-because is passed so a deliverable it names inside the root is reported with its archive.
+	const scratch = closeScratchRoot(ledger, env, id, { doneBecause: done });
 	const pub: EntryPublish | null = entry && commit === null ? await publishEntry(pi, entry, id) : null;
 	const details = { id, path: entry?.path ?? null, branch: entry?.branch ?? null, commit, push: pub?.push ?? null, pr: pub?.pr ?? null, prReason: pub?.prReason ?? null, check: checked };
 	pi.appendEntry("surface-close", details);

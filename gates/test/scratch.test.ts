@@ -51,6 +51,8 @@ describe("constants and location", () => {
 			diskOk: "scratch-disk-ok:",
 			removed: "scratch-removed:",
 			removeFailed: "scratch-remove-failed:",
+			archived: "scratch-archived:",
+			archiveExpired: "scratch-archive-expired:",
 		});
 	});
 

@@ -683,7 +683,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		if (wl === STANDING_WORKLOAD_ID) {
 			const control = controlEntries(ledger.entries(wl, "assumption"));
 			const disk = openScratchEntry(control, "scratch-disk", "scratch-disk-ok");
-			if (disk) scratch.push({ kind: "scratch", workloadId: wl, rowId: disk.id, line: `scratch disk: ${disk.rest} — the daily sweep clears this line once the total is back under` });
+			if (disk) scratch.push({ kind: "scratch", workloadId: wl, rowId: disk.id, line: `scratch disk: ${disk.rest} — the daily sweep clears this line once the total is back under and the free space back over` });
 			const newest = control.findLast((c) => c.prefix === "daily-report" && /^\d{4}-\d{2}-\d{2}\s/.test(c.rest));
 			const age = newest ? hoursElapsed(newest.createdAt, now) : Number.POSITIVE_INFINITY;
 			if (newest && age < REPORT_FRESH_HOURS) {

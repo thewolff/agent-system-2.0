@@ -40,7 +40,7 @@ Read the kind off your task, then follow the matching line.
   poll readiness with a command.
 - Close the slice with the artifact the done-condition names.
 - Throwaway copies, fails-before copies and probe repos go under `$AS2_SCRATCH`, your workload's scratch root
-  (shared with your lane, removed at close and by the daily sweep), never in the worktree or /tmp. Spell targets
+  (shared with your lane, archived then removed at close and by the daily sweep), never in the worktree or /tmp. Spell targets
   `"$AS2_SCRATCH/…"`, whole word quoted, never through another variable, `mktemp` or a relative path after `cd`.
   Inside it `rm -rf`, `git init`/`clone`, `git checkout --`/`restore`/`reset --hard`/`clean -f`/`branch -d`/`tag -d`
   and `git push` to a scratch repo by its path (never a named remote) need no hold; they run confined (writes only

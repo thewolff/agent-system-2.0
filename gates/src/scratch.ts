@@ -24,6 +24,8 @@ export const SCRATCH_ENTRY = {
 	diskOk: "scratch-disk-ok:",
 	removed: "scratch-removed:",
 	removeFailed: "scratch-remove-failed:",
+	archived: "scratch-archived:",
+	archiveExpired: "scratch-archive-expired:",
 } as const;
 
 /** A workload id as the ledger and the harnesses mint it (`wl-mv5…`, chaos's `wl-chaos-<run>`): one path component, never `.` or `/`. */
