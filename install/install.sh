@@ -62,6 +62,17 @@
 # $HOME/agent-scratch/agent-system-2.0/self-heal/launchd.log. --daily-report=off is an =off form like the
 # others: it only boots the job out and deletes its plist, before any install step, and writes nothing else.
 #
+# --drive-backup (macOS only, wl-mvwkt821jx4d6e, jo-issues #300) writes the nightly Google Drive backup's two jobs the
+# same way as --daily-report: install/com.agent-system-2.drive-backup.plist (install/drive-backup/backup-nightly.zsh at
+# 02:30 local time) and install/com.agent-system-2.drive-backup-check.plist (install/drive-backup/check-backup-fresh.zsh
+# at 09:00), each filled with this checkout, the absolute bun path, $HOME, the ledger path and the state dir
+# $HOME/agent-scratch/agent-system-2.0/drive-backup/state (the scripts' own default, where both log), written to
+# $HOME/Library/LaunchAgents and loaded. The nightly job also gets AS2_KEEP_LOCAL from this installer's environment:
+# unset, empty or 0 writes 0 (a local archive is deleted once its Drive copy is proven twice and read back), 1 writes 1
+# (upload and prove, never delete); any other value refuses the flag. The jobs run /usr/bin/sqlite3, /usr/bin/jq (macOS
+# 15 and later) and /usr/bin/perl by those paths, so a missing one refuses the flag. --drive-backup=off is an =off
+# form like the others: it boots both jobs out and deletes both plists, before any install step, and writes nothing else.
+#
 # --control-root=verified (PLAN wl-mvq4edbaf13vnk § 2 "Protect the verifier", R21) registers the train tick's plist
 # (it implies --train-tick) and the profile's OMP extensions from the verified control root,
 # $HOME/.agent-system-2/verified/current, instead of this checkout: the plist's REPO and every path in the rendered
@@ -73,10 +84,13 @@
 # Usage:   bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off]
 #                                  [--train-tick | --train-tick=off]
 #                                  [--daily-report | --daily-report=off]
+#                                  [--drive-backup | --drive-backup=off]
 #                                  [--control-root=verified]
 # Env:     AGENT_SYSTEM_LEDGER_DB   ledger file (default: $HOME/.agent-system-2/ledger.db)
 #          AGENT_SYSTEM_PROFILE     OMP profile name (default: agent-system-2); the profile lives at
 #                                   $HOME/.omp/profiles/<profile>/agent (omp://config-usage.md § Profiles)
+#          AS2_KEEP_LOCAL           with --drive-backup only: unset, empty or 0 (default) or 1, written into the
+#                                   nightly job; any other value refuses the flag
 # Exit:    0 installed, or (=off) each named job is confirmed not loaded and its plist is gone
 #          1 other failure (=off: launchctl not on PATH, `launchctl print` failed for a reason other
 #            than "Could not find service", or bootout failed, each with the plist kept; or the
@@ -86,6 +100,8 @@
 #            not on PATH, or --scratch-sweep refused: not macOS, or --train-tick refused: not macOS, gh,
 #            bun, omp, git, osascript or ctx not on PATH, or `gh auth status` failed (nothing written)
 #            (or --daily-report refused: not macOS, or bun not on PATH; nothing written)
+#            (or --drive-backup refused: not macOS, bun not on PATH, /usr/bin/sqlite3, /usr/bin/jq or /usr/bin/perl
+#            missing, or AS2_KEEP_LOCAL not 0 or 1; nothing written)
 #            (or --control-root=verified refused: no verified root, an extension missing under it, or --train-tick=off)
 #          3 ledger path refused as synced or network folder (nothing written)
 #          4 the ledger file exists at a schema version other than the supported one (5), e.g. a
@@ -121,9 +137,10 @@ CHAOS=""
 SWEEP=""
 TICK=""
 REPORT=""
+DRIVE=""
 CONTROL=""
 USAGE="usage: bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off] [--train-tick | --train-tick=off]"
-USAGE="$USAGE [--daily-report | --daily-report=off] [--control-root=verified]"
+USAGE="$USAGE [--daily-report | --daily-report=off] [--drive-backup | --drive-backup=off] [--control-root=verified]"
 for arg in "$@"; do
 	case "$arg" in
 		--chaos-nightly | --chaos-nightly=off)
@@ -138,6 +155,9 @@ for arg in "$@"; do
 		--daily-report | --daily-report=off)
 			[ -z "$REPORT" ] || fail "$USAGE; the daily-report flag is given twice: $*" 2
 			if [ "$arg" = --daily-report ]; then REPORT=on; else REPORT=off; fi ;;
+		--drive-backup | --drive-backup=off)
+			[ -z "$DRIVE" ] || fail "$USAGE; the drive-backup flag is given twice: $*" 2
+			if [ "$arg" = --drive-backup ]; then DRIVE=on; else DRIVE=off; fi ;;
 		--control-root=verified)
 			[ -z "$CONTROL" ] || fail "$USAGE; the control-root flag is given twice: $*" 2
 			CONTROL=verified ;;
@@ -161,6 +181,10 @@ if { [ "$REPORT" = off ] && { [ "$CHAOS" = on ] || [ "$SWEEP" = on ] || [ "$TICK
 	|| { [ "$REPORT" = on ] && { [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ]; }; }; then
 	fail "$USAGE; an =off form stops a job and exits, so it cannot be combined with a flag that installs one; got: $*" 2
 fi
+if { [ "$DRIVE" = off ] && { [ "$CHAOS" = on ] || [ "$SWEEP" = on ] || [ "$TICK" = on ] || [ "$REPORT" = on ]; }; } \
+	|| { [ "$DRIVE" = on ] && { [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ] || [ "$REPORT" = off ]; }; }; then
+	fail "$USAGE; an =off form stops a job and exits, so it cannot be combined with a flag that installs one; got: $*" 2
+fi
 
 CHAOS_LABEL="com.agent-system-2.chaos"
 CHAOS_TEMPLATE="$REPO/install/$CHAOS_LABEL.plist"
@@ -178,6 +202,14 @@ REPORT_LABEL="com.agent-system-2.daily-report"
 REPORT_TEMPLATE="$REPO/install/$REPORT_LABEL.plist"
 REPORT_PLIST="$LAUNCH_AGENTS/$REPORT_LABEL.plist"
 REPORT_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/self-heal"
+DRIVE_LABEL="com.agent-system-2.drive-backup"
+DRIVE_TEMPLATE="$REPO/install/$DRIVE_LABEL.plist"
+DRIVE_PLIST="$LAUNCH_AGENTS/$DRIVE_LABEL.plist"
+DRIVE_CHECK_LABEL="com.agent-system-2.drive-backup-check"
+DRIVE_CHECK_TEMPLATE="$REPO/install/$DRIVE_CHECK_LABEL.plist"
+DRIVE_CHECK_PLIST="$LAUNCH_AGENTS/$DRIVE_CHECK_LABEL.plist"
+# The state dir backup-nightly.zsh and check-backup-fresh.zsh default to for this HOME; both jobs log there.
+DRIVE_STATE="$HOME/agent-scratch/agent-system-2.0/drive-backup/state"
 
 # An =off form: stop the job and delete its plist (job_off NAME LABEL PLIST), then exit, before anything
 # else runs. It reads no manifest, needs no bun, and writes nothing but the plist removal. It fails
@@ -209,6 +241,15 @@ job_off() {
 	fi
 	step "$name off: no job loaded, no plist"
 }
+# The drive backup's two jobs go off together, the nightly job first; each job_off fails closed on its own.
+if [ "$DRIVE" = off ]; then
+	job_off "drive backup" "$DRIVE_LABEL" "$DRIVE_PLIST"
+	job_off "drive backup check" "$DRIVE_CHECK_LABEL" "$DRIVE_CHECK_PLIST"
+	if [ "$REPORT" != off ] && [ "$CHAOS" != off ] && [ "$SWEEP" != off ] && [ "$TICK" != off ]; then
+		step "nothing else was run or written"
+		exit 0
+	fi
+fi
 if [ "$REPORT" = off ]; then
 	job_off "daily report" "$REPORT_LABEL" "$REPORT_PLIST"
 	if [ "$CHAOS" != off ] && [ "$SWEEP" != off ] && [ "$TICK" != off ]; then
@@ -299,6 +340,26 @@ if [ "$REPORT" = on ]; then
 	[ -f "$REPORT_TEMPLATE" ] || fail "--daily-report: no template at $REPORT_TEMPLATE" 2
 	REPORT_BUN="$(type -P bun)" || fail "--daily-report: bun not found on PATH" 2
 	case "$REPORT_BUN" in /*) ;; *) REPORT_BUN="$PWD/$REPORT_BUN" ;; esac
+fi
+
+# --drive-backup is checked here too, before anything is written: launchd is macOS only. The jobs run bun (absolute, the
+# needs-you writer surface/scripts/drive-backup-notice.ts) and call /usr/bin/sqlite3, /usr/bin/jq and /usr/bin/perl by
+# those paths (jq ships with macOS 15 and later only; Apple marks perl deprecated), so a missing one refuses the flag
+# rather than writing a job whose every night fails. AS2_KEEP_LOCAL comes from this installer's environment.
+if [ "$DRIVE" = on ]; then
+	[ "$(uname -s)" = Darwin ] || fail "--drive-backup is a launchd job; this is not macOS" 2
+	[ -f "$DRIVE_TEMPLATE" ] || fail "--drive-backup: no template at $DRIVE_TEMPLATE" 2
+	[ -f "$DRIVE_CHECK_TEMPLATE" ] || fail "--drive-backup: no template at $DRIVE_CHECK_TEMPLATE" 2
+	DRIVE_BUN="$(type -P bun)" || fail "--drive-backup: bun not found on PATH; the jobs' needs-you writer (surface/scripts/drive-backup-notice.ts) runs on it" 2
+	case "$DRIVE_BUN" in /*) ;; *) DRIVE_BUN="$PWD/$DRIVE_BUN" ;; esac
+	for tool in /usr/bin/sqlite3 /usr/bin/jq /usr/bin/perl; do
+		[ -x "$tool" ] || fail "--drive-backup: $tool is missing or not executable; install/drive-backup/backup-nightly.zsh and check-backup-fresh.zsh run it by that path" 2
+	done
+	case "${AS2_KEEP_LOCAL:-0}" in
+		0) DRIVE_KEEP_LOCAL=0 DRIVE_KEEP_SAYS="a local archive is deleted once its Drive copy is proven twice and read back" ;;
+		1) DRIVE_KEEP_LOCAL=1 DRIVE_KEEP_SAYS="upload and prove, never delete" ;;
+		*) fail "--drive-backup: AS2_KEEP_LOCAL is '$AS2_KEEP_LOCAL'; it must be unset or 0 (delete a local archive once its Drive copy is proven) or 1 (upload and prove, never delete); nothing written" 2 ;;
+	esac
 fi
 
 # --train-tick is checked here too, before anything is written (PLAN wl-mv8s8srodefytc rev 17.1 D10 F15): the tick runs gh,
@@ -746,6 +807,17 @@ if [ "$REPORT" = on ]; then
 	load_job "daily report" "$REPORT_LABEL" "$REPORT_TEMPLATE" "$REPORT_PLIST" "$REPORT_LOG_DIR" \
 		"BUN=$REPORT_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS" "PROFILE=$PROFILE_NAME"
 	step "daily report loaded: runs daily at 07:00 local time; reports and log in $REPORT_LOG_DIR; turn off with: bash install/install.sh --daily-report=off"
+fi
+
+# ---- 6d4. the nightly Google Drive backup (--drive-backup only) -----------------------------------
+# Only with the flag, the same way as 6c: the nightly job and its 9 AM check, both carrying the ledger this install wrote
+# (the needs-you writer's) and logging to the state dir the scripts default to. Reversal: bash install/install.sh --drive-backup=off.
+if [ "$DRIVE" = on ]; then
+	load_job "drive backup" "$DRIVE_LABEL" "$DRIVE_TEMPLATE" "$DRIVE_PLIST" "$DRIVE_STATE" \
+		"BUN=$DRIVE_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS" "STATE=$DRIVE_STATE" "KEEP_LOCAL=$DRIVE_KEEP_LOCAL"
+	load_job "drive backup check" "$DRIVE_CHECK_LABEL" "$DRIVE_CHECK_TEMPLATE" "$DRIVE_CHECK_PLIST" "$DRIVE_STATE" \
+		"BUN=$DRIVE_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS" "STATE=$DRIVE_STATE"
+	step "drive backup loaded: backup-nightly.zsh runs nightly at 02:30 and check-backup-fresh.zsh daily at 09:00 local time; AS2_KEEP_LOCAL=$DRIVE_KEEP_LOCAL ($DRIVE_KEEP_SAYS); state and logs in $DRIVE_STATE; turn off with: bash install/install.sh --drive-backup=off"
 fi
 
 # ---- 6e. Phoenix, on by default (wl-mv65t5d34lts00 PLAN.md § 8.1) ------------------------------------

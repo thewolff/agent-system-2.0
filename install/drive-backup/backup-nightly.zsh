@@ -54,8 +54,11 @@
 #   - never deletes without a re-proved receipt, never deletes or overwrites anything on Drive
 #   - every real run writes last-run.json (start, end, result, counts, failures, alert delivery), success or not
 #
+# State: $HOME/agent-scratch/agent-system-2.0/drive-backup/state (created if missing; launchd's log goes there too, the
+#   plist written by install/install.sh --drive-backup), claims: $HOME/agent-scratch/agent-system-2.0/drive-backup/claims
+#   (on the archive root's volume, outside any checkout), so a manual run and the launchd job share them.
 # Overrides (tests only): AS2_DRIVE_ROOT, AS2_DRIVEFS_DB, AS2_ARCHIVE_ROOT, AS2_CLAIMS, AS2_LEDGER_DB, AS2_LOG
-#   (state files live next to it), AS2_ALERT_CMD, AS2_ALERT_FALLBACK, AS2_NO_ALERT=1, AS2_SKIP_APP_CHECK=1,
+#   (state files live next to it instead), AS2_ALERT_CMD, AS2_ALERT_FALLBACK, AS2_NO_ALERT=1, AS2_SKIP_APP_CHECK=1,
 #   AS2_PROOF_TIMEOUT, AS2_PROOF_POLL, AS2_CLAIM_QUIET, AS2_REPROVE_AFTER, AS2_T_SHORT, AS2_T_LONG (seconds),
 #   AS2_SERVER_READ_CMD, AS2_T_SERVER_READ, AS2_TMPDIR, AS2_UNDER_LAUNCHD=1 (plists set it), AS2_ENVELOPE_FLOOR (bytes).
 # Test seams, each a no-op when unset: AS2_RUNSTAMP (the run stamp, YYYYMMDDTHHMMSS, so runs in one second get
@@ -82,8 +85,10 @@ case "${1:-}:$#" in
 esac
 MODE_LABEL=$MODE
 
-LOG=${AS2_LOG:-$HERE/backup-nightly.log}
+LOG=${AS2_LOG:-$HOME/agent-scratch/agent-system-2.0/drive-backup/state/backup-nightly.log}
 STATE=${LOG:h}
+[[ -d $STATE ]] || /bin/mkdir -p -m 700 -- "$STATE" \
+  || { print -u2 -r -- "backup-nightly.zsh: cannot create the state dir $STATE (mkdir failed, its error is above); nothing done, no last-run.json written"; exit 1 }
 HEARTBEAT=$STATE/last-run.json
 PROGRESS=$STATE/progress.json
 [[ $MODE == run ]] || PROGRESS=""
@@ -93,7 +98,7 @@ FIRST_RUN=$STATE/first-run-epoch
 ROOT_SEEN=$STATE/archive-root-seen
 LEDGER_RECEIPTS=$STATE/ledger-snapshots.tsv
 RECEIPTS=$STATE/receipts
-CLAIMS=${AS2_CLAIMS:-$HERE/claims}
+CLAIMS=${AS2_CLAIMS:-$HOME/agent-scratch/agent-system-2.0/drive-backup/claims}
 ARCHIVE_ROOT=${AS2_ARCHIVE_ROOT:-/Users/jowolff/agent-scratch/agent-system-2.0/scratch-archive}
 LEDGER_DB=${AS2_LEDGER_DB:-$HOME/.agent-system-2/ledger.db}
 ALERT_CMD=${AS2_ALERT_CMD:-$HERE/quiet-alarm.zsh}
@@ -603,13 +608,13 @@ if [[ $MODE == run ]]; then
   if [[ -f $WATCHER_BEAT ]]; then
     wat=$($JQ -r '.at_epoch // empty' "$WATCHER_BEAT" 2>/dev/null)
     if [[ $wat != <-> ]]; then fail_item "$WATCHER_BEAT" watcher "last-check.json is unreadable or malformed"
-    elif (( EPOCHSECONDS - wat > 26*3600 )); then fail_item "$WATCHER_BEAT" watcher "check-backup-fresh.zsh has not run for over 26 h (is com.plumb.as2-drive-backup-check loaded?)"
+    elif (( EPOCHSECONDS - wat > 26*3600 )); then fail_item "$WATCHER_BEAT" watcher "check-backup-fresh.zsh has not run for over 26 h (is com.agent-system-2.drive-backup-check loaded?)"
     fi
     wal=$(alert_ack_problem "$WATCHER_BEAT" $EPOCHSECONDS $ALERT_ACK_WINDOW)
     [[ -n $wal ]] && fail_item "$WATCHER_BEAT" watcher-alert "the 9 AM check's alert: $wal"
   else
     first=$(<$FIRST_RUN)
-    (( EPOCHSECONDS - first > WATCHER_GRACE )) && fail_item "$WATCHER_BEAT" watcher "check-backup-fresh.zsh has never written last-check.json, $(( (EPOCHSECONDS - first) / 3600 )) h after the first backup run (is com.plumb.as2-drive-backup-check loaded?)"
+    (( EPOCHSECONDS - first > WATCHER_GRACE )) && fail_item "$WATCHER_BEAT" watcher "check-backup-fresh.zsh has never written last-check.json, $(( (EPOCHSECONDS - first) / 3600 )) h after the first backup run (is com.agent-system-2.drive-backup-check loaded?)"
   fi
 fi
 

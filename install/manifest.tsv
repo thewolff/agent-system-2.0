@@ -1305,6 +1305,9 @@ surface/test/drive-backup.test.ts	test	-
 install/drive-backup/test-alert.zsh	install	-
 surface/scripts/drive-backup-notice.ts	module	-
 surface/test/drive-backup-notice.test.ts	test	-
+# Its two launchd templates (migration/items/drive-backup-job.md): install.sh --drive-backup fills, writes and loads both.
+install/com.agent-system-2.drive-backup.plist	install	-
+install/com.agent-system-2.drive-backup-check.plist	install	-
 # Jev ranking, show-only first (migration/items/jev-ranking.md): the ranking, the as2_rank tool, the audit, the launch gate, the CLIs.
 surface/src/rank.ts	module	-
 surface/src/rank-audit.ts	module	-

@@ -2,7 +2,7 @@
 
 A nightly job that copies as2's archived scratch folders and a snapshot of the ledger to Google Drive, unchanged (no encryption, Jo's decision 2026-10-28). It removes a local scratch archive only after three things: Drive for desktop's own records prove the cloud copy on two separate nights at least 20 hours apart, the local copy Drive for desktop keeps has been evicted, and the Drive copy then reads back from Google's servers byte-identical. Small archives make that trip inside a nightly envelope (see "Small archives: the nightly envelope").
 
-Nothing here is loaded into launchd yet. Plumb loads both plists through its helper app after review.
+Two launchd jobs run it, installed and loaded from the repo with `bash install/install.sh --drive-backup` (see "Before the first run").
 
 ## Files
 
@@ -12,36 +12,54 @@ Nothing here is loaded into launchd yet. Plumb loads both plists through its hel
 | `lib.zsh` | Shared helpers: the deadline runner (`bounded`), progress receipts, the alert and its delivery check. |
 | `server-read.zsh` | Reads one Drive file from Google's servers: evicts the local copy, proves no complete local copy is left, reads it, checks that the read downloaded it, prints the sha256. |
 | `check-backup-fresh.zsh` | The outside watcher, run at 9 AM. Alerts when the nightly job didn't run, hung, failed, has no sign its alert was shown, or left archives behind. On Sundays it also runs the restore test. |
-| `com.plumb.as2-drive-backup.plist` | launchd job: runs `backup-nightly.zsh` nightly at 2:30 AM. |
-| `com.plumb.as2-drive-backup-check.plist` | launchd job: runs `check-backup-fresh.zsh` daily at 9:00 AM. |
+| `install/com.agent-system-2.drive-backup.plist` | launchd template (in the repo's `install/`): runs `backup-nightly.zsh` nightly at 2:30 AM. `install.sh --drive-backup` fills, writes and loads it. |
+| `install/com.agent-system-2.drive-backup-check.plist` | launchd template (in the repo's `install/`): runs `check-backup-fresh.zsh` daily at 9:00 AM. Installed with the nightly one. |
 | `test-fake-drive.zsh`, `test-fake-drive-*.zsh` | Self-tests against a fake Drive, a fake DriveFS database, a fake server read and stub alerts, in parts that each run alone: `test-fake-drive.zsh` (the core nights, restore by copy, `--verify-restore`; it runs `test-server-read.zsh` first), `-proofs` (adversarial proofs and bounded hangs), `-envelope` (small archives in envelopes), `-envelope-stops` (runs that stop part-way), `-regress` and `-regress-single` (round-6 upload-record regressions for envelopes and single archives), `-crash` and `-crash-late` (a run killed after each retirement step; the round-6 envelope failure text) and `-jobs` (setup failures, the 9 AM check, the ledger-only Sunday). Each part gets its own temp dir, which it leaves in place. |
 | `fake-drive-fixture.zsh` | The shared setup the fake-Drive parts source (fake Drive, fake DriveFS database and uploader, fake clock, alert stubs, helpers). Not a test itself. |
 | `test-server-read.zsh` | Fixtures for `server-read.zsh`: a copy of the real script with only `osascript`, `stat` and `shasum` stubbed, 17 cases (the round-3 and round-4 reviews' cases among them; case 17 holds a full copy in the cache for the whole drain wait, on the `AS2_CLOCK_CMD` fake clock). |
 
-Files the job writes next to itself:
+Files the jobs write in the state dir, `~/agent-scratch/agent-system-2.0/drive-backup/state/` (created if missing; a manual run and the launchd jobs use the same one; `AS2_LOG` moves it for tests):
 
-- logs: `backup-nightly.log`, `check-backup-fresh.log`, `alert-delivery.log`
+- logs: `backup-nightly.log`, `check-backup-fresh.log` (under launchd, the jobs' own output goes there too), `alert-delivery.log`
 - `last-run.json`, written by every real run whatever the outcome
 - `progress.json`: which step the current run is in, and that step's deadline
-- `last-verify.json` and `last-check.json`
+- `last-verify.json` and `last-check.json`. `last-check.json` `confirm` says what became of the morning confirmation: `written: <entry id>`, `skipped: AS2_BUN unset`, `failed: …`, or `not attempted: the check found problems`.
 - `alerts/<stamp>-<pid>.result`: quiet-alarm's exit status for each alert, written when the popup returns
 - `ledger-snapshots.tsv`: one receipt per proven ledger snapshot
-- `claims/<date>/<name>.d/`: archives the job has taken over and not yet deleted
-- `claims/envelopes/<date>/env-<run stamp>.e/`: an envelope of small archives not yet retired (`members`, `upload`, `receipt`, `attempts`, `stuck`)
 - `receipts/<date>/<name>/`: the record of each archive once it is offsite and deleted
 - `receipts/envelopes/<date>/env-<run stamp>.e/`: the record of each retired envelope, with its `members` list
 - `backup-nightly.lock`, `first-run-epoch`, `archive-root-seen`
 
+The claims dir, `~/agent-scratch/agent-system-2.0/drive-backup/claims/` (on the archive root's volume, outside any checkout; `AS2_CLAIMS` moves it for tests):
+
+- `claims/<date>/<name>.d/`: archives the job has taken over and not yet deleted
+- `claims/envelopes/<date>/env-<run stamp>.e/`: an envelope of small archives not yet retired (`members`, `upload`, `receipt`, `attempts`, `stuck`)
+
 ## Before the first run (Jo)
 
 1. Drive for desktop is running and signed in to jdwolff85@gmail.com in Stream files mode. The job expects `/Users/jowolff/Library/CloudStorage/GoogleDrive-jdwolff85@gmail.com/My Drive`.
-2. Check the setup without changing anything:
+2. Check the setup without changing anything, from the main checkout:
 
    ```
-   zsh /Users/jowolff/agent-scratch/agent-system-2.0/drive-backup/backup-nightly.zsh --dry-run
+   zsh install/drive-backup/backup-nightly.zsh --dry-run
    ```
 
-For a cautious first week, set `AS2_KEEP_LOCAL=1` in the nightly plist's `EnvironmentVariables`. The job then uploads and proves everything but never deletes.
+3. Install and load both jobs, from the main checkout, in Terminal (an agent's shell gets `Bootstrap failed: 5` from launchctl):
+
+   ```
+   AS2_KEEP_LOCAL=1 bash install/install.sh --drive-backup
+   launchctl kickstart gui/$(id -u)/com.agent-system-2.drive-backup
+   ```
+
+   The installer writes `~/Library/LaunchAgents/com.agent-system-2.drive-backup.plist` and `com.agent-system-2.drive-backup-check.plist` from the templates and loads both; its last step line names the schedule, the state dir, the `AS2_KEEP_LOCAL` value and the off command. The kickstart runs the nightly job once, now, so any macOS prompt for access to Drive's folders shows while you are at the screen. Its result is in `~/agent-scratch/agent-system-2.0/drive-backup/state/last-run.json`.
+
+`AS2_KEEP_LOCAL=1` is the cautious first weeks: the job uploads and proves everything but never deletes a local archive. Unset or `0` lets it delete a local archive once its Drive copy is proven on two nights and read back from Google's servers. Any other value is refused by the installer. To change it, run the install line again with the new value; the installer rewrites and reloads both plists. Until PR #396 lands the archive producer there is no archive root, so the nightly job backs up only the ledger.
+
+What the plists set (and the jobs read): `HOME`; `PATH=/usr/bin:/bin:/usr/sbin:/sbin` (each script then sets its own); `AS2_UNDER_LAUNCHD=1` (launchd writes the log, so the script does not copy its output there again); `AS2_BUN`, `AS2_REPO` and `AS2_LEDGER_DB` (the needs-you writer: the absolute bun, this checkout and the ledger the install used; with `AS2_BUN` unset, as in a manual run, the needs-you step is recorded as `skipped`); and, in the nightly plist only, `AS2_KEEP_LOCAL` (`0` or `1`). Both jobs have `AbandonProcessGroup` (the detached popup wrapper outlives the run) and `RunAtLoad` false.
+
+The installer refuses the flag (exit 2, nothing written) off macOS, without bun on PATH, without `/usr/bin/sqlite3`, `/usr/bin/jq` (macOS 15 and later) or `/usr/bin/perl`, or with a bad `AS2_KEEP_LOCAL`.
+
+To stop both jobs: `bash install/install.sh --drive-backup=off`. It boots both out and deletes both plists, and touches nothing else: the state dir, the claims and everything on Drive stay.
 
 The backups are not encrypted. Anyone with access to the Google account can read the archives and the ledger.
 
@@ -79,7 +97,7 @@ bytes=...
 first_proven_at=2026-10-28T02:31:12-0700
 reproven_at=2026-10-29T02:31:40-0700
 server_read_back=sha256 match after eviction
-receipt=/Users/jowolff/agent-scratch/agent-system-2.0/drive-backup/receipts/2026-10-27/wl-aaa.tar.gz/receipt
+receipt=/Users/jowolff/agent-scratch/agent-system-2.0/drive-backup/state/receipts/2026-10-27/wl-aaa.tar.gz/receipt
 ```
 
 Running it again is safe. Each step's state lives in the claim dir:
@@ -115,7 +133,7 @@ first_proven_at=...
 reproven_at=...
 server_read_back=envelope sha256 match (server-read.zsh)
 restore=tar -xf <envelope_drive_path> -C <dir> 2026-10-29/wl-tiny.tar.gz
-receipt=/Users/jowolff/agent-scratch/agent-system-2.0/drive-backup/receipts/2026-10-29/wl-tiny.tar.gz/receipt
+receipt=/Users/jowolff/agent-scratch/agent-system-2.0/drive-backup/state/receipts/2026-10-29/wl-tiny.tar.gz/receipt
 ```
 
 ## Proof of upload
@@ -215,7 +233,9 @@ Before replacing the live `~/.agent-system-2/ledger.db`, stop as2. Move the old 
 
 The job sends at most one alert per run. Every failure is also in `backup-nightly.log` and in the `failures` list of `last-run.json` (path, step, error). A real run writes `last-run.json` whatever the outcome, including an unplanned exit. Every external command runs under a deadline: 60 s for small steps, 5 min for eviction, 1 h for hashing, copying and reading back. A command past its deadline has its whole process group killed, and that archive counts as failed for the night. `progress.json` shows the current step and its deadline.
 
-**How an alert is known to be delivered.** Each alert starts quiet-alarm (a silent popup first; it speaks only on "Read it to me") and also sends a macOS notification. quiet-alarm exits 0 only after its popup was shown and answered, and 1 when the popup could not be shown. A detached wrapper writes that exit status to `alerts/<stamp>-<pid>.result` when quiet-alarm returns. A running process is never taken as delivery. The other job reads the result named in the state file:
+**The needs-you line.** While `com.agent-system-2.drive-backup-check.plist` is installed and no check entry (ok or failed) is newer than 30 h, Jo's needs-you list shows `Drive backup check missed: …`. If the check has never written an entry, the plist file's time is the baseline. The line does not expire; the next check entry clears it. On a clean run the 9 AM check writes `drive-backup: check ok` and records the result in last-check.json `confirm`. If that write fails, the check counts it as a problem and alerts.
+
+**How an alert goes out.** Each alert uses three channels, in the order set by the alarm rule (silent channels first, then a silent popup; nothing plays a sound until Jo asks for it). (1) A needs-you entry: `surface/scripts/drive-backup-notice.ts` writes `drive-backup: <nightly|check> failed <date> — <text> — <state file>` on the standing workload. Jo's needs-you list shows `Drive backup <job> failed <date>: <text> — <state file>` until the next clean 9 AM check writes `drive-backup: check ok`. The writer runs as `$AS2_BUN run $AS2_REPO/surface/scripts/drive-backup-notice.ts` on `$AS2_LEDGER_DB`, bounded to 60 s. With AS2_BUN unset (a manual run) the step is recorded as `skipped: AS2_BUN unset`. (2) A macOS notification, with no sound. (3) quiet-alarm's silent popup, which speaks only on "Read it to me". A broken channel never stops the next one. The state file's `alert` field records all three: `<popup>; notification rc <n>; needs-you <written: en-…|skipped: …|failed: …>`. The other job reports every failed channel. quiet-alarm exits 0 only after its popup was shown and answered, and 1 when the popup could not be shown. A detached wrapper writes that exit status to `alerts/<stamp>-<pid>.result` when quiet-alarm returns. A running process is never taken as delivery. The other job reads the result named in the state file:
 
 - `rc=0`: the popup was shown
 - any other `rc`, or an immediate failure: reported at once as "not delivered" or "the popup failed"
@@ -246,17 +266,21 @@ The job sends at most one alert per run. Every failure is also in `backup-nightl
 | The content cache can't be measured for the envelope threshold | Alert `envelope: … cannot work out the envelope threshold …` for each claimed archive not yet uploaded | Archives kept | Check Drive for desktop; `content_cache` belongs next to its metadata DB. |
 | An envelope on Drive is lost or corrupt after its members were deleted | The weekly restore test fails `verify-envelope-…` for the newest envelope; a restore by hand fails its sha256 check | Every small archive in that envelope is gone at once | This is why no member is deleted before the envelope's two-night proof, its server read-back sha256, and every member's own sha256 all hold. |
 | Ledger snapshot, gzip, copy or proof fails | Alert `ledger-<step>: …`; `"ledger": "failed"` | Live ledger untouched | The next night takes a new snapshot. |
-| The job never ran | 9 AM check alert `last nightly run ended N h ago … powered off at 2:30 AM (a sleeping Mac runs the job on wake), or launchd did not start it`, or `no last-run.json` | n/a | Check `launchctl print gui/$(id -u)/com.plumb.as2-drive-backup`. |
+| The job never ran | 9 AM check alert `last nightly run ended N h ago … powered off at 2:30 AM (a sleeping Mac runs the job on wake), or launchd did not start it`, or `no last-run.json` | n/a | Check `launchctl print gui/$(id -u)/com.agent-system-2.drive-backup`; reload both jobs with the install line in "Before the first run", with the same `AS2_KEEP_LOCAL`. |
 | The job is still running at 9 AM | Nothing, if it is inside its step deadline and started under 12 h ago (`last-check.json` has a note); an alert `is hung` or `running N h` otherwise | n/a | A hung run's step is in `progress.json`. |
 | Last night failed | 9 AM check alert: `last nightly run result is 'failure' … first: …` | See that night's alert | The same as the matching row above. |
 | The nightly alert was not shown | 9 AM check alert: `the nightly run's own alert: not delivered …`, `the popup failed …` or `no sign the popup was shown …` | n/a | Check `alert-delivery.log`, the `alerts/` result file and `quiet-alarm.zsh`. |
 | The 9 AM check's alert was not shown | Nightly alert `watcher-alert: the 9 AM check's alert: …` | n/a | Same as the row above. |
+| The needs-you entry was not written | 9 AM check alert `the nightly run's own alert: the needs-you entry was not written: …`, or nightly `watcher-alert: … the needs-you entry was not written: …` | n/a | Check AS2_BUN, AS2_REPO and AS2_LEDGER_DB in the plist, then run the writer by hand with the same arguments. |
+| The notification failed | `the notification failed: rc <n> (…)` in the other job's alert | n/a | Allow notifications for the job (System Settings > Notifications). |
+| The morning confirmation was not written | 9 AM check alert `the morning confirmation (drive-backup: check ok) was not written …` | n/a | As for the needs-you entry; the Drive backup line stays until a check ok lands. |
 | A public archive is older than 3 days (never claimed), with or without a marker | 9 AM check alert listing each path | Archive kept | Usually comes with a setup failure above. |
 | A claimed archive is older than 3 days and not deleted | 9 AM check alert listing each one (`STUCK`, `proven…`, `not proven yet`; an envelope member says `in envelope <dir>` and the envelope's state) | Archive kept | See the matching row above. |
 | The archive root has never existed 7 days after the first run | 9 AM check alert `has never existed` | n/a | No archive was ever made, or the path is wrong. |
 | The weekly restore test fails | Alert `as2 Drive restore test: … verify-<step>` | Nothing deleted | Treat the backup as unproven; copy the file back by hand (Restore above) and compare. Before the archive root is 7 days old with no archive yet, no archive receipt is a note in `last-verify.json` (`archive: not applicable: no archive made yet`), not this failure. |
-| The 9 AM watcher stopped running, never started, or its state is malformed | Nightly alert `watcher: …` | n/a | Load `com.plumb.as2-drive-backup-check`. |
+| The 9 AM watcher stopped running, never started, or its state is malformed | Nightly alert `watcher: …` | n/a | Check `launchctl print gui/$(id -u)/com.agent-system-2.drive-backup-check`; reload both jobs with the install line in "Before the first run", with the same `AS2_KEEP_LOCAL`. |
 | A state file can't be written | Alert `heartbeat: …` or `could not write last-check.json` | n/a | Check disk space and permissions. |
+| The state dir can't be created | The run stops before anything else with `cannot create the state dir …` on stderr (the Terminal on a manual run); under launchd no state file is written, so Jo's needs-you list shows `Drive backup check missed: …` after 30 h | Nothing touched | Check that `~/agent-scratch/agent-system-2.0/` is writable; the install line in "Before the first run" creates the dir. |
 
 What the job never does:
 

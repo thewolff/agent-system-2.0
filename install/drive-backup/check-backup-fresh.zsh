@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Outside watcher for the nightly Drive backup. launchd runs it at 9 AM (com.plumb.as2-drive-backup-check).
+# Outside watcher for the nightly Drive backup. launchd runs it at 9 AM (com.agent-system-2.drive-backup-check).
 #   zsh check-backup-fresh.zsh
 # Raises ONE alert listing every problem found if:
 #   - last-run.json is missing, unreadable, older than 26 h, its result is not "success", or its own alert has no
@@ -19,7 +19,9 @@
 # Writes last-check.json every run (before and after the weekly test); the nightly job reports it if it goes stale,
 # is malformed, or records an alert with a failed channel (alert_ack_problem; the watcher is watched).
 # Env from the plist: AS2_BUN, AS2_REPO, AS2_LEDGER_DB (the needs-you writer, lib.zsh needs_you_write).
-# Overrides (tests only): AS2_LOG (state dir = its directory), AS2_ARCHIVE_ROOT, AS2_CLAIMS, AS2_ALERT_CMD,
+# State: $HOME/agent-scratch/agent-system-2.0/drive-backup/state (created if missing), claims:
+#   $HOME/agent-scratch/agent-system-2.0/drive-backup/claims, the nightly job's own defaults.
+# Overrides (tests only): AS2_LOG (state dir = its directory instead), AS2_ARCHIVE_ROOT, AS2_CLAIMS, AS2_ALERT_CMD,
 #   AS2_ALERT_FALLBACK, AS2_ALERT_ACK, AS2_ALERT_ACK_WINDOW, AS2_NOW_EPOCH, AS2_FORCE_VERIFY=1, AS2_VERIFY_TIMEOUT, AS2_UNDER_LAUNCHD=1;
 #   the rest pass through to --verify-restore.
 
@@ -28,7 +30,9 @@ setopt no_unset pipe_fail extended_glob
 export PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
 HERE=${0:A:h}
-STATE=${AS2_LOG:+${AS2_LOG:h}}; STATE=${STATE:-$HERE}
+STATE=${AS2_LOG:+${AS2_LOG:h}}; STATE=${STATE:-$HOME/agent-scratch/agent-system-2.0/drive-backup/state}
+[[ -d $STATE ]] || /bin/mkdir -p -m 700 -- "$STATE" \
+  || { print -u2 -r -- "check-backup-fresh.zsh: cannot create the state dir $STATE (mkdir failed, its error is above); nothing checked, no last-check.json written"; exit 1 }
 CLOG=$STATE/check-backup-fresh.log
 HEARTBEAT=$STATE/last-run.json
 PROGRESS_FILE=$STATE/progress.json
@@ -36,7 +40,7 @@ CHECK_BEAT=$STATE/last-check.json
 FIRST_RUN=$STATE/first-run-epoch
 ROOT_SEEN=$STATE/archive-root-seen
 ARCHIVE_ROOT=${AS2_ARCHIVE_ROOT:-/Users/jowolff/agent-scratch/agent-system-2.0/scratch-archive}
-CLAIMS=${AS2_CLAIMS:-$HERE/claims}
+CLAIMS=${AS2_CLAIMS:-$HOME/agent-scratch/agent-system-2.0/drive-backup/claims}
 ALERT_CMD=${AS2_ALERT_CMD:-$HERE/quiet-alarm.zsh}
 ALERT_FALLBACK=${AS2_ALERT_FALLBACK:-/usr/bin/osascript}
 VERIFY_TIMEOUT=${AS2_VERIFY_TIMEOUT:-7200}
@@ -93,7 +97,7 @@ fi
 
 # 1. nightly heartbeat
 if [[ ! -f $HEARTBEAT ]]; then
-  (( RUNNING )) || problem "no $HEARTBEAT: the nightly backup has never finished a run here (is com.plumb.as2-drive-backup loaded?)"
+  (( RUNNING )) || problem "no $HEARTBEAT: the nightly backup has never finished a run here (is com.agent-system-2.drive-backup loaded?)"
 else
   end=$($JQ -r '.end_epoch // empty' "$HEARTBEAT" 2>/dev/null); res=$($JQ -r '.result // empty' "$HEARTBEAT" 2>/dev/null)
   if [[ $end != <-> || -z $res ]]; then
