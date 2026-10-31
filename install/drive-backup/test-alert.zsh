@@ -198,7 +198,8 @@ S=$T/s-hang; mkdir -p $S
 alert_in $S run AS2_BUN=$T/bun.zsh AS2_CLOCK_CMD="/bin/cat $T/clock" &
 apid=$!
 wait_for "the writer stub starting" '[[ -f $T/bun.started ]]' || bad "the hung writer stub started"
-print 1000061 > $T/clock
+# The alert's clock reader runs concurrently: publish by rename so it never reads a truncated, empty clock (R7-T2).
+print 1000061 > $T/clock.tmp && /bin/mv -f -- $T/clock.tmp $T/clock
 wait_for "the alert finishing after the bound" '[[ -f $S/alert.json ]]' || bad "the alert finished after the writer's bound"
 wait $apid
 popup_done $S/alert.json || bad "the popup stub ran"
