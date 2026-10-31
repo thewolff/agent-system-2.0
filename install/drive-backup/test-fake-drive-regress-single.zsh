@@ -5,7 +5,11 @@
 # ORIGINAL copy, with exactly one copy on the fake Drive. Then a copy that never proves goes STUCK after the third
 # failed night naming its Drive path, with no further copy; and a run killed between recording the upload and the copy
 # re-proves that path (never a new upload) until a person deletes the record. Nothing is deleted in this part
-# (AS2_REPROVE_AFTER is far away). The envelope cases are in test-fake-drive-regress.zsh. Setup: fake-drive-fixture.zsh.
+# (AS2_REPROVE_AFTER is far away). The failed copy is staged on the Drive folder (copy_fails_after_landing: cp's
+# extended-attribute step is refused on the new file), so it holds whether or not files carry com.apple.provenance
+# (Jo's Mac does, GitHub's hosted macOS runner does not); the setup is checked first and a Mac where cp still exits 0
+# there fails D2's setup check by name. The envelope cases are in test-fake-drive-regress.zsh. Setup:
+# fake-drive-fixture.zsh.
 #   zsh test-fake-drive-regress-single.zsh        prints PASS/FAIL lines, ends with "RESULT: <n> failure(s)", exits n
 emulate -L zsh
 setopt no_unset pipe_fail extended_glob
@@ -28,7 +32,7 @@ night "D night 3: the uploader recovered"
 check "D night 3: the original copy is proven; no new upload; exactly one copy on Drive" 'nofail wl-big1.tar.gz && [[ $(hb .counts.uploaded) == 0 && $(kvf $D1/receipt drive_path) == $D1OBJ && $(arch_copies 2026-11-04/wl-big1.tar.gz) == 1 ]]'
 
 print "\n### D2: a single large archive's copy lands but cp fails; the next night its path's existence check fails; the third night proves the same copy"
-copy_fails_after_landing "$SA/2026-11-05"
+check "D2 setup: the Drive folder lands a copy's bytes and then fails cp, also for a source with no extended attribute" 'copy_fails_after_landing "$SA/2026-11-05"'
 mk $ARCH/2026-11-05/wl-big2.tar.gz 90000
 upmode off
 # timing-under-test: proof deadline, AS2_PROOF_TIMEOUT=2 (fake clock: AS2_CLOCK_CMD)
