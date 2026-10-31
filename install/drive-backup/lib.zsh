@@ -114,17 +114,40 @@ needs_you_write() {
 #   1. the needs-you entry (needs_you_write, bounded 60 s): `<job> failed` for the job MODE_LABEL names, its state file
 #   2. the macOS notification, soundless (no `sound name`, the merge train's form), bounded 15 s
 #   3. quiet-alarm's silent popup, with a positive delivery signal. quiet-alarm shows a popup and blocks until Jo answers
-#      it; it exits 0 only after the popup was shown (a button, Dismiss, or give-up) and 1 when the popup could not be
-#      shown. A detached wrapper records that exit status in $STATE/alerts/<id>.result when quiet-alarm returns, so:
-#        result rc=0         the popup was displayed (the positive signal)
-#        result rc!=0        the popup failed
-#        no result yet       not known: shown and waiting, or stalled before showing
+#      it; it exits 0 only after the popup was shown (a button, Dismiss, or give-up) and any sound Jo asked for played,
+#      1 when the popup could not be shown, and 3 when the popup was shown, Jo picked "Read it to me" and the sound or
+#      speech failed (its `quiet-alarm: audio FAILED: …` line names both commands). A detached wrapper records that exit
+#      status and quiet-alarm's output in $STATE/alerts/<id>.result when quiet-alarm returns; popup_result reads it:
+#        result rc=0                          the popup was displayed (the positive signal)
+#        result rc=3 with the audio line      the popup was displayed; the read-aloud Jo asked for failed
+#        result any other rc                  the popup failed
+#        no result yet                        not known: shown and waiting, or stalled before showing
 #      Process liveness is never taken as delivery.
 # A broken channel never stops the next one. ALERT_STATUS records all three as `<popup>; notification rc <n>[ (<output>)];
 # needs-you <NEEDS_YOU_STATUS>`: the popup's part leads (alert_ack_problem and the fixtures read it there) and the needs-you
-# part is last (its output is the free text). ALERT_STATUS / ALERT_RESULT / ALERT_EPOCH go into the caller's state file; the
-# other job runs alert_ack_problem on them and reports every failed channel.
+# part is last (its output is the free text). The popup's part is `shown: …`, `audio failed: …`, `failed: …` or `sent: …`.
+# ALERT_STATUS / ALERT_RESULT / ALERT_EPOCH go into the caller's state file; the other job runs alert_ack_problem on them and
+# reports every failed channel.
 ALERT_STATUS=none ALERT_RESULT="" ALERT_EPOCH=0
+
+# popup_result <result file>: sets POPUP_RESULT from the wrapper's record (rc=<n>, at_epoch=<n>, then quiet-alarm's output):
+#   shown                                   rc=0
+#   audio-failed <the audio FAILED line>    rc=3 and quiet-alarm's `quiet-alarm: audio FAILED: ` line (a stub's own exit 3
+#                                           without that line is a popup failure)
+#   failed <the rc line>                    anything else, an empty or unreadable file included
+POPUP_RESULT=""
+popup_result() {
+  local -a rl; local l
+  rl=( "${(@f)$(<$1)}" )
+  if [[ ${rl[1]:-} == rc=0 ]]; then POPUP_RESULT=shown; return 0; fi
+  if [[ ${rl[1]:-} == rc=3 ]]; then
+    for l in $rl; do
+      [[ $l == 'quiet-alarm: audio FAILED: '* ]] && { POPUP_RESULT="audio-failed ${l//[[:cntrl:]]/ }"; return 0 }
+    done
+  fi
+  POPUP_RESULT="failed ${rl[1]:-empty result}"
+}
+
 alert() { # <title> <popup> <spoken>
   local alog=$STATE/alert-delivery.log adir=$STATE/alerts id res job=nightly st=$STATE/last-run.json text=$2 fo frc=0
   info "ALERT: $1 / $2"
@@ -166,10 +189,13 @@ alert() { # <title> <popup> <spoken>
     elif [[ -n $ack_end ]]; then
       while [[ ! -f $res ]] && clock_now && (( CLOCK_NOW < ack_end )); do zselect -t 5; done
     fi
-    if [[ -f $res && $(<$res) != rc=0* ]]; then
-      ALERT_STATUS="failed: the popup could not be shown ($res)"
-    elif [[ -f $res ]]; then
-      ALERT_STATUS="shown: popup answered ($res)"
+    if [[ -f $res ]]; then
+      popup_result $res
+      case $POPUP_RESULT in
+        shown) ALERT_STATUS="shown: popup answered ($res)" ;;
+        audio-failed*) ALERT_STATUS="audio failed: the popup was shown and Jo picked Read it to me, but ${POPUP_RESULT#audio-failed quiet-alarm: audio FAILED: } ($res)" ;;
+        *) ALERT_STATUS="failed: the popup could not be shown ($res)" ;;
+      esac
     else
       ALERT_STATUS="sent: awaiting the popup's result in $res"
     fi
@@ -181,8 +207,9 @@ alert() { # <title> <popup> <spoken>
 
 # alert_ack_problem <state json> <now epoch> <window seconds>: prints every problem with the alert recorded in that file
 # (joined by "; "), or nothing. Problems: the needs-you entry was not written; the notification failed; the popup's delivery
-# failed at once, the popup reported a failure, or no popup result after the window. A skipped needs-you entry (AS2_BUN
-# unset: a manual run) is not a problem; it is in the file.
+# failed at once, the popup reported a failure, or no popup result after the window; the popup was shown but the read-aloud
+# Jo picked failed (quiet-alarm exit 3, recorded at once as `audio failed: …` or found later in the result file). A skipped
+# needs-you entry (AS2_BUN unset: a manual run) is not a problem; it is in the file.
 alert_ack_problem() {
   local al res ep part
   local -a probs
@@ -199,10 +226,16 @@ alert_ack_problem() {
   fi
   if [[ $al == failed* ]]; then
     probs+=( "not delivered: ${al%%; notification rc *}" )
+  elif [[ $al == 'audio failed:'* ]]; then
+    probs+=( "the read-aloud failed: ${${al%%; notification rc *}#audio failed: }" )
   elif [[ -n $res ]]; then
     if [[ -f $res ]]; then
-      local -a rl; rl=( "${(@f)$(<$res)}" )
-      [[ ${rl[1]:-} == rc=0 ]] || probs+=( "the popup failed (${rl[1]:-empty result}; see $res)" )
+      popup_result $res
+      case $POPUP_RESULT in
+        shown) ;;
+        audio-failed*) probs+=( "the read-aloud failed: the popup was shown and Jo picked Read it to me, but ${POPUP_RESULT#audio-failed quiet-alarm: audio FAILED: } (see $res)" ) ;;
+        *) probs+=( "the popup failed (${POPUP_RESULT#failed }; see $res)" ) ;;
+      esac
     else
       [[ $ep == <-> ]] || ep=0
       (( $2 - ep > $3 )) && probs+=( "no sign the popup was shown: no result in $res $(( ($2 - ep) / 3600 )) h after it was sent (stalled before showing, or still open and unanswered)" )

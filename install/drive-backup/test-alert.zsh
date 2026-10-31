@@ -5,9 +5,12 @@
 #   - a needs-you writer that fails or hangs is named in the state file, the notification and popup still go, and the
 #     other job reports it; AS2_BUN unset records `skipped: AS2_BUN unset`, never nothing
 #   - the check job writes `check ok` on a clean run and `check failed` (through its alert) on a problem
+#   - the real quiet-alarm.zsh: "Read it to me" whose sound or speech fails is recorded as `audio failed: …` and reported by
+#     the other job; with them working, or after Dismiss (silent), it is a delivered popup (final review F1)
 # Stubs stand in for every channel and log each call, in call order, to $T/calls.log: $T/bun.zsh for $AS2_BUN (the
 # writer; $T/bun.mode = ok | fail | hang), $T/osascript.zsh for the notification ($T/osascript.mode = ok | fail) and
-# $T/popup.zsh for quiet-alarm. Nothing real is touched: no ledger, no notification, no popup, no launchd.
+# $T/popup.zsh for quiet-alarm, or quiet-alarm's own osascript, afplay and say ($T/popup-osa.zsh, $T/afplay.zsh, $T/say.zsh)
+# in the F1 section. Nothing real is touched: no ledger, no notification, no popup, no sound, no launchd.
 #   zsh test-alert.zsh        prints PASS/FAIL lines, ends with "RESULT: <n> failure(s)", exits n
 # Deterministic (Jo's timing rule, decision log 2026-10-28--0840): no fixed waits. AS2_ALERT_ACK=0, so the alert does not
 # wait for the popup's result; the suite waits on the popup stub's own log line and result file (wait_for, a failure-only
@@ -244,6 +247,76 @@ check "the popup stub moved the clock before the alert's next read, and the gate
   '[[ -f $T/popup-holds.advanced && $(<$T/clock) == 1001000 && ! -e $T/gate.timeout ]]'
 check "the alert's window ended on the moved clock: the popup is sent, its result still awaited" \
   '[[ $(st .alert $S) == "sent: awaiting the popup'"'"'s result in "*"; notification rc 0; needs-you written: "* ]]'
+
+print "\n### the real quiet-alarm.zsh: Read it to me with a failing sound and speech is not a delivered alarm (final review F1)"
+# quiet-alarm.zsh itself runs here, through its test seams: QUIET_ALARM_OSASCRIPT ($T/popup-osa.zsh answers the popup with
+# $T/popup.choice), QUIET_ALARM_AFPLAY ($T/afplay.zsh) and QUIET_ALARM_SAY ($T/say.zsh), each failing with its own stderr
+# when $T/audio.mode is fail. No popup, sound or speech is real: PATH also leads with $T/no-audio-bin, whose afplay and say
+# only log REAL-AFPLAY / REAL-SAY and exit 97, so a quiet-alarm that bypassed its seams (a0aea9cf's ran bare `afplay` and
+# `say`) plays nothing and shows in the call order. The fake clock stays at 1000000 and is never moved, so the alert's 1 s
+# result window stays open until the popup's result file is there: the alert waits on that real event (the suite's wait is
+# a failure-only guard, and on a miss it moves the clock past the window to end the alert).
+cat > $T/popup-osa.zsh <<EOF
+#!/bin/zsh
+print -r -- "POPUP \$2" >> $T/calls.log
+print -r -- "\$(<$T/popup.choice)"
+EOF
+cat > $T/afplay.zsh <<EOF
+#!/bin/zsh
+print -r -- "AFPLAY \$*" >> $T/calls.log
+[[ \$(<$T/audio.mode) == ok ]] || { print -u2 "Error: AudioFileOpen failed ('wht?')"; exit 1 }
+EOF
+cat > $T/say.zsh <<EOF
+#!/bin/zsh
+print -r -- "SAY \$*" >> $T/calls.log
+[[ \$(<$T/audio.mode) == ok ]] || { print -u2 "say: Opening output device failed: -54"; exit 2 }
+EOF
+mkdir -p $T/no-audio-bin || exit 99
+for c in afplay say; do
+  print -l '#!/bin/zsh' "print -r -- \"REAL-${(U)c} \$*\" >> $T/calls.log; exit 97" > $T/no-audio-bin/$c
+done
+chmod +x $T/popup-osa.zsh $T/afplay.zsh $T/say.zsh $T/no-audio-bin/afplay $T/no-audio-bin/say
+# real_alarm <state dir>: one run-mode alert through the real quiet-alarm.zsh, held open on the result as above.
+real_alarm() {
+  print 1000000 > $T/clock
+  alert_in $1 run AS2_BUN=$T/bun.zsh AS2_ALERT_CMD=$HERE/quiet-alarm.zsh AS2_ALERT_ACK=1 AS2_CLOCK_CMD="/bin/cat $T/clock" \
+    QUIET_ALARM_OSASCRIPT=$T/popup-osa.zsh QUIET_ALARM_AFPLAY=$T/afplay.zsh QUIET_ALARM_SAY=$T/say.zsh PATH=$T/no-audio-bin:$PATH &
+  local p=$!
+  if ! wait_for "the alert recording the popup's result in $1/alert.json" "[[ -f $1/alert.json ]]"; then
+    bad "the alert in $1 returned once quiet-alarm's result was there"
+    print 2000000 > $T/clock.tmp && /bin/mv -f -- $T/clock.tmp $T/clock
+  fi
+  wait $p
+}
+print ok > $T/bun.mode
+
+print "Read it to me" > $T/popup.choice; print fail > $T/audio.mode; : > $T/calls.log
+S=$T/s-audio-fail; mkdir -p $S; real_alarm $S
+check "the popup, then the Glass sound and the speech of the spoken text, each tried after Read it to me" \
+  '[[ $(channels) == "NEEDSYOU NOTIFICATION POPUP AFPLAY SAY" ]] && grep -qx "AFPLAY /System/Library/Sounds/Glass.aiff" $T/calls.log && grep -qx "SAY The as2 Drive backup has 2 failures." $T/calls.log'
+check "quiet-alarm exits 3 with one line naming both commands, their exit status and their stderr" \
+  '[[ $(sed -n 1p $(st .alert_result $S)) == rc=3 ]] && grep -qxF "quiet-alarm: audio FAILED: afplay rc 1 (Error: AudioFileOpen failed ('"'"'wht?'"'"')); say rc 2 (say: Opening output device failed: -54)" $(st .alert_result $S)'
+check "the state file's alert field names the audio failure, not a delivered popup" \
+  '[[ $(st .alert $S) == "audio failed: the popup was shown and Jo picked Read it to me, but afplay rc 1 ("*"); say rc 2 ("*"-54) ($S/alerts/"*".result); notification rc 0; needs-you written: "* ]]'
+check "the other job reports it as the read-aloud failing" \
+  '[[ $(source $HERE/lib.zsh; alert_ack_problem $S/alert.json $NOW 21600) == "the read-aloud failed: the popup was shown and Jo picked Read it to me, but afplay rc 1 ("*"); say rc 2 ("*"-54) ($S/alerts/"*".result)" ]]'
+$JQ --arg a "sent: awaiting the popup's result in $(st .alert_result $S); notification rc 0; needs-you written: en-stub1" '.alert = $a' $S/alert.json > $S/alert-sent.json
+check "an alert recorded as sent, whose result later says the audio failed, is reported the same way from the result file" \
+  '[[ $(source $HERE/lib.zsh; alert_ack_problem $S/alert-sent.json $NOW 21600) == "the read-aloud failed: the popup was shown and Jo picked Read it to me, but afplay rc 1 ("*"); say rc 2 ("*"-54) (see $S/alerts/"*".result)" ]]'
+print -l rc=3 at_epoch=$NOW "alert-holds.zsh: the popup was never answered" > $S/stub-exit3.result
+$JQ --arg r $S/stub-exit3.result --arg a "sent: awaiting the popup's result in $S/stub-exit3.result; notification rc 0; needs-you written: en-stub1" '.alert = $a | .alert_result = $r' $S/alert.json > $S/alert-exit3.json
+check "an exit 3 without quiet-alarm's audio line (a stub's own guard) stays a popup failure" \
+  '[[ $(source $HERE/lib.zsh; alert_ack_problem $S/alert-exit3.json $NOW 21600) == "the popup failed (rc=3; see $S/stub-exit3.result)" ]]'
+
+print ok > $T/audio.mode; : > $T/calls.log
+S=$T/s-audio-ok; mkdir -p $S; real_alarm $S
+check "Read it to me with the sound and speech working: rc=0, shown, nothing for the other job to report" \
+  '[[ $(channels) == "NEEDSYOU NOTIFICATION POPUP AFPLAY SAY" && $(sed -n 1p $(st .alert_result $S)) == rc=0 && $(st .alert $S) == "shown: popup answered ($S/alerts/"*"; notification rc 0; needs-you written: "* && -z $(source $HERE/lib.zsh; alert_ack_problem $S/alert.json $NOW 21600) ]]'
+
+print "Dismiss (no voice)" > $T/popup.choice; print fail > $T/audio.mode; : > $T/calls.log
+S=$T/s-audio-dismiss; mkdir -p $S; real_alarm $S
+check "Dismiss stays silent (no afplay, no say) and is a delivered popup" \
+  '[[ $(channels) == "NEEDSYOU NOTIFICATION POPUP" && $(sed -n 1p $(st .alert_result $S)) == rc=0 && $(st .alert $S) == "shown: popup answered ("* && -z $(source $HERE/lib.zsh; alert_ack_problem $S/alert.json $NOW 21600) ]]'
 
 print "\nRESULT: $FAILS failure(s)"
 exit $FAILS
