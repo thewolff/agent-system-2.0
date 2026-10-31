@@ -103,8 +103,9 @@ describe("durable stop-on-red and interruption", () => {
 			expect(inspectProof(db, "tp-runtime").inputs.runtime.executor.exec).toBe("7".repeat(64));
 		} finally { db.close(); }
 	});
-	// TOOLS-REVIEW r2 R4: the runtime identity covers the measured policy and the OMP pin, never the non-executing refresh helper.
-	test("the runtime identity hashes resources.json and installed-omp.json, not refresh: a changed policy alone is a changed input, unchanged files are refused", () => {
+	// TOOLS-REVIEW r2 R4: the runtime identity covers the measured policy, never the non-executing refresh helper. TOOLS-REVIEW r3
+	// minor 1: the OMP pin is in the identity of an installed-OMP proof only; an isolated proof never reads it.
+	test("the runtime identity hashes resources.json, and installed-omp.json only in installed-OMP mode, never refresh: unchanged inputs are refused", () => {
 		const libexec = tmp("proof-runtime");
 		const install = (files: Record<string, string>) => { for (const [name, body] of Object.entries(files)) writeFileSync(join(libexec, name), body); };
 		install({ exec: "exec v1", bun: "bun v1", "test-exec.js": "bundle v1", "resources.json": "policy v1", refresh: "helper v1" });
@@ -121,20 +122,32 @@ describe("durable stop-on-red and interruption", () => {
 			const same = again("d", "infrastructure only");
 			expect(() => admitProof(db, "tp-same", same, at(same, "2"), 3)).toThrow("executes the same inputs as failed tp-red");
 			install({ refresh: "helper v2" });
-			expect(() => admitProof(db, "tp-helper", same, at(same, "2"), 3)).toThrow("installed runtime (exec, bun, test-exec.js, resources.json, installed-omp.json)");
+			expect(() => admitProof(db, "tp-helper", same, at(same, "2"), 3)).toThrow("installed runtime (exec, bun, test-exec.js, resources.json) the failure");
 			// Only resources.json changed: a different runtime, admitted with its diagnosis.
 			install({ "resources.json": "policy v2" });
 			const policy = again("e", "the measured resource policy changed");
 			admitProof(db, "tp-policy", policy, at(policy, "2"), 4);
 			expect(inspectProof(db, "tp-policy").inputs.runtime.executor["resources.json"]).not.toBe(inspectProof(db, "tp-red").inputs.runtime.executor["resources.json"]);
-			// Installing an OMP pin, or re-pinning it, is a new identity too.
-			const unpinned = at(policy, "2").runtime.identity;
+			finishProofIteration(db, "tp-policy", nextProofIteration(db, "tp-policy", "tr-policy", 5)!.index, { state: "failed", error: "assertion red", artifacts: "/evidence/tr-policy" });
+			// Isolated: installing an OMP pin, or re-pinning it, is no changed input, so the equivalent failed series is still refused.
+			const unpinned = at(policy, "2").runtime;
 			install({ "installed-omp.json": "pin v1" });
-			const pinned = at(policy, "2").runtime;
-			expect(Object.keys(pinned.executor)).toContain("installed-omp.json");
-			expect(pinned.identity).not.toBe(unpinned);
+			expect(at(policy, "2").runtime).toEqual(unpinned);
 			install({ "installed-omp.json": "pin v2" });
-			expect(at(policy, "2").runtime.identity).not.toBe(pinned.identity);
+			const repin = again("7", "infrastructure only: OMP was re-pinned");
+			expect(() => admitProof(db, "tp-repin", repin, at(repin, "2"), 6)).toThrow("executes the same inputs as failed tp-policy");
+			// Installed-OMP: the pin is hashed, an unchanged pin is refused, and a re-pin is a new identity admitted with its diagnosis.
+			const omp = (sha: string, diagnosis: string) => parseProofManifest({ ...fixture(), mode: "installed-OMP", candidateSha: sha.repeat(40), diagnosis });
+			const ompRed = omp("8", "the first installed-OMP run");
+			expect(Object.keys(at(ompRed, "2").runtime.executor)).toEqual(["bun", "exec", "installed-omp.json", "resources.json", "test-exec.js"]);
+			admitProof(db, "tp-omp", ompRed, at(ompRed, "2"), 7);
+			finishProofIteration(db, "tp-omp", nextProofIteration(db, "tp-omp", "tr-omp", 8)!.index, { state: "failed", error: "assertion red", artifacts: "/evidence/tr-omp" });
+			const ompSame = omp("9", "infrastructure only");
+			expect(() => admitProof(db, "tp-omp-same", ompSame, at(ompSame, "2"), 9)).toThrow("installed runtime (exec, bun, test-exec.js, resources.json, installed-omp.json) the failure");
+			install({ "installed-omp.json": "pin v3" });
+			const ompRepin = omp("a", "the pinned OMP runtime changed");
+			admitProof(db, "tp-omp-repin", ompRepin, at(ompRepin, "2"), 10);
+			expect(inspectProof(db, "tp-omp-repin").inputs.runtime.identity).not.toBe(inspectProof(db, "tp-omp").inputs.runtime.identity);
 		} finally { db.close(); }
 	});
 	test("a missing required runtime file, or an installed-OMP proof without its pin, refuses submission naming every file", () => {

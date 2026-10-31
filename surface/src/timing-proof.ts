@@ -187,22 +187,27 @@ export function executableTree(listing: string): string {
  * helper-only change is no changed input and opens no route past a failed series.
  */
 export const PROOF_RUNTIME_FILES = ["exec", "bun", "test-exec.js", RESOURCE_POLICY] as const;
-/** The pinned OMP runtime (root, tree sha-256, version): hashed whenever installed, so a re-pin is a new identity; an installed-OMP proof requires it. */
+/**
+ * The pinned OMP runtime (root, tree sha-256, version). Only an installed-OMP proof runs on it, so only that mode hashes and
+ * requires it (a re-pin is a new identity there); an isolated proof never reads it, so installing or re-pinning OMP is no
+ * changed input for an isolated series (TOOLS-REVIEW r3 minor 1).
+ */
 export const PROOF_OMP_PIN = "installed-omp.json";
-/** The sha-256 of each PROOF_RUNTIME_FILES file and, when installed, PROOF_OMP_PIN; every unreadable file is named in one error. */
+/** The runtime files a proof of `mode` runs under: PROOF_RUNTIME_FILES, plus PROOF_OMP_PIN in installed-OMP mode. */
+export function proofRuntimeFiles(mode: ProofManifest["mode"]): string[] {
+	return mode === "installed-OMP" ? [...PROOF_RUNTIME_FILES, PROOF_OMP_PIN] : [...PROOF_RUNTIME_FILES];
+}
+/** The sha-256 of each proofRuntimeFiles(mode) file; every missing or unreadable one is named in one error. */
 export function installedRuntimeHashes(libexec: string, mode: ProofManifest["mode"]): Record<string, string> {
 	const out: Record<string, string> = {};
 	const errors: string[] = [];
-	const hash = (name: string, required: boolean): void => {
+	for (const name of proofRuntimeFiles(mode)) {
 		const path = join(libexec, name);
 		try { out[name] = createHash("sha256").update(readFileSync(path)).digest("hex"); }
 		catch (error) {
-			if (!required && (error as NodeJS.ErrnoException).code === "ENOENT") return;
 			errors.push(`installed ${path} ${(error as NodeJS.ErrnoException).code === "ENOENT" ? `is missing${name === PROOF_OMP_PIN ? " (an installed-OMP proof runs only on a pinned runtime)" : ""}` : `is unreadable: ${errText(error)}`}`);
 		}
-	};
-	for (const name of PROOF_RUNTIME_FILES) hash(name, true);
-	hash(PROOF_OMP_PIN, mode === "installed-OMP");
+	}
 	if (errors.length) throw new Error(`timing-proof runtime identity: ${errors.join("; ")}; repair the install with install/as2test-setup.sh before submitting`);
 	return out;
 }
@@ -253,7 +258,7 @@ export function admitProof(db: Database, id: string, manifest: ProofManifest, in
 		if (unchanged) throw new Error(`timing-proof ${id}: failed candidate ${manifest.candidateSha} already observed in ${unchanged.id}; changing budgets, labels, diagnosis or workload is not a fix`);
 		const equivalent = prior.find((p) => p.inputs.candidate.tree === inputs.candidate.tree && p.inputs.runtime.identity === inputs.runtime.identity);
 		if (equivalent) {
-			throw new Error(`timing-proof ${id}: candidate ${manifest.candidateSha} executes the same inputs as failed ${equivalent.id} at ${equivalent.manifest.candidateSha} (executable tree ${inputs.candidate.tree}, runtime ${inputs.runtime.identity} over ${Object.keys(inputs.runtime.executor).join(", ")}); an empty commit, decision-log churn or a diagnosis is not a fix: change the code, dependencies or installed runtime (${[...PROOF_RUNTIME_FILES, PROOF_OMP_PIN].join(", ")}) the failure diagnosed`);
+			throw new Error(`timing-proof ${id}: candidate ${manifest.candidateSha} executes the same inputs as failed ${equivalent.id} at ${equivalent.manifest.candidateSha} (executable tree ${inputs.candidate.tree}, runtime ${inputs.runtime.identity} over ${Object.keys(inputs.runtime.executor).join(", ")}); an empty commit, decision-log churn or a diagnosis is not a fix: change the code, dependencies or installed runtime (${proofRuntimeFiles(manifest.mode).join(", ")}) the failure diagnosed`);
 		}
 		if (prior.length && !manifest.diagnosis) throw new Error(`timing-proof ${id}: prior red ${prior[0]!.id} requires a diagnosis and changed executable inputs`);
 		db.query("INSERT INTO timing_proofs (id, requestedAt, fingerprint, manifest, inputs, state) VALUES (?, ?, ?, ?, ?, 'admitted')").run(id, at, fingerprint, JSON.stringify(manifest), JSON.stringify(inputs));

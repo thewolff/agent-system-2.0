@@ -22,8 +22,8 @@ const LOAD_HARD_SLACK_MS = 5 * 60_000;
 
 /**
  * The executable identity of a series (F4): each pinned commit's tree fetched from the served origin, minus decision-log churn,
- * and the sha-256 of every installed runtime file (installedRuntimeHashes: the executor, its Bun, the measured resource policy and
- * the pinned OMP runtime when installed) with the proof mode.
+ * and the sha-256 of every installed runtime file the mode runs under (installedRuntimeHashes: the executor, its Bun, the measured
+ * resource policy and, for an installed-OMP proof only, the pinned OMP runtime) with the proof mode.
  */
 export function proofInputs(mirror: string, env: Record<string, string>, m: ProofManifest, libexec: string): ProofInputs {
 	const tree = (sha: string) => ({ sha, tree: executableTree(gitSync(mirror, ["ls-tree", "-r", "-z", "--full-tree", sha], env).toString()) });

@@ -5247,8 +5247,21 @@ describe("finite timing proofs on the exclusive runner", () => {
 				hooks: { base: { setup: [], cleanup: [] }, candidate: { setup: [], cleanup: [] } }, skipped: { base: [], candidate: [] } }],
 		});
 	}
-	/** The production submit path: the controller CLI, as a lane runs it. */
+	/**
+	 * The installed runtime files submission hashes into a proof's identity (installedRuntimeHashes), provisioned as synthetic
+	 * fixtures: `<libexec>/resources.json` is a copy of the synthetic policy the world's wrapper runs under, and an installed-OMP
+	 * proof gets a synthetic `<libexec>/installed-omp.json` pin. The world's wrapper reads its OMP pin beside the real Bun, never
+	 * this one, so the installed-OMP proof still fails closed on its executor. Rewriting the same bytes keeps the identity stable.
+	 */
+	function installProofRuntime(w: World, mode: ProofManifest["mode"]): void {
+		writeFileSync(join(w.libexec, "resources.json"), readFileSync(join(w.root, "resources.json")));
+		if (mode === "installed-OMP") {
+			writeFileSync(join(w.libexec, "installed-omp.json"), JSON.stringify({ root: join(w.root, "synthetic-omp"), treeSha256: "0".repeat(64), version: "synthetic test fixture only; no OMP installed" }));
+		}
+	}
+	/** The production submit path: the controller CLI, as a lane runs it, over the synthetic installed runtime. */
 	function submitRaw(w: World, m: ProofManifest) {
+		installProofRuntime(w, m.mode);
 		const path = join(w.root, "proof-manifest.json");
 		writeFileSync(path, JSON.stringify(m));
 		return Bun.spawnSync([process.execPath, PROOF_CLI, "submit", "--manifest", path], { env: w.env, stdout: "pipe", stderr: "pipe" });

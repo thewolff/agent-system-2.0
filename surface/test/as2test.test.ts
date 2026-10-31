@@ -3062,6 +3062,75 @@ describe("the refresh helper", () => {
 		expect(await until(() => alive().length === 0, 5_000)).toBe(true);
 	}, 240_000);
 
+	// TOOLS-REVIEW r3 minor 2: render-exec's stderr is streamed, not only captured, so a stop mid-render-exec loses none of it.
+	test("F2: render-exec's stderr reaches the refresh helper's stderr as it is written, and a TERM or the cap's ALRM mid-render-exec loses none of it", async () => {
+		const o = fixtureOrigin("f2-live");
+		const r = helperRig("f2-live", o);
+		expect(r.run()).toMatchObject({ exit: 0 });
+		const started = join(r.base, "render-exec.pid");
+		const said = "render-exec probe: written before render-exec stalls";
+		// main's render-exec writes one stderr line, records its pid, then blocks on a wait nothing ends: only the helper's stop ends it.
+		const stall = [
+			'import { writeFileSync as __wf } from "node:fs";',
+			'if (process.argv[2] === "render-exec") {',
+			`\tprocess.stderr.write(${JSON.stringify(`${said}\n`)});`,
+			`\t__wf(${JSON.stringify(started)}, String(process.pid));`,
+			"\tAtomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);",
+			"}",
+			"",
+		].join("\n");
+		o.commit({ [AS2]: stall + fixtureSources().get(AS2)! }, "a render-exec that stalls after one stderr line");
+		const installed = tree(r.libexec, ["refresh.d"]);
+		const before = buildDirs();
+		const children: number[] = [];
+		// SIGALRM is what the helper's cap watchdog sends it: sending it here takes the cap's path without waiting out a cap.
+		for (const [signal, says] of [["SIGTERM", "as2test-refresh: ended by a signal; nothing was installed"], ["SIGALRM", " s cap; nothing was installed"]] as const) {
+			rmSync(started, { force: true });
+			const p = Bun.spawn([join(r.libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: r.base, stdout: "pipe", stderr: "pipe" });
+			pids.push(p.pid);
+			let stderr = "";
+			const decoder = new TextDecoder();
+			const drained = (async () => { for await (const chunk of p.stderr) stderr += decoder.decode(chunk, { stream: true }); })();
+			// Live: the line is on the helper's stderr while render-exec still runs, before any stop.
+			expect(await until(() => stderr.includes(said) && existsSync(started) && readFileSync(started, "utf8") !== "", 90_000)).toBe(true);
+			children.push(Number(readFileSync(started, "utf8")));
+			pids.push(children.at(-1)!);
+			process.kill(p.pid, signal);
+			const [exit, stdout] = await Promise.all([p.exited, new Response(p.stdout).text(), drained]);
+			expect({ signal, exit, stdout }).toEqual({ signal, exit: 71, stdout: "" });
+			const lines = stderr.trim().split("\n");
+			expect(lines.filter((l) => l === said)).toHaveLength(1);
+			const stop = lines.findIndex((l) => l.includes(says));
+			expect(stop).toBeGreaterThan(lines.indexOf(said));
+			expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
+			expect(buildDirs().filter((d) => !before.includes(d))).toEqual([]);
+			expect(tree(r.libexec, ["refresh.d"])).toEqual(installed);
+		}
+		const alive = () => children.filter((pid) => {
+			try { process.kill(pid, 0); return true; }
+			catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; }
+		});
+		expect(await until(() => alive().length === 0, 5_000)).toBe(true);
+	}, 240_000);
+
+	// TOOLS-REVIEW r3 minor 3: an uncaught error ends with Bun's version line, which names no cause.
+	test("F2: render-exec dying uncaught gives the refresh helper's die line its error, never Bun's version line or a stack frame", () => {
+		const o = fixtureOrigin("f2-uncaught");
+		const r = helperRig("f2-uncaught", o);
+		expect(r.run()).toMatchObject({ exit: 0 });
+		const installed = tree(r.libexec, ["refresh.d"]);
+		const cause = "render-exec probe: an uncaught failure names its cause";
+		const sha = o.commit({ [AS2]: `if (process.argv[2] === "render-exec") throw new Error(${JSON.stringify(cause)});\n${fixtureSources().get(AS2)!}` }, "a render-exec that dies uncaught");
+		const out = r.run();
+		expect({ exit: out.exit, stdout: out.stdout }).toEqual({ exit: 71, stdout: "" });
+		const lines = out.stderr.trim().split("\n");
+		// Bun's version line and the stack frame streamed above the die line, which skips both.
+		expect(lines.filter((l) => /^Bun v\d/.test(l))).toHaveLength(1);
+		expect(lines.some((l) => /^\s+at /.test(l))).toBe(true);
+		expect(lines.at(-1)).toBe(`as2test-refresh: as2test.ts render-exec at ${sha} failed (exit 1): error: ${cause}`);
+		expect(tree(r.libexec, ["refresh.d"])).toEqual(installed);
+	}, 180_000);
+
 	test("T6: a TERM during a stalled staging install, a step that once ran in the foreground, exits 71 within seconds with no .new file, no build dir and the install unchanged; a second helper meanwhile waits on the lock and exits 69", async () => {
 		const o = fixtureOrigin("t6-stall");
 		const r = helperRig("t6-stall", o);
