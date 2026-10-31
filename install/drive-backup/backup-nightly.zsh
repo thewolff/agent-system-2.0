@@ -49,6 +49,9 @@
 #   (state files live next to it), AS2_ALERT_CMD, AS2_ALERT_FALLBACK, AS2_NO_ALERT=1, AS2_SKIP_APP_CHECK=1,
 #   AS2_PROOF_TIMEOUT, AS2_PROOF_POLL, AS2_CLAIM_QUIET, AS2_REPROVE_AFTER, AS2_T_SHORT, AS2_T_LONG (seconds),
 #   AS2_SERVER_READ_CMD, AS2_T_SERVER_READ, AS2_TMPDIR, AS2_UNDER_LAUNCHD=1 (plists set it), AS2_ENVELOPE_FLOOR (bytes).
+# Test seams, each a no-op when unset: AS2_RUNSTAMP (the run stamp, YYYYMMDDTHHMMSS, so runs in one second get
+#   distinct names), AS2_PROOF_POLL_HOOK (a command run before each proof pass), AS2_CLOCK_CMD (lib.zsh clock_now: a
+#   command printing the epoch seconds every in-run deadline reads).
 # Settings: AS2_KEEP_LOCAL=1 (upload and prove, never delete).
 
 emulate -L zsh
@@ -120,7 +123,13 @@ if [[ ${AS2_UNDER_LAUNCHD:-0} != 1 ]]; then
 fi
 
 START_TS=$(ts); START_EPOCH=$EPOCHSECONDS
-RUNSTAMP=$(strftime '%Y%m%dT%H%M%S' $EPOCHSECONDS)
+# AS2_RUNSTAMP (test seam): two test runs in one second need distinct Drive names; it keeps the real stamp's form.
+if [[ -n ${AS2_RUNSTAMP:-} ]]; then
+  [[ $AS2_RUNSTAMP == [0-9](#c8)T[0-9](#c6) ]] || { print -u2 -r -- "AS2_RUNSTAMP '$AS2_RUNSTAMP' is not YYYYMMDDTHHMMSS; nothing done"; exit 2 }
+  RUNSTAMP=$AS2_RUNSTAMP
+else
+  RUNSTAMP=$(strftime '%Y%m%dT%H%M%S' $EPOCHSECONDS)
+fi
 TODAY=$(strftime '%Y-%m-%d' $EPOCHSECONDS)
 
 # ---------- small bounded helpers (print the value, or the error and return nonzero) ----------
@@ -952,8 +961,14 @@ fi
 # ---------- phase 2: prove every new copy (one shared deadline, no re-uploads) ----------
 if [[ $MODE == run ]] && (( ${#P_KIND} )); then
   say_step "phase 2: proving ${#P_KIND} Drive copies (deadline ${PROOF_TIMEOUT}s)"
-  deadline=$(( EPOCHSECONDS + PROOF_TIMEOUT ))
+  # Deadlines read clock_now (lib.zsh). AS2_PROOF_POLL_HOOK (test seam) runs before each proof pass; a failing hook
+  # is a failure of the run, never ignored.
+  if clock_now; then deadline=$(( CLOCK_NOW_S + PROOF_TIMEOUT )); else deadline=0; fi
   while true; do
+    if [[ -n ${AS2_PROOF_POLL_HOOK:-} ]]; then
+      hook_out=$(bounded $T_SHORT "proof poll hook" /bin/zsh -fc "$AS2_PROOF_POLL_HOOK" 2>&1) \
+        || fail_item "$AS2_PROOF_POLL_HOOK" proof-hook "AS2_PROOF_POLL_HOOK failed: ${hook_out//$'\n'/; }"
+    fi
     left=0
     for i in {1..${#P_KIND}}; do
       [[ ${P_STATE[$i]} == pending ]] || continue
@@ -966,7 +981,7 @@ if [[ $MODE == run ]] && (( ${#P_KIND} )); then
       esac
     done
     (( left == 0 )) && break
-    if (( EPOCHSECONDS >= deadline )); then
+    if ! clock_now || (( CLOCK_NOW_S >= deadline )); then
       for i in {1..${#P_KIND}}; do [[ ${P_STATE[$i]} == pending ]] && P_STATE[$i]=timeout; done
       break
     fi

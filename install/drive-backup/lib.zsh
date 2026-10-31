@@ -25,18 +25,39 @@ progress() { # <step label> <deadline epoch or 0>
   write_file "$PROGRESS" "{\"pid\":$$,\"mode\":\"${MODE_LABEL:-}\",\"start_epoch\":${START_EPOCH:-0},\"step\":\"$l\",\"step_deadline_epoch\":$2,\"updated_epoch\":$EPOCHSECONDS}" || true
 }
 
+# Clock seam (tests): AS2_CLOCK_CMD, when set, is a command (eval'd in a subshell) that prints the current epoch
+# seconds. Every in-run deadline reads the clock through clock_now: bounded() below, backup-nightly.zsh's proof wait,
+# and, under the test clock only, the alert's result window (alert() keeps its fixed ALERT_ACK wait otherwise). A test
+# moves that clock past a deadline instead of waiting for it. Unset (every real run): CLOCK_NOW is $EPOCHREALTIME and
+# CLOCK_NOW_S $EPOCHSECONDS, which is what those deadlines read before the seam. When the command fails or prints
+# anything but seconds, clock_now prints why on stderr and returns 1, and the caller takes the deadline as reached: a
+# broken test clock ends a wait, it never hangs one.
+CLOCK_NOW=0 CLOCK_NOW_S=0
+clock_now() {
+  if [[ -z ${AS2_CLOCK_CMD:-} ]]; then CLOCK_NOW=$EPOCHREALTIME CLOCK_NOW_S=$EPOCHSECONDS; return 0; fi
+  local o rc
+  o=$(eval "$AS2_CLOCK_CMD" 2>&1); rc=$?
+  if (( rc == 0 )) && [[ $o == <->(|.<->) ]]; then CLOCK_NOW=$o CLOCK_NOW_S=${o%%.*}; return 0; fi
+  print -u2 -r -- "clock: AS2_CLOCK_CMD ($AS2_CLOCK_CMD) exited $rc and printed '${o//$'\n'/; }' instead of epoch seconds; the deadline counts as reached"
+  return 1
+}
+
 # bounded <seconds> <label> <command> [args...]
 # Runs one external command in its own process group (perl setpgrp, then exec). On expiry: SIGTERM to the
 # group, up to 2 s grace, SIGKILL, reap; returns 124 and prints "TIMEOUT ..." on stderr. Otherwise returns
-# the command's exit status. stdin and other open fds pass through.
+# the command's exit status. stdin and other open fds pass through. The expiry reads clock_now.
 bounded() {
   local t=$1 label=$2; shift 2
-  local deadline=$(( EPOCHSECONDS + t ))
+  local deadline=$(( EPOCHSECONDS + t )) start k rc
   progress "$label" $deadline
+  # The start is read before the child exists, so a test that waits for the child to block and then moves the clock
+  # can never have its move taken as the start.
+  clock_now || { print -u2 -r -- "TIMEOUT: $label was not started: its deadline clock could not be read"; return 124 }
+  start=$CLOCK_NOW
   /usr/bin/perl -e 'setpgrp(0,0) or die "setpgrp: $!\n"; exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n"' -- "$@" &
-  local pid=$! start=$EPOCHREALTIME k rc
+  local pid=$!
   while kill -0 $pid 2>/dev/null; do
-    if (( EPOCHREALTIME - start >= t )); then
+    if ! clock_now || (( CLOCK_NOW - start >= t )); then
       kill -TERM -- -$pid 2>/dev/null
       for k in {1..40}; do kill -0 -- -$pid 2>/dev/null || break; zselect -t 5; done
       kill -KILL -- -$pid 2>/dev/null
@@ -77,8 +98,17 @@ alert() { # <title> <popup> <spoken>
       print -r -- "$o" >> "$6"
       print -rl -- "rc=$rc" "at_epoch=$EPOCHSECONDS" "$o" > "$5.tmp" && /bin/mv -f -- "$5.tmp" "$5"' \
       zsh "$ALERT_CMD" "$1" "$2" "$3" "$res" "$alog" </dev/null >/dev/null 2>&1 &!
-    # An immediate failure (no GUI session, osascript error) is known within seconds.
-    zselect -t $(( ${ALERT_ACK:-3} * 100 ))
+    # An immediate failure (no GUI session, osascript error) is known within seconds. Under the test clock
+    # (AS2_CLOCK_CMD) the same ALERT_ACK seconds are read from clock_now, and the wait ends when the result is there.
+    if [[ -z ${AS2_CLOCK_CMD:-} ]]; then
+      zselect -t $(( ${ALERT_ACK:-3} * 100 ))
+    else
+      local ack_end
+      if clock_now; then
+        ack_end=$(( CLOCK_NOW + ${ALERT_ACK:-3} ))
+        while [[ ! -f $res ]] && clock_now && (( CLOCK_NOW < ack_end )); do zselect -t 5; done
+      fi
+    fi
     if [[ -f $res && $(<$res) != rc=0* ]]; then
       ALERT_STATUS="failed: the popup could not be shown ($res)"
     elif [[ -f $res ]]; then

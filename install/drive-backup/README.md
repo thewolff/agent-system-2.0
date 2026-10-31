@@ -15,7 +15,7 @@ Nothing here is loaded into launchd yet. Plumb loads both plists through its hel
 | `com.plumb.as2-drive-backup.plist` | launchd job: runs `backup-nightly.zsh` nightly at 2:30 AM. |
 | `com.plumb.as2-drive-backup-check.plist` | launchd job: runs `check-backup-fresh.zsh` daily at 9:00 AM. |
 | `test-fake-drive.zsh` | Self-test against a fake Drive, a fake DriveFS database, a fake server read and stub alerts. It runs `test-server-read.zsh` first. Everything it writes is under one temp dir, which it leaves in place. |
-| `test-server-read.zsh` | Fixtures for `server-read.zsh`: a copy of the real script with only `osascript`, `stat` and `shasum` stubbed, 16 cases (the round-3 and round-4 reviews' cases among them). |
+| `test-server-read.zsh` | Fixtures for `server-read.zsh`: a copy of the real script with only `osascript`, `stat` and `shasum` stubbed, 17 cases (the round-3 and round-4 reviews' cases among them; case 17 holds a full copy in the cache for the whole drain wait, on the `AS2_CLOCK_CMD` fake clock). |
 
 Files the job writes next to itself:
 
@@ -268,8 +268,14 @@ The 04:30 scratch sweep removes `.offsite`, `.attempts` and `.stuck` only once t
 
 `AS2_DRIVE_ROOT`, `AS2_DRIVEFS_DB`, `AS2_ARCHIVE_ROOT`, `AS2_CLAIMS`, `AS2_LEDGER_DB`, `AS2_LOG` (state files go next to it), `AS2_ALERT_CMD`, `AS2_ALERT_FALLBACK`, `AS2_ALERT_ACK`, `AS2_ALERT_ACK_WINDOW`, `AS2_NO_ALERT=1`, `AS2_SKIP_APP_CHECK=1`, `AS2_PROOF_TIMEOUT`, `AS2_PROOF_POLL`, `AS2_CLAIM_QUIET`, `AS2_REPROVE_AFTER`, `AS2_T_SHORT`, `AS2_T_LONG`, `AS2_T_SERVER_READ`, `AS2_SERVER_READ_CMD`, `AS2_SERVER_READ_DRAIN`, `AS2_TMPDIR`, `AS2_UNDER_LAUNCHD=1`, `AS2_ENVELOPE_FLOOR` (bytes; default 16 MiB). The checker also takes `AS2_NOW_EPOCH`, `AS2_FORCE_VERIFY=1` and `AS2_VERIFY_TIMEOUT`.
 
+Test seams, each a no-op when unset, so the suites never wait on wall time (Jo's timing rule, decision log 2026-10-28--0840):
+
+- `AS2_CLOCK_CMD`: a command printing the current epoch seconds. Every in-run deadline reads it instead of the system clock: the proof wait (`backup-nightly.zsh`), the bounded command runner (`lib.zsh` `bounded`), the alert's result window (`lib.zsh` `alert`) and the pause between `server-read.zsh`'s drain scans. A test moves this clock past a deadline instead of waiting for it.
+- `AS2_PROOF_POLL_HOOK`: a command the proof wait runs before each proof pass. The fake-Drive suite uses it to run its fake uploader once, synchronously. A failing hook is a failure of the run.
+- `AS2_RUNSTAMP`: the run stamp (`YYYYMMDDTHHMMSS`) in Drive names, so two test runs in one second get distinct names.
+
 ```
 zsh install/drive-backup/test-fake-drive.zsh
 ```
 
-The last line is `RESULT: 0 failure(s)` when everything passes. The test dir is printed and left in place.
+The last line is `RESULT: 0 failure(s)` when everything passes, and the exit status is the failure count. The test dir is printed and left in place. In the repo, `bun test surface/test/drive-backup.test.ts` runs every `test-*.zsh` here (macOS only), each under its own temp HOME and TMPDIR.

@@ -7,9 +7,12 @@
 # Reviewer's originals, all under $TMPDIR: as2-review3-evict-race2-bawp6r22 (rematerialized during the drain
 # wait), as2-review3-fixtures-azf99ykt (a full copy in an unrecognised cache namespace) and
 # as2-review4-inline-cache-v2tc_ea3 (a full copy in a BLOB inside an accepted chunks.db, case 11).
+# Deterministic: no fixture sleeps or races a background process. A fixture that needs another reader to act during
+# the helper's drain wait, or the drain deadline to pass, gives the helper a fake clock (AS2_CLOCK_CMD, a script
+# that counts its reads); any AS2_CLOCK_CMD the caller set is dropped first.
 emulate -L zsh
 setopt no_unset pipe_fail extended_glob
-zmodload zsh/zselect
+unset AS2_CLOCK_CMD
 HELPER=${1:-${0:A:h}/server-read.zsh}
 W=${2:-$(mktemp -d "${TMPDIR:-/tmp}/as2-server-read-fixtures.XXXXXX")} || exit 99
 [[ -f $HELPER && -d $W ]] || { print -u2 "usage: zsh test-server-read.zsh [<helper>] [<work dir>]"; exit 99 }
@@ -53,12 +56,20 @@ want=$(/usr/bin/shasum -a 256 $D/target); want=${want%% *}
   || bad "control: clean cache and a downloading read are accepted with the file's sha256"
 
 # 2. reviewer race2: a 1 MiB unrelated blob in the cache; after the first dataless stat another reader
-#    materializes the target and the blob leaves the cache; the drain then succeeds
+#    materializes the target and the blob leaves the cache; the drain then succeeds. The other reader acts during
+#    the helper's first 5 s drain pause: the fake clock (AS2_CLOCK_CMD) acts on its first read, which is that pause's
+#    start (the scan before it saw the blob), and moves 5 s on each read, so the pause ends at the second read.
 fixture race-during-drain
 head -c 1048576 /dev/zero > $D/account/content_cache/d0/unrelated-blob
-( while [[ ! -s $D/stat-count ]]; do zselect -t 5; done; : > $D/materialized; rm -f $D/account/content_cache/d0/unrelated-blob ) &
-run race-during-drain; wait
-[[ $RC != 0 && $OUT == *rematerialized* ]] && ok "rematerialized during the drain wait: refused" \
+cat > $D/clock <<EOF
+#!/bin/zsh
+print read >> $D/clock-reads
+integer n=\$(wc -l < $D/clock-reads)
+(( n == 1 )) && { : > $D/materialized; rm -f $D/account/content_cache/d0/unrelated-blob }
+print \$(( 1000000 + 5 * (n - 1) ))
+EOF
+export AS2_CLOCK_CMD="/bin/zsh $D/clock"; run race-during-drain; unset AS2_CLOCK_CMD
+[[ $RC != 0 && $OUT == *rematerialized* && -f $D/clock-reads ]] && ok "rematerialized during the drain wait: refused" \
   || bad "rematerialized during the drain wait: refused"
 
 # 3. reviewer fixtures: a complete local copy in a cache namespace the helper does not recognise
@@ -160,6 +171,22 @@ fixture extra-table
 /usr/bin/sqlite3 $D/account/content_cache/chunks.db 'CREATE TABLE inline_bodies (k TEXT, v BLOB)' || exit 99
 run extra-table
 [[ $RC != 0 && $OUT == *"schema pin changed"* ]] && ok "chunks.db with an extra table: refused as schema pin changed" || bad "chunks.db with an extra table: refused as schema pin changed"
+
+# 17. the cache never drains below the file within the default 120 s drain wait: refused when the wait is over.
+#     The fake clock moves 5 s on each read, so each of the 23 pauses between the 24 scans (120 s / 5 s) takes two
+#     reads and no real time: 46 reads means every scan of the wait ran.
+# timing-under-test: server-read.zsh drain wait, 24 scans 5 s apart (fake clock: AS2_CLOCK_CMD)
+fixture drain-deadline
+head -c 1048576 /dev/zero > $D/account/content_cache/d0/held-copy
+cat > $D/clock <<EOF
+#!/bin/zsh
+print read >> $D/clock-reads
+print \$(( 1000000 + 5 * (\$(wc -l < $D/clock-reads) - 1) ))
+EOF
+export AS2_CLOCK_CMD="/bin/zsh $D/clock"; run drain-deadline; unset AS2_CLOCK_CMD
+[[ $RC != 0 && $OUT == *"can still hold 1048576 bytes after the drain wait"* && $(wc -l < $D/clock-reads) -eq 46 ]] \
+  && ok "a cache that holds a full copy for the whole drain wait: refused after all 24 scans" \
+  || bad "a cache that holds a full copy for the whole drain wait: refused after all 24 scans"
 
 print "RESULT: $FAILS failure(s)"
 exit $FAILS

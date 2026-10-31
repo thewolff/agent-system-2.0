@@ -1282,6 +1282,7 @@ surface/src/linked-api.ts	module	-
 surface/test/linked-api.test.ts	test	-
 install/herdr-file-links/herdr-plugin.toml	install	-
 install/herdr-file-links/open-file.sh	install	-
+ledger/test/file-links-install.test.ts	test	-
 # Nightly Google Drive backup job (jo-issues #300): the job, its helpers, its zsh fixture suites and quiet-alarm.
 install/drive-backup/README.md	install	-
 install/drive-backup/backup-nightly.zsh	install	-
@@ -1291,7 +1292,7 @@ install/drive-backup/quiet-alarm.zsh	install	-
 install/drive-backup/server-read.zsh	install	-
 install/drive-backup/test-fake-drive.zsh	install	-
 install/drive-backup/test-server-read.zsh	install	-
-ledger/test/file-links-install.test.ts	test	-
+surface/test/drive-backup.test.ts	test	-
 # Jev ranking, show-only first (migration/items/jev-ranking.md): the ranking, the as2_rank tool, the audit, the launch gate, the CLIs.
 surface/src/rank.ts	module	-
 surface/src/rank-audit.ts	module	-

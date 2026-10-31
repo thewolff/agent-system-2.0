@@ -5,11 +5,17 @@
 # Contained: every path it writes is under the temp dir T it creates (HOME, TMPDIR, the job's temp dir, fake
 # Drive, fake archives, claims, state, alert results). T is left in place at the end for inspection; nothing is
 # moved or written outside it. It never touches the real Drive, archives, ledger or launchd.
-#   zsh test-fake-drive.zsh        prints PASS/FAIL lines, exits with the number of failures
+#   zsh test-fake-drive.zsh        prints PASS/FAIL lines, ends with "RESULT: <n> failure(s)", exits n
+# Deterministic (Jo's timing rule, decision log 2026-10-28--0840): nothing here sleeps or races a background process.
+# Time comes from the job's test seams: AS2_CLOCK_CMD reads the fake clock $T/clock, which stands still unless a step
+# moves it; AS2_PROOF_POLL_HOOK runs one pass of the fake uploader and then moves that clock one second before each
+# proof pass (AS2_PROOF_POLL=0: no real wait between passes), so "never proves within AS2_PROOF_TIMEOUT=N" is N
+# passes; AS2_RUNSTAMP gives every run its own stamp. Each test that drives a deadline is marked
+# `timing-under-test`. Every other wait is on a real event with a failure-only guard (wait_for, 30 s).
 emulate -L zsh
 setopt no_unset pipe_fail extended_glob
 export PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
-zmodload zsh/datetime zsh/system zsh/stat
+zmodload zsh/datetime zsh/system zsh/stat zsh/zselect
 HERE=${0:A:h}
 REAL_TMP=${TMPDIR:-/tmp}
 T=$(mktemp -d "$REAL_TMP/as2-drive-test.XXXXXX") || { print -u2 "mktemp failed"; exit 99 }
@@ -22,11 +28,20 @@ FAILS=0
 ok()  { print "PASS: $*" }
 bad() { print "FAIL: $*"; FAILS=$((FAILS+1)) }
 check() { local d=$1; shift; if eval "$*"; then ok "$d"; else bad "$d"; fi }
+# wait_for <what> <condition> [guard seconds, default 30]: polls a real condition every 10 ms. The guard is
+# failure-only: on the expected path the condition holds long before it, and when it trips the reason is printed and
+# 1 returned.
+wait_for() { local k g=${3:-30}; for k in {1..$(( g * 100 ))}; do eval "$2" && return 0; zselect -t 1; done; print "guard: $1 did not happen within $g s"; return 1 }
 
-UP_PID=""
+# Processes the suite starts and must end: the two DB holders, a fake "running nightly", a backgrounded night.
+typeset -a FAKE_RUNNING HOLDERS
+all_gone() { local p; for p; do kill -0 $p 2>/dev/null && return 1; done; return 0 }
 cleanup() {
-  [[ -n $UP_PID ]] && kill $UP_PID 2>/dev/null
+  : > $T/alert-holds.release; : > $T/alert-stalls.release; : > $T/fake-run.release   # a stub still waiting ends now
+  (( ${#FAKE_RUNNING} )) && kill $FAKE_RUNNING 2>/dev/null
   exec 7>&- 8>&- 2>/dev/null
+  # the holders exit on EOF; wait for that (the real event) so nothing writes into $T after the suite returns
+  (( ${#HOLDERS} )) && wait_for "the DB holder processes exiting" 'all_gone $HOLDERS' 10
   print "test dir left in place: $T"
 }
 trap cleanup EXIT
@@ -56,70 +71,110 @@ LEDGER=$T/ledger.db
 $SQL $LEDGER "PRAGMA journal_mode=wal; create table events(id integer primary key, body text); insert into events(body) values('one'),('two'),('three');" >/dev/null
 # Drive for desktop and the as2 daemon keep these WAL DBs open; the job opens both -readonly.
 mkfifo $T/hold-fdb $T/hold-ledger
-$SQL "$FDB" < $T/hold-fdb >/dev/null 2>&1 &!
-$SQL "$LEDGER" < $T/hold-ledger >/dev/null 2>&1 &!
+$SQL "$FDB" < $T/hold-fdb > $T/hold-fdb.out 2>&1 &!
+HOLDERS+=( $! )
+$SQL "$LEDGER" < $T/hold-ledger > $T/hold-ledger.out 2>&1 &!
+HOLDERS+=( $! )
 exec 7>$T/hold-fdb 8>$T/hold-ledger
-print "select 1;" >&7; print "select 1;" >&8; sleep 0.5
+print "select 'held';" >&7; print "select 'held';" >&8
+wait_for "the fake Drive for desktop opening its DB" '[[ -f $T/hold-fdb.out && $(<$T/hold-fdb.out) == held ]]' || bad "a reader holds the fake DriveFS DB open"
+wait_for "the fake as2 daemon opening the ledger" '[[ -f $T/hold-ledger.out && $(<$T/hold-ledger.out) == held ]]' || bad "a reader holds the fake ledger open"
 
-# protobuf encoding, as DriveFS stores items.proto
+# The fake clock every deadline in the job reads (AS2_CLOCK_CMD). It starts at the real time and moves only when
+# clock-add.zsh moves it: one second per proof pass (proof-hook.zsh), a popup left open (the alert stubs), and the
+# blocked read-back below.
+print -r -- $EPOCHSECONDS > $T/clock
+cat > $T/clock-add.zsh <<'EOF'
+#!/bin/zsh
+# clock-add.zsh <clock file> <seconds>: moves the fake clock forward; the rename means a reader never sees a part-written file
+c=$(<$1) && print -r -- $(( c + $2 )) > $1.tmp.$$ && /bin/mv -f -- $1.tmp.$$ $1
+EOF
+clock_add() { /bin/zsh $T/clock-add.zsh $T/clock $1 }
+
+# protobuf encoding, as DriveFS stores items.proto (sourced here and by the fake uploader)
+cat > $T/proto.zsh <<'EOF'
 pv() { local n=$1 o="" b; while true; do b=$(( n & 127 )); n=$(( n >> 7 )); (( n )) && o+=$(printf %02x $(( b | 128 ))) || { o+=$(printf %02x $b); break }; done; print -rn -- $o }
-pbs() { local hx=$(print -rn -- "$2" | xxd -p | tr -d '\n'); print -rn -- "$(pv $(( ($1 << 3) | 2 )))$(pv $(( ${#hx} / 2 )))$hx" }
+pbs() { local hx=$(print -rn -- "$2" | /usr/bin/xxd -p | /usr/bin/tr -d '\n'); print -rn -- "$(pv $(( ($1 << 3) | 2 )))$(pv $(( ${#hx} / 2 )))$hx" }
 pbv() { print -rn -- "$(pv $(( ($1 << 3) | 0 )))$(pv $2)" }
 # file proto: id, parent id, title, mime, size, md5 (field 48), head revision (field 78); extra fields optional
 fproto() { # <id> <parent id> <title> <size> <md5> <rev> [extra hex]
   print -rn -- "$(pbs 1 $1)$(pbs 2 $2)$(pbs 3 $3)$(pbs 4 application/octet-stream)$(pbv 5 0)$(pbv 14 $4)$(pbs 46 '')$(pbs 48 $5)$(pbs 78 $6)${7:-}"
 }
+EOF
+source $T/proto.zsh
 
-# Fake uploader, every 0.4 s: new files appear first as local-N (in local_stable_ids, local-content-size), then
-# get a cloud id, revision and proto; a file whose bytes change gets a new revision. Basenames matching a glob in
-# $T/uploader.bad get field 48 = zeros and the real md5 inside the title field (an unrelated field must not prove).
-# $T/uploader.mode: good | off.
-print good > $T/uploader.mode; : > $T/uploader.bad
-uploader() {
-  local n=100 r=0 p rel parent title sid md5 sz comp id pid sig row bad pat rev cid ph m
-  local -a mt
-  while true; do
-    m=$(<$T/uploader.mode); print -r -- $m > $T/uploader.ack
-    if [[ $m == good ]]; then
-      for p in "$DRIVE"/**/*(N); do
-        [[ -p $p ]] && continue
-        rel=${p#$DRIVE/}; parent=1
-        for comp in ${(s:/:)rel}; do
-          sid=$($SQL "$FDB" "select i.stable_id from items i join stable_parents s on s.item_stable_id=i.stable_id where s.parent_stable_id=$parent and i.local_title='$comp' and i.trashed=0;")
-          if [[ -z $sid ]]; then
-            n=$((n+1)); sid=$n
-            if [[ -d ${DRIVE}/${rel%%$comp*}$comp ]]; then
-              $SQL "$FDB" "insert into items values($sid,'cloud$sid',NULL,0,0,1,'application/vnd.google-apps.folder',1,NULL,NULL,NULL,0,0,'$comp',1,NULL,0); insert into stable_parents values($sid,$parent,0);"
-            else
-              $SQL "$FDB" "insert into items values($sid,'local-$sid',NULL,0,0,1,'application/octet-stream',0,NULL,NULL,NULL,0,0,'$comp',1,NULL,0); insert into stable_parents values($sid,$parent,0); insert into local_stable_ids values($sid); insert into item_properties values($sid,'local-content-size',x'01',2);"
-            fi
-          fi
-          parent=$sid
-        done
-        if [[ -f $p ]]; then
-          row=$($SQL "$FDB" "select i.id||'|'||(select pi.id from stable_parents s join items pi on pi.stable_id=s.parent_stable_id where s.item_stable_id=i.stable_id)||'|'||ifnull((select sig from fake_seen where stable_id=i.stable_id),'') from items i where stable_id=$parent")
-          id=${row%%|*}; pid=${${row#*|}%%|*}; sig=${row##*|}
-          zstat -A sz +size -- "$p"; zstat -A mt +mtime -- "$p"
-          [[ $id == local-* || $sig != "$sz:${mt[1]}" ]] || continue
-          md5=$(md5 -q "$p"); title=${p:t}; bad=0
-          for pat in ${(f)"$(<$T/uploader.bad)"}; do [[ -n $pat && $title == ${~pat} ]] && bad=1; done
-          r=$((r+1)); rev="0Bfakerev$(printf %06d $r)xx"
-          cid=cloud$parent
-          if (( bad )); then ph=$(fproto $cid $pid "$title $md5" $sz 00000000000000000000000000000000 $rev)
-          else ph=$(fproto $cid $pid "$title" $sz $md5 $rev); fi
-          $SQL "$FDB" "update items set id='$cid', proto=x'$ph', file_size=$sz where stable_id=$parent; delete from local_stable_ids where stable_id=$parent;
-            delete from item_properties where item_stable_id=$parent; insert into item_properties values($parent,'local-title',cast('$title' as blob),3),($parent,'version-counter',x'01',2);
-            insert or replace into fake_seen values($parent,'$sz:${mt[1]}','$rev');"
-        fi
-      done
+# Fake uploader, one pass per proof pass (the job runs proof-hook.zsh as AS2_PROOF_POLL_HOOK before each one): new
+# files appear first as local-N (in local_stable_ids, local-content-size), then get a cloud id, revision and proto; a
+# file whose bytes change gets a new revision. Basenames matching a glob in $T/uploader.bad get field 48 = zeros and
+# the real md5 inside the title field (an unrelated field must not prove). $T/uploader.mode: good | off.
+# $T/uploader.counters carries the next stable id and the revision counter from one pass to the next.
+print good > $T/uploader.mode; : > $T/uploader.bad; print "100 0" > $T/uploader.counters
+cat > $T/uploader-pass.zsh <<'EOF'
+#!/bin/zsh
+emulate -L zsh
+setopt no_unset pipe_fail extended_glob
+zmodload zsh/stat
+T=${0:A:h}
+DRIVE="$T/CloudStorage/GoogleDrive-test@example.com/My Drive" FDB=$T/metadata_sqlite_db SQL=/usr/bin/sqlite3
+source $T/proto.zsh
+[[ $(<$T/uploader.mode) == good ]] || exit 0
+local -a cnt; cnt=( $(<$T/uploader.counters) )
+integer n=${cnt[1]} r=${cnt[2]}
+# one read of the whole tree: live (untrashed) children by "<parent stable id>/<title>", every item's id and the
+# signature (size:mtime) its last revision was made from
+local -A kid idof sigof
+local row p rel parent prev comp cur sid pid sig md5 title bad pat rev cid ph
+local -a f sz mt
+for row in "${(@f)$($SQL -separator $'\t' "$FDB" "select i.stable_id, ifnull(sp.parent_stable_id,''), i.local_title, i.trashed, i.id, ifnull(fs.sig,'') from items i left join stable_parents sp on sp.item_stable_id=i.stable_id left join fake_seen fs on fs.stable_id=i.stable_id")}"; do
+  [[ -n $row ]] || continue
+  f=( "${(@ps:\t:)row}" )
+  idof[${f[1]}]=${f[5]} sigof[${f[1]}]=${f[6]}
+  [[ ${f[4]} == 0 && -n ${f[2]} ]] && kid[${f[2]}/${f[3]}]=${f[1]}
+done
+for p in "$DRIVE"/**/*(N); do
+  [[ -p $p ]] && continue
+  rel=${p#$DRIVE/}; parent=1 prev=1 cur=""
+  for comp in ${(s:/:)rel}; do
+    cur=${cur:+$cur/}$comp
+    sid=${kid[$parent/$comp]:-}
+    if [[ -z $sid ]]; then
+      n=$((n+1)); sid=$n
+      if [[ -d $DRIVE/$cur ]]; then
+        $SQL "$FDB" "insert into items values($sid,'cloud$sid',NULL,0,0,1,'application/vnd.google-apps.folder',1,NULL,NULL,NULL,0,0,'$comp',1,NULL,0); insert into stable_parents values($sid,$parent,0);" || exit 1
+        idof[$sid]=cloud$sid
+      else
+        $SQL "$FDB" "insert into items values($sid,'local-$sid',NULL,0,0,1,'application/octet-stream',0,NULL,NULL,NULL,0,0,'$comp',1,NULL,0); insert into stable_parents values($sid,$parent,0); insert into local_stable_ids values($sid); insert into item_properties values($sid,'local-content-size',x'01',2);" || exit 1
+        idof[$sid]=local-$sid
+      fi
+      sigof[$sid]="" kid[$parent/$comp]=$sid
     fi
-    sleep 0.4
+    prev=$parent parent=$sid
   done
-}
-uploader &!; UP_PID=$!
-# upmode <good|off>: set the uploader mode and wait until a loop pass has started under it, so no pass that read
-# the old mode is still writing to the fake DB
-upmode() { print -r -- $1 > $T/uploader.mode; rm -f $T/uploader.ack; local k; for k in {1..200}; do [[ -f $T/uploader.ack && $(<$T/uploader.ack) == $1 ]] && return 0; sleep 0.05; done; print "uploader did not acknowledge mode $1"; return 1 }
+  if [[ -f $p ]]; then
+    pid=${idof[$prev]:-} sig=${sigof[$parent]:-}
+    zstat -A sz +size -- "$p"; zstat -A mt +mtime -- "$p"
+    [[ ${idof[$parent]} == local-* || $sig != "$sz:${mt[1]}" ]] || continue
+    md5=$(/sbin/md5 -q "$p"); title=${p:t}; bad=0
+    for pat in ${(f)"$(<$T/uploader.bad)"}; do [[ -n $pat && $title == ${~pat} ]] && bad=1; done
+    r=$((r+1)); rev="0Bfakerev$(printf %06d $r)xx"
+    cid=cloud$parent
+    if (( bad )); then ph=$(fproto $cid $pid "$title $md5" $sz 00000000000000000000000000000000 $rev)
+    else ph=$(fproto $cid $pid "$title" $sz $md5 $rev); fi
+    $SQL "$FDB" "update items set id='$cid', proto=x'$ph', file_size=$sz where stable_id=$parent; delete from local_stable_ids where stable_id=$parent;
+      delete from item_properties where item_stable_id=$parent; insert into item_properties values($parent,'local-title',cast('$title' as blob),3),($parent,'version-counter',x'01',2);
+      insert or replace into fake_seen values($parent,'$sz:${mt[1]}','$rev');" || exit 1
+    idof[$parent]=$cid sigof[$parent]="$sz:${mt[1]}"
+  fi
+done
+print -r -- "$n $r" > $T/uploader.counters
+EOF
+cat > $T/proof-hook.zsh <<'EOF'
+#!/bin/zsh
+# AS2_PROOF_POLL_HOOK: one pass of the fake uploader, then one second of fake time (the proof poll interval) passes
+/bin/zsh ${0:A:h}/uploader-pass.zsh || { print -u2 "fake uploader pass failed"; exit 1 }
+/bin/zsh ${0:A:h}/clock-add.zsh ${0:A:h}/clock 1
+EOF
+upmode() { print -r -- $1 > $T/uploader.mode }   # <good|off>: the next proof pass's uploader pass reads it
 
 ARCH=$T/scratch-archive CLAIMS=$T/claims
 mkdir -p $ARCH/2026-10-20 $ARCH/2026-10-27 $ARCH/2026-10-28
@@ -131,23 +186,41 @@ print junk > $ARCH/2026-10-28/wl-ccc.tar.gz.partial-0123456789ab      # in-progr
 mk $T/src/linked.tar.gz 1000; ln $T/src/linked.tar.gz $ARCH/2026-10-28/wl-lnk.tar.gz   # nlink 2: producer mid-link
 print "drive_path=old" > $ARCH/2026-10-20/wl-old.tar.gz.offsite         # an old marker, archive long gone
 for f in $ARCH/*/*.tar.gz; do shasum -a 256 $f; done > $T/orig.sha
-# Alert stubs. quiet-alarm exits 0 only after its popup was shown, 1 if it could not be shown.
-cat > $T/alert.zsh <<EOF
+# Alert stubs. quiet-alarm exits 0 only after its popup was shown, 1 if it could not be shown. None sleeps:
+# alert.zsh's popup is answered at once; alert-holds.zsh's popup stays open until the test creates
+# $T/alert-holds.release; alert-stalls.zsh never shows one (it ends when the suite does). A stub whose popup stays
+# open moves the fake clock 1000 s on, past the job's result window (AS2_ALERT_ACK), the way real time passes while a
+# popup waits. The stubs' own waits poll a release file every 10 ms; their limits are failure-only guards.
+cat > $T/alert.zsh <<'EOF'
 #!/bin/zsh
-print -r -- "ALERT title=\$1 | popup=\$2" >> $T/alerts.log
-sleep 3
+print -r -- "ALERT title=$1 | popup=$2" >> ${0:A:h}/alerts.log
 print "quiet-alarm: choice=Dismiss (no voice)"
 EOF
-cat > $T/alert-dies.zsh <<EOF
+cat > $T/alert-holds.zsh <<'EOF'
 #!/bin/zsh
-print -r -- "DIES title=\$1" >> $T/alerts-dies.log
+zmodload zsh/zselect
+T=${0:A:h}
+print -r -- "ALERT title=$1 | popup=$2" >> $T/alerts.log
+/bin/zsh $T/clock-add.zsh $T/clock 1000
+for k in {1..6000}; do [[ -e $T/alert-holds.release ]] && break; zselect -t 1; done
+[[ -e $T/alert-holds.release ]] || { print -u2 "alert-holds.zsh: the popup was never answered ($T/alert-holds.release absent after 60 s)"; exit 3 }
+print "quiet-alarm: choice=Dismiss (no voice)"
+EOF
+cat > $T/alert-dies.zsh <<'EOF'
+#!/bin/zsh
+print -r -- "DIES title=$1" >> ${0:A:h}/alerts-dies.log
 print -u2 "quiet-alarm: popup FAILED (osascript exit 1): no GUI session"
 exit 1
 EOF
-cat > $T/alert-stalls.zsh <<EOF
+cat > $T/alert-stalls.zsh <<'EOF'
 #!/bin/zsh
-print -r -- "STALLS title=\$1" >> $T/alerts-stalls.log
-sleep 120
+zmodload zsh/zselect
+T=${0:A:h}
+print -r -- "STALLS title=$1" >> $T/alerts-stalls.log
+/bin/zsh $T/clock-add.zsh $T/clock 1000
+for k in {1..60000}; do [[ -e $T/alert-stalls.release ]] && break; zselect -t 1; done
+[[ -e $T/alert-stalls.release ]] || { print -u2 "alert-stalls.zsh: never released ($T/alert-stalls.release absent after 600 s)"; exit 3 }
+exit 1
 EOF
 print -r -- '#!/bin/zsh' > $T/fallback.zsh; print -r -- "print -r -- \"NOTIFICATION \$*\" >> $T/fallback.log" >> $T/fallback.zsh; chmod +x $T/fallback.zsh
 # Fake server read (the real one is server-read.zsh, tested by test-server-read.zsh): logs the file and prints
@@ -176,16 +249,23 @@ cdir() { print -r -- $CLAIMS/$1.d }
 CC=$T/content_cache; mkdir -p $CC; : > $CC/chunks.db-wal; : > $CC/chunks.db-shm; : > $CC/METADATA
 export AS2_DRIVE_ROOT=$DRIVE AS2_DRIVEFS_DB=$FDB AS2_ARCHIVE_ROOT=$ARCH AS2_CLAIMS=$CLAIMS AS2_LEDGER_DB=$LEDGER \
        AS2_ALERT_CMD=$T/alert.zsh AS2_ALERT_FALLBACK=$T/fallback.zsh AS2_ALERT_ACK=1 AS2_SKIP_APP_CHECK=1 \
-       AS2_PROOF_POLL=1 AS2_PROOF_TIMEOUT=6 AS2_LOG=$T/state/run.log AS2_CLAIM_QUIET=0 AS2_REPROVE_AFTER=0 \
-       AS2_SERVER_READ_CMD=$T/evict.zsh AS2_ENVELOPE_FLOOR=800
-night() { print "\n### $1"; shift; zsh "$HERE/backup-nightly.zsh" "$@" 2>&1 | sed -E "s#$T#\$T#g"; RC=${pipestatus[1]}; print -r -- "--> exit $RC" }
+       AS2_PROOF_POLL=0 AS2_PROOF_TIMEOUT=6 AS2_LOG=$T/state/run.log AS2_CLAIM_QUIET=0 AS2_REPROVE_AFTER=0 \
+       AS2_SERVER_READ_CMD=$T/evict.zsh AS2_ENVELOPE_FLOOR=800 \
+       AS2_CLOCK_CMD="/bin/cat ${(q)T}/clock" AS2_PROOF_POLL_HOOK="/bin/zsh ${(q)T}/proof-hook.zsh"
+# Every run gets its own stamp (AS2_RUNSTAMP), so runs in one second never share a Drive name. The counter is a file,
+# so a night run in a background subshell (the blocked read-back below) takes a number too.
+print 0 > $T/runstamp.counter
+next_stamp() { local n=$(( $(<$T/runstamp.counter) + 1 )); print $n > $T/runstamp.counter; STAMP=$(printf '20990101T%06d' $n) }
+night() { print "\n### $1"; shift; next_stamp; AS2_RUNSTAMP=$STAMP zsh "$HERE/backup-nightly.zsh" "$@" 2>&1 | sed -E "s#$T#\$T#g"; RC=${pipestatus[1]}; print -r -- "--> exit $RC" }
 
 before=$(snapshot)
 night "dry run" --dry-run
 check "dry run: exit 0, no file changed, no last-run.json" '[[ $RC == 0 && $(snapshot) == $before && ! -e $T/state/last-run.json ]]'
 
 print 'wl-bbb.????????????????.*.tar.gz' > $T/uploader.bad   # <id>.<sha16>.<stamp>.tar.gz; not wl-bbb.2.*
-AS2_PROOF_TIMEOUT=4 night "night 1: claims; wl-bbb never proves (real md5 only in an unrelated proto field)"
+# timing-under-test: proof deadline, AS2_PROOF_TIMEOUT=4 = 4 proof passes of 1 fake second (fake clock: AS2_CLOCK_CMD)
+# Night 1's popup stays open (alert-holds.zsh) until the test answers it below.
+AS2_ALERT_CMD=$T/alert-holds.zsh AS2_PROOF_TIMEOUT=4 night "night 1: claims; wl-bbb never proves (real md5 only in an unrelated proto field)"
 check "night 1 exits nonzero" '(( RC != 0 ))'
 check "three quiet nlink-1 archives claimed out of the public dir; .attempts holds each name" '[[ ! -e $ARCH/2026-10-27/wl-aaa.tar.gz && ! -e $ARCH/2026-10-28/wl-bbb.tar.gz && ! -e $ARCH/2026-10-28/wl-bbb.2.tar.gz && -f $(cdir 2026-10-27/wl-aaa.tar.gz)/wl-aaa.tar.gz && -f $ARCH/2026-10-27/wl-aaa.tar.gz.attempts && -f $ARCH/2026-10-28/wl-bbb.tar.gz.attempts ]]'
 check "nlink-2 archive and .partial left alone" '[[ -f $ARCH/2026-10-28/wl-lnk.tar.gz && -f $ARCH/2026-10-28/wl-ccc.tar.gz.partial-0123456789ab ]]'
@@ -195,11 +275,12 @@ check "wl-bbb: 1 failure at step prove, count 1, its copy was rejected (md5 only
 check "Drive names are unique and keep .tar.gz (<id>.<sha16>.<stamp>.tar.gz), stored unchanged" '[[ -n ${(M)${(f)"$(snapshot)"}:#*/wl-aaa.[0-9a-f](#c16).[0-9](#c8)T[0-9](#c6).tar.gz} ]] && cmp -s $(cdir 2026-10-27/wl-aaa.tar.gz)/wl-aaa.tar.gz "$(grep "^drive_path=" $(cdir 2026-10-27/wl-aaa.tar.gz)/receipt | cut -d= -f2-)"'
 check "one alert, sent and awaiting the popup result; notification sent too" '[[ $(alerts) == 1 && $(hb .alert) == sent* && $(hb .alert) == *"notification rc 0"* && -n $(hb .alert_result) ]] && grep -q NOTIFICATION $T/fallback.log'
 check "ledger: proven, unique object under ledger/<date>/" '[[ $(hb .ledger) == proven && $(wc -l < $T/state/ledger-snapshots.tsv | tr -d " ") == 1 ]] && grep -qE "ledger/[0-9-]+/ledger-[0-9T]+-[0-9a-f]{16}.db.gz	" $T/state/ledger-snapshots.tsv'
-sleep 3
+: > $T/alert-holds.release      # Jo answers the popup
+wait_for "the answered popup's result file" '[[ -f $(hb .alert_result) ]]' || bad "night 1's popup result was written"
 check "the popup's result arrives (rc=0: it was shown)" '[[ $(head -1 $(hb .alert_result)) == rc=0 ]]'
 sums1=$(drive_sums)
 
-sleep 1
+# timing-under-test: proof deadline, AS2_PROOF_TIMEOUT=4 (fake clock: AS2_CLOCK_CMD)
 AS2_PROOF_TIMEOUT=4 night "night 2: deleting re-proof for aaa and bbb.2; bbb re-proves its old copy and fails again"
 check "aaa and bbb.2 deleted after re-proof + server read-back; .offsite at the original path; .attempts gone" '[[ $(hb .counts.offsite_and_deleted) == 2 && ! -e $(cdir 2026-10-27/wl-aaa.tar.gz) && -f $ARCH/2026-10-27/wl-aaa.tar.gz.offsite && ! -e $ARCH/2026-10-27/wl-aaa.tar.gz.attempts && -f $T/state/receipts/2026-10-27/wl-aaa.tar.gz/receipt ]]'
 check "the Drive copy was read through the server-read gate" 'grep -q "EVICT .*/wl-aaa\.[0-9a-f]*\..*\.tar\.gz" $T/evict.log && grep -q "read back from Google.s servers (proven server read)" $T/state/run.log'
@@ -207,6 +288,7 @@ check "marker records item id, revision, sha256 and both proofs" 'grep -q "^driv
 check "bbb re-proved its earlier copy (no new upload), count 2" '[[ $(hb .counts.uploaded) == 0 && $(head -1 $(cdir 2026-10-28/wl-bbb.tar.gz)/attempts) == 2 ]] && grep -q "re-proving the earlier upload" $T/state/run.log'
 check "night 2 wrote a second ledger object; the first one is unchanged" '[[ $(wc -l < $T/state/ledger-snapshots.tsv | tr -d " ") == 2 ]] && print -r -- "$sums1" | (cd "$DRIVE" && shasum -a 256 -c - >/dev/null)'
 
+# timing-under-test: proof deadline, AS2_PROOF_TIMEOUT=4 (fake clock: AS2_CLOCK_CMD)
 AS2_PROOF_TIMEOUT=4 night "night 3: bbb uploads afresh (new name), still fails, reaches the limit"
 check "after night 3: stuck in claims and at the original path, count 3" '[[ -f $(cdir 2026-10-28/wl-bbb.tar.gz)/stuck && -f $ARCH/2026-10-28/wl-bbb.tar.gz.stuck && $(head -1 $(cdir 2026-10-28/wl-bbb.tar.gz)/attempts) == 3 && $(hb .counts.uploaded) == 1 ]]'
 check "night 3 alert names wl-bbb as STUCK; heartbeat newly_stuck lists it" 'tail -1 $T/alerts.log | grep -q "STUCK.*wl-bbb.tar.gz" && [[ $(hb ".newly_stuck[0]") == *wl-bbb.tar.gz ]]'
@@ -323,10 +405,36 @@ print "\n### a blocking operation is bounded and the other archives continue"
 fresh 2026-10-28/wl-hang.tar.gz 30000
 fresh 2026-10-28/wl-ok.tar.gz 30000
 hobj=$(grep '^drive_path=' $(rcpt_of 2026-10-28/wl-hang.tar.gz) | cut -d= -f2-)
-mv "$hobj" $T/hang.bak; mkfifo "$hobj"       # reading it back blocks forever
-s=$EPOCHSECONDS
-AS2_T_LONG=3 AS2_T_SERVER_READ=3 AS2_CLAIM_QUIET=999999999 night "read-back of wl-hang blocks"
-check "blocked read-back timed out (step confirm), wl-hang kept, wl-new and wl-ok handled, run finished" '(( RC != 0 )) && [[ -f $(cdir 2026-10-28/wl-hang.tar.gz)/wl-hang.tar.gz && ! -e $(cdir 2026-10-28/wl-ok.tar.gz) && -f $ARCH/2026-10-28/wl-ok.tar.gz.offsite ]] && grep -q "TIMEOUT: server read" $T/state/run.log && (( EPOCHSECONDS - s < 120 ))'
+mv "$hobj" $T/hang.bak; mkfifo "$hobj"       # reading it back blocks until its deadline kills the reader
+# timing-under-test: bounded() deadlines on a blocked read, the re-proof's xattr (T_SHORT, 60 s) and the server read
+# (AS2_T_SERVER_READ=3) (fake clock: AS2_CLOCK_CMD)
+# The night runs in the background. Opening the FIFO for reading blocks until a writer comes, and none does, so each
+# reader stays blocked until its deadline. The test waits for each real event, a live process of that read naming the
+# FIFO (it exists only after bounded() has read its start time), then moves the fake clock past that deadline:
+# 61 s for the xattr read of the item id (optional, so the re-proof goes on without it), then 4 s for the server read.
+# No wall time is measured. If a guard trips, the clock jumps far ahead so any bounded wait still running ends.
+running() { # <name> <text>: a live process matching <name> whose command line contains <text>
+  local l; for l in ${(f)"$(/usr/bin/pgrep -lf "$1" 2>/dev/null)"}; do [[ $l == *"$2"* ]] && return 0; done; return 1
+}
+rm -f $T/hang-night.rc
+{ trap - EXIT; AS2_T_LONG=3 AS2_T_SERVER_READ=3 AS2_CLAIM_QUIET=999999999 night "read-back of wl-hang blocks"; print -r -- $RC > $T/hang-night.rc } &
+FAKE_RUNNING+=( $! ); hang_night=$!
+wait_for "the re-proof's xattr read blocked on the wl-hang FIFO" 'running xattr "$hobj"' 120 \
+  || bad "the re-proof's xattr read of wl-hang reached its blocked open"
+clock_add 61
+wait_for "the server read blocked on the wl-hang FIFO" 'running shasum "$hobj"' 120 \
+  || bad "the server read of wl-hang reached its blocked open"
+clock_add 4
+if ! wait_for "the night with the blocked read-back finishing" '[[ -s $T/hang-night.rc ]]' 120; then
+  bad "the night with the blocked read-back finished once the fake clock passed the deadlines"
+  clock_add 100000
+  wait_for "the night finishing after the clock jumped" '[[ -s $T/hang-night.rc ]]' 60
+fi
+wait $hang_night 2>/dev/null; FAKE_RUNNING=( ${FAKE_RUNNING:#$hang_night} )
+check "both blocked readers' process groups were killed: the FIFO has no reader left" '! sysopen -w -o nonblock -u HANGX "$hobj" 2>/dev/null'
+[[ -n ${HANGX:-} ]] && exec {HANGX}>&-
+RC=$(<$T/hang-night.rc 2>/dev/null); RC=${RC:-unknown}
+check "blocked read-back timed out (step confirm), wl-hang kept, wl-new and wl-ok handled, run finished" '[[ $RC == <-> ]] && (( RC != 0 )) && [[ -f $(cdir 2026-10-28/wl-hang.tar.gz)/wl-hang.tar.gz && ! -e $(cdir 2026-10-28/wl-ok.tar.gz) && -f $ARCH/2026-10-28/wl-ok.tar.gz.offsite ]] && grep -q "TIMEOUT: server read" $T/state/run.log'
 rm -f "$hobj"; mv $T/hang.bak "$hobj"
 check "progress.json ends as finished" '[[ $(jq -r .finished $T/state/progress.json) == true ]]'
 
@@ -368,6 +476,7 @@ check "wl-t3 retired through its envelope" '[[ ! -e $(cdir 2026-10-29/wl-t3.tar.
 print "\n### an envelope that never proves keeps every member and goes stuck as one item"
 mk $ARCH/2026-10-29/wl-t4.tar.gz 100; mk $ARCH/2026-10-29/wl-t5.tar.gz 200
 print 'env-*.tar' > $T/uploader.bad
+# timing-under-test: proof deadline, AS2_PROOF_TIMEOUT=4 on three nights (fake clock: AS2_CLOCK_CMD)
 AS2_ENVELOPE_FLOOR=60000 AS2_PROOF_TIMEOUT=4 night "envelope never proves (night 1)"
 E4=$(ed_of 2026-10-29/wl-t4.tar.gz)
 check "envelope proof failure: both members kept, one failure naming the envelope and both members" '(( RC != 0 )) && [[ -f $(cdir 2026-10-29/wl-t4.tar.gz)/wl-t4.tar.gz && -f $(cdir 2026-10-29/wl-t5.tar.gz)/wl-t5.tar.gz && ! -e $ARCH/2026-10-29/wl-t4.tar.gz.offsite && $(head -1 $E4/attempts) == 1 ]] && jq -r ".failures[] | select(.path == \"$E4\") | .error" $T/state/last-run.json | grep -q "all kept: .*wl-t4.tar.gz, .*wl-t5.tar.gz"'
@@ -396,6 +505,7 @@ AS2_ENVELOPE_FLOOR=60000 AS2_REPROVE_AFTER=999999 night "after a run stopped mid
 check "stopped mid-build: the unfinished build is removed, wl-c1 goes into a new envelope, one upload" '[[ ! -e $gtmp && ! -e $ghost && $(ed_of 2026-10-29/wl-c1.tar.gz) != $ghost && -f $(ed_of 2026-10-29/wl-c1.tar.gz)/receipt && $(( $(envs_on_drive) - n0 )) == 1 ]]'
 mk $ARCH/2026-10-29/wl-c2.tar.gz 100
 upmode off
+# timing-under-test: proof deadline, AS2_PROOF_TIMEOUT=2 (fake clock: AS2_CLOCK_CMD)
 AS2_ENVELOPE_FLOOR=60000 AS2_PROOF_TIMEOUT=2 night "copy made, never proven (Drive for desktop not recording it)" >/dev/null
 E5=$(ed_of 2026-10-29/wl-c2.tar.gz); rm -f $E5/upload_retried $E5/attempts   # the state a run leaves when it stops right after the copy
 n0=$(envs_on_drive)
@@ -404,6 +514,7 @@ AS2_ENVELOPE_FLOOR=60000 AS2_REPROVE_AFTER=999999 night "after a run stopped aft
 check "stopped after the copy: the same Drive copy is re-proven, no second upload" '[[ -f $E5/receipt && $(hb .counts.uploaded) == 0 && $(envs_on_drive) == $n0 ]] && grep -q "re-proving the earlier envelope upload" $T/state/run.log'
 mk $ARCH/2026-10-29/wl-c3.tar.gz 100
 upmode off
+# timing-under-test: proof deadline, AS2_PROOF_TIMEOUT=2 (fake clock: AS2_CLOCK_CMD)
 AS2_ENVELOPE_FLOOR=60000 AS2_PROOF_TIMEOUT=2 night "another envelope, never proven" >/dev/null
 E6=$(ed_of 2026-10-29/wl-c3.tar.gz); c3obj=$(kvf $E6/upload drive_path)
 mv "$c3obj" $T/c3-env.bak; rm -f $E6/upload_retried $E6/attempts   # the state a run leaves when it stops after recording the upload, before the copy
@@ -452,16 +563,24 @@ check "checker flags a root that has never existed after 7 days" '[[ $out == *"h
 print "\n### alert delivery and state-write failures are reported"
 mk $ARCH/2026-10-28/wl-al.tar.gz 1000
 print 'wl-al.????????????????.*.tar.gz' > $T/uploader.bad; upmode good
+# timing-under-test: proof deadline, AS2_PROOF_TIMEOUT=3, and the alert's ALERT_ACK result window: the dying popup
+# stub's result arrives before the fake clock moves (fake clock: AS2_CLOCK_CMD)
 AS2_ALERT_CMD=$T/alert-dies.zsh AS2_PROOF_TIMEOUT=3 night "a failing night whose popup cannot be shown" >/dev/null
 check "popup failure recorded at once; notification sent" '[[ $(hb .alert) == failed* && $(hb .alert) == *"notification rc 0"* ]] && grep -q NOTIFICATION $T/fallback.log'
 out=$(zsh "$HERE/check-backup-fresh.zsh" 2>&1)
 check "checker reports the nightly's failed popup" '[[ $out == *"own alert: not delivered"* ]]'
+# timing-under-test: proof deadline, AS2_PROOF_TIMEOUT=3, and the alert's ALERT_ACK result window: the stalled stub
+# moves the fake clock past it (fake clock: AS2_CLOCK_CMD)
 AS2_ALERT_CMD=$T/alert-stalls.zsh AS2_PROOF_TIMEOUT=3 night "a failing night whose popup stalls without showing" >/dev/null
+stall_res=$(hb .alert_result)
 check "stalled popup is never called delivered" '[[ $(hb .alert) == sent* && ! -f $(hb .alert_result) ]]'
 out=$(AS2_NOW_EPOCH=$(( EPOCHSECONDS + 7*3600 )) zsh "$HERE/check-backup-fresh.zsh" 2>&1)
 check "7 h later, no result: the checker alarms (no sign the popup was shown)" '[[ $out == *"no sign the popup was shown"* ]]'
 out=$(zsh "$HERE/check-backup-fresh.zsh" 2>&1)
 check "inside the 6 h window, no alarm about that popup yet" '[[ $out != *"no sign the popup was shown"* ]]'
+# the stalled stub ends now (it exits 1: never shown); wait for its result so nothing writes into $T later
+: > $T/alert-stalls.release
+wait_for "the stalled popup stub ending" '[[ -f $stall_res ]]' || bad "the stalled popup stub ended when released"
 mv $T/state/last-run.json $T/lr.bak; mkdir $T/state/last-run.json
 night "heartbeat cannot be written" >/dev/null
 check "heartbeat write failure becomes a failure and is alerted" '(( RC != 0 )) && tail -1 $T/alerts.log | grep -q "failure"' 
@@ -476,7 +595,10 @@ chk "fresh success" X=1
 check "fresh success: exit 0, last-check.json ok (or only notes)" '[[ $(jq -r .result $T/state/last-check.json) == ok ]] || jq -r ".problems[]" $T/state/last-check.json'
 chk "30 h later" AS2_NOW_EPOCH=$(( EPOCHSECONDS + 30*3600 ))
 check "stale heartbeat flagged with the sleep/power-off wording" '(( CRC != 0 )) && tail -1 $T/alerts.log | grep -q "powered off"'
-/usr/bin/perl -e 'sleep 20' backup-nightly.zsh &!; fakepid=$!
+# A live process whose command line names backup-nightly.zsh, standing in for a nightly run in progress until the
+# test kills it (a release file is its failure-only 600 s guard)
+/usr/bin/perl -e 'for (1..60000) { exit 0 if -e $ARGV[1]; select(undef, undef, undef, 0.01) } exit 3' backup-nightly.zsh $T/fake-run.release &!
+fakepid=$!; FAKE_RUNNING+=( $fakepid )
 print "{\"pid\":$fakepid,\"mode\":\"run\",\"start_epoch\":$(( EPOCHSECONDS - 600 )),\"step\":\"copy to Drive x\",\"step_deadline_epoch\":$(( EPOCHSECONDS + 3000 )),\"updated_epoch\":$EPOCHSECONDS}" > $T/state/progress.json
 jq '.end_epoch -= 27*3600' $T/state/last-run.json > $T/lr27 && cp $T/state/last-run.json $T/lr.real && mv $T/lr27 $T/state/last-run.json
 chk "last run ended 27 h ago, but a catch-up run is in progress" X=1
@@ -486,6 +608,8 @@ print "{\"pid\":$fakepid,\"mode\":\"run\",\"start_epoch\":$(( EPOCHSECONDS - 600
 chk "a run past its step deadline" X=1
 check "hung run flagged" '(( CRC != 0 )) && tail -1 $T/alerts.log | grep -q "is hung"'
 kill $fakepid 2>/dev/null; print '{"pid":1,"mode":"run","start_epoch":1,"step":"finished","step_deadline_epoch":0,"updated_epoch":1,"finished":true}' > $T/state/progress.json
+wait_for "the stand-in nightly process exiting" 'all_gone $fakepid' || bad "the stand-in nightly process ended"
+FAKE_RUNNING=( ${FAKE_RUNNING:#$fakepid} )
 mk $ARCH/2026-10-28/wl-old.tar.gz 1000; print "drive_path=x" > $ARCH/2026-10-28/wl-old.tar.gz.offsite; touch -t 202610200000 $ARCH/2026-10-28/wl-old.tar.gz
 chk "public archive older than 3 days beside a marker" X=1
 check "old public archive flagged even with a marker" '(( CRC != 0 )) && tail -1 $T/alerts.log | grep -q "wl-old.tar.gz (has an .offsite marker"'

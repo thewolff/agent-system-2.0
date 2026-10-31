@@ -141,8 +141,26 @@ integer SIZE=${ST[3]}
 
 # 3. pinned cache layout and format, able to hold less than the file, within the drain wait (default 120 s;
 #    AS2_SERVER_READ_DRAIN shortens it for tests, which can only make the gate refuse sooner)
+# Clock seam (tests), as lib.zsh's clock_now: with AS2_CLOCK_CMD set (a command printing epoch seconds), the 5 s
+# pause between scans lasts until that clock has moved 5 s on, so a test controls when the next scan comes and what
+# happens before it. Unset (every real run), the pause is the same zselect as before the seam. A clock command that
+# fails or prints anything else refuses the read, and so does a test clock that has not moved 5 s within 300 s of
+# real polling (a stuck test clock fails, it never hangs).
+drain_clock() {
+  local o rc
+  o=$(eval "$AS2_CLOCK_CMD" 2>&1); rc=$?
+  (( rc == 0 )) && [[ $o == <->(|.<->) ]] || fail "drain wait: AS2_CLOCK_CMD ($AS2_CLOCK_CMD) exited $rc and printed '${o//$'\n'/; }' instead of epoch seconds"
+  CLK=${o%%.*}
+}
+drain_pause() {
+  [[ -z ${AS2_CLOCK_CMD:-} ]] && { zselect -t 500; return 0 }
+  integer CLK until g
+  drain_clock; until=$(( CLK + 5 ))
+  for g in {1..30000}; do drain_clock; (( CLK < until )) || return 0; zselect -t 1; done
+  fail "drain wait: the AS2_CLOCK_CMD clock ($AS2_CLOCK_CMD) did not move 5 s on within 300 s of polling; it reads $CLK"
+}
 integer DRAIN_TRIES=$(( ${AS2_SERVER_READ_DRAIN:-120} / 5 )); (( DRAIN_TRIES >= 1 )) || DRAIN_TRIES=1
-for k in {1..$DRAIN_TRIES}; do scan_cache; (( CACHED < SIZE )) && break; (( k < DRAIN_TRIES )) && zselect -t 500; done
+for k in {1..$DRAIN_TRIES}; do scan_cache; (( CACHED < SIZE )) && break; (( k < DRAIN_TRIES )) && drain_pause; done
 (( CACHED < SIZE )) || fail "DriveFS content cache can still hold $CACHED bytes after the drain wait ($NBLOBS blob file(s), $ROW_BYTES in chunks.db rows, $SIDE_BYTES in chunks.db-wal/-shm/METADATA), not less than the file's $SIZE; a local copy may remain"
 
 # 4. still dataless after the cache check, and again right before the read
