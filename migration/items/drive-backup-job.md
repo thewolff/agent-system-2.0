@@ -2,7 +2,7 @@
 title: The nightly Google Drive backup as two repo launchd jobs (install.sh --drive-backup)
 status: building
 workload: wl-mvwkt821jx4d6e
-pr: none
+pr: 416
 ---
 The nightly Google Drive backup (thewolff/jo-issues#300; plan `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mvwkt821jx4d6e/PLAN.md`, slice 5, R8 and R11) moves from a scratch folder with hand-loaded `com.plumb.*` plists into the repo's install machinery, the way the other launchd jobs are done.
 
