@@ -817,7 +817,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		name: LANE_MESSAGE_TOOL,
 		loadMode: "essential",
 		label: "Message Orchestrator",
-		description: "Send one message to the orchestrator about this lane's workload (a finding, a blocker, a QUESTION that needs Jo). It reaches Jo's surface at its next read.",
+		description: "Send one message to the orchestrator about this lane's workload (a finding, a blocker, a question that needs Jo). It reaches Jo's surface at its next read.",
 		parameters: z.object({
 			body: z.string().describe("The message, in plain words."),
 			slice: z.string().optional().describe("The slice id (sl-…) it is about, when it is about one."),

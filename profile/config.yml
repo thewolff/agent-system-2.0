@@ -80,9 +80,9 @@ extensions:
   # one-liner, Jo's one-word flips, decision-log read/render (SPEC-2.0.md § A1.2, § A3, § B3,
   # § B7, § B13.1). Inert unless AGENT_SYSTEM_ROLE=orchestrator on a top-level session. It injects
   # the voice document {repo}/voice/VOICE.md (DESIGN-2.0.md C2.1) into the orchestrator's system
-  # prompt; AGENT_SYSTEM_VOICE overrides the path. The owned output-types contract the gates inject
-  # (row 2) is {repo}/contract/output-types.md. Listed BEFORE the gates: its wake-owed refusal is a
-  # tool_call block, and a block from a handler loaded after the gates lands after the M4b fence
+  # prompt; AGENT_SYSTEM_VOICE overrides the path. The output-types contract the gates inject (row 2)
+  # is the vendored public plugin's {repo}/plugins/output-types/skills/output-types/reference.md
+  # (plugins/VENDOR.md). Listed BEFORE the gates: its wake-owed refusal is a tool_call block, and a block from a handler loaded after the gates lands after the M4b fence
   # has already returned its bash wrapper, which the fence records as a bypass and then refuses
   # every later bash call (gates/src/fence.ts bypassReason). A refusal before the gates ends the
   # chain before the wrapper, as the gates' own rows do.
@@ -310,8 +310,8 @@ testRunner:
   # Every fast set includes these smoke files. Files in macOnly run only in the full main suite:
   # macOS-specific sandbox, shell, filesystem and process APIs cannot be exercised on Linux;
   # the remaining portability cases depend on Linux filesystem identity/order/timing behavior.
-  # The 13 macOS-only files and four portability files found by the Linux probe, test-runner-smoke found by the
-  # as2-hosted run of 2026-10-28, and timing-proof (its historic load needs taskpolicy) (each reason below) stay out of hosted Linux. They run in the post-merge Mac full
+  # Each file in macOnly (its reason beside it; the first 13 macOS-only and four portability files came from the Linux
+  # probe) stays out of hosted Linux. They run in the post-merge Mac full
   # suite and in .github/workflows/as2-hosted.yml's macos-latest job. Keep zsh and bubblewrap
   # tests in the fast set; the hosted workflow installs both. Activation is a ledger word, not a flag.
   # timing-lint.test.ts is the incidental-timing ratchet (Jo's rule, 2026-10-28): static, under a second, and it must
@@ -340,6 +340,7 @@ testRunner:
     surface/test/test-runner.test.ts: Linux timing/signal behavior differs in test T2c
     surface/test/test-runner-smoke.test.ts: admission reads the _as2test process snapshot, which Linux cannot inspect (S5b settles as admission refused, inspection denied)
     surface/test/timing-proof.test.ts: historic load spawns /usr/sbin/taskpolicy and its teardown reads the darwin process list, neither of which exists on Linux
+    surface/test/drive-backup.test.ts: the Drive backup zsh suites use macOS stat/md5/xattr/osascript and the Drive for desktop (DriveFS) layout
   # Files a main run's believability leaves out (§ 2 Main state, jo-issues #243): they need Jo's own machine (an
   # installed OMP) and skip every test under _as2test, so 185 of 195 files is the most a main run can execute and
   # 95 % of 195 is 185.25. Each still runs in the full suite; it only stops counting toward "believable".

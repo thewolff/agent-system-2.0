@@ -15,6 +15,11 @@
 // boots it out and deletes the plist before any install step and writes nothing else.
 // And --train-tick, against fake gh, omp and ctx in a PATH built by the test: ctx's directory is in the tick's PATH,
 // and without ctx the flag is refused with exit 2 and nothing written.
+// And --drive-backup (wl-mvwkt821jx4d6e R8), in the --daily-report pattern: both plists lint, run the nightly job at 02:30
+// and its check at 09:00 with the needs-you writer's environment and AS2_KEEP_LOCAL from the installer's (0 or 1, any
+// other value refused with nothing written; unset keeps the installed nightly plist's value, and refuses when that plist
+// gives no 0 or 1), and are bootstrapped after a retention step line; a failed check load names the loaded nightly job;
+// --drive-backup=off boots both out and deletes both.
 // Installer runs never get the developer PATH (only `installPath`, fake launchctl first where needed), so none can reach a real herdr.
 // The fixture root is removed in afterAll only after every started test body completed; a failed run keeps it and prints its path.
 import { afterAll, beforeAll, describe, expect, test as bunTest } from "bun:test";
@@ -61,7 +66,7 @@ function manifestWith(...pairs: [string, string][]): void {
 }
 
 /** Every top-level directory install/manifest.tsv has rows under (b3e06bb added the M3/M4 ones; M6 added skills/ and bin/). */
-const MANIFEST_DIRS = ["ledger", "install", "profile", "tiers", "classifier", "gates", "skills", "plugins", "bin", "surface", "contract", "voice"];
+const MANIFEST_DIRS = ["ledger", "install", "profile", "tiers", "classifier", "gates", "skills", "plugins", "bin", "surface", "voice"];
 
 let ready = false;
 let started = 0;
@@ -849,6 +854,268 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		mkdirSync(home, { recursive: true });
 		for (const args of [["--daily-report=off", "--scratch-sweep"], ["--daily-report", "--train-tick=off"], ["--daily-report", "--daily-report=off"], ["--daily-report=on"]]) {
 			const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), ...args], { env: { PATH: systemPath, HOME: home }, stdout: "pipe", stderr: "pipe" });
+			expect(r.exitCode).toBe(2);
+		}
+		expect(tree(home)).toEqual([]);
+	});
+
+	// The nightly Google Drive backup's two jobs (wl-mvwkt821jx4d6e R8), in the --daily-report pattern above.
+	const driveLabel = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(readFileSync(join(REPO, "install", "com.agent-system-2.drive-backup.plist"), "utf8"))?.[1] ?? "";
+	const driveCheckLabel = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(readFileSync(join(REPO, "install", "com.agent-system-2.drive-backup-check.plist"), "utf8"))?.[1] ?? "";
+	const driveService = `gui/${process.getuid?.() ?? 0}/${driveLabel}`;
+	const driveCheckService = `gui/${process.getuid?.() ?? 0}/${driveCheckLabel}`;
+	const driveDomain = `gui/${process.getuid?.() ?? 0}`;
+
+	/** Run the scratch copy's installer with `args` under a fresh temp HOME named after `name`. */
+	function driveInstall(name: string, args: string[], path: string, env: Record<string, string> = {}) {
+		const home = join(root, `home-drive-backup-${name}`);
+		mkdirSync(home, { recursive: true });
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), ...args], {
+			env: { PATH: path, HOME: home, ...env }, stdout: "pipe", stderr: "pipe",
+		});
+		return { home, exitCode: r.exitCode ?? -1, out: r.stdout.toString() + r.stderr.toString() };
+	}
+
+	/** Both drive-backup plists under `home`, converted to JSON by plutil after a lint. */
+	function driveJobs(home: string): { nightly: Record<string, unknown>; check: Record<string, unknown> } {
+		const read = (label: string) => {
+			const plist = join(home, "Library", "LaunchAgents", `${label}.plist`);
+			expect(Bun.spawnSync(["/usr/bin/plutil", "-lint", plist]).exitCode).toBe(0);
+			return JSON.parse(Bun.spawnSync(["/usr/bin/plutil", "-convert", "json", "-o", "-", plist]).stdout.toString());
+		};
+		return { nightly: read(driveLabel), check: read(driveCheckLabel) };
+	}
+
+	/**
+	 * A fake launchctl that keeps one loaded flag per label (the shared fakeLaunchctl above keeps one for all), so
+	 * an =off run that stops two jobs sees each loaded until its own bootout. `bootstrap` marks the plist's label
+	 * loaded and says so on stdout (where install.sh's step lines go, so a test can order the two), or, for the
+	 * label `bootstrapFails` names, exits 5 as launchctl does when a bootstrap fails.
+	 */
+	function driveLaunchctl(name: string, loaded: string[], opts: { bootstrapFails?: string } = {}): { bin: string; calls: () => string[] } {
+		const dir = join(root, `drive-backup-launchctl-${name}`);
+		const bin = join(dir, "bin");
+		const log = join(dir, "launchctl.log");
+		mkdirSync(bin, { recursive: true });
+		for (const label of loaded) writeFileSync(join(dir, `loaded.${label}`), "");
+		const fails = opts.bootstrapFails ? `[ "$l" != '${opts.bootstrapFails}' ] || { echo 'Bootstrap failed: 5: Input/output error' >&2; exit 5; }; ` : "";
+		writeFileSync(join(bin, "launchctl"), [
+			"#!/bin/bash",
+			`printf '%s\\n' "$*" >>'${log}'`,
+			'case "$1" in',
+			`\tprint) [ -e '${dir}/loaded.'"\${2##*/}" ] || { printf '%s\\n' 'Bad request.' "Could not find service \\"\${2##*/}\\" in domain for user gui: 501" >&2; exit 113; } ;;`,
+			`\tbootout) rm -f '${dir}/loaded.'"\${2##*/}" ;;`,
+			`\tbootstrap) l="\${3##*/}"; l="\${l%.plist}"; printf 'fake launchctl: bootstrap %s\\n' "$l"; ${fails}: >'${dir}/loaded.'"$l" ;;`,
+			"esac",
+			"",
+		].join("\n"));
+		chmodSync(join(bin, "launchctl"), 0o755);
+		return { bin, calls: () => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter((l) => l !== "") : []) };
+	}
+
+	test.if(process.platform === "darwin")("--drive-backup writes both plists that lint, runs the nightly job at 02:30 and the check at 09:00 with AS2_KEEP_LOCAL 0 by default, and bootstraps both", () => {
+		expect([driveLabel, driveCheckLabel]).toEqual(["com.agent-system-2.drive-backup", "com.agent-system-2.drive-backup-check"]);
+		const launchctl = fakeLaunchctl("drive-backup-on", false);
+		const { home, exitCode, out } = driveInstall("on", ["--drive-backup"], `${launchctl.bin}:${installPath}`);
+		const state = join(home, "agent-scratch", "agent-system-2.0", "drive-backup", "state");
+		expect(out).toContain(`drive backup retention: AS2_KEEP_LOCAL=0 (AS2_KEEP_LOCAL unset: the default; no nightly job installed); ${KEEP_LEGEND}`);
+		expect(out).toContain(`drive backup loaded: backup-nightly.zsh runs nightly at 02:30 and check-backup-fresh.zsh daily at 09:00 local time; AS2_KEEP_LOCAL=0`);
+		expect(out).toContain(`state and logs in ${state}; turn off with: bash install/install.sh --drive-backup=off`);
+		expect(exitCode).toBe(0);
+		const env = {
+			AS2_BUN: join(root, "bin", "bun"),
+			AS2_LEDGER_DB: join(home, ".agent-system-2", "ledger.db"),
+			AS2_REPO: copy,
+			AS2_UNDER_LAUNCHD: "1",
+			HOME: home,
+			PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+		};
+		const common = { WorkingDirectory: copy, ProcessType: "Background", AbandonProcessGroup: true, RunAtLoad: false };
+		const { nightly, check } = driveJobs(home);
+		expect(nightly).toEqual({
+			Label: driveLabel,
+			ProgramArguments: ["/bin/zsh", join(copy, "install", "drive-backup", "backup-nightly.zsh")],
+			EnvironmentVariables: { ...env, AS2_KEEP_LOCAL: "0" },
+			StartCalendarInterval: { Hour: 2, Minute: 30 },
+			StandardOutPath: join(state, "backup-nightly.log"),
+			StandardErrorPath: join(state, "backup-nightly.log"),
+			...common,
+		});
+		expect(check).toEqual({
+			Label: driveCheckLabel,
+			ProgramArguments: ["/bin/zsh", join(copy, "install", "drive-backup", "check-backup-fresh.zsh")],
+			EnvironmentVariables: env,
+			StartCalendarInterval: { Hour: 9, Minute: 0 },
+			StandardOutPath: join(state, "check-backup-fresh.log"),
+			StandardErrorPath: join(state, "check-backup-fresh.log"),
+			...common,
+		});
+		expect(existsSync(state)).toBe(true);
+		expect(launchctl.calls()).toEqual([
+			`print ${driveService}`,
+			`bootstrap ${driveDomain} ${join(home, "Library", "LaunchAgents", `${driveLabel}.plist`)}`,
+			`print ${driveCheckService}`,
+			`bootstrap ${driveDomain} ${join(home, "Library", "LaunchAgents", `${driveCheckLabel}.plist`)}`,
+		]);
+	});
+
+	test.if(process.platform === "darwin")("--drive-backup with AS2_KEEP_LOCAL=1 in the installer's environment writes AS2_KEEP_LOCAL 1 into the nightly job only", () => {
+		const launchctl = fakeLaunchctl("drive-backup-keep", false);
+		const { home, exitCode, out } = driveInstall("keep", ["--drive-backup"], `${launchctl.bin}:${installPath}`, { AS2_KEEP_LOCAL: "1" });
+		expect(out).toContain("AS2_KEEP_LOCAL=1");
+		expect(exitCode).toBe(0);
+		const { nightly, check } = driveJobs(home);
+		expect((nightly.EnvironmentVariables as Record<string, string>).AS2_KEEP_LOCAL).toBe("1");
+		expect(Object.keys(check.EnvironmentVariables as Record<string, string>)).not.toContain("AS2_KEEP_LOCAL");
+	});
+
+	test.if(process.platform === "darwin")("--drive-backup with an AS2_KEEP_LOCAL other than 0 or 1 is refused with exit 2, names the value and writes nothing", () => {
+		for (const value of ["yes", "2", "01"]) {
+			const launchctl = fakeLaunchctl(`drive-backup-bad-keep-${value}`, false);
+			const { home, exitCode, out } = driveInstall(`bad-keep-${value}`, ["--drive-backup"], `${launchctl.bin}:${installPath}`, { AS2_KEEP_LOCAL: value });
+			expect(out).toContain(`--drive-backup: AS2_KEEP_LOCAL is '${value}'`);
+			expect(exitCode).toBe(2);
+			expect(tree(home)).toEqual([]);
+			expect(launchctl.calls()).toEqual([]);
+		}
+	});
+
+	// Final review F2: an unset AS2_KEEP_LOCAL keeps the installed nightly job's value, so a plain reload never turns local
+	// deletion on; the retention step line (with any change, `<old> -> <new>`) comes before either bootstrap.
+	const drivePlistOf = (home: string, label: string) => join(home, "Library", "LaunchAgents", `${label}.plist`);
+	const keepOf = (home: string) => (driveJobs(home).nightly.EnvironmentVariables as Record<string, string>).AS2_KEEP_LOCAL;
+	const KEEP_LEGEND = "0 deletes a local archive once its Drive upload is confirmed (proven on two nights and read back), 1 uploads and proves and never deletes";
+
+	test.if(process.platform === "darwin")("--drive-backup reloaded in the same HOME: AS2_KEEP_LOCAL unset keeps the installed 1 and says unchanged; AS2_KEEP_LOCAL=0 writes 0 and says 1 -> 0 before any bootstrap", () => {
+		const launchctl = driveLaunchctl("reload-keep", []);
+		const path = `${launchctl.bin}:${installPath}`;
+		const first = driveInstall("reload-keep", ["--drive-backup"], path, { AS2_KEEP_LOCAL: "1" });
+		expect(first.exitCode).toBe(0);
+		const home = first.home;
+		const nightly = drivePlistOf(home, driveLabel);
+		expect(keepOf(home)).toBe("1");
+
+		const plain = driveInstall("reload-keep", ["--drive-backup"], path);
+		expect(plain.home).toBe(home);
+		expect(plain.exitCode).toBe(0);
+		expect(keepOf(home)).toBe("1");
+		expect(first.out).toContain(`drive backup retention: AS2_KEEP_LOCAL=1 (set in this installer's environment; no nightly job installed); ${KEEP_LEGEND}`);
+		expect(plain.out).toContain(`drive backup retention: AS2_KEEP_LOCAL=1, unchanged (AS2_KEEP_LOCAL unset: kept from the installed ${nightly}); ${KEEP_LEGEND}`);
+		expect(plain.out).not.toMatch(/AS2_KEEP_LOCAL \S+ -> /);
+		expect(plain.out).toContain("AS2_KEEP_LOCAL=1 (upload and prove, never delete)");
+
+		const callsBefore = launchctl.calls().length;
+		const zero = driveInstall("reload-keep", ["--drive-backup"], path, { AS2_KEEP_LOCAL: "0" });
+		const change = `drive backup retention: AS2_KEEP_LOCAL 1 -> 0 (set in this installer's environment; the installed ${nightly} had 1); ${KEEP_LEGEND}`;
+		expect(zero.out).toContain(change);
+		const firstBootstrap = zero.out.indexOf("fake launchctl: bootstrap");
+		expect(firstBootstrap).toBeGreaterThan(-1);
+		expect(zero.out.indexOf(change)).toBeLessThan(firstBootstrap);
+		expect(zero.exitCode).toBe(0);
+		expect(keepOf(home)).toBe("0");
+		expect(launchctl.calls().slice(callsBefore)).toEqual([
+			`print ${driveService}`,
+			`bootout ${driveService}`,
+			`bootstrap ${driveDomain} ${nightly}`,
+			`print ${driveCheckService}`,
+			`bootout ${driveCheckService}`,
+			`bootstrap ${driveDomain} ${drivePlistOf(home, driveCheckLabel)}`,
+		]);
+	});
+
+	test.if(process.platform === "darwin")("--drive-backup with AS2_KEEP_LOCAL unset over an installed nightly plist whose value is not 0 or 1, missing, or unreadable is refused with exit 2, names the plist and changes nothing; an explicit value still wins", () => {
+		const launchctl = driveLaunchctl("garbage-keep", []);
+		const path = `${launchctl.bin}:${installPath}`;
+		const { home, exitCode } = driveInstall("garbage-keep", ["--drive-backup"], path, { AS2_KEEP_LOCAL: "1" });
+		expect(exitCode).toBe(0);
+		const nightly = drivePlistOf(home, driveLabel);
+		const check = drivePlistOf(home, driveCheckLabel);
+		const installed = readFileSync(nightly);
+		const spoil: [string, () => void][] = [
+			["value yes", () => expect(Bun.spawnSync(["/usr/bin/plutil", "-replace", "EnvironmentVariables.AS2_KEEP_LOCAL", "-string", "yes", nightly]).exitCode).toBe(0)],
+			["key missing", () => expect(Bun.spawnSync(["/usr/bin/plutil", "-remove", "EnvironmentVariables.AS2_KEEP_LOCAL", nightly]).exitCode).toBe(0)],
+			["not a plist", () => writeFileSync(nightly, "garbage\n")],
+		];
+		for (const [what, apply] of spoil) {
+			writeFileSync(nightly, installed);
+			apply();
+			const before = { tree: tree(home), nightly: readFileSync(nightly, "utf8"), check: readFileSync(check, "utf8"), calls: launchctl.calls().length };
+			const r = driveInstall("garbage-keep", ["--drive-backup"], path);
+			const after = { tree: tree(home), nightly: readFileSync(nightly, "utf8"), check: readFileSync(check, "utf8"), calls: launchctl.calls().length };
+			expect({ what, exitCode: r.exitCode, after }).toEqual({ what, exitCode: 2, after: before });
+			expect(r.out).toContain(`install: FAIL: --drive-backup: AS2_KEEP_LOCAL is unset, so the installed nightly job's value would be kept, but ${nightly}`);
+			expect(r.out).toContain("set AS2_KEEP_LOCAL explicitly to 0");
+			expect(r.out).toContain("nothing written");
+			expect(r.out).not.toContain("drive backup retention:");
+		}
+
+		const explicit = driveInstall("garbage-keep", ["--drive-backup"], path, { AS2_KEEP_LOCAL: "1" });
+		expect(explicit.out).toContain(`drive backup retention: AS2_KEEP_LOCAL unreadable -> 1 (set in this installer's environment; the installed ${nightly} gave none:`);
+		expect(explicit.exitCode).toBe(0);
+		expect(keepOf(home)).toBe("1");
+	});
+
+	test.if(process.platform === "darwin")("--drive-backup whose check job's bootstrap fails after the nightly job loaded exits 1 and names the nightly job as loaded with its AS2_KEEP_LOCAL", () => {
+		const launchctl = driveLaunchctl("check-bootstrap-fails", [], { bootstrapFails: driveCheckLabel });
+		const { home, exitCode, out } = driveInstall("check-bootstrap-fails", ["--drive-backup"], `${launchctl.bin}:${installPath}`, { AS2_KEEP_LOCAL: "1" });
+		const nightly = drivePlistOf(home, driveLabel);
+		const check = drivePlistOf(home, driveCheckLabel);
+		expect(out).toContain(`install: FAIL: launchctl bootstrap ${driveDomain} ${check} exited 5; the nightly job ${driveLabel} is loaded from ${nightly} with AS2_KEEP_LOCAL=1 (upload and prove, never delete), but the check job ${driveCheckLabel} did not load`);
+		expect(out).not.toContain("drive backup loaded:");
+		expect(exitCode).toBe(1);
+		expect(launchctl.calls()).toEqual([`print ${driveService}`, `bootstrap ${driveDomain} ${nightly}`, `print ${driveCheckService}`, `bootstrap ${driveDomain} ${check}`]);
+	});
+
+	test("--drive-backup=off boots both drive-backup jobs out and deletes both plists before any install step, with no bun on PATH, and writes nothing else", () => {
+		const home = join(root, "home-drive-backup-off");
+		const agents = join(home, "Library", "LaunchAgents");
+		mkdirSync(agents, { recursive: true });
+		writeFileSync(join(agents, `${driveLabel}.plist`), "<plist/>\n");
+		writeFileSync(join(agents, `${driveCheckLabel}.plist`), "<plist/>\n");
+		const launchctl = driveLaunchctl("off", [driveLabel, driveCheckLabel]);
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--drive-backup=off"], {
+			env: { PATH: `${launchctl.bin}:${systemPath}`, HOME: home }, stdout: "pipe", stderr: "pipe",
+		});
+		const out = r.stdout.toString() + r.stderr.toString();
+		expect(out).toContain(`drive backup booted out: ${driveService}`);
+		expect(out).toContain(`drive backup removed: ${join(agents, `${driveLabel}.plist`)}`);
+		expect(out).toContain(`drive backup check booted out: ${driveCheckService}`);
+		expect(out).toContain(`drive backup check removed: ${join(agents, `${driveCheckLabel}.plist`)}`);
+		expect(out).toContain("nothing else was run or written");
+		expect(out).not.toContain("bun not found");
+		expect(out).not.toContain("reading manifest");
+		expect(r.exitCode).toBe(0);
+		expect(launchctl.calls()).toEqual([`print ${driveService}`, `bootout ${driveService}`, `print ${driveCheckService}`, `bootout ${driveCheckService}`]);
+		expect(tree(home)).toEqual(["Library", join("Library", "LaunchAgents")]);
+	});
+
+	test("--drive-backup=off with --daily-report=off removes all three jobs in one run", () => {
+		const home = join(root, "home-drive-backup-off-both");
+		const agents = join(home, "Library", "LaunchAgents");
+		mkdirSync(agents, { recursive: true });
+		for (const label of [driveLabel, driveCheckLabel, reportLabel]) writeFileSync(join(agents, `${label}.plist`), "<plist/>\n");
+		const launchctl = driveLaunchctl("off-both", []);
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--drive-backup=off", "--daily-report=off"], {
+			env: { PATH: `${launchctl.bin}:${systemPath}`, HOME: home }, stdout: "pipe", stderr: "pipe",
+		});
+		expect(r.exitCode).toBe(0);
+		expect(launchctl.calls()).toEqual([`print ${driveService}`, `print ${driveCheckService}`, `print ${reportService}`]);
+		expect(tree(home)).toEqual(["Library", join("Library", "LaunchAgents")]);
+	});
+
+	test("--drive-backup twice, --drive-backup=off with an installing flag, or --drive-backup with an =off form, is refused with exit 2 and writes nothing", () => {
+		const home = join(root, "home-drive-backup-refused");
+		mkdirSync(home, { recursive: true });
+		const cases: [string[], string][] = [
+			[["--drive-backup", "--drive-backup"], "the drive-backup flag is given twice"],
+			[["--drive-backup", "--drive-backup=off"], "the drive-backup flag is given twice"],
+			[["--drive-backup=off", "--daily-report"], "an =off form stops a job and exits"],
+			[["--drive-backup", "--scratch-sweep=off"], "an =off form stops a job and exits"],
+			[["--drive-backup=on"], "got: --drive-backup=on"],
+		];
+		for (const [args, says] of cases) {
+			const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), ...args], { env: { PATH: systemPath, HOME: home }, stdout: "pipe", stderr: "pipe" });
+			expect(r.stdout.toString() + r.stderr.toString()).toContain(says);
 			expect(r.exitCode).toBe(2);
 		}
 		expect(tree(home)).toEqual([]);

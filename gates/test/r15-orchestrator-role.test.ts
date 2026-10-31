@@ -260,7 +260,7 @@ describe("P-11 row 15: the agent channel's reply tools (PLAN wl-mv8vx7wdj5nx1c T
 // The turn sequence of Jo's session 2026-09-30 (Ilex): entry 30, the QUESTION (the workload id only
 // in the CLAIM above it), then Jo's "use your draft" (entry 31), then a working call (entry 32 was a
 // `write` of README.md). MIGRATION.md item 105: the ask itself is a `questions` row first, raised with
-// orchestrator_raise_question and named by id in the QUESTION block; a block naming no row is refused,
+// orchestrator_raise_question and named by id in the closing ask; a closing ask naming no row is refused,
 // and a block naming an open row is refused until the row is answered — by Jo's word at the surface or
 // by the recorder naming the question. Both extensions are loaded, as the as2 profile loads them.
 const REAL_SESSION = "/Users/jowolff/.omp/profiles/agent-system-2/agent/sessions/-tmp/2026-09-30T04-59-58-976Z_01a0f0af-0c80-7000-abb3-08e67c02614d.jsonl";
@@ -272,14 +272,13 @@ const ILEX_QUESTION = [
 	"**CLAIM**",
 	`I opened a workload for this: the one-line README addition to agent-system-2.0 (${REAL_WL}). It's at normal stakes and autonomous, and no lane is dispatched yet. It's waiting only on the line's text.`,
 	"",
-	"**GUESS(inference)**",
 	"My draft, if you just want something descriptive: `agent-system-2.0: orchestrator, lanes, and tiered hands over a SQLite ledger, with output-types gates; see SPEC-2.0.md and MIGRATION.md.`",
 	"",
-	"**QUESTION**",
+	"**Closing ask**",
 	"What should the one line in the new root `README.md` say: my draft line above (I recommend it if you just want a pointer to the spec and the migration plan), or your own text?",
 ].join("\n");
 /** The same ask, re-sent naming its row. */
-const withId = (q: string) => ILEX_QUESTION.replace("**QUESTION**\n", `**QUESTION**\n(${q}) `);
+const withId = (q: string) => ILEX_QUESTION.replace("**Closing ask**\n", `**Closing ask**\n(${q}) `);
 
 type Entry = { type: string; timestamp?: string; message?: { role: string; content: { type: string; text: string }[] } };
 /** A session-file message; no timestamp, since the binding reads none (fix round 1, B3). */
@@ -415,7 +414,7 @@ describe("P-11 row 15: the orchestrator's QUESTION is a ledger row, answered bef
 		const q = await s.raise();
 		expect(await s.publish(withId(q))).toBeNull();
 		await s.type("which draft, the one with the ledger in it?");
-		expect(await s.publish("**PMDW**\nThe draft is the line quoted above, the one naming the SQLite ledger.")).toBeNull();
+		expect(await s.publish("The draft is the line quoted above, the one naming the SQLite ledger.")).toBeNull();
 		for (const c of READING.slice(0, 3)) expect(await s.call(...c)).toBeUndefined();
 		expect(s.instructions(REAL_WL)).toEqual([]);
 		expect((await s.call("orchestrator_close_workload", { workloadId: REAL_WL }))?.reason).toBe(answerFirstRefusal([q]));
@@ -423,7 +422,7 @@ describe("P-11 row 15: the orchestrator's QUESTION is a ledger row, answered bef
 
 	test("which rows count (fix round 1, B3): an unknown id, a lane's row, a row off the standing slice, or an unknown id beside a good one is unrecorded at publication and at the working call; a resolved row never published is unrecorded; no timestamp is read; a row is cited once; a block naming two open rows names both", async () => {
 		const s = answerSession();
-		expect(await s.publish("**QUESTION**\n(q-nope) Today or tomorrow?")).toStartWith(UNRECORDED_QUESTION_REFUSAL);
+		expect(await s.publish("**Closing ask**\n(q-nope) Today or tomorrow?")).toStartWith(UNRECORDED_QUESTION_REFUSAL);
 		expect((await s.call(...SCHEDULE))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
 		const q = await s.raise();
 		const l = Ledger.open(s.db, { create: false, backup: false, backupOnOpen: false });
@@ -434,23 +433,23 @@ describe("P-11 row 15: the orchestrator's QUESTION is a ledger row, answered bef
 		l.close();
 		for (const bad of [lanes, offSlice]) {
 			s.entries.length = 0;
-			expect(await s.publish(`**QUESTION**\n(${bad}) Today or tomorrow?`)).toStartWith(UNRECORDED_QUESTION_REFUSAL);
+			expect(await s.publish(`**Closing ask**\n(${bad}) Today or tomorrow?`)).toStartWith(UNRECORDED_QUESTION_REFUSAL);
 			expect((await s.call(...SCHEDULE))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
 		}
 		// An unknown id beside a good one is a refusal, never discarded.
 		s.entries.length = 0;
-		expect(await s.publish(`**QUESTION**\n(${q}, q-nope) Today or tomorrow, and the other too?`)).toStartWith(UNRECORDED_QUESTION_REFUSAL);
+		expect(await s.publish(`**Closing ask**\n(${q}, q-nope) Today or tomorrow, and the other too?`)).toStartWith(UNRECORDED_QUESTION_REFUSAL);
 		expect(s.cited()).toEqual([]);
 		// A session file carrying the reply without its citation (never published through the gates): the open row refuses the call answer-first, and the stop refuses the uncited reply. Jo's input lifts the earlier hold first.
 		await s.f.emit("input", { text: "hm", source: "interactive" }, s.ctx);
 		s.entries.length = 0;
-		s.entries.push(said("assistant", `**QUESTION**\n(${q}) Today or tomorrow?`));
+		s.entries.push(said("assistant", `**Closing ask**\n(${q}) Today or tomorrow?`));
 		expect((await s.call(...SCHEDULE))?.reason).toBe(answerFirstRefusal([q]));
-		expect(await s.stop(`**QUESTION**\n(${q}) Today or tomorrow?`)).toBe(UNRECORDED_QUESTION_REFUSAL);
+		expect(await s.stop(`**Closing ask**\n(${q}) Today or tomorrow?`)).toBe(UNRECORDED_QUESTION_REFUSAL);
 		// Published, two open rows in the one block a turn carries: both named; each answered from Jo's own input lifts its own.
 		s.entries.length = 0;
 		const q2 = await s.raise(null);
-		expect(await s.publish(`**QUESTION**\n(${q}, ${q2}) Today or tomorrow, and the other too?`)).toBeNull();
+		expect(await s.publish(`**Closing ask**\n(${q}, ${q2}) Today or tomorrow, and the other too?`)).toBeNull();
 		expect(s.cited()).toEqual([`question-published: ${q} ${q2}`]);
 		expect((await s.call(...SCHEDULE))?.reason).toBe(answerFirstRefusal([q, q2]));
 		const today = await s.type("today");
@@ -465,9 +464,9 @@ describe("P-11 row 15: the orchestrator's QUESTION is a ledger row, answered bef
 		expect(s.instructions(REAL_WL).map((i) => i.body)).toEqual([`Jo: "today" — reading: today (answers ${q})`]);
 		// A published open row cannot be cited by a second reply; a resolved one cannot be cited at all.
 		const q3 = await s.raise();
-		expect(await s.publish(`**QUESTION**\n(${q3}) Again?`)).toBeNull();
-		expect(await s.publish(`**QUESTION**\n(${q3}) Again?`)).toStartWith(reusedQuestionRefusal(q3, "published"));
-		expect(await s.publish(`**QUESTION**\n(${q2}) Again?`)).toStartWith(reusedQuestionRefusal(q2, "answered"));
+		expect(await s.publish(`**Closing ask**\n(${q3}) Again?`)).toBeNull();
+		expect(await s.publish(`**Closing ask**\n(${q3}) Again?`)).toStartWith(reusedQuestionRefusal(q3, "published"));
+		expect(await s.publish(`**Closing ask**\n(${q2}) Again?`)).toStartWith(reusedQuestionRefusal(q2, "answered"));
 		expect(s.cited()).toEqual([`question-published: ${q} ${q2}`, `question-published: ${q3}`]);
 		// Under the hold of that refused reply the working call carries its reason; Jo's input lifts it.
 		expect((await s.call(...SCHEDULE))?.reason).toBe(reusedQuestionRefusal(q2, "answered"));
@@ -477,13 +476,15 @@ describe("P-11 row 15: the orchestrator's QUESTION is a ledger row, answered bef
 		await s.f.emit("before_agent_start", { prompt: `draft ${q4}`, systemPrompt: [] }, s.ctx);
 		expect(s.question(q4)).toMatchObject({ state: "answered" });
 		s.entries.length = 0;
-		s.entries.push(said("assistant", `**QUESTION**\n(${q4}) Draft or mine?`));
+		s.entries.push(said("assistant", `**Closing ask**\n(${q4}) Draft or mine?`));
 		expect((await s.call(...SCHEDULE))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
 	});
 
 	test.skipIf(!existsSync(REAL_SESSION))("on the real session file: entries through Jo's 'use your draft' leave Ilex's README write refused, the ask having no row; raised, published and answered from Jo's input, the write gets the role refusal", async () => {
 		const s = answerSession();
-		const real = readFileSync(REAL_SESSION, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Entry);
+		// The session predates the closing-ask marker: its `**QUESTION**` label (the output-types contract
+		// before 2026-10-28) is read as the `**Closing ask**` marker that replaced it.
+		const real = readFileSync(REAL_SESSION, "utf8").replaceAll("**QUESTION**", "**Closing ask**").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Entry);
 		const jo = real.findIndex((e) => e.message?.role === "user" && e.message.content.some((p) => p.text === "use your draft"));
 		expect(jo).toBeGreaterThan(0);
 		s.entries.push(...real.slice(0, jo + 1));
@@ -521,7 +522,7 @@ async function twoAsked() {
 	const s = answerSession([WL_A, WL_B]);
 	const qA = await s.raise(WL_A);
 	const qB = await s.raise(WL_B);
-	expect(await s.publish(`**QUESTION**\n(${qA}, ${qB}) Should A keep production stakes, and B get a higher ceiling?`)).toBeNull();
+	expect(await s.publish(`**Closing ask**\n(${qA}, ${qB}) Should A keep production stakes, and B get a higher ceiling?`)).toBeNull();
 	return { ...s, qA, qB };
 }
 
@@ -552,7 +553,7 @@ describe("P-11 row 15: a recorded answer lifts the gate on its own workload (MIG
 	test("item 72 positive: no clock is read; a QUESTION entry stamped a minute ahead of the ledger, and an answer row older than it, still lift the gate", async () => {
 		const s = answerSession([WL_A]);
 		const q = await s.raise(WL_A);
-		const text = `**QUESTION**\n(${q}) Should A keep production stakes?`;
+		const text = `**Closing ask**\n(${q}) Should A keep production stakes?`;
 		expect(await s.publish(text)).toBeNull();
 		s.entries[s.entries.length - 1] = { ...said("assistant", text), timestamp: new Date(Date.now() + 60_000).toISOString() };
 		const input = await s.type("keep production");
@@ -585,7 +586,7 @@ describe("P-11 row 15: a recorded answer lifts the gate on its own workload (MIG
 	test("item 72 guard: an open row with no subject scopes to nothing, so a launch naming A waits on it; withdrawn, A's launch passes", async () => {
 		const s = answerSession([WL_A]);
 		const q = await s.raise(null);
-		expect(await s.publish(`**QUESTION**\n(${q}) Rename me?`)).toBeNull();
+		expect(await s.publish(`**Closing ask**\n(${q}) Rename me?`)).toBeNull();
 		for (const c of launchCalls(WL_A)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([q]));
 		await s.f.emit("before_agent_start", { prompt: `withdraw ${q}`, systemPrompt: [] }, s.ctx);
 		expect(s.question(q)).toMatchObject({ state: "withdrawn" });

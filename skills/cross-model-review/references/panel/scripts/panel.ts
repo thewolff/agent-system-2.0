@@ -797,7 +797,6 @@ export function loadPanel(target: string, env: Env, opts: { requireReport: boole
 
 // ---- check -------------------------------------------------------------------------------------
 
-const LABEL = /^(?:[-*]\s+)?\*\*(?:CLAIM|CITE|GUESS(?:\((?:inference|pattern|recall)\))?|ACTION|PMDW|QUESTION)\*\*/;
 const HEADING = /^#{1,6}\s/;
 const labOf = (id: string): string => id.slice(0, id.lastIndexOf("-"));
 const norm = (s: string): string => s.replace(/[*_`]/g, "").replace(/\s+/g, " ").trim().toLowerCase();
@@ -843,42 +842,6 @@ function requiredSections(mode: Mode, manifest: Manifest, markdown: string): { n
 		default:
 			return [];
 	}
-}
-
-/** Every statement block of the report opens with a bold output-types label (contract/output-types.md § Marking). */
-function unlabeledBlocks(markdown: string): string[] {
-	const bad: string[] = [];
-	let block: string[] = [];
-	let fence: string | null = null;
-	const close = () => {
-		const first = block[0];
-		if (first !== undefined) {
-			if (first.trimStart().startsWith("|")) {
-				const cell = first.split("|").map((c) => c.trim()).filter((c) => c !== "")[0];
-				if (cell !== "Type") bad.push(first);
-			} else if (!LABEL.test(first.trimStart())) bad.push(first);
-		}
-		block = [];
-	};
-	for (const line of markdown.split("\n")) {
-		const f = line.trimStart().match(/^(```|~~~)/);
-		if (fence) {
-			if (f && f[1] === fence) fence = null;
-			continue;
-		}
-		if (f) {
-			close();
-			fence = f[1]!;
-			continue;
-		}
-		if (line.trim() === "" || HEADING.test(line)) {
-			close();
-			continue;
-		}
-		block.push(line);
-	}
-	close();
-	return bad;
 }
 
 /** The opener of the informational flag block P-11 row 3 appends to a hand's reply strings (gates/src/rows/r03-receipts.ts renderFlags). */
@@ -1000,7 +963,6 @@ export function check(target: string, env: Env = process.env): { pg: string | nu
 	for (const s of requiredSections(mode, manifest, md)) if (!headings.some((h) => s.re.test(h))) failures.push(`sections: ${mode} report has no "## ${s.name}" section`);
 	if (mode === "triad-verify" && !/^\*\*Verify:\*\*/m.test(md)) failures.push("sections: triad-verify report has no **Verify:** line");
 
-	for (const first of unlabeledBlocks(md)) failures.push(`labels: a statement block opens without a bold contract label: ${JSON.stringify(first.slice(0, 80))}`);
 	return { pg, failures };
 }
 

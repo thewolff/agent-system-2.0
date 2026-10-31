@@ -1098,8 +1098,6 @@ surface/test/delivery.test.ts	test	-
 surface/test/lane.test.ts	test	-
 surface/test/fixtures-fable.test.ts	test	-
 surface/test/tool-mount.test.ts	test	-
-contract/output-types.md	doc	-
-contract/output-types-incidents.md	doc	-
 voice/VOICE.md	doc	-
 voice/agent-collaboration-with-adhd-and-autism.md	doc	-
 surface/src/launch.ts	module	-
@@ -1283,6 +1281,31 @@ surface/test/linked-api.test.ts	test	-
 install/herdr-file-links/herdr-plugin.toml	install	-
 install/herdr-file-links/open-file.sh	install	-
 ledger/test/file-links-install.test.ts	test	-
+# Nightly Google Drive backup job (jo-issues #300): the job, its helpers, its zsh fixture suites and quiet-alarm.
+install/drive-backup/README.md	install	-
+install/drive-backup/backup-nightly.zsh	install	-
+install/drive-backup/check-backup-fresh.zsh	install	-
+install/drive-backup/lib.zsh	install	-
+install/drive-backup/quiet-alarm.zsh	install	-
+install/drive-backup/server-read.zsh	install	-
+install/drive-backup/test-fake-drive.zsh	install	-
+install/drive-backup/test-server-read.zsh	install	-
+install/drive-backup/fake-drive-fixture.zsh	install	-
+install/drive-backup/test-fake-drive-proofs.zsh	install	-
+install/drive-backup/test-fake-drive-envelope.zsh	install	-
+install/drive-backup/test-fake-drive-envelope-stops.zsh	install	-
+install/drive-backup/test-fake-drive-regress.zsh	install	-
+install/drive-backup/test-fake-drive-regress-single.zsh	install	-
+install/drive-backup/test-fake-drive-crash.zsh	install	-
+install/drive-backup/test-fake-drive-crash-late.zsh	install	-
+install/drive-backup/test-fake-drive-jobs.zsh	install	-
+surface/test/drive-backup.test.ts	test	-
+install/drive-backup/test-alert.zsh	install	-
+surface/scripts/drive-backup-notice.ts	module	-
+surface/test/drive-backup-notice.test.ts	test	-
+# Its two launchd templates (migration/items/drive-backup-job.md): install.sh --drive-backup fills, writes and loads both.
+install/com.agent-system-2.drive-backup.plist	install	-
+install/com.agent-system-2.drive-backup-check.plist	install	-
 # Jev ranking, show-only first (migration/items/jev-ranking.md): the ranking, the as2_rank tool, the audit, the launch gate, the CLIs.
 surface/src/rank.ts	module	-
 surface/src/rank-audit.ts	module	-
@@ -1321,6 +1344,11 @@ surface/test/channel-reply.test.ts	test	-
 # hands) and lists each plugins/<p>/skills dir. plugins/paired-as2.ts is as2's seam to the paired adapter.
 plugins/VENDOR.md	doc	-
 plugins/index.ts	extension	-
+plugins/output-types/.claude-plugin/plugin.json	data	-
+plugins/output-types/hooks/hooks.json	data	-
+plugins/output-types/hooks/output-types-inject.mjs	module	-
+plugins/output-types/skills/output-types/SKILL.md	skill-asset	-
+plugins/output-types/skills/output-types/reference.md	skill-asset	-
 plugins/paired-as2.ts	module	-
 plugins/ask-graham/.claude-plugin/plugin.json	data	-
 plugins/ask-graham/.omp-plugin/plugin.json	data	-
