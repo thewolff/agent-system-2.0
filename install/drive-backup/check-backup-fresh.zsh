@@ -12,8 +12,13 @@
 #   - on Sundays: backup-nightly.zsh --verify-restore fails (evict, read the newest archive + ledger back from
 #     Google's servers, compare sha256)
 #   - its own state file cannot be written
+#   - on an otherwise clean run, the morning confirmation (`drive-backup: check ok`, lib.zsh needs_you_write) cannot be
+#     written: that entry is what clears a Drive backup line in Jo's needs-you list
+# On a clean run it writes `drive-backup: check ok` (skipped, and said so in last-check.json `confirm`, when AS2_BUN is
+# unset); on a problem the alert writes `drive-backup: check failed` first (lib.zsh alert, channel 1).
 # Writes last-check.json every run (before and after the weekly test); the nightly job reports it if it goes stale,
-# is malformed, or records an alert with no sign of being shown (the watcher is watched).
+# is malformed, or records an alert with a failed channel (alert_ack_problem; the watcher is watched).
+# Env from the plist: AS2_BUN, AS2_REPO, AS2_LEDGER_DB (the needs-you writer, lib.zsh needs_you_write).
 # Overrides (tests only): AS2_LOG (state dir = its directory), AS2_ARCHIVE_ROOT, AS2_CLAIMS, AS2_ALERT_CMD,
 #   AS2_ALERT_FALLBACK, AS2_ALERT_ACK, AS2_ALERT_ACK_WINDOW, AS2_NOW_EPOCH, AS2_FORCE_VERIFY=1, AS2_VERIFY_TIMEOUT, AS2_UNDER_LAUNCHD=1;
 #   the rest pass through to --verify-restore.
@@ -52,14 +57,15 @@ NOW=${AS2_NOW_EPOCH:-$EPOCHSECONDS}
 local -a PROBLEMS NOTES
 problem() { PROBLEMS+=( "$*" ); info "PROBLEM: $*" }
 note() { NOTES+=( "$*" ); info "note: $*" }
+CONFIRM="not attempted"
 write_beat() { # <result>
   local body
   body=$($JQ -n --arg at "$(ts)" --argjson at_epoch $EPOCHSECONDS --arg result "$1" --arg alert "$ALERT_STATUS" \
-    --arg alert_result "$ALERT_RESULT" --argjson alert_epoch $ALERT_EPOCH \
+    --arg alert_result "$ALERT_RESULT" --argjson alert_epoch $ALERT_EPOCH --arg confirm "$CONFIRM" \
     --argjson problems "$( (( ${#PROBLEMS} )) && print -rl -- $PROBLEMS | $JQ -R . | $JQ -sc . || print '[]')" \
     --argjson notes "$( (( ${#NOTES} )) && print -rl -- $NOTES | $JQ -R . | $JQ -sc . || print '[]')" \
     '{at:$at, at_epoch:$at_epoch, result:$result, alert:$alert, alert_result:$alert_result, alert_epoch:$alert_epoch,
-      problems:$problems, notes:$notes}' 2>&1) || return 1
+      confirm:$confirm, problems:$problems, notes:$notes}' 2>&1) || return 1
   write_file "$CHECK_BEAT" "$body"
 }
 
@@ -168,7 +174,19 @@ if [[ $(strftime '%u' $NOW) == 7 || ${AS2_FORCE_VERIFY:-0} == 1 ]]; then
   fi
 fi
 
-# 5. heartbeat for whoever watches this watcher (the nightly job)
+# 5. the morning confirmation on a clean run: `drive-backup: check ok` clears a Drive backup line in Jo's needs-you list.
+# A failed write is a problem (alerted below, so its own `check failed` entry is tried too); a skip is recorded.
+if (( ! ${#PROBLEMS} )); then
+  last_run="no last-run.json"
+  [[ -f $HEARTBEAT ]] && last_run="last nightly run: $($JQ -r '"result \(.result // "?"), ended \(.end // "?")"' "$HEARTBEAT" 2>/dev/null)"
+  needs_you_write check ok "no problems; $last_run${NOTES:+; ${#NOTES} note(s): ${(j:; :)NOTES}}" "$CHECK_BEAT" ||
+    problem "the morning confirmation (drive-backup: check ok) was not written, so a Drive backup line in the needs-you list stays: ${NEEDS_YOU_STATUS#failed: }"
+  CONFIRM=$NEEDS_YOU_STATUS
+else
+  CONFIRM="not attempted: the check found problems"
+fi
+
+# 6. heartbeat for whoever watches this watcher (the nightly job)
 result=$( (( ${#PROBLEMS} )) && print problems || print ok )
 write_beat $result || { problem "could not write $CHECK_BEAT (the nightly job will report this watcher as stale)"; result=problems }
 

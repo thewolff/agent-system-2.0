@@ -1293,6 +1293,9 @@ install/drive-backup/server-read.zsh	install	-
 install/drive-backup/test-fake-drive.zsh	install	-
 install/drive-backup/test-server-read.zsh	install	-
 surface/test/drive-backup.test.ts	test	-
+install/drive-backup/test-alert.zsh	install	-
+surface/scripts/drive-backup-notice.ts	module	-
+surface/test/drive-backup-notice.test.ts	test	-
 # Jev ranking, show-only first (migration/items/jev-ranking.md): the ranking, the as2_rank tool, the audit, the launch gate, the CLIs.
 surface/src/rank.ts	module	-
 surface/src/rank-audit.ts	module	-

@@ -61,6 +61,13 @@
 // surface/scripts/daily-report.ts) as one line while it is under REPORT_FRESH_HOURS old, keyed by its entry id, so the next day's
 // replaces it; from REPORT_FRESH_HOURS to REPORT_MISSED_DAYS old a `missed` line (a new state, delivered again), only while the job's
 // plist is installed (`reportJobInstalled`); past that, or with no entry at all, nothing. Older entries never render.
+// Drive backup (PLAN wl-mvwkt821jx4d6e slice 3, R5; kind `report`): on the standing workload, the `drive-backup:` entries (writer
+// DRIVE_BACKUP_BY, surface/scripts/drive-backup-notice.ts, called by install/drive-backup/lib.zsh for the nightly job and the 9 AM
+// check). The newest `<job> failed` entry with no `check ok` entry after it is one line naming the job, its date, its text and its
+// state file; the next `check ok` clears it. A `missed` line while the check job's plist is installed (`driveBackupCheckPlist`)
+// and no check entry (ok or failed) is newer than DRIVE_BACKUP_MISSED_HOURS; with no check entry ever, the plist file's mtime
+// (install.sh writes it) is the baseline, so a job that never ran shows too. No expiry while the plist is installed; the next
+// check entry clears it.
 // Train-aware routing (PLAN wl-mv8s8srodefytc rev 17.1 D9 F16): on a workload that owns a train task (surface/src/merge-train.ts
 // `trainTaskWindows`), the first lane death inside a task's window (from the `train-task:` to its settle, or still open) and an
 // intended exit inside one are not shown: the task counts them (D8) and the train tick relaunches the owner (`trainRouted`). The
@@ -87,7 +94,7 @@
 // after the answerable line of the target it names and carrying that target's number (numbering.ts's second pass), never
 // one of its own; a proposal whose target no longer waits has no target line, so it is not shown. Each recent
 // `channel-refused:` is one unnumbered line after the scratch lines (it takes no word).
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type EntryRow, type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
@@ -121,6 +128,79 @@ export const REPORT_MISSED_DAYS = 7;
 /** Whether the daily report's job is installed: its plist under `<home>/Library/LaunchAgents`. */
 export function reportPlistInstalled(home: string = homedir()): boolean {
 	return existsSync(join(home, "Library", "LaunchAgents", `${DAILY_REPORT_LABEL}.plist`));
+}
+
+/** The Drive backup check job's launchd label (install/com.agent-system-2.drive-backup-check.plist). */
+export const DRIVE_BACKUP_CHECK_LABEL = "com.agent-system-2.drive-backup-check";
+/** With no check entry newer than this, while the check plist is installed, the missed line shows: a 09:00 job across a DST change and a late wake. */
+export const DRIVE_BACKUP_MISSED_HOURS = 30;
+
+/**
+ * The Drive backup check job's plist under `<home>/Library/LaunchAgents`: its mtime in ms, or null when it is not installed.
+ * The default home is $HOME (Bun's os.homedir() ignores it), so a test process, whose preload points HOME at a temp dir,
+ * never reads the developer's own LaunchAgents. A plist that exists but cannot be stat'ed throws: never read as absent.
+ */
+export function driveBackupCheckPlist(home: string = process.env.HOME || homedir()): { mtimeMs: number } | null {
+	const path = join(home, "Library", "LaunchAgents", `${DRIVE_BACKUP_CHECK_LABEL}.plist`);
+	const st = statSync(path, { throwIfNoEntry: false });
+	return st ? { mtimeMs: st.mtimeMs } : null;
+}
+
+/** A `drive-backup:` entry's rest: `<job> <result> <local date> — <text> — <state path>` (the last ` — ` ends the text). */
+const DRIVE_BACKUP_REST = /^(nightly|check) (failed|ok) (\d{4}-\d{2}-\d{2}) — (.+) — (\/.*)$/;
+
+export interface DriveBackupEntry {
+	id: string;
+	createdAt: string;
+	job: "nightly" | "check";
+	result: "failed" | "ok";
+	date: string;
+	text: string;
+	state: string;
+}
+
+/** The valid `drive-backup:` entries (writer DRIVE_BACKUP_BY, parsable body) among `control`, oldest first. */
+export function driveBackupEntries(control: readonly ControlEntry[]): DriveBackupEntry[] {
+	const out: DriveBackupEntry[] = [];
+	for (const c of control) {
+		const m = c.prefix === "drive-backup" ? DRIVE_BACKUP_REST.exec(c.rest) : null;
+		if (m) out.push({ id: c.id, createdAt: c.createdAt, job: m[1] as "nightly" | "check", result: m[2] as "failed" | "ok", date: m[3]!, text: m[4]!, state: m[5]! });
+	}
+	return out;
+}
+
+/** The Drive backup lines (R5): the open failure, then the missed line. `plist` is read only when no check entry is fresh. */
+export function driveBackupLines(control: readonly ControlEntry[], now: string, plist: () => { mtimeMs: number } | null): ErrorLine[] {
+	const entries = driveBackupEntries(control);
+	const out: ErrorLine[] = [];
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const e = entries[i]!;
+		if (e.job === "check" && e.result === "ok") break;
+		if (e.result !== "failed") continue;
+		out.push({ kind: "report", workloadId: STANDING_WORKLOAD_ID, rowId: e.id, next: `see ${e.state}`, line: `Drive backup ${e.job} failed ${e.date}: ${e.text} — ${e.state}` });
+		break;
+	}
+	const check = entries.findLast((e) => e.job === "check");
+	if (check && hoursElapsed(check.createdAt, now) < DRIVE_BACKUP_MISSED_HOURS) return out;
+	let installed: { mtimeMs: number } | null;
+	try {
+		installed = plist();
+	} catch (e) {
+		// Never read as absent, and never fatal to the render: the other needs-you lines still show.
+		const look = `check ~/Library/LaunchAgents/${DRIVE_BACKUP_CHECK_LABEL}.plist`;
+		out.push({ kind: "report", workloadId: STANDING_WORKLOAD_ID, rowId: DRIVE_BACKUP_CHECK_LABEL, state: "plist-unreadable", next: look, line: `Drive backup check: its plist could not be read to tell whether the job is installed (${e instanceof Error ? e.message : String(e)}); ${look}` });
+		return out;
+	}
+	if (!installed) return out;
+	const since = check ? check.createdAt : new Date(installed.mtimeMs).toISOString();
+	if (hoursElapsed(since, now) < DRIVE_BACKUP_MISSED_HOURS) return out;
+	const reload = `run \`launchctl print gui/$(id -u)/${DRIVE_BACKUP_CHECK_LABEL}\`, then reload it with \`bash install/install.sh --drive-backup\``;
+	const what = check ? `the newest check entry is ${check.date} ${check.result} (${hoursBetween(check.createdAt, now)} h ago)` : `no check entry since the job was installed ${since} (${hoursBetween(since, now)} h ago)`;
+	out.push({
+		kind: "report", workloadId: STANDING_WORKLOAD_ID, rowId: DRIVE_BACKUP_CHECK_LABEL, state: `missed ${check ? check.id : since}`, next: reload,
+		line: `Drive backup check missed: ${what}; ${reload}`,
+	});
+	return out;
 }
 
 /** Every needs-you line kind; ErrorKind is read from this list, so the issue #334 item 3 test covers each kind there is. */
@@ -175,6 +255,8 @@ export interface ErrorOptions {
 	holdHours?: number;
 	/** Whether the daily report's job is installed (the missed line needs it); default `reportPlistInstalled()`. Called only when an entry is missed. */
 	reportJobInstalled?: () => boolean;
+	/** The Drive backup check job's plist (the missed line needs it); default `driveBackupCheckPlist()`. Called only when no check entry is fresh. */
+	driveBackupCheckPlist?: () => { mtimeMs: number } | null;
 }
 
 const short = (s: string, n = 90): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
@@ -711,6 +793,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 					line: `daily self-heal report missed: the newest is ${newest.rest.slice(0, 10)} (${hoursBetween(newest.createdAt, now)} h); check ${DAILY_REPORT_LABEL}`,
 				});
 			}
+			report.push(...driveBackupLines(control, now, opts.driveBackupCheckPlist ?? (() => driveBackupCheckPlist())));
 			for (const ep of protectionEpisodes(ledger).values()) {
 				if (ep.raised) train.push({ kind: "train", workloadId: wl, rowId: ep.raised.id, next: NO_NEXT_STEP, line: `merge train: main's protection on ${ep.repo} is unverified: ${short(ep.text, 160)} — its normal PRs wait (no merge, no question) until it verifies; the line clears itself then` });
 			}

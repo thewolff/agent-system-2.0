@@ -1,5 +1,6 @@
 # Shared helpers for backup-nightly.zsh and check-backup-fresh.zsh. Sourced, never run.
-# Callers set: STATE (state dir), PROGRESS (progress file or ""), ALERT_CMD, ALERT_FALLBACK, MODE_LABEL.
+# Callers set: STATE (state dir), PROGRESS (progress file or ""), ALERT_CMD, ALERT_FALLBACK, MODE_LABEL (check for the 9 AM
+# check; run or verify for the nightly job). The needs-you writer reads AS2_BUN, AS2_REPO and AS2_LEDGER_DB (the plists set them).
 zmodload zsh/datetime zsh/stat zsh/system zsh/zselect
 zmodload -F zsh/files b:zf_mv b:zf_rm b:zf_mkdir
 
@@ -71,20 +72,75 @@ bounded() {
   return $rc
 }
 
-# Alert with a positive delivery signal. quiet-alarm shows a popup and blocks until Jo answers it; it exits 0
-# only after the popup was shown (a button, Dismiss, or give-up) and 1 when the popup could not be shown. A
-# detached wrapper records that exit status in $STATE/alerts/<id>.result when quiet-alarm returns, so:
-#   result rc=0         the popup was displayed (the positive signal)
-#   result rc!=0        the popup failed
-#   no result yet       not known: shown and waiting, or stalled before showing
-# Process liveness is never taken as delivery. The macOS notification is sent on every alert, so a popup that
-# stalls silently still leaves a notification. ALERT_STATUS / ALERT_RESULT / ALERT_EPOCH go into the caller's
-# state file; the other job runs alert_ack_problem on them and alarms when no rc=0 result arrived in time.
+# The needs-you entry (PLAN wl-mvwkt821jx4d6e slice 3): needs_you_write <job nightly|check> <result failed|ok> <text> <state json>
+# runs surface/scripts/drive-backup-notice.ts with $AS2_BUN from $AS2_REPO on $AS2_LEDGER_DB, bounded 60 s (a ledger locked past
+# its busy retries, a hung bun). It writes one `drive-backup:` entry on the standing workload, which surface/src/errors.ts shows
+# in Jo's needs-you list until the next `check ok`. NEEDS_YOU_STATUS says what happened, never nothing:
+#   written: <entry id>                    the entry is in the ledger
+#   skipped: AS2_BUN unset                 a manual run outside launchd (the plists set it); returns 0
+#   failed: <what, exit, output>           returns 1
+NEEDS_YOU_STATUS=""
+needs_you_write() {
+  local text=${3//[[:cntrl:]]/ } miss="" o rc=0
+  if [[ -z ${AS2_BUN:-} ]]; then
+    NEEDS_YOU_STATUS="skipped: AS2_BUN unset"
+    info "needs-you entry: $NEEDS_YOU_STATUS"
+    return 0
+  fi
+  [[ -n ${AS2_REPO:-} ]] || miss+=" AS2_REPO"
+  [[ -n ${AS2_LEDGER_DB:-} ]] || miss+=" AS2_LEDGER_DB"
+  if [[ -n $miss ]]; then
+    NEEDS_YOU_STATUS="failed: AS2_BUN is set but${miss} unset; the job's plist sets all three"
+    info "needs-you entry: $NEEDS_YOU_STATUS"
+    return 1
+  fi
+  (( ${#text} > 400 )) && text="${text[1,397]}..."
+  o=$(bounded 60 "needs-you entry" "$AS2_BUN" run "$AS2_REPO/surface/scripts/drive-backup-notice.ts" --ledger "$AS2_LEDGER_DB" \
+    --job "$1" --result "$2" --text "$text" --state "$4" 2>&1) || rc=$?
+  o=${o//[[:cntrl:]]/ }
+  if (( rc == 0 )) && [[ $o == "wrote en-"* ]]; then
+    NEEDS_YOU_STATUS="written: ${${o#wrote }%% *}"
+  elif (( rc == 0 )); then
+    NEEDS_YOU_STATUS="failed: $AS2_REPO/surface/scripts/drive-backup-notice.ts exited 0 without naming the entry it wrote: ${o:-no output}"
+  else
+    NEEDS_YOU_STATUS="failed: $AS2_REPO/surface/scripts/drive-backup-notice.ts exit $rc: ${o:-no output}"
+  fi
+  info "needs-you entry: $NEEDS_YOU_STATUS"
+  [[ $NEEDS_YOU_STATUS == written:* ]]
+}
+
+# Alert on three channels, in the order the alarm rule sets (decision log 2026-10-28--1400, alarms show a silent popup
+# before any sound): the silent channels first, then the silent popup; nothing here plays a sound.
+#   1. the needs-you entry (needs_you_write, bounded 60 s): `<job> failed` for the job MODE_LABEL names, its state file
+#   2. the macOS notification, soundless (no `sound name`, the merge train's form), bounded 15 s
+#   3. quiet-alarm's silent popup, with a positive delivery signal. quiet-alarm shows a popup and blocks until Jo answers
+#      it; it exits 0 only after the popup was shown (a button, Dismiss, or give-up) and 1 when the popup could not be
+#      shown. A detached wrapper records that exit status in $STATE/alerts/<id>.result when quiet-alarm returns, so:
+#        result rc=0         the popup was displayed (the positive signal)
+#        result rc!=0        the popup failed
+#        no result yet       not known: shown and waiting, or stalled before showing
+#      Process liveness is never taken as delivery.
+# A broken channel never stops the next one. ALERT_STATUS records all three as `<popup>; notification rc <n>[ (<output>)];
+# needs-you <NEEDS_YOU_STATUS>`: the popup's part leads (alert_ack_problem and the fixtures read it there) and the needs-you
+# part is last (its output is the free text). ALERT_STATUS / ALERT_RESULT / ALERT_EPOCH go into the caller's state file; the
+# other job runs alert_ack_problem on them and reports every failed channel.
 ALERT_STATUS=none ALERT_RESULT="" ALERT_EPOCH=0
 alert() { # <title> <popup> <spoken>
-  local alog=$STATE/alert-delivery.log adir=$STATE/alerts id res
+  local alog=$STATE/alert-delivery.log adir=$STATE/alerts id res job=nightly st=$STATE/last-run.json text=$2 fo frc=0
   info "ALERT: $1 / $2"
   ALERT_EPOCH=$EPOCHSECONDS
+  # 1. needs-you
+  [[ $1 == *': '* ]] && text="${1#*: }: $2"
+  case ${MODE_LABEL:-} in
+    check) job=check st=$STATE/last-check.json ;;
+    verify) st=$STATE/last-verify.json text="restore test: $text" ;;
+  esac
+  needs_you_write $job failed "$text" "$st"
+  # 2. notification
+  fo=$(bounded 15 "notification" "$ALERT_FALLBACK" -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' -e 'end run' "$1" "$2" 2>&1) || frc=$?
+  fo=${fo//[[:cntrl:]]/ }
+  info "notification: rc $frc ${fo}"
+  # 3. popup
   id=$(strftime '%Y%m%dT%H%M%S' $EPOCHSECONDS)-$$
   res=$adir/$id.result
   if [[ ! -f $ALERT_CMD ]]; then
@@ -117,28 +173,40 @@ alert() { # <title> <popup> <spoken>
       ALERT_STATUS="sent: awaiting the popup's result in $res"
     fi
   fi
+  info "popup delivery: $ALERT_STATUS"
+  ALERT_STATUS+="; notification rc $frc${fo:+ ($fo)}; needs-you $NEEDS_YOU_STATUS"
   info "alert delivery: $ALERT_STATUS"
-  local fo frc=0
-  fo=$(bounded 15 "notification" "$ALERT_FALLBACK" -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' -e 'end run' "$1" "$2" 2>&1) || frc=$?
-  ALERT_STATUS+="; notification rc $frc${fo:+ ($fo)}"
-  info "notification: rc $frc ${fo}"
 }
 
-# alert_ack_problem <state json> <now epoch> <window seconds>: prints a problem with the alert recorded in that
-# file, or nothing. Problems: delivery failed at once; the popup reported a failure; no result after the window.
+# alert_ack_problem <state json> <now epoch> <window seconds>: prints every problem with the alert recorded in that file
+# (joined by "; "), or nothing. Problems: the needs-you entry was not written; the notification failed; the popup's delivery
+# failed at once, the popup reported a failure, or no popup result after the window. A skipped needs-you entry (AS2_BUN
+# unset: a manual run) is not a problem; it is in the file.
 alert_ack_problem() {
-  local al res ep
+  local al res ep part
+  local -a probs
   al=$(/usr/bin/jq -r '.alert // empty' "$1" 2>/dev/null)
   res=$(/usr/bin/jq -r '.alert_result // empty' "$1" 2>/dev/null)
   ep=$(/usr/bin/jq -r '.alert_epoch // 0' "$1" 2>/dev/null)
-  [[ $al == failed* ]] && { print -r -- "not delivered: $al"; return 0 }
-  [[ -n $res ]] || return 0
-  if [[ -f $res ]]; then
-    local -a rl; rl=( "${(@f)$(<$res)}" )
-    [[ ${rl[1]:-} == rc=0 ]] || print -r -- "the popup failed (${rl[1]:-empty result}; see $res)"
-    return 0
+  if [[ $al == *'; needs-you '* ]]; then
+    part=${al#*; needs-you }
+    [[ $part == failed:* ]] && probs+=( "the needs-you entry was not written: ${part#failed: }" )
   fi
-  [[ $ep == <-> ]] || ep=0
-  (( $2 - ep > $3 )) && print -r -- "no sign the popup was shown: no result in $res $(( ($2 - ep) / 3600 )) h after it was sent (stalled before showing, or still open and unanswered)"
+  if [[ $al == *'; notification rc '* ]]; then
+    part=${${al#*; notification rc }%%; needs-you *}
+    [[ $part == 0 || $part == '0 ('* ]] || probs+=( "the notification failed: rc $part" )
+  fi
+  if [[ $al == failed* ]]; then
+    probs+=( "not delivered: ${al%%; notification rc *}" )
+  elif [[ -n $res ]]; then
+    if [[ -f $res ]]; then
+      local -a rl; rl=( "${(@f)$(<$res)}" )
+      [[ ${rl[1]:-} == rc=0 ]] || probs+=( "the popup failed (${rl[1]:-empty result}; see $res)" )
+    else
+      [[ $ep == <-> ]] || ep=0
+      (( $2 - ep > $3 )) && probs+=( "no sign the popup was shown: no result in $res $(( ($2 - ep) / 3600 )) h after it was sent (stalled before showing, or still open and unanswered)" )
+    fi
+  fi
+  (( ${#probs} )) && print -r -- "${(j:; :)probs}"
   return 0
 }
