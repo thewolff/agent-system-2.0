@@ -21,7 +21,7 @@ export function ensureStandingWorkload(ledger: Ledger): string {
 	if (!standingSlice(ledger)) {
 		// The fixed id, unless a slice of that id exists and is dead (done or cancelled by a direct write): then a fresh id, same task.
 		const id = ledger.slice(STANDING_SLICE_ID) ? undefined : STANDING_SLICE_ID;
-		ledger.addSlice({ by: SURFACE_BY, id, workloadId: STANDING_WORKLOAD_ID, task: STANDING_SLICE_TASK, doneCondition: "never: open as long as the orchestrator runs", inputs: "the orchestrator's QUESTION blocks to Jo" });
+		ledger.addSlice({ by: SURFACE_BY, id, workloadId: STANDING_WORKLOAD_ID, task: STANDING_SLICE_TASK, doneCondition: "never: open as long as the orchestrator runs", inputs: "the orchestrator's closing asks to Jo" });
 	}
 	return STANDING_WORKLOAD_ID;
 }

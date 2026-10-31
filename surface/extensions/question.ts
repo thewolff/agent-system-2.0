@@ -1,18 +1,18 @@
 // The orchestrator's question to Jo as a ledger row (MIGRATION.md item 105; surface/src/orchestrator-question.ts).
-// The tool writes the `questions` row on the standing slice before the QUESTION block is rendered,
+// The tool writes the `questions` row on the standing slice before the closing ask is rendered,
 // and returns the id the block must name: P-11 row 15 (gates/src/rows/r15-orchestrator-role.ts)
-// refuses the reply that publishes a QUESTION naming no open row, and the orchestrator's next
+// refuses the reply that publishes a closing ask naming no open row, and the orchestrator's next
 // working call while the row is open. The subject workload (the one the ask is about, which Jo's
 // answer is mirrored onto) is a surface-written entry keyed by the question id, never the body
 // (Codex review of PR #55, S1). Jo answers by id at the surface (`<option> q-…`, `withdraw q-…`)
 // or in prose, which the orchestrator records with orchestrator_record_instruction naming the
 // question and the input row the surface wrote for Jo's words (surface/extensions/workload.ts).
-// Jo's standing rulings are checked first (gates/src/rulings.ts `askJo`): a question one of them decides is not raised, and the tool returns the ruling and what to do instead, with no id for a QUESTION block.
+// Jo's standing rulings are checked first (gates/src/rulings.ts `askJo`): a question one of them decides is not raised, and the tool returns the ruling and what to do instead, with no id for a closing ask.
 // `now` (one of NOW_CATEGORIES, PLAN wl-mvg1vs0rhnu3gg § 1.0) skips the rulings and reaches Jo at once; any other word is refused with nothing written.
 // An ask repeating an open question about the same workload returns that id, reused, with no second subject entry; a body naming
 // another workload's open question is a relay and is refused with nothing written (§ 3.5). A reused id an earlier reply already
-// published (row 15's `question-published:` record) is in front of Jo: row 15 refuses a second QUESTION block naming it, so the
-// reply says not to publish one (fix round 1, F2); a reused id never published is named in the QUESTION block as a new one is.
+// published (row 15's `question-published:` record) is in front of Jo: row 15 refuses a second closing ask naming it, so the
+// reply says not to publish one (fix round 1, F2); a reused id never published is named in the closing ask as a new one is.
 import { publishedQuestionIds } from "../../gates/src/rows/r15-orchestrator-role";
 import { decidedText, installedReviewModel, isNowCategory, MODEL_SUBJECTS, type ModelSubject, NOW_CATEGORIES, type NowCategory, nowMarks, subjectProblem } from "../../gates/src/rulings";
 import { raiseOrchestratorQuestion, relayedQuestion, relayRefusal, reservedQuestionBody } from "../src/orchestrator-question";
@@ -29,8 +29,8 @@ export default function questionRow(pi: SurfaceAPI, env: Record<string, string |
 		loadMode: "essential",
 		label: "Ask Jo",
 		description:
-			"Before any **QUESTION** block to Jo, raise the question here: it becomes a ledger row on your standing slice, so Jo can answer it by id, the needs-you lines show it, and a restart re-renders it. " +
-			"Put the returned q-… id in the QUESTION block (e.g. `**QUESTION**\\n(q-…) Should …? Options: a / b`). A QUESTION block naming no such row leaves your next working call refused (P-11 row 15). " +
+			"Before any closing ask to Jo, raise the question here: it becomes a ledger row on your standing slice, so Jo can answer it by id, the needs-you lines show it, and a restart re-renders it. " +
+			"Put the returned q-… id in the closing ask (e.g. `**Closing ask**\\n(q-…) Should …? Options: a / b`). A closing ask naming no such row leaves your next working call refused (P-11 row 15). " +
 			"Name the open workload the ask is about: Jo's answer is mirrored there as an instruction row, where its lanes read it. " +
 			"Jo's standing rulings are checked first: a question one of them already answers is not raised, and the tool returns the ruling and what to do instead. " +
 			"When every option is a provider/model id, `subject` says what the model is for (lane-model or review-model); otherwise it is left out. " +
@@ -83,14 +83,14 @@ export default function questionRow(pi: SurfaceAPI, env: Record<string, string |
 				const reused = `Question ${id}${about ? ` about ${about}` : ""} is already open with this body and options; nothing new was raised.${nowNote}`;
 				if (publishedQuestionIds(ledger).has(id)) {
 					return text(
-						`${reused} An earlier reply already put ${id} in front of Jo: send no new QUESTION block for it (P-11 row 15 holds a reply that asks a row twice); if you mention it, name ${id} in plain words. ${answers}`,
+						`${reused} An earlier reply already put ${id} in front of Jo: send no new closing ask for it (P-11 row 15 holds a reply that asks a row twice); if you mention it, name ${id} in plain words. ${answers}`,
 						{ id, about, options, reused: true, published: true, now: mark },
 					);
 				}
-				return text(`${reused} Name ${id} in your QUESTION block. ${answers}`, { id, about, options, reused: true, published: false, now: mark });
+				return text(`${reused} Name ${id} in your closing ask. ${answers}`, { id, about, options, reused: true, published: false, now: mark });
 			}
 			pi.appendEntry("surface-question", { id, about });
-			return text(`Raised question ${id}${about ? ` about ${about}` : ""} (${options.join(" / ")}); name ${id} in your QUESTION block.${nowNote} ${answers}`, { id, about, options, now: mark });
+			return text(`Raised question ${id}${about ? ` about ${about}` : ""} (${options.join(" / ")}); name ${id} in your closing ask.${nowNote} ${answers}`, { id, about, options, now: mark });
 		},
 	});
 }

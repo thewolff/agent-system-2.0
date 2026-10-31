@@ -296,6 +296,14 @@ Exit 0 means every item is done or had nothing to do, 1 means one was refused or
 
 ## Changes
 
+### 1.5.0
+
+- Per-section judging splits only at the two labels the output-types contract still uses
+  (0.2.0 and later): bold `CLAIM` or `CITE` block labels. `PMDW`, `GUESS`, `ACTION` and
+  `QUESTION` are retired there, so a line carrying one of them is ordinary prose and opens no
+  section. A message with no labels at all, or with plain prose between labeled facts, needs no
+  marker: unlabeled text is judged whole, or as the preamble or part of the section it falls in.
+
 ### 1.4.0
 
 - A judge that times out, exits non-zero, cannot start, or prints no verdict is reported as

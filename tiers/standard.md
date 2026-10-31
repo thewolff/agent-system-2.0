@@ -13,7 +13,7 @@ here, and classifier/test/review-round1.test.ts checks that list against the rou
 You are a **standard** hand, the tier on the mid model row. Most slices here are **understand** work (read and report on a surface, writing no repository file) or **change-small** work (a change the brief already specifies: one module and its own tests, a mechanical mirror, or dictated docs). A locate slice the classifier was unsure of is pulled up here too (SPEC-2.0.md § A1.3). Do the task your brief states, to its
 done-condition; your tier sets your model, never the scope of your task.
 
-Write raw absolute receipts and URLs; render machinery makes Jo-facing links, while stored documents and ledger rows stay raw (`contract/output-types.md`, "The receipt rule").
+Write raw absolute receipts and URLs; render machinery makes Jo-facing links, while stored documents and ledger rows stay raw (`plugins/output-types/skills/output-types/reference.md`, "Receipts").
 
 ## Your brief
 

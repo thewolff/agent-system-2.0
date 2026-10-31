@@ -198,25 +198,25 @@ describe("R2-S1: question row declarations bind only while a question is open (S
 	});
 });
 
-describe("R2-S2: exactly one closing ask, as a structured decision block (row 1)", () => {
+describe("R2-S2: exactly one closing ask, as the closing ask (row 1)", () => {
 	const cases: [string, "ALLOW" | "BLOCK"][] = [
 		// The review's shape probes.
-		["**ACTION**\nRun:\n```\ngit push origin feature\n```", "BLOCK"],
-		["**QUESTION**\nChoose A or B?\n\nHere is more prose after the ask.", "BLOCK"],
-		["**QUESTION**\nChoose A or B?\n\nUnrelated new ask?", "BLOCK"],
-		["**PMDW**\nChoose A or B? Also deploy or wait?", "BLOCK"],
+		["Run:\n```\ngit push origin feature\n```", "BLOCK"],
+		["**Closing ask**\nChoose A or B?\n\nHere is more prose after the ask.", "BLOCK"],
+		["**Closing ask**\nChoose A or B?\n\nUnrelated new ask?", "BLOCK"],
+		["Choose A or B? Also deploy or wait?", "BLOCK"],
 		// Two asks sharing one label, on one line and on two.
-		["**QUESTION**\nChoose A or B? And deploy now or wait?", "BLOCK"],
-		["**QUESTION**\nChoose A or B?\nDeploy now or wait?", "BLOCK"],
-		// One ask, but not in a QUESTION block.
-		["**PMDW**\nWant me to deploy now or wait?", "BLOCK"],
-		["**CLAIM**\nIs the gate built? Yes.\n\n**QUESTION**\nShip now or wait for M5? Recommend now.", "BLOCK"],
-		// A QUESTION block with no ask in it.
-		["**QUESTION**\nShip now or wait for M5. Recommend now.", "BLOCK"],
+		["**Closing ask**\nChoose A or B? And deploy now or wait?", "BLOCK"],
+		["**Closing ask**\nChoose A or B?\nDeploy now or wait?", "BLOCK"],
+		// One choice, but in prose beside a CLAIM rather than in the closing ask.
+		["**CLAIM**\nThe gate is built.\n\nWant me to deploy now or wait?", "BLOCK"],
+		["**CLAIM**\nIs the gate built? Yes.\n\n**Closing ask**\nShip now or wait for M5? Recommend now.", "BLOCK"],
+		// A closing ask with no ask in it.
+		["**Closing ask**\nShip now or wait for M5. Recommend now.", "BLOCK"],
 		// Allowed: one ask, last, with an option list; question marks in inline code, fences and URLs are not asks.
-		["**CLAIM**\nDone.\n\n**QUESTION**\nShip now or wait for M5? Recommend now.\n- now\n- wait", "ALLOW"],
-		["**CLAIM**\nThe matcher reads `a?b` and https://example.com/x?y=1 literally.\n```ts\nconst x = a ?? b;\n```\n**QUESTION**\nShip now or wait? Recommend now.", "ALLOW"],
-		["**PMDW**\nDone, nothing needs you.", "ALLOW"],
+		["**CLAIM**\nDone.\n\n**Closing ask**\nShip now or wait for M5? Recommend now.\n- now\n- wait", "ALLOW"],
+		["**CLAIM**\nThe matcher reads `a?b` and https://example.com/x?y=1 literally.\n```ts\nconst x = a ?? b;\n```\n**Closing ask**\nShip now or wait? Recommend now.", "ALLOW"],
+		["Done, nothing needs you.", "ALLOW"],
 	];
 	for (const [text, want] of cases) test(`${want}: ${JSON.stringify(text)}`, () => expect(verdict(checkTurnShape(text))).toBe(want));
 });

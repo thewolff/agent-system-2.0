@@ -164,28 +164,24 @@ Two of three legs landed (out/status.json).
 
 ## Contract misread
 
-**PMDW**
 None.
 
 ## Valid + actionable
 
 ### S1 · empty input unchecked · 2/3
-**GUESS(inference)**
 - anthropic, openai — both name the empty read.
 
 ## Valid trade-off
 
-**PMDW**
 None.
 
 ## Noise
 
-**PMDW**
 None.
 
 ## Disagreements worth your attention
 
-- **GUESS(inference)** S2 · ordering assumption · 1/3 — anthropic raises it; openai's item says the ordering holds.
+- S2 · ordering assumption · 1/3 — anthropic raises it; openai's item says the ordering holds.
 `;
 
 function doubtReport(change: { markdown?: (md: string) => string; findings?: unknown; dropped?: unknown } = {}): Record<string, unknown> {
@@ -348,23 +344,19 @@ const QUORUM_MD = `## quorum — kit fixture
 ## Converged across labs
 
 ### S1 · add an LRU · 2/3
-**GUESS(inference)**
 anthropic and openai both add an LRU.
 
 ## Divergent — the real decision points
 
-**PMDW**
 None.
 
 ## Unique and load-bearing
 
 ### S2 · tune the TTL · 1/3
-**GUESS(inference)**
 kimi alone tunes the TTL.
 
 ## Vs. the withheld draft
 
-**GUESS(inference)**
 The draft's LRU step is corroborated by two labs.
 `;
 
@@ -461,7 +453,7 @@ describe("check", () => {
 
 	test("rejects a disagreement case placed outside the disagreement section", () => {
 		const report = doubtReport({
-			markdown: (md) => md.replace("## Noise\n\n**PMDW**\nNone.\n", "## Noise\n\n- **GUESS(inference)** S2 · ordering assumption · 1/3 — misfiled.\n").replace(/\n## Disagreements[\s\S]*$/, "\n"),
+			markdown: (md) => md.replace("## Noise\n\nNone.\n", "## Noise\n\n- S2 · ordering assumption · 1/3 — misfiled.\n").replace(/\n## Disagreements[\s\S]*$/, "\n"),
 			findings: [
 				{ id: "S1", title: "empty input unchecked", section: "Valid + actionable", supportIds: ["anthropic-1", "openai-1"], refuteIds: [] },
 				{ id: "S2", title: "ordering assumption", section: "Noise", supportIds: ["anthropic-2"], refuteIds: ["openai-2"] },
@@ -520,21 +512,19 @@ describe("check", () => {
 		expect(failuresOnly(run, "hash:")).toEqual(["hash: out/notes.md has no hash in any panel-published entry"]);
 	});
 
-	test("rejects a statement block with no contract label", () => {
-		const { run } = doubtPanel(doubtReport({ markdown: (md) => md.replace("## Noise\n\n**PMDW**\nNone.", "## Noise\n\nNone.") }));
-		expect(failuresOnly(run, "labels:")).toEqual(['labels: a statement block opens without a bold contract label: "None."']);
+	test("accepts unlabeled statement blocks: the contract labels only receipted facts", () => {
+		const { run, pg } = doubtPanel(doubtReport({ markdown: (md) => md.replace("**CLAIM**\n**Legs:**", "**Legs:**") }));
+		expect(check(run, env)).toEqual({ pg, failures: [] });
 	});
 
-	test("accepts row 3's trailing receipt-flag block, and still rejects an unlabeled block after it", () => {
+	test("accepts row 3's trailing receipt-flag block", () => {
 		const flags = renderFlags(['CLAIM quote "anthropic-6" does not match in/synth.md']);
 		const { run, pg } = doubtPanel(doubtReport({ markdown: (md) => md + flags }));
 		expect(check(run, env)).toEqual({ pg, failures: [] });
-		const { run: after } = doubtPanel(doubtReport({ markdown: (md) => `${md}${flags}\nNone.\n` }));
-		expect(failuresOnly(after, "labels:")).toEqual(['labels: a statement block opens without a bold contract label: "---"', 'labels: a statement block opens without a bold contract label: "None."']);
 	});
 
 	test("rejects a report missing a mode section", () => {
-		const { run } = doubtPanel(doubtReport({ markdown: (md) => md.replace("## Valid trade-off\n\n**PMDW**\nNone.\n\n", "") }));
+		const { run } = doubtPanel(doubtReport({ markdown: (md) => md.replace("## Valid trade-off\n\nNone.\n\n", "") }));
 		expect(failuresOnly(run, "sections:")).toEqual(['sections: doubt report has no "## Valid trade-off" section']);
 	});
 

@@ -15,7 +15,7 @@ disposition (admitted, dropped or do-not-flag) is in `sources.md`.
   (comma-joined when a rule reads two).
 - `mode`: `mechanical` (audit.ts) or `judgment` (the agent; the check names its evidence after "Evidence:"). A judgment
   finding is written in two parts: the observation as **CLAIM** with the evidence.json value as receipt, and the
-  assessment as **GUESS(inference)** with its basis. Intent is never asserted; spam-policy rows are indicators only.
+  assessment unlabeled, with its basis in the sentence. Intent is never asserted; spam-policy rows are indicators only.
 - `applies-when`: the condition that makes the row apply; the default is "the audited URL is meant to be indexed".
 - `intent-effect`: what `--intent noindex=<url>` does to the row for that URL. `observe`: the exclusion is expected, so
   the row becomes an observation. `keep`: the row stays a finding because it defeats the intended exclusion (IDX-002,

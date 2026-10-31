@@ -100,10 +100,8 @@ never to grant repo access to one leg — it is to ground all three identically:
 2. If yes, spawn **one** Claude agent (Agent tool) with `prompts/ground.md`, the brief,
    and the byte cap (`QUORUM_CONTEXT_MAX_BYTES`, default 131072). It reads the relevant
    repos and writes the pack — real paths, hard constraints, cross-repo seams, current
-   state, receipts on every fact — to a scratchpad file. Include in its prompt,
-   verbatim: *"Start your response with the literal text `PMDW`, then a blank line,
-   then your content — every turn, including turns that open with a tool call and no
-   leading prose."*
+   state, receipts on every fact — to a scratchpad file. The output-types contract reaches it through the
+   system prompt (P-11 row 2), so the prompt need not restate it.
 3. **Gate: show the user the pack's path and byte size, and wait for approval before
    any leg spawns.** It is the one input every leg shares, so a bad pack wastes the
    entire run — and it is a single point of bias: a Claude blind spot here propagates

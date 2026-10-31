@@ -11,7 +11,7 @@ as2 was built for one user on one Mac. This page lists what you can change today
 | `profile/mcp.json` | Merged into `mcp.json` beside `config.yml` | The profile's MCP servers: ctx, Linear and PostHog (definitions only; the Linear and PostHog logins are per profile, see [getting-started.md](getting-started.md#mcp-logins-linear-and-posthog)). The installer refuses a file without an `mcpServers.ctx` entry that has a `command` |
 | `tiers/*.md` | Linked into `agents/` | The six role prompts (orchestrator, lane, four hand tiers). Links, so edits are live without a re-install |
 | `voice/VOICE.md` | Read in place | The voice the orchestrator writes in; rendered into its system prompt at each `as2` launch |
-| `contract/output-types.md` | Read in place | The output-types contract injected into every session |
+| `plugins/output-types/skills/output-types/reference.md` | Read in place | The output-types contract injected into every session (the vendored public plugin, plugins/VENDOR.md) |
 
 Edit the files in the checkout and re-run `bash install/install.sh`. The installer overwrites the installed `config.yml` and `models.yml` on every run, so edits made directly in `~/.omp/profiles/` are lost at the next install. `mcp.json` is merged instead: each server named in `profile/mcp.json` replaces the installed server of the same name, and every other installed server and top-level setting is kept. A server removed from `profile/mcp.json` stays installed until you delete it from the installed file, and an installed `mcp.json` that is not a JSON object stops the install (exit 2) before anything is written. The one other exception is `as2 on` / `as2 off`, which flips `gates.fence.enabled` in the installed file until the next install.
 
@@ -40,7 +40,7 @@ Edit the files in the checkout and re-run `bash install/install.sh`. The install
 | `AGENT_SYSTEM_MAX_LANES` | 3 | Autonomous lanes holding workloads at once |
 | `AGENT_SYSTEM_LANE_MAX_TIME` | `2h` | OMP `--max-time` for a lane; the ceiling's remaining wall time takes over when set |
 | `AGENT_SYSTEM_VOICE` | `voice/VOICE.md` in the checkout | The voice document |
-| `AGENT_SYSTEM_CONTRACT` | `contract/output-types.md` in the checkout | The output-types contract |
+| `AGENT_SYSTEM_CONTRACT` | `plugins/output-types/skills/output-types/reference.md` in the checkout | The output-types contract |
 | `AGENT_SYSTEM_DECISION_LOG` | `<repo>/.ai/decision-log` | Where decision-log entries are read from, and written when no lane branch can take one |
 | `AGENT_SYSTEM_TEST_RUNS` | `test-runs/` beside the ledger | The test runner's runs root |
 
