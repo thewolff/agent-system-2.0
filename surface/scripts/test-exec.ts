@@ -4,8 +4,9 @@
 //
 //   exec prepare <run id> <sha>        clone <stage>/<run id>/repo.bundle into runs/<run id>/repo, detached at <sha>
 //   exec full    <run id>              bun test, junit to runs/<run id>/full.xml, console to full.log, under the full cap;
-//                                      with `--parallel=<n>` when caps.json carries `fullWorkers` over 1 (profile/config.yml
-//                                      `testRunner.fullWorkers`; no key runs serially)
+//                                      with resource-admitted `--parallel=<n>` beneath caps.json `fullWorkers`' ceiling when
+//                                      n is over 1 (at one, no `--parallel`: it implies --isolate, and the part stays serial);
+//                                      every part also bounds concurrent cases with `--max-concurrency=1`
 //   exec solo    <run id> ./<file>     bun test ./<file> alone, to solo-<i>.xml/.log, under the solo cap
 //   exec base-prepare <run id> <sha>   the same bundle cloned into runs/<run id>/base/repo at base's <sha> (PLAN wl-mv8s8srodefytc D8)
 //   exec base-solo <run id> ./<file>   `solo` in the base clone, to base-solo-<i>.xml/.log
@@ -32,9 +33,9 @@
 // `<part stem>.signature.log` (both modes); in enforce it then kills every process group holding an owned process and
 // exits 125. Shadow only logs `stuck-would-stop` and leaves the part to its cap.
 //
-// Parallel files (workload wl-mvg2kzuvwngdmo): the worker count rides in caps.json, never in argv, so `full <run id>`
-// keeps its operand count and the installed wrapper needs no change. The runner logs `full workers <n>` before the PR
-// full part; surface/scripts/test-run-waits.ts reads it back per run. The reversal is `fullWorkers: 1` in the profile.
+// Resource policy: caps.json carries only the worker ceiling and optional fixed timingProof booleans, not costs,
+// executable paths or arbitrary env. The wrapper fixes measured resources.json and pinned installed-omp.json.
+// Each part records its actual admission and child argv in <part-stem>.resources.json; configured workers alone are not observation.
 import { Database } from "bun:sqlite";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import {
@@ -45,6 +46,10 @@ import { constants as osConstants } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { type ExecConfig, probeAnswerLine, REAL_GIT, UID_SWEEP } from "../src/as2test";
 import { sweepLegacyNativeTemps } from "../src/as2test-temp";
+import {
+	admitResources, boundedTestArgs, parseResourceCosts, parseTimingProof, proofChildEnv, readInstalledOmp, readResourceInputs, verifyTrustedPath,
+	type InstalledOmp, type ResourceAdmission, type ResourceCosts, type ResourceInputs,
+} from "../src/test-resources";
 import {
 	liveOwned, type Observation, observe, type Proc as Seen, type Signature, type Snapshot, snapshot, STUCK_DEFAULTS, StuckDetector, type TickResult,
 } from "../src/stuck-detect";
@@ -77,13 +82,14 @@ function config(): Config {
 	const c = v as Record<string, unknown>;
 	const abs = (x: unknown): x is string => typeof x === "string" && isAbsolute(x) && normalize(x) === x;
 	const ms = (x: unknown): x is number => typeof x === "number" && Number.isSafeInteger(x) && x >= 0;
-	if (!abs(c.root) || !abs(c.bun) || (c.sweep !== "groups" && c.sweep !== UID_SWEEP) || !(c.hooks === null || abs(c.hooks)) || !ms(c.killGraceMs) || !ms(c.sweepLockWaitMs) || !ms(c.captureMs)
+	if (!abs(c.root) || !abs(c.bun) || !abs(c.resourcesPath) || !abs(c.ompRuntimePath) || (c.sweep !== "groups" && c.sweep !== UID_SWEEP) || !(c.hooks === null || abs(c.hooks)) || !ms(c.killGraceMs) || !ms(c.sweepLockWaitMs) || !ms(c.captureMs)
 		|| !ms(c.detectTickMs) || c.detectTickMs < 1 || !ms(c.detectPersistMs) || !ms(c.signatureCaptureMs) || !ms(c.stopGraceMs) || typeof c.detectTrace !== "boolean") {
 		return refuse("wrapper config is malformed");
 	}
 	if (c.sweep !== "groups" && (c.hooks !== null || c.detectTrace)) return refuse("hooks and detectTrace are for a groups render only");
 	return {
 		root: c.root, bun: c.bun, sweep: c.sweep, hooks: c.hooks, killGraceMs: c.killGraceMs, sweepLockWaitMs: c.sweepLockWaitMs, captureMs: c.captureMs,
+		resourcesPath: c.resourcesPath, ompRuntimePath: c.ompRuntimePath,
 		detectTickMs: c.detectTickMs, detectPersistMs: c.detectPersistMs, signatureCaptureMs: c.signatureCaptureMs, stopGraceMs: c.stopGraceMs, detectTrace: c.detectTrace,
 	};
 }
@@ -1273,6 +1279,66 @@ async function teardown(cfg: Config, work: string, owned: Seen[]): Promise<Teard
  */
 async function part(cfg: Config, runId: string, work: string, dir: string, argv: string[], logPath: string, cap: number, mode: StuckMode): Promise<number> {
 	const stem = basename(logPath, ".log");
+	// Admission is shared by ordinary/proof, full/fast/solo and runs before any test child exists.
+	// A part freezes both the outer workers and the concurrent-case limit; subprocess peaks are
+	// included in measured worker costs, not claimed to be OS-enforced by Bun's case scheduler.
+	const { v: staged } = caps(areas(cfg), runId);
+	const configuredWorkers = stem === "full" || stem === "fast" ? fullWorkers(areas(cfg), runId) : 1;
+	let inputs: ResourceInputs | null = null;
+	let costs: ResourceCosts | null = null;
+	let admission: ResourceAdmission | null = null;
+	let omp: InstalledOmp | null = null;
+	let bun: { path: string; version: string; controls: string[] } | null = null;
+	let executionArgv: string[] | null = null;
+	let env: Record<string, string>;
+	let bounded: string[];
+	const resourcesPath = join(work, `${stem}.resources.json`);
+	const receipt = (error?: string): void => {
+		const fd = openSync(resourcesPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
+		const errors: string[] = [];
+		try {
+			writeFileSync(fd, `${JSON.stringify({ version: 1, status: error ? "error" : "admitted", configuredWorkers,
+				selectedWorkers: admission?.selectedWorkers ?? null, nestedConcurrency: 1, inputs, costs, bun, installedOmp: omp, executionArgv, ...(error ? { error } : {}) })}\n`);
+		} catch (e) { errors.push(`write ${resourcesPath}: ${errText(e)}`); }
+		try { closeSync(fd); } catch (e) { errors.push(`close ${resourcesPath}: ${errText(e)}`); }
+		if (errors.length) throw new Error(errors.join("; "));
+	};
+	try {
+		const proof = parseTimingProof(staged.timingProof);
+		inputs = readResourceInputs();
+		try {
+			if (cfg.sweep !== "groups") verifyTrustedPath(cfg.resourcesPath);
+			costs = parseResourceCosts(JSON.parse(readFileSync(cfg.resourcesPath, "utf8")));
+		} catch (e) {
+			throw new Error(`resource calibration ${cfg.resourcesPath}: ${errText(e)}; provision measured worker (including nested subprocess peaks) and host plus historic-load reserve costs via install/as2test-setup.sh --resources=<file>`);
+		}
+		admission = admitResources(configuredWorkers, inputs, costs);
+		const controlEnv = proofChildEnv(process.env, dir, null, null);
+		const checked = (args: string[]): string => {
+			const r = spawnSync(cfg.bun, args, { env: controlEnv, encoding: "utf8", timeout: 10_000, maxBuffer: 1024 * 1024 });
+			if (r.error || r.status !== 0) throw new Error(`${cfg.bun} ${args.join(" ")} failed: ${r.error?.message ?? `exit ${r.status} signal ${r.signal}`} ${r.stderr}`);
+			return `${r.stdout}${r.stderr}`;
+		};
+		const help = checked(["test", "--help"]);
+		if (!help.includes("--parallel=") || !help.includes("--max-concurrency=")) throw new Error(`${cfg.bun} test --help does not expose --parallel and --max-concurrency; install a supported pinned Bun`);
+		// The receipt's controls are the flags boundedTestArgs adds (no `--parallel` at one worker), never a second spelling of them.
+		bun = { path: cfg.bun, version: checked(["--version"]).trim(), controls: boundedTestArgs(["test"], admission.selectedWorkers).slice(1) };
+		if (proof?.installedOmp) {
+			if (cfg.sweep === "groups") throw new Error("installed OMP proofs require the actual _as2test uid wrapper; a groups/operator fixture is not admitted");
+			const id = spawnSync("/usr/bin/id", ["-u", AS2TEST_USER], { encoding: "utf8", timeout: 10_000 });
+			if (id.error || id.status !== 0 || !/^[1-9]\d*\s*$/.test(id.stdout) || Number(id.stdout.trim()) !== process.getuid?.()) throw new Error(`installed OMP proof must run as ${AS2TEST_USER}; id evidence: ${id.error?.message ?? id.stderr} ${id.stdout}`);
+			omp = readInstalledOmp(cfg.ompRuntimePath);
+			const versionEnv = proofChildEnv(process.env, dir, proof, omp);
+			const version = spawnSync(join(omp.root, "bin", "omp"), ["--version"], { env: versionEnv, cwd: dir, encoding: "utf8", timeout: 10_000, maxBuffer: 1024 * 1024 });
+			if (version.error || version.status !== 0 || version.stdout.trim() !== omp.version) throw new Error(`installed OMP ${omp.root}/bin/omp --version does not match ${omp.version}: ${version.error?.message ?? `exit ${version.status} signal ${version.signal}`} stdout=${version.stdout} stderr=${version.stderr}`);
+		}
+		env = proofChildEnv(process.env, dir, proof, omp);
+		bounded = boundedTestArgs(argv, admission.selectedWorkers);
+	} catch (e) {
+		const error = `part ${runId}/${stem} admission failed: ${errText(e)}`;
+		try { receipt(error); } catch (writeError) { return failed(`${error}; resource receipt ${resourcesPath} failed: ${errText(writeError)}`); }
+		return failed(`${error}; evidence ${resourcesPath}`);
+	}
 	const markerDir = join(work, `stuck-markers-${stem}`);
 	const preload = join(work, `stuck-preload-${stem}.js`);
 	let off: string | null = process.platform === "darwin" ? null : `not darwin (${process.platform})`;
@@ -1291,10 +1357,13 @@ async function part(cfg: Config, runId: string, work: string, dir: string, argv:
 			off = `setup failed: ${errText(e)}`;
 		}
 	}
-	const env = childEnv(process.env, dir);
+	// The allowlisted, proof-only environment was admitted before detector setup.
 	if (off === null) env.AS2TEST_STUCK_MARKERS = markerDir;
+	const args = off === null ? [bounded[0]!, "--preload", preload, ...bounded.slice(1)] : bounded;
+	executionArgv = [cfg.bun, ...args];
+	try { receipt(); } catch (e) { return failed(`part ${runId}/${stem} resource receipt ${resourcesPath} failed: ${errText(e)}; no test child launched`); }
+	process.stdout.write(`resource admission ${stem}: configured ${configuredWorkers}, selected ${admission!.selectedWorkers}, nested 1; ${resourcesPath}\n`);
 	const log = openSync(logPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
-	const args = off === null ? [argv[0]!, "--preload", preload, ...argv.slice(1)] : argv;
 	const child = spawn(cfg.bun, args, { cwd: join(dir, "repo"), env, stdio: ["ignore", log, log], detached: true });
 	closeSync(log);
 	const pgid = child.pid;
@@ -1371,12 +1440,11 @@ async function full(cfg: Config, a: Areas, runId: string): Promise<number> {
 	fence(a, runId);
 	const work = workDir(a, runId);
 	const cap = capMs(a, runId, "fullCapMin");
-	const workers = fullWorkers(a, runId);
 	const mode = stuckMode(a, runId);
 	const xml = join(work, "full.xml");
 	const log = join(work, "full.log");
 	for (const stale of ["full.xml", "full.log", "full.stuck.log", "full.signature.log", "full.stuck-trace.jsonl"]) unlinkIfPresent(join(work, stale));
-	return part(cfg, runId, work, work, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, ...(workers > 1 ? [`--parallel=${workers}`] : [])], log, cap, mode);
+	return part(cfg, runId, work, work, ["test", "--reporter=junit", `--reporter-outfile=${xml}`], log, cap, mode);
 }
 
 /** A test operand's repo-relative path: `./<plain relative path>` naming a Bun test file, checked before anything is touched. */
@@ -1450,12 +1518,11 @@ async function fast(cfg: Config, a: Areas, runId: string, files: string[]): Prom
 	const repo = cloneOf(work);
 	rels.forEach((rel, i) => inClone(repo, files[i]!, rel));
 	const cap = capMs(a, runId, "fastCapMin");
-	const workers = fullWorkers(a, runId);
 	const mode = stuckMode(a, runId);
 	const xml = join(work, "fast.xml");
 	const log = join(work, "fast.log");
-	for (const stale of ["fast.xml", "fast.log", "fast.stuck.log", "fast.signature.log", "fast.stuck-trace.jsonl"]) unlinkIfPresent(join(work, stale));
-	const argv = ["test", "--reporter=junit", `--reporter-outfile=${xml}`, ...(workers > 1 ? [`--parallel=${workers}`] : []), ...rels.map((r) => `./${r}`)];
+	for (const stale of ["fast.xml", "fast.log", "fast.resources.json", "fast.stuck.log", "fast.signature.log", "fast.stuck-trace.jsonl"]) unlinkIfPresent(join(work, stale));
+	const argv = ["test", "--reporter=junit", `--reporter-outfile=${xml}`, ...rels.map((r) => `./${r}`)];
 	return part(cfg, runId, work, work, argv, log, cap, mode);
 }
 

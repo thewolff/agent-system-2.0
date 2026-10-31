@@ -141,8 +141,10 @@ function world(): World {
 	const libexec = join(root, "libexec");
 	mkdirSync(libexec);
 	chmodSync(libexec, 0o755);
+	const resourcesPath = join(root, "resources.json");
+	writeFileSync(resourcesPath, JSON.stringify({ workerCpu: 1, workerMemoryBytes: 1, reserveCpu: 0, reserveMemoryBytes: 0, calibration: "synthetic test fixture only; not host calibration" }));
 	writeFileSync(join(libexec, "exec"), renderExecWrapper({
-		root: as2, bun: process.execPath, script: TEST_EXEC, sweepScope: "groups", hooks: join(root, "hooks"), killGraceMs: 300, sweepLockWaitMs: 30_000,
+		root: as2, bun: process.execPath, script: TEST_EXEC, sweepScope: "groups", hooks: join(root, "hooks"), resourcesPath, killGraceMs: 300, sweepLockWaitMs: 30_000,
 	}));
 	writeFileSync(join(libexec, "bun"), "stand-in for the installed bun\n");
 	writeFileSync(join(libexec, "test-exec.js"), "stand-in for the installed bundle\n");
