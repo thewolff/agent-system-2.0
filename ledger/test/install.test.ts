@@ -154,6 +154,43 @@ describe("install: the tracing switch (wl-mv65t5d34lts00 PLAN.md § 8.1)", () =>
 	});
 });
 
+describe("install: the profile's mcp.json is merged, never replaced (PR #400 review B1)", () => {
+	interface McpFile { mcpServers: Record<string, unknown>; disabledServers?: string[] }
+	const mcpPath = (home: string) => join(home, ".omp", "profiles", "agent-system-2", "agent", "mcp.json");
+	const readMcp = (path: string): McpFile => JSON.parse(readFileSync(path, "utf8"));
+
+	test("a fresh install writes profile/mcp.json; a reinstall keeps an installed server and setting the repo does not own and restores the repo's servers", () => {
+		const repo = readMcp(join(copy, "profile", "mcp.json"));
+		const first = install("mcp-merge");
+		expect(first.exitCode).toBe(0);
+		const path = mcpPath(first.home);
+		expect(readMcp(path)).toEqual(repo);
+
+		const live = readMcp(path);
+		live.mcpServers["hand-added"] = { type: "stdio", command: "true" };
+		live.mcpServers.linear = { type: "http", url: "https://example.invalid/stale" };
+		live.disabledServers = ["hand-added"];
+		writeFileSync(path, JSON.stringify(live));
+
+		const again = install("mcp-merge");
+		expect(again.exitCode).toBe(0);
+		const merged = readMcp(path);
+		expect(merged.disabledServers).toEqual(["hand-added"]);
+		expect(merged.mcpServers).toEqual({ ...repo.mcpServers, "hand-added": { type: "stdio", command: "true" } });
+	});
+
+	test("an installed mcp.json that is not a JSON object stops the install with exit 2, the file untouched", () => {
+		const first = install("mcp-bad");
+		expect(first.exitCode).toBe(0);
+		const path = mcpPath(first.home);
+		writeFileSync(path, "{ not json");
+		const again = install("mcp-bad");
+		expect(again.exitCode).toBe(2);
+		expect(again.out).toContain(`${path} is not JSON`);
+		expect(readFileSync(path, "utf8")).toBe("{ not json");
+	});
+});
+
 describe("install: a ledger at an older schema version is refused with exit 4, nothing written (N1)", () => {
 	// The first schema (94f06b9, version 1) and the last before the hand's identity columns (1fe1b6e, version 4).
 	for (const [rev, version] of [["94f06b9", 1], ["1fe1b6e", 4]] as const) {
