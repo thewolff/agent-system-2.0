@@ -1122,7 +1122,15 @@ export function meterPoll(
 			if (s.notice === 100 && v.w.mode === "autonomous") {
 				hitTried = true;
 				entry(spendBody(r.laneId, r.spend));
-				hit = ceilingHit(ledger, r, v, pushes, alarmFile);
+				// `pushes` was checked against the pre-write window: a branch whose window start or mark changed since (a ceiling
+				// word, a notice, a mark landing in between) is unknown, never progress, so a push read before the window opened cannot raise.
+				const current = pushes === null ? null : new Map(v.branches.map((b) => {
+					const k = branchKey(b);
+					const unchanged = v.start === pre.start && JSON.stringify(v.marks.get(k) ?? null) === JSON.stringify(pre.marks.get(k) ?? null);
+					const p: PushCheck = unchanged ? (pushes.get(k) ?? { kind: "unknown", error: "the remote was not read before the deciding write" }) : { kind: "unknown", error: "the window or its mark changed between the remote read and the deciding write" };
+					return [k, p] as const;
+				}));
+				hit = ceilingHit(ledger, r, v, current, alarmFile);
 			} else if (s.notice !== null) sendCeilingNotice(ledger, { workloadId: r.workloadId, laneId: r.laneId, level: s.notice, spend: r.spend, ceiling: v.ceiling, stakes: v.w.stakes });
 			else if (s.stop) entry(spendBody(r.laneId, r.spend));
 			if (s.stop) entry(laneStopAcceptedBody(r.laneId, "ceiling"));

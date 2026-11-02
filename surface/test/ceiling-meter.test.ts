@@ -442,6 +442,22 @@ describe("PLAN wl-mvqwn80onq9hq8 D12: a 100 % hit rises once by half on progress
 		expect(s.poll(50.2).hit).toMatchObject({ kind: "asked", first: `ceiling reached on ${s.wl}: no progress since ${noticeAt}` });
 	});
 
+	test("R29 a push read before a ceiling word lands between the remote read and the deciding write is unknown, never progress", () => {
+		const s = setup();
+		s.poll(25); // the baseline poll marks head A
+		s.fake.state.heads[`origin wl/${s.wl}`] = SHA_B;
+		// Jo's ceiling word lands after the hit has read B against A, before its write: the window now opens at the new ceiling row
+		s.fake.probe.carries = () => {
+			apply(s.ledger, interpret(s.ledger, `ceiling 40 5 ${s.wl}`)!);
+			return true;
+		};
+		expect(s.poll(50.2).hit).toMatchObject({
+			kind: "asked",
+			first: `ceiling reached on ${s.wl}: push check failed: origin wl/${s.wl}: the window or its mark changed between the remote read and the deciding write`,
+		});
+		expect(s.rows("ceiling").filter((x) => x.createdBy === LANE_RUNNER_BY)).toEqual([]);
+	});
+
 	test("R29 a commit on the workload branch or a push-dest branch the mark lacked is progress, named by remote, branch and sha", () => {
 		const s = setup();
 		s.ledger.recordEntry({ by: LANE, workloadId: s.wl, kind: "assumption", body: `push-dest: fork feature/offset ${SHA_A}` });
