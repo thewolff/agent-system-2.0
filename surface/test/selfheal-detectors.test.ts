@@ -1,13 +1,13 @@
-// The seven self-heal detectors (PLAN wl-mvbcjageg7o2yo § 2.3, R3–R10) on fixtures cut from the
+// The eight self-heal detectors (PLAN wl-mvbcjageg7o2yo § 2.3, R3–R10) on fixtures cut from the
 // recorded failures (fixtures/selfheal/README.md says where each was cut from). Every case goes
 // through the real readers: a temp ledger seeded with the cut rows (reopened read-only), a temp
-// home holding the orchestrator sessions, a temp lanes dir holding the lane sessions, and a temp
-// Jetsam directory; then `runDetectors` over a window.
+// home holding the orchestrator sessions and the profile's OMP logs, a temp lanes dir holding the
+// lane sessions, and a temp Jetsam directory; then `runDetectors` over a window.
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, utimesSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
-import { handLab, JETSAM_UNREADABLE, runDetectors } from "../src/selfheal/detectors";
+import { handLab, JETSAM_UNREADABLE, MCP_LOAD_UNREADABLE, ompLaunch, runDetectors } from "../src/selfheal/detectors";
 import { readDetectorInputs } from "../src/selfheal/read";
 import type { DetectorId, Finding, Window } from "../src/selfheal/types";
 import { clock, tempLedger, tmp } from "./helpers";
@@ -46,7 +46,8 @@ afterAll(() => {
 });
 
 /** A world: a ledger seeded with `ledgerFixtures`' rows, sessions copied under a temp home and lanes dir, a Jetsam dir. */
-function world(o: { ledgerFixtures?: string[]; orchestrator?: string[]; lanes?: { fixture: string; path: string }[]; jetsam?: string[] } = {}) {
+function world(o: { ledgerFixtures?: string[]; orchestrator?: string[]; lanes?: { fixture: string; path: string }[]; jetsam?: string[]; ompLogs?: Record<string, string[]>; profile?: string } = {}) {
+	const profile = o.profile ?? PROFILE;
 	const c = clock("2026-10-01T00:00:00.000Z");
 	const { ledger, path } = tempLedger(c.now);
 	cleanup.push(dirname(path));
@@ -96,12 +97,17 @@ function world(o: { ledgerFixtures?: string[]; orchestrator?: string[]; lanes?: 
 	const jetsamDir = join(root, "DiagnosticReports");
 	mkdirSync(jetsamDir);
 	for (const f of o.jetsam ?? []) copyFileSync(join(FIXTURES, "jetsam", f), join(jetsamDir, f));
+	const logsDir = profile === "default" ? join(home, ".omp", "logs") : join(home, ".omp", "profiles", profile, "logs");
+	for (const [name, lines] of Object.entries(o.ompLogs ?? {})) {
+		mkdirSync(logsDir, { recursive: true });
+		writeFileSync(join(logsDir, name), `${lines.join("\n")}\n`);
+	}
 	return {
 		root, home, lanesDir, sessions, jetsamDir,
 		async run(window: Window, over: { jetsamDir?: string } = {}): Promise<Finding[]> {
 			const ro = Ledger.open(path, { readonly: true });
 			try {
-				const inputs = await readDetectorInputs({ ledger: ro, home, profile: PROFILE, window, jetsamDir: over.jetsamDir ?? jetsamDir, lanesDir });
+				const inputs = await readDetectorInputs({ ledger: ro, home, profile, window, jetsamDir: over.jetsamDir ?? jetsamDir, lanesDir });
 				return runDetectors(inputs, window);
 			} finally {
 				ro.close();
@@ -356,5 +362,134 @@ describe("window boundary (R10)", () => {
 		const windows = await Promise.all(cuts.slice(0, -1).map((from, i) => x.run(w(from, cuts[i + 1]!))));
 		expect(windows.map((fs) => fs.map((f) => f.detector))).toEqual([[], ["flaky-test", "flaky-test"], ["model-start", "flaky-test"]]);
 		expect(windows[1]![0]!.summary).toContain("e27bbc0");
+	});
+});
+
+// ---- mcp-load ------------------------------------------------------------------------------------
+
+// Lines cut from ~/.omp/profiles/agent-system-2/logs on 2026-10-26 and 2026-10-28 (OMP redacts the bearer itself);
+// the ctx line is from 2026-10-27. Timestamps carry the -07:00 offset OMP writes.
+const LINEAR_401 = (ts: string, pid: number) =>
+	JSON.stringify({ timestamp: ts, level: "error", pid, message: "MCP tool load failed", path: "mcp:linear", error: "HTTP 401:  [WWW-Authenticate: Bearer [redacted], resource_metadata=\"https://mcp.linear.app/.well-known/oauth-protected-resource/mcp\", scope=\"read write\"]" });
+const POSTHOG_401 = JSON.stringify({ timestamp: "2026-10-28T16:39:20.297-07:00", level: "error", pid: 38384, message: "MCP tool load failed", path: "mcp:posthog", error: "HTTP 401: No token provided, please provide a valid API token." });
+const CTX_MISSING = JSON.stringify({ timestamp: "2026-10-27T09:12:03.004-07:00", level: "error", pid: 63928, message: "MCP tool load failed", path: "mcp:ctx", error: "Executable not found in $PATH: \"ctx\"" });
+const NOISE = JSON.stringify({ timestamp: "2026-10-26T12:36:01.000-07:00", level: "info", pid: 28363, message: "agent_end maintenance routing" });
+
+describe("mcp-load", () => {
+	// 38384's log is split the way OMP's size rotation splits it: the older half in `.log.1`.
+	const logs = {
+		"omp.2026-10-26.28363.log": [LINEAR_401("2026-10-26T12:36:00.611-07:00", 28363), NOISE],
+		"omp.2026-10-26.70041.log": [LINEAR_401("2026-10-26T16:31:00.358-07:00", 70041)],
+		"omp.2026-10-27.63928.log": [CTX_MISSING, "not json MCP tool load failed"],
+		"omp.2026-10-28.38384.log.1": [LINEAR_401("2026-10-28T16:39:20.269-07:00", 38384)],
+		"omp.2026-10-28.38384.log": [POSTHOG_401],
+		"other.log": [LINEAR_401("2026-10-28T16:40:00.000-07:00", 1)], // not an OMP process log
+	};
+	const logsOf = (home: string, name: string) => join(home, ".omp", "profiles", PROFILE, "logs", name);
+	const AS2_LAUNCH = "env -u PI_PROFILE -u PI_CODING_AGENT_DIR -u PI_CONFIG_DIR OMP_PROFILE=agent-system-2 omp";
+	const DEFAULT_LAUNCH = "env -u OMP_PROFILE -u PI_PROFILE -u PI_CODING_AGENT_DIR -u PI_CONFIG_DIR omp";
+	const HEALTH = (server: string) => `HTTP 401; current login health unknown until a live load: start \`${AS2_LAUNCH}\` and see whether ${server} loads`;
+	const LINEAR = (n: number) => `mcp-load: linear failed to load ${n} time(s) in the window in profile agent-system-2: ${HEALTH("linear")}`;
+	const ALL = w("2026-10-26T00:00:00.000Z", "2026-10-29T00:00:00.000Z");
+
+	test("one finding per server and failure, at its last failure, counting the window's failures, rotated logs included; a 401 leaves the login's current health open", async () => {
+		const x = world({ ompLogs: logs });
+		const fs = of(await x.run(ALL), "mcp-load");
+		expect(fs.map((f) => [f.at, f.summary])).toEqual([
+			["2026-10-27T16:12:03.004Z", "mcp-load: ctx failed to load 1 time(s) in the window in profile agent-system-2: Executable not found in $PATH: \"ctx\""],
+			["2026-10-28T23:39:20.269Z", LINEAR(3)],
+			["2026-10-28T23:39:20.297Z", `mcp-load: posthog failed to load 1 time(s) in the window in profile agent-system-2: ${HEALTH("posthog")}`],
+		]);
+		expect(fs.find((f) => f.summary.includes("linear"))!.evidence).toBe(`${logsOf(x.home, "omp.2026-10-26.28363.log")}:1 .. ${logsOf(x.home, "omp.2026-10-28.38384.log.1")}:1`);
+	});
+
+	test("every rotation suffix is read", async () => {
+		const x = world({ ompLogs: { "omp.2026-10-28.38384.log.4": [LINEAR_401("2026-10-28T16:39:20.269-07:00", 38384)], "omp.2026-10-28.38384.log.12": [POSTHOG_401] } });
+		expect((await x.run(ALL)).map((f) => f.summary.split(" ")[1])).toEqual(["linear", "posthog"]);
+	});
+
+	test("only the window's failures count", async () => {
+		const x = world({ ompLogs: logs });
+		const fs = await x.run(w("2026-10-26T20:00:00.000Z", "2026-10-27T00:00:00.000Z"));
+		expect(fs.map((f) => f.summary)).toEqual([LINEAR(1)]);
+	});
+
+	test("quiet when the profile has no logs directory, and when no line in the window failed", async () => {
+		expect(await world().run(ALL)).toEqual([]);
+		expect(await world({ ompLogs: { "omp.2026-10-26.28363.log": [NOISE] } }).run(ALL)).toEqual([]);
+	});
+
+	test("an unreadable log gives one `mcp-load: OMP logs unreadable` beside the readable logs' findings", async () => {
+		const x = world({ ompLogs: logs });
+		const bad = logsOf(x.home, "omp.2026-10-28.38384.log.1");
+		chmodSync(bad, 0o000);
+		const fs = await x.run(ALL);
+		chmodSync(bad, 0o644);
+		expect(fs.map((f) => [f.at, f.summary])).toEqual([
+			["2026-10-26T00:00:00.000Z", MCP_LOAD_UNREADABLE],
+			["2026-10-26T23:31:00.358Z", LINEAR(2)],
+			["2026-10-27T16:12:03.004Z", "mcp-load: ctx failed to load 1 time(s) in the window in profile agent-system-2: Executable not found in $PATH: \"ctx\""],
+			["2026-10-28T23:39:20.297Z", `mcp-load: posthog failed to load 1 time(s) in the window in profile agent-system-2: ${HEALTH("posthog")}`],
+		]);
+		expect(fs[0]!.evidence).toBe(bad);
+	});
+
+	test("an unreadable logs directory gives one `mcp-load: OMP logs unreadable`, never zero failures", async () => {
+		const x = world({ ompLogs: logs });
+		const dir = join(x.home, ".omp", "profiles", PROFILE, "logs");
+		chmodSync(dir, 0o000);
+		const fs = await x.run(ALL);
+		chmodSync(dir, 0o755);
+		expect(fs.map((f) => [f.detector, f.summary, f.evidence])).toEqual([["mcp-load", MCP_LOAD_UNREADABLE, dir]]);
+	});
+
+	test("the default profile: its logs are read from ~/.omp/logs and a 401 says to start omp with OMP_PROFILE and every fallback cleared", async () => {
+		const x = world({ profile: "default", ompLogs: { "omp.2026-10-28.38384.log": [POSTHOG_401] } });
+		const fs = await x.run(ALL);
+		expect(fs.map((f) => [f.summary, f.evidence])).toEqual([[
+			`mcp-load: posthog failed to load 1 time(s) in the window in profile default: HTTP 401; current login health unknown until a live load: start \`${DEFAULT_LAUNCH}\` and see whether posthog loads`,
+			`${join(x.home, ".omp", "logs", "omp.2026-10-28.38384.log")}:1`,
+		]]);
+	});
+
+	test("a named profile: its logs are read from ~/.omp/profiles/<name>/logs and a 401 says to start omp with OMP_PROFILE=<name> and every fallback cleared", async () => {
+		const x = world({ profile: "scratch-lab", ompLogs: { "omp.2026-10-28.38384.log": [POSTHOG_401] } });
+		const fs = await x.run(ALL);
+		expect(fs.map((f) => [f.summary, f.evidence])).toEqual([[
+			"mcp-load: posthog failed to load 1 time(s) in the window in profile scratch-lab: HTTP 401; current login health unknown until a live load: start `env -u PI_PROFILE -u PI_CODING_AGENT_DIR -u PI_CONFIG_DIR OMP_PROFILE=scratch-lab omp` and see whether posthog loads",
+			`${join(x.home, ".omp", "profiles", "scratch-lab", "logs", "omp.2026-10-28.38384.log")}:1`,
+		]]);
+	});
+
+	test("ompLaunch: empty and `default` are the default profile; any other name is set", () => {
+		expect([ompLaunch("default"), ompLaunch(""), ompLaunch(" default "), ompLaunch("agent-system-2")]).toEqual([
+			DEFAULT_LAUNCH, DEFAULT_LAUNCH, DEFAULT_LAUNCH, AS2_LAUNCH,
+		]);
+	});
+
+	// The hint runs as printed, with `omp` swapped for a probe that asks the installed OMP's own profile
+	// resolver (pi-utils dirs.ts) which profile and agent dir it would open. The probe's environment
+	// carries every variable that could pick another profile, as an as2 lane or Plumb's shell might. The
+	// resolver is imported by absolute path inside the child (as in gates/test/host.test.ts): the global OMP
+	// install is absent on a fresh clone, where these two tests skip, and it must run in the env the hint built.
+	const OMP_UTILS = "/Users/jowolff/.bun/install/global/node_modules/@oh-my-pi/pi-utils/src/dirs.ts";
+	const probe = (hint: string, inherited: Record<string, string>): string => {
+		const argv = hint.split(" ");
+		expect(argv.at(-1)).toBe("omp");
+		const r = Bun.spawnSync([...argv.slice(0, -1), process.execPath, "-e",
+			`const d = await import(${JSON.stringify(OMP_UTILS)}); console.log((d.resolveProfileEnv(process.env.OMP_PROFILE, process.env.PI_PROFILE) ?? "default") + " " + (process.env.PI_CODING_AGENT_DIR ?? "-") + " " + (process.env.PI_CONFIG_DIR ?? "-"))`,
+		], { env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "", ...inherited } });
+		expect(r.exitCode).toBe(0);
+		return r.stdout.toString().trim();
+	};
+	const INHERITED = { OMP_PROFILE: "agent-system-2", PI_PROFILE: "agent-system-2", PI_CODING_AGENT_DIR: "/tmp/elsewhere", PI_CONFIG_DIR: ".elsewhere" };
+
+	test.skipIf(!existsSync(OMP_UTILS))("the default-profile hint opens the default profile even with PI_PROFILE=agent-system-2 inherited", () => {
+		expect(probe(ompLaunch("default"), INHERITED)).toBe("default - -");
+		expect(probe(ompLaunch("default"), { PI_PROFILE: "agent-system-2" })).toBe("default - -");
+	});
+
+	test.skipIf(!existsSync(OMP_UTILS))("a named-profile hint opens that profile whatever PI_PROFILE or OMP_PROFILE is inherited", () => {
+		expect(probe(ompLaunch("agent-system-2"), { ...INHERITED, OMP_PROFILE: "other", PI_PROFILE: "other" })).toBe("agent-system-2 - -");
 	});
 });

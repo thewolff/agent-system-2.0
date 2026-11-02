@@ -1,0 +1,37 @@
+// Opt-out fixture for surface/src/timing-lint.ts (read by surface/test/timing-lint.test.ts, never run): every timing
+// finding here is covered by a well-formed opt-out whose fake clock is in use, so the check reports no finding and no
+// problem, and counts 6 opted-out findings.
+import { expect, test, vi } from "bun:test";
+
+// timing-under-test: the lease lapses exactly at its expiry (fake clock: clock)
+test("a whole test opted out", async () => {
+	const clock = fakeClock(0);
+	const lease = takeLease(clock, 30_000);
+	clock.advance(30_000);
+	await Bun.sleep(0);
+	expect(Date.now() - lease.at).toBeGreaterThanOrEqual(30_000);
+});
+
+test("one line opted out, trailing", () => {
+	vi.useFakeTimers();
+	setTimeout(fire, 1_000); // timing-under-test: the debounce fires after one second (fake clock: vi.useFakeTimers)
+	vi.advanceTimersByTime(1_000);
+});
+
+test("one line opted out, from the line above", () => {
+	vi.useFakeTimers();
+	// timing-under-test: the poll interval is 25 ms (fake clock: vi.advanceTimersByTime)
+
+	const poll = setInterval(check, 25);
+	vi.advanceTimersByTime(25);
+	expect(checks).toBe(1);
+});
+
+// timing-under-test: the stuck detector fires after persistMs of hot ticks (fake clock: tick)
+describe("a whole describe opted out", () => {
+	const tick = (ms: number) => now.value += ms;
+	test("fires", () => {
+		const end = Date.now() + 10;
+		while (Date.now() < end) tick(1);
+	});
+});

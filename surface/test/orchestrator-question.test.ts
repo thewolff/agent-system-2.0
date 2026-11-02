@@ -119,7 +119,7 @@ describe("the question row", () => {
 		expect(ledger.questions(STANDING_WORKLOAD_ID)).toEqual([]);
 		const text = await s.raise({ body: "Open a production workload for the empty-slice\n  wake-read fix now, or later?", options: ["now", "later"], about: wl });
 		const q = s.idOf(text);
-		expect(text).toContain(`about ${wl} (now / later); name ${q} in your QUESTION block`);
+		expect(text).toContain(`about ${wl} (now / later); name ${q} in your closing ask`);
 		expect(ledger.question(q)).toMatchObject({
 			workload_id: STANDING_WORKLOAD_ID, slice_id: STANDING_SLICE_ID, state: "open", created_by: SURFACE_BY,
 			body: "Open a production workload for the empty-slice wake-read fix now, or later?", options: '["now","later"]',
@@ -157,7 +157,7 @@ describe("Jo's standing rulings (PLAN wl-mvfkv7llkp7nk0 § 1, R1, R3)", () => {
 		const s = surface(path);
 		const reply = await s.raise({ body: "The fix touches gates/src/rows/r08.ts. Open it at normal or production stakes?", options: ["normal", "production"] });
 		expect(reply).toStartWith("decided by Jo's ruling gates-stakes: open it at production stakes");
-		expect(reply).toContain("do not publish a QUESTION block");
+		expect(reply).toContain("do not publish a closing ask");
 		expect(ledger.questions(STANDING_WORKLOAD_ID)).toEqual([]);
 		expect(ledger.slice(STANDING_SLICE_ID)!.state).toBe("open");
 		expect(applied(ledger)).toEqual([[SURFACE_BY, STANDING_SLICE_ID, `ruling-applied: gates-stakes kind stakes slice ${STANDING_SLICE_ID} answer production`]]);
@@ -372,7 +372,7 @@ describe("escalation phase 2 through orchestrator_raise_question (PLAN wl-mvg1vs
 		expect(ledger.entries(STANDING_WORKLOAD_ID)).toEqual([]);
 		const reply = await s.raise({ body, options: ["normal", "production"], now: "incident" });
 		const q = s.idOf(reply);
-		expect(reply).toContain(`(normal / production); name ${q} in your QUESTION block. It reaches Jo at once, marked NOW (incident).`);
+		expect(reply).toContain(`(normal / production); name ${q} in your closing ask. It reaches Jo at once, marked NOW (incident).`);
 		const entries = ledger.entries(STANDING_WORKLOAD_ID).map((e) => [e.body, e.created_by]);
 		expect(entries).toEqual([[`now: ${q} incident`, ESCALATION_BY]]);
 		expect(ledger.slice(STANDING_SLICE_ID)!.state).toBe("paused");
@@ -386,8 +386,8 @@ describe("escalation phase 2 through orchestrator_raise_question (PLAN wl-mvg1vs
 		const ask = { body: "Keep the lane running?", options: ["keep", "stop"] };
 		const qa = s.idOf(await s.raise({ ...ask, about: a }));
 		const reused = `Question ${qa} about ${a} is already open with this body and options; nothing new was raised.`;
-		expect(await s.raise({ ...ask, about: a })).toStartWith(`${reused} Name ${qa} in your QUESTION block.`);
-		for (let i = 0; i < 2; i++) expect(await s.raise({ ...ask, about: a, now: "guard" })).toStartWith(`${reused} It reaches Jo at once, marked NOW (guard). Name ${qa} in your QUESTION block.`);
+		expect(await s.raise({ ...ask, about: a })).toStartWith(`${reused} Name ${qa} in your closing ask.`);
+		for (let i = 0; i < 2; i++) expect(await s.raise({ ...ask, about: a, now: "guard" })).toStartWith(`${reused} It reaches Jo at once, marked NOW (guard). Name ${qa} in your closing ask.`);
 		const qb = s.idOf(await s.raise({ ...ask, about: b }));
 		expect(qb).not.toBe(qa);
 		expect(ledger.questions(STANDING_WORKLOAD_ID).map((q) => q.id).sort()).toEqual([qa, qb].sort());
@@ -401,26 +401,26 @@ describe("escalation phase 2 through orchestrator_raise_question (PLAN wl-mvg1vs
 		expect(ledger.instructions(b).map((i) => i.body)).toEqual([`Jo: "stop" — answers ${qb}: Keep the lane running?`]);
 	});
 
-	test("fix round 1 (F2): a repeat of a question an earlier reply published says it is in front of Jo and asks for no new QUESTION block, with and without now; the reply that follows passes row 15", async () => {
+	test("fix round 1 (F2): a repeat of a question an earlier reply published says it is in front of Jo and asks for no new closing ask, with and without now; the reply that follows passes row 15", async () => {
 		const { ledger, path } = tempLedger();
 		const s = surface(path);
 		const ask = { body: "Keep the lane running?", options: ["keep", "stop"] };
 		const q = s.idOf(await s.raise(ask));
 		const reused = `Question ${q} is already open with this body and options; nothing new was raised.`;
-		// Not yet published: the repeat is named in the QUESTION block, as a new question is.
-		expect(await s.raise(ask)).toStartWith(`${reused} Name ${q} in your QUESTION block.`);
+		// Not yet published: the repeat is named in the closing ask, as a new question is.
+		expect(await s.raise(ask)).toStartWith(`${reused} Name ${q} in your closing ask.`);
 		// The reply that publishes it, bound and cited as gates/extensions/r01-turn-shape.ts binds and cites a final reply.
-		const block = `**QUESTION**\n(${q}) Keep the lane running? Options: keep / stop`;
+		const block = `**Closing ask**\n(${q}) Keep the lane running? Options: keep / stop`;
 		const bound = checkQuestionPublication(block, () => ledger);
 		expect(bound).toEqual({ ok: true, questionIds: [q] });
 		recordPublication(() => ledger, [q], "orchestrator");
 		for (const now of [null, "guard", "guard"]) {
 			const reply = await s.raise({ ...ask, ...(now === null ? {} : { now }) });
 			const nowNote = now === null ? "" : " It reaches Jo at once, marked NOW (guard).";
-			expect(reply).toStartWith(`${reused}${nowNote} An earlier reply already put ${q} in front of Jo: send no new QUESTION block for it`);
-			expect(reply).not.toContain("in your QUESTION block");
-			// The final reply that follows the tool's words carries no QUESTION block naming q: row 15 lets it out.
-			expect(checkQuestionPublication(`**PMDW**\n${q} is already in front of Jo; waiting on the answer.`, () => ledger)).toEqual({ ok: true, questionIds: [] });
+			expect(reply).toStartWith(`${reused}${nowNote} An earlier reply already put ${q} in front of Jo: send no new closing ask for it`);
+			expect(reply).not.toContain("in your closing ask");
+			// The final reply that follows the tool's words carries no closing ask naming q: row 15 lets it out.
+			expect(checkQuestionPublication(`${q} is already in front of Jo; waiting on the answer.`, () => ledger)).toEqual({ ok: true, questionIds: [] });
 			// Row 15 is unchanged: the block the old reply asked for is still refused.
 			expect(checkQuestionPublication(block, () => ledger)).toEqual({ ok: false, reason: reusedQuestionRefusal(q, "published") });
 		}

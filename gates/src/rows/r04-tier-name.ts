@@ -5,6 +5,8 @@ import { DISPATCHABLE_TIERS, type Refusal } from "../types";
 export interface DispatchItem {
 	agent?: unknown;
 	task?: unknown;
+	/** The slice id (lane.md § dispatch). */
+	name?: unknown;
 }
 
 /** The spawn items of a `task` call: the batch `tasks[]`, or the flat call itself (omp://tools/task.md, Inputs). */

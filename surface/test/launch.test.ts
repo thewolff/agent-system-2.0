@@ -571,13 +571,16 @@ describe("requirementsProblem: the plan file's `## Requirements` section (PLAN w
 describe("planQuestionProblem reads the plan file (PLAN wl-mv8vwb04cy18n4 D2, D3, R3)", () => {
 	const PATH = "/plans/PLAN.md";
 	const REVIEW = "review: approve-as-is, openai-codex/gpt-6-sol, /plans/PLAN-REVIEW-r1.md";
-	const WITH = ["# PLAN", "## Requirements", "- R1: x => test a", "- R2: y => prompt-only: prose no code can judge", "- R3: z => prompt-only: a one-time live observation"].join("\n");
-	const WITHOUT = ["# PLAN", "## Requirements", "- R1: x => test a"].join("\n");
+	const FAILS = ["## How it fails", "- the build breaks: it surfaces in the run; fix it and rebuild, once"];
+	const WITH = ["# PLAN", ...FAILS, "## Requirements", "- R1: x => test a", "- R2: y => prompt-only: prose no code can judge", "- R3: z => prompt-only: a one-time live observation"].join("\n");
+	const WITHOUT = ["# PLAN", ...FAILS, "## Requirements", "- R1: x => test a"].join("\n");
 	/** `head` padded with `pad` to exactly `bytes` UTF-8 bytes (`pad` one byte or more, dividing the gap). */
 	const sized = (head: string, bytes: number, pad = "x") => `${head}${pad.repeat((bytes - Buffer.byteLength(head)) / Buffer.byteLength(pad))}`;
 	const SIZED_HEAD = `${WITHOUT}\n## Slices\n`;
 	const files: Record<string, string> = {
-		[PATH]: WITH, "/plans/PLAN-none.md": WITHOUT, "/plans/PLAN-bad.md": "# PLAN\n## Requirements\n- R1: no enforcer\n",
+		[PATH]: WITH, "/plans/PLAN-none.md": WITHOUT, "/plans/PLAN-bad.md": `# PLAN\n${FAILS.join("\n")}\n## Requirements\n- R1: no enforcer\n`,
+		"/plans/PLAN-no-fails.md": "# PLAN\n## Requirements\n- R1: x => test a\n## How it fails\n\n## Slices\n- a",
+		"/plans/PLAN-na.md": "# PLAN\nHow it fails: n/a, a one-line docs fix\n## Requirements\n- R1: x => test a",
 		"/plans/PLAN-max.md": sized(SIZED_HEAD, PLAN_FILE_MAX_BYTES),
 		"/plans/PLAN-over.md": sized(SIZED_HEAD, PLAN_FILE_MAX_BYTES + 1),
 		"/plans/PLAN-over-bad.md": sized("# PLAN\n## Requirements\n- R1: no enforcer\n## Slices\n", PLAN_FILE_MAX_BYTES + 1),
@@ -634,6 +637,18 @@ describe("planQuestionProblem reads the plan file (PLAN wl-mv8vwb04cy18n4 D2, D3
 		const wide = sized(SIZED_HEAD, PLAN_FILE_MAX_BYTES + 2 + (Buffer.byteLength(SIZED_HEAD) % 2), "é");
 		expect(wide.length).toBeLessThan(PLAN_FILE_MAX_BYTES);
 		expect(planQuestionProblem(["/plans/PLAN-wide.md", "- sl-1: the one slice", "prompt-only: none", "tradeoff: one", REVIEW].join("\n"), () => true, () => wide)).toContain(`${PLAN_FILE_MAX_BYTES} bytes`);
+	});
+
+	test("issue #334 item 2: a plan file with no How it fails section (or an empty one) is refused naming the heading and the n/a line; the n/a line passes", () => {
+		const refused = check("/plans/PLAN-no-fails.md", ["prompt-only: none"]);
+		expect(refused).toContain('the plan file /plans/PLAN-no-fails.md has no "How it fails" section');
+		expect(refused).toContain("`## How it fails`");
+		expect(refused).toContain("`How it fails: n/a, <reason>`");
+		expect(check("/plans/PLAN-na.md", ["prompt-only: none"])).toBeNull();
+		// a requirements problem and a missing section are both named in one refusal, so one resubmission can fix both
+		const both = planQuestionProblem(["/plans/x.md", "- sl-1: s", "prompt-only: none", "tradeoff: one", REVIEW].join("\n"), () => true, () => "# PLAN\n## Requirements\n- R1: no enforcer\n");
+		expect(both).toContain("R1");
+		expect(both).toContain('"How it fails"');
 	});
 });
 

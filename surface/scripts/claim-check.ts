@@ -56,7 +56,9 @@
 // first. Then split by line and bullet, then by sentence end, code spans intact; a table row is one
 // statement. Never claims: fenced code, lines starting `{`, headers, statements ending `?`, statements in
 // a `**GUESS…**`, `**QUESTION**` or `**PMDW**` block (to the next label or header), and table rows whose
-// first cell is one of those labels. Claim classes run with code spans, double-quoted text and path-like
+// first cell is one of those labels. Those three labels left the output-types contract on 2026-10-28
+// (it now labels only CLAIM and CITE); they are still read here because the replay corpus is older
+// sessions' transcripts, where a block under one of them was a hedge, not a claim. Claim classes run with code spans, double-quoted text and path-like
 // tokens blanked:
 // - tests-pass: a test noun with pass/green/succeed, `all green`, or `N pass, 0 fail`; not when it
 //   negates (`not pass`, `red`, …) or (D) names a failure (fail/fails/failed/failing/failure as a word;

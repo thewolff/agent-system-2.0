@@ -9,6 +9,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	ANTHROPIC_OUT_RULE,
 	type BuilderLedgerView,
 	builderLabs,
 	isReviewDispatch,
@@ -22,7 +23,6 @@ import {
 } from "../src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY } from "../../ledger/src/index";
 import { route } from "../src/route";
-import { LANE_RUNNER_BY, LANE_STARTER_BY } from "../../ledger/src/index";
 import { SURFACE_BY } from "../../surface/src/types";
 import { dist } from "./helpers";
 
@@ -454,6 +454,48 @@ describe("reviewRow: Jo's OpenAI-reviewer rule (in-mv5qdfvskukmbk, in-mv5qfm8910
 
 	test("every other tier returns its row unchanged", () => {
 		for (const tier of ["fast", "standard", "strong"] as const) expect(reviewRow(TABLE, tier)).toEqual(TABLE[tier]);
+	});
+});
+
+describe("Anthropic-out dated OpenAI review policy", () => {
+	const end = Date.parse("2026-10-31T06:00:00-07:00");
+	const row = [...STRONG, "openai/fixture-review", "openai-codex/fixture-review:high"];
+	const table = { fast: row, standard: row, strong: row, deep: ["anthropic/deep", "openai-codex/deep", "moonshot/deep"] };
+	const context = { laneModel: STRONG[1]!, now: end - 1 };
+
+
+	test("filters exact Codex providers after deep substitution, expires at the exact instant, and leaves other lanes unchanged", () => {
+		// Exact-expiry behavior uses injected context.now, never the wall clock.
+		expect(reviewRow(table, "strong", context)).toEqual([STRONG[1]!, "openai-codex/fixture-review:high"]);
+		expect(reviewRow(table, "deep", context)).toEqual([STRONG[1]!, "openai-codex/fixture-review:high"]);
+		expect(reviewRow(table, "strong", { ...context, now: end })).toEqual(row);
+		expect(reviewRow(table, "strong", { ...context, now: end + 1 })).toEqual(row);
+		expect(reviewRow(table, "strong", { ...context, laneModel: STRONG[0]! })).toEqual(row);
+		expect(reviewRow(table, "strong")).toEqual(row);
+	});
+
+	test("normal and production models and allowlists stay Codex-only despite mixed builders, least-involved ordering and grants", () => {
+		for (const stakes of ["normal", "production"] as const) {
+			for (const grant of [false, true]) {
+				const plan = reviewPlan({
+					row, usable: row, context, stakes, grant,
+					builders: { labs: ["openai", "anthropic"], unknown: [] },
+					roles: { anthropic: "review", openai: "lane" },
+				});
+				expect(plan).toMatchObject({
+					kind: "single", models: [STRONG[1]!, "openai-codex/fixture-review:high"],
+					allow: [STRONG[1]!, "openai-codex/fixture-review"], sameLab: true,
+				});
+			}
+		}
+	});
+
+	test("no usable Codex, stale non-OpenAI pins and unknown provenance fail closed", () => {
+		const input = { row, usable: row, context, stakes: "normal" as const, grant: false, builders: { labs: ["openai" as const], unknown: [] } };
+		expect(reviewPlan({ ...input, usable: [STRONG[0]!, STRONG[2]!, "openai/fixture-review"] }).kind).toBe("park");
+		for (const pin of ["anthropic", "kimi"] as const) expect(reviewPlan({ ...input, pin }).kind).toBe("park");
+		expect(reviewPlan({ ...input, builders: { labs: [], unknown: ["unattributed builder"] } }).kind).toBe("park");
+		expect(reviewPlan({ ...input, context: { ...context, now: end } })).toMatchObject({ kind: "single", models: [STRONG[0]!, STRONG[2]!] });
 	});
 });
 

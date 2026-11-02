@@ -18,7 +18,7 @@ import { ceilingOf } from "../src/input";
 import { planFirstBody, withdrawnBy } from "../src/launch";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { STANDING_WORKLOAD_ID, SURFACE_BY as SURFACE } from "../src/types";
-import { clock, ctxOf, fakePi, loadTestText, notices, timers, tmp } from "./helpers";
+import { clock, ctxOf, fakePi, HOW_IT_FAILS, loadTestText, notices, timers, tmp } from "./helpers";
 
 function env(over: Record<string, string> = {}): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
@@ -555,13 +555,13 @@ describe("surface extension adapter", () => {
 		const ctx = ctxOf({ cwd: repo });
 		const who = await f.tool("orchestrator_identity").execute("1", { name: "Sable", pronouns: "they/them" }, undefined, undefined, ctx);
 		expect(who.content[0]!.text).toMatch(/^You are now Sable \(they\/them\); entry en-/);
-		const opened = await f.tool("orchestrator_open_workload").execute("1", { brief: "hotfix the feed header", done: "the feed header renders at the right offset in production" }, undefined, undefined, ctx);
+		const opened = await f.tool("orchestrator_open_workload").execute("1", { brief: `hotfix the feed header${HOW_IT_FAILS}`, done: "the feed header renders at the right offset in production" }, undefined, undefined, ctx);
 		const id = (opened.details as { id: string }).id;
 		expect(opened.content[0]!.text).toContain(`Opened ${id} on ${repo}`);
 		expect(opened.content[0]!.text).toContain("stakes: production · mode: autonomous");
 		expect(opened.content[0]!.text).toContain('inferred production: you said "hotfix"');
 		expect(opened.content[0]!.text).toContain("prior decision");
-		const overridden = await f.tool("orchestrator_open_workload").execute("1", { brief: "hotfix again", done: "the second hotfix is live", stakes: "throwaway", mode: "user-driven" }, undefined, undefined, ctx);
+		const overridden = await f.tool("orchestrator_open_workload").execute("1", { brief: `hotfix again${HOW_IT_FAILS}`, done: "the second hotfix is live", stakes: "throwaway", mode: "user-driven" }, undefined, undefined, ctx);
 		expect(overridden.content[0]!.text).toContain("stakes overridden to throwaway; mode overridden to user-driven");
 		const sched = await f.tool("orchestrator_schedule").execute("1", { due: "2020-01-01", text: "re-measure the threshold; method = routing_review" }, undefined, undefined, ctx);
 		const sid = (sched.details as { id: string }).id;
@@ -594,7 +594,7 @@ describe("surface extension adapter", () => {
 		const closed = await f.tool("orchestrator_close_workload").execute("1", { workloadId: id, receipt: "shipped" }, undefined, undefined, ctx);
 		const path = (closed.details as { path: string }).path;
 		expect(path.startsWith(logDir)).toBe(true);
-		expect(path).toMatch(/--sable--hotfix-the-feed-header\.md$/);
+		expect(path).toMatch(/--sable--hotfix-the-feed-header[-.]/);
 		expect(existsSync(path)).toBe(true);
 		expect(readFileSync(path, "utf8")).toContain("## What changed");
 		const l3 = open(e);

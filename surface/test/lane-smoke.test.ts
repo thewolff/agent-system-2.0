@@ -20,7 +20,7 @@ import orchestratorSurface from "../index";
 import { recordRepo } from "../src/decision-log";
 import { branchName, doneBody, laneExit, laneStarted, worktreePath } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
-import { ctxOf, drainSettled, fakePi, fakeRecords, git, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, notices, setScript, settleDrains, sh, timers, until } from "./helpers";
+import { ctxOf, drainSettled, fakePi, fakeRecords, git, HOW_IT_FAILS, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, notices, setScript, settleDrains, sh, timers, until } from "./helpers";
 
 const roots: LaneRoot[] = [];
 // A root is removed only after settleDrains is done with it: every runner's drain (MIGRATION.md item 71) and every
@@ -73,7 +73,7 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 				{ tool: "lane_raise_question", args: { slice: "$slice", body: "push the branch now?", options: ["yes", "no"] } },
 			],
 		});
-		const opened = await call("orchestrator_open_workload", { brief: "Add a verify line to the README, no plan", done: "README.md carries a verify line", repo: r.repo });
+		const opened = await call("orchestrator_open_workload", { brief: `Add a verify line to the README, no plan${HOW_IT_FAILS}`, done: "README.md carries a verify line", repo: r.repo });
 		const wl = opened.details!.id as string;
 		expect(opened.text).toContain(`Opened ${wl} on ${r.repo}.`);
 		const lane1 = laneIdOf(wl, 1);
@@ -149,7 +149,7 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		roots.push(r);
 		const { call, f } = orchestrator(r);
 		setScript(r, { steps: [addSlice, { hang: true }] });
-		const opened = await call("orchestrator_open_workload", { brief: "Add a verify line to the README, no plan", done: "README.md carries a verify line", repo: r.repo });
+		const opened = await call("orchestrator_open_workload", { brief: `Add a verify line to the README, no plan${HOW_IT_FAILS}`, done: "README.md carries a verify line", repo: r.repo });
 		const wl = opened.details!.id as string;
 		const lane1 = laneIdOf(wl, 1);
 		await until("the lane's claim", () => laneSnapshot(r, wl).workload?.changed_by === lane1);
@@ -196,7 +196,7 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 				{ tool: "lane_release", args: {} },
 			],
 		});
-		const opened = await call("orchestrator_open_workload", { brief: "Add a verify line to the README, no plan", done: "README.md carries a verify line", repo: r.repo });
+		const opened = await call("orchestrator_open_workload", { brief: `Add a verify line to the README, no plan${HOW_IT_FAILS}`, done: "README.md carries a verify line", repo: r.repo });
 		const wl = opened.details!.id as string;
 		const lane1 = laneIdOf(wl, 1);
 		await exitOf(r, wl, lane1);

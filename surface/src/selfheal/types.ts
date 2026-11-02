@@ -1,11 +1,11 @@
 /**
- * Self-heal Phase 1 (detect and report): the shared shapes of the seven detectors and the daily
+ * Self-heal Phase 1 (detect and report): the shared shapes of the eight detectors and the daily
  * report (PLAN wl-mvbcjageg7o2yo § 2.1). Detectors are pure functions over already-read inputs, so
  * tests feed fixtures cut from recorded failures and the report feeds live reads. Nothing here
  * writes, repairs or changes authority.
  */
 
-/** The seven failures of 4-self-heal.md § 3, one detector each. */
+/** The seven failures of 4-self-heal.md § 3, one detector each, and mcp-load (an MCP server that failed to load in the profile). */
 export const DETECTOR_IDS = [
 	"compaction-loop",
 	"hand-lab",
@@ -14,6 +14,7 @@ export const DETECTOR_IDS = [
 	"flaky-test",
 	"jetsam",
 	"model-start",
+	"mcp-load",
 ] as const;
 export type DetectorId = (typeof DETECTOR_IDS)[number];
 

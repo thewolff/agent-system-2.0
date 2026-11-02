@@ -104,7 +104,10 @@ jobs:
       - name: Fast set (one bun test call)
         timeout-minutes: 12
         run: |
+          # Actions runs this as `bash -e`: without `set +e` a failing or capped bun call ends the step here, before
+          # fast.summary is written, and the runner reads that as "no result" instead of judging a red.
           set -uo pipefail
+          set +e
           mapfile -t list < "$W/files"
           start=$(date +%s)
           env -i PATH="$W/shim:$PATH" LANG="${LANG:-C.UTF-8}" USER="$USER" LOGNAME="${LOGNAME:-$USER}" SHELL="${SHELL:-/bin/bash}" TERM="${TERM:-dumb}" \

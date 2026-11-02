@@ -62,7 +62,13 @@ Ask "should we build X?" or "is it worth building?", or type `/ask-graham <the t
 on Claude Code or `/skill:ask-graham <the thing to build>` on OMP.
 
 The skill does not run on a ticket or issue, a bug fix, a task inside an already-decided
-project, or a request to continue existing work.
+project, or a request to continue existing work. One exception: before a task inside a decided
+project writes a new table, a new column on an existing table, a new top-level module, or a new
+service, the skill runs a **structure check**: the local search for what already exists
+(including what else hangs off the same parent table or module, and for a column every column
+already on that table) and the red flags, with no comparables question and no verdict. It always
+says what it found: the matches with receipts, or plainly that there are no similar tables,
+columns, modules, or services. A task that creates none of the four gets no output.
 
 ## Intensity
 
@@ -119,7 +125,10 @@ At `every-idea`, each message you send gets this line attached as hidden context
 
 > ask-graham (intensity every-idea): If this message proposes a new idea that doesn't exist yet
 > (not a ticket, bug, or task in an existing project), run the ask-graham check before planning
-> or building. Otherwise ignore this.
+> or building. If it is a task in an existing project that creates a new table, a new column on an
+> existing table, a new top-level module, or a new service, run the ask-graham structure check
+> (findings only, no verdict) before writing it.
+> Otherwise ignore this.
 
 At `ask` nothing is added. The hook does not classify messages; the agent decides whether a
 message is a new idea, so a ticket can still draw a check if the agent misreads it.
@@ -158,6 +167,28 @@ A waiting reply may instead end with the exact comparables question alone on its
 without quotes. Both hosts let that stop pass without recording a block; mentioning or quoting
 the question in a completed report does not exempt that report from its verdict.
 
+A structure check gives no verdict, and the turn's first use of the skill has to declare it: the
+skill loaded with the args `structure-check <the new structure>` (`/ask-graham structure-check …`,
+a Claude Code `Skill` call, or `/skill:ask-graham structure-check …` on OMP), or a read of
+`skills/ask-graham/structure-check.md` (`skill://ask-graham/structure-check.md` on OMP) before
+SKILL.md. If the turn's first use was anything else (a read of SKILL.md, or an invocation with
+other args or none), it is a full check: a later marker read does not change it. In a structure
+check with no invocation that had other args, a reply passes on both hosts without recording a
+block when it opens with these two lines:
+
+```
+**Structure check:** <the new structure>
+**Found:** <each match, with a file:line receipt and how it overlaps>
+```
+
+or, when the search matched nothing, `**No similar:** <the parent, and what was searched>` as the
+second line. Without one of the two outcome lines the stop is blocked once, with a reason that
+names both; in a structure check a verdict line or the comparables question does not stand in
+for them. A full check still needs its verdict (or the waiting comparables question) even if it
+prints these lines, and the label anywhere but the reply's first line, quoted, fenced, unbolded,
+or with nothing after it, does not count. The check reads the shape, not the content: any text
+after `**Found:**` or `**No similar:**`, even a single period, satisfies it.
+
 **To turn the Stop check off**, without uninstalling: `/ask-graham stop-check off` (or
 `/skill:ask-graham stop-check off` on OMP) writes `stop-check=off` to your user file; add
 `--here` for one repository, or put the line in a `.ask-graham` yourself. Both hosts read it at
@@ -172,6 +203,10 @@ What counts as reading the skill:
 - on OMP, you typing `/skill:ask-graham` at the start of a message or anywhere in it, or the
   agent's `read` of `skill://ask-graham`, `skill://<namespace>/ask-graham`, or a file ending
   `/ask-graham/SKILL.md`.
+
+On either host a read of the structure-check marker (a path ending
+`/ask-graham/structure-check.md`, or `skill://[<namespace>/]ask-graham/structure-check.md`) also
+counts, and declares a structure check.
 
 A skill body pasted into an ordinary message does not count. `/ask-graham intensity` and
 `/ask-graham stop-check` (or their `/skill:ask-graham` forms) give no verdict, so a settings-only
@@ -284,6 +319,22 @@ hosts' hooks/extensions, and manifest version parity. CI runs the same command o
 macOS with Node 24 (`.github/workflows/ask-graham.yml`).
 
 ## Release notes
+
+### 2026-10-28 — 0.7.0
+
+Adds the structure check: before a task inside a decided project writes a new table, a new column
+on an existing table, a new top-level module, or a new service, the skill searches what else hangs
+off the same parent and flags a second
+pattern where the repo already has one, with no verdict. A structure check does not ask the
+comparables question; Jo's call, in Jo's words: "skip the question, but give feedback? like if it
+finds something it should obviously present that it found something. but if it doesnt it should
+let the user know that there were no similar tables, modules, or services". So its reply always
+opens with `**Structure check:**` and then a `**Found:**` or `**No similar:**` line, which the
+Stop check requires in place of a verdict line. Only a turn whose first use of the skill declares
+it (args `structure-check`, or a read of `structure-check.md` before SKILL.md) is a structure
+check. The every-idea nudge names the structure check.
+Columns are in the trigger by Jo's call, in Jo's words: "i agree about the column", answering
+whether the structure check should also fire when a task adds a new column to an existing table.
 
 ### 2026-10-20 — 0.6.0
 

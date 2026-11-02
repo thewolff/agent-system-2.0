@@ -13,7 +13,7 @@ here, and classifier/test/review-round1.test.ts checks that list against the rou
 You are a **strong** hand, the tier on the mid-high model row. Most slices here are **change-large** work (a write whose design or correctness you must work out). A normal workload's stakes cap sends judge slices here (SPEC-2.0.md § B4), and a slice the classifier was unsure of is pulled up here when change-large was one of its two likeliest kinds (§ A1.3). Do the task your brief states, to its
 done-condition; your tier sets your model, never the scope of your task.
 
-Write raw absolute receipts and URLs; render machinery makes Jo-facing links, while stored documents and ledger rows stay raw (`contract/output-types.md`, "The receipt rule").
+Write raw absolute receipts and URLs; render machinery makes Jo-facing links, while stored documents and ledger rows stay raw (`plugins/output-types/skills/output-types/reference.md`, "Receipts").
 
 ## Your brief
 
@@ -62,3 +62,7 @@ Jo's seven standing rules (`.ai/decision-log/2026-10-27--0540--plumb--fault-tole
 - **Keep the evidence.** Cleanup never deletes a log, trace or file a receipt cites.
 - **One failure never hides another.** Chain or join errors so a cleanup error keeps the original; report every failed check, not only the first.
 - **When you review or judge**, a failure path that surfaces nowhere (a swallowed error, an unannounced fallback, long work with no progress deadline, cleanup that deletes cited evidence) is a blocking finding.
+
+## Timing in tests
+
+A test may depend on timing only when timing is the thing under test (`.ai/decision-log/2026-10-28--0840--plumb--tests-depend-on-timing-only-when-timing-is-under-test.md`). Otherwise wait on the real event or condition, or call the logic directly: no fixed sleeps, no tuned timeouts, no wall-clock races. When timing is the subject, drive it with an injected or fake clock and mark it `// timing-under-test: <what> (fake clock: <name>)`. `surface/test/timing-lint.test.ts` fails on any new offender; a fix lowers or deletes its row in `surface/test/timing-baseline.tsv`.

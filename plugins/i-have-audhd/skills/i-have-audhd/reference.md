@@ -234,9 +234,10 @@ command. **A vocabulary check, labeled as one** — hence warn by default.
   judge.
 - **`checks/sections.mjs`** — the units `conclusion-first` and `bad-news-first` judge.
   `splitLabeledSections(text)` → `[{label, line, text}]`. A label line is a prose line
-  (never fenced, commented or quoted) that is exactly one bold label from `PMDW`, `CLAIM`,
-  `CITE`, `GUESS`, `ACTION`, `QUESTION`, optionally with a basis inside the bold
-  (`**GUESS(inference)**`) and a trailing colon; an inline or bulleted bold label is not.
+  (never fenced, commented or quoted) that is exactly one bold label, `CLAIM` or `CITE`,
+  optionally with a parenthetical inside the bold (`**CITE(vendor docs)**`) and a trailing
+  colon; an inline or bulleted bold label is not. The retired output-types labels (`PMDW`,
+  `GUESS`, `ACTION`, `QUESTION`) are ordinary prose since 1.5.0 and open nothing.
   No label line → one unit, the whole text, judged as before 1.1.0. Otherwise the text before
   the first label is a preamble unit and each label line opens a unit running to the next;
   the label line is dropped from the unit, and a heading, blank or rule run directly above a

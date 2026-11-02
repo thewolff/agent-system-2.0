@@ -1,0 +1,42 @@
+// Bad opt-out fixture for surface/src/timing-lint.ts (read by surface/test/timing-lint.test.ts, never run). Each
+// `// expect-problem: <words>` line names a problem the opt-out on the next line must produce; a rejected opt-out leaves
+// its finding standing, and each finding is marked `//! <pattern>` as in positive.txt.
+import { test } from "bun:test";
+
+test("no clock named", async () => {
+	// expect-problem: malformed
+	// timing-under-test: the retry waits one second
+	await Bun.sleep(1_000); //! sleep
+});
+
+test("no reason", async () => {
+	// expect-problem: gives no reason
+	// timing-under-test: (fake clock: clock)
+	await Bun.sleep(clock.step); //! sleep
+});
+
+test("the real clock named", async () => {
+	// expect-problem: names the real clock Date.now
+	// timing-under-test: the lease expires (fake clock: Date.now)
+	expect(Date.now() - t0).toBeLessThan(5_000); //! clock-assert
+});
+
+test("the clock is not in use in this test", async () => {
+	// expect-problem: does not appear as code in the covered test
+	// timing-under-test: the backoff doubles (fake clock: fakeClock)
+	await Bun.sleep(100); //! sleep
+});
+
+test("the clock only appears in a string", async () => {
+	const label = "fakeClock";
+	// expect-problem: does not appear as code in the covered test
+	// timing-under-test: the backoff doubles (fake clock: fakeClock)
+	await Bun.sleep(100); //! sleep
+});
+
+test("an opt-out with nothing to cover", () => {
+	const clock = fakeClock(0);
+	// expect-problem: covers no timing finding
+	// timing-under-test: the clock starts at zero (fake clock: clock)
+	expect(clock.now()).toBe(0);
+});

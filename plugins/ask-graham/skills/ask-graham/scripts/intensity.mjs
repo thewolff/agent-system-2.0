@@ -48,9 +48,9 @@ export const LEVELS = SETTINGS.intensity.values;
 export const DEFAULT_LEVEL = SETTINGS.intensity.default;
 export const REPO_FILE = ".ask-graham";
 
-/** What the hook and the OMP adapter add to a turn at every-idea. Kept to one short instruction. */
+/** What the hook and the OMP adapter add to a turn at every-idea. Kept to short instructions. */
 export const NUDGE =
-  "ask-graham (intensity every-idea): If this message proposes a new idea that doesn't exist yet (not a ticket, bug, or task in an existing project), run the ask-graham check before planning or building. Otherwise ignore this.";
+  "ask-graham (intensity every-idea): If this message proposes a new idea that doesn't exist yet (not a ticket, bug, or task in an existing project), run the ask-graham check before planning or building. If it is a task in an existing project that creates a new table, a new column on an existing table, a new top-level module, or a new service, run the ask-graham structure check (findings only, no verdict) before writing it. Otherwise ignore this.";
 
 /** The user file's path. XDG_CONFIG_HOME counts only when absolute, as the XDG spec says. */
 export function userConfigPath(env = process.env, home = homedir()) {

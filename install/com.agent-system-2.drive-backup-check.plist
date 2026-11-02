@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  agent-system 2.0: the 9 AM watcher of the nightly Google Drive backup (jo-issues #300,
+  install/drive-backup/README.md), as a launchd user agent. TEMPLATE: install/install.sh with its drive-backup
+  flag fills the upper-case placeholder values (XML-escaped), writes the result to
+  $HOME/Library/LaunchAgents/com.agent-system-2.drive-backup-check.plist and loads it with launchctl bootstrap,
+  together with the nightly job com.agent-system-2.drive-backup.plist; the flag's =off form boots both out and
+  deletes both files. Without the flag install.sh never writes it. (An XML comment cannot hold a double hyphen,
+  so the flags are not spelled out here; install/install.sh's header has them.) launchd runs
+  install/drive-backup/check-backup-fresh.zsh at 09:00 local time (a sleeping Mac runs it at wake): it reads the
+  nightly job's state files in $HOME/agent-scratch/agent-system-2.0/drive-backup/state (the scripts' own default
+  for this HOME), alerts on a missed, failed or hung night, runs the restore test on Sundays, and on a clean run
+  writes the drive-backup check ok entry that clears a Drive backup line in Jo's needs-you list. launchd sends its
+  output to that state dir; AS2_UNDER_LAUNCHD keeps the script from copying it to the same log again. AS2_BUN,
+  AS2_REPO and AS2_LEDGER_DB are the needs-you writer's (install/drive-backup/lib.zsh). The script sets its own
+  PATH. AbandonProcessGroup lets the detached alert wrapper outlive the run; RunAtLoad is off.
+  The installed plist's file time is the missed line's baseline until the first check entry (surface/src/errors.ts).
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.agent-system-2.drive-backup-check</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/zsh</string>
+		<string>@REPO@/install/drive-backup/check-backup-fresh.zsh</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>AS2_BUN</key>
+		<string>@BUN@</string>
+		<key>AS2_LEDGER_DB</key>
+		<string>@LEDGER_DB@</string>
+		<key>AS2_REPO</key>
+		<string>@REPO@</string>
+		<key>AS2_UNDER_LAUNCHD</key>
+		<string>1</string>
+		<key>HOME</key>
+		<string>@HOME@</string>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>@REPO@</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>9</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>AbandonProcessGroup</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardOutPath</key>
+	<string>@STATE@/check-backup-fresh.log</string>
+	<key>StandardErrorPath</key>
+	<string>@STATE@/check-backup-fresh.log</string>
+</dict>
+</plist>

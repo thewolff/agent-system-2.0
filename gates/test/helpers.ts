@@ -153,11 +153,15 @@ export function tempLedger(clock?: () => string): { ledger: Ledger; path: string
 	return { ledger: Ledger.open(path, { create: true, backup: false, backupOnOpen: false, ...(clock ? { clock } : {}) }), path };
 }
 
-/** A six-field brief line block. */
+/** The "How it fails" section every fixture brief and plan carries (issue #334 item 2, gates/src/how-it-fails.ts). */
+export const HOW_IT_FAILS_FIXTURE = "## How it fails\n- a test fails: it surfaces in the run's output; fix it and rerun, once";
+
+/** A six-field brief line block, with its "How it fails" section. */
 export function brief(over: Partial<Record<string, string>> = {}): string {
 	const f = { workload: "wl-test1", task: "Add the thing.", "done-condition": "bun test passes", inputs: "gates/", stakes: "normal", "ceiling-share": "10", ...over };
-	return Object.entries(f)
+	const fields = Object.entries(f)
 		.filter(([, v]) => v !== "")
 		.map(([k, v]) => `${k}: ${v}`)
 		.join("\n");
+	return `${fields}\n${HOW_IT_FAILS_FIXTURE}`;
 }

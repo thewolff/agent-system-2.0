@@ -16,6 +16,7 @@
 // (`closeScratchRoot`, PLAN wl-mv5oikd5jtquww § 1.5 as amended 2026-10-28); a failed archive keeps the root, and a failed
 // archive or removal is an entry, never a failed close.
 import { type InstructionRow, type Ledger, type MessageRow, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { checkHowItFails, HOW_IT_FAILS_HEADING, HOW_IT_FAILS_NA_LINE, howItFailsNote } from "../../gates/src/how-it-fails";
 import { classify, type KindJudge, loadKindQuestion } from "../../classifier/src/classify";
 import { closeCheck, closeScratchRoot, commitCloseEntry, type EntryPublish, logDirOf, publishEntry, recordCloseReceipt, type StandIn, standInOf } from "../src/close-entry";
 import { decisionLogContext, lastWorkloadOn, recordRepo, repoOf } from "../src/decision-log";
@@ -252,9 +253,11 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			"`model` (Jo's word only) names the model the workload's lanes run on, kept across relaunches: an exact `provider/model` (e.g. `openai-codex/gpt-6-sol`) on a provider with a known lab, no `:level` suffix; a bad value opens nothing. " +
 			"Intake queue: while started-but-idle workloads outnumber the lane slots the ask is opened queued and the result says `queued, position N of M` (Jev rank order among queued asks); tell Jo that position. " +
 			"`intake: \"queue\"` queues the ask whatever the count; `intake: \"now\"` with `inputId` (Jo's unspent input row) opens past the cap and spends that input, and without one opens nothing. " +
-			"Returns the id, the one-liner, the launch line, and the repository's decision-log entries newer than the last 2.0 workload on it.",
+			"Returns the id, the one-liner, the launch line, and the repository's decision-log entries newer than the last 2.0 workload on it. " +
+			`The brief carries a "How it fails" section (a \`${HOW_IT_FAILS_HEADING}\` heading, any level, with at least one line under it: the errors the work can hit, where each surfaces, the recovery step, the retry bound), ` +
+			`or for trivial work the line \`${HOW_IT_FAILS_NA_LINE}\`; a brief with neither is refused and nothing is opened, so fix it and open again. An n/a pass is recorded on the workload.`,
 		parameters: z.object({
-			brief: z.string().describe("What Jo said, as the workload brief."),
+			brief: z.string().describe(`What Jo said, as the workload brief, with its "How it fails" section (\`${HOW_IT_FAILS_HEADING}\`) or the line \`${HOW_IT_FAILS_NA_LINE}\`.`),
 			done: z.string().optional().describe("One sentence: what is true when this workload is over. Required; ask Jo when you cannot infer it."),
 			repo: z.string().optional().describe("Absolute path of the target repository. Default: the session's cwd."),
 			branch: z.string().optional().describe("Target branch, when known."),
@@ -276,6 +279,9 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			if (!done) {
 				return text("A workload states its outcome: pass `done` — one sentence, what is true when this workload is over. When Jo's words do not say, ask Jo first (a plain reply) and open once they answer. Nothing was opened.");
 			}
+			// Jo, 2026-10-28 (issue #334 item 2, extended to every brief): a brief with no "How it fails" section is refused back to the writer.
+			const failsCheck = checkHowItFails(brief, "the brief");
+			if (!failsCheck.ok) return text(`Refused: ${failsCheck.reason}. Nothing was opened.`);
 			const model = typeof params.model === "string" ? params.model.trim() : null;
 			const problem = model === null ? null : modelProblem(model);
 			if (problem !== null) return text(`Refused: ${problem}. Nothing was opened.`);
@@ -321,6 +327,8 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 					const queued = intake === "queue" ? "intake queue" : idle > cap ? `${idle} started-idle workloads over ${cap} lane slots` : null;
 					const wl = ledger.openWorkload({ by: SURFACE_BY, brief, stakes: finalStakes, mode: modeOverride ?? mode.value });
 					recordRepo(ledger, wl, repo);
+					const failsNote = howItFailsNote(failsCheck, "brief at open");
+					if (failsNote !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: failsNote });
 					ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody(done) });
 					if (plan.trigger !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody(plan.trigger) });
 					if (sized?.entry) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: sized.entry });
@@ -442,7 +450,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 		loadMode: "essential",
 		label: "Record Jo's Instruction",
 		description:
-			"When Jo's message answers a QUESTION you asked about an open workload, or instructs you about one, record it here before anything else, so a lane picking the workload up reads the decision from the ledger. " +
+			"When Jo's message answers a question you asked about an open workload, or instructs you about one, record it here before anything else, so a lane picking the workload up reads the decision from the ledger. " +
 			"Jo's words are never a parameter: the surface writes what Jo typed as an input row and names it to you (`Jo's words above are input in-…`); pass that inputId with your one-line reading. With questionId (a question you raised with orchestrator_raise_question), the question row is answered with the input row's body and the instruction row goes on the workload the question is about, in one transaction; with workloadId alone, the instruction row goes on that workload with the input row's body. Your reading goes in its own entry either way. " +
 			"An input is spent once; a message the surface gave no input id has no receipt and records nothing. A message that neither answers nor instructs (a question about your question, something unrelated) records nothing. Until the row exists, your next working call on the workload is refused (P-11 row 15).",
 		parameters: z.object({

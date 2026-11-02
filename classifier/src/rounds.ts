@@ -25,8 +25,15 @@ export const REVIEW_ROUND_DEFAULTS: Readonly<Record<Stakes, number>> = {
 
 export const SEVERITIES = ["blocking", "major", "minor"] as const;
 export type Severity = (typeof SEVERITIES)[number];
-export const FINDING_KINDS = ["correctness", "security", "tests", "design", "docs", "other"] as const;
+/**
+ * `fault-tolerance` (Jo 2026-10-27, issue #334 item 1): a silent failure path, i.e. a swallowed error, an unannounced
+ * fallback, a long-running step with no progress deadline, or cleanup that deletes cited evidence. Always blocking:
+ * the parser reads one as blocking whatever severity the reviewer wrote (asFinding).
+ */
+export const FINDING_KINDS = ["correctness", "security", "tests", "design", "docs", "fault-tolerance", "other"] as const;
 export type FindingKind = (typeof FINDING_KINDS)[number];
+/** The finding kind that is blocking whatever severity it is written with. */
+export const ALWAYS_BLOCKING_KIND: FindingKind = "fault-tolerance";
 
 export interface Finding {
 	severity: Severity;
@@ -106,7 +113,9 @@ function asFinding(x: unknown): Finding | null {
 	if (typeof title !== "string") return null;
 	const t = title.replace(/\s+/g, " ").trim();
 	if (t === "") return null;
-	return { severity: severity as Severity, kind: kind as FindingKind, title: t.length > TITLE_CHARS ? `${t.slice(0, TITLE_CHARS - 1)}…` : t };
+	// Issue #334 item 1: a silent failure path blocks the round even when the reviewer called it major or minor.
+	const s = kind === ALWAYS_BLOCKING_KIND ? "blocking" : (severity as Severity);
+	return { severity: s, kind: kind as FindingKind, title: t.length > TITLE_CHARS ? `${t.slice(0, TITLE_CHARS - 1)}…` : t };
 }
 
 /** A stored `counts` JSON, validated back into `Findings`; null when it is not one. */
@@ -118,6 +127,8 @@ function asFindings(x: unknown): Findings | null {
 		if (!isObject(row)) return null;
 		for (const [k, n] of Object.entries(row)) {
 			if (!(FINDING_KINDS as readonly string[]).includes(k) || !Number.isInteger(n) || (n as number) < 1) return null;
+			// A fault-tolerance finding is only ever counted as blocking (asFinding); any other cell is not a stored block.
+			if (k === ALWAYS_BLOCKING_KIND && s !== "blocking") return null;
 			out.counts[s][k as FindingKind] = n as number;
 		}
 	}

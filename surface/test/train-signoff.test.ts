@@ -166,7 +166,7 @@ function passing(w: World, scope: "full" | "fast" = "full"): void {
 function expectDecided(w: World, text: string): void {
 	expect(text).toStartWith("decided by Jo's ruling train-signoff: ");
 	expect(text).toContain(`\`gh pr merge ${PR} -R ${REPO} --merge --match-head-commit ${H1}\``);
-	expect(text).toContain("do not publish a QUESTION block");
+	expect(text).toContain("do not publish a closing ask");
 	expect(w.ledger.questions(w.train)).toEqual([]);
 	expect(w.ledger.slice(w.sl)!.state).toBe("open");
 	expect(w.applied()).toEqual([[TRAIN_LANE, w.sl, `ruling-applied: train-signoff kind merge slice ${w.sl} answer merge`]]);

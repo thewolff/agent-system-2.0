@@ -163,21 +163,21 @@ const CODE: [string, string, "py" | "js", string, V][] = [
 ];
 
 const TURNS: [string, string, string, string, V][] = [
-	["P04", "", "quoted prior", "**CLAIM**\nThe prompt says “Ready?”\n**QUESTION**\nMain or feature?", "ALLOW"],
-	["P04", "", "inline prior", "**CLAIM**\nThe marker `**QUESTION**` is text.\n**QUESTION**\nMain or feature?", "ALLOW"],
-	["P04", "", "and prior", "**QUESTION**\nMain or feature and today or tomorrow?", "REFUSE"],
-	["P04", "", "comma prior", "**QUESTION**\nMain or feature, today or tomorrow?", "REFUSE"],
-	["P04", "", "trailing spaces", "**QUESTION**  \nMain or feature?", "ALLOW"],
+	["P04", "", "quoted prior", "**CLAIM**\nThe prompt says “Ready?”\n**Closing ask**\nMain or feature?", "ALLOW"],
+	["P04", "", "inline prior", "**CLAIM**\nThe marker `**Closing ask**` is text.\n**Closing ask**\nMain or feature?", "ALLOW"],
+	["P04", "", "and prior", "**Closing ask**\nMain or feature and today or tomorrow?", "REFUSE"],
+	["P04", "", "comma prior", "**Closing ask**\nMain or feature, today or tomorrow?", "REFUSE"],
+	["P04", "", "trailing spaces", "**Closing ask**  \nMain or feature?", "ALLOW"],
 	["P04", "", "unicode label", "**ＱＵＥＳＴＩＯＮ**\nMain or feature?", "REFUSE"],
-	["P04", "", "bullet asks", "**QUESTION**\nWhich changes?\n- Main or feature?\n- Today or tomorrow?", "REFUSE"],
-	["P04", "", "legit options", "**QUESTION**\nWhich branch?\n- main\n- feature", "ALLOW"],
-	["P04", "", "split fence", "**QUESTION**\nMain or feature?\n```ts\nconst x=1;\n```\nToday or tomorrow?", "REFUSE"],
-	["P04", "", "indented label", "**CLAIM**\nExample:\n    **QUESTION**\n    Which branch?", "ALLOW"],
-	["P04", "", "indented label and real", "**CLAIM**\nExample:\n    **QUESTION**\n    Which branch?\n**QUESTION**\nMain or feature?", "ALLOW"],
-	["P04", "", "tilde shell", "**ACTION**\n~~~bash\ngit push origin main\n~~~", "REFUSE"],
-	["P04", "", "four tick shell", "**ACTION**\n````bash\ngit push origin main\n````", "REFUSE"],
-	["P04", "", "fenced labels", "**CLAIM**\n```md\n**QUESTION**\nWhat?\n```\n**QUESTION**\nMain or feature?", "ALLOW"],
-	["P04", "S3", "quote after question", "**QUESTION**\nMain or feature?\n“Example text?”", "ALLOW"],
+	["P04", "", "bullet asks", "**Closing ask**\nWhich changes?\n- Main or feature?\n- Today or tomorrow?", "REFUSE"],
+	["P04", "", "legit options", "**Closing ask**\nWhich branch?\n- main\n- feature", "ALLOW"],
+	["P04", "", "split fence", "**Closing ask**\nMain or feature?\n```ts\nconst x=1;\n```\nToday or tomorrow?", "REFUSE"],
+	["P04", "", "indented label", "**CLAIM**\nExample:\n    **Closing ask**\n    Which branch?", "ALLOW"],
+	["P04", "", "indented label and real", "**CLAIM**\nExample:\n    **Closing ask**\n    Which branch?\n**Closing ask**\nMain or feature?", "ALLOW"],
+	["P04", "", "tilde shell", "~~~bash\ngit push origin main\n~~~", "REFUSE"],
+	["P04", "", "four tick shell", "````bash\ngit push origin main\n````", "REFUSE"],
+	["P04", "", "fenced labels", "**CLAIM**\n```md\n**Closing ask**\nWhat?\n```\n**Closing ask**\nMain or feature?", "ALLOW"],
+	["P04", "S3", "quote after question", "**Closing ask**\nMain or feature?\n“Example text?”", "ALLOW"],
 ];
 
 describe("astra-6 PROBES.md, every probe verbatim", () => {
@@ -370,12 +370,12 @@ describe("S2: the push refusal's advertised remedy is a form the gate then accep
 
 describe("S3: a wholly quoted line is the ask only when the block has none yet", () => {
 	const S3: [string, V][] = [
-		["**QUESTION**\nMain or feature?\n“Example text?”", "ALLOW"],
-		['**QUESTION**\nMain or feature?\n"Example text?"', "ALLOW"],
-		['**QUESTION**\n"Should I proceed?"', "ALLOW"],
-		["**QUESTION**\n“Should I proceed?”", "ALLOW"],
-		["**QUESTION**\nMain or feature?\nToday or tomorrow?", "REFUSE"],
-		['**QUESTION**\nMain or feature?\n"Example text?" Today or tomorrow?', "REFUSE"],
+		["**Closing ask**\nMain or feature?\n“Example text?”", "ALLOW"],
+		['**Closing ask**\nMain or feature?\n"Example text?"', "ALLOW"],
+		['**Closing ask**\n"Should I proceed?"', "ALLOW"],
+		["**Closing ask**\n“Should I proceed?”", "ALLOW"],
+		["**Closing ask**\nMain or feature?\nToday or tomorrow?", "REFUSE"],
+		['**Closing ask**\nMain or feature?\n"Example text?" Today or tomorrow?', "REFUSE"],
 	];
 	for (const [text, want] of S3) test(`${JSON.stringify(text)} → ${want}`, () => expect(turn(text)).toBe(want));
 });

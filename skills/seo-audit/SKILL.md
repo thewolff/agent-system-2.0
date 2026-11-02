@@ -63,8 +63,7 @@ Nothing is needed from Jo to run the skill. One input is optional and worth nami
    > **CLAIM**
    > the observation: the evidence.json value at its locator, quoted (≤ 300 chars), as receipt.
    >
-   > **GUESS(inference)**
-   > the assessment against the rule's requirement, with its basis.
+   > the assessment against the rule's requirement, unlabeled, with its basis in the sentence.
 
    Intent is never asserted. Spam-policy rows (SPM-) are indicators, never verdicts. Hidden-text checks use only the
    inline-style and attribute signals in the DOM; computed visibility is Not checked.

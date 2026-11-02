@@ -77,9 +77,15 @@ export function consumeAllToOrchestrator(ledger: Ledger, workloadId?: string): n
 	return held.length;
 }
 
-/** One needs-you bullet: `- #<n> <line>` when the line is numbered (a literal `#`, so a markdown renderer cannot renumber it), else `- <line>`. */
+/** A line's text with its next step (issue #334 item 3): `<line> — next: <step>` unless the line already says the step. */
+export function lineWithNext(l: Pick<ErrorLine, "line" | "next">): string {
+	return l.next && !l.line.includes(l.next) ? `${l.line} — next: ${l.next}` : l.line;
+}
+
+/** One needs-you bullet: `- #<n> <line>` when the line is numbered (a literal `#`, so a markdown renderer cannot renumber it), else `- <line>`; the line with its next step. */
 export function needsYouBullet(l: ErrorLine): string {
-	return l.n === undefined ? `- ${l.line}` : `- #${l.n} ${l.line}`;
+	const text = lineWithNext(l);
+	return l.n === undefined ? `- ${text}` : `- #${l.n} ${text}`;
 }
 
 /** The lines as one block for the turn's context or a pushed message. */

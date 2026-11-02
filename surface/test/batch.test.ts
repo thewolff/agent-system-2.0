@@ -279,7 +279,7 @@ describe("security-red (PLAN wl-mvg1vs0rhnu3gg § 3.3): a failing gate test is o
 		expect(sec.security).not.toBeNull();
 		const shown = lines();
 		expect(shown).toEqual([{
-			kind: "security-red", workloadId: wl, rowId: sec.security!, messageIds: [sec.security!],
+			kind: "security-red", next: "a lane asks you before it changes such a test", workloadId: wl, rowId: sec.security!, messageIds: [sec.security!],
 			line: `security tests red on ${wl}: run ${sec.runId} at bbbbbbb (slice ${sl}) has 1 failing under gates/test/, first ${SEC.name} — a lane asks you before it changes such a test`,
 		}]);
 		expect(onFire(l, shown[0]!)).toBe(true);
@@ -320,7 +320,7 @@ describe("security-red (PLAN wl-mvg1vs0rhnu3gg § 3.3): a failing gate test is o
 		expect(sec.ordinary).not.toBeNull();
 		const shown = lines();
 		expect(shown).toEqual([{
-			kind: "security-red", workloadId: owner, rowId: sec.security!, messageIds: [sec.security!],
+			kind: "security-red", next: "a lane asks you before it changes such a test", workloadId: owner, rowId: sec.security!, messageIds: [sec.security!],
 			line: `security tests red on ${owner}: run ${sec.runId} at bbbbbbb (slice ${sl}) has 1 failing under gates/test/, first ${SEC.name} — a lane asks you before it changes such a test`,
 		}]);
 		expect(onFire(l, shown[0]!)).toBe(true);
@@ -344,7 +344,7 @@ describe("security-red (PLAN wl-mvg1vs0rhnu3gg § 3.3): a failing gate test is o
 		const lines = () => errorLines(l, undefined, { now: c.now() }).filter((x) => x.workloadId === wl);
 		const shown = lines();
 		expect(shown).toEqual([{
-			kind: "security-red", workloadId: wl, rowId: sec.security!, messageIds: [sec.security!],
+			kind: "security-red", next: "a lane asks you before it changes such a test", workloadId: wl, rowId: sec.security!, messageIds: [sec.security!],
 			line: `security tests red on ${wl}: run ${sec.runId} at bbbbbbb (slice ${sl}) has 1 failing under gates/test/, first ${SEC.name} — a lane asks you before it changes such a test`,
 		}]);
 		expect(onFire(l, shown[0]!)).toBe(true);

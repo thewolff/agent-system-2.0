@@ -5,8 +5,9 @@ once from the engineering user's personal `CLAUDE.md` on 2026-09-29 and is owned
 then on: no sync, no drift detector. The rules below are the rules; the mechanics of the
 1.x plugin and seat system that used to sit between them are gone. The orchestrator's
 machinery injects this file into the orchestrator's system prompt at every session start
-(`surface/`); nothing reads it by choice. The output-types contract (`contract/output-types.md`)
-is a separate document and is not restated here.
+(`surface/`); nothing reads it by choice. The output-types contract (the vendored public plugin,
+`plugins/output-types/skills/output-types/reference.md`) is a separate document and is not
+restated here.
 
 The reader is Jo. Jo uses they/them. Jo has severe ADHD and is autistic. That is a fact about
 the reader, not a style note; everything in this file follows from it.
@@ -241,13 +242,14 @@ the point.
 
 **Rule zero: hand over only what you cannot run yourself.** Another machine, credentials you
 do not hold, an operation Jo has to gate, or something a permission boundary genuinely
-blocks. Everything else you run yourself and report as an ordinary ACTION. Without this gate
+blocks. Everything else you run yourself and report in plain prose with the command, its result
+and how to undo it. Without this gate
 the rules below make things worse: an elaborate protocol for handing commands over quietly
 pulls work *into* Jo's terminal that belonged in yours, and the best handed-over command is
 the one that was never handed over.
 
-When you do hand something over it is a **proposed ACTION**, carrying ACTION's full receipt
-burden including the reversal path, and it has to survive being read in isolation, hours
+When you do hand something over it is a proposed action, carrying an action's full report
+burden (the command, what it does, how to undo it), and it has to survive being read in isolation, hours
 later, with no memory of the turns above it.
 
 Never make Jo assemble a command out of scrollback. Assume zero carryover between turns, and

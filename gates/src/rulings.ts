@@ -451,9 +451,9 @@ export function raisedId(r: AskResult, what: string): string {
 	throw new Error(`Jo's ruling ${r.decided.ruling} decided ${what}, a kind no ruling covers`);
 }
 
-/** The tools' reply to a decided question: no question id, no QUESTION block. */
+/** The tools' reply to a decided question: no question id, no closing ask. */
 export const decidedText = (d: Decision): string =>
-	`decided by Jo's ruling ${d.ruling}: ${d.action}; no question was raised; do not publish a QUESTION block`;
+	`decided by Jo's ruling ${d.ruling}: ${d.action}; no question was raised; do not publish a closing ask`;
 
 /**
  * The classifier review row's OpenAI model (classifier/src/lab.ts `reviewRow`, `REVIEW_ROW_FROM`: the strong row's

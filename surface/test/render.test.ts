@@ -229,7 +229,7 @@ describe("needs-you: the test runner's failed run on an unheld workload (MIGRATI
 		const { ledger, wl, run, lines } = unheld();
 		const m = run("red")!;
 		const shown = lines();
-		expect(shown).toEqual([{ kind: "test-run", workloadId: wl, rowId: m, messageIds: [m], line: `full suite red on ${wl} at c0ffee1: 2 failing, first x.test.ts > broken — relaunch to fix (/runs/tr-1)` }]);
+		expect(shown).toEqual([{ kind: "test-run", workloadId: wl, rowId: m, messageIds: [m], next: "relaunch to fix", line: `full suite red on ${wl} at c0ffee1: 2 failing, first x.test.ts > broken — relaunch to fix (/runs/tr-1)` }]);
 		expect(consumeLines(ledger, shown)).toBe(1);
 		expect(ledger.message(m)!.state).toBe("delivered");
 		expect(lines()).toEqual([]);

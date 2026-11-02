@@ -1,7 +1,7 @@
 ---
 name: ask-graham
-description: Answers an explicit "should we build X?" with Graham's stated judgment (his gate questions, the 2-minute rule, fewer lines wins) and a verdict of do it now, start now, later, or don't build. Use only when the user asks outright whether something is worth building ("should we build this?", "is it worth building?"), when an ask-graham nudge says a message proposes a new idea, or on /ask-graham. Not for tickets, bug fixes, tasks inside an already-decided project, or continuing existing work.
-argument-hint: "[the thing to build] | intensity [every-idea|ask] [--here] | stop-check [on|off] [--here]"
+description: Answers an explicit "should we build X?" with Graham's stated judgment (his gate questions, the 2-minute rule, fewer lines wins) and a verdict of do it now, start now, later, or don't build. Use only when the user asks outright whether something is worth building ("should we build this?", "is it worth building?"), when an ask-graham nudge says a message proposes a new idea, or on /ask-graham. Not for tickets, bug fixes, tasks inside an already-decided project, or continuing existing work, except a structure check (findings only, no verdict) before such a task writes a new table, a new column on an existing table, a new top-level module, or a new service; load that with the args `structure-check <the new structure>`, or by reading structure-check.md in this skill's directory before SKILL.md.
+argument-hint: "[the thing to build] | structure-check [the new structure] | intensity [every-idea|ask] [--here] | stop-check [on|off] [--here]"
 license: MIT
 ---
 
@@ -20,6 +20,15 @@ Every rule carries its source, and the sources stay separate:
 Two levels. **ask** is the default: the skill runs on `/ask-graham` or an explicit "should we build this?" / "is it worth building?". **every-idea** also runs it whenever the user proposes a new project, product, feature, or tool that does not exist yet; a hook adds a one-line nudge to each message, and the agent decides whether the message is a new idea. (Skill)
 
 At both levels it never runs on a ticket or issue, a bug fix, a task inside an already-decided project, or a request to continue existing work. A nudge on such a message is ignored without comment.
+
+One exception, the **structure check**: when a task inside an already-decided project is about to create a new table, a new column on an existing table, a new top-level module, or a new service, run step 2 (local sources, with its parent search) and step 4 only, before the structure is written. It does not ask the comparables question and does not search the web. The turn's first use of this skill declares it: loading this skill with the args `structure-check <the new structure>`, or reading [`structure-check.md`](structure-check.md) before this file. A turn whose first use was anything else (reading this file, or invoking the skill with other args or none) is a full check. The reply always reports what the search found, either way, with no verdict, gate questions, breakdown or closing ask:
+
+- First line `**Structure check:** <the new structure>`.
+- Next line, when something matched: `**Found:**` and the matches, plainly: each existing table, column, module or service with a file:line receipt and how it overlaps. If one is a second way to do something the repo already does, the second-pattern flag in step 4 fires.
+- Next line, when nothing matched: `**No similar:**` saying there are no similar tables, columns, modules or services, naming the parent and what was searched (for example "no similar tables or columns: searched migrations/ for tables and columns on story_revisions"). An empty search is never silent.
+- Then the step-4 red flags.
+
+The Stop check accepts those two opening lines in place of a verdict only in a structure check, and only when no ask-graham invocation in the turn had other args; a full check still needs its verdict. In a structure check only those two lines count: a `**Verdict:**` line or the comparables question does not stand in for them. A task inside a decided project that creates none of these four still gets no ask-graham output. (Skill)
 
 The level comes from the first of these that exists:
 
@@ -64,7 +73,7 @@ Done when: one sentence a stranger could act on.
 
 Graham's third gate question is "Something else already exists?" (Graham #1). How to answer it is the skill's own (Skill).
 
-Every run, before any internet search, ask exactly: "Do you want me to research and see if something comparable exists?" Ask at either intensity, on `/ask-graham`, an explicit should-we-build question, or an every-idea nudge. This always-asked question is Jo's rule, not Graham's. Settings invocations still only change or show settings. (Jo)
+Every run, before any internet search, ask exactly: "Do you want me to research and see if something comparable exists?" Ask at either intensity, on `/ask-graham`, an explicit should-we-build question, or an every-idea nudge. This always-asked question is Jo's rule, not Graham's. Settings invocations still only change or show settings. (Jo) A structure check does not ask it (see "When it runs"). (Skill)
 
 - **No:** check the local sources below only; do not search the web. Read locally available issue or work records; mark remote-only sources *unreachable* for this run. For every recommended package or tool, still complete the upkeep receipt using local evidence and installed-runtime discovery; unavailable remote evidence is explicitly *unknown* because research was declined. Do not fetch around the user's no. Follow [`references/upkeep.md`](references/upkeep.md) in either research path. (Jo)
 - **Yes:** also search the internet for comparable open-source and commercial software: libraries, CLIs, apps, AI skills, plugins, MCP servers, and SaaS where relevant. Before evaluating candidates, read [`references/comparables-criteria.md`](references/comparables-criteria.md). Apply its gates first, rank survivors without a weighted total, and show options with pros, cons, measured stats, and an upkeep receipt for every recommended package/tool, each dated and sourced. Stars, repo age, forks, and followers are context only, never scored. This method is the skill's, based on the sources in that reference. (Skill)
@@ -73,6 +82,7 @@ Every run, before any internet search, ask exactly: "Do you want me to research 
 For the local search, check every source below that applies, and record each one as *found*, *nothing found*, or *unreachable*:
 
 - **The current repo or workspace.** Grep for the feature's nouns and verbs, its likely command or file names, and the existing words and commands nearby. Read any hit you would cite.
+- **What hangs off the same parent** (technical asks). Name the parent the new thing attaches to, then list its siblings, because a name grep misses a sibling that shares no keyword (a chart pick and `featured_quote_id`). For a table or column: every foreign key and id-array column (`UUID[]`, `int[]`) referencing that parent, and the id-list and single-pick id columns on the parent itself, from `information_schema` or `pg_constraint` (read-only) when a database is reachable and from a grep of the migrations directory either way. For a new column, the parent is its table: list every column already on that table, and the other tables that hold the same kind of thing (a new `chart_candidate_ids` beside `quotes UUID[]` and `featured_quote_id`). For code: what else is registered beside it (the same router, plugin registry, workflow suite, or parent directory) and what else imports the same parent. Name each sibling and the pattern it uses. (Skill)
 - **Prior sessions**, if the agent has a way to search them. Has someone asked for this, half-built it, or researched it already?
 - **Skills and tools already installed.** The session's own skill list, the user's skills directory (`~/.claude/skills/` on Claude Code), the repo's `skills/` directory if it has one.
 - **Where open work lives**, read-only and nothing else:
@@ -110,6 +120,8 @@ Using types, adding types, or typing an untyped module never fires a flag (Jo, s
 
 Skill addition: also flag a collision step 2 found, such as a new command word that is already taken with a different meaning. (Skill)
 
+Skill addition: **a second pattern where one exists.** When the parent search in step 2 finds an existing way to attach or store the same kind of thing, the design uses that pattern or says in one line why it cannot. It fires on a new table, a new join table, or a new side store where the parent already carries a column or list for that role. This is the skill's rule, prompted by the 2026-10-28 review of a chart-pick table that belonged as a `story_revisions` column. (Skill)
+
 Done when: each flag is marked *fires* (with the line of the design that trips it) or *clear*.
 
 ### 5. Pick the verdict
@@ -141,7 +153,7 @@ Done when: every task has acceptance criteria a reviewer could check, and no tas
 
 ## Output
 
-While the comparables answer is pending, report local findings if useful and end with the exact question from step 2; omit the verdict and closing ask. After the user answers, use the completed-check template below.
+While the comparables answer is pending, report local findings if useful and end with the exact question from step 2; omit the verdict and closing ask. After the user answers, use the completed-check template below. A structure check uses the shape in "When it runs" instead: its `**Structure check:**` line, its `**Found:**` or `**No similar:**` line, and the red flags. (Skill)
 
 ```
 **Verdict:** <one of the four verdicts: do it now, start now, later, don't build>. <one-line why>
