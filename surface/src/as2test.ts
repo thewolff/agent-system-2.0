@@ -78,6 +78,13 @@ export interface ExecWrapperOptions {
 	stopGraceMs?: number;
 	/** Test-only, `groups` renders only: append each detector tick's observation to `<work>/<part>.stuck-trace.jsonl` (D3). */
 	detectTrace?: boolean;
+	/**
+	 * Test-only, `groups` renders only: the detector's observation clock is fake. Each classified tick advances it by exactly
+	 * one detectTickMs, and a tick is classified only once every marker-holding worker has really burnt one detectTickMs of
+	 * CPU since the last classified tick, so "hot" and "gap" no longer depend on the machine's load (the live end-to-end
+	 * test's clock in stuck-detect.test.ts, d7f6d63b). Snapshot, markers, argv and CPU reads stay live.
+	 */
+	detectCpuClock?: boolean;
 }
 
 /** What the wrapper hands test-exec in `AS2TEST_EXEC_CONFIG`; test-exec validates it again. */
@@ -95,6 +102,7 @@ export interface ExecConfig {
 	signatureCaptureMs: number;
 	stopGraceMs: number;
 	detectTrace: boolean;
+	detectCpuClock: boolean;
 }
 
 export class WrapperRenderError extends Error {}
@@ -109,12 +117,14 @@ export function execConfigOf(o: ExecWrapperOptions): ExecConfig {
 	}
 	if (o.sweepScope !== "uid" && o.sweepScope !== "groups") throw new WrapperRenderError(`sweepScope must be uid or groups: ${String(o.sweepScope)}`);
 	const testOnly = o.hooks !== undefined || o.killGraceMs !== undefined || o.sweepLockWaitMs !== undefined || o.captureMs !== undefined
-		|| o.detectTickMs !== undefined || o.detectPersistMs !== undefined || o.signatureCaptureMs !== undefined || o.stopGraceMs !== undefined || o.detectTrace !== undefined;
+		|| o.detectTickMs !== undefined || o.detectPersistMs !== undefined || o.signatureCaptureMs !== undefined || o.stopGraceMs !== undefined || o.detectTrace !== undefined
+		|| o.detectCpuClock !== undefined;
 	if (testOnly && o.sweepScope !== "groups") {
-		throw new WrapperRenderError("hooks, killGraceMs, sweepLockWaitMs, captureMs, detectTickMs, detectPersistMs, signatureCaptureMs, stopGraceMs and detectTrace are test-only: a uid render carries none");
+		throw new WrapperRenderError("hooks, killGraceMs, sweepLockWaitMs, captureMs, detectTickMs, detectPersistMs, signatureCaptureMs, stopGraceMs, detectTrace and detectCpuClock are test-only: a uid render carries none");
 	}
 	if (o.hooks !== undefined && !plainAbs(o.hooks)) throw new WrapperRenderError(`hooks must be a normalized absolute path: ${o.hooks}`);
 	if (o.detectTrace !== undefined && typeof o.detectTrace !== "boolean") throw new WrapperRenderError("detectTrace must be a boolean");
+	if (o.detectCpuClock !== undefined && typeof o.detectCpuClock !== "boolean") throw new WrapperRenderError("detectCpuClock must be a boolean");
 	const ms = (v: number | undefined, d: number, k: string): number => {
 		if (v === undefined) return d;
 		if (!Number.isSafeInteger(v) || v < 0) throw new WrapperRenderError(`${k} must be a whole number of ms`);
@@ -128,7 +138,7 @@ export function execConfigOf(o: ExecWrapperOptions): ExecConfig {
 		captureMs: ms(o.captureMs, CAPTURE_MS, "captureMs"),
 		detectTickMs, detectPersistMs: ms(o.detectPersistMs, STUCK_DEFAULTS.persistMs, "detectPersistMs"),
 		signatureCaptureMs: ms(o.signatureCaptureMs, STUCK_DEFAULTS.signatureCaptureMs, "signatureCaptureMs"),
-		stopGraceMs: ms(o.stopGraceMs, STUCK_DEFAULTS.stopGraceMs, "stopGraceMs"), detectTrace: o.detectTrace ?? false,
+		stopGraceMs: ms(o.stopGraceMs, STUCK_DEFAULTS.stopGraceMs, "stopGraceMs"), detectTrace: o.detectTrace ?? false, detectCpuClock: o.detectCpuClock ?? false,
 	};
 }
 
