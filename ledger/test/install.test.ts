@@ -930,7 +930,7 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 			HOME: home,
 			PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
 		};
-		const common = { WorkingDirectory: copy, ProcessType: "Background", AbandonProcessGroup: true, RunAtLoad: false };
+		const common = { WorkingDirectory: copy, ProcessType: "Background", AbandonProcessGroup: true, MaterializeDatalessFiles: true, RunAtLoad: false };
 		const { nightly, check } = driveJobs(home);
 		expect(nightly).toEqual({
 			Label: driveLabel,
