@@ -1498,3 +1498,20 @@ describe("review r7: an access error is never read as a missing file", () => {
 		expect(d.evidence).not.toContain("does not exist");
 	});
 });
+
+describe("review r8 F20: a job that logs less often than launchd starts it is judged by how often it logs", () => {
+	test("chaos (started every quarter hour, logs once a night) passes with a 10 h old log and fails past 26 h (fake clock c.ms)", () => {
+		const f = fake();
+		const p = plistPathOf(f.home, "chaos");
+		const log = join(f.home, "agent-scratch", "chaos", "launchd.log");
+		f.files.set(p, { text: "", mtimeMs: T0 - 30 * 24 * HOUR, exec: false });
+		f.files.set(log, { text: "", mtimeMs: T0 - 10 * HOUR, exec: false });
+		f.plists.set(p, { ProgramArguments: ["/bin/bun", "/repo/surface/scripts/chaos.ts", "--nightly"], StartCalendarInterval: [{ Minute: 0 }, { Minute: 15 }, { Minute: 30 }, { Minute: 45 }], StandardOutPath: log });
+		f.launchctl.set("com.agent-system-2.chaos", print({ path: p, log, runs: 40, exit: 0 }));
+		expect(checkJob(f.deps, row("chaos"))[0]).toMatchObject({ part: "job:chaos", verdict: "pass" });
+		f.c.ms = T0 + 16 * HOUR + 1;
+		const stale = checkJob(f.deps, row("chaos"))[0]!;
+		expect(stale.verdict).toBe("fail");
+		expect(stale.evidence).toContain("was last written 26.0 h ago (window 26.0 h");
+	});
+});

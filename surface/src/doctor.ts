@@ -97,6 +97,11 @@ export interface JobRow {
 	reinstall: string;
 	/** Last exit codes that pass; the doctor's own 1 means "ran and found failures". */
 	okExits: readonly number[];
+	/**
+	 * How recently the job must have logged, when it logs less often than launchd starts it (a start with nothing due exits 0
+	 * silently); overrides the window read from the plist's schedule (review r8 F20).
+	 */
+	logWindowMs?: number;
 }
 
 export const LABEL_PREFIX = "com.agent-system-2.";
@@ -190,6 +195,8 @@ export const JOB_INVENTORY: readonly JobRow[] = [
 			"bun", "omp", "git", "pgrep", "ps", "kill", "cp", "bash", "id", "dscl", "dirname", "uname", "awk", "grep", "tr", "find", "sort", "readlink", "mkdir", "mv", "rm", "ln", "sed",
 		],
 		absolute: ["/bin/ps", "/usr/bin/plutil"], envExecutables: [], reinstall: "bash {repo}/install/install.sh --chaos-nightly", okExits: [0],
+		// Started every quarter hour, but only the 03:00-03:15 PT start with no report yet runs and logs (surface/src/chaos.ts nightlyDue).
+		logWindowMs: DAILY_WINDOW_MS,
 	},
 	{
 		name: "drive-backup", expected: { kind: "opt-in", flag: "--drive-backup" }, pathNames: ["mktemp", "chmod", "pgrep", "rmdir", "rm"],
@@ -454,7 +461,7 @@ function judgeLoaded(deps: DoctorDeps, row: JobRow, plist: Plist, plistPath: str
 		if (f.state === "running" && f.pid !== undefined) return pass(part, `loaded from ${plistPath}, running as pid ${f.pid}, runs ${runs}`);
 		return fail(part, `${label} is loaded but not running (state ${f.state}, runs ${runs}, last exit code ${exitText})`, log ? `read its log: ${log}; then ${bootstrap}` : bootstrap);
 	}
-	const window = recencyWindowMs(plist);
+	const window = row.logWindowMs ?? recencyWindowMs(plist);
 	const exitPart = exit === null ? "not exited yet" : `last exit ${exit}`;
 	if (window === null) return pass(part, `loaded from ${plistPath}, runs ${runs}, ${exitPart} (no schedule to judge recency by)`);
 	if (runs === 0) {
