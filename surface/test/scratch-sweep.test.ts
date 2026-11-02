@@ -608,6 +608,31 @@ describe("scratch sweep: archives (expiry, offsite gate, failures) and the disk 
 		expect(r.report).not.toContain(`root ${closed} removed`);
 	});
 
+	test("a verification copy that could not be removed is still reported when the purge then fails too", () => {
+		const w = world();
+		const closed = open(w);
+		w.ledger.closeWorkload(closed, { by: "orchestrator-surface" });
+		root(w, closed);
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW, {
+			archive: () => ({
+				removeCopy: (dir) => {
+					rmSync(dir, { recursive: true });
+					return `the verification copy ${dir} could not be removed (EPERM: operation not permitted)`;
+				},
+				beforeStage: (path) => {
+					if (!path.endsWith("/repo/src/a.ts")) return;
+					unlinkSync(path);
+					writeFileSync(path, "rewritten");
+				},
+			}),
+		});
+		const line = r.roots.find((x) => x.name === closed)!;
+		expect(line.action).toBe("remove failed");
+		expect(line.why).toContain("./repo/src/a.ts was replaced (another inode)");
+		expect(line.why).toMatch(/the verification copy \S+\/\.verify-[0-9a-f]{16} could not be removed \(EPERM: operation not permitted\)/);
+		expect(r.report).toContain("could not be removed (EPERM: operation not permitted)");
+	});
+
 	test("a descriptor held open into a root across its archive keeps the root (archive failed, renamed back, exit 1); the other roots still go", () => {
 		const w = world();
 		const held = open(w);

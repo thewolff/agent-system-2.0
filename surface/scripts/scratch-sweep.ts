@@ -322,7 +322,8 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 			const reason = r.kind === "refused" ? `refused at removal: ${r.reason}` : r.error;
 			removalFailed.set(name, reason);
 			const back = restoreDetached(d);
-			return { name, sizeKib, action: "remove failed", why: `${why}; archived to ${a.path}, then ${reason}; ${back.said}; what is left is at ${back.at}` };
+			const warned = a.warnings.length ? `; ${a.warnings.join("; ")}` : "";
+			return { name, sizeKib, action: "remove failed", why: `${why}; archived to ${a.path}, then ${reason}; ${back.said}; what is left is at ${back.at}${warned}` };
 		}
 		if (ledger) state = diskState(ledger.workload(STANDING_WORKLOAD_ID) ? ledger.entries(STANDING_WORKLOAD_ID, "assumption") : []);
 	} finally {
