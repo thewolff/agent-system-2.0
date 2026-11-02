@@ -12,14 +12,27 @@ const roots: string[] = [];
 const fixture = (): string => { const root = tmp("resource-runtime"); roots.push(root); return root; };
 afterAll(() => { for (const root of roots) rmSync(root, { recursive: true, force: true }); });
 describe("resource admission", () => {
-	test("configured workers are only a ceiling; both CPU and current memory constrain launch", () => {
-		expect(admitResources(20, inputs, costs)).toMatchObject({ configuredWorkers: 20, selectedWorkers: 4, nestedConcurrency: 1, inputs, costs });
-		expect(admitResources(20, { ...inputs, availableCpuCount: 6 }, costs).selectedWorkers).toBe(2);
+	test("configured workers are only a ceiling; the fixed CPU count and total memory constrain launch", () => {
+		expect(admitResources(20, inputs, costs)).toMatchObject({ configuredWorkers: 20, selectedWorkers: 7, nestedConcurrency: 1, inputs, costs });
+		expect(admitResources(20, { ...inputs, cpuCount: 8, availableCpuCount: 8 }, costs).selectedWorkers).toBe(3);
+		expect(admitResources(20, { ...inputs, totalMemoryBytes: 1400, availableMemoryBytes: 1000 }, costs).selectedWorkers).toBe(3);
 		expect(admitResources(1, inputs, costs).selectedWorkers).toBe(1);
 	});
+	// Jo's "fixed" ruling (q-mvzovbsiyotxuk): live readings are recorded, never selecting, so a busy host cannot change the count.
+	test("a busy host admits exactly what an idle one does, and its live readings are kept in the receipt", () => {
+		const busyInputs = { ...inputs, availableCpuCount: 1, availableMemoryBytes: 1, loadAverage: [40, 30, 20] };
+		const busy = admitResources(20, busyInputs, costs);
+		expect(busy.selectedWorkers).toBe(admitResources(20, inputs, costs).selectedWorkers);
+		expect(busy.inputs).toEqual(busyInputs);
+	});
+	test("the measured calibration admits three workers on this 14-CPU, 24 GiB Mac", () => {
+		const measured = { workerCpu: 1.995, workerMemoryBytes: 2249719808, reserveCpu: 7.806, reserveMemoryBytes: 13056475136, calibration: "PROVISION-FINDINGS.md: worker CPU p99, host CPU p99, memory maxima" };
+		const mac = { cpuCount: 14, availableCpuCount: 14, availableMemoryBytes: 148389888, totalMemoryBytes: 25769803776, loadAverage: [23.9, 17.8, 14.1] };
+		expect(admitResources(6, mac, measured).selectedWorkers).toBe(3);
+	});
 	test("insufficient resources refuse rather than oversubscribing one worker", () => {
-		expect(() => admitResources(6, { ...inputs, availableMemoryBytes: 599 }, costs)).toThrow("cannot admit one worker");
-		expect(() => admitResources(6, { ...inputs, availableCpuCount: 3 }, costs)).toThrow("cannot admit one worker");
+		expect(() => admitResources(6, { ...inputs, totalMemoryBytes: 599, availableMemoryBytes: 500 }, costs)).toThrow("cannot admit one worker");
+		expect(() => admitResources(6, { ...inputs, cpuCount: 3, availableCpuCount: 3 }, costs)).toThrow("cannot admit one worker");
 	});
 	test("missing calibration, invalid readings and nonpositive costs fail visibly", () => {
 		expect(() => parseResourceCosts(null)).toThrow("missing resource calibration");
@@ -35,10 +48,10 @@ describe("resource admission", () => {
 		expect(() => boundedTestArgs(["test"], 2, 3)).toThrow("exceeds the configured ceiling 2");
 	});
 	// TOOLS-REVIEW r2 R5: isolation is a function of configuration, never of host load.
-	test("a configured ceiling over 1 isolates even when a busy host admits one worker; a configured 1 never does", () => {
-		const busy = admitResources(6, { ...inputs, availableCpuCount: 4 }, costs);
-		expect(busy.selectedWorkers).toBe(1);
-		expect(boundedTestArgs(["test"], busy.configuredWorkers, busy.selectedWorkers)).toEqual(["test", "--max-concurrency=1", "--parallel=1"]);
+	test("a configured ceiling over 1 isolates even when the calibration admits one worker; a configured 1 never does", () => {
+		const small = admitResources(6, { ...inputs, cpuCount: 4, availableCpuCount: 4 }, costs);
+		expect(small.selectedWorkers).toBe(1);
+		expect(boundedTestArgs(["test"], small.configuredWorkers, small.selectedWorkers)).toEqual(["test", "--max-concurrency=1", "--parallel=1"]);
 		const idle = admitResources(6, inputs, costs);
 		expect(idle.selectedWorkers).toBeGreaterThan(1);
 		expect(boundedTestArgs(["test"], idle.configuredWorkers, idle.selectedWorkers)).toEqual(["test", "--max-concurrency=1", `--parallel=${idle.selectedWorkers}`]);

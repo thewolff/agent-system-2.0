@@ -1,5 +1,6 @@
 // Executor-owned admission. Costs have no guessed defaults: the trusted install supplies measured
-// worker peaks and host + historical proof-load reserve in resources.json beside the fixed Bun.
+// worker peaks and the measured host reserve in resources.json beside the fixed Bun. The budget is the machine's fixed
+// CPU count and RAM (Jo's "fixed" ruling, q-mvzovbsiyotxuk): one commit gets one worker count however busy the host is.
 import { createHash } from "node:crypto";
 import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { availableParallelism, cpus, freemem, loadavg, totalmem } from "node:os";
@@ -14,10 +15,11 @@ export interface ResourceCosts {
 	/** Durable measurement receipt, including host and historical-load reservation methodology. */
 	calibration: string;
 }
+/** Raw machine readings. Only cpuCount and totalMemoryBytes select workers; the rest is recorded in each part's receipt. */
 export interface ResourceInputs {
 	cpuCount: number;
 	availableCpuCount: number;
-	/** Conservative currently free memory, not total RAM or an inferred reclaimable-memory estimate. */
+	/** os.freemem(): free pages only. On macOS this excludes reclaimable memory and sits near zero on a busy host. */
 	availableMemoryBytes: number;
 	totalMemoryBytes: number;
 	loadAverage: number[];
@@ -58,7 +60,12 @@ export function readResourceInputs(): ResourceInputs {
 	return { cpuCount: cpus().length, availableCpuCount: availableParallelism(), availableMemoryBytes: freemem(), totalMemoryBytes: totalmem(), loadAverage: loadavg() };
 }
 
-/** Freeze one selection for the whole part; a zero-capacity result is a failure, never a forced worker. */
+/**
+ * Freeze one selection for the whole part; a zero-capacity result is a failure, never a forced worker. The budget is
+ * fixed: cpuCount and totalMemoryBytes minus the measured host reserve. Live free memory, available CPUs and load average
+ * are validated and recorded but never select the count, so red or green cannot depend on how busy the host was at launch
+ * (TOOLS-REVIEW r2 R5; provisioning finding: macOS freemem median 0.18 GB would refuse every run).
+ */
 export function admitResources(configuredWorkers: number, inputs: ResourceInputs, rawCosts: ResourceCosts): ResourceAdmission {
 	whole(configuredWorkers, "configuredWorkers");
 	const costs = parseResourceCosts(rawCosts);
@@ -66,8 +73,8 @@ export function admitResources(configuredWorkers: number, inputs: ResourceInputs
 	if (inputs.availableCpuCount > inputs.cpuCount) throw new Error("resource admission: availableCpuCount exceeds cpuCount");
 	if (inputs.availableMemoryBytes > inputs.totalMemoryBytes) throw new Error("resource admission: availableMemoryBytes exceeds totalMemoryBytes");
 	if (inputs.loadAverage.length !== 3 || inputs.loadAverage.some((n) => !Number.isFinite(n) || n < 0)) throw new Error("resource admission: loadAverage reading is malformed");
-	const cpu = Math.floor((inputs.availableCpuCount - costs.reserveCpu) / costs.workerCpu);
-	const memory = Math.floor((inputs.availableMemoryBytes - costs.reserveMemoryBytes) / costs.workerMemoryBytes);
+	const cpu = Math.floor((inputs.cpuCount - costs.reserveCpu) / costs.workerCpu);
+	const memory = Math.floor((inputs.totalMemoryBytes - costs.reserveMemoryBytes) / costs.workerMemoryBytes);
 	const selectedWorkers = Math.min(configuredWorkers, cpu, memory);
 	if (selectedWorkers < 1) throw new Error(`resource admission: cannot admit one worker; configured=${configuredWorkers} inputs=${JSON.stringify(inputs)} costs=${JSON.stringify(costs)}; diagnose capacity or calibration before another run`);
 	return { configuredWorkers, selectedWorkers, nestedConcurrency: 1, inputs: { ...inputs, loadAverage: [...inputs.loadAverage] }, costs };
