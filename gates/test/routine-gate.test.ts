@@ -606,9 +606,14 @@ describe.skipIf(!SANDBOX)("behaviour under sandbox-exec", () => {
 		const fence = worktreeFence(wt, l.wl, true);
 		const profile = fenceProfile([], { kind: "worktree", allow: fence.allow, deny: fence.deny });
 		const ok = sandboxed(profile, "git checkout -- f && git reset -q --keep HEAD~1 && cat f", wt);
-		// stderr is shown only when it carries a denial (xcrun may warn about its cache, which the profile does not allow).
-		expect({ code: ok.code, out: ok.out.trim(), denial: /Operation not permitted|deny\(1\)/.test(ok.err) ? ok.err : "" }).toEqual({ code: 0, out: "one", denial: "" });
+		// stderr counts only lines that carry a denial (xcrun may warn about its cache, which the profile does not allow). The one
+		// denial expected is git's own: deleting the per-worktree AUTO_MERGE ref tries `<common>/packed-refs.lock`, which the fence
+		// keeps unwritable, and git goes on (Jo's ruling in-mvzor59pc1067u). Any other denied path fails here.
+		const packedLock = `error: Unable to create '${join(common, "packed-refs.lock")}': Operation not permitted`;
+		const denials = ok.err.split("\n").filter((x) => /Operation not permitted|deny\(1\)/.test(x) && x.trim() !== packedLock);
+		expect({ code: ok.code, out: ok.out.trim(), denials }).toEqual({ code: 0, out: "one", denials: [] });
 		expect(git(wt, "rev-parse", "HEAD")).not.toBe(tip);
+		expect(existsSync(join(common, "packed-refs.lock"))).toBe(false);
 		const denied = sandboxed(profile, `echo x >> .git; echo x >> "${join(common, "config")}"; echo x > "${join(common, "refs", "heads", "main")}"`, wt);
 		expect(denied.err.match(/Operation not permitted/g)?.length).toBe(3);
 		expect(git(wt, "rev-parse", "main")).toBe(tip);
