@@ -2,7 +2,7 @@
 title: Lanes stay on Anthropic (set-lane-model tool, quota-move alert, weekly-out hand move)
 status: building
 workload: wl-mvwk0v0gmp6cjc
-pr: none
+pr: 421
 ---
 Jo wants lanes to stay on Anthropic and to hear at once, without a sound, when one is moved off it (Jo's in-mvwk6orb520efe and in-mvwl9tkmsym86o, cut down by in-mvzllm9vlzllac). Plan: `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mvwk0v0gmp6cjc/PLAN.md` (rev 5), D1, D2, D4, D5, D6.
 
