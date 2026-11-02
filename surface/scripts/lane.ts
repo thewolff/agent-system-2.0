@@ -68,7 +68,7 @@ import { newLaneSession, runCtxIndex, topLevelSessions } from "../src/ctx-index"
 import { decisionLogContext, repoOf } from "../src/decision-log";
 import { factsBlock } from "../src/facts";
 import { loadTestRunnerConfig } from "../src/close-entry";
-import { checkoutOwnerRepo, isTrainOrFix, openTrains, ownerTasks, TRAIN_LAUNCH_LIMIT, trainLaunchFailures, trainMembers } from "../src/merge-train";
+import { checkoutOwnerRepo, isTrainOrFix, openTrains, ownerTasks, TRAIN_LAUNCH_LIMIT, trainAttempts, trainLaunchFailures, trainMembers } from "../src/merge-train";
 import {
 	activeTrainPr, askTrainPause, emptyTrainScan, nextPdtMidnight, pdtDay, scanTrainDays, trainBudgetGate, trainBudgetPromptLine, trainBudgetRows, trainDayLimit, trainMaxTime,
 	trainMeterErrorBody, trainPausedBody, trainRuleBody, type TrainScan, type TrainScanError,
@@ -77,11 +77,12 @@ import {
 	attempts, branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, heldLive, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
-	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeOrigin, resumePlan, scratchCapMb, sessionOrigin, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, worktreeBody, worktreePath,
+	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeOrigin, resumePlan, scratchCapMb, sessionOrigin, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, trainBindings, worktreeBody,
+	worktreePath,
 } from "../src/launch";
 import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continueCounter, continuePrompt, deadRunPrompt, type DeadTestRun, deadTestRuns, enqueueRunnerDeath, exitOutcome, heldOpenBody, IDLE_CHECK, IDLE_LIMIT, idleActivity,
-	idlePrompt, liveTestRuns, type PromptError, promptErrorOf, releasedOpen, SETTLE_CHECK, SETTLE_IDLE_MS, settleIdle, sliceCounts, STATE_ID, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
+	idlePrompt, liveTestRuns, type PromptError, promptErrorOf, releasedIdle, releasedOpen, SETTLE_CHECK, SETTLE_IDLE_MS, settleIdle, sliceCounts, STATE_ID, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
 	type TurnEndInput, unsettledHandsOf,
 } from "../src/turn-end";
 import { waitingReserved } from "../src/errors";
@@ -296,11 +297,14 @@ function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared, 
 	const cfg = loadTestRunnerConfig(process.env);
 	const origin = cfg.ok && cfg.config.repos.length > 0 ? checkoutOwnerRepo(p.repo)?.toLowerCase() : undefined;
 	const runnerServed = cfg.ok && origin !== undefined && cfg.config.repos.some((r) => r.origin.toLowerCase() === origin);
+	// PLAN wl-mvr888nftz0vcl D11: the merge train's prompt shows TRAIN_DONE and its brief built now from its first membership.
+	const membership = trainBindings(entries, instructions)[0];
 	const prompt = firstPrompt({
 		workload: w, laneId, repo: p.repo, worktree: p.worktree, branch: p.branch, done: doneLine(control), planFirst: planFirst(control)?.trigger ?? null,
 		decisionLog, facts, resolved, instructions: joInstructionsFor(control, instructions, laneId), machinery: canonicalPath(p.repo) === canonicalPath(REPO_ROOT), tools: LANE_TOOLS,
 		scratch: { root: p.scratch, capMb: scratchCapMb(process.env) }, trainTasks: ownerTasks(ledger, w.id),
 		runnerServed, trainOrFix: isTrainOrFix(entries, instructions),
+		train: membership === undefined ? null : { prs: membership.prs, source: membership.source, attempts: trainAttempts(w.id, entries, instructions, ledger.slices(w.id)) },
 	});
 	const out = prompt.split("\n");
 	out.splice(out.indexOf(`stakes: ${w.stakes} · mode: ${w.mode}`) + 1, 0, ceilingLine);
@@ -1328,10 +1332,14 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		const workload = ledger.workload(wl);
 		return { workload, control: controlEntries(es, holdersOf(es, workload?.holder ?? null)) };
 	};
-	/** The open-slice count of this lane's `released-open:` marker (D4), read with the holders decideTurn uses, or null. */
-	const releasedOpenNow = (): number | null => {
+	/**
+	 * This lane's release markers, read with the holders decideTurn uses: the open-slice count of its `released-open:` (D4), or
+	 * null, and whether it wrote `released-idle:` (PLAN wl-mvr888nftz0vcl D13, a merge train's quiet idle release).
+	 */
+	const releaseMarkersNow = (): { releasedOpen: number | null; releasedIdle: boolean } => {
 		const es = ledger.entries(wl);
-		return releasedOpen(controlEntries(es, holdersOf(es, ledger.workload(wl)?.holder ?? null, ledger.holders(wl))), laneId);
+		const control = controlEntries(es, holdersOf(es, ledger.workload(wl)?.holder ?? null, ledger.holders(wl)));
+		return { releasedOpen: releasedOpen(control, laneId), releasedIdle: releasedIdle(control, laneId) };
 	};
 	/** OMP's `--max-time`: the ceiling's remaining wall plus the margin (a train: TRAIN_RUN_MAX_TIME_MIN), or AGENT_SYSTEM_LANE_MAX_TIME when that is set and shorter; fixed at the spawn. */
 	let maxTime = laneMaxTime(process.env);
@@ -1552,8 +1560,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		try {
 			const { workload: cur, control } = controlNow();
 			const held = cur !== null && cur.status === "open" && cur.holder === laneId;
-			// omp exited before the runner decided: a release with this lane's released-open: marker is still open-work (D4).
-			const exit = outcome === null ? exitOutcome(laneId, { ready, held, releasedOpen: releasedOpenNow() }) : null;
+			// omp exited before the runner decided: a release with this lane's released-open: marker is still open-work (D4); a
+			// merge train's released-idle: is its quiet idle release, intended (PLAN wl-mvr888nftz0vcl D13).
+			const exit = outcome === null ? exitOutcome(laneId, { ready, held, ...releaseMarkersNow() }) : null;
 			const final: LaneOutcome = outcome ?? exit!.outcome;
 			const intended = INTENDED_OUTCOMES[final] || exitClass(control, laneId) === "intended";
 			const inFlight = cur ? cur.open_slices + cur.paused_slices : 0;
@@ -1670,6 +1679,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			const entries = ledger.entries(wl);
 			const holders = holdersOf(entries, cur?.holder ?? null, ledger.holders(wl));
 			const runs = runsNow(entries);
+			const control = controlEntries(entries, holders);
 			const input: TurnEndInput = {
 				settled,
 				idle,
@@ -1680,8 +1690,10 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				pendingReserved: idle && waitingReserved(ledger, wl).length > 0,
 				held: cur !== null && cur.status === "open" && cur.holder === laneId,
 				handedOff: cur?.holder === JO_HOLDER,
-				releasedOpen: releasedOpen(controlEntries(entries, holders), laneId),
-				receipt: doneBecause(entries, holders) !== null,
+				releasedOpen: releasedOpen(control, laneId),
+				releasedIdle: releasedIdle(control, laneId),
+				// PLAN wl-mvr888nftz0vcl D3: a merge train is permanent, so a legacy standing done-because on it is no receipt.
+				receipt: !train && doneBecause(entries, holders) !== null,
 				slices: sliceCounts(ledger.slices(wl)),
 				continues,
 				idleContinues,
@@ -1702,8 +1714,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				if (c?.kind === "dead-run") {
 					promptedDead.add(c.run.runId);
 					sendPrompt(deadRunPrompt(c.run));
-				} else if (c?.kind === "idle") sendPrompt(idlePrompt(wl, SETTLE_IDLE, idleContinues, IDLE_LIMIT));
-				else sendPrompt(continuePrompt(wl, input, continues, CONTINUE_LIMIT));
+				} else if (c?.kind === "idle") sendPrompt(idlePrompt(wl, SETTLE_IDLE, idleContinues, IDLE_LIMIT, train));
+				else sendPrompt(continuePrompt(wl, input, continues, CONTINUE_LIMIT, train));
 			} else if (t.decision === "hold") {
 				// The stop poll releases the hold and asks omp (SETTLE_CHECK) before deciding again.
 				awaitingSettle = false;

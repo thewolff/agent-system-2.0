@@ -8,8 +8,10 @@ import { handSettledBody, handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
 import { controlEntries, exitClass, holdersOf } from "../src/launch";
 import { laneDeaths } from "../src/signals";
+import { TRAIN_DONE } from "../src/merge-train";
 import {
-	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, openWorkDeathBody, parkFailedDeathBody, releasedOpen, releasedOpenBody, sliceCounts, turnEnd,
+	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, idlePrompt, openWorkDeathBody, parkFailedDeathBody, releasedIdle, releasedIdleBody, releasedOpen,
+	releasedOpenBody, sliceCounts, turnEnd,
 	turnEndDeathBody, type TurnEndInput, unsettledHands,
 } from "../src/turn-end";
 import { recordDecision } from "../scripts/lane";
@@ -197,6 +199,26 @@ describe("turn end: the texts", () => {
 		const s = (id: string, state: string) => ({ id, state: state as "open", created_by: LANE });
 		expect(sliceCounts([s("sl-a", "open"), s("sl-b", "paused"), s("sl-c", "done"), s("sl-d", "cancelled"), s("sl-e", "paused")])).toEqual({ open: 1, paused: 2, done: 1 });
 	});
+
+	test("R13 (PLAN wl-mvr888nftz0vcl D11): on the merge train the continue and idle prompts carry TRAIN_DONE and never ask for done-because", () => {
+		for (const slices of [{ open: 2, paused: 1, done: 3 }, { open: 0, paused: 0, done: 0 }]) {
+			const p = continuePrompt("wl-t", { unsettledHands: [], slices }, 1, 2, true);
+			expect(p).toContain(`done: ${TRAIN_DONE}`);
+			expect(p).not.toContain("record done-because");
+			expect(p).not.toContain("no done-because receipt");
+			expect(p).not.toContain("with no slice cut");
+			expect(p).toContain("release with no done-because: this train is permanent");
+			expect(p).toEndWith("(continue 1 of 2)");
+		}
+		const idle = idlePrompt("wl-t", 600_000, 1, 3, true);
+		expect(idle).toContain(`done: ${TRAIN_DONE}`);
+		expect(idle).not.toContain("record done-because");
+		expect(idle).toEndWith("(idle prompt 1 of 3)");
+		// every other lane keeps its done-because ask
+		expect(continuePrompt("wl-x", { unsettledHands: [], slices: { open: 1, paused: 0, done: 0 } }, 1, 2)).toContain("record done-because and lane_release");
+		expect(idlePrompt("wl-x", 600_000, 1, 3)).toContain("record done-because first");
+		expect(idlePrompt("wl-x", 600_000, 1, 3)).not.toContain(TRAIN_DONE);
+	});
 });
 
 /** A workload `LANE` holds on a temp ledger, with one open slice. */
@@ -231,6 +253,35 @@ describe("turn end: the runner's writes and reads", () => {
 		// the death is the one decideTurn would have enqueued for the same marker, so the laneDeaths guard keeps it single
 		const marked = input({ held: false, releasedOpen: 1 }).i;
 		expect(exitOutcome(LANE, { ready: true, held: false, releasedOpen: 1 }).death).toBe(turnEndDeathBody(LANE, turnEnd(marked), marked));
+	});
+
+	test("R25 (PLAN wl-mvr888nftz0vcl D13): a train lane's released-idle marker is a quiet idle release, never a death; an ordinary release with open work keeps its death line", () => {
+		// the quiet release: decided released, no death, exit class intended
+		const quiet = input({ held: false, releasedOpen: null, releasedIdle: true }).i;
+		expect(turnEnd(quiet).decision).toBe("released");
+		expect(turnEndDeathBody(LANE, turnEnd(quiet), quiet)).toBeNull();
+		expect(exitOutcome(LANE, { ready: true, held: false, releasedOpen: null, releasedIdle: true })).toEqual({ outcome: "released", death: null });
+		// ordinary workloads: released-open keeps the open-work death
+		const loud = input({ held: false, releasedOpen: 2 }).i;
+		expect(turnEnd(loud).decision).toBe("open-work");
+		expect(turnEndDeathBody(LANE, turnEnd(loud), loud)).toBe(`lane-died: ${LANE}: released with 2 open slice(s), no done-because`);
+	});
+
+	test("R25: released-idle is read only from the lane it names, written by that lane as a holder, and makes the exit intended", () => {
+		const { ledger, wl } = held();
+		const control = () => {
+			const entries = ledger.entries(wl);
+			return controlEntries(entries, holdersOf(entries, null));
+		};
+		ledger.recordEntry({ by: "lane-t-9", workloadId: wl, kind: "assumption", body: releasedIdleBody(LANE, 3) });
+		ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body: releasedIdleBody("lane-t-2", 4) });
+		expect(releasedIdle(control(), LANE)).toBe(false);
+		expect(releasedIdle(control(), "lane-t-2")).toBe(false);
+		ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body: releasedIdleBody(LANE, 2) });
+		expect(releasedIdleBody(LANE, 2)).toBe(`released-idle: ${LANE} open 2`);
+		expect(releasedIdle(control(), LANE)).toBe(true);
+		expect(releasedOpen(control(), LANE)).toBeNull();
+		expect(exitClass(control(), LANE)).toBe("intended");
 	});
 
 	test("the released-open marker is read only from the lane it names, written by that lane as a holder", () => {

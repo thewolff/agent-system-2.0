@@ -26,19 +26,21 @@ interface BoardSeen extends Seen {
 describe("once per decision (D8, D9)", () => {
 	// The production question itself is raised by the train lane in its session (trainBrief step 7c, lane_raise_question), not by
 	// the tick: this pins the tick's half, that one open production question yields one issue and one needs-you line across
-	// passes and that the tick never adds a question of its own (review wl-mvbjiettjrfpxc r1 #4).
+	// passes and that the tick never adds a question of its own (review wl-mvbjiettjrfpxc r1 #4). Rewritten for PLAN
+	// wl-mvr888nftz0vcl R11: the passes stay inside TRAIN_STALL_MS (2 h in all), since past 3 h with no test start the tick's
+	// stall question on the train's other PR is wanted behavior, pinned in train-tick.test.ts.
 	test("R6: a production-stakes merge reaches Jo once: the lane's one question gets one issue and one needs-you line across repeated passes, and the tick adds no question", () => {
 		const w = world();
 		for (let i = 0; i < 3; i++) {
 			w.run();
-			w.c.plusHours(0.5);
+			w.c.plusHours(0.25);
 		}
 		expect(w.ledger.questions(w.train)).toHaveLength(0);
 		const sl = w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: trainSliceId(w.train, 106), task: "PR #106", doneCondition: "terminal", inputs: "#106" });
 		w.ledger.raiseQuestion({ by: TRAIN_LANE, workloadId: w.train, sliceId: sl, body: "#106 production: merge it?", options: ["merged", "skip", "stop"] });
 		for (let i = 0; i < 5; i++) {
 			w.run();
-			w.c.plusHours(0.5);
+			w.c.plusHours(0.25);
 		}
 		expect(w.ledger.questions(w.train)).toHaveLength(1);
 		expect(w.creates()).toHaveLength(1);

@@ -23,6 +23,7 @@ import { identityOf, recordIdentity } from "../src/identity";
 import { ceilingBody, sizeFor } from "../src/ceiling";
 import { attempts, controlEntries, doneBecause, doneBody, doneLine, holdersOf, laneCap, laneModelBody, modelProblem, planFirstBody, queuedBody, supersededBy, withdrawnBy } from "../src/launch";
 import { stakesSource } from "../src/input";
+import { trainPermanentRefusal } from "../src/merge-train";
 import { answerOrchestratorQuestion, inputSpent, joInput, type OrchestratorAnswer, questionSubject, readingBody } from "../src/orchestrator-question";
 import { queuePosition, startedIdle } from "../src/rank-launch";
 import { oneLiner } from "../src/render";
@@ -113,7 +114,8 @@ function heldDeliveredLine(held: MessageRow[]): string | null {
  * entry name; trusted security-red signals stay held for display (a refused or failed close leaves all held). A closed
  * workload's branch is then pushed and an open PR made sure of. Past the check and the pinned
  * commit, a git or gh failure is named in the result and never blocks the close. `cwd` is the
- * repository when the workload has no `repo:` entry. Never throws for a refusal.
+ * repository when the workload has no `repo:` entry. Never throws for a refusal. The merge train is never closed (PLAN
+ * wl-mvr888nftz0vcl D3, `trainPermanentRefusal`): refused right after the closed check, before any git or check.
  */
 export async function closeWorkloadWithEntry(
 	pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, id: string, o: { now: string; cwd: string; receipt: string | null },
@@ -123,6 +125,9 @@ export async function closeWorkloadWithEntry(
 	const w = ledger.workload(id);
 	if (!w) return refused(`No workload ${id}.`);
 	if (w.status === "closed") return refused(`${id} is already closed (${w.closed_at}).`);
+	// PLAN wl-mvr888nftz0vcl D3: the merge train is permanent; refused before any git or check, nothing written.
+	const permanent = trainPermanentRefusal(ledger, id);
+	if (permanent !== null) return refused(`close refused: ${permanent}.`);
 	if (w.holder !== null && (w.holder_lease_until === null || w.holder_lease_until >= o.now)) {
 		return refused(`${id} cannot close: held by ${w.holder} under a live lease; stop it first: \`as2 lane stop ${id}\``);
 	}

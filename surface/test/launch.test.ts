@@ -15,7 +15,7 @@ import {
 	testPrBody, testPrInstructionBody, type Resolution, resumePlan, resumeSession, TRAIN_LANDS_LINE, verdictOf, waivedPrs, waivePrBody, waivePrInstructionBody,
 	withdrawInstructionBody, withdrawnBody, withdrawnBy, landFirstBody, landFirstInstructionBody, landFirstOn, mainRetries, mainRetryBody, mainRetryInstructionBody, sameRepo,
 } from "../src/launch";
-import { consumedByReady, TRAIN_LAUNCH_LIMIT, TRAIN_LAUNCH_OPTIONS, trainLaunchFailures, type TrainLaunchRows } from "../src/merge-train";
+import { consumedByReady, TRAIN_DONE, TRAIN_LAUNCH_LIMIT, TRAIN_LAUNCH_OPTIONS, trainLaunchFailures, type TrainLaunchRows } from "../src/merge-train";
 import { trainBudgetSliceId, trainPausedBody, trainRaiseBody } from "../src/train-budget";
 import type { CleanShellRead } from "../../gates/src/clean-shell";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
@@ -443,6 +443,39 @@ describe("first prompt merge line (decision 11, Codex review S7)", () => {
 		for (const text of [lane({}, false, false), lane({}, true, true), lane({ stakes: "production" }, true, false), lane({ mode: "user-driven" }, true, false)]) {
 			expect(line(text)).not.toContain(TRAIN_LANDS_LINE);
 		}
+	});
+});
+
+describe("first prompt on the permanent merge train (PLAN wl-mvr888nftz0vcl D11, D13, R13)", () => {
+	const prompt = (train: Parameters<typeof firstPrompt>[0]["train"]) => firstPrompt({
+		workload: workload({ id: "wl-trainx", stakes: "normal", mode: "autonomous" }), laneId: "lane-m-1", repo: "/r", worktree: "/r-lanes/wl-trainx", branch: "wl/wl-trainx",
+		done: "the stored done line", planFirst: null, decisionLog: "", facts: "", resolved: [], instructions: [], machinery: true, tools: ["lane_release"], train,
+	});
+	const line = (text: string, head: string) => text.split("\n").find((l) => l.startsWith(head))!;
+
+	test("R13: a train lane's done: is TRAIN_DONE, its brief is built now, and its closing line releases with no done-because", () => {
+		const text = prompt({ prs: [117, 118], source: "board" });
+		expect(line(text, "done: ")).toBe(`done: ${TRAIN_DONE}`);
+		expect(text).not.toContain("the stored done line");
+		expect(line(text, "brief: ")).toContain("#117");
+		expect(text).toContain("sl-train-trainx-117, suite runs on sl-train-trainx-117-full-1");
+		expect(text).toContain("`train-pr: <n> start`");
+		expect(text).not.toContain("Write `done-because:");
+		expect(text).not.toContain("record done-because");
+		expect(text).toContain("release with no done-because: this train is permanent");
+	});
+
+	test("lane decision en-mvznmxcdh0ucsj: a PR on its second attempt is listed with its -a2 slices", () => {
+		const text = prompt({ prs: [117, 118], source: "board", attempts: new Map([[117, { attempt: 2, since: "2026-11-01T00:00:00.000Z" }]]) });
+		expect(text).toContain("#117: sl-train-trainx-117-a2, suite runs on sl-train-trainx-117-a2-full-1, sl-train-trainx-117-a2-full-2");
+		expect(text).toContain("#118: sl-train-trainx-118, suite runs on sl-train-trainx-118-full-1");
+	});
+
+	test("every other lane keeps its done line and the done-because closing line", () => {
+		const text = prompt(null);
+		expect(line(text, "done: ")).toBe("done: the stored done line");
+		expect(text).toContain("Write `done-because: <receipt against the done: line>` with `lane_record_entry` before `lane_release`");
+		expect(text).not.toContain(TRAIN_DONE);
 	});
 });
 

@@ -1490,3 +1490,4 @@ surface/test/fixtures/timing-lint/opt-out-bad.txt	test	-
 surface/src/train-budget.ts	module	-
 surface/test/train-budget.test.ts	test	-
 surface/test/train-permanent.test.ts	test	-
+surface/test/errors-board-refused.test.ts	test	-

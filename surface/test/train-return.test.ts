@@ -16,7 +16,7 @@ import { controlEntries, firstPrompt, laneExitBody, trainFixBody } from "../src/
 import {
 	carryPairs, COMMIT_FILES_CAP, fixBindings, forkOf, forkTaskAlert, ghCompare, nextAttempt, openTrainFix, ownerDeliveries, ownerTasks, recordTrainTask, settleTasks, type TaskView,
 	TRAIN_TASK_KINDS, type TrainPush, type TrainTask, trainPushesOf,
-	trainSliceId, trainTaskWindows, twiceFailed, unsettledTasks,
+	trainBody, trainInstructionBody, trainSliceId, trainTaskWindows, twiceFailed, unsettledTasks,
 } from "../src/merge-train";
 import { type CompareResult, makeRunId, pushDestBody, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRuns } from "../src/test-run";
 import { INSTRUCTION_POLL_MS, LANE_TOOLS, LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX } from "../src/types";
@@ -535,40 +535,50 @@ describe("recording a task (D6)", () => {
 	});
 });
 
-describe("one train per PR (rev 17.1 D8)", () => {
-	test("the train word refuses a PR on another open train of the same repo, opening or appending; another repo or a skipped PR is free", () => {
+describe("one train per PR (rev 17.1 D8; PLAN wl-mvr888nftz0vcl D2: one train)", () => {
+	/** A stale second open train of `repo` carrying `prs`, built from rows as one left open before the one-train cutover would be (the word appends now). */
+	function staleTrain(ledger: Ledger, repo: string, prs: number[]): string {
+		return ledger.write(() => {
+			const id = ledger.openWorkload({ by: SURFACE_BY, brief: "stale train", stakes: "normal", mode: "autonomous" });
+			recordRepo(ledger, id, repo);
+			const ins = ledger.recordInstruction({ ...JO, workloadId: id, body: trainInstructionBody(id, prs) });
+			ledger.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: trainBody(prs, ins) });
+			return id;
+		});
+	}
+
+	test("the train word appends to the one train, refuses another repo, and a stale second train of the same repo refuses a PR on the first until Jo skips it", () => {
 		const w = world();
-		const again = interpret(w.ledger, "train 106 139");
-		if (again?.kind !== "train") throw new Error("not a train");
-		expect(() => applyTrain(w.ledger, again, w.trainCheckout)).toThrow(w.train);
-		const other = interpret(w.ledger, "train 139");
-		if (other?.kind !== "train") throw new Error("not a train");
-		const second = applyTrain(w.ledger, other, w.trainCheckout).workloadId;
-		expect(interpret(w.ledger, `train ${second} 101`)).toMatchObject({ kind: "refused", why: expect.stringContaining(w.train) });
-		// another repo's #101 is another PR
-		const elsewhere = interpret(w.ledger, "train 101");
+		expect(interpret(w.ledger, "train 106 139")).toMatchObject({ kind: "refused", why: `#106 is already on open merge train ${w.train}` });
+		const more = interpret(w.ledger, "train 139");
+		if (more?.kind !== "train") throw new Error("not a train");
+		expect(applyTrain(w.ledger, more, w.trainCheckout).workloadId).toBe(w.train);
+		// another repo's #140 is refused by the one train, nothing written
+		const elsewhere = interpret(w.ledger, "train 140");
 		if (elsewhere?.kind !== "train") throw new Error("not a train");
-		expect(() => applyTrain(w.ledger, elsewhere, checkout("https://github.com/thewolff/other.git"))).not.toThrow();
-		// Jo's skip takes #106 off the first train, so a new train may carry it
+		const before = w.ledger.instructions(w.train).length;
+		expect(() => applyTrain(w.ledger, elsewhere, checkout("https://github.com/thewolff/other.git"))).toThrow("is another repository");
+		expect(w.ledger.instructions(w.train)).toHaveLength(before);
+		const second = staleTrain(w.ledger, checkout(), [150]);
+		expect(interpret(w.ledger, `train ${second} 101`)).toMatchObject({ kind: "refused", why: expect.stringContaining(w.train) });
+		// Jo's skip takes #106 off the first train, so the stale one may carry it
 		const sl = w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: trainSliceId(w.train, 106), task: "PR #106", doneCondition: "terminal", inputs: "#106" });
 		const q = w.ledger.raiseQuestion({ by: TRAIN_LANE, workloadId: w.train, sliceId: sl, body: "#106 production", options: ["merged", "skip", "stop"] });
 		w.ledger.answerQuestion(q, { ...JO, answer: "skip" });
 		expect(interpret(w.ledger, `train ${second} 106`)).toMatchObject({ kind: "train-append" });
 	});
 
-	test("the same repository is its GitHub owner/repo: a subdirectory or another checkout of it is refused too, whatever its case", () => {
+	test("the same repository is its GitHub owner/repo: a subdirectory or another checkout of it appends to the train, whatever its case", () => {
 		const w = world();
 		const sub = join(w.trainCheckout, "surface");
 		mkdirSync(sub);
-		for (const where of [sub, checkout(), checkout("git@github.com:TheWolff/Product.git")]) {
-			const again = interpret(w.ledger, "train 101");
-			if (again?.kind !== "train") throw new Error("not a train");
-			expect(() => applyTrain(w.ledger, again, where)).toThrow(w.train);
+		for (const [i, where] of [sub, checkout(), checkout("git@github.com:TheWolff/Product.git")].entries()) {
+			const more = interpret(w.ledger, `train ${140 + i}`);
+			if (more?.kind !== "train") throw new Error("not a train");
+			expect(applyTrain(w.ledger, more, where).workloadId).toBe(w.train);
 		}
-		// a train opened from another checkout of the repo is refused #101 on append as well
-		const other = interpret(w.ledger, "train 139");
-		if (other?.kind !== "train") throw new Error("not a train");
-		const second = applyTrain(w.ledger, other, checkout()).workloadId;
+		// a stale train from another checkout of the repo is refused #101 on append as well
+		const second = staleTrain(w.ledger, checkout("git@github.com:TheWolff/Product.git"), [150]);
 		expect(interpret(w.ledger, `train ${second} 101`)).toMatchObject({ kind: "refused", why: expect.stringContaining(w.train) });
 	});
 });

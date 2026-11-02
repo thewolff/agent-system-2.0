@@ -11,7 +11,7 @@ import { reviewStopOn } from "../../classifier/src/review-stop";
 import { countRounds, effectiveRoundLimit, type Findings, reviewLimitBody, reviewRoundBody, ROUND_LIMIT_OPTIONS } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { errorLines } from "../src/errors";
-import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
+import { apply, applyTrain, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
 import { boundPrs, controlEntries, holdersOf, landFirstOn, mainRetries, planFirst, planFirstBody, verdictOf, waivedPrs, waivePrBody, withdrawnBy } from "../src/launch";
 import { runnerPreflightBody } from "../src/main-state";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
@@ -19,8 +19,9 @@ import { ensureStandingWorkload } from "../src/identity";
 import { Numbering } from "../src/numbering";
 import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
 import { testRequestedBody, testRunBody } from "../src/test-run";
-import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { clock, tempLedger, workloadWithSlice } from "./helpers";
+import { pdtDay, TRAIN_DAILY_USD, TRAIN_PAUSE_OPTIONS, trainBudgetSliceId, trainDayLimit, trainPausedBody } from "../src/train-budget";
+import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { clock, tempLedger, tmp, workloadWithSlice } from "./helpers";
 
 /**
  * A plan-first workload held by lane-a whose plan slice raised the plan question (decision 15), with
@@ -1738,5 +1739,128 @@ describe("land-first and main-retry: Jo's words on the standing workload (PLAN w
 		const id = ledger.recordInstruction({ by: SURFACE_BY, workloadId: wl, author: "jo", channel: "surface", body: "land-first agent-system-2.0 on" });
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: `land-first: agent-system-2.0 on ${id}` });
 		expect(landFirstOn(ledger.entries(wl), ledger.instructions(wl), "agent-system-2.0")).toBe(false);
+	});
+});
+
+/**
+ * The merge train paused at its day limit (PLAN wl-mvr888nftz0vcl D7): a train opened by Jo's word, the runner's
+ * `train-paused:` for the clock's PDT day, and the tick's raise-or-wait question on its budget slice.
+ */
+function pausedTrain() {
+	const c = clock("2026-10-01T18:00:00.000Z");
+	const { ledger } = tempLedger(c.now);
+	const cmd = interpret(ledger, "train 101");
+	if (cmd?.kind !== "train") throw new Error(`not a train: ${JSON.stringify(cmd)}`);
+	const wl = applyTrain(ledger, cmd, tmp("train-repo")).workloadId;
+	const day = pdtDay(Date.parse(c.now()));
+	const pause = ledger.recordEntry({
+		by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption",
+		body: trainPausedBody({ laneId: "lane-train-1", day, usd: TRAIN_DAILY_USD, limit: TRAIN_DAILY_USD, pr: 101, until: "2026-10-02T07:00:00.000Z" }),
+	});
+	const sl = ledger.addSlice({ by: MERGE_TRAIN_BY, workloadId: wl, id: trainBudgetSliceId(wl, pause), task: "budget", doneCondition: "Jo answered", inputs: "the pause" });
+	const q = ledger.raiseQuestion({ by: MERGE_TRAIN_BY, workloadId: wl, sliceId: sl, body: "raise or wait", options: [...TRAIN_PAUSE_OPTIONS] });
+	return { ledger, c, wl, day, q };
+}
+
+const raises = (ledger: Ledger, wl: string) => controlEntries(ledger.entries(wl)).filter((e) => e.prefix === "train-raise");
+
+describe("raise <usd> [q-…] on the merge train's budget question (PLAN wl-mvr888nftz0vcl D7, R26)", () => {
+	test("`raise 25` with one budget question open: Jo's answer `raise` and the surface's train-raise naming it, in one transaction", () => {
+		const { ledger, wl, day, q } = pausedTrain();
+		const cmd = interpret(ledger, "raise 25");
+		expect(cmd).toEqual({ kind: "raise", workloadId: wl, questionId: q, usd: 25 });
+		const receipt = apply(ledger, cmd!);
+		const answered = ledger.question(q)!;
+		expect(answered.state).toBe("answered");
+		const answer = ledger.instructions(wl).find((i) => i.id === answered.resolved_by)!;
+		expect(answer).toMatchObject({ body: "raise", author: "jo", channel: "surface" });
+		const [r] = raises(ledger, wl);
+		expect(r!.body).toBe(`train-raise: day ${day} usd 25 answer ${answer.id}`);
+		expect(ledger.entries(wl).find((e) => e.body === r!.body)!.created_by).toBe(SURFACE_BY);
+		expect(trainDayLimit(controlEntries(ledger.entries(wl)), day)).toBe(TRAIN_DAILY_USD + 25);
+		expect(receipt).toContain(`raised merge train ${wl}'s limit for ${day} (PDT) by $25 to $${TRAIN_DAILY_USD + 25}: answered ${q} with "raise"`);
+	});
+
+	test("`raise $12.50 q-…` names the question; the paste path and the word table carry it", () => {
+		const { ledger, wl, q } = pausedTrain();
+		expect(interpret(ledger, `raise $12.50 ${q}`)).toEqual({ kind: "raise", workloadId: wl, questionId: q, usd: 12.5 });
+		expect(maxWords(`raise 25 ${q}`)).toBe(3);
+		expect(commandShaped("raise 25")).toBe(true);
+		const paste = interpretPaste(ledger, numbered(ledger), `raise 25 ${q}\nthen carry on with the train`);
+		if (!paste?.ok) throw new Error(`paste refused: ${JSON.stringify(paste)}`);
+		const cmds = paste.items.flatMap((i) => ("cmd" in i ? [i.cmd] : []));
+		expect(cmds).toEqual([{ kind: "raise", workloadId: wl, questionId: q, usd: 25 }]);
+	});
+
+	test("refused, nothing written: bare `raise`, `raise q-…`, numbered `1 raise`, a non-positive or non-plain amount", () => {
+		const { ledger, wl, q } = pausedTrain();
+		const bare = `${q} is the merge train's budget question: \`raise\` alone carries no amount; type \`raise <usd>\`, for example \`raise 50\` (or \`raise 50 ${q}\`), or answer \`wait\``;
+		expect(interpret(ledger, "raise")).toEqual({ kind: "refused", why: bare });
+		expect(interpret(ledger, `raise ${q}`)).toEqual({ kind: "refused", why: bare });
+		const n = numbered(ledger).numberOf(q);
+		expect(n).not.toBeNull();
+		expect(interpretBatch(ledger, numbered(ledger), `${n} raise`)).toEqual({ ok: false, lines: [`#${n}: ${bare}`] });
+		for (const amount of ["0", "-5", "1e3", "25abc", "$0.00"]) {
+			expect(interpret(ledger, `raise ${amount}`)).toEqual({ kind: "refused", why: `${amount} is not a positive number of dollars: raise <usd> [q-…], for example \`raise 50\`` });
+		}
+		expect(interpret(ledger, `raise 25 ${q} now`)).toEqual({ kind: "refused", why: "the raise word is raise <usd> [q-…], for example `raise 50`" });
+		// the apply path refuses a bare raise however it was built
+		expect(() => apply(ledger, { kind: "answer", workloadId: wl, questionId: q, answer: "raise" })).toThrow("carries no amount");
+		expect(ledger.question(q)!.state).toBe("open");
+		expect(raises(ledger, wl)).toEqual([]);
+		expect(ledger.instructions(wl).filter((i) => i.body.startsWith("raise"))).toEqual([]);
+	});
+
+	test("a raise for a day already over is refused, both read after midnight and applied after a reading before it", () => {
+		const { ledger, c, wl, day, q } = pausedTrain();
+		const before = interpret(ledger, "raise 25")!;
+		c.plusHours(24);
+		const today = pdtDay(Date.parse(c.now()));
+		const why = `the paused day ${day} (PDT) is over (today is ${today}): a raise adds money only to the day it names; answer \`wait ${q}\` instead`;
+		expect(interpret(ledger, "raise 25")).toEqual({ kind: "refused", why });
+		expect(() => apply(ledger, before)).toThrow(`${why}; refused, never applied`);
+		expect(ledger.question(q)!.state).toBe("open");
+		expect(raises(ledger, wl)).toEqual([]);
+	});
+
+	test("refused with no budget question open, and a stale raise after the question was answered `wait`", () => {
+		const { ledger } = tempLedger();
+		expect(interpret(ledger, "raise 25")).toEqual({ kind: "refused", why: "no merge-train budget question is open: a raise answers the train's pause question, and the train is not paused" });
+		const t = pausedTrain();
+		const stale = interpret(t.ledger, "raise 25")!;
+		apply(t.ledger, interpret(t.ledger, `wait ${t.q}`)!);
+		expect(() => apply(t.ledger, stale)).toThrow(`${t.q} is answered: a raise answers only an open budget question; refused, never applied`);
+		expect(raises(t.ledger, t.wl)).toEqual([]);
+		expect(interpret(t.ledger, "raise 25")).toEqual({ kind: "refused", why: "no merge-train budget question is open: a raise answers the train's pause question, and the train is not paused" });
+	});
+});
+
+describe("a question offering an option named raise keeps its answers (PLAN wl-mvr888nftz0vcl R28)", () => {
+	test("`raise`, `raise q-…` and a numbered `raise` answer a non-budget question as an ordinary option", () => {
+		for (const form of ["bare", "id", "numbered"] as const) {
+			const { ledger } = tempLedger();
+			const { wl, sl } = workloadWithSlice(ledger);
+			const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Raise the limit or hold?", options: ["raise", "hold"] });
+			if (form === "numbered") {
+				const n = numbered(ledger).numberOf(q);
+				applyBatch(ledger, interpretBatch(ledger, numbered(ledger), `${n} raise`));
+			} else {
+				const cmd = interpret(ledger, form === "bare" ? "raise" : `raise ${q}`)!;
+				expect(cmd).toMatchObject({ kind: "answer", questionId: q, answer: "raise" });
+				apply(ledger, cmd);
+			}
+			const answered = ledger.question(q)!;
+			expect(answered.state).toBe("answered");
+			expect(ledger.instructions(wl).find((i) => i.id === answered.resolved_by)!.body).toBe("raise");
+			expect(controlEntries(ledger.entries(wl)).filter((e) => e.prefix === "train-raise")).toEqual([]);
+		}
+	});
+
+	test("`raise 25` never answers a non-budget question: with no budget question open it is refused", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Raise?", options: ["raise", "hold"] });
+		expect(interpret(ledger, `raise 25 ${q}`)).toEqual({ kind: "refused", why: `${q} is not the merge train's budget question; \`raise <usd>\` answers only that one` });
+		expect(ledger.question(q)!.state).toBe("open");
 	});
 });

@@ -96,13 +96,13 @@ import {
 } from "../src/launch";
 import { attemptBlock, type ChainCommit, ghMainChain, INCONCLUSIVE, type MainState, mainResults, mainState, mainVerdicts } from "../src/main-state";
 import {
-	actionable, type AlertAction, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, carryPairs, checkoutOwnerRepo, type ControlRoot,
+	actionable, type AlertAction, attemptOf, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, carryPairs, checkoutOwnerRepo, type ControlRoot,
 	controlRootRefusal, endPastPauseQuestions, everyTrain, expiredHolds, forkOf, forkTaskAlert, FULL_SUITE_STATUS, ghCompare, isTrainOrFix, type LandFirstEvent, landFirstNoticeBody, landFirstRepos, landFirstRows,
 	type Landing, landingPassOvers, landingReady, lastReadyExit, MAIN_RED_WINDOW_MS, MAIN_RETRY_MS, mainRedNoticeBody, mainRedNotices, mainRedRows, openTrainFix, openTrains, ownerBusy, ownerDeliveries, ownerFreedAt,
-	PROMOTE_ATTEMPTS, prOwner, PROTECTION_UNKNOWN_RAISE_MS, protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState, protectionPassOvers, prStakes, raiseLaunchLimit,
+	parseTrainSlice, PROMOTE_ATTEMPTS, prOwner, PROTECTION_UNKNOWN_RAISE_MS, protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState, protectionPassOvers, prStakes, raiseLaunchLimit,
 	raiseMeterErrorQuestions, raiseTrainStall, raiseTwiceFailed, REPAIR_FAIL_MS, REVOKE_ATTEMPTS, settleTasks, stallRelaunchStops, stopEpisode, stopSummary, TASK_VIEW_FIELDS, type TaskView, taskViewOf,
 	TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, TRAIN_STALL_MS, trainActivityArgs, trainAlertActions, trainAlertBody, trainAlertEndBody, trainAlertMarker, trainAutoboardBody,
-	trainBoardSkipBody, trainCheckout, trainHeadWokenBody, TRAIN_LAUNCH_LIMIT, trainLaunchFailures, trainPrs, trainPushesOf, trainReconciledBody, trainRetries, trainSliceId, trainSlicePr, trainStall,
+	trainAttemptsOf, trainBoardSkipBody, trainCheckout, trainHeadWokenBody, TRAIN_LAUNCH_LIMIT, trainLaunchFailures, trainPrs, trainPushesOf, trainReconciledBody, trainRetries, trainSliceId, trainStall,
 	type TrainPush, type TrainTask, trainWakeBody, testRunStartedBody, testRunStarts, twiceFailed, unsettledTasks,
 } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
@@ -299,8 +299,9 @@ export function tick(d: TickDeps): string[] {
 			const facts: TrainFacts = { wl, repo, checkout, views: new Map(), pushes: new Map(), mergedDeps: [] };
 			trains.push(facts);
 			const errors: unknown[] = [];
+			const attempts = trainAttemptsOf(ledger, wl);
 			for (const n of trainPrs(ledger.entries(wl), ledger.instructions(wl))) {
-				const sl = ledger.slice(trainSliceId(wl, n));
+				const sl = ledger.slice(trainSliceId(wl, n, attemptOf(attempts, n)));
 				if (sl && (sl.state === "done" || sl.state === "cancelled")) continue;
 				try {
 					const v = ghJson(["pr", "view", String(n), "-R", repo, "--json", PR_FIELDS]);
@@ -428,8 +429,9 @@ export function tick(d: TickDeps): string[] {
 		const read = new Set(boardable.map((b) => b.l.repo.toLowerCase()));
 		for (const wl of openTrains(ledger)) {
 			const repo = repoOf(wl);
+			const attempts = trainAttemptsOf(ledger, wl);
 			const pending = trainPrs(ledger.entries(wl), ledger.instructions(wl)).some((n) => {
-				const sl = ledger.slice(trainSliceId(wl, n));
+				const sl = ledger.slice(trainSliceId(wl, n, attemptOf(attempts, n)));
 				return !(sl && (sl.state === "done" || sl.state === "cancelled"));
 			});
 			if (repo !== null && pending) read.add(repo);
@@ -1444,7 +1446,7 @@ interface TrainMerge {
 
 /**
  * Every PR merged by a train open now or closed within MAIN_RED_WINDOW_MS (step 3d's trains, `mainRedRows`), oldest train first,
- * in slice order: its disposition slice `sl-train-<k>-<n>` is done with an artifact starting `merged by train`. `production` when
+ * in slice order: a disposition slice (`sl-train-<k>-<n>`, or `sl-train-<k>-<n>-a<m>` of a later attempt) is done with an artifact starting `merged by train`. `production` when
  * a holder of the train recorded `ruling-applied: train-signoff …` on that slice (the ruling decided its merge question).
  */
 function trainMerges(ledger: Ledger): TrainMerge[] {
@@ -1455,8 +1457,9 @@ function trainMerges(ledger: Ledger): TrainMerge[] {
 		if (w.status === "closed" && w.closed_at! < since) continue;
 		let signoffs: Set<string> | undefined;
 		for (const sl of ledger.slices(t)) {
-			const pr = trainSlicePr(sl.id, t);
-			if (pr === null || sl.id !== trainSliceId(t, pr) || sl.state !== "done" || !sl.artifact?.startsWith("merged by train")) continue;
+			const s = parseTrainSlice(sl.id, t);
+			const pr = s === null || s.full !== null ? null : s.pr;
+			if (pr === null || sl.state !== "done" || !sl.artifact?.startsWith("merged by train")) continue;
 			if (signoffs === undefined) {
 				const entries = ledger.entries(t, "assumption");
 				const holders = holdersOf(entries, w.holder, ledger.holders(t));

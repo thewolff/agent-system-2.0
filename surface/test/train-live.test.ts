@@ -19,7 +19,7 @@ import {
 	attempts, consumedIds, controlEntries, LANE_CAP_ENV, laneCap, laneExitBody, laneReadyBody, laneStartedBody, launchFailedBody, launchRequestedBody, launchRowsFor,
 	type LaneOutcome, STARTER_EXIT, trainBoardBody, verdictOf,
 } from "../src/launch";
-import { actionable, fixBindings, recordTrainTask, TRAIN_ALERT_REPO, TRAIN_LAUNCH_OPTIONS, TRAIN_RETRY_OPTIONS, trainLaunchFailures, trainSliceId } from "../src/merge-train";
+import { actionable, fixBindings, recordTrainTask, TRAIN_ALERT_REPO, TRAIN_DONE, TRAIN_LAUNCH_OPTIONS, TRAIN_RETRY_OPTIONS, trainBody, trainBrief, trainInstructionBody, trainLaunchFailures, trainSliceId } from "../src/merge-train";
 import type { PidState } from "../src/omp-probe";
 import { briefHash, formatOverride, formatSignal, goalsHash, rankDay, type SignalAnswers } from "../src/rank";
 import type { RankConfig } from "../src/rank-launch";
@@ -443,15 +443,28 @@ describe("T2 (acceptance 2): whatever the train's work, one tick pass launches i
 });
 
 describe("T3 (acceptance 4): never two train lanes at once; a train fix workload counts against the cap", () => {
+	/**
+	 * A stale second open train carrying #102, built from the rows `train 102` wrote before the one-train cutover (PLAN
+	 * wl-mvr888nftz0vcl D2: the word appends to the open train now): its repo, done:, Jo's instruction and the train: entry.
+	 */
+	function secondTrain(ledger: Ledger): string {
+		return ledger.write(() => {
+			const id = ledger.openWorkload({ by: SURFACE_BY, brief: trainBrief("wl-second", [102]), stakes: "normal", mode: "autonomous" });
+			recordRepo(ledger, id, tmp("second-train-repo"));
+			ledger.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: `done: ${TRAIN_DONE}` });
+			const ins = ledger.recordInstruction({ ...JO, workloadId: id, body: trainInstructionBody(id, [102]) });
+			ledger.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: trainBody([102], ins) });
+			return id;
+		});
+	}
+
 	test("a second request on the live train lane is refused `held`; a second open train with work is refused `held: train lane … live on <first>`", () => {
 		const w = live();
 		w.pass();
 		const first = w.lane();
 		w.joRequest();
 		expect(w.starter(w.train, SURFACE_BY)).toEqual({ code: STARTER_EXIT.held!, line: `${w.train} not launched: held: ${first} still running (omp pid 5001)` });
-		const cmd = interpret(w.ledger, "train 102");
-		if (cmd?.kind !== "train") throw new Error("not a train");
-		const other = applyTrain(w.ledger, cmd, tmp("second-train-repo")).workloadId;
+		const other = secondTrain(w.ledger);
 		expect(other).not.toBe(w.train);
 		const before = w.ledger.entries(other).length;
 		expect(w.starter(other)).toEqual({ code: STARTER_EXIT.held!, line: `${other} not launched: held: train lane ${first} live on ${w.train}` });
@@ -463,9 +476,7 @@ describe("T3 (acceptance 4): never two train lanes at once; a train fix workload
 
 	test("train A reserves, its pre-claim lapses before spawn, train B reserves and starts; A's spawn write refuses (stage reserve, held) and spawns nothing", () => {
 		const w = live();
-		const cmd = interpret(w.ledger, "train 102");
-		if (cmd?.kind !== "train") throw new Error("not a train");
-		const b = applyTrain(w.ledger, cmd, tmp("second-train-repo")).workloadId;
+		const b = secondTrain(w.ledger);
 		const ra = laneScript.reserve(w.ledger, w.train, MERGE_TRAIN_BY, false, SHOW, w.probeFor);
 		if (!ra.ok) throw new Error(ra.reason);
 		w.c.plusHours(0.1); // past A's three-minute pre-claim

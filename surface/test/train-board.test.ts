@@ -14,7 +14,7 @@ import {
 } from "../src/launch";
 import {
 	actionable, AUTOBOARD_WINDOW_MS, autoboardCutover, boardLanding, isTrainOrFix, type Landing, landingReady, openTrains, protectionGap, TRAIN_DONE, trainAutoboardBody, trainMembers,
-	trainPrs, trainSignoff, trainSliceId,
+	trainAttemptFor, trainAttemptsOf, trainPrs, trainSignoff, trainSliceId,
 } from "../src/merge-train";
 import { makeRunId, testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
 import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
@@ -315,7 +315,9 @@ describe("boardLanding (D3): reuse the repository's open train, opening one only
 		});
 	}
 
-	test("D3: an open train with an effective done-because leaves the PR pending until it closes", () => {
+	// Rewritten for PLAN wl-mvr888nftz0vcl D2/D3 (was "an open train with an effective done-because leaves the PR pending until it
+	// closes"): the train is permanent, so a legacy done-because on it holds nothing back and the board appends.
+	test("D3 (permanent train): an open train with a standing done-because still takes the next PR; no second train opens", () => {
 		const w = world();
 		const cmd = interpret(w.ledger, "train 90");
 		if (cmd?.kind !== "train") throw new Error("not a train");
@@ -324,25 +326,12 @@ describe("boardLanding (D3): reuse the repository's open train, opening one only
 		w.ledger.recordEntry({ by: "lane-t-1", workloadId: jo, kind: "assumption", body: "done-because: #90 merged" });
 		w.ledger.releaseWorkload(jo, { by: "lane-t-1", holder: "lane-t-1" });
 		w.c.plusHours(0.01);
-		const l = ready(landingReady(w.ledger, lane(w), CTX));
 		const count = () => w.ledger.db.query<{ n: number }, []>("SELECT count(*) AS n FROM workloads").get()!.n;
 		const before = count();
-		const entries = w.ledger.entries(jo);
-		for (let retry = 0; retry < 2; retry++) {
-			expect(boardLanding(w.ledger, l)).toEqual({ boarded: false, reason: `the repository's newest merge train ${jo} has a standing done-because` });
-			expect(w.ledger.entries(jo)).toEqual(entries);
-			expect(trainPrs(w.ledger.entries(jo), w.ledger.instructions(jo))).toEqual([90]);
-			expect(openTrains(w.ledger)).toEqual([jo]);
-			expect(count()).toBe(before);
-		}
-		w.ledger.closeWorkload(jo, { by: SURFACE_BY });
-		w.c.plusHours(0.01);
-		const r = boardLanding(w.ledger, l);
-		expect(r).toMatchObject({ boarded: true, opened: true });
-		if (!r.boarded) throw new Error(r.reason);
-		expect(r.train).not.toBe(jo);
-		expect(openTrains(w.ledger)).toEqual([r.train]);
-		expect(trainPrs(w.ledger.entries(r.train), w.ledger.instructions(r.train))).toEqual([101]);
+		const r = boardLanding(w.ledger, ready(landingReady(w.ledger, lane(w), CTX)));
+		expect(r).toMatchObject({ boarded: true, train: jo, opened: false });
+		expect(trainPrs(w.ledger.entries(jo), w.ledger.instructions(jo))).toEqual([90, 101]);
+		expect(openTrains(w.ledger)).toEqual([jo]);
 		expect(count()).toBe(before + 1);
 	});
 
@@ -360,66 +349,62 @@ describe("boardLanding (D3): reuse the repository's open train, opening one only
 		}
 	});
 
+	// Rewritten for PLAN wl-mvr888nftz0vcl D2 (was "historical duplicates keep newest-open selection when the newest is
+	// active/held/done"): with a stale second open train, the one train is the oldest (`theTrain`); a stop on it leaves the PR
+	// pending, a done-because on it holds nothing back, and the stale one is never written.
 	for (const state of ["active", "held", "done"] as const) {
-		test(`D3: historical duplicates keep newest-open selection when the newest is ${state}`, () => {
+		test(`D2: with a stale second open train the board goes to the oldest, which is ${state}`, () => {
 			const w = world();
-			const trains: string[] = [];
-			for (const pr of [90, 91]) {
-				const cmd = interpret(w.ledger, `train ${pr}`);
-				if (cmd?.kind !== "train") throw new Error("not a train");
-				trains.push(applyTrain(w.ledger, cmd, w.repo).workloadId);
-				w.c.plusHours(0.01);
-			}
-			const newest = trains[1]!;
+			const cmd = interpret(w.ledger, "train 90");
+			if (cmd?.kind !== "train") throw new Error("not a train");
+			const oldest = applyTrain(w.ledger, cmd, w.repo).workloadId;
+			w.c.plusHours(0.01);
+			const stale = staleTrain(w, 91);
 			if (state === "held") {
-				const sl = trainSliceId(newest, 91);
-				w.ledger.addSlice({ by: "lane-t-1", workloadId: newest, id: sl, task: "t", doneCondition: "d", inputs: "i" });
-				const q = w.ledger.raiseQuestion({ by: "lane-t-1", workloadId: newest, sliceId: sl, body: "merge #91?", options: ["merged", "skip", "stop"] });
+				const sl = trainSliceId(oldest, 90);
+				w.ledger.addSlice({ by: "lane-t-1", workloadId: oldest, id: sl, task: "t", doneCondition: "d", inputs: "i" });
+				const q = w.ledger.raiseQuestion({ by: "lane-t-1", workloadId: oldest, sliceId: sl, body: "merge #90?", options: ["merged", "skip", "stop"] });
 				w.ledger.answerQuestion(q, { ...JO, answer: "stop" });
 			} else if (state === "done") {
-				w.ledger.claimWorkload(newest, { by: LANE_STARTER_BY, holder: "lane-t-1", leaseMs: 600_000 });
-				w.ledger.recordEntry({ by: "lane-t-1", workloadId: newest, kind: "assumption", body: "done-because: #91 merged" });
-				w.ledger.releaseWorkload(newest, { by: "lane-t-1", holder: "lane-t-1" });
+				w.ledger.claimWorkload(oldest, { by: LANE_STARTER_BY, holder: "lane-t-1", leaseMs: 600_000 });
+				w.ledger.recordEntry({ by: "lane-t-1", workloadId: oldest, kind: "assumption", body: "done-because: #90 merged" });
+				w.ledger.releaseWorkload(oldest, { by: "lane-t-1", holder: "lane-t-1" });
 			}
 			const l = ready(landingReady(w.ledger, lane(w), CTX));
 			const before = w.ledger.db.query<{ n: number }, []>("SELECT count(*) AS n FROM workloads").get()!.n;
-			const entries = trains.map((t) => w.ledger.entries(t));
+			const entries = [oldest, stale].map((t) => w.ledger.entries(t));
 			const r = boardLanding(w.ledger, l);
-			if (state === "active") {
-				expect(r).toMatchObject({ boarded: true, train: newest, opened: false });
-				expect(trainPrs(w.ledger.entries(newest), w.ledger.instructions(newest))).toEqual([91, 101]);
+			if (state === "held") {
+				expect(r).toEqual({ boarded: false, reason: `merge train ${oldest} is held by Jo's stop` });
+				expect(w.ledger.entries(oldest)).toEqual(entries[0]!);
 			} else {
-				expect(r).toEqual({ boarded: false, reason: state === "held"
-					? `the repository's newest merge train ${newest} is held by Jo's stop`
-					: `the repository's newest merge train ${newest} has a standing done-because` });
-				expect(w.ledger.entries(newest)).toEqual(entries[1]!);
+				expect(r).toMatchObject({ boarded: true, train: oldest, opened: false });
+				expect(trainPrs(w.ledger.entries(oldest), w.ledger.instructions(oldest))).toEqual([90, 101]);
 			}
-			expect(w.ledger.entries(trains[0]!)).toEqual(entries[0]!);
-			expect(openTrains(w.ledger)).toEqual(trains);
+			expect(w.ledger.entries(stale)).toEqual(entries[1]!);
+			expect(openTrains(w.ledger)).toEqual([oldest, stale]);
 			expect(w.ledger.db.query<{ n: number }, []>("SELECT count(*) AS n FROM workloads").get()!.n).toBe(before);
 		});
 	}
 
-	test("D3: matching follows repoIdentity across checkouts, ignoring another repository's newer train", () => {
+	// Rewritten for PLAN wl-mvr888nftz0vcl D2 (was "… ignoring another repository's newer train"): `train 101` on another
+	// repository can no longer open a second train, so this keeps only the identity match across checkout spellings; the other
+	// repository's refusal is surface/test/train-permanent.test.ts R1.
+	test("D3: matching follows repoIdentity across checkouts", () => {
 		const w = world();
 		const cmd = interpret(w.ledger, "train 90");
 		if (cmd?.kind !== "train") throw new Error("not a train");
 		const jo = applyTrain(w.ledger, cmd, checkout("git@github.com:THEWOLFF/Product.git")).workloadId;
 		w.c.plusHours(0.01);
-		const otherCmd = interpret(w.ledger, "train 101");
-		if (otherCmd?.kind !== "train") throw new Error("not a train");
-		const other = applyTrain(w.ledger, otherCmd, checkout("https://github.com/thewolff/other.git")).workloadId;
-		const entries = w.ledger.entries(other);
 		const l = ready(landingReady(w.ledger, lane(w), CTX));
 		const before = w.ledger.db.query<{ n: number }, []>("SELECT count(*) AS n FROM workloads").get()!.n;
 		expect(boardLanding(w.ledger, l)).toMatchObject({ boarded: true, train: jo, opened: false });
 		expect(trainPrs(w.ledger.entries(jo), w.ledger.instructions(jo))).toEqual([90, 101]);
-		expect(w.ledger.entries(other)).toEqual(entries);
-		expect(openTrains(w.ledger)).toEqual([jo, other]);
+		expect(openTrains(w.ledger)).toEqual([jo]);
 		expect(w.ledger.db.query<{ n: number }, []>("SELECT count(*) AS n FROM workloads").get()!.n).toBe(before);
 	});
 
-	test("R2: the repository's newest train held by Jo's stop takes nothing and opens nothing", () => {
+	test("R2: the train held by Jo's stop takes nothing and opens nothing", () => {
 		const w = world();
 		const first = boardLanding(w.ledger, ready(landingReady(w.ledger, lane(w, { pr: 117 }), CTX)));
 		if (!first.boarded) throw new Error(first.reason);
@@ -432,7 +417,7 @@ describe("boardLanding (D3): reuse the repository's open train, opening one only
 		const before = w.ledger.db.query<{ n: number }, []>("SELECT count(*) AS n FROM workloads").get()!.n;
 		const entries = w.ledger.entries(first.train);
 		for (let retry = 0; retry < 2; retry++) {
-			expect(boardLanding(w.ledger, l)).toEqual({ boarded: false, reason: `the repository's newest merge train ${first.train} is held by Jo's stop` });
+			expect(boardLanding(w.ledger, l)).toEqual({ boarded: false, reason: `merge train ${first.train} is held by Jo's stop` });
 			expect(w.ledger.db.query<{ n: number }, []>("SELECT count(*) AS n FROM workloads").get()!.n).toBe(before);
 			expect(w.ledger.entries(first.train)).toEqual(entries);
 			expect(trainPrs(w.ledger.entries(first.train), w.ledger.instructions(first.train))).toEqual([117]);
@@ -440,35 +425,54 @@ describe("boardLanding (D3): reuse the repository's open train, opening one only
 		}
 	});
 
-	test("R2 and R16: a PR a train worked (merged or skipped by Jo) never boards again; a board on a train closed without working it is void", () => {
+	// Rewritten for lane decision en-mvznmxcdh0ucsj (was "a PR a train worked (merged or skipped by Jo) never boards again"):
+	// on the open train a terminal PR boards its next attempt at a new head, never at the head its last board carried; a closed
+	// (legacy) train never refuses; the R16 void-board half is unchanged.
+	test("R2 and R16: a PR the open train worked boards attempt 2 at a new head, not at the same head; a board on a train closed without working it is void", () => {
 		const w = world();
-		const closeTrain = (t: string) => {
-			for (const s of w.ledger.slices(t)) if (s.state === "open") w.ledger.completeSlice(s.id, { by: "lane-t-1", artifact: "x" });
-			w.ledger.closeWorkload(t, { by: SURFACE_BY });
-			w.c.plusHours(0.01);
-		};
 		for (const outcome of ["merged", "skip"] as const) {
-			const l = ready(landingReady(w.ledger, lane(w, { pr: outcome === "merged" ? 117 : 118 }), CTX));
+			const pr = outcome === "merged" ? 117 : 118;
+			const l = ready(landingReady(w.ledger, lane(w, { pr }), CTX));
 			const r = boardLanding(w.ledger, l);
 			if (!r.boarded) throw new Error(r.reason);
-			const sl = trainSliceId(r.train, l.pr);
+			const sl = trainSliceId(r.train, pr);
 			w.ledger.addSlice({ by: "lane-t-1", workloadId: r.train, id: sl, task: "t", doneCondition: "d", inputs: "i" });
 			if (outcome === "merged") w.ledger.completeSlice(sl, { by: "lane-t-1", artifact: "merged by train" });
-			else w.ledger.answerQuestion(w.ledger.raiseQuestion({ by: "lane-t-1", workloadId: r.train, sliceId: sl, body: "?", options: ["merged", "skip", "stop"] }), { ...JO, answer: "skip" });
-			closeTrain(r.train);
-			const again = boardLanding(w.ledger, l);
-			expect(again).toEqual({ boarded: false, reason: expect.stringMatching(new RegExp(`^#${l.pr} was worked by merge train ${r.train} \\(${sl} (done|cancelled)\\)$`)) });
+			else w.ledger.cancelSlice(sl, { by: SURFACE_BY });
+			w.c.plusHours(0.01);
+			expect(boardLanding(w.ledger, l)).toEqual({
+				boarded: false, reason: expect.stringMatching(new RegExp(`^#${pr} at ${G} was already boarded on ${r.train} \\(en-[a-z0-9]+\\) and its attempt 1 ended; a new attempt needs a new head$`)),
+			});
+			const again = boardLanding(w.ledger, l, { head: H });
+			expect(again).toMatchObject({ boarded: true, train: r.train, opened: false });
+			expect(trainAttemptFor(w.ledger, r.train, pr)).toEqual({ ok: false, reason: `#${pr} is already on open merge train ${r.train}` });
+			expect(trainAttemptsOf(w.ledger, r.train).get(pr)?.attempt).toBe(2);
 		}
-		// void: the train closed with no PR slice for #119; the PR boards again, on a new train
+		// void: a train closed with no PR slice for #119; the PR boards again, on a new train
+		const t = openTrains(w.ledger)[0]!;
+		for (const s of w.ledger.slices(t)) if (s.state === "open") w.ledger.completeSlice(s.id, { by: "lane-t-1", artifact: "x" });
+		w.ledger.closeWorkload(t, { by: SURFACE_BY });
+		w.c.plusHours(0.01);
 		const l = ready(landingReady(w.ledger, lane(w, { pr: 119 }), CTX));
 		const r = boardLanding(w.ledger, l);
 		if (!r.boarded) throw new Error(r.reason);
-		closeTrain(r.train);
+		expect(r.train).not.toBe(t);
+		w.ledger.closeWorkload(r.train, { by: SURFACE_BY });
+		w.c.plusHours(0.01);
 		const again = boardLanding(w.ledger, l);
 		expect(again).toMatchObject({ boarded: true, opened: true });
 		expect(again.boarded && again.train !== r.train).toBe(true);
 	});
 });
+
+/** A stale second open train (PLAN wl-mvr888nftz0vcl D2), built from rows as the tick once could: MERGE_TRAIN_BY, `repo:` the served checkout, one board of `pr`. */
+function staleTrain(w: World, pr: number): string {
+	const t = w.ledger.openWorkload({ by: MERGE_TRAIN_BY, brief: "stale train", stakes: "normal", mode: "autonomous" });
+	w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: t, kind: "assumption", body: `repo: ${w.repo}` });
+	w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: t, kind: "assumption", body: trainBoardBody({ pr, workload: t, head: G, run: null, review: null }) });
+	w.c.plusHours(0.01);
+	return t;
+}
 
 describe("membership through train-board: (D2, R5)", () => {
 	test("R5: boundPrs admits a boarded PR through the board the merge train wrote, naming it; a lane-written board is dropped and refused", () => {

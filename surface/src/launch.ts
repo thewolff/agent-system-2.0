@@ -20,7 +20,7 @@ import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_CAP_ENV, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
 import { labOf } from "../../classifier/src/lab";
-import { consumedByReady, openTrains } from "./merge-train";
+import { consumedByReady, openTrains, TRAIN_DONE, type TrainAttempt, trainBrief, type TrainSource } from "./merge-train";
 import { type TrainBudgetReason, type TrainBudgetRows, trainBudgetGate } from "./train-budget";
 import {
 	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, ESCALATION_BY, HOLD_HOURS, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
@@ -86,9 +86,9 @@ export const LANE_SCRIPT = join(import.meta.dir, "..", "scripts", "lane.ts");
 export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
-	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
+	"reserved-withdrawn", "ctx-index", "released-open", "released-idle", "plan-question",
 	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr", "waive-pr", "train",
-	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-notice", "train-autoboard",
+	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-board-refused", "train-notice", "train-autoboard",
 	"withdrawn",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
@@ -104,7 +104,7 @@ export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 /** Prefixes whose first token after the colon is the lane id the entry is about. */
 const LANE_SCOPED: Record<string, true> = {
 	launch: true, "launch-failed": true, "lane-started": true, "lane-ready": true, "lane-exit": true, "lane-parked": true, "lane-stop": true,
-	"lane-decided": true, spend: true, "ctx-index": true, "released-open": true, "lane-headroom": true, "lane-metrics": true,
+	"lane-decided": true, spend: true, "ctx-index": true, "released-open": true, "released-idle": true, "lane-headroom": true, "lane-metrics": true,
 };
 /** The daily scratch sweep's `created_by` (surface/scripts/scratch-sweep.ts). */
 export const SCRATCH_SWEEP_BY = "scratch-sweep";
@@ -135,7 +135,8 @@ export const DRIVE_BACKUP_BY = "drive-backup";
  * `released-open: <laneId> slices <k>` is written by `lane_release` in the transaction of the release, as
  * the lane it names, when open or paused slices remain and no holder `done-because:` stands (MIGRATION.md
  * item 40, surface/src/turn-end.ts); the lane tools refuse it from `lane_record_entry`, and a reader honours
- * it only from a holder writing about itself (`validWriter`).
+ * it only from a holder writing about itself (`validWriter`). On a merge train the same release writes
+ * `released-idle: <laneId> open <k>` instead (PLAN wl-mvr888nftz0vcl D13): a quiet idle release, intended, never a death.
  * `lane-decided: <laneId> <outcome>` is the runner's alone: it records an intended decision (`isIntendedOutcome`)
  * before it closes OMP's stdin, so the lane row's shutdown handler reads the end as intended through `exitClass`
  * (MIGRATION.md item 40, decision 14); a death outcome never writes one, its record is its `lane-died:` line (D5).
@@ -208,6 +209,10 @@ export const DRIVE_BACKUP_BY = "drive-backup";
  * and `train-rule: <lane> permanent budget 150 per PDT day max-time <spec>` are the runner's alone (LANE_RUNNER_BY), so a lane
  * can neither lift its own pause nor forge one; `train-raise: day <d> usd <x> answer <id>` is the surface's alone, written with
  * Jo's `raise <usd>` answer. None is lane-scoped here: `exitClass` never reads them as a lane's end intent.
+ * `train-board-refused: pr <n> repo <owner/repo> [workload <W>]` is the train tick's alone (MERGE_TRAIN_BY, PLAN wl-mvr888nftz0vcl
+ * D2), naming the lane workload W whose PR the one train could not board because it serves another repository: a needs-you
+ * line. W is closed by then and the ledger takes no entry on a closed workload, so `boardLanding` writes it on the standing
+ * workload with `workload <W>`; a row with no `workload` names the workload it is on.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -231,6 +236,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"reserved-withdrawn": [],
 	"ctx-index": [LANE_RUNNER_BY, LANE_STARTER_BY],
 	"released-open": [],
+	"released-idle": [],
 	"plan-question": [],
 	"test-requested": [TEST_RUNNER_BY],
 	"test-run": [TEST_RUNNER_BY],
@@ -248,6 +254,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"train-alert": [MERGE_TRAIN_BY],
 	"train-board": [MERGE_TRAIN_BY],
 	"train-board-skip": [MERGE_TRAIN_BY],
+	"train-board-refused": [MERGE_TRAIN_BY],
 	"train-notice": [MERGE_TRAIN_BY],
 	"train-autoboard": [MERGE_TRAIN_BY],
 	withdrawn: [SURFACE_BY],
@@ -312,7 +319,7 @@ function validWriter(prefix: ControlPrefix, rest: string, createdBy: string, hol
 	if (prefix === "done-because" || prefix === "reserved-withdrawn" || prefix === "plan-question" || prefix === "push-dest" || prefix === "train-task" || prefix === "scratch-over-cap" || prefix === "scratch-under-cap") {
 		return holders.includes(createdBy);
 	}
-	if (prefix === "released-open") return laneId === createdBy && holders.includes(createdBy);
+	if (prefix === "released-open" || prefix === "released-idle") return laneId === createdBy && holders.includes(createdBy);
 	if (prefix === "plan") return /^approved auto\b/.test(rest) ? createdBy === ESCALATION_BY : createdBy === SURFACE_BY;
 	if (prefix === "lane-stop") {
 		if (/^accepted\b/.test(rest)) return createdBy === LANE_RUNNER_BY || createdBy === LANE_STARTER_BY;
@@ -564,12 +571,16 @@ export function launchable(
 	return { launch: false, reason: "died-not-relaunched" };
 }
 
-/** The predicate over the rows a launch decision reads (`launchRowsFor`): the surface's run and `reserveLane`'s. */
+/**
+ * The predicate over the rows a launch decision reads (`launchRowsFor`): the surface's run and `reserveLane`'s. A merge train
+ * (`capExempt`: the open trains) is permanent (PLAN wl-mvr888nftz0vcl D3), so its receipt reads as null: a legacy standing
+ * `done-because:` on it never makes it `awaiting-close`.
+ */
 export function verdictOf(rows: ReserveRows): LaunchVerdict {
 	const holders = holdersOf(rows.entries, rows.workload.holder, rows.holders);
 	const control = controlEntries(rows.entries, holders);
 	return launchable(
-		rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap,
+		rows.workload, control, rows.capExempt ? null : doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap,
 		rows.capExempt, withdrawnBy(rows.entries, rows.instructions) !== null, { questions: rows.questions, instructions: rows.instructions },
 	);
 }
@@ -619,7 +630,8 @@ export function decideInteractive(rows: ReserveRows): ReserveVerdict {
 /**
  * One classification for both end-of-lane writers (decision 14): the end was intended when the
  * newest valid lifecycle entry about this lane is `lane-parked:`, an accepted `lane-stop:`, or the runner's
- * `lane-decided:` naming an intended outcome (`isIntendedOutcome`; MIGRATION.md item 40).
+ * `lane-decided:` naming an intended outcome (`isIntendedOutcome`; MIGRATION.md item 40), or a merge train lane's quiet idle
+ * release, `released-idle:` (PLAN wl-mvr888nftz0vcl D13).
  * `lane-started:`, `lane-ready:`, `spend:` and `ctx-index:` are metadata, not intent: the runner records the session
  * when OMP reports it, which can land after an accepted stop (Codex review 2, R5), its meter writes `spend:` beside
  * a stop or a park (DESIGN-workload-ceiling.md § 2 item 4), and the ctx index lands after the exit, so they are skipped.
@@ -632,7 +644,7 @@ export function exitClass(control: readonly ControlEntry[], laneId: string): "in
 		if (c.laneId !== laneId || c.prefix === "lane-started" || c.prefix === "lane-ready" || c.prefix === "spend" || c.prefix === "ctx-index" || c.prefix === "lane-metrics") continue;
 		if (c.prefix === "lane-stop" && !/^accepted\b/.test(c.rest)) continue;
 		if (c.prefix === "lane-decided") return isIntendedOutcome(c.rest) ? "intended" : "unintended";
-		if (c.prefix === "lane-parked" || c.prefix === "lane-stop") return "intended";
+		if (c.prefix === "lane-parked" || c.prefix === "lane-stop" || c.prefix === "released-idle") return "intended";
 		return "unintended";
 	}
 	return "unintended";
@@ -1507,6 +1519,21 @@ export function parseTrainBoard(rest: string): TrainBoard | null {
 }
 
 /**
+ * `train-board-refused: pr <n> repo <owner/repo> workload <W>` (PLAN wl-mvr888nftz0vcl D2), the train tick's alone: the one
+ * train serves another repository. Written on the standing workload (W, a landing, is closed); without `workload` the row
+ * names the workload it is on.
+ */
+export function trainBoardRefusedBody(pr: number, repo: string, workload?: string): string {
+	return `train-board-refused: pr ${pr} repo ${repo}${workload === undefined ? "" : ` workload ${workload}`}`;
+}
+const TRAIN_BOARD_REFUSED_RE = /^pr ([1-9]\d*) repo (\S+)(?: workload (wl-[a-z0-9]+))?$/;
+/** A valid `train-board-refused:` entry's rest, parsed (`workload` null when the row names none); null when it is not that shape. */
+export function parseTrainBoardRefused(rest: string): { pr: number; repo: string; workload: string | null } | null {
+	const m = TRAIN_BOARD_REFUSED_RE.exec(rest);
+	return m ? { pr: Number(m[1]), repo: m[2]!, workload: m[3] ?? null } : null;
+}
+
+/**
  * One membership entry of a merge train (PLAN wl-mvbjiettjrfpxc D2): Jo's valid `train:` binding (`prBindings`, its PRs in Jo's
  * order, `by` Jo's instruction) or the tick's valid `train-board:` (one PR, `by` the board entry itself, `board` parsed).
  */
@@ -1788,6 +1815,12 @@ export interface PromptInput {
 	runnerServed?: boolean;
 	/** This workload is a merge train or a train's fix workload (surface/src/merge-train.ts `isTrainOrFix`). */
 	trainOrFix?: boolean;
+	/**
+	 * This workload is the merge train (PLAN wl-mvr888nftz0vcl D11), with its first membership's PRs and source: the prompt shows
+	 * `done:` TRAIN_DONE and `brief:` `trainBrief` built now, never the rows stored at open, and its closing line releases with no
+	 * done-because. Absent or null for every other workload, a train's fix workload included (R10).
+	 */
+	train?: { prs: readonly number[]; source: TrainSource; attempts?: ReadonlyMap<number, TrainAttempt> } | null;
 }
 
 /** A merge-train task as its owner lane reads it (D7): the task, its detail, and the PR's open full-suite slice on the owner, if any. */
@@ -1854,8 +1887,9 @@ export function firstPrompt(p: PromptInput): string {
 		out.push("");
 	}
 	out.push(`You are lane ${p.laneId} on workload ${w.id}.`);
-	out.push(`done: ${p.done ?? "(not stated; state it in your first entry and work to it)"}`);
-	out.push(`brief: ${w.brief}`);
+	const train = p.train ?? null;
+	out.push(`done: ${train !== null ? TRAIN_DONE : (p.done ?? "(not stated; state it in your first entry and work to it)")}`);
+	out.push(`brief: ${train !== null ? trainBrief(w.id, train.prs, train.source, train.attempts) : w.brief}`);
 	out.push(`stakes: ${w.stakes} · mode: ${w.mode}`);
 	out.push(`repo: ${p.repo}`);
 	out.push(`worktree: ${p.worktree} (branch ${p.branch}); commit there, rebase onto the remote default, push with -u, open the PR; ${mergeLine(p)}`);
@@ -1885,7 +1919,10 @@ export function firstPrompt(p: PromptInput): string {
 		for (const t of p.trainTasks) out.push(...trainTaskLines(t));
 	}
 	out.push("");
-	out.push(`Call \`ledger_wake_read\` first. Then: ${p.tools.map((t) => `\`${t}\``).join(", ")}. Write \`done-because: <receipt against the done: line>\` with \`lane_record_entry\` before \`lane_release\`; \`lane_handoff\` when Jo is taking the workload over.`);
+	const tools = p.tools.map((t) => `\`${t}\``).join(", ");
+	out.push(train !== null
+		? `Call \`ledger_wake_read\` first. Then: ${tools}. When nothing on the train is runnable, \`lane_release\`: release with no done-because: this train is permanent, and \`lane_record_entry\` refuses a done-because on it.`
+		: `Call \`ledger_wake_read\` first. Then: ${tools}. Write \`done-because: <receipt against the done: line>\` with \`lane_record_entry\` before \`lane_release\`; \`lane_handoff\` when Jo is taking the workload over.`);
 	if (p.facts.trim()) {
 		out.push("");
 		out.push(p.facts.trim());
