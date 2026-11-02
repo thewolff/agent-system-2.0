@@ -443,6 +443,18 @@ describe("mcp-load", () => {
 		expect(fs.map((f) => [f.detector, f.summary, f.evidence])).toEqual([["mcp-load", MCP_LOAD_UNREADABLE, dir]]);
 	});
 
+	test("a log that opens but cannot be read (a directory named like a log) is reported unreadable, never read as zero failures", async () => {
+		const x = world({ ompLogs: { "omp.2026-10-28.38384.log": [POSTHOG_401] } });
+		const bad = logsOf(x.home, "omp.2026-10-28.99999.log");
+		mkdirSync(bad);
+		utimesSync(bad, new Date("2026-10-28T12:00:00.000Z"), new Date("2026-10-28T12:00:00.000Z"));
+		const fs = await x.run(ALL);
+		expect(fs.map((f) => [f.summary, f.evidence])).toEqual([
+			[MCP_LOAD_UNREADABLE, bad],
+			[`mcp-load: posthog failed to load 1 time(s) in the window in profile agent-system-2: ${HEALTH("posthog")}`, `${logsOf(x.home, "omp.2026-10-28.38384.log")}:1`],
+		]);
+	});
+
 	test("the default profile: its logs are read from ~/.omp/logs and a 401 says to start omp with OMP_PROFILE and every fallback cleared", async () => {
 		const x = world({ profile: "default", ompLogs: { "omp.2026-10-28.38384.log": [POSTHOG_401] } });
 		const fs = await x.run(ALL);

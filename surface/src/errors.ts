@@ -68,6 +68,10 @@
 // and no check entry (ok or failed) is newer than DRIVE_BACKUP_MISSED_HOURS; with no check entry ever, the plist file's mtime
 // (install.sh writes it) is the baseline, so a job that never ran shows too. No expiry while the plist is installed; the next
 // check entry clears it.
+// Doctor (PLAN wl-mvwks11ye3x9zu § Alerts, amendment A2; kind `report`): on the standing workload, one line per part whose newest
+// `doctor-down:` (writer DOCTOR_BY, surface/src/doctor.ts) has no later `doctor-up:` (surface/src/doctor-entries.ts `openDowns`), keyed
+// by the down entry, its `next` the down's fix. Once POPUP_ATTEMPT_LIMIT of its popups ended failed, abandoned or expired and none was
+// answered (`popupAttempts`), the line says so and takes the state `popup-failed`, so it is delivered again. The up clears it.
 // Train-aware routing (PLAN wl-mv8s8srodefytc rev 17.1 D9 F16): on a workload that owns a train task (surface/src/merge-train.ts
 // `trainTaskWindows`), the first lane death inside a task's window (from the `train-task:` to its settle, or still open) and an
 // intended exit inside one are not shown: the task counts them (D8) and the train tick relaunches the owner (`trainRouted`). The
@@ -103,6 +107,7 @@ import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { type NowCategory, nowMarks } from "../../gates/src/rulings";
 import { nowReserved } from "../../gates/src/rows/r06-reserved";
 import { openPairOffer } from "./input";
+import { localMinute, openDowns, POPUP_ATTEMPT_LIMIT, popupAttempts } from "./doctor-entries";
 import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, landFirstOffPending, laneExit, mainRetries, queuedOf, sameRepo } from "./launch";
 import {
 	landFirstRepos, landFirstRows, type LandFirstRow, latestTrainReconciled, mainRedNotices, protectionEpisodes, RECONCILED_STALE_MS, stopEpisode, type TaskWindow, TRAIN_ALERT_LADDER,
@@ -201,6 +206,16 @@ export function driveBackupLines(control: readonly ControlEntry[], now: string, 
 		line: `Drive backup check missed: ${what}; ${reload}`,
 	});
 	return out;
+}
+
+/** The doctor lines: one per open down, in the order the downs were written; the popup-failed text once its attempts are spent unanswered. */
+export function doctorLines(control: readonly ControlEntry[]): ErrorLine[] {
+	return openDowns(control).map((d): ErrorLine => {
+		const a = popupAttempts(control, d.entryId);
+		const failed = a.spent >= POPUP_ATTEMPT_LIMIT && !a.answered;
+		const line = `as2 doctor: ${d.part} down since ${localMinute(d.createdAt)}: ${d.evidence} — ${d.fix}; clears itself when it passes${failed ? `; popup failed ${a.spent} times: ${a.last}` : ""}`;
+		return { kind: "report", workloadId: STANDING_WORKLOAD_ID, rowId: d.entryId, next: d.fix, ...(failed ? { state: "popup-failed" } : {}), line };
+	});
 }
 
 /** Every needs-you line kind; ErrorKind is read from this list, so the issue #334 item 3 test covers each kind there is. */
@@ -794,6 +809,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 				});
 			}
 			report.push(...driveBackupLines(control, now, opts.driveBackupCheckPlist ?? (() => driveBackupCheckPlist())));
+			report.push(...doctorLines(control));
 			for (const ep of protectionEpisodes(ledger).values()) {
 				if (ep.raised) train.push({ kind: "train", workloadId: wl, rowId: ep.raised.id, next: NO_NEXT_STEP, line: `merge train: main's protection on ${ep.repo} is unverified: ${short(ep.text, 160)} — its normal PRs wait (no merge, no question) until it verifies; the line clears itself then` });
 			}

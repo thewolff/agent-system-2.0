@@ -45,6 +45,10 @@
 #                              set jevRank in the installed profile's config.yml (D7): show (launch
 #                              order unchanged), order, or parallel; prints the old and new value,
 #                              never starts omp: bun surface/scripts/rank-mode.ts
+#          as2 doctor [--json] whether as2's important parts are up (PLAN wl-mvwks11ye3x9zu): one line per part
+#                              (pass/fail/warn/not installed) with its evidence and fix, then a summary; exit 0
+#                              nothing failed, 1 a part failed, 2 a bad argument or the doctor crashed:
+#                              bun surface/scripts/doctor.ts. Run it from your own Terminal, not inside OMP
 #          as2 lane <wl>       run workload <wl> by hand as a lane in this terminal (user-driven mode;
 #                              DESIGN-lane-launcher.md decision 14): bun surface/scripts/lane.ts interactive <wl>
 #          as2 lane stop|cleanup|log <wl>
@@ -320,6 +324,10 @@ case "${1-}" in
 	rank-mode)
 		shift
 		exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/rank-mode.ts" "$@"
+		;;
+	doctor)
+		shift
+		exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/doctor.ts" "$@"
 		;;
 	--print)
 		shift

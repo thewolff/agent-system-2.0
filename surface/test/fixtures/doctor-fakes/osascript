@@ -1,0 +1,11 @@
+#!/bin/sh
+# as2 doctor test fake (surface/test/fixtures/doctor-fakes): logs its argv to $AS2_FAKE_STATE/calls.log and answers
+# from files under $AS2_FAKE_STATE, which surface/test/fixtures/doctor-fakes/state.ts writes. Never runs the real tool.
+S=${AS2_FAKE_STATE:?AS2_FAKE_STATE is not set}
+printf '%s\n' "$(basename "$0") $*" >> "$S/calls.log"
+# quiet-alarm's QUIET_ALARM_OSASCRIPT: osascript.answer is the button (default "Dismiss (no voice)"), osascript.exit
+# the exit code; osascript.stderr goes to stderr.
+cat "$S/osascript.stderr" 2>/dev/null >&2
+code=$(cat "$S/osascript.exit" 2>/dev/null || echo 0)
+[ "$code" = 0 ] && { cat "$S/osascript.answer" 2>/dev/null || echo "Dismiss (no voice)"; }
+exit "$code"
