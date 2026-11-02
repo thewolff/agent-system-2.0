@@ -87,6 +87,7 @@ import { defaultLedgerPath, Ledger } from "../../ledger/src/index";
 import { AS2_VERIFIED_TAG } from "../src/as2test";
 import { ceilingStopped } from "../src/ceiling";
 import { loadTestRunnerConfig } from "../src/close-entry";
+import { doctorTick, realDeps } from "../src/doctor";
 import {
 	attempts, consumedIds, controlEntries, heldLive, holdersOf, LANE_SCRIPT, laneCap, landFirstOffBody, landFirstOffPending, landFirstOn, launchRequestedBody, launchRowsFor, mainRetries, sameRepo, trainBindings, verdictOf,
 } from "../src/launch";
@@ -103,6 +104,7 @@ import {
 	trainWakeBody, twiceFailed, unsettledTasks,
 } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
+import { realNotify } from "../src/notify";
 import { sendNotice, TRAIN_SIGNOFF_APPLIED_PREFIX, trainMergedEntryBody, trainMergedNoticeBody } from "../src/notice";
 import { psMoveAlertProbe, quotaMoves, sigterm, spawnDetached, superviseMove, type SuperviseSeams } from "../src/quota-move-alert";
 import { type CompareResult, decisionLogFault, fastPlans, ownerRepoOf, type ResultRecord, runsRoot, type TestRunnerConfig, testRuns, withFullSuitePublication } from "../src/test-run";
@@ -1443,35 +1445,85 @@ function realRoot(): ControlRoot {
 	return { root, head, modified, current, currentHead: current === null ? null : git(current, ["rev-parse", "HEAD"]), repo: ownerRepoOf(origin)?.toLowerCase() ?? null };
 }
 
-/** No sound clause: train popups stay silent under Jo's silent-popup alarm rule. */
-function realNotify(title: string, text: string): boolean {
-	const str = (s: string) => `"${s.replace(/[\\"]/g, (c) => `\\${c}`)}"`;
-	const r = Bun.spawnSync(["osascript", "-e", `display notification ${str(text)} with title ${str(title)}`], { stdout: "pipe", stderr: "pipe", timeout: 10_000 });
-	return r.exitCode === 0;
+/** `main`'s steps, injectable so a test can make each one throw (PLAN wl-mvwks11ye3x9zu "train-tick main", R13). */
+export interface MainDeps {
+	open(): Ledger;
+	/** The train's work: `tick()` with the real effects. */
+	tick(ledger: Ledger): void;
+	/** The doctor's ctx step; `ledger` null when it could not be opened (the probe and its log line still run). True when the step's run failed (doctorTick's `failed`), false otherwise. */
+	doctor(ledger: Ledger | null, openError: string | null): boolean;
+	close(ledger: Ledger): void;
+	/** stderr: the open failure. */
+	err(line: string): void;
 }
 
-function main(argv: string[]): number {
+function realMainDeps(): MainDeps {
+	const log = (l: string) => process.stdout.write(`${new Date().toISOString()} ${l}\n`);
+	const ledgerPath = defaultLedgerPath(process.env);
+	return {
+		open: () => Ledger.open(ledgerPath, { backupOnOpen: false }),
+		tick: (ledger) => {
+			// D1 boards only on the repositories the test runner serves, read as its starter reads them.
+			const cfg = loadTestRunnerConfig(process.env);
+			if (!cfg.ok) log(`testRunner config unreadable (${cfg.error}): nothing boards this pass`);
+			tick({ ledger, gh: realGh, launch: realLaunch, notify: realNotify, land: { runner: realRunner, root: realRoot, runsRoot: runsRoot(process.env) }, log, ...(cfg.ok ? { config: cfg.config } : {}) });
+		},
+		doctor: (ledger, openError) => {
+			// The doctor beside this script: the tick's own root's (a verified tick runs a verified doctor).
+			const deps = realDeps({ env: process.env, repo: join(import.meta.dir, "..", ".."), doctorScript: join(import.meta.dir, "doctor.ts"), ledgerPath, out: log });
+			return doctorTick(ledger, deps, openError).failed;
+		},
+		close: (ledger) => ledger.close(),
+		err: (l) => process.stderr.write(`${l}\n`),
+	};
+}
+
+/**
+ * One pass: open the ledger, the train's work, the doctor's ctx step, then the close, each in its own try, so the ctx step
+ * runs whatever the train did and a close failure never replaces a work error. Every error is kept: one is rethrown as
+ * it is, two or three as one AggregateError naming each step. A ledger that cannot be opened still gets the ctx probe
+ * and its log line; then main returns 1 (or throws the doctor step's error). Main also returns 1 when no step threw but the
+ * doctor step reported a run failure, so the job's last exit code shows it.
+ */
+export function main(argv: string[], deps: MainDeps = realMainDeps()): number {
 	if (argv.length > 0) {
 		process.stderr.write("usage: bun surface/scripts/train-tick.ts\n");
 		return 2;
 	}
-	let ledger: Ledger;
+	let ledger: Ledger | null = null;
+	let openError: string | null = null;
 	try {
-		ledger = Ledger.open(defaultLedgerPath(process.env), { backupOnOpen: false });
+		ledger = deps.open();
 	} catch (err) {
-		process.stderr.write(`train-tick: the ledger could not be opened: ${String(err)}\n`);
-		return 1;
+		openError = String(err);
+		deps.err(`train-tick: the ledger could not be opened: ${openError}`);
 	}
+	const errors: { step: "train" | "doctor" | "close"; err: unknown }[] = [];
+	if (ledger) {
+		try {
+			deps.tick(ledger);
+		} catch (err) {
+			errors.push({ step: "train", err });
+		}
+	}
+	let doctorFailed = false;
 	try {
-		const log = (l: string) => process.stdout.write(`${new Date().toISOString()} ${l}\n`);
-		// D1 boards only on the repositories the test runner serves, read as its starter reads them.
-		const cfg = loadTestRunnerConfig(process.env);
-		if (!cfg.ok) log(`testRunner config unreadable (${cfg.error}): nothing boards this pass`);
-		tick({ ledger, gh: realGh, launch: realLaunch, notify: realNotify, land: { runner: realRunner, root: realRoot, runsRoot: runsRoot(process.env) }, log, ...(cfg.ok ? { config: cfg.config } : {}) });
-		return 0;
-	} finally {
-		ledger.close();
+		doctorFailed = deps.doctor(ledger, openError);
+	} catch (err) {
+		errors.push({ step: "doctor", err });
 	}
+	if (ledger) {
+		try {
+			deps.close(ledger);
+		} catch (err) {
+			errors.push({ step: "close", err });
+		}
+	}
+	if (errors.length === 1) throw errors[0]!.err;
+	if (errors.length > 1) {
+		throw new AggregateError(errors.map((e) => e.err), `train-tick: ${errors.length} steps failed: ${errors.map((e) => `${e.step}: ${errText(e.err)}`).join("; ")}`);
+	}
+	return openError === null && !doctorFailed ? 0 : 1;
 }
 
 if (import.meta.main) process.exit(main(process.argv.slice(2)));

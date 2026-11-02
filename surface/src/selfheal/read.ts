@@ -15,7 +15,7 @@
  *   the window start, prefiltered on `MCP tool load failed`. A profile with no logs directory yet has
  *   had no session, so no failure; a directory or log that cannot be read is returned as unreadable.
  */
-import { accessSync, constants, createReadStream, type Dirent, readdirSync, readFileSync, statSync } from "node:fs";
+import { createReadStream, type Dirent, openSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { type EntryRow, LANE_RUNNER_BY, type Ledger, type QuestionRow } from "../../../ledger/src/index";
@@ -94,23 +94,50 @@ export function jsonlFilesSince(root: string, sinceMs: number): string[] {
 	return out;
 }
 
-/** Stream `path` one line at a time (1-based numbers); a file that cannot be opened yields nothing. */
-async function eachLine(path: string, f: (line: string, n: number) => void): Promise<void> {
+/** Why `eachLine` did not read a whole file: it could not be opened (missing, no permission), or a read failed (a directory, an I/O error). */
+type LineFailure = { stage: "open" | "read"; error: Error };
+
+/**
+ * Stream `path` one line at a time (1-based numbers). Returns null when the whole file was read, else the failure: the
+ * caller decides whether an unopened file is "no lines" or an unreadable file to report. An error thrown by `f` is
+ * rethrown as it is.
+ */
+async function eachLine(path: string, f: (line: string, n: number) => void): Promise<LineFailure | null> {
+	const asError = (e: unknown) => (e instanceof Error ? e : new Error(String(e)));
+	let fd: number;
 	try {
-		accessSync(path, constants.R_OK);
-	} catch {
-		return;
+		fd = openSync(path, "r");
+	} catch (e) {
+		return { stage: "open", error: asError(e) };
 	}
-	const input = createReadStream(path, { encoding: "utf8" });
+	const input = createReadStream(path, { fd, encoding: "utf8" });
 	const rl = createInterface({ input, crlfDelay: Number.POSITIVE_INFINITY });
 	let n = 0;
+	let thrown: { error: unknown } | null = null;
+	let failure: LineFailure | null = null;
 	try {
-		for await (const line of rl) f(line, ++n);
+		for await (const line of rl) {
+			try {
+				f(line, ++n);
+			} catch (error) {
+				thrown = { error };
+				break;
+			}
+		}
+	} catch (e) {
+		failure = { stage: "read", error: asError(e) };
 	} finally {
 		rl.close();
 		input.destroy();
 	}
+	if (thrown) throw thrown.error;
+	return failure;
 }
+
+/** For readers with no unreadable list: an unopened file holds nothing for them (as before); a failed read throws. */
+const readOrThrow = (failure: LineFailure | null): void => {
+	if (failure?.stage === "read") throw failure.error;
+};
 
 const parse = (line: string): Record<string, unknown> | null => {
 	try {
@@ -135,13 +162,14 @@ async function readCompactions(lanesDir: string, sinceMs: number, toMs: number):
 	for (const wl of workloads) {
 		for (const path of jsonlFilesSince(join(lanesDir, wl, "sessions"), sinceMs)) {
 			const times: string[] = [];
-			await eachLine(path, (line) => {
+			// A session file that cannot be opened holds no compaction for this detector (it has no unreadable list).
+			readOrThrow(await eachLine(path, (line) => {
 				if (!line.includes(COMPACTION)) return;
 				const v = parse(line);
 				if (v === null || v.type !== "compaction" || typeof v.timestamp !== "string") return;
 				const t = Date.parse(v.timestamp);
 				if (t >= sinceMs && t < toMs) times.push(v.timestamp);
-			});
+			}));
 			if (times.length > 0) out.push({ path, workloadId: workloadOfLanePath(lanesDir, path), times });
 		}
 	}
@@ -163,7 +191,8 @@ async function readOrchestratorSessions(sessionsDir: string, sinceMs: number): P
 	const out: OrchestratorSession[] = [];
 	for (const path of jsonlFilesSince(sessionsDir, sinceMs)) {
 		const events: SessionEvent[] = [];
-		await eachLine(path, (line, n) => {
+		// A session file that cannot be opened holds no input for this detector (it has no unreadable list).
+		readOrThrow(await eachLine(path, (line, n) => {
 			if (!line.includes(USER) && !INPUT_MARKS.some((m) => line.includes(m))) return;
 			const v = parse(line);
 			if (v === null) return;
@@ -175,7 +204,7 @@ async function readOrchestratorSessions(sessionsDir: string, sinceMs: number): P
 			} else if (v.type === "custom" && (INPUT_TYPES as readonly unknown[]).includes(v.customType)) {
 				events.push({ line: n, kind: "input", at, id });
 			}
-		});
+		}));
 		if (events.length > 0) out.push({ path, events });
 	}
 	return out;
@@ -376,12 +405,11 @@ export async function readMcpLoadFailures(dir: string, sinceMs: number, toMs: nu
 		const path = join(dir, name);
 		try {
 			if (statSync(path).mtimeMs < sinceMs) continue;
-			accessSync(path, constants.R_OK);
 		} catch (e) {
 			if (!isMissing(e)) unreadable.push(path);
 			continue;
 		}
-		await eachLine(path, (text, line) => {
+		const failure = await eachLine(path, (text, line) => {
 			if (!text.includes(MCP_LOAD_FAILED)) return;
 			const o = parse(text);
 			if (o === null || o.message !== MCP_LOAD_FAILED || typeof o.timestamp !== "string" || typeof o.path !== "string") return;
@@ -389,6 +417,8 @@ export async function readMcpLoadFailures(dir: string, sinceMs: number, toMs: nu
 			if (!Number.isFinite(t) || t < sinceMs || t >= toMs) return;
 			failures.push({ path, line, at: new Date(t).toISOString(), server: o.path.replace(/^mcp:/, ""), error: typeof o.error === "string" ? o.error : String(o.error) });
 		});
+		// A log that vanished after the listing holds none; one that cannot be opened or read is unreadable.
+		if (failure !== null && !(failure.stage === "open" && isMissing(failure.error))) unreadable.push(path);
 	}
 	return { failures, unreadable };
 }

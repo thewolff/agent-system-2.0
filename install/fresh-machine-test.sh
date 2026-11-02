@@ -53,6 +53,12 @@
 # --daily-report writes a plist that lints, runs surface/scripts/daily-report.ts at 07:00 with absolute
 # paths, the ledger and the profile install wrote and the system PATH, logging under
 # ~/agent-scratch/agent-system-2.0/self-heal, and bootstraps it; =off boots it out and deletes it.
+# Every install ends in the full as2 doctor (PLAN wl-mvwks11ye3x9zu, install.sh F8), and every install run here has the
+# clone's shared doctor fakes (surface/test/fixtures/doctor-fakes: launchctl, gh, osascript, dscl and the rest) first on
+# PATH with AS2_FAKE_STATE naming a healthy fake machine for that run's HOME, so its probes never reach this machine's
+# launchd, gh or notifications. ctx goes through a wrapper: `ctx daemon` (the doctor's probe) answers from the fake, and
+# every other ctx call (install's history-root registration, checked in step 3e) goes to the real ctx when one is on
+# PATH, else to the fake. Step 13's fake launchctl answers the doctor's `print`s from the same fake machine.
 #
 # Usage:   bash install/fresh-machine-test.sh
 # Env:     FRESH_TEST_ROOT  where the temp clone and temp HOME go (default: ${TMPDIR:-/tmp})
@@ -93,9 +99,25 @@ ok() { printf 'PASS: %s\n' "$*"; }
 die() { printf 'FAIL: %s\n' "$*"; exit 1; }
 
 # Run the clone's installer as a fresh machine would: only PATH and the temp HOME, nothing else
-# inherited (no OMP_*, no AGENT_SYSTEM_LEDGER_DB). Extra VAR=value pairs may follow.
+# inherited (no OMP_*, no AGENT_SYSTEM_LEDGER_DB), with the doctor's fakes first on PATH and the fake machine for
+# $FAKE_HOME (both set up after step 2). Extra VAR=value pairs may follow.
 run_install() {
-	env -i PATH="$PATH" HOME="$FAKE_HOME" "$@" bash "$CLONE/install/install.sh"
+	env -i PATH="$DOCTOR_PATH:$PATH" HOME="$FAKE_HOME" AS2_FAKE_STATE="$DOCTOR_STATE" "$@" bash "$CLONE/install/install.sh"
+}
+
+# A healthy fake machine for the closing doctor at $1 (the fake state directory) for an install into HOME $2: the shared
+# healthy state (writeHealthyState; its seat is this script's shell, running in the clone), except that ledger-backup is
+# the job that install writes under $2, loaded from that plist and not yet run, so the doctor judges it by the fresh
+# mtime every install gives the plist. Phoenix and the doctor job are not installed: $2 is not this user's home (fake dscl).
+make_doctor_state() {
+	bun -e '
+		const [fakes, state, home, repo, pid, bun] = process.argv.slice(1);
+		const f = await import(`${fakes}/state.ts`);
+		f.writeHealthyState({ state, home: `${state}/healthy-home`, repo, seatPid: Number(pid), bun });
+		const log = `${home}/.agent-system-2/ledger-backup.log`;
+		f.setFake(state, `plutil/${f.LEDGER_BACKUP_LABEL}.plist.json`, JSON.stringify({ Label: f.LEDGER_BACKUP_LABEL, ProgramArguments: [bun], StartInterval: 3600, StandardOutPath: log, StandardErrorPath: log }));
+		f.setFake(state, `launchctl/${f.LEDGER_BACKUP_LABEL}`, f.launchctlPrint({ label: f.LEDGER_BACKUP_LABEL, path: f.plistPath(home, f.LEDGER_BACKUP_LABEL), log, runs: 0, exit: "never" }));
+	' "$DOCTOR_FAKES" "$1" "$2" "$CLONE" "$$" "$(type -P bun)" || die "could not write the doctor's fake machine at $1 for HOME $2"
 }
 
 printf 'fresh-machine install test\n'
@@ -121,6 +143,27 @@ else
 	done
 	ok "overlay done"
 fi
+
+step "2b. the doctor's fakes first on every install's PATH, and a healthy fake machine for $FAKE_HOME"
+DOCTOR_FAKES="$CLONE/surface/test/fixtures/doctor-fakes"
+[ -x "$DOCTOR_FAKES/launchctl" ] || die "no doctor fakes at $DOCTOR_FAKES"
+REAL_CTX="$(type -P ctx || true)"
+DOCTOR_BIN="$WORK/doctor-ctx-bin"
+mkdir -p "$DOCTOR_BIN"
+{
+	printf '#!/bin/sh\n'
+	printf '# fresh-machine-test.sh: the doctor'"'"'s probe (ctx daemon ...) answers from the fake; any other ctx call goes to %s.\n' "${REAL_CTX:-the fake (no real ctx on PATH)}"
+	printf '[ "$1" != daemon ] || exec %q "$@"\n' "$DOCTOR_FAKES/ctx"
+	printf 'exec %q "$@"\n' "${REAL_CTX:-$DOCTOR_FAKES/ctx}"
+} >"$DOCTOR_BIN/ctx"
+chmod 755 "$DOCTOR_BIN/ctx"
+DOCTOR_PATH="$DOCTOR_BIN:$DOCTOR_FAKES"
+for tool in launchctl gh osascript dscl; do
+	[ "$(PATH="$DOCTOR_PATH:$PATH" type -P "$tool")" = "$DOCTOR_FAKES/$tool" ] || die "test setup: $tool on the install PATH is not the doctor's fake"
+done
+DOCTOR_STATE="$WORK/doctor-fakes-state"
+make_doctor_state "$DOCTOR_STATE" "$FAKE_HOME"
+ok "doctor fakes $DOCTOR_FAKES first on the install PATH (ctx through $DOCTOR_BIN/ctx); fake machine at $DOCTOR_STATE"
 
 step "3. install with a temp HOME: $FAKE_HOME"
 mkdir -p "$FAKE_HOME"
@@ -300,6 +343,14 @@ printf '%s\n' "$reinstall_out" | grep -qF "note: $FAKE_HOME/.local/bin is not on
 LOGIN_WANT="==> first launch: this profile routes to anthropic, openai-codex, moonshot, typesafe; OMP needs a login to each once per profile: run /login in the as2 session (credentials stay in $PROFILE/agent.db)"
 [ "$(printf '%s\n' "$reinstall_out" | tail -n 1)" = "$LOGIN_WANT" ] || die "install's last line is '$(printf '%s\n' "$reinstall_out" | tail -n 1)', expected '$LOGIN_WANT'"
 ok "install's last line names the four providers and the once-per-profile /login"
+# The closing doctor (install.sh 6g) ran against the fake machine, passed, and came before install complete.
+doctor_line="$(printf '%s\n' "$reinstall_out" | grep -nE '^as2 doctor: [0-9]+ pass, 0 fail, ' || true)"
+complete_line="$(printf '%s\n' "$reinstall_out" | grep -n '^==> install complete: ' || true)"
+[ -n "$doctor_line" ] && [ -n "$complete_line" ] && [ "${doctor_line%%:*}" -lt "${complete_line%%:*}" ] \
+	|| die "install's output has no passing as2 doctor summary before install complete"
+grep -qxF "ctx daemon status --format json" "$DOCTOR_STATE/calls.log" || die "the closing doctor never asked the fake ctx ($DOCTOR_STATE/calls.log)"
+grep -qxF "launchctl print gui/$(id -u)/com.agent-system-2.ledger-backup" "$DOCTOR_STATE/calls.log" || die "the closing doctor never asked the fake launchctl ($DOCTOR_STATE/calls.log)"
+ok "the closing doctor passed against the fake machine (${doctor_line#*:}) before install complete"
 # Phoenix is on by default on macOS (wl-mv65t5d34lts00 PLAN.md § 8.1; install.sh step 6e is macOS only), but never
 # from a HOME that is not the user's own: this install's temp HOME must not replace the real gui/<uid> job with one
 # pointing into it.
@@ -385,7 +436,7 @@ MCP_WANT="$(printf 'ctx\tnative\t%s\tctx mcp serve\nlinear\tnative\t%s\thttps://
 [ "$(cat "$MCP_LISTING")" = "$MCP_WANT" ] || die "OMP's MCP discovery under the profile is not exactly ctx, linear and posthog from $PROFILE/mcp.json"
 ok "OMP discovers exactly three MCP servers under the profile: ctx, linear and posthog, from $PROFILE/mcp.json; the default-profile and ~/.claude.json decoys are not read"
 CTX_ROOT="omp-agent-system-2-sessions"
-if command -v ctx >/dev/null 2>&1; then
+if [ -n "$REAL_CTX" ]; then
 	[ -d "$PROFILE/sessions" ] || die "install did not create $PROFILE/sessions"
 	roots="$(env -i PATH="$PATH" HOME="$FAKE_HOME" ctx sources --provider pi --format json | bun -e '
 		for (const s of JSON.parse(await Bun.stdin.text()).sources) if (s.selection.kind === "configured") console.log(s.selection.root + "\t" + s.path + "\t" + s.status);
@@ -401,8 +452,10 @@ if command -v ctx >/dev/null 2>&1; then
 	[ "$(grep -c "^\[sources.roots.$CTX_ROOT\]\$" "$FAKE_HOME/.ctx/config.toml")" -eq 1 ] || die "$FAKE_HOME/.ctx/config.toml does not hold exactly one $CTX_ROOT entry"
 	ok "$PROFILE/sessions is ctx pi root $CTX_ROOT under $FAKE_HOME/.ctx; the re-install kept it (one entry in config.toml)"
 else
-	printf '%s\n' "$reinstall_out" | grep -qF "==> note: ctx is not on PATH" || die "ctx is absent and install did not say the root was not registered"
-	ok "ctx is not on PATH here; install said the root was not registered"
+	# No real ctx here: install's registration went through the wrapper to the doctor's fake ctx (step 2b), which logs it.
+	grep -qxF "ctx sources add --provider pi --root $PROFILE/sessions --replace $CTX_ROOT" "$DOCTOR_STATE/calls.log" \
+		|| die "no real ctx on PATH, and install did not register $PROFILE/sessions as $CTX_ROOT through the fake ($DOCTOR_STATE/calls.log)"
+	ok "no real ctx on PATH here; install registered $PROFILE/sessions as $CTX_ROOT through the doctor's fake ctx"
 fi
 
 step "3f. the by-hand lane session: \`as2 lane\` under a freshly rendered profile gets its prompt, the 3 vendored skills and the pair tools (PLAN-2 D6, R12)"
@@ -687,7 +740,9 @@ else
 	ODD_HOME="$WORK/home-@REPO@ & co"
 	ODD_DB="$WORK/db-@REPO@ & co/@REPO@&.db"
 	mkdir -p "$ODD_HOME"
-	env -i PATH="$PATH" HOME="$ODD_HOME" AGENT_SYSTEM_LEDGER_DB="$ODD_DB" bash "$CLONE/install/install.sh" >/dev/null \
+	ODD_STATE="$WORK/doctor-fakes-state-odd"
+	make_doctor_state "$ODD_STATE" "$ODD_HOME"
+	env -i PATH="$DOCTOR_PATH:$PATH" HOME="$ODD_HOME" AS2_FAKE_STATE="$ODD_STATE" AGENT_SYSTEM_LEDGER_DB="$ODD_DB" bash "$CLONE/install/install.sh" >/dev/null \
 		|| die "install with HOME=$ODD_HOME and ledger $ODD_DB exited $?"
 	ODD_PLIST="$ODD_HOME/Library/LaunchAgents/com.agent-system-2.ledger-backup.plist"
 	/usr/bin/plutil -lint "$ODD_PLIST" || die "the plist does not lint"
@@ -718,7 +773,10 @@ else
 	CHAOS_LOG="$FAKE_HOME/agent-scratch/agent-system-2.0/chaos/launchd.log"
 	# A fake launchctl first on PATH: it appends its argv (one line per call) to a log, and keeps one
 	# flag file per label so `print` answers as launchd does for that label (0 loaded, 113 not loaded);
-	# bootstrap names the plist, whose file name is the label plus .plist.
+	# bootstrap names the plist, whose file name is the label plus .plist. For the closing doctor, a `print` of a
+	# label the fake machine holds (ledger-backup) answers from the doctor's fake launchctl, a loaded label's `print`
+	# answers as launchd does for a job loaded from its plist and not yet run, and `bootstrap` stores the plist's JSON
+	# for the doctor's fake plutil.
 	FAKE_BIN="$WORK/fake-launchctl-bin"
 	LAUNCHCTL_LOG="$WORK/launchctl.log"
 	LOADED="$WORK/launchctl.loaded"
@@ -726,21 +784,28 @@ else
 	{
 		printf '#!/bin/bash\n'
 		printf 'printf "%%s\\n" "$*" >>%q\n' "$LAUNCHCTL_LOG"
+		printf 'l="${2##*/}"\n'
 		printf 'case "$1" in\n'
-		printf '\tprint) [ -e %q."${2##*/}" ] || { echo "Could not find service" >&2; exit 113; } ;;\n' "$LOADED"
-		printf '\tbootstrap) p="${3##*/}"; touch %q."${p%%.plist}" ;;\n' "$LOADED"
+		printf '\tprint) [ ! -e "$AS2_FAKE_STATE/launchctl/$l" ] || exec %q "$@"\n' "$DOCTOR_FAKES/launchctl"
+		printf '\t\t[ -e %q."$l" ] || { echo "Could not find service" >&2; exit 113; }\n' "$LOADED"
+		printf '\t\tp="$HOME/Library/LaunchAgents/$l.plist"; log="$(/usr/bin/plutil -extract StandardOutPath raw -o - "$p")" || exit 1\n'
+		printf '\t\tprintf "gui/%%s/%%s = {\\n\\tpath = %%s\\n\\tstate = not running\\n\\tstdout path = %%s\\n\\truns = 0\\n\\tlast exit code = (never exited)\\n}\\n" "$(id -u)" "$l" "$p" "$log" ;;\n'
+		printf '\tbootstrap) p="${3##*/}"; touch %q."${p%%.plist}"\n' "$LOADED"
+		printf '\t\tmkdir -p "$AS2_FAKE_STATE/plutil" && /usr/bin/plutil -convert json -o "$AS2_FAKE_STATE/plutil/$p.json" "$3" || exit 1 ;;\n'
 		printf '\tbootout) rm -f %q."${2##*/}" ;;\n' "$LOADED"
 		printf 'esac\n'
 	} >"$FAKE_BIN/launchctl"
 	chmod 755 "$FAKE_BIN/launchctl"
-	chaos_install() { env -i PATH="$FAKE_BIN:$PATH" HOME="$FAKE_HOME" bash "$CLONE/install/install.sh" "$@"; }
+	chaos_install() { env -i PATH="$FAKE_BIN:$DOCTOR_PATH:$PATH" HOME="$FAKE_HOME" AS2_FAKE_STATE="$DOCTOR_STATE" bash "$CLONE/install/install.sh" "$@"; }
 	launchctl_calls() { if [ -e "$LAUNCHCTL_LOG" ]; then cat "$LAUNCHCTL_LOG"; fi; }
+	# The closing doctor's `launchctl print` of each job it expects: ledger-backup, then each label given (inventory order).
+	doctor_prints() { printf 'print gui/%s/com.agent-system-2.ledger-backup\n' "$(id -u)"; for l in "$@"; do printf 'print %s\n' "$l"; done; }
 
 	[ ! -e "$CHAOS_PLIST" ] || die "the no-flag installs above wrote $CHAOS_PLIST"
 	chaos_install >/dev/null || die "no-flag install with the fake launchctl on PATH exited $?"
 	[ ! -e "$CHAOS_PLIST" ] || die "a no-flag install wrote $CHAOS_PLIST"
-	[ -z "$(launchctl_calls)" ] || die "a no-flag install ran launchctl: $(launchctl_calls)"
-	ok "no flag: no chaos plist under $FAKE_HOME/Library/LaunchAgents and no launchctl call"
+	[ "$(launchctl_calls)" = "$(doctor_prints)" ] || die "a no-flag install ran launchctl beyond the closing doctor's print: $(launchctl_calls)"
+	ok "no flag: no chaos plist under $FAKE_HOME/Library/LaunchAgents and no launchctl call but the closing doctor's print of ledger-backup"
 
 	chaos_install --chaos-nightly || die "install --chaos-nightly exited $?"
 	[ -f "$CHAOS_PLIST" ] || die "install --chaos-nightly wrote no plist at $CHAOS_PLIST"
@@ -775,13 +840,13 @@ else
 	' "$WORK/chaos-job.json" "$(type -P bun)" "$CLONE" "$FAKE_HOME" "$WANT_PATH" "$CHAOS_LOG" \
 		|| die "the chaos plist is not the expected job"
 	[ -d "$(dirname "$CHAOS_LOG")" ] || die "install did not create the log directory $(dirname "$CHAOS_LOG")"
-	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST")"
+	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST"; doctor_prints "$CHAOS_LABEL")"
 	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
 	ok "plist lints; four StartCalendarInterval entries (Minute 0, 15, 30, 45); absolute bun, chaos.ts, WorkingDirectory, HOME, PATH=$WANT_PATH and log; no ledger variable; bootstrapped into gui/$(id -u)"
 
 	rm -f "$LAUNCHCTL_LOG"
 	chaos_install --chaos-nightly >/dev/null || die "re-run of install --chaos-nightly exited $?"
-	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootout $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST")"
+	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootout $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST"; doctor_prints "$CHAOS_LABEL")"
 	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "re-run launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
 	ok "a re-run boots the loaded job out before bootstrapping the rewritten plist"
 
@@ -799,7 +864,7 @@ else
 	NO_OMP_BIN="$WORK/no-omp-bin"
 	mkdir -p "$NO_OMP_BIN"
 	ln -sf "$(type -P bun)" "$NO_OMP_BIN/bun"
-	NO_OMP_PATH="$FAKE_BIN:$NO_OMP_BIN:/usr/bin:/bin:/usr/sbin:/sbin"
+	NO_OMP_PATH="$FAKE_BIN:$DOCTOR_PATH:$NO_OMP_BIN:/usr/bin:/bin:/usr/sbin:/sbin"
 	(PATH="$NO_OMP_PATH"; type -P omp >/dev/null) && die "test setup: omp is still on $NO_OMP_PATH"
 	REFUSED_HOME="$WORK/chaos-refused-home"
 	mkdir -p "$REFUSED_HOME"
@@ -809,7 +874,7 @@ else
 		if [ "$args" = --chaos-nightly ]; then
 			out="$(env -i PATH="$NO_OMP_PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" "$args" 2>&1)"
 		else
-			out="$(env -i PATH="$FAKE_BIN:$PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" "$args" 2>&1)"
+			out="$(env -i PATH="$FAKE_BIN:$DOCTOR_PATH:$PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" "$args" 2>&1)"
 		fi
 		status=$?
 		set -e
@@ -860,13 +925,13 @@ else
 	' "$WORK/sweep-job.json" "$(type -P bun)" "$CLONE" "$FAKE_HOME" "$FAKE_HOME/.agent-system-2/ledger.db" "$SWEEP_LOG" \
 		|| die "the scratch sweep plist is not the expected job"
 	[ -d "$(dirname "$SWEEP_LOG")" ] || die "install did not create the log directory $(dirname "$SWEEP_LOG")"
-	CALLS_WANT="$(printf '%s\n' "print $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST")"
+	CALLS_WANT="$(printf '%s\n' "print $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST"; doctor_prints "$SWEEP_LABEL")"
 	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
 	ok "plist lints; StartCalendarInterval 04:30; absolute bun, scratch-sweep.ts, WorkingDirectory, HOME, ledger and log; system PATH; bootstrapped into gui/$(id -u)"
 
 	rm -f "$LAUNCHCTL_LOG"
 	chaos_install --scratch-sweep >/dev/null || die "re-run of install --scratch-sweep exited $?"
-	CALLS_WANT="$(printf '%s\n' "print $SWEEP_LABEL" "bootout $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST")"
+	CALLS_WANT="$(printf '%s\n' "print $SWEEP_LABEL" "bootout $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST"; doctor_prints "$SWEEP_LABEL")"
 	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "re-run launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
 	ok "a re-run boots the loaded job out before bootstrapping the rewritten plist"
 
@@ -884,7 +949,7 @@ else
 	rm -f "$LAUNCHCTL_LOG"
 	chaos_install --chaos-nightly --scratch-sweep >/dev/null || die "install --chaos-nightly --scratch-sweep exited $?"
 	[ -f "$CHAOS_PLIST" ] && [ -f "$SWEEP_PLIST" ] || die "install with both flags did not write both plists"
-	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST" "print $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST")"
+	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST" "print $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST"; doctor_prints "$SWEEP_LABEL" "$CHAOS_LABEL")"
 	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "both-flag launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
 	rm -f "$LAUNCHCTL_LOG"
 	chaos_install --chaos-nightly=off --scratch-sweep=off || die "install --chaos-nightly=off --scratch-sweep=off exited $?"
@@ -899,7 +964,7 @@ else
 	for args in "--scratch-sweep=on" "--scratch-sweep --scratch-sweep" "--scratch-sweep --chaos-nightly=off" "--scratch-sweep=off --chaos-nightly"; do
 		set +e
 		# shellcheck disable=SC2086 # each case is a list of flags
-		out="$(env -i PATH="$FAKE_BIN:$PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" $args 2>&1)"
+		out="$(env -i PATH="$FAKE_BIN:$DOCTOR_PATH:$PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" $args 2>&1)"
 		status=$?
 		set -e
 		printf '%s -> exit %s: %s\n' "$args" "$status" "$out"
@@ -945,7 +1010,7 @@ else
 	' "$WORK/report-job.json" "$(type -P bun)" "$CLONE" "$FAKE_HOME" "$FAKE_HOME/.agent-system-2/ledger.db" "$REPORT_LOG" \
 		|| die "the daily report plist is not the expected job"
 	[ -d "$(dirname "$REPORT_LOG")" ] || die "install did not create the log directory $(dirname "$REPORT_LOG")"
-	CALLS_WANT="$(printf '%s\n' "print $REPORT_LABEL" "bootstrap gui/$(id -u) $REPORT_PLIST")"
+	CALLS_WANT="$(printf '%s\n' "print $REPORT_LABEL" "bootstrap gui/$(id -u) $REPORT_PLIST"; doctor_prints "$REPORT_LABEL")"
 	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
 	ok "plist lints; StartCalendarInterval 07:00; absolute bun, daily-report.ts, WorkingDirectory, HOME, ledger, profile and log; system PATH; bootstrapped into gui/$(id -u)"
 
@@ -962,7 +1027,7 @@ else
 	for args in "--daily-report=on" "--daily-report --daily-report" "--daily-report --scratch-sweep=off" "--daily-report=off --train-tick"; do
 		set +e
 		# shellcheck disable=SC2086 # each case is a list of flags
-		out="$(env -i PATH="$FAKE_BIN:$PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" $args 2>&1)"
+		out="$(env -i PATH="$FAKE_BIN:$DOCTOR_PATH:$PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" $args 2>&1)"
 		status=$?
 		set -e
 		printf '%s -> exit %s: %s\n' "$args" "$status" "$out"
