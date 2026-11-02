@@ -16,7 +16,8 @@
 // below a launchable one is reported queued behind it and no starter runs; in `show` it is `verdictOf`.
 // At cap it runs `preemptFor` (PLAN wl-mv8wzytml878b4 D3): in `order`, a Jo-ruled workload waiting at
 // cap gets a priority stop written on the lowest-ranked running lane below it, told as
-// `priority-pausing <lane> on <wl> for <X>`.
+// `priority-pausing <lane> on <wl> for <X>`. With `scope: model-only` the tool writes Jo's `lane-model:` alone and stops: no request,
+// no launcher, no pick snapshot, and no holder check, since the next spawn reads it and a live lane is left running on its model.
 import type { Ledger } from "../../ledger/src/index";
 import {
 	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, launchRowsFor, type LaunchVerdict, launchRequestedBody, modelProblem, STARTER_EXIT,
@@ -133,11 +134,13 @@ export default function launchRow(pi: SurfaceAPI, env: Record<string, string | u
 			"Records `launch-requested:` on the workload, then runs the launcher and returns its one line (the lane id, a refusal, or the typed failure). " +
 			"A user-driven workload is not launched: the by-hand command is returned instead. " +
 			"`model` (Jo's word only) names the model this workload's lanes run on, kept across relaunches until changed: an exact `provider/model` (e.g. `openai-codex/gpt-6-sol`) on a provider with a known lab, no `:level` suffix; `default` clears it. " +
-			"A different model than the recorded session ran on starts a fresh session; a lane whose OMP does not report that model fails its launch. On a user-driven workload it is recorded for the by-hand lane.",
+			"A different model than the recorded session ran on starts a fresh session; a lane whose OMP does not report that model fails its launch. On a user-driven workload it is recorded for the by-hand lane. " +
+			"`scope: \"model-only\"` records `model` for the workload's next lane and nothing else: no launch request, no launch, a live lane is not stopped and keeps its model, the mode is unchanged.",
 		parameters: z.object({
 			workloadId: z.string().describe("The open workload (wl-…)."),
 			reason: z.string().optional().describe("Why, in a few words (e.g. 'relaunch after death'); recorded in the request."),
 			model: z.string().optional().describe("Jo's named model: exact provider/model (e.g. openai-codex/gpt-6-sol), no :level; `default` clears it. Omit to keep the one recorded."),
+			scope: z.enum(["launch", "model-only"]).optional().describe("`launch` (the default) requests a launch; `model-only` records `model` for the next lane only: no request, no launch, the live lane untouched. `model-only` requires `model`."),
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -146,6 +149,8 @@ export default function launchRow(pi: SurfaceAPI, env: Record<string, string | u
 			const id = String(params.workloadId ?? "").trim();
 			const reason = typeof params.reason === "string" && params.reason.trim() ? params.reason.trim() : null;
 			const model = typeof params.model === "string" ? params.model.trim() : null;
+			const modelOnly = params.scope === "model-only";
+			if (modelOnly && model === null) return text("Refused: scope model-only records a model for the next lane, and no `model` was named. Nothing was written.");
 			const problem = model === null ? null : modelProblem(model);
 			if (problem !== null) return text(`Refused: ${problem}. Nothing was written.`);
 			if (id === STANDING_WORKLOAD_ID) return text("The standing orchestrator workload never has a lane; nothing was written.");
@@ -154,6 +159,13 @@ export default function launchRow(pi: SurfaceAPI, env: Record<string, string | u
 			if (!w) return text(`No workload ${id}; nothing was written.`);
 			if (w.status === "closed") return text(`${id} is closed (${w.closed_at}); nothing was written.`);
 			if (w.brief.startsWith(DUE_PREFIX)) return text(`${id} is a scheduled row: it never has a lane; nothing was written.`);
+			if (model !== null && modelOnly) {
+				// The model write alone (Jo's word, by the surface): it is read at the next spawn, so a lane holding the lease now is not stopped and keeps its model.
+				const modelId = ledger.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: laneModelBody(model, s.now()) });
+				const live = w.holder !== null && w.holder !== JO_HOLDER && (w.holder_lease_until === null || w.holder_lease_until >= s.now());
+				const now = live ? `${w.holder} keeps running on its current model` : "nothing was launched";
+				return text(`Recorded lane model ${model} (${modelId}) on ${id} for its next lane; no launch was requested, ${now}, and the mode stays ${w.mode}.`, { id, modelId });
+			}
 			if (w.mode === "user-driven") {
 				if (model === null) return text(`${id} is user-driven: no lane launches by itself. Run it by hand with \`${byHandLine(id)}\`, or flip it with the word autonomous. Nothing was written.`);
 				const modelId = ledger.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: laneModelBody(model, s.now()) });

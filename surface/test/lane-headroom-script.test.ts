@@ -8,8 +8,9 @@ import { join } from "node:path";
 import { loadTierTable } from "../../classifier/src/tier-table";
 import { LANE_RUNNER_BY, Ledger } from "../../ledger/src/index";
 import { recordRepo } from "../src/decision-log";
-import { doneBody, laneDir, laneExit, laneModelBody, laneStarted } from "../src/launch";
-import { SURFACE_BY } from "../src/types";
+import { doneBody, laneDir, laneExit, laneModelBody, laneModelPreferenceBody, laneStarted } from "../src/launch";
+import { TRAIN_FIX_MODEL_SOURCE } from "../src/merge-train";
+import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
 import type { FakeScript, FakeStep, LaneRoot } from "./helpers";
 import { fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, laneSnapshot, setScript, settleDrains, sh, until } from "./helpers";
 
@@ -85,13 +86,15 @@ function removeTierTable(r: LaneRoot): void {
 
 const runnerLog = (r: LaneRoot, wl: string) => readFileSync(join(laneDir(wl, r.home), "runner.log"), "utf8");
 const ledgerOf = (r: LaneRoot) => Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
-/** An autonomous workload with its done: line and one open slice, and Jo's `lane-model:` when `model` is given. */
-function openWorkload(r: LaneRoot, model: string | null): string {
+/** An autonomous workload with its done: line and one open slice, Jo's `lane-model:` when `model` is given, and the train's
+ * `lane-model-preference:` when `preferred` is. */
+function openWorkload(r: LaneRoot, model: string | null, preferred: string | null = null): string {
 	const l = ledgerOf(r);
 	try {
 		const wl = l.openWorkload({ by: SURFACE_BY, brief: "headroom probe", stakes: "normal", mode: "autonomous" });
 		recordRepo(l, wl, r.repo);
 		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the probe is done") });
+		if (preferred !== null) l.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: laneModelPreferenceBody(preferred, l.now(), TRAIN_FIX_MODEL_SOURCE) });
 		if (model !== null) l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: laneModelBody(model, l.now()) });
 		l.addSlice({ by: SURFACE_BY, workloadId: wl, task: "probe", doneCondition: "probed", inputs: "README.md" });
 		return wl;
@@ -190,6 +193,48 @@ describe("PLAN wl-mv71x5rwdu7eo0 § 4: the quota guard at the runner's spawn", (
 		const snap = laneSnapshot(r, wl);
 		expect(snap.control.some((c) => c.prefix === "lane-headroom")).toBe(false);
 		expect(laneStarted(snap.control, lane1)).toMatchObject({ model: null, ranModel: A });
+	}, 60_000);
+
+	test("the train's preferred model in quota starts the lane on it: --model in the argv, checked by get_state, no move", async () => {
+		const r = makeRoot({ anthropic: 0.1, "openai-codex": 0.1 });
+		const wl = openWorkload(r, null, SOL);
+		launch(r, wl, { steps: DONE, stateModel: { provider: "openai-codex", id: "gpt-6.1-sol" } });
+		const lane1 = laneIdOf(wl, 1);
+		await endOf(r, wl, lane1);
+		const snap = laneSnapshot(r, wl);
+		expect(laneExit(snap.control, lane1)).toMatchObject({ outcome: "completed" });
+		const argv = spawns(r)[0]!.argv!;
+		expect(argv[argv.indexOf("--model") + 1]).toBe(SOL);
+		expect(laneStarted(snap.control, lane1)).toMatchObject({ model: SOL, ranModel: SOL });
+		expect(snap.control.some((c) => c.prefix === "lane-headroom" || c.prefix === "launch-failed")).toBe(false);
+	}, 60_000);
+
+	test("the train's preferred model refused by the quota guard falls back to ordinary routing: omp spawns with no --model, the lane completes, no launch-failed:", async () => {
+		const r = makeRoot({ anthropic: 0.1, "openai-codex": 0.85 });
+		const wl = openWorkload(r, null, SOL);
+		launch(r, wl, { steps: DONE, stateModel: { provider: "anthropic", id: "claude-opus-5-5" } });
+		const lane1 = laneIdOf(wl, 1);
+		await endOf(r, wl, lane1);
+		const snap = laneSnapshot(r, wl);
+		expect(laneExit(snap.control, lane1)).toMatchObject({ outcome: "completed" });
+		expect(spawns(r)[0]!.argv).not.toContain("--model");
+		expect(commandsOf(r, 1).slice(0, 2)).toEqual(["get_state", "prompt"]);
+		expect(laneStarted(snap.control, lane1)).toMatchObject({ model: null, ranModel: A });
+		expect(snap.control.some((c) => c.prefix === "launch-failed" || c.prefix === "lane-model")).toBe(false);
+		expect(snap.deaths).toEqual([]);
+		expect(runnerLog(r, wl)).toContain(`preferred ${SOL} refused (openai-codex 5h 0.85 used > 0.80); falling back to ordinary routing`);
+	}, 60_000);
+
+	test("Jo's lane-model: over a preference keeps today's refusal: named and out fails at headroom before any omp", async () => {
+		const r = makeRoot({ anthropic: 0.1, "openai-codex": 0.85 });
+		const wl = openWorkload(r, SOL, A);
+		launch(r, wl, { steps: DONE });
+		const lane1 = laneIdOf(wl, 1);
+		await endOf(r, wl, lane1);
+		expect(spawns(r)).toEqual([]);
+		const snap = laneSnapshot(r, wl);
+		expect(snap.control.filter((c) => c.prefix === "launch-failed").map((c) => c.rest)).toEqual([`headroom: named ${SOL}, openai-codex 5h 0.85 used > 0.80`]);
+		expect(snap.deaths).toHaveLength(1);
 	}, 60_000);
 });
 

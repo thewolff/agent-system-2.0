@@ -72,7 +72,7 @@ import { checkoutOwnerRepo, isTrainOrFix, openTrains, ownerTasks, TRAIN_LAUNCH_L
 import {
 	attempts, branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, heldLive, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
-	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
+	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, type LaneModelChoice, laneModelChoice, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeOrigin, resumePlan, scratchCapMb, sessionOrigin, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
@@ -322,18 +322,21 @@ function byHandPromptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prep
 }
 
 /**
- * The model and session this attempt starts on, read fresh at every spawn: Jo's named model (`laneModel`, null for the
- * profile default) and the session `resumeOrigin` picks (decisions 6, 7, 14), resumed only when its origin lane ran on that
- * same model (`resumePlan`, MIGRATION.md item 85); `skipped` says why a recorded session was not resumed.
+ * The model and session this attempt starts on, read fresh at every spawn: Jo's named model, else the train's preference
+ * (`laneModelChoice`; `source` says which, null for the profile default), and the session `resumeOrigin` picks (decisions 6, 7, 14),
+ * resumed only when its origin lane ran on that same model (`resumePlan`, MIGRATION.md item 85); `skipped` says why a recorded
+ * session was not resumed. `ignorePreference` reads Jo's word alone: the runner's fallback when the quota guard refuses a preference.
  */
-function resumeOf(ledger: Ledger, w: WorkloadRow, laneId: string): { model: string | null; resume: string | null; skipped: string | null; recovered: string | null } {
+function resumeOf(
+	ledger: Ledger, w: WorkloadRow, laneId: string, ignorePreference = false,
+): { model: string | null; source: LaneModelChoice["source"]; resume: string | null; skipped: string | null; recovered: string | null } {
 	const entries = ledger.entries(w.id);
 	const control = controlEntries(entries, holdersOf(entries, w.holder));
-	const model = laneModel(control);
+	const { model, source } = laneModelChoice(control, ignorePreference);
 	const resolved = resolutions(control, ledger.questions(w.id), ledger.instructions(w.id), ledger.slices(w.id));
 	const origin = resumeOrigin(control, laneId, resolved);
 	if (origin === null || regularRealpath(origin.session) !== null) {
-		return { model, ...resumePlan(control, laneId, resolved, model), recovered: null };
+		return { model, source, ...resumePlan(control, laneId, resolved, model), recovered: null };
 	}
 	const dir = join(laneDir(w.id, homeDir()), "sessions");
 	let newest: { path: string; canonical: string; mtime: number } | null = null;
@@ -351,7 +354,7 @@ function resumeOf(ledger: Ledger, w: WorkloadRow, laneId: string): { model: stri
 		}
 	}
 	const missing = `recorded session ${origin.session} is missing`;
-	if (newest === null) return { model, resume: null, skipped: `${missing}; no usable top-level workload session`, recovered: null };
+	if (newest === null) return { model, source, resume: null, skipped: `${missing}; no usable top-level workload session`, recovered: null };
 	let candidateLane: string | null = null;
 	for (let i = control.length - 1; i >= 0; i--) {
 		const candidate = sessionOrigin([control[i]!]);
@@ -363,9 +366,9 @@ function resumeOf(ledger: Ledger, w: WorkloadRow, laneId: string): { model: stri
 	const started = candidateLane === null ? null : laneStarted(control, candidateLane);
 	const ran = started === null ? undefined : started.model;
 	if (ran !== model) {
-		return { model, resume: null, skipped: `${missing}; newest ${newest.path} ran on ${ran === undefined ? "unknown" : ran ?? "default"}`, recovered: null };
+		return { model, source, resume: null, skipped: `${missing}; newest ${newest.path} ran on ${ran === undefined ? "unknown" : ran ?? "default"}`, recovered: null };
 	}
-	return { model, resume: newest.path, skipped: null, recovered: `${missing}; recovering newest workload session ${newest.path}` };
+	return { model, source, resume: newest.path, skipped: null, recovered: `${missing}; recovering newest workload session ${newest.path}` };
 }
 
 /** Existing regular files only: aliases may prove provenance, nonexistent paths never do. */
@@ -1289,7 +1292,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	 * wl-mv71x5rwdu7eo0 § 4).
 	 */
 	let readinessStage = "readiness";
-	/** Jo's named model for this spawn (`laneModel`), why a recorded session was not resumed, and what `get_state` reported (MIGRATION.md item 85). */
+	/** This spawn's model (`laneModelChoice`: Jo's, else the train's preference unless refused), why a recorded session was not resumed, and what `get_state` reported (MIGRATION.md item 85). */
 	let model: string | null = null;
 	let resumeSkipped: string | null = null;
 	let ranModel: string | null = null;
@@ -1636,20 +1639,27 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			const remainingWallMin = Math.max(0, ceiling.wallMin - wallMinutes(control, Date.now(), null));
 			const envMs = process.env[LANE_MAX_TIME_ENV]?.trim() ? maxTimeMs(maxTime) : null;
 			const shorter = envMs !== null && envMs < (maxTimeMs(ceilingMaxTime(remainingWallMin)) ?? Number.MAX_SAFE_INTEGER);
-			// Jo's named model and the session, read fresh at this spawn; a session recorded on another model is not resumed (item 85).
-			const start = resumeOf(ledger, w, laneId);
+			// Jo's named model (or the train's preference) and the session, read fresh at this spawn; a session recorded on another
+			// model is not resumed (item 85).
+			let start = resumeOf(ledger, w, laneId);
 			model = start.model;
-			resumeSkipped = start.skipped;
-			if (resumeSkipped !== null) process.stderr.write(`runner: ${laneId} starts a fresh session on ${model ?? "the profile default"}: ${resumeSkipped}\n`);
 			if (room.note !== null) process.stderr.write(`runner: ${laneId} quota guard open: ${room.note}\n`);
 			// Budget comparison can retain Jo's named source, never substitute it. An out decision still fails before any omp,
-			// and the catch below finalizes it as the runner (`failAfterReserve` by lane-runner).
+			// and the catch below finalizes it as the runner (`failAfterReserve` by lane-runner). The train's preference
+			// (`lane-model-preference:`) is no pin: refused, the lane falls back to ordinary routing, re-read without it.
 			if (model !== null) {
 				if (strongRowFailure !== null) process.stderr.write(`runner: ${laneId} quota guard comparison unavailable: the strong row could not be read: ${strongRowFailure}\n`);
 				const decision = room.decisionFor(model, strongRow);
 				if (decision.retained !== null) process.stderr.write(`runner: ${laneId} ${decision.retained}\n`);
-				if (decision.out !== null) throw new Fail(HEADROOM_STAGE, `named ${model}, ${decision.out}`, STARTER_EXIT["not-launchable"]!);
+				if (decision.out !== null) {
+					if (start.source !== "preference") throw new Fail(HEADROOM_STAGE, `named ${model}, ${decision.out}`, STARTER_EXIT["not-launchable"]!);
+					process.stderr.write(`runner: ${laneId} preferred ${model} refused (${decision.out}); falling back to ordinary routing\n`);
+					start = resumeOf(ledger, w, laneId, true);
+					model = start.model;
+				}
 			}
+			resumeSkipped = start.skipped;
+			if (resumeSkipped !== null) process.stderr.write(`runner: ${laneId} starts a fresh session on ${model ?? "the profile default"}: ${resumeSkipped}\n`);
 			argv = laneArgv({
 				worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, maxTime, resume: start.resume, model,
 				remainingWallMin: shorter ? null : remainingWallMin,

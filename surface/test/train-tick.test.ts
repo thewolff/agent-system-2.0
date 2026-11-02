@@ -18,7 +18,7 @@ import { errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
 import { apply, applyTrain, interpret } from "../src/input";
 import {
-	controlEntries, decideLaunch, laneExitBody, laneReadyBody, launchFailedBody, launchRequestedBody, landFirstBody, landFirstInstructionBody, mainRetryBody, mainRetryInstructionBody,
+	controlEntries, decideLaunch, laneExitBody, type LaneModelChoice, laneModelChoice, laneReadyBody, launchFailedBody, launchRequestedBody, landFirstBody, landFirstInstructionBody, mainRetryBody, mainRetryInstructionBody,
 	planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody,
 } from "../src/launch";
 import {
@@ -83,6 +83,32 @@ describe("settles and deliveries (D8, D10)", () => {
 		expect(fixes.map((f) => f.pr)).toEqual([101]);
 		expect(w.ledger.workload(fixes[0]!.workloadId)).toMatchObject({ status: "open", created_by: MERGE_TRAIN_BY });
 		expect(w.launches).toContain(fixes[0]!.workloadId);
+	});
+
+	test("trainFixModel set: the pass that opens a fix workload launches its first lane with the preference already recorded; unset, the opening rows are today's", () => {
+		const SOL = "openai-codex/gpt-6.1-sol";
+		for (const trainFixModel of [SOL, null, undefined]) {
+			const w = world();
+			w.task(101);
+			w.ledger.closeWorkload(w.owner, { by: SURFACE_BY });
+			const seen = new Map<string, LaneModelChoice>();
+			tick({
+				ledger: w.ledger, gh: w.g.gh, notify: () => true, ...(trainFixModel === undefined ? {} : { trainFixModel }),
+				launch: (wl) => {
+					seen.set(wl, laneModelChoice(controlEntries(w.ledger.entries(wl))));
+					return { code: 0, line: `launched ${wl}` };
+				},
+			});
+			const fix = fixBindings(w.ledger)[0]!.workloadId;
+			// the fix workload's first launcher ran in the same pass that opened it
+			expect(seen.get(fix)).toEqual(trainFixModel ? { model: SOL, source: "preference" } : { model: null, source: null });
+			const prefixes = controlEntries(w.ledger.entries(fix)).map((c) => c.prefix);
+			expect(prefixes.slice(0, prefixes.indexOf("launch-requested") + 1)).toEqual(
+				trainFixModel ? ["repo", "done", "train-fix", "push-dest", "lane-model-preference", "launch-requested"] : ["repo", "done", "train-fix", "push-dest", "launch-requested"],
+			);
+			// no lane-model: by anyone: Jo's word stays Jo's
+			expect(prefixes).not.toContain("lane-model");
+		}
 	});
 
 	test("the 2 h rule reads GitHub's push activity on the head branch, and waits while that listing cannot be read (review gtb-r2 F2)", () => {
