@@ -435,7 +435,7 @@ describe("stale-backup: the newest write runs ahead of the newest copy by more t
 
 	test("a missing directory with a fresh ledger is ok: no copy yet, and every write (18:00 to 20:50) is within the gap of the first", () => {
 		const dir = join(tmp("backups-none"), "missing");
-		expect(backupState(db, dir, BACKUP_GAP_MS, AS_OF)).toEqual({ state: "ok", dir, copy: null, behindMs: 170 * 60_000 });
+		expect(backupState(db, dir, BACKUP_GAP_MS, AS_OF)).toEqual({ state: "ok", dir, copy: null, behindMs: 170 * 60_000, rejected: [] });
 	});
 
 	// Review r6 F16: existsSync is false when the parent cannot be searched (EACCES), so a check through it read such a
@@ -469,6 +469,14 @@ describe("stale-backup: the newest write runs ahead of the newest copy by more t
 		expect(f.key).toBe("stale-backup:none");
 		expect(f.since).toBe("2026-10-11T18:00:00.000Z");
 		expect(f.text).toContain(`no ledger backup at or before 2026-10-14T21:00:00.000Z (first ledger write 2026-10-11T18:00:00.000Z); not counted, not a complete copy: ${newestName} (empty file), ${oldCopy} (empty file) in ${dir}`);
+	});
+
+	test("review r7 F19: within the gap, an ok result still names every copy it did not count and why", () => {
+		const newestName = "ledger-2026-10-11T20-55-00.000Z.db";
+		const dir = tmp("backups-ok-rejected");
+		writeFileSync(join(dir, newestName), "");
+		const b = backupState(db, dir, BACKUP_GAP_MS, AS_OF);
+		expect(b).toEqual({ state: "ok", dir, copy: null, behindMs: 170 * 60_000, rejected: [`${newestName} (empty file)`] });
 	});
 
 	test("a newer file ending .invalid (the writer's quarantine) is never a candidate, even when its contents are a complete copy", () => {

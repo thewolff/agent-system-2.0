@@ -223,6 +223,8 @@ export type Run = (argv: readonly string[], env?: Record<string, string | undefi
 
 /** The filesystem reads and the one write the doctor makes, injectable so dependency checks never touch system files in tests. */
 export interface DoctorFs {
+	/** True when the path is there, false when it is not (ENOENT, ENOTDIR); any other error (EACCES) throws, so a check
+	 * through it fails with the real error instead of calling the file missing (review r7 F17). */
 	exists(path: string): boolean;
 	/** A regular file this user may execute. */
 	executable(path: string): boolean;
@@ -480,7 +482,15 @@ export function checkDeps(deps: DoctorDeps, row: JobRow, plist: Plist): PartResu
 		args.forEach((a: string, i) => {
 			if (!a.startsWith("/")) return;
 			checked++;
-			if (i === 0 ? !deps.fs.executable(a) : !deps.fs.exists(a)) missing.push(i === 0 ? `${a} (ProgramArguments[0]) is not an executable file` : `${a} (ProgramArguments[${i}]) does not exist`);
+			let present: boolean;
+			let why = "";
+			try {
+				present = i === 0 ? deps.fs.executable(a) : deps.fs.exists(a);
+			} catch (e) {
+				present = false;
+				why = clip(errText(e));
+			}
+			if (!present) missing.push(why ? `${a} (ProgramArguments[${i}]) could not be checked: ${why}` : i === 0 ? `${a} (ProgramArguments[0]) is not an executable file` : `${a} (ProgramArguments[${i}]) does not exist`);
 		});
 	}
 	const env = plist.EnvironmentVariables;
@@ -615,7 +625,10 @@ function readLedger(deps: DoctorDeps, ledger: Ledger): PartResult[] {
 	try {
 		dir = backupDir(deps.ledgerPath);
 		const b = backupState(ledger.db, dir, BACKUP_GAP_MS, iso(deps.now()));
-		if (b.state === "ok") out.push(pass("backup", b.copy ? `newest complete copy ${b.copy.name}; ledger writes ${age(b.behindMs)} past it (gap ${age(BACKUP_GAP_MS)})` : `no copy yet, and every write is within ${age(BACKUP_GAP_MS)} of the first`));
+		if (b.state === "ok") {
+			const rejected = b.rejected.length ? `; not counted, not a complete copy: ${b.rejected.join(", ")}` : "";
+			out.push(pass("backup", (b.copy ? `newest complete copy ${b.copy.name}; ledger writes ${age(b.behindMs)} past it (gap ${age(BACKUP_GAP_MS)})` : `no complete copy yet, and every write is within ${age(BACKUP_GAP_MS)} of the first`) + rejected));
+		}
 		else if (b.state === "stale") out.push(fail("backup", b.finding.text, kick));
 		else out.push(fail("backup", `unjudged: ${b.why}`, `fix access to ${dir}, then ${kick}`));
 	} catch (e) {
@@ -1423,7 +1436,15 @@ export function realRun(baseEnv: Record<string, string | undefined>): Run {
 }
 
 export const realFs: DoctorFs = {
-	exists: (p) => existsSync(p),
+	exists: (p) => {
+		try {
+			statSync(p);
+			return true;
+		} catch (e) {
+			if (e instanceof Error && "code" in e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return false;
+			throw e;
+		}
+	},
 	executable: (p) => {
 		try {
 			accessSync(p, constants.X_OK);

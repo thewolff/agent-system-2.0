@@ -10,7 +10,7 @@ import { main as doctorMain } from "../scripts/doctor";
 import { main as trainTickMain, type MainDeps } from "../scripts/train-tick";
 import {
 	backupDir, checkCtx, checkDeps, checkDisk, checkGh, checkJob, checkLedger, checkMailbox, checkMcp, checkParts, checkSeat, CLAIM_MS, type DoctorDeps, type DoctorFs, doctorControl, doctorTick, JOB_INVENTORY,
-	type JobRow, ledgerDownPath, ledgerDownPopup, type PartResult, pendingDowns, popupLogPath, popupRun, type ProbeResult, runAfterRestart, runDefault, type RunOutcome, settleAndSpawn, settleClaims, spawnPopupProcess, thenClose,
+	type JobRow, ledgerDownPath, ledgerDownPopup, type PartResult, pendingDowns, popupLogPath, popupRun, type ProbeResult, realFs, runAfterRestart, runDefault, type RunOutcome, settleAndSpawn, settleClaims, spawnPopupProcess, thenClose,
 } from "../src/doctor";
 import { type DoctorRecord, formatDoctor, parseDoctor, POPUP_ATTEMPT_LIMIT, popupAttempts } from "../src/doctor-entries";
 import { doctorLines } from "../src/errors";
@@ -1444,5 +1444,57 @@ describe("review r4 F12: every executable a job reaches by call path is in its r
 
 	test("scratch-sweep: its du, and the archive step's tar and lsof (surface/src/scratch-archive.ts)", () => {
 		expectNamed("scratch-sweep", ["du", "tar", "lsof"], []);
+	});
+});
+
+describe("review r7: an access error is never read as a missing file", () => {
+	test("F17: an installed plist that cannot be stat'd fails job:<label> with the error, never 'missing' or 'not installed'", async () => {
+		const f = fake();
+		const exists = f.deps.fs.exists;
+		const denied = join(f.home, "Library");
+		f.deps.fs.exists = (p) => {
+			if (p.startsWith(denied)) throw Object.assign(new Error(`EACCES: permission denied, stat '${p}'`), { code: "EACCES" });
+			return exists(p);
+		};
+		const rs = await checkParts(f.deps, new Set(["jobs"]));
+		for (const name of ["ledger-backup", "train-tick", "chaos"]) {
+			const r = only(rs, `job:${name}`)[0]!;
+			expect(r.verdict).toBe("fail");
+			expect(r.evidence).toContain("EACCES");
+			expect(r.evidence).not.toContain("is missing");
+		}
+	});
+
+	test("F17: realFs.exists is false only for a path that is not there; a path under an unsearchable directory throws", () => {
+		const parent = tmp("doctor-r7-access");
+		const inner = join(parent, "Library");
+		mkdirSync(inner);
+		writeFileSync(join(inner, "x.plist"), "");
+		expect(realFs.exists(join(inner, "x.plist"))).toBe(true);
+		expect(realFs.exists(join(inner, "absent.plist"))).toBe(false);
+		expect(realFs.exists(join(inner, "x.plist", "under-a-file"))).toBe(false);
+		if (process.getuid?.() === 0) return; // root searches a mode-000 directory, so the denial cannot be made
+		chmodSync(inner, 0o000);
+		try {
+			expect(() => realFs.exists(join(inner, "x.plist"))).toThrow("EACCES");
+		} finally {
+			chmodSync(inner, 0o755);
+		}
+	});
+
+	test("F18: a ProgramArguments path that cannot be checked fails deps:<job> with the error, not 'does not exist'", () => {
+		const f = fake();
+		const r = row("train-tick");
+		for (const a of r.absolute) f.files.set(a, { text: "", mtimeMs: 0, exec: true });
+		for (const n of r.pathNames) f.files.set(`/opt/job/${n}`, { text: "", mtimeMs: 0, exec: true });
+		const exists = f.deps.fs.exists;
+		f.deps.fs.exists = (p) => {
+			if (p === "/denied/train-tick.ts") throw Object.assign(new Error(`EACCES: permission denied, stat '${p}'`), { code: "EACCES" });
+			return exists(p);
+		};
+		const d = checkDeps(f.deps, r, { ProgramArguments: ["/bin/bun", "/denied/train-tick.ts"], EnvironmentVariables: { PATH: "/opt/job" } });
+		expect(d.verdict).toBe("fail");
+		expect(d.evidence).toContain("/denied/train-tick.ts (ProgramArguments[1]) could not be checked: EACCES");
+		expect(d.evidence).not.toContain("does not exist");
 	});
 });

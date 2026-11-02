@@ -695,7 +695,7 @@ export function check(input: Input): Report {
 
 /** stale-backup's judgement of the ledger's scheduled copies (`backupState`): within the gap, a finding, or why it could not be judged. */
 export type BackupState =
-	| { state: "ok"; dir: string; copy: { name: string; at: string } | null; behindMs: number }
+	| { state: "ok"; dir: string; copy: { name: string; at: string } | null; behindMs: number; rejected: string[] }
 	| { state: "stale"; finding: Finding }
 	| { state: "unjudged"; why: string };
 
@@ -743,7 +743,7 @@ export function backupState(db: Database, dir: string, gapMs: number, asOf: stri
 	// With no complete copy at all, nothing since the ledger's first write is captured.
 	const capturedAt = newestCopy?.at ?? oldest;
 	const behindMs = newest && capturedAt ? Date.parse(newest) - Date.parse(capturedAt) : 0;
-	if (behindMs <= gapMs) return { state: "ok", dir, copy: newestCopy ?? null, behindMs };
+	if (behindMs <= gapMs) return { state: "ok", dir, copy: newestCopy ?? null, behindMs, rejected };
 	const copyText = (newestCopy
 		? `newest ledger backup ${newestCopy.at} (${newestCopy.name})`
 		: `no ledger backup at or before ${asOf} (first ledger write ${oldest})`)
