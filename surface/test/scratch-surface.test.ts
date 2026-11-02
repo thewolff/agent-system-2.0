@@ -5,7 +5,7 @@
 // archives the root once the row has closed and only then removes it, keeping a root whose archive
 // fails and refusing a root that is a symlink.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { chmodSync, closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { Ledger } from "../../ledger/src/index";
@@ -15,7 +15,7 @@ import * as laneRow from "../extensions/lane";
 import * as laneScript from "../scripts/lane";
 import { errorLines } from "../src/errors";
 import { closeScratchRoot } from "../src/close-entry";
-import { archiveDetached, archivePathFor, purgeArchived, scratchArchiveBase } from "../src/scratch-archive";
+import { ARCHIVE_DEADLINE_MS, archiveDetached, archivePathFor, purgeArchived, scratchArchiveBase } from "../src/scratch-archive";
 import { ensureStandingWorkload } from "../src/identity";
 import { ensureScratchRoot } from "../src/scratch-root";
 import * as launch from "../src/launch";
@@ -655,6 +655,135 @@ describe("orchestrator_close_workload archives the root, then removes it, after 
 			expect(readFileSync(join(dir, "sub", "late.md"), "utf8")).toBe("late");
 			expect(lstatSync(join(dir, "sub")).mode & 0o7777).toBe(0o700);
 			expect(readdirSync(dir).filter((n) => n.startsWith(".as2-purge-"))).toEqual([]);
+		});
+	});
+
+	describe("the archive's progress deadline and its failure reports (archiveDetached, purgeArchived)", () => {
+		const reEscape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		/** A detached-looking tree with a deliverable and a subdirectory, the archive path for it, and its modes now. */
+		function tree(tag: string) {
+			const dir = join(tmp(tag), `.removing-wl-${tag}-0123456789abcdef`);
+			mkdirSync(join(dir, "sub"), { recursive: true, mode: 0o700 });
+			writeFileSync(join(dir, "REPORT.md"), "aaaa");
+			writeFileSync(join(dir, "sub", "f"), "f");
+			const archiveDir = tmp(`${tag}-archive`);
+			const modes = (): number[] => [dir, join(dir, "sub"), join(dir, "REPORT.md"), join(dir, "sub", "f")].map((p) => lstatSync(p).mode & 0o7777);
+			return { dir, archiveDir, dest: join(archiveDir, `wl-${tag}.tar.gz`), modes, had: modes() };
+		}
+
+		test("a file a leftover writer keeps appending to while it is hashed fails the archive at the size its lstat recorded; the tree is kept", () => {
+			const { dir, archiveDir, dest } = tree("grow");
+			const big = join(dir, "big.log");
+			writeFileSync(big, Buffer.alloc(MIB + MIB / 2, 0x61));
+			// The writer: 1 MiB appended each time the archive reads its clock (after every entry and every 1 MiB hashed), at
+			// most 32 times. Without the size bound the hash would chase it to the last append and the archive would go on.
+			let appends = 0;
+			try {
+				const a = archiveDetached(dir, dest, {
+					openFiles: () => ({ kind: "none" }),
+					clock: () => {
+						if (appends < 32) {
+							appends++;
+							appendFileSync(big, Buffer.alloc(MIB, 0x62));
+						}
+						return 0;
+					},
+				});
+				expect(a.kind).toBe("failed");
+				expect(a.kind === "failed" && a.reason).toMatch(new RegExp(`^${reEscape(big)} grew while it was hashed \\(over \\d+ bytes recorded\\)$`));
+				expect(appends).toBeLessThan(32);
+				expect(readFileSync(join(dir, "REPORT.md"), "utf8")).toBe("aaaa");
+				expect(readdirSync(archiveDir)).toEqual([]);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		test("past its deadline after the freeze, the archive fails at the next entry read: the archive is dropped and the tree kept with its modes", () => {
+			const { dir, archiveDir, dest, modes, had } = tree("deadline");
+			// The progress deadline is the timing under test, driven by the fake clock `clock`; nothing here reads the wall clock.
+			let now = 0;
+			const clock = () => now;
+			const a = archiveDetached(dir, dest, {
+				openFiles: () => ({ kind: "none" }),
+				clock,
+				afterFreeze: () => {
+					now += ARCHIVE_DEADLINE_MS + 1;
+				},
+			});
+			expect(ARCHIVE_DEADLINE_MS).toBe(15 * 60_000);
+			expect(a.kind === "failed" && a.reason).toBe(`archiving ${dir} passed its 15 min deadline at reading ${dir}; the tree is kept; the archive ${dest} was dropped`);
+			expect(modes()).toEqual(had);
+			expect(readFileSync(join(dir, "REPORT.md"), "utf8")).toBe("aaaa");
+			expect(readdirSync(archiveDir)).toEqual([]);
+		});
+
+		test("past its deadline after a 1 MiB chunk of a hash, the archive fails there: the partial is removed and the tree kept", () => {
+			const { dir, archiveDir, dest, modes, had } = tree("deadline-hash");
+			// The progress deadline is the timing under test, driven by the fake clock `clock` (advanced when the verification
+			// copy is removed, right before the archive itself is hashed); nothing here reads the wall clock.
+			let now = 0;
+			const clock = () => now;
+			const a = archiveDetached(dir, dest, {
+				openFiles: () => ({ kind: "none" }),
+				clock,
+				deadlineMs: 60_000,
+				removeCopy: (copy) => {
+					rmSync(copy, { recursive: true });
+					now += 60_001;
+					return null;
+				},
+			});
+			expect(a.kind === "failed" && a.reason).toMatch(new RegExp(`^archiving ${reEscape(dir)} passed its 1 min deadline at hashing ${reEscape(dest)}\\.partial-[0-9a-f]{12}; the tree is kept$`));
+			expect(modes()).toEqual(had);
+			expect(readdirSync(archiveDir)).toEqual([]);
+		});
+
+		test("past its deadline while a staged file is hashed, the purge stops: the file is put back, the staging directory goes and every mode comes back", () => {
+			const { dir, dest, had, modes } = tree("purge-deadline");
+			// The progress deadline is the timing under test, driven by the fake clock `clock` (advanced right before
+			// REPORT.md is staged); nothing here reads the wall clock.
+			let now = 0;
+			const clock = () => now;
+			const a = archiveDetached(dir, dest, { openFiles: () => ({ kind: "none" }), clock });
+			expect(a.kind).toBe("archived");
+			if (a.kind !== "archived") return;
+			const r = purgeArchived({ kind: "detached", path: dir, doomed: dir }, a, {
+				clock,
+				beforeStage: (path) => {
+					if (path.endsWith("/REPORT.md")) now += ARCHIVE_DEADLINE_MS + 1;
+				},
+			});
+			expect(r.kind).toBe("failed");
+			expect(r.kind === "failed" && r.error).toMatch(
+				new RegExp(`^removing ${reEscape(dir)}: \\./REPORT\\.md could not be checked; kept, put back; the purge passed its 15 min deadline at hashing ${reEscape(dir)}/\\.as2-purge-[0-9a-f]{16}/\\d+; nothing more is removed; every archived entry left has its mode back$`),
+			);
+			expect(readFileSync(join(dir, "REPORT.md"), "utf8")).toBe("aaaa");
+			expect(readdirSync(dir).filter((n) => n.startsWith(".as2-purge-"))).toEqual([]);
+			expect(lstatSync(dir).mode & 0o7777).toBe(had[0]!);
+			expect(lstatSync(join(dir, "REPORT.md")).mode & 0o7777).toBe(had[2]!);
+			if (existsSync(join(dir, "sub"))) expect(modes()).toEqual(had);
+		});
+
+		test("a verification copy that could not be removed is still reported when a later step fails the archive: both reasons reach the result", () => {
+			const { dir, dest, modes, had } = tree("copy-left");
+			let left = "";
+			try {
+				const a = archiveDetached(dir, dest, {
+					removeCopy: (copy) => {
+						left = copy;
+						return `the verification copy ${copy} could not be removed (EACCES: permission denied, rmdir)`;
+					},
+					openFiles: () => ({ kind: "open", holders: ["pid 1 has x open"] }),
+				});
+				expect(left).not.toBe("");
+				expect(a.kind === "failed" && a.reason).toBe(
+					`${dir} is not proven quiet: a process still has files open in it (pid 1 has x open), so it could still be written; the verification copy ${left} could not be removed (EACCES: permission denied, rmdir); the archive ${dest} was dropped`,
+				);
+				expect(modes()).toEqual(had);
+			} finally {
+				if (left) rmSync(left, { recursive: true, force: true });
+			}
 		});
 	});
 

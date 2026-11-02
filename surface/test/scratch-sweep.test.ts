@@ -587,6 +587,27 @@ describe("scratch sweep: archives (expiry, offsite gate, failures) and the disk 
 		expect(readFileSync(join(w.base, closed, "repo", "src", "a.ts"), "utf8")).toBe("rewritten");
 	});
 
+	test("the archive table says a root whose purge failed was archived, not removed, and why the removal failed", () => {
+		const w = world();
+		const closed = open(w);
+		w.ledger.closeWorkload(closed, { by: "orchestrator-surface" });
+		root(w, closed);
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW, {
+			archive: () => ({
+				beforeStage: (path) => {
+					if (!path.endsWith("/repo/src/a.ts")) return;
+					unlinkSync(path);
+					writeFileSync(path, "rewritten");
+				},
+			}),
+		});
+		expect(r.roots.find((x) => x.name === closed)!.action).toBe("remove failed");
+		const row = r.report.split("\n").find((l) => l.startsWith(`| ${r.archived[0]!.archive.path} |`));
+		expect(row).toStartWith(`| ${r.archived[0]!.archive.path} | ${r.archived[0]!.archive.bytes} | written | root ${closed} archived, removal failed: removing `);
+		expect(row).toContain("./repo/src/a.ts was replaced (another inode); kept, put back; nothing more was removed; every archived entry left has its mode back; ");
+		expect(r.report).not.toContain(`root ${closed} removed`);
+	});
+
 	test("a descriptor held open into a root across its archive keeps the root (archive failed, renamed back, exit 1); the other roots still go", () => {
 		const w = world();
 		const held = open(w);
@@ -656,6 +677,18 @@ describe("scratch sweep: archives (expiry, offsite gate, failures) and the disk 
 		expect(ok.exit).toBe(0);
 		expect(diskEntries(w)).toHaveLength(2);
 		expect(diskEntries(w)[1]!).toStartWith("scratch-disk-ok: ");
+	});
+
+	test("free space that cannot be measured never clears an open disk guard: no scratch-disk-ok:, and the report names the failed measurement", () => {
+		const w = world();
+		const GIB = 1024 ** 3;
+		runSweep(argsOf(w, { minFreeGib: 20 }), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW, { freeBytes: () => 5 * GIB });
+		expect(diskEntries(w)).toHaveLength(1);
+		const unknown = runSweep(argsOf(w, { minFreeGib: 20 }), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW, { freeBytes: () => null });
+		expect(diskEntries(w)).toHaveLength(1);
+		expect(diskEntries(w)[0]!).toStartWith("scratch-disk: ");
+		expect(unknown.report).toContain(`- free on the scratch volume: unknown: the free space on ${w.base} could not be read (statfs failed)`);
+		expect(unknown.report).toContain(`- ledger: the free space on ${w.base} could not be measured, so the open \`scratch-disk:\` stays open; no entry written`);
 	});
 
 	test("the CLI reads scratchArchive from $AGENT_SYSTEM_SCRATCH_CONFIG; a malformed key falls back to its default with a report note", () => {

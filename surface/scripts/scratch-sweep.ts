@@ -42,7 +42,8 @@
 //     space on the scratch volume is under `scratchArchive.minFreeGib` (default 20), one `scratch-disk:` entry on the
 //     standing workload (a needs-you line), at most one while it is open: the newest `scratch-disk:` /
 //     `scratch-disk-ok:` entry this sweep wrote is the state. A later run with both back within bounds writes
-//     `scratch-disk-ok:`, which clears the line.
+//     `scratch-disk-ok:`, which clears the line; free space that cannot be measured is not back within bounds, so an
+//     open entry stays open and the report says the measurement failed.
 //
 // The `scratchArchive:` block is read from $AGENT_SYSTEM_SCRATCH_CONFIG, else the installed profile config under
 // <home> (surface/src/scratch-archive.ts readScratchArchiveConfig); a missing block or key is its default.
@@ -203,6 +204,8 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 	const base = scratchBase(args.home);
 	const roots: RootLine[] = [];
 	const archived: { name: string; archive: Archived }[] = [];
+	/** Why the purge of an archived root failed, by name: the archive table says the root was archived, not removed. */
+	const removalFailed = new Map<string, string>();
 
 	let baseReal: string | null = null;
 	try {
@@ -316,8 +319,10 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 			const r = purgeArchived(d, a, seams);
 			if (r.kind === "removed") return { name, sizeKib, action: "removed", why: a.warnings.length ? `${why}; ${a.warnings.join("; ")}` : why };
 			failed = true;
+			const reason = r.kind === "refused" ? `refused at removal: ${r.reason}` : r.error;
+			removalFailed.set(name, reason);
 			const back = restoreDetached(d);
-			return { name, sizeKib, action: "remove failed", why: `${why}; archived to ${a.path}, then ${r.kind === "refused" ? `refused at removal: ${r.reason}` : r.error}; ${back.said}; what is left is at ${back.at}` };
+			return { name, sizeKib, action: "remove failed", why: `${why}; archived to ${a.path}, then ${reason}; ${back.said}; what is left is at ${back.at}` };
 		}
 		if (ledger) state = diskState(ledger.workload(STANDING_WORKLOAD_ID) ? ledger.entries(STANDING_WORKLOAD_ID, "assumption") : []);
 	} finally {
@@ -396,6 +401,8 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 	let entryLine: string;
 	if (totalKib === null && !low) entryLine = "the remaining total could not be measured; no entry written";
 	else if (!ledger) entryLine = "the ledger could not be read; no entry written";
+	// Clearing needs both the total and the free space back within bounds; unmeasured free space proves neither way.
+	else if (!over && free === null && state === "open") entryLine = `the free space on ${freeAt} could not be measured, so the open \`${SCRATCH_ENTRY.disk}\` stays open; no entry written`;
 	else if (over === (state === "open")) entryLine = over ? "already open (one `scratch-disk:` entry while open); nothing written" : "nothing to write";
 	else {
 		const why: string[] = [];
@@ -448,7 +455,10 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 	if (archived.length === 0 && expired.length === 0) out.push("none");
 	else {
 		out.push("| archive | bytes | action | why |", "|---|---|---|---|");
-		for (const { name, archive } of archived) out.push(`| ${cell(archive.path)} | ${archive.bytes} | written | root ${cell(name)} removed; ${archive.entries} members, sha256 ${archive.sha256} |`);
+		for (const { name, archive } of archived) {
+			const removal = removalFailed.get(name);
+			out.push(`| ${cell(archive.path)} | ${archive.bytes} | written | root ${cell(name)} ${removal === undefined ? "removed" : cell(`archived, removal failed: ${removal}`)}; ${archive.entries} members, sha256 ${archive.sha256} |`);
+		}
 		for (const l of expired) out.push(`| ${cell(l.path)} | ${l.bytes ?? "-"} | ${l.action} | ${cell(l.why)} |`);
 	}
 	out.push(
@@ -458,7 +468,7 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 		"## remaining",
 		"",
 		`- total under the base: ${totalKib === null ? "unknown" : `${totalKib} KiB (${mib(totalKib)} MiB), ${totalOver ? "over" : "at or under"} ${thresholdMb} MiB`}`,
-		`- free on the scratch volume: ${free === null ? "unknown" : `${gib(free)} GiB, ${low ? "under" : "at or over"} ${args.archive.minFreeGib} GiB`}`,
+		`- free on the scratch volume: ${free === null ? `unknown: the free space on ${freeAt} could not be read (statfs failed)` : `${gib(free)} GiB, ${low ? "under" : "at or over"} ${args.archive.minFreeGib} GiB`}`,
 		`- ledger: ${entryLine}`,
 		"",
 		"## legacy places (sized, never deleted)",

@@ -26,6 +26,14 @@
 // archived SHA-256 or target) before its unlink, and a directory goes only by rmdir. What stays open is a process that
 // chmods the tree back, one running as root, and one that works in the purge's staging directory (`.as2-purge-<16 hex>`,
 // made 0700 after the freeze).
+// Progress deadline: the archive of one root (steps 1–8) and its purge each get ARCHIVE_DEADLINE_MS on an injectable
+// clock, checked after every manifest entry read and every 1 MiB hashed (`progressDeadline`); past it the work stops
+// through its own failure path (the archive's `fail`, the purge's put-back and mode restore), so the tree is kept. A
+// file is hashed only up to the size its lstat recorded, so a writer still appending fails the read instead of keeping
+// it going. The residual: the check runs between reads, so a single read, lstat or readdir syscall that never returns
+// (a hung filesystem) cannot be bounded in-process; the tar and lsof runs are bounded by their own timeouts, and
+// `freezeTree` (stat and chmod per entry, no reads of contents) is not checked, because a stop part way through it
+// would leave modes its failure path cannot give back.
 // The daily sweep (surface/scripts/scratch-sweep.ts) expires archives older than `scratchArchive.expireDays`, and, when
 // `scratchArchive.requireOffsite` is on, only those with an `<archive>.offsite` marker beside them (written by an offsite
 // copy job once its copy is confirmed).
@@ -50,6 +58,8 @@ const PARTIAL_RE = /\.tar\.gz\.partial-[0-9a-f]{12}$/;
 const VERIFY_PREFIX = ".verify-";
 /** Upper bound on one `tar` run (create or extract). */
 const TAR_TIMEOUT_MS = 15 * 60_000;
+/** The progress deadline of one root's archive (`archiveDetached`), and separately of its purge (`purgeArchived`). */
+export const ARCHIVE_DEADLINE_MS = 15 * 60_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const GIB = 1024 ** 3;
 /** Free space an archive must leave on its volume, beyond the archive and its verification copy. */
@@ -156,9 +166,11 @@ export type Manifest = Map<string, ManifestEntry>;
 
 /**
  * Every entry under `dir` (itself included; links are recorded, never followed), with regular files hashed when `hash`.
- * Throws when an entry cannot be read, or is a socket, FIFO or device (tar cannot be trusted to round-trip one).
+ * Throws when an entry cannot be read, or is a socket, FIFO or device (tar cannot be trusted to round-trip one), when a
+ * file grows while it is hashed, and when `check` (a progress deadline, run after every entry and every 1 MiB hashed)
+ * throws.
  */
-export function readManifest(dir: string, hash: boolean): Manifest {
+export function readManifest(dir: string, hash: boolean, check: ProgressCheck = () => {}): Manifest {
 	const out: Manifest = new Map();
 	const stack: string[] = [""];
 	while (stack.length > 0) {
@@ -167,11 +179,12 @@ export function readManifest(dir: string, hash: boolean): Manifest {
 		const st: BigIntStats = lstatSync(abs, { bigint: true });
 		const type = st.isFile() ? "file" : st.isDirectory() ? "dir" : st.isSymbolicLink() ? "link" : null;
 		if (type === null) throw new Error(`${abs} is a socket, FIFO or device; not archivable`);
+		const size = type === "file" ? Number(st.size) : 0;
 		out.set(rel, {
 			type,
-			size: type === "file" ? Number(st.size) : 0,
+			size,
 			mode: Number(st.mode & 0o7777n),
-			sha256: type === "file" && hash ? sha256File(abs) : null,
+			sha256: type === "file" && hash ? sha256File(abs, size, check) : null,
 			target: type === "link" ? readlinkSync(abs) : null,
 			dev: st.dev,
 			ino: st.ino,
@@ -179,8 +192,26 @@ export function readManifest(dir: string, hash: boolean): Manifest {
 			ctimeNs: st.ctimeNs,
 		});
 		if (type === "dir") for (const name of readdirSync(abs)) stack.push(rel === "" ? name : `${rel}/${name}`);
+		check(`reading ${abs}`);
 	}
 	return out;
+}
+
+/** A progress deadline's check: throws once the deadline has passed; `step` says where the work was. */
+export type ProgressCheck = (step: string) => void;
+
+/**
+ * The progress deadline of one root's archive or purge: `seams.deadlineMs` (ARCHIVE_DEADLINE_MS) from now on
+ * `seams.clock` (Date.now). The check it returns throws `<what> passed its <m> min deadline at <step>; <then>` once the
+ * clock is past it. It runs between syscalls, so one that never returns is not bounded by it (see the top of this file).
+ */
+function progressDeadline(what: string, then: string, seams: PurgeSeams): ProgressCheck {
+	const clock = seams.clock ?? Date.now;
+	const ms = seams.deadlineMs ?? ARCHIVE_DEADLINE_MS;
+	const end = clock() + ms;
+	return (step) => {
+		if (clock() > end) throw new Error(`${what} passed its ${Number((ms / 60_000).toFixed(2))} min deadline at ${step}; ${then}`);
+	};
 }
 
 const shown = (rel: string): string => (rel === "" ? "the top directory" : `./${rel}`);
@@ -267,6 +298,8 @@ export interface ArchiveSeams extends PurgeSeams {
 	beforeChmod?: (path: string) => void;
 	/** Replaces the lsof read of what is open under a tree (`openFilesUnder`). */
 	openFiles?: (dir: string) => OpenFiles;
+	/** Replaces the removal of the verification copy (`removeCopy`): what could not be removed, or null. */
+	removeCopy?: (dir: string) => string | null;
 }
 
 /** What lsof shows open under a directory: nothing, these files, or that it could not be shown. */
@@ -313,16 +346,23 @@ export function stillOpen(dir: string, seams: ArchiveSeams = {}): string | null 
 	return `no writer could be ruled out: ${o.reason}`;
 }
 
-/** SHA-256 of the file at `path`, read in 1 MiB chunks. */
-function sha256File(path: string): string {
+/**
+ * SHA-256 of the file at `path`, read in 1 MiB chunks, `check` run after each. `size` is the size its lstat recorded:
+ * reading more than that throws, so a writer still appending to the file cannot keep the read going.
+ */
+function sha256File(path: string, size: number, check: ProgressCheck): string {
 	const hash = createHash("sha256");
 	const fd = openSync(path, "r");
 	try {
 		const buf = Buffer.allocUnsafe(1024 * 1024);
+		let read = 0;
 		for (;;) {
 			const n = readSync(fd, buf, 0, buf.length, null);
 			if (n === 0) break;
+			read += n;
+			if (read > size) throw new Error(`${path} grew while it was hashed (over ${size} bytes recorded)`);
 			hash.update(buf.subarray(0, n));
+			check(`hashing ${path}`);
 		}
 	} finally {
 		closeSync(fd);
@@ -388,17 +428,22 @@ function removeCopy(dir: string): string | null {
 /**
  * Archive the detached tree `dir` to `dest` (or the first free `.<n>` variant of it), verify it and freeze the tree (steps
  * 1–8 at the top of this file). On success the tree is left frozen for `purgeArchived`. Never throws; on failure the tree's
- * modes are given back and nothing is left under the destination but what was there.
+ * modes are given back and nothing is left under the destination but what was there. A failure's reason carries every
+ * earlier warning (a verification copy that could not be removed) and every cleanup that failed. Bounded by the progress
+ * deadline (`seams.clock`, `seams.deadlineMs`; ARCHIVE_DEADLINE_MS): past it, the archive fails with `archiving <dir>
+ * passed its <m> min deadline at <step>; the tree is kept`. A single syscall that never returns is not bounded by it.
  */
 export function archiveDetached(dir: string, dest: string, seams: ArchiveSeams = {}): ArchiveResult {
 	let partial: string | null = null;
 	let copy: string | null = null;
 	let linked: string | null = null;
 	let thawed: [string, number][] | null = null;
+	const warnings: string[] = [];
+	const dropCopy = seams.removeCopy ?? removeCopy;
 	const fail = (reason: string): ArchiveResult => {
-		const also: string[] = [];
+		const also: string[] = [...warnings];
 		if (copy) {
-			const r = removeCopy(copy);
+			const r = dropCopy(copy);
 			if (r) also.push(r);
 		}
 		for (const [what, p] of [["partial archive", partial], ["archive", linked]] as const) {
@@ -417,7 +462,8 @@ export function archiveDetached(dir: string, dest: string, seams: ArchiveSeams =
 		return { kind: "failed", reason: also.length ? `${reason}; ${also.join("; ")}` : reason };
 	};
 	try {
-		const before = readManifest(dir, true);
+		const check = progressDeadline(`archiving ${dir}`, "the tree is kept", seams);
+		const before = readManifest(dir, true, check);
 		let bytes = 0;
 		for (const e of before.values()) bytes += e.size;
 		const at = dirname(dest);
@@ -435,14 +481,13 @@ export function archiveDetached(dir: string, dest: string, seams: ArchiveSeams =
 		mkdirSync(copy, { mode: 0o700 });
 		const out = tar(["-xzpf", partial, "-C", copy]);
 		if (out) return fail(`verifying ${partial}: ${out}`);
-		const diff = contentDiff(before, readManifest(copy, true));
+		const diff = contentDiff(before, readManifest(copy, true, check));
 		if (diff.length > 0) return fail(`the archive does not hold the tree: ${diff.join("; ")}`);
-		const warnings: string[] = [];
-		const left = removeCopy(copy);
+		const left = dropCopy(copy);
 		copy = null;
 		if (left) warnings.push(left);
 		const size = statSync(partial).size;
-		const sha256 = sha256File(partial);
+		const sha256 = sha256File(partial, size, check);
 		chmodSync(partial, 0o600);
 		linkSync(partial, final);
 		linked = final;
@@ -460,7 +505,7 @@ export function archiveDetached(dir: string, dest: string, seams: ArchiveSeams =
 		seams.afterFreeze?.(dir);
 		const open = stillOpen(dir, seams);
 		if (open) return fail(`${dir} is not proven quiet: ${open}`);
-		const now = readManifest(dir, true);
+		const now = readManifest(dir, true, check);
 		const changed = [...frozenDiff(before, frozen.at, frozen.ctimeBefore), ...identityDiff(frozen.at, now), ...hashDiff(before, now)].slice(0, 3);
 		if (changed.length > 0) return fail(`${dir} changed while it was archived: ${changed.join("; ")}`);
 		return { kind: "archived", path: final, bytes: size, sha256, entries: before.size, members: before, frozen: frozen.at, warnings };
@@ -557,10 +602,14 @@ function frozenDiff(before: Manifest, at: Manifest, ctimeBefore: Map<string, big
 	}, 3);
 }
 
-/** Test seams of `purgeArchived`. */
+/** Test seams of `purgeArchived` (and, through ArchiveSeams, of `archiveDetached`). */
 export interface PurgeSeams {
 	/** Runs right before the entry at `path` is moved into the purge's staging directory: a writer racing the purge. */
 	beforeStage?: (path: string) => void;
+	/** The progress deadline's clock, in milliseconds (default Date.now). */
+	clock?: () => number;
+	/** The progress deadline, in milliseconds from the start of the archive or of the purge (default ARCHIVE_DEADLINE_MS). */
+	deadlineMs?: number;
 }
 
 /** The purge's private staging directory, made inside the tree it removes: `.as2-purge-<16 hex>`. */
@@ -574,10 +623,13 @@ const PURGE_STAGING_PREFIX = ".as2-purge-";
  *    The moved entry is then checked: it is unlinked only when it is the inode the freeze recorded, still without write
  *    bits, and (a file) has the archived size and SHA-256 or (a symlink) the archived target;
  *  - a directory is removed only by rmdir, which removes nothing but an empty directory.
- * Anything else stops the purge. An entry the freeze did not record is not touched. A staged entry that fails its check
- * is put back (linked back for a file, which never replaces a name; renamed back only to a free name otherwise; or left
- * in staging, and the result says where). A directory a writer added to is kept. Every recorded entry left then gets its
- * mode from before the archive back, and the result names what was kept. Never throws.
+ * Anything else stops the purge. An entry the freeze did not record is not touched. A staged entry that fails its check,
+ * or whose check throws, is put back (linked back for a file, which never replaces a name; renamed back only to a free
+ * name otherwise; or left in staging, and the result says where). A directory a writer added to is kept. Every recorded
+ * entry left then gets its mode from before the archive back, and the result names what was kept. Bounded by the progress
+ * deadline (`seams.clock`, `seams.deadlineMs`; ARCHIVE_DEADLINE_MS), checked before each entry and after every 1 MiB a
+ * staged file's check hashes: past it the purge stops the same way (`the purge passed its <m> min deadline at <step>;
+ * nothing more is removed`). A single syscall that never returns is not bounded by it. Never throws.
  */
 export function purgeArchived(d: Detached, a: Archived, seams: PurgeSeams = {}): Removal {
 	const stagingName = `${PURGE_STAGING_PREFIX}${randomBytes(8).toString("hex")}`;
@@ -585,13 +637,21 @@ export function purgeArchived(d: Detached, a: Archived, seams: PurgeSeams = {}):
 	let made = false;
 	let held = 0;
 	let kept: string | null = null;
+	// Set first thing in the try below, so a clock that throws stops the purge through its failure path.
+	let check: ProgressCheck = () => {};
 	/** Move `rel` into staging and unlink it there only when it is what was archived; otherwise put it back. */
 	const removeEntry = (rel: string): boolean => {
 		const abs = join(d.doomed, rel);
 		const at = join(staging, String(held++));
 		seams.beforeStage?.(abs);
 		renameSync(abs, at);
-		const why = stagedMismatch(at, a.members.get(rel)!, a.frozen.get(rel)!);
+		let why: string | null;
+		try {
+			why = stagedMismatch(at, a.members.get(rel)!, a.frozen.get(rel)!, check);
+		} catch (e) {
+			kept = `${shown(rel)} could not be checked; ${putBackStaged(at, abs)}`;
+			throw e;
+		}
 		if (why === null) {
 			unlinkSync(at);
 			return true;
@@ -609,6 +669,7 @@ export function purgeArchived(d: Detached, a: Archived, seams: PurgeSeams = {}):
 		}
 		for (const name of readdirSync(abs)) {
 			if (rel === "" && name === stagingName) continue;
+			check(`removing ${join(abs, name)}`);
 			const crel = rel === "" ? name : `${rel}/${name}`;
 			const e = a.frozen.get(crel);
 			if (!e) {
@@ -638,6 +699,7 @@ export function purgeArchived(d: Detached, a: Archived, seams: PurgeSeams = {}):
 	};
 	let error: string;
 	try {
+		check = progressDeadline("the purge", "nothing more is removed", seams);
 		if (purge("")) {
 			rmdirSync(staging);
 			rmdirSync(d.doomed);
@@ -659,14 +721,14 @@ export function purgeArchived(d: Detached, a: Archived, seams: PurgeSeams = {}):
 }
 
 /** Why the staged entry `at` may not be removed (null when it may): not the frozen inode, writable, or not what was archived. */
-function stagedMismatch(at: string, member: ManifestEntry, frozen: ManifestEntry): string | null {
+function stagedMismatch(at: string, member: ManifestEntry, frozen: ManifestEntry, check: ProgressCheck): string | null {
 	const st = lstatSync(at, { bigint: true });
 	const type = st.isFile() ? "file" : st.isSymbolicLink() ? "link" : st.isDirectory() ? "dir" : "other";
 	if (type !== member.type) return `was replaced (by a ${type})`;
 	if (st.ino !== frozen.ino) return "was replaced (another inode)";
 	if (type === "link") return readlinkSync(at) === member.target ? null : "was relinked";
 	if ((Number(st.mode) & 0o222) !== 0) return "was made writable";
-	if (Number(st.size) !== member.size || sha256File(at) !== member.sha256) return "has other contents than the archive";
+	if (Number(st.size) !== member.size || sha256File(at, member.size, check) !== member.sha256) return "has other contents than the archive";
 	return null;
 }
 
