@@ -9,8 +9,8 @@ import { Ledger } from "../../ledger/src/index";
 import { main as doctorMain } from "../scripts/doctor";
 import { main as trainTickMain, type MainDeps } from "../scripts/train-tick";
 import {
-	backupDir, checkCtx, checkDisk, checkGh, checkJob, checkLedger, checkMailbox, checkMcp, checkParts, checkSeat, CLAIM_MS, type DoctorDeps, type DoctorFs, doctorControl, doctorTick, JOB_INVENTORY,
-	type JobRow, ledgerDownPath, ledgerDownPopup, type PartResult, pendingDowns, popupLogPath, popupRun, type ProbeResult, runAfterRestart, runDefault, settleAndSpawn, settleClaims, spawnPopupProcess, thenClose,
+	backupDir, checkCtx, checkDeps, checkDisk, checkGh, checkJob, checkLedger, checkMailbox, checkMcp, checkParts, checkSeat, CLAIM_MS, type DoctorDeps, type DoctorFs, doctorControl, doctorTick, JOB_INVENTORY,
+	type JobRow, ledgerDownPath, ledgerDownPopup, type PartResult, pendingDowns, popupLogPath, popupRun, type ProbeResult, runAfterRestart, runDefault, type RunOutcome, settleAndSpawn, settleClaims, spawnPopupProcess, thenClose,
 } from "../src/doctor";
 import { type DoctorRecord, formatDoctor, parseDoctor, POPUP_ATTEMPT_LIMIT, popupAttempts } from "../src/doctor-entries";
 import { doctorLines } from "../src/errors";
@@ -273,7 +273,7 @@ describe("parts", () => {
 		const log = join(f.home, ".agent-system-2", "logs", "doctor.log");
 		f.files.set(d, { text: "", mtimeMs: T0 - HOUR, exec: false });
 		f.files.set(log, { text: "", mtimeMs: T0 - 5 * MIN, exec: false });
-		for (const a of ["/bin/zsh", "/usr/bin/afplay", "/usr/bin/say", "/usr/bin/launchctl", "/usr/bin/plutil", "/usr/bin/df", "/usr/bin/sysctl", "/usr/bin/dscl"]) f.files.set(a, { text: "", mtimeMs: 0, exec: true });
+		for (const a of ["/bin/zsh", "/bin/rm", "/usr/bin/afplay", "/usr/bin/say", "/usr/bin/launchctl", "/usr/bin/plutil", "/usr/bin/df", "/usr/bin/sysctl", "/usr/bin/dscl"]) f.files.set(a, { text: "", mtimeMs: 0, exec: true });
 		f.plists.set(d, { ProgramArguments: ["/bin/bun", "run", d], StartInterval: 600, RunAtLoad: true, StandardOutPath: log, EnvironmentVariables: { PATH: "/usr/bin:/bin" } });
 		f.launchctl.set("com.agent-system-2.doctor", print({ path: d, log, runs: 4, exit: 1 }));
 		expect(verdicts(checkJob(f.deps, row("doctor")))).toEqual(["pass job:doctor", "pass deps:doctor"]);
@@ -1148,5 +1148,131 @@ describe("review r2: a failure is never hidden by a later one, and never exits 0
 		}
 		expect((caught as Error).message).toStartWith("popup process ran in the foreground (AS2_DOCTOR_POPUP_WAIT=1) and exited 1; output in ");
 		expect((caught as Error).message).toEndWith(`, but closing the popup log ${popupLogPath(home)} after the spawn failed: injected EBADF`);
+	});
+});
+
+/** pid's `ps -o stat=,lstart=` answers exit 0 with a start time that does not parse. */
+const UNPARSABLE = "unexpected-start-format";
+
+describe("review r3: an expired owner's probe failure, an unparsable start time and the audited PATH names are never silent", () => {
+	test("F8: an expired claim whose owner probe fails and whose settlement write throws: the probe error and the write error are both printed, exit 1 (fake clock c.ms)", async () => {
+		const f = fake();
+		const l = standing(f);
+		const until = new Date(T0 + 10 * MIN).toISOString();
+		claim(l, "pp-live", { pid: 7003, start: new Date(LSTART).toISOString(), boot: f.boot.sec, until, downs: [down(l, "job:train-tick")] });
+		l.close();
+		f.c.ms = T0 + 10 * MIN + 1;
+		psFailsFor(f, 7003);
+		// Only settleClaims's write (it returns the settled { v, body } list) throws, inside its transaction.
+		const real = Ledger.prototype.write;
+		Ledger.prototype.write = function <T>(this: Ledger, fn: () => T): T {
+			return real.call(this, () => {
+				const r = fn();
+				if (Array.isArray(r) && r.length > 0 && "body" in r[0] && "v" in r[0]) throw new Error("injected settlement write denied");
+				return r;
+			}) as T;
+		};
+		let r: RunOutcome;
+		try {
+			r = await runDefault(f.deps);
+		} finally {
+			Ledger.prototype.write = real;
+		}
+		expect(r.exit).toBe(1);
+		const notes = r.notes.join("\n");
+		expect(notes).toContain(`doctor: claim pp-live's owner pid 7003 could not be checked (\`ps -p 7003 -o stat=,lstart=\` could not start: ps is not on PATH); it is past until ${until}, so it is settled expired and pid 7003 is not killed`);
+		expect(notes).toContain("doctor: settling popups failed: injected settlement write denied");
+		// The probe line comes before the write's failure; the claim is still unsettled, so the next run settles it.
+		expect(notes.indexOf("could not be checked")).toBeLessThan(notes.indexOf("settling popups failed"));
+		const l2 = open(f);
+		expect(kinds(l2).filter((k) => k.startsWith("popup"))).toEqual(["popup claimed"]);
+		// The same, called directly: the run flag is failed whatever the write did.
+		const flag = { failed: false };
+		const out: string[] = [];
+		l2.write = (() => {
+			throw new Error("injected settlement write denied");
+		}) as Ledger["write"];
+		expect(() => settleClaims(l2, { ...f.deps, out: (x) => out.push(x) }, flag)).toThrow("injected settlement write denied");
+		expect(flag.failed).toBe(true);
+		expect(out.join("\n")).toContain("doctor: claim pp-live's owner pid 7003 could not be checked (`ps -p 7003 -o stat=,lstart=` could not start: ps is not on PATH)");
+		l2.close();
+	});
+
+	test("F9: the popup process whose own ps start time does not parse names ps's answer and exits 1", () => {
+		const f = fake();
+		const l = standing(f);
+		f.ps.set(OWN_PID, { lstart: UNPARSABLE, command: "bun surface/scripts/doctor.ts --popup" });
+		expect(popupRun(l, f.deps)).toBe(1);
+		expect(f.out.join("\n")).toContain(`doctor: this process's start time could not be read (\`ps -p ${OWN_PID} -o stat=,lstart=\` answered a start time that cannot be parsed: S ${UNPARSABLE}); the claim records start unknown`);
+		// With a down pending, the claim records start unknown and the run still exits 1.
+		f.out.length = 0;
+		down(l, "ctx");
+		expect(popupRun(l, f.deps)).toBe(1);
+		expect(f.out.join("\n")).toContain(`answered a start time that cannot be parsed: S ${UNPARSABLE}`);
+		const claimed = recordsOf(l).find((r) => r.prefix === "doctor-popup" && r.outcome.state === "claimed");
+		expect(claimed?.prefix === "doctor-popup" && claimed.outcome.state === "claimed" ? claimed.outcome.start : null).toBe("unknown");
+		l.close();
+	});
+
+	test("F9: a claim's owner whose ps start time does not parse is a failed probe, printed and failing the run, never 'reused'; a recorded start unknown stays unknown (fake clock c.ms)", () => {
+		const f = fake();
+		const l = standing(f);
+		const d = down(l, "ctx");
+		const until = new Date(T0 + HOUR).toISOString();
+		f.ps.set(7003, { lstart: UNPARSABLE, command: "x" });
+		f.ps.set(7004, { lstart: UNPARSABLE, command: "x" });
+		claim(l, "pp-live", { pid: 7003, start: new Date(LSTART).toISOString(), boot: f.boot.sec, until, downs: [d] });
+		claim(l, "pp-nostart", { pid: 7004, start: "unknown", boot: f.boot.sec, until, downs: [d] });
+		const flag = { failed: false };
+		settleClaims(l, f.deps, flag);
+		expect(flag.failed).toBe(true);
+		expect(f.out).toEqual([`doctor: claim pp-live's owner pid 7003 could not be checked (\`ps -p 7003 -o stat=,lstart=\` answered a start time that cannot be parsed: S ${UNPARSABLE}); it stands until ${until}`]);
+		expect(kinds(l).filter((k) => k.startsWith("popup"))).toEqual(["popup claimed", "popup claimed"]);
+		// Past until: both expire and neither is killed (no identity to tell either is the owner).
+		f.c.ms = T0 + HOUR + 1;
+		f.out.length = 0;
+		settleClaims(l, f.deps, { failed: false });
+		expect(f.out.join("\n")).toContain(`doctor: claim pp-live's owner pid 7003 could not be checked (\`ps -p 7003 -o stat=,lstart=\` answered a start time that cannot be parsed: S ${UNPARSABLE}); it is past until ${until}`);
+		const outcomes = Object.fromEntries(recordsOf(l).flatMap((r) => (r.prefix === "doctor-popup" && r.outcome.state !== "claimed" ? [[r.popupId, `${r.outcome.state} ${r.outcome.detail}`]] : [])));
+		expect(outcomes["pp-live"]).toStartWith(`expired past until ${until}; pid 7003 not killed (its identity could not be read: `);
+		expect(outcomes["pp-nostart"]).toBe(`expired past until ${until}; pid 7004 not killed (no start time recorded to tell it is the owner)`);
+		expect(f.killed).toEqual([]);
+		l.close();
+	});
+
+	test("F9: the ledger-down popup's owner whose ps start time does not parse is reported, fails the run and starts no new popup", () => {
+		const f = fake();
+		f.files.set(ledgerDownPath(f.home), ledgerDownRecord(f));
+		f.ps.set(7003, { lstart: UNPARSABLE, command: "x" });
+		const flag = { failed: false };
+		ledgerDownPopup(f.deps, "SQLITE_CORRUPT", flag);
+		expect(flag.failed).toBe(true);
+		expect(f.out.join("\n")).toContain(`the ledger-down popup's owner pid 7003 could not be checked (\`ps -p 7003 -o stat=,lstart=\` answered a start time that cannot be parsed: S ${UNPARSABLE}); no new popup this run`);
+		expect(f.alarms).toEqual([]);
+	});
+
+	/** deps:<job> with every name of the row on /opt/job but `missing`, and every absolute tool present. */
+	const depsWithout = (job: string, missing: string | null): PartResult => {
+		const f = fake();
+		const r = row(job);
+		for (const a of r.absolute) f.files.set(a, { text: "", mtimeMs: 0, exec: true });
+		for (const n of r.pathNames) if (n !== missing) f.files.set(`/opt/job/${n}`, { text: "", mtimeMs: 0, exec: true });
+		return checkDeps(f.deps, r, { ProgramArguments: ["/bin/bun", "x"], EnvironmentVariables: { PATH: "/opt/job" } });
+	};
+
+	test("F10: the doctor job's PATH names include quiet-alarm.zsh's mktemp and rm: one missing fails deps:doctor, naming it", () => {
+		for (const missing of ["mktemp", "rm", "sysctl"]) {
+			expect(depsWithout("doctor", missing)).toMatchObject({ part: "deps:doctor", verdict: "fail", evidence: `${missing} is not on the job's PATH (job PATH /opt/job)` });
+		}
+		expect(depsWithout("doctor", null).verdict).toBe("pass");
+	});
+
+	test("F10: the train-tick job's PATH names include the doctor step's sysctl, the popup's mktemp and rm, and the test runner's sudo: one missing fails deps:train-tick, naming it", () => {
+		for (const missing of ["sysctl", "mktemp", "rm", "sudo"]) {
+			expect(depsWithout("train-tick", missing)).toMatchObject({ part: "deps:train-tick", verdict: "fail", evidence: `${missing} is not on the job's PATH (job PATH /opt/job)` });
+		}
+		expect(depsWithout("train-tick", null).verdict).toBe("pass");
+		// The popup process the tick spawns runs quiet-alarm.zsh under /bin/zsh, with its absolute tools.
+		expect(row("train-tick").absolute).toEqual(["/bin/zsh", "/usr/bin/osascript", "/usr/bin/afplay", "/usr/bin/say"]);
 	});
 });

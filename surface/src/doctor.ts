@@ -118,12 +118,31 @@ export const LABEL_PREFIX = "com.agent-system-2.";
  * - drive-backup: /bin/zsh install/drive-backup/backup-nightly.zsh, lib.zsh, server-read.zsh and quiet-alarm.zsh: the
  *   absolute tools below, AS2_BUN, and mktemp, pgrep, ps and date by name.
  * - drive-backup-check: /bin/zsh install/drive-backup/check-backup-fresh.zsh with lib.zsh and quiet-alarm.zsh.
+ *
+ * The doctor and train-tick rows, audited again by call site (review r3 F10): every name each entry point reaches,
+ * through its own code, the doctor code it runs, the processes it spawns with its environment (the popup process
+ * `doctor.ts --popup`, spawned by spawnPopupProcess with the run's env, and quiet-alarm.zsh under it), and their libraries.
+ * - doctor (surface/scripts/doctor.ts, every mode, and the popup process it spawns):
+ *   launchctl (checkJob's `launchctl print`), plutil (readPlist), dscl (the own-home probe), ctx (checkCtx), gh (checkGh),
+ *   df (checkDisk), sysctl (currentBoot), ps (psRun: ownStart, ownerState; surface/scripts/invariants.ts
+ *   orchestratorsFromPs for checkSeat), pgrep (orchestratorsFromPs → invariants.ts pgrep), osascript (surface/src/notify.ts
+ *   realNotify, the ledger-down banner), mktemp and rm (install/drive-backup/quiet-alarm.zsh: `mktemp -t quiet-alarm`,
+ *   `rm -f "$errfile"`, through notify.ts alarmPopup). Absolute: /bin/zsh (alarmPopup), and quiet-alarm.zsh's defaults
+ *   /usr/bin/osascript, /usr/bin/afplay, /usr/bin/say. The popup process is process.execPath, the job's own bun.
+ * - train-tick (surface/scripts/train-tick.ts): gh (realGh; surface/scripts/test-runner.ts's gh calls), git (its git and
+ *   realRoot; surface/src/merge-train.ts; test-runner.ts), osascript (realNotify), bun and omp (surface/scripts/lane.ts:
+ *   the starter's `bun … run` and the runner's omp), ps (omp-probe.ts runPs; the doctor's psRun), ctx (doctorTick's
+ *   checkCtx), sysctl (doctorTick → settleAndSpawn → settleClaims → currentBoot, and the popup process's popupRun), mktemp
+ *   and rm (the popup process's alarmPopup → quiet-alarm.zsh), sudo (test-runner.ts, which the tick runs for `main` and
+ *   `promote`: its detached run's `sudo -n <libexec>/refresh` and surface/src/test-run.ts wrapperArgv's `sudo -n -u
+ *   _as2test`). Absolute: /bin/zsh, /usr/bin/osascript, /usr/bin/afplay, /usr/bin/say (the popup process's quiet-alarm.zsh).
+ *   Every name added here resolves on a stock macOS PATH (/usr/bin, /bin, /usr/sbin), which ends both jobs' plist PATHs.
  */
 export const JOB_INVENTORY: readonly JobRow[] = [
 	{ name: "ledger-backup", expected: { kind: "always" }, pathNames: [], absolute: [], envExecutables: [], reinstall: "bash {repo}/install/install.sh", okExits: [0] },
 	{
 		name: "doctor", expected: { kind: "own-home" },
-		pathNames: ["ctx", "gh", "osascript", "launchctl", "plutil", "df", "pgrep", "ps", "sysctl", "dscl"],
+		pathNames: ["ctx", "gh", "osascript", "launchctl", "plutil", "df", "pgrep", "ps", "sysctl", "dscl", "mktemp", "rm"],
 		absolute: ["/bin/zsh", "/usr/bin/osascript", "/usr/bin/afplay", "/usr/bin/say"], envExecutables: [], reinstall: "bash {repo}/install/install.sh", okExits: [0, 1],
 	},
 	{
@@ -131,8 +150,8 @@ export const JOB_INVENTORY: readonly JobRow[] = [
 		absolute: ["/bin/date", "/bin/sleep", "/usr/sbin/lsof", "/usr/bin/sed"], envExecutables: ["PHOENIX_PYTHON"], reinstall: "bash {repo}/install/phoenix-agent.sh on", okExits: [0],
 	},
 	{
-		name: "train-tick", expected: { kind: "opt-in", flag: "--train-tick" }, pathNames: ["gh", "bun", "omp", "git", "osascript", "ctx", "ps"],
-		absolute: [], envExecutables: [], reinstall: "bash {repo}/install/install.sh --train-tick", okExits: [0],
+		name: "train-tick", expected: { kind: "opt-in", flag: "--train-tick" }, pathNames: ["gh", "bun", "omp", "git", "osascript", "ctx", "ps", "sysctl", "mktemp", "rm", "sudo"],
+		absolute: ["/bin/zsh", "/usr/bin/osascript", "/usr/bin/afplay", "/usr/bin/say"], envExecutables: [], reinstall: "bash {repo}/install/install.sh --train-tick", okExits: [0],
 	},
 	{ name: "daily-report", expected: { kind: "opt-in", flag: "--daily-report" }, pathNames: [], absolute: [], envExecutables: [], reinstall: "bash {repo}/install/install.sh --daily-report", okExits: [0] },
 	{ name: "scratch-sweep", expected: { kind: "opt-in", flag: "--scratch-sweep" }, pathNames: ["du"], absolute: [], envExecutables: [], reinstall: "bash {repo}/install/install.sh --scratch-sweep", okExits: [0] },
@@ -800,6 +819,9 @@ export function startToken(lstart: string): string {
 	return Number.isFinite(t) ? new Date(t).toISOString() : "unknown";
 }
 
+/** `ps -p <pid> -o stat=,lstart=` answered (exit 0) a start time `startToken` cannot parse: the raw answer, named. */
+const unparsableStart = (pid: number, out: string): string => `\`ps -p ${pid} -o stat=,lstart=\` answered a start time that cannot be parsed: ${clip(out, 160)}`;
+
 /**
  * A run's failure flag: set by every failure the run detects and reports itself (a probe, a write, a spawn, a kill, a
  * close), so the run exits 1 even when every part passes. A crash is not this: it is thrown, and the CLI exits 2.
@@ -808,12 +830,17 @@ export interface RunFlag {
 	failed: boolean;
 }
 
-/** This process's start token (`unknown` when ps cannot tell, with the reason logged and the run failed). */
+/**
+ * This process's start token (`unknown` when ps cannot tell, with the reason logged and the run failed). A ps answer whose
+ * start time does not parse is such a failure too: the line names the raw answer.
+ */
 function ownStart(deps: DoctorDeps, flag: RunFlag): string {
 	try {
 		const out = psAnswer(psRun(deps), deps.pid, "stat=,lstart=");
 		if (out === null) throw new Error(`ps -p ${deps.pid} says this process does not exist`);
-		return startToken(statStart(out).start);
+		const token = startToken(statStart(out).start);
+		if (token === "unknown") throw new Error(unparsableStart(deps.pid, out));
+		return token;
 	} catch (e) {
 		flag.failed = true;
 		deps.out(`doctor: this process's start time could not be read (${clip(errText(e))}); the claim records start unknown, so a reused pid cannot be told from it`);
@@ -821,7 +848,12 @@ function ownStart(deps: DoctorDeps, flag: RunFlag): string {
 	}
 }
 
-/** A recorded owner now: the same process, gone, another process on the pid, alive with no start to compare, or ps failed. */
+/**
+ * A recorded owner now: the same process, gone, another process on the pid, alive with no start to compare, or ps failed.
+ * A recorded start `unknown` is never `same` (the pid alone cannot tell the owner from a reused pid). A ps answer whose
+ * start time does not parse is `failed`, its raw answer in `why`, never `other`: every caller prints a failed probe and
+ * fails its run.
+ */
 export type OwnerState = { state: "same" | "gone" | "other" | "unknown" } | { state: "failed"; why: string };
 
 export function ownerState(deps: DoctorDeps, pid: number, start: string): OwnerState {
@@ -831,7 +863,9 @@ export function ownerState(deps: DoctorDeps, pid: number, start: string): OwnerS
 		const now = statStart(out);
 		if (now.zombie) return { state: "gone" };
 		if (start === "unknown") return { state: "unknown" };
-		return { state: startToken(now.start) === start ? "same" : "other" };
+		const token = startToken(now.start);
+		if (token === "unknown") return { state: "failed", why: unparsableStart(pid, out) };
+		return { state: token === start ? "same" : "other" };
 	} catch (e) {
 		return { state: "failed", why: clip(errText(e)) };
 	}
@@ -853,8 +887,10 @@ export function pendingDowns(control: readonly ControlEntry[]): OpenDown[] {
  * Settle every claim without an outcome, from outside (PLAN "Alerts"): a prior boot, a gone owner or a reused pid →
  * `abandoned <why>`; past `until` → `expired`, and the owner killed when it is still the same process. Identity is read
  * outside the write; the write re-reads and settles only claims still without an outcome. Each line goes to `deps.out` as
- * it happens, so a later throw never drops an earlier line; a boot or identity probe that fails and a kill that fails
- * each set the run's failure flag.
+ * it happens, so a later throw never drops an earlier line: an owner probe that fails is printed before the write, before
+ * or past `until`, so a write that throws never hides it (review r3 F8). A kill comes only after its claim's outcome is
+ * written and is printed when it fails. A boot or identity probe that fails and a kill that fails each set the run's
+ * failure flag.
  */
 export function settleClaims(ledger: Ledger, deps: DoctorDeps, flag: RunFlag): void {
 	const open = popupClaims(doctorControl(ledger)).filter((c) => c.outcome === null);
@@ -879,6 +915,7 @@ export function settleClaims(ledger: Ledger, deps: DoctorDeps, flag: RunFlag): v
 		if (owner.state === "gone") verdicts.push({ popupId: c.popupId, outcome: { state: "abandoned", detail: `owner pid ${pid} gone` }, kill: null });
 		else if (owner.state === "other") verdicts.push({ popupId: c.popupId, outcome: { state: "abandoned", detail: `pid ${pid} reused by another process` }, kill: null });
 		else if (now > Date.parse(until)) {
+			if (owner.state === "failed") deps.out(`doctor: claim ${c.popupId}'s owner pid ${pid} could not be checked (${owner.why}); it is past until ${until}, so it is settled expired and pid ${pid} is not killed`);
 			const note = owner.state === "failed" ? `past until ${until}; pid ${pid} not killed (its identity could not be read: ${owner.why})` : owner.state === "same" ? `past until ${until}; owner pid ${pid} killed` : `past until ${until}; pid ${pid} not killed (no start time recorded to tell it is the owner)`;
 			verdicts.push({ popupId: c.popupId, outcome: { state: "expired", detail: note }, kill: owner.state === "same" ? pid : null });
 		} else if (owner.state === "failed") deps.out(`doctor: claim ${c.popupId}'s owner pid ${pid} could not be checked (${owner.why}); it stands until ${until}`);
