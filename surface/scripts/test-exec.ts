@@ -1311,7 +1311,7 @@ async function part(cfg: Config, runId: string, work: string, dir: string, argv:
 			if (cfg.sweep !== "groups") verifyTrustedPath(cfg.resourcesPath);
 			costs = parseResourceCosts(JSON.parse(readFileSync(cfg.resourcesPath, "utf8")));
 		} catch (e) {
-			throw new Error(`resource calibration ${cfg.resourcesPath}: ${errText(e)}; provision measured worker (including nested subprocess peaks) and host plus historic-load reserve costs via install/as2test-setup.sh --resources=<file>`);
+			throw new Error(`resource calibration ${cfg.resourcesPath}: ${errText(e)}; provision measured worker (including nested subprocess peaks) and host reserve costs via install/as2test-setup.sh --resources=<file>`);
 		}
 		admission = admitResources(configuredWorkers, inputs, costs);
 		const controlEnv = proofChildEnv(process.env, dir, null, null);

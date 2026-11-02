@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { admitResources, boundedTestArgs, parseResourceCosts, parseTimingProof, proofChildEnv, runtimeTreeHash, verifyTrustedPath } from "../src/test-resources";
 import { tmp } from "./helpers";
 
-const costs = { workerCpu: 2, workerMemoryBytes: 400, reserveCpu: 2, reserveMemoryBytes: 200, calibration: "synthetic fixture: worker peak and host plus historical-load reserve" };
+const costs = { workerCpu: 2, workerMemoryBytes: 400, reserveCpu: 2, reserveMemoryBytes: 200, calibration: "synthetic fixture: worker peak and host reserve" };
 const inputs = { cpuCount: 16, availableCpuCount: 12, availableMemoryBytes: 1800, totalMemoryBytes: 3200, loadAverage: [0, 0, 0] };
 
 const roots: string[] = [];
@@ -20,7 +20,7 @@ describe("resource admission", () => {
 	});
 	// Jo's "fixed" ruling (q-mvzovbsiyotxuk): live readings are recorded, never selecting, so a busy host cannot change the count.
 	test("a busy host admits exactly what an idle one does, and its live readings are kept in the receipt", () => {
-		const busyInputs = { ...inputs, availableCpuCount: 1, availableMemoryBytes: 1, loadAverage: [40, 30, 20] };
+		const busyInputs = { ...inputs, availableCpuCount: 1, availableMemoryBytes: 0, loadAverage: [40, 30, 20] };
 		const busy = admitResources(20, busyInputs, costs);
 		expect(busy.selectedWorkers).toBe(admitResources(20, inputs, costs).selectedWorkers);
 		expect(busy.inputs).toEqual(busyInputs);

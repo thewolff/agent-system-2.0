@@ -55,7 +55,7 @@
 #   --dry-run  checks and prints the plan, then stops; nothing is changed and sudo is not called.
 #   --undo     refuses while a run holds the runs lock (<runs root>/runs.db, a heartbeat under 60 s).
 #   --resources=/absolute/file.json   measured worker CPU/memory (including nested subprocess peaks)
-#                                      and host + historical-load reserves; no guessed defaults.
+#                                      and the measured host reserve; no guessed defaults.
 #                                      Required unless a valid root-owned <libexec>/resources.json is
 #                                      already installed, which a re-run then keeps.
 #   --omp-artifact=/absolute/dir --omp-version=<exact --version stdout>
@@ -250,7 +250,7 @@ POLICY="$LIBEXEC/resources.json"
 if [ -n "$RESOURCES" ]; then
 	case "$RESOURCES" in /*) ;; *) fail "--resources must name an absolute measured policy file" ;; esac
 	bun "$CHECKOUT/surface/src/as2test.ts" validate-resources --file "$RESOURCES" >"$TMP/resources.json" ||
-		fail "invalid resource calibration $RESOURCES (its reason is above); include measured nested-worker peaks and host plus historical-load reserve. Nothing changed"
+		fail "invalid resource calibration $RESOURCES (its reason is above); include measured nested-worker peaks and the measured host reserve. Nothing changed"
 elif [ -e "$POLICY" ] || [ -L "$POLICY" ]; then
 	{ [ -f "$POLICY" ] && [ ! -L "$POLICY" ]; } || fail "$POLICY is not a regular file; inspect it, then re-run with --resources=/absolute/measured-policy.json. Nothing changed"
 	read -r owner mode <<<"$(stat -f '%u %Lp' "$POLICY")"
@@ -259,7 +259,7 @@ elif [ -e "$POLICY" ] || [ -L "$POLICY" ]; then
 	bun "$CHECKOUT/surface/src/as2test.ts" validate-resources --file "$POLICY" >/dev/null ||
 		fail "the installed $POLICY is not a valid measured resource policy (its reason is above); re-run with --resources=/absolute/measured-policy.json. Nothing changed"
 else
-	fail "no measured resource policy: $POLICY is missing and no --resources=/absolute/measured-policy.json was given. Every test part of the executor the refresh helper installs admits its workers from it (measured worker CPU/memory including nested subprocess peaks, host plus historical-load reserves); there are no default costs. Measure them, then re-run with --resources. Nothing changed"
+	fail "no measured resource policy: $POLICY is missing and no --resources=/absolute/measured-policy.json was given. Every test part of the executor the refresh helper installs admits its workers from it (measured worker CPU/memory including nested subprocess peaks, and the measured host reserve); there are no default costs. Measure them, then re-run with --resources. Nothing changed"
 fi
 if [ -n "$OMP_ARTIFACT" ] || [ -n "$OMP_VERSION" ]; then
 	[ -n "$OMP_ARTIFACT" ] && [ -n "$OMP_VERSION" ] || fail "--omp-artifact and --omp-version are required together"

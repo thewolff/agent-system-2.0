@@ -47,7 +47,7 @@ export function parseResourceCosts(v: unknown): ResourceCosts {
 	if (!object(v)) throw new Error("missing resource calibration: provision measured resources.json in the trusted wrapper install; no default worker/reserve estimates are admitted");
 	const keys = ["workerCpu", "workerMemoryBytes", "reserveCpu", "reserveMemoryBytes", "calibration"];
 	if (Object.keys(v).some((k) => !keys.includes(k))) throw new Error("resource calibration has unknown fields");
-	if (typeof v.calibration !== "string" || !v.calibration.trim()) throw new Error("resource calibration needs a measurement receipt for worker peaks and host plus historical-load reserve");
+	if (typeof v.calibration !== "string" || !v.calibration.trim()) throw new Error("resource calibration needs a measurement receipt for worker peaks and the host reserve");
 	for (const key of ["reserveCpu", "reserveMemoryBytes"] as const) {
 		if (typeof v[key] !== "number" || !Number.isFinite(v[key]) || v[key] < 0) throw new Error(`resource calibration: ${key} must be nonnegative and finite`);
 	}
@@ -63,13 +63,17 @@ export function readResourceInputs(): ResourceInputs {
 /**
  * Freeze one selection for the whole part; a zero-capacity result is a failure, never a forced worker. The budget is
  * fixed: cpuCount and totalMemoryBytes minus the measured host reserve. Live free memory, available CPUs and load average
- * are validated and recorded but never select the count, so red or green cannot depend on how busy the host was at launch
- * (TOOLS-REVIEW r2 R5; provisioning finding: macOS freemem median 0.18 GB would refuse every run).
+ * are validated and recorded but never select the count, so a busy host cannot change how many workers one commit gets
+ * (TOOLS-REVIEW r2 R5; provisioning finding: macOS freemem median 0.18 GB would refuse every run). Contention can still
+ * slow a part into its caps; only the count is fixed. The memory term divides RSS sums, which leave out wired and
+ * compressed memory, so it is a sanity bound rather than a no-swap guarantee.
  */
 export function admitResources(configuredWorkers: number, inputs: ResourceInputs, rawCosts: ResourceCosts): ResourceAdmission {
 	whole(configuredWorkers, "configuredWorkers");
 	const costs = parseResourceCosts(rawCosts);
-	for (const key of ["cpuCount", "availableCpuCount", "availableMemoryBytes", "totalMemoryBytes"] as const) whole(inputs[key], key);
+	for (const key of ["cpuCount", "availableCpuCount", "totalMemoryBytes"] as const) whole(inputs[key], key);
+	// Recorded only: free memory of 0 is a real macOS reading on a swapping host, not a broken runtime.
+	if (!Number.isSafeInteger(inputs.availableMemoryBytes) || inputs.availableMemoryBytes < 0) throw new Error(`resource admission: availableMemoryBytes must be a nonnegative safe integer (got ${String(inputs.availableMemoryBytes)})`);
 	if (inputs.availableCpuCount > inputs.cpuCount) throw new Error("resource admission: availableCpuCount exceeds cpuCount");
 	if (inputs.availableMemoryBytes > inputs.totalMemoryBytes) throw new Error("resource admission: availableMemoryBytes exceeds totalMemoryBytes");
 	if (inputs.loadAverage.length !== 3 || inputs.loadAverage.some((n) => !Number.isFinite(n) || n < 0)) throw new Error("resource admission: loadAverage reading is malformed");
