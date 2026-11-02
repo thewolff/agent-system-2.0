@@ -494,6 +494,20 @@ describe("episodes", () => {
 		l.close();
 	});
 
+	test("after-restart past the boot run keeps a sibling-named failure from re-checking an open part: printed, exit 1, no new down", async () => {
+		const f = fake();
+		const l = standing(f);
+		const p = plistPathOf(f.home, "train-tick");
+		f.files.set(p, { text: "<plist/>", mtimeMs: T0, exec: false });
+		down(l, "deps:train-tick");
+		l.recordEntry({ by: DOCTOR_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: formatDoctor({ prefix: "doctor-boot", boot: f.boot.sec }) });
+		const r = await runAfterRestart(f.deps);
+		expect(r.exit).toBe(1);
+		expect(verdicts(r.results)).toContain("fail job:train-tick");
+		expect(kinds(l).filter((k) => k.startsWith("down"))).toEqual(["down deps:train-tick"]);
+		l.close();
+	});
+
 	test("a terminal run clears a part it sees pass and never opens a down", async () => {
 		const f = fake();
 		const l = open(f);
@@ -679,6 +693,56 @@ describe("popups", () => {
 		expect(r.exit).toBe(1);
 		expect(verdicts(r.results)).toContain("fail ledger");
 		expect(f.alarms.map((a) => a.title)).toEqual(["as2 doctor: the ledger cannot be opened"]);
+	});
+
+	test("ledger-down popup: a failed owner probe is reported, never called 'showing'; a live attempt starts no new popup, an expired one records the probe failure and does not kill", () => {
+		const f = fake();
+		const rec = (until: number) => JSON.stringify({ boot: f.boot.sec, attempts: [{ pid: 7003, start: new Date(LSTART).toISOString(), began: new Date(T0).toISOString(), until: new Date(until).toISOString() }] });
+		f.files.set(ledgerDownPath(f.home), { text: rec(T0 + 70 * MIN), mtimeMs: T0, exec: false });
+		const base = f.deps.run;
+		f.deps.run = (argv, env) => (argv[0] === "ps" && argv.includes("7003") ? { code: null, stdout: "", stderr: "", error: "could not start: ps is not on PATH" } : base(argv, env));
+		ledgerDownPopup(f.deps, "x");
+		expect(f.out.join("\n")).toContain("owner pid 7003 could not be checked");
+		expect(f.out.join("\n")).toContain("could not start: ps is not on PATH");
+		expect(f.out.join("\n")).not.toContain("popup is showing");
+		expect(f.alarms).toHaveLength(0);
+		f.out.length = 0;
+		f.c.ms = T0 + 70 * MIN + 1;
+		ledgerDownPopup(f.deps, "x");
+		expect(f.killed).toEqual([]);
+		expect(f.alarms).toHaveLength(0);
+		const saved = JSON.parse(f.files.get(ledgerDownPath(f.home))!.text) as { attempts: { outcome?: string; error?: string }[] };
+		expect(saved.attempts[0]!.outcome).toContain("could not be read");
+		expect(saved.attempts[0]!.outcome).toContain("could not start: ps is not on PATH");
+		expect(saved.attempts[0]!.error).toContain("ps for owner pid 7003");
+	});
+
+	test("after-restart with an unopenable ledger and a failed owner probe exits 1 and names the failure", async () => {
+		const f = fake();
+		f.files.set(ledgerDownPath(f.home), { text: JSON.stringify({ boot: f.boot.sec, attempts: [{ pid: 7003, start: new Date(LSTART).toISOString(), began: new Date(T0).toISOString(), until: new Date(T0 + 70 * MIN).toISOString() }] }), mtimeMs: T0, exec: false });
+		const base = f.deps.run;
+		const deps = { ...f.deps, ledgerPath: join(tmp("doctor-gone"), "ledger.db"), run: (argv: readonly string[], env?: Record<string, string | undefined>) => (argv[0] === "ps" && argv.includes("7003") ? { code: null, stdout: "", stderr: "", error: "could not start: ps is not on PATH" } : base(argv, env)) };
+		const r = await runAfterRestart(deps);
+		expect(r.exit).toBe(1);
+		expect(r.notes.join("\n")).toContain("could not start: ps is not on PATH");
+		expect(r.notes.join("\n")).not.toContain("popup is showing");
+	});
+
+	test("a writable open that fails after the read-only check passed exits 1 and names the error", async () => {
+		// The ledger path reads as the real ledger for the checks' reads and as a missing file after them, so the read-only
+		// open passes and the writable open throws (no ledger at <path>).
+		const f = fake();
+		const missing = join(tmp("doctor-missing"), "ledger.db");
+		const reads = { n: 0, limit: Number.POSITIVE_INFINITY };
+		const deps: DoctorDeps = { ...f.deps };
+		Object.defineProperty(deps, "ledgerPath", { get: () => (++reads.n > reads.limit ? missing : f.ledgerPath) });
+		await checkParts(deps);
+		reads.limit = reads.n;
+		reads.n = 0;
+		const d = await runDefault(deps);
+		expect(verdicts(d.results)).toContain("pass ledger");
+		expect(d.notes.join("\n")).toContain(`could not be opened for writing (no ledger at `);
+		expect(d.exit).toBe(1);
 	});
 });
 

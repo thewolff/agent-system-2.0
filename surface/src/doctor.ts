@@ -997,6 +997,7 @@ export function ledgerDownPopup(deps: DoctorDeps, ledgerError: string): void {
 	};
 	const now = deps.now();
 	const last = rec.attempts.at(-1);
+	let probeFailed: string | null = null;
 	if (last && last.outcome === undefined) {
 		if (rec.boot !== boot) last.outcome = `abandoned prior boot ${rec.boot}`;
 		else {
@@ -1004,7 +1005,11 @@ export function ledgerDownPopup(deps: DoctorDeps, ledgerError: string): void {
 			if (owner.state === "gone") last.outcome = `abandoned owner pid ${last.pid} gone`;
 			else if (owner.state === "other") last.outcome = `abandoned pid ${last.pid} reused`;
 			else if (now > Date.parse(last.until)) {
-				last.outcome = `expired past until ${last.until}`;
+				if (owner.state === "failed") {
+					probeFailed = owner.why;
+					last.outcome = `expired past until ${last.until}; pid ${last.pid} not killed (its identity could not be read: ${owner.why})`;
+					last.error = `ps for owner pid ${last.pid}: ${owner.why}`;
+				} else last.outcome = `expired past until ${last.until}`;
 				if (owner.state === "same") {
 					try {
 						deps.kill(last.pid);
@@ -1012,12 +1017,20 @@ export function ledgerDownPopup(deps: DoctorDeps, ledgerError: string): void {
 						last.error = `kill ${last.pid}: ${clip(errText(e))}`;
 					}
 				}
+			} else if (owner.state === "failed") {
+				// The owner may still be alive: no new attempt; the next run probes it again.
+				deps.out(`doctor: the ledger-down popup's owner pid ${last.pid} could not be checked (${owner.why}); no new popup this run; it stands until ${last.until}`);
+				return;
 			} else {
 				deps.out(`doctor: the ledger-down popup is showing (pid ${last.pid}, until ${last.until}); nothing more this run`);
 				return;
 			}
 		}
 		if (!save()) return;
+		if (probeFailed) {
+			deps.out(`doctor: the ledger-down popup's owner pid ${last.pid} could not be checked (${probeFailed}); recorded as expired; no new popup this run, the next run decides`);
+			return;
+		}
 	}
 	if (rec.boot !== boot) rec = { boot, attempts: [] };
 	if (rec.attempts.some((a) => a.outcome?.startsWith("answered"))) {
@@ -1053,11 +1066,12 @@ export interface RunOutcome {
 
 const exitOf = (results: readonly PartResult[], notes: { failed: boolean }): 0 | 1 => (notes.failed || results.some((r) => r.verdict === "fail") ? 1 : 0);
 
-/** Open the ledger for writing; null and a note when it cannot be. */
-function openRw(deps: DoctorDeps, notes: string[]): Ledger | null {
+/** Open the ledger for writing; null, a note and the run's failure flag when it cannot be. */
+function openRw(deps: DoctorDeps, notes: string[], flag: { failed: boolean }): Ledger | null {
 	try {
 		return Ledger.open(deps.ledgerPath, { backupOnOpen: false, clock: () => iso(deps.now()) });
 	} catch (e) {
+		flag.failed = true;
 		notes.push(`doctor: the ledger ${deps.ledgerPath} could not be opened for writing (${clip(errText(e))}); no alert written this run`);
 		return null;
 	}
@@ -1078,7 +1092,7 @@ export async function runDefault(deps: DoctorDeps): Promise<RunOutcome> {
 	const results = await checkParts(deps);
 	const notes: string[] = [];
 	const flag = { failed: false };
-	const ledger = results.some((r) => r.part === "ledger" && r.verdict === "pass") ? openRw(deps, notes) : null;
+	const ledger = results.some((r) => r.part === "ledger" && r.verdict === "pass") ? openRw(deps, notes, flag) : null;
 	if (ledger) {
 		try {
 			withLedger(ledger, notes, flag, "clearing passed parts", () => applyEpisodes(ledger, results, "clear").map((b) => `wrote ${b}`));
@@ -1108,7 +1122,7 @@ export async function runAfterRestart(deps: DoctorDeps): Promise<RunOutcome> {
 		flag.failed = true;
 		notes.push(`doctor: the boot time could not be read (${clip(errText(e))}); the boot run waits for a run that can read it`);
 	}
-	const ledger = openRw(deps, notes);
+	const ledger = openRw(deps, notes, flag);
 	if (!ledger) {
 		const results = await checkParts(deps);
 		const ledgerError = results.find((r) => r.part === "ledger" && r.verdict === "fail")?.evidence ?? notes.at(-1) ?? "the ledger could not be opened";
@@ -1128,7 +1142,10 @@ export async function runAfterRestart(deps: DoctorDeps): Promise<RunOutcome> {
 		}
 		const groups = new Set<Group>(bootDue ? GROUPS : open.map(groupOf));
 		const results = groups.size > 0 ? await checkParts(deps, groups) : [];
-		const relevant = bootDue ? results : results.filter((r) => open.includes(r.part));
+		// A re-check of an open part can fail under a sibling name (deps:train-tick re-checked → fail job:train-tick): every
+		// fail and warn is kept so it is printed and counts toward the exit. "clear" mode never opens a down from it, and a
+		// part clears only when that exact part passes.
+		const relevant = bootDue ? results : results.filter((r) => open.includes(r.part) || r.verdict === "fail" || r.verdict === "warn");
 		withLedger(ledger, notes, flag, "writing episodes", () => applyEpisodes(ledger, relevant, bootDue ? "boot" : "clear").map((b) => `wrote ${b}`));
 		if (bootDue && boot !== null && !flag.failed) {
 			const b = boot;
