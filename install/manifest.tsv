@@ -69,6 +69,7 @@ classifier/test/fixtures/ledger-replay/backup-2026-10-10T17-20-31.871Z.db.gz	tes
 classifier/test/fixtures/ledger-replay/golden.txt	test	-
 classifier/test/fixtures/ledger-replay/live-2026-10-11T22-42-01.718Z.db.gz	test	-
 classifier/test/fixtures/ledger-replay/manifest.json	test	-
+classifier/test/hand-headroom.test.ts	test	-
 classifier/test/hand-session.test.ts	test	-
 classifier/test/headroom.test.ts	test	-
 classifier/test/helpers.ts	test	-
@@ -1101,11 +1102,15 @@ surface/test/tool-mount.test.ts	test	-
 voice/VOICE.md	doc	-
 voice/agent-collaboration-with-adhd-and-autism.md	doc	-
 surface/src/launch.ts	module	-
+surface/src/jo-issues.ts	module	-
+surface/src/quota-move-alert.ts	module	-
 surface/extensions/launch.ts	module	-
+surface/extensions/lane-model.ts	module	-
 surface/extensions/lane-tools.ts	module	-
 surface/scripts/lane.ts	module	-
 surface/src/omp-probe.ts	module	-
 surface/test/lane-tools.test.ts	test	-
+surface/test/quota-move-alert.test.ts	test	-
 ledger/test/lane.test.ts	test	-
 surface/test/fake-omp.ts	test	-
 surface/test/launch.test.ts	test	-
