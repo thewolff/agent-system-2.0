@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -8,6 +8,11 @@ import {
 	openProofSchema, parseProofManifest, type ProofInputs, type ProofManifest, proofEvidence, proofIterations, recoverHistoricLoad, recoverProof, runtimeIdentity, startHistoricLoad,
 } from "../src/timing-proof";
 import { tmp, until } from "./helpers";
+
+// A hang guard, not a timing dependency: the historic-load tests wait on real processes up to the code's own bounds (30 s
+// readiness per process, 10 s reap, `until`'s 30 s). The 5 s default sat below them, so a utility-class load starved past 5 s
+// at load average 34 was killed by the runner mid-launch and the test failed where the code would have finished.
+setDefaultTimeout(180_000);
 
 const sha = "a".repeat(40);
 const fixture = () => ({ version: 1, kind: "smoke", workload: "wl-proof", slice: "sl-proof", repo: "owner/repo", baseSha: sha, candidateSha: "b".repeat(40), mode: "isolated", productionBudget: false, load: "none", runs: { base: 0, candidate: 2 }, files: [{ path: "a.test.ts", cases: [{ base: ["old"], candidate: ["new", "split"], budgetMs: 5000, timingUnderTest: false }], hooks: { base: { setup: [], cleanup: [] }, candidate: { setup: [], cleanup: [] } }, skipped: { base: [], candidate: [] } }] });
