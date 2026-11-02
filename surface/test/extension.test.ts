@@ -64,7 +64,7 @@ describe("surface extension adapter", () => {
 		orchestratorSurface(f.pi, e);
 		expect(f.registered().sort()).toEqual([
 			"as2_rank", "lane_add_slice", "lane_complete_slice", "lane_full_test", "lane_handoff", "lane_message", "lane_raise_question", "lane_read_facts", "lane_record_entry", "lane_release", "lane_train_return", "lane_withdraw_reserved",
-			"orchestrator_channel_done", "orchestrator_close_workload", "orchestrator_identity", "orchestrator_launch_lane", "orchestrator_ledger", "orchestrator_lower_ceiling", "orchestrator_open_workload", "orchestrator_raise_question", "orchestrator_record_instruction", "orchestrator_reply", "orchestrator_schedule", "orchestrator_wake_read", "slice_artifact",
+			"orchestrator_channel_done", "orchestrator_close_workload", "orchestrator_identity", "orchestrator_launch_lane", "orchestrator_ledger", "orchestrator_lower_ceiling", "orchestrator_open_workload", "orchestrator_raise_question", "orchestrator_record_instruction", "orchestrator_reply", "orchestrator_schedule", "orchestrator_set_lane_model", "orchestrator_wake_read", "slice_artifact",
 		]);
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);

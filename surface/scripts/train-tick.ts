@@ -46,7 +46,13 @@
 //     only when `notified` is not written), then `sent`. Jo closing the issue is the ack (`acked`): no more re-sends. Jo's answer
 //     or withdrawal closes the issue (`closed`), found by its marker when level 1 was begun and its url never recorded. The marker
 //     lookup reads every as2-train issue (`ISSUE_LIST_ARGS`, every page); a lookup that fails or reads an unexpected shape throws,
-//     so nothing is created and no `closed` is written on a partial answer: the action stays due for the next pass.
+//     so nothing is created and no `closed` is written on a partial answer: the action stays due for the next pass. The jo-issues
+//     helpers (`issueOps`, `fileNotice`, the listing) live in surface/src/jo-issues.ts, shared with the move alert.
+//  6. Move alerts (PLAN wl-mvwk0v0gmp6cjc D4, surface/src/quota-move-alert.ts `superviseMove`). Every recorded quota move on
+//     every workload, open or closed, no age cutoff, whose alert has a channel neither ok nor exhausted: a stalled claim gets
+//     SIGTERM and `failed stalled: …`, a dead one `failed worker <pid> ended without a result`, a channel with no row 60 s after
+//     the move `unstarted …`; then, while a channel can still run within its 3 attempts per block, `lane.ts move-alert <wl> <E>`
+//     is spawned detached. Its seams (spawn, pid probe, SIGTERM) are TickDeps.moveAlert; the clock is the ledger's.
 // 3b. Boarding (PLAN wl-mvbjiettjrfpxc D1, D3, D4). The first pass writes the cutover, `train-autoboard: on <iso>`, once on the
 //     standing workload. Then every recent closed workload or released landing receipt on a served repository (`autoboardCandidates`,
 //     newest readiness first; a train, a fix workload, a W a board still covers and a W whose PR ended are not read) gets `landingReady`,
@@ -84,6 +90,7 @@ import { loadTestRunnerConfig } from "../src/close-entry";
 import {
 	attempts, consumedIds, controlEntries, heldLive, holdersOf, LANE_SCRIPT, laneCap, landFirstOffBody, landFirstOffPending, landFirstOn, launchRequestedBody, launchRowsFor, mainRetries, sameRepo, trainBindings, verdictOf,
 } from "../src/launch";
+import { field, fileNotice, GhError, type GhResult, ghJsonOf, type IssueOps, issueNumber, issueOps } from "../src/jo-issues";
 import { attemptBlock, type ChainCommit, ghMainChain, INCONCLUSIVE, type MainState, mainResults, mainState, mainVerdicts } from "../src/main-state";
 import {
 	actionable, type AlertAction, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, carryPairs, checkoutOwnerRepo, type ControlRoot,
@@ -97,15 +104,11 @@ import {
 } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import { sendNotice, TRAIN_SIGNOFF_APPLIED_PREFIX, trainMergedEntryBody, trainMergedNoticeBody } from "../src/notice";
+import { psMoveAlertProbe, quotaMoves, sigterm, spawnDetached, superviseMove, type SuperviseSeams } from "../src/quota-move-alert";
 import { type CompareResult, decisionLogFault, fastPlans, ownerRepoOf, type ResultRecord, runsRoot, type TestRunnerConfig, testRuns, withFullSuitePublication } from "../src/test-run";
 import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID } from "../src/types";
 
-/** One gh process: its exit code and output. */
-export interface GhResult {
-	code: number;
-	stdout: string;
-	stderr: string;
-}
+export type { GhResult } from "../src/jo-issues";
 
 /** The tick's land-first seams (PLAN wl-mvq4edbaf13vnk D6, § 2 Protect the verifier): the runner's entry points and the tick's own root. */
 export interface LandDeps {
@@ -135,6 +138,11 @@ export interface TickDeps {
 	config?: Pick<TestRunnerConfig, "repos">;
 	/** Land-first's seams; without them the main-run pass (step 3f) is skipped with one log line. `main()` always passes them. */
 	land?: LandDeps;
+	/**
+	 * The move-alert supervisor's seams (step 6, PLAN wl-mvwk0v0gmp6cjc D4): the detached `lane.ts move-alert` spawn, the pid
+	 * probe and the SIGTERM sender; the clock is the ledger's. Omitted, the real ones (`main()` and every test with no move).
+	 */
+	moveAlert?: SuperviseSeams;
 	log?: (line: string) => void;
 }
 
@@ -142,16 +150,6 @@ export interface TickDeps {
 type PrView = TaskView & { state: string; body: string; mergedAt: string | null };
 
 const PR_FIELDS = `${TASK_VIEW_FIELDS},state,body,mergedAt`;
-/**
- * Every issue the train filed, any state, read whole to find a marker: the REST issue listing (`GET /repos/{o}/{r}/issues`, the
- * as2-train label) through its last page (`--paginate --slurp`, an array of pages), not the search index, so an issue created a
- * moment ago is in it and none is beyond a bound.
- */
-const ISSUE_LIST_ARGS = [
-	"api", `repos/${TRAIN_ALERT_REPO}/issues`, "--method", "GET", "--paginate", "--slurp", "-f", `labels=${TRAIN_ALERT_LABEL}`, "-f", "state=all", "-f", "per_page=100",
-];
-
-class GhError extends Error {}
 
 interface TrainFacts {
 	wl: string;
@@ -162,11 +160,6 @@ interface TrainFacts {
 	mergedDeps: number[];
 }
 
-/** `json[key]` when `json` is an object, else undefined: gh's JSON is read one field at a time, each checked where it is used. */
-function field(json: unknown, key: string): unknown {
-	return typeof json === "object" && json !== null ? Reflect.get(json, key) : undefined;
-}
-
 /** One pass of the tick (D10); returns the lines it logged. */
 export function tick(d: TickDeps): string[] {
 	const out: string[] = [];
@@ -175,15 +168,7 @@ export function tick(d: TickDeps): string[] {
 		d.log?.(line);
 	};
 	const { ledger } = d;
-	const ghJson = (args: string[]): unknown => {
-		const r = d.gh(args);
-		if (r.code !== 0) throw new GhError(`gh ${args.slice(0, 3).join(" ")} exited ${r.code}: ${(r.stderr.trim() || r.stdout.trim()).split("\n").at(-1) ?? ""}`);
-		try {
-			return JSON.parse(r.stdout);
-		} catch {
-			throw new GhError(`gh ${args.slice(0, 3).join(" ")} did not return json`);
-		}
-	};
+	const ghJson = ghJsonOf(d.gh);
 	/** `train-error: tick <reason>` on the train, unless its newest tick error says the same. */
 	const trainError = (wl: string, err: unknown) => {
 		const body = `train-error: tick ${String(err instanceof Error ? err.message : err).replace(/\s+/g, " ").trim()}`;
@@ -395,7 +380,7 @@ export function tick(d: TickDeps): string[] {
 			say(`${STANDING_WORKLOAD_ID}: ${body}`);
 		}
 		const boardable = boardingPass(d, ghJson, say);
-		const ops = issueOps(d, ghJson);
+		const ops = issueOps(d.gh, ghJson);
 		// D6's read set: a repo with an open train holding a non-terminal PR, a boardable PR, or an open episode (protectionPass).
 		const read = new Set(boardable.map((b) => b.l.repo.toLowerCase()));
 		for (const wl of openTrains(ledger)) {
@@ -496,6 +481,17 @@ export function tick(d: TickDeps): string[] {
 			}
 		}
 	}
+	// 6. Move alerts (PLAN wl-mvwk0v0gmp6cjc D4): every recorded move on every workload, open or closed, no age cutoff, with a
+	// channel neither ok nor exhausted: settle its stalled, dead and unstarted claims and spawn `move-alert` while a channel can
+	// still run (3 attempts per block bound it). A pass that throws is logged and the next move still runs; the next tick retries.
+	const seams = d.moveAlert ?? { spawn: spawnDetached, probe: psMoveAlertProbe, kill: sigterm };
+	for (const move of quotaMoves(ledger)) {
+		try {
+			for (const line of superviseMove(ledger, move, seams)) say(`${move.workloadId}: move-alert ${move.eventId}: ${line}`);
+		} catch (err) {
+			say(`${move.workloadId}: move-alert ${move.eventId}: supervisor pass failed: ${errText(err)}; the next tick tries again`);
+		}
+	}
 	return out;
 }
 
@@ -513,13 +509,6 @@ function ownerLaunchDue(ledger: Ledger, owner: string, t: TrainTask): boolean {
 	const last = tried.at(-1)?.createdAt;
 	if (last === undefined || last < t.createdAt) return true;
 	return testRuns(entries).some((r) => r.request.pr === t.pr && r.result !== null && r.result.createdAt > last);
-}
-
-/** The issue number of a jo-issues url. */
-function issueNumber(url: string): string {
-	const m = /\/issues\/(\d+)$/.exec(url);
-	if (!m) throw new GhError(`${url} is not an issue url`);
-	return m[1]!;
 }
 
 /** A candidate that passed both halves of D1 this pass: its landing and the live head it boards at. */
@@ -1327,71 +1316,6 @@ function mergeNoticePass(d: TickDeps, say: (line: string) => void, repoOf: (wl: 
 	}
 }
 
-/** The jo-issues helpers the alerts (D9) and the notices (D6, D7) share. */
-interface IssueOps {
-	/** A gh call that must succeed; its stdout. */
-	run: (args: string[]) => string;
-	/**
-	 * The url of the issue the train filed whose body carries `marker`, any state; null only when the whole listing has none. A
-	 * failed or unreadable listing throws: the caller writes nothing durable and the next pass looks again.
-	 */
-	marked: (marker: string) => string | null;
-	/**
-	 * A gh call that adds labels; its stdout. A failure is retried once, and only when gh says one of `labels` is missing
-	 * (`'<label>' not found`), after each label is created (one that exists already fails harmlessly). `took`, when given, is
-	 * asked after every failure whether the call took effect anyway (an issue create whose reply was lost): its answer is
-	 * returned and nothing is retried.
-	 */
-	labelled: (args: string[], labels: readonly string[], took?: () => string | null) => string;
-}
-
-function issueOps(d: TickDeps, ghJson: (args: string[]) => unknown): IssueOps {
-	const failed = (args: string[], r: GhResult) =>
-		new GhError(`gh ${args.slice(0, 3).join(" ")} exited ${r.code}: ${(r.stderr.trim() || r.stdout.trim()).split("\n").at(-1) ?? ""}`);
-	return {
-		run: (args) => {
-			const r = d.gh(args);
-			if (r.code !== 0) throw failed(args, r);
-			return r.stdout;
-		},
-		marked: (marker) => {
-			const pages = ghJson(ISSUE_LIST_ARGS);
-			if (!Array.isArray(pages) || !pages.every(Array.isArray)) throw new GhError(`gh api repos/${TRAIN_ALERT_REPO}/issues returned an unexpected shape`);
-			for (const i of pages.flat() as unknown[]) {
-				if (typeof i !== "object" || i === null) throw new GhError(`gh api repos/${TRAIN_ALERT_REPO}/issues returned an unexpected shape`);
-				const body = field(i, "body");
-				if (typeof body !== "string" || !body.includes(marker)) continue;
-				const url = field(i, "html_url");
-				if (typeof url !== "string" || url === "") throw new GhError(`gh api repos/${TRAIN_ALERT_REPO}/issues: the issue carrying ${marker} has no html_url`);
-				return url;
-			}
-			return null;
-		},
-		labelled: (args, labels, took) => {
-			let r = d.gh(args);
-			for (let retried = false; r.code !== 0; retried = true) {
-				const done = took?.() ?? null;
-				if (done !== null) return done;
-				const text = `${r.stderr}\n${r.stdout}`;
-				if (retried || !labels.some((l) => text.includes(`'${l}' not found`))) throw failed(args, r);
-				for (const l of labels) d.gh(["label", "create", l, "-R", TRAIN_ALERT_REPO, "--description", "filed by the as2 merge train"]);
-				r = d.gh(args);
-			}
-			return r.stdout;
-		},
-	};
-}
-
-/** A notice's jo-issues issue (D6, D7): the one carrying `marker` in any state, else one created with the as2-train label; its url. */
-function fileNotice(ops: IssueOps, marker: string, title: string, body: string): string {
-	const found = ops.marked(marker);
-	if (found !== null) return found;
-	const args = ["issue", "create", "-R", TRAIN_ALERT_REPO, "--label", TRAIN_ALERT_LABEL, "--title", title, "--body", `${marker}\n${body}`];
-	const url = ops.labelled(args, [TRAIN_ALERT_LABEL], () => ops.marked(marker)).trim().split("\n").filter(Boolean).at(-1) ?? "";
-	issueNumber(url);
-	return url;
-}
-
 /** Close a notice's jo-issues issue with `comment`, unless it is closed already. */
 function closeNotice(ops: IssueOps, ghJson: (args: string[]) => unknown, url: string, comment: string): void {
 	const n = issueNumber(url);
@@ -1403,7 +1327,7 @@ function alert(d: TickDeps, facts: TrainFacts, a: AlertAction, ghJson: (args: st
 	const { ledger } = d;
 	const { q, pr, reason, options, record } = a.alert;
 	const write = (body: string) => ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: facts.wl, kind: "assumption", body });
-	const { run, marked, labelled } = issueOps(d, ghJson);
+	const { run, marked, labelled } = issueOps(d.gh, ghJson);
 	if (a.kind === "close") {
 		const answer = q.resolved_by ? ledger.instructions(facts.wl).find((i) => i.id === q.resolved_by)?.body.trim() : undefined;
 		const why = q.state === "answered" ? `Jo answered ${answer ?? "it"}` : `Jo ${q.state} it`;
