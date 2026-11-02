@@ -594,3 +594,32 @@ describe("P-11 row 15: a recorded answer lifts the gate on its own workload (MIG
 	});
 });
 
+// PLAN wl-mvwk0v0gmp6cjc D1, R3: orchestrator_set_lane_model is hand-on and scoped like the launch tool's `model`.
+const setModelCalls = (id: string): [string, Record<string, unknown>][] => [
+	["orchestrator_set_lane_model", { workloadId: id, model: "default" }],
+	["write", { path: "xd://orchestrator_set_lane_model", content: JSON.stringify({ workloadId: id, model: "default" }) }],
+];
+
+describe("P-11 row 15: orchestrator_set_lane_model waits on its own workload's questions (PLAN wl-mvwk0v0gmp6cjc R3)", () => {
+	test("refused while a row about its workload is open; allowed while only a row about another workload is open", async () => {
+		const s = await twoAsked();
+		for (const c of [...setModelCalls(WL_A), ...setModelCalls(WL_B)]) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([s.qA, s.qB]));
+		const input = await s.type("keep production on A");
+		expect(await s.record({ questionId: s.qA, inputId: input, reading: "keep production stakes on A" })).toStartWith(`Answered ${s.qA}`);
+		for (const c of setModelCalls(WL_A)) expect(await s.call(...c)).toBeUndefined();
+		for (const c of setModelCalls(WL_B)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([s.qB]));
+		// A call naming no workload is unscoped: refused while any row is open.
+		expect((await s.call("orchestrator_set_lane_model", { model: "default" }))?.reason).toBe(answerFirstRefusal([s.qB]));
+	});
+
+	test("refused while a row about nothing is open; withdrawn, it passes", async () => {
+		const s = answerSession([WL_A]);
+		const q = await s.raise(null);
+		expect(await s.publish(`**Closing ask**\n(${q}) Rename me?`)).toBeNull();
+		for (const c of setModelCalls(WL_A)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([q]));
+		await s.f.emit("before_agent_start", { prompt: `withdraw ${q}`, systemPrompt: [] }, s.ctx);
+		expect(s.question(q)).toMatchObject({ state: "withdrawn" });
+		for (const c of setModelCalls(WL_A)) expect(await s.call(...c)).toBeUndefined();
+	});
+});
+

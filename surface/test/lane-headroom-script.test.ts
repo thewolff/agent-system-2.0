@@ -3,12 +3,15 @@
 // Otherwise named models refuse before omp; unnamed models move only to base-in-quota strong-row entries,
 // confirmed by get_state before the first prompt. These process tests run outside the fence.
 import { afterAll, describe, expect, test } from "bun:test";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadTierTable } from "../../classifier/src/tier-table";
 import { LANE_RUNNER_BY, Ledger } from "../../ledger/src/index";
+import { onFire } from "../src/batch";
 import { recordRepo } from "../src/decision-log";
+import { errorLines } from "../src/errors";
 import { doneBody, laneDir, laneExit, laneModelBody, laneStarted } from "../src/launch";
+import { DISMISS_BUTTON, quotaMoves } from "../src/quota-move-alert";
 import { SURFACE_BY } from "../src/types";
 import type { FakeScript, FakeStep, LaneRoot } from "./helpers";
 import { fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, laneSnapshot, setScript, settleDrains, sh, until } from "./helpers";
@@ -47,11 +50,27 @@ function installTierTable(r: LaneRoot, strong?: readonly string[]): void {
 	}));
 }
 
+/**
+ * The move alert's gh and osascript (PLAN wl-mvwk0v0gmp6cjc D4), so a moved lane's detached `lane.ts move-alert` worker never
+ * reaches GitHub or shows a dialog: gh logs its argv and the lane binding it saw, then fails offline; osascript answers Dismiss.
+ */
+function installMoveAlertFakes(r: LaneRoot): void {
+	const gh = join(r.root, "fake-gh");
+	writeFileSync(gh, `#!/bin/sh\nprintf '%s role=%s wl=%s lane=%s\\n' "$*" "\${AGENT_SYSTEM_ROLE-unset}" "\${AGENT_SYSTEM_WORKLOAD_ID-unset}" "\${AGENT_SYSTEM_LANE_ID-unset}" >> '${join(r.root, "gh.log")}'\necho 'fake gh: offline' >&2\nexit 1\n`);
+	const osa = join(r.root, "fake-osascript");
+	writeFileSync(osa, `#!/bin/sh\necho popup >> '${join(r.root, "popup.log")}'\necho '${DISMISS_BUTTON}'\n`);
+	chmodSync(gh, 0o755);
+	chmodSync(osa, 0o755);
+	r.env.AS2_MOVE_ALERT_GH = gh;
+	r.env.AS2_MOVE_ALERT_OSASCRIPT = osa;
+}
+
 const makeRoot = (used: Record<string, number>): LaneRoot => {
 	const r = laneRoot();
 	roots.push(r);
 	writePolls(r, used);
 	installTierTable(r);
+	installMoveAlertFakes(r);
 	return r;
 };
 
@@ -121,6 +140,36 @@ const deathSenders = (r: LaneRoot, wl: string) => {
 	}
 };
 
+/**
+ * R5: the confirmed move wrote its `lane-headroom:` record and one orchestrator-bound `quota-move:` message (one transaction,
+ * `recordQuotaMove`), shown as an on-fire NOW line; then the spawned `move-alert` worker, unbound from the lane, ran both
+ * channels on the fakes (the comment failed offline, the popup answered Dismiss). Waits on the worker's popup result.
+ */
+async function expectMoveAlerted(r: LaneRoot, wl: string, laneId: string, from: string, to: string, reason: string) {
+	const l = ledgerOf(r);
+	try {
+		const moves = quotaMoves(l).filter((m) => m.workloadId === wl);
+		expect(moves.map((m) => [m.subject, m.from, m.to])).toEqual([[`lane ${laneId}`, from, to]]);
+		const move = moves[0]!;
+		expect(move.reason).toStartWith(reason);
+		const event = l.entry(move.eventId)!;
+		expect([event.created_by, event.body]).toEqual([LANE_RUNNER_BY, `lane-headroom: ${laneId} ${from} -> ${to} (${move.reason})`]);
+		const message = l.message(move.messageId)!;
+		expect([message.sender, message.recipient, message.body]).toEqual([LANE_RUNNER_BY, "orchestrator", `quota-move: lane ${laneId} on ${wl}: ${from} -> ${to} (${move.reason})`]);
+		const now = errorLines(l, undefined, { movePidProbe: () => true }).filter((x) => x.kind === "quota-move" && x.workloadId === wl);
+		expect(now.map((x) => x.line)).toEqual([`NOW: lane ${laneId} on ${wl} moved ${from} -> ${to} (${move.reason})`]);
+		expect(onFire(l, now[0]!)).toBe(true);
+		const rows = () => l.entries(wl, "assumption").filter((e) => e.created_by === LANE_RUNNER_BY && e.body.startsWith(`quota-move-alert: ${move.eventId} `)).map((e) => e.body.split(" ").slice(2, 4).join(" "));
+		await until(`the move alert's popup result for ${move.eventId}`, () => rows().includes(`popup ok`));
+		expect(rows().filter((x) => !x.endsWith("spawning"))).toEqual(["comment claim", "comment failed", "popup claim", "popup showing", "popup ok"]);
+	} finally {
+		l.close();
+	}
+	const gh = readFileSync(join(r.root, "gh.log"), "utf8");
+	expect(gh).toContain("role=unset wl=unset lane=unset");
+	expect(existsSync(join(r.root, "popup.log"))).toBe(true);
+}
+
 describe("PLAN wl-mv71x5rwdu7eo0 § 4: the quota guard at the runner's spawn", () => {
 	test("a named anthropic model with anthropic 5h at 0.85: no omp spawned; one launch-failed: at headroom and one lane-died:, both by lane-runner; released", async () => {
 		const r = makeRoot({ anthropic: 0.85 });
@@ -158,6 +207,8 @@ describe("PLAN wl-mv71x5rwdu7eo0 § 4: the quota guard at the runner's spawn", (
 		expect(snap.control.some((c) => c.prefix === "lane-model")).toBe(false);
 		expect(laneStarted(snap.control, lane1)).toMatchObject({ model: null, ranModel: SOL });
 		expect(snap.deaths).toEqual([]);
+		// R5: a 5h-window move writes the move record and its on-fire NOW message together, then alerts.
+		await expectMoveAlerted(r, wl, lane1, A, SOL, REASON);
 	}, 60_000);
 
 	test("an unnamed lane when every strong-row lab is out: never ready at headroom, no prompt, one launch-failed: and one lane-died:", async () => {
@@ -240,6 +291,8 @@ describe("mature week-only runner admission against configured budget alternativ
 				expect(laneStarted(snap.control, lane1)).toMatchObject({ model: null, ranModel: A });
 				expect(snap.control.find((c) => c.prefix === "lane-headroom")?.rest).toStartWith(`${SOL} -> ${A} (openai-codex 7d`);
 				expect(snap.deaths).toEqual([]);
+				// R5: a week move writes the move record and its on-fire NOW message together, then alerts.
+				await expectMoveAlerted(r, wl, lane1, SOL, A, "openai-codex 7d");
 			}
 		}, 60_000);
 
@@ -261,6 +314,7 @@ describe("mature week-only runner admission against configured budget alternativ
 				expect(laneExit(snap.control, lane1)).toMatchObject({ outcome: "completed" });
 				expect(commandsOf(r, 1).slice(0, 4)).toEqual(["get_state", `set_model ${K}`, "get_state", "prompt"]);
 				expect(laneStarted(snap.control, lane1)).toMatchObject({ model: null, ranModel: K });
+				await expectMoveAlerted(r, wl, lane1, SOL, K, "openai-codex ");
 			}
 		}, 60_000);
 
@@ -335,5 +389,6 @@ describe("mature week-only runner admission against configured budget alternativ
 		expect(order.indexOf("lane-headroom")).toBeLessThan(order.indexOf("lane-ready"));
 		expect(snap.control.some((c) => c.prefix === "lane-model")).toBe(false);
 		expect(snap.deaths).toEqual([]);
+		await expectMoveAlerted(r, wl, lane1, A, K, "anthropic 5h");
 	}, 60_000);
 });

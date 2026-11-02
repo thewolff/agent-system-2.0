@@ -52,13 +52,13 @@ describe("projected at reset, by the window's pace", () => {
 		expect(at([poll(0, [lim("openai-codex", "7d", 0.5, WEEK_MIN / 2)])]).decisionFor(SOL).out).toBe(
 			"openai-codex 7d 0.50 used, window pace +0.6 pts/h, projected 1.00 at reset 2026-10-18T00:00Z",
 		);
-		expect(at([poll(0, [lim("openai-codex", "7d", 0.4995, WEEK_MIN / 2)])]).decisionFor(SOL)).toEqual({ out: null, retained: null });
+		expect(at([poll(0, [lim("openai-codex", "7d", 0.4995, WEEK_MIN / 2)])]).decisionFor(SOL)).toEqual({ out: null, retained: null, exhausted: null });
 		expect(at([poll(0, [lim("openai-codex", "7d", 0.5005, WEEK_MIN / 2)])]).decisionFor(SOL).out).not.toBeNull();
 	});
 
 	test("a steep recent rise under the window's pace stays in without an exceptional diagnostic", () => {
 		const h = at([poll(60, [lim("anthropic", "7d", 0.4, 60.7 * 60)]), poll(0, [lim("anthropic", "7d", 0.43, 60.7 * 60)])]);
-		expect(h.decisionFor(OPUS, [SOL])).toEqual({ out: null, retained: null });
+		expect(h.decisionFor(OPUS, [SOL])).toEqual({ out: null, retained: null, exhausted: null });
 	});
 
 	test("live figures: anthropic .43 with 60.7h left is in; openai .56 with 124.7h left is out", () => {
@@ -69,7 +69,7 @@ describe("projected at reset, by the window's pace", () => {
 
 	for (const elapsed of [60, 61]) {
 		test(`early-week .06 at ${elapsed}min does not project`, () => {
-			expect(at([poll(0, [lim("openai-codex", "7d", 0.06, WEEK_MIN - elapsed)])]).decisionFor(SOL)).toEqual({ out: null, retained: null });
+			expect(at([poll(0, [lim("openai-codex", "7d", 0.06, WEEK_MIN - elapsed)])]).decisionFor(SOL)).toEqual({ out: null, retained: null, exhausted: null });
 		});
 	}
 
@@ -98,8 +98,8 @@ describe("projected at reset, by the window's pace", () => {
 			test(`${windowId} .999 remains ordinarily admitted before warm-up at ${elapsed}min`, () => {
 				const source = lim("openai-codex", windowId, 0.999, WEEK_MIN - elapsed);
 				const h = comparison([{ ...source, usedFraction: 0.99 }, claude(0.04)], [source, claude(0.87)]);
-				expect(h.decisionFor(SOL)).toEqual({ out: null, retained: null });
-				expect(h.decisionFor(SOL, [OPUS])).toEqual({ out: null, retained: null });
+				expect(h.decisionFor(SOL)).toEqual({ out: null, retained: null, exhausted: null });
+				expect(h.decisionFor(SOL, [OPUS])).toEqual({ out: null, retained: null, exhausted: null });
 			});
 		}
 	}
@@ -109,13 +109,16 @@ describe("projected at reset, by the window's pace", () => {
 		const hard = lim("openai-codex", "5h", 0.87, 290);
 		const paced = lim("openai-codex", "2d", 0.6, 1440);
 		const ordinary = at([poll(0, [hard, paced])]).decisionFor(SOL);
+		expect(ordinary.exhausted).toBeNull();
+		// The ordinary refusal keeps its wording and precedence; the exhausted week is named beside it.
+		const named = { ...ordinary, exhausted: "openai-codex 7d 1.00 used, quota exhausted" };
 		for (const limits of [[exhausted, hard, paced], [hard, exhausted, paced], [hard, paced, exhausted]]) {
 			const h = comparison([claude(0.04)], [...limits, claude(0.87)]);
-			expect(h.decisionFor(SOL)).toEqual(ordinary);
+			expect(h.decisionFor(SOL)).toEqual(named);
 			expectRefused(h);
 		}
 		const h = comparison([week(0.20), claude(0.04)], [exhausted, week(0.21), claude(0.87)]);
-		expect(h.decisionFor(SOL)).toEqual(at([poll(0, [week(0.21)])]).decisionFor(SOL));
+		expect(h.decisionFor(SOL)).toEqual({ ...at([poll(0, [week(0.21)])]).decisionFor(SOL), exhausted: "openai-codex 7d 1.00 used, quota exhausted" });
 		expectRefused(h);
 	});
 
@@ -129,9 +132,9 @@ describe("projected at reset, by the window's pace", () => {
 				}))),
 			];
 			const h = comparison([claude(0.04)], [...limits, claude(0.87)]);
-			expect(h.decisionFor(SOL)).toEqual({ out: null, retained: null });
-			expect(h.decisionFor(SOL, [OPUS])).toEqual({ out: null, retained: null });
-			expect(at([oldPoll(0, { "openai-codex/7d/chat": used, "openai-codex/1w/chat": used })]).decisionFor(SOL)).toEqual({ out: null, retained: null });
+			expect(h.decisionFor(SOL)).toEqual({ out: null, retained: null, exhausted: null });
+			expect(h.decisionFor(SOL, [OPUS])).toEqual({ out: null, retained: null, exhausted: null });
+			expect(at([oldPoll(0, { "openai-codex/7d/chat": used, "openai-codex/1w/chat": used })]).decisionFor(SOL)).toEqual({ out: null, retained: null, exhausted: null });
 		}
 	});
 
@@ -161,8 +164,8 @@ describe("Anthropic weekly pace is advisory", () => {
 			test(`${selector} admits ${windowId} overpace including below .70 without comparison evidence`, () => {
 				for (const used of [0.21, 0.5, 0.69, 0.999]) {
 					const h = at([poll(0, [lim("anthropic", windowId, used, WEEK_MIN - 2016)])]);
-					expect(h.decisionFor(selector)).toEqual({ out: null, retained: null });
-					expect(h.decisionFor(selector, [SOL])).toEqual({ out: null, retained: null });
+					expect(h.decisionFor(selector)).toEqual({ out: null, retained: null, exhausted: null });
+					expect(h.decisionFor(selector, [SOL])).toEqual({ out: null, retained: null, exhausted: null });
 				}
 			});
 			test(`${selector} still refuses ${windowId} exhaustion before and after warm-up`, () => {
@@ -179,8 +182,8 @@ describe("Anthropic weekly pace is advisory", () => {
 
 	test("tier-specific Anthropic weekly pace is advisory below exhaustion", () => {
 		const h = at([poll(0, [lim("anthropic", "7d", 0.99, WEEK_MIN - 2016, "fable")])]);
-		expect(h.decisionFor(FABLE)).toEqual({ out: null, retained: null });
-		expect(h.decisionFor(OPUS)).toEqual({ out: null, retained: null });
+		expect(h.decisionFor(FABLE)).toEqual({ out: null, retained: null, exhausted: null });
+		expect(h.decisionFor(OPUS)).toEqual({ out: null, retained: null, exhausted: null });
 	});
 
 	test("Anthropic weekly pace exemption preserves coexisting 5h ceiling and pace refusals in either order", () => {
@@ -202,9 +205,42 @@ describe("Anthropic weekly pace is advisory", () => {
 		for (const hard of [lim("anthropic", "5h", 0.81, 290), lim("anthropic", "5h", 0.21, 240)]) {
 			const ordinary = at([poll(0, [hard])]).decisionFor(OPUS);
 			for (const limits of [[exhausted, hard], [hard, exhausted]]) {
-				expect(at([poll(0, limits)]).decisionFor(OPUS, [SOL])).toEqual(ordinary);
+				expect(at([poll(0, limits)]).decisionFor(OPUS, [SOL])).toEqual({ ...ordinary, exhausted: "anthropic 7d 1.00 used, quota exhausted" });
 			}
 		}
+	});
+});
+
+describe("an exhausted week is named beside the refusal (R4)", () => {
+	const EXHAUSTED_WEEK = "anthropic 7d 1.00 used, quota exhausted";
+	test("a 5h limit that refused first keeps out; exhausted names the week", () => {
+		const d = at([poll(0, [lim("anthropic", "5h", 0.9, 290), lim("anthropic", "7d", 1, 3 * 24 * 60)])]).decisionFor(OPUS, [SOL]);
+		expect(d).toEqual({ out: "anthropic 5h 0.90 used > 0.80", retained: null, exhausted: EXHAUSTED_WEEK });
+	});
+	test("the week's own pace text stays out; exhausted carries the exhausted wording", () => {
+		const d = at([poll(0, [lim("anthropic", "7d", 1, 3 * 24 * 60)])]).decisionFor(OPUS);
+		expect(d.out).toMatch(/^anthropic 7d 1\.00 used, window pace /);
+		expect(d.exhausted).toBe(EXHAUSTED_WEEK);
+	});
+	test("a week-pace-only out names no exhausted week, retained or not", () => {
+		const paced = at([poll(0, [lim("openai-codex", "7d", 0.5005, WEEK_MIN / 2)])]).decisionFor(SOL);
+		expect(paced.out).not.toBeNull();
+		expect(paced.exhausted).toBeNull();
+		const retained = mature().decisionFor(SOL, [OPUS]);
+		expect(retained.retained).not.toBeNull();
+		expect(retained.exhausted).toBeNull();
+	});
+	test("a 5h-only out names no exhausted week", () => {
+		expect(at([poll(0, [lim("anthropic", "5h", 0.9, 290), lim("anthropic", "7d", 0.4, 3 * 24 * 60)])]).decisionFor(OPUS))
+			.toEqual({ out: "anthropic 5h 0.90 used > 0.80", retained: null, exhausted: null });
+	});
+	test("fail-open (stale polls) names no exhausted week", () => {
+		const h = at([poll(16, [lim("anthropic", "7d", 1, 3 * 24 * 60)])]);
+		expect(h.note).toContain("stale");
+		expect(h.decisionFor(OPUS)).toEqual({ out: null, retained: null, exhausted: null });
+	});
+	test("a passed reset binds no exhausted week", () => {
+		expect(at([poll(0, [lim("anthropic", "7d", 1, -1)])]).decisionFor(OPUS).exhausted).toBeNull();
 	});
 });
 
@@ -265,6 +301,7 @@ describe("shared Anthropic weekly snapshot", () => {
 				expect(h.decisionFor(OPUS)).toEqual({
 					out: usedFraction === 1 ? "anthropic 7d 1.00 used, quota exhausted" : null,
 					retained: null,
+					exhausted: usedFraction === 1 ? "anthropic 7d 1.00 used, quota exhausted" : null,
 				});
 			});
 		}
@@ -464,7 +501,7 @@ describe("common sample interval and rate evidence", () => {
 
 	test("stale polls fail open without claiming an exceptional retention", () => {
 		const h = comparison([week(0.20), claude(0.04)], [week(0.21), claude(0.18)], 26, 16);
-		expect(h.decisionFor(SOL, [OPUS])).toEqual({ out: null, retained: null });
+		expect(h.decisionFor(SOL, [OPUS])).toEqual({ out: null, retained: null, exhausted: null });
 		expect(h.note).toContain("stale");
 	});
 
@@ -524,11 +561,11 @@ describe("tier binding and selector syntax", () => {
 		const h = at(lines);
 		expect(h.decisionFor(FABLE).out).toMatch(/^anthropic 7d fable 1\.00 used, window pace \+1\.0 pts\/h, projected 1\.75 at reset /);
 		expect(h.decisionFor(` ${FABLE}:high `)).toEqual(h.decisionFor(FABLE));
-		expect(h.decisionFor(`${OPUS}:xhigh`)).toEqual({ out: null, retained: null });
-		expect(h.decisionFor("anthropic")).toEqual({ out: null, retained: null });
+		expect(h.decisionFor(`${OPUS}:xhigh`)).toEqual({ out: null, retained: null, exhausted: null });
+		expect(h.decisionFor("anthropic")).toEqual({ out: null, retained: null, exhausted: null });
 	});
 	test("a provider with no limits is in", () => {
-		expect(at(lines).decisionFor(`${KIMI}:high`)).toEqual({ out: null, retained: null });
+		expect(at(lines).decisionFor(`${KIMI}:high`)).toEqual({ out: null, retained: null, exhausted: null });
 	});
 });
 
@@ -545,7 +582,7 @@ describe("old poll lines (no limits)", () => {
 	});
 	test("only newest limits determine base refusal", () => {
 		const h = at([oldPoll(60, { "openai-codex/5h/chat": 0.99 }), poll(0, [lim("openai-codex", "7d", 0.5, 60)])]);
-		expect(h.decisionFor(SOL)).toEqual({ out: null, retained: null });
+		expect(h.decisionFor(SOL)).toEqual({ out: null, retained: null, exhausted: null });
 	});
 });
 
@@ -573,7 +610,7 @@ describe("fail-open and file read", () => {
 	afterAll(() => rmSync(dir, { recursive: true, force: true }));
 	test("stale is strictly older than 15min", () => {
 		const h = at([poll(16, [lim("anthropic", "5h", 0.99, 120)])]);
-		expect(h.decisionFor(OPUS)).toEqual({ out: null, retained: null });
+		expect(h.decisionFor(OPUS)).toEqual({ out: null, retained: null, exhausted: null });
 		expect(h.note).toBe("headroom polls stale: newest 16 min old in inline lines");
 		expect(at([poll(15, [lim("anthropic", "5h", 0.99, 120)])]).note).toBeNull();
 	});
@@ -588,7 +625,7 @@ describe("fail-open and file read", () => {
 		process.env.AS2_HEADROOM_POLLS = missing;
 		try {
 			const h = headroom({ now: NOW });
-			expect(h.decisionFor(OPUS)).toEqual({ out: null, retained: null });
+			expect(h.decisionFor(OPUS)).toEqual({ out: null, retained: null, exhausted: null });
 			expect(h.note).toBe(`headroom polls unreadable: ${missing} (ENOENT)`);
 			expect(h.anthropicWeek).toBeNull();
 		} finally {

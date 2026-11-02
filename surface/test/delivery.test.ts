@@ -12,7 +12,8 @@ import { type ErrorLine, errorLines } from "../src/errors";
 import { ceilingNoticeBody } from "../src/ceiling";
 import { sendNotice } from "../src/notice";
 import { Numbering } from "../src/numbering";
-import { laneExitBody, planFirstBody } from "../src/launch";
+import { laneExitBody, laneHeadroomBody, planFirstBody } from "../src/launch";
+import { quotaMoveMessageId, recordQuotaMove } from "../src/quota-move-alert";
 import { surfaceSession } from "../src/session";
 import { laneDiedShutdownBody } from "../src/signals";
 import { ARTIFACT_FAILED_PREFIX, ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
@@ -83,6 +84,31 @@ describe("consumption: held orchestrator-bound rows behind a delivered line move
 		expect(ledger.message(toLane)!.state).toBe("held");
 		// the death was surfaced once: it is not a line any more
 		expect(errorLines(ledger).map((l) => l.kind)).toEqual(["artifact"]);
+	});
+
+	test("on a closed workload consumeAllToOrchestrator takes a quota move only as recordQuotaMove wrote it (PLAN wl-mvwk0v0gmp6cjc D4, code review r1 F3)", () => {
+		const { ledger } = tempLedger();
+		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "quota move consumer probe", stakes: "normal", mode: "autonomous" });
+		const [A, SOL, why] = ["anthropic/claude-opus-5-5", "openai-codex/gpt-6.1-sol", "anthropic 7d 0.95 used > 0.90"];
+		const hand = (by: string, lane: string) => recordQuotaMove(ledger, {
+			workloadId: wl, laneId: lane, kind: "hand", token: "tok-7", slice: "sl-b", from: A, to: SOL, reason: why, by,
+			eventBody: `hand-headroom: hand tok-7 (slice sl-b) of lane ${lane} ${A} -> ${SOL} (${why})`,
+		});
+		const trusted = [
+			recordQuotaMove(ledger, { workloadId: wl, laneId: "lane-a-1", kind: "lane", from: A, to: SOL, reason: why, by: LANE_RUNNER_BY, eventBody: laneHeadroomBody("lane-a-1", A, SOL, why) }),
+			hand("lane-a-1", "lane-a-1"),
+		].map(quotaMoveMessageId);
+		const untrusted = [
+			// a lane move not by the lane runner, a hand move by a lane other than the one it names, and a move's body under a plain id
+			quotaMoveMessageId(recordQuotaMove(ledger, { workloadId: wl, laneId: "lane-a-1", kind: "lane", from: A, to: SOL, reason: why, by: "lane-a-1", eventBody: laneHeadroomBody("lane-a-1", A, SOL, why) })),
+			quotaMoveMessageId(hand("lane-x", "lane-y")),
+			ledger.enqueue({ by: LANE_RUNNER_BY, workloadId: wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: ledger.message(trusted[0]!)!.body }),
+		];
+		ledger.closeWorkload(wl, { by: SURFACE_BY });
+		expect(consumeAllToOrchestrator(ledger)).toBe(2);
+		expect(trusted.map((id) => ledger.message(id)!.state)).toEqual(["delivered", "delivered"]);
+		expect(untrusted.map((id) => ledger.message(id)!.state)).toEqual(["held", "held", "held"]);
+		expect(consumeAllToOrchestrator(ledger)).toBe(0);
 	});
 });
 
