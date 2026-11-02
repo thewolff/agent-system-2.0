@@ -1316,4 +1316,8 @@ describe("review r4 F12: every executable a job reaches by call path is in its r
 			["/bin/mv", "/bin/rm", "/bin/test", "/usr/bin/gunzip", "/usr/bin/openssl", "/usr/bin/shasum", "/usr/bin/sqlite3", "/usr/bin/stat", "/usr/bin/tar", "/usr/bin/xxd"],
 		);
 	});
+
+	test("scratch-sweep: its du, and the archive step's tar and lsof (surface/src/scratch-archive.ts)", () => {
+		expectNamed("scratch-sweep", ["du", "tar", "lsof"], []);
+	});
 });

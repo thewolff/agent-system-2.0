@@ -143,7 +143,8 @@ export const LABEL_PREFIX = "com.agent-system-2.";
  *   quiet-alarm.zsh), /usr/bin/dscl (surface/src/as2test.ts realDscl: the test runner's install preflight, readInstall
  *   from decideInstall, with no AGENT_SYSTEM_TEST_RUNNER_INSTALL set).
  * - daily-report: surface/scripts/daily-report.ts spawns nothing.
- * - scratch-sweep: surface/scripts/scratch-sweep.ts runs `du`.
+ * - scratch-sweep: surface/scripts/scratch-sweep.ts runs `du`; its archive step (surface/src/scratch-archive.ts, merged from
+ *   PR #396) runs `tar` (the archive and its verification copy) and `lsof` (openFilesUnder).
  * - chaos (surface/scripts/chaos.ts): pgrep (processList, descendantEdges), kill (the kill steps), git (mustGit, liveCheckoutOf,
  *   surface/src/chaos.ts), cp (`cp -c -R` of node_modules), bash (`bash install/install.sh`), bun (chaos-stub.ts, `lane.ts
  *   launch` and `lane.ts run`), omp (the orchestrator and probes: the walk stops there). The lane processes it spawns, as
@@ -182,7 +183,7 @@ export const JOB_INVENTORY: readonly JobRow[] = [
 		absolute: ["/bin/zsh", "/usr/bin/osascript", "/usr/bin/afplay", "/usr/bin/say", "/usr/bin/dscl"], envExecutables: [], reinstall: "bash {repo}/install/install.sh --train-tick", okExits: [0],
 	},
 	{ name: "daily-report", expected: { kind: "opt-in", flag: "--daily-report" }, pathNames: [], absolute: [], envExecutables: [], reinstall: "bash {repo}/install/install.sh --daily-report", okExits: [0] },
-	{ name: "scratch-sweep", expected: { kind: "opt-in", flag: "--scratch-sweep" }, pathNames: ["du"], absolute: [], envExecutables: [], reinstall: "bash {repo}/install/install.sh --scratch-sweep", okExits: [0] },
+	{ name: "scratch-sweep", expected: { kind: "opt-in", flag: "--scratch-sweep" }, pathNames: ["du", "tar", "lsof"], absolute: [], envExecutables: [], reinstall: "bash {repo}/install/install.sh --scratch-sweep", okExits: [0] },
 	{
 		name: "chaos", expected: { kind: "opt-in", flag: "--chaos-nightly" },
 		pathNames: [
