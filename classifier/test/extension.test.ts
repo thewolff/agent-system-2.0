@@ -411,6 +411,24 @@ describe("round limit: a falling review extends once by itself (D10, R23, R24)",
 		expect(w.logs.some((l) => l.includes(`because ruling review-auto-extend's extend could not be written (disk I/O error)`))).toBe(true);
 	});
 
+	test("R24: the ruling's own ruling-applied write fails: nothing of the extend is written; the question is raised with the failure named", async () => {
+		const w = world();
+		const real = w.ledger.recordEntry.bind(w.ledger);
+		w.ledger.recordEntry = (input) => {
+			if (input.body.startsWith(`ruling-applied: review-auto-extend`)) throw new Error("disk I/O error");
+			return real(input);
+		};
+		const h = lane(w);
+		for (const b of [3, 2, 1]) await h.round(b);
+		w.ledger.recordEntry = real;
+		const qs = w.ledger.questions(w.wl);
+		expect(qs).toHaveLength(1);
+		expect(qs[0]!.body).toEndWith("\n\nauto-extend failed: asking through ruling review-auto-extend: disk I/O error");
+		expect(bodies(w, `review-limit: ${qs[0]!.id} slice ${SL}`)).toHaveLength(1);
+		expect([bodies(w, "ruling-applied:"), bodies(w, "review-rounds-extend:"), notices(w)]).toEqual([[], [], []]);
+		expect(limitOf(w).total).toBe(3);
+	});
+
 	test("R24: the notice write fails and the raise fails too: the round is not closed and the log names both errors", async () => {
 		const w = world();
 		const real = w.ledger.raiseQuestion.bind(w.ledger);

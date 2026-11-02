@@ -1549,8 +1549,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const options = offer ? [...ROUND_LIMIT_OPTIONS, PAIR_OPTION] : [...ROUND_LIMIT_OPTIONS];
 				const reached = `review round ${round.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total})`;
 				// PLAN wl-mvqwn80onq9hq8 D10: ruling review-auto-extend may answer `extend` (falling count, no extend yet, auto-apply
-				// on). Its `ruling-applied:`, the extend and the notice are one nested write; when the extend or notice throws, all
-				// three roll back and the question is raised to Jo in a second write, its body naming the failure.
+				// on). Its `ruling-applied:`, the extend and the notice are one nested write. When any of that write throws (the
+				// ruling's own `ruling-applied:` included, so a failed decision never leaves the loop with neither extend nor
+				// question), all of it rolls back and the question is raised to Jo once more without that ruling, its body naming
+				// the failure; when that raise throws too, the error names both.
 				let extending = false;
 				let asked: AskResult;
 				let autoFailed: string | null = null;
@@ -1577,8 +1579,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						return r;
 					});
 				} catch (error) {
-					if (!extending) throw error;
 					autoFailed = message(error).replace(/\s+/g, " ").trim();
+					if (!extending) autoFailed = `asking through ruling ${AUTO_EXTEND_RULING}: ${autoFailed}`;
 					try {
 						asked = askJo(
 							ledger,
@@ -1587,7 +1589,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 							STANDING_RULINGS.filter(r => r.id !== AUTO_EXTEND_RULING),
 						);
 					} catch (raise) {
-						throw new Error(`ruling ${AUTO_EXTEND_RULING} decided the round-limit question of ${sliceId}, but writing its extend and notice failed (${autoFailed}), and raising the question to Jo failed too (${message(raise)})`, { cause: raise });
+						throw new Error(`the round-limit question of ${sliceId} went through ruling ${AUTO_EXTEND_RULING}, and its write failed (${autoFailed}), and raising the question to Jo failed too (${message(raise)})`, { cause: raise });
 					}
 				}
 				if ("decided" in asked) {

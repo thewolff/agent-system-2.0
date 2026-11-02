@@ -10,7 +10,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { handSpawnBody } from "../../classifier/src/lab";
-import { type Findings, reviewRoundBody } from "../../classifier/src/rounds";
+import { type Findings, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, type Stakes } from "../../ledger/src/index";
 import { type Ceiling, ceilingKey, effectiveCeiling, parseCeilingNotice, parseSpend, scanSpend, type Spend, wallMinutes } from "../src/ceiling";
 import { controlEntries, laneExitBody, laneStartedBody, launchable } from "../src/launch";
@@ -476,6 +476,16 @@ describe("PLAN wl-mvqwn80onq9hq8 D12: a 100 % hit rises once by half on progress
 		round(flat.ledger, flat.wl, flat.sl, 1, 1);
 		round(flat.ledger, flat.wl, flat.sl, 2, 2);
 		expect(flat.poll(50.2).hit).toMatchObject({ kind: "asked", first: `ceiling reached on ${flat.wl}: no progress since ${T0}` });
+
+		// round 2 has a second hand with no readable findings block: its known sum (1) is not a drop from 3
+		const partial = setup();
+		partial.poll(25);
+		round(partial.ledger, partial.wl, partial.sl, 1, 3);
+		round(partial.ledger, partial.wl, partial.sl, 2, 1);
+		const unread = (body: string) => partial.ledger.recordEntry({ by: LANE, workloadId: partial.wl, sliceId: partial.sl, kind: "assumption", body });
+		unread(handSpawnBody({ token: `dt-${partial.sl}-2b`, root: "/s/lane.jsonl", spawnKey: null, review: true, group: `dg-${partial.sl}-2`, row: ["openai/gpt-6"] }));
+		unread(reviewRoundBody({ slice: partial.sl, round: 2, token: `dt-${partial.sl}-2b`, group: `dg-${partial.sl}-2`, verdict: "accepted", findings: UNKNOWN }));
+		expect(partial.poll(50.2).hit).toMatchObject({ kind: "asked", first: `ceiling reached on ${partial.wl}: no progress since ${T0}` });
 	});
 
 	test("R31 half of a ceiling that rounds to no raise is a failed raise: Jo is asked, nothing announces a raise", () => {

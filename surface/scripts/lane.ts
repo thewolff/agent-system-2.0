@@ -959,7 +959,8 @@ function progressOf(ledger: Ledger, v: MeterView, pushes: ReadonlyMap<string, Pu
 		for (let i = 1; i < rounds.length; i++) {
 			const prev = rounds[i - 1]!;
 			const cur = rounds[i]!;
-			if (prev.blocking === null || cur.blocking === null || cur.blocking >= prev.blocking) continue;
+			// Both rounds' counts fully known (as fellEveryRound reads them): a member with no readable findings is missing evidence, never a drop.
+			if (prev.blocking === null || prev.unknown > 0 || prev.unread || cur.blocking === null || cur.unknown > 0 || cur.unread || cur.blocking >= prev.blocking) continue;
 			const settled = entries.filter((e) => {
 				const rr = parseReviewRound(e.body);
 				return rr !== null && rr.slice === s.id && rr.group === cur.group;
