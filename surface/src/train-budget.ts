@@ -401,24 +401,56 @@ export interface TrainBudgetRows {
 }
 
 /**
+ * D5's `meter-error` clearing, the one copy the gate and the tick's wake (D13) read: when Jo cleared meter error `entryId`,
+ * the earliest of his `relaunch` answer to the question keyed to that entry (its instruction's time) and his first launch
+ * word written after the entry; null while he has not (an open question, `hold`, another episode's answer).
+ */
+export function meterErrorClearedAt(rows: TrainBudgetRows, entryId: string): string | null {
+	const at = rows.control.findIndex((c) => c.id === entryId);
+	if (at < 0) throw new Error(`meterErrorClearedAt: ${entryId} is no control entry of ${rows.workloadId}; no clearing can be read for it`);
+	const times: string[] = [];
+	for (const q of budgetQuestions(rows.workloadId, rows.questions, entryId)) {
+		const a = joAnswerTo(q, rows.instructions);
+		if (a !== null && a.body.trim().toLowerCase() === "relaunch") times.push(a.created_at);
+	}
+	const word = rows.control.slice(at + 1).find((c) => c.prefix === "launch-requested" && c.createdBy === SURFACE_BY && /^by jo\b/.test(c.rest));
+	if (word !== undefined) times.push(word.createdAt);
+	return times.length === 0 ? null : times.reduce((a, b) => (b < a ? b : a));
+}
+
+/**
+ * D5's `budget-decision` clearing, the one copy the gate and the tick's wake (D13) read: when Jo cleared two-day pause `p`,
+ * the earliest of any answer of his to `p`'s question (its instruction's time) and his first launch word written at or
+ * after `p.until`; null while he has not. An answer is final, so the episode stays cleared.
+ */
+export function decisionClearedAt(rows: TrainBudgetRows, p: TrainPause): string | null {
+	const untilMs = Date.parse(p.until);
+	const times: string[] = [];
+	for (const q of budgetQuestions(rows.workloadId, rows.questions, p.entryId)) {
+		const a = joAnswerTo(q, rows.instructions);
+		if (a !== null) times.push(a.created_at);
+	}
+	const word = rows.control.find((c) => c.prefix === "launch-requested" && c.createdBy === SURFACE_BY && /^by jo\b/.test(c.rest) && Date.parse(c.createdAt) >= untilMs);
+	if (word !== undefined) times.push(word.createdAt);
+	return times.length === 0 ? null : times.reduce((a, b) => (b < a ? b : a));
+}
+
+/**
  * D5, pure (rows and the clock): why no launch path may start train `rows.workloadId` at `now`, or null. Checked in this
  * order, each an episode Jo can see by its entry id:
- * - `meter-error`: a `train-meter-error:` Jo has not cleared: his `relaunch` answer to the question keyed to that entry, or
- *   a `launch-requested: by jo` written after it. An open question, `hold`, or another episode's answer keeps refusing.
+ * - `meter-error`: a `train-meter-error:` Jo has not cleared (`meterErrorClearedAt`): his `relaunch` answer to the question
+ *   keyed to that entry, or a `launch-requested: by jo` written after it. An open question, `hold`, or another episode's
+ *   answer keeps refusing.
  * - `budget-paused`: the newest `train-paused:` P has `until` after `now` and no `train-raise:` for P's day after P.
  * - `budget-decision`: P's day and the PDT day before it both paused, `now` is at or past P's `until`, and Jo has not
- *   cleared it: any answer of his to P's question, or a `launch-requested: by jo` written at or after `until`.
+ *   cleared it (`decisionClearedAt`): any answer of his to P's question, or a `launch-requested: by jo` written at or after `until`.
  */
 export function trainBudgetGate(rows: TrainBudgetRows, now: string): TrainBudgetRefusal | null {
 	const nowMs = Date.parse(now);
 	if (!Number.isFinite(nowMs)) throw new Error(`trainBudgetGate: now ${JSON.stringify(now)} is not a time; the gate cannot decide ${rows.workloadId}`);
 	const index = new Map(rows.control.map((c, i) => [c.id, i]));
-	const requests = rows.control.filter((c) => c.prefix === "launch-requested" && c.createdBy === SURFACE_BY && /^by jo\b/.test(c.rest));
 	for (const e of trainMeterErrors(rows.control)) {
-		const at = index.get(e.entryId)!;
-		const relaunched = budgetQuestions(rows.workloadId, rows.questions, e.entryId)
-			.some((q) => joAnswerTo(q, rows.instructions)?.body.trim().toLowerCase() === "relaunch");
-		if (relaunched || requests.some((r) => index.get(r.id)! > at)) continue;
+		if (meterErrorClearedAt(rows, e.entryId) !== null) continue;
 		return { reason: "meter-error", entryId: e.entryId, detail: `the train's meter failed (${e.detail}); Jo's \`relaunch\` answer or launch word clears it` };
 	}
 	const pauses = trainPauses(rows.control);
@@ -431,9 +463,7 @@ export function trainBudgetGate(rows: TrainBudgetRows, now: string): TrainBudget
 		if (!raised) return { reason: "budget-paused", entryId: p.entryId, detail: `paused at $${p.usd.toFixed(2)} of $${usdText(p.limit)} for ${p.day} (PDT) until ${p.until}; a raise for ${p.day} lifts it` };
 		return null;
 	}
-	if (!twoDayPause(pauses, p)) return null;
-	const answered = budgetQuestions(rows.workloadId, rows.questions, p.entryId).some((q) => joAnswerTo(q, rows.instructions) !== null);
-	if (answered || requests.some((r) => Date.parse(r.createdAt) >= untilMs)) return null;
+	if (!twoDayPause(pauses, p) || decisionClearedAt(rows, p) !== null) return null;
 	return { reason: "budget-decision", entryId: p.entryId, detail: `paused on ${prevPdtDay(p.day)} and ${p.day} (PDT); held past ${p.until} until Jo answers wait or raise, or gives a launch word` };
 }
 

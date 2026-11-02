@@ -9,8 +9,11 @@
 // (surface/test/train-world.ts).
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { readdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { nowMarks } from "../../gates/src/rulings";
+import { budgetRefusalLine } from "../extensions/launch";
+import { askTrainPause, budgetQuestions, nextPdtMidnight, pdtDay, trainBudgetSliceId, trainDayLimit, trainMeterErrorBody, trainPausedBody, trainRaiseBody } from "../src/train-budget";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { type GhResult, tick } from "../scripts/train-tick";
 import { type Ceiling, ceilingBody, type Spend, spendBody } from "../src/ceiling";
@@ -18,22 +21,25 @@ import { errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
 import { apply, applyTrain, interpret } from "../src/input";
 import {
-	controlEntries, decideLaunch, laneExitBody, laneReadyBody, launchFailedBody, launchRequestedBody, landFirstBody, landFirstInstructionBody, mainRetryBody, mainRetryInstructionBody,
+	controlEntries, decideLaunch, laneExitBody, laneReadyBody, launchFailedBody, launchRequestedBody, launchRowsFor, landFirstBody, landFirstInstructionBody, mainRetryBody, mainRetryInstructionBody,
 	planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody,
 } from "../src/launch";
 import {
 	actionable, type ControlRoot, fixBindings, landFirstNoticeBody, landFirstRows, latestTrainReconciled, mainRedNotices, protectionEpisodes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs,
-	trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainHoldBody, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody, type WakeDeferral,
+	testRunStarts, TRAIN_METER_OPTIONS, TRAIN_STALL_OPTIONS, trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainHoldBody, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody, type WakeDeferral,
 } from "../src/merge-train";
 import { trainMergedNoticeBody } from "../src/notice";
 import { fastPlanBody, makeRunId, testRequestedBody, testRunBody, testRuns, withFullSuitePublication } from "../src/test-run";
 import { ESCALATION_BY, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { releasedOpenBody } from "../src/turn-end";
 import {
-	boardWorld, carry305, COMMIT_FILES_CAP, COMMIT_FILES_PER_PAGE, DECISION_LOG_FILE, type FakeDiffEntry, type FakeIssue, H0, H1, H2, JO, OWNER_LANE, protectedRules, REPO, TRAIN_LANE,
+	boardWorld, carry305, COMMIT_FILES_CAP, COMMIT_FILES_PER_PAGE, DECISION_LOG_FILE, type FakeDiffEntry, type FakeIssue, H0, H1, H2, JO, launchReady, OWNER_LANE, protectedRules, REPO, TRAIN_LANE,
 	world,
 } from "./train-world";
 import { tmp } from "./helpers";
+
+/** The merge-train questions keyed to budget entry `entryId` on train `wl`. */
+const budgetQuestionsOf = (l: Ledger, wl: string, entryId: string) => budgetQuestions(wl, l.questions(wl), entryId);
 
 describe("settles and deliveries (D8, D10)", () => {
 	test("a settle is written once across two ticks", () => {
@@ -198,6 +204,10 @@ describe("alerts (D9)", () => {
 		w.failTwice();
 		const q = w.ledger.questions(w.train)[0]!.id;
 		const issue = w.g.issues[0]!;
+		// #106 waits with no train progress, so it stalls at 3 h with an alert of its own (PLAN wl-mvr888nftz0vcl D8): this test
+		// reads #101's failed-twice alert alone
+		const notes = () => w.notes.filter((n) => n.includes(q));
+		const creates = () => w.creates().filter((a) => a.some((x) => x.includes("#101 needs you")));
 		w.c.plusHours(3.9);
 		w.run();
 		expect(issue.comments).toEqual([]);
@@ -208,7 +218,7 @@ describe("alerts (D9)", () => {
 		expect(issue.comments[0]).toContain("@thewolff");
 		expect(issue.comments[0]).toContain("unacknowledged 4 h");
 		expect(issue.labels).toEqual([TRAIN_ALERT_LABEL, "loud"]);
-		expect(w.notes).toHaveLength(1);
+		expect(notes()).toHaveLength(1);
 		const line = errorLines(w.ledger).find((l) => l.rowId === q);
 		expect(line?.line).toStartWith("LOUD (unacknowledged 4 h)");
 		w.c.plusHours(4);
@@ -216,13 +226,13 @@ describe("alerts (D9)", () => {
 		w.run();
 		expect(issue.comments).toHaveLength(2);
 		expect(issue.labels).toEqual([TRAIN_ALERT_LABEL, "loud", "critical"]);
-		expect(w.notes).toHaveLength(2);
+		expect(notes()).toHaveLength(2);
 		expect(errorLines(w.ledger).find((l) => l.rowId === q)?.line).toStartWith("LOUD, critical (unacknowledged 8 h)");
 		w.c.plusHours(24);
 		w.run();
 		expect(issue.comments).toHaveLength(2);
-		expect(w.notes).toHaveLength(2);
-		expect(w.creates()).toHaveLength(1);
+		expect(notes()).toHaveLength(2);
+		expect(creates()).toHaveLength(1);
 		expect(w.g.calls.some((a) => a.includes("--remove-label"))).toBe(false);
 	});
 
@@ -246,6 +256,7 @@ describe("alerts (D9)", () => {
 	test("acknowledged by closing the issue: no re-send; Jo's answer closes an open issue", () => {
 		const w = world();
 		w.failTwice();
+		const q = w.ledger.questions(w.train)[0]!.id;
 		const issue = w.g.issues[0]!;
 		issue.state = "CLOSED";
 		w.c.plusHours(4.1);
@@ -253,8 +264,9 @@ describe("alerts (D9)", () => {
 		w.c.plusHours(4);
 		w.run();
 		expect(issue.comments).toEqual([]);
-		expect(w.notes).toEqual([]);
-		expect(w.ledger.questions(w.train)[0]!.state).toBe("open");
+		// #106 stalls at 3 h with an alert of its own (PLAN wl-mvr888nftz0vcl D8); #101's closed alert sends nothing
+		expect(w.notes.filter((n) => n.includes(q))).toEqual([]);
+		expect(w.ledger.question(q)!.state).toBe("open");
 
 		const v = world();
 		v.failTwice();
@@ -549,7 +561,7 @@ describe("retries of a released train and fork PRs (D8-D10, review gtb-r1)", () 
 		});
 	}
 
-	test("an expired hold at the ceiling stays unconsumed until Jo raises the ceiling, then wakes once", () => {
+	test("an expired hold on a train its ceiling rows would stop wakes once with no raise: a train reads its daily budget, never its ceiling (PLAN wl-mvr888nftz0vcl D5, R12)", () => {
 		const w = world([101]);
 		const holdId = held(w, TRAIN_LANE, "2026-10-01T12:00:00.000Z");
 		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.train, kind: "assumption", body: ceilingBody({ usd: 10, wallMin: 360 }, "lowered by the orchestrator") });
@@ -558,16 +570,7 @@ describe("retries of a released train and fork PRs (D8-D10, review gtb-r1)", () 
 		const requests = () => controlEntries(w.ledger.entries(w.train)).filter((c) => c.prefix === "launch-requested" && c.createdBy === MERGE_TRAIN_BY);
 		const lines = w.run();
 		w.run();
-		expect(lines).toContainEqual(expect.stringContaining("not requested: stopped at its ceiling"));
-		expect(requests()).toEqual([]);
-		expect(trainLaunches(w)).toBe(0);
-		expect(holdWakes(w, holdId)).toBe(0);
-		expect(actionable(w.ledger, w.train)).toEqual([`#101 hold-expired (${holdId})`]);
-		w.c.plusHours(0.01);
-		const by = w.ledger.recordInstruction({ ...JO, workloadId: w.train, body: "ceiling: 20 6" });
-		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.train, kind: "assumption", body: ceilingBody({ usd: 20, wallMin: 360 }, "ceiling word by jo", by) });
-		w.run();
-		w.run();
+		expect(lines.filter((l) => l.includes("not requested"))).toEqual([]);
 		expect(trainLaunches(w)).toBe(1);
 		// never launched: the train's own cause `first` starts it, so the tick writes no request (PLAN wl-mvpsrr4tr0p1xc D2)
 		expect(requests()).toEqual([]);
@@ -1218,42 +1221,38 @@ describe("the relaunch loop, replaying wl-mvggzumu8zs5xc (PLAN wl-mvgn310dpi5gcg
 		return { ...w, stopAt, spend, requested, stopped };
 	};
 
-	test("T3: at its ceiling neither the train wake nor the owner delivery is requested; the max spend row counts; a Jo raise requests again", () => {
+	test("T3: at its ceiling the owner delivery is not requested; the max spend row counts; a Jo raise requests again; the train's ceiling rows stop nothing (PLAN wl-mvr888nftz0vcl D5, R12)", () => {
 		const w = ceilingWorld();
 		for (const wl of [w.train, w.owner]) w.stopAt(wl, { usd: 42, wallMin: 360 }, { usd: 42.0173, tokens: 1_200_000, wallMin: 95 });
 		let lines = w.run();
-		for (const wl of [w.train, w.owner]) {
-			expect(w.requested(wl)).toBe(0);
-			w.stopped(lines, wl, "42.0173 of 42");
-		}
-		expect(w.launches).toEqual([]);
-		// a later lane's spend row below the ceiling: still stopped at the highest
-		for (const wl of [w.train, w.owner]) w.spend(wl, { usd: 3.5, tokens: 90_000, wallMin: 6 });
+		expect(w.requested(w.owner)).toBe(0);
+		w.stopped(lines, w.owner, "42.0173 of 42");
+		// the train reads its daily budget only: the never-launched train starts on its own cause `first`, with no request
+		// (PLAN wl-mvpsrr4tr0p1xc D2) and no ceiling line
+		expect(lines.filter((l) => l.startsWith(`${w.train}:`) && l.includes("not requested"))).toEqual([]);
+		expect(w.requested(w.train)).toBe(0);
+		expect(w.launches).toEqual([w.train]);
+		// a later lane's spend row below the ceiling: the owner is still stopped at the highest
+		w.spend(w.owner, { usd: 3.5, tokens: 90_000, wallMin: 6 });
 		lines = w.run();
-		expect(w.launches).toEqual([]);
-		for (const wl of [w.train, w.owner]) w.stopped(lines, wl, "42.0173 of 42");
+		expect(w.launches).toEqual([w.train]);
+		w.stopped(lines, w.owner, "42.0173 of 42");
 		// Jo's `ceiling 80 6`: the surface's instruction and the raised ceiling: naming it
-		for (const wl of [w.train, w.owner]) {
-			const by = w.ledger.recordInstruction({ ...JO, workloadId: wl, body: "ceiling: 80 6" });
-			w.ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: ceilingBody({ usd: 80, wallMin: 360 }, "ceiling word by jo", by) });
-		}
+		const by = w.ledger.recordInstruction({ ...JO, workloadId: w.owner, body: "ceiling: 80 6" });
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.owner, kind: "assumption", body: ceilingBody({ usd: 80, wallMin: 360 }, "ceiling word by jo", by) });
 		lines = w.run();
 		expect(lines.filter((l) => l.includes("not requested"))).toEqual([]);
-		// the owner on the tick's request; the never-launched train on its own cause `first`, with no request (PLAN wl-mvpsrr4tr0p1xc D2)
 		expect(w.requested(w.owner)).toBe(1);
-		expect(w.requested(w.train)).toBe(0);
 		expect([...w.launches].sort()).toEqual([w.train, w.owner].sort());
 	});
 
-	test("T3: a wall-only stop (spend wall at the wall ceiling, dollars under) is stopped too", () => {
+	test("T3: a wall-only stop (spend wall at the wall ceiling, dollars under) stops the owner too; the train's does not (PLAN wl-mvr888nftz0vcl D5)", () => {
 		const w = ceilingWorld();
 		for (const wl of [w.train, w.owner]) w.stopAt(wl, { usd: 50, wallMin: 30 }, { usd: 1.5, tokens: 40_000, wallMin: 30 });
 		const lines = w.run();
-		for (const wl of [w.train, w.owner]) {
-			expect(w.requested(wl)).toBe(0);
-			w.stopped(lines, wl, "1.5 of 50");
-		}
-		expect(w.launches).toEqual([]);
+		expect(w.requested(w.owner)).toBe(0);
+		w.stopped(lines, w.owner, "1.5 of 50");
+		expect(w.launches).toEqual([w.train]);
 	});
 });
 
@@ -1659,5 +1658,277 @@ describe("D13: a busy owner defers its PR's wake reasons (R38)", () => {
 		const d = deferrals(w);
 		expect(d.all).toEqual([expect.stringMatching(/^train: #101 #106 /)]);
 		expect(d.out).toEqual([expect.objectContaining({ pr: 101, reasons: ["#101's dependency merged"] })]);
+	});
+});
+
+describe("the permanent train in the tick (PLAN wl-mvr888nftz0vcl D5, D6, D8, D9, D10, D13)", () => {
+	/** A train on `prs` whose lane TRAIN_LANE got ready and worked every PR; `pass` ticks with an isolated as2test root. */
+	const perm = (prs: readonly number[] = [101]) => {
+		const w = world(prs);
+		const root = tmp("as2test-root");
+		for (const n of prs) w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: trainSliceId(w.train, n), task: `PR #${n}`, doneCondition: "terminal", inputs: `#${n}` });
+		w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.train, kind: "assumption", body: laneReadyBody(TRAIN_LANE, w.c.now()) });
+		const pass = () => tick({
+			ledger: w.ledger, gh: w.g.gh, as2testRoot: root,
+			launch: (wl) => {
+				w.launches.push(wl);
+				return launchReady(w.ledger, wl);
+			},
+			notify: (_t, text) => {
+				w.notes.push(text);
+				return true;
+			},
+		});
+		/** The lane holding the train releases it and exits `outcome` (with `reason`). */
+		const end = (outcome: string, reason: string | null = null) => {
+			const lane = w.ledger.workload(w.train)!.holder ?? TRAIN_LANE;
+			w.ledger.releaseWorkload(w.train, { by: lane, holder: lane });
+			w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.train, kind: "assumption", body: laneExitBody(lane, { code: 0, signal: null, outcome, reason }) });
+		};
+		/** The runner's pause of today's PDT day (`pr` none or a PR) and its raise / wait question. */
+		const pause = (pr: number | null = null) => {
+			const nowMs = Date.parse(w.c.now());
+			const lane = w.ledger.workload(w.train)!.holder ?? TRAIN_LANE;
+			const id = w.ledger.recordEntry({
+				by: LANE_RUNNER_BY, workloadId: w.train, kind: "assumption",
+				body: trainPausedBody({ laneId: lane, day: pdtDay(nowMs), usd: 150.12, limit: 150, pr, until: new Date(nextPdtMidnight(nowMs)).toISOString() }),
+			});
+			return { id, q: askTrainPause(w.ledger, w.train, id) };
+		};
+		const launches = () => w.launches.filter((l) => l === w.train).length;
+		const merge = (q: string) => w.ledger.questions(w.train).filter((x) => x.created_by === MERGE_TRAIN_BY && x.id === q);
+		return { ...w, root, pass, end, pause, launches, merge };
+	};
+	const later = (w: { c: { plusHours: (h: number) => void } }, h = 1) => w.c.plusHours(h);
+
+	test("R12: a ready lane cut off by max-time, or stopped at its old ceiling, with #101 open is relaunched once past the train's ceiling rows; a released one is not", () => {
+		for (const [outcome, reason] of [["deadline", null], ["stop", "ceiling"]] as const) {
+			const w = perm();
+			w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.train, kind: "assumption", body: ceilingBody({ usd: 10, wallMin: 360 }, "lowered by the orchestrator") });
+			w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.train, kind: "assumption", body: spendBody(TRAIN_LANE, { usd: 12, tokens: 1000, wallMin: 370 }) });
+			w.end(outcome, reason);
+			later(w, 0.2);
+			expect(actionable(w.ledger, w.train)).toEqual([`lane ${TRAIN_LANE} ended ${outcome}${reason === null ? "" : ` ${reason}`} with #101 open`]);
+			const lines = w.pass();
+			expect(lines.filter((l) => l.includes("not requested"))).toEqual([]);
+			expect(w.launches()).toBe(1);
+			later(w);
+			w.pass();
+			expect(w.launches()).toBe(1);
+		}
+		const v = perm();
+		v.end("released");
+		later(v, 0.2);
+		expect(actionable(v.ledger, v.train)).toEqual([]);
+		v.pass();
+		expect(v.launches()).toBe(0);
+	});
+
+	test("R26 (tick): a paused train launches nothing until Jo's raise for the pause's day, then relaunches once", () => {
+		const w = perm();
+		const { q } = w.pause(101);
+		w.end("stop", "budget");
+		later(w, 0.2);
+		w.pass();
+		expect(w.launches()).toBe(0);
+		const ans = w.ledger.answerQuestion(q, { ...JO, answer: "raise" });
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.train, kind: "assumption", body: trainRaiseBody(pdtDay(Date.parse(w.c.now())), 50, ans) });
+		expect(actionable(w.ledger, w.train)).toEqual([expect.stringMatching(/^budget raised en-/)]);
+		later(w, 0.01); // the next pass comes after Jo's raise
+		w.pass();
+		expect(w.launches()).toBe(1);
+		// the launched lane got ready: the raise's wake is consumed
+		expect(actionable(w.ledger, w.train).filter((t) => t.startsWith("budget"))).toEqual([]);
+		w.pass();
+		expect(w.launches()).toBe(1);
+	});
+
+	test("R7: with no answer, after midnight PDT the tick launches the paused train, withdraws the one-day question and completes its budget slice; the wake is consumed once a lane gets ready", () => {
+		const w = perm();
+		const { id, q } = w.pause(null);
+		w.end("stop", "budget");
+		later(w, 0.2);
+		w.pass();
+		expect(w.launches()).toBe(0);
+		w.c.at(new Date(nextPdtMidnight(Date.parse(w.c.now())) + 60_000).toISOString());
+		const lines = w.pass();
+		expect(w.launches()).toBe(1);
+		expect(w.ledger.question(q)!.state).toBe("withdrawn");
+		expect(w.ledger.slice(trainBudgetSliceId(w.train, id))!.state).toBe("done");
+		expect(lines).toContainEqual(expect.stringContaining(`budget question ${q} withdrawn`));
+		expect(actionable(w.ledger, w.train).filter((t) => t.startsWith("budget"))).toEqual([]);
+		w.pass();
+		expect(w.launches()).toBe(1);
+	});
+
+	test("R9: a second full day: past midnight the gate holds the train with its question open; a second-day raise relaunches, and after a ready lane releases, midnight relaunches at $150 with no second question, the pause naming no PR", () => {
+		const w = perm();
+		w.pause(null);
+		w.end("stop", "budget");
+		w.c.at(new Date(nextPdtMidnight(Date.parse(w.c.now())) + 3_600_000).toISOString());
+		w.pass(); // midnight of day 1: the train relaunches
+		expect(w.launches()).toBe(1);
+		const { q } = w.pause(null); // day 2 at the limit too
+		w.end("stop", "budget");
+		const day2 = pdtDay(Date.parse(w.c.now()));
+		const midnight = nextPdtMidnight(Date.parse(w.c.now()));
+		w.c.at(new Date(midnight + 60_000).toISOString());
+		w.pass();
+		expect(w.launches()).toBe(1);
+		expect(w.ledger.question(q)!.state).toBe("open");
+		// the same episode run again with Jo's raise on day 2: it relaunches at once
+		const v = perm();
+		v.pause(null);
+		v.end("stop", "budget");
+		v.c.at(new Date(nextPdtMidnight(Date.parse(v.c.now())) + 3_600_000).toISOString());
+		v.pass();
+		const p2 = v.pause(null);
+		v.end("stop", "budget");
+		const ans = v.ledger.answerQuestion(p2.q, { ...JO, answer: "raise" });
+		v.ledger.recordEntry({ by: SURFACE_BY, workloadId: v.train, kind: "assumption", body: trainRaiseBody(pdtDay(Date.parse(v.c.now())), 50, ans) });
+		later(v, 0.1);
+		v.pass();
+		expect(v.launches()).toBe(2);
+		v.end("released");
+		const questions = v.ledger.questions(v.train).length;
+		v.c.at(new Date(nextPdtMidnight(Date.parse(v.c.now())) + 60_000).toISOString());
+		v.pass();
+		expect(v.launches()).toBe(3);
+		// no second question on the day-2 pause: one budget question per pause, two pauses (a stall question on #101 is the watchdog's)
+		expect(v.ledger.questions(v.train).filter((x) => x.slice_id.includes("-budget-"))).toHaveLength(2);
+		expect(trainDayLimit(controlEntries(v.ledger.entries(v.train)), pdtDay(Date.parse(v.c.now())))).toBe(150);
+		expect(day2).not.toBe(pdtDay(Date.parse(v.c.now())));
+	});
+
+	test("R5 (tick) and R24: a meter error gets one NOW relaunch / hold question across two ticks and launches nothing; hold keeps it; Jo's relaunch wakes the train once with every PR terminal and no pause row", () => {
+		const w = perm();
+		w.ledger.completeSlice(trainSliceId(w.train, 101), { by: TRAIN_LANE, artifact: "skipped: closed by its author" });
+		const err = w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.train, kind: "assumption", body: trainMeterErrorBody(TRAIN_LANE, { file: "/x/s.jsonl", line: 7, reason: "no cost" }) });
+		w.end("stop", "meter-error");
+		later(w, 0.2);
+		w.pass();
+		w.pass();
+		const qs = budgetQuestionsOf(w.ledger, w.train, err);
+		expect(qs).toHaveLength(1);
+		expect(JSON.parse(qs[0]!.options)).toEqual([...TRAIN_METER_OPTIONS]);
+		expect(qs[0]!.body).toContain("/x/s.jsonl:7 no cost");
+		expect(nowMarks(w.ledger.entries(w.train, "assumption")).get(qs[0]!.id)).toBe("incident");
+		expect(w.launches()).toBe(0);
+		const rows = launchRowsFor(w.ledger, w.train, 10)!;
+		const line = budgetRefusalLine(w.train, "meter-error", rows);
+		expect(line).toStartWith(`${w.train} is stopped by a meter error (${err}): the train's meter failed (/x/s.jsonl:7 no cost)`);
+		expect(line).toEndWith("; nothing launched");
+		w.ledger.answerQuestion(qs[0]!.id, { ...JO, answer: "relaunch" });
+		expect(actionable(w.ledger, w.train)).toEqual([`budget episode ${err} cleared`]);
+		later(w, 0.01);
+		w.pass();
+		expect(w.launches()).toBe(1);
+		expect(actionable(w.ledger, w.train).filter((t) => t.startsWith("budget"))).toEqual([]);
+		w.pass();
+		expect(w.launches()).toBe(1);
+		const v = perm();
+		const e2 = v.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: v.train, kind: "assumption", body: trainMeterErrorBody(TRAIN_LANE, { file: "/x/s.jsonl", line: 1, reason: "bad line" }) });
+		v.end("stop", "meter-error");
+		v.pass();
+		v.ledger.answerQuestion(budgetQuestionsOf(v.ledger, v.train, e2)[0]!.id, { ...JO, answer: "hold" });
+		later(v);
+		v.pass();
+		expect(v.launches()).toBe(0);
+	});
+
+	test("R24: Jo's wait on a two-day pause wakes the train once with every PR terminal", () => {
+		const w = perm();
+		w.ledger.completeSlice(trainSliceId(w.train, 101), { by: TRAIN_LANE, artifact: "skipped: closed by its author" });
+		w.pause(null);
+		w.end("stop", "budget");
+		w.c.at(new Date(nextPdtMidnight(Date.parse(w.c.now())) + 3_600_000).toISOString());
+		w.pass();
+		const before = w.launches();
+		const { id, q } = w.pause(null);
+		w.end("stop", "budget");
+		w.c.at(new Date(nextPdtMidnight(Date.parse(w.c.now())) + 3_600_000).toISOString());
+		w.pass();
+		expect(w.launches()).toBe(before);
+		w.ledger.answerQuestion(q, { ...JO, answer: "wait" });
+		expect(actionable(w.ledger, w.train)).toContain(`budget episode ${id} cleared`);
+		later(w, 0.01);
+		w.pass();
+		expect(w.launches()).toBe(before + 1);
+		expect(actionable(w.ledger, w.train).filter((t) => t.startsWith("budget"))).toEqual([]);
+		w.pass();
+		expect(w.launches()).toBe(before + 1);
+	});
+
+	test("R21: bun's banner in a train run's live log writes test-run-started: once, timed by the log's birth time; no log, no banner or a refused run writes nothing", () => {
+		const w = perm();
+		const runId = makeRunId(Date.parse(w.c.now()), "bnr1");
+		const refused = makeRunId(Date.parse(w.c.now()) + 1, "rfs1");
+		const full = w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: `${trainSliceId(w.train, 101)}-full-1`, task: "#101 suite", doneCondition: "green", inputs: "#101" });
+		for (const id of [runId, refused]) w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: w.train, sliceId: full, kind: "assumption", body: testRequestedBody({ runId: id, pr: 101, sha: H0, slice: full, by: TRAIN_LANE }) });
+		const starts = () => [...testRunStarts(w.ledger.entries(w.train)).values()];
+		w.pass();
+		expect(starts()).toEqual([]);
+		const dir = join(w.root, "runs", runId);
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "full.log"), "preflight\n");
+		w.pass();
+		expect(starts()).toEqual([]);
+		appendFileSync(join(dir, "full.log"), "bun test v1.3.14 (0d9b296a)\n");
+		later(w, 0.5);
+		w.pass();
+		w.pass();
+		const birth = statSync(join(dir, "full.log")).birthtime.toISOString();
+		expect(starts()).toEqual([expect.objectContaining({ runId, pr: 101, at: birth, seen: w.c.now() })]);
+	});
+
+	test("R11: #106 waiting 3 h with no test start and no merge raises one NOW relaunch / ack question listing its causes, whatever #101 has open; a request and result are no progress; ack re-arms the clock", () => {
+		const w = perm([101, 106]);
+		const sl = trainSliceId(w.train, 101);
+		w.ledger.raiseQuestion({ by: TRAIN_LANE, workloadId: w.train, sliceId: sl, body: "#101 production: merge it?", options: ["merged", "skip", "stop"] });
+		const full = w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: `${trainSliceId(w.train, 106)}-full-1`, task: "#106 suite", doneCondition: "green", inputs: "#106" });
+		const runId = makeRunId(Date.parse(w.c.now()) + 5, "stl1");
+		later(w, 1);
+		w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: w.train, sliceId: full, kind: "assumption", body: testRequestedBody({ runId, pr: 106, sha: H0, slice: full, by: TRAIN_LANE }) });
+		// an unreadable live log (a directory where full.log belongs) is a cause, not skipped
+		mkdirSync(join(w.root, "runs", runId, "full.log"), { recursive: true });
+		const stalls = () => w.ledger.questions(w.train).filter((q) => trainSliceId(w.train, 106) === q.slice_id && JSON.stringify(JSON.parse(q.options)) === JSON.stringify(TRAIN_STALL_OPTIONS));
+		later(w, 1.9);
+		w.pass();
+		expect(stalls()).toEqual([]);
+		later(w, 0.2);
+		w.pass();
+		w.pass();
+		expect(stalls()).toHaveLength(1);
+		const q = stalls()[0]!;
+		expect(nowMarks(w.ledger.entries(w.train, "assumption")).get(q.id)).toBe("incident");
+		expect(q.body).toContain("#106 has waited");
+		expect(q.body).toContain(`run ${runId} (#106) requested`);
+		expect(q.body).toContain("live log unreadable");
+		expect(q.body).toContain("no lane-exit: on the train");
+		later(w, 0.1); // Jo acks a while after the question
+		w.ledger.answerQuestion(q.id, { ...JO, answer: "ack" });
+		later(w, 2.9);
+		w.pass();
+		expect(stalls()).toHaveLength(1);
+		later(w, 0.2);
+		w.pass();
+		expect(stalls()).toHaveLength(2);
+	});
+
+	test("D8: Jo's relaunch on a stall question stops the live train lane once with a surface lane-stop:", () => {
+		const w = perm([101]);
+		later(w, 3.1);
+		w.pass();
+		const q = w.ledger.questions(w.train).find((x) => JSON.stringify(JSON.parse(x.options)) === JSON.stringify(TRAIN_STALL_OPTIONS))!;
+		expect(q).toBeDefined();
+		const lane = "lane-x-live";
+		if (w.ledger.workload(w.train)!.holder !== null) w.ledger.releaseWorkload(w.train, { by: w.ledger.workload(w.train)!.holder!, holder: w.ledger.workload(w.train)!.holder! });
+		expect(w.ledger.claimWorkload(w.train, { by: LANE_STARTER_BY, holder: lane, leaseMs: 3_600_000 }).won).toBe(true);
+		later(w, 0.01);
+		w.ledger.answerQuestion(q.id, { ...JO, answer: "relaunch" });
+		w.pass();
+		w.pass();
+		const stops = controlEntries(w.ledger.entries(w.train)).filter((c) => c.prefix === "lane-stop" && c.laneId === lane);
+		expect(stops.map((c) => [c.createdBy, c.rest])).toEqual([[SURFACE_BY, "requested stall-relaunch by jo"]]);
 	});
 });

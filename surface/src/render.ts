@@ -12,7 +12,7 @@
 // is the on-demand read's (LEDGER_TOOL), for one workload or all of them. While an agent channel runs on the ledger
 // handle (PLAN wl-mv8vx7wdj5nx1c D3), every render carries the `## from other agents` block after the needs-you lines:
 // the channel's notes, which are Ilex's to read and not Jo's to answer (surface/src/channel.ts `fromOtherAgents`).
-import { type InFlightWorkload, type InstructionRow, LANE_RUNNER_BY, type Ledger, type MessageRow, type SliceRow, type WorkloadStatusRow } from "../../ledger/src/index";
+import type { InFlightWorkload, InstructionRow, Ledger, MessageRow, SliceRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { channelInForce, fromOtherAgents } from "./channel";
 import { needsYouBullet } from "./delivery";
 import { type ErrorLine, errorLines, parseDue, wordsOf } from "./errors";
@@ -25,7 +25,8 @@ import { pairOfferLine, shownOptions } from "./pair-suggest";
 import { Numbering } from "./numbering";
 import { currentGoals, livePins, parseAudit, rankDay, rankOpen, rankPosition } from "./rank";
 import { queuePosition } from "./rank-launch";
-import { LAST_N, LEDGER_TOOL, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
+import { pdtDay, trainDayLimit, trainPauses, trainRaises } from "./train-budget";
+import { LAST_N, LEDGER_TOOL, STANDING_WORKLOAD_ID } from "./types";
 
 export interface RenderOptions {
 	now?: string;
@@ -89,43 +90,21 @@ function oneLinerParts(ledger: Ledger, workload: WorkloadStatusRow): { state: st
 }
 
 // ---- a merge train's daily budget (PLAN wl-mvr888nftz0vcl D4, D5) ------------------------------------------------
-// A train has no ceiling and no wall: $150 per America/Los_Angeles day plus that day's `train-raise:` rows. The facts are
-// read here from the rows' own prefixes, the runner's `train-paused:` and the surface's `train-raise:`, with the writer
-// checked as the launch gate checks it; the gate itself (surface/src/train-budget.ts) decides launches, this only shows.
-
-const TRAIN_DAILY_USD = 150;
-const PDT_PARTS = new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit" });
-const TRAIN_PAUSED_RE = /^train-paused:\s+lane-\S+\s+day (\d{4}-\d{2}-\d{2}) usd (\S+) limit (\S+) pr ([1-9]\d*|none) until (\S+)$/;
-const TRAIN_RAISE_RE = /^train-raise:\s+day (\d{4}-\d{2}-\d{2}) usd (\S+) answer (\S+)$/;
 
 /**
- * A merge train's limit part of the one-liner: `budget $<L>/PDT day · no wall`, L today's limit ($150 plus every valid
- * `train-raise:` for today's PDT day), then ` · paused until <iso>` while the newest valid `train-paused:` runs past now and no
- * raise for its day came after it. Null for a workload with no train membership (`trainMembers`): it keeps its ceiling.
+ * A merge train's limit part of the one-liner: `budget $<L>/PDT day · no wall`, L today's limit (`trainDayLimit`: $150 plus
+ * every valid `train-raise:` for today's PDT day), then ` · paused until <iso>` while the newest valid `train-paused:` runs
+ * past now and no raise for its day came after it, the gate's `budget-paused` rule (`trainBudgetGate`, which decides
+ * launches; this only shows). Null for a workload with no train membership (`trainMembers`): it keeps its ceiling.
  */
 function trainBudgetText(ledger: Ledger, workloadId: string): string | null {
 	if (trainMembers(ledger.entries(workloadId), ledger.instructions(workloadId)).length === 0) return null;
 	const now = ledger.now();
-	const day = (type: string) => PDT_PARTS.formatToParts(new Date(now)).find((p) => p.type === type)!.value;
-	const today = `${day("year")}-${day("month")}-${day("day")}`;
-	let limit = TRAIN_DAILY_USD;
-	let paused: { day: string; until: string; at: number } | null = null;
-	const raises: { day: string; at: number }[] = [];
-	const rows = ledger.entries(workloadId, "assumption");
-	for (let at = 0; at < rows.length; at++) {
-		const e = rows[at]!;
-		const p = e.created_by === LANE_RUNNER_BY ? TRAIN_PAUSED_RE.exec(e.body.trim()) : null;
-		if (p && Number.isFinite(Date.parse(p[5]!))) paused = { day: p[1]!, until: p[5]!, at };
-		const r = e.created_by === SURFACE_BY ? TRAIN_RAISE_RE.exec(e.body.trim()) : null;
-		const usd = r ? Number(r[2]) : NaN;
-		if (r && Number.isFinite(usd) && usd > 0) {
-			raises.push({ day: r[1]!, at });
-			if (r[1] === today) limit += usd;
-		}
-	}
-	const p = paused;
-	const stillPaused = p !== null && Date.parse(p.until) > Date.parse(now) && !raises.some((r) => r.day === p.day && r.at > p.at);
-	return `budget $${Number(limit.toFixed(2))}/PDT day · no wall${p !== null && stillPaused ? ` · paused until ${when(p.until)}` : ""}`;
+	const control = controlEntries(ledger.entries(workloadId, "assumption"));
+	const p = trainPauses(control).at(-1);
+	const paused = p !== undefined && Date.parse(p.until) > Date.parse(now)
+		&& !trainRaises(control).some((r) => r.day === p.day && control.findIndex((c) => c.id === r.entryId) > control.findIndex((c) => c.id === p.entryId));
+	return `budget $${Number(trainDayLimit(control, pdtDay(Date.parse(now))).toFixed(2))}/PDT day · no wall${p !== undefined && paused ? ` · paused until ${when(p.until)}` : ""}`;
 }
 
 const when = (iso: string): string => iso.replace(/\.\d{3}Z$/, "Z");

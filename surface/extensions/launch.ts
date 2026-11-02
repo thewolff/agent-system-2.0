@@ -17,11 +17,12 @@
 // At cap it runs `preemptFor` (PLAN wl-mv8wzytml878b4 D3): in `order`, a Jo-ruled workload waiting at
 // cap gets a priority stop written on the lowest-ranked running lane below it, told as
 // `priority-pausing <lane> on <wl> for <X>`.
-import type { Ledger } from "../../ledger/src/index";
+import type { Ledger, ReserveRows } from "../../ledger/src/index";
 import {
-	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, launchRowsFor, type LaunchVerdict, launchRequestedBody, modelProblem, STARTER_EXIT,
+	byHandLine, controlEntries, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, launchRowsFor, type LaunchVerdict, launchRequestedBody, modelProblem, STARTER_EXIT,
 } from "../src/launch";
 import { openTrains } from "../src/merge-train";
+import { type TrainBudgetReason, trainBudgetGate, trainBudgetRows, trainPauses } from "../src/train-budget";
 import { preemptFor, rankGate, readRankConfig, writePickSnapshot } from "../src/rank-launch";
 import { surfaceSession } from "../src/session";
 import { DUE_PREFIX, LAUNCH_LANE_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult } from "../src/types";
@@ -37,6 +38,24 @@ const intakeQueuedLine = (workloadId: string, position: string): string =>
 /** The open and tick line for a priority stop `preemptFor` wrote (PLAN wl-mv8wzytml878b4 D4). */
 export const priorityPausingLine = (p: { laneId: string; workloadId: string; forWl: string }): string =>
 	`priority-pausing ${p.laneId} on ${p.workloadId} for ${p.forWl}`;
+
+/**
+ * The line for a train the daily budget refuses (PLAN wl-mvr888nftz0vcl D5), read again from the same rows: when the pause
+ * ends, or what Jo's answer clears. A gate that no longer gives `reason` on these rows says so rather than guess a time.
+ */
+export function budgetRefusalLine(workloadId: string, reason: TrainBudgetReason, rows: ReserveRows): string {
+	const r = trainBudgetGate(trainBudgetRows(rows), rows.now);
+	if (r === null || r.reason !== reason) return `${workloadId} was refused ${reason} by its daily budget, which no longer reads so on a second look (${r?.reason ?? "open"}); nothing launched`;
+	const pause = trainPauses(controlEntries(rows.entries)).find((p) => p.entryId === r.entryId);
+	switch (reason) {
+		case "budget-paused":
+			return `${workloadId} is paused on its daily budget until ${pause?.until ?? `the end of pause ${r.entryId}`}; nothing launched`;
+		case "budget-decision":
+			return `${workloadId} is paused on its daily budget two days in a row (${pause?.day ?? r.entryId} PDT): it waits past midnight until Jo answers its pause question wait or raise, or gives a launch word; nothing launched`;
+		case "meter-error":
+			return `${workloadId} is stopped by a meter error (${r.entryId}): ${r.detail}; nothing launched`;
+	}
+}
 
 export interface LaunchOutcome {
 	/** The predicate said launch and the starter was run. */
@@ -84,6 +103,10 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 				return { attempted: false, code: null, line: `${workloadId} has had a lane and no new cause: relaunch on your word with ${LAUNCH_LANE_TOOL}` };
 			case "closed":
 				return { attempted: false, code: null, line: `${workloadId} is closed; nothing launched` };
+			case "budget-paused":
+			case "budget-decision":
+			case "meter-error":
+				return { attempted: false, code: null, line: budgetRefusalLine(workloadId, verdict.reason, rows) };
 			default: {
 				// Jev ranking's refusals (D7): `ranked: below <wl>`, `queued: position <n>` (the intake queue) and `parallel: <reason>`.
 				const below = /^ranked: below (\S+)$/.exec(verdict.reason);

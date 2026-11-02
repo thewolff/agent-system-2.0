@@ -790,27 +790,21 @@ describe("T6 (acceptance 6): episodes, resets, and the PR the train never worked
 		expect(w.trainLaunches().some((l) => l.includes(requests[3]!))).toBe(false);
 	});
 
-	test("three by-hand sessions on a train Jo flipped to user-driven count no failed launch: the fourth by-hand reservation is admitted (lane decision en-mvpx8gfkld6ku8)", () => {
+	test("a train Jo flipped to user-driven refuses every by-hand reservation (train-autonomous, PLAN wl-mvr888nftz0vcl D5): no lane holds it, no lane row is written, and no failed launch counts", () => {
 		const w = live();
 		ensureStandingWorkload(w.ledger);
 		w.ledger.flipMode(w.train, { by: SURFACE_BY, mode: "user-driven", author: "jo", channel: "surface" });
-		for (let i = 0; i < 3; i++) {
-			const r = laneScript.reserve(w.ledger, w.train, "jo", true, SHOW, w.probeFor);
-			if (!r.ok) throw new Error(r.reason);
-			expect(r.cause).toBe("interactive");
-			// the by-hand starter (`cmdInteractive`): its lane-started:, no lane-ready:, then its release and a clean interactive exit
-			w.started(w.train, r.laneId);
-			w.c.plusHours(STEP_H);
-			w.ledger.releaseWorkload(w.train, { by: LANE_STARTER_BY, holder: r.laneId });
-			w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.train, kind: "assumption", body: laneExitBody(r.laneId, { code: 0, signal: null, outcome: "interactive" }) });
-			w.alive.delete(r.laneId);
+		const before = w.ledger.entries(w.train).length;
+		for (let i = 0; i < 4; i++) {
+			expect(laneScript.reserve(w.ledger, w.train, "jo", true, SHOW, w.probeFor)).toMatchObject({ ok: false, reason: "train-autonomous" });
 			w.c.plusHours(STEP_H);
 		}
 		const now = w.ledger.workload(w.train)!;
+		expect(now.holder).toBeNull();
+		expect(w.ledger.entries(w.train).slice(before).filter((e) => /^lane-(started|ready|exit):/.test(e.body))).toEqual([]);
 		expect(trainLaunchFailures({
 			entries: w.ledger.entries(w.train), instructions: w.ledger.instructions(w.train), questions: w.ledger.questions(w.train), holder: now.holder, holderLeaseUntil: now.holder_lease_until, now: w.ledger.now(),
 		}).count).toBe(0);
-		expect(laneScript.reserve(w.ledger, w.train, "jo", true, SHOW, w.probeFor)).toMatchObject({ ok: true, cause: "interactive" });
 	});
 });
 
