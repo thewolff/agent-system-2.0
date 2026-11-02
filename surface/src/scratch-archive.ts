@@ -27,13 +27,13 @@
 // chmods the tree back, one running as root, and one that works in the purge's staging directory (`.as2-purge-<16 hex>`,
 // made 0700 after the freeze).
 // Progress deadline: the archive of one root (steps 1–8) and its purge each get ARCHIVE_DEADLINE_MS on an injectable
-// clock, checked after every manifest entry read and every 1 MiB hashed (`progressDeadline`); past it the work stops
-// through its own failure path (the archive's `fail`, the purge's put-back and mode restore), so the tree is kept. A
-// file is hashed only up to the size its lstat recorded, so a writer still appending fails the read instead of keeping
-// it going. The residual: the check runs between reads, so a single read, lstat or readdir syscall that never returns
-// (a hung filesystem) cannot be bounded in-process; the tar and lsof runs are bounded by their own timeouts, and
-// `freezeTree` (stat and chmod per entry, no reads of contents) is not checked, because a stop part way through it
-// would leave modes its failure path cannot give back.
+// clock, checked after every manifest entry read, every entry the freeze takes the write bits off, and every 1 MiB
+// hashed (`progressDeadline`); past it the work stops through its own failure path (the freeze's thaw, the archive's
+// `fail`, the purge's put-back and mode restore), so the tree is kept. Those rollbacks are never cut short by the
+// expired deadline. A file is hashed only up to the size its lstat recorded, so a writer still appending fails the read
+// instead of keeping it going. The residual: the check runs between syscalls, so a single read, lstat, chmod or readdir
+// that never returns (a hung filesystem) cannot be bounded in-process; the tar and lsof runs are bounded by their own
+// timeouts.
 // The daily sweep (surface/scripts/scratch-sweep.ts) expires archives older than `scratchArchive.expireDays`, and, when
 // `scratchArchive.requireOffsite` is on, only those with an `<archive>.offsite` marker beside them (written by an offsite
 // copy job once its copy is confirmed).
@@ -499,7 +499,7 @@ export function archiveDetached(dir: string, dest: string, seams: ArchiveSeams =
 		// the inode's, so a hard link from outside is held too (a writable one refuses the freeze). lsof then catches a
 		// descriptor opened before the freeze. Last, every frozen file is hashed again against what was archived: a write
 		// in the freeze's own stat-to-chmod step that kept size and mtime leaves no other trace (the chmod moves ctime).
-		const frozen = freezeTree(dir, seams.beforeChmod);
+		const frozen = freezeTree(dir, seams.beforeChmod, check);
 		if (frozen.kind === "failed") return fail(`${dir} could not be frozen: ${frozen.reason}`);
 		thawed = frozen.changed;
 		seams.afterFreeze?.(dir);
@@ -532,9 +532,10 @@ function hashDiff(archived: Manifest, now: Manifest): string[] {
  * and read each entry after: its manifest at the freeze. Symlinks are left as they are. A regular file with another hard
  * link that is writable refuses (its other path may be the one written); one already without write bits (a git object) is
  * left untouched. On a refusal or error, the bits already taken are given back. `changed` is every path whose mode was
- * changed, with its mode before. `beforeChmod` (a test seam) runs between an entry's stat and its chmod. Never throws.
+ * changed, with its mode before. `beforeChmod` (a test seam) runs between an entry's stat and its chmod. `check` (the
+ * archive's progress deadline) runs after each entry; past it the freeze fails the same way, its bits given back. Never throws.
  */
-export function freezeTree(dir: string, beforeChmod?: (path: string) => void): { kind: "frozen"; at: Manifest; ctimeBefore: Map<string, bigint>; changed: [string, number][] } | { kind: "failed"; reason: string } {
+export function freezeTree(dir: string, beforeChmod?: (path: string) => void, check: ProgressCheck = () => {}): { kind: "frozen"; at: Manifest; ctimeBefore: Map<string, bigint>; changed: [string, number][] } | { kind: "failed"; reason: string } {
 	const at: Manifest = new Map();
 	const ctimeBefore = new Map<string, bigint>();
 	const changed: [string, number][] = [];
@@ -558,6 +559,7 @@ export function freezeTree(dir: string, beforeChmod?: (path: string) => void): {
 			}
 			at.set(rel, entryOf(abs, st));
 			if (st.isDirectory()) for (const name of readdirSync(abs)) stack.push(rel === "" ? name : `${rel}/${name}`);
+			check(`freezing ${abs}`);
 		}
 	} catch (e) {
 		const t = thawTree(dir, changed);

@@ -718,6 +718,30 @@ describe("orchestrator_close_workload archives the root, then removes it, after 
 			expect(readdirSync(archiveDir)).toEqual([]);
 		});
 
+		test("past its deadline part way through the freeze, the freeze stops after that entry: the bits it took are given back, the archive is dropped and the tree kept", () => {
+			const { dir, archiveDir, dest, modes, had } = tree("deadline-freeze");
+			// The progress deadline is the timing under test, driven by the fake clock `clock` (advanced at the freeze's second
+			// chmod); nothing here reads the wall clock.
+			let now = 0;
+			const clock = () => now;
+			let chmods = 0;
+			const a = archiveDetached(dir, dest, {
+				openFiles: () => ({ kind: "none" }),
+				clock,
+				beforeChmod: () => {
+					if (++chmods === 2) now += ARCHIVE_DEADLINE_MS + 1;
+				},
+			});
+			expect(chmods).toBe(2);
+			expect(a.kind).toBe("failed");
+			const reason = a.kind === "failed" ? a.reason : "";
+			expect(reason.startsWith(`${dir} could not be frozen: archiving ${dir} passed its 15 min deadline at freezing ${dir}`)).toBe(true);
+			expect(reason.endsWith(`; the tree is kept; the archive ${dest} was dropped`)).toBe(true);
+			expect(modes()).toEqual(had);
+			expect(readFileSync(join(dir, "REPORT.md"), "utf8")).toBe("aaaa");
+			expect(readdirSync(archiveDir)).toEqual([]);
+		});
+
 		test("past its deadline after a 1 MiB chunk of a hash, the archive fails there: the partial is removed and the tree kept", () => {
 			const { dir, archiveDir, dest, modes, had } = tree("deadline-hash");
 			// The progress deadline is the timing under test, driven by the fake clock `clock` (advanced when the verification
