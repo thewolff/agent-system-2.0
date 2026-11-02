@@ -3,9 +3,11 @@
 // `input` event and his turn's `before_agent_start`, and moves the session clock (`s.now`) and the
 // lane connection's clock together, so the fixed window and the quiet stretch are measured on it.
 import { describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { closeWorkloadWithEntry } from "../extensions/workload";
+import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { recordRepo } from "../src/decision-log";
 import { consumeLines } from "../src/delivery";
 import { applyTrain, interpret } from "../src/input";
@@ -14,7 +16,8 @@ import orchestratorSurface from "../index";
 import { onFire } from "../src/batch";
 import { ceilingNoticeBody } from "../src/ceiling";
 import { errorLines } from "../src/errors";
-import { laneExitBody, SCRATCH_SWEEP_BY } from "../src/launch";
+import { laneExitBody, laneHeadroomBody, SCRATCH_SWEEP_BY } from "../src/launch";
+import { quotaMoveMessageId, recordQuotaMove } from "../src/quota-move-alert";
 import { sendNotice } from "../src/notice";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { surfaceSession } from "../src/session";
@@ -23,7 +26,7 @@ import {
 	type Failure, makeRunId, notifiesOrchestrator, securityRedBody, securityRedOf, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf,
 } from "../src/test-run";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
-import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY, type SurfaceAPI } from "../src/types";
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { askJo, nowBody } from "../../gates/src/rulings";
 import { clock, ctxOf, fakePi, loadTestText, notices, type Sent, tempLedger, timers, tmp, workloadWithSlice } from "./helpers";
@@ -379,6 +382,51 @@ describe("security-red (PLAN wl-mvg1vs0rhnu3gg § 3.3): a failing gate test is o
 		t.minutes(10);
 		t.poll();
 		expect(t.needsYou().some((x) => x.message.content.includes(needle))).toBe(false);
+	});
+});
+
+describe("quota-move (PLAN wl-mvwk0v0gmp6cjc D4, code review r1 F3): a move whose workload closes before delivery", () => {
+	test("stays held through the real close, is rendered and consumed at a wake exactly once, and neither the ledger read, the poll nor the next wake shows it; a message to the lane is left alone", async () => {
+		const t = await surface();
+		const l = t.lane;
+		const { wl, sl } = workloadWithSlice(l);
+		const [A, SOL, why] = ["anthropic/claude-opus-5-5", "openai-codex/gpt-6.1-sol", "anthropic 7d 0.95 used > 0.90"];
+		const laneMove = recordQuotaMove(l, { workloadId: wl, laneId: "lane-a-1", kind: "lane", from: A, to: SOL, reason: why, by: LANE_RUNNER_BY, eventBody: laneHeadroomBody("lane-a-1", A, SOL, why) });
+		const handSubject = `hand tok-7 (slice ${sl}) of lane lane-a-1`;
+		const handMove = recordQuotaMove(l, {
+			workloadId: wl, laneId: "lane-a-1", kind: "hand", token: "tok-7", slice: sl, from: A, to: SOL, reason: why, by: "lane-a-1",
+			eventBody: `hand-headroom: ${handSubject} ${A} -> ${SOL} (${why})`,
+		});
+		const moves = [laneMove, handMove].map(quotaMoveMessageId);
+		// A message to the lane: neither the close nor a wake touches it.
+		const toLane = l.enqueue({ by: SURFACE_BY, workloadId: wl, sender: SURFACE_BY, recipient: "lane-a-1", body: "placeholder for the lane" });
+		l.completeSlice(sl, { by: "lane-a-1", artifact: "done" });
+		// Closed through the real close tool's path, on a scratch checkout no profile serves (close-held.test.ts `closable`).
+		const root = realpathSync(tmp("quota-move-close"));
+		writeFileSync(join(root, "config.yml"), "setupVersion: 2\n");
+		recordRepo(l, wl, root);
+		const pi = { appendEntry: () => {} } as unknown as SurfaceAPI;
+		const closed = await closeWorkloadWithEntry(pi, l, { [TEST_RUNNER_CONFIG_ENV]: join(root, "config.yml") }, wl, { now: t.c.now(), cwd: root, receipt: null });
+		expect(closed.closed).toBe(true);
+		expect(moves.map((id) => l.message(id)!.state)).toEqual(["held", "held"]);
+		const needles = [`NOW: lane lane-a-1 on ${wl} moved ${A} -> ${SOL}`, `NOW: ${handSubject} on ${wl} moved ${A} -> ${SOL}`];
+		const showing = (text: string) => needles.map((n) => text.split(n).length - 1);
+		await t.f.emit("session_compact", { type: "session_compact" }, t.ctx);
+		const wake = await t.jo("go on");
+		expect(showing(wake)).toEqual([1, 1]);
+		expect(moves.map((id) => l.message(id)!.state)).toEqual(["delivered", "delivered"]);
+		expect(l.message(toLane)!.state).toBe("held");
+		await t.f.tool("orchestrator_wake_read").execute("2", { body: "resuming" }, undefined, undefined, t.ctx);
+		const read = (await t.f.tool("orchestrator_ledger").execute("1", {}, undefined, undefined, t.ctx)).content[0]!.text;
+		expect(showing(read)).toEqual([0, 0]);
+		t.minutes(10);
+		t.poll();
+		expect(t.needsYou().filter((x) => showing(x.message.content).some((n) => n > 0))).toEqual([]);
+		// The next wake: the move is not shown again.
+		await t.f.emit("session_compact", { type: "session_compact" }, t.ctx);
+		const next = await t.jo("go on again");
+		expect(next).toContain("This turn owes one wake-read entry");
+		expect(showing(next)).toEqual([0, 0]);
 	});
 });
 

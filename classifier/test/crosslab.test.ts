@@ -115,6 +115,8 @@ function lane(w: World, opts: { fingerprint?: (cwd: string) => string; now?: () 
 	const handlers: Record<string, Handler> = {};
 	const handSession: Record<string, Handler> = {};
 	const logs: string[] = [];
+	/** The move alerts the extension started (PLAN wl-mvwk0v0gmp6cjc D6): workload and event id; no process is spawned. */
+	const moveAlerts: { workloadId: string; eventId: string }[] = [];
 	const extension = createClassifierExtension({
 		judge: async () => JUDGE as never,
 		tierTable: () => w.table,
@@ -130,6 +132,10 @@ function lane(w: World, opts: { fingerprint?: (cwd: string) => string; now?: () 
 		log: line => logs.push(line),
 		now: opts.now ?? (() => RULE_END),
 		...(opts.fingerprint ? { fingerprint: opts.fingerprint } : {}),
+		spawnMoveAlert: (_ledger, workloadId, eventId) => {
+			moveAlerts.push({ workloadId, eventId });
+			return null;
+		},
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
@@ -143,6 +149,7 @@ function lane(w: World, opts: { fingerprint?: (cwd: string) => string; now?: () 
 	const text = (msg: unknown) => (typeof msg === "object" && msg !== null && "content" in msg ? String(msg.content) : "");
 	return {
 		logs,
+		moveAlerts,
 		/** The lane switches to `selector` (OMP's model switch): its later build hands run on that lab. */
 		setLaneModel: (selector: string) => void (ctx.model = currentModel(selector)),
 		toolCall: (input: unknown, toolCallId = "call-1") => handlers.tool_call!({ type: "tool_call", toolName: "task", toolCallId, input }, ctx) as Promise<Reply>,
@@ -2280,11 +2287,10 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 		}
 	});
 
-	test("slower or tied Claude, source exhaustion and a hard source meter still refuse the same-lab build", async () => {
+	test("slower or tied Claude and a hard source meter still refuse the same-lab build; source exhaustion moves it (D6)", async () => {
 		for (const opts of [
 			{ claude: [0.33, 0.33] as [number, number] },
 			{ claude: [0.2, 0.21] as [number, number] },
-			{ sourceUsed: 1 },
 			{ sourceHard: true },
 		]) {
 			usePolls(...comparisonPolls(opts));
@@ -2295,6 +2301,16 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 			expect(bodies(w, "hand-spawn:")).toEqual([]);
 			expect(bodies(w, "headroom-skip:")).toEqual([expect.stringContaining(`headroom-skip: ${SOL} token `)]);
 		}
+		// PLAN wl-mvwk0v0gmp6cjc D6 (Jo, in-mvwl9tkmsym86o): an exhausted OpenAI week moves the build off the lane's lab, to the
+		// strong row's first usable other-lab entry: Claude's 5h window projects out (0.34 an hour in), so Kimi.
+		usePolls(...comparisonPolls({ sourceUsed: 1 }));
+		const w = world();
+		const { h, spawn } = await openaiBuild(w);
+		expect(spawn?.model).toEqual([KIMI]);
+		expect(bodies(w, "hand-spawn:")).toEqual([expect.stringContaining(` row ${KIMI}`)]);
+		expect(bodies(w, "hand-headroom:")).toEqual([expect.stringMatching(new RegExp(`^hand-headroom: hand dt-\\S+ \\(slice sl-work\\) of lane lane-test ${SOL} -> ${KIMI} \\(openai-codex 7d 1\\.00 used, quota exhausted\\)$`))]);
+		expect(bodies(w, "headroom-skip:")).toEqual([expect.stringContaining(`headroom-skip: ${SOL} token `)]);
+		expect(h.moveAlerts).toHaveLength(1);
 	});
 
 	test("unavailable counterfactual budgets cannot retain a build, including session-free and spawn-specific credentials", async () => {
@@ -2508,7 +2524,7 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 		expect(bodies(w, "headroom-skip:")).toEqual([expect.stringMatching(new RegExp(`^headroom-skip: ${OPUS} token dt-\\S+ ${OUT_085}$`))]);
 	});
 
-	test("anthropic 7d fable actually exhausted at 1.00: an Opus build still spawns; only a Fable build is refused", async () => {
+	test("anthropic 7d fable actually exhausted at 1.00: an Opus build still spawns; only a Fable build moves off it (D6)", async () => {
 		const fable = (used: number): Limit => ({ windowId: "7d", tier: "fable", used, resetsIn: 4 * 24 * HOUR });
 		const shared: Limit[] = [
 			{ windowId: "5h", used: 0.1, resetsIn: 2 * HOUR },
@@ -2523,15 +2539,17 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 		expect(opus.result).toBeUndefined();
 		expect(bodies(w, "headroom-skip:")).toEqual([]);
 
-		// The control: the same polls take Fable out (Fable and Opus swap tiers, so the strong build plans on Fable).
+		// The control: the same polls take Fable out (Fable and Opus swap tiers, so the strong build plans on Fable). Its week
+		// is exhausted, so it moves to the strong row's first usable other-lab entry (PLAN wl-mvwk0v0gmp6cjc D6).
 		const f = world({ table: tierTableFromConfig({ task: { agentModelOverrides: { ...ROWS, strong: [FABLE, SOL, KIMI], deep: [OPUS, ASTRA, K3] } } }) });
 		const g = lane(f);
 		g.laneMessage(FABLE);
 		const out = await g.toolCall({ agent: "strong", name: "sl-work", task: brief(f, "change the loader") }, "c1");
 		const spawn = await g.spawn(out!.input.agent, "sl-work");
-		expect(spawn?.block).toBe(true);
-		expect(spawn?.reason).toContain(`${FABLE} (projected out: anthropic 7d fable 1.00 used, window pace +`);
+		expect(spawn?.model).toEqual([SOL]);
+		expect(spawn?.note).toContain(`${FABLE} (projected out: anthropic 7d fable 1.00 used, window pace +`);
 		expect(bodies(f, "headroom-skip:")).toEqual([expect.stringMatching(new RegExp(`^headroom-skip: ${FABLE} token dt-\\S+ anthropic 7d fable 1\\.00 used`))]);
+		expect(bodies(f, "hand-headroom:")).toEqual([expect.stringContaining(`${FABLE} -> ${SOL} (anthropic 7d fable 1.00 used, quota exhausted)`)]);
 	});
 
 	test("stale polls (newest 30 min old) with anthropic 5h at 0.85: nothing is skipped", async () => {
