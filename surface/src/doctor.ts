@@ -102,41 +102,69 @@ export interface JobRow {
 export const LABEL_PREFIX = "com.agent-system-2.";
 
 /**
- * Every install/*.plist, classified (PLAN "job inventory", amendment A3). The dependency columns were audited per entry
- * point (its ProgramArguments script, install/*.sh and *.zsh wrappers, and the surface/scripts/*.ts it runs) for every
- * external executable called by PATH name or absolute path:
- * - ledger-backup: `bun run ledger/scripts/backup.ts`; the script spawns nothing.
- * - doctor: surface/scripts/doctor.ts → this file's probes, and /bin/zsh for install/drive-backup/quiet-alarm.zsh, which
- *   runs /usr/bin/osascript, /usr/bin/afplay and /usr/bin/say.
+ * Every install/*.plist, classified (PLAN "job inventory", amendment A3). The dependency columns are audited by call path
+ * (review r3 F10, r4 F12): from each row's entry point through its own code, the libraries it imports or sources, and every
+ * process it spawns with its environment, to every external executable reached, by PATH name (pathNames) or absolute path
+ * (absolute). The rules:
+ * - Shell builtins are not executables and are left out: echo, printf, print, cd, pwd, test and [ (bare), read, exit,
+ *   local, kill and wait (in bash and zsh), command, type, source, exec, eval, trap, and zsh's loaded-module builtins
+ *   (strftime, zselect, zsystem, zstat, zf_mv, zf_rm, zf_mkdir). An external with a builtin's name is listed when it is
+ *   called by path (/bin/test) or spawned from TypeScript (chaos's `kill`).
+ * - The walk stops at a spawned `omp` session (what a lane or the orchestrator runs is OMP's, not the job's), at `sudo`
+ *   (the _as2test wrapper and refresh run as another user in sudo's reset environment, not the job's) and at another row's
+ *   entry point run in full (the doctor that install.sh runs last), whose names are that row's.
+ * - A module imported but never called on the path adds nothing: the gate rows' git calls (gates/src/git-model.ts
+ *   isWorkTreePath, rows/r06-reserved.ts remoteRepos, r08-push-rebase.ts, r09-protected-edit.ts currentBranch) run only
+ *   when a tool call is gated, which no job does.
+ * - A name the code tries only off macOS is left out (ctx-index.ts passwdHome's `getent`, after dscl): stock macOS has no
+ *   getent, and these jobs are launchd jobs.
+ * Every name below resolves on a stock macOS PATH (/usr/bin, /bin, /usr/sbin), which ends every row's plist PATH.
+ *
+ * - ledger-backup: `bun run ledger/scripts/backup.ts`; it spawns nothing.
+ * - doctor (surface/scripts/doctor.ts, every mode, and the popup process it spawns): launchctl (checkJob's `launchctl
+ *   print`), plutil (readPlist), dscl (the own-home probe), ctx (checkCtx), gh (checkGh), df (checkDisk), sysctl
+ *   (currentBoot), ps (psRun: ownStart, ownerState; surface/scripts/invariants.ts orchestratorsFromPs for checkSeat), pgrep
+ *   (orchestratorsFromPs), osascript (surface/src/notify.ts realNotify, the ledger-down banner), mktemp and rm
+ *   (install/drive-backup/quiet-alarm.zsh: `mktemp -t quiet-alarm`, `rm -f "$errfile"`, through notify.ts alarmPopup).
+ *   Absolute: /bin/zsh (alarmPopup), and quiet-alarm.zsh's defaults /usr/bin/osascript, /usr/bin/afplay, /usr/bin/say.
+ *   The popup process (`doctor.ts --popup`, spawnPopupProcess, with the run's env) is process.execPath, the job's own bun.
  * - phoenix: /bin/bash install/phoenix-run.sh: `dirname` by name; /bin/date, /bin/sleep, /usr/sbin/lsof, /usr/bin/sed;
- *   PHOENIX_PYTHON.
- * - train-tick: surface/scripts/train-tick.ts: gh, git, osascript (realNotify), ctx (the doctor's ctx step); bun and omp
- *   through the lane starter it spawns, and ps (surface/src/omp-probe.ts runPs) in that starter.
+ *   PHOENIX_PYTHON, whose install/phoenix-*.py spawn nothing.
+ * - train-tick (surface/scripts/train-tick.ts): gh (realGh; surface/scripts/test-runner.ts's gh calls), git (its git and
+ *   realRoot; surface/src/merge-train.ts; test-runner.ts), osascript (realNotify), ctx (doctorTick's checkCtx), sysctl
+ *   (doctorTick → settleAndSpawn → settleClaims → currentBoot, and the popup process's popupRun), mktemp and rm (the popup
+ *   process's alarmPopup → quiet-alarm.zsh), sudo (test-runner.ts, which the tick runs for `main` and `promote`: its
+ *   detached run's `sudo -n <libexec>/refresh` and surface/src/test-run.ts wrapperArgv's `sudo -n -u _as2test`).
+ *   The lane starter it spawns (`lane.ts launch`, with its env): git (chooseBase), bun (the detached `lane.ts run` runner,
+ *   the ctx-index worker and the drain, each with the tick's env), omp (the runner's session: the walk stops there), ps
+ *   (surface/src/omp-probe.ts runPs, surface/src/metrics.ts). The runner's ctx-index worker (`lane.ts ctx-index`,
+ *   spawnCtxIndex, after every lane exit): id and dscl (surface/src/ctx-index.ts passwdHome, the home guard before any
+ *   ctx call), then ctx. Absolute: /bin/zsh, /usr/bin/osascript, /usr/bin/afplay, /usr/bin/say (the popup process's
+ *   quiet-alarm.zsh), /usr/bin/dscl (surface/src/as2test.ts realDscl: the test runner's install preflight, readInstall
+ *   from decideInstall, with no AGENT_SYSTEM_TEST_RUNNER_INSTALL set).
  * - daily-report: surface/scripts/daily-report.ts spawns nothing.
  * - scratch-sweep: surface/scripts/scratch-sweep.ts runs `du`.
- * - chaos: surface/scripts/chaos.ts runs bun, omp, git, pgrep, ps and kill.
- * - drive-backup: /bin/zsh install/drive-backup/backup-nightly.zsh, lib.zsh, server-read.zsh and quiet-alarm.zsh: the
- *   absolute tools below, AS2_BUN, and mktemp, pgrep, ps and date by name.
- * - drive-backup-check: /bin/zsh install/drive-backup/check-backup-fresh.zsh with lib.zsh and quiet-alarm.zsh.
- *
- * The doctor and train-tick rows, audited again by call site (review r3 F10): every name each entry point reaches,
- * through its own code, the doctor code it runs, the processes it spawns with its environment (the popup process
- * `doctor.ts --popup`, spawned by spawnPopupProcess with the run's env, and quiet-alarm.zsh under it), and their libraries.
- * - doctor (surface/scripts/doctor.ts, every mode, and the popup process it spawns):
- *   launchctl (checkJob's `launchctl print`), plutil (readPlist), dscl (the own-home probe), ctx (checkCtx), gh (checkGh),
- *   df (checkDisk), sysctl (currentBoot), ps (psRun: ownStart, ownerState; surface/scripts/invariants.ts
- *   orchestratorsFromPs for checkSeat), pgrep (orchestratorsFromPs → invariants.ts pgrep), osascript (surface/src/notify.ts
- *   realNotify, the ledger-down banner), mktemp and rm (install/drive-backup/quiet-alarm.zsh: `mktemp -t quiet-alarm`,
- *   `rm -f "$errfile"`, through notify.ts alarmPopup). Absolute: /bin/zsh (alarmPopup), and quiet-alarm.zsh's defaults
- *   /usr/bin/osascript, /usr/bin/afplay, /usr/bin/say. The popup process is process.execPath, the job's own bun.
- * - train-tick (surface/scripts/train-tick.ts): gh (realGh; surface/scripts/test-runner.ts's gh calls), git (its git and
- *   realRoot; surface/src/merge-train.ts; test-runner.ts), osascript (realNotify), bun and omp (surface/scripts/lane.ts:
- *   the starter's `bun … run` and the runner's omp), ps (omp-probe.ts runPs; the doctor's psRun), ctx (doctorTick's
- *   checkCtx), sysctl (doctorTick → settleAndSpawn → settleClaims → currentBoot, and the popup process's popupRun), mktemp
- *   and rm (the popup process's alarmPopup → quiet-alarm.zsh), sudo (test-runner.ts, which the tick runs for `main` and
- *   `promote`: its detached run's `sudo -n <libexec>/refresh` and surface/src/test-run.ts wrapperArgv's `sudo -n -u
- *   _as2test`). Absolute: /bin/zsh, /usr/bin/osascript, /usr/bin/afplay, /usr/bin/say (the popup process's quiet-alarm.zsh).
- *   Every name added here resolves on a stock macOS PATH (/usr/bin, /bin, /usr/sbin), which ends both jobs' plist PATHs.
+ * - chaos (surface/scripts/chaos.ts): pgrep (processList, descendantEdges), kill (the kill steps), git (mustGit, liveCheckoutOf,
+ *   surface/src/chaos.ts), cp (`cp -c -R` of node_modules), bash (`bash install/install.sh`), bun (chaos-stub.ts, `lane.ts
+ *   launch` and `lane.ts run`), omp (the orchestrator and probes: the walk stops there). The lane processes it spawns, as
+ *   for train-tick: ps (runPs, metrics), git, bun, and the ctx-index worker's id and dscl (its ctx is never reached: the
+ *   scratch HOME fails the guard). install.sh run from the copy, with no flag and the scratch HOME (so own_home fails and
+ *   no phoenix or doctor job is loaded): dirname, uname, awk, grep, tr, find, sort, readlink (the manifest checks), mkdir,
+ *   mv, rm, cp, ln (the profile, extension and launcher writes), id, dscl, sed (own_home); bun (its bun steps); its last
+ *   step, the full doctor, is the doctor row's. Absolute: /bin/ps (psBin, choosePs's probe), /usr/bin/plutil (install.sh's
+ *   lint of the ledger-backup job plist).
+ * - drive-backup: /bin/zsh install/drive-backup/backup-nightly.zsh (run mode), with lib.zsh, server-read.zsh and, through
+ *   lib.zsh alert, quiet-alarm.zsh: mktemp and chmod (setup 4, the private temp dir), pgrep (setup 1), rmdir (claim and
+ *   envelope cleanup; lib.zsh loads only zf_mv, zf_rm and zf_mkdir, so rmdir is /bin/rmdir), rm (quiet-alarm.zsh); the
+ *   absolute tools below, and AS2_BUN (lib.zsh needs_you_write → surface/scripts/drive-backup-notice.ts, which spawns
+ *   nothing). `tee` (the log copy) runs only outside launchd: the plist sets AS2_UNDER_LAUNCHD=1.
+ * - drive-backup-check: /bin/zsh install/drive-backup/check-backup-fresh.zsh with lib.zsh: pgrep and grep (the running-job
+ *   check), sed and tail (the Sunday output), /bin/mkdir, /usr/bin/jq, /usr/bin/perl (lib.zsh bounded), and through lib.zsh
+ *   alert quiet-alarm.zsh (mktemp, rm, /usr/bin/osascript, /usr/bin/afplay, /usr/bin/say) and /bin/mv (the popup result).
+ *   On Sundays it runs `/usr/bin/env AS2_NO_ALERT=1 /bin/zsh backup-nightly.zsh --verify-restore`, which reaches setup 1-4
+ *   (/bin/test, pgrep, /usr/bin/sqlite3, /usr/bin/xxd, /usr/bin/shasum, mktemp, chmod), the restore checks (server-read.zsh
+ *   with /usr/bin/stat, /usr/bin/sqlite3, /usr/bin/perl, /usr/bin/openssl, /usr/bin/osascript, /usr/bin/shasum; /usr/bin/tar;
+ *   /usr/bin/gunzip under /bin/zsh; /usr/bin/sqlite3) and its cleanup (/bin/rm); AS2_BUN as for drive-backup.
  */
 export const JOB_INVENTORY: readonly JobRow[] = [
 	{ name: "ledger-backup", expected: { kind: "always" }, pathNames: [], absolute: [], envExecutables: [], reinstall: "bash {repo}/install/install.sh", okExits: [0] },
@@ -150,17 +178,20 @@ export const JOB_INVENTORY: readonly JobRow[] = [
 		absolute: ["/bin/date", "/bin/sleep", "/usr/sbin/lsof", "/usr/bin/sed"], envExecutables: ["PHOENIX_PYTHON"], reinstall: "bash {repo}/install/phoenix-agent.sh on", okExits: [0],
 	},
 	{
-		name: "train-tick", expected: { kind: "opt-in", flag: "--train-tick" }, pathNames: ["gh", "bun", "omp", "git", "osascript", "ctx", "ps", "sysctl", "mktemp", "rm", "sudo"],
-		absolute: ["/bin/zsh", "/usr/bin/osascript", "/usr/bin/afplay", "/usr/bin/say"], envExecutables: [], reinstall: "bash {repo}/install/install.sh --train-tick", okExits: [0],
+		name: "train-tick", expected: { kind: "opt-in", flag: "--train-tick" }, pathNames: ["gh", "bun", "omp", "git", "osascript", "ctx", "ps", "sysctl", "mktemp", "rm", "sudo", "id", "dscl"],
+		absolute: ["/bin/zsh", "/usr/bin/osascript", "/usr/bin/afplay", "/usr/bin/say", "/usr/bin/dscl"], envExecutables: [], reinstall: "bash {repo}/install/install.sh --train-tick", okExits: [0],
 	},
 	{ name: "daily-report", expected: { kind: "opt-in", flag: "--daily-report" }, pathNames: [], absolute: [], envExecutables: [], reinstall: "bash {repo}/install/install.sh --daily-report", okExits: [0] },
 	{ name: "scratch-sweep", expected: { kind: "opt-in", flag: "--scratch-sweep" }, pathNames: ["du"], absolute: [], envExecutables: [], reinstall: "bash {repo}/install/install.sh --scratch-sweep", okExits: [0] },
 	{
-		name: "chaos", expected: { kind: "opt-in", flag: "--chaos-nightly" }, pathNames: ["bun", "omp", "git", "pgrep", "ps", "kill"], absolute: [], envExecutables: [],
-		reinstall: "bash {repo}/install/install.sh --chaos-nightly", okExits: [0],
+		name: "chaos", expected: { kind: "opt-in", flag: "--chaos-nightly" },
+		pathNames: [
+			"bun", "omp", "git", "pgrep", "ps", "kill", "cp", "bash", "id", "dscl", "dirname", "uname", "awk", "grep", "tr", "find", "sort", "readlink", "mkdir", "mv", "rm", "ln", "sed",
+		],
+		absolute: ["/bin/ps", "/usr/bin/plutil"], envExecutables: [], reinstall: "bash {repo}/install/install.sh --chaos-nightly", okExits: [0],
 	},
 	{
-		name: "drive-backup", expected: { kind: "opt-in", flag: "--drive-backup" }, pathNames: ["mktemp", "pgrep", "ps", "date"],
+		name: "drive-backup", expected: { kind: "opt-in", flag: "--drive-backup" }, pathNames: ["mktemp", "chmod", "pgrep", "rmdir", "rm"],
 		absolute: [
 			"/bin/zsh", "/bin/cp", "/bin/mkdir", "/bin/mv", "/bin/rm", "/bin/test", "/sbin/md5", "/usr/bin/gunzip", "/usr/bin/gzip", "/usr/bin/head", "/usr/bin/jq", "/usr/bin/openssl",
 			"/usr/bin/osascript", "/usr/bin/perl", "/usr/bin/shasum", "/usr/bin/sqlite3", "/usr/bin/stat", "/usr/bin/tar", "/usr/bin/xattr", "/usr/bin/xxd", "/usr/bin/afplay", "/usr/bin/say",
@@ -168,8 +199,11 @@ export const JOB_INVENTORY: readonly JobRow[] = [
 		envExecutables: ["AS2_BUN"], reinstall: "bash {repo}/install/install.sh --drive-backup", okExits: [0],
 	},
 	{
-		name: "drive-backup-check", expected: { kind: "opt-in", flag: "--drive-backup" }, pathNames: ["pgrep", "sed", "tail", "grep", "tar"],
-		absolute: ["/bin/zsh", "/bin/mkdir", "/usr/bin/env", "/usr/bin/jq", "/usr/bin/perl", "/usr/bin/osascript", "/usr/bin/afplay", "/usr/bin/say"],
+		name: "drive-backup-check", expected: { kind: "opt-in", flag: "--drive-backup" }, pathNames: ["pgrep", "grep", "sed", "tail", "mktemp", "chmod", "rm"],
+		absolute: [
+			"/bin/zsh", "/bin/mkdir", "/bin/mv", "/bin/rm", "/bin/test", "/usr/bin/env", "/usr/bin/gunzip", "/usr/bin/jq", "/usr/bin/openssl", "/usr/bin/osascript", "/usr/bin/perl",
+			"/usr/bin/shasum", "/usr/bin/sqlite3", "/usr/bin/stat", "/usr/bin/tar", "/usr/bin/xxd", "/usr/bin/afplay", "/usr/bin/say",
+		],
 		envExecutables: ["AS2_BUN"], reinstall: "bash {repo}/install/install.sh --drive-backup", okExits: [0],
 	},
 ];

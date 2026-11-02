@@ -12,6 +12,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync
 import { dirname, join } from "node:path";
 import { handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
+import { INSTALL_DOCTOR_FAILED, installOutcome } from "../scripts/chaos";
 import { isRunnerCommand } from "../scripts/lane";
 import {
 	copyIntoScratch, daysSinceEpoch, END_RECEIPT_SKEW_MS, emptySeen, type Evidence, type EvidenceItem, FAULT_EVIDENCE, FAULTS, type FaultName, firstHolder, HarnessError, ISOLATION_LIMIT,
@@ -877,5 +878,28 @@ describe("scratch writes never follow a link (code review r1 finding 2)", () => 
 		expect(scratchWriteRefusal(root, join(root, "ok", "x"))).toBeNull();
 		expect(scratchNewPathRefusal(root, join(root, "node_modules"))).toBeNull();
 		expect(scratchNewPathRefusal(root, join(root, "file"))).not.toBeNull();
+	});
+});
+
+describe("setup's install.sh result (code review r4 F13)", () => {
+	const LOG = "/scratch/install.log";
+	test("exit 5 (install's closing doctor failed) is setup success, with one log line naming the scratch HOME and the log", () => {
+		const r = installOutcome({ code: 5, err: "install incomplete: as2 doctor found failing parts (above)" }, LOG);
+		expect(INSTALL_DOCTOR_FAILED).toBe(5);
+		expect(r.note).toContain("closing doctor failed in the scratch HOME");
+		expect(r.note).toContain("as expected for an isolated clone");
+		expect(r.note).toContain(LOG);
+		expect(r.note).not.toContain("\n");
+	});
+	test("exit 0 is success with no line", () => {
+		expect(installOutcome({ code: 0, err: "" }, LOG)).toEqual({ note: null });
+	});
+	test("any other non-zero exit still throws a HarnessError naming the code and the log", () => {
+		expect(() => installOutcome({ code: 1, err: "boom\nlast line" }, LOG)).toThrow(HarnessError);
+		expect(() => installOutcome({ code: 1, err: "boom\nlast line" }, LOG)).toThrow(/install\.sh exited 1: last line \(log \/scratch\/install\.log\)/);
+		expect(() => installOutcome({ code: 2, err: "" }, LOG)).toThrow(HarnessError);
+	});
+	test("a timed-out run never counts as exit 5", () => {
+		expect(() => installOutcome({ code: 5, timedOut: true, err: "" }, LOG)).toThrow(/timed out/);
 	});
 });

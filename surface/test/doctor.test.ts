@@ -1272,7 +1272,48 @@ describe("review r3: an expired owner's probe failure, an unparsable start time 
 			expect(depsWithout("train-tick", missing)).toMatchObject({ part: "deps:train-tick", verdict: "fail", evidence: `${missing} is not on the job's PATH (job PATH /opt/job)` });
 		}
 		expect(depsWithout("train-tick", null).verdict).toBe("pass");
-		// The popup process the tick spawns runs quiet-alarm.zsh under /bin/zsh, with its absolute tools.
-		expect(row("train-tick").absolute).toEqual(["/bin/zsh", "/usr/bin/osascript", "/usr/bin/afplay", "/usr/bin/say"]);
+		// The popup process the tick spawns runs quiet-alarm.zsh under /bin/zsh, with its absolute tools; the test runner it runs reads the _as2test account with /usr/bin/dscl.
+		expect(row("train-tick").absolute).toEqual(["/bin/zsh", "/usr/bin/osascript", "/usr/bin/afplay", "/usr/bin/say", "/usr/bin/dscl"]);
+	});
+});
+
+describe("review r4 F12: every executable a job reaches by call path is in its row, and one missing fails deps:<job> naming it", () => {
+	/** deps:<job> with the row's names on /opt/job and its absolute tools present, except `name` (a PATH name) or `absolute` (a path, removed from the fake machine too). */
+	const depsMissing = (job: string, gone: { name?: string; absolute?: string }): PartResult => {
+		const f = fake();
+		const r = row(job);
+		for (const a of r.absolute) f.files.set(a, { text: "", mtimeMs: 0, exec: true });
+		if (gone.absolute !== undefined) f.files.delete(gone.absolute);
+		for (const n of r.pathNames) if (n !== gone.name) f.files.set(`/opt/job/${n}`, { text: "", mtimeMs: 0, exec: true });
+		return checkDeps(f.deps, r, { ProgramArguments: ["/bin/bun", "x"], EnvironmentVariables: { PATH: "/opt/job", AS2_BUN: "/bin/bun", PHOENIX_PYTHON: "/bin/bun" } });
+	};
+	const expectNamed = (job: string, names: readonly string[], absolutes: readonly string[]) => {
+		for (const name of names) {
+			expect(depsMissing(job, { name })).toMatchObject({ part: `deps:${job}`, verdict: "fail", evidence: `${name} is not on the job's PATH (job PATH /opt/job)` });
+		}
+		for (const absolute of absolutes) {
+			expect(depsMissing(job, { absolute })).toMatchObject({ part: `deps:${job}`, verdict: "fail", evidence: `${absolute} is not an executable file (job PATH /opt/job)` });
+		}
+		expect(depsMissing(job, {}).verdict).toBe("pass");
+	};
+
+	test("train-tick: the runner's ctx-index worker's id and dscl (ctx-index.ts passwdHome) and the test runner's /usr/bin/dscl (as2test.ts realDscl)", () => {
+		expectNamed("train-tick", ["id", "dscl"], ["/usr/bin/dscl"]);
+	});
+
+	test("chaos: its cp and bash, the lane runner's ctx-index id and dscl, install.sh's tools, /bin/ps and install.sh's /usr/bin/plutil", () => {
+		expectNamed("chaos", ["cp", "bash", "id", "dscl", "dirname", "uname", "awk", "grep", "tr", "find", "sort", "readlink", "mkdir", "mv", "rm", "ln", "sed"], ["/bin/ps", "/usr/bin/plutil"]);
+	});
+
+	test("drive-backup: the nightly's chmod (setup 4), rmdir (claim and envelope cleanup) and quiet-alarm.zsh's rm", () => {
+		expectNamed("drive-backup", ["chmod", "rmdir", "rm"], []);
+	});
+
+	test("drive-backup-check: quiet-alarm.zsh's mktemp and rm, lib.zsh's /bin/mv, and the Sunday --verify-restore run's chmod and absolute tools", () => {
+		expectNamed(
+			"drive-backup-check",
+			["mktemp", "rm", "chmod"],
+			["/bin/mv", "/bin/rm", "/bin/test", "/usr/bin/gunzip", "/usr/bin/openssl", "/usr/bin/shasum", "/usr/bin/sqlite3", "/usr/bin/stat", "/usr/bin/tar", "/usr/bin/xxd"],
+		);
 	});
 });
