@@ -709,15 +709,19 @@ export type BackupState =
 export function backupState(db: Database, dir: string, gapMs: number, asOf: string, replay = false): BackupState {
 	const replayNote = replay ? " (replay: the backup directory and its files are read as they are on disk now, not as of as-of: copies pruned since are missing, copies named after as-of are ignored)" : "";
 	const hours = (ms: number) => `${(ms / (60 * MIN)).toFixed(1)}h`;
-	let copies: { name: string; at: string }[];
+	let names: string[];
 	try {
-		copies = (existsSync(dir) ? readdirSync(dir) : []).flatMap(name => {
-			const m = BACKUP_NAME.exec(name);
-			return m ? [{ name, at: `${m[1]}T${m[2]}:${m[3]}:${m[4]}` }] : [];
-		}).filter(c => c.at <= asOf).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+		names = readdirSync(dir);
 	} catch (e) {
-		return { state: "unjudged", why: `the backup directory ${dir} could not be listed: ${e instanceof Error ? e.message : String(e)}` };
+		// Only a missing directory is "no copies yet". existsSync is false on EACCES too, so it is never the test: a
+		// directory that exists but cannot be listed is unjudged (review r6 F16).
+		if (!(e instanceof Error && "code" in e && e.code === "ENOENT")) return { state: "unjudged", why: `the backup directory ${dir} could not be listed: ${e instanceof Error ? e.message : String(e)}` };
+		names = [];
 	}
+	const copies = names.flatMap(name => {
+		const m = BACKUP_NAME.exec(name);
+		return m ? [{ name, at: `${m[1]}T${m[2]}:${m[3]}:${m[4]}` }] : [];
+	}).filter(c => c.at <= asOf).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
 	// Every created_at across the tables that have one (the copy is the whole file, so these are the copied tables).
 	const writesSql = db.query<{ name: string }, []>(
 		"SELECT m.name FROM sqlite_master m WHERE m.type = 'table' AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE name = 'created_at') ORDER BY m.name",

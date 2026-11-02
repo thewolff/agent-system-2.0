@@ -1005,6 +1005,13 @@ export function popupWords(downs: readonly OpenDown[]): { title: string; text: s
  */
 const helperStderr = (o: AlarmOutcome): string => (o.state === "answered" ? o.otherStderr : "");
 
+/**
+ * The read-aloud failure quiet-alarm.zsh reported beside a dialog it showed (exit 3: Jo picked "Read it to me" and the
+ * sound or the speech failed), "" when none. Like helperStderr: the popup stays answered and is never shown again for
+ * it; the run prints it and fails (review r6 F14 residual).
+ */
+const audioFailure = (o: AlarmOutcome): string => (o.state === "answered" && o.detail.startsWith("audio-failed") ? o.detail : "");
+
 /** The detail as recorded: `<button or audio-failed line>; quiet-alarm.zsh stderr: <text>` when the helper wrote other stderr. */
 const recordedDetail = (o: AlarmOutcome): string => {
 	const extra = helperStderr(o);
@@ -1013,10 +1020,11 @@ const recordedDetail = (o: AlarmOutcome): string => {
 
 /**
  * The popup process (`--popup`): settle claims, claim every pending down in one write with a re-read, show the popup,
- * write its outcome. Exit 0 nothing pending or answered, 1 the popup failed, quiet-alarm.zsh wrote other stderr beside
- * an answered popup (kept in the answered outcome's detail), its outcome could not be written, or a settle, kill or
- * identity probe failed (the run's failure flag). The outcome is printed before its write, so a write that fails never
- * hides it. A throw before the claim (the boot probe, the claim's write) is a crash: lines already printed stay printed.
+ * write its outcome. Exit 0 nothing pending or answered, 1 the popup failed, quiet-alarm.zsh reported a read-aloud
+ * failure or wrote other stderr beside an answered popup (kept in the answered outcome's detail), its outcome could not
+ * be written, or a settle, kill or identity probe failed (the run's failure flag). The outcome is printed before its
+ * write, so a write that fails never hides it. A throw before the claim (the boot probe, the claim's write) is a crash:
+ * lines already printed stay printed.
  */
 export function popupRun(ledger: Ledger, deps: DoctorDeps): number {
 	const flag: RunFlag = { failed: false };
@@ -1042,7 +1050,11 @@ export function popupRun(ledger: Ledger, deps: DoctorDeps): number {
 	const outcome = deps.alarm(w.title, w.text, w.spoken, DOCTOR_GIVE_UP_SECS, POPUP_RUN_MS);
 	const recorded = { state: outcome.state, detail: recordedDetail(outcome) };
 	deps.out(`doctor popup ${popupId}: ${recorded.state} ${recorded.detail}`);
-	if (outcome.state === "answered" && outcome.detail.startsWith("audio-failed")) deps.out(`doctor popup ${popupId}: shown, but the read-aloud failed: ${outcome.detail}`);
+	const audio = audioFailure(outcome);
+	if (audio) {
+		flag.failed = true;
+		deps.out(`doctor popup ${popupId}: shown, but the read-aloud failed: ${audio}; the popup counts as answered and is not shown again`);
+	}
 	const extra = helperStderr(outcome);
 	if (extra) {
 		flag.failed = true;
@@ -1116,9 +1128,9 @@ export function ledgerDownState(deps: DoctorDeps): string | null {
  * The doctor job's ledger-down popup (PLAN "Ledger unopenable"): settle the last attempt, then, unless this boot has an
  * answered attempt or POPUP_ATTEMPT_LIMIT unanswered ones, append an attempt and show the popup in the foreground under
  * its own kill bound. A record that cannot be read or written is logged and the banner fires once instead. Every error
- * (an owner probe, a kill, the popup's own outcome, quiet-alarm.zsh's stderr beside an answered popup, which stays in
- * the answered outcome) is printed before the record write that stores it, so a write that fails never hides it, and
- * sets the run's failure flag.
+ * (an owner probe, a kill, the popup's own outcome, quiet-alarm.zsh's read-aloud failure or other stderr beside an
+ * answered popup, which stays in the answered outcome) is printed before the record write that stores it, so a write
+ * that fails never hides it, and sets the run's failure flag.
  */
 export function ledgerDownPopup(deps: DoctorDeps, ledgerError: string, flag: RunFlag): void {
 	const path = ledgerDownPath(deps.home);
@@ -1210,6 +1222,11 @@ export function ledgerDownPopup(deps: DoctorDeps, ledgerError: string, flag: Run
 	attempt.outcome = `${outcome.state} ${recordedDetail(outcome)}`;
 	if (outcome.state !== "answered") flag.failed = true;
 	deps.out(`doctor: ledger-down popup ${attempt.outcome}`);
+	const audio = audioFailure(outcome);
+	if (audio) {
+		flag.failed = true;
+		deps.out(`doctor: the ledger-down popup was shown, but the read-aloud failed: ${audio}; the popup counts as answered and is not shown again this boot`);
+	}
 	const extra = helperStderr(outcome);
 	if (extra) {
 		flag.failed = true;

@@ -8,7 +8,7 @@
 // its origin; and the CLI (--json, --reviews, a bad argument, the checked-in fixture from the repo).
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -18,7 +18,7 @@ import { canonicalPath } from "../../ledger/src/locality";
 import { laneExitBody } from "../src/launch";
 import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
 import { reservedStates } from "../src/errors";
-import { BACKUP_GAP_MS, check, gitIn, type Git, type Input, jsonLines, newestWrite, orchestratorsFromPs, parseArgs, type Probe, type PsDeps, renderTable, type Report, reservedView, reviewsLine, type Run } from "../scripts/invariants";
+import { BACKUP_GAP_MS, backupState, check, gitIn, type Git, type Input, jsonLines, newestWrite, orchestratorsFromPs, parseArgs, type Probe, type PsDeps, renderTable, type Report, reservedView, reviewsLine, type Run } from "../scripts/invariants";
 import { AS_OF, buildFixture, LANE_RUNNER } from "./fixtures/invariants/build";
 
 const SCRIPT = join(import.meta.dir, "..", "scripts", "invariants.ts");
@@ -431,6 +431,27 @@ describe("stale-backup: the newest write runs ahead of the newest copy by more t
 		expect(f.text).toContain("no ledger backup at or before 2026-10-11T21:00:00.000Z (first ledger write 2026-10-11T18:00:00.000Z)");
 		expect(backupFinding(run({ backups: { dir: join(empty, "missing"), gapMs: twoHours } }))!.key).toBe("stale-backup:none");
 		expect(backupFinding(run({ backups: { dir: empty, gapMs: BACKUP_GAP_MS } }))).toBeUndefined();
+	});
+
+	test("a missing directory with a fresh ledger is ok: no copy yet, and every write (18:00 to 20:50) is within the gap of the first", () => {
+		const dir = join(tmp("backups-none"), "missing");
+		expect(backupState(db, dir, BACKUP_GAP_MS, AS_OF)).toEqual({ state: "ok", dir, copy: null, behindMs: 170 * 60_000 });
+	});
+
+	// Review r6 F16: existsSync is false when the parent cannot be searched (EACCES), so a check through it read such a
+	// directory as missing and passed. Root reads a mode-000 directory, so there the denial cannot be staged.
+	test.skipIf(process.getuid?.() === 0)("a backup directory under a mode-000 parent is unjudged with EACCES, never ok, with the same fresh ledger (skipped when run as root: root is never denied)", () => {
+		const parent = tmp("backups-denied");
+		const dir = join(parent, "backups");
+		mkdirSync(dir);
+		chmodSync(parent, 0o000);
+		try {
+			const b = backupState(db, dir, BACKUP_GAP_MS, AS_OF);
+			expect(b.state).toBe("unjudged");
+			expect(b.state === "unjudged" ? b.why : "").toStartWith(`the backup directory ${dir} could not be listed: EACCES`);
+		} finally {
+			chmodSync(parent, 0o700);
+		}
 	});
 
 	test("the fixture copies are complete by the ledger's own test, so the cases above exercise real backups", () => {

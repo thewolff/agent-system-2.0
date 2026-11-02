@@ -816,6 +816,24 @@ describe("popups", () => {
 		l.close();
 	});
 
+	test("F14 residual (review r6): quiet-alarm exits 3 with only the audio line: answered with that line, printed, exit 1, no second popup", () => {
+		const f = fake();
+		const l = standing(f);
+		const d = down(l, "ctx");
+		const audio = "quiet-alarm: audio FAILED: afplay rc 1 (denied); say rc 0";
+		f.deps.alarm = helperAlarm(f, { code: 3, stdout: "quiet-alarm: choice=Read it to me\n", stderr: `${audio}\n` });
+		expect(popupRun(l, f.deps)).toBe(1);
+		const out = f.out.join("\n");
+		expect(out).toContain(`shown, but the read-aloud failed: audio-failed ${audio}; the popup counts as answered and is not shown again`);
+		expect(out).not.toContain("reported an error on stderr");
+		expect(popupOutcomes(l)).toEqual([{ state: "answered", detail: `audio-failed ${audio}` }]);
+		expect(popupAttempts(doctorControl(l), d)).toEqual({ spent: 0, last: null, answered: true });
+		expect(pendingDowns(doctorControl(l))).toEqual([]);
+		expect(popupRun(l, f.deps)).toBe(0);
+		expect(f.alarms).toHaveLength(1);
+		l.close();
+	});
+
 	test("F14: the ledger-down popup answered beside a quiet-alarm mktemp failure keeps the text, prints it, fails the run, and is not shown again", () => {
 		const f = fake();
 		f.deps.alarm = helperAlarm(f, { code: 0, stdout: "quiet-alarm: choice=Dismiss (no voice)\n", stderr: "mktemp: mkstemp failed\n" });
@@ -827,6 +845,25 @@ describe("popups", () => {
 		expect(saved.attempts.map((a) => a.outcome)).toEqual(["answered Dismiss (no voice); quiet-alarm.zsh stderr: mktemp: mkstemp failed"]);
 		const again = { failed: false };
 		ledgerDownPopup(f.deps, "SQLITE_CORRUPT", again);
+		expect(f.alarms).toHaveLength(1);
+		expect(f.out.at(-1)).toContain("the ledger-down popup was shown this boot");
+	});
+
+	test("F14 residual (review r6): the ledger-down popup answered with only quiet-alarm's audio line keeps it, prints it, fails the run, and is not shown again", () => {
+		const f = fake();
+		const audio = "quiet-alarm: audio FAILED: afplay rc 1 (denied); say rc 0";
+		f.deps.alarm = helperAlarm(f, { code: 3, stdout: "quiet-alarm: choice=Read it to me\n", stderr: `${audio}\n` });
+		const flag = { failed: false };
+		ledgerDownPopup(f.deps, "SQLITE_CORRUPT", flag);
+		expect(flag.failed).toBe(true);
+		const out = f.out.join("\n");
+		expect(out).toContain(`the ledger-down popup was shown, but the read-aloud failed: audio-failed ${audio}; the popup counts as answered and is not shown again this boot`);
+		expect(out).not.toContain("reported an error on stderr");
+		const saved = JSON.parse(f.files.get(ledgerDownPath(f.home))!.text) as { attempts: { outcome?: string }[] };
+		expect(saved.attempts.map((a) => a.outcome)).toEqual([`answered audio-failed ${audio}`]);
+		const again = { failed: false };
+		ledgerDownPopup(f.deps, "SQLITE_CORRUPT", again);
+		expect(again.failed).toBe(false);
 		expect(f.alarms).toHaveLength(1);
 		expect(f.out.at(-1)).toContain("the ledger-down popup was shown this boot");
 	});
