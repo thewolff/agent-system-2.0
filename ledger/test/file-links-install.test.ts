@@ -1,11 +1,15 @@
-// T5: the real installer writes only an isolated HOME. An allowlisted PATH contains Bun and
-// system utilities, never the developer's herdr/ctx. Clicks run the manifest action against a
-// recording opener, so neither plugin registration nor an application launch can escape the test.
+// T5: the real installer writes only an isolated HOME. An allowlisted PATH contains the as2 doctor's shared fakes
+// (surface/test/fixtures/doctor-fakes: ctx, gh, launchctl, osascript and the rest, first, so the installer's closing
+// doctor and its ctx registration never reach a real tool), Bun and system utilities, never the developer's herdr/ctx.
+// AS2_FAKE_STATE is a healthy fake machine (writeHealthyState) whose ledger-backup is the job this install writes, loaded
+// and not yet run, so the closing doctor passes without a file written into HOME first. Clicks run
+// the manifest action against a recording opener, so neither plugin registration nor an application launch can escape the test.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { FAKES_DIR, fakeCalls, LEDGER_BACKUP_LABEL, launchctlPrint, plistPath, setFake, writeHealthyState } from "../../surface/test/fixtures/doctor-fakes/state";
 
 const REPO = resolve(import.meta.dir, "../..");
 const PLUGIN_ROOT = join(REPO, "install/herdr-file-links");
@@ -21,6 +25,7 @@ beforeAll(() => {
 	// Fail before any installer call if the supposedly isolated PATH could find a real plugin host.
 	expect(Bun.which("herdr", { PATH: `${bin}:${SYSTEM_PATH}` })).toBeNull();
 	expect(Bun.which("ctx", { PATH: `${bin}:${SYSTEM_PATH}` })).toBeNull();
+	for (const tool of ["ctx", "gh", "launchctl", "osascript", "dscl"]) expect(Bun.which(tool, { PATH: `${FAKES_DIR}:${bin}:${SYSTEM_PATH}` })).toBe(join(FAKES_DIR, tool));
 });
 afterAll(() => { if (root) rmSync(root, { recursive: true, force: true }); });
 
@@ -38,15 +43,20 @@ function install(name: string, withHerdr: boolean) {
 	const home = join(root, `${name} home`);
 	const tools = join(root, `${name} tools`);
 	const calls = join(root, `${name}-herdr.argv`);
+	const state = join(root, `${name} doctor-fakes`);
 	mkdirSync(home, { recursive: true });
 	mkdirSync(tools, { recursive: true });
+	writeHealthyState({ state, home: join(state, "healthy-home"), repo: REPO, seatPid: process.pid, bun: process.execPath });
+	const backupLog = join(home, ".agent-system-2", "ledger-backup.log");
+	setFake(state, `plutil/${LEDGER_BACKUP_LABEL}.plist.json`, JSON.stringify({ Label: LEDGER_BACKUP_LABEL, ProgramArguments: [process.execPath], StartInterval: 3600, StandardOutPath: backupLog, StandardErrorPath: backupLog }));
+	setFake(state, `launchctl/${LEDGER_BACKUP_LABEL}`, launchctlPrint({ label: LEDGER_BACKUP_LABEL, path: plistPath(home, LEDGER_BACKUP_LABEL), log: backupLog, runs: 0, exit: "never" }));
 	if (withHerdr) executable(join(tools, "herdr"), `#!/bin/sh\nprintf '%s\\0' "$@" >>"$HERDR_CALLS"\nprintf '\\0' >>"$HERDR_CALLS"\nexit "\${HERDR_EXIT:-0}"\n`);
 	const run = (extra: Record<string, string> = {}) => Bun.spawnSync(["/bin/bash", join(REPO, "install/install.sh")], {
 		cwd: REPO,
-		env: { HOME: home, PATH: `${tools}:${bin}:${SYSTEM_PATH}`, HERDR_CALLS: calls, ...extra },
+		env: { HOME: home, PATH: `${FAKES_DIR}:${tools}:${bin}:${SYSTEM_PATH}`, HERDR_CALLS: calls, AS2_FAKE_STATE: state, ...extra },
 		stdout: "pipe", stderr: "pipe",
 	});
-	return { home, run, calls: () => recordedCalls(calls) };
+	return { home, run, calls: () => recordedCalls(calls), fakeCalls: () => fakeCalls(state) };
 }
 
 describe("install: openable links in the default OMP profile", () => {
@@ -58,12 +68,15 @@ describe("install: openable links in the default OMP profile", () => {
 		writeFileSync(unrelated, "export {};\n");
 		for (let attempt = 0; attempt < 2; attempt++) {
 			const result = fixture.run();
+			expect(result.stdout.toString()).toContain("install complete");
 			expect(result.exitCode).toBe(0);
 			expect(existsSync(join(extensions, "as2-open-links.ts"))).toBe(true);
 			expect(readlinkSync(join(extensions, "as2-open-links.ts"))).toBe(join(REPO, "gates/extensions/open-links.ts"));
 			expect(readFileSync(unrelated, "utf8")).toBe("export {};\n");
 		}
 		expect(fixture.calls()).toEqual(Array.from({ length: 2 }, () => ["plugin", "link", PLUGIN_ROOT]));
+		// The closing doctor's probes reached the fakes, never the real tools.
+		expect(fixture.fakeCalls()).toEqual(expect.arrayContaining(["ctx daemon status --format json", expect.stringMatching(/^launchctl print gui\/\d+\/com\.agent-system-2\.ledger-backup$/)]));
 	}, 30_000);
 
 	test("without herdr the installer succeeds, emits exactly one skip line, and still links the extension", () => {

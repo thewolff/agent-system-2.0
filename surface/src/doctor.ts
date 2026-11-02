@@ -333,9 +333,15 @@ function expectation(deps: DoctorDeps, row: JobRow): { required: true; note: str
 		if (!h.ok) return { required: true, note: ` (whether HOME is this user's home could not be read: ${h.why})` };
 		return h.home === deps.home ? { required: true, note: "" } : { required: false, line: `not installed: HOME (${deps.home}) is not this user's home (${h.home}), and launchd has one domain per user` };
 	}
+	// Phoenix: off → not expected. Otherwise expected only in this user's own home, the rule install.sh step 6e installs it
+	// by (launchd has one domain per user), so an install into another HOME is not failed for a job it never installs.
 	const p = phoenixSetting(deps);
+	if (p.ok && p.value === "off") return { required: false, line: "not installed (observability.phoenix is off; to turn it on: as2 phoenix all, then bash install/phoenix-agent.sh on)" };
+	const h = ownHome(deps);
+	if (!h.ok) return { required: true, note: ` (whether HOME is this user's home could not be read: ${h.why})` };
+	if (h.home !== deps.home) return { required: false, line: `not installed: HOME (${deps.home}) is not this user's home (${h.home}), so install.sh does not install Phoenix here (launchd has one domain per user)` };
 	if (!p.ok) return { required: true, note: ` (observability.phoenix unknown: ${p.why})` };
-	return p.value === "off" ? { required: false, line: "not installed (observability.phoenix is off; to turn it on: as2 phoenix all, then bash install/phoenix-agent.sh on)" } : { required: true, note: "" };
+	return { required: true, note: "" };
 }
 
 /** `job:<name>` and, when its plist is installed, `deps:<name>`. */

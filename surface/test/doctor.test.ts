@@ -280,8 +280,9 @@ describe("parts", () => {
 		expect(checkJob(f.deps, row("doctor"))[0]!.verdict).toBe("fail");
 	});
 
-	test("phoenix: required unless observability.phoenix is off (unreadable config counts as required); KeepAlive is judged by running", () => {
+	test("phoenix in this user's own home: required unless observability.phoenix is off (unreadable config counts as required); KeepAlive is judged by running", () => {
 		const f = fake();
+		f.ownHome.home = f.home;
 		const p = plistPathOf(f.home, "phoenix");
 		const config = join(f.home, ".omp", "profiles", "agent-system-2", "agent", "config.yml");
 		expect(checkJob(f.deps, row("phoenix"))[0]!.verdict).toBe("not installed");
@@ -295,6 +296,22 @@ describe("parts", () => {
 		expect(checkJob(f.deps, row("phoenix"))[0]).toMatchObject({ verdict: "pass", evidence: `loaded from ${p}, running as pid 777, runs 1` });
 		f.launchctl.set("com.agent-system-2.phoenix", print({ path: p, log: "/l", runs: 9, exit: 1, state: "not running" }));
 		expect(checkJob(f.deps, row("phoenix"))[0]!.verdict).toBe("fail");
+	});
+
+	test("phoenix with HOME not this user's home is not installed, as install.sh never installs it there; an unreadable dscl answer fails closed", () => {
+		const f = fake();
+		const p = plistPathOf(f.home, "phoenix");
+		const config = join(f.home, ".omp", "profiles", "agent-system-2", "agent", "config.yml");
+		f.files.get(config)!.text = "observability:\n  phoenix: all\n";
+		expect(checkJob(f.deps, row("phoenix"))).toEqual([{
+			part: "job:phoenix", verdict: "not installed", fix: "",
+			evidence: `not installed: HOME (${f.home}) is not this user's home (/Users/other), so install.sh does not install Phoenix here (launchd has one domain per user)`,
+		}]);
+		f.files.delete(config);
+		expect(checkJob(f.deps, row("phoenix"))[0]!.verdict).toBe("not installed");
+		const run = f.deps.run;
+		f.deps = { ...f.deps, run: (argv, env) => (argv[0] === "dscl" ? { code: 64, stdout: "", stderr: "dscl: no such user" } : run(argv, env)) };
+		expect(checkJob(f.deps, row("phoenix"))[0]).toMatchObject({ verdict: "fail", evidence: expect.stringContaining(`${p} is missing (whether HOME is this user's home could not be read: `) });
 	});
 
 	test("deps: a name off the job's PATH, an unset or missing env executable and a missing ProgramArguments path fail deps:<job>", () => {

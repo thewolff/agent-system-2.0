@@ -224,6 +224,27 @@ Land-first details, including the shadow-mode activation order and restart recov
 - Turn it on from the main checkout, in Terminal (an agent's shell cannot load launchd jobs): `AS2_KEEP_LOCAL=1 bash install/install.sh --drive-backup`, then once `launchctl kickstart gui/$(id -u)/com.agent-system-2.drive-backup`, so any macOS prompt for Drive's folders shows while you are at the screen. The installer refuses off macOS, without bun on PATH, or without `/usr/bin/sqlite3`, `/usr/bin/jq` or `/usr/bin/perl`.
 - Turn it off with `bash install/install.sh --drive-backup=off`: it boots both jobs out and deletes both plists. The state, the claimed archives and everything on Drive stay, and with the check job gone the missed line never shows.
 
+### Is as2 up? (`as2 doctor`)
+
+- Run `as2 doctor` in your own Terminal, not inside OMP. It checks whether as2's important parts work and prints one line per part, then a summary.
+- What it checks:
+  - **Jobs.** For each launchd job in its inventory (`ledger-backup`, `doctor`, `phoenix`, `train-tick`, `daily-report`, `scratch-sweep`, `chaos`, the Drive jobs): the plist is installed, loaded from its own path, its last exit code is ok, and it ran recently. Opt-in jobs with no plist show as `not installed` and do not fail. A new `install/*.plist` the inventory does not know fails the `job-inventory` part. `deps:<job>` checks that the executables each job runs exist and that its PATH names resolve on the plist's own PATH.
+  - **ctx.** The daemon runs and its `core_refresh` job ran within 2 hours. A supervisor that is not installed is a `warn`.
+  - **ledger.** It opens and reads. **backup:** the newest ledger backup is fresh.
+  - **seat and mailbox.** Ilex's orchestrator process runs. Ilex's inbox has no envelope or dead owner's claim older than 10 minutes and no live claim older than 30 minutes.
+  - **gh.** `thewolff` is logged in on github.com.
+  - **disk.** At least 10 GiB free under `$HOME`.
+  - **mcp.** No MCP load failure in the last 2 hours of the profile's OMP logs.
+- A probe that cannot run, times out or answers in a shape the doctor does not know fails its part. Nothing is skipped into a pass.
+- Output: `pass`, `fail`, `warn` or `-` (not installed), the part, its evidence, and under a failure or warning a `fix:` line. Fixes that touch launchd or ctx are for your own Terminal; an agent's shell gets `Bootstrap failed: 5`.
+- `as2 doctor --json` prints the same run as one JSON object: `at`, `exit`, `parts` (part, verdict, evidence, fix) and `notes`.
+- Exit codes, in every mode: `0` nothing failed, `1` a part failed, `2` a bad argument (`--help` too) or the doctor crashed.
+- `install/install.sh` runs it as its last step. On a failure it prints `install incomplete: as2 doctor found failing parts (above)` and exits 5. On a fresh machine the seat part fails until you have started `as2` once. A failed `launchctl bootstrap` no longer fails the install. It prints one line, `run this in your own Terminal (zsh): launchctl bootstrap gui/$(id -u) <plist>`, and the doctor then reports that job.
+- The doctor job, `com.agent-system-2.doctor`, runs at load and every 600 seconds (`doctor --after-restart`). It is installed only when `$HOME` is your own home. Each run re-checks parts that are down and clears those that pass. Once per boot, after 10 minutes of uptime, it checks every part and opens a down for each failure. It logs one line per run.
+- The train tick also checks ctx, every pass. ctx counts as down after two failing passes in a row.
+- When a part goes down, a stay-up popup (the alarm rule: "Read it to me" or "Dismiss (no voice)", no sound unless you ask) names every down part and its fix. It gives up after 12 hours. A down gets at most 3 failed attempts; after that no popup is tried for it. If the ledger itself cannot open, only the doctor job shows a fallback popup, at most 3 unanswered attempts per boot.
+- Under *needs you*: `as2 doctor: <part> down since <time>: <evidence> — <fix>; clears itself when it passes`. After 3 failed popups it adds `popup failed 3 times: <last outcome>`. The line goes away when the part passes in a later run.
+
 ### Notes from other agents (the agent channel)
 
 - Other agents can message Ilex through one channel. In phase 1 the only sender is Plumb, and Plumb's authority is notes and proposals. A note is information from Plumb, never your word: it is recorded with sender `plumb` (created_by `channel:plumb`), never as you, and nothing it says is applied until you type the word yourself.

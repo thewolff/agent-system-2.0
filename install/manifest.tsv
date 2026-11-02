@@ -1504,3 +1504,5 @@ surface/test/fixtures/doctor-fakes/pgrep	test	-
 surface/test/fixtures/doctor-fakes/plutil	test	-
 surface/test/fixtures/doctor-fakes/ps	test	-
 surface/test/fixtures/doctor-fakes/sysctl	test	-
+# The doctor job: install.sh fills and loads it when HOME is this user's own home; it runs the doctor --after-restart.
+install/com.agent-system-2.doctor.plist	install	-
