@@ -2847,7 +2847,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						const other = labOf(s);
 						return other !== null && other !== lab;
 					});
-					const target = await usableRow(others, registry, disabled, providerRefused, spawnKey, room, table[tier]);
+					// An unclassified spawn plans its lane-lab row with no workload's refusals (above); its move is recorded on the
+					// bound workload, so the target is checked against that workload's refusals as a classified spawn's is.
+					const refusals = found ? providerRefused : refusedProviders(deps.ledger().entries(workloadId), clock());
+					const target = await usableRow(others, registry, disabled, refusals, spawnKey, room, table[tier]);
 					const to = target.usable[0];
 					if (to === undefined) return null;
 					return { from, to, reason, workloadId, retained: target.retained[to] ?? null };
@@ -2880,7 +2883,17 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						if (found && root) {
 							recordSpawn(found, models, null, null, recordMove);
 							hands.push({ ...found, root, spawnKey, tier, models, row: models.map(modelIdentity), cwd: ctx.cwd, before: null });
-						} else recordMove();
+						} else {
+							// An unclassified hand writes no `hand-spawn:` and no routing row, so its target lab is a builder of the
+							// workload only by its `builder-lab: … hand` mark, written with the move or not at all. Its token is the
+							// subject's spawn key, or the move's event id for a keyless hand. `builderRoles` reads the mark as `review`.
+							ledger.write(() => {
+								recordMove();
+								const token = hand.token ?? event.id;
+								if (token === undefined) throw new Error(`the move of ${subject} off ${move.from} returned no event id on ${move.workloadId}; nothing was recorded or spawned`);
+								ledger.recordEntry({ by: deps.laneId, workloadId: move.workloadId, kind: "assumption", body: handBuilderBody(labOf(move.to), token, move.to) });
+							});
+						}
 						const eventId = event.id;
 						if (eventId === undefined) throw new Error(`the move of ${subject} off ${move.from} was not recorded on ${move.workloadId}`);
 						// The move is recorded: a worker that cannot be started is logged, never fatal; the train tick finds the alert unstarted.

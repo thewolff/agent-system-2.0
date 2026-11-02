@@ -104,7 +104,7 @@ import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type EntryRow, type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
-import { MOVE_ALERT_ATTEMPTS, moveAlertTroubles, moveText, type PidProbe, psMoveAlertProbe, quotaMoves } from "./quota-move-alert";
+import { MOVE_ALERT_ATTEMPTS, moveAlertTroubles, moveText, type PidProbe, psMoveAlertProbe, quotaMoves, trustedQuotaMove } from "./quota-move-alert";
 import { CHANNEL_REFUSED_SHOWN_HOURS, channelInForce, channelProposals, channelRefusals } from "./channel";
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { type NowCategory, nowMarks } from "../../gates/src/rulings";
@@ -674,10 +674,11 @@ function securityRedLines(ledger: Ledger): ErrorLine[] {
 	});
 }
 
-/** The D4 NOW lines: each held `quota-move:` message of a recorded move, in the order written, whatever the workload's state. */
+/** The D4 NOW lines: each held, trusted `quota-move:` message of a recorded move (the writer `recordQuotaMove` used), in the order written, whatever the workload's state. */
 function quotaMoveLines(ledger: Ledger): ErrorLine[] {
 	return quotaMoves(ledger).flatMap((move) => {
-		if (ledger.message(move.messageId)?.state !== "held") return [];
+		const m = ledger.message(move.messageId);
+		if (m?.state !== "held" || trustedQuotaMove(ledger, m) === null) return [];
 		const step = "nothing to answer; the @thewolff comment and a silent popup carry the same move";
 		return [{ kind: "quota-move" as const, workloadId: move.workloadId, rowId: move.messageId, messageIds: [move.messageId], next: step, line: `NOW: ${moveText(move)}` }];
 	});

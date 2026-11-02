@@ -4,11 +4,14 @@
 //  1. the needs-you NOW line: `recordQuotaMove` writes the event entry E (the move record itself: `lane-headroom: …` or
 //     `hand-headroom: …`) and one orchestrator-bound `quota-move:` message (id `quotaMoveMessageId(E)`) in one transaction;
 //     surface/src/errors.ts renders it `NOW: <subject> on <wl> moved <from> -> <to> (<reason>)`, on fire (surface/src/batch.ts),
-//     consumed on delivery like `lane-died:`; lane_message refuses the prefix (surface/extensions/lane-tools.ts);
+//     consumed on delivery like `lane-died:`, and at a wake on a closed workload too when `trustedQuotaMove` (surface/src/delivery.ts);
+//     lane_message refuses the prefix (surface/extensions/lane-tools.ts);
 //  2. jo-issues (`comment`): one issue per event (marker `<!-- as2-quota-move <E> -->`, label as2-train), then one comment
 //     starting @thewolff (marker `<!-- as2-quota-move-comment <E> -->`); every create and comment is looked up by its marker
 //     first, so a create whose reply was lost is adopted, never repeated (surface/src/jo-issues.ts);
-//  3. a silent popup (`popup`), after step 2 whatever its result: `display dialog` with "Read it to me" / "Dismiss (no voice)",
+//  3. a silent popup (`popup`), after step 2's result whatever it is (ok, failed or exhausted): the popup is claimable only then,
+//     so a worker that finds the comment unclaimed, spawned for or running leaves the popup to the comment's worker or the tick;
+//     `display dialog` with "Read it to me" / "Dismiss (no voice)",
 //     Dismiss the default and the cancel button, no giving up; Glass and `say` play only on "Read it to me".
 // `spawnMoveAlert` writes `spawning` on each channel a worker can claim, then starts `bun surface/scripts/lane.ts move-alert
 // <wl> <E>` detached, which runs `runMoveAlert`.
@@ -17,7 +20,8 @@
 // `quota-move-alert: <E> <comment|popup> spawning` | `claim pid=<pid> attempt=<n>` | `showing` | `ok <url|button>` |
 // `failed <error>` | `unstarted <why>` | `again <why>`. A channel is claimed in one write transaction only when its newest status
 // is not ok, it has no live claim, and fewer than MOVE_ALERT_ATTEMPTS attempts (claims and unstarted rows) stand since its last
-// `again`, so two workers never run one channel. A claim is live while its pid is a `lane.ts move-alert` process (`PidProbe`)
+// `again`, so two workers never run one channel; the popup also only once the comment has a result (`claimChannel`). A claim is
+// live while its pid is a `lane.ts move-alert` process (`PidProbe`)
 // inside its deadline: a comment claim COMMENT_DEADLINE_MS from the claim, a popup claim POPUP_SHOW_DEADLINE_MS to its
 // `showing` (after `showing` the popup waits on Jo with no deadline, its pid the only liveness test). Past its deadline a claim
 // is stalled (SIGTERM, then `failed stalled: …`); a claim whose pid is gone with no result is dead (`failed worker <pid> ended
@@ -147,6 +151,22 @@ function moveOf(ledger: Ledger, m: MessageRow): QuotaMove | null {
 	return move !== null && ledger.entry(move.eventId)?.workload_id === m.workload_id ? move : null;
 }
 
+/**
+ * A held `quota-move:` message the surface may consume on a closed workload (surface/src/delivery.ts), as it does a trusted
+ * `security-red:`: `parseQuotaMove`'s form (id `msg-qm-<E>`, a body naming its own workload), its event entry E on that workload,
+ * and the writer `recordQuotaMove` uses for both, sender included: LANE_RUNNER_BY for a lane move (E `lane-headroom: <lane> …`), or
+ * for a hand move the lane its subject names (`… of lane <by>`, E `hand-headroom: <subject> …`). Null for anything else.
+ */
+export function trustedQuotaMove(ledger: Ledger, m: MessageRow): QuotaMove | null {
+	const move = parseQuotaMove(m);
+	if (move === null || m.sender !== m.created_by) return null;
+	const event = ledger.entry(move.eventId);
+	if (event === null || event.workload_id !== m.workload_id || event.created_by !== m.created_by) return null;
+	if (move.kind === "lane") return m.created_by === LANE_RUNNER_BY && event.body.startsWith(`lane-headroom: ${move.subject.slice("lane ".length)} `) ? move : null;
+	const writer = /^lane-\S+$/.test(m.created_by) && move.subject.endsWith(` of lane ${m.created_by}`);
+	return writer && event.body.startsWith(`hand-headroom: ${move.subject} `) ? move : null;
+}
+
 /** Every recorded move on every workload, open or closed, oldest first. */
 export function quotaMoves(ledger: Ledger): QuotaMove[] {
 	// An id range (`msg-qm-` up to `msg-qm.`, the next byte after `-`) reads the primary key's index, not every message.
@@ -247,6 +267,8 @@ export type ChannelState =
 
 /** The states a worker may claim from: never claimed yet, spawned for, `again`, or a failure with attempts left. */
 const CLAIMABLE: Partial<Record<ChannelState["state"], true>> = { pending: true, spawning: true, ready: true, unstarted: true, failed: true };
+/** The comment states that are a result: only after one is the popup claimable (the alarm rule: the silent channels first). */
+const COMMENT_RESULT: Partial<Record<ChannelState["state"], true>> = { ok: true, failed: true, exhausted: true };
 
 /** One channel's state from `rows` (all of the move's) at `nowMs`. */
 export function channelState(move: QuotaMove, rows: readonly AlertRow[], channel: MoveAlertChannel, nowMs: number, probe: PidProbe): ChannelState {
@@ -343,14 +365,25 @@ function stateText(s: ChannelState): string {
 
 /**
  * Claim one channel for worker `pid` in one write transaction: settle a stalled or dead claim first, then write `claim
- * pid=<pid> attempt=<n>` only when the channel is claimable (no row yet, `again`, or failed with attempts left). Returns the
- * claim's entry id, or why it was not claimed.
+ * pid=<pid> attempt=<n>` only when the channel is claimable (no row yet, `again`, or failed with attempts left). The popup is
+ * claimable only once the comment has a result (`ok`, `failed` or `exhausted`; a stalled or dead comment claim is settled to
+ * `failed` here first), never while the comment is unclaimed, spawned for, `again` or running. Returns the claim's entry id,
+ * or why it was not claimed.
  */
 export function claimChannel(ledger: Ledger, move: QuotaMove, channel: MoveAlertChannel, seams: SettleSeams & { pid: number }): { claimed: string; attempt: number } | { refused: string } {
 	return ledger.write(() => {
 		settleChannel(ledger, move, channel, seams, false);
-		const s = channelState(move, alertRows(ledger, move), channel, Date.parse(ledger.now()), seams.probe);
+		if (channel === "popup") settleChannel(ledger, move, "comment", seams, false);
+		const rows = alertRows(ledger, move);
+		const now = Date.parse(ledger.now());
+		const s = channelState(move, rows, channel, now, seams.probe);
 		if (CLAIMABLE[s.state] !== true || s.attempts >= MOVE_ALERT_ATTEMPTS) return { refused: stateText(s) };
+		if (channel === "popup") {
+			const comment = channelState(move, rows, "comment", now, seams.probe);
+			if (COMMENT_RESULT[comment.state] !== true) {
+				return { refused: `the comment has no result yet (comment ${stateText(comment)}): the popup follows it, so it is left to the worker that runs the comment, or to the train tick` };
+			}
+		}
 		const attempt = s.attempts + 1;
 		const claimed = recordAlertRow(ledger, move, alertBody(move.eventId, channel, "claim", `pid=${seams.pid} attempt=${attempt}`));
 		return { claimed, attempt };
@@ -418,8 +451,9 @@ function postComment(move: QuotaMove, gh: Gh): string {
 
 /**
  * `lane.ts move-alert <wl> <E> [--again]`: with `again`, open a new block on each exhausted channel; then the comment channel,
- * then the popup channel whatever the comment's result, each only when this worker claims it. Exit 0 when nothing failed and no
- * channel is left exhausted, 1 otherwise (or when E is no move on `wl`).
+ * then the popup channel whatever the comment's result, each only when this worker claims it (the popup only once the comment
+ * has a result: a worker that finds the comment running elsewhere leaves the popup to that worker or the tick, and says so).
+ * Exit 0 when nothing failed and no channel is left exhausted, 1 otherwise (or when E is no move on `wl`).
  */
 export function runMoveAlert(ledger: Ledger, seams: MoveAlertSeams, wl: string, eventId: string, again: boolean): number {
 	const move = quotaMove(ledger, eventId);

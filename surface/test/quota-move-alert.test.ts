@@ -142,8 +142,8 @@ describe("the move record and its NOW line (R5)", () => {
 
 	test("a hand move names its token and slice; an unclassified hand its key", () => {
 		const { ledger, wl, move } = world();
-		move({ kind: "hand", token: "tok-7", slice: "sl-a", eventBody: `hand-headroom: hand tok-7 (slice sl-a) of lane ${LANE} ${A} -> ${SOL} (${REASON})` });
-		move({ kind: "hand", token: "key-3", eventBody: `hand-headroom: unclassified hand key-3 of lane ${LANE} ${A} -> ${SOL} (${REASON})` });
+		move({ kind: "hand", token: "tok-7", slice: "sl-a", by: LANE, eventBody: `hand-headroom: hand tok-7 (slice sl-a) of lane ${LANE} ${A} -> ${SOL} (${REASON})` });
+		move({ kind: "hand", token: "key-3", by: LANE, eventBody: `hand-headroom: unclassified hand key-3 of lane ${LANE} ${A} -> ${SOL} (${REASON})` });
 		expect(errorLines(ledger, undefined, { movePidProbe: () => false }).filter((l) => l.kind === "quota-move").map((l) => l.line)).toEqual([
 			`NOW: hand tok-7 (slice sl-a) of lane ${LANE} on ${wl} moved ${A} -> ${SOL} (${REASON})`,
 			`NOW: unclassified hand key-3 of lane ${LANE} on ${wl} moved ${A} -> ${SOL} (${REASON})`,
@@ -224,7 +224,7 @@ describe("move-alert's channels (R6)", () => {
 		expect(argv.trimEnd().split("\n").slice(-2)).toEqual(["as2: lane moved off anthropic", "the text"]);
 	});
 
-	test("two workers never run one channel: the second finds the first's live comment claim and takes only the popup", () => {
+	test("two workers never run one channel, and the popup waits for the comment's result: B, started during A's comment, shows nothing; A shows the popup after its comment result", () => {
 		const { ledger, wl, move } = world();
 		const m = move();
 		const g = fakeGh();
@@ -235,19 +235,51 @@ describe("move-alert's channels (R6)", () => {
 		g.state.during = () => {
 			bExit = runMoveAlert(ledger, b.seams, wl, m.eventId, false);
 		};
-		const a = worker(g.gh, { pid: 101, live });
+		const atPopup: string[][] = [];
+		const a = worker(g.gh, { pid: 101, live, onPopup: () => atPopup.push(rows(ledger, wl, m.eventId)) });
 		expect(runMoveAlert(ledger, a.seams, wl, m.eventId, false)).toBe(0);
 		expect(bExit).toBe(0);
-		expect(b.logs.some((l) => l.includes("comment not run: running (pid 101, attempt 1)"))).toBe(true);
-		expect(a.logs.some((l) => l.includes(`popup not run: ok ${DISMISS_BUTTON}`))).toBe(true);
-		expect([a.popups.length, b.popups.length]).toEqual([0, 1]);
+		expect(b.logs).toEqual([
+			`move-alert ${m.eventId}: comment not run: running (pid 101, attempt 1)`,
+			`move-alert ${m.eventId}: popup not run: the comment has no result yet (comment running (pid 101, attempt 1)): the popup follows it, so it is left to the worker that runs the comment, or to the train tick`,
+		]);
+		expect([a.popups.length, b.popups.length]).toEqual([1, 0]);
 		expect(g.issues.map((i) => i.comments.length)).toEqual([1]);
-		expect(rows(ledger, wl, m.eventId).filter((r) => r.includes(" claim "))).toEqual(["comment claim pid=101 attempt=1", "popup claim pid=202 attempt=1"]);
+		const url = g.issues[0]!.comments[0]!.url;
+		// A's dialog came up after its comment result and its own popup claim; B claimed nothing.
+		expect(atPopup).toEqual([["comment claim pid=101 attempt=1", `comment ok ${url}`, "popup claim pid=101 attempt=1", "popup showing"]]);
+		expect(rows(ledger, wl, m.eventId)).toEqual(["comment claim pid=101 attempt=1", `comment ok ${url}`, "popup claim pid=101 attempt=1", "popup showing", `popup ok ${DISMISS_BUTTON}`]);
+	});
+
+	test("a comment worker that died leaves the popup to the train tick: its claim is settled failed, the respawned worker retries the comment, then shows the popup", () => {
+		const { ledger, wl, move } = world();
+		const m = move();
+		const g = fakeGh();
+		// Worker 500 claimed the comment and ended with no result; a second worker finds the popup not yet eligible only while 500 lives.
+		const live = new Set([500]);
+		expect(claimChannel(ledger, m, "comment", worker(g.gh, { pid: 500, live }).seams)).toMatchObject({ attempt: 1 });
+		expect(claimChannel(ledger, m, "popup", worker(g.gh, { pid: 501, live }).seams)).toEqual({
+			refused: "the comment has no result yet (comment running (pid 500, attempt 1)): the popup follows it, so it is left to the worker that runs the comment, or to the train tick",
+		});
+		live.delete(500);
+		const spawned: string[][] = [];
+		const tick = worker(g.gh, { pid: 600 });
+		const lines = superviseMove(ledger, m, { ...tick.seams, spawn: (argv) => (spawned.push(argv), 700) });
+		expect(lines).toEqual([`quota-move-alert: ${m.eventId} comment failed worker 500 ended without a result`, "move-alert spawned for comment: pid 700"]);
+		expect(spawned).toHaveLength(1);
+		// The spawned worker: the comment's second attempt, then the popup after its result.
+		const respawned = worker(g.gh, { pid: 700, live: new Set([700]) });
+		expect(runMoveAlert(ledger, respawned.seams, wl, m.eventId, false)).toBe(0);
+		expect(respawned.popups).toHaveLength(1);
+		expect(rows(ledger, wl, m.eventId)).toEqual([
+			"comment claim pid=500 attempt=1", "comment failed worker 500 ended without a result", "comment spawning", "popup spawning",
+			"comment claim pid=700 attempt=2", `comment ok ${g.issues[0]!.comments[0]!.url}`, "popup claim pid=700 attempt=1", "popup showing", `popup ok ${DISMISS_BUTTON}`,
+		]);
 	});
 });
 
 describe("claims, deadlines and the failure line (R7)", () => {
-	test("a comment claim past 180 s and a popup claim with no showing past 30 s are stalled: SIGTERM, then failed stalled", () => {
+	test("a comment claim past 180 s and a popup claim with no showing past 30 s are stalled: SIGTERM, then failed stalled; a popup claim settles a stalled comment first", () => {
 		const { ledger, wl, move, plusSeconds } = world();
 		const m = move();
 		const live = new Set([300]);
@@ -259,12 +291,20 @@ describe("claims, deadlines and the failure line (R7)", () => {
 		plusSeconds(2);
 		expect(settleChannel(ledger, m, "comment", w.seams, true)).toBe(`quota-move-alert: ${m.eventId} comment failed stalled: no comment result after 181 s (pid 300)`);
 		expect(w.kills).toEqual([300]);
+		// m2's comment worker 302 is alive but past its deadline: the popup claim settles it (SIGTERM, failed stalled), then claims.
 		const m2 = move();
-		const p = worker(fakeGh().gh, { pid: 301, live: new Set([301]) });
-		claimChannel(ledger, m2, "popup", p.seams);
+		const p = worker(fakeGh().gh, { pid: 301, live: new Set([301, 302]) });
+		expect(claimChannel(ledger, m2, "comment", { ...p.seams, pid: 302 })).toMatchObject({ attempt: 1 });
+		plusSeconds(181);
+		expect(claimChannel(ledger, m2, "popup", p.seams)).toMatchObject({ attempt: 1 });
+		expect(p.kills).toEqual([302]);
 		plusSeconds(31);
 		expect(settleChannel(ledger, m2, "popup", p.seams, false)).toBe(`quota-move-alert: ${m2.eventId} popup failed stalled: no showing after 31 s (pid 301)`);
-		expect(p.kills).toEqual([301]);
+		expect(p.kills).toEqual([302, 301]);
+		expect(rows(ledger, wl, m2.eventId)).toEqual([
+			"comment claim pid=302 attempt=1", "comment failed stalled: no comment result after 181 s (pid 302)", "popup claim pid=301 attempt=1",
+			"popup failed stalled: no showing after 31 s (pid 301)",
+		]);
 	});
 
 	test("a popup showing with a live pid waits on Jo with no deadline and no failure line", () => {

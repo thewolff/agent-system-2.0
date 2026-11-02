@@ -258,6 +258,58 @@ describe("an exhausted Anthropic week moves a build hand to the first usable Ope
 		expect(h.logs).toEqual([expect.stringContaining("unclassified hand Eval.1 not moved off")]);
 	});
 
+	test("unclassified: the target lab is a builder of the bound workload, so a later review is not routed to it (review r1 F1)", async () => {
+		const w = world(poll([week(1), openaiWeek]));
+		const h = lane(w);
+		h.laneMessage(OPUS);
+		expect(builderLabs(w.ledger, w.wl).labs).toEqual(["anthropic"]);
+		expect((await h.spawn("strong", "Eval.1", "eval"))?.model).toEqual([SOL]);
+		expect(bodies(w, "builder-lab: openai")).toEqual([`builder-lab: openai hand Eval.1 model ${SOL}`]);
+		expect(builderLabs(w.ledger, w.wl).labs).toEqual(["anthropic", "openai"]);
+		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-1");
+		expect(out?.block).toBeUndefined();
+		const review = await h.spawn(out!.input!.agent, "sl-x");
+		expect(review?.model).toEqual([KIMI]);
+
+		// A keyless hand's mark carries its move's event id as its token.
+		const keyless = world(poll([week(1), openaiWeek]));
+		expect((await lane(keyless).spawn("strong", undefined, "eval"))?.model).toEqual([SOL]);
+		const event = keyless.ledger.entries(keyless.wl).find(e => e.body.startsWith("hand-headroom:"))!;
+		expect(bodies(keyless, "builder-lab:")).toEqual([`builder-lab: openai hand ${event.id} model ${SOL}`]);
+	});
+
+	test("unclassified: one transaction, so a failed quota-move: write leaves no builder-lab: mark and refuses the spawn", async () => {
+		const w = world(poll([week(1), openaiWeek]));
+		const broken = Object.create(w.ledger) as Ledger;
+		broken.enqueue = () => {
+			throw new Error("disk I/O error");
+		};
+		const spawn = await lane(w, { ledger: broken }).spawn("strong", "Eval.1", "eval");
+		expect(spawn?.block).toBe(true);
+		expect(spawn?.reason).toContain("disk I/O error");
+		expect(bodies(w, "hand-headroom:")).toEqual([]);
+		expect(bodies(w, "builder-lab:")).toEqual([]);
+	});
+
+	test("unclassified: the move skips a provider refused on the bound workload, and with none left is refused as today (review r1 F4)", async () => {
+		const w = world(poll([week(1), openaiWeek]));
+		w.ledger.recordEntry({ by: LANE_ID, workloadId: w.wl, kind: "assumption", body: "provider-refused: openai-codex status 401 token dt-old" });
+		const h = lane(w);
+		expect((await h.spawn("strong", "Eval.1", "eval"))?.model).toEqual([KIMI]);
+		expect(bodies(w, "hand-headroom:")).toEqual([`hand-headroom: unclassified hand Eval.1 of lane ${LANE_ID} ${OPUS} -> ${KIMI} (${EXHAUSTED})`]);
+
+		const none = world(poll([week(1), openaiWeek]));
+		for (const provider of ["openai-codex", "moonshot"]) {
+			none.ledger.recordEntry({ by: LANE_ID, workloadId: none.wl, kind: "assumption", body: `provider-refused: ${provider} status 401 token dt-old` });
+		}
+		const refused = await lane(none).spawn("strong", "Eval.1", "eval");
+		expect(refused?.block).toBe(true);
+		expect(refused?.reason).toContain(`agent-system-2 classifier: no usable strong model on the lane lab anthropic (${OPUS}): ${OPUS} (projected out: anthropic 7d 1.00 used`);
+		expect(refused?.reason).toContain("a build hand never runs on another lab");
+		expect(quotaMoves(none.ledger)).toEqual([]);
+		expect(bodies(none, "builder-lab:")).toEqual([]);
+	});
+
 	test("the first usable entry in row order: an unusable OpenAI entry passes the move to Kimi", async () => {
 		const w = world(poll([week(1), openaiWeek]));
 		w.registry = fakeRegistry(ALL, ALL.filter(m => m !== SOL));
