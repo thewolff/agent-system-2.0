@@ -19,11 +19,13 @@
 // Env: AGENT_SYSTEM_LEDGER_DB (default ~/.agent-system-2/ledger.db), AGENT_SYSTEM_PROFILE (default agent-system-2),
 // HOME, PATH (every probe resolves on it). AS2_DOCTOR_POPUP_WAIT=1 is a test seam: the popup process runs in the
 // foreground and the run waits for it.
-// Exit, in every mode: 0 nothing failed, 1 a part failed (or the popup failed, or an alert could not be written),
-// 2 a bad argument (--help included: it checks nothing, so it is not a 0) or the doctor itself crashed.
+// Exit, in every mode: 0 nothing failed, 1 a part failed or the doctor detected and reported a failure of its own (the
+// popup failed, an alert could not be written, a probe, kill or spawn failed, the ledger could not be closed), 2 a bad
+// argument (--help included: it checks nothing, so it is not a 0) or the doctor itself crashed. A crash after parts were
+// checked prints what the run had collected first, then the crash.
 import { join, resolve } from "node:path";
 import { defaultLedgerPath, Ledger } from "../../ledger/src/index";
-import { type DoctorDeps, doctorTick, partLine, popupRun, realDeps, type RunOutcome, runAfterRestart, runDefault } from "../src/doctor";
+import { DoctorCrash, type DoctorDeps, doctorTick, type PartResult, partLine, popupRun, realDeps, type RunOutcome, runAfterRestart, runDefault, thenClose } from "../src/doctor";
 
 const USAGE = "usage: bun surface/scripts/doctor.ts [--json | --after-restart | --tick | --popup]";
 
@@ -38,10 +40,26 @@ export function parseMode(argv: readonly string[]): Mode | string {
 	return flags[argv[0]!] ?? `unknown argument ${argv[0]}`;
 }
 
-function summary(o: RunOutcome): string {
+/** The default mode's last line; a run that failed with no failing part (a write, spawn, kill, probe or close) says so. */
+function summary(o: { exit: number; results: readonly PartResult[] }): string {
 	const count = (v: string) => o.results.filter((r) => r.verdict === v).length;
 	const failed = o.results.filter((r) => r.verdict === "fail").map((r) => r.part);
-	return `as2 doctor: ${count("pass")} pass, ${count("fail")} fail${failed.length ? ` (${failed.join(", ")})` : ""}, ${count("warn")} warn, ${count("not installed")} not installed`;
+	const own = o.exit !== 0 && failed.length === 0 ? "; the run failed: see the doctor: lines above" : "";
+	return `as2 doctor: ${count("pass")} pass, ${count("fail")} fail${failed.length ? ` (${failed.join(", ")})` : ""}, ${count("warn")} warn, ${count("not installed")} not installed${own}`;
+}
+
+/** A run's output in its mode; `crash` when the run crashed after collecting `o` (the crash itself goes to stderr, exit 2). */
+function report(mode: "default" | "json" | "after-restart", o: { exit: number; results: readonly PartResult[]; notes: readonly string[] }, deps: DoctorDeps, at: string, crash: string | null): void {
+	if (mode === "default") {
+		for (const r of o.results) deps.out(partLine(r));
+		for (const n of o.notes) deps.out(n);
+		deps.out(crash === null ? summary(o) : `as2 doctor: crashed after the lines above (${crash}); they are what the run had collected`);
+	} else if (mode === "json") {
+		deps.out(JSON.stringify({ at, exit: o.exit, parts: o.results, notes: o.notes, ...(crash === null ? {} : { crash }) }));
+	} else {
+		const failed = o.results.filter((r) => r.verdict === "fail").map((r) => `${r.part} (${r.evidence})`);
+		deps.out(`${at} doctor --after-restart: ${o.results.length} part(s) checked, ${failed.length} failing${failed.length ? `: ${failed.join("; ")}` : ""}${o.notes.length ? `; ${o.notes.join("; ")}` : ""}${crash === null ? "" : `; crashed: ${crash}`}`);
+	}
 }
 
 export async function main(argv: readonly string[], deps: DoctorDeps): Promise<number> {
@@ -52,25 +70,23 @@ export async function main(argv: readonly string[], deps: DoctorDeps): Promise<n
 	}
 	const stamp = () => new Date(deps.now()).toISOString();
 	switch (mode as Mode) {
-		case "default": {
-			const o = await runDefault(deps);
-			for (const r of o.results) deps.out(partLine(r));
-			for (const n of o.notes) deps.out(n);
-			deps.out(summary(o));
-			return o.exit;
-		}
-		case "json": {
-			const o = await runDefault(deps);
-			deps.out(JSON.stringify({ at: stamp(), exit: o.exit, parts: o.results, notes: o.notes }));
-			return o.exit;
-		}
+		case "default":
+		case "json":
 		case "after-restart": {
-			const o = await runAfterRestart(deps);
-			const failed = o.results.filter((r) => r.verdict === "fail").map((r) => `${r.part} (${r.evidence})`);
-			deps.out(`${stamp()} doctor --after-restart: ${o.results.length} part(s) checked, ${failed.length} failing${failed.length ? `: ${failed.join("; ")}` : ""}${o.notes.length ? `; ${o.notes.join("; ")}` : ""}`);
+			const m = mode as "default" | "json" | "after-restart";
+			let o: RunOutcome;
+			try {
+				o = await (m === "after-restart" ? runAfterRestart(deps) : runDefault(deps));
+			} catch (e) {
+				if (!(e instanceof DoctorCrash)) throw e;
+				report(m, { exit: 2, results: e.results, notes: e.notes }, deps, stamp(), e.crash instanceof Error ? e.crash.message : String(e.crash));
+				throw e.crash;
+			}
+			report(m, o, deps, stamp(), null);
 			return o.exit;
 		}
 		case "tick": {
+			const out = (l: string) => deps.out(`${stamp()} ${l}`);
 			let ledger: Ledger | null = null;
 			let openError: string | null = null;
 			try {
@@ -78,20 +94,21 @@ export async function main(argv: readonly string[], deps: DoctorDeps): Promise<n
 			} catch (e) {
 				openError = e instanceof Error ? e.message : String(e);
 			}
-			try {
-				const results = doctorTick(ledger, { ...deps, out: (l) => deps.out(`${stamp()} ${l}`) }, openError);
-				return openError !== null || results.some((r) => r.verdict === "fail") ? 1 : 0;
-			} finally {
-				ledger?.close();
+			if (ledger === null) {
+				doctorTick(null, { ...deps, out }, openError);
+				return 1;
 			}
+			const opened = ledger;
+			const { value: r, closeError } = thenClose(opened, "the doctor's ctx step", () => doctorTick(opened, { ...deps, out }));
+			if (closeError !== null) out(`doctor: the ledger ${deps.ledgerPath} could not be closed after the ctx step: ${closeError}`);
+			return closeError !== null || r.failed || r.results.some((x) => x.verdict === "fail") ? 1 : 0;
 		}
 		case "popup": {
+			const out = (l: string) => deps.out(`${stamp()} ${l}`);
 			const ledger = Ledger.open(deps.ledgerPath, { backupOnOpen: false, clock: () => stamp() });
-			try {
-				return popupRun(ledger, { ...deps, out: (l) => deps.out(`${stamp()} ${l}`) });
-			} finally {
-				ledger.close();
-			}
+			const { value: code, closeError } = thenClose(ledger, "the popup process", () => popupRun(ledger, { ...deps, out }));
+			if (closeError !== null) out(`doctor popup: the ledger ${deps.ledgerPath} could not be closed: ${closeError}`);
+			return closeError !== null ? 1 : code;
 		}
 	}
 	return 2;

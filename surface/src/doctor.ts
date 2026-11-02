@@ -495,42 +495,79 @@ export function backupDir(ledgerPath: string): string {
 	return join(dirname(canonical), "backups", backupNamespace(canonical));
 }
 
+/**
+ * Close a ledger and return its error, or null. It never throws, so a close never replaces the run's own error and never
+ * drops what the run collected (standing rule: one failure never hides another); the caller reports the error.
+ */
+export function closeLedger(ledger: Ledger): { error: unknown } | null {
+	try {
+		ledger.close();
+		return null;
+	} catch (e) {
+		return { error: e };
+	}
+}
+
+/**
+ * `f`, then the ledger's close. `f` and the close both failing → one AggregateError keeping each; only the close failing
+ * → f's value and the close's error text, for the caller to report beside that value.
+ */
+export function thenClose<T>(ledger: Ledger, what: string, f: () => T): { value: T; closeError: string | null } {
+	let value: T;
+	try {
+		value = f();
+	} catch (e) {
+		const c = closeLedger(ledger);
+		if (c) throw new AggregateError([e, c.error], `${what} failed (${clip(errText(e))}), and closing the ledger failed too (${clip(errText(c.error))})`);
+		throw e;
+	}
+	const c = closeLedger(ledger);
+	return { value, closeError: c ? clip(errText(c.error)) : null };
+}
+
 /** `ledger` (open read-only and one read) and `backup` (invariants' backupState; PLAN R6). */
 export function checkLedger(deps: DoctorDeps): PartResult[] {
-	const kick = "run in your own Terminal: launchctl kickstart gui/$(id -u)/com.agent-system-2.ledger-backup";
+	const fix = `fix the ledger at ${deps.ledgerPath} (the error above)`;
 	let ledger: Ledger;
 	try {
 		ledger = Ledger.open(deps.ledgerPath, { readonly: true });
 	} catch (e) {
 		return [
-			fail("ledger", `${deps.ledgerPath} could not be opened: ${clip(errText(e))}`, `fix the ledger at ${deps.ledgerPath} (the error above)`),
+			fail("ledger", `${deps.ledgerPath} could not be opened: ${clip(errText(e))}`, fix),
 			fail("backup", "the ledger could not be opened, so its backups could not be judged", `fix the ledger at ${deps.ledgerPath} first`),
 		];
 	}
+	const opened = ledger;
+	const { value: out, closeError } = thenClose(opened, `reading the ledger ${deps.ledgerPath}`, () => readLedger(deps, opened));
+	if (closeError === null) return out;
+	// The read's verdicts stand (the backup one included); the close failure fails `ledger` beside them.
+	const why = `${deps.ledgerPath} could not be closed after its read: ${closeError}`;
+	return out.map((r) => (r.part !== "ledger" ? r : r.verdict === "fail" ? { ...r, evidence: `${r.evidence}; ${why}` } : fail("ledger", why, fix)));
+}
+
+/** checkLedger's read of an open ledger: every read's error is a part's `fail`, never a throw. */
+function readLedger(deps: DoctorDeps, ledger: Ledger): PartResult[] {
+	const kick = "run in your own Terminal: launchctl kickstart gui/$(id -u)/com.agent-system-2.ledger-backup";
+	const out: PartResult[] = [];
 	try {
-		const out: PartResult[] = [];
-		try {
-			const standing = ledger.workload(STANDING_WORKLOAD_ID);
-			out.push(pass("ledger", `${deps.ledgerPath} opened read-only and read (standing workload ${standing ? "present" : "not yet opened"})`));
-		} catch (e) {
-			out.push(fail("ledger", `${deps.ledgerPath} opened but a read failed: ${clip(errText(e))}`, `fix the ledger at ${deps.ledgerPath} (the error above)`));
-			out.push(fail("backup", "the ledger could not be read, so its backups could not be judged", `fix the ledger at ${deps.ledgerPath} first`));
-			return out;
-		}
-		let dir = "";
-		try {
-			dir = backupDir(deps.ledgerPath);
-			const b = backupState(ledger.db, dir, BACKUP_GAP_MS, iso(deps.now()));
-			if (b.state === "ok") out.push(pass("backup", b.copy ? `newest complete copy ${b.copy.name}; ledger writes ${age(b.behindMs)} past it (gap ${age(BACKUP_GAP_MS)})` : `no copy yet, and every write is within ${age(BACKUP_GAP_MS)} of the first`));
-			else if (b.state === "stale") out.push(fail("backup", b.finding.text, kick));
-			else out.push(fail("backup", `unjudged: ${b.why}`, `fix access to ${dir}, then ${kick}`));
-		} catch (e) {
-			out.push(fail("backup", `the backup state could not be read${dir ? ` (${dir})` : ""}: ${clip(errText(e))}`, kick));
-		}
+		const standing = ledger.workload(STANDING_WORKLOAD_ID);
+		out.push(pass("ledger", `${deps.ledgerPath} opened read-only and read (standing workload ${standing ? "present" : "not yet opened"})`));
+	} catch (e) {
+		out.push(fail("ledger", `${deps.ledgerPath} opened but a read failed: ${clip(errText(e))}`, `fix the ledger at ${deps.ledgerPath} (the error above)`));
+		out.push(fail("backup", "the ledger could not be read, so its backups could not be judged", `fix the ledger at ${deps.ledgerPath} first`));
 		return out;
-	} finally {
-		ledger.close();
 	}
+	let dir = "";
+	try {
+		dir = backupDir(deps.ledgerPath);
+		const b = backupState(ledger.db, dir, BACKUP_GAP_MS, iso(deps.now()));
+		if (b.state === "ok") out.push(pass("backup", b.copy ? `newest complete copy ${b.copy.name}; ledger writes ${age(b.behindMs)} past it (gap ${age(BACKUP_GAP_MS)})` : `no copy yet, and every write is within ${age(BACKUP_GAP_MS)} of the first`));
+		else if (b.state === "stale") out.push(fail("backup", b.finding.text, kick));
+		else out.push(fail("backup", `unjudged: ${b.why}`, `fix access to ${dir}, then ${kick}`));
+	} catch (e) {
+		out.push(fail("backup", `the backup state could not be read${dir ? ` (${dir})` : ""}: ${clip(errText(e))}`, kick));
+	}
+	return out;
 }
 
 /** `seat`: Ilex's orchestrator process (`omp --cwd <repo> … --append-system-prompt …/orchestrator/system.md`; PLAN R7). */
@@ -714,9 +751,11 @@ export function transition(mode: EpisodeMode, r: PartResult, down: OpenDown | un
 	return { prefix: "doctor-down", part: r.part, evidence: r.evidence, fix: r.fix };
 }
 
-/** Write each judged part's transition, one ledger write per part with a re-read; the bodies written. */
-export function applyEpisodes(ledger: Ledger, results: readonly PartResult[], mode: EpisodeMode): string[] {
-	const written: string[] = [];
+/**
+ * Write each judged part's transition, one ledger write per part with a re-read; each body goes to `wrote` once written,
+ * so a later part's failed write never drops an earlier part's line.
+ */
+export function applyEpisodes(ledger: Ledger, results: readonly PartResult[], mode: EpisodeMode, wrote: (body: string) => void): void {
 	for (const r of judged(results)) {
 		const body = ledger.write(() => {
 			ensureStandingWorkload(ledger);
@@ -726,9 +765,8 @@ export function applyEpisodes(ledger: Ledger, results: readonly PartResult[], mo
 			const next = transition(mode, r, down, strike);
 			return next ? record(ledger, next) : null;
 		});
-		if (body) written.push(body);
+		if (body) wrote(body);
 	}
-	return written;
 }
 
 /** Parts with an open down or strike: what the after-restart run re-checks. */
@@ -762,13 +800,22 @@ export function startToken(lstart: string): string {
 	return Number.isFinite(t) ? new Date(t).toISOString() : "unknown";
 }
 
-/** This process's start token (`unknown` when ps cannot tell, with the reason logged). */
-function ownStart(deps: DoctorDeps): string {
+/**
+ * A run's failure flag: set by every failure the run detects and reports itself (a probe, a write, a spawn, a kill, a
+ * close), so the run exits 1 even when every part passes. A crash is not this: it is thrown, and the CLI exits 2.
+ */
+export interface RunFlag {
+	failed: boolean;
+}
+
+/** This process's start token (`unknown` when ps cannot tell, with the reason logged and the run failed). */
+function ownStart(deps: DoctorDeps, flag: RunFlag): string {
 	try {
 		const out = psAnswer(psRun(deps), deps.pid, "stat=,lstart=");
 		if (out === null) throw new Error(`ps -p ${deps.pid} says this process does not exist`);
 		return startToken(statStart(out).start);
 	} catch (e) {
+		flag.failed = true;
 		deps.out(`doctor: this process's start time could not be read (${clip(errText(e))}); the claim records start unknown, so a reused pid cannot be told from it`);
 		return "unknown";
 	}
@@ -805,17 +852,19 @@ export function pendingDowns(control: readonly ControlEntry[]): OpenDown[] {
 /**
  * Settle every claim without an outcome, from outside (PLAN "Alerts"): a prior boot, a gone owner or a reused pid →
  * `abandoned <why>`; past `until` → `expired`, and the owner killed when it is still the same process. Identity is read
- * outside the write; the write re-reads and settles only claims still without an outcome. Returns the lines to log.
+ * outside the write; the write re-reads and settles only claims still without an outcome. Each line goes to `deps.out` as
+ * it happens, so a later throw never drops an earlier line; a boot or identity probe that fails and a kill that fails
+ * each set the run's failure flag.
  */
-export function settleClaims(ledger: Ledger, deps: DoctorDeps): string[] {
-	const lines: string[] = [];
+export function settleClaims(ledger: Ledger, deps: DoctorDeps, flag: RunFlag): void {
 	const open = popupClaims(doctorControl(ledger)).filter((c) => c.outcome === null);
-	if (open.length === 0) return lines;
+	if (open.length === 0) return;
 	let boot: number | null = null;
 	try {
 		boot = currentBoot(deps);
 	} catch (e) {
-		lines.push(`doctor: the boot time could not be read (${clip(errText(e))}), so no claim is judged by boot this run`);
+		flag.failed = true;
+		deps.out(`doctor: the boot time could not be read (${clip(errText(e))}), so no claim is judged by boot this run`);
 	}
 	const now = deps.now();
 	const verdicts: { popupId: string; outcome: Exclude<PopupOutcome, { state: "claimed" }>; kill: number | null }[] = [];
@@ -826,41 +875,46 @@ export function settleClaims(ledger: Ledger, deps: DoctorDeps): string[] {
 			continue;
 		}
 		const owner = ownerState(deps, pid, start);
+		if (owner.state === "failed") flag.failed = true;
 		if (owner.state === "gone") verdicts.push({ popupId: c.popupId, outcome: { state: "abandoned", detail: `owner pid ${pid} gone` }, kill: null });
 		else if (owner.state === "other") verdicts.push({ popupId: c.popupId, outcome: { state: "abandoned", detail: `pid ${pid} reused by another process` }, kill: null });
 		else if (now > Date.parse(until)) {
 			const note = owner.state === "failed" ? `past until ${until}; pid ${pid} not killed (its identity could not be read: ${owner.why})` : owner.state === "same" ? `past until ${until}; owner pid ${pid} killed` : `past until ${until}; pid ${pid} not killed (no start time recorded to tell it is the owner)`;
 			verdicts.push({ popupId: c.popupId, outcome: { state: "expired", detail: note }, kill: owner.state === "same" ? pid : null });
-		} else if (owner.state === "failed") lines.push(`doctor: claim ${c.popupId}'s owner pid ${pid} could not be checked (${owner.why}); it stands until ${until}`);
+		} else if (owner.state === "failed") deps.out(`doctor: claim ${c.popupId}'s owner pid ${pid} could not be checked (${owner.why}); it stands until ${until}`);
 	}
-	if (verdicts.length === 0) return lines;
+	if (verdicts.length === 0) return;
 	const settled = ledger.write(() => {
 		const still = new Set(popupClaims(doctorControl(ledger)).filter((c) => c.outcome === null).map((c) => c.popupId));
 		return verdicts.filter((v) => still.has(v.popupId)).map((v) => ({ v, body: record(ledger, { prefix: "doctor-popup", popupId: v.popupId, outcome: v.outcome }) }));
 	});
 	for (const { v, body } of settled) {
-		lines.push(`wrote ${body}`);
+		deps.out(`wrote ${body}`);
 		if (v.kill === null) continue;
 		try {
 			deps.kill(v.kill);
 		} catch (e) {
-			lines.push(`doctor: expired claim ${v.popupId}'s owner pid ${v.kill} could not be killed: ${clip(errText(e))}`);
+			flag.failed = true;
+			deps.out(`doctor: expired claim ${v.popupId}'s owner pid ${v.kill} could not be killed: ${clip(errText(e))}`);
 		}
 	}
-	return lines;
 }
 
-/** After a run's writes: settle claims, then spawn the popup process when any down is pending. Lines to log. */
-export function settleAndSpawn(ledger: Ledger, deps: DoctorDeps): string[] {
-	const lines = settleClaims(ledger, deps);
+/**
+ * After a run's writes: settle claims, then spawn the popup process when any down is pending; lines to `deps.out`. A
+ * spawn that fails is a line and sets the run's failure flag (PLAN R2: the run exits 1, so install never says "install
+ * complete").
+ */
+export function settleAndSpawn(ledger: Ledger, deps: DoctorDeps, flag: RunFlag): void {
+	settleClaims(ledger, deps, flag);
 	const pending = pendingDowns(doctorControl(ledger));
-	if (pending.length === 0) return lines;
+	if (pending.length === 0) return;
 	try {
-		lines.push(`${pending.length} down(s) pending a popup (${pending.map((d) => d.part).join(", ")}): ${deps.spawnPopup()}`);
+		deps.out(`${pending.length} down(s) pending a popup (${pending.map((d) => d.part).join(", ")}): ${deps.spawnPopup()}`);
 	} catch (e) {
-		lines.push(`doctor: the popup process could not be spawned (${clip(errText(e))}); nothing was claimed, so the next run spawns it again`);
+		flag.failed = true;
+		deps.out(`doctor: spawning the popup process failed (${clip(errText(e))}); this run claimed nothing, so the next run spawns it again`);
 	}
-	return lines;
 }
 
 /** The popup's title, text (every part and its fix) and spoken text. */
@@ -875,12 +929,16 @@ export function popupWords(downs: readonly OpenDown[]): { title: string; text: s
 
 /**
  * The popup process (`--popup`): settle claims, claim every pending down in one write with a re-read, show the popup,
- * write its outcome. Exit 0 nothing pending or answered, 1 the popup failed or its outcome could not be written.
+ * write its outcome. Exit 0 nothing pending or answered, 1 the popup failed, its outcome could not be written, or a
+ * settle, kill or identity probe failed (the run's failure flag). The outcome is printed before its write, so a write
+ * that fails never hides it. A throw before the claim (the boot probe, the claim's write) is a crash: lines already
+ * printed stay printed.
  */
 export function popupRun(ledger: Ledger, deps: DoctorDeps): number {
-	for (const l of settleClaims(ledger, deps)) deps.out(l);
+	const flag: RunFlag = { failed: false };
+	settleClaims(ledger, deps, flag);
 	const boot = currentBoot(deps);
-	const start = ownStart(deps);
+	const start = ownStart(deps, flag);
 	const now = deps.now();
 	// Unique per claim, even for two claims in one millisecond by one pid (a test, or a pid reused at once).
 	const popupId = `pp-${now.toString(36)}-${deps.pid}-${randomBytes(3).toString("hex")}`;
@@ -893,20 +951,27 @@ export function popupRun(ledger: Ledger, deps: DoctorDeps): number {
 	});
 	if (!claim) {
 		deps.out("doctor popup: nothing pending");
-		return 0;
+		return flag.failed ? 1 : 0;
 	}
 	deps.out(`wrote ${claim.body}`);
 	const w = popupWords(claim.downs);
 	const outcome = deps.alarm(w.title, w.text, w.spoken, DOCTOR_GIVE_UP_SECS, POPUP_RUN_MS);
-	const written = ledger.write((): { kind: "already"; outcome: Exclude<PopupOutcome, { state: "claimed" }> } | { kind: "wrote"; body: string } => {
-		const mine = popupClaims(doctorControl(ledger)).find((c) => c.popupId === popupId);
-		if (mine?.outcome) return { kind: "already", outcome: mine.outcome };
-		return { kind: "wrote", body: record(ledger, { prefix: "doctor-popup", popupId, outcome }) };
-	});
-	if (written.kind === "already") deps.out(`doctor popup ${popupId}: ${outcome.state} ${outcome.detail}, but another run settled the claim first (${written.outcome.state} ${written.outcome.detail}); nothing written`);
-	else deps.out(`wrote ${written.body}`);
+	deps.out(`doctor popup ${popupId}: ${outcome.state} ${outcome.detail}`);
 	if (outcome.state === "answered" && outcome.detail.startsWith("audio-failed")) deps.out(`doctor popup ${popupId}: shown, but the read-aloud failed: ${outcome.detail}`);
-	return outcome.state === "answered" ? 0 : 1;
+	let written: { kind: "already"; outcome: Exclude<PopupOutcome, { state: "claimed" }> } | { kind: "wrote"; body: string };
+	try {
+		written = ledger.write(() => {
+			const mine = popupClaims(doctorControl(ledger)).find((c) => c.popupId === popupId);
+			if (mine?.outcome) return { kind: "already" as const, outcome: mine.outcome };
+			return { kind: "wrote" as const, body: record(ledger, { prefix: "doctor-popup", popupId, outcome }) };
+		});
+	} catch (e) {
+		deps.out(`doctor popup ${popupId}: its outcome could not be written (${clip(errText(e))}); the claim stays without one until a later run settles it`);
+		return 1;
+	}
+	if (written.kind === "already") deps.out(`doctor popup ${popupId}: another run settled the claim first (${written.outcome.state} ${written.outcome.detail}); nothing written`);
+	else deps.out(`wrote ${written.body}`);
+	return outcome.state === "answered" && !flag.failed ? 0 : 1;
 }
 
 // ---- the ledger-down popup (file record; the doctor job only) -------------------------------------------------
@@ -960,11 +1025,14 @@ export function ledgerDownState(deps: DoctorDeps): string | null {
 /**
  * The doctor job's ledger-down popup (PLAN "Ledger unopenable"): settle the last attempt, then, unless this boot has an
  * answered attempt or POPUP_ATTEMPT_LIMIT unanswered ones, append an attempt and show the popup in the foreground under
- * its own kill bound. A record that cannot be read or written is logged and the banner fires once instead.
+ * its own kill bound. A record that cannot be read or written is logged and the banner fires once instead. Every error
+ * (an owner probe, a kill, the popup's own outcome) is printed before the record write that stores it, so a write that
+ * fails never hides it, and sets the run's failure flag.
  */
-export function ledgerDownPopup(deps: DoctorDeps, ledgerError: string): void {
+export function ledgerDownPopup(deps: DoctorDeps, ledgerError: string, flag: RunFlag): void {
 	const path = ledgerDownPath(deps.home);
 	const banner = (why: string) => {
+		flag.failed = true;
 		deps.out(`doctor: ledger-down record ${path}: ${why}; the banner fires instead`);
 		const ok = deps.notify("as2 doctor: the ledger cannot be opened", clip(ledgerError, 200));
 		if (!ok) deps.out("doctor: the ledger-down banner could not be shown either (osascript failed)");
@@ -997,24 +1065,28 @@ export function ledgerDownPopup(deps: DoctorDeps, ledgerError: string): void {
 	};
 	const now = deps.now();
 	const last = rec.attempts.at(-1);
-	let probeFailed: string | null = null;
+	let probeFailed = false;
 	if (last && last.outcome === undefined) {
 		if (rec.boot !== boot) last.outcome = `abandoned prior boot ${rec.boot}`;
 		else {
 			const owner = ownerState(deps, last.pid, last.start);
+			if (owner.state === "failed") flag.failed = true;
 			if (owner.state === "gone") last.outcome = `abandoned owner pid ${last.pid} gone`;
 			else if (owner.state === "other") last.outcome = `abandoned pid ${last.pid} reused`;
 			else if (now > Date.parse(last.until)) {
 				if (owner.state === "failed") {
-					probeFailed = owner.why;
+					probeFailed = true;
 					last.outcome = `expired past until ${last.until}; pid ${last.pid} not killed (its identity could not be read: ${owner.why})`;
 					last.error = `ps for owner pid ${last.pid}: ${owner.why}`;
+					deps.out(`doctor: the ledger-down popup's owner pid ${last.pid} could not be checked (${owner.why}); its attempt is past until ${last.until}, so it is expired; no new popup this run, the next run decides`);
 				} else last.outcome = `expired past until ${last.until}`;
 				if (owner.state === "same") {
 					try {
 						deps.kill(last.pid);
 					} catch (e) {
+						flag.failed = true;
 						last.error = `kill ${last.pid}: ${clip(errText(e))}`;
+						deps.out(`doctor: the ledger-down popup's stalled owner pid ${last.pid} could not be killed: ${clip(errText(e))}`);
 					}
 				}
 			} else if (owner.state === "failed") {
@@ -1027,10 +1099,7 @@ export function ledgerDownPopup(deps: DoctorDeps, ledgerError: string): void {
 			}
 		}
 		if (!save()) return;
-		if (probeFailed) {
-			deps.out(`doctor: the ledger-down popup's owner pid ${last.pid} could not be checked (${probeFailed}); recorded as expired; no new popup this run, the next run decides`);
-			return;
-		}
+		if (probeFailed) return;
 	}
 	if (rec.boot !== boot) rec = { boot, attempts: [] };
 	if (rec.attempts.some((a) => a.outcome?.startsWith("answered"))) {
@@ -1039,15 +1108,18 @@ export function ledgerDownPopup(deps: DoctorDeps, ledgerError: string): void {
 	}
 	const bad = unanswered(rec);
 	if (bad.length >= POPUP_ATTEMPT_LIMIT) {
+		flag.failed = true;
 		deps.out(`ledger-down popup failed ${POPUP_ATTEMPT_LIMIT} times this boot: ${bad.at(-1)!.outcome}`);
 		return;
 	}
-	const attempt: LedgerDownAttempt = { pid: deps.pid, start: ownStart(deps), began: iso(now), until: iso(now + LEDGER_DOWN_ATTEMPT_MS) };
+	const attempt: LedgerDownAttempt = { pid: deps.pid, start: ownStart(deps, flag), began: iso(now), until: iso(now + LEDGER_DOWN_ATTEMPT_MS) };
 	rec.attempts.push(attempt);
 	if (!save()) return;
 	const outcome = deps.alarm("as2 doctor: the ledger cannot be opened", `${clip(ledgerError, 600)}\n\nFix: fix the ledger at ${deps.ledgerPath}; the next doctor run checks again.`, "as2 doctor. The ledger cannot be opened.", LEDGER_DOWN_GIVE_UP_SECS, LEDGER_DOWN_ATTEMPT_MS);
 	attempt.outcome = `${outcome.state} ${outcome.detail}`;
-	if (save()) deps.out(`doctor: ledger-down popup ${attempt.outcome}`);
+	if (outcome.state !== "answered") flag.failed = true;
+	deps.out(`doctor: ledger-down popup ${attempt.outcome}`);
+	save();
 }
 
 // ---- modes ---------------------------------------------------------------------------------------------------
@@ -1064,10 +1136,28 @@ export interface RunOutcome {
 	notes: string[];
 }
 
-const exitOf = (results: readonly PartResult[], notes: { failed: boolean }): 0 | 1 => (notes.failed || results.some((r) => r.verdict === "fail") ? 1 : 0);
+/**
+ * A run that threw after collecting part results and notes: the CLI prints what was collected, then reports `crash` as
+ * the crash (exit 2), so a crash never hides what the run had already found (standing rule: one failure never hides
+ * another).
+ */
+export class DoctorCrash extends Error {
+	readonly crash: unknown;
+	readonly results: PartResult[];
+	readonly notes: string[];
+	constructor(crash: unknown, results: PartResult[], notes: string[]) {
+		super(`as2 doctor crashed after collecting ${results.length} part result(s) and ${notes.length} note(s): ${errText(crash)}`, { cause: crash });
+		this.name = "DoctorCrash";
+		this.crash = crash;
+		this.results = results;
+		this.notes = notes;
+	}
+}
+
+const exitOf = (results: readonly PartResult[], flag: RunFlag): 0 | 1 => (flag.failed || results.some((r) => r.verdict === "fail") ? 1 : 0);
 
 /** Open the ledger for writing; null, a note and the run's failure flag when it cannot be. */
-function openRw(deps: DoctorDeps, notes: string[], flag: { failed: boolean }): Ledger | null {
+function openRw(deps: DoctorDeps, notes: string[], flag: RunFlag): Ledger | null {
 	try {
 		return Ledger.open(deps.ledgerPath, { backupOnOpen: false, clock: () => iso(deps.now()) });
 	} catch (e) {
@@ -1077,29 +1167,38 @@ function openRw(deps: DoctorDeps, notes: string[], flag: { failed: boolean }): L
 	}
 }
 
-/** Run `f` against the ledger; an error is a note and marks the run failed, never hides the parts' results. */
-function withLedger(ledger: Ledger, notes: string[], flag: { failed: boolean }, what: string, f: () => string[]): void {
+/** Close the run's writable ledger; a close that fails is a note naming the error and fails the run, never a throw. */
+function closeRw(ledger: Ledger, deps: DoctorDeps, notes: string[], flag: RunFlag): void {
+	const c = closeLedger(ledger);
+	if (!c) return;
+	flag.failed = true;
+	notes.push(`doctor: the ledger ${deps.ledgerPath} could not be closed after this run's writes: ${clip(errText(c.error))}`);
+}
+
+/** Run `f`, which notes its own lines as they happen; an error is a note and marks the run failed, never hides the parts' results. */
+function withLedger(notes: string[], flag: RunFlag, what: string, f: () => void): void {
 	try {
-		notes.push(...f());
+		f();
 	} catch (e) {
 		flag.failed = true;
 		notes.push(`doctor: ${what} failed: ${clip(errText(e))}`);
 	}
 }
 
-/** Default mode (`as2 doctor`, install's last step): every part; clears for parts that pass; pending popups. */
+/**
+ * Default mode (`as2 doctor`, install's last step): every part; clears for parts that pass; pending popups. It never
+ * throws: every step's error is a note that fails the run, the ledger's close included, so the results always return.
+ */
 export async function runDefault(deps: DoctorDeps): Promise<RunOutcome> {
 	const results = await checkParts(deps);
 	const notes: string[] = [];
-	const flag = { failed: false };
+	const flag: RunFlag = { failed: false };
 	const ledger = results.some((r) => r.part === "ledger" && r.verdict === "pass") ? openRw(deps, notes, flag) : null;
 	if (ledger) {
-		try {
-			withLedger(ledger, notes, flag, "clearing passed parts", () => applyEpisodes(ledger, results, "clear").map((b) => `wrote ${b}`));
-			withLedger(ledger, notes, flag, "settling popups", () => settleAndSpawn(ledger, deps));
-		} finally {
-			ledger.close();
-		}
+		const noted: DoctorDeps = { ...deps, out: (l) => notes.push(l) };
+		withLedger(notes, flag, "clearing passed parts", () => applyEpisodes(ledger, results, "clear", (b) => notes.push(`wrote ${b}`)));
+		withLedger(notes, flag, "settling popups", () => settleAndSpawn(ledger, noted, flag));
+		closeRw(ledger, deps, notes, flag);
 	} else {
 		const s = ledgerDownState(deps);
 		if (s) notes.push(s);
@@ -1110,74 +1209,88 @@ export async function runDefault(deps: DoctorDeps): Promise<RunOutcome> {
 /**
  * `--after-restart` (the doctor job, every 600 s): re-check parts with an open episode and clear those that pass; once
  * per boot, after BOOT_SETTLE_MS of uptime, check every part, open a down for each failure, then write `doctor-boot:`;
- * settle and show pending popups. With the ledger unopenable, the ledger-down popup.
+ * settle and show pending popups. With the ledger unopenable, the ledger-down popup. The ledger's close is guarded (a
+ * failure is a note and fails the run); a throw (a ledger read, an unknown part) is a DoctorCrash carrying what the run
+ * had collected, the close's note included.
  */
 export async function runAfterRestart(deps: DoctorDeps): Promise<RunOutcome> {
 	const notes: string[] = [];
-	const flag = { failed: false };
-	let boot: number | null = null;
+	const flag: RunFlag = { failed: false };
+	const noted: DoctorDeps = { ...deps, out: (l) => notes.push(l) };
+	let results: PartResult[] = [];
 	try {
-		boot = currentBoot(deps);
-	} catch (e) {
-		flag.failed = true;
-		notes.push(`doctor: the boot time could not be read (${clip(errText(e))}); the boot run waits for a run that can read it`);
-	}
-	const ledger = openRw(deps, notes, flag);
-	if (!ledger) {
-		const results = await checkParts(deps);
-		const ledgerError = results.find((r) => r.part === "ledger" && r.verdict === "fail")?.evidence ?? notes.at(-1) ?? "the ledger could not be opened";
-		ledgerDownPopup({ ...deps, out: (l) => notes.push(l) }, ledgerError);
-		return { exit: 1, results, notes };
-	}
-	try {
-		const control = doctorControl(ledger);
-		const open = openParts(control);
-		let bootDue = boot !== null && !bootDone(control, boot);
-		if (bootDue && boot !== null) {
-			const uptime = deps.now() - boot * 1000;
-			if (uptime < BOOT_SETTLE_MS) {
-				notes.push(`boot ${boot}: uptime ${age(uptime)}, under ${age(BOOT_SETTLE_MS)}; the boot run waits for the next run`);
-				bootDue = false;
+		let boot: number | null = null;
+		try {
+			boot = currentBoot(deps);
+		} catch (e) {
+			flag.failed = true;
+			notes.push(`doctor: the boot time could not be read (${clip(errText(e))}); the boot run waits for a run that can read it`);
+		}
+		const ledger = openRw(deps, notes, flag);
+		if (!ledger) {
+			results = await checkParts(deps);
+			const ledgerError = results.find((r) => r.part === "ledger" && r.verdict === "fail")?.evidence ?? notes.at(-1) ?? "the ledger could not be opened";
+			ledgerDownPopup(noted, ledgerError, flag);
+			return { exit: 1, results, notes };
+		}
+		let thrown: { error: unknown } | null = null;
+		try {
+			const control = doctorControl(ledger);
+			const open = openParts(control);
+			let bootDue = boot !== null && !bootDone(control, boot);
+			if (bootDue && boot !== null) {
+				const uptime = deps.now() - boot * 1000;
+				if (uptime < BOOT_SETTLE_MS) {
+					notes.push(`boot ${boot}: uptime ${age(uptime)}, under ${age(BOOT_SETTLE_MS)}; the boot run waits for the next run`);
+					bootDue = false;
+				}
 			}
+			const groups = new Set<Group>(bootDue ? GROUPS : open.map(groupOf));
+			const checked = groups.size > 0 ? await checkParts(deps, groups) : [];
+			// A re-check of an open part can fail under a sibling name (deps:train-tick re-checked → fail job:train-tick): every
+			// fail and warn is kept so it is printed and counts toward the exit. "clear" mode never opens a down from it, and a
+			// part clears only when that exact part passes.
+			results = bootDue ? checked : checked.filter((r) => open.includes(r.part) || r.verdict === "fail" || r.verdict === "warn");
+			const relevant = results;
+			withLedger(notes, flag, "writing episodes", () => applyEpisodes(ledger, relevant, bootDue ? "boot" : "clear", (b) => notes.push(`wrote ${b}`)));
+			if (bootDue && boot !== null && !flag.failed) {
+				const b = boot;
+				withLedger(notes, flag, "writing the boot entry", () => {
+					const body = ledger.write(() => (bootDone(doctorControl(ledger), b) ? null : record(ledger, { prefix: "doctor-boot", boot: b })));
+					if (body) notes.push(`wrote ${body}`);
+				});
+			}
+			withLedger(notes, flag, "settling popups", () => settleAndSpawn(ledger, noted, flag));
+		} catch (e) {
+			thrown = { error: e };
 		}
-		const groups = new Set<Group>(bootDue ? GROUPS : open.map(groupOf));
-		const results = groups.size > 0 ? await checkParts(deps, groups) : [];
-		// A re-check of an open part can fail under a sibling name (deps:train-tick re-checked → fail job:train-tick): every
-		// fail and warn is kept so it is printed and counts toward the exit. "clear" mode never opens a down from it, and a
-		// part clears only when that exact part passes.
-		const relevant = bootDue ? results : results.filter((r) => open.includes(r.part) || r.verdict === "fail" || r.verdict === "warn");
-		withLedger(ledger, notes, flag, "writing episodes", () => applyEpisodes(ledger, relevant, bootDue ? "boot" : "clear").map((b) => `wrote ${b}`));
-		if (bootDue && boot !== null && !flag.failed) {
-			const b = boot;
-			withLedger(ledger, notes, flag, "writing the boot entry", () => {
-				const body = ledger.write(() => (bootDone(doctorControl(ledger), b) ? null : record(ledger, { prefix: "doctor-boot", boot: b })));
-				return body ? [`wrote ${body}`] : [];
-			});
-		}
-		withLedger(ledger, notes, flag, "settling popups", () => settleAndSpawn(ledger, deps));
-		return { exit: exitOf(relevant, flag), results: relevant, notes };
-	} finally {
-		ledger.close();
+		closeRw(ledger, deps, notes, flag);
+		if (thrown) throw thrown.error;
+		return { exit: exitOf(results, flag), results, notes };
+	} catch (e) {
+		throw new DoctorCrash(e, results, notes);
 	}
 }
 
 /**
  * The tick's ctx step (train-tick.ts main, every pass; `--tick`): the ctx part only, its episode transition, then claims
- * and popups. `ledger` null (the tick could not open it): the probe and its line only. The ctx line is logged first,
- * whatever the writes then do; a write error is thrown after it.
+ * and popups. `ledger` null (the tick could not open it): the probe and its line only (the caller counts the open
+ * error). The ctx line is logged first, whatever the writes then do; a write error is thrown after it. `failed` is the
+ * run's failure flag: a settle, kill or spawn that failed and was logged.
  */
-export function doctorTick(ledger: Ledger | null, deps: DoctorDeps, ledgerError: string | null = null): PartResult[] {
+export function doctorTick(ledger: Ledger | null, deps: DoctorDeps, ledgerError: string | null = null): { results: PartResult[]; failed: boolean } {
 	const results = guarded("ctx", () => checkCtx(deps));
 	const ctx = results.find((r) => r.verdict === "pass" || r.verdict === "fail")!;
 	const warn = results.filter((r) => r.verdict === "warn").map((r) => `; warn: ${r.evidence}`).join("");
 	if (!ledger) {
 		deps.out(`doctor ctx: ${ctx.verdict} ${ctx.evidence}${warn}; the ledger could not be opened (${clip(ledgerError ?? "unknown error")}), so no episode is written`);
-		return results;
+		return { results, failed: false };
 	}
 	deps.out(`doctor ctx: ${ctx.verdict} ${ctx.evidence}${warn}`);
-	for (const b of applyEpisodes(ledger, [ctx], "tick")) deps.out(`doctor: wrote ${b}`);
-	for (const l of settleAndSpawn(ledger, deps)) deps.out(l);
-	return results;
+	const flag: RunFlag = { failed: false };
+	applyEpisodes(ledger, [ctx], "tick", (b) => deps.out(`doctor: wrote ${b}`));
+	settleAndSpawn(ledger, deps, flag);
+	return { results, failed: flag.failed };
 }
 
 // ---- the real machine -------------------------------------------------------------------------------------------
@@ -1232,25 +1345,40 @@ export const popupLogPath = (home: string): string => join(home, ".agent-system-
 /**
  * Spawn `<bun> <abs doctor.ts> --popup` detached, by absolute paths (process.execPath and the script's own path, never the
  * caller's cwd), output appended to the popup log. Test seam: AS2_DOCTOR_POPUP_WAIT=1 runs the same process in the
- * foreground and waits for its exit, so a test waits on the real popup completion instead of sleeping.
+ * foreground and waits for its exit, so a test waits on the real popup completion instead of sleeping. The log's fd is
+ * closed after the spawn through `closeFd` (a test seam): a spawn error and a close error together are one
+ * AggregateError; a close error after a spawn names the spawned process too.
  */
-export function spawnPopupProcess(env: Record<string, string | undefined>, home: string, doctorScript: string): string {
+export function spawnPopupProcess(env: Record<string, string | undefined>, home: string, doctorScript: string, closeFd: (fd: number) => void = closeSync): string {
 	const log = popupLogPath(home);
 	mkdirSync(dirname(log), { recursive: true });
 	const fd = openSync(log, "a");
+	let spawned: string;
 	try {
 		const argv = [process.execPath, doctorScript, "--popup"];
 		const opts = { cwd: dirname(doctorScript), env: env as Record<string, string>, stdin: "ignore" as const, stdout: fd, stderr: fd };
 		if (env.AS2_DOCTOR_POPUP_WAIT === "1") {
 			const r = Bun.spawnSync(argv, opts);
-			return `popup process ran in the foreground (AS2_DOCTOR_POPUP_WAIT=1) and exited ${r.exitCode ?? "on a signal"}; output in ${log}`;
+			spawned = `popup process ran in the foreground (AS2_DOCTOR_POPUP_WAIT=1) and exited ${r.exitCode ?? "on a signal"}; output in ${log}`;
+		} else {
+			const p = Bun.spawn(argv, { ...opts, detached: true });
+			p.unref();
+			spawned = `popup process ${p.pid} spawned (${argv.join(" ")}); output in ${log}`;
 		}
-		const p = Bun.spawn(argv, { ...opts, detached: true });
-		p.unref();
-		return `popup process ${p.pid} spawned (${argv.join(" ")}); output in ${log}`;
-	} finally {
-		closeSync(fd);
+	} catch (e) {
+		try {
+			closeFd(fd);
+		} catch (c) {
+			throw new AggregateError([e, c], `the popup process could not be spawned (${errText(e)}), and closing its log ${log} failed too (${errText(c)})`);
+		}
+		throw e;
 	}
+	try {
+		closeFd(fd);
+	} catch (c) {
+		throw new Error(`${spawned}, but closing the popup log ${log} after the spawn failed: ${errText(c)}`, { cause: c });
+	}
+	return spawned;
 }
 
 /** SIGKILL a popup owner and its process group (it was spawned detached, so its group is its own pid). */

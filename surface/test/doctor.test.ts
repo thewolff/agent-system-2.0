@@ -3,13 +3,14 @@
 // a temp ledger, and one fake clock `c.ms` that every threshold (2 h, 10 min, 12 h claims, the job windows) is driven by.
 // The real-file reads (the ledger, its backup directory, the OMP logs) use temp directories.
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
+import { main as doctorMain } from "../scripts/doctor";
 import { main as trainTickMain, type MainDeps } from "../scripts/train-tick";
 import {
 	backupDir, checkCtx, checkDisk, checkGh, checkJob, checkLedger, checkMailbox, checkMcp, checkParts, checkSeat, CLAIM_MS, type DoctorDeps, type DoctorFs, doctorControl, doctorTick, JOB_INVENTORY,
-	type JobRow, ledgerDownPath, ledgerDownPopup, type PartResult, pendingDowns, popupRun, type ProbeResult, runAfterRestart, runDefault, settleAndSpawn, settleClaims,
+	type JobRow, ledgerDownPath, ledgerDownPopup, type PartResult, pendingDowns, popupLogPath, popupRun, type ProbeResult, runAfterRestart, runDefault, settleAndSpawn, settleClaims, spawnPopupProcess, thenClose,
 } from "../src/doctor";
 import { type DoctorRecord, formatDoctor, parseDoctor, POPUP_ATTEMPT_LIMIT, popupAttempts } from "../src/doctor-entries";
 import { doctorLines } from "../src/errors";
@@ -562,6 +563,8 @@ describe("popups", () => {
 		const f = fake();
 		const l = standing(f);
 		down(l, "ctx");
+		// The second popup process exists for ps, so its own start time reads (a failed read now fails its run).
+		f.ps.set(OWN_PID + 1, { lstart: LSTART, command: "bun surface/scripts/doctor.ts --popup" });
 		const second: number[] = [];
 		const alarm = f.deps.alarm;
 		f.deps.alarm = (...args) => {
@@ -588,7 +591,7 @@ describe("popups", () => {
 		claim(l, "pp-gone", { pid: 7999, start, boot: f.boot.sec, until, downs: [d] });
 		claim(l, "pp-reused", { pid: 7002, start, boot: f.boot.sec, until, downs: [d] });
 		claim(l, "pp-live", { pid: 7003, start, boot: f.boot.sec, until, downs: [d] });
-		settleClaims(l, f.deps);
+		settleClaims(l, f.deps, { failed: false });
 		const outcomes = () => Object.fromEntries(recordsOf(l).flatMap((r) => (r.prefix === "doctor-popup" && r.outcome.state !== "claimed" ? [[r.popupId, `${r.outcome.state} ${r.outcome.detail}`]] : [])));
 		expect(outcomes()).toEqual({
 			"pp-prior": `abandoned prior boot ${f.boot.sec - 100} (now ${f.boot.sec})`,
@@ -597,7 +600,9 @@ describe("popups", () => {
 		});
 		expect(f.killed).toEqual([]);
 		f.c.ms = T0 + HOUR + 1;
-		settleClaims(l, f.deps);
+		const flag = { failed: false };
+		settleClaims(l, f.deps, flag);
+		expect(flag.failed).toBe(false);
 		expect(outcomes()["pp-live"]).toBe(`expired past until ${until}; owner pid 7003 killed`);
 		expect(f.killed).toEqual([7003]);
 		expect(popupAttempts(doctorControl(l), d)).toEqual({ spent: 4, last: `expired past until ${until}; owner pid 7003 killed`, answered: false });
@@ -617,12 +622,20 @@ describe("popups", () => {
 			{ state: "failed", detail: "zsh quiet-alarm.zsh exited 1: no window server" },
 			{ state: "failed", detail: "zsh quiet-alarm.zsh exited 1: still none" },
 		);
-		expect(settleAndSpawn(l, f.deps)).toEqual(["1 down(s) pending a popup (ctx): popup exited 1"]);
+		// settleAndSpawn's own lines (the popup process's lines go to f.out through popupRun's deps).
+		const flag = { failed: false };
+		const spawnLines = () => {
+			const lines: string[] = [];
+			settleAndSpawn(l, { ...f.deps, out: (x) => lines.push(x) }, flag);
+			return lines;
+		};
+		expect(spawnLines()).toEqual(["1 down(s) pending a popup (ctx): popup exited 1"]);
 		expect(popupAttempts(doctorControl(l), d)).toEqual({ spent: 1, last: "failed zsh quiet-alarm.zsh exited 1: no window server", answered: false });
 		expect(doctorLines(doctorControl(l))[0]!.line).not.toContain("popup failed");
-		settleAndSpawn(l, f.deps);
-		settleAndSpawn(l, f.deps);
-		expect(settleAndSpawn(l, f.deps)).toEqual([]);
+		spawnLines();
+		spawnLines();
+		expect(spawnLines()).toEqual([]);
+		expect(flag.failed).toBe(false);
 		expect(f.spawned).toHaveLength(POPUP_ATTEMPT_LIMIT);
 		expect(f.alarms).toHaveLength(3);
 		const [line] = doctorLines(doctorControl(l));
@@ -648,7 +661,8 @@ describe("popups", () => {
 			return "spawned";
 		};
 		// A spawn that throws is caught and logged by settleAndSpawn; the claim it wrote stays without an outcome.
-		for (let i = 0; i < 6; i++) settleAndSpawn(l, f.deps);
+		const flag = { failed: false };
+		for (let i = 0; i < 6; i++) settleAndSpawn(l, f.deps, flag);
 		expect(f.alarms.length).toBeLessThanOrEqual(4);
 		expect(f.alarms).toHaveLength(3);
 		expect(popupAttempts(doctorControl(l), d)).toEqual({ spent: 3, last: `abandoned owner pid ${pid} gone`, answered: false });
@@ -660,16 +674,17 @@ describe("popups", () => {
 	test("the ledger-down popup: one attempt at a time, at most 3 unanswered per boot, an answer ends it; an unreadable record fires the banner", () => {
 		const f = fake();
 		f.alarmAnswers.push({ state: "failed", detail: "a" }, { state: "failed", detail: "b" }, { state: "failed", detail: "c" });
-		for (let i = 0; i < 4; i++) ledgerDownPopup(f.deps, "SQLITE_CORRUPT");
+		const flag = { failed: false };
+		for (let i = 0; i < 4; i++) ledgerDownPopup(f.deps, "SQLITE_CORRUPT", flag);
 		expect(f.alarms).toHaveLength(3);
 		expect(f.out.at(-1)).toBe("ledger-down popup failed 3 times this boot: failed c");
 		f.boot.sec += 1000;
-		ledgerDownPopup(f.deps, "SQLITE_CORRUPT");
-		ledgerDownPopup(f.deps, "SQLITE_CORRUPT");
+		ledgerDownPopup(f.deps, "SQLITE_CORRUPT", flag);
+		ledgerDownPopup(f.deps, "SQLITE_CORRUPT", flag);
 		expect(f.alarms).toHaveLength(4);
 		expect(f.out.at(-1)).toContain("the ledger-down popup was shown this boot");
 		f.files.get(ledgerDownPath(f.home))!.text = "{not json";
-		ledgerDownPopup(f.deps, "SQLITE_CORRUPT");
+		ledgerDownPopup(f.deps, "SQLITE_CORRUPT", flag);
 		expect(f.notified).toEqual(["as2 doctor: the ledger cannot be opened: SQLITE_CORRUPT"]);
 		expect(f.alarms).toHaveLength(4);
 	});
@@ -678,10 +693,10 @@ describe("popups", () => {
 		const f = fake();
 		f.files.set(ledgerDownPath(f.home), { text: JSON.stringify({ boot: f.boot.sec, attempts: [{ pid: 7003, start: new Date(LSTART).toISOString(), began: new Date(T0).toISOString(), until: new Date(T0 + 70 * MIN).toISOString() }] }), mtimeMs: T0, exec: false });
 		f.ps.set(7003, { lstart: LSTART, command: "x" });
-		ledgerDownPopup(f.deps, "x");
+		ledgerDownPopup(f.deps, "x", { failed: false });
 		expect(f.alarms).toHaveLength(0);
 		f.c.ms = T0 + 70 * MIN + 1;
-		ledgerDownPopup(f.deps, "x");
+		ledgerDownPopup(f.deps, "x", { failed: false });
 		expect(f.killed).toEqual([7003]);
 		expect(f.alarms).toHaveLength(1);
 	});
@@ -701,14 +716,16 @@ describe("popups", () => {
 		f.files.set(ledgerDownPath(f.home), { text: rec(T0 + 70 * MIN), mtimeMs: T0, exec: false });
 		const base = f.deps.run;
 		f.deps.run = (argv, env) => (argv[0] === "ps" && argv.includes("7003") ? { code: null, stdout: "", stderr: "", error: "could not start: ps is not on PATH" } : base(argv, env));
-		ledgerDownPopup(f.deps, "x");
+		const flag = { failed: false };
+		ledgerDownPopup(f.deps, "x", flag);
+		expect(flag.failed).toBe(true);
 		expect(f.out.join("\n")).toContain("owner pid 7003 could not be checked");
 		expect(f.out.join("\n")).toContain("could not start: ps is not on PATH");
 		expect(f.out.join("\n")).not.toContain("popup is showing");
 		expect(f.alarms).toHaveLength(0);
 		f.out.length = 0;
 		f.c.ms = T0 + 70 * MIN + 1;
-		ledgerDownPopup(f.deps, "x");
+		ledgerDownPopup(f.deps, "x", flag);
 		expect(f.killed).toEqual([]);
 		expect(f.alarms).toHaveLength(0);
 		const saved = JSON.parse(f.files.get(ledgerDownPath(f.home))!.text) as { attempts: { outcome?: string; error?: string }[] };
@@ -822,5 +839,308 @@ describe("train-tick main: the ctx step is isolated from the train's work", () =
 		const f = fake();
 		doctorTick(null, f.deps, "SQLITE_CANTOPEN");
 		expect(f.out).toEqual(["doctor ctx: pass daemon running, core_refresh 1 min ago; the ledger could not be opened (SQLITE_CANTOPEN), so no episode is written"]);
+	});
+});
+
+/** Make the `n`th Ledger close from now throw `message`, after really closing; returns the restore. */
+function closeThrowsOn(n: number, message: string): () => void {
+	const real = Ledger.prototype.close;
+	let calls = 0;
+	Ledger.prototype.close = function (this: Ledger) {
+		real.call(this);
+		if (++calls === n) throw new Error(message);
+	};
+	return () => {
+		Ledger.prototype.close = real;
+	};
+}
+
+/** A ledger-down record whose one attempt (pid 7003) runs until T0 + 70 min. */
+const ledgerDownRecord = (f: Fake) => ({ text: JSON.stringify({ boot: f.boot.sec, attempts: [{ pid: 7003, start: new Date(LSTART).toISOString(), began: new Date(T0).toISOString(), until: new Date(T0 + 70 * MIN).toISOString() }] }), mtimeMs: T0, exec: false });
+
+const psFailsFor = (f: Fake, pid: number) => {
+	const base = f.deps.run;
+	f.deps.run = (argv, env) => (argv[0] === "ps" && argv.includes(String(pid)) ? { code: null, stdout: "", stderr: "", error: "could not start: ps is not on PATH" } : base(argv, env));
+};
+
+describe("review r2: a failure is never hidden by a later one, and never exits 0", () => {
+	test("F5: the writable ledger's close failing keeps the parts' failures, names the close error and exits 1 (default mode)", async () => {
+		const f = fake();
+		f.answers.set("ctx", ok(ctxJson({ running: false, lastMs: T0 })));
+		// Close 1 is the ledger check's read-only handle; close 2 is the run's writable one.
+		const restore = closeThrowsOn(2, "injected writable close failure");
+		let code: number;
+		try {
+			code = await doctorMain([], f.deps);
+		} finally {
+			restore();
+		}
+		expect(code).toBe(1);
+		const out = f.out.join("\n");
+		expect(out).toContain("fail ctx: the ctx daemon is not running");
+		expect(out).toContain(`doctor: the ledger ${f.ledgerPath} could not be closed after this run's writes: injected writable close failure`);
+		expect(f.out.at(-1)).toBe("as2 doctor: 10 pass, 1 fail (ctx), 0 warn, 8 not installed");
+	});
+
+	test("F5: the same in --after-restart: the failing parts and the close error are both in the run's line, exit 1", async () => {
+		const f = fake();
+		f.answers.set("ctx", ok(ctxJson({ running: false, lastMs: T0 })));
+		// The writable open comes first, then the boot run's ledger check opens and closes (close 1); close 2 is the writable one.
+		const restore = closeThrowsOn(2, "injected writable close failure");
+		let code: number;
+		try {
+			code = await doctorMain(["--after-restart"], f.deps);
+		} finally {
+			restore();
+		}
+		expect(code).toBe(1);
+		expect(f.out).toHaveLength(1);
+		expect(f.out[0]).toContain("1 failing: ctx (the ctx daemon is not running");
+		expect(f.out[0]).toContain("could not be closed after this run's writes: injected writable close failure");
+	});
+
+	test("F5: a crash in --after-restart prints what the run collected (the boot probe's failure and the close's) before the crash", async () => {
+		const f = fake();
+		const l = standing(f);
+		down(l, "bogus");
+		l.close();
+		const base = f.deps.run;
+		f.deps.run = (argv, env) => (argv[0] === "sysctl" ? { code: 1, stdout: "", stderr: "sysctl: injected failure" } : base(argv, env));
+		// The boot time is unreadable, so only open parts are re-checked; `bogus` is no part the doctor knows (a throw). The
+		// writable close is the first close.
+		const restore = closeThrowsOn(1, "injected writable close failure");
+		let crash: unknown;
+		try {
+			await doctorMain(["--after-restart"], f.deps);
+		} catch (e) {
+			crash = e;
+		} finally {
+			restore();
+		}
+		expect((crash as Error).message).toBe("unknown doctor part bogus");
+		expect(f.out).toHaveLength(1);
+		expect(f.out[0]).toContain("doctor: the boot time could not be read");
+		expect(f.out[0]).toContain("could not be closed after this run's writes: injected writable close failure");
+		expect(f.out[0]).toEndWith("; crashed: unknown doctor part bogus");
+	});
+
+	test("F6: an expired ledger-down attempt whose owner probe fails and whose record cannot be written: both errors are printed (fake clock c.ms)", () => {
+		const f = fake();
+		f.files.set(ledgerDownPath(f.home), ledgerDownRecord(f));
+		f.c.ms = T0 + 70 * MIN + 1;
+		psFailsFor(f, 7003);
+		f.deps.fs.writeAtomic = () => {
+			throw new Error("injected record write denied");
+		};
+		const flag = { failed: false };
+		ledgerDownPopup(f.deps, "SQLITE_CORRUPT", flag);
+		const out = f.out.join("\n");
+		expect(out).toContain("the ledger-down popup's owner pid 7003 could not be checked (`ps");
+		expect(out).toContain("could not start: ps is not on PATH");
+		expect(out).toContain("could not be written (injected record write denied); the banner fires instead");
+		expect(f.notified).toEqual(["as2 doctor: the ledger cannot be opened: SQLITE_CORRUPT"]);
+		expect(flag.failed).toBe(true);
+	});
+
+	test("F7: a pending down, no failing part and a popup spawn that throws: the note is printed and the run exits 1; the tick step reports it too", async () => {
+		const f = fake();
+		const l = standing(f);
+		down(l, "job:train-tick");
+		f.deps.spawnPopup = () => {
+			throw new Error("injected popup spawn refused");
+		};
+		const code = await doctorMain([], f.deps);
+		expect(code).toBe(1);
+		expect(f.out.join("\n")).toContain("doctor: spawning the popup process failed (injected popup spawn refused); this run claimed nothing, so the next run spawns it again");
+		expect(f.out.at(-1)).toBe("as2 doctor: 11 pass, 0 fail, 0 warn, 8 not installed; the run failed: see the doctor: lines above");
+		expect(doctorTick(l, f.deps).failed).toBe(true);
+		l.close();
+	});
+
+	test("sweep: the read-only ledger check's close failing keeps the backup verdict and fails ledger with the close error", () => {
+		const f = fake();
+		const restore = closeThrowsOn(1, "injected read-only close failure");
+		let rs: PartResult[];
+		try {
+			rs = checkLedger(f.deps);
+		} finally {
+			restore();
+		}
+		expect(verdicts(rs)).toEqual(["fail ledger", "pass backup"]);
+		expect(rs[0]!.evidence).toBe(`${f.ledgerPath} could not be closed after its read: injected read-only close failure`);
+	});
+
+	test("sweep: thenClose keeps the value beside a close error, and joins a work error and a close error in one AggregateError", () => {
+		const f = fake();
+		const restore = closeThrowsOn(1, "close failed");
+		try {
+			expect(thenClose(open(f), "w", () => 7)).toEqual({ value: 7, closeError: "close failed" });
+		} finally {
+			restore();
+		}
+		const restore2 = closeThrowsOn(1, "close failed");
+		let caught: unknown;
+		try {
+			thenClose(open(f), "the work", () => {
+				throw new Error("work failed");
+			});
+		} catch (e) {
+			caught = e;
+		} finally {
+			restore2();
+		}
+		expect(caught).toBeInstanceOf(AggregateError);
+		expect((caught as AggregateError).errors.map((e: Error) => e.message)).toEqual(["work failed", "close failed"]);
+		expect((caught as AggregateError).message).toBe("the work failed (work failed), and closing the ledger failed too (close failed)");
+	});
+
+	test("sweep: a settled claim whose owner cannot be killed fails the run (fake clock c.ms)", async () => {
+		const f = fake();
+		const l = standing(f);
+		const d = down(l, "job:train-tick");
+		f.ps.set(7003, { lstart: LSTART, command: "x" });
+		claim(l, "pp-live", { pid: 7003, start: new Date(LSTART).toISOString(), boot: f.boot.sec, until: new Date(T0 + 10 * MIN).toISOString(), downs: [d] });
+		l.close();
+		f.c.ms = T0 + 10 * MIN + 1;
+		f.deps.kill = () => {
+			throw new Error("injected EPERM");
+		};
+		const r = await runDefault(f.deps);
+		expect(r.exit).toBe(1);
+		expect(r.notes.join("\n")).toContain("doctor: expired claim pp-live's owner pid 7003 could not be killed: injected EPERM");
+	});
+
+	test("sweep: a claim judged with the boot probe failing, or with its owner probe failing, fails the run", async () => {
+		const seeded = () => {
+			const f = fake();
+			const l = standing(f);
+			f.ps.set(7003, { lstart: LSTART, command: "x" });
+			claim(l, "pp-live", { pid: 7003, start: new Date(LSTART).toISOString(), boot: f.boot.sec, until: new Date(T0 + HOUR).toISOString(), downs: [down(l, "job:train-tick")] });
+			l.close();
+			return f;
+		};
+		const noBoot = seeded();
+		const base = noBoot.deps.run;
+		noBoot.deps.run = (argv, env) => (argv[0] === "sysctl" ? { code: 1, stdout: "", stderr: "sysctl: injected failure" } : base(argv, env));
+		const r1 = await runDefault(noBoot.deps);
+		expect(r1.exit).toBe(1);
+		expect(r1.notes.join("\n")).toContain("doctor: the boot time could not be read");
+		const noOwner = seeded();
+		psFailsFor(noOwner, 7003);
+		const r2 = await runDefault(noOwner.deps);
+		expect(r2.exit).toBe(1);
+		expect(r2.notes.join("\n")).toContain("doctor: claim pp-live's owner pid 7003 could not be checked");
+	});
+
+	test("sweep: the popup process whose own start time cannot be read exits 1 after showing the popup", () => {
+		const f = fake();
+		const l = standing(f);
+		down(l, "ctx");
+		f.ps.delete(OWN_PID);
+		expect(popupRun(l, f.deps)).toBe(1);
+		expect(f.alarms).toHaveLength(1);
+		expect(f.out.join("\n")).toContain("doctor: this process's start time could not be read");
+		l.close();
+	});
+
+	test("sweep: the popup's outcome is printed even when its write fails, and the popup process exits 1", () => {
+		const f = fake();
+		const l = standing(f);
+		down(l, "ctx");
+		const realWrite = l.write.bind(l);
+		// Every write after the popup was shown (the outcome's) fails.
+		l.write = (<T>(fn: () => T): T => {
+			if (f.alarms.length > 0) throw new Error("injected outcome write failure");
+			return realWrite(fn);
+		}) as Ledger["write"];
+		expect(popupRun(l, f.deps)).toBe(1);
+		const out = f.out.join("\n");
+		expect(out).toMatch(/doctor popup pp-\S+: answered Dismiss \(no voice\)/);
+		expect(out).toContain("its outcome could not be written (injected outcome write failure)");
+		l.close();
+	});
+
+	test("sweep: the ledger-down popup's stalled owner that cannot be killed is printed, not only recorded (fake clock c.ms)", () => {
+		const f = fake();
+		f.files.set(ledgerDownPath(f.home), ledgerDownRecord(f));
+		f.ps.set(7003, { lstart: LSTART, command: "x" });
+		f.c.ms = T0 + 70 * MIN + 1;
+		f.deps.kill = () => {
+			throw new Error("injected EPERM");
+		};
+		const flag = { failed: false };
+		ledgerDownPopup(f.deps, "x", flag);
+		expect(f.out.join("\n")).toContain("doctor: the ledger-down popup's stalled owner pid 7003 could not be killed: injected EPERM");
+		expect(flag.failed).toBe(true);
+	});
+
+	test("sweep: the ledger-down popup's outcome is printed even when the record write after it fails", () => {
+		const f = fake();
+		f.alarmAnswers.push({ state: "failed", detail: "injected dialog error" });
+		let saves = 0;
+		const write = f.deps.fs.writeAtomic;
+		// Save 1 records the new attempt; save 2 its outcome.
+		f.deps.fs.writeAtomic = (p, text) => {
+			if (++saves === 2) throw new Error("injected record write denied");
+			write(p, text);
+		};
+		const flag = { failed: false };
+		ledgerDownPopup(f.deps, "x", flag);
+		const out = f.out.join("\n");
+		expect(out).toContain("doctor: ledger-down popup failed injected dialog error");
+		expect(out).toContain("could not be written (injected record write denied); the banner fires instead");
+		expect(flag.failed).toBe(true);
+	});
+
+	test("sweep: --tick and --popup with a ledger close that fails print it and exit 1, the step's own lines kept", async () => {
+		const f = fake();
+		const restore = closeThrowsOn(1, "injected close failure");
+		let tick: number;
+		try {
+			tick = await doctorMain(["--tick"], f.deps);
+		} finally {
+			restore();
+		}
+		expect(tick).toBe(1);
+		expect(f.out.join("\n")).toContain("doctor ctx: pass daemon running");
+		expect(f.out.at(-1)).toEndWith(`doctor: the ledger ${f.ledgerPath} could not be closed after the ctx step: injected close failure`);
+		f.out.length = 0;
+		const restore2 = closeThrowsOn(1, "injected close failure");
+		let popup: number;
+		try {
+			popup = await doctorMain(["--popup"], f.deps);
+		} finally {
+			restore2();
+		}
+		expect(popup).toBe(1);
+		expect(f.out.join("\n")).toContain("doctor popup: nothing pending");
+		expect(f.out.at(-1)).toEndWith(`doctor popup: the ledger ${f.ledgerPath} could not be closed: injected close failure`);
+	});
+
+	test("sweep: spawnPopupProcess joins a spawn error with a log-close error, and names the spawned process when only the close fails", () => {
+		const home = tmp("doctor-spawn-home");
+		// The fd is really closed, then the close reports a failure.
+		const closeFails = (fd: number) => {
+			closeSync(fd);
+			throw new Error("injected EBADF");
+		};
+		// The script's directory does not exist, so the spawn (its cwd) fails.
+		let caught: unknown;
+		try {
+			spawnPopupProcess({ AS2_DOCTOR_POPUP_WAIT: "1" }, home, join(home, "no-such-dir", "doctor.ts"), closeFails);
+		} catch (e) {
+			caught = e;
+		}
+		expect(caught).toBeInstanceOf(AggregateError);
+		expect((caught as AggregateError).errors.map((e: Error) => e.message).at(-1)).toBe("injected EBADF");
+		// The script does not exist but its directory does: bun starts, exits 1 in the foreground (the WAIT seam), and only the close fails.
+		caught = undefined;
+		try {
+			spawnPopupProcess({ AS2_DOCTOR_POPUP_WAIT: "1" }, home, join(home, "doctor.ts"), closeFails);
+		} catch (e) {
+			caught = e;
+		}
+		expect((caught as Error).message).toStartWith("popup process ran in the foreground (AS2_DOCTOR_POPUP_WAIT=1) and exited 1; output in ");
+		expect((caught as Error).message).toEndWith(`, but closing the popup log ${popupLogPath(home)} after the spawn failed: injected EBADF`);
 	});
 });
