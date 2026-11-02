@@ -15,7 +15,7 @@ import * as laneRow from "../extensions/lane";
 import * as laneScript from "../scripts/lane";
 import { errorLines } from "../src/errors";
 import { closeScratchRoot } from "../src/close-entry";
-import { ARCHIVE_DEADLINE_MS, archiveDetached, archivePathFor, purgeArchived, scratchArchiveBase } from "../src/scratch-archive";
+import { ARCHIVE_DEADLINE_MS, archiveDetached, archivePathFor, purgeArchived, removeCopy, scratchArchiveBase } from "../src/scratch-archive";
 import { ensureStandingWorkload } from "../src/identity";
 import { ensureScratchRoot } from "../src/scratch-root";
 import * as launch from "../src/launch";
@@ -808,6 +808,37 @@ describe("orchestrator_close_workload archives the root, then removes it, after 
 			} finally {
 				if (left) rmSync(left, { recursive: true, force: true });
 			}
+		});
+
+		test("past its deadline part way through removing the verification copy, the archive fails there: the rest of the copy is left (not removed again), the archive dropped and the tree kept", () => {
+			const { dir, archiveDir, dest, modes, had } = tree("deadline-copy");
+			// The progress deadline is the timing under test, driven by the fake clock `clock` (advanced at the copy's second
+			// removal); nothing here reads the wall clock.
+			let now = 0;
+			const clock = () => now;
+			let copy = "";
+			let removals = 0;
+			let calls = 0;
+			const a = archiveDetached(dir, dest, {
+				openFiles: () => ({ kind: "none" }),
+				clock,
+				removeCopy: (at, check) => {
+					copy = at;
+					calls++;
+					return removeCopy(at, (step) => {
+						if (step.startsWith("removing") && ++removals === 2) now += ARCHIVE_DEADLINE_MS + 1;
+						check(step);
+					});
+				},
+			});
+			expect(calls).toBe(1);
+			expect(removals).toBe(2);
+			const reason = a.kind === "failed" ? a.reason : "";
+			expect(reason).toMatch(new RegExp(`^archiving ${reEscape(dir)} passed its 15 min deadline at removing the verification copy at ${reEscape(copy)}/\\S+; the tree is kept; the verification copy ${reEscape(copy)} is left part removed$`));
+			expect(existsSync(copy)).toBe(true);
+			expect(readdirSync(archiveDir).filter((n) => !n.startsWith(".verify-"))).toEqual([]);
+			expect(modes()).toEqual(had);
+			expect(readFileSync(join(dir, "REPORT.md"), "utf8")).toBe("aaaa");
 		});
 	});
 

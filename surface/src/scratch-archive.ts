@@ -27,9 +27,10 @@
 // chmods the tree back, one running as root, and one that works in the purge's staging directory (`.as2-purge-<16 hex>`,
 // made 0700 after the freeze).
 // Progress deadline: the archive of one root (steps 1–8) and its purge each get ARCHIVE_DEADLINE_MS on an injectable
-// clock, checked after every manifest entry read, every entry the freeze takes the write bits off, and every 1 MiB
-// hashed (`progressDeadline`); past it the work stops through its own failure path (the freeze's thaw, the archive's
-// `fail`, the purge's put-back and mode restore), so the tree is kept. Those rollbacks are never cut short by the
+// clock, checked after every manifest entry read, every entry the freeze takes the write bits off, every entry of the
+// verification copy read or removed, and every 1 MiB hashed (`progressDeadline`); past it the work stops through its own
+// failure path (the freeze's thaw, the archive's `fail`, which leaves a part-removed verification copy for the sweep to
+// report rather than remove it again, the purge's put-back and mode restore), so the tree is kept. Those rollbacks are never cut short by the
 // expired deadline. A file is hashed only up to the size its lstat recorded, so a writer still appending fails the read
 // instead of keeping it going. The residual: the check runs between syscalls, so a single read, lstat, chmod or readdir
 // that never returns (a hung filesystem) cannot be bounded in-process; the tar and lsof runs are bounded by their own
@@ -38,7 +39,7 @@
 // `scratchArchive.requireOffsite` is on, only those with an `<archive>.offsite` marker beside them (written by an offsite
 // copy job once its copy is confirmed).
 import { createHash, randomBytes } from "node:crypto";
-import { type BigIntStats, chmodSync, closeSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmdirSync, rmSync, type Stats, statfsSync, statSync, unlinkSync } from "node:fs";
+import { type BigIntStats, chmodSync, closeSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmdirSync, type Stats, statfsSync, statSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { installedConfigPath } from "./pair-suggest";
 import type { Detached, Removal } from "./scratch-remove";
@@ -197,8 +198,11 @@ export function readManifest(dir: string, hash: boolean, check: ProgressCheck = 
 	return out;
 }
 
-/** A progress deadline's check: throws once the deadline has passed; `step` says where the work was. */
+/** A progress deadline's check: throws DeadlinePassed once the deadline has passed; `step` says where the work was. */
 export type ProgressCheck = (step: string) => void;
+
+/** What a ProgressCheck throws, so a step that reports its own errors can still let the deadline through. */
+class DeadlinePassed extends Error {}
 
 /**
  * The progress deadline of one root's archive or purge: `seams.deadlineMs` (ARCHIVE_DEADLINE_MS) from now on
@@ -210,7 +214,7 @@ function progressDeadline(what: string, then: string, seams: PurgeSeams): Progre
 	const ms = seams.deadlineMs ?? ARCHIVE_DEADLINE_MS;
 	const end = clock() + ms;
 	return (step) => {
-		if (clock() > end) throw new Error(`${what} passed its ${Number((ms / 60_000).toFixed(2))} min deadline at ${step}; ${then}`);
+		if (clock() > end) throw new DeadlinePassed(`${what} passed its ${Number((ms / 60_000).toFixed(2))} min deadline at ${step}; ${then}`);
 	};
 }
 
@@ -298,8 +302,8 @@ export interface ArchiveSeams extends PurgeSeams {
 	beforeChmod?: (path: string) => void;
 	/** Replaces the lsof read of what is open under a tree (`openFilesUnder`). */
 	openFiles?: (dir: string) => OpenFiles;
-	/** Replaces the removal of the verification copy (`removeCopy`): what could not be removed, or null. */
-	removeCopy?: (dir: string) => string | null;
+	/** Replaces the removal of the verification copy (`removeCopy`): what could not be removed, or null; `check` is the archive's progress deadline. */
+	removeCopy?: (dir: string, check: ProgressCheck) => string | null;
 }
 
 /** What lsof shows open under a directory: nothing, these files, or that it could not be shown. */
@@ -406,20 +410,36 @@ function tar(args: string[]): string | null {
 	return `tar ${args[0]} exited ${r.exitCode ?? r.signalCode ?? "?"}: ${r.stderr.toString().trim().split("\n")[0] || "no message"}`;
 }
 
-/** Remove a verification copy (directories made writable first, so a read-only directory in the tree cannot pin it). */
-function removeCopy(dir: string): string | null {
+/**
+ * Remove a verification copy (directories made writable first, so a read-only directory in the tree cannot pin it), one
+ * entry at a time, `check` run after each: what could not be removed, or null. The archive's progress deadline passing
+ * is thrown (DeadlinePassed), with what is left of the copy still in place; any other error is returned.
+ */
+export function removeCopy(dir: string, check: ProgressCheck = () => {}): string | null {
 	try {
+		// Pre-order (a directory before its entries), so the reverse is a safe removal order.
+		const order: [string, boolean][] = [];
 		const stack = [dir];
 		while (stack.length > 0) {
 			const at = stack.pop()!;
 			const st = lstatSync(at);
-			if (!st.isDirectory()) continue;
-			chmodSync(at, st.mode | 0o700);
-			for (const name of readdirSync(at)) stack.push(join(at, name));
+			const isDir = st.isDirectory();
+			order.push([at, isDir]);
+			if (isDir) {
+				chmodSync(at, st.mode | 0o700);
+				for (const name of readdirSync(at)) stack.push(join(at, name));
+			}
+			check(`reading the verification copy at ${at}`);
 		}
-		rmSync(dir, { recursive: true });
+		for (let i = order.length - 1; i >= 0; i--) {
+			const [at, isDir] = order[i]!;
+			if (isDir) rmdirSync(at);
+			else unlinkSync(at);
+			check(`removing the verification copy at ${at}`);
+		}
 		return null;
 	} catch (e) {
+		if (e instanceof DeadlinePassed) throw e;
 		if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
 		return `the verification copy ${dir} could not be removed (${message(e)})`;
 	}
@@ -483,7 +503,16 @@ export function archiveDetached(dir: string, dest: string, seams: ArchiveSeams =
 		if (out) return fail(`verifying ${partial}: ${out}`);
 		const diff = contentDiff(before, readManifest(copy, true, check));
 		if (diff.length > 0) return fail(`the archive does not hold the tree: ${diff.join("; ")}`);
-		const left = dropCopy(copy);
+		let left: string | null;
+		try {
+			left = dropCopy(copy, check);
+		} catch (e) {
+			// The deadline stopped the copy's removal: leave the rest of it (the sweep reports a left `.verify-*` copy) rather
+			// than start its removal again, unbounded, in `fail`.
+			warnings.push(`the verification copy ${copy} is left part removed`);
+			copy = null;
+			throw e;
+		}
 		copy = null;
 		if (left) warnings.push(left);
 		const size = statSync(partial).size;
