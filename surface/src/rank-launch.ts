@@ -80,24 +80,20 @@ export function pendingRequest(rows: ReserveRows): string | null {
  * queued workload `queued: position <n>` while a queued workload ranked above it is launchable now and not in `tried`
  * (the drain's tried set, which a drain's starter reads from `DRAIN_TRIED_ENV`; every other path passes none); Jo's
  * pending request is never gated (D6). `show`: otherwise `launchable`'s decision unchanged. `order` / `parallel`: a
- * pending Jo request admits at once with cause `request <id>` (even when `launchable` reports `first`, so the
- * reservation consumes it); otherwise the workload is refused `ranked: below <wl>` while a higher-ranked workload is
- * launchable now (`tried` does not change this), and under `parallel` refused `parallel: <reason>` when
- * `parallelVerdict` holds it.
+ * pending Jo request admits at once on `launchable`'s decision, whose cause is already `request <id>` (it names a pending
+ * request ahead of `first`, so the reservation consumes it); otherwise the workload is refused `ranked: below <wl>` while a
+ * higher-ranked workload is launchable now (`tried` does not change this), and under `parallel` refused `parallel: <reason>`
+ * when `parallelVerdict` holds it.
  * A cap-exempt workload (an open merge train, PLAN wl-mvpsrr4tr0p1xc D1) takes no slot, so it is admitted on
- * `launchable`'s verdict alone in every mode, `show` included, before the queue gate, with a pending request promoted to
- * its cause so the reservation consumes it.
+ * `launchable`'s verdict alone in every mode, `show` included, before the queue gate.
  */
 export function rankGate(ledger: Ledger, rows: ReserveRows, config: RankConfig, tried: ReadonlySet<string> = NO_IDS): LaunchVerdict {
 	const v = verdictOf(rows);
 	if (!v.launch) return v;
-	if (rows.capExempt) {
-		const request = pendingRequest(rows);
-		return request !== null ? { launch: true, cause: { kind: "request", id: request } } : v;
-	}
+	if (rows.capExempt) return v;
 	const request = pendingRequest(rows);
 	if (config.mode === "show") return request !== null ? v : (queueGate(ledger, rows, config, tried) ?? v);
-	if (request !== null) return { launch: true, cause: { kind: "request", id: request } };
+	if (request !== null) return v;
 	const queued = queueGate(ledger, rows, config, tried);
 	if (queued !== null) return queued;
 	const above = higherLaunchable(ledger, rows.workload.id, rows.now, rows.cap, config);
@@ -111,7 +107,7 @@ export function rankGate(ledger: Ledger, rows: ReserveRows, config: RankConfig, 
 
 /**
  * `rankGate` in `reserveLane`'s verdict shape: what the starter composes into `decideLaunch` (in `show`, `decideLaunch`
- * plus the queue gate; a cap-exempt request promoted). `tried` is the drain's tried set (`readDrainTried`), so the
+ * plus the queue gate). `tried` is the drain's tried set (`readDrainTried`), so the
  * reservation agrees with `drainPick`.
  */
 export function decideRanked(ledger: Ledger, rows: ReserveRows, config: RankConfig, tried: ReadonlySet<string> = NO_IDS): ReserveVerdict {

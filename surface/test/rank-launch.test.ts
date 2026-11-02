@@ -271,22 +271,21 @@ describe("T15 / T1 mode read (missing reads order); an explicit show changes no 
 		expect(readRankConfig(homeWith(ORDER_YAML))).toEqual(ORDER);
 	});
 
-	test("explicit show: the open and tick paths admit the lower-ranked workload as today (cause first, even with Jo's request pending), and the starter reserves it", async () => {
+	test("explicit show: the open and tick paths admit the lower-ranked workload as today (Jo's pending request is its cause), and the starter reserves it, consuming the request", async () => {
 		const { l, open } = world();
 		const lo = open("lo: older, Jev ranks it lower", { unblocks: 0.1 });
 		const hi = open("hi: newer, Jev ranks it higher", { unblocks: 0.9 });
 		const req = request(l, lo);
 		const env = homeWith(SHOW_YAML);
-		expect(launchVerdict(l, env, lo)).toEqual({ launch: true, cause: { kind: "first" } });
+		expect(launchVerdict(l, env, lo)).toEqual({ launch: true, cause: { kind: "request", id: req } });
 		const f = fakePi(undefined, { exec: true });
 		const out = await triggerLaunch(f.pi, l, env, lo, "open");
 		expect(out.attempted).toBe(true);
 		expect(f.execs.calls.map((c) => c.args.slice(1, 3))).toEqual([["launch", lo]]);
-		// the starter's reservation: today's cause, and today's leftover request (PLAN § 7 risk 5) stays unconsumed
+		// the starter's reservation names the pending request, so it is consumed and cannot relaunch the workload after it finishes
 		const r = reserve(l, lo, SHOW);
-		expect(r).toMatchObject({ ok: true, cause: "first" });
-		expect(launches(l, lo)).toEqual([`launch: ${laneIdOf(lo, 1)} cause first requested-by test`]);
-		expect(launches(l, lo).some((b) => b.includes(req))).toBe(false);
+		expect(r).toMatchObject({ ok: true, cause: `request ${req}` });
+		expect(launches(l, lo)).toEqual([`launch: ${laneIdOf(lo, 1)} cause request ${req} requested-by test`]);
 		expect(reserve(l, hi, SHOW)).toMatchObject({ ok: true, cause: "first" });
 	});
 
@@ -638,7 +637,7 @@ describe("T16 order gate", () => {
 		open("hi", { unblocks: 0.9 });
 		const req = request(l, lo);
 		const rows = l.launchRows(lo, 3)!;
-		expect(verdictOf(rows)).toEqual({ launch: true, cause: { kind: "first" } });
+		expect(verdictOf(rows)).toEqual({ launch: true, cause: { kind: "request", id: req } });
 		const r = reserve(l, lo, ORDER);
 		expect(r).toEqual({ ok: true, laneId: laneIdOf(lo, 1), cause: `request ${req}` });
 		l.recordEntry({ by: laneIdOf(lo, 1), workloadId: lo, kind: "assumption", body: "done-because: the probe is done" });
@@ -989,18 +988,18 @@ describe("D1 the open train under the rank gate and the cap", () => {
 			open("hi: Jev ranks it above the train", { unblocks: 0.9 });
 			const train = trainOn(l, 101, 0.1);
 			const req = request(l, train);
-			// launchable alone reads `first`; the gate promotes Jo's request for the cap-exempt train in every mode
-			expect(verdictOf(l.launchRows(train, 3, { capExempt: new Set([train]) })!)).toEqual({ launch: true, cause: { kind: "first" } });
+			// launchable names the pending request ahead of `first`, so every mode reserves on it
+			expect(verdictOf(l.launchRows(train, 3, { capExempt: new Set([train]) })!)).toEqual({ launch: true, cause: { kind: "request", id: req } });
 			expect(reserve(l, train, config)).toMatchObject({ ok: true, laneId: laneIdOf(train, 1), cause: `request ${req}` });
 			expect(launches(l, train)).toEqual([expect.stringContaining(`cause request ${req}`)]);
 		}
 	});
 
-	test("show: an ordinary workload's pending request on its first launch still launches `first`", () => {
+	test("show: an ordinary workload's pending request on its first launch is its cause, so the reservation consumes it", () => {
 		const { l, open } = world();
 		const wl = open("ordinary", { unblocks: 0.5 });
-		request(l, wl);
-		expect(reserve(l, wl, SHOW)).toMatchObject({ ok: true, laneId: laneIdOf(wl, 1), cause: "first" });
+		const req = request(l, wl);
+		expect(reserve(l, wl, SHOW)).toMatchObject({ ok: true, laneId: laneIdOf(wl, 1), cause: `request ${req}` });
 	});
 
 	test("order, cap 1: the priority pause neither counts nor stops the train's lane, and never makes room for the train", () => {

@@ -1051,6 +1051,68 @@ export function settleTasks(ledger: Ledger, facts: SettleFacts, now: string): st
 	});
 }
 
+/** An open full-suite slice whose PR's train work has ended, for the tick to cancel (`endedFullSlices`). */
+export interface EndedFullSlice {
+	slice: string;
+	workloadId: string;
+	pr: number;
+	why: string;
+}
+
+/**
+ * Why PR `pr`'s work on train `train` has ended, or null while it goes on: its disposition slice is done or cancelled (merged,
+ * closed, skipped), or it has a task and every task on it is settled (`train-task-settled:`, which a holder's
+ * `train-task-failed:` leads to).
+ */
+function prWorkEnded(ledger: Ledger, train: string, pr: number): string | null {
+	const d = ledger.slice(trainSliceId(train, pr));
+	if (d !== null && (d.state === "done" || d.state === "cancelled")) return `#${pr}'s disposition ${d.id} is ${d.state}`;
+	const control = controlOf(ledger, train);
+	const settles = taskSettles(control);
+	const on = parseTrainTasks(train, control).filter((t) => t.pr === pr);
+	const last = on.at(-1);
+	return last !== undefined && on.every((t) => settles.has(t.id)) ? `every task on #${pr} is settled (${last.id} ${settles.get(last.id)!.outcome})` : null;
+}
+
+/**
+ * The open full-suite slices on train `wl` and its fix workloads whose PR's train work has ended, for the tick to cancel as
+ * MERGE_TRAIN_BY. Only a green or red-main completes a full-suite slice (SETTLING_VERDICTS), and a lane never settles one, so
+ * a red left it open for a next run; once no next run is coming, nothing else settles it, and it holds its workload's close
+ * (the surface tick's "finished but cannot close") and the train's done line (#378's fix workload, #377 merged outside the train).
+ * - The train's own `sl-train-<k>-<n>-full-<r>`, once PR n's disposition slice is done or cancelled (merged, closed, skipped).
+ *   A settled task alone does not end it: the train's lane runs every attempt's suite on the PR's open full-suite slice.
+ * - On each fix workload bound to PR n on `wl` (`fixBinds`), every open slice a runner request for n names, once n's work on
+ *   `wl` has ended (`prWorkEnded`) and on every other open train the workload is bound to n on as well: a fix workload is
+ *   reused across trains (`openTrainFix`), so a PR skipped on `wl` and riding a new train keeps its slice for that train's task.
+ * A slice with a runner request still waiting for its result is left to that run.
+ */
+export function endedFullSlices(ledger: Ledger, wl: string): EndedFullSlice[] {
+	const out: EndedFullSlice[] = [];
+	const trainWaiting = new Set(testRuns(ledger.entries(wl)).filter((r) => r.results.length === 0).map((r) => r.request.slice));
+	for (const s of ledger.slices(wl)) {
+		const n = s.state === "open" ? trainSlicePr(s.id, wl) : null;
+		if (n === null || s.id === trainSliceId(wl, n) || trainWaiting.has(s.id)) continue;
+		const d = ledger.slice(trainSliceId(wl, n));
+		if (d !== null && (d.state === "done" || d.state === "cancelled")) out.push({ slice: s.id, workloadId: wl, pr: n, why: `#${n}'s disposition ${d.id} is ${d.state}` });
+	}
+	const fixes = fixBindings(ledger);
+	const open = openTrains(ledger);
+	for (const f of fixes) {
+		if (!fixBinds(ledger, f, wl, f.pr)) continue;
+		const why = prWorkEnded(ledger, wl, f.pr);
+		if (why === null) continue;
+		const elsewhere = fixes.some((g) => g.workloadId === f.workloadId && g.pr === f.pr && g.train !== wl && open.includes(g.train) && fixBinds(ledger, g, g.train, g.pr) && prWorkEnded(ledger, g.train, g.pr) === null);
+		if (elsewhere) continue;
+		const runs = testRuns(ledger.entries(f.workloadId)).filter((r) => r.request.pr === f.pr);
+		const pending = new Set(runs.filter((r) => r.results.length === 0).map((r) => r.request.slice));
+		for (const sl of new Set(runs.map((r) => r.request.slice))) {
+			const s = ledger.slice(sl);
+			if (s?.state === "open" && s.workload_id === f.workloadId && !pending.has(sl) && !out.some((e) => e.slice === sl)) out.push({ slice: sl, workloadId: f.workloadId, pr: f.pr, why });
+		}
+	}
+	return out;
+}
+
 /** A result of `verdict` at `sha` may carry to the PR's `head` for task `t`: a green at S, neither H0 nor the head, while the head is not H0. */
 function carries(verdict: string, sha: string, t: TrainTask, head: string | null): head is string {
 	return verdict === "green" && head !== null && head !== t.head && sha !== t.head && sha !== head;
