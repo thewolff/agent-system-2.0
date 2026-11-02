@@ -306,7 +306,7 @@ describe("PLAN wl-mv8s939084z1ts D6: the tick finishes the close of a workload J
 		const sl = l.addSlice({ by: HAND, workloadId: wl, task: "draw the panel", doneCondition: "it renders", inputs: "the feed" });
 		l.releaseWorkload(wl, { by: HAND, holder: HAND });
 		l.cancelSlice(sl, { by: SURFACE_BY });
-		// cancel-slice's own launch-requested: (a lane's question withdrawn while nobody held it), never consumed.
+		// an unconsumed launch-requested: by jo (one a cancel-slice wrote before jo-issues#258, or the launch tool's), never consumed.
 		if (requested) l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody("jo", l.now(), "cancel-slice") });
 		const ins = l.recordInstruction({ by: SURFACE_BY, workloadId: wl, body: withdrawInstructionBody(wl), author: "jo", channel: "surface" });
 		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: withdrawnBody(ins) });
