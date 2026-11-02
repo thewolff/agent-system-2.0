@@ -51,7 +51,7 @@
 //   while any such row is still open; a reply the gates withheld (`GateSession.heldReply`) is *held*
 //   with its reason, since the session file carries only its marker. Any of these refuses the call:
 //   one this row refuses anyway (the answer-first line is the one Jo's words need, so it is said
-//   first) or a HAND_ON_TOOLS call (open, close, schedule, launch). A row answered after publication
+//   first) or a HAND_ON_TOOLS call (open, close, schedule, launch, set lane model). A row answered after publication
 //   lifts it: Jo's `<option> q-…` at the surface resolves the row and mirrors the decision on the
 //   subject workload; an answer in prose is recorded by the orchestrator with
 //   orchestrator_record_instruction naming the question and Jo's input row, which does the same.
@@ -60,7 +60,7 @@
 //   question naming several workloads and two clocks compared (the session entry's against the
 //   ledger row's). Here the row's state is the order — the recorder answers the row in the same call
 //   that produces its result, so the session's entries are not read for the answer and no clock is
-//   compared — and a launch or a close that names exactly one workload (a non-empty string
+//   compared — and a launch, a lane-model set or a close that names exactly one workload (a non-empty string
 //   `workloadId`, or in the device form a `content` that parses as a JSON object carrying one) is
 //   refused only while an open row is about that workload or about nothing, so Jo's answer on A lets
 //   A's relaunch through while B waits on its own row; a call whose target cannot be read is
@@ -69,7 +69,7 @@ import { basename, resolve } from "node:path";
 import type { Ledger, QuestionRow } from "../../../ledger/src/index";
 import { standingSlice } from "../../../surface/src/identity";
 import { questionSubject } from "../../../surface/src/orchestrator-question";
-import { CLOSE_WORKLOAD_TOOL, HAND_ON_TOOLS, LAUNCH_LANE_TOOL, RAISE_QUESTION_TOOL, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, SURFACE_TOOLS } from "../../../surface/src/types";
+import { CLOSE_WORKLOAD_TOOL, HAND_ON_TOOLS, LAUNCH_LANE_TOOL, RAISE_QUESTION_TOOL, RECORD_INSTRUCTION_TOOL, SET_LANE_MODEL_TOOL, STANDING_WORKLOAD_ID, SURFACE_TOOLS } from "../../../surface/src/types";
 import { bashCommand, ctxUnmodeled, type Exec, type Expansion, expandShell, gitCall, gitUnmodeled, OUTPUT_ONLY, READ_ONLY_HEADS, readHeadUnmodeled, SEARCH_HEADS, searchHeadUnmodeled, writeDestinations } from "../exec";
 import { gitReads } from "../git-model";
 import { type AgentMessageLike, messageText } from "../session";
@@ -105,7 +105,7 @@ const CTX_MCP_DIRECT: Record<string, true> = Object.fromEntries(CTX_MCP_TOOLS.ma
 const HAND_ON: Record<string, true> = Object.fromEntries(HAND_ON_TOOLS.flatMap((t) => [[t, true], [`xd://${t}`, true]]));
 
 /** The hand-on tools that name one workload, so the answer-first check reads only that workload's questions (MIGRATION.md item 72). */
-const SCOPED: Record<string, true> = { [LAUNCH_LANE_TOOL]: true, [CLOSE_WORKLOAD_TOOL]: true };
+const SCOPED: Record<string, true> = { [LAUNCH_LANE_TOOL]: true, [SET_LANE_MODEL_TOOL]: true, [CLOSE_WORKLOAD_TOOL]: true };
 
 const record = (v: unknown): Record<string, unknown> | null => (v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null);
 
@@ -276,7 +276,7 @@ function roleRefusal(call: ToolCall, ctx: CallContext): Refusal {
 	return null;
 }
 
-/** The one workload a launch or a close names, read fail-closed: a non-empty string `workloadId`, or in the device form a `content` that parses as a JSON object carrying one. Anything else is no target. */
+/** The one workload a launch, a lane-model set or a close names, read fail-closed: a non-empty string `workloadId`, or in the device form a `content` that parses as a JSON object carrying one. Anything else is no target. */
 function scopedTarget(call: ToolCall): string | null {
 	const { toolName, input } = call;
 	if (SCOPED[toolName]) return workloadIdOf(input.workloadId);

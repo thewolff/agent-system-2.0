@@ -12,8 +12,9 @@
 // (P-7c one step), which is what makes a lane death "surfaced once" and what keeps a held
 // `artifact-failed:` message from ever meaning "no live lane" (fable (a)). A notice
 // (surface/src/notice.ts) is shown only while held, so this one step is also what makes it shown once.
-import { type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { type Ledger, type MessageRow, TEST_RUNNER_BY } from "../../ledger/src/index";
 import type { ErrorLine } from "./errors";
+import { QUOTA_MOVE_PREFIX, trustedQuotaMove } from "./quota-move-alert";
 import { parseSecurityRed, SECURITY_RED_PREFIX } from "./test-run";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "./types";
 
@@ -61,18 +62,24 @@ export function consumeLines(ledger: Ledger, lines: ErrorLine[]): number {
 
 /**
  * At a wake the whole queue was rendered: every held orchestrator-bound message on an open workload
- * is delivered, and every held trusted `security-red:` on a closed one, which the render shows whatever
- * the workload's state (surface/src/errors.ts, fix round 1 F3); no other message on a closed workload is
- * touched. The on-demand ledger read (orchestrator_ledger) does the same, for one workload when it rendered one.
+ * is delivered, and on a closed one every held trusted `security-red:` and every held trusted
+ * `quota-move:` (`trustedQuotaMove`), which the render shows whatever the workload's state
+ * (surface/src/errors.ts, fix round 1 F3; PLAN wl-mvwk0v0gmp6cjc D4); no other message on a closed
+ * workload is touched. The on-demand ledger read (orchestrator_ledger) does the same, for one
+ * workload when it rendered one.
  */
 export function consumeAllToOrchestrator(ledger: Ledger, workloadId?: string): number {
-	const sql = `SELECT m.id, m.body, m.workload_id, w.status FROM messages m JOIN workloads w ON w.id = m.workload_id
-		WHERE m.state = 'held' AND m.recipient = ?1 AND (w.status = 'open' OR (m.created_by = ?2 AND instr(m.body, ?3) = 1))
+	const sql = `SELECT m.*, w.status FROM messages m JOIN workloads w ON w.id = m.workload_id
+		WHERE m.state = 'held' AND m.recipient = ?1 AND (w.status = 'open' OR instr(m.body, ?2) = 1 OR instr(m.body, ?3) = 1)
 		${workloadId ? "AND m.workload_id = ?4" : ""} ORDER BY m.created_at, m.rowid`;
-	const q = ledger.db.query<{ id: string; body: string; workload_id: string; status: string }, [string, string, string] | [string, string, string, string]>(sql);
-	const rows = workloadId ? q.all(ORCHESTRATOR_RECIPIENT, TEST_RUNNER_BY, SECURITY_RED_PREFIX, workloadId) : q.all(ORCHESTRATOR_RECIPIENT, TEST_RUNNER_BY, SECURITY_RED_PREFIX);
-	// On a closed workload only the security reds the render showed: a well-formed body naming its own workload.
-	const held = rows.filter((m) => m.status === "open" || parseSecurityRed(m.body)?.workloadId === m.workload_id);
+	const q = ledger.db.query<MessageRow & { status: string }, [string, string, string] | [string, string, string, string]>(sql);
+	const rows = workloadId ? q.all(ORCHESTRATOR_RECIPIENT, SECURITY_RED_PREFIX, QUOTA_MOVE_PREFIX, workloadId) : q.all(ORCHESTRATOR_RECIPIENT, SECURITY_RED_PREFIX, QUOTA_MOVE_PREFIX);
+	// On a closed workload only the trusted signals the render showed: the runner's security red with a well-formed body naming
+	// its own workload, and a quota move as `recordQuotaMove` wrote it.
+	const held = rows.filter((m) =>
+		m.status === "open" ||
+		(m.created_by === TEST_RUNNER_BY && parseSecurityRed(m.body)?.workloadId === m.workload_id) ||
+		trustedQuotaMove(ledger, m) !== null);
 	for (const { id } of held) ledger.advanceMessage(id, "delivered", { by: SURFACE_BY });
 	return held.length;
 }

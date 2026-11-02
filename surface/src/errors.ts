@@ -51,6 +51,12 @@
 // each in the order written, before the test-run lines. A live lane holder, a train task's routing and a later green hide
 // none of them: a failing security test reaches Jo whatever is fixing it. They are read from the messages table, not from
 // the open workloads, so closing the workload before delivery drops none (fix round 1, F3). Delivery consumes each.
+// Quota moves (PLAN wl-mvwk0v0gmp6cjc D4, surface/src/quota-move-alert.ts): every held `quota-move:` message `recordQuotaMove`
+// wrote beside its event entry (a lane moved off a lab, or a hand moved on a used-up week) is one `quota-move` line, `NOW:
+// <subject> on <wl> moved <from> -> <to> (<reason>)`, on fire and consumed on delivery like a death. A move whose alert has a
+// channel failed, exhausted, stalled, dead or unstarted (`moveAlertTroubles`) is one `quota-move-alert` line, row = the event
+// entry, state = the move's newest status entry id, so every new failure is delivered again; it clears when both channels
+// are ok. Both are read from their own query over every workload, open or closed, not from the open workloads.
 // Due: an open workload whose brief starts `due:<date> ` with date <= now by instant (Codex S4).
 // Scratch (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): an open workload whose newest valid `scratch-over-cap:` /
 // `scratch-under-cap:` control entry (a holder's: the lane extension's turn-end measure, surface/extensions/lane.ts)
@@ -102,6 +108,7 @@ import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type EntryRow, type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
+import { MOVE_ALERT_ATTEMPTS, moveAlertTroubles, moveText, type PidProbe, psMoveAlertProbe, quotaMoves, trustedQuotaMove } from "./quota-move-alert";
 import { CHANNEL_REFUSED_SHOWN_HOURS, channelInForce, channelProposals, channelRefusals } from "./channel";
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { type NowCategory, nowMarks } from "../../gates/src/rulings";
@@ -219,7 +226,10 @@ export function doctorLines(control: readonly ControlEntry[]): ErrorLine[] {
 }
 
 /** Every needs-you line kind; ErrorKind is read from this list, so the issue #334 item 3 test covers each kind there is. */
-export const NEEDS_YOU_KINDS = ["reserved", "held", "artifact", "security-red", "test-run", "lane-died", "question", "due", "idle", "scratch", "train", "pair", "notice", "proposal", "channel-refused", "report"] as const;
+export const NEEDS_YOU_KINDS = [
+	"reserved", "held", "artifact", "security-red", "quota-move", "quota-move-alert", "test-run", "lane-died", "question", "due", "idle", "scratch", "train", "pair", "notice", "proposal",
+	"channel-refused", "report",
+] as const;
 export type ErrorKind = (typeof NEEDS_YOU_KINDS)[number];
 
 /** A line's `next` when no next step is known: said explicitly rather than left out (issue #334 item 3). */
@@ -272,6 +282,8 @@ export interface ErrorOptions {
 	reportJobInstalled?: () => boolean;
 	/** The Drive backup check job's plist (the missed line needs it); default `driveBackupCheckPlist()`. Called only when no check entry is fresh. */
 	driveBackupCheckPlist?: () => { mtimeMs: number } | null;
+	/** Whether a move alert's worker pid is alive (the `quota-move-alert` line's stalled and dead claims); default `psMoveAlertProbe`. */
+	movePidProbe?: PidProbe;
 }
 
 const short = (s: string, n = 90): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
@@ -677,6 +689,28 @@ function securityRedLines(ledger: Ledger): ErrorLine[] {
 	});
 }
 
+/** The D4 NOW lines: each held, trusted `quota-move:` message of a recorded move (the writer `recordQuotaMove` used), in the order written, whatever the workload's state. */
+function quotaMoveLines(ledger: Ledger): ErrorLine[] {
+	return quotaMoves(ledger).flatMap((move) => {
+		const m = ledger.message(move.messageId);
+		if (m?.state !== "held" || trustedQuotaMove(ledger, m) === null) return [];
+		const step = "nothing to answer; the @thewolff comment and a silent popup carry the same move";
+		return [{ kind: "quota-move" as const, workloadId: move.workloadId, rowId: move.messageId, messageIds: [move.messageId], next: step, line: `NOW: ${moveText(move)}` }];
+	});
+}
+
+/** The D4 failure lines: one per move whose alert has a failing channel, keyed by its event entry, state its newest status entry. */
+function moveAlertLines(ledger: Ledger, now: string, probe: PidProbe): ErrorLine[] {
+	return moveAlertTroubles(ledger, Date.parse(now), probe).map((t) => {
+		const { move } = t;
+		const step = t.exhausted ? `run bun surface/scripts/lane.ts move-alert ${move.workloadId} ${move.eventId} --again` : `the train tick retries (attempt ${t.attempt} of ${MOVE_ALERT_ATTEMPTS})`;
+		return {
+			kind: "quota-move-alert" as const, workloadId: move.workloadId, rowId: move.eventId, state: t.token, next: step,
+			line: `NOW: alert for the move of ${move.subject} on ${move.workloadId} (${move.from} -> ${move.to}): ${t.parts.join("; ")} — ${step}`,
+		};
+	});
+}
+
 /** Every line owed right now, in § B3 order (1–3), the security-red lines, the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the train notices, the due rows, then the scratch lines, the daily report, the notices, then the channel refusals; each channel proposal directly after its target. */
 export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger.inFlight(), opts: ErrorOptions = {}): ErrorLine[] {
 	const now = opts.now ?? ledger.now();
@@ -685,6 +719,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 	const held: ErrorLine[] = [];
 	const artifact: ErrorLine[] = [];
 	const securityRed = securityRedLines(ledger);
+	const quotaMove = [...quotaMoveLines(ledger), ...moveAlertLines(ledger, now, opts.movePidProbe ?? psMoveAlertProbe)];
 	const testRun: ErrorLine[] = [];
 	const died: ErrorLine[] = [];
 	const idle: ErrorLine[] = [];
@@ -838,7 +873,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			notice.push({ kind: "notice", workloadId: wl, rowId: m.id, messageIds: [m.id], next: "nothing to answer", line: `notice on ${label} (nothing to answer): ${text}` });
 		}
 	}
-	const all = [...reserved, ...held, ...artifact, ...securityRed, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch, ...report, ...notice];
+	const all = [...reserved, ...held, ...artifact, ...securityRed, ...quotaMove, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch, ...report, ...notice];
 	const channel = channelInForce(ledger);
 	if (!channel) return all;
 	const proposals = channelProposals(ledger, channel);
