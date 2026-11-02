@@ -782,7 +782,7 @@ describe("alarmPopup (quiet-alarm.zsh)", () => {
 
 describe("train-tick main: the ctx step is isolated from the train's work", () => {
 	const fakeLedger = { tag: "ledger" } as unknown as Ledger;
-	const steps = (o: { open?: () => Ledger; tick?: () => void; doctor?: () => void; close?: () => void } = {}) => {
+	const steps = (o: { open?: () => Ledger; tick?: () => void; doctor?: () => boolean | void; close?: () => void } = {}) => {
 		const seen: string[] = [];
 		const deps: MainDeps = {
 			open: o.open ?? (() => fakeLedger),
@@ -792,7 +792,7 @@ describe("train-tick main: the ctx step is isolated from the train's work", () =
 			},
 			doctor: (ledger, openError) => {
 				seen.push(`doctor ${ledger ? "ledger" : "null"} ${openError ?? "-"}`);
-				o.doctor?.();
+				return o.doctor?.() ?? false;
 			},
 			close: () => {
 				seen.push("close");
@@ -806,6 +806,12 @@ describe("train-tick main: the ctx step is isolated from the train's work", () =
 	test("every step runs in order and main returns 0", () => {
 		const s = steps();
 		expect(trainTickMain([], s.deps)).toBe(0);
+		expect(s.seen).toEqual(["train", "doctor ledger -", "close"]);
+	});
+
+	test("the doctor step reports a run failure and nothing throws: main returns 1", () => {
+		const s = steps({ doctor: () => true });
+		expect(trainTickMain([], s.deps)).toBe(1);
 		expect(s.seen).toEqual(["train", "doctor ledger -", "close"]);
 	});
 

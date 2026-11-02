@@ -1526,8 +1526,8 @@ export interface MainDeps {
 	open(): Ledger;
 	/** The train's work: `tick()` with the real effects. */
 	tick(ledger: Ledger): void;
-	/** The doctor's ctx step; `ledger` null when it could not be opened (the probe and its log line still run). */
-	doctor(ledger: Ledger | null, openError: string | null): void;
+	/** The doctor's ctx step; `ledger` null when it could not be opened (the probe and its log line still run). True when the step's run failed (doctorTick's `failed`), false otherwise. */
+	doctor(ledger: Ledger | null, openError: string | null): boolean;
 	close(ledger: Ledger): void;
 	/** stderr: the open failure. */
 	err(line: string): void;
@@ -1547,7 +1547,7 @@ function realMainDeps(): MainDeps {
 		doctor: (ledger, openError) => {
 			// The doctor beside this script: the tick's own root's (a verified tick runs a verified doctor).
 			const deps = realDeps({ env: process.env, repo: join(import.meta.dir, "..", ".."), doctorScript: join(import.meta.dir, "doctor.ts"), ledgerPath, out: log });
-			doctorTick(ledger, deps, openError);
+			return doctorTick(ledger, deps, openError).failed;
 		},
 		close: (ledger) => ledger.close(),
 		err: (l) => process.stderr.write(`${l}\n`),
@@ -1558,7 +1558,8 @@ function realMainDeps(): MainDeps {
  * One pass: open the ledger, the train's work, the doctor's ctx step, then the close, each in its own try, so the ctx step
  * runs whatever the train did and a close failure never replaces a work error. Every error is kept: one is rethrown as
  * it is, two or three as one AggregateError naming each step. A ledger that cannot be opened still gets the ctx probe
- * and its log line; then main returns 1 (or throws the doctor step's error).
+ * and its log line; then main returns 1 (or throws the doctor step's error). Main also returns 1 when no step threw but the
+ * doctor step reported a run failure, so the job's last exit code shows it.
  */
 export function main(argv: string[], deps: MainDeps = realMainDeps()): number {
 	if (argv.length > 0) {
@@ -1581,8 +1582,9 @@ export function main(argv: string[], deps: MainDeps = realMainDeps()): number {
 			errors.push({ step: "train", err });
 		}
 	}
+	let doctorFailed = false;
 	try {
-		deps.doctor(ledger, openError);
+		doctorFailed = deps.doctor(ledger, openError);
 	} catch (err) {
 		errors.push({ step: "doctor", err });
 	}
@@ -1597,7 +1599,7 @@ export function main(argv: string[], deps: MainDeps = realMainDeps()): number {
 	if (errors.length > 1) {
 		throw new AggregateError(errors.map((e) => e.err), `train-tick: ${errors.length} steps failed: ${errors.map((e) => `${e.step}: ${errText(e.err)}`).join("; ")}`);
 	}
-	return openError === null ? 0 : 1;
+	return openError === null && !doctorFailed ? 0 : 1;
 }
 
 if (import.meta.main) process.exit(main(process.argv.slice(2)));
