@@ -12,7 +12,7 @@ export interface ResourceCosts {
 	workerMemoryBytes: number;
 	reserveCpu: number;
 	reserveMemoryBytes: number;
-	/** Durable measurement receipt, including host and historical-load reservation methodology. */
+	/** Durable measurement receipt for worker peaks and the host reserve; the proof's historic load is outside the reserve. */
 	calibration: string;
 }
 /** Raw machine readings. Only cpuCount and totalMemoryBytes select workers; the rest is recorded in each part's receipt. */

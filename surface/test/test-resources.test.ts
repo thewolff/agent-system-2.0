@@ -39,6 +39,7 @@ describe("resource admission", () => {
 		expect(() => parseResourceCosts({ ...costs, calibration: "" })).toThrow("calibration");
 		expect(() => parseResourceCosts({ ...costs, workerMemoryBytes: 0 })).toThrow("workerMemoryBytes");
 		expect(() => admitResources(2, { ...inputs, availableMemoryBytes: NaN }, costs)).toThrow("availableMemoryBytes");
+		expect(() => admitResources(2, { ...inputs, availableMemoryBytes: -1 }, costs)).toThrow("nonnegative");
 		expect(() => admitResources(2, { ...inputs, availableMemoryBytes: 4000 }, costs)).toThrow("totalMemoryBytes");
 	});
 	test("the admitted outer count and serial nested bound reach Bun arguments", () => {
