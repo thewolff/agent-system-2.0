@@ -210,6 +210,20 @@ describe("move-alert's channels (R6)", () => {
 		expect(w.voiced).toEqual([textOf(m)]);
 	});
 
+	test("an empty or unexpected popup reply at exit 0 is a failed popup with its output kept, never a silent dismiss; the failure line shows it", () => {
+		for (const stdout of ["", "OK\n"]) {
+			const { ledger, wl, move } = world();
+			const m = move();
+			const w = worker(fakeGh().gh, { answer: { code: 0, stdout, stderr: "" } });
+			expect(runMoveAlert(ledger, w.seams, wl, m.eventId, false)).toBe(1);
+			const popupRows = rows(ledger, wl, m.eventId).filter((r) => r.startsWith("popup "));
+			expect(popupRows.at(-1)).toBe(`popup failed osascript exit 0 with no button: stdout ${JSON.stringify(stdout.trim())}, stderr ""`);
+			expect(popupRows.some((r) => r.startsWith("popup ok"))).toBe(false);
+			expect(w.voiced).toEqual([]);
+			expect(failureLines(ledger).map((l) => l.line).join("\n")).toContain("popup failed osascript exit 0 with no button");
+		}
+	});
+
 	test("the dialog is osascript's display dialog with the two buttons, Dismiss the default and the cancel, and no giving up", () => {
 		const dir = tmp("osascript");
 		const argsFile = join(dir, "args");

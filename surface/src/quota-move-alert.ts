@@ -513,9 +513,15 @@ export function runMoveAlert(ledger: Ledger, seams: MoveAlertSeams, wl: string, 
 			result("popup", popupClaim, "failed", `the popup could not be run: ${errText(err)}`);
 		}
 		if (r !== null) {
-			const button = r.code === 0 ? r.stdout.trim() || DISMISS_BUTTON : `${r.stderr}`.includes("(-128)") ? DISMISS_BUTTON : null;
-			if (button === null) result("popup", popupClaim, "failed", `osascript exit ${r.code ?? "by signal"}: ${oneLine(r.stderr) || oneLine(r.stdout) || "no output"}`);
-			else {
+			// Only Jo's two buttons, or osascript's user-cancel (-128, Escape on the cancel button), are a result: an empty or any
+			// other reply is a failed popup with its output kept, so the tick retries it and the failure line shows (no fallback).
+			const reply = r.stdout.trim();
+			const button = r.code === 0 ? (reply === READ_IT_BUTTON || reply === DISMISS_BUTTON ? reply : null) : `${r.stderr}`.includes("(-128)") ? DISMISS_BUTTON : null;
+			if (button === null) {
+				result("popup", popupClaim, "failed", r.code === 0
+					? `osascript exit 0 with no button: stdout ${JSON.stringify(oneLine(r.stdout))}, stderr ${JSON.stringify(oneLine(r.stderr))}`
+					: `osascript exit ${r.code ?? "by signal"}: ${oneLine(r.stderr) || oneLine(r.stdout) || "no output"}`);
+			} else {
 				const voiced = button === READ_IT_BUTTON ? seams.voice(text) : null;
 				result("popup", popupClaim, "ok", voiced === null ? button : `${button}; the voice failed: ${voiced}`);
 			}
