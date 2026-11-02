@@ -35,12 +35,13 @@
 // it is pushed as `D:refs/heads/wl/<id>` by sha, a plain fast-forward.
 import { existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { SCRATCH_ENTRY, scratchBase, scratchRootFor } from "../../gates/src/scratch";
 import { type EntryRow, homeDir, type InstructionRow, type Ledger, type QuestionRow, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { renderClose, repoOf } from "./decision-log";
 import { ensureStandingWorkload, identityOf } from "./identity";
-import { fileIdentity, removeChild } from "./scratch-remove";
+import { type Archived, type ArchiveSeams, archiveDetached, archivePathFor, type Manifest, purgeArchived } from "./scratch-archive";
+import { detachChild, fileIdentity, restoreDetached } from "./scratch-remove";
 import { branchName, controlEntries, holdersOf, waivedPrs } from "./launch";
 import { checkoutOwnerRepo, trainPrs, trainSkippedOf } from "./merge-train";
 import { REPO_ROOT } from "./session";
@@ -239,22 +240,34 @@ export function recordCloseReceipt(ledger: Ledger, id: string, receipt: string):
 	return ledger.recordInstruction({ by: SURFACE_BY, workloadId: id, body: `close receipt: ${receipt}`, author: "orchestrator", channel: "surface" });
 }
 
-/** What became of a closed workload's scratch root (`removeScratchRoot`). */
-export type ScratchRemoval = { kind: "removed" | "missing"; root: string } | { kind: "failed"; root: string; reason: string };
+/** What became of a closed workload's scratch root (`archiveScratchRoot`). */
+export type ScratchClose =
+	/** No root: nothing to archive or remove. */
+	| { kind: "missing"; root: string }
+	/** Refused before archiving (a symlinked root, a root that resolves elsewhere, a rename aside that failed): nothing archived, nothing removed. */
+	| { kind: "refused"; root: string; reason: string }
+	/** The archive could not be written or verified: the tree is kept, at `keptAt` (its own name when it could be renamed back). */
+	| { kind: "archive-failed"; root: string; reason: string; keptAt: string; restore: string }
+	/** Archived and verified; `removal` says whether the tree then went (`left` is where a part-removed tree remains). */
+	| { kind: "archived"; root: string; physical: string; archive: Archived; removal: { ok: true } | { ok: false; reason: string; left: string } };
 
 /**
- * Remove workload `id`'s scratch root once its close has committed (PLAN wl-mv5oikd5jtquww § 1.5): in-process, exactly
- * `scratchRootFor(home, id)`, refused when that path is a symlink or its realpath is not exactly `<realpath(base)>/<id>`;
- * the removal itself is `removeChild` (./scratch-remove: rename to `.removing-*`, identity re-checked, then removed), so an
- * ancestor swapped meanwhile never redirects it. A leftover `.removing-*` is never touched here (the sweep removes it).
- * A missing root is a no-op. Never throws.
+ * Archive workload `id`'s scratch root, then remove it, once its close has committed (PLAN wl-mv5oikd5jtquww § 1.5, amended
+ * 2026-10-28 after the close of wl-mvs2x210k5ifkz deleted the REPORT.md its done-because named). Exactly `scratchRootFor(home,
+ * id)`, refused when that path is a symlink or its realpath is not exactly `<realpath(base)>/<id>`. The root is first renamed
+ * aside (./scratch-remove detachChild: same dev/ino as judged, renamed to `.removing-*`, checked again), so nothing writing by
+ * its path reaches the tree; the detached tree is archived and verified (./scratch-archive archiveDetached: manifest, capacity,
+ * tar, extraction compared entry by entry, hash, the tree frozen with no write bits, lsof showing nothing open in it, the
+ * tree read again) to `archivePathFor(home, id, now)`; only then is it removed (purgeArchived: only what the freeze
+ * recorded). An archive that fails, a tree a process still has a file open in (or that lsof cannot clear), or one that
+ * cannot be frozen, gets its modes back and is renamed back (restoreDetached) and kept. A missing root is a no-op. Never throws.
  */
-export function removeScratchRoot(home: string, id: string): ScratchRemoval {
+export function archiveScratchRoot(home: string, id: string, now: Date, seams: ArchiveSeams = {}): ScratchClose {
 	let root = join(scratchBase(home), id);
 	try {
 		root = scratchRootFor(home, id);
 		try {
-			if (lstatSync(root).isSymbolicLink()) return { kind: "failed", root, reason: "the root is a symlink" };
+			if (lstatSync(root).isSymbolicLink()) return { kind: "refused", root, reason: "the root is a symlink" };
 		} catch (err) {
 			if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing", root };
 			throw err;
@@ -262,42 +275,133 @@ export function removeScratchRoot(home: string, id: string): ScratchRemoval {
 		const physical = realpathSync.native(root);
 		const base = realpathSync.native(scratchBase(home));
 		const expected = `${base}/${id}`;
-		if (physical !== expected) return { kind: "failed", root, reason: `the root resolves to ${physical}, not ${expected}` };
-		const r = removeChild(base, id, fileIdentity(expected));
-		if (r.kind === "removed") return { kind: "removed", root };
-		return { kind: "failed", root, reason: r.kind === "refused" ? r.reason : r.error };
+		if (physical !== expected) return { kind: "refused", root, reason: `the root resolves to ${physical}, not ${expected}` };
+		const d = detachChild(base, id, fileIdentity(expected));
+		if (d.kind !== "detached") return { kind: "refused", root, reason: d.kind === "refused" ? d.reason : d.error };
+		const archive = archiveDetached(d.doomed, archivePathFor(home, id, now), seams);
+		if (archive.kind === "failed") {
+			const back = restoreDetached(d);
+			return { kind: "archive-failed", root, reason: archive.reason, keptAt: back.at, restore: back.said };
+		}
+		const r = purgeArchived(d, archive, seams);
+		if (r.kind === "removed") return { kind: "archived", root, physical, archive, removal: { ok: true as const } };
+		const back = restoreDetached(d);
+		const removal = { ok: false as const, reason: `${r.kind === "refused" ? r.reason : r.error}; ${back.said}`, left: back.at };
+		return { kind: "archived", root, physical, archive, removal };
 	} catch (err) {
-		return { kind: "failed", root, reason: String(err instanceof Error ? err.message : err) };
+		return { kind: "refused", root, reason: String(err instanceof Error ? err.message : err) };
 	}
 }
 
+/** Characters that end a path named in prose: whitespace, quotes, brackets and the punctuation that follows a path in a sentence. */
+const PATH_END = /[\s"'`<>()[\]{},;]/;
+
 /**
- * After the ledger close: remove the workload's scratch root (`removeScratchRoot`, HOME from `env`) and record the outcome as
- * `scratch-removed: <id> <root>` or `scratch-remove-failed: <id> <root>: <reason>`. The closed workload takes no entries
- * (ledger/schema.sql `entries_insert_workload`), so the entry goes on the standing workload, as the surface. A missing root
- * writes nothing, and so does a HOME that cannot be resolved (ledger/src/locality.ts homeDir): no root can be named, and the
- * sentence says why. Never throws and never fails the close: returns the sentence the close result carries ("" for none).
+ * Every path `text` names inside the scratch root, spelled as one of `roots` (the HOME form, the physical form, `$AS2_SCRATCH`,
+ * `${AS2_SCRATCH}`, `~/…`), each as `[as written, path relative to the root ("" for the root itself)]`, in order, deduplicated.
+ * Lexical only: what the path reaches is `archivedAs`'s to say.
  */
-export function closeScratchRoot(ledger: Ledger, env: Record<string, string | undefined>, id: string): string {
+export function scratchPathsIn(text: string, roots: readonly string[]): [string, string][] {
+	const found: [string, string][] = [];
+	for (const form of roots) {
+		let from = 0;
+		for (;;) {
+			const at = text.indexOf(form, from);
+			if (at < 0) break;
+			from = at + form.length;
+			const next = text[from];
+			if (next !== undefined && next !== "/" && !PATH_END.test(next) && next !== "." && next !== ":") continue;
+			let end = from;
+			while (end < text.length && !PATH_END.test(text[end]!)) end++;
+			// A sentence's full stop or colon after the path is not part of it.
+			while (end > from && /[.:]/.test(text[end - 1]!)) end--;
+			const written = text.slice(at, end);
+			const rel = text.slice(from, end).replace(/^\/+/, "").replace(/\/+$/, "");
+			if (!found.some(([w]) => w === written)) found.push([written, rel]);
+		}
+	}
+	return found;
+}
+
+/**
+ * What the verified archive holds for the path `rel` (relative to the root) the done-because names, from the archive's own
+ * manifest (`members`), never from the path's spelling: a `..` component, an entry the tree did not have, a path reached
+ * through a symlink (the archive holds the link, not what it points to), a symlink itself, or the member it is archived as.
+ */
+export function archivedAs(rel: string, members: Manifest, archive: string): string {
+	const parts = rel === "" ? [] : rel.split("/").filter((p) => p !== "" && p !== ".");
+	if (parts.includes("..")) return `a path with a \`..\` component: not checked against the archive, and not known to be in it`;
+	for (let i = 0; i < parts.length; i++) {
+		const prefix = parts.slice(0, i + 1).join("/");
+		const e = members.get(prefix);
+		if (!e) return `not in the archive ${archive}: the root had no ./${prefix} at close`;
+		if (e.type === "link" && i < parts.length - 1) return `reached through the symlink ./${prefix} (→ ${e.target}): the archive ${archive} holds that link, not what it points to`;
+	}
+	const key = parts.join("/");
+	const e = members.get(key)!;
+	if (e.type === "link") return `a symlink (→ ${e.target}): the archive ${archive} holds the link as ./${key}, not its target`;
+	return `in the archive ${archive} as ${key === "" ? "./ (the whole root)" : `./${key}`}`;
+}
+
+/**
+ * After the ledger close: archive then remove the workload's scratch root (`archiveScratchRoot`, HOME from `env`) and record the
+ * outcome on the standing workload, as the surface (the closed workload takes no entries, ledger/schema.sql
+ * `entries_insert_workload`): `scratch-archived: <id> <archive> <bytes> <sha256>` and then `scratch-removed: <id> <root>` or
+ * `scratch-remove-failed: <id> <root>: <reason>; what is left is at <path>`; an archive that failed is
+ * `scratch-remove-failed: <id> <root>: not archived (<reason>); the root is kept[ at <path>]`, and a root refused before
+ * archiving `scratch-remove-failed: <id> <root>: <reason>`. When the closing workload's done-because (`doneBecause`) names a
+ * path inside the root, the sentence says what the verified archive holds for it (`archivedAs`), or where the kept tree is.
+ * A missing root writes nothing, and so does a HOME that cannot be resolved (ledger/src/locality.ts homeDir): no root can be
+ * named, and the sentence says why. Never throws and never fails the close: returns the sentence the close result carries
+ * ("" for none).
+ */
+export function closeScratchRoot(ledger: Ledger, env: Record<string, string | undefined>, id: string, opts: { doneBecause?: string | null; now?: Date; seams?: ArchiveSeams } = {}): string {
 	let home: string;
 	try {
 		home = homeDir(env);
 	} catch (err) {
 		return `Scratch root of ${id} not removed: ${String(err instanceof Error ? err.message : err)}.`;
 	}
-	const r = removeScratchRoot(home, id);
+	const r = archiveScratchRoot(home, id, opts.now ?? new Date(), opts.seams);
 	if (r.kind === "missing") return "";
-	const body = r.kind === "removed" ? `${SCRATCH_ENTRY.removed} ${id} ${r.root}` : `${SCRATCH_ENTRY.removeFailed} ${id} ${r.root}: ${r.reason}`;
+	const physicalRoot = r.kind === "archived" ? r.physical : null;
+	const keptWhere = r.kind === "archive-failed" && r.keptAt !== physicalRoot && !r.restore.startsWith("renamed back") ? ` at ${r.keptAt} (${r.restore})` : "";
+	const bodies: string[] = [];
+	if (r.kind === "refused") bodies.push(`${SCRATCH_ENTRY.removeFailed} ${id} ${r.root}: ${r.reason}`);
+	else if (r.kind === "archive-failed") bodies.push(`${SCRATCH_ENTRY.removeFailed} ${id} ${r.root}: not archived (${r.reason}); the root is kept${keptWhere}`);
+	else {
+		bodies.push(`${SCRATCH_ENTRY.archived} ${id} ${r.archive.path} ${r.archive.bytes} ${r.archive.sha256}`);
+		bodies.push(r.removal.ok ? `${SCRATCH_ENTRY.removed} ${id} ${r.root}` : `${SCRATCH_ENTRY.removeFailed} ${id} ${r.root}: ${r.removal.reason}; what is left is at ${r.removal.left}`);
+	}
 	let entry: string;
 	try {
 		entry = ledger.write(() => {
 			ensureStandingWorkload(ledger);
-			return `entry ${ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body })} on ${STANDING_WORKLOAD_ID}`;
+			const ids = bodies.map((body) => ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body }));
+			return `${ids.length === 1 ? "entry" : "entries"} ${ids.join(", ")} on ${STANDING_WORKLOAD_ID}`;
 		});
 	} catch (err) {
 		entry = `its entry could not be written: ${String(err instanceof Error ? err.message : err)}`;
 	}
-	return r.kind === "removed" ? `Scratch root ${r.root} removed (${entry}).` : `Scratch root ${r.root} not removed: ${r.reason} (${entry}).`;
+	let sentence: string;
+	if (r.kind === "refused") sentence = `Scratch root ${r.root} not removed: ${r.reason} (${entry}).`;
+	else if (r.kind === "archive-failed") sentence = `Scratch root ${r.root} kept${keptWhere}: not archived: ${r.reason} (${entry}).`;
+	else {
+		const made = `archived to ${r.archive.path} (${r.archive.bytes} bytes, sha256 ${r.archive.sha256})`;
+		sentence = r.removal.ok
+			? `Scratch root ${r.root} ${made} and removed (${entry}).`
+			: `Scratch root ${r.root} ${made} but not removed: ${r.removal.reason}; what is left is at ${r.removal.left}, and the daily sweep archives it again before removing it (${entry}).`;
+		for (const w of r.archive.warnings) sentence += ` Warning: ${w}.`;
+	}
+	if (opts.doneBecause) {
+		const forms = [r.root, ...(physicalRoot ? [physicalRoot] : []), `~/${relative(home, r.root)}`, "${AS2_SCRATCH}", "$AS2_SCRATCH"];
+		for (const [written, rel] of scratchPathsIn(opts.doneBecause, forms)) {
+			if (r.kind === "archived") sentence += ` The done-because names ${written}, inside the scratch root: ${archivedAs(rel, r.archive.members, r.archive.path)}.`;
+			else if (r.kind === "archive-failed") sentence += ` The done-because names ${written}, inside the scratch root, which is kept${keptWhere ? keptWhere : ` at ${r.root}`}.`;
+			else sentence += ` The done-because names ${written}, inside the scratch root, which was not removed.`;
+		}
+	}
+	return sentence;
 }
 
 /** Carries a render out of the transaction it rolls back. */

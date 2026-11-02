@@ -291,7 +291,7 @@ What the job never does:
 - delete a local archive without a receipt that was re-proven on a later night and a matching read-back from Google's servers
 - touch a `.partial-*` file, a `.verify-*` folder, or an archive with more than one link
 
-The 04:30 scratch sweep removes `.offsite`, `.attempts` and `.stuck` only once the sidecar itself is past 14 days and its archive is gone.
+The 04:30 scratch sweep handles the sidecars (`.offsite`, `.attempts`, `.stuck`) in two cases. An archive still at its public path (this job never claimed it) expires once its own mtime is past 14 days, and its sidecars go with it. A sidecar whose archive is gone (claimed or expired) is removed only once the sidecar itself is past 14 days.
 
 ## Overrides for testing
 
