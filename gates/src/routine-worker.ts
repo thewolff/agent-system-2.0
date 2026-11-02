@@ -21,7 +21,14 @@ export interface ClassifyOptions {
 	timeoutMs?: number;
 	/** The worker's entry, default this file; a test points it at a stalling or failing worker. */
 	entry?: string | URL;
+	/** Arms the deadline: `fire` after `ms`, returning its disarm. Default a real timer; a test drives it with a fake clock. */
+	deadline?: (ms: number, fire: () => void) => () => void;
 }
+
+const realDeadline = (ms: number, fire: () => void): (() => void) => {
+	const timer = setTimeout(fire, ms);
+	return () => clearTimeout(timer);
+};
 
 const isStrings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === "string");
 
@@ -53,14 +60,15 @@ export async function classifyUnderDeadline(call: ToolCall, ctx: RoutineContext,
 	} catch (err) {
 		return { ask: `classifier worker failed to start: ${err instanceof Error ? err.message : String(err)}` };
 	}
-	let timer: Timer | undefined;
+	let disarm = (): void => {};
 	const reply = new Promise<RoutineVerdict>((resolve) => {
 		worker.onmessage = (e: MessageEvent) => resolve(parseVerdict(e.data));
 		worker.onerror = (e: ErrorEvent) => resolve({ ask: `classifier worker failed: ${e.message || "an error with no message"}` });
 		worker.addEventListener("close", () => resolve({ ask: "classifier worker exited before it replied" }));
 	});
+	// A deadline seam that throws rejects this promise, and the race's catch below turns it into an ask.
 	const deadline = new Promise<RoutineVerdict>((resolve) => {
-		timer = setTimeout(() => resolve({ ask: `classifier timeout after ${timeoutMs} ms` }), timeoutMs);
+		disarm = (opts.deadline ?? realDeadline)(timeoutMs, () => resolve({ ask: `classifier timeout after ${timeoutMs} ms` }));
 	});
 	try {
 		const request: ClassifyRequest = { call: { toolName: call.toolName, input: call.input }, ctx: { ...ctx } };
@@ -69,7 +77,7 @@ export async function classifyUnderDeadline(call: ToolCall, ctx: RoutineContext,
 	} catch (err) {
 		return { ask: `classifier worker failed: ${err instanceof Error ? err.message : String(err)}` };
 	} finally {
-		clearTimeout(timer);
+		disarm();
 		// Settled either way: a stalled worker is stopped, and a late reply has no listener left to reach.
 		worker.onmessage = null;
 		worker.terminate();

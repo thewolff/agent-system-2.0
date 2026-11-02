@@ -714,7 +714,7 @@ export function alarmLines(ledger: Ledger, now: string, alarmFile: string): Erro
 	}
 	for (const l of latched) {
 		if (l.kind === "alarm-unreadable") {
-			out.push({ kind: "alarm", workloadId: STANDING_WORKLOAD_ID, rowId: "alarm:unreadable", line: `AUTO-APPLY ALARM: ${describeOff(l)}; auto-apply is off` });
+			out.push({ kind: "alarm", workloadId: STANDING_WORKLOAD_ID, rowId: "alarm:unreadable", next: "make the alarm file readable, then say auto-routine", line: `AUTO-APPLY ALARM: ${describeOff(l)}; auto-apply is off` });
 			continue;
 		}
 		if (l.kind !== "alarm") continue;
@@ -725,7 +725,7 @@ export function alarmLines(ledger: Ledger, now: string, alarmFile: string): Erro
 		const evidence = fieldText(f, "evidence") ?? short(plain(text), 160);
 		const error = fieldText(f, "error") ?? "not recorded";
 		out.push({
-			kind: "alarm", workloadId: STANDING_WORKLOAD_ID, rowId: `alarm:${l.line}`,
+			kind: "alarm", workloadId: STANDING_WORKLOAD_ID, rowId: `alarm:${l.line}`, next: "check the auto-applied call, then say auto-routine",
 			line: `AUTO-APPLY ALARM ${wl} ${signal}: ${evidence}; auto-apply is off; ledger write failed: ${error} (alarm-file line ${l.line}; your auto-routine clears it)`,
 		});
 	}
@@ -737,7 +737,7 @@ export function alarmLines(ledger: Ledger, now: string, alarmFile: string): Erro
 		if (at !== null && wl.startsWith("wl-") && ceilingWordAfter(ledger, wl, at)) return;
 		const errors = Array.isArray(f.errors) ? f.errors.filter((e): e is string => typeof e === "string").map(plain).join("; ") : "";
 		const why = fieldText(f, "error") ?? (errors !== "" ? errors : short(plain(text), 160));
-		out.push({ kind: "alarm", workloadId: wl.startsWith("wl-") ? wl : STANDING_WORKLOAD_ID, rowId: `alarm:${i + 1}`, line: `CEILING ALARM ${wl}: ${why} — shown until your next ceiling, extend or halt word on ${wl}` });
+		out.push({ kind: "alarm", workloadId: wl.startsWith("wl-") ? wl : STANDING_WORKLOAD_ID, rowId: `alarm:${i + 1}`, next: `say ceiling, extend or halt for ${wl}`, line: `CEILING ALARM ${wl}: ${why} — shown until your next ceiling, extend or halt word on ${wl}` });
 	});
 	return out;
 }

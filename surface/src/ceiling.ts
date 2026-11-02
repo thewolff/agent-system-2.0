@@ -91,6 +91,8 @@ export const AUTO_RAISE_SOURCE = "auto-raise half";
  * above `c` ($0.001 → $0, $0.01 → $0.01, 1 → 1 min): a null is a failed raise, never announced as one. The arithmetic runs on
  * integer micro-dollars and milli-minutes, so binary noise (0.7 × 150 = 104.99…) never moves a cent or a minute either way; an
  * input finer than that unit is taken at the unit below it ($49.9999999 → 49.999999, so $74.99, never $75), so the cap holds.
+ * Exact only while `3 × micro` and `3 × milli` stay safe integers (about $3 billion, 3 billion minutes); past that the raise is
+ * null, so the runner asks Jo rather than write an inexact or infinite ceiling.
  */
 export function halfRaise(c: Ceiling): Ceiling | null {
 	// Nearest unit, then one unit down when that nearest is above the input: a decimal at the unit's precision maps to the
@@ -99,6 +101,7 @@ export function halfRaise(c: Ceiling): Ceiling | null {
 	if (micro / 1e6 > c.usd) micro -= 1;
 	let milli = Math.round(c.wallMin * 1e3);
 	if (milli / 1e3 > c.wallMin) milli -= 1;
+	if (!Number.isSafeInteger(micro * 3) || !Number.isSafeInteger(milli * 3)) return null;
 	const usd = Math.floor((micro * 3) / 20_000) / 100;
 	const wallMin = Math.floor((milli * 3) / 2_000);
 	return usd > c.usd && wallMin > c.wallMin ? { usd, wallMin } : null;

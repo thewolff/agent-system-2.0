@@ -42,7 +42,7 @@ describe("alarm-file needs-you lines", () => {
 		const lines = alarmOf(ledger);
 		expect(lines).toEqual([
 			{
-				kind: "alarm", workloadId: STANDING_WORKLOAD_ID, rowId: "alarm:1",
+				kind: "alarm", workloadId: STANDING_WORKLOAD_ID, rowId: "alarm:1", next: "check the auto-applied call, then say auto-routine",
 				line: `AUTO-APPLY ALARM ${wl} gh-write: > PATCH /repos/o/r/pulls/1 HTTP/1.1; auto-apply is off; ledger write failed: database is locked (alarm-file line 1; your auto-routine clears it)`,
 			},
 		]);
@@ -82,8 +82,8 @@ describe("alarm-file needs-you lines", () => {
 		c.at("2026-10-27T10:06:00.000Z");
 		expect(routineOn(ledger, Date.parse(c.now()), { alarmFile })).toBe(true);
 		expect(alarmOf(ledger, alarmFile)).toEqual([
-			{ kind: "alarm", workloadId: wl, rowId: "alarm:1", line: `CEILING ALARM ${wl}: ceiling auto-raise failed: SQLITE_BUSY; question write failed: SQLITE_BUSY — shown until your next ceiling, extend or halt word on ${wl}` },
-			{ kind: "alarm", workloadId: other, rowId: "alarm:2", line: `CEILING ALARM ${other}: raise failed: a; question failed: b — shown until your next ceiling, extend or halt word on ${other}` },
+			{ kind: "alarm", workloadId: wl, rowId: "alarm:1", next: `say ceiling, extend or halt for ${wl}`, line: `CEILING ALARM ${wl}: ceiling auto-raise failed: SQLITE_BUSY; question write failed: SQLITE_BUSY — shown until your next ceiling, extend or halt word on ${wl}` },
+			{ kind: "alarm", workloadId: other, rowId: "alarm:2", next: `say ceiling, extend or halt for ${other}`, line: `CEILING ALARM ${other}: raise failed: a; question failed: b — shown until your next ceiling, extend or halt word on ${other}` },
 		]);
 		// auto-routine is not a ceiling word, and a word on another workload does not count.
 		joSays(ledger, STANDING_WORKLOAD_ID, "auto-routine");

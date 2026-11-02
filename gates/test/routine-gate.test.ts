@@ -232,25 +232,34 @@ describe("R7: every failure before the commit falls back to today's refusal and 
 		expect(callMark(c.toolCallId)).toBeUndefined();
 	});
 
+	// The deadline is driven through the `deadline` seam: the test fires it itself, so nothing here races a wall clock.
 	test("the worker: its verdict is routineVerdict's; a stall past the deadline, a throw, an exit and a malformed reply each ask", async () => {
 		const l = lane();
 		const ctx = { role: "lane" as const, cwd: l.home, env: l.env, mode: null };
 		expect(CLASSIFY_DEADLINE_MS).toBe(2000);
-		expect(await classifyUnderDeadline({ toolName: "bash", input: { command: READ } }, ctx)).toEqual({ rule: "read-only", detail: "read-only: for, gh", network: true, readers: [] });
+		// a deadline that never fires: each outcome below is the worker's own, never a race with a clock
+		const never = { deadline: () => () => {} };
+		const armed: { ms: number; fire: () => void }[] = [];
+		const fake = { deadline: (ms: number, fire: () => void) => (armed.push({ ms, fire }), () => {}) };
+		expect(await classifyUnderDeadline({ toolName: "bash", input: { command: READ } }, ctx, never)).toEqual({ rule: "read-only", detail: "read-only: for, gh", network: true, readers: [] });
 		const dir = tmp("rg-workers");
 		const worker = (name: string, body: string): string => {
 			writeFileSync(join(dir, name), body);
 			return join(dir, name);
 		};
-		const stall = worker("stall.ts", "self.onmessage = () => { for (;;) {} };");
-		expect(await classifyUnderDeadline({ toolName: "bash", input: { command: READ } }, ctx, { entry: stall, timeoutMs: 300 })).toEqual({ ask: "classifier timeout after 300 ms" });
-		const thrown = await classifyUnderDeadline({ toolName: "bash", input: { command: READ } }, ctx, { entry: worker("throw.ts", 'self.onmessage = () => { throw new Error("lstat stalled"); };') });
+		const stalled = classifyUnderDeadline({ toolName: "bash", input: { command: READ } }, ctx, { entry: worker("stall.ts", "self.onmessage = () => { for (;;) {} };"), ...fake });
+		expect(armed.map((a) => a.ms)).toEqual([CLASSIFY_DEADLINE_MS]);
+		armed[0]!.fire();
+		expect(await stalled).toEqual({ ask: `classifier timeout after ${CLASSIFY_DEADLINE_MS} ms` });
+		const thrown = await classifyUnderDeadline({ toolName: "bash", input: { command: READ } }, ctx, { entry: worker("throw.ts", 'self.onmessage = () => { throw new Error("lstat stalled"); };'), ...never });
 		expect("ask" in thrown && thrown.ask).toContain("classifier worker failed");
-		const exited = await classifyUnderDeadline({ toolName: "bash", input: { command: READ } }, ctx, { entry: worker("exit.ts", "self.onmessage = () => process.exit(0);") });
+		const exited = await classifyUnderDeadline({ toolName: "bash", input: { command: READ } }, ctx, { entry: worker("exit.ts", "self.onmessage = () => process.exit(0);"), ...never });
 		expect("ask" in exited).toBe(true);
-		expect(await classifyUnderDeadline({ toolName: "bash", input: { command: READ } }, ctx, { entry: worker("bad.ts", 'self.onmessage = () => postMessage({ rule: "read-only" });') })).toEqual({
+		expect(await classifyUnderDeadline({ toolName: "bash", input: { command: READ } }, ctx, { entry: worker("bad.ts", 'self.onmessage = () => postMessage({ rule: "read-only" });'), ...never })).toEqual({
 			ask: 'the classifier worker posted a malformed reply ({"rule":"read-only"})',
 		});
+		const broken = await classifyUnderDeadline({ toolName: "bash", input: { command: READ } }, ctx, { deadline: () => { throw new Error("no timer"); } });
+		expect(broken).toEqual({ ask: "classifier worker failed: no timer" });
 		expect(parseVerdict({ rule: "scratch", detail: "d", network: false, root: "relative" })).toEqual({ ask: expect.stringContaining("malformed") });
 		expect(parseVerdict({ rule: "worktree", detail: "d", network: true, root: "/x" })).toEqual({ ask: expect.stringContaining("malformed") });
 	});
