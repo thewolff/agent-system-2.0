@@ -413,6 +413,25 @@ describe("PLAN wl-mvqwn80onq9hq8 D12: a 100 % hit rises once by half on progress
 		expect(s.poll(50.2).hit).toMatchObject({ kind: "asked", first: `ceiling reached on ${s.wl}: no progress since ${noticeAt}` });
 	});
 
+	test("R29 a slice closed or a review round settled in the notice's own millisecond, before it, is no progress at the hit", () => {
+		const s = setup();
+		s.poll(25);
+		s.c.plusHours(1 / 60);
+		s.ledger.completeSlice(s.sl, { by: LANE, artifact: "done" });
+		expect(meterPoll(s.ledger, { workloadId: s.wl, laneId: LANE, spend: spent(40, 10), state: fresh, probe: s.fake.probe, alarmFile: s.file })).toMatchObject({ notice: 80, hit: null });
+		const noticeAt = s.c.now();
+		expect(s.poll(50.2).hit).toMatchObject({ kind: "asked", first: `ceiling reached on ${s.wl}: no progress since ${noticeAt}` });
+
+		const r = setup();
+		r.poll(25);
+		round(r.ledger, r.wl, r.sl, 1, 3);
+		r.c.plusHours(1 / 60);
+		round(r.ledger, r.wl, r.sl, 2, 1);
+		expect(meterPoll(r.ledger, { workloadId: r.wl, laneId: LANE, spend: spent(40, 10), state: fresh, probe: r.fake.probe, alarmFile: r.file })).toMatchObject({ notice: 80, hit: null });
+		const roundNoticeAt = r.c.now();
+		expect(r.poll(50.2).hit).toMatchObject({ kind: "asked", first: `ceiling reached on ${r.wl}: no progress since ${roundNoticeAt}` });
+	});
+
 	test("R29 a commit on the workload branch or a push-dest branch the mark lacked is progress, named by remote, branch and sha", () => {
 		const s = setup();
 		s.ledger.recordEntry({ by: LANE, workloadId: s.wl, kind: "assumption", body: `push-dest: fork feature/offset ${SHA_A}` });
@@ -490,6 +509,7 @@ describe("PLAN wl-mvqwn80onq9hq8 D12: a 100 % hit rises once by half on progress
 
 	test("R31 half of a ceiling that rounds to no raise is a failed raise: Jo is asked, nothing announces a raise", () => {
 		const s = setup({ ceiling: "ceiling: usd 0.01 wall 1 source stakes normal" });
+		s.c.plusHours(1 / 120); // the window opens at the ceiling row (T0); progress in its own millisecond is not proven
 		s.ledger.completeSlice(s.sl, { by: LANE, artifact: "done" });
 		const hit = s.poll(0.02);
 		expect(hit).toMatchObject({ stop: true, accepted: true, hit: { kind: "asked", first: "ceiling auto-raise failed: half of $0.01 / 1 min rounds to no raise" } });

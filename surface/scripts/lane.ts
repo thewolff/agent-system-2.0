@@ -942,7 +942,9 @@ function meterView(ledger: Ledger, r: { workloadId: string; spend: Spend; state:
  */
 function progressOf(ledger: Ledger, v: MeterView, pushes: ReadonlyMap<string, PushCheck> | null): { found: string | null; unknown: string[] } {
 	const wl = v.w.id;
-	const inWindow = (t: string) => v.start === null || t >= v.start;
+	// Strictly after the window opens: a slice closed or a round settled in the notice's own millisecond may precede it, so a
+	// tie is never proven progress (it asks Jo). Marks keep `>=` (meterView): the notice's own write records them, from heads read before it.
+	const inWindow = (t: string) => v.start === null || t > v.start;
 	const found: string[] = [];
 	const unknown: string[] = [];
 	const slices = ledger.slices(wl);

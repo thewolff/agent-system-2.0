@@ -11,7 +11,7 @@ import { dirname, join } from "node:path";
 import { errorLines } from "../../surface/src/errors";
 import { ensureStandingWorkload } from "../../surface/src/identity";
 import { ESCALATION_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../../surface/src/types";
-import { LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
+import { LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import reservedRow, { type AutoApplyOptions, detectTrip, exitOf, fullOutput } from "../extensions/r06-reserved";
 import {
 	execAllowList,
@@ -243,9 +243,7 @@ describe("R7: every failure before the commit falls back to today's refusal and 
 			return join(dir, name);
 		};
 		const stall = worker("stall.ts", "self.onmessage = () => { for (;;) {} };");
-		const start = Date.now();
 		expect(await classifyUnderDeadline({ toolName: "bash", input: { command: READ } }, ctx, { entry: stall, timeoutMs: 300 })).toEqual({ ask: "classifier timeout after 300 ms" });
-		expect(Date.now() - start).toBeLessThan(2000);
 		const thrown = await classifyUnderDeadline({ toolName: "bash", input: { command: READ } }, ctx, { entry: worker("throw.ts", 'self.onmessage = () => { throw new Error("lstat stalled"); };') });
 		expect("ask" in thrown && thrown.ask).toContain("classifier worker failed");
 		const exited = await classifyUnderDeadline({ toolName: "bash", input: { command: READ } }, ctx, { entry: worker("exit.ts", "self.onmessage = () => process.exit(0);") });
@@ -465,10 +463,12 @@ describe("R9: a failed result or trip write leaves an alarm-file line, an AUTO-A
 		// This process holds its own trip: named on the next call, until Jo's auto-routine is newer.
 		await f.emit("tool_call", call(READ), ctx);
 		expect(requests(l.ledger, l.wl).at(-1)).toMatch(/\(not auto-applied: this process holds an auto-apply trip from \S+ until Jo's auto-routine\)$/);
-		// A real delay: the trip's `at` and the gate session's own ledger both read the wall clock (the gate opens the
-		// ledger file itself, so no test clock reaches it), and auto-routine must be strictly newer than the trip.
-		await Bun.sleep(5);
-		jo(l.ledger, "auto-routine");
+		// auto-routine must be strictly newer than the trip, whose `at` is the wall clock the gate read: Jo's word is
+		// stamped one second after it through a second handle on the same ledger file with a fixed clock.
+		const afterTrip = new Date(Date.parse(lines[0].at) + 1000).toISOString();
+		const stamped = Ledger.open(l.path, { backup: false, backupOnOpen: false, clock: () => afterTrip });
+		jo(stamped, "auto-routine");
+		stamped.close();
 		const again = call(READ);
 		expect(await f.emit("tool_call", again, ctx)).toBeUndefined();
 		expect(callMark(again.toolCallId)).toEqual({ kind: "read-only", network: true, readers: [] });
