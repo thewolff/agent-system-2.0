@@ -76,6 +76,8 @@ Each workload has a ceiling in nominal dollars (list price as OMP computes it, s
 
 At 100 % the lane stops. A raise always needs your word: `extend`, or `ceiling <usd> [<hours>]`. Lanes also run with OMP's `--max-time` (`AGENT_SYSTEM_LANE_MAX_TIME`, default `2h`) as a backstop. The design is in [DESIGN-workload-ceiling.md](../DESIGN-workload-ceiling.md). Spend is recorded per lane run only; per-slice and per-hand spend are planned ([MIGRATION.md](../MIGRATION.md) item 22).
 
+The merge train is the one workload with no ceiling. It is permanent and has $150 per Pacific day (America/Los_Angeles) instead: at the day's limit its runner stops the lane, the train pauses, and you answer one question with `raise <usd>` (more for that day only) or `wait` (it resumes at midnight Pacific). `extend` and `ceiling` are refused on it, and each run's `--max-time` is a 24-hour hang backstop. [USER-GUIDE.md](../USER-GUIDE.md) § 3, The merge train, has the rest.
+
 ## Reserved actions and approvals
 
 Reserved actions are irreversible actions outside the repository ([SPEC-2.0.md](../SPEC-2.0.md) § A4): force-push, hard reset, branch or tag deletion, `rm -rf`, `DROP` / `TRUNCATE`, production database writes, infrastructure teardown, secret rotation, a push to a protected branch (`main`, `master`, `production`, `prod`, `release`), and deploy. Pushes to feature branches and merges of approved, green PRs are not reserved.

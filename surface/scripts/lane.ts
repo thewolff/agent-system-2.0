@@ -68,7 +68,11 @@ import { newLaneSession, runCtxIndex, topLevelSessions } from "../src/ctx-index"
 import { decisionLogContext, repoOf } from "../src/decision-log";
 import { factsBlock } from "../src/facts";
 import { loadTestRunnerConfig } from "../src/close-entry";
-import { checkoutOwnerRepo, isTrainOrFix, openTrains, ownerTasks, TRAIN_LAUNCH_LIMIT, trainLaunchFailures } from "../src/merge-train";
+import { checkoutOwnerRepo, isTrainOrFix, openTrains, ownerTasks, TRAIN_LAUNCH_LIMIT, trainLaunchFailures, trainMembers } from "../src/merge-train";
+import {
+	activeTrainPr, askTrainPause, emptyTrainScan, nextPdtMidnight, pdtDay, scanTrainDays, trainBudgetGate, trainBudgetPromptLine, trainBudgetRows, trainDayLimit, trainMaxTime,
+	trainMeterErrorBody, trainPausedBody, trainRuleBody, type TrainScan, type TrainScanError,
+} from "../src/train-budget";
 import {
 	attempts, branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, heldLive, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
@@ -509,10 +513,13 @@ function liveRefusal(rows: ReserveRows, probeFor: (laneId: string, workloadId: s
  * any other verdict passes unchanged. D3: `held: train lane <laneId> live on <wl>` while another open train has a lane
  * (`liveTrainLane`, its pre-claimed attempts included). D4: `not-launchable: train launch limit: <n> consecutive failed
  * launches (<lane ids>)` once `trainLaunchFailures` counts TRAIN_LAUNCH_LIMIT, whatever the cause: Jo's fresh word is a
- * reset, so it already counts from zero.
+ * reset, so it already counts from zero. PLAN wl-mvr888nftz0vcl D5: the daily budget gate (`trainBudgetGate`) refuses
+ * first, `budget-paused`, `budget-decision` or `meter-error`, so every reservation path waits on it, whatever verdict it got.
  */
 function trainGate(ledger: Ledger, rows: ReserveRows, probeFor: (laneId: string, workloadId: string) => RunnerProbe, v: ReserveVerdict): ReserveVerdict {
 	if (!v.launch || !rows.capExempt) return v;
+	const budget = trainBudgetGate(trainBudgetRows(rows), rows.now);
+	if (budget !== null) return { launch: false, reason: budget.reason };
 	const other = liveTrainLane(ledger, rows.workload.id, rows.now, probeFor, true);
 	if (other !== null) return { launch: false, reason: `held: train lane ${other.laneId} live on ${other.workloadId}` };
 	const failed = trainLaunchFailures({
@@ -821,6 +828,67 @@ export function meterPoll(ledger: Ledger, r: { workloadId: string; laneId: strin
 		if (decided === null || !decided.stop) throw err;
 		process.stderr.write(`runner: the ceiling stop's writes failed: ${String(err)}\n`);
 		return { ...decided, state: r.state, accepted: false };
+	}
+}
+
+/** One train meter poll's outcome (PLAN wl-mvr888nftz0vcl D4): whether the lane stops, why, and what the poll wrote. */
+export interface TrainMeterPoll {
+	stop: boolean;
+	/** The stop's acceptance: `meter-error` when the scan found a defect (a pause on the same poll is still written), else `budget`. */
+	ref: "budget" | "meter-error" | null;
+	/** The acceptance `lane-stop: <lane> accepted <ref>` is on the ledger; false when the writes failed after a stop was decided. */
+	accepted: boolean;
+	day: string;
+	spent: number;
+	errorId: string | null;
+	pauseId: string | null;
+	questionId: string | null;
+}
+
+/**
+ * One train meter poll on the ledger, in one transaction (D4): today's PDT spend from `scan` against `trainDayLimit` read
+ * now, so a raise lands wholly before or after it. Under the limit nothing is written (no notice, no wall). At or over it:
+ * `train-paused:` (the PR `activeTrainPr` names for this lane), its raise/wait question (`askTrainPause`, keyed to the
+ * pause) and `lane-stop: <lane> accepted budget`. A scan defect writes `train-meter-error:` naming the first defect (and
+ * how many more) and `lane-stop: <lane> accepted meter-error`; a pause the same poll reaches is written too, so one failure
+ * never hides the other. When the writes fail after a stop was decided (any scan defect is one), the stop still stands
+ * (`accepted` false: the caller accepts it on its own); any other failure throws.
+ */
+export function trainMeterPoll(
+	ledger: Ledger, r: { workloadId: string; laneId: string; scan: TrainScan; errors: readonly TrainScanError[]; nowMs: number },
+): TrainMeterPoll {
+	const day = pdtDay(r.nowMs);
+	const spent = r.scan.days.get(day) ?? 0;
+	const failed = r.errors.length > 0;
+	let ref: TrainMeterPoll["ref"] = failed ? "meter-error" : null;
+	try {
+		return ledger.write(() => {
+			const recordAs = (body: string): string => ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body });
+			if (!ledger.workload(r.workloadId)) throw new Error(`no workload ${r.workloadId}`);
+			const entries = ledger.entries(r.workloadId);
+			const limit = trainDayLimit(controlEntries(entries), day);
+			const over = spent >= limit;
+			ref = failed ? "meter-error" : over ? "budget" : null;
+			let errorId: string | null = null;
+			if (failed) {
+				const first = r.errors[0]!;
+				const more = r.errors.length > 1 ? ` (and ${r.errors.length - 1} more defects)` : "";
+				errorId = recordAs(trainMeterErrorBody(r.laneId, { ...first, reason: `${first.reason}${more}` }));
+			}
+			let pauseId: string | null = null;
+			let questionId: string | null = null;
+			if (over) {
+				const pr = activeTrainPr({ workloadId: r.workloadId, entries, slices: ledger.slices(r.workloadId) }, r.laneId);
+				pauseId = recordAs(trainPausedBody({ laneId: r.laneId, day, usd: spent, limit, pr, until: new Date(nextPdtMidnight(r.nowMs)).toISOString() }));
+				questionId = askTrainPause(ledger, r.workloadId, pauseId);
+			}
+			if (ref !== null) recordAs(laneStopAcceptedBody(r.laneId, ref));
+			return { stop: ref !== null, ref, accepted: ref !== null, day, spent, errorId, pauseId, questionId };
+		});
+	} catch (err) {
+		if (ref === null) throw err;
+		process.stderr.write(`runner: the train meter's ${ref} stop could not be written on ${r.workloadId}: ${String(err)}; the lane is stopped anyway\n`);
+		return { stop: true, ref, accepted: false, day, spent, errorId: null, pauseId: null, questionId: null };
 	}
 }
 
@@ -1265,7 +1333,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		const es = ledger.entries(wl);
 		return releasedOpen(controlEntries(es, holdersOf(es, ledger.workload(wl)?.holder ?? null, ledger.holders(wl))), laneId);
 	};
-	/** OMP's `--max-time`: the ceiling's remaining wall plus the margin, or AGENT_SYSTEM_LANE_MAX_TIME when that is set and shorter; fixed at the spawn. */
+	/** OMP's `--max-time`: the ceiling's remaining wall plus the margin (a train: TRAIN_RUN_MAX_TIME_MIN), or AGENT_SYSTEM_LANE_MAX_TIME when that is set and shorter; fixed at the spawn. */
 	let maxTime = laneMaxTime(process.env);
 	let deadlineAt = Number.MAX_SAFE_INTEGER;
 	const readyMinutes = READY_MS >= 60_000 ? `${Math.round(READY_MS / 60_000)}m` : `${Math.round(READY_MS / 1000)}s`;
@@ -1403,7 +1471,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	 * acceptance in one transaction. `control` is the poll's snapshot, for the wall only. A failure is logged, never fatal; a
 	 * stop the step called for is taken even when its writes failed. Returns whether it stopped the lane.
 	 */
-	const meter = (control: readonly ControlEntry[]): boolean => {
+	const ceilingMeter = (control: readonly ControlEntry[]): boolean => {
 		let stopping = false;
 		let accepted = false;
 		try {
@@ -1417,6 +1485,40 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		if (stopping) stop("ceiling", "ceiling", accepted);
 		return stopping;
 	};
+	// A merge train's daily budget meter (PLAN wl-mvr888nftz0vcl D4) in place of the ceiling meter: a train is permanent and
+	// has no wall, no ceiling notice and no ceiling stop. Its strict scan restarts at byte 0 with each runner, every line on
+	// its own PDT day. Fixed at the run's start: train membership is never taken back (D1).
+	const train = trainMembers(ledger.entries(wl), ledger.instructions(wl)).length > 0;
+	let trainScan: TrainScan = emptyTrainScan();
+	/**
+	 * One train meter poll (`trainMeterPoll`): at the day's limit the pause, its question and the stop `budget`; on a scan
+	 * defect the meter error and the stop `meter-error`. It fails closed: a poll that throws (a ledger or clock failure) is
+	 * recorded as a meter error when the ledger takes it, logged, and stops the lane, since no spend is allowed past a meter
+	 * that cannot read. Returns whether it stopped the lane.
+	 */
+	const trainMeter = (): boolean => {
+		if (sessionsDir === null) return false;
+		let ref: "budget" | "meter-error" | null = null;
+		let accepted = false;
+		try {
+			const scanned = scanTrainDays(sessionsDir, trainScan);
+			trainScan = scanned.scan;
+			const polled = trainMeterPoll(ledger, { workloadId: wl, laneId, scan: scanned.scan, errors: scanned.errors, nowMs: Date.now() });
+			ref = polled.ref;
+			accepted = polled.accepted;
+		} catch (err) {
+			ref = "meter-error";
+			process.stderr.write(`runner: the train budget meter failed on ${wl}: ${String(err)}; stopping ${laneId} (fail closed)\n`);
+			try {
+				record(trainMeterErrorBody(laneId, { file: "the runner's train meter", line: 0, reason: String(err) }));
+			} catch (writeErr) {
+				process.stderr.write(`runner: the train-meter-error: line could not be written either: ${String(writeErr)}\n`);
+			}
+		}
+		if (ref !== null) stop(ref, ref, accepted);
+		return ref !== null;
+	};
+	const meter = (control: readonly ControlEntry[]): boolean => (train ? trainMeter() : ceilingMeter(control));
 
 	/** Once: stdin EOF, then SIGKILL after the grace period if the child has not exited. */
 	const end = (): void => {
@@ -1631,11 +1733,18 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		const p = prepare(ledger, wl, false);
 		sessionsDir = p.sessionDir;
 		{
-			const { workload: cur, control } = controlNow();
-			const ceiling = effectiveCeiling(control, ledger.instructions(wl), cur?.stakes ?? w.stakes);
-			const remainingWallMin = Math.max(0, ceiling.wallMin - wallMinutes(control, Date.now(), null));
-			const envMs = process.env[LANE_MAX_TIME_ENV]?.trim() ? maxTimeMs(maxTime) : null;
-			const shorter = envMs !== null && envMs < (maxTimeMs(ceilingMaxTime(remainingWallMin)) ?? Number.MAX_SAFE_INTEGER);
+			// A train has no wall (PLAN wl-mvr888nftz0vcl D4): its ceiling rows are never read, and `--max-time` is the 24 h hang
+			// backstop (`trainMaxTime`, a shorter AGENT_SYSTEM_LANE_MAX_TIME still wins). Any other workload: the ceiling's wall.
+			let remainingWallMin: number | null = null;
+			if (train) maxTime = trainMaxTime(process.env);
+			else {
+				const { workload: cur, control } = controlNow();
+				const ceiling = effectiveCeiling(control, ledger.instructions(wl), cur?.stakes ?? w.stakes);
+				const remaining = Math.max(0, ceiling.wallMin - wallMinutes(control, Date.now(), null));
+				const envMs = process.env[LANE_MAX_TIME_ENV]?.trim() ? maxTimeMs(maxTime) : null;
+				const shorter = envMs !== null && envMs < (maxTimeMs(ceilingMaxTime(remaining)) ?? Number.MAX_SAFE_INTEGER);
+				remainingWallMin = shorter ? null : remaining;
+			}
 			// Jo's named model and the session, read fresh at this spawn; a session recorded on another model is not resumed (item 85).
 			const start = resumeOf(ledger, w, laneId);
 			model = start.model;
@@ -1652,7 +1761,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			}
 			argv = laneArgv({
 				worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, maxTime, resume: start.resume, model,
-				remainingWallMin: shorter ? null : remainingWallMin,
+				remainingWallMin,
 			});
 			if (start.recovered !== null) process.stderr.write(`runner: ${laneId} ${start.recovered}; argv ${JSON.stringify(argv)}\n`);
 			maxTime = argv[argv.indexOf("--max-time") + 1]!;
@@ -1730,16 +1839,23 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					clearInterval(readyPoll);
 					const { workload: latest, control } = controlNow();
 					const stakes = latest?.stakes ?? w.stakes;
-					// A relaunch already at or past the ceiling stops here, before lane-ready: and before the first prompt spends a model turn past it.
+					// A relaunch already at or past the ceiling (a train: at or past the day's limit) stops here, before lane-ready: and
+					// before the first prompt spends a model turn past it.
 					if (meter(control)) {
 						ready = true;
 						return;
 					}
-					const ceilingLine = ceilingPromptLine(effectiveCeiling(control, ledger.instructions(wl), stakes), measure(control));
+					// A train's line is its daily budget (PLAN wl-mvr888nftz0vcl D4), from the scan the meter just ran; never a ceiling.
+					const nowMs = Date.now();
+					const ceilingLine = train
+						? trainBudgetPromptLine(trainDayLimit(control, pdtDay(nowMs)), trainScan.days.get(pdtDay(nowMs)) ?? 0, new Date(nextPdtMidnight(nowMs)).toISOString())
+						: ceilingPromptLine(effectiveCeiling(control, ledger.instructions(wl), stakes), measure(control));
 					// The prompt's row cut (PLAN wl-mvpsrr4tr0p1xc D2): taken before `promptFor` reads the rows, so every instruction older
 					// than lane-ready:'s time was in this prompt, and a train's resolution counts as delivered only then (`consumedByReady`).
 					const readAt = ledger.now();
 					const prompt = promptFor(ledger, w, laneId, p, ceilingLine);
+					// Every train lane start's live receipt of the permanent rule (D10, R22), beside its lane-ready:.
+					if (train) record(trainRuleBody(laneId, maxTime));
 					// lane-ready: immediately before the first prompt (item 85): a runner lane that ended without one never got a prompt (builderLabs).
 					record(laneReadyBody(laneId, readAt));
 					sendPrompt(prompt);

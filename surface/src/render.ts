@@ -12,19 +12,20 @@
 // is the on-demand read's (LEDGER_TOOL), for one workload or all of them. While an agent channel runs on the ledger
 // handle (PLAN wl-mv8vx7wdj5nx1c D3), every render carries the `## from other agents` block after the needs-you lines:
 // the channel's notes, which are Ilex's to read and not Jo's to answer (surface/src/channel.ts `fromOtherAgents`).
-import type { InFlightWorkload, InstructionRow, Ledger, MessageRow, SliceRow, WorkloadStatusRow } from "../../ledger/src/index";
+import { type InFlightWorkload, type InstructionRow, LANE_RUNNER_BY, type Ledger, type MessageRow, type SliceRow, type WorkloadStatusRow } from "../../ledger/src/index";
 import { channelInForce, fromOtherAgents } from "./channel";
 import { needsYouBullet } from "./delivery";
 import { type ErrorLine, errorLines, parseDue, wordsOf } from "./errors";
 import { type Identity, identityOf } from "./identity";
 import { parseSpend } from "./ceiling";
 import { ceilingOf, ceilingText, openPairOffer } from "./input";
+import { trainMembers } from "./merge-train";
 import { byHandLine, type ControlEntry, controlEntries, doneLine, holdersOf, isPlanQuestionIn, planFirst, priorityPausedOf, priorityPausingOf, queuedOf } from "./launch";
 import { pairOfferLine, shownOptions } from "./pair-suggest";
 import { Numbering } from "./numbering";
 import { currentGoals, livePins, parseAudit, rankDay, rankOpen, rankPosition } from "./rank";
 import { queuePosition } from "./rank-launch";
-import { LAST_N, LEDGER_TOOL, STANDING_WORKLOAD_ID } from "./types";
+import { LAST_N, LEDGER_TOOL, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 export interface RenderOptions {
 	now?: string;
@@ -57,20 +58,20 @@ export interface Rendered {
 /**
  * `stakes: normal (default …) · mode: autonomous` — one line, both halves flippable in one word; `plan first: …` when the flag stands (decision 15);
  * `queued #N of M` while the workload is in the intake queue (PLAN wl-mvbcjadqgblr7k D8, N from `queuePosition`);
- * the effective ceiling last (DESIGN-workload-ceiling.md § 2 item 5).
+ * the effective ceiling last (DESIGN-workload-ceiling.md § 2 item 5), or for a merge train its daily budget (`trainBudgetText`).
  */
 export function oneLiner(ledger: Ledger, workload: WorkloadStatusRow): string {
 	const p = oneLinerParts(ledger, workload);
-	return `${p.state} — flip either with one word: throwaway / normal / production, autonomous / user-driven · ceiling ${p.ceiling}`;
+	return `${p.state} — flip either with one word: throwaway / normal / production, autonomous / user-driven · ${p.limit}`;
 }
 
-/** The one-liner without its flip hint: `stakes: X · mode: Y[ · plan first: …][ · queued #N of M] · ceiling $A / Bh` (the wake line's core, and a "which one?" candidate, surface/extensions/surface-input.ts). */
+/** The one-liner without its flip hint: `stakes: X · mode: Y[ · plan first: …][ · queued #N of M] · ceiling $A / Bh` (a train: `· budget $L/PDT day · no wall[ · paused until <iso>]`; the wake line's core, and a "which one?" candidate, surface/extensions/surface-input.ts). */
 export function oneLinerCore(ledger: Ledger, workload: WorkloadStatusRow): string {
 	const p = oneLinerParts(ledger, workload);
-	return `${p.state} · ceiling ${p.ceiling}`;
+	return `${p.state} · ${p.limit}`;
 }
 
-function oneLinerParts(ledger: Ledger, workload: WorkloadStatusRow): { state: string; ceiling: string } {
+function oneLinerParts(ledger: Ledger, workload: WorkloadStatusRow): { state: string; limit: string } {
 	const flips = ledger.instructions(workload.id).filter((i) => i.kind === "mode-flip");
 	const lastFlip = flips[flips.length - 1];
 	const effective = ledger.entries(workload.id, "mode-effective");
@@ -83,7 +84,48 @@ function oneLinerParts(ledger: Ledger, workload: WorkloadStatusRow): { state: st
 	// D8: the queue tag ends with the first launch attempt (`queuedOf`); never a needs-you line, a queued ask waits by design.
 	const queued = queuedOf(control) !== null ? queuePosition(ledger, workload.id, ledger.now()) : null;
 	const queuedPart = queued ? ` · queued #${queued.position} of ${queued.of}` : "";
-	return { state: `stakes: ${workload.stakes} · mode: ${mode}${planPart}${queuedPart}`, ceiling: ceilingText(ceilingOf(ledger, workload.id)) };
+	const train = trainBudgetText(ledger, workload.id);
+	return { state: `stakes: ${workload.stakes} · mode: ${mode}${planPart}${queuedPart}`, limit: train ?? `ceiling ${ceilingText(ceilingOf(ledger, workload.id))}` };
+}
+
+// ---- a merge train's daily budget (PLAN wl-mvr888nftz0vcl D4, D5) ------------------------------------------------
+// A train has no ceiling and no wall: $150 per America/Los_Angeles day plus that day's `train-raise:` rows. The facts are
+// read here from the rows' own prefixes, the runner's `train-paused:` and the surface's `train-raise:`, with the writer
+// checked as the launch gate checks it; the gate itself (surface/src/train-budget.ts) decides launches, this only shows.
+
+const TRAIN_DAILY_USD = 150;
+const PDT_PARTS = new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit" });
+const TRAIN_PAUSED_RE = /^train-paused:\s+lane-\S+\s+day (\d{4}-\d{2}-\d{2}) usd (\S+) limit (\S+) pr ([1-9]\d*|none) until (\S+)$/;
+const TRAIN_RAISE_RE = /^train-raise:\s+day (\d{4}-\d{2}-\d{2}) usd (\S+) answer (\S+)$/;
+
+/**
+ * A merge train's limit part of the one-liner: `budget $<L>/PDT day · no wall`, L today's limit ($150 plus every valid
+ * `train-raise:` for today's PDT day), then ` · paused until <iso>` while the newest valid `train-paused:` runs past now and no
+ * raise for its day came after it. Null for a workload with no train membership (`trainMembers`): it keeps its ceiling.
+ */
+function trainBudgetText(ledger: Ledger, workloadId: string): string | null {
+	if (trainMembers(ledger.entries(workloadId), ledger.instructions(workloadId)).length === 0) return null;
+	const now = ledger.now();
+	const day = (type: string) => PDT_PARTS.formatToParts(new Date(now)).find((p) => p.type === type)!.value;
+	const today = `${day("year")}-${day("month")}-${day("day")}`;
+	let limit = TRAIN_DAILY_USD;
+	let paused: { day: string; until: string; at: number } | null = null;
+	const raises: { day: string; at: number }[] = [];
+	const rows = ledger.entries(workloadId, "assumption");
+	for (let at = 0; at < rows.length; at++) {
+		const e = rows[at]!;
+		const p = e.created_by === LANE_RUNNER_BY ? TRAIN_PAUSED_RE.exec(e.body.trim()) : null;
+		if (p && Number.isFinite(Date.parse(p[5]!))) paused = { day: p[1]!, until: p[5]!, at };
+		const r = e.created_by === SURFACE_BY ? TRAIN_RAISE_RE.exec(e.body.trim()) : null;
+		const usd = r ? Number(r[2]) : NaN;
+		if (r && Number.isFinite(usd) && usd > 0) {
+			raises.push({ day: r[1]!, at });
+			if (r[1] === today) limit += usd;
+		}
+	}
+	const p = paused;
+	const stillPaused = p !== null && Date.parse(p.until) > Date.parse(now) && !raises.some((r) => r.day === p.day && r.at > p.at);
+	return `budget $${Number(limit.toFixed(2))}/PDT day · no wall${p !== null && stillPaused ? ` · paused until ${when(p.until)}` : ""}`;
 }
 
 const when = (iso: string): string => iso.replace(/\.\d{3}Z$/, "Z");
@@ -139,7 +181,10 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 		const p = c.prefix === "spend" ? parseSpend(c.rest) : null;
 		return p ? [p] : [];
 	}).at(-1);
-	if (spend) {
+	// A merge train has no ceiling (PLAN wl-mvr888nftz0vcl D4): its total is shown alone; its budget is the one-liner's.
+	if (spend && trainMembers(ledger.entries(workload.id), ledger.instructions(workload.id)).length > 0) {
+		out.push(`spent $${Number(spend.usd.toFixed(2))} since open, every PDT day together`);
+	} else if (spend) {
 		const c = ceilingOf(ledger, workload.id);
 		out.push(`spent $${Number(spend.usd.toFixed(2))} of $${Number(c.usd.toFixed(2))} · ${Number(spend.wallMin.toFixed(1))} of ${c.wallMin} min`);
 	}

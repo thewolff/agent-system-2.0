@@ -21,6 +21,7 @@ import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_CAP_ENV, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
 import { labOf } from "../../classifier/src/lab";
 import { consumedByReady, openTrains } from "./merge-train";
+import { type TrainBudgetReason, type TrainBudgetRows, trainBudgetGate } from "./train-budget";
 import {
 	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, ESCALATION_BY, HOLD_HOURS, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
 } from "./types";
@@ -96,6 +97,7 @@ export const CONTROL_PREFIXES = [
 	"now", "ruling-conflict",
 	"land-first", "main-retry", "train-reconciled", "runner-preflight", "fast-plan", "fast-fallback", "status-failed",
 	"land-first-off-pending", "land-first-off-complete",
+	"train-paused", "train-meter-error", "train-rule", "train-raise",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -201,6 +203,11 @@ export const DRIVE_BACKUP_BY = "drive-backup";
  * the run's workload (surface/scripts/test-runner.ts): `fast-plan: <run id> <json>` (the admission's plan), `fast-fallback: <run id>
  * <reason>` (the one Mac fallback of the hosted fast check) and `status-failed: <run id> <state> on <sha>: <error>` (a refused final
  * post). `main-red:` is not one of them: a train holder writes `main-red: <url> run <id>` (surface/src/merge-train.ts D7).
+ * The permanent train's budget rows (PLAN wl-mvr888nftz0vcl D4, D7, D10; surface/src/train-budget.ts) on the train:
+ * `train-paused: <lane> day <d> usd <x> limit <L> pr <N|none> until <iso>`, `train-meter-error: <lane> <file>:<line> <reason>`
+ * and `train-rule: <lane> permanent budget 150 per PDT day max-time <spec>` are the runner's alone (LANE_RUNNER_BY), so a lane
+ * can neither lift its own pause nor forge one; `train-raise: day <d> usd <x> answer <id>` is the surface's alone, written with
+ * Jo's `raise <usd>` answer. None is lane-scoped here: `exitClass` never reads them as a lane's end intent.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -272,6 +279,10 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"fast-plan": [TEST_RUNNER_BY],
 	"fast-fallback": [TEST_RUNNER_BY],
 	"status-failed": [TEST_RUNNER_BY],
+	"train-paused": [LANE_RUNNER_BY],
+	"train-meter-error": [LANE_RUNNER_BY],
+	"train-rule": [LANE_RUNNER_BY],
+	"train-raise": [SURFACE_BY],
 };
 
 export interface ControlEntry {
@@ -495,7 +506,7 @@ export function instructionLine(i: InstructionRow): string {
  * `launchable` never returns them.
  */
 export type RankRefusal = `ranked: below ${string}` | `parallel: ${string}` | `queued: position ${number}`;
-export type LaunchReason = "closed" | "standing" | "due" | "withdrawn" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched" | RankRefusal;
+export type LaunchReason = "closed" | "standing" | "due" | "withdrawn" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched" | TrainBudgetReason | RankRefusal;
 export type LaunchVerdict = { launch: true; cause: Cause } | { launch: false; reason: LaunchReason };
 
 /** A holder under a lease that is null or not yet lapsed at `now`. */
@@ -518,10 +529,16 @@ export function heldLive(w: { holder: string | null; holder_lease_until: string 
  * A workload priority-paused (`priorityPausedOf`, PLAN wl-mv8wzytml878b4 D3) relaunches with cause
  * `priority <exit id>`, after first, request and resume; any later launch attempt ends that state, so it
  * is consumed once.
+ * A cap-exempt workload is a merge train, which runs under its daily budget (PLAN wl-mvr888nftz0vcl D5): right after the
+ * live-holder check, before any request, receipt or resolution is read, `trainBudgetGate` over `control` and `budget` (the
+ * train's questions and instructions, where Jo's answers are) refuses `budget-paused`, `budget-decision` or `meter-error`,
+ * so a request written while paused, a resolution, Jo's launch word before midnight and the tick all wait. A train's
+ * `ceiling:` rows are never read here. With no `budget` given no answer is read, so an episode only Jo's answer clears
+ * stays refused: the default fails closed.
  */
 export function launchable(
 	w: WorkloadRow, control: readonly ControlEntry[], receipt: string | null, resolved: readonly Resolution[], now: string, liveLanes: number, cap: number,
-	capExempt = false, withdrawn = false,
+	capExempt = false, withdrawn = false, budget: Pick<TrainBudgetRows, "questions" | "instructions"> = { questions: [], instructions: [] },
 ): LaunchVerdict {
 	if (w.status !== "open") return { launch: false, reason: "closed" };
 	if (w.id === STANDING_WORKLOAD_ID) return { launch: false, reason: "standing" };
@@ -529,6 +546,10 @@ export function launchable(
 	if (withdrawn) return { launch: false, reason: "withdrawn" };
 	if (w.mode !== "autonomous") return { launch: false, reason: "user-driven" };
 	if (heldLive(w, now)) return { launch: false, reason: "held" };
+	if (capExempt) {
+		const refused = trainBudgetGate({ workloadId: w.id, control, ...budget }, now);
+		if (refused !== null) return { launch: false, reason: refused.reason };
+	}
 	const tried = attempts(control);
 	const consumed = consumedIds(tried);
 	const req = control.find((c) => c.prefix === "launch-requested" && !consumed.has(c.id));
@@ -549,7 +570,7 @@ export function verdictOf(rows: ReserveRows): LaunchVerdict {
 	const control = controlEntries(rows.entries, holders);
 	return launchable(
 		rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap,
-		rows.capExempt, withdrawnBy(rows.entries, rows.instructions) !== null,
+		rows.capExempt, withdrawnBy(rows.entries, rows.instructions) !== null, { questions: rows.questions, instructions: rows.instructions },
 	);
 }
 
@@ -568,25 +589,28 @@ export function decideLaunch(rows: ReserveRows): ReserveVerdict {
 	return v.launch ? { launch: true, cause: causeText(v.cause) } : v;
 }
 
-export type InteractiveReason = "closed" | "standing" | "due" | "withdrawn" | "autonomous" | "held";
+export type InteractiveReason = "closed" | "standing" | "due" | "withdrawn" | "train-autonomous" | "autonomous" | "held";
 
 /**
  * The interactive policy (decision 8): Jo's `as2 lane <wl>` is the authority, so the cap and the
  * cause rules do not apply; refused on an autonomous workload and while any holder's lease is live.
  * A workload Jo withdrew (`withdrawn`, PLAN wl-mv8s939084z1ts D6) is refused after the closed/standing/due
- * checks, so no lease is taken on it by hand either.
+ * checks, so no lease is taken on it by hand either. A merge train (`train`, the rows' cap-exempt flag) is
+ * refused by hand in either mode, `train-autonomous` (PLAN wl-mvr888nftz0vcl D5): a by-hand session has no
+ * runner meter, so its daily budget could not hold.
  */
-export function interactiveVerdict(w: WorkloadRow, now: string, withdrawn = false): { launch: true } | { launch: false; reason: InteractiveReason } {
+export function interactiveVerdict(w: WorkloadRow, now: string, withdrawn = false, train = false): { launch: true } | { launch: false; reason: InteractiveReason } {
 	if (w.status !== "open") return { launch: false, reason: "closed" };
 	if (w.id === STANDING_WORKLOAD_ID) return { launch: false, reason: "standing" };
 	if (w.brief.startsWith(DUE_PREFIX)) return { launch: false, reason: "due" };
 	if (withdrawn) return { launch: false, reason: "withdrawn" };
+	if (train) return { launch: false, reason: "train-autonomous" };
 	if (w.mode !== "user-driven") return { launch: false, reason: "autonomous" };
 	if (heldLive(w, now)) return { launch: false, reason: "held" };
 	return { launch: true };
 }
 export function decideInteractive(rows: ReserveRows): ReserveVerdict {
-	const v = interactiveVerdict(rows.workload, rows.now, withdrawnBy(rows.entries, rows.instructions) !== null);
+	const v = interactiveVerdict(rows.workload, rows.now, withdrawnBy(rows.entries, rows.instructions) !== null, rows.capExempt);
 	return v.launch ? { launch: true, cause: "interactive" } : v;
 }
 
