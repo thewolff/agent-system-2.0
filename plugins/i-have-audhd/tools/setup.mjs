@@ -107,8 +107,7 @@ function onPath(bin) {
 
 function nodeCheck() {
   const here = spawnSync("node", ["--version"], { encoding: "utf8" });
-  const login = spawnSync("/bin/sh", ["-lc", "command -v node"], { encoding: "utf8" });
-  return { version: here.status === 0 ? here.stdout.trim() : null, login: login.status === 0 };
+  return { version: here.status === 0 ? here.stdout.trim() : null };
 }
 
 // { profile, error } — never prints the file's contents on a parse failure.
@@ -202,10 +201,6 @@ async function run(args, { ask }) {
     return 1;
   }
   console.log(`  node ${node.version} is on PATH.`);
-  if (!node.login) {
-    console.log("  Warning: a login shell (`sh -lc`) does not find node. OMP runs this plugin's hooks through");
-    console.log("  `sh -lc`, so under OMP no check would run. Add node's directory to PATH in your shell profile.");
-  }
 
   const path = defaultProfilePath();
   const { profile, error } = readProfile(path);

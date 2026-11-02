@@ -74,10 +74,26 @@
 // inside the CLI per invocation and effective within one turn. This adapter has none of its
 // own; one switch, one place.
 //
-// FAIL-OPEN CONTRACT. A dead adapter must be visible, never fatal: every failure path (CLI
-// crash, non-zero exit, unparseable stdout, timeout, any thrown error anywhere) returns
-// undefined and leaves one `omp-adapter fail-open: …` line in errors.log. That line is the
-// tally: `grep -c 'omp-adapter fail-open' errors.log`.
+// FAIL-OPEN CONTRACT: graceful to the user, loud to the operator. A dead adapter must be
+// visible, never fatal: every failure path (no usable node, CLI crash, non-zero exit,
+// unparseable stdout, timeout, any thrown error anywhere) returns undefined, so the session
+// goes on, and leaves one `omp-adapter fail-open (<hook>): …` line in errors.log naming the hook
+// and carrying the tail of the CLI's stderr. That line is the tally:
+// `grep -c 'omp-adapter fail-open' errors.log`. The person at the UI is told too, as an error
+// notice naming the hook, the evidence and the log: once per hook and failure kind, again
+// hourly while it keeps failing (saying since when), and at once after that hook succeeded and
+// broke again (createAlarm). With no UI attached the key stays unspent for a session that has
+// one.
+//
+// WHICH NODE. The hooks run under an absolute node path, never a login shell's PATH: `sh -lc
+// node` resolved node from the login profile, and where that profile lacks node every hook
+// exited 127, with its stderr discarded. resolveNode picks I_HAVE_AUDHD_NODE when set (an
+// explicit path that is not executable is an error, never a silent fallback), else the running
+// binary when the host is node, else the first executable `node` on the host's PATH, then
+// $HOME/.local/bin, /opt/homebrew/bin, /usr/local/bin, /usr/bin. OMP itself runs under Bun, so
+// the host's own binary is not node. Nothing found is a loud failure naming where it looked.
+// The node's directory leads the child's PATH, so a judge command with a `#!/usr/bin/env node`
+// shebang finds the same node.
 //
 // TIMEOUT: three budgets, nested so each settles inside the next.
 //   - OMP abandons a session_stop handler at 30s (EXTENSION_HANDLER_TIMEOUT_MS,
@@ -102,9 +118,9 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { accessSync, appendFileSync, constants, mkdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // The plugin root is this module's parent directory (omp/..), so the adapter finds its core
@@ -115,6 +131,14 @@ const INJECT_TIMEOUT_MS = 10_000;
 const PROMPT_TIMEOUT_MS = 3_000;
 const CONTEXT_MESSAGE_TYPE = "i-have-audhd-session-start";
 const WARNING_MESSAGE_TYPE = "i-have-audhd-warning";
+const STOP_HOOK = "i-have-audhd-stop.mjs";
+const INJECT_HOOK = "i-have-audhd-inject.mjs";
+const PROMPT_HOOK = "i-have-audhd-prompt.mjs";
+// How much of a CLI's stderr is held (its tail, where the reason is) and how much reaches the log.
+const STDERR_KEPT = 4_000;
+const STDERR_LOGGED = 300;
+// The re-alert interval for a failure that keeps failing.
+const REALERT_MS = 3_600_000;
 
 type StopEvent = {
   session_id?: unknown;
@@ -141,6 +165,8 @@ type HandlerDeps = {
   takeWarning?: (sessionId: unknown, cwd: string) => Promise<Warning | undefined>;
   // Hands a consumed warning to the host; the registration wires it to sendMessage + notify.
   deliver?: (warning: Warning, ctx: Ctx) => void;
+  // When the person is told about a failure; defaults to this module's one alarm.
+  alarm?: Alarm;
 };
 
 // The Claude Code SessionStart sources the inject hook understands.
@@ -235,24 +261,101 @@ function appendLog(dir: string, file: string, text: string): void {
   }
 }
 
-// The spawn, one shape for both hooks: sh -lc, node, payload on stdin, stdout parsed as JSON.
-// A non-zero exit or unparseable stdout REJECTS instead of dissolving into undefined, because
-// this adapter logs every fail-open rather than silently passing. The timeout lives here,
-// next to the child it has to kill. detached puts sh and node in one fresh process group, so
-// one negative-pid SIGKILL reaps them without touching the host's own group; each judge the
-// core spawns leads a group of its own, which the core reaps itself (judge/ask.mjs, CLEANUP).
-// The harness tag rides both children; only the stop core reads it.
+// A failure with a stable kind, so the alarm keys on what broke rather than on its wording.
+class HookError extends Error {
+  kind: string;
+  constructor(kind: string, message: string) {
+    super(message);
+    this.kind = kind;
+  }
+}
+
+type NodeChoice = { path: string; error?: undefined } | { path?: undefined; error: string };
+
+function isExecutableFile(path: string): boolean {
+  try {
+    accessSync(path, constants.X_OK);
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+// The node the hooks run under (WHICH NODE in the header). Pure over its inputs, for tests.
+export function resolveNode(opts: {
+  env: Record<string, string | undefined>;
+  execPath: string;
+  underBun: boolean;
+  home: string;
+  isExecutable: (path: string) => boolean;
+}): NodeChoice {
+  const { env, execPath, underBun, home, isExecutable } = opts;
+  const hint = "set I_HAVE_AUDHD_NODE to an absolute node path";
+  const explicit = env.I_HAVE_AUDHD_NODE;
+  if (explicit) {
+    return isExecutable(explicit)
+      ? { path: explicit }
+      : { error: `no usable node: I_HAVE_AUDHD_NODE=${explicit} is not an executable file; ${hint}` };
+  }
+  if (!underBun) return { path: execPath };
+  const onPath = (env.PATH ?? "").split(delimiter).filter(Boolean).map((dir) => join(dir, "node"));
+  const fallbacks = [join(home, ".local", "bin", "node"), "/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"];
+  const found = [...onPath, ...fallbacks].find((path) => isExecutable(path));
+  if (found) return { path: found };
+  return { error: `no usable node: none on PATH (${env.PATH ?? ""}) nor at ${fallbacks.join(", ")}; ${hint}` };
+}
+
+// Resolved once per PATH and I_HAVE_AUDHD_NODE pair, not once per spawn.
+let nodeCache: { key: string; choice: NodeChoice } | undefined;
+function hostNode(): NodeChoice {
+  const key = `${process.env.I_HAVE_AUDHD_NODE ?? ""}\0${process.env.PATH ?? ""}`;
+  if (nodeCache?.key !== key) {
+    nodeCache = {
+      key,
+      choice: resolveNode({
+        env: process.env,
+        execPath: process.execPath,
+        underBun: typeof process.versions.bun === "string",
+        home: homedir(),
+        isExecutable: isExecutableFile,
+      }),
+    };
+  }
+  return nodeCache.choice;
+}
+
+// The spawn, one shape for every hook: the resolved node, the hook path, payload on stdin, stdout
+// parsed as JSON. A non-zero exit or unparseable stdout REJECTS instead of dissolving into
+// undefined, because this adapter logs every fail-open rather than silently passing; the tail of
+// the CLI's stderr rides the rejection. The timeout lives here, next to the child it has to kill.
+// detached puts node in a fresh process group, so one negative-pid SIGKILL reaps it and anything
+// it started without touching the host's own group; each judge the core spawns leads a group of
+// its own, which the core reaps itself (judge/ask.mjs, CLEANUP). The harness tag rides every
+// child; only the stop core reads it.
 function spawnHook(hook: string, payload: string, cwd: string, timeoutMs: number): Promise<CliOutput | undefined> {
   const root = process.env.I_HAVE_AUDHD_PLUGIN_ROOT ?? DEFAULT_PLUGIN_ROOT;
+  const node = hostNode();
+  if (node.error !== undefined) return Promise.reject(new HookError("no-node", `omp-adapter: ${node.error}`));
+  const nodePath = node.path;
   const { promise, resolve, reject } = Promise.withResolvers<CliOutput | undefined>();
-  const child = spawn("sh", ["-lc", `node "${root}/hooks/${hook}"`], {
+  const child = spawn(nodePath, [join(root, "hooks", hook)], {
     cwd,
     detached: true,
-    env: { ...process.env, I_HAVE_AUDHD_HARNESS: "omp" },
-    stdio: ["pipe", "pipe", "ignore"],
+    env: {
+      ...process.env,
+      PATH: [dirname(nodePath), process.env.PATH].filter(Boolean).join(delimiter),
+      I_HAVE_AUDHD_HARNESS: "omp",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
   });
   let stdout = "";
+  let stderr = "";
   let settled = false;
+  // The rejection's detail, with the last STDERR_LOGGED characters of stderr when there are any.
+  const withStderr = (text: string): string => {
+    const tail = stderr.replace(/\s+/g, " ").trim().slice(-STDERR_LOGGED);
+    return tail ? `${text}; stderr: ${tail}` : text;
+  };
   const settle = (finish: () => void): void => {
     if (settled) return;
     settled = true;
@@ -265,25 +368,31 @@ function spawnHook(hook: string, payload: string, cwd: string, timeoutMs: number
     } catch {
       // the group already exited between the last event and this timer
     }
-    settle(() => reject(new Error(`omp-adapter: CLI timed out after ${timeoutMs}ms`)));
+    settle(() => reject(new HookError("timeout", withStderr(`omp-adapter: CLI timed out after ${timeoutMs}ms`))));
   }, timeoutMs);
   child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk: string) => {
     stdout += chunk;
   });
-  child.on("error", (err) => settle(() => reject(err)));
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr = (stderr + chunk).slice(-STDERR_KEPT);
+  });
+  child.on("error", (err: NodeJS.ErrnoException) =>
+    settle(() => reject(new HookError(`spawn-${err.code ?? "error"}`, `omp-adapter: could not start ${nodePath}: ${err.message}`))),
+  );
   child.on("close", (code, signal) =>
     settle(() => {
       if (code !== 0) {
         const detail = stdout.trim() ? `: ${collapse(stdout)}` : " with no output";
-        reject(new Error(`omp-adapter: CLI exited ${code ?? signal}${detail}`));
+        reject(new HookError(`exit-${code ?? signal}`, withStderr(`omp-adapter: CLI exited ${code ?? signal}${detail}`)));
       } else if (!stdout.trim()) {
         resolve(undefined); // the CLI's documented quiet path: no verdict, exit 0
       } else {
         try {
           resolve(JSON.parse(stdout) as CliOutput);
         } catch (err) {
-          reject(err);
+          reject(new HookError("unparseable-output", withStderr(err instanceof Error ? err.message : String(err))));
         }
       }
     }),
@@ -291,6 +400,74 @@ function spawnHook(hook: string, payload: string, cwd: string, timeoutMs: number
   child.stdin.on("error", () => {}); // a CLI that exits before reading stdin is not a crash
   child.stdin.end(payload);
   return promise;
+}
+
+// When the person hears about a failure: once per key, again after realertMs while it keeps
+// failing, at once after clear() (the thing healed). In memory, one per omp process: the host is
+// long-lived, so a fresh process telling its person once is the intended cadence.
+export type Alarm = {
+  raise(key: string, message: string, ctx: Ctx): void;
+  clear(prefix: string): void;
+};
+
+export function createAlarm(opts: { now?: () => number; realertMs?: number } = {}): Alarm {
+  const now = opts.now ?? Date.now;
+  const realertMs = opts.realertMs ?? REALERT_MS;
+  const raised = new Map<string, { first: number; last: number }>();
+  return {
+    raise(key, message, ctx) {
+      const notify = ctx.hasUI ? ctx.ui?.notify : undefined;
+      if (!notify) return; // nobody to tell: the key stays unspent
+      const t = now();
+      const seen = raised.get(key);
+      if (seen && t - seen.last < realertMs) return;
+      const first = seen?.first ?? t;
+      raised.set(key, { first, last: t });
+      notify(seen ? `${message} (still failing since ${new Date(first).toISOString()})` : message, "error");
+    },
+    clear(prefix) {
+      for (const key of [...raised.keys()]) if (key.startsWith(prefix)) raised.delete(key);
+    },
+  };
+}
+
+const defaultAlarm = createAlarm();
+
+// What a failure of each hook costs the person, in the alarm's words.
+const CONSEQUENCE: Record<string, string> = {
+  [STOP_HOOK]: "the agent's messages go unchecked",
+  [INJECT_HOOK]: "the rules were not loaded into this session",
+  [PROMPT_HOOK]: "a warning did not reach the agent",
+};
+
+// Every failure path ends here: one named errors.log line, and the alarm. Never throws; a notify
+// that throws is logged, not raised.
+function failOpen(stateDir: string, hook: string, err: unknown, ctx: Ctx, alarm: Alarm, where?: string): void {
+  const detail = err instanceof Error ? err.message : String(err);
+  const label = where ? `${hook}, ${where}` : hook;
+  appendLog(stateDir, "errors.log", `omp-adapter fail-open (${label}): ${detail}`);
+  const kind = err instanceof HookError ? err.kind : collapse(detail, 80);
+  try {
+    alarm.raise(
+      `${label}:${kind}`,
+      `i-have-audhd: ${label} failed, so ${CONSEQUENCE[hook]}: ${collapse(detail, 400)}. ` +
+        `Every failure is logged in ${join(stateDir, "errors.log")}.`,
+      ctx,
+    );
+  } catch (notifyErr) {
+    const why = notifyErr instanceof Error ? notifyErr.message : String(notifyErr);
+    appendLog(stateDir, "errors.log", `omp-adapter: could not notify about ${label}: ${why}`);
+  }
+}
+
+// A UI notice that cannot break the handler that sends it.
+function safeNotify(ctx: Ctx, stateDir: string, message: string, type: "info" | "warning" | "error"): void {
+  if (!ctx.hasUI) return;
+  try {
+    ctx.ui?.notify?.(message, type);
+  } catch (err) {
+    appendLog(stateDir, "errors.log", `omp-adapter: could not notify: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 // The prompt CLI's output as a Warning, or undefined when nothing was pending.
@@ -309,23 +486,24 @@ function asWarning(out: CliOutput | undefined): Warning | undefined {
 async function deliverPendingWarning(sessionId: unknown, ctx: Ctx, deps: HandlerDeps | undefined, stateDir: string): Promise<void> {
   const deliver = deps?.deliver;
   if (!deliver) return;
+  const alarm = deps?.alarm ?? defaultAlarm;
   try {
     const take =
       deps?.takeWarning ??
       (async (sid: unknown, cwd: string) =>
         asWarning(
           await spawnHook(
-            "i-have-audhd-prompt.mjs",
+            PROMPT_HOOK,
             JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: sid }),
             cwd,
             PROMPT_TIMEOUT_MS,
           ),
         ));
     const warning = await take(sessionId, ctx.cwd);
+    alarm.clear(`${PROMPT_HOOK}, warning delivery:`);
     if (warning) deliver(warning, ctx);
   } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    appendLog(stateDir, "errors.log", `omp-adapter fail-open (warning delivery): ${detail}`);
+    failOpen(stateDir, PROMPT_HOOK, err, ctx, alarm, "warning delivery");
   }
 }
 
@@ -334,32 +512,38 @@ async function deliverPendingWarning(sessionId: unknown, ctx: Ctx, deps: Handler
 // The session id the core and the own-block record see is the manager's (see the header's
 // ONE SESSION ID); the payload's provider id stands in only when the manager id is unreadable.
 // Once the core has answered, any warning it left pending is delivered (WARNINGS, header),
-// whether or not this stop also blocks.
+// whether or not this stop also blocks. A systemMessage from the core (a judge that could not
+// answer, said once per key by the core's own cadence, lib/alerts.mjs) goes to the person as a
+// UI warning.
 export async function sessionStopHandler(
   event: StopEvent,
   ctx: Ctx,
   deps?: HandlerDeps,
 ): Promise<{ decision: "block"; reason: string } | undefined> {
   const stateDir = deps?.stateDir ?? join(homedir(), ".claude", ".i-have-audhd-state"); // HOME at call time, like lib/state.mjs
+  const alarm = deps?.alarm ?? defaultAlarm;
   const sessionId = managerSessionId(ctx) ?? event.session_id;
   const key = typeof sessionId === "string" ? sessionId : "";
   const followsOwnBlock = !!event.stop_hook_active && blockedLastStop.has(key);
   blockedLastStop.delete(key); // re-added below only if this call blocks
   let result: { decision: "block"; reason: string } | undefined;
+  let notice: string | undefined;
   try {
-    const runCli: RunCli = deps?.runCli ?? ((p, cwd, ms) => spawnHook("i-have-audhd-stop.mjs", p, cwd, ms));
+    const runCli: RunCli = deps?.runCli ?? ((p, cwd, ms) => spawnHook(STOP_HOOK, p, cwd, ms));
     const payload = buildStopPayload({ ...event, session_id: sessionId, stop_hook_active: followsOwnBlock }, ctx.cwd);
     const verdict = await runCli(payload, ctx.cwd, deps?.timeoutMs ?? CLI_TIMEOUT_MS);
     if (verdict?.decision === "block" && typeof verdict.reason === "string" && verdict.reason) {
       blockedLastStop.add(key);
       result = { decision: "block", reason: verdict.reason };
     }
+    if (typeof verdict?.systemMessage === "string" && verdict.systemMessage) notice = verdict.systemMessage;
     // quiet or non-block verdict: nothing to gate, nothing to log
   } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    appendLog(stateDir, "errors.log", `omp-adapter fail-open: ${detail}`);
+    failOpen(stateDir, STOP_HOOK, err, ctx, alarm);
     return undefined;
   }
+  alarm.clear(`${STOP_HOOK}:`);
+  if (notice) safeNotify(ctx, stateDir, notice, "warning");
   await deliverPendingWarning(sessionId, ctx, deps, stateDir);
   return result;
 }
@@ -400,20 +584,24 @@ export async function sessionStartHandler(
 ): Promise<string | undefined> {
   if (ctx.agent?.kind === "sub") return undefined;
   const stateDir = deps?.stateDir ?? join(homedir(), ".claude", ".i-have-audhd-state");
+  const alarm = deps?.alarm ?? defaultAlarm;
   try {
-    const runCli: RunCli = deps?.runCli ?? ((p, cwd, ms) => spawnHook("i-have-audhd-inject.mjs", p, cwd, ms));
+    const runCli: RunCli = deps?.runCli ?? ((p, cwd, ms) => spawnHook(INJECT_HOOK, p, cwd, ms));
     const out = await runCli(buildStartPayload(source, ctx), ctx.cwd, deps?.timeoutMs ?? INJECT_TIMEOUT_MS);
-    if (out === undefined) return undefined; // I_HAVE_AUDHD_INJECT=off: the CLI's quiet path
+    if (out === undefined) {
+      alarm.clear(`${INJECT_HOOK}:`);
+      return undefined; // I_HAVE_AUDHD_INJECT=off: the CLI's quiet path
+    }
     const hso = out.hookSpecificOutput;
     const context = hso && typeof hso === "object" && "additionalContext" in hso ? hso.additionalContext : undefined;
-    if (typeof context !== "string") throw new Error("omp-adapter: inject CLI output carries no additionalContext");
-    if (ctx.hasUI && typeof out.systemMessage === "string" && out.systemMessage) {
-      ctx.ui?.notify?.(out.systemMessage, "warning");
+    if (typeof context !== "string") {
+      throw new HookError("no-additionalContext", "omp-adapter: inject CLI output carries no additionalContext");
     }
+    alarm.clear(`${INJECT_HOOK}:`);
+    if (typeof out.systemMessage === "string" && out.systemMessage) safeNotify(ctx, stateDir, out.systemMessage, "warning");
     return context || undefined;
   } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    appendLog(stateDir, "errors.log", `omp-adapter fail-open: ${detail}`);
+    failOpen(stateDir, INJECT_HOOK, err, ctx, alarm);
     return undefined;
   }
 }

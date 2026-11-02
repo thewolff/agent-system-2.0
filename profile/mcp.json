@@ -5,6 +5,17 @@
       "type": "stdio",
       "command": "ctx",
       "args": ["mcp", "serve"]
+    },
+    "linear": {
+      "type": "http",
+      "url": "https://mcp.linear.app/mcp"
+    },
+    "posthog": {
+      "type": "http",
+      "url": "https://mcp.posthog.com/mcp",
+      "headers": {
+        "x-posthog-mcp-mode": "cli"
+      }
     }
   }
 }

@@ -13,6 +13,7 @@ const NOW = Date.UTC(2026, 9, 14, 12, 0, 0);
 const MIN = 60_000;
 const WEEK_MIN = 7 * 24 * 60;
 const OPUS = "anthropic/claude-opus-5-5";
+const SONNET = "anthropic/claude-sonnet-5-5";
 const FABLE = "anthropic/claude-fable-5-1";
 const SOL = "openai-codex/gpt-6.1-sol";
 const KIMI = "moonshot/kimi-k2.7-code";
@@ -48,11 +49,11 @@ const expectRefused = (room: Headroom, comparators: readonly string[] = [OPUS], 
 
 describe("projected at reset, by the window's pace", () => {
 	test("half a 7d window gone at .50 projects exactly 1.00; below is in and above is out", () => {
-		expect(at([poll(0, [lim("anthropic", "7d", 0.5, WEEK_MIN / 2)])]).decisionFor(OPUS).out).toBe(
-			"anthropic 7d 0.50 used, window pace +0.6 pts/h, projected 1.00 at reset 2026-10-18T00:00Z",
+		expect(at([poll(0, [lim("openai-codex", "7d", 0.5, WEEK_MIN / 2)])]).decisionFor(SOL).out).toBe(
+			"openai-codex 7d 0.50 used, window pace +0.6 pts/h, projected 1.00 at reset 2026-10-18T00:00Z",
 		);
-		expect(at([poll(0, [lim("anthropic", "7d", 0.4995, WEEK_MIN / 2)])]).decisionFor(OPUS)).toEqual({ out: null, retained: null });
-		expect(at([poll(0, [lim("anthropic", "7d", 0.5005, WEEK_MIN / 2)])]).decisionFor(OPUS).out).not.toBeNull();
+		expect(at([poll(0, [lim("openai-codex", "7d", 0.4995, WEEK_MIN / 2)])]).decisionFor(SOL)).toEqual({ out: null, retained: null });
+		expect(at([poll(0, [lim("openai-codex", "7d", 0.5005, WEEK_MIN / 2)])]).decisionFor(SOL).out).not.toBeNull();
 	});
 
 	test("a steep recent rise under the window's pace stays in without an exceptional diagnostic", () => {
@@ -150,6 +151,145 @@ describe("projected at reset, by the window's pace", () => {
 		expect(at([poll(0, [lim("anthropic", "monthly", 0.99, 60)])]).decisionFor(OPUS).out).toBeNull();
 		for (const resetIn of [-1, 0]) {
 			expect(at([poll(0, [lim("anthropic", "7d", 1, resetIn)])]).decisionFor(OPUS).out).toBeNull();
+		}
+	});
+});
+
+describe("Anthropic weekly pace is advisory", () => {
+	for (const windowId of ["7d", "1w"]) {
+		for (const selector of [SONNET, OPUS]) {
+			test(`${selector} admits ${windowId} overpace including below .70 without comparison evidence`, () => {
+				for (const used of [0.21, 0.5, 0.69, 0.999]) {
+					const h = at([poll(0, [lim("anthropic", windowId, used, WEEK_MIN - 2016)])]);
+					expect(h.decisionFor(selector)).toEqual({ out: null, retained: null });
+					expect(h.decisionFor(selector, [SOL])).toEqual({ out: null, retained: null });
+				}
+			});
+			test(`${selector} still refuses ${windowId} exhaustion before and after warm-up`, () => {
+				for (const elapsed of [59, 60, 2015, 2016, WEEK_MIN / 2]) {
+					for (const used of [1, 1.01]) {
+						const h = at([poll(0, [lim("anthropic", windowId, used, WEEK_MIN - elapsed)])]);
+						expectRefused(h, [SOL], selector);
+						expect(h.decisionFor(selector).out).toContain(`anthropic ${windowId} ${used.toFixed(2)} used`);
+					}
+				}
+			});
+		}
+	}
+
+	test("tier-specific Anthropic weekly pace is advisory below exhaustion", () => {
+		const h = at([poll(0, [lim("anthropic", "7d", 0.99, WEEK_MIN - 2016, "fable")])]);
+		expect(h.decisionFor(FABLE)).toEqual({ out: null, retained: null });
+		expect(h.decisionFor(OPUS)).toEqual({ out: null, retained: null });
+	});
+
+	test("Anthropic weekly pace exemption preserves coexisting 5h ceiling and pace refusals in either order", () => {
+		const weekly = lim("anthropic", "7d", 0.69, WEEK_MIN - 2016);
+		for (const hard of [lim("anthropic", "5h", 0.81, 290), lim("anthropic", "5h", 0.21, 240)]) {
+			for (const selector of [SONNET, OPUS]) {
+				const ordinary = at([poll(0, [hard])]).decisionFor(selector);
+				for (const limits of [[weekly, hard], [hard, weekly]]) {
+					const h = at([poll(0, limits)]);
+					expectRefused(h, [SOL], selector);
+					expect(h.decisionFor(selector)).toEqual(ordinary);
+				}
+			}
+		}
+	});
+
+	test("Anthropic exhausted week preserves coexisting ordinary 5h refusal before weekly warm-up", () => {
+		const exhausted = lim("anthropic", "7d", 1, WEEK_MIN - 59);
+		for (const hard of [lim("anthropic", "5h", 0.81, 290), lim("anthropic", "5h", 0.21, 240)]) {
+			const ordinary = at([poll(0, [hard])]).decisionFor(OPUS);
+			for (const limits of [[exhausted, hard], [hard, exhausted]]) {
+				expect(at([poll(0, limits)]).decisionFor(OPUS, [SOL])).toEqual(ordinary);
+			}
+		}
+	});
+});
+
+describe("shared Anthropic weekly snapshot", () => {
+	test("exposes the newest fresh shared weekly meter without a decision call", () => {
+		const newest = lim("anthropic", "7d", 0.7, 5000);
+		const h = at([poll(0, [newest]), poll(1, [lim("anthropic", "7d", 0.9, 5000)])]);
+		expect(h.anthropicWeek).toEqual({ used: 0.7, resetsAt: newest.resetsAt });
+		expect(h.note).toBeNull();
+	});
+
+	test("equivalent weekly rows select highest usage and deterministic reset on ties", () => {
+		const rows = [
+			lim("anthropic", "7d", 0.7, 5000),
+			lim("anthropic", "1w", 0.8, 5000),
+			lim("anthropic", "7d", 0.8, 5000.5),
+		];
+		for (const limits of [rows, [...rows].reverse()]) {
+			expect(at([poll(0, limits)]).anthropicWeek).toEqual({ used: 0.8, resetsAt: NOW + 5000.5 * MIN });
+		}
+	});
+
+	test("freshness boundary is inclusive and future polls never supply a weekly snapshot", () => {
+		const weekly = lim("anthropic", "7d", 0.7, 5000);
+		expect(at([poll(15, [weekly])]).anthropicWeek).toEqual({ used: 0.7, resetsAt: weekly.resetsAt });
+		for (const age of [15.001, -0.001]) expect(at([poll(age, [weekly])]).anthropicWeek).toBeNull();
+	});
+
+	test("missing newest shared weekly meter does not reuse an older meter", () => {
+		expect(at([poll(1, [lim("anthropic", "7d", 0.7, 5000)]), poll(0, [claude(0.1)])]).anthropicWeek).toBeNull();
+	});
+
+	test("missing, malformed and old-format polls have no weekly snapshot", () => {
+		for (const lines of [[], ["not json", "{}"], [oldPoll(0, { "anthropic/7d": 0.7, "anthropic/1w": 0.8 })]]) {
+			expect(at(lines).anthropicWeek).toBeNull();
+		}
+	});
+
+	test("non-shared, other-provider, other-window, unknown-reset, expired and invalid rows cannot warn", () => {
+		const weekly = lim("anthropic", "7d", 0.7, 5000);
+		const invalid = [
+			{ ...weekly, tier: "fable" }, { ...weekly, provider: "openai-codex" },
+			{ ...weekly, windowId: "5h" }, { ...weekly, windowId: "monthly" },
+			...[null, NOW, NOW - 1, Number.NaN, Number.POSITIVE_INFINITY].map(resetsAt => ({ ...weekly, resetsAt })),
+			...[-0.01, 1.01, Number.NaN, Number.POSITIVE_INFINITY].map(usedFraction => ({ ...weekly, usedFraction })),
+		];
+		expect(at([poll(0, invalid)]).anthropicWeek).toBeNull();
+		expect(at([poll(0, [...invalid, weekly])]).anthropicWeek).toEqual({ used: 0.7, resetsAt: weekly.resetsAt });
+	});
+
+	for (const resetsAt of [8_640_000_000_000_001, NOW * 1e6]) {
+		for (const usedFraction of [0.70, 0.72, 1]) {
+			test(`finite out-of-Date-range reset ${resetsAt} at ${usedFraction} usage cannot supply a snapshot or change admission`, () => {
+				const weekly = { ...lim("anthropic", "7d", usedFraction, 5000), resetsAt };
+				const h = at([poll(0, [weekly])]);
+				expect(h.anthropicWeek).toBeNull();
+				expect(h.note).toBeNull();
+				expect(h.decisionFor(OPUS)).toEqual({
+					out: usedFraction === 1 ? "anthropic 7d 1.00 used, quota exhausted" : null,
+					retained: null,
+				});
+			});
+		}
+	}
+
+	test("the Date maximum reset remains valid and an invalid higher-use row cannot displace it", () => {
+		const weekly = { ...lim("anthropic", "7d", 0.70, 5000), resetsAt: 8_640_000_000_000_000 };
+		const invalid = { ...weekly, usedFraction: 0.99, resetsAt: NOW * 1e6 };
+		for (const limits of [[weekly], [weekly, invalid], [invalid, weekly]]) {
+			expect(at([poll(0, limits)]).anthropicWeek).toEqual({ used: 0.70, resetsAt: weekly.resetsAt });
+		}
+	});
+
+	test("malformed or missing tier identity cannot masquerade as a shared weekly meter", () => {
+		const weekly = lim("anthropic", "7d", 0.7, 5000);
+		for (const tier of [undefined, "", 7, {}, []]) {
+			const line = JSON.stringify({ t: NOW / 1000, limits: [{ ...weekly, tier }] });
+			expect(at([line]).anthropicWeek).toBeNull();
+		}
+	});
+
+	test("zero and exhausted shared meters remain valid snapshot observations", () => {
+		for (const used of [0, 1]) {
+			const weekly = lim("anthropic", "1w", used, 5000);
+			expect(at([poll(0, [weekly])]).anthropicWeek).toEqual({ used, resetsAt: weekly.resetsAt });
 		}
 	});
 });
@@ -379,10 +519,10 @@ describe("common sample interval and rate evidence", () => {
 });
 
 describe("tier binding and selector syntax", () => {
-	const lines = [poll(0, [lim("anthropic", "5h", 0.19, 120), lim("anthropic", "7d", 0.41, 3 * 24 * 60), lim("anthropic", "7d", 0.99, 3 * 24 * 60, "fable")])];
+	const lines = [poll(0, [lim("anthropic", "5h", 0.19, 120), lim("anthropic", "7d", 0.41, 3 * 24 * 60), lim("anthropic", "7d", 1, 3 * 24 * 60, "fable")])];
 	test("Fable's meter takes Fable out, not Opus; :level and whitespace do not change binding", () => {
 		const h = at(lines);
-		expect(h.decisionFor(FABLE).out).toMatch(/^anthropic 7d fable 0\.99 used, window pace \+1\.0 pts\/h, projected 1\.73 at reset /);
+		expect(h.decisionFor(FABLE).out).toMatch(/^anthropic 7d fable 1\.00 used, window pace \+1\.0 pts\/h, projected 1\.75 at reset /);
 		expect(h.decisionFor(` ${FABLE}:high `)).toEqual(h.decisionFor(FABLE));
 		expect(h.decisionFor(`${OPUS}:xhigh`)).toEqual({ out: null, retained: null });
 		expect(h.decisionFor("anthropic")).toEqual({ out: null, retained: null });
@@ -450,6 +590,7 @@ describe("fail-open and file read", () => {
 			const h = headroom({ now: NOW });
 			expect(h.decisionFor(OPUS)).toEqual({ out: null, retained: null });
 			expect(h.note).toBe(`headroom polls unreadable: ${missing} (ENOENT)`);
+			expect(h.anthropicWeek).toBeNull();
 		} finally {
 			if (prev === undefined) delete process.env.AS2_HEADROOM_POLLS;
 			else process.env.AS2_HEADROOM_POLLS = prev;

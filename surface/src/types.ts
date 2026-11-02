@@ -131,7 +131,7 @@ export const ESCALATION_BY = "escalation";
 export const STANDING_WORKLOAD_ID = "wl-orchestrator";
 export const STANDING_BRIEF = "orchestrator standing workload: identity and scheduled rows (never closed)";
 /**
- * The standing slice on the standing workload (MIGRATION.md item 105): every QUESTION the
+ * The standing slice on the standing workload (MIGRATION.md item 105): every question the
  * orchestrator puts to Jo is a `questions` row on it, so the row exists before Jo sees the ask,
  * Jo answers it by id, `stuck-question` counts it and a restart re-renders it. The insert trigger
  * (schema.sql questions_insert_workload) needs an open or paused slice; this one is ensured with
@@ -215,7 +215,7 @@ export const LEDGER_TOOL = "orchestrator_ledger";
 export const LAUNCH_LANE_TOOL = "orchestrator_launch_lane";
 /** Lower a workload's ceiling; raising is Jo's (DESIGN-workload-ceiling.md § 2 item 2; surface/extensions/ceiling.ts). */
 export const LOWER_CEILING_TOOL = "orchestrator_lower_ceiling";
-/** Ask Jo a question as a `questions` row on the standing slice, before the QUESTION block names its id (MIGRATION.md item 105; surface/extensions/question.ts). */
+/** Ask Jo a question as a `questions` row on the standing slice, before the closing ask names its id (MIGRATION.md item 105; surface/extensions/question.ts). */
 export const RAISE_QUESTION_TOOL = "orchestrator_raise_question";
 /** Reply to another agent's channel message, and mark channel messages acted on (PLAN wl-mv8vx7wdj5nx1c D4; surface/extensions/agent-channel.ts). */
 export const CHANNEL_REPLY_TOOL = "orchestrator_reply";
@@ -228,7 +228,7 @@ export const SURFACE_TOOLS = [
 export const SURFACE_READ_TOOLS = [WAKE_READ_TOOL, LEDGER_TOOL] as const;
 /**
  * Surface tools that move a workload on — open, close, schedule — refused on the orchestrator while
- * a QUESTION it sent Jo about an open workload has no instruction row newer than it (P-11 row 15,
+ * a question it sent Jo about an open workload has no instruction row newer than it (P-11 row 15,
  * M7 fix round 2, finding B).
  */
 export const HAND_ON_TOOLS = [OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, LAUNCH_LANE_TOOL] as const;

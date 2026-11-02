@@ -15,6 +15,7 @@ import {
 	type SliceRow, TEST_RUNNER_BY, type WorkloadRow,
 } from "../../ledger/src/index";
 import { type CleanShellRead, cleanShellOn } from "../../gates/src/clean-shell";
+import { checkHowItFails, HOW_IT_FAILS_HEADING, HOW_IT_FAILS_NA_LINE } from "../../gates/src/how-it-fails";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_CAP_ENV, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
@@ -91,9 +92,11 @@ export const CONTROL_PREFIXES = [
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
 	"queued",
-	"lane-metrics", "daily-report",
+	"lane-metrics", "daily-report", "drive-backup",
 	"now", "ruling-conflict",
 	"auto-applied", "auto-applied-result", "auto-apply-tripped", "routine-recorded", "ruling-notice-failed",
+	"land-first", "main-retry", "train-reconciled", "runner-preflight", "fast-plan", "fast-fallback", "status-failed",
+	"land-first-off-pending", "land-first-off-complete",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -106,6 +109,8 @@ const LANE_SCOPED: Record<string, true> = {
 export const SCRATCH_SWEEP_BY = "scratch-sweep";
 /** The daily self-heal report's `created_by` (surface/scripts/daily-report.ts), on the standing workload. */
 export const DAILY_REPORT_BY = "daily-report";
+/** The Drive backup jobs' needs-you writer's `created_by` (surface/scripts/drive-backup-notice.ts), on the standing workload. */
+export const DRIVE_BACKUP_BY = "drive-backup";
 /**
  * Fixed writers per prefix (§ 5). `lane-stop`, `plan` and `done-because` are refined in `validWriter`. The
  * starter writes `lane-started:` / `lane-exit:` for the interactive lane it runs in Jo's terminal
@@ -198,6 +203,15 @@ export const DAILY_REPORT_BY = "daily-report";
  * <evidence>` (on the standing workload) a trip that turns auto-apply off until Jo's `auto-routine`, `routine-recorded: <slice> <record
  * line>` a record-and-announce question ruling `routine-calls` decided, and `ruling-notice-failed: <q-…> <error>` a decided question
  * whose notice failed, so it was raised. `routineOn` reads the first three; a look-alike by anyone else is no control entry.
+ * Land-first's rows (PLAN wl-mvq4edbaf13vnk § 2, D12) are on the standing workload: `land-first: <repo> on|off <instruction id>` and
+ * `main-retry: <repo> <instruction id>` are the surface's alone, Jo's words written after his instruction in one transaction
+ * (`landFirstOn` reads the first). Off also writes the surface's `land-first-off-pending: <repo> <instruction id>` there;
+ * only the tick's `land-first-off-complete: <repo> <instruction id>` clears that request, after revocation under the publication mutex.
+ * `train-reconciled: …` is the train tick's alone (MERGE_TRAIN_BY, D6), which the merge hold reads;
+ * `runner-preflight: ok|refused <reason> source <sha> root <path>` is the runner's alone (TEST_RUNNER_BY, D5), and so are its D4 rows on
+ * the run's workload (surface/scripts/test-runner.ts): `fast-plan: <run id> <json>` (the admission's plan), `fast-fallback: <run id>
+ * <reason>` (the one Mac fallback of the hosted fast check) and `status-failed: <run id> <state> on <sha>: <error>` (a refused final
+ * post). `main-red:` is not one of them: a train holder writes `main-red: <url> run <id>` (surface/src/merge-train.ts D7).
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -258,6 +272,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	queued: [SURFACE_BY],
 	"lane-metrics": [LANE_RUNNER_BY],
 	"daily-report": [DAILY_REPORT_BY],
+	"drive-backup": [DRIVE_BACKUP_BY],
 	now: [ESCALATION_BY],
 	"ruling-conflict": [ESCALATION_BY],
 	"auto-applied": [ESCALATION_BY],
@@ -265,6 +280,15 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"auto-apply-tripped": [ESCALATION_BY],
 	"routine-recorded": [ESCALATION_BY],
 	"ruling-notice-failed": [ESCALATION_BY],
+	"land-first": [SURFACE_BY],
+	"land-first-off-pending": [SURFACE_BY],
+	"land-first-off-complete": [MERGE_TRAIN_BY],
+	"main-retry": [SURFACE_BY],
+	"train-reconciled": [MERGE_TRAIN_BY],
+	"runner-preflight": [TEST_RUNNER_BY],
+	"fast-plan": [TEST_RUNNER_BY],
+	"fast-fallback": [TEST_RUNNER_BY],
+	"status-failed": [TEST_RUNNER_BY],
 };
 
 export interface ControlEntry {
@@ -985,6 +1009,15 @@ export const PLAN_REQUIREMENTS_SHAPE = [
 	`(R ids unique; the split is at the last \` => \`; an enforcer is a kind, ${ENFORCER_KINDS.join(" / ")}, exactly one space and a locator that starts with no whitespace and holds no \`;\`, enforcers separated by \`; \`, none twice; a prompt-only part is exactly \`prompt-only: \` then its reason and is never mixed with enforcers; at least one requirement)`,
 ].join("\n");
 
+/**
+ * The plan file's "How it fails" rule as a plan-first lane's first prompt and `lane_raise_question` render it (Jo 2026-10-28,
+ * issue #334 item 2; the matcher is gates/src/how-it-fails.ts): `planQuestionProblem` refuses a plan file without it.
+ */
+export const PLAN_HOW_IT_FAILS_LINE =
+	`The plan file also carries a "How it fails" section: a \`${HOW_IT_FAILS_HEADING}\` heading (any level) with at least one line under it naming the errors the work can hit, ` +
+	`where each one surfaces, the recovery step and the retry bound; for trivial work, the line \`${HOW_IT_FAILS_NA_LINE}\` instead, and that use is recorded. ` +
+	"The plan question is refused while the plan file has neither; fix the file and raise the question again.";
+
 /** The literal start of a prompt-only enforcer part (PLAN wl-mv8vwb04cy18n4 D1): `prompt-only`, a colon and exactly one space. */
 const PROMPT_ONLY_PREFIX = "prompt-only: ";
 
@@ -1088,7 +1121,8 @@ export const PLAN_FILE_MAX_BYTES = 262144;
  * be read. PLAN wl-mv8vwb04cy18n4 D3: the structural problems come first, the first one wins; then an unreadable
  * plan file, or one whose text is over PLAN_FILE_MAX_BYTES bytes (so a longer file, cut at the extra byte, is
  * refused before any of it is parsed); then the plan file's requirements (`requirementsProblem`, every offender
- * named); then the prompt-only ids against the file's (missing, extra and duplicate ids each named), joined with `; `.
+ * named); then the prompt-only ids against the file's (missing, extra and duplicate ids each named); then the plan file's "How it fails"
+ * section (gates/src/how-it-fails.ts, Jo 2026-10-28, issue #334 item 2), all joined with `; `.
  */
 export function planQuestionProblem(body: string, isFile: (path: string) => boolean, readFile: (path: string) => string | null): string | null {
 	const lines = body.split("\n");
@@ -1129,7 +1163,10 @@ export function planQuestionProblem(body: string, isFile: (path: string) => bool
 	if (text === null) return `the plan file could not be read: "${path}"`;
 	if (Buffer.byteLength(text, "utf8") > PLAN_FILE_MAX_BYTES) return `the plan file is over ${PLAN_FILE_MAX_BYTES} bytes`;
 	const req = requirementsProblem(text);
-	if (req.problem !== null) return req.problem;
+	// Issue #334 item 2: the plan file carries a "How it fails" section (or the n/a line); the refusal names the heading it expects,
+	// beside a requirements problem when there is one, so a single resubmission can fix both.
+	const fails = checkHowItFails(text, `the plan file ${path}`);
+	if (req.problem !== null) return fails.ok ? req.problem : `${req.problem}; ${fails.reason}`;
 	// D2: the body's prompt-only ids equal the file's exactly, or the body is exactly PROMPT_ONLY_NONE when the file has none.
 	const want = new Set(req.promptOnly);
 	const problems: string[] = [];
@@ -1143,6 +1180,7 @@ export function planQuestionProblem(body: string, isFile: (path: string) => bool
 	if (extra.length > 0) problems.push(`it has a prompt-only line for ${extra.join(", ")}, which the plan file does not mark prompt-only`);
 	const twice = [...new Set(listed.filter((id, i) => listed.indexOf(id) !== i))];
 	if (twice.length > 0) problems.push(`it has more than one prompt-only line for ${twice.join(", ")}`);
+	if (!fails.ok) problems.push(fails.reason);
 	return problems.length > 0 ? problems.join("; ") : null;
 }
 
@@ -1320,6 +1358,105 @@ export function prBindings(entries: readonly EntryRow[], instructions: readonly 
 		out.push({ word, prs, instructionId, entryId: c.id, createdAt: c.createdAt });
 	}
 	return out;
+}
+
+// ---- land-first activation and main retries (PLAN wl-mvq4edbaf13vnk § 2 Activation, Attempts; D12) ----------------
+
+/** Jo's word that turns land-first on or off for a repository: `land-first <repo> on|off`. */
+export const LAND_FIRST_WORD = "land-first";
+/** Jo's word that opens a main commit's next attempt block once the runner is repaired: `main-retry <repo>`. */
+export const MAIN_RETRY_WORD = "main-retry";
+/** A repository as Jo names it: `<name>` or `<owner>/<name>`, GitHub's characters. */
+export const REPO_WORD_RE = /^[A-Za-z0-9][\w.-]*(?:\/[A-Za-z0-9][\w.-]*)?$/;
+
+/**
+ * Two repository words name one repository: equal without case, or one is `<owner>/<name>` and the other its `<name>`
+ * (Jo says `agent-system-2.0`; the runner's config names `thewolff/agent-system-2.0`).
+ */
+export function sameRepo(a: string, b: string): boolean {
+	const x = a.toLowerCase();
+	const y = b.toLowerCase();
+	return x === y || x.endsWith(`/${y}`) || y.endsWith(`/${x}`);
+}
+
+/** Jo's instruction body for `land-first <repo> on|off`, which `land-first:` names. */
+export function landFirstInstructionBody(repo: string, on: boolean): string {
+	return `${LAND_FIRST_WORD} ${repo} ${on ? "on" : "off"}`;
+}
+/** `land-first: <repo> on|off <instruction id>`: the surface's record on the standing workload, after Jo's instruction in one transaction. */
+export function landFirstBody(repo: string, on: boolean, instructionId: string): string {
+	return `${LAND_FIRST_WORD}: ${repo} ${on ? "on" : "off"} ${instructionId}`;
+}
+/** Off has two phases: the surface requests revocation, and the tick completes it under the publication mutex. */
+export function landFirstOffBody(repo: string, state: "pending" | "complete", instructionId: string): string {
+	return `land-first-off-${state}: ${repo} ${instructionId}`;
+}
+/** Jo's instruction body for `main-retry <repo>`, which `main-retry:` names. */
+export function mainRetryInstructionBody(repo: string): string {
+	return `${MAIN_RETRY_WORD} ${repo}`;
+}
+/** `main-retry: <repo> <instruction id>`: the surface's record on the standing workload, after Jo's instruction in one transaction. */
+export function mainRetryBody(repo: string, instructionId: string): string {
+	return `${MAIN_RETRY_WORD}: ${repo} ${instructionId}`;
+}
+
+/**
+ * The valid `land-first:` or `main-retry:` entries on the standing workload, oldest first: written by the surface
+ * (`controlEntries` drops any other writer's copy) and naming Jo's instruction on the standing workload, written by
+ * the surface, whose body is exactly the word's (`landFirstInstructionBody`, `mainRetryInstructionBody`).
+ */
+function joRepoEntries(
+	entries: readonly EntryRow[], instructions: readonly InstructionRow[], prefix: "land-first" | "main-retry",
+): { repo: string; on: boolean; instructionId: string; createdAt: string }[] {
+	const out: { repo: string; on: boolean; instructionId: string; createdAt: string }[] = [];
+	for (const c of controlEntries(entries)) {
+		if (c.prefix !== prefix) continue;
+		const on = entries.find((e) => e.id === c.id)?.workload_id;
+		const m = prefix === "land-first" ? /^(\S+) (on|off) (\S+)$/.exec(c.rest) : /^(\S+)() (\S+)$/.exec(c.rest);
+		if (!m || on !== STANDING_WORKLOAD_ID || !REPO_WORD_RE.test(m[1]!)) continue;
+		const state = m[2] === "on";
+		const body = prefix === "land-first" ? landFirstInstructionBody(m[1]!, state) : mainRetryInstructionBody(m[1]!);
+		const ins = instructions.find((x) => x.id === m[3]);
+		if (!ins || ins.workload_id !== on || ins.kind !== "instruction" || ins.author !== "jo" || ins.created_by !== SURFACE_BY || ins.body !== body) continue;
+		out.push({ repo: m[1]!, on: state, instructionId: ins.id, createdAt: c.createdAt });
+	}
+	return out;
+}
+
+/**
+ * Land-first is on for `repo` when the newest valid word says on and no off reconciliation remains.
+ * A later on does not cancel unfinished revocation. Legacy off words without pending markers stay off.
+ * Pass standing entries/instructions: the runner, tick, merge hold and lane extension all read it here.
+ */
+export function landFirstOn(entries: readonly EntryRow[], instructions: readonly InstructionRow[], repo: string): boolean {
+	return (joRepoEntries(entries, instructions, "land-first").filter((e) => sameRepo(e.repo, repo)).at(-1)?.on ?? false)
+		&& landFirstOffPending(entries, instructions, repo).length === 0;
+}
+
+/** Valid, unfinished off instruction ids, oldest first. Completion of one id never clears a newer off. */
+export function landFirstOffPending(entries: readonly EntryRow[], instructions: readonly InstructionRow[], repo: string): string[] {
+	const words = joRepoEntries(entries, instructions, "land-first").filter((e) => !e.on && sameRepo(e.repo, repo));
+	const pending = new Set<string>();
+	for (const c of controlEntries(entries)) {
+		if (c.prefix !== "land-first-off-pending" && c.prefix !== "land-first-off-complete") continue;
+		if (entries.find((e) => e.id === c.id)?.workload_id !== STANDING_WORKLOAD_ID) continue;
+		const m = /^(\S+) (\S+)$/.exec(c.rest);
+		if (!m || !REPO_WORD_RE.test(m[1]!) || !sameRepo(m[1]!, repo)) continue;
+		if (!words.some((w) => w.instructionId === m[2] && w.repo === m[1])) continue;
+		if (c.prefix === "land-first-off-pending") pending.add(m[2]!);
+		else pending.delete(m[2]!);
+	}
+	return [...pending];
+}
+
+/** A normal merge is guarded while activation is on OR an off request is not yet reconciled. */
+export function landFirstHeld(entries: readonly EntryRow[], instructions: readonly InstructionRow[], repo: string): boolean {
+	return landFirstOn(entries, instructions, repo) || landFirstOffPending(entries, instructions, repo).length > 0;
+}
+
+/** The ledger times of Jo's valid `main-retry:` entries for `repo`, oldest first: what opens a main commit's next attempt block (§ 2 Attempts). */
+export function mainRetries(entries: readonly EntryRow[], instructions: readonly InstructionRow[], repo: string): string[] {
+	return joRepoEntries(entries, instructions, "main-retry").filter((e) => sameRepo(e.repo, repo)).map((e) => e.createdAt);
 }
 
 /**
@@ -1737,6 +1874,7 @@ export function firstPrompt(p: PromptInput): string {
 		// PLAN wl-mv8vwb04cy18n4 D4: the requirements grammar reaches plan-first lanes only, from the one constant.
 		out.push(`The plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section that names, for each requirement, its enforcer or why it is prompt-only, in this grammar; a plan file without it, or with a line the check cannot parse, is refused:`);
 		out.push(PLAN_REQUIREMENTS_SHAPE);
+		out.push(PLAN_HOW_IT_FAILS_LINE);
 		out.push(
 			"Change slices are refused until Jo approves. At normal stakes a plan that passes cross-lab review starts on its own unless flow repair is up: when the latest review round on the plan slice passed wholly on labs other than the builder's, `lane_raise_question` approves the plan instead of asking, Jo gets a notice, and you add your change slices.",
 		);

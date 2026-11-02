@@ -192,7 +192,7 @@ describe("needs-you kind `scratch` (§ 1.5, § 1.6)", () => {
 		ledger.recordEntry({ by: "lane-x", workloadId: wl, kind: "assumption", body: `${SCRATCH_ENTRY.overCap} 9999.0 MiB over the 2048 MiB cap at /h/s/${wl}` });
 		expect(scratchLines(ledger)).toEqual([]);
 		const en = ledger.recordEntry({ by: "lane-a", workloadId: wl, kind: "assumption", body: `${SCRATCH_ENTRY.overCap} 3000.0 MiB over the 2048 MiB cap at /h/s/${wl}` });
-		const line = { kind: "scratch", workloadId: wl, rowId: en, line: `scratch of ${wl} over its cap: 3000.0 MiB over the 2048 MiB cap at /h/s/${wl} (advisory: nothing is refused; lane-a was told)` };
+		const line = { kind: "scratch", workloadId: wl, rowId: en, next: "advisory: nothing is refused", line: `scratch of ${wl} over its cap: 3000.0 MiB over the 2048 MiB cap at /h/s/${wl} (advisory: nothing is refused; lane-a was told)` };
 		expect(scratchLines(ledger)).toEqual([line]);
 		// a forged clear from anyone but a holder (here the surface) does not hide it
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: `${SCRATCH_ENTRY.underCap} 1.0 MiB within the 2048 MiB cap at /h/s/${wl}` });
@@ -210,7 +210,7 @@ describe("needs-you kind `scratch` (§ 1.5, § 1.6)", () => {
 		const en = disk(SWEEP_BY, `${SCRATCH_ENTRY.disk} 12000.5 MiB under /h passes 10240 MiB (AGENT_SYSTEM_SCRATCH_TOTAL_MB); report /r.md`);
 		expect(scratchLines(ledger)).toEqual([
 			{
-				kind: "scratch", workloadId: STANDING_WORKLOAD_ID, rowId: en,
+				kind: "scratch", workloadId: STANDING_WORKLOAD_ID, rowId: en, next: "the daily sweep clears this line once the total is back under",
 				line: "scratch disk: 12000.5 MiB under /h passes 10240 MiB (AGENT_SYSTEM_SCRATCH_TOTAL_MB); report /r.md — the daily sweep clears this line once the total is back under",
 			},
 		]);

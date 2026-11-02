@@ -20,6 +20,7 @@ import { join } from "node:path";
 import type { Ledger, MessageRow, MessageState } from "../../ledger/src/index";
 import { homeDir } from "../../ledger/src/locality";
 import { type HeartbeatOf, commandShaped, interpret, parseBatch, stripTail } from "./input";
+import { LAND_FIRST_WORD, MAIN_RETRY_WORD } from "./launch";
 import { readPairSuggestConfig } from "./pair-suggest";
 import { MODE_WORDS, ORCHESTRATOR_RECIPIENT, STAKES_WORDS, STANDING_WORKLOAD_ID } from "./types";
 
@@ -301,6 +302,7 @@ export function proposalOf(ledger: Ledger, line: string): { target: string; word
 /** First words of Jo's surface commands and answers, for the command-shaped mark (D3, D5). */
 const COMMAND_WORDS = new Set<string>([
 	...STAKES_WORDS, ...MODE_WORDS, "approve", "deny", "withdraw", "ceiling", "rounds", "stop-reviews", "cancel-slice", "supersede", "test-pr", "train", "extend", "pair",
+	LAND_FIRST_WORD, MAIN_RETRY_WORD,
 ]);
 
 /**

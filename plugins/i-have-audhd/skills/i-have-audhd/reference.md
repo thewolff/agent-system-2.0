@@ -234,9 +234,10 @@ command. **A vocabulary check, labeled as one** — hence warn by default.
   judge.
 - **`checks/sections.mjs`** — the units `conclusion-first` and `bad-news-first` judge.
   `splitLabeledSections(text)` → `[{label, line, text}]`. A label line is a prose line
-  (never fenced, commented or quoted) that is exactly one bold label from `PMDW`, `CLAIM`,
-  `CITE`, `GUESS`, `ACTION`, `QUESTION`, optionally with a basis inside the bold
-  (`**GUESS(inference)**`) and a trailing colon; an inline or bulleted bold label is not.
+  (never fenced, commented or quoted) that is exactly one bold label, `CLAIM` or `CITE`,
+  optionally with a parenthetical inside the bold (`**CITE(vendor docs)**`) and a trailing
+  colon; an inline or bulleted bold label is not. The retired output-types labels (`PMDW`,
+  `GUESS`, `ACTION`, `QUESTION`) are ordinary prose since 1.5.0 and open nothing.
   No label line → one unit, the whole text, judged as before 1.1.0. Otherwise the text before
   the first label is a preamble unit and each label line opens a unit running to the next;
   the label line is dropped from the unit, and a heading, blank or rule run directly above a
@@ -297,13 +298,15 @@ command. **A vocabulary check, labeled as one** — hence warn by default.
 - **Command** from `enforcement.judgeCommand`: with a `{prompt}` placeholder, the prompt is
   shell-escaped into the command; without one, the prompt is piped to the command's stdin.
   `null`/absent = judge rules inactive (the hook logs fired triggers to `skipped.log`).
-- **Output**: STDOUT ONLY is captured (judges print banners on stderr; merging the streams
-  puts noise in front of the JSON). The LAST JSON object on stdout is the verdict; a
+- **Output**: STDOUT ONLY is parsed (judges print banners on stderr; merging the streams
+  puts noise in front of the JSON; stderr's tail goes to the failure log). The LAST JSON object on stdout is the verdict; a
   `{"type":"result","result":"…"}` envelope is unwrapped one level. The verdict must be
   strictly `{"violation": <boolean>, "reason": <string>}`.
-- **Failures** — timeout, non-zero exit, unparseable output — return
-  `{violation: false, error: …}` plus a `judge-failures.log` line. Fail-open, fail-loud-
-  in-log. Failures are never cached.
+- **Failures** — timeout, non-zero exit, a judge that cannot start, unparseable output —
+  return `{unavailable: true, error: …}` with no verdict, plus a `judge-failures.log` line
+  carrying the tail of the judge's stderr. The Stop hook reports the rule as "Judge
+  unavailable" in the rule's own mode, never as a pass, and tells the person once per rule and
+  error, then hourly (`lib/alerts.mjs`). Failures are never cached.
 - **Timeout** — 30s on Claude Code; 20s when the stop core runs under the OMP adapter's
   `I_HAVE_AUDHD_HARNESS=omp` tag, because OMP drops a `session_stop` handler's result at 30s
   and the adapter kills the core at 25s. Nothing in the profile changes either value.

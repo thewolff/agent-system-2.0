@@ -6,7 +6,10 @@
 // once-per-turn record.
 //
 // THE CHECK. A main-session turn that read the ask-graham skill must end in a line
-// `**Verdict:** <one of VERDICTS>`, unless it ends by asking the comparables question and waiting.
+// `**Verdict:** <one of VERDICTS>`, unless it ends by asking the comparables question and waiting,
+// or it is a structure check: a turn whose first use of the skill declared one (skillUse) and whose
+// reply opens with `**Structure check:**` and then a `**Found:**` or `**No similar:**` line
+// (SKILL.md "When it runs").
 // A turn that did not read the skill, or whose only uses of it were settings invocations (`/ask-graham intensity`, `/ask-graham stop-check`), is not checked.
 // The adapters skip the check entirely when the stop-check setting is off. The check blocks at most once per
 // turn: the caller keeps the opener id of the turn it last blocked and passes it back as
@@ -148,6 +151,14 @@ function isSkillPath(path) {
   return /^skill:\/\/(?:[^/]+\/)?ask-graham(?:\/SKILL\.md)?$/.test(p) || /(?:^|\/)ask-graham\/SKILL\.md$/.test(p);
 }
 
+// A read of the structure-check marker beside SKILL.md: `skill://[<ns>/]ask-graham/structure-check.md`
+// or any path ending `/ask-graham/structure-check.md`. Reading it declares a structure check.
+function isStructurePath(path) {
+  if (typeof path !== "string") return false;
+  const p = path.replace(/:[^/]*$/, "");
+  return /^skill:\/\/(?:[^/]+\/)?ask-graham\/structure-check\.md$/.test(p) || /(?:^|\/)ask-graham\/structure-check\.md$/.test(p);
+}
+
 // The `User: <args>` line OMP's user-invocation template ends a skill prompt with.
 function userLine(text) {
   const lines = text.split(/\r?\n/).filter((l) => l.startsWith("User: "));
@@ -157,25 +168,43 @@ function userLine(text) {
 // Invocation args that ask for a settings subcommand: `intensity` or `stop-check`, optionally
 // followed by more.
 const isSettings = (args) => typeof args === "string" && /^(?:intensity|stop-check)(?:\s|$)/i.test(args.trim());
+// Invocation args that declare a structure check: `structure-check`, optionally followed by more.
+const isStructure = (args) => typeof args === "string" && /^structure-check(?:\s|$)/i.test(args.trim());
 
 /**
- * Whether a turn read the ask-graham skill, and whether every such use was a settings
- * invocation. Reading counts as: a Claude Code Skill tool call or `/ask-graham` slash command, an
- * OMP user-invoked `/skill:ask-graham`, or a file read (Claude Code Read, OMP read) of the skill.
- * A skill body pasted into an ordinary prompt does not count. Returns `{ read, settingsOnly }`;
- * settingsOnly is true iff read is, and every use was an invocation whose args start with
- * `intensity` or `stop-check`. A file read, or an invocation with no args or other args, makes it false.
+ * Whether a turn read the ask-graham skill, whether every such use was a settings invocation, and
+ * whether it is a structure check. Reading counts as: a Claude Code Skill tool call or
+ * `/ask-graham` slash command, an OMP user-invoked `/skill:ask-graham`, or a file read (Claude Code
+ * Read, OMP read) of the skill or its structure-check marker. A skill body pasted into an ordinary
+ * prompt does not count. Returns `{ read, settingsOnly, structureCheck }`; settingsOnly is true iff
+ * read is, and every use was an invocation whose args start with `intensity` or `stop-check`. A
+ * file read, or an invocation with no args or other args, makes it false. structureCheck is true
+ * iff the turn's first use that is not a settings invocation declared one (invocation args
+ * starting `structure-check`, or a read of structure-check.md) and no use was an ordinary
+ * invocation (no args, or args other than settings or `structure-check`). A first use that reads
+ * SKILL.md or invokes the skill otherwise makes it a full check, and a later marker read cannot
+ * change that.
  */
 export function skillUse(turn) {
   let read = false;
   let settingsOnly = true;
-  const invoked = (a) => {
-    read = true;
-    if (!isSettings(a)) settingsOnly = false;
-  };
-  const fileRead = () => {
+  let first = null; // "structure" or "full": the first use that is not a settings invocation
+  let ordinary = false;
+  const use = (kind) => {
     read = true;
     settingsOnly = false;
+    first ??= kind;
+  };
+  const invoked = (a) => {
+    read = true;
+    if (isSettings(a)) return;
+    if (isStructure(a)) return use("structure");
+    ordinary = true;
+    use("full");
+  };
+  const pathRead = (path) => {
+    if (isSkillPath(path)) use("full");
+    else if (isStructurePath(path)) use("structure");
   };
   for (const e of turn?.entries ?? []) {
     if (e.type === "user" && isOpener(e)) {
@@ -194,12 +223,12 @@ export function skillUse(turn) {
       for (const b of content) {
         if (!isObject(b)) continue;
         if (b.type === "tool_use" && b.name === "Skill" && isSkillName(b.input?.skill)) invoked(b.input?.args);
-        else if (b.type === "tool_use" && b.name === "Read" && isSkillPath(b.input?.file_path)) fileRead();
-        else if (b.type === "toolCall" && b.name === "read" && isSkillPath(b.arguments?.path)) fileRead();
+        else if (b.type === "tool_use" && b.name === "Read") pathRead(b.input?.file_path);
+        else if (b.type === "toolCall" && b.name === "read") pathRead(b.arguments?.path);
       }
     }
   }
-  return { read, settingsOnly: read && settingsOnly };
+  return { read, settingsOnly: read && settingsOnly, structureCheck: first === "structure" && !ordinary };
 }
 
 /**
@@ -229,6 +258,17 @@ export const BLOCK_REASON =
   `\`**Verdict:** <verdict>\` naming exactly one of: ${VERDICTS.join(", ")} (SKILL.md step 5). ` +
   "Reply with the verdict line and anything it changes only; do not resend the whole answer.";
 
+/** The reason a structure check's block gives: its two opening lines (SKILL.md "When it runs"). */
+export const STRUCTURE_BLOCK_REASON =
+  "ask-graham: this turn is a structure check, but the reply does not open with its two lines. Start it with " +
+  "`**Structure check:** <the new structure>`, then on the next line either `**Found:** <each match, with a file:line " +
+  "receipt and how it overlaps>` or `**No similar:** <the parent, and what was searched>`. " +
+  "Reply with those lines and anything they change only; do not resend the whole answer.";
+
+// A structure check's reply: `**Structure check:** <text>` as its first line, then, as the next
+// non-blank line, `**Found:** <text>` or `**No similar:** <text>`.
+const STRUCTURE_REPLY = /^\*\*Structure check:\*\*[ \t]*\S[^\n]*\n(?:[ \t]*\n)*\*\*(?:Found|No similar):\*\*[ \t]*\S/;
+
 /**
  * The Stop check for one stop. `entries` is the parsed transcript, `text` the final assistant
  * text (when absent, the last assistant text on the turn), `blockedOpener` the turn opener id
@@ -237,7 +277,8 @@ export const BLOCK_REASON =
  * Returns `{ block: <reason>, opener }` when the stop must be blocked, which the caller records
  * as its new blockedOpener, or `{ pass: <why>, opener }` otherwise, `why` being one of
  * "no-turn", "no-skill-read", "settings" (every skill use was a settings invocation),
- * "verdict", "comparables-question", "already-blocked". `opener` is the turn opener's id, or null with "no-turn".
+ * "verdict", "structure-check", "comparables-question", "already-blocked". `opener` is the turn
+ * opener's id, or null with "no-turn". A structure check's block gives STRUCTURE_BLOCK_REASON.
  */
 export function checkStop({ entries, text, blockedOpener = null } = {}) {
   const turn = currentTurn(entries);
@@ -247,13 +288,27 @@ export function checkStop({ entries, text, blockedOpener = null } = {}) {
   if (!use.read) return { pass: "no-skill-read", opener };
   if (use.settingsOnly) return { pass: "settings", opener };
   const finalText = typeof text === "string" && text.trim() ? text : lastAssistantText(turn);
-  if (findVerdict(finalText)) return { pass: "verdict", opener };
-  // Only the exact question on the final line signals a wait, not a quotation or a report
-  // mentioning it. Use the same final text as the verdict check in both harnesses.
+  const done = use.structureCheck ? structureDone(finalText) : fullDone(finalText);
+  if (done) return { pass: done, opener };
+  if (blockedOpener !== null && blockedOpener === opener) return { pass: "already-blocked", opener };
+  return { block: use.structureCheck ? STRUCTURE_BLOCK_REASON : BLOCK_REASON, opener };
+}
+
+// A structure check is done only by its own shape: the reply opens with the label and its outcome
+// line. A verdict or the comparables question does not stand in for it (SKILL.md "When it runs").
+function structureDone(finalText) {
+  return typeof finalText === "string" && STRUCTURE_REPLY.test(finalText.trimStart().replace(/\r\n/g, "\n"))
+    ? "structure-check"
+    : null;
+}
+
+// A full check is done by a verdict line, or by waiting on the comparables question: only the exact
+// question on the final line signals a wait, not a quotation or a report mentioning it.
+function fullDone(finalText) {
+  if (findVerdict(finalText)) return "verdict";
   if (typeof finalText === "string" &&
       /(?:^|\n)[ \t]*Do you want me to research and see if something comparable exists\?[ \t]*$/.test(finalText.trimEnd())) {
-    return { pass: "comparables-question", opener };
+    return "comparables-question";
   }
-  if (blockedOpener !== null && blockedOpener === opener) return { pass: "already-blocked", opener };
-  return { block: BLOCK_REASON, opener };
+  return null;
 }

@@ -6,7 +6,7 @@
 import { canonicalCall } from "./pair-call";
 import { checkQuestionDispatch } from "./rows/question";
 import { checkTierName } from "./rows/r04-tier-name";
-import { checkBriefFields } from "./rows/r05-brief-fields";
+import { checkBriefFields, checkCard } from "./rows/r05-brief-fields";
 import { checkReserved } from "./rows/r06-reserved";
 import type { WakeRead } from "./rows/r07-wake-read";
 import { checkPushRebase, type TestRecords } from "./rows/r08-push-rebase";
@@ -45,6 +45,8 @@ export function checkToolCall(asCalled: ToolCall, ctx: CallContext, deps: GateDe
 	if (typed) return typed;
 	const wake = deps.wake?.check(call);
 	if (wake) return wake;
+	// Issue #334 item 2: a paired lane's change card carries a "How it fails" section, in a session bound to a workload.
+	if (call.toolName === "pair_propose") return deps.workload ? checkCard(call.input).refusal : null;
 	if (call.toolName === "task") {
 		return (
 			checkTierName(call.input) ??

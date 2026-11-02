@@ -1,5 +1,5 @@
 /**
- * The seven self-heal detectors (PLAN wl-mvbcjageg7o2yo § 2.3), pure: each one reads inputs
+ * The eight self-heal detectors (PLAN wl-mvbcjageg7o2yo § 2.3), pure: each one reads inputs
  * `read.ts` has already gathered and returns findings; nothing here touches a file, the ledger
  * or the clock. The thresholds are this plan's choice and every summary states the one it used.
  *
@@ -10,7 +10,7 @@
  *   pair straddling `from` is reported once, in the window holding its second event.
  * - One finding per subject: per burst (compaction-loop), per routing (hand-lab), per message
  *   (paste-drop), per question (ceiling-wall), per sha (flaky-test), per report (jetsam), per lane
- *   (model-start).
+ *   (model-start), per server and failure (mcp-load).
  */
 import { labOf } from "../../../classifier/src/lab";
 import type { DetectorId, Finding, Window } from "./types";
@@ -126,6 +126,17 @@ export interface JetsamReport {
 	largest: { name: string; pages: number } | null;
 }
 
+/** One `MCP tool load failed` line from an OMP log of the profile: the server it names and its error. */
+export interface McpLoadFailure {
+	/** The log file and its 1-based line. */
+	path: string;
+	line: number;
+	at: string;
+	/** The server name, `mcp:` stripped. */
+	server: string;
+	error: string;
+}
+
 export interface DetectorInputs {
 	compactionSessions: CompactionSession[];
 	orchestratorSessions: OrchestratorSession[];
@@ -138,6 +149,8 @@ export interface DetectorInputs {
 	laneModels: LaneModelSet[];
 	/** `unreadable`: the directory or the report files that could not be read (each counted, never as zero events). */
 	jetsam: { reports: JetsamReport[]; unreadable: string[] };
+	/** `profile`: the OMP profile whose logs were read; `unreadable`: its logs directory or the logs that could not be read (never as zero failures). */
+	mcpLoad: { profile: string; failures: McpLoadFailure[]; unreadable: string[] };
 }
 
 // ---- the detectors -----------------------------------------------------------------------------
@@ -326,6 +339,69 @@ export function modelStart(starts: readonly LaneStart[], models: readonly LaneMo
 	return out;
 }
 
+/** The failure an MCP load error names: `HTTP <status>` when it carries one, else its first 80 characters. */
+export function mcpFailureKind(error: string): string {
+	const http = /^HTTP (\d{3})\b/.exec(error);
+	if (http) return `HTTP ${http[1]}`;
+	const line = error.split("\n")[0]!.trim();
+	return line.length > 80 ? `${line.slice(0, 79)}…` : line;
+}
+
+/** OMP's default profile: an empty name or `default` (pi-utils dirs.ts normalizeProfileName), kept in `~/.omp` rather than `~/.omp/profiles/<name>`. */
+export function isDefaultOmpProfile(profile: string): boolean {
+	const p = profile.trim();
+	return p === "" || p === "default";
+}
+
+/** The variables besides OMP_PROFILE that pick OMP's profile or agent dir (pi-utils dirs.ts): PI_PROFILE is OMP_PROFILE's fallback. */
+const OMP_DIR_ENV_CLEARS = "-u PI_PROFILE -u PI_CODING_AGENT_DIR -u PI_CONFIG_DIR";
+
+/** The command that starts OMP in `profile` whatever the caller's environment: OMP_PROFILE cleared for the default profile and set for any other, and every other profile or agent-dir variable cleared. */
+export function ompLaunch(profile: string): string {
+	return isDefaultOmpProfile(profile)
+		? `env -u OMP_PROFILE ${OMP_DIR_ENV_CLEARS} omp`
+		: `env ${OMP_DIR_ENV_CLEARS} OMP_PROFILE=${profile.trim()} omp`;
+}
+
+/** The summary of the one finding unreadable OMP logs give. */
+export const MCP_LOAD_UNREADABLE = "mcp-load: OMP logs unreadable";
+
+/**
+ * mcp-load: a server OMP could not load in the profile, so its tools were missing from every session
+ * that started then. One finding per server and failure kind, at its last failure in the window,
+ * counting the failures in the window. These are past events: a login that failed then may work now
+ * (OMP refreshed it, or it was redone), so an HTTP 401 or 403 says the login's current health is
+ * unknown and points at the check, never at reauthentication. And one `mcp-load: OMP logs unreadable`
+ * when the logs directory or any log could not be read.
+ */
+export function mcpLoad(input: DetectorInputs["mcpLoad"], w: Window): Finding[] {
+	const from = ms(w.from);
+	const to = ms(w.to);
+	const groups = new Map<string, McpLoadFailure[]>();
+	for (const f of input.failures) {
+		if (ms(f.at) < from || ms(f.at) >= to) continue;
+		const key = `${f.server}\u0000${mcpFailureKind(f.error)}`;
+		const list = groups.get(key);
+		if (list) list.push(f);
+		else groups.set(key, [f]);
+	}
+	const out: Finding[] = [];
+	for (const list of groups.values()) {
+		const sorted = [...list].sort((a, b) => ms(a.at) - ms(b.at));
+		const first = sorted[0]!;
+		const last = sorted[sorted.length - 1]!;
+		const kind = mcpFailureKind(last.error);
+		const login = kind === "HTTP 401" || kind === "HTTP 403"
+			? `; current login health unknown until a live load: start \`${ompLaunch(input.profile)}\` and see whether ${last.server} loads`
+			: "";
+		out.push(finding("mcp-load", last.at, null, null,
+			`mcp-load: ${last.server} failed to load ${sorted.length} time(s) in the window in profile ${input.profile}: ${kind}${login}`,
+			sorted.length === 1 ? `${first.path}:${first.line}` : `${first.path}:${first.line} .. ${last.path}:${last.line}`));
+	}
+	if (input.unreadable.length > 0) out.push(finding("mcp-load", w.from, null, null, MCP_LOAD_UNREADABLE, input.unreadable.join(", ")));
+	return out;
+}
+
 /** Every detector over `inputs`, the findings outside `[from, to)` dropped, oldest first. */
 export function runDetectors(inputs: DetectorInputs, window: Window): Finding[] {
 	const all = [
@@ -336,6 +412,7 @@ export function runDetectors(inputs: DetectorInputs, window: Window): Finding[] 
 		...flakyTest(inputs.testRuns),
 		...jetsam(inputs.jetsam, window),
 		...modelStart(inputs.laneStarts, inputs.laneModels),
+		...mcpLoad(inputs.mcpLoad, window),
 	];
 	const from = ms(window.from);
 	const to = ms(window.to);

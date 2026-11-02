@@ -11,7 +11,7 @@
 //     `daily-report:` entry (its body's `window <from>..<to>`), else 24 h before the run, and never more than
 //     7 days before the run (the report says so when capped). A kickstart or a late wake run neither gaps nor
 //     overlaps, and a job re-enabled after weeks does not stream weeks of session files.
-//  2. The seven detectors (surface/src/selfheal/read.ts readDetectorInputs, detectors.ts runDetectors) and the
+//  2. The eight detectors (surface/src/selfheal/read.ts readDetectorInputs, detectors.ts runDetectors) and the
 //     counts (surface/src/selfheal/counts.ts: lane deaths by cause, lapsed leases, held messages on closed
 //     workloads, lane runs) over that window. The profile whose sessions are read is AGENT_SYSTEM_PROFILE, then
 //     OMP_PROFILE, then `agent-system-2`.

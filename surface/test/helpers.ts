@@ -13,6 +13,18 @@ import type { SurfaceAPI } from "../src/types";
 
 export const tmp = (tag: string): string => mkdtempSync(join(tmpdir(), `surface-${tag}-`));
 
+/** A "How it fails" section a fixture brief or plan ends with, so the open tool and the plan question accept it (issue #334 item 2). */
+export const HOW_IT_FAILS = "\n## How it fails\n- a step fails: it surfaces in that step's output; fix it and retry, once";
+
+/**
+ * Fixture source: an expression whose value is a `Bun.spawn(["/usr/bin/true"], <options>)` subprocess still unreaped when the
+ * call returns, for fixtures that then block their event loop to hold the child as a zombie. Measured on bun 1.3.14, about a
+ * third of these calls return with the child already exited and reaped (`exitCode` set), leaving no zombie at all; the
+ * expression spawns again until one returns with `exitCode` null, and throws after 50 tries.
+ */
+export const unreapedTrue = (options = "{}"): string =>
+	`(() => { for (let i = 0; i < 50; i++) { const c = Bun.spawn(["/usr/bin/true"], ${options}); if (c.exitCode === null) return c; } throw new Error("50 Bun.spawn(/usr/bin/true) calls returned with the child already reaped"); })()`;
+
 /** A settable clock: `at(iso)` moves it; every ledger write stamps the current value. */
 export function clock(start = "2026-10-01T10:00:00.000Z"): { now: () => string; at: (iso: string) => void; plusHours: (h: number) => void } {
 	let t = start;

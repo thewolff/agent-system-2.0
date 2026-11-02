@@ -21,7 +21,7 @@ import {
 } from "../src/rank-launch";
 import { RANK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import * as laneScript from "../scripts/lane";
-import { ctxOf, fakePi, laneIdOf, tempLedger, tempRepo } from "./helpers";
+import { ctxOf, fakePi, HOW_IT_FAILS, laneIdOf, tempLedger, tempRepo } from "./helpers";
 
 const SHOW: RankConfig = { mode: "show", parallelBudgetUsd: 0 };
 const ORDER: RankConfig = { mode: "order", parallelBudgetUsd: 0 };
@@ -188,7 +188,7 @@ function surface(o: SurfaceOptions) {
 	const ctx = ctxOf();
 	/** Jo's ask through the open tool (the world's `open` writes a workload row directly). */
 	const ask = async (brief: string, extra: Record<string, unknown> = {}) => {
-		const r = await f.tool("orchestrator_open_workload").execute("1", { brief, done: "it is done", stakes: "normal", repo: REPO_A, ...extra }, undefined, undefined, ctx);
+		const r = await f.tool("orchestrator_open_workload").execute("1", { brief: `${brief}${HOW_IT_FAILS}`, done: "it is done", stakes: "normal", repo: REPO_A, ...extra }, undefined, undefined, ctx);
 		return { id: (r.details as { id?: string } | undefined)?.id ?? null, text: r.content[0]!.text, details: r.details as { intake?: unknown; queued?: string | null } | undefined };
 	};
 	const input = (words: string) => {

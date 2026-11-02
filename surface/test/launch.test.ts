@@ -13,7 +13,7 @@ import {
 	PLAN_FILE_MAX_BYTES, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_SHAPE, planAutoApprovedBody, planFirst, planFirstBody, planHaltedBody, planQuestionProblem, prBindingInstructionBody,
 	PRIORITY_REASON_PREFIX, priorityPausedOf, priorityPausingOf, requirementsProblem, reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
 	testPrBody, testPrInstructionBody, type Resolution, resumePlan, resumeSession, TRAIN_LANDS_LINE, TRAIN_LANDS_PRODUCTION_LINE, verdictOf, waivedPrs, waivePrBody, waivePrInstructionBody,
-	withdrawInstructionBody, withdrawnBody, withdrawnBy,
+	withdrawInstructionBody, withdrawnBody, withdrawnBy, landFirstBody, landFirstInstructionBody, landFirstOn, mainRetries, mainRetryBody, mainRetryInstructionBody, sameRepo,
 } from "../src/launch";
 import { consumedByReady, TRAIN_LAUNCH_LIMIT, TRAIN_LAUNCH_OPTIONS, trainLaunchFailures, type TrainLaunchRows } from "../src/merge-train";
 import type { CleanShellRead } from "../../gates/src/clean-shell";
@@ -599,13 +599,16 @@ describe("requirementsProblem: the plan file's `## Requirements` section (PLAN w
 describe("planQuestionProblem reads the plan file (PLAN wl-mv8vwb04cy18n4 D2, D3, R3)", () => {
 	const PATH = "/plans/PLAN.md";
 	const REVIEW = "review: approve-as-is, openai-codex/gpt-6-sol, /plans/PLAN-REVIEW-r1.md";
-	const WITH = ["# PLAN", "## Requirements", "- R1: x => test a", "- R2: y => prompt-only: prose no code can judge", "- R3: z => prompt-only: a one-time live observation"].join("\n");
-	const WITHOUT = ["# PLAN", "## Requirements", "- R1: x => test a"].join("\n");
+	const FAILS = ["## How it fails", "- the build breaks: it surfaces in the run; fix it and rebuild, once"];
+	const WITH = ["# PLAN", ...FAILS, "## Requirements", "- R1: x => test a", "- R2: y => prompt-only: prose no code can judge", "- R3: z => prompt-only: a one-time live observation"].join("\n");
+	const WITHOUT = ["# PLAN", ...FAILS, "## Requirements", "- R1: x => test a"].join("\n");
 	/** `head` padded with `pad` to exactly `bytes` UTF-8 bytes (`pad` one byte or more, dividing the gap). */
 	const sized = (head: string, bytes: number, pad = "x") => `${head}${pad.repeat((bytes - Buffer.byteLength(head)) / Buffer.byteLength(pad))}`;
 	const SIZED_HEAD = `${WITHOUT}\n## Slices\n`;
 	const files: Record<string, string> = {
-		[PATH]: WITH, "/plans/PLAN-none.md": WITHOUT, "/plans/PLAN-bad.md": "# PLAN\n## Requirements\n- R1: no enforcer\n",
+		[PATH]: WITH, "/plans/PLAN-none.md": WITHOUT, "/plans/PLAN-bad.md": `# PLAN\n${FAILS.join("\n")}\n## Requirements\n- R1: no enforcer\n`,
+		"/plans/PLAN-no-fails.md": "# PLAN\n## Requirements\n- R1: x => test a\n## How it fails\n\n## Slices\n- a",
+		"/plans/PLAN-na.md": "# PLAN\nHow it fails: n/a, a one-line docs fix\n## Requirements\n- R1: x => test a",
 		"/plans/PLAN-max.md": sized(SIZED_HEAD, PLAN_FILE_MAX_BYTES),
 		"/plans/PLAN-over.md": sized(SIZED_HEAD, PLAN_FILE_MAX_BYTES + 1),
 		"/plans/PLAN-over-bad.md": sized("# PLAN\n## Requirements\n- R1: no enforcer\n## Slices\n", PLAN_FILE_MAX_BYTES + 1),
@@ -662,6 +665,18 @@ describe("planQuestionProblem reads the plan file (PLAN wl-mv8vwb04cy18n4 D2, D3
 		const wide = sized(SIZED_HEAD, PLAN_FILE_MAX_BYTES + 2 + (Buffer.byteLength(SIZED_HEAD) % 2), "é");
 		expect(wide.length).toBeLessThan(PLAN_FILE_MAX_BYTES);
 		expect(planQuestionProblem(["/plans/PLAN-wide.md", "- sl-1: the one slice", "prompt-only: none", "tradeoff: one", REVIEW].join("\n"), () => true, () => wide)).toContain(`${PLAN_FILE_MAX_BYTES} bytes`);
+	});
+
+	test("issue #334 item 2: a plan file with no How it fails section (or an empty one) is refused naming the heading and the n/a line; the n/a line passes", () => {
+		const refused = check("/plans/PLAN-no-fails.md", ["prompt-only: none"]);
+		expect(refused).toContain('the plan file /plans/PLAN-no-fails.md has no "How it fails" section');
+		expect(refused).toContain("`## How it fails`");
+		expect(refused).toContain("`How it fails: n/a, <reason>`");
+		expect(check("/plans/PLAN-na.md", ["prompt-only: none"])).toBeNull();
+		// a requirements problem and a missing section are both named in one refusal, so one resubmission can fix both
+		const both = planQuestionProblem(["/plans/x.md", "- sl-1: s", "prompt-only: none", "tradeoff: one", REVIEW].join("\n"), () => true, () => "# PLAN\n## Requirements\n- R1: no enforcer\n");
+		expect(both).toContain("R1");
+		expect(both).toContain('"How it fails"');
 	});
 });
 
@@ -1127,5 +1142,62 @@ describe("priority pause: the state and its cause (PLAN wl-mv8wzytml878b4 D3, T4
 		const rows = [...first.rows, ...second.rows];
 		expect(priorityPausedOf(control(rows))).toEqual({ laneId: "lane-m-2", forWl: X, exitId: second.ex.id });
 		expect(verdict(rows)).toEqual({ launch: true, cause: { kind: "priority", exitId: second.ex.id } });
+	});
+});
+
+describe("land-first rows: writers and activation (PLAN wl-mvq4edbaf13vnk D12, R32, R33)", () => {
+	let t = 0;
+	const at = () => `2026-10-27T10:${String(++t).padStart(2, "0")}:00.000Z`;
+	const row = (by: string, body: string): EntryRow => ({ ...entry(by, body), workload_id: STANDING_WORKLOAD_ID, created_at: at() } as EntryRow);
+	const jo = (id: string, body: string, over: Partial<InstructionRow> = {}): InstructionRow => ({
+		id, workload_id: STANDING_WORKLOAD_ID, slice_id: null, kind: "instruction", question_id: null, disposition: null, channel: "surface", author: "jo", body,
+		created_by: SURFACE_BY, created_at: NOW, ...over,
+	} as InstructionRow);
+
+	test("each new prefix counts only from its one writer", () => {
+		const writers: [string, string][] = [
+			[landFirstBody("agent-system-2.0", true, "in-1"), SURFACE_BY],
+			[mainRetryBody("agent-system-2.0", "in-1"), SURFACE_BY],
+			["train-reconciled: pr 17 merged", MERGE_TRAIN_BY],
+			[`runner-preflight: ok source ${"a".repeat(40)} root /r`, TEST_RUNNER_BY],
+		];
+		for (const [body, writer] of writers) {
+			for (const by of [SURFACE_BY, MERGE_TRAIN_BY, TEST_RUNNER_BY, "lane-m-1", ESCALATION_BY]) {
+				expect(controlEntries([row(by, body)]).length).toBe(by === writer ? 1 : 0);
+			}
+			// a lane holding the workload cannot write one either
+			expect(controlEntries([row("lane-m-1", body)], ["lane-m-1"])).toEqual([]);
+			expect<string | null>(reservedPrefix(body)).toBe(body.slice(0, body.indexOf(":")));
+		}
+	});
+
+	test("landFirstOn: off with no entry; the newest valid entry wins; an entry naming a forged or mismatched instruction is skipped", () => {
+		const instructions = [jo("in-1", landFirstInstructionBody("agent-system-2.0", true)), jo("in-2", landFirstInstructionBody("agent-system-2.0", false))];
+		expect(landFirstOn([], instructions, "agent-system-2.0")).toBe(false);
+		const onRow = row(SURFACE_BY, landFirstBody("agent-system-2.0", true, "in-1"));
+		const offRow = row(SURFACE_BY, landFirstBody("agent-system-2.0", false, "in-2"));
+		expect(landFirstOn([onRow], instructions, "agent-system-2.0")).toBe(true);
+		expect(landFirstOn([onRow, offRow], instructions, "agent-system-2.0")).toBe(false);
+		// newest says on but names the off instruction: skipped, the older off stands
+		expect(landFirstOn([onRow, offRow, row(SURFACE_BY, landFirstBody("agent-system-2.0", true, "in-2"))], instructions, "agent-system-2.0")).toBe(false);
+		// newest names an instruction that is not there
+		expect(landFirstOn([offRow, row(SURFACE_BY, landFirstBody("agent-system-2.0", true, "in-9"))], instructions, "agent-system-2.0")).toBe(false);
+		// an instruction an agent wrote, or one not authored by Jo, is no word of Jo's
+		for (const over of [{ created_by: "lane-m-1" }, { author: "orchestrator" }, { kind: "answer" as const }, { workload_id: "wl-m" }]) {
+			expect(landFirstOn([row(SURFACE_BY, landFirstBody("agent-system-2.0", true, "in-7"))], [jo("in-7", landFirstInstructionBody("agent-system-2.0", true), over)], "agent-system-2.0")).toBe(false);
+		}
+	});
+
+	test("repositories match by owner/name or name, case-insensitively, never by prefix", () => {
+		expect(sameRepo("agent-system-2.0", "thewolff/agent-system-2.0")).toBe(true);
+		expect(sameRepo("TheWolff/Agent-System-2.0", "thewolff/agent-system-2.0")).toBe(true);
+		expect(sameRepo("system-2.0", "thewolff/agent-system-2.0")).toBe(false);
+		expect(sameRepo("other/agent-system-2.0", "thewolff/agent-system-2.0")).toBe(false);
+		const instructions = [jo("in-1", landFirstInstructionBody("agent-system-2.0", true)), jo("in-2", mainRetryInstructionBody("newdle-web"))];
+		const rows = [row(SURFACE_BY, landFirstBody("agent-system-2.0", true, "in-1")), row(SURFACE_BY, mainRetryBody("newdle-web", "in-2"))];
+		expect(landFirstOn(rows, instructions, "thewolff/agent-system-2.0")).toBe(true);
+		expect(landFirstOn(rows, instructions, "thewolff/newdle-web")).toBe(false);
+		expect(mainRetries(rows, instructions, "thewolff/newdle-web")).toEqual([rows[1]!.created_at]);
+		expect(mainRetries(rows, instructions, "agent-system-2.0")).toEqual([]);
 	});
 });

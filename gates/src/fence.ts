@@ -71,6 +71,7 @@ import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import { type CleanShellCheck, type CleanShellRead, cleanShellOn, CLEAN_SHELL_KEY } from "./clean-shell";
 import { copiedWrapper, expandShell, gitCall, nestedSandboxExec } from "./exec";
 import { HostError, type HostModules, hostSettings, readSetting, unknownSetting } from "./host";
+import { verifiedRoots } from "./rows/r10-raw-ledger";
 import { ownScratchRoot } from "./scratch";
 import { type BranchEntry, type CallMark, type ContextMessage, type Ctx, type GatesAPI, callMark, gateSession, releaseConfined } from "./session";
 import type { ShellStart } from "./shell-start";
@@ -204,19 +205,31 @@ export function repoGitTargets(dir: string): FenceTarget[] | null {
 }
 
 /**
- * Everything the fence denies writes to for `command` run from `cwd`: the ledger directory, and the
- * git targets of every repository the command runs in — `cwd`, each directory a `cd` reaches that the
+ * Everything the fence denies writes to for `command` run from `cwd`: the ledger directory, the verified control root,
+ * and the git targets of every repository the command runs in — `cwd`, each directory a `cd` reaches that the
  * gate can see, and each literal `git -C` path (exec.ts gitCall, the resolver the rows use).
  * The ledger directory is the configured parent and, when the ledger file is a symlink elsewhere, the
  * parent of the file it resolves to, the one the ledger module opens (ledger/src/locality.ts
  * assertLocalPath returns canonicalPath(file); M4b review B2). Keeping the configured parent fenced
- * protects the symlink itself from being replaced.
+ * protects the symlink itself from being replaced. The verified control root (`~/.agent-system-2/verified`, PLAN
+ * wl-mvq4edbaf13vnk § 2 "Integrity of the hold's and the verifier's inputs", R29) is fenced canonical; inside a fenced
+ * ledger directory (the default layout) it adds no target.
  */
 export function fenceTargets(command: string, cwd: string, env: Record<string, string | undefined>, toolEnv?: unknown): FenceTarget[] {
 	const ledgerPath = defaultLedgerPath(env);
 	const out: FenceTarget[] = [{ kind: "subpath", path: canonical(dirname(ledgerPath), "the ledger directory") }];
 	const ledgerFileDir = dirname(canonical(ledgerPath, "the ledger file"));
 	if (ledgerFileDir !== out[0]!.path) out.push({ kind: "subpath", path: ledgerFileDir });
+	// Seatbelt matches the path a write resolves to, so the root is fenced canonical, as the ledger directory is.
+	let roots: string[];
+	try {
+		roots = verifiedRoots(env);
+	} catch (err) {
+		throw new FenceError(`the verified control root cannot be located: ${err instanceof Error ? err.message : String(err)}`);
+	}
+	for (const p of new Set(roots.map((r) => canonical(r, "the verified control root")))) {
+		if (!out.some((t) => t.path === "/" || p === t.path || p.startsWith(`${t.path}/`))) out.push({ kind: "subpath", path: p });
+	}
 	const dirs = new Set([cwd]);
 	for (const e of expandShell(command, cwd, env, toolEnv).commands) {
 		if (e.dirKnown) dirs.add(e.dir);

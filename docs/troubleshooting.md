@@ -24,7 +24,7 @@ The installer writes `~/Library/LaunchAgents/com.agent-system-2.ledger-backup.pl
 
 ### `as2` stops before OMP starts
 
-`as2` renders the orchestrator's system prompt from `voice/VOICE.md` (or `AGENT_SYSTEM_VOICE`) and `contract/output-types.md` (or `AGENT_SYSTEM_CONTRACT`) first, and stops, naming the file, when either is missing. It never passes a missing path to OMP, which would read the path as literal prompt text.
+`as2` renders the orchestrator's system prompt from `voice/VOICE.md` (or `AGENT_SYSTEM_VOICE`) and `plugins/output-types/skills/output-types/reference.md` (or `AGENT_SYSTEM_CONTRACT`) first, and stops, naming the file, when either is missing. It never passes a missing path to OMP, which would read the path as literal prompt text.
 
 ### `as2 off` did not stick
 

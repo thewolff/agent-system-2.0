@@ -147,9 +147,9 @@ describe("B4: push needs a test record on the pushed tree (row 8)", () => {
 
 describe("S1: turn shape (row 1)", () => {
 	const cases: [string, "ALLOW" | "BLOCK"][] = [
-		["**ACTION**\nRun:\n```bash\ngit push origin feature\n```", "BLOCK"],
-		["**ACTION**\nRun:\n```\ngit push origin feature\n```", "BLOCK"],
-		["**QUESTION**\nChoose A or B?\n\nHere is more prose after the ask.", "BLOCK"],
+		["Run:\n```bash\ngit push origin feature\n```", "BLOCK"],
+		["Run:\n```\ngit push origin feature\n```", "BLOCK"],
+		["**Closing ask**\nChoose A or B?\n\nHere is more prose after the ask.", "BLOCK"],
 	];
 	for (const [text, want] of cases) test(`${want}: ${JSON.stringify(text)}`, () => expect(verdict(checkTurnShape(text))).toBe(want));
 });

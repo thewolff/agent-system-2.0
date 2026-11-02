@@ -20,11 +20,13 @@
 // run Jo waived (`waivedRunOf`, PLAN wl-mv5i3lulwwbbi8 D3) passes it, and a PR Jo skipped on a merge
 // train (`trainSkippedOf`, PLAN wl-mv8s8srodefytc § 1) counts as closed; a `red-main` result passes only
 // a merged PR a merge train of the repo lists (`trainPrsOn`, rev 17.1 D8). Any merged PR those rules
-// refuse (`mergedNeedsCover`: no result, an unkept green, a red, error or stale run not waived at its
-// head, a red-main off a train) is covered by a test-runner green of any workload of the repo whose
-// commit is on `origin/<default>` and is its merged head or contains its merge commit (`coverOf`, PLAN
-// wl-mvfjen3q5mqi2o D2: an integration snapshot of the main line, not proof each line it added still
-// runs), else passes on Jo's `waive-pr` (`waivedPrs`, D3). A workload Jo superseded
+// refuse (`mergedNeedsCover`: no result, an unkept green, a fast green, a red, error or stale run not waived
+// at its head, a red-main off a train) is covered by a full-suite green of the repo whose commit is on
+// `origin/<default>` and is its merged head or contains its merge commit (`coverOf`, PLAN wl-mvfjen3q5mqi2o
+// D2: an integration snapshot of the main line, not proof each line it added still runs): a test-runner
+// full-scope green of any workload, or a main run's green believable verdict (`runnerGreensOn`, PLAN
+// wl-mvq4edbaf13vnk D9); a fast green is never a cover and is covered only by a main run. Else it passes on
+// Jo's `waive-pr` (`waivedPrs`, D3). A workload Jo superseded
 // (`supersede <A> <B>`, D2) or withdrew (`withdraw <wl>`, PLAN wl-mv8s939084z1ts D5; the `StandIn`) is
 // decided by `supersededFreshness` instead: no open PR in the set and no bound branch with a commit
 // origin's default lacks, the refusal naming which word stood in. Unlike the rest of this path it fails
@@ -42,9 +44,10 @@ import { fileIdentity, removeChild } from "./scratch-remove";
 import { branchName, controlEntries, holdersOf, waivedPrs } from "./launch";
 import { checkoutOwnerRepo, trainPrs, trainSkippedOf } from "./merge-train";
 import { REPO_ROOT } from "./session";
+import { mainResults, mainVerdicts } from "./main-state";
 import {
-	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, decisionLogFault, mergedNeedsCover,
-	parsePushDest, parseTestRun, type RangeCommit, type RunRecord, SHA_RE, servedRepo, type TestRunnerConfig, testRunnerConfig, testRuns,
+	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, decisionLogFault, isFullSuiteGreen,
+	mergedNeedsCover, parsePushDest, parseTestRun, type RangeCommit, type RunRecord, SHA_RE, servedRepo, type TestRunnerConfig, testRunnerConfig, testRuns,
 } from "./test-run";
 import { DECISION_LOG_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, type SurfaceAPI } from "./types";
 
@@ -720,13 +723,15 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, ownerRep
 		compares.set(`${from} ${to}`, c);
 		return c;
 	};
-	// D2: read once, and only when a merged PR needs a cover; walked newest first, stopping at the first that qualifies.
+	// D2: read once, and only when a merged PR needs a cover; walked newest first, stopping at the first that qualifies. A fast
+	// green's cover is a main run only (`mainOnly`, PLAN wl-mvq4edbaf13vnk D9): a main run on its merge commit or a later main commit.
 	let greens: RunnerGreen[] | null = null;
-	const coverOf = async (pr: PrHead): Promise<ClosePr["cover"]> => {
+	const coverOf = async (pr: PrHead, mainOnly: boolean): Promise<ClosePr["cover"]> => {
 		greens ??= runnerGreensOn(ledger, ownerRepo);
 		for (const g of greens) {
+			if (mainOnly && !g.main) continue;
 			if (!(await hasCommit(exec, top, g.sha)) || !(await ancestor(g.sha, tip))) continue;
-			const at = { runId: g.runId, sha: g.sha, workloadId: g.workloadId };
+			const at = { runId: g.runId, sha: g.sha, workloadId: g.workloadId, main: g.main };
 			if (g.sha === pr.headSha) return { ...at, how: "head" };
 			if (pr.mergeCommit !== null && (await hasCommit(exec, top, pr.mergeCommit)) && (await ancestor(pr.mergeCommit, g.sha))) return { ...at, how: "merge" };
 			if (decisionLogFault(await compare(g.sha, pr.headSha, pr.number)) === null) return { ...at, how: "head" };
@@ -737,7 +742,7 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, ownerRep
 	const prs: ClosePr[] = [];
 	for (const pr of s.heads) {
 		const r = authoritativeRun(records, pr.number)?.result ?? null;
-		const result = r === null ? null : { runId: r.runId, verdict: r.verdict, sha: r.sha };
+		const result = r === null ? null : { runId: r.runId, verdict: r.verdict, sha: r.sha, scope: r.scope };
 		const train = onTrain.has(pr.number);
 		// Only a green on a PR that is not closed, or a red-main on a merged train PR (D8), is ever compared (closeFreshness reads nothing else).
 		const green = pr.state !== "CLOSED" && result?.verdict === "green";
@@ -748,26 +753,31 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, ownerRep
 		const own = { ...pr, result, headCompare, candidateCompare, waivedRun: waivedRunOf(records, pr.number, questions, instructions), trainSkipped, onTrain: train };
 		prs.push({
 			...own,
-			// A cover is sought only for a MERGED PR its own results do not pass (`mergedNeedsCover`, D2).
-			cover: mergedNeedsCover(own) ? await coverOf(pr) : null,
+			// A cover is sought only for a MERGED PR its own results do not pass (`mergedNeedsCover`, D2); a fast green's only from a main run (D9).
+			cover: mergedNeedsCover(own) ? await coverOf(pr, result?.verdict === "green" && result.scope === "fast") : null,
 			waivedByJo: waivedByJo.find((x) => x.pr === pr.number)?.instructionId ?? null,
 		});
 	}
 	return { failure: null, branch, defaultBranch: baseName.replace(/^origin\//, ""), candidate: { sha: candidate, changed }, prs };
 }
 
-/** A test-runner green as the close check's cover search reads it (PLAN wl-mvfjen3q5mqi2o D2). */
+/** A full-suite green as the close check's cover search reads it (PLAN wl-mvfjen3q5mqi2o D2): a PR's, or a main run's (`main`, PLAN wl-mvq4edbaf13vnk D9). */
 interface RunnerGreen {
 	runId: string;
 	sha: string;
 	workloadId: string;
+	main: boolean;
+	createdAt: string;
 }
 
 /**
- * The test runner's green results on every workload, open or closed, whose `repo:` checkout's origin is `ownerRepo`
- * (`checkoutOwnerRepo`, compared without case, as `trainPrsOn` does), newest first (PLAN wl-mvfjen3q5mqi2o D2). Only rows the
- * runner wrote count (`test-run:`'s one writer), so a lane's imitation is never read. The repo match is a cheap pre-filter that
- * skips other repositories before any git call, not the proof: each green's commit must still be on this clone's `origin/<default>`.
+ * The full-suite greens a cover may be, newest first (PLAN wl-mvfjen3q5mqi2o D2, PLAN wl-mvq4edbaf13vnk D9): the test runner's
+ * full-scope PR greens (`isFullSuiteGreen`; a fast green never covers) on every workload, open or closed, whose `repo:`
+ * checkout's origin is `ownerRepo` (`checkoutOwnerRepo`, compared without case, as `trainPrsOn` does), and every main commit's
+ * green believable verdict (`mainVerdicts` over the standing workload's main runs, `mainResults`; a later run of a commit with a
+ * verdict never counts). Only rows the runner wrote count (`test-run:`'s one writer), so a lane's imitation is never read. The
+ * repo match is a cheap pre-filter that skips other repositories before any git call, not the proof: each green's commit must
+ * still be on this clone's `origin/<default>`, which is also what keeps another repository's main run out.
  */
 function runnerGreensOn(ledger: Ledger, ownerRepo: string): RunnerGreen[] {
 	const want = ownerRepo.toLowerCase();
@@ -777,16 +787,20 @@ function runnerGreensOn(ledger: Ledger, ownerRepo: string): RunnerGreen[] {
 	const out: RunnerGreen[] = [];
 	for (const e of rows) {
 		const r = parseTestRun(e.body);
-		if (r === null || r.verdict !== "green") continue;
+		if (r === null || r.main || !isFullSuiteGreen(r)) continue;
 		let on = onRepo.get(e.workload_id);
 		if (on === undefined) {
 			const path = repoOf(ledger, e.workload_id);
 			on = path !== null && checkoutOwnerRepo(path)?.toLowerCase() === want;
 			onRepo.set(e.workload_id, on);
 		}
-		if (on) out.push({ runId: r.runId, sha: r.sha, workloadId: e.workload_id });
+		if (on) out.push({ runId: r.runId, sha: r.sha, workloadId: e.workload_id, main: false, createdAt: e.created_at });
 	}
-	return out;
+	for (const v of mainVerdicts(mainResults(ledger.entries(STANDING_WORKLOAD_ID))).values()) {
+		if (v.verdict === "green") out.push({ runId: v.runId, sha: v.sha, workloadId: STANDING_WORKLOAD_ID, main: true, createdAt: v.at });
+	}
+	// Newest first across both kinds; a stable sort keeps the query's order among equal times.
+	return out.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
 }
 
 /**

@@ -11,8 +11,10 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync
 import { join, relative } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
+import { commandShapedNote } from "../src/channel";
 import { errorLines, waitingReserved } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
+import { landFirstOn } from "../src/launch";
 import { surfaceSession } from "../src/session";
 import { laneDeaths, openPromptWaits } from "../src/signals";
 import { PUSH_TRIES, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
@@ -1121,6 +1123,19 @@ describe("agent channel (PLAN wl-mv8vx7wdj5nx1c)", () => {
 		expect(lines[2]).toContain(`msg ${msg(seen)} ${q} ${msg(seen)}'s aside had already reached Ilex; it is withdrawn from later renders (shown`);
 		expect(lines[3]).toContain(`msg ${msg(handled)} ${q} Ilex had already read and acted on ${msg(handled)}; it is withdrawn from later renders (shown`);
 		expect(lines.filter((l) => l.includes("nothing reached the model"))).toHaveLength(1);
+	});
+});
+
+describe("land-first words from another agent (PLAN wl-mvq4edbaf13vnk D12)", () => {
+	test("`land-first <repo> on|off` and `main-retry <repo>` in a channel message are command-shaped notes, never applied", () => {
+		const { ledger } = tempLedger();
+		ensureStandingWorkload(ledger);
+		for (const line of ["land-first agent-system-2.0 on", "LAND-FIRST agent-system-2.0 off", "main-retry agent-system-2.0", "land-first agent-system-2.0", "main-retry"]) {
+			expect(commandShapedNote(ledger, line)).toBe(true);
+		}
+		expect(commandShapedNote(ledger, "landing first on main went fine")).toBe(false);
+		expect(landFirstOn(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), "agent-system-2.0")).toBe(false);
+		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
 	});
 });
 

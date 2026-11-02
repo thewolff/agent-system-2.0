@@ -184,6 +184,15 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		for (const old of ["resolve / skip / stop", "rerun / skip / stop", "retarget-done", "merge only by Jo", "owner delivery"]) expect(brief).not.toContain(old);
 	});
 
+	test("step 6's local artifact runs migration-items only; the PR's changed test files are left to lane_full_test outside the fence (jo-issues #240)", () => {
+		const lines = trainBrief("wl-mv8s8srodefytc", [101]).split("\n");
+		const s6 = lines.find((l) => l.startsWith("6. "))!;
+		const artifact = /a bare `(bun test [^`]*)`/.exec(s6)?.[1];
+		expect(artifact).toBe("bun test surface/test/migration-items.test.ts");
+		expect(s6).toContain("lane_full_test");
+		expect(s6).not.toContain("changed test files>");
+	});
+
 	test("the brief returns PRs through lane_train_return and files main-red; train-passed is gone, and the lane's notes are no control prefix", () => {
 		const brief = trainBrief("wl-mv8s8srodefytc", [101, 106]);
 		expect(brief).toContain(LANE_TRAIN_RETURN_TOOL);
@@ -850,7 +859,7 @@ describe("the train skip in the close check (§ 1)", () => {
 	/** PR 101 in the close set as `closeFreshness` reads it, its trainSkipped computed from the ledger. */
 	function pr101(ledger: Ledger, wl: string, over: Partial<ClosePr> = {}): ClosePr {
 		return {
-			number: 101, state: "OPEN", headRefName: "feature/x", headSha: SHA_A, result: { runId: "tr-red-1", verdict: "red", sha: SHA_A },
+			number: 101, state: "OPEN", headRefName: "feature/x", headSha: SHA_A, result: { runId: "tr-red-1", verdict: "red", sha: SHA_A, scope: "full" },
 			headCompare: null, candidateCompare: null, waivedRun: null, onTrain: false, mergeCommit: null, cover: null, waivedByJo: null,
 			trainSkipped: trainSkippedOf(101, ledger.entries(wl), ledger.questions(wl), ledger.instructions(wl)), ...over,
 		};

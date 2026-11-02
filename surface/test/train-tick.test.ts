@@ -9,27 +9,32 @@
 // (surface/test/train-world.ts).
 import { describe, expect, test } from "bun:test";
 import { reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
+import { Database } from "bun:sqlite";
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { type GhResult, tick } from "../scripts/train-tick";
 import { type Ceiling, ceilingBody, type Spend, spendBody } from "../src/ceiling";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
-import { applyTrain, interpret } from "../src/input";
+import { apply, applyTrain, interpret } from "../src/input";
 import {
-	controlEntries, decideLaunch, laneExitBody, laneReadyBody, launchFailedBody, launchRequestedBody, planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody,
+	controlEntries, decideLaunch, laneExitBody, laneReadyBody, launchFailedBody, launchRequestedBody, landFirstBody, landFirstInstructionBody, mainRetryBody, mainRetryInstructionBody,
+	planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody,
 } from "../src/launch";
 import {
-	actionable, fixBindings, mainRedNotices, protectionEpisodes, prStakes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertBody, trainAlertMarker,
-	trainHeadWokenBody, trainHoldBody, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody,
+	actionable, type ControlRoot, fixBindings, landFirstNoticeBody, landFirstRows, latestTrainReconciled, mainRedNotices, protectionEpisodes, prStakes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO,
+	trainActivityArgs, trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainHoldBody, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody, type WakeDeferral,
 } from "../src/merge-train";
 import { trainMergedNoticeBody } from "../src/notice";
-import { makeRunId, testRequestedBody, testRuns } from "../src/test-run";
+import { fastPlanBody, makeRunId, testRequestedBody, testRunBody, testRuns, withFullSuitePublication } from "../src/test-run";
 import { ESCALATION_BY, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { releasedOpenBody } from "../src/turn-end";
 import {
 	boardWorld, carry305, COMMIT_FILES_CAP, COMMIT_FILES_PER_PAGE, DECISION_LOG_FILE, type FakeDiffEntry, type FakeIssue, H0, H1, H2, JO, OWNER_LANE, protectedRules, REPO, TRAIN_LANE,
 	world,
 } from "./train-world";
+import { tmp } from "./helpers";
 
 describe("settles and deliveries (D8, D10)", () => {
 	test("a settle is written once across two ticks", () => {
@@ -447,7 +452,7 @@ describe("retries of a released train and fork PRs (D8-D10, review gtb-r1)", () 
 		expect(wakes(v)).toBe(1);
 	});
 
-	test("the live-owner shortcut keeps the PR pending: its train slices stay open, the tick reads it, and a later pass retries it", () => {
+	test("the live-owner shortcut keeps the PR pending: its train slices stay open, the tick reads it, and retries it once the owner's lease ends (D13)", () => {
 		const w = world();
 		// the train's own full-suite run on #101 is red, and the PR goes back to its owner, whose lane stays live
 		worked(w, TRAIN_LANE);
@@ -466,8 +471,14 @@ describe("retries of a released train and fork PRs (D8-D10, review gtb-r1)", () 
 		const views = () => w.g.calls.filter((a) => a[0] === "pr" && a[1] === "view" && a[2] === "101").length;
 		const before = views();
 		w.c.plusHours(0.3);
-		w.run();
+		const lines = w.run();
 		expect(views()).toBeGreaterThan(before);
+		// D13: the retry is #101's own reason, and its owner holds a live lease: deferred, one line, no launch
+		expect(lines.filter((l) => l.includes("#101 wake deferred while its owner is busy"))).toHaveLength(1);
+		expect(trainLaunches(w)).toBe(1);
+		// an owner lease held past its expiry is not busy: the deferred retry wakes the train
+		w.c.plusHours(6);
+		w.run();
 		expect(trainLaunches(w)).toBe(2);
 	});
 
@@ -1117,10 +1128,11 @@ describe("the relaunch loop, replaying wl-mvggzumu8zs5xc (PLAN wl-mvgn310dpi5gcg
 	const CAP = { code: 6, line: "lane-x not launched: cap" };
 	/**
 	 * A one-PR train whose first lane (launched by the starter) returned #101 to its owner and exited released; the owner's lane
-	 * holds it live and pushes H2 only after the task's 2 h mark, so the next tick settles the task failed with H2 untested by the
-	 * train. `at(m)` sets the clock m minutes after that tick.
+	 * pushes H2 only after the task's 2 h mark and then ends (its lease released), so the next tick settles the task failed with
+	 * H2 untested by the train. With `ownerLive` the owner's 6 h lease stays held (the incident's shape, deferred by D13).
+	 * `at(m)` sets the clock m minutes after that tick.
 	 */
-	const settledWorld = () => {
+	const settledWorld = (ownerLive = false) => {
 		const w = world([101]);
 		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.train, kind: "assumption", body: `launch: ${TRAIN_LANE} cause first requested-by ${SURFACE_BY}` });
 		w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.train, kind: "assumption", body: laneReadyBody(TRAIN_LANE, w.c.now()) });
@@ -1133,6 +1145,7 @@ describe("the relaunch loop, replaying wl-mvggzumu8zs5xc (PLAN wl-mvgn310dpi5gcg
 		const p = w.g.prs.get(101)!;
 		p.head = H2;
 		w.g.pushed(p.branch, H2, w.c.now());
+		if (!ownerLive) expect(w.ledger.releaseWorkload(w.owner, { by: OWNER_LANE, holder: OWNER_LANE }).released).toBe(true);
 		w.c.plusHours(0.01);
 		const t0 = Date.parse(w.c.now());
 		const at = (m: number) => w.c.at(new Date(t0 + m * MIN).toISOString());
@@ -1197,6 +1210,30 @@ describe("the relaunch loop, replaying wl-mvggzumu8zs5xc (PLAN wl-mvgn310dpi5gcg
 		expect(w.requests()).toHaveLength(1);
 	});
 
+	test("D13: while the owner's lane holds a live lease, #101's settled task and untested head wake nothing; one line per pass; the lease's expiry wakes it", () => {
+		const w = settledWorld(true);
+		const launched: number[] = [];
+		const lines: string[] = [];
+		for (let m = 0; m < 180; m += 5) {
+			w.at(m);
+			lines.push(...w.tickWith(() => {
+				launched.push(m);
+				return CAP;
+			}).filter((l) => l.includes("#101 wake deferred")));
+		}
+		expect(w.requests()).toEqual([]);
+		expect(w.wakes()).toBe(0);
+		expect(launched).toEqual([]);
+		expect(lines).toHaveLength(36);
+		expect(lines[0]).toContain(`${w.owner} is held live by ${OWNER_LANE}`);
+		expect(lines[0]).toContain(`#101 head ${H2} untested by the train`);
+		// the 6 h lease (claimed ~2 h before t0) expires at about +238 min: the deferred reasons wake the train once
+		w.at(240);
+		w.tickWith(() => CAP);
+		expect(w.requests().map((c) => w.offset(c.createdAt))).toEqual([240]);
+		expect(w.wakes()).toBe(1);
+	});
+
 	/** A released train made actionable by a new board, and #101's task due to its autonomous owner: both would be requested. */
 	const ceilingWorld = () => {
 		const w = world();
@@ -1257,5 +1294,410 @@ describe("the relaunch loop, replaying wl-mvggzumu8zs5xc (PLAN wl-mvgn310dpi5gcg
 			w.stopped(lines, wl, "1.5 of 50");
 		}
 		expect(w.launches).toEqual([]);
+	});
+});
+
+describe("land-first in the tick (PLAN wl-mvq4edbaf13vnk D6, D13, § 2 Protect the verifier)", () => {
+	const G = "1".repeat(40);
+	const T = "2".repeat(40);
+	const HX = "3".repeat(40);
+	const MIN = 60_000;
+	/**
+	 * A served REPO with land-first on, main at T (PR #201) on G (green); a fake runner and a control root that passes the
+	 * self-check; `gh` answers main's ref, chain, PRs, statuses, the tag and status posts, else the boarding world's fake.
+	 */
+	const lf = (o: { on?: boolean } = {}) => {
+		const w = boardWorld();
+		let seq = 0;
+		const jo = (word: string, body: (id: string) => string) => {
+			const id = w.ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: STANDING_WORKLOAD_ID, body: word });
+			w.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: body(id) });
+		};
+		if (o.on ?? true) jo(landFirstInstructionBody(REPO, true), (id) => landFirstBody(REPO, true, id));
+		const mainRun = (sha: string, verdict: "green" | "red" | "error") => w.ledger.recordEntry({
+			by: TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption",
+			body: testRunBody({
+				runId: makeRunId(Date.parse(w.ledger.now()) + ++seq, "main"), verdict, sha, pr: 0, reason: verdict === "error" ? "runner died" : null, headAtEnd: sha, base: null, mergeBase: null,
+				full: { pass: 400, fail: verdict === "red" ? 1 : 0, skip: 0, exit: verdict === "green" ? 0 : 1, ms: 900, error: null }, solo: [],
+				failures: verdict === "red" ? [{ part: "full", name: "x.test.ts > broken", firstError: "error: nope" }] : [], runDir: null, preflight: "ok",
+				scope: "full", main: true, host: "mac", exec: verdict === "error" ? null : { files: 40, tests: 400, treeFiles: 40 },
+			}),
+		});
+		mainRun(G, "green");
+		const gh = {
+			tip: T, landed: w.ledger.now(), tag: G as string | null, open: new Map<number, string>(), status: new Map<string, { state: string; description: string }>(),
+			postFails: false, posts: [] as string[][],
+		};
+		const answer = (v: unknown): GhResult => ({ code: 0, stdout: JSON.stringify(v), stderr: "" });
+		const publicationRoot = tmp("tick-publication");
+		const onGh = { fn: (_args: string[], _timeoutMs?: number) => {} };
+		const fakeGh = (args: string[], timeoutMs?: number): GhResult => {
+			onGh.fn(args, timeoutMs);
+			const p = `repos/${REPO}/`;
+			const [noun, verb] = args;
+			if (noun === "api" && verb === `${p}git/ref/heads/main`) return answer({ object: { sha: gh.tip } });
+			if (noun === "api" && verb?.startsWith(`${p}git/commits/`)) {
+				const sha = verb.slice(`${p}git/commits/`.length);
+				return answer({ sha, tree: { sha: sha === G ? "4".repeat(40) : "5".repeat(40) }, committer: { date: sha === G ? "2026-01-01T00:00:00.000Z" : gh.landed }, parents: sha === G ? [] : [{ sha: G }] });
+			}
+			if (noun === "api" && verb === `${p}commits/${T}/pulls`) return answer([{ number: 201 }]);
+			if (noun === "api" && verb?.startsWith(`${p}commits/`) && verb.endsWith("/pulls")) return answer(verb.includes(G) ? [{ number: 200 }] : []);
+			if (noun === "api" && verb?.endsWith("/statuses") && verb.startsWith(`${p}commits/`)) {
+				const s = gh.status.get(verb.slice(`${p}commits/`.length, -"/statuses".length));
+				return answer(s ? [{ context: "as2/full-suite", ...s }] : []);
+			}
+			if (noun === "api" && verb === "-X") {
+				gh.posts.push(args);
+				return gh.postFails ? { code: 1, stdout: "", stderr: "HTTP 502" } : answer({});
+			}
+			if (noun === "api" && verb === `${p}git/ref/tags/as2-verified`) return gh.tag === null ? { code: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)" } : answer({ object: { type: "commit", sha: gh.tag } });
+			if (noun === "pr" && verb === "list") return answer([...gh.open].map(([number, headRefOid]) => ({ number, headRefOid })));
+			return w.g.gh(args);
+		};
+		const runnerCalls: string[][] = [];
+		const runner = { answer: (_args: string[]): GhResult => ({ code: 0, stdout: "", stderr: "" }) };
+		const root: ControlRoot = { root: "/v/current", head: G, modified: [], current: "/v/current", currentHead: G, repo: REPO };
+		const logs: string[] = [];
+		const onLog = { fn: (_l: string) => {} };
+		const pass = () => tick({
+			ledger: w.ledger, gh: fakeGh, launch: () => ({ code: 1, line: "not launched" }), notify: () => true, config: { repos: [{ origin: REPO, command: "bun test" }] },
+			land: { runner: (a) => (runnerCalls.push(a), runner.answer(a)), root: () => root, runsRoot: publicationRoot }, log: (l) => (logs.push(l), onLog.fn(l)),
+		});
+		const rows = () => landFirstRows(w.ledger.entries(STANDING_WORKLOAD_ID), REPO);
+		const reconciled = () => latestTrainReconciled(w.ledger.entries(STANDING_WORKLOAD_ID), REPO);
+		const at = (m: number) => w.c.at(new Date(Date.parse(gh.landed) + m * MIN).toISOString());
+		return { ...w, gh, mainRun, jo, runnerCalls, runner, root, logs, onLog, onGh, publicationRoot, pass, rows, reconciled, at };
+	};
+	const mainCalls = (x: ReturnType<typeof lf>) => x.runnerCalls.filter((a) => a[0] === "main");
+
+	test("R17, R18: reap first, one main run requested for a tip with no verdict, train-reconciled open after the pass; a verdict stops requests", () => {
+		const x = lf();
+		x.pass();
+		expect(x.runnerCalls).toEqual([["reap"], ["main", "--repo", REPO, "--sha", T]]);
+		const r = x.reconciled()!;
+		expect(r.createdAt).toBe(x.ledger.now());
+		expect(r.r).toMatchObject({ repo: REPO, tip: T, g: G, open: true, repair: null, reasons: "" });
+		expect(r.r.read).toBe(controlEntries(x.ledger.entries(STANDING_WORKLOAD_ID)).findLast((c) => c.prefix === "test-run")!.id);
+		x.mainRun(T, "green");
+		x.c.plusHours(0.1);
+		x.pass();
+		expect(mainCalls(x)).toHaveLength(1);
+		expect(x.reconciled()!.r).toMatchObject({ g: T, open: true });
+	});
+
+	test("R17: a failed reap requests nothing; an inconclusive run is retried only 15 min on, 3 per block, then one exhausted row until main-retry", () => {
+		const x = lf();
+		x.runner.answer = (a) => (a[0] === "reap" ? { code: 1, stdout: "", stderr: "ledger locked" } : { code: 0, stdout: "", stderr: "" });
+		x.pass();
+		expect(mainCalls(x)).toEqual([]);
+		expect(x.logs).toContainEqual(expect.stringContaining("reap exited 1: ledger locked"));
+		x.runner.answer = () => ({ code: 0, stdout: "", stderr: "" });
+		x.mainRun(T, "error");
+		x.at(10);
+		x.pass();
+		expect(mainCalls(x)).toEqual([]);
+		x.at(16);
+		x.pass();
+		expect(mainCalls(x)).toHaveLength(1);
+		x.mainRun(T, "error");
+		x.at(32);
+		x.pass();
+		x.mainRun(T, "error");
+		x.at(48);
+		x.pass();
+		x.at(70);
+		x.pass();
+		expect(mainCalls(x)).toHaveLength(2);
+		expect(x.rows().filter((r) => r.event === "exhausted")).toEqual([expect.objectContaining({ sha: T, block: 1 })]);
+		expect(errorLines(x.ledger).map((l) => l.line)).toContainEqual(`main runs exhausted at ${T.slice(0, 7)}: fix the runner, then say main-retry ${REPO}`);
+		x.at(80);
+		x.jo(mainRetryInstructionBody(REPO), (id) => mainRetryBody(REPO, id));
+		x.at(81);
+		x.pass();
+		expect(mainCalls(x)).toHaveLength(3);
+		expect(errorLines(x.ledger).map((l) => l.line).filter((l) => l.startsWith("main runs exhausted"))).toEqual([]);
+	});
+
+	test("landing revocation holds the bounded publication mutex only for the final POST, not bulk discovery", () => {
+		const x = lf();
+		x.mainRun(T, "red");
+		x.gh.open.set(202, HX);
+		x.gh.status.set(HX, { state: "success", description: "fast green" });
+		withFullSuitePublication(x.publicationRoot, REPO, () => {});
+		const path = join(x.publicationRoot, readdirSync(x.publicationRoot).find((name) => name.includes(".publication-"))!);
+		let reads = 0;
+		let posts = 0;
+		x.onGh.fn = (args, timeoutMs) => {
+			const post = args[1] === "-X" && args[3] === `repos/${REPO}/statuses/${HX}`;
+			const read = (args[0] === "pr" && args[1] === "list") || args[1] === `repos/${REPO}/commits/${HX}/statuses`;
+			if (!post && !read) return;
+			const db = new Database(path);
+			try {
+				db.exec("PRAGMA busy_timeout = 1");
+				if (post) {
+					expect(() => db.exec("BEGIN IMMEDIATE")).toThrow();
+					expect(timeoutMs).toBeGreaterThan(0);
+					expect(timeoutMs).toBeLessThanOrEqual(30_000);
+					posts++;
+				} else {
+					db.exec("BEGIN IMMEDIATE");
+					expect(timeoutMs).toBeUndefined();
+					reads++;
+				}
+			} finally { db.close(); }
+		};
+		x.pass();
+		expect(reads).toBeGreaterThan(0);
+		expect(posts).toBe(1);
+		expect(x.gh.posts).toHaveLength(1);
+	});
+
+	for (const point of ["listing", "status"] as const) test(`off during landing ${point} discovery preserves a newly settled full green`, () => {
+		const x = lf();
+		x.mainRun(T, "red");
+		x.gh.open.set(202, HX);
+		x.gh.status.set(HX, { state: "success", description: "fast green" });
+		let changed = false;
+		x.onGh.fn = (args) => {
+			if (changed || !(point === "listing" ? args[0] === "pr" && args[1] === "list" : args[1] === `repos/${REPO}/commits/${HX}/statuses`)) return;
+			changed = true;
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			const wl = x.ledger.openWorkload({ by: SURFACE_BY, brief: "full result during off", stakes: "normal", mode: "autonomous" });
+			const entry = (body: string) => x.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, kind: "assumption", body });
+			withFullSuitePublication(x.publicationRoot, REPO, () => {
+				entry(testRequestedBody({ runId: "tr-tickfull", pr: 202, sha: HX, slice: "sl-tickfull", by: "lane-test" }));
+				entry(fastPlanBody("tr-tickfull", { ref: "wl/test", scope: "full", reasons: ["schema"] }));
+				entry(testRunBody({ runId: "tr-tickfull", pr: 202, sha: HX, verdict: "green", reason: null, headAtEnd: HX, base: null, mergeBase: null, full: null, solo: [], failures: [], runDir: null, preflight: "ok", scope: "full", host: "mac", main: false, exec: null }));
+				x.gh.status.set(HX, { state: "success", description: "genuine full green" });
+			});
+		};
+		x.pass();
+		expect(changed).toBe(true);
+		expect(x.gh.posts).toEqual([]);
+		expect(x.gh.status.get(HX)?.description).toBe("genuine full green");
+		expect(x.rows().filter((r) => r.event === "revoke-failed")).toEqual([]);
+		expect(x.logs).toContainEqual(expect.stringContaining("skipped stale landing revocation"));
+	});
+
+	test("a new activation generation during landing discovery invalidates the old on-mode revocation", () => {
+		const x = lf();
+		x.mainRun(T, "red");
+		x.gh.open.set(202, HX);
+		x.gh.status.set(HX, { state: "success", description: "new activation green" });
+		let changed = false;
+		x.onGh.fn = (args) => {
+			if (!changed && args[1] === `repos/${REPO}/commits/${HX}/statuses`) {
+				changed = true;
+				x.jo(landFirstInstructionBody(REPO, true), (id) => landFirstBody(REPO, true, id));
+			}
+		};
+		x.pass();
+		expect(changed).toBe(true);
+		expect(x.gh.posts).toEqual([]);
+		expect(x.rows().filter((r) => r.event === "revoke-failed")).toEqual([]);
+		expect(x.logs).toContainEqual(expect.stringContaining("skipped stale landing revocation"));
+	});
+
+	test("main recovery during landing discovery invalidates the old stop at serialized POST", () => {
+		const x = lf();
+		x.mainRun(T, "red");
+		x.gh.open.set(202, HX);
+		x.gh.status.set(HX, { state: "success", description: "green after main recovery" });
+		let recovered = false;
+		x.onGh.fn = (args) => {
+			if (!recovered && args[1] === `repos/${REPO}/commits/${HX}/statuses`) {
+				recovered = true;
+				x.mainRun(T, "green");
+			}
+		};
+		x.pass();
+		expect(recovered).toBe(true);
+		expect(x.gh.posts).toEqual([]);
+		expect(x.reconciled()).toBeNull();
+		expect(x.rows().filter((r) => r.event === "revoke-failed")).toEqual([]);
+		expect(x.logs).toContainEqual(expect.stringContaining("skipped stale landing revocation"));
+	});
+
+	test("legacy off failures never consume a later landing-stop revocation block at the same head", () => {
+		const x = lf();
+		x.mainRun(T, "red");
+		x.gh.open.set(202, HX);
+		x.gh.status.set(HX, { state: "success", description: "fast green after re-on" });
+		x.gh.postFails = true;
+		for (let attempt = 1; attempt <= 3; attempt++) {
+			x.ledger.recordEntry({
+				by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption",
+				body: landFirstNoticeBody(REPO, { event: "revoke-failed", pr: 202, head: HX, attempt, error: "off reconciliation pending: HTTP 502; next tick retries" }),
+			});
+		}
+		for (const minute of [1, 6, 11, 16]) {
+			x.at(minute);
+			x.pass();
+		}
+		expect(x.gh.posts).toHaveLength(3);
+		expect(x.rows().flatMap((r) => r.event === "revoke-failed" && !r.error.startsWith("off reconciliation pending:") ? [r.attempt] : [])).toEqual([1, 2, 3]);
+		expect(x.rows().filter((r) => r.event === "revoke-gave-up")).toHaveLength(1);
+		expect(errorLines(x.ledger).some((line) => line.line.startsWith("revocation failed on #202 "))).toBe(true);
+	});
+
+	test("R17: a red tip opens one stop episode with one issue, revokes an open green 3 times then gives up once, records the repair and fails it at 30 min", () => {
+		const x = lf();
+		x.mainRun(T, "red");
+		x.gh.open.set(202, HX);
+		x.gh.status.set(HX, { state: "success", description: "fast green" });
+		x.gh.postFails = true;
+		for (const m of [1, 6, 11, 16]) {
+			x.at(m);
+			x.pass();
+		}
+		const events = x.rows().map((r) => r.event);
+		expect(events.filter((e) => e === "stop-raised")).toHaveLength(1);
+		expect(events.filter((e) => e === "stop-filed")).toHaveLength(1);
+		expect(x.creates()).toHaveLength(1);
+		expect(events.filter((e) => e === "revoke-failed")).toHaveLength(3);
+		expect(events.filter((e) => e === "revoke-gave-up")).toHaveLength(1);
+		expect(x.gh.posts).toHaveLength(3);
+		expect(x.rows().find((r) => r.event === "repair-woken")).toMatchObject({ tip: T, train: null });
+		expect(x.reconciled()!.r).toMatchObject({ open: false, tip: T, g: G });
+		const lines = errorLines(x.ledger).map((l) => l.line);
+		expect(lines).toContainEqual(expect.stringMatching(new RegExp(`^main red at ${T.slice(0, 7)} since .* on ${REPO}: 1 failing; suspects #201; repair woken `)));
+		expect(lines).toContainEqual(expect.stringMatching(/^revocation failed on #202 /));
+		expect(events).not.toContain("repair-failed");
+		x.at(31);
+		x.pass();
+		expect(x.rows().filter((r) => r.event === "repair-failed")).toHaveLength(1);
+		x.at(36);
+		x.pass();
+		expect(x.rows().filter((r) => r.event === "repair-failed")).toHaveLength(1);
+		// the head moves on: the given-up revocation clears; main's fix lands green and the episode closes with its issue
+		x.gh.open.set(202, "7".repeat(40));
+		x.gh.tip = "6".repeat(40);
+		x.mainRun(x.gh.tip, "green");
+		x.at(40);
+		x.pass();
+		expect(x.rows().map((r) => r.event)).toEqual(expect.arrayContaining(["revoke-cleared", "stop-cleared"]));
+		expect(x.g.issues[0]!.state).toBe("CLOSED");
+		expect(errorLines(x.ledger).map((l) => l.line).filter((l) => /^(main red|revocation failed|landing stopped)/.test(l))).toEqual([]);
+	});
+
+	test("R17: an infrastructure stop (oldest suspect over 40 min, no verdict) files its issue and revokes, but wakes no repair", () => {
+		const x = lf();
+		x.gh.open.set(202, HX);
+		x.gh.status.set(HX, { state: "success", description: "fast green" });
+		x.at(41);
+		x.pass();
+		expect(x.rows().map((r) => r.event)).toEqual(["stop-raised", "stop-filed"]);
+		expect(x.rows()[0]).toMatchObject({ kind: "infrastructure" });
+		expect(x.gh.posts).toEqual([expect.arrayContaining([`repos/${REPO}/statuses/${HX}`, "state=failure"])]);
+		expect(errorLines(x.ledger).map((l) => l.line)).toContainEqual(expect.stringMatching(new RegExp(`^landing stopped at ${T.slice(0, 7)} on ${REPO}: oldest suspect`)));
+	});
+
+	test("R18: a main-run settle newer than the pass's watermark writes no train-reconciled; the next pass does", () => {
+		const x = lf();
+		x.onLog.fn = (l) => {
+			if (l.includes("test-runner main exited")) x.mainRun(T, "green");
+		};
+		x.pass();
+		expect(x.reconciled()).toBeNull();
+		expect(x.logs).toContainEqual(expect.stringContaining("no train-reconciled: a main-run settle landed after this pass read"));
+		x.onLog.fn = () => {};
+		x.c.plusHours(0.1);
+		x.pass();
+		expect(x.reconciled()!.r).toMatchObject({ g: T, open: true });
+	});
+
+	test("R18: a tick whose root fails the self-check while land-first is on refuses: one row, nothing run; with land-first off it runs (shadow mode)", () => {
+		const x = lf();
+		x.root.modified = ["surface/scripts/train-tick.ts"];
+		x.pass();
+		x.c.plusHours(0.1);
+		x.pass();
+		expect(x.runnerCalls).toEqual([]);
+		expect(landFirstRows(x.ledger.entries(STANDING_WORKLOAD_ID), "*").map((r) => r.event)).toEqual(["tick-refused"]);
+		expect(x.reconciled()).toBeNull();
+		expect(errorLines(x.ledger).map((l) => l.line)).toContainEqual(expect.stringMatching(/^verifier: the train tick refuses to run: tracked files modified: surface\/scripts\/train-tick\.ts/));
+		const y = lf({ on: false });
+		y.root.modified = ["x"];
+		y.pass();
+		expect(y.runnerCalls).toEqual([["reap"], ["main", "--repo", REPO, "--sha", T]]);
+		expect(y.reconciled()).toBeNull();
+	});
+
+	test("R31: a lagging promotion is retried once per pass, 3 failures per G then one gave-up; a schema stop files one issue and waits", () => {
+		const x = lf();
+		x.root.currentHead = "9".repeat(40);
+		x.runner.answer = (a) => (a[0] === "promote" ? { code: 1, stdout: "", stderr: "fetch failed" } : { code: 0, stdout: "", stderr: "" });
+		for (let i = 0; i < 5; i++) {
+			x.c.plusHours(0.1);
+			x.pass();
+		}
+		expect(x.runnerCalls.filter((a) => a[0] === "promote")).toEqual(Array(3).fill(["promote", "--sha", G]));
+		expect(x.rows().map((r) => r.event)).toEqual(["promote-failed", "promote-failed", "promote-failed", "promote-gave-up"]);
+		expect(errorLines(x.ledger).map((l) => l.line)).toContainEqual(expect.stringMatching(/^verifier: promotion of 1111111 on thewolff\/product failed 3 times: exit 1: fetch failed/));
+		const y = lf();
+		y.gh.tag = null;
+		y.mainRun(T, "green"); // The verified target is a descendant, not the schema barrier returned by promotion.
+		y.runner.answer = (a) => (a[0] === "promote" ? { code: 0, stdout: `schema ${"8".repeat(40)}\n`, stderr: "" } : { code: 0, stdout: "", stderr: "" });
+		y.pass();
+		y.c.plusHours(0.1);
+		y.pass();
+		expect(y.runnerCalls.filter((a) => a[0] === "promote")).toHaveLength(1);
+		expect(y.rows().filter((r) => r.event === "promote-schema")).toEqual([expect.objectContaining({ sha: "8".repeat(40), g: T, current: G })]);
+		expect(y.creates()).toHaveLength(1);
+		expect(y.g.issues[0]!.body).toContain(`schema barrier ${"8".repeat(40)}`);
+		expect(y.g.issues[0]!.body).toContain(`promote-verified.ts ${T}`);
+		expect(y.g.issues[0]!.body).not.toContain(`promote-verified.ts ${"8".repeat(40)}`);
+		expect(errorLines(y.ledger).map((l) => l.line)).toContainEqual(expect.stringContaining(`verified target ${T} — stop the tick, migrate the live ledger through ${T}, run bun surface/scripts/promote-verified.ts ${T}, restart`));
+		// A newer verified target behind the same barrier must replace the old recovery, not be suppressed by current alone.
+		y.gh.tip = HX;
+		y.mainRun(HX, "green");
+		y.pass();
+		expect(y.rows().filter((r) => r.event === "promote-schema")).toHaveLength(2);
+		expect(y.g.issues.at(-1)!.body).toContain(`promote-verified.ts ${HX}`);
+	});
+});
+
+describe("D13: a busy owner defers its PR's wake reasons (R38)", () => {
+	/** actionable with D13's owners: `why` the per-PR reasons it woke on (the train's own `train:` entry is train-wide), `all` every reason. */
+	const deferrals = (w: ReturnType<typeof world>) => {
+		const out: WakeDeferral[] = [];
+		const all = actionable(w.ledger, w.train, [101], new Map(), new Set(), () => null, { headRefs: new Map([[101, `wl/${w.owner}`]]), defer: (d) => out.push(d) });
+		return { all, why: all.filter((r) => !r.startsWith("train: ")), out };
+	};
+
+	test("an owner whose only open slice waits on an unsettled run defers; a second open slice, a settle or an expired lease does not", () => {
+		const w = world();
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite", doneCondition: "green", inputs: "#101" });
+		const runId = makeRunId(Date.parse(w.c.now()), "abcd");
+		w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: w.owner, sliceId: sl, kind: "assumption", body: testRequestedBody({ runId, pr: 101, sha: H0, slice: sl, by: OWNER_LANE }) });
+		let d = deferrals(w);
+		expect(d.why).toEqual([]);
+		expect(d.out).toEqual([{ pr: 101, owner: w.owner, busy: `${w.owner}'s only open work waits on its test run ${runId}`, reasons: ["#101's dependency merged"] }]);
+		const other = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "more", doneCondition: "done", inputs: "x" });
+		d = deferrals(w);
+		expect(d.why).toEqual(["#101's dependency merged"]);
+		expect(d.out).toEqual([]);
+		w.ledger.cancelSlice(other, { by: OWNER_LANE });
+		expect(w.ledger.claimWorkload(w.owner, { by: LANE_STARTER_BY, holder: OWNER_LANE, leaseMs: 60_000 }).won).toBe(true);
+		w.ledger.releaseWorkload(w.owner, { by: OWNER_LANE, holder: OWNER_LANE });
+		expect(w.ledger.claimWorkload(w.owner, { by: LANE_STARTER_BY, holder: OWNER_LANE, leaseMs: 60_000 }).won).toBe(true);
+		w.ledger.recordEntry({
+			by: TEST_RUNNER_BY, workloadId: w.owner, sliceId: sl, kind: "assumption",
+			body: testRunBody({ runId, verdict: "green", sha: H0, pr: 101, reason: null, headAtEnd: H0, base: null, mergeBase: null, full: { pass: 1, fail: 0, skip: 0, exit: 0, ms: 1, error: null }, solo: [], failures: [], runDir: null, preflight: null }),
+		});
+		d = deferrals(w);
+		expect(d.out.map((x) => x.busy)).toEqual([`${w.owner} is held live by ${OWNER_LANE} until ${w.ledger.workload(w.owner)!.holder_lease_until}`]);
+		w.c.plusHours(0.1);
+		d = deferrals(w);
+		expect(d.out).toEqual([]);
+		expect(d.why).toEqual(["#101's dependency merged"]);
+	});
+
+	test("train-wide reasons are never deferred", () => {
+		const w = world();
+		expect(w.ledger.claimWorkload(w.owner, { by: LANE_STARTER_BY, holder: OWNER_LANE, leaseMs: 3_600_000 }).won).toBe(true);
+		const d = deferrals(w);
+		expect(d.all).toEqual([expect.stringMatching(/^train: #101 #106 /)]);
+		expect(d.out).toEqual([expect.objectContaining({ pr: 101, reasons: ["#101's dependency merged"] })]);
 	});
 });

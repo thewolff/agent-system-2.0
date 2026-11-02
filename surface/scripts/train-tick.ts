@@ -39,7 +39,7 @@
 //  5. Alerts (D9). Each question on a train slice is an alert: the production merge question the lane raises and the failed-twice
 //     question of step 2. The send ladder (`trainAlertActions`): level 1 files an issue on TRAIN_ALERT_REPO labelled as2-train;
 //     4 h and 8 h after it, while the question is open and the issue is not closed, a comment mentioning @thewolff, the `loud`
-//     (then also `critical`) label, a macOS notification with sound, and the LOUD needs-you line (surface/src/errors.ts). Each send
+//     (then also `critical`) label, a silent macOS notification, and the LOUD needs-you line (surface/src/errors.ts). Each send
 //     writes `train-alert: <q> level <n> sending`, does its effects (the issue body and each comment carry a marker the tick looks
 //     for before creating one, and again after a failed create before anything is retried, adopting an issue the failed call filed;
 //     only a missing label is retried, once, after the label is created; labels are only added, never removed; the notification
@@ -48,8 +48,8 @@
 //     lookup reads every as2-train issue (`ISSUE_LIST_ARGS`, every page); a lookup that fails or reads an unexpected shape throws,
 //     so nothing is created and no `closed` is written on a partial answer: the action stays due for the next pass.
 // 3b. Boarding (PLAN wl-mvbjiettjrfpxc D1, D3, D4). The first pass writes the cutover, `train-autoboard: on <iso>`, once on the
-//     standing workload. Then every workload closed within 14 days on a repository the test runner serves (`autoboardCandidates`,
-//     newest close first; a train, a fix workload, a W a board still covers and a W whose PR ended are not read) gets `landingReady`,
+//     standing workload. Then every recent closed workload or released landing receipt on a served repository (`autoboardCandidates`,
+//     newest readiness first; a train, a fix workload, a W a board still covers and a W whose PR ended are not read) gets `landingReady`,
 //     and a ready one the live half: `gh pr view <n> --json <TASK_VIEW_FIELDS>,state,baseRefName,isDraft` (OPEN, no draft, base
 //     main, head branch exactly wl/<W> on the same repository, `prStakes` normal) and, when the head is not the green sha G,
 //     `ghCompare(G, head)` judged by `decisionLogFault`: the head descends from G through single-parent commits each touching only
@@ -74,21 +74,30 @@
 // next run; Jo is not alerted (a boarding or notice failure is logged in the tick's log only). The launcher is
 // `bun surface/scripts/lane.ts launch <wl> --requested-by merge-train`. Steps 3b-3e need the standing workload; without it they
 // are skipped and logged. Exit: 0 the pass ran (logged errors included), 1 the ledger could not be opened, 2 an argument was given.
+import { realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { defaultLedgerPath, Ledger } from "../../ledger/src/index";
+import { AS2_VERIFIED_TAG } from "../src/as2test";
 import { ceilingStopped } from "../src/ceiling";
 import { loadTestRunnerConfig } from "../src/close-entry";
-import { attempts, consumedIds, controlEntries, heldLive, holdersOf, LANE_SCRIPT, laneCap, launchRequestedBody, launchRowsFor, verdictOf } from "../src/launch";
 import {
-	actionable, type AlertAction, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, carryPairs, checkoutOwnerRepo, everyTrain, expiredHolds,
-	forkOf, forkTaskAlert, ghCompare, isTrainOrFix, type Landing, landingReady, lastReadyExit, MAIN_RED_WINDOW_MS, mainRedNoticeBody, mainRedNotices, mainRedRows, openTrainFix, openTrains,
-	ownerDeliveries, PROTECTION_UNKNOWN_RAISE_MS, protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState, protectionPassOvers, prStakes, raiseLaunchLimit,
-	raiseTwiceFailed, settleTasks, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, trainActivityArgs,
-	trainAlertActions, trainAlertBody, trainAlertEndBody, trainAlertMarker, trainAutoboardBody, trainBoardSkipBody, trainCheckout, trainHeadWokenBody, TRAIN_LAUNCH_LIMIT,
-	trainFixStakes, trainLaunchFailures, trainPrs, trainPushesOf, trainRetries, trainSliceId, trainSlicePr, type TrainPush, type TrainTask, trainWakeBody, twiceFailed, unsettledTasks,
+	attempts, consumedIds, controlEntries, heldLive, holdersOf, LANE_SCRIPT, laneCap, landFirstOffBody, landFirstOffPending, landFirstOn, launchRequestedBody, launchRowsFor, mainRetries, sameRepo, trainBindings, verdictOf,
+} from "../src/launch";
+import { attemptBlock, type ChainCommit, ghMainChain, INCONCLUSIVE, type MainState, mainResults, mainState, mainVerdicts } from "../src/main-state";
+import {
+	actionable, type AlertAction, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, carryPairs, checkoutOwnerRepo, type ControlRoot,
+	controlRootRefusal, everyTrain, expiredHolds, forkOf, forkTaskAlert, FULL_SUITE_STATUS, ghCompare, isTrainOrFix, type LandFirstEvent, landFirstNoticeBody, landFirstRepos, landFirstRows,
+	type Landing, landingPassOvers, landingReady, lastReadyExit, MAIN_RED_WINDOW_MS, MAIN_RETRY_MS, mainRedNoticeBody, mainRedNotices, mainRedRows, openTrainFix, openTrains, ownerDeliveries,
+	PROMOTE_ATTEMPTS, PROTECTION_UNKNOWN_RAISE_MS, protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState, protectionPassOvers, prStakes, raiseLaunchLimit,
+	raiseTwiceFailed, REPAIR_FAIL_MS, REVOKE_ATTEMPTS, settleTasks, stopEpisode, stopSummary, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER,
+	TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertActions, trainAlertBody, trainAlertEndBody, trainAlertMarker, trainAutoboardBody, trainBoardSkipBody, trainCheckout,
+	trainHeadWokenBody, TRAIN_LAUNCH_LIMIT, trainFixStakes, trainLaunchFailures, trainPrs, trainPushesOf, trainReconciledBody, trainRetries, trainSliceId, trainSlicePr, type TrainPush, type TrainTask,
+	trainWakeBody, twiceFailed, unsettledTasks,
 } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import { sendNotice, TRAIN_SIGNOFF_APPLIED_PREFIX, trainMergedEntryBody, trainMergedNoticeBody } from "../src/notice";
-import { type CompareResult, decisionLogFault, type TestRunnerConfig, testRuns } from "../src/test-run";
+import { type CompareResult, decisionLogFault, fastPlans, ownerRepoOf, type ResultRecord, runsRoot, type TestRunnerConfig, testRuns, withFullSuitePublication } from "../src/test-run";
 import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID } from "../src/types";
 
 /** One gh process: its exit code and output. */
@@ -98,16 +107,34 @@ export interface GhResult {
 	stderr: string;
 }
 
+/** The tick's land-first seams (PLAN wl-mvq4edbaf13vnk D6, § 2 Protect the verifier): the runner's entry points and the tick's own root. */
+export interface LandDeps {
+	/**
+	 * `bun surface/scripts/test-runner.ts <args>`, run outside the fence; its exit code and output. The tick calls `reap` (settle
+	 * every admitted main request with no settle and no live heartbeat `runner died`; a no-op when there is none), `main --repo
+	 * <owner/repo> --sha <T>` (request a main run at T: the runner admits it as the active run or replaces the pending target,
+	 * and answers 0 doing nothing when T is already either), and `promote --sha <G>` (move `verified/current`, then the tag, to
+	 * G; exit 0 with last line `promoted <G>`, or `schema <sha>` when it stopped before that schema-changing commit).
+	 */
+	runner: (args: string[]) => GhResult;
+	/** The tick's own control root, read now (`ControlRoot`); throws when git or the file system cannot answer. */
+	root: () => ControlRoot;
+	/** Configured runner runs root; tests inject an isolated directory. No new operator configuration. */
+	runsRoot?: string;
+}
+
 /** The tick's seams: gh, the lane launcher and the notification are injected, so a test runs a pass on fakes and a temp ledger. */
 export interface TickDeps {
 	ledger: Ledger;
-	gh: (args: string[]) => GhResult;
+	gh: (args: string[], timeoutMs?: number) => GhResult;
 	/** `lane.ts launch <wl> --requested-by merge-train`: its exit code and last line. */
 	launch: (wl: string) => { code: number; line: string };
-	/** A macOS notification with sound; false when it could not be shown. */
+	/** A silent macOS notification; false when it could not be shown. */
 	notify: (title: string, text: string) => boolean;
 	/** The test runner's served repositories (`testRunner.repos`, profile/config.yml): only their PRs board (D1); none, nothing boards. */
 	config?: Pick<TestRunnerConfig, "repos">;
+	/** Land-first's seams; without them the main-run pass (step 3f) is skipped with one log line. `main()` always passes them. */
+	land?: LandDeps;
 	log?: (line: string) => void;
 }
 
@@ -164,6 +191,30 @@ export function tick(d: TickDeps): string[] {
 		if (last?.body !== body) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body });
 		say(`${wl}: ${body}`);
 	};
+	// § 2 Protect the verifier (R18): while land-first is on for any repository, a tick whose own root fails the self-check
+	// refuses to run: one `tick-refused` row per reason (again after a pass reconciled since), then nothing else this pass.
+	let root: ControlRoot | null = null;
+	if (d.land && ledger.workload(STANDING_WORKLOAD_ID)) {
+		const entries = ledger.entries(STANDING_WORKLOAD_ID);
+		const on = landFirstRepos(entries, ledger.instructions(STANDING_WORKLOAD_ID), true);
+		let refusal: string[];
+		try {
+			root = d.land.root();
+			refusal = controlRootRefusal(root, entries);
+		} catch (err) {
+			refusal = [`the tick's control root could not be read: ${err instanceof Error ? err.message : String(err)}`];
+		}
+		if (refusal.length > 0 && on.length > 0) {
+			const reason = refusal.join("; ").replace(/\s+/g, " ").trim();
+			const prior = landFirstRows(entries, "*").findLast((r) => r.event === "tick-refused");
+			const since = prior === undefined ? false : controlEntries(entries).some((c) => c.prefix === "train-reconciled" && c.createdAt > prior.createdAt);
+			if (prior?.event !== "tick-refused" || prior.reason !== reason || since) {
+				ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstNoticeBody("*", { event: "tick-refused", reason }) });
+			}
+			say(`train tick refused: land-first is on for ${on.join(", ")} and the tick's root fails the self-check: ${reason} — reinstall from verified/current (install/install.sh --control-root=verified)`);
+			return out;
+		}
+	}
 	/**
 	 * Run the launcher for `wl`, after writing `launch-requested: by merge-train` unless one is unconsumed already. On an open
 	 * train (cap-exempt, PLAN wl-mvpsrr4tr0p1xc D2) the verdict (`launchRowsFor` + `verdictOf`) is read first: when the train's
@@ -335,7 +386,8 @@ export function tick(d: TickDeps): string[] {
 		return repos.get(wl)!;
 	};
 	let notices: { wake: Map<string, string>; open: Set<string> } = { wake: new Map(), open: new Set() };
-	if (!ledger.workload(STANDING_WORKLOAD_ID)) say(`${STANDING_WORKLOAD_ID}: no standing workload: boarding, protection, red-main and merge notices skipped`);
+	let land: LandResult | null = null;
+	if (!ledger.workload(STANDING_WORKLOAD_ID)) say(`${STANDING_WORKLOAD_ID}: no standing workload: boarding, protection, red-main, merge notices and main runs skipped`);
 	else {
 		if (autoboardCutover(ledger) === null) {
 			const body = trainAutoboardBody(ledger.now());
@@ -357,6 +409,10 @@ export function tick(d: TickDeps): string[] {
 		notices = protectionPass(d, ghJson, ops, say, read, repoOf);
 		mainRedPass(d, ghJson, ops, say);
 		mergeNoticePass(d, say, repoOf);
+		// 3f. Main runs, landing and promotion (PLAN wl-mvq4edbaf13vnk D6).
+		const served = servedRepos(d.config, say);
+		if (d.land) land = landPass(d, d.land, ghJson, ops, say, repoOf, served, root);
+		else if (served.length > 0) say("land-first: no runner seam (TickDeps.land): main runs, landing and promotion skipped this pass");
 	}
 
 	// 4. Wakes.
@@ -373,10 +429,25 @@ export function tick(d: TickDeps): string[] {
 		const untested = trainRetries(ledger, wl, heads).untested;
 		const expired = expiredHolds(ledger, wl, stakesOf);
 		// D6: while the repo's protection episode is open, a PR passed over for protection waits; its clearing wakes the train.
-		const held = notices.open.has(repoOf(wl) ?? "") ? protectionPassOvers(ledger, wl) : new Set<number>();
-		const why = actionable(ledger, wl, facts?.mergedDeps ?? [], heads, held, stakesOf);
+		// PLAN wl-mvq4edbaf13vnk D6: likewise a PR passed over while the repo's landing is stopped; landing reopening wakes the train.
+		const repo = repoOf(wl) ?? "";
+		const held = new Set([...(notices.open.has(repo) ? protectionPassOvers(ledger, wl) : []), ...(land?.stopped.has(repo) ? landingPassOvers(ledger, wl) : [])]);
+		// D13: a per-PR reason waits while the PR's owner is busy (a live lease, or only an unsettled run); one line per PR.
+		const deferred = new Set<number>();
+		const headRefs = new Map([...(facts?.views ?? [])].map(([n, v]) => [n, v.headRefName]));
+		const why = actionable(ledger, wl, facts?.mergedDeps ?? [], heads, held, stakesOf, {
+			headRefs,
+			defer: (x) => {
+				deferred.add(x.pr);
+				say(`${wl}: #${x.pr} wake deferred while its owner is busy: ${x.busy} (${x.reasons.join("; ")})`);
+			},
+		});
 		const cleared = notices.wake.get(wl);
 		if (cleared !== undefined) why.push(cleared);
+		const reopened = land?.wake.get(wl);
+		if (reopened !== undefined) why.push(reopened);
+		const repair = land?.repairs.get(wl);
+		if (repair !== undefined) why.push(`repair ${repair.tip.slice(0, 7)}`);
 		// D4: at the limit nothing is requested and nothing launched; Jo hears it once per episode, NOW.
 		const failures = trainLaunchFailures({
 			entries: ledger.entries(wl), instructions: ledger.instructions(wl), questions: ledger.questions(wl), holder: w.holder, holderLeaseUntil: w.holder_lease_until, now: ledger.now(),
@@ -400,13 +471,20 @@ export function tick(d: TickDeps): string[] {
 			const after = ledger.entries(wl);
 			const from = r.requestId === null ? r.before : after.findIndex((e) => e.id === r.requestId);
 			for (const h of untested) {
+				if (deferred.has(h.pr)) continue;
 				const body = trainHeadWokenBody(h.pr, h.sha);
 				if (after.some((e, i) => i >= from && e.created_by === MERGE_TRAIN_BY && e.kind === "assumption" && e.body === body)) continue;
 				ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body });
 			}
 		}
-		if (r && (r.requestId !== null || r.code === 0)) for (const h of expired) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainWakeBody(h.pr, h.holdId) });
+		if (r && (r.requestId !== null || r.code === 0)) {
+			for (const h of expired) if (!deferred.has(h.pr)) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainWakeBody(h.pr, h.holdId) });
+			if (repair !== undefined) landNote(d, say, repair.repo, { event: "repair-woken", tip: repair.tip, train: wl });
+		}
 	}
+
+	// 3f's train-reconciled entries, after the wakes they owed (D6, R18).
+	if (land !== null) reconcile(d, land, say);
 
 	// 5. Alerts.
 	for (const facts of trains) {
@@ -451,8 +529,8 @@ interface Boardable {
 }
 
 /**
- * Step 3b (D1, D3, D4): scan the candidates, newest close first, through `landingReady` and the live half (`liveHalf`), then board
- * the ready ones oldest close first (`boardLanding`). A candidate that cannot board gets `train-board-skip:` once per (W, pr, head,
+ * Step 3b (D1, D3, D4): scan the candidates, newest readiness first, through `landingReady` and the live half (`liveHalf`), then board
+ * the ready ones oldest readiness first (`boardLanding`). A candidate that cannot board gets `train-board-skip:` once per (W, pr, head,
  * reason); a gh failure is logged only (retried next pass). Returns the PRs that passed both halves, boarded or not.
  */
 function boardingPass(d: TickDeps, ghJson: (args: string[]) => unknown, say: (line: string) => void): Boardable[] {
@@ -491,7 +569,7 @@ function boardingPass(d: TickDeps, ghJson: (args: string[]) => unknown, say: (li
 			say(`${wl}: board #${l.pr}: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	}
-	ready.sort((a, b) => a.l.closedAt.localeCompare(b.l.closedAt) || a.l.workloadId.localeCompare(b.l.workloadId));
+	ready.sort((a, b) => a.l.readyAt.localeCompare(b.l.readyAt) || a.l.workloadId.localeCompare(b.l.workloadId));
 	for (const b of ready) {
 		const r = boardLanding(ledger, b.l, { head: b.head });
 		if (r.boarded) say(`${r.train}: #${b.l.pr} of ${b.l.workloadId} boarded at ${b.head}${r.opened ? ", train opened" : ""} (${r.entryId})`);
@@ -628,6 +706,562 @@ function mainRedPass(d: TickDeps, ghJson: (args: string[]) => unknown, ops: Issu
 		} catch (err) {
 			say(`${STANDING_WORKLOAD_ID}: main-red ${n.url}: ${err instanceof Error ? err.message : String(err)}`);
 		}
+	}
+}
+
+/** What step 3f found, for the wakes (step 4) and the `train-reconciled:` entries written after them. */
+interface LandResult {
+	/** Trains to wake: landing reopened on their repository and they passed a PR over while it was stopped. */
+	wake: Map<string, string>;
+	/** Land-first repositories whose landing is stopped: their landing pass-overs get no backoff wake. */
+	stopped: Set<string>;
+	/** The open train to wake for each regression's repair (D7), until its `repair-woken` row is written. */
+	repairs: Map<string, { repo: string; tip: string }>;
+	/** Each land-first repository whose pass read main and wrote every row it owed: what its `train-reconciled:` says. */
+	reconcile: { repo: string; state: MainState; read: string | null; repair: string | null }[];
+}
+
+const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
+/** A process's last output line, for a log line or a row. */
+const lastLine = (r: GhResult) => ((r.stdout.trim() || r.stderr.trim()).split("\n").at(-1) ?? "").trim() || "no output";
+const SHA40 = /^[0-9a-f]{40}$/;
+
+/** One land-first row (`landFirstNoticeBody`) on the standing workload as MERGE_TRAIN_BY, and its log line. */
+function landNote(d: Pick<TickDeps, "ledger">, say: (line: string) => void, repo: string, e: LandFirstEvent): void {
+	const body = landFirstNoticeBody(repo, e);
+	d.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+	say(`${STANDING_WORKLOAD_ID}: ${body}`);
+}
+
+/** The test runner's served repositories (`testRunner.repos`) as lowercase `owner/repo`, each once; an origin naming none is logged. */
+function servedRepos(config: TickDeps["config"], say: (line: string) => void): string[] {
+	const out = new Set<string>();
+	for (const r of config?.repos ?? []) {
+		const repo = ownerRepoOf(r.origin);
+		if (repo === null) say(`land-first: testRunner origin ${r.origin} names no GitHub repository: no main runs for it`);
+		else out.add(repo.toLowerCase());
+	}
+	return [...out].sort();
+}
+
+/** Main's tip on GitHub: `gh api repos/<repo>/git/ref/heads/main`'s sha. */
+function mainTip(repo: string, ghJson: (args: string[]) => unknown): string {
+	const path = `repos/${repo}/git/ref/heads/${DEFAULT_BRANCH}`;
+	const sha = field(field(ghJson(["api", path]), "object"), "sha");
+	if (typeof sha !== "string" || !SHA40.test(sha)) throw new GhError(`gh api ${path} returned an unexpected shape`);
+	return sha;
+}
+
+/**
+ * Step 3f (PLAN wl-mvq4edbaf13vnk D6), on the standing workload. Reap first (`test-runner.ts reap`). Then per served repository,
+ * land-first on or not (§ 2 Bootstrap, shadow mode): main's tip and chain (`ghMainChain`), its state (`mainState`), a main run
+ * requested when the tip has no verdict (`requestMain`), and, for the tick's own control repository, promotion reconciled
+ * (`promotePass`). Only with land-first on: the stop episode, its issue and notice, the repair wake, revocation and the
+ * reopen wake (`landingPass`), and a `train-reconciled:` to write after step 4 (`reconcile`). A repository whose main cannot be
+ * read is logged and gets no `train-reconciled:` this pass (F7).
+ */
+function landPass(
+	d: TickDeps, land: LandDeps, ghJson: (args: string[]) => unknown, ops: IssueOps, say: (line: string) => void, repoOf: (wl: string) => string | null, served: string[],
+	root: ControlRoot | null,
+): LandResult {
+	const { ledger } = d;
+	const res: LandResult = { wake: new Map(), stopped: new Set(), repairs: new Map(), reconcile: [] };
+	if (served.length === 0) return res;
+	const reap = land.runner(["reap"]);
+	if (reap.code !== 0) say(`land-first: bun surface/scripts/test-runner.ts reap exited ${reap.code}: ${lastLine(reap)} — no main run is requested this pass; the next pass reaps again`);
+	// The watermark (§ 2): the newest main-run settle this pass read, after the reap's.
+	const results = mainResults(ledger.entries(STANDING_WORKLOAD_ID));
+	const read = results.at(-1)?.entryId ?? null;
+	const greens = new Set([...mainVerdicts(results).values()].filter((v) => v.verdict === "green").map((v) => v.sha));
+	for (const repo of served) {
+		// Off reconciliation does not depend on main being readable, green or even requested this pass.
+		if (!reconcileLandFirstOff(d, repo, land.runsRoot ?? runsRoot(process.env), repoOf, say)) {
+			res.stopped.add(repo);
+			continue;
+		}
+		try {
+			const tip = mainTip(repo, ghJson);
+			const chain: ChainCommit[] = ghMainChain(repo, tip, ghJson, greens);
+			const state = mainState(chain, results, Date.parse(ledger.now()));
+			if (reap.code === 0) requestMain(d, land, say, repo, tip, results);
+			if (root !== null && root.repo === repo) promotePass(d, land, ops, say, repo, state, root);
+			if (!landFirstOn(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), repo)) continue;
+			const repair = landingPass(d, ghJson, ops, say, repoOf, repo, state, results, res);
+			res.reconcile.push({ repo, state, read, repair });
+		} catch (err) {
+			say(`land-first ${repo}: ${errText(err)} — no train-reconciled written this pass; the next pass reads main again`);
+		}
+	}
+	return res;
+}
+
+/**
+ * Discover workloads and their repositories outside the publication mutex. Each head serializes a
+ * fresh ledger-only provenance/activation read and one deadline-clipped POST; completion only the known ids.
+ * Scheduled ticks are the only retry layer: three attempts per newest off instruction, then held
+ * until repair and an explicit new `land-first <repo> off` word. Off receipts never count as
+ * landingPass revocation failures.
+ */
+export function reconcileLandFirstOff(
+	d: Pick<TickDeps, "ledger" | "gh">, repo: string, root: string, repoOf: (wl: string) => string | null, say: (line: string) => void,
+): boolean {
+	const { ledger } = d;
+	const pending = () => landFirstOffPending(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), repo);
+	const ids = pending();
+	if (ids.length === 0) return true;
+	const block = ids.at(-1)!;
+	const attemptPrefix = `off-reconcile-attempt: ${repo} ${block} `;
+	const repair = `merges held; repair the named failure, then issue land-first ${repo} off again to begin a fresh retry block`;
+	// Exact repeated failure receipts are deduplicated within a block, even across other errors.
+	const receipt = (detail: string) => {
+		const body = `train-error: off reconciliation pending for ${repo}: block ${block}: ${detail.replace(/\s+/g, " ").trim()}`;
+		ledger.write(() => {
+			if (!ledger.entries(STANDING_WORKLOAD_ID, "assumption").some((e) => e.created_by === MERGE_TRAIN_BY && e.body === body)) {
+				ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+			}
+		});
+		say(body);
+	};
+	const attempts = ledger.write(() => {
+		const tried = ledger.entries(STANDING_WORKLOAD_ID, "assumption").filter((e) => e.created_by === MERGE_TRAIN_BY && e.body.startsWith(attemptPrefix)).length;
+		if (tried < REVOKE_ATTEMPTS) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `${attemptPrefix}${tried + 1}` });
+		return tried;
+	});
+	if (attempts >= REVOKE_ATTEMPTS) {
+		receipt(`OffReconciliationExhausted: ${REVOKE_ATTEMPTS} attempts exhausted; ${repair}`);
+		return false;
+	}
+	try {
+		// Drain any publisher that read on before the off word. Otherwise the scan could observe
+		// pending, skip that head, then complete off after the old publisher finally posts success.
+		const scan = withFullSuitePublication(root, repo, (remainingMs) => {
+			remainingMs();
+			return pending().some((id) => ids.includes(id));
+		});
+		if (!scan) return pending().length === 0;
+		const ghJson = (args: string[]): unknown => {
+			const r = d.gh(args);
+			if (r.code !== 0) throw new GhError(`gh ${args.join(" ")} exited ${r.code}: ${lastLine(r)}`);
+			try {
+				return JSON.parse(r.stdout);
+			} catch (error) {
+				throw new GhError(`gh ${args.join(" ")} returned invalid JSON: ${errText(error)}`);
+			}
+		};
+		const open = openHeads(repo, ghJson, true);
+		// Include closed workloads: their unmerged PRs can still have usable required statuses.
+		const workloads = ledger.db.query<{ workload_id: string }, []>(
+			"SELECT DISTINCT workload_id FROM entries WHERE kind = 'assumption' AND created_by = 'test-runner' AND body LIKE 'test-requested: %'",
+		).all();
+		const origins = new Map(workloads.map(({ workload_id: wl }) => [wl, repoOf(wl)]));
+		let failed = false;
+		for (const [pr, head] of open) {
+			try {
+				if (newestGateStatus(repo, head, ghJson, true)?.state !== "success") continue;
+				// Discovery is not authority: a full run can settle and publish while statuses are read.
+				const revoked = withFullSuitePublication(root, repo, (remainingMs) => {
+					const entries = ledger.entries(STANDING_WORKLOAD_ID);
+					const instructions = ledger.instructions(STANDING_WORKLOAD_ID);
+					const current = landFirstOffPending(entries, instructions, repo);
+					if (!ids.some((id) => current.includes(id)) || landFirstOn(entries, instructions, repo)) return false;
+					const kind = offHeadAuthority(ledger, repo, pr, head, origins);
+					if (kind === "full") return false;
+					if (kind !== "fast") throw new Error(`cannot identify whether #${pr} ${head}'s success is a full result or fast/tree plan; repair its runner provenance`);
+					const r = d.gh(["api", "-X", "POST", `repos/${repo}/statuses/${head}`, "-f", "state=failure", "-f", `context=${FULL_SUITE_STATUS}`, "-f", "description=land-first off: fast/tree success revoked; request the full suite"], remainingMs());
+					if (r.code !== 0) throw new GhError(`gh status revoke #${pr} ${head} exited ${r.code}: ${lastLine(r)}`);
+					return true;
+				});
+				if (revoked) say(`land-first ${repo}: off reconciliation revoked #${pr} ${head}`);
+			} catch (error) {
+				failed = true;
+				try {
+					receipt(`#${pr} ${head}: ${errText(error)}; merges held; next scheduled tick retries within this instruction's attempt limit`);
+				} catch (receiptError) {
+					throw new AggregateError([error, receiptError], `off reconciliation #${pr} ${head} failed: ${errText(error)}; failure receipt also failed: ${errText(receiptError)}`);
+				}
+			}
+		}
+		if (failed) {
+			if (attempts + 1 >= REVOKE_ATTEMPTS) receipt(`OffReconciliationExhausted: ${REVOKE_ATTEMPTS} attempts exhausted; ${repair}`);
+			return false;
+		}
+		// Every publisher re-reads activation under this mutex; pending off forbids new fast/tree
+		// successes. Thus listing may be outside it, and this bounded completion cannot clear new ids.
+		const complete = withFullSuitePublication(root, repo, (remainingMs) => {
+			remainingMs();
+			ledger.write(() => {
+				const current = pending();
+				for (const id of ids.filter((id) => current.includes(id))) {
+					const instruction = ledger.instructions(STANDING_WORKLOAD_ID).find((i) => i.id === id)!;
+					const wordRepo = instruction.body.split(" ")[1]!;
+					ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstOffBody(wordRepo, "complete", id) });
+				}
+			});
+			return pending().length === 0;
+		});
+		say(`land-first ${repo}: off reconciliation completed for ${ids.join(", ")}${complete ? "; fast/tree successes revoked, full results preserved" : "; a newer off remains pending"}`);
+		return complete;
+	} catch (error) {
+		try {
+			receipt(`${errText(error)}; merges held; next scheduled tick retries within this instruction's attempt limit`);
+			if (attempts + 1 >= REVOKE_ATTEMPTS) receipt(`OffReconciliationExhausted: ${REVOKE_ATTEMPTS} attempts exhausted; ${repair}`);
+		} catch (receiptError) {
+			throw new AggregateError([error, receiptError], `off reconciliation for ${repo} failed: ${errText(error)}; failure receipt could not be persisted: ${errText(receiptError)}`);
+		}
+		return false;
+	}
+}
+
+/**
+ * Read only this head's runner authority at serialization. Repository discovery stays outside the
+ * lock; a newly appearing workload has unknown origin until the next scheduled pass, never stale
+ * fast authority. Copied full/Mac counts must trace to a genuine full source, not a tree/fast plan.
+ */
+function offHeadAuthority(ledger: Ledger, repo: string, pr: number, head: string, origins: ReadonlyMap<string, string | null>): "fast" | "full" | "unknown" {
+	const owners = ledger.db.query<{ workload_id: string }, [string]>(
+		"SELECT DISTINCT workload_id FROM entries WHERE kind = 'assumption' AND created_by = 'test-runner' AND body LIKE ?",
+	).all(`test-requested: % pr=${pr} sha=${head} %`);
+	let kind: "fast" | "unknown" = "unknown";
+	let uncertain = false;
+	for (const { workload_id: wl } of owners) {
+		const origin = origins.get(wl);
+		if (origin === undefined || origin === null) {
+			uncertain = true;
+			continue;
+		}
+		if (!sameRepo(origin, repo)) continue;
+		const rows = ledger.entries(wl);
+		const records = testRuns(rows);
+		const plans = fastPlans(rows);
+		for (const run of records) {
+			if (run.request.pr !== pr || run.request.sha !== head || run.result === null) continue;
+			let source = run.result;
+			let plan = plans.get(source.runId);
+			const seen = new Set<string>();
+			for (;;) {
+				if (plan?.scope === "tree" || plan?.scope === "fast" || source.scope === "fast" || source.reason?.startsWith("carried from main run ")) {
+					kind = "fast";
+					break;
+				}
+				if (source.scope !== "full" || source.host !== "mac" || (source.verdict !== "green" && source.verdict !== "red-main") || seen.has(source.runId)) {
+					uncertain = true;
+					break;
+				}
+				seen.add(source.runId);
+				const carried = /^carried from (tr-[a-z0-9]+) at [0-9a-f]{40} \(decision-log only\)$/.exec(source.reason ?? "");
+				if (carried === null) {
+					if (!source.reason?.startsWith("carried from ")) return "full";
+					uncertain = true;
+					break;
+				}
+				// Source requests may live on a different workload. Only previously discovered,
+				// same-repository owners establish provenance; missing/cyclic chains fail closed.
+				const sources = ledger.db.query<{ workload_id: string }, [string]>(
+					"SELECT DISTINCT workload_id FROM entries WHERE kind = 'assumption' AND created_by = 'test-runner' AND body LIKE ?",
+				).all(`test-requested: ${carried[1]} %`);
+				if (sources.length !== 1) {
+					uncertain = true;
+					break;
+				}
+				const owner = sources[0]!.workload_id;
+				const sourceOrigin = origins.get(owner);
+				if (sourceOrigin === undefined || sourceOrigin === null || !sameRepo(sourceOrigin, repo)) {
+					uncertain = true;
+					break;
+				}
+				const sourceRows = ledger.entries(owner);
+				const previous = testRuns(sourceRows).find((r) => r.request.runId === carried[1])?.result;
+				if (!previous) {
+					uncertain = true;
+					break;
+				}
+				source = previous;
+				plan = fastPlans(sourceRows).get(source.runId);
+			}
+		}
+	}
+	return uncertain ? "unknown" : kind;
+}
+
+/**
+ * D6's main-run request for tip `tip`: none when it has a verdict; when its attempt block is exhausted (`attemptBlock`, reopened
+ * only by Jo's `main-retry:`), one `exhausted` row per block and no request; when its last run was inconclusive, only once that
+ * run is MAIN_RETRY_MS old; otherwise `test-runner.ts main --repo <repo> --sha <tip>` (the runner answers 0 doing nothing while
+ * that tip is already its active or pending main run). A refused request is logged; the next pass asks again.
+ */
+function requestMain(d: TickDeps, land: LandDeps, say: (line: string) => void, repo: string, tip: string, results: readonly ResultRecord[]): void {
+	const { ledger } = d;
+	if (mainVerdicts(results).has(tip)) return;
+	const entries = ledger.entries(STANDING_WORKLOAD_ID);
+	const block = attemptBlock(tip, results, mainRetries(entries, ledger.instructions(STANDING_WORKLOAD_ID), repo));
+	if (block.exhausted) {
+		if (!landFirstRows(entries, repo).some((r) => r.event === "exhausted" && r.sha === tip && r.block === block.block)) landNote(d, say, repo, { event: "exhausted", sha: tip, block: block.block });
+		return;
+	}
+	const last = results.findLast((r) => r.sha === tip);
+	if (last !== undefined && INCONCLUSIVE.includes(last.verdict) && Date.parse(ledger.now()) - Date.parse(last.createdAt) < MAIN_RETRY_MS) return;
+	const r = land.runner(["main", "--repo", repo, "--sha", tip]);
+	say(`land-first ${repo}: main run at ${tip.slice(0, 7)} (attempt block ${block.block}, ${block.attempts} inconclusive): test-runner main exited ${r.code}: ${lastLine(r)}`);
+}
+
+/** The `as2-verified` tag's commit on `repo`; null when the tag does not exist (gh answers 404). */
+function verifiedTag(d: TickDeps, repo: string): string | null {
+	const path = `repos/${repo}/git/ref/tags/${AS2_VERIFIED_TAG}`;
+	const r = d.gh(["api", path]);
+	if (r.code !== 0) {
+		if (/HTTP 404|Not Found/.test(`${r.stderr}\n${r.stdout}`)) return null;
+		throw new GhError(`gh api ${path} exited ${r.code}: ${lastLine(r)}`);
+	}
+	let json: unknown;
+	try {
+		json = JSON.parse(r.stdout);
+	} catch {
+		throw new GhError(`gh api ${path} did not return json`);
+	}
+	const object = field(json, "object");
+	const sha = field(object, "sha");
+	if (field(object, "type") !== "commit" || typeof sha !== "string" || !SHA40.test(sha)) throw new GhError(`gh api ${path} does not name a commit (an annotated or misshapen tag)`);
+	return sha;
+}
+
+/**
+ * § 2 "Promotion is reconciled" (R31), the tick's control repository only, land-first on or not: while `verified/current` or
+ * the `as2-verified` tag lags G, `test-runner.ts promote --sha <G>` (idempotent) once per pass, at most PROMOTE_ATTEMPTS
+ * failures per G (each a `promote-failed` row, the last also `promote-gave-up`), meanwhile running from the current root. An
+ * answer `schema <sha>` (it stopped before that schema-changing commit) files one issue and writes `promote-schema`; no further
+ * call until `current` moves (Jo's reserved promotion). A success after a failure or a schema wait writes `promote-ok`, which
+ * clears the render's verifier line.
+ */
+function promotePass(d: TickDeps, land: LandDeps, ops: IssueOps, say: (line: string) => void, repo: string, state: MainState, root: ControlRoot): void {
+	const { ledger } = d;
+	const g = state.g;
+	if (g === null) return;
+	try {
+		const tag = verifiedTag(d, repo);
+		if (root.currentHead === g && tag === g) return;
+		const rows = landFirstRows(ledger.entries(STANDING_WORKLOAD_ID), repo);
+		const settled = rows.findLast((r) => r.event === "promote-schema" || r.event === "promote-ok");
+		if (settled?.event === "promote-schema" && settled.current === root.currentHead && settled.g === g) return;
+		const fails = rows.filter((r) => r.event === "promote-failed" && r.g === g).length;
+		if (fails >= PROMOTE_ATTEMPTS) return;
+		const r = land.runner(["promote", "--sha", g]);
+		const line = lastLine(r);
+		const m = /^(promoted|schema) ([0-9a-f]{40})$/.exec(line);
+		if (r.code === 0 && m?.[1] === "promoted" && m[2] === g) {
+			const since = rows.findLast((x) => x.event === "promote-ok")?.createdAt ?? "";
+			if (rows.some((x) => (x.event === "promote-failed" || x.event === "promote-gave-up" || x.event === "promote-schema") && x.createdAt >= since)) landNote(d, say, repo, { event: "promote-ok", g });
+			else say(`land-first ${repo}: promoted ${g.slice(0, 7)} (current and the tag)`);
+			return;
+		}
+		if (r.code === 0 && m?.[1] === "schema") {
+			const sha = m[2]!;
+			const url = fileNotice(ops, `<!-- train-notice land-first ${repo} promote-schema ${sha} target ${g} -->`, `verifier: promotion on ${repo} waits on a schema change at ${sha.slice(0, 7)}`, [
+				`Commit ${sha} on ${repo} changes a schema-migration path (ledger/schema.sql or the SCHEMA_VERSION line of ledger/src/index.ts).`,
+				`Promotion stopped before it: verified/current stays at ${root.currentHead ?? "(none)"}, so the control plane keeps running on the old schema; G is ${g}.`,
+				"",
+				`Jo's reserved step: stop the tick, migrate the live ledger through verified target ${g} (including schema barrier ${sha}), run \`bun surface/scripts/promote-verified.ts ${g}\`, restart.`,
+			].join("\n"));
+			landNote(d, say, repo, { event: "promote-schema", sha, g, current: root.currentHead, issue: url });
+			return;
+		}
+		const error = r.code === 0 ? `unexpected answer: ${line}` : `exit ${r.code}: ${line}`;
+		landNote(d, say, repo, { event: "promote-failed", g, attempt: fails + 1, error });
+		if (fails + 1 >= PROMOTE_ATTEMPTS) landNote(d, say, repo, { event: "promote-gave-up", g, error });
+	} catch (err) {
+		say(`land-first ${repo}: promotion of ${g.slice(0, 7)} not reconciled this pass: ${errText(err)}`);
+	}
+}
+
+/** The open PRs of `repo` and their heads: `gh pr list --state open`. */
+function openHeads(repo: string, ghJson: (args: string[]) => unknown, all = false): Map<number, string> {
+	const response = all
+		? ghJson(["api", `repos/${repo}/pulls?state=open&per_page=100`, "--paginate", "--slurp"])
+		: ghJson(["pr", "list", "-R", repo, "--state", "open", "--json", "number,headRefOid", "--limit", "500"]);
+	if (!Array.isArray(response) || (all && response.some((page) => !Array.isArray(page)))) throw new GhError(`gh open PR listing -R ${repo} returned an unexpected shape`);
+	const list: unknown[] = all ? response.flat() : response;
+	const out = new Map<number, string>();
+	for (const p of list as unknown[]) {
+		const n = field(p, "number");
+		const head = all ? field(field(p, "head"), "sha") : field(p, "headRefOid");
+		if (typeof n !== "number" || typeof head !== "string" || !SHA40.test(head)) throw new GhError(`gh pr list -R ${repo} returned a PR with no number or head`);
+		out.set(n, head);
+	}
+	return out;
+}
+
+/** The newest `as2/full-suite` status on `sha` (GitHub lists a commit's statuses newest first); null when it has none. */
+function newestGateStatus(repo: string, sha: string, ghJson: (args: string[]) => unknown, all = false): { state: string; description: string } | null {
+	const path = `repos/${repo}/commits/${sha}/statuses`;
+	const response = ghJson(["api", path, ...(all ? ["--paginate", "--slurp"] : [])]);
+	if (!Array.isArray(response) || (all && response.some((page) => !Array.isArray(page)))) throw new GhError(`gh api ${path} returned an unexpected shape`);
+	const list: unknown[] = all ? response.flat() : response;
+	const s = (list as unknown[]).find((x) => field(x, "context") === FULL_SUITE_STATUS);
+	if (s === undefined) return null;
+	const state = field(s, "state");
+	const description = field(s, "description");
+	if (typeof state !== "string") throw new GhError(`gh api ${path} returned a status with no state`);
+	return { state, description: typeof description === "string" ? description : "" };
+}
+
+/**
+ * D6 and D7 for one land-first repository: landing open closes an open stop episode (its issue closed, `stop-cleared`) and
+ * wakes each open train on the repository with a landing pass-over. Stopped: the episode's `stop-raised` (the one notice) or
+ * `stop-updated` when its kind or tip changes (a comment on its issue), its jo-issues issue for a regression or an
+ * infrastructure stop (`stop-filed`), the repair wake for a regression once per episode (the repository's open train, step 4;
+ * no open train is logged and recorded `train none`), and `repair-failed` REPAIR_FAIL_MS after the wake. While stopped, every
+ * open head whose newest `as2/full-suite` is a success is revoked (failure `landing stopped: …`), one attempt per head per pass,
+ * REVOKE_ATTEMPTS at most, then `revoke-gave-up`; a success the gate posted as the repair (`repair: …`) is kept and returned as
+ * the repair head. A given-up head that is no longer its PR's open head gets `revoke-cleared`. Throws when GitHub cannot answer.
+ */
+function landingPass(
+	d: TickDeps, ghJson: (args: string[]) => unknown, ops: IssueOps, say: (line: string) => void, repoOf: (wl: string) => string | null, repo: string, state: MainState,
+	results: readonly ResultRecord[], res: LandResult,
+): string | null {
+	const { ledger } = d;
+	// Preserve the decision's ledger dependencies through discovery, without holding a network lock.
+	const activation = controlEntries(ledger.entries(STANDING_WORKLOAD_ID))
+		.filter((c) => c.prefix === "land-first" && sameRepo(c.rest.split(" ")[0]!, repo)).map((c) => c.id).join(" ");
+	const watermark = results.at(-1)?.entryId ?? null;
+	const rows = () => landFirstRows(ledger.entries(STANDING_WORKLOAD_ID), repo);
+	const sha7 = (s: string) => s.slice(0, 7);
+	const suspects = [...new Set(state.suspects.flatMap((s) => s.prs))].sort((a, b) => a - b);
+	let ep = stopEpisode(rows());
+	if (state.open) {
+		if (ep !== null) {
+			if (ep.filed !== null) closeNotice(ops, ghJson, ep.filed, `Landing on ${repo} reopened at ${sha7(state.tip)} (G ${sha7(state.g!)}) (as2).`);
+			landNote(d, say, repo, { event: "stop-cleared", why: `landing open at ${sha7(state.tip)}, G ${sha7(state.g!)}` });
+			for (const t of openTrains(ledger)) if (repoOf(t) === repo && landingPassOvers(ledger, t).size > 0) res.wake.set(t, `landing reopened on ${repo}`);
+		}
+	} else {
+		res.stopped.add(repo);
+		const kind = state.stop!;
+		const red = state.suspects.find((s) => s.verdict !== null && s.verdict.verdict !== "green");
+		const redRun = red?.verdict ? (results.find((r) => r.runId === red.verdict!.runId) ?? null) : null;
+		const stop = { kind, tip: state.tip, g: state.g, suspects, failing: redRun === null ? null : (redRun.full?.fail ?? redRun.failures.length) };
+		const body = () => issueBody(ledger, repo, state, suspects, redRun, repoOf);
+		if (ep === null) {
+			landNote(d, say, repo, { event: "stop-raised", ...stop });
+			ep = stopEpisode(rows())!;
+		} else if (ep.state.kind !== kind || ep.state.tip !== state.tip) {
+			landNote(d, say, repo, { event: "stop-updated", ...stop });
+			if (ep.filed !== null) ops.run(["issue", "comment", issueNumber(ep.filed), "-R", TRAIN_ALERT_REPO, "--body", `Updated (as2):\n${body()}`]);
+			ep = stopEpisode(rows())!;
+		}
+		if (kind !== "depth" && ep.filed === null) {
+			const url = fileNotice(ops, `<!-- train-notice land-first ${repo} ${ep.raised.entryId} -->`, `landing stopped on ${repo} (${kind}) at ${sha7(state.tip)}`, body());
+			landNote(d, say, repo, { event: "stop-filed", url });
+		}
+		if (kind === "regression" && ep.woken === null) {
+			const train = openTrains(ledger).find((t) => repoOf(t) === repo);
+			if (train !== undefined) res.repairs.set(train, { repo, tip: state.tip });
+			else {
+				landNote(d, say, repo, { event: "repair-woken", tip: state.tip, train: null });
+				say(`land-first ${repo}: no open merge train to wake for the repair of ${sha7(state.tip)}: an owner's fix PR or Jo repairs it`);
+			}
+		}
+		if (ep.woken !== null && ep.failed === null && Date.parse(ledger.now()) - Date.parse(ep.woken.createdAt) >= REPAIR_FAIL_MS) {
+			landNote(d, say, repo, { event: "repair-failed", tip: ep.woken.tip, woken: ep.woken.createdAt });
+		}
+	}
+	const gaveUp = new Map<string, { pr: number; head: string }>();
+	for (const r of rows()) {
+		if (r.event === "revoke-gave-up") gaveUp.set(`${r.pr} ${r.head}`, r);
+		else if (r.event === "revoke-cleared") gaveUp.delete(`${r.pr} ${r.head}`);
+	}
+	if (state.open && gaveUp.size === 0) return null;
+	const open = openHeads(repo, ghJson);
+	for (const g of gaveUp.values()) {
+		const now = open.get(g.pr);
+		if (now !== g.head) landNote(d, say, repo, { event: "revoke-cleared", pr: g.pr, head: g.head, why: now === undefined ? "the PR is no longer open" : `its head is now ${sha7(now)}` });
+	}
+	if (state.open) return null;
+	let repair: string | null = null;
+	const stopped = `landing stopped: ${state.reasons.join("; ")}`;
+	// GitHub refuses a status description over 140 characters.
+	const description = stopped.length > 140 ? `${stopped.slice(0, 139)}…` : stopped;
+	for (const [n, head] of open) {
+		const st = newestGateStatus(repo, head, ghJson);
+		if (st?.state !== "success") continue;
+		if (st.description.startsWith("repair:")) {
+			if (repair === null) repair = head;
+			else say(`land-first ${repo}: #${n} at ${sha7(head)} is a second repair success; only ${sha7(repair)} is named`);
+			continue;
+		}
+		// Older off reconcilers used this event too; their failures are not landing-stop attempts.
+		const tried = rows().filter((r) => r.event === "revoke-failed" && r.pr === n && r.head === head && !r.error.startsWith("off reconciliation pending:")).length;
+		if (tried >= REVOKE_ATTEMPTS) continue;
+		try {
+			const revoked = withFullSuitePublication(d.land!.runsRoot ?? runsRoot(process.env), repo, (remainingMs) => {
+				const entries = ledger.entries(STANDING_WORKLOAD_ID);
+				const currentActivation = controlEntries(entries)
+					.filter((c) => c.prefix === "land-first" && sameRepo(c.rest.split(" ")[0]!, repo)).map((c) => c.id).join(" ");
+				if (!landFirstOn(entries, ledger.instructions(STANDING_WORKLOAD_ID), repo)
+					|| currentActivation !== activation || (mainResults(entries).at(-1)?.entryId ?? null) !== watermark) {
+					say(`land-first ${repo}: skipped stale landing revocation #${n} ${head}; activation or main authority changed, next tick recomputes`);
+					return false;
+				}
+				const r = d.gh(["api", "-X", "POST", `repos/${repo}/statuses/${head}`, "-f", "state=failure", "-f", `context=${FULL_SUITE_STATUS}`, "-f", `description=${description}`], remainingMs());
+				if (r.code !== 0) throw new GhError(`gh status revoke #${n} ${head} exited ${r.code}: ${lastLine(r)}`);
+				return true;
+			});
+			if (revoked) say(`land-first ${repo}: revoked #${n} at ${sha7(head)}: ${description}`);
+		} catch (err) {
+			const error = errText(err);
+			try {
+				landNote(d, say, repo, { event: "revoke-failed", pr: n, head, attempt: tried + 1, error });
+				if (tried + 1 >= REVOKE_ATTEMPTS) landNote(d, say, repo, { event: "revoke-gave-up", pr: n, head, error });
+			} catch (receiptError) {
+				throw new AggregateError([err, receiptError], `landing revocation #${n} ${head} failed: ${error}; failure receipt also failed: ${errText(receiptError)}`);
+			}
+		}
+	}
+	return repair;
+}
+
+/** A stop episode's jo-issues issue body (D6): the summary, G, each suspect with its PRs, workload and main run, the failing tests. */
+function issueBody(ledger: Ledger, repo: string, state: MainState, suspects: number[], redRun: ResultRecord | null, repoOf: (wl: string) => string | null): string {
+	const owner = (n: number): string | null => {
+		for (const t of everyTrain(ledger)) {
+			if (repoOf(t) !== repo) continue;
+			const b = trainBindings(ledger.entries(t), ledger.instructions(t)).findLast((x) => x.source === "board" && x.prs.includes(n));
+			if (b?.board) return b.board.workload;
+		}
+		return null;
+	};
+	const lines = [stopSummary(repo, { kind: state.stop!, tip: state.tip, g: state.g, suspects, reasons: state.reasons }), "", `G (verified): ${state.g ?? "none in the commits read"}`, "", "Suspects (oldest first):"];
+	for (const s of state.suspects) {
+		const prs = s.prs.length === 0 ? "no PR" : s.prs.map((n) => `#${n} (${owner(n) ?? "workload unknown"})`).join(", ");
+		const run = s.lastRun === null ? "no main run yet" : `main run ${s.lastRun.runId} ${s.lastRun.verdict}${s.lastRun.runDir ? ` ${s.lastRun.runDir}` : ""}`;
+		lines.push(`- ${s.sha} landed ${s.date}: ${prs}; verdict ${s.verdict?.verdict ?? "none"}; ${run}`);
+	}
+	if (redRun !== null) {
+		lines.push("", `Failing tests (run ${redRun.runId}${redRun.runDir ? `, ${redRun.runDir}` : ""}):`);
+		for (const f of redRun.failures.slice(0, 30)) lines.push(`- ${f.name}: ${f.firstError}`);
+		if (redRun.failures.length > 30) lines.push(`- … ${redRun.failures.length - 30} more in the run's result.json`);
+		lines.push("", `Attribution: the runner's main-red row for run ${redRun.runId} on ${STANDING_WORKLOAD_ID} names the suspects whose changes reach a failing test.`);
+	}
+	return lines.join("\n");
+}
+
+/**
+ * The `train-reconciled:` entries of step 3f (D6, R18), after step 4 wrote the wakes they owed: per land-first repository whose
+ * pass read main and wrote every row it owed (`landPass`), in one write transaction that first checks the newest main-run settle
+ * is still the one the pass read (its watermark); when a newer one landed, nothing is written and the next pass recomputes.
+ */
+function reconcile(d: TickDeps, land: LandResult, say: (line: string) => void): void {
+	const { ledger } = d;
+	for (const c of land.reconcile) {
+		const wrote = ledger.write((): string | null => {
+			const newest = mainResults(ledger.entries(STANDING_WORKLOAD_ID)).at(-1)?.entryId ?? null;
+			if (newest !== c.read) return null;
+			const body = trainReconciledBody({
+				repo: c.repo, at: ledger.now(), tip: c.state.tip, g: c.state.g, open: c.state.open, oldest: c.state.oldestMs === null ? null : new Date(c.state.oldestMs).toISOString(),
+				repair: c.state.open ? null : c.repair, read: c.read, reasons: c.state.reasons.join("; "),
+			});
+			ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+			return body;
+		});
+		say(wrote === null ? `land-first ${c.repo}: no train-reconciled: a main-run settle landed after this pass read ${c.read ?? "none"}; the next pass recomputes` : `${STANDING_WORKLOAD_ID}: ${wrote}`);
 	}
 }
 
@@ -840,9 +1474,9 @@ function alert(d: TickDeps, facts: TrainFacts, a: AlertAction, ghJson: (args: st
 	say(`${facts.wl}: alert ${q.id} (#${pr}) level ${level}: re-sent louder on issue #${n}`);
 }
 
-/** gh on PATH, 60 s at most. */
-function realGh(args: string[]): GhResult {
-	const r = Bun.spawnSync(["gh", ...args], { stdout: "pipe", stderr: "pipe", timeout: 60_000 });
+/** gh on PATH, 60 s at most, or the caller's shorter remaining publication budget. */
+function realGh(args: string[], timeoutMs = 60_000): GhResult {
+	const r = Bun.spawnSync(["gh", ...args], { stdout: "pipe", stderr: "pipe", timeout: Math.max(1, Math.min(60_000, timeoutMs)) });
 	return { code: r.exitCode ?? 1, stdout: r.stdout.toString(), stderr: r.exitedDueToTimeout ? "timed out" : r.stderr.toString() };
 }
 
@@ -853,10 +1487,42 @@ function realLaunch(wl: string): { code: number; line: string } {
 	return { code: r.exitCode ?? 1, line: lines.at(-1) ?? (r.exitedDueToTimeout ? "timed out" : "no output") };
 }
 
-/** `osascript -e 'display notification … sound name "Glass"'`. */
+/** The test runner's script beside this one: the tick's own root's, so a verified tick calls a verified runner. */
+const TEST_RUNNER_SCRIPT = join(import.meta.dir, "test-runner.ts");
+
+/** `bun surface/scripts/test-runner.ts <args>`, 10 minutes at most (a promotion fetches and checks out). */
+function realRunner(args: string[]): GhResult {
+	const r = Bun.spawnSync([process.execPath, TEST_RUNNER_SCRIPT, ...args], { stdout: "pipe", stderr: "pipe", timeout: 600_000 });
+	return { code: r.exitCode ?? 1, stdout: r.stdout.toString(), stderr: r.exitedDueToTimeout ? "timed out after 600 s" : r.stderr.toString() };
+}
+
+/** `git -C <cwd> <args>`'s trimmed stdout; throws naming the command and git's error on a non-zero exit. */
+function git(cwd: string, args: string[]): string {
+	const r = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe", timeout: 30_000 });
+	if (r.exitCode !== 0) throw new Error(`git -C ${cwd} ${args.join(" ")} exited ${r.exitCode ?? "on a signal"}: ${r.stderr.toString().trim() || "no output"}`);
+	return r.stdout.toString().trim();
+}
+
+/** The tick's own control root (§ 2 Self-checks): this checkout, its HEAD and modified tracked files, and `verified/current`. */
+function realRoot(): ControlRoot {
+	const root = realpathSync(git(import.meta.dir, ["rev-parse", "--show-toplevel"]));
+	const head = git(root, ["rev-parse", "HEAD"]);
+	const modified = git(root, ["status", "--porcelain", "--untracked-files=no"]).split("\n").filter(Boolean).map((l) => l.slice(3));
+	const link = join(homedir(), ".agent-system-2", "verified", "current");
+	let current: string | null = null;
+	try {
+		current = realpathSync(link);
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw new Error(`${link} could not be resolved: ${errText(err)}`);
+	}
+	const origin = git(root, ["remote", "get-url", "origin"]);
+	return { root, head, modified, current, currentHead: current === null ? null : git(current, ["rev-parse", "HEAD"]), repo: ownerRepoOf(origin)?.toLowerCase() ?? null };
+}
+
+/** No sound clause: train popups stay silent under Jo's silent-popup alarm rule. */
 function realNotify(title: string, text: string): boolean {
 	const str = (s: string) => `"${s.replace(/[\\"]/g, (c) => `\\${c}`)}"`;
-	const r = Bun.spawnSync(["osascript", "-e", `display notification ${str(text)} with title ${str(title)} sound name "Glass"`], { stdout: "pipe", stderr: "pipe", timeout: 10_000 });
+	const r = Bun.spawnSync(["osascript", "-e", `display notification ${str(text)} with title ${str(title)}`], { stdout: "pipe", stderr: "pipe", timeout: 10_000 });
 	return r.exitCode === 0;
 }
 
@@ -877,7 +1543,7 @@ function main(argv: string[]): number {
 		// D1 boards only on the repositories the test runner serves, read as its starter reads them.
 		const cfg = loadTestRunnerConfig(process.env);
 		if (!cfg.ok) log(`testRunner config unreadable (${cfg.error}): nothing boards this pass`);
-		tick({ ledger, gh: realGh, launch: realLaunch, notify: realNotify, log, ...(cfg.ok ? { config: cfg.config } : {}) });
+		tick({ ledger, gh: realGh, launch: realLaunch, notify: realNotify, land: { runner: realRunner, root: realRoot, runsRoot: runsRoot(process.env) }, log, ...(cfg.ok ? { config: cfg.config } : {}) });
 		return 0;
 	} finally {
 		ledger.close();

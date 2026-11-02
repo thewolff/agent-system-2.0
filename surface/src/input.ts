@@ -117,6 +117,14 @@
 // open, a scheduled `due:` row, any open or paused slice (named), any open question, or a holder
 // under a live lease. Done and cancelled slices are both allowed. Bare `withdraw` and `withdraw
 // <q-…>` keep their question meaning.
+//
+// Land-first activation and main retries (PLAN wl-mvq4edbaf13vnk § 2 Activation, Attempts; D12): `land-first <repo> on|off`
+// writes Jo's instruction `land-first <repo> on|off` and the surface's `land-first:` binding in one transaction.
+// Off also writes `land-first-off-pending:` there: merges stay held until tick revocation completes under the publication mutex.
+// On is refused until § 2's bootstrap holds (`bootstrapRefusal`, surface/src/main-state.ts, read from the standing workload's entries), checked
+// again inside `apply`. `main-retry <repo>` writes Jo's `main-retry <repo>` and the surface's `main-retry: <repo> <instruction
+// id>` the same way; it opens the next attempt block of an exhausted main commit (`mainRetries`). Both words are the command
+// or `refused` with the reason, at any length, never prose.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parkQuestions } from "../../classifier/src/lab";
@@ -136,7 +144,9 @@ import { closedReservedRefusal, waitingReserved, wordsOf } from "./errors";
 import {
 	attempts, byHandLine, consumedIds, type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, planApprovedBody, planFirst, planHaltedBody,
 	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody, waivePrBody, waivePrInstructionBody, withdrawInstructionBody, withdrawnBody,
+	LAND_FIRST_WORD, landFirstBody, landFirstInstructionBody, landFirstOffBody, landFirstOffPending, MAIN_RETRY_WORD, mainRetryBody, mainRetryInstructionBody, REPO_WORD_RE,
 } from "./launch";
+import { bootstrapRefusal } from "./main-state";
 import { onOtherTrain, TRAIN_DONE, trainBody, trainBrief, trainHold, trainInstructionBody, trainPrs, trainSlicePr } from "./merge-train";
 import type { Numbering, Target } from "./numbering";
 import { ensureStandingWorkload } from "./identity";
@@ -170,6 +180,10 @@ export type Command =
 	| { kind: "test-pr"; workloadId: string; prs: number[] }
 	/** `waive-pr <wl-…> <N…>`: Jo waives these merged PR numbers on the workload for the close check. */
 	| { kind: "waive-pr"; workloadId: string; prs: number[] }
+	/** `land-first <repo> on|off`: Jo turns land-first on or off for a repository (PLAN wl-mvq4edbaf13vnk D12). */
+	| { kind: "land-first"; repo: string; on: boolean }
+	/** `main-retry <repo>`: Jo opens the next attempt block of the repository's exhausted main commits (PLAN wl-mvq4edbaf13vnk § 2 Attempts). */
+	| { kind: "main-retry"; repo: string }
 	/** `train <N…>`: Jo opens a merge train on these PRs (`applyTrain`, never `apply`: the open needs the surface's repo). */
 	| { kind: "train"; prs: number[] }
 	/** `train <wl-…> <N…>`: Jo adds these PRs to the open merge train `workloadId`. */
@@ -242,6 +256,8 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 	if (word === EXTEND_WORD && words.length === 2 && /^wl-/i.test(words[1]!)) return extendCommand(ledger, words[1]!);
 	// Always the command or `refused`, at any length, so a long binding never passes as prose.
 	if (word === "test-pr" || word === "waive-pr") return prWordCommand(ledger, word, words.slice(1));
+	if (word === LAND_FIRST_WORD) return landFirstCommand(ledger, words.slice(1));
+	if (word === MAIN_RETRY_WORD) return mainRetryCommand(words.slice(1));
 	// The command or `refused` at any length, except `train` alone and `train <q-…>`, which fall through to the answer path.
 	if (word === "train") {
 		const c = trainCommand(ledger, words.slice(1));
@@ -345,13 +361,15 @@ export type BatchResult = { ok: true; items: BatchItem[] } | { ok: false; lines:
 /**
  * The words a single-line command may run to: `ceiling <usd> [<hours>] [wl-…]` is four, `rounds <n> [wl-…]` and
  * `supersede <wl-A> <wl-B>` three, `test-pr <wl-…> <N> [<N> …]`, `waive-pr <wl-…> <N> [<N> …]`,
- * `train [<wl-…>] <N> [<N> …]` and `withdraw wl-…` (PLAN wl-mv8s939084z1ts D1) any number (`interpret` refuses past
- * `TEST_PR_MAX`, and `withdraw` past one id), everything else two.
+ * `train [<wl-…>] <N> [<N> …]`, `withdraw wl-…` (PLAN wl-mv8s939084z1ts D1), `land-first …` and `main-retry …` any number
+ * (`interpret` refuses past `TEST_PR_MAX`, `withdraw` past one id, and the land-first words past their shape), everything else two.
  */
 export function maxWords(text: string): number {
 	if (/^withdraw\s+wl-/i.test(text)) return Number.POSITIVE_INFINITY;
-	const long = /^(ceiling|rounds|supersede|test-pr|waive-pr|train)(?:\s|$)/i.exec(text)?.[1]!.toLowerCase() ?? null;
-	return long === "ceiling" ? 4 : long === "rounds" || long === "supersede" ? 3 : long === "test-pr" || long === "waive-pr" || long === "train" ? Number.POSITIVE_INFINITY : 2;
+	const long = /^(ceiling|rounds|supersede|test-pr|waive-pr|train|land-first|main-retry)(?:\s|$)/i.exec(text)?.[1]!.toLowerCase() ?? null;
+	if (long === "ceiling") return 4;
+	if (long === "rounds" || long === "supersede") return 3;
+	return long === null ? 2 : Number.POSITIVE_INFINITY;
 }
 
 /** Could `text` (one line, trimmed) be a command: a numbered batch (a train word inside one included, to be refused), or short enough for a word command. A false means prose, with no ledger read. */
@@ -941,6 +959,29 @@ function clearedBy(before: RoutineState, after: RoutineState): string[] {
 	return [...before.offs, ...before.latches].map(describeOff).filter((d) => !still.has(d));
 }
 
+/** Why `land-first <repo> on` cannot apply, or null: § 2's bootstrap holds (`bootstrapRefusal`). `off` always applies. `apply` checks it again. */
+function landFirstRefusal(ledger: Ledger, repo: string, on: boolean): string | null {
+	if (!on) return null;
+	const reasons = bootstrapRefusal(ledger.entries(STANDING_WORKLOAD_ID));
+	return reasons.length === 0 ? null : `land-first ${repo} on waits for the bootstrap (PLAN wl-mvq4edbaf13vnk § 2): ${reasons.join("; ")}`;
+}
+
+/** `land-first <repo> on|off` after the word: a repository and `on` or `off`, `landFirstRefusal` clear; anything else is `refused` with the reason, never prose. */
+function landFirstCommand(ledger: Ledger, rest: readonly string[]): Command {
+	const state = rest[1]?.toLowerCase();
+	if (rest.length !== 2 || !REPO_WORD_RE.test(rest[0]!) || (state !== "on" && state !== "off")) {
+		return { kind: "refused", why: `${LAND_FIRST_WORD} names one repository and on or off: ${LAND_FIRST_WORD} <repo> on|off` };
+	}
+	const why = landFirstRefusal(ledger, rest[0]!, state === "on");
+	return why === null ? { kind: "land-first", repo: rest[0]!, on: state === "on" } : { kind: "refused", why };
+}
+
+/** `main-retry <repo>` after the word: one repository; anything else is `refused` with the reason, never prose. */
+function mainRetryCommand(rest: readonly string[]): Command {
+	if (rest.length !== 1 || !REPO_WORD_RE.test(rest[0]!)) return { kind: "refused", why: `${MAIN_RETRY_WORD} names one repository: ${MAIN_RETRY_WORD} <repo>` };
+	return { kind: "main-retry", repo: rest[0]! };
+}
+
 /** Jo's word that halts a workload's plan (PLAN wl-mvfkv7llkp7nk0 § 3). */
 export const HALT_WORD = "halt";
 
@@ -1490,6 +1531,29 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 				}
 				const cleared = clearedBy(before, after);
 				return `auto-routine recorded (instruction ${id}); cleared: ${cleared.length === 0 ? "nothing" : cleared.join("; ")}; ${state}`;
+			});
+		}
+		case "land-first": {
+			// Raw word and pending off marker commit together; acknowledgement is not revocation completion.
+			return ledger.write(() => {
+				const why = landFirstRefusal(ledger, cmd.repo, cmd.on);
+				if (why !== null) throw new Error(why);
+				ensureStandingWorkload(ledger);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(cmd.repo, cmd.on) });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(cmd.repo, cmd.on, id) });
+				if (!cmd.on) ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstOffBody(cmd.repo, "pending", id) });
+				const pending = landFirstOffPending(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), cmd.repo);
+				if (pending.length > 0) return `land-first ${cmd.on ? "on" : "off"} requested for ${cmd.repo} (instruction ${id}); off reconciliation pending: merges held until the tick revokes fast/tree successes`;
+				return `land-first is on for ${cmd.repo} (instruction ${id})`;
+			});
+		}
+		case "main-retry": {
+			// Jo's instruction, then the surface's `main-retry:` naming it, on the standing workload in one transaction (`mainRetries`).
+			return ledger.write(() => {
+				ensureStandingWorkload(ledger);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: STANDING_WORKLOAD_ID, body: mainRetryInstructionBody(cmd.repo) });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: mainRetryBody(cmd.repo, id) });
+				return `main runs of ${cmd.repo} may retry: an exhausted main commit's next block of 3 attempts is open (instruction ${id})`;
 			});
 		}
 		case "halt": {

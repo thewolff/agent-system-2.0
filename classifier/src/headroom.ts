@@ -9,12 +9,13 @@
  * - Projection is the window's own pace (Jo, in-mv8spn0cssasjk, answering q-mv8sl9vnex4zr4 "pace"): the window's
  *   length comes from `windowId` (`5h`, `7d`, …), elapsed = length − (resetsAt − now), and the projected use at reset
  *   is `u / elapsed · length`. Projection starts at max(60min, length/5); unknown length/reset cannot project.
- * - A week-pace-only refusal may be retained against the first configured other-lab budget only when its
+ * - Anthropic week-length pace below actual exhaustion is advisory and never refuses dispatch.
+ * - Other labs' week-pace-only refusals may be retained against the first configured other-lab budget only when its
  *   measured pressure is strictly higher over the same recent 15–60min endpoints. Pressure is the maximum
  *   binding-meter rate, in quota points/hour, not token-equivalent capacity. Hard/exhausted limits never relax.
  * - A limit binds a selector when the provider matches and its tier is null or the model id contains the tier
  *   (`fable` binds `anthropic/claude-fable-*` only; Fable's meter never takes Opus out).
- * - Out: a binding limit with a pace projection ≥ 1.0, a binding 5h limit with `u > FIVE_HOUR_CEILING`, or an
+ * - Out: a binding non-advisory pace projection ≥ 1.0, a binding 5h limit with `u > FIVE_HOUR_CEILING`, or an
  *   exhausted known week with a future reset even before warm-up. A passed reset binds nothing.
  * - Old poll lines (no `limits`) read their `rows` keys as limits with no reset time, so only the 5h rule applies.
  *   A third key segment is a tier unless it is a meter name in `METERS` (`openai-codex/7d/chat` is the shared meter).
@@ -37,6 +38,8 @@ const UNIT_MS: Readonly<Record<string, number>> = { m: 60_000, h: 3_600_000, d: 
 const METERS: Readonly<Record<string, true>> = { chat: true };
 const MIN_MS = 60_000;
 const WEEK_MS = 7 * 24 * 60 * MIN_MS;
+/** Inclusive ECMAScript Date timestamp bound, checked numerically at the advisory snapshot boundary. */
+const MAX_DATE_MS = 8_640_000_000_000_000;
 
 /** Length in ms of a window named like `5h` or `7d`; null when the id is not of that shape. */
 function windowMs(windowId: string): number | null {
@@ -57,6 +60,7 @@ interface Limit {
 interface Poll {
 	t: number; // ms
 	limits: Limit[];
+	anthropicWeek: Headroom["anthropicWeek"];
 }
 
 export interface HeadroomDecision {
@@ -68,13 +72,15 @@ export interface HeadroomDecision {
 export interface Headroom {
 	/** Base refusal, or exceptional retention against ordered configured budget comparators. */
 	decisionFor(selector: string, comparators?: readonly string[]): HeadroomDecision;
+	/** Newest fresh, non-future shared Anthropic week with valid usage and an unexpired, Date-representable reset. */
+	anthropicWeek: { used: number; resetsAt: number } | null;
 	/** Why nothing can be out (fail-open), or null when the polls were read. */
 	note: string | null;
 }
 
 const isNum = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
 
-function parsePoll(line: string): Poll | null {
+function parsePoll(line: string, now: number): Poll | null {
 	let raw: unknown;
 	try {
 		raw = JSON.parse(line);
@@ -85,12 +91,21 @@ function parsePoll(line: string): Poll | null {
 	const { t, rows, limits } = raw as { t?: unknown; rows?: unknown; limits?: unknown };
 	if (!isNum(t)) return null;
 	const found: Limit[] = [];
+	let anthropicWeek: Headroom["anthropicWeek"] = null;
 	if (Array.isArray(limits)) {
 		for (const l of limits) {
 			if (!l || typeof l !== "object") continue;
 			const { provider, windowId, tier, resetsAt, usedFraction } = l as Record<string, unknown>;
 			if (typeof provider !== "string" || typeof windowId !== "string" || !isNum(usedFraction)) continue;
 			found.push({ provider, windowId, tier: typeof tier === "string" && tier ? tier : null, used: usedFraction, resetsAt: isNum(resetsAt) ? resetsAt : null });
+			// Snapshot identity is strict even though legacy admission normalizes absent/invalid tiers to shared.
+			if (provider === "anthropic" && tier === null && windowMs(windowId) === WEEK_MS
+				&& usedFraction >= 0 && usedFraction <= 1 && isNum(resetsAt) && resetsAt > now
+				&& Math.abs(resetsAt) <= MAX_DATE_MS
+				&& (anthropicWeek === null || usedFraction > anthropicWeek.used
+					|| (usedFraction === anthropicWeek.used && resetsAt > anthropicWeek.resetsAt))) {
+				anthropicWeek = { used: usedFraction, resetsAt };
+			}
 		}
 	} else if (rows && typeof rows === "object") {
 		for (const [key, used] of Object.entries(rows as Record<string, unknown>)) {
@@ -99,7 +114,7 @@ function parsePoll(line: string): Poll | null {
 			found.push({ provider, windowId, tier: third && !METERS[third] ? third : null, used, resetsAt: null });
 		}
 	} else return null;
-	return { t: t * 1000, limits: found };
+	return { t: t * 1000, limits: found, anthropicWeek };
 }
 
 const pct = (n: number) => n.toFixed(2);
@@ -142,7 +157,7 @@ function bindingLimits(poll: Poll, selector: string): Limit[] {
 export function headroom(opts: { path?: string; now?: number; lines?: string[] } = {}): Headroom {
 	const now = opts.now ?? Date.now();
 	const path = opts.path ?? (process.env.AS2_HEADROOM_POLLS || DEFAULT_POLLS);
-	const open = (note: string): Headroom => ({ decisionFor: () => ({ out: null, retained: null }), note });
+	const open = (note: string): Headroom => ({ decisionFor: () => ({ out: null, retained: null }), anthropicWeek: null, note });
 
 	let lines = opts.lines;
 	if (!lines) {
@@ -153,7 +168,7 @@ export function headroom(opts: { path?: string; now?: number; lines?: string[] }
 		}
 	}
 	const source = opts.lines ? "inline lines" : path;
-	const polls = lines.flatMap(l => (l.trim() ? (parsePoll(l) ?? []) : [])).sort((a, b) => a.t - b.t);
+	const polls = lines.flatMap(l => (l.trim() ? (parsePoll(l, now) ?? []) : [])).sort((a, b) => a.t - b.t);
 	const newest = polls.at(-1);
 	if (!newest) return open(`headroom polls empty: ${source}`);
 	const age = now - newest.t;
@@ -191,7 +206,7 @@ export function headroom(opts: { path?: string; now?: number; lines?: string[] }
 		const name = `${l.provider} ${l.windowId}${l.tier ? ` ${l.tier}` : ""} ${pct(l.used)} used`;
 		const ceiling = l.windowId === "5h" && l.used > FIVE_HOUR_CEILING;
 		const pace = paceAtReset(l);
-		if (pace && pace.projected >= 1.0) {
+		if (pace && pace.projected >= 1.0 && !(l.provider === "anthropic" && windowMs(l.windowId) === WEEK_MS && l.used < 1)) {
 			const reset = `${new Date(l.resetsAt!).toISOString().slice(0, 16)}Z`;
 			return {
 				reason: `${name}, window pace +${(pace.perHour * 100).toFixed(1)} pts/h, projected ${pct(pace.projected)} at reset ${reset}`,
@@ -204,6 +219,7 @@ export function headroom(opts: { path?: string; now?: number; lines?: string[] }
 
 	return {
 		note: null,
+		anthropicWeek: age < 0 ? null : newest.anthropicWeek,
 		decisionFor(selector: string, comparators: readonly string[] = []): HeadroomDecision {
 			let out: string | null = null;
 			let exhausted: Limit | null = null;

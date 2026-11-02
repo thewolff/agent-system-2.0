@@ -301,7 +301,7 @@ export async function executeVerb(name, args, ctx) {
     switch (name) {
       case "pair_start": return pairStartVerb(args, ctx);
       case "pair_note": return simple(name, ctx, (s, io) => pairNote(s, { text: args.text, roadmap: args.roadmap, earlierRoadmap: args.earlierRoadmap }, io), noteText);
-      case "pair_propose": return simple(name, ctx, (s, io) => pairPropose(s, cardArgs(args), io), (r) => `Card ${r.card.id} recorded. Show it to your partner and wait for their reply.\n${JSON.stringify(r.card, null, 2)}`);
+      case "pair_propose": return simple(name, ctx, (s, io) => pairPropose(s, cardArgs(args), io), cardText);
       case "pair_begin": return pairBeginVerb(args, ctx);
       case "pair_done": return pairDoneVerb(args, ctx);
       case "pair_write": return writeVerb("pair_write", args, ctx);
@@ -331,8 +331,27 @@ function simple(name, ctx, step, describe) {
 
 function cardArgs(a) {
   const pick = {};
-  for (const k of ["boundary", "whyNow", "decision", "currentCode", "effect", "checks", "openPoints"]) if (a[k] !== undefined) pick[k] = a[k];
+  for (const k of ["boundary", "whyNow", "decision", "currentCode", "proposedCode", "effect", "checks", "openPoints"]) if (a[k] !== undefined) pick[k] = a[k];
   return pick;
+}
+
+/**
+ * The card as the agent gets it back. A non-empty proposedCode is lifted out of the JSON and
+ * shown after it as a fenced block, so the planned code reads as code rather than as an
+ * escaped string. A card without one reads exactly as it did before the field existed.
+ */
+function cardText(r) {
+  const head = `Card ${r.card.id} recorded. Show it to your partner and wait for their reply.\n`;
+  const { proposedCode, ...rest } = r.card;
+  if (typeof proposedCode !== "string" || proposedCode === "") return `${head}${JSON.stringify(r.card, null, 2)}`;
+  return `${head}${JSON.stringify(rest, null, 2)}\nPlanned code (proposedCode), to show on the card:\n${fenced(proposedCode)}`;
+}
+
+/** A code fence longer than any backtick run inside `text`, so the text cannot close it. */
+function fenced(text) {
+  const longest = (text.match(/`+/g) ?? []).reduce((n, run) => Math.max(n, run.length), 0);
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return `${fence}\n${text}${text.endsWith("\n") ? "" : "\n"}${fence}`;
 }
 
 function roadmapLines(items) {

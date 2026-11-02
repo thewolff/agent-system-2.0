@@ -8,8 +8,13 @@
 // argument shaped like `ledger/scripts/x.ts` authorises nothing. The one exemption is running a
 // script that canonically resolves inside this repository's `ledger/scripts/`, as the script bun
 // or node executes, with no inline code.
-import { basename, dirname, posix, resolve } from "node:path";
-import { canonicalPath, defaultLedgerPath, LEDGER_DB_ENV } from "../../../ledger/src/locality";
+//
+// The verified control root (PLAN wl-mvq4edbaf13vnk § 2 "Integrity of the hold's and the verifier's inputs", D10, R29):
+// `~/.agent-system-2/verified/` holds the code the runner verified, which the tick and the OMP extensions run. Only the
+// runner, outside the fence, writes it: write, edit and AST-edit calls under it are refused, and eval code naming it with
+// a write API, as for the ledger file (the fence denies bash writes there, fence.ts fenceTargets).
+import { basename, dirname, join, posix, resolve } from "node:path";
+import { canonicalPath, defaultLedgerPath, homeDir, LEDGER_DB_ENV } from "../../../ledger/src/locality";
 import { type CodeFacts, callArgs, codeFacts, computedMember, dbConstructorEscape, evalProcessStart, SPAWN_API, WRITE_API } from "../eval-code";
 import { bashCommand, type CodeFamily, codeInterpreterEnv, type Exec, expandShell, gitCall, gitTraceFiles, interpreterEnv, READ_ONLY_HEADS, writeDestinations } from "../exec";
 import type { Fragment, Word } from "../shell-parse";
@@ -55,6 +60,27 @@ export function ledgerPaths(env: Record<string, string | undefined>): LedgerPath
 	}
 	needles.add(LEDGER_DB_ENV);
 	return { files, needles: [...needles] };
+}
+
+/** The verified control root's name under HOME (§ 2 "Protect the verifier"). */
+const VERIFIED_RELATIVE = posix.join(".agent-system-2", "verified");
+
+/** The verified control root, `$HOME/.agent-system-2/verified`, as configured and canonical (both, when a symlink moves it). */
+export function verifiedRoots(env: Record<string, string | undefined>): string[] {
+	const configured = join(homeDir(env), VERIFIED_RELATIVE);
+	return [...new Set([configured, canonicalOrLexical(configured)])];
+}
+
+/** Is `path` (resolved against `dir`, lexically and canonically) the verified control root or under it? */
+function underVerified(path: string, dir: string, roots: readonly string[]): boolean {
+	const abs = resolve(dir, path);
+	return [abs, canonicalOrLexical(abs)].some((p) => roots.some((r) => p === r || p.startsWith(`${r}/`)));
+}
+
+/** Does eval code name the verified control root: its path in any spelling (`~`, `$HOME`, `homedir() + …`), or its two components as literals (`join(home, ".agent-system-2", "verified")`)? */
+function namesVerified(facts: CodeFacts, roots: readonly string[]): boolean {
+	if (facts.folded.includes(VERIFIED_RELATIVE) || roots.some((r) => facts.folded.includes(r))) return true;
+	return facts.literals.some((l) => /(?:^|\/)\.agent-system-2\/?$/.test(l)) && facts.literals.some((l) => /^\/?verified(?:\/|$)/.test(l));
 }
 
 /**
@@ -681,18 +707,49 @@ function rawWriteInCode(code: string, paths: LedgerPaths, dir: string, family: C
 	const module = dbModule(facts);
 	if (!names) return module ? dbOpenVerdict(facts, module) : null;
 	if (module) return `eval code naming the ledger file and loading the database module "${module}" (no in-process database handle to the ledger is modeled, \`readonly: true\` included)`;
+	return writeApiIn(facts, "the ledger file", "only ledger/src/index.ts writes it");
+}
+
+/**
+ * The write a piece of eval code that names `what` makes, or null: a module the gate cannot name, a member computed at
+ * run time, a write or process API, a `Bun.file()` handle with a write, or an open that is not provably read-only.
+ */
+function writeApiIn(facts: CodeFacts, what: string, owner: string): string | null {
 	const computed = COMPUTED_IMPORT.exec(facts.folded);
-	if (computed) return `eval code naming the ledger file and loading a module the gate cannot name (${computed[0].trim()}…)`;
+	if (computed) return `eval code naming ${what} and loading a module the gate cannot name (${computed[0].trim()}…)`;
 	const member = computedMember(facts);
-	if (member) return `eval code naming the ledger file and reaching a member computed at run time (${member.slice(0, 60)}), whose method the gate cannot name`;
+	if (member) return `eval code naming ${what} and reaching a member computed at run time (${member.slice(0, 60)}), whose method the gate cannot name`;
 	const api = WRITE_API.exec(facts.bare) ?? SPAWN_API.exec(facts.bare) ?? /\.\s*write_(?:text|bytes)\s*\(/.exec(facts.bare);
-	if (api) return `eval code naming the ledger file and calling ${api[0].trim()} (only ledger/src/index.ts writes it)`;
+	if (api) return `eval code naming ${what} and calling ${api[0].trim()} (${owner})`;
 	// A `Bun.file()` handle writes through any alias (`const f = Bun.file(p); f.writer()`, astra-5
 	// R5-B3): with one in the code, every write/delete spelling refuses, bound or not.
 	const bunWrite = /\bBun\s*\.\s*file\s*\(/.test(facts.bare) ? /(?<![\w$])(?:write\w*|delete|unlink)(?![\w$])/.exec(facts.bare) : null;
-	if (bunWrite) return `eval code naming the ledger file with a Bun.file() handle and \`${bunWrite[0]}\` (only ledger/src/index.ts writes it)`;
+	if (bunWrite) return `eval code naming ${what} with a Bun.file() handle and \`${bunWrite[0]}\` (${owner})`;
 	const open = writingOpen(facts);
-	return open ? `eval code naming the ledger file with ${open} (only ledger/src/index.ts writes it)` : null;
+	return open ? `eval code naming ${what} with ${open} (${owner})` : null;
+}
+
+/** Directory and file-tree writes WRITE_API does not list: removing, copying or moving a tree, making a directory, changing modes. */
+const TREE_WRITE_API =
+	/\bshutil\s*\.\s*(?:rmtree|copy\w*|move|chown)\s*\(|\bos\s*\.\s*(?:remove|removedirs|rmdir|replace|makedirs|mkdir|chmod|chown|symlink|link|utime|truncate)\s*\(|\.\s*(?:touch|mkdir|rmdir|unlink|rename|replace|symlink_to|hardlink_to|chmod)\s*\(|\b(?:mkdir|mkdirSync|rmdir|rmdirSync|chmod|chmodSync|utimes|utimesSync|mkdtemp|mkdtempSync)\s*\(/;
+
+/** The write eval code makes under the verified control root (§ 2, R29), or null when it does not name the root or writes nothing. */
+function verifiedWriteInCode(code: string, family: CodeFamily | undefined, roots: readonly string[]): string | null {
+	const facts = codeFacts(code, family);
+	if (!namesVerified(facts, roots)) return null;
+	const tree = TREE_WRITE_API.exec(facts.bare);
+	if (tree) return `eval code naming the verified control root ${roots[0]} and calling ${tree[0].trim()} (only the test runner writes it)`;
+	return writeApiIn(facts, `the verified control root ${roots[0]}`, "only the test runner writes it");
+}
+
+function refuseVerified(what: string): Refusal {
+	return {
+		block: true,
+		reason:
+			`P-11 row 10 refused this: ${what}. The verified control root (~/.agent-system-2/verified/) holds the code the test runner verified on main, ` +
+			`which the train tick and the OMP extensions run (PLAN wl-mvq4edbaf13vnk § 2 "Integrity of the hold's and the verifier's inputs"); only the runner, outside the fence, writes it. ` +
+			`Change the code in a repository checkout and land it through main; the runner promotes it after a green, believable main run. Reading the root is allowed.`,
+	};
 }
 
 function refuse(what: string): Refusal {
@@ -755,16 +812,25 @@ export function checkRawLedgerWrite(call: ToolCall, ctx: CallContext): Refusal {
 		const family = lang === "py" || lang === "python" ? "python" : lang === "js" || lang === "ts" ? "js" : undefined;
 		const code = String(call.input.code ?? call.input.cell ?? "");
 		const why = rawWriteInCode(code, paths, ctx.cwd, family);
+		const verified = why ? null : verifiedWriteInCode(code, family, verifiedRoots(ctx.env));
 		// The processes the code starts, with the environment it gives them (astra-8 B2).
-		const r = why ? refuse(why) : envLedgerWrite(codeInterpreterEnv(code, family, ctx.cwd, ctx.env).writes, ctx.cwd, paths);
+		const r = why ? refuse(why) : verified ? refuseVerified(verified) : envLedgerWrite(codeInterpreterEnv(code, family, ctx.cwd, ctx.env).writes, ctx.cwd, paths);
 		// Row 10 runs before row 6, so its refusal also carries row 6's eval rule (PLAN wl-muzs0ytnaet1v4 D1 (f)).
 		if (r && evalProcessStart(codeFacts(code, family), family)) {
 			return { block: true, reason: `${r.reason} This eval also starts a process: run the command with the bash tool, where the gate reads it; eval does not start processes.` };
 		}
 		return r;
 	}
-	for (const target of writeTargets(call, ctx.cwd)) {
+	const targets = writeTargets(call, ctx.cwd);
+	for (const target of targets) {
 		if (isLedgerFile(target, ctx.cwd, paths)) return refuse(`a ${call.toolName} to ${target}, the ledger file or its WAL/SHM/journal sibling`);
+	}
+	if (targets.length > 0) {
+		const roots = verifiedRoots(ctx.env);
+		// An ast_edit path may be a directory or a glob's static prefix: one above the root reaches into it.
+		const above = (t: string) => call.toolName === "ast_edit" && [t, canonicalOrLexical(t)].some((p) => roots.some((r) => r.startsWith(`${p.replace(/\/$/, "")}/`)));
+		const hit = targets.find((t) => underVerified(t, ctx.cwd, roots) || above(t));
+		if (hit) return refuseVerified(`a ${call.toolName} to ${hit}, the verified control root ${roots[0]} or a path under it`);
 	}
 	return null;
 }

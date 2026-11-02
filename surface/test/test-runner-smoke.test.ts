@@ -9,13 +9,13 @@
 // names the failing test with its first error line, and `lane_complete_slice` is refused with the runner message.
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { renderExecWrapper } from "../src/as2test";
 import { recordRepo } from "../src/decision-log";
-import { type TestRun, testRuns } from "../src/test-run";
+import { partResult, type TestRun, testRuns, WRAPPER_EXIT } from "../src/test-run";
 import { INSTRUCTION_POLL_MS, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, timers, tmp, until } from "./helpers";
 
@@ -318,5 +318,43 @@ describe("S5b: lane_full_test to the lane's aside, through the real starter and 
 		// the lane cannot complete the slice itself: the runner settles it
 		expect(await l.call("lane_complete_slice", { slice: slice!, artifact: "bun test passed" })).toBe(`the test runner settles ${slice}; call lane_full_test. Nothing was completed.`);
 		expect(l.w.ledger.slice(slice!)!.state).toBe("open");
+	});
+});
+
+// PLAN wl-mvq4edbaf13vnk D4 (R9): the Mac fallback of the hosted fast check, through the same rendered wrapper and fake sudo
+// the runner spawns, on the red PR's bundle: `fast` runs only the ./ test files it names, inside the clone, in one bun call.
+describe("fast through the installed-form wrapper: only the named ./ test files, in one bun test call", () => {
+	test("fast on the red PR's clone runs red.test.ts alone (never xa.test.ts), records one process group, and refuses an operand outside the clone or an option", () => {
+		const w = world();
+		const as2 = join(w.root, "as2");
+		const exec = join(w.root, "libexec", "exec");
+		const runId = "tr-fastsmoke1";
+		const stage = join(as2, "stage", runId);
+		mkdirSync(stage);
+		g(fx.bare, "bundle", "create", "-q", join(stage, "repo.bundle"), "--all");
+		writeFileSync(join(stage, "caps.json"), JSON.stringify({ fullCapMin: 2, soloCapMin: 2, fastCapMin: 2 }));
+		writeFileSync(join(as2, "stage", "current"), `${runId}\n`);
+		const wrap = (...args: string[]) => {
+			const r = Bun.spawnSync(["sudo", "-n", "-u", "_as2test", exec, ...args], { env: w.env, stdout: "pipe", stderr: "pipe" });
+			return { exit: r.exitCode, stderr: r.stderr.toString() };
+		};
+		expect(wrap("prepare", runId, fx.head.red)).toEqual({ exit: WRAPPER_EXIT.ok, stderr: "" });
+		const work = join(as2, "runs", runId);
+
+		for (const op of ["../xa.test.ts", "./../red.test.ts", "--bail", "xa.test.ts", "./README.md", "/etc/red.test.ts", "./missing.test.ts"]) {
+			const r = wrap("fast", runId, "./red.test.ts", op);
+			expect({ op, exit: r.exit }).toEqual({ op, exit: WRAPPER_EXIT.refused });
+		}
+		expect(readdirSync(work).filter((n) => n.startsWith("fast."))).toEqual([]);
+
+		const r = wrap("fast", runId, "./red.test.ts");
+		expect(r).toEqual({ exit: 1, stderr: "" });
+		expect(readFileSync(join(w.root, "sudo.log"), "utf8").trim().split("\n").at(-1)).toBe(`fast ${runId}`);
+		expect(readFileSync(join(work, "groups"), "utf8").split("\n").filter((l) => l !== "")).toHaveLength(1);
+		const junit = readFileSync(join(work, "fast.xml"), "utf8");
+		const result = partResult({ junit, log: readFileSync(join(work, "fast.log"), "utf8"), exit: r.exit, ms: 0 });
+		expect(result).toMatchObject({ pass: 1, fail: 1, skip: 0, exit: 1, error: null });
+		expect(result.failures.map((f) => f.name)).toEqual(["red.test.ts > the broken thing"]);
+		expect(junit).not.toContain("xa.test.ts");
 	});
 });

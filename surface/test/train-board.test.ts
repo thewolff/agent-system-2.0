@@ -10,11 +10,11 @@ import { trainPrsOn } from "../src/close-entry";
 import { ensureStandingWorkload } from "../src/identity";
 import { applyTrain, interpret } from "../src/input";
 import {
-	boundPrs, controlEntries, parseTrainBoard, planApprovedBody, planFirstBody, planQuestionBody, reservedPrefix, trainBoardBody, trainFixBody,
+	boundPrs, controlEntries, landFirstBody, landFirstInstructionBody, parseTrainBoard, planApprovedBody, planFirstBody, planQuestionBody, reservedPrefix, trainBoardBody, trainFixBody,
 } from "../src/launch";
 import {
 	actionable, AUTOBOARD_WINDOW_MS, autoboardCutover, boardLanding, isTrainOrFix, type Landing, landingReady, openTrains, protectionGap, TRAIN_DONE, trainAutoboardBody, trainMembers,
-	trainPrs, trainSliceId,
+	PRODUCTION_FAST_GREEN, trainPrs, trainSignoff, trainSliceId,
 } from "../src/merge-train";
 import { makeRunId, testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
 import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
@@ -54,12 +54,19 @@ function world(cutover = true): World {
 	c.plusHours(0.01);
 	return { c, ledger, repo };
 }
+function landFirst(w: World, on = true): void {
+	const id = w.ledger.recordInstruction({ ...JO, workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(ORIGIN, on) });
+	w.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(ORIGIN, on, id) });
+}
+
 
 interface LaneOpts {
 	stakes?: "throwaway" | "normal" | "production";
 	mode?: "autonomous" | "user-driven";
 	pr?: number;
 	verdict?: TestVerdict | "none";
+	/** The run's scope: the full suite (default) or the land-first fast check (PLAN wl-mvq4edbaf13vnk D1). */
+	scope?: "full" | "fast";
 	/** The review on the lane's change slice: a round then its end, a round alone, an end then a fresh round, or none. */
 	review?: "pass" | "accept" | "stop" | "round-only" | "reopened" | "none";
 	/** A loop end written by another writer than the holder lane. */
@@ -92,6 +99,7 @@ function lane(w: World, o: LaneOpts = {}): string {
 			body: testRunBody({
 				runId, verdict, sha: G, pr, reason: verdict === "green" || verdict === "red" ? null : "why", headAtEnd: G, base: null, mergeBase: null,
 				full, solo: [], failures: verdict === "red" ? [{ part: "full", name: "x.test.ts > a", firstError: "boom" }] : [], runDir: null, preflight: null,
+				...(o.scope === "fast" ? { scope: "fast" as const, host: "linux" as const } : {}),
 			}),
 		});
 	}
@@ -143,6 +151,55 @@ describe("landingReady, the ledger half of D1 (R1, R2)", () => {
 		// Jo's accept (the surface) is a passed review too
 		const accepted = lane(w, { review: "accept", endBy: SURFACE_BY });
 		expect(landingReady(w.ledger, accepted, CTX).ready).toBe(true);
+	});
+
+	test("R22: the fast check's green boards like a full green; a stale fast run does not", () => {
+		const w = world();
+		landFirst(w);
+		const wl = lane(w, { pr: 118, scope: "fast", close: false });
+		const l = ready(landingReady(w.ledger, wl, CTX));
+		expect(l.pr).toBe(118);
+		expect(boardLanding(w.ledger, l)).toMatchObject({ boarded: true, opened: true });
+		expect(w.ledger.workload(wl)!.status).toBe("open");
+		expect(landingReady(w.ledger, lane(w, { pr: 119, verdict: "stale", scope: "fast", close: false }), CTX)).toMatchObject({ ready: false, reason: expect.stringMatching(/ is stale$/) });
+	});
+
+	test("production fast green needs Jo's train word, not full scope: signoff on, refused off, never auto-boarded", () => {
+		const w = world();
+		landFirst(w);
+		const wl = lane(w, { pr: 120, stakes: "production", scope: "fast" });
+		expect(landingReady(w.ledger, wl, CTX)).toMatchObject({ ready: false, reason: PRODUCTION_FAST_GREEN });
+		const command = interpret(w.ledger, "train 120");
+		if (command?.kind !== "train") throw new Error("train 120 was not interpreted as a train");
+		const train = applyTrain(w.ledger, command, w.repo).workloadId;
+		const view = { number: 120, headRefName: `wl/${wl}`, headRefOid: G, isCrossRepository: false, headRepository: { name: "product" }, headRepositoryOwner: { login: "thewolff" } };
+		expect(trainSignoff(w.ledger, train, 120, view, ORIGIN, { state: "ok" })).toMatchObject({ ok: true, pr: 120, head: G });
+		landFirst(w, false);
+		expect(trainSignoff(w.ledger, train, 120, view, ORIGIN, { state: "ok" })).toMatchObject({ ok: false, reason: expect.stringContaining("land-first is off") });
+		expect(landingReady(w.ledger, wl, CTX)).toMatchObject({ ready: false, reason: "land-first is off: a fast green is not a full-suite result" });
+	});
+
+	test("released admission keeps strict off-mode, live-owner, unfinished-work and pending-test guards", () => {
+		const w = world();
+		const wl = lane(w, { scope: "fast", close: false });
+		expect(landingReady(w.ledger, wl, CTX)).toMatchObject({ ready: false, reason: "the workload is open" });
+		landFirst(w);
+		const admitted = ready(landingReady(w.ledger, wl, CTX));
+		expect(landingReady(w.ledger, lane(w, { close: false }), CTX)).toMatchObject({ ready: false, reason: "the workload is open" });
+		const holder = "lane-resumed";
+		expect(w.ledger.claimWorkload(wl, { by: LANE_STARTER_BY, holder, leaseMs: 600_000 }).won).toBe(true);
+		expect(landingReady(w.ledger, wl, CTX)).toMatchObject({ ready: false, reason: expect.stringContaining("held live") });
+		expect(boardLanding(w.ledger, admitted)).toMatchObject({ boarded: false, reason: expect.stringContaining("held live") });
+		w.ledger.releaseWorkload(wl, { by: holder, holder });
+		const sl = w.ledger.addSlice({ by: SURFACE_BY, workloadId: wl, task: "more", doneCondition: "done", inputs: "code" });
+		expect(landingReady(w.ledger, wl, CTX)).toMatchObject({ ready: false, reason: "the workload has open or paused slices" });
+		expect(boardLanding(w.ledger, admitted)).toMatchObject({ boarded: false, reason: "the workload has open or paused slices" });
+		w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody({ runId: "tr-pending", pr: 101, sha: G, slice: sl, by: holder }) });
+		expect(landingReady(w.ledger, wl, CTX)).toMatchObject({ ready: false, reason: expect.stringContaining("waits on its test run") });
+		expect(boardLanding(w.ledger, admitted)).toMatchObject({ boarded: false, reason: expect.stringContaining("waits on its test run") });
+		w.ledger.completeSlice(sl, { by: SURFACE_BY, artifact: "done" });
+		expect(landingReady(w.ledger, wl, CTX)).toMatchObject({ ready: false, reason: expect.stringContaining("has no result") });
+		expect(boardLanding(w.ledger, admitted)).toMatchObject({ boarded: false, reason: expect.stringContaining("has no result") });
 	});
 
 	test("R2: each failing rule is not-ready with its reason", () => {

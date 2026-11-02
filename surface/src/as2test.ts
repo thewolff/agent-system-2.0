@@ -13,15 +13,17 @@
 //   the install facts (SOURCE, the account, owners, modes, hashes) and the decision over them;
 // - `parseSource`, the SOURCE file the refresh helper writes (install/as2test-setup.sh wrote it before);
 // - `renderRefreshHelper`: the root-owned sh helper `/usr/local/libexec/as2test/refresh` (workload
-//   wl-mv718fxhwwcn40, PLAN revision 6, § 1.1). It takes no arguments, fetches origin/main from the
-//   fixed AS2TEST_ORIGIN into a root-owned mirror, builds test-exec as an unprivileged build user,
-//   and installs `exec`, `test-exec.js` and `SOURCE`; the runner calls it through `sudo -n` when
-//   `installDecision` reports drift (§ 1.2);
+//   wl-mv718fxhwwcn40, PLAN revision 6, § 1.1). It takes no arguments, fetches the `as2-verified` tag
+//   (AS2_VERIFIED_TAG, PLAN wl-mvq4edbaf13vnk § 2 "The bundle") from the fixed AS2TEST_ORIGIN into a
+//   root-owned mirror, builds test-exec at the tag's commit as an unprivileged build user, and installs
+//   `exec`, `test-exec.js` and `SOURCE`; the runner calls it through `sudo -n` when `installDecision`
+//   reports drift (§ 1.2);
 // - a small CLI the setup script and the helper call: `render-exec`, `render-refresh` and `bundle-inputs`.
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { defaultLedgerPath } from "../../ledger/src/locality";
+import { STUCK_DEFAULTS } from "./stuck-detect";
 import { AS2TEST_EXEC, AS2TEST_ROOT, AS2TEST_USER, WRAPPER_EXIT, type WrapperCall, runsDbOf, wrapperArgv } from "./test-run";
 
 // ---- the wrapper ---------------------------------------------------------------------------------
@@ -33,7 +35,7 @@ export const AS2TEST_SUDOERS = "/etc/sudoers.d/as2test";
 /** The installed files under AS2TEST_LIBEXEC whose sha-256 SOURCE records. */
 export const INSTALLED_FILES = ["exec", "bun", "test-exec.js", "refresh"] as const;
 export type InstalledFile = (typeof INSTALLED_FILES)[number];
-/** The installed files the refresh helper rebuilds from origin/main; only setup writes the others. */
+/** The installed files the refresh helper rebuilds from the `as2-verified` tag's commit; only setup writes the others. */
 export const REBUILT_FILES = ["exec", "test-exec.js"] as const satisfies readonly InstalledFile[];
 /** The PATH the wrapper and test-exec run with; the child's PATH puts its shim dir in front. */
 export const WRAPPER_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -66,6 +68,16 @@ export interface ExecWrapperOptions {
 	sweepLockWaitMs?: number;
 	/** Test-only, `groups` renders only: the stuck capture's deadline at a part's cap (default 20 s). */
 	captureMs?: number;
+	/** Test-only, `groups` renders only: the stuck-worker detector's tick (PLAN wl-mvq8x4pkjmx69s D2; default 1 s). */
+	detectTickMs?: number;
+	/** Test-only, `groups` renders only: how long a signature must hold to match (D2; default 5 s). */
+	detectPersistMs?: number;
+	/** Test-only, `groups` renders only: the signature capture's deadline on a match (D3; default 3 s). */
+	signatureCaptureMs?: number;
+	/** Test-only, `groups` renders only: the enforce stop's SIGTERM → SIGKILL grace (D3; default 1.5 s). */
+	stopGraceMs?: number;
+	/** Test-only, `groups` renders only: append each detector tick's observation to `<work>/<part>.stuck-trace.jsonl` (D3). */
+	detectTrace?: boolean;
 }
 
 /** What the wrapper hands test-exec in `AS2TEST_EXEC_CONFIG`; test-exec validates it again. */
@@ -78,6 +90,11 @@ export interface ExecConfig {
 	killGraceMs: number;
 	sweepLockWaitMs: number;
 	captureMs: number;
+	detectTickMs: number;
+	detectPersistMs: number;
+	signatureCaptureMs: number;
+	stopGraceMs: number;
+	detectTrace: boolean;
 }
 
 export class WrapperRenderError extends Error {}
@@ -91,20 +108,39 @@ export function execConfigOf(o: ExecWrapperOptions): ExecConfig {
 		if (typeof v !== "string" || !plainAbs(v)) throw new WrapperRenderError(`${k} must be a normalized absolute path: ${String(v)}`);
 	}
 	if (o.sweepScope !== "uid" && o.sweepScope !== "groups") throw new WrapperRenderError(`sweepScope must be uid or groups: ${String(o.sweepScope)}`);
-	const testOnly = o.hooks !== undefined || o.killGraceMs !== undefined || o.sweepLockWaitMs !== undefined || o.captureMs !== undefined;
-	if (testOnly && o.sweepScope !== "groups") throw new WrapperRenderError("hooks, killGraceMs, sweepLockWaitMs and captureMs are test-only: a uid render carries none");
+	const testOnly = o.hooks !== undefined || o.killGraceMs !== undefined || o.sweepLockWaitMs !== undefined || o.captureMs !== undefined
+		|| o.detectTickMs !== undefined || o.detectPersistMs !== undefined || o.signatureCaptureMs !== undefined || o.stopGraceMs !== undefined || o.detectTrace !== undefined;
+	if (testOnly && o.sweepScope !== "groups") {
+		throw new WrapperRenderError("hooks, killGraceMs, sweepLockWaitMs, captureMs, detectTickMs, detectPersistMs, signatureCaptureMs, stopGraceMs and detectTrace are test-only: a uid render carries none");
+	}
 	if (o.hooks !== undefined && !plainAbs(o.hooks)) throw new WrapperRenderError(`hooks must be a normalized absolute path: ${o.hooks}`);
+	if (o.detectTrace !== undefined && typeof o.detectTrace !== "boolean") throw new WrapperRenderError("detectTrace must be a boolean");
 	const ms = (v: number | undefined, d: number, k: string): number => {
 		if (v === undefined) return d;
 		if (!Number.isSafeInteger(v) || v < 0) throw new WrapperRenderError(`${k} must be a whole number of ms`);
 		return v;
 	};
+	const detectTickMs = ms(o.detectTickMs, STUCK_DEFAULTS.tickMs, "detectTickMs");
+	if (detectTickMs < 1) throw new WrapperRenderError("detectTickMs must be 1 ms or more");
 	return {
 		root: o.root, bun: o.bun, sweep: o.sweepScope === "uid" ? UID_SWEEP : "groups", hooks: o.hooks ?? null,
 		killGraceMs: ms(o.killGraceMs, KILL_GRACE_MS, "killGraceMs"), sweepLockWaitMs: ms(o.sweepLockWaitMs, SWEEP_LOCK_WAIT_MS, "sweepLockWaitMs"),
 		captureMs: ms(o.captureMs, CAPTURE_MS, "captureMs"),
+		detectTickMs, detectPersistMs: ms(o.detectPersistMs, STUCK_DEFAULTS.persistMs, "detectPersistMs"),
+		signatureCaptureMs: ms(o.signatureCaptureMs, STUCK_DEFAULTS.signatureCaptureMs, "signatureCaptureMs"),
+		stopGraceMs: ms(o.stopGraceMs, STUCK_DEFAULTS.stopGraceMs, "stopGraceMs"), detectTrace: o.detectTrace ?? false,
 	};
 }
+
+/**
+ * The wrapper's check of one test operand (`solo`'s and each of `fast`'s), the body of its sh function `check_test`: `./<plain
+ * relative path>` whose basename is a Bun test file name, so no operand reaches bun as an option or a path outside the clone.
+ */
+const TEST_OPERAND_SH = [
+	'case "$1" in ./*) ;; *) refuse "test must be ./<relative path>" ;; esac;',
+	'_rel=${1#./}; case "/$_rel/" in *//*|*"/../"*|*"/./"*) refuse "test is not a plain relative path" ;; esac;',
+	'case "${_rel##*/}" in *[._]test.ts|*[._]test.tsx|*[._]test.js|*[._]test.jsx|*[._]test.mjs|*[._]test.cjs|*[._]test.mts|*[._]test.cts|*[._]spec.ts|*[._]spec.tsx|*[._]spec.js|*[._]spec.jsx|*[._]spec.mjs|*[._]spec.cjs|*[._]spec.mts|*[._]spec.cts) ;; *) refuse "not a Bun test file name" ;; esac;',
+].join(" ");
 
 /**
  * The `exec` wrapper's sh text (§ 2.3 step 3). It checks the run id against `^tr-[a-z0-9]+$`, the
@@ -112,6 +148,7 @@ export function execConfigOf(o: ExecWrapperOptions): ExecConfig {
  * env: PATH, LANG, TERM, SHELL, USER and LOGNAME (from `id -un`, not the caller), the config, and
  * an existing private `runs/<id>/.wrapper-tmp` TMPDIR before Bun starts. Bootstrap validates argv,
  * fences on `<root>/stage/current`, and rejects symlinked areas/run/temp paths before creating anything.
+ * `fast` (PLAN wl-mvq4edbaf13vnk D4) takes one or more test operands, each checked as `solo`'s one is.
  */
 export function renderExecWrapper(o: ExecWrapperOptions): string {
 	const config = execConfigOf(o);
@@ -132,15 +169,16 @@ export function renderExecWrapper(o: ExecWrapperOptions): string {
 		'\tfull|sweep) [ "$#" -eq 2 ] || refuse "$1 takes exactly <run id>" ;;',
 		'\tprepare|solo|base-prepare|base-solo|cleanup) [ "$#" -eq 3 ] || refuse "$1 takes exactly <run id> and one operand" ;;',
 		'\tprobe) [ "$#" -ge 3 ] || refuse "probe takes <run id> and one or more paths" ;;',
+		'\tfast) [ "$#" -ge 3 ] || refuse "fast takes <run id> and one or more ./<test file>" ;;',
 		'\t*) refuse "unknown subcommand" ;;',
 		"esac",
 		// Reject malformed operands before bootstrap has any filesystem side effect.
+		`check_test() { ${TEST_OPERAND_SH} }`,
 		'case "$1" in',
 		'\tprepare|base-prepare) [ "${#3}" -eq 40 ] || refuse "not a full sha"; case "$3" in *[!0123456789abcdef]*) refuse "not a full sha" ;; esac ;;',
 		`\tcleanup) case "$3" in tr-|tr-*[!${alnum}]*) refuse "old run id is malformed" ;; tr-*) ;; *) refuse "old run id is malformed" ;; esac; [ "$3" != "$2" ] || refuse "cleanup never deletes its own run" ;;`,
-		'\tsolo|base-solo) case "$3" in ./*) ;; *) refuse "test must be ./<relative path>" ;; esac',
-		'\t\trel=${3#./}; case "/$rel/" in *//*|*"/../"*|*"/./"*) refuse "test is not a plain relative path" ;; esac',
-		'\t\tcase "${rel##*/}" in *[._]test.ts|*[._]test.tsx|*[._]test.js|*[._]test.jsx|*[._]test.mjs|*[._]test.cjs|*[._]test.mts|*[._]test.cts|*[._]spec.ts|*[._]spec.tsx|*[._]spec.js|*[._]spec.jsx|*[._]spec.mjs|*[._]spec.cjs|*[._]spec.mts|*[._]spec.cts) ;; *) refuse "not a Bun test file name" ;; esac ;;',
+		'\tsolo|base-solo) check_test "$3" ;;',
+		'\tfast) n=0; for t do n=$((n + 1)); [ "$n" -gt 2 ] || continue; check_test "$t"; done ;;',
 		'\tprobe) n=0; for p do n=$((n + 1)); [ "$n" -gt 2 ] || continue; case "$p" in /*) ;; *) refuse "probe takes absolute paths" ;; esac; done ;;',
 		"esac",
 		// Resolve only the fixed root. Everything below it must be a plain, physical directory.
@@ -172,7 +210,7 @@ export function renderExecWrapper(o: ExecWrapperOptions): string {
 		'\t\tdone',
 		'\tfi',
 		'else',
-		'\tcase "$1" in full|solo|base-prepare|base-solo) refuse "$work does not exist (prepare first)" ;; esac',
+		'\tcase "$1" in full|solo|base-prepare|base-solo|fast) refuse "$work does not exist (prepare first)" ;; esac',
 		'\t(umask 077; /bin/mkdir "$work") || refuse "cannot create $work"',
 		'fi',
 		'if [ -e "$tmp" ] || [ -L "$tmp" ]; then',
@@ -569,8 +607,13 @@ export function preflightDecision(install: Verdict, probe: Verdict): Verdict {
 
 // ---- the refresh helper (PLAN wl-mv718fxhwwcn40 § 1.1) ---------------------------------------------
 
-/** The one origin an installed helper fetches main from: fixed in its text, never read from a remote. */
+/** The one origin an installed helper fetches the verified tag from: fixed in its text, never read from a remote. */
 export const AS2TEST_ORIGIN = "https://github.com/thewolff/agent-system-2.0.git";
+/**
+ * The tag the runner points at the verified commit (PLAN wl-mvq4edbaf13vnk § 2 "The bundle"): the refresh helper fetches
+ * `refs/tags/<this>` and builds its commit, never origin/main, so the bundle is only ever verified code.
+ */
+export const AS2_VERIFIED_TAG = "as2-verified";
 /** The preflight's reason codes (§ 1.3): the helper failed, or a drift outlived its success. */
 export const REFRESH_FAILED = "bundle-refresh-failed";
 export const CHECKOUT_DRIFT = "checkout-drift";
@@ -625,7 +668,7 @@ export interface SourceFacts {
 }
 
 export interface RefreshHelperOptions {
-	/** Where main is fetched from: AS2TEST_ORIGIN for an installed helper; a local bare repo in a test render. */
+	/** Where the as2-verified tag is fetched from: AS2TEST_ORIGIN for an installed helper; a local bare repo in a test render. */
 	origin: string;
 	/** The libexec dir: the helper is `<libexec>/refresh`, its lock, mirror and staged copies are in `<libexec>/refresh.d`. */
 	libexec: string;
@@ -744,9 +787,9 @@ export const REFRESH_STEP_SH = [
  * The refresh helper's sh text (PLAN wl-mv718fxhwwcn40 § 1.1): `<libexec>/refresh`, the one command
  * the second sudoers line allows, with no arguments. Unless its environment is exactly the fixed one
  * it re-execs itself under `env -i`, takes the lock on `refresh.d/lock` (fd 9, lockf), removes the build
- * dir an earlier run left (within the cleanup bound), fetches main from the fixed origin into the
- * root-owned mirror `refresh.d/mirror.git`, and answers `current <sha12>` when the installed SOURCE is
- * byte for byte the SOURCE it would write. Otherwise it unpacks main into a fresh build dir, runs bun
+ * dir an earlier run left (within the cleanup bound), fetches the `as2-verified` tag (AS2_VERIFIED_TAG) from the fixed origin
+ * into the root-owned mirror `refresh.d/mirror.git`, and answers `current <sha12>` when the installed SOURCE is
+ * byte for byte the SOURCE it would write. Otherwise it unpacks the tag's commit into a fresh build dir, runs bun
  * build, `bundle-inputs` and `render-exec` there as the build
  * user, reads the outputs through the build user into the root-only `refresh.d/stage`, checks the
  * staged copies, and installs `exec`, `test-exec.js` and `SOURCE` (last) through dotted `.new` names
@@ -764,7 +807,7 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		"#!/bin/sh",
 		"# agent-system 2.0 test runner: the test-exec bundle refresh helper (workload wl-mv718fxhwwcn40, PLAN",
 		"# § 1.1), rendered by surface/src/as2test.ts renderRefreshHelper. It takes no arguments: every value is",
-		"# fixed here, and it never reads its caller's env, cwd or checkout. It fetches main from ORIGIN into a",
+		`# fixed here, and it never reads its caller's env, cwd or checkout. It fetches the ${AS2_VERIFIED_TAG} tag from ORIGIN into a`,
 		"# root-owned mirror, builds test-exec as the build user, checks what the build user hands back, and",
 		"# installs exec, test-exec.js and SOURCE (last). It never writes itself or the sudoers file.",
 		"# Exit: 0 refreshed or current · 64 usage · 69 lock · 70 fetch · 71 build, check, signal or cap · 72 install · 77 not root.",
@@ -942,20 +985,21 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		"fi",
 		`run /dev/null /bin/rm -rf "$STAGE" && run /dev/null /bin/mkdir -m 0700 "$STAGE" || die ${REFRESH_EXIT.build} "cannot empty $STAGE"`,
 		"",
-		"# The fetch: main only, from ORIGIN only, into the root-owned mirror. Values a command prints reach the shell",
-		"# through a stage file and read, a builtin, never a foreground $(...).",
+		`# The fetch: the ${AS2_VERIFIED_TAG} tag only (PLAN wl-mvq4edbaf13vnk § 2: the commit the runner verified), from ORIGIN only,`,
+		"# into the root-owned mirror; its commit (an annotated tag peeled) is what the build checks out. Values a command",
+		"# prints reach the shell through a stage file and read, a builtin, never a foreground $(...).",
 		`[ -d "$MIRROR" ] || run /dev/null /usr/bin/git ${gitConfig} init -q --bare --template= "$MIRROR" >&2 || die ${REFRESH_EXIT.fetch} "cannot make the mirror $MIRROR"`,
-		`run /dev/null g fetch -q --no-tags "$ORIGIN" '+refs/heads/main:refs/heads/main' >&2 || die ${REFRESH_EXIT.fetch} "fetching main from $ORIGIN failed"`,
-		`run /dev/null g rev-parse -q --verify 'refs/heads/main^{commit}' > "$STAGE/sha" || die ${REFRESH_EXIT.fetch} "the mirror has no main"`,
-		`SHA=; IFS= read -r SHA < "$STAGE/sha" || die ${REFRESH_EXIT.fetch} "the mirror has no main"`,
-		`case "$SHA" in *[!0-9a-f]*) die ${REFRESH_EXIT.fetch} "main is not a sha" ;; esac`,
-		`[ "\${#SHA}" -eq 40 ] || die ${REFRESH_EXIT.fetch} "main is not a full sha"`,
+		`run /dev/null g fetch -q --no-tags "$ORIGIN" '+refs/tags/${AS2_VERIFIED_TAG}:refs/tags/${AS2_VERIFIED_TAG}' >&2 || die ${REFRESH_EXIT.fetch} "fetching the ${AS2_VERIFIED_TAG} tag from $ORIGIN failed"`,
+		`run /dev/null g rev-parse -q --verify 'refs/tags/${AS2_VERIFIED_TAG}^{commit}' > "$STAGE/sha" || die ${REFRESH_EXIT.fetch} "the mirror has no ${AS2_VERIFIED_TAG} tag naming a commit"`,
+		`SHA=; IFS= read -r SHA < "$STAGE/sha" || die ${REFRESH_EXIT.fetch} "the mirror has no ${AS2_VERIFIED_TAG} tag naming a commit"`,
+		`case "$SHA" in *[!0-9a-f]*) die ${REFRESH_EXIT.fetch} "the ${AS2_VERIFIED_TAG} tag's commit is not a sha" ;; esac`,
+		`[ "\${#SHA}" -eq 40 ] || die ${REFRESH_EXIT.fetch} "the ${AS2_VERIFIED_TAG} tag's commit is not a full sha"`,
 		`run /dev/null /usr/bin/awk '$1 == "source-sha" { print $2; exit }' "$LIBEXEC/SOURCE" > "$STAGE/old" 2>/dev/null`,
 		'OLD=; IFS= read -r OLD < "$STAGE/old"',
 		"# none without a SOURCE, or over a provisional one (setup's, before the first run).",
 		'case "$OLD" in "" | *[!0-9a-f]*) OLD=none ;; esac',
 		"",
-		"# Current: the installed SOURCE is byte for byte what this helper would write for main, so the",
+		`# Current: the installed SOURCE is byte for byte what this helper would write for the ${AS2_VERIFIED_TAG} commit, so the`,
 		"# installed files match it too. A legacy or foreign SOURCE never is, and is rebuilt.",
 		'if [ -f "$LIBEXEC/SOURCE" ]; then',
 		`\trun /dev/null /usr/bin/awk '$1 == "input" { print $2 }' "$LIBEXEC/SOURCE" > "$STAGE/inputs.installed" || die ${REFRESH_EXIT.build} "cannot read $LIBEXEC/SOURCE"`,
@@ -963,7 +1007,7 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		`\tif run /dev/null /usr/bin/cmp -s "$STAGE/SOURCE.current" "$LIBEXEC/SOURCE"; then printf 'current %.12s\\n' "$SHA"; exit 0; fi`,
 		"fi",
 		"",
-		`# The build, as ${o.buildUser ?? "the caller"}: main's code never runs as root.`,
+		`# The build, as ${o.buildUser ?? "the caller"}: the fetched code never runs as root.`,
 		'MADE="$STAGE/build"',
 		`run /dev/null /usr/bin/mktemp -d ${REFRESH_BUILD_PARENT}/as2test-refresh.XXXXXX > "$MADE" || die ${REFRESH_EXIT.build} "cannot make a build directory"`,
 		`IFS= read -r BUILD < "$MADE" || die ${REFRESH_EXIT.build} "cannot make a build directory"`,

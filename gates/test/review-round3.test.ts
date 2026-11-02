@@ -166,22 +166,22 @@ describe("RULING-git-C: `git -C <literal path>` is a modeled form (row 6)", () =
 describe("R3-S1: a question mark is not a decision (row 1)", () => {
 	const cases: [string, "ALLOW" | "BLOCK"][] = [
 		// The review's probes, with the verdict the brief requires.
-		["**CLAIM**\nThe user asked, “Should the parser reject this?”\n\n**QUESTION**\nKeep the current parser or reject unknown syntax?", "ALLOW"],
-		["**PMDW**\nDoes that answer your question?", "ALLOW"],
-		["**CLAIM**\nObserved source comment:\n    // Why is this token opaque?\n\n**QUESTION**\nKeep the current parser or reject unknown syntax?", "ALLOW"],
-		["**QUESTION**\nUse main? Ship today?", "BLOCK"],
-		["**PMDW**\nUse main? Ship today?", "BLOCK"],
-		["**QUESTION**\nChoose main or feature; also choose deploy today or tomorrow?", "BLOCK"],
-		["**QUESTION**\nWhich mode?\n- strict\n- permissive", "ALLOW"],
-		// Neighbours: other quoted and code forms, and a PMDW check-in beside the one QUESTION.
-		['**CLAIM**\nThe log line reads *"retry?"* and nothing else.\n\n**QUESTION**\nShip now or wait? Recommend now.', "ALLOW"],
+		["**CLAIM**\nThe user asked, “Should the parser reject this?”\n\n**Closing ask**\nKeep the current parser or reject unknown syntax?", "ALLOW"],
+		["Does that answer your question?", "ALLOW"],
+		["**CLAIM**\nObserved source comment:\n    // Why is this token opaque?\n\n**Closing ask**\nKeep the current parser or reject unknown syntax?", "ALLOW"],
+		["**Closing ask**\nUse main? Ship today?", "BLOCK"],
+		["Use main? Ship today?", "BLOCK"],
+		["**Closing ask**\nChoose main or feature; also choose deploy today or tomorrow?", "BLOCK"],
+		["**Closing ask**\nWhich mode?\n- strict\n- permissive", "ALLOW"],
+		// Neighbours: other quoted and code forms, and a prose check-in beside the one closing ask.
+		['**CLAIM**\nThe log line reads *"retry?"* and nothing else.\n\n**Closing ask**\nShip now or wait? Recommend now.', "ALLOW"],
 		["**CLAIM**\n> Why does this fail?\n\nIt fails on the parser.", "ALLOW"],
-		["**CLAIM**\nThe regex is `a?b`.\n\n**PMDW**\nWant me to proceed?", "ALLOW"],
-		// A PMDW check-in beside the QUESTION is a second ask (adversarial-1, fable; fix round 5).
-		["**PMDW**\nWant me to proceed?\n\n**QUESTION**\nShip now or wait? Recommend now.", "BLOCK"],
-		["**QUESTION**\nShip now or wait?\n\n**QUESTION**\nDeploy or hold?", "BLOCK"],
+		["**CLAIM**\nThe regex is `a?b`.\n\nWant me to proceed?", "ALLOW"],
+		// A prose check-in beside the closing ask is a second ask (adversarial-1, fable; fix round 5).
+		["Want me to proceed?\n\n**Closing ask**\nShip now or wait? Recommend now.", "BLOCK"],
+		["**Closing ask**\nShip now or wait?\n\n**Closing ask**\nDeploy or hold?", "BLOCK"],
 		["**CLAIM**\nIs the gate built? Yes.", "BLOCK"],
-		["**PMDW**\nShip now or wait?", "BLOCK"],
+		["**CLAIM**\nThe gate is built.\n\nShip now or wait?", "BLOCK"],
 	];
 	for (const [text, want] of cases) test(`${want}: ${JSON.stringify(text)}`, () => expect(verdict(checkTurnShape(text))).toBe(want));
 });

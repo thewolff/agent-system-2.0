@@ -41,10 +41,12 @@ export function renderNotice(findings) {
   ].join("\n");
 }
 
-// The person-facing line: which rules fired, and that the agent has the detail.
+// The person-facing line: which rules fired, and that the agent has the detail. A "judge
+// unavailable" finding is left out: the person hears about a dead judge from the Stop hook's own
+// alert, once per rule and error (lib/alerts.mjs), not on every turn. "" when nothing is left.
 export function renderSummary(findings) {
-  const rules = [...new Set(findings.map((f) => f.rule))].join(", ");
-  return `i-have-audhd warned on the agent's last message: ${rules}. The agent gets the fix with this turn.`;
+  const rules = [...new Set(findings.filter((f) => !f.unavailable).map((f) => f.rule))].join(", ");
+  return rules ? `i-have-audhd warned on the agent's last message: ${rules}. The agent gets the fix with this turn.` : "";
 }
 
 // Replace the session's pending notice with these warn findings; none removes it.

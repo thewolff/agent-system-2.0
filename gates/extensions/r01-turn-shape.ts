@@ -19,10 +19,10 @@
 //
 // Row 15's publication binding rides the same hold (Codex review of PR #55, B2): an orchestrator
 // reply that passes row 1 is then bound to its question rows (gates/src/rows/r15-orchestrator-role.ts
-// checkQuestionPublication) — every `q-…` its QUESTION blocks name is an open row on the standing
+// checkQuestionPublication) — every `q-…` its closing ask names is an open row on the standing
 // slice no earlier reply cited — and a refusal is withheld exactly like a row 1 refusal; a passing
 // reply's rows are cited in the ledger (recordPublication). `session_stop` re-binds the last reply
-// against the citations, so a QUESTION that reached Jo with no row never ends the turn. A ledger
+// against the citations, so a closing ask that reached Jo with no row never ends the turn. A ledger
 // that cannot be read refuses rather than passing the reply unchecked. A reply naming no question
 // never opens the ledger, and a ledger that cannot be read still refuses a reply that names one.
 // The hold is kept on the session (`heldReply`) past the stop's block, until a reply passes or Jo's
@@ -54,7 +54,7 @@ function orchestratorReply(s: GateSession, text: string): string | null {
 		recordPublication(() => s.ledger(), bound.questionIds, s.laneId);
 		return null;
 	} catch (err) {
-		return `P-11 row 15 could not bind this reply's QUESTION to the ledger (${String(err)}); the reply is held`;
+		return `P-11 row 15 could not bind this reply's closing ask to the ledger (${String(err)}); the reply is held`;
 	}
 }
 
@@ -100,7 +100,7 @@ export default function turnShapeRow(pi: GatesAPI, env: Record<string, string | 
 			const bound = checkQuestionPublication(text, () => s.ledger(), true);
 			return bound.ok ? undefined : { decision: "block", reason: bound.reason };
 		} catch (err) {
-			return { decision: "block", reason: `P-11 row 15 could not bind this reply's QUESTION to the ledger (${String(err)}); the turn does not end unchecked` };
+			return { decision: "block", reason: `P-11 row 15 could not bind this reply's closing ask to the ledger (${String(err)}); the turn does not end unchecked` };
 		}
 	});
 }

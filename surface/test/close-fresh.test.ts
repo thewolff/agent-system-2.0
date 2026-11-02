@@ -8,17 +8,24 @@
 // `pr list --state all` per head branch from `prs/<branch>.json`, and a testRunner config through
 // `$AGENT_SYSTEM_TEST_RUNNER_CONFIG`.
 import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { tick as trainTick } from "../scripts/train-tick";
+import { promoteMain } from "../scripts/test-runner";
 import { closeWorkloadWithEntry } from "../extensions/workload";
 import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { recordRepo } from "../src/decision-log";
+import { errorLines } from "../src/errors";
+import { ensureStandingWorkload } from "../src/identity";
 import { applyTrain } from "../src/input";
-import { branchName, withdrawInstructionBody, withdrawnBody, worktreePath } from "../src/launch";
-import { testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
-import { SURFACE_BY, type SurfaceAPI } from "../src/types";
+import { branchName, landFirstBody, landFirstInstructionBody, withdrawInstructionBody, withdrawnBody, worktreePath } from "../src/launch";
+import { autoboardCandidates, landFirstRows, openTrains, trainAutoboardBody, trainPrs } from "../src/merge-train";
+import { type ExecCounts, testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
+import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY, type SurfaceAPI } from "../src/types";
 import { clock, tempLedger, tmp } from "./helpers";
+import { fakeGh, REPO as TICK_REPO } from "./train-world";
 
 // Every test spawns real git and the fake gh many times (3-4 s idle); on a loaded runner the 5 s
 // bun default killed them mid-check (tr-0mvqeuifhqv87ca: 4 timeouts, the close check reading -1).
@@ -167,8 +174,11 @@ function requested(x: Closable, runId: string, pr: number, sha: string, o: { wl?
 	x.tick();
 	x.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: o.wl ?? x.wl, kind: "assumption", body: testRequestedBody({ runId, pr, sha, slice: "sl-full-1", by: "lane-a" }) });
 }
-/** The runner's `test-run:` entry for a request; a red-main carries the base comparison it rests on. `o.wl` writes it on another workload, `o.by` forges the writer. */
-function ran(x: Closable, runId: string, pr: number, sha: string, verdict: TestVerdict, o: { wl?: string; by?: string } = {}): void {
+/**
+ * The runner's `test-run:` entry for a request; a red-main carries the base comparison it rests on. `o.wl` writes it on another
+ * workload, `o.by` forges the writer, `o.fast` makes it the fast check on Linux (PLAN wl-mvq4edbaf13vnk D1).
+ */
+function ran(x: Closable, runId: string, pr: number, sha: string, verdict: TestVerdict, o: { wl?: string; by?: string; fast?: boolean } = {}): void {
 	x.tick();
 	const red = verdict === "red" || verdict === "red-main";
 	const broken = "x.test.ts > broken";
@@ -179,6 +189,24 @@ function ran(x: Closable, runId: string, pr: number, sha: string, verdict: TestV
 			full: { pass: 3, fail: red ? 1 : 0, skip: 0, exit: red ? 1 : 0, ms: 900, error: null }, solo: [],
 			failures: red ? [{ part: "full", name: broken, firstError: "error: nope" }] : [], runDir: `/runs/${runId}`, preflight: "ok",
 			...(verdict === "red-main" ? { baseCompare: { sha: "b".repeat(40), parts: [{ part: "full", failing: [broken], baseFailing: [broken], baseError: null }] } } : {}),
+			...(o.fast ? { scope: "fast" as const, host: "linux" as const } : {}),
+		}),
+	});
+}
+/** Executed counts a main run's believability passes on: every test file of the tree ran (PLAN wl-mvq4edbaf13vnk § 2 Main state). */
+const BELIEVABLE: ExecCounts = { files: 40, tests: 400, treeFiles: 40 };
+/** The runner's main run of `sha` on the standing workload (pr 0, the full suite on the Mac); `o.exec` sets its counts, `o.by` forges the writer. */
+function mainRan(x: Closable, runId: string, sha: string, verdict: "green" | "red", o: { exec?: ExecCounts; by?: string } = {}): void {
+	x.tick();
+	ensureStandingWorkload(x.ledger);
+	const red = verdict === "red";
+	x.ledger.recordEntry({
+		by: o.by ?? TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption",
+		body: testRunBody({
+			runId, verdict, sha, pr: 0, reason: null, headAtEnd: sha, base: null, mergeBase: null,
+			full: { pass: 400, fail: red ? 1 : 0, skip: 0, exit: red ? 1 : 0, ms: 900, error: null }, solo: [],
+			failures: red ? [{ part: "full", name: "x.test.ts > broken", firstError: "error: nope" }] : [], runDir: `/runs/${runId}`, preflight: "ok",
+			scope: "full", main: true, host: "mac", exec: o.exec ?? BELIEVABLE,
 		}),
 	});
 }
@@ -907,11 +935,11 @@ function pushDest(x: Closable, remote: string, branch: string, sha: string): voi
 }
 
 /** Another workload whose `repo:` is `repo` (this clone unless given), with the runner's green (or `o.by`'s imitation) at `sha` for PR `pr`; its id. */
-function foreignGreen(w: World, x: Closable, runId: string, pr: number, sha: string, o: { repo?: string; by?: string } = {}): string {
+function foreignGreen(w: World, x: Closable, runId: string, pr: number, sha: string, o: { repo?: string; by?: string; fast?: boolean } = {}): string {
 	const wl = x.ledger.openWorkload({ by: SURFACE_BY, brief: `Another workload's change, run ${runId}`, stakes: "normal", mode: "autonomous" });
 	recordRepo(x.ledger, wl, o.repo ?? w.work);
 	requested(x, runId, pr, sha, { wl });
-	ran(x, runId, pr, sha, "green", { wl, ...(o.by ? { by: o.by } : {}) });
+	ran(x, runId, pr, sha, "green", { wl, ...(o.by ? { by: o.by } : {}), ...(o.fast ? { fast: true } : {}) });
 	return wl;
 }
 
@@ -1285,9 +1313,264 @@ describe("PLAN wl-mvfjen3q5mqi2o D2-D4: a merged PR no green of its own holds pa
 	}, 45_000);
 });
 
+/**
+ * PR #7 from wl/<id> at h with a fast green tr-1 at h (PLAN wl-mvq4edbaf13vnk D1), merged into main by Jo's merge commit m
+ * (`--no-ff`) after main moved on to o.
+ */
+function fastMerged(w: World, x: Closable): { h: string; m: string; o: string; other: string } {
+	const { sha: h } = laneWithCode(w, x);
+	requested(x, "tr-1", 7, h);
+	ran(x, "tr-1", 7, h, "green", { fast: true });
+	const other = otherClone(w);
+	const o = commitFile(w, other, "o.txt", "main moves on");
+	g(w, other, "merge", "-q", "--no-ff", "--no-edit", h);
+	const m = g(w, other, "rev-parse", "HEAD");
+	g(w, other, "push", "-q", "origin", "main");
+	g(w, w.work, "fetch", "-q", "origin");
+	prs(w, x.branch, [{ number: 7, state: "MERGED", headRefOid: h, mergeCommit: m }]);
+	return { h, m, o, other };
+}
+/** D9's refusal for a merged PR whose fast green no main run covers yet. */
+const fastUncovered = (x: Closable, h: string, m: string) =>
+	`PR #7 merged at ${s7(h)} (merge commit ${s7(m)}) with only test-run tr-1, a fast green at ${s7(h)}, and no green, believable main run on main holds it yet: it passes once the main run of ${s7(m)} or of a later main commit is green and believable, or on Jo's \`waive-pr ${x.wl} 7\``;
+
+describe("PLAN wl-mvq4edbaf13vnk D9, R23: a fast green at a merged head is covered at close by a green believable main run on its merge commit or later", () => {
+	test("released reviewed fast-green auto-boards through the real tick scan, stays open until merge and believable main coverage, then closes", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		ensureStandingWorkload(x.ledger);
+		x.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: trainAutoboardBody(x.now()) });
+		const word = x.ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(OWNER_REPO, true) });
+		x.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(OWNER_REPO, true, word) });
+		const holder = "lane-a";
+		expect(x.ledger.claimWorkload(x.wl, { by: LANE_STARTER_BY, holder, leaseMs: 600_000 }).won).toBe(true);
+		const sl = x.ledger.addSlice({ by: holder, workloadId: x.wl, task: "fix", doneCondition: "reviewed green", inputs: "code" });
+		const { sha: h } = laneWithCode(w, x);
+		prs(w, x.branch, [{ number: 7, state: "OPEN", headRefOid: h }]);
+		requested(x, "tr-1", 7, h);
+		ran(x, "tr-1", 7, h, "green", { fast: true });
+		x.ledger.recordEntry({ by: holder, workloadId: x.wl, sliceId: sl, kind: "assumption", body: reviewRoundBody({ slice: sl, round: 1, token: "dt-flow", group: "dg-flow", verdict: "accepted", findings: UNKNOWN }) });
+		x.ledger.recordEntry({ by: holder, workloadId: x.wl, sliceId: sl, kind: "assumption", body: reviewLoopEndBody(sl, "pass") });
+		x.ledger.completeSlice(sl, { by: holder, artifact: "reviewed fast green" });
+		x.tick();
+		x.ledger.recordEntry({ by: holder, workloadId: x.wl, kind: "assumption", body: "done-because: fix reviewed and fast green; ready to land" });
+		expect(x.ledger.releaseWorkload(x.wl, { by: holder, holder }).released).toBe(true);
+		expect(autoboardCandidates(x.ledger)).toContain(x.wl);
+		const early = await close(w, x);
+		expect(early.closed).toBe(false);
+		expect(early.text).toContain("passes close only once the PR has merged");
+		expect(x.ledger.workload(x.wl)!.status).toBe("open");
+
+		const gh = fakeGh();
+		gh.prs.set(7, { head: h, branch: x.branch });
+		trainTick({
+			ledger: x.ledger, config: { repos: [{ origin: OWNER_REPO, command: "bun test" }] },
+			gh: (args) => {
+				const r = gh.gh(args.map((a) => a.replace(OWNER_REPO, TICK_REPO)));
+				if (r.code === 0 && args[0] === "pr" && args[1] === "view") {
+					const view = JSON.parse(r.stdout);
+					view.headRepository = { name: "repo" };
+					view.headRepositoryOwner = { login: "example" };
+					return { ...r, stdout: JSON.stringify(view) };
+				}
+				return r;
+			},
+			launch: () => ({ code: 6, line: "fixture cap" }), notify: () => true,
+		});
+		const trains = openTrains(x.ledger);
+		expect(trains).toHaveLength(1);
+		expect(trainPrs(x.ledger.entries(trains[0]!), x.ledger.instructions(trains[0]!))).toEqual([7]);
+		expect(x.ledger.workload(x.wl)!.status).toBe("open");
+
+		const other = otherClone(w);
+		commitFile(w, other, "o.txt", "main advances");
+		g(w, other, "merge", "-q", "--no-ff", "--no-edit", h);
+		const m = g(w, other, "rev-parse", "HEAD");
+		g(w, other, "push", "-q", "origin", "main");
+		prs(w, x.branch, [{ number: 7, state: "MERGED", headRefOid: h, mergeCommit: m }]);
+		expectRefused(w, x, await close(w, x), fastUncovered(x, h, m), h);
+		mainRan(x, "tr-0main1", m, "green");
+		const final = await close(w, x);
+		expect(final.closed).toBe(true);
+		expect(final.text).toContain(`main run tr-0main1 green and believable at ${s7(m)}`);
+		expect(x.ledger.workload(x.wl)!.status).toBe("closed");
+		expectPublishedOn(w, x, h);
+	}, 40_000);
+
+	test("a main run green and believable on the merge commit, or on a later main commit, covers it and the close publishes on the merged head", async () => {
+		for (const later of [false, true]) {
+			const w = world();
+			withOrigin(w);
+			const x = closable(w);
+			const k = fastMerged(w, x);
+			const at = later ? onMain(w, k.other) : k.m;
+			mainRan(x, "tr-0main1", at, "green");
+
+			const r = await close(w, x);
+
+			expect({ later, closed: r.closed }).toEqual({ later, closed: true });
+			expect(r.text).toContain(
+				`Close check: every other PR in the set is green at its head; PR #7 merged; covered by main run tr-0main1 green and believable at ${s7(at)} (${STANDING_WORKLOAD_ID}), which contains merge commit ${s7(k.m)}.`,
+			);
+			expectPublishedOn(w, x, k.h);
+		}
+	}, 40_000);
+
+	test("a fast green alone never closes: no main run, one before the merge, off main, red, implausible, red then green, lane-written, or a PR's full green on main", async () => {
+		const shapes: { name: string; make: (w: World, x: Closable, k: { m: string; o: string; other: string }) => void }[] = [
+			{ name: "no main run yet", make: () => {} },
+			{ name: "a green main run on the commit before the merge", make: (_w, x, k) => mainRan(x, "tr-0main1", k.o, "green") },
+			{
+				name: "a green main run on a commit off main",
+				make: (w, x, k) => {
+					g(w, k.other, "checkout", "-q", "-b", "side");
+					const q = commitFile(w, k.other, "q.txt", "a commit off main");
+					g(w, k.other, "push", "-q", "origin", "side");
+					mainRan(x, "tr-0main1", q, "green");
+				},
+			},
+			{ name: "a red main run on the merge commit", make: (_w, x, k) => mainRan(x, "tr-0main1", k.m, "red") },
+			{
+				name: "an implausible main run: executed tests in a quarter of the tree's files",
+				make: (_w, x, k) => mainRan(x, "tr-0main1", k.m, "green", { exec: { files: 10, tests: 400, treeFiles: 40 } }),
+			},
+			{
+				name: "a red main verdict, then a green run of the same commit (never laundered)",
+				make: (_w, x, k) => {
+					mainRan(x, "tr-0main1", k.m, "red");
+					mainRan(x, "tr-0main2", k.m, "green");
+				},
+			},
+			{ name: "a lane-written main run", make: (_w, x, k) => mainRan(x, "tr-0main1", k.m, "green", { by: "lane-b" }) },
+			{ name: "another workload's full-suite PR green on main that contains the merge", make: (w, x, k) => void foreignGreen(w, x, "tr-9", 8, onMain(w, k.other)) },
+		];
+		for (const shape of shapes) {
+			const w = world();
+			withOrigin(w);
+			const x = closable(w);
+			const k = fastMerged(w, x);
+			shape.make(w, x, k);
+
+			const r = await close(w, x);
+
+			expect({ shape: shape.name, text: r.text }).toEqual({ shape: shape.name, text: `${x.wl} cannot close: ${fastUncovered(x, k.h, k.m)}` });
+			expectRefused(w, x, r, fastUncovered(x, k.h, k.m), k.h);
+		}
+	}, 120_000);
+
+	test("an open PR's fast green refuses even with a green main run on main; a merged one passes on Jo's waive-pr", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const s = merged(w, x, "OPEN");
+		requested(x, "tr-1", 7, s);
+		ran(x, "tr-1", 7, s, "green", { fast: true });
+		mainRan(x, "tr-0main1", s, "green");
+		const open = `PR #7's newest result is test-run tr-1, a fast green at ${s7(s)}: the fast check before merge is not a full-suite result, so it passes close only once the PR has merged and a green, believable main run on main holds its merge commit`;
+		expectRefused(w, x, await close(w, x), open, s);
+
+		const w2 = world();
+		withOrigin(w2);
+		const x2 = closable(w2);
+		const k = fastMerged(w2, x2);
+		const ins = waivePr(x2, [7]);
+		const r = await close(w2, x2);
+		expect(r.closed).toBe(true);
+		expect(r.text).toContain(`Close check: every other PR in the set is green at its head; waived by Jo: #7 (${ins}).`);
+		expectPublishedOn(w2, x2, k.h);
+	}, 40_000);
+
+	test("the D2 cover reads main runs and drops fast greens: a merged PR past its green passes on a main run, never on another PR's fast green", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const k = mergedPastGreen(w, x);
+		const n = onMain(w, k.other);
+		foreignGreen(w, x, "tr-9", 8, n, { fast: true });
+		expectRefused(w, x, await close(w, x), uncoveredReason(x, 7, k.h, k.m), k.h);
+
+		mainRan(x, "tr-0main1", n, "green");
+		const r = await close(w, x);
+		expect(r.closed).toBe(true);
+		expect(r.text).toContain(
+			`Close check: every other PR in the set is green at its head; PR #7 merged; covered by main run tr-0main1 green and believable at ${s7(n)} (${STANDING_WORKLOAD_ID}), which contains merge commit ${s7(k.m)}.`,
+		);
+	}, 30_000);
+});
+
 /** A new commit on main in `other`, pushed; its sha. */
 function onMain(w: World, other: string): string {
 	const n = commitFile(w, other, "n.txt", "the next PR, merged");
 	g(w, other, "push", "-q", "origin", "main");
 	return n;
 }
+
+describe("schema recovery through the tick and real verified promotion", () => {
+	test("a coalesced descendant-only verdict generates commands that promote the verified target, never the untested schema barrier", () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const base = g(w, w.work, "rev-parse", "HEAD");
+		const barrier = commitFile(w, w.work, "ledger/schema.sql", "schema transition");
+		const target = commitFile(w, w.work, "README.md", "coalesced verified descendant");
+		g(w, w.work, "push", "-q", "origin", "main");
+		mainRan(x, "tr-0base", base, "green");
+		mainRan(x, "tr-0tip", target, "green"); // Intentionally no verdict for the intervening barrier.
+		const directory = join(w.root, "verified");
+		let tag: string | null = null;
+		const answer = (v: unknown) => ({ code: 0, stdout: JSON.stringify(v), stderr: "" });
+		const tagGh = (args: string[]) => {
+			if (args[1] === "-X") {
+				tag = args.find((s) => s.startsWith("sha="))!.slice(4);
+				return answer({});
+			}
+			return tag === null ? { code: 1, stdout: "", stderr: "HTTP 404 Not Found" } : answer({ object: { type: "commit", sha: tag } });
+		};
+		const logs: string[] = [];
+		const promote = (sha: string, manual = false) => promoteMain(x.ledger, OWNER_REPO, sha, (line) => logs.push(line), { directory, origin: w.origin, gh: tagGh, manual });
+		expect(promote(base)).toEqual({ ok: true, sha: base, schema: null });
+		const notices = fakeGh();
+		const tickLogs = trainTick({
+			ledger: x.ledger, config: { repos: [{ origin: OWNER_REPO, command: "bun test" }] },
+			launch: () => ({ code: 6, line: "fixture cap" }), notify: () => true,
+			gh: (args) => {
+				const p = `repos/${OWNER_REPO}/`;
+				if (args[0] === "api" && args[1] === `${p}git/ref/heads/main`) return answer({ object: { sha: target } });
+				if (args[0] === "api" && args[1] === `${p}git/ref/tags/as2-verified`) return tagGh(args);
+				if (args[0] === "api" && args[1]?.startsWith(`${p}git/commits/`)) {
+					const sha = args[1].slice(`${p}git/commits/`.length);
+					const parents = g(w, w.work, "show", "-s", "--format=%P", sha).split(" ").filter(Boolean).map((sha) => ({ sha }));
+					return answer({ sha, tree: { sha: g(w, w.work, "rev-parse", `${sha}^{tree}`) }, committer: { date: x.now() }, parents });
+				}
+				if (args[0] === "api" && args[1]?.startsWith(`${p}commits/`) && args[1].endsWith("/pulls")) return answer([]);
+				return notices.gh(args);
+			},
+			land: {
+				root: () => ({ root: join(directory, base.slice(0, 12)), head: base, modified: [], current: join(directory, base.slice(0, 12)), currentHead: base, repo: OWNER_REPO }),
+				runner: (args) => {
+					if (args[0] !== "promote") return { code: 0, stdout: "", stderr: "" };
+					const r = promote(args[2]!);
+					return r.ok ? { code: 0, stdout: r.schema === null ? `promoted ${r.sha}\n` : `schema ${r.schema}\n`, stderr: "" }
+						: { code: 1, stdout: "", stderr: r.reason };
+				},
+			},
+		});
+		expect(tickLogs.some((line) => line.includes("not reconciled"))).toBe(false);
+		const row = landFirstRows(x.ledger.entries(STANDING_WORKLOAD_ID), OWNER_REPO).find((r) => r.event === "promote-schema");
+		expect(row).toMatchObject({ sha: barrier, g: target, current: base });
+		expect(notices.issues).toHaveLength(1);
+		const notice = notices.issues[0]!.body;
+		const render = errorLines(x.ledger).find((l) => l.line.startsWith("verifier: promotion waits on Jo:"))!.line;
+		expect(notice).toContain(`schema barrier ${barrier}`);
+		expect(render).toContain(s7(barrier));
+		expect(promote(barrier, true)).toMatchObject({ ok: false, reason: expect.stringContaining("no green believable main verdict") });
+		for (const recovery of [notice, render]) {
+			const command = /promote-verified\.ts ([0-9a-f]{40})/.exec(recovery);
+			expect(command?.[1]).toBe(target);
+			expect(promote(command![1]!, true)).toEqual({ ok: true, sha: target, schema: null });
+		}
+		expect(tag).toBe(target);
+		expect(g(w, realpathSync(join(directory, "current")), "rev-parse", "HEAD")).toBe(target);
+	}, 40_000);
+});

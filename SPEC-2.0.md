@@ -1249,8 +1249,12 @@ and counts a question with its options as one ask). The moment the answer needs 
 hand, or a durable record it is not trivial: the orchestrator opens the workload then and says
 so in one line. Row 3 does not flag a zero-label reply whose turn made no working call (a write
 or edit, `task`, `eval`, a command that is not read-only, a ledger tool other than the wake
-read); opening a workload is a working call. Homes: `tiers/orchestrator.md` § *Trivial asks*,
-`contract/output-types.md` § *Scope* and § *Parent-side handling*,
+read); opening a workload is a working call. Nor does it flag a reply, after work, made only of
+actions and proposals (amended 2026-10-28, review S1: the contract reports both as plain prose).
+Homes: `tiers/orchestrator.md` § *Trivial asks*,
+the output-types contract (`plugins/output-types/skills/output-types/reference.md`
+§ *Degraded reports*, *Parent-side*; `contract/output-types.md` § *Scope* and § *Parent-side
+handling* until 2026-10-28),
 `gates/src/rows/r03-receipts.ts` header.
 
 ### B16 · Interactive by default; commands as logged scripts (new requirement P-24)

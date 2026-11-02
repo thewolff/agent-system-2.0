@@ -106,6 +106,7 @@ gates/index.ts	extension	-
 gates/src/eval-code.ts	module	-
 gates/src/exec.ts	module	-
 gates/src/gates.ts	module	-
+gates/src/how-it-fails.ts	module	-
 gates/src/rows/question.ts	module	-
 gates/src/rows/r01-turn-shape.ts	module	-
 gates/src/rows/r02-contract.ts	module	-
@@ -137,8 +138,10 @@ gates/test/routine-switch.test.ts	test	-
 gates/test/r06-reserved.test.ts	test	-
 gates/test/r06-floor.test.ts	test	-
 gates/test/routine-gate.test.ts	test	-
+gates/test/r06-land-first.test.ts	test	-
 gates/test/extension.test.ts	test	-
 gates/test/helpers.ts	test	-
+gates/test/how-it-fails.test.ts	test	-
 gates/test/known-fragment.test.ts	test	-
 gates/test/ledger-rows.test.ts	test	-
 gates/test/message-rows.test.ts	test	-
@@ -1087,6 +1090,8 @@ surface/extensions/wake.ts	module	-
 surface/extensions/surface-input.ts	module	-
 surface/extensions/workload.ts	module	-
 surface/test/helpers.ts	test	-
+surface/test/how-it-fails-entry.test.ts	test	-
+surface/test/next-step.test.ts	test	-
 surface/test/render.test.ts	test	-
 surface/test/input.test.ts	test	-
 surface/test/numbering.test.ts	test	-
@@ -1101,8 +1106,6 @@ surface/test/delivery.test.ts	test	-
 surface/test/lane.test.ts	test	-
 surface/test/fixtures-fable.test.ts	test	-
 surface/test/tool-mount.test.ts	test	-
-contract/output-types.md	doc	-
-contract/output-types-incidents.md	doc	-
 voice/VOICE.md	doc	-
 voice/agent-collaboration-with-adhd-and-autism.md	doc	-
 surface/src/launch.ts	module	-
@@ -1140,7 +1143,12 @@ surface/test/turn-idle.test.ts	test	-
 surface/test/wake-push.test.ts	test	-
 surface/src/test-run.ts	module	-
 surface/test/test-run.test.ts	test	-
+surface/src/fast-set.ts	module	-
+surface/test/fast-set.test.ts	test	-
+surface/src/main-state.ts	module	-
+surface/test/main-state.test.ts	test	-
 surface/scripts/test-runner.ts	module	-
+surface/scripts/promote-verified.ts	module	-
 surface/test/test-runner.test.ts	test	-
 surface/scripts/test-run-waits.ts	module	-
 surface/test/test-run-waits.test.ts	test	-
@@ -1166,6 +1174,10 @@ surface/src/as2test.ts	module	-
 surface/src/as2test-temp.ts	module	-
 surface/test/as2test.test.ts	test	-
 surface/test/as2test-temp.test.ts	test	-
+surface/src/stuck-detect.ts	module	-
+surface/test/stuck-detect.test.ts	test	-
+surface/scripts/stuck-report.ts	module	-
+surface/test/stuck-report.test.ts	test	-
 install/as2test-setup.sh	install	-
 gates/test/r08-push-dest.test.ts	test	-
 surface/test/close-fresh.test.ts	test	-
@@ -1241,8 +1253,10 @@ ledger/test/fixtures/live-guard/reach.fixture.ts	test	-
 surface/src/pending.ts	module	-
 surface/src/batch.ts	module	-
 surface/src/notice.ts	module	-
+surface/src/headroom-notice.ts	module	-
 surface/test/pending.test.ts	test	-
 surface/test/batch.test.ts	test	-
+surface/test/headroom-notice.test.ts	test	-
 # Migration items one file each (wl-mv5mvvs64ahq0w): the numbering tool .github/workflows/migration-number.yml runs.
 surface/src/migration-items.ts	module	-
 surface/scripts/migration-items.ts	module	-
@@ -1276,6 +1290,31 @@ surface/test/linked-api.test.ts	test	-
 install/herdr-file-links/herdr-plugin.toml	install	-
 install/herdr-file-links/open-file.sh	install	-
 ledger/test/file-links-install.test.ts	test	-
+# Nightly Google Drive backup job (jo-issues #300): the job, its helpers, its zsh fixture suites and quiet-alarm.
+install/drive-backup/README.md	install	-
+install/drive-backup/backup-nightly.zsh	install	-
+install/drive-backup/check-backup-fresh.zsh	install	-
+install/drive-backup/lib.zsh	install	-
+install/drive-backup/quiet-alarm.zsh	install	-
+install/drive-backup/server-read.zsh	install	-
+install/drive-backup/test-fake-drive.zsh	install	-
+install/drive-backup/test-server-read.zsh	install	-
+install/drive-backup/fake-drive-fixture.zsh	install	-
+install/drive-backup/test-fake-drive-proofs.zsh	install	-
+install/drive-backup/test-fake-drive-envelope.zsh	install	-
+install/drive-backup/test-fake-drive-envelope-stops.zsh	install	-
+install/drive-backup/test-fake-drive-regress.zsh	install	-
+install/drive-backup/test-fake-drive-regress-single.zsh	install	-
+install/drive-backup/test-fake-drive-crash.zsh	install	-
+install/drive-backup/test-fake-drive-crash-late.zsh	install	-
+install/drive-backup/test-fake-drive-jobs.zsh	install	-
+surface/test/drive-backup.test.ts	test	-
+install/drive-backup/test-alert.zsh	install	-
+surface/scripts/drive-backup-notice.ts	module	-
+surface/test/drive-backup-notice.test.ts	test	-
+# Its two launchd templates (migration/items/drive-backup-job.md): install.sh --drive-backup fills, writes and loads both.
+install/com.agent-system-2.drive-backup.plist	install	-
+install/com.agent-system-2.drive-backup-check.plist	install	-
 # Jev ranking, show-only first (migration/items/jev-ranking.md): the ranking, the as2_rank tool, the audit, the launch gate, the CLIs.
 surface/src/rank.ts	module	-
 surface/src/rank-audit.ts	module	-
@@ -1314,6 +1353,11 @@ surface/test/channel-reply.test.ts	test	-
 # hands) and lists each plugins/<p>/skills dir. plugins/paired-as2.ts is as2's seam to the paired adapter.
 plugins/VENDOR.md	doc	-
 plugins/index.ts	extension	-
+plugins/output-types/.claude-plugin/plugin.json	data	-
+plugins/output-types/hooks/hooks.json	data	-
+plugins/output-types/hooks/output-types-inject.mjs	module	-
+plugins/output-types/skills/output-types/SKILL.md	skill-asset	-
+plugins/output-types/skills/output-types/reference.md	skill-asset	-
 plugins/paired-as2.ts	module	-
 plugins/ask-graham/.claude-plugin/plugin.json	data	-
 plugins/ask-graham/.omp-plugin/plugin.json	data	-
@@ -1327,8 +1371,11 @@ plugins/ask-graham/package.json	data	-
 plugins/ask-graham/skills/ask-graham/SKILL.md	skill	-
 plugins/ask-graham/skills/ask-graham/references/comparables-criteria.md	skill-asset	-
 plugins/ask-graham/skills/ask-graham/references/graham-answers.md	skill-asset	-
+plugins/ask-graham/skills/ask-graham/references/upkeep.md	skill-asset	-
 plugins/ask-graham/skills/ask-graham/scripts/intensity.mjs	skill-asset	-
+plugins/ask-graham/skills/ask-graham/scripts/upkeep.mjs	skill-asset	-
 plugins/ask-graham/skills/ask-graham/scripts/verdict.mjs	skill-asset	-
+plugins/ask-graham/skills/ask-graham/structure-check.md	skill-asset	-
 plugins/i-have-audhd/.claude-plugin/plugin.json	data	-
 plugins/i-have-audhd/.omp-plugin/plugin.json	data	-
 plugins/i-have-audhd/README.md	doc	-
@@ -1344,6 +1391,7 @@ plugins/i-have-audhd/hooks/i-have-audhd-inject.mjs	module	-
 plugins/i-have-audhd/hooks/i-have-audhd-prompt.mjs	module	-
 plugins/i-have-audhd/hooks/i-have-audhd-stop.mjs	module	-
 plugins/i-have-audhd/judge/ask.mjs	module	-
+plugins/i-have-audhd/lib/alerts.mjs	module	-
 plugins/i-have-audhd/lib/config.mjs	module	-
 plugins/i-have-audhd/lib/judge-setup.mjs	module	-
 plugins/i-have-audhd/lib/pending.mjs	module	-
@@ -1435,3 +1483,14 @@ gates/test/paired-coding.test.ts	test	-
 # (wl-mvpwkpqobyp20w PLAN D5, 2026-10-26).
 surface/test/fixtures/train-carry-305/compare.json	test	-
 surface/test/fixtures/train-carry-305/commit-cde03460.json	test	-
+surface/test/fixtures/full-suite-publication-worker.ts	test	-
+surface/test/land-first-off.test.ts	test	-
+# The incidental-timing check (Jo's rule, 2026-10-28: a test depends on timing only when timing is under test): the
+# static checker, its ratchet test, the committed baseline that only shrinks, and the checker's fixtures.
+surface/src/timing-lint.ts	module	-
+surface/test/timing-lint.test.ts	test	-
+surface/test/timing-baseline.tsv	test	-
+surface/test/fixtures/timing-lint/positive.txt	test	-
+surface/test/fixtures/timing-lint/negative.txt	test	-
+surface/test/fixtures/timing-lint/opt-out.txt	test	-
+surface/test/fixtures/timing-lint/opt-out-bad.txt	test	-

@@ -632,7 +632,7 @@ class Run {
 			after: ({ request }) => {
 				if (request.results.some((x) => x.name === "yield" || x.name === "submit_result")) return { text: "done" };
 				const out = request.results.at(-1);
-				return handReport(request, `**ACTION**\nappended one line to chaos/scratch.txt and ran \`bun test chaos/\` → ${out?.isError ? "error" : "ran"}: ${oneLine(out?.text ?? "no output", 400)}`);
+				return handReport(request, `Appended one line to chaos/scratch.txt and ran \`bun test chaos/\` → ${out?.isError ? "error" : "ran"}: ${oneLine(out?.text ?? "no output", 400)}`);
 			},
 		};
 		const review: StubScript = {
@@ -675,7 +675,7 @@ class Run {
 			kind: "orchestrator",
 			match: (r) => r.tools.includes("orchestrator_wake_read") || /You are the \*\*orchestrator\*\* surface/.test(r.system),
 			steps: [{ text: "recording the wake read", tool: { name: "orchestrator_wake_read", input: { body: `chaos ${this.token}: scratch orchestrator; the chaos workload ${this.wl} runs under its lane; next: wait.`, i: "Recording the wake read" } } }],
-			after: { text: "**PMDW**\nchaos scratch orchestrator: nothing to do." },
+			after: { text: "chaos scratch orchestrator: nothing to do." },
 		};
 		const unmatched: StubScript = {
 			kind: "unmatched",
@@ -719,7 +719,7 @@ class Run {
 			},
 			{ tool: "lane_complete_slice", afterHands: 2, input: { slice: SL_REVIEW, artifact: "review-findings: no findings", i: "Completing the review slice" } },
 			{ tool: "lane_add_slice", input: { id: SL_HOLD, task: "chaos-hold: wait for Jo", doneCondition: "Jo answers close or keep", inputs: "none", i: "Adding the hold slice" } },
-			{ tool: "lane_raise_question", input: { slice: SL_HOLD, body: `**QUESTION**\nchaos ${this.token}: close this scratch workload, or keep it? close ends it; keep leaves it parked.`, options: ["close", "keep"], i: "Raising the hold question" } },
+			{ tool: "lane_raise_question", input: { slice: SL_HOLD, body: `**Closing ask**\nchaos ${this.token}: close this scratch workload, or keep it? close ends it; keep leaves it parked.`, options: ["close", "keep"], i: "Raising the hold question" } },
 		];
 		let ptr = 0;
 		let trailingWaits = 0;

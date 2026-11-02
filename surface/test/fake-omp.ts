@@ -168,6 +168,19 @@ const shutdown = async (): Promise<void> => {
 	process.exit(0);
 };
 
+// session_start publishes the lane's claim before later handlers (including verifier git reads)
+// finish. A by-hand stop may signal as soon as that claim is visible, so install shutdown first.
+process.on("SIGTERM", () => {
+	recordLine({ event: "sigterm" });
+	if (script.ignoreTerm) return;
+	if (script.shutdownOnTerm === false) process.exit(143);
+	void shutdown();
+});
+process.on("SIGINT", () => {
+	recordLine({ event: "sigint" });
+	void shutdown();
+});
+
 emit({ type: "ready", protocolVersion: 1, fake: true });
 if (script.claim !== false) await f.emit("session_start", { type: "session_start" }, ctx);
 
@@ -317,17 +330,6 @@ const runPrompt = async (message: string): Promise<void> => {
 	}
 	if (job !== null) background(job);
 };
-
-process.on("SIGTERM", () => {
-	recordLine({ event: "sigterm" });
-	if (script.ignoreTerm) return;
-	if (script.shutdownOnTerm === false) process.exit(143);
-	void shutdown();
-});
-process.on("SIGINT", () => {
-	recordLine({ event: "sigint" });
-	void shutdown();
-});
 
 // The `@file` text is the first user message, after session_start, as OMP prompts it (no `input` event: it is not typed).
 if (initialMessage !== null) {

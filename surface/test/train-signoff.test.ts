@@ -11,7 +11,7 @@ import orchestratorSurface from "../index";
 import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { apply, applyTrain, interpret } from "../src/input";
-import { JO_HOLDER, planAutoApprovedBody, planAutoStartNoticeBody, planFirstBody, trainBoardBody } from "../src/launch";
+import { JO_HOLDER, landFirstBody, landFirstInstructionBody, planAutoApprovedBody, planAutoStartNoticeBody, planFirstBody, trainBoardBody } from "../src/launch";
 import { reviewSettledPassed, trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
 import { sendNotice } from "../src/notice";
 import { makeRunId, testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
@@ -56,7 +56,7 @@ interface World {
 	full: string;
 	work: string;
 	ownerFull: string;
-	run: (wl: string, slice: string, sha: string, verdict: TestVerdict) => string;
+	run: (wl: string, slice: string, sha: string, verdict: TestVerdict, scope?: "full" | "fast") => string;
 	reviewed: (token: string) => void;
 	loopEnd: (reason: LoopEndReason) => void;
 	answers: Record<keyof Gh, Answer>;
@@ -93,16 +93,18 @@ function world(o: { source?: "jo" | "board"; stakes?: "normal" | "production"; n
 
 	let seq = 0;
 	/** A runner request and its result on `wl`'s `slice` for PR 101 at `sha`. */
-	const run = (wl: string, slice: string, sha: string, verdict: TestVerdict) => {
+	const run = (wl: string, slice: string, sha: string, verdict: TestVerdict, scope: "full" | "fast" = "full") => {
 		const runId = makeRunId(Date.now() + ++seq, "abcd");
 		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: slice, kind: "assumption", body: testRequestedBody({ runId, pr: PR, sha, slice, by: TRAIN_LANE }) });
-		const red = verdict === "red";
+		const red = verdict === "red" || verdict === "red-main";
 		ledger.recordEntry({
 			by: TEST_RUNNER_BY, workloadId: wl, sliceId: slice, kind: "assumption",
 			body: testRunBody({
 				runId, verdict, sha, pr: PR, reason: null, headAtEnd: sha, base: null, mergeBase: null,
 				full: { pass: 1, fail: red ? 1 : 0, skip: 0, exit: red ? 1 : 0, ms: 10, error: null }, solo: [],
 				failures: red ? [{ part: "full", name: "src/x.test.ts > case 1", firstError: "boom" }] : [], runDir: null, preflight: null,
+				...(verdict === "red-main" ? { baseCompare: { sha: H0, parts: [{ part: "full", failing: ["src/x.test.ts > case 1"], baseFailing: ["src/x.test.ts > case 1"], baseError: null }] } } : {}),
+				...(scope === "fast" ? { scope, host: "linux" as const } : {}),
 			}),
 		});
 		return runId;
@@ -146,18 +148,25 @@ function world(o: { source?: "jo" | "board"; stakes?: "normal" | "production"; n
 	return { ledger, train, owner, sl, full, work, ownerFull, run, reviewed, loopEnd, answers, ask, applied };
 }
 
+/** Jo enables or disables land-first for the train's repository. */
+function landFirst(w: World, on: boolean): void {
+	ensureStandingWorkload(w.ledger);
+	const id = w.ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(REPO, on) });
+	w.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(REPO, on, id) });
+}
+
 /** The decided case's ledger: W's review passed (one round, ended pass), a green on the train's suite slice at H1. */
-function passing(w: World): void {
+function passing(w: World, scope: "full" | "fast" = "full"): void {
 	w.reviewed("dt-1");
 	w.loopEnd("pass");
-	w.run(w.train, w.full, H1, "green");
+	w.run(w.train, w.full, H1, "green", scope);
 }
 
 /** Decided by train-signoff: no question row, the lane's `ruling-applied:`, the reply saying what to do. */
 function expectDecided(w: World, text: string): void {
 	expect(text).toStartWith("decided by Jo's ruling train-signoff: ");
 	expect(text).toContain(`\`gh pr merge ${PR} -R ${REPO} --merge --match-head-commit ${H1}\``);
-	expect(text).toContain("do not publish a QUESTION block");
+	expect(text).toContain("do not publish a closing ask");
 	expect(w.ledger.questions(w.train)).toEqual([]);
 	expect(w.ledger.slice(w.sl)!.state).toBe("open");
 	expect(w.applied()).toEqual([[TRAIN_LANE, w.sl, `ruling-applied: train-signoff kind merge slice ${w.sl} answer merge`]]);
@@ -209,6 +218,58 @@ describe("R1: a production PR Jo's train word named, reviewed, green at its head
 		w.run(w.train, w.full, H1, "green");
 		expectDecided(w, (await w.ask()).text);
 	});
+});
+
+describe("production signoff uses the repository's land-first scope policy, not its stakes", () => {
+	for (const enabled of [true, false]) {
+		for (const scope of ["fast", "full"] as const) {
+			for (const verdict of ["green", "red-main"] as const) {
+				test(`land-first ${enabled ? "on" : "off"}: ${scope} ${verdict} at the production head`, async () => {
+					const w = world();
+					landFirst(w, enabled);
+					w.reviewed("dt-1");
+					w.loopEnd("pass");
+					w.run(w.train, w.full, H1, verdict, scope);
+					const { text } = await w.ask();
+					if (verdict === "green" ? scope === "full" || enabled : scope === "full" && !enabled) expectDecided(w, text);
+					else expectRaised(w, text);
+				});
+			}
+		}
+	}
+
+	test("a fast green earned on W before its stakes rose passes while land-first is on", async () => {
+		const w = world({ stakes: "normal" });
+		landFirst(w, true);
+		w.reviewed("dt-1");
+		w.loopEnd("pass");
+		w.run(w.owner, w.ownerFull, H1, "green", "fast");
+		w.ledger.setStakes(w.owner, { by: SURFACE_BY, stakes: "production" });
+		expectDecided(w, (await w.ask()).text);
+	});
+
+	for (const verdict of ["red", "stale", "error"] as const) {
+		test(`a newer fast ${verdict} still refuses production signoff`, async () => {
+			const w = world();
+			landFirst(w, true);
+			passing(w, "fast");
+			w.run(w.owner, w.ownerFull, H1, verdict, "fast");
+			expectRaised(w, (await w.ask()).text);
+		});
+	}
+
+	for (const authority of ["Jo's train word", "settled review", "current head", "main protection", "land-first still on"] as const) {
+		test(`a fast green does not replace ${authority}`, async () => {
+			const w = world({ source: authority === "Jo's train word" ? "board" : "jo" });
+			landFirst(w, true);
+			passing(w, "fast");
+			if (authority === "settled review") w.reviewed("dt-2");
+			if (authority === "current head") w.answers.view = { ...(w.answers.view as object), headRefOid: H0 };
+			if (authority === "main protection") w.answers.rules = [];
+			const { text } = await w.ask(OPTIONS, authority === "land-first still on" ? () => landFirst(w, false) : undefined);
+			expectRaised(w, text);
+		});
+	}
 });
 
 describe("R2: every failing rule, or a gh read failing, leaves Jo's question raised", () => {

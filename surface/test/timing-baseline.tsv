@@ -1,0 +1,51 @@
+# The incidental-timing ratchet (surface/test/timing-lint.test.ts; patterns in surface/src/timing-lint.ts).
+# One row per test file and pattern that depended on timing when the rule was made (2026-10-28, origin/main 4c1a6e5):
+# the count of findings the check allows there. Rows only shrink, checked against main's baseline at the merge base: a
+# row added, raised or moved to another file fails. A fix lowers its row to the new count, or deletes it at
+# zero, in the same commit; the check fails until it does. A new finding anywhere fails the check: wait on the real
+# event or call the logic directly, or, when timing is the subject, drive it with a fake clock and mark it
+# `// timing-under-test: <what> (fake clock: <name>)`. Sorted by file then pattern; one TAB between columns.
+file	pattern	count
+classifier/test/review-round2.test.ts	sleep	3
+gates/test/extension.test.ts	sleep	2
+gates/test/guard-replay.test.ts	clock-assert	1
+gates/test/links.test.ts	clock-elapsed	2
+gates/test/open-links.test.ts	timer	3
+gates/test/r15-orchestrator-role.test.ts	sleep	1
+ledger/test/lane.test.ts	sleep	1
+ledger/test/ledger.test.ts	clock-deadline	1
+ledger/test/ledger.test.ts	sleep	2
+skills/seo-audit/test/units.test.ts	timer	2
+surface/test/as2test.test.ts	clock-assert	10
+surface/test/as2test.test.ts	clock-deadline	2
+surface/test/as2test.test.ts	clock-elapsed	3
+surface/test/as2test.test.ts	sleep	2
+surface/test/channel-reply.test.ts	clock-assert	1
+surface/test/channel-reply.test.ts	timer	1
+surface/test/chaos-stub.test.ts	clock-deadline	1
+surface/test/chaos-stub.test.ts	sleep	1
+surface/test/chaos-stub.test.ts	timer	1
+surface/test/ctx-index.test.ts	clock-assert	3
+surface/test/intake-queue.test.ts	clock-elapsed	1
+surface/test/lane-live-lane.test.ts	clock-assert	1
+surface/test/lane-run-guard.test.ts	clock-assert	2
+surface/test/lane-script.test.ts	clock-assert	2
+surface/test/lane-script.test.ts	clock-elapsed	1
+surface/test/lane-script.test.ts	sleep	1
+surface/test/orchestrator-question.test.ts	sleep	1
+surface/test/phoenix-run.test.ts	clock-deadline	2
+surface/test/phoenix-run.test.ts	race	1
+surface/test/phoenix-run.test.ts	sleep	1
+surface/test/ps-shim.test.ts	clock-deadline	1
+surface/test/ps-shim.test.ts	sleep	1
+surface/test/stuck-detect.test.ts	clock-deadline	1
+surface/test/stuck-detect.test.ts	clock-elapsed	1
+surface/test/stuck-detect.test.ts	sleep	3
+surface/test/test-runner.test.ts	clock-assert	4
+surface/test/test-runner.test.ts	clock-deadline	4
+surface/test/test-runner.test.ts	clock-elapsed	4
+surface/test/test-runner.test.ts	sleep	11
+surface/test/test-runner.test.ts	timer	1
+surface/test/tool-mount.test.ts	race	1
+surface/test/tool-mount.test.ts	timer	1
+surface/test/turn-end.test.ts	sleep	1

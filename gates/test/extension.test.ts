@@ -110,12 +110,12 @@ describe("gates extension adapter", () => {
 		expect(f.active()).not.toContain("ask");
 		expect(((await f.emit("tool_call", { toolName: "ask", input: {} }, ctx)) as { block: boolean }).block).toBe(true);
 
-		const report = "**ACTION**\n`bun test` → exit 0\nAll tests pass.";
+		const report = "`bun test` → exit 0\nAll tests pass.";
 		const res = (await f.emit("tool_call", { toolName: "yield", input: { data: { report, files: [] } } }, ctx)) as { block?: boolean; input: { data: { report: string } } };
 		expect(res.block).toBeUndefined();
 		expect(res.input.data.report).toContain("P-11 row 3 receipt check (informational");
 		expect(res.input.data.report).toContain("no such run recorded");
-		expect(await f.emit("session_stop", { last_assistant_message: { content: "**QUESTION**\na?\n**QUESTION**\nb?" } }, ctx)).toBeUndefined();
+		expect(await f.emit("session_stop", { last_assistant_message: { content: "**Closing ask**\na?\n**Closing ask**\nb?" } }, ctx)).toBeUndefined();
 	});
 
 	test("an orchestrator: `ask` kept, turn shape refused at session_stop, receipts flagged into the session", async () => {
@@ -125,11 +125,11 @@ describe("gates extension adapter", () => {
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx);
 		expect(f.active()).toContain("ask");
-		const stop = (await f.emit("session_stop", { last_assistant_message: { content: [{ type: "text", text: "**QUESTION**\na?\n\n**QUESTION**\nb?\n**CITE**\nhttps://nowhere.example" }] } }, ctx)) as { decision: string; reason: string };
+		const stop = (await f.emit("session_stop", { last_assistant_message: { content: [{ type: "text", text: "**Closing ask**\na?\n\n**Closing ask**\nb?\n**CITE**\nhttps://nowhere.example" }] } }, ctx)) as { decision: string; reason: string };
 		expect(stop.decision).toBe("block");
 		expect(stop.reason).toContain("P-11 row 1");
 		expect(f.entries.find((e) => e.type === "p11-receipts")).toBeTruthy();
-		expect(await f.emit("session_stop", { last_assistant_message: { content: "**PMDW**\nAll quiet." } }, ctx)).toBeUndefined();
+		expect(await f.emit("session_stop", { last_assistant_message: { content: "All quiet." } }, ctx)).toBeUndefined();
 	});
 
 	/** A lane bound to a fresh autonomous workload with history, started through the adapter. */
@@ -165,7 +165,7 @@ describe("gates extension adapter", () => {
 		expect(out.content[0]!.text).toContain("as lane-1");
 		expect(ledger.entries(wl, "wake-read")).toMatchObject([{ created_by: "lane-1", body: "resuming slice t from the ledger" }]);
 		expect(await f.emit("tool_call", read, ctx)).toBeUndefined();
-		expect(await f.emit("session_stop", { last_assistant_message: { content: "**PMDW**\nResumed." } }, ctx)).toBeUndefined();
+		expect(await f.emit("session_stop", { last_assistant_message: { content: "Resumed." } }, ctx)).toBeUndefined();
 
 		const dispatch = { toolName: "task", input: { tasks: [{ agent: "builder", task: brief() }] } };
 		expect(((await f.emit("tool_call", dispatch, ctx)) as { block: boolean }).block).toBe(true);
@@ -202,7 +202,7 @@ describe("gates extension adapter", () => {
 		await f.emit("before_agent_start", { prompt: "go", systemPrompt: [] }, ctx);
 		await f.emit("agent_end", { willContinue: false }, ctx);
 		await f.emit("before_agent_start", { prompt: "again", systemPrompt: [] }, ctx);
-		const stop = (await f.emit("session_stop", { last_assistant_message: { content: "**PMDW**\nDone, no tools." } }, ctx)) as { decision: string; reason: string };
+		const stop = (await f.emit("session_stop", { last_assistant_message: { content: "Done, no tools." } }, ctx)) as { decision: string; reason: string };
 		expect(stop.decision).toBe("block");
 		expect(stop.reason).toContain("P-11 row 7");
 	});
@@ -406,14 +406,14 @@ describe("T2 settled links through the gates entry", () => {
 		const f = fakePi();
 		p11Gates(f.pi, env);
 		const ctx = ctxOf({ hasUI: true, cwd: root });
-		const original = message(`**PMDW**\nOpen ${path}.`);
+		const original = message(`Open ${path}.`);
 		const normal = (await f.emit("assistant_message", { message: original }, ctx) ?? original) as { content: { text: string }[] };
 		expect(normal.content[0]!.text).toContain(linked);
 		expect(await f.emit("session_stop", { last_assistant_message: { content: normal.content } }, ctx)).toBeUndefined();
 		const tool = (await f.emit("assistant_message", { message: message(path, true) }, ctx) ?? message(path, true)) as { content: { type: string; text?: string }[] };
 		expect(tool.content[0]!.text).toBe(linked);
 		expect(tool.content[1]!.type).toBe("toolCall");
-		const held = await f.emit("assistant_message", { message: message("**ACTION**\nbash ~/x.sh") }, ctx) as { content: { text: string }[] };
+		const held = await f.emit("assistant_message", { message: message("bash ~/x.sh") }, ctx) as { content: { text: string }[] };
 		expect(held.content[0]!.text).toContain("Reply held");
 		expect((await f.emit("session_stop", { last_assistant_message: { content: held.content } }, ctx) as { reason: string }).reason).toContain("P-11 row 1");
 	});
@@ -425,7 +425,7 @@ describe("T2 settled links through the gates entry", () => {
 		const f = fakePi();
 		p11Gates(f.pi, { ...env, AGENT_SYSTEM_LEDGER_DB: db });
 		const ctx = ctxOf({ hasUI: true, cwd: root });
-		const original = message(`**QUESTION**\n(${q}) Open ${path}? Options: yes / no`);
+		const original = message(`**Closing ask**\n(${q}) Open ${path}? Options: yes / no`);
 		const result = (await f.emit("assistant_message", { message: original }, ctx) ?? original) as { content: { text: string }[] };
 		expect(result.content[0]!.text).toContain(linked);
 		expect(result.content[0]!.text).not.toContain("Reply held");

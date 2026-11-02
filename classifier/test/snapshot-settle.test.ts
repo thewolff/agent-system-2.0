@@ -1,9 +1,9 @@
 /**
  * A hand whose result reaches the lane through a `wait` / `proc` job snapshot settles exactly once,
  * like an auto-delivered one (PLAN wl-muq13bkdghblmo steps 1-5, T1a-T10). The classifier extension
- * on a fake OMP host with a real temp ledger and a real git repository, the crosslab harness.
+ * on a fake OMP host with a real temp ledger and a plain temp folder as the lane's repository, the crosslab harness.
  */
-import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -42,11 +42,6 @@ afterEach(() => {
 	setSystemTime();
 	for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
-
-function git(cwd: string, ...args: string[]): void {
-	const r = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
-	if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
-}
 
 /** The omp pids of lanes A (lane-test), B (lane-b) and C (lane-c), A's and C's second processes, and the start time every start record names. */
 const A_PID = 4101;
@@ -94,10 +89,6 @@ function world(opts: { stakes?: Stakes; started?: boolean } = {}): World {
 	for (const id of ["sl-x", "sl-y"]) ledger.addSlice({ id, workloadId: wl, task: id, doneCondition: "d", inputs: "i", by: "lane-test" });
 	const repo = join(dir, "repo");
 	mkdirSync(repo);
-	git(repo, "init", "-q");
-	writeFileSync(join(repo, "a.txt"), "one\n");
-	git(repo, "add", "-A");
-	git(repo, "commit", "-q", "-m", "init");
 	mkdirSync(join(dir, "sessions"));
 	const laneFile = join(dir, "sessions", "lane.jsonl");
 	writeFileSync(laneFile, "");
@@ -163,6 +154,12 @@ function lane(w: World, opts: { laneId?: string } = {}): Lane {
 		ompState: (pid, start) => {
 			w.probed.push(`${pid} ${start}`);
 			return start === START ? (w.pids[pid] ?? "same") : "failed";
+		},
+		// The repository fingerprint is the real one's own concern (classifier/src/fingerprint.ts, crosslab.test.ts): here it never
+		// changes, and a folder other than the world's own is a test bug, not a process to start.
+		fingerprint: cwd => {
+			if (cwd !== w.repo) throw new Error(`snapshot-settle.test.ts: fingerprint asked about ${cwd}, not the world's repo ${w.repo}`);
+			return "unchanged";
 		},
 		lastWrite: path => w.transcripts[path] ?? null,
 		log: line => logs.push(line),
@@ -734,7 +731,16 @@ describe("U2: a spawned review member no recorded process can still run settles 
 			["B's own earlier process spawned it and exited, A gone, no transcript", { byB: true, written: null }],
 			["B restarted: transcript written after B's first lane-started:, before its second, aged", { bFirst: 2, written: 5, now: 40 }],
 		];
-		for (const [what, o] of cases) held(await lostRound(o), what);
+		// The cases cost no process: no git, no spawn of any kind (the real repoFingerprint is five git calls per case).
+		const spawn = spyOn(Bun, "spawn");
+		const spawnSync = spyOn(Bun, "spawnSync");
+		try {
+			for (const [what, o] of cases) held(await lostRound(o), what);
+			expect({ spawn: spawn.mock.calls.length, spawnSync: spawnSync.mock.calls.length }).toEqual({ spawn: 0, spawnSync: 0 });
+		} finally {
+			spawn.mockRestore();
+			spawnSync.mockRestore();
+		}
 	});
 
 	test("T10d: a production fan-out with one member accepted and one lost completes on the accepted member alone", async () => {

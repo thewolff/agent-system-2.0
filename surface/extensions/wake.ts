@@ -56,10 +56,12 @@
 // Jev rank (PLAN wl-mv8k039gvogt8g D5, D6): every render but a one-workload read carries the rank line under needs-you (surface/src/render.ts
 // `rankLines`, stored rows only, labelled with the rank mode in force), and every tick tries the weekly audit
 // (surface/src/rank-audit.ts `runAudit`), which never throws out of the tick.
+import { join } from "node:path";
 import { CONTRACT_MARKER, contractPath, injectContract } from "../../gates/src/rows/r02-contract";
 import { BACK_HEADING, countLine, lineKey, NEEDS_YOU_HEADING, onFire, pendingText, present, QUIET_HEADING, surfaceWord } from "../src/batch";
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
+import { notifyAnthropicWeek } from "../src/headroom-notice";
 import { ensureStandingWorkload } from "../src/identity";
 import { linkTerminal } from "../src/linked-api";
 import { laneCap } from "../src/launch";
@@ -91,11 +93,18 @@ function tick(s: SurfaceSession, ctx: Ctx, line: string): void {
 	s.tickNotices.push(planned(s, ctx, line));
 }
 
+/** Use this surface's injected environment, never the classifier reader's ambient poll default. */
+function observeHeadroom(s: SurfaceSession, now: string): void {
+	const path = s.env.AS2_HEADROOM_POLLS || join(s.env.HOME || "/", "agent-scratch", "agent-system-2.0", "quota-watch", "polls.jsonl");
+	notifyAnthropicWeek(s.ledger(), { now: Date.parse(now), path });
+}
+
 /** The lines owed now, after this read's own writes (lapsed leases persisted as lane-died rows), numbered with the session's numbering. */
 function readLines(s: SurfaceSession): ErrorLine[] {
 	const ledger = s.ledger();
 	const now = s.now();
 	recordLapsedLeases(ledger, SURFACE_BY, now);
+	observeHeadroom(s, now);
 	return s.numbering.assign(errorLines(ledger, ledger.inFlight(), { now, holdHours: HOLD_HOURS }));
 }
 
@@ -173,6 +182,7 @@ function renderWakeTurn(s: SurfaceSession, ctx: Ctx, trigger: WakeTrigger, ticks
 		ensureStandingWorkload(ledger);
 		const now = s.now();
 		recordLapsedLeases(ledger, SURFACE_BY, now);
+		observeHeadroom(s, now);
 		const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now, numbering: s.numbering, rankMode: readRankConfig(s.env).mode });
 		text = planned(s, ctx, rendered.text);
 		s.delivered.take(rendered.lines);
@@ -276,6 +286,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			}
 			const now = s.now();
 			recordLapsedLeases(ledger, SURFACE_BY, now);
+			observeHeadroom(s, now);
 			const rendered = renderWake(ledger, { heading: `read on demand${wl ? `: ${wl}` : ""}`, holdHours: HOLD_HOURS, now, workloadId: wl, numbering: s.numbering, rankMode: readRankConfig(s.env).mode });
 			s.delivered.take(rendered.lines);
 			unhold(s, rendered.lines);

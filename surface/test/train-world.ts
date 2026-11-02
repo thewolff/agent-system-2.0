@@ -11,9 +11,9 @@ import { type GhResult, tick } from "../scripts/train-tick";
 import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { applyTrain, interpret } from "../src/input";
-import { decideLaunch, laneReadyBody, parseTrainBoard } from "../src/launch";
+import { decideLaunch, landFirstBody, landFirstInstructionBody, laneReadyBody, parseTrainBoard } from "../src/launch";
 import { recordTrainTask, TRAIN_ALERT_REPO, type TrainTask } from "../src/merge-train";
-import { makeRunId, testRequestedBody, type TestRun, testRunBody } from "../src/test-run";
+import { type ExecCounts, makeRunId, testRequestedBody, type TestRun, testRunBody } from "../src/test-run";
 import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, tempLedger, tmp } from "./helpers";
 
@@ -24,6 +24,28 @@ export const JO = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
 export const H0 = "a".repeat(40);
 export const H1 = "b".repeat(40);
 export const H2 = "c".repeat(40);
+
+/** Jo's land-first instruction and the surface row that binds it. */
+export function landFirst(ledger: Ledger, repo: string, on: boolean): void {
+	ensureStandingWorkload(ledger);
+	const id = ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(repo, on) });
+	ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(repo, on, id) });
+}
+
+/** A believable main verdict, matching lane-tools.test.ts's verified-root fixture. */
+export function mainRun(ledger: Ledger, runId: string, sha: string, verdict: "green" | "red", o: { exec?: ExecCounts; by?: string } = {}): void {
+	ensureStandingWorkload(ledger);
+	const red = verdict === "red";
+	ledger.recordEntry({
+		by: o.by ?? TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption",
+		body: testRunBody({
+			runId, verdict, sha, pr: 0, reason: null, headAtEnd: sha, base: null, mergeBase: null,
+			full: { pass: 400, fail: red ? 1 : 0, skip: 0, exit: red ? 1 : 0, ms: 900, error: null }, solo: [],
+			failures: red ? [{ part: "full", name: "x.test.ts > broken", firstError: "error: nope" }] : [], runDir: `/runs/${runId}`, preflight: "ok",
+			scope: "full", main: true, host: "mac", exec: o.exec ?? { files: 40, tests: 400, treeFiles: 40 },
+		}),
+	});
+}
 
 export function checkout(): string {
 	const dir = tmp("train-tick-repo");

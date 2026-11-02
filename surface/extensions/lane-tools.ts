@@ -53,7 +53,7 @@
 // lane names the PR, the kind and a detail file; the tool reads the PR's head with gh and writes the train's `train-task:`
 // (surface/src/merge-train.ts `recordTrainTask`), which no lane can write through `lane_record_entry`.
 import { createHash } from "node:crypto";
-import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import {
 	builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, parseHandSpawn, parseReviewSameLabRule, settledTokens, spentGrants, withheldTokens,
@@ -64,30 +64,33 @@ import {
 	RECORD_ANNOUNCE_OPTION, ROUTINE_RECORD_MAX, RoutineRaiseError, RULING_APPLIED_PREFIX, routineDecidedText, routineRecordProblem, subjectProblem, type TrainSignoffFact,
 } from "../../gates/src/rulings";
 import { alarmFilePath, type RoutineOptions, routineOn } from "../../gates/src/routine-switch";
+import { checkHowItFails, howItFailsNote } from "../../gates/src/how-it-fails";
 import { gateSession } from "../../gates/src/session";
-import type { EntryRow, Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
+import { type EntryRow, homeDir, type InstructionRow, type Ledger, type QuestionRow, type RoutingRow, type WorkloadStatusRow } from "../../ledger/src/index";
 import { repoOf } from "../src/decision-log";
 import { reservedStates } from "../src/errors";
 import { readFacts } from "../src/facts";
 import {
-	CLASSIFIER_MACHINERY_PREFIXES, type ControlEntry, controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_HEADING,
-	PLAN_FILE_MAX_BYTES, PLAN_REQUIREMENTS_SHAPE, type PlanBinding, planAutoApprovedBody, planAutoStartNoticeBody, planFirst, planHalted, planQuestionBinding, planQuestionBody,
-	planQuestionFiles, planQuestionProblem, planSlice, reservedPrefix,
+	CLASSIFIER_MACHINERY_PREFIXES, type ControlEntry, controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, landFirstOn, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE,
+	PLAN_HOW_IT_FAILS_LINE, PLAN_REQUIREMENTS_HEADING, PLAN_FILE_MAX_BYTES, PLAN_REQUIREMENTS_SHAPE, type PlanBinding, planAutoApprovedBody, planAutoStartNoticeBody, planFirst, planHalted, planQuestionBinding,
+	planQuestionBody, planQuestionFiles, planQuestionProblem, planSlice, reservedPrefix,
 } from "../src/launch";
 import {
-	checkoutOwnerRepo, mainProtectionGap, type Protection, recordTrainTask, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_DETAIL_MAX_BYTES, TRAIN_TASK_KINDS, type TrainTaskKind, trainPrs,
+	checkoutOwnerRepo, controlRootRefusal, mainProtectionGap, type Protection, recordTrainTask, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_DETAIL_MAX_BYTES, TRAIN_TASK_KINDS,
+	type TrainTaskKind, trainPrs,
 	trainSignoff, trainSliceId, trainSlicePr,
 } from "../src/merge-train";
 import { DEFAULT_BRANCH } from "../src/merge-train-stack";
 import { NOTICE_PREFIX, sendNotice } from "../src/notice";
 import { PAIR_OPTION } from "../src/pair-suggest";
 import { expandCallerHandles } from "../src/linked-api";
-import { SECURITY_RED_PREFIX, testRuns } from "../src/test-run";
+import { SECURITY_RED_PREFIX, SHA_RE, testRuns } from "../src/test-run";
 import { releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
 import {
 	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, type Ctx, ESCALATION_BY, HOLD_HOURS, LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL,
 	LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, LANE_HANDOFF_TOOL, LANE_MESSAGE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_RELEASE_TOOL,
-	LANE_TRAIN_RETURN_TOOL, LANE_WITHDRAW_RESERVED_TOOL, ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, type SurfaceAPI, TEST_RUN_FAILED_PREFIX, type ToolResult,
+	LANE_TRAIN_RETURN_TOOL, LANE_WITHDRAW_RESERVED_TOOL, ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, STANDING_WORKLOAD_ID, type SurfaceAPI, TEST_RUN_FAILED_PREFIX,
+	type ToolResult,
 } from "../src/types";
 import { isReleased, markReleased } from "./lane";
 
@@ -178,7 +181,7 @@ function planUnchanged(control: readonly ControlEntry[], questionId: string, bod
  * its `hand-settled:` token has no `review-withheld:`, and every model that answered is on a lab
  * outside `builderLabs` computed now (no live set: an in-flight hand counts every lab of its row), or
  * its token ran same-lab (`sameLabTokens`: Jo's same-lab answer to a `review-park:` question of this
- * slice, or Jo's Kimi-out rule); (3) was created after the newest earlier question on the plan slice was
+ * slice, or Jo's Kimi-out or dated Anthropic-out rule); (3) was created after the newest earlier question on the plan slice was
  * raised and resolved (an open one clears nothing). A `review-limit:` question Jo answered `accept`
  * does not reset (3) to its own resolution; when the newest one raised since that resolution
  * exists, the plan clears only on the rows of the round that hit its limit (check 2 still applying)
@@ -239,7 +242,8 @@ const HEADROOM_SKIP = /^headroom-skip: \S+ token (\S+)(?: |$)/;
  * PLAN wl-mv5xay6bjp0268 § 2.6 [r2-M1]: the review tokens on the plan slice `planId` that ran same-lab
  * by right. The entry that lets a token run is either a `review-same-lab: <grant> token <dt>` spend
  * whose grant `joGrant` accepts, or a `review-same-lab-rule: … slice <planId> token <dt> …` entry
- * (Jo's Kimi-out rule); it counts only when the next entry in the workload's order, past an unbroken
+ * (Jo's Kimi-out or dated Anthropic-out rule). The authorization entry itself must be on the plan
+ * slice; it counts only when the next entry in the workload's order, past an unbroken
  * run of that token's `headroom-skip:` rows on the plan slice by the same writer (#228), is that
  * token's `hand-spawn:` on the plan slice by the same writer, what the classifier's `recordSpawn`
  * writes in one transaction. A spend or rule line standing alone, or followed by another writer's
@@ -249,7 +253,7 @@ function sameLabTokens(entries: readonly EntryRow[], planId: string, joGrant: (g
 	const out = new Set<string>();
 	const mine = (x: EntryRow | undefined, e: EntryRow): x is EntryRow => x?.kind === "assumption" && x.created_by === e.created_by && x.slice_id === planId;
 	entries.forEach((e, at) => {
-		if (e.kind !== "assumption") return;
+		if (e.kind !== "assumption" || e.slice_id !== planId) return;
 		const rule = parseReviewSameLabRule(e.body);
 		const spend = rule ? undefined : [...spentGrants([e])][0];
 		const token = rule ? (rule.slice === planId ? rule.token : null) : spend && joGrant(spend[0]) ? spend[1] : null;
@@ -337,7 +341,102 @@ export function planAutoStartRound(ledger: Ledger, workloadId: string, planId: s
 	return round.group;
 }
 
-export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
+/**
+ * The reads the lane extension's load-time self-check makes (PLAN wl-mvq4edbaf13vnk § 2 Protect the verifier, R28), injected
+ * so tests stub git and the filesystem. Each throws an error naming the failed read.
+ */
+export interface VerifierReads {
+	/** The repository root this extension loads from, symlinks resolved. */
+	root(): string;
+	/** `~/.agent-system-2/verified/current` with its symlink resolved; null when it does not exist. */
+	current(): string | null;
+	/** The root's `origin` as `<owner>/<name>`; null when it has no GitHub origin. */
+	ownerRepo(root: string): string | null;
+	/** `git rev-parse HEAD` in the root. */
+	head(root: string): string;
+	/** The tracked files modified in the root: the paths `git status --porcelain --untracked-files=no` prints. */
+	modified(root: string): string[];
+}
+
+/** The verified control root the runner promotes (§ 2 Protect the verifier), as the self-check's line names it. */
+const VERIFIED_CURRENT = "~/.agent-system-2/verified/current";
+
+/** One git read in `root` for the self-check: its stdout, or an error naming the command, its exit and its stderr. */
+function gitRead(root: string, args: string[]): string {
+	const r = Bun.spawnSync(["git", "-C", root, ...args], { stdout: "pipe", stderr: "pipe" });
+	if (r.exitCode !== 0) throw new Error(`git -C ${root} ${args.join(" ")} exited ${r.exitCode}: ${r.stderr.toString().trim() || "no stderr"}`);
+	return r.stdout.toString();
+}
+
+/** The live reads: this file's repository, HOME's verified root, and git in the repository. */
+export function liveVerifierReads(env: Record<string, string | undefined> = process.env): VerifierReads {
+	return {
+		root: () => realpathSync(gitRead(import.meta.dir, ["rev-parse", "--show-toplevel"]).trim()),
+		current: () => {
+			const path = join(homeDir(env), ".agent-system-2", "verified", "current");
+			try {
+				return realpathSync(path);
+			} catch (err) {
+				if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+				throw new Error(`${path} could not be resolved: ${err instanceof Error ? err.message : String(err)}`);
+			}
+		},
+		ownerRepo: (root) => checkoutOwnerRepo(root),
+		head: (root) => gitRead(root, ["rev-parse", "HEAD"]).trim(),
+		// Porcelain v1: two status columns and a space, then the path (a rename prints `old -> new`; the new path is named).
+		modified: (root) => gitRead(root, ["status", "--porcelain", "--untracked-files=no"]).split("\n").filter(Boolean).map((l) => l.slice(3).split(" -> ").at(-1)!),
+	};
+}
+
+/**
+ * The lane extension's load-time self-check (PLAN wl-mvq4edbaf13vnk § 2 Protect the verifier, R28): while land-first is on
+ * for the repository the extension loads from (`landFirstOn` over the standing workload), its root must pass
+ * `controlRootRefusal` (it is `verified/current`, its HEAD has a green believable main verdict, a verified older release
+ * included, and its tracked files are unmodified). The one render line naming the root, the sha and every reason, or null
+ * when it passes or land-first is off. A read that fails leaves the check unrun, and the line names every failed read; a root
+ * or origin that cannot be read means land-first's state cannot be told, and says so.
+ */
+export function verifierSelfCheck(ledger: Pick<Ledger, "entries" | "instructions">, reads: VerifierReads): string | null {
+	const why = (err: unknown) => (err instanceof Error ? err.message : String(err));
+	const next = `Next: run \`install/install.sh --control-root=verified\` so lanes load ${VERIFIED_CURRENT}.`;
+	let root: string;
+	let repo: string | null;
+	try {
+		root = reads.root();
+		repo = reads.ownerRepo(root);
+	} catch (err) {
+		return `verifier: the lane tools' self-check could not read their own repository (${why(err)}), so whether land-first is on for it is unknown. ${next}`;
+	}
+	if (repo === null) return `verifier: the lane tools load from ${root}, which has no GitHub origin, so whether land-first is on for it is unknown and the self-check did not run. ${next}`;
+	const entries = ledger.entries(STANDING_WORKLOAD_ID);
+	if (!landFirstOn(entries, ledger.instructions(STANDING_WORKLOAD_ID), repo)) return null;
+	const failed: string[] = [];
+	const read = <T>(what: string, f: () => T): T | undefined => {
+		try {
+			return f();
+		} catch (err) {
+			failed.push(`${what} could not be read: ${why(err)}`);
+			return undefined;
+		}
+	};
+	const sha = (at: string) => {
+		const h = reads.head(at);
+		if (!SHA_RE.test(h)) throw new Error(`git rev-parse HEAD in ${at} printed ${JSON.stringify(h)}, not a sha`);
+		return h;
+	};
+	const head = read("HEAD", () => sha(root));
+	const modified = read("tracked files", () => reads.modified(root));
+	const current = read(VERIFIED_CURRENT, () => reads.current());
+	const currentHead = current === undefined || current === null ? null : read(`${VERIFIED_CURRENT}'s HEAD`, () => sha(current));
+	if (head === undefined || modified === undefined || current === undefined || currentHead === undefined) {
+		return `verifier: land-first is on for ${repo}, but the lane tools' self-check could not check their root ${root}: ${failed.join("; ")}. ${next}`;
+	}
+	const reasons = controlRootRefusal({ root, head, modified, current, currentHead, repo: repo.toLowerCase() }, entries);
+	if (reasons.length === 0) return null;
+	return `verifier: land-first is on for ${repo}, but the lane tools load unverified code from ${root} at ${head.slice(0, 12)}: ${reasons.join("; ")}. ${next}`;
+}
+
+export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, verifier: VerifierReads = liveVerifierReads(env)): void {
 	const z = pi.zod;
 
 	/** Every lane tool's gate: a bound lane, not released, whose workload is open and held by it under a live lease. */
@@ -355,6 +454,20 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		}
 		return { ok: true, own: { ledger, workload: w, laneId: s.laneId, workloadId: w.id } };
 	};
+
+	// PLAN wl-mvq4edbaf13vnk § 2 Protect the verifier (R28): at load a bound lane checks the control root its tools run from,
+	// and shows one render line while land-first is on and the root fails; it refuses nothing.
+	pi.on("session_start", (_e, ctx) => {
+		const s = gateSession(ctx, env);
+		if (!s.bound) return;
+		let line: string | null;
+		try {
+			line = verifierSelfCheck(s.ledger(), verifier);
+		} catch (err) {
+			line = `verifier: the lane tools' self-check could not read the ledger: ${err instanceof Error ? err.message : String(err)}. Next: check the ledger path this lane runs with.`;
+		}
+		if (line !== null) ctx.ui.notify(line, "warning");
+	});
 
 	/** A slice on this lane's workload that is still open or paused, or the refusal. */
 	const sliceOn = (own: Owned, slice: string, verb: string): { ok: true; state: string } | { ok: false; result: ToolResult } => {
@@ -504,7 +617,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			`each line at most ${PLAN_QUESTION_LINE_MAX} characters and nothing else: the plan file's absolute path; one \`- <slice id>: <what it does>\` line per slice; ` +
 			"one `prompt-only: <R id>: <the requirement, and why no code reaches it>` line per requirement the plan file marks prompt-only, or exactly `prompt-only: none` when it marks none; " +
 			"1 to 3 `tradeoff: <one line>` lines; one `review: <verdict>, <model>, <absolute path to the verdict file>` line. " +
-			`The plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\n` +
+			`The plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\n${PLAN_HOW_IT_FAILS_LINE}\n` +
 			"A plan question offering approve is refused until a review hand named after the plan slice has reviewed the plan on another lab since the last question, and refused in any other shape. " +
 			"Until the plan is approved, a question offering approve on any other slice is refused. " +
 			"Jo's standing rulings are checked first: a question one of them already answers is not raised, and the tool returns the ruling and what to do instead. " +
@@ -607,9 +720,13 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 				if (problem !== null) {
 					return text(
 						`A plan question offering approve has this shape, one item per line, each line at most ${PLAN_QUESTION_LINE_MAX} characters, nothing else:\n${PLAN_QUESTION_SHAPE}\n` +
-							`Its plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\nThis body does not: ${problem}. Nothing was asked.`,
+							`Its plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\n${PLAN_HOW_IT_FAILS_LINE}\nThis body does not: ${problem}. Nothing was asked.`,
 					);
 				}
+				// Issue #334 item 2: a plan that passed on the `How it fails: n/a, <reason>` line, or on the gate's error bypass, is recorded
+				// here, once per checked raise, before the auto-start or the question, so the skip is visible whichever follows.
+				const failsNote = judged.plan === null ? null : howItFailsNote(checkHowItFails(judged.plan.toString("utf8"), "the plan file"), `plan file ${planQuestionFiles(body)?.plan ?? body.split("\n")[0]!.trim()}`);
+				if (failsNote !== null) ledger.write(() => ledger.recordEntry({ by: o.own.laneId, workloadId, sliceId: slice, kind: "assumption", body: failsNote }));
 				// Fix round 1 (F1): the plan file as judged and the verdict file now, bound to the question if it is raised.
 				const verdict = fileSha(planQuestionFiles(body)?.verdict ?? "");
 				if (judged.plan !== null && verdict !== null) binding = { plan: createHash("sha256").update(judged.plan).digest("hex"), verdict };
@@ -776,7 +893,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		name: LANE_MESSAGE_TOOL,
 		loadMode: "essential",
 		label: "Message Orchestrator",
-		description: "Send one message to the orchestrator about this lane's workload (a finding, a blocker, a QUESTION that needs Jo). It reaches Jo's surface at its next read.",
+		description: "Send one message to the orchestrator about this lane's workload (a finding, a blocker, a question that needs Jo). It reaches Jo's surface at its next read.",
 		parameters: z.object({
 			body: z.string().describe("The message, in plain words."),
 			slice: z.string().optional().describe("The slice id (sl-…) it is about, when it is about one."),
@@ -835,6 +952,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		label: "Run Full Test Suite",
 		description:
 			"Run this workload's full test suite outside the fence at an open PR's head. A full part that times out ends the run as an error; after an all-pass part only changed test files with no executed case run alone, and after a red only the failing files outside gates/test/ run alone, as a diagnostic that never turns a red green. Call it after the last push, with the PR number; it returns the run's line at once and the result arrives later as an aside (verdict, counts, failures). " +
+			"On a repository with land-first on, the runner applies the gate instead: a PR whose diff the fast check covers gets the fast check (the fast smoke and the tests its files reach, on Linux), and its result is marked fast (`\"scope\":\"fast\"` in its test-run record); a fast green lets the PR merge but is not a full-suite green, and the workload closes on it only after the merge, once a green believable main run holds the merge commit. Any other PR gets the full suite. The tool's line says whether land-first is on. " +
 			"Without `slice` the runner adds the full-suite slice; with it, the slice must be open on this workload. A green completes that slice; a red, stale or error leaves it open: fix, push, and call again with the slice. " +
 			"Never complete that slice yourself. While a run is live, work on something else or `sleep 60` in bash; never park or release.",
 		parameters: z.object({
@@ -865,7 +983,18 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 				const lastOf = (s: string) => s.trim().split("\n").filter(Boolean).at(-1) ?? null;
 				if (r.code === 0 && !r.killed) {
 					const line = lastOf(r.stdout) ?? "the starter exited 0 without a line";
-					return text(`${line}\nThe result arrives as an aside; until then work on something else or \`sleep 60\` in bash.`, { code: 0, line });
+					// PLAN wl-mvq4edbaf13vnk D9: on a land-first repo the runner applies the gate, so the lane is told which result it will get.
+					const checkout = repoOf(o.own.ledger, o.own.workloadId);
+					const repo = checkout === null ? null : checkoutOwnerRepo(checkout);
+					const landFirst = repo === null ? null : landFirstOn(o.own.ledger.entries(STANDING_WORKLOAD_ID), o.own.ledger.instructions(STANDING_WORKLOAD_ID), repo);
+					const fastNote = `a fast result is marked fast (\`"scope":"fast"\` in its test-run record), and a fast green is not a full-suite green: close takes it only after the merge, once a green believable main run holds the merge commit`;
+					const scope =
+						landFirst === null
+							? `Whether land-first is on could not be read (${o.own.workloadId} has no repo: checkout with a GitHub origin), so this may be the fast check or the full suite; ${fastNote}.`
+							: landFirst
+								? `Land-first is on for ${repo}: the runner applies the gate, so this is the fast check when the PR's diff allows it, else the full suite; ${fastNote}.`
+								: `Land-first is off for ${repo}: this is the full suite.`;
+					return text(`${line}\n${scope}\nThe result arrives as an aside; until then work on something else or \`sleep 60\` in bash.`, { code: 0, line, landFirst });
 				}
 				const line = lastOf(r.stderr) ?? lastOf(r.stdout) ?? (r.killed ? "the starter was killed before it printed" : `the starter exited ${r.code} without a line`);
 				const how = r.killed ? `the starter did not return within ${STARTER_TIMEOUT_MS / 1000} s and was killed` : `starter exit ${r.code}`;

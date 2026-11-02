@@ -20,6 +20,7 @@
 // bash gate reads the command there. Eval code that starts none runs only the quote-blind phrase pass
 // and the browser pass. A `%load` is read and judged as the cell's code, or refused for a respelling.
 // Inline interpreter code in bash keeps every pass; its unreadable launches are respellings (D2).
+import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { BROWSER_WRITE_CALL, type CodeFacts, codeFacts, evalLoads, evalProcessStart, opaqueSpawn } from "../eval-code";
@@ -27,6 +28,12 @@ import { bashCommand, type CodeFamily, codeCommands, codeInterpreterEnv, type Ex
 import { gitModel, gitOptionValueWords, insideDotGit, pushDestinationOperand, type ScratchLift } from "../git-model";
 import { SCRATCH_ENV, insideRoot, ownScratchRoot, scratchSpelling } from "../scratch";
 import { markConfined } from "../session";
+import { Ledger, type EntryRow, type InstructionRow } from "../../../ledger/src/index";
+import { defaultLedgerPath } from "../../../ledger/src/locality";
+import { controlEntries, landFirstHeld, landFirstOffPending } from "../../../surface/src/launch";
+import { INCONCLUSIVE, mainResults, mainVerdicts, SUSPECT_MAX_MS } from "../../../surface/src/main-state";
+import { latestTrainReconciled } from "../../../surface/src/merge-train";
+import { STANDING_WORKLOAD_ID } from "../../../surface/src/types";
 import { parseShell, type Word } from "../shell-parse";
 import { type CallContext, PROTECTED_BRANCH, type Refusal, type ToolCall } from "../types";
 import { currentBranch } from "./r09-protected-edit";
@@ -391,13 +398,13 @@ interface GhApiArg {
 }
 
 /**
- * The words after `api` in a `gh` argv, or null when the subcommand is not `api`. Words before it are
- * global options and their values, as GH reads them.
+ * The words after subcommand `sub` in a `gh` argv, or null when the subcommand is another. Words before
+ * it are global options and their values, as GH reads them.
  */
-function ghApiArgs<T extends { text: string }>(argv: T[]): T[] | null {
+function ghSubArgs<T extends { text: string }>(argv: T[], sub: string): T[] | null {
 	for (let i = 1; i < argv.length; i++) {
 		const t = argv[i]!.text;
-		if (t === "api") return argv.slice(i + 1);
+		if (t === sub) return argv.slice(i + 1);
 		if (t.startsWith("-") || (i > 1 && argv[i - 1]!.text.startsWith("-"))) continue;
 		return null;
 	}
@@ -639,6 +646,273 @@ function stdinText(e: Exec): string | null {
 	const reads = e.redirects.filter((r) => r.op.startsWith("<") && r.op !== "<&");
 	if (reads.some((r) => r.body === null || r.bodyOpaque)) return null;
 	return reads.map((r) => r.body).join("\n");
+}
+
+// The merge hold (PLAN wl-mvq4edbaf13vnk § 2 "The merge hold", D10, R20). On a land-first repository every merge a bash
+// call names that the gate can read is a reserved action held for Jo, unless it is one lone foreground merge command and
+// the ledger says landing is open (or names its pinned head as the repair). A call names a merge when it runs `gh pr
+// merge` (any command the expander reads, scripts included), or when the command line, any decoded word, or any heredoc
+// or here-string names a REST merge endpoint or a merge mutation, whatever the client. The hold reads only the ledger,
+// through a MergeHold reader: the standing workload's `land-first:` (landFirstOn), the tick's `train-reconciled:`
+// (latestTrainReconciled) and the runner's main-run settles (mainResults); and, for a `gh pr merge` that names no
+// repository, the git remotes of the directory it runs in. A merge into a repository land-first is not on for passes as
+// it did before the hold.
+
+/** The newest `train-reconciled:` admits a merge only while it is younger than this (§ 2: a live tick writes one every 5 minutes). */
+const RECONCILED_MAX_MS = 10 * 60_000;
+/** The REST merge endpoints, on a decoded, lowercased text: `…/pulls/<n>/merge` and `repos/<owner>/<repo>/merges`. */
+const MERGE_ENDPOINT = /(?<![\w-])pulls\/[^/\s]*\/merge(?![\w-])|(?<![\w-])repos\/[^/\s]*\/[^/\s]*\/merges(?![\w-])/;
+/** The GraphQL merge mutations, on a lowercased text. */
+const MERGE_MUTATION = /mergepullrequest|mergebranch|enablepullrequestautomerge|enqueuepullrequest/;
+/** The deferred ones: GitHub merges later, when checks pass, so ledger state read now never admits them. */
+const DEFERRED_MUTATION = /enablepullrequestautomerge|enqueuepullrequest/;
+/** The repository a REST merge endpoint or a PR URL names, on a decoded, lowercased text. */
+const ENDPOINT_REPO = /(?<![\w-])repos\/([^/\s"'{}:]+)\/([^/\s"'{}:]+)\/(?:pulls\/[^/\s]*\/merge|merges)(?![\w-])|github\.com\/([^/\s"'{}:]+)\/([^/\s"'{}:]+)\/pull\/\d/g;
+/** Clients whose own words can carry a merge the hold may admit by state: gh, and the common HTTP clients. */
+const MERGE_CLIENTS: Record<string, true> = { gh: true, curl: true, wget: true, http: true, https: true, xh: true };
+/** `gh pr merge` options that take a value, so a value is never read as a flag or as the subcommand. */
+const PR_MERGE_VALUE: Record<string, true> = {
+	"-b": true, "--body": true, "-F": true, "--body-file": true, "-t": true, "--subject": true, "--match-head-commit": true, "-A": true, "--author-email": true, "-R": true, "--repo": true,
+};
+
+/** The standing workload's rows the hold reads, oldest first: `land-first:`, `train-reconciled:` and main-run settles. */
+export interface StandingRows {
+	entries: readonly EntryRow[];
+	instructions: readonly InstructionRow[];
+}
+
+/** What the hold reads (D10's injected reader). A read may throw; the hold then holds and names the error. */
+export interface MergeHold {
+	standing(): StandingRows;
+	/** Now, ms. */
+	now(): number;
+	/** The `owner/name` (lowercase) of every GitHub repository `dir`'s git remotes name; empty when there are none. */
+	remoteRepos(dir: string): string[];
+}
+
+/**
+ * The reader production uses: the ledger at `defaultLedgerPath(env)`, opened read-only for each read, and `git remote -v`.
+ * No ledger file at that path has no `land-first:` entry, so land-first is off (landFirstOn: no entry is off).
+ */
+export function ledgerMergeHold(env: Record<string, string | undefined>): MergeHold {
+	return {
+		standing() {
+			const path = defaultLedgerPath(env);
+			if (!existsSync(path)) return { entries: [], instructions: [] };
+			const ledger = Ledger.open(path, { readonly: true });
+			try {
+				return { entries: ledger.entries(STANDING_WORKLOAD_ID), instructions: ledger.instructions(STANDING_WORKLOAD_ID) };
+			} finally {
+				ledger.close();
+			}
+		},
+		now: () => Date.now(),
+		remoteRepos(dir) {
+			const r = spawnSync("git", ["-C", dir, "remote", "-v"], { encoding: "utf8", timeout: 5000, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
+			if (r.error) throw new Error(`git -C ${dir} remote -v did not run: ${r.error.message}`);
+			if (r.status !== 0) throw new Error(`git -C ${dir} remote -v exited ${r.status}: ${r.stderr.trim()}`);
+			const out = new Set<string>();
+			for (const line of r.stdout.split("\n")) {
+				const m = /^\S+\s+\S*?([^/:\s]+)\/([^/\s]+?)(?:\.git)?\/?\s+\(/.exec(line);
+				if (m) out.add(`${m[1]}/${m[2]}`.toLowerCase());
+			}
+			return [...out];
+		},
+	};
+}
+
+/** A text as the hold matches it: each valid `%XX` decoded until stable (`%2573` is `%73` is `s`), lowercased. */
+function mergeText(text: string): string {
+	let t = text;
+	for (let i = 0; i < 8; i++) {
+		const next = t.replace(/%[0-9a-f]{2}/gi, (m) => String.fromCharCode(Number.parseInt(m.slice(1), 16)));
+		if (next === t) break;
+		t = next;
+	}
+	return t.toLowerCase();
+}
+
+/** Whether a matched text names a merge: a REST merge endpoint or a merge mutation. */
+function namesMerge(text: string): boolean {
+	return MERGE_ENDPOINT.test(text) || MERGE_MUTATION.test(text);
+}
+
+/** A `-R`/`--repo` value in `words`, the last one given; null when none. `skip` names the options whose value is not a repository. */
+function repoFlag(words: Word[], skip: Record<string, true>): string | null {
+	let repo: string | null = null;
+	for (let i = 0; i < words.length; i++) {
+		const t = words[i]!.text;
+		if (t === "-R" || t === "--repo") repo = words[++i]?.text ?? null;
+		else if (t.startsWith("--repo=")) repo = t.slice(7);
+		else if (/^-R./.test(t)) repo = t.slice(2);
+		else if (skip[t]) i++;
+	}
+	return repo;
+}
+
+/** A `gh pr merge` command's words after `merge`, and the `-R`/`--repo` it names before or after `pr`; null for any other command. */
+function ghPrMerge(e: Exec): { args: Word[]; repo: string | null } | null {
+	if (basename(e.argv[0]!.text) !== "gh") return null;
+	const pr = ghSubArgs(e.argv, "pr");
+	if (!pr) return null;
+	let merge: number | null = null;
+	for (let i = 0; i < pr.length && merge === null; i++) {
+		const t = pr[i]!.text;
+		if (PR_MERGE_VALUE[t]) i++;
+		else if (t.startsWith("-")) continue;
+		else if (t !== "merge") return null;
+		else merge = i;
+	}
+	if (merge === null) return null;
+	const globals = e.argv.slice(1, e.argv.length - pr.length - 1);
+	return { args: pr.slice(merge + 1), repo: repoFlag(pr, PR_MERGE_VALUE) ?? repoFlag(globals, {}) };
+}
+
+/** Every text of a bash call the hold matches: the unquoted command line, each decoded word, and each heredoc or here-string body. */
+function callTexts(cmd: string, x: Expansion): string[] {
+	const texts = [unquoted(cmd), ...decodedWords(x).map((w) => w.text)];
+	for (const e of x.commands) for (const r of e.redirects) if (r.body !== null) texts.push(r.body);
+	return texts.map(mergeText);
+}
+
+/**
+ * Why the call is not one lone foreground merge command (§ 2, D10), or null when it is: exactly one command in the
+ * command line and in the expansion, with no operator but a trailing `;` or newline, no keyword (loop, group, function),
+ * no subshell, wrapper, prefix assignment, pipe or inline code; a merge client (MERGE_CLIENTS) whose own words or
+ * heredoc, every one known when the call starts, carry the merge; not `--auto`, not a deferred mutation.
+ */
+function notLoneMerge(cmd: string, cwd: string, env: Record<string, string | undefined>, x: Expansion): string | null {
+	const p = parseShell(cmd, { cwd, env });
+	if (p.failures.length > 0 || p.commands.length !== 1 || x.commands.length !== 1 || x.code.length > 0 || x.blind.length > 0) return "the merge is not the call's only command";
+	const ops = [...p.keywords, ...p.ops.filter((o) => o !== ";" && o !== "\n")];
+	if (ops.length > 0) return `the merge runs under ${ops.join(" ")}`;
+	const e = x.commands[0]!;
+	if (!e.source.top || e.source.stdinFrom) return "the merge is not the call's only command";
+	if (e.mods.wrappers.length > 0 || e.mods.assigns.length > 0) return `the merge runs under ${[...e.mods.wrappers, ...e.mods.assigns.map((w) => w.text)].join(" ")}`;
+	const name = basename(e.argv[0]!.text);
+	if (!MERGE_CLIENTS[name]) return `${name} is not a merge client`;
+	if (e.argv.some((w) => w.opaque || w.glob === true) || e.redirects.some((r) => r.bodyOpaque)) return "a word of the merge command is not known until it runs";
+	const own = [...e.argv.map((w) => w.text), stdinText(e) ?? ""].map(mergeText);
+	const pr = ghPrMerge(e);
+	if (!pr && !own.some(namesMerge)) return "the merge is not in the command's own words";
+	if (pr?.args.some((w) => /^--auto(?:=|$)/.test(w.text))) return "gh pr merge --auto is a deferred merge";
+	if (own.some((w) => DEFERRED_MUTATION.test(w))) return "auto-merge and the merge queue are deferred merges";
+	return null;
+}
+
+/** The head a lone `gh pr merge` pins with `--match-head-commit <sha>`, lowercase; null when it pins none. */
+function pinnedHead(x: Expansion): string | null {
+	const pr = x.commands.length === 1 ? ghPrMerge(x.commands[0]!) : null;
+	if (!pr) return null;
+	for (let i = 0; i < pr.args.length; i++) {
+		const t = pr.args[i]!.text;
+		if (t === "--match-head-commit") return pr.args[i + 1]?.text.toLowerCase() ?? null;
+		if (t.startsWith("--match-head-commit=")) return t.slice(20).toLowerCase();
+	}
+	return null;
+}
+
+/**
+ * Why the ledger does not admit a lone merge into `repo` at `nowMs`, or null when it does (§ 2): the newest
+ * `train-reconciled:` for it is under 10 minutes old and says landing open with its oldest suspect under 40 minutes old,
+ * or names `head` as the repair; and no main-run settle after it in ledger order is red, implausible or inconclusive.
+ */
+function stateRefusal(repo: string, head: string | null, entries: readonly EntryRow[], nowMs: number): string | null {
+	const latest = latestTrainReconciled(entries, repo);
+	if (latest === null) return `no train-reconciled entry for ${repo} on the standing workload (the train tick has not reconciled main)`;
+	const ageMs = nowMs - Date.parse(latest.createdAt);
+	if (!(ageMs < RECONCILED_MAX_MS)) return `the newest train-reconciled entry ${latest.entryId} was written at ${latest.createdAt}, not under ${RECONCILED_MAX_MS / 60_000} minutes ago (is the train tick running?)`;
+	const r = latest.r;
+	const openNow = r.open && (r.oldest === null || nowMs - Date.parse(r.oldest) < SUSPECT_MAX_MS);
+	const repair = r.repair !== null && head !== null && head === r.repair.toLowerCase();
+	if (!openNow && !repair) {
+		if (r.open) return `${latest.entryId} says landing open, but its oldest suspect landed at ${r.oldest}, not under ${SUSPECT_MAX_MS / 60_000} minutes ago`;
+		const why = `${latest.entryId} says landing stopped (${r.reasons || "no reason given"})`;
+		return r.repair ? `${why}; it admits only the repair ${r.repair}, and this merge pins ${head ?? "no head (gh pr merge --match-head-commit <sha> pins one)"}` : why;
+	}
+	const order = new Map(entries.map((e, i) => [e.id, i]));
+	const at = order.get(latest.entryId) ?? -1;
+	const results = mainResults(entries);
+	const verdicts = mainVerdicts(results);
+	for (const s of results) {
+		if ((order.get(s.entryId) ?? -1) <= at) continue;
+		// A green settle is implausible when it is its commit's verdict run and mainVerdicts judged it so.
+		const own = verdicts.get(s.sha);
+		const stop = INCONCLUSIVE.includes(s.verdict)
+			? "inconclusive"
+			: s.verdict === "red" || s.verdict === "red-main"
+				? "red"
+				: own?.runId === s.runId && own.verdict === "implausible"
+					? "implausible"
+					: null;
+		if (stop) return `main run ${s.runId} at ${s.sha} settled ${stop} (${s.verdict}, entry ${s.entryId}) after ${latest.entryId}`;
+	}
+	return null;
+}
+
+/**
+ * The merge hold over one bash call (§ 2, D10, R20): the refusal when the call names a merge into a land-first
+ * repository and is not admitted, else null. The ledger is read only when the call names a merge, git only when a
+ * `gh pr merge` names no repository and land-first is on somewhere.
+ */
+function mergeHoldRefusal(cmd: string, cwd: string, ctx: CallContext, toolEnv: unknown, x: Expansion, hold: MergeHold): Refusal {
+	const texts = callTexts(cmd, x);
+	const prs = x.commands.filter((e) => ghPrMerge(e) !== null);
+	if (prs.length === 0 && !texts.some(namesMerge)) return null;
+	const held = (why: string) => refuse(`a merge the land-first merge hold does not admit (PLAN wl-mvq4edbaf13vnk § 2; ${why})`, `Command: ${cmd}`);
+	let standing: StandingRows;
+	try {
+		standing = hold.standing();
+	} catch (err) {
+		return held(`the ledger could not be read to tell whether land-first is on (${err instanceof Error ? err.message : String(err)}); fix the ledger, then retry`);
+	}
+	const { entries, instructions } = standing;
+	const onRepos = [...new Set(controlEntries(entries).filter((c) => c.prefix === "land-first").map((c) => c.rest.split(" ")[0]!))].filter((r) => landFirstHeld(entries, instructions, r));
+	if (onRepos.length === 0) return null;
+	const unknown = (why: string) => held(`land-first is on for ${onRepos.join(", ")} and the gate cannot tell which repository this merge lands in: ${why}`);
+	// The repositories the merge lands in: those a `gh pr merge -R`, a REST endpoint or a PR URL names; a `gh pr merge`
+	// naming none lands in GH_REPO's, else one of its directory's remotes; a mutation naming none may land in any.
+	const targets = new Set<string>();
+	for (const t of texts) for (const m of t.matchAll(ENDPOINT_REPO)) targets.add(`${m[1] ?? m[3]}/${(m[2] ?? m[4])!.replace(/\.git$/, "")}`);
+	for (const e of prs) {
+		const named = ghPrMerge(e)!.repo;
+		if (named !== null) {
+			targets.add(named.toLowerCase().replace(/^https?:\/\/github\.com\//, ""));
+			continue;
+		}
+		const assign = e.mods.assigns.findLast((w) => w.text.startsWith("GH_REPO="));
+		const assigned = x.assigned.get("GH_REPO")?.at(-1);
+		const tenv = toolEnv !== null && typeof toolEnv === "object" ? (toolEnv as Record<string, unknown>).GH_REPO : undefined;
+		if (assign?.opaque || (!assign && assigned?.opaque)) return unknown("GH_REPO is not known until it runs");
+		const ghRepo = assign ? assign.text.slice(8) : assigned ? assigned.text : typeof tenv === "string" ? tenv : ctx.env.GH_REPO;
+		if (ghRepo) {
+			targets.add(ghRepo.toLowerCase());
+			continue;
+		}
+		if (!e.dirKnown) return unknown("gh pr merge runs in a directory not known until it runs");
+		let remotes: string[];
+		try {
+			remotes = hold.remoteRepos(e.dir);
+		} catch (err) {
+			return unknown(`the git remotes of ${e.dir} could not be read (${err instanceof Error ? err.message : String(err)})`);
+		}
+		if (remotes.length === 0) return unknown(`${e.dir} has no git remote naming a GitHub repository`);
+		for (const r of remotes) targets.add(r);
+	}
+	if (targets.size === 0) for (const r of onRepos) targets.add(r);
+	const landFirst = [...targets].filter((r) => landFirstHeld(entries, instructions, r));
+	if (landFirst.length === 0) return null;
+	const lone = notLoneMerge(cmd, cwd, ctx.env, x);
+	if (lone !== null) return held(`${landFirst.join(", ")} is land-first and this is not one lone foreground merge command, which only Jo approves: ${lone}`);
+	const head = pinnedHead(x);
+	const nowMs = hold.now();
+	for (const repo of landFirst) {
+		const pending = landFirstOffPending(entries, instructions, repo);
+		if (pending.length > 0) return held(`${repo}: off reconciliation pending (${pending.join(", ")}); the tick must revoke fast/tree successes before normal merges resume`);
+		const why = stateRefusal(repo, head, entries, nowMs);
+		if (why !== null) return held(`${repo} is land-first and the ledger does not admit a merge now: ${why}`);
+	}
+	return null;
 }
 
 /**
@@ -1271,7 +1545,7 @@ function reservedInExec(e: Exec, owned: (dir: string) => boolean, data?: Set<Wor
 		if (why) hits.push(why);
 	}
 	if (name === "gh") {
-		const api = ghApiArgs(e.argv);
+		const api = ghSubArgs(e.argv, "api");
 		const why = api ? ghApiModel(api.map((w) => ({ text: w.text, unread: unread(w) })), stdinText(e), mode?.tolerateUnread === true) : null;
 		if (why) hits.push(why);
 	}
@@ -1884,22 +2158,22 @@ function ownedRepos(ctx: ReservedContext, worktreeRoot: string | undefined, scra
 
 /**
  * Row 6 over one tool call. A bash call the scratch rules (scratchFor) let through is marked confined
- * for the fence (session.ts markConfined). With `opts` (the routine classifier's options) nothing is
- * marked: the classifier reads reservedVerdict, and the gate marks the call after it records the
+ * for the fence (session.ts markConfined). `hold` is the merge hold's reader (MergeHold); production reads the ledger.
+ * The routine classifier calls reservedVerdict instead, and the gate marks the call after it records the
  * auto-apply (PLAN wl-mvqwn80onq9hq8 D3).
  */
-export function checkReserved(call: ToolCall, ctx: ReservedContext, opts?: ReservedOptions): Refusal {
-	const v = reservedVerdict(call, ctx, opts);
-	if (!opts && v.refusal === null && v.scratch.length > 0) markConfined(call);
+export function checkReserved(call: ToolCall, ctx: ReservedContext, hold: MergeHold = ledgerMergeHold(ctx.env)): Refusal {
+	const v = reservedVerdict(call, ctx, undefined, hold);
+	if (v.refusal === null && v.scratch.length > 0) markConfined(call);
 	return v.refusal;
 }
 
 /**
  * checkReserved's judgement, without marking the call: the refusal, and the scratch and own-worktree rules that
  * changed a verdict. The bash branch collects every hold of the raw pass, the parsed pass and the interpreter
- * environment, and names one by the floor's precedence (pickHit).
+ * environment, and names one by the floor's precedence (pickHit); the merge hold (MergeHold) refuses first.
  */
-export function reservedVerdict(call: ToolCall, ctx: ReservedContext, opts?: ReservedOptions): ReservedVerdict {
+export function reservedVerdict(call: ToolCall, ctx: ReservedContext, opts?: ReservedOptions, hold: MergeHold = ledgerMergeHold(ctx.env)): ReservedVerdict {
 	const { toolName, input } = call;
 	const none = (refusal: Refusal): ReservedVerdict => ({ refusal, scratch: [], worktree: [] });
 	if (toolName === "bash") {
@@ -1919,6 +2193,8 @@ export function reservedVerdict(call: ToolCall, ctx: ReservedContext, opts?: Res
 			const bare = barePushOfProtected(e, scratch);
 			hits.push(...exec, ...(bare ? [bare] : []));
 		}
+		const merge = mergeHoldRefusal(cmd, cwd, ctx, input.env, x, hold);
+		if (merge) return bash(merge);
 		// Files an interpreter writes because of its environment (astra-7 B3): none inside .git.
 		const ienv = interpreterEnv(x, cwd);
 		if (ienv.writes.some((w) => insideDotGit(resolve(cwd, w.text)))) hits.push(DOT_GIT_ENV_WRITE);

@@ -658,6 +658,7 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const code = await tui.exited;
 		tui.stdin.end();
 		expect(code).toBe(0);
+		expect(eventsOf(r, started.pid)).toContain("sigterm");
 		const snap = laneSnapshot(r, wl);
 		expect(snap.bodies.filter((b) => b.includes(`lane-exit: ${laneId} `))).toEqual([`${LANE_STARTER_BY} ${laneExitBody(laneId, { code: null, signal: null, outcome: "stop", reason: "by-hand" })}`]);
 		expect(laneExit(snap.control, laneId)).toMatchObject({ outcome: "stop", reason: "by-hand" });
@@ -685,6 +686,7 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		process.kill(started.pid, "SIGTERM");
 		await tui.exited;
 		tui.stdin.end();
+		expect(eventsOf(r, started.pid)).toContain("sigterm");
 		const snap = laneSnapshot(r, wl);
 		expect(snap.control.filter((c) => c.prefix === "lane-exit" && c.laneId === laneId)).toHaveLength(1);
 		expect(laneExit(snap.control, laneId)).toMatchObject({ code: "0", outcome: "stop", reason: "by-hand" });
