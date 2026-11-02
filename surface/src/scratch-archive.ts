@@ -412,35 +412,44 @@ function tar(args: string[]): string | null {
 
 /**
  * Remove a verification copy (directories made writable first, so a read-only directory in the tree cannot pin it), one
- * entry at a time, `check` run after each: what could not be removed, or null. The archive's progress deadline passing
- * is thrown (DeadlinePassed), with what is left of the copy still in place; any other error is returned.
+ * entry at a time, `check` run after each: what could not be removed, or null once the copy is gone. An entry already
+ * gone (ENOENT) is passed over and the rest still removed; any other error stops the removal and is returned, naming the
+ * copy left. The archive's progress deadline passing is thrown (DeadlinePassed), with what is left of the copy in place.
  */
 export function removeCopy(dir: string, check: ProgressCheck = () => {}): string | null {
+	const gone = (e: unknown): boolean => (e as NodeJS.ErrnoException).code === "ENOENT";
 	try {
 		// Pre-order (a directory before its entries), so the reverse is a safe removal order.
 		const order: [string, boolean][] = [];
 		const stack = [dir];
 		while (stack.length > 0) {
 			const at = stack.pop()!;
-			const st = lstatSync(at);
-			const isDir = st.isDirectory();
-			order.push([at, isDir]);
-			if (isDir) {
-				chmodSync(at, st.mode | 0o700);
-				for (const name of readdirSync(at)) stack.push(join(at, name));
+			try {
+				const st = lstatSync(at);
+				const isDir = st.isDirectory();
+				order.push([at, isDir]);
+				if (isDir) {
+					chmodSync(at, st.mode | 0o700);
+					for (const name of readdirSync(at)) stack.push(join(at, name));
+				}
+			} catch (e) {
+				if (!gone(e)) throw e;
 			}
 			check(`reading the verification copy at ${at}`);
 		}
 		for (let i = order.length - 1; i >= 0; i--) {
 			const [at, isDir] = order[i]!;
-			if (isDir) rmdirSync(at);
-			else unlinkSync(at);
+			try {
+				if (isDir) rmdirSync(at);
+				else unlinkSync(at);
+			} catch (e) {
+				if (!gone(e)) throw e;
+			}
 			check(`removing the verification copy at ${at}`);
 		}
 		return null;
 	} catch (e) {
 		if (e instanceof DeadlinePassed) throw e;
-		if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
 		return `the verification copy ${dir} could not be removed (${message(e)})`;
 	}
 }
@@ -463,7 +472,8 @@ export function archiveDetached(dir: string, dest: string, seams: ArchiveSeams =
 	const fail = (reason: string): ArchiveResult => {
 		const also: string[] = [...warnings];
 		if (copy) {
-			const r = dropCopy(copy);
+			// Rollback: not cut short by the expired deadline, so no check.
+			const r = dropCopy(copy, () => {});
 			if (r) also.push(r);
 		}
 		for (const [what, p] of [["partial archive", partial], ["archive", linked]] as const) {

@@ -840,6 +840,45 @@ describe("orchestrator_close_workload archives the root, then removes it, after 
 			expect(modes()).toEqual(had);
 			expect(readFileSync(join(dir, "REPORT.md"), "utf8")).toBe("aaaa");
 		});
+
+		test("an entry of the verification copy that is already gone is passed over: the rest of the copy is still removed", () => {
+			const copy = join(tmp("copy-gone"), ".verify-0123456789abcdef");
+			mkdirSync(join(copy, "sub"), { recursive: true });
+			for (const p of ["a", "z", "sub/f"]) writeFileSync(join(copy, p), p);
+			let took = false;
+			const r = removeCopy(copy, (step) => {
+				// Once the top directory is listed, another process removes ./a before the walk reaches it.
+				if (!took && step === `reading the verification copy at ${copy}`) {
+					took = true;
+					unlinkSync(join(copy, "a"));
+				}
+			});
+			expect(took).toBe(true);
+			expect(r).toBeNull();
+			expect(existsSync(copy)).toBe(false);
+		});
+
+		test("the rollback of a failed verification calls the copy-removal seam with a check of its own", () => {
+			const { dir, archiveDir, dest, modes, had } = tree("copy-rollback");
+			const steps: string[] = [];
+			const a = archiveDetached(dir, dest, {
+				openFiles: () => ({ kind: "none" }),
+				afterTar: () => {
+					const partial = readdirSync(archiveDir).find((n) => n.includes(".partial-"))!;
+					writeFileSync(join(archiveDir, partial), "not a gzip archive");
+				},
+				removeCopy: (at, check) => {
+					check(`the seam at ${at}`);
+					steps.push(at);
+					rmSync(at, { recursive: true });
+					return null;
+				},
+			});
+			expect(steps.length).toBe(1);
+			expect(a.kind === "failed" && a.reason).toMatch(new RegExp(`^verifying ${reEscape(dest)}\\.partial-[0-9a-f]{12}: tar -xzpf exited `));
+			expect(readdirSync(archiveDir)).toEqual([]);
+			expect(modes()).toEqual(had);
+		});
 	});
 
 	test("a root that is a symlink is refused: the close still goes through, the target is untouched, scratch-remove-failed: is recorded", async () => {
