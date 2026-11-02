@@ -172,7 +172,7 @@ function fake(): Fake {
 		},
 		alarm: (title, text, spoken, giveUpSecs) => {
 			f.alarms.push({ title, text, spoken, giveUpSecs });
-			return f.alarmAnswers.shift() ?? { state: "answered", detail: "Dismiss (no voice)" };
+			return f.alarmAnswers.shift() ?? { state: "answered", detail: "Dismiss (no voice)", stderr: "", otherStderr: "" };
 		},
 		notify: (title, text) => {
 			f.notified.push(`${title}: ${text}`);
@@ -618,9 +618,9 @@ describe("popups", () => {
 			return `popup exited ${popupRun(l, f.deps)}`;
 		};
 		f.alarmAnswers.push(
-			{ state: "failed", detail: "zsh quiet-alarm.zsh exited 1: no window server" },
-			{ state: "failed", detail: "zsh quiet-alarm.zsh exited 1: no window server" },
-			{ state: "failed", detail: "zsh quiet-alarm.zsh exited 1: still none" },
+			{ state: "failed", detail: "zsh quiet-alarm.zsh exited 1: no window server", stderr: "" },
+			{ state: "failed", detail: "zsh quiet-alarm.zsh exited 1: no window server", stderr: "" },
+			{ state: "failed", detail: "zsh quiet-alarm.zsh exited 1: still none", stderr: "" },
 		);
 		// settleAndSpawn's own lines (the popup process's lines go to f.out through popupRun's deps).
 		const flag = { failed: false };
@@ -673,7 +673,7 @@ describe("popups", () => {
 
 	test("the ledger-down popup: one attempt at a time, at most 3 unanswered per boot, an answer ends it; an unreadable record fires the banner", () => {
 		const f = fake();
-		f.alarmAnswers.push({ state: "failed", detail: "a" }, { state: "failed", detail: "b" }, { state: "failed", detail: "c" });
+		f.alarmAnswers.push({ state: "failed", detail: "a", stderr: "" }, { state: "failed", detail: "b", stderr: "" }, { state: "failed", detail: "c", stderr: "" });
 		const flag = { failed: false };
 		for (let i = 0; i < 4; i++) ledgerDownPopup(f.deps, "SQLITE_CORRUPT", flag);
 		expect(f.alarms).toHaveLength(3);
@@ -761,6 +761,83 @@ describe("popups", () => {
 		expect(d.notes.join("\n")).toContain(`could not be opened for writing (no ledger at `);
 		expect(d.exit).toBe(1);
 	});
+
+	// Review r5 F14: quiet-alarm.zsh can print a mktemp or rm failure and still exit 0 (or 3) after the dialog was
+	// answered. These run the real alarmPopup over an injected runner, so the helper's exit and stderr reach the popup run.
+	const helperAlarm = (f: Fake, run: AlarmRun): DoctorDeps["alarm"] => (title, text, spoken, giveUpSecs, timeoutMs) => {
+		f.alarms.push({ title, text, spoken, giveUpSecs });
+		return alarmPopup(title, text, spoken, { repo: REPO, giveUpSecs, env: {}, timeoutMs, spawn: () => run });
+	};
+	const popupOutcomes = (l: Ledger) => recordsOf(l).flatMap((r) => (r.prefix === "doctor-popup" && r.outcome.state !== "claimed" ? [r.outcome] : []));
+
+	test("F14: quiet-alarm exits 0 answered but printed a mktemp failure: answered with the text kept, printed naming quiet-alarm.zsh, exit 1, no second popup", () => {
+		const f = fake();
+		const l = standing(f);
+		const d = down(l, "ctx");
+		f.deps.alarm = helperAlarm(f, { code: 0, stdout: "quiet-alarm: choice=Dismiss (no voice)\n", stderr: "mktemp: mkstemp failed\n" });
+		expect(popupRun(l, f.deps)).toBe(1);
+		expect(f.out.join("\n")).toContain("shown, but quiet-alarm.zsh reported an error on stderr: mktemp: mkstemp failed");
+		expect(popupOutcomes(l)).toEqual([{ state: "answered", detail: "Dismiss (no voice); quiet-alarm.zsh stderr: mktemp: mkstemp failed" }]);
+		expect(popupAttempts(doctorControl(l), d)).toEqual({ spent: 0, last: null, answered: true });
+		expect(pendingDowns(doctorControl(l))).toEqual([]);
+		expect(popupRun(l, f.deps)).toBe(0);
+		expect(f.alarms).toHaveLength(1);
+		l.close();
+	});
+
+	test("F14: quiet-alarm exits 0 with no stderr: exit 0 and nothing extra printed", () => {
+		const f = fake();
+		const l = standing(f);
+		down(l, "ctx");
+		f.deps.alarm = helperAlarm(f, { code: 0, stdout: "quiet-alarm: choice=Dismiss (no voice)\n", stderr: "" });
+		expect(popupRun(l, f.deps)).toBe(0);
+		expect(f.out).toHaveLength(3);
+		expect(f.out[0]).toStartWith("wrote doctor-popup: ");
+		expect(f.out[1]).toMatch(/^doctor popup pp-\S+: answered Dismiss \(no voice\)$/);
+		expect(f.out[2]).toStartWith("wrote doctor-popup: ");
+		expect(f.out.join("\n")).not.toContain("quiet-alarm");
+		expect(popupOutcomes(l)).toEqual([{ state: "answered", detail: "Dismiss (no voice)" }]);
+		l.close();
+	});
+
+	test("F14: quiet-alarm exits 3 with an audio line and an rm failure: both are kept, both printed, exit 1, no second popup", () => {
+		const f = fake();
+		const l = standing(f);
+		down(l, "ctx");
+		const audio = "quiet-alarm: audio FAILED: afplay rc 1 (x); say rc 0 (no error text)";
+		f.deps.alarm = helperAlarm(f, { code: 3, stdout: "quiet-alarm: choice=Read it to me\n", stderr: `rm: /t/quiet-alarm.x: Permission denied\n${audio}\n` });
+		expect(popupRun(l, f.deps)).toBe(1);
+		const out = f.out.join("\n");
+		expect(out).toContain(`shown, but the read-aloud failed: audio-failed ${audio}`);
+		expect(out).toContain("shown, but quiet-alarm.zsh reported an error on stderr: rm: /t/quiet-alarm.x: Permission denied");
+		expect(popupOutcomes(l)).toEqual([{ state: "answered", detail: `audio-failed ${audio}; quiet-alarm.zsh stderr: rm: /t/quiet-alarm.x: Permission denied` }]);
+		expect(popupRun(l, f.deps)).toBe(0);
+		expect(f.alarms).toHaveLength(1);
+		l.close();
+	});
+
+	test("F14: the ledger-down popup answered beside a quiet-alarm mktemp failure keeps the text, prints it, fails the run, and is not shown again", () => {
+		const f = fake();
+		f.deps.alarm = helperAlarm(f, { code: 0, stdout: "quiet-alarm: choice=Dismiss (no voice)\n", stderr: "mktemp: mkstemp failed\n" });
+		const flag = { failed: false };
+		ledgerDownPopup(f.deps, "SQLITE_CORRUPT", flag);
+		expect(flag.failed).toBe(true);
+		expect(f.out.join("\n")).toContain("the ledger-down popup was shown, but quiet-alarm.zsh reported an error on stderr: mktemp: mkstemp failed");
+		const saved = JSON.parse(f.files.get(ledgerDownPath(f.home))!.text) as { attempts: { outcome?: string }[] };
+		expect(saved.attempts.map((a) => a.outcome)).toEqual(["answered Dismiss (no voice); quiet-alarm.zsh stderr: mktemp: mkstemp failed"]);
+		const again = { failed: false };
+		ledgerDownPopup(f.deps, "SQLITE_CORRUPT", again);
+		expect(f.alarms).toHaveLength(1);
+		expect(f.out.at(-1)).toContain("the ledger-down popup was shown this boot");
+	});
+
+	test("F14: after-restart with an unopenable ledger whose popup was answered beside a quiet-alarm stderr line names that line in its notes (exit 1)", async () => {
+		const f = fake();
+		f.deps.alarm = helperAlarm(f, { code: 0, stdout: "quiet-alarm: choice=Dismiss (no voice)\n", stderr: "rm: /t/quiet-alarm.x: Permission denied\n" });
+		const r = await runAfterRestart({ ...f.deps, ledgerPath: join(tmp("doctor-gone"), "ledger.db") });
+		expect(r.exit).toBe(1);
+		expect(r.notes.join("\n")).toContain("quiet-alarm.zsh reported an error on stderr: rm: /t/quiet-alarm.x: Permission denied");
+	});
 });
 
 describe("alarmPopup (quiet-alarm.zsh)", () => {
@@ -770,13 +847,24 @@ describe("alarmPopup (quiet-alarm.zsh)", () => {
 		return r;
 	} });
 	test("exit 0 is answered with the button; 3 is answered with the audio failure; 1, a spawn error or a timeout is failed", () => {
-		expect(at({ code: 0, stdout: "quiet-alarm: choice=Read it to me\n", stderr: "" })).toEqual({ state: "answered", detail: "Read it to me" });
+		expect(at({ code: 0, stdout: "quiet-alarm: choice=Read it to me\n", stderr: "" })).toEqual({ state: "answered", detail: "Read it to me", stderr: "", otherStderr: "" });
 		expect(at({ code: 3, stdout: "quiet-alarm: choice=Read it to me\n", stderr: "quiet-alarm: audio FAILED: afplay rc 1 (x); say rc 0 (no error text)\n" }))
-			.toEqual({ state: "answered", detail: "audio-failed quiet-alarm: audio FAILED: afplay rc 1 (x); say rc 0 (no error text)" });
+			.toEqual({ state: "answered", detail: "audio-failed quiet-alarm: audio FAILED: afplay rc 1 (x); say rc 0 (no error text)", stderr: "quiet-alarm: audio FAILED: afplay rc 1 (x); say rc 0 (no error text)\n", otherStderr: "" });
 		expect(at({ code: 1, stdout: "", stderr: "quiet-alarm: popup FAILED (osascript exit 1): no\n" }))
-			.toEqual({ state: "failed", detail: "zsh /r/install/drive-backup/quiet-alarm.zsh exited 1: quiet-alarm: popup FAILED (osascript exit 1): no" });
+			.toEqual({ state: "failed", detail: "zsh /r/install/drive-backup/quiet-alarm.zsh exited 1: quiet-alarm: popup FAILED (osascript exit 1): no", stderr: "quiet-alarm: popup FAILED (osascript exit 1): no\n" });
 		expect(at({ code: null, stdout: "", stderr: "", error: "timed out after 1 s and was killed" }))
-			.toEqual({ state: "failed", detail: "zsh /r/install/drive-backup/quiet-alarm.zsh timed out after 1 s and was killed" });
+			.toEqual({ state: "failed", detail: "zsh /r/install/drive-backup/quiet-alarm.zsh timed out after 1 s and was killed", stderr: "" });
+	});
+
+	test("F14: stderr beside an answered dialog is returned on exit 0, and on exit 3 every other line is kept beside the audio line", () => {
+		expect(at({ code: 0, stdout: "quiet-alarm: choice=Dismiss (no voice)\n", stderr: "mktemp: mkstemp failed\n" }))
+			.toEqual({ state: "answered", detail: "Dismiss (no voice)", stderr: "mktemp: mkstemp failed\n", otherStderr: "mktemp: mkstemp failed" });
+		const audio = "quiet-alarm: audio FAILED: afplay rc 1 (x); say rc 0 (no error text)";
+		const stderr = `mktemp: mkstemp failed\n${audio}\nrm: /t/quiet-alarm.x: Permission denied\n`;
+		expect(at({ code: 3, stdout: "quiet-alarm: choice=Read it to me\n", stderr }))
+			.toEqual({ state: "answered", detail: `audio-failed ${audio}`, stderr, otherStderr: "mktemp: mkstemp failed; rm: /t/quiet-alarm.x: Permission denied" });
+		expect(at({ code: 3, stdout: "quiet-alarm: choice=Read it to me\n", stderr: "zsh: something else\n" }))
+			.toEqual({ state: "answered", detail: `audio-failed (no "quiet-alarm: audio FAILED:" line on stderr)`, stderr: "zsh: something else\n", otherStderr: "zsh: something else" });
 	});
 });
 
@@ -1082,7 +1170,7 @@ describe("review r2: a failure is never hidden by a later one, and never exits 0
 
 	test("sweep: the ledger-down popup's outcome is printed even when the record write after it fails", () => {
 		const f = fake();
-		f.alarmAnswers.push({ state: "failed", detail: "injected dialog error" });
+		f.alarmAnswers.push({ state: "failed", detail: "injected dialog error", stderr: "" });
 		let saves = 0;
 		const write = f.deps.fs.writeAtomic;
 		// Save 1 records the new attempt; save 2 its outcome.

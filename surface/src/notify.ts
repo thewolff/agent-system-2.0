@@ -9,8 +9,11 @@
 //   quiet-alarm's exit: 0 shown (Jo picked a button, dismissed it, or it gave up; any sound asked for played) →
 //   `answered <button>`; 3 shown, Jo picked "Read it to me", the Glass sound or the speech failed → `answered
 //   audio-failed <its stderr line>`; 1 or anything else (the popup could not be shown), a spawn failure or a timeout →
-//   `failed <why>`. Tests point quiet-alarm's QUIET_ALARM_OSASCRIPT / QUIET_ALARM_AFPLAY / QUIET_ALARM_SAY seams at
-//   fakes, or inject the runner, so no test ever shows the real dialog.
+//   `failed <why>`. Every outcome carries the helper's whole stderr; an answered one also carries `otherStderr`, its
+//   stderr lines other than the audio-failure line (review r5 F14: quiet-alarm can print a mktemp or rm failure and
+//   still exit 0 after the dialog was answered). The dialog stays answered, so it is never shown again for such a line;
+//   the caller reports the line and fails its run. Tests point quiet-alarm's QUIET_ALARM_OSASCRIPT / QUIET_ALARM_AFPLAY
+//   / QUIET_ALARM_SAY seams at fakes, or inject the runner, so no test ever shows the real dialog.
 import { join } from "node:path";
 
 /** No sound clause: train popups stay silent under Jo's silent-popup alarm rule. */
@@ -23,8 +26,12 @@ export function realNotify(title: string, text: string): boolean {
 /** 12 h: a doctor popup that nobody answers closes by itself and counts as shown. */
 export const DOCTOR_GIVE_UP_SECS = 43_200;
 
-/** What one popup came to: shown (`answered`, the button or `audio-failed <line>`), or not shown (`failed`, why). */
-export type AlarmOutcome = { state: "answered"; detail: string } | { state: "failed"; detail: string };
+/**
+ * What one popup came to: shown (`answered`, the button or `audio-failed <line>`), or not shown (`failed`, why), with
+ * quiet-alarm's whole stderr as captured ("" when it wrote none or never started). `otherStderr` is that stderr without
+ * the audio-failure line, as one line ("" when there is none): an error the helper reported beside a shown dialog.
+ */
+export type AlarmOutcome = { state: "answered"; detail: string; stderr: string; otherStderr: string } | { state: "failed"; detail: string; stderr: string };
 
 /** One quiet-alarm run as spawned: its exit code (null on a signal), both streams, and why it did not finish (spawn error or timeout). */
 export interface AlarmRun {
@@ -61,19 +68,24 @@ const spawnAlarm = (argv: string[], env: Record<string, string | undefined>, tim
 
 const oneLine = (s: string): string => s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").trim();
 
+/** quiet-alarm's audio-failure line prefix (install/drive-backup/quiet-alarm.zsh, exit 3). */
+const AUDIO_FAILED = "quiet-alarm: audio FAILED:";
+
 /** Show the alarm rule's popup through quiet-alarm.zsh and wait for it; never throws (every failure is a `failed` outcome). */
 export function alarmPopup(title: string, text: string, spoken: string, opts: AlarmOptions): AlarmOutcome {
 	const argv = ["/bin/zsh", quietAlarmPath(opts.repo), title, text, spoken];
 	const r = (opts.spawn ?? spawnAlarm)(argv, { ...opts.env, QUIET_ALARM_GIVE_UP_SECS: String(opts.giveUpSecs) }, opts.timeoutMs);
 	const what = `zsh ${quietAlarmPath(opts.repo)}`;
-	if (r.error !== undefined) return { state: "failed", detail: oneLine(`${what} ${r.error}${r.stderr.trim() ? `: ${r.stderr}` : ""}`) };
-	if (r.code === 0) {
+	const stderr = r.stderr;
+	if (r.error !== undefined) return { state: "failed", detail: oneLine(`${what} ${r.error}${stderr.trim() ? `: ${stderr}` : ""}`), stderr };
+	if (r.code === 0 || r.code === 3) {
+		const lines = stderr.split("\n").filter((l) => l.trim() !== "");
+		const at = r.code === 3 ? lines.findIndex((l) => l.startsWith(AUDIO_FAILED)) : -1;
+		const audio = at === -1 ? undefined : lines[at];
+		const otherStderr = oneLine(lines.filter((_, i) => i !== at).join("; "));
+		if (r.code === 3) return { state: "answered", detail: oneLine(`audio-failed ${audio ?? `(no "${AUDIO_FAILED}" line on stderr)`}`), stderr, otherStderr };
 		const choice = /^quiet-alarm: choice=(.*)$/m.exec(r.stdout)?.[1]?.trim();
-		return { state: "answered", detail: oneLine(choice || "shown (no choice line)") };
+		return { state: "answered", detail: oneLine(choice || "shown (no choice line)"), stderr, otherStderr };
 	}
-	if (r.code === 3) {
-		const line = r.stderr.split("\n").find((l) => l.startsWith("quiet-alarm: audio FAILED:")) ?? r.stderr;
-		return { state: "answered", detail: oneLine(`audio-failed ${line.trim() || "no stderr line"}`) };
-	}
-	return { state: "failed", detail: oneLine(`${what} exited ${r.code ?? "on a signal"}: ${r.stderr.trim() || "no error text"}`) };
+	return { state: "failed", detail: oneLine(`${what} exited ${r.code ?? "on a signal"}: ${stderr.trim() || "no error text"}`), stderr };
 }

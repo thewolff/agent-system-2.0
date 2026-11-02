@@ -1494,6 +1494,7 @@ surface/scripts/doctor.ts	module	-
 surface/test/doctor.test.ts	test	-
 surface/test/doctor-cli.test.ts	test	-
 surface/test/doctor-lines.test.ts	test	-
+surface/test/scratch-smoke-install.test.ts	test	-
 surface/test/fixtures/doctor-fakes/state.ts	test	-
 surface/test/fixtures/doctor-fakes/ctx	test	-
 surface/test/fixtures/doctor-fakes/df	test	-
