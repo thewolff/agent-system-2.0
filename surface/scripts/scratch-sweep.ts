@@ -52,7 +52,7 @@
 // Exit: 0 swept (refusals included), 1 the ledger could not be read, a removal failed, or the entry or the
 // report could not be written, an archive or an expiry failed, 2 bad arguments or a bad AGENT_SYSTEM_SCRATCH_TOTAL_MB
 // (nothing done).
-import { type BigIntStats, lstatSync, mkdirSync, readdirSync, readlinkSync, realpathSync, writeFileSync } from "node:fs";
+import { type BigIntStats, lstatSync, mkdirSync, readdirSync, readlinkSync, realpathSync, type Stats, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { SCRATCH_ENTRY, SCRATCH_TOTAL_DEFAULT_MB, SCRATCH_TOTAL_ENV, scratchBase } from "../../gates/src/scratch";
@@ -180,6 +180,8 @@ export interface SweepHooks {
 	archive?: (name: string) => ArchiveSeams;
 	/** Replaces the unlink the archive expiry uses. */
 	expiryUnlink?: (path: string) => void;
+	/** Replaces the lstat the archive expiry uses for an `.offsite` marker and an orphan sidecar and its archive. */
+	expiryLstat?: (path: string) => Stats;
 }
 
 export interface SweepResult {
@@ -326,7 +328,7 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 	// Archive expiry (step 3): only with a readable ledger, so each removal can be recorded.
 	let expired: ExpiryLine[] = [];
 	if (ledger) {
-		const x = expireArchives(args.home, args.archive, now, args.dryRun, hooks.expiryUnlink ? { unlink: hooks.expiryUnlink } : {});
+		const x = expireArchives(args.home, args.archive, now, args.dryRun, { ...(hooks.expiryUnlink ? { unlink: hooks.expiryUnlink } : {}), ...(hooks.expiryLstat ? { lstat: hooks.expiryLstat } : {}) });
 		expired = x.lines;
 		notes.push(...x.notes);
 		if (expired.some((l) => l.action === "expire failed")) failed = true;

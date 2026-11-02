@@ -737,15 +737,19 @@ export function archiveNameKind(name: string): "final" | "partial" | null {
 
 /**
  * The daily sweep's expiry pass over scratchArchiveBase(home): every regular final archive and partial (archiveNameKind)
- * under a date directory whose mtime is more than `expireDays` before `now` is removed, a final archive with its `.offsite`
- * marker and offsite sidecars; with `requireOffsite`, a final archive with no marker is kept. An offsite sidecar whose
+ * under a date directory is removed once the file's own mtime is more than `expireDays` before `now`, a final archive with
+ * its `.offsite` marker and offsite sidecars; with `requireOffsite`, a final archive with no marker is kept. An offsite sidecar whose
  * archive is gone (`<name>.tar.gz.offsite`, `.attempts`, `.stuck`; the offsite job claimed the archive) is removed once
  * it too is older than `expireDays`: until then it holds its name, so no new archive takes it (`freeName`), and a new
  * archive is never written into a date directory that old. Anything else (verification copies, other files, symlinks) is
  * never touched. A date directory left empty is removed (rmdir, never recursive). `dryRun` removes nothing. Never throws.
+ * Only ENOENT means absent: an archive that cannot be read, or whose `.offsite` marker cannot be read, is kept with a
+ * `kept` line naming the error; an orphan sidecar whose archive or itself cannot be read is kept with a note. `seams.lstat`
+ * replaces the reads of the marker and of an orphan sidecar and its archive.
  */
-export function expireArchives(home: string, config: ScratchArchiveConfig, now: Date, dryRun: boolean, seams: { unlink?: (path: string) => void } = {}): { lines: ExpiryLine[]; notes: string[] } {
+export function expireArchives(home: string, config: ScratchArchiveConfig, now: Date, dryRun: boolean, seams: { unlink?: (path: string) => void; lstat?: (path: string) => Stats } = {}): { lines: ExpiryLine[]; notes: string[] } {
 	const unlink = seams.unlink ?? unlinkSync;
+	const lstat = seams.lstat ?? lstatSync;
 	const base = scratchArchiveBase(home);
 	const lines: ExpiryLine[] = [];
 	const notes: string[] = [];
@@ -776,7 +780,7 @@ export function expireArchives(home: string, config: ScratchArchiveConfig, now: 
 			}
 			const sidecar = [OFFSITE_SUFFIX, ...OFFSITE_SIDECARS].find((s) => name.endsWith(`${ARCHIVE_SUFFIX}${s}`));
 			if (sidecar) {
-				const orphan = expireOrphanSidecar(path, path.slice(0, -sidecar.length), cutoff, now, dryRun, unlink);
+				const orphan = expireOrphanSidecar(path, path.slice(0, -sidecar.length), cutoff, now, dryRun, unlink, lstat);
 				if (orphan) notes.push(orphan);
 				continue;
 			}
@@ -799,9 +803,13 @@ export function expireArchives(home: string, config: ScratchArchiveConfig, now: 
 			let hasMarker = false;
 			if (kind === "final") {
 				try {
-					hasMarker = lstatSync(marker).isFile();
-				} catch {
-					hasMarker = false;
+					hasMarker = lstat(marker).isFile();
+				} catch (e) {
+					if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+						// The marker's state is unknown: neither expire it nor apply requireOffsite on a guess.
+						lines.push({ path, bytes: st.size, action: "kept", why: `${ageDays.toFixed(1)} days old, but its ${OFFSITE_SUFFIX} marker could not be read (${message(e)})` });
+						continue;
+					}
 				}
 				if (config.requireOffsite && !hasMarker) {
 					lines.push({ path, bytes: st.size, action: "kept", why: `${ageDays.toFixed(1)} days old, but no ${OFFSITE_SUFFIX} marker (requireOffsite)` });
@@ -845,19 +853,24 @@ export function expireArchives(home: string, config: ScratchArchiveConfig, now: 
 	return { lines, notes };
 }
 
-/** Remove the sidecar `path` when its archive `archive` is gone and its mtime is before `cutoff`; what was done, or null. Never throws. */
-function expireOrphanSidecar(path: string, archive: string, cutoff: number, now: Date, dryRun: boolean, unlink: (path: string) => void): string | null {
+/**
+ * Remove the sidecar `path` when its archive `archive` is gone and its mtime is before `cutoff`; what was done, or null.
+ * Only ENOENT means absent: an archive or sidecar that cannot be read for any other reason keeps the sidecar, with a
+ * note saying so. Never throws.
+ */
+function expireOrphanSidecar(path: string, archive: string, cutoff: number, now: Date, dryRun: boolean, unlink: (path: string) => void, lstat: (path: string) => Stats): string | null {
 	try {
-		lstatSync(archive);
+		lstat(archive);
 		return null;
 	} catch (e) {
-		if ((e as NodeJS.ErrnoException).code !== "ENOENT") return null;
+		if ((e as NodeJS.ErrnoException).code !== "ENOENT") return `${path} kept: its archive ${archive} could not be checked (${message(e)}); check its permissions, the next sweep tries again`;
 	}
 	let st: Stats;
 	try {
-		st = lstatSync(path);
-	} catch {
-		return null;
+		st = lstat(path);
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; // raced away
+		return `${path} kept: it could not be read (${message(e)}); check its permissions, the next sweep tries again`;
 	}
 	if (!st.isFile() || st.mtimeMs >= cutoff) return null;
 	const age = ((now.getTime() - st.mtimeMs) / DAY_MS).toFixed(1);

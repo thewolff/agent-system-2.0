@@ -443,6 +443,54 @@ describe("scratch sweep: archives (expiry, offsite gate, failures) and the disk 
 		expect(r.report).toContain(`${a} expired, but its .attempts could not be removed`);
 	});
 
+	/** An lstat that fails with EPERM for `blocked` and is the real lstatSync for every other path. */
+	const lstatFailing = (blocked: string) => (p: string) => {
+		if (p === blocked) throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" });
+		return lstatSync(p);
+	};
+	/** An unlink that records each path it is asked to remove and removes it. */
+	const unlinkRecorded = (seen: string[]) => (p: string) => {
+		seen.push(p);
+		rmSync(p);
+	};
+
+	test("an .offsite marker that cannot be read keeps its old archive and the marker, reported: neither expired nor judged by requireOffsite", () => {
+		const w = world();
+		const a = archiveAt(w, "2026-10-01", "wl-aa.tar.gz", 27);
+		writeFileSync(`${a}.offsite`, "drive:/as2/wl-aa.tar.gz");
+		const unlinked: string[] = [];
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW, { expiryLstat: lstatFailing(`${a}.offsite`), expiryUnlink: unlinkRecorded(unlinked) });
+		expect(r.exit).toBe(0);
+		expect([existsSync(a), existsSync(`${a}.offsite`)]).toEqual([true, true]);
+		expect(unlinked).toEqual([]);
+		expect(r.expired.find((l) => l.path === a)).toEqual({ path: a, bytes: 2, action: "kept", why: "27.0 days old, but its .offsite marker could not be read (EPERM: operation not permitted)" });
+		expect(r.report).toContain(`| ${a} | 2 | kept | 27.0 days old, but its .offsite marker could not be read (EPERM: operation not permitted) |`);
+		expect(expiredEntries(w)).toEqual([]);
+	});
+
+	test("an orphan sidecar whose archive cannot be checked is kept, with a note naming both and the error", () => {
+		const w = world();
+		const side = archiveAt(w, "2026-10-01", "wl-gone.tar.gz.attempts", 27);
+		const archive = side.slice(0, -".attempts".length);
+		const unlinked: string[] = [];
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW, { expiryLstat: lstatFailing(archive), expiryUnlink: unlinkRecorded(unlinked) });
+		expect(r.exit).toBe(0);
+		expect(existsSync(side)).toBe(true);
+		expect(unlinked).toEqual([]);
+		expect(r.report).toContain(`${side} kept: its archive ${archive} could not be checked (EPERM: operation not permitted); check its permissions, the next sweep tries again`);
+	});
+
+	test("an orphan sidecar that cannot itself be read is kept, with a note naming it and the error", () => {
+		const w = world();
+		const side = archiveAt(w, "2026-10-01", "wl-gone.tar.gz.stuck", 27);
+		const unlinked: string[] = [];
+		const r = runSweep(argsOf(w), { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, NOW, { expiryLstat: lstatFailing(side), expiryUnlink: unlinkRecorded(unlinked) });
+		expect(r.exit).toBe(0);
+		expect(existsSync(side)).toBe(true);
+		expect(unlinked).toEqual([]);
+		expect(r.report).toContain(`${side} kept: it could not be read (EPERM: operation not permitted); check its permissions, the next sweep tries again`);
+	});
+
 	test("a new archive never takes a name an old archive's sidecar still holds, so it cannot inherit that .offsite", () => {
 		const w = world();
 		const closed = open(w);
