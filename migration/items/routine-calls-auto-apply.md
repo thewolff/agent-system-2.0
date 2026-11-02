@@ -2,9 +2,9 @@
 title: Routine calls apply themselves and Jo is told after the fact; Jo is asked only on the § A4 floor
 status: building
 workload: wl-mvqwn80onq9hq8
-pr: none
+pr: 420
 ---
-**Built on branch `wl/wl-mvqwn80onq9hq8`, PR pending.** Workload `wl-mvqwn80onq9hq8` (normal stakes, flow repair jo-issues #213, plan revision 13 at `~/agent-scratch/agent-system-2.0/wl-mvqwn80onq9hq8/PLAN.md`, Jo's ledger inputs `in-mvqwmr95k54feo`, `in-mvqyt4a8gezvgg`, `in-mvqyknri0dy4g0`, `in-mvqyy16frc4u80`). Until now Jo was asked about reserved actions that only read or only touched the lane's own scratch folder, about routine record-and-announce questions, about every plan while flow repair was up, about every review round limit, and about every ceiling hit.
+**Built on branch `wl/wl-mvqwn80onq9hq8`, PR #420.** Workload `wl-mvqwn80onq9hq8` (normal stakes, flow repair jo-issues #213, plan revision 13 at `~/agent-scratch/agent-system-2.0/wl-mvqwn80onq9hq8/PLAN.md`, Jo's ledger inputs `in-mvqwmr95k54feo`, `in-mvqyt4a8gezvgg`, `in-mvqyknri0dy4g0`, `in-mvqyy16frc4u80`). Until now Jo was asked about reserved actions that only read or only touched the lane's own scratch folder, about routine record-and-announce questions, about every plan while flow repair was up, about every review round limit, and about every ceiling hit.
 
 **What changed.**
 - **Auto-apply of held calls.** A reserved action that is wholly read-only, or writes only inside the lane's own scratch root or own worktree, is applied by the gate with an ESCALATION_BY `auto-applied: <rule> <toolCallId> …` row, a notice `auto-applied (<rule>) on <wl>: <command>` and, after the call, an `auto-applied-result:` row (`gates/extensions/r06-reserved.ts`, classifier `gates/src/routine.ts`, fence profiles `gates/src/fence.ts`). A request that may write, a Seatbelt denial or an unreadable `gh` log writes `auto-apply-tripped:` and turns auto-apply off everywhere; a lost write goes to `~/.agent-system-2/auto-apply-alarms.jsonl` and shows as an `AUTO-APPLY ALARM` needs-you line.
