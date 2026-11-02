@@ -9,7 +9,7 @@
 // entry lands on the standing workload, once while open; back within bounds, `scratch-disk-ok:`.
 // --dry-run removes and writes nothing; a missing ledger or a bad threshold removes nothing.
 import { afterAll, describe, expect, test } from "bun:test";
-import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SCRATCH_ENTRY, scratchBase } from "../../gates/src/scratch";
 import { DEFAULT_SCRATCH_ARCHIVE, type ScratchArchiveConfig, scratchArchiveBase } from "../src/scratch-archive";
@@ -574,8 +574,9 @@ describe("scratch sweep: archives (expiry, offsite gate, failures) and the disk 
 			archive: () => ({
 				beforeStage: (path) => {
 					if (!path.endsWith("/repo/src/a.ts")) return;
-					unlinkSync(path);
-					writeFileSync(path, "rewritten");
+					// Made while the old file still exists, so never on its inode (an unlink then a write may reuse it on Linux).
+					writeFileSync(`${path}.new`, "rewritten");
+					renameSync(`${path}.new`, path);
 				},
 			}),
 		});
@@ -596,8 +597,8 @@ describe("scratch sweep: archives (expiry, offsite gate, failures) and the disk 
 			archive: () => ({
 				beforeStage: (path) => {
 					if (!path.endsWith("/repo/src/a.ts")) return;
-					unlinkSync(path);
-					writeFileSync(path, "rewritten");
+					writeFileSync(`${path}.new`, "rewritten");
+					renameSync(`${path}.new`, path);
 				},
 			}),
 		});
@@ -621,8 +622,8 @@ describe("scratch sweep: archives (expiry, offsite gate, failures) and the disk 
 				},
 				beforeStage: (path) => {
 					if (!path.endsWith("/repo/src/a.ts")) return;
-					unlinkSync(path);
-					writeFileSync(path, "rewritten");
+					writeFileSync(`${path}.new`, "rewritten");
+					renameSync(`${path}.new`, path);
 				},
 			}),
 		});

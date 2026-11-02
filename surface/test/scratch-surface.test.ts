@@ -5,7 +5,7 @@
 // archives the root once the row has closed and only then removes it, keeping a root whose archive
 // fails and refusing a root that is a symlink.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { appendFileSync, chmodSync, closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { Ledger } from "../../ledger/src/index";
@@ -596,7 +596,7 @@ describe("orchestrator_close_workload archives the root, then removes it, after 
 			ledger.close();
 		});
 
-		test("a file replaced during the purge (unlinked and written again by its path) is never removed: the purge stops, puts it back, gives every mode back and renames the root back", () => {
+		test("a file replaced during the purge (a new file renamed over its path) is never removed: the purge stops, puts it back, gives every mode back and renames the root back", () => {
 			const { ledger, wl, home, root, leftovers } = setUp();
 			const rootMode = lstatSync(root).mode & 0o7777;
 			const said = closeScratchRoot(ledger, { HOME: home }, wl, {
@@ -604,8 +604,9 @@ describe("orchestrator_close_workload archives the root, then removes it, after 
 				seams: {
 					beforeStage: (path) => {
 						if (!path.endsWith("/REPORT.md")) return;
-						unlinkSync(path);
-						writeFileSync(path, "bbbb");
+						// Made while the old file still exists, so never on its inode (an unlink then a write may reuse it on Linux).
+						writeFileSync(`${path}.new`, "bbbb");
+						renameSync(`${path}.new`, path);
 					},
 				},
 			});
