@@ -276,6 +276,29 @@ needs-you list. The refusal tells the lane to run the command with the bash tool
 reads it; a reserved command run there is held for Jo with the real command in the request. Eval
 code that starts no process is judged as before.
 
+**Amended 2026-10-27 — the § A4 list is the only list that asks Jo; routine calls apply themselves**
+(`migration/items/routine-calls-auto-apply.md`; Jo, ledger inputs `in-mvqwmr95k54feo` (stop asking routine calls)
+and `in-mvqyt4a8gezvgg` (ask only on § A4, and for `rm -rf` only outside the lane's own worktree or scratch folder);
+plan `~/agent-scratch/agent-system-2.0/wl-mvqwn80onq9hq8/PLAN.md` rev 13 §§ D2-D5, D11; built in
+wl-mvqwn80onq9hq8). The A4 list above is now the **floor**: every reserved action on it still asks Jo, and no
+other reserved action does (`FLOOR`, `gates/src/rows/r06-reserved.ts`, one class per row 6 hold and git-model
+reservation: `A4` asks; `deploy` keeps its verdict, owned by wl-mvgorfqqbuyyo0; `guard` is refused with no request,
+for writes another owner holds, such as the test runner's commit status or the merge gate's branch protection;
+`ordinary` runs, a short allow-list of `gh api` writes and the feature-branch pushes; `own-root` auto-applies).
+`rm -rf` asks only outside the lane's own scratch root and own worktree; a temp folder no longer exempts it. A held
+call is **auto-applied** when the gate's classifier (`gates/src/routine.ts`, under a 2-second deadline in a worker
+thread) finds it wholly read-only (rule `read-only`: an allow-list of readers, `gh` read subcommands and
+`gh api` GET) or writing only inside the lane's own scratch root (`scratch`) or own worktree (`worktree`). A call
+the classifier cannot read or does not settle in time asks Jo as before. The gate writes ESCALATION_BY's
+`auto-applied: <rule> <toolCallId> …` row and sends a notice in one `ledger.write`, and only then lets the call
+run, under a fence profile that is read-only (network only for `gh`, whose request log is read after the call) or
+confined to the one root with no network. After the call it writes `auto-applied-result:`. A request that may
+write, a Seatbelt denial, or an unreadable `gh` log writes `auto-apply-tripped:` and turns auto-apply off for every
+lane until Jo's `auto-routine`. A trip or result that cannot be written goes to
+`~/.agent-system-2/auto-apply-alarms.jsonl`, which latches the switch and shows as an `AUTO-APPLY ALARM` needs-you
+line. The switch is one reader, `routineOn` (`gates/src/routine-switch.ts`), read inside the deciding write: Jo's
+`ask-all` turns it off, `auto-routine` turns it on and clears older trips, and with no word it is on.
+
 **Threat model — ruled 2026-09-29.** Jo: *"accidental misuse"*. The gates guard against a lane
 of ours doing a reserved thing **by mistake or over-eager judgment**: every spelling a lane would
 plausibly type while doing its job is modeled and refused (fail-closed on unmodeled forms, the
@@ -536,6 +559,19 @@ whatever holds the workload; it shows as its own on-fire needs-you line, past a 
 while the ordinary test-run line keeps its suppression. A lane asks Jo before it changes such a test. The daily sweep's
 `scratch-disk` line is on fire too.
 
+**Amended 2026-10-27 — ruling `routine-calls`: record and announce** (`migration/items/routine-calls-auto-apply.md`;
+Jo, ledger input `in-mvqwmr95k54feo`; plan rev 13 § D6; built in wl-mvqwn80onq9hq8). `lane_raise_question` takes an
+optional `routine: { record: "<one line>" }`. The tool, not the lane, then appends the fixed option
+`record-and-announce` and recommends it; a lane option spelled like it is refused. Such a question is the new kind
+`record-announce`, and the standing ruling `routine-calls` (`gates/src/rulings.ts`) decides it when the asker is a
+lane, the slice is not the plan slice, no `now` is set, `routineOn` holds, and neither the body nor the record line
+names a § A4 action. The whole effect is fixed in code, in one write: ESCALATION_BY's `routine-recorded: <slice>
+<record line>` beside `ruling-applied:`, and the notice `auto-answered <slice> record-and-announce (ruling
+routine-calls): <line>`. No instruction row and no answered question is written, so nothing reads it as Jo's word,
+and the tool tells the lane the answer authorizes no code, privilege, spend or GitHub change. If the write fails, the
+question is raised to Jo as before. Jo's `end-ruling routine-calls` ends the ruling, and `ask-all` turns it off until
+`auto-routine`. A second ruling, `review-auto-extend`, is recorded under § B4.
+
 ### B4 · Stakes → tier cap, and review as a stakes property (P-9, P-8a, A4 "approved")
 
 **Ruled 2026-09-23.** Jo: *"yes to your reccos"*, after *"so would every normal workload cost
@@ -577,8 +613,8 @@ counts), and has its cross-lab review passed. A PR that fails a test gets a `tra
 ledger row, no line to Jo, and Jo's `train <N>` still lands it. For these PRs the normal row's "told
 in one line after the merge" no longer holds: Jo hears only of a production-stakes merge, a
 conflict the owner fails twice, a red main (once per `main-red` issue), or a main protection the
-tick cannot verify (named once per episode). Production-stakes and user-driven lanes keep the rule
-above unchanged; production auto-boarding is a non-goal.
+tick cannot verify (named once per episode). User-driven lanes keep the rule above unchanged; production
+auto-boarding, a non-goal when this was ruled, is built by *Amended 2026-10-27*, below.
 
 **Amended 2026-10-20 — Jo's train word is the production sign-off** (`migration/items/train-signoff-ruling.md`;
 jo-issues #155; Jo, 2026-10-19 9:10 PM PDT: *"i dont want to be asked twice"*; Jo's standing ruling, ledger input
@@ -595,13 +631,28 @@ standing rulings are checked before a question*). It decides the train lane's me
 passed; the PR is green at its current head; and main's protection reads `ok` live. Then no question row is written,
 the question tool records `ruling-applied: train-signoff kind merge slice <sl> answer merge`, and the train lane merges
 at once with a merge commit pinned to the head it verified (`--match-head-commit`, never `--admin`). If any of these fails, or a
-`gh` read fails, Jo is asked as before. Auto-boarding still never boards a production PR, so a PR only the train tick
-boarded still asks. A question already open when this lands stays Jo's to answer. Jo's `end-ruling train-signoff`
+`gh` read fails, Jo is asked as before. Auto-boarding did not board a production PR when this was ruled; *Amended
+2026-10-27*, below, changes that. A question already open when this lands stays Jo's to answer. Jo's `end-ruling train-signoff`
 ends the ruling at once with no code change, and from then on every production PR asks again. **One line after each
 train merge:** the train tick sends Jo one notice per PR any train merged (`merged by train …`), once, naming either
 his train word (production) or normal stakes. Normal-stakes train merges therefore again send the one-line notice the
 normal row promises; this replaces the auto-board amendment's "no longer holds" sentence above. No notice is sent for a
 PR Jo merged himself or one the train skipped.
+
+**Amended 2026-10-27 — the merge train boards and merges a reviewed production PR on a full-suite green**
+(`migration/items/routine-calls-auto-apply.md`; Jo, ledger input `in-mvqyt4a8gezvgg`: Jo is asked only on the § A4
+list, and a merge of a green, reviewed PR is not on it; plan rev 13 § D11; built in wl-mvqwn80onq9hq8). This amends
+the production row above and the two amendments before it. `landingReady` (`surface/src/merge-train.ts`) boards an
+autonomous workload at normal **or production** stakes (throwaway never), on the same conditions as before: closed,
+holder `done-because:`, review passed, newest run green at the PR's head. At production stakes the green must be a
+full-suite green: a fast green (land-first, `migration/items/train-land-first.md`) never auto-boards a production PR
+(`PRODUCTION_FAST_GREEN`), and Jo's `train <N>` still can. `prStakes` answers `normal` for a production workload
+whose plan is approved and whose newest review passed, so the train merges that PR without asking, and keeps `hold`
+for Jo's `halt` and the plan auto-start's hold. A production PR with no approved plan or no passed review still asks
+Jo merged / skip / stop, and ruling `train-signoff` still decides that question for a PR Jo's train word named. The
+`merges` ruling no longer excludes production, and the first prompt tells a production lane that the train merges its
+green, reviewed PR. Branch protection is unchanged: a green `as2/full-suite` on an up-to-date head, which only the
+test runner posts. Jo's `ask-all` does not change this rule.
 
 **Amended 2026-10-01 — cross-lab review** (MIGRATION.md item 23; Jo: *"any review should happen
 via a model from a lab that did not build it. if the agent building it was anthropic? we use openai
@@ -705,6 +756,17 @@ starting numbers, Jo's to change.
   instruction, then the surface's `test-pr:` entry naming it. The test runner admits a bound
   same-repo open PR whatever its head branch; closed, merged and fork PRs stay refused. The workload
   is always named.
+
+**Amended 2026-10-27 — a falling review extends once by itself** (`migration/items/routine-calls-auto-apply.md`; Jo,
+ledger input `in-mvqyknri0dy4g0`; plan rev 13 § D10; built in wl-mvqwn80onq9hq8). The classifier's round-limit
+question is the new kind `round-limit`. The standing ruling `review-auto-extend` (`gates/src/rulings.ts`) answers
+`extend` when the stakes are normal or production, every completed round of the loop has a known blocking count,
+there are at least two rounds and each count is lower than the one before, the loop has no extend yet (Jo's or
+automatic) and `routineOn` holds. In one write `roundSettled` (`classifier/extension.ts`) records
+`ruling-applied: review-auto-extend`, CLASSIFIER_BY's `review-rounds-extend: … by <ruling-applied entry>`, which
+`effectiveRoundLimit` counts once per loop, and the notice *"review of <slice> on <wl> extended by itself (blocking
+a→b→c, ruling review-auto-extend); `stop-reviews <wl>` stops it; `ask-all` stops all auto-extends"*. The next limit in
+that loop asks Jo, as does a flat, rising or unknown count and any limit after `ask-all`.
 
 **Amended 2026-10-12 — OpenAI reviews on gpt-6-sol** (MIGRATION.md item 110; Jo, ledger inputs
 `in-mv5qdfvskukmbk`: a review that routes to OpenAI runs on `openai-codex/gpt-6-sol`, never
@@ -902,12 +964,19 @@ no review routing on the slice came after it; the round it closes was created af
 resolved; and every member of that round ran, was not withheld, carries no same-lab token (no Jo grant, no Kimi-out
 rule token) and answered only on labs outside the builders. Jo's `accept` at a round limit, a mixed round and any
 later review all fail (b). (c) The body passes the plan-question shape check above. (d) The workload was never
-halted. (e) The `flow-repair` ruling is not active (§ B3, *Amended 2026-10-19*). Then, in one write, the fixed writer
+halted. (e) `routineOn` holds (§ B3, *Amended 2026-10-27*; it replaces the earlier test that the `flow-repair`
+ruling is not active: starting the plan of a workload already open opens no new work, and the flow-repair gate on which
+workloads may open is unchanged). Then, in one write, the fixed writer
 `escalation` (`ESCALATION_BY`) records `plan: approved auto <round group>`, a form valid only from that writer, which
 every reader of plan approval accepts and no lane can write, and sends Jo a notice carrying the plan body: *"plan
 started without your approve on <wl> (normal stakes, cross-lab review passed); it will not merge until 4 h after your
 next message here; `halt <wl>` stops it"*. The lane is told to add its change slices. Auto-start never opens a
-workload and never launches a lane. Production plans, and every plan while flow repair is up, still go to Jo as above.
+workload and never launches a lane. *Amended 2026-10-27* (Jo, `in-mvqyt4a8gezvgg`; wl-mvqwn80onq9hq8): condition (a)
+is now normal **or production** stakes, so a production plan whose review passed wholly cross-lab starts the same way
+(at production stakes one review fans out to every other available lab and every leg must pass), and flow repair no
+longer stops it. The notice ends *"`halt <wl>` stops it; `ask-all` stops all auto-starts"*. Jo's `ask-all` turns
+auto-start off until `auto-routine`; the plan then goes to Jo as above. A production workload's reserved actions
+still ask Jo through the § A4 floor.
 **Stop before merge:** for such a workload `prStakes` (`surface/src/merge-train.ts`) answers `hold: <reason> until
 <time|jo>`. The hold lasts until 4 h (`HOLD_HOURS`) after Jo's first typed surface message created after the notice
 was delivered (the standing-workload instruction `joInputRow` writes; mirrors on other workloads do not count), and
@@ -1043,6 +1112,24 @@ stopped, when that lane's spend is under the new value and no relaunch is alread
 live by-hand lane (`as2 lane <wl>`, `launch:` cause `interactive`) is never stopped at its ceiling and puts nothing
 about it on the needs-you list. That lane gets its spend against the ceiling at every turn start, and Jo gets a line
 in its pane at every further 25 % of the original ceiling's dollars, past 100 % too.
+
+**Amended 2026-10-27 — a ceiling hit with progress rises once by half** (`migration/items/routine-calls-auto-apply.md`;
+Jo, ledger inputs `in-mvqwmr95k54feo` and `in-mvqyy16frc4u80`: progress is mechanical, not liveness; plan rev 13
+§ D12; built in wl-mvqwn80onq9hq8). This amends *"No ceiling extends on its own"* above. When the meter stops an
+autonomous workload at 100 % and `routineOn` holds, and the workload made progress since its newest ceiling notice
+(a slice moved to `done`, a commit is on the remote copy of one of the workload's branches that was not there at the
+window's start, or a complete review round's blocking count fell below the previous round's), and no `ceiling:` row
+with source `auto-raise half` exists on the workload, the same write adds a `ceiling:` row by LANE_RUNNER_BY with
+both values raised by half, rounded down (`halfRaise`, `surface/src/ceiling.ts`; `effectiveCeiling` applies it only
+when it equals `halfRaise` of the ceiling then in force), a `launch-requested:` row, and the notice *"ceiling raised
+once by half on <wl>: $<old>→$<new>, <old>→<new> min; progress: <kind> <evidence>. Next hit asks; `ceiling <usd>
+[<hours>] <wl>` sets another figure, `halt <wl>` stops it."* A remote that cannot be read counts as unknown, never as
+no progress, and its error is named in the notice. Any other hit (a second one, no progress, only unknown progress,
+`ask-all`) keeps the stop and raises a question to Jo, `ceiling reached on <wl>: <why>`, with options `extend` and
+`stop`. If the raise and the question both fail to write, the runner appends a `kind: "ceiling"` line to
+`~/.agent-system-2/auto-apply-alarms.jsonl`, shown as a `CEILING ALARM <wl>` needs-you line until Jo's next
+`ceiling`, `extend` or `halt` word on the workload; that line does not turn auto-apply off. Raising beyond the one
+auto-raise stays Jo's.
 
 ### B12 · Two decisions held since the triple-check (P-7b, P-16/P-15)
 
