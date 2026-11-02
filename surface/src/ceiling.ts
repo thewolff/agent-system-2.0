@@ -89,11 +89,18 @@ export const AUTO_RAISE_SOURCE = "auto-raise half";
  * The runner's one raise by half (D12), rounded down and never above 150 %: dollars to the cent, `floor(usd × 150) / 100`, and
  * wall to the minute, `floor(wall × 1.5)`. $0.10 → $0.15, $5 → $7.50, 61 → 91 min. Null unless both halves come out strictly
  * above `c` ($0.001 → $0, $0.01 → $0.01, 1 → 1 min): a null is a failed raise, never announced as one. The arithmetic runs on
- * integer micro-dollars and milli-minutes, so binary noise (0.7 × 150 = 104.99…) never moves a cent or a minute either way.
+ * integer micro-dollars and milli-minutes, so binary noise (0.7 × 150 = 104.99…) never moves a cent or a minute either way; an
+ * input finer than that unit is taken at the unit below it ($49.9999999 → 49.999999, so $74.99, never $75), so the cap holds.
  */
 export function halfRaise(c: Ceiling): Ceiling | null {
-	const usd = Math.floor((Math.round(c.usd * 1e6) * 3) / 20_000) / 100;
-	const wallMin = Math.floor((Math.round(c.wallMin * 1e3) * 3) / 2_000);
+	// Nearest unit, then one unit down when that nearest is above the input: a decimal at the unit's precision maps to the
+	// same double either way (`k / 1e6 === c.usd`), so only a finer input steps down.
+	let micro = Math.round(c.usd * 1e6);
+	if (micro / 1e6 > c.usd) micro -= 1;
+	let milli = Math.round(c.wallMin * 1e3);
+	if (milli / 1e3 > c.wallMin) milli -= 1;
+	const usd = Math.floor((micro * 3) / 20_000) / 100;
+	const wallMin = Math.floor((milli * 3) / 2_000);
 	return usd > c.usd && wallMin > c.wallMin ? { usd, wallMin } : null;
 }
 

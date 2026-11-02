@@ -116,6 +116,8 @@ describe("PLAN wl-mvqwn80onq9hq8 D12: the runner's one raise by half (R30)", () 
 		// binary noise never moves a cent: 0.7 × 1.5 is 1.05, not 1.04; 0.33 × 1.5 = 0.495 floors to 0.49
 		expect(halfRaise({ usd: 0.7, wallMin: 10 })).toEqual({ usd: 1.05, wallMin: 15 });
 		expect(halfRaise({ usd: 0.33, wallMin: 3 })).toEqual({ usd: 0.49, wallMin: 4 });
+		// an input finer than a micro-dollar or a milli-minute just under a boundary is taken at the unit below, never rounded up past 150 %
+		expect(halfRaise({ usd: 49.9999999, wallMin: 359.9999999 })).toEqual({ usd: 74.99, wallMin: 539 });
 		for (const c of [{ usd: 123.457, wallMin: 777 }, { usd: 0.07, wallMin: 7 }, { usd: 19.99, wallMin: 359 }]) {
 			const h = halfRaise(c)!;
 			expect(h.usd).toBeLessThanOrEqual(c.usd * 1.5);
