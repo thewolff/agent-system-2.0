@@ -432,6 +432,16 @@ describe("PLAN wl-mvqwn80onq9hq8 D12: a 100 % hit rises once by half on progress
 		expect(r.poll(50.2).hit).toMatchObject({ kind: "asked", first: `ceiling reached on ${r.wl}: no progress since ${roundNoticeAt}` });
 	});
 
+	test("R29 a baseline mark tied with the notice's own millisecond never stands in for the notice's mark", () => {
+		const s = setup();
+		s.poll(25); // the baseline poll marks head A
+		s.fake.state.heads[`origin wl/${s.wl}`] = SHA_B;
+		// the 80 % notice in the same millisecond marks head B: B was there when the window opened
+		expect(meterPoll(s.ledger, { workloadId: s.wl, laneId: LANE, spend: spent(40, 10), state: fresh, probe: s.fake.probe, alarmFile: s.file })).toMatchObject({ notice: 80, hit: null });
+		const noticeAt = s.c.now();
+		expect(s.poll(50.2).hit).toMatchObject({ kind: "asked", first: `ceiling reached on ${s.wl}: no progress since ${noticeAt}` });
+	});
+
 	test("R29 a commit on the workload branch or a push-dest branch the mark lacked is progress, named by remote, branch and sha", () => {
 		const s = setup();
 		s.ledger.recordEntry({ by: LANE, workloadId: s.wl, kind: "assumption", body: `push-dest: fork feature/offset ${SHA_A}` });

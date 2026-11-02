@@ -911,7 +911,11 @@ interface MeterView {
 	/** Where the progress window opens: the newest 80 or 100 % ceiling notice, else the `ceiling:` row in force; null with neither. */
 	start: string | null;
 	branches: PushBranch[];
-	/** Per `branchKey`, the window's mark: the branch's oldest `ceiling-mark:` at or after `start`. */
+	/**
+	 * Per `branchKey`, the window's mark: the branch's newest `ceiling-mark:` at or after `start`. Newest, not oldest: a
+	 * baseline poll in the notice's own millisecond writes a mark that ties with the notice's own, and the notice's (the later
+	 * head) must win; a later mark only moves the baseline forward, so it can only ask Jo more, never raise more.
+	 */
 	marks: Map<string, CeilingMark>;
 }
 
@@ -929,7 +933,7 @@ function meterView(ledger: Ledger, r: { workloadId: string; spend: Spend; state:
 	const marks = new Map<string, CeilingMark>();
 	for (const c of control) {
 		const m = c.prefix === "ceiling-mark" && (start === null || c.createdAt >= start) ? parseCeilingMark(c.rest) : null;
-		if (m !== null && !marks.has(branchKey(m))) marks.set(branchKey(m), m);
+		if (m !== null) marks.set(branchKey(m), m);
 	}
 	return { w, control, ceiling: inForce.ceiling, step, start, branches: ceilingBranches(r.workloadId, control), marks };
 }
