@@ -23,19 +23,29 @@
 //     `daily-report: <date> window <from>..<to> findings <n> (<detector> <k>, …) deaths <d> lapsed <l> held-closed <h> — <path>`.
 //  5. A run that finds an entry of its date, or whose entry write fails, deletes its own file: no file is left
 //     without an entry and no entry names a missing file.
+// The report also has an auto-apply section (PLAN wl-mvqwn80onq9hq8 D7, D10, D12; `readAutoAudit`, from the same read-only
+// handle, and the alarm file beside the ledger, gates/src/routine-switch.ts alarmFilePath): one summary line for the window,
+// then every `auto-applied:` row with its `auto-applied-result:` (a row with none past 10 minutes is "results missing"), every
+// `auto-apply-tripped:`, every `routine-recorded:` with its slice beside the count of `ruling-applied: routine-calls`, every
+// classifier `review-rounds-extend:` that names a `ruling-applied: review-auto-extend` entry, every `ceiling:` row whose source
+// starts `auto-raise half` (any writer, named, with its evidence), and every alarm-file line. An alarm file that cannot be read
+// is a line of the section, never a silent zero. The entry body is unchanged.
 // At the end the run prints its own peak RSS in MiB (process.resourceUsage().maxRSS: bytes under Bun 1.3 on darwin,
 // KiB under Node; a value under 1/64 of the current RSS can only be KiB, and the peak is never below the current RSS).
 //
 // --dry-run prints the report and writes nothing (no file, no entry). --home and --now exist for tests.
 // Exit: 0 written, or skipped because the date already has its entry; 1 the ledger could not be read, a reader or
 // detector failed, or the file or the entry could not be written; 2 bad arguments (nothing done).
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import { defaultLedgerPath, type EntryRow, Ledger } from "../../ledger/src/index";
+import { parseReviewRoundsExtend } from "../../classifier/src/rounds";
+import { alarmFilePath, MISSING_RESULT_MS, parseAlarmLine } from "../../gates/src/routine-switch";
+import { CLASSIFIER_BY, defaultLedgerPath, type EntryRow, Ledger } from "../../ledger/src/index";
+import { parseCeiling } from "../src/ceiling";
 import { ensureStandingWorkload } from "../src/identity";
 import { type ControlEntry, controlEntries, DAILY_REPORT_BY } from "../src/launch";
-import { type CountRows, computeCounts, type Counts, type DeathRow, type HeldRow, type LapseRow } from "../src/selfheal/counts";
+import { type CountRows, computeCounts, type Counts, type DeathRow, type HeldRow, inWindow, type LapseRow } from "../src/selfheal/counts";
 import type { DetectorInputs } from "../src/selfheal/detectors";
 import type { readDetectorInputs } from "../src/selfheal/read";
 import { DETECTOR_IDS, type Finding, type Window } from "../src/selfheal/types";
@@ -148,6 +158,110 @@ export function readCountRows(ledger: Ledger, nowIso: string): CountRows {
 	return { deaths, unrecordedLapses, heldClosed, lanes };
 }
 
+/** An `auto-applied:` row (PLAN wl-mvqwn80onq9hq8 D3), parsed: `auto-applied: <rule> <toolCallId> by <lane or hand id> cwd <cwd> net <yes|no>: <command>`. */
+export interface AutoApplied {
+	rule: string;
+	toolCallId: string;
+	by: string;
+	cwd: string;
+	net: boolean;
+	command: string;
+}
+
+const AUTO_APPLIED = /^auto-applied:\s+(\S+)\s+(\S+)\s+by\s+(\S+)\s+cwd\s+(.+?)\s+net\s+(yes|no):\s+([\s\S]+)$/;
+
+/** An `auto-applied:` body read back; null for any other shape (the readers report such a row, never drop it). */
+export function parseAutoApplied(body: string): AutoApplied | null {
+	const m = AUTO_APPLIED.exec(body.trim());
+	return m ? { rule: m[1]!, toolCallId: m[2]!, by: m[3]!, cwd: m[4]!, net: m[5] === "yes", command: m[6]! } : null;
+}
+
+/** What the report's auto-apply section lists for the window (PLAN wl-mvqwn80onq9hq8 D7, D10, D12). */
+export interface AutoAudit {
+	/** ESCALATION_BY's `auto-applied:` rows, oldest first, each with its parse (null: another shape) and its `auto-applied-result:`; `missing` once older than MISSING_RESULT_MS at the run with none. */
+	applied: { id: string; workloadId: string; at: string; body: string; row: AutoApplied | null; result: { id: string; rest: string } | null; missing: boolean }[];
+	/** ESCALATION_BY's `auto-apply-tripped:` rows: `<toolCallId> <signal> <evidence>`. */
+	trips: { id: string; at: string; rest: string }[];
+	/** `ruling-applied: routine-calls …` rows. */
+	routineCalls: number;
+	/** ESCALATION_BY's `routine-recorded: <slice> <record line>` rows. */
+	recorded: { id: string; workloadId: string; at: string; slice: string; record: string }[];
+	/** CLASSIFIER_BY's `review-rounds-extend:` rows whose `by` is a `ruling-applied: review-auto-extend` entry for the same slice. */
+	autoExtends: { id: string; workloadId: string; at: string; slice: string; rounds: number; by: string }[];
+	/** `ceiling:` rows whose source starts `auto-raise half`, by any writer (named); `valid` false when the row does not parse. */
+	autoRaises: { id: string; workloadId: string; at: string; writer: string; rest: string; valid: boolean }[];
+	/** The alarm file's lines dated in the window, and every line with no readable `at`; `error` when the file exists and cannot be read. */
+	alarms: { path: string; lines: { n: number; kind: string | null; at: string | null; raw: string }[]; error: string | null };
+}
+
+/** The rows the auto-apply section reads: assumption entries from the window's start to the run, by body prefix. */
+const AUTO_AUDIT_SQL = `SELECT * FROM entries WHERE kind = 'assumption' AND created_at >= ?1 AND created_at <= ?2 AND (
+  substr(body, 1, 13) = 'auto-applied:' OR substr(body, 1, 20) = 'auto-applied-result:' OR substr(body, 1, 19) = 'auto-apply-tripped:'
+  OR substr(body, 1, 17) = 'routine-recorded:' OR substr(body, 1, 16) = 'ruling-applied: ' OR substr(body, 1, 21) = 'review-rounds-extend:'
+  OR substr(body, 1, 8) = 'ceiling:') ORDER BY created_at, rowid`;
+const AUTO_EXTEND_APPLIED = /^ruling-applied: review-auto-extend kind round-limit slice (\S+) answer extend$/;
+const AUTO_RAISE_SOURCE = "auto-raise half";
+
+/**
+ * The auto-apply section's rows for window `w` at the run `nowIso`, from the read-only handle, and the alarm file `alarmFile`.
+ * A result is matched by tool call id up to the run, so a row late in the window still finds it. A missing alarm file has no
+ * line; one that exists and cannot be read is `alarms.error`, rendered as its own line.
+ */
+export function readAutoAudit(ledger: Pick<Ledger, "db">, w: Window, nowIso: string, alarmFile: string): AutoAudit {
+	const rows = ledger.db.query<EntryRow, [string, string]>(AUTO_AUDIT_SQL).all(w.from, nowIso);
+	const workloadOf = new Map(rows.map((r) => [r.id, r.workload_id]));
+	const control = controlEntries(rows);
+	const results = new Map<string, ControlEntry>();
+	for (const c of control) {
+		if (c.prefix !== "auto-applied-result") continue;
+		const tc = c.rest.split(/\s+/)[0]!;
+		if (tc !== "" && !results.has(tc)) results.set(tc, c);
+	}
+	const inside = (at: string): boolean => inWindow(at, w);
+	const out: AutoAudit = { applied: [], trips: [], routineCalls: 0, recorded: [], autoExtends: [], autoRaises: [], alarms: { path: alarmFile, lines: [], error: null } };
+	for (const c of control) {
+		if (!inside(c.createdAt)) continue;
+		const workloadId = workloadOf.get(c.id)!;
+		if (c.prefix === "auto-applied") {
+			const row = parseAutoApplied(c.body);
+			const r = row ? results.get(row.toolCallId) : undefined;
+			const result = r ? { id: r.id, rest: r.rest.slice(row!.toolCallId.length).trim() } : null;
+			out.applied.push({ id: c.id, workloadId, at: c.createdAt, body: c.body, row, result, missing: result === null && Date.parse(nowIso) - Date.parse(c.createdAt) > MISSING_RESULT_MS });
+		} else if (c.prefix === "auto-apply-tripped") out.trips.push({ id: c.id, at: c.createdAt, rest: c.rest });
+		else if (c.prefix === "routine-recorded") {
+			const [slice = "", ...record] = c.rest.split(" ");
+			out.recorded.push({ id: c.id, workloadId, at: c.createdAt, slice, record: record.join(" ") });
+		}
+	}
+	const bodyOf = ledger.db.query<{ body: string }, [string]>("SELECT body FROM entries WHERE id = ?1");
+	for (const e of rows) {
+		if (!inside(e.created_at)) continue;
+		if (e.body.startsWith("ruling-applied: routine-calls ")) out.routineCalls++;
+		const x = e.created_by === CLASSIFIER_BY ? parseReviewRoundsExtend(e.body) : null;
+		if (x && AUTO_EXTEND_APPLIED.exec(bodyOf.get(x.by)?.body.trim() ?? "")?.[1] === x.slice) {
+			out.autoExtends.push({ id: e.id, workloadId: e.workload_id, at: e.created_at, slice: x.slice, rounds: x.rounds, by: x.by });
+		}
+		if (e.body.startsWith("ceiling:")) {
+			const rest = e.body.slice("ceiling:".length).trim();
+			const parsed = parseCeiling(rest);
+			const auto = parsed ? parsed.source.startsWith(AUTO_RAISE_SOURCE) : rest.includes(`source ${AUTO_RAISE_SOURCE}`);
+			if (auto) out.autoRaises.push({ id: e.id, workloadId: e.workload_id, at: e.created_at, writer: e.created_by, rest, valid: parsed !== null });
+		}
+	}
+	if (existsSync(alarmFile)) {
+		try {
+			readFileSync(alarmFile, "utf8").split("\n").forEach((raw, i) => {
+				if (raw.trim() === "") return;
+				const { kind, at } = parseAlarmLine(raw);
+				if (at === null || inside(at)) out.alarms.lines.push({ n: i + 1, kind, at, raw });
+			});
+		} catch (e) {
+			out.alarms.error = e instanceof Error ? e.message : String(e);
+		}
+	}
+	return out;
+}
+
 /** `<id> <k>` for every detector that fired, in DETECTOR_IDS order. */
 function perDetector(findings: readonly Finding[]): string[] {
 	return DETECTOR_IDS.map((id) => [id, findings.filter((f) => f.detector === id).length] as const).filter(([, k]) => k > 0).map(([id, k]) => `${id} ${k}`);
@@ -161,7 +275,65 @@ export function entryBody(date: string, w: Window, findings: readonly Finding[],
 
 const cell = (s: string): string => s.replace(/\|/g, "\\|").replace(/\n/g, " ");
 
-function render(o: { date: string; nowIso: string; dryRun: boolean; ledgerPath: string; profile: string; window: Window & { capped: boolean }; previousTo: string | null; findings: readonly Finding[]; counts: Counts }): string {
+/** One line of at most `max` characters: whitespace runs (a multi-line command) become one space, and a cut ends with `…`. */
+const oneLine = (s: string, max = 200): string => {
+	const t = s.replace(/\s+/g, " ").trim();
+	return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+};
+
+/** The report's auto-apply section (PLAN wl-mvqwn80onq9hq8 D7): the window's summary line, then each row kind in full. */
+export function renderAutoAudit(a: AutoAudit, nowIso: string): string[] {
+	const byRule = new Map<string, number>();
+	for (const r of a.applied) byRule.set(r.row?.rule ?? "unparsed", (byRule.get(r.row?.rule ?? "unparsed") ?? 0) + 1);
+	const rules = [...byRule].sort(([x], [y]) => x.localeCompare(y)).map(([rule, n]) => `${rule} ${n}`).join(", ");
+	const missing = a.applied.filter((r) => r.missing);
+	const alarmCount = a.alarms.error === null ? String(a.alarms.lines.length) : "unknown (the file could not be read)";
+	const ageMin = (at: string): number => Math.round((Date.parse(nowIso) - Date.parse(at)) / 60_000);
+	const list = <T>(rows: readonly T[], line: (r: T) => string): string[] => (rows.length ? rows.map(line) : ["- none"]);
+	const out: string[] = [
+		"## auto-apply and routine rulings (PLAN wl-mvqwn80onq9hq8 D7)",
+		"",
+		`- in the window: auto-applied ${a.applied.length}${rules ? ` (${rules})` : ""}; results missing past ${MISSING_RESULT_MS / 60_000} min ${missing.length}; trips ${a.trips.length}; routine-recorded ${a.recorded.length} (ruling-applied: routine-calls ${a.routineCalls}); review auto-extends ${a.autoExtends.length}; ceiling auto-raises ${a.autoRaises.length}; alarm-file lines ${alarmCount}`,
+		"",
+		`### auto-applied (${a.applied.length})`,
+		"",
+		...list(a.applied, (r) => {
+			const result = r.result
+				? `result ${r.result.rest} (${r.result.id})`
+				: r.missing
+					? `RESULT MISSING after ${ageMin(r.at)} min`
+					: `no result yet (${ageMin(r.at)} min old)`;
+			if (!r.row) return `- ${r.at} ${r.id} on ${r.workloadId}: does not parse as \`auto-applied: <rule> <toolCallId> by <id> cwd <cwd> net <yes|no>: <command>\`: ${oneLine(r.body)}`;
+			return `- ${r.at} ${r.id} on ${r.workloadId}: ${r.row.rule}, tool call ${r.row.toolCallId}, by ${r.row.by}, cwd ${r.row.cwd}, net ${r.row.net ? "yes" : "no"}: ${oneLine(r.row.command)} — ${result}`;
+		}),
+		"",
+		`### auto-apply trips (${a.trips.length})`,
+		"",
+		...list(a.trips, (t) => `- ${t.at} ${t.id}: ${oneLine(t.rest)}`),
+		"",
+		`### routine-recorded (${a.recorded.length}; ruling-applied: routine-calls ${a.routineCalls})`,
+		"",
+		...list(a.recorded, (r) => `- ${r.at} ${r.id} on ${r.workloadId} slice ${r.slice}: ${oneLine(r.record)}`),
+		"",
+		`### review auto-extends, ruling review-auto-extend (${a.autoExtends.length})`,
+		"",
+		...list(a.autoExtends, (x) => `- ${x.at} ${x.id} on ${x.workloadId} slice ${x.slice}: +${x.rounds} rounds by ${x.by}`),
+		"",
+		`### ceiling auto-raises, source ${AUTO_RAISE_SOURCE} (${a.autoRaises.length})`,
+		"",
+		...list(a.autoRaises, (c) => `- ${c.at} ${c.id} on ${c.workloadId} by ${c.writer}: ${oneLine(c.rest, 400)}${c.valid ? "" : " (does not parse as a ceiling: row)"}`),
+		"",
+		`### auto-apply alarm-file lines (${alarmCount})`,
+		"",
+		`- file: ${a.alarms.path}`,
+	];
+	if (a.alarms.error !== null) out.push(`- ALARM FILE UNREADABLE: ${a.alarms.error}; read it by hand, every line in it is a latch until Jo's auto-routine`);
+	else out.push(...list(a.alarms.lines, (l) => `- line ${l.n} kind ${l.kind ?? "none"} at ${l.at ?? "none readable (listed every run)"}: ${oneLine(l.raw, 400)}`));
+	out.push("");
+	return out;
+}
+
+function render(o: { date: string; nowIso: string; dryRun: boolean; ledgerPath: string; profile: string; window: Window & { capped: boolean }; previousTo: string | null; findings: readonly Finding[]; counts: Counts; auto: AutoAudit }): string {
 	const { window: w, counts: c, findings } = o;
 	const hours = Math.round(((Date.parse(w.to) - Date.parse(w.from)) / HOUR_MS) * 10) / 10;
 	const start = o.previousTo === null ? "no earlier report: 24 h back" : `the previous report's window ended ${o.previousTo}`;
@@ -210,6 +382,7 @@ function render(o: { date: string; nowIso: string; dryRun: boolean; ledgerPath: 
 		`- interactive lanes (not metered in this phase): ${l.interactive.length}${l.interactive.length ? ` (${l.interactive.join(", ")})` : ""}`,
 		"",
 	);
+	out.push(...renderAutoAudit(o.auto, o.nowIso));
 	return out.join("\n");
 }
 
@@ -230,21 +403,23 @@ export async function dailyReport(args: ReportArgs, env: Readonly<Record<string,
 	let previousTo: string | null;
 	let findings: Finding[];
 	let counts: Counts;
+	let auto: AutoAudit;
 	try {
 		previousTo = (ro.workload(STANDING_WORKLOAD_ID) ? reportEntries(ro.entries(STANDING_WORKLOAD_ID, "assumption")).at(-1)?.to : undefined) ?? null;
 		window = reportWindow(previousTo, now);
 		const span: Window = { from: window.from, to: window.to };
 		findings = deps.runDetectors(await deps.readDetectorInputs({ ledger: ro, home: args.home, profile, window: span }), span);
 		counts = computeCounts(readCountRows(ro, nowIso), span);
+		auto = readAutoAudit(ro, span, nowIso, alarmFilePath({ ...env, HOME: args.home }));
 	} catch (e) {
-		return failed(`the ledger, the detectors or the counts could not be read (${e instanceof Error ? e.message : String(e)}); nothing written`);
+		return failed(`the ledger, the detectors, the counts or the auto-apply rows could not be read (${e instanceof Error ? e.message : String(e)}); nothing written`);
 	} finally {
 		ro.close();
 	}
 
 	const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
 	const reportPath = join(reportDir(args.home), `${date}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-${process.pid}.md`);
-	const report = render({ date, nowIso, dryRun: args.dryRun, ledgerPath, profile, window, previousTo, findings, counts });
+	const report = render({ date, nowIso, dryRun: args.dryRun, ledgerPath, profile, window, previousTo, findings, counts, auto });
 	const body = entryBody(date, window, findings, counts, reportPath);
 	const w: Window = { from: window.from, to: window.to };
 	if (args.dryRun) return { exit: 0, report, reportPath: null, entry: null, body, window: w, ledgerLine: `would write on ${STANDING_WORKLOAD_ID}: ${body}` };

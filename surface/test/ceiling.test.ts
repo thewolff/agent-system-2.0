@@ -5,7 +5,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, type EntryRow, type InstructionRow } from "../../ledger/src/index";
-import { ceilingBody, crossed, effectiveCeiling, parseCeiling, parseSpend, scanSpend, sizeFor, spendBody, wallMinutes } from "../src/ceiling";
+import { autoRaiseUsed, ceilingBody, ceilingInForce, crossed, effectiveCeiling, halfRaise, originalCeiling, parseCeiling, parseSpend, scanSpend, sizeFor, spendBody, wallMinutes } from "../src/ceiling";
 import { controlEntries } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
 import { tmp } from "./helpers";
@@ -102,6 +102,71 @@ describe("effective ceiling (§ 2 item 1: a raise needs Jo)", () => {
 		expect(controlEntries([ceilingAt(1, 500, 720, undefined, "lane-m-1")])).toEqual([]);
 		expect(eff([ceilingAt(1, 500, 720, undefined, "lane-m-1")])).toEqual({ usd: 50, wallMin: 360 });
 		expect(eff([ceilingAt(1, 50, 360), ceilingAt(2, 1, 1, undefined, "lane-m-1")])).toEqual({ usd: 50, wallMin: 360 });
+	});
+});
+
+describe("PLAN wl-mvqwn80onq9hq8 D12: the runner's one raise by half (R30)", () => {
+	const eff = (rows: EntryRow[], ins: InstructionRow[] = []) => effectiveCeiling(controlEntries(rows), ins, "normal");
+	const auto = (minute: number, usd: number, wallMin: number, source = "auto-raise half progress slice-closed sl-a") => entry(LANE_RUNNER_BY, ceilingBody({ usd, wallMin }, source), minute);
+
+	test("R30 halfRaise rounds down to the cent and the minute, never above 150 %, and is null unless both halves rise", () => {
+		expect(halfRaise({ usd: 50, wallMin: 360 })).toEqual({ usd: 75, wallMin: 540 });
+		expect(halfRaise({ usd: 0.1, wallMin: 61 })).toEqual({ usd: 0.15, wallMin: 91 });
+		expect(halfRaise({ usd: 5, wallMin: 60 })).toEqual({ usd: 7.5, wallMin: 90 });
+		// binary noise never moves a cent: 0.7 × 1.5 is 1.05, not 1.04; 0.33 × 1.5 = 0.495 floors to 0.49
+		expect(halfRaise({ usd: 0.7, wallMin: 10 })).toEqual({ usd: 1.05, wallMin: 15 });
+		expect(halfRaise({ usd: 0.33, wallMin: 3 })).toEqual({ usd: 0.49, wallMin: 4 });
+		// an input finer than a micro-dollar or a milli-minute just under a boundary is taken at the unit below, never rounded up past 150 %
+		expect(halfRaise({ usd: 49.9999999, wallMin: 359.9999999 })).toEqual({ usd: 74.99, wallMin: 539 });
+		// past exact integer arithmetic the raise is null (the runner asks Jo), never inexact, lossy or infinite
+		expect(halfRaise({ usd: 3_000_000_000, wallMin: 360 })).toEqual({ usd: 4_500_000_000, wallMin: 540 });
+		for (const c of [{ usd: 1e20, wallMin: 360 }, { usd: 1e302, wallMin: 360 }, { usd: 1_000_000_000_000.6, wallMin: 360 }, { usd: 50, wallMin: 1e300 }]) expect(halfRaise(c)).toBeNull();
+		for (const c of [{ usd: 123.457, wallMin: 777 }, { usd: 0.07, wallMin: 7 }, { usd: 19.99, wallMin: 359 }]) {
+			const h = halfRaise(c)!;
+			expect(h.usd).toBeLessThanOrEqual(c.usd * 1.5);
+			expect(h.wallMin).toBeLessThanOrEqual(c.wallMin * 1.5);
+		}
+		expect(halfRaise({ usd: 0.001, wallMin: 60 })).toBeNull();
+		expect(halfRaise({ usd: 0.01, wallMin: 60 })).toBeNull();
+		expect(halfRaise({ usd: 50, wallMin: 1 })).toBeNull();
+	});
+
+	test("R30 a runner raise applies only at exactly halfRaise of the ceiling in force, and only the workload's first such row", () => {
+		expect(controlEntries([auto(2, 75, 540)])).toHaveLength(1);
+		expect(eff([ceilingAt(1, 50, 360), auto(2, 75, 540)])).toEqual({ usd: 75, wallMin: 540 });
+		expect(ceilingInForce(controlEntries([ceilingAt(1, 50, 360), auto(2, 75, 540)]), [], "normal").at).toBe(at(2));
+		// with no ceiling row, half of the stakes size
+		expect(eff([auto(2, 75, 540)])).toEqual({ usd: 75, wallMin: 540 });
+		// any other figure is ignored, above or below
+		expect(eff([ceilingAt(1, 50, 360), auto(2, 76, 540)])).toEqual({ usd: 50, wallMin: 360 });
+		expect(eff([ceilingAt(1, 50, 360), auto(2, 75, 541)])).toEqual({ usd: 50, wallMin: 360 });
+		expect(eff([ceilingAt(1, 50, 360), auto(2, 100, 720)])).toEqual({ usd: 50, wallMin: 360 });
+		expect(eff([ceilingAt(1, 50, 360), auto(2, 40, 300)])).toEqual({ usd: 50, wallMin: 360 });
+		// a runner row whose source is not the auto-raise is ignored, whatever its figure
+		expect(eff([ceilingAt(1, 50, 360), auto(2, 75, 540, "your word")])).toEqual({ usd: 50, wallMin: 360 });
+		expect(eff([ceilingAt(1, 50, 360), auto(2, 75, 540, "auto-raise halfway")])).toEqual({ usd: 50, wallMin: 360 });
+		// once per workload: a second exact half is ignored, and so is one after an ignored first
+		expect(eff([ceilingAt(1, 50, 360), auto(2, 75, 540), auto(3, 112.5, 810)])).toEqual({ usd: 75, wallMin: 540 });
+		expect(eff([ceilingAt(1, 50, 360), auto(2, 80, 540), auto(3, 75, 540)])).toEqual({ usd: 50, wallMin: 360 });
+		// a raise of Jo's after it still needs Jo's instruction; half of Jo's figure applies when it is the first runner raise
+		expect(eff([ceilingAt(1, 50, 360), ceilingAt(2, 100, 720, "in-jo"), auto(3, 150, 1080)], [instruction("in-jo", "jo", 2)])).toEqual({ usd: 150, wallMin: 1080 });
+		// a lowering by the surface after the raise applies as before
+		expect(eff([ceilingAt(1, 50, 360), auto(2, 75, 540), ceilingAt(3, 10, 60)])).toEqual({ usd: 10, wallMin: 60 });
+		// a lane forging the runner's row is dropped by controlEntries
+		expect(controlEntries([entry("lane-m-1", ceilingBody({ usd: 75, wallMin: 540 }, "auto-raise half progress x"))])).toEqual([]);
+	});
+
+	test("autoRaiseUsed counts every runner auto-raise row, applied or not; originalCeiling never takes one", () => {
+		expect(autoRaiseUsed(controlEntries([ceilingAt(1, 50, 360)]))).toBe(false);
+		expect(autoRaiseUsed(controlEntries([ceilingAt(1, 50, 360), auto(2, 80, 540)]))).toBe(true);
+		expect(autoRaiseUsed(controlEntries([ceilingAt(1, 50, 360), entry(SURFACE_BY, ceilingBody({ usd: 75, wallMin: 540 }, "auto-raise half"), 2)]))).toBe(false);
+		expect(originalCeiling(controlEntries([auto(1, 75, 540), ceilingAt(2, 50, 360)]), [], "normal")).toEqual({ usd: 50, wallMin: 360 });
+	});
+
+	test("a source carrying the evidence and failed push checks round-trips", () => {
+		const source = "auto-raise half progress commit-pushed origin wl/wl-m 0123456789abcdef0123456789abcdef01234567; push check failed: fork feat: push URL changed";
+		const [c] = controlEntries([entry(LANE_RUNNER_BY, ceilingBody({ usd: 75, wallMin: 540 }, source))]);
+		expect(parseCeiling(c!.rest)).toEqual({ usd: 75, wallMin: 540, source, by: null });
 	});
 });
 

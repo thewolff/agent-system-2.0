@@ -283,7 +283,7 @@ describe("prStakes (rev 17.1 D1): normal only for a same-repo wl/<id> branch who
 			stakes: "production", reason: `${w.other} is on ${w.elsewhere}, whose origin is thewolff/newdle-web, not ${REPO}`,
 		});
 		expect(of({ headRefName: `wl/${w.bare}` })).toEqual({ stakes: "production", reason: `${w.bare} has no repo: entry` });
-		expect(of({ headRefName: `wl/${w.prod}` })).toEqual({ stakes: "production", reason: `${w.prod}'s stakes are production` });
+		expect(of({ headRefName: `wl/${w.prod}` })).toEqual({ stakes: "production", reason: `${w.prod}'s stakes are production and it has no approved plan (no plan: approved entry)` });
 		// owner/repo compares without case, as GitHub's does
 		expect(of({ headRefName: `wl/${w.normal}`, headRepositoryOwner: { login: "TheWolff" } })).toEqual({ stakes: "normal", reason: `${w.normal} on ${REPO}, stakes normal` });
 		expect(of({ headRefName: `wl/${w.normal}` }).stakes).toBe("normal");
@@ -337,9 +337,9 @@ describe("prStakes hold (PLAN wl-mvfkv7llkp7nk0 § 3, R10): an auto-started or h
 		expect(of()).toMatchObject({ stakes: "hold", until: "jo" });
 		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.normal, kind: "assumption", body: "plan: approved in-2" });
 		expect(of().stakes).toBe("normal");
-		// Production stays production: a hold never lowers it.
+		// Production is held by Jo's halt too (PLAN wl-mvqwn80onq9hq8 D11): the halt holds before the plan and review rule is read.
 		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.prod, kind: "assumption", body: planHaltedBody("in-3") });
-		expect(prStakes(view({ headRefName: `wl/${w.prod}` }), REPO, w.ledger).stakes).toBe("production");
+		expect(prStakes(view({ headRefName: `wl/${w.prod}` }), REPO, w.ledger)).toMatchObject({ stakes: "hold", until: "jo" });
 	});
 });
 
@@ -398,7 +398,7 @@ exit 1
 			`api repos/${REPO}/rulesets/1`,
 		]);
 		const prod = run(w.path, views, ["stakes", "--repo", REPO, "--pr", "102"], PROTECTED);
-		expect([prod.code, prod.out]).toEqual([0, `production: ${w.prod}'s stakes are production\n`]);
+		expect([prod.code, prod.out]).toEqual([0, `production: ${w.prod}'s stakes are production and it has no approved plan (no plan: approved entry)\n`]);
 		expect(prod.calls()).toHaveLength(1);
 		expect(w.ledger.entries(w.normal).length).toBe(before);
 	});
@@ -480,7 +480,7 @@ exit 1
 		expect(run(w.path, views, ["stakes", "--hold-ok", "--repo", REPO, "--pr", "101"], PROTECTED).out).toBe("normal\n");
 		// a PR whose own stakes are production keeps Jo's question, flag or not, and is never a hold
 		const prod = run(w.path, views, ["stakes", "--hold-ok", "--repo", REPO, "--pr", "102"]);
-		expect([prod.code, prod.out]).toEqual([0, `production: ${w.prod}'s stakes are production\n`]);
+		expect([prod.code, prod.out]).toEqual([0, `production: ${w.prod}'s stakes are production and it has no approved plan (no plan: approved entry)\n`]);
 		expect(run(w.path, [], ["stakes", "--hold-ok", "--repo", REPO, "--pr", "999"]).code).toBe(2);
 	}, 30_000);
 
