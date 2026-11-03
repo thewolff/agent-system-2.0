@@ -85,6 +85,7 @@ classifier/test/replay.test.ts	test	-
 classifier/test/review-round1.test.ts	test	-
 classifier/test/review-round2.test.ts	test	-
 classifier/test/review-stop.test.ts	test	-
+classifier/test/review-tier.test.ts	test	-
 classifier/test/rounds.test.ts	test	-
 classifier/test/snapshot-settle.test.ts	test	-
 classifier/test/route.test.ts	test	-

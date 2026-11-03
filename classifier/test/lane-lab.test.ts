@@ -27,6 +27,8 @@ const TABLE = tierTableFromConfig({ task: { agentModelOverrides: ROWS } });
 const ALL = Object.values(ROWS).flat();
 const [OPUS, SOL, KIMI] = ROWS.strong as [string, string, string];
 const [, , K3] = ROWS.deep as [string, string, string];
+/** A normal judge review runs on standard (SPEC-2.0.md § B4, amended 2026-11-03): its Kimi entry is standard's, its OpenAI one strong's. */
+const [, , K25] = ROWS.standard as [string, string, string];
 /** The lane models: each lab's lane, one of them a model no tier row names (tier for tier, not the exact model). */
 const LANE = { anthropic: OPUS, openai: "openai-codex/gpt-6.1-sol", kimi: KIMI } as const;
 const LAB_PREFIX = { anthropic: "anthropic/", openai: "openai-codex/", kimi: "moonshot/" } as const;
@@ -338,7 +340,7 @@ describe("the lane model at each spawn; the row a hand was spawned on holds", ()
 		// The process dies with the hand in flight; the restarted lane reviews.
 		const b = lane(w, { laneModel: OPUS });
 		const review = await dispatch(b, w, "sl-x", "review the change", "r1");
-		expect(review.spawn?.model).toEqual([SOL, KIMI]);
+		expect(review.spawn?.model).toEqual([SOL, K25]);
 
 		// A relaunch on an OpenAI model: its turns and its build hands are openai; the next review goes to kimi.
 		const v = world();
@@ -350,7 +352,7 @@ describe("the lane model at each spawn; the row a hand was spawned on holds", ()
 		expect(built.spawn?.model).toEqual([SOL]);
 		relaunched.handMessage("sl-a", SOL);
 		expect(relaunched.results("c1", [{ id: "sl-a", agent: "strong", model: SOL }])).toBeUndefined();
-		expect((await dispatch(relaunched, v, "sl-x", "review the change", "r1")).spawn?.model).toEqual([KIMI]);
+		expect((await dispatch(relaunched, v, "sl-x", "review the change", "r1")).spawn?.model).toEqual([K25]);
 	});
 });
 
@@ -375,17 +377,17 @@ describe("named and default lanes follow the actual current model", () => {
 });
 
 describe("reviews keep the cross-lab routing, whatever the lane's lab", () => {
-	test("a normal judge review routes off the builder lab, not onto the lane's", async () => {
+	test("a normal judge review routes off the builder lab, not onto the lane's, on standard (SPEC-2.0.md § B4, amended 2026-11-03)", async () => {
 		for (const laneModel of [OPUS, undefined]) {
 			const w = world();
 			const h = lane(w, { laneModel });
 			h.laneMessage(OPUS);
 			const { tier, spawn } = await dispatch(h, w, "sl-x", "review the change", "r1");
-			expect(tier).toBe("strong");
-			expect(spawn?.model).toEqual([SOL, KIMI]);
-			expect(spawnRows(w)).toEqual([[SOL, KIMI].join(",")]);
+			expect(tier).toBe("standard");
+			expect(spawn?.model).toEqual([SOL, K25]);
+			expect(spawnRows(w)).toEqual([[SOL, K25].join(",")]);
 			h.handMessage("sl-x", SOL);
-			expect(h.results("r1", [{ id: "sl-x", agent: "strong", model: SOL }])).toBeUndefined();
+			expect(h.results("r1", [{ id: "sl-x", agent: "standard", model: SOL }])).toBeUndefined();
 		}
 	});
 

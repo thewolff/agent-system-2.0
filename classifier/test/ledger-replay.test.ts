@@ -221,7 +221,7 @@ test("--update refuses, naming it, when one manifest snapshot replays to no line
 	}
 }, 60_000);
 
-test("a production review replays on the deep row with its OpenAI entry from the strong row (Jo, in-mv5qfm8910ycjk): with no strong OpenAI entry the openai lab drops out", () => {
+test("a review replays on its review tier's row with its OpenAI entry from the strong row (Jo, in-mv5qfm8910ycjk; SPEC-2.0.md § B4 amended 2026-11-03): production on deep, normal on standard; with no strong OpenAI entry the openai lab drops out", () => {
 	const dir = mkdtempSync(join(tmpdir(), "ledger-replay-review-row-"));
 	try {
 		const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backupOnOpen: false, backup: false, skipLocalityCheck: true });
@@ -244,15 +244,15 @@ test("a production review replays on the deep row with its OpenAI entry from the
 				replaySnapshot(ledger, "snap", "2026-10-12T00:00:00.000Z", t)
 					.map(l => [l.workload, l.tier, l.rowLabs, l.decision])
 					.sort((a, b) => a[0]!.localeCompare(b[0]!));
-			// The strong row has an OpenAI entry: the deep review row keeps all three labs.
+			// The strong row has an OpenAI entry: the deep and standard review rows keep all three labs, the OpenAI one where the tier row had it.
 			expect(lines(table)).toEqual([
-				["wl-normal", "strong", "anthropic,openai,kimi", "single:anthropic,openai,kimi"],
+				["wl-normal", "standard", "openai,anthropic,kimi", "single:openai,anthropic,kimi"],
 				["wl-prod", "deep", "anthropic,openai,kimi", "fanout:anthropic,openai,kimi"],
 			]);
-			// No strong OpenAI entry: the production review row loses openai and never falls back to the deep row's; the normal review plans on the strong row as given.
+			// No strong OpenAI entry: both review rows lose openai and never fall back to their own tier row's.
 			const noOpenai = { ...table, strong: table.strong.filter(s => labOf(s) !== "openai") };
 			expect(lines(noOpenai)).toEqual([
-				["wl-normal", "strong", "anthropic,kimi", "single:anthropic,kimi"],
+				["wl-normal", "standard", "anthropic,kimi", "single:anthropic,kimi"],
 				["wl-prod", "deep", "anthropic,kimi", "fanout:anthropic,kimi"],
 			]);
 		} finally {

@@ -8,7 +8,8 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { classify, loadCalibration, loadKindQuestion, questionSha256 } from "../src/classify";
-import { KINDS, route, STAKES, TIERS, type Kind, type Tier } from "../src/route";
+import { isReviewDispatch } from "../src/lab";
+import { KINDS, reviewRouting, route, STAKES, TIERS, type Kind, type Tier } from "../src/route";
 import { tierTableFromConfig } from "../src/tier-table";
 import { dist, extensionHost, type FakeRegistry, fakeRegistry, loadSample, recordedJudge, recordedQuestion } from "./helpers";
 
@@ -200,7 +201,12 @@ describe("B2: a spawn's routing is found by its spawn key and tier, never by arr
 });
 
 describe("B3: every kind that can land on a tier gets guidance in that tier's prompt", () => {
-	/** Every (kind, confidence band, top-two partner, stakes) the router can produce, and where it lands. */
+	/**
+	 * Every (kind, confidence band, top-two partner, stakes) the router can produce, and where the final dispatch policy
+	 * lands it (classifier/extension.ts: `route`, then for a review `reviewRouting`, SPEC-2.0.md § B4 amended 2026-11-03).
+	 * A review hand does judge work whatever kind it was classified (a low-confidence review pulled up because judge is in
+	 * its top two), so its tier needs the judge line too.
+	 */
 	function reachable(): Record<Tier, Set<Kind>> {
 		const out = Object.fromEntries(TIERS.map(t => [t, new Set<Kind>()])) as Record<Tier, Set<Kind>>;
 		for (const kind of KINDS)
@@ -208,7 +214,11 @@ describe("B3: every kind that can land on a tier gets guidance in that tier's pr
 				for (const confidence of [0.4, 0.9])
 					for (const stakes of [null, ...STAKES]) {
 						const probabilities = partner === kind ? dist({ [kind]: 0.9 }) : dist({ [kind]: 0.5, [partner]: 0.45 });
-						out[route({ choice: kind, confidence, probabilities }, stakes).tier].add(kind);
+						const routing = route({ choice: kind, confidence, probabilities }, stakes);
+						const review = isReviewDispatch(routing);
+						const tier = (review ? reviewRouting(routing) : routing).tier;
+						out[tier].add(kind);
+						if (review) out[tier].add("judge");
 					}
 		return out;
 	}

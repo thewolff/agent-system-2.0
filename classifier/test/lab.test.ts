@@ -452,8 +452,13 @@ describe("reviewRow: Jo's OpenAI-reviewer rule (in-mv5qdfvskukmbk, in-mv5qfm8910
 		expect(reviewRow(table, "deep")).toEqual(["anthropic/claude-fable-5-1", "moonshot/kimi-k3"]);
 	});
 
-	test("every other tier returns its row unchanged", () => {
-		for (const tier of ["fast", "standard", "strong"] as const) expect(reviewRow(TABLE, tier)).toEqual(TABLE[tier]);
+	test("fast and standard (SPEC-2.0.md § B4 amended 2026-11-03): the openai entry comes from the strong row at its own position; anthropic and kimi stay", () => {
+		expect(reviewRow(TABLE, "fast")).toEqual(["anthropic/claude-haiku-5-5", "openai-codex/gpt-6-sol", "moonshot/kimi-k2.7-code-highspeed"]);
+		expect(reviewRow(TABLE, "standard")).toEqual(["anthropic/claude-sonnet-5-5", "openai-codex/gpt-6-sol", "moonshot/kimi-k2.5"]);
+	});
+
+	test("strong, the rule's own tier, returns its row unchanged", () => {
+		expect(reviewRow(TABLE, "strong")).toEqual(TABLE.strong);
 	});
 });
 

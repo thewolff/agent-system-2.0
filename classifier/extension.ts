@@ -282,7 +282,7 @@ import {
 	severityLine,
 	UNKNOWN,
 } from "./src/rounds";
-import { isTier, route, STAKES, type Routing, type Tier } from "./src/route";
+import { isTier, reviewRouting, route, STAKES, type Routing, type Tier } from "./src/route";
 import { identity, loadTierTable, modelIdentity, type TierTable } from "./src/tier-table";
 import { controlEntries, holdersOf, type LaneStarted, laneStarted, planFirst, planSlice } from "../surface/src/launch";
 import { ompPidState, type PidState } from "../surface/src/omp-probe";
@@ -2441,9 +2441,11 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						let routing = route(classification, brief);
 						// D2: kind judge, or low-confidence with judge in the top two. D5 [R6]: a review's stakes
 						// are the higher of the brief's and the workload row's; they feed the cap, the fan-out
-						// decision and `routings.stakes`. Other dispatches keep the brief's.
+						// decision and `routings.stakes`. Other dispatches keep the brief's. SPEC-2.0.md § B4
+						// "Amended 2026-11-03": a judge-kind review then runs on its stakes' review tier
+						// (`reviewRouting`); a pulled-up low-confidence review keeps its A1.3 pull-up.
 						const review = isReviewDispatch(routing);
-						if (review) routing = route(classification, effectiveStakes(brief, workloadStakes));
+						if (review) routing = reviewRouting(route(classification, effectiveStakes(brief, workloadStakes)));
 						return {
 							item,
 							index,

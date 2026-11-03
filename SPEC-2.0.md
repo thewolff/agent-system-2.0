@@ -582,7 +582,7 @@ fable time?"* exposed that A1.2/A1.3 had left the stakes→cap table unset.
 | Stakes | Tier cap | Review before merge | Jo's part |
 |---|---|---|---|
 | throwaway | fast | none | none |
-| normal | strong | a *judge* slice (runs on strong under the cap); merge proceeds on pass | told in one line after the merge |
+| normal | strong | a *judge* slice (runs on standard, *Amended 2026-11-03 — normal judge reviews on standard*, below); merge proceeds on pass | told in one line after the merge |
 | production | deep | a *judge* slice on deep, **then Jo** | Jo's `train` word on the PR is his approval of the merge: the train merges it once green with its review passed and tells him in one line after (*Amended 2026-10-20*, below); the deploy is a separate reserved one-liner (A4) |
 
 So fable is spent only on production workloads' judge slices and on anything Jo raises. A judge
@@ -821,6 +821,22 @@ built in wl-mv71x5rwdu7eo0). The strong row's OpenAI entry in `profile/config.ym
 OpenAI review, on deep and on strong, runs gpt-6.1-sol, and so does an OpenAI lane's strong build.
 Cross-lab review and the same-lab fallback are unchanged; no other row changes, so gpt-6.1-sol sits
 in one tier. A lane Jo named on a model keeps that model.
+
+**Amended 2026-11-03 — normal judge reviews on standard** (PLAN wl-mv71x5rwdu7eo0, `PLAN-p2-rev4.md` § 2.3, and
+revision 3's § 2.3 it keeps; Jo, ledger input `in-mv71x8ghxo114w`; plan approved in question `q-mv92mqghg2ax34`).
+A **judge-kind** dispatch runs on its review tier, by its effective stakes: **normal on standard**, **throwaway on
+fast**, **production on deep**; with no stakes it keeps deep, as before. `reviewTier` and `reviewRouting` in
+`classifier/src/route.ts` set it after the routing chain, and the move is recorded as the pull-down
+(`routings.pull_down_to`).
+- **Judge kind only.** It overrides the stakes cap (the table above) for judge kind only and lowers no cap for any
+  other kind. A low-confidence dispatch pulled up because judge is one of its two likeliest kinds (§ A1.3) keeps its
+  pull-up and the cap, so at normal stakes it still runs on strong.
+- **OpenAI reviewer.** The OpenAI reviewer is the strong row's OpenAI entry (`openai-codex/gpt-6.1-sol`) at every
+  review tier: `reviewRow` replaces the OpenAI entries of the fast, standard and deep rows by the strong row's (the
+  *Amended 2026-10-12 — OpenAI reviews on gpt-6-sol* rule, which covered deep only, widened to every tier other than
+  strong). Other labs' entries keep their tier's row.
+- **Unchanged.** Cross-lab review, production fan-out, the review park and the same-lab fallback, and the review round
+  limit are unchanged; they read the review's new tier.
 
 ### B5 · Jo steering a lane, and Jo coding manually (P-8, P-13, P-17)
 
