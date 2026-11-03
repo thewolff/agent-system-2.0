@@ -10,7 +10,9 @@
 // that part with the error; every other part still runs.
 //
 // Parts: `job:<name>` and `deps:<name>` per row of JOB_INVENTORY, `job-inventory`, `ctx`, `ledger`, `backup`, `seat`,
-// `mailbox`, `gh`, `disk`, `mcp`. The pass rules are PLAN.md's table ("Parts, probes and pass rules").
+// `mailbox`, `gh`, `disk`, `mcp`. The pass rules are PLAN.md's table ("Parts, probes and pass rules"). Off macOS
+// (`DoctorDeps.platform`), every `job:<name>` is `not installed` with NOT_MACOS_JOB_LINE before any plist or launchctl
+// read: install.sh writes no launchd job there.
 //
 // Alerts (PLAN "Alerts"). Episodes: the tick's ctx part strikes once, then goes down on the second failing pass in a row;
 // the after-restart run opens a down for each failing part once per boot; any run clears a part it sees pass with `up`.
@@ -130,7 +132,7 @@ export const LABEL_PREFIX = "com.agent-system-2.";
  *   print`), plutil (readPlist), dscl (the own-home probe), ctx (checkCtx), gh (checkGh), df (checkDisk), sysctl
  *   (currentBoot), ps (psRun: ownStart, ownerState; surface/scripts/invariants.ts orchestratorsFromPs for checkSeat), pgrep
  *   (orchestratorsFromPs), osascript (surface/src/notify.ts realNotify, the ledger-down banner), mktemp and rm
- *   (install/drive-backup/quiet-alarm.zsh: `mktemp -t quiet-alarm`, `rm -f "$errfile"`, through notify.ts alarmPopup).
+ *   (install/drive-backup/quiet-alarm.zsh: `mktemp "${TMPDIR:-/tmp}/quiet-alarm.XXXXXX"`, `rm -f "$errfile"`, through notify.ts alarmPopup).
  *   Absolute: /bin/zsh (alarmPopup), and quiet-alarm.zsh's defaults /usr/bin/osascript, /usr/bin/afplay, /usr/bin/say.
  *   The popup process (`doctor.ts --popup`, spawnPopupProcess, with the run's env) is process.execPath, the job's own bun.
  * - phoenix: /bin/bash install/phoenix-run.sh: `dirname` by name; /bin/date, /bin/sleep, /usr/sbin/lsof, /usr/bin/sed;
@@ -257,6 +259,8 @@ export interface DoctorDeps {
 	/** This checkout: install/*.plist and install/drive-backup/quiet-alarm.zsh. */
 	repo: string;
 	ledgerPath: string;
+	/** The host platform (realDeps: process.platform). Off "darwin" every launchd job row is not installed, unread. */
+	platform: NodeJS.Platform;
 	/** This process. */
 	pid: number;
 	alive: (pid: number) => boolean;
@@ -386,6 +390,9 @@ function phoenixSetting(deps: DoctorDeps): { ok: true; value: string } | { ok: f
 	}
 }
 
+/** A launchd job row's line off macOS: install.sh writes no launchd job there (steps 4, 6e and 6f skip, the opt-in job flags are refused). */
+export const NOT_MACOS_JOB_LINE = "not installed: not macOS (launchd jobs are macOS only; install.sh writes none here)";
+
 /** Whether a missing plist fails: `required`, or the line a not-installed job prints. */
 function expectation(deps: DoctorDeps, row: JobRow): { required: true; note: string } | { required: false; line: string } {
 	const e = row.expected;
@@ -414,6 +421,7 @@ export function checkJob(deps: DoctorDeps, row: JobRow): PartResult[] {
 	const plistPath = installedPlist(deps.home, row);
 	const reinstall = reinstallOf(row, deps.repo);
 	const bootstrap = `run in your own Terminal (agent shells get "Bootstrap failed: 5"): launchctl bootstrap gui/$(id -u) ${plistPath}`;
+	if (deps.platform !== "darwin") return [{ part, verdict: "not installed", evidence: NOT_MACOS_JOB_LINE, fix: "" }];
 	if (!deps.fs.exists(plistPath)) {
 		const x = expectation(deps, row);
 		if (!x.required) return [{ part, verdict: "not installed", evidence: x.line, fix: "" }];
@@ -1556,6 +1564,7 @@ export function realDeps(o: RealDepsOptions): DoctorDeps {
 		user: info.username,
 		repo: o.repo,
 		ledgerPath: o.ledgerPath,
+		platform: process.platform,
 		pid: process.pid,
 		alive: processAlive,
 		kill: killOwner,
