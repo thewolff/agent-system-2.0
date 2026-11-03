@@ -21,11 +21,17 @@
 // gives no 0 or 1), and are bootstrapped after a retention step line; a failed check load names the loaded nightly job;
 // --drive-backup=off boots both out and deletes both.
 // Installer runs never get the developer PATH (only `installPath`, fake launchctl first where needed), so none can reach a real herdr.
+// The installer's last step is the full as2 doctor (PLAN wl-mvwks11ye3x9zu F8): every run that can reach it has the doctor's
+// shared fakes (surface/test/fixtures/doctor-fakes) before the system directories on PATH and AS2_FAKE_STATE naming a healthy
+// fake machine (`fakeState`), so no run reaches the real launchctl, ctx, gh or osascript; a test's own fake launchctl (the
+// =off cases') answers from that state too (`LAUNCHD_PRE`, `LAUNCHD_POST`). The doctor cases at the end break one part each:
+// a job's last exit code 78, a stopped ctx daemon, and a failed bootstrap of the doctor job in this user's own home.
 // The fixture root is removed in afterAll only after every started test body completed; a failed run keeps it and prints its path.
 import { afterAll, beforeAll, describe, expect, test as bunTest } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { FAKES_DIR, fakeCalls, LEDGER_BACKUP_LABEL, launchctlPrint, plistPath, setFake, writeHealthyState } from "../../surface/test/fixtures/doctor-fakes/state";
 
 const REPO = join(import.meta.dir, "..", "..");
 const T = "\t";
@@ -38,15 +44,68 @@ let manifest: string;
 let original: string;
 let installPath: string;
 
-/** Run the scratch copy's installer the way a fresh machine would: PATH, a temp HOME, and `env`. */
-function install(label: string, env: Record<string, string> = {}): { exitCode: number; out: string; db: string; home: string } {
+const UID = process.getuid?.() ?? 0;
+
+/**
+ * The doctor's fake machine for the installer runs named `name` (made once; later runs under that name share it): the
+ * healthy state (writeHealthyState, its own fake files kept inside the state directory), except that ledger-backup is the
+ * job this install writes under `home`, loaded from that plist and not yet run, so the doctor judges it by the fresh
+ * mtime install gives the plist. Phoenix and the doctor job are not installed: HOME is not this user's home (fake dscl).
+ */
+function fakeState(name: string, home: string, ledger: string): string {
+	const state = join(root, `fakes-${name}`);
+	if (existsSync(state)) return state;
+	writeHealthyState({ state, home: join(state, "healthy-home"), repo: copy, seatPid: process.pid, bun: process.execPath });
+	const log = join(dirname(ledger), "ledger-backup.log");
+	setFake(state, `plutil/${LEDGER_BACKUP_LABEL}.plist.json`, JSON.stringify({
+		Label: LEDGER_BACKUP_LABEL,
+		ProgramArguments: [process.execPath, "run", join(copy, "ledger", "scripts", "backup.ts")],
+		StartInterval: 3600,
+		StandardOutPath: log,
+		StandardErrorPath: log,
+		EnvironmentVariables: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+	}));
+	setFake(state, `launchctl/${LEDGER_BACKUP_LABEL}`, launchctlPrint({ label: LEDGER_BACKUP_LABEL, path: plistPath(home, LEDGER_BACKUP_LABEL), log, runs: 0, exit: "never" }));
+	return state;
+}
+
+/**
+ * The first lines of a test's own fake launchctl, so it and the closing doctor see one launchd when AS2_FAKE_STATE is
+ * set (the =off cases run without it and skip both blocks): `print` of a label the state holds answers from the shared
+ * fake, and `bootstrap` stores the plist's JSON for the shared fake plutil (the plist exists whether or not it loads).
+ */
+const LAUNCHD_PRE = [
+	'if [ -n "${AS2_FAKE_STATE:-}" ]; then',
+	'\tcase "$1" in',
+	`\t\tprint) [ ! -e "$AS2_FAKE_STATE/launchctl/\${2##*/}" ] || exec '${join(FAKES_DIR, "launchctl")}' "$@" ;;`,
+	'\t\tbootstrap) mkdir -p "$AS2_FAKE_STATE/plutil" && /usr/bin/plutil -convert json -o "$AS2_FAKE_STATE/plutil/${3##*/}.json" "$3" || exit 1 ;;',
+	"\tesac",
+	"fi",
+];
+/** The last lines: a `bootstrap` that got this far loads the label from its plist, not yet run; `bootout` unloads it. */
+const LAUNCHD_POST = [
+	'if [ -n "${AS2_FAKE_STATE:-}" ]; then',
+	'\tcase "$1" in',
+	'\t\tbootout) rm -f "$AS2_FAKE_STATE/launchctl/${2##*/}" ;;',
+	'\t\tbootstrap) l="${3##*/}"; l="${l%.plist}"; log="$(/usr/bin/plutil -extract StandardOutPath raw -o - "$3")" || exit 1; mkdir -p "$AS2_FAKE_STATE/launchctl"',
+	"\t\t\tprintf 'gui/%s/%s = {\\n\\tpath = %s\\n\\tstate = not running\\n\\tstdout path = %s\\n\\truns = 0\\n\\tlast exit code = (never exited)\\n}\\n' \"$(id -u)\" \"$l\" \"$3\" \"$log\" >\"$AS2_FAKE_STATE/launchctl/$l\" ;;",
+	"\tesac",
+	"fi",
+];
+
+/** The closing doctor's `launchctl print` calls: ledger-backup, then each installed job of `labels` (inventory order). */
+const doctorPrints = (...labels: string[]) => [LEDGER_BACKUP_LABEL, ...labels].map((l) => `print gui/${UID}/${l}`);
+
+/** Run the scratch copy's installer the way a fresh machine would: PATH, a temp HOME, the doctor's fake machine, and `env`. */
+function install(label: string, env: Record<string, string> = {}): { exitCode: number; out: string; db: string; home: string; state: string } {
 	const home = join(root, `home-${label}`);
 	mkdirSync(home, { recursive: true });
 	const db = env.AGENT_SYSTEM_LEDGER_DB ?? join(home, ".agent-system-2", "ledger.db");
+	const state = env.AS2_FAKE_STATE ?? fakeState(label, home, db);
 	const r = Bun.spawnSync(["bash", join(copy, "install", "install.sh")], {
-		env: { PATH: installPath, HOME: home, ...env }, stdout: "pipe", stderr: "pipe",
+		env: { PATH: installPath, HOME: home, AS2_FAKE_STATE: state, ...env }, stdout: "pipe", stderr: "pipe",
 	});
-	return { exitCode: r.exitCode ?? -1, out: r.stdout.toString() + r.stderr.toString(), db, home };
+	return { exitCode: r.exitCode ?? -1, out: r.stdout.toString() + r.stderr.toString(), db, home, state };
 }
 
 /** Every scheduled copy under the ledger's backups/ root, whatever its namespace directory. */
@@ -79,9 +138,14 @@ const counted = (body: Body) => async () => {
 	await body();
 	finished += 1;
 };
-const test = Object.assign((name: string, body: Body, timeout?: number) => bunTest(name, counted(body), timeout), {
-	if: (cond: boolean) => (name: string, body: Body, timeout?: number) => bunTest.if(cond)(name, counted(body), timeout),
-	skipIf: (cond: boolean) => (name: string, body: Body, timeout?: number) => bunTest.skipIf(cond)(name, counted(body), timeout),
+/**
+ * Every installer run now ends in the full as2 doctor (PLAN wl-mvwks11ye3x9zu F8), so a test that installs three times runs
+ * past bun's 5 s default; this bound is a hang guard, not a measured wait, and no assertion depends on it.
+ */
+const TEST_TIMEOUT_MS = 60_000;
+const test = Object.assign((name: string, body: Body, timeout = TEST_TIMEOUT_MS) => bunTest(name, counted(body), timeout), {
+	if: (cond: boolean) => (name: string, body: Body, timeout = TEST_TIMEOUT_MS) => bunTest.if(cond)(name, counted(body), timeout),
+	skipIf: (cond: boolean) => (name: string, body: Body, timeout = TEST_TIMEOUT_MS) => bunTest.skipIf(cond)(name, counted(body), timeout),
 });
 
 afterAll(() => {
@@ -92,13 +156,14 @@ afterAll(() => {
 beforeAll(() => {
 	root = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "ledger-install-"));
 	// Do not inherit herdr/ctx from the developer's PATH: installer runs must never register a real
-	// plugin. Only Bun and system utilities are needed for these ledger/manifest tests.
+	// plugin. Bun, the doctor's shared fakes (first: its ctx, gh, launchctl, osascript and the rest) and system
+	// utilities are all these ledger/manifest tests need.
 	const bin = join(root, "bin");
 	mkdirSync(bin);
 	symlinkSync(process.execPath, join(bin, "bun"));
-	installPath = `${bin}:/usr/bin:/bin`;
+	installPath = `${FAKES_DIR}:${bin}:/usr/bin:/bin`;
 	expect(Bun.which("herdr", { PATH: installPath })).toBeNull();
-	expect(Bun.which("ctx", { PATH: installPath })).toBeNull();
+	for (const tool of ["ctx", "gh", "launchctl", "osascript", "plutil", "dscl"]) expect(Bun.which(tool, { PATH: installPath })).toBe(join(FAKES_DIR, tool));
 	copy = join(root, "repo");
 	for (const dir of MANIFEST_DIRS) cpSync(join(REPO, dir), join(copy, dir), { recursive: true });
 	for (const d of MANIFEST_DIRS) {
@@ -112,12 +177,23 @@ beforeAll(() => {
 });
 
 describe("install: the baseline copy installs", () => {
-	test("exit 0; ledger created; the first scheduled copy is taken by install (S2 ownership)", () => {
+	test("exit 0; ledger created; the first scheduled copy is taken by install (S2 ownership); the closing doctor passes against the fakes", () => {
 		const r = install("baseline");
 		expect(r.out).toContain("install complete");
 		expect(r.exitCode).toBe(0);
 		expect(existsSync(r.db)).toBe(true);
 		expect(copiesOf(r.db).length).toBe(1);
+		expect(r.out).toMatch(/^as2 doctor: \d+ pass, 0 fail, /m);
+		expect(r.out.search(/^as2 doctor: \d+ pass/m)).toBeLessThan(r.out.indexOf("install complete"));
+		expect(r.out).toContain(`==> doctor job: HOME (${r.home}) is not this user's home directory (/Users/someone-else), so the doctor job is not installed`);
+		expect(existsSync(plistPath(r.home, "com.agent-system-2.doctor"))).toBe(false);
+		// Every probe reached the fakes: the doctor's own and install's ctx registration.
+		const calls = fakeCalls(r.state);
+		expect(calls).toContain(`launchctl print gui/${UID}/${LEDGER_BACKUP_LABEL}`);
+		expect(calls).toContain("ctx daemon status --format json");
+		expect(calls.some((c) => c.startsWith("ctx sources add --provider pi"))).toBe(true);
+		expect(calls.some((c) => c.startsWith("dscl . -read "))).toBe(true);
+		expect(calls.filter((c) => c.startsWith("launchctl ") && !c.startsWith("launchctl print "))).toEqual([]);
 	});
 });
 
@@ -136,7 +212,11 @@ describe("install: the tracing switch (wl-mv65t5d34lts00 PLAN.md § 8.1)", () =>
 		expect(linesOf(first.out, /^tracing:/)).toEqual([expect.stringMatching(/^tracing: no installed config at .*; the template's all is used$/)]);
 		expect(phoenixOf(first.home)).toBe("all");
 		// launchd has one gui/<uid> domain per user: an install into a temp HOME must not replace the real job.
-		if (process.platform === "darwin") expect(linesOf(first.out, /Phoenix/)).toEqual([expect.stringContaining(`==> Phoenix: HOME (${first.home}) is not this user's home directory`)]);
+		// The closing doctor agrees: Phoenix is not installed in a HOME that is not this user's own (its job:phoenix line).
+		if (process.platform === "darwin") {
+			expect(linesOf(first.out, /^==> .*Phoenix/)).toEqual([expect.stringContaining(`==> Phoenix: HOME (${first.home}) is not this user's home directory`)]);
+			expect(linesOf(first.out, /job:phoenix/)).toEqual([expect.stringMatching(/^- {4}job:phoenix: not installed: HOME \(.*\) is not this user's home/)]);
+		}
 		expect(existsSync(join(first.home, "Library", "LaunchAgents", "com.agent-system-2.phoenix.plist"))).toBe(false);
 
 		const config = configOf(first.home);
@@ -529,8 +609,8 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 	// The label install.sh boots out is the template's own Label.
 	const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(readFileSync(join(REPO, "install", "com.agent-system-2.chaos.plist"), "utf8"))?.[1] ?? "";
 	const service = `gui/${process.getuid?.() ?? 0}/${label}`;
-	// Only the fake launchctl and the system directories: no bun, no omp, no git, no ctx.
-	const systemPath = "/usr/bin:/bin";
+	// Only the doctor's fakes (its launchctl first, so no run reaches the real one) and the system directories: no bun, no omp, no git.
+	const systemPath = `${FAKES_DIR}:/usr/bin:/bin`;
 	// The real launchctl is /bin/launchctl on macOS; /usr/bin alone has dirname but no launchctl and no bun.
 	const noLaunchctlPath = "/usr/bin";
 
@@ -541,6 +621,8 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 	 * A fake launchctl that logs its argv. `print` answers from a flag file as launchd does (0 loaded;
 	 * 113 with "Could not find service" on stderr not), as fresh-machine-test.sh step 13's does, unless
 	 * `printFails` gives it another exit and stderr; `bootout` clears the flag, or exits `bootoutExit`.
+	 * With AS2_FAKE_STATE set (an install that reaches the closing doctor), LAUNCHD_PRE and LAUNCHD_POST keep
+	 * the doctor's fake state in step with it.
 	 */
 	function fakeLaunchctl(name: string, loaded: boolean, opts: { printFails?: [number, string]; bootoutExit?: number } = {}): { bin: string; calls: () => string[] } {
 		const dir = join(root, `chaos-off-${name}`);
@@ -556,10 +638,12 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		writeFileSync(join(bin, "launchctl"), [
 			"#!/bin/bash",
 			`printf '%s\\n' "$*" >>'${log}'`,
+			...LAUNCHD_PRE,
 			'case "$1" in',
 			`\tprint) ${print} ;;`,
 			`\tbootout) ${bootout} ;;`,
 			"esac",
+			...LAUNCHD_POST,
 			"",
 		].join("\n"));
 		chmodSync(join(bin, "launchctl"), 0o755);
@@ -725,24 +809,27 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 	// The lanes the tick launches inherit the plist's PATH, so the ctx MCP server in profile/mcp.json and the
 	// exit-time ctx index find `ctx` only when its directory is on it. Every tool is a fake in a directory of its own,
 	// and the run's PATH is built here, so neither a real ctx nor a real herdr leaks in from the developer's PATH.
-	/** Fakes for gh (logged in), omp and, unless `withCtx` is false, ctx; returns the run's PATH, ctx's directory and the fake launchctl's calls. */
+	// gh, ctx and osascript hand every call to the doctor's shared fakes, so the closing doctor's probes answer from
+	// AS2_FAKE_STATE; with ctx the doctor's fakes directory follows the tools (before the system directories) for the rest.
+	/** Fakes for gh (logged in), omp, osascript and, unless `withCtx` is false, ctx; returns the run's PATH, ctx's directory and the fake launchctl's calls. */
 	function tickTools(name: string, withCtx: boolean): { path: string; ctxDir: string; launchctlCalls: () => string[] } {
 		const dir = join(root, `train-tick-${name}`);
 		const tools = join(dir, "tools");
 		const ctxDir = join(dir, "ctx-bin");
 		mkdirSync(tools, { recursive: true });
 		mkdirSync(ctxDir, { recursive: true });
-		for (const tool of ["gh", "omp"]) {
-			writeFileSync(join(tools, tool), "#!/bin/bash\nexit 0\n");
+		const shared = (tool: string) => `#!/bin/bash\nexec '${join(FAKES_DIR, tool)}' "$@"\n`;
+		for (const [tool, body] of [["gh", shared("gh")], ["osascript", shared("osascript")], ["omp", "#!/bin/bash\nexit 0\n"]] as const) {
+			writeFileSync(join(tools, tool), body);
 			chmodSync(join(tools, tool), 0o755);
 		}
 		if (withCtx) {
-			writeFileSync(join(ctxDir, "ctx"), "#!/bin/bash\nprintf '%s\\n' \"fake ctx $*\"\n");
+			writeFileSync(join(ctxDir, "ctx"), shared("ctx"));
 			chmodSync(join(ctxDir, "ctx"), 0o755);
 		}
 		const launchctl = fakeLaunchctl(`train-tick-${name}`, false);
-		// bun alone, from the beforeAll's herdr- and ctx-free bin directory.
-		const path = `${launchctl.bin}:${tools}:${join(root, "bin")}:${ctxDir}:/usr/bin:/bin:/usr/sbin:/sbin`;
+		// bun alone, from the beforeAll's bin directory (which holds no herdr or ctx).
+		const path = `${launchctl.bin}:${tools}:${join(root, "bin")}:${ctxDir}:${withCtx ? `${FAKES_DIR}:` : ""}/usr/bin:/bin:/usr/sbin:/sbin`;
 		expect(Bun.which("herdr", { PATH: path })).toBeNull();
 		expect(Bun.which("ctx", { PATH: path })).toBe(withCtx ? join(ctxDir, "ctx") : null);
 		return { path, ctxDir, launchctlCalls: launchctl.calls };
@@ -753,7 +840,7 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		mkdirSync(home, { recursive: true });
 		const { path, ctxDir } = tickTools("ctx", true);
 		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--train-tick"], {
-			env: { PATH: path, HOME: home }, stdout: "pipe", stderr: "pipe",
+			env: { PATH: path, HOME: home, AS2_FAKE_STATE: fakeState("train-tick-ctx", home, join(home, ".agent-system-2", "ledger.db")) }, stdout: "pipe", stderr: "pipe",
 		});
 		const out = r.stdout.toString() + r.stderr.toString();
 		expect(out).toContain("train tick loaded");
@@ -791,7 +878,7 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		const plist = join(home, "Library", "LaunchAgents", `${reportLabel}.plist`);
 		const launchctl = fakeLaunchctl("daily-report-on", false);
 		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--daily-report"], {
-			env: { PATH: `${launchctl.bin}:${installPath}`, HOME: home, AGENT_SYSTEM_PROFILE: "as2-report-test" }, stdout: "pipe", stderr: "pipe",
+			env: { PATH: `${launchctl.bin}:${installPath}`, HOME: home, AGENT_SYSTEM_PROFILE: "as2-report-test", AS2_FAKE_STATE: fakeState("daily-report-on", home, join(home, ".agent-system-2", "ledger.db")) }, stdout: "pipe", stderr: "pipe",
 		});
 		const out = r.stdout.toString() + r.stderr.toString();
 		expect(out).toContain("daily report loaded: runs daily at 07:00 local time");
@@ -811,7 +898,8 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 			StandardErrorPath: log,
 		});
 		expect(existsSync(dirname(log))).toBe(true);
-		expect(launchctl.calls()).toEqual([`print ${reportService}`, `bootstrap gui/${process.getuid?.() ?? 0} ${plist}`]);
+		expect(launchctl.calls()).toEqual([`print ${reportService}`, `bootstrap gui/${UID} ${plist}`, ...doctorPrints(reportLabel)]);
+		expect(out).toMatch(/^pass job:daily-report: loaded, not yet run/m);
 	});
 
 	test("--daily-report=off boots the job out and deletes its plist before any install step, with no bun on PATH, and writes nothing else", () => {
@@ -866,12 +954,13 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 	const driveCheckService = `gui/${process.getuid?.() ?? 0}/${driveCheckLabel}`;
 	const driveDomain = `gui/${process.getuid?.() ?? 0}`;
 
-	/** Run the scratch copy's installer with `args` under a fresh temp HOME named after `name`. */
+	/** Run the scratch copy's installer with `args` under a fresh temp HOME named after `name`, against the doctor's fake machine for that HOME. */
 	function driveInstall(name: string, args: string[], path: string, env: Record<string, string> = {}) {
 		const home = join(root, `home-drive-backup-${name}`);
 		mkdirSync(home, { recursive: true });
+		const state = fakeState(`drive-backup-${name}`, home, join(home, ".agent-system-2", "ledger.db"));
 		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), ...args], {
-			env: { PATH: path, HOME: home, ...env }, stdout: "pipe", stderr: "pipe",
+			env: { PATH: path, HOME: home, AS2_FAKE_STATE: state, ...env }, stdout: "pipe", stderr: "pipe",
 		});
 		return { home, exitCode: r.exitCode ?? -1, out: r.stdout.toString() + r.stderr.toString() };
 	}
@@ -890,7 +979,8 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 	 * A fake launchctl that keeps one loaded flag per label (the shared fakeLaunchctl above keeps one for all), so
 	 * an =off run that stops two jobs sees each loaded until its own bootout. `bootstrap` marks the plist's label
 	 * loaded and says so on stdout (where install.sh's step lines go, so a test can order the two), or, for the
-	 * label `bootstrapFails` names, exits 5 as launchctl does when a bootstrap fails.
+	 * label `bootstrapFails` names, exits 5 as launchctl does when a bootstrap fails. LAUNCHD_PRE and LAUNCHD_POST keep
+	 * the doctor's fake state in step with it when AS2_FAKE_STATE is set.
 	 */
 	function driveLaunchctl(name: string, loaded: string[], opts: { bootstrapFails?: string } = {}): { bin: string; calls: () => string[] } {
 		const dir = join(root, `drive-backup-launchctl-${name}`);
@@ -902,11 +992,13 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		writeFileSync(join(bin, "launchctl"), [
 			"#!/bin/bash",
 			`printf '%s\\n' "$*" >>'${log}'`,
+			...LAUNCHD_PRE,
 			'case "$1" in',
 			`\tprint) [ -e '${dir}/loaded.'"\${2##*/}" ] || { printf '%s\\n' 'Bad request.' "Could not find service \\"\${2##*/}\\" in domain for user gui: 501" >&2; exit 113; } ;;`,
 			`\tbootout) rm -f '${dir}/loaded.'"\${2##*/}" ;;`,
 			`\tbootstrap) l="\${3##*/}"; l="\${l%.plist}"; printf 'fake launchctl: bootstrap %s\\n' "$l"; ${fails}: >'${dir}/loaded.'"$l" ;;`,
 			"esac",
+			...LAUNCHD_POST,
 			"",
 		].join("\n"));
 		chmodSync(join(bin, "launchctl"), 0o755);
@@ -930,7 +1022,7 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 			HOME: home,
 			PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
 		};
-		const common = { WorkingDirectory: copy, ProcessType: "Background", AbandonProcessGroup: true, RunAtLoad: false };
+		const common = { WorkingDirectory: copy, ProcessType: "Background", AbandonProcessGroup: true, MaterializeDatalessFiles: true, RunAtLoad: false };
 		const { nightly, check } = driveJobs(home);
 		expect(nightly).toEqual({
 			Label: driveLabel,
@@ -956,6 +1048,7 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 			`bootstrap ${driveDomain} ${join(home, "Library", "LaunchAgents", `${driveLabel}.plist`)}`,
 			`print ${driveCheckService}`,
 			`bootstrap ${driveDomain} ${join(home, "Library", "LaunchAgents", `${driveCheckLabel}.plist`)}`,
+			...doctorPrints(driveLabel, driveCheckLabel),
 		]);
 	});
 
@@ -1020,6 +1113,7 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 			`print ${driveCheckService}`,
 			`bootout ${driveCheckService}`,
 			`bootstrap ${driveDomain} ${drivePlistOf(home, driveCheckLabel)}`,
+			...doctorPrints(driveLabel, driveCheckLabel),
 		]);
 	});
 
@@ -1055,15 +1149,22 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		expect(keepOf(home)).toBe("1");
 	});
 
-	test.if(process.platform === "darwin")("--drive-backup whose check job's bootstrap fails after the nightly job loaded exits 1 and names the nightly job as loaded with its AS2_KEEP_LOCAL", () => {
+	test.if(process.platform === "darwin")("--drive-backup whose check job's bootstrap fails after the nightly job loaded goes on: the line to run, then the doctor names the check job, exit 5", () => {
 		const launchctl = driveLaunchctl("check-bootstrap-fails", [], { bootstrapFails: driveCheckLabel });
 		const { home, exitCode, out } = driveInstall("check-bootstrap-fails", ["--drive-backup"], `${launchctl.bin}:${installPath}`, { AS2_KEEP_LOCAL: "1" });
 		const nightly = drivePlistOf(home, driveLabel);
 		const check = drivePlistOf(home, driveCheckLabel);
-		expect(out).toContain(`install: FAIL: launchctl bootstrap ${driveDomain} ${check} exited 5; the nightly job ${driveLabel} is loaded from ${nightly} with AS2_KEEP_LOCAL=1 (upload and prove, never delete), but the check job ${driveCheckLabel} did not load`);
-		expect(out).not.toContain("drive backup loaded:");
-		expect(exitCode).toBe(1);
-		expect(launchctl.calls()).toEqual([`print ${driveService}`, `bootstrap ${driveDomain} ${nightly}`, `print ${driveCheckService}`, `bootstrap ${driveDomain} ${check}`]);
+		const line = `==> run this in your own Terminal (zsh): launchctl bootstrap gui/$(id -u) ${check}`;
+		expect(out).toContain("Bootstrap failed: 5: Input/output error");
+		expect(out.split("\n").filter((l) => l.includes("run this in your own Terminal (zsh)"))).toEqual([`==> run this in your own Terminal (zsh): launchctl bootstrap gui/$(id -u) ${join(home, "Library", "LaunchAgents", `${LEDGER_BACKUP_LABEL}.plist`)}`, line]);
+		expect(out).toContain("drive backup nightly job loaded, check job written, not loaded (its bootstrap failed: run the line above): backup-nightly.zsh runs nightly at 02:30");
+		expect(out).not.toContain("install: FAIL:");
+		expect(out).toMatch(/^pass job:drive-backup: loaded, not yet run/m);
+		expect(out).toMatch(new RegExp(`^fail job:drive-backup-check: ${driveCheckLabel} is not loaded \\(${check.replace(/[.]/g, "\\.")} is installed\\)`, "m"));
+		expect(out).toContain("install incomplete: as2 doctor found failing parts (above)");
+		expect(out).not.toContain("install complete");
+		expect(exitCode).toBe(5);
+		expect(launchctl.calls()).toEqual([`print ${driveService}`, `bootstrap ${driveDomain} ${nightly}`, `print ${driveCheckService}`, `bootstrap ${driveDomain} ${check}`, ...doctorPrints(driveLabel, driveCheckLabel)]);
 	});
 
 	test("--drive-backup=off boots both drive-backup jobs out and deletes both plists before any install step, with no bun on PATH, and writes nothing else", () => {
@@ -1119,5 +1220,76 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 			expect(r.exitCode).toBe(2);
 		}
 		expect(tree(home)).toEqual([]);
+	});
+});
+
+describe("install: the closing as2 doctor decides install complete (PLAN wl-mvwks11ye3x9zu, install.sh F8)", () => {
+	const doctorLabel = "com.agent-system-2.doctor";
+
+	test("a required job whose last exit code is 78: the doctor names it, no install complete, exit 5", () => {
+		const home = join(root, "home-doctor-broken-job");
+		const db = join(home, ".agent-system-2", "ledger.db");
+		const state = fakeState("doctor-broken-job", home, db);
+		const plist = plistPath(home, LEDGER_BACKUP_LABEL);
+		setFake(state, `launchctl/${LEDGER_BACKUP_LABEL}`, launchctlPrint({ label: LEDGER_BACKUP_LABEL, path: plist, log: join(dirname(db), "ledger-backup.log"), runs: 1, exit: 78 }));
+		const r = install("doctor-broken-job");
+		expect(r.out).toMatch(new RegExp(`^fail job:ledger-backup: ${LEDGER_BACKUP_LABEL.replace(/[.]/g, "\\.")} last exit code 78$`, "m"));
+		expect(r.out).toMatch(/^as2 doctor: \d+ pass, 1 fail \(job:ledger-backup\), /m);
+		expect(r.out).toContain("==> install incomplete: as2 doctor found failing parts (above)");
+		expect(r.out).not.toContain("install complete");
+		expect(r.exitCode).toBe(5);
+		expect(fakeCalls(state)).toContain(`launchctl print gui/${UID}/${LEDGER_BACKUP_LABEL}`);
+	});
+
+	test("the ctx daemon not running, every job healthy: the doctor fails ctx, no install complete, exit 5", () => {
+		const home = join(root, "home-doctor-ctx-stopped");
+		const state = fakeState("doctor-ctx-stopped", home, join(home, ".agent-system-2", "ledger.db"));
+		setFake(state, "ctx.mode", "stopped");
+		const r = install("doctor-ctx-stopped");
+		expect(r.out).toMatch(/^fail ctx: the ctx daemon is not running \(\.daemon\.running = false\)$/m);
+		expect(r.out).toMatch(/^pass job:ledger-backup: /m);
+		expect(r.out).toMatch(/^as2 doctor: \d+ pass, 1 fail \(ctx\), /m);
+		expect(r.out).toContain("==> install incomplete: as2 doctor found failing parts (above)");
+		expect(r.out).not.toContain("install complete");
+		expect(r.exitCode).toBe(5);
+		expect(fakeCalls(state)).toContain("ctx daemon status --format json");
+	});
+
+	test.if(process.platform === "darwin")("in this user's own home the doctor job's bootstrap fails (Bootstrap failed: 5): the one line to run, the install goes on to the doctor, which names the job; exit 5", () => {
+		const home = join(root, "home-doctor-bootstrap-fails");
+		const state = fakeState("doctor-bootstrap-fails", home, join(home, ".agent-system-2", "ledger.db"));
+		// HOME is this user's own home (fake dscl), with tracing off so install leaves Phoenix alone (6e).
+		setFake(state, "dscl.home", home);
+		setFake(home, join(".omp", "profiles", "agent-system-2", "agent", "config.yml"), "observability:\n  phoenix: off\n");
+		// A launchctl whose bootstrap fails as an agent shell's does; everything else goes to the doctor's shared fake.
+		const bin = join(root, "doctor-bootstrap-fails-bin");
+		mkdirSync(bin, { recursive: true });
+		writeFileSync(join(bin, "launchctl"), [
+			"#!/bin/bash",
+			...LAUNCHD_PRE,
+			'[ "$1" != bootstrap ] || { printf \'launchctl %s\\n\' "$*" >>"$AS2_FAKE_STATE/calls.log"; echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }',
+			`exec '${join(FAKES_DIR, "launchctl")}' "$@"`,
+			"",
+		].join("\n"));
+		chmodSync(join(bin, "launchctl"), 0o755);
+		const r = install("doctor-bootstrap-fails", { PATH: `${bin}:${installPath}` });
+		const plist = plistPath(home, doctorLabel);
+		expect(r.out).toContain("Bootstrap failed: 5: Input/output error");
+		expect(r.out).toContain(`==> run this in your own Terminal (zsh): launchctl bootstrap gui/$(id -u) ${plist}\n`);
+		expect(r.out).toContain(`==> doctor job written, not loaded (its bootstrap failed: run the line above): as2 doctor --after-restart at load and every 10 minutes`);
+		// The job is written: it lints and runs the doctor after a restart, every 600 s, with a PATH reaching each of its probes.
+		expect(Bun.spawnSync(["/usr/bin/plutil", "-lint", plist]).exitCode).toBe(0);
+		const job = JSON.parse(Bun.spawnSync(["/usr/bin/plutil", "-convert", "json", "-o", "-", plist]).stdout.toString());
+		expect(job).toMatchObject({ Label: doctorLabel, ProgramArguments: [join(root, "bin", "bun"), join(copy, "surface", "scripts", "doctor.ts"), "--after-restart"], RunAtLoad: true, StartInterval: 600 });
+		// Each directory once, in the order the doctor row's pathNames first reach it (ctx, from the fakes, comes first).
+		expect(job.EnvironmentVariables.PATH).toBe(`${FAKES_DIR}:${bin}:/usr/bin:/bin:/usr/sbin:/sbin`);
+		// The install went on: the doctor ran and names the job, and only the job.
+		expect(r.out).toMatch(new RegExp(`^fail job:doctor: ${doctorLabel.replace(/[.]/g, "\\.")} is not loaded \\(${plist.replace(/[.]/g, "\\.")} is installed\\)$`, "m"));
+		expect(r.out).toMatch(/^as2 doctor: \d+ pass, 1 fail \(job:doctor\), /m);
+		expect(r.out).toContain("==> install incomplete: as2 doctor found failing parts (above)");
+		expect(r.out).not.toContain("install complete");
+		expect(r.out).not.toContain("install: FAIL:");
+		expect(r.exitCode).toBe(5);
+		expect(fakeCalls(state)).toEqual(expect.arrayContaining([`launchctl bootstrap gui/${UID} ${plist}`, `launchctl print gui/${UID}/${doctorLabel}`]));
 	});
 });

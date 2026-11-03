@@ -13,7 +13,8 @@
 // 6. `security-red` (PLAN wl-mvg1vs0rhnu3gg § 3.3): a run with a failing security test, whatever holds the workload;
 // 7. a `question` or `reserved` line with state `now` (PLAN wl-mvg1vs0rhnu3gg § 1.0–1.3, surface/src/errors.ts): a
 //    question a valid `now:` control entry marks, or a reserved request whose rule is in NOW_RESERVED;
-// 8. `scratch` for the daily sweep's `scratch-disk:` (§ 1.1: a full disk); a lane's over-cap line is not.
+// 8. `scratch` for the daily sweep's `scratch-disk:` (§ 1.1: a full disk); a lane's over-cap line is not;
+// 9. `quota-move` and `quota-move-alert` (PLAN wl-mvwk0v0gmp6cjc D4): a lane or hand moved off a lab, and its alert failing.
 // Everything else waits for the window: every other `notice` line (surface/src/notice.ts), and every other question and
 // reserved request (a blind "not known until it runs" one among them).
 import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
@@ -60,6 +61,8 @@ export function onFire(ledger: Ledger, line: ErrorLine): boolean {
 		}
 		case "test-run":
 		case "security-red":
+		case "quota-move":
+		case "quota-move-alert":
 			return true;
 		case "question":
 		case "reserved":

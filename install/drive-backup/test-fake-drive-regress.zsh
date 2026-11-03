@@ -3,8 +3,11 @@
 # only a receipt replaces it. Two proof timeouts, two proof errors, and a copy that fails after its bytes landed
 # followed by an existence check that fails; each time the uploader (or Drive) recovers and the third night proves
 # the ORIGINAL envelope copy, with exactly one copy on the fake Drive. Nothing is deleted in this part
-# (AS2_REPROVE_AFTER is far away). The single-archive cases are in test-fake-drive-regress-single.zsh.
-# Setup: fake-drive-fixture.zsh.
+# (AS2_REPROVE_AFTER is far away). The failed copy is staged on the Drive folder (copy_fails_after_landing: cp's
+# extended-attribute step is refused on the new file), so it holds for the job-built envelope whether or not files
+# carry com.apple.provenance (Jo's Mac does, GitHub's hosted macOS runner does not); the setup is checked first and a
+# Mac where cp still exits 0 there fails C's setup check by name. The single-archive cases are in
+# test-fake-drive-regress-single.zsh. Setup: fake-drive-fixture.zsh.
 #   zsh test-fake-drive-regress.zsh        prints PASS/FAIL lines, ends with "RESULT: <n> failure(s)", exits n
 emulate -L zsh
 setopt no_unset pipe_fail extended_glob
@@ -40,7 +43,7 @@ check "B night 3: the original envelope copy is proven; no new upload; exactly o
 
 print "\n### C: an envelope's copy lands but cp fails; the next night the recorded path's existence check fails; the third night proves the same copy"
 TODAY=$(strftime '%Y-%m-%d' $EPOCHSECONDS); DD=$SA/$TODAY   # the folder tonight's envelope goes to (the job's TODAY)
-copy_fails_after_landing "$DD"
+check "C setup: tonight's Drive folder lands a copy's bytes and then fails cp, also for a source with no extended attribute" 'copy_fails_after_landing "$DD"'
 mk $ARCH/2026-11-03/wl-c1.tar.gz 100; mk $ARCH/2026-11-03/wl-c2.tar.gz 200
 upmode off
 # timing-under-test: proof deadline, AS2_PROOF_TIMEOUT=2 (fake clock: AS2_CLOCK_CMD)

@@ -16,7 +16,8 @@
  * - A limit binds a selector when the provider matches and its tier is null or the model id contains the tier
  *   (`fable` binds `anthropic/claude-fable-*` only; Fable's meter never takes Opus out).
  * - Out: a binding non-advisory pace projection ≥ 1.0, a binding 5h limit with `u > FIVE_HOUR_CEILING`, or an
- *   exhausted known week with a future reset even before warm-up. A passed reset binds nothing.
+ *   exhausted known week with a future reset even before warm-up. A passed reset binds nothing. The decision's
+ *   `exhausted` names that week whenever it binds, even when another limit refused first (a build hand moves lab on it).
  * - Old poll lines (no `limits`) read their `rows` keys as limits with no reset time, so only the 5h rule applies.
  *   A third key segment is a tier unless it is a meter name in `METERS` (`openai-codex/7d/chat` is the shared meter).
  *   An unknown third segment read as a tier binds only models whose id contains it, so a misread fails open.
@@ -67,6 +68,11 @@ export interface HeadroomDecision {
 	out: string | null;
 	/** Exceptional admission explanation, never a destination or spawn authorization. */
 	retained: string | null;
+	/**
+	 * Reason text of a binding known week that is exhausted with a future reset, whatever limit refused first (`out`
+	 * keeps its own wording and precedence). Null for a week-pace-only out, a fail-open read and a retained decision.
+	 */
+	exhausted: string | null;
 }
 
 export interface Headroom {
@@ -157,7 +163,7 @@ function bindingLimits(poll: Poll, selector: string): Limit[] {
 export function headroom(opts: { path?: string; now?: number; lines?: string[] } = {}): Headroom {
 	const now = opts.now ?? Date.now();
 	const path = opts.path ?? (process.env.AS2_HEADROOM_POLLS || DEFAULT_POLLS);
-	const open = (note: string): Headroom => ({ decisionFor: () => ({ out: null, retained: null }), anthropicWeek: null, note });
+	const open = (note: string): Headroom => ({ decisionFor: () => ({ out: null, retained: null, exhausted: null }), anthropicWeek: null, note });
 
 	let lines = opts.lines;
 	if (!lines) {
@@ -235,11 +241,12 @@ export function headroom(opts: { path?: string; now?: number; lines?: string[] }
 				out ??= refusal.reason;
 				if (!refusal.weekPaceOnly) weekPaceOnly = false;
 			}
+			const exhaustedText = exhausted === null
+				? null
+				: `${exhausted.provider} ${exhausted.windowId}${exhausted.tier ? ` ${exhausted.tier}` : ""} ${pct(exhausted.used)} used, quota exhausted`;
 			// Exhaustion closes only the week warm-up gap; keep the first existing ordinary refusal and its wording.
-			if (out === null && exhausted !== null) {
-				out = `${exhausted.provider} ${exhausted.windowId}${exhausted.tier ? ` ${exhausted.tier}` : ""} ${pct(exhausted.used)} used, quota exhausted`;
-			}
-			const base = { out, retained: null };
+			if (out === null && exhaustedText !== null) out = exhaustedText;
+			const base = { out, retained: null, exhausted: exhaustedText };
 			if (out === null || !weekPaceOnly || !older) return base;
 			const sourceLab = labOf(selector);
 			if (sourceLab === null) return base;
@@ -256,6 +263,7 @@ export function headroom(opts: { path?: string; now?: number; lines?: string[] }
 			return {
 				out: null,
 				retained: `retained ${selector}: ${out}; ${comparator} recent pressure ${pointsPerHour(comparatorPressure)} pts/h > source ${pointsPerHour(sourcePressure)} pts/h over ${spanMin} min`,
+				exhausted: null,
 			};
 		},
 	};

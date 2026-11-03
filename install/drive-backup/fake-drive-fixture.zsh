@@ -268,9 +268,29 @@ env_copies() { print -rl -- "$SA"/*/${1:t:r}.*.tar(N) | grep -c . }             
 arch_copies() { print -rl -- "$SA"/${1:h}/${${1:t}%.tar.gz}.*.tar.gz(N) | grep -c . }   # <date>/<name>: its copies on Drive
 fail_step() { jq -r --arg p "$1" '.failures[] | select(.path == $p or (.path | endswith($p))) | .step' $T/state/last-run.json }
 fail_text() { jq -r --arg p "$1" '.failures[] | select(.path == $p or (.path | endswith($p))) | .error' $T/state/last-run.json }
-# A Drive folder a copy can land in while cp still fails: every new file in it inherits an entry that denies writing
-# its attributes, so cp writes all the bytes and then exits 1 ("could not copy extended attributes").
-copy_fails_after_landing() { mkdir -p "$1" && /bin/chmod +a "everyone deny writeattr,writeextattr,writesecurity,file_inherit" "$1" }
+# A Drive folder a copy can land in while cp still fails: every new file in it inherits an entry that denies reading
+# and writing its extended attributes and writing its other attributes. /bin/cp -n writes all the bytes, then its
+# extended-attribute step (copyfile lists the new file's attributes before it copies the source's) is refused, and cp
+# exits 1 ("could not copy extended attributes ... Permission denied"). The refused read of the new file is what makes
+# this hold for a source with no extended attribute at all: on GitHub's hosted macOS runner files carry no
+# com.apple.provenance, and with writeextattr alone denied cp failed only when the source had an attribute to copy.
+# Before it sets up <dir>, the helper stages the mechanism in a folder of its own under T with /usr/bin/true (a system
+# file, no extended attribute) as the source; when that cp exits 0 or the bytes do not land it prints why and
+# returns 1, so the caller's check fails naming the cause instead of a later night failing at the wrong step.
+COPY_FAILS_ACL="everyone deny readextattr,writeattr,writeextattr,writesecurity,file_inherit"
+copy_fails_after_landing() { # <dir>
+  local p o rc=0
+  p=$(mktemp -d "$T/copy-fails-probe.XXXXXX") && /bin/chmod +a "$COPY_FAILS_ACL" "$p" \
+    || { print "copy_fails_after_landing: cannot set up its probe folder under $T"; return 1 }
+  o=$(/bin/cp -n -- /usr/bin/true "$p/true" 2>&1) || rc=$?
+  if (( rc == 0 )) || ! /usr/bin/cmp -s /usr/bin/true "$p/true"; then
+    print "copy_fails_after_landing: in $p, cp -n of /usr/bin/true exited $rc (${o:-no output}) and the bytes" \
+      "$( /usr/bin/cmp -s /usr/bin/true "$p/true" && print landed || print 'did not land')," \
+      "so this Mac does not stage a copy that lands and then fails; next step: find which part of cp's attribute step still succeeds here"
+    return 1
+  fi
+  mkdir -p "$1" && /bin/chmod +a "$COPY_FAILS_ACL" "$1" || { print "copy_fails_after_landing: cannot set up $1"; return 1 }
+}
 # A Drive folder whose entries do not answer a stat (permission denied): the existence check of a recorded copy fails
 stat_fails() { /bin/chmod -N "$1" && /bin/chmod +a "everyone deny search" "$1" }
 answers_again() { /bin/chmod -N "$1" }

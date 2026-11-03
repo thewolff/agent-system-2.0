@@ -6,11 +6,14 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { type Ledger, LANE_RUNNER_BY, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { closeWorkloadWithEntry } from "../extensions/workload";
 import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { recordRepo } from "../src/decision-log";
+import { consumeAllToOrchestrator } from "../src/delivery";
 import { errorLines } from "../src/errors";
+import { laneHeadroomBody } from "../src/launch";
+import { quotaMoveMessageId, recordQuotaMove } from "../src/quota-move-alert";
 import { securityRedBody } from "../src/test-run";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY, type SurfaceAPI } from "../src/types";
 import { clock, tempLedger, tmp } from "./helpers";
@@ -129,6 +132,41 @@ describe("close: held orchestrator-bound messages are delivered in the close tra
 		expect(shown[0]!.line).toContain("gates/test/rows.test.ts > refuses");
 		expect(heldLine(r.text)).toContain("held messages delivered at close (5):");
 		expect(heldLine(r.text)).not.toContain(security);
+	});
+
+	test("PLAN wl-mvwk0v0gmp6cjc D4 (code review r1 F3): a trusted quota move stays held through the real close, renders its NOW line, and the wake's consumer delivers it once; look-alikes are delivered at close", async () => {
+		const x = closable();
+		const [A, SOL, why] = ["anthropic/claude-opus-5-5", "openai-codex/gpt-6.1-sol", "anthropic 7d 0.95 used > 0.90"];
+		const laneMove = recordQuotaMove(x.ledger, { workloadId: x.wl, laneId: "lane-a-1", kind: "lane", from: A, to: SOL, reason: why, by: LANE_RUNNER_BY, eventBody: laneHeadroomBody("lane-a-1", A, SOL, why) });
+		const handSubject = "hand tok-7 (slice sl-b) of lane lane-a-1";
+		const handMove = recordQuotaMove(x.ledger, {
+			workloadId: x.wl, laneId: "lane-a-1", kind: "hand", token: "tok-7", slice: "sl-b", from: A, to: SOL, reason: why, by: "lane-a-1",
+			eventBody: `hand-headroom: ${handSubject} ${A} -> ${SOL} (${why})`,
+		});
+		// Look-alikes: a lane's plain message with a move's body, a hand move written by a lane other than the one it names, and a lane move not by the lane runner.
+		const plain = x.ledger.enqueue({ by: "lane-a-1", workloadId: x.wl, sender: "lane-a-1", recipient: ORCHESTRATOR_RECIPIENT, body: x.ledger.message(quotaMoveMessageId(laneMove))!.body });
+		const otherLane = recordQuotaMove(x.ledger, {
+			workloadId: x.wl, laneId: "lane-y", kind: "hand", token: "tok-9", slice: "sl-b", from: A, to: SOL, reason: why, by: "lane-x",
+			eventBody: `hand-headroom: hand tok-9 (slice sl-b) of lane lane-y ${A} -> ${SOL} (${why})`,
+		});
+		const notRunner = recordQuotaMove(x.ledger, { workloadId: x.wl, laneId: "lane-a-1", kind: "lane", from: A, to: SOL, reason: "forged", by: "lane-a-1", eventBody: laneHeadroomBody("lane-a-1", A, SOL, "forged") });
+		const trusted = [laneMove, handMove].map(quotaMoveMessageId);
+		const lookAlikes = [plain, quotaMoveMessageId(otherLane), quotaMoveMessageId(notRunner)];
+
+		const r = await close(x);
+
+		expect(r.closed).toBe(true);
+		expect(states(x, trusted)).toEqual(["held", "held"]);
+		expect(states(x, lookAlikes)).toEqual(["delivered", "delivered", "delivered"]);
+		expect(heldLine(r.text)).toContain("held messages delivered at close (3):");
+		for (const id of trusted) expect(heldLine(r.text)).not.toContain(id);
+		const nowLines = () => errorLines(x.ledger, undefined, { now: x.c.now(), movePidProbe: () => false }).filter((l) => l.kind === "quota-move").map((l) => l.line);
+		expect(nowLines()).toEqual([`NOW: lane lane-a-1 on ${x.wl} moved ${A} -> ${SOL} (${why})`, `NOW: ${handSubject} on ${x.wl} moved ${A} -> ${SOL} (${why})`]);
+		// The wake's consumer (surface/extensions/wake.ts renderWakeTurn) delivers both once; nothing renders them again.
+		expect(consumeAllToOrchestrator(x.ledger)).toBe(2);
+		expect(states(x, trusted)).toEqual(["delivered", "delivered"]);
+		expect(nowLines()).toEqual([]);
+		expect(consumeAllToOrchestrator(x.ledger)).toBe(0);
 	});
 
 	test("12 held messages: 10 listed in order, then `+2 more` by id", async () => {
