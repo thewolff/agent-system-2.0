@@ -1,8 +1,8 @@
 ---
 title: one loud alert path for every event that needs Jo
-status: in-progress
+status: building
 workload: wl-mw0vs9uc3xqtka
-pr: TBD
+pr: 445
 ---
 One alert pass, `surface/scripts/alert-tick.ts`, owns every Jo-directed alert. It runs every 5 minutes from the train tick, outside any LLM, and the writers of the urgent events (the runner in `surface/scripts/lane.ts`, the classifier in `classifier/extension.ts`) kick it at once. Plan: `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mw0vs9uc3xqtka/PLAN.md`. Guide: `USER-GUIDE.md`, section 3 (Jo's words `urgent`, `asap`, `calm`, `ack`) and section 4 (the ALERT line).
 
