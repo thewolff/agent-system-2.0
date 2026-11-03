@@ -70,7 +70,9 @@ describe("nowReserved over real refusals: § 1.2 guard bypasses and § 1.3 irrev
 		["rm -rf", "rm -r" + "f build"],
 		["a local branch deletion", "git branch -" + "D topic"],
 		["a local hard reset", "git reset --ha" + "rd"],
-		["gh api with a mutating method", "gh api -X DEL" + "ETE repos/o/r/labels/x"],
+		// PLAN wl-mvqwn80onq9hq8 D11: the label DELETE that stood here is on the ordinary gh api list and now runs
+		// (the test below); an off-list write (a ref DELETE) is § A4 and still waits.
+		["gh api with a mutating method", "gh api -X DEL" + "ETE repos/o/r/git/refs/heads/x"],
 	];
 	for (const [name, command] of waits) {
 		test(`waits for the window: ${name}`, () => {
@@ -79,6 +81,9 @@ describe("nowReserved over real refusals: § 1.2 guard bypasses and § 1.3 irrev
 			expect(nowReserved(b!)).toBeNull();
 		});
 	}
+	test("ordinary (D11): the label DELETE that waited before the floor raises nothing and runs", () => {
+		expect(checkReserved({ toolName: "bash", input: { command: "gh api -X DEL" + "ETE repos/o/r/labels/x" } }, ctx)).toBeNull();
+	});
 	test("an entry counts only whole: a longer phrase opening with one is not it", () => {
 		expect(nowReserved("deploy it")).toBeNull();
 		expect(nowReserved("deployment notes: x")).toBeNull();

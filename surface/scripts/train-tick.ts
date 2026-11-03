@@ -35,7 +35,18 @@
 //     `trainLaunchFailures`) a train gets no request and no launcher, one log line, and Jo's NOW (incident) question once per
 //     episode (`raiseLaunchLimit`, relaunch / stop, on the slice of its first non-terminal PR, so step 5 files its issue).
 //     An open question never stops the tick: every pass settles, delivers and wakes on every PR.
-//     Steps 3 and 4 request nothing for a workload stopped at its ceiling (`ceilingStopped`): no row, no launcher, a log line only.
+//     Steps 3 and 4 request nothing for a workload that is stopped: an open merge train by its daily budget (`trainBudgetGate`,
+//     PLAN wl-mvr888nftz0vcl D5; its `ceiling:` rows and any old ceiling stop are never read, so a train its old lane left at a
+//     ceiling or max-time relaunches, R12), any other workload at its ceiling (`ceilingStopped`): no row, no launcher, a log
+//     line only. The permanent train's wakes are `actionable`'s: a raise, midnight PDT, a cleared budget episode, Jo's stall
+//     `relaunch`, and a ready lane cut off by max-time or an old ceiling stop with a PR open (D6, D10, D13).
+// 4a. The permanent train's watch (PLAN wl-mvr888nftz0vcl D6, D8, D9, R21), before step 4, held live or not: bun's banner in
+//     each train run's live log (`<as2test root>/runs/<run id>/full.log`, else `fast.log`) becomes `test-run-started: <run>
+//     pr=<n> at <the log's birth time> seen <now>`; a one-day pause past its `until` has its unanswered question withdrawn and
+//     its budget slice completed; a meter error gets Jo's NOW relaunch / hold question; an earlier attempt's open full-suite slice
+//     whose run has a result is cancelled (review r1 F4); Jo's stall `relaunch` stops a live lane
+//     (a surface `lane-stop:`); and a waiting PR with no train progress for 3 h (`trainStall`) gets one NOW relaunch / ack
+//     question per episode on its slice, so step 5 files its issue.
 //  5. Alerts (D9). Each question on a train slice is an alert: the production merge question the lane raises and the failed-twice
 //     question of step 2. The send ladder (`trainAlertActions`): level 1 files an issue on TRAIN_ALERT_REPO labelled as2-train;
 //     4 h and 8 h after it, while the question is open and the issue is not closed, a comment mentioning @thewolff, the `loud`
@@ -80,7 +91,7 @@
 // next run; Jo is not alerted (a boarding or notice failure is logged in the tick's log only). The launcher is
 // `bun surface/scripts/lane.ts launch <wl> --requested-by merge-train`. Steps 3b-3e need the standing workload; without it they
 // are skipped and logged. Exit: 0 the pass ran (logged errors included), 1 the ledger could not be opened, 2 an argument was given.
-import { realpathSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { defaultLedgerPath, Ledger } from "../../ledger/src/index";
@@ -94,20 +105,24 @@ import {
 import { field, fileNotice, GhError, type GhResult, ghJsonOf, type IssueOps, issueNumber, issueOps } from "../src/jo-issues";
 import { attemptBlock, type ChainCommit, ghMainChain, INCONCLUSIVE, type MainState, mainResults, mainState, mainVerdicts } from "../src/main-state";
 import {
-	actionable, type AlertAction, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, carryPairs, checkoutOwnerRepo, type ControlRoot,
-	controlRootRefusal, everyTrain, expiredHolds, forkOf, forkTaskAlert, FULL_SUITE_STATUS, ghCompare, isTrainOrFix, type LandFirstEvent, landFirstNoticeBody, landFirstRepos, landFirstRows,
-	type Landing, landingPassOvers, landingReady, lastReadyExit, MAIN_RED_WINDOW_MS, MAIN_RETRY_MS, mainRedNoticeBody, mainRedNotices, mainRedRows, openTrainFix, openTrains, ownerDeliveries,
-	PROMOTE_ATTEMPTS, PROTECTION_UNKNOWN_RAISE_MS, protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState, protectionPassOvers, prStakes, raiseLaunchLimit,
-	raiseTwiceFailed, REPAIR_FAIL_MS, REVOKE_ATTEMPTS, settleTasks, stopEpisode, stopSummary, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER,
-	TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertActions, trainAlertBody, trainAlertEndBody, trainAlertMarker, trainAutoboardBody, trainBoardSkipBody, trainCheckout,
-	trainHeadWokenBody, TRAIN_LAUNCH_LIMIT, trainLaunchFailures, trainPrs, trainPushesOf, trainReconciledBody, trainRetries, trainSliceId, trainSlicePr, type TrainPush, type TrainTask,
-	trainWakeBody, twiceFailed, unsettledTasks,
+	actionable, type AlertAction, attemptOf, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, carryPairs, checkoutOwnerRepo, type ControlRoot,
+	controlRootRefusal, endPastPauseQuestions, everyTrain, expiredHolds, forkOf, forkTaskAlert, FULL_SUITE_STATUS, ghCompare, isTrainOrFix, type LandFirstEvent, landFirstNoticeBody, landFirstRepos,
+	landFirstRows, type Landing, landingPassOvers, landingReady, lastReadyExit, MAIN_RED_WINDOW_MS, MAIN_RETRY_MS, mainRedNoticeBody, mainRedNotices, mainRedRows, openTrainFix, openTrains, ownerBusy,
+	ownerDeliveries, ownerFreedAt, parseTrainSlice, PROMOTE_ATTEMPTS, prOwner, PROTECTION_UNKNOWN_RAISE_MS, protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState,
+	protectionPassOvers, prStakes, raiseLaunchLimit, raiseMeterErrorQuestions, raiseTrainStall, raiseTwiceFailed, REPAIR_FAIL_MS, retireSupersededFullSlices, REVOKE_ATTEMPTS, settleTasks,
+	stallRelaunchStops, stopEpisode, stopSummary, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, TRAIN_STALL_MS,
+	trainActivityArgs, trainAlertActions, trainAlertBody, trainAlertEndBody, trainAlertMarker, trainAutoboardBody, trainAttemptsOf, trainBoardSkipBody, trainCheckout, trainHeadWokenBody,
+	TRAIN_LAUNCH_LIMIT, trainLaunchFailures, trainPrs, trainPushesOf, trainReconciledBody, trainRetries, trainSliceId, trainStall, type TrainPush, type TrainTask, trainWakeBody, testRunStartedBody,
+	testRunStarts, twiceFailed, unsettledTasks, trainFixStakes,
 } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import { realNotify } from "../src/notify";
 import { sendNotice, TRAIN_SIGNOFF_APPLIED_PREFIX, trainMergedEntryBody, trainMergedNoticeBody } from "../src/notice";
 import { psMoveAlertProbe, quotaMoves, sigterm, spawnDetached, superviseMove, type SuperviseSeams } from "../src/quota-move-alert";
-import { type CompareResult, decisionLogFault, fastPlans, ownerRepoOf, type ResultRecord, runsRoot, type TestRunnerConfig, testRuns, withFullSuitePublication } from "../src/test-run";
+import {
+	AS2TEST_ROOT, type CompareResult, decisionLogFault, fastPlans, ownerRepoOf, type ResultRecord, runsRoot, type TestRunnerConfig, testRuns, withFullSuitePublication, workDirOf,
+} from "../src/test-run";
+import { trainBudgetGate } from "../src/train-budget";
 import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID } from "../src/types";
 
 export type { GhResult } from "../src/jo-issues";
@@ -140,6 +155,11 @@ export interface TickDeps {
 	config?: Pick<TestRunnerConfig, "repos">;
 	/** Land-first's seams; without them the main-run pass (step 3f) is skipped with one log line. `main()` always passes them. */
 	land?: LandDeps;
+	/**
+	 * The test executor's root (AS2TEST_ROOT, `/Users/Shared/as2test`), whose `runs/<run id>/full.log` (or `fast.log`) step 4a reads
+	 * for bun's banner (PLAN wl-mvr888nftz0vcl D8, R21); tests inject an isolated directory. Read only, never written.
+	 */
+	as2testRoot?: string;
 	/**
 	 * The move-alert supervisor's seams (step 6, PLAN wl-mvwk0v0gmp6cjc D4): the detached `lane.ts move-alert` spawn, the pid
 	 * probe and the SIGTERM sender; the clock is the ledger's. Omitted, the real ones (`main()` and every test with no move).
@@ -213,17 +233,27 @@ export function tick(d: TickDeps): string[] {
 	 * and the insert (review r2 F5); the launcher runs after it commits, as it takes its own reservation transaction. Returns
 	 * the launcher's exit code, whether this call wrote the request, the id of the request now pending (null when the train's
 	 * own cause was launched) and the workload's entry count before the launch. Null, with nothing written and no launcher,
-	 * when the workload is stopped at its ceiling (`ceilingStopped`, PLAN wl-mvgn310dpi5gcg D3) or the train's verdict refuses
-	 * with another reason; one line says which.
+	 * when the workload is stopped: an open merge train by its daily budget (`trainBudgetGate`: `budget-paused`,
+	 * `budget-decision` or `meter-error`, PLAN wl-mvr888nftz0vcl D5; a train's `ceiling:` rows and any old ceiling stop are
+	 * never read), any other workload at its ceiling (`ceilingStopped`, PLAN wl-mvgn310dpi5gcg D3); or when the train's verdict
+	 * refuses with another reason; one line says which.
 	 */
 	const request = (wl: string, reason: string): { code: number; wrote: boolean; requestId: string | null; before: number } | null => {
 		const entries = ledger.entries(wl);
 		const w = ledger.workload(wl);
 		const control = controlEntries(entries, holdersOf(entries, w?.holder ?? null, ledger.holders(wl)));
-		const stopped = w ? ceilingStopped(control, ledger.instructions(wl), w.stakes) : null;
-		if (stopped) {
-			say(`${wl}: launch (${reason}) not requested: stopped at its ceiling usd ${stopped.spend.usd} of ${stopped.ceiling.usd}`);
-			return null;
+		if (openTrains(ledger).includes(wl)) {
+			const paused = trainBudgetGate({ workloadId: wl, control, questions: ledger.questions(wl), instructions: ledger.instructions(wl) }, ledger.now());
+			if (paused) {
+				say(`${wl}: launch (${reason}) not requested: ${paused.reason} (${paused.entryId}): ${paused.detail}`);
+				return null;
+			}
+		} else {
+			const stopped = w ? ceilingStopped(control, ledger.instructions(wl), w.stakes) : null;
+			if (stopped) {
+				say(`${wl}: launch (${reason}) not requested: stopped at its ceiling usd ${stopped.spend.usd} of ${stopped.ceiling.usd}`);
+				return null;
+			}
 		}
 		const decided = ledger.write((): { wrote: boolean; requestId: string | null } | { refused: string } => {
 			// re-read inside the transaction: the rows read above may predate another starter's reservation
@@ -258,8 +288,9 @@ export function tick(d: TickDeps): string[] {
 			const facts: TrainFacts = { wl, repo, checkout, views: new Map(), pushes: new Map(), mergedDeps: [] };
 			trains.push(facts);
 			const errors: unknown[] = [];
+			const attempts = trainAttemptsOf(ledger, wl);
 			for (const n of trainPrs(ledger.entries(wl), ledger.instructions(wl))) {
-				const sl = ledger.slice(trainSliceId(wl, n));
+				const sl = ledger.slice(trainSliceId(wl, n, attemptOf(attempts, n)));
 				if (sl && (sl.state === "done" || sl.state === "cancelled")) continue;
 				try {
 					const v = ghJson(["pr", "view", String(n), "-R", repo, "--json", PR_FIELDS]);
@@ -347,8 +378,8 @@ export function tick(d: TickDeps): string[] {
 				say(`${t.train}: #${t.pr} task ${t.id}: head on a fork, settled failed${q ? `, alert question ${q}` : ""}`);
 				continue;
 			}
-			const s = prStakes(view, facts.repo, ledger);
-			const r = openTrainFix(ledger, { task: t, repo: facts.repo, checkout: facts.checkout, view, stakes: s.stakes === "production" ? "production" : "normal" });
+			// The PR workload's own stakes (PLAN wl-mvqwn80onq9hq8 D11), not prStakes: a green, reviewed production PR reads normal there.
+			const r = openTrainFix(ledger, { task: t, repo: facts.repo, checkout: facts.checkout, view, stakes: trainFixStakes(view, facts.repo, ledger) });
 			say(`${t.train}: #${t.pr} task ${t.id}: fix workload ${r.workloadId} ${r.opened ? "opened" : "reused"}`);
 		} catch (err) {
 			trainError(t.train, err);
@@ -387,8 +418,9 @@ export function tick(d: TickDeps): string[] {
 		const read = new Set(boardable.map((b) => b.l.repo.toLowerCase()));
 		for (const wl of openTrains(ledger)) {
 			const repo = repoOf(wl);
+			const attempts = trainAttemptsOf(ledger, wl);
 			const pending = trainPrs(ledger.entries(wl), ledger.instructions(wl)).some((n) => {
-				const sl = ledger.slice(trainSliceId(wl, n));
+				const sl = ledger.slice(trainSliceId(wl, n, attemptOf(attempts, n)));
 				return !(sl && (sl.state === "done" || sl.state === "cancelled"));
 			});
 			if (repo !== null && pending) read.add(repo);
@@ -401,6 +433,16 @@ export function tick(d: TickDeps): string[] {
 		if (d.land) land = landPass(d, d.land, ghJson, ops, say, repoOf, served, root);
 		else if (served.length > 0) say("land-first: no runner seam (TickDeps.land): main runs, landing and promotion skipped this pass");
 	}
+
+	/** A train's PRs held by an open protection episode or a stopped landing on its repository (D6; PLAN wl-mvq4edbaf13vnk D6). */
+	const heldOf = (wl: string): Set<number> => {
+		const repo = repoOf(wl) ?? "";
+		return new Set([...(notices.open.has(repo) ? protectionPassOvers(ledger, wl) : []), ...(land?.stopped.has(repo) ? landingPassOvers(ledger, wl) : [])]);
+	};
+
+	// 4a. The permanent train's watch (PLAN wl-mvr888nftz0vcl D6, D8, D9), held live or not: bun's banner in each run's live log,
+	// the midnight end of a one-day pause's question, the meter-error question, Jo's stall `relaunch` on a live lane, and stalls.
+	for (const wl of openTrains(ledger)) watch(d, wl, heldOf(wl), factsOf(wl), say, (err) => trainError(wl, err));
 
 	// 4. Wakes.
 	for (const wl of openTrains(ledger)) {
@@ -417,8 +459,7 @@ export function tick(d: TickDeps): string[] {
 		const expired = expiredHolds(ledger, wl, stakesOf);
 		// D6: while the repo's protection episode is open, a PR passed over for protection waits; its clearing wakes the train.
 		// PLAN wl-mvq4edbaf13vnk D6: likewise a PR passed over while the repo's landing is stopped; landing reopening wakes the train.
-		const repo = repoOf(wl) ?? "";
-		const held = new Set([...(notices.open.has(repo) ? protectionPassOvers(ledger, wl) : []), ...(land?.stopped.has(repo) ? landingPassOvers(ledger, wl) : [])]);
+		const held = heldOf(wl);
 		// D13: a per-PR reason waits while the PR's owner is busy (a live lease, or only an unsettled run); one line per PR.
 		const deferred = new Set<number>();
 		const headRefs = new Map([...(facts?.views ?? [])].map(([n, v]) => [n, v.headRefName]));
@@ -495,6 +536,142 @@ export function tick(d: TickDeps): string[] {
 		}
 	}
 	return out;
+}
+
+/**
+ * Step 4a for open train `wl` (PLAN wl-mvr888nftz0vcl), whether or not a lane holds it live. Each part runs on its own, so one
+ * that throws (`fail`: a `train-error: tick …` row) hides none of the others:
+ * - R21: bun's banner in each train run's live log (`bannerPass`) becomes `test-run-started:`, timed by the log's birth time;
+ * - D6: a one-day pause whose `until` passed has its unanswered question withdrawn and its budget slice completed
+ *   (`endPastPauseQuestions`);
+ * - D9: Jo's NOW question on a meter error that has none (`raiseMeterErrorQuestions`);
+ * - review r1 F4: an earlier attempt's open full-suite slice whose run has a result is cancelled (`retireSupersededFullSlices`);
+ * - D8: Jo's `relaunch` on a stall question stops the live lane it found (`stallRelaunchStops`), and each stalled PR
+ *   (`trainStall`, with the banner read's unreadable logs as causes and D13's busy owners) gets its NOW question once per
+ *   episode (`raiseTrainStall`).
+ */
+function watch(d: TickDeps, wl: string, held: ReadonlySet<number>, facts: TrainFacts | undefined, say: (line: string) => void, fail: (err: unknown) => void): void {
+	const { ledger } = d;
+	const part = <T>(fn: () => T, fallback: T): T => {
+		try {
+			return fn();
+		} catch (err) {
+			fail(err);
+			return fallback;
+		}
+	};
+	const logErrors = part(() => bannerPass(d, wl, say), null);
+	part(() => {
+		for (const line of endPastPauseQuestions(ledger, wl)) say(`${wl}: ${line}`);
+	}, undefined);
+	part(() => {
+		for (const q of raiseMeterErrorQuestions(ledger, wl)) say(`${wl}: meter error question ${q} (NOW incident)`);
+	}, undefined);
+	part(() => {
+		for (const lane of stallRelaunchStops(ledger, wl)) say(`${wl}: stop requested of ${lane}: Jo answered relaunch on a stall question`);
+	}, undefined);
+	part(() => {
+		for (const line of retireSupersededFullSlices(ledger, wl)) say(`${wl}: ${line}`);
+	}, undefined);
+	part(() => {
+		const w = ledger.workload(wl);
+		if (!w) return;
+		const entries = ledger.entries(wl);
+		const instructions = ledger.instructions(wl);
+		const owners = new Map<number, { busy: string | null; freedAt: string | null }>();
+		for (const n of trainPrs(entries, instructions)) {
+			const owner = prOwner(ledger, wl, n, facts?.views.get(n)?.headRefName ?? null);
+			if (owner !== null) owners.set(n, { busy: ownerBusy(ledger, owner), freedAt: ownerFreedAt(ledger, owner) });
+		}
+		// a banner read that threw is itself a cause: the stall body says the live logs were not read this pass
+		const unread = logErrors ?? [`the banner read of ${wl}'s runs failed this pass (see its train-error: tick row)`];
+		const stalls = trainStall({
+			workloadId: wl, entries, instructions, questions: ledger.questions(wl), slices: ledger.slices(wl), holder: w.holder, holderLeaseUntil: w.holder_lease_until,
+			holders: ledger.holders(wl), heldPassOvers: held, owners, logErrors: unread,
+		}, ledger.now());
+		for (const s of stalls) {
+			const q = raiseTrainStall(ledger, wl, s);
+			if (q !== null) say(`${wl}: #${s.pr} stalled, no train progress since ${s.since}: question ${q} (NOW incident)`);
+		}
+	}, undefined);
+}
+
+/** The live logs a run's executor writes bun's console to: the full part's, then a fast check's (land-first). */
+const LIVE_LOGS = ["full.log", "fast.log"] as const;
+/** Bun's banner, the first line a started `bun test` prints: `bun test v1.3.14 (0d9b296a)`. */
+const BUN_BANNER_RE = /^bun test v\d/m;
+/** How much of a live log's head is read for the banner. */
+const BANNER_BYTES = 4096;
+
+/**
+ * R21 for train `wl`: each train run (`testRuns` on the train, no main run) with no `test-run-started:` yet, and either unsettled
+ * or settled within TRAIN_STALL_MS (an older start cannot move a stall clock), has its live log read (`liveBanner`); bun's
+ * banner there writes `test-run-started: <run> pr=<n> at <birth> seen <now>` once (MERGE_TRAIN_BY, rechecked in its write).
+ * No log or no banner yet (a refused, carried, unspawned or pre-bun run) writes nothing. Returns each log it could not read,
+ * one line each, for the stall body; each is also logged.
+ */
+function bannerPass(d: TickDeps, wl: string, say: (line: string) => void): string[] {
+	const { ledger } = d;
+	const root = d.as2testRoot ?? AS2TEST_ROOT;
+	const entries = ledger.entries(wl);
+	const started = testRunStarts(entries);
+	const nowMs = Date.parse(ledger.now());
+	const errors: string[] = [];
+	for (const r of testRuns(entries)) {
+		const runId = r.request.runId;
+		if (r.request.main !== undefined || started.has(runId)) continue;
+		const settled = r.results.at(-1)?.createdAt;
+		if (settled !== undefined && nowMs - Date.parse(settled) > TRAIN_STALL_MS) continue;
+		const seen = liveBanner(workDirOf(runId, root));
+		if (seen === null) continue;
+		if ("error" in seen) {
+			errors.push(`run ${runId} (#${r.request.pr}): ${seen.error}`);
+			say(`${wl}: run ${runId}: ${seen.error}`);
+			continue;
+		}
+		const body = testRunStartedBody({ runId, pr: r.request.pr, at: seen.at, seen: ledger.now() });
+		const wrote = ledger.write(() => {
+			if (testRunStarts(ledger.entries(wl)).has(runId)) return false;
+			ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body });
+			return true;
+		});
+		if (wrote) say(`${wl}: ${body} (${seen.log})`);
+	}
+	return errors;
+}
+
+/**
+ * Bun's banner in run directory `dir`: the first of LIVE_LOGS whose head holds it, with that log's birth time (`stat`
+ * birthtime: the executor creates the log before bun spawns, so it is never later than the real start). Null when no log
+ * holds it yet (none there, or bun has not printed). A log that cannot be opened for another reason, or read, is an error,
+ * and so is a banner whose birth time the file system does not give (fail closed: never the modification time).
+ */
+function liveBanner(dir: string): { at: string; log: string } | { error: string } | null {
+	for (const name of LIVE_LOGS) {
+		const log = join(dir, name);
+		let fd: number;
+		try {
+			fd = openSync(log, "r");
+		} catch (err) {
+			if (typeof err === "object" && err !== null && Reflect.get(err, "code") === "ENOENT") continue;
+			return { error: `${log} could not be opened: ${err instanceof Error ? err.message : String(err)}` };
+		}
+		try {
+			const buf = Buffer.alloc(BANNER_BYTES);
+			const n = readSync(fd, buf, 0, BANNER_BYTES, 0);
+			if (!BUN_BANNER_RE.test(buf.subarray(0, n).toString("utf8"))) continue;
+			const birth = fstatSync(fd).birthtimeMs;
+			if (!Number.isFinite(birth) || birth <= 0) {
+				return { error: `${log} shows bun's banner but the file system gives no birth time (birthtimeMs ${birth}); no test-run-started: written` };
+			}
+			return { at: new Date(birth).toISOString(), log };
+		} catch (err) {
+			return { error: `${log} could not be read: ${err instanceof Error ? err.message : String(err)}` };
+		} finally {
+			closeSync(fd);
+		}
+	}
+	return null;
 }
 
 /**
@@ -1266,7 +1443,7 @@ interface TrainMerge {
 
 /**
  * Every PR merged by a train open now or closed within MAIN_RED_WINDOW_MS (step 3d's trains, `mainRedRows`), oldest train first,
- * in slice order: its disposition slice `sl-train-<k>-<n>` is done with an artifact starting `merged by train`. `production` when
+ * in slice order: a disposition slice (`sl-train-<k>-<n>`, or `sl-train-<k>-<n>-a<m>` of a later attempt) is done with an artifact starting `merged by train`. `production` when
  * a holder of the train recorded `ruling-applied: train-signoff …` on that slice (the ruling decided its merge question).
  */
 function trainMerges(ledger: Ledger): TrainMerge[] {
@@ -1277,8 +1454,9 @@ function trainMerges(ledger: Ledger): TrainMerge[] {
 		if (w.status === "closed" && w.closed_at! < since) continue;
 		let signoffs: Set<string> | undefined;
 		for (const sl of ledger.slices(t)) {
-			const pr = trainSlicePr(sl.id, t);
-			if (pr === null || sl.id !== trainSliceId(t, pr) || sl.state !== "done" || !sl.artifact?.startsWith("merged by train")) continue;
+			const s = parseTrainSlice(sl.id, t);
+			const pr = s === null || s.full !== null ? null : s.pr;
+			if (pr === null || sl.state !== "done" || !sl.artifact?.startsWith("merged by train")) continue;
 			if (signoffs === undefined) {
 				const entries = ledger.entries(t, "assumption");
 				const holders = holdersOf(entries, w.holder, ledger.holders(t));

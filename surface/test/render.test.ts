@@ -2,11 +2,13 @@
 // failed-run line (MIGRATION.md item 24), identity and the stakes/mode one-liner, all from ledger state.
 import { describe, expect, test } from "bun:test";
 import { TEST_RUNNER_BY } from "../../ledger/src/index";
+import { spendBody } from "../src/ceiling";
 import { consumeLines } from "../src/delivery";
 import { errorLines, parseDue, reservedStates, waitingReserved } from "../src/errors";
 import { ensureStandingWorkload, identityOf, recordIdentity } from "../src/identity";
 import { laneExitBody, laneStopAcceptedBody, laneStopRequestBody, planFirstBody, queuedBody } from "../src/launch";
 import { Numbering } from "../src/numbering";
+import { trainBody, trainInstructionBody } from "../src/merge-train";
 import { oneLiner, rankLines, renderWake } from "../src/render";
 import { briefHash, formatOverride, formatSignal, goalsHash, rankDay, rankOpen, type SignalAnswers } from "../src/rank";
 import { artifactFailures, laneDiedShutdownBody } from "../src/signals";
@@ -711,5 +713,87 @@ describe("the intake queue in the render (PLAN wl-mvbcjadqgblr7k D8)", () => {
 		expect(lineOf(wake.text, newer)).not.toContain("queued");
 		expect(oneLiner(ledger, ledger.workload(newer)!)).not.toContain("queued");
 		expect(lineOf(wake.text, older)).toContain(" · queued #1 of 1 · ");
+	});
+});
+
+describe("a merge train's one-liner: budget per PDT day, no ceiling or wall (PLAN wl-mvr888nftz0vcl D4, D5)", () => {
+	const lineOf = (text: string, wl: string) => text.split("\n").find((l) => l.startsWith(`- ${wl}`))!;
+	const paused = (lane: string, day: string, until: string) => `train-paused: ${lane} day ${day} usd 150.12 limit 150 pr 341 until ${until}`;
+	const raise = (day: string, usd: number) => `train-raise: day ${day} usd ${usd} answer in-x`;
+	const assume = (ledger: Ledger, wl: string, by: string, body: string) => ledger.recordEntry({ by, workloadId: wl, kind: "assumption", body });
+
+	/** A train (Jo's `train` word on it, PRs 341 and 342) and an ordinary workload beside it, on a settable clock. */
+	function world(start: string) {
+		const c = clock(start);
+		const { ledger } = tempLedger(c.now);
+		const { wl: train } = workloadWithSlice(ledger, { brief: "merge train" });
+		const id = ledger.recordInstruction({ by: SURFACE_BY, workloadId: train, body: trainInstructionBody(train, [341, 342]), author: "jo", channel: "surface" });
+		assume(ledger, train, SURFACE_BY, trainBody([341, 342], id));
+		const { wl: plain } = workloadWithSlice(ledger, { brief: "ordinary work" });
+		return { c, ledger, train, plain };
+	}
+
+	test("a train shows budget $150/PDT day · no wall in the one-liner, the wake line and the block, never a ceiling; an ordinary workload keeps its ceiling", () => {
+		const { ledger, train, plain } = world("2026-10-27T17:00:00.000Z");
+		expect(oneLiner(ledger, ledger.workload(train)!)).toEndWith(" · budget $150/PDT day · no wall");
+		expect(oneLiner(ledger, ledger.workload(train)!)).not.toContain("ceiling");
+		const wake = renderWake(ledger, { trigger: "tick" });
+		expect(lineOf(wake.text, train)).toContain(" · budget $150/PDT day · no wall · ");
+		expect(lineOf(wake.text, train)).not.toContain("ceiling");
+		expect(renderWake(ledger, { workloadId: train }).text).toContain(" · budget $150/PDT day · no wall\n");
+		expect(oneLiner(ledger, ledger.workload(plain)!)).toContain(" · ceiling $");
+		expect(lineOf(wake.text, plain)).toContain(" · ceiling $");
+	});
+
+	test("today's limit is $150 plus the surface's raises for today's PDT day only; another day's raise and a raise no surface wrote do not count", () => {
+		const { ledger, train } = world("2026-10-27T17:00:00.000Z");
+		assume(ledger, train, SURFACE_BY, raise("2026-10-27", 25));
+		assume(ledger, train, SURFACE_BY, raise("2026-10-27", 10.5));
+		assume(ledger, train, SURFACE_BY, raise("2026-10-26", 40));
+		assume(ledger, train, "lane-a", raise("2026-10-27", 1000));
+		expect(oneLiner(ledger, ledger.workload(train)!)).toEndWith(" · budget $185.5/PDT day · no wall");
+	});
+
+	test("the PDT day, not the UTC day: on 2026-11-01 (25 h) a raise for that day counts until 08:00Z on 2026-11-02, then the limit is $150 again", () => {
+		const { c, ledger, train } = world("2026-11-02T07:59:00.000Z");
+		assume(ledger, train, SURFACE_BY, raise("2026-11-01", 50));
+		expect(oneLiner(ledger, ledger.workload(train)!)).toEndWith(" · budget $200/PDT day · no wall");
+		c.at("2026-11-02T08:00:00.000Z");
+		expect(oneLiner(ledger, ledger.workload(train)!)).toEndWith(" · budget $150/PDT day · no wall");
+	});
+
+	test("paused until <iso> while the runner's newest pause runs past now; gone after its until, and gone the same day once a raise for its day lands after it", () => {
+		const { c, ledger, train } = world("2026-10-27T22:00:00.000Z");
+		assume(ledger, train, LANE_RUNNER_BY, paused("lane-t-1", "2026-10-27", "2026-10-28T07:00:00.000Z"));
+		expect(oneLiner(ledger, ledger.workload(train)!)).toEndWith(" · budget $150/PDT day · no wall · paused until 2026-10-28T07:00:00Z");
+		expect(lineOf(renderWake(ledger, { trigger: "tick" }).text, train)).toContain(" · no wall · paused until 2026-10-28T07:00:00Z · ");
+		c.at("2026-10-28T07:00:00.000Z");
+		expect(oneLiner(ledger, ledger.workload(train)!)).toEndWith(" · budget $150/PDT day · no wall");
+
+		const raised = world("2026-10-27T22:00:00.000Z");
+		assume(raised.ledger, raised.train, SURFACE_BY, raise("2026-10-27", 20));
+		raised.c.plusHours(0.1);
+		assume(raised.ledger, raised.train, LANE_RUNNER_BY, paused("lane-t-1", "2026-10-27", "2026-10-28T07:00:00.000Z"));
+		// a raise written before the pause does not lift it
+		expect(oneLiner(raised.ledger, raised.ledger.workload(raised.train)!)).toEndWith(" · budget $170/PDT day · no wall · paused until 2026-10-28T07:00:00Z");
+		raised.c.plusHours(0.1);
+		assume(raised.ledger, raised.train, SURFACE_BY, raise("2026-10-27", 25));
+		expect(oneLiner(raised.ledger, raised.ledger.workload(raised.train)!)).toEndWith(" · budget $195/PDT day · no wall");
+	});
+
+	test("a pause row no runner wrote, or a malformed one, never shows as paused", () => {
+		const { ledger, train } = world("2026-10-27T22:00:00.000Z");
+		assume(ledger, train, "lane-a", paused("lane-t-1", "2026-10-27", "2026-10-28T07:00:00.000Z"));
+		assume(ledger, train, LANE_RUNNER_BY, "train-paused: lane-t-1 day 2026-10-27 usd 150.12 limit 150 pr 341 until tomorrow");
+		expect(oneLiner(ledger, ledger.workload(train)!)).toEndWith(" · budget $150/PDT day · no wall");
+	});
+
+	test("the block's spend line of a train names no ceiling or wall; an ordinary workload's still does", () => {
+		const { ledger, train, plain } = world("2026-10-27T17:00:00.000Z");
+		for (const wl of [train, plain]) assume(ledger, wl, LANE_RUNNER_BY, spendBody("lane-t-1", { usd: 212.3, tokens: 1000, wallMin: 900 }));
+		const block = renderWake(ledger, { workloadId: train }).text;
+		expect(block).toContain("\nspent $212.3 since open, every PDT day together\n");
+		expect(block).not.toContain(" min\n");
+		expect(renderWake(ledger, { workloadId: plain }).text).toContain("\nspent $212.3 of $");
 	});
 });

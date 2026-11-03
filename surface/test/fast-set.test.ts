@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type FastConfig, FastSetError, fastSet, fullExceptions, KNOWN_MANIFESTS, parseCheck, resolveRelative, testReach, uncoveredManifests } from "../src/fast-set";
-import { FULL_BEFORE_MERGE_DEFAULT, testRunnerConfig } from "../src/test-run";
+import { FULL_BEFORE_MERGE_DEFAULT, type FastPlan, fastPlanBody, parseFastPlan, testRunnerConfig } from "../src/test-run";
 
 const REPO = join(import.meta.dir, "..", "..");
 
@@ -13,7 +13,7 @@ const REPO = join(import.meta.dir, "..", "..");
 function treeOf(files: Record<string, string>): { tree: string[]; read: (p: string) => string | null } {
 	return { tree: Object.keys(files), read: (p) => (Object.hasOwn(files, p) ? files[p]! : null) };
 }
-const CFG: FastConfig = { fastSmoke: [], macOnly: {}, fullBeforeMerge: [...FULL_BEFORE_MERGE_DEFAULT] };
+const CFG: FastConfig = { fastSmoke: [], macOnly: {}, mainSkip: {}, fullBeforeMerge: [...FULL_BEFORE_MERGE_DEFAULT] };
 const SCHEMA_INDEX_SRC = (v: number, tail = "") => `import { join } from "node:path";\nexport const SCHEMA_VERSION = ${v};\nexport const X = 1;${tail}\n`;
 
 /** A small repository: a chain of importers, a test that spawns a script by path, one that reads a fixture by basename, unrelated tests. */
@@ -52,11 +52,11 @@ describe("the fast set (R1)", () => {
 		const x = at();
 		const plan = fastSet(["src/a.ts"], x.tree, x.read, base.read, CFG);
 		// a → b (src/b.test.ts imports it) → c (test/c.test.ts) → index → lib/use (test/lib.test.ts), and a test naming lib/use.ts
-		expect(plan).toEqual({ kind: "fast", files: ["src/b.test.ts", "test/c.test.ts", "test/lib.test.ts", "test/names-importer.test.ts"], macOnly: [], parse: ["src/a.ts"] });
+		expect(plan).toEqual({ kind: "fast", files: ["src/b.test.ts", "test/c.test.ts", "test/lib.test.ts", "test/names-importer.test.ts"], macOnly: [], mainSkip: [], parse: ["src/a.ts"] });
 		// a change to a test file itself holds that test
 		expect(fastSet(["test/other.test.ts"], x.tree, x.read, base.read, CFG)).toMatchObject({ files: ["test/other.test.ts"] });
 		// a change nothing reaches holds no test
-		expect(fastSet(["README.md"], x.tree, x.read, base.read, CFG)).toEqual({ kind: "fast", files: [], macOnly: [], parse: [] });
+		expect(fastSet(["README.md"], x.tree, x.read, base.read, CFG)).toEqual({ kind: "fast", files: [], macOnly: [], mainSkip: [], parse: [] });
 	});
 
 	test("a test that names a changed file by repo-relative path or by basename is held (spawned scripts, fixtures)", () => {
@@ -103,11 +103,44 @@ describe("the fast set (R1)", () => {
 		const x = at();
 		const cfg: FastConfig = { ...CFG, fastSmoke: ["test/other.test.ts", "test/c.test.ts"], macOnly: { "test/lib.test.ts": "sandbox-exec is macOS only", "test/other.test.ts": "launchd" } };
 		expect(fastSet(["src/a.ts"], x.tree, x.read, base.read, cfg)).toEqual({
-			kind: "fast", files: ["src/b.test.ts", "test/c.test.ts", "test/names-importer.test.ts"], macOnly: ["test/lib.test.ts", "test/other.test.ts"], parse: ["src/a.ts"],
+			kind: "fast", files: ["src/b.test.ts", "test/c.test.ts", "test/names-importer.test.ts"], macOnly: ["test/lib.test.ts", "test/other.test.ts"], mainSkip: [], parse: ["src/a.ts"],
 		});
 		// a smoke file the tree does not hold is a config error, never dropped
 		expect(() => fastSet(["src/a.ts"], x.tree, x.read, base.read, { ...CFG, fastSmoke: ["test/gone.test.ts"] })).toThrow(FastSetError);
 		expect(() => fastSet(["src/a.ts"], x.tree, x.read, base.read, { ...CFG, fastSmoke: ["test/gone.test.ts"] })).toThrow("test/gone.test.ts");
+	});
+
+	test("mainSkip files leave the Linux set too, each listed beside macOnly: reached, smoke, or in both lists (macOnly first)", () => {
+		const x = at();
+		const cfg: FastConfig = {
+			...CFG,
+			fastSmoke: ["test/other.test.ts"],
+			macOnly: { "test/lib.test.ts": "sandbox-exec is macOS only", "test/names-importer.test.ts": "launchd" },
+			mainSkip: { "test/c.test.ts": "needs an installed OMP", "test/other.test.ts": "needs an installed OMP", "test/names-importer.test.ts": "needs an installed OMP", "test/spawn.test.ts": "needs an installed OMP" },
+		};
+		// src/a.ts reaches src/b.test.ts, test/c.test.ts (mainSkip), test/lib.test.ts (macOnly) and test/names-importer.test.ts (both);
+		// the smoke file test/other.test.ts is in mainSkip; test/spawn.test.ts is in mainSkip but not reached, so no list names it
+		const plan = fastSet(["src/a.ts"], x.tree, x.read, base.read, cfg);
+		expect(plan).toEqual({
+			kind: "fast", files: ["src/b.test.ts"], macOnly: ["test/lib.test.ts", "test/names-importer.test.ts"], mainSkip: ["test/c.test.ts", "test/other.test.ts"], parse: ["src/a.ts"],
+		});
+		// every fast-set file is in exactly one list, so none leaves the record
+		if (plan.kind !== "fast") throw new Error(`expected a fast plan, got ${JSON.stringify(plan)}`);
+		const listed = [...plan.files, ...plan.macOnly, ...plan.mainSkip];
+		expect(new Set(listed).size).toBe(listed.length);
+		expect(listed.sort()).toEqual([...testReach(x.tree, x.read)(["src/a.ts"]), "test/other.test.ts"].sort());
+		// a set left with only mainSkip files has no Linux file (the runner refuses to dispatch an empty set)
+		expect(fastSet(["README.md"], x.tree, x.read, base.read, cfg)).toEqual({ kind: "fast", files: [], macOnly: [], mainSkip: ["test/other.test.ts"], parse: [] });
+	});
+
+	test("the recorded plan carries mainSkip; a plan recorded before the split reads as leaving none out", () => {
+		const plan: FastPlan = { ref: "wl/test", scope: "fast", files: ["a.test.ts"], parse: [], macOnly: ["m.test.ts"], mainSkip: ["o.test.ts"] };
+		expect(parseFastPlan(fastPlanBody("tr-abc123", plan))).toEqual({ runId: "tr-abc123", plan });
+		expect(parseFastPlan('fast-plan: tr-abc123 {"ref":"wl/test","scope":"fast","files":["a.test.ts"],"parse":[],"macOnly":[]}')).toEqual({
+			runId: "tr-abc123", plan: { ref: "wl/test", scope: "fast", files: ["a.test.ts"], parse: [], macOnly: [], mainSkip: [] },
+		});
+		// a mainSkip that is not a list of strings is no plan, never a default
+		expect(parseFastPlan('fast-plan: tr-abc123 {"ref":"wl/test","scope":"fast","files":["a.test.ts"],"parse":[],"macOnly":[],"mainSkip":"o.test.ts"}')).toBeNull();
 	});
 
 	test("relative specifiers resolve as Bun does: exact, by extension, a .js specifier to its .ts file, a directory's index", () => {

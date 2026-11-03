@@ -57,6 +57,14 @@ export interface Word {
 	 * when a fragment may be a protected path. A fragment whose head and tail are both empty is not kept.
 	 */
 	fragments?: Fragment[];
+	/**
+	 * Set on an opaque word: true when some unknown part of it is unquoted, so the shell may split it
+	 * into several words (or none) when it runs, or when a quoted part expands to several words (`"$@"`,
+	 * `"${a[@]}"`); false when every unknown part sits inside double quotes and the word stays one word.
+	 * Absent (on a known word, or a word built outside the parser) reads as true for a caller asking
+	 * whether an unknown word may split (PLAN wl-mvqwn80onq9hq8 D2a).
+	 */
+	splits?: boolean;
 }
 
 /** One value a word may take that has an unknown middle: the known text before its first unknown part and after its last. */
@@ -74,6 +82,8 @@ export interface Redirect {
 	body: string | null;
 	/** The body contains expansions whose value is unknown. */
 	bodyOpaque: boolean;
+	/** The file descriptor number written before the operator (`2` in `2>&1`); absent when none was. */
+	fd?: string;
 }
 
 export interface SimpleCommand {
@@ -83,6 +93,12 @@ export interface SimpleCommand {
 	dir: string;
 	/** False once a `cd` to an unknown directory ran before this command. */
 	dirKnown: boolean;
+	/**
+	 * The `cd`/`pushd` operand words that set `dir`, in order (every arm's, after a `case`): what the
+	 * directory was spelled from, for a caller that trusts `dir` only for a literal spelling. A `cd`
+	 * with no operand adds a word holding HOME with no span. Empty while `dir` is the start directory.
+	 */
+	hops: Word[];
 	/** The command whose stdout feeds this one's stdin, in a pipeline. */
 	stdinFrom: SimpleCommand | null;
 	/** Parsed at the top level of the source string (not inside `( … )`, `$( … )`, backticks or a heredoc). */
@@ -96,6 +112,8 @@ export interface ParseResult {
 	ops: string[];
 	/** Keywords dropped from command position at the top level (`!`, `if`, `{`, …). */
 	keywords: string[];
+	/** The same keywords, and `case`, at every depth (inside `( … )`, `$( … )`, backticks and heredocs too), in source order. */
+	compounds: string[];
 }
 
 export interface ParseOptions {
@@ -264,39 +282,69 @@ interface PendingHeredoc {
 	stripTabs: boolean;
 }
 
-/** The parser's definite state at one point of the source (see Parser.snapshot). */
-interface State {
-	vars: Map<string, VarValue>;
+/** Where later commands run: the directory, whether it is known, and the `cd` words that set it (SimpleCommand.hops). */
+interface DirState {
 	dir: string;
 	known: boolean;
+	hops: Word[];
 }
+
+/** The parser's definite state at one point of the source (see Parser.snapshot). */
+interface State extends DirState {
+	vars: Map<string, VarValue>;
+}
+
+/** Keywords that open a compound command whose body is a list of its own (`for` and `select` arrive as a command head). */
+const OPENS_COMPOUND: Record<string, true> = { "{": true, if: true, while: true, until: true, for: true, select: true };
+/** Keywords that start a new list inside an open compound. */
+const STARTS_LIST: Record<string, true> = { then: true, else: true, elif: true, do: true };
+/** Keywords that close a compound command. */
+const CLOSES_COMPOUND: Record<string, true> = { "}": true, fi: true, done: true };
 
 class Parser {
 	i = 0;
 	readonly commands: SimpleCommand[];
 	readonly failures: string[];
+	readonly compounds: string[];
 	readonly ops: string[] = [];
 	readonly keywords: string[] = [];
 	/** This parser reads the top level of the source (no sink: not a nested or sub parse). */
 	readonly top: boolean;
 	dir: string;
 	dirKnown = true;
+	/** The `cd` words that set `dir` (SimpleCommand.hops); a new array on every change, so a snapshot never aliases it. */
+	hops: Word[] = [];
+	/** The compound keywords the last `simple()` read in command position (dropped keywords, then a `for`/`select` head), for list(). */
+	private compound: string[] = [];
 	private pending: PendingHeredoc[] = [];
 
 	constructor(
 		readonly src: string,
 		readonly opts: ParseOptions,
 		readonly vars: Map<string, VarValue>,
-		sink?: { commands: SimpleCommand[]; failures: string[] },
-		dir?: { dir: string; known: boolean },
+		sink?: { commands: SimpleCommand[]; failures: string[]; compounds: string[] },
+		dir?: DirState,
 		/** Record word spans: set by parseShell from `opts.spans`, kept by `nested`, never by a `sub` or heredoc parser. */
 		readonly spans = false,
 	) {
 		this.top = sink === undefined;
 		this.commands = sink?.commands ?? [];
 		this.failures = sink?.failures ?? [];
+		this.compounds = sink?.compounds ?? [];
 		this.dir = dir?.dir ?? opts.cwd;
 		this.dirKnown = dir?.known ?? true;
+		this.hops = dir?.hops ?? [];
+	}
+
+	/** The directory state now, for a nested parser or a list boundary. */
+	private dirState(): DirState {
+		return { dir: this.dir, known: this.dirKnown, hops: this.hops };
+	}
+
+	private setDir(s: DirState): void {
+		this.dir = s.dir;
+		this.dirKnown = s.known;
+		this.hops = s.hops;
 	}
 
 	private op(token: string): void {
@@ -332,7 +380,7 @@ class Parser {
 
 	/** A nested parser over the same source (subshell, `$(…)`), sharing output, with its own directory scope. */
 	private nested(stop: ")" | null): void {
-		const p = new Parser(this.src, this.opts, this.vars, this, { dir: this.dir, known: this.dirKnown }, this.spans);
+		const p = new Parser(this.src, this.opts, this.vars, this, this.dirState(), this.spans);
 		p.i = this.i;
 		p.list(stop);
 		this.i = p.i;
@@ -340,14 +388,25 @@ class Parser {
 
 	/** Parse a separate string (backtick body, heredoc, `eval`) into the same output. */
 	private sub(text: string): void {
-		const p = new Parser(text, this.opts, this.vars, this, { dir: this.dir, known: this.dirKnown });
+		const p = new Parser(text, this.opts, this.vars, this, this.dirState());
 		p.list(null);
 	}
 
-	/** `stop`: `)` closes a subshell or `$( … )` (consumed); `;;` ends a `case` arm at its terminator or at `esac` (left for caseCompound). */
+	/**
+	 * `stop`: `)` closes a subshell or `$( … )` (consumed); `;;` ends a `case` arm at its terminator or at `esac` (left for caseCompound).
+	 * An and-or list ended by `&` runs in a subshell (bash(1), Lists: "the shell executes the command in the background in a
+	 * subshell"), so the commands after it start from the directory its first command started from (PLAN wl-mvqwn80onq9hq8 D2b;
+	 * msg-mvqwye908wldp2: `cd x && rm r0 & ls` runs `ls` where the call started). `starts` holds that directory per open
+	 * compound command (`{`, `if`, `while`, `until`, `for`, `select`): a compound is one command of the list around it, so
+	 * `{ cd x; } &` returns to the directory before the `{`. Variables keep today's reading.
+	 */
 	list(stop: ")" | ";;" | null): void {
 		let prev: SimpleCommand | null = null;
 		let piped = false;
+		const starts: DirState[] = [this.dirState()];
+		const boundary = (): void => {
+			starts[starts.length - 1] = this.dirState();
+		};
 		for (;;) {
 			this.skipBlanks();
 			const c = this.ch;
@@ -371,6 +430,7 @@ class Parser {
 				this.readHeredocs();
 				prev = null;
 				piped = false;
+				boundary();
 				continue;
 			}
 			if (c === "|") {
@@ -386,6 +446,10 @@ class Parser {
 				this.op(this.src.slice(this.i, this.i + n));
 				this.i += n;
 				piped = false;
+				if (n === 1) {
+					this.setDir(starts[starts.length - 1]!);
+					boundary();
+				}
 				continue;
 			}
 			if (c === ";") {
@@ -393,6 +457,7 @@ class Parser {
 				this.op(this.src.slice(this.i, this.i + n));
 				this.i += n;
 				piped = false;
+				boundary();
 				continue;
 			}
 			if (c === "(") {
@@ -408,26 +473,34 @@ class Parser {
 				this.i++;
 				continue;
 			}
+			const before = this.dirState();
 			const cmd = this.simple();
 			if (cmd) {
 				cmd.stdinFrom = piped ? prev : null;
 				prev = cmd;
 			}
 			piped = false;
+			// Keywords sit before the command they lead, so a list or compound they start starts before its effects.
+			for (const kw of this.compound) {
+				if (CLOSES_COMPOUND[kw]) {
+					if (starts.length > 1) starts.pop();
+				} else if (STARTS_LIST[kw]) starts[starts.length - 1] = before;
+				else if (OPENS_COMPOUND[kw]) starts.push(before);
+			}
+			this.compound = [];
 		}
 	}
 
 	/** The definite state later commands see: the variables assigned so far and the directory. */
 	private snapshot(): State {
-		return { vars: new Map(this.vars), dir: this.dir, known: this.dirKnown };
+		return { vars: new Map(this.vars), ...this.dirState() };
 	}
 
 	/** Make `s` the current state, in place: `vars` is one Map shared with nested parsers and the caller. */
 	private restore(s: State): void {
 		this.vars.clear();
 		for (const [k, v] of s.vars) this.vars.set(k, v);
-		this.dir = s.dir;
-		this.dirKnown = s.known;
+		this.setDir(s);
 	}
 
 	/**
@@ -462,7 +535,9 @@ class Parser {
 		}
 		const first = states[0]!;
 		const known = states.every((s) => s.known && s.dir === first.dir);
-		return { vars, dir: first.dir, known };
+		// Every arm's `cd` words, each once: a caller trusting `dir` by its spelling reads them all.
+		const hops = [...new Set(states.flatMap((s) => s.hops))];
+		return { vars, dir: first.dir, known, hops };
 	}
 
 	/**
@@ -501,6 +576,7 @@ class Parser {
 			if (this.atKeyword("esac")) {
 				this.i += 4;
 				if (this.top) this.keywords.push("esac");
+				this.compounds.push("esac");
 				this.restore(this.join(exits));
 				return;
 			}
@@ -549,8 +625,11 @@ class Parser {
 			// `case` in command position, after any keywords (`do case …`, `then case …`, `{ case …`).
 			if (redirects.length === 0 && this.atKeyword("case") && words.every((w) => !w.opaque && !w.glob && KEYWORDS[w.text])) {
 				if (this.top) this.keywords.push(...words.map((w) => w.text), "case");
+				this.compounds.push(...words.map((w) => w.text), "case");
 				this.i += 4;
 				this.caseCompound();
+				// The arms' own lists reset `compound`; the keywords before `case` lead it.
+				this.compound = words.map((w) => w.text);
 				return null;
 			}
 			if (c === "#") {
@@ -580,18 +659,24 @@ class Parser {
 			const redir = /^(\d*)(&>>|&>|<<<|<<-|<<|<>|>>|>\||>&|<&|>|<)/.exec(this.src.slice(this.i));
 			if (redir) {
 				this.i += redir[0].length;
-				this.redirect(redir[2]!, redirects);
+				this.redirect(redir[2]!, redirects, redir[1] || undefined);
 				continue;
 			}
 			words.push(...this.word());
 		}
 		// Drop keywords in command position (`if git reset --hard; then`, `{ … }`).
+		const compound: string[] = [];
 		while (words.length && !words[0]!.opaque && !words[0]!.glob && KEYWORDS[words[0]!.text]) {
 			if (this.top) this.keywords.push(words[0]!.text);
+			this.compounds.push(words[0]!.text);
+			compound.push(words[0]!.text);
 			words.shift();
 		}
+		const head = words[0];
+		if (head && !head.opaque && !head.glob && !head.expanded && (head.text === "for" || head.text === "select")) compound.push(head.text);
+		this.compound = compound;
 		if (words.length === 0 && redirects.length === 0) return null;
-		const cmd: SimpleCommand = { words, redirects, dir: this.dir, dirKnown: this.dirKnown, stdinFrom: null, top: this.top };
+		const cmd: SimpleCommand = { words, redirects, dir: this.dir, dirKnown: this.dirKnown, hops: this.hops, stdinFrom: null, top: this.top };
 		this.effects(cmd);
 		this.commands.push(cmd);
 		return cmd;
@@ -643,21 +728,26 @@ class Parser {
 				const arg = rest.find((x) => x.opaque || !x.text.startsWith("-"));
 				if (!arg) {
 					const home = this.opts.env.HOME;
-					if (home) this.dir = home;
-					else this.dirKnown = false;
+					if (home) {
+						this.dir = home;
+						this.hops = [...this.hops, { text: home, opaque: false, expanded: true }];
+					} else this.dirKnown = false;
 				} else if (arg.opaque || arg.glob || arg.text === "-") this.dirKnown = false;
-				else this.dir = resolvePath(this.dir, arg.text);
+				else {
+					this.dir = resolvePath(this.dir, arg.text);
+					this.hops = [...this.hops, arg];
+				}
 			}
 		}
 	}
 
-	private redirect(op: string, into: Redirect[]): void {
+	private redirect(op: string, into: Redirect[], fd?: string): void {
 		this.skipBlanks();
 		if (op === "<<" || op === "<<-") {
 			const start = this.i;
 			const [delimWord] = this.word();
 			const raw = this.src.slice(start, this.i);
-			const r: Redirect = { op, target: null, body: null, bodyOpaque: false };
+			const r: Redirect = { op, target: null, body: null, bodyOpaque: false, ...(fd ? { fd } : {}) };
 			into.push(r);
 			this.pending.push({ redirect: r, delim: delimWord?.text ?? "", expand: !/['"\\]/.test(raw), stripTabs: op === "<<-" });
 			return;
@@ -665,10 +755,10 @@ class Parser {
 		const words = this.word();
 		const target = words[0] ?? { text: "", opaque: true };
 		if (op === "<<<") {
-			into.push({ op, target: null, body: target.text, bodyOpaque: target.opaque });
+			into.push({ op, target: null, body: target.text, bodyOpaque: target.opaque, ...(fd ? { fd } : {}) });
 			return;
 		}
-		into.push({ op, target, body: null, bodyOpaque: false });
+		into.push({ op, target, body: null, bodyOpaque: false, ...(fd ? { fd } : {}) });
 	}
 
 	/** Heredoc bodies start on the line after the operator (called at each newline). */
@@ -695,7 +785,7 @@ class Parser {
 			const body = lines.join("\n");
 			h.redirect.body = body;
 			if (h.expand) {
-				const p = new Parser(body, this.opts, this.vars, this, { dir: this.dir, known: this.dirKnown });
+				const p = new Parser(body, this.opts, this.vars, this, this.dirState());
 				h.redirect.bodyOpaque = p.expansionsOnly();
 			}
 		}
@@ -721,10 +811,15 @@ class Parser {
 	/** Set while reading one word when its spelling carries an expansion or ANSI-C quoting. */
 	private sawExpansion = false;
 
+	/** Set by expansion() when an expansion may give several words even inside double quotes (`"$@"`, `"${a[@]}"`); read and reset around each `"…"` by wordParts. */
+	private multiField = false;
+
 	private wordParts(): Word[] {
 		const parts: Part[] = [];
 		let quoted = false;
 		let braceable = true;
+		/** An unquoted unknown part, or a quoted expansion to several words (Word.splits). */
+		let splits = false;
 		const startLen = this.i;
 		for (;;) {
 			const c = this.ch;
@@ -745,6 +840,7 @@ class Parser {
 					this.failures.push("unterminated ' quote");
 					this.i = this.src.length;
 					parts.push(OPAQUE);
+					splits = true;
 					break;
 				}
 				parts.push({ s: this.src.slice(this.i + 1, end), q: 1 });
@@ -756,9 +852,15 @@ class Parser {
 			if (c === '"') {
 				this.i++;
 				parts.push({ s: "", q: 1 });
-				if (!this.doubleQuoted(parts, true)) {
+				const outerMulti = this.multiField;
+				this.multiField = false;
+				const closed = this.doubleQuoted(parts, true);
+				if (this.multiField) splits = true;
+				this.multiField = outerMulti;
+				if (!closed) {
 					this.failures.push('unterminated " quote');
 					parts.push(OPAQUE);
+					splits = true;
 					break;
 				}
 				quoted = true;
@@ -775,6 +877,7 @@ class Parser {
 			}
 			if (c === "$" || c === "`") {
 				const v = this.expansion(false);
+				if (typeof v !== "string") splits = true;
 				parts.push(v === OPAQUE ? OPAQUE : Array.isArray(v) ? { alts: v } : { s: v, q: 2 });
 				braceable = false;
 				continue;
@@ -782,6 +885,7 @@ class Parser {
 			if (c === "~" && this.i === startLen && (ENDS_WORD(this.src[this.i + 1]) || this.src[this.i + 1] === "/")) {
 				const home = this.opts.env.HOME;
 				parts.push(home === undefined ? OPAQUE : { s: home, q: 1 });
+				if (home === undefined) splits = true;
 				this.i++;
 				continue;
 			}
@@ -825,10 +929,11 @@ class Parser {
 				patterns = dedupeHoles(patterns);
 				if (patterns.length > MAX_CANDIDATES) {
 					this.failures.push(`a word with more than ${MAX_CANDIDATES} possible values (variables a \`case\` assigned)`);
-					return [{ text, opaque: true, glob }];
+					return [{ text, opaque: true, glob, splits: true }];
 				}
 			}
-			const w: Word = { text, opaque: true, glob };
+			// A known unquoted expansion beside the unknown part splits too: the word is not field-split here.
+			const w: Word = { text, opaque: true, glob, splits: splits || chars.some((ch) => ch.split) };
 			const candidates = patterns.filter((x) => !x.hole).map((x) => x.head);
 			const fragments = patterns.filter((x) => x.hole && (x.head !== "" || x.tail !== "")).map((x) => ({ head: x.head, tail: x.tail }));
 			if (candidates.length > 0) w.candidates = candidates;
@@ -839,7 +944,7 @@ class Parser {
 		const ifs: string | null = this.vars.has("IFS") ? (typeof ifsValue === "string" ? ifsValue : null) : DEFAULT_IFS;
 		const splittable = chars.some((ch) => ch.split);
 		// IFS set to a value the gate does not know: an unquoted expansion splits in unknown places.
-		if (splittable && ifs === null) return [{ text, opaque: true, glob: hasGlob(chars) }];
+		if (splittable && ifs === null) return [{ text, opaque: true, glob: hasGlob(chars), splits: true }];
 		if (ifs === null || ifs === "" || !chars.some((ch) => ch.split && ifs.includes(ch.c))) {
 			const w: Word = { text, opaque: false, glob: hasGlob(chars) };
 			if (this.spans) w.span = [startLen, this.i];
@@ -921,6 +1026,8 @@ class Parser {
 				return OPAQUE;
 			}
 			const inner = this.src.slice(start, this.i - 1);
+			// `${a[@]}`, `${@:2}`, `${!p@}`: several words even inside double quotes.
+			if (inner.includes("@")) this.multiField = true;
 			return /^[A-Za-z_]\w*$/.test(inner) ? this.lookup(inner) : OPAQUE;
 		}
 		if (n !== undefined && /[A-Za-z_]/.test(n)) {
@@ -929,6 +1036,7 @@ class Parser {
 			return this.lookup(m[0]);
 		}
 		if (n !== undefined && /[0-9@*#?$!-]/.test(n)) {
+			if (n === "@") this.multiField = true;
 			this.i += 2;
 			return OPAQUE;
 		}
@@ -1066,7 +1174,7 @@ export function braceExpand(text: string): string[] {
 export function parseShell(src: string, opts: ParseOptions, vars: Map<string, VarValue> = new Map()): ParseResult {
 	const p = new Parser(src.replace(/\r\n?/g, "\n"), opts, vars, undefined, undefined, opts.spans === true);
 	p.list(null);
-	return { commands: p.commands, failures: p.failures, ops: p.ops, keywords: p.keywords };
+	return { commands: p.commands, failures: p.failures, ops: p.ops, keywords: p.keywords, compounds: p.compounds };
 }
 
 /** Single-quote a value for re-parsing (`'it'\''s'`). */

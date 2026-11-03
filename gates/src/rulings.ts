@@ -7,8 +7,8 @@
 // entry by the asker, or raises it as before. A ruling comes only from Jo's words and is added only by
 // a code change here; it ends at its date, at the event its source names, or at once on Jo's
 // `end-ruling <id>` (surface/src/input.ts), an instruction on the standing workload that
-// `endedRulings` reads. A ruling decides only its own kind: round-limit, train, plan and
-// every other question is `other` and always asks.
+// `endedRulings` reads. A ruling decides only its own kind: train, plan and every other question is `other` and always
+// asks; a round-limit question is decided only by ruling `review-auto-extend` (below).
 //
 // Callers pass the facts a scope needs (`RulingFacts`): the classifier its R1–R5 verdict for a park
 // (classifier/extension.ts), a lane the workload's builders, stakes and train flag, and on a train's merge question the
@@ -26,6 +26,18 @@
 // answers decide nothing: the question is raised with ESCALATION_BY's `ruling-conflict: <q-…> <ruling ids…>`.
 // Both lines are control entries (surface/src/launch.ts), so a look-alike by anyone else is no mark.
 //
+// PLAN wl-mvqwn80onq9hq8 D6: ruling `routine-calls` decides a lane's record-announce question, one whose options carry
+// RECORD_ANNOUNCE_OPTION because the lane passed `routine: { record }` and the tool appended it (no lane spells it:
+// `machineOptionSpelling`). It holds only while `routineOn` (read through `facts.routineOn` inside askJo's write) is true,
+// off the plan slice, without `now`, and when the screen (`routineScreen`) finds no § A4 action in the body or the record
+// line. Its whole effect is `routine-recorded:`, `ruling-applied:` and a notice; it writes no instruction or answer.
+//
+// PLAN wl-mvqwn80onq9hq8 D10: ruling `review-auto-extend` decides the classifier's round-limit question (QuestionKind
+// `round-limit`, options extend / accept / stop) with `extend` at normal or production stakes when the loop's blocking count
+// fell in every round (`facts.fell`), the loop has no extend yet (`facts.extended`), `routineOn` holds and no `now`. The
+// classifier (classifier/extension.ts `roundSettled`) writes CLASSIFIER_BY's `review-rounds-extend:` naming the
+// `ruling-applied:` entry (`AskResult.applied`) and a notice in the same write.
+//
 // No import of surface/src/orchestrator-question.ts or surface/src/merge-train.ts: both call `askJo`,
 // and gates/src/rows already imports the former.
 import type { EntryRow, InstructionRow, Ledger } from "../../ledger/src/index";
@@ -33,12 +45,14 @@ import { type Builders, KIMI_OUT_RULE, labOf, reviewRow } from "../../classifier
 import { loadTierTable, modelIdentity } from "../../classifier/src/tier-table";
 import { controlEntries } from "../../surface/src/launch";
 import { installedConfigPath } from "../../surface/src/pair-suggest";
-import { ESCALATION_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../../surface/src/types";
+import { NOTICE_PREFIX } from "../../surface/src/notice";
+import { ESCALATION_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../../surface/src/types";
 
-export type RulingId = "kimi-out" | "flow-repair" | "merges" | "models" | "gates-stakes" | "train-signoff";
+export type RulingId = "kimi-out" | "flow-repair" | "merges" | "models" | "gates-stakes" | "train-signoff" | "routine-calls" | "review-auto-extend";
 
 /** What a question asks, from its option set (count-questions.py's mapping); a `model` question's kind is its declared subject. */
-export type QuestionKind = "review-park" | "open-workload" | "merge" | "stakes" | "lane-model" | "review-model" | "other";
+export type QuestionKind =
+	| "review-park" | "open-workload" | "merge" | "stakes" | "lane-model" | "review-model" | "round-limit" | "record-announce" | "other";
 
 /** The declared subject of a question whose every option is a `provider/model` id: the option set alone cannot tell them apart. */
 export const MODEL_SUBJECTS = ["lane-model", "review-model"] as const;
@@ -51,6 +65,48 @@ export interface RulingQuestion {
 	body: string;
 	options: readonly string[];
 	subject?: ModelSubject | null;
+	/**
+	 * The option the machinery recommends: set only by `askJo` from a lane's `routine: { record }`, which appends
+	 * RECORD_ANNOUNCE_OPTION itself (PLAN wl-mvqwn80onq9hq8 D6). Never stored, so `ruling-miss` cannot replay it.
+	 */
+	recommend?: string | null;
+	/** The lane's one-line record of a routine call, when `recommend` is set. */
+	record?: string | null;
+}
+
+/** PLAN wl-mvqwn80onq9hq8 D6: the machinery's option for a routine call; a lane's options never spell it (`machineOptionSpelling`). */
+export const RECORD_ANNOUNCE_OPTION = "record-and-announce";
+/** The longest record line `routine: { record }` takes. */
+export const ROUTINE_RECORD_MAX = 200;
+/** The longest cut of the record line the notice carries. */
+export const ROUTINE_NOTICE_RECORD_MAX = 120;
+/** The spellings a lane option may not take, compared with case and separators removed. */
+const MACHINE_OPTIONS = ["recordandannounce", "announceonly", "recordonly"];
+/** Is `option` the machinery's `record-and-announce`, `announce-only` or `record-only`, in any case or with any separators? */
+export const machineOptionSpelling = (option: string): boolean => MACHINE_OPTIONS.includes(option.toLowerCase().replace(/[^a-z0-9]/g, ""));
+
+/**
+ * PLAN wl-mvqwn80onq9hq8 D6, the screen: the § A4 action a routine question's body or record line names, or null. Such a
+ * question is never decided by ruling `routine-calls`; it goes to Jo. Lowercase `drop` and `truncate` count only with a
+ * table, database or schema after them; the uppercase SQL words count alone.
+ */
+const ROUTINE_SCREEN: readonly [string, RegExp][] = [
+	["force-push", /\bforce[\s-]?push|\bpush\b[^\n]*\s(?:--force|-f)\b|--force-with-lease/i],
+	["reset --hard", /\breset\s+--hard\b|\bhard[\s-]reset/i],
+	["branch or tag deletion", /\bbranch\s+-[dD]\b|\btag\s+-d\b|\bpush\b[^\n]*\s(?:--delete|-d)\b|\b(?:delet|remov)\w*\s+(?:\S+\s+){0,3}?(?:branch|tag)(?:es|s)?\b|\b(?:branch|tag)(?:es|s)?\s+(?:\S+\s+){0,2}?delet/i],
+	["rm -rf", /\brm\s+(?:-[a-zA-Z]+\s+)*-[a-zA-Z]*[rR][a-zA-Z]*\b/],
+	["DROP", /\bDROP\b|\b[Dd]rop\s+(?:the\s+|a\s+)?(?:\w+\s+)?(?:[Tt]able|[Dd]atabase|[Ss]chema|[Cc]olumn|[Ii]ndex)s?\b/],
+	["TRUNCATE", /\bTRUNCATE\b|\b[Tt]runcat\w*\s+(?:the\s+|a\s+)?(?:\w+\s+)?(?:[Tt]able|[Dd]atabase)s?\b/],
+	["production database", /\bprod(?:uction)?[\s-]+(?:db|database|data)\b/i],
+	["teardown", /\btear[\s-]?down\b|\btears?\s+down\b|\btore\s+down\b/i],
+	["destroy", /\bdestr(?:oy|uct)\w*/i],
+	["secret", /\bsecrets?\b/i],
+	["rotate", /\brotat\w*/i],
+	["protected branch", /\bprotected\s+branch|\bbranch\s+protection/i],
+];
+/** The first § A4 action `text` names (the screen), or null when it names none. */
+export function routineScreen(text: string): string | null {
+	return ROUTINE_SCREEN.find(([, re]) => re.test(text))?.[0] ?? null;
 }
 
 /**
@@ -67,7 +123,7 @@ export interface RulingFacts {
 	kimiOut?: boolean;
 	/** A lane's workload builders now (classifier/src/lab.ts `builderLabs`). */
 	builders?: Builders | null;
-	/** A lane's workload stakes. */
+	/** A lane's workload stakes, or the classifier's on a round-limit question. */
 	stakes?: string | null;
 	/** A lane's workload is a merge train. */
 	train?: boolean;
@@ -77,6 +133,20 @@ export interface RulingFacts {
 	about?: string | null;
 	/** The classifier review row's OpenAI model, read only when a review-model question needs it. */
 	reviewModel?: () => string | null;
+	/**
+	 * PLAN wl-mvqwn80onq9hq8 D1, D6, D10: is auto-apply on (gates/src/routine-switch.ts `routineOn`)? Called inside askJo's write,
+	 * never cached; rulings `routine-calls` and `review-auto-extend` decide nothing without it.
+	 */
+	routineOn?: () => boolean;
+	/** A lane's question is on its workload's plan slice (surface/src/launch.ts `planSlice` while `plan: first` stands). */
+	onPlanSlice?: boolean;
+	/**
+	 * PLAN wl-mvqwn80onq9hq8 D10, the classifier's round-limit question: every completed round of the loop has a known blocking
+	 * count, there are at least two, and each is strictly lower than the one before (classifier/src/rounds.ts `fellEveryRound`).
+	 */
+	fell?: boolean;
+	/** PLAN wl-mvqwn80onq9hq8 D10, the classifier's round-limit question: the loop already has an extend, Jo's or automatic. */
+	extended?: boolean;
 	/** The clock the rulings' dates are read on (ms since the epoch); `Date.now()` when absent. */
 	now?: number;
 }
@@ -115,14 +185,20 @@ export const RULED_LANE_MODEL = "anthropic/claude-opus-5-5";
 const PROVIDER_REFUSAL = /refus|\b(?:401|403|429)\b|quota|suspend|rate.?limit|overloaded|usage polic|non-retryable/i;
 /** The words an open-workload question queues with, in the order the answer prefers. */
 const QUEUE_WORDS = ["queue", "later", "hold"];
+/** The round-limit question's options (classifier/src/rounds.ts ROUND_LIMIT_OPTIONS) and the `pair` offer it may carry. */
+const ROUND_LIMIT_WORDS = ["extend", "accept", "stop"];
+const ROUND_LIMIT_EXTRA = "pair";
 
 /**
  * The question's kind, deterministic on the option set: `approve` is the plan question (`other`); `same-lab` a
  * review park; every option a `provider/model` id the declared `subject` (`other` when none is declared, which the
  * tools refuse before asking: `subjectProblem`); `normal` and `production` stakes; `open`/`launch` with
- * `later`/`hold`/`queue` an open-workload question; `merged`/`merge`/`integrate` a merge question; anything else `other`.
+ * `later`/`hold`/`queue` an open-workload question; `merged`/`merge`/`integrate` a merge question; `extend`, `accept` and
+ * `stop`, with nothing else but `pair`, the round-limit question (PLAN wl-mvqwn80onq9hq8 D10); then, when the
+ * machinery `recommend`s RECORD_ANNOUNCE_OPTION and the options carry it beside at least one of the lane's own, a
+ * record-announce question (PLAN wl-mvqwn80onq9hq8 D6); anything else `other`.
  */
-export function questionKind(options: readonly string[], subject?: ModelSubject | null): QuestionKind {
+export function questionKind(options: readonly string[], subject?: ModelSubject | null, recommend?: string | null): QuestionKind {
 	const s = new Set(options.map((o) => o.toLowerCase()));
 	if (s.has("approve")) return "other";
 	if (s.has("same-lab")) return "review-park";
@@ -130,6 +206,8 @@ export function questionKind(options: readonly string[], subject?: ModelSubject 
 	if (s.has("normal") && s.has("production")) return "stakes";
 	if ((s.has("open") || s.has("launch")) && QUEUE_WORDS.some((w) => s.has(w))) return "open-workload";
 	if (s.has("merged") || s.has("merge") || s.has("integrate")) return "merge";
+	if (ROUND_LIMIT_WORDS.every((w) => s.has(w)) && [...s].every((o) => ROUND_LIMIT_WORDS.includes(o) || o === ROUND_LIMIT_EXTRA)) return "round-limit";
+	if (recommend === RECORD_ANNOUNCE_OPTION && options.includes(RECORD_ANNOUNCE_OPTION) && options.some((o) => o !== RECORD_ANNOUNCE_OPTION)) return "record-announce";
 	return "other";
 }
 
@@ -161,7 +239,7 @@ export function trainSignoffAction(f: Extract<TrainSignoffFact, { ok: true }>): 
 	);
 }
 
-/** The six rulings: DRAFT.md § 4's five, with scope and end as their sources and REVIEW.md A4 give them, and train-signoff (PLAN wl-mvg8itbt0rz3ls D1). */
+/** The eight rulings: DRAFT.md § 4's five, with scope and end as their sources and REVIEW.md A4 give them, train-signoff (PLAN wl-mvg8itbt0rz3ls D1), routine-calls (PLAN wl-mvqwn80onq9hq8 D6) and review-auto-extend (D10). */
 export const STANDING_RULINGS: readonly Ruling[] = [
 	{
 		id: "kimi-out",
@@ -195,10 +273,12 @@ export const STANDING_RULINGS: readonly Ruling[] = [
 		id: "merges",
 		sources: ["in-mv91wdhs446ark"],
 		kinds: ["merge"],
-		scope: (_q, _k, f) => f.asker === "lane" && f.stakes === "normal" && f.train === false,
+		// PLAN wl-mvqwn80onq9hq8 D11: no stakes scope. A production lane's green, reviewed PR goes to the train too, which merges it
+		// once its plan is approved and its newest review passed (surface/src/merge-train.ts `prStakes`) and holds it on Jo's halt.
+		scope: (_q, _k, f) => f.asker === "lane" && f.train === false,
 		answer: () => "train",
 		action: () => "send lane_message that PR #N is green at <sha> and ready for the merge train, then release (lane_release)",
-		exceptions: "Production-stakes workloads and merge-train workloads ask.",
+		exceptions: "Merge-train workloads ask.",
 		ends: { at: null, event: "Jo's word" },
 	},
 	{
@@ -240,6 +320,45 @@ export const STANDING_RULINGS: readonly Ruling[] = [
 		exceptions:
 			"A PR whose merge question is already open on any of its train slices (Jo's answer stands), a merge question asked on a full-suite slice rather than the PR's disposition slice, a train Jo stopped and has not resumed with his train word, a PR no Jo `train` word named, a PR with no ledger workload (non-`wl/` branch, fork), a workload not at production stakes, held by Jo's halt (or the auto-start's hold), whose plan is not yet approved, or whose newest review has not passed or is still running, a head no green run tested, main's protection not verified ok live, or gh failing: asked.",
 		ends: { at: null, event: "Jo's end-ruling train-signoff (jo-issues #155: Jo's train word is the production sign-off)" },
+	},
+	{
+		// PLAN wl-mvqwn80onq9hq8 D6: Jo's in-mvqwmr95k54feo. A lane's routine call, the option the machinery appended, is
+		// recorded and announced: askJo writes `routine-recorded:`, `ruling-applied:` and the notice in one write, and nothing a
+		// lane or row 15 reads as Jo's word. Its whole effect is that record, so it authorizes no change.
+		id: "routine-calls",
+		sources: ["in-mvqwmr95k54feo"],
+		kinds: ["record-announce"],
+		scope: (q, _k, f) =>
+			f.asker === "lane" &&
+			f.onPlanSlice === false &&
+			routineScreen(q.body) === null &&
+			routineScreen(q.record ?? "") === null &&
+			f.routineOn?.() === true,
+		answer: () => RECORD_ANNOUNCE_OPTION,
+		action: () => "the record line is written as routine-recorded: and Jo has a notice; change nothing on the strength of this answer",
+		exceptions:
+			"A question on the plan slice, asked with `now`, by anyone but a lane, whose body or record line names a § A4 action (force-push, reset --hard, branch or tag deletion, rm -rf, DROP, TRUNCATE, production database, teardown, destroy, secret, rotate, protected branch), while Jo's `ask-all` or a trip holds auto-apply off, or whose notice cannot be written: asked.",
+		ends: { at: null, event: "Jo's end-ruling routine-calls; Jo's ask-all turns it off until auto-routine" },
+	},
+	{
+		// PLAN wl-mvqwn80onq9hq8 D10: Jo's in-mvqyknri0dy4g0. A review loop at its round limit whose blocking count fell in every
+		// round extends once by itself: the classifier writes CLASSIFIER_BY's `review-rounds-extend:` naming the ruling-applied
+		// entry and a notice in the same write (classifier/extension.ts `roundSettled`). The next limit in the loop has an extend,
+		// so it asks.
+		id: "review-auto-extend",
+		sources: ["in-mvqyknri0dy4g0"],
+		kinds: ["round-limit"],
+		scope: (_q, _k, f) =>
+			f.asker === "classifier" &&
+			(f.stakes === "normal" || f.stakes === "production") &&
+			f.fell === true &&
+			f.extended === false &&
+			f.routineOn?.() === true,
+		answer: () => "extend",
+		action: () => "the loop gets one more block of its round limit (review-rounds-extend:) and Jo has a notice; the next limit in this loop asks",
+		exceptions:
+			"A loop at throwaway stakes, whose blocking count was flat, rose, or was unknown or unread in any round, with fewer than two rounds, that already has an extend (Jo's or this ruling's), asked with `now`, by anyone but the classifier, while Jo's `ask-all` or a trip holds auto-apply off, or whose extend or notice cannot be written: asked.",
+		ends: { at: null, event: "Jo's end-ruling review-auto-extend; Jo's ask-all turns it off until auto-routine" },
 	},
 ];
 
@@ -290,7 +409,7 @@ export function rulingOutcome(
 	state: { now: number; ended: ReadonlySet<RulingId> },
 	rulings: readonly Ruling[] = STANDING_RULINGS,
 ): RulingOutcome {
-	const kind = questionKind(q.options, q.subject);
+	const kind = questionKind(q.options, q.subject, q.recommend);
 	if (kind === "other") return null;
 	const decisions: Decision[] = [];
 	for (const r of rulings) {
@@ -353,8 +472,8 @@ export function nowMarks(entries: readonly EntryRow[]): Map<string, NowCategory>
 	return out;
 }
 
-/** The ledger calls `askJo` makes; `Ledger` and the classifier's `RoutingLedger` satisfy it. */
-export type AskLedger = Pick<Ledger, "write" | "raiseQuestion" | "recordEntry" | "instructions" | "questions" | "entries">;
+/** The ledger calls `askJo` makes; `Ledger` and the classifier's `RoutingLedger` satisfy it. `enqueue` sends ruling routine-calls' notice. */
+export type AskLedger = Pick<Ledger, "write" | "raiseQuestion" | "recordEntry" | "instructions" | "questions" | "entries" | "enqueue">;
 
 export interface AskInput {
 	by: string;
@@ -365,10 +484,55 @@ export interface AskInput {
 	subject?: ModelSubject | null;
 	/** Jo hears it at once: one of `NOW_CATEGORIES`; any other word is refused and nothing is asked. */
 	now?: NowCategory | null;
+	/**
+	 * PLAN wl-mvqwn80onq9hq8 D6: a lane's routine call, from `lane_raise_question`'s `routine: { record }`. The options then carry
+	 * RECORD_ANNOUNCE_OPTION, which the tool appended, and the machinery recommends it.
+	 */
+	routine?: { record: string } | null;
 }
 
-/** A raised question, the open one an identical ask reused (nothing raised again), or a ruling's decision. */
-export type AskResult = { raised: string } | { raised: string; reused: true } | { decided: Decision };
+/**
+ * A raised question (with `noticeFailed` when ruling routine-calls decided it but its record or notice could not be written),
+ * the open one an identical ask reused (nothing raised again), or a ruling's decision with `applied`, the asker's
+ * `ruling-applied:` entry (the `by` of the classifier's auto-extend, PLAN wl-mvqwn80onq9hq8 D10), and `recorded`, the
+ * `routine-recorded:` entry and the notice message, when ruling routine-calls decided it.
+ */
+export type AskResult =
+	| { raised: string; noticeFailed?: string }
+	| { raised: string; reused: true }
+	| { decided: Decision; applied: string; recorded?: { entry: string; notice: string } };
+
+/** ESCALATION_BY's record of a record-and-announce question ruling routine-calls decided: `routine-recorded: <slice> <record line>`. */
+export const ROUTINE_RECORDED_PREFIX = "routine-recorded";
+export const routineRecordedBody = (sliceId: string, record: string): string => `${ROUTINE_RECORDED_PREFIX}: ${sliceId} ${record}`;
+/** ESCALATION_BY's record that a decided question's record or notice failed, so it was raised: `ruling-notice-failed: <q-…> <error>`. */
+export const RULING_NOTICE_FAILED_PREFIX = "ruling-notice-failed";
+/** The notice ruling routine-calls sends (after `notice: `): the slice, the answer, the ruling and the record line cut to ROUTINE_NOTICE_RECORD_MAX. */
+export function routineNoticeBody(sliceId: string, record: string): string {
+	const line = record.replace(/\s+/g, " ").trim();
+	const max = ROUTINE_NOTICE_RECORD_MAX;
+	return `auto-answered ${sliceId} ${RECORD_ANNOUNCE_OPTION} (ruling routine-calls): ${line.length > max ? `${line.slice(0, max - 1).trimEnd()}…` : line}`;
+}
+/** The tool's reply when ruling routine-calls decided a question (PLAN wl-mvqwn80onq9hq8 D6): what was done, and that it authorizes nothing. */
+export const routineDecidedText = (entryId: string): string =>
+	`decided by Jo's ruling routine-calls: ${RECORD_ANNOUNCE_OPTION}. Recorded ${entryId} and announced. This answer is a decision to change nothing; ` +
+	"it authorizes no code, privilege, spend or GitHub change. A change needs its own question. No question was raised; do not publish a QUESTION block.";
+
+/** Why a routine record line is refused, or null: one line, not empty, at most ROUTINE_RECORD_MAX characters. */
+export function routineRecordProblem(record: string): string | null {
+	if (record.trim() === "") return "`routine.record` is one line saying what is recorded; it is empty";
+	if (/[\r\n]/.test(record)) return "`routine.record` is one line; it has a line break";
+	if (record.length > ROUTINE_RECORD_MAX) return `\`routine.record\` is at most ${ROUTINE_RECORD_MAX} characters; it has ${record.length}`;
+	return null;
+}
+
+/** An error's message on one line, for a ledger body. */
+const oneLine = (e: unknown): string => (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").trim();
+
+/** askJo's throw when ruling routine-calls' record and notice failed and raising the question failed too: its message names both. */
+export class RoutineRaiseError extends Error {
+	override readonly name = "RoutineRaiseError";
+}
 
 /**
  * The orchestrator's subject entry, as surface/src/orchestrator-question.ts `questionSubjectBody` writes it (the surface,
@@ -412,7 +576,12 @@ function openRepeat(ledger: AskLedger, input: AskInput, facts: RulingFacts): str
  * - otherwise the rulings are checked: a decided question writes no question row and records `ruling-applied:` as the
  *   asker on the question's workload and slice; rulings in conflict decide nothing, and the question is raised with
  *   ESCALATION_BY's `ruling-conflict:`; with none deciding the question is raised (which pauses its slice).
- * Throws, asking nothing, when the declared subject does not fit the options or `now` is not one of `NOW_CATEGORIES`.
+ * PLAN wl-mvqwn80onq9hq8 D6: a record-announce question decided (ruling routine-calls) writes exactly ESCALATION_BY's
+ * `routine-recorded:`, the asker's `ruling-applied:` and ESCALATION_BY's notice, in one nested write; no instruction and no
+ * question row. When that nested write throws, all three roll back and the question is raised as an undecided one, with
+ * ESCALATION_BY's `ruling-notice-failed: <q-…> <error>` beside it; when that raise throws too, the error names both.
+ * Throws, asking nothing, when the declared subject does not fit the options, `now` is not one of `NOW_CATEGORIES`, or a
+ * `routine` ask's record line is not one line or its options lack RECORD_ANNOUNCE_OPTION.
  * `rulings` is `STANDING_RULINGS` except where a test injects others.
  */
 export function askJo(ledger: AskLedger, input: AskInput, facts: RulingFacts, rulings: readonly Ruling[] = STANDING_RULINGS): AskResult {
@@ -420,6 +589,12 @@ export function askJo(ledger: AskLedger, input: AskInput, facts: RulingFacts, ru
 	if (problem !== null) throw new Error(`${problem}; nothing was asked`);
 	const now = input.now ?? null;
 	if (now !== null && !isNowCategory(now)) throw new Error(`now is one of ${NOW_CATEGORIES.join(", ")}, not ${now}; nothing was asked`);
+	const routine = input.routine ?? null;
+	if (routine !== null) {
+		const recordProblem = routineRecordProblem(routine.record);
+		if (recordProblem !== null) throw new Error(`${recordProblem}; nothing was asked`);
+		if (!input.options.includes(RECORD_ANNOUNCE_OPTION)) throw new Error(`a routine ask carries the option ${RECORD_ANNOUNCE_OPTION}, which the tool appends; nothing was asked`);
+	}
 	const escalation = (body: string) =>
 		ledger.recordEntry({ by: ESCALATION_BY, workloadId: input.workloadId, sliceId: input.sliceId, kind: "assumption", body });
 	return ledger.write(() => {
@@ -428,24 +603,59 @@ export function askJo(ledger: AskLedger, input: AskInput, facts: RulingFacts, ru
 			if (now !== null && !nowMarks(ledger.entries(input.workloadId, "assumption")).has(open)) escalation(nowBody(open, now));
 			return { raised: open, reused: true as const };
 		}
-		const q = { body: input.body, options: input.options, subject: input.subject ?? null };
+		const q: RulingQuestion = {
+			body: input.body,
+			options: input.options,
+			subject: input.subject ?? null,
+			recommend: routine === null ? null : RECORD_ANNOUNCE_OPTION,
+			record: routine?.record ?? null,
+		};
 		const outcome =
 			now === null
 				? rulingOutcome(q, facts, { now: facts.now ?? Date.now(), ended: endedRulings(ledger.instructions(STANDING_WORKLOAD_ID)) }, rulings)
 				: null;
+		let noticeFailed: string | null = null;
 		if (outcome !== null && "decided" in outcome) {
-			const kind = questionKind(q.options, q.subject);
-			ledger.recordEntry({ by: input.by, workloadId: input.workloadId, sliceId: input.sliceId, kind: "assumption", body: rulingAppliedBody(outcome.decided, kind, input.sliceId) });
-			return { decided: outcome.decided };
+			const kind = questionKind(q.options, q.subject, q.recommend);
+			const applied = () =>
+				ledger.recordEntry({ by: input.by, workloadId: input.workloadId, sliceId: input.sliceId, kind: "assumption", body: rulingAppliedBody(outcome.decided, kind, input.sliceId) });
+			if (kind !== "record-announce") {
+				return { decided: outcome.decided, applied: applied() };
+			}
+			const record = routine!.record;
+			try {
+				const { applied: appliedId, ...recorded } = ledger.write(() => {
+					const entry = escalation(routineRecordedBody(input.sliceId, record));
+					const appliedEntry = applied();
+					const notice = ledger.enqueue({
+						by: ESCALATION_BY, workloadId: input.workloadId, sender: ESCALATION_BY, recipient: ORCHESTRATOR_RECIPIENT, body: `${NOTICE_PREFIX} ${routineNoticeBody(input.sliceId, record)}`,
+					});
+					return { entry, notice, applied: appliedEntry };
+				});
+				return { decided: outcome.decided, applied: appliedId, recorded };
+			} catch (e) {
+				noticeFailed = oneLine(e);
+			}
 		}
-		const raised = ledger.raiseQuestion({ by: input.by, workloadId: input.workloadId, sliceId: input.sliceId, body: input.body, options: input.options });
+		let raised: string;
+		try {
+			raised = ledger.raiseQuestion({ by: input.by, workloadId: input.workloadId, sliceId: input.sliceId, body: input.body, options: input.options });
+			if (noticeFailed !== null) escalation(`${RULING_NOTICE_FAILED_PREFIX}: ${raised} ${noticeFailed}`);
+		} catch (e) {
+			if (noticeFailed === null) throw e;
+			throw new RoutineRaiseError(
+				`ruling routine-calls decided the question on ${input.sliceId}, but writing its record and notice failed (${noticeFailed}), ` +
+					`and raising it to Jo failed too (${oneLine(e)}); nothing was written. Next step: report both errors to the orchestrator with lane_message.`,
+				{ cause: e },
+			);
+		}
 		if (now !== null) escalation(nowBody(raised, now));
-		if (outcome !== null) escalation(rulingConflictBody(raised, outcome.conflict));
-		return { raised };
+		if (outcome !== null && "conflict" in outcome) escalation(rulingConflictBody(raised, outcome.conflict));
+		return noticeFailed === null ? { raised } : { raised, noticeFailed };
 	});
 }
 
-/** The question id of a question no ruling decides (a round-limit or train question); a decision there is a defect, thrown. */
+/** The question id of a question no ruling decides (a train question, or one the asker knows no ruling covers); a decision there is a defect, thrown. */
 export function raisedId(r: AskResult, what: string): string {
 	if ("raised" in r) return r.raised;
 	throw new Error(`Jo's ruling ${r.decided.ruling} decided ${what}, a kind no ruling covers`);

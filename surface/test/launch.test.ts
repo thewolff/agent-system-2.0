@@ -12,10 +12,11 @@ import {
 	laneExitBody, laneReadyBody, launchable, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, launchRequestedBody, maxTimeMs,
 	PLAN_FILE_MAX_BYTES, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_SHAPE, planAutoApprovedBody, planFirst, planFirstBody, planHaltedBody, planQuestionProblem, prBindingInstructionBody,
 	PRIORITY_REASON_PREFIX, priorityPausedOf, priorityPausingOf, requirementsProblem, reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
-	testPrBody, testPrInstructionBody, type Resolution, resumePlan, resumeSession, TRAIN_LANDS_LINE, verdictOf, waivedPrs, waivePrBody, waivePrInstructionBody,
+	testPrBody, testPrInstructionBody, type Resolution, resumePlan, resumeSession, TRAIN_LANDS_LINE, TRAIN_LANDS_PRODUCTION_LINE, verdictOf, waivedPrs, waivePrBody, waivePrInstructionBody,
 	withdrawInstructionBody, withdrawnBody, withdrawnBy, landFirstBody, landFirstInstructionBody, landFirstOn, mainRetries, mainRetryBody, mainRetryInstructionBody, sameRepo,
 } from "../src/launch";
-import { consumedByReady, TRAIN_LAUNCH_LIMIT, TRAIN_LAUNCH_OPTIONS, trainLaunchFailures, type TrainLaunchRows } from "../src/merge-train";
+import { consumedByReady, TRAIN_DONE, TRAIN_LAUNCH_LIMIT, TRAIN_LAUNCH_OPTIONS, trainLaunchFailures, type TrainLaunchRows } from "../src/merge-train";
+import { trainBudgetSliceId, trainPausedBody, trainRaiseBody } from "../src/train-budget";
 import type { CleanShellRead } from "../../gates/src/clean-shell";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { pairOfferBody, pairSignalBody, pairSignalFailedBody } from "../src/pair-suggest";
@@ -175,12 +176,15 @@ describe("control writers (Codex review 2, R4)", () => {
 		expect(control([entry(LANE_RUNNER_BY, body)]).map((c) => [c.prefix, c.laneId, c.createdBy])).toEqual([["launch-failed", lane, LANE_RUNNER_BY]]);
 		expect(control([entry(lane, body)], lane)).toEqual([]);
 	});
-	test("ceiling: is the surface's alone and spend: the runner's alone; the lane tools' refusal sees both as reserved", () => {
+	test("ceiling: is the surface's and the runner's (D12's auto-raise), ceiling-mark: and spend: the runner's alone; the lane tools' refusal sees all three as reserved", () => {
 		const ceiling = "ceiling: usd 50 wall 360 source stakes normal";
 		const spend = "spend: lane-m-1 usd 1 tokens 10 wall 2";
-		expect(control([entry(SURFACE_BY, ceiling), entry(LANE_RUNNER_BY, spend)]).map((c) => [c.prefix, c.laneId])).toEqual([["ceiling", null], ["spend", "lane-m-1"]]);
-		expect(control([entry(LANE_RUNNER_BY, ceiling), entry("lane-m-1", ceiling), entry(SURFACE_BY, spend), entry("lane-m-1", spend)], "lane-m-1")).toEqual([]);
-		expect([reservedPrefix(ceiling), reservedPrefix(spend)]).toEqual(["ceiling", "spend"]);
+		const mark = `ceiling-mark: origin wl/wl-m file:///r.git ${"a".repeat(40)}`;
+		expect(control([entry(SURFACE_BY, ceiling), entry(LANE_RUNNER_BY, ceiling), entry(LANE_RUNNER_BY, spend), entry(LANE_RUNNER_BY, mark)]).map((c) => [c.prefix, c.laneId, c.createdBy])).toEqual([
+			["ceiling", null, SURFACE_BY], ["ceiling", null, LANE_RUNNER_BY], ["spend", "lane-m-1", LANE_RUNNER_BY], ["ceiling-mark", null, LANE_RUNNER_BY],
+		]);
+		expect(control([entry("lane-m-1", ceiling), entry(SURFACE_BY, spend), entry("lane-m-1", spend), entry(SURFACE_BY, mark), entry("lane-m-1", mark)], "lane-m-1")).toEqual([]);
+		expect([reservedPrefix(ceiling), reservedPrefix(spend), reservedPrefix(mark)]).toEqual(["ceiling", "spend", "ceiling-mark"]);
 	});
 	test("released-open: (MIGRATION.md item 40) is honoured only from a holder writing about itself; the lane tools' refusal sees it as reserved", () => {
 		const lane = "lane-m-1";
@@ -431,17 +435,75 @@ describe("first prompt merge line (decision 11, Codex review S7)", () => {
 			expect(served).not.toContain("tell Jo");
 			for (const s of ["cross-lab review", "green at its head", "record done-because and release", "the merge train lands the PR"]) expect(served).toContain(s);
 		}
-		// everyone else keeps the current text: a repo the runner does not serve, a train or fix lane, other stakes, a user-driven lane
+		// everyone else keeps the current text: a repo the runner does not serve, a train or fix lane, throwaway stakes, a user-driven lane
 		expect(line(lane({}, false, false))).toContain("never merge on this repo: Jo integrates it.");
 		expect(line(lane({}, false, false, false))).toContain("merge proceeds on a judge slice's pass");
 		expect(line(lane({}, true, true))).toContain("never merge on this repo: Jo integrates it.");
 		expect(line(lane({}, true, true, false))).toContain("merge proceeds on a judge slice's pass");
-		expect(line(lane({ stakes: "production" }, true, false, false))).toContain("the merge is Jo's");
+		expect(line(lane({ stakes: "production" }, false, false, false))).toContain("the merge is Jo's");
 		expect(line(lane({ stakes: "throwaway" }, true, false, false))).toContain("merge when green");
 		expect(line(lane({ mode: "user-driven" }, true, false))).toContain("never merge on this repo: Jo integrates it.");
-		for (const text of [lane({}, false, false), lane({}, true, true), lane({ stakes: "production" }, true, false), lane({ mode: "user-driven" }, true, false)]) {
+		for (const text of [lane({}, false, false), lane({}, true, true), lane({ stakes: "throwaway" }, true, false), lane({ mode: "user-driven" }, true, false)]) {
 			expect(line(text)).not.toContain(TRAIN_LANDS_LINE);
 		}
+	});
+
+	test("R27 (PLAN wl-mvqwn80onq9hq8 D11): an autonomous, runner-served, production machinery lane is told the train merges its green, reviewed PR, never that Jo integrates it", () => {
+		const lane = (over: Partial<WorkloadRow>, runnerServed: boolean, trainOrFix: boolean, machinery = true) => firstPrompt({
+			workload: workload({ stakes: "production", mode: "autonomous", ...over }), laneId: "lane-m-1", repo: "/r", worktree: "/r-lanes/wl-m", branch: "wl/wl-m", done: "it works",
+			planFirst: null, decisionLog: "", facts: "", resolved: [], instructions: [], machinery, tools: ["lane_release"], runnerServed, trainOrFix,
+		});
+		const line = (text: string) => text.split("\n").find((l) => l.startsWith("worktree: "))!;
+		for (const machinery of [true, false]) {
+			const served = line(lane({}, true, false, machinery));
+			expect(served).toEndWith(TRAIN_LANDS_PRODUCTION_LINE);
+			expect(served).not.toContain("Jo integrates");
+			expect(served).not.toContain("the merge is Jo's");
+			for (const s of ["cross-lab review", "record done-because and release", "the merge train merges a green, reviewed PR", "with no question to Jo", "Jo's halt"]) {
+				expect(served).toContain(s);
+			}
+		}
+		// the train branch is checked before the machinery branch only for a served, autonomous, non-train production lane
+		expect(line(lane({}, false, false))).toContain("never merge on this repo: Jo integrates it.");
+		expect(line(lane({}, true, true))).toContain("never merge on this repo: Jo integrates it.");
+		expect(line(lane({ mode: "user-driven" }, true, false))).toContain("never merge on this repo: Jo integrates it.");
+		expect(line(lane({}, true, true, false))).toContain("the merge is Jo's");
+		for (const text of [lane({}, false, false), lane({}, true, true), lane({ mode: "user-driven" }, true, false)]) {
+			expect(line(text)).not.toContain(TRAIN_LANDS_PRODUCTION_LINE);
+		}
+	});
+});
+
+describe("first prompt on the permanent merge train (PLAN wl-mvr888nftz0vcl D11, D13, R13)", () => {
+	const prompt = (train: Parameters<typeof firstPrompt>[0]["train"]) => firstPrompt({
+		workload: workload({ id: "wl-trainx", stakes: "normal", mode: "autonomous" }), laneId: "lane-m-1", repo: "/r", worktree: "/r-lanes/wl-trainx", branch: "wl/wl-trainx",
+		done: "the stored done line", planFirst: null, decisionLog: "", facts: "", resolved: [], instructions: [], machinery: true, tools: ["lane_release"], train,
+	});
+	const line = (text: string, head: string) => text.split("\n").find((l) => l.startsWith(head))!;
+
+	test("R13: a train lane's done: is TRAIN_DONE, its brief is built now, and its closing line releases with no done-because", () => {
+		const text = prompt({ prs: [117, 118], source: "board" });
+		expect(line(text, "done: ")).toBe(`done: ${TRAIN_DONE}`);
+		expect(text).not.toContain("the stored done line");
+		expect(line(text, "brief: ")).toContain("#117");
+		expect(text).toContain("sl-train-trainx-117, suite runs on sl-train-trainx-117-full-1");
+		expect(text).toContain("`train-pr: <n> start`");
+		expect(text).not.toContain("Write `done-because:");
+		expect(text).not.toContain("record done-because");
+		expect(text).toContain("release with no done-because: this train is permanent");
+	});
+
+	test("lane decision en-mvznmxcdh0ucsj: a PR on its second attempt is listed with its -a2 slices", () => {
+		const text = prompt({ prs: [117, 118], source: "board", attempts: new Map([[117, { attempt: 2, since: "2026-11-01T00:00:00.000Z" }]]) });
+		expect(text).toContain("#117: sl-train-trainx-117-a2, suite runs on sl-train-trainx-117-a2-full-1, sl-train-trainx-117-a2-full-2");
+		expect(text).toContain("#118: sl-train-trainx-118, suite runs on sl-train-trainx-118-full-1");
+	});
+
+	test("every other lane keeps its done line and the done-because closing line", () => {
+		const text = prompt(null);
+		expect(line(text, "done: ")).toBe("done: the stored done line");
+		expect(text).toContain("Write `done-because: <receipt against the done: line>` with `lane_record_entry` before `lane_release`");
+		expect(text).not.toContain(TRAIN_DONE);
 	});
 });
 
@@ -1171,5 +1233,106 @@ describe("land-first rows: writers and activation (PLAN wl-mvq4edbaf13vnk D12, R
 		expect(landFirstOn(rows, instructions, "thewolff/newdle-web")).toBe(false);
 		expect(mainRetries(rows, instructions, "thewolff/newdle-web")).toEqual([rows[1]!.created_at]);
 		expect(mainRetries(rows, instructions, "agent-system-2.0")).toEqual([]);
+	});
+});
+
+describe("a merge train's daily budget in the launch predicate (PLAN wl-mvr888nftz0vcl D5, R6, R8, R10)", () => {
+	// NOW is 2026-10-01 03:00 PDT: the day's pause runs until 2026-10-02T07:00Z, the day before's ended at 2026-10-01T07:00Z.
+	const UNTIL = "2026-10-02T07:00:00.000Z";
+	let k = 0;
+	const at = (iso: string, by: string, body: string): EntryRow => ({ id: `en-b${++k}`, workload_id: "wl-m", slice_id: null, kind: "assumption", body, created_by: by, created_at: iso } as EntryRow);
+	const paused = (iso: string, day: string, until: string, by = LANE_RUNNER_BY) => at(iso, by, trainPausedBody({ laneId: "lane-m-1", day, usd: 150.5, limit: 150, pr: 7, until }));
+	const joRequest = (iso: string) => at(iso, SURFACE_BY, launchRequestedBody("jo", iso));
+	const tried = () => at("2026-10-01T08:00:00.000Z", LANE_STARTER_BY, "launch: lane-m-1 cause first requested-by jo");
+	const rows = (entries: EntryRow[], over: Partial<ReserveRows> = {}): ReserveRows => ({
+		workload: workload(), entries, questions: [], instructions: [], slices: [], holders: [], liveLanes: 0, capExempt: true, cap: 3, now: NOW, ...over,
+	});
+	/** The tick's question on pause `p`'s budget slice, answered by Jo with `answer` when given. */
+	const askedOf = (p: EntryRow, answer: string | null): Pick<ReserveRows, "questions" | "instructions"> => {
+		const q: QuestionRow = {
+			id: "q-b1", workload_id: "wl-m", slice_id: trainBudgetSliceId("wl-m", p.id), body: "raise or wait?", options: JSON.stringify(["raise", "wait"]),
+			state: answer === null ? "open" : "answered", resolved_by: answer === null ? null : "in-b1", created_by: MERGE_TRAIN_BY, created_at: NOW, changed_by: MERGE_TRAIN_BY, changed_at: NOW, rev: 0,
+		};
+		const ins: InstructionRow[] = answer === null ? [] : [{
+			id: "in-b1", workload_id: "wl-m", slice_id: q.slice_id, kind: "answer", question_id: q.id, disposition: null, channel: "surface", author: "jo", body: answer, created_by: SURFACE_BY, created_at: NOW,
+		}];
+		return { questions: [q], instructions: ins };
+	};
+
+	test("budget-paused refuses before any request is read: Jo's launch request written while paused, a tick request and a first launch all wait", () => {
+		const p = paused("2026-10-01T09:00:00.000Z", "2026-10-01", UNTIL);
+		const no = { launch: false, reason: "budget-paused" };
+		expect(verdictOf(rows([p]))).toEqual(no);
+		expect(verdictOf(rows([tried(), p, joRequest("2026-10-01T09:30:00.000Z")]))).toEqual(no);
+		expect(verdictOf(rows([tried(), p, at("2026-10-01T09:30:00.000Z", MERGE_TRAIN_BY, launchRequestedBody(MERGE_TRAIN_BY, NOW))]))).toEqual(no);
+		// held and closed still come first
+		expect(verdictOf(rows([p], { workload: workload({ status: "closed" }) }))).toEqual({ launch: false, reason: "closed" });
+	});
+
+	test("a same-day raise after the pause lifts it; midnight lifts a single-day pause; the request then launches", () => {
+		const p = paused("2026-10-01T09:00:00.000Z", "2026-10-01", UNTIL);
+		const req = joRequest("2026-10-01T09:30:00.000Z");
+		const raise = at("2026-10-01T09:40:00.000Z", SURFACE_BY, trainRaiseBody("2026-10-01", 50, "in-r"));
+		expect(verdictOf(rows([tried(), p, req, raise]))).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+		expect(verdictOf(rows([tried(), p, req], { now: UNTIL }))).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+		// a lane-written raise is not the surface's: still paused
+		expect(verdictOf(rows([tried(), p, req, at("2026-10-01T09:40:00.000Z", "lane-m-1", trainRaiseBody("2026-10-01", 50, "in-r"))]))).toEqual({ launch: false, reason: "budget-paused" });
+	});
+
+	test("budget-decision past midnight after two paused PDT days, until Jo answers; a second-day raise answer clears it", () => {
+		const p1 = paused("2026-09-30T20:00:00.000Z", "2026-09-30", "2026-10-01T07:00:00.000Z");
+		const p2 = paused("2026-10-01T09:00:00.000Z", "2026-10-01", UNTIL);
+		const after = "2026-10-02T09:00:00.000Z";
+		expect(verdictOf(rows([tried(), p1, p2], { now: after, ...askedOf(p2, null) }))).toEqual({ launch: false, reason: "budget-decision" });
+		const raise = at("2026-10-02T08:00:00.000Z", SURFACE_BY, trainRaiseBody("2026-10-01", 50, "in-b1"));
+		const req = at("2026-10-02T08:00:00.000Z", SURFACE_BY, launchRequestedBody(MERGE_TRAIN_BY, after));
+		expect(verdictOf(rows([tried(), p1, p2, raise, req], { now: after, ...askedOf(p2, "raise 50") }))).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+		// launchable with no question rows given cannot see an answer: the default fails closed
+		expect(launchable(workload(), control([tried(), p1, p2]), null, [], after, 0, 3, true)).toEqual({ launch: false, reason: "budget-decision" });
+	});
+
+	test("meter-error refuses until Jo's relaunch answer or his later launch word", () => {
+		const e = at("2026-10-01T09:00:00.000Z", LANE_RUNNER_BY, "train-meter-error: lane-m-1 /s/lane.jsonl:4 the line is not JSON");
+		expect(verdictOf(rows([tried(), e]))).toEqual({ launch: false, reason: "meter-error" });
+		const req = joRequest("2026-10-01T09:30:00.000Z");
+		expect(verdictOf(rows([tried(), e, req]))).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+		expect(verdictOf(rows([tried(), e], askedOf(e, "hold")))).toEqual({ launch: false, reason: "meter-error" });
+	});
+
+	test("R10: a workload that is not a train never reads the budget rows, and a train's ceiling: rows are never read", () => {
+		const p = paused("2026-10-01T09:00:00.000Z", "2026-10-01", UNTIL);
+		expect(verdictOf(rows([p], { capExempt: false }))).toEqual({ launch: true, cause: { kind: "first" } });
+		expect(verdictOf(rows([tried(), p, at("2026-10-01T09:01:00.000Z", LANE_RUNNER_BY, "train-meter-error: lane-m-1 /s:1 x")], { capExempt: false }))).toEqual({ launch: false, reason: "died-not-relaunched" });
+		const ceiling = at("2026-10-01T08:30:00.000Z", SURFACE_BY, "ceiling: usd 1 wall 1 source tiny");
+		const spent = at("2026-10-01T08:40:00.000Z", LANE_RUNNER_BY, "lane-stop: lane-m-1 accepted ceiling");
+		expect(verdictOf(rows([ceiling, spent]))).toEqual({ launch: true, cause: { kind: "first" } });
+	});
+
+	test("the budget prefixes are written only by their writers: the runner's three, the surface's raise", () => {
+		const body = trainPausedBody({ laneId: "lane-m-1", day: "2026-10-01", usd: 151, limit: 150, pr: null, until: UNTIL });
+		for (const [prefix, text, writer] of [
+			["train-paused", body, LANE_RUNNER_BY],
+			["train-meter-error", "train-meter-error: lane-m-1 /s:1 x", LANE_RUNNER_BY],
+			["train-rule", "train-rule: lane-m-1 permanent budget 150 per PDT day max-time 1440m", LANE_RUNNER_BY],
+			["train-raise", trainRaiseBody("2026-10-01", 50, "in-r"), SURFACE_BY],
+		] as const) {
+			const kept = (by: string) => control([launch("lane-m-1", "first"), entry(by, text)], "lane-m-1").filter((c) => c.prefix === prefix);
+			expect(kept(writer)).toHaveLength(1);
+			for (const other of [LANE_RUNNER_BY, SURFACE_BY, MERGE_TRAIN_BY, LANE_STARTER_BY, "lane-m-1"].filter((x) => x !== writer)) expect(kept(other)).toEqual([]);
+		}
+	});
+});
+
+describe("a merge train is refused by hand (PLAN wl-mvr888nftz0vcl D5)", () => {
+	const rows = (w: WorkloadRow, capExempt: boolean): ReserveRows => ({
+		workload: w, entries: [], questions: [], instructions: [], slices: [], holders: [], liveLanes: 0, capExempt, cap: 3, now: NOW,
+	});
+	test("`as2 lane <train>` is refused train-autonomous in either mode; closed comes first; a non-train decides as before", () => {
+		const no = { launch: false, reason: "train-autonomous" };
+		expect(decideInteractive(rows(workload({ mode: "user-driven" }), true))).toEqual(no);
+		expect(decideInteractive(rows(workload(), true))).toEqual(no);
+		expect(decideInteractive(rows(workload({ mode: "user-driven", status: "closed" }), true))).toEqual({ launch: false, reason: "closed" });
+		expect(decideInteractive(rows(workload({ mode: "user-driven" }), false))).toEqual({ launch: true, cause: "interactive" });
+		expect(decideInteractive(rows(workload(), false))).toEqual({ launch: false, reason: "autonomous" });
 	});
 });

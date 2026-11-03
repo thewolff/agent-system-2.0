@@ -122,6 +122,9 @@ gates/src/rows/r10-raw-ledger.ts	module	-
 gates/src/rows/r11-jo-instruction.ts	module	-
 gates/src/rows/r14-ask-policy.ts	module	-
 gates/src/rulings.ts	module	-
+gates/src/routine.ts	module	-
+gates/src/routine-switch.ts	module	-
+gates/src/routine-worker.ts	module	-
 gates/src/session.ts	module	-
 gates/src/shell-parse.ts	module	-
 gates/src/targets.ts	module	-
@@ -131,7 +134,11 @@ gates/src/git-model.ts	module	-
 gates/src/fence.ts	module	-
 gates/test/case-and-noexec.test.ts	test	-
 gates/test/rulings.test.ts	test	-
+gates/test/routine.test.ts	test	-
+gates/test/routine-switch.test.ts	test	-
 gates/test/r06-reserved.test.ts	test	-
+gates/test/r06-floor.test.ts	test	-
+gates/test/routine-gate.test.ts	test	-
 gates/test/r06-land-first.test.ts	test	-
 gates/test/extension.test.ts	test	-
 gates/test/helpers.ts	test	-
@@ -1091,6 +1098,7 @@ surface/test/input.test.ts	test	-
 surface/test/numbering.test.ts	test	-
 surface/test/decision-log.test.ts	test	-
 surface/test/extension.test.ts	test	-
+surface/test/errors.test.ts	test	-
 surface/src/signals.ts	module	-
 surface/src/delivery.ts	module	-
 surface/extensions/lane.ts	module	-
@@ -1122,6 +1130,7 @@ surface/test/lane-model-script.test.ts	test	-
 surface/test/lane-resume-script.test.ts	test	-
 surface/test/by-hand-context.test.ts	test	-
 surface/test/lane-headroom-script.test.ts	test	-
+surface/test/lane-extensions-suspended.test.ts	test	-
 surface/src/ctx-index.ts	module	-
 surface/test/ctx-index.test.ts	test	-
 surface/src/close-entry.ts	module	-
@@ -1147,6 +1156,7 @@ surface/test/main-state.test.ts	test	-
 surface/scripts/test-runner.ts	module	-
 surface/scripts/promote-verified.ts	module	-
 surface/test/test-runner.test.ts	test	-
+surface/test/hook-marker.test.ts	test	-
 surface/scripts/test-run-waits.ts	module	-
 surface/test/test-run-waits.test.ts	test	-
 surface/src/merge-train.ts	module	-
@@ -1154,6 +1164,7 @@ surface/src/merge-train-resolve.ts	module	-
 surface/src/merge-train-stack.ts	module	-
 surface/scripts/merge-train.ts	module	-
 surface/test/merge-train-resolve.test.ts	test	-
+surface/test/merge-train.test.ts	test	-
 surface/test/train-word.test.ts	test	-
 surface/test/merge-train-stack.test.ts	test	-
 surface/test/train-return.test.ts	test	-
@@ -1491,6 +1502,19 @@ surface/test/fixtures/timing-lint/positive.txt	test	-
 surface/test/fixtures/timing-lint/negative.txt	test	-
 surface/test/fixtures/timing-lint/opt-out.txt	test	-
 surface/test/fixtures/timing-lint/opt-out-bad.txt	test	-
+# The permanent merge train (wl-mvr888nftz0vcl, migration/items/permanent-merge-train.md): the daily budget, its
+# pause, raise, meter and launch gate, and the tests of the budget and of the train's permanence.
+surface/src/train-budget.ts	module	-
+surface/test/train-budget.test.ts	test	-
+surface/test/train-permanent.test.ts	test	-
+surface/test/errors-board-refused.test.ts	test	-
+# Test-timing automation, isolated proof requests and executor-owned resource admission.
+surface/src/timing-automation.ts	module	-
+surface/test/timing-automation.test.ts	test	-
+surface/src/timing-proof.ts	module	-
+surface/test/timing-proof.test.ts	test	-
+surface/src/test-resources.ts	module	-
+surface/test/test-resources.test.ts	test	-
 # as2 doctor (PLAN wl-mvwks11ye3x9zu): the checks, episodes and popups, the CLI, the entry text forms, the alarm popup, the fakes.
 surface/src/doctor.ts	module	-
 surface/src/doctor-entries.ts	module	-

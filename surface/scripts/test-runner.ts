@@ -111,6 +111,8 @@
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS    the refresh helper's cap (default REFRESH_CAP_S plus a minute, 15 min)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS  its SIGTERM-to-SIGKILL grace (default 10 s)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_REAP_MS   how long it then waits for sudo to exit (default 30 s)
+//   AGENT_SYSTEM_TEST_RUNNER_CLOCK         a file of whole milliseconds the runner's deadline clock runs ahead of Date.now()
+//                                           (`runnerNow`); a test rewrites it to step a deadline past instead of waiting it out
 //   AGENT_SYSTEM_TEST_HOOKS                 a directory of pause/mark files at named boundaries (`hook`), and the
 //                                           `<run id>.refresh-signal.refuse` file: the runner's signals to the refresh
 //                                           helper's sudo are refused, as the kernel may refuse Jo's signal to a root sudo
@@ -125,7 +127,7 @@ import { dirname, join, resolve } from "node:path";
 import { assertNotLiveLedgerUnderTest, defaultLedgerPath, type EntryRow, Ledger, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import {
 	AS2_VERIFIED_TAG, AS2TEST_LIBEXEC, AS2TEST_SUDOERS, CHECKOUT_DRIFT, type DsclRead, type InstallFacts, installDecision, type InstallVerdict, type OwnerIds, preflightDecision,
-	preflightProbes, probeCall, probeDecision, readInstall, REBUILT_FILES, REFRESH_CAP_S, REFRESH_EXIT, REFRESH_FAILED, type Verdict,
+	preflightProbes, probeCall, probeDecision, readInstall, REBUILT_FILES, REFRESH_CAP_S, REFRESH_EXIT, REFRESH_FAILED, RESOURCE_POLICY, type Verdict,
 } from "../src/as2test";
 import { repoOf } from "../src/decision-log";
 import { FastSetError, type FastRun, type FullRun, fastSet, parseCheck, type ReadFile } from "../src/fast-set";
@@ -146,6 +148,9 @@ import {
 	testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict, soloPlan, type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
 import { liveProcs, snapshot, STUCK_DEFAULTS } from "../src/stuck-detect";
+import {
+	type ExclusiveSession, openProofSchema, type PinnedTarget, proofRunIds, proofWaiterLive, recoverHistoricLoad, recoverProofSeries, type SessionPart,
+} from "../src/timing-proof";
 import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID } from "../src/types";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
@@ -176,9 +181,9 @@ const STUCK_BACKSTOP_MS = STUCK_DEFAULTS.persistMs + STUCK_DEFAULTS.signatureCap
 /** How often the backstop reads an enforce part's stdout (AGENT_SYSTEM_TEST_RUNNER_STUCK_POLL_MS). */
 const STUCK_POLL_MS = 1_000;
 /** One deadline over every attempt of the sweep after a stuck or stalled part, the only cleanup step (AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS). */
-const STUCK_SWEEP_MS = 12_000;
+export const STUCK_SWEEP_MS = 12_000;
 /** The post-sweep deadline of a stuck or stalled run, under FINALIZE_MS (AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS). */
-const STUCK_FINALIZE_MS = 12_000;
+export const STUCK_FINALIZE_MS = 12_000;
 /** How long after the stuck fact the containment check may retry before the run names its failure (AGENT_SYSTEM_TEST_RUNNER_STUCK_CONTAIN_MS). */
 const STUCK_CONTAIN_MS = 60_000;
 /** Between containment checks, a bounded sweep and this wait (AGENT_SYSTEM_TEST_RUNNER_CONTAIN_RETRY_MS). */
@@ -186,12 +191,40 @@ const CONTAIN_RETRY_MS = 5_000;
 /** How long a run retries the admission gate before it ends `admission refused` (AGENT_SYSTEM_TEST_RUNNER_ADMIT_MS). */
 const ADMIT_MS = 30_000;
 /** The post-sweep finalization deadline of a run that was not stuck (AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS). */
-const FINALIZE_MS = 150_000;
+export const FINALIZE_MS = 150_000;
 
-const msEnv = (name: string, fallback: number): number => {
+export const msEnv = (name: string, fallback: number): number => {
 	const n = Number(process.env[name]);
 	return Number.isFinite(n) && n > 0 ? n : fallback;
 };
+
+/**
+ * The runner's clock for its own deadlines (the clock-ownership table's runner row, PLAN wl-mvtueivmiujnom sl-timing-detector): the
+ * post-sweep finalization deadline (head re-check, result, publication), the release horizon, the stuck sweep, containment and
+ * admission deadlines with their ownership checkpoints, and the verified reconciliation and promotion holder budget. Production
+ * reads Date.now(). Under test, AGENT_SYSTEM_TEST_RUNNER_CLOCK names a file holding the whole milliseconds this clock runs ahead of
+ * Date.now(): a test steps a deadline past by rewriting the file (atomically) while it observes the run, instead of waiting real
+ * time out. An unreadable file, or one that holds anything but whole milliseconds, throws naming the file; never a silent zero.
+ * Lock heartbeats and the queue's liveness stay on Date.now(): other processes write and judge them. The release horizon compares
+ * the row's heartbeatAt with this clock, so a step brings that horizon closer by the step.
+ */
+export function runnerNow(): number {
+	return Date.now() + runnerClockAhead();
+}
+function runnerClockAhead(): number {
+	const path = process.env.AGENT_SYSTEM_TEST_RUNNER_CLOCK;
+	if (!path) return 0;
+	let text: string;
+	try {
+		text = readFileSync(path, "utf8");
+	} catch (e) {
+		throw new Error(`the runner clock file ${path} (AGENT_SYSTEM_TEST_RUNNER_CLOCK) is unreadable: ${errText(e)}; the test must write it before the run starts`);
+	}
+	if (!/^\d+\n?$/.test(text)) throw new Error(`the runner clock file ${path} (AGENT_SYSTEM_TEST_RUNNER_CLOCK) holds ${JSON.stringify(text.slice(0, 40))}, not whole milliseconds`);
+	return Number(text.trim());
+}
+/** A runnerNow deadline as the Date.now() deadline a `hook` pause checks, taken at the call: a step during that pause is not seen there. */
+const hookDeadline = (deadline: number): number => deadline - runnerClockAhead();
 
 /** Where the preflight finds the install it checks, and the ids its owners must carry. */
 export interface InstallSpec {
@@ -219,7 +252,7 @@ export function installSpec(env: Record<string, string | undefined> = process.en
 	return { libexec: v.libexec, sudoers: v.sudoers, ids: { root: v.ids.root, wheel: v.ids.wheel, jo: v.ids.jo }, dscl };
 }
 
-class Fail extends Error {
+export class Fail extends Error {
 	constructor(message: string, readonly code: number) {
 		super(message);
 	}
@@ -229,7 +262,7 @@ class Stop extends Error {}
 /** The run lost its lock or its request: it writes `superseded` and settles nothing. */
 class Superseded extends Error {}
 
-const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+export const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 /**
  * The state a verdict posts on the sha the fetch confirmed; stale and superseded post none (no result for that sha), and nothing posts
@@ -239,7 +272,7 @@ const FULL_SUITE_STATE: Partial<Record<TestVerdict, "success" | "failure" | "err
 
 const isBusy = (e: unknown): boolean => e instanceof Error && "code" in e && typeof e.code === "string" && e.code.startsWith("SQLITE_BUSY");
 
-function openLedger(): Ledger {
+export function openLedger(): Ledger {
 	try {
 		return Ledger.open(defaultLedgerPath(process.env));
 	} catch (e) {
@@ -269,7 +302,7 @@ function originOf(repo: string, deadline = Infinity): string | null {
 }
 
 /** The repo, its `owner/repo` and the URL the run clones (the origin, or the test override). */
-function servedOf(ledger: Ledger, wl: string, config: TestRunnerConfig): { repo: string; ownerRepo: string; url: string } {
+export function servedOf(ledger: Ledger, wl: string, config: TestRunnerConfig): { repo: string; ownerRepo: string; url: string } {
 	const repo = repoOf(ledger, wl);
 	if (!repo) throw new Fail(`${wl} has no repo: entry`, START_EXIT.refused);
 	const origin = originOf(repo);
@@ -293,7 +326,7 @@ export function heartbeatOf(root: string, runId: string): number | null {
 /**
  * A named boundary. With AGENT_SYSTEM_TEST_HOOKS set, every pass appends a line to
  * `<dir>/<id>.<point>.marks` (`id` is the run id; the starter's carry, which has no run, names its workload);
- * when `<dir>/<id>.<point>.pause` exists, it writes `.reached` and waits for `.go`, then removes all three
+ * when `<dir>/<id>.<point>.pause` exists, it publishes `.reached` and waits for `.go`, then removes all three
  * (one pause per arming). Unset, it is inert.
  */
 function hookMark(id: string, point: string, info: Record<string, unknown> = {}): { base: string } | null {
@@ -303,21 +336,35 @@ function hookMark(id: string, point: string, info: Record<string, unknown> = {})
 	appendFileSync(`${base}.marks`, `${JSON.stringify({ at: Date.now(), pid: process.pid, ...info })}\n`);
 	return { base };
 }
+/** This process's temporary file for `<base>.reached`: beside it, so the rename that publishes it stays in one directory. */
+function hookTemp(base: string): string {
+	return `${base}.reached.${process.pid}.tmp`;
+}
+/**
+ * Publishes `<base>.reached` (this pid, the time and `info`) atomically: the JSON goes to this process's temporary file
+ * and is renamed over `.reached`, so a reader polling it sees no file or the whole payload, never a partial one
+ * (surface/test/hook-marker.test.ts). A write or rename error propagates.
+ */
+function hookReached(base: string, info: Record<string, unknown>): void {
+	const temp = hookTemp(base);
+	writeFileSync(temp, JSON.stringify({ pid: process.pid, at: Date.now(), ...info }));
+	renameSync(temp, `${base}.reached`);
+}
 function hookResume(base: string): void {
-	for (const s of [".pause", ".go", ".reached"]) rmSync(base + s, { force: true });
+	for (const path of [`${base}.pause`, `${base}.go`, `${base}.reached`, hookTemp(base)]) rmSync(path, { force: true });
 }
 /** The synchronous form, for a boundary inside an open SQLite transaction. */
-function hookSync(id: string, point: string, info: Record<string, unknown> = {}): void {
+export function hookSync(id: string, point: string, info: Record<string, unknown> = {}): void {
 	const h = hookMark(id, point, info);
 	if (!h || !existsSync(`${h.base}.pause`)) return;
-	writeFileSync(`${h.base}.reached`, JSON.stringify({ pid: process.pid, at: Date.now(), ...info }));
+	hookReached(h.base, info);
 	while (!existsSync(`${h.base}.go`)) Bun.sleepSync(25);
 	hookResume(h.base);
 }
-async function hook(runId: string, point: string, info: Record<string, unknown> = {}, deadline = Infinity): Promise<void> {
+export async function hook(runId: string, point: string, info: Record<string, unknown> = {}, deadline = Infinity): Promise<void> {
 	const h = hookMark(runId, point, info);
 	if (!h || !existsSync(`${h.base}.pause`)) return;
-	writeFileSync(`${h.base}.reached`, JSON.stringify({ pid: process.pid, at: Date.now(), ...info }));
+	hookReached(h.base, info);
 	while (!existsSync(`${h.base}.go`)) {
 		if (Date.now() >= deadline) throw new Stop(`post-sweep deadline exceeded at ${point}`);
 		await Bun.sleep(25);
@@ -354,6 +401,7 @@ export function openLockDb(root: string, busyMs: number = msEnv("AGENT_SYSTEM_TE
 	// settles. It lives here, not in the ledger, on purpose: the tick re-requests every main tip that has no verdict on each pass, so losing
 	// runs.db loses nothing durable, and a replaced target never needs an inconclusive test-run of its own.
 	busyLoop(() => db.exec("CREATE TABLE IF NOT EXISTS main_pending (repo TEXT PRIMARY KEY, sha TEXT NOT NULL, at INTEGER NOT NULL)"));
+	openProofSchema(db);
 	return db;
 }
 
@@ -674,7 +722,7 @@ function revokeIfActive(ledger: Ledger, root: string, gh: Gh, repo: string, reas
 }
 
 /** A git command for the runner's own trusted reads (`trustedEnv`, no hooks), synchronous; a failure throws naming it. */
-function gitSync(gitDir: string, args: string[], env: Record<string, string>, opts: { stdin?: Uint8Array; timeoutMs?: number } = {}): Buffer {
+export function gitSync(gitDir: string, args: string[], env: Record<string, string>, opts: { stdin?: Uint8Array; timeoutMs?: number } = {}): Buffer {
 	const r = spawnSync(["git", `--git-dir=${gitDir}`, ...NO_HOOKS, ...args], { env, stdin: opts.stdin ?? "ignore", stdout: "pipe", stderr: "pipe", timeout: opts.timeoutMs ?? 120_000 });
 	if (r.exitCode !== 0) {
 		const why = r.exitedDueToTimeout ? `timed out after ${(opts.timeoutMs ?? 120_000) / 1000} s` : r.stderr.toString().trim().split("\n").at(-1) || `exit ${r.exitCode}`;
@@ -726,7 +774,7 @@ export function treeAt(gitDir: string, commit: string, env: Record<string, strin
 }
 
 /** The runner's bare mirror of `ownerRepo` under the runs root: admissions fetch each head into `refs/as2/<run id>/…` there, so concurrent fetches never share a ref. */
-function mirrorOf(root: string, ownerRepo: string, env: Record<string, string>): string {
+export function mirrorOf(root: string, ownerRepo: string, env: Record<string, string>): string {
 	const dir = join(root, "mirror", `${ownerRepo.replace("/", "__")}.git`);
 	if (!existsSync(join(dir, "HEAD"))) {
 		mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -1257,7 +1305,7 @@ function promotionBudgetMs(): number {
 		+ msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", FINALIZE_MS);
 }
 function verifierTimeout(deadline: number, cap: number, operation: string): number {
-	const remaining = deadline - Date.now();
+	const remaining = deadline - runnerNow();
 	if (remaining <= 0) throw new Stop(`verified reconciliation/promotion holder deadline exceeded before ${operation}; retry after inspecting the verifier`);
 	return Math.min(cap, remaining);
 }
@@ -1287,8 +1335,23 @@ export function promoteMain(ledger: Ledger, repo: string, sha: string, log: (s: 
 		const dir = resolve(o.directory ?? verifiedDirectory());
 		db = openPromotionDb(dir);
 		hookMark(sha, "promotion-acquiring");
-		db.exec(`PRAGMA busy_timeout = ${Math.trunc(promotionBudgetMs())}; BEGIN IMMEDIATE`);
-		const deadline = Date.now() + promotionBudgetMs();
+		// One nonblocking BEGIN per attempt against the holder budget on the runner's clock, as installCheck waits: a waiter allows a
+		// healthy holder's whole bounded work, not SQLite's five-second default. It blocks the thread as the busy wait it replaces did.
+		db.exec("PRAGMA busy_timeout = 0");
+		const acquireBy = runnerNow() + promotionBudgetMs();
+		for (let waitMs = 25; ; waitMs = Math.min(waitMs * 2, 250)) {
+			try {
+				db.exec("BEGIN IMMEDIATE");
+				break;
+			} catch (e) {
+				if (!isBusy(e)) throw e;
+				const left = acquireBy - runnerNow();
+				if (left <= 0) throw new Error(`verified promotion could not acquire ${join(dir, "promotion.db")} within its holder budget: ${errText(e)}; retry after the publisher finishes`);
+				hookMark(sha, "promotion-busy");
+				Bun.sleepSync(Math.min(waitMs, left));
+			}
+		}
+		const deadline = runnerNow() + promotionBudgetMs();
 		const git = (cwd: string, args: string[]) => verifierGit(cwd, args, deadline);
 		const clone = join(dir, "repo");
 		const origin = o.origin ?? process.env.AGENT_SYSTEM_TEST_RUNNER_ORIGIN ?? `https://github.com/${repo}.git`;
@@ -1429,14 +1492,14 @@ export function reap(ledger: Ledger, root: string): { settled: string[]; failed:
 }
 
 /**
- * The detached `run <run id>` (the starter's and a main admission's spawn): its log is `<run dir>/runner.log`, and `runner.json`
- * names its pid. Throws when the process cannot start.
+ * The detached `<script> run <run id>` (the starter's and a main admission's spawn; a proof submission's controller is its own
+ * `script`): its log is `<run dir>/runner.log`, and `runner.json` names its pid. Throws when the process cannot start.
  */
-function spawnRunner(runDir: string, runId: string): number {
+export function spawnRunner(runDir: string, runId: string, script: string = import.meta.path): number {
 	mkdirSync(runDir, { recursive: true, mode: 0o700 });
 	const fd = openSync(join(runDir, "runner.log"), "a", 0o600);
 	try {
-		const child = spawn([process.execPath, import.meta.path, "run", runId], { cwd: runDir, env: process.env, stdin: "ignore", stdout: fd, stderr: fd, detached: true });
+		const child = spawn([process.execPath, script, "run", runId], { cwd: runDir, env: process.env, stdin: "ignore", stdout: fd, stderr: fd, detached: true });
 		child.unref();
 		writeFileSync(join(runDir, "runner.json"), `${JSON.stringify({ pid: child.pid, pgid: child.pid, runId })}\n`, { mode: 0o600 });
 		return child.pid;
@@ -1521,7 +1584,7 @@ function carryCandidate(ledger: Ledger, sources: readonly string[], pr: number, 
 }
 
 /** The mirror's git env (`trustedEnv`) over an empty gitconfig under the runs root. */
-function mirrorEnv(root: string): Record<string, string> {
+export function mirrorEnv(root: string): Record<string, string> {
 	const gitconfig = join(root, "mirror", "trusted.gitconfig");
 	if (!existsSync(gitconfig)) {
 		mkdirSync(dirname(gitconfig), { recursive: true, mode: 0o700 });
@@ -1585,7 +1648,7 @@ function landAdmission(o: {
 			if (e instanceof FastSetError) throw new Fail(e.message, START_EXIT.refused);
 			throw e;
 		}
-		const plan: FastPlan = s.kind === "fast" ? { ref: o.ref, scope: "fast", files: s.files, parse: s.parse, macOnly: s.macOnly } : { ref: o.ref, scope: "full", reasons: s.reasons };
+		const plan: FastPlan = s.kind === "fast" ? { ref: o.ref, scope: "fast", files: s.files, parse: s.parse, macOnly: s.macOnly, mainSkip: s.mainSkip } : { ref: o.ref, scope: "full", reasons: s.reasons };
 		return { plan, carryFrom: null };
 	} finally {
 		dropRunRefs(mirror, o.runId, env, o.log);
@@ -1734,9 +1797,9 @@ function trustedEnv(gitconfig: string): Record<string, string> {
 	for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !k.startsWith("GIT_")) env[k] = v;
 	return { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: gitconfig, GIT_TERMINAL_PROMPT: "0" };
 }
-const NO_HOOKS = ["-c", "core.hooksPath=/dev/null"];
+export const NO_HOOKS = ["-c", "core.hooksPath=/dev/null"];
 /** The network commands' extra settings (§ 2.3 step 2): no template, and only the keychain helper. */
-const NETWORK = [...NO_HOOKS, "-c", "init.templateDir=", "-c", "credential.helper=", "-c", "credential.helper=osxkeychain"];
+export const NETWORK = [...NO_HOOKS, "-c", "init.templateDir=", "-c", "credential.helper=", "-c", "credential.helper=osxkeychain"];
 
 /**
  * File-backed output cannot wait for EOF held by a grandchild. Poll the exit status with a
@@ -1799,7 +1862,7 @@ export async function run(cmd: string[], o: {
  */
 type Wrapped = { code: number | null; signal: string | null; out: string; outlived: boolean; err: string; abandoned: boolean; candidate: number | null };
 
-class Runner {
+export class Runner implements ExclusiveSession {
 	readonly root = runsRoot(process.env);
 	readonly runDir: string;
 	readonly as2root = process.env.AGENT_SYSTEM_TEST_RUNNER_ROOT || AS2TEST_ROOT;
@@ -1847,20 +1910,32 @@ class Runner {
 	private mainTree: CommitTree | null = null;
 	private mainSuspects: string[] = [];
 	private mainDiffs = new Map<string, string[]>();
-	/** The run's place in the lock queue: its `test-requested:` entry's created_at in ms, read once at start. */
+	/** Set by the cleanup transition (`cleanup`): the cleanup-only identity the lock row and `current` moved to. */
+	private cleanupOwner: string | null = null;
+	/** An exclusive session's pinned commit (`prepareSession`); null for an ordinary run, which fetches its PR or main commit. */
+	private pinned: PinnedTarget | null = null;
+	/** The run's place in the lock queue: its `test-requested:` entry's created_at in ms (a hosted session's own), read once at start. */
 	readonly requestedAt: number;
 	private readonly f: RunFacts & { base: string | null; mergeBase: string | null; preflight: string | null };
 	/** `_as2test`'s uid as the install check read it (dscl), for the spawn-free containment check; null until then or when unknown. */
 	private as2testUid: number | null = null;
 
-	constructor(readonly ledger: Ledger, readonly wl: string, readonly request: TestRequested, readonly config: TestRunnerConfig) {
+	/**
+	 * `controlled`: an exclusive session a controller process drives (ExclusiveSession), which has no `test-requested:` row and whose
+	 * stdout is the controller's log, so the run keeps its own runner.log and wrapper.jsonl in its run dir.
+	 */
+	constructor(readonly ledger: Ledger, readonly wl: string, readonly request: TestRequested, readonly config: TestRunnerConfig,
+		readonly controlled: { requestedAt: number } | null = null) {
 		this.runDir = runDirOf(this.root, request.runId);
 		this.stageRoot = join(this.as2root, "stage");
 		this.stage = stageDirOf(request.runId, this.as2root);
 		this.workDir = workDirOf(request.runId, this.as2root);
-		const rec = testRuns(ledger.entries(wl)).find((r) => r.request.runId === request.runId);
-		if (!rec) throw new Fail(`no test-requested: record for ${request.runId} on ${wl}`, START_EXIT.failed);
-		this.requestedAt = Date.parse(rec.request.createdAt);
+		if (controlled !== null) this.requestedAt = controlled.requestedAt;
+		else {
+			const rec = testRuns(ledger.entries(wl)).find((r) => r.request.runId === request.runId);
+			if (!rec) throw new Fail(`no test-requested: record for ${request.runId} on ${wl}`, START_EXIT.failed);
+			this.requestedAt = Date.parse(rec.request.createdAt);
+		}
 		this.lockDb = openLockDb(this.root, this.lockBusyMs);
 		this.capBytes = reportCapBytes(config);
 		this.f = {
@@ -1870,11 +1945,12 @@ class Runner {
 	}
 
 	get id(): string {
-		return this.request.runId;
+		return this.cleanupOwner ?? this.request.runId;
 	}
 
 	log(s: string): void {
 		process.stdout.write(`${new Date().toISOString()} ${s}\n`);
+		if (this.controlled !== null) appendFileSync(join(this.runDir, "runner.log"), `${new Date().toISOString()} ${s}\n`, { mode: 0o600 });
 	}
 
 	/** One tick of the 15 s timer (§ 2.2 step 4): the heartbeat file, then the lock row's heartbeatAt by this run's own id. */
@@ -1882,7 +1958,7 @@ class Runner {
 		const now = Date.now();
 		try {
 			const tmp = join(this.runDir, `.heartbeat.${process.pid}`);
-			writeFileSync(tmp, heartbeatText(this.id, now), { mode: 0o600 });
+			writeFileSync(tmp, heartbeatText(this.request.runId, now), { mode: 0o600 });
 			renameSync(tmp, join(this.runDir, "heartbeat"));
 		} catch (e) {
 			this.log(`heartbeat file not written: ${errText(e)}`);
@@ -1957,7 +2033,8 @@ class Runner {
 					return;
 				}
 				if (queuedTooLong(waitStart, Date.now(), this.config, train)) throw new Stop("queued too long");
-				hookMark(this.id, "queued");
+				// Outside every runs.db transaction: a test pauses a waiter here (`queued.pause`) and knows it holds no write lock.
+				await hook(this.id, "queued");
 				await Bun.sleep(pollMs);
 			}
 		} catch (e) {
@@ -1991,7 +2068,9 @@ class Runner {
 		const { blocker, dead } = queueAhead(rows, this.id, (q) => {
 			let recs = records.get(q.workloadId);
 			if (!recs) records.set(q.workloadId, (recs = testRuns(this.ledger.entries(q.workloadId))));
-			return queueWaiterLive(recs.find((r) => r.request.runId === q.runId), heartbeatOf(this.root, q.runId), now);
+			// A hosted session's iteration has no ledger request: its runs.db row and heartbeat judge it.
+			return proofWaiterLive(this.lockDb, this.root, q.runId, now)
+				?? queueWaiterLive(recs.find((r) => r.request.runId === q.runId), heartbeatOf(this.root, q.runId), now);
 		});
 		const prune = this.lockDb.query("DELETE FROM queue WHERE runId = ?");
 		for (const runId of dead) prune.run(runId);
@@ -2036,7 +2115,7 @@ class Runner {
 	 */
 	private async checkpointBy(phase: string, what: string, deadline: number): Promise<boolean> {
 		try {
-			await hook(this.id, `phase-${phase}`, {}, deadline);
+			await hook(this.id, `phase-${phase}`, {}, hookDeadline(deadline));
 		} catch (e) {
 			if (!(e instanceof Stop)) throw e;
 			this.log(`${what}: the ownership checkpoint was paused at its test hook past its deadline; going on without it`);
@@ -2057,7 +2136,7 @@ class Runner {
 					if (!isBusy(e)) throw e;
 					hookMark(this.id, "checkpoint-busy", { phase, attempts });
 				}
-				const left = deadline - Date.now();
+				const left = deadline - runnerNow();
 				if (left <= 0) break;
 				await Bun.sleep(Math.min(50, left));
 			}
@@ -2094,7 +2173,7 @@ class Runner {
 		const backstop = capMs !== null && this.config.stuckStop === "enforce" ? new StuckWatch(msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_BACKSTOP_MS", STUCK_BACKSTOP_MS)) : null;
 		const r = await run(argv, {
 			cwd: this.as2root, env: process.env,
-			timeoutMs: timeoutMs ?? (capMs ?? 0) + outliveMs + 120_000, inheritStderr: capMs === null,
+			timeoutMs: timeoutMs ?? (capMs ?? 0) + outliveMs + 120_000, inheritStderr: this.controlled === null && capMs === null,
 			onSpawn: (pid) => {
 				hookMark(this.id, `spawn-${call.sub}`, { pid });
 				this.log(`${argv.slice(4).join(" ")}: started pid ${pid}`);
@@ -2112,6 +2191,7 @@ class Runner {
 		const { out, err } = r;
 		if (out.trim()) process.stdout.write(out.endsWith("\n") ? out : `${out}\n`);
 		if (capMs !== null && err) process.stderr.write(`${err}\n`);
+		if (this.controlled !== null) appendFileSync(join(this.runDir, "wrapper.jsonl"), `${JSON.stringify({ argv, code: r.code, signal: r.signal, out, err, at: Date.now() })}\n`, { mode: 0o600 });
 		const ended = r.abandoned ? "exit null (abandoned by the stuck backstop)" : `${r.signal ?? `exit ${r.code}`}${outlived ? " (after the outlive sweep)" : ""}`;
 		this.log(`${argv.slice(4).join(" ")} → ${ended}`);
 		return { code: r.code, signal: r.signal, out, outlived, err, abandoned: r.abandoned, candidate: r.abandoned ? (backstop?.first()?.worker ?? null) : null };
@@ -2158,9 +2238,9 @@ class Runner {
 	 */
 	private async boundedSweep(after: string, deadline: number): Promise<boolean> {
 		for (let attempt = 0; attempt <= SWEEP_RETRIES; attempt++) {
-			if (Date.now() >= deadline) break;
+			if (runnerNow() >= deadline) break;
 			if (!(await this.checkpointBy("sweep", `the sweep after ${after}`, deadline))) return false;
-			const left = deadline - Date.now();
+			const left = deadline - runnerNow();
 			if (left <= 0) break;
 			hookMark(this.id, "sweep", { after, attempt });
 			let r: Wrapped;
@@ -2228,14 +2308,14 @@ class Runner {
 	 */
 	private async halt(stem: string, at: number): Promise<void> {
 		const sweepMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS", STUCK_SWEEP_MS);
-		const sweepBy = Date.now() + sweepMs;
+		const sweepBy = runnerNow() + sweepMs;
 		this.lockBusy(0);
 		const after = stem;
 		const retryMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_CONTAIN_RETRY_MS", CONTAIN_RETRY_MS);
 		const deadline = at + msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_CONTAIN_MS", STUCK_CONTAIN_MS);
 		await this.boundedSweep(after, sweepBy);
 		for (;;) {
-			const checkedAt = Date.now();
+			const checkedAt = runnerNow();
 			const c = this.containment();
 			if (c.kind === "contained") {
 				this.log(`contained after ${after}: no live ${AS2TEST_USER} process`);
@@ -2250,8 +2330,8 @@ class Runner {
 				else if (this.f.executorStalled !== null) this.f.executorStalled += failed;
 				return;
 			}
-			await this.boundedSweep(after, Math.min(deadline, Date.now() + sweepMs));
-			const wait = Math.min(checkedAt + retryMs, deadline) - Date.now();
+			await this.boundedSweep(after, Math.min(deadline, runnerNow() + sweepMs));
+			const wait = Math.min(checkedAt + retryMs, deadline) - runnerNow();
 			if (wait > 0) await Bun.sleep(wait);
 		}
 	}
@@ -2265,9 +2345,9 @@ class Runner {
 	private async admit(): Promise<boolean> {
 		const sweepMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS", STUCK_SWEEP_MS);
 		const retryMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_CONTAIN_RETRY_MS", CONTAIN_RETRY_MS);
-		const deadline = Date.now() + msEnv("AGENT_SYSTEM_TEST_RUNNER_ADMIT_MS", ADMIT_MS);
+		const deadline = runnerNow() + msEnv("AGENT_SYSTEM_TEST_RUNNER_ADMIT_MS", ADMIT_MS);
 		for (;;) {
-			const checkedAt = Date.now();
+			const checkedAt = runnerNow();
 			const c = this.containment();
 			if (c.kind === "contained") return true;
 			const why = c.kind === "live" ? `live ${AS2TEST_USER} processes ${c.pids.join(",")}` : "inspection denied";
@@ -2277,8 +2357,8 @@ class Runner {
 				return false;
 			}
 			this.log(`admission: ${why}${c.kind === "denied" ? ` (${c.why})` : ""}; sweeping and checking again`);
-			await this.boundedSweep("admission", Math.min(deadline, Date.now() + sweepMs));
-			const wait = Math.min(checkedAt + retryMs, deadline) - Date.now();
+			await this.boundedSweep("admission", Math.min(deadline, runnerNow() + sweepMs));
+			const wait = Math.min(checkedAt + retryMs, deadline) - runnerNow();
 			if (wait > 0) await Bun.sleep(wait);
 		}
 	}
@@ -2412,7 +2492,7 @@ class Runner {
 			// layer: nonblocking BEGINs, bounded backoff and one deadline, followed by exactly one reconciliation.
 			db.exec("PRAGMA busy_timeout = 0");
 			const budget = promotionBudgetMs();
-			const deadline = Date.now() + budget;
+			const deadline = runnerNow() + budget;
 			let waitMs = 25;
 			for (;;) {
 				try {
@@ -2420,14 +2500,14 @@ class Runner {
 					break;
 				} catch (e) {
 					if (!isBusy(e)) throw e;
-					if (Date.now() >= deadline) throw new Stop(`verified reconciliation could not acquire ${join(directory, "promotion.db")} within its holder budget: ${errText(e)}; retry after the publisher finishes`);
+					if (runnerNow() >= deadline) throw new Stop(`verified reconciliation could not acquire ${join(directory, "promotion.db")} within its holder budget: ${errText(e)}; retry after the publisher finishes`);
 					if (waitMs === 25) this.log(`verified reconciliation waiting for ${join(directory, "promotion.db")}`);
 					hookMark(this.id, "promotion-busy");
-					await Bun.sleep(Math.min(waitMs, Math.max(0, deadline - Date.now())));
+					await Bun.sleep(Math.min(waitMs, Math.max(0, deadline - runnerNow())));
 					waitMs = Math.min(waitMs * 2, 250);
 				}
 			}
-			return await this.reconcileInstall(true, Date.now() + budget);
+			return await this.reconcileInstall(true, runnerNow() + budget);
 		} catch (e) {
 			failure = e;
 			throw e;
@@ -2466,7 +2546,9 @@ class Runner {
 			if (r.code !== REFRESH_EXIT.ok) {
 				// The REFRESH_EXIT name of the code (`fetch` for 70); `failed` for a code the helper does not define, such as sudo's own refusal.
 				const name = Object.entries(REFRESH_EXIT).find(([, c]) => c === r.code)?.[0] ?? "failed";
-				const how = !r.exited ? `still running ${r.reap} after its SIGKILL` : r.code === null ? `ended by ${r.signal ?? "a signal"}` : `${name} (exit ${r.code})`;
+				// 71 covers more than the build (renderRefreshHelper): the measured resource policy is refused before any fetch.
+				const why = r.code === REFRESH_EXIT.build ? `: ${join(this.install.libexec, RESOURCE_POLICY)} missing or unusable, or the build, a check of its output, a signal or the helper's cap stopped it` : "";
+				const how = !r.exited ? `still running ${r.reap} after its SIGKILL` : r.code === null ? `ended by ${r.signal ?? "a signal"}` : `${name} (exit ${r.code}${why})`;
 				const cap = r.timedOut ? ` after the runner's ${r.cap} cap` : "";
 				// Past the cap, a sudo with no exit code of its own (never reaped, or ended by the runner's signal) says
 				// nothing of the root helper under it, which may still be running and holding refresh.d/lock. This run's
@@ -2482,7 +2564,7 @@ class Runner {
 				const rel = Object.keys(src.inputs).find((k) => facts.inputHashes[k] !== src.inputs[k]);
 				const head = await run(["git", ...NO_HOOKS, "rev-parse", "--verify", "HEAD"], { cwd: REPO_ROOT, env: trustedEnv("/dev/null"), timeoutMs: verifierTimeout(deadline, 30_000, "reading the drifted checkout") });
 				const sha = /^[0-9a-f]{40}$/.test(head.out.trim()) ? head.out.trim().slice(0, 12) : "unknown";
-				stop(`${CHECKOUT_DRIFT}: ${rel} in the runner's checkout ${REPO_ROOT} (HEAD ${sha}) differs from the bundle, which is built from origin/main ${src.sourceSha.slice(0, 12)}; bring the checkout to origin/main`);
+				stop(`${CHECKOUT_DRIFT}: ${rel} in the runner's checkout ${REPO_ROOT} (HEAD ${sha}) differs from the bundle, which is built from the commit refs/tags/${AS2_VERIFIED_TAG} names, ${src.sourceSha.slice(0, 12)}; bring the checkout to that commit`);
 			}
 			if (!v.ok && v.kind === "file-drift") {
 				const reason = v.reason;
@@ -2522,6 +2604,8 @@ class Runner {
 		const at = (id: string): number => parseInt(id.slice(3, 12), 36) || 0;
 		// D5, R16: a run a main run, a runner `main-red:` or an open incident cites is kept 30 days, outside KEEP_RUNS.
 		const cited = this.ledger.workload(STANDING_WORKLOAD_ID) === null ? new Set<string>() : citedRuns(this.ledger.entries(STANDING_WORKLOAD_ID), Date.now());
+		// Proof iterations are permanent evidence, not rebuildable run scratch: retention never prunes their receipts.
+		for (const id of proofRunIds(this.lockDb)) cited.add(id);
 		const prune = retentionPrune([...ids].map((id) => ({ id, at: at(id) })), cited, this.id);
 		for (const old of prune) {
 			rmSync(stageDirOf(old, this.as2root), { recursive: true, force: true });
@@ -2557,7 +2641,10 @@ class Runner {
 		};
 		const { request: q } = this;
 		await git([...NETWORK, "clone", "-q", "--no-checkout", this.url, "."], "git clone");
-		if (q.main !== undefined) {
+		if (this.pinned !== null) {
+			await git([...NETWORK, "fetch", "-q", "origin", q.sha], `fetching ${this.pinned.label} pinned commit`);
+			this.f.fetchedSha = await git([...NO_HOOKS, "rev-parse", "--verify", "FETCH_HEAD^{commit}"], `reading ${this.pinned.label} fetched commit`);
+		} else if (q.main !== undefined) {
 			await git([...NETWORK, "fetch", "-q", "origin", q.sha], "fetching the requested main commit");
 			this.f.fetchedSha = await git([...NO_HOOKS, "rev-parse", "--verify", "FETCH_HEAD^{commit}"], "reading the requested main commit");
 		} else {
@@ -2568,7 +2655,12 @@ class Runner {
 		await git([...NO_HOOKS, "checkout", "-q", "--detach", q.sha], "git checkout");
 		this.f.headAtStart = await git([...NO_HOOKS, "rev-parse", "HEAD"], "reading HEAD");
 		let changed: string[] = [];
-		if (q.main !== undefined) {
+		if (this.pinned !== null) {
+			const listing = await run(["git", ...NO_HOOKS, "ls-tree", "-r", "-z", "--full-tree", q.sha], { cwd: repo, env, timeoutMs: 120_000 });
+			if (listing.code !== 0) throw new Stop(`git ls-tree ${q.sha} failed: ${listing.err.split("\n").at(-1) || `exit ${listing.code}`}`);
+			try { this.pinned.check({ files: treeAt(join(repo, ".git"), q.sha, env, false).files, listing: listing.out }); }
+			catch (e) { throw new Stop(`${this.pinned.label} ${q.sha}: ${errText(e)}`); }
+		} else if (q.main !== undefined) {
 			this.mainTree = treeAt(join(repo, ".git"), q.sha, env, false);
 			const verdicts = mainVerdicts(mainResults(this.ledger.entries(STANDING_WORKLOAD_ID)));
 			const chain = (await git([...NO_HOOKS, "rev-list", "--first-parent", `--max-count=${CHAIN_MAX}`, q.sha], "reading main suspects")).split("\n");
@@ -2597,7 +2689,10 @@ class Runner {
 		await git([...NO_HOOKS, "bundle", "create", "-q", bundle, "--all"], "git bundle create");
 		chmodSync(bundle, 0o640);
 		const caps = join(this.stage, "caps.json");
-		writeFileSync(caps, `${JSON.stringify({ fullCapMin: this.config.fullCapMin, soloCapMin: this.config.soloCapMin, fullWorkers: this.config.fullWorkers, fastCapMin: this.config.fastCapMin, stuckStop: this.config.stuckStop })}\n`, { mode: 0o640 });
+		writeFileSync(caps, `${JSON.stringify({
+			fullCapMin: this.config.fullCapMin, soloCapMin: this.config.soloCapMin, fullWorkers: this.config.fullWorkers, fastCapMin: this.config.fastCapMin, stuckStop: this.config.stuckStop,
+			...this.pinned?.caps,
+		})}\n`, { mode: 0o640 });
 		chmodSync(caps, 0o640);
 		chmodSync(this.stage, 0o750);
 		this.log(`trusted phase: ${q.sha} on base ${this.f.base}, merge-base ${this.f.mergeBase}; changed test files: ${changed.join(" ") || "none"}`);
@@ -2624,7 +2719,7 @@ class Runner {
 	 * further part. Such a call's junit and log are imported whatever its ending, a wrapper refusal or failure (64, 70) included, so
 	 * its partial failures and security evidence stay in the verdict (PLAN wl-mvq8x4pkjmx69s R5).
 	 */
-	async part(call: { sub: "full" } | { sub: "solo" | "base-solo"; file: string } | { sub: "fast"; files: string[] }): Promise<{ result: PartResult; junit: string | null; timedOut: boolean; halted: boolean }> {
+	async part(call: { sub: "full" } | { sub: "solo" | "base-solo"; file: string } | { sub: "fast"; files: string[] }): Promise<{ result: PartResult; junit: string | null; timedOut: boolean; halted: boolean; stem: string }> {
 		await this.checkpoint(call.sub);
 		const capMs = (call.sub === "full" ? this.config.fullCapMin : call.sub === "fast" ? this.config.fastCapMin : this.config.soloCapMin) * 60_000;
 		const started = Date.now();
@@ -2654,8 +2749,8 @@ class Runner {
 			const imported = importPart(this.workDir, this.runDir, name, this.capBytes);
 			out = { result: partResult({ ...imported, exit: r.signal !== null ? null : r.code, ms, timedOut, maxBytes: this.capBytes }), junit: imported.junit };
 		}
-		if (halt === null) return { ...out, timedOut, halted: false };
-		const at = Date.now();
+		if (halt === null) return { ...out, timedOut, halted: false, stem: name };
+		const at = runnerNow();
 		out.result = { ...out.result, error: halt };
 		// The verdict's part label (`full`, a solo's `./<file>`, `base ./<file>`); runner.log's lines name the stem, as the exec's do.
 		const label = call.sub === "full" || call.sub === "fast" ? call.sub : call.sub === "solo" ? call.file : `base ${call.file}`;
@@ -2666,7 +2761,7 @@ class Runner {
 		}
 		this.log(`${name}: ${halt}; no further part`);
 		await this.halt(name, at);
-		return { ...out, timedOut, halted: true };
+		return { ...out, timedOut, halted: true, stem: name };
 	}
 
 	/**
@@ -2789,6 +2884,7 @@ class Runner {
 			await this.sweep("publish");
 			if (!(await this.admit())) throw new Stop(this.f.error ?? "admission refused");
 			await this.preflight(install);
+			await this.recoverAbandonedSessions();
 		} catch (e) {
 			this.preflightThrew(e);
 			throw e;
@@ -2796,14 +2892,56 @@ class Runner {
 		this.recordPreflight(null);
 	}
 
+	/**
+	 * Before any part of this owner's, ordinary or hosted (TOOLS-REVIEW-r1 F1): dead sessions' runs.db transitions
+	 * (`recoverProofSeries`); then every other session's historic load still recorded open, killed only by verified identity
+	 * (`recoverHistoricLoad`), since the lock holder's load is the only legitimate one; then their worlds, removed through the
+	 * wrapper when a cleanup intent shows the evidence was imported, else retained. Never rewrites a red receipt. A load or world it
+	 * cannot settle stops this run before any part, every failure named.
+	 */
+	private async recoverAbandonedSessions(): Promise<void> {
+		recoverProofSeries(this.lockDb, this.root, Date.now);
+		await this.checkpoint("session-recovery");
+		const loads: string[] = [];
+		for (const runId of proofRunIds(this.lockDb)) {
+			if (runId === this.request.runId) continue;
+			try {
+				const r = await recoverHistoricLoad(runDirOf(this.root, runId), this.id);
+				if (r !== null) this.log(`recovered the historic load of ${runId}: ${r.outcomes.map((o) => `pid ${o.pid} ${o.outcome}`).join(", ") || "no process was recorded"}`);
+			} catch (e) { loads.push(errText(e)); }
+		}
+		if (loads.length) throw new Stop(`abandoned historic load not contained: ${loads.join("; ")}`);
+		const abandoned = this.lockDb.query<{ runId: string; seriesId: string; error: string | null }, []>(
+			"SELECT i.runId, i.seriesId, i.error FROM timing_proof_iterations i JOIN timing_proofs p ON p.id = i.seriesId WHERE i.state IN ('failed', 'interrupted')",
+		).all();
+		for (const old of abandoned) {
+			const target = workDirOf(old.runId, this.as2root);
+			if (old.runId === this.id || !existsSync(target)) continue;
+			const dir = runDirOf(this.root, old.runId);
+			mkdirSync(dir, { recursive: true, mode: 0o700 });
+			if (existsSync(join(dir, "proof-retained-world.json"))) continue;
+			// No cleanup intent means the worker may have died before importing raw evidence. Retain that sandbox, never erase it.
+			if (!existsSync(join(dir, "proof-cleanup.json"))) {
+				writeFileSync(join(dir, "proof-retained-world.json"), JSON.stringify({ target, originalError: old.error, reason: "interrupted before evidence import/cleanup intent", containedBy: this.id, at: Date.now() }), { mode: 0o600 });
+				this.log(`retained interrupted proof world ${target}; containment swept, raw evidence must be archived before removal`);
+				continue;
+			}
+			await this.checkpoint("proof-recovery");
+			const r = await this.wrap({ sub: "cleanup", runId: this.id, oldRunId: old.runId });
+			const error = r.code === WRAPPER_EXIT.ok && !existsSync(target) ? null : `proof recovery cleanup ${target}: ${r.signal ?? `exit ${r.code}`}, root exists=${existsSync(target)}`;
+			appendFileSync(join(dir, "proof-recovery.jsonl"), `${JSON.stringify({ seriesId: old.seriesId, originalError: old.error, owner: this.id, target, at: Date.now(), error })}\n`, { mode: 0o600 });
+			if (error) throw new Stop(`${old.error ?? "abandoned proof"}; ${error}; inspect ${dir}/proof-recovery.jsonl`);
+		}
+	}
+
 	/** The post-sweep finalization deadline, then the head re-check (§ 2.3 step 5). */
 	private async headRecheck(): Promise<void> {
-		const finalizeMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", 150_000);
+		const finalizeMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", FINALIZE_MS);
 		const halted = this.f.stuck !== null || this.f.executorStalled !== null;
-		this.postSweepDeadline = Date.now() + (halted ? Math.min(finalizeMs, msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS", STUCK_FINALIZE_MS)) : finalizeMs);
+		this.postSweepDeadline = runnerNow() + (halted ? Math.min(finalizeMs, msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS", STUCK_FINALIZE_MS)) : finalizeMs);
 		this.log(`post-sweep finalization started; deadline ${new Date(this.postSweepDeadline).toISOString()}`);
-		await hook(this.id, "head-recheck", {}, this.postSweepDeadline);
-		this.f.headAtEnd = this.request.main !== undefined ? this.f.fetchedSha : await this.headNow(Math.max(1, this.postSweepDeadline - Date.now()));
+		await hook(this.id, "head-recheck", {}, hookDeadline(this.postSweepDeadline));
+		this.f.headAtEnd = this.request.main !== undefined ? this.f.fetchedSha : await this.headNow(Math.max(1, this.postSweepDeadline - runnerNow()));
 	}
 
 	/**
@@ -2985,10 +3123,10 @@ class Runner {
 			} catch (e) {
 				if (!isBusy(e)) throw e;
 				hookMark(this.id, "publication-busy");
-				const remaining = this.postSweepDeadline - Date.now();
+				const remaining = this.postSweepDeadline - runnerNow();
 				if (remaining <= 0) throw new Stop("post-sweep deadline exceeded during publication");
 				Bun.sleepSync(Math.min(50, remaining));
-				if (Date.now() >= this.postSweepDeadline) throw new Stop("post-sweep deadline exceeded during publication");
+				if (runnerNow() >= this.postSweepDeadline) throw new Stop("post-sweep deadline exceeded during publication");
 			}
 		}
 		const { run, settled } = published;
@@ -3011,6 +3149,78 @@ class Runner {
 		}
 	}
 
+	// ---- ExclusiveSession (src/timing-proof.ts): this lifecycle, driven by the controller in scripts/timing-proof.ts ----------
+
+	partPlan(file: string | null): { argv: string[]; capMs: number } {
+		const argv = wrapperArgv(file === null ? { sub: "full", runId: this.id } : { sub: "solo", runId: this.id, file: `./${file}` }, this.exec);
+		return { argv, capMs: (file === null ? this.config.fullCapMin : this.config.soloCapMin) * 60_000 };
+	}
+
+	async prepareSession(target: PinnedTarget): Promise<{ startedAt: number; completedAt: number }> {
+		if (this.controlled === null) throw new Error(`run ${this.request.runId} is an ordinary run; only a controller-held session is prepared by a controller`);
+		mkdirSync(this.runDir, { recursive: true, mode: 0o700 });
+		this.beat();
+		this.timer = setInterval(() => this.beat(), msEnv("AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS", HEARTBEAT_EVERY_MS));
+		const served = servedOf(this.ledger, this.wl, this.config);
+		if (served.ownerRepo.toLowerCase() !== target.repo.toLowerCase()) throw new Stop(`${target.label}: repo ${target.repo} is not ${this.wl}'s served repo ${served.ownerRepo}`);
+		({ url: this.url, repo: this.repo, ownerRepo: this.ownerRepo } = served);
+		this.pinned = target;
+		await this.acquire();
+		await this.macPreflight();
+		if (await this.trusted() === null) throw new Stop(`${target.label}: pinned SHA ${this.request.sha} was not fetched exactly (fetched ${this.f.fetchedSha})`);
+		const startedAt = Date.now();
+		await this.prepare();
+		return { startedAt, completedAt: Date.now() };
+	}
+
+	async runPart(file: string | null): Promise<SessionPart> {
+		const { result, timedOut, halted, stem } = await this.part(file === null ? { sub: "full" } : { sub: "solo", file: `./${file}` });
+		return { stem, result, timedOut, halted };
+	}
+
+	async sweepContained(label: string): Promise<{ kind: "contained" }> {
+		await this.sweep(label);
+		const contained = this.containment();
+		if (contained.kind !== "contained") throw new Stop(`containment after the sweep of ${label}: ${JSON.stringify(contained)}`);
+		return contained;
+	}
+
+	/** The wrapper refuses a world's own cleanup; the lock and current move to a cleanup-only identity, never relaxing that guard. */
+	async cleanup(): Promise<void> {
+		const original = this.request.runId;
+		const owner = freshRunId();
+		const path = join(this.runDir, "proof-cleanup.json");
+		writeFileSync(path, JSON.stringify({ original, owner, state: "intent", workDir: this.workDir, at: Date.now() }), { mode: 0o600 });
+		await this.checkpoint("proof-cleanup");
+		this.lockDb.transaction(() => {
+			const changed = this.lockDb.query("UPDATE lock SET runId = ? WHERE runId = ?").run(owner, original).changes;
+			if (changed !== 1) throw new Superseded("the cleanup transition lost the original lock ownership");
+			writeCurrent(this.stageRoot, owner);
+			// A kill here rolls back SQLite but not current: next acquisition republishes its owner before sweep/parts.
+			hookSync(original, "proof-cleanup-published", { original, owner });
+		}).immediate();
+		this.cleanupOwner = owner;
+		writeFileSync(path, JSON.stringify({ original, owner, state: "transferred", workDir: this.workDir, at: Date.now() }), { mode: 0o600 });
+		await hook(original, "proof-cleanup-transferred", { original, owner });
+		const r = await this.wrap({ sub: "cleanup", runId: owner, oldRunId: original });
+		if (r.code !== WRAPPER_EXIT.ok || existsSync(this.workDir)) throw new Stop(`cleanup ${this.workDir}: ${r.signal ?? `exit ${r.code}`}, root still exists=${existsSync(this.workDir)}`);
+		writeFileSync(path, JSON.stringify({ original, owner, state: "verified", workDir: this.workDir, at: Date.now() }), { mode: 0o600 });
+	}
+
+	owned(): boolean {
+		return this.held && !this.superseded;
+	}
+
+	async releaseSession(): Promise<string[]> {
+		const errors: string[] = [];
+		try { if (!await this.release()) errors.push("exclusive lock release failed"); }
+		catch (error) { errors.push(`exclusive lock release: ${errText(error)}`); }
+		clearInterval(this.timer);
+		this.leaveQueue();
+		try { this.lockDb.close(); } catch (error) { errors.push(`runs.db close: ${errText(error)}`); }
+		return errors;
+	}
+
 	async main(): Promise<number> {
 		mkdirSync(this.runDir, { recursive: true, mode: 0o700 });
 		this.beat();
@@ -3028,11 +3238,11 @@ class Runner {
 			if (!Number.isFinite(this.postSweepDeadline)) {
 				const finalizeMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", FINALIZE_MS);
 				const stopped = this.f.stuck !== null || this.f.executorStalled !== null;
-				this.postSweepDeadline = Date.now() + (stopped ? Math.min(finalizeMs, msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS", STUCK_FINALIZE_MS)) : finalizeMs);
+				this.postSweepDeadline = runnerNow() + (stopped ? Math.min(finalizeMs, msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS", STUCK_FINALIZE_MS)) : finalizeMs);
 			}
 			try {
-				await hook(this.id, "result", {}, this.postSweepDeadline);
-				if (Date.now() >= this.postSweepDeadline) throw new Stop("post-sweep deadline exceeded before publication");
+				await hook(this.id, "result", {}, hookDeadline(this.postSweepDeadline));
+				if (runnerNow() >= this.postSweepDeadline) throw new Stop("post-sweep deadline exceeded before publication");
 			} catch (e) {
 				this.f.error = errText(e);
 				this.log(`stopped: ${this.f.error}`);
@@ -3066,7 +3276,7 @@ class Runner {
 				}
 				return START_EXIT.failed;
 			}
-			if (this.request.main !== undefined) await hook(this.id, "main-published", {}, this.postSweepDeadline);
+			if (this.request.main !== undefined) await hook(this.id, "main-published", {}, hookDeadline(this.postSweepDeadline));
 			this.admitPendingMain();
 			// PR338: no GitHub call holds the Mac slot. A failed release is still a failed runner, even if publication succeeds.
 			const released = await this.release();
@@ -3086,7 +3296,7 @@ class Runner {
 			const state = this.f.fetchedSha === run.sha ? FULL_SUITE_STATE[run.verdict] : undefined;
 			if (state) {
 				try {
-					await hook(this.wl, "gate-publication", {}, this.postSweepDeadline);
+					await hook(this.wl, "gate-publication", {}, hookDeadline(this.postSweepDeadline));
 					const plan = fastPlanOf(this.ledger.entries(this.wl), this.id);
 					const ref = plan?.ref ?? (() => ghPrView(this.ownerRepo, run.pr).headRefName);
 					const contained = /; containment failed: /.test(`${this.f.stuck ?? ""}${this.f.executorStalled ?? ""}`) ? ", containment failed" : "";
@@ -3185,7 +3395,7 @@ class Runner {
 			}
 			const horizon = beatAt + HEARTBEAT_STALE_MS;
 			if (this.releaseFailures === 1) this.log(`the lock release failed: ${errText(failed)}; retrying until ${new Date(horizon).toISOString()}`);
-			const now = Date.now();
+			const now = runnerNow();
 			if (lockHolderStale(beatAt, now)) {
 				this.log(`the lock was not released: ${errText(failed)} (${this.releaseFailures} attempts; the row's heartbeatAt ${new Date(beatAt).toISOString()} is stale for a waiter since ${new Date(horizon).toISOString()}); the row holds this run until a waiter takes it`);
 				return false;
@@ -3226,7 +3436,14 @@ const USAGE = "usage: test-runner.ts start <wl> <pr> [--slice <id>] --requested-
  * settle on is exit 3 (`START_EXIT.failed`) naming each, after the others were settled, and the tick requests no main run that pass.
  */
 function cmdReap(): number {
-	const { settled, failed } = reap(openLedger(), runsRoot(process.env));
+	const root = runsRoot(process.env);
+	const { settled, failed } = reap(openLedger(), root);
+	let db: Database | null = null;
+	try {
+		db = openLockDb(root);
+		for (const p of recoverProofSeries(db, root, Date.now)) if (p.state === "failed") process.stderr.write(`${p.error}; proof only, no ordinary slice settled\n`);
+	} catch (error) { failed.push(`proof recovery: ${errText(error)}`); }
+	finally { try { db?.close(); } catch (error) { failed.push(`proof recovery runs.db close: ${errText(error)}`); } }
 	process.stdout.write(settled.length === 0 ? "reaped none\n" : `reaped ${settled.join(" ")}\n`);
 	if (failed.length > 0) throw new Fail(`reap could not settle on ${failed.join("; ")}; the next reap tries again`, START_EXIT.failed);
 	return START_EXIT.ok;
@@ -3254,6 +3471,10 @@ function cmdMain(repo: string, sha: string): number {
 	} finally {
 		db.close();
 	}
+}
+
+export function freshRunId(): string {
+	return makeRunId(Date.now(), Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => (b % 36).toString(36)).join(""));
 }
 
 export async function main(argv: string[]): Promise<number> {

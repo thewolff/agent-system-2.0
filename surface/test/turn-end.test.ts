@@ -4,17 +4,23 @@
 // one-per-lane guard, and D6's hand predicate against forged and stale settles.
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { handSettledBody, handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
 import { controlEntries, exitClass, holdersOf } from "../src/launch";
 import { laneDeaths } from "../src/signals";
+import { TRAIN_DONE } from "../src/merge-train";
 import {
-	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, openWorkDeathBody, parkFailedDeathBody, releasedOpen, releasedOpenBody, sliceCounts, turnEnd,
+	AS2_EXTENSION_ENTRIES, as2ExtensionPaths, BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, extensionsSuspendedDeathBody, extensionsSuspendedOf,
+	extensionsUnconfirmedDeathBody, configStamp, heldOpenBody, idlePrompt, openWorkDeathBody, polledSuspensionOf, readAs2ExtensionPaths, suspendedAs2, suspensionOf,
+	parkFailedDeathBody, releasedIdle, releasedIdleBody, releasedOpen, releasedOpenBody, sliceCounts, turnEnd,
 	turnEndDeathBody, type TurnEndInput, unsettledHands,
 } from "../src/turn-end";
 import { recordDecision } from "../scripts/lane";
 import { SURFACE_BY } from "../src/types";
-import { tempLedger } from "./helpers";
+import { COMPACTION_FRAME, SESSION_PERSISTENCE_FRAME, SUSPENDED_FRAMES, tempLedger } from "./helpers";
 
 const LANE = "lane-t-1";
 const HAND = { token: "dt-a", job: "sl-plan" };
@@ -197,6 +203,26 @@ describe("turn end: the texts", () => {
 		const s = (id: string, state: string) => ({ id, state: state as "open", created_by: LANE });
 		expect(sliceCounts([s("sl-a", "open"), s("sl-b", "paused"), s("sl-c", "done"), s("sl-d", "cancelled"), s("sl-e", "paused")])).toEqual({ open: 1, paused: 2, done: 1 });
 	});
+
+	test("R13 (PLAN wl-mvr888nftz0vcl D11): on the merge train the continue and idle prompts carry TRAIN_DONE and never ask for done-because", () => {
+		for (const slices of [{ open: 2, paused: 1, done: 3 }, { open: 0, paused: 0, done: 0 }]) {
+			const p = continuePrompt("wl-t", { unsettledHands: [], slices }, 1, 2, true);
+			expect(p).toContain(`done: ${TRAIN_DONE}`);
+			expect(p).not.toContain("record done-because");
+			expect(p).not.toContain("no done-because receipt");
+			expect(p).not.toContain("with no slice cut");
+			expect(p).toContain("release with no done-because: this train is permanent");
+			expect(p).toEndWith("(continue 1 of 2)");
+		}
+		const idle = idlePrompt("wl-t", 600_000, 1, 3, true);
+		expect(idle).toContain(`done: ${TRAIN_DONE}`);
+		expect(idle).not.toContain("record done-because");
+		expect(idle).toEndWith("(idle prompt 1 of 3)");
+		// every other lane keeps its done-because ask
+		expect(continuePrompt("wl-x", { unsettledHands: [], slices: { open: 1, paused: 0, done: 0 } }, 1, 2)).toContain("record done-because and lane_release");
+		expect(idlePrompt("wl-x", 600_000, 1, 3)).toContain("record done-because first");
+		expect(idlePrompt("wl-x", 600_000, 1, 3)).not.toContain(TRAIN_DONE);
+	});
 });
 
 /** A workload `LANE` holds on a temp ledger, with one open slice. */
@@ -231,6 +257,35 @@ describe("turn end: the runner's writes and reads", () => {
 		// the death is the one decideTurn would have enqueued for the same marker, so the laneDeaths guard keeps it single
 		const marked = input({ held: false, releasedOpen: 1 }).i;
 		expect(exitOutcome(LANE, { ready: true, held: false, releasedOpen: 1 }).death).toBe(turnEndDeathBody(LANE, turnEnd(marked), marked));
+	});
+
+	test("R25 (PLAN wl-mvr888nftz0vcl D13): a train lane's released-idle marker is a quiet idle release, never a death; an ordinary release with open work keeps its death line", () => {
+		// the quiet release: decided released, no death, exit class intended
+		const quiet = input({ held: false, releasedOpen: null, releasedIdle: true }).i;
+		expect(turnEnd(quiet).decision).toBe("released");
+		expect(turnEndDeathBody(LANE, turnEnd(quiet), quiet)).toBeNull();
+		expect(exitOutcome(LANE, { ready: true, held: false, releasedOpen: null, releasedIdle: true })).toEqual({ outcome: "released", death: null });
+		// ordinary workloads: released-open keeps the open-work death
+		const loud = input({ held: false, releasedOpen: 2 }).i;
+		expect(turnEnd(loud).decision).toBe("open-work");
+		expect(turnEndDeathBody(LANE, turnEnd(loud), loud)).toBe(`lane-died: ${LANE}: released with 2 open slice(s), no done-because`);
+	});
+
+	test("R25: released-idle is read only from the lane it names, written by that lane as a holder, and makes the exit intended", () => {
+		const { ledger, wl } = held();
+		const control = () => {
+			const entries = ledger.entries(wl);
+			return controlEntries(entries, holdersOf(entries, null));
+		};
+		ledger.recordEntry({ by: "lane-t-9", workloadId: wl, kind: "assumption", body: releasedIdleBody(LANE, 3) });
+		ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body: releasedIdleBody("lane-t-2", 4) });
+		expect(releasedIdle(control(), LANE)).toBe(false);
+		expect(releasedIdle(control(), "lane-t-2")).toBe(false);
+		ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body: releasedIdleBody(LANE, 2) });
+		expect(releasedIdleBody(LANE, 2)).toBe(`released-idle: ${LANE} open 2`);
+		expect(releasedIdle(control(), LANE)).toBe(true);
+		expect(releasedOpen(control(), LANE)).toBeNull();
+		expect(exitClass(control(), LANE)).toBe("intended");
 	});
 
 	test("the released-open marker is read only from the lane it names, written by that lane as a holder", () => {
@@ -331,5 +386,148 @@ describe("recordDecision: the runner's decided outcome on the ledger before EOF 
 		expect(ledger.question(q)!.state).toBe("open");
 		expect(markers()).toEqual([[LANE_RUNNER_BY, `lane-decided: ${LANE} parked`]]);
 		expect(deaths()).toEqual([]);
+	});
+});
+
+describe("turn end: the as2 extensions suspended by a profile config change (decision en-mw01fr5uts72g0)", () => {
+	const roots = ["/Users/jowolff/code/agent-system-2.0", "/Users/jowolff/.agent-system-2/verified/current"];
+	test("both real extensions notices name the four as2 entries (the trigger)", () => {
+		SUSPENDED_FRAMES.forEach((raw, k) => {
+			expect(extensionsSuspendedOf(JSON.parse(raw) as Record<string, unknown>)).toEqual(AS2_EXTENSION_ENTRIES.map((e) => `${roots[k]}/${e}`));
+		});
+	});
+
+	test("the death bodies are one line each: confirmed names the loaded paths no longer enabled, unconfirmed names why", () => {
+		const enabled = extensionsSuspendedOf(JSON.parse(SUSPENDED_FRAMES[1]) as Record<string, unknown>)!;
+		const loaded = AS2_EXTENSION_ENTRIES.map((e) => `${roots[0]}/${e}`);
+		expect(extensionsSuspendedDeathBody(LANE, loaded, enabled)).toBe(
+			`lane-died: ${LANE}: extensions suspended by a profile config change (/Users/jowolff/code/agent-system-2.0/surface/index.ts, /Users/jowolff/code/agent-system-2.0/gates/index.ts, /Users/jowolff/code/agent-system-2.0/classifier/extension.ts, /Users/jowolff/code/agent-system-2.0/plugins/index.ts no longer enabled; OMP now enables /Users/jowolff/.agent-system-2/verified/current/surface/index.ts, /Users/jowolff/.agent-system-2/verified/current/gates/index.ts, /Users/jowolff/.agent-system-2/verified/current/classifier/extension.ts, /Users/jowolff/.agent-system-2/verified/current/plugins/index.ts); a relaunch loads the current paths`,
+		);
+		expect(extensionsUnconfirmedDeathBody(LANE, ["/r/gates/index.ts"], "the profile config re-read failed: /p/config.yml does not parse:\n  bad\tyaml ")).toBe(
+			`lane-died: ${LANE}: extensions likely suspended by a profile config change (OMP now enables /r/gates/index.ts; not confirmed: the profile config re-read failed: /p/config.yml does not parse: bad yaml); a relaunch loads the current paths`,
+		);
+	});
+
+	test("as2ExtensionPaths: the rendered profile's four as2 entries, resolved, without the non-as2 one; no extensions list is none", () => {
+		const text = [
+			"setupVersion: 2",
+			"extensions:",
+			...AS2_EXTENSION_ENTRIES.map((e) => `  - "/r/a/../${e}"`),
+			'  - "/Users/x/.omp/agent/extensions/foo.ts"',
+			"  - 7",
+			"",
+		].join("\n");
+		expect(as2ExtensionPaths(Bun.YAML.parse(text))).toEqual(AS2_EXTENSION_ENTRIES.map((e) => `/r/${e}`));
+		// The shipped profile/config.yml rendered as install.sh does ({repo} → a root): its four as2 entries, in order.
+		const shipped = readFileSync(join(import.meta.dir, "..", "..", "profile", "config.yml"), "utf8").replaceAll("{repo}", "/as2-root");
+		expect(as2ExtensionPaths(Bun.YAML.parse(shipped))).toEqual(AS2_EXTENSION_ENTRIES.map((e) => `/as2-root/${e}`));
+		expect(as2ExtensionPaths(Bun.YAML.parse("setupVersion: 2\n"))).toEqual([]);
+		expect(as2ExtensionPaths({ extensions: "/r/surface/index.ts" })).toEqual([]);
+		expect(as2ExtensionPaths(null)).toEqual([]);
+	});
+
+	test("readAs2ExtensionPaths: the file's as2 paths; a missing file or invalid YAML is a one-line error, never a throw", () => {
+		const dir = mkdtempSync(join(tmpdir(), "turn-end-ext-"));
+		try {
+			const config = join(dir, "config.yml");
+			const missing = readAs2ExtensionPaths(config);
+			expect("error" in missing && missing.error.startsWith(`${config} could not be read: `)).toBe(true);
+			writeFileSync(config, 'extensions:\n  - "/r/gates/index.ts"\n');
+			expect(readAs2ExtensionPaths(config)).toEqual({ paths: ["/r/gates/index.ts"] });
+			writeFileSync(config, "extensions: [\"/r/gates/index.ts\"\n  bad: : :\n");
+			const invalid = readAs2ExtensionPaths(config);
+			expect("error" in invalid && invalid.error.startsWith(`${config} does not parse: `)).toBe(true);
+			expect("error" in invalid && invalid.error.includes("\n")).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("suspendedAs2: a replaced set is all suspended; a retained set, alone or with paths added, is none", () => {
+		const a = AS2_EXTENSION_ENTRIES.map((e) => `/a/${e}`);
+		const b = AS2_EXTENSION_ENTRIES.map((e) => `/b/${e}`);
+		expect(suspendedAs2(a, b)).toEqual(a);
+		expect(suspendedAs2(a, a)).toEqual([]);
+		expect(suspendedAs2(a, [...a, ...b, "/x/other/surface/index.ts"])).toEqual([]);
+		expect(suspendedAs2(a, [a[0]!, a[2]!])).toEqual([a[1]!, a[3]!]);
+	});
+
+	test("suspensionOf: confirmed, still enabled, or unconfirmed with the reason (spawn unreadable, nothing as2 at spawn, re-read failed)", () => {
+		const a = AS2_EXTENSION_ENTRIES.map((e) => `/a/${e}`);
+		const b = AS2_EXTENSION_ENTRIES.map((e) => `/b/${e}`);
+		expect(suspensionOf({ paths: a }, { paths: b })).toEqual({ kind: "confirmed", suspended: a });
+		expect(suspensionOf({ paths: a }, { paths: [...a, ...b] })).toEqual({ kind: "still-enabled" });
+		expect(suspensionOf({ error: "E1" }, { paths: a })).toEqual({ kind: "unconfirmed", reason: "the profile config was unreadable at spawn: E1" });
+		expect(suspensionOf({ paths: [] }, { paths: b })).toEqual({ kind: "unconfirmed", reason: "the profile config listed no as2 extension at spawn, so what the lane loaded is unknown" });
+		expect(suspensionOf({ paths: a }, { error: "E2" })).toEqual({ kind: "unconfirmed", reason: "the profile config re-read failed: E2" });
+	});
+
+	test("the no-notice death body (a removal alone, from the stop poll) names the loaded paths and leaves out what OMP enables", () => {
+		expect(extensionsSuspendedDeathBody(LANE, ["/a/surface/index.ts", "/a/gates/index.ts"])).toBe(
+			`lane-died: ${LANE}: extensions suspended by a profile config change (/a/surface/index.ts, /a/gates/index.ts no longer enabled); a relaunch loads the current paths`,
+		);
+		expect(extensionsSuspendedDeathBody(LANE, ["/a/surface/index.ts"], [])).toBe(extensionsSuspendedDeathBody(LANE, ["/a/surface/index.ts"]));
+	});
+
+	test("polledSuspensionOf (the stop poll, review round 2): removed is confirmed with what the config newly enables; retained, alone or with paths added, is still enabled; a failed read is unreadable, never confirmed", () => {
+		const a = AS2_EXTENSION_ENTRIES.map((e) => `/a/${e}`);
+		const b = AS2_EXTENSION_ENTRIES.map((e) => `/b/${e}`);
+		// A → B: all of A suspended; B (in config order) is what OMP now enables
+		expect(polledSuspensionOf(a, { paths: b })).toEqual({ kind: "confirmed", suspended: a, enabled: b });
+		// A → A+B → B as the poll sees it: the same, from the last read alone
+		expect(polledSuspensionOf(a, { paths: [...b, ...b] })).toEqual({ kind: "confirmed", suspended: a, enabled: b });
+		// removal only: nothing newly enabled
+		expect(polledSuspensionOf(a, { paths: [] })).toEqual({ kind: "confirmed", suspended: a, enabled: [] });
+		expect(polledSuspensionOf(a, { paths: [a[0]!, a[2]!] })).toEqual({ kind: "confirmed", suspended: [a[1]!, a[3]!], enabled: [] });
+		// retained, alone or with paths added
+		expect(polledSuspensionOf(a, { paths: a })).toEqual({ kind: "still-enabled" });
+		expect(polledSuspensionOf(a, { paths: [...a, ...b, "/x/other/surface/index.ts"] })).toEqual({ kind: "still-enabled" });
+		expect(polledSuspensionOf(a, { error: "E3" })).toEqual({ kind: "unreadable", error: "E3" });
+	});
+
+	test("configStamp: changes when the file is rewritten (content or size), is stable when it is not; a missing file is a one-line error, never a throw", () => {
+		const dir = mkdtempSync(join(tmpdir(), "turn-end-stamp-"));
+		try {
+			const config = join(dir, "config.yml");
+			const missing = configStamp(config);
+			expect("error" in missing && missing.error.startsWith(`${config} could not be stat'ed: `)).toBe(true);
+			writeFileSync(config, 'extensions:\n  - "/a/gates/index.ts"\n');
+			const first = configStamp(config);
+			expect(configStamp(config)).toEqual(first);
+			writeFileSync(config, 'extensions:\n  - "/b/gates/index.ts"\n  - "/b/surface/index.ts"\n');
+			expect(configStamp(config)).not.toEqual(first);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a notice enabling only another extension, another notice source or message, and a non-notice frame are not a suspension", () => {
+		const notice = (source: string, message: string) => ({ type: "notice", level: "warning", message, source });
+		expect(extensionsSuspendedOf(notice("extensions", "Restart omp to load newly enabled extensions: /Users/x/.omp/agent/extensions/foo.ts"))).toBeNull();
+		expect(extensionsSuspendedOf(notice("compaction", "Restart omp to load newly enabled extensions: /Users/x/surface/index.ts"))).toBeNull();
+		expect(extensionsSuspendedOf(notice("session-persistence", "Restart omp to load newly enabled extensions: /Users/x/gates/index.ts"))).toBeNull();
+		// the real compaction and session-persistence notices, verbatim
+		expect(extensionsSuspendedOf(JSON.parse(COMPACTION_FRAME) as Record<string, unknown>)).toBeNull();
+		expect(extensionsSuspendedOf(JSON.parse(SESSION_PERSISTENCE_FRAME) as Record<string, unknown>)).toBeNull();
+		expect(extensionsSuspendedOf(notice("extensions", "Extension /Users/x/surface/index.ts failed to load"))).toBeNull();
+		// the as2 entry name alone, or as part of another file name, is not the entry
+		expect(extensionsSuspendedOf(notice("extensions", "Restart omp to load newly enabled extensions: /Users/x/my-surface/index.ts.bak, surface/index.ts"))).toBeNull();
+		const real = JSON.parse(SUSPENDED_FRAMES[0]) as Record<string, unknown>;
+		expect(extensionsSuspendedOf({ ...real, type: "prompt_result" })).toBeNull();
+		expect(extensionsSuspendedOf({ type: "response", id: "state", data: { message: real.message } })).toBeNull();
+	});
+
+	test("an enable notice naming as2 entries among other extensions returns only the as2 ones", () => {
+		const message = "Restart omp to load newly enabled extensions: /Users/x/.omp/agent/extensions/foo.ts, /r/gates/index.ts";
+		expect(extensionsSuspendedOf({ type: "notice", level: "warning", message, source: "extensions" })).toEqual(["/r/gates/index.ts"]);
+	});
+
+	test("drift: AS2_EXTENSION_ENTRIES are the {repo}/… entries of profile/config.yml's extensions: list, in order", () => {
+		const root = "/as2-drift-root";
+		const text = readFileSync(join(import.meta.dir, "..", "..", "profile", "config.yml"), "utf8").replaceAll("{repo}", root);
+		const config = Bun.YAML.parse(text) as { extensions?: unknown };
+		expect(Array.isArray(config.extensions)).toBe(true);
+		const entries = (config.extensions as unknown[]).filter((e): e is string => typeof e === "string" && e.startsWith(`${root}/`)).map((e) => e.slice(root.length + 1));
+		expect(entries).toEqual([...AS2_EXTENSION_ENTRIES]);
 	});
 });

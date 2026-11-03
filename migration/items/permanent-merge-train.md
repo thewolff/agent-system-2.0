@@ -1,0 +1,24 @@
+---
+title: The merge train is permanent, with $150 per Pacific day and no wall ceiling
+status: building
+workload: wl-mvr888nftz0vcl
+pr: none
+---
+**Built on branch `wl/wl-mvr888nftz0vcl`, PR pending.** Workload `wl-mvr888nftz0vcl` (normal stakes, jo-issues #213, plan revision 10 at `~/agent-scratch/agent-system-2.0/wl-mvr888nftz0vcl/PLAN.md`). Until now a merge train was an ordinary finite workload: it got a ceiling at open (`ceiling: usd 50 wall 360`), stopped at its wall, closed on a `done-because:` once its PRs were done, and a second train could open beside it.
+
+**What changed.**
+- **One permanent train.** Any workload with train membership (`train:` or `train-board:`, `trainMembers` in `surface/src/merge-train.ts`) is the merge train, with no new marker and no ledger rewrite. `train <N>` and the tick's boarding append to the open train and open one only when none is open; a PR of another repository is refused (`train`) or written as `train-board-refused:`, a needs-you line (boarding). The train is never closed, withdrawn or superseded: the close path, `withdraw` and `supersede` refuse it, `lane_record_entry` refuses a `done-because:` on it, and an old one on it is read as no receipt. When nothing is runnable its lane releases with `released-idle:`, which is no lane death.
+- **No wall, a daily budget.** The train's `ceiling:` rows are never read; `extend`, `ceiling` and the lower-ceiling tool refuse it with nothing written. It has $150 per America/Los_Angeles day (`surface/src/train-budget.ts`), counted per line from the session files by each line's own timestamp. Each run's `--max-time` is 1440 min, a hang backstop; a shorter `AGENT_SYSTEM_LANE_MAX_TIME` still wins.
+- **Pause and one question.** At the day's limit the runner writes `train-paused: <lane> day <YYYY-MM-DD> usd <x> limit <L> pr <N|none> until <iso>`, stops the lane, and asks Jo one question, options `raise` / `wait`, whose first line names the dollars, the PR and the resume time. `raise <usd> [q-…]` writes `train-raise: day <day> usd <x> answer <id>` and lifts the pause for that Pacific day only; `wait` or no answer resumes it at midnight Pacific, and the tick withdraws the unanswered question then. A second full day in a row stays paused past midnight until Jo answers.
+- **Meter error.** A session file the meter cannot read, a line that is not JSON, or a line with no timestamp or cost writes `train-meter-error:`, stops the lane, and the tick raises a NOW question (`relaunch` / `hold`).
+- **Stall alert.** The train tick raises a NOW question (`relaunch` / `ack`) on a waiting PR with no test execution start and no merge for 3 hours, listing every cause it finds. A start is the bun banner in the executor's live log, recorded as `test-run-started:`.
+- **Autonomous only.** A train cannot run by hand (`interactiveVerdict` reason `train-autonomous`) and the `user-driven` word is refused on it.
+- **Launch gate.** `trainBudgetGate` refuses every launch path while the train is paused, held for the two-day decision, or stopped on a meter error. Review-round limits are unchanged.
+- **Render.** The train's one-liner reads `budget $<L>/PDT day · no wall`, with `· paused until <iso>` while paused, and its block's spend line names no ceiling or wall.
+- **Docs.** `USER-GUIDE.md` § 3 (The merge train, and the `train`, `raise`, `extend`, `ceiling`, `user-driven`, `withdraw` and `supersede` rows) and § 4 and § 6, `tiers/orchestrator.md` (The one-liner), `docs/concepts.md`, `docs/configuration.md`, `DESIGN-workload-ceiling.md` and `DESIGN-lane-launcher.md` (amendments).
+
+**After landing (Plumb).** A train open at landing cuts over by itself, with no stop request and no data rewrite: once its old lane exits, the new tick relaunches the same workload under the new rule; a train opened after landing starts under it. Either way the live checkout must run this code before an old-code train lane can write `done-because:` and an old surface close it. So at landing:
+1. Plumb updates the live checkout to the merged main and restarts as2 there.
+2. On the train workload's next lane start, Plumb confirms the runner wrote `train-rule: <lane> permanent budget 150 per PDT day max-time <m>` beside its `lane-ready:` (read it with `sqlite3 -readonly ~/.agent-system-2/ledger.db "SELECT created_at, body FROM entries WHERE workload_id = '<train>' AND body LIKE 'train-rule:%' ORDER BY created_at"`). That row is the receipt that the train runs under the rule. No row after a lane start means the live checkout still runs old code: update it again before anything else.
+
+**Rollback.** Revert the PR. The train is an ordinary finite workload again: its old `ceiling:` rows apply on the next launch, and `train-paused:`, `train-raise:`, `train-meter-error:`, `train-rule:` and `test-run-started:` rows stay in the ledger unread.

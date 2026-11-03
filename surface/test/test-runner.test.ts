@@ -12,7 +12,7 @@ import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "
 import type { Subprocess } from "bun";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { Ledger, LiveLedgerUnderTestError, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { KILL_GRACE_MS, renderExecWrapper, SWEEP_LOCK_WAIT_MS } from "../src/as2test";
@@ -24,15 +24,18 @@ import {
 } from "../src/test-run";
 import { FULL_SUITE_STATUS, landFirstNoticeBody, trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
 import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { admitMain, citedRuns, importPart, importReport, lockRow, openLockDb, postGate, postStatus, promoteMain, publishIfOwner, reap as reapRequests, retentionPrune, revokeOpen, run, START_EXIT, verifiedPreflight, type Gh } from "../scripts/test-runner";
+import { admitMain, citedRuns, FINALIZE_MS, importPart, importReport, lockRow, openLockDb, postGate, postStatus, promoteMain, publishIfOwner, reap as reapRequests, retentionPrune, revokeOpen, run, START_EXIT, STUCK_FINALIZE_MS, STUCK_SWEEP_MS, verifiedPreflight, type Gh } from "../scripts/test-runner";
 import { bootstrapRefusal, mainResults, mainVerdicts, parseRunnerPreflight, SUSPECT_MAX_MS } from "../src/main-state";
 import { type Proc, snapshot, STUCK_DEFAULTS } from "../src/stuck-detect";
+import { admitProof, inspectProof, type LoadReceipt, parseProofManifest, type ProofManifest } from "../src/timing-proof";
 import { alive, tmp, unreapedTrue, until } from "./helpers";
 import { carry305, landFirst, mainRun } from "./train-world";
 
 setDefaultTimeout(180_000);
 
 const RUNNER = join(import.meta.dir, "..", "scripts", "test-runner.ts");
+/** The timing-proof controller: submit, inspect and the detached series `run` (TOOLS-REVIEW-r1 F5). */
+const PROOF_CLI = join(import.meta.dir, "..", "..", "scripts", "timing-proof.ts");
 const TEST_EXEC = join(import.meta.dir, "..", "scripts", "test-exec.ts");
 const OWNER_REPO = "thewolff/agent-system-2.0";
 const LANE = "lane-runnertest-1";
@@ -135,7 +138,7 @@ test("spins", () => {
 }, 600_000);
 `;
 
-const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7, gate: 8, skipped: 9, loud: 10, parse: 11, belief95: 12, belief90: 13, belief80: 14, spin: 15 } as const;
+const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7, gate: 8, skipped: 9, loud: 10, parse: 11, belief95: 12, belief90: 13, belief80: 14, spin: 15, proofenv: 16 } as const;
 type PrName = keyof typeof PR;
 const PR_FILES: Record<PrName, Record<string, string>> = {
 	green: { "a.test.ts": PASS("a") },
@@ -156,6 +159,18 @@ const PR_FILES: Record<PrName, Record<string, string>> = {
 	belief90: Object.fromEntries(Array.from({ length: 19 }, (_, i) => [`belief-${i}.test.ts`, i < 2 ? SKIPPED("skipped") : PASS(`belief ${i}`)])),
 	belief80: { "a.test.ts": PASS("one") + '\ntest("two", () => {});\ntest("three", () => {});\n' },
 	spin: { "spin.test.ts": SPIN },
+	proofenv: { "proof-env.test.ts": `import { beforeAll, afterAll, expect, test } from "bun:test";
+beforeAll(() => console.log("timing-proof setup proof-env.test.ts ready"));
+afterAll(() => console.log("timing-proof cleanup proof-env.test.ts reaped"));
+test("proof environment", () => {
+	expect(process.env.AS2_STUCK_BUDGET_PROOF).toBe("1");
+	expect(process.env.GH_TOKEN).toBeUndefined();
+	expect(process.env.OPENAI_API_KEY).toBeUndefined();
+	const child = Bun.spawnSync([process.execPath, "-e", "console.log(JSON.stringify({budget:process.env.AS2_STUCK_BUDGET_PROOF,secret:process.env.GH_TOKEN}))"], {env:process.env,stdout:"pipe",stderr:"pipe"});
+	expect(child.exitCode).toBe(0);
+	expect(JSON.parse(child.stdout.toString())).toEqual({budget:"1"});
+});
+` },
 };
 
 interface Fixture {
@@ -324,6 +339,8 @@ interface World {
 	hooks: string;
 	origin: string;
 	checkout: string;
+	/** The runner's deadline clock file (AGENT_SYSTEM_TEST_RUNNER_CLOCK): how far `runnerNow` runs ahead of Date.now(); see `stepClock`. */
+	clock: string;
 	env: Record<string, string>;
 	ledger: Ledger;
 	/** Run `fn` with the ledger clock `ms` in the past. */
@@ -353,6 +370,8 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 	writeFileSync(join(home, ".gitconfig"), evil);
 	writeFileSync(join(home, ".config", "git", "config"), evil);
 	const ledgerPath = join(home, ".agent-system-2", "ledger.db");
+	const clock = join(root, "runner-clock");
+	writeFileSync(clock, "0");
 	let offset = 0;
 	let pinned: string | null = null;
 	const ledger = Ledger.open(ledgerPath, { create: true, backup: false, backupOnOpen: false, clock: () => pinned ?? new Date(Date.now() - offset).toISOString() });
@@ -388,8 +407,10 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 	mkdirSync(libexec);
 	chmodSync(libexec, 0o755);
 	const exec = join(libexec, "exec");
+	const resourcesPath = join(root, "resources.json");
+	writeFileSync(resourcesPath, JSON.stringify({ workerCpu: 1, workerMemoryBytes: 1, reserveCpu: 0, reserveMemoryBytes: 0, calibration: "synthetic test fixture only; not host calibration" }));
 	writeFileSync(exec, renderExecWrapper({
-		root: as2, bun: process.execPath, script: TEST_EXEC, sweepScope: "groups", hooks, killGraceMs: o.killGraceMs ?? 300, sweepLockWaitMs: o.sweepLockWaitMs ?? 30_000, ...o.detect,
+		root: as2, bun: process.execPath, script: TEST_EXEC, sweepScope: "groups", hooks, resourcesPath, killGraceMs: o.killGraceMs ?? 300, sweepLockWaitMs: o.sweepLockWaitMs ?? 30_000, ...o.detect,
 	}));
 	writeFileSync(join(libexec, "bun"), "stand-in for the installed bun\n");
 	writeFileSync(join(libexec, "test-exec.js"), "stand-in for the installed bundle\n");
@@ -427,11 +448,23 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 		AGENT_SYSTEM_TEST_RUNNER_VERIFIED: join(home, ".agent-system-2", "verified"),
 		AGENT_SYSTEM_TEST_RUNNER_INSTALL: JSON.stringify({ libexec, sudoers, ids: { root: uid, wheel: gid, jo: uid }, account: { uid, gid } }),
 		AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS: "500", AGENT_SYSTEM_TEST_RUNNER_POLL_MS: "200", AGENT_SYSTEM_TEST_RUNNER_BUSY_MS: "300", AGENT_SYSTEM_TEST_HOOKS: hooks,
+		AGENT_SYSTEM_TEST_RUNNER_CLOCK: clock,
 		// Credentials in Jo's env: none may reach the code under test (plan § 3).
 		GH_TOKEN: "secret-gh", ANTHROPIC_API_KEY: "secret-anthropic", OPENAI_API_KEY: "secret-openai", MOONSHOT_API_KEY: "secret-moonshot",
 		SSH_AUTH_SOCK: "/tmp/secret-agent.sock", OMP_SESSION_TOKEN: "secret-omp", AGENT_SYSTEM_SECRET: "secret-as",
 	};
-	return { root, home, runs, as2, libexec, exec, hooks, origin, checkout, env, ledger, ago, pin };
+	return { root, home, runs, as2, libexec, exec, hooks, origin, checkout, clock, env, ledger, ago, pin };
+}
+
+/**
+ * Step the runner's deadline clock (`runnerNow`: the post-sweep finalization, release horizon, stuck sweep, containment, admission
+ * and promotion deadlines) `ms` further ahead of Date.now(), atomically. A deadline the run holds is then past without real time
+ * waited out; the run's processes read the file at each deadline check, so the step reaches them all.
+ */
+function stepClock(w: World, ms: number): void {
+	const ahead = Number(readFileSync(w.clock, "utf8")) + ms;
+	writeFileSync(`${w.clock}.next`, String(ahead));
+	renameSync(`${w.clock}.next`, w.clock);
 }
 
 /** Real detached control root and actual tag/helper/SOURCE facts; no fixture-only ok row. */
@@ -480,7 +513,12 @@ function start(w: World, wl: string, pr: number, extra: string[] = []) {
 	return { code: r.exitCode, out: r.stdout.toString().trim(), err: r.stderr.toString().trim() };
 }
 
-const newRunId = (): string => makeRunId(Date.now(), Math.random().toString(36).slice(2, 8).padEnd(4, "0"));
+/** The clock reading of the last run id made here: each new id takes a later one, so run ids are strictly ordered by creation. */
+let lastRunIdMs = 0;
+function newRunId(): string {
+	lastRunIdMs = Math.max(Date.now(), lastRunIdMs + 1);
+	return makeRunId(lastRunIdMs, Math.random().toString(36).slice(2, 8).padEnd(4, "0"));
+}
 
 /** A `test-requested:` written as the starter would, `agoMs` in the past; returns the run id. */
 function request(w: World, wl: string, slice: string, pr: number, sha: string, agoMs = 0): string {
@@ -936,7 +974,7 @@ describe("start: the carried green (PLAN wl-mvpwkpqobyp20w D4)", () => {
 			const rec = testRuns(w.ledger.entries(train)).find((r) => r.request.runId === id)!;
 			w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: train, kind: "assumption", body: fastPlanBody(id,
 				source.startsWith("tree") ? { ref: `wl/${train}`, scope: "tree", g: S, run: "tr-mainseed" }
-					: source.startsWith("fast") ? { ref: `wl/${train}`, scope: "fast", files: [], parse: [], macOnly: [] }
+					: source.startsWith("fast") ? { ref: `wl/${train}`, scope: "fast", files: [], parse: [], macOnly: [], mainSkip: [] }
 						: { ref: `wl/${train}`, scope: "full", reasons: ["production"] }) });
 			if (source === "tree decision-log") {
 				const next = request(w, train, rec.request.slice, P, S, 1000);
@@ -1772,13 +1810,12 @@ describe("red main: each failing file rerun alone on base (PLAN wl-mv8s8srodefyt
 		const { wl, slice } = workload(w);
 		const runId = request(w, wl, slice, 25, r.head[25]!);
 		arm(w, runId, "phase-base-prepare");
-		const child = spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "2000" });
+		const child = spawnRun(w, runId);
 		try {
 			await reached(w, runId, "phase-base-prepare");
-			// A real delay: the runner is a spawned process timing its deadline with its own Date.now(), out of reach
-			// of fake timers. Holding base-prepare past the 2 s finalize window is what the ordering must survive; 2 s
-			// leaves finalization itself (a hook, a local git ls-remote, the result hook) ample room on a loaded machine.
-			await Bun.sleep(3000);
+			// Base-prepare held while the runner's clock passes the whole production finalize window: a post-sweep deadline started
+			// before the base runs would be past at the head re-check; finalization itself keeps all of FINALIZE_MS in real time.
+			stepClock(w, FINALIZE_MS + 1_000);
 			go(w, runId, "phase-base-prepare");
 			await child.exited;
 			const run = await resultOf(w, wl, runId);
@@ -1848,6 +1885,18 @@ describe("the preflight refreshes a drifted bundle before the first sweep (PLAN 
 		expect(sudoCalls(w)).toEqual(["refresh"]);
 	});
 
+	test("T2a: the helper exits 71; the reason names exit 71's causes, the resource policy first, with the helper's last stderr line", async () => {
+		const w = world();
+		setRefresh(w, `echo "as2test-refresh: ${join(w.libexec, "resources.json")}, the measured resource policy the executor requires, is missing" >&2\nexit 71`);
+		writeSource(w.libexec, { inputSha: "f".repeat(64) });
+		const { run } = await runGreen(w);
+		expect(run.verdict).toBe("error");
+		expect(run.reason).toBe(
+			`preflight: bundle-refresh-failed: the refresh helper build (exit 71: ${join(w.libexec, "resources.json")} missing or unusable, or the build, a check of its output, a signal or the helper's cap stopped it): as2test-refresh: ${join(w.libexec, "resources.json")}, the measured resource policy the executor requires, is missing`,
+		);
+		expect(sudoCalls(w)).toEqual(["refresh"]);
+	});
+
 	test("T2b: a helper past the runner's cap gets SIGTERM, then SIGKILL; the runner waits for its sudo to exit, and the run is error bundle-refresh-failed naming the cap", async () => {
 		const w = world();
 		// It ignores TERM, as a root helper's sudo may never pass one on: only the SIGKILL ends it.
@@ -1855,9 +1904,8 @@ describe("the preflight refreshes a drifted bundle before the first sweep (PLAN 
 		writeSource(w.libexec, { inputSha: "f".repeat(64) });
 		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS = "1000";
 		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS = "500";
-		const t0 = Date.now();
+		// The run ends without waiting out the helper's 60 s: the reason names its SIGKILL after the cap, not its own exit.
 		const { run } = await runGreen(w);
-		expect(Date.now() - t0).toBeLessThan(30_000);
 		expect(run.verdict).toBe("error");
 		expect(run.reason).toBe(
 			"preflight: bundle-refresh-failed: the refresh helper ended by SIGKILL after the runner's 1 s cap; the helper may still be running, and the next refresh waits on its lock (exit 69, lock, while it holds it): as2test-refresh: building",
@@ -1885,10 +1933,8 @@ describe("the preflight refreshes a drifted bundle before the first sweep (PLAN 
 		// The kernel refuses Jo's signals to a root sudo; this hook file stands in for that refusal.
 		writeFileSync(join(w.hooks, `${first}.refresh-signal.refuse`), "");
 		try {
-			const t0 = Date.now();
 			await spawnRun(w, first).exited;
 			const run = await resultOf(w, wl, first);
-			expect(Date.now() - t0).toBeLessThan(30_000);
 			expect(run.verdict).toBe("error");
 			expect(run.reason).toBe(
 				"preflight: bundle-refresh-failed: the refresh helper still running 0.5 s after its SIGKILL after the runner's 1 s cap; the helper may still be running, and the next refresh waits on its lock (exit 69, lock, while it holds it): as2test-refresh: building",
@@ -1928,7 +1974,7 @@ describe("the preflight refreshes a drifted bundle before the first sweep (PLAN 
 		expect(run.verdict).toBe("error");
 		const head12 = g(REPO, "rev-parse", "HEAD").slice(0, 12);
 		expect(run.reason).toBe(
-			`preflight: checkout-drift: surface/scripts/test-exec.ts in the runner's checkout ${REPO} (HEAD ${head12}) differs from the bundle, which is built from origin/main ${OLD12}; bring the checkout to origin/main`,
+			`preflight: checkout-drift: surface/scripts/test-exec.ts in the runner's checkout ${REPO} (HEAD ${head12}) differs from the bundle, which is built from the commit refs/tags/as2-verified names, ${OLD12}; bring the checkout to that commit`,
 		);
 		expect(sudoCalls(w)).toEqual(["refresh"]);
 	});
@@ -2017,9 +2063,8 @@ describe("the junit and log import", () => {
 		expect(existsSync(join(d.run, "full.xml"))).toBe(false);
 
 		expect(Bun.spawnSync(["/usr/bin/mkfifo", join(d.work, "solo-1.xml")]).exitCode).toBe(0);
-		const t0 = Date.now();
+		// A blocking open of a FIFO with no writer never returns; the answer coming back at all is the non-blocking proof.
 		expect(importReport(d.work, d.run, "solo-1.xml", 1_000_000)).toEqual({ text: null, error: "solo-1.xml is not a regular file" });
-		expect(Date.now() - t0).toBeLessThan(2_000);
 
 		writeFileSync(join(d.work, "solo-2.xml"), JUNIT);
 		expect(importReport(d.work, d.run, "solo-2.xml", 100)).toEqual({ text: null, error: "solo-2.xml is over the 100-byte report cap" });
@@ -2185,8 +2230,6 @@ interface Waiter {
 function waiter(w: World, agoMs: number): Waiter {
 	const { wl, slice } = workload(w);
 	const id = request(w, wl, slice, PR.green, fx.main, agoMs);
-	// The next run id takes a later clock reading: run ids are strictly ordered by creation.
-	Bun.sleepSync(5);
 	return { id, wl, slice };
 }
 
@@ -2244,49 +2287,12 @@ function settleDead(w: World, r: Waiter): void {
 }
 
 /**
- * The child is stopped once its heartbeat file has not changed for over two heartbeat periods (the world's 500 ms): a running
- * runner rewrites it every period. (`ps` cannot be spawned in every sandbox this suite runs in.)
+ * Pause the queued run `runId` at its `queued` hook, after an attempt's transaction and before its poll wait: it holds no runs.db
+ * write lock there, keeps its queue row and (its heartbeat timer still running) stays a live waiter. `go(w, runId, "queued")` resumes it.
  */
-async function seenStopped(w: World, runId: string): Promise<void> {
-	const quietMs = 2 * Number(w.env.AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS) + 100;
-	let seen = heartbeatAt(w, runId);
-	let since = Date.now();
-	await until(`${runId} stopped (its heartbeat unchanged for ${quietMs} ms)`, () => {
-		const now = heartbeatAt(w, runId);
-		if (now !== seen) {
-			seen = now;
-			since = Date.now();
-		}
-		return Date.now() - since > quietMs;
-	}, 20_000);
-}
-
-/**
- * Stop `child` outside any runs.db transaction: wait for its heartbeat under 1 s old, SIGSTOP it, and see it stopped; then a
- * probe connection (busy_timeout 300 ms) runs BEGIN IMMEDIATE; COMMIT. A busy probe means the child froze inside its acquiring
- * transaction: SIGCONT, sleep one poll, try again (at most 10 times). Every wait is bounded at 20 s, under the 60 s stale threshold.
- */
-async function stopOutsideTx(w: World, child: Child, runId: string): Promise<void> {
-	for (let attempt = 0; attempt < 10; attempt++) {
-		await until(`a heartbeat of ${runId} under 1 s old`, () => Date.now() - (heartbeatAt(w, runId) ?? 0) < 1_000, 20_000);
-		process.kill(child.pid, "SIGSTOP");
-		await seenStopped(w, runId);
-		const probe = new Database(join(w.runs, "runs.db"));
-		try {
-			probe.exec("PRAGMA busy_timeout = 300");
-			probe.exec("BEGIN IMMEDIATE");
-			probe.exec("COMMIT");
-			return;
-		} catch (e) {
-			if (!(e instanceof Error && "code" in e && String(e.code).startsWith("SQLITE_BUSY"))) throw e;
-		} finally {
-			probe.close();
-		}
-		process.kill(child.pid, "SIGCONT");
-		// One runner poll (the world's 200 ms) before the next stop, so the child can finish the transaction it froze in.
-		await Bun.sleep(200);
-	}
-	throw new Error(`${runId} froze inside a runs.db transaction on every one of 10 stops`);
+async function pauseQueued(w: World, runId: string): Promise<void> {
+	arm(w, runId, "queued");
+	await reached(w, runId, "queued");
 }
 
 /** Every child resumed, killed and awaited: a failing assertion leaves no stopped process behind. */
@@ -2308,7 +2314,7 @@ const queuedCount = (w: World, r: Waiter): number => marks(w, r.id, "queued").le
 const acquiredAt = (w: World, r: Waiter): number => marks(w, r.id, "acquired")[0]!.at as number;
 
 describe("the lock queue: queued runs take the lock oldest request first", () => {
-	test("T1: on a stale-holder takeover, younger waiters B and C wait for the oldest, A, while A is stopped; then A, B, C acquire in request order", async () => {
+	test("T1: on a stale-holder takeover, younger waiters B and C wait for the oldest, A, while A is paused; then A, B, C acquire in request order", async () => {
 		const w = world();
 		const { A, B, C } = requestsCBA(w);
 		holdLock(w);
@@ -2316,7 +2322,7 @@ describe("the lock queue: queued runs take the lock oldest request first", () =>
 		try {
 			for (const r of [A, B, C]) kids.push(spawnRun(w, r.id));
 			await until("A, B and C queued", () => [A, B, C].every((r) => queuedCount(w, r) >= 1));
-			await stopOutsideTx(w, kids[0]!, A.id);
+			await pauseQueued(w, A.id);
 			runsDb(w, (db) => db.query("UPDATE lock SET heartbeatAt = ?").run(Date.now() - 61_000));
 			const b0 = queuedCount(w, B);
 			const c0 = queuedCount(w, C);
@@ -2324,7 +2330,7 @@ describe("the lock queue: queued runs take the lock oldest request first", () =>
 				() => (queuedCount(w, B) >= b0 + 3 && queuedCount(w, C) >= c0 + 3) || marks(w, B.id, "acquired").length + marks(w, C.id, "acquired").length > 0, 20_000);
 			expect({ B: marks(w, B.id, "acquired"), C: marks(w, C.id, "acquired") }).toEqual({ B: [], C: [] });
 			expect(runsDb(w, (db) => lockRow(db)?.runId)).toBe("tr-otherholder");
-			process.kill(kids[0]!.pid, "SIGCONT");
+			go(w, A.id, "queued");
 			for (const r of [A, B, C]) expect((await resultOf(w, r.wl, r.id)).verdict).toBe("stale");
 			await Promise.all(kids.map((k) => k.exited));
 			expect(marks(w, A.id, "acquired")).toEqual([expect.objectContaining({ displaced: "tr-otherholder" })]);
@@ -2423,13 +2429,19 @@ describe("the lock queue: queued runs take the lock oldest request first", () =>
 			await until("A, B and C queued", () => [A, B, C].every((r) => queuedCount(w, r) >= 1));
 			const original = queueRows(w).find((q) => q.runId === A.id)!.requestedAt;
 			expect(original).toBe(requestedAtOf(w, A));
-			await stopOutsideTx(w, kids[0]!, A.id);
-			writeHeartbeat(w, A.id, Date.now() - 61_000);
-			await until("A's row pruned", () => !queueRows(w).some((q) => q.runId === A.id), 20_000);
+			await pauseQueued(w, A.id);
+			// Stopped, A's heartbeat timer is frozen too; a beat already in flight at the stop is overwritten until A's row is pruned.
+			process.kill(kids[0]!.pid, "SIGSTOP");
+			const staleAt = Date.now() - 61_000;
+			await until("A's row pruned", () => {
+				if (heartbeatAt(w, A.id) !== staleAt) writeHeartbeat(w, A.id, staleAt);
+				return !queueRows(w).some((q) => q.runId === A.id);
+			}, 20_000);
 			expect(runsDb(w, (db) => lockRow(db)?.runId)).toBe("tr-otherholder");
 			process.kill(kids[0]!.pid, "SIGCONT");
-			const back = () => queueRows(w).find((q) => q.runId === A.id)?.requestedAt === original && Date.now() - (heartbeatAt(w, A.id) ?? 0) < 5_000;
-			await until("A back in the queue at its original place with a fresh heartbeat", back, 20_000);
+			go(w, A.id, "queued");
+			const back = () => queueRows(w).find((q) => q.runId === A.id)?.requestedAt === original && (heartbeatAt(w, A.id) ?? 0) > staleAt;
+			await until("A back in the queue at its original place with a heartbeat newer than the stale one", back, 20_000);
 			// Any attempt of B or C that read A's old heartbeat has ended once each has queued twice more.
 			const b0 = queuedCount(w, B);
 			const c0 = queuedCount(w, C);
@@ -2549,20 +2561,83 @@ describe("the runs lock under test (Guard A, MIGRATION.md item 114)", () => {
 });
 
 // A subprocess can be gone while its inherited stdout is still open in a descendant.
-// The helper exits naturally; no signal or live database is used by this reproduction.
+// The helper holds the inherited stdout until the test releases it; no signal or live database is used by this reproduction.
+// Its root goes on `roots` (afterAll's deletion) only once the case and the release both passed: a failure keeps holder.stderr and
+// holder.status and names the root in its error, and a case abandoned at the test timeout never reaches the push, so it keeps them too.
 test("command completion does not wait for an exited child's inherited pipes", async () => {
 	const root = realpathSync(tmp("runner-pipe"));
-	roots.push(root);
 	const helper = join(root, "holder.ts");
-	writeFileSync(helper, 'await Bun.sleep(1500);');
-	const started = Date.now();
-	const result = await run([process.execPath, "-e", `Bun.spawn([process.execPath, ${JSON.stringify(helper)}], {stdout: "inherit", stderr: "inherit", stdin: "ignore"}).unref(); console.log("done");`], {
-		cwd: root, env: GIT_ENV, timeoutMs: 200,
-	});
-	expect(result).toMatchObject({ code: 0, out: "done\n", err: "" });
-	expect(Date.now() - started).toBeLessThan(1000);
-	// Let the finite helper finish before afterAll removes its directory.
-	await Bun.sleep(1600);
+	const release = join(root, "release");
+	const pidFile = join(root, "holder.pid");
+	const errFile = join(root, "holder.stderr");
+	const statusFile = join(root, "holder.status");
+	expect(Bun.spawnSync(["/usr/bin/mkfifo", release]).exitCode).toBe(0);
+	// It opens the FIFO read-write (which returns at once), records its pid, then blocks reading the FIFO until the test writes
+	// it: the pipe stays open until then, and while it lives the FIFO has a reader, so the release's nonblocking open finds one.
+	writeFileSync(helper, `import { openSync, readSync, writeFileSync } from "node:fs";\nconst gate = openSync(${JSON.stringify(release)}, "r+");\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nreadSync(gate, Buffer.alloc(1), 0, 1, null);\n`);
+	// A shell between the command and the helper keeps the helper's stderr and, once it has reaped it, its exit status (renamed
+	// in whole), so a helper that dies is reported; the shell holds the command's stdout and stderr as well.
+	const holder = ["/bin/sh", "-c", `"$1" "$2" 2>"$3"; echo "$?" >"$4.tmp" && /bin/mv "$4.tmp" "$4"`, "holder", process.execPath, helper, errFile, statusFile];
+	const statusOf = () => existsSync(statusFile) && readFileSync(statusFile, "utf8").trim();
+	const stderrOf = () => (existsSync(errFile) ? readFileSync(errFile, "utf8") : `(no ${errFile})`);
+	const messageOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+	/** Let the helper through with one byte into the FIFO, opened without blocking, and see it exit 0 before afterAll removes its directory. */
+	const releaseHolder = async (): Promise<void> => {
+		const ready = await until("the holder's pid, or its exit status", () => {
+			const pid = existsSync(pidFile) && Number(readFileSync(pidFile, "utf8"));
+			if (pid) return { pid };
+			const status = statusOf();
+			return status ? { status } : false;
+		});
+		if (!("pid" in ready)) throw new Error(`the holder exited (its shell reports exit status ${ready.status}) before recording its pid in ${pidFile}; stderr: ${stderrOf()}`);
+		const { pid } = ready;
+		let fd: number;
+		try {
+			fd = openSync(release, constants.O_WRONLY | constants.O_NONBLOCK);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENXIO") throw error;
+			// No reader: the helper opened the FIFO before recording its pid and keeps it open until written, so it is gone.
+			let status: string;
+			try {
+				status = await until(`the exit status of the holder (pid ${pid}), gone with no reader at ${release}`, statusOf);
+			} catch (statusError) {
+				status = `unknown (${messageOf(statusError)})`;
+			}
+			throw new Error(`releasing the holder (pid ${pid}): ${release} has no reader, so the holder is gone; its shell reports exit status ${status}; stderr: ${stderrOf()}`, { cause: error });
+		}
+		try {
+			writeSync(fd, "\n");
+		} finally {
+			closeSync(fd);
+		}
+		const status = await until(`the exit status of the holder (pid ${pid}) after its release`, statusOf);
+		expect({ pid, status, stderr: stderrOf() }).toEqual({ pid, status: "0", stderr: "" });
+	};
+	let failure: { error: unknown } | null = null;
+	try {
+		// A wait on the open pipe would never end before the release below: it would time out at 200 ms and throw instead.
+		const result = await run([process.execPath, "-e", `Bun.spawn(${JSON.stringify(holder)}, {stdout: "inherit", stderr: "inherit", stdin: "ignore"}).unref(); console.log("done");`], {
+			cwd: root, env: GIT_ENV, timeoutMs: 200,
+		});
+		expect(result).toMatchObject({ code: 0, out: "done\n", err: "" });
+	} catch (error) {
+		failure = { error };
+	}
+	// The release runs whatever the case's outcome; its failure never hides the case's own.
+	let released: { error: unknown } | null = null;
+	try {
+		await releaseHolder();
+	} catch (error) {
+		released = { error };
+	}
+	if (!failure && !released) {
+		roots.push(root);
+		return;
+	}
+	const kept = `fixture evidence kept at ${root}`;
+	if (failure && released) throw new AggregateError([failure.error, released.error], `the case failed (${messageOf(failure.error)}), and releasing its holder failed too: ${messageOf(released.error)}; ${kept}`);
+	const error = (failure ?? released)!.error;
+	throw new Error(`${messageOf(error)}; ${kept}`, { cause: error });
 });
 
 for (const point of ["head-recheck", "result"]) {
@@ -2573,11 +2648,12 @@ for (const point of ["head-recheck", "result"]) {
 		arm(w, runId, point);
 		const child = spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "300" });
 		try {
+			// The hook stays paused: the deadline passes there however slowly the machine runs, so the waits below are failure bounds only.
 			await reached(w, runId, point);
-			const run = await resultOf(w, wl, runId, 2500);
+			const run = await resultOf(w, wl, runId);
 			expect(run.verdict).toBe("error");
 			expect(run.reason).toContain("post-sweep deadline exceeded");
-			await until("guarded runner exits", () => child.exitCode !== null, 2500);
+			await until("guarded runner exits", () => child.exitCode !== null);
 			expect(child.exitCode).toBe(0);
 			expect(JSON.parse(readFileSync(join(w.runs, runId, "result.json"), "utf8"))).toMatchObject({ verdict: "error" });
 			expect(w.ledger.slice(slice)!.state).toBe("open");
@@ -2598,21 +2674,18 @@ test("publication contention leaves a local error verdict and releases the run l
 	const { wl, slice } = workload(w);
 	const runId = request(w, wl, slice, PR.green, fx.head.green);
 	arm(w, runId, "result");
-	const child = spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "2000" });
+	const child = spawnRun(w, runId);
 	await reached(w, runId, "result");
-	const deadline = Date.parse(/post-sweep finalization started; deadline (.+)/.exec(runnerLog(w, runId))![1]!);
 	w.ledger.db.exec("BEGIN IMMEDIATE");
 	try {
-		// The runner is another process, so spend its real clock budget at the hook;
-		// publication must inherit the remainder rather than start a fresh timeout.
-		await until("most of the shared finalization budget is spent", () => Date.now() >= deadline - 500, 2000);
-		const resumedAt = Date.now();
+		// Most of the shared finalization budget spent at the hook on the runner's clock (60 s of it left), then publication meets
+		// the held ledger; the rest is stepped past only once it retries there. A fresh publication timeout would outlast the step.
+		stepClock(w, FINALIZE_MS - 60_000);
 		go(w, runId, "result");
-		await until("publication fails within the post-sweep deadline", () => child.exitCode !== null, 3000);
-		const exitedAt = Date.now();
-		expect(exitedAt).toBeGreaterThanOrEqual(deadline);
-		expect(exitedAt).toBeLessThan(deadline + 1000);
-		console.info(`publication under held ledger: exited ${exitedAt - resumedAt} ms after resume, ${exitedAt - deadline} ms after the shared deadline`);
+		await until("publication attempts the held ledger", () => marks(w, runId, "publication-busy").length > 0);
+		expect(child.exitCode).toBeNull();
+		stepClock(w, 60_000);
+		await until("publication fails at the shared post-sweep deadline", () => child.exitCode !== null);
 		expect(child.exitCode).toBe(START_EXIT.failed);
 		const result = JSON.parse(readFileSync(join(w.runs, runId, "result.json"), "utf8"));
 		expect(result.verdict).toBe("error");
@@ -2634,7 +2707,7 @@ test("publication retries a transient ledger lock within the post-sweep deadline
 	const { wl, slice } = workload(w);
 	const runId = request(w, wl, slice, PR.green, fx.head.green);
 	arm(w, runId, "result");
-	const child = spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "2000" });
+	const child = spawnRun(w, runId);
 	try {
 		await reached(w, runId, "result");
 		w.ledger.db.exec("BEGIN IMMEDIATE");
@@ -2647,7 +2720,7 @@ test("publication retries a transient ledger lock within the post-sweep deadline
 			w.ledger.db.exec("ROLLBACK");
 			go(w, runId, "result");
 		}
-		await until("publication succeeds after the ledger lock clears", () => child.exitCode !== null, 3000);
+		await until("publication succeeds after the ledger lock clears", () => child.exitCode !== null);
 		expect(child.exitCode).toBe(0);
 		const results = testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.results;
 		expect(results).toHaveLength(1);
@@ -2907,7 +2980,7 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 			const id = runIdOf(start(w, requester.wl, PR.green, ["--slice", requester.slice]));
 			const result = await finalized(w, requester.wl, id);
 			expect(fastPlanOf(w.ledger.entries(requester.wl), id)).toEqual({
-				ref: `wl/${owner.wl}`, scope: "fast", files: ["a.test.ts"], parse: ["a.test.ts"], macOnly: [],
+				ref: `wl/${owner.wl}`, scope: "fast", files: ["a.test.ts"], parse: ["a.test.ts"], macOnly: [], mainSkip: [],
 			});
 			expect(result).toMatchObject({ verdict: "green", scope: "fast", host: "linux", exec: { files: 1, tests: 1, treeFiles: 1 } });
 			expect(dispatches(w)).toHaveLength(1);
@@ -2923,7 +2996,7 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 			artifact(w, fx.head.green, mode);
 			const id = runIdOf(start(w, wl, PR.green, ["--slice", slice]));
 			const result = await finalized(w, wl, id);
-			expect(fastPlanOf(w.ledger.entries(wl), id)).toEqual({ ref: `wl/${wl}`, scope: "fast", files: ["a.test.ts"], parse: ["a.test.ts"], macOnly: [] });
+			expect(fastPlanOf(w.ledger.entries(wl), id)).toEqual({ ref: `wl/${wl}`, scope: "fast", files: ["a.test.ts"], parse: ["a.test.ts"], macOnly: [], mainSkip: [] });
 			expect(result).toMatchObject({
 				verdict: mode === "green" ? "green" : "red", scope: "fast", host: "linux",
 				exec: { files: mode === "missing" ? 0 : 1, tests: mode === "missing" ? 0 : 1, treeFiles: 1 },
@@ -2972,7 +3045,7 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 			const { wl, slice } = bind(w, PR.green, fx.head.green);
 			const id = request(w, wl, slice, PR.green, fx.head.green);
 			w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: slice, kind: "assumption", body: fastPlanBody(id, {
-				ref: `wl/${wl}`, scope: "fast", files: ["a.test.ts"], parse: ["a.test.ts"], macOnly: [],
+				ref: `wl/${wl}`, scope: "fast", files: ["a.test.ts"], parse: ["a.test.ts"], macOnly: [], mainSkip: [],
 			}) });
 			const publisher = failure === "lock" ? new Database(join(w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!, "promotion.db")) : null;
 			publisher?.exec("BEGIN IMMEDIATE");
@@ -3013,7 +3086,7 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 		const { wl, slice } = bind(w, PR.green, fx.head.green);
 		const id = request(w, wl, slice, PR.green, fx.head.green);
 		w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: slice, kind: "assumption", body: fastPlanBody(id, {
-			ref: `wl/${wl}`, scope: "fast", files: ["a.test.ts"], parse: ["a.test.ts"], macOnly: [],
+			ref: `wl/${wl}`, scope: "fast", files: ["a.test.ts"], parse: ["a.test.ts"], macOnly: [], mainSkip: [],
 		}) });
 		writeFileSync(join(w.root, "gh.log"), "");
 		arm(w, id, "phase-install");
@@ -3415,17 +3488,19 @@ describe("land-first main D5 (R13, R14)", () => {
 			if (path === "publication error") w.ledger.db.exec(`CREATE TRIGGER refuse_main_result BEFORE INSERT ON entries
 				WHEN NEW.body LIKE 'test-run:%' BEGIN SELECT RAISE(FAIL, 'main result publication refused by fixture'); END`);
 			let runnerExit: Promise<number> | undefined;
+			// The repository's publication mutex, held here as `withFullSuitePublication` holds it (BEGIN IMMEDIATE on its file), so
+			// the test can wait on the real child's mark asynchronously while it owns the mutex.
+			withFullSuitePublication(w.runs, OWNER_REPO, () => {});
+			const mutex = new Database(join(w.runs, readdirSync(w.runs).find((f) => f.startsWith("runs.db.publication-") && f.endsWith(".db"))!));
 			try {
-				withFullSuitePublication(w.runs, OWNER_REPO, () => {
+				mutex.exec("BEGIN IMMEDIATE");
+				try {
 					const child = spawnRun(w, id, path === "startup" ? { AGENT_SYSTEM_TEST_RUNNER_CONFIG: join(w.root, "missing.yml") } : {});
 					runnerExit = child.exited;
-					// A real child blocks in SQLite while this synchronous callback owns the mutex; fake timers cannot drive its clock.
-					const deadline = Date.now() + 60_000;
-					while (marks(w, OWNER_REPO.replaceAll("/", "_"), "main-revocation-acquiring").length === 0) {
+					await until("main acquiring the publication mutex", () => {
 						if (child.exitCode !== null) throw new Error(`main exited before acquiring publication mutex: ${child.exitCode}\n${runnerLog(w, id)}`);
-						if (Date.now() >= deadline) throw new Error(`main did not reach publication mutex before fixture deadline\n${runnerLog(w, id)}`);
-						Bun.sleepSync(25);
-					}
+						return marks(w, OWNER_REPO.replaceAll("/", "_"), "main-revocation-acquiring").length > 0;
+					}, 60_000);
 					expect(calls(w)).not.toContain("context=as2/full-suite");
 					expect(calls(w)).not.toContain("context=as2/main-full");
 					// Stand in for the off reconciler completing under the same mutex, before the waiting main can read activation.
@@ -3435,7 +3510,9 @@ describe("land-first main D5 (R13, R14)", () => {
 						w.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstOffBody(OWNER_REPO, "pending", off) });
 						w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstOffBody(OWNER_REPO, "complete", off) });
 					});
-				});
+				} finally {
+					mutex.exec("COMMIT");
+				}
 				expect(await runnerExit).toBe(path === "publication error" ? START_EXIT.failed : 0);
 				expect(calls(w)).not.toContain("context=as2/full-suite");
 				expect(calls(w)).not.toContain("pr list");
@@ -3445,6 +3522,7 @@ describe("land-first main D5 (R13, R14)", () => {
 					: await resultOf(w, STANDING_WORKLOAD_ID, id);
 				expect(result).toMatchObject({ main: true, verdict: path === "settle" ? "red" : "error" });
 			} finally {
+				mutex.close();
 				await runnerExit;
 			}
 		});
@@ -3847,8 +3925,11 @@ done`));
 			await until("preflight waiting for promotion", () => marks(w, id, "promotion-busy").length > 0);
 			const firstBeat = parseHeartbeat(readFileSync(join(w.runs, id, "heartbeat"), "utf8"), id)!;
 			await until("heartbeat while promotion is contended", () => parseHeartbeat(readFileSync(join(w.runs, id, "heartbeat"), "utf8"), id)! > firstBeat);
-			// Real SQLite contention crosses child processes using Date.now(); fake timers cannot exercise the former five-second timeout.
-			await Bun.sleep(5500);
+			// Past the former five-second timeout on the runner's clock: a reconciliation still retrying after a 5.5 s step waits for
+			// the healthy holder rather than giving up.
+			const reconcileBusy = marks(w, id, "promotion-busy").length;
+			stepClock(w, 5_500);
+			await until("reconciliation still retrying after the 5.5 s step", () => marks(w, id, "promotion-busy").length > reconcileBusy);
 			expect(realpathSync(join(directory, "current"))).toBe(old);
 			expect(existsSync(join(w.root, "sudo.log"))).toBe(false);
 			symlinkSync(next, join(directory, "next"));
@@ -3863,8 +3944,12 @@ done`));
 			expect(() => publisher.exec("BEGIN IMMEDIATE")).toThrow(/locked|busy/i);
 			expect(realpathSync(join(directory, "current"))).toBe(next);
 			expect(readFileSync(join(w.root, "verified-tag"), "utf8")).toBe(fx.main);
-			// The separate synchronous publisher must also survive a real >5 s refresh holder; child clocks cannot be advanced here.
-			await Bun.sleep(5500);
+			// The separate publisher also waits through a holder past SQLite's five-second default: past a 5.5 s step of the runner's
+			// clock, it is still retrying its nonblocking BEGIN.
+			await until("promotion retrying the held reconciliation lock", () => marks(w, fx.head.green, "promotion-busy").length > 0);
+			const promotionBusy = marks(w, fx.head.green, "promotion-busy").length;
+			stepClock(w, 5_500);
+			await until("promotion still retrying after the 5.5 s step", () => marks(w, fx.head.green, "promotion-busy").length > promotionBusy);
 			writeFileSync(refreshGo, "");
 			expect(await runner.exited).toBe(0);
 			expect(await promotion.exited).toBe(0);
@@ -3997,8 +4082,8 @@ test("verified promotion never publishes another served repository's shadow gree
 // Review r1 finding 4: release() used to clear `held` before its delete, so a failed delete left the row held and the finally's
 // release returned at once. Review r2 finding 2: release then gave up after a 2 s deadline. Either way the next run waited for the
 // row's heartbeat to go stale. Both tests run the production release settings (no knob): the release retries until the row would
-// be stale for a waiter.
-test("runs.db held for 4 s from the first lock-row delete (past the old 2 s deadline): the row goes within 200 ms of the hold's end, and the queued next run takes it within its 2 s poll, not as a stale takeover", async () => {
+// be stale for a waiter. The runner's clock (`stepClock`) carries the hold past those deadlines; no real time is waited out.
+test("runs.db held for 4 s of the runner's clock from the first lock-row delete (past the old 2 s deadline): the release retries through the hold, the row goes once it ends, and the queued next run takes it, not as a stale takeover", async () => {
 	const w = world();
 	const { wl, slice } = workload(w);
 	const runId = request(w, wl, slice, PR.green, fx.head.green);
@@ -4016,13 +4101,12 @@ test("runs.db held for 4 s from the first lock-row delete (past the old 2 s dead
 		db.exec("BEGIN IMMEDIATE");
 		holding = true;
 		go(w, runId, "release");
-		const first = await until("the first delete fails", () => marks(w, runId, "release-failed")[0], 10_000);
-		// A genuine 4 s hold: the subject is the runner process's own clock against a real SQLite lock, which fake timers in this
-		// process cannot move; the hold ends 4 s after the runner's first failed delete (its own mark time), not a guessed delay.
-		await Bun.sleep(Number(first.at) + 4_000 - Date.now());
-		const failedInHold = marks(w, runId, "release-failed").length;
+		await until("the first delete fails", () => marks(w, runId, "release-failed")[0], 10_000);
+		// The hold spans 4 s of the runner's clock; a retry after that step shows the release still going past the old 2 s deadline.
+		const failedBeforeStep = marks(w, runId, "release-failed").length;
+		stepClock(w, 4_000);
+		await until("a delete retried after the 4 s step", () => marks(w, runId, "release-failed").length > failedBeforeStep);
 		db.exec("ROLLBACK");
-		const heldEnd = Date.now();
 		holding = false;
 		await kids[0]!.exited;
 		expect(kids[0]!.exitCode).toBe(0);
@@ -4030,19 +4114,12 @@ test("runs.db held for 4 s from the first lock-row delete (past the old 2 s dead
 		expect(log).toMatch(/ the lock release failed: .+; retrying until \S+\n/);
 		expect(log).toContain(" lock released\n");
 		expect(log).not.toContain("the lock was not released");
-		// retried every 50 ms through the whole hold, past where the 2 s deadline gave up
-		expect(failedInHold).toBeGreaterThan(40);
-		const releasedAt = logAt(log, / lock released$/);
-		console.info(`release after a 4 s hold: the row went ${releasedAt - heldEnd} ms after the hold ended`);
-		// The 50 ms retry frees the row soon after the hold; the bound only has to tell that apart from the 60 s stale horizon,
-		// with room for a loaded machine (a review run beside the full suite saw 600 ms).
-		expect(releasedAt - heldEnd).toBeLessThan(2_000);
 		expect((await resultOf(w, wl, runId)).verdict).toBe("green");
 		await kids[1]!.exited;
 		// displaced null: the row was gone when it took the lock, never waited out as a stale holder's
 		const took = marks(w, next.id, "acquired");
 		expect(took).toEqual([expect.objectContaining({ displaced: null })]);
-		expect(Number(took[0]!.at) - releasedAt).toBeLessThan(2_000 + 1_000);
+		// The row was released, so the waiter took it as a free row, not as a stale holder's at the 60 s horizon.
 		expect((await resultOf(w, next.wl, next.id)).verdict).toBe("stale");
 		expect(lockRow(db)).toBeNull();
 	} finally {
@@ -4053,7 +4130,7 @@ test("runs.db held for 4 s from the first lock-row delete (past the old 2 s dead
 	}
 });
 
-test("the release horizon reached while runs.db stays held (the row's heartbeatAt written 59 s back at the release hook): `the lock was not released` at the horizon, the run exits START_EXIT.failed with its status posted, and the queued run then takes the stale row", async () => {
+test("the release horizon reached while runs.db stays held (the runner's clock stepped past the row's heartbeatAt + 60 s at the release hook): `the lock was not released` at the horizon, the run exits START_EXIT.failed with its status posted, and the queued run then takes the stale row", async () => {
 	const w = world();
 	const { wl, slice } = workload(w);
 	const runId = request(w, wl, slice, PR.green, fx.head.green);
@@ -4067,29 +4144,31 @@ test("the release horizon reached while runs.db stays held (the row's heartbeatA
 		const next = waiter(w, 0);
 		kids.push(spawnRun(w, next.id));
 		await until("the next run is queued behind the holder", () => marks(w, next.id, "queued").length > 0, 60_000);
-		// From the release hook on, the run's heartbeat leaves the row alone, so this heartbeatAt is the one release reads.
-		// 59 s back: still live to the waiter until the hold is in place.
-		const beatAt = Date.now() - 59_000;
+		// From the release hook on, the run's heartbeat leaves the row alone, so this heartbeatAt is the one release reads; fresh,
+		// it stays live to the waiter (its own Date.now()) for the whole test until the test writes it stale below.
+		const beatAt = Date.now();
 		expect(db.query("UPDATE lock SET heartbeatAt = ? WHERE runId = ?").run(beatAt, runId).changes).toBe(1);
 		db.exec("BEGIN IMMEDIATE");
 		holding = true;
 		go(w, runId, "release");
+		await until("the first delete fails", () => marks(w, runId, "release-failed")[0], 10_000);
+		const horizon = beatAt + 60_000;
+		// Never before a waiter could take the row: the runner's clock is short of the horizon until this step.
+		expect(runnerLog(w, runId)).not.toContain("the lock was not released");
+		stepClock(w, 60_000 + 1_000);
 		await kids[0]!.exited;
 		expect(kids[0]!.exitCode).toBe(START_EXIT.failed);
 		const log = runnerLog(w, runId);
-		const horizon = beatAt + 60_000;
 		expect(log).toContain(` the lock release failed: `);
 		expect(log).toContain(`; retrying until ${new Date(horizon).toISOString()}\n`);
 		expect(log).toMatch(/ the lock was not released: .+ \(\d+ attempts; the row's heartbeatAt \S+ is stale for a waiter since \S+\); the row holds this run until a waiter takes it\n/);
 		expect(log).not.toContain(" lock released\n");
-		const gaveUp = logAt(log, / the lock was not released: /);
-		// never before a waiter could take the row, and not long after
-		expect(gaveUp).toBeGreaterThan(horizon);
-		expect(gaveUp - horizon).toBeLessThan(500);
 		expect((await resultOf(w, wl, runId)).verdict).toBe("green");
 		expect(statusPosts(w)).toEqual([`success ${fx.head.green}`]);
 		expect(lockRow(db)).toMatchObject({ runId, heartbeatAt: beatAt });
-		db.exec("ROLLBACK");
+		// The waiter's clock past the horizon too: the row's heartbeatAt stale to it, written in the held transaction and committed.
+		expect(db.query("UPDATE lock SET heartbeatAt = ? WHERE runId = ?").run(beatAt - 61_000, runId).changes).toBe(1);
+		db.exec("COMMIT");
 		holding = false;
 		await kids[1]!.exited;
 		expect(marks(w, next.id, "acquired")).toEqual([expect.objectContaining({ displaced: runId })]);
@@ -4357,27 +4436,31 @@ exit 125`);
 		expect(log).toContain("the sweep after full was abandoned at its deadline");
 		const paused = JSON.parse(readFileSync(`${hookBase(w, runId, "sweep-read1")}.reached`, "utf8")) as { pid: number };
 		expect(alive(paused.pid)).toBe(false);
-		const stuckAt = logAt(log, / full tr-[a-z0-9]+ → exit 125$/);
+		// The deadlines pass while the sweep and the head re-check stay paused, however slowly the machine runs; the finalization
+		// deadline the log names is STUCK_FINALIZE_MS (here 1.5 s) from its start, both read off the runner's own log.
 		const started = logAt(log, /post-sweep finalization started/);
 		const deadline = Date.parse(/post-sweep finalization started; deadline (\S+)/.exec(log)![1]!);
-		expect(started - stuckAt).toBeLessThan(1500 + 1000);
 		expect(deadline - started).toBeLessThanOrEqual(1500);
-		expect(logAt(log, / lock released$/) - stuckAt).toBeLessThan(1500 + 1500 + 2000);
+		expect(logAt(log, /the sweep after full was abandoned at its deadline/)).toBeLessThanOrEqual(started);
 	});
 
 	// Review r1 finding 2: the post-stuck sweep's ownership checkpoint used to wait out publishIfOwner's busyLoop (12 busy_timeouts,
 	// about 60 s at the production 5 s) before the shared sweep deadline was even read.
-	test("runs.db held from the stuck part's end through its sweep's ownership checkpoint: the checkpoint gives up at the sweep deadline, and the lock is released within the sweep deadline + STUCK_FINALIZE_MS + slack", async () => {
+	// The hold starts at the checkpoint's own hook, after the stuck exit: `halt` has set runs.db's busy_timeout to 0 by then. A hold
+	// taken while the part still ran met the 500 ms heartbeat's synchronous UPDATE at the 5 s busy_timeout, which blocks the runner's
+	// thread until the busy wait ends, so when the exit was logged depended on whether a heartbeat fell inside the hold.
+	test("runs.db held from the stuck part's end through its sweep's ownership checkpoint: the checkpoint gives up once the runner's clock passes the sweep deadline, not after a synchronous busy wait, and the lock is released", async () => {
 		const w = world({ stuckStop: "enforce" });
 		const { wl, slice } = workload(w);
-		standIn(w, `while [ ! -f "$here/held" ]; do sleep 0.05; done
+		standIn(w, `while [ ! -f "$here/armed" ]; do sleep 0.05; done
 stp 4242 4243
 exit 125`);
 		const runId = request(w, wl, slice, PR.green, fx.head.green);
-		const sweepMs = 1500;
-		const finalizeMs = 1500;
+		const sweepMs = STUCK_SWEEP_MS;
+		const finalizeMs = STUCK_FINALIZE_MS;
 		const db = lockDbOf(w);
-		// The production busy_timeout, so a checkpoint that waits on runs.db synchronously waits far past every deadline here.
+		// The production busy_timeout, so a checkpoint that waits on runs.db synchronously waits far past the sweep deadline, which the
+		// runner's clock (production STUCK_SWEEP_MS) reaches only when the test steps it, once the checkpoint is retrying.
 		const child = spawnRun(w, runId, {
 			...STUCK_KNOBS, AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS: String(sweepMs), AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS: String(finalizeMs), AGENT_SYSTEM_TEST_RUNNER_BUSY_MS: "5000",
 		});
@@ -4385,13 +4468,28 @@ exit 125`);
 		let holding = false;
 		try {
 			await until("the stand-in started", () => existsSync(join(w.root, "standin.pid")), 60_000);
-			db.exec("BEGIN IMMEDIATE");
+			// The publish sweep's checkpoint is behind the run now: the next `phase-sweep` is the stuck part's bounded sweep's.
+			arm(w, runId, "phase-sweep");
+			writeFileSync(join(w.root, "armed"), "");
+			await reached(w, runId, "phase-sweep");
+			expect(runnerLog(w, runId)).toMatch(/ full tr-[a-z0-9]+ → exit 125$/m);
+			// BEGIN IMMEDIATE fails at once (busy_timeout 0) while the runner's nonblocking heartbeat is mid-UPDATE; it is retried until held.
+			await until("the test holds runs.db", () => {
+				try {
+					db.exec("BEGIN IMMEDIATE");
+					return true;
+				} catch (e) {
+					if (!/database is locked/.test((e as Error).message)) throw e;
+					return false;
+				}
+			});
 			holding = true;
-			writeFileSync(join(w.root, "held"), "");
-			await until("the runner saw the stuck exit", () => / full tr-[a-z0-9]+ → exit 125$/m.test(runnerLog(w, runId)), 60_000);
-			// Held until the checkpoint gives up, or for the whole bound when it never does.
-			const heldUntil = Date.now() + sweepMs + finalizeMs + 2000;
-			await until("the checkpoint gives up or the bound passes", () => gaveUp.test(runnerLog(w, runId)) || Date.now() >= heldUntil, 60_000);
+			go(w, runId, "phase-sweep");
+			await until("the checkpoint retrying the held runs.db", () => marks(w, runId, "checkpoint-busy").length > 0);
+			// A checkpoint in a synchronous busy wait (12 × the 5 s busy_timeout) would not read the stepped deadline before this
+			// wait's 30 s failure bound; the nonblocking one gives up at its next attempt.
+			stepClock(w, sweepMs);
+			await until("the checkpoint gives up at the stepped sweep deadline", () => gaveUp.test(runnerLog(w, runId)));
 			db.exec("ROLLBACK");
 			holding = false;
 			await child.exited;
@@ -4399,10 +4497,7 @@ exit 125`);
 			expect(run.verdict).toBe("error");
 			expect(run.reason).toStartWith(`full: ${STOP_REASON}`);
 			const log = runnerLog(w, runId);
-			const stuckAt = logAt(log, / full tr-[a-z0-9]+ → exit 125$/);
-			expect(logAt(log, / lock released$/) - stuckAt).toBeLessThan(sweepMs + finalizeMs + 2000);
 			expect(log).toMatch(gaveUp);
-			expect(logAt(log, gaveUp) - stuckAt).toBeLessThan(sweepMs + 1000);
 			expect(marks(w, runId, "checkpoint-busy").length).toBeGreaterThan(0);
 			// no sweep ran after the stuck part: its deadline passed in the checkpoint; the containment check judged what was left
 			expect(marks(w, runId, "sweep").map((x) => x.after)).toEqual(["publish"]);
@@ -4410,7 +4505,8 @@ exit 125`);
 			expect(lockRow(db)).toBeNull();
 		} finally {
 			if (holding) db.exec("ROLLBACK");
-			writeFileSync(join(w.root, "held"), "");
+			writeFileSync(join(w.root, "armed"), "");
+			go(w, runId, "phase-sweep");
 			await child.exited;
 			db.close();
 		}
@@ -4574,7 +4670,6 @@ exit 125`);
 		const first = workload(w);
 		const second = workload(w);
 		const runId = request(w, first.wl, first.slice, PR.spin, fx.head.spin, 1_000);
-		Bun.sleepSync(5);
 		const nextId = request(w, second.wl, second.slice, PR.green, fx.head.green);
 		const kids: Child[] = [];
 		let pgids: number[] = [];
@@ -4759,7 +4854,6 @@ async function withProof(path: string, o: { stallExec?: boolean; holdCleanup?: b
 	const first = workload(w);
 	const second = workload(w);
 	const runId = request(w, first.wl, first.slice, PR.spin, fx.head.spin, 1_000);
-	Bun.sleepSync(5);
 	const nextId = request(w, second.wl, second.slice, PR.green, fx.head.green);
 	const kids: Child[] = [];
 	let execPid: number | null = null;
@@ -5035,7 +5129,7 @@ interface FieldRun {
 	capMin: number;
 	verdict: string | null;
 	reason: string | null;
-	/** The runner process's wall time, spawn to exit. */
+	/** The runner's wall time as its own runner.log records it, first line to last (the test takes no clock reading of its own). */
 	runnerMs: number | null;
 	/** An injected run's spin worker (the fixture's `spin.pid`): its decisions are injected, every other one is on the real files. */
 	spinWorker: number | null;
@@ -5095,9 +5189,12 @@ describe.if(process.env.AS2_STUCK_FIELD_SOAK === "1")("field soak (field-soak.sh
 		return r;
 	}
 	/** The run's own `test-run:` and result.json: settled. */
-	async function settled(w: World, wl: string, r: FieldRun, kid: Child, spawnedAt: number): Promise<void> {
+	async function settled(w: World, wl: string, r: FieldRun, kid: Child): Promise<void> {
 		await kid.exited;
-		r.runnerMs = Date.now() - spawnedAt;
+		// Only timestamped lines: a multi-line log entry's continuation lines carry no time.
+		const stamps = runnerLog(w, r.runId).split("\n").map((l) => Date.parse(l.slice(0, l.indexOf(" ")))).filter(Number.isFinite);
+		if (stamps.length === 0) throw new Error(`field soak: ${r.runId}'s runner.log has no timestamped line`);
+		r.runnerMs = stamps.at(-1)! - stamps[0]!;
 		const run = await resultOf(w, wl, r.runId);
 		r.verdict = run.verdict;
 		r.reason = run.reason ?? null;
@@ -5134,10 +5231,9 @@ describe.if(process.env.AS2_STUCK_FIELD_SOAK === "1")("field soak (field-soak.sh
 				const { wl, slice } = workload(w);
 				const runId = request(w, wl, slice, FIELD_PR.soak, origin.head.soak);
 				const r = entry("soak", "shadow", runId, FIELD_PR.soak, origin.head.soak, FIELD_CAP_MIN);
-				const at = Date.now();
 				const kid = spawnRun(w, runId);
 				kids.push(kid);
-				await settled(w, wl, r, kid, at);
+				await settled(w, wl, r, kid);
 			}
 		} catch (e) {
 			errors.push(e);
@@ -5152,7 +5248,6 @@ describe.if(process.env.AS2_STUCK_FIELD_SOAK === "1")("field soak (field-soak.sh
 			const first = workload(w);
 			const second = workload(w);
 			const runId = request(w, first.wl, first.slice, FIELD_PR.spin, origin.head.spin, 1_000);
-			Bun.sleepSync(5);
 			const nextId = request(w, second.wl, second.slice, FIELD_PR.soak, origin.head.soak);
 			const injected = entry("injected", mode, runId, FIELD_PR.spin, origin.head.spin, capMin);
 			const queued = entry("queued", mode, nextId, FIELD_PR.soak, origin.head.soak, capMin);
@@ -5161,10 +5256,8 @@ describe.if(process.env.AS2_STUCK_FIELD_SOAK === "1")("field soak (field-soak.sh
 			const stop = watchTrees(kids, seen);
 			const errors: unknown[] = [];
 			try {
-				const at = Date.now();
 				kids.push(spawnRun(w, runId));
 				await until(`${runId} took the lock`, () => / took the lock\n/.test(runnerLog(w, runId)), 120_000);
-				const nextAt = Date.now();
 				kids.push(spawnRun(w, nextId));
 				await until(`${nextId} queued behind ${runId}`, () => marks(w, nextId, "queued").length >= 1, 60_000);
 				const execPid = (await until(`${runId}'s full call`, () => marks(w, runId, "spawn-full")[0], 300_000)).pid as number;
@@ -5182,12 +5275,359 @@ describe.if(process.env.AS2_STUCK_FIELD_SOAK === "1")("field soak (field-soak.sh
 				}, capMin * 60_000 + 5 * 60_000);
 				injected.killedAfterFull = await killLeft(`${runId}'s full part (${mode})`, tree);
 				save();
-				await settled(w, first.wl, injected, kids[0]!, at);
-				await settled(w, second.wl, queued, kids[1]!, nextAt);
+				await settled(w, first.wl, injected, kids[0]!);
+				await settled(w, second.wl, queued, kids[1]!);
 			} catch (e) {
 				errors.push(e);
 			}
 			await close(`injected ${mode}`, kids, seen, stop, errors);
 		}, 20 * 60_000);
 	}
+});
+
+// Proofs use these real world fixtures and the same rendered wrapper as ordinary runs, never a substitute execution loop.
+describe("finite timing proofs on the exclusive runner", () => {
+	/** Preserve new proof worlds on any failure; the file's ordinary afterAll must not erase their receipts. */
+	function proofTest(name: string, body: () => unknown | Promise<unknown>): void {
+		test(name, async () => {
+			const firstRoot = roots.length;
+			try { await body(); }
+			catch (error) {
+				const retained = roots.splice(firstRoot);
+				throw new Error(`timing proof failed; fixture evidence retained at ${retained.join(", ")}`, { cause: error });
+			}
+		});
+	}
+	function proofEach<T extends string>(values: readonly T[], name: string, body: (value: T) => unknown | Promise<unknown>): void {
+		for (const value of values) proofTest(name.replace("%s", value), () => body(value));
+	}
+	// Use the production connection's existing contention policy, not lockDbOf's intentional zero-wait fault-injection policy.
+	const proofDbOf = (w: World): Database => openLockDb(w.runs);
+	function manifest(wl: string, slice: string, sha: string, file = "a.test.ts", names = ["a"]): ProofManifest {
+		return parseProofManifest({
+			version: 1, kind: "smoke", workload: wl, slice, repo: OWNER_REPO, baseSha: sha, candidateSha: sha,
+			mode: "isolated", productionBudget: false, load: "none", runs: { base: 0, candidate: 2 },
+			files: [{ path: file, cases: names.map((name) => ({ base: [name], candidate: [name], budgetMs: 5000, timingUnderTest: false })),
+				hooks: { base: { setup: [], cleanup: [] }, candidate: { setup: [], cleanup: [] } }, skipped: { base: [], candidate: [] } }],
+		});
+	}
+	/**
+	 * The installed runtime files submission hashes into a proof's identity (installedRuntimeHashes), provisioned as synthetic
+	 * fixtures: `<libexec>/resources.json` is a copy of the synthetic policy the world's wrapper runs under, and an installed-OMP
+	 * proof gets a synthetic `<libexec>/installed-omp.json` pin. The world's wrapper reads its OMP pin beside the real Bun, never
+	 * this one, so the installed-OMP proof still fails closed on its executor. Rewriting the same bytes keeps the identity stable.
+	 */
+	function installProofRuntime(w: World, mode: ProofManifest["mode"]): void {
+		writeFileSync(join(w.libexec, "resources.json"), readFileSync(join(w.root, "resources.json")));
+		if (mode === "installed-OMP") {
+			writeFileSync(join(w.libexec, "installed-omp.json"), JSON.stringify({ root: join(w.root, "synthetic-omp"), treeSha256: "0".repeat(64), version: "synthetic test fixture only; no OMP installed" }));
+		}
+	}
+	/** The production submit path: the controller CLI, as a lane runs it, over the synthetic installed runtime. */
+	function submitRaw(w: World, m: ProofManifest) {
+		installProofRuntime(w, m.mode);
+		const path = join(w.root, "proof-manifest.json");
+		writeFileSync(path, JSON.stringify(m));
+		return Bun.spawnSync([process.execPath, PROOF_CLI, "submit", "--manifest", path], { env: w.env, stdout: "pipe", stderr: "pipe" });
+	}
+	function submit(w: World, m: ProofManifest) {
+		const r = submitRaw(w, m);
+		if (r.exitCode !== 0) throw new Error(`proof submit exit ${r.exitCode}: ${r.stderr.toString()}`);
+		const id = /^timing-proof (tp-[a-z0-9]+) admitted/m.exec(r.stdout.toString())?.[1];
+		if (!id) throw new Error(`proof submit returned no series: ${r.stdout.toString()}`);
+		return id;
+	}
+	/** A direct admission for a test that drives the series `run` itself; its executable inputs are distinct per candidate SHA. */
+	function admitDirect(db: Database, id: string, m: ProofManifest) {
+		const tree = (sha: string) => ({ sha, tree: sha.padEnd(64, "0") });
+		admitProof(db, id, m, { base: tree(m.baseSha), candidate: tree(m.candidateSha), runtime: { mode: m.mode, executor: { exec: "3".repeat(64) }, identity: "3".repeat(64) } }, Date.now());
+	}
+	async function terminal(w: World, id: string) {
+		const db = proofDbOf(w);
+		try {
+			return await until(`proof ${id} terminal`, () => {
+				const p = inspectProof(db, id);
+				return p.state === "failed" || p.state === "complete" ? p : null;
+			}, 120_000);
+		} finally { db.close(); }
+	}
+	proofTest("ordinary queue preserves a live proof waiter and gets its turn between finite iterations", async () => {
+		const w = world(), first = workload(w), proof = workload(w), other = workload(w);
+		const firstId = request(w, first.wl, first.slice, PR.green, fx.head.green);
+		arm(w, firstId, "phase-full");
+		const firstChild = spawnRun(w, firstId);
+		let otherChild: Subprocess | null = null;
+		let proofRunId = "", otherId = "", id = "";
+		try {
+			await reached(w, firstId, "phase-full");
+			id = submit(w, manifest(proof.wl, proof.slice, fx.head.green));
+			const db = proofDbOf(w);
+			let queuedAt = 0;
+			try {
+				const row = await until("proof registered in ordinary exclusive queue", () => db.query<{ runId: string; requestedAt: number }, [string]>("SELECT runId, requestedAt FROM queue WHERE workloadId = ?").get(proof.wl), 60_000);
+				proofRunId = row.runId; queuedAt = row.requestedAt;
+			} finally { db.close(); }
+			arm(w, proofRunId, "phase-solo");
+			otherId = w.pin(new Date(queuedAt + 1).toISOString(), () => request(w, other.wl, other.slice, PR.green, fx.head.green));
+			arm(w, otherId, "phase-full"); otherChild = spawnRun(w, otherId);
+			go(w, firstId, "phase-full");
+			await reached(w, proofRunId, "phase-solo");
+			const ordering = proofDbOf(w);
+			try {
+				await until("ordinary waiter registered before proof release", () => ordering.query("SELECT runId FROM queue WHERE runId = ?").get(otherId), 60_000);
+				// Inject the queue's logical sort input, rather than depending on how many wall milliseconds the tiny part takes.
+				ordering.query("UPDATE queue SET requestedAt = ? WHERE runId = ?").run(queuedAt - 1, otherId);
+			} finally { ordering.close(); }
+			go(w, proofRunId, "phase-solo");
+			await reached(w, otherId, "phase-full");
+			const check = proofDbOf(w);
+			try {
+				const p = await until("next proof iteration queued behind ordinary owner", () => {
+					const p = inspectProof(check, id);
+					return p.iterations.length === 2 && p.iterations[1]!.state === "running" ? p : null;
+				}, 60_000);
+				expect(lockRow(check)?.runId).toBe(otherId);
+				expect(p.iterations[0]!.state).toBe("complete");
+			} finally { check.close(); }
+			go(w, otherId, "phase-full");
+			expect((await terminal(w, id)).state).toBe("complete");
+			expect((await resultOf(w, other.wl, otherId)).verdict).toBe("green");
+		} finally {
+			go(w, firstId, "phase-full");
+			if (proofRunId) go(w, proofRunId, "phase-solo");
+			if (otherId) go(w, otherId, "phase-full");
+			await firstChild.exited;
+			if (otherChild) await otherChild.exited;
+		}
+	});
+	proofTest("productionBudget reaches real child/descendant without credentials; actual setup and cleanup markers are required", async () => {
+		const w = world(), { wl, slice } = workload(w);
+		const m = manifest(wl, slice, fx.head.proofenv, "proof-env.test.ts", ["proof environment"]);
+		m.productionBudget = true;
+		for (const phase of ["base", "candidate"] as const) m.files[0]!.hooks[phase] = { setup: ["ready"], cleanup: ["reaped"] };
+		const p = await terminal(w, submit(w, m));
+		expect(p.error).toBeNull(); expect(p.state).toBe("complete");
+		for (const i of p.iterations) {
+			const receipt = JSON.parse(readFileSync(join(w.runs, i.runId, "proof.json"), "utf8"));
+			expect(receipt.execution.markers).toEqual(["timing-proof setup proof-env.test.ts ready", "timing-proof cleanup proof-env.test.ts reaped"]);
+			expect(receipt.resources.executionArgv).toContain("./proof-env.test.ts");
+		}
+	});
+	proofTest("installed-OMP mode cannot fall back to the groups/operator executor or publish a green", async () => {
+		const w = world(), { wl, slice } = workload(w);
+		const m = manifest(wl, slice, fx.head.green); m.mode = "installed-OMP";
+		const p = await terminal(w, submit(w, m));
+		expect(p.state).toBe("failed"); expect(p.iterations).toHaveLength(1);
+		const receipt = JSON.parse(readFileSync(join(w.runs, p.iterations[0]!.runId, "solo-1.resources.json"), "utf8"));
+		expect(receipt.status).toBe("error");
+		expect(receipt.error).toContain("actual _as2test");
+		expect(receipt.executionArgv).toBeNull();
+		expect(w.ledger.slice(slice)?.state).toBe("open");
+		expect(testRuns(w.ledger.entries(wl))).toHaveLength(0);
+		expect(existsSync(join(w.root, "status-ok.log"))).toBe(false);
+	});
+	proofTest("submit/inspect queues two actual solos, preserves JUnit/resources/cleanup, and settles no slice or status", async () => {
+		const w = world(), { wl, slice } = workload(w);
+		const id = submit(w, manifest(wl, slice, fx.head.green));
+		const p = await terminal(w, id);
+		expect(p.error).toBeNull();
+		expect(p.state).toBe("complete");
+		expect(p.iterations).toHaveLength(2);
+		expect(new Set(p.iterations.map((i) => i.runId)).size).toBe(2);
+		for (const i of p.iterations) {
+			const dir = join(w.runs, i.runId);
+			const receipt = JSON.parse(readFileSync(join(dir, "proof.json"), "utf8"));
+			expect(receipt.execution.cases.map((c: { name: string }) => c.name)).toEqual(["a"]);
+			expect(receipt.resources.status).toBe("admitted");
+			expect(receipt.cleanup.state).toBe("verified");
+			expect(existsSync(workDirOf(i.runId, w.as2))).toBe(false);
+			expect(readFileSync(join(dir, "solo-1.xml"), "utf8")).toContain('name="a"');
+			expect(readFileSync(join(dir, "wrapper.jsonl"), "utf8")).toContain(`./a.test.ts`);
+		}
+		const inspected = Bun.spawnSync([process.execPath, PROOF_CLI, "inspect", "--series", id], { env: w.env, stdout: "pipe", stderr: "pipe" });
+		expect(inspected.exitCode).toBe(0);
+		expect(JSON.parse(inspected.stdout.toString()).completionProof).toBe(false);
+		expect(w.ledger.slice(slice)?.state).toBe("open");
+		expect(testRuns(w.ledger.entries(wl))).toHaveLength(0);
+		expect(existsSync(join(w.root, "status-ok.log"))).toBe(false);
+	});
+	proofTest("five fresh full executions ignore an existing main green and leave it unchanged", async () => {
+		const w = world(), { wl, slice } = workload(w);
+		mainRun(w.ledger, "tr-existingproofgreen", fx.head.green, "green", { exec: { files: 2, tests: 2, treeFiles: 2 } });
+		const before = mainResults(w.ledger.entries(STANDING_WORKLOAD_ID));
+		const m = manifest(wl, slice, fx.head.green);
+		m.kind = "full-series"; m.runs = { base: 0, candidate: 5 };
+		m.files.push({ ...m.files[0]!, path: "xa.test.ts", cases: [{ base: ["xa"], candidate: ["xa"], budgetMs: 5000, timingUnderTest: false }] });
+		const p = await terminal(w, submit(w, m));
+		expect(p.error).toBeNull(); expect(p.state).toBe("complete"); expect(p.iterations).toHaveLength(5);
+		expect(new Set(p.iterations.map((i) => i.runId)).size).toBe(5);
+		for (const i of p.iterations) {
+			const receipt = JSON.parse(readFileSync(join(w.runs, i.runId, "proof.json"), "utf8"));
+			expect(receipt.part.stem).toBe("full"); expect(receipt.execution.cases).toHaveLength(2); expect(receipt.cleanup.state).toBe("verified");
+		}
+		expect(mainResults(w.ledger.entries(STANDING_WORKLOAD_ID))).toEqual(before);
+		expect(testRuns(w.ledger.entries(wl))).toHaveLength(0);
+	});
+	proofEach(["red", "skipped", "missing"] as const, "%s stops at the first candidate and cannot replay on restart", async (kind) => {
+		const w = world(), { wl, slice } = workload(w);
+		const m = kind === "red" ? manifest(wl, slice, fx.head.red, "red.test.ts", [...Array.from({ length: 25 }, (_, i) => `case ${String(i + 1).padStart(2, "0")}`), "passes"])
+			: manifest(wl, slice, kind === "skipped" ? fx.head.skipped : fx.head.green, "a.test.ts", [kind === "skipped" ? "a skipped" : "missing"]);
+		const id = submit(w, m), p = await terminal(w, id);
+		expect(p.state).toBe("failed"); expect(p.iterations).toHaveLength(1);
+		expect(existsSync(join(w.runs, p.iterations[0]!.runId, "solo-1.xml"))).toBe(true);
+		const restart = Bun.spawnSync([process.execPath, PROOF_CLI, "run", id], { env: w.env, stdout: "pipe", stderr: "pipe" });
+		expect(restart.exitCode).toBe(3);
+		expect(existsSync(workDirOf(p.iterations[0]!.runId, w.as2))).toBe(true);
+		expect(existsSync(join(w.runs, p.iterations[0]!.runId, "proof-retained-world.json"))).toBe(true);
+		const db = proofDbOf(w);
+		try { expect(inspectProof(db, id).iterations).toHaveLength(1); } finally { db.close(); }
+		expect(w.ledger.slice(slice)?.state).toBe("open");
+	});
+	proofTest("admission rejects a SHA not fetched from served origin and an arbitrary environment", () => {
+		const w = world(), { wl, slice } = workload(w);
+		for (const bad of [{ ...manifest(wl, slice, fx.head.green), candidateSha: "f".repeat(40) }, { ...manifest(wl, slice, fx.head.green), env: { GH_TOKEN: "smuggled" } }]) {
+			const r = submitRaw(w, bad as ProofManifest);
+			expect(r.exitCode).not.toBe(0);
+			const db = proofDbOf(w);
+			try { expect(db.query("SELECT id FROM timing_proofs").all()).toHaveLength(0); } finally { db.close(); }
+		}
+	});
+	proofEach(["proof-cleanup-published", "proof-cleanup-transferred"], "crash at %s retains interrupted attempt; next ordinary owner republishes and reaps its world", async (boundary) => {
+		const w = world(), { wl, slice } = workload(w);
+		const db = proofDbOf(w), id = "tp-crashproof";
+		try { admitDirect(db, id, manifest(wl, slice, fx.head.green)); } finally { db.close(); }
+		arm(w, id, "proof-iteration");
+		const child = Bun.spawn([process.execPath, PROOF_CLI, "run", id], { env: w.env, stdout: "ignore", stderr: "ignore" });
+		let runId = "";
+		try {
+			await reached(w, id, "proof-iteration");
+			runId = JSON.parse(readFileSync(`${hookBase(w, id, "proof-iteration")}.reached`, "utf8")).runId;
+			arm(w, runId, boundary); go(w, id, "proof-iteration");
+			await reached(w, runId, boundary);
+		} finally { child.kill("SIGKILL"); await child.exited; }
+		const originalRoot = workDirOf(runId, w.as2);
+		expect(existsSync(originalRoot)).toBe(true);
+		expect(existsSync(join(w.runs, runId, "proof-cleanup.json"))).toBe(true);
+		// Model the dead holder's lease expiry directly; the behavior is crash recovery, not a wall-clock race.
+		writeFileSync(join(w.runs, runId, "heartbeat"), heartbeatText(runId, Date.now() - 120_000));
+		staleRow(w);
+		const ordinary = request(w, wl, slice, PR.green, fx.head.green);
+		const next = spawnRun(w, ordinary);
+		try {
+			const result = await resultOf(w, wl, ordinary);
+			expect(result.verdict).toBe("green");
+			await next.exited;
+		} finally { if (next.exitCode === null) { next.kill("SIGKILL"); await next.exited; } }
+		const check = proofDbOf(w);
+		try {
+			const p = inspectProof(check, id);
+			expect(p.state).toBe("failed"); expect(p.iterations).toHaveLength(1); expect(p.iterations[0]!.state).toBe("interrupted");
+			expect(lockRow(check)).toBeNull();
+		} finally { check.close(); }
+		expect(existsSync(originalRoot)).toBe(false);
+		expect(readFileSync(join(w.runs, runId, "proof-recovery.jsonl"), "utf8")).toContain("originalError");
+	});
+
+	// ---- TOOLS-REVIEW-r1 F1: the historic load outlives no owner ----------------------------------------------------------
+	const liveOf = (pids: number[]): number[] => {
+		const s = snapshot(process.getuid!());
+		if (s.kind !== "ok") throw new Error(`process list of this uid unavailable: ${s.why}`);
+		return pids.filter((pid) => s.procs.some((p) => p.pid === pid && !p.zombie));
+	};
+	proofEach(["SIGKILL", "SIGSTOP"] as const, "a controller lost to %s after its historic load is ready leaks no load; the next owner recovers it before any part", async (signal) => {
+		const w = world(), { wl, slice } = workload(w);
+		const m = manifest(wl, slice, fx.head.green);
+		m.kind = "full-series"; m.runs = { base: 0, candidate: 5 }; m.load = "historic";
+		m.files.push({ ...m.files[0]!, path: "xa.test.ts", cases: [{ base: ["xa"], candidate: ["xa"], budgetMs: 5000, timingUnderTest: false }] });
+		const id = signal === "SIGKILL" ? "tp-loadkilled" : "tp-loadstopped";
+		const db = proofDbOf(w);
+		try { admitDirect(db, id, m); } finally { db.close(); }
+		arm(w, id, "proof-iteration");
+		// No run heartbeat after the first: the lost holder's staleness below is then the only one (as the supersede tests do).
+		const child = Bun.spawn([process.execPath, PROOF_CLI, "run", id], { env: { ...w.env, AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS: "600000" }, stdout: "ignore", stderr: "ignore" });
+		let pids: number[] = [];
+		try {
+			await reached(w, id, "proof-iteration");
+			const runId: string = JSON.parse(readFileSync(`${hookBase(w, id, "proof-iteration")}.reached`, "utf8")).runId;
+			arm(w, runId, "phase-full"); go(w, id, "proof-iteration");
+			// The load is started, and every process has announced readiness, before the part's hook.
+			await reached(w, runId, "phase-full");
+			const loadPath = join(w.runs, runId, "load.json");
+			const launched: LoadReceipt = JSON.parse(readFileSync(loadPath, "utf8"));
+			pids = launched.processes.map((p) => p.pid);
+			expect(pids).toHaveLength(14);
+			expect(liveOf(pids)).toEqual(pids);
+			child.kill(signal);
+			if (signal === "SIGKILL") {
+				await child.exited;
+				await until("every load process ended with its killed owner", () => liveOf(pids).length === 0, 30_000);
+			}
+			// Model the lost holder's lease expiry directly; the behavior is recovery, not a wall-clock race.
+			writeFileSync(join(w.runs, runId, "heartbeat"), heartbeatText(runId, Date.now() - 120_000));
+			staleRow(w);
+			const ordinary = request(w, wl, slice, PR.green, fx.head.green);
+			const next = spawnRun(w, ordinary);
+			try {
+				expect((await resultOf(w, wl, ordinary)).verdict).toBe("green");
+				await next.exited;
+			} finally { if (next.exitCode === null) { next.kill("SIGKILL"); await next.exited; } }
+			expect(liveOf(pids)).toEqual([]);
+			const recovered: LoadReceipt = JSON.parse(readFileSync(loadPath, "utf8"));
+			expect(recovered.state).toBe("recovered");
+			const recovery = readFileSync(join(w.runs, runId, "load-recovery.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l) as { by: string; outcomes: { outcome: string }[] });
+			expect(recovery.map((r) => r.by)).toEqual([ordinary]);
+			const outcomes = recovery[0]!.outcomes.map((o) => o.outcome);
+			expect(outcomes).toHaveLength(14);
+			// A stopped owner's load is still running; a killed owner's load ended at its stdin EOF, or is killed if still exiting.
+			for (const o of outcomes) expect(signal === "SIGSTOP" ? ["killed"] : ["gone", "killed"]).toContain(o);
+			const check = proofDbOf(w);
+			try {
+				const p = inspectProof(check, id);
+				expect(p.state).toBe("failed"); expect(p.iterations[0]!.state).toBe("interrupted");
+			} finally { check.close(); }
+		} finally {
+			if (child.exitCode === null) { child.kill("SIGKILL"); await child.exited; }
+			for (const pid of liveOf(pids)) {
+				try { process.kill(-pid, "SIGKILL"); }
+				catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH" && (error as NodeJS.ErrnoException).code !== "EPERM") throw error; }
+			}
+		}
+	});
+
+	// ---- TOOLS-REVIEW-r1 F4: production submit keys a failure to its executable inputs ------------------------------------
+	proofTest("production submit refuses an equivalent failed tree: an empty commit, decision-log churn, a new diagnosis or workload", async () => {
+		const w = world(), { wl, slice } = workload(w), other = workload(w);
+		const names = [...Array.from({ length: 25 }, (_, i) => `case ${String(i + 1).padStart(2, "0")}`), "passes"];
+		const first = await terminal(w, submit(w, manifest(wl, slice, fx.head.red, "red.test.ts", names)));
+		expect(first.state).toBe("failed");
+		const redTree = g(w.origin, "rev-parse", `${fx.head.red}^{tree}`);
+		const empty = g(w.origin, "commit-tree", redTree, "-p", fx.head.red, "-m", "retry without change");
+		// Decision-log churn: the red tree plus one new .ai/decision-log entry, built in a scratch index.
+		const index = { ...GIT_ENV, GIT_INDEX_FILE: join(w.root, "churn.index") };
+		const gi = (...args: string[]): string => {
+			const r = Bun.spawnSync(["git", ...args], { cwd: w.origin, env: index, stdout: "pipe", stderr: "pipe" });
+			if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
+			return r.stdout.toString().trim();
+		};
+		gi("read-tree", redTree);
+		gi("update-index", "--add", "--cacheinfo", `100644,${g(w.origin, "rev-parse", `${fx.head.red}:red.test.ts`)},.ai/decision-log/2026-10-31--0000--lane--retry.md`);
+		const churn = g(w.origin, "commit-tree", gi("write-tree"), "-p", empty, "-m", "decision log only");
+		g(w.origin, "update-ref", "refs/heads/proof-empty", empty);
+		g(w.origin, "update-ref", "refs/heads/proof-churn", churn);
+		const refused: { sha: string; wl: string; slice: string; diagnosis: string; why: string }[] = [
+			{ sha: empty, wl, slice, diagnosis: "an empty commit after the red", why: "executes the same inputs as failed" },
+			{ sha: churn, wl: other.wl, slice: other.slice, diagnosis: "infrastructure only: the host was busy", why: "executes the same inputs as failed" },
+			{ sha: fx.head.red, wl: other.wl, slice: other.slice, diagnosis: "budgets raised under another workload", why: "already observed" },
+		];
+		for (const r of refused) {
+			const m = { ...manifest(r.wl, r.slice, r.sha, "red.test.ts", names), diagnosis: r.diagnosis };
+			m.files[0]!.cases[0]!.budgetMs = 10_000;
+			const out = submitRaw(w, m);
+			expect(out.exitCode).not.toBe(0);
+			expect(out.stderr.toString()).toContain(r.why);
+		}
+		const db = proofDbOf(w);
+		try { expect(db.query("SELECT id FROM timing_proofs").all()).toEqual([{ id: first.id }]); } finally { db.close(); }
+		expect(w.ledger.slice(slice)?.state).toBe("open");
+	});
 });

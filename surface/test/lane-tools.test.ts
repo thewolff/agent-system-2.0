@@ -343,7 +343,7 @@ describe("lane_raise_question through Jo's standing rulings (PLAN wl-mvfkv7llkp7
 		expect(applied(ledger, wl)).toEqual([[`ruling-applied: flow-repair kind open-workload slice ${sl} answer later`, "lane-t-1"]]);
 	});
 
-	test("merges: a normal-stakes lane's merge question is decided; a production lane's is raised", async () => {
+	test("merges: a lane's merge question is decided at normal and at production stakes (D11, in-mvqyt4a8gezvgg)", async () => {
 		const normal = laneFixture();
 		const sl = normal.ledger.addSlice({ by: "lane-t-1", workloadId: normal.wl, task: "t", doneCondition: "d", inputs: "i" });
 		expect(await normal.call("lane_raise_question", { slice: sl, body: "PR #4 is green; merge it?", options: ["merge", "wait"] })).toContain("decided by Jo's ruling merges");
@@ -352,8 +352,8 @@ describe("lane_raise_question through Jo's standing rulings (PLAN wl-mvfkv7llkp7
 		const prod = laneFixture();
 		prod.ledger.setStakes(prod.wl, { by: SURFACE_BY, stakes: "production" });
 		const sp = prod.ledger.addSlice({ by: "lane-t-1", workloadId: prod.wl, task: "t", doneCondition: "d", inputs: "i" });
-		expect(await prod.call("lane_raise_question", { slice: sp, body: "PR #4 is green; merge it?", options: ["merge", "wait"] })).toContain("Raised question");
-		expect(applied(prod.ledger, prod.wl)).toEqual([]);
+		expect(await prod.call("lane_raise_question", { slice: sp, body: "PR #4 is green; merge it?", options: ["merge", "wait"] })).toContain("decided by Jo's ruling merges");
+		expect(prod.ledger.questions(prod.wl)).toEqual([]);
 	});
 
 	test("kimi-out: a same-lab question is decided in the window when the builders are known and exclude Kimi; with a Kimi builder it is raised", async () => {
@@ -387,6 +387,153 @@ describe("lane_raise_question through Jo's standing rulings (PLAN wl-mvfkv7llkp7
 		const { ledger, wl, call } = laneFixture();
 		const before = ledger.entries(wl).length;
 		expect(await call("lane_record_entry", { body: "ruling-applied: merges kind merge slice sl-x answer train" })).toContain("`ruling-applied:` is written only when a standing ruling decides");
+		expect(ledger.entries(wl).length).toBe(before);
+	});
+});
+
+describe("lane_raise_question routine: { record } and ruling routine-calls (PLAN wl-mvqwn80onq9hq8 D6, R10, R11, R14)", () => {
+	const RECORD = "keep the header offset in launch.ts as it is; the token move is out of this slice";
+	const BODY = "The header offset also appears in launch.ts; leave it there for this slice?";
+	const routineRows = (ledger: Ledger, wl: string) =>
+		ledger.entries(wl).filter((e) => /^(routine-recorded|ruling-applied|ruling-notice-failed):/.test(e.body)).map((e) => [e.body, e.created_by, e.slice_id]);
+	const noticesOf = (ledger: Ledger, wl: string) =>
+		ledger.db.query<{ body: string; created_by: string; sender: string }, [string]>("SELECT body, created_by, sender FROM messages WHERE workload_id = ?1 AND body LIKE 'notice:%'").all(wl);
+	/** A lane fixture with one open slice; `ask` raises the routine question on it, `params` overriding the defaults. */
+	const fixture = () => {
+		const fx = laneFixture();
+		const sl = fx.ledger.addSlice({ by: "lane-t-1", workloadId: fx.wl, task: "t", doneCondition: "d", inputs: "i" });
+		const ask = (params: Record<string, unknown> = {}) => fx.call("lane_raise_question", { slice: sl, body: BODY, options: ["keep", "move"], routine: { record: RECORD }, ...params });
+		return { ...fx, sl, ask };
+	};
+
+	test("R10/R11: decided by ruling routine-calls: only routine-recorded:, ruling-applied: and one notice, no question, instruction or answer row; the reply authorizes nothing", async () => {
+		const { ledger, wl, sl, ask } = fixture();
+		const reply = await ask();
+		const recorded = ledger.entries(wl).find((e) => e.body.startsWith("routine-recorded:"))!;
+		expect(reply).toBe(
+			`decided by Jo's ruling routine-calls: record-and-announce. Recorded ${recorded.id} and announced. This answer is a decision to change nothing; ` +
+				"it authorizes no code, privilege, spend or GitHub change. A change needs its own question. No question was raised; do not publish a QUESTION block.",
+		);
+		expect(routineRows(ledger, wl)).toEqual([
+			[`routine-recorded: ${sl} ${RECORD}`, ESCALATION_BY, sl],
+			[`ruling-applied: routine-calls kind record-announce slice ${sl} answer record-and-announce`, "lane-t-1", sl],
+		]);
+		expect(noticesOf(ledger, wl)).toEqual([{ body: `notice: auto-answered ${sl} record-and-announce (ruling routine-calls): ${RECORD}`, created_by: ESCALATION_BY, sender: ESCALATION_BY }]);
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.instructions(wl)).toEqual([]);
+		expect(ledger.slice(sl)!.state).toBe("open");
+		// The routine-recorded: row is a control entry: ESCALATION_BY's alone.
+		expect(controlEntries(ledger.entries(wl)).filter((c) => c.prefix === "routine-recorded").map((c) => c.rest)).toEqual([`${sl} ${RECORD}`]);
+	});
+
+	test("R10: a lane cannot spell the machinery's option, in any case or with any separators; nothing is written", async () => {
+		const { ledger, wl, sl, call } = fixture();
+		const before = ledger.entries(wl).length;
+		for (const spelled of ["record-and-announce", "Record_And_Announce", "RECORDANDANNOUNCE", "announce-only", "Record.Only"]) {
+			const reply = await call("lane_raise_question", { slice: sl, body: BODY, options: ["keep", spelled] });
+			expect({ spelled, reply }).toEqual({ spelled, reply: expect.stringContaining(`The option \`${spelled}\` is the machinery's`) });
+		}
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.entries(wl).length).toBe(before);
+	});
+
+	test("a record line that is empty, multi-line or over 200 characters is refused with nothing written", async () => {
+		const { ledger, wl, ask } = fixture();
+		const before = ledger.entries(wl).length;
+		expect(await ask({ routine: { record: "  " } })).toContain("`routine.record` is one line saying what is recorded; it is empty; nothing was asked.");
+		expect(await ask({ routine: { record: "one\ntwo" } })).toContain("it has a line break; nothing was asked.");
+		expect(await ask({ routine: { record: "x".repeat(201) } })).toContain("at most 200 characters; it has 201; nothing was asked.");
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.entries(wl).length).toBe(before);
+	});
+
+	/** Each case: the question goes to Jo with the machinery's option appended, and the ruling writes nothing. */
+	const asked: [string, (fx: { ledger: Ledger; ask: (params?: Record<string, unknown>) => Promise<string> }) => Promise<string>][] = [
+		["Jo said ask-all", async (fx) => {
+			apply(fx.ledger, interpret(fx.ledger, "ask-all")!);
+			return fx.ask();
+		}],
+		["Jo ended ruling routine-calls", async (fx) => {
+			apply(fx.ledger, interpret(fx.ledger, "end-ruling routine-calls")!);
+			return fx.ask();
+		}],
+		["the question carries now", (fx) => fx.ask({ now: "integrity" })],
+		["the body names a force-push", (fx) => fx.ask({ body: "Force-push the branch after the rebase, or leave it?" })],
+		["the body names reset --hard", (fx) => fx.ask({ body: "git reset --hard to origin, or keep the local commits?" })],
+		["the record line names a branch deletion", (fx) => fx.ask({ routine: { record: "delete the stale wl/old branch afterwards" } })],
+		["the record line names rm -rf", (fx) => fx.ask({ routine: { record: "rm -rf build before the next run" } })],
+		["the body names DROP", (fx) => fx.ask({ body: "Run DROP on the cache table, or keep it?" })],
+		["the body names a production database", (fx) => fx.ask({ body: "Read from the production database, or keep the fixture?" })],
+		["the record line names a secret rotation", (fx) => fx.ask({ routine: { record: "rotate the deploy secret next week" } })],
+		["the record line names a protected branch", (fx) => fx.ask({ routine: { record: "leave the protected branch rule as it is" } })],
+	];
+	for (const [name, run] of asked) {
+		test(`R11: asked when ${name}`, async () => {
+			const fx = fixture();
+			const reply = await run(fx);
+			expect(reply).toContain("Raised question");
+			expect(reply).toContain("(keep / move / record-and-announce)");
+			const questions = fx.ledger.questions(fx.wl);
+			expect(questions.map((q) => JSON.parse(q.options))).toEqual([["keep", "move", "record-and-announce"]]);
+			expect(routineRows(fx.ledger, fx.wl)).toEqual([]);
+			expect(noticesOf(fx.ledger, fx.wl)).toEqual([]);
+		});
+	}
+
+	test("R11: a routine question on the plan slice is asked", async () => {
+		const { ledger, wl, planId, call } = await planFixture();
+		const reply = await call("lane_raise_question", { slice: planId, body: BODY, options: ["keep", "move"], routine: { record: RECORD } });
+		expect(reply).toContain("Raised question");
+		expect(routineRows(ledger, wl)).toEqual([]);
+		expect(noticesOf(ledger, wl)).toEqual([]);
+	});
+
+	test("R11: after Jo's auto-routine following ask-all, the routine question is decided again", async () => {
+		const fx = fixture();
+		apply(fx.ledger, interpret(fx.ledger, "ask-all")!);
+		expect(await fx.ask({ body: "First routine call?" })).toContain("Raised question");
+		apply(fx.ledger, interpret(fx.ledger, "auto-routine")!);
+		expect(await fx.ask({ body: "Second routine call?" })).toStartWith("decided by Jo's ruling routine-calls: record-and-announce.");
+	});
+
+	test("a failed notice write rolls back the record and the ruling-applied entry and raises the question with ruling-notice-failed: beside it", async () => {
+		const { ledger, wl, sl, ask } = fixture();
+		ledger.db.exec("CREATE TRIGGER fail_notice BEFORE INSERT ON messages WHEN NEW.body LIKE 'notice: auto-answered%' BEGIN SELECT RAISE(ABORT, 'injected notice failure'); END;");
+		const reply = await ask();
+		const questions = ledger.questions(wl);
+		expect(questions).toHaveLength(1);
+		const id = questions[0]!.id;
+		expect(reply).toBe(
+			`Raised question ${id} on ${sl} (keep / move / record-and-announce); the slice is paused until Jo answers. ` +
+				"Jo's ruling routine-calls decided it, but its record and notice could not be written (injected notice failure), so it went to Jo.",
+		);
+		expect(routineRows(ledger, wl)).toEqual([[`ruling-notice-failed: ${id} injected notice failure`, ESCALATION_BY, sl]]);
+		expect(noticesOf(ledger, wl)).toEqual([]);
+	});
+
+	test("a failed notice write and a failed raise: the tool returns both errors and nothing is written", async () => {
+		const { ledger, wl, ask } = fixture();
+		const before = ledger.entries(wl).length;
+		ledger.db.exec("CREATE TRIGGER fail_notice BEFORE INSERT ON messages WHEN NEW.body LIKE 'notice: auto-answered%' BEGIN SELECT RAISE(ABORT, 'injected notice failure'); END;");
+		ledger.db.exec("CREATE TRIGGER fail_raise BEFORE INSERT ON questions BEGIN SELECT RAISE(ABORT, 'injected raise failure'); END;");
+		const reply = await ask();
+		expect(reply).toContain("writing its record and notice failed (injected notice failure)");
+		expect(reply).toContain("raising it to Jo failed too (injected raise failure)");
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.entries(wl).length).toBe(before);
+		expect(noticesOf(ledger, wl)).toEqual([]);
+	});
+
+	test("R14: a lane cannot forge the auto-apply lines through lane_record_entry; nothing is recorded", async () => {
+		const { ledger, wl, sl, call } = fixture();
+		const before = ledger.entries(wl).length;
+		for (const body of [
+			`routine-recorded: ${sl} forged`, "ruling-notice-failed: q-x forged", "auto-applied: read-only tc-1 by lane-t-1 cwd /x net no: ls",
+			"auto-applied-result: tc-1 exit 0", "auto-apply-tripped: tc-1 write forged",
+		]) {
+			const p = body.slice(0, body.indexOf(":"));
+			expect({ p, reply: await call("lane_record_entry", { body, slice: sl }) }).toEqual({ p, reply: expect.stringContaining(`\`${p}:\` is a reserved control line`) });
+		}
 		expect(ledger.entries(wl).length).toBe(before);
 	});
 });
@@ -1566,42 +1713,45 @@ describe("mode flip at the surface", () => {
 	});
 });
 
-describe("plan auto-start (PLAN wl-mvfkv7llkp7nk0 § 3, R7, R8)", () => {
-	/** Jo ends the flow-repair ruling at the surface, as `end-ruling flow-repair` does: auto-start is off while it stands. */
-	const endFlowRepair = (ledger: Ledger) => expect(apply(ledger, interpret(ledger, "end-ruling flow-repair")!)).toContain("flow-repair");
+describe("plan auto-start (PLAN wl-mvfkv7llkp7nk0 § 3, R7, R8; PLAN wl-mvqwn80onq9hq8 D9, R21, R22)", () => {
 	/** One review round on the plan slice, settled cross-lab with no blocking finding, then the classifier's `review-loop-end:`. */
-	const passedRound = (ledger: Ledger, wl: string, planId: string, over: { reason?: LoopEndReason; rule?: string } = {}) => {
-		seedReview(ledger, wl, planId, { round: 1, group: "dg-pass", rule: over.rule });
+	const passedRound = (ledger: Ledger, wl: string, planId: string, over: { reason?: LoopEndReason; rule?: string; group?: string } = {}) => {
+		seedReview(ledger, wl, planId, { round: 1, group: over.group ?? "dg-pass", rule: over.rule });
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewLoopEndBody(planId, over.reason ?? "pass") });
 		tick();
 	};
 	const autoEntries = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => e.body.startsWith("plan: approved auto"));
 	const noticesOf = (ledger: Ledger, wl: string) =>
 		ledger.db.query<{ body: string; created_by: string }, [string]>("SELECT body, created_by FROM messages WHERE workload_id = ?1 AND body LIKE 'notice:%'").all(wl);
+	/** Jo's one word at the surface (`ask-all`, `auto-routine`), as surface/src/input.ts applies it. */
+	const joWord = (ledger: Ledger, word: string) => apply(ledger, interpret(ledger, word)!);
 
-	test("a normal plan whose latest round passed cross-lab starts with no question: ESCALATION_BY's approval, Jo's notice, change slices accepted", async () => {
-		const { ledger, wl, planId, ask, call } = await planFixture();
-		endFlowRepair(ledger);
-		passedRound(ledger, wl, planId);
-		const reply = await ask();
-		expect(reply).toContain("The plan is approved");
-		expect(reply).toContain("add your change slices");
-		expect(ledger.questions(wl)).toHaveLength(0);
-		expect(autoEntries(ledger, wl).map((e) => [e.body, e.created_by])).toEqual([["plan: approved auto dg-pass", ESCALATION_BY]]);
-		const sent = noticesOf(ledger, wl);
-		expect(sent).toHaveLength(1);
-		expect(sent[0]!.created_by).toBe(ESCALATION_BY);
-		expect(sent[0]!.body).toContain(`plan started without your approve on ${wl}`);
-		expect(sent[0]!.body).toContain(`\`halt ${wl}\` stops it`);
-		expect(sent[0]!.body).toContain(PLAN_FILE);
-		const entries = ledger.entries(wl);
-		expect(planFirst(controlEntries(entries, holdersOf(entries, ledger.workload(wl)!.holder)))).toBeNull();
-		expect(await call("lane_add_slice", { task: "change it", doneCondition: "d", inputs: "i", kind: "change-small" })).toMatch(/^Added slice/);
-	});
+	for (const stakes of ["normal", "production"] as const) {
+		test(`R21: a ${stakes} plan whose latest round passed cross-lab starts while Jo's flow-repair ruling stands: ESCALATION_BY's approval, a notice naming halt and ask-all, change slices accepted`, async () => {
+			const { ledger, wl, planId, ask, call } = await planFixture(stakes);
+			// Flow repair is up: Jo never ended it in this ledger.
+			expect(ledger.instructions(STANDING_WORKLOAD_ID).some((i) => i.body === "end-ruling flow-repair")).toBe(false);
+			passedRound(ledger, wl, planId);
+			const reply = await ask();
+			expect(reply).toContain("The plan is approved");
+			expect(reply).toContain(`at ${stakes} stakes`);
+			expect(reply).toContain("add your change slices");
+			expect(ledger.questions(wl)).toHaveLength(0);
+			expect(autoEntries(ledger, wl).map((e) => [e.body, e.created_by])).toEqual([["plan: approved auto dg-pass", ESCALATION_BY]]);
+			const sent = noticesOf(ledger, wl);
+			expect(sent).toHaveLength(1);
+			expect(sent[0]!.created_by).toBe(ESCALATION_BY);
+			expect(sent[0]!.body).toContain(`plan started without your approve on ${wl}`);
+			expect(sent[0]!.body).toContain(`\`halt ${wl}\` stops it; \`ask-all\` stops all auto-starts`);
+			expect(sent[0]!.body).toContain(PLAN_FILE);
+			const entries = ledger.entries(wl);
+			expect(planFirst(controlEntries(entries, holdersOf(entries, ledger.workload(wl)!.holder)))).toBeNull();
+			expect(await call("lane_add_slice", { task: "change it", doneCondition: "d", inputs: "i", kind: "change-small" })).toMatch(/^Added slice/);
+		});
+	}
 
 	test("Anthropic-out same-lab evidence permits the question but never auto-approves or sends an auto-start notice", async () => {
 		const { ledger, wl, planId, ask } = await planFixture();
-		endFlowRepair(ledger);
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: laneBuilderBody("openai", "lane-t-1", OTHER_LAB) });
 		seedReview(ledger, wl, planId, { ran: [OTHER_LAB], anthropicOut: true, rule: planId, round: 1, group: "dg-pass" });
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewLoopEndBody(planId, "pass") });
@@ -1613,20 +1763,25 @@ describe("plan auto-start (PLAN wl-mvfkv7llkp7nk0 § 3, R7, R8)", () => {
 	});
 
 	const toJo: [string, (ledger: Ledger, wl: string, planId: string) => void][] = [
-		["flow repair is up (the ruling not ended)", (ledger, wl, planId) => passedRound(ledger, wl, planId)],
-		["the loop ended on Jo's accept at the round limit, not a pass", (ledger, wl, planId) => {
-			endFlowRepair(ledger);
-			passedRound(ledger, wl, planId, { reason: "accept" });
+		["Jo said ask-all (R22)", (ledger, wl, planId) => {
+			expect(joWord(ledger, "ask-all")).toContain("auto-apply is off");
+			passedRound(ledger, wl, planId);
 		}],
+		["Jo ended ruling routine-calls", (ledger, wl, planId) => {
+			expect(joWord(ledger, "end-ruling routine-calls")).toContain("routine-calls");
+			passedRound(ledger, wl, planId);
+		}],
+		["a trip turned auto-apply off", (ledger, wl, planId) => {
+			ensureStandingWorkload(ledger);
+			ledger.recordEntry({ by: ESCALATION_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: "auto-apply-tripped: tc-1 write > PATCH /x HTTP/1.1" });
+			passedRound(ledger, wl, planId);
+		}],
+		["the loop ended on Jo's accept at the round limit, not a pass", (ledger, wl, planId) => passedRound(ledger, wl, planId, { reason: "accept" })],
 		["a review was dispatched after the passing loop-end", (ledger, wl, planId) => {
-			endFlowRepair(ledger);
 			passedRound(ledger, wl, planId);
 			seedReview(ledger, wl, planId);
 		}],
-		["a member ran on Jo's Kimi-out same-lab rule token", (ledger, wl, planId) => {
-			endFlowRepair(ledger);
-			passedRound(ledger, wl, planId, { rule: planId });
-		}],
+		["a member ran on Jo's Kimi-out same-lab rule token", (ledger, wl, planId) => passedRound(ledger, wl, planId, { rule: planId })],
 	];
 	for (const [name, seed] of toJo) {
 		test(`the plan question goes to Jo when ${name}`, async () => {
@@ -1638,12 +1793,59 @@ describe("plan auto-start (PLAN wl-mvfkv7llkp7nk0 § 3, R7, R8)", () => {
 		});
 	}
 
-	test("the plan question goes to Jo at production stakes", async () => {
-		const { ledger, wl, planId, ask } = await planFixture("production");
-		endFlowRepair(ledger);
+	test("R22: after ask-all the plan goes to Jo; after Jo's auto-routine the next plan question starts it", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		joWord(ledger, "ask-all");
 		passedRound(ledger, wl, planId);
-		expect(await ask()).toContain("Raised question");
+		const asked = await ask();
+		expect(asked).toContain("Raised question");
+		expect(apply(ledger, interpret(ledger, "revise")!)).toContain("revise");
+		joWord(ledger, "auto-routine");
+		passedRound(ledger, wl, planId, { group: "dg-pass-2" });
+		expect(await ask()).toContain("The plan is approved: its review round dg-pass-2 passed");
+		expect(autoEntries(ledger, wl)).toHaveLength(1);
+	});
+
+	test("D9 (b) at production stakes: a round of two lab legs starts only when every leg passed", async () => {
+		for (const blocking of [1, 0]) {
+			const { ledger, wl, planId } = await planFixture("production");
+			seedReview(ledger, wl, planId, { round: 1, group: "dg-pass", ran: [OTHER_LAB] });
+			seedReview(ledger, wl, planId, { round: 1, group: "dg-pass", ran: ["moonshot/kimi-k3"], blocking });
+			ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewLoopEndBody(planId, "pass") });
+			expect({ blocking, round: planAutoStartRound(ledger, wl, planId, Date.now()) }).toEqual({ blocking, round: blocking === 0 ? "dg-pass" : null });
+		}
+	});
+
+	test("R22: a failed auto-start write raises the plan question to Jo with `auto-start failed: <error>` first and starts nothing", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		passedRound(ledger, wl, planId);
+		ledger.db.exec("CREATE TRIGGER fail_auto BEFORE INSERT ON entries WHEN NEW.body LIKE 'plan: approved auto%' BEGIN SELECT RAISE(ABORT, 'injected auto-start failure'); END;");
+		const reply = await ask();
+		const questions = ledger.questions(wl);
+		expect(questions).toHaveLength(1);
+		expect(questions[0]!.body.split("\n")[0]).toBe("auto-start failed: injected auto-start failure");
+		expect(questions[0]!.body.split("\n").slice(1).join("\n")).toBe(PLAN_BODY);
+		expect(reply).toBe(
+			`Raised question ${questions[0]!.id} on ${planId} (approve / revise / cancel); the slice is paused until Jo answers. ` +
+				"The plan auto-start failed (injected auto-start failure), so the plan question went to Jo with that as its first line.",
+		);
+		expect(planQuestions(ledger, wl)).toEqual([boundPlanQuestion(questions[0]!.id)]);
 		expect(autoEntries(ledger, wl)).toHaveLength(0);
+		expect(noticesOf(ledger, wl)).toHaveLength(0);
+	});
+
+	test("R22: when the auto-start write and the raise both fail, the tool returns both errors and writes nothing", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		passedRound(ledger, wl, planId);
+		const before = ledger.entries(wl).length;
+		ledger.db.exec("CREATE TRIGGER fail_auto BEFORE INSERT ON entries WHEN NEW.body LIKE 'plan: approved auto%' BEGIN SELECT RAISE(ABORT, 'injected auto-start failure'); END;");
+		ledger.db.exec("CREATE TRIGGER fail_raise BEFORE INSERT ON questions BEGIN SELECT RAISE(ABORT, 'injected raise failure'); END;");
+		const reply = await ask();
+		expect(reply).toContain("The plan auto-start failed (injected auto-start failure)");
+		expect(reply).toContain("raising the plan question to Jo failed too (injected raise failure)");
+		expect(ledger.questions(wl)).toHaveLength(0);
+		expect(ledger.entries(wl)).toHaveLength(before);
+		expect(noticesOf(ledger, wl)).toHaveLength(0);
 	});
 
 	test("a lane cannot forge `plan: approved auto`: lane_record_entry refuses it and a lane-written one approves nothing; lane_message refuses `notice:`", async () => {
@@ -1660,7 +1862,6 @@ describe("plan auto-start (PLAN wl-mvfkv7llkp7nk0 § 3, R7, R8)", () => {
 
 	test("halt: Jo's word stands the plan again, refuses change slices, stops the live lane, and the plan never auto-starts again; Jo's approve starts it", async () => {
 		const { ledger, wl, planId, ask, call } = await planFixture();
-		endFlowRepair(ledger);
 		passedRound(ledger, wl, planId);
 		expect(await ask()).toContain("The plan is approved");
 		const cmd = interpret(ledger, `halt ${wl}`);
@@ -1725,7 +1926,6 @@ describe("plan auto-start (PLAN wl-mvfkv7llkp7nk0 § 3, R7, R8)", () => {
 		test(`R8: ${name} vetoes auto-start on its own; the same round without it starts`, async () => {
 			for (const veto of [false, true]) {
 				const { ledger, wl, planId } = await planFixture();
-				endFlowRepair(ledger);
 				seed(ledger, wl, planId, veto);
 				expect({ veto, round: planAutoStartRound(ledger, wl, planId, Date.now()) }).toEqual({ veto, round: veto ? null : "dg-pass" });
 			}
@@ -1735,7 +1935,6 @@ describe("plan auto-start (PLAN wl-mvfkv7llkp7nk0 § 3, R7, R8)", () => {
 	test("PLAN wl-mvg1vs0rhnu3gg § 1.0 (R1): an auto-start-eligible plan asked with now: guard goes to Jo tagged NOW and writes no plan: approved auto; the same plan without now starts", async () => {
 		for (const now of ["guard", null]) {
 			const { ledger, wl, planId, call } = await planFixture();
-			endFlowRepair(ledger);
 			passedRound(ledger, wl, planId);
 			tick();
 			const reply = await call("lane_raise_question", { slice: planId, body: PLAN_BODY, options: [...PLAN_OPTIONS], ...(now === null ? {} : { now }) });
