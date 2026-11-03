@@ -135,10 +135,8 @@ describe("ledger state admits a lone foreground merge (R20)", () => {
 		expect(bash(`gh pr merge 5 --squash`, h)).toBeNull();
 		expect(bash(`curl -X PUT -H "Authorization: token x" https://api.github.com/repos/${REPO}/pulls/5/merge`, h)).toBeNull();
 		expect(bash(`gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: "PR_x"}) { clientMutationId } }'`, h)).toBeNull();
-		// a REST write through gh api stays a reserved action of its own, as before the hold
-		const rest = bash(`gh api -X PUT repos/${REPO}/pulls/5/merge -f merge_method=merge`, h);
-		expect(rest!.reason).toContain("gh api with a mutating method");
-		expect(isHold(rest)).toBe(false);
+		// the REST merge through gh api is an ordinary GitHub write under the § A4 floor (PLAN wl-mvqwn80onq9hq8 D11), so admitted too
+		expect(bash(`gh api -X PUT repos/${REPO}/pulls/5/merge -f merge_method=merge`, h)).toBeNull();
 		// a trailing `;` or newline is still one command
 		expect(bash(`gh pr merge 5 --merge;\n`, h)).toBeNull();
 	});

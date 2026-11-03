@@ -3,13 +3,18 @@
 // bare answer word with more than one target is ambiguous; a numbered batch is checked whole
 // against the session numbering (MIGRATION.md § M7 follow-ups item 1); the review round limit's
 // words and answers (PLAN wl-mupu0sx2o046io D9, D10); `cancel-slice`, `supersede` and the plan-first
-// approve receipt (PLAN wl-mv5i3lulwwbbi8 D1, D2, D4).
+// approve receipt (PLAN wl-mv5i3lulwwbbi8 D1, D2, D4); Jo's `ask-all` / `auto-routine` (PLAN wl-mvqwn80onq9hq8 D1, R12).
 import { describe, expect, test } from "bun:test";
+import { appendFileSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { handSpawnBody, reviewParkBody } from "../../classifier/src/lab";
-import { askJo, checkRulings } from "../../gates/src/rulings";
+import { askJo, checkRulings, raisedId } from "../../gates/src/rulings";
+import { ALARM_FILE_NAME, routineOn, routineState } from "../../gates/src/routine-switch";
 import { reviewStopOn } from "../../classifier/src/review-stop";
 import { countRounds, effectiveRoundLimit, type Findings, reviewLimitBody, reviewRoundBody, ROUND_LIMIT_OPTIONS } from "../../classifier/src/rounds";
-import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { ceilingQuestionBody, effectiveCeiling } from "../src/ceiling";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { LEDGER_DB_ENV } from "../../ledger/src/locality";
 import { errorLines } from "../src/errors";
 import { apply, applyTrain, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
 import { boundPrs, controlEntries, holdersOf, landFirstOn, mainRetries, planFirst, planFirstBody, verdictOf, waivedPrs, waivePrBody, withdrawnBy } from "../src/launch";
@@ -20,7 +25,7 @@ import { Numbering } from "../src/numbering";
 import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
 import { testRequestedBody, testRunBody } from "../src/test-run";
 import { pdtDay, TRAIN_DAILY_USD, TRAIN_PAUSE_OPTIONS, trainBudgetSliceId, trainDayLimit, trainPausedBody } from "../src/train-budget";
-import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ESCALATION_BY, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, tempLedger, tmp, workloadWithSlice } from "./helpers";
 
 /**
@@ -1160,9 +1165,150 @@ describe("end-ruling (PLAN wl-mvfkv7llkp7nk0 § 1, R1)", () => {
 	test("an unknown ruling id, or no id, is refused with nothing written", () => {
 		const { ledger } = tempLedger();
 		ensureStandingWorkload(ledger);
-		expect(interpret(ledger, "end-ruling nope")).toEqual({ kind: "refused", why: "nope is no standing ruling (kimi-out, flow-repair, merges, models, gates-stakes, train-signoff)" });
-		expect(interpret(ledger, "end-ruling")).toEqual({ kind: "refused", why: "end-ruling names one ruling: end-ruling <kimi-out | flow-repair | merges | models | gates-stakes | train-signoff>" });
+		expect(interpret(ledger, "end-ruling nope")).toEqual({ kind: "refused", why: "nope is no standing ruling (kimi-out, flow-repair, merges, models, gates-stakes, train-signoff, routine-calls, review-auto-extend)" });
+		expect(interpret(ledger, "end-ruling")).toEqual({ kind: "refused", why: "end-ruling names one ruling: end-ruling <kimi-out | flow-repair | merges | models | gates-stakes | train-signoff | routine-calls | review-auto-extend>" });
 		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
+	});
+});
+
+describe("ask-all / auto-routine: Jo's one-word auto-apply switch (PLAN wl-mvqwn80onq9hq8 D1, R12)", () => {
+	/** Run `fn` with the default ledger path (so the default alarm file) in a fresh temp dir, restoring it after. */
+	function withAlarmDir<T>(fn: (alarmFile: string) => T): T {
+		const before = process.env[LEDGER_DB_ENV];
+		const dir = tmp("alarms");
+		process.env[LEDGER_DB_ENV] = join(dir, "ledger.db");
+		try {
+			return fn(join(dir, ALARM_FILE_NAME));
+		} finally {
+			if (before === undefined) delete process.env[LEDGER_DB_ENV];
+			else process.env[LEDGER_DB_ENV] = before;
+		}
+	}
+	const switchRows = (ledger: Ledger) => ledger.instructions(STANDING_WORKLOAD_ID).map((i) => [i.kind, i.body, i.author, i.channel, i.created_by]);
+
+	test("ask-all writes Jo's instruction on the standing workload and turns auto-apply off; a repeat is refused; it survives a reopen", () => {
+		withAlarmDir((alarmFile) => {
+			const c = clock("2026-10-27T10:00:00.000Z");
+			const { ledger, path } = tempLedger(c.now);
+			const cmd = interpret(ledger, "ask-all");
+			expect(cmd).toEqual({ kind: "routine-switch", word: "ask-all" });
+			expect(commandShaped("ask-all")).toBe(true);
+			const receipt = apply(ledger, cmd!);
+			const id = ledger.instructions(STANDING_WORKLOAD_ID)[0]!.id;
+			expect(switchRows(ledger)).toEqual([["instruction", "ask-all", "jo", "surface", SURFACE_BY]]);
+			expect(receipt).toBe(
+				`ask-all recorded (instruction ${id}); auto-apply is off: your ask-all (instruction ${id}). Reserved actions, routine questions, plan auto-start, review auto-extend and the ceiling's auto-raise ask you again until your \`auto-routine\``,
+			);
+			expect(routineOn(ledger, Date.parse(c.now()), { alarmFile })).toBe(false);
+			expect(interpret(ledger, "ask-all")).toEqual({ kind: "refused", why: `auto-apply is already off (your ask-all (instruction ${id})); nothing written` });
+			expect(interpret(ledger, "ask-all now")).toEqual({ kind: "refused", why: "ask-all is one word: send `ask-all` alone" });
+			expect(() => apply(ledger, { kind: "routine-switch", word: "ask-all" })).toThrow("auto-apply is already off");
+			expect(ledger.instructions(STANDING_WORKLOAD_ID)).toHaveLength(1);
+			// The switch is ledger rows: a reopened ledger (a restarted process) reads it off.
+			ledger.close();
+			const reopened = Ledger.open(path, { backup: false, backupOnOpen: false });
+			expect(routineOn(reopened, Date.parse(c.now()), { alarmFile })).toBe(false);
+			reopened.close();
+		});
+	});
+
+	test("auto-routine is refused while auto-apply is on, and after ask-all turns it back on, naming what it cleared", () => {
+		withAlarmDir(() => {
+			const c = clock("2026-10-27T10:00:00.000Z");
+			const { ledger } = tempLedger(c.now);
+			expect(interpret(ledger, "auto-routine")).toEqual({ kind: "refused", why: "auto-apply is already on; nothing written" });
+			apply(ledger, interpret(ledger, "ask-all")!);
+			const off = ledger.instructions(STANDING_WORKLOAD_ID)[0]!.id;
+			c.at("2026-10-27T10:01:00.000Z");
+			const receipt = apply(ledger, interpret(ledger, "auto-routine")!);
+			const on = ledger.instructions(STANDING_WORKLOAD_ID)[1]!;
+			expect(on).toMatchObject({ body: "auto-routine", author: "jo", channel: "surface", created_by: SURFACE_BY });
+			expect(receipt).toBe(`auto-routine recorded (instruction ${on.id}); cleared: your ask-all (instruction ${off}); auto-apply is now on`);
+			expect(routineState(ledger, Date.parse(c.now())).on).toBe(true);
+		});
+	});
+
+	test("auto-routine is accepted whenever a trip, a missing result or an alarm line holds it off, clears each by row id or line number, and deletes nothing", () => {
+		withAlarmDir((alarmFile) => {
+			const c = clock("2026-10-27T10:00:00.000Z");
+			const { ledger } = tempLedger(c.now);
+			ensureStandingWorkload(ledger);
+			const { wl } = workloadWithSlice(ledger);
+			const trip = ledger.recordEntry({ by: ESCALATION_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: "auto-apply-tripped: tc-1 write > PATCH /x HTTP/1.1" });
+			const lost = ledger.recordEntry({ by: ESCALATION_BY, workloadId: wl, kind: "assumption", body: "auto-applied: read-only tc-2 by lane-a cwd /x net no: ls" });
+			appendFileSync(alarmFile, `${JSON.stringify({ kind: "result", at: "2026-10-27T10:00:00.000Z", workload: wl })}\n`);
+			appendFileSync(alarmFile, `${JSON.stringify({ kind: "ceiling", at: "2026-10-27T10:00:00.000Z", workload: wl })}\n`);
+			c.at("2026-10-27T10:20:00.000Z");
+			// Already off: ask-all would repeat the state, so it is refused, naming every reason.
+			const refused = interpret(ledger, "ask-all");
+			if (refused?.kind !== "refused") throw new Error(`ask-all was not refused: ${JSON.stringify(refused)}`);
+			for (const part of [`trip ${trip}`, `auto-applied ${lost} on ${wl}`, "alarm-file line 1 (kind result)"]) expect(refused.why).toContain(part);
+			expect(refused.why).not.toContain("line 2");
+			const receipt = apply(ledger, interpret(ledger, "auto-routine")!);
+			expect(receipt).toContain(`cleared: trip ${trip} (tc-1 write > PATCH /x HTTP/1.1); auto-applied ${lost} on ${wl} (tool call tc-2) has no result after 10 minutes; alarm-file line 1 (kind result); auto-apply is now on`);
+			expect(routineOn(ledger, Date.parse(c.now()), { alarmFile })).toBe(true);
+			// The evidence stays: the rows and both alarm lines.
+			expect([ledger.entry(trip)?.id, ledger.entry(lost)?.id]).toEqual([trip, lost]);
+			expect(readFileSync(alarmFile, "utf8").trim().split("\n")).toHaveLength(2);
+		});
+	});
+
+	test("a lane's ask-all is not Jo's word: only the surface's instruction from Jo switches", () => {
+		withAlarmDir((alarmFile) => {
+			const c = clock("2026-10-27T10:00:00.000Z");
+			const { ledger } = tempLedger(c.now);
+			ensureStandingWorkload(ledger);
+			ledger.recordInstruction({ by: "lane-a", author: "jo", channel: "surface", workloadId: STANDING_WORKLOAD_ID, body: "ask-all" });
+			expect(routineOn(ledger, Date.parse(c.now()), { alarmFile })).toBe(true);
+			expect(interpret(ledger, "ask-all")).toEqual({ kind: "routine-switch", word: "ask-all" });
+		});
+	});
+});
+
+describe("the runner's ceiling question (PLAN wl-mvqwn80onq9hq8 D12, R31)", () => {
+	const LANE = "lane-c-1";
+	/** An autonomous normal workload at $50 / 6h whose lane stopped at the ceiling and whose runner asked Jo; `other` is a lane's question on the same slice. */
+	function asked() {
+		const c = clock("2026-10-27T10:00:00.000Z");
+		const { ledger } = tempLedger(c.now);
+		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "Move the header offset", stakes: "normal", mode: "autonomous" });
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: "ceiling: usd 50 wall 360 source stakes normal" });
+		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: `launch: ${LANE} cause first requested-by test` });
+		expect(ledger.claimWorkload(wl, { by: LANE_STARTER_BY, holder: LANE, leaseMs: 3_600_000 }).won).toBe(true);
+		const sl = ledger.addSlice({ by: LANE, workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: `spend: ${LANE} usd 50.2 wall 30 tokens 10` });
+		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: `lane-stop: ${LANE} accepted ceiling` });
+		const body = ceilingQuestionBody(`ceiling reached on ${wl}: no progress since 2026-10-27T09:00:00.000Z`, wl, { usd: 50.2, wallMin: 30, tokens: 10 }, { usd: 50, wallMin: 360 }, "normal", null);
+		const q = raisedId(askJo(ledger, { by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body, options: ["extend", "stop"] }, { asker: "lane", now: Date.parse(c.now()) }), "the test's ceiling question");
+		const ceiling = () => effectiveCeiling(controlEntries(ledger.entries(wl)), ledger.instructions(wl), "normal");
+		return { c, ledger, wl, sl, q, body, ceiling };
+	}
+
+	test("R31 Jo's `ceiling <usd> <wl>` withdraws the open runner ceiling question in the raise's write; a lane's question of the same shape stays", () => {
+		const a = asked();
+		const lanes = a.ledger.raiseQuestion({ by: LANE, workloadId: a.wl, sliceId: a.sl, body: a.body, options: ["extend", "stop"] });
+		const receipt = apply(a.ledger, interpret(a.ledger, `ceiling 80 8 ${a.wl}`)!);
+		expect(receipt).toContain(`withdrew the ceiling question ${a.q}`);
+		expect(a.ledger.question(a.q)!.state).toBe("withdrawn");
+		expect(a.ledger.question(lanes)!.state).toBe("open");
+		expect(a.ceiling()).toEqual({ usd: 80, wallMin: 480 });
+	});
+
+	test("R31 the answer `extend` raises one block of the workload's own size, naming the answer, withdraws nothing else and requests the relaunch; `stop` leaves the stop", () => {
+		const a = asked();
+		const receipt = apply(a.ledger, interpret(a.ledger, `extend ${a.q}`)!);
+		expect(a.ledger.question(a.q)!.state).toBe("answered");
+		expect(receipt).toContain(`ceiling on ${a.wl} extended by`);
+		expect(receipt).toContain("a relaunch is requested");
+		expect(a.ceiling()).toEqual({ usd: 100, wallMin: 720 });
+		const [answer] = a.ledger.instructions(a.wl).filter((i) => i.kind === "answer");
+		expect(controlEntries(a.ledger.entries(a.wl)).filter((x) => x.prefix === "ceiling").at(-1)!.body).toBe(`ceiling: usd 100 wall 720 source extend one block by ${answer!.id}`);
+
+		const b = asked();
+		apply(b.ledger, interpret(b.ledger, `stop ${b.q}`)!);
+		expect(b.ledger.question(b.q)!.state).toBe("answered");
+		expect(b.ceiling()).toEqual({ usd: 50, wallMin: 360 });
+		expect(controlEntries(b.ledger.entries(b.wl)).filter((x) => x.prefix === "launch-requested")).toEqual([]);
 	});
 });
 

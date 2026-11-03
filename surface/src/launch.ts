@@ -85,7 +85,7 @@ export const LANE_SCRIPT = join(import.meta.dir, "..", "scripts", "lane.ts");
 
 export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
-	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
+	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "ceiling-mark", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "released-idle", "plan-question",
 	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr", "waive-pr", "train",
 	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-board-refused", "train-notice", "train-autoboard",
@@ -97,6 +97,7 @@ export const CONTROL_PREFIXES = [
 	"lane-metrics", "daily-report", "drive-backup",
 	"doctor-strike", "doctor-down", "doctor-up", "doctor-popup", "doctor-boot",
 	"now", "ruling-conflict",
+	"auto-applied", "auto-applied-result", "auto-apply-tripped", "routine-recorded", "ruling-notice-failed",
 	"land-first", "main-retry", "train-reconciled", "runner-preflight", "fast-plan", "fast-fallback", "status-failed",
 	"land-first-off-pending", "land-first-off-complete",
 	"train-paused", "train-meter-error", "train-rule", "train-raise", "train-attempt",
@@ -123,8 +124,12 @@ export const DOCTOR_BY = "as2-doctor";
  * `launch-failed:` comes from the starter (a failure before the spawn) and from the runner (a lane
  * that never became ready, or a readiness step that failed; Codex review 2, R4). A lane never writes it.
  * `repo:` is the open tool's record of the repository (decision-log.ts); a lane's note never routes git.
- * `ceiling:` is the surface's alone (open, Jo's words, the lowering tool) and `spend:` the runner's
- * alone (DESIGN-workload-ceiling.md § 2 item 1); the raise-needs-Jo rule lives in `effectiveCeiling`.
+ * `ceiling:` is the surface's (open, Jo's words, the lowering tool) and the runner's (PLAN wl-mvqwn80onq9hq8 D12: its one raise
+ * by half at a 100 % hit with progress, applied only in that exact shape by `ceilingInForce`), and `spend:` the runner's
+ * alone (DESIGN-workload-ceiling.md § 2 item 1); the raise-needs-Jo rule lives in `effectiveCeiling`. `ceiling-mark: <remote>
+ * <branch> <push url> <sha|none|unknown>` is the runner's alone (D12): a workload branch's remote head when a ceiling window
+ * opens, which the progress test at the hit reads. `launch-requested:` is the surface's (Jo's), the merge train's and the
+ * runner's (`by lane-runner … (ceiling auto-raise)`, written with that raise).
  * `plan:` is the surface's (`first <trigger>` at open, `approved <instruction>` on Jo's approve, `halted <instruction>` on
  * Jo's `halt`), except `approved auto <round group>`, which only ESCALATION_BY writes (the plan auto-start in
  * `lane_raise_question`, PLAN wl-mvfkv7llkp7nk0 § 3) and the surface never does.
@@ -201,6 +206,12 @@ export const DOCTOR_BY = "as2-doctor";
  * The escalation lines (PLAN wl-mvg1vs0rhnu3gg § 1.0, § 1.9; gates/src/rulings.ts `askJo`) are ESCALATION_BY's alone, written on the
  * question's workload and slice in the raise's transaction: `now: <q-…> <category>` marks a question Jo hears at once (or upgrades a
  * reused open one), and `ruling-conflict: <q-…> <ruling id> <ruling id>…` records the active rulings that disagreed on it, so it was raised.
+ * The auto-apply lines (PLAN wl-mvqwn80onq9hq8 D1, D3, D5, D6; gates/src/routine-switch.ts) are ESCALATION_BY's alone too:
+ * `auto-applied: <rule> <toolCallId> by <lane or hand> cwd <cwd> net <yes|no>: <command>` records a reserved action the gate applied
+ * by itself, `auto-applied-result: <toolCallId> exit <code|unknown|refused>` its result, `auto-apply-tripped: <toolCallId> <signal>
+ * <evidence>` (on the standing workload) a trip that turns auto-apply off until Jo's `auto-routine`, `routine-recorded: <slice> <record
+ * line>` a record-and-announce question ruling `routine-calls` decided, and `ruling-notice-failed: <q-…> <error>` a decided question
+ * whose notice failed, so it was raised. `routineOn` reads the first three; a look-alike by anyone else is no control entry.
  * Land-first's rows (PLAN wl-mvq4edbaf13vnk § 2, D12) are on the standing workload: `land-first: <repo> on|off <instruction id>` and
  * `main-retry: <repo> <instruction id>` are the surface's alone, Jo's words written after his instruction in one transaction
  * (`landFirstOn` reads the first). Off also writes the surface's `land-first-off-pending: <repo> <instruction id>` there;
@@ -232,7 +243,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"launch-failed": [LANE_STARTER_BY, LANE_RUNNER_BY],
 	worktree: [LANE_STARTER_BY],
 	branch: [LANE_STARTER_BY],
-	"launch-requested": [SURFACE_BY, MERGE_TRAIN_BY],
+	"launch-requested": [SURFACE_BY, MERGE_TRAIN_BY, LANE_RUNNER_BY],
 	plan: [SURFACE_BY, ESCALATION_BY],
 	done: [SURFACE_BY, MERGE_TRAIN_BY],
 	repo: [SURFACE_BY, MERGE_TRAIN_BY],
@@ -243,7 +254,8 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"lane-stop": [SURFACE_BY, LANE_STARTER_BY, LANE_RUNNER_BY],
 	"lane-decided": [LANE_RUNNER_BY],
 	"done-because": [],
-	ceiling: [SURFACE_BY],
+	ceiling: [SURFACE_BY, LANE_RUNNER_BY],
+	"ceiling-mark": [LANE_RUNNER_BY],
 	spend: [LANE_RUNNER_BY],
 	"artifact-tree": [],
 	"reserved-withdrawn": [],
@@ -297,6 +309,11 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"doctor-boot": [DOCTOR_BY],
 	now: [ESCALATION_BY],
 	"ruling-conflict": [ESCALATION_BY],
+	"auto-applied": [ESCALATION_BY],
+	"auto-applied-result": [ESCALATION_BY],
+	"auto-apply-tripped": [ESCALATION_BY],
+	"routine-recorded": [ESCALATION_BY],
+	"ruling-notice-failed": [ESCALATION_BY],
 	"land-first": [SURFACE_BY],
 	"land-first-off-pending": [SURFACE_BY],
 	"land-first-off-complete": [MERGE_TRAIN_BY],
@@ -1685,9 +1702,13 @@ export function planHaltedBody(instructionId: string): string {
 }
 /** The opening of the auto-start's notice text (after `notice: `), by which `prStakes` finds the notice whose delivery starts the hold. */
 export const PLAN_AUTO_STARTED = "plan started without your approve";
-/** The auto-start's notice (PLAN wl-mvfkv7llkp7nk0 § 3): the § 3 wording on `wl`, then the plan question's body. */
+/**
+ * The auto-start's notice (PLAN wl-mvfkv7llkp7nk0 § 3, PLAN wl-mvqwn80onq9hq8 D9): the § 3 wording on `wl` with both off
+ * words, `halt <wl>` for this plan and `ask-all` for every auto-start, then the plan question's body. A normal- or
+ * production-stakes plan starts this way, so the notice names neither.
+ */
 export function planAutoStartNoticeBody(wl: string, planBody: string): string {
-	return `${PLAN_AUTO_STARTED} on ${wl} (normal stakes, cross-lab review passed); it will not merge until ${HOLD_HOURS} h after your next message here; \`halt ${wl}\` stops it\n${planBody}`;
+	return `${PLAN_AUTO_STARTED} on ${wl} (cross-lab review passed); it will not merge until ${HOLD_HOURS} h after your next message here; \`halt ${wl}\` stops it; \`ask-all\` stops all auto-starts\n${planBody}`;
 }
 /**
  * The plan file and the review verdict file a plan question was checked on, each as its sha256 in hex (PLAN wl-mvg1vs0rhnu3gg
@@ -1880,12 +1901,23 @@ export const TRAIN_LANDS_LINE =
 	`never merge it yourself and never hand it to Jo: a cross-lab review slice is required before the PR is done; once the PR is green at its head in a full suite (\`${LANE_FULL_TEST_TOOL}\`) and that review has passed, record done-because and release. The surface closes the workload and the merge train lands the PR.`;
 
 /**
- * Decision 11's completion policy: an autonomous normal-stakes lane on a repo the test runner serves, other than a merge
- * train or a fix workload, hands its green reviewed PR to the merge train (PLAN wl-mvbjiettjrfpxc D10, `TRAIN_LANDS_LINE`);
- * otherwise Jo integrates this machinery repo, and a product repo merges per SPEC-2.0.md § stakes.
+ * The production lane's merge line (PLAN wl-mvqwn80onq9hq8 D11): the train merges a green, reviewed production PR once the
+ * plan is approved, with no question to Jo; Jo's halt and the auto-start hold keep it off main while they stand.
+ */
+export const TRAIN_LANDS_PRODUCTION_LINE =
+	`${TRAIN_LANDS_LINE} At production stakes the merge train merges a green, reviewed PR whose plan is approved, with no question to Jo; while Jo's halt or the plan auto-start's hold stands, the train holds it.`;
+
+/**
+ * Decision 11's completion policy: an autonomous normal- or production-stakes lane on a repo the test runner serves, other than
+ * a merge train or a fix workload, hands its green reviewed PR to the merge train (PLAN wl-mvbjiettjrfpxc D10,
+ * `TRAIN_LANDS_LINE`; production since PLAN wl-mvqwn80onq9hq8 D11, `TRAIN_LANDS_PRODUCTION_LINE`), on this machinery repo too:
+ * the train branch is checked first. Otherwise Jo integrates this machinery repo, and a product repo merges per SPEC-2.0.md § stakes.
  */
 function mergeLine(p: PromptInput): string {
-	if (p.runnerServed === true && p.trainOrFix !== true && p.workload.mode === "autonomous" && p.workload.stakes === "normal") return TRAIN_LANDS_LINE;
+	if (p.runnerServed === true && p.trainOrFix !== true && p.workload.mode === "autonomous") {
+		if (p.workload.stakes === "normal") return TRAIN_LANDS_LINE;
+		if (p.workload.stakes === "production") return TRAIN_LANDS_PRODUCTION_LINE;
+	}
 	if (p.machinery) return "never merge on this repo: Jo integrates it. A merge-train lane merges other PRs only as its brief's self-merge step allows, never its own branch.";
 	if (p.workload.stakes === "production") return "the merge is Jo's: a judge slice, then Jo approves the merge.";
 	if (p.workload.stakes === "normal") return "merge proceeds on a judge slice's pass; tell Jo in one line after the merge.";

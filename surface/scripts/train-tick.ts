@@ -106,13 +106,14 @@ import { field, fileNotice, GhError, type GhResult, ghJsonOf, type IssueOps, iss
 import { attemptBlock, type ChainCommit, ghMainChain, INCONCLUSIVE, type MainState, mainResults, mainState, mainVerdicts } from "../src/main-state";
 import {
 	actionable, type AlertAction, attemptOf, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, carryPairs, checkoutOwnerRepo, type ControlRoot,
-	controlRootRefusal, endPastPauseQuestions, everyTrain, expiredHolds, forkOf, forkTaskAlert, FULL_SUITE_STATUS, ghCompare, isTrainOrFix, type LandFirstEvent, landFirstNoticeBody, landFirstRepos, landFirstRows,
-	type Landing, landingPassOvers, landingReady, lastReadyExit, MAIN_RED_WINDOW_MS, MAIN_RETRY_MS, mainRedNoticeBody, mainRedNotices, mainRedRows, openTrainFix, openTrains, ownerBusy, ownerDeliveries, ownerFreedAt,
-	parseTrainSlice, PROMOTE_ATTEMPTS, prOwner, PROTECTION_UNKNOWN_RAISE_MS, protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState, protectionPassOvers, prStakes, raiseLaunchLimit,
-	raiseMeterErrorQuestions, raiseTrainStall, raiseTwiceFailed, REPAIR_FAIL_MS, retireSupersededFullSlices, REVOKE_ATTEMPTS, settleTasks, stallRelaunchStops, stopEpisode, stopSummary, TASK_VIEW_FIELDS, type TaskView, taskViewOf,
-	TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, TRAIN_STALL_MS, trainActivityArgs, trainAlertActions, trainAlertBody, trainAlertEndBody, trainAlertMarker, trainAutoboardBody,
-	trainAttemptsOf, trainBoardSkipBody, trainCheckout, trainHeadWokenBody, TRAIN_LAUNCH_LIMIT, trainLaunchFailures, trainPrs, trainPushesOf, trainReconciledBody, trainRetries, trainSliceId, trainStall,
-	type TrainPush, type TrainTask, trainWakeBody, testRunStartedBody, testRunStarts, twiceFailed, unsettledTasks,
+	controlRootRefusal, endPastPauseQuestions, everyTrain, expiredHolds, forkOf, forkTaskAlert, FULL_SUITE_STATUS, ghCompare, isTrainOrFix, type LandFirstEvent, landFirstNoticeBody, landFirstRepos,
+	landFirstRows, type Landing, landingPassOvers, landingReady, lastReadyExit, MAIN_RED_WINDOW_MS, MAIN_RETRY_MS, mainRedNoticeBody, mainRedNotices, mainRedRows, openTrainFix, openTrains, ownerBusy,
+	ownerDeliveries, ownerFreedAt, parseTrainSlice, PROMOTE_ATTEMPTS, prOwner, PROTECTION_UNKNOWN_RAISE_MS, protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState,
+	protectionPassOvers, prStakes, raiseLaunchLimit, raiseMeterErrorQuestions, raiseTrainStall, raiseTwiceFailed, REPAIR_FAIL_MS, retireSupersededFullSlices, REVOKE_ATTEMPTS, settleTasks,
+	stallRelaunchStops, stopEpisode, stopSummary, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, TRAIN_STALL_MS,
+	trainActivityArgs, trainAlertActions, trainAlertBody, trainAlertEndBody, trainAlertMarker, trainAutoboardBody, trainAttemptsOf, trainBoardSkipBody, trainCheckout, trainHeadWokenBody,
+	TRAIN_LAUNCH_LIMIT, trainLaunchFailures, trainPrs, trainPushesOf, trainReconciledBody, trainRetries, trainSliceId, trainStall, type TrainPush, type TrainTask, trainWakeBody, testRunStartedBody,
+	testRunStarts, twiceFailed, unsettledTasks, trainFixStakes,
 } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import { realNotify } from "../src/notify";
@@ -377,8 +378,8 @@ export function tick(d: TickDeps): string[] {
 				say(`${t.train}: #${t.pr} task ${t.id}: head on a fork, settled failed${q ? `, alert question ${q}` : ""}`);
 				continue;
 			}
-			const s = prStakes(view, facts.repo, ledger);
-			const r = openTrainFix(ledger, { task: t, repo: facts.repo, checkout: facts.checkout, view, stakes: s.stakes === "production" ? "production" : "normal" });
+			// The PR workload's own stakes (PLAN wl-mvqwn80onq9hq8 D11), not prStakes: a green, reviewed production PR reads normal there.
+			const r = openTrainFix(ledger, { task: t, repo: facts.repo, checkout: facts.checkout, view, stakes: trainFixStakes(view, facts.repo, ledger) });
 			say(`${t.train}: #${t.pr} task ${t.id}: fix workload ${r.workloadId} ${r.opened ? "opened" : "reused"}`);
 		} catch (err) {
 			trainError(t.train, err);

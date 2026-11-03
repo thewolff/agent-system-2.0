@@ -1329,7 +1329,7 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 		expect(readFileSync(rec!.session!, "utf8")).toContain("ceiling: $1 / 60 min for the workload; spent so far $0.00");
 	}, 60_000);
 
-	test("R12 100 % (a jump past 80 % between polls): the stop notice alone and no question, lane-stop: accepted ceiling, outcome stop reason ceiling, no lane-died: though a slice is open, released, the ceiling not raised", async () => {
+	test("R12 100 % (a jump past 80 % between polls) with no progress (PLAN wl-mvqwn80onq9hq8 D12): no stop notice, the runner's question to Jo instead, lane-stop: accepted ceiling, outcome stop reason ceiling, no lane-died: though a slice is open, released, the ceiling not raised", async () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r, { slice: true });
 		tinyCeiling(r, wl, 1);
@@ -1343,8 +1343,9 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 		expect(snap.workload!.holder).toBeNull();
 		const stops = snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === laneId);
 		expect(stops.map((s) => [s.createdBy, s.rest])).toEqual([[LANE_RUNNER_BY, "accepted ceiling"]]);
-		expect(ceilingNoticesOf(r, wl)).toEqual([{ level: 100, key: TINY, workloadId: wl }]);
-		expect(snap.questions).toEqual([]);
+		expect(ceilingNoticesOf(r, wl)).toEqual([]);
+		expect(snap.questions.map((q) => [q.created_by, q.body.split("\n")[0]!.startsWith(`ceiling reached on ${wl}: `), JSON.parse(q.options)])).toEqual([[LANE_RUNNER_BY, true, ["extend", "stop"]]]);
+		expect(snap.questions[0]!.body.split("\n")[1]).toStartWith(`ceiling 100 % at ${TINY} on ${wl}: `);
 		expect(snap.control.filter((c) => c.prefix === "ceiling").map((c) => c.rest)).toEqual(["usd 1 wall 60 source test tiny ceiling"]);
 		expect(spendsOf(snap.control, laneId).at(-1)).toMatchObject({ usd: 1.2, tokens: 5000 });
 		const [rec] = fakeRecords(r);
@@ -1369,7 +1370,7 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 		expect(last.tokens).toBe(30);
 	}, 60_000);
 
-	test("R12 a relaunch on the same ceiling value (Jo's plain relaunch, no raise): the runner meters before the first prompt and stops without sending it, no second stop notice, no lane-died:", async () => {
+	test("R12 a relaunch on the same ceiling value (Jo's plain relaunch, no raise): the runner meters before the first prompt and stops without sending it, no stop notice and no second question (D12), no lane-died:", async () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r, { slice: true });
 		tinyCeiling(r, wl, 1);
@@ -1388,8 +1389,8 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 		expect(snap.deaths).toEqual([]);
 		expect(snap.workload!.holder).toBeNull();
 		expect(snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === lane2).map((c) => c.rest)).toEqual(["accepted ceiling"]);
-		expect(ceilingNoticesOf(r, wl)).toEqual([{ level: 100, key: TINY, workloadId: wl }]);
-		expect(snap.questions).toEqual([]);
+		expect(ceilingNoticesOf(r, wl)).toEqual([]);
+		expect(snap.questions.map((q) => q.created_by)).toEqual([LANE_RUNNER_BY]);
 		expect(spendsOf(snap.control, lane2).at(-1)).toMatchObject({ usd: 1.2, tokens: 5000 });
 		const starts = fakeRecords(r).filter((x) => x.argv !== undefined);
 		expect(starts).toHaveLength(2);
@@ -1409,6 +1410,10 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 			const receipt = apply(l, interpret(l, word === "extend" ? `extend ${wl}` : `ceiling 20 ${wl}`)!);
 			l.close();
 			expect(receipt).toContain(`${laneIdOf(wl, 1)} stopped at the ceiling, so a relaunch is requested`);
+			// D12: the runner's ceiling question is withdrawn in the raise's write, so no stale question remains
+			const [q] = laneSnapshot(r, wl).questions;
+			expect(receipt).toContain(`withdrew the ceiling question ${q!.id}`);
+			expect(q!.state).toBe("withdrawn");
 			setMeterScript(r, [{ usage: { usd: 0.1, tokens: 10 } }, { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }]);
 			expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
 			const lane2 = laneIdOf(wl, 2);
@@ -1416,7 +1421,7 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 			const snap = laneSnapshot(r, wl);
 			expect(snap.deaths).toEqual([]);
 			expect(snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === lane2)).toEqual([]);
-			expect(ceilingNoticesOf(r, wl)).toEqual([{ level: 100, key: TINY, workloadId: wl }]);
+			expect(ceilingNoticesOf(r, wl)).toEqual([]);
 			const starts = fakeRecords(r).filter((x) => x.argv !== undefined);
 			expect(starts).toHaveLength(2);
 			expect(eventsOf(r, starts[1]!.pid)).toEqual(["prompt", "eof"]);
