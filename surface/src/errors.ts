@@ -104,16 +104,17 @@
 // after the answerable line of the target it names and carrying that target's number (numbering.ts's second pass), never
 // one of its own; a proposal whose target no longer waits has no target line, so it is not shown. Each recent
 // `channel-refused:` is one unnumbered line after the scratch lines (it takes no word).
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { ALARM_FILE_NAME, CEILING_ALARM_KIND, describeOff, routineState } from "../../gates/src/routine-switch";
 import { type EntryRow, type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import { MOVE_ALERT_ATTEMPTS, moveAlertTroubles, moveText, type PidProbe, psMoveAlertProbe, quotaMoves, trustedQuotaMove } from "./quota-move-alert";
 import { CHANNEL_REFUSED_SHOWN_HOURS, channelInForce, channelProposals, channelRefusals } from "./channel";
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { type NowCategory, nowMarks } from "../../gates/src/rulings";
 import { nowReserved } from "../../gates/src/rows/r06-reserved";
-import { openPairOffer } from "./input";
+import { HALT_WORD, openPairOffer } from "./input";
 import { localMinute, openDowns, POPUP_ATTEMPT_LIMIT, popupAttempts } from "./doctor-entries";
 import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, landFirstOffPending, laneExit, mainRetries, queuedOf, sameRepo } from "./launch";
 import {
@@ -128,7 +129,7 @@ import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "
 import { parseSecurityRed, parseTestRunFailed, SECURITY_RED_PREFIX, SECURITY_TEST_PATHS, testRuns } from "./test-run";
 import { NOTICE_PREFIX } from "./notice";
 import { isPaired, parseCeilingNotice } from "./ceiling";
-import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
+import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY, TEST_RUN_FAILED_PREFIX } from "./types";
 
 /** The daily report's launchd label (install/com.agent-system-2.daily-report.plist). */
 export const DAILY_REPORT_LABEL = "com.agent-system-2.daily-report";
@@ -227,8 +228,8 @@ export function doctorLines(control: readonly ControlEntry[]): ErrorLine[] {
 
 /** Every needs-you line kind; ErrorKind is read from this list, so the issue #334 item 3 test covers each kind there is. */
 export const NEEDS_YOU_KINDS = [
-	"reserved", "held", "artifact", "security-red", "quota-move", "quota-move-alert", "test-run", "lane-died", "question", "due", "idle", "scratch", "train", "pair", "notice", "proposal",
-	"channel-refused", "report",
+	"reserved", "held", "artifact", "security-red", "quota-move", "quota-move-alert", "test-run", "lane-died", "question", "due", "idle", "scratch", "alarm", "train", "pair", "notice",
+	"proposal", "channel-refused", "report",
 ] as const;
 export type ErrorKind = (typeof NEEDS_YOU_KINDS)[number];
 
@@ -280,6 +281,8 @@ export interface ErrorOptions {
 	holdHours?: number;
 	/** Whether the daily report's job is installed (the missed line needs it); default `reportPlistInstalled()`. Called only when an entry is missed. */
 	reportJobInstalled?: () => boolean;
+	/** The alarm file (PLAN wl-mvqwn80onq9hq8 D5, D12); default `auto-apply-alarms.jsonl` beside the ledger file, which for the live ledger is `alarmFilePath`. */
+	alarmFile?: string;
 	/** The Drive backup check job's plist (the missed line needs it); default `driveBackupCheckPlist()`. Called only when no check entry is fresh. */
 	driveBackupCheckPlist?: () => { mtimeMs: number } | null;
 	/** Whether a move alert's worker pid is alive (the `quota-move-alert` line's stalled and dead claims); default `psMoveAlertProbe`. */
@@ -689,6 +692,83 @@ function securityRedLines(ledger: Ledger): ErrorLine[] {
 	});
 }
 
+/** One alarm-file line's fields as its writer set them (gates/extensions/r06-reserved.ts D5; the ceiling runner, D12); null when the line is not a JSON object. */
+function alarmFields(raw: string): Record<string, unknown> | null {
+	try {
+		const v: unknown = JSON.parse(raw);
+		return v !== null && typeof v === "object" && !Array.isArray(v) ? Object.fromEntries(Object.entries(v)) : null;
+	} catch {
+		// A torn append: the line latches all the same (routine-switch.ts parseAlarmLine); its text is shown raw.
+		return null;
+	}
+}
+
+const fieldText = (f: Record<string, unknown> | null, key: string): string | null => {
+	const v = f?.[key];
+	return typeof v === "string" && v.trim() !== "" ? plain(v) : null;
+};
+
+/** Whether Jo's `ceiling` or `extend` word (`ceiling: <usd> <hours>`, or the `extend` answer) or `halt <wl>` on `workloadId` came after `at` (D12). */
+function ceilingWordAfter(ledger: Ledger, workloadId: string, at: string): boolean {
+	const t = Date.parse(at);
+	if (Number.isNaN(t)) return false;
+	return ledger.instructions(workloadId).some(
+		(i) =>
+			i.author === "jo" && i.channel === "surface" && i.created_by === SURFACE_BY && Date.parse(i.created_at) > t &&
+			(i.body.startsWith("ceiling: ") || i.body.trim() === `${HALT_WORD} ${workloadId}` || (i.kind === "answer" && i.body.trim() === "extend")),
+	);
+}
+
+/**
+ * The alarm-file lines (PLAN wl-mvqwn80onq9hq8 D5, D12), read from the file each time like the scratch lines read the
+ * filesystem: one `AUTO-APPLY ALARM` line per latching line newer than Jo's latest `auto-routine` (the switch's own
+ * reading, routineState, so the needs-you line and the latch agree; an unreadable file is one), and one `CEILING ALARM
+ * <wl>` line per `ceiling` line until Jo's next ceiling, extend or halt word on that workload. A ceiling line never turns
+ * auto-apply off. Keyed by the file's line number: the file is append-only.
+ */
+export function alarmLines(ledger: Ledger, now: string, alarmFile: string): ErrorLine[] {
+	const out: ErrorLine[] = [];
+	const state = routineState(ledger, Date.parse(now), { alarmFile });
+	const latched = state.latches.filter((l) => l.kind === "alarm" || l.kind === "alarm-unreadable");
+	let raw: string[] = [];
+	if (existsSync(alarmFile)) {
+		try {
+			raw = readFileSync(alarmFile, "utf8").split("\n");
+		} catch (err) {
+			// routineState read it a moment ago or reported it unreadable; either way the latch line below names it.
+			if (!latched.some((l) => l.kind === "alarm-unreadable")) latched.push({ kind: "alarm-unreadable", path: alarmFile, error: err instanceof Error ? err.message : String(err) });
+		}
+	}
+	for (const l of latched) {
+		if (l.kind === "alarm-unreadable") {
+			out.push({ kind: "alarm", workloadId: STANDING_WORKLOAD_ID, rowId: "alarm:unreadable", next: "make the alarm file readable, then say auto-routine", line: `AUTO-APPLY ALARM: ${describeOff(l)}; auto-apply is off` });
+			continue;
+		}
+		if (l.kind !== "alarm") continue;
+		const text = raw[l.line - 1] ?? "";
+		const f = alarmFields(text);
+		const wl = fieldText(f, "workload") ?? "(no workload)";
+		const signal = fieldText(f, "signal") ?? `kind ${l.alarmKind ?? "none"}`;
+		const evidence = fieldText(f, "evidence") ?? short(plain(text), 160);
+		const error = fieldText(f, "error") ?? "not recorded";
+		out.push({
+			kind: "alarm", workloadId: STANDING_WORKLOAD_ID, rowId: `alarm:${l.line}`, next: "check the auto-applied call, then say auto-routine",
+			line: `AUTO-APPLY ALARM ${wl} ${signal}: ${evidence}; auto-apply is off; ledger write failed: ${error} (alarm-file line ${l.line}; your auto-routine clears it)`,
+		});
+	}
+	raw.forEach((text, i) => {
+		const f = text.trim() === "" ? null : alarmFields(text);
+		if (f?.kind !== CEILING_ALARM_KIND) return;
+		const wl = fieldText(f, "workload") ?? "(no workload)";
+		const at = fieldText(f, "at");
+		if (at !== null && wl.startsWith("wl-") && ceilingWordAfter(ledger, wl, at)) return;
+		const errors = Array.isArray(f.errors) ? f.errors.filter((e): e is string => typeof e === "string").map(plain).join("; ") : "";
+		const why = fieldText(f, "error") ?? (errors !== "" ? errors : short(plain(text), 160));
+		out.push({ kind: "alarm", workloadId: wl.startsWith("wl-") ? wl : STANDING_WORKLOAD_ID, rowId: `alarm:${i + 1}`, next: `say ceiling, extend or halt for ${wl}`, line: `CEILING ALARM ${wl}: ${why} — shown until your next ceiling, extend or halt word on ${wl}` });
+	});
+	return out;
+}
+
 /**
  * PLAN wl-mvr888nftz0vcl D2: each standing `train-board-refused:` (`boardRefusals`: the tick could not board a ready PR because
  * the one merge train serves another repository) as a train line on the PR's own workload, naming the PR, its repository and
@@ -728,7 +808,7 @@ function moveAlertLines(ledger: Ledger, now: string, probe: PidProbe): ErrorLine
 	});
 }
 
-/** Every line owed right now, in § B3 order (1–3), the security-red lines, the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the train notices, the due rows, then the scratch lines, the daily report, the notices, then the channel refusals; each channel proposal directly after its target. */
+/** Every line owed right now, in § B3 order (1–3), the security-red lines, the quota-move lines, the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the train notices, the due rows, then the scratch lines, the alarm-file lines, the daily report, the notices, then the channel refusals; each channel proposal directly after its target. */
 export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger.inFlight(), opts: ErrorOptions = {}): ErrorLine[] {
 	const now = opts.now ?? ledger.now();
 	const holdHours = opts.holdHours ?? HOLD_HOURS;
@@ -891,7 +971,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		}
 	}
 	train.push(...boardRefusalLines(ledger));
-	const all = [...reserved, ...held, ...artifact, ...securityRed, ...quotaMove, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch, ...report, ...notice];
+	const all = [...reserved, ...held, ...artifact, ...securityRed, ...quotaMove, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch, ...alarmLines(ledger, now, opts.alarmFile ?? join(dirname(ledger.path), ALARM_FILE_NAME)), ...report, ...notice];
 	const channel = channelInForce(ledger);
 	if (!channel) return all;
 	const proposals = channelProposals(ledger, channel);
