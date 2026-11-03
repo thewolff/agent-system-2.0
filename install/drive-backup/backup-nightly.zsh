@@ -44,6 +44,19 @@
 # (and goes stuck) as one item.
 # Plus each night the ledger: sqlite3 -readonly .backup, quick_check, gzip, unique Drive path
 #   as2-backup/ledger/<date>/ledger-<run stamp>-<sha256 first 16>.db.gz, proven, receipt appended. Never deleted.
+# Plus closed lane folders (PLAN wl-mw14khl4uf388q "The nightly"; Jo 2026-11-03, input in-mw14k72c8u38lb), with
+# surface/scripts/lane-archive.ts run by $AS2_BUN from $AS2_REPO, each under `bounded`:
+#   lanes produce  (before the claim phase) tars each lane folder of a workload closed more than 24 h, quiet for 1 h,
+#                  into <archive root>/<UTC date>/<wl>.lane.tar.gz, extract-verified; from there it is an archive like
+#                  any other: claimed, enveloped or uploaded alone, proven, re-proven 20 h later, read back from
+#                  Google's servers, <origin>.offsite, receipts/. Cap: AS2_LANE_BUDGET (default 3600 s) + T_LONG.
+#   lanes retire   (after the receipts phase) removes a lane folder whose exact tar has that offsite proof, only
+#                  with AS2_KEEP_LOCAL=0 (`--keep-local`), and leaves ~/.agent-system-2/lanes/<wl>.offsite naming
+#                  the restore command, `as2 lane restore <wl>`. Cap: T_LONG per lane record or marker.
+#   Each `fail` line is a failure of the run (last-run.json `failures`, the alert); `ok`/`skip` lines are logged;
+#   the counts go to last-run.json `lanes` and `counts.lanes_*`. AS2_BUN unset (a manual run): `lanes: skipped:
+#   AS2_BUN unset`, nothing tarred or removed. --dry-run passes --dry-run to both (they list, change nothing).
+#   The records live in $STATE/lane-archives (AS2_LANE_ARCHIVE_STATE, exported here; restore reads the same).
 #
 # Fault tolerance (Jo's standing principles, decision log 2026-10-27 fault-tolerance-principles):
 #   - setup failures (lock, Drive root/app, DriveFS DB or its schema, archive root, temp dir) stop the run
@@ -65,8 +78,11 @@
 #   distinct names), AS2_PROOF_POLL_HOOK (a command run before each proof pass), AS2_CLOCK_CMD (lib.zsh clock_now: a
 #   command printing the epoch seconds every in-run deadline reads), AS2_CRASH_AFTER=<step>[:<n>] (the run kills
 #   itself with SIGKILL right after the n-th time, default the first, it completes <step>: upload-recorded, marker,
-#   unlink, member-receipt, claim-moved, envelope-moved; see crash_point).
-# Settings: AS2_KEEP_LOCAL=1 (upload and prove, never delete).
+#   unlink, member-receipt, claim-moved, envelope-moved; see crash_point). AS2_LANE_ONLY=<wl> (passed through to
+#   lane-archive.ts: produce and retire consider that one lane alone; the real round trip's seam).
+# Settings: AS2_KEEP_LOCAL=1 (upload and prove, never delete: neither a scratch archive nor a lane folder).
+#   AS2_LANE_BUDGET (seconds of lane tarring per night, default 3600). From the plists: AS2_BUN, AS2_REPO,
+#   AS2_LEDGER_DB (the needs-you writer and the lane phases).
 
 emulate -L zsh
 setopt pipe_fail no_unset extended_glob
@@ -179,6 +195,9 @@ crash_point() {
   kill -KILL $$
 }
 typeset -A C; C=( seen 0 claimed 0 uploaded 0 proven 0 waiting_reproof 0 deleted 0 kept_local 0 enveloped 0 )
+# The lane phases (lanes produce, lanes retire): LANES_RESULT is last-run.json `lanes`, never empty; LC the counts.
+typeset -A LC; LC=( tarred 0 skipped 0 retired 0 held 0 )
+LANES_RESULT=not-run
 LEDGER_RESULT=not-run RESULT="" ROOT_STATE=present
 json_array() { (( $# )) || { print -r -- '[]'; return 0 }; print -rl -- "$@" | $JQ -R . | $JQ -sc . }
 failures_json() {
@@ -196,14 +215,17 @@ write_heartbeat() { # <result>; returns nonzero if it could not be written
     --arg alert_result "$ALERT_RESULT" --argjson alert_epoch $ALERT_EPOCH \
     --argjson seen ${C[seen]} --argjson claimed ${C[claimed]} --argjson uploaded ${C[uploaded]} --argjson proven ${C[proven]} \
     --argjson waiting ${C[waiting_reproof]} --argjson deleted ${C[deleted]} --argjson kept ${C[kept_local]} --argjson enveloped ${C[enveloped]} \
-    --argjson failed ${#F_PATH} --argjson keep_local $(( KEEP_LOCAL == 1 )) \
+    --argjson failed ${#F_PATH} --argjson keep_local $(( KEEP_LOCAL == 1 )) --arg lanes "$LANES_RESULT" \
+    --argjson lt ${LC[tarred]} --argjson ls ${LC[skipped]} --argjson lr ${LC[retired]} --argjson lh ${LC[held]} \
     --argjson new_stuck "$(json_array $NEW_STUCK)" --argjson skipped_stuck "$(json_array $SKIPPED_STUCK)" \
     --argjson failures "$(failures_json)" \
     '{start:$start, start_epoch:$start_epoch, end:$end, end_epoch:$end_epoch, result:$result, log:$log,
       archive_root:$root, keep_local:($keep_local==1), alert:$alert, alert_result:$alert_result, alert_epoch:$alert_epoch,
       counts:{public_archives_seen:$seen, claimed:$claimed, uploaded:$uploaded, proven:$proven,
               waiting_reproof:$waiting, offsite_and_deleted:$deleted, kept_local:$kept, enveloped:$enveloped, failed:$failed,
-              newly_stuck:($new_stuck|length), skipped_stuck:($skipped_stuck|length)},
+              newly_stuck:($new_stuck|length), skipped_stuck:($skipped_stuck|length),
+              lanes_tarred:$lt, lanes_skipped:$ls, lanes_retired:$lr, lanes_held:$lh},
+      lanes:$lanes,
       ledger:$ledger, newly_stuck:$new_stuck, skipped_stuck:$skipped_stuck, failures:$failures}' 2>&1) || { info "heartbeat JSON: $body"; return 1 }
   write_file "$HEARTBEAT" "$body"
 }
@@ -687,6 +709,78 @@ claim() {
   C[claimed]=$(( C[claimed] + 1 ))
   return 0
 }
+
+# ---------- lane folders (PLAN wl-mw14khl4uf388q "The nightly"; see the header) ----------
+LANES_ROOT=$HOME/.agent-system-2/lanes
+export AS2_LANE_ARCHIVE_STATE=$STATE/lane-archives   # lane-archive.ts and `as2 lane restore` read the records here
+LANE_SCRIPT=${AS2_REPO:-<AS2_REPO unset>}/surface/scripts/lane-archive.ts
+LANE_BUDGET=${AS2_LANE_BUDGET:-3600}
+LANES_OK=1   # 0: the lane phases do not run tonight, LANES_RESULT says why
+if [[ -z ${AS2_BUN:-} ]]; then
+  LANES_OK=0 LANES_RESULT="skipped: AS2_BUN unset"
+  info "lanes: $LANES_RESULT (a manual run; the plists set it): no lane folder is tarred or removed"
+elif [[ -z ${AS2_REPO:-} ]]; then
+  LANES_OK=0 LANES_RESULT="failed: AS2_BUN is set but AS2_REPO unset; the job's plist sets both"
+  fail_item "$SCRIPT" lanes "AS2_BUN is set but AS2_REPO unset, so $LANE_SCRIPT cannot be found; no lane folder is tarred or removed (the job's plist sets both)"
+elif [[ $LANE_BUDGET != <1-> ]]; then
+  LANES_OK=0 LANES_RESULT="failed: AS2_LANE_BUDGET=$LANE_BUDGET is not a positive number of seconds"
+  fail_item "$SCRIPT" lanes "AS2_LANE_BUDGET=$LANE_BUDGET is not a positive number of seconds; no lane folder is tarred or removed"
+fi
+# lane_cmd <produce|retire> <cap seconds> <args...>: one lane-archive.ts run under `bounded`, its stdout and stderr in
+# $WORK. `fail` lines are failures of the run (path: the lane folder, or the script for `-`), `ok`/`skip` lines are
+# logged, the counts line fills LC and LANES_RESULT. An exit other than 0, a timeout, a missing counts line or an
+# unknown line is a failure too, named with the exit and stderr; exit 1 whose own `fail - …` line says it broke counts once.
+lane_cmd() {
+  local phase=$1 cap=$2; shift 2
+  local out=$WORK/lanes-$phase.out err=$WORK/lanes-$phase.err rc=0 l counts="" broke=0 e k v
+  local -a f
+  bounded $cap "lanes $phase" "$AS2_BUN" run "$LANE_SCRIPT" $phase "$@" > "$out" 2> "$err" || rc=$?
+  for l in "${(@f)$(<$out)}"; do
+    [[ -n $l ]] || continue
+    f=( "${(@ps:\t:)l}" )
+    case ${f[1]}:${#f} in
+      ok:3|skip:3) info "lanes $phase: ${f[1]} ${f[2]}: ${f[3]}" ;;
+      fail:3)
+        if [[ ${f[2]} == - ]]; then broke=1; fail_item "$LANE_SCRIPT" "lane-$phase" "${f[3]}"
+        else fail_item "$LANES_ROOT/${f[2]}" "lane-$phase" "${f[3]}"; fi ;;
+      counts:3)
+        if [[ ${f[2]} == $phase ]]; then counts=${f[3]}
+        else fail_item "$LANE_SCRIPT" "lane-$phase" "a counts line for '${f[2]}' from the $phase run: $l"; fi ;;
+      *) fail_item "$LANE_SCRIPT" "lane-$phase" "an output line that is not ok|skip|fail|counts with three TAB-separated fields: $l" ;;
+    esac
+  done
+  e=$(<$err); e=${e//$'\n'/; }
+  if (( rc != 0 )) && ! (( rc == 1 && broke )); then
+    fail_item "$LANE_SCRIPT" "lane-$phase" "exit $rc${e:+: $e}$( (( rc == 124 )) && print " (killed at its ${cap} s cap)")"
+  elif [[ -n $e ]]; then
+    info "lanes $phase: stderr (exit $rc): $e"
+  fi
+  if (( rc == 0 )) && [[ -z $counts ]]; then
+    l=$(<$out); fail_item "$LANE_SCRIPT" "lane-$phase" "exit 0 without its counts line; its output: ${${l//$'\n'/; }[1,2000]:-nothing}"
+  fi
+  [[ $LANES_RESULT == not-run ]] && LANES_RESULT="" || LANES_RESULT+="; "
+  if [[ -n $counts ]]; then
+    LANES_RESULT+="$phase: $counts"
+    for l in ${(s: :)counts}; do
+      k=${l%%=*} v=${l#*=}
+      [[ $v == <-> ]] || { fail_item "$LANE_SCRIPT" "lane-$phase" "counts line value '$l' is not a number"; continue }
+      case $phase:$k in
+        produce:tarred) LC[tarred]=$v ;; produce:skipped) LC[skipped]=$v ;;
+        retire:retired) LC[retired]=$v ;; retire:held) LC[held]=$v ;;
+      esac
+    done
+  else
+    LANES_RESULT+="$phase: failed (exit $rc; see failures)"
+  fi
+  info "lanes $phase: ${counts:-no counts} (exit $rc)"
+}
+
+if (( LANES_OK )); then
+  say_step "lanes produce: closed lane folders under $LANES_ROOT into $ARCHIVE_ROOT (budget ${LANE_BUDGET}s${AS2_LANE_ONLY:+, only $AS2_LANE_ONLY})"
+  lane_cmd produce $(( LANE_BUDGET + T_LONG )) --ledger "$LEDGER_DB" --archive-root "$ARCHIVE_ROOT" --drivefs-db "$DRIVEFS_DB" \
+    ${${(M)MODE:#dry}:+--dry-run}
+  [[ -d $ARCHIVE_ROOT && $ROOT_STATE == absent-never-seen ]] && info "the lane producer created the archive root $ARCHIVE_ROOT; tonight's lane tars are claimed by the next run"
+fi
 
 # ---------- phase 0: claim quiet public archives ----------
 say_step "phase 0: public archives under $ARCHIVE_ROOT"
@@ -1206,12 +1300,21 @@ if [[ $MODE == run ]] && (( ${#P_KIND} )); then
   done
 fi
 
+# ---------- lanes retire: remove lane folders whose exact tar is proven offsite (receipts above) ----------
+if (( LANES_OK )); then
+  # Cap: T_LONG per live record or lane marker (retire's own deadlines fail first; this is the hang guard).
+  local -a lane_work; lane_work=( $AS2_LANE_ARCHIVE_STATE/wl-*.json(N) $LANES_ROOT/wl-*.offsite(N) )
+  say_step "lanes retire: --keep-local $KEEP_LOCAL, ${#lane_work} lane record(s) and marker(s)${AS2_LANE_ONLY:+, only $AS2_LANE_ONLY}"
+  lane_cmd retire $(( T_LONG * (${#lane_work} > 0 ? ${#lane_work} : 1) )) --keep-local "$KEEP_LOCAL" --receipts "$RECEIPTS" \
+    --claims "$CLAIMS" ${${(M)MODE:#dry}:+--dry-run}
+fi
+
 # ---------- summary ----------
 if [[ $MODE == dry ]]; then
-  say_step "dry run done: ${C[seen]} public archive(s), ${#claims} claimed, ${#envs} envelope(s), ${#SKIPPED_STUCK} stuck; nothing changed"
+  say_step "dry run done: ${C[seen]} public archive(s), ${#claims} claimed, ${#envs} envelope(s), ${#SKIPPED_STUCK} stuck, lanes $LANES_RESULT; nothing changed"
   finish 0
 fi
-say_step "summary: public ${C[seen]}, claimed ${C[claimed]}, put in a new envelope ${C[enveloped]}, uploaded ${C[uploaded]}, proven ${C[proven]}, waiting re-proof ${C[waiting_reproof]}, offsite+deleted ${C[deleted]}, failed ${#F_PATH}, newly stuck ${#NEW_STUCK}, skipped stuck ${#SKIPPED_STUCK}, ledger $LEDGER_RESULT"
+say_step "summary: public ${C[seen]}, claimed ${C[claimed]}, put in a new envelope ${C[enveloped]}, uploaded ${C[uploaded]}, proven ${C[proven]}, waiting re-proof ${C[waiting_reproof]}, offsite+deleted ${C[deleted]}, failed ${#F_PATH}, newly stuck ${#NEW_STUCK}, skipped stuck ${#SKIPPED_STUCK}, ledger $LEDGER_RESULT, lanes $LANES_RESULT"
 if (( ${#F_PATH} )); then
   for i in {1..${#F_PATH}}; do info "failure $i: [${F_STEP[$i]}] ${F_PATH[$i]}: ${F_ERR[$i]}"; done
 fi
