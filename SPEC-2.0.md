@@ -822,6 +822,21 @@ OpenAI review, on deep and on strong, runs gpt-6.1-sol, and so does an OpenAI la
 Cross-lab review and the same-lab fallback are unchanged; no other row changes, so gpt-6.1-sol sits
 in one tier. A lane Jo named on a model keeps that model.
 
+*Amended 2026-11-03 — Z.ai as a review lab* (`migration/items/zai-review-lab.md`; plan
+`/Users/jowolff/agent-scratch/agent-system-2.0/wl-mw148irbq33zt5/PLAN.md` §§ D1–D6; built in wl-mw148irbq33zt5).
+`zai` is a third lab for cross-lab review, beside anthropic, openai and kimi. The profile's rows carry
+`zai/glm-5.3-flash` (fast), `zai/glm-5.3-flashx` (standard) and `zai/glm-5.3` (strong), second in each row before
+`openai-codex`; a deep review takes strong's `zai/glm-5.3`, because three GLM models fill four tiers. **Reviews only:**
+`REVIEW_ONLY_LABS` (`classifier/src/lab.ts`) names `zai`, and every build-side path refuses or skips it, so builds stay
+on the lane's lab (Jo's ruling that build lanes run on Opus; § A1.3, *Amended 2026-10-14*). **Panels stay three-lab**
+(anthropic, openai, kimi): a panel never plans a zai leg or synthesises on zai, and historical `panel-group:` bodies still
+parse. **Balance empty:** a Z.ai HTTP 429 carrying code 1113 (insufficient balance) makes the classifier write a
+classifier-owned `zai-balance:` entry, which a lane cannot forge. When no model answered the review, the review parks
+with one `review-park:` question that names the balance and where to top up, and a production fan-out whose every member
+failed to dispatch parks the same way. When the in-hand fallback answered, the review stands and Jo gets one notice per
+workload. A plain 429 (1302, 1305 or no code) keeps the existing failed-dispatch and re-dispatch path, and no
+`provider-refused:` row is written for 1113. The cross-lab rules above are otherwise unchanged.
+
 ### B5 · Jo steering a lane, and Jo coding manually (P-8, P-13, P-17)
 
 **Ruled 2026-09-23.** Jo: *"yes to your reccos"* to *"what happens if i decide i want to steer or
