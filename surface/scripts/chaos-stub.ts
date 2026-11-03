@@ -622,6 +622,8 @@ export interface StubProfile {
 	enabledProviders: string[];
 	/** config.yml `disabledProviders`: every other provider OMP knows. */
 	disabledProviders: string[];
+	/** mcp.json servers removed because they reach a remote host (any `url`); local stdio servers stay. */
+	droppedMcpServers: string[];
 }
 
 /** Every `provider/model` string anywhere under `v` (the tier rows of `task.agentModelOverrides`). */
@@ -750,7 +752,25 @@ export function writeStubProfile(agentDir: string, port: number, opts: StubProfi
 	config.disabledProviders = disabledProviders;
 	writeFileSync(configPath, `# chaos-stub overlay (surface/scripts/chaos-stub.ts writeStubProfile): every role stub-routed, no fallbacks\n${JSON.stringify(config, null, 1)}\n`);
 
-	return { modelsPath, configPath, routedProviders, routedModelIds: [...routedIds].sort(), roles, enabledProviders: [...enabled].sort(), disabledProviders };
+	// MCP: the profile's mcp.json (profile/mcp.json, placed beside config.yml by install.sh) names remote servers
+	// (Linear, PostHog since 4957744c). Every omp start connects to them, which is egress the run must not have and
+	// which fails the egress self-test (2026-11-03 nightly). Remote servers go; local stdio ones (ctx) stay.
+	const mcpPath = join(agentDir, "mcp.json");
+	const droppedMcpServers: string[] = [];
+	if (existsSync(mcpPath)) {
+		const mcp = fields(JSON.parse(readFileSync(mcpPath, "utf8")));
+		const servers = fields(mcp.mcpServers);
+		for (const [name, raw] of Object.entries(servers)) {
+			if (fields(raw).url !== undefined) {
+				delete servers[name];
+				droppedMcpServers.push(name);
+			}
+		}
+		mcp.mcpServers = servers;
+		writeFileSync(mcpPath, `${JSON.stringify(mcp, null, 1)}\n`);
+	}
+
+	return { modelsPath, configPath, routedProviders, routedModelIds: [...routedIds].sort(), roles, enabledProviders: [...enabled].sort(), disabledProviders, droppedMcpServers: droppedMcpServers.sort() };
 }
 
 // ───────────────────────────── judge-probe ─────────────────────────────

@@ -90,6 +90,7 @@ describe.skipIf(OMP === null)("chaos stub and proxy against the installed omp", 
 		rowProviders = [...new Set(Object.values(shipped.task.agentModelOverrides).flat().map((m) => m.split("/")[0]!))];
 		const config = { setupVersion: 2, modelRoles: { judge: "typesafe/jev-1.13.0" }, retry: { enabled: false, fallbackChains: { judge: [] } }, task: shipped.task };
 		writeFileSync(join(agentDir, "config.yml"), `${JSON.stringify(config)}\n`);
+		copyFileSync(join(REPO, "profile", "mcp.json"), join(agentDir, "mcp.json"));
 		proxy = startProxy();
 		stub = startStub({ nonce: NONCE, scripts: [PROBE] });
 		// moonshot stays routed and enabled: run (1) names a moonshot model explicitly, whether or not the shipped tier rows do.
@@ -116,6 +117,13 @@ describe.skipIf(OMP === null)("chaos stub and proxy against the installed omp", 
 		stub?.stop();
 		proxy?.stop();
 		if (root) rmSync(root, { recursive: true, force: true });
+	});
+
+	test("the profile keeps local MCP servers and drops every remote one, so no omp start reaches Linear or PostHog", () => {
+		const mcp = JSON.parse(readFileSync(join(agentDir, "mcp.json"), "utf8")) as { mcpServers: Record<string, { url?: string; command?: string }> };
+		expect(profile.droppedMcpServers).toEqual(["linear", "posthog"]);
+		expect(Object.keys(mcp.mcpServers)).toEqual(["ctx"]);
+		for (const server of Object.values(mcp.mcpServers)) expect(server.url).toBeUndefined();
 	});
 
 	test("the profile routes every built-in role to the stub, disables what the run does not name, and matches the installed role list", () => {
