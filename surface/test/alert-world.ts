@@ -82,7 +82,7 @@ export function alertSeams(gh: Gh, o: { ps?: () => string } = {}): PopupRecord &
 	const kills: PopupRecord["kills"] = [];
 	const seams: AlertSeams = {
 		gh,
-		quota: () => ({ subjects: [], log: [], error: null }),
+		quota: () => ({ subjects: [], log: [], error: null, unavailable: false }),
 		sources: { alarmFile: join(tmp("alarm"), "alarm.jsonl"), reportsDir: join(tmp("reports"), "none"), files: fsReportFiles, probe: () => ({ failure: null, omp: () => "gone", runner: () => "gone" }) },
 		popup: {
 			spawn: (argv, env) => {

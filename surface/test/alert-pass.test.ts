@@ -1,6 +1,8 @@
 // The alert pass (PLAN wl-mw0vs9uc3xqtka D3; R1, R8-R24): one pass over a temp ledger with recording fakes for gh, the popup
 // spawn, ps and kill. No real gh, popup or signal is ever used.
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { LANE_STARTER_BY } from "../../ledger/src/index";
 import { alertMarker, alertRecords, openEpisode } from "../src/alert-path";
 import { nightlyFault } from "../src/chaos";
@@ -11,7 +13,10 @@ import { laneDiedShutdownBody } from "../src/signals";
 import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { alertPass, lockedAlertPass } from "../scripts/alert-tick";
 import { POPUP_TAG_ENV } from "../scripts/alert-popup";
+import { runQuotaWatch } from "../src/quota-watch";
+import { takeRunnerLock } from "../src/runner-probe";
 import { type AlertWorld, ceilingStopped, ISSUE, world } from "./alert-world";
+import { tmp } from "./helpers";
 
 describe("one pass over a ceiling-stopped workload (D3, R8)", () => {
 	test("an urgent workload: the raised row, the issue with its create marker, the level-2 comment and label, and the popup kick", () => {
@@ -201,6 +206,41 @@ describe("the pass lock (D3)", () => {
 		expect(lockedAlertPass(w.deps, () => ({ release: () => void released++ }))).toEqual({ problems: [] });
 		expect(released).toBe(1);
 	});
+
+	test("a lock that cannot be read at its release is the pass's problem and its log line (review r2 N3)", () => {
+		const w = world();
+		const dir = tmp("alert-lock");
+		const path = join(dir, "alert-pass.lock");
+		const self = { pid: 4100, start: "Tue Nov  3 09:00:00 2026" };
+		const lock = () => {
+			const held = takeRunnerLock({ write: (fn) => fn() }, path, self, () => "gone");
+			if (!("release" in held)) throw new Error(`refused: ${held.state}`);
+			// The lock file is replaced by a directory during the pass.
+			rmSync(path);
+			mkdirSync(path);
+			return held;
+		};
+		const r = lockedAlertPass(w.deps, lock);
+		const line = `alert pass: releasing the lock failed: run lock ${path}: its owner could not be read: `;
+		expect(r!.problems).toEqual([expect.stringContaining(line)]);
+		expect(w.log).toContainEqual(expect.stringContaining(line));
+	});
+
+	test("a pass that throws and a release that fails are both thrown, the pass's error first (review r2 N3)", () => {
+		const w = world();
+		w.deps.quota = () => {
+			throw new Error("quota boom");
+		};
+		let caught: unknown;
+		try {
+			lockedAlertPass(w.deps, () => ({ release: () => { throw new Error("release boom"); } }));
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught).toBeInstanceOf(AggregateError);
+		expect((caught as AggregateError).errors.map((e: Error) => e.message)).toEqual(["quota boom", "release boom"]);
+		expect(w.log).toContainEqual("alert pass: releasing the lock failed: release boom");
+	});
 });
 
 describe("an ack in a crash window and an unreadable source (R13, D2)", () => {
@@ -252,6 +292,34 @@ describe("an ack in a crash window and an unreadable source (R13, D2)", () => {
 		expect(sourceLines()[0]!.line).toContain("chaos");
 		denied = false;
 		alertPass(w.deps);
+		expect(w.g.issues).toHaveLength(1);
+		expect(w.g.issues[0]!.state).toBe("OPEN");
+		expect(sourceLines()).toEqual([]);
+	});
+
+	test("a quota saved state that cannot be read holds the quota alert unchanged and says so; once it reads again nothing is filed twice (review r2 N1)", () => {
+		const w = world();
+		const dir = tmp("quota-hold");
+		const statePath = join(dir, "state.json");
+		const usage = JSON.stringify({ capacity: { anthropic: [{ window: "7d", accounts: 1, usedAccounts: 0.96 }] }, reports: [] });
+		w.deps.quota = (now) => runQuotaWatch({ dir, now: Date.parse(now), readUsage: () => usage, plistInstalled: () => false });
+		alertPass(w.deps);
+		const key = "quota:anthropic/7d:level-95";
+		expect(w.g.issues).toHaveLength(1);
+		expect(w.g.issues[0]!.body).toContain(key);
+		const saved = readFileSync(statePath, "utf8");
+		writeFileSync(statePath, "{ half");
+		w.c.plusHours(0.1);
+		const r = alertPass(w.deps);
+		expect(w.g.issues[0]!.state).toBe("OPEN");
+		expect(w.rows().filter((x) => x.startsWith(`alert: ${key} closed `))).toEqual([]);
+		expect(r.problems).toEqual([expect.stringContaining(`quota source: quota watch: ${statePath} is not JSON`)]);
+		expect(w.log).toContain(`alert pass: ${key}: held unchanged: its quota source could not be read this pass`);
+		const sourceLines = () => errorLines(w.ledger).filter((l) => l.kind === "alert" && l.line.includes("is not JSON"));
+		expect(sourceLines()).toHaveLength(1);
+		writeFileSync(statePath, saved);
+		w.c.plusHours(0.1);
+		expect(alertPass(w.deps).problems).toEqual([]);
 		expect(w.g.issues).toHaveLength(1);
 		expect(w.g.issues[0]!.state).toBe("OPEN");
 		expect(sourceLines()).toEqual([]);

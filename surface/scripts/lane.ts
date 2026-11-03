@@ -1440,7 +1440,8 @@ type Frame = Record<string, unknown>;
  * time, then the recorded omp and runner pids (`liveRunnerOf`). A refusal at either step exits `held` with no ledger write,
  * no preparation, no spawn and no finalization, since the lifecycle, the claim and the omp may belong to a runner already
  * there. The owner runs the lane (`runOwned`) and frees the lock however it ends; a runner killed before that leaves the
- * lock to the next one's stale takeover.
+ * lock to the next one's stale takeover. A lock that cannot be read or removed at the release is the run's failure when
+ * the run went through, and a line on stderr beside the run's own error when it did not (review r2 N3).
  */
 async function cmdRun(wl: string, laneId: string): Promise<number> {
 	const ledger = openLedger();
@@ -1448,6 +1449,16 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 	if (!w) throw new Fail("run", `no workload ${wl}`, STARTER_EXIT.unknown!);
 	const probe = runnerProbe(wl, laneId);
 	const lock = holdRunnerLock(ledger, wl, laneId, probe);
+	/** Release the lock; why it failed (naming the lock path), or null. */
+	const release = (): string | null => {
+		try {
+			lock.release();
+			return null;
+		} catch (err) {
+			return `${laneId}: its run lock was not released (${oneLine(err)}); the next runner takes it over once this pid is gone`;
+		}
+	};
+	let code: number;
 	try {
 		const live = liveRunnerOf(controlEntries(ledger.entries(wl)), laneId, process.pid, probe);
 		if (live?.uninspected) {
@@ -1457,10 +1468,16 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 			throw new Fail("run", `${laneId} not started: the recorded ${live.what} pid ${live.pid} is alive and no start time was recorded for it, so it cannot be told from this lane's omp; nothing was written, retryable once it exits`, STARTER_EXIT.held!);
 		}
 		if (live !== null) throw new Fail("run", `${laneId} already running: ${live.what} pid ${live.pid}`, STARTER_EXIT.held!);
-		return await runOwned(ledger, w, wl, laneId, lock);
-	} finally {
-		lock.release();
+		code = await runOwned(ledger, w, wl, laneId, lock);
+	} catch (err) {
+		// One failure never hides another: the run's own error stays the one thrown, with the release's beside it in the log.
+		const why = release();
+		if (why !== null) process.stderr.write(`runner: ${why}\n`);
+		throw err;
 	}
+	const why = release();
+	if (why !== null) throw new Fail("run", why, STARTER_EXIT.unknown!);
+	return code;
 }
 
 /**

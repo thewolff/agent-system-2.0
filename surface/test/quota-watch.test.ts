@@ -184,6 +184,8 @@ describe("failed usage reads", () => {
 		const fail = (i: number) => new Error(`omp usage --json exited 1: boom ${i}`);
 		const r1 = w.pass(T0, fail(1));
 		expect(r1.error).toBe("quota watch: omp usage read failed (1 in a row): omp usage --json exited 1: boom 1");
+		// A failed read is not an evaluation: the alert pass holds the quota alerts it has (review r2 N1).
+		expect(r1.unavailable).toBe(true);
 		expect(r1.subjects).toEqual([]);
 		expect(w.pass(T0 + 5 * MIN, fail(2)).subjects).toEqual([]);
 		const r3 = w.pass(T0 + 10 * MIN, fail(3));
@@ -204,7 +206,9 @@ describe("failed usage reads", () => {
 		const fresh = watch(newDir());
 		fresh.pass(T0, fail(1));
 		fresh.pass(T0 + 5 * MIN, fail(2));
-		expect(fresh.pass(T0 + 10 * MIN, usage({ "anthropic/7d": 0.1 })).error).toBeNull();
+		const good = fresh.pass(T0 + 10 * MIN, usage({ "anthropic/7d": 0.1 }));
+		expect(good.error).toBeNull();
+		expect(good.unavailable).toBe(false);
 		const after = fresh.pass(T0 + 15 * MIN, fail(4));
 		expect(after.error).toContain("(1 in a row)");
 		expect(after.subjects).toEqual([]);
@@ -224,6 +228,7 @@ describe("failed usage reads", () => {
 		const r = w.pass(T0, usage({ "anthropic/7d": 0.99 }));
 		expect(r.error).toStartWith(`quota watch: ${join(dir, "state.json")} is not JSON`);
 		expect(r.subjects).toEqual([]);
+		expect(r.unavailable).toBe(true);
 		expect(w.calls()).toBe(0);
 		expect(readFileSync(join(dir, "state.json"), "utf8")).toBe("{ half");
 	});
@@ -267,7 +272,7 @@ describe("Plumb's watcher installed", () => {
 		const dir = newDir();
 		const w = watch(dir, { installed: true });
 		const r = w.pass(T0, usage({ "anthropic/7d": 0.99 }));
-		expect(r).toEqual({ subjects: [], error: null, log: [expect.stringContaining("com.agent-system-2.quota-watch.plist")] });
+		expect(r).toEqual({ subjects: [], error: null, unavailable: false, log: [expect.stringContaining("com.agent-system-2.quota-watch.plist")] });
 		expect(w.calls()).toBe(0);
 		expect(existsSync(join(dir, "polls.jsonl"))).toBe(false);
 		expect(existsSync(join(dir, "state.json"))).toBe(false);
@@ -284,6 +289,7 @@ describe("Plumb's watcher installed", () => {
 		const r = w.pass(T0, usage({ "anthropic/7d": 0.99 }));
 		expect(r.subjects).toEqual([]);
 		expect(r.error).toContain("EACCES: permission denied");
+		expect(r.unavailable).toBe(true);
 		expect(w.calls()).toBe(0);
 	});
 
@@ -316,6 +322,7 @@ describe("subject lifetime and poll cadence", () => {
 		expect(w.calls()).toBe(1);
 		expect(keys(soon)).toEqual(["quota:anthropic/7d:level-85"]);
 		expect(soon.error).toBeNull();
+		expect(soon.unavailable).toBe(false);
 		expect(readFileSync(join(dir, "polls.jsonl"), "utf8").split("\n").filter(Boolean)).toHaveLength(1);
 
 		w.pass(T0 + MIN_POLL_GAP_S * 1000, new Error("omp usage --json timed out after 120 s and was killed"));
@@ -323,5 +330,6 @@ describe("subject lifetime and poll cadence", () => {
 		const held = w.pass(T0 + (MIN_POLL_GAP_S + 30) * 1000);
 		expect(w.calls()).toBe(2);
 		expect(held.error).toBe("quota watch: omp usage read failed (1 in a row): omp usage --json timed out after 120 s and was killed (the attempt 30 s ago)");
+		expect(held.unavailable).toBe(true);
 	});
 });

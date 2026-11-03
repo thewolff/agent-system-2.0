@@ -239,17 +239,22 @@ export function doctorLines(control: readonly ControlEntry[]): ErrorLine[] {
  * D4 (PLAN wl-mw0vs9uc3xqtka): the ALERT lines from the standing workload's control entries, one per open episode Jo has not
  * acked, in the order the keys were first written. The words (title, first text line, next, workload) are the episode's newest
  * `raised` / `updated` words; an episode with none (adopted, or a row written before the words existed) says its key and where
- * it came from. `issue` is the url level 1 recorded, else the gh error; a gh error stands until a later `level … sent`,
- * `updated` or `merged-closed` row of the key. `popup` reads the episode's `alert-popup:` rows at its current level; a popup
+ * it came from. `issue` is the url level 1 recorded, else the gh error; a gh error stands until a later `level … sent` or
+ * `updated` row of the key. `popup` reads the episode's `alert-popup:` rows at its current level; a popup
  * error stands until a later popup row of the episode. A key with no open episode that stands on an error (`pending`: a
- * failed source's `source:<kind>` key, a legacy alert held before adoption, a merged issue's cleanup after its close) has
- * one line naming it (review r1 #4, #6). `records` is `alertRecords(control)`, passed when the caller has it.
+ * failed source's `source:<kind>` key, a legacy alert held before adoption, an error after its alert closed) has one line
+ * naming it (review r1 #4, #6). A merged legacy issue whose cleanup failed has its own line until its `merged-closed`,
+ * whether its episode is open, acked or closed (review r2 N6). `records` is `alertRecords(control)`, passed when the
+ * caller has it.
  */
 export function alertLines(control: readonly ControlEntry[], records: ReadonlyMap<string, AlertKeyRecord> = alertRecords(control)): ErrorLine[] {
 	const position = new Map(control.map((c, i) => [c.id, i] as const));
 	const popups = alertPopupRows(control);
 	const out: ErrorLine[] = [];
 	for (const [key, rec] of records) {
+		for (const e of rec.episodes) {
+			for (const [url, m] of e.merged) if (m.closedAt === null && m.error !== null) out.push(mergedCleanupLine(key, url, m.into, m.error));
+		}
 		const ep = openEpisode(rec);
 		if (ep === null) {
 			const p = rec.pending;
@@ -263,7 +268,7 @@ export function alertLines(control: readonly ControlEntry[], records: ReadonlyMa
 		const ghCleared = control.some((c, i) => {
 			if (i <= ghAt || c.prefix !== "alert") return false;
 			const p = parseAlertRow(c.rest);
-			return p?.key === key && ((p.row.row === "level" && p.row.step === "sent") || p.row.row === "updated" || p.row.row === "merged-closed");
+			return p?.key === key && ((p.row.row === "level" && p.row.step === "sent") || p.row.row === "updated");
 		});
 		const gh = ghRow !== undefined && !ghCleared ? ghRow.text : null;
 		const mine = popups.filter((r) => r.key === key && r.episode === ep.id);
@@ -298,12 +303,18 @@ export function alertLines(control: readonly ControlEntry[], records: ReadonlyMa
 /** The ALERT line of a key that stands on an error with no open episode (`AlertKeyRecord.pending`). */
 function pendingLine(key: string, rec: AlertKeyRecord, p: NonNullable<AlertKeyRecord["pending"]>): ErrorLine {
 	const retry = "the next alert pass retries; fix what it names if it persists";
-	const [what, next] = key.startsWith("source:")
+	const [what, step] = key.startsWith("source:")
 		? [`${key} failed`, `its alerts are held unchanged (no close, no popup cancel) until it reads again; ${retry}`]
 		: rec.episodes.length === 0
 			? [`${key} held before adoption (${p.channel})`, `no issue is filed and no popup shown for it until it is adopted; ${retry}`]
-			: [`${key} cleanup after its alert closed (${p.channel})`, retry];
-	return { kind: "alert", workloadId: STANDING_WORKLOAD_ID, rowId: p.id, next, line: `ALERT ${what}: ${p.text} — ${next}` };
+			: [`${key} failed after its alert closed (${p.channel})`, retry];
+	return { kind: "alert", workloadId: STANDING_WORKLOAD_ID, rowId: p.id, next: step, line: `ALERT ${what}: ${p.text} — ${step}` };
+}
+
+/** The ALERT line of a merged legacy issue whose cleanup (pointer comment, close) failed and is not done yet (review r2 N6). */
+function mergedCleanupLine(key: string, url: string, into: string, error: { text: string; id: string }): ErrorLine {
+	const step = `the next alert pass retries the pointer comment and the close; or close ${url} by hand with a pointer to ${into}`;
+	return { kind: "alert", workloadId: STANDING_WORKLOAD_ID, rowId: error.id, next: step, line: `ALERT ${key} cleanup of merged issue ${url} failed: ${error.text} — ${step}` };
 }
 
 /** Every needs-you line kind; ErrorKind is read from this list, so the issue #334 item 3 test covers each kind there is. */

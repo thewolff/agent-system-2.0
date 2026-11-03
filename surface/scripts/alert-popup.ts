@@ -294,29 +294,45 @@ export function legacyHelperSet(procs: readonly Proc[], claim: LegacyClaim, move
 	return { members: [...set.values()], reused: owner === null && procs.some((p) => p.pid === claim.pid) };
 }
 
-/** The `legacy-popup` rows of one key, read back: every `terminating` and `killed` row, oldest first, and the settlement. */
+/**
+ * The `legacy-popup` rows of one key, read back: every `terminating`, `killed` (SIGKILL delivered, or the member already
+ * gone) and `kill-failed` (SIGKILL threw; review r2 N5) row, oldest first, and the settlement.
+ */
 export interface LegacyPopupRecord {
 	terminating: { members: Member[]; sent: string }[];
 	killed: { members: Member[]; at: string }[];
+	killFailed: { members: Member[]; at: string; error: string }[];
 	settled: string | null;
 }
 
 /** The key's `alert: <key> legacy-popup …` texts, oldest first, read back. */
 export function legacyPopupRecord(texts: readonly string[]): LegacyPopupRecord {
-	const r: LegacyPopupRecord = { terminating: [], killed: [], settled: null };
+	const r: LegacyPopupRecord = { terminating: [], killed: [], killFailed: [], settled: null };
 	for (const t of texts) {
 		let m: RegExpExecArray | null;
 		if ((m = /^terminating members=(\S*) sent=(\S+)$/.exec(t))) r.terminating.push({ members: parseMembers(m[1]!), sent: m[2]! });
 		else if ((m = /^killed members=(\S*) at=(\S+)$/.exec(t))) r.killed.push({ members: parseMembers(m[1]!), at: m[2]! });
+		else if ((m = /^kill-failed members=(\S*) at=(\S+) error=(.*)$/.exec(t))) r.killFailed.push({ members: parseMembers(m[1]!), at: m[2]!, error: m[3]! });
 		else if ((m = /^settled (.+)$/.exec(t))) r.settled ??= m[1]!;
 	}
 	return r;
 }
 
-/** What the pass does now for a legacy claim not yet settled: one row and its signal each. */
+/** SIGKILL attempts per legacy member: after this many failed deliveries it is not tried again, and is the key's error. */
+export const LEGACY_KILL_ATTEMPTS = 3;
+
+/** The row of members whose SIGKILL was delivered (or who were already gone) at `at`. */
+export const legacyKilledText = (members: readonly Member[], at: string): string => `killed ${membersField(members)} at=${at}`;
+/** The row of one member whose SIGKILL threw at `at`, with the error. */
+export const legacyKillFailedText = (member: Member, at: string, error: string): string => `kill-failed ${membersField([member])} at=${at} error=${error.replace(/\s+/g, " ").trim()}`;
+
+/**
+ * What the pass does now for a legacy claim not yet settled. `terminate` and `settle` carry their row; `kill` carries none:
+ * the pass writes `killed` for the members the signal reached and `kill-failed` for each it did not (review r2 N5).
+ */
 export type LegacyStep =
 	| { do: "terminate"; members: Proc[]; text: string }
-	| { do: "kill"; members: Proc[]; text: string }
+	| { do: "kill"; members: Proc[] }
 	| { do: "settle"; text: string }
 	| { do: "error"; text: string };
 
@@ -324,9 +340,10 @@ export type LegacyStep =
  * D3's legacy settlement over one `ps -A -ww` read (`procs`) at `now`, in order. The helper set is found again on every
  * pass (`legacyHelperSet`); before any `terminating` row an empty set is `settled …`, and a helper not yet recorded is
  * signalled (`terminating …`) whenever it is first seen, so a voice that starts after the first SIGTERM joins the set
- * (review r1 #2). A recorded member still matching 30 s after its own SIGTERM gets SIGKILL (`killed …`, once each); one still
- * matching 5 minutes after its SIGKILL is the key's error, the key held back until it goes. `settled cancelled at cutover`
- * only once no recorded member matches and the set has nothing new. Empty while it waits, and once settled.
+ * (review r1 #2). A recorded member still matching 30 s after its own SIGTERM gets SIGKILL; a SIGKILL that failed is tried
+ * again on the next pass, LEGACY_KILL_ATTEMPTS times in all, and then is the key's error (review r2 N5). One still matching
+ * 5 minutes after a delivered SIGKILL is the key's error too, the key held back until it goes. `settled cancelled at
+ * cutover` only once no recorded member matches and the set has nothing new. Empty while it waits, and once settled.
  */
 export function settleLegacy(rec: LegacyPopupRecord, procs: readonly Proc[], claim: LegacyClaim, move: QuotaMove, now: string): LegacyStep[] {
 	if (rec.settled !== null) return [];
@@ -347,8 +364,15 @@ export function settleLegacy(rec: LegacyPopupRecord, procs: readonly Proc[], cla
 		const at = rec.killed.filter((x) => x.members.some((m) => sameProc(p, m))).map((x) => Date.parse(x.at));
 		return at.length === 0 ? null : Math.min(...at);
 	};
-	const due = matching.filter((p) => killedAt(p) === null && t - termAt(p) >= POPUP_KILL_AFTER_MS);
-	if (due.length > 0) steps.push({ do: "kill", members: due, text: `killed ${membersField(due)} at=${now}` });
+	const failures = (p: Proc) => rec.killFailed.filter((x) => x.members.some((m) => sameProc(p, m)));
+	const unkilled = matching.filter((p) => killedAt(p) === null && t - termAt(p) >= POPUP_KILL_AFTER_MS);
+	const due = unkilled.filter((p) => failures(p).length < LEGACY_KILL_ATTEMPTS);
+	if (due.length > 0) steps.push({ do: "kill", members: due });
+	const exhausted = unkilled.filter((p) => failures(p).length >= LEGACY_KILL_ATTEMPTS);
+	if (exhausted.length > 0) {
+		const each = exhausted.map((p) => `${memberToken(p)} (last: ${failures(p).at(-1)!.error})`).join(", ");
+		steps.push({ do: "error", text: `legacy popup members whose SIGKILL failed ${LEGACY_KILL_ATTEMPTS} times, not tried again: ${each}` });
+	}
 	const stuck = matching.filter((p) => {
 		const k = killedAt(p);
 		return k !== null && t - k >= POPUP_KILL_GRACE_MS;

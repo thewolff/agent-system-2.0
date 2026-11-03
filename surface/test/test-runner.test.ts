@@ -17,7 +17,7 @@ import { dirname, join, resolve } from "node:path";
 import { Ledger, LiveLedgerUnderTestError, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { KILL_GRACE_MS, renderExecWrapper, SWEEP_LOCK_WAIT_MS } from "../src/as2test";
 import { recordRepo } from "../src/decision-log";
-import { ALERT_BY, alertBody, landFirstBody, landFirstInstructionBody, landFirstOffBody, trainFixBody } from "../src/launch";
+import { ALERT_BY, alertBody, type AlertRow, landFirstBody, landFirstInstructionBody, landFirstOffBody, trainFixBody } from "../src/launch";
 import {
 	childLayout, fastPlanBody, fastPlanOf, heartbeatText, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, runnerDiedRun, type TestRun, testRequestedBody, testRunBody, testRuns, workDirOf,
 	withFullSuitePublication, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
@@ -2800,13 +2800,30 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 	}
 
 	// Review F3: incident designation drives both admission and publication, not an arbitrary revert-shaped branch.
-	// "named fix in the alert issue" (PLAN wl-mw0vs9uc3xqtka R22): the stop has no legacy stop-filed issue; the incident issue is
-	// the `main:<repo>` alert episode's, and namedFix reads it through stopIssueUrl.
-	for (const repair of ["partial revert", "named fix", "named fix in the alert issue", "tree revert", "unrelated revert"] as const) {
+	// The alert-issue cases (PLAN wl-mw0vs9uc3xqtka R22): the stop has no legacy stop-filed issue; the incident issue is the
+	// `main:<repo>` alert episode's, and namedFix reads it through stopIssueUrl. "named fix in the alert issue": the episode is
+	// raised after the stop. "named fix in an alert issue open before the stop" (review r2 N7): the episode was raised an hour
+	// before the stop and is still open, so it is the incident's. "fix named only in an earlier closed episode" (review r2 N7):
+	// that episode closed before the stop was raised and no episode is open, so it names no repair of this stop.
+	const ALERT_CASES = ["named fix in the alert issue", "named fix in an alert issue open before the stop", "fix named only in an earlier closed episode"] as const;
+	for (const repair of ["partial revert", "named fix", ...ALERT_CASES, "tree revert", "unrelated revert"] as const) {
 		test(`${repair}: stopped-main admission and publication preserve the repair's required scope`, async () => {
 			const w = landWorld();
-			const fix = repair === "named fix" || repair === "named fix in the alert issue";
-			const incident = `https://github.com/thewolff/jo-issues/issues/${repair === "named fix in the alert issue" ? 95 : 91}`;
+			const viaAlert = (ALERT_CASES as readonly string[]).includes(repair);
+			const stale = repair === "fix named only in an earlier closed episode";
+			const fix = repair === "named fix" || viaAlert;
+			const incident = `https://github.com/thewolff/jo-issues/issues/${viaAlert ? 95 : 91}`;
+			const key = `main:${OWNER_REPO}`;
+			const alert = (row: AlertRow) => w.ledger.recordEntry({ by: ALERT_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: alertBody(key, row) });
+			const episode = () => {
+				alert({ row: "raised", kind: "main-red", start: 1, digest: "0123456789ab" });
+				alert({ row: "level", level: 1, step: "sent", url: incident });
+			};
+			if (repair === "named fix in an alert issue open before the stop") w.ago(3_600_000, episode);
+			if (stale) {
+				w.ago(7_200_000, episode);
+				w.ago(3_600_000, () => alert({ row: "closed", why: "main was green again" }));
+			}
 			mainRun(w.ledger, "tr-regression", fx.head.red, "red");
 			g(w.origin, "update-ref", "refs/heads/main", fx.head.red);
 			api(w, "git/ref/heads/main", { object: { sha: fx.head.red } });
@@ -2816,12 +2833,8 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 			});
 			api(w, `commits/${fx.head.red}/pulls`, [{ number: PR.red }]);
 			w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstNoticeBody(OWNER_REPO, { event: "stop-raised", kind: "regression", tip: fx.head.red, g: fx.main, suspects: [PR.red], failing: 1 }) });
-			if (repair === "named fix in the alert issue") {
-				const key = `main:${OWNER_REPO}`;
-				for (const row of [{ row: "raised", kind: "main-red", start: 1, digest: "0123456789ab" }, { row: "level", level: 1, step: "sent", url: incident }] as const) {
-					w.ledger.recordEntry({ by: ALERT_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: alertBody(key, row) });
-				}
-			} else w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstNoticeBody(OWNER_REPO, { event: "stop-filed", url: incident }) });
+			if (repair === "named fix in the alert issue") episode();
+			else if (!viaAlert) w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstNoticeBody(OWNER_REPO, { event: "stop-filed", url: incident }) });
 			writeFileSync(join(w.root, "incident.json"), JSON.stringify({ body: fix ? "fix #1" : "repair incident", comments: [] }));
 			const tree = g(w.origin, "rev-parse", `${repair === "tree revert" ? fx.main : fx.head.green}^{tree}`);
 			const head = g(w.origin, "commit-tree", tree, "-p", fx.head.red, "-m", repair);
@@ -2852,6 +2865,12 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 				expect(marks(w, id, "acquired")).toEqual([]);
 				expect(statusPosts(w).at(-1)).toBe(`success ${head}`);
 				expect(calls(w).at(-1)).toContain("description=repair: revert to G's tree");
+			} else if (stale) {
+				// Refused: no repair of this stop, so no full admission, the gate fails, and the closed episode's issue is never read.
+				expect(result.scope).toBe("fast");
+				expect(statusPosts(w).at(-1)).toBe(`failure ${head}`);
+				expect(calls(w).at(-1)).toContain("not the incident's repair");
+				expect(calls(w).filter((s) => s.startsWith("issue view "))).toEqual([]);
 			} else if (repair === "unrelated revert") {
 				expect(result.scope).toBe("fast");
 				expect(statusPosts(w).at(-1)).toBe(`failure ${head}`);

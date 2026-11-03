@@ -11,6 +11,7 @@ import { landFirstNoticeBody, mainRedNoticeBody } from "../src/merge-train";
 import { commentMarker, issueMarker, moveText, moveTitle, POPUP_SCRIPT, QUOTA_MOVE_ALERT_PREFIX, quotaMoves, recordQuotaMove } from "../src/quota-move-alert";
 import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { alertPass } from "../scripts/alert-tick";
+import { LEGACY_KILL_ATTEMPTS } from "../scripts/alert-popup";
 import { type AlertWorld, ISSUE, world } from "./alert-world";
 
 const A = "anthropic/claude-opus-5-5";
@@ -117,7 +118,7 @@ describe("main:<repo> with two legacy issues (D3 r5 #1, R16)", () => {
 		legacyMain(w, { red: true, stop: true });
 		alertPass(w.deps);
 		expect(keyRows(w).filter((r) => r.includes(" merged-closed "))).toEqual([]);
-		expect(keyRows(w).filter((r) => r.startsWith(`alert: ${KEY} error gh `))).toHaveLength(1);
+		expect(keyRows(w).filter((r) => r.startsWith(`alert: ${KEY} error merged:${RED_ISSUE} gh: `))).toHaveLength(1);
 		// Main goes green: the stop and the notice clear, so the canonical episode closes this pass.
 		const put = (body: string) => w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
 		put(landFirstNoticeBody(REPO, { event: "stop-cleared", why: "main is green again" }));
@@ -129,6 +130,68 @@ describe("main:<repo> with two legacy issues (D3 r5 #1, R16)", () => {
 		expect(issue(w, STOP_ISSUE).state).toBe("CLOSED");
 		expect(issue(w, RED_ISSUE).state).toBe("CLOSED");
 		expect(keyRows(w).filter((r) => r === `alert: ${KEY} merged-closed ${RED_ISSUE}`)).toHaveLength(1);
+	});
+
+	/** Main goes green: the stop and the notice clear, so the canonical episode closes at the next pass. */
+	const greenAgain = (w: AlertWorld) => {
+		const put = (body: string) => w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+		put(landFirstNoticeBody(REPO, { event: "stop-cleared", why: "main is green again" }));
+		put(mainRedNoticeBody(SOURCE, "cleared", "the source issue was closed"));
+	};
+	const records = (w: AlertWorld) => alertRecords(controlEntries(w.ledger.entries(STANDING_WORKLOAD_ID))).get(KEY)!;
+	/** The needs-you lines that carry the failed pointer comment's gh error (the recording gh answers HTTP 502). */
+	const cleanupLines = (w: AlertWorld) => errorLines(w.ledger).filter((l) => l.kind === "alert" && l.line.includes("HTTP 502"));
+
+	test("the key reopens before the old episode's cleanup succeeds: `merged-closed` completes the old episode, once (review r2 N4)", () => {
+		let down = true;
+		const w = world({ fail: (a) => down && a[0] === "issue" && a[1] === "comment" && a[2] === "90" });
+		legacyMain(w, { red: true, stop: true });
+		alertPass(w.deps);
+		greenAgain(w);
+		w.c.plusHours(0.01);
+		alertPass(w.deps);
+		expect(records(w).episodes.map((e) => e.closed !== null)).toEqual([true]);
+		// Landing stops again: a new episode opens on the same key while the old cleanup is still owed.
+		w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstNoticeBody(REPO, { event: "stop-raised", kind: "regression", tip: "b".repeat(40), g: null, suspects: [13], failing: 1 }) });
+		w.c.plusHours(0.01);
+		alertPass(w.deps);
+		expect(records(w).episodes).toHaveLength(2);
+		expect(openEpisode(records(w))).not.toBeNull();
+		down = false;
+		w.c.plusHours(0.01);
+		alertPass(w.deps);
+		w.c.plusHours(0.01);
+		alertPass(w.deps);
+		expect(issue(w, RED_ISSUE).state).toBe("CLOSED");
+		expect(keyRows(w).filter((r) => r === `alert: ${KEY} merged-closed ${RED_ISSUE}`)).toHaveLength(1);
+		expect(records(w).episodes[0]!.merged.get(RED_ISSUE)!.closedAt).not.toBeNull();
+		expect(records(w).loose.filter((r) => r.row.row === "merged-closed")).toEqual([]);
+		expect(cleanupLines(w)).toEqual([]);
+	});
+
+	test("a merged issue's cleanup failure shows on needs-you while its episode is acked, and after it closed (review r2 N6)", () => {
+		let down = true;
+		const w = world({ fail: (a) => down && a[0] === "issue" && a[1] === "comment" && a[2] === "90" });
+		legacyMain(w, { red: true, stop: true });
+		alertPass(w.deps);
+		expect(cleanupLines(w)).toHaveLength(1);
+		// Jo closes the canonical issue: the episode is acked, and its own ALERT line goes.
+		issue(w, STOP_ISSUE).state = "CLOSED";
+		w.c.plusHours(0.01);
+		alertPass(w.deps);
+		expect(records(w).episodes[0]!.acked).not.toBeNull();
+		expect(issue(w, RED_ISSUE).state).toBe("OPEN");
+		expect(cleanupLines(w)).toEqual([expect.objectContaining({ line: expect.stringContaining("HTTP 502") })]);
+		greenAgain(w);
+		w.c.plusHours(0.01);
+		alertPass(w.deps);
+		expect(records(w).episodes[0]!.closed).not.toBeNull();
+		expect(cleanupLines(w)).toHaveLength(1);
+		down = false;
+		w.c.plusHours(0.01);
+		alertPass(w.deps);
+		expect(issue(w, RED_ISSUE).state).toBe("CLOSED");
+		expect(cleanupLines(w)).toEqual([]);
 	});
 });
 
@@ -234,5 +297,58 @@ describe("a legacy quota-move popup still on screen at cutover (D3, R16, R23)", 
 		expect(w.kills).toEqual([[900, "SIGTERM"]]);
 		expect(w.rows()).toContain(`alert: ${key} legacy-popup settled cancelled at cutover`);
 		expect(adopted(w, key)).toHaveLength(1);
+	});
+
+	test("a SIGKILL that fails is not recorded as `killed`: it is tried again on the next pass, and the member settles once it is gone (review r2 N5)", () => {
+		const p = legacyPopup();
+		const { w, key } = p;
+		const record = w.deps.popup.kill;
+		let failNext = 1;
+		w.deps.popup = { ...w.deps.popup, kill: (pid, sig) => {
+			record(pid, sig);
+			if (sig === "SIGKILL" && failNext > 0) {
+				failNext--;
+				throw new Error(`kill ${pid}: EPERM: operation not permitted`);
+			}
+			return true;
+		} };
+		p.set([`  900     1   900 ${LS} ${p.owner}`]);
+		alertPass(w.deps);
+		plusSeconds(w, 31);
+		alertPass(w.deps);
+		expect(w.kills).toEqual([[900, "SIGTERM"], [900, "SIGKILL"]]);
+		expect(w.rows().filter((r) => r.startsWith(`alert: ${key} legacy-popup killed `))).toEqual([]);
+		expect(w.rows().filter((r) => r.startsWith(`alert: ${key} legacy-popup kill-failed members=900:`))).toHaveLength(1);
+		plusSeconds(w, 10);
+		alertPass(w.deps);
+		expect(w.kills).toEqual([[900, "SIGTERM"], [900, "SIGKILL"], [900, "SIGKILL"]]);
+		expect(w.rows().filter((r) => r.startsWith(`alert: ${key} legacy-popup killed members=900:`))).toHaveLength(1);
+		p.set([]);
+		plusSeconds(w, 10);
+		alertPass(w.deps);
+		expect(w.rows()).toContain(`alert: ${key} legacy-popup settled cancelled at cutover`);
+		expect(adopted(w, key)).toHaveLength(1);
+	});
+
+	test("a SIGKILL that fails three times is not tried a fourth time and is the key's error on needs-you (review r2 N5)", () => {
+		const p = legacyPopup();
+		const { w, key } = p;
+		const record = w.deps.popup.kill;
+		w.deps.popup = { ...w.deps.popup, kill: (pid, sig) => {
+			record(pid, sig);
+			if (sig === "SIGKILL") throw new Error(`kill ${pid}: EPERM: operation not permitted`);
+			return true;
+		} };
+		p.set([`  900     1   900 ${LS} ${p.owner}`]);
+		alertPass(w.deps);
+		for (let i = 0; i < 5; i++) {
+			plusSeconds(w, 31);
+			alertPass(w.deps);
+		}
+		expect(w.kills.filter(([, sig]) => sig === "SIGKILL")).toHaveLength(LEGACY_KILL_ATTEMPTS);
+		const line = errorLines(w.ledger).find((l) => l.kind === "alert" && l.line.includes(key))?.line ?? "";
+		expect(line).toContain(`SIGKILL failed ${LEGACY_KILL_ATTEMPTS} times, not tried again: 900:`);
+		expect(line).toContain("EPERM");
+		expect(adopted(w, key)).toEqual([]);
 	});
 });

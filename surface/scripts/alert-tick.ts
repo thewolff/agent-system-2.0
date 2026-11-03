@@ -35,9 +35,9 @@ import { alarmFilePath } from "../../gates/src/routine-switch";
 import {
 	ALERT_LADDER, ALERT_POPUP_ATTEMPTS, type AlertAck, type AlertAction, alertAcks, alertActions, type AlertEpisode, type AlertKeyRecord, type AlertKind, alertKindOfKey,
 	alertMarker, alertPopupAnsweredAt, alertPopupRows, alertRecords, alertSourceKey, alertWords, type AlertSubject, errorChanged, legacyLandFirstMarker,
-	legacyMainRedMarker, legacyTrainAlertMarker, legacyTrainAlerts, legacyTrainLevel, openEpisode, type Urgency, urgencyOf, withUrgency,
+	legacyMainRedMarker, legacyTrainAlertMarker, legacyTrainAlerts, legacyTrainLevel, mergedChannel, openEpisode, type Urgency, urgencyOf, withUrgency,
 } from "../src/alert-path";
-import { alertSources, fsReportFiles, psProbe, type SourceSeams } from "../src/alert-sources";
+import { alertSources, fsReportFiles, psProbe, type SourceProblem, type SourceSeams } from "../src/alert-sources";
 import { field, type Gh, GhError, type GhResult, ghJsonOf, issueNumber, issueOps } from "../src/jo-issues";
 import { ALERT_BY, alertBody, alertPopupBody, type AlertRow, controlEntries, heldLive } from "../src/launch";
 import { checkoutOwnerRepo, everyTrain, landFirstRows, mainRedNotices, stopEpisode, TRAIN_ALERT_LABEL, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, trainCheckout } from "../src/merge-train";
@@ -50,8 +50,8 @@ import { EXTEND_SOURCE, parseCeiling } from "../src/ceiling";
 import { HALT_WORD, isRunnerCeilingQuestion } from "../src/input";
 import { STANDING_WORKLOAD_ID } from "../src/types";
 import {
-	ALERT_POPUP_SCRIPT, groupKey, type LegacyClaim, legacyPopupRecord, type Member, parsePs, POPUP_TAG_ENV, popupAttempts, type PopupAttempt, popupStatus, popupTag,
-	type Proc, psArgs, settleAttempt, settleLegacy, terminatingDetail,
+	ALERT_POPUP_SCRIPT, groupKey, type LegacyClaim, legacyKilledText, legacyKillFailedText, legacyPopupRecord, type Member, parsePs, POPUP_TAG_ENV, popupAttempts,
+	type PopupAttempt, popupStatus, popupTag, type Proc, psArgs, settleAttempt, settleLegacy, terminatingDetail,
 } from "./alert-popup";
 
 /** The popup's seams: the worker spawn, the ps reads, the signals. */
@@ -114,10 +114,11 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 	const standing = () => controlEntries(ledger.entries(STANDING_WORKLOAD_ID));
 	const records = () => alertRecords(standing());
 
-	// 1. The quota watch.
+	// 1. The quota watch. Its failure is a source problem when its subjects are not this pass's evaluation (review r2 N1),
+	// else (a later write failed) a problem line beside subjects that still hold.
 	const quota = d.quota(now);
 	for (const l of quota.log) say(l);
-	if (quota.error !== null) problems.push(quota.error);
+	if (quota.error !== null && !quota.unavailable) problems.push(quota.error);
 
 	// 2. The sources.
 	const control0 = standing();
@@ -141,14 +142,15 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 		popupAnsweredAt: (key) => alertPopupAnsweredAt(control0, key),
 	};
 	const src = alertSources(ledger, seams);
-	// A source that failed is unknown state, not a clear (review r1 #4): every open episode of its kind (or the one key a
-	// problem names) is held unchanged this pass, and the failure is its `source:<kind>` key's error row, on the needs-you
-	// surface until the source evaluates cleanly again. (The quota watch's subjects come from its own saved alert state, so
-	// its read errors are a problem line, not a hold.)
+	// A source that failed is unknown state, not a clear (review r1 #4, r2 N1): every open episode of its kind (or the one key
+	// a problem names) is held unchanged this pass, and the failure is its `source:<kind>` key's error row, on the needs-you
+	// surface until the source evaluates cleanly again. The quota watch's unavailable pass is one more such problem.
+	const quotaProblem = quota.error ?? "quota watch: unavailable with no error named (a defect in surface/src/quota-watch.ts runQuotaWatch)";
+	const sourceProblems: SourceProblem[] = quota.unavailable ? [{ source: "quota", error: quotaProblem }, ...src.problems] : src.problems;
 	const sourceErrors = new Map<AlertKind, string[]>();
 	const failedKinds = new Set<AlertKind>();
 	const failedKeys = new Set<string>();
-	for (const p of src.problems) {
+	for (const p of sourceProblems) {
 		problem(`${p.source} source: ${p.error}`);
 		sourceErrors.set(p.source, [...(sourceErrors.get(p.source) ?? []), p.error]);
 		if (p.key === undefined) failedKinds.add(p.source);
@@ -179,14 +181,17 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 		}
 	};
 
-	/** An error row for `key` on `channel` (episode or not), written only when its text changed; and the log line. */
-	const keyError = (key: string, channel: string, err: unknown) => {
+	/**
+	 * An error row for `key` on `channel`, written only when its text changed (against `prior` when given: a merged issue's
+	 * last cleanup error; else the open episode's, or the key's pending error); and the log line.
+	 */
+	const keyError = (key: string, channel: string, err: unknown, prior?: string | null) => {
 		const text = errText(err);
 		say(`${key}: ${channel}: ${text}`);
 		try {
 			const rec = records().get(key);
 			const ep = openEpisode(rec);
-			const changed = ep !== null ? errorChanged(ep, channel, text) : !(rec?.pending?.channel === channel && rec.pending.text === text);
+			const changed = prior !== undefined ? prior !== text : ep !== null ? errorChanged(ep, channel, text) : !(rec?.pending?.channel === channel && rec.pending.text === text);
 			if (changed) alertRow(key, { row: "error", channel, text });
 		} catch (writeErr) {
 			problem(`${key}: the error row for ${channel} (${text}) could not be written: ${errText(writeErr)}`);
@@ -267,10 +272,23 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 						waits.push(step.text);
 						continue;
 					}
-					if (step.do === "terminate" || step.do === "kill") {
-						const sig = step.do === "terminate" ? "SIGTERM" : "SIGKILL";
-						failed.push(...signal(step.members, sig));
-						waits.push(`${sig} sent to ${step.members.map((p) => p.pid).join(", ")}`);
+					if (step.do === "kill") {
+						// Each member's SIGKILL outcome is its own row: `killed` only for the members it reached, so a failed one
+						// is tried again on the next pass, up to LEGACY_KILL_ATTEMPTS (review r2 N5).
+						const outcomes = step.members.map((p) => ({ p, error: signalOne(p, "SIGKILL") }));
+						const reached = outcomes.filter((o) => o.error === null).map((o) => o.p);
+						if (reached.length > 0) alertRow(key, { row: "legacy-popup", text: legacyKilledText(reached, now) });
+						for (const o of outcomes) {
+							if (o.error === null) continue;
+							alertRow(key, { row: "legacy-popup", text: legacyKillFailedText(o.p, now, o.error) });
+							failed.push(`SIGKILL ${o.p.pid}: ${o.error}`);
+						}
+						waits.push(`SIGKILL sent to ${step.members.map((p) => p.pid).join(", ")}`);
+						continue;
+					}
+					if (step.do === "terminate") {
+						failed.push(...signal(step.members, "SIGTERM"));
+						waits.push(`SIGTERM sent to ${step.members.map((p) => p.pid).join(", ")}`);
 					}
 					alertRow(key, { row: "legacy-popup", text: step.text });
 				}
@@ -405,7 +423,9 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 		}
 	}
 	// Merged legacy issues: a pointer comment, the close, then `merged-closed` (r5 #1); retried on every pass until each is
-	// done, after its episode closed too (review r1 #5).
+	// done, after its episode closed or was acked too (review r1 #5). A failure is the merged issue's own error row
+	// (`mergedChannel`): it binds to this episode whatever episode is open, and stays on needs-you until `merged-closed`
+	// (review r2 N4, N6).
 	const mergeCleanup = (key: string, ep: AlertEpisode): void => {
 		for (const [url, m] of ep.merged) {
 			if (m.closedAt !== null) continue;
@@ -417,7 +437,7 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 				say(`${key}: ${url} closed, merged into ${m.into}`);
 			} catch (err) {
 				stopped.add(key);
-				keyError(key, err instanceof GhError ? "gh" : "pass", err);
+				keyError(key, mergedChannel(url), `${err instanceof GhError ? "gh" : "pass"}: ${errText(err)}`, m.error?.text ?? null);
 				return;
 			}
 		}
@@ -504,17 +524,22 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 		say(`${s.key}: level ${level} on ${url}`);
 	}
 
+	/** SIGTERM or SIGKILL one member: null when sent (or it was already gone), else the error. */
+	function signalOne(p: Proc, sig: "SIGTERM" | "SIGKILL"): string | null {
+		try {
+			d.popup.kill(p.pid, sig);
+			return null;
+		} catch (err) {
+			return errText(err);
+		}
+	}
+
 	/** SIGTERM or SIGKILL each member; the failures, each naming its pid. */
 	function signal(members: readonly Proc[], sig: "SIGTERM" | "SIGKILL"): string[] {
-		const failed: string[] = [];
-		for (const p of members) {
-			try {
-				d.popup.kill(p.pid, sig);
-			} catch (err) {
-				failed.push(`${sig} ${p.pid}: ${errText(err)}`);
-			}
-		}
-		return failed;
+		return members.flatMap((p) => {
+			const error = signalOne(p, sig);
+			return error === null ? [] : [`${sig} ${p.pid}: ${error}`];
+		});
 	}
 
 	/** Step 5: settle every unsettled attempt, then spawn a worker for each sent level with a popup that has none. */
@@ -656,7 +681,9 @@ export function realAlertLock(ledger: Ledger, path: string): AlertLock {
 
 /**
  * One pass under the lock. Returns null when another pass holds it (one log line; the next tick or kick does the work), else
- * the pass's result. The lock is released whatever the pass did; a release failure never hides the pass's own error.
+ * the pass's result. The lock is released whatever the pass did. A release failure (the lock unreadable or not removable,
+ * review r2 N3) is logged and is one more of the result's problems; when the pass itself threw, both are thrown together,
+ * the pass's error first.
  */
 export function lockedAlertPass(d: AlertPassDeps, lock: AlertLock): AlertPassResult | null {
 	const held = lock();
@@ -674,8 +701,10 @@ export function lockedAlertPass(d: AlertPassDeps, lock: AlertLock): AlertPassRes
 	try {
 		held.release();
 	} catch (err) {
+		const line = `alert pass: releasing the lock failed: ${errText(err)}`;
+		d.log(line);
 		if (passErr !== undefined) throw new AggregateError([passErr, err], `alert pass failed: ${errText(passErr)}; releasing its lock also failed: ${errText(err)}`);
-		throw new Error(`alert pass: releasing the lock failed: ${errText(err)}`);
+		result!.problems.push(line);
 	}
 	if (passErr !== undefined) throw passErr;
 	return result!;

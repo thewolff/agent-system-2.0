@@ -80,6 +80,13 @@ export interface QuotaWatchResult {
 	log: string[];
 	/** `quota watch: <what broke>` when this pass's read or write failed, for the needs-you line; else null. */
 	error: string | null;
+	/**
+	 * True when `subjects` is not this pass's evaluation of the quota: the plist check, the saved state's read or decode,
+	 * or the usage read failed (now, or in the attempt a pass under the poll gap repeats). The alert pass then holds every
+	 * open quota episode unchanged, as for any source that could not be read (review r2 N1). False for a pass that
+	 * evaluated, even when it found nothing or only a later write failed.
+	 */
+	unavailable: boolean;
 }
 
 /** One poll line's limit, field for field as watch.py writes it. */
@@ -313,11 +320,11 @@ export function runQuotaWatch(deps: QuotaWatchDeps): QuotaWatchResult {
 		installed = deps.plistInstalled();
 	} catch (e) {
 		const error = `quota watch: cannot tell whether Plumb's watcher (${QUOTA_WATCH_PLIST_LABEL}.plist) is installed, so no poll this pass: ${message(e)}`;
-		return { subjects: [], log: [error], error };
+		return { subjects: [], log: [error], error, unavailable: true };
 	}
 	if (installed) {
 		log.push(`quota watch: Plumb's watcher is still installed (~/Library/LaunchAgents/${QUOTA_WATCH_PLIST_LABEL}.plist); it polls, so this step raises nothing`);
-		return { subjects: [], log, error: null };
+		return { subjects: [], log, error: null, unavailable: false };
 	}
 
 	const statePath = join(deps.dir, STATE_FILE);
@@ -338,13 +345,13 @@ export function runQuotaWatch(deps: QuotaWatchDeps): QuotaWatchResult {
 		lastError = typeof le === "string" ? le : null;
 	} catch (e) {
 		const error = `quota watch: ${message(e)}`;
-		return { subjects: [], log: [...log, error], error };
+		return { subjects: [], log: [...log, error], error, unavailable: true };
 	}
 
 	const sinceAttempt = nowS - lastAttempt;
 	if (sinceAttempt >= 0 && sinceAttempt < MIN_POLL_GAP_S) {
 		log.push(`quota watch: last poll attempt ${Math.round(sinceAttempt)} s ago (under ${MIN_POLL_GAP_S} s); no poll this pass`);
-		return { subjects: activeSubjects(alerts, nowS), log, error: lastError ? `quota watch: ${lastError} (the attempt ${Math.round(sinceAttempt)} s ago)` : null };
+		return { subjects: activeSubjects(alerts, nowS), log, error: lastError ? `quota watch: ${lastError} (the attempt ${Math.round(sinceAttempt)} s ago)` : null, unavailable: lastError !== null };
 	}
 	state[LAST_ATTEMPT] = nowS;
 
@@ -405,5 +412,5 @@ export function runQuotaWatch(deps: QuotaWatchDeps): QuotaWatchResult {
 	}
 	const error = errors.length > 0 ? `quota watch: ${errors.join("; ")}` : null;
 	if (error) log.push(error);
-	return { subjects: activeSubjects(alerts, nowS), log, error };
+	return { subjects: activeSubjects(alerts, nowS), log, error, unavailable: snap === null };
 }

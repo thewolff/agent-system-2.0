@@ -221,8 +221,12 @@ export interface AlertEpisode {
 	sent: Map<number, string>;
 	/** The newest error per channel (`gh`, `popup`, …). */
 	errors: Map<string, { text: string; at: string; id: string }>;
-	/** Each legacy issue merged into this one: its canonical url, and when `merged-closed` was written. */
-	merged: Map<string, { into: string; closedAt: string | null }>;
+	/**
+	 * Each legacy issue merged into this one: its canonical url, when `merged-closed` was written, and the newest cleanup error
+	 * (an `error merged:<url>` row) while it is not closed. Both bind to this episode whatever episode of the key is open
+	 * (review r2 N4), and the error is on the needs-you surface until `merged-closed`, acked or closed episode alike (N6).
+	 */
+	merged: Map<string, { into: string; closedAt: string | null; error: { text: string; at: string; id: string } | null }>;
 	acked: { why: string; at: string } | null;
 	closed: { why: string; at: string } | null;
 }
@@ -241,11 +245,16 @@ export interface AlertKeyRecord {
 	pending: { channel: string; text: string; at: string; id: string } | null;
 }
 
+/** The error channel of a merged issue's cleanup (`error merged:<url> <text>`): it binds to the episode that merged `url`. */
+const MERGED_CHANNEL = "merged:";
+export const mergedChannel = (url: string): string => `${MERGED_CHANNEL}${url}`;
+
 /**
  * Every key's record among the standing workload's control entries (`alert:`, valid only from ALERT_BY), oldest first. One
  * episode per key at a time: a `raised` or `adopted` row while an episode is open is kept as a loose row and opens nothing;
- * a row after `closed` that is not a new opening is loose too, except a `merged-closed` for an issue an earlier episode
- * merged, which completes that episode's cleanup (review r1 #5).
+ * a row after `closed` that is not a new opening is loose too. A `merged-closed` row, and an `error` row on a merged issue's
+ * channel (`mergedChannel`), go to the newest episode that merged that issue and has not closed it, open or not, whatever
+ * episode is open now (review r1 #5, r2 N4); with no such episode they are loose.
  */
 export function alertRecords(control: readonly ControlEntry[]): Map<string, AlertKeyRecord> {
 	const out = new Map<string, AlertKeyRecord>();
@@ -258,6 +267,14 @@ export function alertRecords(control: readonly ControlEntry[]): Map<string, Aler
 		const entry: AlertRowEntry = { id: c.id, at: c.createdAt, key: p.key, row: p.row };
 		const open = openEpisode(rec);
 		const r = p.row;
+		const mergedUrl = r.row === "merged-closed" ? r.url : r.row === "error" && r.channel.startsWith(MERGED_CHANNEL) ? r.channel.slice(MERGED_CHANNEL.length) : null;
+		if (mergedUrl !== null) {
+			const m = rec.episodes.findLast((e) => e.merged.get(mergedUrl)?.closedAt === null)?.merged.get(mergedUrl);
+			if (m === undefined) rec.loose.push(entry);
+			else if (r.row === "merged-closed") m.closedAt = c.createdAt;
+			else if (r.row === "error") m.error = { text: r.text, at: c.createdAt, id: c.id };
+			continue;
+		}
 		rec.pending = open === null && r.row === "error" ? { channel: r.channel, text: r.text, at: c.createdAt, id: c.id } : null;
 		if (r.row === "raised" || r.row === "adopted") {
 			if (open !== null) {
@@ -279,9 +296,7 @@ export function alertRecords(control: readonly ControlEntry[]): Map<string, Aler
 			continue;
 		}
 		if (open === null) {
-			const done = r.row === "merged-closed" ? rec.episodes.findLast((e) => e.merged.get(r.url)?.closedAt === null)?.merged.get(r.url) : undefined;
-			if (done !== undefined) done.closedAt = c.createdAt;
-			else rec.loose.push(entry);
+			rec.loose.push(entry);
 			continue;
 		}
 		switch (r.row) {
@@ -301,14 +316,8 @@ export function alertRecords(control: readonly ControlEntry[]): Map<string, Aler
 				open.errors.set(r.channel, { text: r.text, at: c.createdAt, id: c.id });
 				break;
 			case "merged":
-				if (!open.merged.has(r.url)) open.merged.set(r.url, { into: r.into, closedAt: null });
+				if (!open.merged.has(r.url)) open.merged.set(r.url, { into: r.into, closedAt: null, error: null });
 				break;
-			case "merged-closed": {
-				const m = open.merged.get(r.url);
-				if (m === undefined) rec.loose.push(entry);
-				else m.closedAt ??= c.createdAt;
-				break;
-			}
 			case "legacy-popup":
 				rec.loose.push(entry);
 				break;

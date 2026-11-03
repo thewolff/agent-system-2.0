@@ -117,14 +117,17 @@ export interface RunnerIdentity {
 	start: string;
 }
 
-/** The lock file's owner: null when there is no file, `unreadable` when its content is not a pid and a start time. */
+/**
+ * The lock file's owner: null when there is no file (ENOENT), `unreadable` when its content is not a pid and a start time.
+ * Any other read failure (a directory in its place, EACCES, EIO) throws, naming the lock path and the error (review r2 N3).
+ */
 function lockOwner(path: string): RunnerIdentity | null | "unreadable" {
 	let text: string;
 	try {
 		text = readFileSync(path, "utf8");
 	} catch (err) {
 		if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-		throw err;
+		throw new Error(`run lock ${path}: its owner could not be read: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
 	}
 	try {
 		const o = JSON.parse(text) as { pid?: unknown; start?: unknown };
@@ -139,7 +142,8 @@ function lockOwner(path: string): RunnerIdentity | null | "unreadable" {
  * A run lock this runner took. `held` re-reads the file: true while no other runner holds the lane id, that is while the
  * file names `self`, or while it is gone (removed under the runner, as with its lane dir) and nobody has taken it since;
  * false once it names another runner or names none. `owns` is the strict read the spawn needs (`startAsOwner`): true only
- * while the file exists and names `self`. `release` removes the file only while it names `self`.
+ * while the file exists and names `self`. `release` removes the file only while it names `self`. A failure to read the file
+ * (anything but its absence) or to remove it throws from each, naming the lock path: never read as "not mine".
  */
 export interface RunnerLock {
 	path: string;
@@ -148,6 +152,7 @@ export interface RunnerLock {
 	tookOver: { owner: RunnerIdentity; state: "gone" | "other" } | null;
 	held(): boolean;
 	owns(): boolean;
+	/** Removes the file while it names `self`; a no-op when it is gone or names another; throws when it cannot be read or removed. */
 	release(): void;
 }
 
@@ -162,14 +167,13 @@ export interface LockRefusal {
 }
 
 function heldLock(path: string, self: RunnerIdentity, tookOver: RunnerLock["tookOver"]): RunnerLock {
-	/** Whether the file names this runner: null when there is no file, false when it names another runner or none. */
+	/**
+	 * Whether the file names this runner: null when there is no file, false when it names another runner or none. A read
+	 * failure throws (lockOwner), so a file this runner cannot read is never mistaken for one it does not own (review r2 N3).
+	 */
 	const mine = (): boolean | null => {
-		try {
-			const o = lockOwner(path);
-			return o === null ? null : o !== "unreadable" && o.pid === self.pid && o.start === self.start;
-		} catch {
-			return false;
-		}
+		const o = lockOwner(path);
+		return o === null ? null : o !== "unreadable" && o.pid === self.pid && o.start === self.start;
 	};
 	return {
 		path, self, tookOver,
@@ -177,7 +181,13 @@ function heldLock(path: string, self: RunnerIdentity, tookOver: RunnerLock["took
 		owns: () => mine() === true,
 		// No other runner replaces a lock whose owner is alive, so the file read as this runner's is still this runner's at the rm.
 		release: () => {
-			if (mine() === true) rmSync(path, { force: true });
+			if (mine() !== true) return;
+			try {
+				rmSync(path);
+			} catch (err) {
+				if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+				throw new Error(`run lock ${path}: it names this process but could not be removed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+			}
 		},
 	};
 }
