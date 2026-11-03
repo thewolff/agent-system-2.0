@@ -72,7 +72,7 @@ describe("launch predicate matrix (§ 3 states)", () => {
 
 describe("awaiting close: the holder's done-because: stands (L1, the by-hand wasted launch)", () => {
 	const rows = (w: WorkloadRow, entries: EntryRow[], holders: string[] = []): ReserveRows => ({
-		workload: w, entries, questions: [], instructions: [], slices: [], holders, liveLanes: 0, capExempt: false, cap: 3, now: NOW,
+		workload: w, entries, questions: [], instructions: [], slices: [], holders, holderChanges: [], liveLanes: 0, capExempt: false, cap: 3, now: NOW,
 	});
 	const done = (by: string) => entry(by, "done-because: all five slices done");
 	test("a by-hand holder's receipt, no launch: history: the ledger's recorded holder makes it the holder's; nothing launches", () => {
@@ -834,7 +834,7 @@ describe("withdrawn: Jo's `withdraw <wl>` word (PLAN wl-mv8s939084z1ts D3, D6)",
 	});
 	const word = jo("in-1", withdrawInstructionBody("wl-m"));
 	const rows = (w: WorkloadRow, entries: EntryRow[], instructions: InstructionRow[] = [word], holders: string[] = []): ReserveRows => ({
-		workload: w, entries, questions: [], instructions, slices: [], holders, liveLanes: 0, capExempt: false, cap: 3, now: NOW,
+		workload: w, entries, questions: [], instructions, slices: [], holders, holderChanges: [], liveLanes: 0, capExempt: false, cap: 3, now: NOW,
 	});
 
 	test("the surface's entry naming Jo's instruction on the workload stands; the newest valid one wins", () => {
@@ -961,7 +961,7 @@ describe("cap-exempt launch predicate (PLAN wl-mvpsrr4tr0p1xc D1)", () => {
 
 	test("verdictOf passes the rows' capExempt through", () => {
 		const rows = (capExempt: boolean): ReserveRows => ({
-			workload: workload(), entries: [], questions: [], instructions: [], slices: [], holders: [], liveLanes: 3, capExempt, cap: 3, now: NOW,
+			workload: workload(), entries: [], questions: [], instructions: [], slices: [], holders: [], holderChanges: [], liveLanes: 3, capExempt, cap: 3, now: NOW,
 		});
 		expect(verdictOf(rows(false))).toEqual({ launch: false, reason: "cap" });
 		expect(verdictOf(rows(true))).toEqual({ launch: true, cause: { kind: "first" } });
@@ -1163,7 +1163,7 @@ describe("priority pause: the state and its cause (PLAN wl-mv8wzytml878b4 D3, T4
 		expect(verdict([...rows, req])).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
 		const withReceipt = [...rows, entry("lane-m-1", "done-because: all done")];
 		const reserve: ReserveRows = {
-			workload: workload(), entries: withReceipt, questions: [], instructions: [], slices: [], holders: [], liveLanes: 0, capExempt: false, cap: 3, now: NOW,
+			workload: workload(), entries: withReceipt, questions: [], instructions: [], slices: [], holders: [], holderChanges: [], liveLanes: 0, capExempt: false, cap: 3, now: NOW,
 		};
 		expect(verdictOf(reserve)).toEqual({ launch: false, reason: "awaiting-close" });
 		expect(verdict(rows, { holder: "lane-m-2", holder_lease_until: "2026-10-01T10:05:00.000Z" })).toEqual({ launch: false, reason: "held" });
@@ -1245,7 +1245,7 @@ describe("a merge train's daily budget in the launch predicate (PLAN wl-mvr888nf
 	const joRequest = (iso: string) => at(iso, SURFACE_BY, launchRequestedBody("jo", iso));
 	const tried = () => at("2026-10-01T08:00:00.000Z", LANE_STARTER_BY, "launch: lane-m-1 cause first requested-by jo");
 	const rows = (entries: EntryRow[], over: Partial<ReserveRows> = {}): ReserveRows => ({
-		workload: workload(), entries, questions: [], instructions: [], slices: [], holders: [], liveLanes: 0, capExempt: true, cap: 3, now: NOW, ...over,
+		workload: workload(), entries, questions: [], instructions: [], slices: [], holders: [], holderChanges: [], liveLanes: 0, capExempt: true, cap: 3, now: NOW, ...over,
 	});
 	/** The tick's question on pause `p`'s budget slice, answered by Jo with `answer` when given. */
 	const askedOf = (p: EntryRow, answer: string | null): Pick<ReserveRows, "questions" | "instructions"> => {
@@ -1325,7 +1325,7 @@ describe("a merge train's daily budget in the launch predicate (PLAN wl-mvr888nf
 
 describe("a merge train is refused by hand (PLAN wl-mvr888nftz0vcl D5)", () => {
 	const rows = (w: WorkloadRow, capExempt: boolean): ReserveRows => ({
-		workload: w, entries: [], questions: [], instructions: [], slices: [], holders: [], liveLanes: 0, capExempt, cap: 3, now: NOW,
+		workload: w, entries: [], questions: [], instructions: [], slices: [], holders: [], holderChanges: [], liveLanes: 0, capExempt, cap: 3, now: NOW,
 	});
 	test("`as2 lane <train>` is refused train-autonomous in either mode; closed comes first; a non-train decides as before", () => {
 		const no = { launch: false, reason: "train-autonomous" };
