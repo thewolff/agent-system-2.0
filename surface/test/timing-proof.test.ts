@@ -64,24 +64,25 @@ describe("executed-case and hook evidence", () => {
 		m.files[0]!.hooks.candidate.cleanup.push("reaped");
 		expect(() => proofEvidence(m, i, xml(["new", "split"]), "")).toThrow("cleanup");
 	});
-	test("a repeated JUnit identity takes its ordinal in JUnit order, and every occurrence is checked on its own", () => {
+	test("a repeated skipped JUnit identity takes its ordinal in JUnit order; a repeated executed identity is refused", () => {
 		const f = fixture();
-		const repeated = (skipped: Record<"base" | "candidate", string[]>) => ({ ...f, files: [{ ...f.files[0]!, cases: [{ base: ["run", "run [2]"], candidate: ["run", "run [2]"], budgetMs: 5000, timingUnderTest: false }], skipped }] });
+		const repeated = (skipped: Record<"base" | "candidate", string[]>) => ({ ...f, files: [{ ...f.files[0]!, cases: [{ base: ["run"], candidate: ["run"], budgetMs: 5000, timingUnderTest: false }], skipped }] });
 		const m = parseProofManifest(repeated({ base: ["(unnamed)", "(unnamed) [2]"], candidate: ["(unnamed)", "(unnamed) [2]"] }));
 		const i = { phase: "candidate" as const, file: "a.test.ts" };
-		const green: [string, "pass" | "fail" | "skip"][] = [["run", "pass"], ["(unnamed)", "skip"], ["run", "pass"], ["(unnamed)", "skip"]];
-		expect(proofEvidence(m, i, report(green), "").cases.map((c) => c.identity)).toEqual(["a.test.ts > run", "a.test.ts > (unnamed)", "a.test.ts > run [2]", "a.test.ts > (unnamed) [2]"]);
-		expect(proofEvidence(m, { ...i, phase: "base" }, report(green), "").cases).toHaveLength(4);
-		// A dropped skipped occurrence, a third one, a repeat that now runs and a repeat that is now skipped are each refused.
-		expect(() => proofEvidence(m, i, report(green.slice(0, 3)), "")).toThrow("a.test.ts > (unnamed) [2]: frozen skipped case changed");
+		const green: [string, "pass" | "fail" | "skip"][] = [["run", "pass"], ["(unnamed)", "skip"], ["(unnamed)", "skip"]];
+		expect(proofEvidence(m, i, report(green), "").cases.map((c) => c.identity)).toEqual(["a.test.ts > run", "a.test.ts > (unnamed)", "a.test.ts > (unnamed) [2]"]);
+		expect(proofEvidence(m, { ...i, phase: "base" }, report(green), "").cases).toHaveLength(3);
+		// A dropped skipped occurrence, a third one and a repeat that now runs are each refused.
+		expect(() => proofEvidence(m, i, report(green.slice(0, 2)), "")).toThrow("a.test.ts > (unnamed) [2]: frozen skipped case changed");
 		expect(() => proofEvidence(m, i, report([...green, ["(unnamed)", "skip"]]), "")).toThrow("a.test.ts > (unnamed) [3]: unexpected JUnit case");
-		expect(() => proofEvidence(m, i, report([...green.slice(0, 3), ["(unnamed)", "pass"]]), "")).toThrow("a.test.ts > (unnamed) [2]: frozen skipped case changed");
-		expect(() => proofEvidence(m, i, report([...green.slice(0, 2), ["run", "skip"], ["(unnamed)", "skip"]]), "")).toThrow("a.test.ts > run [2]: expected exactly one EXECUTED case (skip)");
-		// Each executed occurrence is held to the candidate's pass on its own.
-		expect(() => proofEvidence(m, i, report([green[0]!, green[1]!, ["run", "fail"], green[3]!]), "")).toThrow("a.test.ts > run [2]: candidate case failed");
-		expect(() => proofEvidence(m, i, report([["run", "fail"], ...green.slice(1)]), "")).toThrow("a.test.ts > run: candidate case failed");
+		expect(() => proofEvidence(m, i, report([green[0]!, green[1]!, ["(unnamed)", "pass"]]), "")).toThrow("a.test.ts > (unnamed): duplicate JUnit case");
+		// Two executed cases of one identity have no stable discriminator: refused in either phase, whatever their times, and with a skipped twin.
+		for (const phase of ["base", "candidate"] as const) {
+			expect(() => proofEvidence(m, { ...i, phase }, report([["run", "pass"], ["run", "pass"], green[1]!, green[2]!]), "")).toThrow("a.test.ts > run: duplicate JUnit case");
+			expect(() => proofEvidence(m, { ...i, phase }, report([["run", "pass"], ["run", "skip"], green[1]!, green[2]!]), "")).toThrow("a.test.ts > run: duplicate JUnit case");
+		}
 		// An ordinal that collides with a case literally named so is a duplicate, and a manifest list still refuses a true duplicate.
-		expect(() => proofEvidence(m, i, report([["run", "pass"], ["run [2]", "pass"], ["run", "pass"]]), "")).toThrow("a.test.ts > run [2]: duplicate JUnit case");
+		expect(() => proofEvidence(m, i, report([["(unnamed)", "skip"], ["(unnamed) [2]", "skip"], ["(unnamed)", "skip"], ["run", "pass"]]), "")).toThrow("a.test.ts > (unnamed) [2]: duplicate JUnit case");
 		expect(() => parseProofManifest(repeated({ base: ["(unnamed)", "(unnamed)"], candidate: [] }))).toThrow("duplicate identity");
 	});
 });

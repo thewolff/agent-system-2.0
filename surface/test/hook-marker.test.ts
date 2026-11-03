@@ -36,8 +36,10 @@ const EXEC = join(SCRIPTS, "test-exec.ts");
 /**
  * The preload in the writer's process: it holds every hooks-directory writeFileSync half written until the test releases
  * it, and announces the writer's first look for a hooks-directory `.go` (the hook has published) in the wait directory.
- * Its own signal files (`held-N`, `waiting`) appear whole: written beside, then renamed in, so the test that sees the
- * name reads the full path (hosted Linux read `waiting` empty between its create and its write, run 41593591693).
+ * Its own signal files (`held-N`, `waiting`) appear whole and in one event: written in the box directory, which nothing
+ * watches, then renamed into the watched one. A plain write let hosted Linux read `waiting` empty between its create and
+ * its write (run 41593591693); a temporary file beside it gave the watcher two events within a millisecond, which Bun
+ * 1.3.14's fs.watch can collapse (sl-lf-marker-linux), and the next hosted Linux run's synchronous case hung (run 41595494185).
  */
 const SEAM = `const fs = require("node:fs");
 const { dirname, join } = require("node:path");
@@ -45,7 +47,7 @@ const { hooks, seam, wait } = JSON.parse(process.env.HOOK_MARKER_SEAM);
 const plain = fs.writeFileSync;
 const exists = fs.existsSync;
 const signal = (path, text) => {
-	const temp = join(dirname(path), "." + process.pid + ".tmp");
+	const temp = join(dirname(dirname(path)), "." + process.pid + ".signal");
 	plain(temp, text);
 	fs.renameSync(temp, path);
 };

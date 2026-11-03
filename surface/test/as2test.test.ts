@@ -22,7 +22,7 @@ import {
 	bundleInputs, CAPTURE_MS, CREDENTIAL_PATHS, execArgv, execConfigOf, type InstallVerdict, installDecision, installLayout, parseSource, preflightDecision,
 	preflightProbes, probeCall, probeDecision, readInstall, renderExecWrapper, type SweepScope, UID_SWEEP, WrapperRenderError,
 } from "../src/as2test";
-import { snapshot, STUCK_DEFAULTS } from "../src/stuck-detect";
+import { type Proc, snapshot, STUCK_DEFAULTS } from "../src/stuck-detect";
 import { AS2TEST_USER, CHILD_ENV_ALLOWLIST, childEnv, partResult, WRAPPER_EXIT, type WrapperCall } from "../src/test-run";
 import { tmp, unreapedTrue } from "./helpers";
 
@@ -62,15 +62,20 @@ function unseal(p: string): void {
 }
 
 /**
- * What one case made: its tmp directories, the subprocesses it spawned, and the other processes it took (each pid with the
- * start time `ps` gave when the case took it, its identity: a pid already gone then is never signalled, and a pid that names
- * another process by release is left alone). The case's own wrapper (`test` below) releases them inside the case's own time.
+ * What one case made: its tmp directories, the subprocesses it spawned, the other processes it took (each pid with the
+ * start time the process list gave when the case took it, its identity: a pid already gone then is never signalled, and a
+ * pid that names another process by release is left alone), the process groups it took through a member it saw in them,
+ * and the gates (FIFOs) and hook dirs it made. The case's own wrapper (`test` below) releases them inside the case's own time.
  */
 interface Owned {
 	name: string;
 	dirs: string[];
 	subprocs: { pid: number; exitCode: number | null; signalCode: string | null; exited: Promise<number>; kill(signal?: NodeJS.Signals): void }[];
 	procs: { pid: number; started: number }[];
+	/** A group is the case's while a member it took (pid, start time) is still in it: then the group never ceased to exist. */
+	groups: { pgid: number; pid: number; started: number }[];
+	gates: string[];
+	hooks: string[];
 }
 let owner: Owned | null = null;
 function owning(what: string): Owned {
@@ -78,16 +83,18 @@ function owning(what: string): Owned {
 	return owner;
 }
 
-/**
- * `pid → start time (µs)` for those of `list` that exist now (a zombie exists), from the detector's own spawn-free process
- * list (`snapshot`, sysctl KERN_PROC_UID): no ps, which a sandboxed run may not spawn.
- */
+/** This user's processes now, from the detector's own spawn-free process list (`snapshot`, sysctl KERN_PROC_UID): no ps. */
+function processes(what: string): Proc[] {
+	const s = snapshot(process.getuid!());
+	if (s.kind !== "ok") throw new Error(`the process list for ${what} is ${s.kind}: ${s.why}`);
+	return s.procs;
+}
+
+/** `pid → start time (µs)` for those of `list` that exist now (a zombie exists). */
 function startTimes(list: number[]): Map<number, number> {
 	const out = new Map<number, number>();
 	if (list.length === 0) return out;
-	const s = snapshot(process.getuid!());
-	if (s.kind !== "ok") throw new Error(`the process list for pids ${list.join(", ")} is ${s.kind}: ${s.why}`);
-	for (const p of s.procs) if (list.includes(p.pid)) out.set(p.pid, p.startUs);
+	for (const p of processes(`pids ${list.join(", ")}`)) if (list.includes(p.pid)) out.set(p.pid, p.startUs);
 	return out;
 }
 
@@ -98,68 +105,193 @@ function own(...list: number[]): void {
 }
 
 /**
- * Release what `o` owns: SIGKILL each subprocess still running and each taken process that is still the one taken, await
- * every exit (a subprocess's `exited`, any other process's kernel exit event through `exitOf`), then unseal and remove its
- * directories. Every failure is returned, none stops the rest.
+ * The process groups that are never the case's: this test process's and every ancestor's. A process the case owns may
+ * share them (a subprocess spawned without a group of its own); it is then killed by pid, never by its group.
  */
-async function release(o: Owned): Promise<Error[]> {
+function foreignGroups(procs: Proc[]): Set<number> {
+	const byPid = new Map(procs.map((p) => [p.pid, p]));
+	if (!byPid.has(process.pid)) throw new Error(`this test process (pid ${process.pid}) is not in its own process list; no group can be told apart from its own`);
+	const out = new Set<number>([0, 1]);
+	for (let p = byPid.get(process.pid); p !== undefined && !out.has(p.pid); p = byPid.get(p.ppid)) out.add(p.pgid);
+	return out;
+}
+
+/**
+ * The current case owns these fixture processes and the process group each is in (unless that group is the test process's
+ * own or an ancestor's): taken as soon as a fixture publishes the pid, so a case that fails before its normal end still
+ * kills the group (every worker and child in it) and awaits its exit.
+ */
+function ownWithGroup(...list: number[]): void {
+	const o = owning(`a fixture process and its group (${list.join(", ")})`);
+	const procs = processes(`pids ${list.join(", ")}`);
+	const foreign = foreignGroups(procs);
+	for (const p of procs) {
+		if (!list.includes(p.pid)) continue;
+		o.procs.push({ pid: p.pid, started: p.startUs });
+		if (!foreign.has(p.pgid)) o.groups.push({ pgid: p.pgid, pid: p.pid, started: p.startUs });
+	}
+}
+
+/**
+ * What `o` owns in the process list `procs`: each taken process still the one taken, each live subprocess (unreaped, so its
+ * pid is still ours), and every descendant of those (born no earlier than its parent); the groups to kill, each proved by
+ * an owned process in it now; and the groups taken earlier that still have live members but no owned one, which are left
+ * alone and reported.
+ */
+interface OwnedNow {
+	pids: Proc[];
+	groups: number[];
+	unproven: string[];
+}
+function ownedIn(o: Owned, procs: Proc[]): OwnedNow {
+	const byPid = new Map(procs.map((p) => [p.pid, p]));
+	const children = new Map<number, Proc[]>();
+	for (const p of procs) children.set(p.ppid, [...(children.get(p.ppid) ?? []), p]);
+	const mine = new Map<number, Proc>();
+	const take = (p: Proc | undefined) => {
+		if (p === undefined || mine.has(p.pid)) return;
+		mine.set(p.pid, p);
+		for (const c of children.get(p.pid) ?? []) if (c.startUs >= p.startUs) take(c);
+	};
+	for (const t of [...o.procs, ...o.groups]) if (byPid.get(t.pid)?.startUs === t.started) take(byPid.get(t.pid));
+	for (const s of o.subprocs) if (s.exitCode === null && s.signalCode === null) take(byPid.get(s.pid));
+	const foreign = foreignGroups(procs);
+	const groups = [...new Set([...mine.values()].map((p) => p.pgid))].filter((g) => !foreign.has(g));
+	const unproven = [...new Set(o.groups.map((g) => g.pgid))].filter((g) => !groups.includes(g) && !foreign.has(g)).flatMap((g) => {
+		const live = procs.filter((p) => p.pgid === g && !p.zombie);
+		return live.length === 0 ? [] : [`group ${g} still has ${live.map((p) => `${p.pid} (${p.comm})`).join(", ")}, and no process the case took is in it any more: left alone, not provably the case's`];
+	});
+	return { pids: [...mine.values()], groups, unproven };
+}
+
+/** At most this many looks at the process list after the kill, each after awaiting the exit of every member it still saw. */
+const RELEASE_LOOKS = 3;
+
+/**
+ * Release what `o` owns: SIGKILL every owned process group (killpg) and every other owned process still the one taken, and
+ * each subprocess still running; then let through every gate (FIFO) and hook the case made, for a holder the case could not
+ * prove its own; await every exit (a subprocess's `exited`, any other process's kernel exit event through `exitOf`) and
+ * check the process list until no killed group has a live member. Then the case's directories are removed, unless `keep`
+ * (the case failed) or the release itself failed: a failed world keeps its logs, and `kept` says so. Every failure is
+ * returned, none stops the rest.
+ */
+async function release(o: Owned, keep: boolean): Promise<{ errors: Error[]; kept: boolean }> {
 	const errors: Error[] = [];
 	const failed = (what: string, error: unknown) => errors.push(new Error(`${what}: ${error instanceof Error ? error.message : String(error)}`, { cause: error }));
+	let owned: OwnedNow = { pids: [], groups: [], unproven: [] };
+	try {
+		owned = ownedIn(o, processes(`releasing what "${o.name}" owned`));
+	} catch (error) {
+		failed("reading what the case owns from the process list", error);
+	}
+	for (const u of owned.unproven) failed("an owned process group", new Error(u));
+	const killedGroups: number[] = [];
+	for (const g of owned.groups) {
+		try {
+			process.kill(-g, "SIGKILL");
+			killedGroups.push(g);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ESRCH") failed(`SIGKILL process group ${g}`, error);
+		}
+	}
+	const live = (p: { exitCode: number | null; signalCode: string | null }) => p.exitCode === null && p.signalCode === null;
+	const subprocPids = new Set(o.subprocs.map((p) => p.pid));
+	const killed: number[] = [];
+	for (const p of owned.pids) {
+		if (killedGroups.includes(p.pgid) || subprocPids.has(p.pid) || p.zombie) continue;
+		try {
+			process.kill(p.pid, "SIGKILL");
+			killed.push(p.pid);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ESRCH") failed(`SIGKILL ${p.pid}`, error);
+		}
+	}
 	for (const p of o.subprocs) {
-		if (p.exitCode !== null || p.signalCode !== null) continue;
+		if (!live(p)) continue;
 		try {
 			p.kill("SIGKILL");
 		} catch (error) {
 			failed(`SIGKILL subprocess ${p.pid}`, error);
 		}
 	}
-	const killed: number[] = [];
-	let now = new Map<number, number>();
-	try {
-		now = startTimes([...new Set(o.procs.map((p) => p.pid))]);
-	} catch (error) {
-		failed("reading the start times of the owned processes", error);
-	}
-	for (const { pid, started } of o.procs) {
-		if (now.get(pid) !== started || killed.includes(pid)) continue;
+	// The gates and hooks a holder the case could not prove its own may still wait at.
+	for (const g of o.gates) {
 		try {
-			process.kill(pid, "SIGKILL");
-			killed.push(pid);
+			const fd = openSync(g, constants.O_WRONLY | constants.O_NONBLOCK);
+			try {
+				writeSync(fd, "\n");
+			} finally {
+				closeSync(fd);
+			}
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ESRCH") failed(`SIGKILL ${pid}`, error);
+			// ENXIO: no process has the FIFO open, so nobody waits at it; ENOENT: the case removed it.
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "ENXIO" && code !== "ENOENT") failed(`letting through the gate ${g}`, error);
 		}
 	}
-	const exits = await Promise.allSettled([...o.subprocs.map((p) => p.exited), ...killed.map((pid) => exitOf(pid))]);
+	for (const h of o.hooks) {
+		try {
+			for (const n of readdirSync(h)) if (n.endsWith(".pause") && !existsSync(join(h, `${n.slice(0, -".pause".length)}.go`))) writeFileSync(join(h, `${n.slice(0, -".pause".length)}.go`), "");
+		} catch (error) {
+			failed(`releasing the hooks in ${h}`, error);
+		}
+	}
+	const members = owned.pids.filter((p) => killedGroups.includes(p.pgid) && !p.zombie).map((p) => p.pid);
+	const exits = await Promise.allSettled([...o.subprocs.map((p) => p.exited), ...[...killed, ...members].map((pid) => exitOf(pid))]);
 	for (const e of exits) if (e.status === "rejected") failed("awaiting an owned process's exit", e.reason);
-	for (const d of o.dirs) {
+	// Verified exit: no killed group keeps a live member (one forked as the kill landed included).
+	for (let look = 1; killedGroups.length > 0; look++) {
+		let left: Proc[];
 		try {
-			unseal(d);
-			rmSync(d, { recursive: true, force: true });
+			left = processes(`the groups ${killedGroups.join(", ")} after their SIGKILL`).filter((p) => killedGroups.includes(p.pgid) && !p.zombie);
 		} catch (error) {
-			failed(`removing ${d}`, error);
+			failed("checking that the killed groups are empty", error);
+			break;
+		}
+		if (left.length === 0) break;
+		if (look === RELEASE_LOOKS) {
+			failed("verifying the killed groups' exit", new Error(`after ${RELEASE_LOOKS} looks, each awaiting the exit of what it saw, live members remain: ${left.map((p) => `${p.pid} (${p.comm}, group ${p.pgid})`).join(", ")}`));
+			break;
+		}
+		const waited = await Promise.allSettled(left.map((p) => exitOf(p.pid)));
+		for (const e of waited) if (e.status === "rejected") failed("awaiting a killed group member's exit", e.reason);
+	}
+	const kept = keep || errors.length > 0;
+	if (!kept) {
+		for (const d of o.dirs) {
+			try {
+				unseal(d);
+				rmSync(d, { recursive: true, force: true });
+			} catch (error) {
+				failed(`removing ${d}`, error);
+			}
 		}
 	}
-	return errors;
+	return { errors, kept };
 }
 
-/** A case whose `finally` bun test never ran (it timed out): its leftovers are released by the next case, or after the file. */
+const messageOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+const keptLine = (o: Owned): string => `the case's worlds are kept for diagnosis: ${o.dirs.length > 0 ? o.dirs.join(", ") : "(it made none)"}`;
+
+/** A case whose `finally` bun test never ran (it timed out, so it failed): its leftovers are released by the next case, or after the file; its worlds are kept. */
 async function releaseAbandoned(): Promise<void> {
 	const left = owner;
 	if (left === null) return;
 	owner = null;
-	const errors = await release(left);
-	if (errors.length > 0) throw new AggregateError(errors, `releasing what the abandoned case "${left.name}" owned failed: ${errors.map((e) => e.message).join("; ")}`);
+	const { errors } = await release(left, true);
+	console.error(`as2test.test.ts: the abandoned case "${left.name}" is released; ${keptLine(left)}`);
+	if (errors.length > 0) throw new AggregateError(errors, `releasing what the abandoned case "${left.name}" owned failed: ${errors.map(messageOf).join("; ")}; ${keptLine(left)}`);
 }
-afterAll(releaseAbandoned);
 
 /**
  * bun test's `test`, with the case owning what it makes: its body runs, then everything it owns is released and awaited
- * inside its own timeout. A body failure is rethrown as is; a release failure fails the case too, joined with the body's.
+ * inside its own timeout. A failed case keeps its worlds: the body's error is rethrown with their absolute paths added to
+ * its message; a release failure fails the case too, joined with the body's (whose message the joined one repeats).
  */
 function test(name: string, body: () => unknown, timeout?: number): void {
 	bunTest(name, async () => {
 		await releaseAbandoned();
-		const o: Owned = { name, dirs: [], subprocs: [], procs: [] };
+		const o: Owned = { name, dirs: [], subprocs: [], procs: [], groups: [], gates: [], hooks: [] };
 		owner = o;
 		let failure: { error: unknown } | null = null;
 		try {
@@ -168,10 +300,19 @@ function test(name: string, body: () => unknown, timeout?: number): void {
 			failure = { error };
 		}
 		owner = null;
-		const errors = await release(o);
-		if (failure && errors.length > 0) throw new AggregateError([failure.error, ...errors], `${name}: the case failed, and releasing what it owned failed too: ${errors.map((e) => e.message).join("; ")}`);
-		if (failure) throw failure.error;
-		if (errors.length > 0) throw new AggregateError(errors, `${name}: releasing what the case owned failed: ${errors.map((e) => e.message).join("; ")}`);
+		const { errors, kept } = await release(o, failure !== null);
+		const where = kept ? `; ${keptLine(o)}` : "";
+		if (failure && errors.length > 0) {
+			throw new AggregateError([failure.error, ...errors], `${name}: the case failed (${messageOf(failure.error)}), and releasing what it owned failed too: ${errors.map(messageOf).join("; ")}${where}`);
+		}
+		if (failure) {
+			if (failure.error instanceof Error) {
+				failure.error.message += `\n${keptLine(o)}`;
+				throw failure.error;
+			}
+			throw new AggregateError([failure.error], `${name}: the case failed (${messageOf(failure.error)})${where}`);
+		}
+		if (errors.length > 0) throw new AggregateError(errors, `${name}: releasing what the case owned failed: ${errors.map(messageOf).join("; ")}${where}`);
 	}, timeout);
 }
 
@@ -222,6 +363,8 @@ interface Box {
 	exec: string;
 	bin: string;
 	hooks: string;
+	/** The test-exec its wrapper runs. */
+	script: string;
 }
 
 /** The detector's test-only knobs a box's wrapper may carry (PLAN wl-mvq8x4pkjmx69s D3). */
@@ -234,9 +377,10 @@ interface DetectKnobs {
 	detectFeed?: boolean;
 }
 
-/** A tmp as2test root with a groups-scope wrapper and a fake sudo on PATH (§ 6 S4b). */
-function box(tag: string, opts: { killGraceMs?: number; sweepLockWaitMs?: number; captureMs?: number; script?: string } & DetectKnobs = {}): Box {
-	const base = dir(tag);
+type BoxOptions = { killGraceMs?: number; sweepLockWaitMs?: number; captureMs?: number; script?: string } & DetectKnobs;
+
+/** An as2test root with a groups-scope wrapper and a fake sudo on PATH (§ 6 S4b), laid out in `base`. */
+function boxIn(base: string, opts: BoxOptions): Box {
 	const root = join(base, "root");
 	for (const d of ["stage", "runs", "locks"]) mkdirSync(join(root, d), { recursive: true });
 	writeFileSync(join(root, "locks", "sweep.db"), "", { mode: 0o600 });
@@ -250,7 +394,14 @@ function box(tag: string, opts: { killGraceMs?: number; sweepLockWaitMs?: number
 	writeFileSync(resourcesPath, SYNTHETIC_POLICY);
 	const { script, killGraceMs, ...limits } = opts;
 	writeFileSync(exec, renderExecWrapper({ root, bun: BUN, script: script ?? SCRIPT, sweepScope: "groups", resourcesPath, hooks, killGraceMs: killGraceMs ?? 500, ...limits }), { mode: 0o755 });
-	return { root, exec, bin, hooks };
+	return { root, exec, bin, hooks, script: script ?? SCRIPT };
+}
+
+/** A tmp as2test root the case owns (its dir, and its hooks, which the case's release lets through). */
+function box(tag: string, opts: BoxOptions = {}): Box {
+	const b = boxIn(dir(tag), opts);
+	owning(`the hooks of ${tag}`).hooks.push(b.hooks);
+	return b;
 }
 
 /** A second wrapper over the same root with other test limits. */
@@ -289,8 +440,8 @@ function spawnCall(b: Box, c: WrapperCall, exec = b.exec) {
 const setCurrent = (b: Box, runId: string) => writeFileSync(join(b.root, "stage", "current"), `${runId}\n`);
 const workOf = (b: Box, runId: string) => join(b.root, "runs", runId);
 
-/** A fixture repo bundled into `<stage>/<run id>/repo.bundle`, with caps; returns the head sha. */
-function stageRepo(b: Box, runId: string, files: Record<string, string>, caps: Record<string, unknown> = { fullCapMin: 1, soloCapMin: 1 }): string {
+/** A fixture repo committed beside `b`'s root and bundled into `<stage>/<run id>/repo.bundle`, with caps; returns the head sha. */
+function commitAndBundle(b: Box, runId: string, files: Record<string, string>, caps: Record<string, unknown>): string {
 	const src = join(b.root, "..", `src-${runId}`);
 	mkdirSync(src, { recursive: true });
 	git(src, "init", "-q", "-b", "main");
@@ -308,6 +459,118 @@ function stageRepo(b: Box, runId: string, files: Record<string, string>, caps: R
 	return sha;
 }
 
+/**
+ * An immutable preparation template (PLAN wl-mw01xdcflkdnq0 sl-lf-detector-exec item 3, R17): a box of its own, made once
+ * per file run for each distinct (kind, test-exec, run id, files, caps), in which the fixture repo was committed and bundled
+ * into `<stage>/<run id>` and, for `prepared`, the run was prepared into `<runs>/<run id>` by the wrapper. No case ever
+ * runs anything in it: each copies it into its own fresh box (`copyTemplate`), and after the file its tree hash must be the
+ * one recorded at creation.
+ */
+interface Template {
+	base: string;
+	runId: string;
+	sha: string;
+	/** The ways `base` is spelled (as made, and resolved); a file naming one is in `naming`. */
+	spellings: string[];
+	/** Files (relative to `base`) whose text names the template: git's reflogs only, rewritten to the case's box in each copy. */
+	naming: string[];
+	hash: string;
+}
+const templates = new Map<string, Template>();
+const DEFAULT_CAPS = { fullCapMin: 1, soloCapMin: 1 };
+
+/** A digest of the tree at `root`: every entry's relative path, kind and permission bits, and a file's bytes or a link's target. */
+function treeHash(root: string): string {
+	const h = new Bun.CryptoHasher("sha256");
+	const walk = (rel: string) => {
+		const at = join(root, rel);
+		const st = lstatSync(at);
+		h.update(`${rel}\0${st.mode & 0o170000}\0${st.mode & 0o7777}\0`);
+		if (st.isSymbolicLink()) h.update(readlinkSync(at));
+		else if (st.isFile()) h.update(readFileSync(at));
+		else if (st.isDirectory()) for (const n of readdirSync(at).sort()) walk(rel === "" ? n : join(rel, n));
+		h.update("\0");
+	};
+	walk("");
+	return h.digest("hex");
+}
+
+/**
+ * The files under `base`/`under` whose bytes name the template (any of `spellings`). Only git's reflogs may (a clone logs
+ * `clone: from <bundle>`): their text is rewritten in each copy. Any other file or a symlink naming it is an error, since
+ * a copy of it would point at the template.
+ */
+function namingFiles(base: string, spellings: string[], under: string[]): string[] {
+	const out: string[] = [];
+	const walk = (rel: string) => {
+		const at = join(base, rel);
+		const st = lstatSync(at);
+		if (st.isSymbolicLink()) {
+			const to = readlinkSync(at);
+			if (spellings.some((s) => to.includes(s))) throw new Error(`the preparation's symlink ${at} points into the template (${to}): a copy would reach the template`);
+		} else if (st.isDirectory()) {
+			for (const n of readdirSync(at).sort()) walk(join(rel, n));
+		} else if (st.isFile() && spellings.some((s) => readFileSync(at).includes(s))) {
+			if (!rel.includes("/.git/logs/")) throw new Error(`the preparation names the template's path in ${at}, which is not one of git's reflogs: a copy would point at the template`);
+			out.push(rel);
+		}
+	};
+	for (const u of under) walk(u);
+	return out;
+}
+
+/** The template for these inputs, made on its first use in the file run (a failed one is kept and named in the error). */
+function template(kind: "staged" | "prepared", script: string, runId: string, files: Record<string, string>, caps: Record<string, unknown>): Template {
+	const key = JSON.stringify([kind, script, runId, files, caps]);
+	const known = templates.get(key);
+	if (known !== undefined) return known;
+	const made = tmp("as2test-template");
+	const base = realpathSync(made);
+	try {
+		const b = boxIn(base, { script });
+		const sha = commitAndBundle(b, runId, files, caps);
+		const under = [join("root", "stage", runId)];
+		if (kind === "prepared") {
+			setCurrent(b, runId);
+			const r = call(b, { sub: "prepare", runId, sha });
+			if (r.exit !== WRAPPER_EXIT.ok || r.stderr !== "") throw new Error(`prepare ${runId} exited ${r.exit}; stderr: ${r.stderr}`);
+			under.push(join("root", "runs", runId));
+		}
+		const spellings = [...new Set([base, made])];
+		const t = { base, runId, sha, spellings, naming: namingFiles(base, spellings, under), hash: treeHash(base) };
+		templates.set(key, t);
+		return t;
+	} catch (error) {
+		throw new Error(`making the ${kind} template of ${runId} in ${base} failed (kept for diagnosis): ${messageOf(error)}`, { cause: error });
+	}
+}
+
+/** Copy `parts` (stage, runs) of template `t`'s run into `b`'s root, fresh: the case's own mutable copy, never a merge. */
+function copyTemplate(t: Template, b: Box, parts: ("stage" | "runs")[]): void {
+	const caseBase = dirname(b.root);
+	for (const part of parts) {
+		const from = join(t.base, "root", part, t.runId);
+		const to = join(b.root, part, t.runId);
+		if (existsSync(to)) throw new Error(`${to} already exists: a template copy never merges into a case's own state`);
+		// -R copies a symlink as a symlink; -p keeps modes (the private startup TMPDIR's 0700 included) and times.
+		const r = Bun.spawnSync(["/bin/cp", "-Rp", from, to], { stdout: "pipe", stderr: "pipe" });
+		if (r.exitCode !== 0) throw new Error(`/bin/cp -Rp ${from} ${to} exited ${r.exitCode}: ${r.stderr.toString()}`);
+		for (const rel of t.naming.filter((n) => n.startsWith(`${join("root", part, t.runId)}/`))) {
+			const file = join(caseBase, rel);
+			let text = readFileSync(file, "utf8");
+			for (const s of t.spellings) text = text.replaceAll(s, caseBase);
+			writeFileSync(file, text);
+		}
+	}
+}
+
+/** The fixture repo's bundle and caps in `<stage>/<run id>`, copied from its template; returns the head sha. */
+function stageRepo(b: Box, runId: string, files: Record<string, string>, caps: Record<string, unknown> = DEFAULT_CAPS): string {
+	const t = template("staged", b.script, runId, files, caps);
+	copyTemplate(t, b, ["stage"]);
+	return t.sha;
+}
+
 const OK_TEST = `import { expect, test } from "bun:test";\ntest("ok", () => { expect(1).toBe(1); });\n`;
 const ENV_TEST = `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("env", () => { writeFileSync("../env.json", JSON.stringify(process.env)); });\n`;
 const SLOW_TEST = `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("slow", async () => {\n\tconst c = Bun.spawn(["/bin/sleep", "300"]);\n\twriteFileSync("../slow.pid", String(c.pid));\n\tawait new Promise(() => {});\n}, 600_000);\n`;
@@ -315,15 +578,40 @@ const ORPHAN_TEST = `import { test } from "bun:test";\ntest("orphan", () => {\n\
 /** The same, but the grandchild ignores SIGTERM: only a SIGKILL ends it. */
 const STUBBORN_TEST = `import { test } from "bun:test";\ntest("stubborn", () => {\n\tBun.spawnSync(["/bin/sh", "-c", "(trap '' TERM; exec /bin/sleep 300) >/dev/null 2>&1 & echo $! > ../orphan.pid"]);\n});\n`;
 
-/** prepare a fresh run: stage the repo, publish current, clone. */
-function prepared(b: Box, runId: string, files: Record<string, string>, caps?: Record<string, unknown>): string {
-	const sha = stageRepo(b, runId, files, caps);
+/** A fresh prepared run: the staged repo and the prepared run dir copied from their template, then current published. */
+function prepared(b: Box, runId: string, files: Record<string, string>, caps: Record<string, unknown> = DEFAULT_CAPS): string {
+	const t = template("prepared", b.script, runId, files, caps);
+	copyTemplate(t, b, ["stage", "runs"]);
 	setCurrent(b, runId);
-	const r = call(b, { sub: "prepare", runId, sha });
-	expect(r.stderr).toBe("");
-	expect(r.exit).toBe(WRAPPER_EXIT.ok);
-	return sha;
+	return t.sha;
 }
+
+/**
+ * After the file: an abandoned case's leftovers are released, then each template must still have the tree hash it was made
+ * with (no case wrote into it) and is removed; a changed one is kept and named. Every failure is reported together.
+ */
+afterAll(async () => {
+	const errors: Error[] = [];
+	try {
+		await releaseAbandoned();
+	} catch (error) {
+		errors.push(error instanceof Error ? error : new Error(String(error)));
+	}
+	for (const t of templates.values()) {
+		try {
+			const now = treeHash(t.base);
+			if (now !== t.hash) {
+				errors.push(new Error(`the template ${t.base} changed during the file run (tree hash ${t.hash} at creation, ${now} now): something wrote into it; kept for diagnosis`));
+				continue;
+			}
+			unseal(t.base);
+			rmSync(t.base, { recursive: true, force: true });
+		} catch (error) {
+			errors.push(new Error(`checking and removing the template ${t.base}: ${messageOf(error)}`, { cause: error }));
+		}
+	}
+	if (errors.length > 0) throw new AggregateError(errors, `as2test.test.ts after the file: ${errors.map(messageOf).join("; ")}`);
+});
 
 describe("executor resource and proof boundary", () => {
 	test("full launch records admitted capacity and bounds both file workers and concurrent cases", () => {
@@ -1461,10 +1749,10 @@ function published(work: string, name: string): string | undefined {
 	return existsSync(path) ? readFileSync(path, "utf8") : undefined;
 }
 
-/** The spin fixture's `Ready` (the case owns its worker); the wrapper exiting first is an error. */
+/** The spin fixture's `Ready` (the case owns its worker and the worker's group from the publication on); the wrapper exiting first is an error. */
 async function readySpin(work: string, p: Wrapper): Promise<Ready> {
 	const r = JSON.parse(await when(join(work, "ready-spin"), () => published(work, "ready-spin"), "the spin fixture's ready-spin", p)) as Ready;
-	own(r.worker);
+	ownWithGroup(r.worker);
 	return r;
 }
 
@@ -1518,10 +1806,10 @@ async function feedToMatch(tick: (at: number, cpu: Record<number, number>) => Pr
 /** The test knobs of a fed detector: STUCK_DEFAULTS tick and persistence on fed time, the trace on. */
 const FED = { detectFeed: true, detectTrace: true } as const;
 
-/** The pid a fixture wrote to `<work>/<name>`, owned by the case. */
+/** The pid a fixture wrote to `<work>/<name>`, owned by the case with its process group. */
 function fixturePid(work: string, name: string): number {
 	const pid = Number(readFileSync(join(work, name), "utf8"));
-	own(pid);
+	ownWithGroup(pid);
 	return pid;
 }
 
@@ -1560,9 +1848,13 @@ async function gateAsync(g) {
 }
 `;
 
-/** Make the gates `names` in `work` (each an empty publication dir and a FIFO) and `<work>/bin/sleep`, GATE_HEAD's SLEEP. */
+/**
+ * Make the gates `names` in `work` (each an empty publication dir and a FIFO the case owns, so its release lets a holder
+ * through) and `<work>/bin/sleep`, GATE_HEAD's SLEEP.
+ */
 function makeGates(work: string, names: string[]): void {
 	readyDirs(work, ...names);
+	owning(`the gates ${names.join(", ")} in ${work}`).gates.push(...names.map((g) => join(work, `${g}.go`)));
 	const r = Bun.spawnSync(["/usr/bin/mkfifo", ...names.map((g) => join(work, `${g}.go`))], { stdout: "pipe", stderr: "pipe" });
 	if (r.exitCode !== 0) throw new Error(`/usr/bin/mkfifo in ${work} exited ${r.exitCode}: ${r.stderr.toString()}`);
 	mkdirSync(join(work, "bin"));
@@ -1578,9 +1870,11 @@ function makeGates(work: string, names: string[]): void {
 	].join("\n"), { mode: 0o755 });
 }
 
-/** Await gate `g`'s publication (`announce`); returns the pid it published. */
+/** Await gate `g`'s publication (`announce`); the case owns the pid it published and that pid's group from then on. */
 async function reached(work: string, g: string, p: Wrapper): Promise<number> {
-	return Number(await when(join(work, g), () => published(work, g), `the gate ${g}`, p));
+	const pid = Number(await when(join(work, g), () => published(work, g), `the gate ${g}`, p));
+	ownWithGroup(pid);
+	return pid;
 }
 
 /** Let the fixture through gate `g`: one line on its FIFO, written non-blocking (the fixture holds it open, so a missing reader is an error, never a wait). */
@@ -2151,17 +2445,25 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		prepared(b, "tr-ss1", { "spin.test.ts": spinTest(false), "a.test.ts": OK_TEST }, { fullCapMin: 0.15, soloCapMin: 0.15, fullWorkers: 2 });
 		const work = workOf(b, "tr-ss1");
 		readyDirs(work, "ready-spin");
+		const t0 = Date.now();
 		const p = spawnCall(b, { sub: "full", runId: "tr-ss1" });
 		const { worker, zombie, ...ready } = await readySpin(work, p);
 		await exitOf(zombie);
 		// The match is acked on the last fed tick, so it came before the cap: a tick after the cap is acked `ended`.
 		await feedToMatch(feeder(b, "tr-ss1", p), { worker, zombie, ...ready });
 		const code = await p.exited;
+		const exitedAt = Date.now();
 		const stdout = await new Response(p.stdout).text();
 		const stderr = await new Response(p.stderr).text();
 		report({ fixture: "shadow", exit: code, stdout, stderr });
 		expect(code).toBe(WRAPPER_EXIT.timeout);
 		expect(stderr).toBe("as2test: timeout: the part passed its cap of 9000 ms; its group was killed\n");
+		// Real-clock timing under test (PLAN R16): the real wall cap is unchanged by fed ticks, with main's bounds: the part
+		// ran its whole cap (fullCapMin 0.15, 9000 ms) and ended within the cap, its stuck capture (CAPTURE_MS), the box's
+		// kill grace (500 ms) and main's 5 s slack. Named timestamps, as in the production integration below.
+		const capElapsedMs = exitedAt - t0;
+		expect(capElapsedMs).toBeGreaterThanOrEqual(9_000);
+		expect(capElapsedMs).toBeLessThan(9_000 + CAPTURE_MS + 500 + 5_000);
 		const lines = detectorLines(stdout);
 		expect(lines.map((l) => l.keyword)).toEqual(["stuck-signature", "stuck-would-stop", "stuck-captured"]);
 		for (const l of lines) expect(new Date(l.iso).toISOString()).toBe(l.iso);
@@ -2264,13 +2566,28 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		const { first, sig, stop } = enforceLines(stdout, ready.worker, ready.zombie);
 		// A real tick matches only once the signature has held persistMs (stuck-detect.ts StuckDetector.tick).
 		expect(Number(/ spun (\d+) ms /.exec(stderr)?.[1])).toBeGreaterThanOrEqual(STUCK_DEFAULTS.persistMs);
-		// The durations are measurements of the real clock on whatever load the run meets: recorded, never asserted.
+		// The durations, from the fixture's own ready time (published before the detector's first look at the spin), are
+		// recorded first, so a run that breaks a bound below still leaves its figures.
 		const figures = {
 			fixture: "production", readyToSignatureMs: Date.parse(sig.iso) - ready.at, readyToFirstSignatureMs: Date.parse(first.iso) - ready.at,
-			signatureToStopMs: Date.parse(stop.iso) - Date.parse(sig.iso), stopToExitMs: exitedAt - Date.parse(stop.iso), totalMs: exitedAt - ready.at,
+			signatureToStopMs: Date.parse(stop.iso) - Date.parse(sig.iso), signatureToExitMs: exitedAt - Date.parse(sig.iso), stopToExitMs: exitedAt - Date.parse(stop.iso),
+			totalMs: exitedAt - ready.at,
 		};
 		report(figures);
 		console.log(`as2test production detector timing: ${JSON.stringify(figures)}`);
+		// Real-clock timing under test (PLAN R16): the production contract at STUCK_DEFAULTS, with main's bounds and main's 3 s
+		// slack, each constant charged once. The timing linter's opt-out names only a fake clock, so these carry no opt-out
+		// marker; they measure named timestamps, as main's signature-to-exit bound did.
+		const { tickMs, persistMs, signatureCaptureMs, stopGraceMs, verifyMs } = STUCK_DEFAULTS;
+		// The signature held persistMs before the stop (main's bound, 50 ms under it).
+		expect(figures.signatureToStopMs).toBeGreaterThanOrEqual(persistMs - 50);
+		// Signature to confirmed exit: the persistence, the signature capture's deadline, the stop grace and the exit verification.
+		expect(figures.signatureToExitMs).toBeLessThan(persistMs + signatureCaptureMs + stopGraceMs + verifyMs + 3_000);
+		// Stop to confirmed exit: the signature capture's deadline, the stop grace and the exit verification.
+		expect(figures.stopToExitMs).toBeLessThan(signatureCaptureMs + stopGraceMs + verifyMs + 3_000);
+		// From ready: the first tick after it may compare a window that began before the spin, so the tick after that is the
+		// first whose whole window is hot (2 × tickMs); then the same budget. A slow first observation fails here.
+		expect(figures.totalMs).toBeLessThan(2 * tickMs + persistMs + signatureCaptureMs + stopGraceMs + verifyMs + 3_000);
 		await exitOf(ready.worker);
 		expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
 		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
