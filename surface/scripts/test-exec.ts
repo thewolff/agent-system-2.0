@@ -41,7 +41,7 @@ import { Database } from "bun:sqlite";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import {
 	accessSync, appendFileSync, chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync,
-	readFileSync, readSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync, writeSync,
+	readFileSync, readSync, realpathSync, renameSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync, writeSync,
 } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
@@ -154,14 +154,18 @@ function workDir(a: Areas, runId: string): string {
 }
 
 /**
- * A test's pause point: when `<hooks>/<run>.<point>.pause` exists, write `.reached` (this pid, the time and `info`) and wait for
- * `.go`, or until `stop` says so (the stuck capture's hooks stop at its deadline).
+ * A test's pause point: when `<hooks>/<run>.<point>.pause` exists, publish `.reached` (this pid, the time and `info`) and wait
+ * for `.go`, or until `stop` says so (the stuck capture's hooks stop at its deadline). The JSON goes to this process's
+ * temporary file beside `.reached` and is renamed over it, so a reader sees no file or the whole payload, never a partial
+ * one (surface/test/hook-marker.test.ts); a write or rename error propagates.
  */
 async function hook(cfg: Config, runId: string, point: string, o: { stop?: () => boolean; info?: Record<string, unknown> } = {}): Promise<void> {
 	if (!cfg.hooks) return;
 	const base = join(cfg.hooks, `${runId}.${point}`);
 	if (!existsSync(`${base}.pause`)) return;
-	writeFileSync(`${base}.reached`, JSON.stringify({ pid: process.pid, at: Date.now(), ...o.info }));
+	const temp = `${base}.reached.${process.pid}.tmp`;
+	writeFileSync(temp, JSON.stringify({ pid: process.pid, at: Date.now(), ...o.info }));
+	renameSync(temp, `${base}.reached`);
 	while (!existsSync(`${base}.go`) && !o.stop?.()) await Bun.sleep(25);
 }
 

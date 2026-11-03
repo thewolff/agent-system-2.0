@@ -185,15 +185,22 @@ describe("install: the baseline copy installs", () => {
 		expect(copiesOf(r.db).length).toBe(1);
 		expect(r.out).toMatch(/^as2 doctor: \d+ pass, 0 fail, /m);
 		expect(r.out.search(/^as2 doctor: \d+ pass/m)).toBeLessThan(r.out.indexOf("install complete"));
-		expect(r.out).toContain(`==> doctor job: HOME (${r.home}) is not this user's home directory (/Users/someone-else), so the doctor job is not installed`);
 		expect(existsSync(plistPath(r.home, "com.agent-system-2.doctor"))).toBe(false);
 		// Every probe reached the fakes: the doctor's own and install's ctx registration.
 		const calls = fakeCalls(r.state);
-		expect(calls).toContain(`launchctl print gui/${UID}/${LEDGER_BACKUP_LABEL}`);
 		expect(calls).toContain("ctx daemon status --format json");
 		expect(calls.some((c) => c.startsWith("ctx sources add --provider pi"))).toBe(true);
-		expect(calls.some((c) => c.startsWith("dscl . -read "))).toBe(true);
 		expect(calls.filter((c) => c.startsWith("launchctl ") && !c.startsWith("launchctl print "))).toEqual([]);
+		if (process.platform === "darwin") {
+			expect(r.out).toContain(`==> doctor job: HOME (${r.home}) is not this user's home directory (/Users/someone-else), so the doctor job is not installed`);
+			expect(calls).toContain(`launchctl print gui/${UID}/${LEDGER_BACKUP_LABEL}`);
+			expect(calls.some((c) => c.startsWith("dscl . -read "))).toBe(true);
+		} else {
+			// Off macOS install.sh writes no launchd job and the doctor reads none: every job row is the not-macOS line.
+			expect(r.out).toContain("==> doctor job: not macOS; no launchd job written");
+			expect(r.out).toMatch(/^- {4}job:ledger-backup: not installed: not macOS \(launchd jobs are macOS only; install\.sh writes none here\)$/m);
+			expect(calls.filter((c) => c.startsWith("launchctl ") || c.startsWith("plutil ") || c.startsWith("dscl "))).toEqual([]);
+		}
 	});
 });
 
@@ -1233,12 +1240,23 @@ describe("install: the closing as2 doctor decides install complete (PLAN wl-mvwk
 		const plist = plistPath(home, LEDGER_BACKUP_LABEL);
 		setFake(state, `launchctl/${LEDGER_BACKUP_LABEL}`, launchctlPrint({ label: LEDGER_BACKUP_LABEL, path: plist, log: join(dirname(db), "ledger-backup.log"), runs: 1, exit: 78 }));
 		const r = install("doctor-broken-job");
-		expect(r.out).toMatch(new RegExp(`^fail job:ledger-backup: ${LEDGER_BACKUP_LABEL.replace(/[.]/g, "\\.")} last exit code 78$`, "m"));
-		expect(r.out).toMatch(/^as2 doctor: \d+ pass, 1 fail \(job:ledger-backup\), /m);
-		expect(r.out).toContain("==> install incomplete: as2 doctor found failing parts (above)");
-		expect(r.out).not.toContain("install complete");
-		expect(r.exitCode).toBe(5);
-		expect(fakeCalls(state)).toContain(`launchctl print gui/${UID}/${LEDGER_BACKUP_LABEL}`);
+		if (process.platform === "darwin") {
+			expect(r.out).toMatch(new RegExp(`^fail job:ledger-backup: ${LEDGER_BACKUP_LABEL.replace(/[.]/g, "\\.")} last exit code 78$`, "m"));
+			expect(r.out).toMatch(/^as2 doctor: \d+ pass, 1 fail \(job:ledger-backup\), /m);
+			expect(r.out).toContain("==> install incomplete: as2 doctor found failing parts (above)");
+			expect(r.out).not.toContain("install complete");
+			expect(r.exitCode).toBe(5);
+			expect(fakeCalls(state)).toContain(`launchctl print gui/${UID}/${LEDGER_BACKUP_LABEL}`);
+		} else {
+			// Off macOS install.sh writes no launchd job, so there is no job to have exited 78: the doctor reads no launchd
+			// state, every job row is the not-macOS line, and the install completes.
+			expect(r.out).toMatch(/^- {4}job:ledger-backup: not installed: not macOS \(launchd jobs are macOS only; install\.sh writes none here\)$/m);
+			expect(r.out).toMatch(/^as2 doctor: 9 pass, 0 fail, 0 warn, 9 not installed$/m);
+			expect(r.out).toContain("install complete");
+			expect(r.out).not.toContain("install incomplete");
+			expect(r.exitCode).toBe(0);
+			expect(fakeCalls(state).filter((c) => c.startsWith("launchctl ") || c.startsWith("plutil ") || c.startsWith("dscl "))).toEqual([]);
+		}
 	});
 
 	test("the ctx daemon not running, every job healthy: the doctor fails ctx, no install complete, exit 5", () => {
@@ -1247,8 +1265,13 @@ describe("install: the closing as2 doctor decides install complete (PLAN wl-mvwk
 		setFake(state, "ctx.mode", "stopped");
 		const r = install("doctor-ctx-stopped");
 		expect(r.out).toMatch(/^fail ctx: the ctx daemon is not running \(\.daemon\.running = false\)$/m);
-		expect(r.out).toMatch(/^pass job:ledger-backup: /m);
-		expect(r.out).toMatch(/^as2 doctor: \d+ pass, 1 fail \(ctx\), /m);
+		if (process.platform === "darwin") {
+			expect(r.out).toMatch(/^pass job:ledger-backup: /m);
+			expect(r.out).toMatch(/^as2 doctor: \d+ pass, 1 fail \(ctx\), /m);
+		} else {
+			expect(r.out).toMatch(/^- {4}job:ledger-backup: not installed: not macOS \(launchd jobs are macOS only; install\.sh writes none here\)$/m);
+			expect(r.out).toMatch(/^as2 doctor: 8 pass, 1 fail \(ctx\), 0 warn, 9 not installed$/m);
+		}
 		expect(r.out).toContain("==> install incomplete: as2 doctor found failing parts (above)");
 		expect(r.out).not.toContain("install complete");
 		expect(r.exitCode).toBe(5);

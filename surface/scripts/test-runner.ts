@@ -296,7 +296,7 @@ export function heartbeatOf(root: string, runId: string): number | null {
 /**
  * A named boundary. With AGENT_SYSTEM_TEST_HOOKS set, every pass appends a line to
  * `<dir>/<id>.<point>.marks` (`id` is the run id; the starter's carry, which has no run, names its workload);
- * when `<dir>/<id>.<point>.pause` exists, it writes `.reached` and waits for `.go`, then removes all three
+ * when `<dir>/<id>.<point>.pause` exists, it publishes `.reached` and waits for `.go`, then removes all three
  * (one pause per arming). Unset, it is inert.
  */
 function hookMark(id: string, point: string, info: Record<string, unknown> = {}): { base: string } | null {
@@ -306,21 +306,35 @@ function hookMark(id: string, point: string, info: Record<string, unknown> = {})
 	appendFileSync(`${base}.marks`, `${JSON.stringify({ at: Date.now(), pid: process.pid, ...info })}\n`);
 	return { base };
 }
+/** This process's temporary file for `<base>.reached`: beside it, so the rename that publishes it stays in one directory. */
+function hookTemp(base: string): string {
+	return `${base}.reached.${process.pid}.tmp`;
+}
+/**
+ * Publishes `<base>.reached` (this pid, the time and `info`) atomically: the JSON goes to this process's temporary file
+ * and is renamed over `.reached`, so a reader polling it sees no file or the whole payload, never a partial one
+ * (surface/test/hook-marker.test.ts). A write or rename error propagates.
+ */
+function hookReached(base: string, info: Record<string, unknown>): void {
+	const temp = hookTemp(base);
+	writeFileSync(temp, JSON.stringify({ pid: process.pid, at: Date.now(), ...info }));
+	renameSync(temp, `${base}.reached`);
+}
 function hookResume(base: string): void {
-	for (const s of [".pause", ".go", ".reached"]) rmSync(base + s, { force: true });
+	for (const path of [`${base}.pause`, `${base}.go`, `${base}.reached`, hookTemp(base)]) rmSync(path, { force: true });
 }
 /** The synchronous form, for a boundary inside an open SQLite transaction. */
-function hookSync(id: string, point: string, info: Record<string, unknown> = {}): void {
+export function hookSync(id: string, point: string, info: Record<string, unknown> = {}): void {
 	const h = hookMark(id, point, info);
 	if (!h || !existsSync(`${h.base}.pause`)) return;
-	writeFileSync(`${h.base}.reached`, JSON.stringify({ pid: process.pid, at: Date.now(), ...info }));
+	hookReached(h.base, info);
 	while (!existsSync(`${h.base}.go`)) Bun.sleepSync(25);
 	hookResume(h.base);
 }
 export async function hook(runId: string, point: string, info: Record<string, unknown> = {}, deadline = Infinity): Promise<void> {
 	const h = hookMark(runId, point, info);
 	if (!h || !existsSync(`${h.base}.pause`)) return;
-	writeFileSync(`${h.base}.reached`, JSON.stringify({ pid: process.pid, at: Date.now(), ...info }));
+	hookReached(h.base, info);
 	while (!existsSync(`${h.base}.go`)) {
 		if (Date.now() >= deadline) throw new Stop(`post-sweep deadline exceeded at ${point}`);
 		await Bun.sleep(25);
