@@ -160,7 +160,7 @@ describe("close: held orchestrator-bound messages are delivered in the close tra
 		expect(states(x, lookAlikes)).toEqual(["delivered", "delivered", "delivered"]);
 		expect(heldLine(r.text)).toContain("held messages delivered at close (3):");
 		for (const id of trusted) expect(heldLine(r.text)).not.toContain(id);
-		const nowLines = () => errorLines(x.ledger, undefined, { now: x.c.now(), movePidProbe: () => false }).filter((l) => l.kind === "quota-move").map((l) => l.line);
+		const nowLines = () => errorLines(x.ledger, undefined, { now: x.c.now() }).filter((l) => l.kind === "quota-move").map((l) => l.line);
 		expect(nowLines()).toEqual([`NOW: lane lane-a-1 on ${x.wl} moved ${A} -> ${SOL} (${why})`, `NOW: ${handSubject} on ${x.wl} moved ${A} -> ${SOL} (${why})`]);
 		// The wake's consumer (surface/extensions/wake.ts renderWakeTurn) delivers both once; nothing renders them again.
 		expect(consumeAllToOrchestrator(x.ledger)).toBe(2);

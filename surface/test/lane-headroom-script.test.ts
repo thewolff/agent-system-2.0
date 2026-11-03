@@ -156,7 +156,7 @@ async function expectMoveAlerted(r: LaneRoot, wl: string, laneId: string, from: 
 		expect([event.created_by, event.body]).toEqual([LANE_RUNNER_BY, `lane-headroom: ${laneId} ${from} -> ${to} (${move.reason})`]);
 		const message = l.message(move.messageId)!;
 		expect([message.sender, message.recipient, message.body]).toEqual([LANE_RUNNER_BY, "orchestrator", `quota-move: lane ${laneId} on ${wl}: ${from} -> ${to} (${move.reason})`]);
-		const now = errorLines(l, undefined, { movePidProbe: () => true }).filter((x) => x.kind === "quota-move" && x.workloadId === wl);
+		const now = errorLines(l).filter((x) => x.kind === "quota-move" && x.workloadId === wl);
 		expect(now.map((x) => x.line)).toEqual([`NOW: lane ${laneId} on ${wl} moved ${from} -> ${to} (${move.reason})`]);
 		expect(onFire(l, now[0]!)).toBe(true);
 		const rows = () => l.entries(wl, "assumption").filter((e) => e.created_by === LANE_RUNNER_BY && e.body.startsWith(`quota-move-alert: ${move.eventId} `)).map((e) => e.body.split(" ").slice(2, 4).join(" "));

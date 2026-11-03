@@ -306,6 +306,9 @@ export function errorChanged(ep: AlertEpisode, channel: string, text: string): b
 
 // ---- popup rows ---------------------------------------------------------------------------------
 
+/** Popup attempts per level (D3): after this many failed or unstarted attempts that level's popup stops and the line says so (D4). */
+export const ALERT_POPUP_ATTEMPTS = 3;
+
 /** One `alert-popup:` row: the key, episode and level it is about, its step and the step's detail. */
 export interface AlertPopupRow {
 	id: string;

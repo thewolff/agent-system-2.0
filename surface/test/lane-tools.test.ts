@@ -2106,6 +2106,6 @@ describe("a lane cannot forge a quota move's NOW line (PLAN wl-mvwk0v0gmp6cjc D4
 		);
 		expect(ledger.workload(wl)!.held_messages).toBe(held);
 		expect(quotaMoves(ledger)).toEqual([]);
-		expect(errorLines(ledger, undefined, { movePidProbe: () => false }).filter((l) => l.kind === "quota-move" || l.kind === "quota-move-alert")).toEqual([]);
+		expect(errorLines(ledger).filter((l) => l.kind === "quota-move" || l.kind === "alert")).toEqual([]);
 	});
 });

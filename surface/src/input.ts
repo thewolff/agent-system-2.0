@@ -137,6 +137,12 @@
 // again inside `apply`. `main-retry <repo>` writes Jo's `main-retry <repo>` and the surface's `main-retry: <repo> <instruction
 // id>` the same way; it opens the next attempt block of an exhausted main commit (`mainRetries`). Both words are the command
 // or `refused` with the reason, at any length, never prose.
+//
+// The alert path's words (PLAN wl-mw0vs9uc3xqtka D6, surface/src/alert-path.ts): `urgent|asap|calm <wl-…>` writes Jo's
+// instruction `<word> <wl>` on that open workload (`urgencyOf` reads the newest); `ack <wl-…|alert key>` writes Jo's
+// instruction `ack <target>` on the workload (a key of no workload: on the standing workload), which `alertAcks` reads and the
+// alert pass turns into `acked`. Each receipt names the open alerts it touches. A workload not open, or an ack with no open
+// alert to touch, is `refused` naming what is open. The word alone, or `ack <q-…|en-…>`, keeps its answer meaning.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parkQuestions } from "../../classifier/src/lab";
@@ -171,6 +177,7 @@ import { PAIR_OPTION, type PairSite, pairOfferLine, pairTakenBody, parsePairOffe
 import { parseHeartbeat, recordLive, type RunRecord, runDirOf, runsRoot, testRuns } from "./test-run";
 import { pendingWrapperLines } from "./pending";
 import { DUE_PREFIX, MERGE_TRAIN_BY, MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
+import { ACK_WORD, alertLevel, alertRecords, openEpisode, URGENCY_WORDS, type UrgencyWord } from "./alert-path";
 
 /** A "which one?" candidate: a needs-you row (`Target`) or, for a bare stakes, mode, `ceiling`, `rounds` or `stop-reviews` word, a workload in view. */
 export type Candidate = Target | { kind: "workload"; workloadId: string };
@@ -214,6 +221,10 @@ export type Command =
 	| { kind: "withdraw-workload"; workloadId: string }
 	/** `raise <usd> [q-…]`: Jo's answer `raise` to the merge train's budget pause question `questionId`, adding `usd` to the pause's PDT day (PLAN wl-mvr888nftz0vcl D7). */
 	| { kind: "raise"; workloadId: string; questionId: string; usd: number }
+	/** `urgent|asap|calm <wl-…>`: Jo's word on the workload's urgency, read by the alert pass (`urgencyOf`, PLAN wl-mw0vs9uc3xqtka D5, D6). */
+	| { kind: "urgency"; workloadId: string; word: UrgencyWord }
+	/** `ack <wl-…|alert key>`: Jo acknowledges every open alert of a workload, or one alert key (`alertAcks`, D6); recorded on `workloadId`. */
+	| { kind: "ack"; workloadId: string; target: string }
 	/** A bare word that fits more than one row or workload: refused, never applied. */
 	| { kind: "ambiguous"; word: string; candidates: Candidate[] }
 	/** A command naming a row it cannot take (`deny en-…` for a request no longer waiting): refused with `why`, never applied and never prose. */
@@ -275,6 +286,10 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 	if (word === HALT_WORD && words.length === 2 && /^wl-/i.test(words[1]!)) return haltCommand(ledger, words[1]!);
 	// `extend <wl-…>` likewise; `extend` alone or `extend <q-…>` falls through, so the round-limit question's `extend` still answers.
 	if (word === EXTEND_WORD && words.length === 2 && /^wl-/i.test(words[1]!)) return extendCommand(ledger, words[1]!);
+	// PLAN wl-mw0vs9uc3xqtka D6: `urgent|asap|calm <wl-…>` and `ack <wl-…|alert key>` are the command or `refused`; the word alone, or
+	// naming anything else (`ack q-…`), falls through, so a question offering one of these words still answers.
+	if ((URGENCY_WORDS as readonly string[]).includes(word) && words.length === 2 && /^wl-/i.test(words[1]!)) return urgencyCommand(ledger, word as UrgencyWord, words[1]!);
+	if (word === ACK_WORD && words.length === 2 && (/^wl-/i.test(words[1]!) || words[1]!.includes(":"))) return ackCommand(ledger, words[1]!);
 	// Always the command or `refused`, at any length, so a long binding never passes as prose.
 	if (word === "test-pr" || word === "waive-pr") return prWordCommand(ledger, word, words.slice(1));
 	if (word === LAND_FIRST_WORD) return landFirstCommand(ledger, words.slice(1));
@@ -512,7 +527,7 @@ export function stripTail(line: string): string {
 /** The words that open a command: the stakes and mode words, the answer words, every option an open question offers, and the long commands. */
 function commandWords(ledger: Ledger): string[] {
 	const offered = ledger.inFlight().flatMap((w) => w.openQuestions).flatMap((q) => q.options.map((o) => o.toLowerCase()));
-	return [...STAKES_WORDS, ...MODE_WORDS, "approve", "deny", "withdraw", "ceiling", EXTEND_WORD, "rounds", "stop-reviews", HALT_WORD, RAISE_WORD, ...offered];
+	return [...STAKES_WORDS, ...MODE_WORDS, "approve", "deny", "withdraw", "ceiling", EXTEND_WORD, "rounds", "stop-reviews", HALT_WORD, RAISE_WORD, ...URGENCY_WORDS, ACK_WORD, ...offered];
 }
 
 /**
@@ -578,6 +593,10 @@ function resolves(cmd: Command): string | null {
 			return "the auto-apply switch";
 		case "halt":
 			return `${HALT_WORD} ${cmd.workloadId}`;
+		case "urgency":
+			return `urgency of ${cmd.workloadId}`;
+		case "ack":
+			return `${ACK_WORD} ${cmd.target}`;
 		default:
 			return null;
 	}
@@ -1061,6 +1080,58 @@ function extendCommand(ledger: Ledger, wl: string): Command {
 	// PLAN wl-mvr888nftz0vcl D4: the merge train has no ceiling to extend; nothing is written.
 	const why = trainNoWallRefusal(ledger, wl);
 	return why === null ? { kind: "extend", workloadId: wl } : { kind: "refused", why };
+}
+
+/** One open, unacked alert episode as Jo's words read it: its key, its level, and the workload it is about (null for a key of none). */
+interface OpenAlert {
+	key: string;
+	level: number;
+	workload: string | null;
+}
+
+/**
+ * Every open alert episode Jo has not acked (PLAN wl-mw0vs9uc3xqtka D4, D6), from the standing workload's `alert:` rows. Its
+ * workload is the episode's recorded words' (`AlertWords.workload`, the subject's), else the `wl-…` a workload-kind key names.
+ */
+function openAlerts(ledger: Ledger): OpenAlert[] {
+	const records = alertRecords(controlEntries(ledger.entries(STANDING_WORKLOAD_ID, "assumption")));
+	const out: OpenAlert[] = [];
+	for (const [key, rec] of records) {
+		const ep = openEpisode(rec);
+		if (ep === null || ep.acked !== null) continue;
+		out.push({ key, level: alertLevel(records, key), workload: ep.words?.workload ?? /^(?:ceiling|died|parked):(wl-\S+)$/.exec(key)?.[1] ?? null });
+	}
+	return out;
+}
+
+/** The receipt's list of alerts: `key (level n)`, comma-separated, or `none`. */
+function alertList(alerts: readonly OpenAlert[]): string {
+	return alerts.length === 0 ? "none" : alerts.map((a) => `${a.key} (level ${a.level})`).join(", ");
+}
+
+/** `urgent|asap|calm <wl-…>` (D6): the command on an open workload other than the standing one, else `refused`, never prose. */
+function urgencyCommand(ledger: Ledger, word: UrgencyWord, wl: string): Command {
+	return workloadsInView(ledger).includes(wl) ? { kind: "urgency", workloadId: wl, word } : { kind: "refused", why: `${wl} is not an open workload` };
+}
+
+/**
+ * `ack <wl-…|alert key>` (D6): a workload id acks every open alert of that workload, recorded on it; an alert key acks that
+ * key, recorded on its workload (the standing workload for a key of none). With nothing open to ack it is `refused` naming
+ * what is open, never prose. `ack` alone and `ack <q-…|en-…>` never reach here: they stay answer words.
+ */
+function ackCommand(ledger: Ledger, target: string): Command {
+	const open = openAlerts(ledger);
+	const named = open.length === 0 ? "no alert is open" : `open: ${alertList(open)}`;
+	if (/^wl-/i.test(target)) {
+		if (!ledger.workload(target)) return { kind: "refused", why: `${target} is no workload` };
+		return open.some((a) => a.workload === target)
+			? { kind: "ack", workloadId: target, target }
+			: { kind: "refused", why: `no open alert on ${target} to ack (${named})` };
+	}
+	const hit = open.find((a) => a.key === target);
+	return hit === undefined
+		? { kind: "refused", why: `no open alert ${target} to ack (${named})` }
+		: { kind: "ack", workloadId: hit.workload ?? STANDING_WORKLOAD_ID, target };
 }
 
 /** Jo's word that raises the merge train's limit for a paused PDT day (PLAN wl-mvr888nftz0vcl D7). */
@@ -1728,6 +1799,27 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 				const raiseId = ledger.recordEntry({ by: SURFACE_BY, workloadId: q.workload_id, kind: "assumption", body: trainRaiseBody(p.day, cmd.usd, answerId) });
 				const limit = trainDayLimit(controlEntries(ledger.entries(q.workload_id, "assumption")), p.day);
 				return `raised merge train ${q.workload_id}'s limit for ${p.day} (PDT) by $${usdText(cmd.usd)} to $${usdText(limit)}: answered ${q.id} with "raise" (answer ${answerId}; train-raise ${raiseId}); the next train tick relaunches it`;
+			});
+		}
+		case "urgency": {
+			// D6: Jo's instruction `<word> <wl>` on the workload, the exact body `urgencyOf` reads; the receipt names its open alerts.
+			return ledger.write(() => {
+				if (!workloadsInView(ledger).includes(cmd.workloadId)) throw new Error(`${cmd.workloadId} is not an open workload`);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: `${cmd.word} ${cmd.workloadId}` });
+				const open = openAlerts(ledger).filter((a) => a.workload === cmd.workloadId);
+				const what = cmd.word === "calm" ? "not urgent: its new alerts start at level 1" : "urgent: its new alerts start at level 2";
+				return `${cmd.workloadId} is ${what} (instruction ${id}); its open alerts: ${alertList(open)}`;
+			});
+		}
+		case "ack": {
+			// D6: refusal re-checked, then Jo's instruction `ack <target>` (the body `alertAcks` reads) on the workload; the alert pass
+			// closes each issue and writes `acked`, and the receipt names every alert the ack touches.
+			return ledger.write(() => {
+				const again = ackCommand(ledger, cmd.target);
+				if (again.kind !== "ack") throw new Error(again.kind === "refused" ? again.why : `ack ${cmd.target} no longer applies`);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: again.workloadId, body: `${ACK_WORD} ${cmd.target}` });
+				const touched = openAlerts(ledger).filter((a) => (/^wl-/i.test(cmd.target) ? a.workload === cmd.target : a.key === cmd.target));
+				return `acked ${alertList(touched)} (instruction ${id} on ${again.workloadId}); the alert pass closes their issues and stops their escalation`;
 			});
 		}
 		case "ambiguous":
