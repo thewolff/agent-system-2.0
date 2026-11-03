@@ -1110,12 +1110,14 @@ surface/test/tool-mount.test.ts	test	-
 voice/VOICE.md	doc	-
 voice/agent-collaboration-with-adhd-and-autism.md	doc	-
 surface/src/launch.ts	module	-
+surface/src/lane-offsite.ts	module	-
 surface/src/jo-issues.ts	module	-
 surface/src/quota-move-alert.ts	module	-
 surface/extensions/launch.ts	module	-
 surface/extensions/lane-model.ts	module	-
 surface/extensions/lane-tools.ts	module	-
 surface/scripts/lane.ts	module	-
+surface/scripts/lane-archive.ts	module	-
 surface/src/omp-probe.ts	module	-
 surface/test/lane-tools.test.ts	test	-
 surface/test/quota-move-alert.test.ts	test	-
@@ -1123,6 +1125,8 @@ ledger/test/lane.test.ts	test	-
 surface/test/fake-omp.ts	test	-
 surface/test/launch.test.ts	test	-
 surface/test/lane-script.test.ts	test	-
+surface/test/lane-offsite.test.ts	test	-
+surface/test/lane-archive.test.ts	test	-
 surface/test/lane-live-lane.test.ts	test	-
 surface/test/lane-release-exit.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-
@@ -1317,6 +1321,7 @@ install/drive-backup/test-fake-drive-regress-single.zsh	install	-
 install/drive-backup/test-fake-drive-crash.zsh	install	-
 install/drive-backup/test-fake-drive-crash-late.zsh	install	-
 install/drive-backup/test-fake-drive-jobs.zsh	install	-
+install/drive-backup/test-fake-drive-lanes.zsh	install	-
 surface/test/drive-backup.test.ts	test	-
 install/drive-backup/test-alert.zsh	install	-
 surface/scripts/drive-backup-notice.ts	module	-

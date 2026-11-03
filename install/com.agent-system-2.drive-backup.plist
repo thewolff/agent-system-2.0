@@ -8,11 +8,14 @@
   flag's =off form boots both out and deletes both files. Without the flag install.sh never writes it. (An XML
   comment cannot hold a double hyphen, so the flags are not spelled out here; install/install.sh's header has
   them.) launchd runs install/drive-backup/backup-nightly.zsh at 02:30 local time (a sleeping Mac runs it at
-  wake): it copies the ledger snapshot and the scratch archives to Drive, proves each upload, and writes its state
+  wake): it copies the ledger snapshot, the scratch archives and closed lane folders (tarred by
+  surface/scripts/lane-archive.ts, run with AS2_BUN from AS2_REPO) to Drive, proves each upload, and writes its state
   files to $HOME/agent-scratch/agent-system-2.0/drive-backup/state, the script's own default for this HOME, where
   launchd also sends its output. AS2_UNDER_LAUNCHD keeps the script from copying its output to the same log
-  again. AS2_BUN, AS2_REPO and AS2_LEDGER_DB are the needs-you writer's (install/drive-backup/lib.zsh); AS2_KEEP_LOCAL
-  is the installer's value (1 uploads and proves but never deletes a local archive). The script sets its own PATH.
+  again. AS2_BUN, AS2_REPO and AS2_LEDGER_DB are the needs-you writer's (install/drive-backup/lib.zsh) and the lane
+  phases'; AS2_KEEP_LOCAL is the installer's value and covers scratch archives and lane folders alike: 1 uploads and
+  proves but never deletes a local archive or a lane folder; 0 deletes a local archive after its proof and removes a
+  closed lane folder after the proof of its tar (as2 lane restore puts it back). The script sets its own PATH.
   AbandonProcessGroup lets the detached alert wrapper outlive the run; RunAtLoad is off, so loading never starts
   a run. MaterializeDatalessFiles is on because launchd's default is off: a launchd job then cannot read an evicted
   Drive file (the read fails with EDEADLK), and the restore test and the deletion re-proof must download one.

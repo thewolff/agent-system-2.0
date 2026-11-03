@@ -54,6 +54,10 @@
 #          as2 lane stop|cleanup|log <wl>
 #                              stop the workload's lane (requested through the ledger; signals omp only
 #                              when its pid still matches), remove a clean pushed worktree, tail the runner log
+#          as2 lane restore <wl> [--to <dir>] [--deadline <s>]
+#                              put a closed lane's folder back from Drive (PLAN wl-mw14khl4uf388q): copy, check
+#                              sha256 and every manifest entry, then in place (exit 75 while a retire or restore
+#                              runs) or into <dir>/<wl>: bun surface/scripts/lane.ts restore <wl> [...]
 #          as2 --print [args]  render <prompt>, then print the omp command line `as2 [args]` would run, without running it
 #          as2 -h | --help     this text
 # Env:     AGENT_SYSTEM_PROFILE  OMP profile name (default: agent-system-2), as install/install.sh
@@ -297,13 +301,18 @@ case "${1-}" in
 	lane)
 		shift
 		case "${1-}" in
+			restore)
+				shift
+				[ -n "${1-}" ] || { printf 'as2 lane restore: a workload id is required (as2 lane restore <wl> [--to <dir>] [--deadline <s>])\n' >&2; exit 1; }
+				exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/lane.ts" restore "$@"
+				;;
 			stop | cleanup | log)
 				sub="$1"
 				shift
 				[ -n "${1-}" ] || { printf 'as2 lane %s: a workload id is required\n' "$sub" >&2; exit 1; }
 				exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/lane.ts" "$sub" "$1"
 				;;
-			'') printf 'as2 lane: a workload id is required (as2 lane <wl> | as2 lane stop|cleanup|log <wl>)\n' >&2; exit 1 ;;
+			'') printf 'as2 lane: a workload id is required (as2 lane <wl> | as2 lane stop|cleanup|log <wl> | as2 lane restore <wl>)\n' >&2; exit 1 ;;
 			*) exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/lane.ts" interactive "$1" ;;
 		esac
 		;;

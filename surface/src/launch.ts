@@ -2012,7 +2012,18 @@ export const STARTER_EXIT: Record<string, number> = {
 	ledger: 8,
 	closed: 9,
 	"not-launchable": 10,
+	/** The lane folder is offsite on Drive (`lanes/<wl>.offsite`, surface/src/lane-offsite.ts): `prepare()` and the runner refuse. */
+	offsite: 11,
 };
+
+/**
+ * What a launch refusal adds when the workload's lane folder is offsite on Drive (`lanes/<wl>.offsite` exists, either
+ * state; PLAN wl-mw14khl4uf388q "Launch guard"): appended after `; ` to `launchable()`'s and the interactive policy's
+ * `closed` refusal where lane.ts renders it, and the reason of `prepare()`'s and the runner's own refusal.
+ */
+export function offsiteRefusalNote(workloadId: string): string {
+	return `its lane folder is offsite on Drive: run as2 lane restore ${workloadId}`;
+}
 
 /** The by-hand command for a user-driven workload (decision 14). */
 export function byHandLine(workloadId: string): string {

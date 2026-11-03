@@ -21,6 +21,12 @@ T=$(mktemp -d "$REAL_TMP/as2-drive-test.XXXXXX") || { print -u2 "mktemp failed";
 mkdir -p $T/home $T/tmp $T/state $T/src || exit 99
 export HOME=$T/home TMPDIR=$T/tmp AS2_TMPDIR=$T/tmp
 print "test dir: $T"
+# AS2_BUN and AS2_REPO (surface/test/drive-backup.test.ts passes the bun running it and this checkout) are kept as
+# FIXTURE_BUN and FIXTURE_REPO for a part that runs bun itself (test-fake-drive-lanes.zsh exports them for its nights)
+# and unset for the job, so every other part's nights run as a manual run does: the needs-you entry and the lane
+# phases are recorded as `skipped: AS2_BUN unset`.
+FIXTURE_BUN=${AS2_BUN:-} FIXTURE_REPO=${AS2_REPO:-${HERE:h:h}}
+unset AS2_BUN AS2_REPO
 SQL=/usr/bin/sqlite3
 FAILS=0
 ok()  { print "PASS: $*" }

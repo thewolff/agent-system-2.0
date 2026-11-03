@@ -41,7 +41,16 @@
 //                                        grace, each only while the pid's start time matches
 //                                        lane-started:), release only once it is gone
 //   cleanup <wl>                         remove the worktree when clean and pushed; keep the branch
-//   log <wl>                             print the runner log path and tail it
+//   log <wl>                             print the runner log path and tail it; for a lane whose folder is offsite on
+//                                        Drive (`lanes/<wl>.offsite`), say so and name `as2 lane restore <wl>`
+//   restore <wl> [--to <dir>] [--deadline <s>]
+//                                        put an offsite lane folder back from Drive (src/lane-offsite.ts restoreLane):
+//                                        copy and verify the tar (sha256 against the marker and the receipt, every
+//                                        manifest entry), then in place under the offsite lock (exit 75 while a retire
+//                                        or restore holds it), or to <dir>/<wl> with --to (no lock, the lanes root and
+//                                        records untouched); each external step under <s> seconds (default 3600).
+//                                        Launch, interactive and run refuse a workload whose lane marker exists (exit 11
+//                                        from prepare and the runner, before the runner's lock creates the folder)
 //   ctx-index <wl> <laneId> --by runner|starter
 //                                        after a lane's exit, detached: claim once per lane, import the
 //                                        workload's sessions folder into ctx, check the lane's session by
@@ -93,8 +102,9 @@ import {
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneReceipt, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody,
 	launchRequestedBody, doneLine, maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeOrigin, resumePlan, scratchCapMb, sessionOrigin, STARTER_EXIT, stateModelCheck, stateModelOf,
-	STOP_POLL_MS, trainBindings, worktreeBody, worktreePath,
+	STOP_POLL_MS, offsiteRefusalNote, trainBindings, worktreeBody, worktreePath,
 } from "../src/launch";
+import { hasMarker, laneArchiveStateDir, logPathFor, markerPath, RESTORE_DEADLINE_S, RESTORE_KILL_ENV, RestoreError, restoreKillHook, restoreLane, stepRunner } from "../src/lane-offsite";
 import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continueCounter, continuePrompt, deadRunPrompt, type DeadTestRun, deadTestRuns, enqueueRunnerDeath, exitOutcome, extensionsSuspendedDeathBody, extensionsSuspendedOf,
 	extensionsUnconfirmedDeathBody, configStamp, type PolledSuspension, polledSuspensionOf, readAs2ExtensionPaths, suspensionOf,
@@ -266,6 +276,8 @@ function chooseBase(repo: string): Base {
 
 /** Preflight (exit 2/3/4), worktree and branch (exit 5; the base is `chooseBase`'s, never refused), the scratch root, the system prompt file. Runs after the reservation. */
 function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
+	// PLAN wl-mw14khl4uf388q "Launch guard": never recreate an offsite lane's folder; `as2 lane restore` brings it back.
+	if (hasMarker(wl, homeDir())) throw new Fail("preflight", `${wl}: ${offsiteRefusalNote(wl)} (marker ${markerPath(wl, homeDir())})`, STARTER_EXIT.offsite!);
 	if (!which("omp")) throw new Fail("preflight", "no `omp` on PATH", STARTER_EXIT["no-omp"]!);
 	const config = profileConfig();
 	if (!existsSync(config)) throw new Fail("preflight", `no profile config at ${config}; run: as2 install`, STARTER_EXIT["no-profile"]!);
@@ -597,7 +609,8 @@ function reserveOrExit(ledger: Ledger, wl: string, who: string, interactive: boo
 	const r = reserve(ledger, wl, who, interactive);
 	if (r.ok) return r.laneId;
 	const code = /^cap\b/.test(r.reason) ? STARTER_EXIT.cap! : /^held\b/.test(r.reason) ? STARTER_EXIT.held! : /^closed\b/.test(r.reason) ? STARTER_EXIT.closed! : STARTER_EXIT["not-launchable"]!;
-	throw new Fail("reserve", `${wl} not launched: ${r.reason}`, code);
+	const reason = /^closed\b/.test(r.reason) && hasMarker(wl, homeDir()) ? `${r.reason}; ${offsiteRefusalNote(wl)}` : r.reason;
+	throw new Fail("reserve", `${wl} not launched: ${reason}`, code);
 }
 
 // ---- launch --------------------------------------------------------------------------------------
@@ -627,16 +640,19 @@ function cmdLaunch(wl: string, who: string): number {
 
 /**
  * The per-workload ctx index (MIGRATION.md item 43): `ctx-index` in its own detached process, stdio to
- * the lane dir's `ctx-index.log`, spawned as cmdLaunch spawns the runner. Every exit path calls it
- * after its exit, release and death writes, so nothing waits on ctx; the subcommand's claim lets one
- * worker per lane proceed. A spawn failure goes to stderr and changes nothing else.
+ * src/lane-offsite.ts `logPathFor(wl, "ctx-index")` with its directory as cwd: the lane dir's `ctx-index.log`, or
+ * `lanes/<wl>.ctx-index.log` in the lanes root once the lane's offsite marker exists, so the folder is never recreated.
+ * Spawned as cmdLaunch spawns the runner. Every exit path calls it after its exit, release and death writes, so nothing
+ * waits on ctx; the subcommand's claim lets one worker per lane proceed. A spawn failure goes to stderr and changes
+ * nothing else. `argv` replaces the worker's command (tests).
  */
-function spawnCtxIndex(wl: string, laneId: string, by: "runner" | "starter"): void {
+export function spawnCtxIndex(wl: string, laneId: string, by: "runner" | "starter", argv: string[] = ["bun", import.meta.path, "ctx-index", wl, laneId, "--by", by]): void {
 	try {
-		const dir = laneDir(wl, homeDir());
+		const logPath = logPathFor(wl, "ctx-index", homeDir());
+		const dir = dirname(logPath);
 		mkdirSync(dir, { recursive: true });
-		const log = openSync(join(dir, "ctx-index.log"), "a");
-		const worker = spawn(["bun", import.meta.path, "ctx-index", wl, laneId, "--by", by], {
+		const log = openSync(logPath, "a");
+		const worker = spawn(argv, {
 			cwd: dir, env: process.env, stdin: "ignore", stdout: log, stderr: log, detached: true,
 		});
 		worker.unref();
@@ -1827,6 +1843,8 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 	const ledger = openLedger();
 	const w = ledger.workload(wl);
 	if (!w) throw new Fail("run", `no workload ${wl}`, STARTER_EXIT.unknown!);
+	// Before the run lock, which lives under lanes/<wl>/ and would recreate an offsite lane's folder.
+	if (hasMarker(wl, homeDir())) throw new Fail("run", `${laneId} not started: ${wl}: ${offsiteRefusalNote(wl)} (marker ${markerPath(wl, homeDir())})`, STARTER_EXIT.offsite!);
 	const probe = runnerProbe(wl, laneId);
 	const lock = holdRunnerLock(ledger, wl, laneId, probe);
 	try {
@@ -3004,11 +3022,40 @@ function cmdCleanup(wl: string): number {
 }
 
 function cmdLog(wl: string): number {
+	if (hasMarker(wl, homeDir())) line(`${wl}: ${offsiteRefusalNote(wl)} (marker ${markerPath(wl, homeDir())})`);
 	const path = join(laneDir(wl, homeDir()), "runner.log");
 	line(path);
 	if (existsSync(path)) {
 		const tail = readFileSync(path, "utf8").split("\n").slice(-40).join("\n");
 		process.stdout.write(`${tail}\n`);
+	}
+	return 0;
+}
+
+/** `restore <wl> [--to <dir>] [--deadline <s>]`: src/lane-offsite.ts restoreLane on the real step runner; RESTORE_KILL_ENV is its test seam. */
+async function cmdRestore(wl: string, rest: string[]): Promise<number> {
+	const usage = "usage: lane.ts restore <wl> [--to <dir>] [--deadline <seconds>]";
+	let to: string | null = null;
+	let deadlineS = RESTORE_DEADLINE_S;
+	for (let i = 0; i < rest.length; i++) {
+		const a = rest[i]!;
+		const v = rest[i + 1];
+		if (a === "--to" && v !== undefined) to = v;
+		else if (a === "--deadline" && v !== undefined) {
+			deadlineS = Number(v);
+			if (!Number.isInteger(deadlineS) || deadlineS <= 0) throw new Fail("restore", `--deadline needs a whole number of seconds above 0, not ${v}; ${usage}`, 1);
+		} else throw new Fail("restore", `unexpected argument ${a}; ${usage}`, 1);
+		i += 1;
+	}
+	const home = homeDir();
+	try {
+		await restoreLane({
+			wl, home, stateDir: laneArchiveStateDir(process.env, home), to, deadlineMs: deadlineS * 1000, log: line, run: stepRunner({ log: line }),
+			kill: restoreKillHook(process.env[RESTORE_KILL_ENV]),
+		});
+	} catch (err) {
+		if (err instanceof RestoreError) throw new Fail("restore", err.message, err.code);
+		throw err;
 	}
 	return 0;
 }
@@ -3034,7 +3081,7 @@ function cmdMoveAlert(wl: string, eventId: string | undefined, again: boolean): 
 async function main(argv: string[]): Promise<number> {
 	const [cmd, wl, ...rest] = argv;
 	if (!cmd || !wl) {
-		process.stderr.write("usage: lane.ts launch|run|interactive|stop|cleanup|log|ctx-index|drain|move-alert <workload> [...]\n");
+		process.stderr.write("usage: lane.ts launch|run|interactive|stop|cleanup|log|restore|ctx-index|drain|move-alert <workload> [...]\n");
 		return 1;
 	}
 	switch (cmd) {
@@ -3055,6 +3102,8 @@ async function main(argv: string[]): Promise<number> {
 			return cmdCleanup(wl);
 		case "log":
 			return cmdLog(wl);
+		case "restore":
+			return cmdRestore(wl, rest);
 		case "ctx-index": {
 			const i = rest.indexOf("--by");
 			return runCtxIndex({
