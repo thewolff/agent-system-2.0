@@ -27,12 +27,15 @@ import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_B
 import { admitMain, citedRuns, importPart, importReport, lockRow, openLockDb, postGate, postStatus, promoteMain, publishIfOwner, reap as reapRequests, retentionPrune, revokeOpen, run, START_EXIT, verifiedPreflight, type Gh } from "../scripts/test-runner";
 import { bootstrapRefusal, mainResults, mainVerdicts, parseRunnerPreflight, SUSPECT_MAX_MS } from "../src/main-state";
 import { type Proc, snapshot, STUCK_DEFAULTS } from "../src/stuck-detect";
+import { admitProof, inspectProof, type LoadReceipt, parseProofManifest, type ProofManifest } from "../src/timing-proof";
 import { alive, tmp, unreapedTrue, until } from "./helpers";
 import { carry305, landFirst, mainRun } from "./train-world";
 
 setDefaultTimeout(180_000);
 
 const RUNNER = join(import.meta.dir, "..", "scripts", "test-runner.ts");
+/** The timing-proof controller: submit, inspect and the detached series `run` (TOOLS-REVIEW-r1 F5). */
+const PROOF_CLI = join(import.meta.dir, "..", "..", "scripts", "timing-proof.ts");
 const TEST_EXEC = join(import.meta.dir, "..", "scripts", "test-exec.ts");
 const OWNER_REPO = "thewolff/agent-system-2.0";
 const LANE = "lane-runnertest-1";
@@ -135,7 +138,7 @@ test("spins", () => {
 }, 600_000);
 `;
 
-const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7, gate: 8, skipped: 9, loud: 10, parse: 11, belief95: 12, belief90: 13, belief80: 14, spin: 15 } as const;
+const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7, gate: 8, skipped: 9, loud: 10, parse: 11, belief95: 12, belief90: 13, belief80: 14, spin: 15, proofenv: 16 } as const;
 type PrName = keyof typeof PR;
 const PR_FILES: Record<PrName, Record<string, string>> = {
 	green: { "a.test.ts": PASS("a") },
@@ -156,6 +159,18 @@ const PR_FILES: Record<PrName, Record<string, string>> = {
 	belief90: Object.fromEntries(Array.from({ length: 19 }, (_, i) => [`belief-${i}.test.ts`, i < 2 ? SKIPPED("skipped") : PASS(`belief ${i}`)])),
 	belief80: { "a.test.ts": PASS("one") + '\ntest("two", () => {});\ntest("three", () => {});\n' },
 	spin: { "spin.test.ts": SPIN },
+	proofenv: { "proof-env.test.ts": `import { beforeAll, afterAll, expect, test } from "bun:test";
+beforeAll(() => console.log("timing-proof setup proof-env.test.ts ready"));
+afterAll(() => console.log("timing-proof cleanup proof-env.test.ts reaped"));
+test("proof environment", () => {
+	expect(process.env.AS2_STUCK_BUDGET_PROOF).toBe("1");
+	expect(process.env.GH_TOKEN).toBeUndefined();
+	expect(process.env.OPENAI_API_KEY).toBeUndefined();
+	const child = Bun.spawnSync([process.execPath, "-e", "console.log(JSON.stringify({budget:process.env.AS2_STUCK_BUDGET_PROOF,secret:process.env.GH_TOKEN}))"], {env:process.env,stdout:"pipe",stderr:"pipe"});
+	expect(child.exitCode).toBe(0);
+	expect(JSON.parse(child.stdout.toString())).toEqual({budget:"1"});
+});
+` },
 };
 
 interface Fixture {
@@ -388,8 +403,10 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 	mkdirSync(libexec);
 	chmodSync(libexec, 0o755);
 	const exec = join(libexec, "exec");
+	const resourcesPath = join(root, "resources.json");
+	writeFileSync(resourcesPath, JSON.stringify({ workerCpu: 1, workerMemoryBytes: 1, reserveCpu: 0, reserveMemoryBytes: 0, calibration: "synthetic test fixture only; not host calibration" }));
 	writeFileSync(exec, renderExecWrapper({
-		root: as2, bun: process.execPath, script: TEST_EXEC, sweepScope: "groups", hooks, killGraceMs: o.killGraceMs ?? 300, sweepLockWaitMs: o.sweepLockWaitMs ?? 30_000, ...o.detect,
+		root: as2, bun: process.execPath, script: TEST_EXEC, sweepScope: "groups", hooks, resourcesPath, killGraceMs: o.killGraceMs ?? 300, sweepLockWaitMs: o.sweepLockWaitMs ?? 30_000, ...o.detect,
 	}));
 	writeFileSync(join(libexec, "bun"), "stand-in for the installed bun\n");
 	writeFileSync(join(libexec, "test-exec.js"), "stand-in for the installed bundle\n");
@@ -1848,6 +1865,18 @@ describe("the preflight refreshes a drifted bundle before the first sweep (PLAN 
 		expect(sudoCalls(w)).toEqual(["refresh"]);
 	});
 
+	test("T2a: the helper exits 71; the reason names exit 71's causes, the resource policy first, with the helper's last stderr line", async () => {
+		const w = world();
+		setRefresh(w, `echo "as2test-refresh: ${join(w.libexec, "resources.json")}, the measured resource policy the executor requires, is missing" >&2\nexit 71`);
+		writeSource(w.libexec, { inputSha: "f".repeat(64) });
+		const { run } = await runGreen(w);
+		expect(run.verdict).toBe("error");
+		expect(run.reason).toBe(
+			`preflight: bundle-refresh-failed: the refresh helper build (exit 71: ${join(w.libexec, "resources.json")} missing or unusable, or the build, a check of its output, a signal or the helper's cap stopped it): as2test-refresh: ${join(w.libexec, "resources.json")}, the measured resource policy the executor requires, is missing`,
+		);
+		expect(sudoCalls(w)).toEqual(["refresh"]);
+	});
+
 	test("T2b: a helper past the runner's cap gets SIGTERM, then SIGKILL; the runner waits for its sudo to exit, and the run is error bundle-refresh-failed naming the cap", async () => {
 		const w = world();
 		// It ignores TERM, as a root helper's sudo may never pass one on: only the SIGKILL ends it.
@@ -1928,7 +1957,7 @@ describe("the preflight refreshes a drifted bundle before the first sweep (PLAN 
 		expect(run.verdict).toBe("error");
 		const head12 = g(REPO, "rev-parse", "HEAD").slice(0, 12);
 		expect(run.reason).toBe(
-			`preflight: checkout-drift: surface/scripts/test-exec.ts in the runner's checkout ${REPO} (HEAD ${head12}) differs from the bundle, which is built from origin/main ${OLD12}; bring the checkout to origin/main`,
+			`preflight: checkout-drift: surface/scripts/test-exec.ts in the runner's checkout ${REPO} (HEAD ${head12}) differs from the bundle, which is built from the commit refs/tags/as2-verified names, ${OLD12}; bring the checkout to that commit`,
 		);
 		expect(sudoCalls(w)).toEqual(["refresh"]);
 	});
@@ -5190,4 +5219,351 @@ describe.if(process.env.AS2_STUCK_FIELD_SOAK === "1")("field soak (field-soak.sh
 			await close(`injected ${mode}`, kids, seen, stop, errors);
 		}, 20 * 60_000);
 	}
+});
+
+// Proofs use these real world fixtures and the same rendered wrapper as ordinary runs, never a substitute execution loop.
+describe("finite timing proofs on the exclusive runner", () => {
+	/** Preserve new proof worlds on any failure; the file's ordinary afterAll must not erase their receipts. */
+	function proofTest(name: string, body: () => unknown | Promise<unknown>): void {
+		test(name, async () => {
+			const firstRoot = roots.length;
+			try { await body(); }
+			catch (error) {
+				const retained = roots.splice(firstRoot);
+				throw new Error(`timing proof failed; fixture evidence retained at ${retained.join(", ")}`, { cause: error });
+			}
+		});
+	}
+	function proofEach<T extends string>(values: readonly T[], name: string, body: (value: T) => unknown | Promise<unknown>): void {
+		for (const value of values) proofTest(name.replace("%s", value), () => body(value));
+	}
+	// Use the production connection's existing contention policy, not lockDbOf's intentional zero-wait fault-injection policy.
+	const proofDbOf = (w: World): Database => openLockDb(w.runs);
+	function manifest(wl: string, slice: string, sha: string, file = "a.test.ts", names = ["a"]): ProofManifest {
+		return parseProofManifest({
+			version: 1, kind: "smoke", workload: wl, slice, repo: OWNER_REPO, baseSha: sha, candidateSha: sha,
+			mode: "isolated", productionBudget: false, load: "none", runs: { base: 0, candidate: 2 },
+			files: [{ path: file, cases: names.map((name) => ({ base: [name], candidate: [name], budgetMs: 5000, timingUnderTest: false })),
+				hooks: { base: { setup: [], cleanup: [] }, candidate: { setup: [], cleanup: [] } }, skipped: { base: [], candidate: [] } }],
+		});
+	}
+	/**
+	 * The installed runtime files submission hashes into a proof's identity (installedRuntimeHashes), provisioned as synthetic
+	 * fixtures: `<libexec>/resources.json` is a copy of the synthetic policy the world's wrapper runs under, and an installed-OMP
+	 * proof gets a synthetic `<libexec>/installed-omp.json` pin. The world's wrapper reads its OMP pin beside the real Bun, never
+	 * this one, so the installed-OMP proof still fails closed on its executor. Rewriting the same bytes keeps the identity stable.
+	 */
+	function installProofRuntime(w: World, mode: ProofManifest["mode"]): void {
+		writeFileSync(join(w.libexec, "resources.json"), readFileSync(join(w.root, "resources.json")));
+		if (mode === "installed-OMP") {
+			writeFileSync(join(w.libexec, "installed-omp.json"), JSON.stringify({ root: join(w.root, "synthetic-omp"), treeSha256: "0".repeat(64), version: "synthetic test fixture only; no OMP installed" }));
+		}
+	}
+	/** The production submit path: the controller CLI, as a lane runs it, over the synthetic installed runtime. */
+	function submitRaw(w: World, m: ProofManifest) {
+		installProofRuntime(w, m.mode);
+		const path = join(w.root, "proof-manifest.json");
+		writeFileSync(path, JSON.stringify(m));
+		return Bun.spawnSync([process.execPath, PROOF_CLI, "submit", "--manifest", path], { env: w.env, stdout: "pipe", stderr: "pipe" });
+	}
+	function submit(w: World, m: ProofManifest) {
+		const r = submitRaw(w, m);
+		if (r.exitCode !== 0) throw new Error(`proof submit exit ${r.exitCode}: ${r.stderr.toString()}`);
+		const id = /^timing-proof (tp-[a-z0-9]+) admitted/m.exec(r.stdout.toString())?.[1];
+		if (!id) throw new Error(`proof submit returned no series: ${r.stdout.toString()}`);
+		return id;
+	}
+	/** A direct admission for a test that drives the series `run` itself; its executable inputs are distinct per candidate SHA. */
+	function admitDirect(db: Database, id: string, m: ProofManifest) {
+		const tree = (sha: string) => ({ sha, tree: sha.padEnd(64, "0") });
+		admitProof(db, id, m, { base: tree(m.baseSha), candidate: tree(m.candidateSha), runtime: { mode: m.mode, executor: { exec: "3".repeat(64) }, identity: "3".repeat(64) } }, Date.now());
+	}
+	async function terminal(w: World, id: string) {
+		const db = proofDbOf(w);
+		try {
+			return await until(`proof ${id} terminal`, () => {
+				const p = inspectProof(db, id);
+				return p.state === "failed" || p.state === "complete" ? p : null;
+			}, 120_000);
+		} finally { db.close(); }
+	}
+	proofTest("ordinary queue preserves a live proof waiter and gets its turn between finite iterations", async () => {
+		const w = world(), first = workload(w), proof = workload(w), other = workload(w);
+		const firstId = request(w, first.wl, first.slice, PR.green, fx.head.green);
+		arm(w, firstId, "phase-full");
+		const firstChild = spawnRun(w, firstId);
+		let otherChild: Subprocess | null = null;
+		let proofRunId = "", otherId = "", id = "";
+		try {
+			await reached(w, firstId, "phase-full");
+			id = submit(w, manifest(proof.wl, proof.slice, fx.head.green));
+			const db = proofDbOf(w);
+			let queuedAt = 0;
+			try {
+				const row = await until("proof registered in ordinary exclusive queue", () => db.query<{ runId: string; requestedAt: number }, [string]>("SELECT runId, requestedAt FROM queue WHERE workloadId = ?").get(proof.wl), 60_000);
+				proofRunId = row.runId; queuedAt = row.requestedAt;
+			} finally { db.close(); }
+			arm(w, proofRunId, "phase-solo");
+			otherId = w.pin(new Date(queuedAt + 1).toISOString(), () => request(w, other.wl, other.slice, PR.green, fx.head.green));
+			arm(w, otherId, "phase-full"); otherChild = spawnRun(w, otherId);
+			go(w, firstId, "phase-full");
+			await reached(w, proofRunId, "phase-solo");
+			const ordering = proofDbOf(w);
+			try {
+				await until("ordinary waiter registered before proof release", () => ordering.query("SELECT runId FROM queue WHERE runId = ?").get(otherId), 60_000);
+				// Inject the queue's logical sort input, rather than depending on how many wall milliseconds the tiny part takes.
+				ordering.query("UPDATE queue SET requestedAt = ? WHERE runId = ?").run(queuedAt - 1, otherId);
+			} finally { ordering.close(); }
+			go(w, proofRunId, "phase-solo");
+			await reached(w, otherId, "phase-full");
+			const check = proofDbOf(w);
+			try {
+				const p = await until("next proof iteration queued behind ordinary owner", () => {
+					const p = inspectProof(check, id);
+					return p.iterations.length === 2 && p.iterations[1]!.state === "running" ? p : null;
+				}, 60_000);
+				expect(lockRow(check)?.runId).toBe(otherId);
+				expect(p.iterations[0]!.state).toBe("complete");
+			} finally { check.close(); }
+			go(w, otherId, "phase-full");
+			expect((await terminal(w, id)).state).toBe("complete");
+			expect((await resultOf(w, other.wl, otherId)).verdict).toBe("green");
+		} finally {
+			go(w, firstId, "phase-full");
+			if (proofRunId) go(w, proofRunId, "phase-solo");
+			if (otherId) go(w, otherId, "phase-full");
+			await firstChild.exited;
+			if (otherChild) await otherChild.exited;
+		}
+	});
+	proofTest("productionBudget reaches real child/descendant without credentials; actual setup and cleanup markers are required", async () => {
+		const w = world(), { wl, slice } = workload(w);
+		const m = manifest(wl, slice, fx.head.proofenv, "proof-env.test.ts", ["proof environment"]);
+		m.productionBudget = true;
+		for (const phase of ["base", "candidate"] as const) m.files[0]!.hooks[phase] = { setup: ["ready"], cleanup: ["reaped"] };
+		const p = await terminal(w, submit(w, m));
+		expect(p.error).toBeNull(); expect(p.state).toBe("complete");
+		for (const i of p.iterations) {
+			const receipt = JSON.parse(readFileSync(join(w.runs, i.runId, "proof.json"), "utf8"));
+			expect(receipt.execution.markers).toEqual(["timing-proof setup proof-env.test.ts ready", "timing-proof cleanup proof-env.test.ts reaped"]);
+			expect(receipt.resources.executionArgv).toContain("./proof-env.test.ts");
+		}
+	});
+	proofTest("installed-OMP mode cannot fall back to the groups/operator executor or publish a green", async () => {
+		const w = world(), { wl, slice } = workload(w);
+		const m = manifest(wl, slice, fx.head.green); m.mode = "installed-OMP";
+		const p = await terminal(w, submit(w, m));
+		expect(p.state).toBe("failed"); expect(p.iterations).toHaveLength(1);
+		const receipt = JSON.parse(readFileSync(join(w.runs, p.iterations[0]!.runId, "solo-1.resources.json"), "utf8"));
+		expect(receipt.status).toBe("error");
+		expect(receipt.error).toContain("actual _as2test");
+		expect(receipt.executionArgv).toBeNull();
+		expect(w.ledger.slice(slice)?.state).toBe("open");
+		expect(testRuns(w.ledger.entries(wl))).toHaveLength(0);
+		expect(existsSync(join(w.root, "status-ok.log"))).toBe(false);
+	});
+	proofTest("submit/inspect queues two actual solos, preserves JUnit/resources/cleanup, and settles no slice or status", async () => {
+		const w = world(), { wl, slice } = workload(w);
+		const id = submit(w, manifest(wl, slice, fx.head.green));
+		const p = await terminal(w, id);
+		expect(p.error).toBeNull();
+		expect(p.state).toBe("complete");
+		expect(p.iterations).toHaveLength(2);
+		expect(new Set(p.iterations.map((i) => i.runId)).size).toBe(2);
+		for (const i of p.iterations) {
+			const dir = join(w.runs, i.runId);
+			const receipt = JSON.parse(readFileSync(join(dir, "proof.json"), "utf8"));
+			expect(receipt.execution.cases.map((c: { name: string }) => c.name)).toEqual(["a"]);
+			expect(receipt.resources.status).toBe("admitted");
+			expect(receipt.cleanup.state).toBe("verified");
+			expect(existsSync(workDirOf(i.runId, w.as2))).toBe(false);
+			expect(readFileSync(join(dir, "solo-1.xml"), "utf8")).toContain('name="a"');
+			expect(readFileSync(join(dir, "wrapper.jsonl"), "utf8")).toContain(`./a.test.ts`);
+		}
+		const inspected = Bun.spawnSync([process.execPath, PROOF_CLI, "inspect", "--series", id], { env: w.env, stdout: "pipe", stderr: "pipe" });
+		expect(inspected.exitCode).toBe(0);
+		expect(JSON.parse(inspected.stdout.toString()).completionProof).toBe(false);
+		expect(w.ledger.slice(slice)?.state).toBe("open");
+		expect(testRuns(w.ledger.entries(wl))).toHaveLength(0);
+		expect(existsSync(join(w.root, "status-ok.log"))).toBe(false);
+	});
+	proofTest("five fresh full executions ignore an existing main green and leave it unchanged", async () => {
+		const w = world(), { wl, slice } = workload(w);
+		mainRun(w.ledger, "tr-existingproofgreen", fx.head.green, "green", { exec: { files: 2, tests: 2, treeFiles: 2 } });
+		const before = mainResults(w.ledger.entries(STANDING_WORKLOAD_ID));
+		const m = manifest(wl, slice, fx.head.green);
+		m.kind = "full-series"; m.runs = { base: 0, candidate: 5 };
+		m.files.push({ ...m.files[0]!, path: "xa.test.ts", cases: [{ base: ["xa"], candidate: ["xa"], budgetMs: 5000, timingUnderTest: false }] });
+		const p = await terminal(w, submit(w, m));
+		expect(p.error).toBeNull(); expect(p.state).toBe("complete"); expect(p.iterations).toHaveLength(5);
+		expect(new Set(p.iterations.map((i) => i.runId)).size).toBe(5);
+		for (const i of p.iterations) {
+			const receipt = JSON.parse(readFileSync(join(w.runs, i.runId, "proof.json"), "utf8"));
+			expect(receipt.part.stem).toBe("full"); expect(receipt.execution.cases).toHaveLength(2); expect(receipt.cleanup.state).toBe("verified");
+		}
+		expect(mainResults(w.ledger.entries(STANDING_WORKLOAD_ID))).toEqual(before);
+		expect(testRuns(w.ledger.entries(wl))).toHaveLength(0);
+	});
+	proofEach(["red", "skipped", "missing"] as const, "%s stops at the first candidate and cannot replay on restart", async (kind) => {
+		const w = world(), { wl, slice } = workload(w);
+		const m = kind === "red" ? manifest(wl, slice, fx.head.red, "red.test.ts", [...Array.from({ length: 25 }, (_, i) => `case ${String(i + 1).padStart(2, "0")}`), "passes"])
+			: manifest(wl, slice, kind === "skipped" ? fx.head.skipped : fx.head.green, "a.test.ts", [kind === "skipped" ? "a skipped" : "missing"]);
+		const id = submit(w, m), p = await terminal(w, id);
+		expect(p.state).toBe("failed"); expect(p.iterations).toHaveLength(1);
+		expect(existsSync(join(w.runs, p.iterations[0]!.runId, "solo-1.xml"))).toBe(true);
+		const restart = Bun.spawnSync([process.execPath, PROOF_CLI, "run", id], { env: w.env, stdout: "pipe", stderr: "pipe" });
+		expect(restart.exitCode).toBe(3);
+		expect(existsSync(workDirOf(p.iterations[0]!.runId, w.as2))).toBe(true);
+		expect(existsSync(join(w.runs, p.iterations[0]!.runId, "proof-retained-world.json"))).toBe(true);
+		const db = proofDbOf(w);
+		try { expect(inspectProof(db, id).iterations).toHaveLength(1); } finally { db.close(); }
+		expect(w.ledger.slice(slice)?.state).toBe("open");
+	});
+	proofTest("admission rejects a SHA not fetched from served origin and an arbitrary environment", () => {
+		const w = world(), { wl, slice } = workload(w);
+		for (const bad of [{ ...manifest(wl, slice, fx.head.green), candidateSha: "f".repeat(40) }, { ...manifest(wl, slice, fx.head.green), env: { GH_TOKEN: "smuggled" } }]) {
+			const r = submitRaw(w, bad as ProofManifest);
+			expect(r.exitCode).not.toBe(0);
+			const db = proofDbOf(w);
+			try { expect(db.query("SELECT id FROM timing_proofs").all()).toHaveLength(0); } finally { db.close(); }
+		}
+	});
+	proofEach(["proof-cleanup-published", "proof-cleanup-transferred"], "crash at %s retains interrupted attempt; next ordinary owner republishes and reaps its world", async (boundary) => {
+		const w = world(), { wl, slice } = workload(w);
+		const db = proofDbOf(w), id = "tp-crashproof";
+		try { admitDirect(db, id, manifest(wl, slice, fx.head.green)); } finally { db.close(); }
+		arm(w, id, "proof-iteration");
+		const child = Bun.spawn([process.execPath, PROOF_CLI, "run", id], { env: w.env, stdout: "ignore", stderr: "ignore" });
+		let runId = "";
+		try {
+			await reached(w, id, "proof-iteration");
+			runId = JSON.parse(readFileSync(`${hookBase(w, id, "proof-iteration")}.reached`, "utf8")).runId;
+			arm(w, runId, boundary); go(w, id, "proof-iteration");
+			await reached(w, runId, boundary);
+		} finally { child.kill("SIGKILL"); await child.exited; }
+		const originalRoot = workDirOf(runId, w.as2);
+		expect(existsSync(originalRoot)).toBe(true);
+		expect(existsSync(join(w.runs, runId, "proof-cleanup.json"))).toBe(true);
+		// Model the dead holder's lease expiry directly; the behavior is crash recovery, not a wall-clock race.
+		writeFileSync(join(w.runs, runId, "heartbeat"), heartbeatText(runId, Date.now() - 120_000));
+		staleRow(w);
+		const ordinary = request(w, wl, slice, PR.green, fx.head.green);
+		const next = spawnRun(w, ordinary);
+		try {
+			const result = await resultOf(w, wl, ordinary);
+			expect(result.verdict).toBe("green");
+			await next.exited;
+		} finally { if (next.exitCode === null) { next.kill("SIGKILL"); await next.exited; } }
+		const check = proofDbOf(w);
+		try {
+			const p = inspectProof(check, id);
+			expect(p.state).toBe("failed"); expect(p.iterations).toHaveLength(1); expect(p.iterations[0]!.state).toBe("interrupted");
+			expect(lockRow(check)).toBeNull();
+		} finally { check.close(); }
+		expect(existsSync(originalRoot)).toBe(false);
+		expect(readFileSync(join(w.runs, runId, "proof-recovery.jsonl"), "utf8")).toContain("originalError");
+	});
+
+	// ---- TOOLS-REVIEW-r1 F1: the historic load outlives no owner ----------------------------------------------------------
+	const liveOf = (pids: number[]): number[] => {
+		const s = snapshot(process.getuid!());
+		if (s.kind !== "ok") throw new Error(`process list of this uid unavailable: ${s.why}`);
+		return pids.filter((pid) => s.procs.some((p) => p.pid === pid && !p.zombie));
+	};
+	proofEach(["SIGKILL", "SIGSTOP"] as const, "a controller lost to %s after its historic load is ready leaks no load; the next owner recovers it before any part", async (signal) => {
+		const w = world(), { wl, slice } = workload(w);
+		const m = manifest(wl, slice, fx.head.green);
+		m.kind = "full-series"; m.runs = { base: 0, candidate: 5 }; m.load = "historic";
+		m.files.push({ ...m.files[0]!, path: "xa.test.ts", cases: [{ base: ["xa"], candidate: ["xa"], budgetMs: 5000, timingUnderTest: false }] });
+		const id = signal === "SIGKILL" ? "tp-loadkilled" : "tp-loadstopped";
+		const db = proofDbOf(w);
+		try { admitDirect(db, id, m); } finally { db.close(); }
+		arm(w, id, "proof-iteration");
+		// No run heartbeat after the first: the lost holder's staleness below is then the only one (as the supersede tests do).
+		const child = Bun.spawn([process.execPath, PROOF_CLI, "run", id], { env: { ...w.env, AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS: "600000" }, stdout: "ignore", stderr: "ignore" });
+		let pids: number[] = [];
+		try {
+			await reached(w, id, "proof-iteration");
+			const runId: string = JSON.parse(readFileSync(`${hookBase(w, id, "proof-iteration")}.reached`, "utf8")).runId;
+			arm(w, runId, "phase-full"); go(w, id, "proof-iteration");
+			// The load is started, and every process has announced readiness, before the part's hook.
+			await reached(w, runId, "phase-full");
+			const loadPath = join(w.runs, runId, "load.json");
+			const launched: LoadReceipt = JSON.parse(readFileSync(loadPath, "utf8"));
+			pids = launched.processes.map((p) => p.pid);
+			expect(pids).toHaveLength(14);
+			expect(liveOf(pids)).toEqual(pids);
+			child.kill(signal);
+			if (signal === "SIGKILL") {
+				await child.exited;
+				await until("every load process ended with its killed owner", () => liveOf(pids).length === 0, 30_000);
+			}
+			// Model the lost holder's lease expiry directly; the behavior is recovery, not a wall-clock race.
+			writeFileSync(join(w.runs, runId, "heartbeat"), heartbeatText(runId, Date.now() - 120_000));
+			staleRow(w);
+			const ordinary = request(w, wl, slice, PR.green, fx.head.green);
+			const next = spawnRun(w, ordinary);
+			try {
+				expect((await resultOf(w, wl, ordinary)).verdict).toBe("green");
+				await next.exited;
+			} finally { if (next.exitCode === null) { next.kill("SIGKILL"); await next.exited; } }
+			expect(liveOf(pids)).toEqual([]);
+			const recovered: LoadReceipt = JSON.parse(readFileSync(loadPath, "utf8"));
+			expect(recovered.state).toBe("recovered");
+			const recovery = readFileSync(join(w.runs, runId, "load-recovery.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l) as { by: string; outcomes: { outcome: string }[] });
+			expect(recovery.map((r) => r.by)).toEqual([ordinary]);
+			const outcomes = recovery[0]!.outcomes.map((o) => o.outcome);
+			expect(outcomes).toHaveLength(14);
+			// A stopped owner's load is still running; a killed owner's load ended at its stdin EOF, or is killed if still exiting.
+			for (const o of outcomes) expect(signal === "SIGSTOP" ? ["killed"] : ["gone", "killed"]).toContain(o);
+			const check = proofDbOf(w);
+			try {
+				const p = inspectProof(check, id);
+				expect(p.state).toBe("failed"); expect(p.iterations[0]!.state).toBe("interrupted");
+			} finally { check.close(); }
+		} finally {
+			if (child.exitCode === null) { child.kill("SIGKILL"); await child.exited; }
+			for (const pid of liveOf(pids)) {
+				try { process.kill(-pid, "SIGKILL"); }
+				catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH" && (error as NodeJS.ErrnoException).code !== "EPERM") throw error; }
+			}
+		}
+	});
+
+	// ---- TOOLS-REVIEW-r1 F4: production submit keys a failure to its executable inputs ------------------------------------
+	proofTest("production submit refuses an equivalent failed tree: an empty commit, decision-log churn, a new diagnosis or workload", async () => {
+		const w = world(), { wl, slice } = workload(w), other = workload(w);
+		const names = [...Array.from({ length: 25 }, (_, i) => `case ${String(i + 1).padStart(2, "0")}`), "passes"];
+		const first = await terminal(w, submit(w, manifest(wl, slice, fx.head.red, "red.test.ts", names)));
+		expect(first.state).toBe("failed");
+		const redTree = g(w.origin, "rev-parse", `${fx.head.red}^{tree}`);
+		const empty = g(w.origin, "commit-tree", redTree, "-p", fx.head.red, "-m", "retry without change");
+		// Decision-log churn: the red tree plus one new .ai/decision-log entry, built in a scratch index.
+		const index = { ...GIT_ENV, GIT_INDEX_FILE: join(w.root, "churn.index") };
+		const gi = (...args: string[]): string => {
+			const r = Bun.spawnSync(["git", ...args], { cwd: w.origin, env: index, stdout: "pipe", stderr: "pipe" });
+			if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
+			return r.stdout.toString().trim();
+		};
+		gi("read-tree", redTree);
+		gi("update-index", "--add", "--cacheinfo", `100644,${g(w.origin, "rev-parse", `${fx.head.red}:red.test.ts`)},.ai/decision-log/2026-10-31--0000--lane--retry.md`);
+		const churn = g(w.origin, "commit-tree", gi("write-tree"), "-p", empty, "-m", "decision log only");
+		g(w.origin, "update-ref", "refs/heads/proof-empty", empty);
+		g(w.origin, "update-ref", "refs/heads/proof-churn", churn);
+		const refused: { sha: string; wl: string; slice: string; diagnosis: string; why: string }[] = [
+			{ sha: empty, wl, slice, diagnosis: "an empty commit after the red", why: "executes the same inputs as failed" },
+			{ sha: churn, wl: other.wl, slice: other.slice, diagnosis: "infrastructure only: the host was busy", why: "executes the same inputs as failed" },
+			{ sha: fx.head.red, wl: other.wl, slice: other.slice, diagnosis: "budgets raised under another workload", why: "already observed" },
+		];
+		for (const r of refused) {
+			const m = { ...manifest(r.wl, r.slice, r.sha, "red.test.ts", names), diagnosis: r.diagnosis };
+			m.files[0]!.cases[0]!.budgetMs = 10_000;
+			const out = submitRaw(w, m);
+			expect(out.exitCode).not.toBe(0);
+			expect(out.stderr.toString()).toContain(r.why);
+		}
+		const db = proofDbOf(w);
+		try { expect(db.query("SELECT id FROM timing_proofs").all()).toEqual([{ id: first.id }]); } finally { db.close(); }
+		expect(w.ledger.slice(slice)?.state).toBe("open");
+	});
 });

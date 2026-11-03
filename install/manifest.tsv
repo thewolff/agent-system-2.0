@@ -1491,6 +1491,13 @@ surface/test/fixtures/timing-lint/positive.txt	test	-
 surface/test/fixtures/timing-lint/negative.txt	test	-
 surface/test/fixtures/timing-lint/opt-out.txt	test	-
 surface/test/fixtures/timing-lint/opt-out-bad.txt	test	-
+# Test-timing automation, isolated proof requests and executor-owned resource admission.
+surface/src/timing-automation.ts	module	-
+surface/test/timing-automation.test.ts	test	-
+surface/src/timing-proof.ts	module	-
+surface/test/timing-proof.test.ts	test	-
+surface/src/test-resources.ts	module	-
+surface/test/test-resources.test.ts	test	-
 # as2 doctor (PLAN wl-mvwks11ye3x9zu): the checks, episodes and popups, the CLI, the entry text forms, the alarm popup, the fakes.
 surface/src/doctor.ts	module	-
 surface/src/doctor-entries.ts	module	-

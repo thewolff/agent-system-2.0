@@ -1223,6 +1223,28 @@ export function parseJunit(xml: string, opts: { maxBytes?: number } = {}): Junit
 	return { ok: true, tests, pass, fail, skip: skipped, failures: out };
 }
 
+/** Strict per-case evidence for finite timing proofs; shares the normal runner's XML reader. */
+export function junitCases(xml: string): { file: string; name: string; status: "pass" | "fail" | "skip"; ms: number }[] {
+	const report = parseJunit(xml);
+	if (!report.ok) throw new Error(report.error);
+	const out: { file: string; name: string; status: "pass" | "fail" | "skip"; ms: number }[] = [];
+	eachCase(parseXml(xml), (c, file, describes) => {
+		const skipped = c.children.some((n) => n.name === "skipped");
+		const seconds = c.attrs.time ?? (skipped ? "0" : undefined);
+		if (seconds === undefined || !/^(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(seconds) || !Number.isFinite(Number(seconds))) {
+			throw new Error(`junit case ${file} > ${c.attrs.name ?? "?"} has no finite duration`);
+		}
+		if (!c.attrs.name) throw new Error(`junit case in ${file} has no name`);
+		out.push({
+			file: repoRel(file), name: [...describes, c.attrs.name].join(" > "),
+			status: skipped ? "skip" : c.children.some((n) => n.name === "failure" || n.name === "error") ? "fail" : "pass",
+			ms: Number(seconds) * 1000,
+		});
+	});
+	if (out.filter((c) => c.status === "skip").length !== report.skip) throw new Error("junit skipped case count disagrees with report");
+	return out;
+}
+
 /**
  * The files a junit report ran at least one test of (PLAN wl-mvq4edh02r5z40 D1, the required coverage): each file, repo-relative
  * with any `./` dropped, one of whose `<testcase>` elements has no `<skipped>` child (Bun 1.3.14 writes `<skipped />` for a skip
