@@ -1555,3 +1555,4 @@ surface/test/quota-watch.test.ts	test	-
 surface/test/alert-replay.test.ts	test	-
 surface/test/fixtures/alert-replay/source-rows.json	test	-
 surface/test/fixtures/alert-replay/snapshot-10-52Z.json	test	-
+surface/test/fixtures/alert-replay/load.ts	test	-
