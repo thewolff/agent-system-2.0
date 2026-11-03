@@ -721,7 +721,10 @@ class Run {
 	laneTurn(request: StubRequest): StubTurn {
 		for (const r of request.results) if (r.name !== null && !this.laneResults.has(r.toolUseId)) this.laneResults.set(r.toolUseId, `${r.name}${r.isError ? " (error)" : ""}: ${oneLine(r.text, 240)}`);
 		const brief = (slice: string, task: string, done: string, inputs: string) =>
-			`slice: ${slice}\nworkload: ${this.wl}\ntask: ${task}\ndone-condition: ${done}\ninputs: ${inputs}\nstakes: normal\nceiling-share: 10`;
+			`slice: ${slice}\nworkload: ${this.wl}\ntask: ${task}\ndone-condition: ${done}\ninputs: ${inputs}\nstakes: normal\nceiling-share: 10\n` +
+			// P-11 row 5 refuses a dispatch without this section (Jo 2026-10-28, issue #334 item 2); without it the scripted
+			// hand never runs, the lane parks, and every lane fault ends in HARNESS-ERROR before its trigger.
+			"## How it fails\nbun test chaos/ exits non-zero: the hand reports the failing line and stops; one attempt, no retry.";
 		const plan: { tool: string; input: Record<string, unknown>; afterHands?: number }[] = [
 			{ tool: "ledger_wake_read", input: { body: `chaos ${this.token}: fresh workload ${this.wl}, no slices yet; next: cut the change slice.`, i: "Recording the wake read" } },
 			{ tool: "lane_add_slice", input: { id: SL_CHANGE, kind: "change-small", task: "append one line to chaos/scratch.txt and run bun test chaos/", doneCondition: "bun test chaos/ exits 0 with the line appended to chaos/scratch.txt", inputs: "chaos/scratch.txt and chaos/scratch.test.ts in the lane worktree", i: "Adding the change slice" } },
