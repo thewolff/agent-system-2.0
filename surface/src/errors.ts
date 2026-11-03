@@ -119,8 +119,9 @@ import { localMinute, openDowns, POPUP_ATTEMPT_LIMIT, popupAttempts } from "./do
 import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, landFirstOffPending, laneExit, mainRetries, queuedOf, sameRepo } from "./launch";
 import {
 	boardRefusals, landFirstRepos, landFirstRows, type LandFirstRow, latestTrainReconciled, mainRedNotices, protectionEpisodes, RECONCILED_STALE_MS, stopEpisode, type TaskWindow,
-	theTrain, TRAIN_ALERT_LADDER, trainAlertLevel, trainCheckout, trainMembers, trainTaskWindows,
+	theTrain, trainCheckout, trainMembers, trainTaskWindows,
 } from "./merge-train";
+import { ALERT_LADDER, alertLevel, alertRecords } from "./alert-path";
 import { attemptBlock, mainResults, mainVerdicts, parseRunnerPreflight } from "./main-state";
 import { questionSubject } from "./orchestrator-question";
 import { answerable } from "./numbering";
@@ -907,9 +908,9 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			const offer = openPairOffer(ledger, q);
 			if (offer) questions.push({ kind: "pair", workloadId: wl, rowId: q.id, state: "offer", next: `Answer pair ${q.id}`, line: pairOfferLine(wordsOf(ledger, wl, control), q.id, wl, offer.signals) });
 			const body = isPlanQuestionIn(control, q) ? `\n  ${q.body.split("\n").join("\n  ")}` : ` ${short(q.body, 120)}`;
-			// D9's re-send: level 2 or 3 of the train tick's ladder makes the line LOUD, each level a new state.
-			const loud = trainAlertLevel(control, q.id);
-			const step = loud >= 2 ? TRAIN_ALERT_LADDER.find((s) => s.level === loud) : undefined;
+			// D4: level 2 or 3 of the question's `q:` alert key (the alert path's ladder) makes the line LOUD, each level a new state.
+			const loud = alertLevel(alertRecords(controlEntries(ledger.entries(STANDING_WORKLOAD_ID))), `q:${q.id}`);
+			const step = loud >= 2 ? ALERT_LADDER.find((s) => s.level === loud) : undefined;
 			const tag = `${nowTag}${step ? `LOUD${step.labels.includes("critical") ? ", critical" : ""} (unacknowledged ${step.afterMs / 3_600_000} h): ` : ""}`;
 			const asker = q.created_by === MERGE_TRAIN_BY ? `merge train ${label} needs you` : `lane on ${label} is waiting on you`;
 			// A NOW question is on fire from its first poll (batch.ts onFire), so its state stays `now` whatever the ladder's level.

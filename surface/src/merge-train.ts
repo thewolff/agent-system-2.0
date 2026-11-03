@@ -1872,143 +1872,22 @@ function openRetryQuestion(ledger: Ledger, wl: string, pr: number): QuestionRow 
 	return ledger.questions(wl).find((q) => q.slice_id === sl && q.state === "open" && (JSON.parse(q.options) as string[]).includes("retry")) ?? null;
 }
 
-// ---- part 3: what Jo hears, and the re-send (rev 17.1 D9-D10) ------------------------------------
+// ---- part 3: what Jo hears (rev 17.1 D9-D10) ------------------------------------------------------
+// The send ladder, its records and its actions moved to surface/src/alert-path.ts (PLAN wl-mw0vs9uc3xqtka D1), which carries
+// every Jo-directed alert; a train question is its `q:` key. What stays here is the train's own: where its issues go, the
+// failed-twice question and its options, and the reason a train question names.
 
 /** Where every train alert is filed (D9): an issue on Jo's issues repository. */
 export const TRAIN_ALERT_REPO = "thewolff/jo-issues";
 /** The label every issue the train files carries (Jo's in-mv93i1qi9mypkw): the issues intake skips it, and no re-send removes it. */
 export const TRAIN_ALERT_LABEL = "as2-train";
-/** Who a re-send mentions (D9's ladder). */
+/** Who a level 2 or 3 re-send mentions (D9's ladder). */
 export const TRAIN_ALERT_MENTION = "@thewolff";
 /** The options of the alert the tick raises when attempt 2 settled failed (D9): `retry` grants two more attempts (`nextAttempt`). */
 export const TRAIN_RETRY_OPTIONS: readonly string[] = ["retry", "skip", "stop"];
-/**
- * The send ladder (D9 F14): level 1 is the issue, at raise; levels 2 and 3 re-send it louder this long after level 1 was sent,
- * with these labels added beside `as2-train` (a comment mentioning Jo, a macOS notification with sound, a LOUD needs-you line).
- * Nothing is sent after level 3.
- */
-export const TRAIN_ALERT_LADDER: readonly { level: number; afterMs: number; labels: readonly string[] }[] = [
-	{ level: 1, afterMs: 0, labels: [] },
-	{ level: 2, afterMs: 4 * 3_600_000, labels: ["loud"] },
-	{ level: 3, afterMs: 8 * 3_600_000, labels: ["loud", "critical"] },
-];
-
-/** The marker an alert's issue body (level 1) or comment (levels 2, 3) carries, so a retried send finds it before creating another. */
-export function trainAlertMarker(q: string, level: number): string {
-	return `<!-- train-alert ${q} level ${level} -->`;
-}
-
-/** A step of one send (D9): `sending` before the effects, `notified` after the notification, `sent` after them all (with the issue's url). */
-export type AlertStep = "sending" | "notified" | "sent";
-
-/** `train-alert: <q> level <n> sending|notified|sent [<issue url>]`, the tick's (MERGE_TRAIN_BY) record of a send. */
-export function trainAlertBody(q: string, level: number, step: AlertStep, url?: string): string {
-	return `train-alert: ${q} level ${level} ${step}${url ? ` ${url}` : ""}`;
-}
-
-/** `train-alert: <q> acked <why>` (Jo closed the issue: no more re-sends) or `train-alert: <q> closed <why>` (the tick closed it after Jo's answer). */
-export function trainAlertEndBody(q: string, end: "acked" | "closed", why: string): string {
-	return `train-alert: ${q} ${end} ${why.replace(/\s+/g, " ").trim()}`;
-}
-
-const ALERT_RE = /^(q-[a-z0-9]+) (?:level ([1-9]) (sending|notified|sent)(?: (\S+))?|(acked|closed)(?: ([\s\S]*))?)$/;
-
-/** What the ledger holds about one alert's sends: per level, when `sending` and `sent` were written, whether it notified; the issue; the ends. */
-export interface AlertRecord {
-	q: string;
-	sending: Map<number, string>;
-	sent: Map<number, string>;
-	notified: Set<number>;
-	/** The issue level 1 created or found. */
-	url: string | null;
-	acked: boolean;
-	closed: boolean;
-}
-
-/** Every alert's record among a train's control entries (`train-alert:`, valid only from MERGE_TRAIN_BY), by question id. */
-export function trainAlertRecords(control: readonly ControlEntry[]): Map<string, AlertRecord> {
-	const out = new Map<string, AlertRecord>();
-	for (const c of control) {
-		const m = c.prefix === "train-alert" ? ALERT_RE.exec(c.rest) : null;
-		if (!m) continue;
-		const r = out.get(m[1]!) ?? { q: m[1]!, sending: new Map(), sent: new Map(), notified: new Set<number>(), url: null, acked: false, closed: false };
-		out.set(r.q, r);
-		if (m[5] === "acked") r.acked = true;
-		else if (m[5] === "closed") r.closed = true;
-		else {
-			const level = Number(m[2]);
-			if (m[3] === "notified") r.notified.add(level);
-			else if (m[3] === "sending") { if (!r.sending.has(level)) r.sending.set(level, c.createdAt); }
-			else if (!r.sent.has(level)) {
-				r.sent.set(level, c.createdAt);
-				if (level === 1 && m[4]) r.url = m[4];
-			}
-		}
-	}
-	return out;
-}
-
-/** The loudest level the tick has begun sending for question `q` (0 when none): 2 and 3 make its needs-you line LOUD (D9). */
-export function trainAlertLevel(control: readonly ControlEntry[], q: string): number {
-	const r = trainAlertRecords(control).get(q);
-	return r ? Math.max(0, ...r.sending.keys()) : 0;
-}
-
-/** A train question as an alert (D9): every question on one of the train's PR slices is one of Jo's two triggers. */
-export interface TrainAlert {
-	q: QuestionRow;
-	pr: number;
-	options: string[];
-	/** `failed twice` (the tick's retry / skip / stop), `production merge` (the lane's merged / skip / stop), `stall` (the tick's relaunch / ack, PLAN wl-mvr888nftz0vcl D8) or `launch limit` (the tick's relaunch / stop, D4). */
-	reason: string;
-	record: AlertRecord;
-}
-
+/** Why a train question needs Jo, by its options: the phrase its alert's title names. */
 export function trainAlertReason(options: readonly string[]): string {
 	return options.includes("retry") ? "failed twice" : options.includes("merged") ? "production merge" : options.includes("ack") ? "stall" : options.includes("relaunch") ? "launch limit" : "question";
-}
-
-/**
- * What the tick owes an alert now: send ladder level `level`, or close the issue of an alert Jo answered or withdrew. A close
- * whose record has no url (level 1 `sending` with no `sent`: the issue may have been filed before a crash) finds the issue by
- * its level 1 marker first.
- */
-export type AlertAction = { kind: "send"; alert: TrainAlert; level: number } | { kind: "close"; alert: TrainAlert };
-
-/**
- * The alert sends and closes owed on train `wl` at `now` (D9). An open question: a level whose `sending` has no `sent` is
- * finished first (a crash between them); else level 1 when nothing was sent; else the next level once its `afterMs` has passed
- * since level 1 was sent, until level 3. An acknowledged alert (Jo closed its issue, `acked`) gets nothing more. A question
- * answered or withdrawn (the settle, F13) gets its issue closed once, including one whose level 1 send was begun and not
- * finished (its issue may exist with no url recorded); one settled before any send gets nothing.
- */
-export function trainAlertActions(ledger: Ledger, wl: string, now: string): AlertAction[] {
-	const records = trainAlertRecords(controlOf(ledger, wl));
-	const out: AlertAction[] = [];
-	for (const q of ledger.questions(wl)) {
-		const pr = trainSlicePr(q.slice_id, wl);
-		if (pr === null) continue;
-		const options = JSON.parse(q.options) as string[];
-		const record = records.get(q.id) ?? { q: q.id, sending: new Map(), sent: new Map(), notified: new Set<number>(), url: null, acked: false, closed: false };
-		const alert = { q, pr, options, reason: trainAlertReason(options), record };
-		if (q.state !== "open") {
-			const begun = record.url !== null || (record.sending.has(1) && !record.sent.has(1));
-			if (begun && !record.closed && !record.acked) out.push({ kind: "close", alert });
-			continue;
-		}
-		if (record.acked) continue;
-		const unfinished = [...record.sending.keys()].filter((l) => !record.sent.has(l)).sort((a, b) => a - b)[0];
-		if (unfinished !== undefined) {
-			out.push({ kind: "send", alert, level: unfinished });
-			continue;
-		}
-		const top = Math.max(0, ...record.sent.keys());
-		const next = TRAIN_ALERT_LADDER.find((s) => s.level === top + 1);
-		if (!next) continue;
-		const first = record.sent.get(1);
-		if (next.level === 1 || (first !== undefined && Date.parse(now) - Date.parse(first) >= next.afterMs)) out.push({ kind: "send", alert, level: next.level });
-	}
-	return out;
 }
 
 /** A PR whose attempt 2 settled failed with no `retry` from Jo since (D8, D9), and no alert raised for that task yet. */

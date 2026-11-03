@@ -27,10 +27,11 @@ import {
 } from "../src/launch";
 import {
 	actionable, budgetWakes, type ControlRoot, fixBindings, landFirstNoticeBody, landFirstRows, latestTrainReconciled, mainRedNotices, protectionEpisodes, recordTrainTask, TRAIN_ALERT_LABEL,
-	TRAIN_ALERT_REPO, TRAIN_LAUNCH_LIMIT, trainActivityArgs, retireSupersededFullSlices, testRunStarts, TRAIN_LAUNCH_OPTIONS, TRAIN_METER_OPTIONS, TRAIN_STALL_OPTIONS, trainAlertBody, trainAlertMarker,
+	TRAIN_ALERT_REPO, TRAIN_LAUNCH_LIMIT, trainActivityArgs, retireSupersededFullSlices, testRunStarts, TRAIN_LAUNCH_OPTIONS, TRAIN_METER_OPTIONS, TRAIN_STALL_OPTIONS,
 	trainAttemptsOf, trainFullSliceId, trainHeadWokenBody, trainHoldBody, trainLaunchFailures, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody, type WakeDeferral, prStakes,
 } from "../src/merge-train";
 import { trainMergedNoticeBody } from "../src/notice";
+import { legacyTrainAlertMarker } from "../src/alert-path";
 import { recordQuotaMove } from "../src/quota-move-alert";
 import { fastPlanBody, makeRunId, testRequestedBody, testRunBody, testRuns, withFullSuitePublication } from "../src/test-run";
 import { ESCALATION_BY, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
@@ -631,7 +632,7 @@ describe("alert sends with an uncertain outcome (D9, review gtb-r1 findings 9 an
 		ledger.entries(train).filter((e) => e.created_by === MERGE_TRAIN_BY && e.body.startsWith(`train-alert: ${q} `)).map((e) => e.body);
 	/** A tick that wrote level 1 `sending` for `q` and died before `sent`. */
 	const sendingOnly = (ledger: Ledger, train: string, q: string): void => {
-		ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: train, kind: "assumption", body: trainAlertBody(q, 1, "sending") });
+		ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: train, kind: "assumption", body: `train-alert: ${q} level 1 sending` });
 	};
 
 	test("a create that files the issue but exits nonzero: the marker is found again, the issue adopted, nothing filed twice", () => {
@@ -693,7 +694,7 @@ describe("alert sends with an uncertain outcome (D9, review gtb-r1 findings 9 an
 		const q = mergeQuestion(w.ledger, w.train);
 		sendingOnly(w.ledger, w.train, q);
 		const url = `https://github.com/${TRAIN_ALERT_REPO}/issues/1`;
-		w.g.issues.push({ number: 1, url, title: "merge train: #106 needs you (production merge)", body: `${trainAlertMarker(q, 1)}\n…`, state: "OPEN", labels: [TRAIN_ALERT_LABEL], comments: [] });
+		w.g.issues.push({ number: 1, url, title: "merge train: #106 needs you (production merge)", body: `${legacyTrainAlertMarker(q, 1)}\n…`, state: "OPEN", labels: [TRAIN_ALERT_LABEL], comments: [] });
 		w.ledger.answerQuestion(q, { ...JO, answer: "skip" });
 		w.run();
 		w.run();
@@ -718,9 +719,9 @@ describe("alert sends with an uncertain outcome (D9, review gtb-r1 findings 9 an
 
 	/** Issue #1 carrying `q`'s level 1 marker, then `others` as2-train issues filed after it: a newest-first listing reaches #1 last. */
 	const buried = (w: { g: { issues: FakeIssue[] } }, q: string, others: number): FakeIssue => {
-		w.g.issues.push({ number: 1, url: `https://github.com/${TRAIN_ALERT_REPO}/issues/1`, title: "merge train: #106 needs you (production merge)", body: `${trainAlertMarker(q, 1)}\n…`, state: "OPEN", labels: [TRAIN_ALERT_LABEL], comments: [] });
+		w.g.issues.push({ number: 1, url: `https://github.com/${TRAIN_ALERT_REPO}/issues/1`, title: "merge train: #106 needs you (production merge)", body: `${legacyTrainAlertMarker(q, 1)}\n…`, state: "OPEN", labels: [TRAIN_ALERT_LABEL], comments: [] });
 		for (let n = 2; n <= others + 1; n++) {
-			w.g.issues.push({ number: n, url: `https://github.com/${TRAIN_ALERT_REPO}/issues/${n}`, title: `merge train: #${n} needs you (failed twice)`, body: `${trainAlertMarker(`q-other${n}`, 1)}\n…`, state: "CLOSED", labels: [TRAIN_ALERT_LABEL], comments: [] });
+			w.g.issues.push({ number: n, url: `https://github.com/${TRAIN_ALERT_REPO}/issues/${n}`, title: `merge train: #${n} needs you (failed twice)`, body: `${legacyTrainAlertMarker(`q-other${n}`, 1)}\n…`, state: "CLOSED", labels: [TRAIN_ALERT_LABEL], comments: [] });
 		}
 		return w.g.issues[0]!;
 	};
