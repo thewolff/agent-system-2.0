@@ -13,7 +13,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
-	chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync,
+	chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, watch, writeFileSync,
 } from "node:fs";
 import { userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -130,6 +130,7 @@ interface DetectKnobs {
 	signatureCaptureMs?: number;
 	stopGraceMs?: number;
 	detectTrace?: boolean;
+	detectFeed?: boolean;
 }
 
 /** A tmp as2test root with a groups-scope wrapper and a fake sudo on PATH (§ 6 S4b). */
@@ -1140,11 +1141,15 @@ function report(row: Record<string, unknown>): void {
 	if (to) writeFileSync(to, `${JSON.stringify(row)}\n`, { flag: "a" });
 }
 
-/** The lines a positive spin fixture's test file starts with: flock from libSystem, as the preload binds it. */
+/**
+ * The lines a positive spin fixture's test file starts with: flock from libSystem, as the preload binds it, and `publish`,
+ * which puts `<work>/<dir>/pid` in place whole, by a rename from a temporary file outside `<dir>`: the test made `<dir>` empty,
+ * so that rename is the only event there (`when`).
+ */
 const SPIN_HEAD = `import { test } from "bun:test";
 import { dlopen, FFIType } from "bun:ffi";
 import { spawn } from "node:child_process";
-import { closeSync, constants, ftruncateSync, openSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants, ftruncateSync, openSync, renameSync, writeFileSync, writeSync } from "node:fs";
 const flock = dlopen("/usr/lib/libSystem.B.dylib", { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } }).symbols.flock;
 /** Hold this process's marker exactly as the preload does: O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, LOCK_EX|LOCK_NB, then the D1 content. */
 function holdMarker(command) {
@@ -1155,10 +1160,15 @@ function holdMarker(command) {
 	writeSync(fd, since + "\\t" + command + "\\n", 0);
 	return fd;
 }
+function publish(dir, body) {
+	writeFileSync("../" + dir + ".tmp", body);
+	renameSync("../" + dir + ".tmp", "../" + dir + "/pid");
+}
 `;
 /**
  * A detached helper (its own process group) the spinning worker starts first: once the signature capture's file exists it
- * starts a second detached group (`sleep 300`) and records it in ../late.pid, then stays alive as its parent.
+ * starts a second detached group (`sleep 300`) and publishes its pid as ../ready-late/pid, then stays alive as its parent.
+ * It polls in its own process: the work dir it would watch is busy, so a watched event there can be dropped (`when`).
  */
 const LATE_HELPER = `const fs = require("node:fs");
 const { spawn } = require("node:child_process");
@@ -1167,22 +1177,151 @@ const t = setInterval(() => {
 	if (!fs.existsSync("../full.signature.log")) return;
 	clearInterval(t);
 	const s = spawn("/bin/sleep", ["300"], { detached: true, stdio: "ignore" });
-	fs.writeFileSync("../late.pid", String(s.pid));
+	fs.writeFileSync("../ready-late.tmp", String(s.pid));
+	fs.renameSync("../ready-late.tmp", "../ready-late/pid");
 }, 25);
 `;
 /**
  * The positive fixture (PLAN sl-sd-exec): the observable lost-reap state built by hand. The test holds its own marker for
- * `true`, spawns /usr/bin/true asynchronously at once, then spins forever: marker active, the worker hot, the child an
- * unreaped zombie. With `late`, a detached helper group is started first (LATE_HELPER).
+ * `true`, spawns /usr/bin/true asynchronously at once, publishes ../ready-spin/pid (`Ready`: worker, zombie and its own
+ * clock's ready time), then spins forever: marker active, the worker hot, the child an unreaped zombie. With `late`, a
+ * detached helper group is started first (LATE_HELPER).
  */
 const spinTest = (late: boolean) => `${SPIN_HEAD}test("spins", () => {
-	writeFileSync("../spin.pid", String(process.pid));
 ${late ? `\tspawn(process.execPath, ["-e", ${JSON.stringify(LATE_HELPER)}], { detached: true, stdio: "ignore" });\n` : ""}	holdMarker("true");
 	const z = ${unreapedTrue()};
-	writeFileSync("../zombie.pid", String(z.pid));
+	publish("ready-spin", JSON.stringify({ worker: process.pid, zombie: z.pid, at: Date.now() }));
 	for (;;) {}
 }, 600_000);
 `;
+
+/** What the waits read of a wrapper call running in the background (`spawnCall`). */
+interface Wrapper {
+	pid: number;
+	exitCode: number | null;
+	exited: Promise<number>;
+	stderr: ReadableStream<Uint8Array>;
+}
+
+/** The spin fixture's ready-to-spin publication: its marker is held and its /usr/bin/true spawned; `at` is its own clock's time. */
+interface Ready {
+	worker: number;
+	zombie: number;
+	at: number;
+}
+
+/**
+ * `probe()`'s first defined answer, read before the first wait and again after every event in `dir`. `dir` must be one where
+ * the awaited publication is the only event: Bun 1.3.14's fs.watch drops an event that repeats the type or the name of the
+ * last one it emitted within about a millisecond. `p` exiting first is an error naming its exit and stderr. No timer: the
+ * test's own timeout is the hang guard.
+ */
+async function when<T>(dir: string, probe: () => T | undefined, what: string, p?: Wrapper): Promise<T> {
+	let events = 0;
+	let failure = null as Error | null;
+	let wake = Promise.withResolvers<void>();
+	const w = watch(dir, () => {
+		events++;
+		wake.resolve();
+	});
+	w.on("error", (e: Error) => {
+		failure = new Error(`${what}: watching ${dir}: ${e.message}`);
+		wake.resolve();
+	});
+	try {
+		for (;;) {
+			const seen = events;
+			const v = probe();
+			if (v !== undefined) return v;
+			if (failure) throw failure;
+			if (events !== seen) continue;
+			wake = Promise.withResolvers<void>();
+			const exited = await Promise.race([wake.promise.then(() => false), p ? p.exited.then(() => true) : new Promise<boolean>(() => {})]);
+			if (exited) {
+				const last = probe();
+				if (last !== undefined) return last;
+				throw new Error(`${what}: the wrapper (pid ${p!.pid}) exited ${p!.exitCode} first; stderr: ${await new Response(p!.stderr).text()}`);
+			}
+		}
+	} finally {
+		w.close();
+	}
+}
+
+/** Resolves once `pid` has exited (a zombie has; a gone pid at once): `caffeinate -w`, the kernel's exit event, no polling. */
+async function exitOf(pid: number): Promise<void> {
+	const c = Bun.spawn(["/usr/bin/caffeinate", "-w", String(pid)], { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
+	const code = await c.exited;
+	if (code !== 0) throw new Error(`/usr/bin/caffeinate -w ${pid} exited ${code}: ${await new Response(c.stderr).text()}`);
+}
+
+/** Make the empty directories `<work>/<name>` a fixture publishes into (`publish`), before the part starts. */
+const readyDirs = (work: string, ...names: string[]) => {
+	for (const n of names) mkdirSync(join(work, n));
+};
+
+/** `<work>/<name>/pid` once published (`when`), or undefined. */
+function published(work: string, name: string): string | undefined {
+	const path = join(work, name, "pid");
+	return existsSync(path) ? readFileSync(path, "utf8") : undefined;
+}
+
+/** The spin fixture's `Ready` (its worker joins the pids afterAll kills); the wrapper exiting first is an error. */
+async function readySpin(work: string, p: Wrapper): Promise<Ready> {
+	const r = JSON.parse(await when(join(work, "ready-spin"), () => published(work, "ready-spin"), "the spin fixture's ready-spin", p)) as Ready;
+	pids.push(r.worker);
+	return r;
+}
+
+type Pair = { worker: number; zombie: number };
+/** A `detectFeed` tick's answer (test-exec `StuckWatch.feed`). */
+interface Ack {
+	n: number;
+	at?: number;
+	signatures?: Pair[];
+	started?: Pair[];
+	matched?: Pair[];
+	cleared?: (Pair & { matched: boolean })[];
+	ended?: true;
+	error?: string;
+}
+
+/**
+ * The feed driver of a `detectFeed` part: each call is the next tick n. It makes `<hooks>/<run>.<part>.detect-ack.<n>`, publishes
+ * `.detect-feed.<n>` whole (`{ at, cpu }`), and returns the detector's ack; the wrapper exiting first is an error.
+ */
+function feeder(b: Box, runId: string, p: Wrapper, stem = "full"): (at: number, cpu: Record<number, number>) => Promise<Ack> {
+	const base = join(b.hooks, `${runId}.${stem}`);
+	let n = 0;
+	return async (at, cpu) => {
+		n++;
+		const ackDir = `${base}.detect-ack.${n}`;
+		mkdirSync(ackDir);
+		writeFileSync(`${base}.detect-feed.${n}.tmp`, JSON.stringify({ at, cpu }));
+		renameSync(`${base}.detect-feed.${n}.tmp`, `${base}.detect-feed.${n}`);
+		const ack = join(ackDir, "ack");
+		return JSON.parse(await when(ackDir, () => (existsSync(ack) ? readFileSync(ack, "utf8") : undefined), `ack ${n} of ${base}`, p)) as Ack;
+	};
+}
+
+/**
+ * Fed ticks at STUCK_DEFAULTS for a ready spin fixture whose /usr/bin/true has exited (a zombie): tick k at (k - 1) × tickMs,
+ * the worker's CPU exactly the elapsed time (hot from tick 2), every other candidate unsampled. The signature starts on tick
+ * 2 and matches persistMs later, on tick 2 + persistMs / tickMs; nothing else starts, matches or clears.
+ */
+async function feedToMatch(tick: (at: number, cpu: Record<number, number>) => Promise<Ack>, r: Ready): Promise<Ack[]> {
+	const { tickMs, persistMs } = STUCK_DEFAULTS;
+	const last = 2 + persistMs / tickMs;
+	const acks: Ack[] = [];
+	for (let k = 1; k <= last; k++) acks.push(await tick((k - 1) * tickMs, { [r.worker]: (k - 1) * tickMs * 1e6 }));
+	const pair = { worker: r.worker, zombie: r.zombie };
+	const shape = (a: Ack) => ({ n: a.n, ended: a.ended, error: a.error, started: a.started, matched: a.matched, cleared: a.cleared });
+	expect(acks.map(shape)).toEqual(acks.map((_, i) => ({ n: i + 1, ended: undefined, error: undefined, started: i === 1 ? [pair] : [], matched: i === last - 1 ? [pair] : [], cleared: [] })));
+	return acks;
+}
+
+/** The test knobs of a fed detector: STUCK_DEFAULTS tick and persistence on fed time, the trace on. */
+const FED = { detectFeed: true, detectTrace: true } as const;
 
 /** The pid a fixture wrote to `<work>/<name>`, added to the pids afterAll kills. */
 function fixturePid(work: string, name: string): number {
@@ -1590,36 +1729,42 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
 	}, 360_000);
 
-	test("enforce: the spin fixture gets a signature line, stuck-stop, a signature capture, a teardown of every owned group (a group created during the capture included) and exit 125 within persist + capture + teardown + slack; capture tools, marker dir and preload are gone", async () => {
-		// A capture budget past the default, so the held hook and a loaded machine's slow sample still leave all five sections
-		// (the cut at the budget is the stuck-cut test's).
-		const knobs = { ...DETECT, signatureCaptureMs: 10_000 };
-		const b = box("stuck-enforce", knobs);
+	// The cases below run the detector on fed ticks (detectFeed): time and the worker's CPU are the test's explicit samples on
+	// a real snapshot, markers and argv, and the signature capture's deadline is fed too (cut only where the test publishes
+	// it). Each waits on real events: the fixture's ready-spin publication, the zombie's exit (`exitOf`), each tick's ack and
+	// the wrapper's exit. The real clock at STUCK_DEFAULTS is the production integration's, after them.
+	test("enforce, fed ticks: the spin fixture's signature starts on tick 2 and stops persistMs later with stuck-stop, a signature capture, a teardown of every owned group (a group created during the capture included) and exit 125; capture tools, marker dir and preload are gone", async () => {
+		const b = box("stuck-enforce", FED);
 		prepared(b, "tr-se1", { "spin.test.ts": spinTest(true), "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
 		const work = workOf(b, "tr-se1");
+		readyDirs(work, "ready-spin", "ready-late");
 		const hook = join(b.hooks, "tr-se1.signature-capture");
 		writeFileSync(`${hook}.pause`, "");
 		const p = spawnCall(b, { sub: "full", runId: "tr-se1" });
+		let ready: Ready;
+		let late: number;
 		try {
-			// Hold the capture until the helper has made its second group: that group is new during the capture.
-			expect(await until(() => existsSync(`${hook}.reached`), 30_000)).toBe(true);
-			expect(await until(() => existsSync(join(work, "late.pid")), 2_000)).toBe(true);
+			ready = await readySpin(work, p);
+			await exitOf(ready.zombie);
+			await feedToMatch(feeder(b, "tr-se1", p), ready);
+			// The capture holds at its hook until the helper has made its second group: that group is new during the capture.
+			late = Number(await when(join(work, "ready-late"), () => published(work, "ready-late"), "the late helper's ready-late", p));
+			pids.push(late);
 		} finally {
 			writeFileSync(`${hook}.go`, "");
 		}
 		const code = await p.exited;
-		const exitedAt = Date.now();
 		const stdout = await new Response(p.stdout).text();
 		const stderr = await new Response(p.stderr).text();
-		const worker = fixturePid(work, "spin.pid");
-		const zombie = fixturePid(work, "zombie.pid");
+		const { worker, zombie } = ready;
 		const helper = fixturePid(work, "helper.pid");
-		const late = fixturePid(work, "late.pid");
 		const leader = Number(readFileSync(join(work, "groups"), "utf8").split("\n")[0]);
 		report({ fixture: "enforce", exit: code, stdout, stderr });
 		expect(worker).not.toBe(leader);
 		expect(code).toBe(WRAPPER_EXIT.stuck);
-		const { first, sig, stop, captured, killed } = enforceLines(stdout, worker, zombie);
+		// Fed ticks leave no flap: one signature, its stop, the capture and the teardown.
+		expect(keywordsOf(stdout)).toEqual(["stuck-signature", "stuck-stop", "stuck-captured", "stuck-killed"]);
+		const { sig, captured, killed } = enforceLines(stdout, worker, zombie);
 		expect(sig.rest).toMatch(new RegExp(`^worker ${worker} zombie ${zombie} since \\d+ mode enforce bun ${Bun.version.replaceAll(".", "\\.")} ${Bun.revision}$`));
 		expect(captured.rest).toMatch(/^file full\.signature\.log ms \d+$/);
 		const k = /^pgids ([\d,]+) ms (\d+) contained$/.exec(killed.rest);
@@ -1627,22 +1772,18 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		const stopSet = k![1]!.split(",").map(Number);
 		// The leader's group (the worker's too), the helper's and the one made during the capture.
 		expect(stopSet).toEqual(expect.arrayContaining([leader, helper, late]));
-		expect(stderr).toMatch(new RegExp(`^stuck: worker ${worker} spun \\d+ ms in Bun\\.spawnSync with unreaped child ${zombie}; ${stopSet.length} process groups killed, containment contained\\n$`));
-		const spun = Number(/ spun (\d+) ms /.exec(stderr)![1]);
-		expect(spun).toBeGreaterThanOrEqual(DETECT.detectPersistMs);
-		expect(Date.parse(stop.iso) - Date.parse(sig.iso)).toBeGreaterThanOrEqual(DETECT.detectPersistMs - 50);
-		// The budget runs from the matching signature's first tick (PLAN § Budget).
-		const signatureToExit = exitedAt - Date.parse(sig.iso);
-		expect(signatureToExit).toBeLessThan(DETECT.detectPersistMs + knobs.signatureCaptureMs + STUCK_DEFAULTS.stopGraceMs + STUCK_DEFAULTS.verifyMs + 3_000);
-		report({ fixture: "enforce", signatureToExitMs: signatureToExit, firstSignatureToExitMs: exitedAt - Date.parse(first.iso), stopToExitMs: exitedAt - Date.parse(stop.iso) });
+		// spun is fed time: the signature's first tick (1 × tickMs) to the match (persistMs later).
+		expect(stderr).toBe(`stuck: worker ${worker} spun ${STUCK_DEFAULTS.persistMs} ms in Bun.spawnSync with unreaped child ${zombie}; ${stopSet.length} process groups killed, containment contained\n`);
 		// Every owned process and group is gone, with no sweep.
 		for (const pid of [leader, worker, helper, late]) expect({ pid, alive: alive(pid) }).toEqual({ pid, alive: false });
 		for (const g of stopSet) expect({ g, alive: alive(-g) }).toEqual({ g, alive: false });
 		const groups = readFileSync(join(work, "groups"), "utf8").split("\n").filter(Boolean).map(Number);
 		expect(groups).toEqual(expect.arrayContaining(stopSet));
-		// The signature capture: tree, marker, sample, lsof, log tail; its tools are gone and its cap dir cleared.
+		// The signature capture: tree, marker, sample, lsof, log tail, run to its end (no cut was fed); its tools are gone and
+		// its cap dir cleared.
 		const text = readFileSync(join(work, "full.signature.log"), "utf8");
-		expect(text).toContain(`signature capture of full: worker ${worker} spun `);
+		expect(text).toContain(`signature capture of full: worker ${worker} spun ${STUCK_DEFAULTS.persistMs} ms `);
+		expect(text).toContain(`deadline fed (${join(b.hooks, "tr-se1.full.detect-cut")})`);
 		const s = signatureSections(text);
 		expect(Object.keys(s)).toEqual(["1", "2", "3", "4", "5"]);
 		expect(s["1"]).toContain(`${worker} `);
@@ -1662,48 +1803,48 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 	}, 90_000);
 
 	for (const how of ["fifo", "symlink"] as const) {
-		test(`enforce: refuses a ${how} groups file after the stop decision, still kills every owned group and preserves the stuck cause with unconfirmed cleanup`, async () => {
-			const signatureCaptureMs = 10_000;
-			const b = box(`stuck-groups-${how}`, { ...DETECT, signatureCaptureMs });
+		test(`enforce, fed ticks: refuses a ${how} groups file after the stop decision, still kills every owned group and preserves the stuck cause with unconfirmed cleanup`, async () => {
+			const b = box(`stuck-groups-${how}`, FED);
 			const runId = how === "fifo" ? "tr-sef1" : "tr-ses1";
 			prepared(b, runId, { "spin.test.ts": spinTest(true), "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
 			const work = workOf(b, runId);
+			readyDirs(work, "ready-spin", "ready-late");
 			const hook = join(b.hooks, `${runId}.signature-capture`);
 			const target = join(work, "groups-target");
 			writeFileSync(target, "UNCHANGED\n");
 			writeFileSync(`${hook}.pause`, "");
 			const p = spawnCall(b, { sub: "full", runId });
 			try {
-				// The watch has stopped: only enforce teardown will persist after this replacement.
-				expect(await until(() => existsSync(`${hook}.reached`), 30_000)).toBe(true);
-				expect(await until(() => existsSync(join(work, "late.pid")), 2_000)).toBe(true);
-				const worker = fixturePid(work, "spin.pid");
-				const zombie = fixturePid(work, "zombie.pid");
+				const { worker, zombie, ...ready } = await readySpin(work, p);
+				await exitOf(zombie);
+				// The stop is decided on the last fed tick and no tick follows it: only the enforce teardown persists groups now,
+				// and it waits behind the capture, held at its hook.
+				await feedToMatch(feeder(b, runId, p), { worker, zombie, ...ready });
+				const late = Number(await when(join(work, "ready-late"), () => published(work, "ready-late"), "the late helper's ready-late", p));
 				const helper = fixturePid(work, "helper.pid");
-				const late = fixturePid(work, "late.pid");
 				const leader = Number(readFileSync(join(work, "groups"), "utf8").split("\n")[0]);
-				pids.push(leader);
+				pids.push(leader, late);
 				rmSync(join(work, "groups"));
 				if (how === "fifo") expect(Bun.spawnSync(["/usr/bin/mkfifo", join(work, "groups")], { timeout: 1_000 }).exitCode).toBe(0);
 				else symlinkSync(target, join(work, "groups"));
 				writeFileSync(`${hook}.go`, "");
-				expect(await until(() => p.exitCode !== null, signatureCaptureMs + STUCK_DEFAULTS.stopGraceMs + STUCK_DEFAULTS.verifyMs + 3_000)).toBe(true);
-				expect(p.exitCode).toBe(WRAPPER_EXIT.stuck);
+				expect(await p.exited).toBe(WRAPPER_EXIT.stuck);
 				const stdout = await new Response(p.stdout).text();
 				const stderr = await new Response(p.stderr).text();
+				expect(keywordsOf(stdout)).toEqual(["stuck-signature", "stuck-stop", "stuck-captured", "stuck-killed"]);
 				const { killed } = enforceLines(stdout, worker, zombie);
 				const k = /^pgids ([\d,]+) ms \d+ unconfirmed cleanup-failed$/.exec(killed.rest);
 				expect(k).not.toBeNull();
 				const stopSet = k![1]!.split(",").map(Number);
 				expect(stopSet).toEqual(expect.arrayContaining([leader, helper, late]));
-				expect(stderr).toContain(`stuck: worker ${worker} spun `);
-				expect(stderr).toContain(`in Bun.spawnSync with unreaped child ${zombie};`);
+				expect(stderr).toContain(`stuck: worker ${worker} spun ${STUCK_DEFAULTS.persistMs} ms in Bun.spawnSync with unreaped child ${zombie};`);
 				expect(stderr).toContain("containment unconfirmed:");
 				expect(stderr).toContain(`timeout cleanup: cannot persist descendant groups to ${join(work, "groups")}: open failed:`);
 				expect(lstatSync(join(work, "groups"))[how === "fifo" ? "isFIFO" : "isSymbolicLink"]()).toBe(true);
 				expect(readFileSync(target, "utf8")).toBe("UNCHANGED\n");
-				// Do not sweep a hostile groups path; teardown must contain the processes itself.
-				expect(await until(() => [leader, worker, helper, late].every((pid) => !alive(pid)) && stopSet.every((g) => !alive(-g)), 3_000)).toBe(true);
+				// Do not sweep a hostile groups path; teardown must contain the processes itself: each one exits.
+				for (const pid of [leader, worker, helper, late]) await exitOf(pid);
+				expect(stopSet.filter((g) => alive(-g))).toEqual([]);
 			} finally {
 				writeFileSync(`${hook}.go`, "");
 				if (p.exitCode === null) p.kill("SIGKILL");
@@ -1712,37 +1853,31 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		}, 60_000);
 	}
 
-	test("shadow (caps.json without stuckStop): the spin fixture gets stuck-would-stop and a signature capture, nothing is stopped, and the part runs on to its cap and exits 124 as before", async () => {
-		const b = box("stuck-shadow", DETECT);
+	test("shadow (caps.json without stuckStop), fed ticks: the spin fixture gets stuck-would-stop persistMs after its signature and a signature capture, nothing is stopped, and the part runs on to its cap and exits 124 as before", async () => {
+		const b = box("stuck-shadow", FED);
 		prepared(b, "tr-ss1", { "spin.test.ts": spinTest(false), "a.test.ts": OK_TEST }, { fullCapMin: 0.15, soloCapMin: 0.15, fullWorkers: 2 });
-		const t0 = Date.now();
-		const r = call(b, { sub: "full", runId: "tr-ss1" });
 		const work = workOf(b, "tr-ss1");
-		const worker = fixturePid(work, "spin.pid");
-		const zombie = fixturePid(work, "zombie.pid");
-		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
-		expect(r.stderr).toBe("as2test: timeout: the part passed its cap of 9000 ms; its group was killed\n");
-		expect(Date.now() - t0).toBeGreaterThanOrEqual(9_000);
-		expect(Date.now() - t0).toBeLessThan(9_000 + CAPTURE_MS + 500 + 5_000);
-		const lines = detectorLines(r.stdout);
-		// Only this signature's lines; a flap (a tick under the hot share on a loaded machine) may clear and restart it.
-		for (const l of lines) {
-			expect(["stuck-signature", "stuck-cleared", "stuck-would-stop", "stuck-captured"]).toContain(l.keyword);
-			expect(new Date(l.iso).toISOString()).toBe(l.iso);
-			if (l.keyword !== "stuck-captured") expect(l.rest).toStartWith(`worker ${worker} zombie ${zombie}`);
-		}
-		const would = lines.findIndex((l) => l.keyword === "stuck-would-stop");
-		expect(would).toBeGreaterThan(0);
-		const sig = lines[would - 1]!;
-		expect(sig.keyword).toBe("stuck-signature");
-		expect(sig.rest).toMatch(new RegExp(`^worker ${worker} zombie ${zombie} since \\d+ mode shadow bun `));
-		expect(lines[would]!.rest).toBe(`worker ${worker} zombie ${zombie}`);
-		expect(lines.filter((l) => l.keyword === "stuck-captured").map((l) => l.rest)).toEqual([expect.stringMatching(/^file full\.signature\.log ms \d+$/)]);
-		// The would-stop came at the persistence, long before the cap: the part ran on untouched.
-		expect(Date.parse(lines[would]!.iso) - Date.parse(sig.iso)).toBeGreaterThanOrEqual(DETECT.detectPersistMs - 50);
-		expect(Date.parse(lines[would]!.iso) - t0).toBeLessThan(9_000 - 2_000);
-		report({ fixture: "shadow", stdout: r.stdout, stderr: r.stderr });
-		expect(Object.keys(signatureSections(readFileSync(join(work, "full.signature.log"), "utf8")))).toEqual(["1", "2", "3", "4", "5"]);
+		readyDirs(work, "ready-spin");
+		const p = spawnCall(b, { sub: "full", runId: "tr-ss1" });
+		const { worker, zombie, ...ready } = await readySpin(work, p);
+		await exitOf(zombie);
+		// The match is acked on the last fed tick, so it came before the cap: a tick after the cap is acked `ended`.
+		await feedToMatch(feeder(b, "tr-ss1", p), { worker, zombie, ...ready });
+		const code = await p.exited;
+		const stdout = await new Response(p.stdout).text();
+		const stderr = await new Response(p.stderr).text();
+		report({ fixture: "shadow", exit: code, stdout, stderr });
+		expect(code).toBe(WRAPPER_EXIT.timeout);
+		expect(stderr).toBe("as2test: timeout: the part passed its cap of 9000 ms; its group was killed\n");
+		const lines = detectorLines(stdout);
+		expect(lines.map((l) => l.keyword)).toEqual(["stuck-signature", "stuck-would-stop", "stuck-captured"]);
+		for (const l of lines) expect(new Date(l.iso).toISOString()).toBe(l.iso);
+		expect(lines[0]!.rest).toMatch(new RegExp(`^worker ${worker} zombie ${zombie} since \\d+ mode shadow bun `));
+		expect(lines[1]!.rest).toBe(`worker ${worker} zombie ${zombie}`);
+		expect(lines[2]!.rest).toMatch(/^file full\.signature\.log ms \d+$/);
+		const text = readFileSync(join(work, "full.signature.log"), "utf8");
+		expect(text).toContain(`signature capture of full: worker ${worker} spun ${STUCK_DEFAULTS.persistMs} ms `);
+		expect(Object.keys(signatureSections(text))).toEqual(["1", "2", "3", "4", "5"]);
 		// D5's cap path is unchanged: its stuck capture, then the group's kill.
 		expect(Object.keys(stuckSections(readFileSync(join(work, "full.stuck.log"), "utf8")))).toEqual(["1", "2", "3", "4"]);
 		// The cap kills the leader's group as before. A --parallel worker has its own group, which a groups sweep does not
@@ -1753,53 +1888,112 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		} catch (e) {
 			if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e;
 		}
-		expect(await until(() => !alive(worker), 3_000)).toBe(true);
+		await exitOf(worker);
 		expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
 		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
 	}, 90_000);
 
-	test("a signature capture whose tools are still running at its deadline is cut there: every capture group is SIGKILLed, the file says so, and the stop still exits 125 within the bound", async () => {
-		const signatureCaptureMs = 600;
-		const b = box("stuck-cut", { ...DETECT, signatureCaptureMs });
+	test("a signature capture whose tools are still running at its deadline is cut there: every capture group is SIGKILLed, the file says so, and the stop still exits 125", async () => {
+		const b = box("stuck-cut", FED);
 		prepared(b, "tr-sk1", { "spin.test.ts": spinTest(false), "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
 		const work = workOf(b, "tr-sk1");
-		// Never released: sample (1 s) cannot finish inside 600 ms either.
+		readyDirs(work, "ready-spin");
+		// The fed deadline has passed before the capture starts: the capture is cut at its first look, once its sample and lsof
+		// are started, and the hook it holds at is never released.
+		const cut = join(b.hooks, "tr-sk1.full.detect-cut");
+		writeFileSync(cut, "");
 		const hook = join(b.hooks, "tr-sk1.signature-capture");
 		writeFileSync(`${hook}.pause`, "");
 		const p = spawnCall(b, { sub: "full", runId: "tr-sk1" });
 		try {
-			const code = await p.exited;
-			const exitedAt = Date.now();
+			const { worker, zombie, ...ready } = await readySpin(work, p);
+			await exitOf(zombie);
+			await feedToMatch(feeder(b, "tr-sk1", p), { worker, zombie, ...ready });
+			expect(await p.exited).toBe(WRAPPER_EXIT.stuck);
 			const stdout = await new Response(p.stdout).text();
-			const worker = fixturePid(work, "spin.pid");
-			const zombie = fixturePid(work, "zombie.pid");
-			expect(code).toBe(WRAPPER_EXIT.stuck);
 			expect(existsSync(`${hook}.reached`)).toBe(true);
-			const { sig } = enforceLines(stdout, worker, zombie);
-			expect(exitedAt - Date.parse(sig.iso)).toBeLessThan(DETECT.detectPersistMs + signatureCaptureMs + STUCK_DEFAULTS.stopGraceMs + STUCK_DEFAULTS.verifyMs + 3_000);
+			expect(keywordsOf(stdout)).toEqual(["stuck-signature", "stuck-stop", "stuck-captured", "stuck-killed"]);
+			enforceLines(stdout, worker, zombie);
 			const text = readFileSync(join(work, "full.signature.log"), "utf8");
-			const cutAt = Number(/^capture cut at (\d+) ms$/m.exec(text)?.[1]);
-			expect(cutAt).toBeGreaterThanOrEqual(signatureCaptureMs);
-			expect(cutAt).toBeLessThan(signatureCaptureMs + 1_000);
+			expect(text).toContain(`deadline fed (${cut})`);
+			expect(text).toMatch(/^capture cut at \d+ ms$/m);
 			expect(Object.keys(signatureSections(text))).toEqual(["1", "2"]);
 			const killed = /^killed capture groups: (.*)$/m.exec(text)?.[1] ?? "";
 			expect(killed).toMatch(/^\d+( \d+)*$/);
 			const tools = capturePids(text);
-			expect(await until(() => tools.every((t) => !alive(t)), 2_000)).toBe(true);
+			expect(tools.length).toBeGreaterThan(0);
+			for (const t of tools) await exitOf(t);
 			expect(readdirSync(work).filter((n) => n.startsWith("full.signature-"))).toEqual([]);
 		} finally {
 			writeFileSync(`${hook}.go`, "");
 		}
 	}, 90_000);
 
-	test("a caps.json stuckStop other than shadow or enforce is refused for full and solo", () => {
+	test("fed ticks: a malformed feed turns the detector off loudly (its ack names the field, a stuck-detector-off line) and the part runs on to its cap", async () => {
+		const b = box("stuck-feed-bad", FED);
+		prepared(b, "tr-sfb1", { "spin.test.ts": spinTest(false), "a.test.ts": OK_TEST }, { fullCapMin: 0.15, soloCapMin: 0.15, fullWorkers: 2 });
+		const work = workOf(b, "tr-sfb1");
+		readyDirs(work, "ready-spin");
+		const p = spawnCall(b, { sub: "full", runId: "tr-sfb1" });
+		const { worker } = await readySpin(work, p);
+		const base = join(b.hooks, "tr-sfb1.full");
+		mkdirSync(`${base}.detect-ack.1`);
+		writeFileSync(`${base}.detect-feed.1.tmp`, JSON.stringify({ at: "soon", cpu: {} }));
+		renameSync(`${base}.detect-feed.1.tmp`, `${base}.detect-feed.1`);
+		const ack = join(`${base}.detect-ack.1`, "ack");
+		const answer = JSON.parse(await when(`${base}.detect-ack.1`, () => (existsSync(ack) ? readFileSync(ack, "utf8") : undefined), "ack 1", p)) as Ack;
+		const why = `detector feed ${base}.detect-feed.1: at is not a finite number: "soon"`;
+		expect(answer).toEqual({ n: 1, error: why });
+		expect(await p.exited).toBe(WRAPPER_EXIT.timeout);
+		const lines = detectorLines(await new Response(p.stdout).text());
+		expect(lines.map((l) => `${l.keyword} ${l.rest}`)).toEqual([`stuck-detector-off reason ${why}`]);
+		try {
+			process.kill(worker, "SIGKILL");
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e;
+		}
+		await exitOf(worker);
+	}, 90_000);
+
+	test("production integration, real ticks at STUCK_DEFAULTS (enforce): the spin fixture is stopped and exits 125; ready→signature, signature→stop, stop→exit and the total are recorded from the fixture's own ready time", async () => {
+		const b = box("stuck-real");
+		prepared(b, "tr-sr1", { "spin.test.ts": spinTest(false), "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
+		const work = workOf(b, "tr-sr1");
+		readyDirs(work, "ready-spin");
+		const p = spawnCall(b, { sub: "full", runId: "tr-sr1" });
+		const ready = await readySpin(work, p);
+		const code = await p.exited;
+		const exitedAt = Date.now();
+		const stdout = await new Response(p.stdout).text();
+		const stderr = await new Response(p.stderr).text();
+		report({ fixture: "production", exit: code, stdout, stderr });
+		expect(code).toBe(WRAPPER_EXIT.stuck);
+		const { first, sig, stop } = enforceLines(stdout, ready.worker, ready.zombie);
+		// A real tick matches only once the signature has held persistMs (stuck-detect.ts StuckDetector.tick).
+		expect(Number(/ spun (\d+) ms /.exec(stderr)?.[1])).toBeGreaterThanOrEqual(STUCK_DEFAULTS.persistMs);
+		// The durations are measurements of the real clock on whatever load the run meets: recorded, never asserted.
+		const figures = {
+			fixture: "production", readyToSignatureMs: Date.parse(sig.iso) - ready.at, readyToFirstSignatureMs: Date.parse(first.iso) - ready.at,
+			signatureToStopMs: Date.parse(stop.iso) - Date.parse(sig.iso), stopToExitMs: exitedAt - Date.parse(stop.iso), totalMs: exitedAt - ready.at,
+		};
+		report(figures);
+		console.log(`as2test production detector timing: ${JSON.stringify(figures)}`);
+		await exitOf(ready.worker);
+		expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
+		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
+	}, 90_000);
+
+	test("a caps.json stuckStop other than shadow or enforce is refused for full and solo", async () => {
+		// One prepared run; each bad value is written over its caps.json, which full and solo read before anything else.
+		const b = box("stuck-bad");
+		prepared(b, "tr-sb1", { "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1 });
+		const caps = join(b.root, "stage", "tr-sb1", "caps.json");
 		for (const bad of ["on", true, null, 1]) {
-			const b = box("stuck-bad");
-			prepared(b, "tr-sb1", { "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, stuckStop: bad });
-			for (const c of [{ sub: "full", runId: "tr-sb1" }, { sub: "solo", runId: "tr-sb1", file: "./a.test.ts" }] as WrapperCall[]) {
-				const r = call(b, c);
-				expect(r.exit).toBe(WRAPPER_EXIT.refused);
-				expect(r.stderr).toContain("stuckStop");
+			writeFileSync(caps, JSON.stringify({ fullCapMin: 1, soloCapMin: 1, stuckStop: bad }));
+			const runs = ([{ sub: "full", runId: "tr-sb1" }, { sub: "solo", runId: "tr-sb1", file: "./a.test.ts" }] as WrapperCall[]).map((c) => spawnCall(b, c));
+			for (const [i, p] of runs.entries()) {
+				const [exit, stderr] = await Promise.all([p.exited, new Response(p.stderr).text()]);
+				expect({ bad, part: i, exit, refusal: stderr.includes("stuckStop") }).toEqual({ bad, part: i, exit: WRAPPER_EXIT.refused, refusal: true });
 			}
 		}
 	});
@@ -2136,7 +2330,7 @@ describe("sweep", () => {
 		const argvUses = text.split("\n").flatMap((l, i) => (/"\$@"/.test(l) ? [i] : []));
 		expect(argvUses).toEqual([execLine + 2]);
 		expect(text).toContain(`'/usr/local/libexec/as2test/bun' '/usr/local/libexec/as2test/test-exec.js' "$@"`);
-		const knobs = [{ hooks: "/tmp/h" }, { killGraceMs: 1 }, { sweepLockWaitMs: 1 }, { captureMs: 1 }, { detectTickMs: 1 }, { detectPersistMs: 1 }, { signatureCaptureMs: 1 }, { stopGraceMs: 1 }, { detectTrace: true }, { detectTrace: false }];
+		const knobs = [{ hooks: "/tmp/h" }, { killGraceMs: 1 }, { sweepLockWaitMs: 1 }, { captureMs: 1 }, { detectTickMs: 1 }, { detectPersistMs: 1 }, { signatureCaptureMs: 1 }, { stopGraceMs: 1 }, { detectTrace: true }, { detectTrace: false }, { detectFeed: true }, { detectFeed: false }];
 		for (const extra of knobs) {
 			expect(() => renderExecWrapper({ root: "/r", bun: "/b", script: "/s", sweepScope: "uid", ...extra })).toThrow(WrapperRenderError);
 		}
@@ -2144,12 +2338,13 @@ describe("sweep", () => {
 		expect(() => renderExecWrapper({ root: "/r", bun: "/b", script: "/s", sweepScope: "all" as SweepScope })).toThrow(WrapperRenderError);
 		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "uid" })).toMatchObject({
 			killGraceMs: 10_000, sweepLockWaitMs: 60_000, captureMs: 20_000, hooks: null,
-			detectTickMs: STUCK_DEFAULTS.tickMs, detectPersistMs: STUCK_DEFAULTS.persistMs, signatureCaptureMs: STUCK_DEFAULTS.signatureCaptureMs, stopGraceMs: STUCK_DEFAULTS.stopGraceMs, detectTrace: false,
+			detectTickMs: STUCK_DEFAULTS.tickMs, detectPersistMs: STUCK_DEFAULTS.persistMs, signatureCaptureMs: STUCK_DEFAULTS.signatureCaptureMs, stopGraceMs: STUCK_DEFAULTS.stopGraceMs, detectTrace: false, detectFeed: false,
 		});
 		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", captureMs: 1_500 }).captureMs).toBe(1_500);
 		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", detectTickMs: 50, detectPersistMs: 400, signatureCaptureMs: 900, stopGraceMs: 300, detectTrace: true }))
 			.toMatchObject({ detectTickMs: 50, detectPersistMs: 400, signatureCaptureMs: 900, stopGraceMs: 300, detectTrace: true });
-		for (const bad of [{ detectTickMs: 0 }, { detectPersistMs: -1 }, { stopGraceMs: 1.5 }, { detectTrace: "yes" as unknown as boolean }]) {
+		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", hooks: "/h", detectFeed: true }).detectFeed).toBe(true);
+		for (const bad of [{ detectTickMs: 0 }, { detectPersistMs: -1 }, { stopGraceMs: 1.5 }, { detectTrace: "yes" as unknown as boolean }, { detectFeed: "yes" as unknown as boolean }, { detectFeed: true }]) {
 			expect(() => execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", ...bad })).toThrow(WrapperRenderError);
 		}
 	});

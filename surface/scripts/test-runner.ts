@@ -111,6 +111,8 @@
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS    the refresh helper's cap (default REFRESH_CAP_S plus a minute, 15 min)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS  its SIGTERM-to-SIGKILL grace (default 10 s)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_REAP_MS   how long it then waits for sudo to exit (default 30 s)
+//   AGENT_SYSTEM_TEST_RUNNER_CLOCK         a file of whole milliseconds the runner's deadline clock runs ahead of Date.now()
+//                                           (`runnerNow`); a test rewrites it to step a deadline past instead of waiting it out
 //   AGENT_SYSTEM_TEST_HOOKS                 a directory of pause/mark files at named boundaries (`hook`), and the
 //                                           `<run id>.refresh-signal.refuse` file: the runner's signals to the refresh
 //                                           helper's sudo are refused, as the kernel may refuse Jo's signal to a root sudo
@@ -179,9 +181,9 @@ const STUCK_BACKSTOP_MS = STUCK_DEFAULTS.persistMs + STUCK_DEFAULTS.signatureCap
 /** How often the backstop reads an enforce part's stdout (AGENT_SYSTEM_TEST_RUNNER_STUCK_POLL_MS). */
 const STUCK_POLL_MS = 1_000;
 /** One deadline over every attempt of the sweep after a stuck or stalled part, the only cleanup step (AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS). */
-const STUCK_SWEEP_MS = 12_000;
+export const STUCK_SWEEP_MS = 12_000;
 /** The post-sweep deadline of a stuck or stalled run, under FINALIZE_MS (AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS). */
-const STUCK_FINALIZE_MS = 12_000;
+export const STUCK_FINALIZE_MS = 12_000;
 /** How long after the stuck fact the containment check may retry before the run names its failure (AGENT_SYSTEM_TEST_RUNNER_STUCK_CONTAIN_MS). */
 const STUCK_CONTAIN_MS = 60_000;
 /** Between containment checks, a bounded sweep and this wait (AGENT_SYSTEM_TEST_RUNNER_CONTAIN_RETRY_MS). */
@@ -189,12 +191,40 @@ const CONTAIN_RETRY_MS = 5_000;
 /** How long a run retries the admission gate before it ends `admission refused` (AGENT_SYSTEM_TEST_RUNNER_ADMIT_MS). */
 const ADMIT_MS = 30_000;
 /** The post-sweep finalization deadline of a run that was not stuck (AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS). */
-const FINALIZE_MS = 150_000;
+export const FINALIZE_MS = 150_000;
 
 export const msEnv = (name: string, fallback: number): number => {
 	const n = Number(process.env[name]);
 	return Number.isFinite(n) && n > 0 ? n : fallback;
 };
+
+/**
+ * The runner's clock for its own deadlines (the clock-ownership table's runner row, PLAN wl-mvtueivmiujnom sl-timing-detector): the
+ * post-sweep finalization deadline (head re-check, result, publication), the release horizon, the stuck sweep, containment and
+ * admission deadlines with their ownership checkpoints, and the verified reconciliation and promotion holder budget. Production
+ * reads Date.now(). Under test, AGENT_SYSTEM_TEST_RUNNER_CLOCK names a file holding the whole milliseconds this clock runs ahead of
+ * Date.now(): a test steps a deadline past by rewriting the file (atomically) while it observes the run, instead of waiting real
+ * time out. An unreadable file, or one that holds anything but whole milliseconds, throws naming the file; never a silent zero.
+ * Lock heartbeats and the queue's liveness stay on Date.now(): other processes write and judge them. The release horizon compares
+ * the row's heartbeatAt with this clock, so a step brings that horizon closer by the step.
+ */
+export function runnerNow(): number {
+	return Date.now() + runnerClockAhead();
+}
+function runnerClockAhead(): number {
+	const path = process.env.AGENT_SYSTEM_TEST_RUNNER_CLOCK;
+	if (!path) return 0;
+	let text: string;
+	try {
+		text = readFileSync(path, "utf8");
+	} catch (e) {
+		throw new Error(`the runner clock file ${path} (AGENT_SYSTEM_TEST_RUNNER_CLOCK) is unreadable: ${errText(e)}; the test must write it before the run starts`);
+	}
+	if (!/^\d+\n?$/.test(text)) throw new Error(`the runner clock file ${path} (AGENT_SYSTEM_TEST_RUNNER_CLOCK) holds ${JSON.stringify(text.slice(0, 40))}, not whole milliseconds`);
+	return Number(text.trim());
+}
+/** A runnerNow deadline as the Date.now() deadline a `hook` pause checks, taken at the call: a step during that pause is not seen there. */
+const hookDeadline = (deadline: number): number => deadline - runnerClockAhead();
 
 /** Where the preflight finds the install it checks, and the ids its owners must carry. */
 export interface InstallSpec {
@@ -1275,7 +1305,7 @@ function promotionBudgetMs(): number {
 		+ msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", FINALIZE_MS);
 }
 function verifierTimeout(deadline: number, cap: number, operation: string): number {
-	const remaining = deadline - Date.now();
+	const remaining = deadline - runnerNow();
 	if (remaining <= 0) throw new Stop(`verified reconciliation/promotion holder deadline exceeded before ${operation}; retry after inspecting the verifier`);
 	return Math.min(cap, remaining);
 }
@@ -1305,8 +1335,23 @@ export function promoteMain(ledger: Ledger, repo: string, sha: string, log: (s: 
 		const dir = resolve(o.directory ?? verifiedDirectory());
 		db = openPromotionDb(dir);
 		hookMark(sha, "promotion-acquiring");
-		db.exec(`PRAGMA busy_timeout = ${Math.trunc(promotionBudgetMs())}; BEGIN IMMEDIATE`);
-		const deadline = Date.now() + promotionBudgetMs();
+		// One nonblocking BEGIN per attempt against the holder budget on the runner's clock, as installCheck waits: a waiter allows a
+		// healthy holder's whole bounded work, not SQLite's five-second default. It blocks the thread as the busy wait it replaces did.
+		db.exec("PRAGMA busy_timeout = 0");
+		const acquireBy = runnerNow() + promotionBudgetMs();
+		for (let waitMs = 25; ; waitMs = Math.min(waitMs * 2, 250)) {
+			try {
+				db.exec("BEGIN IMMEDIATE");
+				break;
+			} catch (e) {
+				if (!isBusy(e)) throw e;
+				const left = acquireBy - runnerNow();
+				if (left <= 0) throw new Error(`verified promotion could not acquire ${join(dir, "promotion.db")} within its holder budget: ${errText(e)}; retry after the publisher finishes`);
+				hookMark(sha, "promotion-busy");
+				Bun.sleepSync(Math.min(waitMs, left));
+			}
+		}
+		const deadline = runnerNow() + promotionBudgetMs();
 		const git = (cwd: string, args: string[]) => verifierGit(cwd, args, deadline);
 		const clone = join(dir, "repo");
 		const origin = o.origin ?? process.env.AGENT_SYSTEM_TEST_RUNNER_ORIGIN ?? `https://github.com/${repo}.git`;
@@ -1603,7 +1648,7 @@ function landAdmission(o: {
 			if (e instanceof FastSetError) throw new Fail(e.message, START_EXIT.refused);
 			throw e;
 		}
-		const plan: FastPlan = s.kind === "fast" ? { ref: o.ref, scope: "fast", files: s.files, parse: s.parse, macOnly: s.macOnly } : { ref: o.ref, scope: "full", reasons: s.reasons };
+		const plan: FastPlan = s.kind === "fast" ? { ref: o.ref, scope: "fast", files: s.files, parse: s.parse, macOnly: s.macOnly, mainSkip: s.mainSkip } : { ref: o.ref, scope: "full", reasons: s.reasons };
 		return { plan, carryFrom: null };
 	} finally {
 		dropRunRefs(mirror, o.runId, env, o.log);
@@ -1988,7 +2033,8 @@ export class Runner implements ExclusiveSession {
 					return;
 				}
 				if (queuedTooLong(waitStart, Date.now(), this.config, train)) throw new Stop("queued too long");
-				hookMark(this.id, "queued");
+				// Outside every runs.db transaction: a test pauses a waiter here (`queued.pause`) and knows it holds no write lock.
+				await hook(this.id, "queued");
 				await Bun.sleep(pollMs);
 			}
 		} catch (e) {
@@ -2069,7 +2115,7 @@ export class Runner implements ExclusiveSession {
 	 */
 	private async checkpointBy(phase: string, what: string, deadline: number): Promise<boolean> {
 		try {
-			await hook(this.id, `phase-${phase}`, {}, deadline);
+			await hook(this.id, `phase-${phase}`, {}, hookDeadline(deadline));
 		} catch (e) {
 			if (!(e instanceof Stop)) throw e;
 			this.log(`${what}: the ownership checkpoint was paused at its test hook past its deadline; going on without it`);
@@ -2090,7 +2136,7 @@ export class Runner implements ExclusiveSession {
 					if (!isBusy(e)) throw e;
 					hookMark(this.id, "checkpoint-busy", { phase, attempts });
 				}
-				const left = deadline - Date.now();
+				const left = deadline - runnerNow();
 				if (left <= 0) break;
 				await Bun.sleep(Math.min(50, left));
 			}
@@ -2192,9 +2238,9 @@ export class Runner implements ExclusiveSession {
 	 */
 	private async boundedSweep(after: string, deadline: number): Promise<boolean> {
 		for (let attempt = 0; attempt <= SWEEP_RETRIES; attempt++) {
-			if (Date.now() >= deadline) break;
+			if (runnerNow() >= deadline) break;
 			if (!(await this.checkpointBy("sweep", `the sweep after ${after}`, deadline))) return false;
-			const left = deadline - Date.now();
+			const left = deadline - runnerNow();
 			if (left <= 0) break;
 			hookMark(this.id, "sweep", { after, attempt });
 			let r: Wrapped;
@@ -2262,14 +2308,14 @@ export class Runner implements ExclusiveSession {
 	 */
 	private async halt(stem: string, at: number): Promise<void> {
 		const sweepMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS", STUCK_SWEEP_MS);
-		const sweepBy = Date.now() + sweepMs;
+		const sweepBy = runnerNow() + sweepMs;
 		this.lockBusy(0);
 		const after = stem;
 		const retryMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_CONTAIN_RETRY_MS", CONTAIN_RETRY_MS);
 		const deadline = at + msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_CONTAIN_MS", STUCK_CONTAIN_MS);
 		await this.boundedSweep(after, sweepBy);
 		for (;;) {
-			const checkedAt = Date.now();
+			const checkedAt = runnerNow();
 			const c = this.containment();
 			if (c.kind === "contained") {
 				this.log(`contained after ${after}: no live ${AS2TEST_USER} process`);
@@ -2284,8 +2330,8 @@ export class Runner implements ExclusiveSession {
 				else if (this.f.executorStalled !== null) this.f.executorStalled += failed;
 				return;
 			}
-			await this.boundedSweep(after, Math.min(deadline, Date.now() + sweepMs));
-			const wait = Math.min(checkedAt + retryMs, deadline) - Date.now();
+			await this.boundedSweep(after, Math.min(deadline, runnerNow() + sweepMs));
+			const wait = Math.min(checkedAt + retryMs, deadline) - runnerNow();
 			if (wait > 0) await Bun.sleep(wait);
 		}
 	}
@@ -2299,9 +2345,9 @@ export class Runner implements ExclusiveSession {
 	private async admit(): Promise<boolean> {
 		const sweepMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS", STUCK_SWEEP_MS);
 		const retryMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_CONTAIN_RETRY_MS", CONTAIN_RETRY_MS);
-		const deadline = Date.now() + msEnv("AGENT_SYSTEM_TEST_RUNNER_ADMIT_MS", ADMIT_MS);
+		const deadline = runnerNow() + msEnv("AGENT_SYSTEM_TEST_RUNNER_ADMIT_MS", ADMIT_MS);
 		for (;;) {
-			const checkedAt = Date.now();
+			const checkedAt = runnerNow();
 			const c = this.containment();
 			if (c.kind === "contained") return true;
 			const why = c.kind === "live" ? `live ${AS2TEST_USER} processes ${c.pids.join(",")}` : "inspection denied";
@@ -2311,8 +2357,8 @@ export class Runner implements ExclusiveSession {
 				return false;
 			}
 			this.log(`admission: ${why}${c.kind === "denied" ? ` (${c.why})` : ""}; sweeping and checking again`);
-			await this.boundedSweep("admission", Math.min(deadline, Date.now() + sweepMs));
-			const wait = Math.min(checkedAt + retryMs, deadline) - Date.now();
+			await this.boundedSweep("admission", Math.min(deadline, runnerNow() + sweepMs));
+			const wait = Math.min(checkedAt + retryMs, deadline) - runnerNow();
 			if (wait > 0) await Bun.sleep(wait);
 		}
 	}
@@ -2446,7 +2492,7 @@ export class Runner implements ExclusiveSession {
 			// layer: nonblocking BEGINs, bounded backoff and one deadline, followed by exactly one reconciliation.
 			db.exec("PRAGMA busy_timeout = 0");
 			const budget = promotionBudgetMs();
-			const deadline = Date.now() + budget;
+			const deadline = runnerNow() + budget;
 			let waitMs = 25;
 			for (;;) {
 				try {
@@ -2454,14 +2500,14 @@ export class Runner implements ExclusiveSession {
 					break;
 				} catch (e) {
 					if (!isBusy(e)) throw e;
-					if (Date.now() >= deadline) throw new Stop(`verified reconciliation could not acquire ${join(directory, "promotion.db")} within its holder budget: ${errText(e)}; retry after the publisher finishes`);
+					if (runnerNow() >= deadline) throw new Stop(`verified reconciliation could not acquire ${join(directory, "promotion.db")} within its holder budget: ${errText(e)}; retry after the publisher finishes`);
 					if (waitMs === 25) this.log(`verified reconciliation waiting for ${join(directory, "promotion.db")}`);
 					hookMark(this.id, "promotion-busy");
-					await Bun.sleep(Math.min(waitMs, Math.max(0, deadline - Date.now())));
+					await Bun.sleep(Math.min(waitMs, Math.max(0, deadline - runnerNow())));
 					waitMs = Math.min(waitMs * 2, 250);
 				}
 			}
-			return await this.reconcileInstall(true, Date.now() + budget);
+			return await this.reconcileInstall(true, runnerNow() + budget);
 		} catch (e) {
 			failure = e;
 			throw e;
@@ -2704,7 +2750,7 @@ export class Runner implements ExclusiveSession {
 			out = { result: partResult({ ...imported, exit: r.signal !== null ? null : r.code, ms, timedOut, maxBytes: this.capBytes }), junit: imported.junit };
 		}
 		if (halt === null) return { ...out, timedOut, halted: false, stem: name };
-		const at = Date.now();
+		const at = runnerNow();
 		out.result = { ...out.result, error: halt };
 		// The verdict's part label (`full`, a solo's `./<file>`, `base ./<file>`); runner.log's lines name the stem, as the exec's do.
 		const label = call.sub === "full" || call.sub === "fast" ? call.sub : call.sub === "solo" ? call.file : `base ${call.file}`;
@@ -2890,12 +2936,12 @@ export class Runner implements ExclusiveSession {
 
 	/** The post-sweep finalization deadline, then the head re-check (§ 2.3 step 5). */
 	private async headRecheck(): Promise<void> {
-		const finalizeMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", 150_000);
+		const finalizeMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", FINALIZE_MS);
 		const halted = this.f.stuck !== null || this.f.executorStalled !== null;
-		this.postSweepDeadline = Date.now() + (halted ? Math.min(finalizeMs, msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS", STUCK_FINALIZE_MS)) : finalizeMs);
+		this.postSweepDeadline = runnerNow() + (halted ? Math.min(finalizeMs, msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS", STUCK_FINALIZE_MS)) : finalizeMs);
 		this.log(`post-sweep finalization started; deadline ${new Date(this.postSweepDeadline).toISOString()}`);
-		await hook(this.id, "head-recheck", {}, this.postSweepDeadline);
-		this.f.headAtEnd = this.request.main !== undefined ? this.f.fetchedSha : await this.headNow(Math.max(1, this.postSweepDeadline - Date.now()));
+		await hook(this.id, "head-recheck", {}, hookDeadline(this.postSweepDeadline));
+		this.f.headAtEnd = this.request.main !== undefined ? this.f.fetchedSha : await this.headNow(Math.max(1, this.postSweepDeadline - runnerNow()));
 	}
 
 	/**
@@ -3077,10 +3123,10 @@ export class Runner implements ExclusiveSession {
 			} catch (e) {
 				if (!isBusy(e)) throw e;
 				hookMark(this.id, "publication-busy");
-				const remaining = this.postSweepDeadline - Date.now();
+				const remaining = this.postSweepDeadline - runnerNow();
 				if (remaining <= 0) throw new Stop("post-sweep deadline exceeded during publication");
 				Bun.sleepSync(Math.min(50, remaining));
-				if (Date.now() >= this.postSweepDeadline) throw new Stop("post-sweep deadline exceeded during publication");
+				if (runnerNow() >= this.postSweepDeadline) throw new Stop("post-sweep deadline exceeded during publication");
 			}
 		}
 		const { run, settled } = published;
@@ -3192,11 +3238,11 @@ export class Runner implements ExclusiveSession {
 			if (!Number.isFinite(this.postSweepDeadline)) {
 				const finalizeMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", FINALIZE_MS);
 				const stopped = this.f.stuck !== null || this.f.executorStalled !== null;
-				this.postSweepDeadline = Date.now() + (stopped ? Math.min(finalizeMs, msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS", STUCK_FINALIZE_MS)) : finalizeMs);
+				this.postSweepDeadline = runnerNow() + (stopped ? Math.min(finalizeMs, msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS", STUCK_FINALIZE_MS)) : finalizeMs);
 			}
 			try {
-				await hook(this.id, "result", {}, this.postSweepDeadline);
-				if (Date.now() >= this.postSweepDeadline) throw new Stop("post-sweep deadline exceeded before publication");
+				await hook(this.id, "result", {}, hookDeadline(this.postSweepDeadline));
+				if (runnerNow() >= this.postSweepDeadline) throw new Stop("post-sweep deadline exceeded before publication");
 			} catch (e) {
 				this.f.error = errText(e);
 				this.log(`stopped: ${this.f.error}`);
@@ -3230,7 +3276,7 @@ export class Runner implements ExclusiveSession {
 				}
 				return START_EXIT.failed;
 			}
-			if (this.request.main !== undefined) await hook(this.id, "main-published", {}, this.postSweepDeadline);
+			if (this.request.main !== undefined) await hook(this.id, "main-published", {}, hookDeadline(this.postSweepDeadline));
 			this.admitPendingMain();
 			// PR338: no GitHub call holds the Mac slot. A failed release is still a failed runner, even if publication succeeds.
 			const released = await this.release();
@@ -3250,7 +3296,7 @@ export class Runner implements ExclusiveSession {
 			const state = this.f.fetchedSha === run.sha ? FULL_SUITE_STATE[run.verdict] : undefined;
 			if (state) {
 				try {
-					await hook(this.wl, "gate-publication", {}, this.postSweepDeadline);
+					await hook(this.wl, "gate-publication", {}, hookDeadline(this.postSweepDeadline));
 					const plan = fastPlanOf(this.ledger.entries(this.wl), this.id);
 					const ref = plan?.ref ?? (() => ghPrView(this.ownerRepo, run.pr).headRefName);
 					const contained = /; containment failed: /.test(`${this.f.stuck ?? ""}${this.f.executorStalled ?? ""}`) ? ", containment failed" : "";
@@ -3349,7 +3395,7 @@ export class Runner implements ExclusiveSession {
 			}
 			const horizon = beatAt + HEARTBEAT_STALE_MS;
 			if (this.releaseFailures === 1) this.log(`the lock release failed: ${errText(failed)}; retrying until ${new Date(horizon).toISOString()}`);
-			const now = Date.now();
+			const now = runnerNow();
 			if (lockHolderStale(beatAt, now)) {
 				this.log(`the lock was not released: ${errText(failed)} (${this.releaseFailures} attempts; the row's heartbeatAt ${new Date(beatAt).toISOString()} is stale for a waiter since ${new Date(horizon).toISOString()}); the row holds this run until a waiter takes it`);
 				return false;

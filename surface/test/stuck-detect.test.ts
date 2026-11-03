@@ -299,19 +299,53 @@ const uid = process.getuid!();
 const roots: string[] = [];
 const kids: { kill: (s?: number | NodeJS.Signals) => void }[] = [];
 afterAll(() => {
-	for (const k of kids) k.kill("SIGKILL");
-	for (const r of roots) rmSync(r, { recursive: true, force: true });
+	const errors: unknown[] = [];
+	for (const k of kids) {
+		try {
+			k.kill("SIGKILL");
+		} catch (e) {
+			errors.push(e);
+		}
+	}
+	for (const r of roots) {
+		try {
+			rmSync(r, { recursive: true, force: true });
+		} catch (e) {
+			errors.push(e);
+		}
+	}
+	if (errors.length > 0) throw new AggregateError(errors, `stuck-detect live cleanup: ${errors.length} kill or rm failure(s)`);
 });
 
-/** Polls `probe`: a kernel process state has no event to await, so this re-reads it every 50 ms (a real delay by nature). */
-async function until<T>(what: string, probe: () => T | null | undefined | false, ms = 5_000): Promise<T> {
-	const deadline = Date.now() + ms;
-	for (;;) {
-		const v = probe();
-		if (v) return v;
-		if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-		await Bun.sleep(50);
-	}
+/** Lines of a child's stdout, one per call; a stream that ends before a full line is an error naming `what`. */
+function lineReader(stdout: ReadableStream<Uint8Array>, what: string): () => Promise<string> {
+	const reader = stdout.getReader();
+	const dec = new TextDecoder();
+	let buf = "";
+	return async () => {
+		for (;;) {
+			const nl = buf.indexOf("\n");
+			if (nl >= 0) {
+				const line = buf.slice(0, nl);
+				buf = buf.slice(nl + 1);
+				return line;
+			}
+			const { value, done } = await reader.read();
+			if (done) throw new Error(`${what}: stdout ended before a full line (read ${JSON.stringify(buf)})`);
+			buf += dec.decode(value, { stream: true });
+		}
+	};
+}
+
+/**
+ * Resolves once `pid` has exited (it is a zombie or gone): /usr/bin/caffeinate -w returns when the pid exits, at once for
+ * one already exited. The caller then reads the snapshot for the state it expects; a zombie is never inferred from this.
+ */
+async function exitedOf(pid: number): Promise<void> {
+	const w = spawn(["/usr/bin/caffeinate", "-w", String(pid)], { stdout: "ignore", stderr: "pipe" });
+	kids.push(w);
+	const code = await w.exited;
+	if (code !== 0) throw new Error(`/usr/bin/caffeinate -w ${pid} exited ${code}: ${await new Response(w.stderr).text()}`);
 }
 
 const procOf = (pid: number): Proc | undefined => {
@@ -360,15 +394,7 @@ setTimeout(() => {}, 60_000);
 async function holder(env: Record<string, string>, extraArgs: string[] = []) {
 	const p = spawn([process.execPath, "-e", HOLDER, ...extraArgs], { env: { ...process.env, ...env }, stdin: "pipe", stdout: "pipe", stderr: "inherit" });
 	kids.push(p);
-	const reader = p.stdout.getReader();
-	let text = "";
-	while (!text.includes("\n")) {
-		const { value, done } = await reader.read();
-		if (done) break;
-		text += new TextDecoder().decode(value);
-	}
-	reader.releaseLock();
-	const words = text.trim().split(" ");
+	const words = (await lineReader(p.stdout, "the marker holder")()).trim().split(" ");
 	expect(words.slice(0, 2)).toEqual(["held", "0"]);
 	return { p, words };
 }
@@ -395,7 +421,9 @@ describe.skipIf(!LIVE)("live: snapshot, argv and CPU through bun:ffi", () => {
 		const p = spawn(["/bin/sleep", "30"], { stdout: "ignore", stderr: "ignore" });
 		kids.push(p);
 		const after = Date.now();
-		const c = await until("the child in the snapshot", () => procOf(p.pid));
+		// Bun.spawn is posix_spawn, which loads the image before it returns (a non-executable path fails the spawn call
+		// itself, EACCES): the child is in the table with its exec'd image as soon as spawn returns, so it is read once.
+		const c = procOf(p.pid)!;
 		expect(c).toMatchObject({ ppid: process.pid, zombie: false, comm: "sleep" });
 		expect(c.startUs).toBeGreaterThanOrEqual((before - 5) * 1000);
 		expect(c.startUs).toBeLessThanOrEqual((after + 5) * 1000);
@@ -408,37 +436,52 @@ describe.skipIf(!LIVE)("live: snapshot, argv and CPU through bun:ffi", () => {
 		// sh forks /usr/bin/true, prints its pid and execs into sleep, which never waits: true stays a zombie.
 		const sh = spawn(["/bin/sh", "-c", "/usr/bin/true & echo $!; exec /bin/sleep 30"], { stdout: "pipe", stderr: "ignore" });
 		kids.push(sh);
-		const reader = sh.stdout.getReader();
-		const { value } = await reader.read();
-		reader.releaseLock();
-		const child = Number(new TextDecoder().decode(value).trim());
-		const z = await until("the child to be a zombie", () => {
-			const c = procOf(child);
-			return c?.zombie && c;
-		});
+		const child = Number(await lineReader(sh.stdout, "sh")());
+		await exitedOf(child);
+		const z = procOf(child);
 		expect(z).toMatchObject({ pid: child, ppid: sh.pid, zombie: true, comm: "true" });
 		expect(procArgv(child)).toBeNull(); // a zombie has no argument area
 		sh.kill("SIGKILL");
 	});
 
-	test("a busy child's CPU grows at about one core: the mach timebase scaling gives ns", async () => {
-		const p = spawn([process.execPath, "-e", "for(;;){}"], { stdout: "ignore", stderr: "ignore" });
+	/**
+	 * Burns CPU until its own rusage (process.cpuUsage, user + system, µs) reaches 50 ms of CPU (a CPU condition, not a
+	 * wall one), prints that total, then prints it again on each stdin line.
+	 */
+	const CPU_CHILD = `
+import { writeSync } from "node:fs";
+const total = () => { const u = process.cpuUsage(); return u.user + u.system; };
+while (total() < 50_000) {}
+writeSync(1, total() + "\\n");
+process.stdin.on("data", () => writeSync(1, total() + "\\n"));
+`;
+	/** process.cpuUsage truncates user and system to µs each: the reported total is at most 2 µs below the kernel's; 10 µs of margin. */
+	const RUSAGE_ROUNDING_NS = 10_000;
+
+	test("a child's sampled CPU lies between the CPU it reported just before and just after the sample: the mach timebase scaling gives ns", async () => {
+		// The CPU read is checked against the child's own rusage, never against wall time: a CPU/wall ratio depends on the
+		// share of a core the machine gives the child (tr-0mvswzq5hk2blyw, tr-0mvzkktvgxlltc7). Unscaled mach units
+		// (24 MHz ticks on arm64) would read about 42 times too small and fall below the bracket.
+		const p = spawn([process.execPath, "-e", CPU_CHILD], { stdin: "pipe", stdout: "pipe", stderr: "inherit" });
 		kids.push(p);
-		// Real delays by nature: the kernel's CPU accounting of a spinning process is what is measured against wall time.
-		await Bun.sleep(200);
-		const c0 = cpuNs(p.pid)!;
-		const t0 = performance.now();
-		await Bun.sleep(1_000);
-		const c1 = cpuNs(p.pid)!;
-		const wall = (performance.now() - t0) * 1e6;
-		expect(c0).toBeGreaterThan(0);
-		expect(c1 - c0).toBeGreaterThan(0.5 * wall);
-		expect(c1 - c0).toBeLessThan(1.3 * wall);
-		p.kill("SIGKILL");
+		try {
+			const line = lineReader(p.stdout, "the CPU child");
+			const before = Number(await line()) * 1000;
+			const sampled = cpuNs(p.pid);
+			p.stdin.write("x\n");
+			await p.stdin.flush();
+			const after = Number(await line()) * 1000;
+			expect(before).toBeGreaterThanOrEqual(50_000_000);
+			expect(sampled).not.toBeNull();
+			expect(sampled!).toBeGreaterThanOrEqual(before);
+			expect(sampled!).toBeLessThanOrEqual(after + RUSAGE_ROUNDING_NS);
+		} finally {
+			p.kill("SIGKILL");
+		}
 		await p.exited;
 		expect(cpuNs(p.pid)).toBeNull(); // reaped: gone
 		expect(procArgv(p.pid)).toBeNull();
-	});
+	}, 30_000); // a failure bound only: one bun start and 50 ms of its CPU at any share of a core
 
 	test("another uid's list is readable without a spawn (uid 0: launchd, pid 1)", () => {
 		const s = snapshot(0);
@@ -498,48 +541,52 @@ describe.skipIf(!LIVE)("live: markers", () => {
 });
 
 describe.skipIf(!LIVE)("live: observe and the classifier end to end", () => {
-	test("a spinning bun holding its marker with an unreaped /usr/bin/true child matches; after its SIGKILL the signature clears", async () => {
+	test("a spinning bun holding its marker with an unreaped /usr/bin/true child matches at persistMs; after its SIGKILL the signature clears", async () => {
 		const dir = markerDir();
 		// `test` in its argv makes the holder a bun test process by argv; it is the part's leader (no --test-worker needed).
 		const { p, words } = await holder({ MARKER_DIR: dir, HOLD: "spin" }, ["test"]);
-		const since = Number(words[2]);
-		const zombie = Number(words[3]);
-		// The observation clock is fake and the spinner's CPU is real. "Hot" compares a worker's CPU delta with the wall delta
-		// between observations (HOT_SHARE), and a late tick is a gap. Both are scheduler-dependent on a real clock: under load
-		// the spinner got under 80% of a core, or this process woke late, and the signature never persisted
-		// (tr-0mvs9idg2cc61rm, null after 10 s). Here each tick advances the clock one tickMs, and only after the spinner has
-		// really burnt one tickMs of CPU since the last observation, so every tick after the first is hot. The test proves
-		// what it did before (live snapshot, markers, argv and CPU reads feed the classifier, which matches and then clears)
-		// at any CPU share. It also pins the persistence exactly: matched on the tick that reaches persistMs, not before.
-		const tickMs = 100;
-		const det = new StuckDetector({ tickMs, persistMs: 4 * tickMs, bunPath: process.execPath, leaderPid: p.pid });
-		let now = Date.now();
-		let cpuSeen = 0;
-		const tick = () => {
-			const obs = observe({ uid, markerDir: dir, candidatesOf: (s) => det.candidatesOf(s), argvOf: (s) => det.argvNeeded(s) });
-			cpuSeen = obs.cpu.get(p.pid) ?? cpuSeen;
-			now += tickMs;
-			return det.tick({ ...obs, at: now });
-		};
-		expect(activeOf(dir)).toEqual([{ pid: p.pid, since, command: "true" }]);
-		const z = await until("the child to be a zombie", () => procOf(zombie)?.zombie);
-		expect(z).toBe(true);
-		const matchedAt: number[] = [];
-		let matched: Signature | null = null;
-		for (let i = 1; i <= 8 && !matched; i++) {
-			if (i > 1) await until("the spinner to burn one tick of CPU", () => (cpuNs(p.pid) ?? 0) - cpuSeen >= tickMs * 1e6, 15_000);
-			const r = tick();
-			if (r.matched.length) matchedAt.push(i);
-			matched = r.matched[0] ?? null;
+		try {
+			const since = Number(words[2]);
+			const zombie = Number(words[3]);
+			// The snapshot, the markers, argv and the CPU read are live; the classifier's time inputs are fed. "Hot" compares
+			// a worker's CPU delta with the tick clock's delta (HOT_SHARE), and a late tick is a gap: on a real clock both
+			// follow the scheduler, and under load the spinner got under 80% of a core or this process woke late, so the
+			// signature never persisted (tr-0mvs9idg2cc61rm, tr-0mvsdt2r8l27rg0: null after 10 s). Here tick i is at
+			// T0 + i * tickMs and the spinner's CPU sample is i * tickMs of CPU (one core), so every tick after the first is
+			// hot, at the production tickMs and persistMs; the live CPU read is checked to be the spinner's and nonzero.
+			const { tickMs, persistMs } = STUCK_DEFAULTS;
+			const det = new StuckDetector({ tickMs, persistMs, bunPath: process.execPath, leaderPid: p.pid });
+			const look = () => observe({ uid, markerDir: dir, candidatesOf: (s) => det.candidatesOf(s), argvOf: (s) => det.argvNeeded(s) });
+			const tick = (i: number) => {
+				const obs = look();
+				expect([...obs.cpu.keys()]).toEqual([p.pid]);
+				expect(obs.cpu.get(p.pid)!).toBeGreaterThan(0);
+				return det.tick({ ...obs, at: T0 + i * tickMs, cpu: new Map([[p.pid, i * tickMs * 1e6]]) });
+			};
+			expect(activeOf(dir)).toEqual([{ pid: p.pid, since, command: "true" }]);
+			await exitedOf(zombie);
+			expect(procOf(zombie)).toMatchObject({ ppid: p.pid, zombie: true, comm: "true" });
+			const matchedAt: number[] = [];
+			let matched: Signature | null = null;
+			const last = persistMs / tickMs + 4;
+			for (let i = 1; i <= last; i++) {
+				const r = tick(i);
+				if (r.matched.length) matchedAt.push(i);
+				matched = r.matched[0] ?? matched;
+			}
+			// Tick 1 has no CPU baseline; tick 2 starts the hold; tick 7 is persistMs (5 ticks) after it, and it matches once.
+			expect(matchedAt).toEqual([2 + persistMs / tickMs]);
+			expect(matched).toMatchObject({ worker: { pid: p.pid }, zombie: { pid: zombie }, since, command: "true" });
+			p.kill("SIGKILL");
+			await p.exited;
+			const obs = look();
+			expect(obs.cpu.size).toBe(0); // the leader is gone: no candidate is read
+			const r = det.tick({ ...obs, at: T0 + (last + 1) * tickMs });
+			expect(r.signatures).toEqual([]);
+			expect(r.cleared.map((c) => c.matched)).toEqual([true]);
+			expect(r.owned.map((o) => o.pid).sort()).toEqual([p.pid, zombie].sort());
+		} finally {
+			p.kill("SIGKILL");
 		}
-		// Tick 1 has no CPU baseline; tick 2 starts the hold; tick 6 is persistMs (4 ticks) after it.
-		expect(matchedAt).toEqual([6]);
-		expect(matched).toMatchObject({ worker: { pid: p.pid }, zombie: { pid: zombie }, since, command: "true" });
-		p.kill("SIGKILL");
-		await p.exited;
-		const r = tick();
-		expect(r.signatures).toEqual([]);
-		expect(r.cleared.map((c) => c.matched)).toEqual([true]);
-		expect(r.owned.map((o) => o.pid).sort()).toEqual([p.pid, zombie].sort());
-	}, 90_000); // a failure bound only: five 15 s waits for 0.1 s of spinner CPU each, never reached at any normal share
+	}, 30_000); // a failure bound only: one bun start and ten observations
 });

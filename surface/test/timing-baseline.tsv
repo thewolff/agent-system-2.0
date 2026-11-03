@@ -16,7 +16,7 @@ ledger/test/lane.test.ts	sleep	1
 ledger/test/ledger.test.ts	clock-deadline	1
 ledger/test/ledger.test.ts	sleep	2
 skills/seo-audit/test/units.test.ts	timer	2
-surface/test/as2test.test.ts	clock-assert	10
+surface/test/as2test.test.ts	clock-assert	8
 surface/test/as2test.test.ts	clock-deadline	2
 surface/test/as2test.test.ts	clock-elapsed	3
 surface/test/as2test.test.ts	sleep	2
@@ -38,13 +38,6 @@ surface/test/phoenix-run.test.ts	race	1
 surface/test/phoenix-run.test.ts	sleep	1
 surface/test/ps-shim.test.ts	clock-deadline	1
 surface/test/ps-shim.test.ts	sleep	1
-surface/test/stuck-detect.test.ts	clock-deadline	1
-surface/test/stuck-detect.test.ts	clock-elapsed	1
-surface/test/stuck-detect.test.ts	sleep	3
-surface/test/test-runner.test.ts	clock-assert	4
-surface/test/test-runner.test.ts	clock-deadline	4
-surface/test/test-runner.test.ts	clock-elapsed	4
-surface/test/test-runner.test.ts	sleep	11
 surface/test/test-runner.test.ts	timer	1
 surface/test/tool-mount.test.ts	race	1
 surface/test/tool-mount.test.ts	timer	1

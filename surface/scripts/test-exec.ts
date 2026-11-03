@@ -84,14 +84,19 @@ function config(): Config {
 	const abs = (x: unknown): x is string => typeof x === "string" && isAbsolute(x) && normalize(x) === x;
 	const ms = (x: unknown): x is number => typeof x === "number" && Number.isSafeInteger(x) && x >= 0;
 	if (!abs(c.root) || !abs(c.bun) || !abs(c.resourcesPath) || !abs(c.ompRuntimePath) || (c.sweep !== "groups" && c.sweep !== UID_SWEEP) || !(c.hooks === null || abs(c.hooks)) || !ms(c.killGraceMs) || !ms(c.sweepLockWaitMs) || !ms(c.captureMs)
-		|| !ms(c.detectTickMs) || c.detectTickMs < 1 || !ms(c.detectPersistMs) || !ms(c.signatureCaptureMs) || !ms(c.stopGraceMs) || typeof c.detectTrace !== "boolean") {
+		|| !ms(c.detectTickMs) || c.detectTickMs < 1 || !ms(c.detectPersistMs) || !ms(c.signatureCaptureMs) || !ms(c.stopGraceMs) || typeof c.detectTrace !== "boolean"
+		|| !(c.detectFeed === undefined || typeof c.detectFeed === "boolean")) {
 		return refuse("wrapper config is malformed");
 	}
-	if (c.sweep !== "groups" && (c.hooks !== null || c.detectTrace)) return refuse("hooks and detectTrace are for a groups render only");
+	// detectFeed is the one optional knob: the wrapper always writes it, and a config without it (written by hand) has it off.
+	const detectFeed = c.detectFeed === true;
+	if (c.sweep !== "groups" && (c.hooks !== null || c.detectTrace || detectFeed)) return refuse("hooks, detectTrace and detectFeed are for a groups render only");
+	if (detectFeed && c.hooks === null) return refuse("detectFeed needs hooks");
 	return {
 		root: c.root, bun: c.bun, sweep: c.sweep, hooks: c.hooks, killGraceMs: c.killGraceMs, sweepLockWaitMs: c.sweepLockWaitMs, captureMs: c.captureMs,
 		resourcesPath: c.resourcesPath, ompRuntimePath: c.ompRuntimePath,
 		detectTickMs: c.detectTickMs, detectPersistMs: c.detectPersistMs, signatureCaptureMs: c.signatureCaptureMs, stopGraceMs: c.stopGraceMs, detectTrace: c.detectTrace,
+		detectFeed,
 	};
 }
 
@@ -601,12 +606,13 @@ async function captureSections(cfg: Config, runId: string, c: Capture, pgid: num
 
 /**
  * A bounded capture into `path`, opened O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW; when that open fails the capture is skipped with one
- * stderr line naming `what` and null comes back. One deadline (`ms`) owns it: at the deadline every capture group still running
- * is SIGKILLed, its readers are abandoned, the cap dir is cleared with bounded work only (`clearCapDir`) and the file says
- * `capture cut at <ms> ms`. The caller calls the returned capture's `afterKill` (a leftover cap dir goes, the file closes).
- * Never throws.
+ * stderr line naming `what` and null comes back. One deadline owns it: `ms` after the start, or (`{ fed }`, a `detectFeed` test's
+ * signature capture) the first look, at once and then every 25 ms, at which `fed()` says the test cut it. At the deadline every
+ * capture group still running is SIGKILLed, its readers are abandoned, the cap dir is cleared with bounded work only
+ * (`clearCapDir`) and the file says `capture cut at <ms> ms`. The caller calls the returned capture's `afterKill` (a leftover cap
+ * dir goes, the file closes). Never throws.
  */
-async function boundedCapture(what: string, path: string, ms: number, header: (started: number) => string, sections: (c: Capture) => Promise<void>): Promise<Capture | null> {
+async function boundedCapture(what: string, path: string, ms: number | { fed: () => boolean }, header: (started: number) => string, sections: (c: Capture) => Promise<void>): Promise<Capture | null> {
 	let fd: number;
 	try {
 		fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
@@ -614,11 +620,19 @@ async function boundedCapture(what: string, path: string, ms: number, header: (s
 		process.stderr.write(`as2test: ${what} skipped: cannot create ${path}: ${errText(e)}\n`);
 		return null;
 	}
-	const c = new Capture(fd, ms);
+	const c = new Capture(fd, typeof ms === "number" ? ms : Number.POSITIVE_INFINITY);
 	try {
 		c.write(header(c.started));
 		const deadline = Promise.withResolvers<"cut">();
-		const timer = setTimeout(() => deadline.resolve("cut"), ms);
+		let settled = false;
+		const timer = typeof ms === "number" ? setTimeout(() => deadline.resolve("cut"), ms) : undefined;
+		if (typeof ms !== "number") {
+			const { fed } = ms;
+			(async () => {
+				while (!settled && !fed()) await Bun.sleep(25);
+				if (!settled) deadline.resolve("cut");
+			})().catch((e: unknown) => deadline.reject(e));
+		}
 		const run = sections(c).then(
 			() => "done" as const,
 			(e: unknown) => {
@@ -627,6 +641,7 @@ async function boundedCapture(what: string, path: string, ms: number, header: (s
 			},
 		);
 		const how = await Promise.race([run, deadline.promise]);
+		settled = true;
 		clearTimeout(timer);
 		const killed = c.stop();
 		c.clearCapDir();
@@ -1032,6 +1047,25 @@ interface WatchPart {
 	markerDir: string;
 }
 
+/** One `detectFeed` tick (tests): its monotonic elapsed ms and each candidate's CPU ns; a candidate it names no CPU for reads null. */
+interface Fed {
+	at: number;
+	cpu: Map<number, number>;
+}
+
+/** A `.detect-feed.<n>` file: `{"at": <ms>, "cpu": {"<pid>": <ns>, …}}`; throws, naming the field, on anything else. */
+function fedSample(text: string): Fed {
+	const v = JSON.parse(text) as { at?: unknown; cpu?: unknown };
+	if (typeof v.at !== "number" || !Number.isFinite(v.at)) throw new Error(`at is not a finite number: ${JSON.stringify(v.at)}`);
+	if (!v.cpu || typeof v.cpu !== "object" || Array.isArray(v.cpu)) throw new Error("cpu is not an object of pid to ns");
+	const cpu = new Map<number, number>();
+	for (const [pid, ns] of Object.entries(v.cpu)) {
+		if (!/^[1-9]\d*$/.test(pid) || typeof ns !== "number" || !Number.isSafeInteger(ns) || ns < 0) throw new Error(`cpu ${pid}: ${JSON.stringify(ns)} is not a pid and whole ns`);
+		cpu.set(Number(pid), ns);
+	}
+	return { at: v.at, cpu };
+}
+
 /**
  * The detector of one part (D3): one observation per tick from the spawn until the part ends, the cap fires or a stop is
  * decided. Each signature's first tick, its clearing and its match are stdout lines. A shadow match starts the part's one
@@ -1060,7 +1094,58 @@ class StuckWatch {
 	}
 
 	start(): void {
-		this.timer = setInterval(() => this.tick(), this.p.cfg.detectTickMs);
+		if (!this.p.cfg.detectFeed) {
+			this.timer = setInterval(() => this.tick(null), this.p.cfg.detectTickMs);
+			return;
+		}
+		this.feed().catch((e) => {
+			this.line("stuck-detector-off", `reason detector feed failed: ${e instanceof Error ? e.message : errText(e)}`);
+			this.end();
+		});
+	}
+
+	/**
+	 * `detectFeed` (tests): one tick per `<hooks>/<run>.<part>.detect-feed.<n>` (n from 1), taken in order, each answered by
+	 * `<hooks>/<run>.<part>.detect-ack.<n>/ack`: the tick's signatures, starts, matches and clears, `ended` when the part had
+	 * already ended, or the `error` that turned the detector off (also its `stuck-detector-off` line). The test makes the
+	 * `.detect-ack.<n>` directory before it publishes feed n, so the ack's arrival is the only event there (Bun 1.3.14's
+	 * fs.watch drops an event that repeats the last one's type or name within about a millisecond). Both files are
+	 * published whole: the ack by a rename from a temporary file in the hooks directory; a missing ack directory is an error.
+	 */
+	private async feed(): Promise<void> {
+		const base = this.feedBase();
+		const pair = (s: Signature) => ({ worker: s.worker.pid, zombie: s.zombie.pid });
+		const ack = (n: number, body: Record<string, unknown>) => {
+			const temp = `${base}.detect-ack.${n}.${process.pid}.tmp`;
+			writeFileSync(temp, JSON.stringify({ n, ...body }));
+			renameSync(temp, join(`${base}.detect-ack.${n}`, "ack"));
+		};
+		for (let n = 1; !this.ended; n++) {
+			const path = `${base}.detect-feed.${n}`;
+			while (!this.ended && !existsSync(path)) await Bun.sleep(25);
+			if (this.ended) {
+				if (existsSync(path)) ack(n, { ended: true });
+				return;
+			}
+			let fed: Fed;
+			try {
+				fed = fedSample(readFileSync(path, "utf8"));
+			} catch (e) {
+				const why = `detector feed ${path}: ${e instanceof Error ? e.message : errText(e)}`;
+				this.line("stuck-detector-off", `reason ${why}`);
+				this.end();
+				ack(n, { error: why });
+				return;
+			}
+			const r = this.tick(fed);
+			if (r === null) ack(n, { ended: true });
+			else ack(n, { at: fed.at, signatures: r.signatures.map(pair), started: r.started.map(pair), matched: r.matched.map(pair), cleared: r.cleared.map((c) => ({ ...pair(c.sig), matched: c.matched })) });
+		}
+	}
+
+	/** `<hooks>/<run>.<part>`: where a `detectFeed` test publishes its feed and its signature-capture cut. */
+	private feedBase(): string {
+		return join(this.p.cfg.hooks!, `${this.p.runId}.${this.p.stem}`);
 	}
 
 	/** No tick classifies after this (the part ended, the cap fired, or a stop was decided). */
@@ -1079,15 +1164,21 @@ class StuckWatch {
 		stuckLine(this.p.stem, keyword, rest);
 	}
 
-	private tick(): void {
-		if (this.ended) return;
+	/**
+	 * One observation and classification; null when none classified (the watch had ended, or the detector turned itself off).
+	 * `fed` (detectFeed, tests): the tick's elapsed time and each candidate's CPU are the test's explicit samples; the snapshot,
+	 * markers and argv stay real.
+	 */
+	private tick(fed: Fed | null): TickResult | null {
+		if (this.ended) return null;
 		const { cfg, mode } = this.p;
 		try {
-			const obs = observe({ uid: this.uid, markerDir: this.p.markerDir, candidatesOf: (s) => this.det.candidatesOf(s), argvOf: (s) => this.det.argvNeeded(s) });
+			const real = observe({ uid: this.uid, markerDir: this.p.markerDir, candidatesOf: (s) => this.det.candidatesOf(s), argvOf: (s) => this.det.argvNeeded(s) });
+			const obs: Observation = fed === null ? real : { ...real, at: fed.at, cpu: new Map([...real.cpu.keys()].map((pid) => [pid, fed.cpu.get(pid) ?? null])) };
 			if (obs.snap.kind === "unavailable") {
 				this.line("stuck-detector-off", `reason ${obs.snap.why}`);
 				this.end();
-				return;
+				return null;
 			}
 			const r = this.det.tick(obs);
 			if (cfg.sweep === "groups") this.recordGroups(r.owned);
@@ -1108,15 +1199,17 @@ class StuckWatch {
 					this.stopping = true;
 					this.end();
 					this.decided.resolve({ sig: m, spunMs, snap: obs.snap, owned: r.owned });
-					return;
+					return r;
 				}
 				this.line("stuck-would-stop", pair(m));
 				// One signature capture per part; in shadow nothing is killed, so the capture's file closes as soon as it ends.
 				this.shadowCapture ??= this.capture({ sig: m, spunMs, snap: obs.snap, owned: r.owned }).then((c) => c?.afterKill());
 			}
+			return r;
 		} catch (e) {
 			this.line("stuck-detector-off", `reason detector failed: ${e instanceof Error ? e.message : errText(e)}`);
 			this.end();
+			return null;
 		}
 	}
 
@@ -1149,16 +1242,21 @@ class StuckWatch {
 		appendFileSync(join(this.p.work, `${this.p.stem}.stuck-trace.jsonl`), `${JSON.stringify(row)}\n`);
 	}
 
-	/** The part's one signature capture (D3), bounded by signatureCaptureMs; `stuck-captured` once its file is written. */
+	/**
+	 * The part's one signature capture (D3), bounded by signatureCaptureMs; `stuck-captured` once its file is written. Under
+	 * `detectFeed` (tests) its deadline is fed too: the capture is cut when `<hooks>/<run>.<part>.detect-cut` exists (at once
+	 * when it already does) and runs to its end otherwise.
+	 */
 	async capture(d: StopDecision): Promise<Capture | null> {
 		const { cfg, runId, work, stem, logPath, markerDir } = this.p;
 		const { sig } = d;
+		const cutPath = cfg.detectFeed ? `${this.feedBase()}.detect-cut` : null;
 		const c = await boundedCapture(
 			"signature capture",
 			join(work, `${stem}.signature.log`),
-			cfg.signatureCaptureMs,
+			cutPath === null ? cfg.signatureCaptureMs : { fed: () => existsSync(cutPath) },
 			(started) =>
-				`signature capture of ${stem}: worker ${sig.worker.pid} spun ${d.spunMs} ms in Bun.spawnSync (marker since ${sig.since}, command ${sig.command}) with unreaped child ${sig.zombie.pid}; mode ${this.p.mode}, ${new Date(started).toISOString()}, deadline ${cfg.signatureCaptureMs} ms\n`,
+				`signature capture of ${stem}: worker ${sig.worker.pid} spun ${d.spunMs} ms in Bun.spawnSync (marker since ${sig.since}, command ${sig.command}) with unreaped child ${sig.zombie.pid}; mode ${this.p.mode}, ${new Date(started).toISOString()}, deadline ${cutPath === null ? `${cfg.signatureCaptureMs} ms` : `fed (${cutPath})`}\n`,
 			(c) => signatureSections(cfg, runId, c, d, work, stem, logPath, markerDir),
 		);
 		if (c !== null) this.line("stuck-captured", `file ${stem}.signature.log ms ${Date.now() - c.started}`);
