@@ -1536,3 +1536,22 @@ surface/test/fixtures/doctor-fakes/ps	test	-
 surface/test/fixtures/doctor-fakes/sysctl	test	-
 # The doctor job: install.sh fills and loads it when HOME is this user's own home; it runs the doctor --after-restart.
 install/com.agent-system-2.doctor.plist	install	-
+surface/scripts/alert-popup.ts	module	-
+surface/scripts/alert-tick.ts	module	-
+surface/src/alert-path.ts	module	-
+surface/src/alert-sources.ts	module	-
+surface/src/quota-watch.ts	module	-
+surface/src/runner-probe.ts	module	-
+surface/test/alert-boundary.test.ts	test	-
+surface/test/alert-cutover.test.ts	test	-
+surface/test/alert-lines.test.ts	test	-
+surface/test/alert-pass.test.ts	test	-
+surface/test/alert-path.test.ts	test	-
+surface/test/alert-popup-ps.test.ts	test	-
+surface/test/alert-popup.test.ts	test	-
+surface/test/alert-sources.test.ts	test	-
+surface/test/alert-world.ts	test	-
+surface/test/quota-watch.test.ts	test	-
+surface/test/alert-replay.test.ts	test	-
+surface/test/fixtures/alert-replay/source-rows.json	test	-
+surface/test/fixtures/alert-replay/snapshot-10-52Z.json	test	-
