@@ -13,7 +13,7 @@ import { controlEntries, exitClass, holdersOf } from "../src/launch";
 import { laneDeaths } from "../src/signals";
 import {
 	AS2_EXTENSION_ENTRIES, as2ExtensionPaths, BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, extensionsSuspendedDeathBody, extensionsSuspendedOf,
-	extensionsUnconfirmedDeathBody, heldOpenBody, openWorkDeathBody, readAs2ExtensionPaths, suspendedAs2, suspensionOf,
+	extensionsUnconfirmedDeathBody, configStamp, heldOpenBody, openWorkDeathBody, polledSuspensionOf, readAs2ExtensionPaths, suspendedAs2, suspensionOf,
 	parkFailedDeathBody, releasedOpen, releasedOpenBody, sliceCounts, turnEnd,
 	turnEndDeathBody, type TurnEndInput, unsettledHands,
 } from "../src/turn-end";
@@ -410,6 +410,45 @@ describe("turn end: the as2 extensions suspended by a profile config change (dec
 		expect(suspensionOf({ error: "E1" }, { paths: a })).toEqual({ kind: "unconfirmed", reason: "the profile config was unreadable at spawn: E1" });
 		expect(suspensionOf({ paths: [] }, { paths: b })).toEqual({ kind: "unconfirmed", reason: "the profile config listed no as2 extension at spawn, so what the lane loaded is unknown" });
 		expect(suspensionOf({ paths: a }, { error: "E2" })).toEqual({ kind: "unconfirmed", reason: "the profile config re-read failed: E2" });
+	});
+
+	test("the no-notice death body (a removal alone, from the stop poll) names the loaded paths and leaves out what OMP enables", () => {
+		expect(extensionsSuspendedDeathBody(LANE, ["/a/surface/index.ts", "/a/gates/index.ts"])).toBe(
+			`lane-died: ${LANE}: extensions suspended by a profile config change (/a/surface/index.ts, /a/gates/index.ts no longer enabled); a relaunch loads the current paths`,
+		);
+		expect(extensionsSuspendedDeathBody(LANE, ["/a/surface/index.ts"], [])).toBe(extensionsSuspendedDeathBody(LANE, ["/a/surface/index.ts"]));
+	});
+
+	test("polledSuspensionOf (the stop poll, review round 2): removed is confirmed with what the config newly enables; retained, alone or with paths added, is still enabled; a failed read is unreadable, never confirmed", () => {
+		const a = AS2_EXTENSION_ENTRIES.map((e) => `/a/${e}`);
+		const b = AS2_EXTENSION_ENTRIES.map((e) => `/b/${e}`);
+		// A → B: all of A suspended; B (in config order) is what OMP now enables
+		expect(polledSuspensionOf(a, { paths: b })).toEqual({ kind: "confirmed", suspended: a, enabled: b });
+		// A → A+B → B as the poll sees it: the same, from the last read alone
+		expect(polledSuspensionOf(a, { paths: [...b, ...b] })).toEqual({ kind: "confirmed", suspended: a, enabled: b });
+		// removal only: nothing newly enabled
+		expect(polledSuspensionOf(a, { paths: [] })).toEqual({ kind: "confirmed", suspended: a, enabled: [] });
+		expect(polledSuspensionOf(a, { paths: [a[0]!, a[2]!] })).toEqual({ kind: "confirmed", suspended: [a[1]!, a[3]!], enabled: [] });
+		// retained, alone or with paths added
+		expect(polledSuspensionOf(a, { paths: a })).toEqual({ kind: "still-enabled" });
+		expect(polledSuspensionOf(a, { paths: [...a, ...b, "/x/other/surface/index.ts"] })).toEqual({ kind: "still-enabled" });
+		expect(polledSuspensionOf(a, { error: "E3" })).toEqual({ kind: "unreadable", error: "E3" });
+	});
+
+	test("configStamp: changes when the file is rewritten (content or size), is stable when it is not; a missing file is a one-line error, never a throw", () => {
+		const dir = mkdtempSync(join(tmpdir(), "turn-end-stamp-"));
+		try {
+			const config = join(dir, "config.yml");
+			const missing = configStamp(config);
+			expect("error" in missing && missing.error.startsWith(`${config} could not be stat'ed: `)).toBe(true);
+			writeFileSync(config, 'extensions:\n  - "/a/gates/index.ts"\n');
+			const first = configStamp(config);
+			expect(configStamp(config)).toEqual(first);
+			writeFileSync(config, 'extensions:\n  - "/b/gates/index.ts"\n  - "/b/surface/index.ts"\n');
+			expect(configStamp(config)).not.toEqual(first);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	test("a notice enabling only another extension, another notice source or message, and a non-notice frame are not a suspension", () => {

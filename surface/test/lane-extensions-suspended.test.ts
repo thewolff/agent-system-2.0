@@ -7,15 +7,16 @@
 // `writeFile` step rewriting the profile config as install.sh would and its `emit` step writing the real frames verbatim),
 // as lane-script.test.ts drives them: the outcome is `error` with one lane-died: naming the cause, no continue prompt, no
 // hold; an enable-only notice (every loaded as2 path still enabled) and an unrelated notice (a non-as2 extension enabled,
-// compaction) never end a lane.
+// compaction) never end a lane. A suspension OMP gives no notice for (A → A+B → B, a removal alone) is found by the
+// runner's stop poll re-reading the changed config (review round 2 of PR #428), and a failed poll read never ends a lane.
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { handSpawnBody } from "../../classifier/src/lab";
 import { Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { recordRepo } from "../src/decision-log";
 import { doneBody, laneDir, laneExit } from "../src/launch";
-import { heartbeatText, runDirOf, runsRoot, testRequestedBody } from "../src/test-run";
+import { heartbeatText, runDirOf, runsRoot, testRequestedBody, testRunBody } from "../src/test-run";
 import { AS2_EXTENSION_ENTRIES, BACKGROUND_SUFFIX, extensionsSuspendedDeathBody, extensionsSuspendedOf, extensionsUnconfirmedDeathBody, readAs2ExtensionPaths } from "../src/turn-end";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
 import { COMPACTION_FRAME, type FakeStep, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh, SUSPENDED_FRAMES, until } from "./helpers";
@@ -188,5 +189,87 @@ describe("the runner: as2 extensions suspended mid-run (decision en-mw01fr5uts72
 		expect(orchestratorMessages(r, wl)).toEqual([death]);
 		expect(promptsOf(r).map((p) => p.id)).toEqual(["p1"]);
 		expect(eventsOf(r)).toContain("background-done");
+	}, 30_000);
+
+	// Review round 2 of PR #428: OMP names a newly enabled path once per process and a removal never, so these suspensions
+	// come with no notice; the runner's stop poll (every STOP_POLL_MS) finds them by re-reading the changed profile config.
+	const runnerLog = (r: LaneRoot, wl: string): string => readFileSync(join(laneDir(wl, r.home), "runner.log"), "utf8");
+
+	test("A → A+B → B (review round 2): the A+B notice leaves the lane going; the next turn's rewrite to B alone, which OMP never announces, ends it at the stop poll → error with one confirmed lane-died:, released, an abort", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r);
+		writeConfigA(r);
+		// The rewrite to B alone is the second turn's: the fake runs it only once the runner sends the continue prompt, which it
+		// does after it has read the A+B notice (frame order), so the notice's re-read sees A+B and only the poll can see B alone.
+		setScript(r, { prompts: [[rewrite(r, configText([...as2At(ROOT_A), ...as2At(ROOT_B)])), { emit: notice }], [rewrite(r, configText(as2At(ROOT_B))), { hang: true }]] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ code: "0", outcome: "error" });
+		// The poll's body: A no longer enabled, and the as2 paths the config enables that the lane did not load (B's).
+		const death = extensionsSuspendedDeathBody(laneId, as2At(ROOT_A), as2At(ROOT_B));
+		const snap = laneSnapshot(r, wl);
+		expect(snap.deaths).toEqual([death]);
+		expect(snap.workload!.holder).toBeNull();
+		expect(promptsOf(r).map((p) => p.id)).toEqual(["p1", "p2"]);
+		expect(eventsOf(r)).toContain("abort");
+		expect(orchestratorMessages(r, wl)).toEqual([death]);
+		const log = runnerLog(r, wl);
+		expect(log).toContain(`runner: ${laneId} extensions notice enables ${enabled.join(", ")}; the loaded as2 extensions are still enabled; the lane goes on\n`);
+		expect(log).toContain(`runner: ${laneId} extensions suspended with no notice: ${as2At(ROOT_A).join(", ")} no longer enabled in ${configPath(r)}; ending the lane\n`);
+	}, 30_000);
+
+	test("removal only (review round 2): the config rewritten with no as2 entry and no notice at all → error at the stop poll with the no-notice death naming root A's four paths", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r);
+		writeConfigA(r);
+		setScript(r, { steps: [rewrite(r, "setupVersion: 2\nextensions:\n  - \"/Users/x/.omp/agent/extensions/foo.ts\"\n"), { hang: true }] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ code: "0", outcome: "error" });
+		const death = extensionsSuspendedDeathBody(laneId, as2At(ROOT_A));
+		expect(death).not.toContain("OMP now enables");
+		const snap = laneSnapshot(r, wl);
+		expect(snap.deaths).toEqual([death]);
+		expect(snap.workload!.holder).toBeNull();
+		expect(orchestratorMessages(r, wl)).toEqual([death]);
+		expect(promptsOf(r).map((p) => p.id)).toEqual(["p1"]);
+		expect(eventsOf(r)).toContain("abort");
+	}, 30_000);
+
+	test("a failed poll read never ends the lane (review round 2): the config rewritten as invalid YAML with no notice, the lane held for a live test run until the poll has logged the parse error, then the run lands → completed, no lane-died:, the error logged once", async () => {
+		const r = makeRoot();
+		const { wl, sl } = openWorkload(r);
+		writeConfigA(r);
+		// A live test run holds the lane after its receipt (turn-end D8: two continue prompts, then the hold) until the test
+		// lands the run's result, so the clean end cannot come before the poll has read the invalid config.
+		const runId = "tr-0extpoll1";
+		const sha = "b".repeat(40);
+		const l = ledgerOf(r);
+		l.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody({ runId, pr: 17, sha, slice: sl, by: "lane-x" }) });
+		l.close();
+		const dir = runDirOf(runsRoot(r.env), runId);
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "heartbeat"), heartbeatText(runId, Date.now()));
+		setScript(r, { prompts: [[rewrite(r, INVALID_YAML), { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }]], steps: [] });
+		const laneId = launched(r, wl);
+		const logPath = join(laneDir(wl, r.home), "runner.log");
+		await until("the poll's config-check line in runner.log", () => (existsSync(logPath) && readFileSync(logPath, "utf8").includes(`runner: ${laneId} profile config check failed: `)) || null);
+		// The file still holds the invalid YAML: its read now is the error the poll's re-read met.
+		const reread = readAs2ExtensionPaths(configPath(r));
+		if (!("error" in reread)) throw new Error(`${configPath(r)} parsed; the test's INVALID_YAML must not`);
+		expect(reread.error).toContain("does not parse");
+		const failed = `runner: ${laneId} profile config check failed: ${reread.error}; no evidence of a suspension, the lane goes on (an extensions notice still re-reads it)\n`;
+		expect(runnerLog(r, wl)).toContain(failed);
+		expect(laneExit(laneSnapshot(r, wl).control, laneId)).toBeNull();
+		const l2 = ledgerOf(r);
+		l2.recordEntry({
+			by: TEST_RUNNER_BY, workloadId: wl, kind: "assumption",
+			body: testRunBody({
+				runId, verdict: "error", sha, pr: 17, reason: "runner died", headAtEnd: sha, base: null, mergeBase: null, full: null, solo: [], failures: [], runDir: null, preflight: null,
+			}),
+		});
+		l2.close();
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ code: "0", outcome: "completed" });
+		expect(laneSnapshot(r, wl).deaths).toEqual([]);
+		expect(eventsOf(r)).not.toContain("abort");
+		expect(runnerLog(r, wl).split(failed).length - 1).toBe(1);
 	}, 30_000);
 });

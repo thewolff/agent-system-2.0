@@ -9,7 +9,7 @@
 // (`settleIdle`: unsettled and silent, asked rather than waited on forever) and the lane's test runs
 // (`liveTestRuns` holds like a hand; `deadTestRuns` asks once for a new run), as pure helpers the
 // runner feeds from omp's frames, the ledger and the runs' heartbeat files.
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseHandSpawn, settledTokens } from "../../classifier/src/lab";
 import { type EntryRow, LANE_RUNNER_BY, type Ledger, type RoutingRow, type SliceRow } from "../../ledger/src/index";
@@ -306,9 +306,42 @@ export function suspensionOf(loaded: { paths: string[] } | { error: string }, no
 	const suspended = suspendedAs2(loaded.paths, now.paths);
 	return suspended.length > 0 ? { kind: "confirmed", suspended } : { kind: "still-enabled" };
 }
-/** `lane-died: <laneId>: extensions suspended by a profile config change (<loaded paths> no longer enabled; OMP now enables <paths>); …` (decision en-mw01fr5uts72g0). */
-export function extensionsSuspendedDeathBody(laneId: string, suspended: readonly string[], enabled: readonly string[]): string {
-	return `${LANE_DIED_PREFIX} ${laneId}: extensions suspended by a profile config change (${suspended.join(", ")} no longer enabled; OMP now enables ${enabled.join(", ")}); a relaunch loads the current paths`;
+/**
+ * What a stop-poll re-read of the profile config shows with no notice (review round 2 of PR #428): OMP's config listener
+ * suspends a loaded path no longer enabled on every config change, but names a newly enabled path only once per process
+ * and a removal never, so A → A+B (a notice; the lane goes on) → B, or a removal alone, suspends with no frame at all.
+ * `loaded` is the spawn read's non-empty as2 set. Confirmed carries the suspended paths and the as2 paths the config now
+ * enables that the lane did not load (what OMP would name in a notice, in config order; none for a removal alone); an
+ * unreadable config is no evidence of a suspension, and the runner goes on.
+ */
+export type PolledSuspension = { kind: "confirmed"; suspended: string[]; enabled: string[] } | { kind: "still-enabled" } | { kind: "unreadable"; error: string };
+export function polledSuspensionOf(loaded: readonly string[], now: { paths: string[] } | { error: string }): PolledSuspension {
+	if ("error" in now) return { kind: "unreadable", error: now.error };
+	const suspended = suspendedAs2(loaded, now.paths);
+	if (suspended.length === 0) return { kind: "still-enabled" };
+	const had = new Set(loaded);
+	return { kind: "confirmed", suspended, enabled: [...new Set(now.paths)].filter((p) => !had.has(p)) };
+}
+/**
+ * The profile config's identity for the stop poll's change check (device, inode, size, mtime and ctime in ns): the poll
+ * re-reads the file only when it differs from the last one seen. A stat failure is its one-line error, never a throw.
+ */
+export function configStamp(configPath: string): { stamp: string } | { error: string } {
+	try {
+		const s = statSync(configPath, { bigint: true });
+		return { stamp: `${s.dev}:${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}` };
+	} catch (err) {
+		return { error: `${configPath} could not be stat'ed: ${errLine(err)}` };
+	}
+}
+/**
+ * `lane-died: <laneId>: extensions suspended by a profile config change (<loaded paths> no longer enabled; OMP now enables
+ * <paths>); …` (decision en-mw01fr5uts72g0). `enabled` is what the notice names, or, from the stop poll, the as2 paths the
+ * config enables that the lane did not load; with none (a removal alone) the `; OMP now enables …` clause is left out.
+ */
+export function extensionsSuspendedDeathBody(laneId: string, suspended: readonly string[], enabled: readonly string[] = []): string {
+	const now = enabled.length > 0 ? `; OMP now enables ${enabled.join(", ")}` : "";
+	return `${LANE_DIED_PREFIX} ${laneId}: extensions suspended by a profile config change (${suspended.join(", ")} no longer enabled${now}); a relaunch loads the current paths`;
 }
 /** `lane-died: <laneId>: extensions likely suspended by a profile config change (OMP now enables <paths>; not confirmed: <reason>); …`: the config could not confirm it, and the lane stops anyway. */
 export function extensionsUnconfirmedDeathBody(laneId: string, enabled: readonly string[], reason: string): string {
