@@ -21,7 +21,9 @@
 #   4. Right after the cache check, and again right before the read, the file is still dataless with 0 blocks.
 #      A file that rematerialized at any point up to then fails (another reader may have brought back a copy
 #      before the cache was shown to hold none).
-#   5. The read: sha256 of the file. Reading a dataless file makes the File Provider download it.
+#   5. The read: sha256 of the file, read with /bin/cat piped to shasum. A read error fails with that error
+#      ("read failed: ..."); it is never hashed as a short read. Reading a dataless file makes the File Provider
+#      download it.
 #   6. After the read the file is materialized (not dataless, blocks > 0): the read caused a download.
 #
 # Between check 4 and the read there is no complete local copy anywhere checked, so any materialization in
@@ -32,6 +34,12 @@
 # Observed 2026-10-28 on this Mac: a 4 MiB file in My Drive/as2-backup/setup-check went from flags 64, 8192
 # blocks to flags 1073741920 (SF_DATALESS set), 0 blocks; the cache held 0 blob files; reading it back took
 # 6.5 s, returned the uploaded sha256, and left the file materialized (flags 64, 8192 blocks).
+#
+# 2026-11-01: the weekly restore test, run by launchd, failed at step 6 ("still dataless after a full read").
+# launchd starts jobs with dataless-file materialization off (man setiopolicy_np: the default policy is
+# IOPOL_MATERIALIZE_DATALESS_FILES_OFF), so read() on an evicted file failed with EDEADLK, and shasum hashed the
+# empty read without saying so. The plists now set MaterializeDatalessFiles true (man launchd.plist), and step 5
+# fails loudly on a read error.
 emulate -L zsh
 setopt no_unset pipe_fail extended_glob
 zmodload zsh/stat zsh/zselect
@@ -70,7 +78,7 @@ chunks_bytes() {
   local o h t c rc; local -a tabs cols terms; integer sum=0
   o=$(q "select type||char(31)||name||char(31)||tbl_name||char(31)||coalesce(sql,'') from sqlite_master order by type, name;") \
     || fail "cannot read the schema of $cache/chunks.db (sqlite3 exit $?): ${o//$'\n'/; }; a full local copy cannot be ruled out"
-  # openssl, not shasum: the fixtures stub /usr/bin/shasum as "the read", and this hash is not a read of the file
+  # openssl, not shasum: the fixtures stub /bin/cat as "the read", and this hash is not a read of the file
   h=$(print -r -- "$o" | /usr/bin/openssl dgst -sha256 -r 2>&1) || fail "cannot hash the chunks.db schema: $h"; h=${h%% *}
   # sqlite3 -list prints char(31) as the two characters ^_ (that rendering is what the pin hashes); show it as |
   [[ $h == $PIN_CHUNKS_SCHEMA ]] || { o=${o//'^_'/|}; fail "DriveFS content cache schema pin changed: chunks.db schema sha256 $h, verified $PIN_CHUNKS_SCHEMA (${o//$'\n'/; }). Deletion is blocked until server-read.zsh is re-verified against the new format and PIN_CHUNKS_SCHEMA updated." }
@@ -169,8 +177,16 @@ stat_f; dataless || fail "file rematerialized during the cache check (flags ${ST
 scan_cache; (( CACHED < SIZE )) || fail "DriveFS content cache grew to $CACHED bytes before the read ($NBLOBS blob file(s), $ROW_BYTES in chunks.db rows, $SIDE_BYTES in chunks.db-wal/-shm/METADATA)"
 stat_f; dataless || fail "file rematerialized right before the read (flags ${ST[1]}, ${ST[2]} blocks)"
 
-# 5. the read
-h=$(/usr/bin/shasum -a 256 -- "$f" 2>&1) || fail "read failed: $h"
+# 5. the read: /bin/cat reads the file, shasum hashes the stream. Not shasum on the path: Digest::SHA stops at a
+#    failed read() and prints the digest of what it got (the empty digest e3b0c442... for a first read that fails,
+#    exit 0), so a read error would pass as a hash. Under pipe_fail a failing cat fails the pipeline; its error
+#    (stderr, merged in here) is the failure message. shasum's own "<hash>  -" line is dropped from it.
+h=$( { /bin/cat -- "$f" | /usr/bin/shasum -a 256 } 2>&1 ) || {
+  local -a errl; errl=( "${(@)${(@f)h}:#[0-9a-f](#c64)  -}" )
+  h="read failed: ${(j:; :)errl}"
+  [[ $h == *"Resource deadlock avoided"* ]] && h+=" (EDEADLK: this process may not be allowed to materialize dataless files; a launchd job needs MaterializeDatalessFiles true in its plist, rerun install/install.sh with its drive-backup flag from Terminal)"
+  fail "$h"
+}
 h=${h%% *}
 [[ $h == [0-9a-f](#c64) ]] || fail "shasum said: $h"
 

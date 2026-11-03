@@ -15,6 +15,8 @@
   output to that state dir; AS2_UNDER_LAUNCHD keeps the script from copying it to the same log again. AS2_BUN,
   AS2_REPO and AS2_LEDGER_DB are the needs-you writer's (install/drive-backup/lib.zsh). The script sets its own
   PATH. AbandonProcessGroup lets the detached alert wrapper outlive the run; RunAtLoad is off.
+  MaterializeDatalessFiles is on because launchd's default is off: a launchd job then cannot read an evicted Drive
+  file (the read fails with EDEADLK), and the restore test and the deletion re-proof must download one.
   The installed plist's file time is the missed line's baseline until the first check entry (surface/src/errors.ts).
 -->
 <plist version="1.0">
@@ -53,6 +55,8 @@
 	<key>ProcessType</key>
 	<string>Background</string>
 	<key>AbandonProcessGroup</key>
+	<true/>
+	<key>MaterializeDatalessFiles</key>
 	<true/>
 	<key>RunAtLoad</key>
 	<false/>
