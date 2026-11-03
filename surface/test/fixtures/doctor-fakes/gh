@@ -1,0 +1,8 @@
+#!/bin/sh
+# as2 doctor test fake (surface/test/fixtures/doctor-fakes): logs its argv to $AS2_FAKE_STATE/calls.log and answers
+# from files under $AS2_FAKE_STATE, which surface/test/fixtures/doctor-fakes/state.ts writes. Never runs the real tool.
+S=${AS2_FAKE_STATE:?AS2_FAKE_STATE is not set}
+printf '%s\n' "$(basename "$0") $*" >> "$S/calls.log"
+# gh auth status --json hosts: gh.json holds the answer, gh.exit its exit code.
+cat "$S/gh.json" 2>/dev/null
+exit "$(cat "$S/gh.exit" 2>/dev/null || echo 0)"

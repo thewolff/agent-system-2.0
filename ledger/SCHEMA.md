@@ -63,8 +63,9 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
     installer writes a launchd user agent that runs it every hour and once at load
     (`install/com.agent-system-2.ledger-backup.plist`, filled in and written to
     `$HOME/Library/LaunchAgents/com.agent-system-2.ledger-backup.plist`; its output goes to
-    `ledger-backup.log` beside the ledger). The installer never loads it. To load it, and to
-    unload it (unload before loading again after a re-install):
+    `ledger-backup.log` beside the ledger). The installer never loads it: it prints the bootstrap
+    line to run in your own Terminal, and `as2 doctor` fails `job:ledger-backup` until the job is
+    loaded. To load it, and to unload it (unload before loading again after a re-install):
 
     ```sh
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-system-2.ledger-backup.plist

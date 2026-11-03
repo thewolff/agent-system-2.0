@@ -683,63 +683,81 @@ export function check(input: Input): Report {
 	}
 
 	// ---- stale-backup -----------------------------------------------------------------------------
-	// A finding only when the ledger's newest write is newer than the newest copy by more than the gap: writes no
-	// copy captured. Never the copy's wall-clock age: 2026-10-09T18:03Z to 2026-10-11T18:10Z the ledger wrote
-	// nothing, every copy matched it, and an age-of-copy rule read that as stale (wl-mv4gn9l7spcsg0 FINDINGS.md).
-	const { dir: backupDir, gapMs } = input.backups;
-	const replayNote = replay ? " (replay: the backup directory and its files are read as they are on disk now, not as of as-of: copies pruned since are missing, copies named after as-of are ignored)" : "";
-	const hours = (ms: number) => `${(ms / (60 * MIN)).toFixed(1)}h`;
-	let copies: { name: string; at: string }[] | null = null;
-	try {
-		copies = (existsSync(backupDir) ? readdirSync(backupDir) : []).flatMap(name => {
-			const m = BACKUP_NAME.exec(name);
-			return m ? [{ name, at: `${m[1]}T${m[2]}:${m[3]}:${m[4]}` }] : [];
-		}).filter(c => c.at <= asOf).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
-	} catch (e) {
-		skip("stale-backup", `the backup directory ${backupDir} could not be listed: ${e instanceof Error ? e.message : String(e)}`);
-	}
-	if (copies) {
-		// Every created_at across the tables that have one (the copy is the whole file, so these are the copied tables).
-		const writesSql = db.query<{ name: string }, []>(
-			"SELECT m.name FROM sqlite_master m WHERE m.type = 'table' AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE name = 'created_at') ORDER BY m.name",
-		).all().map(t => `SELECT created_at FROM "${t.name}"`).join(" UNION ALL ");
-		const writes = run<{ oldest: string | null; newest: string | null }>(
-			`SELECT min(created_at) AS oldest, max(created_at) AS newest FROM (${writesSql}) WHERE created_at <= :asOf`,
-			{ ":asOf": asOf },
-		);
-		const { oldest, newest } = writes.rows[0]!;
-		// The newest copy that is a complete ledger by the backup writer's own test (copyProblem: not empty, readable,
-		// integrity_check ok, at SCHEMA_VERSION). A newer file named like a copy that fails it captured nothing, so the
-		// walk goes back past it; opening is read-only, and quarantining such a file stays the writer's job.
-		const rejected: string[] = [];
-		let newestCopy: { name: string; at: string } | undefined;
-		for (const c of copies.toReversed()) {
-			const problem = copyProblem(join(backupDir, c.name));
-			if (problem === null) { newestCopy = c; break; }
-			rejected.push(`${c.name} (${problem})`);
-		}
-		// With no complete copy at all, nothing since the ledger's first write is captured.
-		const capturedAt = newestCopy?.at ?? oldest;
-		const behindMs = newest && capturedAt ? Date.parse(newest) - Date.parse(capturedAt) : 0;
-		if (behindMs > gapMs) {
-			const copyText = (newestCopy
-				? `newest ledger backup ${newestCopy.at} (${newestCopy.name})`
-				: `no ledger backup at or before ${asOf} (first ledger write ${oldest})`)
-				+ (rejected.length ? `; not counted, not a complete copy: ${rejected.join(", ")}` : "");
-			findings.push({
-				key: `stale-backup:${newestCopy?.name ?? "none"}`,
-				invariant: "stale-backup",
-				workload: "ledger",
-				since: capturedAt!,
-				text: `newest ledger write ${newest} is ${hours(behindMs)} newer than ${copyText} in ${backupDir} (gap ${hours(gapMs)})${replayNote}: writes since then are in no copy. The job is ledger/scripts/backup.ts (launchd agent com.agent-system-2.ledger-backup on macOS).`,
-				query: `ls ${backupDir}/ledger-*.db; copyProblem() (ledger/src/index.ts) on each, newest first; ${writes.shown}`,
-			});
-		}
-	}
+	const backup = backupState(db, input.backups.dir, input.backups.gapMs, asOf, replay);
+	if (backup.state === "unjudged") skip("stale-backup", backup.why);
+	else if (backup.state === "stale") findings.push(backup.finding);
 
 	return {
 		asOf, replay, liveLanes: liveLanes ? [...liveLanes] : null, reviewsInFlight, orphanReviews, findings, skipped,
 		elapsedMs: Math.round(performance.now() - t0),
+	};
+}
+
+/** stale-backup's judgement of the ledger's scheduled copies (`backupState`): within the gap, a finding, or why it could not be judged. */
+export type BackupState =
+	| { state: "ok"; dir: string; copy: { name: string; at: string } | null; behindMs: number; rejected: string[] }
+	| { state: "stale"; finding: Finding }
+	| { state: "unjudged"; why: string };
+
+/**
+ * The stale-backup rule over `db` and the copy directory `dir`, as of `asOf` (`check()` reports it; `as2 doctor`'s backup
+ * part reads it, PLAN wl-mvwks11ye3x9zu R6). A finding only when the ledger's newest write is newer than the newest copy by
+ * more than `gapMs`: writes no copy captured. Never the copy's wall-clock age: 2026-10-09T18:03Z to 2026-10-11T18:10Z the
+ * ledger wrote nothing, every copy matched it, and an age-of-copy rule read that as stale (wl-mv4gn9l7spcsg0 FINDINGS.md).
+ * A directory that cannot be listed is `unjudged`, never a pass. `replay` adds the note that files are read as they are now.
+ */
+export function backupState(db: Database, dir: string, gapMs: number, asOf: string, replay = false): BackupState {
+	const replayNote = replay ? " (replay: the backup directory and its files are read as they are on disk now, not as of as-of: copies pruned since are missing, copies named after as-of are ignored)" : "";
+	const hours = (ms: number) => `${(ms / (60 * MIN)).toFixed(1)}h`;
+	let names: string[];
+	try {
+		names = readdirSync(dir);
+	} catch (e) {
+		// Only a missing directory is "no copies yet". existsSync is false on EACCES too, so it is never the test: a
+		// directory that exists but cannot be listed is unjudged (review r6 F16).
+		if (!(e instanceof Error && "code" in e && e.code === "ENOENT")) return { state: "unjudged", why: `the backup directory ${dir} could not be listed: ${e instanceof Error ? e.message : String(e)}` };
+		names = [];
+	}
+	const copies = names.flatMap(name => {
+		const m = BACKUP_NAME.exec(name);
+		return m ? [{ name, at: `${m[1]}T${m[2]}:${m[3]}:${m[4]}` }] : [];
+	}).filter(c => c.at <= asOf).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+	// Every created_at across the tables that have one (the copy is the whole file, so these are the copied tables).
+	const writesSql = db.query<{ name: string }, []>(
+		"SELECT m.name FROM sqlite_master m WHERE m.type = 'table' AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE name = 'created_at') ORDER BY m.name",
+	).all().map(t => `SELECT created_at FROM "${t.name}"`).join(" UNION ALL ");
+	// Positional, so it binds on a strict connection (the Ledger's) and a plain one (invariants' own) alike.
+	const writesQuery = `SELECT min(created_at) AS oldest, max(created_at) AS newest FROM (${writesSql}) WHERE created_at <= ?1`;
+	const { oldest, newest } = db.query<{ oldest: string | null; newest: string | null }, [string]>(writesQuery).all(asOf)[0]!;
+	const shown = writesQuery.replace(/\s+/g, " ").trim().replaceAll("?1", `'${asOf.replaceAll("'", "''")}'`);
+	// The newest copy that is a complete ledger by the backup writer's own test (copyProblem: not empty, readable,
+	// integrity_check ok, at SCHEMA_VERSION). A newer file named like a copy that fails it captured nothing, so the
+	// walk goes back past it; opening is read-only, and quarantining such a file stays the writer's job.
+	const rejected: string[] = [];
+	let newestCopy: { name: string; at: string } | undefined;
+	for (const c of copies.toReversed()) {
+		const problem = copyProblem(join(dir, c.name));
+		if (problem === null) { newestCopy = c; break; }
+		rejected.push(`${c.name} (${problem})`);
+	}
+	// With no complete copy at all, nothing since the ledger's first write is captured.
+	const capturedAt = newestCopy?.at ?? oldest;
+	const behindMs = newest && capturedAt ? Date.parse(newest) - Date.parse(capturedAt) : 0;
+	if (behindMs <= gapMs) return { state: "ok", dir, copy: newestCopy ?? null, behindMs, rejected };
+	const copyText = (newestCopy
+		? `newest ledger backup ${newestCopy.at} (${newestCopy.name})`
+		: `no ledger backup at or before ${asOf} (first ledger write ${oldest})`)
+		+ (rejected.length ? `; not counted, not a complete copy: ${rejected.join(", ")}` : "");
+	return {
+		state: "stale",
+		finding: {
+			key: `stale-backup:${newestCopy?.name ?? "none"}`,
+			invariant: "stale-backup",
+			workload: "ledger",
+			since: capturedAt!,
+			text: `newest ledger write ${newest} is ${hours(behindMs)} newer than ${copyText} in ${dir} (gap ${hours(gapMs)})${replayNote}: writes since then are in no copy. The job is ledger/scripts/backup.ts (launchd agent com.agent-system-2.ledger-backup on macOS).`,
+			query: `ls ${dir}/ledger-*.db; copyProblem() (ledger/src/index.ts) on each, newest first; ${shown}`,
+		},
 	};
 }
 

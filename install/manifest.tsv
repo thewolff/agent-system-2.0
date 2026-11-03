@@ -1491,3 +1491,25 @@ surface/test/fixtures/timing-lint/positive.txt	test	-
 surface/test/fixtures/timing-lint/negative.txt	test	-
 surface/test/fixtures/timing-lint/opt-out.txt	test	-
 surface/test/fixtures/timing-lint/opt-out-bad.txt	test	-
+# as2 doctor (PLAN wl-mvwks11ye3x9zu): the checks, episodes and popups, the CLI, the entry text forms, the alarm popup, the fakes.
+surface/src/doctor.ts	module	-
+surface/src/doctor-entries.ts	module	-
+surface/src/notify.ts	module	-
+surface/scripts/doctor.ts	module	-
+surface/test/doctor.test.ts	test	-
+surface/test/doctor-cli.test.ts	test	-
+surface/test/doctor-lines.test.ts	test	-
+surface/test/scratch-smoke-install.test.ts	test	-
+surface/test/fixtures/doctor-fakes/state.ts	test	-
+surface/test/fixtures/doctor-fakes/ctx	test	-
+surface/test/fixtures/doctor-fakes/df	test	-
+surface/test/fixtures/doctor-fakes/dscl	test	-
+surface/test/fixtures/doctor-fakes/gh	test	-
+surface/test/fixtures/doctor-fakes/launchctl	test	-
+surface/test/fixtures/doctor-fakes/osascript	test	-
+surface/test/fixtures/doctor-fakes/pgrep	test	-
+surface/test/fixtures/doctor-fakes/plutil	test	-
+surface/test/fixtures/doctor-fakes/ps	test	-
+surface/test/fixtures/doctor-fakes/sysctl	test	-
+# The doctor job: install.sh fills and loads it when HOME is this user's own home; it runs the doctor --after-restart.
+install/com.agent-system-2.doctor.plist	install	-

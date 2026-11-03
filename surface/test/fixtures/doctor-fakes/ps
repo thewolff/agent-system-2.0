@@ -1,0 +1,22 @@
+#!/bin/sh
+# as2 doctor test fake (surface/test/fixtures/doctor-fakes): logs its argv to $AS2_FAKE_STATE/calls.log and answers
+# from files under $AS2_FAKE_STATE, which surface/test/fixtures/doctor-fakes/state.ts writes. Never runs the real tool.
+S=${AS2_FAKE_STATE:?AS2_FAKE_STATE is not set}
+printf '%s\n' "$(basename "$0") $*" >> "$S/calls.log"
+# ps -p <pid> -o <fields> (either order): ps/<pid>.command answers -o command=; any other field answers a fixed
+# lstart (with "S " before it for stat=,lstart=). A pid with no command file answers only while it is alive (kill -0).
+pid= fields=
+while [ $# -gt 0 ]; do
+  case $1 in
+    -p) pid=$2; shift 2 ;;
+    -o) fields=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -f "$S/ps/$pid.command" ] || kill -0 "$pid" 2>/dev/null || exit 1
+lstart=$(cat "$S/ps.lstart" 2>/dev/null || echo "Mon Nov  2 09:00:00 2026")
+case $fields in
+  command=) cat "$S/ps/$pid.command" 2>/dev/null || echo "fake-process $pid" ;;
+  stat=,lstart=) echo "S $lstart" ;;
+  *) echo "$lstart" ;;
+esac
