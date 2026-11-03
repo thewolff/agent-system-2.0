@@ -110,9 +110,16 @@ export interface AlertRowEntry {
 
 const ROW_RE = /^(\S+) (raised|level|updated|error|adopted|merged|merged-closed|legacy-popup|acked|closed)(?: ([\s\S]*))?$/;
 
-/** What subject `s` says, as its `raised` and `updated` rows carry it for the needs-you line (D4): its title, its text's first line, its next step and its workload. */
+/**
+ * What subject `s` says, as its `raised` and `updated` rows carry it for the needs-you line (D4): its title, its text's first
+ * line, its next step and its workload. When the text carries withUrgency's `urgent (from …)` line, the line ends with it too,
+ * so a wrong urgency inference is visible on the needs-you line as well as in the issue (D5).
+ */
 export function alertWords(s: Pick<AlertSubject, "title" | "text" | "next" | "workloadId">): AlertWords {
-	return { title: s.title, line: s.text.split("\n").find((l) => l.trim() !== "") ?? "", next: s.next, workload: s.workloadId };
+	const first = s.text.split("\n").find((l) => l.trim() !== "") ?? "";
+	const urgent = /^urgent \(from [^\n]*\)$/m.exec(s.text)?.[0];
+	const line = urgent !== undefined && first !== urgent ? `${first} — ${urgent}` : first;
+	return { title: s.title, line, next: s.next, workload: s.workloadId };
 }
 
 /** A row's trailing words field (`alertBody`'s JSON object) parsed: null when absent, undefined when it is not that object (the row then does not parse). */

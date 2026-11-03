@@ -4,7 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { alertMarker, alertRecords, openEpisode } from "../src/alert-path";
 import { apply, interpret } from "../src/input";
 import { ALERT_BY, alertPopupBody, controlEntries } from "../src/launch";
-import { STANDING_WORKLOAD_ID } from "../src/types";
+import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { alertPass, lockedAlertPass } from "../scripts/alert-tick";
 import { POPUP_TAG_ENV } from "../scripts/alert-popup";
 import { ceilingStopped, ISSUE, world } from "./alert-world";
@@ -58,6 +58,31 @@ describe("one pass over a ceiling-stopped workload (D3, R8)", () => {
 		alertPass(w.deps);
 		expect(w.g.issues[0]!.state).toBe("CLOSED");
 		expect(w.rows().some((r) => r.startsWith(`alert: ceiling:${wl} closed `))).toBe(true);
+	});
+});
+
+describe("urgency is visible where Jo reads the alert (D5)", () => {
+	test("a brief citing Jo's urgent input: the issue body and the needs-you line both say `urgent (from <input id>)`", () => {
+		const w = world();
+		const inputId = w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, body: "fix the header offset, urgent", author: "jo", channel: "surface" });
+		const wl = ceilingStopped(w.ledger, `input ${inputId}: move the header offset into a token`);
+		alertPass(w.deps);
+		const key = `ceiling:${wl}`;
+		const ep = openEpisode(alertRecords(controlEntries(w.ledger.entries(STANDING_WORKLOAD_ID))).get(key))!;
+		expect(ep.start).toBe(2);
+		expect(w.g.issues[0]!.body).toContain(`urgent (from ${inputId})`);
+		expect(ep.words?.line).toEndWith(` — urgent (from ${inputId})`);
+		// Applied once: the issue says it on one line only.
+		expect(w.g.issues[0]!.body.split(`urgent (from ${inputId})`)).toHaveLength(2);
+	});
+
+	test("a workload that is not urgent: neither the issue nor the line says urgent", () => {
+		const w = world();
+		const wl = ceilingStopped(w.ledger, "Move the header offset into a token");
+		alertPass(w.deps);
+		const ep = openEpisode(alertRecords(controlEntries(w.ledger.entries(STANDING_WORKLOAD_ID))).get(`ceiling:${wl}`))!;
+		expect(w.g.issues[0]!.body).not.toContain("urgent (from");
+		expect(ep.words?.line).not.toContain("urgent");
 	});
 });
 

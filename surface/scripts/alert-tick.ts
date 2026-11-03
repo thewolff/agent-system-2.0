@@ -35,7 +35,7 @@ import { alarmFilePath } from "../../gates/src/routine-switch";
 import {
 	ALERT_LADDER, ALERT_POPUP_ATTEMPTS, type AlertAck, type AlertAction, alertAcks, alertActions, type AlertKeyRecord, alertMarker, alertPopupAnsweredAt,
 	alertPopupRows, alertRecords, alertWords, type AlertSubject, errorChanged, legacyLandFirstMarker, legacyMainRedMarker, legacyTrainAlertMarker, legacyTrainAlerts,
-	legacyTrainLevel, openEpisode, urgencyOf,
+	legacyTrainLevel, openEpisode, type Urgency, urgencyOf, withUrgency,
 } from "../src/alert-path";
 import { alertSources, fsReportFiles, psProbe, type SourceSeams } from "../src/alert-sources";
 import { field, type Gh, GhError, type GhResult, ghJsonOf, issueNumber, issueOps } from "../src/jo-issues";
@@ -120,23 +120,27 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 	// 2. The sources.
 	const control0 = standing();
 	const inputRow = (id: string) => ledger.db.query<InstructionRow, [string]>("SELECT * FROM instructions WHERE id = ?").get(id) ?? null;
-	const urgentCache = new Map<string, boolean>();
+	// Urgency (D5) is read once per workload per pass: the sources' boolean seam sets their start level, and the pass then
+	// applies withUrgency to every subject with a workload, once, so its text (issue and needs-you line) names what decided it.
+	const urgencyCache = new Map<string, Urgency>();
+	const urgency = (wl: string): Urgency => {
+		let u = urgencyCache.get(wl);
+		if (u === undefined) {
+			const w = ledger.workload(wl);
+			u = w === null ? { urgent: false, from: null, unread: [] } : urgencyOf({ id: w.id, brief: w.brief }, ledger.instructions(wl), inputRow);
+			if (u.unread.length > 0) say(`${wl}: the brief cites input ${u.unread.join(", ")}, which is not Jo's input row on this ledger: its urgency was not read from it`);
+			urgencyCache.set(wl, u);
+		}
+		return u;
+	};
 	const seams: SourceSeams = {
 		...d.sources, now,
-		urgent: (wl) => {
-			if (!urgentCache.has(wl)) {
-				const w = ledger.workload(wl);
-				const u = w === null ? { urgent: false, from: null, unread: [] } : urgencyOf({ id: w.id, brief: w.brief }, ledger.instructions(wl), inputRow);
-				if (u.unread.length > 0) say(`${wl}: the brief cites input ${u.unread.join(", ")}, which is not Jo's input row on this ledger: its urgency was not read from it`);
-				urgentCache.set(wl, u.urgent);
-			}
-			return urgentCache.get(wl)!;
-		},
+		urgent: (wl) => urgency(wl).urgent,
 		popupAnsweredAt: (key) => alertPopupAnsweredAt(control0, key),
 	};
 	const src = alertSources(ledger, seams);
 	for (const p of src.problems) problem(`${p.source} source: ${p.error}`);
-	let subjects: AlertSubject[] = [...quota.subjects, ...src.subjects];
+	let subjects: AlertSubject[] = [...quota.subjects, ...src.subjects].map((s) => (s.workloadId === null ? s : withUrgency(s, urgency(s.workloadId))));
 
 	const ghJson = ghJsonOf(d.gh);
 	const ops = issueOps(d.gh, ghJson);
