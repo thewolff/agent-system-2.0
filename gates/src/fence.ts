@@ -26,11 +26,17 @@
 // the args that execute (pi-agent-core agent-loop.ts:3126-3132, `args: record.args`, the revision
 // baked in at :2776-2777) but cannot be cancelled: the loop pushes it and runs the tool without
 // waiting on extensions (agent-loop.ts:3126-3208; agent-session.ts:4403-4411 ignores the handlers'
-// results). So the check here is after the fact: a bash call whose executing command is not this
+// results). So the check here is after the fact: a bash call that executes a command other than this
 // fence's own wrapper for that tool call id is written down (a ledger `assumption` row), and every
 // later bash call in the session is refused until restart. The start event also fires for a call a
-// later handler blocked (agent-loop.ts:3126 precedes the block check at :3163), with the unrevised
-// args, so a later handler's block reads as a bypass too: loud over silent.
+// later handler blocked, with the typed args (OMP 18.8.6 pi-agent-core agent-loop.ts:3076 keeps them,
+// the block at :3090-3093 discards the fence's revision, the start at :3479-3486 precedes the block's
+// throw at :3517-3518), so a start carrying the typed command is not judged there: the call ran
+// without the fence if its `tool_result` arrives (that event fires only inside the tool wrapper's
+// execute, which a blocked call never reaches: pi-coding-agent extensibility/extensions/wrapper.ts
+// :440-473) or if it ends without an error; it was blocked if it ends as an error with no
+// `tool_result` (agent-loop.ts:3591-3597, :3401-3407). jo-issues #233: before this, every block by a
+// later extension (paired coding's) locked the session out.
 //
 // Fails closed: a path that cannot be canonicalized, `sandbox-exec` missing, OMP's
 // `bash.autoBackground.enabled` off, settings that cannot be read, or a host OMP whose major.minor is
@@ -542,17 +548,29 @@ export const INTERNAL_URL_REASON =
 
 /** The ledger body when a later handler bypassed the fence on `toolCallId`. */
 export const fenceBypassBody = (toolCallId: string) =>
-	`M4b OS fence bypassed: bash call ${toolCallId} executed a command other than the fence's wrapper, so a tool_call handler in an extension loaded after the gates replaced or dropped it (or blocked the call, which the start event cannot tell apart); every later bash call in this session is refused until OMP restarts.`;
+	`M4b OS fence bypassed: bash call ${toolCallId} executed a command other than the fence's wrapper, so a tool_call handler in an extension loaded after the gates replaced or dropped it; every later bash call in this session is refused until OMP restarts.`;
 
 const bypassReason = (toolCallId: string) =>
 	`M4b OS fence: bash call ${toolCallId} ran without the fence's wrapper, because a tool_call handler loaded after the gates replaced it (recorded in the ledger); every bash call is refused until OMP restarts. Make that extension's tool_call handler return undefined for bash, or load it before the gates, then restart.`;
 
 /**
- * Per session: the wrapper the fence returned for each bash call id, the call that bypassed it, and
+ * A bash call the fence wrapped: its wrapper, the command as typed, whether it started with that typed
+ * command (a later handler's block, or a run without the fence: open until `tool_result` or the end
+ * says which), and whether its `tool_result` arrived (the bash tool's execute ran).
+ */
+interface FencedCall {
+	wrapper: string;
+	typed: string;
+	startedTyped?: true;
+	ran?: true;
+}
+
+/**
+ * Per session: each bash call the fence wrapped and has not settled, the call that bypassed it, and
  * the context hook's decision for the branch it last read (keyed on the leaf id and entry count).
  */
 interface FenceState {
-	expected: Map<string, string>;
+	expected: Map<string, FencedCall>;
 	bypassed: string | null;
 	revised?: { leaf: string | undefined; count: number; calls: Set<string> };
 }
@@ -893,11 +911,28 @@ export function registerFence(
 		}
 		const wrapped = (mark?.kind === "read-only" && mark.network ? NETWORK_ENV_PREFIX : "") + wrapCommand(sandboxExec, profile, command);
 		s.bashOriginals.set(event.toolCallId, command);
-		state.expected.set(event.toolCallId, wrapped);
+		state.expected.set(event.toolCallId, { wrapper: wrapped, typed: command });
 		// An explicit cwd goes back as the absolute directory the targets were found from, so bash runs
 		// where the fence looked even if the host's resolution drifts from hostCommandCwd's copy.
 		return { input: { ...event.input, command: wrapped, ...(event.input.cwd ? { cwd } : {}) } };
 	});
+
+	// Write down that bash call `toolCallId` ran without the fence, once per session, and lock the session out.
+	const recordBypass = (ctx: Ctx, toolCallId: string): void => {
+		const state = fenceState(ctx);
+		if (state.bypassed !== null) return;
+		state.bypassed = toolCallId;
+		const body = fenceBypassBody(toolCallId);
+		const s = gateSession(ctx, env);
+		try {
+			if (s.bound) s.ledger().recordEntry({ workloadId: s.workloadId!, kind: "assumption", body, by: s.laneId });
+			else pi.appendEntry("p11-fence-bypassed", { body });
+		} catch (err) {
+			ctx.ui.notify(`${body} The ledger entry saying so could not be written: ${String(err)}`, "error");
+			return;
+		}
+		ctx.ui.notify(body, "error");
+	};
 
 	// What actually executes (see the header): a call the fence wrapped must start as that wrapper.
 	// A call it never wrapped (refused by it or an earlier row, or the fence off) has no entry.
@@ -912,42 +947,64 @@ export function registerFence(
 	// refused, a call a later handler blocked (it starts with its typed args), a later extension's
 	// replacement. If the entry cannot be written the call still runs, and stays wrapped in the
 	// model's view: a warning, never a refusal, for a display aid.
+	// A start with any other command is a bypass at once: a blocked call starts with exactly the typed
+	// args (the header), so anything else ran. A start with exactly the typed command is either a block
+	// or a later handler that handed the typed input back; `tool_result` or the end decides (below).
 	pi.on("tool_execution_start", (event, ctx) => {
 		if (event.toolName !== "bash") return undefined;
 		const state = fenceState(ctx);
-		const expected = state.expected.get(event.toolCallId);
-		if (expected === undefined) return undefined;
-		state.expected.delete(event.toolCallId);
+		const call = state.expected.get(event.toolCallId);
+		if (call === undefined) return undefined;
 		const command = prop(event.args, "command");
-		if (typeof command === "string" && stripOuterBlanks(command) === expected) {
+		if (typeof command === "string" && stripOuterBlanks(command) === call.wrapper) {
+			state.expected.delete(event.toolCallId);
 			try {
-				pi.appendEntry(FENCE_REVISION_ENTRY, { toolCallId: event.toolCallId, sha256: wrapperHash(expected) });
+				pi.appendEntry(FENCE_REVISION_ENTRY, { toolCallId: event.toolCallId, sha256: wrapperHash(call.wrapper) });
 			} catch (err) {
 				ctx.ui.notify(`M4b OS fence: the ${FENCE_REVISION_ENTRY} entry for bash call ${event.toolCallId} could not be written, so the model will see that call with the fence's wrapper: ${String(err)}`, "warning");
 			}
 			return undefined;
 		}
-		if (state.bypassed !== null) return undefined;
-		state.bypassed = event.toolCallId;
-		const body = fenceBypassBody(event.toolCallId);
-		const s = gateSession(ctx, env);
-		try {
-			if (s.bound) s.ledger().recordEntry({ workloadId: s.workloadId!, kind: "assumption", body, by: s.laneId });
-			else pi.appendEntry("p11-fence-bypassed", { body });
-		} catch (err) {
-			ctx.ui.notify(`${body} The ledger entry saying so could not be written: ${String(err)}`, "error");
+		if (command === call.typed && !call.ran) {
+			call.startedTyped = true;
 			return undefined;
 		}
-		ctx.ui.notify(body, "error");
+		state.expected.delete(event.toolCallId);
+		recordBypass(ctx, event.toolCallId);
 		return undefined;
 	});
 
-	// After rows 3 and 8 have read the original (they register earlier), drop it.
+	// After rows 3 and 8 have read the original (they register earlier), drop it. A `tool_result` means
+	// the bash tool's execute ran (OMP emits it only from the tool wrapper's execute, wrapper.ts:440-473),
+	// so a call that started with its typed command ran without the fence. One whose start has not
+	// reached the fence yet is marked, and its start judges it.
 	pi.on("tool_result", (event, ctx) => {
 		if (event.toolName !== "bash" || !event.toolCallId) return undefined;
 		gateSession(ctx, env).bashOriginals.delete(event.toolCallId);
 		releaseConfined(event.toolCallId);
-		fenceState(ctx).expected.delete(event.toolCallId);
+		const state = fenceState(ctx);
+		const call = state.expected.get(event.toolCallId);
+		if (call === undefined) return undefined;
+		if (call.startedTyped) {
+			state.expected.delete(event.toolCallId);
+			recordBypass(ctx, event.toolCallId);
+		} else {
+			call.ran = true;
+		}
+		return undefined;
+	});
+
+	// Every call settles here, a blocked one included. A call that started with its typed command and
+	// had no `tool_result` was blocked by a later handler when it ends as an error (the block throws
+	// before the tool runs: agent-loop.ts:3517-3518, :3591-3597): not a bypass. Ending without an
+	// error it ran, as far as the fence can tell: a bypass.
+	pi.on("tool_execution_end", (event, ctx) => {
+		if (event.toolName !== "bash") return undefined;
+		const state = fenceState(ctx);
+		const call = state.expected.get(event.toolCallId);
+		if (call === undefined) return undefined;
+		state.expected.delete(event.toolCallId);
+		if (call.startedTyped && !event.isError) recordBypass(ctx, event.toolCallId);
 		return undefined;
 	});
 
