@@ -31,13 +31,14 @@
 // attempts a channel is exhausted until `move-alert <wl> <E> --again` opens a new block. `moveAlertTroubles` is the
 // state-derived failure line's query.
 import { closeSync, mkdirSync, openSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname } from "node:path";
 import { spawn, spawnSync } from "bun";
 import { SCRATCH_ENV } from "../../gates/src/scratch";
 import { LANE_ENV, ROLE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { homeDir, LANE_RUNNER_BY, type Ledger, type MessageRow } from "../../ledger/src/index";
 import { field, fileNotice, type Gh, type GhResult, GhError, ghJsonOf, issueNumber, issueOps } from "./jo-issues";
-import { LANE_SCRIPT, laneDir } from "./launch";
+import { logPathFor } from "./lane-offsite";
+import { LANE_SCRIPT } from "./launch";
 import { TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO } from "./merge-train";
 import { psAnswer, runPs } from "./omp-probe";
 import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID } from "./types";
@@ -557,8 +558,9 @@ export const spawnDetached: MoveAlertSpawn = (argv, env, log) => {
 const BUN = basename(process.execPath).startsWith("bun") ? process.execPath : "bun";
 
 /**
- * Start `bun <repo>/surface/scripts/lane.ts move-alert <wl> <E>` detached, the lane binding dropped, logging to the lane dir's
- * move-alert.log; returns its pid. First, in one write, each channel a worker could claim (within its attempts) gets a
+ * Start `bun <repo>/surface/scripts/lane.ts move-alert <wl> <E>` detached, the lane binding dropped, logging to the lane's
+ * move-alert.log (lane-offsite.ts `logPathFor`: `lanes/<wl>.move-alert.log` beside an offsite lane's marker, so the folder
+ * is never recreated); returns its pid. First, in one write, each channel a worker could claim (within its attempts) gets a
  * `spawning` row, so a worker that never claims it is unstarted UNSTARTED_AFTER_MS later (an attempt) and the train tick's
  * spawns stay bounded; with none, nothing is spawned and null is returned. A spawn failure is written, in one write, as
  * `unstarted spawn: <error>` on those channels (an attempt; the tick tries again within the bound) and returns null; when that
@@ -580,7 +582,7 @@ export function spawnMoveAlert(ledger: Ledger, wl: string, eventId: string, spaw
 	if (spawning.open.length === 0) return null;
 	const argv = [BUN, LANE_SCRIPT, "move-alert", wl, eventId];
 	try {
-		return spawnFn(argv, unboundEnv(process.env), join(laneDir(wl, homeDir()), "move-alert.log"));
+		return spawnFn(argv, unboundEnv(process.env), logPathFor(wl, "move-alert", homeDir()));
 	} catch (err) {
 		const why = errText(err);
 		try {

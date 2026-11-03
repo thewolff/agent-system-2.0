@@ -1117,6 +1117,7 @@ surface/extensions/launch.ts	module	-
 surface/extensions/lane-model.ts	module	-
 surface/extensions/lane-tools.ts	module	-
 surface/scripts/lane.ts	module	-
+surface/scripts/lane-archive.ts	module	-
 surface/src/omp-probe.ts	module	-
 surface/test/lane-tools.test.ts	test	-
 surface/test/quota-move-alert.test.ts	test	-
@@ -1125,6 +1126,7 @@ surface/test/fake-omp.ts	test	-
 surface/test/launch.test.ts	test	-
 surface/test/lane-script.test.ts	test	-
 surface/test/lane-offsite.test.ts	test	-
+surface/test/lane-archive.test.ts	test	-
 surface/test/lane-live-lane.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-
 surface/test/lane-model.test.ts	test	-

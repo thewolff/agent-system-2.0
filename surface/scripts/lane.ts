@@ -98,7 +98,7 @@ import {
 	launchRequestedBody, doneLine, maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeOrigin, resumePlan, scratchCapMb, sessionOrigin, STARTER_EXIT, stateModelCheck, stateModelOf,
 	STOP_POLL_MS, offsiteRefusalNote, trainBindings, worktreeBody, worktreePath,
 } from "../src/launch";
-import { hasMarker, laneArchiveStateDir, markerPath, RESTORE_DEADLINE_S, RESTORE_KILL_ENV, RestoreError, restoreKillHook, restoreLane, stepRunner } from "../src/lane-offsite";
+import { hasMarker, laneArchiveStateDir, logPathFor, markerPath, RESTORE_DEADLINE_S, RESTORE_KILL_ENV, RestoreError, restoreKillHook, restoreLane, stepRunner } from "../src/lane-offsite";
 import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continueCounter, continuePrompt, deadRunPrompt, type DeadTestRun, deadTestRuns, enqueueRunnerDeath, exitOutcome, extensionsSuspendedDeathBody, extensionsSuspendedOf,
 	extensionsUnconfirmedDeathBody, configStamp, type PolledSuspension, polledSuspensionOf, readAs2ExtensionPaths, suspensionOf,
@@ -623,16 +623,19 @@ function cmdLaunch(wl: string, who: string): number {
 
 /**
  * The per-workload ctx index (MIGRATION.md item 43): `ctx-index` in its own detached process, stdio to
- * the lane dir's `ctx-index.log`, spawned as cmdLaunch spawns the runner. Every exit path calls it
- * after its exit, release and death writes, so nothing waits on ctx; the subcommand's claim lets one
- * worker per lane proceed. A spawn failure goes to stderr and changes nothing else.
+ * src/lane-offsite.ts `logPathFor(wl, "ctx-index")` with its directory as cwd: the lane dir's `ctx-index.log`, or
+ * `lanes/<wl>.ctx-index.log` in the lanes root once the lane's offsite marker exists, so the folder is never recreated.
+ * Spawned as cmdLaunch spawns the runner. Every exit path calls it after its exit, release and death writes, so nothing
+ * waits on ctx; the subcommand's claim lets one worker per lane proceed. A spawn failure goes to stderr and changes
+ * nothing else. `argv` replaces the worker's command (tests).
  */
-function spawnCtxIndex(wl: string, laneId: string, by: "runner" | "starter"): void {
+export function spawnCtxIndex(wl: string, laneId: string, by: "runner" | "starter", argv: string[] = ["bun", import.meta.path, "ctx-index", wl, laneId, "--by", by]): void {
 	try {
-		const dir = laneDir(wl, homeDir());
+		const logPath = logPathFor(wl, "ctx-index", homeDir());
+		const dir = dirname(logPath);
 		mkdirSync(dir, { recursive: true });
-		const log = openSync(join(dir, "ctx-index.log"), "a");
-		const worker = spawn(["bun", import.meta.path, "ctx-index", wl, laneId, "--by", by], {
+		const log = openSync(logPath, "a");
+		const worker = spawn(argv, {
 			cwd: dir, env: process.env, stdin: "ignore", stdout: log, stderr: log, detached: true,
 		});
 		worker.unref();

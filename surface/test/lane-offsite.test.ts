@@ -4,14 +4,16 @@
 // lane-archive state dir, with real tar archives built here. Kills come from the restore's own kill hook
 // (AS2_LANE_RESTORE_KILL_AT) in a real `lane.ts restore` child, and every rerun is a fresh process. The offsite lock is
 // held by a real child process. The refusals go through `lane.ts launch|interactive|run|log` on a real ledger with a
-// closed workload. No test sleeps: the hung copy's deadline and progress fire on the step runner's fake timers.
+// closed workload. No test sleeps: the hung copy's deadline and progress fire on the step runner's fake timers. One case
+// runs the real lane-archive producer after a restore (slice sl-lb-producer), on an injected clock and quota.
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
-	chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
+	chmodSync, cpSync, existsSync, lstatSync, lutimesSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
+import { formatLine, produce, QUIET_MS, readRecord } from "../scripts/lane-archive";
 import { recordRepo } from "../src/decision-log";
 import { doneBody, laneDir, STARTER_EXIT } from "../src/launch";
 import {
@@ -373,6 +375,42 @@ describe("restore in place: the reconciliation", () => {
 		expect(retired.leftovers).toEqual([{ from: removing, to: join(w.lanes, left[0]!), done: true }]);
 		// The folder is local again with no marker and no live record: the producer sees a new lane folder.
 		expect(readdirSync(w.state).filter((n) => n.endsWith(".json"))).toEqual([]);
+	});
+
+	test("restore from a stranded retirement, then the real producer re-tars the folder as a new generation beside the first", async () => {
+		const w = world();
+		const removing = join(w.lanes, ".removing-wl-regen1-0a1b2c3d4e5f");
+		mkdirSync(join(removing, "sessions"), { recursive: true });
+		writeFileSync(join(removing, "sessions", "half.jsonl"), "half purged\n");
+		const f = offsite(w, "wl-regen1", { state: "retiring", stranded: [removing] });
+		await restoreLane(opts(w, f.wl));
+		expectRestored(w, f);
+		// The restored folder, quiet for the injected clock: its entries' mtimes an hour and more before it.
+		const now = Date.parse("2026-11-05T12:00:00.000Z");
+		const old = new Date(now - 2 * QUIET_MS);
+		const stack = [laneDir(f.wl, w.home)];
+		while (stack.length > 0) {
+			const p = stack.pop()!;
+			if (lstatSync(p).isDirectory()) for (const n of readdirSync(p)) stack.push(join(p, n));
+			lutimesSync(p, old, old);
+		}
+		const lines: string[] = [];
+		const counts = await produce({
+			home: w.home, stateDir: w.state, archiveRoot: join(w.root, "archive"), workload: () => ({ status: "closed", closed_at: "2026-11-01T00:00:00.000Z" }),
+			quota: () => ({ account: "1", total: 2 ** 50, used: 0, remaining: 2 ** 50 }), emit: (l) => lines.push(formatLine(l)), clock: () => now, freeBytes: () => 2 ** 40,
+		});
+		expect(counts).toEqual({ tarred: 1, recovered: 0, skipped: 0, failed: 0, eligible: 1 });
+		// The first generation's name is still held by its archive in another date directory, so this one is `.lane.2`.
+		const second = join(w.root, "archive", "2026-11-05", `${f.wl}.lane.2.tar.gz`);
+		expect(lines[0]).toStartWith(`ok\t${f.wl}\ttarred ${laneDir(f.wl, w.home)} (`);
+		const rec = readRecord(join(w.state, `${f.wl}.json`));
+		expect(rec).toMatchObject({ state: "pending", workload: f.wl, archive: second, sha256: sha256(second) });
+		expect(compareContent(f.marker.content, rec.content)).toEqual([]);
+		expect(rec.sha256).not.toBe(f.marker.tar_sha256);
+		expect(existsSync(join(w.root, "archive", DAY, `${f.wl}.lane.tar.gz`))).toBe(true);
+		// The first generation's record stays settled in restored/; the new one is the only live record.
+		expect(readRecord(join(w.state, "restored", `${f.wl}.json`)).sha256).toBe(f.marker.tar_sha256);
+		expect(readdirSync(w.state).filter((n) => n.endsWith(".json"))).toEqual([`${f.wl}.json`]);
 	});
 
 	test("a rename that genuinely fails: refused with its own message, nothing published, the marker kept with its planned moves; a rerun after the fix completes", async () => {
