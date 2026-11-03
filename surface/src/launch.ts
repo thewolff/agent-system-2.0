@@ -1699,11 +1699,13 @@ export function laneReleasedBody(laneId: string): string {
  * two steps; `updated` a changed text's one comment; `error` a failed channel (gh or popup); `adopted` a legacy alert taken over
  * as the key's episode (url `none` when no issue was found: level 0, filed fresh); `merged` / `merged-closed` a second legacy
  * issue folded into the canonical one; `legacy-popup` a legacy quota-move popup's settlement; `acked` and `closed` the ends.
+ * The `raised` and `updated` rows end with the subject's words (`AlertWords`, one JSON object) so the needs-you line (PLAN D4,
+ * surface/src/errors.ts) can say what the alert is about from the ledger alone; a row written before the words existed has none.
  */
 export type AlertRow =
-	| { row: "raised"; kind: AlertKind; start: 1 | 2; digest: string }
+	| { row: "raised"; kind: AlertKind; start: 1 | 2; digest: string; words?: AlertWords | null }
 	| { row: "level"; level: number; step: "sending" | "sent"; url: string | null }
-	| { row: "updated"; digest: string }
+	| { row: "updated"; digest: string; words?: AlertWords | null }
 	| { row: "error"; channel: string; text: string }
 	| { row: "adopted"; url: string | null; level: number; from: string }
 	| { row: "merged"; url: string; into: string }
@@ -1711,6 +1713,23 @@ export type AlertRow =
 	| { row: "legacy-popup"; text: string }
 	| { row: "acked"; why: string }
 	| { row: "closed"; why: string };
+
+/**
+ * What an alert says, as its `raised` and `updated` rows carry it (PLAN D4): the subject's title, the first line of its text,
+ * its next step, and the workload it is about (null for a key of no workload). `alertWords` (surface/src/alert-path.ts) makes it.
+ */
+export interface AlertWords {
+	title: string;
+	line: string;
+	next: string;
+	workload: string | null;
+}
+
+/** The words as the row's trailing field: one JSON object on one line (each string's whitespace collapsed). */
+function wordsField(w: AlertWords | null | undefined): string {
+	if (w === null || w === undefined) return "";
+	return ` ${JSON.stringify({ title: oneLine(w.title), line: oneLine(w.line), next: oneLine(w.next), workload: w.workload })}`;
+}
 
 /** The `alert:` body of `row` for subject `key`. Throws when the key or a token field is empty or holds whitespace (it would not parse back). */
 export function alertBody(key: string, row: AlertRow): string {
@@ -1720,9 +1739,9 @@ export function alertBody(key: string, row: AlertRow): string {
 	};
 	const head = `alert: ${token("key", key)}`;
 	switch (row.row) {
-		case "raised": return `${head} raised ${row.kind} start ${row.start} ${token("digest", row.digest)}`;
+		case "raised": return `${head} raised ${row.kind} start ${row.start} ${token("digest", row.digest)}${wordsField(row.words)}`;
 		case "level": return `${head} level ${row.level} ${row.step}${row.url === null ? "" : ` ${token("url", row.url)}`}`;
-		case "updated": return `${head} updated ${token("digest", row.digest)}`;
+		case "updated": return `${head} updated ${token("digest", row.digest)}${wordsField(row.words)}`;
 		case "error": return `${head} error ${token("channel", row.channel)} ${oneLine(row.text)}`;
 		case "adopted": return `${head} adopted ${row.url === null ? "none" : token("url", row.url)} level ${row.level} from ${oneLine(row.from)}`;
 		case "merged": return `${head} merged ${token("url", row.url)} into ${token("url", row.into)}`;

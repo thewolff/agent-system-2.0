@@ -15,7 +15,7 @@
 // and the parsers of the legacy alerts' rows and markers that cutover adoption reads (D3).
 import { createHash } from "node:crypto";
 import type { EntryRow, InstructionRow } from "../../ledger/src/index";
-import { ALERT_POPUP_STEPS, type AlertPopupStep, type AlertRow, type ControlEntry, controlEntries } from "./launch";
+import { ALERT_POPUP_STEPS, type AlertPopupStep, type AlertRow, type AlertWords, type ControlEntry, controlEntries } from "./launch";
 import type { StopEpisode } from "./merge-train";
 
 /** What kind of event a subject is; one key per (kind, thing). */
@@ -110,6 +110,28 @@ export interface AlertRowEntry {
 
 const ROW_RE = /^(\S+) (raised|level|updated|error|adopted|merged|merged-closed|legacy-popup|acked|closed)(?: ([\s\S]*))?$/;
 
+/** What subject `s` says, as its `raised` and `updated` rows carry it for the needs-you line (D4): its title, its text's first line, its next step and its workload. */
+export function alertWords(s: Pick<AlertSubject, "title" | "text" | "next" | "workloadId">): AlertWords {
+	return { title: s.title, line: s.text.split("\n").find((l) => l.trim() !== "") ?? "", next: s.next, workload: s.workloadId };
+}
+
+/** A row's trailing words field (`alertBody`'s JSON object) parsed: null when absent, undefined when it is not that object (the row then does not parse). */
+function parseWords(field: string | undefined): AlertWords | null | undefined {
+	if (field === undefined) return null;
+	let v: unknown;
+	try {
+		v = JSON.parse(field);
+	} catch {
+		// Not JSON: the row is not the grammar, so the caller drops it like any other malformed row.
+		return undefined;
+	}
+	if (v === null || typeof v !== "object") return undefined;
+	const o = v as Record<string, unknown>;
+	const str = (k: string) => typeof o[k] === "string";
+	if (!str("title") || !str("line") || !str("next") || !(o.workload === null || o.workload === undefined || str("workload"))) return undefined;
+	return { title: o.title as string, line: o.line as string, next: o.next as string, workload: (o.workload as string | null | undefined) ?? null };
+}
+
 /** The `alert:` rest (`controlEntries`' `rest`) parsed, or null when it is not that grammar (`alertBody`'s inverse). */
 export function parseAlertRow(rest: string): { key: string; row: AlertRow } | null {
 	const top = ROW_RE.exec(rest);
@@ -118,16 +140,20 @@ export function parseAlertRow(rest: string): { key: string; row: AlertRow } | nu
 	const tail = top[3] ?? "";
 	let m: RegExpExecArray | null;
 	switch (top[2]) {
-		case "raised":
-			m = /^(\S+) start ([12]) (\S+)$/.exec(tail);
+		case "raised": {
+			m = /^(\S+) start ([12]) (\S+)(?: (\{.*\}))?$/.exec(tail);
 			if (!m || !Object.hasOwn(ALERT_KINDS, m[1]!)) return null;
-			return { key, row: { row: "raised", kind: m[1] as AlertKind, start: Number(m[2]) as 1 | 2, digest: m[3]! } };
+			const words = parseWords(m[4]);
+			return words === undefined ? null : { key, row: { row: "raised", kind: m[1] as AlertKind, start: Number(m[2]) as 1 | 2, digest: m[3]!, words } };
+		}
 		case "level":
 			m = /^([1-9]) (sending|sent)(?: (\S+))?$/.exec(tail);
 			return m ? { key, row: { row: "level", level: Number(m[1]), step: m[2] as "sending" | "sent", url: m[3] ?? null } } : null;
-		case "updated":
-			m = /^(\S+)$/.exec(tail);
-			return m ? { key, row: { row: "updated", digest: m[1]! } } : null;
+		case "updated": {
+			m = /^(\S+)(?: (\{.*\}))?$/.exec(tail);
+			const words = m ? parseWords(m[2]) : undefined;
+			return m && words !== undefined ? { key, row: { row: "updated", digest: m[1]!, words } } : null;
+		}
 		case "error":
 			m = /^(\S+) (.+)$/.exec(tail);
 			return m ? { key, row: { row: "error", channel: m[1]!, text: m[2]! } } : null;
@@ -163,6 +189,8 @@ export interface AlertEpisode {
 	digest: string | null;
 	/** The issue: level 1's `sent` url, or the adopted one. */
 	url: string | null;
+	/** What the alert says (`AlertWords`): the raise's, then each `updated` that carries words; null for an adopted episode, or a row written before the words existed, until one does. */
+	words: AlertWords | null;
 	/** Per level, when `sending` and `sent` were first written (an adopted level n counts levels 1..n sent at adoption). */
 	sending: Map<number, string>;
 	sent: Map<number, string>;
@@ -205,7 +233,7 @@ export function alertRecords(control: readonly ControlEntry[]): Map<string, Aler
 			const raised = r.row === "raised";
 			const ep: AlertEpisode = {
 				key: p.key, id: c.id, openedAt: c.createdAt, opened: r.row, kind: raised ? r.kind : null, start: raised ? r.start : null,
-				adoptedFrom: raised ? null : r.from, digest: raised ? r.digest : null, url: raised ? null : r.url,
+				adoptedFrom: raised ? null : r.from, digest: raised ? r.digest : null, url: raised ? null : r.url, words: raised ? (r.words ?? null) : null,
 				sending: new Map(), sent: new Map(), errors: new Map(), merged: new Map(), acked: null, closed: null,
 			};
 			// An adopted level n counts levels 1..n as begun and sent at adoption.
@@ -231,6 +259,7 @@ export function alertRecords(control: readonly ControlEntry[]): Map<string, Aler
 				break;
 			case "updated":
 				open.digest = r.digest;
+				if (r.words) open.words = r.words;
 				break;
 			case "error":
 				open.errors.set(r.channel, { text: r.text, at: c.createdAt, id: c.id });

@@ -8,7 +8,7 @@ import { describe, expect, test } from "bun:test";
 import { type EntryRow, LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
 import {
 	ALERT_LADDER, type AlertAction, alertActions, alertDigest, type AlertKeyRecord, alertLevel, alertPopupAnsweredAt, alertPopupRows, alertRecords, type AlertSeen, type AlertSubject,
-	legacyMarkers, legacyTrainAlerts, legacyTrainLevel, openEpisode, stopIssueUrl, urgencyOf, withUrgency,
+	alertWords, legacyMarkers, legacyTrainAlerts, legacyTrainLevel, openEpisode, parseAlertRow, stopIssueUrl, urgencyOf, withUrgency,
 } from "../src/alert-path";
 import { ensureStandingWorkload } from "../src/identity";
 import { ALERT_BY, alertBody, alertPopupBody, type AlertRow, type ControlEntry, controlEntries, laneReleasedBody } from "../src/launch";
@@ -318,6 +318,28 @@ describe("the `alert:` records", () => {
 		const fresh = subject({ key: "q:q-new", kind: "train" });
 		w.write(fresh.key, { row: "adopted", url: null, level: 0, from: "train-alert q-new" });
 		expect(w.pass([s, fresh]).map(shape)).toEqual([`send ${fresh.key} 1`]);
+	});
+
+	test("the words of `raised` and `updated` round-trip and the episode carries the newest; an old row has none; a bad field drops the row", () => {
+		const w = world();
+		const s = subject({ title: "wl-x stopped at its ceiling", text: "\nspent $153.83 of $150\nlane-4 exited", next: "extend wl-x" });
+		const words = alertWords(s);
+		expect(words).toEqual({ title: "wl-x stopped at its ceiling", line: "spent $153.83 of $150", next: "extend wl-x", workload: s.workloadId });
+		w.write(s.key, { row: "raised", kind: "ceiling", start: 1, digest: alertDigest(s), words });
+		expect(w.records().get(s.key)!.episodes[0]!.words).toEqual(words);
+		const later = alertWords({ ...s, title: "wl-x: \"quoted\" — still stopped", text: "spent $160.02 of $150" });
+		w.write(s.key, { row: "updated", digest: "0123456789ab", words: later });
+		expect(openEpisode(w.records().get(s.key))!.words).toEqual(later);
+		// An `updated` row with no words keeps the words the episode had.
+		w.write(s.key, { row: "updated", digest: "ba9876543210" });
+		expect(openEpisode(w.records().get(s.key))).toMatchObject({ digest: "ba9876543210", words: later });
+
+		const old = "main:thewolff/old";
+		w.write(old, { row: "raised", kind: "main-red", start: 1, digest: "0123456789ab" });
+		expect(openEpisode(w.records().get(old))!.words).toBeNull();
+		expect(parseAlertRow("ceiling:wl-y raised ceiling start 1 0123456789ab {\"title\":1}")).toBeNull();
+		expect(parseAlertRow("ceiling:wl-y updated 0123456789ab {not json}")).toBeNull();
+		expect(parseAlertRow("ceiling:wl-y raised ceiling start 1 0123456789ab {\"title\":\"t\",\"line\":\"l\",\"next\":\"n\"}")?.row).toMatchObject({ words: { title: "t", line: "l", next: "n", workload: null } });
 	});
 
 	test("alertBody refuses a key or url that would not parse back", () => {
