@@ -243,19 +243,27 @@ function readComplete(file: string, from: number): { text: string; bytes: number
 	}
 }
 
-function assistantUsage(line: string): { usd: number; tokens: number } {
-	if (!line.includes('"assistant"')) return { usd: 0, tokens: 0 };
+/**
+ * One session-file line's assistant usage, the one per-message parser (`scanSpend` here, the routing
+ * report's per-hand cost in surface/src/routing-report.ts): a `{"type":"message","message":{"role":
+ * "assistant","usage":…}}` line gives its `usage.cost.total` in dollars and `usage.totalTokens`, a
+ * missing or non-numeric field 0; any other line gives 0. `malformed` is true for a line that names
+ * `"assistant"` but is not JSON (a torn or corrupt line): it counts 0, which `scanSpend` accepts and
+ * the routing report counts and prints.
+ */
+export function assistantUsage(line: string): { usd: number; tokens: number; malformed: boolean } {
+	if (!line.includes('"assistant"')) return { usd: 0, tokens: 0, malformed: false };
 	let v: unknown;
 	try {
 		v = JSON.parse(line);
 	} catch {
-		return { usd: 0, tokens: 0 };
+		return { usd: 0, tokens: 0, malformed: true };
 	}
 	const rec = v as { type?: unknown; message?: { role?: unknown; usage?: { totalTokens?: unknown; cost?: { total?: unknown } } } } | null;
-	if (rec === null || typeof rec !== "object" || rec.type !== "message" || rec.message?.role !== "assistant") return { usd: 0, tokens: 0 };
+	if (rec === null || typeof rec !== "object" || rec.type !== "message" || rec.message?.role !== "assistant") return { usd: 0, tokens: 0, malformed: false };
 	const cost = rec.message.usage?.cost?.total;
 	const total = rec.message.usage?.totalTokens;
-	return { usd: typeof cost === "number" && Number.isFinite(cost) ? cost : 0, tokens: typeof total === "number" && Number.isFinite(total) ? total : 0 };
+	return { usd: typeof cost === "number" && Number.isFinite(cost) ? cost : 0, tokens: typeof total === "number" && Number.isFinite(total) ? total : 0, malformed: false };
 }
 
 /**

@@ -1537,3 +1537,8 @@ surface/test/fixtures/doctor-fakes/ps	test	-
 surface/test/fixtures/doctor-fakes/sysctl	test	-
 # The doctor job: install.sh fills and loads it when HOME is this user's own home; it runs the doctor --after-restart.
 install/com.agent-system-2.doctor.plist	install	-
+# as2 routing (PLAN wl-mv71x5rwdu7eo0 rev 4 § 2.1): the read-only routing report, its CLI and tests.
+surface/src/routing-report.ts	module	-
+surface/scripts/routing-report.ts	module	-
+surface/test/routing-report.test.ts	test	-
+surface/test/routing-report-bin.test.ts	test	-
