@@ -1,0 +1,7 @@
+---
+title: A lane cannot forge a review panel's ledger lines
+status: building
+workload: wl-mv5m7qvgkxhpj4
+pr: 247
+---
+**Built on branch `wl/wl-mv5m7qvgkxhpj4`, PR #247.** Follow-up to MIGRATION.md item 111 (three-lab review panels, PR #108). The PR #108 live acceptance triad, run as a panel on the merge diff, found one high-severity defect. The anthropic leg's verdict was survived; the openai leg could not establish it from its packet. The classifier records a panel as `panel-group:`, `panel-leg:`, `panel-synth:`, `panel-published:` and `panel-run:` entries, of kind `assumption`, stamped with the lane id. None of these prefixes was in `CLASSIFIER_MACHINERY_PREFIXES` (`surface/src/launch.ts`), so a lane could write them itself with `lane_record_entry`. `panelGroups` folds them without checking who wrote them. A forged `panel-run: <pg> void …` voids a run. A forged `panel-leg: <pg> <lab> missing …`, written before that lab's hand settles, fixes the leg's outcome, because the first leg line per lab wins. Either line, written after a `done-because:`, also supersedes the receipt. **Fix:** the five prefixes join the closed list, so `lane_record_entry` refuses them (the test at `surface/test/lane-tools.test.ts` loops over every listed prefix) and `doneBecause` skips them. The test in `surface/test/launch.test.ts` that requires every lane-stamped classifier body to be listed now includes the panel lines. Run on a `git archive origin/main` unpack (d880a9a) with only that test applied, it fails: `Expected to contain: "panel-group"`.
