@@ -43,7 +43,8 @@
 // 4a. The permanent train's watch (PLAN wl-mvr888nftz0vcl D6, D8, D9, R21), before step 4, held live or not: bun's banner in
 //     each train run's live log (`<as2test root>/runs/<run id>/full.log`, else `fast.log`) becomes `test-run-started: <run>
 //     pr=<n> at <the log's birth time> seen <now>`; a one-day pause past its `until` has its unanswered question withdrawn and
-//     its budget slice completed; a meter error gets Jo's NOW relaunch / hold question; Jo's stall `relaunch` stops a live lane
+//     its budget slice completed; a meter error gets Jo's NOW relaunch / hold question; an earlier attempt's open full-suite slice
+//     whose run has a result is cancelled (review r1 F4); Jo's stall `relaunch` stops a live lane
 //     (a surface `lane-stop:`); and a waiting PR with no train progress for 3 h (`trainStall`) gets one NOW relaunch / ack
 //     question per episode on its slice, so step 5 files its issue.
 //  5. Alerts (D9). Each question on a train slice is an alert: the production merge question the lane raises and the failed-twice
@@ -100,7 +101,7 @@ import {
 	controlRootRefusal, endPastPauseQuestions, everyTrain, expiredHolds, forkOf, forkTaskAlert, FULL_SUITE_STATUS, ghCompare, isTrainOrFix, type LandFirstEvent, landFirstNoticeBody, landFirstRepos, landFirstRows,
 	type Landing, landingPassOvers, landingReady, lastReadyExit, MAIN_RED_WINDOW_MS, MAIN_RETRY_MS, mainRedNoticeBody, mainRedNotices, mainRedRows, openTrainFix, openTrains, ownerBusy, ownerDeliveries, ownerFreedAt,
 	parseTrainSlice, PROMOTE_ATTEMPTS, prOwner, PROTECTION_UNKNOWN_RAISE_MS, protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState, protectionPassOvers, prStakes, raiseLaunchLimit,
-	raiseMeterErrorQuestions, raiseTrainStall, raiseTwiceFailed, REPAIR_FAIL_MS, REVOKE_ATTEMPTS, settleTasks, stallRelaunchStops, stopEpisode, stopSummary, TASK_VIEW_FIELDS, type TaskView, taskViewOf,
+	raiseMeterErrorQuestions, raiseTrainStall, raiseTwiceFailed, REPAIR_FAIL_MS, retireSupersededFullSlices, REVOKE_ATTEMPTS, settleTasks, stallRelaunchStops, stopEpisode, stopSummary, TASK_VIEW_FIELDS, type TaskView, taskViewOf,
 	TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, TRAIN_STALL_MS, trainActivityArgs, trainAlertActions, trainAlertBody, trainAlertEndBody, trainAlertMarker, trainAutoboardBody,
 	trainAttemptsOf, trainBoardSkipBody, trainCheckout, trainHeadWokenBody, TRAIN_LAUNCH_LIMIT, trainLaunchFailures, trainPrs, trainPushesOf, trainReconciledBody, trainRetries, trainSliceId, trainStall,
 	type TrainPush, type TrainTask, trainWakeBody, testRunStartedBody, testRunStarts, twiceFailed, unsettledTasks,
@@ -545,6 +546,7 @@ export function tick(d: TickDeps): string[] {
  * - D6: a one-day pause whose `until` passed has its unanswered question withdrawn and its budget slice completed
  *   (`endPastPauseQuestions`);
  * - D9: Jo's NOW question on a meter error that has none (`raiseMeterErrorQuestions`);
+ * - review r1 F4: an earlier attempt's open full-suite slice whose run has a result is cancelled (`retireSupersededFullSlices`);
  * - D8: Jo's `relaunch` on a stall question stops the live lane it found (`stallRelaunchStops`), and each stalled PR
  *   (`trainStall`, with the banner read's unreadable logs as causes and D13's busy owners) gets its NOW question once per
  *   episode (`raiseTrainStall`).
@@ -568,6 +570,9 @@ function watch(d: TickDeps, wl: string, held: ReadonlySet<number>, facts: TrainF
 	}, undefined);
 	part(() => {
 		for (const lane of stallRelaunchStops(ledger, wl)) say(`${wl}: stop requested of ${lane}: Jo answered relaunch on a stall question`);
+	}, undefined);
+	part(() => {
+		for (const line of retireSupersededFullSlices(ledger, wl)) say(`${wl}: ${line}`);
 	}, undefined);
 	part(() => {
 		const w = ledger.workload(wl);

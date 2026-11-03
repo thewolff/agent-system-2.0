@@ -10,7 +10,7 @@ import { applyTrain, interpret } from "../src/input";
 import { controlEntries, launchRequestedBody } from "../src/launch";
 import { trainFullSliceId, trainSliceId } from "../src/merge-train";
 import {
-	activeTrainPr, askTrainPause, emptyTrainScan, nextPdtMidnight, pdtDay, prevPdtDay, scanTrainDays, TRAIN_DAILY_USD, TRAIN_RUN_MAX_TIME_MIN, TRAIN_TZ,
+	activeTrainPr, askTrainPause, emptyTrainScan, nextPdtMidnight, pdtDay, prevPdtDay, scanTrainDays, TRAIN_DAILY_USD, TRAIN_METER_NAMED, TRAIN_RUN_MAX_TIME_MIN, TRAIN_TZ,
 	trainBudgetGate, trainBudgetRows, trainBudgetSliceId, trainDayLimit, trainMaxTime, trainMeterErrorBody, trainPausedBody, trainPauses, trainRaiseBody,
 } from "../src/train-budget";
 import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
@@ -141,7 +141,19 @@ describe("scanTrainDays: the strict incremental reader (D4, R4, R5)", () => {
 			[f, 7, "an assistant line with no finite non-negative message.usage.cost.total"],
 		]);
 		expect(r.scan.days.get("2026-11-02")).toBe(7);
-		expect(trainMeterErrorBody("lane-x", r.errors[0]!)).toBe(`train-meter-error: lane-x ${f}:2 the line is not JSON`);
+		expect(trainMeterErrorBody("lane-x", r.errors, { path: "/l/meter-errors/lane-x-t.json" })).toBe(
+			`train-meter-error: lane-x ${r.errors.map((e) => `${e.file}:${e.line} ${e.reason}`).join("; ")}; evidence /l/meter-errors/lane-x-t.json`,
+		);
+	});
+
+	test("train-meter-error: names the first TRAIN_METER_NAMED defects, counts the rest, and says where all of them are or why they are not", () => {
+		const defects = Array.from({ length: TRAIN_METER_NAMED + 2 }, (_, i) => ({ file: "/s/x.jsonl", line: i + 1, reason: "the line is not JSON" }));
+		const named = defects.slice(0, TRAIN_METER_NAMED).map((d) => `/s/x.jsonl:${d.line} the line is not JSON`).join("; ");
+		expect(trainMeterErrorBody("lane-x", defects, { path: "/e.json" })).toBe(`train-meter-error: lane-x ${named}; and 2 more; evidence /e.json`);
+		expect(trainMeterErrorBody("lane-x", defects.slice(0, TRAIN_METER_NAMED), { path: "/e.json" })).toBe(`train-meter-error: lane-x ${named}; evidence /e.json`);
+		expect(trainMeterErrorBody("lane-x", defects, { failed: "ENOTDIR: not a\ndirectory" })).toBe(`train-meter-error: lane-x ${named}; and 2 more; evidence write failed: ENOTDIR: not a directory`);
+		expect(trainMeterErrorBody("lane-x", defects.slice(0, 1), null)).toBe("train-meter-error: lane-x /s/x.jsonl:1 the line is not JSON");
+		expect(() => trainMeterErrorBody("lane-x", [], null)).toThrow(/no defect given for lane-x/);
 	});
 
 	test("a file that shrank below what was counted is an error, not a rescan", () => {
@@ -319,7 +331,9 @@ describe("trainBudgetGate (D5, R6, R8)", () => {
 
 	test("meter-error refuses until Jo's relaunch answer or his launch word after it; hold keeps it", () => {
 		const { ledger, c, wl } = train();
-		const e = ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: trainMeterErrorBody(LANE, { file: "/s/lane.jsonl", line: 4, reason: "the line is not JSON" }) });
+		const defects = [{ file: "/s/lane.jsonl", line: 4, reason: "the line is not JSON" }, { file: "/s/lane.jsonl", line: 9, reason: "an assistant line with no parseable top-level timestamp" }];
+		const e = ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: trainMeterErrorBody(LANE, defects, { path: "/l/meter-errors/e.json" }) });
+		expect(gate(ledger, wl)?.detail).toContain("/s/lane.jsonl:4 the line is not JSON; /s/lane.jsonl:9 an assistant line with no parseable top-level timestamp; evidence /l/meter-errors/e.json");
 		expect(gate(ledger, wl)).toMatchObject({ reason: "meter-error", entryId: e });
 		// Jo's answer to the meter error's question (D9's raise is another slice's; this one is asked here as the tick would).
 		const sl = trainBudgetSliceId(wl, e);
@@ -331,7 +345,7 @@ describe("trainBudgetGate (D5, R6, R8)", () => {
 		expect(gate(ledger, wl)).toBeNull();
 
 		const other = train();
-		other.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: other.wl, kind: "assumption", body: trainMeterErrorBody(LANE, { file: "/s", line: 0, reason: "EACCES" }) });
+		other.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: other.wl, kind: "assumption", body: trainMeterErrorBody(LANE, [{ file: "/s", line: 0, reason: "EACCES" }], { failed: "ENOTDIR" }) });
 		other.c.plusHours(1);
 		joLaunch(other.ledger, other.wl);
 		expect(gate(other.ledger, other.wl)).toBeNull();
@@ -339,7 +353,7 @@ describe("trainBudgetGate (D5, R6, R8)", () => {
 
 	test("a lane-written meter error is not the runner's and refuses nothing", () => {
 		const { ledger, wl } = train();
-		ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body: trainMeterErrorBody(LANE, { file: "/s", line: 1, reason: "forged" }) });
+		ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body: trainMeterErrorBody(LANE, [{ file: "/s", line: 1, reason: "forged" }], null) });
 		expect(gate(ledger, wl)).toBeNull();
 	});
 

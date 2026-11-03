@@ -1833,6 +1833,27 @@ describe("raise <usd> [q-…] on the merge train's budget question (PLAN wl-mvr8
 		expect(raises(t.ledger, t.wl)).toEqual([]);
 		expect(interpret(t.ledger, "raise 25")).toEqual({ kind: "refused", why: "no merge-train budget question is open: a raise answers the train's pause question, and the train is not paused" });
 	});
+
+	test("review r1 F5: a raise is whole cents: `raise 0.001` and `raise 1.005` refused with nothing written and the question open; `raise 0.01` stores exactly 0.01", () => {
+		const { ledger, wl, day, q } = pausedTrain();
+		for (const amount of ["0.001", "1.005", `$0.001`]) {
+			const why = `${amount} has more than two decimals: a raise is whole cents (at most two decimals, at least 0.01), never rounded; raise <usd> [q-…], for example \`raise 50\``;
+			expect(interpret(ledger, `raise ${amount}`)).toEqual({ kind: "refused", why });
+			expect(interpret(ledger, `raise ${amount} ${q}`)).toEqual({ kind: "refused", why });
+		}
+		// a command built past the parser is refused by the apply path too, writing nothing
+		for (const usd of [0.001, 1.005, 0]) {
+			expect(() => apply(ledger, { kind: "raise", workloadId: wl, questionId: q, usd })).toThrow("is not whole cents (at most two decimals, at least 0.01)");
+		}
+		expect(ledger.question(q)!.state).toBe("open");
+		expect(raises(ledger, wl)).toEqual([]);
+		expect(ledger.instructions(wl).filter((i) => i.body.startsWith("raise"))).toEqual([]);
+		const cmd = interpret(ledger, "raise 0.01");
+		expect(cmd).toEqual({ kind: "raise", workloadId: wl, questionId: q, usd: 0.01 });
+		expect(apply(ledger, cmd!)).toContain(`by $0.01 to $${TRAIN_DAILY_USD + 0.01}`);
+		expect(raises(ledger, wl).map((r) => r.rest)).toEqual([expect.stringMatching(new RegExp(`^day ${day} usd 0\\.01 answer in-`))]);
+		expect(trainDayLimit(controlEntries(ledger.entries(wl)), day)).toBe(TRAIN_DAILY_USD + 0.01);
+	});
 });
 
 describe("a question offering an option named raise keeps its answers (PLAN wl-mvr888nftz0vcl R28)", () => {

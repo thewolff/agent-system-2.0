@@ -71,7 +71,7 @@ import { loadTestRunnerConfig } from "../src/close-entry";
 import { checkoutOwnerRepo, isTrainOrFix, openTrains, ownerTasks, TRAIN_LAUNCH_LIMIT, trainAttempts, trainLaunchFailures, trainMembers } from "../src/merge-train";
 import {
 	activeTrainPr, askTrainPause, emptyTrainScan, nextPdtMidnight, pdtDay, scanTrainDays, trainBudgetGate, trainBudgetPromptLine, trainBudgetRows, trainDayLimit, trainMaxTime,
-	trainMeterErrorBody, trainPausedBody, trainRuleBody, type TrainScan, type TrainScanError,
+	TRAIN_METER_NAMED, trainMeterErrorBody, type TrainMeterEvidence, trainPausedBody, trainRuleBody, type TrainScan, type TrainScanError,
 } from "../src/train-budget";
 import {
 	attempts, branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, heldLive, holdersOf,
@@ -304,7 +304,7 @@ function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared, 
 		decisionLog, facts, resolved, instructions: joInstructionsFor(control, instructions, laneId), machinery: canonicalPath(p.repo) === canonicalPath(REPO_ROOT), tools: LANE_TOOLS,
 		scratch: { root: p.scratch, capMb: scratchCapMb(process.env) }, trainTasks: ownerTasks(ledger, w.id),
 		runnerServed, trainOrFix: isTrainOrFix(entries, instructions),
-		train: membership === undefined ? null : { prs: membership.prs, source: membership.source, attempts: trainAttempts(w.id, entries, instructions, ledger.slices(w.id)) },
+		train: membership === undefined ? null : { prs: membership.prs, source: membership.source, attempts: trainAttempts(entries, instructions) },
 	});
 	const out = prompt.split("\n");
 	out.splice(out.indexOf(`stakes: ${w.stakes} · mode: ${w.mode}`) + 1, 0, ceilingLine);
@@ -845,26 +845,57 @@ export interface TrainMeterPoll {
 	day: string;
 	spent: number;
 	errorId: string | null;
+	/** On a scan defect, where every defect was kept (`writeMeterEvidence`): the evidence file's path, or why it was not written. */
+	evidence: TrainMeterEvidence | null;
 	pauseId: string | null;
 	questionId: string | null;
+}
+
+/**
+ * A meter error's evidence (PLAN wl-mvr888nftz0vcl D5, D9): every defect of one poll, as JSON, in a new file
+ * `<laneDir>/meter-errors/<lane>-<instant>.json` under the lane directory the runner already writes this workload's files in
+ * (`prepare`'s `dir`). Never overwrites a kept file (`wx`). Returns the path, or why the write failed; it never throws, so
+ * the stop it is evidence for still happens and the `train-meter-error:` says the write failed.
+ */
+export function writeMeterEvidence(
+	laneDir: string, r: { workloadId: string; laneId: string; errors: readonly TrainScanError[]; nowMs: number },
+): TrainMeterEvidence {
+	try {
+		const at = new Date(r.nowMs).toISOString();
+		const dir = join(laneDir, "meter-errors");
+		mkdirSync(dir, { recursive: true });
+		const path = join(dir, `${r.laneId}-${at.replace(/:/g, "-")}.json`);
+		const defects = r.errors.map((e) => ({ file: e.file, line: e.line, reason: e.reason }));
+		writeFileSync(path, `${JSON.stringify({ workloadId: r.workloadId, laneId: r.laneId, at, count: defects.length, defects }, null, "\t")}\n`, { flag: "wx" });
+		return { path };
+	} catch (err) {
+		const failed = `${oneLine(err)} (under ${laneDir})`;
+		process.stderr.write(`runner: the train meter's evidence file for ${r.laneId} on ${r.workloadId} could not be written: ${failed}; its train-meter-error: says so and names the first ${TRAIN_METER_NAMED} defects\n`);
+		return { failed };
+	}
 }
 
 /**
  * One train meter poll on the ledger, in one transaction (D4): today's PDT spend from `scan` against `trainDayLimit` read
  * now, so a raise lands wholly before or after it. Under the limit nothing is written (no notice, no wall). At or over it:
  * `train-paused:` (the PR `activeTrainPr` names for this lane), its raise/wait question (`askTrainPause`, keyed to the
- * pause) and `lane-stop: <lane> accepted budget`. A scan defect writes `train-meter-error:` naming the first defect (and
- * how many more) and `lane-stop: <lane> accepted meter-error`; a pause the same poll reaches is written too, so one failure
- * never hides the other. When the writes fail after a stop was decided (any scan defect is one), the stop still stands
- * (`accepted` false: the caller accepts it on its own); any other failure throws.
+ * pause) and `lane-stop: <lane> accepted budget`. A scan defect first keeps every defect in an evidence file under `laneDir`
+ * (`writeMeterEvidence`), then writes `train-meter-error:` naming the first TRAIN_METER_NAMED defects, how many more, and
+ * that file (or why it could not be written), and `lane-stop: <lane> accepted meter-error`; a pause the same poll reaches
+ * is written too, so one failure never hides the other. When the writes fail after a stop was decided (any scan defect is
+ * one), the stop still stands (`accepted` false: the caller accepts it on its own) and the meter error is logged whole;
+ * any other failure throws.
  */
 export function trainMeterPoll(
-	ledger: Ledger, r: { workloadId: string; laneId: string; scan: TrainScan; errors: readonly TrainScanError[]; nowMs: number },
+	ledger: Ledger,
+	r: { workloadId: string; laneId: string; laneDir: string; scan: TrainScan; errors: readonly TrainScanError[]; nowMs: number },
 ): TrainMeterPoll {
 	const day = pdtDay(r.nowMs);
 	const spent = r.scan.days.get(day) ?? 0;
 	const failed = r.errors.length > 0;
 	let ref: TrainMeterPoll["ref"] = failed ? "meter-error" : null;
+	const evidence = failed ? writeMeterEvidence(r.laneDir, r) : null;
+	const errorBody = failed ? trainMeterErrorBody(r.laneId, r.errors, evidence) : null;
 	try {
 		return ledger.write(() => {
 			const recordAs = (body: string): string => ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body });
@@ -873,12 +904,7 @@ export function trainMeterPoll(
 			const limit = trainDayLimit(controlEntries(entries), day);
 			const over = spent >= limit;
 			ref = failed ? "meter-error" : over ? "budget" : null;
-			let errorId: string | null = null;
-			if (failed) {
-				const first = r.errors[0]!;
-				const more = r.errors.length > 1 ? ` (and ${r.errors.length - 1} more defects)` : "";
-				errorId = recordAs(trainMeterErrorBody(r.laneId, { ...first, reason: `${first.reason}${more}` }));
-			}
+			const errorId = errorBody === null ? null : recordAs(errorBody);
 			let pauseId: string | null = null;
 			let questionId: string | null = null;
 			if (over) {
@@ -887,12 +913,13 @@ export function trainMeterPoll(
 				questionId = askTrainPause(ledger, r.workloadId, pauseId);
 			}
 			if (ref !== null) recordAs(laneStopAcceptedBody(r.laneId, ref));
-			return { stop: ref !== null, ref, accepted: ref !== null, day, spent, errorId, pauseId, questionId };
+			return { stop: ref !== null, ref, accepted: ref !== null, day, spent, errorId, evidence, pauseId, questionId };
 		});
 	} catch (err) {
 		if (ref === null) throw err;
-		process.stderr.write(`runner: the train meter's ${ref} stop could not be written on ${r.workloadId}: ${String(err)}; the lane is stopped anyway\n`);
-		return { stop: true, ref, accepted: false, day, spent, errorId: null, pauseId: null, questionId: null };
+		const lost = errorBody === null ? "" : `; the meter error it could not record: ${errorBody}`;
+		process.stderr.write(`runner: the train meter's ${ref} stop could not be written on ${r.workloadId}: ${String(err)}; the lane is stopped anyway${lost}\n`);
+		return { stop: true, ref, accepted: false, day, spent, errorId: null, evidence, pauseId: null, questionId: null };
 	}
 }
 
@@ -1464,6 +1491,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	let tally: Spend = { usd: 0, tokens: 0, wallMin: 0 };
 	let meterState: MeterState = { sent: [] };
 	let sessionsDir: string | null = null;
+	/** This workload's lane directory (`prepare`'s `dir`, `laneDir`), set with `sessionsDir`: where a meter error's evidence file goes. */
+	let laneFilesDir: string | null = null;
 	let runStart: number | null = null;
 	const measure = (control: readonly ControlEntry[]): Spend => {
 		if (sessionsDir !== null) tally = scanSpend(sessionsDir, offsets, tally);
@@ -1505,20 +1534,20 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	 * that cannot read. Returns whether it stopped the lane.
 	 */
 	const trainMeter = (): boolean => {
-		if (sessionsDir === null) return false;
+		if (sessionsDir === null || laneFilesDir === null) return false;
 		let ref: "budget" | "meter-error" | null = null;
 		let accepted = false;
 		try {
 			const scanned = scanTrainDays(sessionsDir, trainScan);
 			trainScan = scanned.scan;
-			const polled = trainMeterPoll(ledger, { workloadId: wl, laneId, scan: scanned.scan, errors: scanned.errors, nowMs: Date.now() });
+			const polled = trainMeterPoll(ledger, { workloadId: wl, laneId, laneDir: laneFilesDir, scan: scanned.scan, errors: scanned.errors, nowMs: Date.now() });
 			ref = polled.ref;
 			accepted = polled.accepted;
 		} catch (err) {
 			ref = "meter-error";
 			process.stderr.write(`runner: the train budget meter failed on ${wl}: ${String(err)}; stopping ${laneId} (fail closed)\n`);
 			try {
-				record(trainMeterErrorBody(laneId, { file: "the runner's train meter", line: 0, reason: String(err) }));
+				record(trainMeterErrorBody(laneId, [{ file: "the runner's train meter", line: 0, reason: String(err) }], null));
 			} catch (writeErr) {
 				process.stderr.write(`runner: the train-meter-error: line could not be written either: ${String(writeErr)}\n`);
 			}
@@ -1744,6 +1773,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	try {
 		const p = prepare(ledger, wl, false);
 		sessionsDir = p.sessionDir;
+		laneFilesDir = p.dir;
 		{
 			// A train has no wall (PLAN wl-mvr888nftz0vcl D4): its ceiling rows are never read, and `--max-time` is the 24 h hang
 			// backstop (`trainMaxTime`, a shorter AGENT_SYSTEM_LANE_MAX_TIME still wins). Any other workload: the ceiling's wall.

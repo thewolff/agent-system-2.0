@@ -210,7 +210,7 @@ export function idlePrompt(workloadId: string, idleMs: number, n: number, limit:
 	const wait = idleMs >= 60_000 ? `${Math.round(idleMs / 60_000)} min` : `${Math.round(idleMs / 1000)} s`;
 	const release = train
 		? `release with no done-because when nothing on the train is runnable (lane_release): this train is permanent. done: ${TRAIN_DONE}`
-		: "release (record done-because first when the done line is met, then lane_release)";
+		: "release (record done-because first when the done line is met, then lane_release).";
 	return `Your session on ${workloadId} has background work pending and no activity for ${wait}: if you need its result, \`wait\` for it; otherwise continue your slices, or ${release} (idle prompt ${n} of ${limit})`;
 }
 

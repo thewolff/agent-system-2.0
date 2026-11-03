@@ -14,8 +14,8 @@ import orchestratorSurface from "../index";
 import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
-import { applyTrain, interpret } from "../src/input";
-import { controlEntries, exitClass, holdersOf, launchRowsFor, trainFixBody, verdictOf } from "../src/launch";
+import { apply, applyTrain, interpret } from "../src/input";
+import { controlEntries, exitClass, holdersOf, launchRowsFor, trainBoardBody, trainFixBody, verdictOf } from "../src/launch";
 import {
 	boardLanding, boardRefusals, isTrain, type Landing, landingReady, openTrains, parseTrainSlice, TRAIN_DONE, trainAttemptFor, trainAttemptsOf, trainAutoboardBody,
 	trainFullSliceId, trainPrs, trainSliceId,
@@ -179,6 +179,82 @@ describe("R1, the board side: one train, appended to, opened only when none is o
 		expect(parseTrainSlice("sl-train-abc123-7-a1", t)).toBeNull();
 		expect(parseTrainSlice("sl-train-abc123-7-a2", "wl-other")).toBeNull();
 		expect(parseTrainSlice("sl-plan", t)).toBeNull();
+	});
+});
+
+describe("review r1 F3: a PR's attempt is decided in its membership transaction, never inferred from a slice later", () => {
+	const JO = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
+	/** Every `train-attempt:` row on `train`, as [writer, body, created_at]. */
+	const attemptRows = (ledger: Ledger, train: string) =>
+		ledger.entries(train).filter((e) => e.body.startsWith("train-attempt:")).map((e) => [e.created_by, e.body, e.created_at]);
+	/** Jo's train opened by `train 117` on a ledger stamped by a settable clock, and #117's attempt-1 slice, opened by the train lane. */
+	const joWorld = () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const train = joTrain(ledger);
+		c.plusHours(0.01);
+		const sl1 = ledger.addSlice({ by: LANE, workloadId: train, id: trainSliceId(train, 117), task: "PR #117", doneCondition: "terminal", inputs: "#117" });
+		return { c, ledger, train, sl1 };
+	};
+
+	test("(a) Jo's `train <wl> 117` resuming a held train while #117's attempt-1 slice is open writes no train-attempt row; #117 stays on attempt 1 after that slice is cancelled in the resume's millisecond", () => {
+		const { c, ledger, train, sl1 } = joWorld();
+		const q = ledger.raiseQuestion({ by: LANE, workloadId: train, sliceId: sl1, body: "#117 production: merge it?", options: ["merged", "skip", "stop"] });
+		ledger.answerQuestion(q, { ...JO, answer: "stop" });
+		c.plusHours(0.01);
+		const receipt = apply(ledger, interpret(ledger, `train ${train} 117`)!);
+		expect(receipt).toStartWith(`added #117 to merge train ${train} (instruction `);
+		const resume = ledger.entries(train).filter((e) => e.body.startsWith("train: 117 ")).at(-1)!;
+		expect(attemptRows(ledger, train)).toEqual([]);
+		expect(trainAttemptsOf(ledger, train).get(117)?.attempt).toBe(1);
+		// the clock is not moved: the slice turns terminal in the resume row's own millisecond
+		ledger.cancelSlice(sl1, { by: LANE });
+		expect(ledger.slice(sl1)!.changed_at).toBe(resume.created_at);
+		expect(trainAttemptsOf(ledger, train).get(117)).toEqual({ attempt: 1, since: ledger.entries(train).find((e) => e.body.startsWith("train: 117 "))!.created_at });
+		expect(attemptRows(ledger, train)).toEqual([]);
+	});
+
+	test("(b) Jo's word: a terminal attempt-1 slice, then `train <wl> 117` in the same millisecond, starts attempt 2 and writes its row as the surface", () => {
+		const { c, ledger, train, sl1 } = joWorld();
+		c.plusHours(0.01);
+		ledger.cancelSlice(sl1, { by: LANE });
+		const receipt = apply(ledger, interpret(ledger, `train ${train} 117`)!);
+		expect(receipt).toStartWith(`added #117 (attempt 2) to merge train ${train} (instruction `);
+		const at = ledger.slice(sl1)!.changed_at;
+		expect(attemptRows(ledger, train)).toEqual([[SURFACE_BY, "train-attempt: pr 117 attempt 2", at]]);
+		expect(trainAttemptsOf(ledger, train).get(117)).toEqual({ attempt: 2, since: at });
+	});
+
+	test("(b) boardLanding: a terminal attempt-1 slice, then a re-board in the same millisecond, starts attempt 2 and writes its row as the merge train", () => {
+		const w = world();
+		const first = w.board(w.landing(117));
+		if (!first.boarded) throw new Error(first.reason);
+		const train = first.train;
+		const sl1 = w.ledger.addSlice({ by: LANE, workloadId: train, id: trainSliceId(train, 117), task: "PR #117", doneCondition: "terminal", inputs: "#117" });
+		const again = w.landing(117, H);
+		// no clock move from here: the cancel and the board share a millisecond
+		w.ledger.cancelSlice(sl1, { by: LANE });
+		const r = boardLanding(w.ledger, w.ready(again));
+		expect(r).toMatchObject({ boarded: true, train, opened: false });
+		const at = w.ledger.slice(sl1)!.changed_at;
+		expect(attemptRows(w.ledger, train)).toEqual([[MERGE_TRAIN_BY, "train-attempt: pr 117 attempt 2", at]]);
+		expect(trainAttemptsOf(w.ledger, train).get(117)).toEqual({ attempt: 2, since: at });
+	});
+
+	test("(c) a membership with no train-attempt row reads as attempt 1, even a second train-board: written after attempt 1's slice turned terminal", () => {
+		const w = world();
+		const first = w.board(w.landing(117));
+		if (!first.boarded) throw new Error(first.reason);
+		const train = first.train;
+		const sl1 = w.ledger.addSlice({ by: LANE, workloadId: train, id: trainSliceId(train, 117), task: "PR #117", doneCondition: "terminal", inputs: "#117" });
+		w.ledger.cancelSlice(sl1, { by: LANE });
+		const again = w.landing(117, H);
+		// a membership row as one written before train-attempt: rows existed: the board alone, no attempt row beside it
+		w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: train, kind: "assumption", body: trainBoardBody({ pr: 117, workload: again, head: H, run: null, review: null }) });
+		expect(trainPrs(w.ledger.entries(train), w.ledger.instructions(train))).toEqual([117]);
+		expect(attemptRows(w.ledger, train)).toEqual([]);
+		const firstBoard = w.ledger.entries(train).find((e) => e.body.startsWith("train-board: pr 117 "))!;
+		expect(trainAttemptsOf(w.ledger, train).get(117)).toEqual({ attempt: 1, since: firstBoard.created_at });
 	});
 });
 

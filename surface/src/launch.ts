@@ -98,7 +98,7 @@ export const CONTROL_PREFIXES = [
 	"now", "ruling-conflict",
 	"land-first", "main-retry", "train-reconciled", "runner-preflight", "fast-plan", "fast-fallback", "status-failed",
 	"land-first-off-pending", "land-first-off-complete",
-	"train-paused", "train-meter-error", "train-rule", "train-raise",
+	"train-paused", "train-meter-error", "train-rule", "train-raise", "train-attempt",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -216,6 +216,9 @@ export const DRIVE_BACKUP_BY = "drive-backup";
  * D2), naming the lane workload W whose PR the one train could not board because it serves another repository: a needs-you
  * line. W is closed by then and the ledger takes no entry on a closed workload, so `boardLanding` writes it on the standing
  * workload with `workload <W>`; a row with no `workload` names the workload it is on.
+ * `train-attempt: pr <n> attempt <m>` (m ≥ 2; PLAN wl-mvr888nftz0vcl, review r1 F3) records that a membership row began PR n's
+ * attempt m, decided once in the membership's own transaction; its writer is the membership row's: the surface beside Jo's
+ * `train:` (SURFACE_BY), the train tick beside its `train-board:` (MERGE_TRAIN_BY). `trainAttempts` reads attempts from it alone.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -295,6 +298,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"train-meter-error": [LANE_RUNNER_BY],
 	"train-rule": [LANE_RUNNER_BY],
 	"train-raise": [SURFACE_BY],
+	"train-attempt": [SURFACE_BY, MERGE_TRAIN_BY],
 };
 
 export interface ControlEntry {

@@ -853,7 +853,7 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, ownerRep
 		const mainRed = pr.state === "MERGED" && train && result?.verdict === "red-main" && pr.headSha === result.sha;
 		const headCompare = green && pr.headSha !== result.sha ? await compare(result.sha, pr.headSha, pr.number) : null;
 		const candidateCompare = (green || mainRed) && pr.headRefName === branch && candidate !== result!.sha ? await compare(result!.sha, candidate, pr.number) : null;
-		const trainSkipped = trainSkippedOf(pr.number, entries, questions, instructions, id, ledger.slices(id));
+		const trainSkipped = trainSkippedOf(pr.number, entries, questions, instructions, id);
 		const own = { ...pr, result, headCompare, candidateCompare, waivedRun: waivedRunOf(records, pr.number, questions, instructions), trainSkipped, onTrain: train };
 		prs.push({
 			...own,

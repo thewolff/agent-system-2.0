@@ -286,11 +286,28 @@ export function trainRaises(control: readonly ControlEntry[]): TrainRaise[] {
 	return out;
 }
 
-/** `train-meter-error: <lane> <file>:<line> <reason>`: the runner's alone; the episode is the entry (D5, D9). */
-export function trainMeterErrorBody(laneId: string, e: TrainScanError): string {
-	return `train-meter-error: ${laneId} ${e.file}:${e.line} ${e.reason}`.replace(/\s*\n\s*/g, " ");
+/** How many defects a `train-meter-error:` names; the rest are counted (`and <k> more`) and live in its evidence file. */
+export const TRAIN_METER_NAMED = 10;
+/** A meter error's evidence file: the absolute path of the JSON holding every defect, or why it could not be written. */
+export type TrainMeterEvidence = { path: string } | { failed: string };
+/**
+ * `train-meter-error: <lane> <file>:<line> <reason>[; <file>:<line> <reason>]…[; and <k> more][; evidence <path> | ; evidence
+ * write failed: <why>]`: the runner's alone; the episode is the entry (D5, D9). The first TRAIN_METER_NAMED defects are named,
+ * the rest counted; `evidence` is the file holding all of them (null when there is no defect list to keep: the runner's own
+ * meter failure, whose one defect is the whole error). Throws on no defect: an empty meter error names nothing to repair.
+ */
+export function trainMeterErrorBody(laneId: string, errors: readonly TrainScanError[], evidence: TrainMeterEvidence | null): string {
+	if (errors.length === 0) throw new Error(`trainMeterErrorBody: no defect given for ${laneId}; a train-meter-error: names at least one`);
+	const parts = errors.slice(0, TRAIN_METER_NAMED).map((e) => `${e.file}:${e.line} ${e.reason}`);
+	if (errors.length > TRAIN_METER_NAMED) parts.push(`and ${errors.length - TRAIN_METER_NAMED} more`);
+	if (evidence !== null) parts.push("path" in evidence ? `evidence ${evidence.path}` : `evidence write failed: ${evidence.failed}`);
+	return `train-meter-error: ${laneId} ${parts.join("; ")}`.replace(/\s*\n\s*/g, " ");
 }
-/** Every valid `train-meter-error:` among `control`, oldest first; each is one episode whatever its text says. */
+/**
+ * Every valid `train-meter-error:` among `control`, oldest first; each is one episode whatever its text says. `detail` is
+ * everything after the lane (the named defects, the count and the evidence clause, `trainMeterErrorBody`), shown whole by
+ * the gate's refusal and the meter question.
+ */
 export function trainMeterErrors(control: readonly ControlEntry[]): { entryId: string; laneId: string; detail: string; createdAt: string }[] {
 	const out: { entryId: string; laneId: string; detail: string; createdAt: string }[] = [];
 	for (const c of control) {

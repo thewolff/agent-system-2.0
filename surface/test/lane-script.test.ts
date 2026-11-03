@@ -15,8 +15,10 @@ import { handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { ceilingBody, parseCeilingNotice, parseSpend } from "../src/ceiling";
 import { apply, applyTrain, interpret } from "../src/input";
-import { emptyTrainScan, scanTrainDays, trainBudgetSliceId, trainPausedBody, trainRaiseBody, type TrainScanResult } from "../src/train-budget";
-import { trainSliceId } from "../src/merge-train";
+import {
+	emptyTrainScan, scanTrainDays, trainBudgetGate, trainBudgetRows, trainBudgetSliceId, trainMeterErrors, trainPausedBody, trainRaiseBody, type TrainScanResult,
+} from "../src/train-budget";
+import { trainMeterQuestionBody, trainSliceId } from "../src/merge-train";
 import { errorLines } from "../src/errors";
 import { recordRepo } from "../src/decision-log";
 import { branchName, type ControlEntry, doneBody, laneCap, laneDir, laneEnv, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, trainFixBody, verdictOf, worktreePath } from "../src/launch";
@@ -1545,7 +1547,7 @@ describe("lane script: a merge train's daily budget meter (PLAN wl-mvr888nftz0vc
 		const errors = snap.control.filter((c) => c.prefix === "train-meter-error");
 		expect(errors).toHaveLength(1);
 		expect(errors[0]!.createdBy).toBe(LANE_RUNNER_BY);
-		expect(errors[0]!.rest).toMatch(new RegExp(`^${laneId} ${rec!.session!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:\\d+ an assistant line with no parseable top-level timestamp$`));
+		expect(errors[0]!.rest).toMatch(new RegExp(`^${laneId} ${rec!.session!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:\\d+ an assistant line with no parseable top-level timestamp; evidence /.+/meter-errors/${laneId}-\\S+\\.json$`));
 		expect(snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === laneId).map((s) => [s.createdBy, s.rest])).toEqual([[LANE_RUNNER_BY, "accepted meter-error"]]);
 		expect(ceilingNoticesOf(r, wl)).toEqual([]);
 		expect(snap.control.filter((c) => c.prefix === "train-paused")).toEqual([]);
@@ -1584,11 +1586,12 @@ describe("trainMeterPoll: one transaction per poll (PLAN wl-mvr888nftz0vcl D4, R
 	// 2026-11-02 18:00 PST, a fixed instant: its PDT day is 2026-11-02 and the next midnight 2026-11-03T08:00Z.
 	const NOW = Date.parse("2026-11-02T18:00:00.000Z");
 	const line = (timestamp: string, total: number) => JSON.stringify({ type: "message", timestamp, message: { role: "assistant", usage: { cost: { total } } } });
-	/** A train on a temp ledger and a session directory whose one file `scanOf` rewrites and scans from byte 0. */
+	/** A train on a temp ledger, a session directory whose one file `scanOf` rewrites and scans from byte 0, and the lane directory a meter error's evidence goes under. */
 	interface TrainWorld {
 		ledger: Ledger;
 		path: string;
 		wl: string;
+		laneDir: string;
 		scanOf: (lines: string[]) => TrainScanResult;
 	}
 	function world(): TrainWorld {
@@ -1602,11 +1605,17 @@ describe("trainMeterPoll: one transaction per poll (PLAN wl-mvr888nftz0vcl D4, R
 			writeFileSync(join(dir, "s.jsonl"), `${lines.join("\n")}\n`);
 			return scanTrainDays(dir, emptyTrainScan());
 		};
-		return { ledger, path, wl, scanOf };
+		return { ledger, path, wl, laneDir: tmp("train-lane"), scanOf };
 	}
 	const poll = (w: TrainWorld, s: TrainScanResult, nowMs = NOW) =>
-		laneScript.trainMeterPoll(w.ledger, { workloadId: w.wl, laneId: LANE, scan: s.scan, errors: s.errors, nowMs });
+		laneScript.trainMeterPoll(w.ledger, { workloadId: w.wl, laneId: LANE, laneDir: w.laneDir, scan: s.scan, errors: s.errors, nowMs });
 	const bodiesOf = (w: TrainWorld, prefix: string) => w.ledger.entries(w.wl).filter((e) => e.body.startsWith(prefix));
+	/** The evidence file a `train-meter-error:` cites, read back as JSON. */
+	const evidenceOf = (body: string): { workloadId: string; laneId: string; at: string; count: number; defects: { file: string; line: number; reason: string }[] } => {
+		const m = /; evidence (\/.+\.json)$/.exec(body);
+		if (!m) throw new Error(`no evidence path in ${body}`);
+		return JSON.parse(readFileSync(m[1]!, "utf8"));
+	};
 
 	test("under the day's limit nothing is written: no notice, no wall, no stop; yesterday's spend is not today's", () => {
 		const w = world();
@@ -1647,11 +1656,66 @@ describe("trainMeterPoll: one transaction per poll (PLAN wl-mvr888nftz0vcl D4, R
 		const w = world();
 		const p = poll(w, w.scanOf([line("2026-11-02T17:00:00.000Z", 151), "{torn", JSON.stringify({ type: "message", message: { role: "assistant" } })]));
 		expect(p).toMatchObject({ stop: true, ref: "meter-error", accepted: true });
-		const errs = bodiesOf(w, "train-meter-error:");
-		expect(errs).toHaveLength(1);
-		expect(errs[0]!.body).toMatch(/^train-meter-error: lane-mvtrain-1 \S+s\.jsonl:2 the line is not JSON \(and 1 more defects\)$/);
+		expect(bodiesOf(w, "train-meter-error:")).toHaveLength(1);
 		expect(bodiesOf(w, "train-paused:")).toHaveLength(1);
 		expect(bodiesOf(w, "lane-stop:").map((e) => e.body)).toEqual([laneStopAcceptedBody(LANE, "meter-error")]);
+	});
+
+	test("every defect is kept: two defects are both named in train-meter-error:, and its evidence file under the lane directory holds both", () => {
+		const w = world();
+		const s = w.scanOf([line("2026-11-02T17:00:00.000Z", 1), "{torn", JSON.stringify({ type: "message", message: { role: "assistant" } })]);
+		const p = poll(w, s);
+		expect(p).toMatchObject({ stop: true, ref: "meter-error", accepted: true });
+		const errs = bodiesOf(w, "train-meter-error:");
+		expect(errs.map((e) => e.id)).toEqual([p.errorId!]);
+		const f = s.errors[0]!.file;
+		const evidence = join(w.laneDir, "meter-errors", `${LANE}-2026-11-02T18-00-00.000Z.json`);
+		expect(p.evidence).toEqual({ path: evidence });
+		expect(errs[0]!.body).toBe(`train-meter-error: ${LANE} ${f}:2 the line is not JSON; ${f}:3 an assistant line with no parseable top-level timestamp; evidence ${evidence}`);
+		expect(evidenceOf(errs[0]!.body)).toEqual({
+			workloadId: w.wl, laneId: LANE, at: "2026-11-02T18:00:00.000Z", count: 2,
+			defects: [{ file: f, line: 2, reason: "the line is not JSON" }, { file: f, line: 3, reason: "an assistant line with no parseable top-level timestamp" }],
+		});
+		// The parser, the gate and the meter question read the whole entry: both defects and the evidence path.
+		const rows = trainBudgetRows({ workload: { id: w.wl }, entries: w.ledger.entries(w.wl), questions: w.ledger.questions(w.wl), instructions: w.ledger.instructions(w.wl) });
+		const [parsed] = trainMeterErrors(rows.control);
+		expect(parsed).toMatchObject({ entryId: p.errorId, laneId: LANE, detail: errs[0]!.body.slice(`train-meter-error: ${LANE} `.length) });
+		const gate = trainBudgetGate(rows, w.ledger.now());
+		expect(gate).toMatchObject({ reason: "meter-error", entryId: p.errorId });
+		expect(gate!.detail).toContain(`${f}:3 an assistant line with no parseable top-level timestamp; evidence ${evidence}`);
+		expect(trainMeterQuestionBody(w.wl, parsed!)).toContain(`${f}:2 the line is not JSON; ${f}:3 an assistant line with no parseable top-level timestamp; evidence ${evidence} (${p.errorId})`);
+	});
+
+	test("twelve defects: the entry names the first ten and `and 2 more`; the evidence file holds all twelve", () => {
+		const w = world();
+		const s = w.scanOf(Array.from({ length: 12 }, (_, i) => `{torn ${i}`));
+		expect(s.errors).toHaveLength(12);
+		expect(poll(w, s)).toMatchObject({ stop: true, ref: "meter-error", accepted: true });
+		const body = bodiesOf(w, "train-meter-error:")[0]!.body;
+		const f = s.errors[0]!.file;
+		const named = Array.from({ length: 10 }, (_, i) => `${f}:${i + 1} the line is not JSON`).join("; ");
+		expect(body).toBe(`train-meter-error: ${LANE} ${named}; and 2 more; evidence ${join(w.laneDir, "meter-errors", `${LANE}-2026-11-02T18-00-00.000Z.json`)}`);
+		const kept = evidenceOf(body);
+		expect(kept.count).toBe(12);
+		expect(kept.defects.map((d) => `${d.file}:${d.line} ${d.reason}`)).toEqual(s.errors.map((e) => `${e.file}:${e.line} ${e.reason}`));
+	});
+
+	test("an evidence file that cannot be written still stops the lane; the entry says the write failed and why, and names the defects", () => {
+		const w = world();
+		// The lane directory is a plain file, so meter-errors/ under it cannot be made.
+		const blocked = join(w.laneDir, "not-a-dir");
+		writeFileSync(blocked, "");
+		const s = w.scanOf(Array.from({ length: 11 }, (_, i) => `{torn ${i}`));
+		const p = laneScript.trainMeterPoll(w.ledger, { workloadId: w.wl, laneId: LANE, laneDir: blocked, scan: s.scan, errors: s.errors, nowMs: NOW });
+		expect(p).toMatchObject({ stop: true, ref: "meter-error", accepted: true });
+		expect(p.evidence).toMatchObject({ failed: expect.stringContaining(`(under ${blocked})`) });
+		const body = bodiesOf(w, "train-meter-error:")[0]!.body;
+		const f = s.errors[0]!.file;
+		const named = Array.from({ length: 10 }, (_, i) => `${f}:${i + 1} the line is not JSON`).join("; ");
+		expect(body).toStartWith(`train-meter-error: ${LANE} ${named}; and 1 more; evidence write failed: `);
+		expect(body).toMatch(/ENOTDIR|EEXIST|not a directory/i);
+		expect(bodiesOf(w, "lane-stop:").map((e) => e.body)).toEqual([laneStopAcceptedBody(LANE, "meter-error")]);
+		expect(existsSync(join(blocked, "meter-errors"))).toBe(false);
 	});
 
 	test("a failed write after a stop was decided still stops (accepted false); under the limit a failure throws", () => {

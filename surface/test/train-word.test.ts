@@ -866,7 +866,7 @@ describe("the train skip in the close check (§ 1)", () => {
 		return {
 			number: 101, state: "OPEN", headRefName: "feature/x", headSha: SHA_A, result: { runId: "tr-red-1", verdict: "red", sha: SHA_A, scope: "full" },
 			headCompare: null, candidateCompare: null, waivedRun: null, onTrain: false, mergeCommit: null, cover: null, waivedByJo: null,
-			trainSkipped: trainSkippedOf(101, ledger.entries(wl), ledger.questions(wl), ledger.instructions(wl), wl, ledger.slices(wl)), ...over,
+			trainSkipped: trainSkippedOf(101, ledger.entries(wl), ledger.questions(wl), ledger.instructions(wl), wl), ...over,
 		};
 	}
 	const facts = (prs: ClosePr[]) => ({ failure: null, branch: "wl/wl-t", defaultBranch: "main", candidate: { sha: SHA_B, changed: [] }, prs });

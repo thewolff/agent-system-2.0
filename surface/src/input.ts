@@ -151,7 +151,7 @@ import {
 } from "./launch";
 import { bootstrapRefusal } from "./main-state";
 import {
-	currentAttemptSlice, isTrain, onOtherTrain, repoIdentity, TRAIN_DONE, trainAttemptFor, trainAttemptsOf, trainAutonomousRefusal, trainBody, trainBrief, trainCheckout, trainHold,
+	currentAttemptSlice, isTrain, onOtherTrain, repoIdentity, TRAIN_DONE, trainAttemptBody, trainAttemptFor, trainAttemptsOf, trainAutonomousRefusal, trainBody, trainBrief, trainCheckout, trainHold,
 	trainInstructionBody, trainNoWallRefusal, trainPermanentRefusal, trainPrs, trainSlicePr, theTrain,
 } from "./merge-train";
 import { pdtDay, type TrainPause, trainBudgetSliceId, trainDayLimit, trainPauses, trainRaiseBody, usdText } from "./train-budget";
@@ -1060,7 +1060,8 @@ function raiseRefusal(ledger: Ledger, q: Pick<QuestionRow, "id" | "state">, p: T
  * - no argument: `refused` (`bareRaiseRefusal`) when a budget question is open and no other open question offers `raise`;
  * - `raise <q-…>`: `refused` when that question is a budget question;
  * - `raise <amount> [q-…]`, the amount any token that starts like a number (`50`, `$50`, `-5`, `.5`, `1e3`): the command when the
- *   amount is a plain positive number of dollars (a leading `$` allowed, as `ceiling` takes it), the third word if any is a
+ *   amount is a plain number of whole cents, at most two decimals and at least 0.01 (a leading `$` allowed, as `ceiling` takes
+ *   it; `0.001` or `1.005` would round in the `train-raise:` row, so they are refused, not rounded), the third word if any is a
  *   question id, the named question (or the only open budget question) is a budget question, and `raiseRefusal` is clear.
  *   Several open budget questions and none named is `ambiguous`; anything else is `refused`, never prose.
  */
@@ -1078,9 +1079,10 @@ function raiseCommand(ledger: Ledger, rest: readonly string[]): Command | null {
 	if (!/^[$+-]?\.?\d/.test(rest[0]!)) return null;
 	const usage = "raise <usd> [q-…], for example `raise 50`";
 	if (rest.length > 2 || (rest.length === 2 && !/^q-/i.test(rest[1]!))) return { kind: "refused", why: `the raise word is ${usage}` };
-	const m = /^\$?(\d+(?:\.\d+)?)$/.exec(rest[0]!);
-	const usd = m ? Number(m[1]) : Number.NaN;
-	if (!Number.isFinite(usd) || usd <= 0) return { kind: "refused", why: `${rest[0]} is not a positive number of dollars: ${usage}` };
+	const m = /^\$?(\d+)(?:\.(\d+))?$/.exec(rest[0]!);
+	if ((m?.[2]?.length ?? 0) > 2) return { kind: "refused", why: `${rest[0]} has more than two decimals: a raise is whole cents (at most two decimals, at least 0.01), never rounded; ${usage}` };
+	const usd = m ? Number(m[2] === undefined ? m[1] : `${m[1]}.${m[2]}`) : Number.NaN;
+	if (!wholeCents(usd)) return { kind: "refused", why: `${rest[0]} is not a positive number of dollars: ${usage}` };
 	let q: (typeof open)[number] | undefined;
 	if (rest.length === 2) {
 		q = open.find((x) => x.id === rest[1]);
@@ -1093,6 +1095,11 @@ function raiseCommand(ledger: Ledger, rest: readonly string[]): Command | null {
 	}
 	const why = raiseRefusal(ledger, q, budgetPauseOf(ledger, q)!);
 	return why === null ? { kind: "raise", workloadId: q.workload_id, questionId: q.id, usd } : { kind: "refused", why };
+}
+
+/** A raise amount the `train-raise:` row stores exactly (D7): finite, at least 0.01, and whole cents (`usdText` keeps it as is). */
+function wholeCents(usd: number): boolean {
+	return Number.isFinite(usd) && usd >= 0.01 && Number(usdText(usd)) === usd;
 }
 
 /**
@@ -1631,6 +1638,7 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 		case "raise": {
 			// PLAN wl-mvr888nftz0vcl D7: in one transaction, the question open and its pause's day today checked again (a reading made
 			// before midnight never applies a stale raise after it), then Jo's answer `raise` and the surface's `train-raise:` naming it.
+			if (!wholeCents(cmd.usd)) throw new Error(`raise ${cmd.usd} on ${cmd.questionId} is not whole cents (at most two decimals, at least 0.01): the train-raise: row would round it; refused, never applied`);
 			return ledger.write(() => {
 				const q = ledger.question(cmd.questionId);
 				const p = q ? budgetPauseOf(ledger, q) : null;
@@ -1654,25 +1662,31 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
  * Add `prs` to merge train `wl` inside the caller's transaction (`train <wl> <N…>`, and `train <N…>` while a train is open):
  * `trainAppendRefusal` checked again, then Jo's instruction `train <wl> <N…>` and the surface's `train:` naming it, and Jo's
  * `launch-requested:` when the train is autonomous and no lane holds it live. A PR whose current attempt on the train is
- * terminal boards its next attempt (lane decision en-mvznmxcdh0ucsj), named in the receipt. Returns the receipt.
+ * terminal boards its next attempt m (lane decision en-mvznmxcdh0ucsj): decided here, once, and recorded beside the `train:`
+ * as the surface's `train-attempt: pr <n> attempt <m>` (`trainAttempts` reads only that), named in the receipt. A PR re-named
+ * while its attempt is open (a held train's resume) gets no row and stays on its attempt. Returns the receipt.
  */
 function appendTrain(ledger: Ledger, wl: string, prs: readonly number[]): string {
 	const why = trainAppendRefusal(ledger, wl, prs);
 	if (why !== null) throw new Error(`${why}; refused, never applied`);
-	// Read before the write: once the train: row names a PR, its next attempt is the current one.
-	const named = prs.map((n) => {
+	// Decided before the write: once the train: row names a PR, its next attempt is the current one.
+	const next = prs.map((n) => {
 		const a = trainAttemptFor(ledger, wl, n);
-		return a.ok && a.attempt > 1 ? `#${n} (attempt ${a.attempt})` : `#${n}`;
+		return { n, attempt: a.ok && a.attempt > 1 ? a.attempt : null };
 	});
 	const stamp = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
 	const id = ledger.recordInstruction({ ...stamp, workloadId: wl, body: trainInstructionBody(wl, prs) });
 	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: trainBody(prs, id) });
+	for (const { n, attempt } of next) {
+		if (attempt !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: trainAttemptBody(n, attempt) });
+	}
 	const w = ledger.workload(wl)!;
 	let relaunch = "";
 	if (w.mode === "autonomous" && !heldLive(w, ledger.now())) {
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), "train append") });
 		relaunch = "; no lane holds it live, so a relaunch is requested";
 	}
+	const named = next.map(({ n, attempt }) => (attempt === null ? `#${n}` : `#${n} (attempt ${attempt})`));
 	return `added ${named.join(", ")} to merge train ${wl} (instruction ${id}); order ${trainPrs(ledger.entries(wl), ledger.instructions(wl)).join(", ")}${relaunch}`;
 }
 

@@ -26,7 +26,7 @@ import {
 } from "../src/launch";
 import {
 	actionable, type ControlRoot, fixBindings, landFirstNoticeBody, landFirstRows, latestTrainReconciled, mainRedNotices, protectionEpisodes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs,
-	testRunStarts, TRAIN_METER_OPTIONS, TRAIN_STALL_OPTIONS, trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainHoldBody, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody, type WakeDeferral,
+	retireSupersededFullSlices, testRunStarts, TRAIN_LAUNCH_OPTIONS, TRAIN_METER_OPTIONS, TRAIN_STALL_OPTIONS, trainAlertBody, trainAlertMarker, trainAttemptsOf, trainFullSliceId, trainHeadWokenBody, trainHoldBody, trainLaunchFailures, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody, type WakeDeferral,
 } from "../src/merge-train";
 import { trainMergedNoticeBody } from "../src/notice";
 import { fastPlanBody, makeRunId, testRequestedBody, testRunBody, testRuns, withFullSuitePublication } from "../src/test-run";
@@ -37,6 +37,9 @@ import {
 	world,
 } from "./train-world";
 import { tmp } from "./helpers";
+import type { RankConfig } from "../src/rank-launch";
+// A namespace import, as lane-script.test.ts does: a name lane.ts stops exporting fails only the test that calls it.
+import * as laneScript from "../scripts/lane";
 
 /** The merge-train questions keyed to budget entry `entryId` on train `wl`. */
 const budgetQuestionsOf = (l: Ledger, wl: string, entryId: string) => budgetQuestions(wl, l.questions(wl), entryId);
@@ -1803,7 +1806,7 @@ describe("the permanent train in the tick (PLAN wl-mvr888nftz0vcl D5, D6, D8, D9
 	test("R5 (tick) and R24: a meter error gets one NOW relaunch / hold question across two ticks and launches nothing; hold keeps it; Jo's relaunch wakes the train once with every PR terminal and no pause row", () => {
 		const w = perm();
 		w.ledger.completeSlice(trainSliceId(w.train, 101), { by: TRAIN_LANE, artifact: "skipped: closed by its author" });
-		const err = w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.train, kind: "assumption", body: trainMeterErrorBody(TRAIN_LANE, { file: "/x/s.jsonl", line: 7, reason: "no cost" }) });
+		const err = w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.train, kind: "assumption", body: trainMeterErrorBody(TRAIN_LANE, [{ file: "/x/s.jsonl", line: 7, reason: "no cost" }], null) });
 		w.end("stop", "meter-error");
 		later(w, 0.2);
 		w.pass();
@@ -1827,7 +1830,7 @@ describe("the permanent train in the tick (PLAN wl-mvr888nftz0vcl D5, D6, D8, D9
 		w.pass();
 		expect(w.launches()).toBe(1);
 		const v = perm();
-		const e2 = v.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: v.train, kind: "assumption", body: trainMeterErrorBody(TRAIN_LANE, { file: "/x/s.jsonl", line: 1, reason: "bad line" }) });
+		const e2 = v.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: v.train, kind: "assumption", body: trainMeterErrorBody(TRAIN_LANE, [{ file: "/x/s.jsonl", line: 1, reason: "bad line" }], null) });
 		v.end("stop", "meter-error");
 		v.pass();
 		v.ledger.answerQuestion(budgetQuestionsOf(v.ledger, v.train, e2)[0]!.id, { ...JO, answer: "hold" });
@@ -1930,5 +1933,140 @@ describe("the permanent train in the tick (PLAN wl-mvr888nftz0vcl D5, D6, D8, D9
 		w.pass();
 		const stops = controlEntries(w.ledger.entries(w.train)).filter((c) => c.prefix === "lane-stop" && c.laneId === lane);
 		expect(stops.map((c) => [c.createdBy, c.rest])).toEqual([[SURFACE_BY, "requested stall-relaunch by jo"]]);
+	});
+
+	test("review r1 F2: three insufficient raises, each relaunch stopped by the runner's pre-prompt budget stop, then midnight: the tick relaunches and trainGate admits; three genuine failed starts still reach the limit", () => {
+		const w = perm();
+		ensureStandingWorkload(w.ledger);
+		const SHOW: RankConfig = { mode: "show", parallelBudgetUsd: 0 };
+		const gone: laneScript.RunnerProbe = { omp: () => "gone", runner: () => "gone" };
+		/** The runner's meter poll on `lane` with today's spend at $400, past every limit the raises reach: its pause, question and accepted budget stop, then the exit. */
+		const budgetStop = (lane: string): string => {
+			const nowMs = Date.parse(w.c.now());
+			const r = laneScript.trainMeterPoll(w.ledger, { workloadId: w.train, laneId: lane, scan: { files: new Map(), days: new Map([[pdtDay(nowMs), 400]]) }, errors: [], nowMs });
+			expect(r).toMatchObject({ stop: true, ref: "budget", accepted: true });
+			w.end("stop", "budget");
+			return r.questionId!;
+		};
+		// what each reserved lane does: stop at the meter before lane-ready: (the runner's pre-prompt return), or get ready
+		let next: "budget-stop" | "ready" = "budget-stop";
+		const refusals: string[] = [];
+		const admitted: string[] = [];
+		const pass = () => tick({
+			ledger: w.ledger, gh: w.g.gh, as2testRoot: w.root,
+			launch: (wl) => {
+				const r = laneScript.reserve(w.ledger, wl, MERGE_TRAIN_BY, false, SHOW, () => gone);
+				if (!r.ok) {
+					refusals.push(r.reason);
+					return { code: 1, line: `${wl} not launched: ${r.reason}` };
+				}
+				admitted.push(r.laneId);
+				if (next === "budget-stop") budgetStop(r.laneId);
+				else w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneReadyBody(r.laneId, w.ledger.now()) });
+				return { code: 0, line: `launched ${r.laneId}` };
+			},
+			notify: (_t, text) => {
+				w.notes.push(text);
+				return true;
+			},
+		});
+		const failures = () => {
+			const now = w.ledger.workload(w.train)!;
+			return trainLaunchFailures({ entries: w.ledger.entries(w.train), instructions: w.ledger.instructions(w.train), questions: w.ledger.questions(w.train), holder: now.holder, holderLeaseUntil: now.holder_lease_until, now: w.ledger.now() });
+		};
+		// the initial pause: the ready lane reaches the day's limit
+		let q = budgetStop(TRAIN_LANE);
+		for (let i = 1; i <= 3; i++) {
+			later(w, 0.1);
+			// Jo's raise of $10: the limit stays under the $400 spent, so the relaunched lane stops at its first meter poll
+			apply(w.ledger, interpret(w.ledger, `raise 10 ${q}`)!);
+			later(w, 0.01);
+			pass();
+			expect(admitted).toHaveLength(i);
+			q = w.ledger.questions(w.train).find((x) => x.state === "open" && x.slice_id.includes("-budget-"))!.id;
+		}
+		expect(refusals).toEqual([]);
+		expect(failures().count).toBe(0);
+		// midnight PDT: the gate reopens, the tick relaunches the train, and the starter's trainGate admits it
+		next = "ready";
+		w.c.at(new Date(nextPdtMidnight(Date.parse(w.c.now())) + 60_000).toISOString());
+		pass();
+		expect(refusals).toEqual([]);
+		expect(admitted).toHaveLength(4);
+		expect(w.ledger.questions(w.train).filter((x) => JSON.stringify(JSON.parse(x.options)) === JSON.stringify(TRAIN_LAUNCH_OPTIONS))).toEqual([]);
+
+		// the limit still holds for genuine failed starts: three launches that never got ready, each finalized by its runner
+		const v = perm();
+		ensureStandingWorkload(v.ledger);
+		v.end("released");
+		for (let i = 1; i <= 3; i++) {
+			// the tick's request, as its relaunch pass writes it, which the reservation consumes
+			v.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: v.train, kind: "assumption", body: launchRequestedBody("merge-train", v.ledger.now()) });
+			const r = laneScript.reserve(v.ledger, v.train, LANE_RUNNER_BY, false, SHOW, () => gone);
+			if (!r.ok) throw new Error(`attempt ${i} refused: ${r.reason}`);
+			v.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: v.train, kind: "assumption", body: launchFailedBody(r.laneId, "startup", "omp exited 1 before ready") });
+			v.ledger.releaseWorkload(v.train, { by: LANE_STARTER_BY, holder: r.laneId });
+			v.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: v.train, kind: "assumption", body: laneExitBody(r.laneId, { code: 1, signal: null, outcome: "never-ready" }) });
+			later(v, 0.1);
+		}
+		v.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: v.train, kind: "assumption", body: launchRequestedBody("merge-train", v.ledger.now()) });
+		expect(laneScript.reserve(v.ledger, v.train, LANE_RUNNER_BY, false, SHOW, () => gone)).toMatchObject({ ok: false, reason: expect.stringMatching(/^not-launchable: train launch limit: 3 consecutive failed launches/) });
+	});
+
+	test("review r1 F4: #101 skipped with its full slice's run live, re-boarded as attempt 2; once the old run is red the next pass cancels the old full slice once, as the merge train, and attempt 2's slices are untouched", () => {
+		const w = perm();
+		const beat = () => Date.parse(w.ledger.now());
+		const slice = (id: string) => w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id, task: `train slice ${id}`, doneCondition: "terminal", inputs: "#101" });
+		const sl1 = trainSliceId(w.train, 101);
+		const full1 = slice(trainFullSliceId(w.train, 101, 1));
+		const oldRun = makeRunId(Date.parse(w.c.now()), "old1");
+		w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: w.train, sliceId: full1, kind: "assumption", body: testRequestedBody({ runId: oldRun, pr: 101, sha: H0, slice: full1, by: TRAIN_LANE }) });
+		const q = w.ledger.raiseQuestion({ by: TRAIN_LANE, workloadId: w.train, sliceId: sl1, body: "#101 production: merge it?", options: ["merged", "skip", "stop"] });
+		// Jo's skip: attempt 1's disposition slice cancelled, its full slice kept open for its live run
+		expect(apply(w.ledger, interpret(w.ledger, `skip ${q}`, beat)!, beat)).toContain(`kept ${full1} open: test run ${oldRun} is live`);
+		expect(w.ledger.slice(sl1)!.state).toBe("cancelled");
+		later(w, 0.01);
+		expect(apply(w.ledger, interpret(w.ledger, `train ${w.train} 101`)!)).toStartWith(`added #101 (attempt 2) to merge train ${w.train}`);
+		expect(trainAttemptsOf(w.ledger, w.train).get(101)?.attempt).toBe(2);
+		const sl2 = slice(trainSliceId(w.train, 101, 2));
+		const full2 = slice(trainFullSliceId(w.train, 101, 1, 2));
+		const curRun = makeRunId(Date.parse(w.c.now()) + 1, "cur1");
+		w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: w.train, sliceId: full2, kind: "assumption", body: testRequestedBody({ runId: curRun, pr: 101, sha: H0, slice: full2, by: TRAIN_LANE }) });
+		// an earlier attempt's full slice with no run at all is left alone, whatever opened it
+		const bare1 = slice(trainFullSliceId(w.train, 101, 2));
+		const states = () => Object.fromEntries([full1, bare1, sl2, full2].map((id) => [id, w.ledger.slice(id)!.state]));
+		const open = { [full1]: "open", [bare1]: "open", [sl2]: "open", [full2]: "open" };
+		const retired = () => w.ledger.entries(w.train).filter((e) => e.created_by === MERGE_TRAIN_BY && e.body.startsWith("retired "));
+		// the old run has no result yet (live): nothing is retired
+		w.pass();
+		expect(states()).toEqual(open);
+		expect(retired()).toEqual([]);
+		// both runs settle red: the old attempt's and the current attempt's
+		later(w, 0.01);
+		for (const [runId, sl] of [[oldRun, full1], [curRun, full2]] as const) {
+			w.ledger.recordEntry({
+				by: TEST_RUNNER_BY, workloadId: w.train, sliceId: sl, kind: "assumption",
+				body: testRunBody({
+					runId, verdict: "red", sha: H0, pr: 101, reason: null, headAtEnd: H0, base: null, mergeBase: null, full: { pass: 1, fail: 1, skip: 0, exit: 1, ms: 1, error: null }, solo: [],
+					failures: [{ part: "full", name: "x.test.ts > broken", firstError: "error: nope" }], runDir: null, preflight: null,
+				}),
+			});
+		}
+		const result = testRuns(w.ledger.entries(w.train)).find((r) => r.request.runId === oldRun)!.result!;
+		w.pass();
+		expect(states()).toEqual({ ...open, [full1]: "cancelled" });
+		expect(w.ledger.slice(full1)!.changed_by).toBe(MERGE_TRAIN_BY);
+		const line = `retired ${full1}: attempt 1 of #101 was superseded by attempt 2, and its test run ${oldRun} settled red (${result.entryId}); cancelled by the merge train`;
+		expect(retired().map((e) => [e.slice_id, e.body])).toEqual([[full1, line]]);
+		// a second pass writes nothing more
+		const rev = w.ledger.slice(full1)!.rev;
+		later(w, 0.01);
+		w.pass();
+		const entries = w.ledger.entries(w.train).length;
+		expect(retireSupersededFullSlices(w.ledger, w.train)).toEqual([]);
+		expect(w.ledger.entries(w.train)).toHaveLength(entries);
+		expect(retired()).toHaveLength(1);
+		expect(w.ledger.slice(full1)!.rev).toBe(rev);
+		expect(states()).toEqual({ ...open, [full1]: "cancelled" });
 	});
 });
