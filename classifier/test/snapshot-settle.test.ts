@@ -26,8 +26,10 @@ const ROWS = {
 };
 const TABLE = tierTableFromConfig({ task: { agentModelOverrides: ROWS } });
 const ALL = Object.values(ROWS).flat();
-const [OPUS, SOL, KIMI] = ROWS.strong as [string, string, string];
+const [OPUS, SOL] = ROWS.strong as [string, string, string];
 const FABLE = ROWS.deep[0]!;
+/** A normal judge review runs on standard (SPEC-2.0.md § B4, amended 2026-11-03): standard's row, its OpenAI entry from strong. */
+const REVIEW_ROW = [SOL, ROWS.standard[2]!];
 
 /** `review…` briefs are judge 0.9; anything else change-large 0.9. */
 function answer(brief: string) {
@@ -229,7 +231,7 @@ async function reviewing() {
 	const h = lane(w);
 	h.laneMessage(OPUS);
 	const spawn = await asyncSpawn(h, w, "c1", "sl-x", "sl-x");
-	expect(spawn?.model).toEqual([SOL, KIMI]);
+	expect(spawn?.model).toEqual(REVIEW_ROW);
 	return { w, h };
 }
 
@@ -257,7 +259,7 @@ describe("a review collected by a job snapshot settles once", () => {
 		const again = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "c2");
 		expect(again?.reason).toBeUndefined();
 		h.asyncReturned("c2", [{ index: 0, id: "sl-x-1", status: "running" }]);
-		expect((await h.spawn("strong", "sl-x-1"))?.reason).toBeUndefined();
+		expect((await h.spawn("standard", "sl-x-1"))?.reason).toBeUndefined();
 		const count = countRounds(w.ledger.entries(w.wl), "sl-x");
 		expect(count.rounds.map(r => [r.n, r.complete])).toEqual([
 			[1, true],
@@ -322,7 +324,7 @@ describe("a review collected by a job snapshot settles once", () => {
 		h.handMessage("sl-x", SOL);
 		expect(h.snapshot("write", { proc: { op: "cancel", jobs: [job("sl-x", "cancelled")], cancelled: [{ id: "sl-x", status: "cancelled" }] } })).toBeUndefined();
 		const [row] = routings(w);
-		expect(routings(w).map(r => [r.agent_id, r.outcome, r.models, r.ran_models])).toEqual([["sl-x", "refused-model-unknown", JSON.stringify([SOL, KIMI]), null]]);
+		expect(routings(w).map(r => [r.agent_id, r.outcome, r.models, r.ran_models])).toEqual([["sl-x", "refused-model-unknown", JSON.stringify(REVIEW_ROW), null]]);
 		expect(bodies(w, "hand-settled:")).toEqual([`hand-settled: ${spawnTokens(w)[0]} routing ${row!.id}`]);
 		expect(bodies(w, "review-round:")).toEqual([expect.stringMatching(/ round 1 .* verdict withheld blocking unknown counts unknown$/)]);
 		const written = w.ledger.entries(w.wl).length;
@@ -397,7 +399,7 @@ describe("review r1 finding 1: an earlier job's snapshot never settles or releas
 		const { w, h } = await h2Pending();
 		expect(h.snapshot("wait", { op: "jobs", jobs: [job("sl-x-2", "completed")] })).toBeUndefined();
 		expect(h.snapshot("read", { proc: { jobs: [job("sl-x-2", "completed")], agents: [], daemons: [] } })).toBeUndefined();
-		expect((await h.spawn("strong", "sl-x-2"))?.model).toEqual([SOL, KIMI]);
+		expect((await h.spawn("standard", "sl-x-2"))?.model).toEqual(REVIEW_ROW);
 		expect(spawnTokens(w)).toHaveLength(2);
 	});
 
@@ -406,13 +408,13 @@ describe("review r1 finding 1: an earlier job's snapshot never settles or releas
 		const out = h.snapshot("read", { proc: { job: job("sl-x-2", "completed"), log: SECRET } }, SECRET);
 		expect(out?.isError).toBe(true);
 		expect(out?.content?.[0]?.text).not.toContain("SECRET-OUTPUT");
-		expect((await h.spawn("strong", "sl-x-2"))?.model).toEqual([SOL, KIMI]);
+		expect((await h.spawn("standard", "sl-x-2"))?.model).toEqual(REVIEW_ROW);
 		expect(spawnTokens(w)).toHaveLength(2);
 	});
 
 	test("H1's `read proc://<id>` does not settle held H2, and its text is withheld", async () => {
 		const { w, h } = await h2Pending();
-		expect((await h.spawn("strong", "sl-x-2"))?.model).toEqual([SOL, KIMI]);
+		expect((await h.spawn("standard", "sl-x-2"))?.model).toEqual(REVIEW_ROW);
 		const h2 = spawnTokens(w)[1]!;
 		h.handMessage("sl-x-2", SOL);
 		const out = h.snapshot("read", { proc: { job: job("sl-x-2", "completed"), log: SECRET } }, SECRET);
@@ -431,7 +433,7 @@ describe("review r1 finding 1: an earlier job's snapshot never settles or releas
 		h.laneMessage(OPUS);
 		const d1 = delivery(["sl-x-2"], "SECRET-OUTPUT of an earlier job", Date.now() - 60_000);
 		expect(h.context(d1)[0]).toContain("refused this async task result");
-		expect((await asyncSpawn(h, w, "c1", "sl-x", "sl-x-2"))?.model).toEqual([SOL, KIMI]);
+		expect((await asyncSpawn(h, w, "c1", "sl-x", "sl-x-2"))?.model).toEqual(REVIEW_ROW);
 		h.handMessage("sl-x-2", SOL);
 		expect(h.snapshot("wait", { op: "wait", jobs: [job("sl-x-2", "completed", { resultText: CLEAN })] })).toBeUndefined();
 		settledOnce(w);
@@ -588,7 +590,7 @@ describe("U2: a spawned review member no recorded process can still run settles 
 		const a = lane(w, o.byB ? { laneId: "lane-b" } : {});
 		a.laneMessage(OPUS);
 		if (o.exit === "before") exit(w);
-		expect((await asyncSpawn(a, w, "c1", "sl-x", "sl-x"))?.model).toEqual([SOL, KIMI]);
+		expect((await asyncSpawn(a, w, "c1", "sl-x", "sl-x"))?.model).toEqual(REVIEW_ROW);
 		a.handMessage("sl-x", SOL);
 		if (o.byB) exit(w, LANE_RUNNER_BY, "lane-b");
 		if (o.exit === "after") exit(w);
@@ -628,7 +630,7 @@ describe("U2: a spawned review member no recorded process can still run settles 
 	/** The lost member's three rows, all by `classifier`: the routing row, `hand-settled:`, `review-round: … failed-dispatch`; no round counted. */
 	function settledLost(w: World, token: string) {
 		const [row] = routings(w);
-		expect(routings(w).map(r => [r.agent_id, r.outcome, r.models, r.created_by])).toEqual([["sl-x", "refused-model-unknown", JSON.stringify([SOL, KIMI]), CLASSIFIER_BY]]);
+		expect(routings(w).map(r => [r.agent_id, r.outcome, r.models, r.created_by])).toEqual([["sl-x", "refused-model-unknown", JSON.stringify(REVIEW_ROW), CLASSIFIER_BY]]);
 		const settles = w.ledger.entries(w.wl).filter(e => /^(hand-settled|review-round):/.test(e.body));
 		expect(settles.map(e => [e.created_by, e.body])).toEqual([
 			[CLASSIFIER_BY, `hand-settled: ${token} routing ${row!.id}`],
@@ -650,9 +652,9 @@ describe("U2: a spawned review member no recorded process can still run settles 
 		expect(next?.reason).toBeUndefined();
 		settledLost(w, token);
 		// Settled, the lost hand's row is no builder: anthropic (the lanes' own lab) is the only one.
-		const spawn = await b.spawn("strong", "sl-x");
+		const spawn = await b.spawn("standard", "sl-x");
 		expect(spawn?.reason).toBeUndefined();
-		expect(spawn?.model).toEqual([SOL, KIMI]);
+		expect(spawn?.model).toEqual(REVIEW_ROW);
 		expect(countRounds(w.ledger.entries(w.wl), "sl-x").rounds.map(r => [r.n, r.complete])).toEqual([[1, false]]);
 	});
 
@@ -687,9 +689,9 @@ describe("U2: a spawned review member no recorded process can still run settles 
 		settledLost(w, token);
 		// A's pid was asked with the start it recorded; B's own was not asked.
 		expect(w.probed).toEqual([`${A_PID} ${START}`]);
-		const spawn = await b.spawn("strong", "sl-x");
+		const spawn = await b.spawn("standard", "sl-x");
 		expect(spawn?.reason).toBeUndefined();
-		expect(spawn?.model).toEqual([SOL, KIMI]);
+		expect(spawn?.model).toEqual(REVIEW_ROW);
 		expect(countRounds(w.ledger.entries(w.wl), "sl-x").rounds.map(r => [r.n, r.complete])).toEqual([[1, false]]);
 	});
 

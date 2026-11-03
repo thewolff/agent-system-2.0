@@ -49,6 +49,12 @@
 #                              (pass/fail/warn/not installed) with its evidence and fix, then a summary; exit 0
 #                              nothing failed, 1 a part failed, 2 a bad argument or the doctor crashed:
 #                              bun surface/scripts/doctor.ts. Run it from your own Terminal, not inside OMP
+#          as2 routing [--since <ISO>] [--until <ISO>] [--split <ISO>] [--workload <wl>] [--ledger <path>] [--json]
+#                              the routing report, read-only (PLAN wl-mv71x5rwdu7eo0 § 2.1): per kind × tier the
+#                              rows, outcomes, models, pull-ups/downs, review vs build, cost per hand (n/a when the
+#                              hand's session file is gone) and headroom skips; first line `<N> rows · jev <J> ·
+#                              change-large <L> of <C> code rows`; exit 2 on a bad argument:
+#                              bun surface/scripts/routing-report.ts
 #          as2 lane <wl>       run workload <wl> by hand as a lane in this terminal (user-driven mode;
 #                              DESIGN-lane-launcher.md decision 14): bun surface/scripts/lane.ts interactive <wl>
 #          as2 lane stop|cleanup|log <wl>
@@ -328,6 +334,10 @@ case "${1-}" in
 	doctor)
 		shift
 		exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/doctor.ts" "$@"
+		;;
+	routing)
+		shift
+		exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/routing-report.ts" "$@"
 		;;
 	--print)
 		shift

@@ -30,7 +30,7 @@ import {
 } from "../../ledger/src/index";
 import { errorLines } from "../../surface/src/errors";
 import { builderLabs, labOf, providerOf, reviewPlan, reviewRow } from "../src/lab";
-import { route } from "../src/route";
+import { reviewRouting, route } from "../src/route";
 import { loadTierTable, type TierTable } from "../src/tier-table";
 
 const REPO = join(import.meta.dir, "..", "..");
@@ -130,8 +130,9 @@ export function replaySnapshot(ledger: Ledger, snapshot: string, now: string, ta
 		// The replay holds no hand in flight, so no review token is live. A dead hand's session file is not part of the
 		// frozen fixture (it lives under $HOME), so the resolver is ledger-only: a dead hand counts nothing (MIGRATION.md item 86).
 		const builders = builderLabs(ledger, id, new Set(), () => []);
-		// The judge kind's tier through the real routing chain, capped by the workload's stakes.
-		const tier = route({ choice: "judge", confidence: 1, probabilities: { judge: 1 } }, stakes).tier;
+		// The judge kind's tier through the real dispatch policy: the routing chain on the workload's stakes, then the
+		// judge review tier (SPEC-2.0.md § B4 "Amended 2026-11-03").
+		const tier = reviewRouting(route({ choice: "judge", confidence: 1, probabilities: { judge: 1 } }, stakes)).tier;
 		// The row a review plans on (Jo's OpenAI-reviewer rule, in-mv5qfm8910ycjk), not the tier row itself.
 		const row = reviewRow(table, tier);
 		// Hypothetical dispatch: every row model usable, no grant, no pin, the workload's own stakes.
@@ -190,7 +191,7 @@ export const RULES = {
 	coverage: "fixture coverage (manifest.json / workloads table)",
 	fixture: "fixture",
 	builders: "D3 builderLabs (classifier/src/lab.ts)",
-	tierRow: "tier row (STAKES_CAP in classifier/src/route.ts, profile/config.yml)",
+	tierRow: "tier row (REVIEW_TIER in classifier/src/route.ts, profile/config.yml)",
 	reviewPlan: "D4–D6 reviewPlan (classifier/src/lab.ts)",
 	needsYou: "§ B3 errorLines (surface/src/errors.ts)",
 } as const;

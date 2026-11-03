@@ -243,19 +243,31 @@ function readComplete(file: string, from: number): { text: string; bytes: number
 	}
 }
 
-function assistantUsage(line: string): { usd: number; tokens: number } {
-	if (!line.includes('"assistant"')) return { usd: 0, tokens: 0 };
+/**
+ * One session-file line's assistant usage, the one per-message parser (`scanSpend` here, the routing
+ * report's per-hand cost in surface/src/routing-report.ts): a `{"type":"message","message":{"role":
+ * "assistant","usage":…}}` line gives its `usage.cost.total` in dollars and `usage.totalTokens`, a
+ * missing or non-numeric field 0; any other line gives 0. `malformed` is true for a line that names
+ * `"assistant"` but is not JSON (a torn or corrupt line): it counts 0. `costMissing` is true for an
+ * assistant message whose `usage.cost.total` is not a finite number (absent, a string, null): its
+ * dollars count 0 here, but they are unknown, not zero; an explicit numeric 0 is a known zero.
+ * `scanSpend` sums `usd` and `tokens` only and accepts both flags; the routing report marks a hand
+ * with either flag (or an unterminated last line) `incomplete`, its cost n/a, never summed as zero.
+ */
+export function assistantUsage(line: string): { usd: number; tokens: number; malformed: boolean; costMissing: boolean } {
+	if (!line.includes('"assistant"')) return { usd: 0, tokens: 0, malformed: false, costMissing: false };
 	let v: unknown;
 	try {
 		v = JSON.parse(line);
 	} catch {
-		return { usd: 0, tokens: 0 };
+		return { usd: 0, tokens: 0, malformed: true, costMissing: false };
 	}
 	const rec = v as { type?: unknown; message?: { role?: unknown; usage?: { totalTokens?: unknown; cost?: { total?: unknown } } } } | null;
-	if (rec === null || typeof rec !== "object" || rec.type !== "message" || rec.message?.role !== "assistant") return { usd: 0, tokens: 0 };
+	if (rec === null || typeof rec !== "object" || rec.type !== "message" || rec.message?.role !== "assistant") return { usd: 0, tokens: 0, malformed: false, costMissing: false };
 	const cost = rec.message.usage?.cost?.total;
 	const total = rec.message.usage?.totalTokens;
-	return { usd: typeof cost === "number" && Number.isFinite(cost) ? cost : 0, tokens: typeof total === "number" && Number.isFinite(total) ? total : 0 };
+	const costKnown = typeof cost === "number" && Number.isFinite(cost);
+	return { usd: costKnown ? cost : 0, tokens: typeof total === "number" && Number.isFinite(total) ? total : 0, malformed: false, costMissing: !costKnown };
 }
 
 /**

@@ -53,6 +53,7 @@ import type { Subprocess } from "bun";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { modelIdentity } from "../../classifier/src/tier-table";
 import { parseHandSpawn, settledTokens } from "../../classifier/src/lab";
 import { type EntryRow, Ledger } from "../../ledger/src/index";
 import { canonicalPath, defaultLedgerPath, homeDir } from "../../ledger/src/locality";
@@ -233,6 +234,30 @@ const oneLine = (s: string, max = 300): string => {
 	const t = s.replace(/\s+/g, " ").trim();
 	return t.length > max ? `${t.slice(0, max - 1)}…` : t;
 };
+
+/**
+ * The model id a probe of `selector` reaches the stub with: the selector's identity without the provider. OMP takes a
+ * `:level` suffix off before the request (classifier/src/tier-table.ts modelIdentity), so the stub counts
+ * `anthropic/claude-opus-5-5:medium` under `claude-opus-5-5`.
+ */
+export const stubModelId = (selector: string): string => {
+	const id = modelIdentity(selector);
+	return id.slice(id.indexOf("/") + 1);
+};
+
+/**
+ * The preflight's model probes in parallel batches of up to `size`, in order. Two selectors of one model (`x` and
+ * `x:medium`) reach the stub under one `stubModelId`, so they never share a batch: each probe's served count is its own.
+ */
+export function probeBatches(models: readonly string[], size = 4): string[][] {
+	const batches: string[][] = [];
+	for (const m of models) {
+		const batch = batches.find((b) => b.length < size && !b.some((o) => stubModelId(o) === stubModelId(m)));
+		if (batch) batch.push(m);
+		else batches.push([m]);
+	}
+	return batches;
+}
 
 /** Every assistant message under `dirs` (session .jsonl files of the scratch run) that carries content but not the nonce. */
 function nonceMisses(dirs: readonly string[], nonce: string): string[] {
@@ -774,9 +799,9 @@ class Run {
 			...Object.values(config.task?.agentModelOverrides ?? {}).flat(),
 		])].sort();
 		const misses: string[] = [];
-		for (let i = 0; i < models.length; i += 4) {
-			await Promise.all(models.slice(i, i + 4).map(async (m) => {
-				const bare = m.slice(m.indexOf("/") + 1);
+		for (const batch of probeBatches(models)) {
+			await Promise.all(batch.map(async (m) => {
+				const bare = stubModelId(m);
 				const before = stub.counts().messages[bare] ?? 0;
 				const r = await this.omp(["--model", m], `${PROBE_MODEL_MARK} ${m}`);
 				const served = (stub.counts().messages[bare] ?? 0) - before;

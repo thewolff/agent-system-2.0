@@ -28,6 +28,8 @@ export type Ctx = GatesCtx & {
 	modelRegistry?: unknown;
 	/** The session's current effective system prompt blocks (ExtensionContext.getSystemPrompt, types.ts:529 on OMP 18.8); at session_start the base prompt the launch built. */
 	getSystemPrompt?(): string[];
+	/** The session's current model, read live (ExtensionContext.model, types.ts:507 on OMP 18.8.6; runner.ts:1379 getter); undefined when none. */
+	model?: { provider: string; id: string };
 };
 type Handler<E, R = unknown> = (event: E, ctx: Ctx) => R | Promise<R>;
 /** A custom message the surface sends or returns; `details` carries the push key the `context` guard reads (surface/extensions/wake.ts). */
@@ -87,6 +89,8 @@ export type SurfaceAPI = GatesAPI<Ctx> & {
 	on(event: "message_end", h: Handler<{ type: "message_end"; message: HostMessage }>): void;
 	/** The messages about to reach the model; a returned `messages` replaces them (types.ts:1220-1222, runner.ts:1935). */
 	on(event: "context", h: Handler<{ type: "context"; messages: HostMessage[] }, { messages?: HostMessage[] } | undefined>): void;
+	/** The session's thinking level, not persisted to settings (ExtensionAPI.setThinkingLevel, types.ts:1627 on OMP 18.8.6; loader.ts:339). Optional: a host without it is logged, never assumed. */
+	setThinkingLevel?(level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"): void;
 	/** OMP 18.3.0: `deliverAs: "aside"` injects at the next step boundary; an idle session starts a turn regardless of `triggerTurn`. */
 	sendMessage?(message: SurfaceMessage, options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" }): void;
 	exec?(command: string, args: string[], options?: { timeout?: number; cwd?: string }): Promise<ExecResult>;

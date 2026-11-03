@@ -30,6 +30,8 @@ const ROWS = {
 const TABLE = tierTableFromConfig({ task: { agentModelOverrides: ROWS } });
 const ALL = Object.values(ROWS).flat();
 const [OPUS, SOL, KIMI] = ROWS.strong as [string, string, string];
+/** A normal judge review runs on standard (SPEC-2.0.md § B4, amended 2026-11-03): standard's row, its OpenAI entry from strong. */
+const [SONNET, , REVIEW_KIMI] = ROWS.standard as [string, string, string];
 const LANE_ID = "lane-hh";
 /** The lane's clock: after Jo's dated Kimi-out and Anthropic-out rules ended, so neither applies. */
 const NOW = Date.parse("2026-11-02T12:00:00-08:00");
@@ -269,7 +271,7 @@ describe("an exhausted Anthropic week moves a build hand to the first usable Ope
 		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-1");
 		expect(out?.block).toBeUndefined();
 		const review = await h.spawn(out!.input!.agent, "sl-x");
-		expect(review?.model).toEqual([KIMI]);
+		expect(review?.model).toEqual([REVIEW_KIMI]);
 
 		// A keyless hand's mark carries its move's event id as its token.
 		const keyless = world(poll([week(1), openaiWeek]));
@@ -413,7 +415,7 @@ describe("no exhausted week, no move (R11)", () => {
 		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-1");
 		expect(out?.block).toBeUndefined();
 		const review = await h.spawn(out!.input!.agent, "sl-x");
-		expect(review?.model).toEqual([SOL, KIMI]);
+		expect(review?.model).toEqual([SOL, REVIEW_KIMI]);
 		expect(review?.note).toContain("review routed off the builder lab anthropic");
 		expect(bodies(w, "hand-headroom:")).toEqual([]);
 		expect(quotaMoves(w.ledger)).toEqual([]);
@@ -424,8 +426,8 @@ describe("no exhausted week, no move (R11)", () => {
 		r.laneMessage(SOL);
 		const rout = await r.toolCall({ agent: "strong", name: "sl-x", task: brief(v, "review the change") }, "rev-1");
 		const other = await r.spawn(rout!.input!.agent, "sl-x");
-		expect(other?.model).toEqual([KIMI]);
-		expect(other?.note).toContain(`skipped ${OPUS} (projected out: anthropic 7d 1.00 used, window pace +`);
+		expect(other?.model).toEqual([REVIEW_KIMI]);
+		expect(other?.note).toContain(`skipped ${SONNET} (projected out: anthropic 7d 1.00 used, window pace +`);
 		expect(quotaMoves(v.ledger)).toEqual([]);
 	});
 });

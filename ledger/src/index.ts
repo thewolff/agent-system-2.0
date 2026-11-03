@@ -958,6 +958,16 @@ export class Ledger {
 			"SELECT * FROM routings WHERE session_root = ? AND agent_id = ? ORDER BY created_at, rowid").all(sessionRoot, agentId);
 	}
 
+	/**
+	 * Routings on every workload, open or closed, oldest first: `since` inclusive and `until` exclusive on
+	 * created_at (ISO strings in the column's own `…T…:…:….sssZ` form compare as text), one workload when
+	 * `workloadId` is given. Read-only; the routing report's reader (surface/src/routing-report.ts).
+	 */
+	routingsIn(range: RowRange = {}): RoutingRow[] {
+		const { where, params } = rangeClause(range);
+		return this.db.query<RoutingRow, string[]>(`SELECT * FROM routings${where} ORDER BY created_at, rowid`).all(...params);
+	}
+
 	// ---- entries ---------------------------------------------------------------------------
 
 	/** A lane-written entry (P-11). Append-only. In the gates' port, `GateLedger` in gates/src/types.ts. */
@@ -981,6 +991,17 @@ export class Ledger {
 	/** One entry by id, on any workload (open or closed), or null. */
 	entry(id: string): EntryRow | null {
 		return this.db.query<EntryRow, [string]>("SELECT * FROM entries WHERE id = ?").get(id);
+	}
+
+	/**
+	 * Entries on every workload, open or closed, whose body starts with `prefix` (compared exactly, no
+	 * pattern characters), oldest first, in `range` as `routingsIn` reads it. Read-only; the routing
+	 * report reads `headroom-skip:` entries with it.
+	 */
+	entriesWithPrefix(prefix: string, range: RowRange = {}): EntryRow[] {
+		if (prefix === "") throw new Error("entriesWithPrefix: an empty prefix would read every entry; name one");
+		const { where, params } = rangeClause(range, ["substr(body, 1, length(?)) = ?"], [prefix, prefix]);
+		return this.db.query<EntryRow, string[]>(`SELECT * FROM entries${where} ORDER BY created_at, rowid`).all(...params);
 	}
 
 	/**
@@ -1227,4 +1248,28 @@ export class Ledger {
 	private expectOne(sql: string, params: (string | number | null)[], what: string): void {
 		if (this.db.query(sql).all(...params).length !== 1) throw new Error(`no ${what}`);
 	}
+}
+
+/** A created_at window and an optional workload, for the cross-workload readers (`routingsIn`, `entriesWithPrefix`). */
+export interface RowRange {
+	/** Inclusive lower bound, an ISO instant in the column's form (`…T…:…:….sssZ`). */
+	since?: string;
+	/** Exclusive upper bound, same form. */
+	until?: string;
+	workloadId?: string;
+}
+
+/** `range` (plus any leading conditions) as a WHERE clause and its positional parameters, in order. */
+function rangeClause(range: RowRange, conds: string[] = [], params: string[] = []): { where: string; params: string[] } {
+	const c = [...conds];
+	const p = [...params];
+	const add = (cond: string, value: string | undefined) => {
+		if (value === undefined) return;
+		c.push(cond);
+		p.push(value);
+	};
+	add("created_at >= ?", range.since);
+	add("created_at < ?", range.until);
+	add("workload_id = ?", range.workloadId);
+	return { where: c.length === 0 ? "" : ` WHERE ${c.join(" AND ")}`, params: p };
 }

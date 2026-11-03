@@ -26,8 +26,10 @@ const ROWS = {
 };
 const TABLE = tierTableFromConfig({ task: { agentModelOverrides: ROWS } });
 const ALL = Object.values(ROWS).flat();
-const [OPUS, SOL, KIMI] = ROWS.strong as [string, string, string];
+const [OPUS, SOL] = ROWS.strong as [string, string, string];
 const [, , K3] = ROWS.deep as [string, string, string];
+/** A normal judge review runs on standard (SPEC-2.0.md § B4, amended 2026-11-03): its Kimi entry is standard's, its OpenAI one strong's. */
+const [, , K25] = ROWS.standard as [string, string, string];
 
 /** `review…` briefs are judge 0.9; anything else change-large 0.9. */
 function answer(brief: string) {
@@ -151,7 +153,8 @@ function lane(w: World): Lane {
 	};
 	return {
 		toolCall: toolCallId => handlers.tool_call!({ type: "tool_call", toolName: "task", toolCallId, input: { agent: "strong", name: "sl-x", task: brief(w) } }, ctx) as Promise<Reply>,
-		spawn: (spawnKey, agent = "strong") => handlers.before_subagent_spawn!({ type: "before_subagent_spawn", agent, invocationKind: "task", patterns: [], spawnKey }, ctx) as Promise<Reply>,
+		// A normal judge review runs on standard (SPEC-2.0.md § B4, amended 2026-11-03).
+		spawn: (spawnKey, agent = "standard") => handlers.before_subagent_spawn!({ type: "before_subagent_spawn", agent, invocationKind: "task", patterns: [], spawnKey }, ctx) as Promise<Reply>,
 		laneMessage: selector => void handlers.message_end!(assistant(selector), ctx),
 		handMessage: (agentId, selector, turn) =>
 			void handSession.message_end!(assistant(selector, turn), { ...ctx, sessionManager: { getSessionFile: () => `${w.root}/${agentId}.jsonl` } }),
@@ -162,7 +165,7 @@ function lane(w: World): Lane {
 			),
 		results: (toolCallId, id, model, output) =>
 			handlers.tool_result!(
-				{ type: "tool_result", toolName: "task", toolCallId, isError: false, input: {}, content: [], details: { results: [{ id, agent: "strong", resolvedModelIdentity: model, output }] } },
+				{ type: "tool_result", toolName: "task", toolCallId, isError: false, input: {}, content: [], details: { results: [{ id, agent: "standard", resolvedModelIdentity: model, output }] } },
 				ctx,
 			) as ToolReply,
 		resultsOf: (toolCallId, results) =>
@@ -205,7 +208,7 @@ describe("defect 1: a commit in another worktree does not withhold a review (T12
 		git(w.repo, "worktree", "add", "-q", join(w.dir, "other"), "-b", "other");
 		const h = lane(w);
 		h.laneMessage(OPUS);
-		expect((await blockingReview(h, "rev-1"))?.model).toEqual([SOL, KIMI]);
+		expect((await blockingReview(h, "rev-1"))?.model).toEqual([SOL, K25]);
 		writeFileSync(join(w.dir, "other", "b.txt"), "elsewhere\n");
 		git(join(w.dir, "other"), "add", "-A");
 		git(join(w.dir, "other"), "commit", "-q", "-m", "work in another lane");
@@ -243,9 +246,9 @@ describe("defect 2: a review hand that dies on a provider error is a failed disp
 		h.laneMessage(OPUS);
 		await blockingReview(h, "rev-1");
 		h.handMessage("sl-x", SOL, { error: 429 });
-		h.handMessage("sl-x", KIMI);
-		expect(h.results("rev-1", "sl-x", KIMI, CLEAN)).toBeUndefined();
-		expect(w.ledger.routings(w.wl).map(r => [r.outcome, r.ran_models])).toEqual([["ran", JSON.stringify([KIMI])]]);
+		h.handMessage("sl-x", K25);
+		expect(h.results("rev-1", "sl-x", K25, CLEAN)).toBeUndefined();
+		expect(w.ledger.routings(w.wl).map(r => [r.outcome, r.ran_models])).toEqual([["ran", JSON.stringify([K25])]]);
 		expect(rounds(w).map(r => r.verdict)).toEqual(["accepted"]);
 		expect(bodies(w, "provider-refused:")).toEqual([]);
 	});
@@ -285,7 +288,7 @@ describe("defect 3: a provider that refused the login is routed around (T14)", (
 	/** A review whose only turn got a 403 from openai-codex; `kimiDown` leaves openai the only non-builder lab. */
 	async function refused(kimiDown: boolean): Promise<{ w: World; h: Lane }> {
 		const w = world();
-		if (kimiDown) w.creds.splice(w.creds.indexOf(KIMI), 1);
+		if (kimiDown) w.creds.splice(w.creds.indexOf(K25), 1);
 		const h = lane(w);
 		h.laneMessage(OPUS);
 		await blockingReview(h, "rev-1");
@@ -297,7 +300,7 @@ describe("defect 3: a provider that refused the login is routed around (T14)", (
 
 	test("the next review routes to a non-builder lab on another provider", async () => {
 		const { h } = await refused(false);
-		expect((await blockingReview(h, "rev-2"))?.model).toEqual([KIMI]);
+		expect((await blockingReview(h, "rev-2"))?.model).toEqual([K25]);
 	});
 
 	test("with that provider's lab the only non-builder lab, the review parks, and the question says why", async () => {
@@ -324,7 +327,7 @@ describe("defect 5: a stale delivery never settles a new hand with the same agen
 	async function spawnH2(h: Lane, call: string): Promise<void> {
 		expect((await h.toolCall(call))?.reason).toBeUndefined();
 		h.asyncReturned(call, "sl-x-2");
-		expect((await h.spawn("sl-x-2"))?.model).toEqual([SOL, KIMI]);
+		expect((await h.spawn("sl-x-2"))?.model).toEqual([SOL, K25]);
 	}
 
 	test("the incident's shape: an earlier job's delivery with no row is withheld as before, and H2 settles once on its own delivery", async () => {

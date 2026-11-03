@@ -415,30 +415,32 @@ export function parkQuestionBody(sliceId: string, builders: Builders, reasons: r
  * OpenAI model, never gpt-6-astra; that entry is gpt-6.1-sol since Jo's in-mv8qzqym1ihmv4
  * (2026-10-14; gpt-6-sol before). Jo chose to build it here, not in the tier table
  * (in-mv5qfm8910ycjk): gpt-6.1-sol is the strong row's OpenAI entry, and `tierTableFromConfig`
- * refuses one model in two tiers (a fallback to it would pull up a tier), so the deep row stays
- * unchanged and non-review deep spawns keep the deep row. Each entry names a lab whose review
- * entries on the deep row come from the named tier's row instead. It holds until the review-cost
- * framework workload lands or Jo says otherwise; ending it is deleting the entry.
+ * refuses one model in two tiers (a fallback to it would pull up a tier), so the other rows stay
+ * unchanged and non-review spawns keep their own tier's row. SPEC-2.0.md § B4 "Amended 2026-11-03"
+ * (PLAN-p2-rev4.md § 2.3, Jo's in-mv71x8ghxo114w): the OpenAI reviewer is that strong-row entry at
+ * every review tier, so a judge review on standard or fast (its new review tiers) or deep keeps it.
+ * Each entry names a lab whose review entries on every other tier's row come from the named tier's
+ * row instead. It holds until the review-cost framework workload lands or Jo says otherwise; ending
+ * it is deleting the entry.
  */
 export const REVIEW_ROW_FROM: Readonly<Partial<Record<Lab, Tier>>> = { openai: "strong" };
 
 /**
- * The row a review dispatch on `tier` plans on. On `deep`: the deep row with every entry of a lab
- * named in `REVIEW_ROW_FROM` replaced, at that lab's first deep entry, by the named tier's entries
- * of the same lab (identities de-duplicated); a lab with none there loses its deep entries and
- * never falls back to them. Other labs' entries stay where they are. Any other tier: its row.
- * With explicit current-lane/time context, the active Anthropic-out rule then keeps only exact
- * openai-codex provider entries. No context preserves the historical row for offline consumers.
+ * The row a review dispatch on `tier` plans on: `tier`'s row with every entry of a lab named in
+ * `REVIEW_ROW_FROM` (for any tier other than the named one) replaced, at that lab's first entry in
+ * the row, by the named tier's entries of the same lab (identities de-duplicated); a lab with none
+ * there loses its entries in this row and never falls back to them. Other labs' entries stay where
+ * they are; on the named tier itself the row is unchanged. With explicit current-lane/time context,
+ * the active Anthropic-out rule then keeps only exact openai-codex provider entries. No context
+ * preserves the historical row for offline consumers.
  */
 export function reviewRow(table: TierTable, tier: Tier, context?: ReviewContext): string[] {
-	const row = table[tier];
-	if (tier !== "deep") return anthropicOutRuleActive(context) ? row.filter(s => providerOf(s) === "openai-codex") : [...row];
 	const out: string[] = [];
 	const replaced = new Set<Lab>();
-	for (const selector of row) {
+	for (const selector of table[tier]) {
 		const lab = labOf(selector);
 		const from = lab === null ? undefined : REVIEW_ROW_FROM[lab];
-		if (lab === null || from === undefined) {
+		if (lab === null || from === undefined || from === tier) {
 			out.push(selector);
 			continue;
 		}

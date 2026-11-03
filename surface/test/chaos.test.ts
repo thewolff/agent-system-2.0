@@ -12,7 +12,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync
 import { dirname, join } from "node:path";
 import { handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
-import { INSTALL_DOCTOR_FAILED, installOutcome } from "../scripts/chaos";
+import { INSTALL_DOCTOR_FAILED, installOutcome, probeBatches, stubModelId } from "../scripts/chaos";
 import { isRunnerCommand } from "../scripts/lane";
 import {
 	copyIntoScratch, daysSinceEpoch, END_RECEIPT_SKEW_MS, emptySeen, type Evidence, type EvidenceItem, FAULT_EVIDENCE, FAULTS, type FaultName, firstHolder, HarnessError, ISOLATION_LIMIT,
@@ -901,5 +901,20 @@ describe("setup's install.sh result (code review r4 F13)", () => {
 	});
 	test("a timed-out run never counts as exit 5", () => {
 		expect(() => installOutcome({ code: 5, timedOut: true, err: "" }, LOG)).toThrow(/timed out/);
+	});
+});
+
+describe("preflight model probes count by identity (PLAN-p2 rev 4 § 2.3, strong row `anthropic/claude-opus-5-5:medium`)", () => {
+	test("a `:level` selector is counted under the id the stub sees, the suffix dropped", () => {
+		expect(stubModelId("anthropic/claude-opus-5-5:medium")).toBe("claude-opus-5-5");
+		expect(stubModelId("anthropic/claude-opus-5-5")).toBe("claude-opus-5-5");
+		expect(stubModelId("openai-codex/gpt-6.1-sol")).toBe("gpt-6.1-sol");
+	});
+	test("two selectors of one model never share a batch; the rest pack four to a batch in order", () => {
+		const models = ["anthropic/claude-fable-5-1", "anthropic/claude-haiku-5-5", "anthropic/claude-opus-5-5", "anthropic/claude-opus-5-5:medium", "anthropic/claude-sonnet-5-5", "openai-codex/gpt-6.1-sol"];
+		expect(probeBatches(models)).toEqual([
+			["anthropic/claude-fable-5-1", "anthropic/claude-haiku-5-5", "anthropic/claude-opus-5-5", "anthropic/claude-sonnet-5-5"],
+			["anthropic/claude-opus-5-5:medium", "openai-codex/gpt-6.1-sol"],
+		]);
 	});
 });

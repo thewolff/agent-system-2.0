@@ -32,6 +32,23 @@ export const STAKES_CAP: Readonly<Record<Stakes, Tier>> = {
 	production: "deep",
 };
 
+// SPEC-2.0.md § B4 "Amended 2026-11-03 — normal judge reviews on standard": the tier a judge-kind
+// dispatch runs on, by its stakes. Overrides the stakes cap for judge kind only; every other kind
+// keeps STAKES_CAP.
+export const REVIEW_TIER: Readonly<Record<Stakes, Tier>> = {
+	throwaway: "fast",
+	normal: "standard",
+	production: "deep",
+};
+
+/**
+ * The judge-kind review tier for `stakes`; `null` stakes (missing or unreadable) names none, so the
+ * dispatch keeps what `route` gave it: no cap, judge on deep.
+ */
+export function reviewTier(stakes: Stakes | null): Tier | null {
+	return stakes === null ? null : REVIEW_TIER[stakes];
+}
+
 // SPEC-2.0.md § A1.3 "Measured 2026-09-23": threshold 0.55. Flagged means at or below it (ruled
 // 2026-09-29 after the M3 gate run: a brief answered at exactly 0.55 was under-served in one of two
 // live draws; the sweeps in research/classifier-sample.md were computed strictly-below).
@@ -142,4 +159,22 @@ export function route(answer: KindAnswer, stakes: Stakes | null): Routing {
 		pullDown,
 		tier,
 	};
+}
+
+/**
+ * SPEC-2.0.md § B4 "Amended 2026-11-03": a review dispatch's routing under the final dispatch
+ * policy. Only judge kind moves, to `reviewTier(stakes)`, recorded as the pull-down (from the tier
+ * before any cap, so `routings.pull_down_to` names the review tier). Any other kind, a low-confidence
+ * review pulled up because judge is in its top two included, keeps `route`'s answer; so does `null`
+ * stakes. `routing` is `route`'s output on the review's effective stakes.
+ */
+export function reviewRouting(routing: Routing): Routing {
+	if (routing.kind !== "judge") return routing;
+	const tier = reviewTier(routing.stakes);
+	if (tier === null || tier === routing.tier) return routing;
+	// REVIEW_TIER sits at or below STAKES_CAP for every stakes, so the review tier never pulls a judge up.
+	if (tierRank(tier) > tierRank(routing.tier)) {
+		throw new Error(`review tier ${tier} for stakes ${routing.stakes} is above the routed tier ${routing.tier}; REVIEW_TIER in classifier/src/route.ts must not exceed STAKES_CAP`);
+	}
+	return { ...routing, pullDown: { from: routing.pullDown?.from ?? routing.tier, to: tier }, tier };
 }
