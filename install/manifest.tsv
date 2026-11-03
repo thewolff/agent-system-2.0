@@ -90,6 +90,7 @@ classifier/test/snapshot-settle.test.ts	test	-
 classifier/test/route.test.ts	test	-
 classifier/test/tier-files.test.ts	test	-
 classifier/test/tier-table.test.ts	test	-
+classifier/test/zai-balance.test.ts	test	-
 gates/extensions/question.ts	extension	-
 gates/extensions/r01-turn-shape.ts	extension	-
 gates/extensions/r02-contract.ts	extension	-

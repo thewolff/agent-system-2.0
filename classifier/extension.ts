@@ -190,12 +190,12 @@ import {
 	handSpawnBody,
 	handSpawns,
 	isKimiQuotaRefusal,
+	isZaiBalanceEmpty,
 	isReviewDispatch,
 	KIMI_OUT_RULE,
 	kimiOutRuleActive,
 	type Lab,
 	labOf,
-	LABS,
 	laneBuilderBody,
 	openParkQuestion,
 	PARK_OPTIONS,
@@ -207,7 +207,9 @@ import {
 	type ReviewContext,
 	type ReviewPlanInput,
 	reviewPlan,
+	REVIEW_ONLY_LABS,
 	REVIEW_ROW_FROM,
+	REVIEW_ROW_FROM_SOURCE,
 	reviewRow,
 	reviewSameLabBody,
 	reviewSameLabRuleBody,
@@ -218,6 +220,10 @@ import {
 	tokenOfRouting,
 	unspentGrant,
 	withheldTokens,
+	zaiBalanceBody,
+	zaiBalanceNoticeBody,
+	zaiBalanceReason,
+	zaiBalanceTokens,
 } from "./src/lab";
 import type { RoutingLedger } from "./src/ledger-port";
 import {
@@ -238,6 +244,9 @@ import {
 	panelLegBody,
 	type Manifest,
 	type PanelLedger,
+	PANEL_LABS,
+	isPanelLab,
+	type PanelLab,
 	type PanelMode,
 	type PanelRole,
 	panelSynthBody,
@@ -596,7 +605,8 @@ function reviewRowNotes(table: TierTable, tier: Tier, pin: Lab | null, context?:
 		if (pin !== null && pin !== lab) return [];
 		const of = (r: readonly string[]) => r.filter(s => labOf(s) === lab).join(",");
 		if (of(row) === of(table[tier])) return [];
-		return [of(row) ? `${lab} reviewer from the ${from} row (Jo, in-mv5qfm8910ycjk)` : `no ${lab} reviewer: the ${from} row has no ${lab} entry and a review never falls back to the ${tier} row's (Jo, in-mv5qfm8910ycjk)`];
+		const source = REVIEW_ROW_FROM_SOURCE[lab] ?? "REVIEW_ROW_FROM";
+		return [of(row) ? `${lab} reviewer from the ${from} row (${source})` : `no ${lab} reviewer: the ${from} row has no ${lab} entry and a review never falls back to the ${tier} row's (${source})`];
 	});
 }
 
@@ -768,11 +778,11 @@ type PanelPlan =
 			run: string;
 			pg: string;
 			pdir: string;
-			members: Lab[];
-			missing: { lab: Lab; reason: string }[];
-			ingested: { inputs: Record<string, string>; mode: PanelMode; schema: unknown; tasks: Record<Lab, string> } | null;
+			members: PanelLab[];
+			missing: { lab: PanelLab; reason: string }[];
+			ingested: { inputs: Record<string, string>; mode: PanelMode; schema: unknown; tasks: Record<PanelLab, string> } | null;
 	  }
-	| { kind: "panel-synth"; run: string; pg: string; pdir: string; lab: Lab; builderLab: boolean; task: string; schema: unknown };
+	| { kind: "panel-synth"; run: string; pg: string; pdir: string; lab: PanelLab; builderLab: boolean; task: string; schema: unknown };
 
 /** D5 [R6]: a review's effective stakes, the higher of the brief's and the workload row's. */
 function effectiveStakes(brief: Stakes | null, workload: Stakes | null): Stakes | null {
@@ -1334,7 +1344,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * (another round passed since it was published, REVIEW-r4) closes out with no question (`park`).
 	 * So does a group whose spawned members all failed to dispatch (`review-round: … failed-dispatch`,
 	 * PLAN wl-muq13bkdghblmo step 8; review r1 finding 3): it is no round (`countRounds`), and like a
-	 * single failed dispatch the review is dispatched again. So does a group whose Kimi is out under
+	 * single failed dispatch the review is dispatched again, unless a member's token has a `zai-balance:`
+	 * entry (PLAN wl-mw148irbq33zt5 D4): a re-dispatch would plan Z.ai again, so that group parks with the
+	 * balance reason (a loop Jo stopped takes no question). So does a group whose Kimi is out under
 	 * Jo's rule: no question and nothing written; the re-dispatch's spawn decides. When R1–R3 and (i)
 	 * hold (`kimiOutAtGroupEnd`, from the ledger), (ii) awaits `usableRow` on the review row's kimi
 	 * entries with the live registry and disabled providers of the latest session context this process
@@ -1371,7 +1383,19 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			);
 			if (members.length > 0 && members.every(m => failed.has(m.token))) {
 				fanOuts.delete(group);
-				log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId}: every spawned member failed to dispatch, so it is no round and nothing parks; the review is dispatched again`);
+				const balance = zaiBalanceTokens(entries);
+				if (!members.some(m => balance.has(m.token))) {
+					log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId}: every spawned member failed to dispatch, so it is no round and nothing parks; the review is dispatched again`);
+					return;
+				}
+				const why = `production review fan-out ${group} of ${sliceId}: every spawned member failed to dispatch and Z.ai's balance is empty (zai-balance:), so a re-dispatch would plan Z.ai again`;
+				const stop = loopStop(entries, ledger.instructions(workloadId), workloadId, sliceId);
+				if (stop) {
+					log(`agent-system-2 classifier: ${why}; the loop is stopped by ${stop}, so no park question`);
+					return;
+				}
+				const spent = members.map(m => (balance.has(m.token) ? zaiBalanceReason(balance.get(m.token)!) : `${m.spawnKey ?? m.token} failed to dispatch`));
+				log(`agent-system-2 classifier: ${why}; ${parkedLine(sliceId, park(workloadId, sliceId, spent, fan ? fan.loop : groupLoop(entries, sliceId, group)))}`);
 				return;
 			}
 			const reasons: string[] = [];
@@ -1791,7 +1815,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	): void {
 		const ledger = deps.ledger();
 		const state = panelGroups(ledger.entries(workloadId)).get(spawn.group);
-		const lab = state ? (roleOf(state, spawn.token)?.lab ?? labOf(spawn.row[0] ?? "")) : null;
+		const found = state ? (roleOf(state, spawn.token)?.lab ?? labOf(spawn.row[0] ?? "")) : null;
+		// A panel hand only ever spawns on a panel lab (PANEL_LABS); a row naming another is not this panel's.
+		const lab = isPanelLab(found) ? found : null;
 		if (!state || !lab) return;
 		const panel: PanelRole = roleOf(state, spawn.token) ?? { group: spawn.group, pdir: state.group.pdir, lab, role: "synth" };
 		if (panel.role === "leg" ? state.legs.has(lab) : state.synths.get(spawn.token)?.end) return; // already judged
@@ -1836,7 +1862,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		}
 		if (runs.has(run)) return `the panel run ${run} is named twice in this call`;
 		runs.add(run);
-		const names = field.field === "panel" ? LABS.map(lab => `${c.sliceId}--${lab}`) : [`${c.sliceId}--synth`];
+		const names = field.field === "panel" ? PANEL_LABS.map(lab => `${c.sliceId}--${lab}`) : [`${c.sliceId}--synth`];
 		for (const name of names) {
 			if (!OMP_AGENT_ID.test(name)) return `\`${c.sliceId}\` is too long for its panel hand name \`${name}\` (at most 48 characters, an OMP agent id); use a shorter slice id`;
 			const conflict = spawnKeyConflict(name, waiting(), "pending ");
@@ -1863,7 +1889,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			if (existing) return `the panel run ${run} was already dispatched as ${existing.pg}; prepare a new run (one group per run)`;
 			const held = panelDispatchHeld(entries, ledger.instructions(c.workloadId), ledger.workload(c.workloadId)?.stakes ?? "normal", c.workloadId, c.sliceId);
 			if (held) return held;
-			const pins = LABS.map(lab => ({ lab, ...panelPin({ row, usable, lab, skipped: why }) }));
+			const pins = PANEL_LABS.map(lab => ({ lab, ...panelPin({ row, usable, lab, skipped: why }) }));
 			const members = pins.filter(p => p.models.length > 0).map(p => p.lab);
 			if (members.length === 0) return `no lab can run a panel member now (${pins.flatMap(p => p.reasons).join(", ")}); dispatch the panel again later`;
 			const pg = newToken("pg");
@@ -1889,7 +1915,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		} catch (error) {
 			return `panel ${state.pg} is void (${voidRun(ledger, at, state.pg, message(error))}); run a new panel`;
 		}
-		const pick = synthLab({ row, usable, builders: buildersOf(c.workloadId), skipped: why });
+		const pick = synthLab({ row, usable, builders: buildersOf(c.workloadId), labs: PANEL_LABS, skipped: why });
 		if ("reasons" in pick) return `no lab can run panel ${state.pg}'s synthesis now (${pick.reasons.join(", ")}); dispatch it again later`;
 		const task = synthTask(withoutPanelLines(c.item.task ?? ""), state.group.pdir, manifest, landedLabs(state), pick.lab, pick.builderLab);
 		return { kind: "panel-synth", run, pg: state.pg, pdir: state.group.pdir, lab: pick.lab, builderLab: pick.builderLab, task, schema };
@@ -1901,8 +1927,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		const manifest = ingested.manifest;
 		const schema: unknown = JSON.parse(readNoFollow(join(plan.pdir, "in", manifest.legSchema)).toString("utf8"));
 		const text = withoutPanelLines(c.item.task ?? "");
-		const tasks = { anthropic: "", openai: "", kimi: "" };
-		for (const lab of LABS) tasks[lab] = memberTask(text, plan.pdir, manifest, lab);
+		const tasks: Record<PanelLab, string> = { anthropic: "", openai: "", kimi: "" };
+		for (const lab of PANEL_LABS) tasks[lab] = memberTask(text, plan.pdir, manifest, lab);
 		plan.ingested = { inputs: ingested.inputs, mode: manifest.mode, schema, tasks };
 	}
 
@@ -1919,7 +1945,12 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * `failed-dispatch` (no round), no fingerprint check and no builder mark, no park; a 401 / 403 also
 	 * writes `provider-refused:` (step 9), and so does a kimi-lab provider's quota or suspension 429
 	 * while Jo's Kimi-out rule is active (PLAN wl-mv5xay6bjp0268 § 2.4; a login refusal of the same
-	 * provider wins). A review hand's `review-round:` (D9) lands in the
+	 * provider wins). A review hand any of whose failed turns hit an empty Z.ai balance
+	 * (`isZaiBalanceEmpty`, PLAN wl-mw148irbq33zt5 D4) gets one `zai-balance:` entry in the same
+	 * transaction; a single review hand that is a failed dispatch then parks with the balance reason
+	 * instead of being dispatched again, and one another model answered keeps its review and, when the
+	 * entry is the workload's first, sends one notice to the orchestrator (in a savepoint whose failure
+	 * is logged and never withholds the review). A review hand's `review-round:` (D9) lands in the
 	 * same transaction, with the findings parsed from `delivered` (what reached the lane for it).
 	 */
 	function settle(hand: Hand, agentId: string, reported: string | null, log: (line: string) => void, delivered: string | null): Verdict {
@@ -1954,6 +1985,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		const providerRefused = new Map(
 			[...errors.filter(e => isKimiQuotaRefusal(e.provider, e.status, e.error, now)), ...errors.filter(e => e.status === 401 || e.status === 403)].map(e => [e.provider, e.status!] as const),
 		);
+		const balance = hand.review ? errors.find(e => isZaiBalanceEmpty(e.provider, e.status, e.error)) : undefined;
+		let noticeFailed = null as string | null;
 		// A panel hand is judged before the transaction (its session audited, its result file read, its
 		// inputs re-hashed); its line lands in the transaction with its routing row.
 		const panelWithheld = failedDispatch
@@ -1972,6 +2005,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			const ledger = deps.ledger();
 			const entry = (body: string) => ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body });
 			ledger.write(() => {
+				noticeFailed = null; // a busy-retried transaction runs this body again
 				const routingId = recordRouting(hand, hand.models, outcome, ran.length > 0 ? ran : null, agentId);
 				if (changed) {
 					entry(reviewWithheldBody(hand.token));
@@ -1980,6 +2014,18 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					for (const model of new Map(models.map(m => [labOf(m) ?? m, m])).values()) entry(handBuilderBody(labOf(model), hand.token, model));
 				}
 				if (failedDispatch) for (const [provider, status] of providerRefused) entry(providerRefusedBody(provider, status, hand.token));
+				if (balance) {
+					const first = zaiBalanceTokens(ledger.entries(hand.workloadId)).size === 0;
+					entry(zaiBalanceBody(hand.token, balance.model));
+					if (first && !failedDispatch) {
+						try {
+							const body = `${NOTICE_PREFIX} ${zaiBalanceNoticeBody(hand.workloadId, hand.sliceId, ran)}`;
+							ledger.write(() => ledger.enqueue({ by: CLASSIFIER_BY, workloadId: hand.workloadId, sliceId: hand.sliceId, sender: CLASSIFIER_BY, recipient: ORCHESTRATOR_RECIPIENT, body }));
+						} catch (error) {
+							noticeFailed = message(error);
+						}
+					}
+				}
 				entry(handSettledBody(hand.token, routingId));
 				if (hand.panel) late = writePanelEnd(ledger, hand, hand.panel, end!);
 				else if (hand.review) writeRound(ledger, hand, roundVerdict, findings);
@@ -1991,22 +2037,32 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			if (hand.panel) panelEnded(hand, hand.panel, "routing-unwritten", log);
 			else if (hand.review) recordRound(hand, failedDispatch ? "failed-dispatch" : "withheld", findings, log); // its round still ends
 		}
+		if (noticeFailed !== null) {
+			log(`agent-system-2 classifier: the Z.ai balance notice for ${hand.sliceId}'s review (${hand.token}, zai-balance: written) could not be sent to the orchestrator (${noticeFailed}); the review stands`);
+		}
 		if (hand.panel) {
 			if (written) refusal = panelSettled(hand, hand.panel, end!, late, refusal, agentId, log);
 		} else if (hand.review && hand.group.startsWith("fg-")) {
 			memberEnded(hand, `${agentId} ${failedDispatch ? "failed to dispatch" : refusal ? "withheld" : "accepted"}`, true, log, null);
 		} else if (hand.review) {
-			if (outcome === "refused-model-unknown" && !failedDispatch) {
-				// D6 runtime outage: no model answered on a single review hand (e.g. every allowed entry failed).
-				// A loop Jo stopped (D10) takes no park question. A failed dispatch is no round: the review is
-				// dispatched again, routed off a provider that refused (step 9; a kimi quota 429 under Jo's
-				// Kimi-out rule). Silence is not Kimi-specific, so this park asks even under that rule.
+			// D6 runtime outage: no model answered on a single review hand (e.g. every allowed entry failed).
+			// A loop Jo stopped (D10) takes no park question. A failed dispatch is no round: the review is
+			// dispatched again, routed off a provider that refused (step 9; a kimi quota 429 under Jo's
+			// Kimi-out rule), unless the Z.ai balance is empty (PLAN wl-mw148irbq33zt5 D4): a re-dispatch
+			// would plan Z.ai again, so it parks with the balance reason. Silence is not Kimi-specific, so
+			// the outage park asks even under that rule.
+			const parkWhy = failedDispatch
+				? balance
+					? zaiBalanceReason(balance.model)
+					: null
+				: outcome === "refused-model-unknown"
+					? `the review hand ${agentId} ended with no model answering on ${hand.models.join(", ")}`
+					: null;
+			if (parkWhy !== null) {
 				try {
 					const ledger = deps.ledger();
 					const stop = loopStop(ledger.entries(hand.workloadId), ledger.instructions(hand.workloadId), hand.workloadId, hand.sliceId);
-					if (!stop) {
-						refusal = `${refusal}; ${parkedLine(hand.sliceId, park(hand.workloadId, hand.sliceId, [`the review hand ${agentId} ended with no model answering on ${hand.models.join(", ")}`], hand.loop))}`;
-					}
+					if (!stop) refusal = `${refusal}; ${parkedLine(hand.sliceId, park(hand.workloadId, hand.sliceId, [parkWhy], hand.loop))}`;
 				} catch (error) {
 					refusal = `${refusal}; the review could not be parked (${message(error)})`;
 				}
@@ -2622,7 +2678,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						const base = { toolCallId: event.toolCallId, sliceId: c.sliceId, workloadId: c.workloadId, routing: c.routing, review: c.review, loop, dispatchedAt: Date.now(), panel: null };
 						if (typeof plan === "object" && plan.kind === "panel") {
 							const ingested = plan.ingested!;
-							const members: Record<Lab, string | null> = { anthropic: null, openai: null, kimi: null };
+							const members: Record<PanelLab, string | null> = { anthropic: null, openai: null, kimi: null };
 							for (const lab of plan.members) {
 								const token = newToken("dt");
 								members[lab] = token;
@@ -2873,7 +2929,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				/**
 				 * PLAN wl-mvwk0v0gmp6cjc D6 (Jo, in-mvwl9tkmsym86o, amending in-mv7hm58386f2o0 for this case): a build hand with no
 				 * usable lane-lab entry, one of them out on an exhausted week, moves to the first entry of its tier row on another
-				 * (known) lab, in row order, that `usableRow` admits (the same checks: enabled, credentials, not refused, not out).
+				 * (known) lab that builds (not `REVIEW_ONLY_LABS`), in row order, that `usableRow` admits (the same checks: enabled,
+				 * credentials, not refused, not out).
 				 * Null, with today's refusal, when no week is exhausted, no other-lab entry is usable, or an unclassified hand's
 				 * session is bound to no workload (the move could not be recorded). A hand whose lane already moved plans on the
 				 * lane's new lab and never reaches here.
@@ -2887,9 +2944,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						log(`agent-system-2 classifier: unclassified hand ${spawnKey ?? "(no spawn key)"} not moved off ${from} (${reason}): this session is bound to no workload, so the move could not be recorded; refused as before`);
 						return null;
 					}
+					// A reviews-only lab's entries are never a build hand's target (PLAN wl-mw148irbq33zt5 D3).
 					const others = table[tier].filter(s => {
 						const other = labOf(s);
-						return other !== null && other !== lab;
+						return other !== null && other !== lab && !REVIEW_ONLY_LABS.has(other);
 					});
 					// An unclassified spawn plans its lane-lab row with no workload's refusals (above); its move is recorded on the
 					// bound workload, so the target is checked against that workload's refusals as a classified spawn's is.

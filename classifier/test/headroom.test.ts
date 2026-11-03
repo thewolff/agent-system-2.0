@@ -393,8 +393,22 @@ describe("mature week-only comparison", () => {
 	});
 
 	test("unknown source lab cannot receive the exception", () => {
-		const h = comparison([week(0.20, "zai"), claude(0.04)], [week(0.21, "zai"), claude(0.18)]);
-		expectRefused(h, [OPUS], "zai/glm-5");
+		const h = comparison([week(0.20, "mystery"), claude(0.04)], [week(0.21, "mystery"), claude(0.18)]);
+		expectRefused(h, [OPUS], "mystery/model-5");
+	});
+
+	test("R6: a reviews-only lab (zai) is never the comparator, however fast its meter burns (PLAN wl-mw148irbq33zt5 D3)", () => {
+		const GLM = "zai/glm-5.3";
+		const zai = (used: number) => lim("zai", "5h", used, 200);
+		// zai burns faster than the source; Claude burns slower: without the skip zai would retain the source.
+		const h = comparison([week(0.20), claude(0.04), zai(0.04)], [week(0.21), claude(0.045), zai(0.5)]);
+		expectRefused(h, [GLM]);
+		expectRefused(h, [GLM, OPUS]);
+		// zai skipped, the next other lab decides: a faster Claude retains, named in the reason.
+		const faster = comparison([week(0.20), claude(0.04), zai(0.04)], [week(0.21), claude(0.18), zai(0.5)]);
+		const retained = faster.decisionFor(SOL, [GLM, OPUS]).retained;
+		expect(retained).toContain(OPUS);
+		expect(retained).not.toContain(GLM);
 	});
 
 	test("only configured comparators count, not fast providers that appear solely in polls", () => {

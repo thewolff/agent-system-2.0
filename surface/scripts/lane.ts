@@ -56,6 +56,7 @@ import { type Subprocess, spawn, spawnSync } from "bun";
 import { appendFileSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { headroom } from "../../classifier/src/headroom";
+import { isReviewOnly } from "../../classifier/src/lab";
 import { countRounds, parseReviewRound } from "../../classifier/src/rounds";
 import { loadTierTable, modelIdentity } from "../../classifier/src/tier-table";
 import { fenceTargets } from "../../gates/src/fence";
@@ -2308,7 +2309,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		};
 		/**
 		 * An unnamed lane whose first get_state model `from` remains out (`reason`) after budget comparison moves, before its
-		 * first prompt, to the first base-in-quota entry of the installed strong row (`:level` dropped), in row order.
+		 * first prompt, to the first base-in-quota entry of the installed strong row (`:level` dropped), in row order,
+		 * skipping a reviews-only lab's entries (`REVIEW_ONLY_LABS`, PLAN wl-mw148irbq33zt5 D3: a lane builds).
 		 * Destination decisions never use comparators: retention protects the source, not another out destination.
 		 * `set_model`, then a get_state must report it. An unreadable tier table or every entry out is never-ready at `headroom`.
 		 */
@@ -2317,9 +2319,10 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				failModel(`${from} is out (${reason}); the strong row could not be read: ${strongRowFailure}`, HEADROOM_STAGE);
 				return;
 			}
-			const to = strongRow.find((s) => room.decisionFor(s).out === null);
+			const targets = strongRow.filter((s) => !isReviewOnly(s));
+			const to = targets.find((s) => room.decisionFor(s).out === null);
 			if (to === undefined) {
-				failModel(`${from} is out (${reason}); every strong-row entry is out: ${strongRow.map((s) => `${s} (${room.decisionFor(s).out})`).join("; ")}`, HEADROOM_STAGE);
+				failModel(`${from} is out (${reason}); every strong-row entry a lane can run on is out: ${targets.map((s) => `${s} (${room.decisionFor(s).out})`).join("; ")}`, HEADROOM_STAGE);
 				return;
 			}
 			move = { from, to, reason };

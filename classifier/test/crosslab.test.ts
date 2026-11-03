@@ -17,7 +17,7 @@ import { LANE_RUNNER_BY, Ledger, type Stakes } from "../../ledger/src/index";
 import { createClassifierExtension, REVIEW_FINDINGS_PARAGRAPH } from "../extension";
 import { loadCalibration } from "../src/classify";
 import { reviewStopBody, stopReviewsInstructionBody } from "../src/review-stop";
-import { handSpawnBody } from "../src/lab";
+import { builderLabs, handSpawnBody, isReviewRouting, labOf } from "../src/lab";
 import { countRounds, parseReviewRound, reviewRoundsBody, reviewRoundsExtendBody, roundsInstructionBody } from "../src/rounds";
 import { tierTableFromConfig, type TierTable } from "../src/tier-table";
 import { JO_HOLDER } from "../../surface/src/launch";
@@ -822,6 +822,52 @@ function stopReviews(w: World, target: string): string {
 
 const rounds = (w: World) => bodies(w, "review-round:").map(b => parseReviewRound(b)!);
 const messages = (w: World) => w.ledger.db.query<{ recipient: string; body: string }, [string]>("SELECT recipient, body FROM messages WHERE workload_id = ? ORDER BY created_at, rowid").all(w.wl);
+
+describe("Z.ai GLM reviewer (PLAN wl-mw148irbq33zt5 D2, R3)", () => {
+	const GLM = "zai/glm-5.3";
+	// The profile's shape: zai second in fast, standard and strong, before openai-codex; deep has no zai entry.
+	const ZROWS = {
+		fast: [ROWS.fast[0]!, "zai/glm-5.3-flash", ROWS.fast[1]!, ROWS.fast[2]!],
+		standard: [ROWS.standard[0]!, "zai/glm-5.3-flashx", ROWS.standard[1]!, ROWS.standard[2]!],
+		strong: [OPUS, GLM, SOL, KIMI],
+		deep: ROWS.deep,
+	};
+	const GLMS = Object.values(ZROWS).flat().filter(s => s.startsWith("zai/"));
+	/** A normal-stakes workload on the zai rows whose registry offers and credentials every model. */
+	const zworld = () => {
+		const v = world({ table: tierTableFromConfig({ task: { agentModelOverrides: ZROWS } }) });
+		up(v, ...GLMS);
+		return { ...v, registry: fakeRegistry([...ALL, ...GLMS], v.creds) };
+	};
+
+	test("a normal-stakes review of Anthropic-built work plans zai/glm-5.3 first, OpenAI as the in-hand fallback", async () => {
+		const w = zworld();
+		const h = lane(w);
+		h.laneMessage(OPUS);
+		const spawn = await reviewSpawn(h, w);
+		expect(spawn?.model).toEqual([GLM, SOL, KIMI]);
+		expect(bodies(w, "hand-spawn:")).toEqual([expect.stringContaining(` review yes `)]);
+		expect(parseHandSpawnRow(w)).toEqual([GLM, SOL, KIMI]);
+	});
+
+	test("a review that answered on zai/glm-5.3 settles ran, is accepted as a round, and zai never becomes a builder", async () => {
+		const w = zworld();
+		const h = lane(w);
+		h.laneMessage(OPUS);
+		expect(await reviewRound(h, w, "rev-1", CLEAN, { model: GLM })).toBeUndefined();
+		const [row] = w.ledger.routings(w.wl);
+		expect(row).toMatchObject({ slice_id: "sl-x", kind: "judge", outcome: "ran", ran_models: JSON.stringify([GLM]) });
+		expect(isReviewRouting(row!)).toBe(true);
+		expect(labOf(GLM)).toBe("zai");
+		// Another lab: the settled review's lab is not among the builders.
+		expect(builderLabs(w.ledger, w.wl)).toEqual({ labs: ["anthropic"], unknown: [] });
+		expect(rounds(w)).toMatchObject([{ slice: "sl-x", round: 1, verdict: "accepted" }]);
+		expect(bodies(w, "review-withheld:")).toEqual([]);
+	});
+});
+
+/** The row of the one `hand-spawn:` entry. */
+const parseHandSpawnRow = (w: World) => bodies(w, "hand-spawn:")[0]!.replace(/^.* row /, "").split(",");
 
 describe("Round limit (D9), wired", () => {
 	test("every review item's brief gains the findings paragraph, each fan-out member's too, and a change item's does not", async () => {

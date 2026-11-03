@@ -40,7 +40,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import type { EntryRow, InstructionRow, Ledger, RoutingRow, Stakes } from "../../ledger/src/index";
-import { type Lab, LABS, labOf, parseHandSpawn, settledTokens, withheldTokens } from "./lab";
+import { type Lab, labOf, parseHandSpawn, settledTokens, withheldTokens } from "./lab";
 import type { RoutingLedger } from "./ledger-port";
 import { reviewStopOn } from "./review-stop";
 import { effectiveRoundLimit, type InstructionInput } from "./rounds";
@@ -50,6 +50,18 @@ export type PanelLedger = RoutingLedger & Pick<Ledger, "path" | "slices">;
 
 type Entry = Pick<EntryRow, "kind" | "body" | "created_at"> & { slice_id?: string | null };
 
+/**
+ * A panel's labs, in order (PLAN wl-mw148irbq33zt5 D1): its own list, not `LABS` (classifier/src/lab.ts).
+ * A panel has exactly three legs, the panel script and synth.schema.json under skills/cross-model-review
+ * pin that, and every recorded `panel-group:` body names exactly these members; a lab joins panels only
+ * by its own change.
+ */
+export const PANEL_LABS = ["anthropic", "openai", "kimi"] as const satisfies readonly Lab[];
+export type PanelLab = (typeof PANEL_LABS)[number];
+
+/** True when `lab` is one of `PANEL_LABS`. */
+export const isPanelLab = (lab: Lab | null): lab is PanelLab => lab !== null && (PANEL_LABS as readonly Lab[]).includes(lab);
+
 export const PANEL_MODES = ["triad", "triad-verify", "quorum", "quorum-refute", "refute", "doubt"] as const;
 export type PanelMode = (typeof PANEL_MODES)[number];
 
@@ -58,7 +70,7 @@ export interface PanelRole {
 	group: string;
 	pdir: string;
 	/** A leg's lab; the synthesis hand's pinned lab. */
-	lab: Lab;
+	lab: PanelLab;
 	role: "leg" | "synth";
 	/** Synthesis only: it runs on a builder lab (no other lab was usable at dispatch). */
 	builderLab?: boolean;
@@ -77,9 +89,9 @@ export interface Manifest {
 	legSchema: string;
 	synthPrompt: string;
 	synthSchema: string;
-	legTimeoutMin: { default: number } & Partial<Record<Lab, number>>;
+	legTimeoutMin: { default: number } & Partial<Record<PanelLab, number>>;
 	inputs: Record<string, string>;
-	legInputs: Record<Lab, string[]>;
+	legInputs: Record<PanelLab, string[]>;
 	synthInputs: string[];
 	withheld: string[];
 	canary: string | null;
@@ -125,7 +137,7 @@ export function parseManifest(text: string): Manifest {
 	};
 	for (const key of ["legSchema", "synthPrompt", "synthSchema"]) listed(m[key], key);
 	if (!isObject(m.legInputs)) return bad("legInputs is not an object");
-	for (const lab of LABS) {
+	for (const lab of PANEL_LABS) {
 		const list = m.legInputs[lab];
 		if (!isStrings(list) || list.length === 0) bad(`legInputs.${lab} is not a non-empty list of paths`);
 		for (const rel of list as string[]) listed(rel, `legInputs.${lab}`);
@@ -135,12 +147,12 @@ export function parseManifest(text: string): Manifest {
 	if (!isStrings(m.withheld)) bad("withheld is not a list of paths");
 	for (const rel of m.withheld as string[]) {
 		listed(rel, "withheld");
-		for (const lab of LABS) if ((m.legInputs[lab] as string[]).includes(rel)) bad(`withheld ${rel} is in legInputs.${lab}`);
+		for (const lab of PANEL_LABS) if ((m.legInputs[lab] as string[]).includes(rel)) bad(`withheld ${rel} is in legInputs.${lab}`);
 	}
 	const t = m.legTimeoutMin;
 	if (!isObject(t) || typeof t.default !== "number" || !(t.default > 0)) bad("legTimeoutMin.default is not a positive number");
 	for (const [key, value] of Object.entries(t as object)) {
-		if (key !== "default" && !(LABS as readonly string[]).includes(key)) bad(`legTimeoutMin.${key} names no lab`);
+		if (key !== "default" && !(PANEL_LABS as readonly string[]).includes(key)) bad(`legTimeoutMin.${key} names no lab`);
 		if (typeof value !== "number" || !(value > 0)) bad(`legTimeoutMin.${key} is not a positive number`);
 	}
 	if (m.canary !== null && m.canary !== undefined && typeof m.canary !== "string") bad("canary is not a string or null");
@@ -148,7 +160,7 @@ export function parseManifest(text: string): Manifest {
 }
 
 /** A leg's timeout in minutes: its lab's override, else the default. */
-export function legTimeoutMin(manifest: Pick<Manifest, "legTimeoutMin">, lab: Lab): number {
+export function legTimeoutMin(manifest: Pick<Manifest, "legTimeoutMin">, lab: PanelLab): number {
 	return manifest.legTimeoutMin[lab] ?? manifest.legTimeoutMin.default;
 }
 
@@ -161,7 +173,7 @@ export interface PanelGroup {
 	mode: PanelMode;
 	/** Every ingested file, relative to `<pdir>/in/`, with its sha256: the manifest's inputs plus `manifest.json`. */
 	inputs: Record<string, string>;
-	members: Record<Lab, string | null>;
+	members: Record<PanelLab, string | null>;
 }
 
 /**
@@ -185,7 +197,7 @@ export function words(text: string, cap = 240): string {
 export const panelGroupBody = (pg: string, g: PanelGroup) =>
 	`panel-group: ${pg} ${JSON.stringify({ run: g.run, pdir: g.pdir, slice: g.slice, mode: g.mode, inputs: g.inputs, members: { anthropic: g.members.anthropic, openai: g.members.openai, kimi: g.members.kimi } })}`;
 
-export function panelLegBody(pg: string, lab: Lab, line: LegLine): string {
+export function panelLegBody(pg: string, lab: PanelLab, line: LegLine): string {
 	if (line.status === "landed") return `panel-leg: ${pg} ${lab} landed sha256 ${line.sha} bound ${line.bound}`;
 	if (line.status === "missing") return `panel-leg: ${pg} ${lab} missing ${words(line.reason)}`;
 	return `panel-leg: ${pg} ${lab} excluded ${words(line.reason)}`;
@@ -215,8 +227,8 @@ export function parsePanelGroup(body: string): (PanelGroup & { pg: string }) | n
 	if (!isObject(j) || typeof j.run !== "string" || typeof j.pdir !== "string" || typeof j.slice !== "string" || typeof j.mode !== "string") return null;
 	if (!(PANEL_MODES as readonly string[]).includes(j.mode) || !isObject(j.inputs) || !isObject(j.members)) return null;
 	if (!Object.values(j.inputs).every(v => typeof v === "string")) return null;
-	const members = {} as Record<Lab, string | null>;
-	for (const lab of LABS) {
+	const members = {} as Record<PanelLab, string | null>;
+	for (const lab of PANEL_LABS) {
 		const token = j.members[lab];
 		if (token !== null && typeof token !== "string") return null;
 		members[lab] = token;
@@ -224,11 +236,11 @@ export function parsePanelGroup(body: string): (PanelGroup & { pg: string }) | n
 	return { pg: m[1]!, run: j.run, pdir: j.pdir, slice: j.slice, mode: j.mode as PanelMode, inputs: j.inputs as Record<string, string>, members };
 }
 
-export function parsePanelLeg(body: string): { pg: string; lab: Lab; line: LegLine } | null {
+export function parsePanelLeg(body: string): { pg: string; lab: PanelLab; line: LegLine } | null {
 	const m = PANEL_LEG.exec(body.trim());
 	if (!m) return null;
 	const line: LegLine = m[3] ? { status: "landed", sha: m[3], bound: m[4] as Binding } : m[5] ? { status: "missing", reason: m[5] } : { status: "excluded", reason: m[6]! };
-	return { pg: m[1]!, lab: m[2] as Lab, line };
+	return { pg: m[1]!, lab: m[2] as PanelLab, line };
 }
 
 export function parsePanelSynth(body: string): { pg: string; token: string; end: SynthEnd | null } | null {
@@ -263,7 +275,7 @@ export interface PanelState {
 	/** The `panel-group:` entry's time (ms): an unspawned leg's timeout counts from it. */
 	at: number;
 	/** The first line per lab: a later one (another instance's race) is ignored. */
-	legs: Map<Lab, LegLine>;
+	legs: Map<PanelLab, LegLine>;
 	/** Synthesis attempts by token, dispatch order: when dispatched (ms) and how each ended. */
 	synths: Map<string, { at: number; end: SynthEnd | null }>;
 	published: { out: Published | null; report: Published | null };
@@ -321,7 +333,7 @@ export function groupOfRun(entries: readonly Entry[], runReal: string): PanelSta
 
 /** A panel hand's role, from its group and its token: rebuilt on recovery. */
 export function roleOf(state: PanelState, token: string): PanelRole | null {
-	for (const lab of LABS) if (state.group.members[lab] === token) return { group: state.pg, pdir: state.group.pdir, lab, role: "leg" };
+	for (const lab of PANEL_LABS) if (state.group.members[lab] === token) return { group: state.pg, pdir: state.group.pdir, lab, role: "leg" };
 	return null;
 }
 
@@ -451,7 +463,7 @@ export class VoidRun extends Error {}
  * per-leg packet; everyone else's shared one), plus the panel paragraph. Byte-identical across the
  * three members except quorum-refute's packet path. No review-findings paragraph.
  */
-export function memberTask(text: string, pdir: string, manifest: Manifest, lab: Lab): string {
+export function memberTask(text: string, pdir: string, manifest: Manifest, lab: PanelLab): string {
 	const inputs = manifest.legInputs[lab].map(rel => join(pdir, "in", rel));
 	const packet = inputs.find(p => basename(p) === "packet.md") ?? inputs[0]!;
 	const paragraph = [
@@ -465,7 +477,7 @@ export function memberTask(text: string, pdir: string, manifest: Manifest, lab: 
 }
 
 /** The synthesis hand's task: the lane's text plus what it may read, the lab it runs on, and its output. */
-export function synthTask(text: string, pdir: string, manifest: Manifest, landed: readonly Lab[], lab: Lab, builderLab: boolean): string {
+export function synthTask(text: string, pdir: string, manifest: Manifest, landed: readonly PanelLab[], lab: PanelLab, builderLab: boolean): string {
 	const reads = synthAllowed(pdir, manifest, landed);
 	return [
 		text,
@@ -477,10 +489,10 @@ export function synthTask(text: string, pdir: string, manifest: Manifest, landed
 }
 
 /** What a leg may read: its `legInputs` under `<pdir>/in/`. */
-export const legAllowed = (pdir: string, manifest: Manifest, lab: Lab) => manifest.legInputs[lab].map(rel => join(pdir, "in", rel));
+export const legAllowed = (pdir: string, manifest: Manifest, lab: PanelLab) => manifest.legInputs[lab].map(rel => join(pdir, "in", rel));
 
 /** What the synthesis hand may read: `status.json`, the landed legs' outputs, the synthesis prompt, and `synthInputs`. */
-export const synthAllowed = (pdir: string, manifest: Manifest, landed: readonly Lab[]) => [
+export const synthAllowed = (pdir: string, manifest: Manifest, landed: readonly PanelLab[]) => [
 	join(pdir, "out", "status.json"),
 	...landed.map(lab => join(pdir, "out", "legs", `${lab}.json`)),
 	join(pdir, "in", manifest.synthPrompt),
@@ -784,10 +796,10 @@ export function legShapeProblem(value: unknown): string | null {
 }
 
 /** CONTRACT § 1 synthesis shape, its `synth` naming the lab it was pinned to (and whether that is a builder lab, when known: recovery does not know it). */
-export function synthShapeProblem(value: unknown, lab: Lab, builderLab: boolean | undefined): string | null {
+export function synthShapeProblem(value: unknown, lab: PanelLab, builderLab: boolean | undefined): string | null {
 	if (!isObject(value)) return "the output is not a JSON object";
-	if (!Array.isArray(value.legs) || value.legs.length !== LABS.length) return "legs does not name the three labs";
-	for (const want of LABS) {
+	if (!Array.isArray(value.legs) || value.legs.length !== PANEL_LABS.length) return "legs does not name the three labs";
+	for (const want of PANEL_LABS) {
 		const leg = value.legs.find(l => isObject(l) && l.lab === want);
 		if (!isObject(leg) || !["landed", "missing", "excluded"].includes(leg.status as string)) return `legs has no ${want} line with a status`;
 	}
@@ -803,7 +815,7 @@ export function synthShapeProblem(value: unknown, lab: Lab, builderLab: boolean 
 }
 
 /** A leg's output with `"id": "<lab>-<n>"` on each item (n 1-based, by position), and the ids; null when it has no `items` array of objects. */
-export function assignIds(output: unknown, lab: Lab): { output: Record<string, unknown>; ids: string[] } | null {
+export function assignIds(output: unknown, lab: PanelLab): { output: Record<string, unknown>; ids: string[] } | null {
 	if (!isObject(output) || !Array.isArray(output.items) || !output.items.every(isObject)) return null;
 	const ids = output.items.map((_, i) => `${lab}-${i + 1}`);
 	const items = output.items.map((item, i) => {
@@ -889,7 +901,7 @@ export function voidRun(ledger: PanelPort, at: Stamp, pg: string, reason: string
 }
 
 /** Write `panel-leg:` for `lab` unless the lab has one; returns the line already there (a late result), or null when this one landed. Call inside a write transaction. */
-export function writeLeg(ledger: PanelPort, at: Stamp, pg: string, lab: Lab, line: LegLine): LegLine | null {
+export function writeLeg(ledger: PanelPort, at: Stamp, pg: string, lab: PanelLab, line: LegLine): LegLine | null {
 	const state = panelGroups(ledger.entries(at.workloadId)).get(pg);
 	const known = state?.legs.get(lab);
 	if (known) return known;
@@ -928,7 +940,7 @@ export function finalizeLegs(ledger: PanelPort, at: Stamp, pg: string, hooks?: P
 	if (!state) return "waiting";
 	if (state.void) return { void: state.void };
 	if (state.published.out) return "already";
-	if (LABS.some(lab => !state.legs.has(lab))) return "waiting";
+	if (PANEL_LABS.some(lab => !state.legs.has(lab))) return "waiting";
 	const fail = (reason: string): Finalized => ({ void: voidRun(ledger, at, pg, reason) });
 	let manifest: Manifest;
 	let schema: unknown;
@@ -944,7 +956,7 @@ export function finalizeLegs(ledger: PanelPort, at: Stamp, pg: string, hooks?: P
 	const rows = new Map(ledger.routings(at.workloadId).map(r => [r.id, r]));
 	const files: { rel: string; bytes: string }[] = [];
 	const legs: Record<string, { status: LegLine["status"]; reason: string | null; model: string | null; token: string | null; findingIds: string[] }> = {};
-	for (const lab of LABS) {
+	for (const lab of PANEL_LABS) {
 		const line = state.legs.get(lab)!;
 		const token = state.group.members[lab];
 		const row: Pick<RoutingRow, "session_root" | "agent_id" | "ran_models"> | undefined = token ? rows.get(settled.get(token) ?? "") : undefined;
@@ -1000,8 +1012,8 @@ function ranModel(json: string | null): string | null {
 }
 
 /** The landed labs of a published group, read from its `status.json` line's legs (the ledger-hashed copy). */
-export function landedLabs(state: PanelState): Lab[] {
-	return LABS.filter(lab => state.legs.get(lab)?.status === "landed");
+export function landedLabs(state: PanelState): PanelLab[] {
+	return PANEL_LABS.filter(lab => state.legs.get(lab)?.status === "landed");
 }
 
 /**
@@ -1146,7 +1158,7 @@ export function deliveredForm(delivered: string, text: string): "full" | "partia
  */
 export function legLine(
 	state: PanelState,
-	lab: Lab,
+	lab: PanelLab,
 	hand: { root: string; agentId: string },
 	lanes: string,
 	refusal: string | null,
@@ -1263,7 +1275,7 @@ export function sweepPanels(ledger: PanelPort, at: Stamp, now: number = Date.now
 			continue;
 		}
 		if (!state.published.out) {
-			for (const lab of LABS) {
+			for (const lab of PANEL_LABS) {
 				if (state.legs.has(lab)) continue;
 				const token = state.group.members[lab];
 				const base = (token ? spawnTime.get(token) : undefined) ?? state.at;
@@ -1282,13 +1294,21 @@ export function sweepPanels(ledger: PanelPort, at: Stamp, now: number = Date.now
 			if (row) {
 				const lab = labOf(row.model ?? "");
 				const withheld =
-					row.outcome !== "ran" ? `withheld ${row.outcome}` : withheldTokens(entries).has(token) ? "withheld changed-work" : !row.agent_id || !lab ? "no-settled-hand" : null;
+					row.outcome !== "ran"
+						? `withheld ${row.outcome}`
+						: withheldTokens(entries).has(token)
+							? "withheld changed-work"
+							: !row.agent_id || !lab
+								? "no-settled-hand"
+								: !isPanelLab(lab)
+									? `off-panel-lab ${lab}`
+									: null;
 				// `<pdir>` is `<ledger dir>/lanes/<workload>/panels/<pg>` (`panelDir`): the audit's every-panel root is three up.
 				const reply = withheld ? { failed: withheld } : synthReply(state, { root: row.session_root, agentId: row.agent_id! }, dirname(dirname(dirname(state.group.pdir))));
 				const end =
 					"failed" in reply
 						? (ledger.write(() => writeSynthEnd(ledger, at, state.pg, token, { status: "failed", reason: reply.failed })) ?? { status: "failed" as const, reason: reply.failed })
-						: finishSynth(ledger, at, state.pg, token, { lab: lab! }, reply.text, hooks);
+						: finishSynth(ledger, at, state.pg, token, { lab: lab as PanelLab }, reply.text, hooks);
 				done.push(`${state.pg} synthesis ${token} ${"void" in end ? `void (${end.void})` : end.status === "landed" ? "published report" : `failed ${end.reason}`}`);
 				continue;
 			}
@@ -1324,7 +1344,7 @@ export function panelDispatchHeld(entries: readonly EntryRow[], instructions: re
 }
 
 /** `legHeld`: why panel leg `token` of `pg` may not spawn now, read from the ledger, or null. */
-export function legHeld(entries: readonly EntryRow[], instructions: readonly InstructionView[], stakes: Stakes, workloadId: string, pg: string, lab: Lab): string | null {
+export function legHeld(entries: readonly EntryRow[], instructions: readonly InstructionView[], stakes: Stakes, workloadId: string, pg: string, lab: PanelLab): string | null {
 	const state = panelGroups(entries).get(pg);
 	if (!state) return `panel ${pg} has no panel-group entry`;
 	if (state.void) return `panel ${pg} is void (${state.void})`;

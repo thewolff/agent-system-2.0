@@ -325,6 +325,17 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		}
 		expect(ledger.entries(wl).length).toBe(before);
 	});
+
+	test("PLAN wl-mw148irbq33zt5 D4, R15: the classifier's zai-balance: receipt is refused by lane_record_entry with nothing recorded", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "review", doneCondition: "d", inputs: "i" });
+		const before = ledger.entries(wl).length;
+		// classifier/src/lab.ts zaiBalanceBody, its shape as a literal so it loads on the baseline
+		const body = "zai-balance: token dt-a model zai/glm-5.3";
+		expect(await call("lane_record_entry", { body })).toContain("`zai-balance:` is a reserved control line");
+		expect(await call("lane_record_entry", { body: `  ${body}`, slice: sl })).toContain("`zai-balance:` is a reserved control line");
+		expect(ledger.entries(wl).length).toBe(before);
+	});
 });
 
 describe("lane_raise_question through Jo's standing rulings (PLAN wl-mvfkv7llkp7nk0 § 1, R1–R3)", () => {

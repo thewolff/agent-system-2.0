@@ -13,9 +13,12 @@ import {
 	type BuilderLedgerView,
 	builderLabs,
 	isReviewDispatch,
+	isReviewOnly,
 	isReviewRouting,
+	LABS,
 	labOf,
 	parkQuestionBody,
+	REVIEW_ONLY_LABS,
 	reviewPlan,
 	REVIEW_ROW_FROM,
 	reviewRow,
@@ -52,13 +55,25 @@ const view = (entries: FixtureEntry[], routings: Row[] = []): BuilderLedgerView 
 const LANE = [entry('lane-started: lane-a {"pid":1}'), entry("builder-lab: anthropic lane lane-a model anthropic/claude-opus-5-5")];
 
 describe("D1: provider → lab", () => {
-	test("the map names three labs; a provider it does not name has no lab", () => {
+	test("the map names four labs; a provider it does not name has no lab", () => {
 		expect(labOf("anthropic/claude-opus-5-5")).toBe("anthropic");
+		expect(labOf("zai/glm-5.3")).toBe("zai");
+		expect(labOf("zai/glm-5.3-flash:high")).toBe("zai");
 		expect(labOf("openai/gpt-6")).toBe("openai");
 		expect(labOf("openai-codex/gpt-6-sol:high")).toBe("openai");
 		expect(labOf("kimi-code/k3")).toBe("kimi");
 		expect(labOf("moonshot/kimi-k2.7-code")).toBe("kimi");
 		expect(labOf("mystery/model-x")).toBeNull();
+	});
+
+	test("LABS is the row order anthropic, zai, openai, kimi; Kimi stays (PLAN wl-mw148irbq33zt5 D1, R11)", () => {
+		expect(LABS).toEqual(["anthropic", "zai", "openai", "kimi"]);
+	});
+
+	test("zai alone takes reviews only (D3); a provider with no lab is not reviews-only", () => {
+		expect([...REVIEW_ONLY_LABS]).toEqual(["zai"]);
+		expect(isReviewOnly("zai/glm-5.3")).toBe(true);
+		for (const s of ["anthropic/claude-opus-5-5", "openai-codex/gpt-6.1-sol", "moonshot/kimi-k3", "mystery/model-x"]) expect(isReviewOnly(s)).toBe(false);
 	});
 });
 
@@ -425,8 +440,8 @@ describe("reviewRow: Jo's OpenAI-reviewer rule (in-mv5qdfvskukmbk, in-mv5qfm8910
 		deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra", "moonshot/kimi-k3"],
 	};
 
-	test("the rule names openai, from the strong row", () => {
-		expect(REVIEW_ROW_FROM).toEqual({ openai: "strong" });
+	test("the rule names openai and zai, both from the strong row", () => {
+		expect(REVIEW_ROW_FROM).toEqual({ openai: "strong", zai: "strong" });
 	});
 
 	test("deep: the openai entry comes from the strong row at its own position; anthropic and kimi stay", () => {
@@ -447,9 +462,26 @@ describe("reviewRow: Jo's OpenAI-reviewer rule (in-mv5qdfvskukmbk, in-mv5qfm8910
 		expect(reviewRow(table, "deep")).toEqual(["anthropic/claude-fable-5-1", "moonshot/kimi-k3"]);
 	});
 
-	test("deep with no openai entry: the row is unchanged", () => {
+	test("deep with no openai entry: the strong row's openai entries are appended (PLAN wl-mw148irbq33zt5 D2)", () => {
 		const table = { ...TABLE, deep: ["anthropic/claude-fable-5-1", "moonshot/kimi-k3"] };
-		expect(reviewRow(table, "deep")).toEqual(["anthropic/claude-fable-5-1", "moonshot/kimi-k3"]);
+		expect(reviewRow(table, "deep")).toEqual(["anthropic/claude-fable-5-1", "moonshot/kimi-k3", "openai-codex/gpt-6-sol"]);
+	});
+
+	test("R4: deep has no zai entry, so the strong row's zai entry is appended after the row; openai's substitution is unchanged", () => {
+		const table = {
+			...TABLE,
+			strong: ["anthropic/claude-opus-5-5", "zai/glm-5.3", "openai-codex/gpt-6-sol", "moonshot/kimi-k2.7-code"],
+		};
+		expect(reviewRow(table, "deep")).toEqual(["anthropic/claude-fable-5-1", "openai-codex/gpt-6-sol", "moonshot/kimi-k3", "zai/glm-5.3"]);
+	});
+
+	test("deep with a zai entry: it is replaced at its own position by the strong row's, like openai's", () => {
+		const table = {
+			...TABLE,
+			strong: ["anthropic/claude-opus-5-5", "zai/glm-5.3", "openai-codex/gpt-6-sol"],
+			deep: ["anthropic/claude-fable-5-1", "zai/glm-deep", "openai-codex/gpt-6-astra"],
+		};
+		expect(reviewRow(table, "deep")).toEqual(["anthropic/claude-fable-5-1", "zai/glm-5.3", "openai-codex/gpt-6-sol"]);
 	});
 
 	test("every other tier returns its row unchanged", () => {

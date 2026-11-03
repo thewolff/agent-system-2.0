@@ -1,23 +1,27 @@
 /**
  * `buildRow` (classifier/src/build-row.ts): a build hand's row is its tier row's entries of the lane's
- * lab, in row order with thinking suffixes kept; no lane model, no lab, or no entry of the lab is an
- * error, never another lab's entries. The spawn wiring is lane-lab.test.ts's.
+ * lab, in row order with thinking suffixes kept; no lane model, no lab, a reviews-only lab, or no entry
+ * of the lab is an error, never another lab's entries. The spawn wiring is lane-lab.test.ts's.
  */
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { buildRow } from "../src/build-row";
-import { LABS, labOf } from "../src/lab";
+import { type Lab, LABS, labOf, REVIEW_ONLY_LABS } from "../src/lab";
 import { TIERS } from "../src/route";
 import { loadTierTable, tierTableFromConfig } from "../src/tier-table";
 
 const ROWS = {
 	fast: ["anthropic/claude-haiku-5-5", "openai-codex/gpt-5.6-luna:low", "moonshot/kimi-k2.7-code-highspeed"],
 	standard: ["openai-codex/gpt-6-luna", "anthropic/claude-sonnet-5-5", "moonshot/kimi-k2.5", "openai/gpt-6-luna"],
-	strong: ["anthropic/claude-opus-5-5:high", "openai-codex/gpt-6-sol:high", "kimi-code/kimi-for-coding", "moonshot/kimi-k2.7-code"],
+	strong: ["anthropic/claude-opus-5-5:high", "zai/glm-5.3", "openai-codex/gpt-6-sol:high", "kimi-code/kimi-for-coding", "moonshot/kimi-k2.7-code"],
 	deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra:xhigh"],
 };
 const TABLE = tierTableFromConfig({ task: { agentModelOverrides: ROWS } });
-const LANE = { anthropic: "anthropic/claude-opus-5-5", openai: "openai-codex/gpt-6.1-sol", kimi: "moonshot/kimi-k2.7-code" } as const;
+const LANE = { anthropic: "anthropic/claude-opus-5-5", zai: "zai/glm-5.3", openai: "openai-codex/gpt-6.1-sol", kimi: "moonshot/kimi-k2.7-code" } as const;
+/** The labs a lane builds on: every lab but the reviews-only ones (PLAN wl-mw148irbq33zt5 D3). */
+const BUILD_LABS = LABS.filter((lab): lab is Exclude<Lab, "zai"> => !REVIEW_ONLY_LABS.has(lab));
+const reviewsOnly = (model: string) =>
+	`the lane's model ${model} is on lab zai, which takes reviews only (REVIEW_ONLY_LABS in classifier/src/lab.ts): a build hand never runs on it`;
 
 describe("buildRow", () => {
 	test("every lab, every tier: the row's entries of the lane's lab, in row order, suffixes kept", () => {
@@ -31,7 +35,7 @@ describe("buildRow", () => {
 			},
 			kimi: { fast: ["moonshot/kimi-k2.7-code-highspeed"], standard: ["moonshot/kimi-k2.5"], strong: ["kimi-code/kimi-for-coding", "moonshot/kimi-k2.7-code"] },
 		} as const;
-		for (const lab of LABS) {
+		for (const lab of BUILD_LABS) {
 			for (const tier of TIERS) {
 				const want = (expected[lab] as Partial<Record<string, readonly string[]>>)[tier];
 				const got = buildRow(TABLE, tier, LANE[lab]);
@@ -53,6 +57,17 @@ describe("buildRow", () => {
 		});
 	});
 
+	test("R5: a lane on a reviews-only lab (zai) gets no build row in any tier, even where its row has a zai entry", () => {
+		expect(BUILD_LABS).toEqual(["anthropic", "openai", "kimi"]);
+		const profile = loadTierTable(join(import.meta.dir, "..", "..", "profile", "config.yml"));
+		for (const table of [TABLE, profile]) {
+			for (const tier of TIERS) {
+				expect(buildRow(table, tier, LANE.zai)).toEqual({ error: reviewsOnly(LANE.zai) });
+				expect(buildRow(table, tier, "zai/glm-5.3-flash")).toEqual({ error: reviewsOnly("zai/glm-5.3-flash") });
+			}
+		}
+	});
+
 	test("the table is not changed", () => {
 		const before = JSON.stringify(TABLE);
 		buildRow(TABLE, "standard", LANE.openai);
@@ -61,7 +76,7 @@ describe("buildRow", () => {
 
 	test("the installed profile's rows: each lab's build row is a lab-only, order-kept part of its tier row", () => {
 		const table = loadTierTable(join(import.meta.dir, "..", "..", "profile", "config.yml"));
-		for (const lab of LABS) {
+		for (const lab of BUILD_LABS) {
 			for (const tier of TIERS) {
 				const got = buildRow(table, tier, LANE[lab]);
 				const own = table[tier].filter(s => labOf(s) === lab);

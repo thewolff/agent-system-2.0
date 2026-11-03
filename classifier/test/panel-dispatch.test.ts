@@ -48,8 +48,8 @@ afterEach(() => {
 
 const sha = (text: string) => createHash("sha256").update(text).digest("hex");
 
-/** A production workload on a temp ledger, the lane's session file, and a credential list to take labs down. */
-function world() {
+/** A production workload on a temp ledger, the lane's session file, and a credential list to take labs down. `extra`: models beyond `ROWS` the registry offers. */
+function world(extra: readonly string[] = []) {
 	const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "panel-dispatch-"));
 	dirs.push(dir);
 	const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backup: false });
@@ -60,8 +60,8 @@ function world() {
 	const laneFile = join(dir, "sessions", "lane.jsonl");
 	writeFileSync(laneFile, "");
 	mkdirSync(join(dir, "sessions", "lane")); // the lane's artifacts directory: its hands' session and result files
-	const creds = [...ALL];
-	return { dir, ledger, wl, laneFile, root: laneFile.slice(0, -".jsonl".length), creds, registry: fakeRegistry(ALL, creds) };
+	const creds = [...ALL, ...extra];
+	return { dir, ledger, wl, laneFile, root: laneFile.slice(0, -".jsonl".length), creds, registry: fakeRegistry([...ALL, ...extra], creds) };
 }
 type World = ReturnType<typeof world>;
 
@@ -537,6 +537,47 @@ describe("panel dispatch", () => {
 		const { w, pg, pdir } = await lostSynthesis(body => /^panel-synth: \S+ \S+ landed /.test(body), "entry");
 		expect(readFileSync(join(pdir, "out", "report.json"), "utf8")).toBe(SYNTH_REPORT); // written, never recorded
 		await resumed(w, pg, pdir);
+	});
+});
+
+describe("panels keep their three labs with zai in the rows (PLAN wl-mw148irbq33zt5 D1, R1)", () => {
+	// zai second in every row, as the profile has it; deep's own zai entry is replaced by strong's glm-5.3
+	// (REVIEW_ROW_FROM), which puts zai before openai in the deep review row: the first non-builder lab.
+	const ZROWS = {
+		fast: [ROWS.fast[0]!, "zai/glm-5.3-flash", ROWS.fast[1]!, ROWS.fast[2]!],
+		standard: [ROWS.standard[0]!, "zai/glm-5.3-flashx", ROWS.standard[1]!, ROWS.standard[2]!],
+		strong: [OPUS, "zai/glm-5.3", SOL, ROWS.strong[2]!],
+		deep: [FABLE, "zai/glm-5.2", ROWS.deep[1]!, K3],
+	};
+	const ZTABLE = tierTableFromConfig({ task: { agentModelOverrides: ZROWS } });
+	const GLM = Object.values(ZROWS).flat().filter(s => s.startsWith("zai/"));
+
+	test("panel planning names no zai leg, ingestion makes no zai task, and no spawn row names a zai model", async () => {
+		const w = world(GLM);
+		const h = lane(w, w.ledger, { table: ZTABLE });
+		h.laneMessage(OPUS); // anthropic built: zai is the first other lab in row order
+		const run = stagingRun(w);
+		const { out, spawns } = await panel(h, w, run);
+		expect(out?.block).toBeUndefined();
+		expect(out?.input?.tasks?.map(t => t.name)).toEqual(["sl-x--anthropic", "sl-x--openai", "sl-x--kimi"]);
+		expect(Object.keys(group(w).members)).toEqual(["anthropic", "openai", "kimi"]);
+		for (const t of out!.input!.tasks) expect(t.task).not.toContain("zai");
+		expect(spawns["sl-x--anthropic"]?.model).toEqual([FABLE]);
+		expect(spawns["sl-x--openai"]?.model).toEqual([SOL]);
+		expect(spawns["sl-x--kimi"]?.model).toEqual([K3]);
+		expect(bodies(w, "hand-spawn: ").flatMap(b => parseHandSpawn(b)!.row).filter(s => s.startsWith("zai/"))).toEqual([]);
+		expect(bodies(w, "panel-leg: ").filter(b => b.includes(" zai "))).toEqual([]);
+	});
+
+	test("the synthesis skips zai, the first usable non-builder lab in the review row, and lands on openai", async () => {
+		const w = world(GLM);
+		const h = lane(w, w.ledger, { table: ZTABLE });
+		h.laneMessage(OPUS);
+		const run = stagingRun(w);
+		await panel(h, w, run);
+		settleAll(h, w);
+		await synthesise(h, w, run); // asserts the synthesis spawns on SOL
+		expect(bodies(w, "hand-spawn: ").map(b => parseHandSpawn(b)!.row).at(-1)).toEqual([SOL]);
 	});
 });
 

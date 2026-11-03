@@ -13,6 +13,8 @@
  * - Other labs' week-pace-only refusals may be retained against the first configured other-lab budget only when its
  *   measured pressure is strictly higher over the same recent 15–60min endpoints. Pressure is the maximum
  *   binding-meter rate, in quota points/hour, not token-equivalent capacity. Hard/exhausted limits never relax.
+ *   A reviews-only lab (`REVIEW_ONLY_LABS`, PLAN wl-mw148irbq33zt5 D3) is never the comparator: it carries no build
+ *   work, so its budget is not one a build lab's retention can be weighed against.
  * - A limit binds a selector when the provider matches and its tier is null or the model id contains the tier
  *   (`fable` binds `anthropic/claude-fable-*` only; Fable's meter never takes Opus out).
  * - Out: a binding non-advisory pace projection ≥ 1.0, a binding 5h limit with `u > FIVE_HOUR_CEILING`, or an
@@ -26,7 +28,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { labOf } from "./lab";
+import { labOf, REVIEW_ONLY_LABS } from "./lab";
 
 export const STALE_MIN = 15;
 /** Fixed floor and window fraction of elapsed time required for pace projection. */
@@ -250,10 +252,11 @@ export function headroom(opts: { path?: string; now?: number; lines?: string[] }
 			if (out === null || !weekPaceOnly || !older) return base;
 			const sourceLab = labOf(selector);
 			if (sourceLab === null) return base;
-			// Stopping at the first known other lab also preserves its first occurrence across aliases.
+			// Stopping at the first known other lab also preserves its first occurrence across aliases; a reviews-only
+			// lab is skipped (PLAN wl-mw148irbq33zt5 D3).
 			const comparator = comparators.find(s => {
 				const lab = labOf(s);
-				return lab !== null && lab !== sourceLab;
+				return lab !== null && lab !== sourceLab && !REVIEW_ONLY_LABS.has(lab);
 			});
 			if (comparator === undefined) return base;
 			const sourcePressure = pressureOf(selector);

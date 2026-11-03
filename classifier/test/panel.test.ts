@@ -9,7 +9,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
-import { handSettledBody, handSpawnBody, type Lab } from "../src/lab";
+import { handSettledBody, handSpawnBody, LABS as ALL_LABS, panelPin, synthLab } from "../src/lab";
 import {
 	assignIds,
 	auditSession,
@@ -37,6 +37,8 @@ import {
 	parsePanelSynth,
 	type PanelState,
 	parsePanelVoid,
+	PANEL_LABS,
+	type PanelLab,
 	schemaProblem,
 	sweepPanels,
 	synthHeld,
@@ -46,8 +48,8 @@ import {
 	writeSynthEnd,
 } from "../src/panel";
 
-const LABS: Lab[] = ["anthropic", "openai", "kimi"];
-const MODEL: Record<Lab, string> = { anthropic: "anthropic/claude-fable-5-1", openai: "openai-codex/gpt-6-astra", kimi: "moonshot/kimi-k3" };
+const LABS: readonly PanelLab[] = PANEL_LABS;
+const MODEL: Record<PanelLab, string> = { anthropic: "anthropic/claude-fable-5-1", openai: "openai-codex/gpt-6-astra", kimi: "moonshot/kimi-k3" };
 const sha = (text: string) => createHash("sha256").update(text).digest("hex");
 
 const dirs: string[] = [];
@@ -65,7 +67,7 @@ function stagingRun(dir: string, opts: { mode?: Mode; workload?: string; slice?:
 		"synth.md": "synthesise\n",
 		"synth.schema.json": JSON.stringify({ type: "object", required: ["markdown"] }),
 	};
-	const legInputs: Record<Lab, string[]> = { anthropic: [], openai: [], kimi: [] };
+	const legInputs: Record<PanelLab, string[]> = { anthropic: [], openai: [], kimi: [] };
 	if (opts.mode === "quorum-refute") {
 		for (const lab of LABS) {
 			files[`legs/${lab}/packet.md`] = `packet for ${lab}\n`;
@@ -114,11 +116,11 @@ function fixture(opts: { mode?: Mode; legTimeoutMin?: Record<string, number> } =
 	const pg = "pg-test1";
 	const pdir = panelDir(ledger.path, wl, pg);
 	const ingested = ingestRun(run, wl, "sl-p", pdir);
-	const members = { anthropic: "dt-a", openai: "dt-o", kimi: "dt-k" } as Record<Lab, string | null>;
+	const members = { anthropic: "dt-a", openai: "dt-o", kimi: "dt-k" } as Record<PanelLab, string | null>;
 	ledger.recordEntry({ by: "lane-test", workloadId: wl, sliceId: "sl-p", kind: "assumption", body: panelGroupBody(pg, { run: ingested.run, pdir, slice: "sl-p", mode: ingested.manifest.mode, inputs: ingested.inputs, members }) });
 	const at = { workloadId: wl, by: "lane-test" };
 	/** Lab `lab`'s hand settled: its routing row, `hand-settled:`, its result file, and (unless `line` is false) its landed line. */
-	const land = (lab: Lab, output: string, line = true) => {
+	const land = (lab: PanelLab, output: string, line = true) => {
 		const agentId = `sl-p--${lab}`;
 		const routingId = ledger.recordRouting({
 			by: "lane-test",
@@ -146,7 +148,7 @@ function fixture(opts: { mode?: Mode; legTimeoutMin?: Record<string, number> } =
 
 const reply = (...titles: string[]) => JSON.stringify({ items: titles.map(title => ({ title })) });
 /** A valid synthesis reply (CONTRACT § 1's shape) pinned to `lab`, whose markdown is `markdown`. */
-const synthReport = (lab: Lab, markdown = "# Report\n") =>
+const synthReport = (lab: PanelLab, markdown = "# Report\n") =>
 	JSON.stringify({
 		legs: LABS.map(l => ({ lab: l, status: "landed", model: MODEL[l], reason: "" })),
 		synth: { lab, builderLab: false },
@@ -192,10 +194,55 @@ describe("entry bodies", () => {
 		expect(parsePanelVoid(panelVoidBody("pg-1", "hash in/packet.md"))).toEqual({ pg: "pg-1", reason: "hash in/packet.md" });
 	});
 
+	test("an original three-member panel-group body, as recorded before zai joined LABS, still parses (PLAN wl-mw148irbq33zt5 R1)", () => {
+		const recorded =
+			'panel-group: pg-mv0abc123 {"run":"/s/run-1","pdir":"/l/lanes/wl-x/panels/pg-mv0abc123","slice":"sl-a","mode":"triad","inputs":{"packet.md":"' +
+			"a".repeat(64) +
+			'"},"members":{"anthropic":"dt-1","openai":"dt-2","kimi":null}}';
+		expect(parsePanelGroup(recorded)).toEqual({
+			pg: "pg-mv0abc123",
+			run: "/s/run-1",
+			pdir: "/l/lanes/wl-x/panels/pg-mv0abc123",
+			slice: "sl-a",
+			mode: "triad",
+			inputs: { "packet.md": "a".repeat(64) },
+			members: { anthropic: "dt-1", openai: "dt-2", kimi: null },
+		});
+	});
+
+	test("panels keep exactly anthropic, openai and kimi while LABS names zai too", () => {
+		expect(PANEL_LABS).toEqual(["anthropic", "openai", "kimi"]);
+		expect(ALL_LABS).toContain("zai");
+		expect(parsePanelLeg(`panel-leg: pg-1 zai missing no-usable-model x`)).toBeNull();
+	});
+
 	test("free text in a body is one line, capped", () => {
 		expect(words("a\n  b\tc")).toBe("a b c");
 		expect(words("x".repeat(500))).toHaveLength(240);
 		expect(panelLegBody("pg-1", "openai", { status: "missing", reason: "multi\nline" })).toBe("panel-leg: pg-1 openai missing multi line");
+	});
+});
+
+describe("panel lab picks with zai in the row (PLAN wl-mw148irbq33zt5 D1)", () => {
+	const row = ["anthropic/claude-opus-5-5", "zai/glm-5.3", "openai-codex/gpt-6.1-sol", "moonshot/kimi-k3"];
+	const anthropic = { labs: ["anthropic" as const], unknown: [] };
+
+	test("synthLab skips zai, the first non-builder lab in row order, and picks the first panel lab", () => {
+		expect(synthLab({ row, usable: row, builders: anthropic, labs: PANEL_LABS })).toEqual({ lab: "openai", builderLab: false });
+	});
+
+	test("synthLab with only zai usable besides the builder falls to the builder panel lab, never zai", () => {
+		expect(synthLab({ row, usable: row.slice(0, 2), builders: anthropic, labs: PANEL_LABS })).toEqual({ lab: "anthropic", builderLab: true });
+	});
+
+	test("synthLab with only zai usable has no lab, and its reasons name the panel labs' entries only", () => {
+		expect(synthLab({ row, usable: ["zai/glm-5.3"], builders: anthropic, labs: PANEL_LABS })).toEqual({
+			reasons: ["anthropic/claude-opus-5-5 (not usable)", "openai-codex/gpt-6.1-sol (not usable)", "moonshot/kimi-k3 (not usable)"],
+		});
+	});
+
+	test("panelPin keeps a panel lab's own entries and no zai entry", () => {
+		for (const lab of PANEL_LABS) expect(panelPin({ row, usable: row, lab }).models.some(s => s.startsWith("zai/"))).toBe(false);
 	});
 });
 
