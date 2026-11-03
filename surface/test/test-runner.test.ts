@@ -17,7 +17,7 @@ import { dirname, join, resolve } from "node:path";
 import { Ledger, LiveLedgerUnderTestError, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { KILL_GRACE_MS, renderExecWrapper, SWEEP_LOCK_WAIT_MS } from "../src/as2test";
 import { recordRepo } from "../src/decision-log";
-import { landFirstBody, landFirstInstructionBody, landFirstOffBody, trainFixBody } from "../src/launch";
+import { ALERT_BY, alertBody, landFirstBody, landFirstInstructionBody, landFirstOffBody, trainFixBody } from "../src/launch";
 import {
 	childLayout, fastPlanBody, fastPlanOf, heartbeatText, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, runnerDiedRun, type TestRun, testRequestedBody, testRunBody, testRuns, workDirOf,
 	withFullSuitePublication, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
@@ -2756,9 +2756,13 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 	}
 
 	// Review F3: incident designation drives both admission and publication, not an arbitrary revert-shaped branch.
-	for (const repair of ["partial revert", "named fix", "tree revert", "unrelated revert"] as const) {
+	// "named fix in the alert issue" (PLAN wl-mw0vs9uc3xqtka R22): the stop has no legacy stop-filed issue; the incident issue is
+	// the `main:<repo>` alert episode's, and namedFix reads it through stopIssueUrl.
+	for (const repair of ["partial revert", "named fix", "named fix in the alert issue", "tree revert", "unrelated revert"] as const) {
 		test(`${repair}: stopped-main admission and publication preserve the repair's required scope`, async () => {
 			const w = landWorld();
+			const fix = repair === "named fix" || repair === "named fix in the alert issue";
+			const incident = `https://github.com/thewolff/jo-issues/issues/${repair === "named fix in the alert issue" ? 95 : 91}`;
 			mainRun(w.ledger, "tr-regression", fx.head.red, "red");
 			g(w.origin, "update-ref", "refs/heads/main", fx.head.red);
 			api(w, "git/ref/heads/main", { object: { sha: fx.head.red } });
@@ -2767,23 +2771,26 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 				committer: { date: new Date().toISOString() }, parents: [{ sha: fx.main }],
 			});
 			api(w, `commits/${fx.head.red}/pulls`, [{ number: PR.red }]);
-			for (const event of [
-				{ event: "stop-raised" as const, kind: "regression" as const, tip: fx.head.red, g: fx.main, suspects: [PR.red], failing: 1 },
-				{ event: "stop-filed" as const, url: `https://github.com/${OWNER_REPO}/issues/91` },
-			]) w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstNoticeBody(OWNER_REPO, event) });
-			writeFileSync(join(w.root, "incident.json"), JSON.stringify({ body: repair === "named fix" ? "fix #1" : "repair incident", comments: [] }));
+			w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstNoticeBody(OWNER_REPO, { event: "stop-raised", kind: "regression", tip: fx.head.red, g: fx.main, suspects: [PR.red], failing: 1 }) });
+			if (repair === "named fix in the alert issue") {
+				const key = `main:${OWNER_REPO}`;
+				for (const row of [{ row: "raised", kind: "main-red", start: 1, digest: "0123456789ab" }, { row: "level", level: 1, step: "sent", url: incident }] as const) {
+					w.ledger.recordEntry({ by: ALERT_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: alertBody(key, row) });
+				}
+			} else w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstNoticeBody(OWNER_REPO, { event: "stop-filed", url: incident }) });
+			writeFileSync(join(w.root, "incident.json"), JSON.stringify({ body: fix ? "fix #1" : "repair incident", comments: [] }));
 			const tree = g(w.origin, "rev-parse", `${repair === "tree revert" ? fx.main : fx.head.green}^{tree}`);
 			const head = g(w.origin, "commit-tree", tree, "-p", fx.head.red, "-m", repair);
 			g(w.origin, "update-ref", `refs/pull/${PR.green}/head`, head);
 			const { wl, slice } = bind(w, PR.green, head);
-			const ref = repair === "named fix" ? `wl/${wl}` : `train/revert-${(repair === "unrelated revert" ? fx.main : fx.head.red).slice(0, 7)}`;
+			const ref = fix ? `wl/${wl}` : `train/revert-${(repair === "unrelated revert" ? fx.main : fx.head.red).slice(0, 7)}`;
 			setPr(w, PR.green, { sha: head, headRefName: ref });
 			w.ledger.claimWorkload(wl, { by: LANE, holder: LANE, leaseMs: 600_000 });
 			w.ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body: pushDestBody({ remote: "origin", branch: ref, sha: head }) });
 			api(w, `compare/${fx.head.red}...${head}`, { status: "ahead" });
 			api(w, `git/commits/${head}`, { tree: { sha: tree } });
 			if (repair === "unrelated revert") artifact(w, head, "green");
-			if (repair === "named fix") {
+			if (fix) {
 				// A previously fast-green head on a train must actually run the newly required full repair scope.
 				joTrains(w, wl, [PR.green]);
 				const prior = request(w, wl, slice, PR.green, head, 1000);
@@ -2811,7 +2818,8 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 				expect(subsOf(w, id)).toContain("full");
 				expect(dispatches(w)).toEqual([]);
 				expect(statusPosts(w).at(-1)).toBe(`success ${head}`);
-				expect(calls(w).at(-1)).toContain(`description=repair: ${repair === "named fix" ? "fix" : "partial revert"}, full suite green`);
+				expect(calls(w).at(-1)).toContain(`description=repair: ${fix ? "fix" : "partial revert"}, full suite green`);
+				if (fix) expect(calls(w).filter((s) => s.startsWith("issue view "))).toContain(`issue view ${incident} --json body,comments`);
 			}
 		});
 	}
