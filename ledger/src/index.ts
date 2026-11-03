@@ -217,6 +217,8 @@ export interface ReserveRows {
 	slices: SliceRow[];
 	/** Every holder the workload ever had, oldest first (`holders`). */
 	holders: string[];
+	/** Every holder change, oldest first, with its writer (`holderChanges`): the starter's live-lane check reads self-releases from it. */
+	holderChanges: HolderChange[];
 	/** Open autonomous workloads held by a `lane-*` holder whose lease is null or not yet lapsed at `now`, cap-exempt workloads not counted. */
 	liveLanes: number;
 	/** This workload is in the cap-exempt set the caller passed (`launchRows`): the surface's open merge trains, outside the lane cap. */
@@ -225,6 +227,13 @@ export interface ReserveRows {
 	now: string;
 }
 export type ReserveVerdict = { launch: true; cause: string } | { launch: false; reason: string };
+/** One `holder a->b` change the workloads provenance trigger recorded: `from` / `to` null for no holder, `by` its `changed_by` (the row's `lane_instance`). */
+export interface HolderChange {
+	at: string;
+	from: string | null;
+	to: string | null;
+	by: string;
+}
 
 export interface WorkloadRow {
 	id: string;
@@ -549,6 +558,20 @@ export class Ledger {
 	}
 
 	/**
+	 * Extend the lease of `holder` only while it still holds the open workload: one UPDATE, no holder change written (PLAN
+	 * wl-mvidsu83epvpj4 D2b). Unlike `claimWorkload` it never takes an unheld or lapsed workload, so a renewal racing the
+	 * holder's own release cannot undo it. Returns whether it renewed.
+	 */
+	renewLease(id: string, input: Stamp & { holder: string; leaseMs: number }): boolean {
+		const t = this.now();
+		const until = new Date(Date.parse(t) + input.leaseMs).toISOString();
+		return this.write(() => this.db.query(
+			`UPDATE workloads SET holder_lease_until = ?, changed_by = ?, changed_at = max(changed_at, ?), rev = rev + 1
+			 WHERE id = ? AND status = 'open' AND holder = ? RETURNING id`,
+		).all(until, input.by, t, id, input.holder).length === 1);
+	}
+
+	/**
 	 * Release only when `holder` still holds the workload (DESIGN-lane-launcher.md decision 5): a
 	 * stale lane cannot release a live one. Zero rows is the typed refusal, naming the current holder.
 	 */
@@ -567,11 +590,11 @@ export class Ledger {
 
 	/**
 	 * What a launch decision reads (the surface's own predicate run, and `reserveLane` inside its
-	 * transaction): the workload row, its entries, questions, instructions and slices, and the
-	 * live-lane count at `now`. Null when there is no such workload. `capExempt` is the set of
-	 * workloads outside the lane cap (the surface's open merge trains; this module knows no trains):
-	 * their holders are not counted in `liveLanes`, and `ReserveRows.capExempt` says whether this
-	 * workload is one of them.
+	 * transaction): the workload row, its entries, questions, instructions and slices, its holder
+	 * history, and the live-lane count at `now`. Null when there is no such workload. `capExempt` is
+	 * the set of workloads outside the lane cap (the surface's open merge trains; this module knows no
+	 * trains): their holders are not counted in `liveLanes`, and `ReserveRows.capExempt` says whether
+	 * this workload is one of them.
 	 */
 	launchRows(workloadId: string, cap: number, opts: { capExempt?: ReadonlySet<string> } = {}): ReserveRows | null {
 		const now = this.now();
@@ -584,6 +607,7 @@ export class Ledger {
 			instructions: this.instructions(workloadId),
 			slices: this.slices(workloadId),
 			holders: this.holders(workloadId),
+			holderChanges: this.holderChanges(workloadId),
 			liveLanes: this.liveLaneHolders(now, opts.capExempt).length,
 			capExempt: opts.capExempt?.has(workloadId) ?? false,
 			cap,
@@ -1049,14 +1073,14 @@ export class Ledger {
 		return out;
 	}
 
-	/** Every `holder a->b` change the workloads provenance trigger recorded, oldest first; `from` / `to` null for no holder (`-`). */
-	holderChanges(workloadId: string): { at: string; from: string | null; to: string | null }[] {
-		const rows = this.db.query<{ at: string; detail: string | null }, [string]>(
-			"SELECT at, detail FROM provenance WHERE workload_id = ? AND tbl = 'workloads' AND action = 'update' ORDER BY seq").all(workloadId);
-		const out: { at: string; from: string | null; to: string | null }[] = [];
+	/** Every `holder a->b` change the workloads provenance trigger recorded, oldest first, with its writer (`HolderChange`). */
+	holderChanges(workloadId: string): HolderChange[] {
+		const rows = this.db.query<{ at: string; detail: string | null; lane_instance: string }, [string]>(
+			"SELECT at, detail, lane_instance FROM provenance WHERE workload_id = ? AND tbl = 'workloads' AND action = 'update' ORDER BY seq").all(workloadId);
+		const out: HolderChange[] = [];
 		for (const r of rows) {
 			const m = /(?:^|\s)holder (\S+?)->(\S+)/.exec(r.detail ?? "");
-			if (m) out.push({ at: r.at, from: m[1] === "-" ? null : m[1]!, to: m[2] === "-" ? null : m[2]! });
+			if (m) out.push({ at: r.at, from: m[1] === "-" ? null : m[1]!, to: m[2] === "-" ? null : m[2]!, by: r.lane_instance });
 		}
 		return out;
 	}

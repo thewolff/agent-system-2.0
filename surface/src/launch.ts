@@ -1293,6 +1293,15 @@ export function doneBecause(entries: readonly EntryRow[], holders: readonly stri
 	return null;
 }
 
+/**
+ * Whether a receipt stands for the runner (PLAN wl-mvidsu83epvpj4 D2): a holder's `done-because:` (`doneBecause`), never on a
+ * merge train (PLAN wl-mvr888nftz0vcl D3: a train is permanent, so a legacy standing done-because on it is no receipt). The
+ * runner's turn-end input and its stop-poll trigger (`terminalNow`) both read it here (PLAN wl-mw0ytmzi89d683 F3).
+ */
+export function laneReceipt(entries: readonly EntryRow[], holders: readonly string[], train: boolean): boolean {
+	return !train && doneBecause(entries, holders) !== null;
+}
+
 /** Jo's words for `supersede <wl-A> <wl-B>` (PLAN wl-mv5i3lulwwbbi8 D2): the instruction body on A that `superseded:` names. */
 export function supersedeInstructionBody(workloadId: string, by: string): string {
 	return `supersede ${workloadId} ${by}`;
