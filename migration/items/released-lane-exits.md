@@ -1,7 +1,7 @@
 ---
 title: A released lane's omp ends, and a released lane never blocks a relaunch
 status: open
-workload: wl-mvidsu83epvpj4
+workload: wl-mw0ytmzi89d683
 pr: none
 ---
 **Why:** after a lane released its workload, wrote `released-open:` or wrote `done-because:`, its omp rpc child often stayed alive. In omp 18.8.6 rpc mode `pi.shutdown()` only requests shutdown, and the process exits once background work drains, so an unsettled background job kept omp up. The runner (`surface/scripts/lane.ts`) then waited the full 15-minute settle window, and the starter refused every relaunch with `lane reserve: <wl> not launched: held: <lane> still running (omp pid N)` (exit 7). Reported in jo-issues #184 (https://github.com/thewolff/jo-issues/issues/184), jo-issues #47 (https://github.com/thewolff/jo-issues/issues/47) and agent-system-2.0 #283 (https://github.com/thewolff/agent-system-2.0/issues/283). Plan: `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mvidsu83epvpj4/PLAN.md` rev 9.

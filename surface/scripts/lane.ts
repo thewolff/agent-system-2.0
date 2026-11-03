@@ -580,7 +580,9 @@ function liveTrainLane(
 		if (w.holder !== null && heldLive(w, now)) return { laneId: w.holder, workloadId: other };
 		const entries = ledger.entries(other);
 		const control = controlEntries(entries, holdersOf(entries, w.holder, ledger.holders(other)));
-		const live = liveLaneOf(control, (laneId) => probeFor(laneId, other));
+		// No holder history: a peer train's lane refuses while its runner or omp lives, self-released or not (PLAN
+		// wl-mw0ytmzi89d683 F1); only the next spawner on the same workload ends a stale omp, so only that check skips it.
+		const live = liveLaneOf(control, [], (laneId) => probeFor(laneId, other));
 		if (live !== null) return { laneId: live.laneId, workloadId: other };
 		if (!pending) continue;
 		for (const a of attempts(control)) {
@@ -2214,12 +2216,13 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 
 	/**
 	 * PLAN wl-mvidsu83epvpj4 D2's terminal signals as the ledger stands: this lane released itself (`selfReleased`, from the
-	 * holder history), and a holder's `done-because:` stands (`receipt`).
+	 * holder history), and a holder's `done-because:` stands (`receipt`; never on a merge train, as the turn-end input reads
+	 * it, PLAN wl-mvr888nftz0vcl D3 and wl-mw0ytmzi89d683 F3).
 	 */
 	const terminalNow = (): { selfReleased: boolean; receipt: boolean } => {
 		const entries = ledger.entries(wl);
 		const holders = holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl));
-		return { selfReleased: selfReleased(ledger.holderChanges(wl), laneId), receipt: doneBecause(entries, holders) !== null };
+		return { selfReleased: selfReleased(ledger.holderChanges(wl), laneId), receipt: !train && doneBecause(entries, holders) !== null };
 	};
 
 	/**
