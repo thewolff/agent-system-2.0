@@ -565,14 +565,21 @@ describe("R33: the worktree fence", () => {
 		expect(() => worktreeFence(wt, l.wl, false)).toThrow("not this worktree's");
 	});
 
-	test.skipIf(!SANDBOX_EXEC)("R32: an rm in the own worktree auto-applies as rule worktree and the fence wraps it under the worktree profile", async () => {
+	test("R32: an rm in the own worktree auto-applies as rule worktree: one auto-applied row, then the worktree mark", async () => {
 		const l = lane();
 		const { wt } = worktreeOf(l);
 		mkdirSync(join(wt, "build"));
 		const c = call("rm -rf build", wt);
-		const r = await rows(l, { fence: ON }).emit("tool_call", c, ctxOf(l.home));
+		expect(await rows(l).emit("tool_call", c, ctxOf(l.home))).toBeUndefined();
 		expect(control(l.ledger, l.wl, "auto-applied").map((e) => e.body)).toEqual([`auto-applied: worktree ${c.toolCallId} by lane-1 cwd ${wt} net no: rm -rf build`]);
 		expect(callMark(c.toolCallId)).toEqual({ kind: "worktree", root: wt });
+	});
+
+	test.skipIf(!SANDBOX_EXEC)("R32: the fence wraps an auto-applied rm in the own worktree under the worktree profile", async () => {
+		const l = lane();
+		const { wt } = worktreeOf(l);
+		mkdirSync(join(wt, "build"));
+		const r = await rows(l, { fence: ON }).emit("tool_call", call("rm -rf build", wt), ctxOf(l.home));
 		const wrapped = String(r?.input?.command);
 		expect(wrapped).toContain(`(allow file-write* (subpath "${wt}")`);
 		expect(wrapped).toContain(`(deny file-write* (literal "${join(wt, ".git")}")`);
