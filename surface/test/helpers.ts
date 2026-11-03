@@ -306,8 +306,10 @@ export function tempRepo(): string {
 /**
  * A scratch root for the lane script: HOME with the profile config and a fresh ledger, the fake omp
  * on PATH ahead of the real binary, a git repo with one commit and a bare remote. The readiness window is the production one
- * (PRECLAIM_LEASE_MS), a failure-only hang guard: a busy full suite can delay the fake omp's claim past seconds, and a test
- * whose subject is the window elapsing sets its own short AGENT_SYSTEM_LANE_READY_MS in `over`. The SIGKILL grace is shortened
+ * (PRECLAIM_LEASE_MS, 3 min), so no test's pass path races it: a busy full suite can delay the fake omp's claim past seconds.
+ * It outlasts every test timeout, so it never fires in a test that is not about it; a lane that never claims shows up as the
+ * test's own timeout (`until` names what it waited for) and `settleDrains`' SIGKILL of the runner. A test whose subject is the
+ * window sets its own short AGENT_SYSTEM_LANE_READY_MS in `over`. The SIGKILL grace is shortened
  * through the runner's test knob; `over` adds or
  * replaces environment variables. The quota polls (`AS2_HEADROOM_POLLS`, classifier/src/headroom.ts) point at a file that
  * does not exist, so the runner's guard is open and never reads the real quota-watch polls (PLAN wl-mv71x5rwdu7eo0 § 4); a

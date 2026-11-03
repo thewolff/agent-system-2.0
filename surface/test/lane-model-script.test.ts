@@ -221,11 +221,13 @@ describe("T4: a named model OMP does not report fails the launch before any prom
 	}, 60_000);
 
 	test("T4b-p: no get_state answer within the readiness window", async () => {
-		// The window elapsing is the subject: a short one, set here (the root's default is the production window).
-		const r = makeRoot({ AGENT_SYSTEM_LANE_READY_MS: "4000" });
+		// The window elapsing is the subject, on the real clock (a runner subprocess takes no fake clock). It is 10 s, well past
+		// any claim delay a busy suite has shown, so the claim lands inside it; get_state never answers inside it (10 min late),
+		// so the window ends on the model check, never on a missed claim.
+		const r = makeRoot({ AGENT_SYSTEM_LANE_READY_MS: "10000" });
 		const { wl } = openWorkload(r, X);
-		launch(r, wl, { steps: DONE, stateDelayMs: 10_000 });
-		await expectModelFailure(r, wl, `named ${X}, no get_state model within 4s`);
+		launch(r, wl, { steps: DONE, stateDelayMs: 600_000 });
+		await expectModelFailure(r, wl, `named ${X}, no get_state model within 10s`);
 	}, 60_000);
 
 	test("T4r-p: a stop accepted after the model failure and before finalisation still leaves one launch-failed: and one lane-died:, both at model (R3-1)", async () => {
@@ -254,17 +256,19 @@ describe("T4: a named model OMP does not report fails the launch before any prom
 
 describe("T5c: lane-ready: only just before the first prompt", () => {
 	test("preparation does not consume the child's claim/model readiness window", async () => {
-		const r = makeRoot();
+		// The window's start is the subject, on the real clock (a runner subprocess takes no fake clock): a 10 s window, and a
+		// prepare that takes 12 s. A clock started at prepare would expire before omp exists; started at spawn, the claim and
+		// the model reply (1.5 s late) land well inside it.
+		const r = makeRoot({ AGENT_SYSTEM_LANE_READY_MS: "10000" });
 		const { wl } = openWorkload(r, X);
 		const realGit = Bun.which("git");
 		if (realGit === null) throw new Error("git is required by the lane fixture");
 		const shim = join(r.root, "bin", "git");
 		// Only the runner's prepare is delayed, not the starter or the child's verifier
-		// self-check in the extension's repository. Its 4s consumes the old readiness clock
-		// before omp exists; the delayed model reply then misses the first poll.
+		// self-check in the extension's repository.
 		writeFileSync(shim, `#!/bin/sh
 if [ -n "$AGENT_SYSTEM_LANE_ID" ] && [ "$2" = ${JSON.stringify(r.repo)} ] && [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; then
-  sleep 4
+  sleep 12
 fi
 exec ${JSON.stringify(realGit)} "$@"
 `);
