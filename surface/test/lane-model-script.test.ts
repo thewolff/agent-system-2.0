@@ -27,8 +27,8 @@ afterAll(async () => {
 	for (const r of roots) rmSync(r.root, { recursive: true, force: true });
 	for (const s of settled) if (s.status === "rejected") throw s.reason;
 }, 120_000);
-const makeRoot = (): LaneRoot => {
-	const r = laneRoot();
+const makeRoot = (over: Record<string, string> = {}): LaneRoot => {
+	const r = laneRoot(over);
 	roots.push(r);
 	return r;
 };
@@ -221,7 +221,8 @@ describe("T4: a named model OMP does not report fails the launch before any prom
 	}, 60_000);
 
 	test("T4b-p: no get_state answer within the readiness window", async () => {
-		const r = makeRoot();
+		// The window elapsing is the subject: a short one, set here (the root's default is the production window).
+		const r = makeRoot({ AGENT_SYSTEM_LANE_READY_MS: "4000" });
 		const { wl } = openWorkload(r, X);
 		launch(r, wl, { steps: DONE, stateDelayMs: 10_000 });
 		await expectModelFailure(r, wl, `named ${X}, no get_state model within 4s`);

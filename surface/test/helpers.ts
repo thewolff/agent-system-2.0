@@ -7,7 +7,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
-import { type ControlEntry, controlEntries, holdersOf, laneStarted } from "../src/launch";
+import { type ControlEntry, controlEntries, holdersOf, laneStarted, PRECLAIM_LEASE_MS } from "../src/launch";
 import { laneDeaths } from "../src/signals";
 import type { SurfaceAPI } from "../src/types";
 
@@ -305,8 +305,10 @@ export function tempRepo(): string {
 
 /**
  * A scratch root for the lane script: HOME with the profile config and a fresh ledger, the fake omp
- * on PATH ahead of the real binary, a git repo with one commit and a bare remote. The readiness
- * window and the SIGKILL grace are shortened through the runner's two test knobs; `over` adds or
+ * on PATH ahead of the real binary, a git repo with one commit and a bare remote. The readiness window is the production one
+ * (PRECLAIM_LEASE_MS), a failure-only hang guard: a busy full suite can delay the fake omp's claim past seconds, and a test
+ * whose subject is the window elapsing sets its own short AGENT_SYSTEM_LANE_READY_MS in `over`. The SIGKILL grace is shortened
+ * through the runner's test knob; `over` adds or
  * replaces environment variables. The quota polls (`AS2_HEADROOM_POLLS`, classifier/src/headroom.ts) point at a file that
  * does not exist, so the runner's guard is open and never reads the real quota-watch polls (PLAN wl-mv71x5rwdu7eo0 § 4); a
  * headroom test passes its own fixture in `over`. `tag` names the temp root (`surface-<tag>-…`): one with spaces puts spaces in
@@ -347,7 +349,7 @@ export function laneRoot(over: Record<string, string> = {}, tag = "lane-root", r
 	const env: Record<string, string> = {
 		PATH: `${bin}:${process.env.PATH ?? ""}`, HOME: home, AGENT_SYSTEM_LEDGER_DB: ledgerPath, FAKE_OMP_RECORD: record, FAKE_OMP_SCRIPT: script,
 		TMPDIR: temp, BUN_INSTALL_CACHE_DIR: bunCache,
-		AGENT_SYSTEM_LANE_READY_MS: "4000", AGENT_SYSTEM_LANE_END_GRACE_MS: "1500", AGENT_SYSTEM_LEASE_MS: "60000", AS2_HEADROOM_POLLS: join(root, "no-headroom-polls.jsonl"), ...over,
+		AGENT_SYSTEM_LANE_READY_MS: String(PRECLAIM_LEASE_MS), AGENT_SYSTEM_LANE_END_GRACE_MS: "1500", AGENT_SYSTEM_LEASE_MS: "60000", AS2_HEADROOM_POLLS: join(root, "no-headroom-polls.jsonl"), ...over,
 	};
 	return { root, home, repo, remote, ledgerPath, record, script, env };
 }
