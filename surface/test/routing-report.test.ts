@@ -265,6 +265,24 @@ describe("routing report: cost per hand", () => {
 		expect(lines).toContain(`  n/a ${h.routingId} ${f.wl} change-small/standard incomplete (1 unparsed line(s); partial usd 0.5000 tokens 200): ${join(f.root, "torn.jsonl")}`);
 	});
 
+	for (const [where, body] of [
+		["alone", ['{"type":"message","message":{"role":"assis', ""]],
+		["between valid messages", [assistant(0.25, 100), '{"type":"message","mess', assistant(0.25, 100), ""]],
+	] as const) {
+		test(`a line torn before the "assistant" marker (${where}) makes the hand incomplete, never a measured zero`, () => {
+			const f = fixture();
+			writeFileSync(join(f.root, "cut.jsonl"), body.join("\n"));
+			f.add({ at: "2026-10-10T01:00:00.000Z", kind: "change-small", tier: "standard", agentId: "cut" });
+			const r = report(f);
+			expect(r.all.cost).toEqual({ hands: 1, read: 0, missing: 0, unreadable: 0, incomplete: 1, usd: 0, tokens: 0 });
+			const h = r.hands[0]!;
+			expect(h).toMatchObject({ state: "incomplete", usd: null, tokens: null, incomplete: { costMissing: 0, malformed: 1, unterminated: false } });
+			const lines = renderRoutingReport(r).split("\n");
+			expect(lines).toContain("cost usd n/a · tokens n/a · read 0 of 1 hands · per hand n/a · n/a 1 (session file missing 0, unreadable 0, incomplete 1)");
+			expect(JSON.parse(JSON.stringify(r)).hands[0]).toMatchObject({ state: "incomplete", usd: null });
+		});
+	}
+
 	test("an unterminated last line makes the hand incomplete, even when every line parses", () => {
 		const f = fixture();
 		writeFileSync(join(f.root, "open.jsonl"), [assistant(0.25, 100), assistant(0.25, 100)].join("\n"));

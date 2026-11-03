@@ -61,8 +61,10 @@ export function sessionFile(row: Pick<RoutingRow, "session_root" | "agent_id">):
 /**
  * One hand's USD and tokens from its single session file, every line through `assistantUsage`. A file that does not
  * exist (ENOENT) is `missing`; any other read error is `unreadable` with its code and message. A file with any
- * assistant message lacking a finite cost, any `"assistant"` line that is not JSON, or an unterminated last line is
- * `incomplete`: its cost is unknown, and the known part rides along for display only.
+ * assistant message lacking a finite cost, any non-empty line that is not JSON, or an unterminated last line is
+ * `incomplete`: its cost is unknown, and the known part rides along for display only. `assistantUsage` parses only
+ * lines naming `"assistant"` (the ceiling meter's fast path); every other line is parsed here, so a line torn before
+ * that marker is still caught (code review r2 F1).
  */
 export function readHandUsage(row: Pick<RoutingRow, "session_root" | "agent_id">): HandUsage {
 	const file = sessionFile(row);
@@ -86,11 +88,22 @@ export function readHandUsage(row: Pick<RoutingRow, "session_root" | "agent_id">
 		usd += u.usd;
 		tokens += u.tokens;
 		if (u.malformed) malformed++;
+		else if (!line.includes('"assistant"') && !parses(line)) malformed++;
 		if (u.costMissing) costMissing++;
 	}
 	const unterminated = lines[lines.length - 1] !== "";
 	if (malformed > 0 || costMissing > 0 || unterminated) return { state: "incomplete", file, costMissing, malformed, unterminated, usd, tokens };
 	return { state: "read", file, usd, tokens };
+}
+
+/** True when `line` is JSON. A session file is JSON lines, so a line that does not parse is torn or corrupt. */
+function parses(line: string): boolean {
+	try {
+		JSON.parse(line);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 export interface CostTotals {
