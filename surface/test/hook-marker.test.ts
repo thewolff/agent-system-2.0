@@ -36,12 +36,19 @@ const EXEC = join(SCRIPTS, "test-exec.ts");
 /**
  * The preload in the writer's process: it holds every hooks-directory writeFileSync half written until the test releases
  * it, and announces the writer's first look for a hooks-directory `.go` (the hook has published) in the wait directory.
+ * Its own signal files (`held-N`, `waiting`) appear whole: written beside, then renamed in, so the test that sees the
+ * name reads the full path (hosted Linux read `waiting` empty between its create and its write, run 41593591693).
  */
 const SEAM = `const fs = require("node:fs");
 const { dirname, join } = require("node:path");
 const { hooks, seam, wait } = JSON.parse(process.env.HOOK_MARKER_SEAM);
 const plain = fs.writeFileSync;
 const exists = fs.existsSync;
+const signal = (path, text) => {
+	const temp = join(dirname(path), "." + process.pid + ".tmp");
+	plain(temp, text);
+	fs.renameSync(temp, path);
+};
 let holds = 0;
 let waiting = false;
 fs.writeFileSync = (path, data, opts) => {
@@ -53,7 +60,7 @@ fs.writeFileSync = (path, data, opts) => {
 	try {
 		let at = 0;
 		while (at < half) at += fs.writeSync(fd, bytes, at, half - at);
-		plain(join(seam, "held-" + holds++), path);
+		signal(join(seam, "held-" + holds++), path);
 		fs.closeSync(fs.openSync(join(seam, "release"), "r"));
 		while (at < bytes.length) at += fs.writeSync(fd, bytes, at, bytes.length - at);
 	} finally {
@@ -63,7 +70,7 @@ fs.writeFileSync = (path, data, opts) => {
 fs.existsSync = (path) => {
 	if (!waiting && typeof path === "string" && dirname(path) === hooks && path.endsWith(".go")) {
 		waiting = true;
-		plain(join(wait, "waiting"), path);
+		signal(join(wait, "waiting"), path);
 	}
 	return exists(path);
 };
