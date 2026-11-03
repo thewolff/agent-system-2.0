@@ -2578,16 +2578,16 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		// Real-clock timing under test (PLAN R16): the production contract at STUCK_DEFAULTS, with main's bounds and main's 3 s
 		// slack, each constant charged once. The timing linter's opt-out names only a fake clock, so these carry no opt-out
 		// marker; they measure named timestamps, as main's signature-to-exit bound did.
-		const { tickMs, persistMs, signatureCaptureMs, stopGraceMs, verifyMs } = STUCK_DEFAULTS;
+		const { persistMs, signatureCaptureMs, stopGraceMs, verifyMs } = STUCK_DEFAULTS;
 		// The signature held persistMs before the stop (main's bound, 50 ms under it).
 		expect(figures.signatureToStopMs).toBeGreaterThanOrEqual(persistMs - 50);
 		// Signature to confirmed exit: the persistence, the signature capture's deadline, the stop grace and the exit verification.
 		expect(figures.signatureToExitMs).toBeLessThan(persistMs + signatureCaptureMs + stopGraceMs + verifyMs + 3_000);
 		// Stop to confirmed exit: the signature capture's deadline, the stop grace and the exit verification.
 		expect(figures.stopToExitMs).toBeLessThan(signatureCaptureMs + stopGraceMs + verifyMs + 3_000);
-		// From ready: the first tick after it may compare a window that began before the spin, so the tick after that is the
-		// first whose whole window is hot (2 × tickMs); then the same budget. A slow first observation fails here.
-		expect(figures.totalMs).toBeLessThan(2 * tickMs + persistMs + signatureCaptureMs + stopGraceMs + verifyMs + 3_000);
+		// Ready to exit is recorded, not bounded: main had no such bound, and a real tick that loses the signature (a loaded
+		// host) restarts its persistence, so the stop can come well after the first signature (hosted macOS run 41600363639:
+		// first signature 1937 ms after ready, the persisted one 15982 ms, signature to exit 7353 ms inside its bound).
 		await exitOf(ready.worker);
 		expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
 		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
