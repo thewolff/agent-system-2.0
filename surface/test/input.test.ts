@@ -3,7 +3,8 @@
 // bare answer word with more than one target is ambiguous; a numbered batch is checked whole
 // against the session numbering (MIGRATION.md § M7 follow-ups item 1); the review round limit's
 // words and answers (PLAN wl-mupu0sx2o046io D9, D10); `cancel-slice`, `supersede` and the plan-first
-// approve receipt (PLAN wl-mv5i3lulwwbbi8 D1, D2, D4); Jo's `ask-all` / `auto-routine` (PLAN wl-mvqwn80onq9hq8 D1, R12).
+// approve receipt (PLAN wl-mv5i3lulwwbbi8 D1, D2, D4); Jo's `ask-all` / `auto-routine` (PLAN wl-mvqwn80onq9hq8 D1, R12); the alert
+// path's `urgent|asap|calm <wl>` and `ack <wl-…|alert key>` (PLAN wl-mw0vs9uc3xqtka D6).
 import { describe, expect, test } from "bun:test";
 import { appendFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -17,7 +18,8 @@ import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, TEST_RUNNER_BY } from "../../l
 import { LEDGER_DB_ENV } from "../../ledger/src/locality";
 import { errorLines } from "../src/errors";
 import { apply, applyTrain, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
-import { boundPrs, controlEntries, holdersOf, landFirstOn, mainRetries, planFirst, planFirstBody, verdictOf, waivedPrs, waivePrBody, withdrawnBy } from "../src/launch";
+import { ALERT_BY, type AlertRow, alertBody, boundPrs, controlEntries, holdersOf, landFirstOn, mainRetries, planFirst, planFirstBody, verdictOf, waivedPrs, waivePrBody, withdrawnBy } from "../src/launch";
+import { ACK_WORD, alertAcks, alertWords, URGENCY_WORDS, urgencyOf } from "../src/alert-path";
 import { runnerPreflightBody } from "../src/main-state";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { ensureStandingWorkload } from "../src/identity";
@@ -2029,5 +2031,100 @@ describe("a question offering an option named raise keeps its answers (PLAN wl-m
 		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Raise?", options: ["raise", "hold"] });
 		expect(interpret(ledger, `raise 25 ${q}`)).toEqual({ kind: "refused", why: `${q} is not the merge train's budget question; \`raise <usd>\` answers only that one` });
 		expect(ledger.question(q)!.state).toBe("open");
+	});
+});
+
+describe("urgent / asap / calm <wl> and ack <wl-…|alert key>: Jo's words on the alert path (PLAN wl-mw0vs9uc3xqtka D6)", () => {
+	/** An open workload, and a writer of ALERT_BY's `alert:` rows on the standing workload. */
+	const setup = () => {
+		const c = clock("2026-11-03T10:00:00.000Z");
+		const { ledger } = tempLedger(c.now);
+		ensureStandingWorkload(ledger);
+		const { wl } = workloadWithSlice(ledger);
+		const write = (key: string, row: AlertRow) => ledger.recordEntry({ by: ALERT_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: alertBody(key, row) });
+		/** A raised episode of `key` about `about` (null: a key of no workload), its level-`level` send recorded. */
+		const open = (key: string, about: string | null, level = 1) => {
+			write(key, { row: "raised", kind: about === null ? "main-red" : "ceiling", start: 1, digest: "0123456789ab", words: alertWords({ title: key, text: "t", next: "n", workloadId: about }) });
+			write(key, { row: "level", level, step: "sent", url: null });
+		};
+		return { c, ledger, wl, write, open };
+	};
+
+	test("each urgency word writes Jo's instruction on the workload that urgencyOf reads, newest winning, and names the workload's open alerts", () => {
+		const { ledger, wl, open } = setup();
+		open(`ceiling:${wl}`, wl, 2);
+		open("main:thewolff/x", null);
+		const inputRow = () => null;
+		const urgentOf = () => urgencyOf({ id: wl, brief: "nothing quoted" }, ledger.instructions(wl), inputRow);
+		const words = ["urgent", "calm", "ASAP"] as const;
+		for (const word of words) {
+			const cmd = interpret(ledger, `${word} ${wl}`);
+			expect(cmd).toEqual({ kind: "urgency", workloadId: wl, word: word.toLowerCase() });
+			const receipt = apply(ledger, cmd!);
+			const ins = ledger.instructions(wl).at(-1)!;
+			expect([ins.body, ins.author, ins.channel]).toEqual([`${word.toLowerCase()} ${wl}`, "jo", "surface"]);
+			expect(receipt).toContain(`(instruction ${ins.id}); its open alerts: ceiling:${wl} (level 2)`);
+			expect(receipt).not.toContain("main:thewolff/x");
+			expect(urgentOf()).toMatchObject({ urgent: word !== "calm", from: `${word.toLowerCase()} ${ins.id}` });
+		}
+		expect(URGENCY_WORDS).toEqual(["urgent", "asap", "calm"]);
+	});
+
+	test("an urgency word on no open workload is refused with nothing written; the word alone, or naming no workload, is not this command", () => {
+		const { ledger, wl } = setup();
+		expect(interpret(ledger, "urgent wl-nope")).toEqual({ kind: "refused", why: "wl-nope is not an open workload" });
+		expect(interpret(ledger, `calm ${STANDING_WORKLOAD_ID}`)).toEqual({ kind: "refused", why: `${STANDING_WORKLOAD_ID} is not an open workload` });
+		expect(interpret(ledger, "urgent")).toBeNull();
+		expect(interpret(ledger, "asap please")).toBeNull();
+		expect(ledger.instructions(wl)).toEqual([]);
+	});
+
+	test("ack <wl-…> writes Jo's instruction on that workload, which alertAcks reads, and names every open alert of it", () => {
+		const { ledger, wl, open } = setup();
+		const sl = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "ask", doneCondition: "answered", inputs: "none" });
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "?", options: ["ack", "no"] });
+		open(`ceiling:${wl}`, wl, 2);
+		open(`q:${q}`, wl, 3);
+		open("main:thewolff/x", null);
+		const cmd = interpret(ledger, `ack ${wl}`);
+		expect(cmd).toEqual({ kind: "ack", workloadId: wl, target: wl });
+		const receipt = apply(ledger, cmd!);
+		const ins = ledger.instructions(wl).at(-1)!;
+		expect([ins.body, ins.author]).toEqual([`${ACK_WORD} ${wl}`, "jo"]);
+		expect(alertAcks(ledger.instructions(wl))).toEqual([{ target: wl, id: ins.id, at: ins.created_at }]);
+		expect(receipt).toBe(`acked ceiling:${wl} (level 2), q:${q} (level 3) (instruction ${ins.id} on ${wl}); the alert pass closes their issues and stops their escalation`);
+		// `ack q-…` stays an answer to the question that offers `ack`
+		expect(interpret(ledger, `ack ${q}`)).toMatchObject({ kind: "answer", questionId: q });
+	});
+
+	test("ack <alert key> of no workload is recorded on the standing workload; a key of a workload on that workload", () => {
+		const { ledger, wl, open } = setup();
+		open("main:thewolff/x", null);
+		open(`ceiling:${wl}`, wl);
+		const r1 = apply(ledger, interpret(ledger, "ack main:thewolff/x")!);
+		const standing = ledger.instructions(STANDING_WORKLOAD_ID).at(-1)!;
+		expect(alertAcks([standing]).map((a) => a.target)).toEqual(["main:thewolff/x"]);
+		expect(r1).toBe(`acked main:thewolff/x (level 1) (instruction ${standing.id} on ${STANDING_WORKLOAD_ID}); the alert pass closes their issues and stops their escalation`);
+		expect(interpret(ledger, `ack ceiling:${wl}`)).toEqual({ kind: "ack", workloadId: wl, target: `ceiling:${wl}` });
+	});
+
+	test("ack with nothing open to ack is refused naming what is open, with nothing written; an acked episode is no longer open", () => {
+		const { ledger, wl, write, open } = setup();
+		expect(interpret(ledger, `ack ${wl}`)).toEqual({ kind: "refused", why: `no open alert on ${wl} to ack (no alert is open)` });
+		open("main:thewolff/x", null);
+		expect(interpret(ledger, "ack chaos:nope")).toEqual({ kind: "refused", why: "no open alert chaos:nope to ack (open: main:thewolff/x (level 1))" });
+		expect(interpret(ledger, "ack wl-nope")).toEqual({ kind: "refused", why: "wl-nope is no workload" });
+		write("main:thewolff/x", { row: "acked", why: "ack" });
+		expect(interpret(ledger, "ack main:thewolff/x")).toEqual({ kind: "refused", why: "no open alert main:thewolff/x to ack (no alert is open)" });
+		expect(ledger.instructions(wl)).toEqual([]);
+		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
+		expect(interpret(ledger, "ack")).toBeNull();
+	});
+
+	test("in a paste: an ack line is a command; `urgent wl-nope` refuses the paste on its line", () => {
+		const { ledger, wl, open } = setup();
+		open(`ceiling:${wl}`, wl);
+		expect(interpretPaste(ledger, new Numbering(), `ack ${wl}\ncalm ${wl}`)).toMatchObject({ ok: true });
+		expect(interpretPaste(ledger, new Numbering(), `ack ${wl}\nurgent wl-nope`)).toMatchObject({ ok: false });
 	});
 });

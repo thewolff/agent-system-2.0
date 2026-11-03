@@ -1674,6 +1674,27 @@ describe("item 40: lane_release with work open, and the terminal pair while a ha
 		expect(ctx.shutdowns).toHaveLength(0);
 	});
 
+	test("wl-mw0vs9uc3xqtka D2.3: every release writes lane-released: as the lane, a valid control entry, open work or not; a refused release writes none", async () => {
+		const released = (ledger: Ledger, wl: string) => {
+			const entries = ledger.entries(wl);
+			return controlEntries(entries, holdersOf(entries, ledger.workload(wl)!.holder, ledger.holders(wl))).filter((c) => c.prefix === "lane-released").map((c) => [c.createdBy, c.laneId]);
+		};
+		const withOpen = laneFixture();
+		withOpen.ledger.addSlice({ by: "lane-t-1", workloadId: withOpen.wl, task: "open", doneCondition: "d", inputs: "i" });
+		expect(await withOpen.call("lane_release", {})).toContain("Released");
+		expect(released(withOpen.ledger, withOpen.wl)).toEqual([["lane-t-1", "lane-t-1"]]);
+
+		const idle = laneFixture();
+		expect(await idle.call("lane_release", {})).toContain("Released");
+		expect(released(idle.ledger, idle.wl)).toEqual([["lane-t-1", "lane-t-1"]]);
+
+		const refused = laneFixture();
+		refused.ledger.releaseWorkload(refused.wl, { by: "lane-t-1", holder: "lane-t-1" });
+		refused.ledger.claimWorkload(refused.wl, { by: "lane-x", holder: "lane-x", leaseMs: 60_000 });
+		expect(await refused.call("lane_release", {})).not.toContain("Released");
+		expect(released(refused.ledger, refused.wl)).toEqual([]);
+	});
+
 	for (const tool of ["lane_release", "lane_handoff"] as const) {
 		test(`D6: ${tool} refuses while this lane's hand is unsettled (a forged settle included), and goes through once it settles; another lane's hand does not block`, async () => {
 			const { ledger, wl, ctx, call } = laneFixture();
@@ -2085,6 +2106,6 @@ describe("a lane cannot forge a quota move's NOW line (PLAN wl-mvwk0v0gmp6cjc D4
 		);
 		expect(ledger.workload(wl)!.held_messages).toBe(held);
 		expect(quotaMoves(ledger)).toEqual([]);
-		expect(errorLines(ledger, undefined, { movePidProbe: () => false }).filter((l) => l.kind === "quota-move" || l.kind === "quota-move-alert")).toEqual([]);
+		expect(errorLines(ledger).filter((l) => l.kind === "quota-move" || l.kind === "alert")).toEqual([]);
 	});
 });

@@ -68,7 +68,7 @@ import { recordRepo } from "../src/decision-log";
 import { laneDir, STARTER_EXIT, worktreePath } from "../src/launch";
 import { type Proxy, type ProxyAttempt, startProxy } from "./chaos-proxy";
 import { type Stub, type StubProfile, type StubRequest, type StubScript, type StubTurn, startStub, writeStubProfile } from "./chaos-stub";
-import { isRunnerCommand } from "./lane";
+import { isRunnerCommand } from "../src/runner-probe";
 
 /**
  * Hosts whose measured-phase proxy attempts are listed in the report rather than failing the run.

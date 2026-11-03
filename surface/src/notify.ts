@@ -1,11 +1,11 @@
-// The two ways as2 gets Jo's attention outside a session (PLAN wl-mvwks11ye3x9zu "Alerts", amendment A1):
+// The ways as2 gets Jo's attention outside a session (PLAN wl-mvwks11ye3x9zu "Alerts", amendment A1; PLAN wl-mw0vs9uc3xqtka D3):
 //
-// - `realNotify`: the merge train's banner, moved here unchanged from surface/scripts/train-tick.ts (PR #412): an
-//   osascript `display notification` with no sound clause, so train popups stay silent under Jo's silent-popup alarm
-//   rule. It does not stay up and does not wait.
+// - `realNotify`: the doctor's banner: an osascript `display notification` with no sound clause, so popups stay silent under
+//   Jo's silent-popup alarm rule. It does not stay up and does not wait.
 // - `alarmPopup`: the alarm rule's stay-up popup (.ai/decision-log/2026-10-28--1400--plumb--alarms-show-a-silent-popup-
 //   before-any-sound.md), by running the repo's own install/drive-backup/quiet-alarm.zsh "<title>" "<text>" "<spoken>"
-//   with QUIET_ALARM_GIVE_UP_SECS (12 h for the doctor's popups). It blocks until Jo answers or the dialog gives up.
+//   with QUIET_ALARM_GIVE_UP_SECS (12 h for the doctor's popups and the alert path's). It blocks until Jo answers or the
+//   dialog gives up.
 //   quiet-alarm's exit: 0 shown (Jo picked a button, dismissed it, or it gave up; any sound asked for played) →
 //   `answered <button>`; 3 shown, Jo picked "Read it to me", the Glass sound or the speech failed → `answered
 //   audio-failed <its stderr line>`; 1 or anything else (the popup could not be shown), a spawn failure or a timeout →
@@ -14,9 +14,18 @@
 //   still exit 0 after the dialog was answered). The dialog stays answered, so it is never shown again for such a line;
 //   the caller reports the line and fails its run. Tests point quiet-alarm's QUIET_ALARM_OSASCRIPT / QUIET_ALARM_AFPLAY
 //   / QUIET_ALARM_SAY seams at fakes, or inject the runner, so no test ever shows the real dialog.
-import { join } from "node:path";
+// - `kickAlerts`: start the alert pass (surface/scripts/alert-tick.ts) at once, detached, after an urgent event's writer
+//   recorded it (the runner after a quota move or a ceiling stop, the classifier after a hand's quota move). The train
+//   tick runs the same pass every 5 minutes, so a kick that cannot start is reported by its caller and the next tick does
+//   the work. `spawnDetached` is also how the pass starts its popup worker (surface/scripts/alert-popup.ts).
+import { closeSync, mkdirSync, openSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { spawn } from "bun";
+import { SCRATCH_ENV } from "../../gates/src/scratch";
+import { LANE_ENV, ROLE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
+import { homeDir } from "../../ledger/src/locality";
 
-/** No sound clause: train popups stay silent under Jo's silent-popup alarm rule. */
+/** No sound clause: the banner stays silent under Jo's silent-popup alarm rule. */
 export function realNotify(title: string, text: string): boolean {
 	const str = (s: string) => `"${s.replace(/[\\"]/g, (c) => `\\${c}`)}"`;
 	const r = Bun.spawnSync(["osascript", "-e", `display notification ${str(text)} with title ${str(title)}`], { stdout: "pipe", stderr: "pipe", timeout: 10_000 });
@@ -88,4 +97,51 @@ export function alarmPopup(title: string, text: string, spoken: string, opts: Al
 		return { state: "answered", detail: oneLine(choice || "shown (no choice line)"), stderr, otherStderr };
 	}
 	return { state: "failed", detail: oneLine(`${what} exited ${r.code ?? "on a signal"}: ${stderr.trim() || "no error text"}`), stderr };
+}
+
+/** A detached process start: argv, its environment, and the log its stdout and stderr append to; returns its pid or throws. */
+export type DetachedSpawn = (argv: string[], env: Record<string, string>, log: string) => number;
+
+/** Bun.spawn detached (its own session and process group), stdin ignored, both streams appended to `log` (created with its directory), unref'd. */
+export const spawnDetached: DetachedSpawn = (argv, env, log) => {
+	mkdirSync(dirname(log), { recursive: true });
+	const fd = openSync(log, "a");
+	try {
+		const p = spawn(argv, { env, stdin: "ignore", stdout: fd, stderr: fd, detached: true });
+		p.unref();
+		return p.pid;
+	} finally {
+		closeSync(fd);
+	}
+};
+
+/** `env` without the lane binding (role, workload, lane id, scratch root), as lane.ts `starterEnv` drops it: the alert pass is not a lane. */
+export function unboundEnv(env: Record<string, string | undefined>): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [k, v] of Object.entries(env)) if (v !== undefined && k !== ROLE_ENV && k !== WORKLOAD_ENV && k !== LANE_ENV && k !== SCRATCH_ENV) out[k] = v;
+	return out;
+}
+
+/** The bun that runs a detached script: this process's when it is bun, else `bun` on PATH. */
+export const BUN = basename(process.execPath).startsWith("bun") ? process.execPath : "bun";
+
+/** The alert pass's entry point, beside this checkout's other scripts. */
+export const ALERT_TICK_SCRIPT = join(import.meta.dir, "..", "scripts", "alert-tick.ts");
+
+/** The log the kicked passes and the popup workers append to: AS2_ALERT_SPAWN_LOG, else `~/.agent-system-2/alert-pass.log`. */
+export function alertSpawnLog(env: Record<string, string | undefined> = process.env): string {
+	return env.AS2_ALERT_SPAWN_LOG || join(homeDir(env), ".agent-system-2", "alert-pass.log");
+}
+
+/**
+ * Start one alert pass now (`bun surface/scripts/alert-tick.ts`, detached, the lane binding dropped) after `why` (the event its
+ * writer just recorded); returns its pid. Throws naming the spawn's failure: the caller reports it, and the train tick's next
+ * pass does the work. Two passes never overlap: the pass takes its lock (alert-tick.ts), and a pass that finds it held exits 0.
+ */
+export function kickAlerts(why: string, spawnFn: DetachedSpawn = spawnDetached, env: Record<string, string | undefined> = process.env): number {
+	try {
+		return spawnFn([BUN, ALERT_TICK_SCRIPT, "--kicked-by", why.replace(/\s+/g, "-")], unboundEnv(env), alertSpawnLog(env));
+	} catch (err) {
+		throw new Error(`the alert pass could not be kicked after ${why}: ${err instanceof Error ? err.message : String(err)}; the train tick's next pass (every 5 minutes) does the work`);
+	}
 }

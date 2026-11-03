@@ -1,5 +1,5 @@
-// The omp liveness probe one copy serves: `lane.ts`'s run guard (`runnerProbe`, `startTime`,
-// `selfIdentity`) and the classifier's lost-hand settle (classifier/extension.ts `handLost`, PLAN
+// The omp liveness probe one copy serves: the run guard (`runnerProbe`, `selfIdentity` in surface/src/runner-probe.ts, `startTime`
+// in surface/scripts/lane.ts) and the classifier's lost-hand settle (classifier/extension.ts `handLost`, PLAN
 // wl-mv64rsqw2fcs1s D2). Every ps call goes through `runPs`, bounded by PS_TIMEOUT_MS, and is read
 // strictly (`psAnswer`): only ps's clean "no such process" reads as gone, never a failure.
 import { spawnSync } from "bun";

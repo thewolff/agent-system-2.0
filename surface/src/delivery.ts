@@ -11,7 +11,9 @@
 // The consumer half: a delivered line's held orchestrator-bound messages move to `delivered`
 // (P-7c one step), which is what makes a lane death "surfaced once" and what keeps a held
 // `artifact-failed:` message from ever meaning "no live lane" (fable (a)). A notice
-// (surface/src/notice.ts) is shown only while held, so this one step is also what makes it shown once.
+// (surface/src/notice.ts) is shown only while held, so this one step is also what makes it shown once. An ALERT line (PLAN
+// wl-mw0vs9uc3xqtka D4, surface/src/errors.ts `alertLines`) carries no message, so a delivery consumes nothing of it: it is
+// level-triggered, delivered again at each new state (its level and standing errors), and shown until its episode ends.
 import { type Ledger, type MessageRow, TEST_RUNNER_BY } from "../../ledger/src/index";
 import type { ErrorLine } from "./errors";
 import { QUOTA_MOVE_PREFIX, trustedQuotaMove } from "./quota-move-alert";

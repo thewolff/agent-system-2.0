@@ -1,0 +1,986 @@
+{
+ "what": "wl-mw01xdcflkdnq0 as of 2026-11-03T10:52:00.000Z, 33 s after the runner stopped lane-mw01xdcflkdnq0-4 at its ceiling (en-mw0ki8aaswx2wy lane-stop and en-mw0ki8fxrzf6r4 lane-exit at 10:51:27Z; ceiling in force $150, en-mw01xdchwe35kh); PLAN wl-mw0vs9uc3xqtka D8.",
+ "as_of": "2026-11-03T10:52:00.000Z",
+ "built_from": "source-rows.json: rows created after as_of dropped; the mutable fields that changed after as_of restored to their as_of values from the live ledger's provenance table (sqlite3 -readonly ~/.agent-system-2/ledger.db)",
+ "loader": "load.ts replays these rows through the ledger's triggers: each row inserted as its table's triggers require (rev 0, open/held, stamps equal to creation), then moved to its state here at its changed_at. State fields (status, holder, holder_lease_until, closed_at, state, resolved_by, artifact) are reproduced and checked; rev counts are not (the loader makes one update per changed row).",
+ "dropped": [
+  {
+   "table": "slices",
+   "id": "sl-lf-submit-run",
+   "created_at": "2026-11-03T16:15:05.260Z"
+  },
+  {
+   "table": "questions",
+   "id": "q-mw0vvcsw89e5uh",
+   "created_at": "2026-11-03T16:09:35.888Z"
+  },
+  {
+   "table": "questions",
+   "id": "q-mw0w2inu4s6gff",
+   "created_at": "2026-11-03T16:15:10.074Z"
+  },
+  {
+   "table": "instructions",
+   "id": "in-mw0vpq0e40spy2",
+   "created_at": "2026-11-03T16:05:13.070Z"
+  },
+  {
+   "table": "instructions",
+   "id": "in-mw0vsjwmdbilh5",
+   "created_at": "2026-11-03T16:07:25.126Z"
+  },
+  {
+   "table": "instructions",
+   "id": "in-mw0w1t2s427hp3",
+   "created_at": "2026-11-03T16:14:36.916Z"
+  },
+  {
+   "table": "instructions",
+   "id": "in-mw0w1t2u9bl4zn",
+   "created_at": "2026-11-03T16:14:36.918Z"
+  },
+  {
+   "table": "instructions",
+   "id": "in-mw0w6w6pwlqypx",
+   "created_at": "2026-11-03T16:18:34.225Z"
+  },
+  {
+   "table": "entries",
+   "id": "en-mw0vpq0e63zp3p",
+   "created_at": "2026-11-03T16:05:13.070Z"
+  }
+ ],
+ "restored": [
+  {
+   "table": "workloads",
+   "id": "wl-mw01xdcflkdnq0",
+   "field": "status",
+   "live": "closed",
+   "at_10_52Z": "open",
+   "receipt": "provenance seq 789645 (2026-11-03T10:51:27.742Z, lane-mw01xdcflkdnq0-4: holder lane-mw01xdcflkdnq0-4->- lease -) is the last workload update at or before 10:52:00Z, the 5360th; the next is seq 792424 at 16:05:30Z; status open->closed is seq 793289 at 16:20:31.838Z"
+  },
+  {
+   "table": "workloads",
+   "id": "wl-mw01xdcflkdnq0",
+   "field": "closed_at",
+   "live": "2026-11-03T16:20:31.838Z",
+   "at_10_52Z": null,
+   "receipt": "provenance seq 789645 (2026-11-03T10:51:27.742Z, lane-mw01xdcflkdnq0-4: holder lane-mw01xdcflkdnq0-4->- lease -) is the last workload update at or before 10:52:00Z, the 5360th; the next is seq 792424 at 16:05:30Z; status open->closed is seq 793289 at 16:20:31.838Z"
+  },
+  {
+   "table": "workloads",
+   "id": "wl-mw01xdcflkdnq0",
+   "field": "holder",
+   "live": null,
+   "at_10_52Z": null,
+   "receipt": "provenance seq 789645 (2026-11-03T10:51:27.742Z, lane-mw01xdcflkdnq0-4: holder lane-mw01xdcflkdnq0-4->- lease -) is the last workload update at or before 10:52:00Z, the 5360th; the next is seq 792424 at 16:05:30Z; status open->closed is seq 793289 at 16:20:31.838Z"
+  },
+  {
+   "table": "workloads",
+   "id": "wl-mw01xdcflkdnq0",
+   "field": "holder_lease_until",
+   "live": null,
+   "at_10_52Z": null,
+   "receipt": "provenance seq 789645 (2026-11-03T10:51:27.742Z, lane-mw01xdcflkdnq0-4: holder lane-mw01xdcflkdnq0-4->- lease -) is the last workload update at or before 10:52:00Z, the 5360th; the next is seq 792424 at 16:05:30Z; status open->closed is seq 793289 at 16:20:31.838Z"
+  },
+  {
+   "table": "workloads",
+   "id": "wl-mw01xdcflkdnq0",
+   "field": "changed_by",
+   "live": "orchestrator-surface",
+   "at_10_52Z": "lane-mw01xdcflkdnq0-4",
+   "receipt": "provenance seq 789645 (2026-11-03T10:51:27.742Z, lane-mw01xdcflkdnq0-4: holder lane-mw01xdcflkdnq0-4->- lease -) is the last workload update at or before 10:52:00Z, the 5360th; the next is seq 792424 at 16:05:30Z; status open->closed is seq 793289 at 16:20:31.838Z"
+  },
+  {
+   "table": "workloads",
+   "id": "wl-mw01xdcflkdnq0",
+   "field": "changed_at",
+   "live": "2026-11-03T16:20:31.838Z",
+   "at_10_52Z": "2026-11-03T10:51:27.742Z",
+   "receipt": "provenance seq 789645 (2026-11-03T10:51:27.742Z, lane-mw01xdcflkdnq0-4: holder lane-mw01xdcflkdnq0-4->- lease -) is the last workload update at or before 10:52:00Z, the 5360th; the next is seq 792424 at 16:05:30Z; status open->closed is seq 793289 at 16:20:31.838Z"
+  },
+  {
+   "table": "workloads",
+   "id": "wl-mw01xdcflkdnq0",
+   "field": "rev",
+   "live": 5450,
+   "at_10_52Z": 5360,
+   "receipt": "provenance seq 789645 (2026-11-03T10:51:27.742Z, lane-mw01xdcflkdnq0-4: holder lane-mw01xdcflkdnq0-4->- lease -) is the last workload update at or before 10:52:00Z, the 5360th; the next is seq 792424 at 16:05:30Z; status open->closed is seq 793289 at 16:20:31.838Z"
+  },
+  {
+   "table": "slices",
+   "id": "sl-orchestrator-questions",
+   "field": "state",
+   "live": "paused",
+   "at_10_52Z": "open",
+   "receipt": "provenance seq 783013 (03:57:03.378Z, paused->open), its 196th update and the last at or before 10:52:00Z; the next is seq 792351 at 16:02:54.719Z (open->paused)"
+  },
+  {
+   "table": "slices",
+   "id": "sl-orchestrator-questions",
+   "field": "changed_by",
+   "live": "orchestrator-surface",
+   "at_10_52Z": "orchestrator-surface",
+   "receipt": "provenance seq 783013 (03:57:03.378Z, paused->open), its 196th update and the last at or before 10:52:00Z; the next is seq 792351 at 16:02:54.719Z (open->paused)"
+  },
+  {
+   "table": "slices",
+   "id": "sl-orchestrator-questions",
+   "field": "changed_at",
+   "live": "2026-11-03T18:14:53.225Z",
+   "at_10_52Z": "2026-11-03T03:57:03.378Z",
+   "receipt": "provenance seq 783013 (03:57:03.378Z, paused->open), its 196th update and the last at or before 10:52:00Z; the next is seq 792351 at 16:02:54.719Z (open->paused)"
+  },
+  {
+   "table": "slices",
+   "id": "sl-orchestrator-questions",
+   "field": "rev",
+   "live": 205,
+   "at_10_52Z": 196,
+   "receipt": "provenance seq 783013 (03:57:03.378Z, paused->open), its 196th update and the last at or before 10:52:00Z; the next is seq 792351 at 16:02:54.719Z (open->paused)"
+  },
+  {
+   "table": "slices",
+   "id": "sl-lf-timing-proof",
+   "field": "state",
+   "live": "done",
+   "at_10_52Z": "paused",
+   "receipt": "provenance seq 787589 (07:19:36.184Z, open->paused on q-mw0cxrzs3xrkz7), its 1st update; paused->open is seq 792920 at 16:14:36.918Z, open->done seq 793241 at 16:19:51.513Z"
+  },
+  {
+   "table": "slices",
+   "id": "sl-lf-timing-proof",
+   "field": "artifact",
+   "live": "Three file series were admitted at candidate 232f059cc565b7144eba098d4996403bcf401dee: tp-0mw0w2d0qffvwstsq, tp-0mw0w2dkef2ooz171 and tp-0mw0w2e56zryapixp. Ids and manifests are in /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/timing-proof/SERIES.md and series.tsv. At 16:19Z `bun scripts/timing-proof.ts inspect --series <id>` showed each series running with 0 runs, and the controllers were alive (pids 96988, 97173, 97425). Verdicts were still pending at release; a series keeps running without the slice (scripts/timing-proof.ts:187).",
+   "at_10_52Z": null,
+   "receipt": "provenance seq 787589 (07:19:36.184Z, open->paused on q-mw0cxrzs3xrkz7), its 1st update; paused->open is seq 792920 at 16:14:36.918Z, open->done seq 793241 at 16:19:51.513Z"
+  },
+  {
+   "table": "slices",
+   "id": "sl-lf-timing-proof",
+   "field": "changed_by",
+   "live": "lane-mw01xdcflkdnq0-7",
+   "at_10_52Z": "lane-mw01xdcflkdnq0-3",
+   "receipt": "provenance seq 787589 (07:19:36.184Z, open->paused on q-mw0cxrzs3xrkz7), its 1st update; paused->open is seq 792920 at 16:14:36.918Z, open->done seq 793241 at 16:19:51.513Z"
+  },
+  {
+   "table": "slices",
+   "id": "sl-lf-timing-proof",
+   "field": "changed_at",
+   "live": "2026-11-03T16:19:51.513Z",
+   "at_10_52Z": "2026-11-03T07:19:36.184Z",
+   "receipt": "provenance seq 787589 (07:19:36.184Z, open->paused on q-mw0cxrzs3xrkz7), its 1st update; paused->open is seq 792920 at 16:14:36.918Z, open->done seq 793241 at 16:19:51.513Z"
+  },
+  {
+   "table": "slices",
+   "id": "sl-lf-timing-proof",
+   "field": "rev",
+   "live": 3,
+   "at_10_52Z": 1,
+   "receipt": "provenance seq 787589 (07:19:36.184Z, open->paused on q-mw0cxrzs3xrkz7), its 1st update; paused->open is seq 792920 at 16:14:36.918Z, open->done seq 793241 at 16:19:51.513Z"
+  },
+  {
+   "table": "slices",
+   "id": "sl-lf-review",
+   "field": "state",
+   "live": "done",
+   "at_10_52Z": "open",
+   "receipt": "provenance seq 789632 (10:51:22.948Z, orchestrator-surface: paused->open), its 2nd update; open->done is seq 792611 at 16:08:38.369Z"
+  },
+  {
+   "table": "slices",
+   "id": "sl-lf-review",
+   "field": "artifact",
+   "live": "Review round 4 (sl-lf-review-4, cross-lab, PR #430 at 232f059cc565b7144eba098d4996403bcf401dee): review-findings {\"findings\":[]}. The round-3 blocking finding (inherited-pipe test deletes failed-holder evidence) is closed, with receipts at surface/test/test-runner.test.ts:43-45,2567-2573,2616-2640. The held-checkpoint proof is retained (test-runner.test.ts:4470-4511; surface/scripts/test-runner.ts:2116-2148,2309-2316). Earlier rounds: r1 2 blocking, r2 3, r3 1, all fixed in b48073ab, 06b86928, e21e28ee and 232f059c.",
+   "at_10_52Z": null,
+   "receipt": "provenance seq 789632 (10:51:22.948Z, orchestrator-surface: paused->open), its 2nd update; open->done is seq 792611 at 16:08:38.369Z"
+  },
+  {
+   "table": "slices",
+   "id": "sl-lf-review",
+   "field": "changed_by",
+   "live": "lane-mw01xdcflkdnq0-5",
+   "at_10_52Z": "orchestrator-surface",
+   "receipt": "provenance seq 789632 (10:51:22.948Z, orchestrator-surface: paused->open), its 2nd update; open->done is seq 792611 at 16:08:38.369Z"
+  },
+  {
+   "table": "slices",
+   "id": "sl-lf-review",
+   "field": "changed_at",
+   "live": "2026-11-03T16:08:38.369Z",
+   "at_10_52Z": "2026-11-03T10:51:22.948Z",
+   "receipt": "provenance seq 789632 (10:51:22.948Z, orchestrator-surface: paused->open), its 2nd update; open->done is seq 792611 at 16:08:38.369Z"
+  },
+  {
+   "table": "slices",
+   "id": "sl-lf-review",
+   "field": "rev",
+   "live": 3,
+   "at_10_52Z": 2,
+   "receipt": "provenance seq 789632 (10:51:22.948Z, orchestrator-surface: paused->open), its 2nd update; open->done is seq 792611 at 16:08:38.369Z"
+  },
+  {
+   "table": "questions",
+   "id": "q-mw0cxrzs3xrkz7",
+   "field": "state",
+   "live": "answered",
+   "at_10_52Z": "open",
+   "receipt": "provenance seq 787588 (insert, open, 07:19:36.184Z); its only update is seq 792919 at 16:14:36.918Z (open->answered by in-mw0w1t2u9bl4zn). Never changed by 10:52Z: changed_by/changed_at empty, so the loader leaves the insert stamp (created_by/created_at) the schema requires"
+  },
+  {
+   "table": "questions",
+   "id": "q-mw0cxrzs3xrkz7",
+   "field": "resolved_by",
+   "live": "in-mw0w1t2u9bl4zn",
+   "at_10_52Z": null,
+   "receipt": "provenance seq 787588 (insert, open, 07:19:36.184Z); its only update is seq 792919 at 16:14:36.918Z (open->answered by in-mw0w1t2u9bl4zn). Never changed by 10:52Z: changed_by/changed_at empty, so the loader leaves the insert stamp (created_by/created_at) the schema requires"
+  },
+  {
+   "table": "questions",
+   "id": "q-mw0cxrzs3xrkz7",
+   "field": "changed_by",
+   "live": "orchestrator-surface",
+   "at_10_52Z": null,
+   "receipt": "provenance seq 787588 (insert, open, 07:19:36.184Z); its only update is seq 792919 at 16:14:36.918Z (open->answered by in-mw0w1t2u9bl4zn). Never changed by 10:52Z: changed_by/changed_at empty, so the loader leaves the insert stamp (created_by/created_at) the schema requires"
+  },
+  {
+   "table": "questions",
+   "id": "q-mw0cxrzs3xrkz7",
+   "field": "changed_at",
+   "live": "2026-11-03T16:14:36.918Z",
+   "at_10_52Z": null,
+   "receipt": "provenance seq 787588 (insert, open, 07:19:36.184Z); its only update is seq 792919 at 16:14:36.918Z (open->answered by in-mw0w1t2u9bl4zn). Never changed by 10:52Z: changed_by/changed_at empty, so the loader leaves the insert stamp (created_by/created_at) the schema requires"
+  },
+  {
+   "table": "questions",
+   "id": "q-mw0cxrzs3xrkz7",
+   "field": "rev",
+   "live": 1,
+   "at_10_52Z": 0,
+   "receipt": "provenance seq 787588 (insert, open, 07:19:36.184Z); its only update is seq 792919 at 16:14:36.918Z (open->answered by in-mw0w1t2u9bl4zn). Never changed by 10:52Z: changed_by/changed_at empty, so the loader leaves the insert stamp (created_by/created_at) the schema requires"
+  },
+  {
+   "table": "messages",
+   "id": "msg-mw0ki8aacothmz",
+   "field": "state",
+   "live": "delivered",
+   "at_10_52Z": "held",
+   "receipt": "provenance seq 789642 (insert, held, 10:51:27.730Z); held->delivered is seq 789651 at 10:52:16.304Z, after 10:52:00Z"
+  },
+  {
+   "table": "messages",
+   "id": "msg-mw0ki8aacothmz",
+   "field": "changed_by",
+   "live": "orchestrator-surface",
+   "at_10_52Z": "lane-runner",
+   "receipt": "provenance seq 789642 (insert, held, 10:51:27.730Z); held->delivered is seq 789651 at 10:52:16.304Z, after 10:52:00Z"
+  },
+  {
+   "table": "messages",
+   "id": "msg-mw0ki8aacothmz",
+   "field": "changed_at",
+   "live": "2026-11-03T10:52:16.304Z",
+   "at_10_52Z": "2026-11-03T10:51:27.730Z",
+   "receipt": "provenance seq 789642 (insert, held, 10:51:27.730Z); held->delivered is seq 789651 at 10:52:16.304Z, after 10:52:00Z"
+  },
+  {
+   "table": "messages",
+   "id": "msg-mw0ki8aacothmz",
+   "field": "rev",
+   "live": 1,
+   "at_10_52Z": 0,
+   "receipt": "provenance seq 789642 (insert, held, 10:51:27.730Z); held->delivered is seq 789651 at 10:52:16.304Z, after 10:52:00Z"
+  }
+ ],
+ "rows": {
+  "workloads": [
+   {
+    "id": "wl-orchestrator",
+    "brief": "orchestrator standing workload: identity and scheduled rows (never closed)",
+    "stakes": "throwaway",
+    "mode": "autonomous",
+    "status": "open",
+    "holder": null,
+    "holder_lease_until": null,
+    "closed_at": null,
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-09-30T03:08:38.458Z",
+    "changed_by": "orchestrator-surface",
+    "changed_at": "2026-09-30T03:08:38.458Z",
+    "rev": 0
+   },
+   {
+    "id": "wl-mw01xdcflkdnq0",
+    "brief": "Jo (2026-11-03 ~02:05Z, input in-mw01ww9xf3gx8s; Jo ~6:05 PM PST 11/2: \"yes and i want it done ASAP\"): open a normal-stakes as2 workload and start it now. Goal: finish switching on land-first, which runs fast checks before merge and the full suite on main after (PR #369; Jo's 10/27 ruling). Readiness report with receipts: /Users/jowolff/agent-scratch/agent-system-2.0/land-first/READINESS-2026-11-02.md.\n\nLane work:\n1. Make as2-hosted green on Linux. It fails 12 tests in ledger/test/install.test.ts, ledger/test/file-links-install.test.ts and surface/test/doctor-cli.test.ts.\n2. Fix the main-suite flakes, so land-first's revert-on-red never reverts a good PR: 12 of the 13 red main runs since 10/28 passed when rerun alone, and 10 of them named surface/test/as2test.test.ts. Fix only the flakes main runs actually hit. Don't duplicate the test-timing cause batches (/Users/jowolff/agent-scratch/agent-system-2.0/wl-mvtueivmiujnom/PLAN.md:72-120); those belong to the test-timing follow-up, which isn't open yet.\n3. Run the proof Jo deferred (migration/items/train-land-first.md, the \"Before Jo says land-first agent-system-2.0 on\" list): dispatch as2-fast against a real PR head through the verified ref, measure the Linux seconds of the fast sets for the last 20 code landings, and keep the receipts.\n\nNot lane work: the install that moves lane tools to the verified root (as2test-setup.sh, then install.sh --control-root=verified) is Jo's to run, through Plumb's update sequence once lanes are idle. The on word (`land-first agent-system-2.0 on`) is Jo's alone; the lane never writes it.\n\nKnown context: with land-first off, the runner preflight only records refusals (Plumb, 2026-11-02). The verified bundle's SOURCE file lags promotions that change no SOURCE input (test-runner.ts:2405-2406, 2463); expect refused-but-recorded preflight rows, which are not this workload's failure.\n\nBuild lanes run on anthropic/claude-opus-5-5 (Jo's model rule; the profile default).\n\n## How it fails\n- **Any proof fails** (as2-hosted still red on Linux, a flake that reproduces, the as2-fast dispatch refusing or erroring, or fast-set timings missing or over budget). It surfaces as the failing CI run, test-run row or dispatch log. Recovery: land-first stays off; the lane names the failure and its receipt to Jo as a question with options. Bound: two fix rounds per item, then the question.\n- **A Linux-only failure needs a platform change outside the three named test files** (install paths, file links, doctor CLI assumptions). It surfaces in the hosted run's log. Recovery: fix in the code under test only if it's a real Linux bug; otherwise make the test platform-correct. Never skip or quarantine a test. Bound: one question to Jo if the change touches install behavior on the Mac.\n- **A flake can't be reproduced** from the main-run history. It surfaces as a solo rerun passing repeatedly. Recovery: record the run ids and the solo-rerun evidence and leave it unfixed with a named reason; no retry-until-green, no timeout raise. Bound: 20 isolated runs per suspect file.\n- **A flake fix overlaps a test-timing cause batch.** It surfaces when the cause matches PLAN.md:72-120. Recovery: stop that fix and name the batch in the report. Bound: none needed.\n- **The as2-fast dispatch needs credentials, a ruleset change or a verified-ref publish the lane can't do.** It surfaces as a gh/Actions refusal. Recovery: a question to Jo naming the exact step and owner. Bound: one question.\n- **The full suite hangs** (the known Bun.spawnSync git hang on full runs). It surfaces in lane_full_test as an error. Recovery: rerun once; if it hangs again, report it with the run id. Bound: 2 reruns.\n- **A profile config rewrite suspends this lane's extensions** (the lane-stop bug still open in its own workload). It surfaces as the lane dying with open work. Recovery: relaunch on Jo's word. Bound: Jo decides.",
+    "stakes": "normal",
+    "mode": "autonomous",
+    "status": "open",
+    "holder": null,
+    "holder_lease_until": null,
+    "closed_at": null,
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T02:11:21.423Z",
+    "changed_by": "lane-mw01xdcflkdnq0-4",
+    "changed_at": "2026-11-03T10:51:27.742Z",
+    "rev": 5360
+   }
+  ],
+  "slices": [
+   {
+    "id": "sl-orchestrator-questions",
+    "workload_id": "wl-orchestrator",
+    "task": "orchestrator questions to Jo: the standing slice every orchestrator question is raised on (never closed)",
+    "done_condition": "never: open as long as the orchestrator runs",
+    "inputs": "the orchestrator's QUESTION blocks to Jo",
+    "state": "open",
+    "artifact": null,
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-10-12T05:22:08.221Z",
+    "changed_by": "orchestrator-surface",
+    "changed_at": "2026-11-03T03:57:03.378Z",
+    "rev": 196
+   },
+   {
+    "id": "sl-lf-plan",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "task": "Plan the land-first readiness work: Linux fixes for as2-hosted, main-flake triage against the test-timing batches, and the deferred as2-fast proof",
+    "done_condition": "PLAN.md at /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/PLAN.md passes cross-lab review and is approved (auto-start or Jo)",
+    "inputs": "READINESS-2026-11-02.md; migration/items/train-land-first.md; wl-mvtueivmiujnom PLAN.md:72-120 and AUDIT-MAP.json; hosted run 41562147664 artifacts; ledger pr=0 test-run rows",
+    "state": "done",
+    "artifact": "Jo approved q-mw03m7aiqqyvp1 (in-mw04acjx0ncuyk); plan /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/PLAN.md; review pass /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/PLAN-REVIEW-r7.md",
+    "created_by": "lane-mw01xdcflkdnq0-1",
+    "created_at": "2026-11-03T02:16:20.769Z",
+    "changed_by": "lane-mw01xdcflkdnq0-3",
+    "changed_at": "2026-11-03T03:18:36.993Z",
+    "rev": 5
+   },
+   {
+    "id": "sl-lf-dispatch",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "task": "question to Jo: run dispatch.sh --dry-run then dispatch.sh from his Terminal (row 6 reserves the as2-fast POST)",
+    "done_condition": "Jo answers dispatched (runs.tsv holds run ids) or skip (proof named missing, land-first stays off)",
+    "inputs": "/Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/proof/dispatch.sh, manifest.json",
+    "state": "done",
+    "artifact": "Jo answered dispatched (q-mw051no32n38dr). /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/proof/dispatch.log: dry run \"19 POST(s) printed, none sent\", then \"done: 19 dispatched now\"; /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/proof/runs.tsv: 19 run ids 41573651539..41573708968 (PR case tr-0lfproof00 at b72d5366).",
+    "created_by": "lane-mw01xdcflkdnq0-3",
+    "created_at": "2026-11-03T03:38:33.278Z",
+    "changed_by": "lane-mw01xdcflkdnq0-3",
+    "changed_at": "2026-11-03T03:46:11.278Z",
+    "rev": 3
+   },
+   {
+    "id": "sl-lf-collect",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "task": "run collect.ts on the 19 dispatched runs; TIMING.md and PROOF.md with case verdicts, proof verdict and activation readiness kept apart",
+    "done_condition": "PROOF.md and TIMING.md in the plan directory with every case's verdict and run URL, the proof verdict, and the readiness facts (tag, verified/current, bundle SOURCE, newest runner-preflight row, newest green main verdict)",
+    "inputs": "proof/collect.ts, proof/manifest.json, proof/runs.tsv; read-only gh and ledger",
+    "state": "done",
+    "artifact": "/Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/PROOF.md (rounds 1 and 2, both FAIL with named causes), proof/ and proof2/ collect.json, TIMING.md, artifacts; Jo chose followup (q-mw090n9s6xfbs0): round 3 after the verified-root install, in a follow-up workload. land-first stays off.",
+    "created_by": "lane-mw01xdcflkdnq0-3",
+    "created_at": "2026-11-03T03:46:11.279Z",
+    "changed_by": "lane-mw01xdcflkdnq0-3",
+    "changed_at": "2026-11-03T06:33:40.349Z",
+    "rev": 5
+   },
+   {
+    "id": "sl-lf-dispatch-2",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "task": "question to Jo: run proof2/dispatch.sh (round 2, mainSkip left out of the Linux set) from his Terminal",
+    "done_condition": "Jo answers dispatched (proof2/runs.tsv holds run ids) or skip",
+    "inputs": "/Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/proof2/dispatch.sh, proof2/manifest.json",
+    "state": "done",
+    "artifact": "Jo answered dispatched (q-mw07ou0gldifnm). /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/proof2/dispatch.log \"done: 19 dispatched now, 0 already had a run\"; /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/proof2/runs.tsv holds 19 run ids (PR case tr-0lfproof200 at 17aee869).",
+    "created_by": "lane-mw01xdcflkdnq0-3",
+    "created_at": "2026-11-03T04:52:40.813Z",
+    "changed_by": "lane-mw01xdcflkdnq0-3",
+    "changed_at": "2026-11-03T05:17:55.601Z",
+    "rev": 3
+   },
+   {
+    "id": "sl-lf-timing-proof",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "task": "runner file-series (5 base on baac9a48, 20 candidate on 071c28c1) for as2test.test.ts, stuck-detect.test.ts, test-runner.test.ts; SERIES.md",
+    "done_condition": "each series' inspect shows every candidate iteration green with every requested case executed, no new skip, cleanup complete; SERIES.md lists selection commands/output, series ids, candidate sha, verdicts",
+    "inputs": "scripts/timing-proof.ts, surface/src/timing-proof.ts, the three test files at 071c28c1; /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/timing-proof/",
+    "state": "paused",
+    "artifact": null,
+    "created_by": "lane-mw01xdcflkdnq0-3",
+    "created_at": "2026-11-03T05:52:33.030Z",
+    "changed_by": "lane-mw01xdcflkdnq0-3",
+    "changed_at": "2026-11-03T07:19:36.184Z",
+    "rev": 1
+   },
+   {
+    "id": "sl-lf-proof-tool",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "task": "timing-proof tool cannot read test-runner.test.ts: bun's JUnit lists two skipped `field soak (field-soak.sh) > (unnamed)` cases, and proofEvidence throws on duplicate identities; decide tool fix vs leaving that series unproven",
+    "done_condition": "Jo's answer recorded; on toolfix, timing-proof.ts gives repeated JUnit identities an ordinal suffix with a failing-before test, and the test-runner manifest parses and passes proofEvidence against both scratch JUnit files",
+    "inputs": "surface/src/timing-proof.ts proofEvidence (:117-151), its test file; /Users/jowolff/agent-scratch/agent-system-2.0/scratch/wl-mw01xdcflkdnq0/{base,cand}-test-runner.xml",
+    "state": "done",
+    "artifact": "commit ff81fad7: surface/src/timing-proof.ts identifiedCases (ordinal suffix); new test fails on old tool (/Users/jowolff/agent-scratch/agent-system-2.0/scratch/wl-mw01xdcflkdnq0/proof-tool-before.txt), `bun test surface/test/timing-proof.test.ts` 19 pass 0 fail; /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/timing-proof/manifest-test-runner.json parses and passes proofEvidence on both scratch phases (/Users/jowolff/agent-scratch/agent-system-2.0/scratch/wl-mw01xdcflkdnq0/tr-validate.out).",
+    "created_by": "lane-mw01xdcflkdnq0-3",
+    "created_at": "2026-11-03T06:07:14.358Z",
+    "changed_by": "lane-mw01xdcflkdnq0-3",
+    "changed_at": "2026-11-03T07:01:42.449Z",
+    "rev": 3
+   },
+   {
+    "id": "sl-lf-review",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "task": "Cross-lab findings-only review of PR #430's diff (baac9a48..44e132b8) and the timing-proof manifests/SERIES.md",
+    "done_condition": "A review hand on another lab returns a review-findings block with no blocking finding, or the blocking findings are fixed and re-reviewed within the round limit",
+    "inputs": "worktree /Users/jowolff/code/agent-system-2.0-lanes/wl-mw01xdcflkdnq0 at 44e132b8; PLAN.md, FLAKES.md, DETECTOR*.md, RUNNER.md, PROOF.md, timing-proof/ in the plan directory",
+    "state": "open",
+    "artifact": null,
+    "created_by": "lane-mw01xdcflkdnq0-3",
+    "created_at": "2026-11-03T07:19:40.480Z",
+    "changed_by": "orchestrator-surface",
+    "changed_at": "2026-11-03T10:51:22.948Z",
+    "rev": 2
+   }
+  ],
+  "questions": [
+   {
+    "id": "q-mw02q3jper5ny3",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-plan",
+    "body": "/Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/PLAN.md\n- sl-lf-linux: doctor reports launchd jobs not installed off Darwin; portable mktemp in quiet-alarm; failing tests assert per-platform, none skipped\n- sl-lf-flakes: FLAKES.md maps every red main run to its test-timing batch; 20 solo runs each for intake-queue and typed-input\n- sl-lf-proof-prep: sets.ts (fast sets via verified fastSet), idempotent dispatch.sh for Jo, bounded collect.ts with runner judgment\n- sl-lf-dispatch: one question giving Jo the dispatch.sh line, since row 6 reserves the as2-fast POST for lanes\n- sl-lf-collect: judge runs, TIMING.md and PROOF.md; proof verdict kept apart from activation readiness\n- sl-lf-docs: dated proof paragraph with receipt paths in migration/items/train-land-first.md\n- sl-lf-review: cross-lab findings-only review of the settled diff and proof tooling\n- sl-lf-pr: merge main, declared artifact, push, PR, lane_full_test green, done-because\nprompt-only: R5: no skip, quarantine, macOnly/mainSkip move or timeout raise; a diff property checked by the cross-lab review\nprompt-only: R6: every red/error main run named with batch and mechanism; a report over past runs no code can check\nprompt-only: R7: unowned flake fixed only if reproduced, else 20 solo exits kept; an investigation evidenced by its runs\nprompt-only: R8: no fix overlaps a test-timing batch; scope judged by the cross-lab review against the batch text\nprompt-only: R9: Jo, not the lane, sends the as2-fast dispatches; row 6 reserves the POST for every lane\nprompt-only: R13: lane never runs install.sh/as2test-setup.sh or writes the on word; a conduct rule evidenced by the ledger\nprompt-only: R14: receipts kept in the plan directory and named in the migration item; retention checked at close\ntradeoff: the as2test.test.ts flake (11 of 13 main reds) stays with the test-timing batches and can still false-revert until they land\ntradeoff: Jo runs one Terminal line for up to 21 dispatches; the lane exercises the runner's checks and judgment, not its POST\ntradeoff: old landing heads run with today's runner and config; ones with the old Linux doctor bug count only for timing\nreview: pass, openai-codex/gpt-6.1-sol, /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/PLAN-REVIEW-r4.md",
+    "options": "[\"approve\",\"revise\",\"cancel\"]",
+    "state": "answered",
+    "resolved_by": "in-mw035i1eifo3kx",
+    "created_by": "lane-mw01xdcflkdnq0-1",
+    "created_at": "2026-11-03T02:33:41.749Z",
+    "changed_by": "orchestrator-surface",
+    "changed_at": "2026-11-03T02:45:40.370Z",
+    "rev": 1
+   },
+   {
+    "id": "q-mw03m7aiqqyvp1",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-plan",
+    "body": "/Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/PLAN.md\n- sl-lf-linux: doctor reports launchd jobs not installed off Darwin; portable mktemp in quiet-alarm; failing tests assert per-platform, none skipped\n- sl-lf-marker: all three .reached writers publish by temp file + rename; new hook-marker.test.ts fails before, passes after\n- sl-lf-flakes: FLAKES.md maps every red main run to its batch (marker/detector as taken); 20 solo runs each for intake-queue, typed-input\n- sl-lf-detector-exec: detector batch, executor side: injected elapsed clocks, controlled capture, owned process cleanup in as2test/stuck tests\n- sl-lf-detector-runner: detector batch, runner side: StuckWatch/backstop clocks in the four test-runner/test-run files; worker crash diagnosed\n- sl-lf-baseline: timing-audit shrink of timing-baseline.tsv; timing-lint green\n- sl-lf-timing-proof: runner file-series (5 base, 20 candidate under load) per changed batch file and helper consumer; SERIES.md\n- sl-lf-proof-prep: sets.ts (fast sets via verified fastSet), idempotent dispatch.sh for Jo, bounded collect.ts with runner judgment\n- sl-lf-dispatch: one question giving Jo the dispatch.sh line, since row 6 reserves the as2-fast POST for lanes\n- sl-lf-collect: judge runs, TIMING.md and PROOF.md; proof verdict kept apart from activation readiness\n- sl-lf-docs: dated proof paragraph, taken batches and series ids in migration/items/train-land-first.md\n- sl-lf-review: cross-lab findings-only review of the settled diff and proof tooling\n- sl-lf-pr: merge main, declared artifact, push, PR, lane_full_test green, done-because\nprompt-only: R5: no skip, quarantine, macOnly/mainSkip move or timeout raise, folded batches too; checked by the cross-lab review\nprompt-only: R6: every red/error main run named with batch and mechanism; a report over past runs no code can check\nprompt-only: R7: unowned flake fixed only if reproduced, else 20 solo exits kept; an investigation evidenced by its runs\nprompt-only: R8: no fix overlaps a batch other than marker/detector (marked TAKEN); scope judged by the cross-lab review\nprompt-only: R9: Jo, not the lane, sends the as2-fast dispatches; row 6 reserves the POST for every lane\nprompt-only: R13: lane never runs install.sh/as2test-setup.sh or writes the on word; a conduct rule evidenced by the ledger\nprompt-only: R14: receipts kept in the plan directory and named in the migration item; retention checked at close\nprompt-only: R20: every as2test/stuck failure mapped to a diagnosed cause or named unreproduced; a report no code can check\nprompt-only: R21: series cover every changed batch file and helper consumer at the PR head; lane checks via git, review reads SERIES.md\ntradeoff: one file-series of as2test.test.ts or test-runner.test.ts is about 3-4 h of runner time, interleaved with the train\ntradeoff: Jo runs one Terminal line for up to 21 dispatches; the lane exercises the runner's checks and judgment, not its POST\ntradeoff: one PR carries all of it; the train lands it only after release, so the Linux fix lands with the detector work\nreview: pass, openai-codex/gpt-6.1-sol, /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/PLAN-REVIEW-r7.md",
+    "options": "[\"approve\",\"revise\",\"cancel\"]",
+    "state": "answered",
+    "resolved_by": "in-mw04acjx0ncuyk",
+    "created_by": "lane-mw01xdcflkdnq0-2",
+    "created_at": "2026-11-03T02:58:39.594Z",
+    "changed_by": "orchestrator-surface",
+    "changed_at": "2026-11-03T03:17:26.157Z",
+    "rev": 1
+   },
+   {
+    "id": "q-mw051no32n38dr",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-dispatch",
+    "body": "The deferred land-first proof needs as2-fast dispatched for 19 cases: the PR head of this workload's PR #430 and 18 of the 20 frozen code landings (#383 and #388 would have run the full Mac suite, so they need no hosted run). The lane cannot send these: P-11 row 6 reserves the as2-fast dispatch POST for every lane, and it also refuses the lane running the script's dry run. Please run two lines in your Terminal, first the dry run, which sends nothing and prints every POST:\nbash /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/proof/dispatch.sh --dry-run\nthen, if it ends with \"dry run done\", the real one:\nbash /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/proof/dispatch.sh\nWhat it does: checks the as2-verified tag equals ~/.agent-system-2/verified/current (1b538f93), reads every existing as2-fast run since 03:26Z so a rerun never sends a second dispatch for a case, then sends the same POST the runner's hostedFast sends (ref as2-verified), recording run ids in proof/runs.tsv. Public repo, so no Actions cost; the runs post no commit status. Undo: none needed. If it stops, the reason is the last line, and the full log is /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/proof/dispatch.log; rerunning is safe. Answer dispatched once it says done (the lane then collects and judges the runs), or skip to leave the proof missing and land-first off. Recommended: dispatched.",
+    "options": "[\"dispatched\",\"skip\"]",
+    "state": "answered",
+    "resolved_by": "in-mw05au5eazjer2",
+    "created_by": "lane-mw01xdcflkdnq0-3",
+    "created_at": "2026-11-03T03:38:40.275Z",
+    "changed_by": "orchestrator-surface",
+    "changed_at": "2026-11-03T03:45:48.578Z",
+    "rev": 1
+   },
+   {
+    "id": "q-mw05l1pci6x0ay",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-collect",
+    "body": "The land-first proof failed, and the cause is a real gap in the fast check, not a flake. All 19 as2-fast runs you dispatched came back red-incomplete. On Linux, the ten testRunner.mainSkip files (seven gates/test/shell-start-session-*, plugins by-hand-session and loader, surface tool-mount) skip every test, because they need an installed OMP and the hosted runner has none. fastSet (surface/src/fast-set.ts:235) only takes macOnly files out of the Linux set, and the runner's fastExec reds any planned file that ran no test. So with land-first on, every PR that reaches those files would be held. Timing is fine: every bun wall is 299-383 s, under the 600 s cap. Receipts: /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/PROOF.md and proof/TIMING.md. land-first stays off until this is fixed.\nfastset (recommended): fastSet also leaves mainSkip files out of the Linux set, listed beside macOnly. It's a small change in surface/src/fast-set.ts plus a test, on this PR. These files already run in no automated suite, so no coverage is lost, and the one list stays the single source. Then you run dispatch.sh once more for a fresh round.\nmaconly: copy the ten files into testRunner.macOnly in profile/config.yml. It's a config change only, but it duplicates the list, and moving files to macOnly needs your waiver of R5.\nstop: no fix here. The proof is recorded as failed with these receipts, land-first stays off, and the fix becomes its own workload. Everything else on this workload carries on either way.",
+    "options": "[\"fastset\",\"maconly\",\"stop\"]",
+    "state": "answered",
+    "resolved_by": "in-mw05mds5gffwgv",
+    "created_by": "lane-mw01xdcflkdnq0-3",
+    "created_at": "2026-11-03T03:53:44.928Z",
+    "changed_by": "orchestrator-surface",
+    "changed_at": "2026-11-03T03:54:47.237Z",
+    "rev": 1
+   },
+   {
+    "id": "q-mw07ou0gldifnm",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-dispatch-2",
+    "body": "Round 2 of the land-first proof is ready. It needs as2-fast dispatched again from your Terminal, because P-11 row 6 reserves that POST for lanes. The fastset fix you chose is on PR #430 at head 17aee869: the ten OMP-dependent mainSkip files now leave the fast Linux set. Round 2 recomputes the sets with that fix, giving 19 hosted cases: the PR head plus the same 18 frozen landings (#383 and #388 still go full). Round 1's files in proof/ are kept. Run the dry run first; it sends nothing:\nbash /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/proof2/dispatch.sh --dry-run\nthen, if it ends with \"dry run done\":\nbash /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/proof2/dispatch.sh\nSame checks as round 1: the as2-verified tag must equal verified/current; a complete run listing since 04:20Z means it never double-sends; request ids are tr-0lfproof2NN. The log is proof2/dispatch.log, and rerunning is safe. Answer dispatched once it says done, or skip to leave the proof failed at round 1 with land-first off. Recommended: dispatched.",
+    "options": "[\"dispatched\",\"skip\"]",
+    "state": "answered",
+    "resolved_by": "in-mw08kuxy371m5v",
+    "created_by": "lane-mw01xdcflkdnq0-3",
+    "created_at": "2026-11-03T04:52:40.816Z",
+    "changed_by": "orchestrator-surface",
+    "changed_at": "2026-11-03T05:17:35.015Z",
+    "rev": 1
+   },
+   {
+    "id": "q-mw090n9s6xfbs0",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-collect",
+    "body": "Round 2 of the land-first proof also failed. Both causes are named, and land-first stays off. Receipts: /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/PROOF.md (round 2 section).\n- **PR case:** the 14 failures are all paired-coding tests that can't start bubblewrap: `bwrap: setting up uid map: Permission denied`. as2-fast.yml never lifts Ubuntu's AppArmor user-namespace limit; as2-hosted.yml does. The one-line fix is now on PR #430 (sl-lf-fast-userns). But as2-fast always runs the workflow from the as2-verified tag, so the fix only counts after the PR merges and you do the verified-root install.\n- **One old landing:** #406 timed out at the 600 s cap because surface/test/wtree.test.ts hung. That's the known full-run hang; every other case ran that file and passed.\n- **The mainSkip fix you chose holds:** no case was red-incomplete.\n- **Timing passes:** every completed case took 294-393 s, under the 600 s cap.\n\nSo the proof can't go green from this lane. A green needs a third dispatch after merge and install, and the train only merges after this lane releases.\nfollowup (recommended): this workload finishes once the rest is done: the as2test flake work, the Linux fixes, review, and a green full suite. It closes on the done line's \"failed proof named to Jo\" branch. The orchestrator then opens a small follow-up: after your verified-root install, rerun proof2/dispatch.sh for round 3.\nhold: this lane keeps the workload open until the round-3 result, which needs a hand merge outside the train.",
+    "options": "[\"followup\",\"hold\"]",
+    "state": "answered",
+    "resolved_by": "in-mw0bae1avaf74n",
+    "created_by": "lane-mw01xdcflkdnq0-3",
+    "created_at": "2026-11-03T05:29:51.568Z",
+    "changed_by": "orchestrator-surface",
+    "changed_at": "2026-11-03T06:33:25.391Z",
+    "rev": 1
+   },
+   {
+    "id": "q-mw0acptqls3k87",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-proof-tool",
+    "body": "The repeated-run timing proof can't run on test-runner.test.ts, and the cause is a bug in the proof tool (PR #415). Bun's JUnit output lists two skipped cases under the same name, `field soak (field-soak.sh) > (unnamed)`, on main and on PR #430 alike. The tool's proofEvidence (surface/src/timing-proof.ts:125) throws \"duplicate JUnit case\" on any repeated name, so no manifest for that file can ever pass, on any commit. Receipts: /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/timing-proof/SERIES.md and the scratch XML (base-test-runner.xml:239,251).\ntoolfix (recommended): on PR #430, the tool gives a repeated name an ordinal suffix in JUnit order (`(unnamed)`, `(unnamed) [2]`), plus a test that fails on today's tool. Each occurrence is still checked one by one, so a new skip or a missing case is still caught. This touches the tools batch's code, which has already landed, so it duplicates no open batch. Then test-runner.test.ts gets its 5+20 runs like the other two files.\nunproven: no tool change. The test-runner.test.ts series is recorded as unprovable with this receipt, and the detector-runner changes rest on the Mac load runs (207 pass 0 fail under load) and the full suite.\nEither way, the series submit has to come from your Terminal. My bash calls can't write ~/.agent-system-2 (`EPERM … mkdir …/test-runs/mirror`). I'll send one script line for that once the as2test fix lands.",
+    "options": "[\"toolfix\",\"unproven\"]",
+    "state": "answered",
+    "resolved_by": "in-mw0bae1cl3m4bo",
+    "created_by": "lane-mw01xdcflkdnq0-3",
+    "created_at": "2026-11-03T06:07:14.366Z",
+    "changed_by": "orchestrator-surface",
+    "changed_at": "2026-11-03T06:33:25.392Z",
+    "rev": 1
+   },
+   {
+    "id": "q-mw0cxrzs3xrkz7",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-timing-proof",
+    "body": "Needs you: one command from your Terminal to submit the timing-proof series for wl-mw01xdcflkdnq0. The lane sandbox cannot write under ~/.agent-system-2 (EPERM), so the lane cannot submit.\n\nRun: bash /Users/jowolff/agent-scratch/agent-system-2.0/wl-mw01xdcflkdnq0/timing-proof/submit.sh\n\nWhat it does:\n- Checks that the worktree head descends from candidate ff81fad7 and changes none of the proven inputs.\n- Submits three file-series (stuck-detect, test-runner, as2test). Each is 5 base runs and 20 candidate runs, isolated, under historic load.\n- Records the ids in timing-proof/series.tsv and logs to timing-proof/submit.log.\n- Is safe to rerun: recorded manifests are skipped, and the tool refuses a duplicate.\n- Undo: nothing to undo beyond the proof rows; a series is read-only evidence.\n\nAnswer \"ran\" once it prints \"=== done\", or \"skip\" to leave the timing proof unsubmitted and named open in the close receipt.",
+    "options": "[\"ran\",\"skip\"]",
+    "state": "open",
+    "resolved_by": null,
+    "created_by": "lane-mw01xdcflkdnq0-3",
+    "created_at": "2026-11-03T07:19:36.184Z",
+    "changed_by": null,
+    "changed_at": null,
+    "rev": 0
+   },
+   {
+    "id": "q-mw0ggsq4is47gt",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-review",
+    "body": "The review of sl-lf-review reached its round limit: 3 failed rounds of 3 allowed (normal stakes).\nFinal round (round 3), remaining findings: blocking 1 (fault-tolerance 1) · major 0 · minor 0\n- blocking fault-tolerance: The inherited-pipe test deletes its failed-holder evidence\nBlocking per round: round 1: 2 · round 2: 3 · round 3: 1\nEstimate (not a measurement): about 2 more rounds, ceil(last 1 / mean fall 0.5 per round)\nextend: one more block of 3 rounds for sl-lf-review; the lane may dispatch the next review.\naccept: the review counts as passed with these findings left; the lane may close sl-lf-review and go on, and the final round's finding titles ride the slice artifact and the PR (a plan slice may then be raised to Jo).\nstop: no further round; the review does not count as passed; the lane reports and holds sl-lf-review for Jo.",
+    "options": "[\"extend\",\"accept\",\"stop\"]",
+    "state": "answered",
+    "resolved_by": "in-mw0ki4lfwe59qb",
+    "created_by": "lane-mw01xdcflkdnq0-3",
+    "created_at": "2026-11-03T08:58:22.444Z",
+    "changed_by": "orchestrator-surface",
+    "changed_at": "2026-11-03T10:51:22.948Z",
+    "rev": 1
+   }
+  ],
+  "instructions": [
+   {
+    "id": "in-mw01ww9xf3gx8s",
+    "workload_id": "wl-orchestrator",
+    "slice_id": "sl-orchestrator-questions",
+    "kind": "instruction",
+    "question_id": null,
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "Open a normal-stakes as2 workload, and start it now: Jo wants it done ASAP (Jo 2026-11-02 ~6:05 PM PST, \"yes and i want it done ASAP\"). Goal: finish switching on land-first, which runs fast checks before merge and the full suite on main after (PR #369; Jo's 10/27 ruling). The readiness report, with receipts: /Users/jowolff/agent-scratch/agent-system-2.0/land-first/READINESS-2026-11-02.md. Lane work: (1) make as2-hosted green on Linux, which fails 12 tests in ledger/test/install.test.ts, ledger/test/file-links-install.test.ts and surface/test/doctor-cli.test.ts; (2) fix the main-suite flakes, so that land-first's revert-on-red never reverts a good PR: 12 of the 13 red main runs since 10/28 passed when rerun alone, and 10 of them named surface/test/as2test.test.ts. Fix only the flakes main runs actually hit, and don't duplicate the test-timing cause batches (wl-mvtueivmiujnom/PLAN.md:72-120); (3) run the proof Jo deferred (migration/items/train-land-first.md, the \"Before Jo says land-first agent-system-2.0 on\" list): dispatch as2-fast against a real PR head through the verified ref, measure the Linux seconds of the fast sets for the last 20 code landings, and retain the receipts. Not lane work: the install that moves lane tools to the verified root (as2test-setup.sh, then install.sh --control-root=verified) is Jo's to run, through Plumb's update sequence once lanes are idle, and the on word is Jo's. It's machinery, with a How it fails section: if any proof fails, land-first stays off and the lane names the failure and its receipt. Build lanes run on Opus.",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T02:10:59.301Z"
+   },
+   {
+    "id": "in-mw022wrar20ktn",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "instruction",
+    "question_id": null,
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "approve en-mw01ys1j8weaq7",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T02:15:39.862Z"
+   },
+   {
+    "id": "in-mw02y4jfxhs27j",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "instruction",
+    "question_id": null,
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "Jo: \"revise q-mw02q3jper5ny3: Jo wants land-first on ASAP, and the as2test.test.ts flake (11 of 13 main reds) is the blocker that would make it false-revert good PRs. So fold the two test-timing batches that own it, sl-timing-detector and sl-timing-marker (wl-mvtueivmiujnom/PLAN.md), into this workload, and fix them here. Record in that PLAN.md that both are taken, so the test-timing follow-up skips them. Keep R5 (no skip, quarantine, macOnly/mainSkip move or timeout raise) for them too. Everything else in the plan stands.\" — reading: Revise the land-first plan (q-mw02q3jper5ny3): fold the test-timing batches sl-timing-detector and sl-timing-marker (from /Users/jowolff/agent-scratch/agent-system-2.0/wl-mvtueivmiujnom/PLAN.md) into this workload and fix the surface/test/as2test.test.ts flake here; record in that test-timing PLAN.md that both batches are taken so the follow-up skips them; R5 (no skip, quarantine, macOnly/mainSkip move or timeout raise) applies to them too; everything else in the plan stands.",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T02:39:56.283Z"
+   },
+   {
+    "id": "in-mw035i1eifo3kx",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-plan",
+    "kind": "answer",
+    "question_id": "q-mw02q3jper5ny3",
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "revise",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T02:45:40.370Z"
+   },
+   {
+    "id": "in-mw04acjx0ncuyk",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-plan",
+    "kind": "answer",
+    "question_id": "q-mw03m7aiqqyvp1",
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "approve",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T03:17:26.157Z"
+   },
+   {
+    "id": "in-mw04r70drc9wv7",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "instruction",
+    "question_id": null,
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "approve en-mw04f2kymr4ibj",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T03:30:32.125Z"
+   },
+   {
+    "id": "in-mw04r70dxm3wu6",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "instruction",
+    "question_id": null,
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "approve en-mw04fiwxv8x794",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T03:30:32.125Z"
+   },
+   {
+    "id": "in-mw04zzq9e4ij2i",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "instruction",
+    "question_id": null,
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "approve en-mw04q9cvlvxfcd",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T03:37:22.593Z"
+   },
+   {
+    "id": "in-mw05au5eazjer2",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-dispatch",
+    "kind": "answer",
+    "question_id": "q-mw051no32n38dr",
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "dispatched",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T03:45:48.578Z"
+   },
+   {
+    "id": "in-mw05cn5t1b7j74",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "instruction",
+    "question_id": null,
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "approve en-mw059tb3i5c4sz",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T03:47:12.833Z"
+   },
+   {
+    "id": "in-mw05mds5gffwgv",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-collect",
+    "kind": "answer",
+    "question_id": "q-mw05l1pci6x0ay",
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "fastset",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T03:54:47.237Z"
+   },
+   {
+    "id": "in-mw05n4c6uvtbzy",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "instruction",
+    "question_id": null,
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "deny en-mw05fbdp6gidd5",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T03:55:21.654Z"
+   },
+   {
+    "id": "in-mw05patuzek6n3",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "instruction",
+    "question_id": null,
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "Jo: \"keep\" — answers q-mw05mr2pqnjggs: The answer `fastset` on the land-first lane's question about the fast check (q-mw05l1pci6x0ay, answer in-mw05mds5gffwgv) was recorded from the paste line inside Ilex's own held reply, which the i-have-audhd hook echoed back into the input; Jo may not have typed it. fastset means the fast check also leaves the ten OMP-dependent testRunner.mainSkip files out of the Linux run (a code change plus a test on the land-first PR, then one more dispatch.sh round). Answer keep to stand by fastset; answer revise to have Ilex tell the land-first lane to stop that change and re-ask with the three options (fastset, maconly, stop). Recommended: keep, because fastset was the recommended fix, it keeps the skip list in one place, and it is a reversible change on an unmerged PR.",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T03:57:03.378Z"
+   },
+   {
+    "id": "in-mw08gaoky7s7lj",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "instruction",
+    "question_id": null,
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "deny en-mw06h7hzc0jwiw",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T05:14:02.132Z"
+   },
+   {
+    "id": "in-mw08kuxy371m5v",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-dispatch-2",
+    "kind": "answer",
+    "question_id": "q-mw07ou0gldifnm",
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "dispatched",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T05:17:35.014Z"
+   },
+   {
+    "id": "in-mw08smttmf1de4",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "instruction",
+    "question_id": null,
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "approve en-mw078hcbdovusx",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T05:23:37.745Z"
+   },
+   {
+    "id": "in-mw08titxz3i609",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "instruction",
+    "question_id": null,
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "approve en-mw08hxqv18yxrb",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T05:24:19.221Z"
+   },
+   {
+    "id": "in-mw0bae1avaf74n",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-collect",
+    "kind": "answer",
+    "question_id": "q-mw090n9s6xfbs0",
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "followup",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T06:33:25.390Z"
+   },
+   {
+    "id": "in-mw0bae1cl3m4bo",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-proof-tool",
+    "kind": "answer",
+    "question_id": "q-mw0acptqls3k87",
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "toolfix",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T06:33:25.392Z"
+   },
+   {
+    "id": "in-mw0ki4lfwe59qb",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": "sl-lf-review",
+    "kind": "answer",
+    "question_id": "q-mw0ggsq4is47gt",
+    "disposition": null,
+    "channel": "surface",
+    "author": "jo",
+    "body": "extend",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T10:51:22.947Z"
+   }
+  ],
+  "entries": [
+   {
+    "id": "en-mw01xdchwe35kh",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "assumption",
+    "body": "ceiling: usd 150 wall 1080 source stakes normal x3 change-large",
+    "created_by": "orchestrator-surface",
+    "created_at": "2026-11-03T02:11:21.425Z"
+   },
+   {
+    "id": "en-mw04adb826m1ut",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "assumption",
+    "body": "launch: lane-mw01xdcflkdnq0-3 cause resume in-mw04acjx0ncuyk requested-by jo",
+    "created_by": "lane-starter",
+    "created_at": "2026-11-03T03:17:27.140Z"
+   },
+   {
+    "id": "en-mw04adoztp06ov",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "assumption",
+    "body": "lane-started: lane-mw01xdcflkdnq0-3 {\"pid\":92575,\"start\":\"Mon Nov  2 19:17:27 2026\",\"session\":null,\"argv\":[\"--mode\",\"rpc\",\"--no-ui\",\"--cwd\",\"/Users/jowolff/code/agent-system-2.0-lanes/wl-mw01xdcflkdnq0\",\"--session-dir\",\"/Users/jowolff/.agent-system-2/lanes/wl-mw01xdcflkdnq0/sessions\",\"--append-system-prompt\",\"/Users/jowolff/.agent-system-2/lanes/wl-mw01xdcflkdnq0/system.md\",\"--max-time\",\"1054m\",\"--resume\",\"/Users/jowolff/.agent-system-2/lanes/wl-mw01xdcflkdnq0/sessions/2026-11-03T02-11-26-317Z_01a19f2c-f5ed-7000-86f0-18fa742d9cb9.jsonl\"],\"runnerPid\":92502,\"model\":null,\"ranModel\":null,\"resumeSkipped\":null}",
+    "created_by": "lane-runner",
+    "created_at": "2026-11-03T03:17:27.635Z"
+   },
+   {
+    "id": "en-mw04afrwkxb534",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "assumption",
+    "body": "lane-started: lane-mw01xdcflkdnq0-3 {\"pid\":92575,\"start\":\"Mon Nov  2 19:17:27 2026\",\"session\":\"/Users/jowolff/.agent-system-2/lanes/wl-mw01xdcflkdnq0/sessions/2026-11-03T02-11-26-317Z_01a19f2c-f5ed-7000-86f0-18fa742d9cb9.jsonl\",\"argv\":[\"--mode\",\"rpc\",\"--no-ui\",\"--cwd\",\"/Users/jowolff/code/agent-system-2.0-lanes/wl-mw01xdcflkdnq0\",\"--session-dir\",\"/Users/jowolff/.agent-system-2/lanes/wl-mw01xdcflkdnq0/sessions\",\"--append-system-prompt\",\"/Users/jowolff/.agent-system-2/lanes/wl-mw01xdcflkdnq0/system.md\",\"--max-time\",\"1054m\",\"--resume\",\"/Users/jowolff/.agent-system-2/lanes/wl-mw01xdcflkdnq0/sessions/2026-11-03T02-11-26-317Z_01a19f2c-f5ed-7000-86f0-18fa742d9cb9.jsonl\"],\"runnerPid\":92502,\"model\":null,\"ranModel\":\"anthropic/claude-opus-5-5\",\"resumeSkipped\":null}",
+    "created_by": "lane-runner",
+    "created_at": "2026-11-03T03:17:30.332Z"
+   },
+   {
+    "id": "en-mw0f33tu84nwjt",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "assumption",
+    "body": "spend: lane-mw01xdcflkdnq0-3 usd 120.0554 tokens 280296743 wall 338.3",
+    "created_by": "lane-runner",
+    "created_at": "2026-11-03T08:19:44.034Z"
+   },
+   {
+    "id": "en-mw0io5w892rhyj",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "assumption",
+    "body": "lane-parked: lane-mw01xdcflkdnq0-3 questions q-mw051no32n38dr,q-mw05l1pci6x0ay,q-mw07ou0gldifnm,q-mw090n9s6xfbs0,q-mw0acptqls3k87,q-mw0cxrzs3xrkz7,q-mw0ggsq4is47gt session /Users/jowolff/.agent-system-2/lanes/wl-mw01xdcflkdnq0/sessions/2026-11-03T02-11-26-317Z_01a19f2c-f5ed-7000-86f0-18fa742d9cb9.jsonl",
+    "created_by": "lane-runner",
+    "created_at": "2026-11-03T10:00:05.336Z"
+   },
+   {
+    "id": "en-mw0io69nez3yjg",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "assumption",
+    "body": "spend: lane-mw01xdcflkdnq0-3 usd 134.349 tokens 316583491 wall 438.7",
+    "created_by": "lane-runner",
+    "created_at": "2026-11-03T10:00:05.819Z"
+   },
+   {
+    "id": "en-mw0io69nb5seds",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "assumption",
+    "body": "lane-exit: lane-mw01xdcflkdnq0-3 code 0 signal - outcome parked",
+    "created_by": "lane-runner",
+    "created_at": "2026-11-03T10:00:05.819Z"
+   },
+   {
+    "id": "en-mw0ki5jgdyj2fm",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "assumption",
+    "body": "launch: lane-mw01xdcflkdnq0-4 cause resume in-mw0ki4lfwe59qb requested-by jo",
+    "created_by": "lane-starter",
+    "created_at": "2026-11-03T10:51:24.172Z"
+   },
+   {
+    "id": "en-mw0ki5wqfldgv6",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "assumption",
+    "body": "lane-started: lane-mw01xdcflkdnq0-4 {\"pid\":32587,\"start\":\"Tue Nov  3 02:51:24 2026\",\"session\":null,\"argv\":[\"--mode\",\"rpc\",\"--no-ui\",\"--cwd\",\"/Users/jowolff/code/agent-system-2.0-lanes/wl-mw01xdcflkdnq0\",\"--session-dir\",\"/Users/jowolff/.agent-system-2/lanes/wl-mw01xdcflkdnq0/sessions\",\"--append-system-prompt\",\"/Users/jowolff/.agent-system-2/lanes/wl-mw01xdcflkdnq0/system.md\",\"--max-time\",\"652m\",\"--resume\",\"/Users/jowolff/.agent-system-2/lanes/wl-mw01xdcflkdnq0/sessions/2026-11-03T02-11-26-317Z_01a19f2c-f5ed-7000-86f0-18fa742d9cb9.jsonl\"],\"runnerPid\":32580,\"model\":null,\"ranModel\":null,\"resumeSkipped\":null}",
+    "created_by": "lane-runner",
+    "created_at": "2026-11-03T10:51:24.650Z"
+   },
+   {
+    "id": "en-mw0ki7qa5d6joc",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "assumption",
+    "body": "lane-started: lane-mw01xdcflkdnq0-4 {\"pid\":32587,\"start\":\"Tue Nov  3 02:51:24 2026\",\"session\":\"/Users/jowolff/.agent-system-2/lanes/wl-mw01xdcflkdnq0/sessions/2026-11-03T02-11-26-317Z_01a19f2c-f5ed-7000-86f0-18fa742d9cb9.jsonl\",\"argv\":[\"--mode\",\"rpc\",\"--no-ui\",\"--cwd\",\"/Users/jowolff/code/agent-system-2.0-lanes/wl-mw01xdcflkdnq0\",\"--session-dir\",\"/Users/jowolff/.agent-system-2/lanes/wl-mw01xdcflkdnq0/sessions\",\"--append-system-prompt\",\"/Users/jowolff/.agent-system-2/lanes/wl-mw01xdcflkdnq0/system.md\",\"--max-time\",\"652m\",\"--resume\",\"/Users/jowolff/.agent-system-2/lanes/wl-mw01xdcflkdnq0/sessions/2026-11-03T02-11-26-317Z_01a19f2c-f5ed-7000-86f0-18fa742d9cb9.jsonl\"],\"runnerPid\":32580,\"model\":null,\"ranModel\":\"anthropic/claude-opus-5-5\",\"resumeSkipped\":null}",
+    "created_by": "lane-runner",
+    "created_at": "2026-11-03T10:51:27.010Z"
+   },
+   {
+    "id": "en-mw0ki8aa7svqsj",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "assumption",
+    "body": "spend: lane-mw01xdcflkdnq0-4 usd 153.829 tokens 346710479 wall 438.7",
+    "created_by": "lane-runner",
+    "created_at": "2026-11-03T10:51:27.730Z"
+   },
+   {
+    "id": "en-mw0ki8aaswx2wy",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "assumption",
+    "body": "lane-stop: lane-mw01xdcflkdnq0-4 accepted ceiling",
+    "created_by": "lane-runner",
+    "created_at": "2026-11-03T10:51:27.730Z"
+   },
+   {
+    "id": "en-mw0ki8fxs3trry",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "assumption",
+    "body": "spend: lane-mw01xdcflkdnq0-4 usd 153.829 tokens 346710479 wall 438.7",
+    "created_by": "lane-runner",
+    "created_at": "2026-11-03T10:51:27.933Z"
+   },
+   {
+    "id": "en-mw0ki8fxrzf6r4",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "kind": "assumption",
+    "body": "lane-exit: lane-mw01xdcflkdnq0-4 code 0 signal - outcome stop reason ceiling",
+    "created_by": "lane-runner",
+    "created_at": "2026-11-03T10:51:27.933Z"
+   }
+  ],
+  "messages": [
+   {
+    "id": "msg-mw0ki8aacothmz",
+    "workload_id": "wl-mw01xdcflkdnq0",
+    "slice_id": null,
+    "sender": "lane-runner",
+    "recipient": "orchestrator",
+    "body": "notice: ceiling 100 % at usd 150 wall 1080 on wl-mw01xdcflkdnq0: $153.83 of $150 (102 %) and 439 of 1080 minutes (40 %), normal stakes; 346710479 tokens.\nThe lane is stopped at the ceiling and nothing relaunches on its own. To go on: `extend wl-mw01xdcflkdnq0` (one more block of its own size) or `ceiling <usd> [<hours>] wl-mw01xdcflkdnq0`; either relaunches it. To drive it yourself: `user-driven wl-mw01xdcflkdnq0`.",
+    "state": "held",
+    "created_by": "lane-runner",
+    "created_at": "2026-11-03T10:51:27.730Z",
+    "changed_by": "lane-runner",
+    "changed_at": "2026-11-03T10:51:27.730Z",
+    "rev": 0
+   }
+  ]
+ }
+}

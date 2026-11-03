@@ -50,16 +50,14 @@
 //                                        admits, one starter at a time, oldest workload first (MIGRATION.md item 71),
 //                                        or in Jev rank order under `jevRank` order/parallel (src/rank-launch.ts);
 //                                        <wl> names the workload whose lane ended, for drain.log only
-//   move-alert <wl> <E> [--again]       detached after a recorded move (src/quota-move-alert.ts, PLAN wl-mvwk0v0gmp6cjc D4):
-//                                        the @thewolff jo-issues comment, then the silent popup, each claimed in the
-//                                        ledger; --again opens a new block of attempts on an exhausted channel. gh and
-//                                        osascript come from AS2_MOVE_ALERT_GH / AS2_MOVE_ALERT_OSASCRIPT when set
 //
-// Stamps: every subcommand writes as `lane-starter`, except `run` and `move-alert`, which write as `lane-runner`, and
+// Stamps: every subcommand writes as `lane-starter`, except `run`, which writes as `lane-runner`, and
 // `ctx-index`, which writes as the one its `--by` names. `drain` writes nothing itself: its starters write as `lane-starter`.
+// After a quota move and after a ceiling stop the runner kicks the alert pass (src/notify.ts `kickAlerts`, PLAN
+// wl-mw0vs9uc3xqtka D3): `bun surface/scripts/alert-tick.ts`, detached.
 // Exit codes for launch/interactive: surface/src/launch.ts STARTER_EXIT.
 import { type Subprocess, spawn, spawnSync } from "bun";
-import { appendFileSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { headroom } from "../../classifier/src/headroom";
 import { countRounds, parseReviewRound } from "../../classifier/src/rounds";
@@ -104,7 +102,7 @@ import {
 } from "../src/turn-end";
 import { waitingReserved } from "../src/errors";
 import { laneMetrics, laneMetricsBody, psSampler, RSS_SAMPLE_MS, rssMeter } from "../src/metrics";
-import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
+import { type PsRun, runPs, statStart } from "../src/omp-probe";
 import { sendNotice } from "../src/notice";
 import {
 	decideRanked, DRAIN_TRIED_ENV, drainPick, formatDrainTried, type RankConfig, rankShadowLine, readDrainTried, readRankConfig, writePickSnapshot,
@@ -113,9 +111,11 @@ import { renderWorkload } from "../src/render";
 import { laneDeaths } from "../src/signals";
 import { readTracingSetting, tracingEnv } from "../src/tracing";
 import { parseHeartbeat, parsePushDest, runDirOf, runsRoot, testRuns } from "../src/test-run";
+import { recordQuotaMove } from "../src/quota-move-alert";
+import { kickAlerts } from "../src/notify";
 import {
-	ghCommand, glassAndSay, osascriptPopup, psMoveAlertProbe, recordQuotaMove, runMoveAlert, sigterm, spawnMoveAlert,
-} from "../src/quota-move-alert";
+	type LiveRunner, liveRunnerOf, type LockRefusal, type RunnerIdentity, type RunnerLock, type RunnerProbe, runnerProbe, selfIdentity, takeRunnerLock,
+} from "../src/runner-probe";
 import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV } from "../src/types";
 import { readCleanShell } from "../../gates/src/clean-shell";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
@@ -1330,73 +1330,6 @@ export function ceilingPromptLine(c: Ceiling, s: Spend): string {
 
 // ---- the run guard: one runner per lane id ---------------------------------------------------------
 
-/** How the guard asks the machine about a `lane-started:` entry's two pids; the tests pass a fake. */
-export interface RunnerProbe {
-	/** The omp pid against the start time the entry recorded; with none recorded, `unknown` while the pid is alive (`gone` once it is not). */
-	omp(pid: number, start: string): PidState;
-	/** The runner pid, whose start time no entry records: `same` only while its command line is still `lane.ts run <wl> <laneId>` (`isRunnerCommand`). */
-	runner(pid: number): PidState;
-}
-
-/**
- * The process a second `lane.ts run` on the same lane id would collide with: alive and this lane's, (`uninspected`) one
- * ps could not answer for, or (`unverified`) a live omp pid with no recorded start time.
- */
-export interface LiveRunner {
-	what: "omp" | "runner";
-	pid: number;
-	/** The probe answered `failed`: the pid may be this lane's live process, and the run is refused as retryable, not as running. */
-	uninspected?: true;
-	/** The probe answered `unknown`: a live pid no start time can tell from this lane's omp, refused as retryable until it exits. */
-	unverified?: true;
-}
-
-/**
- * The live process of a lane id already running, or null when `lane.ts run` may start it (pure; the probe is the only
- * outside read). Every `lane-started:` for `laneId` after its newest `lane-exit:` is checked, newest first, so a pid that
- * a later start record superseded but that is still alive refuses too: a lane id with a live omp is running whichever
- * entry named it. An entry refuses when its omp pid is `same` (alive, and its start time matches the recorded one), or
- * when its runner pid is not `selfPid` and is `same` (still running `lane.ts run` on this workload and lane id: no start
- * time is recorded for the runner, so its command line is the identity check). `gone` and `other` (the pid was reused)
- * never refuse. `unknown` (the omp pid is alive and no start time was recorded for it) refuses as `unverified`: it cannot
- * be told apart from this lane's omp, so it is never permission to start (openai review r2 #1). `failed` (ps could not
- * answer for a recorded pid) refuses as `uninspected`: the owner was not shown gone, so a second runner could be a
- * duplicate and its finalizer could release the first one's workload (openai review r1 #4).
- * `selfPid` skips only the runner check, since this process matches its own command; an omp that entry names still counts.
- *
- * This is the second check, not the exclusion: `cmdRun` runs it while holding the lane id's run lock (`takeRunnerLock`),
- * which is what keeps two `run` calls on one lane id from both spawning omp. This check catches what the lock cannot
- * see: an omp still alive after its runner died (the lock was taken over from a dead pid), and a lane id an interactive
- * lane or a runner that predates the lock started.
- */
-export function liveRunnerOf(control: readonly ControlEntry[], laneId: string, selfPid: number, probe: RunnerProbe): LiveRunner | null {
-	const checked = new Set<string>();
-	for (let i = control.length - 1; i >= 0; i--) {
-		const c = control[i]!;
-		if (c.laneId !== laneId) continue;
-		if (c.prefix === "lane-exit") return null;
-		if (c.prefix !== "lane-started") continue;
-		const s = laneStarted([c], laneId);
-		if (s === null) continue;
-		// The runner re-records lane-started: once omp names its model and session; the pids repeat, so each pair is probed once.
-		const key = `${s.pid} ${s.start} ${s.runnerPid}`;
-		if (checked.has(key)) continue;
-		checked.add(key);
-		if (s.pid > 0) {
-			const omp = probe.omp(s.pid, s.start);
-			if (omp === "same") return { what: "omp", pid: s.pid };
-			if (omp === "unknown") return { what: "omp", pid: s.pid, unverified: true };
-			if (omp === "failed") return { what: "omp", pid: s.pid, uninspected: true };
-		}
-		if (s.runnerPid > 0 && s.runnerPid !== selfPid) {
-			const runner = probe.runner(s.runnerPid);
-			if (runner === "same") return { what: "runner", pid: s.runnerPid };
-			if (runner === "failed") return { what: "runner", pid: s.runnerPid, uninspected: true };
-		}
-	}
-	return null;
-}
-
 /**
  * The first live lane on a workload (PLAN wl-mvgn310dpi5gcg D2), or null: every lane id with a `lane-started:` after its newest
  * `lane-exit:`, newest first, checked by `liveRunnerOf` with `probeFor(laneId)`. A lane whose runner or omp is alive refuses
@@ -1594,161 +1527,11 @@ export function spawnIfReserved<C>(
 	return spawnChild();
 }
 
-/** Whether a `ps -o command=` line is `lane.ts run <wl> <laneId>` (how `cmdLaunch` and chaos start a runner), whatever the path to lane.ts. */
-export function isRunnerCommand(command: string, wl: string, laneId: string): boolean {
-	const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	return new RegExp(`(?:^|[\\s/])lane\\.ts run ${esc(wl)} ${esc(laneId)}(?:\\s|$)`).test(command);
-}
-
-/**
- * The machine's probe for `liveRunnerOf`, over `run` (ps; the tests pass a fake). The omp pid is read by the shared
- * strict reader (`ompPidState`, surface/src/omp-probe.ts); the runner pid by its command line. A ps that cannot be
- * spawned or answers anything but a clean line or a clean "no such process" reads `failed`, its reason kept in
- * `failure` for the refusal.
- */
-export function runnerProbe(wl: string, laneId: string, run: PsRun = runPs): RunnerProbe & { failure: string | null } {
-	const p = {
-		failure: null as string | null,
-		omp: (pid: number, start: string): PidState =>
-			ompPidState(pid, start, run, (reason) => {
-				p.failure = reason;
-			}),
-		runner: (pid: number): PidState => {
-			try {
-				const command = psAnswer(run, pid, "command=");
-				return command === null ? "gone" : isRunnerCommand(command, wl, laneId) ? "same" : "other";
-			} catch (err) {
-				p.failure = err instanceof Error ? err.message : String(err);
-				return "failed";
-			}
-		},
-	};
-	return p;
-}
-
 // ---- the run lock: one owner per lane id -----------------------------------------------------------
-
-/** A runner's identity in its run lock: its pid and that pid's ps start time, so a reused pid never reads as the owner. */
-export interface RunnerIdentity {
-	pid: number;
-	start: string;
-}
 
 /** The lane id's run lock, under the lanes root beside the lane's system prompt, sessions and logs: `~/.agent-system-2/lanes/<wl>/<laneId>.run.lock`. */
 export function runnerLockPath(wl: string, laneId: string, h: string = homeDir()): string {
 	return join(laneDir(wl, h), `${laneId}.run.lock`);
-}
-
-/** The lock file's owner: null when there is no file, `unreadable` when its content is not a pid and a start time. */
-function lockOwner(path: string): RunnerIdentity | null | "unreadable" {
-	let text: string;
-	try {
-		text = readFileSync(path, "utf8");
-	} catch (err) {
-		if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-		throw err;
-	}
-	try {
-		const o = JSON.parse(text) as { pid?: unknown; start?: unknown };
-		if (typeof o.pid === "number" && Number.isInteger(o.pid) && o.pid > 0 && typeof o.start === "string") return { pid: o.pid, start: o.start };
-	} catch {
-		// not JSON: unreadable, below
-	}
-	return "unreadable";
-}
-
-/**
- * A run lock this runner took. `held` re-reads the file: true while no other runner holds the lane id, that is while the
- * file names `self`, or while it is gone (removed under the runner, as with its lane dir) and nobody has taken it since;
- * false once it names another runner or names none. `owns` is the strict read the spawn needs (`startAsOwner`): true only
- * while the file exists and names `self`. `release` removes the file only while it names `self`.
- */
-export interface RunnerLock {
-	path: string;
-	self: RunnerIdentity;
-	/** The stale owner this runner replaced (its pid gone, or reused by a process with another start time), or null. */
-	tookOver: { owner: RunnerIdentity; state: "gone" | "other" } | null;
-	held(): boolean;
-	owns(): boolean;
-	release(): void;
-}
-
-/**
- * Why `takeRunnerLock` refused: the owner is alive (`same`), alive with no start time to verify it by (`unknown`), ps
- * could not answer for it (`failed`), the file names no owner (`unreadable`), or a writer outside the protocol created
- * the file between the read and the link (`raced`). Every one is a refusal, never a takeover.
- */
-export interface LockRefusal {
-	owner: RunnerIdentity | null;
-	state: "same" | "unknown" | "failed" | "unreadable" | "raced";
-}
-
-function heldLock(path: string, self: RunnerIdentity, tookOver: RunnerLock["tookOver"]): RunnerLock {
-	/** Whether the file names this runner: null when there is no file, false when it names another runner or none. */
-	const mine = (): boolean | null => {
-		try {
-			const o = lockOwner(path);
-			return o === null ? null : o !== "unreadable" && o.pid === self.pid && o.start === self.start;
-		} catch {
-			return false;
-		}
-	};
-	return {
-		path, self, tookOver,
-		held: () => mine() !== false,
-		owns: () => mine() === true,
-		// No other runner replaces a lock whose owner is alive, so the file read as this runner's is still this runner's at the rm.
-		release: () => {
-			if (mine() === true) rmSync(path, { force: true });
-		},
-	};
-}
-
-/**
- * Take a lane id's run lock at `path` for `self`, or refuse (openai review r2 #1). The file holds the owner's pid and ps
- * start time and is created exclusively: the identity is written to a file of this pid's own and hard-linked in, so the
- * lock never exists half-written, and the link fails EEXIST as an O_EXCL create does. An existing lock is taken over
- * only when `check` (the same pid-and-start-time check an omp gets) reads its owner `gone` or `other`; any other answer
- * refuses. The read, the check, the takeover and the create all run inside one ledger write: the ledger's BEGIN
- * IMMEDIATE is the cross-process mutex, so two runners that both find one stale owner cannot both replace it, and the
- * mutex is never left behind (SQLite drops it when its process dies). Nothing is written to the ledger. A lock that
- * already names `self` is held (a busy-retried transaction runs this body twice). `check` runs inside the write, so it
- * must be bounded: the runner's is `runnerProbe` over `runPs`, where a ps past PS_TIMEOUT_MS reads `failed` (a refusal).
- */
-export function takeRunnerLock(ledger: Pick<Ledger, "write">, path: string, self: RunnerIdentity, check: (pid: number, start: string) => PidState): RunnerLock | LockRefusal {
-	mkdirSync(dirname(path), { recursive: true });
-	return ledger.write((): RunnerLock | LockRefusal => {
-		const owner = lockOwner(path);
-		if (owner === "unreadable") return { owner: null, state: "unreadable" };
-		if (owner !== null && owner.pid === self.pid && owner.start === self.start) return heldLock(path, self, null);
-		let tookOver: RunnerLock["tookOver"] = null;
-		if (owner !== null) {
-			const state = check(owner.pid, owner.start);
-			if (state !== "gone" && state !== "other") return { owner, state };
-			rmSync(path, { force: true });
-			tookOver = { owner, state };
-		}
-		const tmp = `${path}.${self.pid}.tmp`;
-		writeFileSync(tmp, `${JSON.stringify(self)}\n`, { mode: 0o600 });
-		try {
-			linkSync(tmp, path);
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-			const now = lockOwner(path);
-			return { owner: now === "unreadable" ? null : now, state: "raced" };
-		} finally {
-			rmSync(tmp, { force: true });
-		}
-		return heldLock(path, self, tookOver);
-	});
-}
-
-/** This process's identity for its run lock: its pid and its ps start time, read strictly (a ps failure throws). */
-export function selfIdentity(run: PsRun = runPs, pid: number = process.pid): RunnerIdentity {
-	const out = psAnswer(run, pid, "stat=,lstart=");
-	const start = out === null ? "" : statStart(out).start;
-	if (!start) throw new Error(`ps -p ${pid} -o stat=,lstart= answered ${out === null ? "no such process" : `no start time: ${out}`}`);
-	return { pid, start };
 }
 
 /**
@@ -1821,7 +1604,8 @@ type Frame = Record<string, unknown>;
  * time, then the recorded omp and runner pids (`liveRunnerOf`). A refusal at either step exits `held` with no ledger write,
  * no preparation, no spawn and no finalization, since the lifecycle, the claim and the omp may belong to a runner already
  * there. The owner runs the lane (`runOwned`) and frees the lock however it ends; a runner killed before that leaves the
- * lock to the next one's stale takeover.
+ * lock to the next one's stale takeover. A lock that cannot be read or removed at the release is the run's failure when
+ * the run went through, and a line on stderr beside the run's own error when it did not (review r2 N3).
  */
 async function cmdRun(wl: string, laneId: string): Promise<number> {
 	const ledger = openLedger();
@@ -1829,6 +1613,16 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 	if (!w) throw new Fail("run", `no workload ${wl}`, STARTER_EXIT.unknown!);
 	const probe = runnerProbe(wl, laneId);
 	const lock = holdRunnerLock(ledger, wl, laneId, probe);
+	/** Release the lock; why it failed (naming the lock path), or null. */
+	const release = (): string | null => {
+		try {
+			lock.release();
+			return null;
+		} catch (err) {
+			return `${laneId}: its run lock was not released (${oneLine(err)}); the next runner takes it over once this pid is gone`;
+		}
+	};
+	let code: number;
 	try {
 		const live = liveRunnerOf(controlEntries(ledger.entries(wl)), laneId, process.pid, probe);
 		if (live?.uninspected) {
@@ -1838,10 +1632,16 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 			throw new Fail("run", `${laneId} not started: the recorded ${live.what} pid ${live.pid} is alive and no start time was recorded for it, so it cannot be told from this lane's omp; nothing was written, retryable once it exits`, STARTER_EXIT.held!);
 		}
 		if (live !== null) throw new Fail("run", `${laneId} already running: ${live.what} pid ${live.pid}`, STARTER_EXIT.held!);
-		return await runOwned(ledger, w, wl, laneId, lock);
-	} finally {
-		lock.release();
+		code = await runOwned(ledger, w, wl, laneId, lock);
+	} catch (err) {
+		// One failure never hides another: the run's own error stays the one thrown, with the release's beside it in the log.
+		const why = release();
+		if (why !== null) process.stderr.write(`runner: ${why}\n`);
+		throw err;
 	}
+	const why = release();
+	if (why !== null) throw new Fail("run", why, STARTER_EXIT.unknown!);
+	return code;
 }
 
 /**
@@ -2165,6 +1965,14 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			}
 			// The exit is on the ledger (this write's, or the one `lane.ts stop` wrote first): index the workload's sessions.
 			spawnCtxIndex(wl, laneId, "runner");
+			// A ceiling stop is an alert once no lane holds the workload, which this write made true: start the alert pass now.
+			if (final === "stop" && stopReason === "ceiling") {
+				try {
+					kickAlerts(`ceiling stop of ${laneId}`);
+				} catch (err) {
+					process.stderr.write(`runner: ${laneId}: ${String(err)}\n`);
+				}
+			}
 		} catch (err) {
 			process.stderr.write(`runner: finalization failed: ${String(err)}\n`);
 		}
@@ -2661,8 +2469,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				}
 				// The move holds only once get_state reports the target: then the lane-headroom: record and its on-fire quota-move:
 				// message are written in one transaction (D4; a failed write takes the runner's failure path, as the bare record did),
-				// the move alert is spawned, ranModel names the target, and ready may follow. The move is recorded by then, so a
-				// spawn that cannot even be recorded is logged, not fatal: the train tick finds the alert unstarted and spawns it.
+				// the alert pass is kicked, ranModel names the target, and ready may follow. The move is recorded by then, so a kick
+				// that cannot start is logged, not fatal: the train tick's next alert pass raises it.
 				if (o.type === "response" && o.id === MOVED_STATE_ID && move !== null && !modelChecked && outcome === null) {
 					const now = stateModelOf(o);
 					if (now === move.to) {
@@ -2671,9 +2479,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 							eventBody: laneHeadroomBody(laneId, move.from, move.to, move.reason),
 						});
 						try {
-							spawnMoveAlert(ledger, wl, eventId);
+							kickAlerts(`quota move ${eventId}`);
 						} catch (err) {
-							process.stderr.write(`runner: ${laneId} move alert ${eventId} not started: ${String(err)}; the train tick spawns it once the alert reads unstarted\n`);
+							process.stderr.write(`runner: ${laneId}: ${String(err)}\n`);
 						}
 						ranModel = now;
 						rerecord = true;
@@ -3013,28 +2821,12 @@ function cmdLog(wl: string): number {
 	return 0;
 }
 
-/** `move-alert <wl> <E> [--again]`: the move alert's worker on the real gh and osascript (or the env's overrides). */
-function cmdMoveAlert(wl: string, eventId: string | undefined, again: boolean): number {
-	if (!eventId) throw new Fail("move-alert", "move-alert needs <wl> <event entry id> [--again]", 1);
-	const ledger = openLedger();
-	try {
-		return runMoveAlert(ledger, {
-			gh: ghCommand(process.env.AS2_MOVE_ALERT_GH || "gh"),
-			popup: osascriptPopup(process.env.AS2_MOVE_ALERT_OSASCRIPT || "/usr/bin/osascript"),
-			voice: glassAndSay, probe: psMoveAlertProbe, kill: sigterm, pid: process.pid,
-			log: (s) => process.stderr.write(`${new Date().toISOString()} ${s}\n`),
-		}, wl, eventId, again);
-	} finally {
-		ledger.close();
-	}
-}
-
 // ---- main ------------------------------------------------------------------------------------------
 
 async function main(argv: string[]): Promise<number> {
 	const [cmd, wl, ...rest] = argv;
 	if (!cmd || !wl) {
-		process.stderr.write("usage: lane.ts launch|run|interactive|stop|cleanup|log|ctx-index|drain|move-alert <workload> [...]\n");
+		process.stderr.write("usage: lane.ts launch|run|interactive|stop|cleanup|log|ctx-index|drain <workload> [...]\n");
 		return 1;
 	}
 	switch (cmd) {
@@ -3064,8 +2856,6 @@ async function main(argv: string[]): Promise<number> {
 		}
 		case "drain":
 			return cmdDrain(wl);
-		case "move-alert":
-			return cmdMoveAlert(wl, rest[0], rest.includes("--again"));
 		default:
 			process.stderr.write(`lane.ts: unknown subcommand ${cmd}\n`);
 			return 1;

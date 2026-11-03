@@ -23,6 +23,7 @@ import { actionable, fixBindings, recordTrainTask, TRAIN_ALERT_REPO, TRAIN_DONE,
 import type { PidState } from "../src/omp-probe";
 import { briefHash, formatOverride, formatSignal, goalsHash, rankDay, type SignalAnswers } from "../src/rank";
 import type { RankConfig } from "../src/rank-launch";
+import type { RunnerProbe } from "../src/runner-probe";
 import { makeRunId, testRequestedBody, type TestRun, testRunBody } from "../src/test-run";
 import { releasedOpenBody } from "../src/turn-end";
 import { MERGE_TRAIN_BY, RANK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
@@ -30,7 +31,7 @@ import { type GhResult, tick } from "../scripts/train-tick";
 // A namespace import, as lane-script.test.ts does: a name lane.ts stops exporting fails only the test that calls it.
 import * as laneScript from "../scripts/lane";
 import { clock, fakePi, tempLedger, tmp } from "./helpers";
-import { checkout, fakeGh, H0, H1, JO, REPO } from "./train-world";
+import { checkout, fakeGh, H0, H1, JO, REPO, tickAlerts } from "./train-world";
 
 const CAP = 5;
 const SHOW: RankConfig = { mode: "show", parallelBudgetUsd: 0 };
@@ -60,11 +61,13 @@ const refusalCode = (reason: string): number =>
 
 /**
  * The world: train `prs` (one checkout with REPO's origin), an autonomous owner on `wl/<owner>` for #101's tasks, a fake gh
- * whose PR views carry the bodies and merge states `views` sets, and the launcher the tick runs.
+ * whose PR views carry the bodies and merge states `views` sets, and the launcher the tick runs. The ledger has the standing
+ * workload, where the tick's alert pass (PLAN wl-mw0vs9uc3xqtka D3) writes its `alert:` rows; its jo-issues issues land in `g`.
  */
 function live(prs: readonly number[] = [101], config: RankConfig = SHOW) {
 	const c = clock("2026-10-26T06:00:00.000Z");
 	const { ledger, path } = tempLedger(c.now);
+	ensureStandingWorkload(ledger);
 	const repo = checkout();
 	const cmd = interpret(ledger, `train ${prs.join(" ")}`);
 	if (cmd?.kind !== "train") throw new Error("not a train");
@@ -83,7 +86,7 @@ function live(prs: readonly number[] = [101], config: RankConfig = SHOW) {
 	// The runner probe: a lane is alive (`same`) from its `lane-started:` until its exit; every other pid is gone.
 	const alive = new Set<string>();
 	const answer = (laneId: string): PidState => (alive.has(laneId) ? "same" : "gone");
-	const probeFor = (laneId: string): laneScript.RunnerProbe => ({ omp: () => answer(laneId), runner: () => answer(laneId) });
+	const probeFor = (laneId: string): RunnerProbe => ({ omp: () => answer(laneId), runner: () => answer(laneId) });
 	let pid = 5000;
 	const started = (wl: string, laneId: string) => {
 		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(laneId, { pid: ++pid, start: OMP_START, session: null, argv: [], runnerPid: ++pid }) });
@@ -130,10 +133,12 @@ function live(prs: readonly number[] = [101], config: RankConfig = SHOW) {
 		return r;
 	};
 	const logs: string[] = [];
+	/** The tick's alert pass on recording seams over `g` (train-world.ts `tickAlerts`): no real gh, popup or ps. */
+	const alerts = tickAlerts(g).alerts;
 	/** One tick pass, one interval after the last; `on` is the ledger the tick reads (a test's interposing view of `ledger`). */
 	const pass = (on: Ledger = ledger) => {
 		c.plusHours(STEP_H);
-		return tick({ ledger: on, gh, launch, notify: () => true, log: (l) => logs.push(l) });
+		return tick({ ledger: on, gh, launch, alerts, log: (l) => logs.push(l) });
 	};
 	/** The exit drain, in-process: `cmdDrain`'s walk in `show` (oldest first, `launchRowsFor` + `verdictOf`), each launch through the starter. */
 	const drain = () => {

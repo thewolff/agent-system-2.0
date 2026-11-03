@@ -1,20 +1,20 @@
 /**
  * A build hand moves lab on a used-up week (PLAN wl-mvwk0v0gmp6cjc D6, R10–R12; Jo, in-mvwl9tkmsym86o, amending
  * in-mv7hm58386f2o0 for this case). The host builds the classifier on a temp ledger and a fake model registry, as
- * crosslab.test.ts's `lane()` does: helpers.ts `extensionHost` has no seam for the move-alert spawn, and no test may start
- * the real worker, so `spawnMoveAlert` runs surface/src/quota-move-alert.ts's own `spawnMoveAlert` with a fake spawner.
- * The quota guard reads real-shaped poll lines from the file `AS2_HEADROOM_POLLS` names, on the lane's injected clock.
+ * crosslab.test.ts's `lane()` does: helpers.ts `extensionHost` has no seam for the alert pass's kick, and no test may start
+ * the real pass, so `kickAlerts` is a recorder (PLAN wl-mw0vs9uc3xqtka D3). R12 runs the alert pass itself on recording seams
+ * (surface/test/alert-world.ts). The quota guard reads real-shaped poll lines from the file `AS2_HEADROOM_POLLS` names, on the
+ * lane's injected clock.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
-import type { Gh, GhResult } from "../../surface/src/jo-issues";
-import { TRAIN_ALERT_REPO } from "../../surface/src/merge-train";
-import {
-	commentMarker, DISMISS_BUTTON, type MoveAlertSeams, moveAlertTroubles, quotaMove, quotaMoveMessageId, quotaMoves, runMoveAlert, spawnMoveAlert,
-} from "../../surface/src/quota-move-alert";
+import { alertPass } from "../../surface/scripts/alert-tick";
+import { ensureStandingWorkload } from "../../surface/src/identity";
+import { moveText, moveTitle, quotaMove, quotaMoveMessageId, quotaMoves } from "../../surface/src/quota-move-alert";
+import { alertRowsOf, alertSeams, fakeGh } from "../../surface/test/alert-world";
 import { createClassifierExtension } from "../extension";
 import { loadCalibration } from "../src/classify";
 import { builderLabs } from "../src/lab";
@@ -109,10 +109,11 @@ const brief = (w: World, task: string) =>
 type Handler = (event: unknown, ctx?: unknown) => unknown;
 type Reply = { block?: boolean; reason?: string; input?: { agent: string; name: string }; model?: string[]; note?: string } | undefined;
 
-/** One lane process's hooks, and what it logged and spawned. */
+/** One lane process's hooks, and what it logged and kicked. */
 interface Lane {
 	logs: string[];
-	spawned: string[][];
+	/** Each alert-pass kick's `why`, in order. */
+	kicks: string[];
 	toolCall(input: unknown, toolCallId: string): Promise<Reply>;
 	spawn(agent: string, spawnKey: string | undefined, invocationKind?: string): Promise<Reply>;
 	laneMessage(selector: string): unknown;
@@ -123,14 +124,14 @@ interface Lane {
 
 /**
  * One lane process. `bound`: the session's bound workload (`AGENT_SYSTEM_WORKLOAD_ID`), the world's unless given;
- * `ledger`: what `deps.ledger()` returns (a failing stand-in for the one-transaction check). `alert`: the move alert's
- * start, by default the real `spawnMoveAlert` with a fake spawner whose argv lands in `spawned`.
+ * `ledger`: what `deps.ledger()` returns (a failing stand-in for the one-transaction check). `kick`: the alert pass's
+ * start, by default a recorder whose `why` lands in `kicks` and answers pid 4242.
  */
-function lane(w: World, opts: { laneModel?: string; bound?: string | null; ledger?: Ledger; alert?: (ledger: Ledger, wl: string, eventId: string) => number | null } = {}): Lane {
+function lane(w: World, opts: { laneModel?: string; bound?: string | null; ledger?: Ledger; kick?: (why: string) => number } = {}): Lane {
 	const handlers: Record<string, Handler> = {};
 	const handSession: Record<string, Handler> = {};
 	const logs: string[] = [];
-	const spawned: string[][] = [];
+	const kicks: string[] = [];
 	const extension = createClassifierExtension({
 		judge: async () => JUDGE as never,
 		tierTable: () => TABLE,
@@ -145,11 +146,10 @@ function lane(w: World, opts: { laneModel?: string; bound?: string | null; ledge
 		log: line => logs.push(line),
 		now: () => NOW,
 		fingerprint: () => "fingerprint",
-		spawnMoveAlert: opts.alert ?? ((ledger, wl, eventId) =>
-			spawnMoveAlert(ledger, wl, eventId, argv => {
-				spawned.push(argv);
-				return 4242;
-			}, () => false)),
+		kickAlerts: opts.kick ?? (why => {
+			kicks.push(why);
+			return 4242;
+		}),
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
@@ -160,7 +160,7 @@ function lane(w: World, opts: { laneModel?: string; bound?: string | null; ledge
 	};
 	return {
 		logs,
-		spawned,
+		kicks,
 		toolCall: (input: unknown, toolCallId: string) => handlers.tool_call!({ type: "tool_call", toolName: "task", toolCallId, input }, ctx) as Promise<Reply>,
 		spawn: (agent: string, spawnKey: string | undefined, invocationKind = "task") =>
 			handlers.before_subagent_spawn!({ type: "before_subagent_spawn", agent, invocationKind, patterns: [], spawnKey }, ctx) as Promise<Reply>,
@@ -217,9 +217,9 @@ describe("an exhausted Anthropic week moves a build hand to the first usable Ope
 				body: `quota-move: ${subject} on ${w.wl}: ${OPUS} -> ${SOL} (${EXHAUSTED})`,
 			});
 			expect(spawn?.note).toContain(`moved off the lane lab anthropic (${OPUS}) to ${SOL}: ${EXHAUSTED} (hand-headroom ${event.id}`);
-			// The alert's worker was started for this event (fake spawner), each channel marked spawning.
-			expect(h.spawned).toEqual([[expect.any(String), expect.stringContaining("lane.ts"), "move-alert", w.wl, event.id]]);
-			expect(bodies(w, `quota-move-alert: ${event.id} `)).toEqual([`quota-move-alert: ${event.id} comment spawning`, `quota-move-alert: ${event.id} popup spawning`]);
+			// The alert pass was kicked for this event (fake kick); the pass, not the classifier, writes the alert's rows.
+			expect(h.kicks).toEqual([`quota move ${event.id}`]);
+			expect(bodies(w, `quota-move-alert: ${event.id} `)).toEqual([]);
 			// No routing at the move; the target lab is a builder once spawned.
 			expect(w.ledger.routings(w.wl)).toEqual([]);
 			expect(builderLabs(w.ledger, w.wl).labs).toContain("openai");
@@ -239,7 +239,7 @@ describe("an exhausted Anthropic week moves a build hand to the first usable Ope
 		expect(bodies(w, "hand-headroom:")).toEqual([`hand-headroom: ${subject} ${OPUS} -> ${SOL} (${EXHAUSTED})`]);
 		expect(quotaMoves(w.ledger).map(m => [m.subject, m.from, m.to, m.reason])).toEqual([[subject, OPUS, SOL, EXHAUSTED]]);
 		expect(bodies(w, "hand-spawn:")).toEqual([]);
-		expect(h.spawned).toHaveLength(1);
+		expect(h.kicks).toHaveLength(1);
 
 		const keyless = world(poll([week(1), openaiWeek]));
 		expect((await lane(keyless).spawn("strong", undefined, "eval"))?.model).toEqual([SOL]);
@@ -254,7 +254,7 @@ describe("an exhausted Anthropic week moves a build hand to the first usable Ope
 		expect(spawn?.reason).toContain(`no usable strong model on the lane lab anthropic (${OPUS})`);
 		expect(spawn?.reason).toContain("a build hand never runs on another lab");
 		expect(quotaMoves(w.ledger)).toEqual([]);
-		expect(h.spawned).toEqual([]);
+		expect(h.kicks).toEqual([]);
 		expect(h.logs).toEqual([expect.stringContaining("unclassified hand Eval.1 not moved off")]);
 	});
 
@@ -349,10 +349,10 @@ describe("an exhausted Anthropic week moves a build hand to the first usable Ope
 		expect(quotaMoves(w.ledger)).toEqual([]);
 	});
 
-	test("an alert that cannot be started is logged with its event id and does not undo the spawn", async () => {
+	test("an alert pass that cannot be kicked is logged with its event id and does not undo the spawn", async () => {
 		const w = world(poll([week(1), openaiWeek]));
 		const h = lane(w, {
-			alert: () => {
+			kick: () => {
 				throw new Error("spawn failed and recording that failed too");
 			},
 		});
@@ -360,7 +360,7 @@ describe("an exhausted Anthropic week moves a build hand to the first usable Ope
 		const { spawn } = await buildSpawn(h, w);
 		expect(spawn?.model).toEqual([SOL]);
 		const event = w.ledger.entries(w.wl).find(e => e.body.startsWith("hand-headroom:"))!;
-		expect(h.logs).toEqual([expect.stringContaining(`move alert ${event.id} on ${w.wl}`)]);
+		expect(h.logs).toEqual([expect.stringContaining(`move ${event.id} on ${w.wl}`)]);
 		expect(h.logs[0]).toContain("spawn failed and recording that failed too");
 		expect(bodies(w, "hand-spawn:")).toHaveLength(1);
 	});
@@ -376,7 +376,7 @@ describe("no exhausted week, no move (R11)", () => {
 		expect(spawn?.reason).toBe(`agent-system-2 classifier: no usable strong model on the lane lab anthropic (${OPUS}): ${OPUS} (projected out: ${FIVE_HOUR_OUT}); a build hand never runs on another lab`);
 		expect(bodies(w, "hand-headroom:")).toEqual([]);
 		expect(quotaMoves(w.ledger)).toEqual([]);
-		expect(h.spawned).toEqual([]);
+		expect(h.kicks).toEqual([]);
 		const unclassified = await h.spawn("strong", "Eval.1", "eval");
 		expect(unclassified?.block).toBe(true);
 		expect(quotaMoves(w.ledger)).toEqual([]);
@@ -392,7 +392,7 @@ describe("no exhausted week, no move (R11)", () => {
 		expect(spawn?.reason).toContain(`no usable strong model on the lane lab openai (${SOL}): ${SOL} (projected out: openai-codex 7d 0.60 used, window pace +`);
 		expect(spawn?.reason).toContain("a build hand never runs on another lab");
 		expect(quotaMoves(w.ledger)).toEqual([]);
-		expect(h.spawned).toEqual([]);
+		expect(h.kicks).toEqual([]);
 	});
 
 	test("a hand on a lane that already moved is a normal spawn on the lane's lab, with no alert", async () => {
@@ -430,71 +430,35 @@ describe("no exhausted week, no move (R11)", () => {
 	});
 });
 
-interface FakeIssue {
-	number: number;
-	title: string;
-	body: string;
-	comments: { body: string; url: string }[];
-}
-
-/** jo-issues in memory: the REST listing (one page), issue create / view / comment, label create. */
-function fakeGh() {
-	const issues: FakeIssue[] = [];
-	const url = (n: number) => `https://github.com/${TRAIN_ALERT_REPO}/issues/${n}`;
-	const flag = (args: string[], f: string) => args[args.indexOf(f) + 1]!;
-	const ok = (stdout: string): GhResult => ({ code: 0, stdout, stderr: "" });
-	const gh: Gh = args => {
-		if (args[0] === "api" && args[1] === `repos/${TRAIN_ALERT_REPO}/issues`) return ok(JSON.stringify([issues.map(i => ({ body: i.body, html_url: url(i.number) }))]));
-		if (args[0] === "issue" && args[1] === "create") {
-			issues.push({ number: issues.length + 1, title: flag(args, "--title"), body: flag(args, "--body"), comments: [] });
-			return ok(`${url(issues.length)}\n`);
-		}
-		const issue = issues[Number(args[2]) - 1];
-		if (args[0] === "issue" && args[1] === "view" && issue) return ok(JSON.stringify({ comments: issue.comments }));
-		if (args[0] === "issue" && args[1] === "comment" && issue) {
-			const u = `${url(issue.number)}#issuecomment-${issue.comments.length + 1}`;
-			issue.comments.push({ body: flag(args, "--body"), url: u });
-			return ok(`${u}\n`);
-		}
-		if (args[0] === "label" && args[1] === "create") return ok("");
-		return { code: 1, stdout: "", stderr: `fake gh: unexpected call ${args.join(" ")}` };
-	};
-	return { gh, issues };
-}
-
 describe("the alert machinery reads a hand move as it reads a lane move (R12)", () => {
-	test("move-alert posts the @thewolff comment naming hand, slice, lane, workload, from, to and reason, then the silent popup", async () => {
+	test("the alert pass files move:<E> at level 2: issue and @thewolff comment naming hand, slice, lane, workload, from, to and reason, then the silent popup", async () => {
 		const w = world(poll([fiveHour(0.9), week(1), openaiWeek]));
 		const h = lane(w);
 		h.laneMessage(OPUS);
 		expect((await buildSpawn(h, w)).spawn?.model).toEqual([SOL]);
 		const token = tokenOf(w);
 		const event = w.ledger.entries(w.wl).find(e => e.body.startsWith("hand-headroom:"))!;
-		expect(quotaMove(w.ledger, event.id)).toMatchObject({ kind: "hand", subject: `hand ${token} (slice sl-work) of lane ${LANE_ID}`, from: OPUS, to: SOL, reason: EXHAUSTED });
+		const move = quotaMove(w.ledger, event.id)!;
+		expect(move).toMatchObject({ kind: "hand", subject: `hand ${token} (slice sl-work) of lane ${LANE_ID}`, from: OPUS, to: SOL, reason: EXHAUSTED });
 
+		ensureStandingWorkload(w.ledger);
 		const g = fakeGh();
-		const popups: { title: string; text: string }[] = [];
-		const seams: MoveAlertSeams = {
-			gh: g.gh,
-			popup: (title, text) => {
-				popups.push({ title, text });
-				return { code: 0, stdout: `${DISMISS_BUTTON}\n`, stderr: "" };
-			},
-			voice: () => null,
-			probe: () => false,
-			kill: () => undefined,
-			pid: 4242,
-			log: () => undefined,
-		};
-		expect(runMoveAlert(w.ledger, seams, w.wl, event.id, false)).toBe(0);
-		expect(g.issues.map(i => i.title)).toEqual(["as2: hand moved off anthropic"]);
-		const comment = g.issues[0]!.comments.map(c => c.body);
-		expect(comment).toHaveLength(1);
-		expect(comment[0]).toStartWith("@thewolff ");
-		for (const part of [`hand ${token}`, "slice sl-work", `lane ${LANE_ID}`, w.wl, OPUS, SOL, EXHAUSTED, commentMarker(event.id)]) expect(comment[0]).toContain(part);
+		const { seams, spawns } = alertSeams(g.gh);
+		const log: string[] = [];
+		expect(alertPass({ ...seams, ledger: w.ledger, log: l => log.push(l), sources: { ...seams.sources, trainRepo: () => null } }).problems).toEqual([]);
+		const key = `move:${event.id}`;
+		expect(moveTitle(move)).toBe("as2: hand moved off anthropic");
+		const mine = g.issues.filter(i => i.title === moveTitle(move));
+		expect(mine).toHaveLength(1);
 		const text = `hand ${token} (slice sl-work) of lane ${LANE_ID} on ${w.wl} moved ${OPUS} -> ${SOL} (${EXHAUSTED})`;
-		expect(popups).toEqual([{ title: "as2: hand moved off anthropic", text }]);
-		// Both channels ok: no failure line for this move.
-		expect(moveAlertTroubles(w.ledger, Date.parse(w.ledger.now()), () => false)).toEqual([]);
+		expect(moveText(move)).toBe(text);
+		expect(mine[0]!.body).toContain(text);
+		expect(mine[0]!.comments).toHaveLength(1);
+		// the comment carries its alert marker on the first line, then the mention
+		expect(mine[0]!.comments[0]).toContain("\n@thewolff needs you now: as2: hand moved off anthropic.");
+		for (const part of [`hand ${token}`, "slice sl-work", `lane ${LANE_ID}`, w.wl, OPUS, SOL, EXHAUSTED]) expect(`${mine[0]!.body}\n${mine[0]!.comments[0]}`).toContain(part);
+		// The silent popup: one worker for this key at level 2. A subject starting at level 2 sends level 1 (the issue) and level 2 in one pass.
+		expect(spawns.map(s => [s.argv[2], s.argv[4]])).toContainEqual([key, "2"]);
+		expect(alertRowsOf(w.ledger)).toEqual(expect.arrayContaining([`alert: ${key} level 1 sent ${mine[0]!.url}`, `alert: ${key} level 2 sent`]));
 	});
 });

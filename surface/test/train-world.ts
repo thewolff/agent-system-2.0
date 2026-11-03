@@ -1,20 +1,22 @@
 // The merge train tick's test world, shared by train-tick.test.ts and train-escalation.test.ts: a fake gh (PR views, push
-// activity, main's rules, compares, jo-issues issues), a train with its owner (`world`), and a boarding world on the standing
-// workload with the test runner serving REPO (`boardWorld`, PLAN wl-mvbjiettjrfpxc D1-D7). Temp ledgers and temp git checkouts
-// with a fake GitHub origin only.
+// activity, main's rules, compares, jo-issues issues and labels), a train with its owner (`world`), and a boarding world on the
+// standing workload with the test runner serving REPO (`boardWorld`, PLAN wl-mvbjiettjrfpxc D1-D7). Every tick runs the alert
+// pass (PLAN wl-mw0vs9uc3xqtka D3) on recording seams (surface/test/alert-world.ts `alertSeams`) over the same fake gh, so its
+// jo-issues issues land in `g.issues` and its popups in `popups`. Temp ledgers and temp git checkouts with a fake GitHub origin only.
 import { expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
-import { type GhResult, tick } from "../scripts/train-tick";
+import { type GhResult, tick, type TickDeps } from "../scripts/train-tick";
 import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { applyTrain, interpret } from "../src/input";
 import { decideLaunch, landFirstBody, landFirstInstructionBody, laneReadyBody, parseTrainBoard } from "../src/launch";
-import { recordTrainTask, TRAIN_ALERT_REPO, type TrainTask } from "../src/merge-train";
+import { recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, type TrainTask } from "../src/merge-train";
 import { type ExecCounts, makeRunId, testRequestedBody, type TestRun, testRunBody } from "../src/test-run";
 import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { alertRowsOf, alertSeams, freeLock, type PopupRecord } from "./alert-world";
 import { clock, tempLedger, tmp } from "./helpers";
 
 export const REPO = "thewolff/product";
@@ -96,7 +98,9 @@ export const COMMIT_FILES_CAP = 3000;
  * by `<base>...<head>`, each commit a sha (one parent) or `{ sha, parents }` (a merge has two), and each commit's files (a path,
  * or a diff entry with `status` and `previous_filename`), listed as GitHub
  * lists them: COMMIT_FILES_PER_PAGE per page, each page the commit object again, at most COMMIT_FILES_CAP in all. `saved` answers a
- * `gh api <path>` with a saved GitHub answer as given (surface/test/fixtures/train-carry-305/), before any of the above.
+ * `gh api <path>` with a saved GitHub answer as given (surface/test/fixtures/train-carry-305/), before any of the above. jo-issues'
+ * `labels` (as2-train, loud and critical unless a test removes one) answer `gh label list` and grow by `gh label create`; an
+ * `issue create` or `issue edit` naming a label not in it fails as gh does (`could not add label: '<l>' not found`).
  */
 export function fakeGh() {
 	const prs = new Map<number, { head: string; branch: string; state?: string; base?: string; draft?: boolean; fork?: boolean }>();
@@ -108,6 +112,7 @@ export function fakeGh() {
 	const saved = new Map<string, unknown>();
 	/** Issues on REPO itself (a holder's main-red issue), by number. */
 	const repoIssues = new Map<number, "OPEN" | "CLOSED">();
+	const labels = new Set([TRAIN_ALERT_LABEL, "loud", "critical"]);
 	const main: { rules: unknown; bypass: string } = { rules: protectedRules(), bypass: "never" };
 	let fail: ((args: string[]) => boolean) | null = null;
 	const ok = (stdout: unknown): GhResult => ({ code: 0, stdout: typeof stdout === "string" ? stdout : JSON.stringify(stdout), stderr: "" });
@@ -171,6 +176,14 @@ export function fakeGh() {
 			const listed = [...issues].sort((a, b) => b.number - a.number).filter((i) => i.labels.includes(flag(args, "--label")!)).slice(0, Number(flag(args, "--limit") ?? 30));
 			return ok(listed.map((i) => ({ number: i.number, url: i.url, body: i.body })));
 		}
+		if (noun === "label" && verb === "list") return ok([...labels].map((name) => ({ name })));
+		if (noun === "label" && verb === "create") {
+			labels.add(args[2]!);
+			return ok("");
+		}
+		const wanted = noun === "issue" && (verb === "create" || verb === "edit") ? flag(args, verb === "create" ? "--label" : "--add-label") ?? "" : "";
+		const absent = wanted.split(",").find((l) => l !== "" && !labels.has(l));
+		if (absent !== undefined) return { code: 1, stdout: "", stderr: `could not add label: '${absent}' not found` };
 		if (noun === "issue" && verb === "create") {
 			const number = issues.length + 1;
 			const url = `https://github.com/${TRAIN_ALERT_REPO}/issues/${number}`;
@@ -183,7 +196,7 @@ export function fakeGh() {
 		}
 		if (noun === "issue" && verb === "view") {
 			const i = issue(args);
-			return ok({ state: i.state, comments: i.comments.map((body) => ({ body })) });
+			return ok({ state: i.state, body: i.body, comments: i.comments.map((body) => ({ body })) });
 		}
 		if (noun === "issue" && verb === "comment") {
 			issue(args).comments.push(flag(args, "--body")!);
@@ -207,7 +220,7 @@ export function fakeGh() {
 		const before = activity.filter((a) => a.ref === `refs/heads/${branch}`).at(-1)?.after ?? "0".repeat(40);
 		activity.push({ before, after: sha, ref: `refs/heads/${branch}`, timestamp: at, activity_type: "push" });
 	};
-	return { gh, prs, activity, pushed, issues, repoIssues, calls, compares, commitFiles, saved, main, failWhen: (f: ((args: string[]) => boolean) | null) => { fail = f; } };
+	return { gh, prs, activity, pushed, issues, repoIssues, labels, calls, compares, commitFiles, saved, main, failWhen: (f: ((args: string[]) => boolean) | null) => { fail = f; } };
 }
 
 /** Main's rules as `gh api repos/<repo>/rules/branches/main` answers for a protected main: a strict as2/full-suite check in ruleset 1. */
@@ -227,10 +240,23 @@ export function launchReady(ledger: Ledger, wl: string): { code: number; line: s
 	return { code: 0, line: `launched ${r.laneId}` };
 }
 
-/** A train on `prs` (#101 and #106 by default) held by TRAIN_LANE, the autonomous owner of #101, a fake gh and launcher, on one ledger with a settable clock. */
+/**
+ * TickDeps.alerts for a test tick: the alert pass's recording seams over `g`'s gh, read at each call (a test that swaps `g.gh`
+ * swaps the pass's gh too), and a lock that is always free; `popups` lists each popup worker the pass spawned, by key and level.
+ */
+export function tickAlerts(g: { gh: (args: string[]) => GhResult }): PopupRecord & { alerts: NonNullable<TickDeps["alerts"]>; popups: () => { key: string; level: number }[] } {
+	const { seams, spawns, kills } = alertSeams((args) => g.gh(args));
+	return { alerts: { seams, lock: freeLock }, spawns, kills, popups: () => spawns.map((s) => ({ key: s.argv[2]!, level: Number(s.argv[4]) })) };
+}
+
+/**
+ * A train on `prs` (#101 and #106 by default) held by TRAIN_LANE, the autonomous owner of #101, a fake gh and launcher, on one
+ * ledger with a settable clock and the standing workload (the alert pass writes its `alert:` rows there; `alertRows` reads them).
+ */
 export function world(prs: readonly number[] = [101, 106]) {
 	const c = clock();
 	const { ledger } = tempLedger(c.now);
+	ensureStandingWorkload(ledger);
 	const trainCheckout = checkout();
 	const cmd = interpret(ledger, `train ${prs.join(" ")}`);
 	if (cmd?.kind !== "train") throw new Error("not a train");
@@ -243,13 +269,13 @@ export function world(prs: readonly number[] = [101, 106]) {
 	g.prs.set(101, { head: H0, branch });
 	g.prs.set(106, { head: H0, branch: "feature/other" });
 	const launches: string[] = [];
-	const notes: string[] = [];
+	const alerts = tickAlerts(g);
 	/** The fake launcher (`launchReady`). */
 	const launch = (wl: string) => {
 		launches.push(wl);
 		return launchReady(ledger, wl);
 	};
-	const run = () => tick({ ledger, gh: g.gh, launch, notify: (_t, text) => { notes.push(text); return true; } });
+	const run = () => tick({ ledger, gh: g.gh, launch, alerts: alerts.alerts });
 	/** The train lane's lane_train_return for PR `pr` at the fake PR's current head. */
 	const task = (pr: number, kind: TrainTask["kind"] = "red"): TrainTask => {
 		const p = g.prs.get(pr)!;
@@ -293,7 +319,7 @@ export function world(prs: readonly number[] = [101, 106]) {
 		push(101, H2, "red");
 		return run();
 	};
-	return { c, ledger, train, owner, g, launches, notes, run, task, push, settles, creates, failTwice };
+	return { c, ledger, train, owner, g, launches, alerts: alerts.alerts, popups: alerts.popups, alertRows: () => alertRowsOf(ledger), run, task, push, settles, creates, failTwice };
 }
 
 /** The test runner's config serving REPO, as the tick reads `testRunner.repos`. */
@@ -335,7 +361,8 @@ export function boardWorld() {
 		launches.push(wl);
 		return launchReady(ledger, wl);
 	};
-	const run = () => tick({ ledger, gh: g.gh, launch, notify: () => true, log: (l) => logs.push(l), config: SERVED });
+	const alerts = tickAlerts(g);
+	const run = () => tick({ ledger, gh: g.gh, launch, alerts: alerts.alerts, log: (l) => logs.push(l), config: SERVED });
 	c.plusHours(0.01);
 	run();
 	c.plusHours(0.01);
@@ -378,5 +405,5 @@ export function boardWorld() {
 	/** The `gh pr view` calls for PR `pr` so far. */
 	const views = (pr: number) => g.calls.filter((a) => a[0] === "pr" && a[1] === "view" && a[2] === String(pr)).length;
 	const creates = () => g.calls.filter((a) => a[0] === "issue" && a[1] === "create");
-	return { c, ledger, repo, g, launches, logs, run, landing, standing, skips, boards, views, creates };
+	return { c, ledger, repo, g, launches, logs, alerts: alerts.alerts, popups: alerts.popups, alertRows: () => alertRowsOf(ledger), run, landing, standing, skips, boards, views, creates };
 }

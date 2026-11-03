@@ -8,16 +8,16 @@
 // a dead owner's lock is taken over, a lock removed before its owner's spawn leaves exactly one omp spawned, and a ps
 // that stalls inside the spawn's ledger write is killed at its bound, failing the launch with no omp left running.
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type EntryRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { recordRepo } from "../src/decision-log";
 import { controlEntries, doneBody, laneExitBody, laneStartedBody, STARTER_EXIT } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
+import { runnerLockPath, startAsOwner, startTime, writeAsOwner } from "../scripts/lane";
 import {
-	isRunnerCommand, liveRunnerOf, type LockRefusal, type RunnerLock, type RunnerProbe, runnerLockPath, runnerProbe, selfIdentity,
-	startAsOwner, startTime, takeRunnerLock, writeAsOwner,
-} from "../scripts/lane";
+	isRunnerCommand, liveRunnerOf, type LockRefusal, type RunnerLock, type RunnerProbe, runnerProbe, selfIdentity, takeRunnerLock,
+} from "../src/runner-probe";
 import type { PidState, PsResult, PsRun } from "../src/omp-probe";
 import { alive, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, tmp, until } from "./helpers";
 
@@ -406,6 +406,23 @@ describe("takeRunnerLock and writeAsOwner: one owner per lane id, and only the o
 		expect(isLock(takeRunnerLock(inline, path, B, check({})))).toBe(true);
 		expect(a.owns()).toBe(false);
 		expect(a.held()).toBe(false);
+	});
+
+	test("a lock file that cannot be read is an error naming its path, never `not mine`: held, owns and release throw, and writeAsOwner runs nothing (review r2 N3)", () => {
+		const path = lockAt();
+		const a = takeRunnerLock(inline, path, A, check({}));
+		if (!isLock(a)) throw new Error("refused");
+		rmSync(path);
+		mkdirSync(path);
+		const unreadable = `run lock ${path}: its owner could not be read: `;
+		expect(() => a.release()).toThrow(unreadable);
+		expect(() => a.held()).toThrow(unreadable);
+		expect(() => a.owns()).toThrow(unreadable);
+		const ran: string[] = [];
+		expect(() => writeAsOwner(inline, a, () => ran.push("finalizer"))).toThrow(unreadable);
+		expect(ran).toEqual([]);
+		// The directory a failed release left is still there: the evidence is kept.
+		expect(statSync(path).isDirectory()).toBe(true);
 	});
 
 	test("startAsOwner (openai review r3): the spawn runs inside the ledger write after the lock is read as this runner's; a removed lock, or one another runner took, runs nothing", () => {

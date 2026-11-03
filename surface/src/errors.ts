@@ -53,10 +53,16 @@
 // the open workloads, so closing the workload before delivery drops none (fix round 1, F3). Delivery consumes each.
 // Quota moves (PLAN wl-mvwk0v0gmp6cjc D4, surface/src/quota-move-alert.ts): every held `quota-move:` message `recordQuotaMove`
 // wrote beside its event entry (a lane moved off a lab, or a hand moved on a used-up week) is one `quota-move` line, `NOW:
-// <subject> on <wl> moved <from> -> <to> (<reason>)`, on fire and consumed on delivery like a death. A move whose alert has a
-// channel failed, exhausted, stalled, dead or unstarted (`moveAlertTroubles`) is one `quota-move-alert` line, row = the event
-// entry, state = the move's newest status entry id, so every new failure is delivered again; it clears when both channels
-// are ok. Both are read from their own query over every workload, open or closed, not from the open workloads.
+// <subject> on <wl> moved <from> -> <to> (<reason>)`, on fire and consumed on delivery like a death. It is read from its own
+// query over every workload, open or closed, not from the open workloads. The move's comment and popup are the alert path's
+// (`move:<entry>` key), so a failing one shows on its ALERT line.
+// Alert (PLAN wl-mw0vs9uc3xqtka D4, surface/src/alert-path.ts): one `alert` line per open episode of the alert path that Jo has
+// not acked (`alertRecords` over the standing workload's `alert:` rows), first of all the lines: `ALERT[ LOUD| CRITICAL]
+// <title>: <first text line> — <next> (issue <url> | issue not filed: <gh error>; popup <shown|answered <button>|failed n of
+// 3: <error>|not yet>)`, the words read from the episode's `raised` / `updated` rows. Row = the episode id; state = `L<level>`
+// and a short hash of the errors standing now, so each new level and each new failure is delivered again. On fire
+// (surface/src/batch.ts), never consumed on delivery: it stays until the episode is acked or closed. A failure to read the
+// rows is itself one `alert` line, and every other line still renders (the CEILING ALARM line reads the alarm file alone).
 // Due: an open workload whose brief starts `due:<date> ` with date <= now by instant (Codex S4).
 // Scratch (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): an open workload whose newest valid `scratch-over-cap:` /
 // `scratch-under-cap:` control entry (a holder's: the lane extension's turn-end measure, surface/extensions/lane.ts)
@@ -82,8 +88,9 @@
 // `trainTaskWindows`), the first lane death inside a task's window (from the `train-task:` to its settle, or still open) and an
 // intended exit inside one are not shown: the task counts them (D8) and the train tick relaunches the owner (`trainRouted`). The
 // test runner's no-live-lane `test-run-failed:` is not shown only when it is a run of the task's own PR while the task is
-// unsettled, or the red run its settle counted (`trainRoutedRun`); any other failure is shown. Jo hears of the PR only through D9's two alerts. An alert question whose send ladder
-// the tick has taken to level 2 or 3 (`train-alert:`, surface/scripts/train-tick.ts) shows as a LOUD line, a new state each level.
+// unsettled, or the red run its settle counted (`trainRoutedRun`); any other failure is shown. Jo hears of the PR only through D9's two alerts. An alert question whose
+// `q:<id>` alert key the alert pass has taken to level 2 or 3 (`alertLevel`) shows as a LOUD line, a new state each level; its ALERT
+// line carries the issue and the popup.
 // Notice (PLAN wl-mvfkv7llkp7nk0 § 2, surface/src/notice.ts): every held orchestrator-bound `notice:` message, one line
 // each, in the order written. Not answerable, so never numbered, and routine for batching (surface/src/batch.ts onFire);
 // a delivery consumes it, after which it no longer shows. A `notice:` written by a lane that holds or held the workload
@@ -104,12 +111,13 @@
 // after the answerable line of the target it names and carrying that target's number (numbering.ts's second pass), never
 // one of its own; a proposal whose target no longer waits has no target line, so it is not shown. Each recent
 // `channel-refused:` is one unnumbered line after the scratch lines (it takes no word).
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { ALARM_FILE_NAME, CEILING_ALARM_KIND, describeOff, routineState } from "../../gates/src/routine-switch";
 import { type EntryRow, type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
-import { MOVE_ALERT_ATTEMPTS, moveAlertTroubles, moveText, type PidProbe, psMoveAlertProbe, quotaMoves, trustedQuotaMove } from "./quota-move-alert";
+import { moveText, quotaMoves, trustedQuotaMove } from "./quota-move-alert";
 import { CHANNEL_REFUSED_SHOWN_HOURS, channelInForce, channelProposals, channelRefusals } from "./channel";
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { type NowCategory, nowMarks } from "../../gates/src/rulings";
@@ -119,8 +127,9 @@ import { localMinute, openDowns, POPUP_ATTEMPT_LIMIT, popupAttempts } from "./do
 import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, landFirstOffPending, laneExit, mainRetries, queuedOf, sameRepo } from "./launch";
 import {
 	boardRefusals, landFirstRepos, landFirstRows, type LandFirstRow, latestTrainReconciled, mainRedNotices, protectionEpisodes, RECONCILED_STALE_MS, stopEpisode, type TaskWindow,
-	theTrain, TRAIN_ALERT_LADDER, trainAlertLevel, trainCheckout, trainMembers, trainTaskWindows,
+	theTrain, trainCheckout, trainMembers, trainTaskWindows,
 } from "./merge-train";
+import { ALERT_LADDER, ALERT_POPUP_ATTEMPTS, type AlertKeyRecord, alertLevel, alertPopupRows, alertRecords, openEpisode, parseAlertRow } from "./alert-path";
 import { attemptBlock, mainResults, mainVerdicts, parseRunnerPreflight } from "./main-state";
 import { questionSubject } from "./orchestrator-question";
 import { answerable } from "./numbering";
@@ -226,9 +235,91 @@ export function doctorLines(control: readonly ControlEntry[]): ErrorLine[] {
 	});
 }
 
+/**
+ * D4 (PLAN wl-mw0vs9uc3xqtka): the ALERT lines from the standing workload's control entries, one per open episode Jo has not
+ * acked, in the order the keys were first written. The words (title, first text line, next, workload) are the episode's newest
+ * `raised` / `updated` words; an episode with none (adopted, or a row written before the words existed) says its key and where
+ * it came from. `issue` is the url level 1 recorded, else the gh error; a gh error stands until a later `level … sent` or
+ * `updated` row of the key. `popup` reads the episode's `alert-popup:` rows at its current level; a popup
+ * error stands until a later popup row of the episode. A key with no open episode that stands on an error (`pending`: a
+ * failed source's `source:<kind>` key, a legacy alert held before adoption, an error after its alert closed) has one line
+ * naming it (review r1 #4, #6). A merged legacy issue whose cleanup failed has its own line until its `merged-closed`,
+ * whether its episode is open, acked or closed (review r2 N6). `records` is `alertRecords(control)`, passed when the
+ * caller has it.
+ */
+export function alertLines(control: readonly ControlEntry[], records: ReadonlyMap<string, AlertKeyRecord> = alertRecords(control)): ErrorLine[] {
+	const position = new Map(control.map((c, i) => [c.id, i] as const));
+	const popups = alertPopupRows(control);
+	const out: ErrorLine[] = [];
+	for (const [key, rec] of records) {
+		for (const e of rec.episodes) {
+			for (const [url, m] of e.merged) if (m.closedAt === null && m.error !== null) out.push(mergedCleanupLine(key, url, m.into, m.error));
+		}
+		const ep = openEpisode(rec);
+		if (ep === null) {
+			const p = rec.pending;
+			if (p !== null && !(p.channel === "popup" && popups.some((r) => r.key === key && position.get(r.id)! > position.get(p.id)!))) out.push(pendingLine(key, rec, p));
+			continue;
+		}
+		if (ep.acked !== null) continue;
+		const level = alertLevel(records, key);
+		const ghRow = ep.errors.get("gh");
+		const ghAt = ghRow === undefined ? -1 : position.get(ghRow.id)!;
+		const ghCleared = control.some((c, i) => {
+			if (i <= ghAt || c.prefix !== "alert") return false;
+			const p = parseAlertRow(c.rest);
+			return p?.key === key && ((p.row.row === "level" && p.row.step === "sent") || p.row.row === "updated");
+		});
+		const gh = ghRow !== undefined && !ghCleared ? ghRow.text : null;
+		const mine = popups.filter((r) => r.key === key && r.episode === ep.id);
+		const popupRow = ep.errors.get("popup");
+		const popupError = popupRow !== undefined && !mine.some((r) => position.get(r.id)! > position.get(popupRow.id)!) ? popupRow.text : null;
+		const atLevel = mine.filter((r) => r.level === level);
+		// An attempt ends `unstarted` or `settled` (the pass's), or `ok`; a worker's `failed` only reports, so it is not counted (review r1 #1).
+		const failures = atLevel.filter((r) => r.step === "settled" || r.step === "unstarted");
+		const answered = atLevel.find((r) => r.step === "ok");
+		const last = atLevel.at(-1);
+		const failed = failures.length > 0 ? `failed ${failures.length} of ${ALERT_POPUP_ATTEMPTS}: ${failures.at(-1)!.detail}` : null;
+		let popup = answered !== undefined
+			? `answered ${answered.detail}`
+			: last?.step === "failed" ? `failed, settling: ${last.detail}` : last?.step === "showing" || last?.step === "terminating" ? "shown" : (failed ?? "not yet");
+		if (popupError !== null) popup += `, error: ${popupError}`;
+		const issue = ep.url !== null ? `issue ${ep.url}${gh !== null ? `, gh failed: ${gh}` : ""}` : gh !== null ? `issue not filed: ${gh}` : "issue not filed yet";
+		const labels = ALERT_LADDER.find((s) => s.level === level)?.labels ?? [];
+		const tag = labels.includes("critical") ? " CRITICAL" : labels.includes("loud") ? " LOUD" : "";
+		const w = ep.words;
+		const says = w !== null ? w.line : ep.adoptedFrom !== null ? `adopted from ${ep.adoptedFrom}` : "no words recorded for this alert";
+		const step = w !== null && w.next.trim() !== "" ? w.next : NO_NEXT_STEP;
+		const errors = [gh, popupError, failed].filter((e): e is string => e !== null);
+		out.push({
+			kind: "alert", workloadId: w?.workload ?? STANDING_WORKLOAD_ID, rowId: ep.id, next: step,
+			state: `L${level}${errors.length > 0 ? ` ${createHash("sha256").update(errors.join("\n")).digest("hex").slice(0, 8)}` : ""}`,
+			line: `ALERT${tag} ${w?.title ?? key}${says.trim() !== "" ? `: ${says}` : ""} — ${step} (${issue}; popup ${popup})`,
+		});
+	}
+	return out;
+}
+
+/** The ALERT line of a key that stands on an error with no open episode (`AlertKeyRecord.pending`). */
+function pendingLine(key: string, rec: AlertKeyRecord, p: NonNullable<AlertKeyRecord["pending"]>): ErrorLine {
+	const retry = "the next alert pass retries; fix what it names if it persists";
+	const [what, step] = key.startsWith("source:")
+		? [`${key} failed`, `its alerts are held unchanged (no close, no popup cancel) until it reads again; ${retry}`]
+		: rec.episodes.length === 0
+			? [`${key} held before adoption (${p.channel})`, `no issue is filed and no popup shown for it until it is adopted; ${retry}`]
+			: [`${key} failed after its alert closed (${p.channel})`, retry];
+	return { kind: "alert", workloadId: STANDING_WORKLOAD_ID, rowId: p.id, next: step, line: `ALERT ${what}: ${p.text} — ${step}` };
+}
+
+/** The ALERT line of a merged legacy issue whose cleanup (pointer comment, close) failed and is not done yet (review r2 N6). */
+function mergedCleanupLine(key: string, url: string, into: string, error: { text: string; id: string }): ErrorLine {
+	const step = `the next alert pass retries the pointer comment and the close; or close ${url} by hand with a pointer to ${into}`;
+	return { kind: "alert", workloadId: STANDING_WORKLOAD_ID, rowId: error.id, next: step, line: `ALERT ${key} cleanup of merged issue ${url} failed: ${error.text} — ${step}` };
+}
+
 /** Every needs-you line kind; ErrorKind is read from this list, so the issue #334 item 3 test covers each kind there is. */
 export const NEEDS_YOU_KINDS = [
-	"reserved", "held", "artifact", "security-red", "quota-move", "quota-move-alert", "test-run", "lane-died", "question", "due", "idle", "scratch", "alarm", "train", "pair", "notice",
+	"alert", "reserved", "held", "artifact", "security-red", "quota-move", "test-run", "lane-died", "question", "due", "idle", "scratch", "alarm", "train", "pair", "notice",
 	"proposal", "channel-refused", "report",
 ] as const;
 export type ErrorKind = (typeof NEEDS_YOU_KINDS)[number];
@@ -285,8 +376,6 @@ export interface ErrorOptions {
 	alarmFile?: string;
 	/** The Drive backup check job's plist (the missed line needs it); default `driveBackupCheckPlist()`. Called only when no check entry is fresh. */
 	driveBackupCheckPlist?: () => { mtimeMs: number } | null;
-	/** Whether a move alert's worker pid is alive (the `quota-move-alert` line's stalled and dead claims); default `psMoveAlertProbe`. */
-	movePidProbe?: PidProbe;
 }
 
 const short = (s: string, n = 90): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
@@ -719,6 +808,28 @@ function ceilingWordAfter(ledger: Ledger, workloadId: string, at: string): boole
 	);
 }
 
+/** One `CEILING ALARM <wl>` line of the alarm file, with the `at` its alarm line carries (null when it carries none). */
+export interface CeilingAlarm {
+	line: ErrorLine;
+	at: string | null;
+}
+
+/** The alarm file's `ceiling` lines (its text, `raw`, split on newlines) no ceiling, extend or halt word on their workload has cleared since their `at` (D12). */
+export function ceilingAlarms(ledger: Ledger, raw: readonly string[]): CeilingAlarm[] {
+	const out: CeilingAlarm[] = [];
+	raw.forEach((text, i) => {
+		const f = text.trim() === "" ? null : alarmFields(text);
+		if (f?.kind !== CEILING_ALARM_KIND) return;
+		const wl = fieldText(f, "workload") ?? "(no workload)";
+		const at = fieldText(f, "at");
+		if (at !== null && wl.startsWith("wl-") && ceilingWordAfter(ledger, wl, at)) return;
+		const errors = Array.isArray(f.errors) ? f.errors.filter((e): e is string => typeof e === "string").map(plain).join("; ") : "";
+		const why = fieldText(f, "error") ?? (errors !== "" ? errors : short(plain(text), 160));
+		out.push({ at, line: { kind: "alarm", workloadId: wl.startsWith("wl-") ? wl : STANDING_WORKLOAD_ID, rowId: `alarm:${i + 1}`, next: `say ceiling, extend or halt for ${wl}`, line: `CEILING ALARM ${wl}: ${why} — shown until your next ceiling, extend or halt word on ${wl}` } });
+	});
+	return out;
+}
+
 /**
  * The alarm-file lines (PLAN wl-mvqwn80onq9hq8 D5, D12), read from the file each time like the scratch lines read the
  * filesystem: one `AUTO-APPLY ALARM` line per latching line newer than Jo's latest `auto-routine` (the switch's own
@@ -756,16 +867,7 @@ export function alarmLines(ledger: Ledger, now: string, alarmFile: string): Erro
 			line: `AUTO-APPLY ALARM ${wl} ${signal}: ${evidence}; auto-apply is off; ledger write failed: ${error} (alarm-file line ${l.line}; your auto-routine clears it)`,
 		});
 	}
-	raw.forEach((text, i) => {
-		const f = text.trim() === "" ? null : alarmFields(text);
-		if (f?.kind !== CEILING_ALARM_KIND) return;
-		const wl = fieldText(f, "workload") ?? "(no workload)";
-		const at = fieldText(f, "at");
-		if (at !== null && wl.startsWith("wl-") && ceilingWordAfter(ledger, wl, at)) return;
-		const errors = Array.isArray(f.errors) ? f.errors.filter((e): e is string => typeof e === "string").map(plain).join("; ") : "";
-		const why = fieldText(f, "error") ?? (errors !== "" ? errors : short(plain(text), 160));
-		out.push({ kind: "alarm", workloadId: wl.startsWith("wl-") ? wl : STANDING_WORKLOAD_ID, rowId: `alarm:${i + 1}`, next: `say ceiling, extend or halt for ${wl}`, line: `CEILING ALARM ${wl}: ${why} — shown until your next ceiling, extend or halt word on ${wl}` });
-	});
+	for (const a of ceilingAlarms(ledger, raw)) out.push(a.line);
 	return out;
 }
 
@@ -791,32 +893,36 @@ function quotaMoveLines(ledger: Ledger): ErrorLine[] {
 	return quotaMoves(ledger).flatMap((move) => {
 		const m = ledger.message(move.messageId);
 		if (m?.state !== "held" || trustedQuotaMove(ledger, m) === null) return [];
-		const step = "nothing to answer; the @thewolff comment and a silent popup carry the same move";
+		const step = "nothing to answer; its ALERT line carries the move's jo-issues comment and silent popup";
 		return [{ kind: "quota-move" as const, workloadId: move.workloadId, rowId: move.messageId, messageIds: [move.messageId], next: step, line: `NOW: ${moveText(move)}` }];
 	});
 }
 
-/** The D4 failure lines: one per move whose alert has a failing channel, keyed by its event entry, state its newest status entry. */
-function moveAlertLines(ledger: Ledger, now: string, probe: PidProbe): ErrorLine[] {
-	return moveAlertTroubles(ledger, Date.parse(now), probe).map((t) => {
-		const { move } = t;
-		const step = t.exhausted ? `run bun surface/scripts/lane.ts move-alert ${move.workloadId} ${move.eventId} --again` : `the train tick retries (attempt ${t.attempt} of ${MOVE_ALERT_ATTEMPTS})`;
-		return {
-			kind: "quota-move-alert" as const, workloadId: move.workloadId, rowId: move.eventId, state: t.token, next: step,
-			line: `NOW: alert for the move of ${move.subject} on ${move.workloadId} (${move.from} -> ${move.to}): ${t.parts.join("; ")} — ${step}`,
-		};
-	});
-}
-
-/** Every line owed right now, in § B3 order (1–3), the security-red lines, the quota-move lines, the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the train notices, the due rows, then the scratch lines, the alarm-file lines, the daily report, the notices, then the channel refusals; each channel proposal directly after its target. */
+/** Every line owed right now: the ALERT lines first, then § B3 order (1–3), the security-red lines, the quota-move lines, the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the train notices, the due rows, then the scratch lines, the alarm-file lines, the daily report, the notices, then the channel refusals; each channel proposal directly after its target. */
 export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger.inFlight(), opts: ErrorOptions = {}): ErrorLine[] {
 	const now = opts.now ?? ledger.now();
 	const holdHours = opts.holdHours ?? HOLD_HOURS;
+	// D4: the alert path's rows are read once, for the ALERT lines and the train questions' LOUD tag. A read that fails is one ALERT
+	// line naming it, and no question is tagged LOUD meanwhile; every other line still renders (R21: the CEILING ALARM line reads the alarm file alone).
+	let alertRecs: ReadonlyMap<string, AlertKeyRecord> = new Map();
+	let alert: ErrorLine[];
+	try {
+		const standing = controlEntries(ledger.entries(STANDING_WORKLOAD_ID, "assumption"));
+		alertRecs = alertRecords(standing);
+		alert = alertLines(standing, alertRecs);
+	} catch (err) {
+		const why = err instanceof Error ? err.message : String(err);
+		const step = "check the ledger the surface reads; the alert pass's escalations show here again once its rows read";
+		alert = [{
+			kind: "alert", workloadId: STANDING_WORKLOAD_ID, rowId: "alert:unreadable", state: why, next: step,
+			line: `ALERT rows unreadable: the alert: rows of ${STANDING_WORKLOAD_ID} could not be read (${short(plain(why), 160)}); open alerts and LOUD tags are not shown — ${step}`,
+		}];
+	}
 	const reserved: ErrorLine[] = [];
 	const held: ErrorLine[] = [];
 	const artifact: ErrorLine[] = [];
 	const securityRed = securityRedLines(ledger);
-	const quotaMove = [...quotaMoveLines(ledger), ...moveAlertLines(ledger, now, opts.movePidProbe ?? psMoveAlertProbe)];
+	const quotaMove = quotaMoveLines(ledger);
 	const testRun: ErrorLine[] = [];
 	const died: ErrorLine[] = [];
 	const idle: ErrorLine[] = [];
@@ -907,9 +1013,9 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			const offer = openPairOffer(ledger, q);
 			if (offer) questions.push({ kind: "pair", workloadId: wl, rowId: q.id, state: "offer", next: `Answer pair ${q.id}`, line: pairOfferLine(wordsOf(ledger, wl, control), q.id, wl, offer.signals) });
 			const body = isPlanQuestionIn(control, q) ? `\n  ${q.body.split("\n").join("\n  ")}` : ` ${short(q.body, 120)}`;
-			// D9's re-send: level 2 or 3 of the train tick's ladder makes the line LOUD, each level a new state.
-			const loud = trainAlertLevel(control, q.id);
-			const step = loud >= 2 ? TRAIN_ALERT_LADDER.find((s) => s.level === loud) : undefined;
+			// D4: level 2 or 3 of the question's `q:` alert key (the alert path's ladder) makes the line LOUD, each level a new state.
+			const loud = alertLevel(alertRecs, `q:${q.id}`);
+			const step = loud >= 2 ? ALERT_LADDER.find((s) => s.level === loud) : undefined;
 			const tag = `${nowTag}${step ? `LOUD${step.labels.includes("critical") ? ", critical" : ""} (unacknowledged ${step.afterMs / 3_600_000} h): ` : ""}`;
 			const asker = q.created_by === MERGE_TRAIN_BY ? `merge train ${label} needs you` : `lane on ${label} is waiting on you`;
 			// A NOW question is on fire from its first poll (batch.ts onFire), so its state stays `now` whatever the ladder's level.
@@ -971,7 +1077,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		}
 	}
 	train.push(...boardRefusalLines(ledger));
-	const all = [...reserved, ...held, ...artifact, ...securityRed, ...quotaMove, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch, ...alarmLines(ledger, now, opts.alarmFile ?? join(dirname(ledger.path), ALARM_FILE_NAME)), ...report, ...notice];
+	const all = [...alert, ...reserved, ...held, ...artifact, ...securityRed, ...quotaMove, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch, ...alarmLines(ledger, now, opts.alarmFile ?? join(dirname(ledger.path), ALARM_FILE_NAME)), ...report, ...notice];
 	const channel = channelInForce(ledger);
 	if (!channel) return all;
 	const proposals = channelProposals(ledger, channel);

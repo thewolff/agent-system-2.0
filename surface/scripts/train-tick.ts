@@ -46,24 +46,13 @@
 //     its budget slice completed; a meter error gets Jo's NOW relaunch / hold question; an earlier attempt's open full-suite slice
 //     whose run has a result is cancelled (review r1 F4); Jo's stall `relaunch` stops a live lane
 //     (a surface `lane-stop:`); and a waiting PR with no train progress for 3 h (`trainStall`) gets one NOW relaunch / ack
-//     question per episode on its slice, so step 5 files its issue.
-//  5. Alerts (D9). Each question on a train slice is an alert: the production merge question the lane raises and the failed-twice
-//     question of step 2. The send ladder (`trainAlertActions`): level 1 files an issue on TRAIN_ALERT_REPO labelled as2-train;
-//     4 h and 8 h after it, while the question is open and the issue is not closed, a comment mentioning @thewolff, the `loud`
-//     (then also `critical`) label, a silent macOS notification, and the LOUD needs-you line (surface/src/errors.ts). Each send
-//     writes `train-alert: <q> level <n> sending`, does its effects (the issue body and each comment carry a marker the tick looks
-//     for before creating one, and again after a failed create before anything is retried, adopting an issue the failed call filed;
-//     only a missing label is retried, once, after the label is created; labels are only added, never removed; the notification
-//     only when `notified` is not written), then `sent`. Jo closing the issue is the ack (`acked`): no more re-sends. Jo's answer
-//     or withdrawal closes the issue (`closed`), found by its marker when level 1 was begun and its url never recorded. The marker
-//     lookup reads every as2-train issue (`ISSUE_LIST_ARGS`, every page); a lookup that fails or reads an unexpected shape throws,
-//     so nothing is created and no `closed` is written on a partial answer: the action stays due for the next pass. The jo-issues
-//     helpers (`issueOps`, `fileNotice`, the listing) live in surface/src/jo-issues.ts, shared with the move alert.
-//  6. Move alerts (PLAN wl-mvwk0v0gmp6cjc D4, surface/src/quota-move-alert.ts `superviseMove`). Every recorded quota move on
-//     every workload, open or closed, no age cutoff, whose alert has a channel neither ok nor exhausted: a stalled claim gets
-//     SIGTERM and `failed stalled: …`, a dead one `failed worker <pid> ended without a result`, a channel with no row 60 s after
-//     the move `unstarted …`; then, while a channel can still run within its 3 attempts per block, `lane.ts move-alert <wl> <E>`
-//     is spawned detached. Its seams (spawn, pid probe, SIGTERM) are TickDeps.moveAlert; the clock is the ledger's.
+//     question per episode on its slice, so the alert pass raises it.
+//  5. The alert pass (PLAN wl-mw0vs9uc3xqtka D3, surface/scripts/alert-tick.ts `lockedAlertPass`), in process, at the end of
+//     every tick: the quota watch, every alert source (train questions, quota moves, main red and land-first stops, ceiling
+//     stops, deaths, parked workloads, chaos), Jo's acks, and their jo-issues issues, comments, labels and silent popups. It
+//     is the one owner of Jo-directed alerts: this tick files no train-question, move, main-red or land-first issue itself, it
+//     writes the state rows those sources read. The pass takes its own lock; a pass already running (a kick) skips this one.
+//     Its seams are TickDeps.alerts (main passes the real ones; omitted, the tick logs that no pass ran); a train's repository is the one this tick read in step 1.
 // 3b. Boarding (PLAN wl-mvbjiettjrfpxc D1, D3, D4). The first pass writes the cutover, `train-autoboard: on <iso>`, once on the
 //     standing workload. Then every recent closed workload or released landing receipt on a served repository (`autoboardCandidates`,
 //     newest readiness first; a train, a fix workload, a W a board still covers and a W whose PR ended are not read) gets `landingReady`,
@@ -79,8 +68,8 @@
 //     jo-issues issue (`filed`), and on `ok` the issue closed with a comment, `cleared`, and every train that passed a PR over for
 //     protection woken. While an episode is open, protection pass-overs get no backoff wake.
 // 3d. Red main (D7). Each holder `main-red: <url> run <id>` on a train open or closed within 24 h whose url is an issue on that
-//     train's repository: `train-notice: main-red <url> raised run <id>` once per url, one jo-issues issue (`filed`), and
-//     `cleared` (the jo-issues issue closed) once `gh issue view` shows that issue CLOSED. Any other url is logged only.
+//     train's repository: `train-notice: main-red <url> raised run <id>` once per url, and `cleared` once `gh issue view` shows
+//     that url CLOSED. Any other url is logged only. The alert pass (step 5) files and closes Jo's issue from these rows.
 // 3e. Merge notices (PLAN wl-mvg8itbt0rz3ls D4). Each train open or closed within 24 h (the window of 3d), each of its slices
 //     `sl-train-<k>-<n>` done with an artifact starting `merged by train`: in one write, unless the standing workload has it,
 //     `train-notice: merged <owner/repo> #<n> <train>` and one notice to Jo (`trainMergedNoticeBody`, surface/src/notice.ts),
@@ -105,20 +94,19 @@ import {
 import { field, fileNotice, GhError, type GhResult, ghJsonOf, type IssueOps, issueNumber, issueOps } from "../src/jo-issues";
 import { attemptBlock, type ChainCommit, ghMainChain, INCONCLUSIVE, type MainState, mainResults, mainState, mainVerdicts } from "../src/main-state";
 import {
-	actionable, type AlertAction, attemptOf, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, carryPairs, checkoutOwnerRepo, type ControlRoot,
+	actionable, attemptOf, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, carryPairs, checkoutOwnerRepo, type ControlRoot,
 	controlRootRefusal, endPastPauseQuestions, everyTrain, expiredHolds, forkOf, forkTaskAlert, FULL_SUITE_STATUS, ghCompare, isTrainOrFix, type LandFirstEvent, landFirstNoticeBody, landFirstRepos,
 	landFirstRows, type Landing, landingPassOvers, landingReady, lastReadyExit, MAIN_RED_WINDOW_MS, MAIN_RETRY_MS, mainRedNoticeBody, mainRedNotices, mainRedRows, openTrainFix, openTrains, ownerBusy,
 	ownerDeliveries, ownerFreedAt, parseTrainSlice, PROMOTE_ATTEMPTS, prOwner, PROTECTION_UNKNOWN_RAISE_MS, protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState,
 	protectionPassOvers, prStakes, raiseLaunchLimit, raiseMeterErrorQuestions, raiseTrainStall, raiseTwiceFailed, REPAIR_FAIL_MS, retireSupersededFullSlices, REVOKE_ATTEMPTS, settleTasks,
-	stallRelaunchStops, stopEpisode, stopSummary, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, TRAIN_STALL_MS,
-	trainActivityArgs, trainAlertActions, trainAlertBody, trainAlertEndBody, trainAlertMarker, trainAutoboardBody, trainAttemptsOf, trainBoardSkipBody, trainCheckout, trainHeadWokenBody,
+	stallRelaunchStops, stopEpisode, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_ALERT_REPO, TRAIN_STALL_MS,
+	trainActivityArgs, trainAutoboardBody, trainAttemptsOf, trainBoardSkipBody, trainCheckout, trainHeadWokenBody,
 	TRAIN_LAUNCH_LIMIT, trainLaunchFailures, trainPrs, trainPushesOf, trainReconciledBody, trainRetries, trainSliceId, trainStall, type TrainPush, type TrainTask, trainWakeBody, testRunStartedBody,
 	testRunStarts, twiceFailed, unsettledTasks, trainFixStakes,
 } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
-import { realNotify } from "../src/notify";
+import { alertLockPath, type AlertLock, type AlertPassDeps, checkoutTrainRepo, lockedAlertPass, realAlertLock, realAlertSeams } from "./alert-tick";
 import { sendNotice, TRAIN_SIGNOFF_APPLIED_PREFIX, trainMergedEntryBody, trainMergedNoticeBody } from "../src/notice";
-import { psMoveAlertProbe, quotaMoves, sigterm, spawnDetached, superviseMove, type SuperviseSeams } from "../src/quota-move-alert";
 import {
 	AS2TEST_ROOT, type CompareResult, decisionLogFault, fastPlans, ownerRepoOf, type ResultRecord, runsRoot, type TestRunnerConfig, testRuns, withFullSuitePublication, workDirOf,
 } from "../src/test-run";
@@ -149,8 +137,11 @@ export interface TickDeps {
 	gh: (args: string[], timeoutMs?: number) => GhResult;
 	/** `lane.ts launch <wl> --requested-by merge-train`: its exit code and last line. */
 	launch: (wl: string) => { code: number; line: string };
-	/** A silent macOS notification; false when it could not be shown. */
-	notify: (title: string, text: string) => boolean;
+	/**
+	 * The alert pass's seams (step 5, PLAN wl-mw0vs9uc3xqtka D3) and its lock; main passes the real ones from the environment
+	 * (`realAlertSeams`, `realAlertLock`). Omitted, the tick logs that it ran no alert pass. Tests inject recording fakes.
+	 */
+	alerts?: { seams: Omit<AlertPassDeps, "ledger" | "log" | "sources"> & { sources: Omit<AlertPassDeps["sources"], "trainRepo"> }; lock: AlertLock };
 	/** The test runner's served repositories (`testRunner.repos`, profile/config.yml): only their PRs board (D1); none, nothing boards. */
 	config?: Pick<TestRunnerConfig, "repos">;
 	/** Land-first's seams; without them the main-run pass (step 3f) is skipped with one log line. `main()` always passes them. */
@@ -160,11 +151,6 @@ export interface TickDeps {
 	 * for bun's banner (PLAN wl-mvr888nftz0vcl D8, R21); tests inject an isolated directory. Read only, never written.
 	 */
 	as2testRoot?: string;
-	/**
-	 * The move-alert supervisor's seams (step 6, PLAN wl-mvwk0v0gmp6cjc D4): the detached `lane.ts move-alert` spawn, the pid
-	 * probe and the SIGTERM sender; the clock is the ledger's. Omitted, the real ones (`main()` and every test with no move).
-	 */
-	moveAlert?: SuperviseSeams;
 	log?: (line: string) => void;
 }
 
@@ -426,7 +412,7 @@ export function tick(d: TickDeps): string[] {
 			if (repo !== null && pending) read.add(repo);
 		}
 		notices = protectionPass(d, ghJson, ops, say, read, repoOf);
-		mainRedPass(d, ghJson, ops, say);
+		mainRedPass(d, ghJson, say);
 		mergeNoticePass(d, say, repoOf);
 		// 3f. Main runs, landing and promotion (PLAN wl-mvq4edbaf13vnk D6).
 		const served = servedRepos(d.config, say);
@@ -514,26 +500,16 @@ export function tick(d: TickDeps): string[] {
 	// 3f's train-reconciled entries, after the wakes they owed (D6, R18).
 	if (land !== null) reconcile(d, land, say);
 
-	// 5. Alerts.
-	for (const facts of trains) {
-		for (const a of trainAlertActions(ledger, facts.wl, ledger.now())) {
-			try {
-				alert(d, facts, a, ghJson, say);
-			} catch (err) {
-				trainError(facts.wl, err);
-			}
-		}
-	}
-	// 6. Move alerts (PLAN wl-mvwk0v0gmp6cjc D4): every recorded move on every workload, open or closed, no age cutoff, with a
-	// channel neither ok nor exhausted: settle its stalled, dead and unstarted claims and spawn `move-alert` while a channel can
-	// still run (3 attempts per block bound it). A pass that throws is logged and the next move still runs; the next tick retries.
-	const seams = d.moveAlert ?? { spawn: spawnDetached, probe: psMoveAlertProbe, kill: sigterm };
-	for (const move of quotaMoves(ledger)) {
-		try {
-			for (const line of superviseMove(ledger, move, seams)) say(`${move.workloadId}: move-alert ${move.eventId}: ${line}`);
-		} catch (err) {
-			say(`${move.workloadId}: move-alert ${move.eventId}: supervisor pass failed: ${errText(err)}; the next tick tries again`);
-		}
+	// 5. The alert pass, in process (PLAN wl-mw0vs9uc3xqtka D3): its problems are logged; the next tick or kick runs it again.
+	try {
+		if (d.alerts === undefined) throw new Error("TickDeps.alerts was not given, so this tick has no gh, popup or ps seams for the pass (main passes the real ones)");
+		const alerts = d.alerts;
+		const repoOf = checkoutTrainRepo(ledger);
+		const trainRepo = (wl: string) => trains.find((t) => t.wl === wl)?.repo ?? repoOf(wl);
+		const r = lockedAlertPass({ ...alerts.seams, ledger, log: say, sources: { ...alerts.seams.sources, trainRepo } }, alerts.lock);
+		for (const p of r?.problems ?? []) say(`${STANDING_WORKLOAD_ID}: alert pass: ${p}`);
+	} catch (err) {
+		say(`${STANDING_WORKLOAD_ID}: alert pass failed: ${errText(err)}; the next tick or kick runs it again`);
 	}
 	return out;
 }
@@ -834,13 +810,13 @@ function protectionPass(
 }
 
 /**
- * Step 3d (D7): each valid holder `main-red:` row raises once per url (`raised`, the needs-you line), its jo-issues issue is filed
- * once (`filed`), and once the main-red issue is CLOSED the jo-issues issue is closed and `cleared` written. A url that is no
- * issue on the train's own repository is logged only.
+ * Step 3d (D7): each valid holder `main-red:` row raises once per url (`raised`; the alert pass's `main:<repo>` subject, PLAN
+ * wl-mw0vs9uc3xqtka D2.4, files and escalates it), and once the main-red issue is CLOSED `cleared` is written. A url that is
+ * no issue on the train's own repository is logged only.
  */
-function mainRedPass(d: TickDeps, ghJson: (args: string[]) => unknown, ops: IssueOps, say: (line: string) => void): void {
+function mainRedPass(d: TickDeps, ghJson: (args: string[]) => unknown, say: (line: string) => void): void {
 	const { ledger } = d;
-	const write = (url: string, state: "raised" | "filed" | "cleared", text: string) => {
+	const write = (url: string, state: "raised" | "cleared", text: string) => {
 		const body = mainRedNoticeBody(url, state, text);
 		ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
 		say(`${STANDING_WORKLOAD_ID}: ${body}`);
@@ -859,17 +835,7 @@ function mainRedPass(d: TickDeps, ghJson: (args: string[]) => unknown, ops: Issu
 		if (n.cleared !== null) continue;
 		try {
 			const [, repo, num] = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/issues\/(\d+)$/.exec(n.url)!;
-			let issue = n.issue;
-			if (issue === null) {
-				issue = fileNotice(ops, `<!-- train-notice main-red ${n.url} -->`, `merge train: main is red on ${repo}`, [
-					`Main is red on ${repo}: ${n.url} (merge train run ${n.run}).`,
-					"",
-					"The merge train keeps merging PRs that add no failure (red-main); this issue closes itself when that issue closes.",
-				].join("\n"));
-				write(n.url, "filed", issue);
-			}
 			if (field(ghJson(["issue", "view", num!, "-R", repo!, "--json", "state"]), "state") !== "CLOSED") continue;
-			closeNotice(ops, ghJson, issue, `${n.url} is closed (as2).`);
 			write(n.url, "cleared", `${n.url} closed`);
 		} catch (err) {
 			say(`${STANDING_WORKLOAD_ID}: main-red ${n.url}: ${err instanceof Error ? err.message : String(err)}`);
@@ -1296,7 +1262,6 @@ function landingPass(
 	let ep = stopEpisode(rows());
 	if (state.open) {
 		if (ep !== null) {
-			if (ep.filed !== null) closeNotice(ops, ghJson, ep.filed, `Landing on ${repo} reopened at ${sha7(state.tip)} (G ${sha7(state.g!)}) (as2).`);
 			landNote(d, say, repo, { event: "stop-cleared", why: `landing open at ${sha7(state.tip)}, G ${sha7(state.g!)}` });
 			for (const t of openTrains(ledger)) if (repoOf(t) === repo && landingPassOvers(ledger, t).size > 0) res.wake.set(t, `landing reopened on ${repo}`);
 		}
@@ -1306,18 +1271,14 @@ function landingPass(
 		const red = state.suspects.find((s) => s.verdict !== null && s.verdict.verdict !== "green");
 		const redRun = red?.verdict ? (results.find((r) => r.runId === red.verdict!.runId) ?? null) : null;
 		const stop = { kind, tip: state.tip, g: state.g, suspects, failing: redRun === null ? null : (redRun.full?.fail ?? redRun.failures.length) };
-		const body = () => issueBody(ledger, repo, state, suspects, redRun, repoOf);
+		// The stop's rows only: the alert pass's `main:<repo>` subject (PLAN wl-mw0vs9uc3xqtka D2.4) files, comments on and closes
+		// the incident issue from them.
 		if (ep === null) {
 			landNote(d, say, repo, { event: "stop-raised", ...stop });
 			ep = stopEpisode(rows())!;
 		} else if (ep.state.kind !== kind || ep.state.tip !== state.tip) {
 			landNote(d, say, repo, { event: "stop-updated", ...stop });
-			if (ep.filed !== null) ops.run(["issue", "comment", issueNumber(ep.filed), "-R", TRAIN_ALERT_REPO, "--body", `Updated (as2):\n${body()}`]);
 			ep = stopEpisode(rows())!;
-		}
-		if (kind !== "depth" && ep.filed === null) {
-			const url = fileNotice(ops, `<!-- train-notice land-first ${repo} ${ep.raised.entryId} -->`, `landing stopped on ${repo} (${kind}) at ${sha7(state.tip)}`, body());
-			landNote(d, say, repo, { event: "stop-filed", url });
 		}
 		if (kind === "regression" && ep.woken === null) {
 			const train = openTrains(ledger).find((t) => repoOf(t) === repo);
@@ -1384,31 +1345,6 @@ function landingPass(
 		}
 	}
 	return repair;
-}
-
-/** A stop episode's jo-issues issue body (D6): the summary, G, each suspect with its PRs, workload and main run, the failing tests. */
-function issueBody(ledger: Ledger, repo: string, state: MainState, suspects: number[], redRun: ResultRecord | null, repoOf: (wl: string) => string | null): string {
-	const owner = (n: number): string | null => {
-		for (const t of everyTrain(ledger)) {
-			if (repoOf(t) !== repo) continue;
-			const b = trainBindings(ledger.entries(t), ledger.instructions(t)).findLast((x) => x.source === "board" && x.prs.includes(n));
-			if (b?.board) return b.board.workload;
-		}
-		return null;
-	};
-	const lines = [stopSummary(repo, { kind: state.stop!, tip: state.tip, g: state.g, suspects, reasons: state.reasons }), "", `G (verified): ${state.g ?? "none in the commits read"}`, "", "Suspects (oldest first):"];
-	for (const s of state.suspects) {
-		const prs = s.prs.length === 0 ? "no PR" : s.prs.map((n) => `#${n} (${owner(n) ?? "workload unknown"})`).join(", ");
-		const run = s.lastRun === null ? "no main run yet" : `main run ${s.lastRun.runId} ${s.lastRun.verdict}${s.lastRun.runDir ? ` ${s.lastRun.runDir}` : ""}`;
-		lines.push(`- ${s.sha} landed ${s.date}: ${prs}; verdict ${s.verdict?.verdict ?? "none"}; ${run}`);
-	}
-	if (redRun !== null) {
-		lines.push("", `Failing tests (run ${redRun.runId}${redRun.runDir ? `, ${redRun.runDir}` : ""}):`);
-		for (const f of redRun.failures.slice(0, 30)) lines.push(`- ${f.name}: ${f.firstError}`);
-		if (redRun.failures.length > 30) lines.push(`- … ${redRun.failures.length - 30} more in the run's result.json`);
-		lines.push("", `Attribution: the runner's main-red row for run ${redRun.runId} on ${STANDING_WORKLOAD_ID} names the suspects whose changes reach a failing test.`);
-	}
-	return lines.join("\n");
 }
 
 /**
@@ -1502,82 +1438,6 @@ function closeNotice(ops: IssueOps, ghJson: (args: string[]) => unknown, url: st
 	if (field(ghJson(["issue", "view", n, "-R", TRAIN_ALERT_REPO, "--json", "state"]), "state") !== "CLOSED") ops.run(["issue", "close", n, "-R", TRAIN_ALERT_REPO, "--comment", comment]);
 }
 
-/** One alert action's effects (D9's send ladder, or the close after Jo's answer). */
-function alert(d: TickDeps, facts: TrainFacts, a: AlertAction, ghJson: (args: string[]) => unknown, say: (line: string) => void): void {
-	const { ledger } = d;
-	const { q, pr, reason, options, record } = a.alert;
-	const write = (body: string) => ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: facts.wl, kind: "assumption", body });
-	const { run, marked, labelled } = issueOps(d.gh, ghJson);
-	if (a.kind === "close") {
-		const answer = q.resolved_by ? ledger.instructions(facts.wl).find((i) => i.id === q.resolved_by)?.body.trim() : undefined;
-		const why = q.state === "answered" ? `Jo answered ${answer ?? "it"}` : `Jo ${q.state} it`;
-		// No url: level 1 was begun and not finished, so its issue is found by its marker in the whole listing, or was never filed.
-		const url = record.url ?? marked(trainAlertMarker(q.id, 1));
-		if (url === null) {
-			write(trainAlertEndBody(q.id, "closed", `${why}; no issue was filed`));
-			say(`${facts.wl}: alert ${q.id} settled (${why}) before its issue was filed`);
-			return;
-		}
-		const n = issueNumber(url);
-		const state = field(ghJson(["issue", "view", n, "-R", TRAIN_ALERT_REPO, "--json", "state"]), "state");
-		if (state !== "CLOSED") run(["issue", "close", n, "-R", TRAIN_ALERT_REPO, "--comment", `${why} (${q.id}) in as2.`]);
-		write(trainAlertEndBody(q.id, "closed", why));
-		say(`${facts.wl}: alert ${q.id} settled (${why}): issue #${n} closed`);
-		return;
-	}
-	const level = a.level;
-	const marker = trainAlertMarker(q.id, level);
-	const prUrl = `https://github.com/${facts.repo}/pull/${pr}`;
-	if (level === 1) {
-		if (!record.sending.has(1)) write(trainAlertBody(q.id, 1, "sending"));
-		let url = marked(marker) ?? "";
-		if (url === "") {
-			const body = [
-				marker,
-				`Merge train ${facts.wl} on ${facts.repo}: ${prUrl} needs you (${reason}).`,
-				"",
-				`Question ${q.id}; answer it in the as2 session with one word: ${options.join(" / ")}.`,
-				"",
-				q.body,
-				"",
-				`Closing this issue acknowledges the alert and stops the re-sends at 4 h and 8 h; it does not answer ${q.id}.`,
-			].join("\n");
-			const args = ["issue", "create", "-R", TRAIN_ALERT_REPO, "--label", TRAIN_ALERT_LABEL, "--title", `merge train: #${pr} needs you (${reason})`, "--body", body];
-			const created = labelled(args, [TRAIN_ALERT_LABEL], () => marked(marker));
-			url = created.trim().split("\n").filter(Boolean).at(-1) ?? "";
-			issueNumber(url);
-		}
-		write(trainAlertBody(q.id, 1, "sent", url));
-		say(`${facts.wl}: alert ${q.id} (#${pr}, ${reason}) level 1: ${url}`);
-		return;
-	}
-	const n = issueNumber(record.url!);
-	const step = TRAIN_ALERT_LADDER.find((s) => s.level === level)!;
-	const hours = step.afterMs / 3_600_000;
-	const issue = ghJson(["issue", "view", n, "-R", TRAIN_ALERT_REPO, "--json", "state,comments"]);
-	const comments = field(issue, "comments");
-	if (field(issue, "state") === "CLOSED") {
-		write(trainAlertEndBody(q.id, "acked", `issue #${n} closed`));
-		say(`${facts.wl}: alert ${q.id} acknowledged: issue #${n} closed`);
-		return;
-	}
-	if (!record.sending.has(level)) write(trainAlertBody(q.id, level, "sending"));
-	if (!(Array.isArray(comments) && comments.some((c) => {
-		const body = field(c, "body");
-		return typeof body === "string" && body.includes(marker);
-	}))) {
-		run(["issue", "comment", n, "-R", TRAIN_ALERT_REPO, "--body", `${marker}\n${TRAIN_ALERT_MENTION} unacknowledged ${hours} h: ${prUrl} still needs you (${reason}). Question ${q.id}: ${options.join(" / ")}. Close this issue to acknowledge.`]);
-	}
-	labelled(["issue", "edit", n, "-R", TRAIN_ALERT_REPO, "--add-label", step.labels.join(",")], step.labels);
-	if (!record.notified.has(level)) {
-		const shown = d.notify("as2 merge train", `#${pr} needs you (${reason}), unacknowledged ${hours} h: ${q.id}`);
-		if (shown) write(trainAlertBody(q.id, level, "notified"));
-		else say(`${facts.wl}: alert ${q.id} level ${level}: the notification could not be shown`);
-	}
-	write(trainAlertBody(q.id, level, "sent"));
-	say(`${facts.wl}: alert ${q.id} (#${pr}) level ${level}: re-sent louder on issue #${n}`);
-}
-
 /** gh on PATH, 60 s at most, or the caller's shorter remaining publication budget. */
 function realGh(args: string[], timeoutMs = 60_000): GhResult {
 	const r = Bun.spawnSync(["gh", ...args], { stdout: "pipe", stderr: "pipe", timeout: Math.max(1, Math.min(60_000, timeoutMs)) });
@@ -1644,7 +1504,7 @@ function realMainDeps(): MainDeps {
 			// D1 boards only on the repositories the test runner serves, read as its starter reads them.
 			const cfg = loadTestRunnerConfig(process.env);
 			if (!cfg.ok) log(`testRunner config unreadable (${cfg.error}): nothing boards this pass`);
-			tick({ ledger, gh: realGh, launch: realLaunch, notify: realNotify, land: { runner: realRunner, root: realRoot, runsRoot: runsRoot(process.env) }, log, ...(cfg.ok ? { config: cfg.config } : {}) });
+			tick({ ledger, gh: realGh, launch: realLaunch, alerts: { seams: realAlertSeams(process.env), lock: realAlertLock(ledger, alertLockPath(process.env)) }, land: { runner: realRunner, root: realRoot, runsRoot: runsRoot(process.env) }, log, ...(cfg.ok ? { config: cfg.config } : {}) });
 		},
 		doctor: (ledger, openError) => {
 			// The doctor beside this script: the tick's own root's (a verified tick runs a verified doctor).

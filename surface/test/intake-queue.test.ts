@@ -19,6 +19,7 @@ import { briefHash, formatOverride, formatSignal, goalsHash, rankDay, type Signa
 import {
 	DRAIN_TRIED_ENV, drainCandidates, drainPick, formatDrainTried, preemptFor, queueOrder, queuePosition, type RankConfig, readDrainTried, startedIdle,
 } from "../src/rank-launch";
+import type { RunnerProbe } from "../src/runner-probe";
 import { RANK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import * as laneScript from "../scripts/lane";
 import { ctxOf, fakePi, HOW_IT_FAILS, laneIdOf, tempLedger, tempRepo } from "./helpers";
@@ -76,7 +77,7 @@ function withCap<T>(cap: number, f: () => T): T {
 /** A probe factory answering `omp` and `runner` for every lane, recording each ask (surface/test/lane-live-lane.test.ts's pattern); the real ps is never run. */
 function fakeProbe(answer: { omp: PidState; runner: PidState }) {
 	const calls: { laneId: string; what: "omp" | "runner"; pid: number }[] = [];
-	const probeFor = (laneId: string): laneScript.RunnerProbe => ({
+	const probeFor = (laneId: string): RunnerProbe => ({
 		omp: (pid) => {
 			calls.push({ laneId, what: "omp", pid });
 			return answer.omp;
@@ -95,7 +96,7 @@ const NO_LIVE_LANE = fakeProbe({ omp: "gone", runner: "gone" }).probeFor;
  * real ps); `tried` as a drain hands it (unset: read from `DRAIN_TRIED_ENV`).
  */
 const reserve = (
-	l: Ledger, wl: string, config: RankConfig, cap = 3, interactive = false, tried?: ReadonlySet<string>, probeFor: (laneId: string) => laneScript.RunnerProbe = NO_LIVE_LANE,
+	l: Ledger, wl: string, config: RankConfig, cap = 3, interactive = false, tried?: ReadonlySet<string>, probeFor: (laneId: string) => RunnerProbe = NO_LIVE_LANE,
 ) => withCap(cap, () => laneScript.reserve(l, wl, interactive ? "jo" : "test", interactive, config, probeFor, tried));
 /** One drain to its end, as `cmdDrain` runs it: `drainPick`, mark tried, the starter's reservation with the tried set; `cap` stops it. */
 function drain(l: Ledger, cap: number, config: RankConfig): { wl: string; cause: string }[] {

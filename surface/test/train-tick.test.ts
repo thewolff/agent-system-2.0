@@ -1,12 +1,13 @@
 // The merge train's tick (PLAN wl-mv8s8srodefytc rev 17.1 D9-D10, part 3): settles once, opens one fix workload per PR,
-// launches owners and the train, raises the failed-twice alert, files each alert once on jo-issues with the as2-train label,
-// re-sends it louder at 4 h and 8 h until acknowledged, and keeps acting while a question is open. Auto-boarding (PLAN
+// launches owners and the train, raises the failed-twice alert, and keeps acting while a question is open. The tick's alert
+// pass (PLAN wl-mw0vs9uc3xqtka D3, TickDeps.alerts) files each alert once on jo-issues with the as2-train label and re-sends it
+// louder at 4 h and 8 h until acknowledged. Auto-boarding (PLAN
 // wl-mvbjiettjrfpxc D1, D3, D4, D6): the cutover, the live half of "a lane finished green", one skip row per head and reason,
 // boarding oldest close first, and a protection episode that clears and wakes the trains it held. The relaunch loop (PLAN
 // wl-mvgn310dpi5gcg D1, D3): a wake per request whichever starter serves it, and no request at the ceiling. A green carries over
 // decision-log commits in settle and boarding through GitHub's compare (PLAN wl-mvpwkpqobyp20w D2, D3).
-// Temp ledgers, temp git checkouts with a fake GitHub origin, a fake gh, a fake launcher and a fake notification only
-// (surface/test/train-world.ts).
+// Temp ledgers, temp git checkouts with a fake GitHub origin, a fake gh, a fake launcher and the alert pass's recording seams
+// only (surface/test/train-world.ts, surface/test/alert-world.ts).
 import { describe, expect, test } from "bun:test";
 import { reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { Database } from "bun:sqlite";
@@ -22,16 +23,16 @@ import { errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
 import { apply, applyTrain, interpret } from "../src/input";
 import {
-	controlEntries, decideLaunch, laneExitBody, laneHeadroomBody, laneReadyBody, laneStopAcceptedBody, launchFailedBody, launchRequestedBody, launchRowsFor, landFirstBody, landFirstInstructionBody, mainRetryBody,
+	controlEntries, decideLaunch, laneExitBody, laneReadyBody, laneStopAcceptedBody, launchFailedBody, launchRequestedBody, launchRowsFor, landFirstBody, landFirstInstructionBody, mainRetryBody,
 	mainRetryInstructionBody, planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody,
 } from "../src/launch";
 import {
 	actionable, budgetWakes, type ControlRoot, fixBindings, landFirstNoticeBody, landFirstRows, latestTrainReconciled, mainRedNotices, protectionEpisodes, recordTrainTask, TRAIN_ALERT_LABEL,
-	TRAIN_ALERT_REPO, TRAIN_LAUNCH_LIMIT, trainActivityArgs, retireSupersededFullSlices, testRunStarts, TRAIN_LAUNCH_OPTIONS, TRAIN_METER_OPTIONS, TRAIN_STALL_OPTIONS, trainAlertBody, trainAlertMarker,
+	TRAIN_ALERT_REPO, TRAIN_LAUNCH_LIMIT, trainActivityArgs, retireSupersededFullSlices, testRunStarts, TRAIN_LAUNCH_OPTIONS, TRAIN_METER_OPTIONS, TRAIN_STALL_OPTIONS,
 	trainAttemptsOf, trainFullSliceId, trainHeadWokenBody, trainHoldBody, trainLaunchFailures, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody, type WakeDeferral, prStakes,
 } from "../src/merge-train";
 import { trainMergedNoticeBody } from "../src/notice";
-import { recordQuotaMove } from "../src/quota-move-alert";
+import { legacyTrainAlertMarker } from "../src/alert-path";
 import { fastPlanBody, makeRunId, testRequestedBody, testRunBody, testRuns, withFullSuitePublication } from "../src/test-run";
 import { ESCALATION_BY, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { releasedOpenBody } from "../src/turn-end";
@@ -41,6 +42,7 @@ import {
 } from "./train-world";
 import { clock, tempLedger, tmp } from "./helpers";
 import type { RankConfig } from "../src/rank-launch";
+import type { RunnerProbe } from "../src/runner-probe";
 // A namespace import, as lane-script.test.ts does: a name lane.ts stops exporting fails only the test that calls it.
 import * as laneScript from "../scripts/lane";
 
@@ -233,12 +235,13 @@ describe("alerts (D9)", () => {
 		const q = w.ledger.questions(w.train)[0]!.id;
 		const issue = w.g.issues[0]!;
 		// #106 waits with no train progress, so it stalls at 3 h with an alert of its own (PLAN wl-mvr888nftz0vcl D8): this test
-		// reads #101's failed-twice alert alone
-		const notes = () => w.notes.filter((n) => n.includes(q));
+		// reads #101's failed-twice alert alone. Each level's silent popup is one popup worker the alert pass spawns.
+		const popups = () => w.popups().filter((p) => p.key === `q:${q}`).map((p) => p.level);
 		const creates = () => w.creates().filter((a) => a.some((x) => x.includes("#101 needs you")));
 		w.c.plusHours(3.9);
 		w.run();
 		expect(issue.comments).toEqual([]);
+		expect(popups()).toEqual([]);
 		w.c.plusHours(0.2);
 		w.run();
 		w.run();
@@ -246,7 +249,7 @@ describe("alerts (D9)", () => {
 		expect(issue.comments[0]).toContain("@thewolff");
 		expect(issue.comments[0]).toContain("unacknowledged 4 h");
 		expect(issue.labels).toEqual([TRAIN_ALERT_LABEL, "loud"]);
-		expect(notes()).toHaveLength(1);
+		expect(popups()).toEqual([2]);
 		const line = errorLines(w.ledger).find((l) => l.rowId === q);
 		expect(line?.line).toStartWith("LOUD (unacknowledged 4 h)");
 		w.c.plusHours(4);
@@ -254,31 +257,35 @@ describe("alerts (D9)", () => {
 		w.run();
 		expect(issue.comments).toHaveLength(2);
 		expect(issue.labels).toEqual([TRAIN_ALERT_LABEL, "loud", "critical"]);
-		expect(notes()).toHaveLength(2);
+		expect(popups()).toEqual([2, 3]);
 		expect(errorLines(w.ledger).find((l) => l.rowId === q)?.line).toStartWith("LOUD, critical (unacknowledged 8 h)");
 		w.c.plusHours(24);
 		w.run();
 		expect(issue.comments).toHaveLength(2);
-		expect(notes()).toHaveLength(2);
+		expect(popups()).toEqual([2, 3]);
 		expect(creates()).toHaveLength(1);
 		expect(w.g.calls.some((a) => a.includes("--remove-label"))).toBe(false);
 	});
 
-	test("a crash between sending and sent: the retry posts no second comment and notifies once", () => {
+	test("a crash between sending and sent: the retry posts no second comment and spawns one popup", () => {
 		const w = world();
 		w.failTwice();
+		const q = w.ledger.questions(w.train)[0]!.id;
 		const issue = w.g.issues[0]!;
+		const rows = () => w.alertRows().filter((r) => r.startsWith(`alert: q:${q} `));
 		w.c.plusHours(4.1);
 		w.g.failWhen((a) => a[0] === "issue" && a[1] === "edit");
 		w.run();
 		expect(issue.comments).toHaveLength(1);
-		expect(w.notes).toHaveLength(0);
+		expect(w.popups().filter((p) => p.key === `q:${q}`)).toEqual([]);
+		expect(rows().slice(-2)).toEqual([`alert: q:${q} level 2 sending`, expect.stringMatching(new RegExp(`^alert: q:${q} error gh gh issue edit \\d+ exited 1: HTTP 502$`))]);
 		w.g.failWhen(null);
 		w.run();
 		w.run();
 		expect(issue.comments).toHaveLength(1);
 		expect(issue.labels).toContain("loud");
-		expect(w.notes).toHaveLength(1);
+		expect(rows().filter((r) => r.startsWith(`alert: q:${q} level 2 `))).toEqual([`alert: q:${q} level 2 sending`, `alert: q:${q} level 2 sent`]);
+		expect(w.popups().filter((p) => p.key === `q:${q}`)).toEqual([{ key: `q:${q}`, level: 2 }]);
 	});
 
 	test("acknowledged by closing the issue: no re-send; Jo's answer closes an open issue", () => {
@@ -293,18 +300,21 @@ describe("alerts (D9)", () => {
 		w.run();
 		expect(issue.comments).toEqual([]);
 		// #106 stalls at 3 h with an alert of its own (PLAN wl-mvr888nftz0vcl D8); #101's closed alert sends nothing
-		expect(w.notes.filter((n) => n.includes(q))).toEqual([]);
+		expect(w.popups().filter((p) => p.key === `q:${q}`)).toEqual([]);
+		expect(w.alertRows()).toContainEqual(expect.stringMatching(new RegExp(`^alert: q:${q} acked `)));
 		expect(w.ledger.question(q)!.state).toBe("open");
 
 		const v = world();
 		v.failTwice();
-		v.ledger.answerQuestion(v.ledger.questions(v.train)[0]!.id, { ...JO, answer: "skip" });
+		const q2 = v.ledger.questions(v.train)[0]!.id;
+		v.ledger.answerQuestion(q2, { ...JO, answer: "skip" });
 		v.run();
 		expect(v.g.issues[0]!.state).toBe("CLOSED");
 		v.c.plusHours(5);
 		v.run();
 		expect(v.g.issues[0]!.comments).toEqual([]);
 		expect(v.g.calls.filter((a) => a[0] === "issue" && a[1] === "close")).toHaveLength(1);
+		expect(v.alertRows().filter((r) => r.startsWith(`alert: q:${q2} closed `))).toHaveLength(1);
 	});
 
 	test("a production-stakes PR's merge question is an alert", () => {
@@ -507,7 +517,7 @@ describe("retries of a released train and fork PRs (D8-D10, review gtb-r1)", () 
 			if (args[0] !== "pr" || args[1] !== "view" || args[2] !== "106") return r;
 			return { ...r, stdout: JSON.stringify({ ...JSON.parse(r.stdout), isCrossRepository: true, headRepositoryOwner: { login: "someone" } }) };
 		};
-		const pass = () => tick({ ledger: w.ledger, gh, launch: (wl) => ({ code: 0, line: `launched ${wl}` }), notify: () => true });
+		const pass = () => tick({ ledger: w.ledger, gh, launch: (wl) => ({ code: 0, line: `launched ${wl}` }), alerts: w.alerts });
 		pass();
 		pass();
 		expect(fixBindings(w.ledger)).toEqual([]);
@@ -560,7 +570,7 @@ describe("retries of a released train and fork PRs (D8-D10, review gtb-r1)", () 
 			w.c.at("2026-10-01T12:00:00.000Z");
 			let calls = 0;
 			const pass = () => tick({
-				ledger: w.ledger, gh: w.g.gh, notify: () => true,
+				ledger: w.ledger, gh: w.g.gh, alerts: w.alerts,
 				launch: () => {
 					calls += 1;
 					return { code: 6, line: "lane-x not launched: cap" };
@@ -620,19 +630,20 @@ describe("retries of a released train and fork PRs (D8-D10, review gtb-r1)", () 
 	});
 });
 
-describe("alert sends with an uncertain outcome (D9, review gtb-r1 findings 9 and 10)", () => {
-	/** The production merge question on #106 of `train`: an open alert the next tick files at level 1. */
+describe("alert sends with an uncertain outcome (D9, review gtb-r1 findings 9 and 10; the alert pass, PLAN wl-mw0vs9uc3xqtka D3)", () => {
+	/** The production merge question on #106 of `train`: an open alert the next tick's alert pass files at level 1. */
 	const mergeQuestion = (ledger: Ledger, train: string): string => {
 		const sl = ledger.addSlice({ by: TRAIN_LANE, workloadId: train, id: trainSliceId(train, 106), task: "PR #106", doneCondition: "terminal", inputs: "#106" });
 		return ledger.raiseQuestion({ by: TRAIN_LANE, workloadId: train, sliceId: sl, body: "#106 production: merge it?", options: ["merged", "skip", "stop"] });
 	};
-	/** The tick's `train-alert:` entries for question `q` on `train`, oldest first. */
-	const alertEntries = (ledger: Ledger, train: string, q: string): string[] =>
-		ledger.entries(train).filter((e) => e.created_by === MERGE_TRAIN_BY && e.body.startsWith(`train-alert: ${q} `)).map((e) => e.body);
-	/** A tick that wrote level 1 `sending` for `q` and died before `sent`. */
+	/** The alert pass's `alert:` rows for question `q`'s key `q:<q>`, oldest first. */
+	const alertRows = (w: { alertRows: () => string[] }, q: string): string[] => w.alertRows().filter((r) => r.startsWith(`alert: q:${q} `));
+	/** A retired tick that wrote level 1 `sending` for `q` and died before `sent`: the pass adopts it (D3 legacy adoption). */
 	const sendingOnly = (ledger: Ledger, train: string, q: string): void => {
-		ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: train, kind: "assumption", body: trainAlertBody(q, 1, "sending") });
+		ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: train, kind: "assumption", body: `train-alert: ${q} level 1 sending` });
 	};
+	const raised = (q: string) => expect.stringMatching(new RegExp(`^alert: q:${q} raised train start 1 `));
+	const ghError = (q: string, text: string) => expect.stringMatching(new RegExp(`^alert: q:${q} error gh .*${text}`));
 
 	test("a create that files the issue but exits nonzero: the marker is found again, the issue adopted, nothing filed twice", () => {
 		const w = world();
@@ -645,65 +656,58 @@ describe("alert sends with an uncertain outcome (D9, review gtb-r1 findings 9 an
 			return r;
 		};
 		w.run();
+		expect(alertRows(w, q)).toEqual([raised(q), `alert: q:${q} level 1 sending`, ghError(q, "exited 1: HTTP 502: the reply was lost")]);
 		w.run();
 		expect(w.g.issues).toHaveLength(1);
 		expect(w.creates()).toHaveLength(1);
-		expect(alertEntries(w.ledger, w.train, q)).toEqual([`train-alert: ${q} level 1 sending`, `train-alert: ${q} level 1 sent ${w.g.issues[0]!.url}`]);
+		expect(alertRows(w, q).slice(3)).toEqual([`alert: q:${q} level 1 sent ${w.g.issues[0]!.url}`]);
 	});
 
-	test("a create that fails for another reason is not retried: the error is logged and the next tick files the issue once", () => {
+	test("a create that fails for another reason is not retried: the error is on the ALERT line and the next tick files the issue once", () => {
 		const w = world();
-		mergeQuestion(w.ledger, w.train);
+		const q = mergeQuestion(w.ledger, w.train);
 		w.g.failWhen((a) => a[0] === "issue" && a[1] === "create");
-		w.run();
+		const lines = w.run();
 		expect(w.creates()).toHaveLength(1);
-		expect(w.g.calls.some((a) => a[0] === "label")).toBe(false);
-		expect(w.ledger.entries(w.train).some((e) => e.body.startsWith("train-error: tick"))).toBe(true);
+		expect(w.g.calls.some((a) => a[0] === "label" && a[1] === "create")).toBe(false);
+		expect(alertRows(w, q).at(-1)).toEqual(ghError(q, "gh issue create -R exited 1: HTTP 502"));
+		expect(lines).toContainEqual(expect.stringContaining(`q:${q}: gh: gh issue create -R exited 1: HTTP 502`));
+		expect(errorLines(w.ledger).find((l) => l.kind === "alert")?.line).toContain("(issue not filed: gh issue create -R exited 1: HTTP 502;");
 		w.g.failWhen(null);
 		w.run();
 		expect(w.g.issues).toHaveLength(1);
 		expect(w.creates()).toHaveLength(2);
+		expect(alertRows(w, q).at(-1)).toBe(`alert: q:${q} level 1 sent ${w.g.issues[0]!.url}`);
 	});
 
-	test("a missing as2-train label: the label is created and the issue filed once", () => {
+	test("a missing as2-train label: the label is created first and the issue filed once", () => {
 		const w = world();
 		const q = mergeQuestion(w.ledger, w.train);
-		const real = w.g.gh;
-		const labels = new Set<string>();
-		w.g.gh = (args) => {
-			if (args[0] === "label" && args[1] === "create") {
-				labels.add(args[2]!);
-				return { code: 0, stdout: "", stderr: "" };
-			}
-			if (args[0] === "issue" && args[1] === "create" && !labels.has(TRAIN_ALERT_LABEL)) {
-				w.g.calls.push(args);
-				return { code: 1, stdout: "", stderr: `could not add label: '${TRAIN_ALERT_LABEL}' not found` };
-			}
-			return real(args);
-		};
+		w.g.labels.delete(TRAIN_ALERT_LABEL);
 		w.run();
-		expect([...labels]).toEqual([TRAIN_ALERT_LABEL]);
+		expect(w.g.calls.filter((a) => a[0] === "label" && a[1] === "create")).toEqual([expect.arrayContaining(["label", "create", TRAIN_ALERT_LABEL, "-R", TRAIN_ALERT_REPO])]);
+		expect(w.g.labels.has(TRAIN_ALERT_LABEL)).toBe(true);
 		expect(w.g.issues).toHaveLength(1);
-		expect(w.creates()).toHaveLength(2);
-		expect(alertEntries(w.ledger, w.train, q).at(-1)).toBe(`train-alert: ${q} level 1 sent ${w.g.issues[0]!.url}`);
+		expect(w.creates()).toHaveLength(1);
+		expect(alertRows(w, q).at(-1)).toBe(`alert: q:${q} level 1 sent ${w.g.issues[0]!.url}`);
 	});
 
-	test("answered after a crash between level 1 sending and sent: the marked issue is found and closed once, the end written", () => {
+	test("answered after a crash between level 1 sending and sent: the marked issue is adopted, closed once, the end written", () => {
 		const w = world();
 		const q = mergeQuestion(w.ledger, w.train);
 		sendingOnly(w.ledger, w.train, q);
 		const url = `https://github.com/${TRAIN_ALERT_REPO}/issues/1`;
-		w.g.issues.push({ number: 1, url, title: "merge train: #106 needs you (production merge)", body: `${trainAlertMarker(q, 1)}\n…`, state: "OPEN", labels: [TRAIN_ALERT_LABEL], comments: [] });
+		w.g.issues.push({ number: 1, url, title: "merge train: #106 needs you (production merge)", body: `${legacyTrainAlertMarker(q, 1)}\n…`, state: "OPEN", labels: [TRAIN_ALERT_LABEL], comments: [] });
 		w.ledger.answerQuestion(q, { ...JO, answer: "skip" });
 		w.run();
 		w.run();
 		expect(w.g.issues[0]!.state).toBe("CLOSED");
 		expect(w.g.calls.filter((a) => a[0] === "issue" && a[1] === "close")).toHaveLength(1);
 		expect(w.creates()).toEqual([]);
-		expect(alertEntries(w.ledger, w.train, q)).toEqual([`train-alert: ${q} level 1 sending`, expect.stringMatching(new RegExp(`^train-alert: ${q} closed `))]);
+		expect(alertRows(w, q)).toEqual([`alert: q:${q} adopted ${url} level 1 from train-alert ${q} on ${w.train}`, expect.stringMatching(new RegExp(`^alert: q:${q} closed Jo answered .*\\(${q}\\)$`))]);
 	});
 
-	test("withdrawn after level 1 sending with no issue filed: the end is written and nothing is created", () => {
+	test("withdrawn after level 1 sending with no issue filed: the end is written and nothing is created or closed", () => {
 		const w = world();
 		const q = mergeQuestion(w.ledger, w.train);
 		sendingOnly(w.ledger, w.train, q);
@@ -713,21 +717,21 @@ describe("alert sends with an uncertain outcome (D9, review gtb-r1 findings 9 an
 		expect(w.g.issues).toEqual([]);
 		expect(w.creates()).toEqual([]);
 		expect(w.g.calls.some((a) => a[0] === "issue" && a[1] === "close")).toBe(false);
-		expect(alertEntries(w.ledger, w.train, q)).toEqual([`train-alert: ${q} level 1 sending`, expect.stringMatching(new RegExp(`^train-alert: ${q} closed `))]);
+		expect(alertRows(w, q)).toEqual([`alert: q:${q} adopted none level 0 from train-alert ${q} on ${w.train}`, `alert: q:${q} closed question ${q} was withdrawn`]);
 	});
 
 	/** Issue #1 carrying `q`'s level 1 marker, then `others` as2-train issues filed after it: a newest-first listing reaches #1 last. */
 	const buried = (w: { g: { issues: FakeIssue[] } }, q: string, others: number): FakeIssue => {
-		w.g.issues.push({ number: 1, url: `https://github.com/${TRAIN_ALERT_REPO}/issues/1`, title: "merge train: #106 needs you (production merge)", body: `${trainAlertMarker(q, 1)}\n…`, state: "OPEN", labels: [TRAIN_ALERT_LABEL], comments: [] });
+		w.g.issues.push({ number: 1, url: `https://github.com/${TRAIN_ALERT_REPO}/issues/1`, title: "merge train: #106 needs you (production merge)", body: `${legacyTrainAlertMarker(q, 1)}\n…`, state: "OPEN", labels: [TRAIN_ALERT_LABEL], comments: [] });
 		for (let n = 2; n <= others + 1; n++) {
-			w.g.issues.push({ number: n, url: `https://github.com/${TRAIN_ALERT_REPO}/issues/${n}`, title: `merge train: #${n} needs you (failed twice)`, body: `${trainAlertMarker(`q-other${n}`, 1)}\n…`, state: "CLOSED", labels: [TRAIN_ALERT_LABEL], comments: [] });
+			w.g.issues.push({ number: n, url: `https://github.com/${TRAIN_ALERT_REPO}/issues/${n}`, title: `merge train: #${n} needs you (failed twice)`, body: `${legacyTrainAlertMarker(`q-other${n}`, 1)}\n…`, state: "CLOSED", labels: [TRAIN_ALERT_LABEL], comments: [] });
 		}
 		return w.g.issues[0]!;
 	};
-	/** The tick's marker lookup, in either form gh offers. */
+	/** The pass's marker lookup, in either form gh offers. */
 	const listing = (a: string[]) => (a[0] === "api" && a[1] === `repos/${TRAIN_ALERT_REPO}/issues`) || (a[0] === "issue" && a[1] === "list");
 
-	test("answered after a crash, its marked issue far beyond the first page of the listing: found and closed, never recorded as no issue (review gtb-r2 F3)", () => {
+	test("answered after a crash, its marked issue far beyond the first page of the listing: found and closed, never adopted as no issue (review gtb-r2 F3)", () => {
 		const w = world();
 		const q = mergeQuestion(w.ledger, w.train);
 		sendingOnly(w.ledger, w.train, q);
@@ -737,12 +741,10 @@ describe("alert sends with an uncertain outcome (D9, review gtb-r1 findings 9 an
 		w.run();
 		expect(target.state).toBe("CLOSED");
 		expect(w.g.calls.filter((a) => a[0] === "issue" && a[1] === "close")).toEqual([expect.arrayContaining(["close", "1"])]);
-		const end = alertEntries(w.ledger, w.train, q).at(-1)!;
-		expect(end).toMatch(new RegExp(`^train-alert: ${q} closed `));
-		expect(end).not.toContain("no issue was filed");
+		expect(alertRows(w, q)).toEqual([`alert: q:${q} adopted ${target.url} level 1 from train-alert ${q} on ${w.train}`, expect.stringMatching(new RegExp(`^alert: q:${q} closed `))]);
 	});
 
-	test("a marker lookup that fails or reads an unexpected shape writes nothing durable: no close recorded, no issue created, and the next tick finishes (review gtb-r2 F3)", () => {
+	test("a marker lookup that fails or reads an unexpected shape writes nothing durable: no adoption, no close, no issue created, and the next tick finishes (review gtb-r2 F3)", () => {
 		// the close after Jo's answer
 		const w = world();
 		const q = mergeQuestion(w.ledger, w.train);
@@ -751,17 +753,17 @@ describe("alert sends with an uncertain outcome (D9, review gtb-r1 findings 9 an
 		w.ledger.answerQuestion(q, { ...JO, answer: "skip" });
 		const real = w.g.gh;
 		w.g.gh = (args) => (listing(args) ? { code: 0, stdout: JSON.stringify({ message: "Server Error" }), stderr: "" } : real(args));
-		w.run();
+		const shape = w.run();
 		w.g.gh = real;
 		w.g.failWhen(listing);
 		w.run();
 		expect(target.state).toBe("OPEN");
-		expect(alertEntries(w.ledger, w.train, q)).toEqual([`train-alert: ${q} level 1 sending`]);
-		expect(w.ledger.entries(w.train).filter((e) => e.body.startsWith("train-error: tick")).length).toBeGreaterThan(0);
+		expect(alertRows(w, q)).toEqual([ghError(q, "returned an unexpected shape"), ghError(q, "exited 1: HTTP 502")]);
+		expect(shape).toContainEqual(expect.stringContaining(`q:${q}: gh: gh api repos/${TRAIN_ALERT_REPO}/issues returned an unexpected shape`));
 		w.g.failWhen(null);
 		w.run();
 		expect(target.state).toBe("CLOSED");
-		expect(alertEntries(w.ledger, w.train, q).at(-1)).not.toContain("no issue was filed");
+		expect(alertRows(w, q).slice(2)).toEqual([`alert: q:${q} adopted ${target.url} level 1 from train-alert ${q} on ${w.train}`, expect.stringMatching(new RegExp(`^alert: q:${q} closed `))]);
 
 		// level 1's lookup before a create: the question is open and its issue was filed before a crash
 		const v = world();
@@ -771,11 +773,12 @@ describe("alert sends with an uncertain outcome (D9, review gtb-r1 findings 9 an
 		v.g.failWhen(listing);
 		v.run();
 		expect(v.creates()).toEqual([]);
-		expect(alertEntries(v.ledger, v.train, q2)).toEqual([`train-alert: ${q2} level 1 sending`]);
+		expect(alertRows(v, q2)).toEqual([ghError(q2, "exited 1: HTTP 502")]);
 		v.g.failWhen(null);
 		v.run();
 		expect(v.creates()).toEqual([]);
-		expect(alertEntries(v.ledger, v.train, q2).at(-1)).toBe(`train-alert: ${q2} level 1 sent ${filed.url}`);
+		expect(alertRows(v, q2)).toContainEqual(`alert: q:${q2} adopted ${filed.url} level 1 from train-alert ${q2} on ${v.train}`);
+		expect(alertRows(v, q2).some((r) => r.startsWith(`alert: q:${q2} level 1 `))).toBe(false);
 	});
 });
 
@@ -1160,7 +1163,7 @@ describe("the relaunch loop, replaying wl-mvggzumu8zs5xc (PLAN wl-mvgn310dpi5gcg
 		const offset = (iso: string) => (Date.parse(iso) - t0) / MIN;
 		const requests = () => controlEntries(w.ledger.entries(w.train)).filter((c) => c.prefix === "launch-requested" && c.createdBy === MERGE_TRAIN_BY);
 		const wakes = () => w.ledger.entries(w.train).filter((e) => e.created_by === MERGE_TRAIN_BY && e.body === trainHeadWokenBody(101, H2)).length;
-		const tickWith = (launch: (wl: string) => { code: number; line: string }) => tick({ ledger: w.ledger, gh: w.g.gh, launch, notify: () => true });
+		const tickWith = (launch: (wl: string) => { code: number; line: string }) => tick({ ledger: w.ledger, gh: w.g.gh, launch, alerts: w.alerts });
 		return { ...w, at, offset, requests, wakes, tickWith };
 	};
 
@@ -1364,7 +1367,7 @@ describe("land-first in the tick (PLAN wl-mvq4edbaf13vnk D6, D13, § 2 Protect t
 		const logs: string[] = [];
 		const onLog = { fn: (_l: string) => {} };
 		const pass = () => tick({
-			ledger: w.ledger, gh: fakeGh, launch: () => ({ code: 1, line: "not launched" }), notify: () => true, config: { repos: [{ origin: REPO, command: "bun test" }] },
+			ledger: w.ledger, gh: fakeGh, launch: () => ({ code: 1, line: "not launched" }), alerts: w.alerts, config: { repos: [{ origin: REPO, command: "bun test" }] },
 			land: { runner: (a) => (runnerCalls.push(a), runner.answer(a)), root: () => root, runsRoot: publicationRoot }, log: (l) => (logs.push(l), onLog.fn(l)),
 		});
 		const rows = () => landFirstRows(w.ledger.entries(STANDING_WORKLOAD_ID), REPO);
@@ -1544,8 +1547,9 @@ describe("land-first in the tick (PLAN wl-mvq4edbaf13vnk D6, D13, § 2 Protect t
 		expect(errorLines(x.ledger).some((line) => line.line.startsWith("revocation failed on #202 "))).toBe(true);
 	});
 
-	test("R17: a red tip opens one stop episode with one issue, revokes an open green 3 times then gives up once, records the repair and fails it at 30 min", () => {
+	test("R17: a red tip opens one stop episode with one issue (the alert pass's main:<repo> key), revokes an open green 3 times then gives up once, records the repair and fails it at 30 min", () => {
 		const x = lf();
+		const key = `main:${REPO}`;
 		x.mainRun(T, "red");
 		x.gh.open.set(202, HX);
 		x.gh.status.set(HX, { state: "success", description: "fast green" });
@@ -1556,8 +1560,12 @@ describe("land-first in the tick (PLAN wl-mvq4edbaf13vnk D6, D13, § 2 Protect t
 		}
 		const events = x.rows().map((r) => r.event);
 		expect(events.filter((e) => e === "stop-raised")).toHaveLength(1);
-		expect(events.filter((e) => e === "stop-filed")).toHaveLength(1);
+		// the tick writes the stop's rows only; the alert pass files its one issue
+		expect(events).not.toContain("stop-filed");
 		expect(x.creates()).toHaveLength(1);
+		expect(x.g.issues[0]!.title).toBe(`landing stopped on ${REPO}`);
+		expect(x.alertRows().filter((r) => r.startsWith(`alert: ${key} raised main-red start 1 `))).toHaveLength(1);
+		expect(x.alertRows()).toContainEqual(`alert: ${key} level 1 sent ${x.g.issues[0]!.url}`);
 		expect(events.filter((e) => e === "revoke-failed")).toHaveLength(3);
 		expect(events.filter((e) => e === "revoke-gave-up")).toHaveLength(1);
 		expect(x.gh.posts).toHaveLength(3);
@@ -1581,16 +1589,21 @@ describe("land-first in the tick (PLAN wl-mvq4edbaf13vnk D6, D13, § 2 Protect t
 		x.pass();
 		expect(x.rows().map((r) => r.event)).toEqual(expect.arrayContaining(["revoke-cleared", "stop-cleared"]));
 		expect(x.g.issues[0]!.state).toBe("CLOSED");
-		expect(errorLines(x.ledger).map((l) => l.line).filter((l) => /^(main red|revocation failed|landing stopped)/.test(l))).toEqual([]);
+		expect(x.g.calls.filter((a) => a[0] === "issue" && a[1] === "close")).toHaveLength(1);
+		expect(x.alertRows().filter((r) => r.startsWith(`alert: ${key} closed `))).toHaveLength(1);
+		expect(errorLines(x.ledger).map((l) => l.line).filter((l) => /^(main red|revocation failed|landing stopped|ALERT)/.test(l))).toEqual([]);
 	});
 
-	test("R17: an infrastructure stop (oldest suspect over 40 min, no verdict) files its issue and revokes, but wakes no repair", () => {
+	test("R17: an infrastructure stop (oldest suspect over 40 min, no verdict) files its issue (through the alert pass) and revokes, but wakes no repair", () => {
 		const x = lf();
 		x.gh.open.set(202, HX);
 		x.gh.status.set(HX, { state: "success", description: "fast green" });
 		x.at(41);
 		x.pass();
-		expect(x.rows().map((r) => r.event)).toEqual(["stop-raised", "stop-filed"]);
+		expect(x.rows().map((r) => r.event)).toEqual(["stop-raised"]);
+		expect(x.creates()).toHaveLength(1);
+		expect(x.g.issues[0]).toMatchObject({ title: `landing stopped on ${REPO}`, state: "OPEN", body: expect.stringContaining("fix the runner, then say main-retry") });
+		expect(x.alertRows()).toContainEqual(`alert: main:${REPO} level 1 sent ${x.g.issues[0]!.url}`);
 		expect(x.rows()[0]).toMatchObject({ kind: "infrastructure" });
 		expect(x.gh.posts).toEqual([expect.arrayContaining([`repos/${REPO}/statuses/${HX}`, "state=failure"])]);
 		expect(errorLines(x.ledger).map((l) => l.line)).toContainEqual(expect.stringMatching(new RegExp(`^landing stopped at ${T.slice(0, 7)} on ${REPO}: oldest suspect`)));
@@ -1719,10 +1732,7 @@ describe("the permanent train in the tick (PLAN wl-mvr888nftz0vcl D5, D6, D8, D9
 				w.launches.push(wl);
 				return launchReady(w.ledger, wl);
 			},
-			notify: (_t, text) => {
-				w.notes.push(text);
-				return true;
-			},
+			alerts: w.alerts,
 		});
 		/** The lane holding the train releases it and exits `outcome` (with `reason`). */
 		const end = (outcome: string, reason: string | null = null) => {
@@ -1981,7 +1991,7 @@ describe("the permanent train in the tick (PLAN wl-mvr888nftz0vcl D5, D6, D8, D9
 		const w = perm();
 		ensureStandingWorkload(w.ledger);
 		const SHOW: RankConfig = { mode: "show", parallelBudgetUsd: 0 };
-		const gone: laneScript.RunnerProbe = { omp: () => "gone", runner: () => "gone" };
+		const gone: RunnerProbe = { omp: () => "gone", runner: () => "gone" };
 		/** The runner's meter poll on `lane` with today's spend at $400, past every limit the raises reach: its pause, question and accepted budget stop, then the exit. */
 		const budgetStop = (lane: string): string => {
 			const nowMs = Date.parse(w.c.now());
@@ -2007,10 +2017,7 @@ describe("the permanent train in the tick (PLAN wl-mvr888nftz0vcl D5, D6, D8, D9
 				else w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneReadyBody(r.laneId, w.ledger.now()) });
 				return { code: 0, line: `launched ${r.laneId}` };
 			},
-			notify: (_t, text) => {
-				w.notes.push(text);
-				return true;
-			},
+			alerts: w.alerts,
 		});
 		const failures = () => {
 			const now = w.ledger.workload(w.train)!;
@@ -2059,7 +2066,7 @@ describe("the permanent train in the tick (PLAN wl-mvr888nftz0vcl D5, D6, D8, D9
 		const w = perm();
 		ensureStandingWorkload(w.ledger);
 		const SHOW: RankConfig = { mode: "show", parallelBudgetUsd: 0 };
-		const gone: laneScript.RunnerProbe = { omp: () => "gone", runner: () => "gone" };
+		const gone: RunnerProbe = { omp: () => "gone", runner: () => "gone" };
 		const meter = (lane: string) => {
 			const nowMs = Date.parse(w.c.now());
 			return laneScript.trainMeterPoll(w.ledger, { workloadId: w.train, laneId: lane, scan: { files: new Map(), days: new Map([[pdtDay(nowMs), 400]]) }, errors: [], nowMs });
@@ -2097,10 +2104,7 @@ describe("the permanent train in the tick (PLAN wl-mvr888nftz0vcl D5, D6, D8, D9
 				w.end("stop", "budget");
 				return { code: 0, line: `launched ${r.laneId}` };
 			},
-			notify: (_t, text) => {
-				w.notes.push(text);
-				return true;
-			},
+			alerts: w.alerts,
 		});
 		for (let i = 1; i <= 4; i++) {
 			later(w, 0.01);
@@ -2172,109 +2176,5 @@ describe("the permanent train in the tick (PLAN wl-mvr888nftz0vcl D5, D6, D8, D9
 		expect(retired()).toHaveLength(1);
 		expect(w.ledger.slice(full1)!.rev).toBe(rev);
 		expect(states()).toEqual({ ...open, [full1]: "cancelled" });
-	});
-});
-
-describe("the move-alert supervisor pass (PLAN wl-mvwk0v0gmp6cjc D4, R8)", () => {
-	const A = "anthropic/claude-opus-5-5";
-	const SOL = "openai-codex/gpt-6.1-sol";
-	const LANE = "lane-qm-1";
-
-	/**
-	 * A ledger on a settable clock with the standing workload (where a closed workload's alert rows go), a failing gh (the pass
-	 * calls none), and the pass's fake spawn, pid probe and SIGTERM.
-	 */
-	function supervised() {
-		const c = clock("2026-11-02T10:00:00.000Z");
-		const { ledger } = tempLedger(c.now);
-		ensureStandingWorkload(ledger);
-		const open = ledger.openWorkload({ by: SURFACE_BY, brief: "open workload with moves", stakes: "normal", mode: "autonomous" });
-		const closed = ledger.openWorkload({ by: SURFACE_BY, brief: "closed workload with moves", stakes: "normal", mode: "autonomous" });
-		const live = new Set<number>();
-		const spawned: string[] = [];
-		const kills: number[] = [];
-		const move = (wl: string) => recordQuotaMove(ledger, { workloadId: wl, laneId: LANE, kind: "lane", from: A, to: SOL, reason: "anthropic 7d 0.95 used", by: LANE_RUNNER_BY, eventBody: laneHeadroomBody(LANE, A, SOL, "anthropic 7d 0.95 used") });
-		const row = (wl: string, e: string, rest: string) => ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: `quota-move-alert: ${e} ${rest}` });
-		/** The move's alert rows, oldest first, on its workload and the standing one. */
-		const rowsOf = (wl: string, e: string) =>
-			[...ledger.entries(wl, "assumption"), ...ledger.entries(STANDING_WORKLOAD_ID, "assumption")]
-				.filter((x) => x.created_by === LANE_RUNNER_BY && x.body.startsWith(`quota-move-alert: ${e} `))
-				.sort((a, b) => a.created_at.localeCompare(b.created_at))
-				.map((x) => x.body.slice(`quota-move-alert: ${e} `.length));
-		const gh = (args: string[]): GhResult => ({ code: 1, stdout: "", stderr: `the supervisor pass calls no gh: ${args.join(" ")}` });
-		const pass = () => tick({
-			ledger, gh, launch: (wl) => ({ code: 0, line: `launched ${wl}` }), notify: () => true,
-			moveAlert: { spawn: (argv) => (spawned.push(argv.at(-1)!), 9000 + spawned.length), probe: (pid) => live.has(pid), kill: (pid) => kills.push(pid) },
-		});
-		const plusSeconds = (s: number) => c.at(new Date(Date.parse(c.now()) + s * 1000).toISOString());
-		return { ledger, open, closed, live, spawned, kills, move, row, rowsOf, pass, plusSeconds };
-	}
-
-	test("dead, stalled and unstarted claims are settled over open and closed workloads, and move-alert is spawned for each", () => {
-		const s = supervised();
-		const dead = s.move(s.open);
-		s.row(s.open, dead, "comment claim pid=500 attempt=1");
-		const stalled = s.move(s.open);
-		s.row(s.open, stalled, "comment claim pid=501 attempt=1");
-		s.live.add(501);
-		const quiet = s.move(s.closed);
-		s.ledger.closeWorkload(s.closed, { by: SURFACE_BY });
-		s.plusSeconds(181);
-		const log = s.pass();
-		expect(s.rowsOf(s.open, dead).slice(1)).toEqual(["comment failed worker 500 ended without a result", "popup unstarted no claim 181 s after the move", "comment spawning", "popup spawning"]);
-		expect(s.kills).toEqual([501]);
-		expect(s.rowsOf(s.open, stalled)[1]).toBe("comment failed stalled: no comment result after 181 s (pid 501)");
-		expect(s.rowsOf(s.closed, quiet)).toEqual([
-			"comment unstarted no claim 181 s after the move", "popup unstarted no claim 181 s after the move", "comment spawning", "popup spawning",
-		]);
-		expect(s.spawned).toEqual([dead, stalled, quiet]);
-		expect(log).toContain(`${s.closed}: move-alert ${quiet}: move-alert spawned for comment, popup: pid 9003`);
-		// The next pass, inside a minute of the spawns, spawns nothing more: each spawned worker has its minute to claim.
-		s.plusSeconds(30);
-		s.pass();
-		expect(s.spawned).toHaveLength(3);
-	});
-
-	test("a spawned worker that never claims costs an attempt, and the third failed attempt ends the spawns", () => {
-		const s = supervised();
-		const e = s.move(s.open);
-		for (let tickNo = 0; tickNo < 6; tickNo++) {
-			s.plusSeconds(300);
-			s.pass();
-		}
-		// Unstarted after the move, then after each of two spawns: three attempts, so exhausted, and no third spawn.
-		expect(s.spawned).toEqual([e, e]);
-		expect(s.rowsOf(s.open, e).filter((r) => r.startsWith("comment"))).toEqual([
-			"comment unstarted no claim 300 s after the move", "comment spawning", "comment unstarted no claim 300 s after the spawn", "comment spawning",
-			"comment unstarted no claim 300 s after the spawn",
-		]);
-		expect(errorLines(s.ledger, undefined, { movePidProbe: () => false }).find((l) => l.kind === "quota-move-alert")?.line).toEndWith(`— run bun surface/scripts/lane.ts move-alert ${s.open} ${e} --again`);
-	});
-
-	test("nothing is settled or spawned for a move whose channels are ok, exhausted, running, or waiting on Jo", () => {
-		const s = supervised();
-		const ok = s.move(s.closed);
-		for (const r of ["comment claim pid=1 attempt=1", "comment ok https://github.com/x/y/issues/1#issuecomment-1", "popup claim pid=1 attempt=1", "popup showing", "popup ok Dismiss (no voice)"]) s.row(s.closed, ok, r);
-		const exhausted = s.move(s.open);
-		for (let n = 1; n <= 3; n++) {
-			s.row(s.open, exhausted, `comment claim pid=${n} attempt=${n}`);
-			s.row(s.open, exhausted, "comment failed gh issue create exited 1: HTTP 502");
-		}
-		s.row(s.open, exhausted, "popup claim pid=3 attempt=1");
-		s.row(s.open, exhausted, "popup showing");
-		s.row(s.open, exhausted, "popup ok Dismiss (no voice)");
-		s.plusSeconds(3600);
-		const running = s.move(s.open);
-		s.row(s.open, running, "comment claim pid=600 attempt=1");
-		const waiting = s.move(s.open);
-		for (const r of ["comment claim pid=601 attempt=1", "comment ok https://github.com/x/y/issues/2#issuecomment-1", "popup claim pid=601 attempt=1", "popup showing"]) s.row(s.open, waiting, r);
-		s.live.add(600);
-		s.live.add(601);
-		s.plusSeconds(120);
-		const before = [ok, exhausted, running, waiting].map((e) => s.rowsOf(e === ok ? s.closed : s.open, e).length);
-		s.pass();
-		expect([ok, exhausted, running, waiting].map((e) => s.rowsOf(e === ok ? s.closed : s.open, e).length)).toEqual(before);
-		expect(s.spawned).toEqual([]);
-		expect(s.kills).toEqual([]);
 	});
 });

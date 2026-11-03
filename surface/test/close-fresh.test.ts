@@ -25,7 +25,7 @@ import { autoboardCandidates, landFirstRows, openTrains, trainAutoboardBody, tra
 import { type ExecCounts, testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
 import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY, type SurfaceAPI } from "../src/types";
 import { clock, tempLedger, tmp } from "./helpers";
-import { fakeGh, REPO as TICK_REPO } from "./train-world";
+import { fakeGh, REPO as TICK_REPO, tickAlerts } from "./train-world";
 
 // Every test spawns real git and the fake gh many times (3-4 s idle); on a loaded runner the 5 s
 // bun default killed them mid-check (tr-0mvqeuifhqv87ca: 4 timeouts, the close check reading -1).
@@ -1376,7 +1376,8 @@ describe("PLAN wl-mvq4edbaf13vnk D9, R23: a fast green at a merged head is cover
 				}
 				return r;
 			},
-			launch: () => ({ code: 6, line: "fixture cap" }), notify: () => true,
+			// the alert pass on recording seams over a jo-issues of its own (train-world.ts `tickAlerts`): nothing real
+			launch: () => ({ code: 6, line: "fixture cap" }), alerts: tickAlerts(fakeGh()).alerts,
 		});
 		const trains = openTrains(x.ledger);
 		expect(trains).toHaveLength(1);
@@ -1533,7 +1534,7 @@ describe("schema recovery through the tick and real verified promotion", () => {
 		const notices = fakeGh();
 		const tickLogs = trainTick({
 			ledger: x.ledger, config: { repos: [{ origin: OWNER_REPO, command: "bun test" }] },
-			launch: () => ({ code: 6, line: "fixture cap" }), notify: () => true,
+			launch: () => ({ code: 6, line: "fixture cap" }), alerts: tickAlerts(fakeGh()).alerts,
 			gh: (args) => {
 				const p = `repos/${OWNER_REPO}/`;
 				if (args[0] === "api" && args[1] === `${p}git/ref/heads/main`) return answer({ object: { sha: target } });
