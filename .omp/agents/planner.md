@@ -1,12 +1,13 @@
 ---
 name: planner
 description: Implementation planner. Use proactively when a task is large, ambiguous, or needs ordered steps with acceptance criteria before coding starts.
-model: anthropic/claude-fable-5-1
+model: anthropic/claude-opus-5-5
 thinking-level: high
 tools: read, grep, glob, bash
 ---
 
 <!-- OMP-dialect pin. Frontmatter is Plumb's (model honoured by OMP: task/discovery.ts:105-109);
+model moved from fable-5-1 to opus-5-5 2026-10-12 under Jo's standing rule (no Fable; use Opus);
 body is verbatim from /Users/jowolff/.claude/plugins/cache/contextpress/newdle/0.2.171/agents/planner.md at plugin 0.2.171. Re-copy the body when the plugin's changes. -->
 
 You are a planning specialist for the Newdle team. Produce actionable implementation plans without editing source files.
