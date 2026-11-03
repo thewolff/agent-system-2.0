@@ -21,14 +21,15 @@ import { errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
 import { apply, applyTrain, interpret } from "../src/input";
 import {
-	controlEntries, decideLaunch, laneExitBody, laneReadyBody, launchFailedBody, launchRequestedBody, launchRowsFor, landFirstBody, landFirstInstructionBody, mainRetryBody, mainRetryInstructionBody,
-	planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody,
+	controlEntries, decideLaunch, laneExitBody, laneHeadroomBody, laneReadyBody, launchFailedBody, launchRequestedBody, launchRowsFor, landFirstBody, landFirstInstructionBody, mainRetryBody,
+	mainRetryInstructionBody, planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody,
 } from "../src/launch";
 import {
 	actionable, type ControlRoot, fixBindings, landFirstNoticeBody, landFirstRows, latestTrainReconciled, mainRedNotices, protectionEpisodes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs,
 	retireSupersededFullSlices, testRunStarts, TRAIN_LAUNCH_OPTIONS, TRAIN_METER_OPTIONS, TRAIN_STALL_OPTIONS, trainAlertBody, trainAlertMarker, trainAttemptsOf, trainFullSliceId, trainHeadWokenBody, trainHoldBody, trainLaunchFailures, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody, type WakeDeferral,
 } from "../src/merge-train";
 import { trainMergedNoticeBody } from "../src/notice";
+import { recordQuotaMove } from "../src/quota-move-alert";
 import { fastPlanBody, makeRunId, testRequestedBody, testRunBody, testRuns, withFullSuitePublication } from "../src/test-run";
 import { ESCALATION_BY, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { releasedOpenBody } from "../src/turn-end";
@@ -36,7 +37,7 @@ import {
 	boardWorld, carry305, COMMIT_FILES_CAP, COMMIT_FILES_PER_PAGE, DECISION_LOG_FILE, type FakeDiffEntry, type FakeIssue, H0, H1, H2, JO, launchReady, OWNER_LANE, protectedRules, REPO, TRAIN_LANE,
 	world,
 } from "./train-world";
-import { tmp } from "./helpers";
+import { clock, tempLedger, tmp } from "./helpers";
 import type { RankConfig } from "../src/rank-launch";
 // A namespace import, as lane-script.test.ts does: a name lane.ts stops exporting fails only the test that calls it.
 import * as laneScript from "../scripts/lane";
@@ -2068,5 +2069,106 @@ describe("the permanent train in the tick (PLAN wl-mvr888nftz0vcl D5, D6, D8, D9
 		expect(retired()).toHaveLength(1);
 		expect(w.ledger.slice(full1)!.rev).toBe(rev);
 		expect(states()).toEqual({ ...open, [full1]: "cancelled" });
+describe("the move-alert supervisor pass (PLAN wl-mvwk0v0gmp6cjc D4, R8)", () => {
+	const A = "anthropic/claude-opus-5-5";
+	const SOL = "openai-codex/gpt-6.1-sol";
+	const LANE = "lane-qm-1";
+
+	/**
+	 * A ledger on a settable clock with the standing workload (where a closed workload's alert rows go), a failing gh (the pass
+	 * calls none), and the pass's fake spawn, pid probe and SIGTERM.
+	 */
+	function supervised() {
+		const c = clock("2026-11-02T10:00:00.000Z");
+		const { ledger } = tempLedger(c.now);
+		ensureStandingWorkload(ledger);
+		const open = ledger.openWorkload({ by: SURFACE_BY, brief: "open workload with moves", stakes: "normal", mode: "autonomous" });
+		const closed = ledger.openWorkload({ by: SURFACE_BY, brief: "closed workload with moves", stakes: "normal", mode: "autonomous" });
+		const live = new Set<number>();
+		const spawned: string[] = [];
+		const kills: number[] = [];
+		const move = (wl: string) => recordQuotaMove(ledger, { workloadId: wl, laneId: LANE, kind: "lane", from: A, to: SOL, reason: "anthropic 7d 0.95 used", by: LANE_RUNNER_BY, eventBody: laneHeadroomBody(LANE, A, SOL, "anthropic 7d 0.95 used") });
+		const row = (wl: string, e: string, rest: string) => ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: `quota-move-alert: ${e} ${rest}` });
+		/** The move's alert rows, oldest first, on its workload and the standing one. */
+		const rowsOf = (wl: string, e: string) =>
+			[...ledger.entries(wl, "assumption"), ...ledger.entries(STANDING_WORKLOAD_ID, "assumption")]
+				.filter((x) => x.created_by === LANE_RUNNER_BY && x.body.startsWith(`quota-move-alert: ${e} `))
+				.sort((a, b) => a.created_at.localeCompare(b.created_at))
+				.map((x) => x.body.slice(`quota-move-alert: ${e} `.length));
+		const gh = (args: string[]): GhResult => ({ code: 1, stdout: "", stderr: `the supervisor pass calls no gh: ${args.join(" ")}` });
+		const pass = () => tick({
+			ledger, gh, launch: (wl) => ({ code: 0, line: `launched ${wl}` }), notify: () => true,
+			moveAlert: { spawn: (argv) => (spawned.push(argv.at(-1)!), 9000 + spawned.length), probe: (pid) => live.has(pid), kill: (pid) => kills.push(pid) },
+		});
+		const plusSeconds = (s: number) => c.at(new Date(Date.parse(c.now()) + s * 1000).toISOString());
+		return { ledger, open, closed, live, spawned, kills, move, row, rowsOf, pass, plusSeconds };
+	}
+
+	test("dead, stalled and unstarted claims are settled over open and closed workloads, and move-alert is spawned for each", () => {
+		const s = supervised();
+		const dead = s.move(s.open);
+		s.row(s.open, dead, "comment claim pid=500 attempt=1");
+		const stalled = s.move(s.open);
+		s.row(s.open, stalled, "comment claim pid=501 attempt=1");
+		s.live.add(501);
+		const quiet = s.move(s.closed);
+		s.ledger.closeWorkload(s.closed, { by: SURFACE_BY });
+		s.plusSeconds(181);
+		const log = s.pass();
+		expect(s.rowsOf(s.open, dead).slice(1)).toEqual(["comment failed worker 500 ended without a result", "popup unstarted no claim 181 s after the move", "comment spawning", "popup spawning"]);
+		expect(s.kills).toEqual([501]);
+		expect(s.rowsOf(s.open, stalled)[1]).toBe("comment failed stalled: no comment result after 181 s (pid 501)");
+		expect(s.rowsOf(s.closed, quiet)).toEqual([
+			"comment unstarted no claim 181 s after the move", "popup unstarted no claim 181 s after the move", "comment spawning", "popup spawning",
+		]);
+		expect(s.spawned).toEqual([dead, stalled, quiet]);
+		expect(log).toContain(`${s.closed}: move-alert ${quiet}: move-alert spawned for comment, popup: pid 9003`);
+		// The next pass, inside a minute of the spawns, spawns nothing more: each spawned worker has its minute to claim.
+		s.plusSeconds(30);
+		s.pass();
+		expect(s.spawned).toHaveLength(3);
+	});
+
+	test("a spawned worker that never claims costs an attempt, and the third failed attempt ends the spawns", () => {
+		const s = supervised();
+		const e = s.move(s.open);
+		for (let tickNo = 0; tickNo < 6; tickNo++) {
+			s.plusSeconds(300);
+			s.pass();
+		}
+		// Unstarted after the move, then after each of two spawns: three attempts, so exhausted, and no third spawn.
+		expect(s.spawned).toEqual([e, e]);
+		expect(s.rowsOf(s.open, e).filter((r) => r.startsWith("comment"))).toEqual([
+			"comment unstarted no claim 300 s after the move", "comment spawning", "comment unstarted no claim 300 s after the spawn", "comment spawning",
+			"comment unstarted no claim 300 s after the spawn",
+		]);
+		expect(errorLines(s.ledger, undefined, { movePidProbe: () => false }).find((l) => l.kind === "quota-move-alert")?.line).toEndWith(`— run bun surface/scripts/lane.ts move-alert ${s.open} ${e} --again`);
+	});
+
+	test("nothing is settled or spawned for a move whose channels are ok, exhausted, running, or waiting on Jo", () => {
+		const s = supervised();
+		const ok = s.move(s.closed);
+		for (const r of ["comment claim pid=1 attempt=1", "comment ok https://github.com/x/y/issues/1#issuecomment-1", "popup claim pid=1 attempt=1", "popup showing", "popup ok Dismiss (no voice)"]) s.row(s.closed, ok, r);
+		const exhausted = s.move(s.open);
+		for (let n = 1; n <= 3; n++) {
+			s.row(s.open, exhausted, `comment claim pid=${n} attempt=${n}`);
+			s.row(s.open, exhausted, "comment failed gh issue create exited 1: HTTP 502");
+		}
+		s.row(s.open, exhausted, "popup claim pid=3 attempt=1");
+		s.row(s.open, exhausted, "popup showing");
+		s.row(s.open, exhausted, "popup ok Dismiss (no voice)");
+		s.plusSeconds(3600);
+		const running = s.move(s.open);
+		s.row(s.open, running, "comment claim pid=600 attempt=1");
+		const waiting = s.move(s.open);
+		for (const r of ["comment claim pid=601 attempt=1", "comment ok https://github.com/x/y/issues/2#issuecomment-1", "popup claim pid=601 attempt=1", "popup showing"]) s.row(s.open, waiting, r);
+		s.live.add(600);
+		s.live.add(601);
+		s.plusSeconds(120);
+		const before = [ok, exhausted, running, waiting].map((e) => s.rowsOf(e === ok ? s.closed : s.open, e).length);
+		s.pass();
+		expect([ok, exhausted, running, waiting].map((e) => s.rowsOf(e === ok ? s.closed : s.open, e).length)).toEqual(before);
+		expect(s.spawned).toEqual([]);
+		expect(s.kills).toEqual([]);
 	});
 });

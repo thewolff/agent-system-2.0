@@ -14,7 +14,8 @@
   again. AS2_BUN, AS2_REPO and AS2_LEDGER_DB are the needs-you writer's (install/drive-backup/lib.zsh); AS2_KEEP_LOCAL
   is the installer's value (1 uploads and proves but never deletes a local archive). The script sets its own PATH.
   AbandonProcessGroup lets the detached alert wrapper outlive the run; RunAtLoad is off, so loading never starts
-  a run.
+  a run. MaterializeDatalessFiles is on because launchd's default is off: a launchd job then cannot read an evicted
+  Drive file (the read fails with EDEADLK), and the restore test and the deletion re-proof must download one.
 -->
 <plist version="1.0">
 <dict>
@@ -54,6 +55,8 @@
 	<key>ProcessType</key>
 	<string>Background</string>
 	<key>AbandonProcessGroup</key>
+	<true/>
+	<key>MaterializeDatalessFiles</key>
 	<true/>
 	<key>RunAtLoad</key>
 	<false/>

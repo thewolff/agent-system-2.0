@@ -30,6 +30,7 @@ import { queuePosition, startedIdle } from "../src/rank-launch";
 import { oneLiner } from "../src/render";
 import { surfaceSession } from "../src/session";
 import { inferMode, inferStakes, type JudgedSize, judgedLarge, planFirstTrigger, saidNoPlan, saidPlanIt } from "../src/stakes";
+import { trustedQuotaMove } from "../src/quota-move-alert";
 import { parseSecurityRed, SECURITY_RED_PREFIX } from "../src/test-run";
 import {
 	CLOSE_WORKLOAD_TOOL, type Ctx, DUE_PREFIX, IDENTITY_TOOL, MODE_WORDS, OPEN_WORKLOAD_TOOL, ORCHESTRATOR_RECIPIENT, RECORD_INSTRUCTION_TOOL, SCHEDULE_TOOL,
@@ -68,14 +69,16 @@ const HELD_BODY_MAX = 200;
 
 /**
  * PLAN wl-mvbcjageg7o2yo § 2.5: inside the close transaction, ordinary held orchestrator-bound
- * messages move to `delivered`. Trusted security reds keep their dedicated closed-workload route
- * (`securityRedLines` / `consumeAllToOrchestrator`), so they still reach Jo before being delivered.
+ * messages move to `delivered`. Trusted security reds and trusted quota moves (`trustedQuotaMove`,
+ * PLAN wl-mvwk0v0gmp6cjc D4) keep their dedicated closed-workload route (`securityRedLines` /
+ * `quotaMoveLines` / `consumeAllToOrchestrator`), so they still reach Jo before being delivered.
  * Returns only the rows delivered here.
  */
 function deliverHeldAtClose(ledger: Ledger, id: string): MessageRow[] {
 	const held = ledger.db.query<MessageRow, [string, string]>(
 		"SELECT * FROM messages WHERE workload_id = ?1 AND state = 'held' AND recipient = ?2 ORDER BY created_at, rowid").all(id, ORCHESTRATOR_RECIPIENT)
-		.filter((m) => !(m.created_by === TEST_RUNNER_BY && m.body.startsWith(SECURITY_RED_PREFIX) && parseSecurityRed(m.body)?.workloadId === id));
+		.filter((m) => !(m.created_by === TEST_RUNNER_BY && m.body.startsWith(SECURITY_RED_PREFIX) && parseSecurityRed(m.body)?.workloadId === id))
+		.filter((m) => trustedQuotaMove(ledger, m) === null);
 	for (const m of held) ledger.advanceMessage(m.id, "delivered", { by: SURFACE_BY });
 	return held;
 }

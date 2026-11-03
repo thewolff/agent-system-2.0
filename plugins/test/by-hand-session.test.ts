@@ -28,6 +28,7 @@ import { recordRepo } from "../../surface/src/decision-log";
 import { controlEntries, doneBody, holdersOf, laneDir, laneStarted } from "../../surface/src/launch";
 import { SURFACE_BY } from "../../surface/src/types";
 import { alive, type LaneRoot, settleDrains, until } from "../../surface/test/helpers";
+import { FAKES_DIR, fakeCalls, LEDGER_BACKUP_LABEL, launchctlPrint, plistPath, setFake, writeHealthyState } from "../../surface/test/fixtures/doctor-fakes/state";
 import { NUDGE } from "../ask-graham/skills/ask-graham/scripts/intensity.mjs";
 import { BLOCK_REASON } from "../ask-graham/skills/ask-graham/scripts/verdict.mjs";
 import { HAS_OMP, OMP, OMP_SKIP, PAIR_TOOLS } from "./omp-host.ts";
@@ -262,16 +263,26 @@ beforeAll(async () => {
 	w = { root, home, repo: join(root, "repo"), ledgerPath: join(home, ".agent-system-2", "ledger.db"), env, stub, byHandWl, autoWl, requests, runs: [] };
 
 	// The profile, as a fresh machine gets it (install/fresh-machine-test.sh run_install), then the stub's routes over it.
-	// The installer never gets the developer PATH (only Bun and system utilities, as ledger/test/install.test.ts does), so it
-	// cannot reach a real herdr or ctx: a real herdr would register its plugin under this scratch HOME, and its socket path
-	// there can exceed sun_path. The session below keeps env.PATH, since it needs the installed OMP.
+	// The installer never gets the developer PATH (the as2 doctor's shared fakes first, then Bun and system utilities, as
+	// ledger/test/install.test.ts does), so it cannot reach a real herdr, ctx or launchctl: a real herdr would register its
+	// plugin under this scratch HOME, and its socket path there can exceed sun_path. Its closing doctor answers from a healthy
+	// fake machine (writeHealthyState) whose ledger-backup is the job this install writes, loaded and not yet run. The
+	// session below keeps env.PATH, since it needs the installed OMP.
 	const installBin = join(root, "install-bin");
 	mkdirSync(installBin);
 	symlinkSync(process.execPath, join(installBin, "bun"));
-	const installPath = `${installBin}:/usr/bin:/bin`;
-	for (const bin of ["herdr", "ctx"]) if (Bun.which(bin, { PATH: installPath })) throw new Error(`${bin} is on the installer PATH ${installPath}`);
-	const install = await run("install.sh", ["bash", join(REPO, "install", "install.sh")], REPO, { PATH: installPath, HOME: home }, "");
-	if (install.code !== 0) throw new Error(`install.sh exited ${install.code}: ${install.err.slice(-2000)}`);
+	const installPath = `${FAKES_DIR}:${installBin}:/usr/bin:/bin`;
+	if (Bun.which("herdr", { PATH: installPath })) throw new Error(`herdr is on the installer PATH ${installPath}`);
+	for (const bin of ["ctx", "launchctl"]) if (Bun.which(bin, { PATH: installPath }) !== join(FAKES_DIR, bin)) throw new Error(`${bin} on the installer PATH ${installPath} is not the doctor's fake`);
+	const fakeState = join(root, "doctor-fakes");
+	writeHealthyState({ state: fakeState, home: join(fakeState, "healthy-home"), repo: REPO, seatPid: process.pid, bun: process.execPath });
+	const backupPlist = plistPath(home, LEDGER_BACKUP_LABEL);
+	const backupLog = join(home, ".agent-system-2", "ledger-backup.log");
+	setFake(fakeState, `plutil/${LEDGER_BACKUP_LABEL}.plist.json`, JSON.stringify({ Label: LEDGER_BACKUP_LABEL, ProgramArguments: [process.execPath], StartInterval: 3600, StandardOutPath: backupLog, StandardErrorPath: backupLog }));
+	setFake(fakeState, `launchctl/${LEDGER_BACKUP_LABEL}`, launchctlPrint({ label: LEDGER_BACKUP_LABEL, path: backupPlist, log: backupLog, runs: 0, exit: "never" }));
+	const install = await run("install.sh", ["bash", join(REPO, "install", "install.sh")], REPO, { PATH: installPath, HOME: home, AS2_FAKE_STATE: fakeState }, "");
+	if (install.code !== 0) throw new Error(`install.sh exited ${install.code}: ${install.out.slice(-2000)}${install.err.slice(-2000)}`);
+	if (!fakeCalls(fakeState).includes("ctx daemon status --format json")) throw new Error(`install.sh's closing doctor never asked the fake ctx (${fakeState}/calls.log)`);
 	writeStubProfile(join(home, ".omp", "profiles", "agent-system-2", "agent"), stub.port);
 	// Jo's ask-graham setting (plugins/VENDOR.md): every idea gets the nudge.
 	mkdirSync(join(home, ".config", "ask-graham"), { recursive: true });

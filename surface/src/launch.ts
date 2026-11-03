@@ -95,6 +95,7 @@ export const CONTROL_PREFIXES = [
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
 	"queued",
 	"lane-metrics", "daily-report", "drive-backup",
+	"doctor-strike", "doctor-down", "doctor-up", "doctor-popup", "doctor-boot",
 	"now", "ruling-conflict",
 	"land-first", "main-retry", "train-reconciled", "runner-preflight", "fast-plan", "fast-fallback", "status-failed",
 	"land-first-off-pending", "land-first-off-complete",
@@ -113,6 +114,8 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
 export const DAILY_REPORT_BY = "daily-report";
 /** The Drive backup jobs' needs-you writer's `created_by` (surface/scripts/drive-backup-notice.ts), on the standing workload. */
 export const DRIVE_BACKUP_BY = "drive-backup";
+/** `as2 doctor`'s `created_by` (surface/src/doctor.ts: the tick's ctx step, the after-restart job, terminal runs and the popup process), on the standing workload. */
+export const DOCTOR_BY = "as2-doctor";
 /**
  * Fixed writers per prefix (§ 5). `lane-stop`, `plan` and `done-because` are refined in `validWriter`. The
  * starter writes `lane-started:` / `lane-exit:` for the interactive lane it runs in Jo's terminal
@@ -219,6 +222,10 @@ export const DRIVE_BACKUP_BY = "drive-backup";
  * `train-attempt: pr <n> attempt <m>` (m ≥ 2; PLAN wl-mvr888nftz0vcl, review r1 F3) records that a membership row began PR n's
  * attempt m, decided once in the membership's own transaction; its writer is the membership row's: the surface beside Jo's
  * `train:` (SURFACE_BY), the train tick beside its `train-board:` (MERGE_TRAIN_BY). `trainAttempts` reads attempts from it alone.
+ * `as2 doctor`'s rows (PLAN wl-mvwks11ye3x9zu § Alerts, surface/src/doctor-entries.ts) are DOCTOR_BY's alone, on the standing workload:
+ * `doctor-strike:` (a first failing tick of the ctx part), `doctor-down:` / `doctor-up:` (a part's episode opens and clears; an open
+ * down is a `report` needs-you line), `doctor-popup:` (a popup process's claim and its outcome, the attempt budget) and
+ * `doctor-boot:` (the after-restart run's once-per-boot mark). A copy by any other writer is dropped here, so nothing forges or clears an alert.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -283,6 +290,11 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"lane-metrics": [LANE_RUNNER_BY],
 	"daily-report": [DAILY_REPORT_BY],
 	"drive-backup": [DRIVE_BACKUP_BY],
+	"doctor-strike": [DOCTOR_BY],
+	"doctor-down": [DOCTOR_BY],
+	"doctor-up": [DOCTOR_BY],
+	"doctor-popup": [DOCTOR_BY],
+	"doctor-boot": [DOCTOR_BY],
 	now: [ESCALATION_BY],
 	"ruling-conflict": [ESCALATION_BY],
 	"land-first": [SURFACE_BY],

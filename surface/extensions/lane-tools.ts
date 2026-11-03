@@ -78,6 +78,7 @@ import {
 import { DEFAULT_BRANCH } from "../src/merge-train-stack";
 import { NOTICE_PREFIX, sendNotice } from "../src/notice";
 import { PAIR_OPTION } from "../src/pair-suggest";
+import { QUOTA_MOVE_PREFIX } from "../src/quota-move-alert";
 import { expandCallerHandles } from "../src/linked-api";
 import { SECURITY_RED_PREFIX, SHA_RE, testRuns } from "../src/test-run";
 import { releasedIdleBody, releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
@@ -102,7 +103,9 @@ const SLICE_ID_RE = /^sl-\S+$/;
 const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text: t }], details });
 
 /** Message bodies the machinery writes and the surface reads as signals; a lane's own message must not open with one. */
-const PUSHED_SIGNAL_PREFIXES = [LANE_DIED_PREFIX, PROMPT_WAIT_PREFIX, PROMPT_RESOLVED_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, TEST_RUN_FAILED_PREFIX, NOTICE_PREFIX, SECURITY_RED_PREFIX];
+const PUSHED_SIGNAL_PREFIXES = [
+	LANE_DIED_PREFIX, PROMPT_WAIT_PREFIX, PROMPT_RESOLVED_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, TEST_RUN_FAILED_PREFIX, NOTICE_PREFIX, SECURITY_RED_PREFIX, QUOTA_MOVE_PREFIX,
+];
 
 /** The slice kinds `lane_add_slice` takes; the routing kinds, so the plan slice is `judge` (SPEC § B6). */
 const SLICE_KINDS = ["locate", "understand", "change-small", "change-large", "judge"] as const;

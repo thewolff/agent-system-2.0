@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Fixtures for the server-read gate, built the way the round-3 reviewer built theirs: a copy of the real helper
-# with only /usr/bin/osascript, /usr/bin/stat and /usr/bin/shasum swapped for stubs that model what macOS
+# with only /usr/bin/osascript, /usr/bin/stat and /bin/cat swapped for stubs that model what macOS
 # reports. Every scan, wait and decision in the helper runs unchanged.
 #   zsh test-server-read.zsh [<helper>] [<work dir>]
 # Defaults: ./server-read.zsh, a new temp dir (left in place). Prints PASS/FAIL lines; exits with the failures.
@@ -23,8 +23,8 @@ print "server-read fixtures for $HELPER in $W"
 
 # fixture <name>: a fresh dir with account/content_cache (a chunks.db with the schema verified on the real
 # DriveFS, empty; an empty METADATA; d0, d1), a 1 MiB target, stubs, and the helper copy run.zsh. stat-stub
-# reports dataless until $D/materialized exists, then materialized; shasum-stub materializes the target (as a
-# real read would) unless $D/read-no-download exists.
+# reports dataless until $D/materialized exists, then materialized; cat-stub (the helper's read) materializes the
+# target (as a real read would) unless $D/read-no-download exists.
 fixture() {
   D=$W/$1; mkdir -p $D/account/content_cache/d0 $D/account/content_cache/d1 || exit 99
   /usr/bin/sqlite3 $D/account/content_cache/chunks.db 'CREATE TABLE ranges (id INTEGER PRIMARY KEY NOT NULL, ranges_proto BLOB)' || exit 99
@@ -36,14 +36,14 @@ fixture() {
 print call >> $D/stat-count
 if [[ -e $D/materialized ]]; then print "64 2048 1048576"; else print "1073741824 0 1048576"; fi
 EOF
-  cat > $D/shasum-stub <<EOF
+  cat > $D/cat-stub <<EOF
 #!/bin/zsh
 [[ -e $D/read-no-download ]] || : > $D/materialized
-exec /usr/bin/shasum "\$@"
+exec /bin/cat "\$@"
 EOF
   chmod +x $D/*-stub
   : > $D/stat-count
-  sed -e "s#/usr/bin/osascript#$D/osascript-stub#g" -e "s#/usr/bin/stat #$D/stat-stub #g" -e "s#/usr/bin/shasum#$D/shasum-stub#g" \
+  sed -e "s#/usr/bin/osascript#$D/osascript-stub#g" -e "s#/usr/bin/stat #$D/stat-stub #g" -e "s#/bin/cat #$D/cat-stub #g" \
     "$HELPER" > $D/run.zsh
 }
 run() { OUT=$(/bin/zsh $D/run.zsh $D/target $D/account 2>&1); RC=$?; print -r -- "  [$1] exit $RC: ${OUT//$'\n'/ | }" }
@@ -187,6 +187,19 @@ export AS2_CLOCK_CMD="/bin/zsh $D/clock"; run drain-deadline; unset AS2_CLOCK_CM
 [[ $RC != 0 && $OUT == *"can still hold 1048576 bytes after the drain wait"* && $(wc -l < $D/clock-reads) -eq 46 ]] \
   && ok "a cache that holds a full copy for the whole drain wait: refused after all 24 scans" \
   || bad "a cache that holds a full copy for the whole drain wait: refused after all 24 scans"
+
+# 18. the read fails (launchd's default policy: materialization off, so read() of a dataless file gives EDEADLK):
+#     refused with the reader's error and the materialization hint, and no sha256 line (no hash of a short read)
+fixture read-fails
+cat > $D/cat-stub <<EOF
+#!/bin/zsh
+print -u2 "cat: \$2: Resource deadlock avoided"
+exit 1
+EOF
+run read-fails
+[[ $RC != 0 && $OUT == *"read failed: cat: "*"Resource deadlock avoided"* && $OUT == *MaterializeDatalessFiles* && $OUT != *sha256=* ]] \
+  && ok "a read that fails with EDEADLK: refused with the error and the materialization hint, no hash" \
+  || bad "a read that fails with EDEADLK: refused with the error and the materialization hint, no hash"
 
 print "RESULT: $FAILS failure(s)"
 exit $FAILS
