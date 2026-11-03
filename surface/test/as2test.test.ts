@@ -14,7 +14,7 @@ import { afterAll, test as bunTest, describe, expect } from "bun:test";
 import * as childProcess from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
-	chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync,
+	chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync,
 } from "node:fs";
 import { userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -763,6 +763,17 @@ function capturePids(text: string): number[] {
 }
 /** What a capture may leave in the work dir besides its file: its cap dir or a sample report. */
 const captureLeftovers = (work: string): string[] => readdirSync(work).filter((n) => n.includes(".stuck-") || n.startsWith("sample-"));
+/**
+ * The persist refusal for a hostile groups file at `path`. A symlink fails its O_NOFOLLOW open (ELOOP). A FIFO fails its
+ * O_WRONLY|O_NONBLOCK open with ENXIO while no process holds its read end; when one does (`readerHeld`, or anything else
+ * in the full suite that opens the pathname), the open succeeds and the fstat check refuses it. Both refuse without
+ * blocking or writing, so with no reader held by the case either stage is the refusal.
+ */
+function groupsRefusal(how: "fifo" | "symlink", path: string, readerHeld = false): RegExp {
+	const validate = "validate failed: not a regular file";
+	const stage = how === "symlink" ? "open failed: [^\\n]*ELOOP" : readerHeld ? validate : `(?:open failed: [^\\n]*ENXIO|${validate})`;
+	return new RegExp(`timeout cleanup: cannot persist descendant groups to ${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}: ${stage}`);
+}
 
 // ---- the wrapper's argv checks ---------------------------------------------------------------------------
 
@@ -1236,8 +1247,7 @@ describe("fullWorkers: the PR full part runs its files at once; base and a keyle
 				expect(code).toBe(WRAPPER_EXIT.failed);
 				const stderr = await new Response(p.stderr).text();
 				expect(stderr).toContain("timeout: the part passed its cap of 2400 ms; its group was killed");
-				expect(stderr).toContain(`timeout cleanup: cannot persist descendant groups to ${join(work, "groups")}`);
-				expect(stderr).toContain("open failed:");
+				expect(stderr).toMatch(groupsRefusal(how, join(work, "groups")));
 				expect(lstatSync(join(work, "groups"))[how === "fifo" ? "isFIFO" : "isSymbolicLink"]()).toBe(true);
 				expect(readFileSync(target, "utf8")).toBe("UNCHANGED\n");
 				// Do not sweep: its existing pathname read is unsafe for this deliberately hostile groups file.
@@ -2477,6 +2487,9 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 			writeFileSync(target, "UNCHANGED\n");
 			writeFileSync(`${hook}.pause`, "");
 			const p = spawnCall(b, { sub: "full", runId });
+			// The fifo case holds the FIFO's read end, so the wrapper's non-blocking write open succeeds and its fstat check
+			// must refuse; the symlink case's O_NOFOLLOW open refuses first.
+			let reader: number | undefined;
 			try {
 				const { worker, zombie, ...ready } = await readySpin(work, p);
 				await exitOf(zombie);
@@ -2488,8 +2501,10 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 				const leader = Number(readFileSync(join(work, "groups"), "utf8").split("\n")[0]);
 				own(leader, late);
 				rmSync(join(work, "groups"));
-				if (how === "fifo") expect(Bun.spawnSync(["/usr/bin/mkfifo", join(work, "groups")], { timeout: 1_000 }).exitCode).toBe(0);
-				else symlinkSync(target, join(work, "groups"));
+				if (how === "fifo") {
+					expect(Bun.spawnSync(["/usr/bin/mkfifo", join(work, "groups")], { timeout: 1_000 }).exitCode).toBe(0);
+					reader = openSync(join(work, "groups"), constants.O_RDONLY | constants.O_NONBLOCK);
+				} else symlinkSync(target, join(work, "groups"));
 				writeFileSync(`${hook}.go`, "");
 				expect(await p.exited).toBe(WRAPPER_EXIT.stuck);
 				const stdout = await new Response(p.stdout).text();
@@ -2502,13 +2517,16 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 				expect(stopSet).toEqual(expect.arrayContaining([leader, helper, late]));
 				expect(stderr).toContain(`stuck: worker ${worker} spun ${STUCK_DEFAULTS.persistMs} ms in Bun.spawnSync with unreaped child ${zombie};`);
 				expect(stderr).toContain("containment unconfirmed:");
-				expect(stderr).toContain(`timeout cleanup: cannot persist descendant groups to ${join(work, "groups")}: open failed:`);
+				expect(stderr).toMatch(groupsRefusal(how, join(work, "groups"), how === "fifo"));
+				// Nothing reached the held read end: with no writer left, a read is end of file.
+				if (reader !== undefined) expect(readSync(reader, Buffer.alloc(64))).toBe(0);
 				expect(lstatSync(join(work, "groups"))[how === "fifo" ? "isFIFO" : "isSymbolicLink"]()).toBe(true);
 				expect(readFileSync(target, "utf8")).toBe("UNCHANGED\n");
 				// Do not sweep a hostile groups path; teardown must contain the processes itself: each one exits.
 				for (const pid of [leader, worker, helper, late]) await exitOf(pid);
 				expect(stopSet.filter((g) => alive(-g))).toEqual([]);
 			} finally {
+				if (reader !== undefined) closeSync(reader);
 				writeFileSync(`${hook}.go`, "");
 				if (p.exitCode === null) p.kill("SIGKILL");
 				await p.exited;

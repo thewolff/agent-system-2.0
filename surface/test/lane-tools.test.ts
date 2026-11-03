@@ -33,7 +33,7 @@ import { recordRepo, renderClose } from "../src/decision-log";
 import { openPlanPath } from "../src/plan-paths";
 import { quotaMoves } from "../src/quota-move-alert";
 import { ESCALATION_BY, LANE_FULL_TEST_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, HOW_IT_FAILS, notices, tempLedger, tempRepo, tmp } from "./helpers";
+import { ctxOf, fakePi, HOW_IT_FAILS, notices, tempLedger, tempRepo, tmp, typedTurn } from "./helpers";
 
 /** Jo's `land-first <repo> on|off` as the surface records it: his instruction, then `land-first:` naming it, on the standing workload. */
 function landFirst(ledger: Ledger, repo: string, on: boolean): void {
@@ -1703,7 +1703,7 @@ describe("mode flip at the surface", () => {
 		orchestratorSurface(f.pi, env, {});
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
-		await f.emit("before_agent_start", { prompt: "user-driven", systemPrompt: [] }, ctx);
+		await typedTurn(f, ctx, "user-driven");
 		const stop = ledger.entries(wl).find((e) => e.body.startsWith("lane-stop:"));
 		expect(stop?.body).toBe("lane-stop: lane-t-1 requested mode-flip by jo");
 		expect(stop?.created_by).toBe(SURFACE_BY);

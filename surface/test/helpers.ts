@@ -129,6 +129,16 @@ export function fakePi(tools = ["read", "bash", "ask", "task", "yield"], o: { ex
 	return { pi: pi as unknown as SurfaceAPI, emit, entries, sent, execs, active: () => active, tool, registered: () => [...registered.keys()], admit, context };
 }
 
+/**
+ * Jo types `prompt` (OMP's `input`, source interactive), then the turn starts on it: the surface applies a ledger command only
+ * from Jo's typed take (surface/extensions/surface-input.ts header; jo-issues #306). Returns what the fake host's
+ * `before_agent_start` returns.
+ */
+export async function typedTurn(f: { emit: (name: string, event: Record<string, unknown>, ctx: unknown) => Promise<unknown> }, ctx: unknown, prompt: string): Promise<unknown> {
+	await f.emit("input", { text: prompt, source: "interactive" }, ctx);
+	return f.emit("before_agent_start", { prompt, systemPrompt: [] }, ctx);
+}
+
 export const notices: string[] = [];
 /** The same notifications as `notices`, with the level each was notified at. */
 export const notified: { message: string; type?: string }[] = [];
