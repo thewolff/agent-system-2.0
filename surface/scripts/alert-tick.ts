@@ -46,6 +46,8 @@ import { ompPidState, runPs } from "../src/omp-probe";
 import { alertRows, commentMarker, issueMarker, quotaMoves } from "../src/quota-move-alert";
 import { type QuotaWatchResult, quotaWatchDeps, runQuotaWatch } from "../src/quota-watch";
 import { type LockRefusal, type RunnerLock, selfIdentity, takeRunnerLock } from "../src/runner-probe";
+import { EXTEND_SOURCE, parseCeiling } from "../src/ceiling";
+import { HALT_WORD, isRunnerCeilingQuestion } from "../src/input";
 import { STANDING_WORKLOAD_ID } from "../src/types";
 import {
 	ALERT_POPUP_SCRIPT, groupKey, type LegacyClaim, legacyPopupRecord, type Member, parsePs, POPUP_TAG_ENV, popupAttempts, type PopupAttempt, popupStatus, popupTag,
@@ -317,7 +319,7 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 	for (const wl of new Set([STANDING_WORKLOAD_ID, ...subjects.flatMap((s) => (s.workloadId === null ? [] : [s.workloadId]))])) acks.push(...alertAcks(ledger.instructions(wl)));
 	acks.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
 	const cleared = new Map<string, string>();
-	for (const [key, rec] of rec0) if (openEpisode(rec) !== null && !active.has(key)) cleared.set(key, clearedWhy(ledger, key, now));
+	for (const [key, rec] of rec0) if (openEpisode(rec) !== null && !active.has(key)) cleared.set(key, clearedWhy(ledger, key, now, openEpisode(rec)!.openedAt));
 	let actions: AlertAction[];
 	try {
 		actions = alertActions(subjects.filter((s) => !stopped.has(s.key)), new Map([...rec0].filter(([k]) => !stopped.has(k))), { issueStates, acks, cleared }, now);
@@ -514,8 +516,13 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 	}
 }
 
-/** Why a key that is no longer a subject cleared, when the ledger says (the close comment names it). */
-function clearedWhy(ledger: Ledger, key: string, now: string): string {
+/**
+ * Why a key that is no longer a subject cleared, when the ledger says (the close comment names it, D8). `since` is the open
+ * episode's start: only what happened after it cleared the alert. A ceiling names Jo's clearing word with its input id (the
+ * newest `extend`, `ceiling … <wl>` or `halt <wl>`, or `stop` answering the runner's ceiling question); a died alert names the
+ * relaunch or the live holder; a parked alert names the answer Jo gave. Anything else falls back to the workload's state.
+ */
+function clearedWhy(ledger: Ledger, key: string, now: string, since: string): string {
 	const [kind, id] = [key.slice(0, key.indexOf(":")), key.slice(key.indexOf(":") + 1)];
 	if (kind === "q") {
 		const q = ledger.question(id);
@@ -526,12 +533,39 @@ function clearedWhy(ledger: Ledger, key: string, now: string): string {
 		}
 		return `question ${id} was ${q.state}`;
 	}
-	if (id.startsWith("wl-")) {
-		const w = ledger.workload(id);
-		if (w === null) return `${id} is not on the ledger`;
-		if (w.status !== "open") return `${id} is ${w.status}`;
-		if (heldLive(w, now)) return `${w.holder} holds it`;
+	if (!id.startsWith("wl-")) return `${key} is no longer active`;
+	const w = ledger.workload(id);
+	if (w === null) return `${id} is not on the ledger`;
+	if (w.status !== "open") return `${id} is ${w.status}`;
+	const jo = ledger.instructions(id).filter((i) => i.author === "jo" && i.created_at >= since);
+	const said = (i: InstructionRow) => `Jo answered ${i.body.trim()} (${i.id})`;
+	if (kind === "ceiling") {
+		// `extend` and `ceiling <usd> [<hours>]` both record the instruction `ceiling: <usd> <hours>`; the `ceiling:` entry
+		// naming that instruction says which word it was (source EXTEND_SOURCE for extend), so the comment names Jo's word.
+		const raised = ledger.entries(id, "assumption").flatMap((e) => (e.body.startsWith("ceiling: ") ? [parseCeiling(e.body.slice("ceiling: ".length))] : []));
+		const halt = `${HALT_WORD} ${id}`;
+		const questions = ledger.questions(id);
+		const words = jo.flatMap((i): { i: InstructionRow; word: string }[] => {
+			const body = i.body.trim();
+			if (body === halt) return [{ i, word: halt }];
+			const c = raised.find((x) => x !== null && x.by === i.id);
+			if (c) return [{ i, word: c.source === EXTEND_SOURCE ? `extend ${id}` : `ceiling ${c.usd} ${Number((c.wallMin / 60).toFixed(2))} ${id}` }];
+			const q = i.kind === "answer" && i.question_id !== null ? questions.find((x) => x.id === i.question_id) : undefined;
+			return q !== undefined && body === "stop" && isRunnerCeilingQuestion(q) ? [{ i, word: `stop to ${q.id}` }] : [];
+		});
+		const clearing = words.at(-1);
+		if (clearing !== undefined) return `Jo answered ${clearing.word} (${clearing.i.id})`;
 	}
+	if (kind === "died") {
+		const relaunch = controlEntries(ledger.entries(id)).filter((c) => (c.prefix === "launch" || c.prefix === "lane-started") && c.createdAt >= since).at(-1);
+		if (relaunch !== undefined) return `${relaunch.laneId ?? "a lane"} was relaunched on ${id} (${relaunch.id}, ${relaunch.createdAt})`;
+		if (w.open_slices + w.paused_slices === 0) return `${id} has no open or paused slice left`;
+	}
+	if (kind === "parked") {
+		const answer = jo.filter((i) => i.kind === "answer").at(-1);
+		if (answer !== undefined) return `${said(answer)}${answer.question_id ? ` to ${answer.question_id}` : ""}`;
+	}
+	if (heldLive(w, now)) return `${w.holder} holds ${id}`;
 	return `${key} is no longer active`;
 }
 

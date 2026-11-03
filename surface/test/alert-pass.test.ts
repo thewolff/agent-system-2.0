@@ -1,13 +1,15 @@
 // The alert pass (PLAN wl-mw0vs9uc3xqtka D3; R1, R8-R24): one pass over a temp ledger with recording fakes for gh, the popup
 // spawn, ps and kill. No real gh, popup or signal is ever used.
 import { describe, expect, test } from "bun:test";
+import { LANE_STARTER_BY } from "../../ledger/src/index";
 import { alertMarker, alertRecords, openEpisode } from "../src/alert-path";
 import { apply, interpret } from "../src/input";
 import { ALERT_BY, alertPopupBody, controlEntries } from "../src/launch";
-import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { laneDiedShutdownBody } from "../src/signals";
+import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { alertPass, lockedAlertPass } from "../scripts/alert-tick";
 import { POPUP_TAG_ENV } from "../scripts/alert-popup";
-import { ceilingStopped, ISSUE, world } from "./alert-world";
+import { type AlertWorld, ceilingStopped, ISSUE, world } from "./alert-world";
 
 describe("one pass over a ceiling-stopped workload (D3, R8)", () => {
 	test("an urgent workload: the raised row, the issue with its create marker, the level-2 comment and label, and the popup kick", () => {
@@ -58,6 +60,69 @@ describe("one pass over a ceiling-stopped workload (D3, R8)", () => {
 		alertPass(w.deps);
 		expect(w.g.issues[0]!.state).toBe("CLOSED");
 		expect(w.rows().some((r) => r.startsWith(`alert: ceiling:${wl} closed `))).toBe(true);
+	});
+});
+
+describe("the close comment names what cleared the alert (D8)", () => {
+	/** The `--comment` of the pass's `gh issue close`, or null when it closed nothing. */
+	const closeComment = (w: AlertWorld): string | null => {
+		const a = w.g.calls.find((c) => c[0] === "issue" && c[1] === "close");
+		return a === undefined ? null : a[a.indexOf("--comment") + 1]!;
+	};
+	const jo = (w: AlertWorld, text: string): void => {
+		const cmd = interpret(w.ledger, text);
+		if (cmd === null) throw new Error(`interpret refused "${text}"`);
+		apply(w.ledger, cmd);
+	};
+	/** Jo's newest instruction on `wl` whose body is `body`: its id, which the close comment must cite. */
+	const instructionId = (w: AlertWorld, wl: string, body: string): string => {
+		const i = w.ledger.instructions(wl).filter((x) => x.author === "jo" && x.body.trim() === body).at(-1);
+		if (i === undefined) throw new Error(`no Jo instruction "${body}" on ${wl}: ${JSON.stringify(w.ledger.instructions(wl).map((x) => x.body))}`);
+		return i.id;
+	};
+
+	// Jo types the word; the ledger records `extend` and `ceiling` as the instruction `ceiling: <usd> <hours>` (input.ts),
+	// so the comment is checked against the word Jo typed and the id of the instruction that word recorded.
+	for (const [typed, said, recorded] of [["extend", "extend", "ceiling: 100 12"], ["ceiling 100", "ceiling 100 6", "ceiling: 100 6"], ["halt", "halt", "halt"]] as const) {
+		test(`a ceiling cleared by Jo's \`${typed}\`: the close comment says Jo answered it, with its input id`, () => {
+			const w = world();
+			const wl = ceilingStopped(w.ledger, "Move the header offset into a token");
+			alertPass(w.deps);
+			w.c.plusHours(0.01);
+			jo(w, `${typed} ${wl}`);
+			alertPass(w.deps);
+			const body = recorded === "halt" ? `halt ${wl}` : recorded;
+			expect(closeComment(w)).toBe(`Jo answered ${said} ${wl} (${instructionId(w, wl, body)}) (as2).`);
+		});
+	}
+
+	test("a died alert cleared by a relaunch names the relaunched lane and its launch row", () => {
+		const w = world();
+		const wl = w.ledger.openWorkload({ by: "lane-a", brief: "Fix the feed header offset", stakes: "normal", mode: "autonomous" });
+		w.ledger.addSlice({ by: "lane-a", workloadId: wl, task: "Move the header offset", doneCondition: "bun test passes", inputs: "src/header.css" });
+		w.ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 60_000 });
+		w.ledger.releaseWorkload(wl, { by: "lane-a", holder: "lane-a" });
+		w.ledger.enqueue({ by: "lane-a", workloadId: wl, sender: "lane-a", recipient: ORCHESTRATOR_RECIPIENT, body: laneDiedShutdownBody("lane-a", w.ledger.now(), 1) });
+		alertPass(w.deps);
+		expect(w.g.issues).toHaveLength(1);
+		w.c.plusHours(0.01);
+		const launch = w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-b cause relaunch requested-by test" });
+		alertPass(w.deps);
+		expect(closeComment(w)).toBe(`lane-b was relaunched on ${wl} (${launch}, ${w.c.now()}) (as2).`);
+	});
+
+	test("a parked alert cleared by Jo's answer names the answer, its input id and the question", () => {
+		const w = world();
+		const wl = w.ledger.openWorkload({ by: "lane-a", brief: "Fix the header", stakes: "normal", mode: "autonomous" });
+		const sl = w.ledger.addSlice({ by: "lane-a", workloadId: wl, task: "Move it", doneCondition: "d", inputs: "i" });
+		w.ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 });
+		const q = w.ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which token name?", options: ["short", "long"] });
+		alertPass(w.deps);
+		expect(w.g.issues).toHaveLength(1);
+		w.c.plusHours(0.01);
+		w.ledger.answerQuestion(q, { by: SURFACE_BY, answer: "short", author: "jo", channel: "surface" });
+		alertPass(w.deps);
+		expect(closeComment(w)).toBe(`Jo answered short (${instructionId(w, wl, "short")}) to ${q} (as2).`);
 	});
 });
 
