@@ -3,6 +3,8 @@
 import { describe, expect, test } from "bun:test";
 import { LANE_STARTER_BY } from "../../ledger/src/index";
 import { alertMarker, alertRecords, openEpisode } from "../src/alert-path";
+import { nightlyFault } from "../src/chaos";
+import { errorLines } from "../src/errors";
 import { apply, interpret } from "../src/input";
 import { ALERT_BY, alertPopupBody, controlEntries } from "../src/launch";
 import { laneDiedShutdownBody } from "../src/signals";
@@ -201,9 +203,64 @@ describe("the pass lock (D3)", () => {
 	});
 });
 
+describe("an ack in a crash window and an unreadable source (R13, D2)", () => {
+	test("ack in the sending/sent crash window: the issue found by its create marker is closed before `acked` is written (R13, review r1 #3)", () => {
+		const w = world();
+		const wl = ceilingStopped(w.ledger, "Move the header offset into a token");
+		// The create goes through on GitHub but its reply is lost: the pass records `level 1 sending` and an error, no url.
+		let lose = true;
+		w.deps.gh = (args) => {
+			const r = w.g.gh(args);
+			return lose && args[0] === "issue" && args[1] === "create" ? { code: 1, stdout: "", stderr: "connection reset after the request was sent" } : r;
+		};
+		alertPass(w.deps);
+		lose = false;
+		const key = `ceiling:${wl}`;
+		const ep = openEpisode(alertRecords(controlEntries(w.ledger.entries(STANDING_WORKLOAD_ID))).get(key))!;
+		expect(ep.url).toBeNull();
+		expect([...ep.sending.keys()]).toEqual([1]);
+		expect(w.g.issues).toHaveLength(1);
+		w.c.plusHours(0.01);
+		const cmd = interpret(w.ledger, `ack ${wl}`);
+		if (cmd === null) throw new Error(`interpret refused "ack ${wl}"`);
+		apply(w.ledger, cmd);
+		alertPass(w.deps);
+		expect(w.g.issues).toHaveLength(1);
+		expect(w.g.issues[0]!.state).toBe("CLOSED");
+		expect(w.rows().filter((r) => r.startsWith(`alert: ${key} acked `))).toHaveLength(1);
+	});
+
+	test("a source that cannot be read holds its alerts unchanged and says so on the needs-you surface; once it reads again nothing is filed twice (review r1 #4)", () => {
+		const w = world();
+		const date = "2026-11-03";
+		const name = `${date}-${nightlyFault(date)}.md`;
+		let denied = false;
+		w.deps.sources = {
+			...w.deps.sources, reportsDir: "/reports",
+			files: { list: () => [name], read: () => { if (denied) throw new Error("EACCES: permission denied, open '/reports'"); return "# chaos lost-row: FAIL\n- verdict: a row was lost\n"; } },
+		};
+		alertPass(w.deps);
+		const key = `chaos:${name}`;
+		expect(w.g.issues).toHaveLength(1);
+		denied = true;
+		const r = alertPass(w.deps);
+		expect(r.problems).toEqual([expect.stringContaining("EACCES")]);
+		expect(w.g.issues[0]!.state).toBe("OPEN");
+		expect(w.rows().filter((x) => x.startsWith(`alert: ${key} closed `))).toEqual([]);
+		const sourceLines = () => errorLines(w.ledger).filter((l) => l.kind === "alert" && l.line.includes("EACCES"));
+		expect(sourceLines()).toHaveLength(1);
+		expect(sourceLines()[0]!.line).toContain("chaos");
+		denied = false;
+		alertPass(w.deps);
+		expect(w.g.issues).toHaveLength(1);
+		expect(w.g.issues[0]!.state).toBe("OPEN");
+		expect(sourceLines()).toEqual([]);
+	});
+});
+
 describe("popup settlement (D3: pid and lstart pairs and the AS2_ALERT_POPUP tag only)", () => {
 	const LS = "Tue Nov  3 10:00:00 2026";
-	test("a worker past its claim is gone while its tagged osascript remains: SIGTERM to the tagged one only, then `failed` once it is gone", () => {
+	test("a worker past its claim is gone while its tagged osascript remains: SIGTERM to the tagged one only, then `settled` once it is gone", () => {
 		let snapshot = "";
 		const w = world({ ps: () => snapshot });
 		const wl = ceilingStopped(w.ledger, 'Jo said "ASAP"');
@@ -228,7 +285,7 @@ describe("popup settlement (D3: pid and lstart pairs and the AS2_ALERT_POPUP tag
 		snapshot = `  600     1   600 Tue Nov  3 11:00:00 2026 /bin/sleep 5`;
 		alertPass(w.deps);
 		expect(w.kills).toHaveLength(2);
-		expect(w.rows().some((r) => r === `alert-popup: ${key} ${ep.id} 2 failed worker ended after showing`)).toBe(true);
+		expect(w.rows().some((r) => r === `alert-popup: ${key} ${ep.id} 2 settled worker ended after showing`)).toBe(true);
 		// Settled with attempts left: the next attempt is spawned with its own tag.
 		alertPass(w.deps);
 		expect(w.spawns.at(-1)!.env[POPUP_TAG_ENV]).toBe(`${ep.id}:2:2`);

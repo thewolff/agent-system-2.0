@@ -365,6 +365,14 @@ describe("the `alert:` records", () => {
 		expect(alertPopupAnsweredAt(w.control(), "move:en-b")).toBeNull();
 	});
 
+	test("a `failed` worker report and the pass's `settled` row both parse back (review r1 #1)", () => {
+		const w = world();
+		const put = (body: string) => w.ledger.recordEntry({ by: ALERT_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+		put(alertPopupBody("move:en-a", "en-ep1", 2, "failed", "osascript exit 1"));
+		put(alertPopupBody("move:en-a", "en-ep1", 2, "settled", "worker failed: osascript exit 1"));
+		expect(alertPopupRows(w.control()).map((r) => [r.step, r.detail])).toEqual([["failed", "osascript exit 1"], ["settled", "worker failed: osascript exit 1"]]);
+	});
+
 	test("`lane-released:` counts only from the lane it names, while that lane is a holder", () => {
 		const w = world();
 		const wl = w.ledger.openWorkload({ by: SURFACE_BY, brief: "b", stakes: "normal", mode: "autonomous" });

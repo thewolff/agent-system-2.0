@@ -179,6 +179,32 @@ describe("ceiling (D2.1, R2)", () => {
 		jo(ledger, `ceiling 100 ${wl}`);
 		expect(ceilingSubjects(ledger, open(ledger), seams(c, { alarmFile }))).toEqual([]);
 	});
+
+	test("an alarm-file CEILING ALARM line clears while a lane holds the workload live, and on Jo's stop answer to the runner's ceiling question (R2, review r1 #7)", () => {
+		const held = fixture();
+		const wl = ceilingWorkload(held.ledger);
+		const alarmFile = join(tmp("alarm"), "alarm.jsonl");
+		writeFileSync(alarmFile, `${JSON.stringify({ kind: CEILING_ALARM_KIND, at: T0, workload: wl, error: "ledger write failed: SQLITE_BUSY" })}\n`);
+		held.c.plusHours(0.01);
+		expect(keys(ceilingSubjects(held.ledger, open(held.ledger), seams(held.c, { alarmFile })))).toEqual([`ceiling:${wl}`]);
+		held.ledger.claimWorkload(wl, { by: "lane-review", holder: "lane-review", leaseMs: 3_600_000 });
+		expect(ceilingSubjects(held.ledger, open(held.ledger), seams(held.c, { alarmFile }))).toEqual([]);
+		held.c.plusHours(2);
+		expect(keys(ceilingSubjects(held.ledger, open(held.ledger), seams(held.c, { alarmFile })))).toEqual([`ceiling:${wl}`]);
+
+		const { ledger, c } = fixture();
+		const w2 = ceilingWorkload(ledger);
+		const file2 = join(tmp("alarm"), "alarm.jsonl");
+		writeFileSync(file2, `${JSON.stringify({ kind: CEILING_ALARM_KIND, at: T0, workload: w2, error: "ledger write failed: SQLITE_BUSY" })}\n`);
+		c.plusHours(0.01);
+		const q = ledger.raiseQuestion({
+			by: LANE_RUNNER_BY, workloadId: w2, sliceId: ledger.slices(w2)[0]!.id, options: ["extend", "stop"],
+			body: ceilingQuestionBody(`ceiling reached on ${w2}: spend at the ceiling`, w2, { usd: 50.2, tokens: 1000, wallMin: 40 }, { usd: 50, wallMin: 360 }, "normal", null),
+		});
+		expect(keys(ceilingSubjects(ledger, open(ledger), seams(c, { alarmFile: file2 })))).toEqual([`ceiling:${w2}`]);
+		ledger.answerQuestion(q, { by: SURFACE_BY, answer: "stop", author: "jo", channel: "surface" });
+		expect(ceilingSubjects(ledger, open(ledger), seams(c, { alarmFile: file2 }))).toEqual([]);
+	});
 });
 
 // ---- 2. died (R3) -------------------------------------------------------------------------------------------------

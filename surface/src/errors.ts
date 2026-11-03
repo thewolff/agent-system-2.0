@@ -241,7 +241,9 @@ export function doctorLines(control: readonly ControlEntry[]): ErrorLine[] {
  * `raised` / `updated` words; an episode with none (adopted, or a row written before the words existed) says its key and where
  * it came from. `issue` is the url level 1 recorded, else the gh error; a gh error stands until a later `level … sent`,
  * `updated` or `merged-closed` row of the key. `popup` reads the episode's `alert-popup:` rows at its current level; a popup
- * error stands until a later popup row of the episode. `records` is `alertRecords(control)`, passed when the caller has it.
+ * error stands until a later popup row of the episode. A key with no open episode that stands on an error (`pending`: a
+ * failed source's `source:<kind>` key, a legacy alert held before adoption, a merged issue's cleanup after its close) has
+ * one line naming it (review r1 #4, #6). `records` is `alertRecords(control)`, passed when the caller has it.
  */
 export function alertLines(control: readonly ControlEntry[], records: ReadonlyMap<string, AlertKeyRecord> = alertRecords(control)): ErrorLine[] {
 	const position = new Map(control.map((c, i) => [c.id, i] as const));
@@ -249,7 +251,12 @@ export function alertLines(control: readonly ControlEntry[], records: ReadonlyMa
 	const out: ErrorLine[] = [];
 	for (const [key, rec] of records) {
 		const ep = openEpisode(rec);
-		if (ep === null || ep.acked !== null) continue;
+		if (ep === null) {
+			const p = rec.pending;
+			if (p !== null && !(p.channel === "popup" && popups.some((r) => r.key === key && position.get(r.id)! > position.get(p.id)!))) out.push(pendingLine(key, rec, p));
+			continue;
+		}
+		if (ep.acked !== null) continue;
 		const level = alertLevel(records, key);
 		const ghRow = ep.errors.get("gh");
 		const ghAt = ghRow === undefined ? -1 : position.get(ghRow.id)!;
@@ -263,11 +270,14 @@ export function alertLines(control: readonly ControlEntry[], records: ReadonlyMa
 		const popupRow = ep.errors.get("popup");
 		const popupError = popupRow !== undefined && !mine.some((r) => position.get(r.id)! > position.get(popupRow.id)!) ? popupRow.text : null;
 		const atLevel = mine.filter((r) => r.level === level);
-		const failures = atLevel.filter((r) => r.step === "failed" || r.step === "unstarted");
+		// An attempt ends `unstarted` or `settled` (the pass's), or `ok`; a worker's `failed` only reports, so it is not counted (review r1 #1).
+		const failures = atLevel.filter((r) => r.step === "settled" || r.step === "unstarted");
 		const answered = atLevel.find((r) => r.step === "ok");
 		const last = atLevel.at(-1);
 		const failed = failures.length > 0 ? `failed ${failures.length} of ${ALERT_POPUP_ATTEMPTS}: ${failures.at(-1)!.detail}` : null;
-		let popup = answered !== undefined ? `answered ${answered.detail}` : last?.step === "showing" || last?.step === "terminating" ? "shown" : (failed ?? "not yet");
+		let popup = answered !== undefined
+			? `answered ${answered.detail}`
+			: last?.step === "failed" ? `failed, settling: ${last.detail}` : last?.step === "showing" || last?.step === "terminating" ? "shown" : (failed ?? "not yet");
 		if (popupError !== null) popup += `, error: ${popupError}`;
 		const issue = ep.url !== null ? `issue ${ep.url}${gh !== null ? `, gh failed: ${gh}` : ""}` : gh !== null ? `issue not filed: ${gh}` : "issue not filed yet";
 		const labels = ALERT_LADDER.find((s) => s.level === level)?.labels ?? [];
@@ -283,6 +293,17 @@ export function alertLines(control: readonly ControlEntry[], records: ReadonlyMa
 		});
 	}
 	return out;
+}
+
+/** The ALERT line of a key that stands on an error with no open episode (`AlertKeyRecord.pending`). */
+function pendingLine(key: string, rec: AlertKeyRecord, p: NonNullable<AlertKeyRecord["pending"]>): ErrorLine {
+	const retry = "the next alert pass retries; fix what it names if it persists";
+	const [what, next] = key.startsWith("source:")
+		? [`${key} failed`, `its alerts are held unchanged (no close, no popup cancel) until it reads again; ${retry}`]
+		: rec.episodes.length === 0
+			? [`${key} held before adoption (${p.channel})`, `no issue is filed and no popup shown for it until it is adopted; ${retry}`]
+			: [`${key} cleanup after its alert closed (${p.channel})`, retry];
+	return { kind: "alert", workloadId: STANDING_WORKLOAD_ID, rowId: p.id, next, line: `ALERT ${what}: ${p.text} — ${next}` };
 }
 
 /** Every needs-you line kind; ErrorKind is read from this list, so the issue #334 item 3 test covers each kind there is. */
@@ -776,6 +797,28 @@ function ceilingWordAfter(ledger: Ledger, workloadId: string, at: string): boole
 	);
 }
 
+/** One `CEILING ALARM <wl>` line of the alarm file, with the `at` its alarm line carries (null when it carries none). */
+export interface CeilingAlarm {
+	line: ErrorLine;
+	at: string | null;
+}
+
+/** The alarm file's `ceiling` lines (its text, `raw`, split on newlines) no ceiling, extend or halt word on their workload has cleared since their `at` (D12). */
+export function ceilingAlarms(ledger: Ledger, raw: readonly string[]): CeilingAlarm[] {
+	const out: CeilingAlarm[] = [];
+	raw.forEach((text, i) => {
+		const f = text.trim() === "" ? null : alarmFields(text);
+		if (f?.kind !== CEILING_ALARM_KIND) return;
+		const wl = fieldText(f, "workload") ?? "(no workload)";
+		const at = fieldText(f, "at");
+		if (at !== null && wl.startsWith("wl-") && ceilingWordAfter(ledger, wl, at)) return;
+		const errors = Array.isArray(f.errors) ? f.errors.filter((e): e is string => typeof e === "string").map(plain).join("; ") : "";
+		const why = fieldText(f, "error") ?? (errors !== "" ? errors : short(plain(text), 160));
+		out.push({ at, line: { kind: "alarm", workloadId: wl.startsWith("wl-") ? wl : STANDING_WORKLOAD_ID, rowId: `alarm:${i + 1}`, next: `say ceiling, extend or halt for ${wl}`, line: `CEILING ALARM ${wl}: ${why} — shown until your next ceiling, extend or halt word on ${wl}` } });
+	});
+	return out;
+}
+
 /**
  * The alarm-file lines (PLAN wl-mvqwn80onq9hq8 D5, D12), read from the file each time like the scratch lines read the
  * filesystem: one `AUTO-APPLY ALARM` line per latching line newer than Jo's latest `auto-routine` (the switch's own
@@ -813,16 +856,7 @@ export function alarmLines(ledger: Ledger, now: string, alarmFile: string): Erro
 			line: `AUTO-APPLY ALARM ${wl} ${signal}: ${evidence}; auto-apply is off; ledger write failed: ${error} (alarm-file line ${l.line}; your auto-routine clears it)`,
 		});
 	}
-	raw.forEach((text, i) => {
-		const f = text.trim() === "" ? null : alarmFields(text);
-		if (f?.kind !== CEILING_ALARM_KIND) return;
-		const wl = fieldText(f, "workload") ?? "(no workload)";
-		const at = fieldText(f, "at");
-		if (at !== null && wl.startsWith("wl-") && ceilingWordAfter(ledger, wl, at)) return;
-		const errors = Array.isArray(f.errors) ? f.errors.filter((e): e is string => typeof e === "string").map(plain).join("; ") : "";
-		const why = fieldText(f, "error") ?? (errors !== "" ? errors : short(plain(text), 160));
-		out.push({ kind: "alarm", workloadId: wl.startsWith("wl-") ? wl : STANDING_WORKLOAD_ID, rowId: `alarm:${i + 1}`, next: `say ceiling, extend or halt for ${wl}`, line: `CEILING ALARM ${wl}: ${why} — shown until your next ceiling, extend or halt word on ${wl}` });
-	});
+	for (const a of ceilingAlarms(ledger, raw)) out.push(a.line);
 	return out;
 }
 

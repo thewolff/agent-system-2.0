@@ -10,7 +10,8 @@
 //  1. ceiling `ceiling:<wl>`: an open, non-train workload stopped at its ceiling (`ceilingStopped`) whose newest lane
 //     lifecycle entry is `lane-stop: <lane> accepted ceiling` or `lane-exit: … outcome stop reason ceiling`, with no live
 //     holder and no `halt <wl>` or `stop` answer to the runner's ceiling question since that entry; or an uncleared
-//     `CEILING ALARM` line of the alarm file (`alarmLines`, cleared by Jo's ceiling, extend or halt word).
+//     `CEILING ALARM` line of the alarm file (`ceilingAlarms`, cleared by Jo's ceiling, extend or halt word) on a workload
+//     no lane holds live, with no `stop` answer to the runner's ceiling question since the alarm (R2's whole clear set).
 //  2. died `died:<wl>`: an open workload with open or paused slices whose newest lane ended by a `lane-died:` message or an
 //     unrecorded lapse (`laneDeaths`, `unrecordedLapse`), not routed into a train task (`trainRouted`), no live holder.
 //  3. released-alive `lane:<laneId>`: a `lane-released: <laneId>` entry 5 minutes old or more, no `lane-exit:` for the lane,
@@ -30,7 +31,7 @@ import type { InFlightWorkload, Ledger } from "../../ledger/src/index";
 import type { AlertKind, AlertSubject } from "./alert-path";
 import { ceilingNoticeBody, ceilingStopped } from "./ceiling";
 import { nightlyFault } from "./chaos";
-import { alarmLines, controlOf, plain, reservedStates, trainRouted, wordsOf } from "./errors";
+import { ceilingAlarms, controlOf, plain, reservedStates, trainRouted, wordsOf } from "./errors";
 import { HALT_WORD, isRunnerCeilingQuestion } from "./input";
 import { type ControlEntry, controlEntries, heldLive, holdersOf, laneExit } from "./launch";
 import {
@@ -80,10 +81,15 @@ export interface SourceSeams {
 /** The machine's probe (ps through surface/src/runner-probe.ts). */
 export const psProbe: SourceSeams["probe"] = (wl, laneId) => runnerProbe(wl, laneId);
 
-/** A per-item failure a source could name: what broke, where, and the evidence; the pass shows it, the next pass retries. */
+/**
+ * A per-item failure a source could name: what broke, where, and the evidence; the pass shows it, the next pass retries.
+ * What it holds (review r1 #4): with no `key`, every open episode of the source's kind, whose state is unknown while it
+ * stands; with a `key`, that key only; with `key: null`, nothing (a bad item that names no key and cannot clear one).
+ */
 export interface SourceProblem {
 	source: AlertKind;
 	error: string;
+	key?: string | null;
 }
 
 /** The workloads open now, with their status rows (`Ledger.inFlight`), read once per pass. */
@@ -125,10 +131,20 @@ function stopEnded(ledger: Ledger, wl: string, at: string): boolean {
 	});
 }
 
-/** D2.1: each open, non-train workload stopped at its ceiling with no lane on it and no stop from Jo; or with an uncleared CEILING ALARM line. */
+/** The alarm file's text as lines, [] when there is none; a file that cannot be read throws naming it (the ceiling source fails, D2). */
+function alarmFileLines(path: string): string[] {
+	if (!existsSync(path)) return [];
+	try {
+		return readFileSync(path, "utf8").split("\n");
+	} catch (err) {
+		throw new Error(`the alarm file ${path} cannot be read, so its CEILING ALARM lines are unknown: ${errText(err)}`);
+	}
+}
+
+/** D2.1: each open, non-train workload stopped at its ceiling with no lane on it and no stop from Jo; or with an uncleared CEILING ALARM line, under the same clear set. */
 export function ceilingSubjects(ledger: Ledger, open: Open, s: SourceSeams): AlertSubject[] {
 	const out: AlertSubject[] = [];
-	const alarms = alarmLines(ledger, s.now, s.alarmFile).filter((l) => l.line.startsWith("CEILING ALARM "));
+	const alarms = ceilingAlarms(ledger, alarmFileLines(s.alarmFile));
 	for (const { workload: w } of open) {
 		if (w.id === STANDING_WORKLOAD_ID || isTrain(ledger, w.id)) continue;
 		const facts: string[] = [];
@@ -138,7 +154,10 @@ export function ceilingSubjects(ledger: Ledger, open: Open, s: SourceSeams): Ale
 		if (stopped !== null && stop !== null && !heldLive(w, s.now) && !stopEnded(ledger, w.id, stop.createdAt)) {
 			facts.push(ceilingNoticeBody(100, w.id, stopped.spend, stopped.ceiling, w.stakes), `${stop.laneId} stopped: ${stop.body} (${stop.id}, ${stop.createdAt}); no lane holds it.`);
 		}
-		for (const a of alarms) if (a.workloadId === w.id) facts.push(`${a.line} (alarm file ${s.alarmFile}, ${a.rowId})`);
+		for (const a of alarms) {
+			if (a.line.workloadId !== w.id || heldLive(w, s.now) || (a.at !== null && stopEnded(ledger, w.id, a.at))) continue;
+			facts.push(`${a.line.line} (alarm file ${s.alarmFile}, ${a.line.rowId})`);
+		}
 		if (facts.length === 0) continue;
 		const usd = stopped === null ? "" : ` ($${stopped.spend.usd.toFixed(2)} of $${stopped.ceiling.usd})`;
 		out.push({
@@ -220,7 +239,7 @@ export function releasedAliveSubjects(ledger: Ledger, s: SourceSeams, problems: 
 			const live = liveRunnerOf(control, lane, 0, probe);
 			if (live === null) continue;
 			if (live.uninspected) {
-				problems.push({ source: "released-alive", error: `${lane} on ${wl}: ps could not answer for its ${live.what} pid ${live.pid} (${probe.failure ?? "no reason recorded"}); released ${newest.createdAt}, no lane-exit:` });
+				problems.push({ source: "released-alive", key: `lane:${lane}`, error: `${lane} on ${wl}: ps could not answer for its ${live.what} pid ${live.pid} (${probe.failure ?? "no reason recorded"}); released ${newest.createdAt}, no lane-exit:` });
 				continue;
 			}
 			out.push({
@@ -264,7 +283,7 @@ export function mainRedSubjects(ledger: Ledger, s: SourceSeams, problems: Source
 		if (n.cleared !== null) continue;
 		const m = ISSUE_URL.exec(n.url);
 		if (!m) {
-			problems.push({ source: "main-red", error: `main-red notice ${n.raised.id}: ${n.url} is not a GitHub issue url, so no repository key; not raised` });
+			problems.push({ source: "main-red", key: null, error: `main-red notice ${n.raised.id}: ${n.url} is not a GitHub issue url, so no repository key; not raised` });
 			continue;
 		}
 		at(m[1]!.toLowerCase()).notices.push(`Main is red on ${m[1]}: ${n.url} (merge train run ${n.run}, raised ${n.raised.createdAt}).`);
@@ -397,7 +416,7 @@ export function alertSources(ledger: Ledger, s: SourceSeams): { subjects: AlertS
 	try {
 		open = ledger.inFlight();
 	} catch (err) {
-		problems.push({ source: "ceiling", error: `ledger.inFlight() failed, so ceiling, died, parked and train were not computed: ${errText(err)}` });
+		for (const source of ["ceiling", "died", "parked", "train"] as const) problems.push({ source, error: `ledger.inFlight() failed, so the ${source} source was not computed: ${errText(err)}` });
 	}
 	const run = (source: AlertKind, f: () => AlertSubject[]) => {
 		try {

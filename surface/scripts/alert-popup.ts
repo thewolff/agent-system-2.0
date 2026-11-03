@@ -8,18 +8,21 @@
 // lstart=<s> attempt=<n> until=<iso>`), refused when the level already has an unsettled claim, an `ok`, or
 // ALERT_POPUP_ATTEMPTS ended attempts; then writes `showing`, shows the silent stay-up popup through surface/src/notify.ts
 // `alarmPopup` (the doctor's helper: no sound unless Jo picks "Read it to me", the 10/28 alarm rule), and writes `ok <button>`
-// or `failed <why>`.
+// or `failed <why>`. A `failed` only reports: the attempt stays the pass's to settle until no member of it is left, and the
+// pass ends it with `settled` (review r1 #1).
 //
 // The pure half the pass uses is here too, so the identity rule lives in one file:
 // - `parsePs`: one `ps -A [-E] -ww -o pid=,ppid=,pgid=,lstart=,command=` read, a process per line.
 // - `popupAttempts` / `settleAttempt`: each attempt's rows, and what the pass owes an unsettled one now. A process belongs to
 //   an attempt only by its own identity: the worker by the pid and lstart pair its claim recorded, any other process by
 //   carrying this attempt's exact AS2_ALERT_POPUP tag in its launch environment (`ps -E`). No bare pid or pgid ever selects
-//   a process, and a signal goes only to a recorded member whose pid and lstart still match.
+//   a process, and a signal goes only to a recorded member whose pid and lstart still match. A member still matching
+//   POPUP_KILL_GRACE_MS after its SIGKILL is the key's error, and the attempt stays unsettled (R24).
 // - `legacyHelperSet` / `settleLegacy`: a quota-move popup of the retired move alert, still on screen at cutover, found by
 //   its owner's argv (`lane.ts move-alert <wl> <E>`), its dialog's argv (the legacy POPUP_SCRIPT and this move's title and
 //   text), its voice's argv (`say <text>`), and, while the owner is identified in the same read, its process group and
-//   children; settled before the key is adopted.
+//   children; the set is found again on every pass and a helper first seen late joins it (review r1 #2); settled, once
+//   the whole set is gone, before the key is adopted.
 import { ALERT_POPUP_ATTEMPTS, type AlertEpisode, alertPopupRows, type AlertPopupRow, alertRecords, openEpisode } from "../src/alert-path";
 import { ALERT_BY, alertBody, alertPopupBody, controlEntries } from "../src/launch";
 import { type AlarmOutcome, alarmPopup, DOCTOR_GIVE_UP_SECS } from "../src/notify";
@@ -38,8 +41,8 @@ export const POPUP_UNTIL_MS = DOCTOR_GIVE_UP_SECS * 1000 + 10 * 60_000;
 export const POPUP_CLAIM_MS = 60_000;
 /** A member still matching this long after its SIGTERM gets SIGKILL. */
 export const POPUP_KILL_AFTER_MS = 30_000;
-/** A legacy member still matching this long after its SIGKILL is the key's error (D3 "Legacy popups"). */
-export const LEGACY_KILL_GRACE_MS = 5 * 60_000;
+/** A member (the alert path's or a legacy one) still matching this long after its SIGKILL is the key's error (D3; R24). */
+export const POPUP_KILL_GRACE_MS = 5 * 60_000;
 /** The worker script, for the pass's spawn. */
 export const ALERT_POPUP_SCRIPT = join(import.meta.dir, "alert-popup.ts");
 
@@ -128,8 +131,10 @@ export interface PopupAttempt {
 	showing: boolean;
 	/** Each `terminating` row: why, the members it signalled, and when. */
 	terminating: { why: string; members: Member[]; sent: string }[];
-	/** `ok`, `failed` or `unstarted`; null while the attempt is unsettled. */
-	end: { step: "ok" | "failed" | "unstarted"; detail: string; at: string } | null;
+	/** The worker's own `failed` report: the attempt stays unsettled until the pass finds no member left. */
+	failed: { detail: string; at: string } | null;
+	/** `ok`, `unstarted` or `settled` (and `failed` for a legacy answer's attempt 0); null while the attempt is unsettled. */
+	end: { step: "ok" | "failed" | "unstarted" | "settled"; detail: string; at: string } | null;
 }
 
 export const popupTag = (a: Pick<PopupAttempt, "episode" | "level" | "attempt">): string => `${a.episode}:${a.level}:${a.attempt}`;
@@ -137,9 +142,10 @@ export const groupKey = (key: string, episode: string, level: number): string =>
 
 /**
  * Every attempt among the `alert-popup:` rows, by `groupKey`, oldest first. `spawning attempt=<n>` opens attempt n; a claim
- * joins the attempt its `attempt=` names; `showing`, `ok`, `failed`, `terminating` and `unstarted` join the newest attempt
- * of their (key, episode, level), since the pass starts one attempt at a time. An `ok` or `failed` with no attempt to join
- * (the answer of a legacy popup, recorded at adoption) is an ended attempt 0 of its own; any other such row is ignored.
+ * joins the attempt its `attempt=` names; `showing`, `ok`, `failed`, `terminating`, `unstarted` and `settled` join the newest
+ * attempt of their (key, episode, level), since the pass starts one attempt at a time. A `failed` is the worker's report and
+ * ends nothing. An `ok` or `failed` with no attempt to join (the answer of a legacy popup, recorded at adoption) is an ended
+ * attempt 0 of its own; any other such row is ignored.
  */
 export function popupAttempts(rows: readonly AlertPopupRow[]): Map<string, PopupAttempt[]> {
 	const out = new Map<string, PopupAttempt[]>();
@@ -149,7 +155,7 @@ export function popupAttempts(rows: readonly AlertPopupRow[]): Map<string, Popup
 		out.set(g, list);
 		if (r.step === "spawning") {
 			const n = Number(kv(r.detail, "attempt"));
-			if (Number.isInteger(n) && n > 0) list.push({ key: r.key, episode: r.episode, level: r.level, attempt: n, spawningAt: r.at, claim: null, showing: false, terminating: [], end: null });
+			if (Number.isInteger(n) && n > 0) list.push({ key: r.key, episode: r.episode, level: r.level, attempt: n, spawningAt: r.at, claim: null, showing: false, terminating: [], failed: null, end: null });
 			continue;
 		}
 		if (r.step === "claim") {
@@ -164,15 +170,16 @@ export function popupAttempts(rows: readonly AlertPopupRow[]): Map<string, Popup
 		}
 		const a = list.at(-1);
 		if ((a === undefined || a.end !== null) && (r.step === "ok" || r.step === "failed")) {
-			list.push({ key: r.key, episode: r.episode, level: r.level, attempt: 0, spawningAt: r.at, claim: null, showing: false, terminating: [], end: { step: r.step, detail: r.detail, at: r.at } });
+			list.push({ key: r.key, episode: r.episode, level: r.level, attempt: 0, spawningAt: r.at, claim: null, showing: false, terminating: [], failed: null, end: { step: r.step, detail: r.detail, at: r.at } });
 			continue;
 		}
 		if (a === undefined || a.end !== null) continue;
 		if (r.step === "showing") a.showing = true;
+		else if (r.step === "failed") a.failed ??= { detail: r.detail, at: r.at };
 		else if (r.step === "terminating") {
 			const m = /^(.*?) members=(\S*) sent=(\S+)$/.exec(r.detail);
 			if (m) a.terminating.push({ why: m[1]!, members: parseMembers(m[2]!), sent: m[3]! });
-		} else a.end = { step: r.step, detail: r.detail, at: r.at };
+		} else a.end = { step: r.step as "ok" | "unstarted" | "settled", detail: r.detail, at: r.at };
 	}
 	return out;
 }
@@ -191,12 +198,15 @@ export function popupStatus(attempts: readonly PopupAttempt[] | undefined): { ok
 export type SettleStep =
 	| { do: "terminate"; why: string; members: Proc[] }
 	| { do: "kill"; members: Proc[] }
-	| { do: "end"; step: "failed" | "unstarted"; detail: string };
+	| { do: "stuck"; detail: string }
+	| { do: "end"; step: "unstarted" | "settled"; detail: string };
 
 /**
  * D3's settlement for one unsettled attempt over one `ps -E` read (`procs`) at `now`. `cancel` is why its episode no longer
  * wants it (`acked …`, `closed …`, `superseded by level 3`), else null. Members: the worker (the claim's pid and lstart
  * pair) and every process carrying the attempt's tag. Returns the steps in order; none while the attempt runs as it should.
+ * A worker's `failed` report settles nothing by itself: its members are signalled first, and `settled` comes only once none
+ * is left (review r1 #1). Members still matching POPUP_KILL_GRACE_MS after their SIGKILL are `stuck`: the key's error (R24).
  */
 export function settleAttempt(a: PopupAttempt, procs: readonly Proc[], now: string, cancel: string | null): SettleStep[] {
 	const t = Date.parse(now);
@@ -204,24 +214,31 @@ export function settleAttempt(a: PopupAttempt, procs: readonly Proc[], now: stri
 	const tagged = procs.filter((p) => carriesTag(p, tag));
 	const worker = a.claim === null ? [] : procs.filter((p) => p.pid === a.claim!.pid && p.lstart === a.claim!.lstart);
 	const members = [...new Map([...worker, ...tagged].map((p) => [`${p.pid} ${p.lstart}`, p])).values()];
+	const reported = a.failed === null ? null : `worker failed: ${a.failed.detail}`;
 	if (a.terminating.length > 0) {
 		const recorded = a.terminating.flatMap((x) => x.members);
 		const matching = stillMatching(procs, recorded);
 		const fresh = members.filter((p) => !recorded.some((m) => sameProc(p, m)));
+		const sentTo = (p: Proc) => Math.min(...a.terminating.filter((x) => x.members.some((m) => sameProc(p, m))).map((x) => Date.parse(x.sent)));
 		const steps: SettleStep[] = [];
 		if (fresh.length > 0) steps.push({ do: "terminate", why: a.terminating[0]!.why, members: fresh });
-		const due = matching.filter((p) => a.terminating.some((x) => x.members.some((m) => sameProc(p, m)) && t - Date.parse(x.sent) >= POPUP_KILL_AFTER_MS));
+		const due = matching.filter((p) => t - sentTo(p) >= POPUP_KILL_AFTER_MS);
 		if (due.length > 0) steps.push({ do: "kill", members: due });
-		if (matching.length === 0 && fresh.length === 0) steps.push({ do: "end", step: "failed", detail: a.terminating[0]!.why });
+		const stuck = matching.filter((p) => t - sentTo(p) >= POPUP_KILL_AFTER_MS + POPUP_KILL_GRACE_MS);
+		if (stuck.length > 0) {
+			steps.push({ do: "stuck", detail: `popup attempt ${a.attempt} members still alive ${POPUP_KILL_GRACE_MS / 60_000} minutes after SIGKILL: ${stuck.map(memberToken).join(", ")}; no replacement starts until they are gone` });
+		}
+		if (matching.length === 0 && fresh.length === 0) steps.push({ do: "end", step: "settled", detail: reported ?? a.terminating[0]!.why });
 		return steps;
 	}
 	if (a.claim === null) {
+		if (reported !== null) return tagged.length > 0 ? [{ do: "terminate", why: reported, members: tagged }] : [{ do: "end", step: "settled", detail: reported }];
 		if (t - Date.parse(a.spawningAt) < POPUP_CLAIM_MS && cancel === null) return [];
 		const why = cancel === null ? `no claim ${POPUP_CLAIM_MS / 1000} s after spawning` : `cancelled ${cancel} before its claim`;
 		return tagged.length > 0 ? [{ do: "terminate", why: `unstarted: ${why}`, members: tagged }] : [{ do: "end", step: "unstarted", detail: why }];
 	}
-	if (members.length === 0) return [{ do: "end", step: "failed", detail: "worker ended without a result" }];
-	const why = t >= Date.parse(a.claim.until) ? "expired" : cancel !== null ? `cancelled ${cancel}` : worker.length === 0 ? "worker ended after showing" : null;
+	if (members.length === 0) return [{ do: "end", step: "settled", detail: reported ?? "worker ended without a result" }];
+	const why = t >= Date.parse(a.claim.until) ? "expired" : cancel !== null ? `cancelled ${cancel}` : reported ?? (worker.length === 0 ? "worker ended after showing" : null);
 	return why === null ? [] : [{ do: "terminate", why, members }];
 }
 
@@ -277,26 +294,26 @@ export function legacyHelperSet(procs: readonly Proc[], claim: LegacyClaim, move
 	return { members: [...set.values()], reused: owner === null && procs.some((p) => p.pid === claim.pid) };
 }
 
-/** The `legacy-popup` rows of one key, read back. */
+/** The `legacy-popup` rows of one key, read back: every `terminating` and `killed` row, oldest first, and the settlement. */
 export interface LegacyPopupRecord {
-	terminating: { members: Member[]; sent: string } | null;
-	killed: { members: Member[]; at: string } | null;
+	terminating: { members: Member[]; sent: string }[];
+	killed: { members: Member[]; at: string }[];
 	settled: string | null;
 }
 
 /** The key's `alert: <key> legacy-popup …` texts, oldest first, read back. */
 export function legacyPopupRecord(texts: readonly string[]): LegacyPopupRecord {
-	const r: LegacyPopupRecord = { terminating: null, killed: null, settled: null };
+	const r: LegacyPopupRecord = { terminating: [], killed: [], settled: null };
 	for (const t of texts) {
 		let m: RegExpExecArray | null;
-		if ((m = /^terminating members=(\S*) sent=(\S+)$/.exec(t))) r.terminating ??= { members: parseMembers(m[1]!), sent: m[2]! };
-		else if ((m = /^killed members=(\S*) at=(\S+)$/.exec(t))) r.killed = { members: parseMembers(m[1]!), at: m[2]! };
+		if ((m = /^terminating members=(\S*) sent=(\S+)$/.exec(t))) r.terminating.push({ members: parseMembers(m[1]!), sent: m[2]! });
+		else if ((m = /^killed members=(\S*) at=(\S+)$/.exec(t))) r.killed.push({ members: parseMembers(m[1]!), at: m[2]! });
 		else if ((m = /^settled (.+)$/.exec(t))) r.settled ??= m[1]!;
 	}
 	return r;
 }
 
-/** What the pass does now for a legacy claim not yet settled. */
+/** What the pass does now for a legacy claim not yet settled: one row and its signal each. */
 export type LegacyStep =
 	| { do: "terminate"; members: Proc[]; text: string }
 	| { do: "kill"; members: Proc[]; text: string }
@@ -304,28 +321,40 @@ export type LegacyStep =
 	| { do: "error"; text: string };
 
 /**
- * D3's legacy settlement over one `ps -A -ww` read (`procs`) at `now`: no terminating yet → the helper set, empty
- * (`settled …`) or signalled (`terminating …`); then SIGKILL to recorded members still matching 30 s after `sent`
- * (`killed …`), `settled cancelled at cutover` once none matches, and members still matching 5 minutes after the SIGKILL
- * are the key's error, the key held back until they go. Null once settled.
+ * D3's legacy settlement over one `ps -A -ww` read (`procs`) at `now`, in order. The helper set is found again on every
+ * pass (`legacyHelperSet`); before any `terminating` row an empty set is `settled …`, and a helper not yet recorded is
+ * signalled (`terminating …`) whenever it is first seen, so a voice that starts after the first SIGTERM joins the set
+ * (review r1 #2). A recorded member still matching 30 s after its own SIGTERM gets SIGKILL (`killed …`, once each); one still
+ * matching 5 minutes after its SIGKILL is the key's error, the key held back until it goes. `settled cancelled at cutover`
+ * only once no recorded member matches and the set has nothing new. Empty while it waits, and once settled.
  */
-export function settleLegacy(rec: LegacyPopupRecord, procs: readonly Proc[], claim: LegacyClaim, move: QuotaMove, now: string): LegacyStep | null {
-	if (rec.settled !== null) return null;
+export function settleLegacy(rec: LegacyPopupRecord, procs: readonly Proc[], claim: LegacyClaim, move: QuotaMove, now: string): LegacyStep[] {
+	if (rec.settled !== null) return [];
 	const t = Date.parse(now);
-	if (rec.terminating === null) {
-		const h = legacyHelperSet(procs, claim, move);
-		if (h.members.length === 0) return { do: "settle", text: `settled ${h.reused ? "claim pid reused" : "worker ended without a result"}` };
-		return { do: "terminate", members: h.members, text: `terminating ${membersField(h.members)} sent=${now}` };
+	const h = legacyHelperSet(procs, claim, move);
+	if (rec.terminating.length === 0) {
+		if (h.members.length === 0) return [{ do: "settle", text: `settled ${h.reused ? "claim pid reused" : "worker ended without a result"}` }];
+		return [{ do: "terminate", members: h.members, text: `terminating ${membersField(h.members)} sent=${now}` }];
 	}
-	const matching = stillMatching(procs, rec.terminating.members);
-	if (matching.length === 0) return { do: "settle", text: "settled cancelled at cutover" };
-	if (rec.killed === null) {
-		return t - Date.parse(rec.terminating.sent) >= POPUP_KILL_AFTER_MS ? { do: "kill", members: matching, text: `killed ${membersField(matching)} at=${now}` } : null;
-	}
-	if (t - Date.parse(rec.killed.at) >= LEGACY_KILL_GRACE_MS) {
-		return { do: "error", text: `legacy popup members still alive ${LEGACY_KILL_GRACE_MS / 60_000} minutes after SIGKILL: ${matching.map(memberToken).join(", ")}` };
-	}
-	return null;
+	const recorded = rec.terminating.flatMap((x) => x.members);
+	const matching = stillMatching(procs, recorded);
+	const fresh = h.members.filter((p) => !recorded.some((m) => sameProc(p, m)));
+	if (matching.length === 0 && fresh.length === 0) return [{ do: "settle", text: "settled cancelled at cutover" }];
+	const steps: LegacyStep[] = [];
+	if (fresh.length > 0) steps.push({ do: "terminate", members: fresh, text: `terminating ${membersField(fresh)} sent=${now}` });
+	const termAt = (p: Proc) => Math.min(...rec.terminating.filter((x) => x.members.some((m) => sameProc(p, m))).map((x) => Date.parse(x.sent)));
+	const killedAt = (p: Proc) => {
+		const at = rec.killed.filter((x) => x.members.some((m) => sameProc(p, m))).map((x) => Date.parse(x.at));
+		return at.length === 0 ? null : Math.min(...at);
+	};
+	const due = matching.filter((p) => killedAt(p) === null && t - termAt(p) >= POPUP_KILL_AFTER_MS);
+	if (due.length > 0) steps.push({ do: "kill", members: due, text: `killed ${membersField(due)} at=${now}` });
+	const stuck = matching.filter((p) => {
+		const k = killedAt(p);
+		return k !== null && t - k >= POPUP_KILL_GRACE_MS;
+	});
+	if (stuck.length > 0) steps.push({ do: "error", text: `legacy popup members still alive ${POPUP_KILL_GRACE_MS / 60_000} minutes after SIGKILL: ${stuck.map(memberToken).join(", ")}` });
+	return steps;
 }
 
 // ---- the worker ---------------------------------------------------------------------------------

@@ -1752,8 +1752,12 @@ export function alertBody(key: string, row: AlertRow): string {
 	}
 }
 
-/** The steps of an alert popup (PLAN wl-mw0vs9uc3xqtka D3 popup worker): the worker's claim and outcome, the pass's spawn and settlement. */
-export const ALERT_POPUP_STEPS = ["spawning", "claim", "showing", "ok", "failed", "terminating", "unstarted"] as const;
+/**
+ * The steps of an alert popup (PLAN wl-mw0vs9uc3xqtka D3 popup worker): the worker's claim and outcome, the pass's spawn and
+ * settlement. A worker's `failed` reports its failure; the attempt stays unsettled until the pass finds its members gone and
+ * writes `settled` (review r1 #1), so the failure counts once and no replacement starts while a member lives.
+ */
+export const ALERT_POPUP_STEPS = ["spawning", "claim", "showing", "ok", "failed", "terminating", "unstarted", "settled"] as const;
 export type AlertPopupStep = (typeof ALERT_POPUP_STEPS)[number];
 /** `alert-popup: <key> <episode> <level> <step> [<detail>]`, ALERT_BY's alone on the standing workload; the detail is one line. */
 export function alertPopupBody(key: string, episode: string, level: number, step: AlertPopupStep, detail?: string): string {

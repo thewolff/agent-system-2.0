@@ -33,9 +33,9 @@ import { type InstructionRow, Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath, homeDir } from "../../ledger/src/locality";
 import { alarmFilePath } from "../../gates/src/routine-switch";
 import {
-	ALERT_LADDER, ALERT_POPUP_ATTEMPTS, type AlertAck, type AlertAction, alertAcks, alertActions, type AlertKeyRecord, alertMarker, alertPopupAnsweredAt,
-	alertPopupRows, alertRecords, alertWords, type AlertSubject, errorChanged, legacyLandFirstMarker, legacyMainRedMarker, legacyTrainAlertMarker, legacyTrainAlerts,
-	legacyTrainLevel, openEpisode, type Urgency, urgencyOf, withUrgency,
+	ALERT_LADDER, ALERT_POPUP_ATTEMPTS, type AlertAck, type AlertAction, alertAcks, alertActions, type AlertEpisode, type AlertKeyRecord, type AlertKind, alertKindOfKey,
+	alertMarker, alertPopupAnsweredAt, alertPopupRows, alertRecords, alertSourceKey, alertWords, type AlertSubject, errorChanged, legacyLandFirstMarker,
+	legacyMainRedMarker, legacyTrainAlertMarker, legacyTrainAlerts, legacyTrainLevel, openEpisode, type Urgency, urgencyOf, withUrgency,
 } from "../src/alert-path";
 import { alertSources, fsReportFiles, psProbe, type SourceSeams } from "../src/alert-sources";
 import { field, type Gh, GhError, type GhResult, ghJsonOf, issueNumber, issueOps } from "../src/jo-issues";
@@ -141,7 +141,19 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 		popupAnsweredAt: (key) => alertPopupAnsweredAt(control0, key),
 	};
 	const src = alertSources(ledger, seams);
-	for (const p of src.problems) problem(`${p.source} source: ${p.error}`);
+	// A source that failed is unknown state, not a clear (review r1 #4): every open episode of its kind (or the one key a
+	// problem names) is held unchanged this pass, and the failure is its `source:<kind>` key's error row, on the needs-you
+	// surface until the source evaluates cleanly again. (The quota watch's subjects come from its own saved alert state, so
+	// its read errors are a problem line, not a hold.)
+	const sourceErrors = new Map<AlertKind, string[]>();
+	const failedKinds = new Set<AlertKind>();
+	const failedKeys = new Set<string>();
+	for (const p of src.problems) {
+		problem(`${p.source} source: ${p.error}`);
+		sourceErrors.set(p.source, [...(sourceErrors.get(p.source) ?? []), p.error]);
+		if (p.key === undefined) failedKinds.add(p.source);
+		else if (p.key !== null) failedKeys.add(p.key);
+	}
 	let subjects: AlertSubject[] = [...quota.subjects, ...src.subjects].map((s) => (s.workloadId === null ? s : withUrgency(s, urgency(s.workloadId))));
 
 	const ghJson = ghJsonOf(d.gh);
@@ -174,13 +186,25 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 		try {
 			const rec = records().get(key);
 			const ep = openEpisode(rec);
-			const loose = [...(rec?.loose ?? [])].reverse().find((r) => r.row.row === "error" && r.row.channel === channel);
-			const changed = ep !== null ? errorChanged(ep, channel, text) : !(loose !== undefined && loose.row.row === "error" && loose.row.text === text);
+			const changed = ep !== null ? errorChanged(ep, channel, text) : !(rec?.pending?.channel === channel && rec.pending.text === text);
 			if (changed) alertRow(key, { row: "error", channel, text });
 		} catch (writeErr) {
 			problem(`${key}: the error row for ${channel} (${text}) could not be written: ${errText(writeErr)}`);
 		}
 	};
+
+	// Each failed source's row; a source with a pending error that evaluated cleanly this pass is closed.
+	for (const [kind, texts] of sourceErrors) keyError(alertSourceKey(kind), "source", `${kind} source: ${texts.join("; ")}`);
+	for (const [key, rec] of records()) {
+		const kind = key.startsWith("source:") ? key.slice("source:".length) : null;
+		if (kind === null || rec.pending === null || sourceErrors.has(kind as AlertKind)) continue;
+		try {
+			alertRow(key, { row: "closed", why: `the ${kind} source evaluated again` });
+			say(`${key}: the ${kind} source evaluated again; its held alerts go on`);
+		} catch (err) {
+			problem(`${key}: the closed row of the ${kind} source (it evaluated again) could not be written: ${errText(err)}`);
+		}
+	}
 
 	// 3. Legacy adoption.
 	const held = new Set<string>();
@@ -234,16 +258,24 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 			adopt(key, () => {
 				const pid = Number(/pid=(\d+)/.exec(claimRow!.rest)?.[1]);
 				const claim: LegacyClaim = { pid, attempt: Number(/attempt=(\d+)/.exec(claimRow!.rest)?.[1] ?? 0) };
-				const step = settleLegacy(lrec, legacyPs(), claim, move, now);
-				if (step === null) throw new KeyStop(`the legacy popup of ${move.eventId} is being settled (terminating members recorded); adoption waits`);
-				if (step.do === "error") throw new KeyStop(step.text);
-				if (step.do === "terminate" || step.do === "kill") {
-					const failed = signal(step.members, step.do === "terminate" ? "SIGTERM" : "SIGKILL");
+				const steps = settleLegacy(lrec, legacyPs(), claim, move, now);
+				if (steps.length === 0) throw new KeyStop(`the legacy popup of ${move.eventId} is being settled (terminating members recorded); adoption waits`);
+				const failed: string[] = [];
+				const waits: string[] = [];
+				for (const step of steps) {
+					if (step.do === "error") {
+						waits.push(step.text);
+						continue;
+					}
+					if (step.do === "terminate" || step.do === "kill") {
+						const sig = step.do === "terminate" ? "SIGTERM" : "SIGKILL";
+						failed.push(...signal(step.members, sig));
+						waits.push(`${sig} sent to ${step.members.map((p) => p.pid).join(", ")}`);
+					}
 					alertRow(key, { row: "legacy-popup", text: step.text });
-					if (failed.length > 0) throw new KeyStop(`signalling the legacy popup of ${move.eventId} failed: ${failed.join("; ")}`);
-					throw new KeyStop(`the legacy popup of ${move.eventId} was signalled (${step.text}); adoption waits for its members to go`);
 				}
-				alertRow(key, { row: "legacy-popup", text: step.text });
+				if (failed.length > 0) waits.push(`signalling failed: ${failed.join("; ")}`);
+				if (waits.length > 0) throw new KeyStop(`the legacy popup of ${move.eventId} is not settled: ${waits.join("; ")}; adoption waits for every member to go`);
 			});
 			if (held.has(key)) continue;
 		}
@@ -298,10 +330,44 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 		}
 	}
 	subjects = subjects.filter((s) => !held.has(s.key));
+	// A key that stood on an adoption error and is neither held this pass nor a subject any more was never adopted: its
+	// pending error is closed, so the needs-you line goes with the subject (review r1 #6).
+	for (const [key, rec] of records()) {
+		if (rec.episodes.length > 0 || rec.pending === null || alertKindOfKey(key) === null || held.has(key) || active.has(key)) continue;
+		try {
+			alertRow(key, { row: "closed", why: "the subject cleared before it was adopted" });
+			say(`${key}: cleared before it was adopted; its ${rec.pending.channel} error is closed`);
+		} catch (err) {
+			problem(`${key}: the closed row of a key that cleared before adoption could not be written: ${errText(err)}`);
+		}
+	}
 
 	// 4. The actions and their effects.
-	rec0 = records();
 	const stopped = new Set<string>(held);
+	for (const [key, rec] of records()) {
+		const ep = openEpisode(rec);
+		if (ep === null) continue;
+		const kind = ep.kind ?? alertKindOfKey(key);
+		if (!failedKeys.has(key) && !(kind !== null && failedKinds.has(kind))) continue;
+		stopped.add(key);
+		say(`${key}: held unchanged: its ${kind ?? "unknown"} source could not be read this pass`);
+	}
+	// An episode whose level-1 create went out but whose reply was lost has no url: its issue is found by the create
+	// marker and recorded before the issue states and acks are read, as the close does (review r1 #3, R13).
+	for (const [key, rec] of records()) {
+		const ep = openEpisode(rec);
+		if (ep === null || ep.acked !== null || ep.url !== null || !ep.sending.has(1) || stopped.has(key)) continue;
+		try {
+			const url = marked(alertMarker(key, ep.id, "create"));
+			if (url === null) continue;
+			alertRow(key, { row: "level", level: 1, step: "sent", url });
+			say(`${key}: level 1's issue found by its create marker: ${url}`);
+		} catch (err) {
+			stopped.add(key);
+			keyError(key, err instanceof GhError ? "gh" : "pass", err);
+		}
+	}
+	rec0 = records();
 	const issueStates = new Map<string, "OPEN" | "CLOSED">();
 	for (const [key, rec] of rec0) {
 		const ep = openEpisode(rec);
@@ -338,10 +404,9 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 			keyError(key, err instanceof GhError ? "gh" : "pass", err);
 		}
 	}
-	// Merged legacy issues: a pointer comment, the close, then `merged-closed` (r5 #1).
-	for (const [key, rec] of records()) {
-		const ep = openEpisode(rec);
-		if (ep === null || stopped.has(key)) continue;
+	// Merged legacy issues: a pointer comment, the close, then `merged-closed` (r5 #1); retried on every pass until each is
+	// done, after its episode closed too (review r1 #5).
+	const mergeCleanup = (key: string, ep: AlertEpisode): void => {
 		for (const [url, m] of ep.merged) {
 			if (m.closedAt !== null) continue;
 			try {
@@ -353,9 +418,12 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 			} catch (err) {
 				stopped.add(key);
 				keyError(key, err instanceof GhError ? "gh" : "pass", err);
-				break;
+				return;
 			}
 		}
+	};
+	for (const [key, rec] of records()) {
+		for (const ep of rec.episodes) if (!stopped.has(key)) mergeCleanup(key, ep);
 	}
 
 	// 5. The popups.
@@ -504,6 +572,10 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 					continue;
 				}
 				busy.add(a.key);
+				if (s.do === "stuck") {
+					keyError(a.key, "popup", s.detail);
+					continue;
+				}
 				const failed = signal(s.members, s.do === "terminate" ? "SIGTERM" : "SIGKILL");
 				if (s.do === "terminate") row("terminating", terminatingDetail(s.why, s.members as Member[], now));
 				say(`${a.key}: level ${a.level} popup attempt ${a.attempt}: ${s.do === "terminate" ? "SIGTERM" : "SIGKILL"} to ${s.members.map((p) => p.pid).join(", ")}`);

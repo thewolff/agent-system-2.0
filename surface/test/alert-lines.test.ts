@@ -83,6 +83,10 @@ describe("ALERT lines (D4)", () => {
 		w.popup(w.key, ep, 2, "showing");
 		expect(w.alerts()[0]!.line).toEndWith(`(issue ${ISSUE}; popup shown)`);
 		w.popup(w.key, ep, 2, "failed", "osascript exit 1: not authorized");
+		// The worker's report alone settles nothing (review r1 #1): the pass's `settled` ends the attempt, counted once.
+		expect(w.alerts()[0]!.line).toEndWith(`(issue ${ISSUE}; popup failed, settling: osascript exit 1: not authorized)`);
+		w.popup(w.key, ep, 2, "settled", "worker failed: osascript exit 1: not authorized");
+		expect(w.alerts()[0]!.line).toEndWith(`(issue ${ISSUE}; popup failed 1 of ${ALERT_POPUP_ATTEMPTS}: worker failed: osascript exit 1: not authorized)`);
 		w.popup(w.key, ep, 2, "unstarted", "spawn ENOENT osascript");
 		const failing = w.alerts()[0]!;
 		expect(failing.line).toEndWith(`(issue ${ISSUE}; popup failed 2 of ${ALERT_POPUP_ATTEMPTS}: spawn ENOENT osascript)`);

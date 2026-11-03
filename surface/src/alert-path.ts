@@ -54,6 +54,24 @@ const ALERT_KINDS: Record<AlertKind, true> = {
 	ceiling: true, died: true, parked: true, train: true, "released-alive": true, "main-red": true, chaos: true, "quota-move": true, quota: true,
 };
 
+/** The kind each key prefix of the `AlertSubject.key` grammar names. */
+const KIND_OF_PREFIX: Record<string, AlertKind> = {
+	ceiling: "ceiling", died: "died", parked: "parked", q: "train", lane: "released-alive", main: "main-red", chaos: "chaos", move: "quota-move", quota: "quota",
+};
+
+/** The kind key `key` belongs to, read from its prefix (an adopted episode records no kind); null for a key of no source. */
+export function alertKindOfKey(key: string): AlertKind | null {
+	const prefix = key.slice(0, Math.max(0, key.indexOf(":")));
+	return Object.hasOwn(KIND_OF_PREFIX, prefix) ? KIND_OF_PREFIX[prefix]! : null;
+}
+
+/**
+ * The key a failed source's error rows go on (`source:<kind>`, review r1 #4): no subject has it, so it never opens an
+ * episode; its `error` row is the key's pending error, on the needs-you surface until a loose `closed` row says the source
+ * evaluated again.
+ */
+export const alertSourceKey = (kind: AlertKind): string => `source:${kind}`;
+
 // ---- the ladder ---------------------------------------------------------------------------------
 
 const HOUR_MS = 3_600_000;
@@ -214,12 +232,20 @@ export interface AlertKeyRecord {
 	key: string;
 	episodes: AlertEpisode[];
 	loose: AlertRowEntry[];
+	/**
+	 * The error the key stands on while no episode of it is open (a legacy alert held before adoption, a failed source, a
+	 * merged issue's cleanup after its episode closed): the newest `error` row written outside an episode, until any later
+	 * row of the key that is not such an error (an opening, `legacy-popup`, `merged-closed`, a loose `closed`). The needs-you
+	 * surface shows it (review r1 #4, #6).
+	 */
+	pending: { channel: string; text: string; at: string; id: string } | null;
 }
 
 /**
  * Every key's record among the standing workload's control entries (`alert:`, valid only from ALERT_BY), oldest first. One
  * episode per key at a time: a `raised` or `adopted` row while an episode is open is kept as a loose row and opens nothing;
- * a row after `closed` that is not a new opening is loose too.
+ * a row after `closed` that is not a new opening is loose too, except a `merged-closed` for an issue an earlier episode
+ * merged, which completes that episode's cleanup (review r1 #5).
  */
 export function alertRecords(control: readonly ControlEntry[]): Map<string, AlertKeyRecord> {
 	const out = new Map<string, AlertKeyRecord>();
@@ -227,11 +253,12 @@ export function alertRecords(control: readonly ControlEntry[]): Map<string, Aler
 		if (c.prefix !== "alert") continue;
 		const p = parseAlertRow(c.rest);
 		if (p === null) continue;
-		const rec = out.get(p.key) ?? { key: p.key, episodes: [], loose: [] };
+		const rec = out.get(p.key) ?? { key: p.key, episodes: [], loose: [], pending: null };
 		out.set(p.key, rec);
 		const entry: AlertRowEntry = { id: c.id, at: c.createdAt, key: p.key, row: p.row };
 		const open = openEpisode(rec);
 		const r = p.row;
+		rec.pending = open === null && r.row === "error" ? { channel: r.channel, text: r.text, at: c.createdAt, id: c.id } : null;
 		if (r.row === "raised" || r.row === "adopted") {
 			if (open !== null) {
 				rec.loose.push(entry);
@@ -252,7 +279,9 @@ export function alertRecords(control: readonly ControlEntry[]): Map<string, Aler
 			continue;
 		}
 		if (open === null) {
-			rec.loose.push(entry);
+			const done = r.row === "merged-closed" ? rec.episodes.findLast((e) => e.merged.get(r.url)?.closedAt === null)?.merged.get(r.url) : undefined;
+			if (done !== undefined) done.closedAt = c.createdAt;
+			else rec.loose.push(entry);
 			continue;
 		}
 		switch (r.row) {
