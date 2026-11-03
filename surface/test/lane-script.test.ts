@@ -7,7 +7,7 @@
 // exit including a thrown exception after the reservation (B3), a stop persists its acceptance
 // then abort → stdin EOF → bounded SIGKILL (B4), and every exit is classified with a requested stop
 // never writing lane-died:.
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -18,7 +18,7 @@ import { apply, applyTrain, interpret } from "../src/input";
 import {
 	emptyTrainScan, scanTrainDays, trainBudgetGate, trainBudgetRows, trainBudgetSliceId, trainMeterErrors, trainPausedBody, trainRaiseBody, type TrainScanResult,
 } from "../src/train-budget";
-import { trainMeterQuestionBody, trainSliceId } from "../src/merge-train";
+import { TRAIN_LAUNCH_LIMIT, trainMeterQuestionBody, trainSliceId } from "../src/merge-train";
 import { errorLines } from "../src/errors";
 import { recordRepo } from "../src/decision-log";
 import { branchName, type ControlEntry, doneBody, laneCap, laneDir, laneEnv, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, trainFixBody, verdictOf, worktreePath } from "../src/launch";
@@ -1700,25 +1700,47 @@ describe("trainMeterPoll: one transaction per poll (PLAN wl-mvr888nftz0vcl D4, R
 		expect(kept.defects.map((d) => `${d.file}:${d.line} ${d.reason}`)).toEqual(s.errors.map((e) => `${e.file}:${e.line} ${e.reason}`));
 	});
 
-	test("an evidence file that cannot be written still stops the lane; the entry says the write failed and why, and names the defects", () => {
+	test("review r2 B1: an evidence file that cannot be written still stops the lane; the entry names every defect and why the write failed, stderr lists every defect, and the parser, gate and question read it all", () => {
 		const w = world();
 		// The lane directory is a plain file, so meter-errors/ under it cannot be made.
 		const blocked = join(w.laneDir, "not-a-dir");
 		writeFileSync(blocked, "");
-		const s = w.scanOf(Array.from({ length: 11 }, (_, i) => `{torn ${i}`));
-		const p = laneScript.trainMeterPoll(w.ledger, { workloadId: w.wl, laneId: LANE, laneDir: blocked, scan: s.scan, errors: s.errors, nowMs: NOW });
+		// thirteen torn lines, past TRAIN_METER_NAMED: each defect is told apart by its own line number
+		const s = w.scanOf(Array.from({ length: 13 }, (_, i) => `{torn ${i}`));
+		expect(s.errors).toHaveLength(13);
+		const stderr = spyOn(process.stderr, "write").mockImplementation(() => true);
+		let p: laneScript.TrainMeterPoll;
+		let logged: string;
+		try {
+			p = laneScript.trainMeterPoll(w.ledger, { workloadId: w.wl, laneId: LANE, laneDir: blocked, scan: s.scan, errors: s.errors, nowMs: NOW });
+		} finally {
+			logged = stderr.mock.calls.map((c) => String(c[0])).join("");
+			stderr.mockRestore();
+		}
 		expect(p).toMatchObject({ stop: true, ref: "meter-error", accepted: true });
-		expect(p.evidence).toMatchObject({ failed: expect.stringContaining(`(under ${blocked})`) });
+		const failed = p.evidence !== null && "failed" in p.evidence ? p.evidence.failed : null;
+		expect(failed).toContain(`(under ${blocked})`);
 		const body = bodiesOf(w, "train-meter-error:")[0]!.body;
-		const f = s.errors[0]!.file;
-		const named = Array.from({ length: 10 }, (_, i) => `${f}:${i + 1} the line is not JSON`).join("; ");
-		expect(body).toStartWith(`train-meter-error: ${LANE} ${named}; and 1 more; evidence write failed: `);
+		const every = s.errors.map((e) => `${e.file}:${e.line} ${e.reason}`);
+		expect(body).toStartWith(`train-meter-error: ${LANE} ${every.join("; ")}; evidence write failed: `);
+		expect(body).not.toContain(" more;");
 		expect(body).toMatch(/ENOTDIR|EEXIST|not a directory/i);
+		expect(logged).toContain(`could not be written: ${failed}; its train-meter-error: names all 13 defects instead`);
+		for (const d of every) expect(logged).toContain(`${LANE} meter defect ${d}\n`);
 		expect(bodiesOf(w, "lane-stop:").map((e) => e.body)).toEqual([laneStopAcceptedBody(LANE, "meter-error")]);
 		expect(existsSync(join(blocked, "meter-errors"))).toBe(false);
+		const rows = trainBudgetRows({ workload: { id: w.wl }, entries: w.ledger.entries(w.wl), questions: w.ledger.questions(w.wl), instructions: w.ledger.instructions(w.wl) });
+		const [parsed] = trainMeterErrors(rows.control);
+		expect(parsed).toMatchObject({ entryId: p.errorId, laneId: LANE, detail: body.slice(`train-meter-error: ${LANE} `.length) });
+		const gate = trainBudgetGate(rows, w.ledger.now());
+		const question = trainMeterQuestionBody(w.wl, parsed!);
+		for (const d of every) {
+			expect(gate!.detail).toContain(d);
+			expect(question).toContain(d);
+		}
 	});
 
-	test("a failed write after a stop was decided still stops (accepted false); under the limit a failure throws", () => {
+	test("a failed write after a stop was decided still stops (accepted false) and logs that the stop counts against the launch limit; under the limit a failure throws", () => {
 		const w = world();
 		const db = new Database(w.path);
 		try {
@@ -1726,8 +1748,20 @@ describe("trainMeterPoll: one transaction per poll (PLAN wl-mvr888nftz0vcl D4, R
 		} finally {
 			db.close();
 		}
-		const p = poll(w, w.scanOf([line("2026-11-02T17:00:00.000Z", 151)]));
+		const stderr = spyOn(process.stderr, "write").mockImplementation(() => true);
+		let p: laneScript.TrainMeterPoll;
+		let logged: string;
+		try {
+			p = poll(w, w.scanOf([line("2026-11-02T17:00:00.000Z", 151)]));
+		} finally {
+			logged = stderr.mock.calls.map((c) => String(c[0])).join("");
+			stderr.mockRestore();
+		}
 		expect(p).toMatchObject({ stop: true, ref: "budget", accepted: false, pauseId: null });
+		expect(logged).toContain(`runner: the train meter's budget stop could not be written on ${w.wl}: `);
+		expect(logged).toContain(
+			`the lane is stopped anyway, and with no episode row naming ${LANE} this stop counts against the train's launch limit (${TRAIN_LAUNCH_LIMIT} failed launches)`,
+		);
 		expect(bodiesOf(w, "lane-stop:")).toEqual([]);
 		expect(() => laneScript.trainMeterPoll(w.ledger, { workloadId: "wl-missing", laneId: LANE, scan: emptyTrainScan(), errors: [], nowMs: NOW })).toThrow(/no workload wl-missing/);
 	});

@@ -196,6 +196,12 @@ describe("review r1 F3: a PR's attempt is decided in its membership transaction,
 		const sl1 = ledger.addSlice({ by: LANE, workloadId: train, id: trainSliceId(train, 117), task: "PR #117", doneCondition: "terminal", inputs: "#117" });
 		return { c, ledger, train, sl1 };
 	};
+	/** The membership entry on `train` that began an attempt, as `TrainAttempt` carries it: its id and its index in the ledger's order; the first matching `first`, else the newest. */
+	const membership = (ledger: Ledger, train: string, prefix: string, first: boolean) => {
+		const es = ledger.entries(train);
+		const index = first ? es.findIndex((e) => e.body.startsWith(prefix)) : es.findLastIndex((e) => e.body.startsWith(prefix));
+		return { entryId: es[index]!.id, index };
+	};
 
 	test("(a) Jo's `train <wl> 117` resuming a held train while #117's attempt-1 slice is open writes no train-attempt row; #117 stays on attempt 1 after that slice is cancelled in the resume's millisecond", () => {
 		const { c, ledger, train, sl1 } = joWorld();
@@ -210,7 +216,9 @@ describe("review r1 F3: a PR's attempt is decided in its membership transaction,
 		// the clock is not moved: the slice turns terminal in the resume row's own millisecond
 		ledger.cancelSlice(sl1, { by: LANE });
 		expect(ledger.slice(sl1)!.changed_at).toBe(resume.created_at);
-		expect(trainAttemptsOf(ledger, train).get(117)).toEqual({ attempt: 1, since: ledger.entries(train).find((e) => e.body.startsWith("train: 117 "))!.created_at });
+		expect(trainAttemptsOf(ledger, train).get(117)).toEqual({
+			attempt: 1, since: ledger.entries(train).find((e) => e.body.startsWith("train: 117 "))!.created_at, ...membership(ledger, train, "train: 117 ", true),
+		});
 		expect(attemptRows(ledger, train)).toEqual([]);
 	});
 
@@ -222,7 +230,10 @@ describe("review r1 F3: a PR's attempt is decided in its membership transaction,
 		expect(receipt).toStartWith(`added #117 (attempt 2) to merge train ${train} (instruction `);
 		const at = ledger.slice(sl1)!.changed_at;
 		expect(attemptRows(ledger, train)).toEqual([[SURFACE_BY, "train-attempt: pr 117 attempt 2", at]]);
-		expect(trainAttemptsOf(ledger, train).get(117)).toEqual({ attempt: 2, since: at });
+		// review r2 M1: the boundary is Jo's new `train:` row, written just before the attempt row in one transaction
+		const begun = membership(ledger, train, "train: 117 ", false);
+		expect(ledger.entries(train)[begun.index + 1]!.body).toBe("train-attempt: pr 117 attempt 2");
+		expect(trainAttemptsOf(ledger, train).get(117)).toEqual({ attempt: 2, since: at, ...begun });
 	});
 
 	test("(b) boardLanding: a terminal attempt-1 slice, then a re-board in the same millisecond, starts attempt 2 and writes its row as the merge train", () => {
@@ -238,7 +249,9 @@ describe("review r1 F3: a PR's attempt is decided in its membership transaction,
 		expect(r).toMatchObject({ boarded: true, train, opened: false });
 		const at = w.ledger.slice(sl1)!.changed_at;
 		expect(attemptRows(w.ledger, train)).toEqual([[MERGE_TRAIN_BY, "train-attempt: pr 117 attempt 2", at]]);
-		expect(trainAttemptsOf(w.ledger, train).get(117)).toEqual({ attempt: 2, since: at });
+		const begun = membership(w.ledger, train, "train-board: pr 117 ", false);
+		expect(begun.entryId).toBe(r.boarded ? r.entryId : "");
+		expect(trainAttemptsOf(w.ledger, train).get(117)).toEqual({ attempt: 2, since: at, ...begun });
 	});
 
 	test("(c) a membership with no train-attempt row reads as attempt 1, even a second train-board: written after attempt 1's slice turned terminal", () => {
@@ -254,7 +267,7 @@ describe("review r1 F3: a PR's attempt is decided in its membership transaction,
 		expect(trainPrs(w.ledger.entries(train), w.ledger.instructions(train))).toEqual([117]);
 		expect(attemptRows(w.ledger, train)).toEqual([]);
 		const firstBoard = w.ledger.entries(train).find((e) => e.body.startsWith("train-board: pr 117 "))!;
-		expect(trainAttemptsOf(w.ledger, train).get(117)).toEqual({ attempt: 1, since: firstBoard.created_at });
+		expect(trainAttemptsOf(w.ledger, train).get(117)).toEqual({ attempt: 1, since: firstBoard.created_at, ...membership(w.ledger, train, "train-board: pr 117 ", true) });
 	});
 });
 

@@ -13,7 +13,7 @@ import { appendFileSync, mkdirSync, readdirSync, statSync, writeFileSync } from 
 import { join } from "node:path";
 import { nowMarks } from "../../gates/src/rulings";
 import { budgetRefusalLine } from "../extensions/launch";
-import { askTrainPause, budgetQuestions, nextPdtMidnight, pdtDay, trainBudgetSliceId, trainDayLimit, trainMeterErrorBody, trainPausedBody, trainRaiseBody } from "../src/train-budget";
+import { askTrainPause, budgetQuestions, nextPdtMidnight, pdtDay, trainBudgetRows, trainBudgetSliceId, trainDayLimit, trainMeterErrorBody, trainPausedBody, trainRaiseBody } from "../src/train-budget";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { type GhResult, tick } from "../scripts/train-tick";
 import { type Ceiling, ceilingBody, type Spend, spendBody } from "../src/ceiling";
@@ -21,11 +21,11 @@ import { errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
 import { apply, applyTrain, interpret } from "../src/input";
 import {
-	controlEntries, decideLaunch, laneExitBody, laneHeadroomBody, laneReadyBody, launchFailedBody, launchRequestedBody, launchRowsFor, landFirstBody, landFirstInstructionBody, mainRetryBody,
+	controlEntries, decideLaunch, laneExitBody, laneHeadroomBody, laneReadyBody, laneStopAcceptedBody, launchFailedBody, launchRequestedBody, launchRowsFor, landFirstBody, landFirstInstructionBody, mainRetryBody,
 	mainRetryInstructionBody, planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody,
 } from "../src/launch";
 import {
-	actionable, type ControlRoot, fixBindings, landFirstNoticeBody, landFirstRows, latestTrainReconciled, mainRedNotices, protectionEpisodes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs,
+	actionable, budgetWakes, type ControlRoot, fixBindings, landFirstNoticeBody, landFirstRows, latestTrainReconciled, mainRedNotices, protectionEpisodes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, TRAIN_LAUNCH_LIMIT, trainActivityArgs,
 	retireSupersededFullSlices, testRunStarts, TRAIN_LAUNCH_OPTIONS, TRAIN_METER_OPTIONS, TRAIN_STALL_OPTIONS, trainAlertBody, trainAlertMarker, trainAttemptsOf, trainFullSliceId, trainHeadWokenBody, trainHoldBody, trainLaunchFailures, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody, type WakeDeferral,
 } from "../src/merge-train";
 import { trainMergedNoticeBody } from "../src/notice";
@@ -2012,6 +2012,68 @@ describe("the permanent train in the tick (PLAN wl-mvr888nftz0vcl D5, D6, D8, D9
 		}
 		v.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: v.train, kind: "assumption", body: launchRequestedBody("merge-train", v.ledger.now()) });
 		expect(laneScript.reserve(v.ledger, v.train, LANE_RUNNER_BY, false, SHOW, () => gone)).toMatchObject({ ok: false, reason: expect.stringMatching(/^not-launchable: train launch limit: 3 consecutive failed launches/) });
+	});
+
+	test("review r2 B2: four relaunches whose train-paused: insertion failed, with Jo's raise wake unconsumed, reach the launch limit; a recorded pause stays exempt", () => {
+		const w = perm();
+		ensureStandingWorkload(w.ledger);
+		const SHOW: RankConfig = { mode: "show", parallelBudgetUsd: 0 };
+		const gone: laneScript.RunnerProbe = { omp: () => "gone", runner: () => "gone" };
+		const meter = (lane: string) => {
+			const nowMs = Date.parse(w.c.now());
+			return laneScript.trainMeterPoll(w.ledger, { workloadId: w.train, laneId: lane, scan: { files: new Map(), days: new Map([[pdtDay(nowMs), 400]]) }, errors: [], nowMs });
+		};
+		const failures = () => {
+			const now = w.ledger.workload(w.train)!;
+			return trainLaunchFailures({ entries: w.ledger.entries(w.train), instructions: w.ledger.instructions(w.train), questions: w.ledger.questions(w.train), holder: now.holder, holderLeaseUntil: now.holder_lease_until, now: w.ledger.now() });
+		};
+		const wakes = () => budgetWakes(trainBudgetRows({ workload: { id: w.train }, entries: w.ledger.entries(w.train), questions: w.ledger.questions(w.train), instructions: w.ledger.instructions(w.train) }), w.ledger.now());
+		// the recorded pause: the ready lane reaches the day's limit, its episode written; then Jo's raise of $10, under the $400 spent
+		const first = meter(TRAIN_LANE);
+		expect(first).toMatchObject({ stop: true, ref: "budget", accepted: true });
+		w.end("stop", "budget");
+		later(w, 0.1);
+		apply(w.ledger, interpret(w.ledger, `raise 10 ${first.questionId}`)!);
+		expect(failures().count).toBe(0);
+		const raised = wakes();
+		expect(raised).toEqual([expect.stringMatching(/^budget raised en-/)]);
+		// from here every train-paused: insertion fails: each relaunched lane stops at its meter with no episode row
+		w.ledger.db.exec("CREATE TRIGGER inject_pause_failure BEFORE INSERT ON entries WHEN NEW.body LIKE 'train-paused:%' BEGIN SELECT RAISE(ABORT, 'injected: train-paused: insert failed'); END;");
+		const admitted: string[] = [];
+		const refusals: string[] = [];
+		const pass = () => tick({
+			ledger: w.ledger, gh: w.g.gh, as2testRoot: w.root,
+			launch: (wl) => {
+				const r = laneScript.reserve(w.ledger, wl, MERGE_TRAIN_BY, false, SHOW, () => gone);
+				if (!r.ok) {
+					refusals.push(r.reason);
+					return { code: 1, line: `${wl} not launched: ${r.reason}` };
+				}
+				admitted.push(r.laneId);
+				expect(meter(r.laneId)).toMatchObject({ stop: true, ref: "budget", accepted: false, pauseId: null, questionId: null });
+				// the runner's own acceptance (lane.ts `stop`) and its exit, outcome stop reason budget
+				w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneStopAcceptedBody(r.laneId, "budget") });
+				w.end("stop", "budget");
+				return { code: 0, line: `launched ${r.laneId}` };
+			},
+			notify: (_t, text) => {
+				w.notes.push(text);
+				return true;
+			},
+		});
+		for (let i = 1; i <= 4; i++) {
+			later(w, 0.01);
+			pass();
+		}
+		// the wake is never consumed (no lane got ready), yet the relaunches stop at the limit
+		expect(wakes()).toEqual(raised);
+		expect(admitted).toHaveLength(TRAIN_LAUNCH_LIMIT);
+		const f = failures();
+		expect(f.count).toBe(TRAIN_LAUNCH_LIMIT);
+		expect(f.lanes).toEqual(admitted);
+		expect(f.lanes).not.toContain(TRAIN_LANE);
+		for (const line of f.failures) expect(line).toContain("its budget stop recorded no train-paused: or train-meter-error: naming it (the episode write failed), so it counts");
+		expect(w.ledger.questions(w.train).filter((x) => JSON.stringify(JSON.parse(x.options)) === JSON.stringify(TRAIN_LAUNCH_OPTIONS))).toHaveLength(1);
 	});
 
 	test("review r1 F4: #101 skipped with its full slice's run live, re-boarded as attempt 2; once the old run is red the next pass cancels the old full slice once, as the merge train, and attempt 2's slices are untouched", () => {

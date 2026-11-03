@@ -146,14 +146,21 @@ describe("scanTrainDays: the strict incremental reader (D4, R4, R5)", () => {
 		);
 	});
 
-	test("train-meter-error: names the first TRAIN_METER_NAMED defects, counts the rest, and says where all of them are or why they are not", () => {
+	test("train-meter-error: with its evidence file names the first TRAIN_METER_NAMED defects and counts the rest; with none, names nothing more", () => {
 		const defects = Array.from({ length: TRAIN_METER_NAMED + 2 }, (_, i) => ({ file: "/s/x.jsonl", line: i + 1, reason: "the line is not JSON" }));
 		const named = defects.slice(0, TRAIN_METER_NAMED).map((d) => `/s/x.jsonl:${d.line} the line is not JSON`).join("; ");
 		expect(trainMeterErrorBody("lane-x", defects, { path: "/e.json" })).toBe(`train-meter-error: lane-x ${named}; and 2 more; evidence /e.json`);
 		expect(trainMeterErrorBody("lane-x", defects.slice(0, TRAIN_METER_NAMED), { path: "/e.json" })).toBe(`train-meter-error: lane-x ${named}; evidence /e.json`);
-		expect(trainMeterErrorBody("lane-x", defects, { failed: "ENOTDIR: not a\ndirectory" })).toBe(`train-meter-error: lane-x ${named}; and 2 more; evidence write failed: ENOTDIR: not a directory`);
 		expect(trainMeterErrorBody("lane-x", defects.slice(0, 1), null)).toBe("train-meter-error: lane-x /s/x.jsonl:1 the line is not JSON");
 		expect(() => trainMeterErrorBody("lane-x", [], null)).toThrow(/no defect given for lane-x/);
+	});
+
+	test("review r2 B1: when the evidence file could not be written, train-meter-error: names every one of more than TRAIN_METER_NAMED distinct defects beside the write failure", () => {
+		const defects = Array.from({ length: TRAIN_METER_NAMED + 3 }, (_, i) => ({ file: `/s/file-${i}.jsonl`, line: 100 + i, reason: `defect number ${i} of its own kind` }));
+		const body = trainMeterErrorBody("lane-x", defects, { failed: "ENOSPC: disk\nfull" });
+		expect(body).toBe(`train-meter-error: lane-x ${defects.map((d) => `${d.file}:${d.line} ${d.reason}`).join("; ")}; evidence write failed: ENOSPC: disk full`);
+		for (const d of defects) expect(body).toContain(`${d.file}:${d.line} ${d.reason}`);
+		expect(body).not.toContain(" more;");
 	});
 
 	test("a file that shrank below what was counted is an error, not a rescan", () => {

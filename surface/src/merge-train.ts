@@ -114,10 +114,21 @@ export function trainSlicePr(sliceId: string, wl: string): number | null {
 	return parseTrainSlice(sliceId, wl)?.pr ?? null;
 }
 
-/** A member PR's current attempt on a train (`trainAttempts`): its number and the created_at of the membership entry that began it. */
+/**
+ * A member PR's current attempt on a train (`trainAttempts`): its number, the created_at `since` of the row that began it
+ * (its first membership entry for attempt 1, its `train-attempt:` row for attempt m ≥ 2), and the membership entry that began
+ * it (`entryId`) with that entry's ledger position (`index`).
+ */
 export interface TrainAttempt {
 	attempt: number;
 	since: string;
+	/** The membership entry (Jo's `train:` or the tick's `train-board:`) that began the attempt. */
+	entryId: string;
+	/**
+	 * That entry's index in the `entries` `trainAttempts` was given, in `Ledger.entries` order (created_at, then rowid: write
+	 * order within one millisecond), so two rows in one millisecond are ordered as they were written (review r2 M1).
+	 */
+	index: number;
 }
 
 /**
@@ -128,18 +139,27 @@ export interface TrainAttempt {
  * by that row's writer). A member with no `train-attempt:` row is on attempt 1, so a membership written before the row
  * existed reads as attempt 1, and re-naming a PR whose attempt is open (Jo's `train <wl> <N…>` resuming a held train) writes
  * no row and begins nothing, whatever its slice does afterwards. A row naming a PR that is no member begins nothing; a PR
- * absent from the map is no member.
+ * absent from the map is no member. Attempt m's boundary is the membership entry that began it: both writers (`appendTrain`
+ * in surface/src/input.ts, `boardLanding`) write it just before the `train-attempt:` row in one transaction, so it is the
+ * newest membership entry naming the PR before that row in `entries` order; a row with none before it named no member when
+ * it was written and begins nothing. Pass `entries` in `Ledger.entries` order.
  */
 export function trainAttempts(entries: readonly EntryRow[], instructions: readonly InstructionRow[]): Map<number, TrainAttempt> {
+	const index = new Map(entries.map((e, i) => [e.id, i] as const));
+	const bindings = trainBindings(entries, instructions).map((b) => ({ ...b, index: index.get(b.entryId)! }));
 	const out = new Map<number, TrainAttempt>();
-	for (const b of trainBindings(entries, instructions)) {
-		for (const pr of b.prs) if (!out.has(pr)) out.set(pr, { attempt: 1, since: b.createdAt });
+	for (const b of bindings) {
+		for (const pr of b.prs) if (!out.has(pr)) out.set(pr, { attempt: 1, since: b.createdAt, entryId: b.entryId, index: b.index });
 	}
 	for (const c of controlEntries(entries)) {
-		if (c.prefix !== "train-attempt") continue;
-		const m = TRAIN_ATTEMPT_RE.exec(c.rest);
-		const cur = m ? out.get(Number(m[1])) : undefined;
-		if (m && cur !== undefined && Number(m[2]) > cur.attempt) out.set(Number(m[1]), { attempt: Number(m[2]), since: c.createdAt });
+		const m = c.prefix === "train-attempt" ? TRAIN_ATTEMPT_RE.exec(c.rest) : null;
+		if (m === null) continue;
+		const pr = Number(m[1]);
+		const attempt = Number(m[2]);
+		const cur = out.get(pr);
+		const at = index.get(c.id)!;
+		const start = bindings.findLast((b) => b.index < at && b.prs.includes(pr));
+		if (cur !== undefined && start !== undefined && attempt > cur.attempt) out.set(pr, { attempt, since: c.createdAt, entryId: start.entryId, index: start.index });
 	}
 	return out;
 }
@@ -2205,15 +2225,18 @@ export function trainSignoff(ledger: Ledger, train: string, pr: number, view: Ta
 	const trainQuestions = ledger.questions(train);
 	if (view.number !== pr) return no(`gh's view is of #${view.number}, not #${pr}`);
 	// Lane decision en-mvznmxcdh0ucsj: the sign-off is about the PR's current boarding attempt; Jo's train word must name it at or
-	// after that attempt began, so his word on an earlier attempt never signs off a later one.
+	// after the membership entry that began that attempt in ledger order (`TrainAttempt.index`, `Ledger.entries` order: created_at,
+	// then rowid), never by timestamp, so his word on an earlier attempt never signs off a later one written in the same
+	// millisecond (review r2 M1), and his word that itself began the attempt does.
 	const attempts = trainAttempts(trainEntries, trainInstructions);
-	const since = attempts.get(pr)?.since ?? "";
+	const start = attempts.get(pr)?.index ?? 0;
+	const position = new Map(trainEntries.map((e, i) => [e.id, i] as const));
 	const slice = trainSliceId(train, pr, attemptOf(attempts, pr));
 	const asked = trainQuestions.find((q) => q.state === "open" && trainSlicePr(q.slice_id, train) === pr);
 	if (asked !== undefined) return no(`${asked.slice_id} has open question ${asked.id}: Jo's answer stands`);
 	const stopped = trainHold({ entries: trainEntries, instructions: trainInstructions, questions: trainQuestions });
 	if (stopped !== null) return no(stopped);
-	if (!trainBindings(trainEntries, trainInstructions).some((b) => b.source === "jo" && b.prs.includes(pr) && b.createdAt >= since)) return no(`no train word of Jo's on ${train} names #${pr}`);
+	if (!trainBindings(trainEntries, trainInstructions).some((b) => b.source === "jo" && b.prs.includes(pr) && position.get(b.entryId)! >= start)) return no(`no train word of Jo's on ${train} names #${pr}`);
 	const b = branchWorkload(view, trainRepo, ledger);
 	if (!b.ok) return no(b.reason);
 	if (b.w.stakes !== "production") return no(`${b.id}'s stakes are ${b.w.stakes}, not production`);
@@ -2659,8 +2682,9 @@ export interface TrainLaunchFailures {
  * attempt and the workload is no longer held by it under a live lease (a starter or runner that died before readiness without
  * finalizing). The walk stops at an attempt whose lane wrote `lane-ready:`, at a by-hand attempt (`cause interactive`: Jo's
  * session gets its first prompt from a file and has no runner readiness step, so it is never a failed launch, as
- * `neverReadyLanes` reads it) and at an intended meter stop (`trainMeterStopped`: the runner's pre-prompt budget or meter-error
- * stop returns before `lane-ready:`, and the budget gate, not this limit, bounds what follows it); the newest attempt still held
+ * `neverReadyLanes` reads it) and at a recorded meter episode (`trainMeterStopped`: the runner's pre-prompt budget or
+ * meter-error stop returns before `lane-ready:`, and the budget gate, not this limit, bounds what follows its `train-paused:` or
+ * `train-meter-error:`; a meter stop whose episode row was never written counts, its line saying so); the newest attempt still held
  * under a live lease and not ready is in flight and not counted. A reset is Jo's `launch-requested: by jo`, Jo's `relaunch`
  * answer to the D4 question (the tick's, options `TRAIN_LAUNCH_OPTIONS`) or a `train:` binding; an attempt counts only when
  * written after it (entry order on a tie with an entry, the attempt on a tie with an answer). Pure: pass the rows one read took.
@@ -2696,7 +2720,12 @@ export function trainLaunchFailures(rows: TrainLaunchRows): TrainLaunchFailures 
 			: next ? `no lane-ready:, superseded by ${next.laneId}${exit ? ` (lane-exit: outcome ${exit.outcome})` : ""}`
 			: rows.holder === a.laneId && live ? null
 			: `no lane-ready:, ${rows.holder === a.laneId ? "its lease lapsed" : `the workload is held by ${rows.holder ?? "no one"}`}${exit ? ` (lane-exit: outcome ${exit.outcome})` : ""}`;
-		if (why !== null) counted.unshift({ laneId: a.laneId, at: a.createdAt, line: `${a.laneId} (${a.createdAt}): ${why}` });
+		// Review r2 B2: a meter stop whose episode row was never written is no recorded episode; it counts, and says why.
+		const unrecorded = trainMeterStopRef(control, a.laneId);
+		const line = why === null ? null
+			: unrecorded === null ? why
+			: `${why}; its ${unrecorded} stop recorded no train-paused: or train-meter-error: naming it (the episode write failed), so it counts`;
+		if (line !== null) counted.unshift({ laneId: a.laneId, at: a.createdAt, line: `${a.laneId} (${a.createdAt}): ${line}` });
 	}
 	return {
 		count: counted.length,
@@ -2711,16 +2740,30 @@ export function trainLaunchFailures(rows: TrainLaunchRows): TrainLaunchFailures 
 const TRAIN_METER_STOP = /^(budget|meter-error)$/;
 
 /**
- * Whether `laneId` ended in the train meter's intended stop (PLAN wl-mvr888nftz0vcl D4), never a failed launch: the runner's
- * `lane-stop: <lane> accepted budget|meter-error`, written in the meter poll's own transaction with its `train-paused:` or
- * `train-meter-error:` (`controlEntries` keeps only the runner's or starter's acceptance), else, when that write failed, the
- * exit the runner finalized with, `lane-exit: … outcome stop reason budget|meter-error`. The acceptance is read first because
- * it lands before the exit and survives a runner that dies before finalizing.
+ * The train meter's stop reference `laneId` ended with, or null: the runner's `lane-stop: <lane> accepted budget|meter-error`
+ * (`controlEntries` keeps only the runner's or starter's acceptance), else the exit it finalized with, `lane-exit: … outcome
+ * stop reason budget|meter-error`. Neither says the stop's episode was recorded: a meter poll whose transaction failed still
+ * stops the lane, and the runner accepts that stop on its own.
+ */
+export function trainMeterStopRef(control: readonly ControlEntry[], laneId: string): string | null {
+	for (const c of control) {
+		const ref = c.prefix === "lane-stop" && c.laneId === laneId ? /^accepted\s+(\S+)$/.exec(c.rest)?.[1] : undefined;
+		if (ref !== undefined && TRAIN_METER_STOP.test(ref)) return ref;
+	}
+	const exit = laneExit(control, laneId);
+	return exit !== null && exit.outcome === "stop" && exit.reason !== null && TRAIN_METER_STOP.test(exit.reason) ? exit.reason : null;
+}
+
+/**
+ * Whether `laneId` ended in a recorded train meter episode (PLAN wl-mvr888nftz0vcl D4), never a failed launch: a valid
+ * `train-paused:` (`trainPauses`) or `train-meter-error:` (`trainMeterErrors`) naming that lane, the runner's row written in
+ * the meter poll's one transaction with its `lane-stop: <lane> accepted budget|meter-error`, or the runner's fail-closed
+ * meter error. The budget gate holds such an episode, so it, not the launch limit, bounds what follows. A meter stop with no
+ * such row (the poll's or the fail-closed write failed; `trainMeterStopRef` alone) is not exempt (review r2 B2): nothing gates
+ * the next launch, so it counts as a failed launch and TRAIN_LAUNCH_LIMIT bounds the relaunches.
  */
 export function trainMeterStopped(control: readonly ControlEntry[], laneId: string): boolean {
-	if (control.some((c) => c.prefix === "lane-stop" && c.laneId === laneId && TRAIN_METER_STOP.test(/^accepted\s+(\S+)$/.exec(c.rest)?.[1] ?? ""))) return true;
-	const exit = laneExit(control, laneId);
-	return exit !== null && exit.outcome === "stop" && exit.reason !== null && TRAIN_METER_STOP.test(exit.reason);
+	return trainPauses(control).some((p) => p.laneId === laneId) || trainMeterErrors(control).some((e) => e.laneId === laneId);
 }
 
 /** D4's question body: the count, the time span and lanes, what each answer does, then each failure line. */

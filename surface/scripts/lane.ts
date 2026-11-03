@@ -75,7 +75,7 @@ import { loadTestRunnerConfig } from "../src/close-entry";
 import { checkoutOwnerRepo, isTrainOrFix, openTrains, ownerTasks, TRAIN_LAUNCH_LIMIT, trainAttempts, trainLaunchFailures, trainMembers } from "../src/merge-train";
 import {
 	activeTrainPr, askTrainPause, emptyTrainScan, nextPdtMidnight, pdtDay, scanTrainDays, trainBudgetGate, trainBudgetPromptLine, trainBudgetRows, trainDayLimit, trainMaxTime,
-	TRAIN_METER_NAMED, trainMeterErrorBody, type TrainMeterEvidence, trainPausedBody, trainRuleBody, type TrainScan, type TrainScanError,
+	trainMeterErrorBody, type TrainMeterEvidence, trainPausedBody, trainRuleBody, type TrainScan, type TrainScanError,
 } from "../src/train-budget";
 import {
 	attempts, branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, heldLive, holdersOf,
@@ -862,7 +862,8 @@ export interface TrainMeterPoll {
  * A meter error's evidence (PLAN wl-mvr888nftz0vcl D5, D9): every defect of one poll, as JSON, in a new file
  * `<laneDir>/meter-errors/<lane>-<instant>.json` under the lane directory the runner already writes this workload's files in
  * (`prepare`'s `dir`). Never overwrites a kept file (`wx`). Returns the path, or why the write failed; it never throws, so
- * the stop it is evidence for still happens and the `train-meter-error:` says the write failed.
+ * the stop it is evidence for still happens. On a failed write it logs the failure and every defect, one per line, and the
+ * `train-meter-error:` (`trainMeterErrorBody` with `{ failed }`) names every defect too (review r2 B1).
  */
 export function writeMeterEvidence(
 	laneDir: string, r: { workloadId: string; laneId: string; errors: readonly TrainScanError[]; nowMs: number },
@@ -877,7 +878,10 @@ export function writeMeterEvidence(
 		return { path };
 	} catch (err) {
 		const failed = `${oneLine(err)} (under ${laneDir})`;
-		process.stderr.write(`runner: the train meter's evidence file for ${r.laneId} on ${r.workloadId} could not be written: ${failed}; its train-meter-error: says so and names the first ${TRAIN_METER_NAMED} defects\n`);
+		const lines = r.errors.map((e) => `runner:   ${r.laneId} meter defect ${e.file}:${e.line} ${oneLine(e.reason)}\n`).join("");
+		process.stderr.write(
+			`runner: the train meter's evidence file for ${r.laneId} on ${r.workloadId} could not be written: ${failed}; its train-meter-error: names all ${r.errors.length} defects instead, and so do these lines:\n${lines}`,
+		);
 		return { failed };
 	}
 }
@@ -888,10 +892,11 @@ export function writeMeterEvidence(
  * `train-paused:` (the PR `activeTrainPr` names for this lane), its raise/wait question (`askTrainPause`, keyed to the
  * pause) and `lane-stop: <lane> accepted budget`. A scan defect first keeps every defect in an evidence file under `laneDir`
  * (`writeMeterEvidence`), then writes `train-meter-error:` naming the first TRAIN_METER_NAMED defects, how many more, and
- * that file (or why it could not be written), and `lane-stop: <lane> accepted meter-error`; a pause the same poll reaches
- * is written too, so one failure never hides the other. When the writes fail after a stop was decided (any scan defect is
- * one), the stop still stands (`accepted` false: the caller accepts it on its own) and the meter error is logged whole;
- * any other failure throws.
+ * that file, or, when the file could not be written, every defect and why (`trainMeterErrorBody`), and `lane-stop: <lane>
+ * accepted meter-error`; a pause the same poll reaches is written too, so one failure never hides the other. When the writes
+ * fail after a stop was decided (any scan defect is one), the stop still stands (`accepted` false: the caller accepts it on
+ * its own), the meter error is logged whole, and the log says the stop counts against the launch limit: with no episode row
+ * naming the lane, `trainMeterStopped` (surface/src/merge-train.ts) does not exempt it. Any other failure throws.
  */
 export function trainMeterPoll(
 	ledger: Ledger,
@@ -925,7 +930,11 @@ export function trainMeterPoll(
 	} catch (err) {
 		if (ref === null) throw err;
 		const lost = errorBody === null ? "" : `; the meter error it could not record: ${errorBody}`;
-		process.stderr.write(`runner: the train meter's ${ref} stop could not be written on ${r.workloadId}: ${String(err)}; the lane is stopped anyway${lost}\n`);
+		// Review r2 B2: with no train-paused: or train-meter-error: naming this lane, its stop is no recorded episode, so
+		// trainLaunchFailures (surface/src/merge-train.ts) counts it as a failed launch and TRAIN_LAUNCH_LIMIT bounds the relaunches.
+		process.stderr.write(
+			`runner: the train meter's ${ref} stop could not be written on ${r.workloadId}: ${String(err)}; the lane is stopped anyway, and with no episode row naming ${r.laneId} this stop counts against the train's launch limit (${TRAIN_LAUNCH_LIMIT} failed launches)${lost}\n`,
+		);
 		return { stop: true, ref, accepted: false, day, spent, errorId: null, evidence, pauseId: null, questionId: null };
 	}
 }
@@ -1556,7 +1565,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			try {
 				record(trainMeterErrorBody(laneId, [{ file: "the runner's train meter", line: 0, reason: String(err) }], null));
 			} catch (writeErr) {
-				process.stderr.write(`runner: the train-meter-error: line could not be written either: ${String(writeErr)}\n`);
+				process.stderr.write(
+					`runner: the train-meter-error: line could not be written either: ${String(writeErr)}; with no episode row naming ${laneId} this stop counts against the train's launch limit (${TRAIN_LAUNCH_LIMIT} failed launches)\n`,
+				);
 			}
 		}
 		if (ref !== null) stop(ref, ref, accepted);
