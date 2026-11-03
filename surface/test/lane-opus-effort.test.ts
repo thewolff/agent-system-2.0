@@ -6,8 +6,13 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
-import laneRow, { OPUS_MEDIUM_MODEL, thinkingLevelSetBody } from "../extensions/lane";
+import laneRow from "../extensions/lane";
 import { ctxOf, fakePi, tmp } from "./helpers";
+
+// Spelled here, not imported, so on a tree without the change this file still loads and fails by assertion.
+const OPUS_MEDIUM_MODEL = "anthropic/claude-opus-5-5";
+const thinkingLevelSetBody = (model: string): string =>
+	`thinking-level: ${model} entered; set medium (Jo's in-mv8gcb2bbue4g0); a level set while on this entry is kept`;
 
 type Model = { provider: string; id: string };
 const OPUS: Model = { provider: "anthropic", id: "claude-opus-5-5" };
