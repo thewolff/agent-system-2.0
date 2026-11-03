@@ -50,7 +50,7 @@ function fixture() {
 		const runId = `tr-off${pr}`;
 		const entry = (body: string) => ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, kind: "assumption", body });
 		entry(testRequestedBody({ runId, pr, sha: head, slice: `sl-off${pr}`, by: "lane-off" }));
-		entry(fastPlanBody(runId, scope === "tree" ? { ref: "wl/test", scope, g: HEAD, run: "tr-main" } : scope === "fast" ? { ref: "wl/test", scope, files: ["a.test.ts"], parse: [], macOnly: [] } : { ref: "wl/test", scope, reasons: ["schema"] }));
+		entry(fastPlanBody(runId, scope === "tree" ? { ref: "wl/test", scope, g: HEAD, run: "tr-main" } : scope === "fast" ? { ref: "wl/test", scope, files: ["a.test.ts"], parse: [], macOnly: [], mainSkip: [] } : { ref: "wl/test", scope, reasons: ["schema"] }));
 		entry(testRunBody({ runId, pr, sha: head, verdict: "green", reason: null, headAtEnd: head, base: null, mergeBase: null, full: null, solo: [], failures: [], runDir: null, preflight: "ok", scope: scope === "fast" ? "fast" : "full", host: scope === "fast" ? "linux" : "mac", main: false, exec: null }));
 	};
 	result(1, HEAD, "fast");
@@ -160,7 +160,7 @@ describe("land-first off reconciliation", () => {
 			const entry = (body: string) => x.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: x.wl, kind: "assumption", body });
 			if (source !== "missing") {
 				entry(testRequestedBody({ runId: "tr-source", pr: 1, sha: FULL, slice: "sl-source", by: "lane-off" }));
-				entry(fastPlanBody("tr-source", source === "tree" ? { ref: "wl/test", scope: "tree", g: HEAD, run: "tr-main" } : source === "fast" ? { ref: "wl/test", scope: "fast", files: ["a.test.ts"], parse: [], macOnly: [] } : { ref: "wl/test", scope: "full", reasons: ["schema"] }));
+				entry(fastPlanBody("tr-source", source === "tree" ? { ref: "wl/test", scope: "tree", g: HEAD, run: "tr-main" } : source === "fast" ? { ref: "wl/test", scope: "fast", files: ["a.test.ts"], parse: [], macOnly: [], mainSkip: [] } : { ref: "wl/test", scope: "full", reasons: ["schema"] }));
 				entry(testRunBody({ runId: "tr-source", pr: 1, sha: FULL, verdict: "green", reason: source === "cycle" ? `carried from tr-copy at ${OTHER} (decision-log only)` : null, headAtEnd: FULL, base: null, mergeBase: null, full: null, solo: [], failures: [], runDir: null, preflight: "ok", scope: source === "fast" ? "fast" : "full", host: source === "fast" ? "linux" : "mac", main: false, exec: null }));
 			}
 			entry(testRequestedBody({ runId: "tr-copy", pr: 1, sha: OTHER, slice: "sl-copy", by: "lane-off" }));

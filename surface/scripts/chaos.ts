@@ -1319,10 +1319,6 @@ async function main(argv: string[]): Promise<number> {
 	return new Run(fault!, a.variant, a.nightly).execute();
 }
 
-if (import.meta.main) {
-	process.exit(await main(process.argv.slice(2)));
-}
-
 /** install.sh exit code for "the closing doctor found failing parts" (install/install.sh header: "else `install incomplete: as2 doctor found failing parts (above)` and exit 5"). */
 const INSTALL_DOCTOR_FAILED = 5;
 
@@ -1341,3 +1337,10 @@ function installOutcome(install: { code: number | null; timedOut?: boolean; err:
 }
 
 export { parseArgs, nonceMisses, installOutcome, INSTALL_DOCTOR_FAILED };
+
+// The entry point stays last: `await main()` runs before any module-level `const` declared below it is initialized,
+// so a declaration after this block throws "Cannot access … before initialization" in the nightly run only
+// (tests import this module, so import.meta.main is false there). That shipped once: INSTALL_DOCTOR_FAILED, 2026-11-03.
+if (import.meta.main) {
+	process.exit(await main(process.argv.slice(2)));
+}

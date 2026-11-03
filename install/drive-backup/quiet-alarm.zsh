@@ -28,7 +28,7 @@
 title=$1 text=$2 spoken=$3
 give_up=${QUIET_ALARM_GIVE_UP_SECS:-0}
 [[ $give_up == <-> ]] || give_up=0
-errfile=$(mktemp -t quiet-alarm) || errfile=/dev/null
+errfile=$(mktemp "${TMPDIR:-/tmp}/quiet-alarm.XXXXXX") || errfile=/dev/null
 choice=$("${QUIET_ALARM_OSASCRIPT:-/usr/bin/osascript}" - "$title" "$text" "$give_up" <<'APPLESCRIPT' 2>"$errfile"
 on run argv
 	set giveUp to (item 3 of argv) as integer

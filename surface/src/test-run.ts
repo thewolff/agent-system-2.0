@@ -292,9 +292,12 @@ export function withFullSuitePublication<T>(root: string, repo: string, body: (r
 	return value;
 }
 
-/** The runner's admission plan; tree carries are not full-suite execution even when their result has full scope. */
+/**
+ * The runner's admission plan; tree carries are not full-suite execution even when their result has full scope. A fast plan's
+ * `macOnly` and `mainSkip` are the fast-set test files left out of `files` (surface/src/fast-set.ts `FastRun`).
+ */
 export type FastPlan = { ref: string } & (
-	| { scope: "fast"; files: string[]; parse: string[]; macOnly: string[] }
+	| { scope: "fast"; files: string[]; parse: string[]; macOnly: string[]; mainSkip: string[] }
 	| { scope: "full"; reasons: string[] }
 	| { scope: "tree"; g: string; run: string }
 );
@@ -317,7 +320,11 @@ export function parseFastPlan(body: string): { runId: string; plan: FastPlan } |
 	const p = v as Record<string, unknown>;
 	if (v === null || typeof v !== "object" || typeof p.ref !== "string") return null;
 	const ref = p.ref;
-	if (p.scope === "fast" && planStrings(p.files) && planStrings(p.parse) && planStrings(p.macOnly)) return { runId: m[1]!, plan: { ref, scope: "fast", files: p.files, parse: p.parse, macOnly: p.macOnly } };
+	// A fast plan recorded before mainSkip was split out of `files` has no `mainSkip` key: its mainSkip files are in `files`, so it left none out.
+	const mainSkip = p.mainSkip === undefined ? [] : p.mainSkip;
+	if (p.scope === "fast" && planStrings(p.files) && planStrings(p.parse) && planStrings(p.macOnly) && planStrings(mainSkip)) {
+		return { runId: m[1]!, plan: { ref, scope: "fast", files: p.files, parse: p.parse, macOnly: p.macOnly, mainSkip } };
+	}
 	if (p.scope === "full" && planStrings(p.reasons)) return { runId: m[1]!, plan: { ref, scope: "full", reasons: p.reasons } };
 	if (p.scope === "tree" && isSha(p.g) && isRunId(p.run)) return { runId: m[1]!, plan: { ref, scope: "tree", g: p.g, run: p.run } };
 	return null;
