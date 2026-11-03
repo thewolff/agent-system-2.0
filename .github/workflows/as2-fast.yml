@@ -66,11 +66,15 @@ jobs:
         with:
           bun-version: 1.3.14
       # The probe's two environment gaps: the bin/as2 tests spawn zsh, and the Linux pairing fence needs bubblewrap.
+      # Ubuntu 24.04's AppArmor blocks the unprivileged user namespaces bubblewrap needs (gates/test/paired-coding.test.ts:
+      # "bwrap: setting up uid map"); as2-hosted.yml lifts it the same way. Without it every fast set reaching
+      # paired-coding.test.ts went red (land-first proof round 2, wl-mw01xdcflkdnq0).
       - name: Install zsh and bubblewrap
         run: |
           set -euo pipefail
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends zsh bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           zsh --version; bwrap --version
       - name: Environment facts
         run: |

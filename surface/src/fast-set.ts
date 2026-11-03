@@ -30,15 +30,23 @@ const PARSE_EXTS = [".ts", ".tsx", ".js"] as const;
 
 /** A file of the tree, null when the tree has no such file. */
 export type ReadFile = (path: string) => string | null;
-export type FastConfig = Pick<TestRunnerConfig, "fastSmoke" | "macOnly" | "fullBeforeMerge">;
+export type FastConfig = Pick<TestRunnerConfig, "fastSmoke" | "macOnly" | "mainSkip" | "fullBeforeMerge">;
 
-/** The fast check's plan for one head: the Linux files to run, the mac-only files left for main runs, and the parse targets. */
+/**
+ * The fast check's plan for one head: the Linux files to run, the mac-only and main-skip files left out of the Linux set, and
+ * the parse targets. Every fast-set test file is in exactly one of `files`, `macOnly` and `mainSkip`.
+ */
 export interface FastRun {
 	kind: "fast";
 	/** Repo-relative Bun test files the hosted Linux run executes, sorted. */
 	files: string[];
-	/** Fast-set test files in `testRunner.macOnly`: they run only in main runs, sorted. */
+	/** Fast-set test files in `testRunner.macOnly`: they run only in main runs, sorted. A file also in `mainSkip` is listed here. */
 	macOnly: string[];
+	/**
+	 * Fast-set test files in `testRunner.mainSkip`, sorted: they need an installed OMP and run in no automated suite; the
+	 * hosted Linux check would execute none of their tests.
+	 */
+	mainSkip: string[];
 	/** Changed `.ts`, `.tsx` and `.js` files present at X, which must transpile (`parseCheck`), sorted. */
 	parse: string[];
 }
@@ -161,7 +169,7 @@ function reachOver(changed: readonly string[], graph: Map<string, ModuleImports>
  * A tree's test reach (§ 2 The fast check), its import graph scanned once: for a change C, the tree's Bun test files that
  * are in R(C), import a file of R(C) (so are in R(C) themselves), or name a file of R(C) by repo-relative path or basename
  * in their source; plus every test file of the directory of any module with an import that does not resolve inside the
- * tree. Sorted; smoke and macOnly are not applied. Attribution calls it once per suspect over one tree.
+ * tree. Sorted; smoke, macOnly and mainSkip are not applied. Attribution calls it once per suspect over one tree.
  */
 export function testReach(tree: readonly string[], read: ReadFile): (changed: readonly string[]) => string[] {
 	const graph = importGraph(tree, read);
@@ -218,8 +226,9 @@ export function fullExceptions(
 /**
  * The fast check's plan for head X (D2): `full` with every exception when one applies, else the fast set. `changed` is C
  * (`git diff --name-only <merge-base> X`), `tree` the tracked files at X, `read` a file at X, `readBase` a file at the
- * merge-base. The Linux files are the reached tests plus `fastSmoke`, minus `macOnly`. A smoke file not in the tree is a
- * config error, never dropped.
+ * merge-base. The Linux files are the reached tests plus `fastSmoke`, minus `macOnly` and minus `mainSkip` (a smoke file in
+ * either list leaves the Linux set too); each file left out is listed in the plan's `macOnly` or `mainSkip`, `macOnly` first
+ * when a file is in both. A smoke file not in the tree is a config error, never dropped.
  */
 export function fastSet(
 	changed: readonly string[], tree: readonly string[], read: ReadFile, readBase: ReadFile, cfg: FastConfig,
@@ -232,9 +241,10 @@ export function fastSet(
 	const set = new Set([...testReach(tree, read)(changed), ...cfg.fastSmoke]);
 	const files: string[] = [];
 	const macOnly: string[] = [];
-	for (const f of [...set].sort()) (Object.hasOwn(cfg.macOnly, f) ? macOnly : files).push(f);
+	const mainSkip: string[] = [];
+	for (const f of [...set].sort()) (Object.hasOwn(cfg.macOnly, f) ? macOnly : Object.hasOwn(cfg.mainSkip, f) ? mainSkip : files).push(f);
 	const parse = changed.filter((p) => inTree.has(p) && (PARSE_EXTS as readonly string[]).includes(extOf(p))).sort();
-	return { kind: "fast", files, macOnly, parse };
+	return { kind: "fast", files, macOnly, mainSkip, parse };
 }
 
 /** Each parse target that does not transpile (`Bun.Transpiler`, no execution), with Bun's first message; empty when all do. */

@@ -139,6 +139,142 @@ export function serveFixture(dir: string, cfg: ServeConfig = loadServe(dir)): Se
 	});
 }
 
+// Fixture ports are fixed (recorded pages, canonicals and rendered/127.0.0.1-<port>__*.json name them), and every family
+// test file audits every fixture, so two files run at once (`bun test --parallel`, or two `bun test` calls, possibly from
+// two checkouts) want the same port at the same time. The bound port is the lock: one process serves a fixture at a time
+// and the rest wait for it to let go. A waiter holds a plain TCP connection to the holder's listener and wakes on that
+// connection's end: `server.stop(true)` closes it as it releases the port, an idle timeout or reset closes it earlier
+// (the waiter then finds the port still bound and waits again). Every retry follows an event; the one timer is the
+// hang guard below. Bun.serve's reusePort was rejected: on Linux it shares one port across processes and load-balances
+// requests between them (https://bun.com/guides/http/cluster.md), which is the sharing this lock exists to prevent.
+// A port that refuses connections yet will not bind is bound by something that is not listening; that is not a
+// fixture server, so after REFUSED_LIMIT such rounds in a row the wait fails with the port named. A waiter connection
+// that ends in a socket error is not a release: the error is kept, the bind is retried, and ERROR_LIMIT such rounds in
+// a row fail the wait with the errors as its reason.
+const REFUSED_LIMIT = 3;
+const ERROR_LIMIT = 3;
+// Every round, of any outcome, counts against ROUND_LIMIT, so a listener that accepts and closes at once (a
+// "release" that never frees the port) cannot spin. A legitimate wait spends one round per idle close of the waiter's
+// connection (Bun.serve's idle timeout closed it after 12 s in a probe run on Bun 1.3.14) plus one per holder that
+// hands the port on, so ACQUIRE_DEADLINE_MS spends at most ~25 rounds on idle closes; 100 leaves room for 75 handovers.
+const ROUND_LIMIT = 100;
+// The hang guard on one acquisition: connect, the holder's release and the rebind, together. It is failure-only: it
+// ends a stuck wait (a listener that accepts and never closes, a connect that never completes) with an error naming
+// the port, its holder and this deadline, and never decides a pass. A normal acquisition waits behind at most the other
+// test files' recorded audits of the same fixture, which finish inside their 50-60 s beforeAll bounds (the whole
+// `bun test skills/seo-audit` run took 5.5 s on 2026-11-02); 300 s is five times the longest of those bounds, so the
+// guard stays out of any wait a passing run needs, and it still bounds record-fixtures.ts, which has no outer deadline.
+export const ACQUIRE_DEADLINE_MS = 300_000;
+
+type Round = { kind: "released" } | { kind: "refused" } | { kind: "error"; error: Error } | { kind: "deadline" };
+
+// One wait round on 127.0.0.1:<port>: "released" when the listener closes a connection held to it cleanly, "refused"
+// when nothing listens there, "error" with the socket error when the connection fails, "deadline" when `expired` fires
+// first (the connection is then closed). Any other connect failure throws.
+async function holderRound(port: number, expired: AbortSignal): Promise<Round> {
+	if (expired.aborted) return { kind: "deadline" };
+	const ended = Promise.withResolvers<Round>();
+	const onExpired = () => ended.resolve({ kind: "deadline" });
+	expired.addEventListener("abort", onExpired, { once: true });
+	Bun.connect({
+		hostname: "127.0.0.1",
+		port,
+		socket: {
+			data() {},
+			end(socket) {
+				socket.end();
+				ended.resolve({ kind: "released" });
+			},
+			close: (_socket, error) => ended.resolve(error ? { kind: "error", error } : { kind: "released" }),
+			error: (_socket, error) => ended.resolve({ kind: "error", error }),
+		},
+	}).then(
+		// A round that ended on the deadline leaves this connection open (or opens it late); close it.
+		(socket) => void ended.promise.then((r) => r.kind === "deadline" && socket.terminate()),
+		(e: unknown) => {
+			if (e instanceof Error && "code" in e && e.code === "ECONNREFUSED") ended.resolve({ kind: "refused" });
+			else ended.reject(new Error(`fixture port ${port}: waiting for its holder, connect failed: ${String(e)}`, { cause: e }));
+		},
+	);
+	try {
+		return await ended.promise;
+	} finally {
+		expired.removeEventListener("abort", onExpired);
+	}
+}
+
+// Who listens on 127.0.0.1:<port>, from lsof, for a failed acquisition's message. lsof's own failure is reported in
+// the text it returns, never dropped.
+function portHolder(port: number): string {
+	try {
+		const r = Bun.spawnSync(["lsof", "-nP", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN", "-Fpc"], { timeout: 10_000 });
+		const out = r.stdout.toString();
+		const procs = [...out.matchAll(/^p(\d+)\nc(.*)$/gm)].map((m) => `pid ${m[1]} (${m[2]})`);
+		if (procs.length) return procs.join(", ");
+		if (r.exitCode === 1 && !out) return "no process listens on it now (lsof found none)";
+		return `unknown (lsof exited ${r.exitCode ?? r.signalCode}: ${r.stderr.toString().trim() || "no output"})`;
+	} catch (e) {
+		return `unknown (lsof failed: ${String(e)})`;
+	}
+}
+
+// serveFixture on the fixture's port once no other process serves it, within ACQUIRE_DEADLINE_MS.
+export async function serveFixtureExclusive(
+	dir: string,
+	cfg: ServeConfig = loadServe(dir),
+	deadlineMs: number = ACQUIRE_DEADLINE_MS,
+): Promise<Server<undefined>> {
+	const expired = new AbortController();
+	const guard = setTimeout(() => expired.abort(), deadlineMs);
+	const where = `fixture port ${cfg.port} (${dir})`;
+	const errors: Error[] = [];
+	let refused = 0;
+	let failed = 0;
+	let rounds = 0;
+	const kept = () =>
+		errors.length ? `; socket errors on the waiter's connection: ${errors.map((e) => String(e)).join("; ")}` : "";
+	try {
+		for (;;) {
+			try {
+				return serveFixture(dir, cfg);
+			} catch (e) {
+				if (!(e instanceof Error && "code" in e && e.code === "EADDRINUSE")) throw e;
+			}
+			if (rounds === ROUND_LIMIT)
+				throw new AggregateError(
+					errors,
+					`${where}: still bound after ${ROUND_LIMIT} wait rounds (holder: ${portHolder(cfg.port)})${kept()}; find it with \`lsof -nP -iTCP:${cfg.port}\` and free the port`,
+				);
+			rounds++;
+			const round = await holderRound(cfg.port, expired.signal);
+			if (round.kind === "deadline")
+				throw new AggregateError(
+					errors,
+					`${where}: not acquired within the ${deadlineMs / 1000} s acquisition deadline after ${rounds} wait rounds; holder: ${portHolder(cfg.port)}, which kept the port bound and the waiter's connection open${kept()}; find it with \`lsof -nP -iTCP:${cfg.port}\` and free the port`,
+				);
+			if (round.kind === "released") {
+				refused = 0;
+				failed = 0;
+			} else if (round.kind === "refused") {
+				if (++refused === REFUSED_LIMIT)
+					throw new AggregateError(
+						errors,
+						`${where}: bind failed with EADDRINUSE and connects were refused ${REFUSED_LIMIT} times in a row, so a socket that is not a listening fixture server holds 127.0.0.1:${cfg.port} (holder: ${portHolder(cfg.port)})${kept()}; find it with \`lsof -nP -iTCP:${cfg.port}\` and free the port`,
+					);
+			} else {
+				errors.push(round.error);
+				if (++failed === ERROR_LIMIT)
+					throw new AggregateError(
+						errors,
+						`${where}: the waiter's connection to the holder failed ${ERROR_LIMIT} times in a row (holder: ${portHolder(cfg.port)})${kept()}`,
+					);
+			}
+		}
+	} finally {
+		clearTimeout(guard);
+	}
+}
+
 // The base64 SHA-256 of a certificate's SubjectPublicKeyInfo, the form Chrome's
 // --ignore-certificate-errors-spki-list takes: it lets the recording Chrome trust a TLS fixture's self-signed cert.
 export function spkiHash(certPem: string): string {
@@ -193,7 +329,7 @@ export async function runAudit(args: string[], env: Record<string, string> = {})
 export async function auditFixture(name: string, mode: "recorded" | "record" = "recorded"): Promise<AuditRun> {
 	const dir = join(FIXTURES_DIR, name);
 	const cfg = loadServe(dir);
-	const server = serveFixture(dir, cfg);
+	const server = await serveFixtureExclusive(dir, cfg);
 	const out = mkdtempSync(join(tmpdir(), `seo-audit-${name}-`));
 	try {
 		const env: Record<string, string> = cfg.tls ? { NODE_EXTRA_CA_CERTS: join(dir, "cert.pem") } : {};

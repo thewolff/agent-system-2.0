@@ -82,13 +82,23 @@ describe("as2 doctor CLI", () => {
 		const r = cli(m);
 		expect(r.err).toBe("");
 		expect(r.code).toBe(0);
-		for (const part of ["job-inventory", "job:ledger-backup", "deps:ledger-backup", "ctx", "ledger", "backup", "seat", "mailbox", "gh", "disk", "mcp"]) {
+		// Darwin: ledger-backup is read from its plist and launchd. Off macOS every launchd job row is not installed, unread.
+		const passes = process.platform === "darwin" ? ["job-inventory", "job:ledger-backup", "deps:ledger-backup", "ctx", "ledger", "backup", "seat", "mailbox", "gh", "disk", "mcp"] : ["job-inventory", "ctx", "ledger", "backup", "seat", "mailbox", "gh", "disk", "mcp"];
+		for (const part of passes) {
 			expect(r.out).toMatch(new RegExp(`^pass ${part.replace(/[.:-]/g, "\\$&")}: `, "m"));
 		}
-		expect(r.out).toMatch(/^- {4}job:train-tick: not installed \(opt-in: install\.sh --train-tick\)/m);
-		expect(r.out).toMatch(/^- {4}job:phoenix: not installed \(observability\.phoenix is off/m);
-		expect(r.out).toMatch(/^- {4}job:doctor: not installed: HOME .* is not this user's home/m);
-		expect(r.out).toMatch(/^as2 doctor: 11 pass, 0 fail, 0 warn, 8 not installed$/m);
+		if (process.platform === "darwin") {
+			expect(r.out).toMatch(/^- {4}job:train-tick: not installed \(opt-in: install\.sh --train-tick\)/m);
+			expect(r.out).toMatch(/^- {4}job:phoenix: not installed \(observability\.phoenix is off/m);
+			expect(r.out).toMatch(/^- {4}job:doctor: not installed: HOME .* is not this user's home/m);
+			expect(r.out).toMatch(/^as2 doctor: 11 pass, 0 fail, 0 warn, 8 not installed$/m);
+		} else {
+			for (const job of ["ledger-backup", "doctor", "phoenix", "train-tick", "daily-report", "scratch-sweep", "chaos", "drive-backup", "drive-backup-check"]) {
+				expect(r.out).toMatch(new RegExp(`^- {4}job:${job}: not installed: not macOS \\(launchd jobs are macOS only; install\\.sh writes none here\\)$`, "m"));
+			}
+			expect(r.out).not.toMatch(/^pass (job|deps):/m);
+			expect(r.out).toMatch(/^as2 doctor: 9 pass, 0 fail, 0 warn, 9 not installed$/m);
+		}
 		expect(records(m)).toEqual([]);
 		const json = cli(m, "--json");
 		expect(json.code).toBe(0);
@@ -110,18 +120,24 @@ describe("as2 doctor CLI", () => {
 		test("the after-restart run reports both, exits 1, opens two downs and one claim covering both, one popup, answered", () => {
 			expect(first.err).toBe("");
 			expect(first.code).toBe(1);
-			expect(first.out).toContain("2 failing: ");
-			expect(first.out).toContain("ctx (the ctx daemon is not running");
-			expect(first.out).toContain(`job:ledger-backup (${LEDGER_BACKUP_LABEL} is not loaded`);
+			if (process.platform === "darwin") {
+				expect(first.out).toContain("2 failing: ");
+				expect(first.out).toContain("ctx (the ctx daemon is not running");
+				expect(first.out).toContain(`job:ledger-backup (${LEDGER_BACKUP_LABEL} is not loaded`);
+			} else {
+				// Off macOS the unloaded job is not installed (the not-macOS line), so ctx is the one failing part.
+				expect(first.out).toContain("1 failing: ctx (the ctx daemon is not running");
+				expect(first.out).not.toContain("job:ledger-backup (");
+			}
 			const rs = records(m);
 			const downs = rs.filter((r) => r.prefix === "doctor-down");
-			expect(downs.map((d) => d.part).sort()).toEqual(["ctx", "job:ledger-backup"]);
+			expect(downs.map((d) => d.part).sort()).toEqual(process.platform === "darwin" ? ["ctx", "job:ledger-backup"] : ["ctx"]);
 			expect(rs.filter((r) => r.prefix === "doctor-boot")).toHaveLength(1);
 			const popups = rs.filter((r) => r.prefix === "doctor-popup");
 			expect(popups).toHaveLength(2);
 			const [claim, outcome] = popups;
 			expect(claim!.outcome.state).toBe("claimed");
-			if (claim!.outcome.state === "claimed") expect(claim!.outcome.downs).toHaveLength(2);
+			if (claim!.outcome.state === "claimed") expect(claim!.outcome.downs).toHaveLength(process.platform === "darwin" ? 2 : 1);
 			expect(outcome).toEqual({ prefix: "doctor-popup", popupId: claim!.popupId, outcome: { state: "answered", detail: "Dismiss (no voice)" } });
 			expect(osascriptCalls(m)).toHaveLength(1);
 			expect(readFileSync(join(m.home, ".agent-system-2", "doctor", "popup.log"), "utf8")).toContain(`answered Dismiss (no voice)`);
