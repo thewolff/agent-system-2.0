@@ -2069,6 +2069,9 @@ describe("the permanent train in the tick (PLAN wl-mvr888nftz0vcl D5, D6, D8, D9
 		expect(retired()).toHaveLength(1);
 		expect(w.ledger.slice(full1)!.rev).toBe(rev);
 		expect(states()).toEqual({ ...open, [full1]: "cancelled" });
+	});
+});
+
 describe("the move-alert supervisor pass (PLAN wl-mvwk0v0gmp6cjc D4, R8)", () => {
 	const A = "anthropic/claude-opus-5-5";
 	const SOL = "openai-codex/gpt-6.1-sol";
