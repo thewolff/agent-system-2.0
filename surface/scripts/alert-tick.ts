@@ -22,11 +22,12 @@
 //     `issueOps`, without its retrying `labelled`), each effect looked up by its marker first. A gh failure is the key's
 //     `alert: <key> error gh …` row (written when the text changes) and stops that key for this pass; nothing retries
 //     inside a pass.
-//  5. The popups (D3 popup worker): every unsettled attempt settled by its members' pid and lstart pairs and their
-//     AS2_ALERT_POPUP tag (surface/scripts/alert-popup.ts), then a worker spawned, detached, for each sent level with a
-//     popup that has none, while attempts remain. One spawn per level per pass.
+//  5. The popups (D3 popup worker): every unsettled attempt settled by its members, the processes whose pid and lstart match
+//     a pair recorded for it (its worker's claim, or a line of its registry: surface/scripts/alert-popup.ts), then a worker
+//     spawned, detached, for each sent level with a popup that has none, while attempts remain. One spawn per level per pass.
 // Seams (main): AGENT_SYSTEM_LEDGER_DB (the ledger), AS2_ALERT_GH (the gh binary), AS2_ALERT_SPAWN_LOG (the popup worker's
-// log), QUIET_ALARM_OSASCRIPT / _AFPLAY / _SAY (inherited by the popup), AS2_CHAOS_REPORTS, AS2_QUOTA_DIR.
+// log), AS2_ALERT_POPUP_DIR (the attempts' registries), QUIET_ALARM_OSASCRIPT / _AFPLAY / _SAY (inherited by the popup),
+// AS2_CHAOS_REPORTS, AS2_QUOTA_DIR.
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type InstructionRow, Ledger } from "../../ledger/src/index";
@@ -50,19 +51,21 @@ import { EXTEND_SOURCE, parseCeiling } from "../src/ceiling";
 import { HALT_WORD, isRunnerCeilingQuestion } from "../src/input";
 import { STANDING_WORKLOAD_ID } from "../src/types";
 import {
-	ALERT_POPUP_SCRIPT, groupKey, type LegacyClaim, legacyKilledText, legacyKillFailedText, legacyPopupRecord, type Member, parsePs, POPUP_TAG_ENV, popupAttempts,
-	type PopupAttempt, popupStatus, popupTag, type Proc, psArgs, settleAttempt, settleLegacy, terminatingDetail,
+	ALERT_POPUP_SCRIPT, alertPopupDir, groupKey, type LegacyClaim, legacyKilledText, legacyKillFailedText, legacyPopupRecord, type Member, parsePs, popupAttempts,
+	popupRegistryPath, type PopupAttempt, popupStatus, type Proc, PS_ARGS, readRegistry, settleAttempt, settleLegacy, terminatingDetail,
 } from "./alert-popup";
 
-/** The popup's seams: the worker spawn, the ps reads, the signals. */
+/** The popup's seams: the worker spawn, the registries, the ps reads, the signals. */
 export interface PopupSeams {
 	/** A detached start (surface/src/notify.ts `spawnDetached`); returns the pid or throws. */
 	spawn: DetachedSpawn;
-	/** The environment the worker starts with (the lane binding dropped); AS2_ALERT_POPUP is added per attempt. */
+	/** The environment the worker starts with (the lane binding dropped). */
 	env: Record<string, string>;
 	/** The log the worker's streams append to. */
 	log: string;
-	/** `ps <args>`'s stdout (`psArgs(true)` with -E, `psArgs(false)` without); throws naming the failure (EPERM, exit, timeout). */
+	/** The attempts' registries' directory (`alertPopupDir`); each worker gets it as AS2_ALERT_POPUP_DIR, so both read one place. */
+	dir: string;
+	/** `ps <args>`'s stdout (always PS_ARGS); throws naming the failure (EPERM, exit, timeout). */
 	ps: (args: string[]) => string;
 	/** Signal one process: true when sent, false when it is already gone (ESRCH); any other failure throws. */
 	kill: (pid: number, signal: "SIGTERM" | "SIGKILL") => boolean;
@@ -217,7 +220,7 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 	const active = new Set(subjects.map((s) => s.key));
 	let rec0 = records();
 	let legacyProcs: Proc[] | null = null;
-	const legacyPs = (): Proc[] => (legacyProcs ??= parsePs(d.popup.ps(psArgs(false))));
+	const legacyPs = (): Proc[] => (legacyProcs ??= parsePs(d.popup.ps([...PS_ARGS])));
 	const adopt = (key: string, run: () => void) => {
 		try {
 			run();
@@ -549,13 +552,14 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 		const unsettled = [...groups.values()].flatMap((list) => list.filter((a) => a.end === null));
 		const busy = new Set<string>();
 		if (unsettled.length > 0) {
+			// A fresh read, never the legacy step's: a pid and lstart pair is checked against the processes as they are now.
 			let procs: Proc[] | null = null;
 			try {
-				procs = parsePs(d.popup.ps(psArgs(true)));
+				procs = parsePs(d.popup.ps([...PS_ARGS]));
 			} catch (err) {
 				for (const k of new Set(unsettled.map((a) => a.key))) {
 					busy.add(k);
-					keyError(k, "popup", `ps -A -E could not be read, so no popup was settled: ${errText(err)}`);
+					keyError(k, "popup", `ps -A could not be read, so no popup was settled: ${errText(err)}`);
 				}
 			}
 			if (procs !== null) for (const a of unsettled) settle(a, procs, recs, busy);
@@ -570,7 +574,7 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 			const attempt = st.failures + 1;
 			try {
 				write(alertPopupBody(key, ep.id, level, "spawning", `attempt=${attempt}`));
-				const pid = d.popup.spawn([BUN, ALERT_POPUP_SCRIPT, key, ep.id, String(level)], { ...d.popup.env, [POPUP_TAG_ENV]: popupTag({ episode: ep.id, level, attempt }) }, d.popup.log);
+				const pid = d.popup.spawn([BUN, ALERT_POPUP_SCRIPT, key, ep.id, String(level), String(attempt)], { ...d.popup.env, AS2_ALERT_POPUP_DIR: d.popup.dir }, d.popup.log);
 				say(`${key}: level ${level} popup attempt ${attempt} spawned (pid ${pid})`);
 			} catch (err) {
 				try {
@@ -583,14 +587,18 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 		}
 	}
 
-	/** One unsettled attempt's settlement (D3): signals to its proven members, its rows. */
+	/**
+	 * One unsettled attempt's settlement (D3): signals to its proven members, its rows. The registry is read after `procs`,
+	 * so a helper recorded between the two reads is a member when it was alive at the ps read. A registry that cannot be read
+	 * is this key's error, and nothing of the attempt is signalled or settled this pass.
+	 */
 	function settle(a: PopupAttempt, procs: Proc[], recs: Map<string, AlertKeyRecord>, busy: Set<string>): void {
 		const ep = recs.get(a.key)?.episodes.find((e) => e.id === a.episode) ?? null;
 		const top = ep === null ? 0 : Math.max(0, ...ep.sent.keys());
 		const cancel = ep === null ? "its episode is not on the ledger" : ep.closed !== null ? `closed: ${ep.closed.why}` : ep.acked !== null ? `acked: ${ep.acked.why}` : top > a.level ? `superseded by level ${top}` : null;
 		const row = (step: Parameters<typeof alertPopupBody>[3], detail: string) => write(alertPopupBody(a.key, a.episode, a.level, step, detail));
 		try {
-			for (const s of settleAttempt(a, procs, now, cancel)) {
+			for (const s of settleAttempt(a, procs, now, cancel, readRegistry(popupRegistryPath(d.popup.dir, a)))) {
 				if (s.do === "end") {
 					row(s.step, s.detail);
 					say(`${a.key}: level ${a.level} popup attempt ${a.attempt} ${s.step}: ${s.detail}`);
@@ -758,7 +766,7 @@ export function realAlertSeams(env: Record<string, string | undefined> = process
 		gh: realAlertGh(env),
 		quota: (now) => runQuotaWatch(quotaWatchDeps(env, Date.parse(now))),
 		sources: { alarmFile: alarmFilePath(env), reportsDir: chaosReportsDir(env), files: fsReportFiles, probe: psProbe },
-		popup: { spawn: spawnDetached, env: unboundEnv(env), log: alertSpawnLog(env), ps: realPs, kill: realKill },
+		popup: { spawn: spawnDetached, env: unboundEnv(env), log: alertSpawnLog(env), dir: alertPopupDir(env), ps: realPs, kill: realKill },
 	};
 }
 

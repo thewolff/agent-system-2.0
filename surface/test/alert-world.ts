@@ -74,8 +74,8 @@ export type AlertSeams = Omit<AlertPassDeps, "ledger" | "log" | "sources"> & { s
 
 /**
  * Recording seams for one alert pass over `gh`: no quota subjects, an alarm file and chaos dir with nothing in them, a runner
- * probe that finds every lane gone, a popup spawn that records and answers pid 4242, `ps` from `o.ps` (no process by default)
- * and a kill that records. No real gh, popup, ps or signal is ever used.
+ * probe that finds every lane gone, a popup spawn that records and answers pid 4242, an empty registry directory of its
+ * own, `ps` from `o.ps` (no process by default) and a kill that records. No real gh, popup, ps or signal is ever used.
  */
 export function alertSeams(gh: Gh, o: { ps?: () => string } = {}): PopupRecord & { seams: AlertSeams } {
 	const spawns: PopupRecord["spawns"] = [];
@@ -89,7 +89,7 @@ export function alertSeams(gh: Gh, o: { ps?: () => string } = {}): PopupRecord &
 				spawns.push({ argv, env });
 				return 4242;
 			},
-			env: { PATH: "/usr/bin:/bin" }, log: join(tmp("alert-log"), "alert-pass.log"),
+			env: { PATH: "/usr/bin:/bin" }, log: join(tmp("alert-log"), "alert-pass.log"), dir: tmp("alert-popups"),
 			ps: o.ps ?? (() => ""),
 			kill: (pid, sig) => {
 				kills.push([pid, sig]);

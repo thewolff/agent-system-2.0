@@ -25,6 +25,8 @@ One alert pass, `surface/scripts/alert-tick.ts`, owns every Jo-directed alert. I
 
 **Urgent starts at level 2.** A workload is urgent when Jo's newest word on it is `urgent` or `asap` (`urgencyOf`), or, with no word, when the Jo input its brief cites says asap or urgent. Its alerts start at level 2; level 1's channels still run first in the same pass. Quota moves and quota alerts also start at level 2.
 
+**Popups are cancelled only by recorded identity** (Jo's registry rule, q-mw175xfx2etc13). Each popup attempt has a registry, `~/.agent-system-2/alert-popups/<episode>.<level>.<attempt>.pids`, one `<pid> <lstart> <name>` line per process: the worker (`surface/scripts/alert-popup.ts`) writes its own line, and `install/drive-backup/quiet-alarm.zsh`, given the file in `QUIET_ALARM_REGISTER`, writes one for its zsh and for each osascript, afplay and say it starts. The pass signals only a recorded pid whose start time still matches a live process, so a reused pid is never signalled. A helper that dies, or is never recorded, between its start and its line is not cancelled; it ends on its own, at the answer or at the 12 h give-up. The doctor's and drive-backup's popups pass no registry and are unchanged. The registry files stay after an attempt settles, a few per alert.
+
 **Jo's words** (`surface/src/input.ts`): `urgent <wl>`, `asap <wl>`, `calm <wl>` (clears urgency), and `ack <wl|key>`, which acks every open alert of a workload or one alert key.
 
 **Jo's issue #49 is folded in.** `surface/src/quota-watch.ts` ports the active loop of Plumb's quota watcher (`omp usage` polls into `polls.jsonl`, thresholds, fast-burn, three failed polls). Each firing rule is a `quota:<key>:<rule>` alert.

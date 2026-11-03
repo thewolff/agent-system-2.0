@@ -12,7 +12,7 @@ import { ALERT_BY, alertPopupBody, controlEntries } from "../src/launch";
 import { laneDiedShutdownBody } from "../src/signals";
 import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { alertPass, lockedAlertPass } from "../scripts/alert-tick";
-import { POPUP_TAG_ENV } from "../scripts/alert-popup";
+import { popupRegistryPath, registryLine } from "../scripts/alert-popup";
 import { runQuotaWatch } from "../src/quota-watch";
 import { takeRunnerLock } from "../src/runner-probe";
 import { type AlertWorld, ceilingStopped, ISSUE, world } from "./alert-world";
@@ -36,8 +36,8 @@ describe("one pass over a ceiling-stopped workload (D3, R8)", () => {
 		expect(issue!.comments[0]).toContain(alertMarker(key, ep.id, "level 2"));
 		expect(issue!.comments[0]).toContain("@thewolff");
 		expect(w.spawns).toHaveLength(1);
-		expect(w.spawns[0]!.argv.slice(-3)).toEqual([key, ep.id, "2"]);
-		expect(w.spawns[0]!.env[POPUP_TAG_ENV]).toBe(`${ep.id}:2:1`);
+		expect(w.spawns[0]!.argv.slice(-4)).toEqual([key, ep.id, "2", "1"]);
+		expect(w.spawns[0]!.env).toEqual({ PATH: "/usr/bin:/bin", AS2_ALERT_POPUP_DIR: w.deps.popup.dir });
 		expect(w.rows()).toContain(alertPopupBody(key, ep.id, 2, "spawning", "attempt=1"));
 		// A second pass changes nothing: no second issue, comment or popup.
 		const before = w.g.calls.filter((a) => a[1] === "create" || a[1] === "comment").length;
@@ -326,22 +326,29 @@ describe("an ack in a crash window and an unreadable source (R13, D2)", () => {
 	});
 });
 
-describe("popup settlement (D3: pid and lstart pairs and the AS2_ALERT_POPUP tag only)", () => {
+describe("popup settlement (D3: recorded pid and lstart pairs only, Jo's registry rule)", () => {
 	const LS = "Tue Nov  3 10:00:00 2026";
-	test("a worker past its claim is gone while its tagged osascript remains: SIGTERM to the tagged one only, then `settled` once it is gone", () => {
-		let snapshot = "";
-		const w = world({ ps: () => snapshot });
+	const CLAIM = `pid=500 pgid=500 lstart=${LS.replace(/ /g, "_")} attempt=1 until=2026-11-04T00:00:00.000Z`;
+	/** An urgent ceiling alert after one pass, its attempt-1 claim and `showing` written as a worker would. */
+	function claimed(ps: () => string) {
+		const w = world({ ps });
 		const wl = ceilingStopped(w.ledger, 'Jo said "ASAP"');
 		alertPass(w.deps);
 		const key = `ceiling:${wl}`;
 		const ep = openEpisode(alertRecords(controlEntries(w.ledger.entries(STANDING_WORKLOAD_ID))).get(key))!;
 		const write = (step: Parameters<typeof alertPopupBody>[3], detail?: string) =>
 			w.ledger.recordEntry({ by: ALERT_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: alertPopupBody(key, ep.id, 2, step, detail) });
-		write("claim", `pid=500 pgid=500 lstart=${LS.replace(/ /g, "_")} attempt=1 until=2026-11-04T00:00:00.000Z`);
+		write("claim", CLAIM);
 		write("showing");
-		const tag = `${POPUP_TAG_ENV}=${ep.id}:2:1`;
-		// The worker (500) is gone; its osascript (600) carries the tag; 700 reuses no identity and carries another tag.
-		snapshot = [`  600     1   500 ${LS} /usr/bin/osascript -e x ${tag}`, `  700     1   700 ${LS} /usr/bin/osascript ${POPUP_TAG_ENV}=en-other:2:1`].join("\n");
+		return { w, key, ep, registry: popupRegistryPath(w.deps.popup.dir, { episode: ep.id, level: 2, attempt: 1 }) };
+	}
+
+	test("a worker past its claim is gone while its recorded osascript remains: SIGTERM to the recorded one only, then `settled` once it is gone", () => {
+		let snapshot = "";
+		const { w, key, ep, registry } = claimed(() => snapshot);
+		writeFileSync(registry, registryLine({ pid: 500, lstart: "Tue Nov 3 10:00:00 2026", name: "worker" }) + registryLine({ pid: 600, lstart: "Tue Nov 3 10:00:00 2026", name: "osascript" }));
+		// The worker (500) is gone; its osascript (600) is recorded; 700 is recorded nowhere, though its argv names this attempt.
+		snapshot = [`  600     1   500 ${LS} /usr/bin/osascript -e x`, `  700     1   700 ${LS} /usr/bin/osascript AS2_ALERT_POPUP=${ep.id}:2:1`].join("\n");
 		alertPass(w.deps);
 		expect(w.kills).toEqual([[600, "SIGTERM"]]);
 		expect(w.rows().some((r) => r.startsWith(`alert-popup: ${key} ${ep.id} 2 terminating worker ended after showing members=600:`))).toBe(true);
@@ -354,18 +361,29 @@ describe("popup settlement (D3: pid and lstart pairs and the AS2_ALERT_POPUP tag
 		alertPass(w.deps);
 		expect(w.kills).toHaveLength(2);
 		expect(w.rows().some((r) => r === `alert-popup: ${key} ${ep.id} 2 settled worker ended after showing`)).toBe(true);
-		// Settled with attempts left: the next attempt is spawned with its own tag.
+		// Settled with attempts left: the next attempt is spawned with its own number.
 		alertPass(w.deps);
-		expect(w.spawns.at(-1)!.env[POPUP_TAG_ENV]).toBe(`${ep.id}:2:2`);
+		expect(w.spawns.at(-1)!.argv.at(-1)).toBe("2");
 	});
 
 	test("a ps refusal is the key's `error popup` and leaves the claim unsettled: nothing signalled, no new worker", () => {
-		const w = world({ ps: () => { throw new Error("ps -A -E exited 126: Operation not permitted"); } });
+		const w = world({ ps: () => { throw new Error("ps -A exited 126: Operation not permitted"); } });
 		const wl = ceilingStopped(w.ledger, 'Jo said "ASAP"');
 		alertPass(w.deps);
 		alertPass(w.deps);
 		expect(w.kills).toEqual([]);
 		expect(w.spawns).toHaveLength(1);
-		expect(w.rows().some((r) => r.startsWith(`alert: ceiling:${wl} error popup ps -A -E could not be read`))).toBe(true);
+		expect(w.rows().some((r) => r.startsWith(`alert: ceiling:${wl} error popup ps -A could not be read`))).toBe(true);
+	});
+
+	test("a registry line that is not <pid> <lstart> <name> is the key's `error popup` naming the file: nothing signalled or settled, no new worker", () => {
+		const { w, key, registry } = claimed(() => "");
+		writeFileSync(registry, "600 yesterday osascript\n");
+		alertPass(w.deps);
+		alertPass(w.deps);
+		expect(w.kills).toEqual([]);
+		expect(w.spawns).toHaveLength(1);
+		expect(w.rows().some((r) => r.startsWith(`alert-popup: ${key} `) && / (settled|terminating) /.test(r))).toBe(false);
+		expect(w.rows().some((r) => r.startsWith(`alert: ${key} error popup settling popup attempt 1 failed: popup registry ${registry} line 1 is not <pid> <lstart> <name>`))).toBe(true);
 	});
 });

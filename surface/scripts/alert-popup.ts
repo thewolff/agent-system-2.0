@@ -1,23 +1,30 @@
 // The alert path's popup (PLAN wl-mw0vs9uc3xqtka D3 "Popup worker", "Legacy popups at cutover"; R12, R24).
 //
-// `bun surface/scripts/alert-popup.ts <key> <episode> <level>` is the detached worker the alert pass
-// (surface/scripts/alert-tick.ts) spawns after a ladder level with a popup was sent. The pass gives it the environment
-// variable AS2_ALERT_POPUP=<episode>:<level>:<attempt>, and every process the worker starts inherits it: the zsh of
-// install/drive-backup/quiet-alarm.zsh, its osascript, and after "Read it to me" its afplay and say, wherever they are
-// reparented. The worker claims the attempt in one ledger write (`alert-popup: <key> <episode> <level> claim pid=<p> pgid=<g>
-// lstart=<s> attempt=<n> until=<iso>`), refused when the level already has an unsettled claim, an `ok`, or
-// ALERT_POPUP_ATTEMPTS ended attempts; then writes `showing`, shows the silent stay-up popup through surface/src/notify.ts
-// `alarmPopup` (the doctor's helper: no sound unless Jo picks "Read it to me", the 10/28 alarm rule), and writes `ok <button>`
-// or `failed <why>`. A `failed` only reports: the attempt stays the pass's to settle until no member of it is left, and the
+// `bun surface/scripts/alert-popup.ts <key> <episode> <level> <attempt>` is the detached worker the alert pass
+// (surface/scripts/alert-tick.ts) spawns after a ladder level with a popup was sent. The worker claims the attempt in one
+// ledger write (`alert-popup: <key> <episode> <level> claim pid=<p> pgid=<g> lstart=<s> attempt=<n> until=<iso>`), refused
+// when the level already has an unsettled claim, an `ok`, or ALERT_POPUP_ATTEMPTS ended attempts; records itself in the
+// attempt's registry; then writes `showing`, shows the silent stay-up popup through surface/src/notify.ts `alarmPopup` (the
+// doctor's helper: no sound unless Jo picks "Read it to me", the 10/28 alarm rule), and writes `ok <button>` or
+// `failed <why>`. A `failed` only reports: the attempt stays the pass's to settle until no member of it is left, and the
 // pass ends it with `settled` (review r1 #1).
 //
+// The registry (Jo's rule, q-mw175xfx2etc13 `registry`): one file per attempt, `<AS2_ALERT_POPUP_DIR>/<episode>.<level>.
+// <attempt>.pids`, one `<pid> <lstart> <name>` line per process, appended by the process that starts it. A file, not
+// `alert-popup:` rows, because quiet-alarm.zsh starts the helpers while the worker is blocked in its synchronous spawn,
+// and plain zsh can append a line where a ledger row would need bun. The worker writes its own line before it shows
+// anything (a registry it cannot write fails the attempt); install/drive-backup/quiet-alarm.zsh, given the file in
+// QUIET_ALARM_REGISTER, writes one for its own zsh (the worker cannot: spawnSync gives it no pid until the zsh exits) and
+// one for each osascript, afplay and say right after starting it. A helper that dies, or is never recorded, between its
+// start and its line is not cancelled: it ends on its own, at the answer or at the 12 h give-up (the gap Jo accepted).
+//
 // The pure half the pass uses is here too, so the identity rule lives in one file:
-// - `parsePs`: one `ps -A [-E] -ww -o pid=,ppid=,pgid=,lstart=,command=` read, a process per line.
+// - `parsePs`: one `ps -A -ww -o pid=,ppid=,pgid=,lstart=,command=` read, a process per line.
 // - `popupAttempts` / `settleAttempt`: each attempt's rows, and what the pass owes an unsettled one now. A process belongs to
-//   an attempt only by its own identity: the worker by the pid and lstart pair its claim recorded, any other process by
-//   carrying this attempt's exact AS2_ALERT_POPUP tag in its launch environment (`ps -E`). No bare pid or pgid ever selects
-//   a process, and a signal goes only to a recorded member whose pid and lstart still match. A member still matching
-//   POPUP_KILL_GRACE_MS after its SIGKILL is the key's error, and the attempt stays unsettled (R24).
+//   an attempt only by a pid and lstart pair recorded for it: the worker's claim, or a line of the attempt's registry. No
+//   argv, environment, bare pid or pgid ever selects a process, and a signal goes only to a recorded member whose pid and
+//   lstart still match a live process (a pid reused after exit has another lstart and is never signalled). A member still
+//   matching POPUP_KILL_GRACE_MS after its SIGKILL is the key's error, and the attempt stays unsettled (R24).
 // - `legacyHelperSet` / `settleLegacy`: a quota-move popup of the retired move alert, still on screen at cutover, found by
 //   its owner's argv (`lane.ts move-alert <wl> <E>`), its dialog's argv (the legacy POPUP_SCRIPT and this move's title and
 //   text), its voice's argv (`say <text>`), and, while the owner is identified in the same read, its process group and
@@ -29,12 +36,11 @@ import { type AlarmOutcome, alarmPopup, DOCTOR_GIVE_UP_SECS } from "../src/notif
 import { psAnswer, type PsRun, runPs } from "../src/omp-probe";
 import { POPUP_SCRIPT, type QuotaMove, moveText, moveTitle } from "../src/quota-move-alert";
 import { STANDING_WORKLOAD_ID } from "../src/types";
-import { join } from "node:path";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
-import { defaultLedgerPath } from "../../ledger/src/locality";
+import { defaultLedgerPath, homeDir } from "../../ledger/src/locality";
 
-/** The environment variable that tags every process of one popup attempt: `<episode>:<level>:<attempt>`. */
-export const POPUP_TAG_ENV = "AS2_ALERT_POPUP";
 /** A claim's life: quiet-alarm gives up after 12 h; 10 minutes more for the worker to write its result. */
 export const POPUP_UNTIL_MS = DOCTOR_GIVE_UP_SECS * 1000 + 10 * 60_000;
 /** A `spawning` attempt with no claim this long after it is `unstarted`. */
@@ -46,13 +52,12 @@ export const POPUP_KILL_GRACE_MS = 5 * 60_000;
 /** The worker script, for the pass's spawn. */
 export const ALERT_POPUP_SCRIPT = join(import.meta.dir, "alert-popup.ts");
 
-/** The one ps read the pass makes per pass: with `-E` for the alert path's own popups, without it for the legacy helper set (r9 #1). */
-export const PS_FIELDS = ["-ww", "-o", "pid=,ppid=,pgid=,lstart=,command="] as const;
-export const psArgs = (withEnv: boolean): string[] => ["-A", ...(withEnv ? ["-E"] : []), ...PS_FIELDS];
+/** The ps read the pass makes (one at legacy adoption, one fresh at popup settlement): no `-E`, nothing but argv after lstart. */
+export const PS_ARGS: readonly string[] = ["-A", "-ww", "-o", "pid=,ppid=,pgid=,lstart=,command="];
 
 // ---- ps -----------------------------------------------------------------------------------------
 
-/** One process as ps listed it; `lstart` with its spacing collapsed, `command` its argv (and, under -E, its launch environment) as one line. */
+/** One process as ps listed it; `lstart` with its spacing collapsed, `command` its argv as one line. */
 export interface Proc {
 	pid: number;
 	ppid: number;
@@ -69,7 +74,7 @@ export interface Member {
 
 const PS_LINE = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\d+\s+\d{1,2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$/;
 
-/** `ps -A [-E] -ww -o pid=,ppid=,pgid=,lstart=,command=`'s stdout, one Proc per line. Throws naming a line that is not that shape. */
+/** `ps -A -ww -o pid=,ppid=,pgid=,lstart=,command=`'s stdout, one Proc per line. Throws naming a line that is not that shape. */
 export function parsePs(out: string): Proc[] {
 	const procs: Proc[] = [];
 	for (const line of out.split("\n")) {
@@ -97,9 +102,56 @@ const sameProc = (p: Member, m: Member): boolean => p.pid === m.pid && p.lstart 
 /** The procs in `procs` that are still the recorded `members` (pid and lstart both match). */
 export const stillMatching = (procs: readonly Proc[], members: readonly Member[]): Proc[] => procs.filter((p) => members.some((m) => sameProc(p, m)));
 
-/** Whether `p`'s launch environment (as `ps -E` prints it after the argv) carries exactly `<POPUP_TAG_ENV>=<tag>`. */
-export function carriesTag(p: Proc, tag: string): boolean {
-	return p.command.split(/\s+/).includes(`${POPUP_TAG_ENV}=${tag}`);
+// ---- the registry -------------------------------------------------------------------------------
+
+/** The directory of the attempts' registries: AS2_ALERT_POPUP_DIR, else `~/.agent-system-2/alert-popups`. */
+export function alertPopupDir(env: Record<string, string | undefined> = process.env): string {
+	return env.AS2_ALERT_POPUP_DIR || join(homeDir(env), ".agent-system-2", "alert-popups");
+}
+
+/** One attempt's registry file in `dir`: `<episode>.<level>.<attempt>.pids` (an episode id is its opening row's entry id). */
+export const popupRegistryPath = (dir: string, a: Pick<PopupAttempt, "episode" | "level" | "attempt">): string => join(dir, `${a.episode}.${a.level}.${a.attempt}.pids`);
+
+/** One registry line: the process's pid and lstart (spacing collapsed, as `parsePs` yields it), and what it is. */
+export interface Registered extends Member {
+	name: string;
+}
+
+/** A registry line as written: `<pid> <lstart> <name>`. */
+export const registryLine = (r: Registered): string => `${r.pid} ${r.lstart} ${r.name}\n`;
+
+const REGISTRY_LINE = /^(\d+) (\S+ \S+ \d{1,2} \d{1,2}:\d{2}:\d{2} \d{4}) (\S+)$/;
+
+/** A registry file's text, one Registered per line. Throws naming the file and the first line that is not `<pid> <lstart> <name>`. */
+export function parseRegistry(text: string, path: string): Registered[] {
+	const out: Registered[] = [];
+	for (const [i, line] of text.split("\n").entries()) {
+		if (line === "") continue;
+		const m = REGISTRY_LINE.exec(line);
+		if (!m || Number(m[1]) <= 0) throw new Error(`popup registry ${path} line ${i + 1} is not <pid> <lstart> <name>: ${JSON.stringify(line.slice(0, 200))}`);
+		out.push({ pid: Number(m[1]), lstart: m[2]!, name: m[3]! });
+	}
+	return out;
+}
+
+/** The registry at `path`; none yet (no such file) is no process recorded. Any other read failure throws, naming the file. */
+export function readRegistry(path: string): Registered[] {
+	let text: string;
+	try {
+		text = readFileSync(path, "utf8");
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw new Error(`popup registry ${path} could not be read: ${err instanceof Error ? err.message : String(err)}`);
+	}
+	return parseRegistry(text, path);
+}
+
+/**
+ * An attempt's members in one ps read: every process whose pid and lstart match a recorded pair, the claim's (the
+ * worker) or a registry line's. A process recorded nowhere is never a member, whatever its argv says.
+ */
+export function liveMembers(claim: Pick<PopupClaim, "pid" | "lstart"> | null, registered: readonly Member[], procs: readonly Proc[]): Proc[] {
+	return stillMatching(procs, [...(claim === null ? [] : [{ pid: claim.pid, lstart: claim.lstart }]), ...registered]);
 }
 
 /** Read one `key=value` field of a row's detail. */
@@ -137,7 +189,6 @@ export interface PopupAttempt {
 	end: { step: "ok" | "failed" | "unstarted" | "settled"; detail: string; at: string } | null;
 }
 
-export const popupTag = (a: Pick<PopupAttempt, "episode" | "level" | "attempt">): string => `${a.episode}:${a.level}:${a.attempt}`;
 export const groupKey = (key: string, episode: string, level: number): string => `${key} ${episode} ${level}`;
 
 /**
@@ -202,18 +253,17 @@ export type SettleStep =
 	| { do: "end"; step: "unstarted" | "settled"; detail: string };
 
 /**
- * D3's settlement for one unsettled attempt over one `ps -E` read (`procs`) at `now`. `cancel` is why its episode no longer
- * wants it (`acked …`, `closed …`, `superseded by level 3`), else null. Members: the worker (the claim's pid and lstart
- * pair) and every process carrying the attempt's tag. Returns the steps in order; none while the attempt runs as it should.
+ * D3's settlement for one unsettled attempt over one ps read (`procs`) at `now`. `cancel` is why its episode no longer
+ * wants it (`acked …`, `closed …`, `superseded by level 3`), else null. `registered` is the attempt's registry
+ * (`readRegistry`). Members: `liveMembers`, the processes whose pid and lstart match the claim's pair or a registry line.
+ * Returns the steps in order; none while the attempt runs as it should.
  * A worker's `failed` report settles nothing by itself: its members are signalled first, and `settled` comes only once none
  * is left (review r1 #1). Members still matching POPUP_KILL_GRACE_MS after their SIGKILL are `stuck`: the key's error (R24).
  */
-export function settleAttempt(a: PopupAttempt, procs: readonly Proc[], now: string, cancel: string | null): SettleStep[] {
+export function settleAttempt(a: PopupAttempt, procs: readonly Proc[], now: string, cancel: string | null, registered: readonly Member[]): SettleStep[] {
 	const t = Date.parse(now);
-	const tag = popupTag(a);
-	const tagged = procs.filter((p) => carriesTag(p, tag));
-	const worker = a.claim === null ? [] : procs.filter((p) => p.pid === a.claim!.pid && p.lstart === a.claim!.lstart);
-	const members = [...new Map([...worker, ...tagged].map((p) => [`${p.pid} ${p.lstart}`, p])).values()];
+	const worker = a.claim === null ? [] : stillMatching(procs, [a.claim]);
+	const members = liveMembers(a.claim, registered, procs);
 	const reported = a.failed === null ? null : `worker failed: ${a.failed.detail}`;
 	if (a.terminating.length > 0) {
 		const recorded = a.terminating.flatMap((x) => x.members);
@@ -232,10 +282,10 @@ export function settleAttempt(a: PopupAttempt, procs: readonly Proc[], now: stri
 		return steps;
 	}
 	if (a.claim === null) {
-		if (reported !== null) return tagged.length > 0 ? [{ do: "terminate", why: reported, members: tagged }] : [{ do: "end", step: "settled", detail: reported }];
+		if (reported !== null) return members.length > 0 ? [{ do: "terminate", why: reported, members }] : [{ do: "end", step: "settled", detail: reported }];
 		if (t - Date.parse(a.spawningAt) < POPUP_CLAIM_MS && cancel === null) return [];
 		const why = cancel === null ? `no claim ${POPUP_CLAIM_MS / 1000} s after spawning` : `cancelled ${cancel} before its claim`;
-		return tagged.length > 0 ? [{ do: "terminate", why: `unstarted: ${why}`, members: tagged }] : [{ do: "end", step: "unstarted", detail: why }];
+		return members.length > 0 ? [{ do: "terminate", why: `unstarted: ${why}`, members }] : [{ do: "end", step: "unstarted", detail: why }];
 	}
 	if (members.length === 0) return [{ do: "end", step: "settled", detail: reported ?? "worker ended without a result" }];
 	const why = t >= Date.parse(a.claim.until) ? "expired" : cancel !== null ? `cancelled ${cancel}` : reported ?? (worker.length === 0 ? "worker ended after showing" : null);
@@ -383,15 +433,16 @@ export function settleLegacy(rec: LegacyPopupRecord, procs: readonly Proc[], cla
 
 // ---- the worker ---------------------------------------------------------------------------------
 
-/** The worker's seams: the ledger, its own identity, and the dialog. */
+/** The worker's seams: the ledger, its own identity, the registry directory, and the dialog. */
 export interface WorkerDeps {
 	ledger: Ledger;
-	env: Record<string, string | undefined>;
 	pid: number;
 	/** `ps -p <pid> -o pgid=,lstart=` for this process; throws naming the failure. */
 	identity(pid: number): { pgid: number; lstart: string };
-	/** The popup: surface/src/notify.ts `alarmPopup` (quiet-alarm.zsh) in production. */
-	alarm(title: string, text: string, spoken: string): AlarmOutcome;
+	/** The registries' directory (`alertPopupDir`), the same the pass reads. */
+	dir: string;
+	/** The popup: surface/src/notify.ts `alarmPopup` (quiet-alarm.zsh, QUIET_ALARM_REGISTER=`registry`) in production. */
+	alarm(title: string, text: string, spoken: string, registry: string): AlarmOutcome;
 	err(line: string): void;
 }
 
@@ -420,19 +471,17 @@ function claimRefusal(ep: AlertEpisode | null, attempts: readonly PopupAttempt[]
 }
 
 /**
- * The worker: claim, show, record. Returns its exit code: 0 after `ok`, 1 after `failed` or a refused claim, 2 on bad
- * arguments (no row; the pass marks the attempt `unstarted` after 60 s).
+ * The worker: claim, record itself in the attempt's registry, show, record the outcome. Returns its exit code: 0 after
+ * `ok`, 1 after `failed` or a refused claim, 2 on bad arguments (no row; the pass marks the attempt `unstarted` after 60 s).
  */
 export function workerRun(argv: string[], d: WorkerDeps): number {
-	const [key, episode, levelText] = argv;
+	const [key, episode, levelText, attemptText] = argv;
 	const level = Number(levelText);
-	const tag = d.env[POPUP_TAG_ENV] ?? "";
-	const tm = /^(\S+):([1-9]):(\d+)$/.exec(tag);
-	if (argv.length !== 3 || !key || !episode || !Number.isInteger(level) || !tm || tm[1] !== episode || Number(tm[2]) !== level) {
-		d.err(`alert-popup: usage: alert-popup.ts <key> <episode> <level> with ${POPUP_TAG_ENV}=<episode>:<level>:<attempt>; got ${JSON.stringify(argv)} and ${POPUP_TAG_ENV}=${JSON.stringify(tag)}`);
+	const attempt = Number(attemptText);
+	if (argv.length !== 4 || !key || !episode || !Number.isInteger(level) || level < 1 || !Number.isInteger(attempt) || attempt < 1) {
+		d.err(`alert-popup: usage: alert-popup.ts <key> <episode> <level> <attempt>; got ${JSON.stringify(argv)}`);
 		return 2;
 	}
-	const attempt = Number(tm[3]);
 	const { ledger } = d;
 	const row = (step: Parameters<typeof alertPopupBody>[3], detail?: string) =>
 		ledger.recordEntry({ by: ALERT_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: alertPopupBody(key, episode, level, step, detail) });
@@ -462,11 +511,23 @@ export function workerRun(argv: string[], d: WorkerDeps): number {
 		d.err(`alert-popup ${key} ${episode} ${level}: claim refused: ${claimed.refused}`);
 		return 1;
 	}
+	// Jo's registry rule: the worker's own line goes in before anything is shown, so a registry it cannot write ends the
+	// attempt as `failed` instead of showing a popup the pass could never cancel.
+	const registry = popupRegistryPath(d.dir, { episode, level, attempt });
+	try {
+		mkdirSync(dirname(registry), { recursive: true });
+		appendFileSync(registry, registryLine({ pid: d.pid, lstart: self.lstart, name: "worker" }));
+	} catch (err) {
+		const why = `cannot record itself in its registry ${registry}: ${err instanceof Error ? err.message : String(err)}`;
+		row("failed", why);
+		d.err(`alert-popup ${key} ${episode} ${level}: ${why}`);
+		return 1;
+	}
 	const w = claimed.ep.words;
 	const title = `as2: ${w?.title ?? key}`;
 	const lines = [w?.line ?? `alert ${key} needs you`, ...(w?.next ? [`Next: ${w.next}`] : []), ...(claimed.ep.url ? [`Issue: ${claimed.ep.url}`] : []), `Close the issue, or say ack ${key}, to stop the re-sends.`];
 	row("showing");
-	const outcome = d.alarm(title, lines.join("\n"), `${w?.title ?? key}. ${w?.line ?? ""} ${w?.next ?? ""}`.trim());
+	const outcome = d.alarm(title, lines.join("\n"), `${w?.title ?? key}. ${w?.line ?? ""} ${w?.next ?? ""}`.trim(), registry);
 	if (outcome.state === "answered") {
 		row("ok", outcome.detail);
 		if (outcome.otherStderr !== "") {
@@ -487,8 +548,8 @@ if (import.meta.main) {
 	let code = 1;
 	try {
 		code = workerRun(process.argv.slice(2), {
-			ledger, env, pid: process.pid, identity: (pid) => psIdentity(pid), err: (l) => process.stderr.write(`${new Date().toISOString()} ${l}\n`),
-			alarm: (title, text, spoken) => alarmPopup(title, text, spoken, { repo: join(import.meta.dir, "..", ".."), giveUpSecs: DOCTOR_GIVE_UP_SECS, env, timeoutMs: DOCTOR_GIVE_UP_SECS * 1000 + 5 * 60_000 }),
+			ledger, pid: process.pid, identity: (pid) => psIdentity(pid), dir: alertPopupDir(env), err: (l) => process.stderr.write(`${new Date().toISOString()} ${l}\n`),
+			alarm: (title, text, spoken, registry) => alarmPopup(title, text, spoken, { repo: join(import.meta.dir, "..", ".."), giveUpSecs: DOCTOR_GIVE_UP_SECS, env: { ...env, QUIET_ALARM_REGISTER: registry }, timeoutMs: DOCTOR_GIVE_UP_SECS * 1000 + 5 * 60_000 }),
 		});
 	} finally {
 		ledger.close();
