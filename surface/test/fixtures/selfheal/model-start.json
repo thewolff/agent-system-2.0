@@ -1,0 +1,35 @@
+{
+	"source": "live ledger, wl-mv8cvw0lq3rlds lane-1 start and the lane-model entry 3 min later",
+	"rows": [
+		{
+			"t": "entry",
+			"id": "en-mv8cx8c8kwwe80",
+			"workloadId": "wl-mv8cvw0lq3rlds",
+			"sliceId": null,
+			"kind": "assumption",
+			"by": "lane-runner",
+			"at": "2026-10-14T17:01:37.784Z",
+			"body": "lane-started: lane-mv8cvw0lq3rlds-1 {\"pid\":56595,\"start\":\"Wed Oct 14 10:01:37 2026\",\"session\":null,\"argv\":[],\"runnerPid\":56587,\"model\":null,\"ranModel\":null}"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv8cx99rgl6gw0",
+			"workloadId": "wl-mv8cvw0lq3rlds",
+			"sliceId": null,
+			"kind": "assumption",
+			"by": "lane-runner",
+			"at": "2026-10-14T17:01:38.991Z",
+			"body": "lane-started: lane-mv8cvw0lq3rlds-1 {\"pid\":56595,\"start\":\"Wed Oct 14 10:01:37 2026\",\"session\":null,\"argv\":[],\"runnerPid\":56587,\"model\":null,\"ranModel\":\"anthropic/claude-opus-5-5\"}"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv8d1b8mlysd8g",
+			"workloadId": "wl-mv8cvw0lq3rlds",
+			"sliceId": null,
+			"kind": "assumption",
+			"by": "orchestrator-surface",
+			"at": "2026-10-14T17:04:48.166Z",
+			"body": "lane-model: openai-codex/gpt-6.1-sol by jo at 2026-10-14T17:04:48.166Z"
+		}
+	]
+}

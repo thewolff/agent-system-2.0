@@ -5,49 +5,115 @@
 // (PLAN wl-mupu0sx2o046io D8, and its D9 round-limit exception), and the terminal pair ending the
 // lane without a death.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	handSettledBody, handSpawnBody, laneBuilderBody, PARK_OPTIONS, reviewParkBody, reviewSameLabBody, reviewWithheldBody,
 } from "../../classifier/src/lab";
 import {
 	countRounds, effectiveRoundLimit, ROUND_LIMIT_OPTIONS, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, reviewRoundsExtendBody, roundLimitQuestionBody, UNKNOWN,
+	type LoopEndReason,
 } from "../../classifier/src/rounds";
 import { gateSession } from "../../gates/src/session";
 import { Ledger, type RoutingOutcome, TEST_RUNNER_BY } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
+import laneToolsRow, { liveVerifierReads, planAutoStartRound, planReviewRefusal, TEST_RUNNER_SCRIPT, type VerifierReads, verifierSelfCheck } from "../extensions/lane-tools";
+import { ensureStandingWorkload } from "../src/identity";
 import { errorLines, reservedStates, waitingReserved } from "../src/errors";
-import { planReviewRefusal, TEST_RUNNER_SCRIPT } from "../extensions/lane-tools";
+import { renderWake } from "../src/render";
 import { apply, interpret } from "../src/input";
-import { CLASSIFIER_MACHINERY_PREFIXES, controlEntries, holdersOf, PLAN_OPTIONS, planApprovedBody, planFirst, planFirstBody, doneBody } from "../src/launch";
-import { testRequestedBody } from "../src/test-run";
+import {
+	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, holdersOf, landFirstBody, landFirstInstructionBody, PLAN_FILE_MAX_BYTES, PLAN_OPTIONS, PLAN_REQUIREMENTS_SHAPE, planApprovedBody, planFirst,
+	planFirstBody, doneBody,
+} from "../src/launch";
+import { type ExecCounts, testRequestedBody, testRunBody } from "../src/test-run";
 import { releasedOpen } from "../src/turn-end";
-import { recordRepo } from "../src/decision-log";
-import { LANE_FULL_TEST_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
+import { recordRepo, renderClose } from "../src/decision-log";
+import { openPlanPath } from "../src/plan-paths";
+import { quotaMoves } from "../src/quota-move-alert";
+import { ESCALATION_BY, LANE_FULL_TEST_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ctxOf, fakePi, HOW_IT_FAILS, notices, tempLedger, tempRepo, tmp } from "./helpers";
+
+/** Jo's `land-first <repo> on|off` as the surface records it: his instruction, then `land-first:` naming it, on the standing workload. */
+function landFirst(ledger: Ledger, repo: string, on: boolean): void {
+	ensureStandingWorkload(ledger);
+	const id = ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(repo, on) });
+	ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(repo, on, id) });
+}
+/** The runner's main run of `sha` on the standing workload; `exec` sets its counts (believable by default), `by` forges the writer. */
+function mainRun(ledger: Ledger, runId: string, sha: string, verdict: "green" | "red", o: { exec?: ExecCounts; by?: string } = {}): void {
+	ensureStandingWorkload(ledger);
+	const red = verdict === "red";
+	ledger.recordEntry({
+		by: o.by ?? TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption",
+		body: testRunBody({
+			runId, verdict, sha, pr: 0, reason: null, headAtEnd: sha, base: null, mergeBase: null,
+			full: { pass: 400, fail: red ? 1 : 0, skip: 0, exit: red ? 1 : 0, ms: 900, error: null }, solo: [],
+			failures: red ? [{ part: "full", name: "x.test.ts > broken", firstError: "error: nope" }] : [], runDir: `/runs/${runId}`, preflight: "ok",
+			scope: "full", main: true, host: "mac", exec: o.exec ?? { files: 40, tests: 400, treeFiles: 40 },
+		}),
+	});
+}
 
 const LANE_MODEL = "anthropic/claude-opus-5-5";
 const OTHER_LAB = "openai-codex/gpt-6-astra";
 
 // PLAN wl-muq22rnjcfrrpc D7: the plan file and the review verdict a plan question names are real files.
+// PLAN wl-mv8vwb04cy18n4 D1: the plan file carries a `## Requirements` section; this one marks no requirement prompt-only.
 const PLAN_DIR = tmp("plan");
 const PLAN_FILE = join(PLAN_DIR, "PLAN.md");
-const VERDICT_FILE = join(PLAN_DIR, "PLAN-REVIEW-r1.md");
-writeFileSync(PLAN_FILE, "# PLAN\n");
+const VERDICT_FILE = join(PLAN_DIR, "r.md");
+writeFileSync(PLAN_FILE, [
+	"# PLAN", "", "## Design", "", "The header offset moves into one token.", "", HOW_IT_FAILS, "",
+	"## Requirements", "",
+	"- R1: the header offset lives in one token => test surface/test/tokens.test.ts; code src/tokens.ts headerOffset",
+	"- R2: the old constant is gone => test surface/test/tokens.test.ts the constant case",
+	"", "## Slices", "", "| Slice | Kind |", "|---|---|",
+].join("\n"));
 writeFileSync(VERDICT_FILE, "verdict: approve-as-is\n");
 const REVIEW_LINE = `review: approve-as-is, ${OTHER_LAB}, ${VERDICT_FILE}`;
-/** A plan-question body in D7's shape: the plan path, `slices` slice lines, `tradeoffs` tradeoff lines, the review line. */
+const NONE_LINE = "prompt-only: none";
+/** A plan-question body in D7's shape: the plan path, `slices` slice lines, `prompt-only: none` (PLAN wl-mv8vwb04cy18n4 D2), `tradeoffs` tradeoff lines, the review line. */
 const planBody = (slices = 2, tradeoffs = 1) => [
 	PLAN_FILE,
 	...Array.from({ length: slices }, (_, i) => `- sl-${i + 1}: slice ${i + 1}, one line`),
+	NONE_LINE,
 	...Array.from({ length: tradeoffs }, (_, i) => `tradeoff: tradeoff ${i + 1}`),
 	REVIEW_LINE,
 ].join("\n");
 const PLAN_BODY = planBody();
+/** Writes a plan file `name` under PLAN_DIR from `lines` (joined with `eol`) and returns its absolute path. */
+const planFile = (name: string, lines: string[], eol = "\n") => {
+	const path = join(PLAN_DIR, name);
+	writeFileSync(path, lines.join(eol));
+	return path;
+};
+/** A plan file whose Requirements section marks R2 and R3 prompt-only (PLAN wl-mv8vwb04cy18n4 D1, D2). */
+const PROMPT_ONLY_FILE = planFile("PLAN-prompt-only.md", [
+	"# PLAN", HOW_IT_FAILS, "", "## Requirements", "",
+	"- R1: the refusal names the grammar => test surface/test/lane-tools.test.ts",
+	"- R2: the SPEC amendment states the rule => prompt-only: human-read prose no code can judge",
+	"- R3: the change reaches main only by Jo's merge => prompt-only: no gate refuses a lane's merge here",
+]);
+const PROMPT_ONLY_LINES = [
+	"prompt-only: R2: the SPEC amendment states the rule; prose no code can judge",
+	"prompt-only: R3: the change reaches main only by Jo's merge; no gate refuses it",
+];
+/** A plan-question body on `path`: one slice line, `promptOnly` lines, one tradeoff, the review line. */
+const bodyOn = (path: string, promptOnly: string[]) => [path, "- sl-1: slice 1, one line", ...promptOnly, "tradeoff: tradeoff 1", REVIEW_LINE].join("\n");
+/**
+ * The holder's `plan-question:` entry for `id` as lane_raise_question writes it (fix round 1, F1): the sha256 of the plan file
+ * and of the verdict file it was checked on. Hashed here with node:crypto, so this file loads on the baseline.
+ */
+const boundPlanQuestion = (id: string, plan = PLAN_FILE, verdict = VERDICT_FILE) => {
+	const sha = (p: string) => createHash("sha256").update(readFileSync(p)).digest("hex");
+	return `plan-question: ${id} plan-sha256 ${sha(plan)} verdict-sha256 ${sha(verdict)}`;
+};
 
-function laneFixture(over: { planFirst?: boolean; mode?: "autonomous" | "user-driven"; exec?: boolean } = {}) {
+function laneFixture(over: { planFirst?: boolean; mode?: "autonomous" | "user-driven"; exec?: boolean; stakes?: "normal" | "production" } = {}) {
 	const { ledger, path } = tempLedger();
-	const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "Move the header offset into a token", stakes: "normal", mode: over.mode ?? "autonomous" });
+	const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "Move the header offset into a token", stakes: over.stakes ?? "normal", mode: over.mode ?? "autonomous" });
 	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the header offset lives in one token") });
 	if (over.planFirst) {
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
@@ -75,16 +141,16 @@ let handSeq = 0;
  * One settled review hand on `slice`, written as the classifier writes it (PLAN D2–D6, D9): an
  * optional spent `review-same-lab:` grant or Jo's Kimi-out `review-same-lab-rule:` line naming
  * `rule` as its slice (PLAN wl-mv5xay6bjp0268 § 2.2, a string literal so it loads on the baseline),
- * `hand-spawn:` (by `spawnBy`, the lane by default, after a `gap` entry when given), the judge
- * routing row, `review-withheld:` when asked, `hand-settled:`, and a `review-round:` when `round`
- * is given. Ticks the clock on both sides so its rows sort strictly between the questions before
- * and after it.
+ * `hand-spawn:` (by `spawnBy`, the lane by default, after a `gap` entry and then the `between`
+ * entries when given), the judge routing row, `review-withheld:` when asked, `hand-settled:`, and a
+ * `review-round:` when `round` is given. Ticks the clock on both sides so its rows sort strictly
+ * between the questions before and after it.
  */
 function seedReview(
 	ledger: Ledger, wl: string, slice: string,
 	over: {
 		ran?: string[]; outcome?: RoutingOutcome; withheld?: boolean; grant?: string; rule?: string; gap?: string; spawnBy?: string; group?: string; round?: number;
-		blocking?: number;
+		blocking?: number; between?: (token: string) => { body: string; by?: string }[]; anthropicOut?: boolean; ruleToken?: string; ruleEntrySlice?: string;
 	} = {},
 ): { token: string; routing: string } {
 	tick();
@@ -93,10 +159,13 @@ function seedReview(
 	const group = over.group ?? `dg-t${n}`;
 	const ran = over.ran ?? [OTHER_LAB];
 	const outcome = over.outcome ?? "ran";
-	const entry = (body: string, by = "lane-t-1") => ledger.recordEntry({ by, workloadId: wl, sliceId: slice, kind: "assumption", body });
+	const entry = (body: string, by = "lane-t-1", sliceId = slice) => ledger.recordEntry({ by, workloadId: wl, sliceId, kind: "assumption", body });
 	if (over.grant) entry(reviewSameLabBody(over.grant, token));
-	if (over.rule) entry(`review-same-lab-rule: in-mv5xafhywe3w8w slice ${over.rule} token ${token} labs anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)`);
+	if (over.rule) entry(over.anthropicOut
+		? `review-same-lab-rule: in-mvtur7tlze7r5o slice ${over.rule} token ${over.ruleToken ?? token} labs openai anthropic-out until 2026-10-31T06:00:00-07:00`
+		: `review-same-lab-rule: in-mv5xafhywe3w8w slice ${over.rule} token ${token} labs anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)`, undefined, over.ruleEntrySlice);
 	if (over.gap) entry(over.gap);
+	for (const b of over.between?.(token) ?? []) entry(b.body, b.by);
 	entry(handSpawnBody({ token, root: "/tmp/lane-t-1", spawnKey: slice, review: true, group, row: ran }), over.spawnBy);
 	const routing = ledger.recordRouting({
 		by: "lane-t-1", workloadId: wl, sliceId: slice, spawnKey: slice, sessionRoot: "/tmp/lane-t-1", agentId: `${slice}-${n}`,
@@ -121,6 +190,48 @@ function jo(ledger: Ledger, questionId: string, answer: string): string {
 	tick();
 	return ledger.answerQuestion(questionId, { by: SURFACE_BY, answer, author: "jo", channel: "surface" });
 }
+
+describe("T4: lane-written handles stay raw on disk", () => {
+	test("entry, message and plan question expand caller-local paths before storage and preserve openPlanPath and decision logs", async () => {
+		const x = laneFixture({ planFirst: true });
+		Object.assign(x.ctx.sessionManager, { getSessionFile: () => join(PLAN_DIR, "lane.jsonl"), getSessionId: () => "lane-local" });
+		Object.assign(x.ctx, { localProtocolOptions: { getArtifactsDir: () => PLAN_DIR } });
+		// Optional on the baseline: absence of the new machinery must fail a stored-body assertion, not module loading.
+		const linksPath = join(import.meta.dir, "..", "..", "gates", "src", "links.ts");
+		const links = await import(linksPath).catch((error: Error & { code?: string }) => {
+			if (error.code === "MODULE_NOT_FOUND" || error.code === "ERR_MODULE_NOT_FOUND") return undefined;
+			throw error;
+		});
+		links?.setLinkRouter({
+			async locate(handle: string, rc: { localProtocolOptions?: { getArtifactsDir?(): string }; sessionId?: string; rules: unknown[] }) {
+				expect(rc.sessionId).toBe("lane-local");
+				expect(rc.rules).toEqual([]);
+				return handle === "local://PLAN.md" ? join(rc.localProtocolOptions!.getArtifactsDir!(), "PLAN.md") : null;
+			},
+			locateSync() { return undefined; },
+		});
+		try {
+			expect(await x.call("lane_record_entry", { body: "Read local://PLAN.md" })).toContain("Recorded entry");
+			expect(x.ledger.entries(x.wl).at(-1)!.body).toBe(`Read ${PLAN_FILE}`);
+			expect(await x.call("lane_message", { body: "Review local://PLAN.md and artifact://missing" })).toContain("Sent message");
+			expect(x.ledger.inFlight().find((w) => w.workload.id === x.wl)!.pendingMessages.at(-1)!.body).toBe(`Review ${PLAN_FILE} and artifact://missing`);
+			await x.call("lane_add_slice", { task: "plan", doneCondition: "approved", inputs: "brief", kind: "judge", id: "sl-local-plan" });
+			seedReview(x.ledger, x.wl, "sl-local-plan");
+			const body = PLAN_BODY.replace(PLAN_FILE, "local://PLAN.md");
+			expect(await x.call("lane_raise_question", { slice: "sl-local-plan", body, options: ["approve", "revise", "cancel"] })).toContain("Raised question");
+			const q = x.ledger.questions(x.wl).at(-1)!;
+			expect(q.body).toBe(PLAN_BODY);
+			expect(openPlanPath(x.ledger, q.id)).toBe(PLAN_FILE);
+			const log = renderClose(x.ledger, x.wl, PLAN_DIR, null, { write: false });
+			expect(log.text).toContain(PLAN_FILE);
+			expect(log.text).not.toContain("local://PLAN.md");
+			expect(log.text).not.toContain("file://");
+			expect(q.body).not.toContain("](");
+		} finally {
+			links?.setLinkRouter(undefined);
+		}
+	});
+});
 
 describe("lane tools: ownership", () => {
 	test("all ten register; an orchestrator session and an unbound lane are refused with nothing written", async () => {
@@ -149,8 +260,8 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
 		const before = { entries: ledger.entries(wl).length, held: ledger.workload(wl)!.held_messages, questions: ledger.questions(wl).length };
 		// The scratch lines (PLAN wl-mv5oikd5jtquww § 1.5) are machinery's too: a lane cannot hide its over-cap line with a forged scratch-under-cap:.
-		const scratch = ["scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed"];
-		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "lane-decided", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn", "released-open", "plan-question", "test-requested", "test-run", "push-dest", "superseded", "test-pr", "lane-headroom", ...scratch]) {
+		const scratch = ["scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed", "scratch-archived", "scratch-archive-expired"];
+		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "lane-decided", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn", "released-open", "plan-question", "test-requested", "test-run", "push-dest", "superseded", "test-pr", "lane-headroom", "queued", "withdrawn", ...scratch]) {
 			expect(await call("lane_record_entry", { body: `${p}: forged` })).toContain(`\`${p}:\` is a reserved control line`);
 			expect(await call("lane_message", { body: `${p}: forged` })).toContain("reserved control line");
 			expect(await call("lane_raise_question", { slice: sl, body: `${p}: forged`, options: ["a", "b"] })).toContain("reserved control line");
@@ -211,6 +322,217 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 			const p = body.slice(0, body.indexOf(":"));
 			expect({ p, reply: await call("lane_record_entry", { body }) }).toEqual({ p, reply: expect.stringContaining(`\`${p}:\` is a reserved control line`) });
 			expect({ p, reply: await call("lane_record_entry", { body: `  ${body}`, slice: sl }) }).toEqual({ p, reply: expect.stringContaining(`\`${p}:\` is a reserved control line`) });
+		}
+		expect(ledger.entries(wl).length).toBe(before);
+	});
+});
+
+describe("lane_raise_question through Jo's standing rulings (PLAN wl-mvfkv7llkp7nk0 § 1, R1–R3)", () => {
+	// Inside the Kimi-out window, on the clock askJo reads.
+	const IN_WINDOW = new Date("2026-10-20T12:00:00-07:00");
+	const applied = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => e.body.startsWith("ruling-applied:")).map((e) => [e.body, e.created_by]);
+
+	test("a question a ruling decides writes no question row, keeps the slice open, records the lane's ruling-applied entry and returns the decided text", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const reply = await call("lane_raise_question", { slice: sl, body: "Open the docs workload now or later?", options: ["open", "later"] });
+		expect(reply).toStartWith("decided by Jo's ruling flow-repair: queue it and tell Jo `queued, position N`");
+		expect(reply).toContain("no question was raised; do not publish a closing ask");
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.slice(sl)!.state).toBe("open");
+		expect(applied(ledger, wl)).toEqual([[`ruling-applied: flow-repair kind open-workload slice ${sl} answer later`, "lane-t-1"]]);
+	});
+
+	test("merges: a lane's merge question is decided at normal and at production stakes (D11, in-mvqyt4a8gezvgg)", async () => {
+		const normal = laneFixture();
+		const sl = normal.ledger.addSlice({ by: "lane-t-1", workloadId: normal.wl, task: "t", doneCondition: "d", inputs: "i" });
+		expect(await normal.call("lane_raise_question", { slice: sl, body: "PR #4 is green; merge it?", options: ["merge", "wait"] })).toContain("decided by Jo's ruling merges");
+		expect(normal.ledger.questions(normal.wl)).toEqual([]);
+
+		const prod = laneFixture();
+		prod.ledger.setStakes(prod.wl, { by: SURFACE_BY, stakes: "production" });
+		const sp = prod.ledger.addSlice({ by: "lane-t-1", workloadId: prod.wl, task: "t", doneCondition: "d", inputs: "i" });
+		expect(await prod.call("lane_raise_question", { slice: sp, body: "PR #4 is green; merge it?", options: ["merge", "wait"] })).toContain("decided by Jo's ruling merges");
+		expect(prod.ledger.questions(prod.wl)).toEqual([]);
+	});
+
+	test("kimi-out: a same-lab question is decided in the window when the builders are known and exclude Kimi; with a Kimi builder it is raised", async () => {
+		setSystemTime(IN_WINDOW);
+		const ok = laneFixture();
+		ok.ledger.recordEntry({ by: "lane-t-1", workloadId: ok.wl, kind: "assumption", body: laneBuilderBody("anthropic", "lane-t-1", LANE_MODEL) });
+		const sl = ok.ledger.addSlice({ by: "lane-t-1", workloadId: ok.wl, task: "t", doneCondition: "d", inputs: "i" });
+		expect(await ok.call("lane_raise_question", { slice: sl, body: "Kimi is out; review same-lab?", options: [...PARK_OPTIONS] })).toContain("decided by Jo's ruling kimi-out: re-dispatch the review");
+		expect(ok.ledger.questions(ok.wl)).toEqual([]);
+
+		const kimi = laneFixture();
+		kimi.ledger.recordEntry({ by: "lane-t-1", workloadId: kimi.wl, kind: "assumption", body: laneBuilderBody("kimi", "lane-t-1", "moonshot/kimi-k3") });
+		const sk = kimi.ledger.addSlice({ by: "lane-t-1", workloadId: kimi.wl, task: "t", doneCondition: "d", inputs: "i" });
+		expect(await kimi.call("lane_raise_question", { slice: sk, body: "Kimi is out; review same-lab?", options: [...PARK_OPTIONS] })).toContain("Raised question");
+	});
+
+	test("a model question declares its subject: refused without one, decided as a lane-model question with it", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const options = [LANE_MODEL, "openai-codex/gpt-6.1-sol"];
+		expect(await call("lane_raise_question", { slice: sl, body: "Which model should this lane run on?", options })).toContain("declare `subject`");
+		expect(await call("lane_raise_question", { slice: sl, body: "Ship?", options: ["ship", "hold"], subject: "lane-model" })).toContain("only when every option");
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(await call("lane_raise_question", { slice: sl, body: "Which model should this lane run on?", options, subject: "lane-model" })).toContain(
+			`decided by Jo's ruling models: run the lane on ${LANE_MODEL}`,
+		);
+		expect(ledger.questions(wl)).toEqual([]);
+	});
+
+	test("a lane cannot forge ruling-applied: through lane_record_entry", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const before = ledger.entries(wl).length;
+		expect(await call("lane_record_entry", { body: "ruling-applied: merges kind merge slice sl-x answer train" })).toContain("`ruling-applied:` is written only when a standing ruling decides");
+		expect(ledger.entries(wl).length).toBe(before);
+	});
+});
+
+describe("lane_raise_question routine: { record } and ruling routine-calls (PLAN wl-mvqwn80onq9hq8 D6, R10, R11, R14)", () => {
+	const RECORD = "keep the header offset in launch.ts as it is; the token move is out of this slice";
+	const BODY = "The header offset also appears in launch.ts; leave it there for this slice?";
+	const routineRows = (ledger: Ledger, wl: string) =>
+		ledger.entries(wl).filter((e) => /^(routine-recorded|ruling-applied|ruling-notice-failed):/.test(e.body)).map((e) => [e.body, e.created_by, e.slice_id]);
+	const noticesOf = (ledger: Ledger, wl: string) =>
+		ledger.db.query<{ body: string; created_by: string; sender: string }, [string]>("SELECT body, created_by, sender FROM messages WHERE workload_id = ?1 AND body LIKE 'notice:%'").all(wl);
+	/** A lane fixture with one open slice; `ask` raises the routine question on it, `params` overriding the defaults. */
+	const fixture = () => {
+		const fx = laneFixture();
+		const sl = fx.ledger.addSlice({ by: "lane-t-1", workloadId: fx.wl, task: "t", doneCondition: "d", inputs: "i" });
+		const ask = (params: Record<string, unknown> = {}) => fx.call("lane_raise_question", { slice: sl, body: BODY, options: ["keep", "move"], routine: { record: RECORD }, ...params });
+		return { ...fx, sl, ask };
+	};
+
+	test("R10/R11: decided by ruling routine-calls: only routine-recorded:, ruling-applied: and one notice, no question, instruction or answer row; the reply authorizes nothing", async () => {
+		const { ledger, wl, sl, ask } = fixture();
+		const reply = await ask();
+		const recorded = ledger.entries(wl).find((e) => e.body.startsWith("routine-recorded:"))!;
+		expect(reply).toBe(
+			`decided by Jo's ruling routine-calls: record-and-announce. Recorded ${recorded.id} and announced. This answer is a decision to change nothing; ` +
+				"it authorizes no code, privilege, spend or GitHub change. A change needs its own question. No question was raised; do not publish a QUESTION block.",
+		);
+		expect(routineRows(ledger, wl)).toEqual([
+			[`routine-recorded: ${sl} ${RECORD}`, ESCALATION_BY, sl],
+			[`ruling-applied: routine-calls kind record-announce slice ${sl} answer record-and-announce`, "lane-t-1", sl],
+		]);
+		expect(noticesOf(ledger, wl)).toEqual([{ body: `notice: auto-answered ${sl} record-and-announce (ruling routine-calls): ${RECORD}`, created_by: ESCALATION_BY, sender: ESCALATION_BY }]);
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.instructions(wl)).toEqual([]);
+		expect(ledger.slice(sl)!.state).toBe("open");
+		// The routine-recorded: row is a control entry: ESCALATION_BY's alone.
+		expect(controlEntries(ledger.entries(wl)).filter((c) => c.prefix === "routine-recorded").map((c) => c.rest)).toEqual([`${sl} ${RECORD}`]);
+	});
+
+	test("R10: a lane cannot spell the machinery's option, in any case or with any separators; nothing is written", async () => {
+		const { ledger, wl, sl, call } = fixture();
+		const before = ledger.entries(wl).length;
+		for (const spelled of ["record-and-announce", "Record_And_Announce", "RECORDANDANNOUNCE", "announce-only", "Record.Only"]) {
+			const reply = await call("lane_raise_question", { slice: sl, body: BODY, options: ["keep", spelled] });
+			expect({ spelled, reply }).toEqual({ spelled, reply: expect.stringContaining(`The option \`${spelled}\` is the machinery's`) });
+		}
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.entries(wl).length).toBe(before);
+	});
+
+	test("a record line that is empty, multi-line or over 200 characters is refused with nothing written", async () => {
+		const { ledger, wl, ask } = fixture();
+		const before = ledger.entries(wl).length;
+		expect(await ask({ routine: { record: "  " } })).toContain("`routine.record` is one line saying what is recorded; it is empty; nothing was asked.");
+		expect(await ask({ routine: { record: "one\ntwo" } })).toContain("it has a line break; nothing was asked.");
+		expect(await ask({ routine: { record: "x".repeat(201) } })).toContain("at most 200 characters; it has 201; nothing was asked.");
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.entries(wl).length).toBe(before);
+	});
+
+	/** Each case: the question goes to Jo with the machinery's option appended, and the ruling writes nothing. */
+	const asked: [string, (fx: { ledger: Ledger; ask: (params?: Record<string, unknown>) => Promise<string> }) => Promise<string>][] = [
+		["Jo said ask-all", async (fx) => {
+			apply(fx.ledger, interpret(fx.ledger, "ask-all")!);
+			return fx.ask();
+		}],
+		["Jo ended ruling routine-calls", async (fx) => {
+			apply(fx.ledger, interpret(fx.ledger, "end-ruling routine-calls")!);
+			return fx.ask();
+		}],
+		["the question carries now", (fx) => fx.ask({ now: "integrity" })],
+		["the body names a force-push", (fx) => fx.ask({ body: "Force-push the branch after the rebase, or leave it?" })],
+		["the body names reset --hard", (fx) => fx.ask({ body: "git reset --hard to origin, or keep the local commits?" })],
+		["the record line names a branch deletion", (fx) => fx.ask({ routine: { record: "delete the stale wl/old branch afterwards" } })],
+		["the record line names rm -rf", (fx) => fx.ask({ routine: { record: "rm -rf build before the next run" } })],
+		["the body names DROP", (fx) => fx.ask({ body: "Run DROP on the cache table, or keep it?" })],
+		["the body names a production database", (fx) => fx.ask({ body: "Read from the production database, or keep the fixture?" })],
+		["the record line names a secret rotation", (fx) => fx.ask({ routine: { record: "rotate the deploy secret next week" } })],
+		["the record line names a protected branch", (fx) => fx.ask({ routine: { record: "leave the protected branch rule as it is" } })],
+	];
+	for (const [name, run] of asked) {
+		test(`R11: asked when ${name}`, async () => {
+			const fx = fixture();
+			const reply = await run(fx);
+			expect(reply).toContain("Raised question");
+			expect(reply).toContain("(keep / move / record-and-announce)");
+			const questions = fx.ledger.questions(fx.wl);
+			expect(questions.map((q) => JSON.parse(q.options))).toEqual([["keep", "move", "record-and-announce"]]);
+			expect(routineRows(fx.ledger, fx.wl)).toEqual([]);
+			expect(noticesOf(fx.ledger, fx.wl)).toEqual([]);
+		});
+	}
+
+	test("R11: a routine question on the plan slice is asked", async () => {
+		const { ledger, wl, planId, call } = await planFixture();
+		const reply = await call("lane_raise_question", { slice: planId, body: BODY, options: ["keep", "move"], routine: { record: RECORD } });
+		expect(reply).toContain("Raised question");
+		expect(routineRows(ledger, wl)).toEqual([]);
+		expect(noticesOf(ledger, wl)).toEqual([]);
+	});
+
+	test("R11: after Jo's auto-routine following ask-all, the routine question is decided again", async () => {
+		const fx = fixture();
+		apply(fx.ledger, interpret(fx.ledger, "ask-all")!);
+		expect(await fx.ask({ body: "First routine call?" })).toContain("Raised question");
+		apply(fx.ledger, interpret(fx.ledger, "auto-routine")!);
+		expect(await fx.ask({ body: "Second routine call?" })).toStartWith("decided by Jo's ruling routine-calls: record-and-announce.");
+	});
+
+	test("a failed notice write rolls back the record and the ruling-applied entry and raises the question with ruling-notice-failed: beside it", async () => {
+		const { ledger, wl, sl, ask } = fixture();
+		ledger.db.exec("CREATE TRIGGER fail_notice BEFORE INSERT ON messages WHEN NEW.body LIKE 'notice: auto-answered%' BEGIN SELECT RAISE(ABORT, 'injected notice failure'); END;");
+		const reply = await ask();
+		const questions = ledger.questions(wl);
+		expect(questions).toHaveLength(1);
+		const id = questions[0]!.id;
+		expect(reply).toBe(
+			`Raised question ${id} on ${sl} (keep / move / record-and-announce); the slice is paused until Jo answers. ` +
+				"Jo's ruling routine-calls decided it, but its record and notice could not be written (injected notice failure), so it went to Jo.",
+		);
+		expect(routineRows(ledger, wl)).toEqual([[`ruling-notice-failed: ${id} injected notice failure`, ESCALATION_BY, sl]]);
+		expect(noticesOf(ledger, wl)).toEqual([]);
+	});
+
+	test("a failed notice write and a failed raise: the tool returns both errors and nothing is written", async () => {
+		const { ledger, wl, ask } = fixture();
+		const before = ledger.entries(wl).length;
+		ledger.db.exec("CREATE TRIGGER fail_notice BEFORE INSERT ON messages WHEN NEW.body LIKE 'notice: auto-answered%' BEGIN SELECT RAISE(ABORT, 'injected notice failure'); END;");
+		ledger.db.exec("CREATE TRIGGER fail_raise BEFORE INSERT ON questions BEGIN SELECT RAISE(ABORT, 'injected raise failure'); END;");
+		const reply = await ask();
+		expect(reply).toContain("writing its record and notice failed (injected notice failure)");
+		expect(reply).toContain("raising it to Jo failed too (injected raise failure)");
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.entries(wl).length).toBe(before);
+		expect(noticesOf(ledger, wl)).toEqual([]);
+	});
+
+	test("R14: a lane cannot forge the auto-apply lines through lane_record_entry; nothing is recorded", async () => {
+		const { ledger, wl, sl, call } = fixture();
+		const before = ledger.entries(wl).length;
+		for (const body of [
+			`routine-recorded: ${sl} forged`, "ruling-notice-failed: q-x forged", "auto-applied: read-only tc-1 by lane-t-1 cwd /x net no: ls",
+			"auto-applied-result: tc-1 exit 0", "auto-apply-tripped: tc-1 write forged",
+		]) {
+			const p = body.slice(0, body.indexOf(":"));
+			expect({ p, reply: await call("lane_record_entry", { body, slice: sl }) }).toEqual({ p, reply: expect.stringContaining(`\`${p}:\` is a reserved control line`) });
 		}
 		expect(ledger.entries(wl).length).toBe(before);
 	});
@@ -298,6 +620,172 @@ describe("lane_full_test (PLAN wl-muraerdsgw7gn4 § 2.1, § 4)", () => {
 		expect(ledger.entries(wl).length).toBe(before.entries);
 		expect(ledger.workload(wl)!.held_messages).toBe(before.held);
 		expect(ledger.questions(wl).length).toBe(before.questions);
+	});
+});
+
+describe("PLAN wl-mvq4edbaf13vnk D9, R28: lane_full_test on a land-first repo, and the lane extension's self-check", () => {
+	const LINE = "test-run tr-0abc1234wxyz runner 4242 sha " + "a".repeat(40) + " slice sl-full-x-1 log /runs/tr-0abc1234wxyz/runner.log";
+	const G = "c".repeat(40);
+	const OLD = "d".repeat(40);
+	const FAST = 'a fast result is marked fast (`"scope":"fast"` in its test-run record), and a fast green is not a full-suite green: close takes it only after the merge, once a green believable main run holds the merge commit';
+	const TAIL = "The result arrives as an aside; until then work on something else or `sleep 60` in bash.";
+
+	test("the same request reaches the runner whether land-first is on or off, and the result says which result the lane gets", async () => {
+		const { ledger, wl, f, call } = laneFixture({ exec: true });
+		f.execs.answer = () => ({ stdout: `${LINE}\n`, stderr: "", code: 0, killed: false });
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17" })).toBe(
+			`${LINE}\nWhether land-first is on could not be read (${wl} has no repo: checkout with a GitHub origin), so this may be the fast check or the full suite; ${FAST}.\n${TAIL}`,
+		);
+		const repo = tempRepo();
+		expect(Bun.spawnSync(["git", "-C", repo, "remote", "add", "origin", "https://github.com/thewolff/agent-system-2.0.git"]).exitCode).toBe(0);
+		recordRepo(ledger, wl, repo);
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17" })).toBe(`${LINE}\nLand-first is off for thewolff/agent-system-2.0: this is the full suite.\n${TAIL}`);
+		// Jo names the repo by its short name; it is the same repository
+		landFirst(ledger, "agent-system-2.0", true);
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17" })).toBe(
+			`${LINE}\nLand-first is on for thewolff/agent-system-2.0: the runner applies the gate, so this is the fast check when the PR's diff allows it, else the full suite; ${FAST}.\n${TAIL}`,
+		);
+		// another repository's land-first does not turn it on; Jo's later off turns it off
+		landFirst(ledger, "agent-system-2.0", false);
+		landFirst(ledger, "thewolff/other-repo", true);
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17" })).toContain("Land-first is off for thewolff/agent-system-2.0: this is the full suite.");
+		const args = [TEST_RUNNER_SCRIPT, "start", wl, "17", "--requested-by", "lane-t-1"];
+		expect(f.execs.calls.map((c) => c.args)).toEqual([args, args, args, args]);
+	});
+
+	/** Reads of a verified root: `/v/c` is verified/current, its HEAD is G, nothing is modified; `over` replaces any read. */
+	const reads = (over: Partial<VerifierReads> = {}): VerifierReads => ({
+		root: () => "/v/c", current: () => "/v/c", ownerRepo: () => "thewolff/agent-system-2.0", head: () => G, modified: () => [], ...over,
+	});
+	/** A ledger with land-first on for agent-system-2.0 and a green believable main verdict on G. */
+	const onLedger = () => {
+		const { ledger } = tempLedger();
+		landFirst(ledger, "agent-system-2.0", true);
+		mainRun(ledger, "tr-0main1", G, "green");
+		return ledger;
+	};
+	const NEXT = "Next: run `install/install.sh --control-root=verified` so lanes load ~/.agent-system-2/verified/current.";
+
+	test("a verified root passes, and so does an older verified release; with land-first off nothing is shown whatever fails", () => {
+		const ledger = onLedger();
+		expect(verifierSelfCheck(ledger, reads())).toBeNull();
+		mainRun(ledger, "tr-0main2", OLD, "green");
+		mainRun(ledger, "tr-0main3", "e".repeat(40), "green");
+		expect(verifierSelfCheck(ledger, reads({ head: () => OLD }))).toBeNull();
+		const broken = reads({ root: () => "/dev/checkout", current: () => null, head: () => "f".repeat(40), modified: () => ["x.ts"] });
+		const { ledger: off } = tempLedger();
+		expect(verifierSelfCheck(off, broken)).toBeNull();
+		landFirst(off, "agent-system-2.0", true);
+		landFirst(off, "agent-system-2.0", false);
+		expect(verifierSelfCheck(off, broken)).toBeNull();
+		// land-first on for another repository leaves this one off
+		landFirst(off, "thewolff/other-repo", true);
+		expect(verifierSelfCheck(off, broken)).toBeNull();
+	});
+
+	test("each failed check is named on one line, and all of them at once on the same line", () => {
+		const ledger = onLedger();
+		const lead = "verifier: land-first is on for thewolff/agent-system-2.0, but the lane tools load unverified code from";
+		expect(verifierSelfCheck(ledger, reads({ current: () => "/v/b" }))).toBe(`${lead} /v/c at ${G.slice(0, 12)}: root /v/c is not verified/current (/v/b). ${NEXT}`);
+		expect(verifierSelfCheck(ledger, reads({ current: () => null }))).toBe(
+			`${lead} /v/c at ${G.slice(0, 12)}: no verified control root: ~/.agent-system-2/verified/current does not exist. ${NEXT}`,
+		);
+		expect(verifierSelfCheck(ledger, reads({ modified: () => ["surface/src/test-run.ts", "gates/src/rows/r06-reserved.ts"] }))).toBe(
+			`${lead} /v/c at ${G.slice(0, 12)}: tracked files modified: surface/src/test-run.ts, gates/src/rows/r06-reserved.ts. ${NEXT}`,
+		);
+		expect(verifierSelfCheck(ledger, reads({ root: () => "/dev/checkout", current: () => "/v/c", head: () => OLD, modified: () => ["a.ts"] }))).toBe(
+			`${lead} /dev/checkout at ${OLD.slice(0, 12)}: root /dev/checkout is not verified/current (/v/c); HEAD ${OLD.slice(0, 12)} has no green believable main verdict; tracked files modified: a.ts. ${NEXT}`,
+		);
+	});
+
+	test("HEAD passes only on a green believable verdict: none, red, implausible, red then green, or a lane-written green each fail", () => {
+		const cases: { name: string; seed: (l: Ledger) => void }[] = [
+			{ name: "none", seed: () => {} },
+			{ name: "red", seed: (l) => mainRun(l, "tr-0main9", OLD, "red") },
+			{ name: "implausible", seed: (l) => mainRun(l, "tr-0main9", OLD, "green", { exec: { files: 10, tests: 400, treeFiles: 40 } }) },
+			{
+				name: "red then green",
+				seed: (l) => {
+					mainRun(l, "tr-0main8", OLD, "red");
+					mainRun(l, "tr-0main9", OLD, "green");
+				},
+			},
+			{ name: "lane-written green", seed: (l) => mainRun(l, "tr-0main9", OLD, "green", { by: "lane-t-1" }) },
+		];
+		for (const c of cases) {
+			const ledger = onLedger();
+			c.seed(ledger);
+			expect({ name: c.name, line: verifierSelfCheck(ledger, reads({ head: () => OLD })) }).toEqual({
+				name: c.name,
+				line: `verifier: land-first is on for thewolff/agent-system-2.0, but the lane tools load unverified code from /v/c at ${OLD.slice(0, 12)}: HEAD ${OLD.slice(0, 12)} has no green believable main verdict. ${NEXT}`,
+			});
+		}
+	});
+
+	test("a failed read leaves the check unrun and is named with every other; an unreadable root or origin says land-first's state is unknown", () => {
+		const ledger = onLedger();
+		const boom = (what: string) => () => {
+			throw new Error(what);
+		};
+		const lead = "verifier: land-first is on for thewolff/agent-system-2.0, but the lane tools' self-check could not check their root /v/c:";
+		expect(verifierSelfCheck(ledger, reads({ head: boom("git rev-parse HEAD exited 128: not a git repository"), modified: boom("git status failed") }))).toBe(
+			`${lead} HEAD could not be read: git rev-parse HEAD exited 128: not a git repository; tracked files could not be read: git status failed; ~/.agent-system-2/verified/current's HEAD could not be read: git rev-parse HEAD exited 128: not a git repository. ${NEXT}`,
+		);
+		expect(verifierSelfCheck(ledger, reads({ head: (at) => (at === "/v/c" ? "not-a-sha" : G) }))).toBe(
+			`${lead} HEAD could not be read: git rev-parse HEAD in /v/c printed "not-a-sha", not a sha; ~/.agent-system-2/verified/current's HEAD could not be read: git rev-parse HEAD in /v/c printed "not-a-sha", not a sha. ${NEXT}`,
+		);
+		expect(verifierSelfCheck(ledger, reads({ current: boom("EACCES") }))).toBe(`${lead} ~/.agent-system-2/verified/current could not be read: EACCES. ${NEXT}`);
+		expect(verifierSelfCheck(ledger, reads({ root: boom("git rev-parse --show-toplevel exited 128") }))).toBe(
+			`verifier: the lane tools' self-check could not read their own repository (git rev-parse --show-toplevel exited 128), so whether land-first is on for it is unknown. ${NEXT}`,
+		);
+		expect(verifierSelfCheck(ledger, reads({ ownerRepo: () => null }))).toBe(
+			`verifier: the lane tools load from /v/c, which has no GitHub origin, so whether land-first is on for it is unknown and the self-check did not run. ${NEXT}`,
+		);
+	});
+
+	test("at session start a bound lane shows the line once as a warning; a passing root and an unbound session show nothing", async () => {
+		const { ledger, path } = tempLedger();
+		landFirst(ledger, "agent-system-2.0", true);
+		mainRun(ledger, "tr-0main1", G, "green");
+		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "a lane's work", stakes: "normal", mode: "autonomous" });
+		const bound = { AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_LEDGER_DB: path, AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: "lane-t-1", HOME: "/nonexistent-home" };
+		const start = async (env: Record<string, string>, r: VerifierReads) => {
+			const f = fakePi();
+			laneToolsRow(f.pi, env, r);
+			const before = notices.length;
+			await f.emit("session_start", { type: "session_start" }, ctxOf());
+			return notices.slice(before);
+		};
+		expect(await start(bound, reads({ modified: () => ["a.ts"] }))).toEqual([
+			`verifier: land-first is on for thewolff/agent-system-2.0, but the lane tools load unverified code from /v/c at ${G.slice(0, 12)}: tracked files modified: a.ts. ${NEXT}`,
+		]);
+		expect(await start(bound, reads())).toEqual([]);
+		expect(await start({ AGENT_SYSTEM_LEDGER_DB: path, HOME: "/nonexistent-home" }, reads({ modified: () => ["a.ts"] }))).toEqual([]);
+	});
+
+	test("the live reads: the verified/current symlink resolved or missing, HEAD, the origin, and modified tracked paths with a rename's new name", () => {
+		const repo = tempRepo();
+		const home = tmp("home");
+		const live = liveVerifierReads({ HOME: home });
+		expect(live.current()).toBeNull();
+		mkdirSync(join(home, ".agent-system-2", "verified"), { recursive: true });
+		symlinkSync(repo, join(home, ".agent-system-2", "verified", "current"));
+		expect(live.current()).toBe(repo);
+		const git = (...args: string[]) => {
+			const r = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
+			expect({ args, code: r.exitCode }).toEqual({ args, code: 0 });
+			return r.stdout.toString().trim();
+		};
+		expect(live.head(repo)).toBe(git("rev-parse", "HEAD"));
+		expect(live.ownerRepo(repo)).toBeNull();
+		git("remote", "add", "origin", "git@github.com:thewolff/agent-system-2.0.git");
+		expect(live.ownerRepo(repo)).toBe("thewolff/agent-system-2.0");
+		expect(live.modified(repo)).toEqual([]);
+		writeFileSync(join(repo, "untracked.txt"), "never named\n");
+		writeFileSync(join(repo, "README.md"), "changed\n");
+		git("mv", ".gitignore", "kept.ignore");
+		expect(live.modified(repo).sort()).toEqual(["README.md", "kept.ignore"]);
+		expect(() => live.head(join(home, "nowhere"))).toThrow(/rev-parse HEAD exited/);
 	});
 });
 
@@ -470,8 +958,8 @@ describe("plan-first (decision 15) through the lane tools and Jo's answer", () =
 });
 
 /** A plan-first workload whose lane (on anthropic) added its plan slice; `ask` raises a question on it through the tool. */
-async function planFixture() {
-	const fx = laneFixture({ planFirst: true });
+async function planFixture(stakes: "normal" | "production" = "normal") {
+	const fx = laneFixture({ planFirst: true, stakes });
 	await fx.call("lane_add_slice", { task: "plan the cut", doneCondition: "plan approved", inputs: "brief", kind: "judge" });
 	const planId = fx.ledger.slices(fx.wl)[0]!.id;
 	const ask = (options: string[] = [...PLAN_OPTIONS], slice = planId, body = PLAN_BODY) => {
@@ -535,7 +1023,11 @@ describe("plan review (PLAN D8): the plan question waits for a review by another
 		expect(await ask()).toContain("Raised question");
 		const first = ledger.questions(wl)[0]!.id;
 		seedReview(ledger, wl, planId);
-		expect(await ask()).toContain(planReviewRefusal(planId)); // the previous question is still open
+		// The previous question is still open: the same plan question asked again is that open question, reused (PLAN wl-mvg1vs0rhnu3gg § 1.0).
+		expect(await ask()).toBe(`Question ${first} on ${planId} is already open with this body and options; nothing new was raised. The slice stays paused until Jo answers ${first}.`);
+		expect(ledger.questions(wl)).toHaveLength(1);
+		// A changed plan question while the first is open is refused: it keeps every plan check.
+		expect(await ask(undefined, planId, planBody(3))).toContain(planReviewRefusal(planId));
 		jo(ledger, first, "revise");
 		expect(await ask()).toContain(planReviewRefusal(planId));
 		seedReview(ledger, wl, planId);
@@ -572,6 +1064,67 @@ describe("plan review (PLAN D8): the plan question waits for a review by another
 		expect(ledger.questions(wl)).toHaveLength(0);
 		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], rule: planId });
 		expect(await ask()).toContain("Raised question");
+	});
+
+	/** classifier/extension.ts headroomSkipBody, as entry 19408 (wl-mvaqnihc2r85c0) wrote it, a literal so it loads on the baseline. */
+	const skip = (token: string, by?: string) => ({ body: `headroom-skip: openai-codex/gpt-6.1-sol token ${token} openai-codex 7d 0.27 used, window pace +1.0 pts/h, projected 1.65 at reset 2026-10-22T06:17Z`, by });
+
+	test("#228: Jo's Kimi-out rule still counts across an unbroken run of the token's headroom-skip: rows before its hand-spawn: (entries 19407-19409, wl-mvaqnihc2r85c0)", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		// A skip that breaks the run clears nothing: another token's, another writer's, or one followed by an unrelated note.
+		const broken: ((t: string) => { body: string; by?: string }[])[] = [() => [skip("dt-other")], (t) => [skip(t, "lane-x")], (t) => [skip(t), { body: "an unrelated note" }]];
+		for (const between of broken) {
+			seedReview(ledger, wl, planId, { ran: [LANE_MODEL], rule: planId, between });
+			expect(await ask()).toContain(planReviewRefusal(planId));
+		}
+		expect(ledger.questions(wl)).toHaveLength(0);
+		// 19407 rule, 19408 headroom-skip, 19409 hand-spawn: the plan question goes through.
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], rule: planId, between: (t) => [skip(t)] });
+		expect(await ask()).toContain("Raised question");
+	});
+
+	test("Anthropic-out receipt admits only a successful, non-withheld adjacent same-token/slice/writer review, including headroom skips", async () => {
+		for (const invalid of ["slice", "entry-slice", "token", "writer", "gap", "skip-token", "skip-writer", "withheld", "unsuccessful", null]) {
+			const { ledger, wl, planId, ask } = await planFixture();
+			ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: laneBuilderBody("openai", "lane-t-1", OTHER_LAB) });
+			if (invalid === "entry-slice") {
+				tick();
+				ledger.addSlice({ by: "lane-t-1", workloadId: wl, id: "sl-other", task: "other review", doneCondition: "d", inputs: "i" });
+			}
+			seedReview(ledger, wl, planId, {
+				ran: [OTHER_LAB], anthropicOut: true, rule: invalid === "slice" ? "sl-other" : planId,
+				ruleToken: invalid === "token" ? "dt-wrong" : undefined,
+				ruleEntrySlice: invalid === "entry-slice" ? "sl-other" : undefined,
+				spawnBy: invalid === "writer" ? "lane-x" : undefined,
+				gap: invalid === "gap" ? "unrelated note" : undefined,
+				withheld: invalid === "withheld", outcome: invalid === "unsuccessful" ? "refused-model-unknown" : "ran",
+				between: t => [skip(invalid === "skip-token" ? "dt-wrong" : t, invalid === "skip-writer" ? "lane-x" : undefined), skip(t)],
+			});
+			const reply = await ask();
+			expect(reply).toContain(invalid === null ? "Raised question" : planReviewRefusal(planId));
+			expect(ledger.questions(wl)).toHaveLength(invalid === null ? 1 : 0);
+		}
+	});
+
+	test("a valid pre-expiry Anthropic-out receipt remains admissible after the rule expires", async () => {
+		// setSystemTime drives both review instants; no elapsed wall-time dependency.
+		setSystemTime(new Date("2026-10-31T05:59:00-07:00"));
+		const { ledger, wl, planId, ask } = await planFixture();
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: laneBuilderBody("openai", "lane-t-1", OTHER_LAB) });
+		seedReview(ledger, wl, planId, { ran: [OTHER_LAB], anthropicOut: true, rule: planId });
+		setSystemTime(new Date("2026-10-31T06:01:00-07:00"));
+		expect(ledger.claimWorkload(wl, { by: "lane-t-1", holder: "lane-t-1", leaseMs: 60_000 }).won).toBe(true);
+		expect(await ask()).toContain("Raised question");
+	});
+
+	test("#228: a run of two headroom-skip: rows still counts the rule, and a spent same-lab grant counts across one the same way", async () => {
+		const two = await planFixture();
+		seedReview(two.ledger, two.wl, two.planId, { ran: [LANE_MODEL], rule: two.planId, between: (t) => [skip(t), skip(t)] });
+		expect(await two.ask()).toContain("Raised question");
+		const granted = await planFixture();
+		const grant = jo(granted.ledger, parkQuestion(granted.ledger, granted.wl, granted.planId), "same-lab");
+		seedReview(granted.ledger, granted.wl, granted.planId, { ran: [LANE_MODEL], grant, between: (t) => [skip(t)] });
+		expect(await granted.ask()).toContain("Raised question");
 	});
 
 	test("a forged spend (PLAN wl-mv5xay6bjp0268 § 2.6 [r2-M1]): Jo's genuine same-lab grant clears nothing unless its spend is immediately followed by the token's hand-spawn: from the same writer", async () => {
@@ -617,25 +1170,32 @@ describe("the plan question's shape (PLAN wl-muq22rnjcfrrpc D7)", () => {
 		seedReview(ledger, wl, planId);
 		const bad: [string, string[]][] = [
 			["a bare path", [PLAN_FILE]],
-			["no slice line", [PLAN_FILE, trade, REVIEW_LINE]],
-			["a slice line with an id and no task", [PLAN_FILE, "- sl-1", trade, REVIEW_LINE]],
-			["a slice line with an id, a colon and no task", [PLAN_FILE, "- sl-1:", trade, REVIEW_LINE]],
-			["no tradeoff line", [PLAN_FILE, slice, REVIEW_LINE]],
+			["no slice line", [PLAN_FILE, NONE_LINE, trade, REVIEW_LINE]],
+			["a slice line with an id and no task", [PLAN_FILE, "- sl-1", NONE_LINE, trade, REVIEW_LINE]],
+			["a slice line with an id, a colon and no task", [PLAN_FILE, "- sl-1:", NONE_LINE, trade, REVIEW_LINE]],
+			["no tradeoff line", [PLAN_FILE, slice, NONE_LINE, REVIEW_LINE]],
 			["4 tradeoff lines", planBody(2, 4).split("\n")],
-			["no review line", [PLAN_FILE, slice, trade]],
-			["two review lines", [PLAN_FILE, slice, trade, REVIEW_LINE, REVIEW_LINE]],
-			["a review line with no path", [PLAN_FILE, slice, trade, `review: approve-as-is, ${OTHER_LAB}`]],
-			["a review line with four fields", [PLAN_FILE, slice, trade, `review: approve-as-is, ${OTHER_LAB}, extra, ${VERDICT_FILE}`]],
-			["a review line with a relative path", [PLAN_FILE, slice, trade, `review: approve-as-is, ${OTHER_LAB}, PLAN-REVIEW-r1.md`]],
-			["a review line naming a missing file", [PLAN_FILE, slice, trade, `review: approve-as-is, ${OTHER_LAB}, ${join(PLAN_DIR, "missing.md")}`]],
-			["a relative plan path", ["PLAN.md", slice, trade, REVIEW_LINE]],
-			["a missing plan file", [join(PLAN_DIR, "missing.md"), slice, trade, REVIEW_LINE]],
-			["a plan path that is a directory", [PLAN_DIR, slice, trade, REVIEW_LINE]],
-			["a 161-character line", [PLAN_FILE, `- sl-1: ${"x".repeat(153)}`, trade, REVIEW_LINE]],
-			["an unknown line kind", [PLAN_FILE, slice, "note: also this", trade, REVIEW_LINE]],
-			["a blank line", [PLAN_FILE, slice, "", trade, REVIEW_LINE]],
-			["a tradeoff before the slices", [PLAN_FILE, trade, slice, REVIEW_LINE]],
-			["a line after the review", [PLAN_FILE, slice, trade, REVIEW_LINE, trade]],
+			["no review line", [PLAN_FILE, slice, NONE_LINE, trade]],
+			["two review lines", [PLAN_FILE, slice, NONE_LINE, trade, REVIEW_LINE, REVIEW_LINE]],
+			["a review line with no path", [PLAN_FILE, slice, NONE_LINE, trade, `review: approve-as-is, ${OTHER_LAB}`]],
+			["a review line with four fields", [PLAN_FILE, slice, NONE_LINE, trade, `review: approve-as-is, ${OTHER_LAB}, extra, ${VERDICT_FILE}`]],
+			["a review line with a relative path", [PLAN_FILE, slice, NONE_LINE, trade, `review: approve-as-is, ${OTHER_LAB}, PLAN-REVIEW-r1.md`]],
+			["a review line naming a missing file", [PLAN_FILE, slice, NONE_LINE, trade, `review: approve-as-is, ${OTHER_LAB}, ${join(PLAN_DIR, "missing.md")}`]],
+			["a relative plan path", ["PLAN.md", slice, NONE_LINE, trade, REVIEW_LINE]],
+			["a missing plan file", [join(PLAN_DIR, "missing.md"), slice, NONE_LINE, trade, REVIEW_LINE]],
+			["a plan path that is a directory", [PLAN_DIR, slice, NONE_LINE, trade, REVIEW_LINE]],
+			["a 161-character line", [PLAN_FILE, `- sl-1: ${"x".repeat(153)}`, NONE_LINE, trade, REVIEW_LINE]],
+			["an unknown line kind", [PLAN_FILE, slice, NONE_LINE, "note: also this", trade, REVIEW_LINE]],
+			["a blank line", [PLAN_FILE, slice, NONE_LINE, "", trade, REVIEW_LINE]],
+			["a tradeoff before the slices", [PLAN_FILE, trade, slice, NONE_LINE, REVIEW_LINE]],
+			["a line after the review", [PLAN_FILE, slice, NONE_LINE, trade, REVIEW_LINE, trade]],
+			// PLAN wl-mv8vwb04cy18n4 D2: the prompt-only line kind, between the slice lines and the tradeoff lines.
+			["a prompt-only line before the slices", [PLAN_FILE, NONE_LINE, slice, trade, REVIEW_LINE]],
+			["a prompt-only line after a tradeoff", [PLAN_FILE, slice, trade, NONE_LINE, REVIEW_LINE]],
+			["a prompt-only line with no R id", [PLAN_FILE, slice, "prompt-only: the SPEC amendment", trade, REVIEW_LINE]],
+			["a prompt-only line with an R id and no text", [PLAN_FILE, slice, "prompt-only: R2:", trade, REVIEW_LINE]],
+			["prompt-only:none without its space", [PLAN_FILE, slice, "prompt-only:none", trade, REVIEW_LINE]],
+			["a 161-character prompt-only line", [PROMPT_ONLY_FILE, slice, `prompt-only: R2: ${"x".repeat(144)}`, PROMPT_ONLY_LINES[1]!, trade, REVIEW_LINE]],
 		];
 		const entries = ledger.entries(wl).length;
 		const accepted: string[] = [];
@@ -653,17 +1213,17 @@ describe("the plan question's shape (PLAN wl-muq22rnjcfrrpc D7)", () => {
 		expect(await ask([...PLAN_OPTIONS], planId, PLAN_FILE)).toContain(planReviewRefusal(planId));
 	});
 
-	test("a ten-slice plan, 15 lines with one at exactly 160 characters, is raised with the holder's plan-question: entry in the same write", async () => {
+	test("a ten-slice plan, 16 lines with one at exactly 160 characters, is raised with the holder's plan-question: entry in the same write", async () => {
 		const { ledger, wl, planId, ask } = await planFixture();
 		seedReview(ledger, wl, planId);
 		const body = planBody(10, 3).replace(slice, `- sl-1: ${"x".repeat(152)}`);
-		expect(body.split("\n")).toHaveLength(15);
+		expect(body.split("\n")).toHaveLength(16);
 		expect(Math.max(...body.split("\n").map((l) => l.length))).toBe(160);
 		expect(await ask([...PLAN_OPTIONS], planId, body)).toContain("Raised question");
 		const q = ledger.questions(wl)[0]!;
 		expect(q.body).toBe(body);
 		const marker = ledger.entries(wl).at(-1)!;
-		expect([marker.kind, marker.created_by, marker.slice_id, marker.body, marker.created_at]).toEqual(["assumption", "lane-t-1", planId, `plan-question: ${q.id}`, q.created_at]);
+		expect([marker.kind, marker.created_by, marker.slice_id, marker.body, marker.created_at]).toEqual(["assumption", "lane-t-1", planId, boundPlanQuestion(q.id), q.created_at]);
 	});
 
 	test("control: a plan-slice question without approve is not shape-checked, gets no plan-question: entry, and is cut at 120 on the needs-you line", async () => {
@@ -672,6 +1232,135 @@ describe("the plan question's shape (PLAN wl-muq22rnjcfrrpc D7)", () => {
 		expect(await ask(["left", "right"], planId, body)).toContain("Raised question");
 		expect(ledger.entries(wl).some((e) => e.body.startsWith("plan-question:"))).toBe(false);
 		expect(errorLines(ledger).find((l) => l.kind === "question")!.line).toContain(`: ${body.slice(0, 119)}… — answer with one word: left / right`);
+	});
+});
+
+describe("plan requirements name their enforcer (PLAN wl-mv8vwb04cy18n4 D1-D5)", () => {
+	/** Asks the reviewed plan slice `body` and returns the reply, the questions and entries before and after. */
+	async function refused(body: string) {
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		const entries = ledger.entries(wl).length;
+		const reply = await ask([...PLAN_OPTIONS], planId, body);
+		expect(reply).toContain("Nothing was asked.");
+		expect(ledger.questions(wl)).toHaveLength(0);
+		expect(ledger.entries(wl)).toHaveLength(entries);
+		return reply;
+	}
+	/** The `R<n>` ids a reply names, unique and sorted (the shapes it carries hold none): what the lane acts on, not the sentence. */
+	const idsIn = (reply: string) => [...new Set(reply.match(/\bR\d+\b/g) ?? [])].sort();
+
+	test("R1, R6: a plan file with no `## Requirements` line, or a section with no requirement line, is refused with the requirements grammar in the refusal and nothing written", async () => {
+		const none = planFile("PLAN-no-section.md", ["# PLAN", "", "## Design", "", "- R1: a requirement in the wrong section => test x"]);
+		const reply = await refused(bodyOn(none, [NONE_LINE]));
+		expect(reply).toContain(PLAN_REQUIREMENTS_SHAPE);
+		expect(idsIn(reply)).toEqual([]);
+		const empty = planFile("PLAN-empty-section.md", ["# PLAN", "", "## Requirements", "", "", "## Slices", "- R1: after the section => test x"]);
+		const second = await refused(bodyOn(empty, [NONE_LINE]));
+		expect(second).toContain(PLAN_REQUIREMENTS_SHAPE);
+		expect(idsIn(second)).toEqual([]);
+	});
+
+	test("issue #334 item 2: a plan file with no How it fails section is refused naming the heading, nothing written; on the n/a line it is raised and the n/a pass recorded", async () => {
+		const none = planFile("PLAN-no-fails.md", ["# PLAN", "", "## Requirements", "", "- R1: x => test surface/test/x.test.ts"]);
+		const reply = await refused(bodyOn(none, [NONE_LINE]));
+		expect(reply).toContain(`the plan file ${none} has no "How it fails" section`);
+		expect(reply).toContain("`## How it fails`");
+		expect(reply).toContain("`How it fails: n/a, <reason>`");
+		const na = planFile("PLAN-na.md", ["# PLAN", "How it fails: n/a, a one-line docs fix", "", "## Requirements", "", "- R1: x => test surface/test/x.test.ts"]);
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		expect(await ask([...PLAN_OPTIONS], planId, bodyOn(na, [NONE_LINE]))).not.toContain("Nothing was asked.");
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith("how-it-fails:")).map((e) => e.body)).toEqual([`how-it-fails: n/a, a one-line docs fix (plan file ${na})`]);
+	});
+
+	test("R2: a section with several defects is refused naming every offender, a bad separator included; a well-formed line beside them is not named", async () => {
+		const path = planFile("PLAN-defects.md", [
+			"# PLAN", "## Requirements",
+			"- R1: a => b, arrows in the text => test surface/test/a.test.ts",
+			"- R2: no enforcer at all",
+			"- R3: an unknown kind => tests surface/test/a.test.ts",
+			"- R4: an empty locator => code",
+			"- R5: a short reason => prompt-only: because",
+			"prose inside the section",
+			"- R3: the same id again => gate row 6",
+			"- R6: two spaces after the kind => test  surface/test/a.test.ts",
+			"- R7: no space after the colon => prompt-only:no code reaches it",
+		]);
+		const reply = await refused(bodyOn(path, [NONE_LINE]));
+		expect(idsIn(reply)).toEqual(["R2", "R3", "R4", "R5", "R6", "R7"]);
+		expect(reply).toMatch(/\bline 8\b/);
+	});
+
+	test("R3: the body's prompt-only ids must equal the plan file's: none for items, a missing id, an extra id, a duplicate, none missing, none mixed with ids", async () => {
+		const [r2, r3] = PROMPT_ONLY_LINES as [string, string];
+		expect(idsIn(await refused(bodyOn(PROMPT_ONLY_FILE, [NONE_LINE])))).toEqual(["R2", "R3"]);
+		expect(idsIn(await refused(bodyOn(PROMPT_ONLY_FILE, [r2])))).toEqual(["R3"]);
+		expect(idsIn(await refused(bodyOn(PROMPT_ONLY_FILE, [r2, r3, "prompt-only: R1: the refusal names the grammar"])))).toEqual(["R1"]);
+		expect(idsIn(await refused(bodyOn(PROMPT_ONLY_FILE, [r2, r3, r3])))).toEqual(["R3"]);
+		expect(idsIn(await refused(bodyOn(PLAN_FILE, [])))).toEqual([]);
+		const mixed = await refused(bodyOn(PROMPT_ONLY_FILE, [r2, r3, NONE_LINE]));
+		expect(idsIn(mixed)).toEqual([]);
+		expect(mixed).toContain(PLAN_REQUIREMENTS_SHAPE);
+	});
+
+	test("a plan file over PLAN_FILE_MAX_BYTES, a sparse 64 MiB one included, is refused for its size with nothing written; one of exactly PLAN_FILE_MAX_BYTES is raised", async () => {
+		const head = ["# PLAN", HOW_IT_FAILS, "", "## Requirements", "", "- R1: the plan file is read bounded => test surface/test/lane-tools.test.ts", "", "## Slices", ""].join("\n");
+		const exact = planFile("PLAN-max.md", [head + "x".repeat(PLAN_FILE_MAX_BYTES - Buffer.byteLength(head))]);
+		const over = planFile("PLAN-over.md", [head + "x".repeat(PLAN_FILE_MAX_BYTES + 1 - Buffer.byteLength(head))]);
+		const sparse = planFile("PLAN-sparse.md", [head]);
+		truncateSync(sparse, 64 * 1024 * 1024);
+		for (const path of [over, sparse]) {
+			const reply = await refused(bodyOn(path, [NONE_LINE]));
+			expect(reply).toContain(`${PLAN_FILE_MAX_BYTES} bytes`);
+			expect(idsIn(reply)).toEqual([]);
+		}
+		rmSync(sparse);
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		expect(await ask([...PLAN_OPTIONS], planId, bodyOn(exact, [NONE_LINE]))).toContain("Raised question");
+		expect(ledger.questions(wl)).toHaveLength(1);
+	});
+
+	test("R4: a well-formed plan with prompt-only items, one line at exactly 160 characters, is raised through the tool; the needs-you line and the workload block show every prompt-only line whole", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		const long = `${PROMPT_ONLY_LINES[0]} ${"y".repeat(160 - PROMPT_ONLY_LINES[0]!.length - 1)}`;
+		expect(long).toHaveLength(160);
+		const body = bodyOn(PROMPT_ONLY_FILE, [long, PROMPT_ONLY_LINES[1]!]);
+		expect(await ask([...PLAN_OPTIONS], planId, body)).toContain("Raised question");
+		const q = ledger.questions(wl)[0]!;
+		expect(q.body).toBe(body);
+		const lines = body.split("\n");
+		const r = renderWake(ledger);
+		expect(r.text).toContain(`(${q.id}, slice ${planId}):\n  ${lines.join("\n  ")} — answer with one word: approve / revise / cancel`);
+		expect(r.text).toContain(`\n- ${q.id} on ${planId}:\n  ${lines.join("\n  ")} — options: approve / revise / cancel\n`);
+		const needsYou = errorLines(ledger).find((l) => l.rowId === q.id)!.line;
+		for (const l of [long, PROMPT_ONLY_LINES[1]!]) expect(needsYou).toContain(`\n  ${l}\n`);
+	});
+
+	test("R5 (pin): a plan question raised before the change, in the old shape on a plan file with no section, is never re-checked: Jo's approve still approves the plan", async () => {
+		const { ledger, wl, planId } = await planFixture();
+		const old = planFile("PLAN-old.md", ["# PLAN", "", "Written before plans named their enforcers."]);
+		const body = [old, "- sl-1: slice 1, one line", "tradeoff: tradeoff 1", REVIEW_LINE].join("\n");
+		tick();
+		// As lane_raise_question wrote it before the change: the question and the holder's plan-question: entry in one write.
+		ledger.write(() => {
+			const q = ledger.raiseQuestion({ by: "lane-t-1", workloadId: wl, sliceId: planId, body, options: [...PLAN_OPTIONS] });
+			ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: `plan-question: ${q}` });
+		});
+		expect(apply(ledger, interpret(ledger, "approve")!)).toContain("plan approved");
+		const entries = ledger.entries(wl);
+		expect(planFirst(controlEntries(entries, holdersOf(entries, ledger.workload(wl)!.holder)))).toBeNull();
+	});
+
+	test("R6: lane_raise_question's description carries the requirements grammar and the prompt-only line kind", () => {
+		const { f } = laneFixture();
+		const tool = f.tool(LANE_RAISE_QUESTION_TOOL);
+		const description = "description" in tool && typeof tool.description === "string" ? tool.description : "";
+		expect(description).toContain(PLAN_REQUIREMENTS_SHAPE);
+		expect(description).toContain("`prompt-only: <R id>: ");
+		expect(description).toContain("`prompt-only: none`");
 	});
 });
 
@@ -751,7 +1440,7 @@ describe("the plan slice moves past a closed one (PLAN wl-muq22rnjcfrrpc D9)", (
 		seedReview(ledger, wl, planId);
 		expect(await ask()).toContain("Raised question");
 		const planQ = ledger.questions(wl).find((q) => q.slice_id === planId)!;
-		expect(ledger.entries(wl).filter((e) => e.body.startsWith("plan-question:")).map((e) => e.body)).toEqual([`plan-question: ${planQ.id}`]);
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith("plan-question:")).map((e) => e.body)).toEqual([boundPlanQuestion(planQ.id)]);
 	});
 
 	test("D4 control: once the plan is approved, an approve question on another slice is ordinary: raised, no plan-question:, no plan receipt", async () => {
@@ -1021,5 +1710,381 @@ describe("mode flip at the surface", () => {
 		expect(ledger.workload(wl)!.mode).toBe("user-driven");
 		ledger.close();
 		Ledger.open(path).close();
+	});
+});
+
+describe("plan auto-start (PLAN wl-mvfkv7llkp7nk0 § 3, R7, R8; PLAN wl-mvqwn80onq9hq8 D9, R21, R22)", () => {
+	/** One review round on the plan slice, settled cross-lab with no blocking finding, then the classifier's `review-loop-end:`. */
+	const passedRound = (ledger: Ledger, wl: string, planId: string, over: { reason?: LoopEndReason; rule?: string; group?: string } = {}) => {
+		seedReview(ledger, wl, planId, { round: 1, group: over.group ?? "dg-pass", rule: over.rule });
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewLoopEndBody(planId, over.reason ?? "pass") });
+		tick();
+	};
+	const autoEntries = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => e.body.startsWith("plan: approved auto"));
+	const noticesOf = (ledger: Ledger, wl: string) =>
+		ledger.db.query<{ body: string; created_by: string }, [string]>("SELECT body, created_by FROM messages WHERE workload_id = ?1 AND body LIKE 'notice:%'").all(wl);
+	/** Jo's one word at the surface (`ask-all`, `auto-routine`), as surface/src/input.ts applies it. */
+	const joWord = (ledger: Ledger, word: string) => apply(ledger, interpret(ledger, word)!);
+
+	for (const stakes of ["normal", "production"] as const) {
+		test(`R21: a ${stakes} plan whose latest round passed cross-lab starts while Jo's flow-repair ruling stands: ESCALATION_BY's approval, a notice naming halt and ask-all, change slices accepted`, async () => {
+			const { ledger, wl, planId, ask, call } = await planFixture(stakes);
+			// Flow repair is up: Jo never ended it in this ledger.
+			expect(ledger.instructions(STANDING_WORKLOAD_ID).some((i) => i.body === "end-ruling flow-repair")).toBe(false);
+			passedRound(ledger, wl, planId);
+			const reply = await ask();
+			expect(reply).toContain("The plan is approved");
+			expect(reply).toContain(`at ${stakes} stakes`);
+			expect(reply).toContain("add your change slices");
+			expect(ledger.questions(wl)).toHaveLength(0);
+			expect(autoEntries(ledger, wl).map((e) => [e.body, e.created_by])).toEqual([["plan: approved auto dg-pass", ESCALATION_BY]]);
+			const sent = noticesOf(ledger, wl);
+			expect(sent).toHaveLength(1);
+			expect(sent[0]!.created_by).toBe(ESCALATION_BY);
+			expect(sent[0]!.body).toContain(`plan started without your approve on ${wl}`);
+			expect(sent[0]!.body).toContain(`\`halt ${wl}\` stops it; \`ask-all\` stops all auto-starts`);
+			expect(sent[0]!.body).toContain(PLAN_FILE);
+			const entries = ledger.entries(wl);
+			expect(planFirst(controlEntries(entries, holdersOf(entries, ledger.workload(wl)!.holder)))).toBeNull();
+			expect(await call("lane_add_slice", { task: "change it", doneCondition: "d", inputs: "i", kind: "change-small" })).toMatch(/^Added slice/);
+		});
+	}
+
+	test("Anthropic-out same-lab evidence permits the question but never auto-approves or sends an auto-start notice", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: laneBuilderBody("openai", "lane-t-1", OTHER_LAB) });
+		seedReview(ledger, wl, planId, { ran: [OTHER_LAB], anthropicOut: true, rule: planId, round: 1, group: "dg-pass" });
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewLoopEndBody(planId, "pass") });
+		tick();
+		expect(planAutoStartRound(ledger, wl, planId, Date.now())).toBeNull();
+		expect(await ask()).toContain("Raised question");
+		expect(autoEntries(ledger, wl)).toEqual([]);
+		expect(noticesOf(ledger, wl)).toEqual([]);
+	});
+
+	const toJo: [string, (ledger: Ledger, wl: string, planId: string) => void][] = [
+		["Jo said ask-all (R22)", (ledger, wl, planId) => {
+			expect(joWord(ledger, "ask-all")).toContain("auto-apply is off");
+			passedRound(ledger, wl, planId);
+		}],
+		["Jo ended ruling routine-calls", (ledger, wl, planId) => {
+			expect(joWord(ledger, "end-ruling routine-calls")).toContain("routine-calls");
+			passedRound(ledger, wl, planId);
+		}],
+		["a trip turned auto-apply off", (ledger, wl, planId) => {
+			ensureStandingWorkload(ledger);
+			ledger.recordEntry({ by: ESCALATION_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: "auto-apply-tripped: tc-1 write > PATCH /x HTTP/1.1" });
+			passedRound(ledger, wl, planId);
+		}],
+		["the loop ended on Jo's accept at the round limit, not a pass", (ledger, wl, planId) => passedRound(ledger, wl, planId, { reason: "accept" })],
+		["a review was dispatched after the passing loop-end", (ledger, wl, planId) => {
+			passedRound(ledger, wl, planId);
+			seedReview(ledger, wl, planId);
+		}],
+		["a member ran on Jo's Kimi-out same-lab rule token", (ledger, wl, planId) => passedRound(ledger, wl, planId, { rule: planId })],
+	];
+	for (const [name, seed] of toJo) {
+		test(`the plan question goes to Jo when ${name}`, async () => {
+			const { ledger, wl, planId, ask } = await planFixture();
+			seed(ledger, wl, planId);
+			expect(await ask()).toContain("Raised question");
+			expect(autoEntries(ledger, wl)).toHaveLength(0);
+			expect(noticesOf(ledger, wl)).toHaveLength(0);
+		});
+	}
+
+	test("R22: after ask-all the plan goes to Jo; after Jo's auto-routine the next plan question starts it", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		joWord(ledger, "ask-all");
+		passedRound(ledger, wl, planId);
+		const asked = await ask();
+		expect(asked).toContain("Raised question");
+		expect(apply(ledger, interpret(ledger, "revise")!)).toContain("revise");
+		joWord(ledger, "auto-routine");
+		passedRound(ledger, wl, planId, { group: "dg-pass-2" });
+		expect(await ask()).toContain("The plan is approved: its review round dg-pass-2 passed");
+		expect(autoEntries(ledger, wl)).toHaveLength(1);
+	});
+
+	test("D9 (b) at production stakes: a round of two lab legs starts only when every leg passed", async () => {
+		for (const blocking of [1, 0]) {
+			const { ledger, wl, planId } = await planFixture("production");
+			seedReview(ledger, wl, planId, { round: 1, group: "dg-pass", ran: [OTHER_LAB] });
+			seedReview(ledger, wl, planId, { round: 1, group: "dg-pass", ran: ["moonshot/kimi-k3"], blocking });
+			ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewLoopEndBody(planId, "pass") });
+			expect({ blocking, round: planAutoStartRound(ledger, wl, planId, Date.now()) }).toEqual({ blocking, round: blocking === 0 ? "dg-pass" : null });
+		}
+	});
+
+	test("R22: a failed auto-start write raises the plan question to Jo with `auto-start failed: <error>` first and starts nothing", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		passedRound(ledger, wl, planId);
+		ledger.db.exec("CREATE TRIGGER fail_auto BEFORE INSERT ON entries WHEN NEW.body LIKE 'plan: approved auto%' BEGIN SELECT RAISE(ABORT, 'injected auto-start failure'); END;");
+		const reply = await ask();
+		const questions = ledger.questions(wl);
+		expect(questions).toHaveLength(1);
+		expect(questions[0]!.body.split("\n")[0]).toBe("auto-start failed: injected auto-start failure");
+		expect(questions[0]!.body.split("\n").slice(1).join("\n")).toBe(PLAN_BODY);
+		expect(reply).toBe(
+			`Raised question ${questions[0]!.id} on ${planId} (approve / revise / cancel); the slice is paused until Jo answers. ` +
+				"The plan auto-start failed (injected auto-start failure), so the plan question went to Jo with that as its first line.",
+		);
+		expect(planQuestions(ledger, wl)).toEqual([boundPlanQuestion(questions[0]!.id)]);
+		expect(autoEntries(ledger, wl)).toHaveLength(0);
+		expect(noticesOf(ledger, wl)).toHaveLength(0);
+	});
+
+	test("R22: when the auto-start write and the raise both fail, the tool returns both errors and writes nothing", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		passedRound(ledger, wl, planId);
+		const before = ledger.entries(wl).length;
+		ledger.db.exec("CREATE TRIGGER fail_auto BEFORE INSERT ON entries WHEN NEW.body LIKE 'plan: approved auto%' BEGIN SELECT RAISE(ABORT, 'injected auto-start failure'); END;");
+		ledger.db.exec("CREATE TRIGGER fail_raise BEFORE INSERT ON questions BEGIN SELECT RAISE(ABORT, 'injected raise failure'); END;");
+		const reply = await ask();
+		expect(reply).toContain("The plan auto-start failed (injected auto-start failure)");
+		expect(reply).toContain("raising the plan question to Jo failed too (injected raise failure)");
+		expect(ledger.questions(wl)).toHaveLength(0);
+		expect(ledger.entries(wl)).toHaveLength(before);
+		expect(noticesOf(ledger, wl)).toHaveLength(0);
+	});
+
+	test("a lane cannot forge `plan: approved auto`: lane_record_entry refuses it and a lane-written one approves nothing; lane_message refuses `notice:`", async () => {
+		const { ledger, wl, call } = await planFixture();
+		const before = ledger.entries(wl).length;
+		expect(await call("lane_record_entry", { body: "plan: approved auto dg-forged" })).toContain("`plan:` is a reserved control line");
+		expect(ledger.entries(wl).length).toBe(before);
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: "plan: approved auto dg-forged" });
+		expect(await call("lane_add_slice", { task: "change it", doneCondition: "d", inputs: "i", kind: "change-small" })).toContain("not approved");
+		const held = ledger.workload(wl)!.held_messages;
+		expect(await call("lane_message", { body: "notice: plan started without your approve" })).toContain("`notice:`");
+		expect(ledger.workload(wl)!.held_messages).toBe(held);
+	});
+
+	test("halt: Jo's word stands the plan again, refuses change slices, stops the live lane, and the plan never auto-starts again; Jo's approve starts it", async () => {
+		const { ledger, wl, planId, ask, call } = await planFixture();
+		passedRound(ledger, wl, planId);
+		expect(await ask()).toContain("The plan is approved");
+		const cmd = interpret(ledger, `halt ${wl}`);
+		expect(cmd).toEqual({ kind: "halt", workloadId: wl });
+		expect(apply(ledger, cmd!)).toContain(`${wl} is halted`);
+		const entries = ledger.entries(wl);
+		const halt = ledger.instructions(wl).find((i) => i.body === `halt ${wl}`)!;
+		expect(halt).toMatchObject({ author: "jo", channel: "surface", created_by: SURFACE_BY });
+		expect(entries.some((e) => e.body === `plan: halted ${halt.id}` && e.created_by === SURFACE_BY)).toBe(true);
+		expect(entries.some((e) => e.body.startsWith("lane-stop: lane-t-1") && e.created_by === SURFACE_BY)).toBe(true);
+		expect(planFirst(controlEntries(entries, holdersOf(entries, ledger.workload(wl)!.holder)))).toMatchObject({ trigger: `halted by Jo (instruction ${halt.id})` });
+		expect(await call("lane_add_slice", { task: "change it", doneCondition: "d", inputs: "i", kind: "change-small" })).toContain("the plan is not approved");
+		expect(interpret(ledger, `halt ${wl}`)).toMatchObject({ kind: "refused" });
+		// A fresh passing round on the plan slice: the question still goes to Jo, whose approve starts the plan as before.
+		passedRound(ledger, wl, planId);
+		expect(await ask()).toContain("Raised question");
+		expect(autoEntries(ledger, wl)).toHaveLength(1);
+		expect(apply(ledger, interpret(ledger, "approve")!)).toContain("plan approved");
+		expect(await call("lane_add_slice", { task: "change it", doneCondition: "d", inputs: "i", kind: "change-small" })).toMatch(/^Added slice/);
+	});
+
+	/** One review loop on the plan slice that ended on a pass: its one round `dg-pass` of `members` (each a `seedReview`), then the classifier's `review-loop-end:`. */
+	const passWith = (ledger: Ledger, wl: string, planId: string, members: { ran?: string[]; grant?: string }[]) => {
+		for (const m of members) seedReview(ledger, wl, planId, { round: 1, group: "dg-pass", ...m });
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewLoopEndBody(planId, "pass") });
+		tick();
+	};
+	// Each seed writes an otherwise-eligible round; `veto` adds the one thing a single guard of planAutoStartRound refuses.
+	const vetoes: [string, (ledger: Ledger, wl: string, planId: string, veto: boolean) => void][] = [
+		["a review hand-spawn on the plan slice after the passing loop-end, with no routing", (ledger, wl, planId, veto) => {
+			passWith(ledger, wl, planId, [{}]);
+			if (veto) {
+				// Its row is on the builder's own lab: an unsettled hand counts its row as builders (builderLabs item 3), and this adds none.
+				ledger.recordEntry({
+					by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption",
+					body: handSpawnBody({ token: "dt-late", root: "/tmp/lane-t-1", spawnKey: planId, review: true, group: "dg-late", row: [LANE_MODEL] }),
+				});
+			}
+		}],
+		["a review routing on the plan slice after the passing loop-end, with no hand-spawn", (ledger, wl, planId, veto) => {
+			passWith(ledger, wl, planId, [{}]);
+			if (veto) {
+				ledger.recordRouting({
+					by: "lane-t-1", workloadId: wl, sliceId: planId, spawnKey: planId, sessionRoot: "/tmp/lane-t-1", agentId: `${planId}-late`,
+					kind: "judge", confidence: 0.9, probabilities: { judge: 0.9 }, classifiedTier: "strong", tier: "strong",
+					models: [OTHER_LAB], judgeModel: "typesafe/jev-1.13.0", outcome: "ran", ranModels: [OTHER_LAB],
+				});
+			}
+		}],
+		["a member spawned on Jo's same-lab grant (his `same-lab` answer to the park question), though it answered on another lab", (ledger, wl, planId, veto) => {
+			const grant = jo(ledger, parkQuestion(ledger, wl, planId), "same-lab");
+			passWith(ledger, wl, planId, [veto ? { grant } : {}]);
+		}],
+		["a genuine same-lab passing round: its one member answered on the builder's lab", (ledger, wl, planId, veto) => {
+			passWith(ledger, wl, planId, [{ ran: [veto ? LANE_MODEL : OTHER_LAB] }]);
+		}],
+		["a mixed-member passing round: one member on another lab, the other on the builder's lab", (ledger, wl, planId, veto) => {
+			passWith(ledger, wl, planId, [{ ran: [OTHER_LAB] }, { ran: [veto ? LANE_MODEL : OTHER_LAB] }]);
+		}],
+	];
+	for (const [name, seed] of vetoes) {
+		test(`R8: ${name} vetoes auto-start on its own; the same round without it starts`, async () => {
+			for (const veto of [false, true]) {
+				const { ledger, wl, planId } = await planFixture();
+				seed(ledger, wl, planId, veto);
+				expect({ veto, round: planAutoStartRound(ledger, wl, planId, Date.now()) }).toEqual({ veto, round: veto ? null : "dg-pass" });
+			}
+		});
+	}
+
+	test("PLAN wl-mvg1vs0rhnu3gg § 1.0 (R1): an auto-start-eligible plan asked with now: guard goes to Jo tagged NOW and writes no plan: approved auto; the same plan without now starts", async () => {
+		for (const now of ["guard", null]) {
+			const { ledger, wl, planId, call } = await planFixture();
+			passedRound(ledger, wl, planId);
+			tick();
+			const reply = await call("lane_raise_question", { slice: planId, body: PLAN_BODY, options: [...PLAN_OPTIONS], ...(now === null ? {} : { now }) });
+			if (now === null) {
+				expect(reply).toContain("The plan is approved");
+				expect(autoEntries(ledger, wl)).toHaveLength(1);
+				expect(ledger.questions(wl)).toHaveLength(0);
+				continue;
+			}
+			const questions = ledger.questions(wl);
+			expect(questions).toHaveLength(1);
+			const id = questions[0]!.id;
+			expect(reply).toBe(`Raised question ${id} on ${planId} (approve / revise / cancel); the slice is paused until Jo answers. It reaches Jo at once, marked NOW (guard).`);
+			expect(nowEntries(ledger, wl)).toEqual([[`now: ${id} guard`, ESCALATION_BY]]);
+			expect(planQuestions(ledger, wl)).toEqual([boundPlanQuestion(id)]);
+			expect(autoEntries(ledger, wl)).toHaveLength(0);
+			expect(noticesOf(ledger, wl)).toHaveLength(0);
+		}
+	});
+});
+
+/** The `now:` marks on `wl` as [body, writer]; a literal prefix, so this file loads on the baseline. */
+const nowEntries = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => e.body.startsWith("now: ")).map((e) => [e.body, e.created_by]);
+/** The holder's `plan-question:` entries on `wl`. */
+const planQuestions = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => e.body.startsWith("plan-question: ")).map((e) => e.body);
+/** The reply to an ask that repeats the open question `id` on `slice`. */
+const reusedReply = (id: string, slice: string, now?: string) =>
+	`Question ${id} on ${slice} is already open with this body and options; nothing new was raised.${now ? ` It reaches Jo at once, marked NOW (${now}).` : ""} The slice stays paused until Jo answers ${id}.`;
+
+describe("escalation phase 2 through the lane tools (PLAN wl-mvg1vs0rhnu3gg § 1.0, § 3.3, § 3.5; R1, R7)", () => {
+	test("an unknown now word is refused and nothing is written", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const before = ledger.entries(wl).length;
+		expect(await call("lane_raise_question", { slice: sl, body: "Which header keeps the offset?", options: ["left", "right"], now: "urgent" })).toBe(
+			"`now` is one of integrity, security, incident, guard, boundary, irreversible, money, not urgent; nothing was asked.",
+		);
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.entries(wl)).toHaveLength(before);
+		expect(ledger.slice(sl)!.state).toBe("open");
+	});
+
+	test("now: security raises a normal-stakes merge question past the merges ruling, with ESCALATION_BY's now: mark and no ruling-applied", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const reply = await call("lane_raise_question", { slice: sl, body: "PR #4 is green; merge it?", options: ["merge", "wait"], now: "security" });
+		const questions = ledger.questions(wl);
+		expect(questions).toHaveLength(1);
+		const id = questions[0]!.id;
+		expect(reply).toBe(`Raised question ${id} on ${sl} (merge / wait); the slice is paused until Jo answers. It reaches Jo at once, marked NOW (security).`);
+		expect(nowEntries(ledger, wl)).toEqual([[`now: ${id} security`, ESCALATION_BY]]);
+		expect(ledger.entries(wl).some((e) => e.body.startsWith("ruling-applied:"))).toBe(false);
+		expect(ledger.slice(sl)!.state).toBe("paused");
+	});
+
+	test("a plan question with now still needs its review: unreviewed, it is refused with nothing written", async () => {
+		const { ledger, wl, planId, call } = await planFixture();
+		const before = ledger.entries(wl).length;
+		expect(await call("lane_raise_question", { slice: planId, body: PLAN_BODY, options: [...PLAN_OPTIONS], now: "guard" })).toContain(planReviewRefusal(planId));
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.entries(wl)).toHaveLength(before);
+	});
+
+	test("an unchanged plan question asked twice is the open one, reused: no second question row and no second plan-question:", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		expect(await ask()).toContain("Raised question");
+		const id = ledger.questions(wl)[0]!.id;
+		expect(await ask()).toBe(reusedReply(id, planId));
+		expect(ledger.questions(wl).map((q) => q.id)).toEqual([id]);
+		expect(planQuestions(ledger, wl)).toEqual([boundPlanQuestion(id)]);
+	});
+
+	test("a reviewed production plan: repeated unchanged with no new review it is the same id; repeated with now: guard it gains one trusted now: mark; a changed plan with no fresh review is refused", async () => {
+		const { ledger, wl, planId, ask, call } = await planFixture("production");
+		seedReview(ledger, wl, planId);
+		const raised = await ask();
+		const id = ledger.questions(wl)[0]!.id;
+		expect(raised).toBe(`Raised question ${id} on ${planId} (approve / revise / cancel); the slice is paused until Jo answers.`);
+		expect(await ask()).toBe(reusedReply(id, planId));
+		expect(nowEntries(ledger, wl)).toEqual([]);
+		for (let i = 0; i < 2; i++) {
+			tick();
+			expect(await call("lane_raise_question", { slice: planId, body: PLAN_BODY, options: [...PLAN_OPTIONS], now: "guard" })).toBe(reusedReply(id, planId, "guard"));
+		}
+		expect(ledger.questions(wl).map((q) => q.id)).toEqual([id]);
+		expect(nowEntries(ledger, wl)).toEqual([[`now: ${id} guard`, ESCALATION_BY]]);
+		expect(planQuestions(ledger, wl)).toEqual([boundPlanQuestion(id)]);
+		expect(ledger.entries(wl).some((e) => e.body.startsWith("plan: approved auto"))).toBe(false);
+		// Changed: one more slice line. No review ran since the open question, so it keeps every check.
+		expect(await ask(undefined, planId, planBody(3))).toContain(planReviewRefusal(planId));
+		expect(await call("lane_raise_question", { slice: planId, body: planBody(3), options: [...PLAN_OPTIONS], now: "guard" })).toContain(planReviewRefusal(planId));
+		expect(ledger.questions(wl).map((q) => q.id)).toEqual([id]);
+		expect(nowEntries(ledger, wl)).toHaveLength(1);
+	});
+
+	test("fix round 1 (F1): a reviewed plan whose PLAN.md is edited after the raise (R2 made prompt-only), its question bytes unchanged, is refused on repeat with and without now: guard; no now: mark, no new row", async () => {
+		const { ledger, wl, planId, ask, call } = await planFixture("production");
+		const lines = ["# PLAN", HOW_IT_FAILS, "", "## Requirements", "", "- R1: the header offset lives in one token => test surface/test/tokens.test.ts", "- R2: the old constant is gone => test surface/test/tokens.test.ts"];
+		const path = planFile("PLAN-edited.md", lines);
+		const body = bodyOn(path, [NONE_LINE]);
+		seedReview(ledger, wl, planId);
+		expect(await ask(undefined, planId, body)).toContain("Raised question");
+		const id = ledger.questions(wl)[0]!.id;
+		// Unchanged: the repeat is the open question.
+		expect(await ask(undefined, planId, body)).toBe(reusedReply(id, planId));
+		const entries = ledger.entries(wl).length;
+		// The plan file changes under the same path: R2 is now prompt-only, which the body's `prompt-only: none` no longer matches.
+		planFile("PLAN-edited.md", [...lines.slice(0, -1), "- R2: the old constant is gone => prompt-only: no test can see a deleted name"]);
+		expect(await ask(undefined, planId, body)).toContain(planReviewRefusal(planId));
+		tick();
+		expect(await call("lane_raise_question", { slice: planId, body, options: [...PLAN_OPTIONS], now: "guard" })).toContain(planReviewRefusal(planId));
+		expect(ledger.questions(wl).map((q) => q.id)).toEqual([id]);
+		expect(nowEntries(ledger, wl)).toEqual([]);
+		expect(ledger.entries(wl)).toHaveLength(entries);
+		// The verdict file changing alone is refused the same way, once the plan file is back as it was.
+		planFile("PLAN-edited.md", lines);
+		expect(await ask(undefined, planId, body)).toBe(reusedReply(id, planId));
+		writeFileSync(VERDICT_FILE, "verdict: revise\n");
+		try {
+			tick();
+			expect(await call("lane_raise_question", { slice: planId, body, options: [...PLAN_OPTIONS], now: "guard" })).toContain(planReviewRefusal(planId));
+		} finally {
+			writeFileSync(VERDICT_FILE, "verdict: approve-as-is\n");
+		}
+		expect(nowEntries(ledger, wl)).toEqual([]);
+		expect(ledger.entries(wl)).toHaveLength(entries);
+		// The question's holder entry carries the two hashes the raise checked (the plan file is back as it was then).
+		expect(planQuestions(ledger, wl)).toEqual([boundPlanQuestion(id, path)]);
+	});
+
+	test("a lane message opening with security-red: (the test runner's signal) is refused and nothing is sent", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const held = ledger.workload(wl)!.held_messages;
+		expect(await call("lane_message", { body: `security-red: ${wl} sl-x tr-0abc1234wxyz ${"a".repeat(40)} 1 gates/test/r06-reserved.test.ts > refuses a deploy` })).toBe(
+			"A message opening with `security-red:` is a signal the machinery pushes to Jo; a lane's words must not read as one. Nothing was sent.",
+		);
+		expect(ledger.workload(wl)!.held_messages).toBe(held);
+	});
+});
+
+describe("a lane cannot forge a quota move's NOW line (PLAN wl-mvwk0v0gmp6cjc D4, R5)", () => {
+	test("a lane message opening with quota-move: is refused, nothing is sent, and no NOW line or move alert follows", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const held = ledger.workload(wl)!.held_messages;
+		expect(await call("lane_message", { body: `quota-move: lane lane-x on ${wl}: anthropic/claude-opus-5-5 -> openai-codex/gpt-6.1-sol (anthropic 7d 0.95 used)` })).toBe(
+			"A message opening with `quota-move:` is a signal the machinery pushes to Jo; a lane's words must not read as one. Nothing was sent.",
+		);
+		expect(ledger.workload(wl)!.held_messages).toBe(held);
+		expect(quotaMoves(ledger)).toEqual([]);
+		expect(errorLines(ledger, undefined, { movePidProbe: () => false }).filter((l) => l.kind === "quota-move" || l.kind === "quota-move-alert")).toEqual([]);
 	});
 });

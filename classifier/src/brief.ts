@@ -46,3 +46,25 @@ export function briefStakes(task: string | undefined, context: string | undefine
 	const value = briefField("stakes", task, context)?.toLowerCase() ?? null;
 	return isStakes(value) ? value : null;
 }
+
+/**
+ * A three-lab panel's brief field (PLAN wl-mv5m7qvgkxhpj4 § 3.2; classifier/src/panel.ts): `panel:
+ * <staging run path>` dispatches one member per lab, `panel-synth: <staging run path>` the synthesis
+ * hand. Same line syntax as FIELD_LINE; the first such line in `task`, else in `context`, wins.
+ */
+const PANEL_LINE = /^[ \t]*(?:[-*][ \t]+)?(?:\*\*)?(panel|panel-synth)(?:\*\*)?[ \t]*:(?:\*\*)?[ \t]*(\S.*?)[ \t]*$/gim;
+
+export type PanelField = { field: "panel" | "panel-synth"; run: string };
+
+export function briefPanel(task: string | undefined, context: string | undefined): PanelField | null {
+	for (const text of [task, context]) {
+		const match = text ? [...text.matchAll(PANEL_LINE)][0] : undefined;
+		if (match) return { field: match[1]!.toLowerCase() as PanelField["field"], run: match[2]! };
+	}
+	return null;
+}
+
+/** `text` without its panel brief lines: a member's task does not name the staging run it never reads. */
+export function withoutPanelLines(text: string): string {
+	return text.replace(PANEL_LINE, "").replace(/\n{3,}/g, "\n\n");
+}

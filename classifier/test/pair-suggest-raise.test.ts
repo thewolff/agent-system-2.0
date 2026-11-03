@@ -9,8 +9,9 @@
  * `CONFIG`, surface/scripts/lane.ts preflight), with `PI_CODING_AGENT_DIR` pointing at the same agent directory. HOME
  * is a per-file temp directory, restored afterwards.
  *
- * Regression: these fail on 946c016 by assertion (no `pair` option, no `pair:` line, no `pair-offer:` entry). The
- * switch-off, missing-config, throwaway, user-driven and forged-signal cases are guards that pass there too.
+ * Regression: these fail on 946c016 by assertion (no `pair` option, no `pair-offer:` entry). The switch-off,
+ * missing-config, throwaway, user-driven and forged-signal cases are guards that pass there too. Since PLAN
+ * wl-mvb9mw00ycfjeo D1 (R1) an offered question's body is byte-identical to the no-offer raise.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -28,7 +29,7 @@ import { tierTableFromConfig } from "../src/tier-table";
 import { dist, fakeRegistry, recordedQuestion } from "./helpers";
 
 const ROWS = {
-	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna", "moonshot/kimi-k2.7-code-highspeed"],
+	fast: ["anthropic/claude-haiku-5-5", "openai-codex/gpt-5.6-luna", "moonshot/kimi-k2.7-code-highspeed"],
 	standard: ["anthropic/claude-sonnet-5-5", "openai-codex/gpt-6-luna", "moonshot/kimi-k2.5"],
 	strong: ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "moonshot/kimi-k2.7-code"],
 	deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra", "moonshot/kimi-k3"],
@@ -218,20 +219,16 @@ function parsedOffer(body: string): { q: string; site: string; signals: string[]
 	return m ? { q: m[1]!, site: m[2]!, signals: m[3]!.toLowerCase().split(",") } : null;
 }
 
-const ROUND_LIMIT_TAIL = (wl: string) =>
-	`Answering pair stops this review loop like stop and switches this workload to user-driven, so you steer the lane yourself (as2 lane ${wl}).`;
-
-describe("round-limit raise with pair-suggest on (D1, D3, D6)", () => {
-	test("switch all and a classifier-stamped `pair-signal: taste yes 0.91`: options end with pair, the body is the unchanged body plus one last `pair:` line, and one classifier-stamped pair-offer: names the question", async () => {
+describe("round-limit raise with pair-suggest on (D1, D3, D6; PLAN wl-mvb9mw00ycfjeo D1, R1)", () => {
+	test("switch all and a classifier-stamped `pair-signal: taste yes 0.91`: options end with pair, the body is byte-identical to the no-offer raise, and one classifier-stamped pair-offer: names the question", async () => {
 		pairSuggest("all");
 		const w = world();
 		roundsLimit(w, 1);
 		pairSignal(w, TASTE_YES);
 		const q = await toTheLimit(w, 1);
 		expect(q.options).toEqual([...ROUND_LIMIT_OPTIONS, "pair"]);
-		const line = `pair: jev: UI/taste work (0.91). ${ROUND_LIMIT_TAIL(w.wl)}`;
-		expect(q.body.split("\n").at(-1)).toBe(line);
-		expect(q.body).toBe(`${baseBody(w)}\n${line}`);
+		expect(q.body).toBe(baseBody(w));
+		expect(q.body).not.toContain("pair");
 		const o = offers(w);
 		expect(o.map((e) => e.created_by)).toEqual([CLASSIFIER_BY]);
 		expect(parsedOffer(o[0]!.body)).toEqual({ q: q.id, site: "round-limit", signals: ["e"] });
@@ -244,7 +241,8 @@ describe("round-limit raise with pair-suggest on (D1, D3, D6)", () => {
 		const w = world();
 		const q = await toTheLimit(w, 3);
 		expect(q.options).toEqual([...ROUND_LIMIT_OPTIONS, "pair"]);
-		expect(q.body).toBe(`${baseBody(w)}\npair: blocking 1 → 1 → 1 over rounds 1–3. ${ROUND_LIMIT_TAIL(w.wl)}`);
+		expect(q.body).toBe(baseBody(w));
+		expect(q.body).not.toContain("pair");
 		expect(parsedOffer(offers(w)[0]!.body)).toEqual({ q: q.id, site: "round-limit", signals: ["a"] });
 	});
 

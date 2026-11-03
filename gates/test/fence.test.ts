@@ -22,14 +22,15 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import { Ledger } from "../../ledger/src/index";
 import { ALREADY_WRAPPED_REASON, FENCE_OFF_BODY, type FenceSettings, fenceBypassBody, fenceProfile, fenceSettingsFrom, INTERNAL_URL_REASON, registerFence, shellStartReason, wrapCommand } from "../src/fence";
 import { type HostModules, VERIFIED_HOST } from "../src/host";
 import p11Gates from "../index";
+import { DISPLAY_LINKS } from "../extensions/open-links";
 import { gateSession, type GatesAPI } from "../src/session";
 import { copiedWrapper } from "../src/exec";
 import { copiedWrapperReason } from "../src/rows/r18-typed-wrapper";
@@ -38,13 +39,13 @@ import { readCleanShell } from "../src/clean-shell";
 import { advanceOriginMain, CERTIFIED, commit, environOf, git, repoWithOrigin, shellStartFixture, tmp } from "./helpers";
 
 type AnyHandler = (event: Record<string, unknown>, ctx: unknown) => unknown;
-type Revised = { block?: boolean; reason?: string; input?: Record<string, unknown>; additionalContext?: string } | undefined;
+type Revised = { block?: boolean; reason?: string; input?: Record<string, unknown>; additionalContext?: string; messages?: Record<string, unknown>[] } | undefined;
 
 const ON: FenceSettings = { enabled: true, autoBackground: true };
 
 /**
- * A fake OMP extension API chaining handlers the way the runner does (runner.ts emitToolCall): every
- * handler gets the same original event, the first block returns, otherwise the last result wins.
+ * A fake OMP extension API chaining handlers the way the runner does: emitToolCall gives every
+ * handler the original event and stops at the first block; emitContext threads replacement messages.
  */
 function fakePi() {
 	const handlers = new Map<string, AnyHandler[]>();
@@ -63,6 +64,10 @@ function fakePi() {
 		for (const h of handlers.get(name) ?? []) {
 			const r = (await h(event, ctx)) as Revised;
 			if (!r) continue;
+			if (name === "context") {
+				if (!r.messages) continue;
+				event = { ...event, messages: r.messages };
+			}
 			last = r;
 			if (r.block) return r;
 		}
@@ -122,8 +127,25 @@ function sh(command: string, cwd: string, env: Record<string, string | undefined
 
 /** Every file under `dir` with its bytes: proof nothing changed. */
 function snapshot(dir: string): string {
-	const r = spawnSync("/bin/bash", ["-c", `find . -print | LC_ALL=C sort | while read -r f; do printf '%s ' "$f"; [ -f "$f" ] && shasum "$f" | cut -c1-40 || echo; done`], { cwd: dir, encoding: "utf8" });
-	return r.stdout;
+	const paths = ["."];
+	const visit = (parent: string) => {
+		for (const entry of readdirSync(join(dir, parent), { withFileTypes: true })) {
+			const path = `${parent}/${entry.name}`;
+			paths.push(path);
+			if (entry.isDirectory()) visit(path);
+		}
+	};
+	visit(".");
+	return paths.sort().map((path) => {
+		const file = join(dir, path);
+		let isFile = false;
+		try {
+			isFile = statSync(file).isFile();
+		} catch {
+			// Like the shell's -f, dangling or unresolvable symlinks have no file digest.
+		}
+		return `${path} ${isFile ? createHash("sha1").update(readFileSync(file)).digest("hex") : ""}\n`;
+	}).join("");
 }
 
 describe("the fence refuses sandboxed writes into the configured ledger directory", () => {
@@ -342,8 +364,10 @@ describe("every extension profile/config.yml loads returns undefined from tool_c
 			const f = fakePi();
 			mod.default(f.pi);
 			const results = await f.results("tool_call", { toolName: "bash", toolCallId: "ext-1", input: { command: "echo hi" } }, ctxOf(REPO));
-			// No result at all is an extension with no tool_call handler (plugins/index.ts: its adapters
-			// register none, plugins/test/loader.test.ts), which cannot drop the wrapper either.
+			// No result at all is an extension that registered no tool_call handler here. plugins/index.ts
+			// binds its adapters only at a by-hand lane's session_start (plugins/test/loader.test.ts); bound,
+			// paired-coding's handler (through plugins/paired-as2.ts) returns undefined for bash outside
+			// pairing and a block, never a revision, while pairing, so it cannot drop the wrapper either.
 			expect(results).toEqual(results.map(() => undefined));
 		});
 	}
@@ -448,11 +472,18 @@ describe("the call's cwd resolves the way OMP's bash tool does (M4b review B1)",
 		expect({ block: r?.block, input: r?.input, why: r?.reason?.includes("is not an existing directory") }).toEqual({ block: true, input: undefined, why: true });
 	});
 
-	// Machine-local: the host's own resolver, where OMP is installed (skipped visibly on a fresh clone,
-	// so it is imported dynamically: a static import of this absolute path would fail the whole file there).
-	const PATH_UTILS = "/Users/jowolff/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/src/tools/path-utils.ts";
-	test.skipIf(!existsSync(PATH_UTILS))("parity: every cwd the fence accepts is the directory OMP's resolveToCwd picks", async () => {
-		const { resolveToCwd } = (await import(PATH_UTILS)) as { resolveToCwd(p: string, cwd: string): string };
+	// Runtime-selected installed source, independent of the test runner's isolated HOME.
+	// A checkout without the host's source skips only this parity test.
+	let pathUtils: string | null = null;
+	const omp = Bun.which("omp");
+	if (omp) {
+		let dir = dirname(realpathSync(omp));
+		while (basename(dir) !== "@oh-my-pi" && dirname(dir) !== dir) dir = dirname(dir);
+		const candidate = join(dir, "pi-coding-agent", "src", "tools", "path-utils.ts");
+		if (existsSync(candidate)) pathUtils = candidate;
+	}
+	test.skipIf(pathUtils === null)("parity: every cwd the fence accepts is the directory OMP's resolveToCwd picks", async () => {
+		const { resolveToCwd } = (await import(pathUtils!)) as { resolveToCwd(p: string, cwd: string): string };
 		mkdirSync(join(session, "sub"), { recursive: true });
 		const sub = join(session, "sub");
 		const spellings = ["sub", "./sub", "sub/", `../${basename(session)}/sub`, sub, `${sub}/`, "//", "/", "~", `~/${relative(homedir(), sub)}`, `~${relative(homedir(), sub)}`];
@@ -1153,11 +1184,11 @@ describe("item 99: the model sees its own bash calls as typed (the fence's conte
 				}
 				return { outcomes, args };
 			},
-			/** The context event over a copy of the messages: the gates' own return, and whether the copy they were handed changed. */
+			/** Thread copied messages through every context handler, as OMP does; record whether any replacement mutated its input. */
 			async context(over: typeof ctx = ctx) {
 				const sent = structuredClone(messages);
 				const before = structuredClone(sent);
-				const returned = (await f.results("context", { type: "context", messages: sent }, over)).find((r) => r !== undefined) as { messages: Msg[] } | undefined;
+				const returned = await f.emit("context", { type: "context", messages: sent }, over) as { messages: Msg[] } | undefined;
 				return { sent, returned, mutated: !Bun.deepEquals(sent, before, true) };
 			},
 			/**
@@ -1195,6 +1226,29 @@ describe("item 99: the model sees its own bash calls as typed (the fence's conte
 		// The unchanged result keeps its identity: OMP's shallow-clone fallback hands over the session's own objects.
 		expect(returned?.messages[1]).toBe(sent[1]!);
 		expect(returned?.messages[0]?.timestamp).toBe(sent[0]!.timestamp);
+	});
+
+	test("display-only link filtering and typed bash unwrapping compose in one model context without changing persisted history", async () => {
+		const d = tmp("unwrap-link-asides");
+		const s = host({ HOME: d, PATH: process.env.PATH }, d);
+		const aside = () => ({ role: "custom", customType: DISPLAY_LINKS, content: "display only", timestamp: s.now() });
+		s.record(aside());
+		const { args } = await s.turn([{ id: "linked-bash", input: { command: "git status", cwd: d, timeout: 30 } }]);
+		const kept = { role: "custom", customType: "other-extension", content: "keep me", timestamp: s.now() };
+		s.record(kept);
+		s.record(aside());
+		const persisted = structuredClone(s.messages);
+		const { sent, returned, mutated } = await s.context();
+		expect(returned?.messages).toHaveLength(3);
+		expect(commandOf(returned?.messages, 0)).toBe("git status");
+		expect((returned?.messages[0]?.content as { arguments: Args }[])[0]?.arguments).toEqual({ command: "git status", cwd: args[0]!.cwd, timeout: 30 });
+		expect(returned?.messages[1]).toBe(sent[2]);
+		expect(returned?.messages[2]).toBe(sent[3]);
+		expect(returned?.messages[2]).toEqual(kept);
+		expect(mutated).toBe(false);
+		expect(commandOf(sent, 1)).toBe(args[0]!.command);
+		expect(s.messages).toEqual(persisted);
+		expect((await s.context()).returned?.messages).toEqual(returned?.messages);
 	});
 
 	test("R1b a fence-approved revision a later extension padded with outer whitespace is unwrapped", async () => {

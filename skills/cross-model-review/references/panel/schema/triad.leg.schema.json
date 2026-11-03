@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "panel triad leg — three lenses, one union of findings",
+  "description": "Output contract of one triad panel leg. The leg applies all three triad lenses (references/triad/prompts/architecture.md, correctness.md, cold-read.md) and returns every finding in one items array, each tagged with the lens that produced it. The finding fields are the union of architecture.schema.json and correctness.schema.json plus cold-read.md's markdown fields; a field a lens does not use is the empty string. The classifier assigns item ids <lab>-<n> by position.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "items"],
+  "properties": {
+    "status": {
+      "type": "object",
+      "description": "One status per lens, as each base prompt defines it.",
+      "additionalProperties": false,
+      "required": ["architecture", "correctness", "cold-read"],
+      "properties": {
+        "architecture": { "type": "string", "enum": ["no_findings", "findings"] },
+        "correctness": { "type": "string", "enum": ["no_ticket", "no_findings", "findings"] },
+        "cold-read": { "type": "string", "enum": ["no_findings", "findings"] }
+      }
+    },
+    "items": {
+      "type": "array",
+      "description": "Every finding of every lens. Empty when all three lenses found nothing. Ordered by severity within each lens.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["lens", "title", "severity", "where", "what", "evidence", "trigger", "spec", "first_read", "fix"],
+        "properties": {
+          "lens": { "type": "string", "enum": ["architecture", "correctness", "cold-read"], "description": "The lens whose prompt this finding answers." },
+          "title": { "type": "string", "description": "Short title for the defect." },
+          "severity": { "type": "string", "enum": ["critical", "high", "medium", "low"] },
+          "where": { "type": "string", "description": "file:line, or the boundary/contract affected." },
+          "what": { "type": "string", "description": "The defect (architecture: and the path traced to find it; cold-read: what's unclear, assumed, or misleading)." },
+          "evidence": { "type": "string", "description": "architecture: the named consumer, decision-log entry, or arch doc checked. Empty string for the other lenses." },
+          "trigger": { "type": "string", "description": "correctness: the concrete input or sequence that causes it, and the wrong outcome. Empty string for the other lenses." },
+          "spec": { "type": "string", "description": "correctness: the ticket line it violates, or \"edge case — not in ticket\". Empty string for the other lenses." },
+          "first_read": { "type": "string", "description": "cold-read: what you initially thought, if it differed from what you concluded. Empty string for the other lenses or when it did not differ." },
+          "fix": { "type": "string", "description": "Specific, minimal fix." }
+        }
+      }
+    }
+  }
+}

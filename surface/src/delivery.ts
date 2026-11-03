@@ -10,9 +10,12 @@
 //
 // The consumer half: a delivered line's held orchestrator-bound messages move to `delivered`
 // (P-7c one step), which is what makes a lane death "surfaced once" and what keeps a held
-// `artifact-failed:` message from ever meaning "no live lane" (fable (a)).
-import type { Ledger } from "../../ledger/src/index";
+// `artifact-failed:` message from ever meaning "no live lane" (fable (a)). A notice
+// (surface/src/notice.ts) is shown only while held, so this one step is also what makes it shown once.
+import { type Ledger, type MessageRow, TEST_RUNNER_BY } from "../../ledger/src/index";
 import type { ErrorLine } from "./errors";
+import { QUOTA_MOVE_PREFIX, trustedQuotaMove } from "./quota-move-alert";
+import { parseSecurityRed, SECURITY_RED_PREFIX } from "./test-run";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "./types";
 
 const identity = (l: ErrorLine): string => `${l.kind}:${l.workloadId}:${l.rowId}`;
@@ -59,20 +62,37 @@ export function consumeLines(ledger: Ledger, lines: ErrorLine[]): number {
 
 /**
  * At a wake the whole queue was rendered: every held orchestrator-bound message on an open workload
- * is delivered. The on-demand ledger read (orchestrator_ledger) does the same, for one workload when
- * it rendered one.
+ * is delivered, and on a closed one every held trusted `security-red:` and every held trusted
+ * `quota-move:` (`trustedQuotaMove`), which the render shows whatever the workload's state
+ * (surface/src/errors.ts, fix round 1 F3; PLAN wl-mvwk0v0gmp6cjc D4); no other message on a closed
+ * workload is touched. The on-demand ledger read (orchestrator_ledger) does the same, for one
+ * workload when it rendered one.
  */
 export function consumeAllToOrchestrator(ledger: Ledger, workloadId?: string): number {
-	const sql = `SELECT m.id FROM messages m JOIN workloads w ON w.id = m.workload_id WHERE w.status = 'open' AND m.state = 'held' AND m.recipient = ?1 ${workloadId ? "AND m.workload_id = ?2" : ""} ORDER BY m.created_at, m.rowid`;
-	const q = ledger.db.query<{ id: string }, [string] | [string, string]>(sql);
-	const held = workloadId ? q.all(ORCHESTRATOR_RECIPIENT, workloadId) : q.all(ORCHESTRATOR_RECIPIENT);
+	const sql = `SELECT m.*, w.status FROM messages m JOIN workloads w ON w.id = m.workload_id
+		WHERE m.state = 'held' AND m.recipient = ?1 AND (w.status = 'open' OR instr(m.body, ?2) = 1 OR instr(m.body, ?3) = 1)
+		${workloadId ? "AND m.workload_id = ?4" : ""} ORDER BY m.created_at, m.rowid`;
+	const q = ledger.db.query<MessageRow & { status: string }, [string, string, string] | [string, string, string, string]>(sql);
+	const rows = workloadId ? q.all(ORCHESTRATOR_RECIPIENT, SECURITY_RED_PREFIX, QUOTA_MOVE_PREFIX, workloadId) : q.all(ORCHESTRATOR_RECIPIENT, SECURITY_RED_PREFIX, QUOTA_MOVE_PREFIX);
+	// On a closed workload only the trusted signals the render showed: the runner's security red with a well-formed body naming
+	// its own workload, and a quota move as `recordQuotaMove` wrote it.
+	const held = rows.filter((m) =>
+		m.status === "open" ||
+		(m.created_by === TEST_RUNNER_BY && parseSecurityRed(m.body)?.workloadId === m.workload_id) ||
+		trustedQuotaMove(ledger, m) !== null);
 	for (const { id } of held) ledger.advanceMessage(id, "delivered", { by: SURFACE_BY });
 	return held.length;
 }
 
-/** One needs-you bullet: `- #<n> <line>` when the line is numbered (a literal `#`, so a markdown renderer cannot renumber it), else `- <line>`. */
+/** A line's text with its next step (issue #334 item 3): `<line> — next: <step>` unless the line already says the step. */
+export function lineWithNext(l: Pick<ErrorLine, "line" | "next">): string {
+	return l.next && !l.line.includes(l.next) ? `${l.line} — next: ${l.next}` : l.line;
+}
+
+/** One needs-you bullet: `- #<n> <line>` when the line is numbered (a literal `#`, so a markdown renderer cannot renumber it), else `- <line>`; the line with its next step. */
 export function needsYouBullet(l: ErrorLine): string {
-	return l.n === undefined ? `- ${l.line}` : `- #${l.n} ${l.line}`;
+	const text = lineWithNext(l);
+	return l.n === undefined ? `- ${text}` : `- #${l.n} ${text}`;
 }
 
 /** The lines as one block for the turn's context or a pushed message. */

@@ -1,7 +1,9 @@
 // P-11 row 3 as its own extension (astra review S4): the session's tool history, a hand's yield
 // flagged in place (never blocked), and a top-level turn's receipts flagged into the session. A
 // turn is `before_agent_start` to `session_stop`; its working calls (workCall) feed the zero-label
-// check and its trivial-ask carve-out (src/rows/r03-receipts.ts header).
+// check and its trivial-ask carve-out (src/rows/r03-receipts.ts header). A pair_write, pair_edit or
+// pair_run counts as its write, edit or bash equivalent (src/pair-call.ts).
+import { canonicalCall, canonicalResult } from "../src/pair-call";
 import { checkReceipts, historyEvent, renderFlags, workCall } from "../src/rows/r03-receipts";
 import { type GatesAPI, type GateSession, gateSession, messageText } from "../src/session";
 
@@ -42,7 +44,8 @@ export default function receiptsRow(pi: GatesAPI, env: Record<string, string | u
 		return undefined;
 	});
 
-	pi.on("tool_result", (event, ctx) => {
+	pi.on("tool_result", (result, ctx) => {
+		const event = canonicalResult(result, ctx.cwd);
 		const s = gateSession(ctx, env);
 		const h = historyEvent(event.toolName, s.originalInput(event), event.details, event.isError);
 		if (h) s.history.push(h);
@@ -52,7 +55,8 @@ export default function receiptsRow(pi: GatesAPI, env: Record<string, string | u
 	// Row 3 at a hand's exit: flag the report, never block (SPEC-2.0.md § B15 item 5).
 	pi.on("tool_call", (event, ctx) => {
 		const s = gateSession(ctx, env);
-		if (s.role !== "hand" && workCall(event.toolName, event.input, ctx.cwd, env)) {
+		const call = canonicalCall(event, ctx.cwd);
+		if (s.role !== "hand" && workCall(call.toolName, call.input, ctx.cwd, env)) {
 			const turn = turns.get(s);
 			if (turn) turn.push(event.toolName);
 			else turns.set(s, [event.toolName]);

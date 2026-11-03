@@ -65,12 +65,22 @@ export interface ExecResult {
 	killed: boolean;
 }
 
+/** Host-owned Text layout, injected by the entry so row modules never bare-import OMP. */
+export interface ResultText {
+	render(width: number): readonly string[];
+	invalidate(): void;
+}
+export type ResultTextConstructor = new (text: string, paddingX?: number, paddingY?: number) => ResultText;
+export type ResultTextLoader = () => Promise<ResultTextConstructor>;
+
 /** The extension API as the surface rows see it: the gates' slice plus the lane-boundary events and the push action. */
 export type SurfaceAPI = GatesAPI<Ctx> & {
 	on(event: "tool_approval_requested", h: Handler<{ sessionId: string; toolCallId: string; toolName: string; reason?: string }>): void;
 	on(event: "tool_approval_resolved", h: Handler<{ sessionId: string; toolCallId: string; toolName: string; approved: boolean; reason?: string }>): void;
 	on(event: "tool_execution_end", h: Handler<{ toolCallId: string; toolName: string; result: unknown; isError: boolean }>): void;
 	on(event: "session_shutdown", h: Handler<{ type: "session_shutdown" }>): void;
+	/** A turn starts (ExtensionAPI.on "agent_start"): the agent channel's observed-turn receipt (surface/extensions/agent-channel.ts). */
+	on(event: "agent_start", h: Handler<{ type: "agent_start" }>): void;
 	/** OMP 18.4.4 types.ts:1267-1271: the turn's message may carry `details` (agent-session.ts:7306-7318 keeps them). */
 	on(event: "before_agent_start", h: Handler<{ prompt: string; systemPrompt: string[] }, { systemPrompt?: string[]; message?: SurfaceMessage } | undefined>): void;
 	/** Fires for a turn's input messages (pi-agent-core agent-loop.ts emitInputMessages) and for an aside folded into context (agent-session.ts:1178-1181). */
@@ -81,7 +91,7 @@ export type SurfaceAPI = GatesAPI<Ctx> & {
 	sendMessage?(message: SurfaceMessage, options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" }): void;
 	exec?(command: string, args: string[], options?: { timeout?: number; cwd?: string }): Promise<ExecResult>;
 	/** The zod members the lane tools use beyond the gates' slice (surface/extensions/lane-tools.ts). */
-	zod: { array(item: unknown): ZodSchema; enum(values: readonly [string, ...string[]]): ZodSchema };
+	zod: { array(item: unknown): ZodSchema; enum(values: readonly [string, ...string[]]): ZodSchema; union(items: readonly unknown[]): ZodSchema };
 };
 interface ZodSchema {
 	describe(text: string): unknown;
@@ -90,6 +100,27 @@ interface ZodSchema {
 
 /** The provenance stamp on every write the surface makes. */
 export const SURFACE_BY = "orchestrator-surface";
+/**
+ * The merge train's machinery stamp (PLAN wl-mv8s8srodefytc rev 17.1 D8, D10): the train tick outside the fence writes
+ * `train-task-settled:`, a fix workload's `train-fix:`, `repo:`, `done:` and `push-dest:`, and `launch-requested:` as this.
+ */
+export const MERGE_TRAIN_BY = "merge-train";
+/**
+ * The owner's word that it cannot fix a train task (D7): `train-task-failed: <tt-…> <why>`, a lane note through
+ * `lane_record_entry` on the owner's workload, read only from a holder of that workload (surface/src/merge-train.ts `settleTasks`).
+ */
+export const TRAIN_TASK_FAILED_PREFIX = "train-task-failed:";
+/**
+ * The stamp of Jev ranking's machinery rows (PLAN wl-mv8k039gvogt8g D3; surface/src/rank.ts): `priority-signal:`,
+ * `priority-signal-failed:` and `rank-shown:`, written by whichever session ranks (the orchestrator, a lane, a hand).
+ */
+export const RANK_BY = "as2-rank";
+/**
+ * The escalation policy's machinery stamp (PLAN wl-mvfkv7llkp7nk0 § 3): `lane_raise_question`'s auto-start of a
+ * cross-lab-passed normal-stakes plan writes `plan: approved auto <round group>` and its notice as this, never as the lane.
+ * The one `plan:` form it may write is `approved auto …` (surface/src/launch.ts `validWriter`).
+ */
+export const ESCALATION_BY = "escalation";
 
 /**
  * The orchestrator's standing workload: the one open workload that carries rows belonging to no
@@ -100,7 +131,7 @@ export const SURFACE_BY = "orchestrator-surface";
 export const STANDING_WORKLOAD_ID = "wl-orchestrator";
 export const STANDING_BRIEF = "orchestrator standing workload: identity and scheduled rows (never closed)";
 /**
- * The standing slice on the standing workload (MIGRATION.md item 105): every QUESTION the
+ * The standing slice on the standing workload (MIGRATION.md item 105): every question the
  * orchestrator puts to Jo is a `questions` row on it, so the row exists before Jo sees the ask,
  * Jo answers it by id, `stuck-question` counts it and a restart re-renders it. The insert trigger
  * (schema.sql questions_insert_workload) needs an open or paused slice; this one is ensured with
@@ -182,19 +213,27 @@ export const RECORD_INSTRUCTION_TOOL = "orchestrator_record_instruction";
 export const LEDGER_TOOL = "orchestrator_ledger";
 /** Jo's word to (re)launch an autonomous lane on a workload (DESIGN-lane-launcher.md § 4; surface/extensions/launch.ts). */
 export const LAUNCH_LANE_TOOL = "orchestrator_launch_lane";
+/** Jo's word to set or clear a workload's lane model without launching (PLAN wl-mvwk0v0gmp6cjc D1; surface/extensions/lane-model.ts). */
+export const SET_LANE_MODEL_TOOL = "orchestrator_set_lane_model";
 /** Lower a workload's ceiling; raising is Jo's (DESIGN-workload-ceiling.md § 2 item 2; surface/extensions/ceiling.ts). */
 export const LOWER_CEILING_TOOL = "orchestrator_lower_ceiling";
-/** Ask Jo a question as a `questions` row on the standing slice, before the QUESTION block names its id (MIGRATION.md item 105; surface/extensions/question.ts). */
+/** Ask Jo a question as a `questions` row on the standing slice, before the closing ask names its id (MIGRATION.md item 105; surface/extensions/question.ts). */
 export const RAISE_QUESTION_TOOL = "orchestrator_raise_question";
-export const SURFACE_TOOLS = [WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, RECORD_INSTRUCTION_TOOL, LEDGER_TOOL, LAUNCH_LANE_TOOL, LOWER_CEILING_TOOL, RAISE_QUESTION_TOOL] as const;
+/** Reply to another agent's channel message, and mark channel messages acted on (PLAN wl-mv8vx7wdj5nx1c D4; surface/extensions/agent-channel.ts). */
+export const CHANNEL_REPLY_TOOL = "orchestrator_reply";
+export const CHANNEL_DONE_TOOL = "orchestrator_channel_done";
+export const SURFACE_TOOLS = [
+	WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, RECORD_INSTRUCTION_TOOL, LEDGER_TOOL, LAUNCH_LANE_TOOL, SET_LANE_MODEL_TOOL, LOWER_CEILING_TOOL,
+	RAISE_QUESTION_TOOL, CHANNEL_REPLY_TOOL, CHANNEL_DONE_TOOL,
+] as const;
 /** Surface tools that read rather than work (P-11 row 3's working-call test): the wake read records only that it read. */
 export const SURFACE_READ_TOOLS = [WAKE_READ_TOOL, LEDGER_TOOL] as const;
 /**
- * Surface tools that move a workload on — open, close, schedule — refused on the orchestrator while
- * a QUESTION it sent Jo about an open workload has no instruction row newer than it (P-11 row 15,
- * M7 fix round 2, finding B).
+ * Surface tools that move a workload on — open, close, schedule, launch, set lane model — refused on the
+ * orchestrator while a question it sent Jo about an open workload has no instruction row newer than it
+ * (P-11 row 15, M7 fix round 2, finding B).
  */
-export const HAND_ON_TOOLS = [OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, LAUNCH_LANE_TOOL] as const;
+export const HAND_ON_TOOLS = [OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, LAUNCH_LANE_TOOL, SET_LANE_MODEL_TOOL] as const;
 /** The one tool the surface registers on a lane session: declare a slice's runtime-artifact command (surface/extensions/lane.ts). */
 export const ARTIFACT_TOOL = "slice_artifact";
 /** The lane's ledger tools (DESIGN-lane-launcher.md decision 4; surface/extensions/lane-tools.ts). */
@@ -211,9 +250,11 @@ export const LANE_WITHDRAW_RESERVED_TOOL = "lane_withdraw_reserved";
 export const LANE_FULL_TEST_TOOL = "lane_full_test";
 /** The unbudgeted read of a repo's M8 facts (MIGRATION.md item 106; surface/src/facts.ts readFacts; surface/extensions/lane-tools.ts). */
 export const LANE_READ_FACTS_TOOL = "lane_read_facts";
+/** Return a merge-train PR to the lane that owns it (PLAN wl-mv8s8srodefytc rev 17.1 D6; surface/src/merge-train.ts recordTrainTask). */
+export const LANE_TRAIN_RETURN_TOOL = "lane_train_return";
 export const LANE_TOOLS = [
 	LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_MESSAGE_TOOL, LANE_WITHDRAW_RESERVED_TOOL, LANE_RELEASE_TOOL, LANE_HANDOFF_TOOL,
-	LANE_FULL_TEST_TOOL, LANE_READ_FACTS_TOOL,
+	LANE_FULL_TEST_TOOL, LANE_READ_FACTS_TOOL, LANE_TRAIN_RETURN_TOOL,
 ] as const;
 
 /** The one-word flips Jo can type at the surface (§ A1.2, § B13.1). */

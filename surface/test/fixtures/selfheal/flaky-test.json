@@ -1,0 +1,75 @@
+{
+	"source": "live ledger, test-run entries for shas e27bbc0 (PR #136), db80ef2 and 49443be (PR #101)",
+	"rows": [
+		{
+			"t": "entry",
+			"id": "en-mv7hclx22h3bwg",
+			"workloadId": "wl-mv718fxhwwcn40",
+			"sliceId": "sl-sr-live",
+			"kind": "assumption",
+			"by": "test-runner",
+			"at": "2026-10-14T02:17:47.510Z",
+			"body": "test-run: tr-0mv7hajkqb4l6u7 error sha=e27bbc074c8d811c1955a843f0216c24e346e673 pr=136 {\"sha\":\"e27bbc074c8d811c1955a843f0216c24e346e673\",\"pr\":136,\"reason\":\"preflight: SOURCE has no file refresh; re-run install/as2test-setup.sh\",\"headAtEnd\":null,\"base\":null,\"mergeBase\":null,\"full\":null,\"solo\":[],\"failures\":[],\"runDir\":\"/Users/jowolff/.agent-system-2/test-runs/tr-0mv7hajkqb4l6u7\",\"preflight\":\"preflight: SOURCE has no file refresh; re-run install/as2test-setup.sh\"}"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv7i2bs91uv0u8",
+			"workloadId": "wl-mv718fxhwwcn40",
+			"sliceId": "sl-sr-live",
+			"kind": "assumption",
+			"by": "test-runner",
+			"at": "2026-10-14T02:37:47.433Z",
+			"body": "test-run: tr-0mv7hlnz0hx3w4m red sha=e27bbc074c8d811c1955a843f0216c24e346e673 pr=136 {\"sha\":\"e27bbc074c8d811c1955a843f0216c24e346e673\",\"pr\":136,\"reason\":null,\"headAtEnd\":\"e27bbc074c8d811c1955a843f0216c24e346e673\",\"base\":\"1703ed1e6545725a2ad85eba01617ccc344f2fca\",\"mergeBase\":\"1703ed1e6545725a2ad85eba01617ccc344f2fca\",\"full\":{\"pass\":4627,\"fail\":2,\"skip\":30,\"exit\":1,\"ms\":754452,\"error\":null},\"solo\":[],\"failures\":[{\"part\":\"full\",\"name\":\"surface/test/lane-model-script.test.ts > T8: named then cleared > T8b-p: the X launch failed before a session: default resumes the default-era s1\",\"firstError\":\"error: expect(received).toBe(expected)\"},{\"part\":\"full\",\"name\":\"surface/test/lane-script.test.ts > lane script: launch, run, log, cleanup against the fake omp > repo facts (MIGRATION.md item 106): the prompt the fake omp receives carries the root's facts after the tools line and before the decision-log context, never another repo's; a relaunch after an m8-rollback drops that batch\",\"firstError\":\"error: expect(received).toBe(expected)\"}],\"runDir\":\"/Users/jowolff/.agent-system-2/test-runs/tr-0mv7hlnz0hx3w4m\",\"preflight\":\"install: _as2test 600:600, bun 1.3.14, source https://github.com/thewolff/agent-system-2.0.git at 1703ed1e6545; probe: 23 paths unreachable as _as2test\"}"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv7iji2w4p7fnk",
+			"workloadId": "wl-mv718fxhwwcn40",
+			"sliceId": "sl-sr-live",
+			"kind": "assumption",
+			"by": "test-runner",
+			"at": "2026-10-14T02:51:08.744Z",
+			"body": "test-run: tr-0mv7i34jkc92773 green sha=e27bbc074c8d811c1955a843f0216c24e346e673 pr=136 {\"sha\":\"e27bbc074c8d811c1955a843f0216c24e346e673\",\"pr\":136,\"reason\":null,\"headAtEnd\":\"e27bbc074c8d811c1955a843f0216c24e346e673\",\"base\":\"0769aefc4435f0e8bcc4c4cf703a380333181e50\",\"mergeBase\":\"1703ed1e6545725a2ad85eba01617ccc344f2fca\",\"full\":{\"pass\":4629,\"fail\":0,\"skip\":30,\"exit\":0,\"ms\":743458,\"error\":null},\"solo\":[],\"failures\":[],\"runDir\":\"/Users/jowolff/.agent-system-2/test-runs/tr-0mv7i34jkc92773\",\"preflight\":\"install: _as2test 600:600, bun 1.3.14, source https://github.com/thewolff/agent-system-2.0.git at 1703ed1e6545; probe: 23 paths unreachable as _as2test\"}"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv7m6q1qd7c3k0",
+			"workloadId": "wl-mv6144px2e2n7k",
+			"sliceId": "sl-train-101-c",
+			"kind": "assumption",
+			"by": "test-runner",
+			"at": "2026-10-14T04:33:11.006Z",
+			"body": "test-run: tr-0mv7ko8g75klpf5 red sha=db80ef2fe8f7912f8629184fc2cd7c81acc0006c pr=101 {\"sha\":\"db80ef2fe8f7912f8629184fc2cd7c81acc0006c\",\"pr\":101,\"reason\":null,\"headAtEnd\":\"db80ef2fe8f7912f8629184fc2cd7c81acc0006c\",\"base\":\"eee0a7a25601d645aeef8ea68640dc08c68cbdda\",\"mergeBase\":\"eee0a7a25601d645aeef8ea68640dc08c68cbdda\",\"full\":{\"pass\":4698,\"fail\":1,\"skip\":30,\"exit\":1,\"ms\":725098,\"error\":null},\"solo\":[{\"file\":\"./classifier/test/crosslab.test.ts\",\"pass\":90,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":26780,\"error\":null},{\"file\":\"./classifier/test/rounds.test.ts\",\"pass\":32,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":68,\"error\":null},{\"file\":\"./classifier/test/snapshot-settle.test.ts\",\"pass\":29,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":9397,\"error\":null},{\"file\":\"./surface/test/close-entry.test.ts\",\"pass\":12,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":9030,\"error\":null},{\"file\":\"./surface/test/close-fresh.test.ts\",\"pass\":27,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":29496,\"error\":null},{\"file\":\"./surface/test/extension.test.ts\",\"pass\":16,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":893,\"error\":null},{\"file\":\"./surface/test/input.test.ts\",\"pass\":64,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":881,\"error\":null},{\"file\":\"./surface/test/lane-model.test.ts\",\"pass\":16,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":249,\"error\":null},{\"file\":\"./surface/test/lane-script.test.ts\",\"pass\":63,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":271920,\"error\":null},{\"file\":\"./surface/test/lane-tools.test.ts\",\"pass\":58,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":1578,\"error\":null},{\"file\":\"./surface/test/launch.test.ts\",\"pass\":53,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":62,\"error\":null},{\"file\":\"./surface/test/test-run.test.ts\",\"pass\":62,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":728,\"error\":null},{\"file\":\"./surface/test/turn-end.test.ts\",\"pass\":29,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":200,\"error\":null},{\"file\":\"./surface/test/turn-idle.test.ts\",\"pass\":13,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":63,\"error\":null}],\"failures\":[{\"part\":\"full\",\"name\":\"surface/test/lane-model-script.test.ts > T1–T3: the runner starts on Jo's model and keeps the session only on it > T2p: the tick's resume after Jo's answer keeps --model and the parked session\",\"firstError\":\"error: expect(received).toBe(expected)\"}],\"runDir\":\"/Users/jowolff/.agent-system-2/test-runs/tr-0mv7ko8g75klpf5\",\"preflight\":\"install: _as2test 600:600, bun 1.3.14, source https://github.com/thewolff/agent-system-2.0.git at eee0a7a25601; probe: 23 paths unreachable as _as2test\"}"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv7mxoocq63668",
+			"workloadId": "wl-mv6144px2e2n7k",
+			"sliceId": "sl-train-101-c",
+			"kind": "assumption",
+			"by": "test-runner",
+			"at": "2026-10-14T04:54:08.940Z",
+			"body": "test-run: tr-0mv7m7zeiku5jfv green sha=db80ef2fe8f7912f8629184fc2cd7c81acc0006c pr=101 {\"sha\":\"db80ef2fe8f7912f8629184fc2cd7c81acc0006c\",\"pr\":101,\"reason\":null,\"headAtEnd\":\"db80ef2fe8f7912f8629184fc2cd7c81acc0006c\",\"base\":\"eee0a7a25601d645aeef8ea68640dc08c68cbdda\",\"mergeBase\":\"eee0a7a25601d645aeef8ea68640dc08c68cbdda\",\"full\":{\"pass\":4699,\"fail\":0,\"skip\":30,\"exit\":0,\"ms\":720855,\"error\":null},\"solo\":[{\"file\":\"./classifier/test/crosslab.test.ts\",\"pass\":90,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":25482,\"error\":null},{\"file\":\"./classifier/test/rounds.test.ts\",\"pass\":32,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":70,\"error\":null},{\"file\":\"./classifier/test/snapshot-settle.test.ts\",\"pass\":29,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":9075,\"error\":null},{\"file\":\"./surface/test/close-entry.test.ts\",\"pass\":12,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":8712,\"error\":null},{\"file\":\"./surface/test/close-fresh.test.ts\",\"pass\":27,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":28764,\"error\":null},{\"file\":\"./surface/test/extension.test.ts\",\"pass\":16,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":1000,\"error\":null},{\"file\":\"./surface/test/input.test.ts\",\"pass\":64,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":1018,\"error\":null},{\"file\":\"./surface/test/lane-model.test.ts\",\"pass\":16,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":264,\"error\":null},{\"file\":\"./surface/test/lane-script.test.ts\",\"pass\":63,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":271473,\"error\":null},{\"file\":\"./surface/test/lane-tools.test.ts\",\"pass\":58,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":1472,\"error\":null},{\"file\":\"./surface/test/launch.test.ts\",\"pass\":53,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":68,\"error\":null},{\"file\":\"./surface/test/test-run.test.ts\",\"pass\":62,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":708,\"error\":null},{\"file\":\"./surface/test/turn-end.test.ts\",\"pass\":29,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":191,\"error\":null},{\"file\":\"./surface/test/turn-idle.test.ts\",\"pass\":13,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":62,\"error\":null}],\"failures\":[],\"runDir\":\"/Users/jowolff/.agent-system-2/test-runs/tr-0mv7m7zeiku5jfv\",\"preflight\":\"install: _as2test 600:600, bun 1.3.14, source https://github.com/thewolff/agent-system-2.0.git at eee0a7a25601; probe: 23 paths unreachable as _as2test\"}"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv8do4u3uoz1ts",
+			"workloadId": "wl-mv6144px2e2n7k",
+			"sliceId": "sl-train-101-d",
+			"kind": "assumption",
+			"by": "test-runner",
+			"at": "2026-10-14T17:22:32.955Z",
+			"body": "test-run: tr-0mv8cx8sqznvf18 red sha=49443be05d134e2e5c591eb2653606bdaa6bfa7c pr=101 {\"sha\":\"49443be05d134e2e5c591eb2653606bdaa6bfa7c\",\"pr\":101,\"reason\":null,\"headAtEnd\":\"49443be05d134e2e5c591eb2653606bdaa6bfa7c\",\"base\":\"4b3799643ce211c8e0e0afce0765bc402d263fd4\",\"mergeBase\":\"4b3799643ce211c8e0e0afce0765bc402d263fd4\",\"full\":{\"pass\":4793,\"fail\":1,\"skip\":30,\"exit\":1,\"ms\":754979,\"error\":null},\"solo\":[{\"file\":\"./classifier/test/crosslab.test.ts\",\"pass\":90,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":27469,\"error\":null},{\"file\":\"./classifier/test/rounds.test.ts\",\"pass\":32,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":69,\"error\":null},{\"file\":\"./classifier/test/snapshot-settle.test.ts\",\"pass\":29,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":9953,\"error\":null},{\"file\":\"./surface/test/close-entry.test.ts\",\"pass\":12,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":9486,\"error\":null},{\"file\":\"./surface/test/close-fresh.test.ts\",\"pass\":27,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":30174,\"error\":null},{\"file\":\"./surface/test/extension.test.ts\",\"pass\":16,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":822,\"error\":null},{\"file\":\"./surface/test/input.test.ts\",\"pass\":64,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":910,\"error\":null},{\"file\":\"./surface/test/lane-model.test.ts\",\"pass\":16,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":266,\"error\":null},{\"file\":\"./surface/test/lane-script.test.ts\",\"pass\":63,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":271919,\"error\":null},{\"file\":\"./surface/test/lane-tools.test.ts\",\"pass\":58,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":1563,\"error\":null},{\"file\":\"./surface/test/launch.test.ts\",\"pass\":53,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":65,\"error\":null},{\"file\":\"./surface/test/test-run.test.ts\",\"pass\":62,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":713,\"error\":null},{\"file\":\"./surface/test/turn-end.test.ts\",\"pass\":29,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":192,\"error\":null},{\"file\":\"./surface/test/turn-idle.test.ts\",\"pass\":13,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":67,\"error\":null}],\"failures\":[{\"part\":\"full\",\"name\":\"surface/test/lane-model-script.test.ts > T1–T3: the runner starts on Jo's model and keeps the session only on it > T2p: the tick's resume after Jo's answer keeps --model and the parked session\",\"firstError\":\"error: expect(received).toBe(expected)\"}],\"runDir\":\"/Users/jowolff/.agent-system-2/test-runs/tr-0mv8cx8sqznvf18\",\"preflight\":\"install: _as2test 600:600, bun 1.3.14, source https://github.com/thewolff/agent-system-2.0.git at 4b3799643ce2; refreshed eee0a7a25601..4b3799643ce2; probe: 23 paths unreachable as _as2test\"}"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv8efz3jdpx79c",
+			"workloadId": "wl-mv6144px2e2n7k",
+			"sliceId": "sl-train-101-d",
+			"kind": "assumption",
+			"by": "test-runner",
+			"at": "2026-10-14T17:44:11.887Z",
+			"body": "test-run: tr-0mv8dot8ez2z09d green sha=49443be05d134e2e5c591eb2653606bdaa6bfa7c pr=101 {\"sha\":\"49443be05d134e2e5c591eb2653606bdaa6bfa7c\",\"pr\":101,\"reason\":null,\"headAtEnd\":\"49443be05d134e2e5c591eb2653606bdaa6bfa7c\",\"base\":\"4b3799643ce211c8e0e0afce0765bc402d263fd4\",\"mergeBase\":\"4b3799643ce211c8e0e0afce0765bc402d263fd4\",\"full\":{\"pass\":4794,\"fail\":0,\"skip\":30,\"exit\":0,\"ms\":783324,\"error\":null},\"solo\":[{\"file\":\"./classifier/test/crosslab.test.ts\",\"pass\":90,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":29416,\"error\":null},{\"file\":\"./classifier/test/rounds.test.ts\",\"pass\":32,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":79,\"error\":null},{\"file\":\"./classifier/test/snapshot-settle.test.ts\",\"pass\":29,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":10853,\"error\":null},{\"file\":\"./surface/test/close-entry.test.ts\",\"pass\":12,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":9624,\"error\":null},{\"file\":\"./surface/test/close-fresh.test.ts\",\"pass\":27,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":31895,\"error\":null},{\"file\":\"./surface/test/extension.test.ts\",\"pass\":16,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":883,\"error\":null},{\"file\":\"./surface/test/input.test.ts\",\"pass\":64,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":1001,\"error\":null},{\"file\":\"./surface/test/lane-model.test.ts\",\"pass\":16,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":303,\"error\":null},{\"file\":\"./surface/test/lane-script.test.ts\",\"pass\":63,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":275599,\"error\":null},{\"file\":\"./surface/test/lane-tools.test.ts\",\"pass\":58,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":1890,\"error\":null},{\"file\":\"./surface/test/launch.test.ts\",\"pass\":53,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":72,\"error\":null},{\"file\":\"./surface/test/test-run.test.ts\",\"pass\":62,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":717,\"error\":null},{\"file\":\"./surface/test/turn-end.test.ts\",\"pass\":29,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":174,\"error\":null},{\"file\":\"./surface/test/turn-idle.test.ts\",\"pass\":13,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":59,\"error\":null}],\"failures\":[],\"runDir\":\"/Users/jowolff/.agent-system-2/test-runs/tr-0mv8dot8ez2z09d\",\"preflight\":\"install: _as2test 600:600, bun 1.3.14, source https://github.com/thewolff/agent-system-2.0.git at 4b3799643ce2; probe: 23 paths unreachable as _as2test\"}"
+		}
+	]
+}

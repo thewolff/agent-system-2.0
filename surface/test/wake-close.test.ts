@@ -6,16 +6,17 @@
 // surface's `pi.exec` is the fake one (no git or gh process runs), answering the close check as a
 // served repo whose `git rev-parse` fails, so the refusal comes from the real close path.
 import { describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { Ledger } from "../../ledger/src/index";
 import { launchVerdict } from "../extensions/launch";
 import orchestratorSurface from "../index";
 import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { recordRepo } from "../src/decision-log";
-import { doneBody } from "../src/launch";
+import { doneBody, launchRequestedBody, trainBoardBody, withdrawInstructionBody, withdrawnBody } from "../src/launch";
 import { surfaceSession } from "../src/session";
-import { SURFACE_BY } from "../src/types";
+import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, timers, tmp } from "./helpers";
 
 const ORIGIN_URL = "https://github.com/example/repo.git";
@@ -35,10 +36,15 @@ function env(): Record<string, string> {
 const open = (e: Record<string, string>) => Ledger.open(e.AGENT_SYSTEM_LEDGER_DB!, { backup: false, backupOnOpen: false });
 const HAND = "lane-plumb-by-hand";
 
-/** A by-hand holder's released workload with its `done-because:` receipt standing: awaiting close, nothing open. */
-function awaitingClose(e: Record<string, string>, repo: string): string {
+/**
+ * A by-hand holder's released workload with its `done-because:` receipt standing: awaiting close, nothing open. A `train` one
+ * is a merge train boarded with #7, its done-because a legacy row (PLAN wl-mvr888nftz0vcl D3 refuses a new one); the train is
+ * permanent, so its receipt is never read and it is never awaiting close.
+ */
+function awaitingClose(e: Record<string, string>, repo: string, train = false): string {
 	const l = open(e);
 	const wl = l.openWorkload({ by: SURFACE_BY, brief: "Add a verify line to the README", stakes: "normal", mode: "autonomous" });
+	if (train) l.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainBoardBody({ pr: 7, workload: wl, head: "a".repeat(40), run: null, review: null }) });
 	recordRepo(l, wl, repo);
 	l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("README.md carries a verify line") });
 	expect(l.claimWorkload(wl, { by: HAND, holder: HAND, leaseMs: 60_000 }).won).toBe(true);
@@ -46,7 +52,8 @@ function awaitingClose(e: Record<string, string>, repo: string): string {
 	l.completeSlice(sl, { by: HAND, artifact: "the line" });
 	l.recordEntry({ by: HAND, workloadId: wl, kind: "assumption", body: "done-because: README.md carries a verify line\nchecked by reading it" });
 	l.releaseWorkload(wl, { by: HAND, holder: HAND });
-	expect(launchVerdict(l, e, wl)).toEqual({ launch: false, reason: "awaiting-close" });
+	if (train) expect(launchVerdict(l, e, wl)).not.toEqual({ launch: false, reason: "awaiting-close" });
+	else expect(launchVerdict(l, e, wl)).toEqual({ launch: false, reason: "awaiting-close" });
 	l.close();
 	return wl;
 }
@@ -84,7 +91,16 @@ describe("the tick's refused close is told once per refusal", () => {
 			}
 		};
 		const closeChecks = () => f.execs.calls.filter((c) => c.command === "git" && c.args[2] === "config").length;
-		const refusal = (fatal: string) => `- tick: ${wl} cannot close: the close check could not answer: ${repo} is not a git checkout (git rev-parse exited 128: ${fatal})`;
+		const expectRefusal = (lines: string[], fatal: string) => {
+			expect(lines).toHaveLength(1);
+			expect(lines[0]).toStartWith(`- tick: ${wl} cannot close:`);
+			expect(lines[0]).toContain(`](${pathToFileURL(repo).href})`);
+			expect(lines[0]).toContain("git rev-parse exited 128");
+			expect(lines[0]).toContain(fatal);
+			const l = open(e);
+			expect(l.workload(wl)!.status).toBe("open");
+			l.close();
+		};
 
 		timers.length = 0;
 		await f.emit("session_start", { type: "session_start" }, ctx);
@@ -94,7 +110,7 @@ describe("the tick's refused close is told once per refusal", () => {
 		await tick();
 		await tick();
 		expect(closeChecks()).toBe(2);
-		expect(await applied()).toEqual([refusal("fatal: first")]);
+		expectRefusal(await applied(), "fatal: first");
 		await tick();
 		expect(closeChecks()).toBe(3);
 		expect(await applied()).toEqual([]);
@@ -104,7 +120,7 @@ describe("the tick's refused close is told once per refusal", () => {
 		await tick();
 		await tick();
 		expect(closeChecks()).toBe(5);
-		expect(await applied()).toEqual([refusal("fatal: second")]);
+		expectRefusal(await applied(), "fatal: second");
 
 		// not ready (a slice opens), then ready again: the same refusal is told again
 		const l = open(e);
@@ -112,26 +128,72 @@ describe("the tick's refused close is told once per refusal", () => {
 		l.close();
 		await tick();
 		expect(closeChecks()).toBe(5);
-		expect(await applied()).toEqual([`- tick: ${wl} is finished but cannot close: 1 open slice(s), 0 paused, 0 open question(s) — resolve them or close by hand`]);
+		const stuck = await applied();
+		expect(stuck).toHaveLength(1);
+		expect(stuck[0]).toStartWith(`- tick: ${wl}`);
+		expect(stuck[0]).toContain("cannot close:");
+		expect(stuck[0]).toContain("1 open slice(s)");
+		expect(stuck[0]).toContain("0 paused");
+		expect(stuck[0]).toContain("0 open question(s)");
 		const l2 = open(e);
 		l2.completeSlice(sl, { by: HAND, artifact: "done" });
 		l2.close();
 		await tick();
 		await tick();
 		expect(closeChecks()).toBe(7);
-		expect(await applied()).toEqual([refusal("fatal: second")]);
+		expectRefusal(await applied(), "fatal: second");
 
 		// the close goes through (the repo is no longer served): told as usual
 		git.origin = false;
 		await tick();
 		const closed = await applied();
 		expect(closed).toHaveLength(1);
-		expect(closed[0]).toStartWith(`- tick: closed ${wl}: README.md carries a verify line — Decision-log entry rendered at ${join(repo, ".ai", "decision-log")}/`);
+		expect(closed[0]).toStartWith(`- tick: closed ${wl}:`);
+		const logDir = join(repo, ".ai", "decision-log");
+		const entries = readdirSync(logDir);
+		expect(entries).toHaveLength(1);
+		expect(closed[0]).toContain(`](${pathToFileURL(join(logDir, entries[0]!)).href})`);
+		expect(closed[0]).toContain("not committed:");
+		expect(closed[0]).toContain("git rev-parse exited 128");
+		expect(closed[0]).toContain("fatal: second");
 		const after = open(e);
 		expect(after.workload(wl)!.status).toBe("closed");
 		after.close();
 		await tick();
 		expect(await applied()).toEqual([]);
+		expect(f.execs.calls.filter((c) => c.command === "bun")).toEqual([]);
+	});
+});
+
+// Rewritten for PLAN wl-mvr888nftz0vcl D3 (was "one tick closes a merge train and an owner workload"): the merge train is
+// permanent, so the tick never closes it, even with a legacy done-because standing; the owner's close is told as before.
+describe("a merge train is never auto-closed (PLAN wl-mvbjiettjrfpxc D10, wl-mvr888nftz0vcl D3)", () => {
+	test("R19: one tick closes an owner workload and leaves the merge train open: the owner's close notice is pushed, nothing about the train", async () => {
+		const e = env();
+		const repo = tmp("repo");
+		const owner = awaitingClose(e, repo);
+		const train = awaitingClose(e, repo, true);
+		const f = fakePi(undefined, { exec: true });
+		// No origin: the repo is not served, so each close goes through without the runner's green.
+		f.execs.answer = () => ({ stdout: "", stderr: "", code: 1, killed: false });
+		orchestratorSurface(f.pi, e, {});
+		const ctx = ctxOf({ cwd: repo });
+		const s = surfaceSession(ctx, e);
+		timers.length = 0;
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		timers[0]!.fn();
+		while (s.launching) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setImmediate(resolve);
+			await promise;
+		}
+		const after = open(e);
+		expect([after.workload(owner)!.status, after.workload(train)!.status]).toEqual(["closed", "open"]);
+		after.close();
+		const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
+		const text = turn.messages[0]?.content ?? "";
+		expect(text).toContain(`- tick: closed ${owner}: README.md carries a verify line`);
+		expect(text).not.toContain(`closed ${train}`);
 	});
 });
 
@@ -237,5 +299,101 @@ describe("the tick's catch-up runs when the poll throws (MIGRATION.md item 71)",
 		const line = `tick: ${wl}: the starter exited 0 without a line`;
 		expect(s.tickNotices).toEqual([line]);
 		expect(s.noticesInFlight?.lines).toEqual([line]);
+	});
+});
+
+describe("PLAN wl-mv8s939084z1ts D6: the tick finishes the close of a workload Jo withdrew, in either mode", () => {
+	/** A released workload with a done: line, a cancelled slice and no receipt, then Jo's `withdraw <wl>` as the surface writes it. */
+	function withdrawn(e: Record<string, string>, repo: string, mode: "autonomous" | "user-driven", requested: boolean): { wl: string; ins: string } {
+		const l = open(e);
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "Prototype the data-viz panel", stakes: "normal", mode });
+		recordRepo(l, wl, repo);
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the panel renders the feed") });
+		expect(l.claimWorkload(wl, { by: HAND, holder: HAND, leaseMs: 60_000 }).won).toBe(true);
+		const sl = l.addSlice({ by: HAND, workloadId: wl, task: "draw the panel", doneCondition: "it renders", inputs: "the feed" });
+		l.releaseWorkload(wl, { by: HAND, holder: HAND });
+		l.cancelSlice(sl, { by: SURFACE_BY });
+		// cancel-slice's own launch-requested: (a lane's question withdrawn while nobody held it), never consumed.
+		if (requested) l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody("jo", l.now(), "cancel-slice") });
+		const ins = l.recordInstruction({ by: SURFACE_BY, workloadId: wl, body: withdrawInstructionBody(wl), author: "jo", channel: "surface" });
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: withdrawnBody(ins) });
+		expect(launchVerdict(l, e, wl)).toEqual({ launch: false, reason: "withdrawn" });
+		l.close();
+		return { wl, ins };
+	}
+	/** The surface on the fake exec (served origin whose `git rev-parse` fails while `git.origin`; unserved after), with one-poll and applied-block helpers. */
+	async function surface(e: Record<string, string>, repo: string) {
+		const git = { origin: true };
+		const f = fakePi(undefined, { exec: true });
+		f.execs.answer = (command, args) => {
+			if (command === "git" && args[2] === "config") return git.origin ? { stdout: `${ORIGIN_URL}\n`, stderr: "", code: 0, killed: false } : { stdout: "", stderr: "", code: 1, killed: false };
+			if (command === "git" && args[2] === "rev-parse" && args[3] === "--show-toplevel") return { stdout: "", stderr: "fatal: no", code: 128, killed: false };
+			return { stdout: "", stderr: "", code: 0, killed: false };
+		};
+		orchestratorSurface(f.pi, e, {});
+		const ctx = ctxOf({ cwd: repo });
+		const s = surfaceSession(ctx, e);
+		const applied = async (): Promise<string[]> => {
+			const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
+			const text = turn.messages[0]?.content ?? "";
+			const heading = "## Applied from the surface since your last turn";
+			return text.includes(heading) ? text.split(heading)[1]!.trim().split("\n\n")[0]!.split("\n") : [];
+		};
+		const tick = async () => {
+			timers[0]!.fn();
+			while (s.launching) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				setImmediate(resolve);
+				await promise;
+			}
+		};
+		timers.length = 0;
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		expect(timers).toHaveLength(1);
+		return { f, git, tick, applied };
+	}
+	const said = (ins: string) => `withdrawn by Jo (${ins}): closed with no done-because: receipt`;
+
+	test("autonomous with an unconsumed launch-requested: the tick closes it and launches nothing", async () => {
+		const e = env();
+		const repo = tmp("repo");
+		const { wl, ins } = withdrawn(e, repo, "autonomous", true);
+		const h = await surface(e, repo);
+		h.git.origin = false;
+
+		await h.tick();
+
+		const closed = await h.applied();
+		expect(closed).toHaveLength(1);
+		expect(closed[0]).toStartWith(`- tick: closed ${wl}: ${said(ins)} — Decision-log entry rendered at [${join(repo, ".ai", "decision-log")}/`);
+		expect(h.f.execs.calls.filter((c) => c.command === "bun")).toEqual([]);
+		const after = open(e);
+		expect(after.workload(wl)!.status).toBe("closed");
+		expect(after.instructions(wl).map((i) => i.body)).toContain(`close receipt: ${said(ins)}`);
+		after.close();
+	});
+
+	test("user-driven: the first tick's close is refused (served, the check cannot answer) and told once; a later tick closes it", async () => {
+		const e = env();
+		const repo = tmp("repo");
+		const { wl, ins } = withdrawn(e, repo, "user-driven", false);
+		const h = await surface(e, repo);
+		await h.tick();
+		await h.tick();
+		expect(h.f.execs.calls.filter((c) => c.command === "git" && c.args[2] === "config")).toHaveLength(2);
+		expect(await h.applied()).toEqual([`- tick: ${wl} cannot close: the close check could not answer: [${repo}](${pathToFileURL(repo).href}) is not a git checkout (git rev-parse exited 128: fatal: no)`]);
+		const still = open(e);
+		expect(still.workload(wl)!.status).toBe("open");
+		still.close();
+
+		h.git.origin = false;
+		await h.tick();
+		const closed = await h.applied();
+		expect(closed).toHaveLength(1);
+		expect(closed[0]).toStartWith(`- tick: closed ${wl}: ${said(ins)} — `);
+		expect(h.f.execs.calls.filter((c) => c.command === "bun")).toEqual([]);
+		const after = open(e);
+		expect(after.workload(wl)!.status).toBe("closed");
+		after.close();
 	});
 });

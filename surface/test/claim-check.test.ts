@@ -158,7 +158,7 @@ class Transcript {
 		this.lastAside = this.entry({
 			type: "custom_message",
 			customType: "lane-test-run",
-			content: `Test run ${runId} on wl-x: ${verdict} at deadbeef (PR #1, slice sl-full, ledger entry en-2).\nFull suite: ${passed} passed, ${failed} failed, 0 skipped.\nChanged test files alone: none.`,
+			content: `Test run ${runId} on wl-x: ${verdict} at deadbeef (PR #1, slice sl-full, ledger entry en-2).\nFull suite: ${passed} passed, ${failed} failed, 0 skipped.\nTest files alone: none.`,
 			display: true,
 		});
 		return this;

@@ -4,13 +4,14 @@
  */
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { labOf } from "../src/lab";
 import { TIERS, tierRank } from "../src/route";
 import { loadTierTable, TierTableError, tierTableFromConfig } from "../src/tier-table";
 
 const TEMPLATE = join(import.meta.dir, "..", "..", "profile", "config.yml");
 
 const valid = {
-	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna"],
+	fast: ["anthropic/claude-haiku-5-5", "openai-codex/gpt-5.6-luna"],
 	standard: ["anthropic/claude-sonnet-5-5", "moonshot/kimi-k2.5"],
 	strong: ["anthropic/claude-opus-5-5"],
 	deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra"],
@@ -32,26 +33,24 @@ const problemsOf = (fn: () => unknown): string[] => {
 describe("profile template tier table", () => {
 	test("the shipped template parses and every tier has a row led by its ruled pin", () => {
 		const table = loadTierTable(TEMPLATE);
-		// SPEC-2.0.md § A1.3: today fast=haiku-4-5, standard=sonnet-5-5 (Jo, 2026-09-29), strong=opus-5-5, deep=fable-5-1.
-		expect(table.fast[0]).toBe("anthropic/claude-haiku-4-5");
+		// SPEC-2.0.md § A1.3: today fast=haiku-5-5, standard=sonnet-5-5 (Jo, 2026-09-29), strong=opus-5-5, deep=fable-5-1.
+		expect(table.fast[0]).toBe("anthropic/claude-haiku-5-5");
 		expect(table.standard[0]).toBe("anthropic/claude-sonnet-5-5");
 		expect(table.strong[0]).toBe("anthropic/claude-opus-5-5");
 		expect(table.deep[0]).toBe("anthropic/claude-fable-5-1");
-		// SPEC-2.0.md § B11: each row spreads across the three flat-rate providers.
+		// SPEC-2.0.md § B11: each row spreads across the flat-rate providers. Kimi is off the rows until
+		// Jo pays Moonshot (migration/items/kimi-off-tier-rows-until-paid.md restores the three-provider assertion).
 		for (const tier of TIERS) {
-			expect(new Set(table[tier].map(m => m.split("/")[0]))).toEqual(new Set(["anthropic", "openai-codex", "moonshot"]));
+			expect(new Set(table[tier].map(m => m.split("/")[0]))).toEqual(new Set(["anthropic", "openai-codex"]));
 		}
 	});
 
-	test("T17: each tier's Kimi entry is on moonshot (Jo, in-muq3zh77r02g3k), and no row names kimi-code", () => {
+	test("T17: no tier row names a kimi-lab entry (Kimi off the rows until paid)", () => {
 		const table = loadTierTable(TEMPLATE);
-		expect(Object.fromEntries(TIERS.map(tier => [tier, table[tier][2]]))).toEqual({
-			fast: "moonshot/kimi-k2.7-code-highspeed",
-			standard: "moonshot/kimi-k2.5",
-			strong: "moonshot/kimi-k2.7-code",
-			deep: "moonshot/kimi-k3",
-		});
-		expect(TIERS.flatMap(tier => table[tier]).filter(m => m.startsWith("kimi-code/"))).toEqual([]);
+		// migration/items/kimi-off-tier-rows-until-paid.md restores the original T17: each tier's [2] entry is
+		// moonshot (fast kimi-k2.7-code-highspeed, standard kimi-k2.5, strong kimi-k2.7-code, deep kimi-k3, Jo,
+		// in-muq3zh77r02g3k), and no row names kimi-code.
+		expect(TIERS.flatMap(tier => table[tier]).filter(m => labOf(m) === "kimi")).toEqual([]);
 	});
 
 	test("every fallback in the template stays on its tier: no entry reappears in a higher row", () => {

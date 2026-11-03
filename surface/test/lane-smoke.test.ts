@@ -13,13 +13,14 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { launchVerdict } from "../extensions/launch";
 import orchestratorSurface from "../index";
 import { recordRepo } from "../src/decision-log";
 import { branchName, doneBody, laneExit, laneStarted, worktreePath } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
-import { ctxOf, drainSettled, fakePi, fakeRecords, git, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, notices, setScript, settleDrains, sh, timers, until } from "./helpers";
+import { ctxOf, drainSettled, fakePi, fakeRecords, git, HOW_IT_FAILS, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, notices, setScript, settleDrains, sh, timers, until } from "./helpers";
 
 const roots: LaneRoot[] = [];
 // A root is removed only after settleDrains is done with it: every runner's drain (MIGRATION.md item 71) and every
@@ -72,7 +73,7 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 				{ tool: "lane_raise_question", args: { slice: "$slice", body: "push the branch now?", options: ["yes", "no"] } },
 			],
 		});
-		const opened = await call("orchestrator_open_workload", { brief: "Add a verify line to the README, no plan", done: "README.md carries a verify line", repo: r.repo });
+		const opened = await call("orchestrator_open_workload", { brief: `Add a verify line to the README, no plan${HOW_IT_FAILS}`, done: "README.md carries a verify line", repo: r.repo });
 		const wl = opened.details!.id as string;
 		expect(opened.text).toContain(`Opened ${wl} on ${r.repo}.`);
 		const lane1 = laneIdOf(wl, 1);
@@ -148,7 +149,7 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		roots.push(r);
 		const { call, f } = orchestrator(r);
 		setScript(r, { steps: [addSlice, { hang: true }] });
-		const opened = await call("orchestrator_open_workload", { brief: "Add a verify line to the README, no plan", done: "README.md carries a verify line", repo: r.repo });
+		const opened = await call("orchestrator_open_workload", { brief: `Add a verify line to the README, no plan${HOW_IT_FAILS}`, done: "README.md carries a verify line", repo: r.repo });
 		const wl = opened.details!.id as string;
 		const lane1 = laneIdOf(wl, 1);
 		await until("the lane's claim", () => laneSnapshot(r, wl).workload?.changed_by === lane1);
@@ -195,7 +196,7 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 				{ tool: "lane_release", args: {} },
 			],
 		});
-		const opened = await call("orchestrator_open_workload", { brief: "Add a verify line to the README, no plan", done: "README.md carries a verify line", repo: r.repo });
+		const opened = await call("orchestrator_open_workload", { brief: `Add a verify line to the README, no plan${HOW_IT_FAILS}`, done: "README.md carries a verify line", repo: r.repo });
 		const wl = opened.details!.id as string;
 		const lane1 = laneIdOf(wl, 1);
 		await exitOf(r, wl, lane1);
@@ -257,8 +258,10 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		const [notice] = await until("the tick's notice", () => (pushedNotices().length > 0 ? pushedNotices() : null));
 		const applied = notice!.message.content.split(APPLIED)[1]!.split("\n");
 		expect(applied).toHaveLength(1);
-		expect(applied[0]).toStartWith(`- tick: closed ${wl}: README.md carries a verify line — Decision-log entry `);
-		expect(applied[0]).toEndWith(` committed on ${branchName(wl)}; pushed to origin; PR opened: ${PR_URL}.`);
+		expect(applied[0]).toStartWith(`- tick: closed ${wl}:`);
+		expect(applied[0]).toContain(`](${pathToFileURL(join(r.repo, "README.md")).href})`);
+		expect(applied[0]).toContain(`<${PR_URL}>`);
+		expect(f.execs.calls.filter((c) => c.command === "bun")).toEqual([]);
 	}, 120_000);
 
 	test("the tick's close names a publish failure in its one notice line: gh failing leaves the entry committed and pushed, the close done, and Jo told there is no PR and why", async () => {
@@ -271,12 +274,21 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		await awake();
 		timers[0]!.fn();
 		await until("the tick's close", () => laneSnapshot(r, wl).workload?.status === "closed");
+		expect(git(r.repo, ["log", "--oneline", branchName(wl)]).out.split("\n")).toHaveLength(2);
+		expect(git(r.repo, ["log", "-1", "--format=%s", branchName(wl)]).out).toMatch(new RegExp(`^docs: decision-log entry .* \\(workload ${wl}\\)$`));
+		expect(git(r.repo, ["log", "--oneline", "main"]).out.split("\n")).toHaveLength(1);
 		expect(git(r.repo, ["ls-remote", "origin", `refs/heads/${branchName(wl)}`]).out.split(/\s/)[0]).toBe(git(r.repo, ["rev-parse", branchName(wl)]).out);
 		const [notice] = await until("the tick's notice", () => (pushedNotices().length > 0 ? pushedNotices() : null));
 		const applied = notice!.message.content.split(APPLIED)[1]!.split("\n");
 		expect(applied).toHaveLength(1);
-		expect(applied[0]).toStartWith(`- tick: closed ${wl}: README.md carries a verify line — Decision-log entry `);
-		expect(applied[0]).toEndWith(` committed on ${branchName(wl)}; pushed to origin; no PR: gh pr list exited 1: gh: not logged in; open one from ${branchName(wl)}.`);
+		expect(applied[0]).toStartWith(`- tick: closed ${wl}:`);
+		expect(applied[0]).toContain(`](${pathToFileURL(join(r.repo, "README.md")).href})`);
+		expect(applied[0]).toContain("no PR:");
+		expect(applied[0]).toContain("gh pr list exited 1");
+		expect(applied[0]).toContain("gh: not logged in");
+		expect(applied[0]).not.toContain(`<${PR_URL}>`);
+		expect(f.execs.calls.filter((c) => c.command === "gh").map((c) => c.args.slice(0, 2))).toEqual([["pr", "list"]]);
+		expect(f.execs.calls.filter((c) => c.command === "bun")).toEqual([]);
 	}, 120_000);
 
 	test("the tick does not close a workload awaiting close while a slice is open, and says so once per state: one notice after two ticks, again when the slice count changes", async () => {

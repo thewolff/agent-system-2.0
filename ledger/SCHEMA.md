@@ -18,10 +18,11 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
     followed to its target, then the not-yet-existing rest), so a symlink into a synced folder, a
     synced folder that is itself a symlink, a symlinked `$HOME`, and an existing or dangling
     database symlink are all refused ("… is inside …, a synced folder");
-  - any path whose mount is not local: on macOS, the mount entry for the path's mount point
-    (from `df -P` then `/sbin/mount`) must carry the `local` flag; on Linux, the `/proc/mounts`
-    filesystem type must not be a network type (`nfs`, `cifs`, `smbfs`, `sshfs`, and the rest
-    listed in `locality.ts`). A mount that cannot be determined is refused too.
+  - any path whose mount is not local, judged on the nearest existing ancestor in process (no
+    child process): on macOS, native `statfs` must report the `MNT_LOCAL` flag; on Linux, the
+    `/proc/self/mountinfo` entries of the path's device (`major:minor` of its `st_dev`) must not
+    carry a network filesystem type (`nfs`, `cifs`, `smbfs`, `fuse.sshfs`, and the rest listed in
+    `locality.ts`). A mount that cannot be determined is refused too.
 
   The module then opens the canonical path, so what was checked is what is opened
   (`Ledger#path` is that canonical path).
@@ -62,8 +63,9 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
     installer writes a launchd user agent that runs it every hour and once at load
     (`install/com.agent-system-2.ledger-backup.plist`, filled in and written to
     `$HOME/Library/LaunchAgents/com.agent-system-2.ledger-backup.plist`; its output goes to
-    `ledger-backup.log` beside the ledger). The installer never loads it. To load it, and to
-    unload it (unload before loading again after a re-install):
+    `ledger-backup.log` beside the ledger). The installer never loads it: it prints the bootstrap
+    line to run in your own Terminal, and `as2 doctor` fails `job:ledger-backup` until the job is
+    loaded. To load it, and to unload it (unload before loading again after a re-install):
 
     ```sh
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-system-2.ledger-backup.plist
@@ -138,6 +140,10 @@ time; any other writer may choose any id with the right prefix. A slice a lane d
 hand must also be a valid OMP agent id, `[A-Za-z0-9_-]{1,48}`, because the dispatch's `name` is the
 slice id and OMP would rename anything else (SPEC-2.0.md § B9; the classifier refuses the dispatch);
 the module's generated ids always are (`sl-` plus base36 characters, 17 in 2026).
+
+The suffix calculation reduces a safely representable integer, preserving low-word entropy rather
+than rounding a 64-bit random draw through a JavaScript Number. Six base36 characters remain a
+finite random space, not a uniqueness guarantee; duplicate IDs are still refused by the file.
 
 ### `workloads`
 

@@ -11,7 +11,7 @@ import { basename, dirname, join } from "node:path";
 import { BACKUP_SOURCE_FILE, backupNamespace, canonicalPath, Ledger, LiveLedgerUnderTestError } from "../../ledger/src/index";
 import { assertOwnedOnly, BACKUP_NAME, diffLines, diffReport, FIXTURE_DIR, GOLDEN_PATH, readManifest, refreeze, replayFixture, replaySnapshot, TIER_CONFIG_PATH, updateGolden } from "../scripts/ledger-replay";
 import { labOf } from "../src/lab";
-import { loadTierTable } from "../src/tier-table";
+import { tierTableFromConfig } from "../src/tier-table";
 
 test("the ledger replay matches golden.txt line for line", () => {
 	const names = readManifest().snapshots.map((s) => s.name);
@@ -228,13 +228,23 @@ test("a production review replays on the deep row with its OpenAI entry from the
 		try {
 			ledger.openWorkload({ id: "wl-prod", brief: "replay test", stakes: "production", mode: "autonomous", by: "orch-test" });
 			ledger.openWorkload({ id: "wl-normal", brief: "replay test", stakes: "normal", mode: "autonomous", by: "orch-test" });
-			const table = loadTierTable(TIER_CONFIG_PATH);
+			// Fixed three-lab rows, so the test does not follow whether the shipped profile carries a kimi entry.
+			const table = tierTableFromConfig({
+				task: {
+					agentModelOverrides: {
+						fast: ["anthropic/claude-haiku-5-5", "openai-codex/gpt-5.6-luna:low", "moonshot/kimi-k2.7-code-highspeed"],
+						standard: ["openai-codex/gpt-6-luna", "anthropic/claude-sonnet-5-5", "moonshot/kimi-k2.5"],
+						strong: ["anthropic/claude-opus-5-5:high", "openai-codex/gpt-6-sol:high", "moonshot/kimi-k2.7-code"],
+						deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra:xhigh", "moonshot/kimi-k3"],
+					},
+				},
+			});
 			// The two workloads may open in one millisecond, which makes the replay's created_at order unfixed: compare by workload id.
 			const lines = (t: typeof table) =>
 				replaySnapshot(ledger, "snap", "2026-10-12T00:00:00.000Z", t)
 					.map(l => [l.workload, l.tier, l.rowLabs, l.decision])
 					.sort((a, b) => a[0]!.localeCompare(b[0]!));
-			// The profile's strong row has an OpenAI entry: the deep review row keeps all three labs.
+			// The strong row has an OpenAI entry: the deep review row keeps all three labs.
 			expect(lines(table)).toEqual([
 				["wl-normal", "strong", "anthropic,openai,kimi", "single:anthropic,openai,kimi"],
 				["wl-prod", "deep", "anthropic,openai,kimi", "fanout:anthropic,openai,kimi"],

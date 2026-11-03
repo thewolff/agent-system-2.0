@@ -4,7 +4,7 @@
 # $HOME, and that the OMP profile lands under it too: config.yml rendered from profile/config.yml
 # with {repo} filled, models.yml beside it, the six tier files linked into agents/, and OMP's own
 # skill discovery under that HOME and profile listing exactly the manifest's `skill` rows (the
-# 24 of DESIGN-2.0.md § C6.1, including 2 from vendored plugins) with decoy skills planted in ~/.claude and ~/.agents not among them,
+# 25 of DESIGN-2.0.md § C6.1's 22 plus 3 from vendored plugins) with decoy skills planted in ~/.claude and ~/.agents not among them,
 # and OMP's own extension loading under that HOME and profile loading exactly the four configured
 # extensions in the order surface, gates, classifier, plugins, with no load error. The launcher
 # (`launcher` rows, bin/as2) is linked at $HOME/.local/bin/as2, `as2 --print` prints the exact omp
@@ -14,10 +14,14 @@
 # providers the profile routes to with the once-per-profile /login (M7 finding 2); the eleven
 # look-and-feel keys copied from Jo's default profile are in the rendered profile at their values
 # and the installed OMP reads each one back. The profile's mcp.json (profile/mcp.json) lands beside
-# config.yml and OMP's own MCP discovery under that HOME and profile finds exactly the ctx server,
-# from that file, with decoy servers planted in the default profile's mcp.json and ~/.claude.json
-# not among them; and the profile's sessions directory is a named ctx `pi` history root under that
-# HOME's ctx data root, registered once however often install runs (M8 ctx wiring).
+# config.yml and OMP's own MCP discovery under that HOME and profile finds exactly the ctx, linear and
+# posthog servers, from that file (definitions only; no credential is needed), with decoy servers
+# planted in the default profile's mcp.json and ~/.claude.json not among them; and the profile's
+# sessions directory is a named ctx `pi` history root under that
+# HOME's ctx data root, registered once however often install runs (M8 ctx wiring). And the clone's
+# plugins/test/by-hand-session.test.ts passes: a real `as2 lane` by-hand session under a profile
+# rendered by the clone's installer gets prompt.md, reads the 3 vendored skills from the clone and is
+# offered each pair tool once, while a hand, an autonomous lane and the orchestrator get none.
 # Also proves the refusals: an unmanifested file or any symbolic link under a machinery
 # directory fails install; a wrong, missing or duplicated ledger-schema row fails install; a
 # profile whose includeSkills differs from the manifest fails install and writes no profile; a
@@ -45,6 +49,16 @@
 # the plist; both flags in one run load both jobs and both =off forms remove both; an unknown form,
 # a flag given twice and an =off form with an installing flag are refused with exit 2 and nothing
 # written. No real launchctl runs.
+# And the daily self-heal report job (macOS, step 15, wl-mvbcjageg7o2yo), the same way as step 14:
+# --daily-report writes a plist that lints, runs surface/scripts/daily-report.ts at 07:00 with absolute
+# paths, the ledger and the profile install wrote and the system PATH, logging under
+# ~/agent-scratch/agent-system-2.0/self-heal, and bootstraps it; =off boots it out and deletes it.
+# Every install ends in the full as2 doctor (PLAN wl-mvwks11ye3x9zu, install.sh F8), and every install run here has the
+# clone's shared doctor fakes (surface/test/fixtures/doctor-fakes: launchctl, gh, osascript, dscl and the rest) first on
+# PATH with AS2_FAKE_STATE naming a healthy fake machine for that run's HOME, so its probes never reach this machine's
+# launchd, gh or notifications. ctx goes through a wrapper: `ctx daemon` (the doctor's probe) answers from the fake, and
+# every other ctx call (install's history-root registration, checked in step 3e) goes to the real ctx when one is on
+# PATH, else to the fake. Step 13's fake launchctl answers the doctor's `print`s from the same fake machine.
 #
 # Usage:   bash install/fresh-machine-test.sh
 # Env:     FRESH_TEST_ROOT  where the temp clone and temp HOME go (default: ${TMPDIR:-/tmp})
@@ -72,14 +86,38 @@ FAKE_HOME="$WORK/home"
 SQLITE3="$(command -v sqlite3)"
 [ -x /usr/bin/sqlite3 ] && SQLITE3=/usr/bin/sqlite3
 
+# Never register a real plugin from this throwaway clone, even when herdr is installed on the
+# developer's PATH. T5's Bun test records and asserts the link command separately.
+HERDR_TEST_BIN="$WORK/fake-herdr-bin"
+mkdir -p "$HERDR_TEST_BIN"
+printf '#!/bin/sh\nexit 0\n' >"$HERDR_TEST_BIN/herdr"
+chmod 755 "$HERDR_TEST_BIN/herdr"
+export PATH="$HERDR_TEST_BIN:$PATH"
+
 step() { printf '\n==> %s\n' "$*"; }
 ok() { printf 'PASS: %s\n' "$*"; }
 die() { printf 'FAIL: %s\n' "$*"; exit 1; }
 
 # Run the clone's installer as a fresh machine would: only PATH and the temp HOME, nothing else
-# inherited (no OMP_*, no AGENT_SYSTEM_LEDGER_DB). Extra VAR=value pairs may follow.
+# inherited (no OMP_*, no AGENT_SYSTEM_LEDGER_DB), with the doctor's fakes first on PATH and the fake machine for
+# $FAKE_HOME (both set up after step 2). Extra VAR=value pairs may follow.
 run_install() {
-	env -i PATH="$PATH" HOME="$FAKE_HOME" "$@" bash "$CLONE/install/install.sh"
+	env -i PATH="$DOCTOR_PATH:$PATH" HOME="$FAKE_HOME" AS2_FAKE_STATE="$DOCTOR_STATE" "$@" bash "$CLONE/install/install.sh"
+}
+
+# A healthy fake machine for the closing doctor at $1 (the fake state directory) for an install into HOME $2: the shared
+# healthy state (writeHealthyState; its seat is this script's shell, running in the clone), except that ledger-backup is
+# the job that install writes under $2, loaded from that plist and not yet run, so the doctor judges it by the fresh
+# mtime every install gives the plist. Phoenix and the doctor job are not installed: $2 is not this user's home (fake dscl).
+make_doctor_state() {
+	bun -e '
+		const [fakes, state, home, repo, pid, bun] = process.argv.slice(1);
+		const f = await import(`${fakes}/state.ts`);
+		f.writeHealthyState({ state, home: `${state}/healthy-home`, repo, seatPid: Number(pid), bun });
+		const log = `${home}/.agent-system-2/ledger-backup.log`;
+		f.setFake(state, `plutil/${f.LEDGER_BACKUP_LABEL}.plist.json`, JSON.stringify({ Label: f.LEDGER_BACKUP_LABEL, ProgramArguments: [bun], StartInterval: 3600, StandardOutPath: log, StandardErrorPath: log }));
+		f.setFake(state, `launchctl/${f.LEDGER_BACKUP_LABEL}`, f.launchctlPrint({ label: f.LEDGER_BACKUP_LABEL, path: f.plistPath(home, f.LEDGER_BACKUP_LABEL), log, runs: 0, exit: "never" }));
+	' "$DOCTOR_FAKES" "$1" "$2" "$CLONE" "$$" "$(type -P bun)" || die "could not write the doctor's fake machine at $1 for HOME $2"
 }
 
 printf 'fresh-machine install test\n'
@@ -106,6 +144,27 @@ else
 	ok "overlay done"
 fi
 
+step "2b. the doctor's fakes first on every install's PATH, and a healthy fake machine for $FAKE_HOME"
+DOCTOR_FAKES="$CLONE/surface/test/fixtures/doctor-fakes"
+[ -x "$DOCTOR_FAKES/launchctl" ] || die "no doctor fakes at $DOCTOR_FAKES"
+REAL_CTX="$(type -P ctx || true)"
+DOCTOR_BIN="$WORK/doctor-ctx-bin"
+mkdir -p "$DOCTOR_BIN"
+{
+	printf '#!/bin/sh\n'
+	printf '# fresh-machine-test.sh: the doctor'"'"'s probe (ctx daemon ...) answers from the fake; any other ctx call goes to %s.\n' "${REAL_CTX:-the fake (no real ctx on PATH)}"
+	printf '[ "$1" != daemon ] || exec %q "$@"\n' "$DOCTOR_FAKES/ctx"
+	printf 'exec %q "$@"\n' "${REAL_CTX:-$DOCTOR_FAKES/ctx}"
+} >"$DOCTOR_BIN/ctx"
+chmod 755 "$DOCTOR_BIN/ctx"
+DOCTOR_PATH="$DOCTOR_BIN:$DOCTOR_FAKES"
+for tool in launchctl gh osascript dscl; do
+	[ "$(PATH="$DOCTOR_PATH:$PATH" type -P "$tool")" = "$DOCTOR_FAKES/$tool" ] || die "test setup: $tool on the install PATH is not the doctor's fake"
+done
+DOCTOR_STATE="$WORK/doctor-fakes-state"
+make_doctor_state "$DOCTOR_STATE" "$FAKE_HOME"
+ok "doctor fakes $DOCTOR_FAKES first on the install PATH (ctx through $DOCTOR_BIN/ctx); fake machine at $DOCTOR_STATE"
+
 step "3. install with a temp HOME: $FAKE_HOME"
 mkdir -p "$FAKE_HOME"
 run_install || die "install exited $?"
@@ -122,6 +181,7 @@ grep -qF -- "- \"$CLONE/classifier/extension.ts\"" "$PROFILE/config.yml" || die 
 grep -qF -- "- \"$CLONE/gates/index.ts\"" "$PROFILE/config.yml" || die "rendered config does not name the gates extension by the clone's path"
 grep -qF -- "- \"$CLONE/plugins/ask-graham/skills\"" "$PROFILE/config.yml" || die "rendered config does not point customDirectories at $CLONE/plugins/ask-graham/skills"
 grep -qF -- "- \"$CLONE/plugins/i-have-audhd/skills\"" "$PROFILE/config.yml" || die "rendered config does not point customDirectories at $CLONE/plugins/i-have-audhd/skills"
+grep -qF -- "- \"$CLONE/plugins/paired-coding/skills\"" "$PROFILE/config.yml" || die "rendered config does not point customDirectories at $CLONE/plugins/paired-coding/skills"
 cmp -s "$CLONE/profile/models.yml" "$PROFILE/models.yml" || die "models.yml under the profile differs from profile/models.yml"
 ok "config.yml rendered with {repo}=$CLONE; models.yml placed beside it"
 TIERS="$(cd "$CLONE/tiers" && find . -maxdepth 1 -name '*.md' -type f | sed 's|^\./||' | LC_ALL=C sort)"
@@ -144,7 +204,7 @@ done
 # the names, WANT_AT each name with the exact file it must be discovered from.
 WANT_AT="$(awk -F'\t' -v clone="$CLONE" '$2 == "skill" { n = $1; sub(/\/SKILL\.md$/, "", n); sub(/^.*\//, "", n); print n "\t" clone "/" $1 }' "$CLONE/install/manifest.tsv" | LC_ALL=C sort)"
 WANT="$(printf '%s\n' "$WANT_AT" | cut -f1)"
-[ "$(printf '%s' "$WANT" | grep -c .)" -eq 24 ] || die "manifest has $(printf '%s' "$WANT" | grep -c .) skill rows, expected 24 (DESIGN-2.0.md § C6.1's 22 plus the 2 vendored plugin skills)"
+[ "$(printf '%s' "$WANT" | grep -c .)" -eq 25 ] || die "manifest has $(printf '%s' "$WANT" | grep -c .) skill rows, expected 25 (DESIGN-2.0.md § C6.1's 22 plus the 3 vendored plugin skills)"
 # The listing goes through the installed omp package's own discovery (Settings → cfgSkills →
 # discoverSkills), the code path the CLI uses (sdk.ts `cfgSkills.get(settings)`; OMP 18.4.4 has no
 # Settings.getGroup, which this step called on 18.3.0); omp has no skill-listing subcommand.
@@ -170,7 +230,7 @@ grep -q 'decoy' "$LISTING" && die "a decoy skill was discovered"
 GOT_AT="$(awk -F'\t' 'NF == 3 && $1 != "warning" { print $1 "\t" $3 }' "$LISTING" | LC_ALL=C sort)"
 [ "$GOT_AT" = "$WANT_AT" ] || die "a discovered skill does not come from its manifest row's file; got: $(printf '%s' "$GOT_AT" | tr '\n' ' ')"
 grep -q '^warning' "$LISTING" && die "skill discovery reported warnings"
-ok "exactly 24 skills discovered, each from its manifest row's file (22 under $CLONE/skills, 2 under $CLONE/plugins/*/skills), no decoy, no warnings; listing kept at $LISTING"
+ok "exactly 25 skills discovered, each from its manifest row's file (22 under $CLONE/skills, 3 under $CLONE/plugins/*/skills), no decoy, no warnings; listing kept at $LISTING"
 
 # The same package's extension loading, as a session does it (sdk.ts discoverSessionExtensionPaths:
 # cfgExtensions + cfgDisabledExtensions read from settings — OMP 18.4.4 has no Settings.get —
@@ -198,17 +258,18 @@ EXT_WANT="$(printf 'loaded\t%s\n' "$CLONE/surface/index.ts" "$CLONE/gates/index.
 [ "$(cat "$EXT_LISTING")" = "$EXT_WANT" ] || die "OMP did not load exactly surface, gates, classifier, plugins in that order"
 ok "OMP loaded exactly four extensions, in order: surface, gates, classifier, plugins (the rendered config's order); no load errors; listing kept at $EXT_LISTING"
 
-# Clash C11 (plugins/VENDOR.md): installed copies of i-have-audhd and ask-graham must not load beside
-# plugins/index.ts. A project plugin root (<anchor>/.omp/plugins, extensibility/plugins/loader.ts
-# loadEnabledPlugins) seeded with both, plus a control plugin, under a fresh anchor dir: the control
-# loads (the seeding reaches discovery), the two disabled names do not, plugins/index.ts still does.
+# Clash C11 (plugins/VENDOR.md): installed copies of i-have-audhd, ask-graham and paired-coding must
+# not load beside plugins/index.ts. A project plugin root (<anchor>/.omp/plugins,
+# extensibility/plugins/loader.ts loadEnabledPlugins) seeded with all three, plus a control plugin,
+# under a fresh anchor dir: the control loads (the seeding reaches discovery), the three disabled
+# names do not, plugins/index.ts still does.
 DECOY_DIR="$WORK/plugin-decoy"
-for p in i-have-audhd ask-graham decoy-control; do
+for p in i-have-audhd ask-graham paired-coding decoy-control; do
 	mkdir -p "$DECOY_DIR/.omp/plugins/node_modules/$p/omp"
 	printf '{"name":"%s","version":"0.0.1","omp":{"extensions":["omp/%s-omp.ts"]}}\n' "$p" "$p" >"$DECOY_DIR/.omp/plugins/node_modules/$p/package.json"
 	printf 'export default function () {}\n' >"$DECOY_DIR/.omp/plugins/node_modules/$p/omp/$p-omp.ts"
 done
-printf '{"plugins":{"i-have-audhd":{"version":"0.0.1","enabled":true},"ask-graham":{"version":"0.0.1","enabled":true},"decoy-control":{"version":"0.0.1","enabled":true}}}\n' >"$DECOY_DIR/.omp/plugins/omp-plugins.lock.json"
+printf '{"plugins":{"i-have-audhd":{"version":"0.0.1","enabled":true},"ask-graham":{"version":"0.0.1","enabled":true},"paired-coding":{"version":"0.0.1","enabled":true},"decoy-control":{"version":"0.0.1","enabled":true}}}\n' >"$DECOY_DIR/.omp/plugins/omp-plugins.lock.json"
 DECOY_LISTING="$WORK/extension-listing-plugin-decoy.txt"
 (cd "$DECOY_DIR" && env -i PATH="$PATH" HOME="$FAKE_HOME" OMP_PROFILE=agent-system-2 bun -e "
 	const m = await import('$OMP_PKG/src/index.ts');
@@ -223,9 +284,9 @@ DECOY_LISTING="$WORK/extension-listing-plugin-decoy.txt"
 sed 's/^/  /' "$DECOY_LISTING"
 grep -q '^error' "$DECOY_LISTING" && die "OMP reported an extension load error with seeded plugin copies"
 grep -qF "/decoy-control/omp/decoy-control-omp.ts" "$DECOY_LISTING" || die "the seeded control plugin did not load, so the C11 check is vacuous"
-grep -qE '/(i-have-audhd|ask-graham)/omp/[a-z-]+-omp\.ts$' "$DECOY_LISTING" && die "an installed copy of i-have-audhd or ask-graham loaded beside plugins/index.ts (clash C11)"
+grep -qE '/(i-have-audhd|ask-graham|paired-coding)/omp/[a-z-]+-omp\.ts$' "$DECOY_LISTING" && die "an installed copy of i-have-audhd, ask-graham or paired-coding loaded beside plugins/index.ts (clash C11)"
 grep -qxF "$(printf 'loaded\t%s' "$CLONE/plugins/index.ts")" "$DECOY_LISTING" || die "plugins/index.ts did not load with seeded plugin copies"
-ok "seeded installed copies of i-have-audhd and ask-graham stay unloaded (disabledExtensions), the control plugin and plugins/index.ts load; listing kept at $DECOY_LISTING"
+ok "seeded installed copies of i-have-audhd, ask-graham and paired-coding stay unloaded (disabledExtensions), the control plugin and plugins/index.ts load; listing kept at $DECOY_LISTING"
 
 step "3c2. under the rendered profile OMP skips its first-launch wizard (M7 finding 2) and reads Jo's look-and-feel keys"
 # The installed omp package's own reads, as main.ts's cold-launch gate does them: setupVersion from
@@ -282,11 +343,32 @@ printf '%s\n' "$reinstall_out" | grep -qF "note: $FAKE_HOME/.local/bin is not on
 LOGIN_WANT="==> first launch: this profile routes to anthropic, openai-codex, moonshot, typesafe; OMP needs a login to each once per profile: run /login in the as2 session (credentials stay in $PROFILE/agent.db)"
 [ "$(printf '%s\n' "$reinstall_out" | tail -n 1)" = "$LOGIN_WANT" ] || die "install's last line is '$(printf '%s\n' "$reinstall_out" | tail -n 1)', expected '$LOGIN_WANT'"
 ok "install's last line names the four providers and the once-per-profile /login"
+# The closing doctor (install.sh 6g) ran against the fake machine, passed, and came before install complete.
+doctor_line="$(printf '%s\n' "$reinstall_out" | grep -nE '^as2 doctor: [0-9]+ pass, 0 fail, ' || true)"
+complete_line="$(printf '%s\n' "$reinstall_out" | grep -n '^==> install complete: ' || true)"
+[ -n "$doctor_line" ] && [ -n "$complete_line" ] && [ "${doctor_line%%:*}" -lt "${complete_line%%:*}" ] \
+	|| die "install's output has no passing as2 doctor summary before install complete"
+grep -qxF "ctx daemon status --format json" "$DOCTOR_STATE/calls.log" || die "the closing doctor never asked the fake ctx ($DOCTOR_STATE/calls.log)"
+grep -qxF "launchctl print gui/$(id -u)/com.agent-system-2.ledger-backup" "$DOCTOR_STATE/calls.log" || die "the closing doctor never asked the fake launchctl ($DOCTOR_STATE/calls.log)"
+ok "the closing doctor passed against the fake machine (${doctor_line#*:}) before install complete"
+# Phoenix is on by default on macOS (wl-mv65t5d34lts00 PLAN.md § 8.1; install.sh step 6e is macOS only), but never
+# from a HOME that is not the user's own: this install's temp HOME must not replace the real gui/<uid> job with one
+# pointing into it.
+if [ "$(uname -s)" != Darwin ]; then
+	ok "not macOS: install has no Phoenix step; skipped"
+else
+	printf '%s\n' "$reinstall_out" | grep -qF "==> Phoenix: HOME ($FAKE_HOME) is not this user's home directory" \
+		|| die "install into the temp HOME did not skip the Phoenix LaunchAgent"
+	ok "install into a temp HOME skips the Phoenix LaunchAgent and says why"
+fi
 # The cwd is the clone the link resolves into, whatever directory as2 is run from (Jo's second session ran from ~/tmp);
 # the template's gates.cleanShell is "off", so no shell-start hook is dropped.
 # --print renders the base-prompt file first (voice + contract, surface/scripts/orchestrator-prompt.ts) and names it.
+# The tracing words lead: the rendered profile's observability.phoenix is all (wl-mv65t5d34lts00 PLAN.md § 8.1), so the
+# orchestrator gets the template's otel map, and env -i leaves no inherited OTEL_* name to unset.
 AS2_PROMPT="$FAKE_HOME/.agent-system-2/orchestrator/system.md"
-PRINT_WANT="env OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(cd -P "$CLONE" && pwd -P) --append-system-prompt $AS2_PROMPT"
+OTEL_WANT="OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:6006/v1/traces OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf OTEL_EXPORTER_OTLP_TRACES_TIMEOUT=2000 OTEL_TRACES_EXPORTER=otlp OTEL_LOGS_EXPORTER=none OTEL_METRICS_EXPORTER=none OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=none OTEL_SDK_DISABLED=false OTEL_SERVICE_NAME=as2-orchestrator OTEL_RESOURCE_ATTRIBUTES=openinference.project.name=as2-orchestrator,as2.role=orchestrator"
+PRINT_WANT="env $OTEL_WANT OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(cd -P "$CLONE" && pwd -P) --append-system-prompt $AS2_PROMPT"
 for sh in zsh bash; do
 	command -v "$sh" >/dev/null 2>&1 || die "$sh not found; the launcher is tested under zsh and bash"
 	got="$(env -i PATH="$FAKE_HOME/.local/bin:$PATH" HOME="$FAKE_HOME" "$sh" "$AS2" --print)" || die "$sh $AS2 --print exited $?"
@@ -330,8 +412,10 @@ diff "$PROFILE/config.yml" <(bun -e "process.stdout.write((await Bun.file('$CLON
 	|| die "as2 clean-shell off did not leave the rendered config as the template"
 ok "as2 clean-shell adds workload ids to a list once, sets all and off, refuses a bad id, and off leaves the template"
 
-step "3e. the ctx MCP server reaches the profile through its own mcp.json; its sessions are a ctx history root (M8 ctx wiring)"
-cmp -s "$CLONE/profile/mcp.json" "$PROFILE/mcp.json" || die "mcp.json under the profile differs from profile/mcp.json"
+step "3e. the ctx, linear and posthog MCP servers reach the profile through its own mcp.json; its sessions are a ctx history root (M8 ctx wiring)"
+# A fresh HOME has no installed mcp.json, so the merge's result is profile/mcp.json itself, re-serialized.
+bun -e 'const [a, b] = process.argv.slice(1).map((p) => JSON.stringify(JSON.parse(require("fs").readFileSync(p, "utf8")))); process.exit(a === b ? 0 : 1)' "$CLONE/profile/mcp.json" "$PROFILE/mcp.json" \
+	|| die "mcp.json under the profile is not profile/mcp.json"
 # Decoys where the default profile and Claude Code keep MCP servers: under the as2 profile OMP reads
 # its user MCP config from the profile's agent dir only (discovery/builtin.ts getAgentDir()), and the
 # Claude user source is opt-in (discovery/claude.ts getUserClaude), so neither may appear.
@@ -344,15 +428,15 @@ MCP_LISTING="$WORK/mcp-listing.txt"
 	const { loadAllMCPConfigs } = await import('$OMP_PKG/src/mcp/config.ts');
 	await m.Settings.loadReadOnly({ cwd: process.cwd(), agentDir: m.getAgentDir() });
 	const r = await loadAllMCPConfigs(process.cwd());
-	for (const [name, s] of Object.entries(r.sources)) console.log(name + '\t' + s.provider + '\t' + s.path + '\t' + [r.configs[name].command, ...(r.configs[name].args ?? [])].join(' '));
+	for (const [name, s] of Object.entries(r.sources)) console.log(name + '\t' + s.provider + '\t' + s.path + '\t' + (r.configs[name].url ?? [r.configs[name].command, ...(r.configs[name].args ?? [])].join(' ')));
 	process.exit(0);
 " >"$MCP_LISTING") || die "MCP discovery under $FAKE_HOME exited $?"
 sed 's/^/  /' "$MCP_LISTING"
-MCP_WANT="$(printf 'ctx\tnative\t%s\tctx mcp serve' "$PROFILE/mcp.json")"
-[ "$(cat "$MCP_LISTING")" = "$MCP_WANT" ] || die "OMP's MCP discovery under the profile is not exactly the ctx server from $PROFILE/mcp.json"
-ok "OMP discovers exactly one MCP server under the profile: ctx, from $PROFILE/mcp.json; the default-profile and ~/.claude.json decoys are not read"
+MCP_WANT="$(printf 'ctx\tnative\t%s\tctx mcp serve\nlinear\tnative\t%s\thttps://mcp.linear.app/mcp\nposthog\tnative\t%s\thttps://mcp.posthog.com/mcp' "$PROFILE/mcp.json" "$PROFILE/mcp.json" "$PROFILE/mcp.json")"
+[ "$(cat "$MCP_LISTING")" = "$MCP_WANT" ] || die "OMP's MCP discovery under the profile is not exactly ctx, linear and posthog from $PROFILE/mcp.json"
+ok "OMP discovers exactly three MCP servers under the profile: ctx, linear and posthog, from $PROFILE/mcp.json; the default-profile and ~/.claude.json decoys are not read"
 CTX_ROOT="omp-agent-system-2-sessions"
-if command -v ctx >/dev/null 2>&1; then
+if [ -n "$REAL_CTX" ]; then
 	[ -d "$PROFILE/sessions" ] || die "install did not create $PROFILE/sessions"
 	roots="$(env -i PATH="$PATH" HOME="$FAKE_HOME" ctx sources --provider pi --format json | bun -e '
 		for (const s of JSON.parse(await Bun.stdin.text()).sources) if (s.selection.kind === "configured") console.log(s.selection.root + "\t" + s.path + "\t" + s.status);
@@ -368,9 +452,18 @@ if command -v ctx >/dev/null 2>&1; then
 	[ "$(grep -c "^\[sources.roots.$CTX_ROOT\]\$" "$FAKE_HOME/.ctx/config.toml")" -eq 1 ] || die "$FAKE_HOME/.ctx/config.toml does not hold exactly one $CTX_ROOT entry"
 	ok "$PROFILE/sessions is ctx pi root $CTX_ROOT under $FAKE_HOME/.ctx; the re-install kept it (one entry in config.toml)"
 else
-	printf '%s\n' "$reinstall_out" | grep -qF "==> note: ctx is not on PATH" || die "ctx is absent and install did not say the root was not registered"
-	ok "ctx is not on PATH here; install said the root was not registered"
+	# No real ctx here: install's registration went through the wrapper to the doctor's fake ctx (step 2b), which logs it.
+	grep -qxF "ctx sources add --provider pi --root $PROFILE/sessions --replace $CTX_ROOT" "$DOCTOR_STATE/calls.log" \
+		|| die "no real ctx on PATH, and install did not register $PROFILE/sessions as $CTX_ROOT through the fake ($DOCTOR_STATE/calls.log)"
+	ok "no real ctx on PATH here; install registered $PROFILE/sessions as $CTX_ROOT through the doctor's fake ctx"
 fi
+
+step "3f. the by-hand lane session: \`as2 lane\` under a freshly rendered profile gets its prompt, the 3 vendored skills and the pair tools (PLAN-2 D6, R12)"
+# plugins/test/by-hand-session.test.ts runs the clone's bin/as2 lane by-hand path, an autonomous lane and the orchestrator
+# with the installed omp against a local stub model, under a HOME it renders with the clone's install.sh. It never skips.
+(cd "$CLONE" && env -i PATH="$PATH" HOME="$FAKE_HOME" TMPDIR="$WORK" bun test plugins/test/by-hand-session.test.ts) \
+	|| die "plugins/test/by-hand-session.test.ts failed in the clone"
+ok "the by-hand lane session receives prompt.md, lists the manifest's skills, reads the 3 vendored skills from the clone and is offered each pair tool once; the hand, the autonomous lane and the orchestrator get none"
 
 step "4. inspect the installed ledger with raw sqlite3"
 printf 'user_version=%s journal_mode=%s tables=%s triggers=%s integrity=%s\n' \
@@ -647,7 +740,9 @@ else
 	ODD_HOME="$WORK/home-@REPO@ & co"
 	ODD_DB="$WORK/db-@REPO@ & co/@REPO@&.db"
 	mkdir -p "$ODD_HOME"
-	env -i PATH="$PATH" HOME="$ODD_HOME" AGENT_SYSTEM_LEDGER_DB="$ODD_DB" bash "$CLONE/install/install.sh" >/dev/null \
+	ODD_STATE="$WORK/doctor-fakes-state-odd"
+	make_doctor_state "$ODD_STATE" "$ODD_HOME"
+	env -i PATH="$DOCTOR_PATH:$PATH" HOME="$ODD_HOME" AS2_FAKE_STATE="$ODD_STATE" AGENT_SYSTEM_LEDGER_DB="$ODD_DB" bash "$CLONE/install/install.sh" >/dev/null \
 		|| die "install with HOME=$ODD_HOME and ledger $ODD_DB exited $?"
 	ODD_PLIST="$ODD_HOME/Library/LaunchAgents/com.agent-system-2.ledger-backup.plist"
 	/usr/bin/plutil -lint "$ODD_PLIST" || die "the plist does not lint"
@@ -678,7 +773,10 @@ else
 	CHAOS_LOG="$FAKE_HOME/agent-scratch/agent-system-2.0/chaos/launchd.log"
 	# A fake launchctl first on PATH: it appends its argv (one line per call) to a log, and keeps one
 	# flag file per label so `print` answers as launchd does for that label (0 loaded, 113 not loaded);
-	# bootstrap names the plist, whose file name is the label plus .plist.
+	# bootstrap names the plist, whose file name is the label plus .plist. For the closing doctor, a `print` of a
+	# label the fake machine holds (ledger-backup) answers from the doctor's fake launchctl, a loaded label's `print`
+	# answers as launchd does for a job loaded from its plist and not yet run, and `bootstrap` stores the plist's JSON
+	# for the doctor's fake plutil.
 	FAKE_BIN="$WORK/fake-launchctl-bin"
 	LAUNCHCTL_LOG="$WORK/launchctl.log"
 	LOADED="$WORK/launchctl.loaded"
@@ -686,21 +784,28 @@ else
 	{
 		printf '#!/bin/bash\n'
 		printf 'printf "%%s\\n" "$*" >>%q\n' "$LAUNCHCTL_LOG"
+		printf 'l="${2##*/}"\n'
 		printf 'case "$1" in\n'
-		printf '\tprint) [ -e %q."${2##*/}" ] || { echo "Could not find service" >&2; exit 113; } ;;\n' "$LOADED"
-		printf '\tbootstrap) p="${3##*/}"; touch %q."${p%%.plist}" ;;\n' "$LOADED"
+		printf '\tprint) [ ! -e "$AS2_FAKE_STATE/launchctl/$l" ] || exec %q "$@"\n' "$DOCTOR_FAKES/launchctl"
+		printf '\t\t[ -e %q."$l" ] || { echo "Could not find service" >&2; exit 113; }\n' "$LOADED"
+		printf '\t\tp="$HOME/Library/LaunchAgents/$l.plist"; log="$(/usr/bin/plutil -extract StandardOutPath raw -o - "$p")" || exit 1\n'
+		printf '\t\tprintf "gui/%%s/%%s = {\\n\\tpath = %%s\\n\\tstate = not running\\n\\tstdout path = %%s\\n\\truns = 0\\n\\tlast exit code = (never exited)\\n}\\n" "$(id -u)" "$l" "$p" "$log" ;;\n'
+		printf '\tbootstrap) p="${3##*/}"; touch %q."${p%%.plist}"\n' "$LOADED"
+		printf '\t\tmkdir -p "$AS2_FAKE_STATE/plutil" && /usr/bin/plutil -convert json -o "$AS2_FAKE_STATE/plutil/$p.json" "$3" || exit 1 ;;\n'
 		printf '\tbootout) rm -f %q."${2##*/}" ;;\n' "$LOADED"
 		printf 'esac\n'
 	} >"$FAKE_BIN/launchctl"
 	chmod 755 "$FAKE_BIN/launchctl"
-	chaos_install() { env -i PATH="$FAKE_BIN:$PATH" HOME="$FAKE_HOME" bash "$CLONE/install/install.sh" "$@"; }
+	chaos_install() { env -i PATH="$FAKE_BIN:$DOCTOR_PATH:$PATH" HOME="$FAKE_HOME" AS2_FAKE_STATE="$DOCTOR_STATE" bash "$CLONE/install/install.sh" "$@"; }
 	launchctl_calls() { if [ -e "$LAUNCHCTL_LOG" ]; then cat "$LAUNCHCTL_LOG"; fi; }
+	# The closing doctor's `launchctl print` of each job it expects: ledger-backup, then each label given (inventory order).
+	doctor_prints() { printf 'print gui/%s/com.agent-system-2.ledger-backup\n' "$(id -u)"; for l in "$@"; do printf 'print %s\n' "$l"; done; }
 
 	[ ! -e "$CHAOS_PLIST" ] || die "the no-flag installs above wrote $CHAOS_PLIST"
 	chaos_install >/dev/null || die "no-flag install with the fake launchctl on PATH exited $?"
 	[ ! -e "$CHAOS_PLIST" ] || die "a no-flag install wrote $CHAOS_PLIST"
-	[ -z "$(launchctl_calls)" ] || die "a no-flag install ran launchctl: $(launchctl_calls)"
-	ok "no flag: no chaos plist under $FAKE_HOME/Library/LaunchAgents and no launchctl call"
+	[ "$(launchctl_calls)" = "$(doctor_prints)" ] || die "a no-flag install ran launchctl beyond the closing doctor's print: $(launchctl_calls)"
+	ok "no flag: no chaos plist under $FAKE_HOME/Library/LaunchAgents and no launchctl call but the closing doctor's print of ledger-backup"
 
 	chaos_install --chaos-nightly || die "install --chaos-nightly exited $?"
 	[ -f "$CHAOS_PLIST" ] || die "install --chaos-nightly wrote no plist at $CHAOS_PLIST"
@@ -735,13 +840,13 @@ else
 	' "$WORK/chaos-job.json" "$(type -P bun)" "$CLONE" "$FAKE_HOME" "$WANT_PATH" "$CHAOS_LOG" \
 		|| die "the chaos plist is not the expected job"
 	[ -d "$(dirname "$CHAOS_LOG")" ] || die "install did not create the log directory $(dirname "$CHAOS_LOG")"
-	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST")"
+	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST"; doctor_prints "$CHAOS_LABEL")"
 	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
 	ok "plist lints; four StartCalendarInterval entries (Minute 0, 15, 30, 45); absolute bun, chaos.ts, WorkingDirectory, HOME, PATH=$WANT_PATH and log; no ledger variable; bootstrapped into gui/$(id -u)"
 
 	rm -f "$LAUNCHCTL_LOG"
 	chaos_install --chaos-nightly >/dev/null || die "re-run of install --chaos-nightly exited $?"
-	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootout $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST")"
+	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootout $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST"; doctor_prints "$CHAOS_LABEL")"
 	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "re-run launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
 	ok "a re-run boots the loaded job out before bootstrapping the rewritten plist"
 
@@ -759,7 +864,7 @@ else
 	NO_OMP_BIN="$WORK/no-omp-bin"
 	mkdir -p "$NO_OMP_BIN"
 	ln -sf "$(type -P bun)" "$NO_OMP_BIN/bun"
-	NO_OMP_PATH="$FAKE_BIN:$NO_OMP_BIN:/usr/bin:/bin:/usr/sbin:/sbin"
+	NO_OMP_PATH="$FAKE_BIN:$DOCTOR_PATH:$NO_OMP_BIN:/usr/bin:/bin:/usr/sbin:/sbin"
 	(PATH="$NO_OMP_PATH"; type -P omp >/dev/null) && die "test setup: omp is still on $NO_OMP_PATH"
 	REFUSED_HOME="$WORK/chaos-refused-home"
 	mkdir -p "$REFUSED_HOME"
@@ -769,7 +874,7 @@ else
 		if [ "$args" = --chaos-nightly ]; then
 			out="$(env -i PATH="$NO_OMP_PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" "$args" 2>&1)"
 		else
-			out="$(env -i PATH="$FAKE_BIN:$PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" "$args" 2>&1)"
+			out="$(env -i PATH="$FAKE_BIN:$DOCTOR_PATH:$PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" "$args" 2>&1)"
 		fi
 		status=$?
 		set -e
@@ -820,13 +925,13 @@ else
 	' "$WORK/sweep-job.json" "$(type -P bun)" "$CLONE" "$FAKE_HOME" "$FAKE_HOME/.agent-system-2/ledger.db" "$SWEEP_LOG" \
 		|| die "the scratch sweep plist is not the expected job"
 	[ -d "$(dirname "$SWEEP_LOG")" ] || die "install did not create the log directory $(dirname "$SWEEP_LOG")"
-	CALLS_WANT="$(printf '%s\n' "print $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST")"
+	CALLS_WANT="$(printf '%s\n' "print $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST"; doctor_prints "$SWEEP_LABEL")"
 	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
 	ok "plist lints; StartCalendarInterval 04:30; absolute bun, scratch-sweep.ts, WorkingDirectory, HOME, ledger and log; system PATH; bootstrapped into gui/$(id -u)"
 
 	rm -f "$LAUNCHCTL_LOG"
 	chaos_install --scratch-sweep >/dev/null || die "re-run of install --scratch-sweep exited $?"
-	CALLS_WANT="$(printf '%s\n' "print $SWEEP_LABEL" "bootout $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST")"
+	CALLS_WANT="$(printf '%s\n' "print $SWEEP_LABEL" "bootout $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST"; doctor_prints "$SWEEP_LABEL")"
 	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "re-run launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
 	ok "a re-run boots the loaded job out before bootstrapping the rewritten plist"
 
@@ -844,7 +949,7 @@ else
 	rm -f "$LAUNCHCTL_LOG"
 	chaos_install --chaos-nightly --scratch-sweep >/dev/null || die "install --chaos-nightly --scratch-sweep exited $?"
 	[ -f "$CHAOS_PLIST" ] && [ -f "$SWEEP_PLIST" ] || die "install with both flags did not write both plists"
-	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST" "print $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST")"
+	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST" "print $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST"; doctor_prints "$SWEEP_LABEL" "$CHAOS_LABEL")"
 	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "both-flag launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
 	rm -f "$LAUNCHCTL_LOG"
 	chaos_install --chaos-nightly=off --scratch-sweep=off || die "install --chaos-nightly=off --scratch-sweep=off exited $?"
@@ -859,7 +964,70 @@ else
 	for args in "--scratch-sweep=on" "--scratch-sweep --scratch-sweep" "--scratch-sweep --chaos-nightly=off" "--scratch-sweep=off --chaos-nightly"; do
 		set +e
 		# shellcheck disable=SC2086 # each case is a list of flags
-		out="$(env -i PATH="$FAKE_BIN:$PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" $args 2>&1)"
+		out="$(env -i PATH="$FAKE_BIN:$DOCTOR_PATH:$PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" $args 2>&1)"
+		status=$?
+		set -e
+		printf '%s -> exit %s: %s\n' "$args" "$status" "$out"
+		[ "$status" -eq 2 ] || die "install $args exited $status, expected 2"
+	done
+	[ -z "$(find "$REFUSED_HOME" -mindepth 1)" ] || die "a refused flag still wrote under $REFUSED_HOME: $(find "$REFUSED_HOME" -mindepth 1)"
+	[ -z "$(launchctl_calls)" ] || die "a refused flag ran launchctl: $(launchctl_calls)"
+	ok "an unknown form, a flag given twice and an =off form with an installing flag are each refused with exit 2; nothing written, no launchctl call"
+fi
+
+step "15. the daily self-heal report: --daily-report writes and loads it, =off boots it out and deletes it, no flag writes none"
+if [ "$(uname -s)" != Darwin ]; then
+	ok "not macOS: --daily-report is refused there (no launchd); skipped"
+else
+	# Step 13's fake launchctl (one flag file per label) and its log, chaos_install and launchctl_calls.
+	REPORT_PLIST="$FAKE_HOME/Library/LaunchAgents/com.agent-system-2.daily-report.plist"
+	REPORT_LABEL="gui/$(id -u)/com.agent-system-2.daily-report"
+	REPORT_LOG="$FAKE_HOME/agent-scratch/agent-system-2.0/self-heal/launchd.log"
+	[ ! -e "$REPORT_PLIST" ] || die "the installs above, none with --daily-report, wrote $REPORT_PLIST"
+	ok "no flag: no daily report plist under $FAKE_HOME/Library/LaunchAgents"
+
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --daily-report || die "install --daily-report exited $?"
+	[ -f "$REPORT_PLIST" ] || die "install --daily-report wrote no plist at $REPORT_PLIST"
+	/usr/bin/plutil -lint "$REPORT_PLIST" || die "the daily report plist does not lint"
+	/usr/bin/plutil -convert json -o "$WORK/report-job.json" "$REPORT_PLIST"
+	printf 'daily report job: %s\n' "$(cat "$WORK/report-job.json")"
+	bun -e '
+		const [file, bun, repo, home, ledger, log] = process.argv.slice(1);
+		const job = JSON.parse(await Bun.file(file).text());
+		const want = {
+			Label: "com.agent-system-2.daily-report",
+			ProgramArguments: [bun, `${repo}/surface/scripts/daily-report.ts`],
+			EnvironmentVariables: { AGENT_SYSTEM_LEDGER_DB: ledger, AGENT_SYSTEM_PROFILE: "agent-system-2", HOME: home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+			WorkingDirectory: repo,
+			StartCalendarInterval: { Hour: 7, Minute: 0 },
+			ProcessType: "Background",
+			StandardOutPath: log,
+			StandardErrorPath: log,
+		};
+		const canon = (v) => Array.isArray(v) ? v.map(canon) : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon(v[k])])) : v;
+		if (JSON.stringify(canon(job)) !== JSON.stringify(canon(want))) { console.error(`daily report job differs; want ${JSON.stringify(want)}`); process.exit(1); }
+	' "$WORK/report-job.json" "$(type -P bun)" "$CLONE" "$FAKE_HOME" "$FAKE_HOME/.agent-system-2/ledger.db" "$REPORT_LOG" \
+		|| die "the daily report plist is not the expected job"
+	[ -d "$(dirname "$REPORT_LOG")" ] || die "install did not create the log directory $(dirname "$REPORT_LOG")"
+	CALLS_WANT="$(printf '%s\n' "print $REPORT_LABEL" "bootstrap gui/$(id -u) $REPORT_PLIST"; doctor_prints "$REPORT_LABEL")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	ok "plist lints; StartCalendarInterval 07:00; absolute bun, daily-report.ts, WorkingDirectory, HOME, ledger, profile and log; system PATH; bootstrapped into gui/$(id -u)"
+
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --daily-report=off || die "install --daily-report=off exited $?"
+	[ ! -e "$REPORT_PLIST" ] || die "--daily-report=off left $REPORT_PLIST"
+	CALLS_WANT="$(printf '%s\n' "print $REPORT_LABEL" "bootout $REPORT_LABEL")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "=off launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	ok "=off booted the job out of $REPORT_LABEL and deleted the plist"
+
+	REFUSED_HOME="$WORK/report-refused-home"
+	mkdir -p "$REFUSED_HOME"
+	rm -f "$LAUNCHCTL_LOG"
+	for args in "--daily-report=on" "--daily-report --daily-report" "--daily-report --scratch-sweep=off" "--daily-report=off --train-tick"; do
+		set +e
+		# shellcheck disable=SC2086 # each case is a list of flags
+		out="$(env -i PATH="$FAKE_BIN:$DOCTOR_PATH:$PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" $args 2>&1)"
 		status=$?
 		set -e
 		printf '%s -> exit %s: %s\n' "$args" "$status" "$out"

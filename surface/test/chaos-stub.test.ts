@@ -23,7 +23,7 @@ const OMP = Bun.which("omp");
 const BUN = process.execPath;
 const PROFILE = "chaos-test";
 const NONCE = `chaos-${Date.now().toString(36)}`;
-const CHAT = "anthropic/claude-haiku-4-5";
+const CHAT = "anthropic/claude-haiku-5-5";
 const PROBE_TOOL_OUT = "chaos-tool-ok";
 
 /** One scripted kind: a bash tool turn, then a text reply. Every request matches it. */
@@ -72,6 +72,7 @@ describe.skipIf(OMP === null)("chaos stub and proxy against the installed omp", 
 	let proxy: Proxy;
 	let env: Record<string, string>;
 	let profile: StubProfile;
+	let rowProviders: string[];
 
 	beforeAll(() => {
 		root = realpathSync(mkdtempSync(join(tmpdir(), "chaos-stub-")));
@@ -84,12 +85,15 @@ describe.skipIf(OMP === null)("chaos stub and proxy against the installed omp", 
 		// provider retries so the un-routed probe fails once instead of backing off for minutes. The shipped
 		// tier rows (task.agentModelOverrides) name the providers the run's hands use, which stay enabled.
 		copyFileSync(join(REPO, "profile", "models.yml"), join(agentDir, "models.yml"));
-		const shipped = Bun.YAML.parse(readFileSync(join(REPO, "profile", "config.yml"), "utf8")) as { task: unknown };
+		const shipped = Bun.YAML.parse(readFileSync(join(REPO, "profile", "config.yml"), "utf8")) as { task: { agentModelOverrides: Record<string, string[]> } };
+		// The providers the shipped tier rows name; moonshot is among them again once migration/items/kimi-off-tier-rows-until-paid.md restores its entries.
+		rowProviders = [...new Set(Object.values(shipped.task.agentModelOverrides).flat().map((m) => m.split("/")[0]!))];
 		const config = { setupVersion: 2, modelRoles: { judge: "typesafe/jev-1.13.0" }, retry: { enabled: false, fallbackChains: { judge: [] } }, task: shipped.task };
 		writeFileSync(join(agentDir, "config.yml"), `${JSON.stringify(config)}\n`);
 		proxy = startProxy();
 		stub = startStub({ nonce: NONCE, scripts: [PROBE] });
-		profile = writeStubProfile(agentDir, stub.port, { unrouted: ["minimax", "groq"] });
+		// moonshot stays routed and enabled: run (1) names a moonshot model explicitly, whether or not the shipped tier rows do.
+		profile = writeStubProfile(agentDir, stub.port, { unrouted: ["minimax", "groq"], enabled: ["moonshot"] });
 		const proxyUrl = proxy.url;
 		env = {
 			PATH: [dirname(BUN), dirname(OMP!), "/usr/bin", "/bin"].join(":"),
@@ -126,7 +130,7 @@ describe.skipIf(OMP === null)("chaos stub and proxy against the installed omp", 
 		expect(config.modelRoles.judge).toBe("typesafe/jev-1.13.0");
 		expect(config.retry.enabled).toBe(false); // keys the writer does not own are kept
 		for (const role of ROLE_IDS) expect(config.retry.fallbackChains[role]).toEqual([]);
-		for (const p of ["anthropic", "openai-codex", "moonshot", "typesafe", "minimax", "groq"]) expect(profile.enabledProviders).toContain(p);
+		for (const p of [...rowProviders, "typesafe", "minimax", "groq"]) expect(profile.enabledProviders).toContain(p);
 		for (const p of ["openrouter", "bedrock-mantle", "ollama"]) expect(config.disabledProviders).toContain(p);
 		expect(config.disabledProviders.filter((p) => profile.enabledProviders.includes(p))).toEqual([]);
 		for (const selector of Object.values(config.modelRoles)) expect(config.disabledProviders).not.toContain(selector.split("/")[0]);

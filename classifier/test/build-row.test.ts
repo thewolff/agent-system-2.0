@@ -11,7 +11,7 @@ import { TIERS } from "../src/route";
 import { loadTierTable, tierTableFromConfig } from "../src/tier-table";
 
 const ROWS = {
-	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna:low", "moonshot/kimi-k2.7-code-highspeed"],
+	fast: ["anthropic/claude-haiku-5-5", "openai-codex/gpt-5.6-luna:low", "moonshot/kimi-k2.7-code-highspeed"],
 	standard: ["openai-codex/gpt-6-luna", "anthropic/claude-sonnet-5-5", "moonshot/kimi-k2.5", "openai/gpt-6-luna"],
 	strong: ["anthropic/claude-opus-5-5:high", "openai-codex/gpt-6-sol:high", "kimi-code/kimi-for-coding", "moonshot/kimi-k2.7-code"],
 	deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra:xhigh"],
@@ -22,7 +22,7 @@ const LANE = { anthropic: "anthropic/claude-opus-5-5", openai: "openai-codex/gpt
 describe("buildRow", () => {
 	test("every lab, every tier: the row's entries of the lane's lab, in row order, suffixes kept", () => {
 		const expected = {
-			anthropic: { fast: ["anthropic/claude-haiku-4-5"], standard: ["anthropic/claude-sonnet-5-5"], strong: ["anthropic/claude-opus-5-5:high"], deep: ["anthropic/claude-fable-5-1"] },
+			anthropic: { fast: ["anthropic/claude-haiku-5-5"], standard: ["anthropic/claude-sonnet-5-5"], strong: ["anthropic/claude-opus-5-5:high"], deep: ["anthropic/claude-fable-5-1"] },
 			openai: {
 				fast: ["openai-codex/gpt-5.6-luna:low"],
 				standard: ["openai-codex/gpt-6-luna", "openai/gpt-6-luna"],

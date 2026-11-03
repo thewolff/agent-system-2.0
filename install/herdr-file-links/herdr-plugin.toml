@@ -1,0 +1,18 @@
+id = "as2.file-links"
+name = "as2 file links"
+version = "1.0.0"
+min_herdr_version = "0.9.0"
+description = "Open local file links from as2 replies, or their existing parent folder. Requires Bun."
+platforms = ["macos"]
+
+# Herdr runs argv commands with the plugin root as cwd; no shell expansion in the manifest.
+[[actions]]
+id = "open-file"
+title = "Open local file"
+command = ["/bin/sh", "./open-file.sh"]
+
+[[link_handlers]]
+id = "file"
+title = "Open local file"
+pattern = "^file://"
+action = "open-file"

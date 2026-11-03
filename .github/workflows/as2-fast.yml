@@ -1,0 +1,134 @@
+# as2's hosted fast check (PLAN wl-mvq4edbaf13vnk D3; modelled on the Linux probe of 2026-10-27, linux-probe.yml on
+# plumb/linux-probe). The test runner dispatches it on ref `as2-verified`, so these steps are always the verified
+# commit's, never the tested head's. It checks out `sha`, reproduces the runner's child env and layout as the probe did,
+# and runs ONE `bun test` call on `files` with a JUnit reporter under testRunner.fastCapMin (10 minutes). It uploads the
+# JUnit, the console log and an exit summary as the artifact `as2-fast-<request>`; the runner downloads and judges them.
+# It posts nothing: no status, no comment, no check (read-only token).
+name: as2-fast
+run-name: as2-fast ${{ inputs.request }} at ${{ inputs.sha }}
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: The full 40-hex commit sha to test (the PR head with main merged in).
+        required: true
+        type: string
+      files:
+        description: The fast set, space-separated, each ./<repo-relative path> to a Bun test file.
+        required: true
+        type: string
+      request:
+        description: The runner's request id (tr-<a-z0-9>), naming the run and its artifact.
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    # A bound on the whole job: setup plus the one bun call, whose own cap is 10 minutes (below).
+    timeout-minutes: 20
+    env:
+      SHA: ${{ inputs.sha }}
+      FILES: ${{ inputs.files }}
+      REQUEST: ${{ inputs.request }}
+      # The probe's layout: /tmp, not $RUNNER_TEMP, whose `_` link tests Markdown-escape.
+      W: /tmp/as2work
+    steps:
+      # Inputs reach the shell only through env, never through ${{ }} in a script, and are checked before anything runs.
+      - name: Check inputs
+        run: |
+          set -euo pipefail
+          bad() { echo "::error title=as2-fast inputs::$1; the runner's dispatch is malformed, nothing ran"; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || bad "sha '$SHA' is not a full 40-hex commit sha"
+          [[ "$REQUEST" =~ ^tr-[a-z0-9]+$ ]] || bad "request '$REQUEST' does not match ^tr-[a-z0-9]+\$"
+          read -r -a list <<< "$FILES"
+          (( ${#list[@]} > 0 )) || bad "files names no test file"
+          declare -A seen=()
+          for f in "${list[@]}"; do
+            [[ "$f" == ./* ]] || bad "file '$f' must be ./<repo-relative path>"
+            rel="${f#./}"
+            [[ "$rel" =~ ^[A-Za-z0-9._/@+-]+$ ]] || bad "file '$f' has a character outside [A-Za-z0-9._/@+-]"
+            [[ "/$rel/" != *//* && "/$rel/" != */../* && "/$rel/" != */./* ]] || bad "file '$f' is not a plain relative path"
+            [[ "${rel##*/}" =~ [._](test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$ ]] || bad "file '$f' is not a Bun test file name"
+            [[ -z "${seen[$rel]:-}" ]] || bad "file '$f' is named more than once"
+            seen[$rel]=1
+          done
+          mkdir -p "$W/out"
+          printf '%s\n' "${list[@]}" > "$W/files"
+          echo "request $REQUEST sha $SHA: ${#list[@]} test file(s)"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      # The probe's two environment gaps: the bin/as2 tests spawn zsh, and the Linux pairing fence needs bubblewrap.
+      # Ubuntu 24.04's AppArmor blocks the unprivileged user namespaces bubblewrap needs (gates/test/paired-coding.test.ts:
+      # "bwrap: setting up uid map"); as2-hosted.yml lifts it the same way. Without it every fast set reaching
+      # paired-coding.test.ts went red (land-first proof round 2, wl-mw01xdcflkdnq0).
+      - name: Install zsh and bubblewrap
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends zsh bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          zsh --version; bwrap --version
+      - name: Environment facts
+        run: |
+          uname -a; nproc; bun --version; git --version; command -v git
+      # The runner's child env (surface/src/test-run.ts childEnv): an emptied env plus PATH/LANG/USER/LOGNAME/SHELL/TERM,
+      # a throwaway HOME, TMPDIR, XDG dirs, bun cache, ledger path, a git shim first on PATH and a user-only gitconfig.
+      # The repo is a detached checkout of sha with no origin, as test-exec `prepare` leaves it, carrying main's record
+      # (refs/heads/main, refs/tags/as2-trusted-main) as the runner's bundle does. No _as2test sandbox wrapper.
+      - name: Prepare runner-like child layout
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          [[ "$head" == "$SHA" ]] || { echo "::error title=as2-fast checkout::HEAD is $head, not the requested $SHA"; exit 1; }
+          main="$(git rev-parse --verify -q 'refs/remotes/origin/main^{commit}')" || { echo "::error title=as2-fast checkout::origin/main was not fetched, so main's record cannot be recreated"; exit 1; }
+          root="$(pwd -P)"
+          while IFS= read -r f; do
+            real="$(realpath -e -- "$f")" || { echo "::error title=as2-fast files::$f does not exist at $SHA"; exit 1; }
+            [[ "$real" == "$root/"* && -f "$real" ]] || { echo "::error title=as2-fast files::$f is not a regular file inside the checkout"; exit 1; }
+          done < "$W/files"
+          mkdir -p "$W/home/tmp" "$W/home/.config" "$W/home/.cache" "$W/home/.local/share" "$W/home/.bun/install/cache" "$W/home/.agent-system-2" "$W/shim"
+          printf '[user]\n\tname = as2 test runner\n\temail = as2-test-runner@localhost\n' > "$W/home/.gitconfig"
+          REAL_GIT="$(command -v git)"
+          printf '#!/bin/sh\nGIT_CONFIG_NOSYSTEM=1\nGIT_TERMINAL_PROMPT=0\nGIT_ASKPASS=/usr/bin/false\nexport GIT_CONFIG_NOSYSTEM GIT_TERMINAL_PROMPT GIT_ASKPASS\nexec %s -c credential.helper= "$@"\n' "'$REAL_GIT'" > "$W/shim/git"
+          chmod 755 "$W/shim/git"
+          git branch -f main "$main"
+          git tag -f as2-trusted-main "$main"
+          git checkout --quiet --detach "$SHA"
+          git remote remove origin
+      # One bun test call on the fast set, JUnit to fast.xml, console to fast.log, under fastCapMin (profile/config.yml
+      # testRunner.fastCapMin, 10): TERM at the cap, KILL 30 s later; a cap ends 124 (timeout's own code).
+      - name: Fast set (one bun test call)
+        timeout-minutes: 12
+        run: |
+          # Actions runs this as `bash -e`: without `set +e` a failing or capped bun call ends the step here, before
+          # fast.summary is written, and the runner reads that as "no result" instead of judging a red.
+          set -uo pipefail
+          set +e
+          mapfile -t list < "$W/files"
+          start=$(date +%s)
+          env -i PATH="$W/shim:$PATH" LANG="${LANG:-C.UTF-8}" USER="$USER" LOGNAME="${LOGNAME:-$USER}" SHELL="${SHELL:-/bin/bash}" TERM="${TERM:-dumb}" \
+            HOME="$W/home" TMPDIR="$W/home/tmp" XDG_CONFIG_HOME="$W/home/.config" XDG_CACHE_HOME="$W/home/.cache" XDG_DATA_HOME="$W/home/.local/share" \
+            BUN_INSTALL_CACHE_DIR="$W/home/.bun/install/cache" AGENT_SYSTEM_LEDGER_DB="$W/home/.agent-system-2/ledger.db" \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$W/home/.gitconfig" GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false \
+            timeout --signal=TERM --kill-after=30s 10m \
+            bun test --reporter=junit --reporter-outfile="$W/out/fast.xml" --parallel="$(nproc)" "${list[@]}" > "$W/out/fast.log" 2>&1
+          code=$?
+          end=$(date +%s)
+          printf 'request %s sha %s files %s exit %s wall %s s\n' "$REQUEST" "$SHA" "${#list[@]}" "$code" "$((end - start))" | tee "$W/out/fast.summary"
+          tail -n 40 "$W/out/fast.log"
+          exit "$code"
+      - name: Upload JUnit and log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: as2-fast-${{ inputs.request }}
+          path: /tmp/as2work/out
+          if-no-files-found: error

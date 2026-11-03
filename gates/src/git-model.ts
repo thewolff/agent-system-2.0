@@ -30,12 +30,17 @@ import type { GitCall } from "./exec";
 import type { Word } from "./shell-parse";
 import { PROTECTED_BRANCH } from "./types";
 
-/** A refusal of a git form: `reserved` names a § A4 action, otherwise the form is unmodeled. */
+/**
+ * A refusal of a git form: `reserved` names a row 6 hold (r06-reserved.ts FLOOR classes it: § A4, guard or
+ * own-root), otherwise the form is unmodeled. `discard` marks a work-tree discard (PLAN wl-mvqwn80onq9hq8 D11):
+ * row 6 holds it for the own worktree or a scratch repository and refuses it as guard in any other checkout.
+ */
 export interface GitVerdict {
 	reserved: boolean;
 	why: string;
 	/** The allowed spelling, for an unmodeled form. */
 	spelling?: string;
+	discard?: true;
 }
 
 type Value = "" | "=" | "=?";
@@ -226,6 +231,7 @@ const firstOf = (p: Parsed, keys: Record<string, string>): string | null => p.op
 const BUILTIN_STRATEGY = /^(?:ort|recursive|resolve|octopus|ours|subtree)$/;
 
 const reserved = (why: string): GitVerdict => ({ reserved: true, why });
+const discard = (why: string): GitVerdict => ({ reserved: true, why, discard: true });
 const unmodeled = (why: string, spelling: string): GitVerdict => ({ reserved: false, why, spelling });
 
 /** Options that run a program, per subcommand: always refused, whatever else the command does. */
@@ -240,7 +246,7 @@ const RUNS_PROGRAM: Record<string, Record<string, string>> = {
 	rebase: { exec: "rebase --exec/-x runs a program after each commit" },
 };
 
-/** Options per subcommand that are § A4 reserved actions (the discard family, force-push, ref deletion). */
+/** Options per subcommand that row 6 holds (the discard family, force-push, ref deletion, a forced pull); r06-reserved.ts FLOOR classes each why. */
 const RESERVED_OPTS: Record<string, Record<string, string>> = {
 	reset: { hard: "git reset --hard", merge: "git reset --merge (discards working changes)", keep: "git reset --keep (moves HEAD and rewrites the work tree)" },
 	checkout: { force: "git checkout --force (discards working changes)", patch: "git checkout --patch (discards working hunks)" },
@@ -265,17 +271,25 @@ const RESERVED_OPTS: Record<string, Record<string, string>> = {
  * decides: `repo` when the repository the command works on is inside the own scratch root (rule 2),
  * `push` when every push destination is a path inside it (rule 3). A lifted reserved verdict is set
  * aside and the model goes on judging the rest of the command; `used` collects each one set aside.
+ * `worktree` (the routine classifier's own-worktree rule, PLAN wl-mvqwn80onq9hq8 D2b) is present when
+ * the repository is the workload's own worktree: the work-tree discards (WORKTREE_OPTS and the
+ * clean/restore/checkout-path verdicts) are set aside into it, never `reset --hard`, branch or tag
+ * deletion or a push. `discards` (the routine classifier's case 2 only, D11 own-root) lets the `repo`
+ * lift set WORKTREE_OPTS aside too, so `reset --merge|--keep`, `checkout --force|--patch` and `switch
+ * --force|--discard-changes` in a scratch repository auto-apply like its other discards.
  */
 export interface ScratchLift {
 	repo: boolean;
 	push: boolean;
 	used: string[];
+	worktree?: string[];
+	discards?: boolean;
 }
 
 /**
  * The RESERVED_OPTS a scratch lift may set aside, per subcommand: rule 2's `reset --hard`,
  * `branch -d/-D`, `tag -d`; rule 3's force and delete pushes. Never `--mirror`, `--all`, `--branches`,
- * `--prune`, `reset --merge/--keep`, `checkout --force/--patch`: those keep today's verdict.
+ * `--prune`; `reset --merge/--keep`, `checkout --force/--patch` only under ScratchLift.discards.
  */
 const SCRATCH_OPTS: Record<string, { lift: "repo" | "push"; keys: Record<string, true> }> = {
 	reset: { lift: "repo", keys: { hard: true } },
@@ -284,11 +298,36 @@ const SCRATCH_OPTS: Record<string, { lift: "repo" | "push"; keys: Record<string,
 	push: { lift: "push", keys: { force: true, "force-with-lease": true, "force-if-includes": true, delete: true } },
 };
 
-/** Whether `lift` sets aside every reserved option `p` carries for `sub` (one outside SCRATCH_OPTS keeps the verdict). */
-function liftsOpts(sub: string, p: Parsed, lift: ScratchLift | undefined): lift is ScratchLift {
+/** The RESERVED_OPTS the own-worktree lift sets aside (ScratchLift.worktree): the work-tree discards only, never `reset --hard`. */
+const WORKTREE_OPTS: Record<string, Record<string, true>> = {
+	reset: { merge: true, keep: true },
+	checkout: { force: true, patch: true },
+	switch: { "discard-changes": true, force: true },
+};
+
+/**
+ * Where the verdicts `p` reserves for `sub` are set aside: `lift.used` when the scratch lift covers
+ * every reserved option it carries, `lift.worktree` when the own-worktree lift does; null when neither
+ * covers them all (one outside both keeps the verdict).
+ */
+function liftsOpts(sub: string, p: Parsed, lift: ScratchLift | undefined): string[] | null {
+	const reservedKeys = p.opts.filter((o) => RESERVED_OPTS[sub]![o.key] !== undefined).map((o) => o.key);
 	const s = SCRATCH_OPTS[sub];
-	if (!s || !lift?.[s.lift]) return false;
-	return p.opts.every((o) => RESERVED_OPTS[sub]![o.key] === undefined || s.keys[o.key] === true);
+	if (s && lift?.[s.lift] && reservedKeys.every((k) => s.keys[k] === true)) return lift.used;
+	const w = WORKTREE_OPTS[sub];
+	if (!w || !reservedKeys.every((k) => w[k] === true)) return null;
+	if (lift?.worktree) return lift.worktree;
+	return lift?.repo && lift.discards ? lift.used : null;
+}
+
+/**
+ * The verdict for the RESERVED_OPTS keys `p` carries for `sub`: a discard (WORKTREE_OPTS) only when every
+ * one is, else the first that is not (`reset --merge --hard` is the § A4 hard reset, never a discard).
+ */
+function reservedOptVerdict(sub: string, p: Parsed): GitVerdict {
+	const keys = p.opts.filter((o) => RESERVED_OPTS[sub]![o.key] !== undefined).map((o) => o.key);
+	const held = keys.find((k) => WORKTREE_OPTS[sub]?.[k] !== true);
+	return held !== undefined ? reserved(RESERVED_OPTS[sub]![held]!) : discard(RESERVED_OPTS[sub]![keys[0]!]!);
 }
 
 /** Options per subcommand the gate does not model (not reserved, but not safe to pass unread). */
@@ -576,9 +615,11 @@ function actionVerdict(g: GitCall, sub: string, args: string[], spelling: string
 	return "why" in v ? v : { action, p: v };
 }
 
-/** Subcommands refused outright: each rewrites history, moves refs directly, or runs a program. */
+/**
+ * Subcommands refused outright: each rewrites history, moves refs directly, or runs a program
+ * (`update-ref` is modeled in updateRefVerdict: its delete forms are § A4 branch deletion).
+ */
 const REFUSED_SUBS: Record<string, GitVerdict> = {
-	"update-ref": reserved("git update-ref moves or deletes a ref directly (a history rewrite)"),
 	"filter-branch": reserved("git filter-branch rewrites history"),
 	replace: reserved("git replace substitutes objects (a history rewrite)"),
 	difftool: unmodeled("git difftool runs an external program (--extcmd, -x or the configured tool)", "`git diff`"),
@@ -586,6 +627,31 @@ const REFUSED_SUBS: Record<string, GitVerdict> = {
 	"verify-commit": unmodeled("git verify-commit runs gpg to check the signature (gpg.program)", "`git log -1 <commit>` (without signature checks)"),
 	"verify-tag": unmodeled("git verify-tag runs gpg to check the signature (gpg.program)", "`git show -s <tag>` (without signature checks)"),
 };
+
+/**
+ * `git update-ref` (git-update-ref(1), `git update-ref -h` on git 2.50.1): `-d` (alone or bundled before a
+ * `-m` that takes the rest of its word) deletes the ref, a § A4 branch or tag deletion; `--stdin` (any
+ * prefix of it, as parse-options reads one) reads commands that can delete; any other form moves a ref,
+ * a local ref rewrite of the shared repository (guard, D11).
+ */
+function updateRefVerdict(args: string[]): GitVerdict {
+	for (let i = 0; i < args.length; i++) {
+		const a = args[i]!;
+		if (a === "--") break;
+		if (a.startsWith("--")) {
+			const name = a.slice(2).split("=")[0]!;
+			if (name !== "" && "stdin".startsWith(name)) return reserved("git update-ref --stdin (its commands can delete refs)");
+			continue;
+		}
+		if (!/^-[A-Za-z0-9]+$/.test(a)) continue;
+		const letters = a.slice(1);
+		const m = letters.indexOf("m");
+		if ((m < 0 ? letters : letters.slice(0, m)).includes("d")) return reserved("git update-ref -d deletes a ref directly (branch or tag deletion)");
+		// `-m <reason>`: the next word is its value, never an option.
+		if (m === letters.length - 1) i++;
+	}
+	return reserved("git update-ref moves a ref directly (a local ref rewrite)");
+}
 
 /** Is `p` a path in the work tree (it exists, or git tracks it)? `checkout <p>` would then restore it. */
 function isWorkTreePath(dir: string, p: string): boolean {
@@ -676,8 +742,9 @@ const ACTION_SPELLING: Record<string, string> = {
 
 /**
  * Why a `git` command (already a modeled form per gitUnmodeled: literal words, builtin subcommand)
- * is refused by the positive model, or null. `lift` (row 6's scratch rules only) sets aside the
- * reserved verdicts its conditions cover and records each in `lift.used`.
+ * is refused by the positive model, or null. `lift` (row 6's scratch rules and the own-worktree rule
+ * only) sets aside the reserved verdicts its conditions cover and records each in `lift.used`, or in
+ * `lift.worktree` for one the own-worktree lift sets aside.
  */
 export function gitModel(g: GitCall, lift?: ScratchLift): GitVerdict | null {
 	const sub = g.sub;
@@ -687,6 +754,7 @@ export function gitModel(g: GitCall, lift?: ScratchLift): GitVerdict | null {
 	// round 7, § A4 accidental misuse). Choosing a viewer (`help --man`/`--web`/`--info`) stays refused.
 	const args = g.args.map((w: Word) => w.text);
 	if (args.length === 1 && (args[0] === "-h" || args[0] === "--help")) return null;
+	if (sub === "update-ref") return updateRefVerdict(args);
 	const refusedSub = REFUSED_SUBS[sub];
 	if (refusedSub) return refusedSub;
 
@@ -761,8 +829,9 @@ export function gitModel(g: GitCall, lift?: ScratchLift): GitVerdict | null {
 	if (program) return unmodeled(RUNS_PROGRAM[sub]![program]!, spelling);
 	const res = firstOf(p, RESERVED_OPTS[sub] ?? {});
 	if (res) {
-		if (!liftsOpts(sub, p, lift)) return reserved(RESERVED_OPTS[sub]![res]!);
-		lift.used.push(RESERVED_OPTS[sub]![res]!);
+		const into = liftsOpts(sub, p, lift);
+		if (!into) return reservedOptVerdict(sub, p);
+		into.push(RESERVED_OPTS[sub]![res]!);
 	}
 	const unm = firstOf(p, UNMODELED_OPTS[sub] ?? {});
 	if (unm) return unmodeled(UNMODELED_OPTS[sub]![unm]!, spelling);
@@ -772,30 +841,32 @@ export function gitModel(g: GitCall, lift?: ScratchLift): GitVerdict | null {
 	}
 
 	// A reserved verdict a scratch lift of `kind` sets aside (rule 2: the repository is inside the own
-	// scratch root; rule 3: every push destination is), else the verdict.
+	// scratch root; rule 3: every push destination is), or the own-worktree lift sets aside (a `repo`
+	// verdict on the workload's own worktree), else the verdict.
 	const liftable = (kind: "repo" | "push", v: GitVerdict): GitVerdict | null => {
-		if (!lift?.[kind]) return v;
-		lift.used.push(v.why);
+		const into = lift?.[kind] ? lift.used : kind === "repo" ? lift?.worktree : undefined;
+		if (!into) return v;
+		into.push(v.why);
 		return null;
 	};
 	switch (sub) {
 		case "reset":
 			return null;
 		case "clean":
-			if (has(p, "interactive")) return reserved("git clean -i (removes untracked files)");
-			return on(p, "dry-run") && !has(p, "force") ? null : liftable("repo", reserved("git clean (removes untracked files; force in any position or spelling, or clean.requireForce off)"));
+			if (has(p, "interactive")) return discard("git clean -i (removes untracked files)");
+			return on(p, "dry-run") && !has(p, "force") ? null : liftable("repo", discard("git clean (removes untracked files; force in any position or spelling, or clean.requireForce off)"));
 		case "restore":
 			// The final state of each switch, in argument order (astra-6 B3: `--staged --no-staged` is the work tree).
-			return on(p, "staged") && !has(p, "worktree") ? null : liftable("repo", reserved("git restore of the work tree (discards working changes)"));
+			return on(p, "staged") && !has(p, "worktree") ? null : liftable("repo", discard("git restore of the work tree (discards working changes)"));
 		case "checkout": {
-			if (p.dashdash || p.after.length > 0) return liftable("repo", reserved("git checkout -- <path> (discards working changes)"));
+			if (p.dashdash || p.after.length > 0) return liftable("repo", discard("git checkout -- <path> (discards working changes)"));
 			// Branch creation by final value, not presence (astra-7 B1: `--orphan foo --no-orphan .` checks out `.`).
 			const creates = finalValue(p, "-b") !== null || finalValue(p, "orphan") !== null;
-			if (p.operands.length > 1) return liftable("repo", reserved("git checkout <commit> <path> (discards working changes)"));
+			if (p.operands.length > 1) return liftable("repo", discard("git checkout <commit> <path> (discards working changes)"));
 			const target = p.operands[0];
 			if (!creates && target !== undefined) {
 				if (!g.dir) return unmodeled("git checkout in a directory the gate cannot resolve", spelling);
-				if (isWorkTreePath(g.dir, target)) return liftable("repo", reserved(`git checkout ${target} (a path: discards working changes)`));
+				if (isWorkTreePath(g.dir, target)) return liftable("repo", discard(`git checkout ${target} (a path: discards working changes)`));
 			}
 			return null;
 		}

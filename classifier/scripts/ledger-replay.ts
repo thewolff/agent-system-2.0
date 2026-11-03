@@ -168,7 +168,7 @@ function replayBytes(bytes: Uint8Array, name: string, now: string, table: TierTa
 	try {
 		const path = join(tmp, "ledger.db");
 		writeFileSync(path, bytes);
-		// skipLocalityCheck: a temporary copy; the check would read $HOME and spawn df/mount.
+		// skipLocalityCheck: a temporary copy; the check would read $HOME and ask statfs or mountinfo about a throwaway path.
 		const ledger = Ledger.open(path, { backupOnOpen: false, backup: false, clock: () => now, skipLocalityCheck: true });
 		try {
 			return replaySnapshot(ledger, name, now, table);

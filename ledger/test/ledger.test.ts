@@ -6,6 +6,7 @@ import { basename, dirname, join } from "node:path";
 // Only names that also existed before the N1-N4 fixes, so each regression below fails on its own
 // assertion against the old module rather than the whole file failing to load.
 import { assertLocalPath, defaultLedgerPath, Ledger, LEDGER_DB_ENV, LedgerLocationError, SCHEMA_VERSION } from "../src/index";
+import { mountLocality } from "../src/locality";
 
 const REPO = join(import.meta.dir, "..", "..");
 const SQLITE3 = existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
@@ -341,6 +342,67 @@ describe("locality", () => {
 		expect(r.exitCode).toBe(3);
 		expect(r.stderr.toString()).toContain("a synced folder");
 		expect(existsSync(target)).toBe(false);
+	});
+
+	// These run where the statfs(2) layout was measured (arm64 macOS); Linux reads /proc/self/mountinfo,
+	// covered in ledger/test/locality.test.ts.
+	const statfsHost = process.platform === "darwin" && process.arch === "arm64";
+
+	test.skipIf(!statfsHost)("arm64 macOS: the probe asks the kernel and starts no child process (T1)", () => {
+		const dir = scratch("t1");
+		const target = join(dir, "ledger.db");
+		const script = join(dir, "probe.ts");
+		// Plain JS, no types: the recorders must be installed before locality.ts loads, so it is imported
+		// dynamically (a static import would be hoisted above them).
+		writeFileSync(script, `
+			const calls = [];
+			for (const name of ["spawn", "spawnSync"]) {
+				const real = Bun[name].bind(Bun);
+				Bun[name] = (...args) => { calls.push(args[0]); return real(...args); };
+			}
+			const { mountLocality, assertLocalPath } = await import(${JSON.stringify(join(REPO, "ledger", "src", "locality.ts"))});
+			const where = mountLocality(process.argv[2]);
+			assertLocalPath(process.argv[2]);
+			console.log(JSON.stringify({ where, calls }));
+		`);
+		const r = Bun.spawnSync(["bun", script, target], { stdout: "pipe", stderr: "pipe" });
+		expect(r.stderr.toString()).toBe("");
+		expect(r.exitCode).toBe(0);
+		expect(JSON.parse(r.stdout.toString())).toEqual({ where: "local", calls: [] });
+	});
+
+	/** /sbin/mount as { source, mount point, flags } rows. */
+	const mountTable = () => Bun.spawnSync(["/sbin/mount"], { stdout: "pipe", stderr: "pipe" }).stdout.toString().split("\n")
+		.flatMap((l) => {
+			const m = /^(.+?) on (.+) \((.*)\)$/.exec(l);
+			return m ? [{ source: m[1]!, mp: m[2]!, flags: m[3]!.split(",").map((s) => s.trim()) }] : [];
+		});
+	const under = (mp: string, path: string) => mp === "/" || path === mp || path.startsWith(`${mp}/`);
+
+	test.skipIf(!statfsHost)("arm64 macOS: the statfs answer agrees with /sbin/mount for the temp dir, / and /dev (T2)", () => {
+		const table = mountTable();
+		for (const [path, viaData] of [[realpathSync(scratch("t2")), true], ["/", false], ["/dev", false]] as const) {
+			// A path under the firmlinked /private, /Users, ... is listed by /sbin/mount under the Data volume.
+			const candidates = table.filter((e) => under(e.mp, path) || (viaData && under(e.mp, `/System/Volumes/Data${path}`)));
+			const entry = candidates.sort((a, b) => b.mp.length - a.mp.length)[0];
+			expect(entry, path).toBeDefined();
+			expect(entry!.flags, path).toContain("local");
+			expect(mountLocality(path), path).toBe("local");
+		}
+	});
+
+	// Only the indirect map's root: Apple autofs never makes it a trigger, so statfs mounts nothing.
+	const autoHome = statfsHost ? mountTable().find((e) => e.source === "map auto_home" && e.mp === "/System/Volumes/Data/home" && e.flags[0] === "autofs") : undefined;
+	test.skipIf(!autoHome)("arm64 macOS: the autofs indirect-map root is reported as network (T2, skipped when /sbin/mount does not list map auto_home on /System/Volumes/Data/home)", () => {
+		const where = mountLocality("/System/Volumes/Data/home");
+		expect(where.startsWith("network:/System/Volumes/Data/home ")).toBe(true);
+		expect(where).toContain("(autofs)");
+	});
+
+	test("a path whose every ancestor below / is missing reports the locality of / (T3)", () => {
+		const missing = join("/", `ledger-missing-${process.pid}-${Date.now()}`, "a", "b", "ledger.db");
+		expect(existsSync(dirname(dirname(dirname(missing))))).toBe(false);
+		expect(mountLocality(missing)).toBe(mountLocality("/"));
 	});
 });
 
@@ -778,7 +840,7 @@ describe("a killed writer's temporary snapshot is reclaimed; a live writer's is 
 			import * as fs from "node:fs";
 			import { mock } from "bun:test";
 			const realLink = fs.linkSync;
-			mock.module("node:fs", () => ({ ...fs, linkSync: (src: string, dst: string) => { realLink(src, dst); process.kill(process.pid, "SIGKILL"); } }));
+			mock.module("node:fs", () => ({ ...fs, linkSync: (src: string, dst: string) => { realLink(src, dst); if (dst.endsWith(".db")) process.kill(process.pid, "SIGKILL"); } }));
 			// Dynamic on purpose: the module must load after the mock is installed.
 			const { Ledger } = await import(${JSON.stringify(join(REPO, "ledger", "src", "index.ts"))});
 			Ledger.open(${JSON.stringify(path)}, { backupOnOpen: false, clock: () => "2026-09-28T00:00:00.000Z" }).backupIfDue();
@@ -799,6 +861,82 @@ describe("a killed writer's temporary snapshot is reclaimed; a live writer's is 
 			expect(taken).toBe(join(copyDir, "ledger-2026-09-30T00-00-00.000Z.db"));
 			expect(temps()).toEqual([inProgress]);
 			expect(readdirSync(copyDir).sort()).toEqual(["SOURCE", inProgress, basename(taken!)].sort());
+		} finally {
+			live.kill();
+			l.close();
+		}
+	});
+});
+
+describe("SOURCE is published whole, so a concurrent opener never reads it empty (parallel full run, lane-run-guard)", () => {
+	test("review probe: a second opener reading at every step of the first copy never sees an empty owner, and SOURCE is only a link destination", () => {
+		const dir = scratch("source-atomic");
+		const path = join(dir, "ledger.db");
+		Ledger.open(path, { create: true, backupOnOpen: false }).close();
+		// The race: a write to SOURCE creates the file before its content lands. The worker splits any
+		// such write at that point and runs the second opener's backups() in between, and after every
+		// other call that can publish a file.
+		const worker = join(dir, "source-worker.ts");
+		writeFileSync(worker, `
+			import * as fs from "node:fs";
+			import { basename, join } from "node:path";
+			import { mock } from "bun:test";
+			const real = { ...fs };
+			const targets = [];
+			const seen = [];
+			let reader = null;
+			const probe = (at) => {
+				if (!reader) return;
+				try { reader.backups(); } catch (e) { seen.push(at + ": " + e.message); }
+			};
+			const publish = (name, dst) => (...args) => {
+				if (basename(String(args[dst])) === "SOURCE") targets.push(name);
+				const r = real[name](...args);
+				probe(name);
+				return r;
+			};
+			mock.module("node:fs", () => ({
+				...fs,
+				writeFileSync: (p, data, opts) => {
+					if (basename(String(p)) !== "SOURCE") return real.writeFileSync(p, data, opts);
+					targets.push("writeFileSync");
+					real.closeSync(real.openSync(p, "w"));
+					probe("SOURCE created, content not yet written");
+					real.writeFileSync(p, data, opts);
+					probe("writeFileSync");
+				},
+				appendFileSync: publish("appendFileSync", 0),
+				copyFileSync: publish("copyFileSync", 1),
+				renameSync: publish("renameSync", 1),
+				linkSync: publish("linkSync", 1),
+			}));
+			// Dynamic on purpose: the module must load after the mock is installed.
+			const { Ledger } = await import(${JSON.stringify(join(REPO, "ledger", "src", "index.ts"))});
+			const writer = Ledger.open(${JSON.stringify(path)}, { backupOnOpen: false, clock: () => "2026-09-28T00:00:00.000Z" });
+			reader = Ledger.open(${JSON.stringify(path)}, { backupOnOpen: false });
+			const taken = writer.backupIfDue();
+			probe("after backupIfDue");
+			const source = real.readFileSync(join(writer.backupDir, "SOURCE"), "utf8");
+			console.log(JSON.stringify({ taken: taken !== null, targets, seen, owner: source === writer.path + "\\n" }));
+		`);
+		const r = Bun.spawnSync(["bun", "run", worker], { stdout: "pipe", stderr: "pipe" });
+		expect({ exitCode: r.exitCode, err: r.stderr.toString() }).toEqual({ exitCode: 0, err: "" });
+		expect(JSON.parse(r.stdout.toString())).toEqual({ taken: true, targets: ["linkSync"], seen: [], owner: true });
+	});
+
+	test("a killed writer's temporary SOURCE is reclaimed by the next due copy; a live writer's is not", () => {
+		const l = fresh("source-temp", { backupOnOpen: false });
+		l.backupIfDue(true);
+		const copyDir = l.backupDir!;
+		const gone = Bun.spawnSync(["true"]).pid;
+		const live = Bun.spawn(["sleep", "30"]);
+		const orphan = `.SOURCE.${gone}-orphan.tmp`;
+		const inProgress = `.SOURCE.${live.pid}-inprogress.tmp`;
+		for (const name of [orphan, inProgress]) writeFileSync(join(copyDir, name), l.path);
+		try {
+			l.backupIfDue(true);
+			expect(readdirSync(copyDir).filter((n) => n.endsWith(".tmp"))).toEqual([inProgress]);
+			expect(readFileSync(join(copyDir, "SOURCE"), "utf8")).toBe(`${l.path}\n`);
 		} finally {
 			live.kill();
 			l.close();
@@ -1002,6 +1140,52 @@ describe("schema v3-v5: routings and entries through the module", () => {
 		l.recordRouting({ ...routing(w, s), outcome: "refused-out-of-row", ranModels: ["x/off-row"] });
 		expect(l.routings(w).map((r) => [r.outcome, r.ran_models])).toEqual([["refused-out-of-row", '["x/off-row"]']]);
 		l.close();
+	});
+
+	test("recordEntry preserves distinct low-word draws in a same-millisecond burst", () => {
+		const path = join(scratch("entry-id-burst"), "ledger.db");
+		const count = 64;
+		// Keep clock and crypto stubs in a child: parallel test workers must never observe them.
+		const writer = Bun.spawnSync([process.execPath, "-e", `
+			import { Ledger } from ${JSON.stringify(join(REPO, "ledger", "src", "index.ts"))};
+			const l = Ledger.open(${JSON.stringify(path)}, {
+				create: true, backup: false, clock: () => "2026-09-28T21:00:00.000Z",
+			});
+			try {
+				const w = l.openWorkload({
+					id: "wl-low-word-burst", brief: "entry IDs", stakes: "normal", mode: "user-driven", by: "orch-1",
+				});
+				Date.now = () => 1000;
+				let lowWord = 0;
+				Object.defineProperty(crypto, "getRandomValues", {
+					value: (words) => {
+						words[0] = 0xffffffff;
+						words[1] = lowWord++;
+						return words;
+					},
+				});
+				const ids = [];
+				for (let i = 0; i < ${count}; i++) {
+					ids.push(l.recordEntry({ workloadId: w, kind: "assumption", body: "entry-" + i, by: "lane-1" }));
+				}
+				console.log(JSON.stringify(ids));
+			} finally {
+				l.close();
+			}
+		`], { stdout: "pipe", stderr: "pipe" });
+		expect({ exitCode: writer.exitCode, err: writer.stderr.toString() }).toEqual({ exitCode: 0, err: "" });
+		const ids = JSON.parse(writer.stdout.toString()) as string[];
+		expect(ids).toHaveLength(count);
+		expect(new Set(ids).size).toBe(count);
+		for (const id of ids) expect(id).toMatch(/^en-rs[0-9a-z]{6}$/);
+		const l = Ledger.open(path, { backup: false });
+		try {
+			expect(l.entries("wl-low-word-burst").map((entry) => [entry.id, entry.body])).toEqual(
+				ids.map((id, i) => [id, "entry-" + i]),
+			);
+		} finally {
+			l.close();
+		}
 	});
 
 	test("recordEntry/entries: kind filter, optional slice, oldest first, provenance logged, refused on a closed workload", () => {

@@ -10,16 +10,52 @@
 // message in the starter; a refusal wrote nothing. The result is one line for the tool result or
 // the log. The open tool, the answer and withdrawal paths, the mode flip and the wake tick all call
 // it; the tool below adds Jo's `launch-requested:` cause first, with Jo's `lane-model:` in the same
-// transaction when `model` is given (MIGRATION.md item 85).
-import type { Ledger } from "../../ledger/src/index";
+// transaction when `model` is given (MIGRATION.md item 85), and Jo's pick snapshot (`rank-shown: … by
+// pick`, PLAN wl-mv8k039gvogt8g D6) before the request. The pre-check applies Jev ranking's gate
+// (`rankGate`, D7) as the starter's reservation does, so in `order` / `parallel` a workload ranked
+// below a launchable one is reported queued behind it and no starter runs; in `show` it is `verdictOf`.
+// At cap it runs `preemptFor` (PLAN wl-mv8wzytml878b4 D3): in `order`, a Jo-ruled workload waiting at
+// cap gets a priority stop written on the lowest-ranked running lane below it, told as
+// `priority-pausing <lane> on <wl> for <X>`.
+import type { Ledger, ReserveRows } from "../../ledger/src/index";
 import {
-	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, type LaunchVerdict, launchRequestedBody, modelProblem, verdictOf,
+	byHandLine, controlEntries, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, launchRowsFor, type LaunchVerdict, launchRequestedBody, modelProblem, STARTER_EXIT,
 } from "../src/launch";
+import { openTrains } from "../src/merge-train";
+import { type TrainBudgetReason, trainBudgetGate, trainBudgetRows, trainPauses } from "../src/train-budget";
+import { preemptFor, rankGate, readRankConfig, writePickSnapshot } from "../src/rank-launch";
 import { surfaceSession } from "../src/session";
 import { DUE_PREFIX, LAUNCH_LANE_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult } from "../src/types";
 
 const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text: t }], details });
 const inactive = text("This session is not the orchestrator surface; nothing was written.");
+/** The open and tick line for a workload the rank gate queues behind a higher-ranked launchable one. */
+const queuedLine = (workloadId: string, above: string): string =>
+	`${workloadId} queued behind ${above} (Jev rank); it launches once nothing ranked above it is launchable`;
+/** The open and tick line for a queued workload the intake queue's gate holds behind a launchable one ranked above it (PLAN wl-mvbcjadqgblr7k D5). */
+const intakeQueuedLine = (workloadId: string, position: string): string =>
+	`${workloadId} queued at position ${position} (intake queue, rank order); it launches once no queued workload ranked above it is launchable`;
+/** The open and tick line for a priority stop `preemptFor` wrote (PLAN wl-mv8wzytml878b4 D4). */
+export const priorityPausingLine = (p: { laneId: string; workloadId: string; forWl: string }): string =>
+	`priority-pausing ${p.laneId} on ${p.workloadId} for ${p.forWl}`;
+
+/**
+ * The line for a train the daily budget refuses (PLAN wl-mvr888nftz0vcl D5), read again from the same rows: when the pause
+ * ends, or what Jo's answer clears. A gate that no longer gives `reason` on these rows says so rather than guess a time.
+ */
+export function budgetRefusalLine(workloadId: string, reason: TrainBudgetReason, rows: ReserveRows): string {
+	const r = trainBudgetGate(trainBudgetRows(rows), rows.now);
+	if (r === null || r.reason !== reason) return `${workloadId} was refused ${reason} by its daily budget, which no longer reads so on a second look (${r?.reason ?? "open"}); nothing launched`;
+	const pause = trainPauses(controlEntries(rows.entries)).find((p) => p.entryId === r.entryId);
+	switch (reason) {
+		case "budget-paused":
+			return `${workloadId} is paused on its daily budget until ${pause?.until ?? `the end of pause ${r.entryId}`}; nothing launched`;
+		case "budget-decision":
+			return `${workloadId} is paused on its daily budget two days in a row (${pause?.day ?? r.entryId} PDT): it waits past midnight until Jo answers its pause question wait or raise, or gives a launch word; nothing launched`;
+		case "meter-error":
+			return `${workloadId} is stopped by a meter error (${r.entryId}): ${r.detail}; nothing launched`;
+	}
+}
 
 export interface LaunchOutcome {
 	/** The predicate said launch and the starter was run. */
@@ -35,21 +71,31 @@ export interface LaunchOutcome {
  * `requested-by` the starter records. Never throws: an exec failure is a line.
  */
 export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, workloadId: string, who: string): Promise<LaunchOutcome> {
-	const rows = ledger.launchRows(workloadId, laneCap(env));
+	const rows = launchRowsFor(ledger, workloadId, laneCap(env));
 	if (!rows) return { attempted: false, code: null, line: `no workload ${workloadId}` };
-	const verdict = verdictOf(rows);
+	const config = readRankConfig(env);
+	const verdict = rankGate(ledger, rows, config);
 	if (!verdict.launch) {
 		switch (verdict.reason) {
 			case "standing":
 			case "due":
 				return { attempted: false, code: null, line: null };
+			case "withdrawn":
+				return { attempted: false, code: null, line: `${workloadId} was withdrawn by Jo and is awaiting close; nothing launched` };
 			case "user-driven":
 				return { attempted: false, code: null, line: `${workloadId} is user-driven: no lane launches by itself; run it by hand with \`${byHandLine(workloadId)}\`` };
 			case "held":
 				return { attempted: false, code: null, line: `${workloadId} is held by ${rows.workload.holder} (lease until ${rows.workload.holder_lease_until ?? "none"}); nothing launched` };
 			case "cap": {
-				const live = ledger.liveLaneHolders(rows.now).map((l) => `${l.holder} on ${l.workloadId}`);
-				return { attempted: false, code: null, line: `${workloadId} queued behind ${live.join(", ")} (cap ${rows.cap}); the tick launches it when a slot frees` };
+				// Only the lanes the cap counts: an open merge train's lane takes no slot (PLAN wl-mvpsrr4tr0p1xc D1).
+				const live = ledger.liveLaneHolders(rows.now, new Set(openTrains(ledger))).map((l) => `${l.holder} on ${l.workloadId}`);
+				const queued = `${workloadId} queued behind ${live.join(", ")} (cap ${rows.cap}); the tick launches it when a slot frees`;
+				try {
+					const { paused } = preemptFor(ledger, rows.now, rows.cap, config, SURFACE_BY);
+					return { attempted: false, code: null, line: paused ? `${queued}; ${priorityPausingLine(paused)}` : queued };
+				} catch (err) {
+					return { attempted: false, code: null, line: `${queued}; the priority pause check failed: ${String(err)}` };
+				}
 			}
 			case "awaiting-close":
 				return { attempted: false, code: null, line: `${workloadId} is finished and awaiting close: its holder wrote done-because:; nothing launched` };
@@ -57,6 +103,18 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 				return { attempted: false, code: null, line: `${workloadId} has had a lane and no new cause: relaunch on your word with ${LAUNCH_LANE_TOOL}` };
 			case "closed":
 				return { attempted: false, code: null, line: `${workloadId} is closed; nothing launched` };
+			case "budget-paused":
+			case "budget-decision":
+			case "meter-error":
+				return { attempted: false, code: null, line: budgetRefusalLine(workloadId, verdict.reason, rows) };
+			default: {
+				// Jev ranking's refusals (D7): `ranked: below <wl>`, `queued: position <n>` (the intake queue) and `parallel: <reason>`.
+				const below = /^ranked: below (\S+)$/.exec(verdict.reason);
+				if (below) return { attempted: false, code: null, line: queuedLine(workloadId, below[1]!) };
+				const position = /^queued: position (\d+)$/.exec(verdict.reason);
+				if (position) return { attempted: false, code: null, line: intakeQueuedLine(workloadId, position[1]!) };
+				return { attempted: false, code: null, line: `${workloadId} held by the parallel rule (Jev rank) — ${verdict.reason.replace(/^parallel: /, "")}; it launches when no lane it would run beside holds it` };
+			}
 		}
 	}
 	if (!pi.exec) return { attempted: false, code: null, line: `${workloadId}: the host has no exec for extensions, so the starter could not run; launch by hand with \`bun ${LANE_SCRIPT} launch ${workloadId}\`` };
@@ -64,6 +122,12 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 		const r = await pi.exec("bun", [LANE_SCRIPT, "launch", workloadId, "--requested-by", who], { timeout: 30_000 });
 		const out = (r.stdout.trim() || r.stderr.trim()).split("\n").filter(Boolean);
 		const last = out[out.length - 1] ?? (r.killed ? "the starter was killed before it printed" : `the starter exited ${r.code} without a line`);
+		// The reservation's own gate run binds: a higher-ranked workload that became launchable after the pre-check queues this one.
+		const refused = r.code === STARTER_EXIT["not-launchable"] ? last : "";
+		const below = /not launched: ranked: below (\S+)$/.exec(refused);
+		if (below) return { attempted: true, code: r.code, line: queuedLine(workloadId, below[1]!) };
+		const position = /not launched: queued: position (\d+)$/.exec(refused);
+		if (position) return { attempted: true, code: r.code, line: intakeQueuedLine(workloadId, position[1]!) };
 		return { attempted: true, code: r.code, line: r.code === 0 ? `${workloadId}: ${last}` : `${workloadId}: launch failed (starter exit ${r.code}): ${last}` };
 	} catch (err) {
 		return { attempted: true, code: null, line: `${workloadId}: the starter could not be run: ${String(err)}` };
@@ -71,13 +135,14 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 }
 
 /**
- * The verdict alone, for the tick: whether a launch would be attempted now, or the workload is
- * awaiting close (the tick closes it). The tick execs only on a launch verdict, so a refused
- * workload costs one read per poll and no process. Null when there is no such workload.
+ * The verdict alone, for the tick: whether a launch would be attempted now (the rank gate applied,
+ * as `triggerLaunch` applies it), or the workload is awaiting close or withdrawn (the tick closes it).
+ * The tick execs only on a launch verdict, so a refused workload — a queued one included — costs one
+ * read per poll and no process. Null when there is no such workload.
  */
 export function launchVerdict(ledger: Ledger, env: Record<string, string | undefined>, workloadId: string): LaunchVerdict | null {
-	const rows = ledger.launchRows(workloadId, laneCap(env));
-	return rows && verdictOf(rows);
+	const rows = launchRowsFor(ledger, workloadId, laneCap(env));
+	return rows && rankGate(ledger, rows, readRankConfig(env));
 }
 
 export default function launchRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
@@ -121,12 +186,14 @@ export default function launchRow(pi: SurfaceAPI, env: Record<string, string | u
 			if (w.holder !== null && w.holder !== JO_HOLDER && (w.holder_lease_until === null || w.holder_lease_until >= now)) {
 				return text(`${id} is held by ${w.holder} under a live lease (until ${w.holder_lease_until ?? "none"}); stop it first: \`as2 lane stop ${id}\`. Nothing was written.`);
 			}
-			// § B5 "X back to you": Jo's hold after a handoff is released with the request, in one transaction.
+			// § B5 "X back to you": Jo's hold after a handoff is released with the request, in one transaction. Jo's pick snapshot
+			// (D6: the waiting workloads in Jev order, pins ignored) lands in the same transaction, before the request it audits.
 			const requestId = ledger.write(() => {
 				if (w.holder === JO_HOLDER) {
 					const r = ledger.releaseWorkload(id, { by: SURFACE_BY, holder: JO_HOLDER });
 					if (!r.released) throw new Error(`Jo's hold on ${id} could not be released: held by ${r.holder ?? "nobody"}`);
 				}
+				writePickSnapshot(ledger, now);
 				if (model !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: laneModelBody(model, now) });
 				return ledger.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: launchRequestedBody("jo", now, reason ?? undefined) });
 			});

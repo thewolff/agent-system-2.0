@@ -5,10 +5,11 @@
 //       `controlEntries` drops a `pair-taken:` with the wrong stamp.
 //   (2) `lane_raise_question` refuses an option `pair`, so a lane cannot raise its own question offering it.
 //   (3) Jo's `pair` is honoured only on a round-limit question offered by a classifier-stamped `pair-offer:` with site
-//       round-limit, or on the runner's ceiling question offered by a lane-runner-stamped one with site ceiling; any
-//       other offer is refused naming the question, and nothing is written.
+//       round-limit (the one raise site since PLAN wl-mvfkv7llkp7nk0 § 4); any other offer is refused naming the
+//       question, and nothing is written, whether typed, numbered (`1 pair`) or pasted (PLAN wl-mvb9mw00ycfjeo R4); no
+//       render shows an offer line for it (R2).
 // The lane tools are driven through the fake extension API as surface/test/lane-tools.test.ts drives them; Jo's word
-// through `interpret` / `apply` (surface/src/input.ts).
+// through `interpret` / `apply`, `interpretBatch` and `interpretPaste` (surface/src/input.ts).
 //
 // Regression: fails on 946c016 by assertion (the four bodies are recorded, a `pair` option is raised, and `pair` on a
 // forged offer is answered as a plain word).
@@ -16,9 +17,10 @@ import { describe, expect, test } from "bun:test";
 import { reviewLimitBody, ROUND_LIMIT_OPTIONS } from "../../classifier/src/rounds";
 import { CLASSIFIER_BY, LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
-import { CEILING_OPTIONS } from "../src/ceiling";
-import { apply, interpret } from "../src/input";
+import { errorLines } from "../src/errors";
+import { apply, interpret, interpretBatch, interpretPaste } from "../src/input";
 import { CLASSIFIER_MACHINERY_PREFIXES, controlEntries } from "../src/launch";
+import { Numbering } from "../src/numbering";
 import { SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, tempLedger } from "./helpers";
 
@@ -108,10 +110,9 @@ describe("D9 (2): a lane cannot raise its own question offering pair", () => {
 });
 
 describe("D9 (3): Jo's pair is honoured only on an offer from the question's raiser, at its own site", () => {
-	/** One forged offer: who raised the question (on an sl-ceiling slice when `ceiling`, with its review-limit: when `limit`), who wrote its pair-offer:, at which site, naming which question. */
+	/** One forged offer: who raised the question (with its review-limit: when `limit`), who wrote its pair-offer:, at which site, naming which question. */
 	interface Forgery {
 		raisedBy: string;
-		ceiling?: boolean;
 		limit?: boolean;
 		offerBy: string;
 		site: string;
@@ -123,12 +124,8 @@ describe("D9 (3): Jo's pair is honoured only on an offer from the question's rai
 		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "Restyle the settings modal", stakes: "normal", mode: "autonomous" });
 		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: `launch: ${LANE} cause first requested-by test` });
 		expect(ledger.claimWorkload(wl, { by: LANE_STARTER_BY, holder: LANE, leaseMs: 60_000 }).won).toBe(true);
-		const sl = ledger.addSlice({
-			by: o.ceiling ? LANE_RUNNER_BY : LANE, workloadId: wl, ...(o.ceiling ? { id: `sl-ceiling-${wl.slice(3)}-1` } : {}),
-			task: "t", doneCondition: "Jo answers stop, extend or split for the ceiling usd 50 wall 360", inputs: "i",
-		});
-		const options = o.ceiling ? [...CEILING_OPTIONS, "pair"] : [...ROUND_LIMIT_OPTIONS, "pair"];
-		const q = ledger.raiseQuestion({ by: o.raisedBy, workloadId: wl, sliceId: sl, body: "Decide.\npair: a reason.", options });
+		const sl = ledger.addSlice({ by: LANE, workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const q = ledger.raiseQuestion({ by: o.raisedBy, workloadId: wl, sliceId: sl, body: "Decide.", options: [...ROUND_LIMIT_OPTIONS, "pair"] });
 		if (o.limit) ledger.recordEntry({ by: o.raisedBy, workloadId: wl, sliceId: sl, kind: "assumption", body: reviewLimitBody(q, sl) });
 		const named = o.offerNames === "another" ? "q-another" : q;
 		ledger.recordEntry({ by: o.offerBy, workloadId: wl, kind: "assumption", body: `pair-offer: ${named} site ${o.site} signals e` });
@@ -138,18 +135,24 @@ describe("D9 (3): Jo's pair is honoured only on an offer from the question's rai
 	const cases: [string, Forgery][] = [
 		["a round-limit question whose pair-offer: the lane wrote", { raisedBy: LANE, limit: true, offerBy: LANE, site: "round-limit" }],
 		["a round-limit question whose pair-offer: the runner wrote", { raisedBy: LANE, limit: true, offerBy: LANE_RUNNER_BY, site: "round-limit" }],
-		["a round-limit question offered at site ceiling", { raisedBy: LANE, limit: true, offerBy: CLASSIFIER_BY, site: "ceiling" }],
 		["a round-limit question whose pair-offer: names another question", { raisedBy: LANE, limit: true, offerBy: CLASSIFIER_BY, site: "round-limit", offerNames: "another" }],
 		["the lane's own question (no review-limit:) with a classifier pair-offer:", { raisedBy: LANE, offerBy: CLASSIFIER_BY, site: "round-limit" }],
-		["a ceiling question whose pair-offer: the classifier wrote", { raisedBy: LANE_RUNNER_BY, ceiling: true, offerBy: CLASSIFIER_BY, site: "ceiling" }],
-		["a ceiling question offered at site round-limit", { raisedBy: LANE_RUNNER_BY, ceiling: true, offerBy: LANE_RUNNER_BY, site: "round-limit" }],
-		["a question on an sl-ceiling slice the lane raised, with a runner pair-offer:", { raisedBy: LANE, ceiling: true, offerBy: LANE_RUNNER_BY, site: "ceiling" }],
 	];
 	for (const [name, o] of cases) {
-		test(`${name}: pair is refused naming the question, nothing written`, () => {
+		test(`${name}: pair is refused naming the question on every path, nothing written, and no offer line is shown`, () => {
 			const { ledger, wl, q } = forged(o);
 			const before = snapshot(ledger, wl);
 			expect(typed(ledger, "pair")).toEqual({ refused: expect.stringContaining(`${q} does not offer pair`) });
+			const numbering = new Numbering();
+			const lines = numbering.assign(errorLines(ledger));
+			expect(lines.filter((l) => l.kind === "pair")).toEqual([]);
+			expect(lines.map((l) => l.line).join("\n")).not.toContain("pair offer");
+			const batch = interpretBatch(ledger, numbering, `${numbering.numberOf(q)} pair`);
+			expect(batch?.ok).toBe(true);
+			expect(() => ledger.write(() => batch!.ok && batch!.items.map(({ cmd }) => apply(ledger, cmd)))).toThrow(`${q} does not offer pair`);
+			const paste = interpretPaste(ledger, numbering, `pair ${q}\nThanks.`);
+			expect(paste?.ok).toBe(true);
+			expect(() => ledger.write(() => paste!.ok && paste!.items.map((i) => i.kind === "command" && apply(ledger, i.cmd)))).toThrow(`${q} does not offer pair`);
 			expect(snapshot(ledger, wl)).toEqual(before);
 		});
 	}

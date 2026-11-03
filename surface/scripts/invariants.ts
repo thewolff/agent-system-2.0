@@ -35,9 +35,11 @@
 // | no-independent-lab | the classifier's own `builderLabs` (classifier/src/lab.ts) excludes all three labs; review tokens held by a live spawning lane are passed as `liveReviews`, as the classifier does | `no-independent-lab:<wl>` |
 // | stale-reserved | a `reserved-request` entry older than 30 min that `reservedStates` (surface/src/errors.ts) still finds `waiting`: no `approve <id>` / `deny <id>` instruction, no `reserved-withdrawn: <id>`, its raising lane still holds the workload (a `lane-stopped` request is closed, not stale), and no later request repeats it | `stale-reserved:<entry>` |
 // | stuck-question | a question open for more than 30 min | `stuck-question:<q>` |
+// | ruling-miss | a question open as of as-of, raised at or after the ledger's first `ruling-applied:` entry landed by as-of (the activation receipt: only `askJo`, gates/src/rulings.ts, writes one; with none, nothing is selected), that an active standing ruling would have decided (`checkRulings` replayed as of its raise: its asker read from its writer — the orchestrator surface on the standing workload with its `question-about:` subject, the merge train, the classifier for a question its `review-park:` / `review-limit:` entry names, else the lane — with the workload's builders, stakes and train flag then, and Jo's `end-ruling` words by then): a raise path that bypassed `askJo`. A question whose every option is a `provider/model` id is never one: its row does not carry the declared subject. Nor is a NOW question, one a valid `now:` control entry (ESCALATION_BY's, `nowMarks`) names: it skips the rulings by design, and a look-alike by anyone else exempts nothing | `ruling-miss:<q>` |
+// | auto-apply-audit | PLAN wl-mvqwn80onq9hq8 D7: an ESCALATION_BY `auto-applied:` row on an open workload where (a) no `auto-applied-result:` for its tool call landed within 10 min, (b) an `auto-apply-tripped:` names its tool call, or (c) its command, re-run through today's `routineVerdict` (gates/src/routine.ts) with the row's cwd, its writer's role (`lane-…` a lane, else a hand), the workload's scratch root under HOME (read as it is now, also in replay) and, for a lane, the workload's `worktree:` entry, now asks (a classifier tightened since); also a row that does not parse, and a trip naming no `auto-applied:` row at all. Escaped writes are (b)'s, never (c)'s. (c) is skipped, naming the rows, for a workload whose scratch root is gone | `auto-apply-audit:<auto-applied entry>` (`auto-apply-audit:<trip entry>` for a trip with no row) |
 // | stuck-review | a `hand-spawn: … review yes` with no `hand-settled:` after 45 min while any lane on the workload is alive | `stuck-review:<token>` |
 // | provider-refusal-loop | 2+ `lane-exit:` on one workload within 30 min, each with refusal evidence (`usage polic`, `non-retryable`, `refusal`) in ledger entries/messages from 2 min before to 5 min after the exit (never past as-of), or, for `outcome error`, in the final `prompt_result` of the lane's rpc log `lane-<n>.jsonl` (read as it is now) | `provider-refusal-loop:<wl>:<first lane>` |
-// | silent-orchestrator | no `wl-orchestrator` entry for 2 h while any lane process is alive | `silent-orchestrator:<last entry id>` |
+// | silent-orchestrator | no `wl-orchestrator` entry for 2 h while any lane process is alive; the train tick's rows there (MERGE_TRAIN_BY: its boards' skips, notices and cutover, PLAN wl-mvbjiettjrfpxc D10) are not the orchestrator's | `silent-orchestrator:<last entry id>` |
 // | checkout-behind-main | `git rev-parse HEAD` differs from `origin/main` in the checkout. Behind (HEAD is an ancestor of origin/main): `behind origin/main by <n>; fast-forward at a lull` (or `fast-forward would refuse` with the modified tracked files, or `git status failed` when cleanliness could not be read). Diverged (neither is an ancestor of the other): `DIVERGED … needs a person`. Ahead only (origin/main is an ancestor of HEAD: local commits not yet on main) is not a finding. It never fetches, so origin/main is whatever the checkout already has. | `checkout-behind-main:<head12>:<origin12>` (`…:diverged:…` when diverged) |
 // | process-older-than-head | an `omp --cwd <checkout>` process (not a persistent seat: commands naming `/seat-sessions/` are skipped) started before HEAD arrived, where "arrived" is the later of HEAD's commit time and its newest reflog entry | `process-older-than-head:<pid>:<head12>` |
 // | ff-lull | checkout-behind-main with tracked files clean (`git status --porcelain --untracked-files=no` succeeded and printed nothing) AND zero review hands in flight. In flight = a `hand-spawn: … review yes` token with no `hand-settled: <token>` whose spawning lane has a live `lane.ts run` process: the `liveReviews` set the classifier passes to `builderLabs`. Unsettled review hands whose lane is gone are listed, not counted. The text cites the fingerprint rule (classifier/src/fingerprint.ts header: a review's fingerprint covers its lane's worktree only) rather than asserting the fast-forward is safe. | `ff-lull:<origin12>:<id of the newest review hand-settled entry>`, so one notice per lull |
@@ -67,15 +69,23 @@ import { Database } from "bun:sqlite";
 import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { builderLabs, describeBuilders, excludedLabs, parseHandSpawn } from "../../classifier/src/lab";
+import { parseReviewLimit } from "../../classifier/src/rounds";
+import { checkRulings, endedRulings, nowMarks, type RulingFacts } from "../../gates/src/rulings";
 import { BACKUP_DEFAULTS, BACKUP_NAME, backupNamespace, copyProblem, processAlive } from "../../ledger/src/index";
-import type { EntryKind, EntryRow, InstructionRow, WorkloadStatusRow } from "../../ledger/src/index";
+import type { EntryKind, EntryRow, InstructionRow, RoutingRow, Stakes, WorkloadStatusRow } from "../../ledger/src/index";
 import { assertNotLiveLedgerUnderTest, canonicalPath, defaultLedgerPath, homeDir } from "../../ledger/src/locality";
+import { routineVerdict } from "../../gates/src/routine";
+import { MISSING_RESULT_MS } from "../../gates/src/routine-switch";
+import { ownScratchRoot, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
+import { LANE_ENV, ROLE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { type ReservedLedgerView, reservedStates } from "../src/errors";
-import { laneDir } from "../src/launch";
-import { STANDING_WORKLOAD_ID } from "../src/types";
+import { type ControlEntry, controlEntries, laneDir } from "../src/launch";
+import { trainPrs } from "../src/merge-train";
+import { ESCALATION_BY, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { type AutoApplied, parseAutoApplied } from "./daily-report";
 
 export const INVARIANTS = [
-	"dead-lane", "silent-lane", "orphan-hand", "no-independent-lab", "stale-reserved", "stuck-question", "stuck-review",
+	"dead-lane", "silent-lane", "orphan-hand", "no-independent-lab", "stale-reserved", "stuck-question", "ruling-miss", "auto-apply-audit", "stuck-review",
 	"provider-refusal-loop", "silent-orchestrator", "checkout-behind-main", "process-older-than-head", "ff-lull", "stale-backup",
 ] as const;
 export type Invariant = (typeof INVARIANTS)[number];
@@ -133,6 +143,11 @@ export interface Input {
 	orchestrators: () => Probe<OrchestratorProcess[]>;
 	/** The ledger's scheduled-copy directory, and how far the newest write may run ahead of the newest copy. */
 	backups: { dir: string; gapMs: number };
+	/**
+	 * The environment auto-apply-audit (c) re-runs a row's command in, as `laneEnv` builds a lane's from the starter's: its
+	 * HOME places the workload's scratch root, and the role, workload, lane and `AS2_SCRATCH` are written over it per row.
+	 */
+	env: Record<string, string | undefined>;
 }
 
 const MIN = 60_000;
@@ -162,9 +177,25 @@ const QUESTION_SQL = `SELECT q.id, q.workload_id, q.created_at, q.body FROM ques
   WHERE q.created_at <= :cutoff
     AND (q.state = 'open' OR (SELECT i.created_at FROM instructions i WHERE i.id = q.resolved_by) > :asOf)
   ORDER BY q.created_at`;
+/**
+ * ruling-miss: questions open as of :asOf and raised at or after the rulings check went live, with their workload's stakes.
+ * The ledger's activation receipt is its first `ruling-applied:` entry landed by :asOf (only `askJo`, gates/src/rulings.ts,
+ * writes one; a lane cannot, surface/extensions/lane-tools.ts): questions raised before it went to Jo by design, and with
+ * none there is nothing to compare against, so nothing is selected.
+ */
+const RULING_MISS_SQL = `SELECT q.id, q.workload_id, q.body, q.options, q.created_by, q.created_at, w.stakes FROM questions q JOIN workloads w ON w.id = q.workload_id
+  WHERE q.created_at <= :asOf
+    AND q.created_at >= (SELECT min(a.created_at) FROM entries a WHERE a.body LIKE 'ruling-applied: %' AND a.created_at <= :asOf)
+    AND (q.state = 'open' OR (SELECT i.created_at FROM instructions i WHERE i.id = q.resolved_by) > :asOf)
+  ORDER BY q.created_at`;
+/** auto-apply-audit: ESCALATION_BY's auto-apply rows on every workload (trips sit on the standing one), with each row's workload status. */
+const AUTO_APPLY_SQL = `SELECT e.id, e.workload_id, e.slice_id, e.kind, e.body, e.created_by, e.created_at, w.status FROM entries e JOIN workloads w ON w.id = e.workload_id
+  WHERE e.kind = 'assumption' AND e.created_by = :writer AND e.created_at <= :asOf
+    AND (substr(e.body, 1, 13) = 'auto-applied:' OR substr(e.body, 1, 20) = 'auto-applied-result:' OR substr(e.body, 1, 19) = 'auto-apply-tripped:')
+  ORDER BY e.created_at, e.rowid`;
 const NEAR_SQL = `SELECT body FROM entries WHERE workload_id = :wl AND created_at BETWEEN :from AND :to
   UNION ALL SELECT body FROM messages WHERE workload_id = :wl AND created_at BETWEEN :from AND :to`;
-const ORCH_SQL = `SELECT id, created_at FROM entries WHERE workload_id = :wl AND created_at <= :asOf ORDER BY created_at DESC LIMIT 1`;
+const ORCH_SQL = `SELECT id, created_at FROM entries WHERE workload_id = :wl AND created_by <> :tick AND created_at <= :asOf ORDER BY created_at DESC LIMIT 1`;
 const REVIEW_SQL = `SELECT id, workload_id, created_at, body FROM entries
   WHERE (body LIKE 'hand-spawn:% review yes %' OR body LIKE 'hand-settled: %') AND created_at <= :asOf ORDER BY created_at, rowid`;
 
@@ -457,6 +488,132 @@ export function check(input: Input): Report {
 		});
 	}
 
+	// ---- 5b. ruling-miss (gates/src/rulings.ts checkRulings, replayed as of each raise) ----------
+	const misses = run<{ id: string; workload_id: string; body: string; options: string; created_by: string; created_at: string; stakes: Stakes }>(RULING_MISS_SQL, {
+		":asOf": asOf,
+	});
+	for (const q of misses.rows) {
+		const t = q.created_at;
+		const p = { ":wl": q.workload_id, ":t": t };
+		const entries = db.query("SELECT * FROM entries WHERE workload_id = :wl AND created_at <= :t ORDER BY created_at, rowid").all(p as never) as EntryRow[];
+		const instructions = db.query("SELECT * FROM instructions WHERE workload_id = :wl AND created_at <= :t ORDER BY created_at, rowid").all(p as never) as InstructionRow[];
+		const standing = db
+			.query("SELECT * FROM instructions WHERE workload_id = :wl AND created_at <= :t ORDER BY created_at, rowid")
+			.all({ ":wl": STANDING_WORKLOAD_ID, ":t": t } as never) as InstructionRow[];
+		// The raise's own marks (`review-park:`, `review-limit:`, `question-about:`) are written in its transaction, after the row: read up to as-of.
+		const marks = db
+			.query("SELECT * FROM entries WHERE workload_id = :wl AND created_at <= :asOf ORDER BY created_at, rowid")
+			.all({ ":wl": q.workload_id, ":asOf": asOf } as never) as EntryRow[];
+		const names = (e: EntryRow) => e.created_by === q.created_by && (e.body.startsWith(`review-park: ${q.id} slice `) || parseReviewLimit(e.body)?.questionId === q.id);
+		// A NOW question skips every ruling by design (askJo, PLAN wl-mvg1vs0rhnu3gg § 1.0): only ESCALATION_BY's valid `now:` mark, written in its raise's (or upgrade's) transaction, exempts it.
+		if (nowMarks(marks).has(q.id)) continue;
+		let facts: RulingFacts;
+		if (q.workload_id === STANDING_WORKLOAD_ID && q.created_by === SURFACE_BY) {
+			const about = marks.find((e) => e.created_by === SURFACE_BY && e.body.startsWith(`question-about: ${q.id} `))?.body.split(" ")[2] ?? null;
+			facts = { asker: "orchestrator", about };
+		} else if (q.created_by === MERGE_TRAIN_BY) facts = { asker: "train" };
+		else if (marks.some(names)) facts = { asker: "classifier", kimiOut: false };
+		else {
+			const routings = db.query("SELECT * FROM routings WHERE workload_id = :wl AND created_at <= :t ORDER BY created_at").all(p as never) as RoutingRow[];
+			facts = {
+				asker: "lane",
+				builders: builderLabs({ entries: () => entries, routings: () => routings }, q.workload_id),
+				stakes: q.stakes,
+				train: trainPrs(entries, instructions).length > 0,
+			};
+		}
+		const decided = checkRulings({ body: q.body, options: JSON.parse(q.options) as string[], subject: null }, facts, { now: Date.parse(t), ended: endedRulings(standing) });
+		if (decided === null) continue;
+		findings.push({
+			key: `ruling-miss:${q.id}`,
+			invariant: "ruling-miss",
+			workload: q.workload_id,
+			since: t,
+			text: `question ${q.id} (raised by ${q.created_by}, ${facts.asker}) went to Jo though Jo's ruling ${decided.ruling} answers it (${decided.answer}: ${decided.action}): a raise path bypassed askJo (gates/src/rulings.ts). ${q.body.replace(/\s+/g, " ").slice(0, 100)}`,
+			query: `${misses.shown} -- then gates/src/rulings.ts checkRulings over the workload's entries, routings and instructions up to the question's created_at`,
+		});
+	}
+
+	// ---- 5c. auto-apply-audit (PLAN wl-mvqwn80onq9hq8 D7) ------------------------------------------------
+	// Each ESCALATION_BY `auto-applied:` row on an open workload: (a) its result landed within MISSING_RESULT_MS, (b) no trip
+	// names its tool call, and (c) today's classifier, re-run on its command, still lets it through. A trip naming no row is a
+	// finding of its own. Rows and trips are matched by tool call id; look-alikes by any other writer are not read.
+	const auto = run<Entry & { status: string }>(AUTO_APPLY_SQL, { ":writer": ESCALATION_BY, ":asOf": asOf });
+	const autoStatus = new Map(auto.rows.map(r => [r.id, r]));
+	const autoControl = controlEntries(auto.rows as EntryRow[]);
+	const callOf = (c: ControlEntry) => c.rest.split(/\s+/)[0] ?? "";
+	const resultFor = new Map<string, ControlEntry>();
+	const tripsFor = new Map<string, ControlEntry[]>();
+	const appliedCalls = new Set<string>();
+	for (const c of autoControl) {
+		if (c.prefix === "auto-applied-result") {
+			if (!resultFor.has(callOf(c))) resultFor.set(callOf(c), c);
+		} else if (c.prefix === "auto-apply-tripped") tripsFor.set(callOf(c), [...(tripsFor.get(callOf(c)) ?? []), c]);
+		else if (c.prefix === "auto-applied") {
+			const a = parseAutoApplied(c.body);
+			if (a) appliedCalls.add(a.toolCallId);
+		}
+	}
+	const autoQuery = `${auto.shown} -- then: per auto-applied row, its tool call's auto-applied-result: and auto-apply-tripped:, and gates/src/routine.ts routineVerdict on its command`;
+	const cut = (s: string, n = 120) => {
+		const t = s.replace(/\s+/g, " ").trim();
+		return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+	};
+	/** (c): today's verdict on a row's command in the env a lane or hand of `wl` has, or why it cannot be re-run here. */
+	const reverdict = (wl: string, a: AutoApplied): { ask: string } | { ok: true } | { unjudged: string } => {
+		const lane = a.by.startsWith("lane-");
+		const env: Record<string, string | undefined> = { ...input.env, [ROLE_ENV]: lane ? "lane" : "hand", [WORKLOAD_ENV]: wl, [LANE_ENV]: lane ? a.by : undefined };
+		try {
+			env[SCRATCH_ENV] = scratchRootFor(homeDir(input.env), wl);
+		} catch (e) {
+			return { unjudged: `no scratch root can be named (${e instanceof Error ? e.message : String(e)})` };
+		}
+		if (ownScratchRoot(env) === null) return { unjudged: `its scratch root ${env[SCRATCH_ENV]} is not a directory now` };
+		const worktree = lane ? controlEntries((byWorkload.get(wl) ?? []) as EntryRow[]).findLast(c => c.prefix === "worktree")?.rest : undefined;
+		const v = routineVerdict({ toolName: "bash", input: { command: a.command } }, { role: lane ? "lane" : "hand", cwd: a.cwd, env, ...(worktree ? { worktreeRoot: worktree } : {}) });
+		return "ask" in v ? { ask: v.ask } : { ok: true };
+	};
+	const unjudged = new Map<string, { why: string; ids: string[] }>();
+	for (const c of autoControl) {
+		if (c.prefix !== "auto-applied") continue;
+		const row = autoStatus.get(c.id)!;
+		if (row.status !== "open") continue;
+		const a = parseAutoApplied(c.body);
+		if (!a) {
+			findings.push({
+				key: `auto-apply-audit:${c.id}`, invariant: "auto-apply-audit", workload: row.workload_id, since: c.createdAt,
+				text: `auto-applied ${c.id} does not parse as \`auto-applied: <rule> <toolCallId> by <id> cwd <cwd> net <yes|no>: <command>\`, so its result, trips and today's verdict cannot be matched: ${cut(c.body)}`,
+				query: autoQuery,
+			});
+			continue;
+		}
+		const why: string[] = [];
+		if (!resultFor.has(a.toolCallId) && c.createdAt <= ago(MISSING_RESULT_MS)) why.push(`(a) no auto-applied-result: for tool call ${a.toolCallId} after ${age(c.createdAt)}`);
+		for (const t of tripsFor.get(a.toolCallId) ?? []) why.push(`(b) tripped: ${t.id} at ${t.createdAt}: ${cut(t.rest)}`);
+		const v = reverdict(row.workload_id, a);
+		if ("ask" in v) why.push(`(c) today's routineVerdict asks: ${v.ask}`);
+		else if ("unjudged" in v) {
+			const u = unjudged.get(row.workload_id) ?? { why: v.unjudged, ids: [] };
+			u.ids.push(c.id);
+			unjudged.set(row.workload_id, u);
+		}
+		if (why.length === 0) continue;
+		findings.push({
+			key: `auto-apply-audit:${c.id}`, invariant: "auto-apply-audit", workload: row.workload_id, since: c.createdAt,
+			text: `auto-applied ${c.id} (${a.rule}, tool call ${a.toolCallId}, by ${a.by}, cwd ${a.cwd}, net ${a.net ? "yes" : "no"}): ${cut(a.command)} — ${why.join("; ")}.`,
+			query: autoQuery,
+		});
+	}
+	for (const c of autoControl) {
+		if (c.prefix !== "auto-apply-tripped" || appliedCalls.has(callOf(c))) continue;
+		findings.push({
+			key: `auto-apply-audit:${c.id}`, invariant: "auto-apply-audit", workload: autoStatus.get(c.id)!.workload_id, since: c.createdAt,
+			text: `trip ${c.id} names tool call ${callOf(c) || "(none)"}, which no auto-applied: row records: ${cut(c.rest)}`,
+			query: autoQuery,
+		});
+	}
+	for (const [wl, u] of unjudged) skip("auto-apply-audit", `(c) not re-run on ${wl}: ${u.why}; rows ${u.ids.join(", ")}`);
+
 	// ---- 7. provider-refusal-loop ---------------------------------------------------------------
 	for (const [wl, entries] of byWorkload) {
 		const refusals: { lane: string; at: string; why: string }[] = [];
@@ -496,7 +653,7 @@ export function check(input: Input): Report {
 	}
 
 	// ---- 8. silent-orchestrator -----------------------------------------------------------------
-	const orch = run<{ id: string; created_at: string }>(ORCH_SQL, { ":wl": STANDING_WORKLOAD_ID, ":asOf": asOf });
+	const orch = run<{ id: string; created_at: string }>(ORCH_SQL, { ":wl": STANDING_WORKLOAD_ID, ":tick": MERGE_TRAIN_BY, ":asOf": asOf });
 	const lastOrch = orch.rows[0];
 	if (!liveLanes) skip("silent-orchestrator", NO_PGREP);
 	else if (liveLanes.size > 0 && (!lastOrch || lastOrch.created_at < ago(120 * MIN))) {
@@ -622,63 +779,81 @@ export function check(input: Input): Report {
 	}
 
 	// ---- stale-backup -----------------------------------------------------------------------------
-	// A finding only when the ledger's newest write is newer than the newest copy by more than the gap: writes no
-	// copy captured. Never the copy's wall-clock age: 2026-10-09T18:03Z to 2026-10-11T18:10Z the ledger wrote
-	// nothing, every copy matched it, and an age-of-copy rule read that as stale (wl-mv4gn9l7spcsg0 FINDINGS.md).
-	const { dir: backupDir, gapMs } = input.backups;
-	const replayNote = replay ? " (replay: the backup directory and its files are read as they are on disk now, not as of as-of: copies pruned since are missing, copies named after as-of are ignored)" : "";
-	const hours = (ms: number) => `${(ms / (60 * MIN)).toFixed(1)}h`;
-	let copies: { name: string; at: string }[] | null = null;
-	try {
-		copies = (existsSync(backupDir) ? readdirSync(backupDir) : []).flatMap(name => {
-			const m = BACKUP_NAME.exec(name);
-			return m ? [{ name, at: `${m[1]}T${m[2]}:${m[3]}:${m[4]}` }] : [];
-		}).filter(c => c.at <= asOf).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
-	} catch (e) {
-		skip("stale-backup", `the backup directory ${backupDir} could not be listed: ${e instanceof Error ? e.message : String(e)}`);
-	}
-	if (copies) {
-		// Every created_at across the tables that have one (the copy is the whole file, so these are the copied tables).
-		const writesSql = db.query<{ name: string }, []>(
-			"SELECT m.name FROM sqlite_master m WHERE m.type = 'table' AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE name = 'created_at') ORDER BY m.name",
-		).all().map(t => `SELECT created_at FROM "${t.name}"`).join(" UNION ALL ");
-		const writes = run<{ oldest: string | null; newest: string | null }>(
-			`SELECT min(created_at) AS oldest, max(created_at) AS newest FROM (${writesSql}) WHERE created_at <= :asOf`,
-			{ ":asOf": asOf },
-		);
-		const { oldest, newest } = writes.rows[0]!;
-		// The newest copy that is a complete ledger by the backup writer's own test (copyProblem: not empty, readable,
-		// integrity_check ok, at SCHEMA_VERSION). A newer file named like a copy that fails it captured nothing, so the
-		// walk goes back past it; opening is read-only, and quarantining such a file stays the writer's job.
-		const rejected: string[] = [];
-		let newestCopy: { name: string; at: string } | undefined;
-		for (const c of copies.toReversed()) {
-			const problem = copyProblem(join(backupDir, c.name));
-			if (problem === null) { newestCopy = c; break; }
-			rejected.push(`${c.name} (${problem})`);
-		}
-		// With no complete copy at all, nothing since the ledger's first write is captured.
-		const capturedAt = newestCopy?.at ?? oldest;
-		const behindMs = newest && capturedAt ? Date.parse(newest) - Date.parse(capturedAt) : 0;
-		if (behindMs > gapMs) {
-			const copyText = (newestCopy
-				? `newest ledger backup ${newestCopy.at} (${newestCopy.name})`
-				: `no ledger backup at or before ${asOf} (first ledger write ${oldest})`)
-				+ (rejected.length ? `; not counted, not a complete copy: ${rejected.join(", ")}` : "");
-			findings.push({
-				key: `stale-backup:${newestCopy?.name ?? "none"}`,
-				invariant: "stale-backup",
-				workload: "ledger",
-				since: capturedAt!,
-				text: `newest ledger write ${newest} is ${hours(behindMs)} newer than ${copyText} in ${backupDir} (gap ${hours(gapMs)})${replayNote}: writes since then are in no copy. The job is ledger/scripts/backup.ts (launchd agent com.agent-system-2.ledger-backup on macOS).`,
-				query: `ls ${backupDir}/ledger-*.db; copyProblem() (ledger/src/index.ts) on each, newest first; ${writes.shown}`,
-			});
-		}
-	}
+	const backup = backupState(db, input.backups.dir, input.backups.gapMs, asOf, replay);
+	if (backup.state === "unjudged") skip("stale-backup", backup.why);
+	else if (backup.state === "stale") findings.push(backup.finding);
 
 	return {
 		asOf, replay, liveLanes: liveLanes ? [...liveLanes] : null, reviewsInFlight, orphanReviews, findings, skipped,
 		elapsedMs: Math.round(performance.now() - t0),
+	};
+}
+
+/** stale-backup's judgement of the ledger's scheduled copies (`backupState`): within the gap, a finding, or why it could not be judged. */
+export type BackupState =
+	| { state: "ok"; dir: string; copy: { name: string; at: string } | null; behindMs: number; rejected: string[] }
+	| { state: "stale"; finding: Finding }
+	| { state: "unjudged"; why: string };
+
+/**
+ * The stale-backup rule over `db` and the copy directory `dir`, as of `asOf` (`check()` reports it; `as2 doctor`'s backup
+ * part reads it, PLAN wl-mvwks11ye3x9zu R6). A finding only when the ledger's newest write is newer than the newest copy by
+ * more than `gapMs`: writes no copy captured. Never the copy's wall-clock age: 2026-10-09T18:03Z to 2026-10-11T18:10Z the
+ * ledger wrote nothing, every copy matched it, and an age-of-copy rule read that as stale (wl-mv4gn9l7spcsg0 FINDINGS.md).
+ * A directory that cannot be listed is `unjudged`, never a pass. `replay` adds the note that files are read as they are now.
+ */
+export function backupState(db: Database, dir: string, gapMs: number, asOf: string, replay = false): BackupState {
+	const replayNote = replay ? " (replay: the backup directory and its files are read as they are on disk now, not as of as-of: copies pruned since are missing, copies named after as-of are ignored)" : "";
+	const hours = (ms: number) => `${(ms / (60 * MIN)).toFixed(1)}h`;
+	let names: string[];
+	try {
+		names = readdirSync(dir);
+	} catch (e) {
+		// Only a missing directory is "no copies yet". existsSync is false on EACCES too, so it is never the test: a
+		// directory that exists but cannot be listed is unjudged (review r6 F16).
+		if (!(e instanceof Error && "code" in e && e.code === "ENOENT")) return { state: "unjudged", why: `the backup directory ${dir} could not be listed: ${e instanceof Error ? e.message : String(e)}` };
+		names = [];
+	}
+	const copies = names.flatMap(name => {
+		const m = BACKUP_NAME.exec(name);
+		return m ? [{ name, at: `${m[1]}T${m[2]}:${m[3]}:${m[4]}` }] : [];
+	}).filter(c => c.at <= asOf).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+	// Every created_at across the tables that have one (the copy is the whole file, so these are the copied tables).
+	const writesSql = db.query<{ name: string }, []>(
+		"SELECT m.name FROM sqlite_master m WHERE m.type = 'table' AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE name = 'created_at') ORDER BY m.name",
+	).all().map(t => `SELECT created_at FROM "${t.name}"`).join(" UNION ALL ");
+	// Positional, so it binds on a strict connection (the Ledger's) and a plain one (invariants' own) alike.
+	const writesQuery = `SELECT min(created_at) AS oldest, max(created_at) AS newest FROM (${writesSql}) WHERE created_at <= ?1`;
+	const { oldest, newest } = db.query<{ oldest: string | null; newest: string | null }, [string]>(writesQuery).all(asOf)[0]!;
+	const shown = writesQuery.replace(/\s+/g, " ").trim().replaceAll("?1", `'${asOf.replaceAll("'", "''")}'`);
+	// The newest copy that is a complete ledger by the backup writer's own test (copyProblem: not empty, readable,
+	// integrity_check ok, at SCHEMA_VERSION). A newer file named like a copy that fails it captured nothing, so the
+	// walk goes back past it; opening is read-only, and quarantining such a file stays the writer's job.
+	const rejected: string[] = [];
+	let newestCopy: { name: string; at: string } | undefined;
+	for (const c of copies.toReversed()) {
+		const problem = copyProblem(join(dir, c.name));
+		if (problem === null) { newestCopy = c; break; }
+		rejected.push(`${c.name} (${problem})`);
+	}
+	// With no complete copy at all, nothing since the ledger's first write is captured.
+	const capturedAt = newestCopy?.at ?? oldest;
+	const behindMs = newest && capturedAt ? Date.parse(newest) - Date.parse(capturedAt) : 0;
+	if (behindMs <= gapMs) return { state: "ok", dir, copy: newestCopy ?? null, behindMs, rejected };
+	const copyText = (newestCopy
+		? `newest ledger backup ${newestCopy.at} (${newestCopy.name})`
+		: `no ledger backup at or before ${asOf} (first ledger write ${oldest})`)
+		+ (rejected.length ? `; not counted, not a complete copy: ${rejected.join(", ")}` : "");
+	return {
+		state: "stale",
+		finding: {
+			key: `stale-backup:${newestCopy?.name ?? "none"}`,
+			invariant: "stale-backup",
+			workload: "ledger",
+			since: capturedAt!,
+			text: `newest ledger write ${newest} is ${hours(behindMs)} newer than ${copyText} in ${dir} (gap ${hours(gapMs)})${replayNote}: writes since then are in no copy. The job is ledger/scripts/backup.ts (launchd agent com.agent-system-2.ledger-backup on macOS).`,
+			query: `ls ${dir}/ledger-*.db; copyProblem() (ledger/src/index.ts) on each, newest first; ${shown}`,
+		},
 	};
 }
 
@@ -871,6 +1046,7 @@ export function main(argv: string[]): number {
 			git: available("git") ? gitIn(args.repo) : null,
 			orchestrators: () => orchestratorsFromPs(args.repo),
 			backups: { dir: join(dirname(canonical), "backups", backupNamespace(canonical)), gapMs: args.backupGapMs },
+			env: process.env,
 		});
 		if (args.reviews) console.log(reviewsLine(report));
 		else if (args.json) {

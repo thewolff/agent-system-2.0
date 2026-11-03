@@ -1,0 +1,25 @@
+{
+	"source": "live ledger, test-run entries for sha 7482fbd (error then green, never red)",
+	"rows": [
+		{
+			"t": "entry",
+			"id": "en-mva2bmm239r0g0",
+			"workloadId": "wl-mv8wzytml878b4",
+			"sliceId": "sl-rank-pause",
+			"kind": "assumption",
+			"by": "test-runner",
+			"at": "2026-10-15T21:40:26.042Z",
+			"body": "test-run: tr-0mv9qjpm4vobqer error sha=7482fbdf685fb8d836a1d10df47bd86f9b6d59d1 pr=158 {\"sha\":\"7482fbdf685fb8d836a1d10df47bd86f9b6d59d1\",\"pr\":158,\"reason\":\"runner died\",\"headAtEnd\":null,\"base\":null,\"mergeBase\":null,\"full\":null,\"solo\":[],\"failures\":[],\"runDir\":\"/Users/jowolff/.agent-system-2/test-runs/tr-0mv9qjpm4vobqer\",\"preflight\":null}"
+		},
+		{
+			"t": "entry",
+			"id": "en-mva35u44051b7k",
+			"workloadId": "wl-mv8wzytml878b4",
+			"sliceId": "sl-rank-pause",
+			"kind": "assumption",
+			"by": "test-runner",
+			"at": "2026-10-15T22:03:55.444Z",
+			"body": "test-run: tr-0mva2bmm0sn8frw green sha=7482fbdf685fb8d836a1d10df47bd86f9b6d59d1 pr=158 {\"sha\":\"7482fbdf685fb8d836a1d10df47bd86f9b6d59d1\",\"pr\":158,\"reason\":null,\"headAtEnd\":\"7482fbdf685fb8d836a1d10df47bd86f9b6d59d1\",\"base\":\"847182926060e6381af642962f3aa5981cd9de0c\",\"mergeBase\":\"847182926060e6381af642962f3aa5981cd9de0c\",\"full\":{\"pass\":5287,\"fail\":0,\"skip\":94,\"exit\":0,\"ms\":1050853,\"error\":null},\"solo\":[{\"file\":\"./surface/test/lane-script.test.ts\",\"pass\":64,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":289118,\"error\":null},{\"file\":\"./surface/test/launch.test.ts\",\"pass\":76,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":142,\"error\":null},{\"file\":\"./surface/test/priority-pause.test.ts\",\"pass\":1,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":19570,\"error\":null},{\"file\":\"./surface/test/rank-launch.test.ts\",\"pass\":35,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":8265,\"error\":null},{\"file\":\"./surface/test/rank-tool.test.ts\",\"pass\":21,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":1000,\"error\":null},{\"file\":\"./surface/test/rank.test.ts\",\"pass\":34,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":430,\"error\":null},{\"file\":\"./surface/test/render.test.ts\",\"pass\":35,\"fail\":0,\"skip\":0,\"exit\":0,\"ms\":785,\"error\":null}],\"failures\":[],\"runDir\":\"/Users/jowolff/.agent-system-2/test-runs/tr-0mva2bmm0sn8frw\",\"preflight\":\"install: _as2test 600:600, bun 1.3.14, source https://github.com/thewolff/agent-system-2.0.git at 847182926060; probe: 23 paths unreachable as _as2test\"}"
+		}
+	]
+}

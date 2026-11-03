@@ -9,15 +9,23 @@
 // regardless of the last-N window), pending messages with their P-7c states, the last N ledger
 // entries (instructions, answers, assumptions, wake reads, slice completions and cancellations, and
 // hand-backs the orchestrator has acted on — § B7 names hand-backs as recent history, Codex S5) —
-// is the on-demand read's (LEDGER_TOOL), for one workload or all of them.
+// is the on-demand read's (LEDGER_TOOL), for one workload or all of them. While an agent channel runs on the ledger
+// handle (PLAN wl-mv8vx7wdj5nx1c D3), every render carries the `## from other agents` block after the needs-you lines:
+// the channel's notes, which are Ilex's to read and not Jo's to answer (surface/src/channel.ts `fromOtherAgents`).
 import type { InFlightWorkload, InstructionRow, Ledger, MessageRow, SliceRow, WorkloadStatusRow } from "../../ledger/src/index";
+import { channelInForce, fromOtherAgents } from "./channel";
 import { needsYouBullet } from "./delivery";
-import { type ErrorLine, errorLines, parseDue } from "./errors";
+import { type ErrorLine, errorLines, parseDue, wordsOf } from "./errors";
 import { type Identity, identityOf } from "./identity";
 import { parseSpend } from "./ceiling";
-import { ceilingOf, ceilingText } from "./input";
-import { byHandLine, controlEntries, doneLine, holdersOf, isPlanQuestionIn, planFirst } from "./launch";
+import { ceilingOf, ceilingText, openPairOffer } from "./input";
+import { trainMembers } from "./merge-train";
+import { byHandLine, type ControlEntry, controlEntries, doneLine, holdersOf, isPlanQuestionIn, planFirst, priorityPausedOf, priorityPausingOf, queuedOf } from "./launch";
+import { pairOfferLine, shownOptions } from "./pair-suggest";
 import { Numbering } from "./numbering";
+import { currentGoals, livePins, parseAudit, rankDay, rankOpen, rankPosition } from "./rank";
+import { queuePosition } from "./rank-launch";
+import { pdtDay, trainDayLimit, trainPauses, trainRaises } from "./train-budget";
 import { LAST_N, LEDGER_TOOL, STANDING_WORKLOAD_ID } from "./types";
 
 export interface RenderOptions {
@@ -37,6 +45,8 @@ export interface RenderOptions {
 	heading?: string;
 	/** The session's numbering (surface/src/session.ts), so a row keeps its `#n` across renders; a fresh one (1..k) when absent. */
 	numbering?: Numbering;
+	/** The Jev rank mode in force (surface/src/rank-launch.ts readRankConfig), for the rank line's label; show when absent. */
+	rankMode?: string;
 }
 
 export interface Rendered {
@@ -48,29 +58,53 @@ export interface Rendered {
 
 /**
  * `stakes: normal (default …) · mode: autonomous` — one line, both halves flippable in one word; `plan first: …` when the flag stands (decision 15);
- * the effective ceiling last (DESIGN-workload-ceiling.md § 2 item 5).
+ * `queued #N of M` while the workload is in the intake queue (PLAN wl-mvbcjadqgblr7k D8, N from `queuePosition`);
+ * the effective ceiling last (DESIGN-workload-ceiling.md § 2 item 5), or for a merge train its daily budget (`trainBudgetText`).
  */
 export function oneLiner(ledger: Ledger, workload: WorkloadStatusRow): string {
 	const p = oneLinerParts(ledger, workload);
-	return `${p.state} — flip either with one word: throwaway / normal / production, autonomous / user-driven · ceiling ${p.ceiling}`;
+	return `${p.state} — flip either with one word: throwaway / normal / production, autonomous / user-driven · ${p.limit}`;
 }
 
-/** The one-liner without its flip hint: `stakes: X · mode: Y[ · plan first: …] · ceiling $A / Bh` (a "which one?" candidate, surface/extensions/surface-input.ts). */
+/** The one-liner without its flip hint: `stakes: X · mode: Y[ · plan first: …][ · queued #N of M] · ceiling $A / Bh` (a train: `· budget $L/PDT day · no wall[ · paused until <iso>]`; the wake line's core, and a "which one?" candidate, surface/extensions/surface-input.ts). */
 export function oneLinerCore(ledger: Ledger, workload: WorkloadStatusRow): string {
 	const p = oneLinerParts(ledger, workload);
-	return `${p.state} · ceiling ${p.ceiling}`;
+	return `${p.state} · ${p.limit}`;
 }
 
-function oneLinerParts(ledger: Ledger, workload: WorkloadStatusRow): { state: string; ceiling: string } {
+function oneLinerParts(ledger: Ledger, workload: WorkloadStatusRow): { state: string; limit: string } {
 	const flips = ledger.instructions(workload.id).filter((i) => i.kind === "mode-flip");
 	const lastFlip = flips[flips.length - 1];
 	const effective = ledger.entries(workload.id, "mode-effective");
 	const lastEffective = effective[effective.length - 1];
 	const pending = lastFlip && lastFlip.body === workload.mode && !(lastEffective && lastEffective.body === workload.mode && lastEffective.created_at >= lastFlip.created_at);
 	const mode = pending ? `${workload.mode} (flip pending until the lane's tool policy matches)` : workload.mode;
-	const plan = planFirst(controlEntries(ledger.entries(workload.id, "assumption")));
+	const control = controlEntries(ledger.entries(workload.id, "assumption"));
+	const plan = planFirst(control);
 	const planPart = plan ? ` · plan first: ${plan.trigger}` : "";
-	return { state: `stakes: ${workload.stakes} · mode: ${mode}${planPart}`, ceiling: ceilingText(ceilingOf(ledger, workload.id)) };
+	// D8: the queue tag ends with the first launch attempt (`queuedOf`); never a needs-you line, a queued ask waits by design.
+	const queued = queuedOf(control) !== null ? queuePosition(ledger, workload.id, ledger.now()) : null;
+	const queuedPart = queued ? ` · queued #${queued.position} of ${queued.of}` : "";
+	const train = trainBudgetText(ledger, workload.id);
+	return { state: `stakes: ${workload.stakes} · mode: ${mode}${planPart}${queuedPart}`, limit: train ?? `ceiling ${ceilingText(ceilingOf(ledger, workload.id))}` };
+}
+
+// ---- a merge train's daily budget (PLAN wl-mvr888nftz0vcl D4, D5) ------------------------------------------------
+
+/**
+ * A merge train's limit part of the one-liner: `budget $<L>/PDT day · no wall`, L today's limit (`trainDayLimit`: $150 plus
+ * every valid `train-raise:` for today's PDT day), then ` · paused until <iso>` while the newest valid `train-paused:` runs
+ * past now and no raise for its day came after it, the gate's `budget-paused` rule (`trainBudgetGate`, which decides
+ * launches; this only shows). Null for a workload with no train membership (`trainMembers`): it keeps its ceiling.
+ */
+function trainBudgetText(ledger: Ledger, workloadId: string): string | null {
+	if (trainMembers(ledger.entries(workloadId), ledger.instructions(workloadId)).length === 0) return null;
+	const now = ledger.now();
+	const control = controlEntries(ledger.entries(workloadId, "assumption"));
+	const p = trainPauses(control).at(-1);
+	const paused = p !== undefined && Date.parse(p.until) > Date.parse(now)
+		&& !trainRaises(control).some((r) => r.day === p.day && control.findIndex((c) => c.id === r.entryId) > control.findIndex((c) => c.id === p.entryId));
+	return `budget $${Number(trainDayLimit(control, pdtDay(Date.parse(now))).toFixed(2))}/PDT day · no wall${p !== undefined && paused ? ` · paused until ${when(p.until)}` : ""}`;
 }
 
 const when = (iso: string): string => iso.replace(/\.\d{3}Z$/, "Z");
@@ -85,12 +119,37 @@ function instructionLine(i: InstructionRow): string {
 	}
 }
 
-/** One workload's block. */
-export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: number = LAST_N): string {
+/** Every ranked workload's place for the render (PLAN wl-mv8wzytml878b4 D4): `rankPosition` and Jo's pins, read once per render. */
+export interface RankMarks {
+	positions: ReadonlyMap<string, number>;
+	ruled: ReadonlySet<string>;
+}
+
+export function rankMarks(ledger: Ledger, now: string): RankMarks {
+	return { positions: rankPosition(ledger, now), ruled: new Set(livePins(ledger).map((p) => p.workloadId)) };
+}
+
+/** `rank #n`, then ` ruled` for Jo's item; null for a row `rankOpen` never ranks (a `due:` row, the standing workload). */
+function rankMark(workloadId: string, marks: RankMarks): string | null {
+	const n = marks.positions.get(workloadId);
+	return n === undefined ? null : `rank #${n}${marks.ruled.has(workloadId) ? " ruled" : ""}`;
+}
+
+/** Beside the lane (D4): `priority-paused for <X> (relaunches when a slot reaches it)`, `priority-pausing for <X>` while the stop is pending, else null. */
+function priorityMark(control: readonly ControlEntry[]): string | null {
+	const paused = priorityPausedOf(control);
+	if (paused) return `priority-paused for ${paused.forWl} (relaunches when a slot reaches it)`;
+	const pausing = priorityPausingOf(control);
+	return pausing ? `priority-pausing for ${pausing.forWl}` : null;
+}
+
+/** One workload's block; `marks` from `rankMarks`, read once by `renderWake`. */
+export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: number = LAST_N, marks: RankMarks = rankMarks(ledger, ledger.now())): string {
 	const { workload, slices, openQuestions, pendingMessages } = w;
 	const out: string[] = [];
 	const due = parseDue(workload.brief);
-	out.push(`## ${workload.id}${due ? ` (scheduled, due ${due.due})` : ""}`);
+	const rank = rankMark(workload.id, marks);
+	out.push(`## ${workload.id}${due ? ` (scheduled, due ${due.due})` : ""}${rank ? ` · ${rank}` : ""}`);
 	out.push(`brief: ${workload.brief}`);
 	const control = controlEntries(ledger.entries(workload.id, "assumption"));
 	const done = doneLine(control);
@@ -101,12 +160,16 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 		const p = c.prefix === "spend" ? parseSpend(c.rest) : null;
 		return p ? [p] : [];
 	}).at(-1);
-	if (spend) {
+	// A merge train has no ceiling (PLAN wl-mvr888nftz0vcl D4): its total is shown alone; its budget is the one-liner's.
+	if (spend && trainMembers(ledger.entries(workload.id), ledger.instructions(workload.id)).length > 0) {
+		out.push(`spent $${Number(spend.usd.toFixed(2))} since open, every PDT day together`);
+	} else if (spend) {
 		const c = ceilingOf(ledger, workload.id);
 		out.push(`spent $${Number(spend.usd.toFixed(2))} of $${Number(c.usd.toFixed(2))} · ${Number(spend.wallMin.toFixed(1))} of ${c.wallMin} min`);
 	}
 	const lane = workload.holder ? `${workload.holder} (lease until ${workload.holder_lease_until ?? "none"})` : "none";
-	out.push(`opened ${when(workload.created_at)} by ${workload.created_by}; last activity ${when(workload.last_activity_at)}; lane: ${lane}`);
+	const priority = priorityMark(control);
+	out.push(`opened ${when(workload.created_at)} by ${workload.created_by}; last activity ${when(workload.last_activity_at)}; lane: ${lane}${priority ? ` · ${priority}` : ""}`);
 	if (workload.mode === "user-driven" && !due && !workload.holder) out.push(`by hand: \`${byHandLine(workload.id)}\``);
 	out.push(`slices: ${slices.length === 0 ? "none open" : ""}`);
 	for (const s of slices) out.push(`- ${s.id} [${s.state}] ${s.task} — done when: ${s.done_condition}; inputs: ${s.inputs}`);
@@ -114,11 +177,14 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 		out.push("open questions:");
 		// A multi-line body keeps its lines under the bullet, indented as errorLines indents them (PLAN wl-muq22rnjcfrrpc D8);
 		// the plan question's body starts on the line beneath its q- id, so its path sits right under the line naming it (PLAN wl-mv61a8dh4aeneo D2).
+		// A stored `pair` is not listed; a valid offer is its own line beneath the question (PLAN wl-mvb9mw00ycfjeo D4).
 		const entries = ledger.entries(workload.id);
 		const valid = controlEntries(entries, holdersOf(entries, workload.holder, ledger.holders(workload.id)));
 		for (const q of openQuestions) {
 			const body = q.body.split("\n").join("\n  ");
-			out.push(`- ${q.id} on ${q.slice_id}:${isPlanQuestionIn(valid, q) ? `\n  ${body}` : ` ${body}`} — options: ${q.options.join(" / ")}`);
+			out.push(`- ${q.id} on ${q.slice_id}:${isPlanQuestionIn(valid, q) ? `\n  ${body}` : ` ${body}`} — options: ${shownOptions(q.options).join(" / ")}`);
+			const offer = openPairOffer(ledger, q);
+			if (offer) out.push(`  ${pairOfferLine(wordsOf(ledger, workload.id, valid), q.id, workload.id, offer.signals)}`);
 		}
 	}
 	if (pendingMessages.length > 0) {
@@ -147,22 +213,57 @@ function title(brief: string): string {
 }
 
 /**
- * One open workload on one line, for the wake: `- <id>: <title> · <one-liner core> · lane: … · slices: …`, then the
- * needs-you lines that are about it (their `#n`, else their kind), its open question ids and its pending message
+ * One open workload on one line, for the wake: `- <id>: <title> · <one-liner core> · rank #n[ ruled] · lane: …[ · priority-…] · slices: …`,
+ * then the needs-you lines that are about it (their `#n`, else their kind), its open question ids and its pending message
  * count when there are any. The block is the on-demand read's (`renderWorkload`).
  */
-export function workloadLine(ledger: Ledger, w: InFlightWorkload, lines: readonly ErrorLine[]): string {
+export function workloadLine(ledger: Ledger, w: InFlightWorkload, lines: readonly ErrorLine[], marks: RankMarks = rankMarks(ledger, ledger.now())): string {
 	const { workload, slices, openQuestions, pendingMessages } = w;
 	const due = parseDue(workload.brief);
-	const parts = [`- ${workload.id}${due ? ` (scheduled, due ${due.due})` : ""}: ${title(workload.brief)}`, oneLinerCore(ledger, workload), `lane: ${workload.holder ?? "none"}`];
+	const parts = [`- ${workload.id}${due ? ` (scheduled, due ${due.due})` : ""}: ${title(workload.brief)}`, oneLinerCore(ledger, workload)];
+	const rank = rankMark(workload.id, marks);
+	if (rank) parts.push(rank);
+	parts.push(`lane: ${workload.holder ?? "none"}`);
+	const priority = priorityMark(controlEntries(ledger.entries(workload.id, "assumption")));
+	if (priority) parts.push(priority);
 	const states = new Map<string, number>();
 	for (const s of slices) states.set(s.state, (states.get(s.state) ?? 0) + 1);
 	parts.push(`slices: ${states.size === 0 ? "none open" : [...states].map(([state, n]) => `${n} ${state}`).join(", ")}`);
-	const mine = lines.filter((l) => l.workloadId === workload.id);
+	// A channel proposal carries its target's number: the target line already lists it.
+	const mine = lines.filter((l) => l.workloadId === workload.id && l.kind !== "proposal");
 	if (mine.length > 0) parts.push(`needs you: ${mine.map((l) => (l.n === undefined ? l.kind : `#${l.n}`)).join(", ")}`);
 	if (openQuestions.length > 0) parts.push(`open questions: ${openQuestions.map((q) => q.id).join(", ")}`);
 	if (pendingMessages.length > 0) parts.push(`${pendingMessages.length} message(s) not yet acted on`);
 	return parts.join(" · ");
+}
+
+/** A rank-audit line is shown while its row is this young (D5: the newest audit, under 7 days old). */
+const AUDIT_SHOWN_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * The Jev rank lines under the needs-you block (PLAN wl-mv8k039gvogt8g D5), from `rankOpen` over stored rows only (no
+ * judge, no write): `Rank (Jev, show-only): 1 <wl> <title≤40> · 2 … · 3 …; <n> unscored; goals <set date|stale|none>;
+ * as2_rank for the table`, then the newest `rank-audit:` while under 7 days old. Empty with nothing ranked and no audit.
+ */
+export function rankLines(ledger: Ledger, now: string, mode = "show"): string[] {
+	const items = rankOpen(ledger, now);
+	const out: string[] = [];
+	if (items.length > 0) {
+		const top = items.slice(0, 3).map((i, n) => {
+			const t = i.title.replace(/\s+/g, " ");
+			return `${n + 1} ${i.workloadId} ${t.length > 40 ? `${t.slice(0, 39)}…` : t}${i.pinned ? " (pinned)" : i.score === undefined ? " (unscored)" : ""}`;
+		});
+		const goals = currentGoals(ledger, now);
+		const label = mode === "show" ? "Jev, show-only" : mode === "order" ? "Jev, launch order" : `Jev, launch order ${mode}`;
+		out.push(`Rank (${label}): ${top.join(" · ")}; ${items.filter((i) => i.score === undefined).length} unscored; goals ${goals.state === "set" && goals.setAt ? `set ${rankDay(goals.setAt)}` : goals.state}; as2_rank for the table`);
+	}
+	const audits = controlEntries(ledger.entries(STANDING_WORKLOAD_ID, "assumption")).filter((c) => c.prefix === "rank-audit");
+	const newest = audits.at(-1);
+	const a = newest ? parseAudit(newest.body) : null;
+	if (newest && a && Date.parse(now) - Date.parse(newest.createdAt) < AUDIT_SHOWN_MS) {
+		out.push(`Rank audit ${a.from}..${a.to}: ${a.picks} pick(s) of Jo's, ${a.scorable} scorable, Jev's #1 ${a.top1}, top 3 ${a.top3}, mean percentile ${a.meanpct ?? "unknown"}; report ${a.report}`);
+	}
+	return out;
 }
 
 /** The whole wake render. */
@@ -179,16 +280,20 @@ export function renderWake(ledger: Ledger, opts: RenderOptions = {}): Rendered {
 	out.push("## needs you");
 	if (lines.length === 0) out.push("nothing: no reserved action waiting, nothing held past the threshold, no slice failed twice, no lane died, no lane left work idle, no lane waiting on you, nothing scheduled past due");
 	for (const l of lines) out.push(needsYouBullet(l));
+	if (!opts.workloadId) out.push(...rankLines(ledger, now, opts.rankMode));
+	const channel = channelInForce(ledger);
+	if (channel) out.push("", ...fromOtherAgents(ledger, channel, now));
 	const work = inFlight.filter((w) => w.workload.id !== STANDING_WORKLOAD_ID && (!opts.workloadId || w.workload.id === opts.workloadId));
 	const compact = opts.compact ?? (opts.trigger !== undefined && !opts.workloadId);
+	const marks = rankMarks(ledger, now);
 	out.push("");
 	if (work.length === 0) out.push("## open workloads\nnone");
 	else if (compact) {
 		out.push(`## open workloads (one line each; one workload's slices, questions with options, messages and recent entries: ${LEDGER_TOOL} with workload: <wl-…>)`);
-		for (const w of work) out.push(workloadLine(ledger, w, lines));
+		for (const w of work) out.push(workloadLine(ledger, w, lines, marks));
 	} else {
 		for (const w of work) {
-			out.push(renderWorkload(ledger, w, opts.lastN));
+			out.push(renderWorkload(ledger, w, opts.lastN, marks));
 			out.push("");
 		}
 	}

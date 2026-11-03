@@ -43,8 +43,13 @@ export interface BranchEntry {
 export interface Ctx {
 	hasUI: boolean;
 	cwd: string;
-	/** `getBranch`: the current branch, root to leaf, custom entries included (OMP session/session-manager.ts getBranch); optional because not every host or fake carries it. */
-	sessionManager: { getHeader(): { parentSession?: string } | null; getEntries(): { type: string }[]; getBranch?(): BranchEntry[] };
+	/**
+	 * `getBranch`: the current branch, root to leaf, custom entries included (OMP session/session-manager.ts getBranch); optional because not every host or fake carries it.
+	 * `getArtifactPath`: where a spilled tool output's artifact lives (OMP session-manager.ts getArtifactPath), for the auto-apply detector's full read (PLAN wl-mvqwn80onq9hq8 D5).
+	 */
+	sessionManager: { getHeader(): { parentSession?: string } | null; getEntries(): { type: string }[]; getBranch?(): BranchEntry[]; getSessionFile?(): string | undefined; getSessionId?(): string; getArtifactPath?(id: string): Promise<string | null> };
+	/** The calling host's local:// mapping (OMP ExtensionContext.localProtocolOptions). */
+	localProtocolOptions?: { getArtifactsDir?: () => string | null; getSessionId?: () => string | null };
 	ui: { notify(message: string, type?: "info" | "warning" | "error"): void };
 }
 /**
@@ -78,9 +83,15 @@ export interface GatesAPI<C extends Ctx = Ctx> {
 	on(event: "input", h: Handler<{ text: string; source: "interactive" | "rpc" | "extension" }, { handled: true } | undefined, C>): void;
 	/** `additionalContext`: handler-authored text OMP delivers to the model after the batch's tool results (OMP 18.8.5 extensibility/shared-events.ts ToolCallEventResult; accumulated across handlers, dropped when any handler blocks or the call's result is an error). */
 	on(event: "tool_call", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown> }, { block?: boolean; reason?: string; input?: Record<string, unknown>; additionalContext?: string } | undefined, C>): void;
-	/** `additionalContext` here is delivered even when the call failed (shared-events.ts ToolResultEventResult). */
-	on(event: "tool_result", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown>; details?: unknown; isError: boolean }, { additionalContext?: string } | undefined, C>): void;
+	/**
+	 * `additionalContext` here is delivered even when the call failed (shared-events.ts ToolResultEventResult). `content` and
+	 * `isError` replace the result the model sees (ToolResultEventResult; the auto-apply gate's failed-trip rewrite, PLAN
+	 * wl-mvqwn80onq9hq8 D5). `content` on the event is the result's text and image parts as the tool returned them.
+	 */
+	on(event: "tool_result", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown>; content?: unknown; details?: unknown; isError: boolean }, { additionalContext?: string; content?: unknown[]; isError?: boolean } | undefined, C>): void;
 	on(event: "tool_execution_start", h: Handler<{ toolName: string; toolCallId: string; args: unknown }, undefined, C>): void;
+	/** Every call settles with this, a refused one included (OMP pi-agent-core agent-loop.ts; a block throws before `tool_result` is emitted). */
+	on(event: "tool_execution_end", h: Handler<{ toolName: string; toolCallId: string; result: unknown; isError: boolean }, undefined, C>): void;
 	on(event: "agent_end", h: Handler<{ willContinue?: boolean }, undefined, C>): void;
 	on(event: "assistant_message", h: Handler<{ type: "assistant_message"; message: AgentMessageLike }, { content: TextPart[] } | undefined, C>): void;
 	/** The messages about to be sent to the model (a copy; OMP 18.8.6 extensibility/extensions/runner.ts emitContext): `messages` replaces them for this request only, nothing is persisted. */
@@ -97,6 +108,8 @@ export interface GatesAPI<C extends Ctx = Ctx> {
 	getAllTools(): { name: string }[];
 	setActiveTools(names: string[]): Promise<void>;
 	appendEntry(customType: string, data?: unknown): void;
+	/** Session-local slash commands; skill entries carry this caller's skill file path. */
+	getCommands?(): { name: string; source?: string; path?: string }[];
 	registerTool(tool: {
 		name: string;
 		label: string;
@@ -109,6 +122,8 @@ export interface GatesAPI<C extends Ctx = Ctx> {
 		 *  first real session 2026-09-30: the wake gate refused `write xd://orchestrator_wake_read` as "not the wake read". */
 		loadMode?: "essential" | "discoverable";
 		/** OMP passes the session's context fifth (omp://extensions.md, "Current `execute` signature"). */
+		/** OMP's Component-shaped custom result renderer (extensions/types.ts ToolDefinition.renderResult). */
+		renderResult?(result: ToolResult, options: { expanded: boolean; isPartial: boolean }, theme: unknown, args?: Record<string, unknown>): { render(width: number): readonly string[]; invalidate(): void };
 		execute(toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: C): Promise<ToolResult>;
 	}): void;
 	zod: { object(shape: Record<string, unknown>): unknown; string(): StringSchema };
@@ -212,29 +227,62 @@ export function gateSession(ctx: Ctx, env: Record<string, string | undefined>): 
 const CONFINED = Symbol.for("agent-system-2.0/p11-gates/confined");
 
 /**
- * Bash calls a scratch-root rule let through (PLAN wl-mv5oikd5jtquww § 1.2: row 6's rules 1–4 and 6,
- * row 8's skip), by tool call id, like GateSession.bashOriginals. The rows see the OMP event but not
- * its ctx, so this is keyed by id alone (ids are unique per call) and hangs off globalThis like the
- * session store. The fence (fence.ts) runs a marked call under the confined profile or refuses it,
- * and drops the id at the call's result.
+ * How the fence must run a call a rule let through (fence.ts): `confined` to a root (`root` null: the own scratch root,
+ * PLAN wl-mv5oikd5jtquww § 1.2, rows 6 and 8), `worktree`-confined to the lane's own worktree (PLAN wl-mvqwn80onq9hq8
+ * D2b), or `read-only` (D4: no file writes, network only when `network`, then an exec allow-list naming `readers`).
  */
-function confinedIds(): Set<string> {
-	const g = globalThis as { [CONFINED]?: Set<string> };
-	return (g[CONFINED] ??= new Set());
+export type CallMark =
+	| { kind: "confined"; root: string | null }
+	| { kind: "worktree"; root: string }
+	| { kind: "read-only"; network: boolean; readers: string[] };
+
+/**
+ * Bash calls a rule let through on the condition that the fence runs them under a narrower profile, by tool call id,
+ * like GateSession.bashOriginals: the scratch-root rules (PLAN wl-mv5oikd5jtquww § 1.2: row 6's rules 1–4 and 6, row 8's
+ * skip) and the auto-apply gate (PLAN wl-mvqwn80onq9hq8 D3: after its `auto-applied:` row commits). The rows see the
+ * OMP event but not its ctx, so this is keyed by id alone (ids are unique per call) and hangs off globalThis like the
+ * session store. The fence (fence.ts) runs a marked call under its profile or refuses it, pair_run refuses it, and both
+ * drop the id at the call's result.
+ */
+function marks(): Map<string, CallMark> {
+	const g = globalThis as { [CONFINED]?: Map<string, CallMark> };
+	return (g[CONFINED] ??= new Map());
 }
 
-/** Mark `call` confined; a call with no tool call id cannot be (the fence refuses such a call anyway). */
-export function markConfined(call: ToolCall): void {
+function markCall(call: ToolCall, mark: CallMark): void {
 	const id = "toolCallId" in call ? call.toolCallId : undefined;
-	if (typeof id === "string" && id !== "") confinedIds().add(id);
+	if (typeof id === "string" && id !== "") marks().set(id, mark);
 }
 
-/** Whether a row marked the call with this id confined. */
+/**
+ * Mark `call` confined to `root`: the own scratch root when `root` is absent (the scratch-root rules), or the root the
+ * auto-apply gate names; `worktree` for the lane's own worktree, which the fence validates and confines with its `.git`
+ * file denied (D2b). A call with no tool call id cannot be marked (the fence refuses such a call anyway).
+ */
+export function markConfined(call: ToolCall, root?: string, kind: "scratch" | "worktree" = "scratch"): void {
+	if (kind === "worktree") {
+		if (root === undefined) throw new Error("markConfined: a worktree mark needs the worktree root");
+		markCall(call, { kind: "worktree", root });
+	} else markCall(call, { kind: "confined", root: root ?? null });
+}
+
+/** Mark `call` read-only (D3, D4): the fence runs it with no file writes, and with network only when `network`, under an exec allow-list naming `readers`. */
+export function markReadOnly(call: ToolCall, network: boolean, readers: readonly string[] = []): void {
+	markCall(call, { kind: "read-only", network, readers: [...readers] });
+}
+
+/** Whether a rule marked the call with this id confined (to a scratch root or a worktree). */
 export function isConfined(toolCallId: string): boolean {
-	return confinedIds().has(toolCallId);
+	const m = marks().get(toolCallId);
+	return m !== undefined && m.kind !== "read-only";
+}
+
+/** The mark on the call with this id, or undefined. */
+export function callMark(toolCallId: string): CallMark | undefined {
+	return marks().get(toolCallId);
 }
 
 /** Forget the mark, once the call has a result. */
 export function releaseConfined(toolCallId: string): void {
-	confinedIds().delete(toolCallId);
+	marks().delete(toolCallId);
 }

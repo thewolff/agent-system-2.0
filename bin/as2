@@ -4,21 +4,29 @@
 #
 # Usage:   as2 [omp args...]   start the orchestrator, in <repo> (its cwd is fixed, not the shell's:
 #                              Jo's second session ran from ~/tmp, 2026-09-30):
-#                              env OMP_PROFILE=<profile> AGENT_SYSTEM_ROLE=orchestrator omp --cwd <repo>
-#                                --append-system-prompt <prompt> [args...]
+#                              env [-u BASH_ENV ...] [-u OTEL_…]... OTEL_…=… OMP_PROFILE=<profile> AGENT_SYSTEM_ROLE=orchestrator
+#                                omp --cwd <repo> --append-system-prompt <prompt> [args...]
 #                              <prompt> is $HOME/.agent-system-2/orchestrator/system.md, rendered first
 #                              from the voice document and the output-types contract, so every turn
 #                              sends the same system prompt (surface/scripts/orchestrator-prompt.ts);
 #                              a missing source file stops the launch, naming it. Where gates.cleanShell
 #                              is "all" (the clean shell is on for the orchestrator), the shell-start
 #                              hooks are dropped (gates/src/shell-start.ts):
-#                                env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 OMP_PROFILE=...
+#                                env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 ...
+#                              The OTEL_* words are the tracing switch's, below: every inherited OTEL_* name
+#                              unset, then OTEL_SDK_DISABLED=true, or the otel map when observability.phoenix is `all`
 #          as2 install         run <repo>/install/install.sh (ledger, profile, this launcher); its
 #                              last line names the providers to log in to once per profile
 #                              (/login inside the session; OMP's first-launch wizard is skipped)
 #          as2 on | off        set gates.fence.enabled to true | false in the installed profile's
 #                              config.yml, printing the old and new value (a re-install resets it
 #                              to the template's value)
+#          as2 phoenix off|all|<wl-id>
+#                              set observability.phoenix in the installed profile's config.yml (the
+#                              tracing switch, wl-mv65t5d34lts00 PLAN.md §§ 2, 8): off, all (the default:
+#                              lanes, the orchestrator and every OMP seat), or add a workload's lanes; printing
+#                              the old and new value. Read at launch: a lane takes it when (re)launched. A
+#                              re-install keeps the installed value
 #          as2 clean-shell off | all | <wl>
 #                              set gates.cleanShell in the installed profile's config.yml: the clean
 #                              shell (gates/src/clean-shell.ts) off everywhere, on everywhere, or on
@@ -30,6 +38,17 @@
 #                              set pairSuggest in the installed profile's config.yml (PLAN
 #                              wl-mv67564rdkfvnk D2): off, all, or add one workload id to the list;
 #                              prints the old and new value, never starts omp
+#          as2 rank [--top N]  Jev's ranking of the open workloads, read-only (PLAN wl-mv8k039gvogt8g D5):
+#                              bun surface/scripts/rank.ts; the as2_rank table without asking Jev (an
+#                              item with no current signal is listed unscored); writes nothing
+#          as2 rank-mode show | order | parallel [--budget <usd>]
+#                              set jevRank in the installed profile's config.yml (D7): show (launch
+#                              order unchanged), order, or parallel; prints the old and new value,
+#                              never starts omp: bun surface/scripts/rank-mode.ts
+#          as2 doctor [--json] whether as2's important parts are up (PLAN wl-mvwks11ye3x9zu): one line per part
+#                              (pass/fail/warn/not installed) with its evidence and fix, then a summary; exit 0
+#                              nothing failed, 1 a part failed, 2 a bad argument or the doctor crashed:
+#                              bun surface/scripts/doctor.ts. Run it from your own Terminal, not inside OMP
 #          as2 lane <wl>       run workload <wl> by hand as a lane in this terminal (user-driven mode;
 #                              DESIGN-lane-launcher.md decision 14): bun surface/scripts/lane.ts interactive <wl>
 #          as2 lane stop|cleanup|log <wl>
@@ -79,6 +98,28 @@ quote() {
 	esac
 }
 
+# The orchestrator's tracing env (wl-mv65t5d34lts00 PLAN.md § 2; surface/src/tracing.ts), as env(1) words on one
+# line: `-u NAME` for every inherited OTEL_* name, then the reader's NAME=value lines
+# (surface/scripts/tracing.ts env orchestrator). The reader's notes (a malformed setting) are relayed to stderr.
+# If the reader fails or prints anything else, the words are the off state the reader itself gives,
+# OTEL_SDK_DISABLED=true (so no dotenv file can turn export on), and one line on stderr says so. Every word is
+# in quote()'s unquoted set (names OTEL_[A-Za-z0-9_]*, values the reader's value shape), so callers `eval` it.
+tracing_words() {
+	words="$(awk 'BEGIN { for (k in ENVIRON) if (k ~ /^OTEL_[A-Za-z0-9_]*$/) printf "-u %s ", k }')"
+	if out="$(bun "$REPO/surface/scripts/tracing.ts" env orchestrator --config "$CONFIG" 2>&1)"; then rc=0; else rc=$?; fi
+	shape='^OTEL_[A-Z0-9_]+=[A-Za-z0-9_./:=,@%+-]*$'
+	other="$(printf '%s\n' "$out" | grep -Ev "$shape|^as2: tracing: " || true)"
+	if [ "$rc" -eq 0 ] && [ -z "$other" ] && printf '%s\n' "$out" | grep -q '^OTEL_SDK_DISABLED='; then
+		printf '%s\n' "$out" | grep '^as2: tracing: ' >&2 || true
+		printf '%s%s\n' "$words" "$(printf '%s\n' "$out" | grep -E "$shape" | tr '\n' ' ')"
+	else
+		reason="exit $rc"
+		[ "$rc" -ne 0 ] || reason="unexpected output"
+		printf 'as2: the tracing switch could not be read (%s); omp starts with tracing off (OTEL_SDK_DISABLED=true)\n' "$reason" >&2
+		printf '%sOTEL_SDK_DISABLED=true\n' "$words"
+	fi
+}
+
 fence() {
 	want="$1"
 	[ -f "$CONFIG" ] || { printf 'as2: no installed profile config at %s; run: as2 install\n' "$CONFIG" >&2; exit 1; }
@@ -105,6 +146,14 @@ fence() {
 # launch is exactly main's.
 orchestrator_clean() {
 	bun "$REPO/gates/scripts/clean-shell.ts" orchestrator "$AGENT_DIR" >/dev/null 2>&1
+}
+
+# The env(1) words before OMP_PROFILE= on the orchestrator's launch line, for callers to `eval`: the
+# clean shell's -u words where orchestrator_clean says on, then tracing_words. Every word is in quote()'s
+# unquoted set.
+orchestrator_words() {
+	if orchestrator_clean; then printf '%s' "-u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 "; fi
+	tracing_words
 }
 
 # The clean-shell switch: `cleanShell:` under the top-level `gates:` mapping (profile/config.yml), read
@@ -259,24 +308,40 @@ case "${1-}" in
 		esac
 		;;
 	off) fence false ;;
+	phoenix)
+		shift
+		[ "$#" -eq 1 ] || { printf 'as2 phoenix: one value is required: off | all | <wl-id>\n' >&2; exit 1; }
+		exec bun "$REPO/surface/scripts/tracing.ts" set "$1" --config "$CONFIG"
+		;;
 	pair-suggest)
 		shift
 		pair_suggest "$@"
 		;;
+	rank)
+		shift
+		exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/rank.ts" "$@"
+		;;
+	rank-mode)
+		shift
+		exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/rank-mode.ts" "$@"
+		;;
+	doctor)
+		shift
+		exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/doctor.ts" "$@"
+		;;
 	--print)
 		shift
 		render_prompt
+		words="$(orchestrator_words)"
+		eval "set -- $words OMP_PROFILE=\"\$PROFILE_NAME\" AGENT_SYSTEM_ROLE=orchestrator omp --cwd \"\$REPO\" --append-system-prompt \"\$PROMPT\" \"\$@\""
 		line="env"
-		if orchestrator_clean; then line="$line -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4"; fi
-		line="$line OMP_PROFILE=$(quote "$PROFILE_NAME") AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(quote "$REPO") --append-system-prompt $(quote "$PROMPT")"
 		for arg in "$@"; do line="$line $(quote "$arg")"; done
 		printf '%s\n' "$line"
 		;;
 	*)
 		render_prompt
-		if orchestrator_clean; then
-			exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 OMP_PROFILE="$PROFILE_NAME" AGENT_SYSTEM_ROLE=orchestrator omp --cwd "$REPO" --append-system-prompt "$PROMPT" "$@"
-		fi
-		exec env OMP_PROFILE="$PROFILE_NAME" AGENT_SYSTEM_ROLE=orchestrator omp --cwd "$REPO" --append-system-prompt "$PROMPT" "$@"
+		words="$(orchestrator_words)"
+		eval "set -- $words OMP_PROFILE=\"\$PROFILE_NAME\" AGENT_SYSTEM_ROLE=orchestrator omp --cwd \"\$REPO\" --append-system-prompt \"\$PROMPT\" \"\$@\""
+		exec env "$@"
 		;;
 esac

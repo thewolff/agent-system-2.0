@@ -32,7 +32,7 @@ const OMP = "/Users/jowolff/.bun/install/global/node_modules/@oh-my-pi";
 const RESOLVER = `${OMP}/pi-coding-agent/src/config/model-resolver.ts`;
 const HAS_OMP = existsSync(RESOLVER);
 
-const FAST = ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna"];
+const FAST = ["anthropic/claude-haiku-5-5", "openai-codex/gpt-5.6-luna"];
 const DEEP = ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra"];
 const TABLE = tierTableFromConfig({
 	task: {
@@ -48,7 +48,7 @@ const ALL_MODELS = [...new Set(Object.values(TABLE).flat())];
 const PARENT = "openai-codex/gpt-6-astra"; // the lane runs on deep's row: an OpenAI lane, so its fast hands run on gpt-5.6-luna
 const brief = (workloadId: string, text: string) => `workload: ${workloadId}\ntask: ${text}\nstakes: normal`;
 /** A blocking task call's result: tier hand `id` on fast, reporting a fast-row model. */
-const settled = (id: string) => ({ results: [{ id, agent: "fast", resolvedModelIdentity: "anthropic/claude-haiku-4-5" }] });
+const settled = (id: string) => ({ results: [{ id, agent: "fast", resolvedModelIdentity: "anthropic/claude-haiku-5-5" }] });
 const locate = (confidence: number) => ({ choice: "locate", confidence, probabilities: dist({ locate: confidence }) });
 /** Answers locate at .9 for a brief mentioning "first", at .8 otherwise. */
 const JUDGE = {
@@ -78,7 +78,7 @@ describe("R2-B1: the tier row holds at OMP's final selection, not only at the ho
 			const spawn = await h.spawn("fast", "Lane.sl-one");
 			if (spawn?.model) {
 				const final = await finalSelection(spawn.model, registry, "Lane.sl-one");
-				// Before the fix: {"returned":["anthropic/claude-haiku-4-5",…],"actual":"openai-codex/gpt-6-astra","fallback":true}.
+				// Before the fix: {"returned":["anthropic/claude-haiku-5-5",…],"actual":"openai-codex/gpt-6-astra","fallback":true}.
 				expect({ returned: spawn.model, ...final }).toEqual({ returned: spawn.model, actual: spawn.model[0]!, fallback: false });
 			}
 			expect(spawn?.block).toBe(true);
@@ -89,7 +89,7 @@ describe("R2-B1: the tier row holds at OMP's final selection, not only at the ho
 	);
 
 	test.skipIf(!HAS_OMP)("a row model credentialed for the child's session is returned and is what OMP selects", async () => {
-		const registry = fakeRegistry(ALL_MODELS, [...DEEP, "openai-codex/gpt-5.6-luna"], ["anthropic/claude-haiku-4-5"]);
+		const registry = fakeRegistry(ALL_MODELS, [...DEEP, "openai-codex/gpt-5.6-luna"], ["anthropic/claude-haiku-5-5"]);
 		const h = extensionHost({ judge: JUDGE, table: TABLE, registry, laneModel: PARENT });
 		await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "first") });
 		const spawn = await h.spawn("fast", "Lane.sl-one");
@@ -124,7 +124,7 @@ describe("R2-B1: the tier row holds at OMP's final selection, not only at the ho
 		await anthropic.toolCall({ agent: "fast", name: "sl-one", task: brief(anthropic.workloadId, "first") });
 		const refused = await anthropic.spawn("fast", "sl-one");
 		expect(refused?.block).toBe(true);
-		expect(refused?.reason).toContain("anthropic/claude-haiku-4-5 (provider disabled)");
+		expect(refused?.reason).toContain("anthropic/claude-haiku-5-5 (provider disabled)");
 		expect(refused?.reason).not.toContain("openai-codex/gpt-5.6-luna");
 	});
 
@@ -167,12 +167,12 @@ describe("R2-B1: the tier row holds at OMP's final selection, not only at the ho
 			const h = extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS) });
 			await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "first") }, "c1");
 			await h.spawn("fast", "sl-one");
-			h.handMessage("sl-one", "anthropic", "claude-haiku-4-5");
+			h.handMessage("sl-one", "anthropic", "claude-haiku-5-5");
 			const out = h.toolResult("c1", false, {
-				results: [result("sl-one", "fast", "anthropic/claude-haiku-4-5@some-upstream"), result("Reviewer", "reviewer", "anthropic/claude-opus-5-5")],
+				results: [result("sl-one", "fast", "anthropic/claude-haiku-5-5@some-upstream"), result("Reviewer", "reviewer", "anthropic/claude-opus-5-5")],
 			});
 			expect(out).toBeUndefined();
-			expect(h.routings().map(r => [r.outcome, r.ran_models])).toEqual([["ran", '["anthropic/claude-haiku-4-5"]']]);
+			expect(h.routings().map(r => [r.outcome, r.ran_models])).toEqual([["ran", '["anthropic/claude-haiku-5-5"]']]);
 		});
 	});
 });
@@ -371,16 +371,16 @@ describe("R3-1: an async tier hand that ran off its row is refused where its out
 		expect(reply?.model).toEqual([FAST[0]!]);
 		expect(returned).toBeUndefined(); // nothing to check yet: the async call carries no hand output
 		// A retry fallback, or anything after the spawn check, answered on the hand with a deep model.
-		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-4-5");
+		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-5-5");
 		h.handMessage("Lane.sl-one", "openai-codex", "gpt-6-astra");
 		const [sent] = h.context([asyncDelivery(["Lane.sl-one"], "the off-row hand's findings")]);
 		expect(text(sent)).not.toContain("the off-row hand's findings");
 		expect(text(sent)).toContain(
-			"agent-system-2 classifier refused this async task result: Lane.sl-one ran on openai-codex/gpt-6-astra, outside the fast row (anthropic/claude-haiku-4-5)",
+			"agent-system-2 classifier refused this async task result: Lane.sl-one ran on openai-codex/gpt-6-astra, outside the fast row (anthropic/claude-haiku-5-5)",
 		);
 		const [row] = h.routings();
 		expect(row).toMatchObject({ slice_id: "sl-one", spawn_key: "Lane.sl-one", tier: "fast", outcome: "refused-out-of-row" });
-		expect(JSON.parse(row!.ran_models!)).toEqual(["anthropic/claude-haiku-4-5", "openai-codex/gpt-6-astra"]);
+		expect(JSON.parse(row!.ran_models!)).toEqual(["anthropic/claude-haiku-5-5", "openai-codex/gpt-6-astra"]);
 		expect(JSON.parse(row!.models)).toEqual([FAST[0]!]);
 		expect(row!.model).toBe(FAST[0]!);
 	});
@@ -398,7 +398,7 @@ describe("R3-1: an async tier hand that ran off its row is refused where its out
 
 	test("an async hand that stayed on its row is delivered untouched and recorded as ran", async () => {
 		const { h } = await asyncHand();
-		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-4-5");
+		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-5-5");
 		const delivery = asyncDelivery(["Lane.sl-one"], "the hand's findings");
 		expect(h.context([delivery])).toEqual([delivery]);
 		const [row] = h.routings();
@@ -408,11 +408,11 @@ describe("R3-1: an async tier hand that ran off its row is refused where its out
 
 	test("an async hand that fell back to another lab's entry of the fast row is withheld: a build hand runs only on the lane's lab", async () => {
 		const { h } = await asyncHand();
-		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-4-5");
+		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-5-5");
 		h.handMessage("Lane.sl-one", "openai-codex", "gpt-5.6-luna");
 		const [sent] = h.context([asyncDelivery(["Lane.sl-one"], "the other-lab findings")]);
 		expect(text(sent)).not.toContain("the other-lab findings");
-		expect(text(sent)).toContain("Lane.sl-one ran on openai-codex/gpt-5.6-luna, outside the fast row (anthropic/claude-haiku-4-5)");
+		expect(text(sent)).toContain("Lane.sl-one ran on openai-codex/gpt-5.6-luna, outside the fast row (anthropic/claude-haiku-5-5)");
 		expect(h.routings().map(r => [r.outcome, r.ran_models])).toEqual([["refused-out-of-row", JSON.stringify(FAST)]]);
 	});
 
@@ -436,7 +436,7 @@ describe("R3-1: an async tier hand that ran off its row is refused where its out
 		);
 		await h.spawn("fast", "Lane.sl-one");
 		await h.spawn("fast", "Lane.sl-two");
-		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-4-5");
+		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-5-5");
 		h.handMessage("Lane.sl-two", "anthropic", "claude-opus-5-5");
 		const [sent] = h.context([asyncDelivery(["Lane.sl-one", "Lane.sl-two"], "both outputs")]);
 		expect(text(sent)).toContain("async task delivery (agents Lane.sl-one, Lane.sl-two, delivered together)");
@@ -462,26 +462,26 @@ describe("R3-2: blocking hands are checked on every model that answered, not onl
 		await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "find it") }, "call-c");
 		await h.spawn("fast", "sl-one"); // a blocking spawn is keyed by the item name
 		h.handMessage("Lane.sl-one", "openai-codex", "gpt-6-astra");
-		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-4-5");
+		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-5-5");
 		const result = h.toolResult("call-c", false, {
-			results: [{ id: "Lane.sl-one", agent: "fast", resolvedModelIdentity: "anthropic/claude-haiku-4-5" }],
+			results: [{ id: "Lane.sl-one", agent: "fast", resolvedModelIdentity: "anthropic/claude-haiku-5-5" }],
 		});
 		expect(result?.isError).toBe(true);
 		expect(result?.content?.[0]?.text).toContain("Lane.sl-one ran on openai-codex/gpt-6-astra, outside the fast row");
 		const [row] = h.routings();
 		expect(row).toMatchObject({ spawn_key: "sl-one", outcome: "refused-out-of-row" });
-		expect(JSON.parse(row!.ran_models!)).toEqual(["openai-codex/gpt-6-astra", "anthropic/claude-haiku-4-5"]);
+		expect(JSON.parse(row!.ran_models!)).toEqual(["openai-codex/gpt-6-astra", "anthropic/claude-haiku-5-5"]);
 	});
 
 	test("a blocking hand on its row passes and is recorded once", async () => {
 		const h = extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS) });
 		await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "find it") }, "call-d");
 		await h.spawn("fast", "sl-one");
-		h.handMessage("sl-one", "anthropic", "claude-haiku-4-5");
-		const details = { results: [{ id: "sl-one", agent: "fast", resolvedModelIdentity: "anthropic/claude-haiku-4-5" }] };
+		h.handMessage("sl-one", "anthropic", "claude-haiku-5-5");
+		const details = { results: [{ id: "sl-one", agent: "fast", resolvedModelIdentity: "anthropic/claude-haiku-5-5" }] };
 		expect(h.toolResult("call-d", false, details)).toBeUndefined();
 		expect(h.toolResult("call-d", false, details)).toBeUndefined();
-		expect(h.routings()).toMatchObject([{ outcome: "ran", ran_models: '["anthropic/claude-haiku-4-5"]' }]);
+		expect(h.routings()).toMatchObject([{ outcome: "ran", ran_models: '["anthropic/claude-haiku-5-5"]' }]);
 	});
 });
 
@@ -551,7 +551,7 @@ describe("R4-B2: hand state is keyed by the lane's session root, not the hand's 
 			text(((lane("context", { messages: [asyncDelivery(["sl-one"], out)] }) as { messages?: unknown[] } | undefined)?.messages ?? [asyncDelivery(["sl-one"], out)])[0]);
 		bh("message_end", { message: { role: "assistant", provider: "anthropic", model: "claude-fable-5-1" } });
 		expect(sent(b, "B OFF ROW SECRET")).not.toContain("B OFF ROW SECRET");
-		ah("message_end", { message: { role: "assistant", provider: "anthropic", model: "claude-haiku-4-5" } });
+		ah("message_end", { message: { role: "assistant", provider: "anthropic", model: "claude-haiku-5-5" } });
 		expect(sent(a, "A GOOD")).toBe("A GOOD");
 		expect(sent(b, "B OFF ROW SECRET")).not.toContain("B OFF ROW SECRET");
 		expect(ledger.routings(workloadId).map(r => r.outcome)).toEqual(["refused-out-of-row", "ran"]);
@@ -573,7 +573,7 @@ describe("R4-B3: a refusal outlives the extension instance that made it", () => 
 
 	test("an accepted delivery replays as accepted; one never settled before the restart is withheld", async () => {
 		const { h } = await asyncHand();
-		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-4-5");
+		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-5-5");
 		const good = asyncDelivery(["Lane.sl-one"], "GOOD OUTPUT");
 		expect(h.context([good])).toEqual([good]);
 		await h.toolCall({ agent: "fast", name: "sl-two", task: brief(h.workloadId, "find it") }, "call-b");
@@ -592,7 +592,7 @@ describe("R4-B4: a hand whose own turns were never seen is withheld, whatever it
 		await h.spawn("fast", "sl-one");
 		const out = h.toolResult("call-c", false, settled("sl-one"));
 		expect(out?.isError).toBe(true);
-		expect(out?.content?.[0]?.text).toContain("sl-one: no model that answered on it could be read (its result reports anthropic/claude-haiku-4-5");
+		expect(out?.content?.[0]?.text).toContain("sl-one: no model that answered on it could be read (its result reports anthropic/claude-haiku-5-5");
 		expect(h.routings().map(r => [r.outcome, r.ran_models])).toEqual([["refused-model-unknown", null]]);
 		expect(h.logs).toEqual([
 			"agent-system-2 classifier: no assistant message_end was seen in session /tmp/lane/sl-one.jsonl for hand sl-one; its output is withheld as refused-model-unknown",
@@ -604,7 +604,7 @@ describe("R4-B4: a hand whose own turns were never seen is withheld, whatever it
 		const other = extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS), laneFile: "/tmp/other-lane.jsonl" });
 		await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "find it") }, "call-c");
 		await h.spawn("fast", "sl-one");
-		other.handMessage("sl-one", "anthropic", "claude-haiku-4-5");
+		other.handMessage("sl-one", "anthropic", "claude-haiku-5-5");
 		expect(h.toolResult("call-c", false, settled("sl-one"))?.isError).toBe(true);
 	});
 });
@@ -706,7 +706,7 @@ describe("R5-B1: durable recovery matches the owning session root and the alloca
 		const a = probeHost(shared, "/tmp/rootA.jsonl");
 		await a.toolCall(probeInput(shared.workloadId));
 		await a.spawn("fast", "sl-one");
-		a.handMessage("sl-one", "anthropic", "claude-haiku-4-5");
+		a.handMessage("sl-one", "anthropic", "claude-haiku-5-5");
 		const good = asyncDelivery(["sl-one"], "GOOD");
 		expect(a.context([good])).toEqual([good]);
 		// CROSS_ROOT: root B never dispatched, yet its fresh instance sees a `sl-one` delivery.
@@ -744,8 +744,8 @@ describe("R5-S1: the row carries the final allocated agent id; recovery takes th
 		const c = probeHost(shared);
 		await c.toolCall(probeInput(shared.workloadId));
 		await c.spawn("fast", "sl-one"); // the hook runs before allocation (task/structured-subagent.ts:658-671)
-		c.handMessage("sl-one-2", "anthropic", "claude-haiku-4-5");
-		expect(c.toolResult("call-1", false, { results: [{ agent: "fast", id: "sl-one-2", resolvedModelIdentity: "anthropic/claude-haiku-4-5" }] })).toBeUndefined();
+		c.handMessage("sl-one-2", "anthropic", "claude-haiku-5-5");
+		expect(c.toolResult("call-1", false, { results: [{ agent: "fast", id: "sl-one-2", resolvedModelIdentity: "anthropic/claude-haiku-5-5" }] })).toBeUndefined();
 		const suffixed = asyncDelivery(["sl-one-2"], "GOOD SUFFIXED");
 		expect(probeHost(shared).context([suffixed])).toEqual([suffixed]);
 		expect(c.routings().map(r => [r.slice_id, r.spawn_key, r.agent_id, r.outcome])).toEqual([["sl-one", "sl-one", "sl-one-2", "ran"]]);
@@ -756,7 +756,7 @@ describe("R5-S1: the row carries the final allocated agent id; recovery takes th
 		const e = probeHost(shared);
 		await e.toolCall(probeInput(shared.workloadId));
 		await e.spawn("fast", "sl-one-2");
-		e.handMessage("sl-one-2", "anthropic", "claude-haiku-4-5");
+		e.handMessage("sl-one-2", "anthropic", "claude-haiku-5-5");
 		const ambiguous = asyncDelivery(["sl-one-2"], "GOOD AMBIGUOUS");
 		expect(e.context([ambiguous])).toEqual([ambiguous]);
 		expect(probeHost(shared).context([ambiguous])).toEqual([ambiguous]);

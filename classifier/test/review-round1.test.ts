@@ -13,7 +13,7 @@ import { tierTableFromConfig } from "../src/tier-table";
 import { dist, extensionHost, type FakeRegistry, fakeRegistry, loadSample, recordedJudge, recordedQuestion } from "./helpers";
 
 const REPO = join(import.meta.dir, "..", "..");
-const FAST = ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna"];
+const FAST = ["anthropic/claude-haiku-5-5", "openai-codex/gpt-5.6-luna"];
 const TABLE = tierTableFromConfig({
 	task: {
 		agentModelOverrides: {
@@ -59,7 +59,7 @@ describe("B1: the returned row is the final-selection allowlist", () => {
 
 			const anthropic = await host({ judge: recordedJudge([]), registry }).spawn("fast", undefined, "eval");
 			expect(anthropic?.block).toBe(true);
-			expect(anthropic?.reason).toContain("anthropic/claude-haiku-4-5 (no credentials)");
+			expect(anthropic?.reason).toContain("anthropic/claude-haiku-5-5 (no credentials)");
 			expect(anthropic?.reason).not.toContain("openai-codex/gpt-5.6-luna");
 		},
 	);
@@ -69,7 +69,7 @@ describe("B1: the returned row is the final-selection allowlist", () => {
 		const spawn = await h.spawn("fast", undefined, "eval");
 		expect(spawn?.block).toBe(true);
 		expect(spawn?.reason).toContain("no usable fast model");
-		expect(spawn?.reason).toContain("anthropic/claude-haiku-4-5 (no credentials)");
+		expect(spawn?.reason).toContain("anthropic/claude-haiku-5-5 (no credentials)");
 		const openai = await host({ judge: recordedJudge([]), registry: fakeRegistry(ALL_MODELS, ["openai-codex/gpt-6-astra"]), laneModel: "openai-codex/gpt-6-astra" }).spawn("fast", undefined, "eval");
 		expect(openai?.block).toBe(true);
 		expect(openai?.reason).toContain("openai-codex/gpt-5.6-luna (no credentials)");
@@ -108,8 +108,8 @@ describe("B2: a spawn's routing is found by its spawn key and tier, never by arr
 		await routed;
 		await h.spawn("fast", "Lane.sl-one");
 		await h.spawn("fast", "Lane.sl-two");
-		h.handMessage("Lane.sl-two", "anthropic", "claude-haiku-4-5");
-		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-4-5");
+		h.handMessage("Lane.sl-two", "anthropic", "claude-haiku-5-5");
+		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-5-5");
 		h.deliver(["Lane.sl-one"]);
 		h.deliver(["Lane.sl-two"]);
 		expect(h.routings().map(r => [r.slice_id, r.spawn_key])).toEqual([
@@ -158,7 +158,7 @@ describe("B2: a spawn's routing is found by its spawn key and tier, never by arr
 		h.toolResult("c1", false, { results: [], async: { state: "running", jobId: "Lane.sl-one-2", type: "task" } });
 		const spawn = await h.spawn("fast", "Lane.sl-one-2");
 		expect(spawn?.block).toBeUndefined();
-		h.handMessage("Lane.sl-one-2", "anthropic", "claude-haiku-4-5");
+		h.handMessage("Lane.sl-one-2", "anthropic", "claude-haiku-5-5");
 		h.deliver(["Lane.sl-one-2"]);
 		expect(h.routings().map(r => [r.slice_id, r.spawn_key, r.tier])).toEqual([["sl-one", "Lane.sl-one-2", "fast"]]);
 	});
@@ -174,7 +174,7 @@ describe("B2: a spawn's routing is found by its spawn key and tier, never by arr
 		expect(wrongTier?.reason).toContain("classified fast");
 		await h.spawn("fast", "sl-two");
 		await h.spawn("fast", "sl-one");
-		const ran = (id: string) => ({ results: [{ id, agent: "fast", resolvedModelIdentity: "anthropic/claude-haiku-4-5" }] });
+		const ran = (id: string) => ({ results: [{ id, agent: "fast", resolvedModelIdentity: "anthropic/claude-haiku-5-5" }] });
 		h.toolResult("c2", false, ran("sl-two"));
 		h.toolResult("c1", false, ran("sl-one"));
 		expect(h.routings().map(r => r.slice_id)).toEqual(["sl-two", "sl-one"]);
@@ -230,8 +230,10 @@ describe("B3: every kind that can land on a tier gets guidance in that tier's pr
 });
 
 describe("S1: the replay replays what was measured; an uncalibrated question refuses dispatch", () => {
-	test("the calibration record names the question the sample was recorded with", () => {
-		expect(loadCalibration().questionSha256).toBe(loadSample().questionSha256);
+	test("the calibration record names the question and judge the sample was recorded with", () => {
+		const sample = loadSample();
+		expect(loadCalibration().questionSha256).toBe(sample.questionSha256);
+		expect(sample.judgeModel).toBe(loadCalibration().judgeModel);
 	});
 
 	test("the live question is the re-measured one, so the calibration gate lets it route", async () => {

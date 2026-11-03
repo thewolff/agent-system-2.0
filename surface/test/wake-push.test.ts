@@ -5,15 +5,15 @@
 // (ctx.setInterval), emits `message_end` for a pushed message the way OMP admits it, keeps unconfirmed
 // sends as OMP's ACP branch would, and runs the `context` hook over what would reach the model.
 import { describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { CONTRACT_MARKER } from "../../gates/src/rows/r02-contract";
-import { Ledger } from "../../ledger/src/index";
+import { Ledger, type MessageRow } from "../../ledger/src/index";
 import { launchVerdict } from "../extensions/launch";
 import orchestratorSurface from "../index";
-import { doneBody } from "../src/launch";
-import { surfaceSession } from "../src/session";
-import { SURFACE_BY } from "../src/types";
+import { doneBody, planFirstBody } from "../src/launch";
+import { type SurfaceSession, surfaceSession } from "../src/session";
+import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, type Sent, timeouts, timers, tmp } from "./helpers";
 
 const APPLIED = "## Applied from the surface since your last turn";
@@ -25,7 +25,7 @@ function env(over: Record<string, string> = {}): Record<string, string> {
 	writeFileSync(voice, "VOICE DOC BODY");
 	const contract = join(tmp("contract"), "output-types.md");
 	writeFileSync(contract, "CONTRACT DOC BODY");
-	const e = { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: join(tmp("ledger"), "ledger.db"), AGENT_SYSTEM_VOICE: voice, AGENT_SYSTEM_CONTRACT: contract, HOME: "/nonexistent-home", ...over };
+	const e = { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: join(tmp("ledger"), "ledger.db"), AGENT_SYSTEM_VOICE: voice, AGENT_SYSTEM_CONTRACT: contract, AS2_HEADROOM_POLLS: join(tmp("headroom-missing"), "polls.jsonl"), HOME: "/nonexistent-home", ...over };
 	Ledger.open(e.AGENT_SYSTEM_LEDGER_DB, { create: true, backup: false, backupOnOpen: false }).close();
 	return e;
 }
@@ -96,6 +96,44 @@ const keyOf = (m: { details?: unknown }) => (m.details as Key | undefined)?.surf
 const occurrences = (text: string, needle: string) => text.split(needle).length - 1;
 
 describe("Fix 1: a pending wake is pushed as an aside, and confirmed", () => {
+	test("T4: space-bearing ledger paths link synchronously without changing wake retries or notice confirmation", async () => {
+		const t = surface();
+		const path = join(tmp("linked-wake"), "PLAN with spaces.md");
+		writeFileSync(path, "# Plan\n");
+		const target = new URL(`file://${path}`).href;
+		const linked = `[${path}](${target})`;
+		const l = Ledger.open(t.e.AGENT_SYSTEM_LEDGER_DB!, { backup: false, backupOnOpen: false });
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "Review plan", stakes: "normal", mode: "user-driven" });
+		const sl = l.addSlice({ by: "lane-a", workloadId: wl, task: "plan", doneCondition: "reviewed", inputs: path });
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
+		expect(l.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: null }).won).toBe(true);
+		l.write(() => {
+			const q = l.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: path, options: ["approve", "revise"] });
+			l.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "assumption", body: `plan-question: ${q}` });
+		});
+		l.close();
+		await t.start();
+		t.fire();
+		const first = t.of("surface-wake")[0]!;
+		expect(first.message.content).toContain(linked);
+		const key = `wake:${t.s().wakeInFlight!.wakeId}`;
+		expect(keyOf(first.message)).toBe(key);
+		expect(t.s().wakeInFlight!.tries).toBe(1);
+		t.s().tickNotices.push(`tick: reviewed ${path}`);
+		t.tick();
+		expect(t.s().wakeInFlight!.tries).toBe(2);
+		t.tick();
+		expect(t.s().wakeInFlight!.tries).toBe(3);
+		expect(t.of("surface-wake").map((m) => keyOf(m.message))).toEqual([key, key, key]);
+		expect(t.of("surface-notices")).toHaveLength(0);
+		await t.admit(first);
+		expect(t.s().wakeInFlight).toBeNull();
+		t.tick();
+		const notice = t.of("surface-notices");
+		expect(notice).toHaveLength(1);
+		expect(notice[0]!.message.content).toContain(`tick: reviewed ${linked}`);
+	});
+
 	test("W1 launch: the one-shot pushes the wake with the voice and contract inlined; bash is owed; message_end confirms; Jo's next turn carries no wake; the read clears the block", async () => {
 		const t = surface();
 		await t.start();
@@ -105,7 +143,8 @@ describe("Fix 1: a pending wake is pushed as an aside, and confirmed", () => {
 		expect(wakes).toHaveLength(1);
 		const content = wakes[0]!.message.content;
 		expect(content).toContain("(wake: session-start)");
-		expect(content).toContain(`# Voice document (${t.e.AGENT_SYSTEM_VOICE})\n\nVOICE DOC BODY`);
+		expect(content).toContain(`[${t.e.AGENT_SYSTEM_VOICE}](${new URL(`file://${t.e.AGENT_SYSTEM_VOICE}`).href})`);
+		expect(content).toContain("VOICE DOC BODY");
 		expect(content).toContain(`${CONTRACT_MARKER}\nCONTRACT DOC BODY`);
 		expect(content.indexOf("VOICE DOC BODY")).toBeLessThan(content.indexOf("(wake: session-start)"));
 		expect(content.indexOf("CONTRACT DOC BODY")).toBeLessThan(content.indexOf("(wake: session-start)"));
@@ -403,5 +442,122 @@ describe("Fix 2: the tick's notices are pushed from their own queue, and confirm
 		const carrying = out.filter((m) => typeof m.content === "string" && m.content.includes(w.line(1)));
 		expect(carrying).toEqual([render]);
 		expect(appliedOf(turn)).toEqual([`- ${w.line(1)}`, `- ${w.line(2)}`]);
+	});
+});
+
+describe("Anthropic weekly advisory reaches the actual wake read and poll delivery path", () => {
+	const now = Date.parse("2026-10-27T10:00:00.000Z");
+	const reset = now + 3 * 86_400_000;
+	function poll(path: string, used = 0.70, resetsAt = reset): void {
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, JSON.stringify({ t: now / 1000, limits: [{ provider: "anthropic", windowId: "7d", tier: null, usedFraction: used, resetsAt }] }) + "\n");
+	}
+	const weeklyMessages = (t: { s(): SurfaceSession }) => t.s().ledger().db.query<MessageRow, [string]>("SELECT * FROM messages WHERE workload_id = ? AND body LIKE 'notice: Anthropic 7-day meter %'").all(STANDING_WORKLOAD_ID);
+
+	test("a fresh injected 70% fixture appears at the poll as an aside, is delivered and never requeued", async () => {
+		const t = surface({ env: { AGENT_SYSTEM_SURFACE_BATCH_MS: "0" } });
+		t.s().now = () => new Date(now).toISOString();
+		await t.start();
+		await t.jo();
+		await t.read();
+		expect(weeklyMessages(t)).toEqual([]);
+		poll(t.e.AS2_HEADROOM_POLLS!);
+		t.tick();
+		const pushed = t.of("surface-needs-you");
+		expect(pushed).toHaveLength(1);
+		expect(pushed[0]!.message.content).toContain("70% used (30% left)");
+		expect(pushed[0]!.message.content).toContain("nothing to answer");
+		expect(pushed[0]!.message.content).toContain("open answer lines: 0");
+		expect(pushed[0]!.options).toEqual({ deliverAs: "aside", triggerTurn: true });
+		expect(weeklyMessages(t)).toHaveLength(1);
+		expect(weeklyMessages(t)[0]!.state).toBe("delivered");
+		await t.admit(pushed[0]!);
+		t.tick();
+		poll(t.e.AS2_HEADROOM_POLLS!, 0.92);
+		t.tick();
+		expect(t.of("surface-needs-you")).toHaveLength(1);
+		expect(weeklyMessages(t)).toHaveLength(1);
+		expect((await t.jo()).messages.map(m => m.content).join("\n")).not.toContain("Anthropic 7-day meter");
+	});
+
+	test("the first wake sees an injected fixture and an ordinary turn also observes a newly fresh fixture", async () => {
+		for (const onWake of [true, false]) {
+			const t = surface();
+			t.s().now = () => new Date(now).toISOString();
+			if (onWake) poll(t.e.AS2_HEADROOM_POLLS!, 0.84);
+			await t.start();
+			const wake = await t.jo();
+			if (onWake) expect(wake.messages.map(m => m.content).join("\n")).toContain("84% used (16% left)");
+			else {
+				await t.read();
+				poll(t.e.AS2_HEADROOM_POLLS!, 0.84);
+				expect((await t.jo()).messages.map(m => m.content).join("\n")).toContain("84% used (16% left)");
+			}
+			expect(weeklyMessages(t)).toHaveLength(1);
+			expect(weeklyMessages(t)[0]!.state).toBe("delivered");
+		}
+	});
+
+	test("a finite invalid weekly reset leaves existing needs-you visible in the actual pushed wake without a quota notice", async () => {
+		const t = surface();
+		t.s().now = () => new Date(now).toISOString();
+		poll(t.e.AS2_HEADROOM_POLLS!, 0.72, now * 1e6);
+		const l = Ledger.open(t.e.AGENT_SYSTEM_LEDGER_DB!, { backup: false, backupOnOpen: false });
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "Keep this decision visible", stakes: "normal", mode: "user-driven" });
+		const sl = l.addSlice({ by: SURFACE_BY, workloadId: wl, task: "choose", doneCondition: "decision recorded", inputs: "question" });
+		const question = l.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which release should remain visible?", options: ["current", "next"] });
+		l.close();
+		await t.start();
+		t.fire();
+		const wakes = t.of("surface-wake");
+		expect(wakes).toHaveLength(1);
+		const content = wakes[0]!.message.content;
+		expect(content).toContain("(wake: session-start)");
+		expect(content).toContain("needs you");
+		expect(content).toContain(question);
+		expect(content).toContain("Which release should remain visible?");
+		expect(content).not.toContain("could not be rendered");
+		expect(content).not.toContain("Anthropic 7-day meter");
+		expect(weeklyMessages(t)).toEqual([]);
+	});
+
+	test("missing injected path and missing injected HOME default never read an ambient quota fixture", async () => {
+		const ambient = join(tmp("ambient-headroom"), "polls.jsonl");
+		poll(ambient, 0.99);
+		const previous = process.env.AS2_HEADROOM_POLLS;
+		process.env.AS2_HEADROOM_POLLS = ambient;
+		try {
+			const configurations: Record<string, string>[] = [
+				{ AS2_HEADROOM_POLLS: join(tmp("isolated-missing"), "polls.jsonl") },
+				{ AS2_HEADROOM_POLLS: "", HOME: tmp("isolated-home") },
+			];
+			for (const overrides of configurations) {
+				const t = surface({ env: overrides });
+				t.s().now = () => new Date(now).toISOString();
+				await t.start();
+				const wake = await t.jo();
+				expect(wake.messages.map(m => m.content).join("\n")).not.toContain("Anthropic 7-day meter");
+				await t.read();
+				t.tick();
+				expect(weeklyMessages(t)).toEqual([]);
+				expect(t.of("surface-needs-you")).toEqual([]);
+			}
+		} finally {
+			if (previous === undefined) delete process.env.AS2_HEADROOM_POLLS;
+			else process.env.AS2_HEADROOM_POLLS = previous;
+		}
+	});
+
+	test("without an override the poll path is derived from the surface's injected HOME", async () => {
+		const home = tmp("headroom-home");
+		poll(join(home, "agent-scratch", "agent-system-2.0", "quota-watch", "polls.jsonl"));
+		const t = surface({ env: { AS2_HEADROOM_POLLS: "", HOME: home } });
+		t.s().now = () => new Date(now).toISOString();
+		await t.start();
+		t.fire();
+		expect(t.of("surface-wake")).toHaveLength(1);
+		expect(t.of("surface-wake")[0]!.message.content).toContain("70% used (30% left)");
+		expect(weeklyMessages(t)).toHaveLength(1);
+		expect(weeklyMessages(t)[0]!.state).toBe("delivered");
 	});
 });

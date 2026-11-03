@@ -11,7 +11,7 @@ import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { controlEntries } from "../src/launch";
 import { PLAN_SKIP_CONFIDENCE, planFirstTrigger, saidNoPlan } from "../src/stakes";
-import { ctxOf, fakePi, tmp } from "./helpers";
+import { ctxOf, fakePi, HOW_IT_FAILS, tmp } from "./helpers";
 
 function env(): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
@@ -46,7 +46,7 @@ async function openWith(deps: Deps, params: Record<string, unknown>) {
 	const f = fakePi();
 	const e = env();
 	orchestratorSurface(f.pi, e, deps);
-	const r = await f.tool("orchestrator_open_workload").execute("1", { done: "it is done", ...params }, undefined, undefined, ctxOf());
+	const r = await f.tool("orchestrator_open_workload").execute("1", { done: "it is done", ...params, brief: `${String(params.brief ?? "")}${HOW_IT_FAILS}` }, undefined, undefined, ctxOf());
 	const id = detail(r.details, "id")!;
 	const l = Ledger.open(e.AGENT_SYSTEM_LEDGER_DB!, { create: true, backup: false, backupOnOpen: false });
 	const control = controlEntries(l.entries(id, "assumption"));

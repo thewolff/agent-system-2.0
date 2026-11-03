@@ -5,10 +5,15 @@
  * memory in the ledger's shapes; nothing opens a ledger.
  */
 import { describe, expect, test } from "bun:test";
+import { CLASSIFIER_BY } from "../../ledger/src/index";
 import {
+	autoExtendNoticeBody,
+	blockingOf,
 	countRounds,
 	type EntryInput,
 	effectiveRoundLimit,
+	fellEveryRound,
+	type LimitEntryInput,
 	type Findings,
 	type FindingsOrUnknown,
 	type InstructionInput,
@@ -128,6 +133,76 @@ describe("limit: slice extends", () => {
 	test("a new loop starts with the full allowance, without the old loop's extends", () => {
 		const entries = [entry(reviewLimitBody(q, SL)), entry(reviewRoundsExtendBody(SL, 3, "in-ext")), entry(reviewLoopEndBody(SL, "accept"))];
 		expect(effectiveRoundLimit(entries, [answer("in-ext")], "normal", SL).total).toBe(3);
+	});
+});
+
+describe("limit: the classifier's auto-extend (PLAN wl-mvqwn80onq9hq8 D10, R23)", () => {
+	const APPLIED = `ruling-applied: review-auto-extend kind round-limit slice ${SL} answer extend`;
+	/** An entry with its id and writer, as the ledger returns it. */
+	const row = (id: string, body: string, by: string, slice: string | null = SL): LimitEntryInput => ({ ...entry(body, slice), id, created_by: by });
+	const auto = (appliedId: string, by = CLASSIFIER_BY) => row(`en-x${appliedId}`, reviewRoundsExtendBody(SL, 3, appliedId), by);
+
+	test("an extend by CLASSIFIER_BY naming the slice's ruling-applied: review-auto-extend entry adds its block", () => {
+		const entries = [row("en-app1", APPLIED, "lane-1"), auto("en-app1")];
+		expect(effectiveRoundLimit(entries, [], "normal", SL)).toEqual({ workload: 3, extend: 3, total: 6 });
+		expect(effectiveRoundLimit(entries, [], "normal", "sl-y").total).toBe(3);
+	});
+
+	test("at most one auto-extend counts per loop; a new loop starts without it", () => {
+		const two = [row("en-app1", APPLIED, "lane-1"), auto("en-app1"), row("en-app2", APPLIED, "lane-1"), auto("en-app2"), auto("en-app1")];
+		expect(effectiveRoundLimit(two, [], "normal", SL).total).toBe(6);
+		const ended = [row("en-app1", APPLIED, "lane-1"), auto("en-app1"), entry(reviewLoopEndBody(SL, "accept"))];
+		expect(effectiveRoundLimit(ended, [], "normal", SL).total).toBe(3);
+		// The next loop may have its own one.
+		const next = [...ended, row("en-app2", APPLIED, "lane-1"), auto("en-app2")];
+		expect(effectiveRoundLimit(next, [], "normal", SL).total).toBe(6);
+	});
+
+	test("the en- form from another writer, naming another entry, another slice's ruling-applied, or with no ids adds nothing", () => {
+		const applied = row("en-app1", APPLIED, "lane-1");
+		expect(effectiveRoundLimit([applied, auto("en-app1", "lane-1")], [], "normal", SL).total).toBe(3);
+		expect(effectiveRoundLimit([applied, row("en-other", "some-entry: x", "lane-1"), auto("en-other")], [], "normal", SL).total).toBe(3);
+		const otherSlice = row("en-app9", "ruling-applied: review-auto-extend kind round-limit slice sl-y answer extend", "lane-1", "sl-y");
+		expect(effectiveRoundLimit([otherSlice, auto("en-app9")], [], "normal", SL).total).toBe(3);
+		const flipped = row("en-app3", `ruling-applied: flow-repair kind round-limit slice ${SL} answer extend`, "lane-1");
+		expect(effectiveRoundLimit([flipped, auto("en-app3")], [], "normal", SL).total).toBe(3);
+		// A caller that hands in rows without id and writer never counts one.
+		expect(effectiveRoundLimit([entry(APPLIED), entry(reviewRoundsExtendBody(SL, 3, "en-app1"))], [], "normal", SL).total).toBe(3);
+	});
+
+	test("Jo's extend and the auto-extend both count in one loop", () => {
+		const q = "q-limit-x";
+		const entries = [row("en-app1", APPLIED, "lane-1"), auto("en-app1"), entry(reviewLimitBody(q, SL)), entry(reviewRoundsExtendBody(SL, 3, "in-ext"))];
+		expect(effectiveRoundLimit(entries, [instr("in-ext", "extend", { kind: "answer", question_id: q })], "normal", SL)).toEqual({ workload: 3, extend: 6, total: 9 });
+	});
+});
+
+describe("fellEveryRound and the auto-extend notice (PLAN wl-mvqwn80onq9hq8 D10, R23, R24)", () => {
+	const rounds = (...blocking: FindingsOrUnknown[]) => blocking.flatMap((b, i) => round(`dt-f${i}`, "accepted", b));
+
+	test("true only with at least two complete rounds, every count known, each lower than the one before", () => {
+		expect(fellEveryRound(countRounds(rounds(findingsWith(3), findingsWith(2), findingsWith(1)), SL))).toBe(true);
+		expect(fellEveryRound(countRounds(rounds(findingsWith(2), findingsWith(1)), SL))).toBe(true);
+		expect(fellEveryRound(countRounds(rounds(findingsWith(3)), SL))).toBe(false);
+		expect(fellEveryRound(countRounds(rounds(findingsWith(3), findingsWith(3), findingsWith(1)), SL))).toBe(false);
+		expect(fellEveryRound(countRounds(rounds(findingsWith(2), findingsWith(3), findingsWith(1)), SL))).toBe(false);
+		expect(fellEveryRound(countRounds(rounds(findingsWith(3), UNKNOWN, findingsWith(1)), SL))).toBe(false);
+	});
+
+	test("a round with a member's block unknown beside a known one is not a known count", () => {
+		const pair = (n: number, blocking: number) => [
+			spawn(`dt-${n}a`, `dg-${n}`), spawn(`dt-${n}b`, `dg-${n}`),
+			settle(`dt-${n}a`, `dg-${n}`, "accepted", findingsWith(blocking), n),
+			settle(`dt-${n}b`, `dg-${n}`, "withheld", UNKNOWN, n),
+		];
+		expect(fellEveryRound(countRounds([...pair(1, 3), ...pair(2, 2)], SL))).toBe(false);
+	});
+
+	test("the notice names the slice, the workload, each round's blocking count and both off words", () => {
+		const c = countRounds(rounds(findingsWith(3), findingsWith(2), findingsWith(1)), SL);
+		expect(autoExtendNoticeBody(SL, "wl-abc", c)).toBe(
+			`review of ${SL} on wl-abc extended by itself (blocking 3→2→1, ruling review-auto-extend); \`stop-reviews wl-abc\` stops it; \`ask-all\` stops all auto-extends`,
+		);
 	});
 });
 
@@ -258,6 +333,45 @@ describe("countRounds", () => {
 			entry(`review-round: ${SL} round 1 token dt-z group dg-z verdict accepted blocking 5 counts ${JSON.stringify(findingsWith(1))}`),
 		];
 		expect(countRounds(entries, SL).rounds).toEqual([]);
+	});
+});
+
+describe("fault-tolerance findings (issue #334 item 1): a silent failure path is blocking", () => {
+	/** A reviewer's report on a diff whose `catch {}` hides the push error, filed at the severity the reviewer chose. */
+	const report = (severity: string) =>
+		[
+			"Reviewed the push helper.",
+			"```ts",
+			"try { await push(branch); } catch {}",
+			"```",
+			"The empty catch hides a failed push: the lane reports done with nothing on the remote.",
+			block([f(severity, "fault-tolerance", "catch {} hides a failed push")]),
+		].join("\n");
+
+	test("a catch {} hiding an error is a blocking fault-tolerance finding, at whatever severity the reviewer wrote", () => {
+		for (const severity of ["blocking", "major", "minor"]) {
+			const p = parsed(report(severity));
+			expect({ severity, counts: p.counts }).toEqual({ severity, counts: { blocking: { "fault-tolerance": 1 }, major: {}, minor: {} } });
+			expect(blockingOf(p)).toBe(1);
+		}
+	});
+
+	test("a stored round whose fault-tolerance count is not blocking is malformed, not read as a pass (review of #405, should-fix 5)", () => {
+		const round = (findings: ReturnType<typeof parsed>) => reviewRoundBody({ slice: SL, round: 1, token: "dt-1", group: "dg-1", verdict: "accepted", findings });
+		// a legacy round (major correctness, minor docs) still round-trips
+		const legacy = round(parsed(block([f("major", "correctness", "off by one"), f("minor", "docs", "typo in readme")])));
+		expect(parseReviewRound(legacy)?.findings).toEqual(parsed(block([f("major", "correctness", "off by one"), f("minor", "docs", "typo in readme")])));
+		// a valid round with a minor docs finding parses; the same body with only that count's kind changed to fault-tolerance does not
+		const valid = round(parsed(block([f("minor", "docs", "typo in readme")])));
+		expect(parseReviewRound(valid)).not.toBeNull();
+		expect(valid).toContain(' blocking 0 counts {"');
+		const minorFaultTolerance = valid.replace('"docs"', '"fault-tolerance"');
+		expect(minorFaultTolerance).toContain('"minor":{"fault-tolerance":1}');
+		expect(parseReviewRound(minorFaultTolerance)).toBeNull();
+		// and a fault-tolerance round written by the parser itself round-trips as blocking
+		const ft = round(parsed(report("minor")));
+		expect(ft).toContain(" blocking 1 counts ");
+		expect(parseReviewRound(ft)?.findings).toEqual(parsed(report("minor")));
 	});
 });
 

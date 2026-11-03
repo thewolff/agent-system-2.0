@@ -3,7 +3,9 @@
 // (up to four words, never read as a batch), `rounds <n> [wl-…]` (up to three words, never read as
 // a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), `cancel-slice <sl-…>` and
 // `supersede <wl-A> <wl-B>` (PLAN wl-mv5i3lulwwbbi8 D1, D2), `test-pr <wl-…> <N> [<N> …]`
-// (any length, never read as a batch; PLAN wl-mv5qdfvv82ivwg § 2.1), or a numbered batch
+// (any length, never read as a batch; PLAN wl-mv5qdfvv82ivwg § 2.1), `train [<wl-…>] <N> [<N> …]`
+// (any length, never read as a batch, refused inside one; PLAN wl-mv8s8srodefytc § 1), `withdraw <wl-…>`
+// (any length, never read as a batch; PLAN wl-mv8s939084z1ts D1), or a numbered batch
 // answering needs-you lines by their session number ("1 approve, 2 deny", or one per line;
 // MIGRATION.md § M7 follow-ups item 1). Read
 // from the turn's prompt in `before_agent_start` rather than from the `input` event, because
@@ -43,7 +45,10 @@
 // wl-mv65nllu5g181s): while an orchestrator question is open or a workload besides the standing one
 // is, a prompt that applies as no command and that Jo typed is written first as an `instruction`
 // row by Jo on the standing workload, body = the prompt, and its `in-…` id is echoed into the
-// turn's context. That row is the one authority orchestrator_record_instruction may resolve a
+// turn's context. The body leaves out the pair offer lines of a `pending` block pasted back (PLAN
+// wl-mvb9mw00ycfjeo R3; `withoutPairOffers`, the rule interpretPaste drops them by), so an offer is
+// never Jo's words; a prompt that is nothing but such a block's wrapper, offer lines included,
+// writes no row and echoes that nothing applied. That row is the one authority orchestrator_record_instruction may resolve a
 // question or record an instruction with (naming questionId or workloadId, and inputId): Jo's words
 // reach the ledger from that row, never from the model's parameters. "Jo typed" is OMP's `input`
 // event, source interactive or rpc (never the hidden session-stop continuation, an aside, or
@@ -68,7 +73,19 @@
 // cancelled slice's, so both run it too); a
 // flip to autonomous writes Jo's `launch-requested:` cause and runs the trigger; a flip
 // to user-driven while an autonomous lane holds the workload writes the `lane-stop:` request the
-// runner accepts.
+// runner accepts. Jo's `train <N…>` opens a merge train (`applyTrain`, the surface's cwd as its repo) and
+// runs the trigger on the new id, taken from `applyTrain`'s result; `train <wl-…> <N…>` adds to one,
+// writing Jo's `launch-requested:` when no lane holds it live, and runs the trigger too.
+//
+// Closing a withdrawn workload (PLAN wl-mv8s939084z1ts D4): after the transaction that applied a
+// `withdraw <wl-…>` commits, on the single word and the paste path (never on a refused paste or a
+// rolled-back transaction), `closeAfter` closes each withdrawn workload through
+// `closeWorkloadWithEntry` (the close tool's body, no receipt: the withdrawal stands in for it) and
+// appends its line to that command's echo: `Closed <wl>.` with the decision-log entry, or `<wl> stays
+// open: <refusal>; the tick retries the close`. A close that throws is named the same way (`withdrawn,
+// but the close failed: …`), never as "could not apply", since the withdrawal is committed; the wake
+// tick finishes a close the word could not (surface/extensions/wake.ts `catchUp`). A withdrawal is
+// no resolution a lane resumes on, so it runs no launch trigger.
 //
 // Surface words (PLAN wl-mv5msri070p0qo D1, D4), each only as the whole trimmed input: `pending`
 // and `brb` are read from the `input` event and handled there, so OMP drops them and no turn starts
@@ -76,23 +93,69 @@
 // the next idle poll while the session streams; `brb` holds the routine needs-you pushes); neither
 // goes on the typed FIFO. `back` reaches the model, and the wake row reads it in its
 // `before_agent_start`; its turn takes its own typed entry and writes no row.
+//
+// Pair (PLAN wl-mvb9mw00ycfjeo D6): a `pair` answer's receipt (surface/src/input.ts applyPair) ends on a
+// line that is exactly the by-hand command `as2 lane wl-…`. The launch trigger's note is never appended
+// to an echo that already carries its workload's by-hand command as a line (nothing launches on a
+// user-driven workload, and the receipt says how to continue). After the commit, on every path (single,
+// numbered batch, paste), the command of the last pair answer applied is copied through the row's
+// copier, and `(copied to the clipboard)` or `(not copied: <why>)` goes on a line of its own after it,
+// inside the same receipt; that receipt is the echo's last line, so no later notice replaces it on
+// screen. A copy that fails never undoes the answer.
 import type { Ledger } from "../../ledger/src/index";
 import { AWAY_NOTICE, pendingText, surfaceWord } from "../src/batch";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
-import { apply, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, modeFlipControl, type PasteInstruction, runHeartbeat } from "../src/input";
+import { apply, applyTrain, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, modeFlipControl, type PasteInstruction, runHeartbeat } from "../src/input";
+import { byHandLine } from "../src/launch";
+import { PAIR_OPTION } from "../src/pair-suggest";
+import { PENDING_WRAPPER_ONLY, withoutPairOffers } from "../src/pending";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { oneLinerCore } from "../src/render";
 import { DISCARDED_KEPT, type SurfaceSession, surfaceSession, type TypedEntry } from "../src/session";
 import { type Ctx, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY } from "../src/types";
 import { triggerLaunch } from "./launch";
+import { closeWorkloadWithEntry } from "./workload";
 
 /** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null; `stop-reviews` and `cancel-slice` withdraw questions too. */
 const resumes = (cmd: Command): string | null =>
 	cmd.kind === "answer" || cmd.kind === "withdraw" || cmd.kind === "stop-reviews" || cmd.kind === "cancel-slice" ? cmd.workloadId : null;
 
-/** The workload the launch trigger runs for after `cmd`: one a resolution resumes, or one a flip to autonomous hands to a lane; else null. */
-const launches = (cmd: Command): string | null => resumes(cmd) ?? (cmd.kind === "mode" && cmd.mode === "autonomous" ? cmd.workloadId : null);
+/** The workload the launch trigger runs for after `cmd`: one a resolution resumes, one a flip to autonomous hands to a lane, or a merge train Jo added to; else null. */
+const launches = (cmd: Command): string | null =>
+	resumes(cmd) ?? ((cmd.kind === "mode" && cmd.mode === "autonomous") || cmd.kind === "train-append" ? cmd.workloadId : null);
+
+/** The workload of a `pair` answer (its receipt carries the by-hand command, PLAN wl-mvb9mw00ycfjeo D6), else null. */
+const pairOf = (cmd: Command): string | null => (cmd.kind === "answer" && cmd.answer.toLowerCase() === PAIR_OPTION ? cmd.workloadId : null);
+
+/**
+ * One applied command's echo: its receipt, the workload the launch trigger runs for, the workload of a `pair` answer, and
+ * `closes`, the workload a `withdraw <wl-…>` closes after its transaction commits (PLAN wl-mv8s939084z1ts D4).
+ */
+interface Echo {
+	wl: string | null;
+	line: string;
+	pair?: string | null;
+	closes?: string;
+}
+
+/** Copies `text` to Jo's clipboard: null when it was copied, else why not, in a few words. */
+export type Copier = (text: string, ctx: Ctx) => Promise<string | null>;
+
+/**
+ * The default copier (PLAN wl-mvb9mw00ycfjeo D6): pbcopy through `pi.exec` (which takes no stdin, so the text is an
+ * argument of `sh -c`), only on macOS with a UI and outside SSH (best effort: tmux reattached across SSH can misjudge).
+ */
+export function pbcopyCopier(pi: SurfaceAPI, env: Record<string, string | undefined>, platform: string = process.platform): Copier {
+	return async (text, ctx) => {
+		if (platform !== "darwin") return "no clipboard on this system";
+		if (!ctx.hasUI) return "no terminal to copy for";
+		if (env.SSH_CONNECTION || env.SSH_TTY) return "this is an SSH session";
+		if (!pi.exec) return "the host has no exec for extensions";
+		const r = await pi.exec("sh", ["-c", 'printf %s "$1" | pbcopy', "sh", text], { timeout: 2000 });
+		return r.code === 0 ? null : `pbcopy exited ${r.code}`;
+	};
+}
 
 /** `line 5` or `lines 5–7`: the span of a paste's plain-words run. */
 const span = (i: PasteInstruction): string => (i.from === i.to ? `line ${i.from}` : `lines ${i.from}–${i.to}`);
@@ -103,10 +166,20 @@ const span = (i: PasteInstruction): string => (i.from === i.to ? `line ${i.from}
  * relaunch nothing to consume; a flip to user-driven while an autonomous lane holds the workload writes the
  * `lane-stop:` request the runner accepts. Jo's `pair` answer writes its own inside `apply` (PLAN wl-mv67564rdkfvnk D7).
  * `heartbeatOf` is the reader the command was interpreted with, so `cancel-slice` re-checks its live run against the same files.
+ * A train-open goes through `applyTrain` with `repo` (the surface's cwd) and launches the id it opened; every other
+ * command launches `launches(cmd)`. Returns the echo and the workload the launch trigger runs for; a `withdraw <wl-…>`
+ * echo names the workload `closeAfter` closes.
  */
-function applyOne(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf): string {
+function applyOne(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf, repo: string): Echo {
+	if (cmd.kind === "train") {
+		const r = applyTrain(ledger, cmd, repo);
+		return { wl: r.workloadId, line: r.line };
+	}
 	const r = apply(ledger, cmd, heartbeatOf);
-	return cmd.kind === "mode" ? r + modeFlipControl(ledger, cmd.workloadId, cmd.mode) : r;
+	return {
+		wl: launches(cmd), line: cmd.kind === "mode" ? r + modeFlipControl(ledger, cmd.workloadId, cmd.mode) : r, pair: pairOf(cmd),
+		closes: cmd.kind === "withdraw-workload" ? cmd.workloadId : undefined,
+	};
 }
 
 /** A ledger refusal inside a paste's transaction, carrying the line it happened on. */
@@ -227,7 +300,7 @@ export function showPending(pi: SurfaceAPI, s: SurfaceSession): void {
 	pi.sendMessage?.({ customType: "surface-pending", content, display: true }, {});
 }
 
-export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
+export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, copier: Copier = pbcopyCopier(pi, env)): void {
 	/** Queue the echo lines for the next turn's context, record the input once, notify each line; each line decorated with its plan paths first (D2). */
 	const echo = (s: SurfaceSession, ctx: Ctx, text: string, lines: string[], level: "info" | "warning"): void => {
 		const shown = lines.map((l) => withPlanPathsOrWarn(() => s.ledger(), s.numbering, l, (m) => ctx.ui.notify(m, "warning")));
@@ -243,11 +316,18 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 	 * The Jo-input row for a prose prompt (see the header): written only when Jo typed this prompt
 	 * (`joTyped`, the turn's take) and there is something it could answer or instruct (an open
 	 * orchestrator question, or an open workload besides the standing one), its id echoed for the
-	 * recorder. `ledger` is the turn's handle when the prompt was read against the ledger already,
-	 * else opened here.
+	 * recorder. Its body is the prompt less a pasted `pending` block's pair offer lines; a prompt
+	 * that is nothing but such a block's wrapper writes no row and echoes PENDING_WRAPPER_ONLY.
+	 * `ledger` is the turn's handle when the prompt was read against the ledger already, else
+	 * opened here.
 	 */
 	const joInputRow = (s: SurfaceSession, ctx: Ctx, text: string, joTyped: boolean, ledger: Ledger | null): void => {
 		if (!joTyped) return;
+		const words = withoutPairOffers(text);
+		if (words === null) {
+			echo(s, ctx, text, [PENDING_WRAPPER_ONLY], "info");
+			return;
+		}
 		try {
 			const l = ledger ?? s.ledger();
 			const inFlight = l.inFlight();
@@ -255,7 +335,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			if (open.length === 0 && !inFlight.some((w) => w.workload.id !== STANDING_WORKLOAD_ID)) return;
 			const id = l.write(() => {
 				ensureStandingWorkload(l);
-				return l.recordInstruction({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: standingSlice(l)?.id ?? null, body: text, author: "jo", channel: "surface" });
+				return l.recordInstruction({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: standingSlice(l)?.id ?? null, body: words, author: "jo", channel: "surface" });
 			});
 			pi.appendEntry("surface-jo-input", { id });
 			const answer = open.length > 0 ? `if they answer ${open.join(" or ")}, record that with ${RECORD_INSTRUCTION_TOOL} naming questionId and inputId ${id}; ` : "";
@@ -336,17 +416,55 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		ctx.setTimeout(() => sweepTyped(s, ctx), 0);
 		return undefined;
 	});
-	/** Run the launch trigger once per workload the applied commands hand on, appending its line to the last echo for that workload; a trigger that throws is named there, the commands being applied already. */
-	const launchAfter = async (ledger: Ledger, echoes: { wl: string | null; line: string }[]): Promise<void> => {
+	/**
+	 * Run the launch trigger once per workload the applied commands hand on, appending its line to the last echo for that workload; a trigger that throws is named there, the commands being applied already.
+	 * A trigger that launched nothing adds no line to a workload whose echoes already carry its by-hand command as a line (a pair receipt, D6).
+	 */
+	const launchAfter = async (ledger: Ledger, echoes: Echo[]): Promise<void> => {
 		for (const wl of [...new Set(echoes.map((e) => e.wl).filter((wl) => wl !== null))]) {
 			const last = echoes.findLast((e) => e.wl === wl)!;
+			const byHand = echoes.some((e) => e.wl === wl && e.line.split("\n").includes(byHandLine(wl)));
 			try {
 				const launched = await triggerLaunch(pi, ledger, env, wl, "jo");
-				if (launched.line) last.line += `; ${launched.line}`;
+				if (launched.line && !(byHand && !launched.attempted)) last.line += `; ${launched.line}`;
 			} catch (err) {
 				last.line += `; applied, but the launch on ${wl} after it failed: ${String(err)}`;
 			}
 		}
+	};
+
+	/**
+	 * PLAN wl-mv8s939084z1ts D4: close each workload a committed `withdraw <wl-…>` withdrew, appending the close's line to that
+	 * command's echo: its text when closed, else the refusal and that the tick retries; a close that throws is named there too, never
+	 * as "could not apply", the withdrawal being committed already.
+	 */
+	const closeAfter = async (ledger: Ledger, ctx: Ctx, s: SurfaceSession, echoes: Echo[]): Promise<void> => {
+		for (const e of echoes) {
+			if (e.closes === undefined) continue;
+			try {
+				const r = await closeWorkloadWithEntry(pi, ledger, env, e.closes, { now: s.now(), cwd: ctx.cwd, receipt: null });
+				e.line += r.closed ? `; ${r.text}` : `; ${e.closes} stays open: ${r.text}; the tick retries the close`;
+			} catch (err) {
+				e.line += `; withdrawn, but the close failed: ${reason(err)}; the tick retries`;
+			}
+		}
+	};
+
+	/**
+	 * D6, after the commit: copy the by-hand command of the last pair answer in `echoes`, put whether it was copied on a
+	 * line of its own at the end of that receipt, and move that receipt last. A copier that throws is a copy not made.
+	 */
+	const copyPair = async (ctx: Ctx, echoes: Echo[]): Promise<Echo[]> => {
+		const i = echoes.findLastIndex((e) => e.pair);
+		if (i < 0) return echoes;
+		const e = echoes[i]!;
+		let why: string | null;
+		try {
+			why = await copier(byHandLine(e.pair!), ctx);
+		} catch (err) {
+			why = reason(err);
+		}
+		return [...echoes.slice(0, i), ...echoes.slice(i + 1), { ...e, line: `${e.line}\n${why === null ? "(copied to the clipboard)" : `(not copied: ${why})`}` }];
 	};
 
 	/** A turn's prompt as Jo's input (see the header): a command applies; prose goes to `asProse`, which the caller's take decides. */
@@ -388,15 +506,15 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				refuse(verdicts, r.held, r.refused.find((f) => f.why !== null)!.line);
 				return undefined;
 			}
-			let echoes: { wl: string | null; line: string }[];
+			let echoes: Echo[];
 			try {
 				// All-or-nothing, one transaction, in paste order; each command through apply(), so each is its own ledger row.
 				echoes = ledger.write(() =>
 					r.items.flatMap((item) => {
 						if (item.kind === "instruction") return [{ wl: null, line: `${span(item)} → an instruction for you, one row: "${item.text.replace(/\s*\n\s*/g, " ")}"` }];
 						try {
-							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, heartbeatOf)}` }));
-							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd, heartbeatOf) }];
+							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, heartbeatOf)}`, pair: pairOf(cmd) }));
+							return [applyOne(ledger, item.cmd, heartbeatOf, ctx.cwd)];
 						} catch (err) {
 							throw new LineFailure(item.line, item.text, err);
 						}
@@ -416,7 +534,8 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				return undefined;
 			}
 			await launchAfter(ledger, echoes);
-			echo(s, ctx, text, echoes.map((e) => e.line), "info");
+			await closeAfter(ledger, ctx, s, echoes);
+			echo(s, ctx, text, (await copyPair(ctx, echoes)).map((e) => e.line), "info");
 			return undefined;
 		}
 
@@ -429,9 +548,10 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			let lines: string[];
 			try {
 				// D4: all-or-nothing, one transaction; each answer through apply(), so each is its own ledger row.
-				const echoes = ledger.write(() => batch.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd)}` })));
+				const heartbeatOf = runHeartbeat(env);
+				const echoes: Echo[] = ledger.write(() => batch.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, heartbeatOf)}`, pair: pairOf(cmd) })));
 				await launchAfter(ledger, echoes);
-				lines = echoes.map((e) => e.line);
+				lines = (await copyPair(ctx, echoes)).map((e) => e.line);
 			} catch (err) {
 				lines = [`could not apply "${text}": ${reason(err)}`];
 			}
@@ -455,9 +575,10 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				echo(s, ctx, text, [cmd.why], "warning");
 				return undefined;
 			}
-			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd, heartbeatOf)) }];
+			const echoes = [ledger.write(() => applyOne(ledger, cmd, heartbeatOf, ctx.cwd))];
 			await launchAfter(ledger, echoes);
-			receipt = echoes[0]!.line;
+			await closeAfter(ledger, ctx, s, echoes);
+			receipt = (await copyPair(ctx, echoes))[0]!.line;
 		} catch (err) {
 			receipt = `could not apply "${text}": ${reason(err)}`;
 		}

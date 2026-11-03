@@ -4,8 +4,7 @@
 // workloads out, the exact block for a fixed ledger, the line format, prompt waits under the fence
 // and not counted, a multiword-option question under the fence and counted, and the empty case.
 import { describe, expect, test } from "bun:test";
-import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
-import { CEILING_OPTIONS } from "../src/ceiling";
+import type { Ledger } from "../../ledger/src/index";
 import { ensureStandingWorkload } from "../src/identity";
 import { doneBody, planFirstBody } from "../src/launch";
 import { raiseOrchestratorQuestion } from "../src/orchestrator-question";
@@ -43,12 +42,6 @@ function planQuestion(ledger: Ledger, body: string): { wl: string; q: string } {
 	return { wl, q };
 }
 
-/** The runner's ceiling question: its own `sl-ceiling-<n>` slice, raised by the lane runner. */
-function ceilingQuestion(ledger: Ledger, wl: string, body: string): string {
-	const sl = ledger.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: `sl-ceiling-${wl.slice(3)}-1`, task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
-	return ledger.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body, options: [...CEILING_OPTIONS] });
-}
-
 /** A fixed ledger: a reserved request, three kinds of lane question, the plan question, and the orchestrator's own question. */
 function fixture() {
 	const c = clock();
@@ -61,13 +54,13 @@ function fixture() {
 	c.plusHours(0.1);
 	const qMarked = ledger.raiseQuestion({ by: "lane-a", workloadId: a.wl, sliceId: a.sl, body: "Keep the `legacy` alias? `keep` (recommended), or drop it", options: ["drop", "keep"] });
 	c.plusHours(0.1);
-	const qCeiling = ceilingQuestion(ledger, a.wl, "Spend reached 80 % of the ceiling.\nstop (the default): the lane is stopped at the ceiling.");
+	const qDefault = ledger.raiseQuestion({ by: "lane-a", workloadId: a.wl, sliceId: a.sl, body: "Ship the header dark first?\nflag (the default): behind the flag.", options: ["now", "flag", "later"] });
 	c.plusHours(1);
 	const p = planQuestion(ledger, planBody("approve-with-changes"));
 	c.plusHours(1);
 	ensureStandingWorkload(ledger);
-	const qOrch = raiseOrchestratorQuestion(ledger, { body: "Merge #12 now or wait for the smoke run?", options: ["merge", "wait"], about: a.wl });
-	return { c, ledger, a, en, qPlain, qMarked, qCeiling, p, qOrch };
+	const qOrch = raiseOrchestratorQuestion(ledger, { body: "Merge #12 now or wait for the smoke run?", options: ["merge", "wait"], about: a.wl }).raised;
+	return { c, ledger, a, en, qPlain, qMarked, qDefault, p, qOrch };
 }
 
 /** The answer lines inside the block's fence (a plan question's `  plan for …` line beneath its own left out). */
@@ -87,7 +80,7 @@ describe("pending: the block (PLAN wl-mv5msri070p0qo D1)", () => {
 	});
 
 	test("the exact block for a fixed ledger: reserved first, then questions, one line per open row", () => {
-		const { ledger, en, qPlain, qMarked, qCeiling, p, qOrch } = fixture();
+		const { ledger, en, qPlain, qMarked, qDefault, p, qOrch } = fixture();
 		const on = `— on ${DONE_A}`;
 		expect(pendingBlock(pendingItems(ledger))).toEqual({
 			count: 6,
@@ -97,7 +90,7 @@ describe("pending: the block (PLAN wl-mv5msri070p0qo D1)", () => {
 				`approve ${en}  # reserved action: push: git push origin main ${on} · no recommendation recorded · also: deny`,
 				`left ${qPlain}  # Which token name ${on} · no recommendation recorded · also: right / withdraw`,
 				`keep ${qMarked}  # Keep the legacy alias? keep (recommended), or drop it ${on} · recommended · also: drop / withdraw`,
-				`stop ${qCeiling}  # Spend reached 80 % of the ceiling ${on} · recommended (the default) · also: extend / split / withdraw`,
+				`flag ${qDefault}  # Ship the header dark first ${on} · recommended (the default) · also: now / later / withdraw`,
 				`approve ${p.q}  # plan for the pending word ships — on the pending word ships · recommended (review: approve-with-changes) · also: revise / cancel / withdraw`,
 				`  plan for ${p.q}: /tmp/plan.md`,
 				`merge ${qOrch}  # Merge #12 now or wait for the smoke run — on your orchestrator's question about ${DONE_A} · no recommendation recorded · also: wait / withdraw`,
@@ -244,17 +237,6 @@ describe("pending: the recorded recommendation, in precedence", () => {
 		expect(pendingItems(ledger).find((i) => i.id === q)).toMatchObject({ answer: "approve", recommended: null, workloadWords: "Brief" });
 	});
 
-	test("the runner's ceiling question recommends stop as the default, its body marked or not", () => {
-		const { ledger } = tempLedger();
-		const { wl } = held(ledger, "lane-a", "Brief", "the ceiling holds");
-		const q = ceilingQuestion(ledger, wl, "80 % of the ceiling");
-		expect(pendingItems(ledger).find((i) => i.id === q)).toMatchObject({ answer: "stop", recommended: "stop", recordedWhere: "the default" });
-		// a lane's own question with the same options and no mark records none
-		const { wl: other, sl } = held(ledger, "lane-b", "Other", null);
-		const own = ledger.raiseQuestion({ by: "lane-b", workloadId: other, sliceId: sl, body: "80 % of the ceiling", options: ["extend", "stop", "split"] });
-		expect(pendingItems(ledger).find((i) => i.id === own)).toMatchObject({ answer: "extend", recommended: null });
-	});
-
 	test("a (recommended), (the default) or (default) mark names the option, case-insensitively, the first match winning", () => {
 		const { ledger } = tempLedger();
 		const { wl, sl } = held(ledger, "lane-a", "Brief", null);
@@ -278,7 +260,7 @@ describe("pending: which rows are covered", () => {
 		const { ledger } = tempLedger();
 		const standing = ensureStandingWorkload(ledger);
 		expect(standing).toBe(STANDING_WORKLOAD_ID);
-		const bare = raiseOrchestratorQuestion(ledger, { body: "Ship it?", options: ["ship", "hold"], about: null });
+		const bare = raiseOrchestratorQuestion(ledger, { body: "Ship it?", options: ["ship", "hold"], about: null }).raised;
 		const unbound = ledger.recordEntry({ by: "lane-4242", workloadId: standing, kind: "reserved-request", body: "deploy: fly deploy (P-11 row 6 refused tool call c1)" });
 		// a closed workload: its question answered, its slice done, a request still unanswered when it closed
 		const closed = ledger.openWorkload({ by: SURFACE_BY, brief: "Closed one", stakes: "normal", mode: "autonomous" });

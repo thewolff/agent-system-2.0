@@ -88,6 +88,8 @@ export function processAlive(pid: number): boolean {
 
 /** In each namespace directory: the canonical path of the ledger its copies are of. */
 export const BACKUP_SOURCE_FILE = "SOURCE";
+/** `backupIfDue`'s temporary SOURCE before it is linked into place: `.SOURCE.<writer pid>-<random>.tmp`. */
+const SOURCE_TEMP_NAME = /^\.SOURCE\.(\d+)-[0-9a-z]*\.tmp$/;
 
 /**
  * The backup subdirectory for the ledger at canonical path `source`: its file name without the
@@ -215,8 +217,10 @@ export interface ReserveRows {
 	slices: SliceRow[];
 	/** Every holder the workload ever had, oldest first (`holders`). */
 	holders: string[];
-	/** Open autonomous workloads held by a `lane-*` holder whose lease is null or not yet lapsed at `now`. */
+	/** Open autonomous workloads held by a `lane-*` holder whose lease is null or not yet lapsed at `now`, cap-exempt workloads not counted. */
 	liveLanes: number;
+	/** This workload is in the cap-exempt set the caller passed (`launchRows`): the surface's open merge trains, outside the lane cap. */
+	capExempt: boolean;
 	cap: number;
 	now: string;
 }
@@ -412,7 +416,9 @@ const ID_PREFIX = { workload: "wl", slice: "sl", message: "msg", question: "q", 
 /** `<prefix>-<ms since epoch, base36><6 random base36>`: sortable by creation, short enough to type. */
 export function newId(kind: keyof typeof ID_PREFIX): string {
 	const rand = crypto.getRandomValues(new Uint32Array(2));
-	const tail = ((rand[0]! * 2 ** 32 + rand[1]!) % 36 ** 6).toString(36).padStart(6, "0");
+	// Keep 53 random bits so adding the low word is exact before reducing the suffix.
+	const random53 = (rand[0]! & 0x1fffff) * 2 ** 32 + rand[1]!;
+	const tail = (random53 % 36 ** 6).toString(36).padStart(6, "0");
 	return `${ID_PREFIX[kind]}-${Date.now().toString(36)}${tail}`;
 }
 
@@ -562,9 +568,12 @@ export class Ledger {
 	/**
 	 * What a launch decision reads (the surface's own predicate run, and `reserveLane` inside its
 	 * transaction): the workload row, its entries, questions, instructions and slices, and the
-	 * live-lane count at `now`. Null when there is no such workload.
+	 * live-lane count at `now`. Null when there is no such workload. `capExempt` is the set of
+	 * workloads outside the lane cap (the surface's open merge trains; this module knows no trains):
+	 * their holders are not counted in `liveLanes`, and `ReserveRows.capExempt` says whether this
+	 * workload is one of them.
 	 */
-	launchRows(workloadId: string, cap: number): ReserveRows | null {
+	launchRows(workloadId: string, cap: number, opts: { capExempt?: ReadonlySet<string> } = {}): ReserveRows | null {
 		const now = this.now();
 		const workload = this.db.query<WorkloadRow, [string]>("SELECT * FROM workloads WHERE id = ?").get(workloadId);
 		if (!workload) return null;
@@ -575,19 +584,23 @@ export class Ledger {
 			instructions: this.instructions(workloadId),
 			slices: this.slices(workloadId),
 			holders: this.holders(workloadId),
-			liveLanes: this.liveLaneHolders(now).length,
+			liveLanes: this.liveLaneHolders(now, opts.capExempt).length,
+			capExempt: opts.capExempt?.has(workloadId) ?? false,
 			cap,
 			now,
 		};
 	}
 
-	/** The `lane-*` holders of open autonomous workloads under a lease that is null or not yet lapsed at `now`, with their workload ids. */
-	liveLaneHolders(now: string = this.now()): { workloadId: string; holder: string }[] {
+	/**
+	 * The `lane-*` holders of open autonomous workloads under a lease that is null or not yet lapsed at `now`, with their
+	 * workload ids; a workload in `exempt` (outside the lane cap, `launchRows`) is left out.
+	 */
+	liveLaneHolders(now: string = this.now(), exempt?: ReadonlySet<string>): { workloadId: string; holder: string }[] {
 		return this.db.query<{ id: string; holder: string }, [string]>(
 			`SELECT id, holder FROM workloads
 			 WHERE mode = 'autonomous' AND status = 'open' AND holder GLOB 'lane-*'
 			   AND (holder_lease_until IS NULL OR holder_lease_until >= ?) ORDER BY created_at, id`,
-		).all(now).map((r) => ({ workloadId: r.id, holder: r.holder }));
+		).all(now).filter((r) => !exempt?.has(r.id)).map((r) => ({ workloadId: r.id, holder: r.holder }));
 	}
 
 	/**
@@ -596,12 +609,13 @@ export class Ledger {
 	 * launch verdict mints the ordinal, pre-claims for the lane id with `leaseMs` (stamped `by`, the
 	 * starter, so the lane's own claim is a real readiness signal) and writes the attempt entry
 	 * `launch: <laneId> cause <cause> requested-by <who>`. A refusal returns before any write.
+	 * `capExempt`, when given, is evaluated inside the transaction and passed to `launchRows`.
 	 */
 	reserveLane(workloadId: string, input: Stamp & {
-		cap: number; leaseMs: number; requestedBy: string; decide: (rows: ReserveRows) => ReserveVerdict;
+		cap: number; leaseMs: number; requestedBy: string; decide: (rows: ReserveRows) => ReserveVerdict; capExempt?: () => ReadonlySet<string>;
 	}): ReserveResult {
 		return this.write(() => {
-			const rows = this.launchRows(workloadId, input.cap);
+			const rows = this.launchRows(workloadId, input.cap, { capExempt: input.capExempt?.() });
 			if (!rows) return { ok: false as const, reason: "no such workload" };
 			const verdict = input.decide(rows);
 			if (!verdict.launch) return { ok: false as const, reason: verdict.reason };
@@ -1118,7 +1132,20 @@ export class Ledger {
 		mkdirSync(policy.dir, { recursive: true });
 		const source = join(policy.dir, BACKUP_SOURCE_FILE);
 		assertNotLiveLedgerUnderTest(source);
-		if (!existsSync(source)) writeFileSync(source, `${this.path}\n`);
+		// SOURCE appears whole or not at all: written under a temporary name, then linked into place,
+		// so a concurrent opener's backups() never reads it empty or partial.
+		if (!existsSync(source)) {
+			const tmp = join(policy.dir, `.${BACKUP_SOURCE_FILE}.${process.pid}-${Math.random().toString(36).slice(2)}.tmp`);
+			try {
+				writeFileSync(tmp, `${this.path}\n`);
+				linkSync(tmp, source); // fails if SOURCE appeared meanwhile; never replaces it
+			} catch (e) {
+				// Another connection published SOURCE first; backups() below still checks whose it is.
+				if (!(e instanceof Error && "code" in e && e.code === "EEXIST")) throw e;
+			} finally {
+				rmSync(tmp, { force: true });
+			}
+		}
 		try {
 			this.backup(dest);
 		} catch (e) {
@@ -1131,10 +1158,10 @@ export class Ledger {
 		for (const old of all.slice(0, Math.max(0, all.length - Math.max(1, policy.keep)))) {
 			for (const suffix of ["", "-wal", "-shm"]) rmSync(old.path + suffix, { force: true });
 		}
-		// A writer killed between VACUUM INTO and its `finally` leaves its temporary snapshot behind.
-		// Reclaim those whose writer is gone; a live writer's (or a reused pid's) is left alone.
+		// A writer killed between writing a temporary file (SOURCE or a VACUUM INTO snapshot) and its
+		// `finally` leaves it behind. Reclaim those whose writer is gone; a live writer's (or a reused pid's) is left alone.
 		for (const name of readdirSync(policy.dir)) {
-			const m = BACKUP_TEMP_NAME.exec(name);
+			const m = BACKUP_TEMP_NAME.exec(name) ?? SOURCE_TEMP_NAME.exec(name);
 			if (m && !processAlive(Number(m[1]))) rmSync(join(policy.dir, name), { force: true });
 		}
 		return dest;

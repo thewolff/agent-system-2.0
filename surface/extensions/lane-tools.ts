@@ -18,41 +18,80 @@
 // checks its body against the plan question's shape (PLAN wl-muq22rnjcfrrpc D7) and writes the
 // holder's `plan-question:` entry in the question's transaction (D9 part two). While `plan: first`
 // stands unapproved it refuses `approve` on any other slice, naming the plan slice and the ways out
-// (PLAN wl-mv5i3lulwwbbi8 D4).
+// (PLAN wl-mv5i3lulwwbbi8 D4). The plan question's check also reads the plan file once, at raise time:
+// its `## Requirements` section names each requirement's enforcer or says prompt-only, and the body's
+// `prompt-only:` lines list exactly the prompt-only ids (PLAN wl-mv8vwb04cy18n4 D1-D3); questions
+// already raised are never re-checked. Every question goes through Jo's standing rulings (gates/src/rulings.ts `askJo`,
+// PLAN wl-mvfkv7llkp7nk0 § 1): one a ruling decides writes no question row, records the lane's `ruling-applied:` and
+// returns what to do instead; a question whose every option is a `provider/model` id declares its `subject`. A merge
+// train's merge question on one of its PRs' disposition slices carries the `trainSignoff` fact, its gh half read live here (PLAN
+// wl-mvg8itbt0rz3ls D2, surface/src/merge-train.ts `trainSignoff`), so Jo's ruling train-signoff can decide it.
+// PLAN wl-mvg1vs0rhnu3gg § 1.0, § 3.5: `now` (one of NOW_CATEGORIES; any other word is refused, nothing written) skips the
+// rulings and plan auto-start; a plan question carrying it still passes the review and shape checks. An ask repeating an
+// open question on its slice (same body and options) goes to `askJo`, which returns the open id as reused (with a `now:`
+// mark when the repeat carries `now`); `plan-question:` is written only on a new raise, carrying the sha256 of the plan file
+// and the verdict file the raise checked. A plan repeat skips the plan checks only while both files still hash the same
+// (fix round 1, F1); a changed file takes every check, which refuses it while the open question stands.
+// PLAN wl-mvqwn80onq9hq8 D6, D9: `routine: { record }` appends the machinery's `record-and-announce` option (a lane option
+// spelling it is refused) so Jo's ruling routine-calls can record and announce a routine call; the plan auto-start runs at
+// normal and production stakes while `routineOn` holds, whatever Jo's flow-repair ruling, and a failed auto-start write asks
+// Jo with `auto-start failed: <error>` first.
 // MIGRATION.md item 40 (PLAN wl-muq1v31q5ly7ls D4, D6): `lane_release` writes `released-open:` in the
 // release's own transaction when open or paused slices remain and no holder receipt stands, and the
 // terminal pair refuses while a hand this lane spawned is unsettled (surface/src/turn-end.ts);
 // `lane_record_entry` refuses the classifier's lines as well (`CLASSIFIER_MACHINERY_PREFIXES`: `hand-spawn:`,
 // `review-round:`, the same-lab and Kimi-out lines `review-same-lab:`, `review-same-lab-rule:`, `provider-refused:`
 // and the rest; PLAN wl-mv64rsqw2fcs1s D5, PLAN wl-mv5xay6bjp0268 § 2.6), so a lane cannot forge a settle or a round
-// verdict, grant itself same-lab or manufacture Kimi-out evidence.
+// verdict, grant itself same-lab or manufacture Kimi-out evidence; and it refuses `ruling-applied:`, which only
+// `askJo` writes, so a lane cannot claim a ruling decided a question it never asked.
 // `lane_full_test` asks the test runner (MIGRATION.md item 24; PLAN wl-muraerdsgw7gn4 § 2.1, § 4) to
 // run the suite outside the fence at a PR head: the lane names a PR and optionally an open slice,
 // nothing else, and the installed starter does the rest. A slice the runner was asked to settle is
 // never completed through `lane_complete_slice`.
 // `lane_read_facts` is the one read: the repo's M8 facts with no budget (MIGRATION.md item 106; surface/src/facts.ts).
-import { statSync } from "node:fs";
-import { join } from "node:path";
+// `lane_train_return` is the merge train's way to hand a PR back to its owner (PLAN wl-mv8s8srodefytc rev 17.1 D6): the
+// lane names the PR, the kind and a detail file; the tool reads the PR's head with gh and writes the train's `train-task:`
+// (surface/src/merge-train.ts `recordTrainTask`), which no lane can write through `lane_record_entry`.
+import { createHash } from "node:crypto";
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import {
 	builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, parseHandSpawn, parseReviewSameLabRule, settledTokens, spentGrants, withheldTokens,
 } from "../../classifier/src/lab";
-import { countRounds, parseReviewLimit } from "../../classifier/src/rounds";
+import { countRounds, parseReviewGroup, parseReviewLimit, parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
+import {
+	type AskResult, askJo, decidedText, installedReviewModel, isNowCategory, machineOptionSpelling, MODEL_SUBJECTS, type ModelSubject, NOW_CATEGORIES, type NowCategory, nowMarks, questionKind,
+	RECORD_ANNOUNCE_OPTION, ROUTINE_RECORD_MAX, RoutineRaiseError, RULING_APPLIED_PREFIX, routineDecidedText, routineRecordProblem, subjectProblem, type TrainSignoffFact,
+} from "../../gates/src/rulings";
+import { alarmFilePath, type RoutineOptions, routineOn } from "../../gates/src/routine-switch";
+import { checkHowItFails, howItFailsNote } from "../../gates/src/how-it-fails";
 import { gateSession } from "../../gates/src/session";
-import type { EntryRow, Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
+import { type EntryRow, homeDir, type InstructionRow, type Ledger, type QuestionRow, type RoutingRow, type WorkloadStatusRow } from "../../ledger/src/index";
 import { repoOf } from "../src/decision-log";
 import { reservedStates } from "../src/errors";
 import { readFacts } from "../src/facts";
 import {
-	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, planFirst, planQuestionBody,
-	planQuestionProblem, planSlice, reservedPrefix,
+	CLASSIFIER_MACHINERY_PREFIXES, type ControlEntry, controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, landFirstOn, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE,
+	PLAN_HOW_IT_FAILS_LINE, PLAN_REQUIREMENTS_HEADING, PLAN_FILE_MAX_BYTES, PLAN_REQUIREMENTS_SHAPE, type PlanBinding, planAutoApprovedBody, planAutoStartNoticeBody, planFirst, planHalted, planQuestionBinding,
+	planQuestionBody, planQuestionFiles, planQuestionProblem, planSlice, reservedPrefix,
 } from "../src/launch";
-import { PAIR_OPTION } from "../src/pair-suggest";
-import { testRuns } from "../src/test-run";
-import { releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
 import {
-	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, type Ctx, LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL,
+	attemptOf, checkoutOwnerRepo, controlRootRefusal, mainProtectionGap, type Protection, recordTrainTask, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_DETAIL_MAX_BYTES, TRAIN_TASK_KINDS,
+	isTrain, type TrainTaskKind, trainAttemptsOf, trainPermanentRefusal, trainPrs,
+	trainSignoff, trainSliceId, trainSlicePr,
+} from "../src/merge-train";
+import { DEFAULT_BRANCH } from "../src/merge-train-stack";
+import { NOTICE_PREFIX, sendNotice } from "../src/notice";
+import { PAIR_OPTION } from "../src/pair-suggest";
+import { QUOTA_MOVE_PREFIX } from "../src/quota-move-alert";
+import { expandCallerHandles } from "../src/linked-api";
+import { SECURITY_RED_PREFIX, SHA_RE, testRuns } from "../src/test-run";
+import { releasedIdleBody, releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
+import {
+	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, type Ctx, ESCALATION_BY, HOLD_HOURS, LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL,
 	LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, LANE_HANDOFF_TOOL, LANE_MESSAGE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_RELEASE_TOOL,
-	LANE_WITHDRAW_RESERVED_TOOL, ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, type SurfaceAPI, TEST_RUN_FAILED_PREFIX, type ToolResult,
+	LANE_TRAIN_RETURN_TOOL, LANE_WITHDRAW_RESERVED_TOOL, ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, STANDING_WORKLOAD_ID, type SurfaceAPI, TEST_RUN_FAILED_PREFIX,
+	type ToolResult,
 } from "../src/types";
 import { isReleased, markReleased } from "./lane";
 
@@ -69,7 +108,9 @@ const SLICE_ID_RE = /^sl-\S+$/;
 const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text: t }], details });
 
 /** Message bodies the machinery writes and the surface reads as signals; a lane's own message must not open with one. */
-const PUSHED_SIGNAL_PREFIXES = [LANE_DIED_PREFIX, PROMPT_WAIT_PREFIX, PROMPT_RESOLVED_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, TEST_RUN_FAILED_PREFIX];
+const PUSHED_SIGNAL_PREFIXES = [
+	LANE_DIED_PREFIX, PROMPT_WAIT_PREFIX, PROMPT_RESOLVED_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, TEST_RUN_FAILED_PREFIX, NOTICE_PREFIX, SECURITY_RED_PREFIX, QUOTA_MOVE_PREFIX,
+];
 
 /** The slice kinds `lane_add_slice` takes; the routing kinds, so the plan slice is `judge` (SPEC § B6). */
 const SLICE_KINDS = ["locate", "understand", "change-small", "change-large", "judge"] as const;
@@ -87,13 +128,63 @@ type Ownership = { ok: true; own: Owned } | { ok: false; result: ToolResult };
 export const planReviewRefusal = (planId: string) =>
 	`a plan goes to Jo only after a review by another lab: dispatch a review hand named ${planId} on the plan, then raise the question naming its verdict`;
 
+/** PLAN wl-mvqwn80onq9hq8 D6: is `slice` its workload's plan slice, `planSlice` while `plan: first` stands? Ruling routine-calls never decides there. */
+function onPlanSlice(ledger: Ledger, own: Owned, slice: string): boolean {
+	const entries = ledger.entries(own.workloadId);
+	return planFirst(controlEntries(entries, holdersOf(entries, own.workload.holder))) !== null && planSlice(ledger.slices(own.workloadId))?.id === slice;
+}
+
+/**
+ * At most PLAN_FILE_MAX_BYTES + 1 bytes of the regular file at `p`, or null when it cannot be read. Non-blocking open, then a
+ * regular-file check on the open descriptor: a path swapped for a FIFO after a stat neither blocks the surface nor is read.
+ * The read is bounded whatever the file's size or growth (PLAN wl-mv8vwb04cy18n4 D3).
+ */
+function readBounded(p: string): Buffer | null {
+	try {
+		const fd = openSync(p, constants.O_RDONLY | constants.O_NONBLOCK);
+		try {
+			if (!fstatSync(fd).isFile()) return null;
+			const buf = Buffer.alloc(PLAN_FILE_MAX_BYTES + 1);
+			let n = 0;
+			while (n < buf.length) {
+				const got = readSync(fd, buf, n, buf.length - n, n);
+				if (got === 0) break;
+				n += got;
+			}
+			return buf.subarray(0, n);
+		} finally {
+			closeSync(fd);
+		}
+	} catch {
+		return null;
+	}
+}
+
+/** The sha256 of the regular file at `p` when it holds at most PLAN_FILE_MAX_BYTES bytes; null otherwise. */
+function fileSha(p: string): string | null {
+	const b = readBounded(p);
+	return b === null || b.length > PLAN_FILE_MAX_BYTES ? null : createHash("sha256").update(b).digest("hex");
+}
+
+/**
+ * PLAN wl-mvg1vs0rhnu3gg fix round 1, F1: may a repeat of the open plan question `questionId` skip the plan checks? Only when a
+ * holder's `plan-question:` entry binds it to the plan file's and the verdict file's sha256 and both files hash the same now.
+ * An entry with no binding (one written before the fix), or a file changed, missing or over the bound, is not unchanged.
+ */
+function planUnchanged(control: readonly ControlEntry[], questionId: string, body: string): boolean {
+	const bound = control.filter((c) => c.prefix === "plan-question").map((c) => planQuestionBinding(c.rest, questionId)).findLast((b) => b !== null) ?? null;
+	const files = planQuestionFiles(body);
+	if (bound === null || files === null) return false;
+	return fileSha(files.plan) === bound.plan && fileSha(files.verdict) === bound.verdict;
+}
+
 /**
  * PLAN wl-mupu0sx2o046io D8: has the plan slice `planId` a review that clears a question offering
  * `approve`? A `routings` row that (1) is on the plan slice and is a review (D2 read-back); (2) ran,
  * its `hand-settled:` token has no `review-withheld:`, and every model that answered is on a lab
  * outside `builderLabs` computed now (no live set: an in-flight hand counts every lab of its row), or
  * its token ran same-lab (`sameLabTokens`: Jo's same-lab answer to a `review-park:` question of this
- * slice, or Jo's Kimi-out rule); (3) was created after the newest earlier question on the plan slice was
+ * slice, or Jo's Kimi-out or dated Anthropic-out rule); (3) was created after the newest earlier question on the plan slice was
  * raised and resolved (an open one clears nothing). A `review-limit:` question Jo answered `accept`
  * does not reset (3) to its own resolution; when the newest one raised since that resolution
  * exists, the plan clears only on the rows of the round that hit its limit (check 2 still applying)
@@ -147,26 +238,33 @@ export function planReviewed(ledger: Ledger, workloadId: string, planId: string)
 	});
 }
 
+/** classifier/extension.ts `headroomSkipBody`: `headroom-skip: <selector> token <dt> <reason>`; group 1 is the token. */
+const HEADROOM_SKIP = /^headroom-skip: \S+ token (\S+)(?: |$)/;
+
 /**
  * PLAN wl-mv5xay6bjp0268 § 2.6 [r2-M1]: the review tokens on the plan slice `planId` that ran same-lab
  * by right. The entry that lets a token run is either a `review-same-lab: <grant> token <dt>` spend
  * whose grant `joGrant` accepts, or a `review-same-lab-rule: … slice <planId> token <dt> …` entry
- * (Jo's Kimi-out rule); it counts only when the very next entry in the workload's order is that
+ * (Jo's Kimi-out or dated Anthropic-out rule). The authorization entry itself must be on the plan
+ * slice; it counts only when the next entry in the workload's order, past an unbroken
+ * run of that token's `headroom-skip:` rows on the plan slice by the same writer (#228), is that
  * token's `hand-spawn:` on the plan slice by the same writer, what the classifier's `recordSpawn`
  * writes in one transaction. A spend or rule line standing alone, or followed by another writer's
  * spawn, clears nothing.
  */
 function sameLabTokens(entries: readonly EntryRow[], planId: string, joGrant: (grant: string) => boolean): Set<string> {
 	const out = new Set<string>();
+	const mine = (x: EntryRow | undefined, e: EntryRow): x is EntryRow => x?.kind === "assumption" && x.created_by === e.created_by && x.slice_id === planId;
 	entries.forEach((e, at) => {
-		if (e.kind !== "assumption") return;
+		if (e.kind !== "assumption" || e.slice_id !== planId) return;
 		const rule = parseReviewSameLabRule(e.body);
 		const spend = rule ? undefined : [...spentGrants([e])][0];
 		const token = rule ? (rule.slice === planId ? rule.token : null) : spend && joGrant(spend[0]) ? spend[1] : null;
 		if (token === null) return;
-		const next = entries[at + 1];
-		const spawn = next?.kind === "assumption" ? parseHandSpawn(next.body) : null;
-		if (spawn?.token === token && next!.created_by === e.created_by && next!.slice_id === planId) out.add(token);
+		let n = at + 1;
+		while (mine(entries[n], e) && HEADROOM_SKIP.exec(entries[n]!.body)?.[1] === token) n++;
+		const next = entries[n];
+		if (mine(next, e) && parseHandSpawn(next.body)?.token === token) out.add(token);
 	});
 	return out;
 }
@@ -181,7 +279,167 @@ function ranModels(row: Pick<RoutingRow, "ran_models">): string[] {
 	}
 }
 
-export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
+/**
+ * PLAN wl-mvfkv7llkp7nk0 § 3: the dispatch group of the review round that lets the plan question on plan slice `planId`
+ * start the plan with no question to Jo, or null when the question goes to Jo. The caller has checked that the question is
+ * the plan question and its body is in shape ((c)). All of these hold:
+ * (a) the workload's stakes are normal or production (PLAN wl-mvqwn80onq9hq8 D9, in-mvqyt4a8gezvgg);
+ * (b) the newest `review-loop-end:` on the plan slice is `reason pass`, and it is the latest review state: after it the
+ *     slice has no `hand-spawn: … review yes`, `review-group:` or `review-round:` entry, and no review routing that is not
+ *     a member of the round it closes. That round (`countRounds` over the entries before the loop-end) is the loop's
+ *     newest, complete and passed, and every member's routing is a review on the plan slice that ran, has no
+ *     `review-withheld:`, ran on no same-lab token (no `review-same-lab:` grant spend and no `review-same-lab-rule:` names
+ *     it), was answered only by models on labs outside `builderLabs`, and was created after every question on the plan
+ *     slice was resolved (none may be open). Jo's `accept` at a round limit ends the loop with `reason accept`, so it fails.
+ *     A production dispatch fans out to every other available lab, one member per leg, so every leg must pass;
+ * (d) no `plan: halted` on the workload, ever;
+ * (e) auto-apply is on at `now` (ms since the epoch): gates/src/routine-switch.ts `routineOn`, so Jo's `ask-all`, a trip or a
+ *     latch sends the plan to Jo (PLAN wl-mvqwn80onq9hq8 D9). Jo's `flow-repair` ruling no longer stops it: starting an open
+ *     workload's plan opens no new work, and the flow-repair intake gate is unchanged (lane assumption en-mvqyngm5e35f2n).
+ * Throws when the switch cannot be read (gates/src/routine-switch.ts `routineState`); the caller then asks Jo.
+ */
+export function planAutoStartRound(ledger: Ledger, workloadId: string, planId: string, now: number, routine: RoutineOptions = {}): string | null {
+	const stakes = ledger.workload(workloadId)?.stakes;
+	if ((stakes !== "normal" && stakes !== "production") || !routineOn(ledger, now, routine)) return null;
+	const entries = ledger.entries(workloadId);
+	if (planHalted(controlEntries(entries))) return null;
+	const endAt = entries.findLastIndex((e) => e.kind === "assumption" && parseReviewLoopEnd(e.body)?.slice === planId);
+	if (endAt < 0 || parseReviewLoopEnd(entries[endAt]!.body)!.reason !== "pass") return null;
+	const later = entries.slice(endAt + 1).some((e) => {
+		if (e.kind !== "assumption") return false;
+		const body = e.body.trim();
+		return (e.slice_id === planId && parseHandSpawn(body)?.review === true) || parseReviewGroup(body)?.slice === planId || parseReviewRound(body)?.slice === planId;
+	});
+	if (later) return null;
+	const round = countRounds(entries.slice(0, endAt), planId).rounds.at(-1);
+	if (!round?.complete || !round.passed || round.members.length === 0) return null;
+	const questions = ledger.questions(workloadId).filter((q) => q.slice_id === planId);
+	if (questions.some((q) => q.state === "open")) return null;
+	const since = questions.reduce((at, q) => (q.changed_at > at ? q.changed_at : at), "");
+	const settled = settledTokens(entries);
+	const withheld = withheldTokens(entries);
+	const sameLab = new Set(spentGrants(entries).values());
+	for (const e of entries) {
+		const rule = e.kind === "assumption" ? parseReviewSameLabRule(e.body) : null;
+		if (rule) sameLab.add(rule.token);
+	}
+	const routings = ledger.routings(workloadId);
+	const builders = builderLabs(ledger, workloadId);
+	const members = new Set<string>();
+	for (const m of round.members) {
+		const id = settled.get(m.token);
+		const row = routings.find((r) => r.id === id);
+		if (!m.spawned || !m.accepted || withheld.has(m.token) || sameLab.has(m.token) || row === undefined) return null;
+		if (row.slice_id !== planId || !isReviewRouting(row) || row.outcome !== "ran" || row.created_at <= since) return null;
+		const ran = ranModels(row);
+		const crossLab = ran.length > 0 && ran.every((model) => {
+			const lab = labOf(model);
+			return lab !== null && !isBuilder(builders, lab);
+		});
+		if (!crossLab) return null;
+		members.add(row.id);
+	}
+	const end = entries[endAt]!.created_at;
+	if (routings.some((r) => r.slice_id === planId && isReviewRouting(r) && !members.has(r.id) && r.created_at >= end)) return null;
+	return round.group;
+}
+
+/**
+ * The reads the lane extension's load-time self-check makes (PLAN wl-mvq4edbaf13vnk § 2 Protect the verifier, R28), injected
+ * so tests stub git and the filesystem. Each throws an error naming the failed read.
+ */
+export interface VerifierReads {
+	/** The repository root this extension loads from, symlinks resolved. */
+	root(): string;
+	/** `~/.agent-system-2/verified/current` with its symlink resolved; null when it does not exist. */
+	current(): string | null;
+	/** The root's `origin` as `<owner>/<name>`; null when it has no GitHub origin. */
+	ownerRepo(root: string): string | null;
+	/** `git rev-parse HEAD` in the root. */
+	head(root: string): string;
+	/** The tracked files modified in the root: the paths `git status --porcelain --untracked-files=no` prints. */
+	modified(root: string): string[];
+}
+
+/** The verified control root the runner promotes (§ 2 Protect the verifier), as the self-check's line names it. */
+const VERIFIED_CURRENT = "~/.agent-system-2/verified/current";
+
+/** One git read in `root` for the self-check: its stdout, or an error naming the command, its exit and its stderr. */
+function gitRead(root: string, args: string[]): string {
+	const r = Bun.spawnSync(["git", "-C", root, ...args], { stdout: "pipe", stderr: "pipe" });
+	if (r.exitCode !== 0) throw new Error(`git -C ${root} ${args.join(" ")} exited ${r.exitCode}: ${r.stderr.toString().trim() || "no stderr"}`);
+	return r.stdout.toString();
+}
+
+/** The live reads: this file's repository, HOME's verified root, and git in the repository. */
+export function liveVerifierReads(env: Record<string, string | undefined> = process.env): VerifierReads {
+	return {
+		root: () => realpathSync(gitRead(import.meta.dir, ["rev-parse", "--show-toplevel"]).trim()),
+		current: () => {
+			const path = join(homeDir(env), ".agent-system-2", "verified", "current");
+			try {
+				return realpathSync(path);
+			} catch (err) {
+				if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+				throw new Error(`${path} could not be resolved: ${err instanceof Error ? err.message : String(err)}`);
+			}
+		},
+		ownerRepo: (root) => checkoutOwnerRepo(root),
+		head: (root) => gitRead(root, ["rev-parse", "HEAD"]).trim(),
+		// Porcelain v1: two status columns and a space, then the path (a rename prints `old -> new`; the new path is named).
+		modified: (root) => gitRead(root, ["status", "--porcelain", "--untracked-files=no"]).split("\n").filter(Boolean).map((l) => l.slice(3).split(" -> ").at(-1)!),
+	};
+}
+
+/**
+ * The lane extension's load-time self-check (PLAN wl-mvq4edbaf13vnk § 2 Protect the verifier, R28): while land-first is on
+ * for the repository the extension loads from (`landFirstOn` over the standing workload), its root must pass
+ * `controlRootRefusal` (it is `verified/current`, its HEAD has a green believable main verdict, a verified older release
+ * included, and its tracked files are unmodified). The one render line naming the root, the sha and every reason, or null
+ * when it passes or land-first is off. A read that fails leaves the check unrun, and the line names every failed read; a root
+ * or origin that cannot be read means land-first's state cannot be told, and says so.
+ */
+export function verifierSelfCheck(ledger: Pick<Ledger, "entries" | "instructions">, reads: VerifierReads): string | null {
+	const why = (err: unknown) => (err instanceof Error ? err.message : String(err));
+	const next = `Next: run \`install/install.sh --control-root=verified\` so lanes load ${VERIFIED_CURRENT}.`;
+	let root: string;
+	let repo: string | null;
+	try {
+		root = reads.root();
+		repo = reads.ownerRepo(root);
+	} catch (err) {
+		return `verifier: the lane tools' self-check could not read their own repository (${why(err)}), so whether land-first is on for it is unknown. ${next}`;
+	}
+	if (repo === null) return `verifier: the lane tools load from ${root}, which has no GitHub origin, so whether land-first is on for it is unknown and the self-check did not run. ${next}`;
+	const entries = ledger.entries(STANDING_WORKLOAD_ID);
+	if (!landFirstOn(entries, ledger.instructions(STANDING_WORKLOAD_ID), repo)) return null;
+	const failed: string[] = [];
+	const read = <T>(what: string, f: () => T): T | undefined => {
+		try {
+			return f();
+		} catch (err) {
+			failed.push(`${what} could not be read: ${why(err)}`);
+			return undefined;
+		}
+	};
+	const sha = (at: string) => {
+		const h = reads.head(at);
+		if (!SHA_RE.test(h)) throw new Error(`git rev-parse HEAD in ${at} printed ${JSON.stringify(h)}, not a sha`);
+		return h;
+	};
+	const head = read("HEAD", () => sha(root));
+	const modified = read("tracked files", () => reads.modified(root));
+	const current = read(VERIFIED_CURRENT, () => reads.current());
+	const currentHead = current === undefined || current === null ? null : read(`${VERIFIED_CURRENT}'s HEAD`, () => sha(current));
+	if (head === undefined || modified === undefined || current === undefined || currentHead === undefined) {
+		return `verifier: land-first is on for ${repo}, but the lane tools' self-check could not check their root ${root}: ${failed.join("; ")}. ${next}`;
+	}
+	const reasons = controlRootRefusal({ root, head, modified, current, currentHead, repo: repo.toLowerCase() }, entries);
+	if (reasons.length === 0) return null;
+	return `verifier: land-first is on for ${repo}, but the lane tools load unverified code from ${root} at ${head.slice(0, 12)}: ${reasons.join("; ")}. ${next}`;
+}
+
+export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, verifier: VerifierReads = liveVerifierReads(env)): void {
 	const z = pi.zod;
 
 	/** Every lane tool's gate: a bound lane, not released, whose workload is open and held by it under a live lease. */
@@ -199,6 +457,20 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		}
 		return { ok: true, own: { ledger, workload: w, laneId: s.laneId, workloadId: w.id } };
 	};
+
+	// PLAN wl-mvq4edbaf13vnk § 2 Protect the verifier (R28): at load a bound lane checks the control root its tools run from,
+	// and shows one render line while land-first is on and the root fails; it refuses nothing.
+	pi.on("session_start", (_e, ctx) => {
+		const s = gateSession(ctx, env);
+		if (!s.bound) return;
+		let line: string | null;
+		try {
+			line = verifierSelfCheck(s.ledger(), verifier);
+		} catch (err) {
+			line = `verifier: the lane tools' self-check could not read the ledger: ${err instanceof Error ? err.message : String(err)}. Next: check the ledger path this lane runs with.`;
+		}
+		if (line !== null) ctx.ui.notify(line, "warning");
+	});
 
 	/** A slice on this lane's workload that is still open or paused, or the refusal. */
 	const sliceOn = (own: Owned, slice: string, verb: string): { ok: true; state: string } | { ok: false; result: ToolResult } => {
@@ -229,6 +501,46 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		const hands = unsettledHands(own.ledger, own.workloadId, own.laneId);
 		if (hands.length === 0) return null;
 		return text(`hand(s) ${hands.map((h) => h.token).join(", ")} you spawned are still unsettled; keep your turn alive until each result is delivered, then release. Nothing was ${verb}.`);
+	};
+
+	/**
+	 * PLAN wl-mvg8itbt0rz3ls D2: the live reads `trainSignoff` needs for PR `pr` on train `workloadId`, through the same `pi.exec`
+	 * `lane_train_return` uses: `gh pr view <pr> --json TASK_VIEW_FIELDS`, main's rules, and every ruleset those rules name, then
+	 * `mainProtectionGap` over the prefetched answers. No repo, no exec, a failed gh call or a shape `taskViewOf` rejects: the reason.
+	 */
+	const signoffReads = async (
+		ledger: Ledger, workloadId: string, pr: number,
+	): Promise<{ ok: true; pr: number; view: TaskView; trainRepo: string; protection: Protection } | { ok: false; reason: string }> => {
+		const no = (reason: string) => ({ ok: false as const, reason });
+		const checkout = repoOf(ledger, workloadId);
+		const trainRepo = checkout === null ? null : checkoutOwnerRepo(checkout);
+		if (trainRepo === null) return no(`${workloadId} has no repo: checkout with a GitHub origin`);
+		const exec = pi.exec;
+		if (!exec) return no("the host has no exec for extensions, so gh could not be read");
+		const gh = async (args: string[]): Promise<unknown> => {
+			const r = await exec("gh", args, { timeout: STARTER_TIMEOUT_MS });
+			if (r.code !== 0 || r.killed) throw new Error(`gh ${args.join(" ")} failed (exit ${r.code}): ${r.stderr.trim() || r.stdout.trim()}`);
+			return JSON.parse(r.stdout);
+		};
+		try {
+			const view = taskViewOf(await gh(["pr", "view", String(pr), "-R", trainRepo, "--json", TASK_VIEW_FIELDS]));
+			if (view === null) return no(`gh pr view ${pr} -R ${trainRepo} returned an unexpected shape`);
+			const rules = await gh(["api", `repos/${trainRepo}/rules/branches/${DEFAULT_BRANCH}`]);
+			const ids = new Set<number>();
+			for (const rule of Array.isArray(rules) ? (rules as unknown[]) : []) {
+				const id = typeof rule === "object" && rule !== null && "ruleset_id" in rule ? rule.ruleset_id : undefined;
+				if (typeof id === "number" && Number.isSafeInteger(id) && id > 0) ids.add(id);
+			}
+			const rulesets = new Map<number, unknown>();
+			for (const id of ids) rulesets.set(id, await gh(["api", `repos/${trainRepo}/rulesets/${id}`]));
+			const protection = mainProtectionGap(rules, (id) => {
+				if (!rulesets.has(id)) throw new Error(`ruleset ${id} was not read`);
+				return rulesets.get(id);
+			});
+			return { ok: true, pr, view, trainRepo, protection };
+		} catch (err) {
+			return no(`gh could not be read: ${err instanceof Error ? err.message : String(err)}`);
+		}
 	};
 
 	pi.registerTool({
@@ -306,37 +618,80 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			"Ask Jo a question on a slice of this lane's workload; the slice pauses until Jo answers with one of the options (or withdraws). " +
 			"The plan slice closes this way, options approve / revise / cancel, with a body that carries the plan short, one item per line, " +
 			`each line at most ${PLAN_QUESTION_LINE_MAX} characters and nothing else: the plan file's absolute path; one \`- <slice id>: <what it does>\` line per slice; ` +
+			"one `prompt-only: <R id>: <the requirement, and why no code reaches it>` line per requirement the plan file marks prompt-only, or exactly `prompt-only: none` when it marks none; " +
 			"1 to 3 `tradeoff: <one line>` lines; one `review: <verdict>, <model>, <absolute path to the verdict file>` line. " +
+			`The plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\n${PLAN_HOW_IT_FAILS_LINE}\n` +
 			"A plan question offering approve is refused until a review hand named after the plan slice has reviewed the plan on another lab since the last question, and refused in any other shape. " +
-			"Until the plan is approved, a question offering approve on any other slice is refused.",
+			"Until the plan is approved, a question offering approve on any other slice is refused. " +
+			"Jo's standing rulings are checked first: a question one of them already answers is not raised, and the tool returns the ruling and what to do instead. " +
+			"When every option is a provider/model id, `subject` says what the model is for (lane-model or review-model); otherwise it is left out. " +
+			`\`now\` (one of ${NOW_CATEGORIES.join(", ")}) puts the question before Jo at once, past every ruling and past plan auto-start: a credible data-integrity or security risk or an urgent incident, ` +
+			"weakening a guard or crossing a boundary Jo stated, or an irreversible effect or money commitment the plan does not authorize. " +
+			"Asking an open question again (same slice, body and options) returns its id and raises nothing new; with `now` it marks that question NOW. " +
+			"A repeated plan question whose plan file or verdict file changed since it was raised takes every plan check again, which refuses it while the open one stands. " +
+			`\`routine: { record }\` marks a routine call that changes nothing: the tool appends the option \`${RECORD_ANNOUNCE_OPTION}\` (no option of yours may spell it, \`announce-only\` or \`record-only\`), ` +
+			`and off the plan slice, without \`now\`, while auto-apply is on and no § A4 action is named, Jo's ruling routine-calls records the line and tells Jo, with no question raised. ` +
+			"That answer is a decision to change nothing and authorizes no code, privilege, spend or GitHub change; a change needs its own question.",
 		parameters: z.object({
 			slice: z.string().describe("The slice id (sl-…) the question is about."),
 			body: z.string().describe("The question, in plain words (the plan slice's approve question: the plan in the shape above)."),
 			options: z.array(z.string()).describe("At least two answers Jo can give in one word each."),
+			subject: z
+				.enum(MODEL_SUBJECTS)
+				.optional()
+				.describe("Required when every option is a provider/model id: lane-model (the model a lane runs on) or review-model (the model a review runs on)."),
+			now: z.enum(NOW_CATEGORIES).optional().describe("Only when Jo must hear it at once: the category of the now trigger."),
+			routine: z
+				.object({ record: z.string().describe(`One line, at most ${ROUTINE_RECORD_MAX} characters: what is recorded and announced.`) })
+				.optional()
+				.describe(`A routine call that changes nothing: the tool appends \`${RECORD_ANNOUNCE_OPTION}\` and recommends it.`),
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const before = owned(ctx, "asked");
+			if (!before.ok) return before.result;
+			const slice = String(params.slice ?? "").trim();
+			const body = await expandCallerHandles(String(params.body ?? "").trim(), pi, ctx);
+			// Locating is async: use current ownership, not the lease/holder snapshot from before it.
 			const o = owned(ctx, "asked");
 			if (!o.ok) return o.result;
-			const slice = String(params.slice ?? "").trim();
-			const body = String(params.body ?? "").trim();
-			const options = Array.isArray(params.options) ? params.options.map((x) => String(x).trim()).filter((x) => x.length > 0) : [];
+			const laneOptions = Array.isArray(params.options) ? params.options.map((x) => String(x).trim()).filter((x) => x.length > 0) : [];
 			if (!slice || !body) return text("A question names a slice id and a body; nothing was asked.");
-			if (new Set(options.map((x) => x.toLowerCase())).size < 2) return text("A question offers at least two distinct options Jo can answer with; nothing was asked.");
-			// PLAN wl-mv67564rdkfvnk D9 (2): `pair` is offered only by the round-limit and ceiling raise sites, never by a lane.
-			if (options.some((x) => x.toLowerCase() === PAIR_OPTION)) return text(`The option \`${PAIR_OPTION}\` is offered only by the round-limit and ceiling questions the machinery raises; nothing was asked.`);
+			if (new Set(laneOptions.map((x) => x.toLowerCase())).size < 2) return text("A question offers at least two distinct options Jo can answer with; nothing was asked.");
+			// PLAN wl-mvqwn80onq9hq8 D6: `record-and-announce` is the machinery's option, appended for `routine`; no lane spells it.
+			const spelled = laneOptions.find(machineOptionSpelling);
+			if (spelled !== undefined) {
+				return text(`The option \`${spelled}\` is the machinery's: pass \`routine: { record: "<one line>" }\` and the tool appends \`${RECORD_ANNOUNCE_OPTION}\`; nothing was asked.`);
+			}
+			const record = params.routine === undefined ? null : String(params.routine.record ?? "").trim();
+			const recordProblem = record === null ? null : routineRecordProblem(record);
+			if (recordProblem !== null) return text(`${recordProblem}; nothing was asked.`);
+			const routine = record === null ? null : { record };
+			const options = routine === null ? laneOptions : [...laneOptions, RECORD_ANNOUNCE_OPTION];
+			// PLAN wl-mv67564rdkfvnk D9 (2): `pair` is offered only by the round-limit raise site, never by a lane.
+			if (options.some((x) => x.toLowerCase() === PAIR_OPTION)) return text(`The option \`${PAIR_OPTION}\` is offered only by the round-limit question the machinery raises; nothing was asked.`);
 			if (options.some((x) => /\s/.test(x))) return text("Each option is one word (Jo answers with it alone or as `<option> q-…`); nothing was asked.");
+			const nowWord = typeof params.now === "string" && params.now.trim() !== "" ? params.now.trim() : null;
+			if (nowWord !== null && !isNowCategory(nowWord)) return text(`\`now\` is one of ${NOW_CATEGORIES.join(", ")}, not ${nowWord}; nothing was asked.`);
+			const now: NowCategory | null = nowWord;
 			const refused = reserved(body, "asked") ?? runnerSignal(body, "asked");
 			if (refused) return refused;
 			const on = sliceOn(o.own, slice, "asked");
 			if (!on.ok) return on.result;
 			const { ledger, workloadId } = o.own;
+			const subject = typeof params.subject === "string" && params.subject !== "" ? (params.subject as ModelSubject) : null;
+			// PLAN wl-mvg1vs0rhnu3gg § 1.0 (review r3 F1): an ask repeating an open question on this slice, with the same body and
+			// options, goes to askJo, which returns the open id as reused (askJo's own rule; a model-subject ask never repeats one).
+			const optionsJson = JSON.stringify(options);
+			const repeated = subject === null ? ledger.questions(workloadId).find((q) => q.state === "open" && q.slice_id === slice && q.body === body && q.options === optionsJson) : undefined;
 			// A question offering approve on the plan slice while `plan: first` stands is the plan question: reviewed (D8), then in shape (D7).
 			// Offering approve on any other slice then is refused (PLAN wl-mv5i3lulwwbbi8 D4): Jo's approve there would approve nothing.
 			let plan = false;
+			let control: ControlEntry[] = [];
 			if (options.some((x) => x.toLowerCase() === "approve")) {
 				const entries = ledger.entries(workloadId);
-				const planSl = planFirst(controlEntries(entries, holdersOf(entries, o.own.workload.holder))) !== null ? planSlice(ledger.slices(workloadId)) : null;
+				control = controlEntries(entries, holdersOf(entries, o.own.workload.holder));
+				const planSl = planFirst(control) !== null ? planSlice(ledger.slices(workloadId)) : null;
 				if (planSl !== null && planSl.id !== slice) {
 					return text(
 						`plan: first stands and the plan is not approved, so only the plan slice ${planSl.id} (${planSl.state}) may offer approve; ` +
@@ -346,20 +701,153 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 				}
 				plan = planSl !== null;
 			}
-			if (plan) {
+			// Fix round 1 (F1): a plan repeat skips the plan checks and auto-start only while the plan file and the verdict file hash
+			// as they did when the open question was raised (`planUnchanged`); otherwise it takes every check, and planReviewed
+			// refuses it while that question stands open.
+			const skippedChecks = plan && repeated !== undefined && planUnchanged(control, repeated.id, body);
+			let binding: PlanBinding | undefined;
+			// PLAN wl-mvqwn80onq9hq8 D9: the auto-start write's error, and the body the question goes to Jo with after it.
+			let autoStartFailed: string | null = null;
+			let askBody = body;
+			if (plan && !skippedChecks) {
 				if (!planReviewed(ledger, workloadId, slice)) return text(`${planReviewRefusal(slice)}. Nothing was asked.`);
-				const problem = planQuestionProblem(body, (p) => statSync(p, { throwIfNoEntry: false })?.isFile() ?? false);
+				// PLAN wl-mv8vwb04cy18n4 D3: the plan file is read here, once (`readBounded`); a file that cannot be read is null and
+				// refused, and a plan over PLAN_FILE_MAX_BYTES is refused (planQuestionProblem) without the surface holding more of it.
+				// The bytes judged are the bytes the question's binding hashes, so no edit between the check and the hash is bound.
+				const judged: { plan: Buffer | null } = { plan: null };
+				const readFile = (p: string): string | null => {
+					judged.plan = readBounded(p);
+					return judged.plan?.toString("utf8") ?? null;
+				};
+				const problem = planQuestionProblem(body, (p) => statSync(p, { throwIfNoEntry: false })?.isFile() ?? false, readFile);
 				if (problem !== null) {
-					return text(`A plan question offering approve has this shape, one item per line, each line at most ${PLAN_QUESTION_LINE_MAX} characters, nothing else:\n${PLAN_QUESTION_SHAPE}\nThis body does not: ${problem}. Nothing was asked.`);
+					return text(
+						`A plan question offering approve has this shape, one item per line, each line at most ${PLAN_QUESTION_LINE_MAX} characters, nothing else:\n${PLAN_QUESTION_SHAPE}\n` +
+							`Its plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\n${PLAN_HOW_IT_FAILS_LINE}\nThis body does not: ${problem}. Nothing was asked.`,
+					);
+				}
+				// Issue #334 item 2: a plan that passed on the `How it fails: n/a, <reason>` line, or on the gate's error bypass, is recorded
+				// here, once per checked raise, before the auto-start or the question, so the skip is visible whichever follows.
+				const failsNote = judged.plan === null ? null : howItFailsNote(checkHowItFails(judged.plan.toString("utf8"), "the plan file"), `plan file ${planQuestionFiles(body)?.plan ?? body.split("\n")[0]!.trim()}`);
+				if (failsNote !== null) ledger.write(() => ledger.recordEntry({ by: o.own.laneId, workloadId, sliceId: slice, kind: "assumption", body: failsNote }));
+				// Fix round 1 (F1): the plan file as judged and the verdict file now, bound to the question if it is raised.
+				const verdict = fileSha(planQuestionFiles(body)?.verdict ?? "");
+				if (judged.plan !== null && verdict !== null) binding = { plan: createHash("sha256").update(judged.plan).digest("hex"), verdict };
+				// PLAN wl-mvfkv7llkp7nk0 § 3, PLAN wl-mvqwn80onq9hq8 D9: a normal- or production-stakes plan whose latest review round
+				// passed wholly cross-lab starts here while auto-apply is on, with no question row: ESCALATION_BY's `plan: approved
+				// auto <group>` and Jo's notice, in one write that re-reads (a)–(e). A plan question carrying `now` skips this and goes
+				// to Jo (PLAN wl-mvg1vs0rhnu3gg § 1.0, review r2 N1). A write that throws starts nothing: the plan question goes to Jo
+				// with `auto-start failed: <error>` as its body's first line.
+				let started: string | null = null;
+				if (now === null) {
+					try {
+						started = ledger.write(() => {
+							const group = planAutoStartRound(ledger, workloadId, slice, Date.parse(ledger.now()), { alarmFile: alarmFilePath(env) });
+							if (group === null) return null;
+							ledger.recordEntry({ by: ESCALATION_BY, workloadId, sliceId: slice, kind: "assumption", body: planAutoApprovedBody(group) });
+							sendNotice(ledger, { by: ESCALATION_BY, workloadId, body: planAutoStartNoticeBody(workloadId, body) });
+							return group;
+						});
+					} catch (e) {
+						autoStartFailed = (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").trim();
+						askBody = `auto-start failed: ${autoStartFailed}\n${body}`;
+					}
+				}
+				if (started !== null) {
+					return text(
+						`The plan is approved: its review round ${started} passed on labs other than the builder's at ${o.own.workload.stakes} stakes, so it started without Jo's approve ` +
+							`and no question was raised; Jo has a notice, and its PRs wait ${HOLD_HOURS} h after Jo's next message before the train merges them. ` +
+							`Complete ${slice} with ${LANE_COMPLETE_SLICE_TOOL}, then add your change slices with ${LANE_ADD_SLICE_TOOL}.`,
+						{ approved: "auto", group: started },
+					);
 				}
 			}
-			// D9 part two: the plan question's role is recorded as it is raised, by the holding lane, in the same write.
-			const id = ledger.write(() => {
-				const q = ledger.raiseQuestion({ by: o.own.laneId, workloadId, sliceId: slice, body, options });
-				if (plan) ledger.recordEntry({ by: o.own.laneId, workloadId, sliceId: slice, kind: "assumption", body: planQuestionBody(q) });
-				return q;
+			// D9 part two: the plan question's role is recorded as it is raised, by the holding lane, in the same write, with the
+			// binding of its plan and verdict files (fix round 1, F1); a reused open question already has its entry (PLAN
+			// wl-mvg1vs0rhnu3gg § 3.5). A plan repeat that skipped the plan checks and finds its open question resolved inside the
+			// write is rolled back: a new plan question passes every check.
+			// PLAN wl-mvfkv7llkp7nk0 § 1: the standing rulings are checked first; a decided question writes no question row.
+			const subjectWrong = subjectProblem(options, subject);
+			if (subjectWrong !== null) return text(`${subjectWrong}; nothing was asked.`);
+			// PLAN wl-mvg8itbt0rz3ls D2: a train's merge question on a PR's disposition slice for its current attempt (`trainSliceId`
+			// with `trainAttempts`, the slice the ruling's action completes and its notice reads) carries the `trainSignoff` fact Jo's
+			// ruling train-signoff reads; a `-full-<r>` slice's, or an earlier attempt's, carries none and is raised. gh is read here,
+			// before the write, and the ledger half is computed inside it.
+			const train = trainPrs(ledger.entries(workloadId), ledger.instructions(workloadId)).length > 0;
+			const mergePr = train && questionKind(options, subject) === "merge" ? trainSlicePr(slice, workloadId) : null;
+			const signoffPr = mergePr !== null && slice === trainSliceId(workloadId, mergePr, attemptOf(trainAttemptsOf(ledger, workloadId), mergePr)) ? mergePr : null;
+			const reads = signoffPr === null ? null : await signoffReads(ledger, workloadId, signoffPr);
+			const resolvedMeanwhile = new Error("the repeated open question was resolved");
+			let asked: AskResult | { refused: ToolResult };
+			try {
+				asked = ledger.write(() => {
+					// The gh reads awaited outside any transaction: the holder, its live lease and the slice are read again here, in
+					// the write that decides or raises, and refused as the guards before the reads refuse.
+					const again = owned(ctx, "asked");
+					if (!again.ok) return { refused: again.result };
+					const still = sliceOn(again.own, slice, "asked");
+					if (!still.ok) return { refused: still.result };
+					const signoff: TrainSignoffFact | null =
+						reads === null ? null : reads.ok ? trainSignoff(ledger, workloadId, reads.pr, reads.view, reads.trainRepo, reads.protection) : { ok: false, reason: reads.reason };
+					const r = askJo(
+						ledger,
+						{ by: again.own.laneId, workloadId, sliceId: slice, body: askBody, options, subject, now, routine },
+						{
+							asker: "lane",
+							builders: builderLabs(ledger, workloadId),
+							stakes: again.own.workload.stakes,
+							train,
+							...(signoff === null ? {} : { trainSignoff: signoff }),
+							reviewModel: () => installedReviewModel(env),
+							// PLAN wl-mvqwn80onq9hq8 D6: ruling routine-calls reads the switch inside this write and never decides on the plan slice.
+							...(routine === null ? {} : { onPlanSlice: onPlanSlice(ledger, again.own, slice), routineOn: () => routineOn(ledger, Date.parse(ledger.now()), { alarmFile: alarmFilePath(env) }) }),
+						},
+					);
+					if (skippedChecks && !("reused" in r)) throw resolvedMeanwhile;
+					if (plan && "raised" in r && !("reused" in r)) ledger.recordEntry({ by: again.own.laneId, workloadId, sliceId: slice, kind: "assumption", body: planQuestionBody(r.raised, binding) });
+					return r;
+				});
+			} catch (e) {
+				if (e === resolvedMeanwhile) {
+					return text(`The open question this repeats on ${slice} was resolved while you asked; nothing was asked. Raise the plan question again: a new one passes every plan check.`);
+				}
+				const raiseError = (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").trim();
+				// PLAN wl-mvqwn80onq9hq8 D6, D9: when the decision's own write failed and the raise failed too, both errors come back.
+				if (autoStartFailed !== null) {
+					return text(
+						`The plan auto-start failed (${autoStartFailed}) and raising the plan question to Jo failed too (${raiseError}); nothing was started or asked. ` +
+							`Next step: report both errors to the orchestrator with ${LANE_MESSAGE_TOOL}.`,
+						{ autoStartFailed, raiseError },
+					);
+				}
+				if (e instanceof RoutineRaiseError) return text(raiseError, { raiseError });
+				throw e;
+			}
+			if ("refused" in asked) return asked.refused;
+			if ("decided" in asked) {
+				const { ruling, answer } = asked.decided;
+				if (asked.recorded !== undefined) return text(routineDecidedText(asked.recorded.entry), { ruling, answer, recorded: asked.recorded.entry, notice: asked.recorded.notice });
+				return text(`${decidedText(asked.decided)}.`, { ruling, answer });
+			}
+			const id = asked.raised;
+			const mark = nowMarks(ledger.entries(workloadId, "assumption")).get(id) ?? null;
+			const nowNote = mark === null ? "" : ` It reaches Jo at once, marked NOW (${mark}).`;
+			if ("reused" in asked) {
+				return text(`Question ${id} on ${slice} is already open with this body and options; nothing new was raised.${nowNote} The slice stays paused until Jo answers ${id}.`, { id, reused: true, now: mark });
+			}
+			const noticeFailed = asked.noticeFailed ?? null;
+			const failedNote =
+				autoStartFailed !== null
+					? ` The plan auto-start failed (${autoStartFailed}), so the plan question went to Jo with that as its first line.`
+					: noticeFailed !== null
+						? ` Jo's ruling routine-calls decided it, but its record and notice could not be written (${noticeFailed}), so it went to Jo.`
+						: "";
+			return text(`Raised question ${id} on ${slice} (${options.join(" / ")}); the slice is paused until Jo answers.${nowNote}${failedNote}`, {
+				id,
+				now: mark,
+				...(autoStartFailed === null ? {} : { autoStartFailed }),
+				...(noticeFailed === null ? {} : { noticeFailed }),
 			});
-			return text(`Raised question ${id} on ${slice} (${options.join(" / ")}); the slice is paused until Jo answers.`, { id });
 		},
 	});
 
@@ -376,16 +864,26 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const before = owned(ctx, "recorded");
+			if (!before.ok) return before.result;
+			const body = await expandCallerHandles(String(params.body ?? "").trim(), pi, ctx);
 			const o = owned(ctx, "recorded");
 			if (!o.ok) return o.result;
-			const body = String(params.body ?? "").trim();
 			if (!body) return text("An entry has a body; nothing was recorded.");
 			const prefix = reservedPrefix(body);
 			if (prefix !== null && prefix !== "done-because") return reserved(body, "recorded")!;
+			if (prefix === "done-because") {
+				// PLAN wl-mvr888nftz0vcl D3: the merge train is permanent; its lane releases with no done-because.
+				const permanent = trainPermanentRefusal(o.own.ledger, o.own.workloadId);
+				if (permanent !== null) return text(`done-because refused: ${permanent}. When nothing on the train is runnable, lane_release with no done-because.`);
+			}
 			if (body.startsWith(ARTIFACT_COMMAND_PREFIX)) return text(`A slice's artifact command is declared with slice_artifact, not written as an entry; nothing was recorded.`);
 			const machinery = /^([a-z-]+):/.exec(body)?.[1];
 			if (machinery !== undefined && (CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).includes(machinery)) {
 				return text(`A body opening with \`${machinery}:\` is a reserved control line the classifier writes; nothing was recorded. Say it in plain words.`);
+			}
+			if (machinery === RULING_APPLIED_PREFIX) {
+				return text(`A body opening with \`${RULING_APPLIED_PREFIX}:\` is written only when a standing ruling decides a raised question; nothing was recorded. Say it in plain words.`);
 			}
 			const signal = runnerSignal(body, "recorded");
 			if (signal) return signal;
@@ -404,16 +902,18 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		name: LANE_MESSAGE_TOOL,
 		loadMode: "essential",
 		label: "Message Orchestrator",
-		description: "Send one message to the orchestrator about this lane's workload (a finding, a blocker, a QUESTION that needs Jo). It reaches Jo's surface at its next read.",
+		description: "Send one message to the orchestrator about this lane's workload (a finding, a blocker, a question that needs Jo). It reaches Jo's surface at its next read.",
 		parameters: z.object({
 			body: z.string().describe("The message, in plain words."),
 			slice: z.string().optional().describe("The slice id (sl-…) it is about, when it is about one."),
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const before = owned(ctx, "sent");
+			if (!before.ok) return before.result;
+			const body = await expandCallerHandles(String(params.body ?? "").trim(), pi, ctx);
 			const o = owned(ctx, "sent");
 			if (!o.ok) return o.result;
-			const body = String(params.body ?? "").trim();
 			if (!body) return text("A message has a body; nothing was sent.");
 			const refused = reserved(body, "sent");
 			if (refused) return refused;
@@ -460,7 +960,8 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		loadMode: "essential",
 		label: "Run Full Test Suite",
 		description:
-			"Run this workload's full test suite outside the fence at an open PR's head, then each changed test file alone. Call it after the last push, with the PR number; it returns the run's line at once and the result arrives later as an aside (verdict, counts, failures). " +
+			"Run this workload's full test suite outside the fence at an open PR's head. A full part that times out ends the run as an error; after an all-pass part only changed test files with no executed case run alone, and after a red only the failing files outside gates/test/ run alone, as a diagnostic that never turns a red green. Call it after the last push, with the PR number; it returns the run's line at once and the result arrives later as an aside (verdict, counts, failures). " +
+			"On a repository with land-first on, the runner applies the gate instead: a PR whose diff the fast check covers gets the fast check (the fast smoke and the tests its files reach, on Linux), and its result is marked fast (`\"scope\":\"fast\"` in its test-run record); a fast green lets the PR merge but is not a full-suite green, and the workload closes on it only after the merge, once a green believable main run holds the merge commit. Any other PR gets the full suite. The tool's line says whether land-first is on. " +
 			"Without `slice` the runner adds the full-suite slice; with it, the slice must be open on this workload. A green completes that slice; a red, stale or error leaves it open: fix, push, and call again with the slice. " +
 			"Never complete that slice yourself. While a run is live, work on something else or `sleep 60` in bash; never park or release.",
 		parameters: z.object({
@@ -491,7 +992,18 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 				const lastOf = (s: string) => s.trim().split("\n").filter(Boolean).at(-1) ?? null;
 				if (r.code === 0 && !r.killed) {
 					const line = lastOf(r.stdout) ?? "the starter exited 0 without a line";
-					return text(`${line}\nThe result arrives as an aside; until then work on something else or \`sleep 60\` in bash.`, { code: 0, line });
+					// PLAN wl-mvq4edbaf13vnk D9: on a land-first repo the runner applies the gate, so the lane is told which result it will get.
+					const checkout = repoOf(o.own.ledger, o.own.workloadId);
+					const repo = checkout === null ? null : checkoutOwnerRepo(checkout);
+					const landFirst = repo === null ? null : landFirstOn(o.own.ledger.entries(STANDING_WORKLOAD_ID), o.own.ledger.instructions(STANDING_WORKLOAD_ID), repo);
+					const fastNote = `a fast result is marked fast (\`"scope":"fast"\` in its test-run record), and a fast green is not a full-suite green: close takes it only after the merge, once a green believable main run holds the merge commit`;
+					const scope =
+						landFirst === null
+							? `Whether land-first is on could not be read (${o.own.workloadId} has no repo: checkout with a GitHub origin), so this may be the fast check or the full suite; ${fastNote}.`
+							: landFirst
+								? `Land-first is on for ${repo}: the runner applies the gate, so this is the fast check when the PR's diff allows it, else the full suite; ${fastNote}.`
+								: `Land-first is off for ${repo}: this is the full suite.`;
+					return text(`${line}\n${scope}\nThe result arrives as an aside; until then work on something else or \`sleep 60\` in bash.`, { code: 0, line, landFirst });
 				}
 				const line = lastOf(r.stderr) ?? lastOf(r.stdout) ?? (r.killed ? "the starter was killed before it printed" : `the starter exited ${r.code} without a line`);
 				const how = r.killed ? `the starter did not return within ${STARTER_TIMEOUT_MS / 1000} s and was killed` : `starter exit ${r.code}`;
@@ -499,6 +1011,58 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			} catch (err) {
 				return text(`No test run started: the starter could not be run: ${String(err)}`, { code: null });
 			}
+		},
+	});
+
+	pi.registerTool({
+		name: LANE_TRAIN_RETURN_TOOL,
+		loadMode: "essential",
+		label: "Return PR to Owner",
+		description:
+			"Merge-train lanes only: hand a PR the train cannot land back to its owner as a task (no question to Jo). `kind` is red (the suite), conflict (the resolver could not fix it) or stack (a dependency problem); " +
+			"`detail` is the absolute path of a file holding the first failures and errors (run id, head, failing tests, the resolver's message, the chain), which becomes the task's body. " +
+			"The tool reads the PR's current head and owner, sets the attempt and records the task; the train tick delivers and settles it. Then go on to the next PR.",
+		parameters: z.object({
+			pr: z.string().describe("The PR number on this train, e.g. 17."),
+			kind: z.enum(TRAIN_TASK_KINDS).describe("red | conflict | stack."),
+			detail: z.string().describe("The absolute path of the detail file (under $AS2_SCRATCH)."),
+		}),
+		approval: "write",
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const o = owned(ctx, "returned");
+			if (!o.ok) return o.result;
+			const { ledger, workloadId, laneId } = o.own;
+			const prText = String(params.pr ?? "").trim().replace(/^#/, "");
+			if (!/^[1-9]\d*$/.test(prText) || !Number.isSafeInteger(Number(prText))) return text(`A returned PR is named by number (e.g. 17); \`${prText}\` is not one. Nothing was returned.`);
+			const pr = Number(prText);
+			const kind = String(params.kind ?? "") as TrainTaskKind;
+			const path = String(params.detail ?? "").trim();
+			if (!isAbsolute(path)) return text(`detail is the absolute path of the detail file; \`${path}\` is not absolute. Nothing was returned.`);
+			let detail: string;
+			try {
+				if (statSync(path).size > TRAIN_DETAIL_MAX_BYTES) return text(`${path} is over ${TRAIN_DETAIL_MAX_BYTES} bytes; keep the first failures and errors. Nothing was returned.`);
+				detail = readFileSync(path, "utf8");
+			} catch (err) {
+				return text(`The detail file ${path} could not be read (${String(err)}); nothing was returned.`);
+			}
+			const checkout = repoOf(ledger, workloadId);
+			const trainRepo = checkout === null ? null : checkoutOwnerRepo(checkout);
+			if (trainRepo === null) return text(`Workload ${workloadId} has no repo: checkout with a GitHub origin, so the PR's owner cannot be read; nothing was returned.`);
+			if (!pi.exec) return text("The host has no exec for extensions, so gh could not read the PR; nothing was returned.");
+			let view: TaskView | null;
+			try {
+				const r = await pi.exec("gh", ["pr", "view", prText, "-R", trainRepo, "--json", TASK_VIEW_FIELDS], { timeout: STARTER_TIMEOUT_MS });
+				if (r.code !== 0 || r.killed) return text(`gh pr view ${pr} -R ${trainRepo} failed (exit ${r.code}): ${r.stderr.trim() || r.stdout.trim()}. Nothing was returned.`);
+				view = taskViewOf(JSON.parse(r.stdout));
+			} catch (err) {
+				return text(`gh pr view ${pr} -R ${trainRepo} could not be read: ${String(err)}. Nothing was returned.`);
+			}
+			if (view === null) return text(`gh pr view ${pr} -R ${trainRepo} returned an unexpected shape; nothing was returned.`);
+			const r = recordTrainTask(ledger, { train: workloadId, by: laneId, pr, kind, detail, view, trainRepo });
+			if (!r.ok) return text(`${r.reason}. Nothing was returned.`);
+			const t = r.task;
+			const who = t.owner ?? "none yet (the tick delivers to the PR's open fix workload, or opens one)";
+			return text(`Recorded task ${t.id} (${t.entryId}): #${pr} attempt ${t.attempt}, kind ${t.kind}, head ${t.head}, owner ${who}. The train tick delivers and settles it; go on to the next PR.`, { id: t.id });
 		},
 	});
 
@@ -556,7 +1120,10 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 					const entries = ledger.entries(workloadId);
 					const slices = sliceCounts(ledger.slices(workloadId));
 					const open = slices.open + slices.paused;
-					if (open > 0 && doneBecause(entries, holdersOf(entries, laneId, ledger.holders(workloadId))) === null) {
+					// PLAN wl-mvr888nftz0vcl D13: the merge train never has a receipt, so its release with open work is a quiet idle release.
+					if (open > 0 && isTrain(ledger, workloadId)) {
+						ledger.recordEntry({ by: laneId, workloadId, kind: "assumption", body: releasedIdleBody(laneId, open) });
+					} else if (open > 0 && doneBecause(entries, holdersOf(entries, laneId, ledger.holders(workloadId))) === null) {
 						ledger.recordEntry({ by: laneId, workloadId, kind: "assumption", body: releasedOpenBody(laneId, open) });
 					}
 					return released;

@@ -1,0 +1,20 @@
+{"bug_type":"298","timestamp":"2026-10-13 12:41:41.00 -0700"}
+{
+  "memoryStatus": {
+    "pageSize": 16384
+  },
+  "processes": [
+    {
+      "name": "bun",
+      "rpages": 850679
+    },
+    {
+      "name": "com.apple.Virtualization.Virtual",
+      "rpages": 393909
+    },
+    {
+      "name": "bun",
+      "rpages": 81575
+    }
+  ]
+}

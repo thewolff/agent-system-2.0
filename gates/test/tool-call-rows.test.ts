@@ -51,7 +51,7 @@ describe("row 5: all six brief fields", () => {
 	});
 	test("allows fields in the item, in the shared context, bolded and bulleted", () => {
 		expect(checkBriefFields({ tasks: [{ agent: "fast", task: brief() }] })).toBeNull();
-		const shared = "workload: wl-abc\ninputs: gates/\nstakes: production\nceiling-share: 12.5%";
+		const shared = "workload: wl-abc\ninputs: gates/\nstakes: production\nceiling-share: 12.5%\n### How it fails\n- the build breaks: fix and rebuild, once";
 		expect(checkBriefFields({ context: shared, tasks: [{ agent: "fast", task: "- **task:** fix it\n- **done-condition:** tests green" }] })).toBeNull();
 	});
 });
@@ -96,6 +96,56 @@ describe("row 6: § A4 reserved actions", () => {
 	// M8 ctx wiring: ctx is not a § A4 reserved action, so a lane runs its reads and its writes alike.
 	const allowed = ["git push origin feat", "git push -u origin feat", "git status", "rm -r build", "rm -f a.txt", "git branch feat", "gh pr create --fill", "git fetch origin --prune", "echo drop tables later", "git push origin main-fix", "ctx search wl-munn32rmt6ajnk --since 2d", "ctx show session 01a0f0ca", "ctx import --all", "ctx sources add --provider pi --root /tmp/s as2"];
 	for (const cmd of allowed) {
+		test(`allows: ${cmd}`, () => expect(checkReserved({ toolName: "bash", input: { command: cmd } }, lane())).toBeNull());
+	}
+	// PLAN wl-mv8s8srodefytc rev 17.1 D2: a lane never writes the commit status, check run or check suite main's branch protection reads.
+	const STATUS = "(the merge gate's as2/full-suite is the test runner's alone)";
+	const sha = "a".repeat(40);
+	const statusWrites = [
+		`gh api -X POST repos/o/r/statuses/${sha} -f state=success -f context=as2/full-suite`,
+		`gh api repos/o/r/statuses/${sha} -f state=success`,
+		`gh api --method PATCH repos/o/r/check-runs/7 --input body.json`,
+		`gh api repos/o/r/check-runs -F name=as2/full-suite`,
+		`gh api repos/o/r/statuses/${sha} --raw-field state=success`,
+		`gh api --method=PUT /repos/o/r/check-runs/7`,
+		`gh api --input s.json --jq .state -H Accept:application/json repos/o/r/statuses/${sha}`,
+		"endpoint=$(cat f); gh api --input s.json \"$endpoint\"",
+		`gh api --method=POST repos/o/r/statuses/${sha}`,
+		"gh api -XPOST repos/o/r/check-runs",
+		"gh api repos/o/r/check-suites/5/rerequest --input -",
+		"gh api graphql -f query='mutation { createCheckRun(input: {repositoryId: \"R\", name: \"as2/full-suite\", headSha: \"a\"}) { checkRun { id } } }'",
+		"gh api graphql -f query='\n  mutation {\n    createCheckRun(input: {repositoryId: \"R\", name: \"as2/full-suite\", headSha: \"a\"}) { checkRun { id } }\n  }\n'",
+		"gh api graphql -F query=@- <<'EOF'\nmutation { createCheckRun(input: {repositoryId: \"R\", name: \"as2/full-suite\", headSha: \"a\"}) { checkRun { id } } }\nEOF",
+		"gh api graphql -F query=@q.graphql",
+		"gh api graphql --input q.json",
+		"cat q.graphql | gh api graphql -F query=@-",
+		`gh api repos/o/r/%73tatuses/${sha} -f state=success`,
+		`gh api repos/o/r/%2573tatuses/${sha} -f state=success`,
+		`gh api repos/o/r/STATUSES/${sha} -f state=success`,
+		`gh api https://api.github.com/repos/o/r/statuses/${sha} --input s.json`,
+		"gh api repos/o/r/check%2Druns -F name=as2/full-suite",
+		"gh api repos/o/r/%zz/7 -f state=success",
+		"gh api graphql -f query='mutation { %63reateCheckRun(input: {}) { checkRun { id } } }'",
+	];
+	for (const cmd of statusWrites) {
+		test(`refuses a status or check-run write: ${cmd}`, () => {
+			const r = checkReserved({ toolName: "bash", input: { command: cmd } }, lane());
+			expect(r?.block).toBe(true);
+			expect(r?.reason).toContain(STATUS);
+		});
+	}
+	const statusReads = [
+		`gh api repos/o/r/statuses/${sha}`,
+		`gh api -X GET repos/o/r/commits/${sha}/check-runs`,
+		`gh api -X GET repos/o/r/commits/${sha}/check-runs -f per_page=100`,
+		`gh api --method GET repos/o/r/statuses/${sha}`,
+		"gh api repos/o/r/pulls/7 --jq .state",
+		"gh api repos/o/r/issues/7/comments -F body=@note.md",
+		"gh api graphql -f query='query { viewer { login } }'",
+		"gh api graphql -F query=@- <<'EOF'\nquery { viewer { login } }\nEOF",
+		`gh api -X GET repos/o/r/commits/${sha}/%73tatuses`,
+	];
+	for (const cmd of statusReads) {
 		test(`allows: ${cmd}`, () => expect(checkReserved({ toolName: "bash", input: { command: cmd } }, lane())).toBeNull());
 	}
 	test("refuses a reserved action inside a script the command runs", () => {

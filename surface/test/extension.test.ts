@@ -3,20 +3,22 @@
 // first message at start and after compaction, voice document in the system prompt, wake-read
 // owed and enforced on tool calls and at stop), Jo's one-word input applied and shown next turn,
 // `cancel-slice` on a parked lane's question runs the launch trigger (PLAN wl-mv5i3lulwwbbi8 D1),
+// `withdraw <wl-…>` closes the workload right after its record commits (PLAN wl-mv8s939084z1ts D4),
 // and the identity / open / close / schedule tools.
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { linkTerminal } from "../../gates/src/links";
 import { reviewLimitBody, ROUND_LIMIT_OPTIONS } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
-import { CEILING_OPTIONS } from "../src/ceiling";
+import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { errorLines } from "../src/errors";
 import { ceilingOf } from "../src/input";
-import { planFirstBody } from "../src/launch";
+import { planFirstBody, withdrawnBy } from "../src/launch";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { STANDING_WORKLOAD_ID, SURFACE_BY as SURFACE } from "../src/types";
-import { clock, ctxOf, fakePi, notices, timers, tmp } from "./helpers";
+import { clock, ctxOf, fakePi, HOW_IT_FAILS, loadTestText, notices, timers, tmp } from "./helpers";
 
 function env(over: Record<string, string> = {}): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
@@ -61,8 +63,8 @@ describe("surface extension adapter", () => {
 		ledger.close();
 		orchestratorSurface(f.pi, e);
 		expect(f.registered().sort()).toEqual([
-			"lane_add_slice", "lane_complete_slice", "lane_full_test", "lane_handoff", "lane_message", "lane_raise_question", "lane_read_facts", "lane_record_entry", "lane_release", "lane_withdraw_reserved",
-			"orchestrator_close_workload", "orchestrator_identity", "orchestrator_launch_lane", "orchestrator_ledger", "orchestrator_lower_ceiling", "orchestrator_open_workload", "orchestrator_raise_question", "orchestrator_record_instruction", "orchestrator_schedule", "orchestrator_wake_read", "slice_artifact",
+			"as2_rank", "lane_add_slice", "lane_complete_slice", "lane_full_test", "lane_handoff", "lane_message", "lane_raise_question", "lane_read_facts", "lane_record_entry", "lane_release", "lane_train_return", "lane_withdraw_reserved",
+			"orchestrator_channel_done", "orchestrator_close_workload", "orchestrator_identity", "orchestrator_launch_lane", "orchestrator_ledger", "orchestrator_lower_ceiling", "orchestrator_open_workload", "orchestrator_raise_question", "orchestrator_record_instruction", "orchestrator_reply", "orchestrator_schedule", "orchestrator_set_lane_model", "orchestrator_wake_read", "slice_artifact",
 		]);
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
@@ -197,7 +199,7 @@ describe("surface extension adapter", () => {
 		l.close();
 	});
 
-	test("the pending block of a reserved request, a plan question, a ceiling question and a free-form question, pasted whole, applies four answers in one transaction (PLAN wl-mv5msri070p0qo § 3)", async () => {
+	test("the pending block of a reserved request, a plan question, a marked-default question and a free-form question, pasted whole, applies four answers in one transaction (PLAN wl-mv5msri070p0qo § 3)", async () => {
 		const f = fakePi();
 		const e = env();
 		const l = open(e);
@@ -217,12 +219,10 @@ describe("surface extension adapter", () => {
 			l.recordEntry({ by: "lane-p", workloadId: p, sliceId: sp, kind: "assumption", body: `plan-question: ${id}` });
 			return id;
 		});
-		// the runner's ceiling question
+		// a lane question whose body marks its default
 		const c = l.openWorkload({ by: SURFACE, brief: "Move the header offset into a token", stakes: "normal", mode: "autonomous" });
-		l.recordEntry({ by: SURFACE, workloadId: c, kind: "assumption", body: "ceiling: usd 50 wall 360 source stakes normal" });
-		l.recordEntry({ by: LANE_STARTER_BY, workloadId: c, kind: "assumption", body: "launch: lane-t-1 cause first requested-by test" });
-		const sc = l.addSlice({ by: LANE_RUNNER_BY, workloadId: c, id: "sl-ceiling-1", task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
-		const ceiling = l.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: c, sliceId: sc, body: "80 % of the ceiling", options: [...CEILING_OPTIONS] });
+		const sc = l.addSlice({ by: "lane-t-1", workloadId: c, task: "t", doneCondition: "d", inputs: "c.ts" });
+		const ceiling = l.raiseQuestion({ by: "lane-t-1", workloadId: c, sliceId: sc, body: "Keep going?\nstop (the default): park here.", options: ["extend", "stop", "split"] });
 		orchestratorSurface(f.pi, e);
 		const ctx = ctxOf();
 		notices.length = 0;
@@ -555,13 +555,13 @@ describe("surface extension adapter", () => {
 		const ctx = ctxOf({ cwd: repo });
 		const who = await f.tool("orchestrator_identity").execute("1", { name: "Sable", pronouns: "they/them" }, undefined, undefined, ctx);
 		expect(who.content[0]!.text).toMatch(/^You are now Sable \(they\/them\); entry en-/);
-		const opened = await f.tool("orchestrator_open_workload").execute("1", { brief: "hotfix the feed header", done: "the feed header renders at the right offset in production" }, undefined, undefined, ctx);
+		const opened = await f.tool("orchestrator_open_workload").execute("1", { brief: `hotfix the feed header${HOW_IT_FAILS}`, done: "the feed header renders at the right offset in production" }, undefined, undefined, ctx);
 		const id = (opened.details as { id: string }).id;
 		expect(opened.content[0]!.text).toContain(`Opened ${id} on ${repo}`);
 		expect(opened.content[0]!.text).toContain("stakes: production · mode: autonomous");
 		expect(opened.content[0]!.text).toContain('inferred production: you said "hotfix"');
 		expect(opened.content[0]!.text).toContain("prior decision");
-		const overridden = await f.tool("orchestrator_open_workload").execute("1", { brief: "hotfix again", done: "the second hotfix is live", stakes: "throwaway", mode: "user-driven" }, undefined, undefined, ctx);
+		const overridden = await f.tool("orchestrator_open_workload").execute("1", { brief: `hotfix again${HOW_IT_FAILS}`, done: "the second hotfix is live", stakes: "throwaway", mode: "user-driven" }, undefined, undefined, ctx);
 		expect(overridden.content[0]!.text).toContain("stakes overridden to throwaway; mode overridden to user-driven");
 		const sched = await f.tool("orchestrator_schedule").execute("1", { due: "2020-01-01", text: "re-measure the threshold; method = routing_review" }, undefined, undefined, ctx);
 		const sid = (sched.details as { id: string }).id;
@@ -594,7 +594,7 @@ describe("surface extension adapter", () => {
 		const closed = await f.tool("orchestrator_close_workload").execute("1", { workloadId: id, receipt: "shipped" }, undefined, undefined, ctx);
 		const path = (closed.details as { path: string }).path;
 		expect(path.startsWith(logDir)).toBe(true);
-		expect(path).toMatch(/--sable--hotfix-the-feed-header\.md$/);
+		expect(path).toMatch(/--sable--hotfix-the-feed-header[-.]/);
 		expect(existsSync(path)).toBe(true);
 		expect(readFileSync(path, "utf8")).toContain("## What changed");
 		const l3 = open(e);
@@ -612,7 +612,7 @@ describe("surface extension adapter", () => {
 		const wl = seed.openWorkload({ by: "lane-a", brief: "Add a line to the README", stakes: "normal", mode: "autonomous" });
 		const sl = seed.addSlice({ by: "lane-a", workloadId: wl, task: "write the line", doneCondition: "README.md has it", inputs: "README.md" });
 		seed.close();
-		orchestratorSurface(f.pi, e);
+		await orchestratorSurface(f.pi, e, { loadText: loadTestText });
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		const wake = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as Started;
@@ -702,5 +702,138 @@ describe("cancel-slice at the surface (PLAN wl-mv5i3lulwwbbi8 D1)", () => {
 		expect(l.slice(sl)!.state).toBe("cancelled");
 		expect(l.instructions(wl).map((i) => [i.kind, i.author, i.channel])).toEqual([["instruction", "jo", "surface"], ["withdrawal", "jo", "surface"]]);
 		l.close();
+	});
+});
+
+describe("withdraw <wl-…> at the surface (PLAN wl-mv8s939084z1ts D4)", () => {
+	const ORIGIN_URL = "https://github.com/example/repo.git";
+	/** The env with a test-runner config serving example/repo: the fake exec's `git config` answer decides served or not. */
+	function servedEnv(): Record<string, string> {
+		const config = join(tmp("config"), "config.yml");
+		writeFileSync(config, "setupVersion: 2\ntestRunner:\n  repos:\n    - origin: example/repo\n      command: bun test\n");
+		return env({ [TEST_RUNNER_CONFIG_ENV]: config });
+	}
+	/** An open workload whose one slice was cancelled and that no one holds: the word's accepted case. */
+	function cancelledWorkload(e: Record<string, string>): string {
+		const l = open(e);
+		const wl = l.openWorkload({ by: SURFACE, brief: "Prototype the data-viz panel", stakes: "normal", mode: "autonomous" });
+		l.cancelSlice(l.addSlice({ by: SURFACE, workloadId: wl, task: "draw the panel", doneCondition: "it renders", inputs: "the feed" }), { by: SURFACE });
+		l.close();
+		return wl;
+	}
+	/**
+	 * The surface on the fake exec (no git or gh process runs): while `git.origin`, `git config` names a served origin and
+	 * `git rev-parse --show-toplevel` then fails, so the close check refuses; otherwise the repo has no origin and is not served.
+	 */
+	function surface(e: Record<string, string>, git = { origin: false }) {
+		const f = fakePi(undefined, { exec: true });
+		f.execs.answer = (command, args) => {
+			if (command === "git" && args[2] === "config") return git.origin ? { stdout: `${ORIGIN_URL}\n`, stderr: "", code: 0, killed: false } : { stdout: "", stderr: "", code: 1, killed: false };
+			if (command === "git" && args[2] === "rev-parse" && args[3] === "--show-toplevel") return { stdout: "", stderr: "fatal: no", code: 128, killed: false };
+			return { stdout: "", stderr: "", code: 0, killed: false };
+		};
+		orchestratorSurface(f.pi, e, {});
+		return f;
+	}
+	/** The `surface-close` entries the close appends, one per workload it closed. */
+	const closes = (entries: readonly { type: string }[]) => entries.filter((x) => x.type === "surface-close");
+
+	test("typed: the record is written and the workload closes at once, the echo carrying `Closed <wl>`; no launch runs", async () => {
+		const e = servedEnv();
+		const wl = cancelledWorkload(e);
+		const f = surface(e);
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `withdraw ${wl}`, systemPrompt: [] }, ctxOf({ cwd: tmp("repo") }));
+		const l = open(e);
+		const [ins] = l.instructions(wl).filter((i) => i.kind === "instruction");
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toStartWith(`withdrew ${wl} (instruction ${ins!.id}); closing it with no done-because: receipt; Closed ${wl}.`);
+		expect(l.workload(wl)!.status).toBe("closed");
+		expect(l.instructions(wl).map((i) => i.body)).toContain(`close receipt: withdrawn by Jo (${ins!.id}): closed with no done-because: receipt`);
+		l.close();
+		expect(closes(f.entries)).toHaveLength(1);
+		expect(f.execs.calls.filter((c) => c.command === "bun")).toEqual([]);
+	});
+
+	test("a refused close (served repo whose git fails) leaves it open with the withdrawal standing, and the echo says the tick retries", async () => {
+		const e = servedEnv();
+		const wl = cancelledWorkload(e);
+		const repo = tmp("repo");
+		const f = surface(e, { origin: true });
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `withdraw ${wl}`, systemPrompt: [] }, ctxOf({ cwd: repo }));
+		const l = open(e);
+		const by = withdrawnBy(l.entries(wl), l.instructions(wl));
+		expect(by).not.toBeNull();
+		expect(notices).toEqual([
+			linkTerminal(`withdrew ${wl} (instruction ${by!.instructionId}); closing it with no done-because: receipt; ${wl} stays open: ${wl} cannot close: the close check could not answer: ${repo} is not a git checkout (git rev-parse exited 128: fatal: no); the tick retries the close`),
+		]);
+		expect(l.workload(wl)!.status).toBe("open");
+		l.close();
+		expect(closes(f.entries)).toEqual([]);
+	});
+
+	test("a close that throws is named after the committed withdrawal, never as `could not apply`", async () => {
+		const e = servedEnv();
+		const wl = cancelledWorkload(e);
+		// the repo is a regular file: rendering the decision-log entry under it throws inside the close
+		const notDir = join(tmp("repo"), "a-file");
+		writeFileSync(notDir, "not a directory");
+		const f = surface(e);
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `withdraw ${wl}`, systemPrompt: [] }, ctxOf({ cwd: notDir }));
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toMatch(new RegExp(`^withdrew ${wl} \\(instruction in-\\S+\\); closing it with no done-because: receipt; withdrawn, but the close failed: .+; the tick retries$`));
+		expect(notices[0]).not.toContain("could not apply");
+		const l = open(e);
+		expect(l.workload(wl)!.status).toBe("open");
+		expect(withdrawnBy(l.entries(wl), l.instructions(wl))).not.toBeNull();
+		l.close();
+	});
+
+	test("a paste of a withdrawal and a valid command closes exactly once; a paste whose later line is refused closes nothing and writes nothing", async () => {
+		const e = servedEnv();
+		const wl = cancelledWorkload(e);
+		const f = surface(e);
+		const ctx = ctxOf({ cwd: tmp("repo") });
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `withdraw ${wl}\nwithdraw wl-nope`, systemPrompt: [] }, ctx);
+		expect(notices).toEqual([`line 1 "withdraw ${wl}": ok, not applied`, 'line 2 "withdraw wl-nope": wl-nope is not an open workload', "nothing applied: fix line 2 and paste all of it again"]);
+		let l = open(e);
+		expect(l.instructions(wl)).toEqual([]);
+		expect(withdrawnBy(l.entries(wl), l.instructions(wl))).toBeNull();
+		l.close();
+		expect(f.execs.calls).toEqual([]);
+		expect(closes(f.entries)).toEqual([]);
+
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `production ${wl}\nwithdraw ${wl}`, systemPrompt: [] }, ctx);
+		expect(notices).toHaveLength(2);
+		expect(notices[0]).toStartWith(`stakes on ${wl} → production`);
+		expect(notices[1]).toStartWith(`withdrew ${wl} (instruction `);
+		expect(notices[1]).toContain(`; Closed ${wl}.`);
+		expect(closes(f.entries)).toHaveLength(1);
+		l = open(e);
+		expect(l.workload(wl)).toMatchObject({ status: "closed", stakes: "production" });
+		l.close();
+	});
+
+	test("`withdraw wl-x please` typed is refused with the reason, and writes no Jo-input prose row", async () => {
+		const e = servedEnv();
+		const wl = cancelledWorkload(e);
+		const f = surface(e);
+		const ctx = ctxOf();
+		notices.length = 0;
+		const text = `withdraw ${wl} please`;
+		await f.emit("input", { text, source: "interactive" }, ctx);
+		await f.emit("before_agent_start", { prompt: text, systemPrompt: [] }, ctx);
+		expect(notices).toEqual(["withdraw names one workload: withdraw wl-…"]);
+		expect(f.entries.filter((x) => x.type === "surface-jo-input")).toEqual([]);
+		const l = open(e);
+		expect(l.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
+		expect(l.instructions(wl)).toEqual([]);
+		expect(l.workload(wl)!.status).toBe("open");
+		l.close();
+		expect(closes(f.entries)).toEqual([]);
 	});
 });

@@ -1,0 +1,35 @@
+{
+	"source": "live ledger, wl-mv8cvw0lq3rlds lane-2, started on the recorded lane-model",
+	"rows": [
+		{
+			"t": "entry",
+			"id": "en-mv8d1b8mlysd8g",
+			"workloadId": "wl-mv8cvw0lq3rlds",
+			"sliceId": null,
+			"kind": "assumption",
+			"by": "orchestrator-surface",
+			"at": "2026-10-14T17:04:48.166Z",
+			"body": "lane-model: openai-codex/gpt-6.1-sol by jo at 2026-10-14T17:04:48.166Z"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv8d2t5cbmgjcw",
+			"workloadId": "wl-mv8cvw0lq3rlds",
+			"sliceId": null,
+			"kind": "assumption",
+			"by": "lane-runner",
+			"at": "2026-10-14T17:05:58.032Z",
+			"body": "lane-started: lane-mv8cvw0lq3rlds-2 {\"pid\":89406,\"start\":\"Wed Oct 14 10:05:58 2026\",\"session\":null,\"argv\":[],\"runnerPid\":89371,\"model\":\"openai-codex/gpt-6.1-sol\",\"ranModel\":null}"
+		},
+		{
+			"t": "entry",
+			"id": "en-mv8d2u6w3b93b4",
+			"workloadId": "wl-mv8cvw0lq3rlds",
+			"sliceId": null,
+			"kind": "assumption",
+			"by": "lane-runner",
+			"at": "2026-10-14T17:05:59.384Z",
+			"body": "lane-started: lane-mv8cvw0lq3rlds-2 {\"pid\":89406,\"start\":\"Wed Oct 14 10:05:58 2026\",\"session\":null,\"argv\":[],\"runnerPid\":89371,\"model\":\"openai-codex/gpt-6.1-sol\",\"ranModel\":\"openai-codex/gpt-6.1-sol\"}"
+		}
+	]
+}

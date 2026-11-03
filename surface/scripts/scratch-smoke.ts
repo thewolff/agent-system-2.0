@@ -45,6 +45,7 @@ import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import { copyIntoScratch, HarnessError, laneStarts, PS_SHIM, removeFromScratch, scratchNewPathRefusal } from "../src/chaos";
 import { recordRepo } from "../src/decision-log";
 import { laneDir, STARTER_EXIT, worktreePath } from "../src/launch";
+import { installOutcome } from "./chaos";
 import { type Proxy, startProxy } from "./chaos-proxy";
 import { type Stub, type StubRequest, type StubScript, type StubToolResult, type StubTurn, startStub, writeStubProfile } from "./chaos-stub";
 
@@ -53,7 +54,7 @@ const SOURCE = resolve(import.meta.dir, "..", "..");
 const PROFILE = "agent-system-2";
 /** Logs and run directories (the slice brief names this directory). */
 const LOG_DIR = join(homedir(), "agent-scratch", "agent-system-2.0", "wl-mv5oikd5jtquww", "smoke");
-const CHAT_MODEL = "anthropic/claude-haiku-4-5";
+const CHAT_MODEL = "anthropic/claude-haiku-5-5";
 const LEASE_MS = 120_000;
 const PROBE_MS = 120_000;
 /** From the launch to the lane's lane-exit: (or lane-died:). */
@@ -312,11 +313,38 @@ export function parseArgs(argv: string[]): Args | string {
 	return a;
 }
 
-interface Ran {
+export interface Ran {
 	code: number | null;
 	out: string;
 	err: string;
 	timedOut: boolean;
+}
+
+/** What installProfile needs: the copy, the throwaway HOME and PATH, the run directory install.log goes in, and the Run's spawn and log. */
+export interface InstallDeps {
+	repo: string;
+	home: string;
+	path: string;
+	runDir: string;
+	run: (cmd: string[], o: { cwd: string; env?: Record<string, string>; ms: number }) => Promise<Ran>;
+	say: (line: string) => void;
+}
+
+/**
+ * install/install.sh from the copy into the throwaway HOME, its whole output kept in runDir/install.log; returns the profile's agent
+ * dir. The exit is judged by chaos.ts installOutcome: 0 is success; INSTALL_DOCTOR_FAILED (5, install's closing doctor found failing
+ * parts) is success with one logged line, since the doctor's seat part cannot pass for a copy no orchestrator runs for; any other
+ * exit, or a timeout, throws HarnessError.
+ */
+export async function installProfile(d: InstallDeps): Promise<string> {
+	const install = await d.run(["bash", join(d.repo, "install", "install.sh")], { cwd: d.repo, env: { PATH: d.path, HOME: d.home }, ms: 300_000 });
+	const log = join(d.runDir, "install.log");
+	writeFileSync(log, `${install.out}\n--- stderr ---\n${install.err}`);
+	const outcome = installOutcome(install, log);
+	if (outcome.note !== null) d.say(`setup: ${outcome.note}`);
+	const agentDir = join(d.home, ".omp", "profiles", PROFILE, "agent");
+	if (!existsSync(join(agentDir, "config.yml"))) throw new HarnessError(`install.sh wrote no profile at ${agentDir}`);
+	return agentDir;
 }
 
 /** Why `ps` at `bin` cannot report this process, or null when it can (the setuid /bin/ps fails with EPERM in a sandbox). */
@@ -496,11 +524,7 @@ class Run {
 		} else this.say(`setup: the tree has the scratch contract; the launcher must export ${SCRATCH_ENV} itself (expected ${this.root})`);
 
 		this.say("setup: install/install.sh into the throwaway HOME");
-		const install = await this.run(["bash", join(this.repo, "install", "install.sh")], { cwd: this.repo, env: { PATH: this.env.PATH!, HOME: this.home }, ms: 300_000 });
-		writeFileSync(join(this.R, "install.log"), `${install.out}\n--- stderr ---\n${install.err}`);
-		if (install.code !== 0) throw new HarnessError(`install.sh exited ${install.code}${install.timedOut ? " (timed out)" : ""}: ${oneLine(install.err.trim().split("\n").at(-1) ?? "")} (log ${join(this.R, "install.log")})`);
-		const agentDir = join(this.home, ".omp", "profiles", PROFILE, "agent");
-		if (!existsSync(join(agentDir, "config.yml"))) throw new HarnessError(`install.sh wrote no profile at ${agentDir}`);
+		const agentDir = await installProfile({ repo: this.repo, home: this.home, path: this.env.PATH!, runDir: this.R, run: (cmd, o) => this.run(cmd, o), say: (l) => this.say(l) });
 		writeStubProfile(agentDir, this.stub.port, { chatModel: CHAT_MODEL });
 	}
 

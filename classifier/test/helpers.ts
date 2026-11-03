@@ -14,29 +14,45 @@ export interface SampleRow {
 	addition?: boolean;
 	response: { choice: string; confidence: number; probabilities: Record<string, number> };
 	judge_model: string;
+	/** 2026-10-20 recording: `sample` (the 2026-09-28 thirty-two), `audit`, `heldout-A` or `heldout-B`. */
+	set?: string;
+	/** 2026-10-20 audit rows: the 2026-10-19 hand-size audit's verdict, `firm`, `soft` or `correct`. */
+	audit?: string;
+	/** 2026-10-20 held-out rows: the blind label, `over` (standard would do) or `correct` (strong needed). */
+	label?: string;
+	sublabel?: string;
+	/** 2026-10-20 audit and held-out rows: the routing row the brief was dispatched under, and its stakes. */
+	rt?: string;
+	stakes?: string;
 }
 
 /**
- * The sample the calibration holds for: 2026-09-28, the thirty 2026-09-23 briefs plus two review
- * additions (research/classifier-sample.md § Re-measurement 2026-09-28; classifier/calibration.json).
+ * The sample the calibration holds for: 2026-10-20, the 2026-09-28 thirty-two plus the 2026-10-19
+ * hand-size audit's twenty and held-out sets A and B (research/classifier-sample.md § Re-measurement
+ * 2026-10-20; classifier/calibration.json).
  */
-export const FIXTURE_PATH = join(import.meta.dir, "fixtures", "classifier-sample-2026-09-28.jsonl");
+export const FIXTURE_PATH = join(import.meta.dir, "fixtures", "classifier-sample-2026-10-20.jsonl");
 
 /**
  * The question that sample was recorded with, kept byte-for-byte so the replay replays what was
  * measured. The classifier asks classifier/kind-question.json, which may differ until a new sample
  * is recorded (calibration.json).
  */
-export const RECORDED_QUESTION_PATH = join(import.meta.dir, "fixtures", "kind-question-2026-09-28.json");
+export const RECORDED_QUESTION_PATH = join(import.meta.dir, "fixtures", "kind-question-2026-10-20.json");
 export const recordedQuestion = (): KindQuestion => loadKindQuestion(RECORDED_QUESTION_PATH);
+
+/** The superseded 2026-09-28 recording, kept as history: its answers belong to its own question. */
+export const FIXTURE_PATH_2026_09_28 = join(import.meta.dir, "fixtures", "classifier-sample-2026-09-28.jsonl");
+export const RECORDED_QUESTION_PATH_2026_09_28 = join(import.meta.dir, "fixtures", "kind-question-2026-09-28.json");
 
 /** The superseded 2026-09-23 recording, kept as history: its answers belong to its own question. */
 export const FIXTURE_PATH_2026_09_23 = join(import.meta.dir, "fixtures", "classifier-sample-30.jsonl");
 export const RECORDED_QUESTION_PATH_2026_09_23 = join(import.meta.dir, "fixtures", "kind-question-2026-09-23.json");
 
-export function loadSample(path: string = FIXTURE_PATH): { questionSha256: string; rows: SampleRow[] } {
+/** A recording's meta line and rows; `judgeModel` is in the meta line from 2026-10-20 on. */
+export function loadSample(path: string = FIXTURE_PATH): { questionSha256: string; judgeModel?: string; rows: SampleRow[] } {
 	const [meta, ...rows] = readFileSync(path, "utf8").trim().split("\n").map(line => JSON.parse(line));
-	return { questionSha256: meta.meta.question_sha256, rows };
+	return { questionSha256: meta.meta.question_sha256, judgeModel: meta.meta.judge_model, rows };
 }
 
 type JudgeReply = { choice: string; confidence: number; probabilities?: Record<string, number> };

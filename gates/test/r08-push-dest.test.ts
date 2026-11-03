@@ -8,13 +8,15 @@
 // Real git config in temp repos with a bare origin; every push is judged, none runs.
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { TRAIN_PREPARE, TRAIN_PUSH } from "../../surface/src/merge-train";
 import { artifactTreeBody } from "../../surface/src/signals";
 import { boundBranches, parsePushDest } from "../../surface/src/test-run";
 import { ctxOf, fakePi } from "../../surface/test/helpers";
 import pushRebaseRow from "../extensions/r08-push-rebase";
+import { checkReserved } from "../src/rows/r06-reserved";
 import { judgePush, type PushJudgment, type TestRecords } from "../src/rows/r08-push-rebase";
 import type { CallContext } from "../src/types";
-import { commit, git, repoWithOrigin, tempLedger, testRecord, tmp } from "./helpers";
+import { advanceOriginMain, commit, git, repoWithOrigin, tempLedger, testRecord, tmp } from "./helpers";
 
 const lane = (cwd: string): CallContext => ({ role: "lane", cwd, env: { HOME: "/nonexistent-home" } });
 const bash = (command: string) => ({ toolName: "bash", input: { command } });
@@ -505,5 +507,56 @@ describe("the extension writes push-dest entries at tool_call, as the lane, once
 		expect(r?.block).toBe(true);
 		expect(r?.reason).toContain("its destination could not be recorded");
 		expect(s.recorded()).toEqual([]);
+	});
+});
+
+describe("the merge train's step 2 preparation and step 6 push pass row 8 (PLAN wl-mv8s8srodefytc, trainBrief)", () => {
+	const HEAD_BRANCH = "wl/wl-pr";
+	/** The brief's literal command with its placeholders filled in. */
+	const fill = (template: string, path: string, attempt: number) =>
+		template.replace("<k>", "mv8s8srodefytc").replace("<n>", "101").replace("<a>", String(attempt)).replace("<a new path beside the lane worktree>", path).replace("<head branch>", HEAD_BRANCH);
+	/** A PR head branch on origin behind an advanced origin/main, and the lane's checkout fetched after (step 2's `git fetch origin`). */
+	function train() {
+		const r = repoWithOrigin();
+		git(r.work, "switch", "-q", "-c", HEAD_BRANCH);
+		commit(r.work, "pr.txt", "pr\n");
+		git(r.work, "push", "-q", "origin", HEAD_BRANCH);
+		git(r.work, "switch", "-q", "main");
+		advanceOriginMain(r.root, r.origin);
+		git(r.work, "fetch", "-q", "origin");
+		return r;
+	}
+	/** Step 2's command run in the lane's checkout, then step 3's merge of main in the new PR worktree. */
+	function prepare(work: string, prepareCommand: string, pr: string): void {
+		expect(checkReserved(bash(prepareCommand), lane(work))).toBeNull();
+		git(work, ...prepareCommand.split(" ").slice(1));
+		git(pr, "merge", "--no-ff", "-q", "-m", "merge main", "origin/main");
+	}
+
+	test("a fresh branch tracking the head: the push is let through onto the head branch when the test record matches the tree", () => {
+		const r = train();
+		const pr = join(r.root, "pr-101-1");
+		prepare(r.work, fill(TRAIN_PREPARE, pr, 1), pr);
+		const push = fill(TRAIN_PUSH, pr, 1);
+		const j = judgePush(bash(push), lane(pr), () => [testRecord(pr)]);
+		expect(j.refusal).toBeNull();
+		expect(j.dests).toEqual([{ remote: "origin", branch: HEAD_BRANCH, sha: git(pr, "rev-parse", "HEAD") }]);
+		// the same push with no record on the merged tree is refused
+		expect(judgePush(bash(push), lane(pr), () => []).refusal?.reason).toContain("no passing test record");
+		// a second attempt at the same PR takes the next attempt number: the first branch stays
+		const again = join(r.root, "pr-101-2");
+		expect(() => git(r.work, ...fill(TRAIN_PREPARE, again, 1).split(" ").slice(1))).toThrow("already exists");
+		prepare(r.work, fill(TRAIN_PREPARE, again, 2), again);
+		expect(judgePush(bash(fill(TRAIN_PUSH, again, 2)), lane(again), () => [testRecord(again)]).refusal).toBeNull();
+	});
+
+	test("a detached worktree at the head cannot make the step 6 push", () => {
+		const r = train();
+		const pr = join(r.root, "pr-101-detached");
+		git(r.work, "worktree", "add", "--detach", pr, `origin/${HEAD_BRANCH}`);
+		git(pr, "merge", "--no-ff", "-q", "-m", "merge main", "origin/main");
+		const j = judgePush(bash(fill(TRAIN_PUSH, pr, 1)), lane(pr), () => [testRecord(pr)]);
+		expect(j.refusal?.reason).toContain("detached HEAD");
+		expect(j.dests).toEqual([]);
 	});
 });

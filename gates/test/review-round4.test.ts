@@ -201,16 +201,16 @@ describe("S3: row 1 reads structural blocks after one quote/code normalization",
 	// The accepted/refused example table (triad 1, leg C). A "decision" is one choice; `and`, a
 	// comma, `;`, `:` and `also` join two.
 	const table: [string, "ALLOW" | "BLOCK", string][] = [
-		["**QUESTION**\nChoose main or feature and deploy today or tomorrow?", "BLOCK", "two choices joined by and"],
-		["**QUESTION**\nChoose main or feature, deploy today or tomorrow?", "BLOCK", "two choices joined by a comma"],
-		["**QUESTION**\nChoose main or feature; also deploy today or tomorrow?", "BLOCK", "two choices joined by ; also"],
-		["**QUESTION**\nThe quoted message was “Ready?”\nKeep or revert?", "ALLOW", "a quoted question mark is not an ask"],
-		["**CLAIM**\nThe token is `**QUESTION**`.\n\n**QUESTION**\nKeep or revert?", "ALLOW", "an inline-code label is not a block"],
-		["**CLAIM**\nThey wrote “She asked ‘Ready?’ yesterday.”\n\n**QUESTION**\nKeep or revert?", "ALLOW", "nested curly quotes are stripped"],
-		["**QUESTION**\nKeep or revert?", "ALLOW", "one choice, last"],
-		["**QUESTION**\nShip now or wait?\n\n**QUESTION**\nDeploy or hold?", "BLOCK", "two QUESTION blocks"],
-		["**PMDW**\nShip now or wait?", "BLOCK", "a decision outside a QUESTION block"],
-		["**CLAIM**\nThe label `**QUESTION**` stays inline.\n\n**PMDW**\nWant me to proceed?", "ALLOW", "a check-in with an inline-code label"],
+		["**Closing ask**\nChoose main or feature and deploy today or tomorrow?", "BLOCK", "two choices joined by and"],
+		["**Closing ask**\nChoose main or feature, deploy today or tomorrow?", "BLOCK", "two choices joined by a comma"],
+		["**Closing ask**\nChoose main or feature; also deploy today or tomorrow?", "BLOCK", "two choices joined by ; also"],
+		["**Closing ask**\nThe quoted message was “Ready?”\nKeep or revert?", "ALLOW", "a quoted question mark is not an ask"],
+		["**CLAIM**\nThe token is `**Closing ask**`.\n\n**Closing ask**\nKeep or revert?", "ALLOW", "an inline-code label is not a block"],
+		["**CLAIM**\nThey wrote “She asked ‘Ready?’ yesterday.”\n\n**Closing ask**\nKeep or revert?", "ALLOW", "nested curly quotes are stripped"],
+		["**Closing ask**\nKeep or revert?", "ALLOW", "one choice, last"],
+		["**Closing ask**\nShip now or wait?\n\n**Closing ask**\nDeploy or hold?", "BLOCK", "two closing asks"],
+		["**CLAIM**\nThe gate is built.\n\nShip now or wait?", "BLOCK", "a decision outside the closing ask"],
+		["**CLAIM**\nThe label `**Closing ask**` stays inline.\n\nWant me to proceed?", "ALLOW", "a check-in with an inline-code label"],
 	];
 	for (const [text, want, why] of table) test(`${want} (${why}): ${JSON.stringify(text)}`, () => expect(verdict(checkTurnShape(text))).toBe(want));
 });

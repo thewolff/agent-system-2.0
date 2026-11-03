@@ -52,8 +52,13 @@
 			<integer>45</integer>
 		</dict>
 	</array>
+	<!--
+	  Standard, not Background: the chaos run starts omp sessions and lanes against its scratch ledger,
+	  with timeouts. Background makes darwin throttle that tree (priority 4 instead of 31, about 10x
+	  slower), the same throttle that timed out the merge train's lanes (jo-issues 213).
+	-->
 	<key>ProcessType</key>
-	<string>Background</string>
+	<string>Standard</string>
 	<key>StandardOutPath</key>
 	<string>@HOME@/agent-scratch/agent-system-2.0/chaos/launchd.log</string>
 	<key>StandardErrorPath</key>

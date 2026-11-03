@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  agent-system 2.0: Phoenix, the local trace store as2's OMP processes export spans to, as a launchd
+  user agent (wl-mv65t5d34lts00). TEMPLATE: install/phoenix-agent.sh with its on argument fills the
+  upper-case placeholder values (XML-escaped), writes the result to
+  $HOME/Library/LaunchAgents/com.agent-system-2.phoenix.plist and loads it with launchctl bootstrap
+  (a loaded copy is booted out first); its off argument boots it out and deletes that file. The job
+  runs a copy of install/phoenix-run.sh in the Phoenix home bin directory (never a checkout path),
+  which starts Phoenix through phoenix-serve.py on 127.0.0.1 only, caps its memory and checks its
+  listeners. KeepAlive restarts it no sooner than ThrottleInterval seconds after an exit (75: memory
+  cap; 78: a listener not on loopback, ports not bound in time, the memory footprint not sampleable, or an
+  unchecked Phoenix version). PATH is the system directories: the wrapper runs lsof and sleep by absolute
+  path, and Phoenix and its footprint sampler by the uv tool's Python.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.agent-system-2.phoenix</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>@PHOENIX_HOME@/bin/phoenix-run.sh</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>@HOME@</string>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>PHOENIX_PYTHON</key>
+		<string>@PYTHON@</string>
+		<key>PHOENIX_HOST</key>
+		<string>127.0.0.1</string>
+		<key>PHOENIX_PORT</key>
+		<string>@PORT@</string>
+		<key>PHOENIX_GRPC_PORT</key>
+		<string>@GRPC_PORT@</string>
+		<key>PHOENIX_WORKING_DIR</key>
+		<string>@PHOENIX_HOME@/data</string>
+		<key>PHOENIX_TELEMETRY_ENABLED</key>
+		<string>false</string>
+		<key>PHOENIX_DEFAULT_RETENTION_POLICY_DAYS</key>
+		<string>30</string>
+		<key>PHOENIX_MEM_CAP_MB</key>
+		<string>1536</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>@PHOENIX_HOME@/data</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>@PHOENIX_HOME@/launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>@PHOENIX_HOME@/launchd.log</string>
+</dict>
+</plist>

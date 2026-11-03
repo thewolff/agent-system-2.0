@@ -1,10 +1,12 @@
 // The tool-call rows of P-11 (DESIGN-2.0.md:334-354) composed in one pass. OMP-free: the extension
 // entry files under gates/extensions/ feed each row OMP's `tool_call` events, and the tests feed this
 // composition plain objects. First refusal wins; the order puts the cheap, local checks first and
-// row 8 (which fetches) last.
+// row 8 (which fetches) last. A paired-coding mutation is judged as its write, edit or bash
+// equivalent (src/pair-call.ts canonicalCall).
+import { canonicalCall } from "./pair-call";
 import { checkQuestionDispatch } from "./rows/question";
 import { checkTierName } from "./rows/r04-tier-name";
-import { checkBriefFields } from "./rows/r05-brief-fields";
+import { checkBriefFields, checkCard } from "./rows/r05-brief-fields";
 import { checkReserved } from "./rows/r06-reserved";
 import type { WakeRead } from "./rows/r07-wake-read";
 import { checkPushRebase, type TestRecords } from "./rows/r08-push-rebase";
@@ -35,13 +37,16 @@ export function checkQuestionRow(input: Record<string, unknown>, workload: GateD
 	}
 }
 
-export function checkToolCall(call: ToolCall, ctx: CallContext, deps: GateDeps = {}): Refusal {
+export function checkToolCall(asCalled: ToolCall, ctx: CallContext, deps: GateDeps = {}): Refusal {
+	const call = canonicalCall(asCalled, ctx.cwd);
 	const ask = checkAsk(call.toolName, ctx.role, ctx.mode);
 	if (ask) return ask;
 	const typed = checkTypedWrapper(call);
 	if (typed) return typed;
 	const wake = deps.wake?.check(call);
 	if (wake) return wake;
+	// Issue #334 item 2: a paired lane's change card carries a "How it fails" section, in a session bound to a workload.
+	if (call.toolName === "pair_propose") return deps.workload ? checkCard(call.input).refusal : null;
 	if (call.toolName === "task") {
 		return (
 			checkTierName(call.input) ??

@@ -6,8 +6,8 @@
   and writes the result to $HOME/Library/LaunchAgents/com.agent-system-2.ledger-backup.plist. It
   never loads it; the load and unload commands are in ledger/SCHEMA.md ("Scheduled second copy").
   Every hour (and once at load) launchd runs the backup job, which takes a copy only when the
-  ledger's newest copy is a day old, and exits nonzero when a due copy fails. PATH is set because
-  the locality check runs df.
+  ledger's newest copy is a day old, and exits nonzero when a due copy fails. PATH is a fixed
+  system PATH, so nothing the job resolves by name comes from the user's shell.
 -->
 <plist version="1.0">
 <dict>

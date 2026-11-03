@@ -1,9 +1,10 @@
 // Where the ledger file lives, and the refusal to put it on a synced or network folder.
 // SPEC-2.0.md § B2 fix 3: v1 ledger state is local, never on a synced or network folder,
 // because SQLite WAL does not work over a network filesystem.
-import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { native, type PasswdResult, type StatfsResult } from "./native";
 
 /** Env var that overrides the ledger path. The M4 raw-write gate matches the same variable. */
 export const LEDGER_DB_ENV = "AGENT_SYSTEM_LEDGER_DB";
@@ -53,43 +54,23 @@ export class LiveLedgerUnderTestError extends Error {
 	}
 }
 
-let passwdHomeCache: string | undefined;
-
 /**
- * This user's home from the passwd database, looked up once per process. Not `os.homedir()` or
- * `os.userInfo()`: in Bun both follow the HOME the process started with. Only absolute-path tools
- * are run, with an empty env. A failed lookup throws, so the guard fails closed.
+ * This user's home from the passwd database, through `lookup` (native getpwuid_r in production: no
+ * process is started). Not `os.homedir()` or `os.userInfo()`: in Bun both follow the HOME the process
+ * started with. A failed lookup throws, so the guard fails closed. Not cached: the in-process lookup
+ * costs microseconds, and no remembered answer stands in for a check.
  */
-function passwdHome(): string {
-	if (passwdHomeCache !== undefined) return passwdHomeCache;
+function passwdHome(lookup: LocalityProbe["passwdHome"]): string {
 	const uid = process.getuid?.();
-	const fail = (why: string): never => {
-		throw new Error(`cannot look up this user's passwd home (${why}); refusing to resolve a ledger path under test`);
-	};
-	if (uid === undefined) return fail("no uid on this platform");
-	const getent = ["/usr/bin/getent", "/bin/getent"].find((p) => existsSync(p));
-	const [cmd, field]: [string[], number] = process.platform === "darwin"
-		? [["/usr/bin/id", "-P", String(uid)], 8]
-		: getent ? [[getent, "passwd", String(uid)], 5] : fail("no getent");
-	let line: string | undefined;
-	let why: string;
-	try {
-		const out = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "pipe", env: {} });
-		line = out.exitCode === 0 ? out.stdout.toString().trim().split("\n")[0] : undefined;
-		why = `${cmd.join(" ")} exited ${out.exitCode}: ${out.stderr.toString().trim()}`;
-	} catch (e) {
-		return fail(`${cmd[0]}: ${e instanceof Error ? e.message : String(e)}`);
-	}
-	const home = line?.split(":")[field];
-	if (!home || !isAbsolute(home)) return fail(why);
-	passwdHomeCache = home;
-	return home;
+	const found: PasswdResult = uid === undefined ? { ok: false, why: "no uid on this platform" } : lookup(uid);
+	if (!found.ok) throw new Error(`cannot look up this user's passwd home (${found.why}); refusing to resolve a ledger path under test`);
+	return found.home;
 }
 
 /** Every live ledger root under test (PLAN wl-mv4yf3zgf9lm2o § 2 item 4), as written. */
-function liveRoots(): string[] {
+function liveRoots(lookup: LocalityProbe["passwdHome"]): string[] {
 	const env = process.env;
-	const roots = [join(passwdHome(), ".agent-system-2")];
+	const roots = [join(passwdHome(lookup), ".agent-system-2")];
 	if (env[TEST_REAL_HOME_ENV]) roots.push(join(env[TEST_REAL_HOME_ENV], ".agent-system-2"));
 	if (env[TEST_REAL_LEDGER_DB_ENV]) roots.push(dirname(resolve(env[TEST_REAL_LEDGER_DB_ENV])));
 	// Fail closed: a test process no preload isolated still has the developer's HOME and ledger override.
@@ -123,13 +104,13 @@ function comparablePath(path: string): string {
 
 /**
  * Under test, throws LiveLedgerUnderTestError when `path` (canonicalised) is inside a live ledger
- * root (canonicalised). Outside a test process it returns at once: no lookup, no spawn.
+ * root (canonicalised). Outside a test process it returns at once: no lookup.
  */
-export function assertNotLiveLedgerUnderTest(path: string): void {
+function notLiveUnderTest(probe: LocalityProbe, path: string): void {
 	// Active in a `bun test` process (NODE_ENV=test) or one the preload isolated.
 	if (process.env.NODE_ENV !== "test" && !process.env[TEST_ISOLATED_ENV]) return;
 	const real = comparablePath(path);
-	for (const root of liveRoots()) {
+	for (const root of liveRoots(probe.passwdHome)) {
 		const canon = comparablePath(root);
 		if (real === canon || real.startsWith(canon + sep)) throw new LiveLedgerUnderTestError(resolve(path), root);
 	}
@@ -153,7 +134,7 @@ export const SYNCED_HOME_FOLDERS = [
 	"pCloud Drive",
 ];
 
-/** Filesystem types refused on Linux (from /proc/mounts). macOS uses the "local" mount flag instead. */
+/** Filesystem types refused on Linux (from /proc/self/mountinfo). macOS uses the MNT_LOCAL mount flag instead. */
 export const NETWORK_FS_TYPES: Record<string, true> = {
 	nfs: true, nfs4: true, cifs: true, smb: true, smb3: true, smbfs: true, afs: true, afpfs: true,
 	webdav: true, davfs: true, "fuse.sshfs": true, sshfs: true, "9p": true, ceph: true, glusterfs: true,
@@ -227,32 +208,57 @@ function existingAncestor(path: string): string {
 	return p;
 }
 
-function mountPointOf(path: string): string | null {
-	const out = Bun.spawnSync(["df", "-P", path], { stdout: "pipe", stderr: "pipe" });
-	if (out.exitCode !== 0) return null;
-	const lines = out.stdout.toString().trim().split("\n");
-	const last = lines[lines.length - 1]?.trim().split(/\s+/);
-	// POSIX df -P: Filesystem, blocks, used, available, capacity, mounted-on (may contain spaces).
-	return last && last.length >= 6 ? last.slice(5).join(" ") : null;
+/** glibc's gnu_dev_major/gnu_dev_minor of a 64-bit dev_t, as `major:minor` the way mountinfo prints it. */
+function majorMinor(dev: bigint): string {
+	const major = ((dev >> 8n) & 0xfffn) | ((dev >> 32n) & 0xfffff000n);
+	const minor = (dev & 0xffn) | ((dev >> 12n) & 0xffffff00n);
+	return `${major}:${minor}`;
 }
 
-/** "local" | "network:<why>" | "unknown:<why>". */
-export function mountLocality(path: string): string {
-	const target = existingAncestor(path);
-	const mp = mountPointOf(target);
-	if (!mp) return "unknown:df failed";
-	if (process.platform === "darwin") {
-		const out = Bun.spawnSync(["/sbin/mount"], { stdout: "pipe", stderr: "pipe" });
-		const line = out.stdout.toString().split("\n").find((l) => l.includes(` on ${mp} (`));
-		if (!line) return `unknown:no mount entry for ${mp}`;
-		const flags = line.slice(line.lastIndexOf("(") + 1, line.lastIndexOf(")")).split(",").map((s) => s.trim());
-		return flags.includes("local") ? "local" : `network:${mp} is mounted without the local flag (${flags[0]})`;
+/**
+ * Linux locality of `path`, whose st_dev is `dev`, from the text of /proc/self/mountinfo (proc(5)):
+ * `id parent major:minor root mount-point options [optional fields] - fstype source super-options`.
+ * The entries of the path's own device are the candidates: one device is one superblock, so a hidden
+ * or bind-mounted entry of it has the same type, and a mount hidden under another one is a different
+ * device. A malformed line (an empty field, a relative mount point) refuses (unknown), it is never skipped.
+ */
+export function linuxLocality(mountinfo: string, dev: bigint, path: string): string {
+	const device = majorMinor(dev);
+	const candidates: { mountPoint: string; fsType: string }[] = [];
+	for (const line of mountinfo.split("\n")) {
+		if (line === "") continue;
+		const f = line.split(" ");
+		const dash = f.indexOf("-", 6);
+		if (f.includes("") || !/^\d+$/.test(f[0] ?? "") || !/^\d+$/.test(f[1] ?? "") || !/^\d+:\d+$/.test(f[2] ?? "") || !(f[4] ?? "").startsWith("/") || dash < 0 || f.length !== dash + 4) {
+			return `unknown:malformed /proc/self/mountinfo line: ${line}`;
+		}
+		if (f[2] !== device) continue;
+		const mountPoint = (f[4] ?? "").replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(Number.parseInt(octal, 8)));
+		candidates.push({ mountPoint, fsType: f[dash + 1] ?? "" });
 	}
-	if (existsSync("/proc/mounts")) {
-		const entry = readFileSync("/proc/mounts", "utf8").split("\n").map((l) => l.split(" "))
-			.find((f) => f[1]?.replace(/\\040/g, " ") === mp);
-		if (!entry) return `unknown:no /proc/mounts entry for ${mp}`;
-		return Object.hasOwn(NETWORK_FS_TYPES, entry[2] ?? "") ? `network:${mp} is ${entry[2]}` : "local";
+	if (candidates.length === 0) return `unknown:no mountinfo entry for device ${device} (${path})`;
+	const network = candidates.find((c) => Object.hasOwn(NETWORK_FS_TYPES, c.fsType));
+	return network ? `network:${network.mountPoint} is ${network.fsType}` : "local";
+}
+
+/** "local" | "network:<why>" | "unknown:<why>", for the nearest existing ancestor of `path`. */
+function locality(probe: LocalityProbe, path: string): string {
+	const target = existingAncestor(path);
+	if (probe.platform === "darwin") {
+		const fs = probe.statfs(target);
+		if (!fs.ok) return `unknown:statfs failed: ${fs.why}`;
+		return fs.local ? "local" : `network:${fs.mountOn} is mounted without the local flag (${fs.fsType})`;
+	}
+	if (probe.platform === "linux") {
+		const mountinfo = probe.mountinfo();
+		if (mountinfo === null) return "unknown:cannot read /proc/self/mountinfo";
+		let dev: bigint;
+		try {
+			dev = statSync(target, { bigint: true }).dev;
+		} catch (e) {
+			return `unknown:stat ${target}: ${e instanceof Error ? e.message : String(e)}`;
+		}
+		return linuxLocality(mountinfo, dev, target);
 	}
 	return "unknown:unsupported platform";
 }
@@ -265,7 +271,7 @@ export function mountLocality(path: string): string {
  * and a symlinked $HOME are all refused. An undeterminable mount is refused too: the rule is
  * "never on a network folder", so an unknown answer is not a pass.
  */
-export function assertLocalPath(path: string, home: string = process.env.HOME ?? homedir()): string {
+function localPath(probe: LocalityProbe, path: string, home: string): string {
 	const abs = resolve(path);
 	const real = canonicalPath(abs);
 	for (const rel of SYNCED_HOME_FOLDERS) {
@@ -279,9 +285,53 @@ export function assertLocalPath(path: string, home: string = process.env.HOME ??
 			}
 		}
 	}
-	const where = mountLocality(real);
+	const where = locality(probe, real);
 	if (where !== "local") {
 		throw new LedgerLocationError(`ledger path ${real} is not on a local filesystem (${where}); set ${LEDGER_DB_ENV} to a local path`);
 	}
 	return real;
 }
+
+// ---- the guards, bound to what they ask the system ----------------------------------------------
+
+/** What the locality guards ask the system. Production asks REAL_PROBE; tests build their own guard set. */
+export interface LocalityProbe {
+	/** Whose mount rules apply: statfs on darwin, mountinfo on linux. */
+	platform: NodeJS.Platform;
+	statfs(path: string): StatfsResult;
+	/** The text of /proc/self/mountinfo, or null when it cannot be read. */
+	mountinfo(): string | null;
+	passwdHome(uid: number): PasswdResult;
+}
+
+export interface LocalityGuards {
+	/** "local" | "network:<why>" | "unknown:<why>". */
+	mountLocality(path: string): string;
+	assertLocalPath(path: string, home?: string): string;
+	assertNotLiveLedgerUnderTest(path: string): void;
+}
+
+/** The guards asking `probe`. Not re-exported by ./index.ts: only the REAL_PROBE set below reaches Ledger.open. */
+export function localityGuards(probe: LocalityProbe): LocalityGuards {
+	return {
+		mountLocality: (path) => locality(probe, path),
+		assertLocalPath: (path, home = process.env.HOME ?? homedir()) => localPath(probe, path, home),
+		assertNotLiveLedgerUnderTest: (path) => notLiveUnderTest(probe, path),
+	};
+}
+
+/** In process, no child: native statfs and getpwuid_r (./native.ts), /proc/self/mountinfo read as a file. */
+const REAL_PROBE: LocalityProbe = {
+	platform: process.platform,
+	statfs: (path) => native.statfsMount(path),
+	mountinfo: () => {
+		try {
+			return readFileSync("/proc/self/mountinfo", "utf8");
+		} catch {
+			return null;
+		}
+	},
+	passwdHome: (uid) => native.passwdHomeOf(uid),
+};
+
+export const { mountLocality, assertLocalPath, assertNotLiveLedgerUnderTest }: LocalityGuards = localityGuards(REAL_PROBE);

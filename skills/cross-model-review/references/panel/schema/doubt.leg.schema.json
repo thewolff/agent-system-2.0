@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "panel doubt leg — adversarial findings on one artifact",
+  "description": "Output contract of one doubt panel leg (references/doubt-driven-development.md Step 3). Issues only: status no_issues with an empty items array is how a leg states it cannot find any after thorough examination. The classifier assigns item ids <lab>-<n> by position.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "items"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "description": "issues: one or more entries below. no_issues: none found after thorough examination.",
+      "enum": ["issues", "no_issues"]
+    },
+    "items": {
+      "type": "array",
+      "description": "One entry per issue, most damaging first.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["category", "title", "where", "what", "basis"],
+        "properties": {
+          "category": {
+            "type": "string",
+            "description": "The adversarial prompt's list: unstated assumptions, edge cases not handled, hidden coupling or shared state, ways the contract could be violated, existing conventions this might break, failure modes under unexpected input.",
+            "enum": ["unstated_assumption", "unhandled_edge_case", "hidden_coupling", "contract_violation", "convention_break", "failure_mode"]
+          },
+          "title": { "type": "string", "description": "Short title for the issue." },
+          "where": { "type": "string", "description": "The place in the ARTIFACT: a line, heading, or quoted phrase." },
+          "what": { "type": "string", "description": "What is wrong, and the concrete input, sequence, or reading under which it fails." },
+          "basis": { "type": "string", "description": "The ARTIFACT or CONTRACT text the issue rests on, quoted or located." }
+        }
+      }
+    }
+  }
+}

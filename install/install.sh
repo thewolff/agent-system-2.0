@@ -5,7 +5,7 @@
 # each row by its kind. Today that means: create or verify the ledger from the manifest's one
 # ledger-schema row, using its one ledger-init row, take the first scheduled copy with its one
 # ledger-backup row, (macOS) write the periodic backup job from its one ledger-backup-agent row
-# into $HOME/Library/LaunchAgents (written, never loaded: the load command is printed at the end),
+# into $HOME/Library/LaunchAgents (written, never loaded: the one-line load command for your own Terminal is printed),
 # and build the OMP profile: render the `profile` row profile/config.yml with {repo} filled into
 # $HOME/.omp/profiles/<profile>/agent/config.yml, place the `profile` row profile/models.yml beside
 # it, and link every `tier` row into $HOME/.omp/profiles/<profile>/agent/agents/. `skill` rows
@@ -19,43 +19,108 @@
 # user MCP config from that profile's own agent directory only, so the ctx MCP server reaches an as2
 # session through this file and not through ~/.omp/agent/mcp.json. The profile's session directory
 # is registered as a named ctx `pi` history root (per-machine ctx state, not a manifest row), so
-# as2 transcripts are in the ctx index. The last line names the providers the rendered profile
+# as2 transcripts are in the ctx index. The tracing switch (observability.phoenix) keeps its installed
+# value across a re-install, and on macOS, unless that value is off and only when $HOME is this user's
+# own home, the Phoenix LaunchAgent is (re)installed with install/phoenix-agent.sh on; a Phoenix that
+# does not start is reported and does not fail the install. On macOS and only when $HOME is this user's own home, the
+# doctor job (install/com.agent-system-2.doctor.plist: surface/scripts/doctor.ts in its after-restart mode, at load and
+# every 600 s) is written and loaded the way the flag jobs below are, its PATH built from where each name its
+# JOB_INVENTORY row in surface/src/doctor.ts runs resolves now, then the system directories. A `launchctl bootstrap` that
+# fails (an agent shell gets "Bootstrap failed: 5") never fails the install: one line says what to run in your own
+# Terminal, `run this in your own Terminal (zsh): launchctl bootstrap gui/$(id -u) <plist>`, and the install goes on.
+# The last step runs the full doctor (bun surface/scripts/doctor.ts, every part) with its output shown: `install
+# complete` is printed only when it exits 0, else `install incomplete: as2 doctor found failing parts (above)` and
+# exit 5, everything already written kept. The last line names the providers the rendered profile
 # routes to and says each needs a /login once per profile (the profile's setupVersion skips OMP's
 # first-launch sign-in scene).
+# File links also install in the default OMP profile (persistent seats do not use the as2 profile):
+# ~/.omp/agent/extensions/as2-open-links.ts points into this checkout. If herdr is on PATH, its
+# as2.file-links plugin is linked from install/herdr-file-links; without herdr one notice is printed.
+# Reversal: herdr plugin unlink as2.file-links; remove the default-profile extension symlink.
 #
-# Two flags (macOS only), each optional and usable together. --chaos-nightly also writes the nightly
+# Three flags (macOS only), each optional and usable together. --chaos-nightly also writes the nightly
 # chaos job: the template install/com.agent-system-2.chaos.plist filled with this checkout, the
 # absolute bun path, $HOME and a PATH of the bun, omp and git directories, written to
 # $HOME/Library/LaunchAgents/com.agent-system-2.chaos.plist and loaded with
-# `launchctl bootstrap gui/$UID` (a loaded copy is booted out first). Its log goes to
+# `launchctl bootstrap gui/$UID` (a loaded copy is booted out first; a failed bootstrap prints the line to run and goes on). Its log goes to
 # $HOME/agent-scratch/agent-system-2.0/chaos/launchd.log. --scratch-sweep writes the daily scratch
 # sweep job the same way: install/com.agent-system-2.scratch-sweep.plist filled with this checkout,
 # the absolute bun path, $HOME and the ledger path, written to
 # $HOME/Library/LaunchAgents/com.agent-system-2.scratch-sweep.plist and loaded; it runs
 # surface/scripts/scratch-sweep.ts at 04:30 local time, logging to
-# $HOME/agent-scratch/agent-system-2.0/scratch-sweep/launchd.log. Each flag's =off form only boots
+# $HOME/agent-scratch/agent-system-2.0/scratch-sweep/launchd.log. --train-tick writes the merge train's
+# tick (PLAN wl-mv8s8srodefytc rev 17.1 D10) the same way: install/com.agent-system-2.train-tick.plist
+# filled with this checkout, the absolute bun path, $HOME, the ledger path, the profile name and a PATH
+# of the gh, bun, omp, git, osascript and ctx directories, written to
+# $HOME/Library/LaunchAgents/com.agent-system-2.train-tick.plist and loaded; it runs
+# surface/scripts/train-tick.ts every 300 s, logging to
+# $HOME/agent-scratch/agent-system-2.0/train-tick/launchd.log. Each flag's =off form only boots
 # that job out and deletes its plist, then exits: it runs right after the arguments are read, before
 # the bun check and every install step, so it needs no bun, writes no ledger and registers nothing
 # (stopping a job never depends on a reinstall succeeding). It fails closed: when launchctl is missing
-# or cannot confirm the job is absent, it says why, keeps the plist and exits 1. The two =off forms
+# or cannot confirm the job is absent, it says why, keeps the plist and exits 1. The =off forms
 # may be given together; an =off form with an installing flag is refused. Without a flag nothing
-# about either job is written, read or run.
+# about its job is written, read or run.
+#
+# --daily-report (macOS only, PLAN wl-mvbcjageg7o2yo § 2.6) writes the daily self-heal report job the same way as
+# --scratch-sweep: install/com.agent-system-2.daily-report.plist filled with this checkout, the absolute bun
+# path, $HOME, the ledger path and the profile name, written to
+# $HOME/Library/LaunchAgents/com.agent-system-2.daily-report.plist and loaded; it runs
+# surface/scripts/daily-report.ts at 07:00 local time, logging to
+# $HOME/agent-scratch/agent-system-2.0/self-heal/launchd.log. --daily-report=off is an =off form like the
+# others: it only boots the job out and deletes its plist, before any install step, and writes nothing else.
+#
+# --drive-backup (macOS only, wl-mvwkt821jx4d6e, jo-issues #300) writes the nightly Google Drive backup's two jobs the
+# same way as --daily-report: install/com.agent-system-2.drive-backup.plist (install/drive-backup/backup-nightly.zsh at
+# 02:30 local time) and install/com.agent-system-2.drive-backup-check.plist (install/drive-backup/check-backup-fresh.zsh
+# at 09:00), each filled with this checkout, the absolute bun path, $HOME, the ledger path and the state dir
+# $HOME/agent-scratch/agent-system-2.0/drive-backup/state (the scripts' own default, where both log), written to
+# $HOME/Library/LaunchAgents and loaded. The nightly job also gets AS2_KEEP_LOCAL: 0 (a local archive is deleted once
+# its Drive copy is proven twice and read back) or 1 (upload and prove, never delete) from this installer's environment;
+# unset or empty, the installed nightly plist's value is kept, and with no nightly plist installed it is 0. Any other
+# value, or an unset one over an installed plist that gives no 0 or 1, refuses the flag. A step line names the value,
+# and any change as `AS2_KEEP_LOCAL <old> -> <new>`, before either job is loaded. The jobs run /usr/bin/sqlite3, /usr/bin/jq (macOS
+# 15 and later) and /usr/bin/perl by those paths, so a missing one refuses the flag. --drive-backup=off is an =off
+# form like the others: it boots both jobs out and deletes both plists, before any install step, and writes nothing else.
+#
+# --control-root=verified (PLAN wl-mvq4edbaf13vnk § 2 "Protect the verifier", R21) registers the train tick's plist
+# (it implies --train-tick) and the profile's OMP extensions from the verified control root,
+# $HOME/.agent-system-2/verified/current, instead of this checkout: the plist's REPO and every path in the rendered
+# profile's extensions: list name that root, through the `current` symlink, so a promotion the runner makes is live
+# without a re-install. Everything else (skills, tiers, launchers, the ledger module) still comes from this checkout.
+# It refuses (exit 2, nothing written) when the root or an extension file under it is missing, or with --train-tick=off.
+# Without it the tick and the extensions come from this checkout, as before.
 #
 # Usage:   bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off]
+#                                  [--train-tick | --train-tick=off]
+#                                  [--daily-report | --daily-report=off]
+#                                  [--drive-backup | --drive-backup=off]
+#                                  [--control-root=verified]
 # Env:     AGENT_SYSTEM_LEDGER_DB   ledger file (default: $HOME/.agent-system-2/ledger.db)
 #          AGENT_SYSTEM_PROFILE     OMP profile name (default: agent-system-2); the profile lives at
 #                                   $HOME/.omp/profiles/<profile>/agent (omp://config-usage.md § Profiles)
-# Exit:    0 installed, or (=off) each named job is confirmed not loaded and its plist is gone
+#          AS2_KEEP_LOCAL           with --drive-backup only: 0 or 1, written into the nightly job; unset or empty
+#                                   keeps the installed nightly job's value (0 when none is installed); any other
+#                                   value refuses the flag
+# Exit:    0 installed and the full doctor passed, or (=off) each named job is confirmed not loaded and its plist is gone
 #          1 other failure (=off: launchctl not on PATH, `launchctl print` failed for a reason other
 #            than "Could not find service", or bootout failed, each with the plist kept; or the
 #            plist removal failed)
 #          2 manifest or profile check failed, an argument other than the flags (or a flag twice, or
 #            an =off form with an installing flag), --chaos-nightly refused: not macOS, or omp or git
-#            not on PATH, or --scratch-sweep refused: not macOS (nothing written)
+#            not on PATH, or --scratch-sweep refused: not macOS, or --train-tick refused: not macOS, gh,
+#            bun, omp, git, osascript or ctx not on PATH, or `gh auth status` failed (nothing written)
+#            (or --daily-report refused: not macOS, or bun not on PATH; nothing written)
+#            (or --drive-backup refused: not macOS, bun not on PATH, /usr/bin/sqlite3, /usr/bin/jq or /usr/bin/perl
+#            missing, AS2_KEEP_LOCAL not 0 or 1, or AS2_KEEP_LOCAL unset and the installed nightly plist gives no
+#            0 or 1; nothing written)
+#            (or --control-root=verified refused: no verified root, an extension missing under it, or --train-tick=off)
 #          3 ledger path refused as synced or network folder (nothing written)
 #          4 the ledger file exists at a schema version other than the supported one (5), e.g. a
 #            version-1 to -4 ledger from before schema v5 (nothing written; no upgrade exists:
 #            move the file aside and re-run to create a new ledger)
+#          5 installed, but the full doctor (the last step) did not exit 0: the failing parts are printed above it with
+#            their fixes, and everything written stays (fix them, then re-run)
 #
 # Order matters: every check runs before anything is written, so a failed install leaves the
 # machine as it found it. Safe to re-run: an existing ledger at the current schema is untouched,
@@ -66,7 +131,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="$REPO/install/manifest.tsv"
 # Directories whose every file must have a manifest row. Listed ahead of the steps that create
 # them so a new directory cannot slip in unchecked.
-MACHINERY_DIRS=(ledger install extensions agents profile skills plugins tiers classifier gates bin surface contract voice)
+MACHINERY_DIRS=(ledger install extensions agents profile skills plugins tiers classifier gates bin surface voice)
 # The one schema file the ledger module applies (ledger/src/index.ts SCHEMA_PATH). The manifest's
 # ledger-schema row must name exactly this file; the init script re-checks it against the module.
 CANONICAL_SCHEMA="ledger/schema.sql"
@@ -81,10 +146,15 @@ LOCAL_BIN="$HOME/.local/bin"
 step() { printf '==> %s\n' "$*"; }
 fail() { printf 'install: FAIL: %s\n' "$1" >&2; exit "${2:-1}"; }
 
-# The two launchd jobs: each off unless its flag names it (empty = do nothing about it at all).
+# The three launchd jobs: each off unless its flag names it (empty = do nothing about it at all).
 CHAOS=""
 SWEEP=""
-USAGE="usage: bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off]"
+TICK=""
+REPORT=""
+DRIVE=""
+CONTROL=""
+USAGE="usage: bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off] [--train-tick | --train-tick=off]"
+USAGE="$USAGE [--daily-report | --daily-report=off] [--drive-backup | --drive-backup=off] [--control-root=verified]"
 for arg in "$@"; do
 	case "$arg" in
 		--chaos-nightly | --chaos-nightly=off)
@@ -93,12 +163,40 @@ for arg in "$@"; do
 		--scratch-sweep | --scratch-sweep=off)
 			[ -z "$SWEEP" ] || fail "$USAGE; the scratch-sweep flag is given twice: $*" 2
 			if [ "$arg" = --scratch-sweep ]; then SWEEP=on; else SWEEP=off; fi ;;
+		--train-tick | --train-tick=off)
+			[ -z "$TICK" ] || fail "$USAGE; the train-tick flag is given twice: $*" 2
+			if [ "$arg" = --train-tick ]; then TICK=on; else TICK=off; fi ;;
+		--daily-report | --daily-report=off)
+			[ -z "$REPORT" ] || fail "$USAGE; the daily-report flag is given twice: $*" 2
+			if [ "$arg" = --daily-report ]; then REPORT=on; else REPORT=off; fi ;;
+		--drive-backup | --drive-backup=off)
+			[ -z "$DRIVE" ] || fail "$USAGE; the drive-backup flag is given twice: $*" 2
+			if [ "$arg" = --drive-backup ]; then DRIVE=on; else DRIVE=off; fi ;;
+		--control-root=verified)
+			[ -z "$CONTROL" ] || fail "$USAGE; the control-root flag is given twice: $*" 2
+			CONTROL=verified ;;
 		*) fail "$USAGE; got: $*" 2 ;;
 	esac
 done
+# The control root: this checkout, or with --control-root=verified the verified root the test runner promotes. The
+# verified root registers the tick, so it implies --train-tick and cannot share a run with --train-tick=off.
+CONTROL_ROOT="$REPO"
+if [ "$CONTROL" = verified ]; then
+	[ "$TICK" != off ] || fail "$USAGE; --control-root=verified registers the train tick, so it cannot be combined with --train-tick=off; got: $*" 2
+	TICK=on
+	CONTROL_ROOT="$HOME/.agent-system-2/verified/current"
+fi
 # An =off form stops its job and exits before any install step, so it cannot share a run with a flag
 # that installs one.
-if { [ "$CHAOS" = off ] || [ "$SWEEP" = off ]; } && { [ "$CHAOS" = on ] || [ "$SWEEP" = on ]; }; then
+if { [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ]; } && { [ "$CHAOS" = on ] || [ "$SWEEP" = on ] || [ "$TICK" = on ]; }; then
+	fail "$USAGE; an =off form stops a job and exits, so it cannot be combined with a flag that installs one; got: $*" 2
+fi
+if { [ "$REPORT" = off ] && { [ "$CHAOS" = on ] || [ "$SWEEP" = on ] || [ "$TICK" = on ]; }; } \
+	|| { [ "$REPORT" = on ] && { [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ]; }; }; then
+	fail "$USAGE; an =off form stops a job and exits, so it cannot be combined with a flag that installs one; got: $*" 2
+fi
+if { [ "$DRIVE" = off ] && { [ "$CHAOS" = on ] || [ "$SWEEP" = on ] || [ "$TICK" = on ] || [ "$REPORT" = on ]; }; } \
+	|| { [ "$DRIVE" = on ] && { [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ] || [ "$REPORT" = off ]; }; }; then
 	fail "$USAGE; an =off form stops a job and exits, so it cannot be combined with a flag that installs one; got: $*" 2
 fi
 
@@ -110,6 +208,22 @@ SWEEP_LABEL="com.agent-system-2.scratch-sweep"
 SWEEP_TEMPLATE="$REPO/install/$SWEEP_LABEL.plist"
 SWEEP_PLIST="$LAUNCH_AGENTS/$SWEEP_LABEL.plist"
 SWEEP_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/scratch-sweep"
+TICK_LABEL="com.agent-system-2.train-tick"
+TICK_TEMPLATE="$REPO/install/$TICK_LABEL.plist"
+TICK_PLIST="$LAUNCH_AGENTS/$TICK_LABEL.plist"
+TICK_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/train-tick"
+REPORT_LABEL="com.agent-system-2.daily-report"
+REPORT_TEMPLATE="$REPO/install/$REPORT_LABEL.plist"
+REPORT_PLIST="$LAUNCH_AGENTS/$REPORT_LABEL.plist"
+REPORT_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/self-heal"
+DRIVE_LABEL="com.agent-system-2.drive-backup"
+DRIVE_TEMPLATE="$REPO/install/$DRIVE_LABEL.plist"
+DRIVE_PLIST="$LAUNCH_AGENTS/$DRIVE_LABEL.plist"
+DRIVE_CHECK_LABEL="com.agent-system-2.drive-backup-check"
+DRIVE_CHECK_TEMPLATE="$REPO/install/$DRIVE_CHECK_LABEL.plist"
+DRIVE_CHECK_PLIST="$LAUNCH_AGENTS/$DRIVE_CHECK_LABEL.plist"
+# The state dir backup-nightly.zsh and check-backup-fresh.zsh default to for this HOME; both jobs log there.
+DRIVE_STATE="$HOME/agent-scratch/agent-system-2.0/drive-backup/state"
 
 # An =off form: stop the job and delete its plist (job_off NAME LABEL PLIST), then exit, before anything
 # else runs. It reads no manifest, needs no bun, and writes nothing but the plist removal. It fails
@@ -141,9 +255,26 @@ job_off() {
 	fi
 	step "$name off: no job loaded, no plist"
 }
-if [ "$CHAOS" = off ] || [ "$SWEEP" = off ]; then
+# The drive backup's two jobs go off together, the nightly job first; each job_off fails closed on its own.
+if [ "$DRIVE" = off ]; then
+	job_off "drive backup" "$DRIVE_LABEL" "$DRIVE_PLIST"
+	job_off "drive backup check" "$DRIVE_CHECK_LABEL" "$DRIVE_CHECK_PLIST"
+	if [ "$REPORT" != off ] && [ "$CHAOS" != off ] && [ "$SWEEP" != off ] && [ "$TICK" != off ]; then
+		step "nothing else was run or written"
+		exit 0
+	fi
+fi
+if [ "$REPORT" = off ]; then
+	job_off "daily report" "$REPORT_LABEL" "$REPORT_PLIST"
+	if [ "$CHAOS" != off ] && [ "$SWEEP" != off ] && [ "$TICK" != off ]; then
+		step "nothing else was run or written"
+		exit 0
+	fi
+fi
+if [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ]; then
 	if [ "$CHAOS" = off ]; then job_off "chaos nightly" "$CHAOS_LABEL" "$CHAOS_PLIST"; fi
 	if [ "$SWEEP" = off ]; then job_off "scratch sweep" "$SWEEP_LABEL" "$SWEEP_PLIST"; fi
+	if [ "$TICK" = off ]; then job_off "train tick" "$TICK_LABEL" "$TICK_PLIST"; fi
 	step "nothing else was run or written"
 	exit 0
 fi
@@ -166,29 +297,50 @@ fill_template() {
 	' "$@"
 }
 
+# The one line a person runs in their own Terminal to load a written plist: an agent shell's `launchctl bootstrap` gets
+# "Bootstrap failed: 5", so install never depends on its own bootstrap (bootstrap_line PLIST).
+bootstrap_line() { printf '==> run this in your own Terminal (zsh): launchctl bootstrap gui/$(id -u) %q\n' "$1"; }
+
 # Write a filled launchd template and (re)load it: load_job NAME LABEL TEMPLATE PLIST LOGDIR NAME=value...
 # launchd keeps the plist a job was bootstrapped with and refuses to bootstrap a label that is already
 # loaded, so a loaded job is booted out before the new plist replaces it; `launchctl print` exits 113
-# for a label that is not loaded. The filled plist must lint before anything is booted out.
+# for a label that is not loaded. The filled plist must lint before anything is booted out. A caller may set
+# LOAD_JOB_NOTE for the call (LOAD_JOB_NOTE=... load_job ...): every failure here ends with it, so a failure can
+# name what an earlier load already changed. A failed bootstrap is not a failure: launchctl's own message stays above,
+# bootstrap_line prints the one line to run, and the install goes on, so the closing doctor reports the job not loaded.
+# LOAD_JOB_STATE says which happened, for the caller's step line.
 load_job() {
-	local name="$1" label="$2" template="$3" plist="$4" logdir="$5" status
+	local name="$1" label="$2" template="$3" plist="$4" logdir="$5" note="${LOAD_JOB_NOTE:-}" status
 	shift 5
 	step "$name: install/${template##*/} -> $plist"
-	mkdir -p "$LAUNCH_AGENTS" "$logdir"
+	mkdir -p "$LAUNCH_AGENTS" "$logdir" || fail "mkdir -p $LAUNCH_AGENTS $logdir exited $?$note" 1
 	fill_template "$template" "$@" >"$plist.tmp.$$" \
-		|| { rm -f "$plist.tmp.$$"; fail "$name job template ${template##*/} could not be filled" 1; }
-	/usr/bin/plutil -lint "$plist.tmp.$$" >/dev/null || { rm -f "$plist.tmp.$$"; fail "the filled $name job plist does not lint" 1; }
+		|| { rm -f "$plist.tmp.$$"; fail "$name job template ${template##*/} could not be filled$note" 1; }
+	/usr/bin/plutil -lint "$plist.tmp.$$" >/dev/null || { rm -f "$plist.tmp.$$"; fail "the filled $name job plist does not lint$note" 1; }
 	if launchctl print "gui/$UID/$label" >/dev/null 2>&1; then
-		launchctl bootout "gui/$UID/$label" || { status=$?; rm -f "$plist.tmp.$$"; fail "launchctl bootout gui/$UID/$label exited $status" 1; }
+		launchctl bootout "gui/$UID/$label" || { status=$?; rm -f "$plist.tmp.$$"; fail "launchctl bootout gui/$UID/$label exited $status$note" 1; }
 	fi
-	mv -f "$plist.tmp.$$" "$plist"
-	launchctl bootstrap "gui/$UID" "$plist" || fail "launchctl bootstrap gui/$UID $plist exited $?" 1
+	mv -f "$plist.tmp.$$" "$plist" || fail "mv -f $plist.tmp.$$ $plist exited $?$note" 1
+	if launchctl bootstrap "gui/$UID" "$plist"; then
+		LOAD_JOB_STATE="loaded"
+	else
+		bootstrap_line "$plist"
+		LOAD_JOB_STATE="written, not loaded (its bootstrap failed: run the line above)"
+	fi
+}
+
+# Whether $HOME is this user's own home directory, read from the user database with dscl, never from $HOME (Bun's
+# os.userInfo().homedir follows $HOME): launchd has one gui/<uid> domain per user, so a job loaded from another HOME (a
+# test's temp HOME) would replace the real one. Sets USER_HOME to dscl's answer (empty when dscl gives none).
+own_home() {
+	USER_HOME="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p')" || USER_HOME=""
+	[ -n "$USER_HOME" ] && [ "$(cd "$HOME" && pwd -P)" = "$(cd "$USER_HOME" 2>/dev/null && pwd -P)" ]
 }
 
 # --chaos-nightly is checked here, before anything is written: launchd is macOS only, and the job's
 # PATH is built from where bun, omp and git are now (launchd's own PATH has none of ~/.bun/bin), so
 # a missing omp or git refuses the flag rather than writing a job that cannot start a session.
-# (The CHAOS_* and SWEEP_* label, template, plist and log names are set above, beside the =off path.)
+# (The CHAOS_*, SWEEP_* and TICK_* label, template, plist and log names are set above, beside the =off path.)
 if [ "$CHAOS" = on ]; then
 	[ "$(uname -s)" = Darwin ] || fail "--chaos-nightly is a launchd job; this is not macOS" 2
 	[ -f "$CHAOS_TEMPLATE" ] || fail "--chaos-nightly: no template at $CHAOS_TEMPLATE" 2
@@ -216,13 +368,116 @@ if [ "$SWEEP" = on ]; then
 	case "$SWEEP_BUN" in /*) ;; *) SWEEP_BUN="$PWD/$SWEEP_BUN" ;; esac
 fi
 
+# --daily-report is checked here too, before anything is written: launchd is macOS only. The job runs bun (absolute)
+# and reads files only, so it needs no omp, git or gh.
+if [ "$REPORT" = on ]; then
+	[ "$(uname -s)" = Darwin ] || fail "--daily-report is a launchd job; this is not macOS" 2
+	[ -f "$REPORT_TEMPLATE" ] || fail "--daily-report: no template at $REPORT_TEMPLATE" 2
+	REPORT_BUN="$(type -P bun)" || fail "--daily-report: bun not found on PATH" 2
+	case "$REPORT_BUN" in /*) ;; *) REPORT_BUN="$PWD/$REPORT_BUN" ;; esac
+fi
+
+# --drive-backup is checked here too, before anything is written: launchd is macOS only. The jobs run bun (absolute, the
+# needs-you writer surface/scripts/drive-backup-notice.ts) and call /usr/bin/sqlite3, /usr/bin/jq and /usr/bin/perl by
+# those paths (jq ships with macOS 15 and later only; Apple marks perl deprecated), so a missing one refuses the flag
+# rather than writing a job whose every night fails. AS2_KEEP_LOCAL comes from this installer's environment when it is 0
+# or 1; unset or empty, it is the installed nightly job's (read from its plist), so a plain reload never changes
+# retention, and only with no nightly plist it is 0. An installed plist that gives no 0 or 1 refuses an unset
+# AS2_KEEP_LOCAL (final review F2): the operator says which retention is meant.
+if [ "$DRIVE" = on ]; then
+	[ "$(uname -s)" = Darwin ] || fail "--drive-backup is a launchd job; this is not macOS" 2
+	[ -f "$DRIVE_TEMPLATE" ] || fail "--drive-backup: no template at $DRIVE_TEMPLATE" 2
+	[ -f "$DRIVE_CHECK_TEMPLATE" ] || fail "--drive-backup: no template at $DRIVE_CHECK_TEMPLATE" 2
+	DRIVE_BUN="$(type -P bun)" || fail "--drive-backup: bun not found on PATH; the jobs' needs-you writer (surface/scripts/drive-backup-notice.ts) runs on it" 2
+	case "$DRIVE_BUN" in /*) ;; *) DRIVE_BUN="$PWD/$DRIVE_BUN" ;; esac
+	for tool in /usr/bin/sqlite3 /usr/bin/jq /usr/bin/perl; do
+		[ -x "$tool" ] || fail "--drive-backup: $tool is missing or not executable; install/drive-backup/backup-nightly.zsh and check-backup-fresh.zsh run it by that path" 2
+	done
+	# The installed nightly job's value: DRIVE_KEEP_WAS is 0 or 1, or DRIVE_KEEP_WAS_ERR says why there is none.
+	DRIVE_KEEP_WAS="" DRIVE_KEEP_WAS_ERR=""
+	if [ -e "$DRIVE_PLIST" ]; then
+		if ! keep_read="$(/usr/bin/plutil -extract EnvironmentVariables.AS2_KEEP_LOCAL raw -expect string -o - "$DRIVE_PLIST" 2>&1)"; then
+			DRIVE_KEEP_WAS_ERR="plutil could not read its EnvironmentVariables.AS2_KEEP_LOCAL as a string ($keep_read)"
+		else
+			case "$keep_read" in
+				0 | 1) DRIVE_KEEP_WAS="$keep_read" ;;
+				*) DRIVE_KEEP_WAS_ERR="its EnvironmentVariables.AS2_KEEP_LOCAL is '$keep_read', not 0 or 1" ;;
+			esac
+		fi
+	fi
+	case "${AS2_KEEP_LOCAL:-}" in
+		0 | 1) DRIVE_KEEP_LOCAL="$AS2_KEEP_LOCAL" DRIVE_KEEP_FROM="set in this installer's environment" ;;
+		"")
+			[ -z "$DRIVE_KEEP_WAS_ERR" ] || fail "--drive-backup: AS2_KEEP_LOCAL is unset, so the installed nightly job's value would be kept, but $DRIVE_PLIST gives none: $DRIVE_KEEP_WAS_ERR; set AS2_KEEP_LOCAL explicitly to 0 (delete a local archive once its Drive copy is proven) or 1 (upload and prove, never delete) and run again; nothing written" 2
+			if [ -n "$DRIVE_KEEP_WAS" ]; then
+				DRIVE_KEEP_LOCAL="$DRIVE_KEEP_WAS" DRIVE_KEEP_FROM="AS2_KEEP_LOCAL unset: kept from the installed $DRIVE_PLIST"
+			else
+				DRIVE_KEEP_LOCAL=0 DRIVE_KEEP_FROM="AS2_KEEP_LOCAL unset: the default"
+			fi ;;
+		*) fail "--drive-backup: AS2_KEEP_LOCAL is '$AS2_KEEP_LOCAL'; it must be unset (keep the installed nightly job's value, or 0 on a new install) or 0 (delete a local archive once its Drive copy is proven) or 1 (upload and prove, never delete); nothing written" 2 ;;
+	esac
+	if [ "$DRIVE_KEEP_LOCAL" = 0 ]; then
+		DRIVE_KEEP_SAYS="a local archive is deleted once its Drive copy is proven twice and read back"
+	else
+		DRIVE_KEEP_SAYS="upload and prove, never delete"
+	fi
+	# The retention step line, printed before either job is loaded: the value, and the change when there is one.
+	if [ -n "$DRIVE_KEEP_WAS_ERR" ]; then
+		DRIVE_KEEP_STEP="AS2_KEEP_LOCAL unreadable -> $DRIVE_KEEP_LOCAL ($DRIVE_KEEP_FROM; the installed $DRIVE_PLIST gave none: $DRIVE_KEEP_WAS_ERR)"
+	elif [ -z "$DRIVE_KEEP_WAS" ]; then
+		DRIVE_KEEP_STEP="AS2_KEEP_LOCAL=$DRIVE_KEEP_LOCAL ($DRIVE_KEEP_FROM; no nightly job installed)"
+	elif [ "$DRIVE_KEEP_WAS" = "$DRIVE_KEEP_LOCAL" ]; then
+		DRIVE_KEEP_STEP="AS2_KEEP_LOCAL=$DRIVE_KEEP_LOCAL, unchanged ($DRIVE_KEEP_FROM)"
+	else
+		DRIVE_KEEP_STEP="AS2_KEEP_LOCAL $DRIVE_KEEP_WAS -> $DRIVE_KEEP_LOCAL ($DRIVE_KEEP_FROM; the installed $DRIVE_PLIST had $DRIVE_KEEP_WAS)"
+	fi
+	DRIVE_KEEP_STEP="drive backup retention: $DRIVE_KEEP_STEP; 0 deletes a local archive once its Drive upload is confirmed (proven on two nights and read back), 1 uploads and proves and never deletes"
+fi
+
+# --train-tick is checked here too, before anything is written (PLAN wl-mv8s8srodefytc rev 17.1 D10 F15): the tick runs gh,
+# launches lanes (bun, omp, git) and notifies (osascript), and the lanes it launches inherit its PATH, so their ctx MCP
+# server (profile/mcp.json) and their exit-time ctx index need ctx on it too. Its PATH is built from where each is now, the
+# way the chaos job's is; a missing tool, or a gh that is not logged in, refuses the flag rather than writing a tick that
+# cannot act.
+if [ "$TICK" = on ]; then
+	[ "$(uname -s)" = Darwin ] || fail "--train-tick is a launchd job; this is not macOS" 2
+	[ -f "$TICK_TEMPLATE" ] || fail "--train-tick: no template at $TICK_TEMPLATE" 2
+	TICK_PATH=""
+	for tool in gh bun omp git osascript ctx; do
+		tool_bin="$(type -P "$tool")" || fail "--train-tick: $tool not found on PATH; the train tick's PATH needs it" 2
+		case "$tool_bin" in /*) ;; *) tool_bin="$PWD/$tool_bin" ;; esac
+		if [ "$tool" = bun ]; then TICK_BUN="$tool_bin"; fi
+		TICK_PATH="${TICK_PATH:+$TICK_PATH:}$(dirname "$tool_bin")"
+	done
+	dirs="$TICK_PATH:/usr/bin:/bin:/usr/sbin:/sbin"
+	TICK_PATH=""
+	while IFS= read -r -d: dir; do
+		case ":$TICK_PATH:" in *":$dir:"*) ;; *) TICK_PATH="${TICK_PATH:+$TICK_PATH:}$dir" ;; esac
+	done <<<"$dirs:"
+	gh_status="$(gh auth status 2>&1)" || fail "--train-tick: \`gh auth status\` failed, so the tick could not read PRs or file alerts: $(printf '%s' "$gh_status" | tail -n 1)" 2
+fi
+
+# --control-root=verified is checked here too, before anything is written: the root must be a checkout the runner
+# promoted, holding the tick script; each extension file under it is checked when the profile is rendered (2b).
+if [ "$CONTROL" = verified ]; then
+	[ -d "$CONTROL_ROOT" ] || fail "--control-root=verified: no verified control root at $CONTROL_ROOT; the test runner creates it after a green, believable main run (PLAN wl-mvq4edbaf13vnk § 2 \"Protect the verifier\"), so run in shadow mode until one exists, then re-run this" 2
+	[ -e "$CONTROL_ROOT/.git" ] || fail "--control-root=verified: $CONTROL_ROOT is not a git checkout (no .git); the runner's promotion did not finish, so check its log, then re-run this" 2
+	[ -f "$CONTROL_ROOT/surface/scripts/train-tick.ts" ] || fail "--control-root=verified: $CONTROL_ROOT has no surface/scripts/train-tick.ts, so the tick could not run from it" 2
+	step "control root: $CONTROL_ROOT (the train tick and the profile's extensions run from it)"
+fi
+
 # ---- 1. read and validate the manifest ------------------------------------------------------
 step "reading manifest $MANIFEST"
 [ -f "$MANIFEST" ] || fail "no manifest at $MANIFEST" 2
-# [[ == ]] honours nocasematch (BASH_ENV can set it); the membership checks below must be exact.
+# Case patterns below must not inherit nocasematch from BASH_ENV.
 shopt -u nocasematch
-# One path per line, wrapped in newlines, so membership is a builtin [[ ]] match: no process per row.
-paths=$'\n'
+# Find the first duplicate with exact string keys, not a scan of a growing path string per row.
+# Leave reporting in the validation loop so an earlier invalid row still wins.
+duplicate_line="$(LC_ALL=C awk -F '\t' '
+	substr($0, 1, 1) == "#" || $0 == "" { next }
+	!header_seen++ { next }
+	++seen["p" $1] == 2 { print NR; exit }
+' "$MANIFEST")"
 rows=0
 header_seen=0
 line_no=0
@@ -245,7 +500,9 @@ while IFS= read -r line || [ -n "$line" ]; do
 		continue
 	fi
 	IFS=$'\t' read -r path kind dest extra <<<"$line"
+	# read collapses TAB whitespace; require the original row to match its three fields exactly.
 	[ -n "${path:-}" ] && [ -n "${kind:-}" ] && [ -n "${dest:-}" ] && [ -z "${extra:-}" ] \
+		&& [ "$line" = "$path"$'\t'"$kind"$'\t'"$dest" ] \
 		|| fail "manifest line $line_no: need exactly three TAB-separated fields: $line" 2
 	[ -f "$REPO/$path" ] || fail "manifest line $line_no: $path does not exist in the repo" 2
 	[ ! -L "$REPO/$path" ] || fail "manifest line $line_no: $path is a symbolic link; machinery artifacts are regular files" 2
@@ -298,8 +555,7 @@ while IFS= read -r line || [ -n "$line" ]; do
 		ledger-module | module | extension | data | test | doc | install) [ "$dest" = "-" ] || fail "manifest line $line_no: kind $kind is used in place; destination must be -" 2 ;;
 		*) fail "manifest line $line_no: unknown kind '$kind' (this installer knows ledger-schema, ledger-module, ledger-init, ledger-backup, ledger-backup-agent, module, extension, tier, profile, skill, skill-asset, launcher, data, test, doc, install)" 2 ;;
 	esac
-	if [[ $paths == *$'\n'"$path"$'\n'* ]]; then fail "manifest line $line_no: duplicate row for $path" 2; fi
-	paths="$paths$path"$'\n'
+	[ "$line_no" != "$duplicate_line" ] || fail "manifest line $line_no: duplicate row for $path" 2
 	rows=$((rows + 1))
 done <"$MANIFEST"
 [ "$header_seen" -eq 1 ] || fail "manifest has no header row" 2
@@ -332,10 +588,19 @@ missing=""
 links=""
 for dir in "${MACHINERY_DIRS[@]}"; do
 	[ -e "$REPO/$dir" ] || [ -L "$REPO/$dir" ] || continue
-	while IFS= read -r file; do
-		rel="${file#"$REPO"/}"
-		[[ $paths == *$'\n'"$rel"$'\n'* ]] || missing="$missing  $rel"$'\n'
-	done < <(find "$REPO/$dir" -type f ! -name '.DS_Store' ! -path '*/node_modules/*' | LC_ALL=C sort)
+	unmanifested="$(find "$REPO/$dir" -type f ! -name '.DS_Store' ! -path '*/node_modules/*' | LC_ALL=C sort |
+		INSTALL_REPO="$REPO" LC_ALL=C awk -F '\t' '
+			FNR == NR { paths["p" $1] = 1; next }
+			{
+				rel = substr($0, length(ENVIRON["INSTALL_REPO"]) + 2)
+				if (!(("p" rel) in paths)) print rel
+			}
+		' "$MANIFEST" -)" || fail "could not check manifest coverage under $dir" 2
+	if [ -n "$unmanifested" ]; then
+		while IFS= read -r rel; do
+			missing="$missing  $rel"$'\n'
+		done <<<"$unmanifested"
+	fi
 	while IFS= read -r link; do
 		links="$links  ${link#"$REPO"/} -> $(readlink "$link")"$'\n'
 	done < <(find "$REPO/$dir" -type l ! -path '*/node_modules/*' | LC_ALL=C sort)
@@ -358,16 +623,30 @@ step "no unmanifested files, no symbolic links"
 # two skill rows share a name, when skills.includeSkills is not exactly the names of the manifest's
 # `skill` rows, or when a `skill` row's SKILL.md has no frontmatter description (omp://skills.md:
 # the native provider drops such a skill, and the allowlist would then name a skill that never
-# loads).
+# loads). With --control-root=verified, {repo} in the extensions: block (to the next top-level key) becomes the
+# verified control root instead, and the render is also refused when an extension does not name a file under it.
 step "profile: rendering $CONFIG_ROW for profile $PROFILE_NAME"
 set +e
-RENDERED="$(bun -e '
+RENDERED="$(AS2_CONTROL_ROOT="$CONTROL_ROOT" bun -e '
 	const [template, repo, ...names] = process.argv.slice(1);
+	const control = process.env.AS2_CONTROL_ROOT;
 	const fail = (m) => { console.error(`install: profile: ${m}`); process.exit(1); };
-	const text = (await Bun.file(template).text()).split("{repo}").join(repo);
+	if (!control) fail("AS2_CONTROL_ROOT is not set (install.sh passes the control root)");
+	const raw = await Bun.file(template).text();
+	const block = /^extensions:[^\n]*\n(?:(?:[ \t#][^\n]*)?\n)*/m.exec(raw);
+	const fill = (s, root) => s.split("{repo}").join(root);
+	const text = block ? fill(raw.slice(0, block.index), repo) + fill(block[0], control) + fill(raw.slice(block.index + block[0].length), repo) : fill(raw, repo);
 	if (text.includes("{repo}")) fail("a {repo} survived the render");
 	let doc;
 	try { doc = Bun.YAML.parse(text); } catch (e) { fail(`rendered ${template} is not YAML: ${e.message}`); }
+	if (control !== repo) {
+		const exts = Array.isArray(doc?.extensions) ? doc.extensions : null;
+		if (!exts || exts.length === 0) fail(`--control-root=verified: ${template} has no extensions: list to point at ${control}`);
+		for (const p of exts) {
+			if (typeof p !== "string" || !p.startsWith(`${control}/`)) fail(`--control-root=verified: extension ${JSON.stringify(p)} is not under the control root ${control}`);
+			if (!(await Bun.file(p).exists())) fail(`--control-root=verified: extension ${p} does not exist in the verified control root; promote a commit that has it, then re-run`);
+		}
+	}
 	const skills = doc && typeof doc === "object" ? doc.skills : undefined;
 	if (!skills || typeof skills !== "object") fail(`${template} has no skills: block`);
 	const dirs = skills.customDirectories;
@@ -403,6 +682,16 @@ set -e
 [ "$status" -eq 0 ] || fail "profile render refused" 2
 step "profile ok: includeSkills matches the $(printf '%s' "$skill_names" | grep -c .) skill rows; every skill has a description"
 
+# The tracing switch survives a re-install (wl-mv65t5d34lts00 PLAN.md § 8.1): the installed profile's
+# observability.phoenix, as written, replaces the template's in the render, so `as2 phoenix off` stays off and
+# only a fresh profile starts at the template's all. One line says which; a render that does not take the value
+# alone is refused like any other render.
+set +e
+RENDERED="$(printf '%s\n' "$RENDERED" | bun "$REPO/surface/scripts/tracing.ts" carry "$PROFILE_DIR/config.yml")"
+status=$?
+set -e
+[ "$status" -eq 0 ] || fail "profile render refused (tracing switch carry exited $status)" 2
+
 # The providers this profile routes to, for the login line printed after a successful install
 # (section 7): every model named in the rendered task.agentModelOverrides and modelRoles, in that
 # order, so the line follows the tier table rather than a second copy of it. Read here, before
@@ -417,12 +706,31 @@ PROVIDERS="$(printf '%s' "$RENDERED" | bun -e '
 ')" || fail "profile render refused" 2
 
 # The profile's MCP config (profile/mcp.json) must be an MCP config OMP will read: a JSON object
-# whose mcpServers names the ctx server. Checked here, before anything is written.
-bun -e '
-	let doc;
-	try { doc = JSON.parse(await Bun.file(process.argv[1]).text()); } catch (e) { console.error(`install: profile: ${process.argv[1]} is not JSON: ${e.message}`); process.exit(1); }
-	if (!doc?.mcpServers?.ctx?.command) { console.error(`install: profile: ${process.argv[1]} has no mcpServers.ctx with a command`); process.exit(1); }
-' "$REPO/$MCP_ROW" || fail "profile mcp.json refused" 2
+# whose mcpServers names the ctx server. The repo owns only the servers that file names: they are
+# merged into the installed $PROFILE_DIR/mcp.json, replacing an installed server of the same name,
+# and every other installed server and top-level setting is kept (a server added by hand, say).
+# With no installed file the repo's file is the result. Both are checked and the merge is computed
+# here, before anything is written, so an installed file that is not a JSON object stops the install
+# with nothing changed. A server later dropped from profile/mcp.json stays installed until removed by hand.
+set +e
+MCP_MERGED="$(bun -e '
+	const [template, live] = process.argv.slice(1);
+	const fail = (m) => { console.error(`install: profile: ${m}`); process.exit(1); };
+	const read = async (p) => { try { return JSON.parse(await Bun.file(p).text()); } catch (e) { fail(`${p} is not JSON: ${e.message}`); } };
+	const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+	const doc = await read(template);
+	if (!doc?.mcpServers?.ctx?.command) fail(`${template} has no mcpServers.ctx with a command`);
+	let out = doc;
+	if (await Bun.file(live).exists()) {
+		const cur = await read(live);
+		if (!isObject(cur) || (cur.mcpServers !== undefined && !isObject(cur.mcpServers))) fail(`${live} is not a JSON object with an mcpServers object; fix it or move it aside, then re-run`);
+		out = { ...cur, mcpServers: { ...(cur.mcpServers ?? {}), ...doc.mcpServers } };
+	}
+	process.stdout.write(JSON.stringify(out, null, 2));
+' "$REPO/$MCP_ROW" "$PROFILE_DIR/mcp.json")"
+status=$?
+set -e
+[ "$status" -eq 0 ] || fail "profile mcp.json refused" 2
 
 # ---- 3. install the ledger ---------------------------------------------------------------------
 # ledger-init creates or verifies the ledger from the ledger-schema row. It refuses a schema file
@@ -460,9 +768,8 @@ if [ "$(uname -s)" = Darwin ]; then
 		>"$PLIST.tmp.$$" || { rm -f "$PLIST.tmp.$$"; fail "backup job template $AGENT_ROW could not be filled" 1; }
 	/usr/bin/plutil -lint "$PLIST.tmp.$$" >/dev/null || { rm -f "$PLIST.tmp.$$"; fail "the filled backup job plist does not lint" 1; }
 	mv -f "$PLIST.tmp.$$" "$PLIST"
-	step "backup job written, not loaded. To load it (and after any re-install, unload first):"
-	printf '    launchctl bootstrap gui/$(id -u) %q\n' "$PLIST"
-	printf '  to unload:\n    launchctl bootout gui/$(id -u)/com.agent-system-2.ledger-backup\n'
+	step "backup job written, not loaded (after a re-install, unload the old one first: launchctl bootout gui/\$(id -u)/com.agent-system-2.ledger-backup)"
+	bootstrap_line "$PLIST"
 else
 	step "backup job: not macOS; no periodic job written (systemd timer not built yet); the open-time copy is the only schedule"
 fi
@@ -470,20 +777,37 @@ fi
 # ---- 5. the OMP profile (profile + tier rows) ---------------------------------------------------
 # Written last, after the ledger steps, so a refused ledger leaves no half-profile behind. The
 # tier files are symbolic links into the checkout: a tier edit is live without a re-install, and
-# nothing under the profile is a second copy to drift. Re-runs rewrite the same content.
+# nothing under the profile is a second copy to drift. Re-runs rewrite the same content, except
+# mcp.json, which keeps installed servers and settings the repo does not own (step 2).
 step "profile: $PROFILE_DIR"
 mkdir -p "$PROFILE_DIR/agents"
 printf '%s' "$RENDERED" >"$PROFILE_DIR/config.yml.tmp.$$" || { rm -f "$PROFILE_DIR/config.yml.tmp.$$"; fail "could not write $PROFILE_DIR/config.yml" 1; }
 mv -f "$PROFILE_DIR/config.yml.tmp.$$" "$PROFILE_DIR/config.yml"
 cp -f "$REPO/$MODELS_ROW" "$PROFILE_DIR/models.yml"
-cp -f "$REPO/$MCP_ROW" "$PROFILE_DIR/mcp.json"
-step "profile written: config.yml (rendered from $CONFIG_ROW), models.yml (from $MODELS_ROW), mcp.json (from $MCP_ROW)"
+printf '%s\n' "$MCP_MERGED" >"$PROFILE_DIR/mcp.json.tmp.$$" || { rm -f "$PROFILE_DIR/mcp.json.tmp.$$"; fail "could not write $PROFILE_DIR/mcp.json" 1; }
+mv -f "$PROFILE_DIR/mcp.json.tmp.$$" "$PROFILE_DIR/mcp.json"
+step "profile written: config.yml (rendered from $CONFIG_ROW), models.yml (from $MODELS_ROW), mcp.json (the servers of $MCP_ROW merged into the installed file; other installed servers and settings kept)"
 while IFS= read -r tier; do
 	[ -n "$tier" ] || continue
 	ln -sfn "$REPO/$tier" "$PROFILE_DIR/agents/${tier##*/}"
 	step "tier linked: $PROFILE_DIR/agents/${tier##*/} -> $REPO/$tier"
 done <<<"$tier_rows"
 step "profile ready: omp --profile $PROFILE_NAME (or OMP_PROFILE=$PROFILE_NAME); skills load from $REPO/skills"
+
+# ---- 5b. file links in default-profile seats and herdr -------------------------------------------
+# The default profile auto-discovers this extension; as2 itself loads it through gates/index.ts.
+# Like tier links, this points at the checkout that `as2 install` runs from, never a lane copy
+# unless somebody explicitly runs install there. No herdr command runs without a herdr on PATH.
+DEFAULT_EXTENSIONS="$HOME/.omp/agent/extensions"
+mkdir -p "$DEFAULT_EXTENSIONS"
+ln -sfn "$REPO/gates/extensions/open-links.ts" "$DEFAULT_EXTENSIONS/as2-open-links.ts"
+step "default-profile extension linked: $DEFAULT_EXTENSIONS/as2-open-links.ts -> $REPO/gates/extensions/open-links.ts"
+if command -v herdr >/dev/null 2>&1; then
+	herdr plugin link "$REPO/install/herdr-file-links" || fail "herdr plugin link exited $?" 1
+	step "herdr file-link handler linked: as2.file-links"
+else
+	step "note: herdr is not on PATH; file-link handler not registered (install herdr, then re-run this script)"
+fi
 
 # ---- 6. the launcher (launcher rows) ------------------------------------------------------------
 # A symbolic link into the checkout, like the tier files: the script resolves its own real path to
@@ -526,7 +850,7 @@ fi
 if [ "$CHAOS" = on ]; then
 	load_job "chaos nightly" "$CHAOS_LABEL" "$CHAOS_TEMPLATE" "$CHAOS_PLIST" "$CHAOS_LOG_DIR" \
 		"BUN=$CHAOS_BUN" "HOME=$HOME" "REPO=$REPO" "PATH=$CHAOS_PATH"
-	step "chaos nightly loaded: fires every quarter hour, runs once a night at 03:00 America/Los_Angeles; log $CHAOS_LOG_DIR/launchd.log; turn off with: bash install/install.sh --chaos-nightly=off"
+	step "chaos nightly $LOAD_JOB_STATE: fires every quarter hour, runs once a night at 03:00 America/Los_Angeles; log $CHAOS_LOG_DIR/launchd.log; turn off with: bash install/install.sh --chaos-nightly=off"
 fi
 
 # ---- 6d. the daily scratch sweep (--scratch-sweep only) -------------------------------------------
@@ -535,9 +859,127 @@ fi
 if [ "$SWEEP" = on ]; then
 	load_job "scratch sweep" "$SWEEP_LABEL" "$SWEEP_TEMPLATE" "$SWEEP_PLIST" "$SWEEP_LOG_DIR" \
 		"BUN=$SWEEP_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS"
-	step "scratch sweep loaded: runs daily at 04:30 local time; reports and log in $SWEEP_LOG_DIR; turn off with: bash install/install.sh --scratch-sweep=off"
+	step "scratch sweep $LOAD_JOB_STATE: runs daily at 04:30 local time; reports and log in $SWEEP_LOG_DIR; turn off with: bash install/install.sh --scratch-sweep=off"
 fi
 
+# ---- 6d2. the merge train's tick (--train-tick only) ----------------------------------------------
+# Only with the flag, the same way as 6c. The job carries the ledger this install wrote and the profile it rendered, so the
+# tick reads and writes that ledger and the lanes it launches run on that profile. Reversal: bash install/install.sh --train-tick=off.
+if [ "$TICK" = on ]; then
+	load_job "train tick" "$TICK_LABEL" "$TICK_TEMPLATE" "$TICK_PLIST" "$TICK_LOG_DIR" \
+		"BUN=$TICK_BUN" "HOME=$HOME" "REPO=$CONTROL_ROOT" "LEDGER_DB=$LEDGER_ABS" "PROFILE=$PROFILE_NAME" "PATH=$TICK_PATH"
+	step "train tick $LOAD_JOB_STATE from $CONTROL_ROOT: runs every 5 minutes; log $TICK_LOG_DIR/launchd.log; turn off with: bash install/install.sh --train-tick=off"
+fi
+
+# ---- 6d3. the daily self-heal report (--daily-report only) ---------------------------------------
+# Only with the flag, the same way as 6c. The job carries the ledger this install wrote and the profile it rendered, so the
+# report reads that ledger and that profile's sessions. Reversal: bash install/install.sh --daily-report=off.
+if [ "$REPORT" = on ]; then
+	load_job "daily report" "$REPORT_LABEL" "$REPORT_TEMPLATE" "$REPORT_PLIST" "$REPORT_LOG_DIR" \
+		"BUN=$REPORT_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS" "PROFILE=$PROFILE_NAME"
+	step "daily report $LOAD_JOB_STATE: runs daily at 07:00 local time; reports and log in $REPORT_LOG_DIR; turn off with: bash install/install.sh --daily-report=off"
+fi
+
+# ---- 6d4. the nightly Google Drive backup (--drive-backup only) -----------------------------------
+# Only with the flag, the same way as 6c: the nightly job and its 9 AM check, both carrying the ledger this install wrote
+# (the needs-you writer's) and logging to the state dir the scripts default to. The retention line comes before either load,
+# and a failed check load names the nightly job it leaves loaded and its AS2_KEEP_LOCAL. Reversal: bash install/install.sh --drive-backup=off.
+if [ "$DRIVE" = on ]; then
+	step "$DRIVE_KEEP_STEP"
+	load_job "drive backup" "$DRIVE_LABEL" "$DRIVE_TEMPLATE" "$DRIVE_PLIST" "$DRIVE_STATE" \
+		"BUN=$DRIVE_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS" "STATE=$DRIVE_STATE" "KEEP_LOCAL=$DRIVE_KEEP_LOCAL"
+	drive_state="$LOAD_JOB_STATE"
+	LOAD_JOB_NOTE="; the nightly job $DRIVE_LABEL is $drive_state from $DRIVE_PLIST with AS2_KEEP_LOCAL=$DRIVE_KEEP_LOCAL ($DRIVE_KEEP_SAYS), but the check job $DRIVE_CHECK_LABEL did not load; fix the cause and run bash install/install.sh --drive-backup again (AS2_KEEP_LOCAL unset keeps $DRIVE_KEEP_LOCAL), or turn both off with bash install/install.sh --drive-backup=off" \
+		load_job "drive backup check" "$DRIVE_CHECK_LABEL" "$DRIVE_CHECK_TEMPLATE" "$DRIVE_CHECK_PLIST" "$DRIVE_STATE" \
+		"BUN=$DRIVE_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS" "STATE=$DRIVE_STATE"
+	[ "$drive_state" = loaded ] && [ "$LOAD_JOB_STATE" = loaded ] || drive_state="nightly job $drive_state, check job $LOAD_JOB_STATE"
+	step "drive backup $drive_state: backup-nightly.zsh runs nightly at 02:30 and check-backup-fresh.zsh daily at 09:00 local time; AS2_KEEP_LOCAL=$DRIVE_KEEP_LOCAL ($DRIVE_KEEP_SAYS); state and logs in $DRIVE_STATE; turn off with: bash install/install.sh --drive-backup=off"
+fi
+
+# ---- 6e. Phoenix, on by default (wl-mv65t5d34lts00 PLAN.md § 8.1) ------------------------------------
+# Phoenix, the local trace UI for as2's OMP spans: on macOS, unless observability.phoenix is off,
+# install/phoenix-agent.sh on (idempotent: it rewrites the same files and reloads the job). Only when $HOME is
+# this user's own home directory (own_home, above): launchd has one gui/<uid> domain per user, so an install into another
+# HOME (a test's temp HOME) must never boot out the real job or load one pointing into that directory
+# (phoenix-agent.sh refuses it too). A failing `on` (no phoenix uv tool, launchctl refused, not healthy in time)
+# is reported with the retry command and does not fail the install: with Phoenix down every omp drops its spans
+# silently (PLAN.md § 4). Reversal: as2 phoenix off, then bash install/phoenix-agent.sh off.
+if [ "$(uname -s)" = Darwin ]; then
+	phoenix_value="$(printf '%s\n' "$RENDERED" | bun -e '
+		const p = Bun.YAML.parse(await Bun.stdin.text())?.observability?.phoenix;
+		process.stdout.write(Array.isArray(p) ? `[${p.join(", ")}]` : String(p));
+	')" || fail "the rendered profile could not be read back for observability.phoenix" 1
+	if [ "$phoenix_value" = off ]; then
+		step "Phoenix: observability.phoenix is off, so the LaunchAgent is neither installed nor changed (to turn it on: as2 phoenix all, then bash $REPO/install/phoenix-agent.sh on)"
+	elif ! own_home; then
+		step "Phoenix: HOME ($HOME) is not this user's home directory (${USER_HOME:-unknown}), so the LaunchAgent is not installed from this run (launchd has one domain per user)"
+	elif bash "$REPO/install/phoenix-agent.sh" on; then
+		step "Phoenix: running on http://127.0.0.1:6006 for observability.phoenix: $phoenix_value (status: bash $REPO/install/phoenix-agent.sh status)"
+	else
+		status=$?
+		step "note: Phoenix did not start (phoenix-agent.sh on exited $status; the reason is above); as2 runs without it and its omp processes drop their spans; retry: bash $REPO/install/phoenix-agent.sh on"
+	fi
+fi
+
+# ---- 6f. the doctor job (PLAN wl-mvwks11ye3x9zu, install.sh F8) ---------------------------------------
+# macOS, and only when $HOME is this user's own home (own_home, the Phoenix rule in 6e): install/com.agent-system-2.doctor.plist
+# filled and loaded like the flag jobs, running surface/scripts/doctor.ts in its after-restart mode at load and every 600 s.
+# Its PATH holds the directory of each name the doctor runs by name (the doctor row's pathNames in JOB_INVENTORY,
+# surface/src/doctor.ts, read here so the two cannot drift), as resolved now, then the system directories. A name not
+# found is left off with a note, and the closing doctor's deps:doctor part fails until it is installed and install re-run.
+# Reversal: launchctl bootout gui/$(id -u)/com.agent-system-2.doctor, then delete $HOME/Library/LaunchAgents/com.agent-system-2.doctor.plist.
+DOCTOR_LABEL="com.agent-system-2.doctor"
+DOCTOR_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/doctor"
+if [ "$(uname -s)" != Darwin ]; then
+	step "doctor job: not macOS; no launchd job written"
+elif ! own_home; then
+	step "doctor job: HOME ($HOME) is not this user's home directory (${USER_HOME:-unknown}), so the doctor job is not installed from this run (launchd has one domain per user)"
+else
+	doctor_names="$(bun -e '
+		const { JOB_INVENTORY } = await import(process.argv[1]);
+		const row = JOB_INVENTORY.find((r) => r.name === "doctor");
+		if (!row) { console.error(`install: ${process.argv[1]} has no doctor row in JOB_INVENTORY`); process.exit(1); }
+		console.log(row.pathNames.join("\n"));
+	' "$REPO/surface/src/doctor.ts")" || fail "the doctor job's PATH names could not be read from $REPO/surface/src/doctor.ts (JOB_INVENTORY)" 1
+	DOCTOR_BUN="$(type -P bun)"
+	case "$DOCTOR_BUN" in /*) ;; *) DOCTOR_BUN="$PWD/$DOCTOR_BUN" ;; esac
+	dirs=""
+	doctor_missing=""
+	while IFS= read -r tool; do
+		[ -n "$tool" ] || continue
+		if tool_bin="$(type -P "$tool")"; then
+			case "$tool_bin" in /*) ;; *) tool_bin="$PWD/$tool_bin" ;; esac
+			dirs="${dirs:+$dirs:}$(dirname "$tool_bin")"
+		else
+			doctor_missing="$doctor_missing $tool"
+		fi
+	done <<<"$doctor_names"
+	# The tool directories first, then the system ones; each directory once, in first-seen order.
+	dirs="${dirs:+$dirs:}/usr/bin:/bin:/usr/sbin:/sbin"
+	DOCTOR_PATH=""
+	while IFS= read -r -d: dir; do
+		case ":$DOCTOR_PATH:" in *":$dir:"*) ;; *) DOCTOR_PATH="${DOCTOR_PATH:+$DOCTOR_PATH:}$dir" ;; esac
+	done <<<"$dirs:"
+	[ -z "$doctor_missing" ] || step "note: doctor job: not found on PATH:$doctor_missing; the job's PATH lacks them, and as2 doctor's deps:doctor part fails until each is installed and this script re-run"
+	load_job "doctor" "$DOCTOR_LABEL" "$REPO/install/$DOCTOR_LABEL.plist" "$LAUNCH_AGENTS/$DOCTOR_LABEL.plist" "$DOCTOR_LOG_DIR" \
+		"BUN=$DOCTOR_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS" "PROFILE=$PROFILE_NAME" "PATH=$DOCTOR_PATH"
+	step "doctor job $LOAD_JOB_STATE: as2 doctor --after-restart at load and every 10 minutes; log $DOCTOR_LOG_DIR/launchd.log"
+fi
+
+# ---- 6g. the full doctor, the last check (PLAN wl-mvwks11ye3x9zu, install.sh F8) ---------------------------
+# Every part (surface/scripts/doctor.ts, default mode) against the ledger and profile this run wrote, its output shown.
+# Install is complete only when it exits 0; on 1 (a part failed) or 2 (a bad argument or the doctor's own crash) the
+# install is incomplete and exits 5, keeping everything written above: fix what the doctor names, then re-run.
+step "as2 doctor: checking every part (bun $REPO/surface/scripts/doctor.ts)"
+set +e
+AGENT_SYSTEM_LEDGER_DB="$LEDGER_ABS" AGENT_SYSTEM_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/doctor.ts"
+status=$?
+set -e
+if [ "$status" -ne 0 ]; then
+	step "install incomplete: as2 doctor found failing parts (above)"
+	[ "$status" -eq 1 ] || step "note: as2 doctor exited $status (2 is a bad argument or the doctor's own crash; its error is above)"
+	exit 5
+fi
 step "install complete: ledger at $LEDGER_DB"
 
 # ---- 7. provider login, once per profile ---------------------------------------------------------

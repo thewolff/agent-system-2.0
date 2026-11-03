@@ -80,9 +80,9 @@ extensions:
   # one-liner, Jo's one-word flips, decision-log read/render (SPEC-2.0.md § A1.2, § A3, § B3,
   # § B7, § B13.1). Inert unless AGENT_SYSTEM_ROLE=orchestrator on a top-level session. It injects
   # the voice document {repo}/voice/VOICE.md (DESIGN-2.0.md C2.1) into the orchestrator's system
-  # prompt; AGENT_SYSTEM_VOICE overrides the path. The owned output-types contract the gates inject
-  # (row 2) is {repo}/contract/output-types.md. Listed BEFORE the gates: its wake-owed refusal is a
-  # tool_call block, and a block from a handler loaded after the gates lands after the M4b fence
+  # prompt; AGENT_SYSTEM_VOICE overrides the path. The output-types contract the gates inject (row 2)
+  # is the vendored public plugin's {repo}/plugins/output-types/skills/output-types/reference.md
+  # (plugins/VENDOR.md). Listed BEFORE the gates: its wake-owed refusal is a tool_call block, and a block from a handler loaded after the gates lands after the M4b fence
   # has already returned its bash wrapper, which the fence records as a bypass and then refuses
   # every later bash call (gates/src/fence.ts bypassReason). A refusal before the gates ends the
   # chain before the wrapper, as the gates' own rows do.
@@ -99,33 +99,36 @@ extensions:
   # M3: pre-dispatch classifier — brief → kind → tier → cap → model (SPEC-2.0.md § A1.3).
   - "{repo}/classifier/extension.ts"
 
-  # Jo's i-have-audhd and ask-graham plugins, vendored from jo-wolff-plugins at a pin
-  # (plugins/VENDOR.md, which carries the clash check). plugins/index.ts loads both OMP adapters only
-  # when AGENT_SYSTEM_ROLE=orchestrator: lane prompts arrive as rpc `input`, which would get
-  # ask-graham's every-idea nudge, and a lane's reader is the orchestrator, not Jo. Last in the list:
-  # OMP returns the first session_stop block, so the surface's and the gates' blocks run first, and
-  # neither plugin has a tool_call handler, so the fence order above is unaffected.
-  # Reversal: delete the line (and the two plugin skill dirs and names below).
+  # Jo's i-have-audhd, ask-graham and paired-coding plugins, vendored from jo-wolff-plugins at one pin
+  # (plugins/VENDOR.md, which carries the clash check). plugins/index.ts loads i-have-audhd and
+  # ask-graham in the orchestrator and in every lane, and paired-coding only in a by-hand lane
+  # (AGENT_SYSTEM_ROLE=lane with AGENT_SYSTEM_BY_HAND=1). A hand runs none of them: OMP rebinds this
+  # extension into a subagent with the parent's env still set, so the loader decides by session
+  # context at session_start (ctx.agent.kind "sub", or the gates' parent-session check). Last in the
+  # list: OMP returns the first session_stop block, so the surface's and the gates' blocks run first,
+  # and the gates' tool_call checks run before paired-coding's.
+  # Reversal: delete the line (and the three plugin skill dirs and names below).
   - "{repo}/plugins/index.ts"
 
-# The same two plugins installed through `omp plugin install` (Jo's default profile, 2026-10-14) live
-# in OMP's root plugin dir, ~/.omp/plugins, which every profile reads (pi-utils dirs.ts getPluginsDir:
-# rootSubdir, not the profile's), so without this they load into every as2 session, lanes
+# The same three plugins installed through `omp plugin install` (Jo's default profile) live in OMP's
+# root plugin dir, ~/.omp/plugins, which every profile reads (pi-utils dirs.ts getPluginsDir:
+# rootSubdir, not the profile's), so without this they load into every as2 session, lanes and hands
 # included, unpinned and beside plugins/index.ts (VENDOR.md clash C11). OMP skips a discovered
 # extension whose `extension-module:<file name>` is listed here (extensibility/extensions/loader.ts
 # discoverExtensionPaths isDisabledName); configured paths above are not filtered by it.
-# Reversal: delete these two entries (the marketplace copies then load in every as2 session again).
+# Reversal: delete these entries (the marketplace copies then load in every as2 session again).
 disabledExtensions:
   - "extension-module:i-have-audhd-omp"
   - "extension-module:ask-graham-omp"
+  - "extension-module:paired-coding-omp"
 
 
-# ── Skills (DESIGN-2.0.md § C6.1: 22 rows; MIGRATION.md M6; skills/VENDOR.md; plus the 2 vendored
+# ── Skills (DESIGN-2.0.md § C6.1: 22 rows; MIGRATION.md M6; skills/VENDOR.md; plus the 3 vendored
 #    plugin skills, plugins/VENDOR.md) ──
 # The checkout's skills/ and the vendored plugins' skills/ dirs are the only skill sources: the
 # providers that would pull skills from ~/.claude, ~/.codex, ~/.agents, the profile's own
 # agent/skills, or the working directory are off (extensibility/skills.ts loadSkills
-# isSourceEnabled), and includeSkills names the 24 manifest `skill` rows exactly (omp://skills.md:
+# isSourceEnabled), and includeSkills names the 25 manifest `skill` rows exactly (omp://skills.md:
 # includeSkills is an allowlist; empty means all). The installer refuses a render whose list differs
 # from the manifest's `skill` rows, or whose customDirectories is not <repo>/skills followed by the
 # plugin skill dirs that hold a `skill` row. Reversal: an empty includeSkills with the providers back
@@ -143,6 +146,7 @@ skills:
     - "{repo}/skills"
     - "{repo}/plugins/ask-graham/skills"
     - "{repo}/plugins/i-have-audhd/skills"
+    - "{repo}/plugins/paired-coding/skills"
   includeSkills:
     - accessibility
     - api-and-interface-design
@@ -160,6 +164,7 @@ skills:
     - impeccable
     - interview-me
     - observability-and-instrumentation
+    - paired-coding
     - performance-optimization
     - research
     - resolving-merge-conflicts
@@ -180,6 +185,10 @@ skills:
 
 modelRoles:
   judge: typesafe/jev-1.13.0
+  # Jo 2026-10-26 (in-mvplvhx6h1c35s): an unnamed lane and Ilex start on Opus by setting, not by OMP's
+  # provider-default order; a lane Jo pinned with `lane-model:` passes --model and is unaffected
+  # (surface/src/launch.ts laneArgv).
+  default: anthropic/claude-opus-5-5
 retry:
   fallbackChains:
     judge: []
@@ -198,12 +207,25 @@ retry:
 # classifier keeps only the usable entries of the classified, capped tier's row whose lab is the lab
 # of the lane's current model, falls back only between those, and refuses the dispatch when none is
 # usable; it never falls to another lab's entry. It refuses a task result from a hand that ran
-# outside the entries it was given (classifier/extension.ts). Reviews still take the other labs'
-# entries of the row, in this order (below, and SPEC-2.0.md § B4).
+# outside the entries it was given (classifier/extension.ts).
+# Reviews normally take other labs' entries of the tier row (below, and SPEC-2.0.md § B4).
+# Temporary dated exception (Jo, 2026-10-29, input in-mvtur7tlze7r5o): until
+# 2026-10-31T06:00:00-07:00 (Saturday, 6 AM PDT), an OpenAI lane's review uses only
+# openai-codex entries from its review row, even when the workload has mixed Anthropic and
+# OpenAI builder history. It runs same-lab; there is no cross-lab park for this exception.
+# If no usable Codex entry remains, refuse visibly rather than widening to another provider.
+# At the exact end instant the exception is inactive and prior review routing resumes
+# automatically; builds continue to follow the lane lab throughout. Running classifier
+# processes must restart to load the code change. Deep review OpenAI substitution remains
+# the strong-row rule below; no tier selector is changed.
 # Row 1 of each tier is the ruled Anthropic pin (SPEC-2.0.md § A1.3; .omp/agents/*.md:4). Rows 2-3
 # (openai-codex, moonshot) are the same tier on the other providers, approved as written by Jo
 # 2026-09-28. Standard's row 1 is anthropic/claude-sonnet-5-5 (Jo, 2026-09-29). Row 3 moved from
 # kimi-code to moonshot (Jo, in-muq3zh77r02g3k).
+# The moonshot row-3 entries are removed until Kimi is paid again (Jo, 2026-10-26,
+# in-mvplvhx6h1c35s; the Moonshot account is suspended for insufficient balance). While
+# classifier/src/lab.ts KIMI_OUT_RULE is active (ends 2026-11-01T00:00-07:00), its rowOmission treats
+# a row with no kimi entry as Kimi out. migration/items/kimi-off-tier-rows-until-paid.md restores them.
 # Every provider in a row must be in the provider → lab map in classifier/src/lab.ts: a build is
 # restricted to its lane's lab by that map, and a review is routed to labs other than the
 # builder's (SPEC-2.0.md § B4, "Amended 2026-10-01 — cross-lab review"); a review whose row names a
@@ -211,29 +233,24 @@ retry:
 task:
   agentModelOverrides:
     fast:
-      - anthropic/claude-haiku-4-5
+      - anthropic/claude-haiku-5-5
       - openai-codex/gpt-5.6-luna
-      - moonshot/kimi-k2.7-code-highspeed
     standard:
       - anthropic/claude-sonnet-5-5
       - openai-codex/gpt-6-luna
-      - moonshot/kimi-k2.5
     strong:
       - anthropic/claude-opus-5-5
       - openai-codex/gpt-6.1-sol
-      - moonshot/kimi-k2.7-code
-    # deep's OpenAI entry is not used for reviews: classifier/src/lab.ts REVIEW_ROW_FROM sends a
-    # deep review's OpenAI reviewer to the strong row via reviewRow (Jo, 2026-10-12,
-    # in-mv5qfm8910ycjk), until the review-cost framework workload lands or Jo says otherwise. The
-    # strong row's OpenAI entry is gpt-6.1-sol (Jo, 2026-10-14, in-mv8qzqym1ihmv4: it replaced
-    # gpt-6-sol), so those reviews run gpt-6.1-sol.
+    # Deep reviews substitute the OpenAI reviewer from this strong row (Jo, 2026-10-12,
+    # in-mv5qfm8910ycjk), until the review-cost framework workload lands or Jo says otherwise.
+    # The strong-row entry is gpt-6.1-sol (Jo, 2026-10-14, in-mv8qzqym1ihmv4: it replaced
+    # gpt-6-sol). The dated Anthropic-out restriction does not change this substitution.
     # Non-review deep spawns take their lane lab's entry of this row (an OpenAI lane's deep build runs
     # gpt-6-astra). The row itself is unchanged: naming gpt-6.1-sol here would
     # put one model in two tiers, which classifier/src/tier-table.ts refuses (MIGRATION.md item 110).
     deep:
       - anthropic/claude-fable-5-1
       - openai-codex/gpt-6-astra
-      - moonshot/kimi-k3
   # M4: any task.* keys for the tool policy go inside this `task:` mapping (YAML allows one
   # `task:` key per file).
 
@@ -282,7 +299,99 @@ testRunner:
   fullCapMin: 20
   soloCapMin: 10
   reportCapMb: 50
-  queueMaxMin: 60
+  queueMaxMin: 1440
+  # Workers for the PR's full part (workload wl-mvg2kzuvwngdmo): over 1, test-exec runs it as
+  # `bun test --parallel=<n>` (an integer of 1 or more; absent means 1). Base reruns (`base-full`)
+  # stay serial whatever this says. surface/scripts/test-run-waits.ts reads each run's `full workers`
+  # line and wait back per day. Reversal: `fullWorkers: 1`.
+  fullWorkers: 6
+
+  # Land-first fast Linux gate and full Mac main verification (PLAN wl-mvq4edbaf13vnk § 2).
+  # Every fast set includes these smoke files. Files in macOnly run only in the full main suite:
+  # macOS-specific sandbox, shell, filesystem and process APIs cannot be exercised on Linux;
+  # the remaining portability cases depend on Linux filesystem identity/order/timing behavior.
+  # Each file in macOnly (its reason beside it; the first 13 macOS-only and four portability files came from the Linux
+  # probe) stays out of hosted Linux. They run in the post-merge Mac full
+  # suite and in .github/workflows/as2-hosted.yml's macos-latest job. Keep zsh and bubblewrap
+  # tests in the fast set; the hosted workflow installs both. Activation is a ledger word, not a flag.
+  # The fast set leaves files in macOnly and in mainSkip out of its Linux files, smoke files included, and lists each
+  # beside them in the run's fast-plan (surface/src/fast-set.ts `fastSet`), so no file leaves the record.
+  # timing-lint.test.ts is the incidental-timing ratchet (Jo's rule, 2026-10-28): static, under a second, and it must
+  # run on every PR, since a new offender is a new test file the reach scan would not otherwise pick.
+  fastSmoke:
+    - surface/test/fast-set.test.ts
+    - surface/test/main-state.test.ts
+    - surface/test/timing-lint.test.ts
+  macOnly:
+    gates/test/fence.test.ts: sandbox-exec macOS OS fence
+    gates/test/r18-typed-wrapper.test.ts: requires sandbox-exec on PATH
+    gates/test/r18-typed-wrapper-exec.test.ts: requires sandbox-exec on PATH
+    gates/test/scratch-fence.test.ts: inspects sandbox-exec fence command
+    gates/test/r08-tree-evidence.test.ts: exercises lane under sandbox-exec fence
+    gates/test/probe-suite.test.ts: exercises real gate chain under sandbox-exec fence
+    surface/test/lane.test.ts: exercises lane under sandbox-exec wrapper
+    gates/test/shell-start-bash.test.ts: asserts macOS /bin/bash 3.2 and /private/tmp semantics
+    gates/test/printf-property.test.ts: models macOS /bin/bash 3.2 printf behavior
+    gates/test/shell-start.test.ts: reads macOS _NSGetEnviron from libSystem
+    surface/test/ps-shim.test.ts: shim loads macOS libSystem.B.dylib
+    surface/test/as2test.test.ts: uses /private/tmp and macOS as2test helpers
+    surface/test/phoenix-run.test.ts: assumes /usr/sbin/lsof on macOS
+    surface/test/scratch-audit.test.ts: Linux ext4 directory size and /tmp alias behavior differ
+    surface/test/scratch-remove.test.ts: Linux inode reuse affects directory identity check
+    surface/test/decision-log.test.ts: Linux directory iteration ordering differs
+    surface/test/test-runner.test.ts: Linux timing/signal behavior differs in test T2c
+    surface/test/test-runner-smoke.test.ts: admission reads the _as2test process snapshot, which Linux cannot inspect (S5b settles as admission refused, inspection denied)
+    surface/test/timing-proof.test.ts: historic load spawns /usr/sbin/taskpolicy and its teardown reads the darwin process list, neither of which exists on Linux
+    surface/test/drive-backup.test.ts: the Drive backup zsh suites use macOS stat/md5/xattr/osascript and the Drive for desktop (DriveFS) layout
+  # Files a main run's believability leaves out (§ 2 Main state, jo-issues #243): they need Jo's own machine (an
+  # installed OMP) and skip every test under _as2test, so 185 of 195 files is the most a main run can execute and
+  # 95 % of 195 is 185.25. Each still runs in the full suite and stops counting toward "believable". The fast Linux
+  # set leaves them out as well (listed in the fast-plan's mainSkip): without an installed OMP they execute no test.
+  mainSkip:
+    gates/test/shell-start-session-env.test.ts: needs an installed OMP (omp on PATH)
+    gates/test/shell-start-session-hooks.test.ts: needs an installed OMP (omp on PATH)
+    gates/test/shell-start-session-named.test.ts: needs an installed OMP (omp on PATH)
+    gates/test/shell-start-session-rc.test.ts: needs an installed OMP (omp on PATH)
+    gates/test/shell-start-session-reuse.test.ts: needs an installed OMP (omp on PATH)
+    gates/test/shell-start-session-switch.test.ts: needs an installed OMP (omp on PATH)
+    gates/test/shell-start-session-work.test.ts: needs an installed OMP (omp on PATH)
+    plugins/test/by-hand-session.test.ts: needs Jo's installed OMP package under ~/.bun (plugins/test/omp-host.ts)
+    plugins/test/loader.test.ts: needs Jo's installed OMP package under ~/.bun (plugins/test/omp-host.ts)
+    surface/test/tool-mount.test.ts: needs an omp binary on PATH
+  fullBeforeMerge:
+    - package.json
+    - bun.lock
+    - bunfig.toml
+    - tsconfig.json
+    - Cargo.toml
+    - Cargo.lock
+    - build.sh
+  fastCapMin: 10
+  fastWaitMin: 15
+
+# ── Tracing switch (wl-mv65t5d34lts00 PLAN.md §§ 2, 8; surface/src/tracing.ts) ──
+# Which omp processes export their spans to the local Phoenix (install/phoenix-agent.sh): all (the
+# default: every lane, the orchestrator and every OMP seat), off, or a flow list of workload ids (their
+# lanes only; hands run inside their lane's process and share its export). Read at launch by
+# surface/scripts/lane.ts, bin/as2 and Jo's seat launcher, which set the otel map below on a covered
+# process and OTEL_SDK_DISABLED=true on every other, after dropping any inherited OTEL_* name. Names must
+# be OTEL_*, values ^[A-Za-z0-9_./:=,@%+-]*$; others are dropped. Every name below is required while the
+# switch is on: one missing, empty or dropped turns tracing off (OMP would fill it from a project's .env).
+# A missing or malformed block is off. Lanes' spans land in Phoenix project as2-<workload id>, the
+# orchestrator's in as2-orchestrator, a seat's in seat-<name>. OMP has no registration for the key and
+# keeps it in the raw layer. Set it with `as2 phoenix off|all|<wl-id>`; a re-install keeps the installed
+# value (install.sh, `tracing.ts carry`), so only a fresh profile starts at all.
+# Reversal: `as2 phoenix off`.
+observability:
+  phoenix: all            # all | off | [wl-…, wl-…]
+  otel:
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://127.0.0.1:6006/v1/traces
+    OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: http/protobuf
+    OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: "2000"
+    OTEL_TRACES_EXPORTER: otlp
+    OTEL_LOGS_EXPORTER: none
+    OTEL_METRICS_EXPORTER: none
+    OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: none
 
 # ── The pair-suggest switch (PLAN wl-mv67564rdkfvnk D2; surface/src/pair-suggest.ts pairSuggestOn) ──
 # `off`, `all`, or a list of workload ids ([wl-a, wl-b]). When it covers an autonomous workload above
@@ -292,3 +401,45 @@ testRunner:
 # it with `as2 pair-suggest off|all|<wl-id>`; a missing or malformed value reads as off, which is the
 # reversal. OMP has no registration for the key and keeps it in the raw layer.
 pairSuggest: all
+
+# ── Jev ranking's launch gate (PLAN wl-mv8k039gvogt8g D7, wl-mv8wzytml878b4 D2; surface/src/rank-launch.ts readRankConfig) ──
+# `mode: order` (the default) starts the top-ranked launchable workload first (Jo's ruled list first, then Jev),
+# and pauses the lowest-ranked running lane for a Jo-ruled workload waiting at cap; the paused workload
+# relaunches by itself when a slot comes back to it. `show` changes no launch (the drain only logs a
+# `rank-shadow` line beside its oldest-first pick) and turns priority pause off; `parallel` adds the parallel
+# rule (different repositories only, the remaining ceilings within parallelBudgetUsd, a clear merge
+# order) and also turns priority pause off. Jo's launch word and `as2 lane` are never gated. Read fresh at
+# every launch decision; a missing or malformed block reads as order; `show` is the reversal. Set it with
+# `as2 rank-mode show|order|parallel [--budget <usd>]`. parallelBudgetUsd 0 (or missing) means the budget
+# is unknown: no parallel start.
+# OMP has no registration for the key and keeps it in the raw layer.
+jevRank:
+  mode: order
+  parallelBudgetUsd: 0
+
+# ── The agent channel to Ilex (PLAN wl-mv8vx7wdj5nx1c D1; surface/src/channel.ts readChannelConfig) ──
+# The other agents that may message Ilex, the orchestrator surface, each with its transport and authority.
+# omp-mailbox: the OMP seat mailbox ($OMP_PERSISTENT_SEAT_MAILBOX_ROOT, else ~/.omp/agent/seat-mailboxes), drained
+# from inbox/ilex/ at session start and every 2 s. notes: the only authority this phase builds; a message is a note
+# Ilex reads, or a proposal Jo may take by typing his own word, and nothing in it is ever applied or authored as Jo.
+# Read at the orchestrator's session start: an unknown key, transport or authority refuses the whole block with a
+# notice, and the channel is off for that session. OMP has no registration for the key and keeps it in the raw layer.
+# Reversal: delete the block (no block, no channel).
+channel:
+  senders:
+    - { id: plumb, transport: omp-mailbox, authority: notes }
+
+# ── Scratch archives (surface/src/scratch-archive.ts readScratchArchiveConfig) ──
+# A closed workload's scratch root, and every root the daily sweep (surface/scripts/scratch-sweep.ts) removes,
+# is first written to one verified .tar.gz under ~/agent-scratch/agent-system-2.0/scratch-archive/<UTC date>/;
+# a root whose archive fails is kept. The per-root and total size caps stay in AGENT_SYSTEM_SCRATCH_CAP_MB and
+# AGENT_SYSTEM_SCRATCH_TOTAL_MB. expireDays: the daily sweep removes archives older than this (days, by mtime).
+# requireOffsite: when true, an archive expires only once an offsite copy job has written `<archive>.offsite`
+# beside it; false is plain age expiry. minFreeGib: the sweep's `scratch-disk:` needs-you line also opens when
+# free space on the scratch volume is under this many GiB. Read by the sweep at each run; a missing block or a
+# malformed key is its default (14, false, 20). OMP has no registration for the key and keeps it in the raw layer.
+# Reversal: delete the block (the defaults apply).
+scratchArchive:
+  expireDays: 14
+  requireOffsite: false
+  minFreeGib: 20

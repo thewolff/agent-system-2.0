@@ -12,7 +12,7 @@ import type { Ledger } from "../../ledger/src/index";
 import { closeWorkloadWithEntry } from "../extensions/workload";
 import { commitCloseEntry, publishEntry, TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { recordRepo } from "../src/decision-log";
-import { branchName, worktreePath } from "../src/launch";
+import { branchName, withdrawInstructionBody, withdrawnBody, worktreePath } from "../src/launch";
 import { SURFACE_BY, type SurfaceAPI } from "../src/types";
 import { clock, tempLedger, tmp } from "./helpers";
 
@@ -267,6 +267,30 @@ describe("close: the decision-log entry rides the lane branch wl/<id>, never the
 		const d = r.details as { path: string };
 		expect(g(w, w.work, "show", d.path)).toContain(`- orchestrator (surface): close receipt: superseded by ${by} (Jo, ${ins})`);
 		expect(x.ledger.instructions(x.wl).map((i) => i.body)).toContain(`close receipt: superseded by ${by} (Jo, ${ins})`);
+	});
+
+	test("PLAN wl-mv8s939084z1ts D4: an unserved repo's withdrawn workload closes without a receipt; the entry and the close receipt say withdrawn", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w.work);
+		x.ledger.recordEntry({ by: SURFACE_BY, workloadId: x.wl, kind: "assumption", body: "done: the feed header sits at its offset" });
+		const refused = await close(piOf(w), x, w.work);
+		expect(refused.closed).toBe(false);
+		expect(refused.text).toContain("no `done-because:` receipt from its holder");
+		const ins = x.ledger.recordInstruction({ by: SURFACE_BY, workloadId: x.wl, body: withdrawInstructionBody(x.wl), author: "jo", channel: "surface" });
+		x.ledger.recordEntry({ by: SURFACE_BY, workloadId: x.wl, kind: "assumption", body: withdrawnBody(ins) });
+
+		const r = await close(piOf(w), x, w.work);
+
+		const said = `withdrawn by Jo (${ins}): closed with no done-because: receipt`;
+		expect(r.closed).toBe(true);
+		expect(r.receipt).toBe(said);
+		expect(x.ledger.workload(x.wl)!.status).toBe("closed");
+		const d = r.details as { path: string };
+		const entry = g(w, w.work, "show", d.path);
+		expect(entry).toContain(`- orchestrator (surface): close receipt: ${said}`);
+		expect(entry).toContain(`- jo (surface): ${withdrawInstructionBody(x.wl)}`);
+		expect(x.ledger.instructions(x.wl).map((i) => i.body)).toContain(`close receipt: ${said}`);
 	});
 });
 

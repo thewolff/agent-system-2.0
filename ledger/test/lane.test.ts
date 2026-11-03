@@ -103,6 +103,43 @@ describe("reserveLane (decision 8)", () => {
 		l.close();
 	});
 
+	test("a cap-exempt set: its holders leave liveLanes and liveLaneHolders, its own rows say capExempt, and reserveLane reads the set inside its transaction", () => {
+		const { ledger: l } = fresh("exempt");
+		const a = l.openWorkload({ brief: "a", stakes: "normal", mode: "autonomous", by: "orch" });
+		const train = l.openWorkload({ brief: "train", stakes: "normal", mode: "autonomous", by: "orch" });
+		const d = l.openWorkload({ brief: "d", stakes: "normal", mode: "autonomous", by: "orch" });
+		l.claimWorkload(a, { by: "lane-a-1", holder: "lane-a-1", leaseMs: 60_000 });
+		l.claimWorkload(train, { by: "lane-t-1", holder: "lane-t-1", leaseMs: 60_000 });
+		const exempt = new Set([train]);
+		expect(l.launchRows(d, 3)).toMatchObject({ liveLanes: 2, capExempt: false });
+		expect(l.launchRows(d, 3, { capExempt: exempt })).toMatchObject({ liveLanes: 1, capExempt: false });
+		expect(l.launchRows(train, 3, { capExempt: exempt })).toMatchObject({ liveLanes: 1, capExempt: true });
+		expect(l.liveLaneHolders(l.now(), exempt)).toEqual([{ workloadId: a, holder: "lane-a-1" }]);
+		// order-free: liveLaneHolders sorts by created_at, id, and ids end in a random suffix, so a millisecond tie may put train first
+		expect(l.liveLaneHolders(l.now()).map((h) => h.workloadId).sort()).toEqual([a, train].sort());
+		const seen: { liveLanes: number; capExempt: boolean }[] = [];
+		let calls = 0;
+		const r = l.reserveLane(d, {
+			by: LANE_STARTER_BY, cap: 2, leaseMs: 1000, requestedBy: "t",
+			capExempt: () => {
+				calls++;
+				expect(l.db.inTransaction).toBe(true);
+				return exempt;
+			},
+			decide: (rows) => {
+				seen.push({ liveLanes: rows.liveLanes, capExempt: rows.capExempt });
+				return decide(rows);
+			},
+		});
+		// under cap 2 the train's lane takes no slot, so d is admitted
+		expect(r).toMatchObject({ ok: true, laneId: `lane-${d.slice(3)}-1` });
+		expect(calls).toBe(1);
+		expect(seen).toEqual([{ liveLanes: 1, capExempt: false }]);
+		// without the set every holder counts: cap 2 is full
+		expect(reserve(l, l.openWorkload({ brief: "e", stakes: "normal", mode: "autonomous", by: "orch" }), 2)).toEqual({ ok: false, reason: "cap" });
+		l.close();
+	});
+
 	test("concurrent starters across processes: 3 workloads × 3 processes each → exactly one lane per workload, distinct ordinals, the fourth workload refused by the cap, refusals write nothing", async () => {
 		const { path, ledger: l } = fresh("concurrent");
 		const wls = ["wl-c1", "wl-c2", "wl-c3", "wl-c4"].map((id) => l.openWorkload({ brief: id, stakes: "normal", mode: "autonomous", by: "orch", id }));

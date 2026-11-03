@@ -2,7 +2,8 @@
 // `model` param of the open and launch tools, the `lane-model:` control line, `--model` in both argvs,
 // the session kept only on the same model, the get_state check that gates readiness, the prompt error
 // in the death line, and the lane's own forgery refused. The runner rows that spawn the fake omp are
-// in lane-model-script.test.ts.
+// in lane-model-script.test.ts. `orchestrator_set_lane_model` (PLAN wl-mvwk0v0gmp6cjc D1, R1/R2) writes
+// the line alone, with no launch.
 import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -12,8 +13,8 @@ import {
 	controlEntries, doneBody, interactiveArgv, laneArgv, laneModel, laneModelBody, modelProblem, type Resolution, resumePlan, stateModelCheck, stateModelOf,
 } from "../src/launch";
 import { promptEndedDeathBody, promptErrorOf, turnEnd, turnEndDeathBody, type TurnEndInput } from "../src/turn-end";
-import { SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, tempLedger, tmp } from "./helpers";
+import { DUE_PREFIX, STANDING_BRIEF, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ctxOf, fakePi, HOW_IT_FAILS, tempLedger, tmp } from "./helpers";
 
 const A = "anthropic/claude-opus-5-5";
 const X = "openai-codex/gpt-6-sol";
@@ -55,7 +56,7 @@ function surface() {
 describe("T1/T2: Jo's lane-model: line and the argv", () => {
 	test("T1u: the open tool records Jo's model as the surface; laneArgv carries --model after --max-time, before --resume", async () => {
 		const s = surface();
-		const r = await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", done: "it is done", stakes: "normal", model: X });
+		const r = await s.call("orchestrator_open_workload", { brief: `move the header offset into a token${HOW_IT_FAILS}`, done: "it is done", stakes: "normal", model: X });
 		const id = String(r.details?.id);
 		expect(r.text).toContain(`lane model: ${X}`);
 		const l = s.ledger();
@@ -72,7 +73,7 @@ describe("T1/T2: Jo's lane-model: line and the argv", () => {
 
 	test("T1u: the launch tool writes lane-model: in the launch-requested: transaction, model first", async () => {
 		const s = surface();
-		const id = String((await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", done: "it is done", stakes: "normal" })).details?.id);
+		const id = String((await s.call("orchestrator_open_workload", { brief: `move the header offset into a token${HOW_IT_FAILS}`, done: "it is done", stakes: "normal" })).details?.id);
 		const r = await s.call("orchestrator_launch_lane", { workloadId: id, model: X, reason: "relaunch on openai" });
 		expect(r.text).toContain(`with lane model ${X}`);
 		const l = s.ledger();
@@ -101,7 +102,7 @@ describe("T3/T8: the session is resumed only on the model it ran on", () => {
 		expect(resumePlan(c, "lane-m-2", [], X)).toEqual({ resume: null, skipped: `/one ran on ${A}` });
 		expect(resumePlan(c, "lane-m-2", [], A)).toEqual({ resume: "/one", skipped: null });
 		expect(resumePlan(c, "lane-m-2", [], null)).toEqual({ resume: null, skipped: `/one ran on ${A}` });
-		expect(interactiveArgv({ ...SPEC, model: X, resume: null })).toEqual(["--cwd", "/w", "--session-dir", "/s", "--append-system-prompt", "/p", "--model", X]);
+		expect(interactiveArgv({ ...SPEC, model: X, resume: null, firstPromptPath: "/l/prompt.md" })).toEqual(["--cwd", "/w", "--session-dir", "/s", "--append-system-prompt", "/p", "--model", X, "@/l/prompt.md"]);
 	});
 
 	test("T3b: a session only lane-parked: recorded keeps its lane's model; with no lane-started: at all it is unknown", () => {
@@ -140,7 +141,7 @@ describe("T3/T8: the session is resumed only on the model it ran on", () => {
 		expect(argv).not.toContain("--model");
 		expect(argv).not.toContain("--resume");
 		expect(argv).not.toContain("default");
-		expect(interactiveArgv({ ...SPEC, model, resume: plan.resume })).toEqual(["--cwd", "/w", "--session-dir", "/s", "--append-system-prompt", "/p"]);
+		expect(interactiveArgv({ ...SPEC, model, resume: plan.resume, firstPromptPath: "/l/prompt.md" })).toEqual(["--cwd", "/w", "--session-dir", "/s", "--append-system-prompt", "/p", "@/l/prompt.md"]);
 	});
 
 	test("T8b: named then cleared, the X launch failing before a session: default resumes the default-era s1", () => {
@@ -224,13 +225,13 @@ describe("T7: a model Jo cannot name is refused with nothing written", () => {
 	test("the open tool opens nothing; the launch tool writes nothing", async () => {
 		const s = surface();
 		for (const model of BAD) {
-			const r = await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", done: "it is done", stakes: "normal", model });
+			const r = await s.call("orchestrator_open_workload", { brief: `move the header offset into a token${HOW_IT_FAILS}`, done: "it is done", stakes: "normal", model });
 			expect(r.text).toContain("Nothing was opened.");
 		}
 		let l = s.ledger();
 		expect(l.inFlight().length).toBe(0);
 		l.close();
-		const id = String((await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", done: "it is done", stakes: "normal" })).details?.id);
+		const id = String((await s.call("orchestrator_open_workload", { brief: `move the header offset into a token${HOW_IT_FAILS}`, done: "it is done", stakes: "normal" })).details?.id);
 		l = s.ledger();
 		const before = l.entries(id).length;
 		l.close();
@@ -242,7 +243,7 @@ describe("T7: a model Jo cannot name is refused with nothing written", () => {
 
 	test("on a user-driven workload the model is recorded and the by-hand line returned; nothing launches", async () => {
 		const s = surface();
-		const id = String((await s.call("orchestrator_open_workload", { brief: "move the header offset into a token", done: "it is done", stakes: "normal", mode: "user-driven" })).details?.id);
+		const id = String((await s.call("orchestrator_open_workload", { brief: `move the header offset into a token${HOW_IT_FAILS}`, done: "it is done", stakes: "normal", mode: "user-driven" })).details?.id);
 		const r = await s.call("orchestrator_launch_lane", { workloadId: id, model: X });
 		expect(r.text).toContain(`Recorded lane model ${X}`);
 		expect(r.text).toContain(`as2 lane ${id}`);
@@ -270,5 +271,122 @@ describe("T9: a lane cannot name its own model", () => {
 		const r = await f.tool("lane_record_entry").execute("1", { body: laneModelBody(X, NOW) }, undefined, undefined, ctxOf());
 		expect(r.content[0]!.text).toContain("`lane-model:` is a reserved control line");
 		expect(ledger.entries(wl).length).toBe(before);
+	});
+});
+
+describe("R1/R2 (PLAN wl-mvwk0v0gmp6cjc D1): orchestrator_set_lane_model writes one lane-model: line and launches nothing", () => {
+	/** The orchestrator surface with a recording exec, so a starter exec would show in `f.execs.calls`. */
+	function setSurface() {
+		const e = orchestratorEnv();
+		const f = fakePi(undefined, { exec: true });
+		orchestratorSurface(f.pi, e, {});
+		const set = async (params: Record<string, unknown>) => {
+			const r = await f.tool("orchestrator_set_lane_model").execute("1", params, undefined, undefined, ctxOf());
+			return r.content[0]!.text;
+		};
+		const ledger = () => Ledger.open(e.AGENT_SYSTEM_LEDGER_DB!, { create: true, backup: false, backupOnOpen: false });
+		return { f, set, ledger };
+	}
+	const open = (l: Ledger, mode: "autonomous" | "user-driven", brief = "Move the header offset into a token") =>
+		l.openWorkload({ by: SURFACE_BY, brief, stakes: "normal", mode });
+	/** What the tool must leave alone, and the entries it may add to. */
+	const snapshot = (l: Ledger, id: string) => {
+		const w = l.workload(id);
+		return { ids: l.entries(id).map((x) => x.id), holder: w?.holder ?? null, lease: w?.holder_lease_until ?? null, status: w?.status ?? null };
+	};
+
+	test("R1: idle autonomous, user-driven and held-live workloads each get exactly one surface lane-model: line, no launch-requested:, no exec, no lease change; laneModel reads it back", async () => {
+		const s = setSurface();
+		let l = s.ledger();
+		const idle = open(l, "autonomous");
+		const byHand = open(l, "user-driven");
+		const held = open(l, "autonomous");
+		l.recordEntry({ by: LANE_STARTER_BY, workloadId: held, kind: "assumption", body: "launch: lane-t-1 cause first requested-by jo" });
+		expect(l.claimWorkload(held, { by: LANE_STARTER_BY, holder: "lane-t-1", leaseMs: 3_600_000 }).won).toBe(true);
+		const before = new Map([idle, byHand, held].map((id) => [id, snapshot(l, id)]));
+		l.close();
+
+		const results = new Map<string, string>();
+		for (const id of [idle, byHand, held]) results.set(id, await s.set({ workloadId: id, model: X }));
+
+		l = s.ledger();
+		for (const id of [idle, byHand, held]) {
+			const was = before.get(id)!;
+			const now = snapshot(l, id);
+			const added = l.entries(id).filter((x) => !was.ids.includes(x.id));
+			expect(added.length).toBe(1);
+			expect(added[0]!.created_by).toBe(SURFACE_BY);
+			expect(added[0]!.body).toStartWith(`lane-model: ${X} by jo at `);
+			expect({ holder: now.holder, lease: now.lease, status: now.status }).toEqual({ holder: was.holder, lease: was.lease, status: was.status });
+			const control = controlEntries(l.entries(id, "assumption"));
+			expect(control.some((c) => c.prefix === "launch-requested")).toBe(false);
+			expect(laneModel(control)).toBe(X);
+			const tail = id === held ? ` lane-t-1 keeps running on its current model; the next lane on ${held} starts on ${X}.` : "";
+			expect(results.get(id)).toBe(`Recorded lane model ${X} (${added[0]!.id}) on ${id}. No lane launched.${tail}`);
+		}
+		l.close();
+		expect(s.f.execs.calls).toEqual([]);
+	});
+
+	test("R1: `default` writes one more line and reads back as null, on an idle and a held workload", async () => {
+		const s = setSurface();
+		let l = s.ledger();
+		const idle = open(l, "autonomous");
+		const held = open(l, "autonomous");
+		expect(l.claimWorkload(held, { by: LANE_STARTER_BY, holder: "lane-t-2", leaseMs: 3_600_000 }).won).toBe(true);
+		l.close();
+		for (const id of [idle, held]) {
+			expect(await s.set({ workloadId: id, model: X })).toContain("No lane launched.");
+			l = s.ledger();
+			const count = l.entries(id).length;
+			l.close();
+			const r = await s.set({ workloadId: id, model: "default" });
+			expect(r).toStartWith("Recorded lane model default (");
+			l = s.ledger();
+			expect(l.entries(id).length).toBe(count + 1);
+			const control = controlEntries(l.entries(id, "assumption"));
+			expect(control.filter((c) => c.prefix === "lane-model").length).toBe(2);
+			expect(laneModel(control)).toBeNull();
+			expect(l.workload(id)?.holder ?? null).toBe(id === held ? "lane-t-2" : null);
+			l.close();
+		}
+		expect(s.f.execs.calls).toEqual([]);
+	});
+
+	test("R2: a bad model, a missing, closed, standing or due: workload is refused with nothing written", async () => {
+		const s = setSurface();
+		let l = s.ledger();
+		l.openWorkload({ by: SURFACE_BY, brief: STANDING_BRIEF, stakes: "normal", mode: "autonomous", id: STANDING_WORKLOAD_ID });
+		const idle = open(l, "autonomous");
+		const closed = open(l, "autonomous");
+		l.closeWorkload(closed, { by: SURFACE_BY });
+		const due = open(l, "autonomous", `${DUE_PREFIX}2026-11-01 set lane models back`);
+		const watched = [STANDING_WORKLOAD_ID, idle, closed, due];
+		const before = watched.map((id) => snapshot(l, id));
+		l.close();
+
+		for (const model of ["opus", "foo/bar", "openai-codex/x:high", "", "   "]) {
+			const r = await s.set({ workloadId: idle, model });
+			expect(r).toStartWith("Refused: ");
+			expect(r).toEndWith("Nothing was written.");
+		}
+		const refused: [Record<string, unknown>, string][] = [
+			[{ workloadId: "wl-nope", model: X }, "no workload wl-nope"],
+			[{ workloadId: closed, model: X }, `${closed} is closed`],
+			[{ workloadId: STANDING_WORKLOAD_ID, model: "default" }, "standing orchestrator workload"],
+			[{ workloadId: due, model: X }, `${due} is a scheduled row`],
+		];
+		for (const [params, why] of refused) {
+			const r = await s.set(params);
+			expect(r).toStartWith("Refused: ");
+			expect(r).toContain(why);
+			expect(r).toEndWith("Nothing was written.");
+		}
+
+		l = s.ledger();
+		expect(watched.map((id) => snapshot(l, id))).toEqual(before);
+		expect(l.workload("wl-nope")).toBeNull();
+		l.close();
+		expect(s.f.execs.calls).toEqual([]);
 	});
 });

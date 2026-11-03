@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  agent-system 2.0: the merge train's tick (PLAN wl-mv8s8srodefytc rev 17.1 D10), as a launchd user agent.
+  TEMPLATE: install/install.sh with its train-tick flag fills the upper-case placeholder values
+  (XML-escaped), writes the result to $HOME/Library/LaunchAgents/com.agent-system-2.train-tick.plist
+  and loads it with launchctl bootstrap; the flag's =off form boots it out and deletes that file.
+  Without the flag install.sh never writes it. (An XML comment cannot hold a double hyphen, so the
+  flags are not spelled out here; install/install.sh's header has them.) launchd runs
+  surface/scripts/train-tick.ts every 300 s, outside the fence: it settles train tasks, opens fix
+  workloads, launches owners and trains, and files and re-sends Jo's alerts on thewolff/jo-issues.
+  PATH holds the directories of gh, bun, omp, git, osascript and ctx as resolved at install (launchd's
+  own PATH lacks them; the lanes the tick launches inherit this PATH and need ctx for their ctx MCP
+  server and history index); the profile and ledger variables name what install wrote, so a launch the
+  tick makes runs on that profile and the tick reads and writes that ledger.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.agent-system-2.train-tick</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@BUN@</string>
+		<string>@REPO@/surface/scripts/train-tick.ts</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>AGENT_SYSTEM_LEDGER_DB</key>
+		<string>@LEDGER_DB@</string>
+		<key>AGENT_SYSTEM_PROFILE</key>
+		<string>@PROFILE@</string>
+		<key>HOME</key>
+		<string>@HOME@</string>
+		<key>PATH</key>
+		<string>@PATH@</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>@REPO@</string>
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<!--
+	  Interactive, not Background or Standard: the tick launches merge-train lanes, those lanes request
+	  full-suite test runs, and every process in that tree inherits this job's scheduling clamp
+	  (jo-issues 213). Background clamps the tree to priority 4, about 10x slower, so full runs hit their
+	  20-minute cap. Standard still clamps it to utility, priority 20: in the 2026-10-28 TrainLoadLoop
+	  measurement full parts were green on 5 of 26 runs at base priority 20 and on 4 of 6 at base 31,
+	  and classifier/test/snapshot-settle.test.ts T10c timed out 6 of 6 under taskpolicy -c utility and
+	  passed 6 of 6 at 31. Interactive applies no limits (launchd.plist(5)).
+	-->
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>@HOME@/agent-scratch/agent-system-2.0/train-tick/launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/agent-scratch/agent-system-2.0/train-tick/launchd.log</string>
+</dict>
+</plist>

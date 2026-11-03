@@ -1,0 +1,23 @@
+---
+title: Every plan requirement names its enforcer, or says prompt-only and why
+status: building
+workload: wl-mv8vwb04cy18n4
+pr: 157
+number: 137
+---
+Workload `wl-mv8vwb04cy18n4` (production stakes, plan revision 3 at `~/agent-scratch/agent-system-2.0/wl-mv8vwb04cy18n4/PLAN.md`, approved by Jo). **The problem:** a prose instruction to a model drifts; code that tests, gates, hooks or refuses does not. A plan could list requirements that nothing but the lane's good intentions would hold, and Jo had no way to see which ones. Jo, 2026-10-12: *"nothing matters without machinery."* Jo's instruction for this workload (ledger input `in-mv8vw0sx5g4d8g`): *"Each plan requirement names its enforcer (test, gate row, hook, code path) or says prompt-only and why; the plan check refuses a plan missing that, and the plan question lists prompt-only items for Jo."*
+
+**The rule** (SPEC-2.0.md § B6, *Amended 2026-10-14 — requirements name their enforcer*). Every lane plan file holds exactly one `## Requirements` section, and every non-blank line in it is a requirement line:
+
+```
+- R<n>: <requirement> => <enforcer>[; <enforcer>]…
+- R<n>: <requirement> => prompt-only: <why no code can enforce it>
+```
+
+An enforcer is `test`, `gate`, `hook` or `code` plus a locator saying where (`test surface/test/launch.test.ts`, `gate row 8`, `code surface/src/launch.ts planQuestionProblem`), separated by `; `. The line splits at its last ` => `; ids are unique; a locator holds no `;`; a prompt-only reason has at least two words and is never mixed with an enforcer. The plan question gains one line kind after its slice lines: `prompt-only: <R id>: <text>`, one per prompt-only requirement with exactly the file's ids, or `prompt-only: none`. Jo's needs-you line shows the plan question whole, so the prompt-only items reach Jo with the plan. The normative rule behind it, machinery first for all work on or with agent, LLM or AI software (Jo, `in-mv61a9s52y4g00`), is recorded as SPEC-2.0.md § B14.3, *Amended 2026-10-14 — machinery first for all work*.
+
+**Where it is enforced.** `planQuestionProblem` in `surface/src/launch.ts`, called by `lane_raise_question` (`surface/extensions/lane-tools.ts`) on a plan question offering `approve`, after the plan-review gate. It reads the plan file the question names, names every offending requirement in one refusal, then checks the `prompt-only:` ids against the file. The grammar lives once, as `PLAN_REQUIREMENTS_SHAPE` in `surface/src/launch.ts`, and is rendered into the refusal, the tool's description and a plan-first lane's first prompt; `tiers/lane.md` carries the `prompt-only:` line in its question shape and one sentence pointing at the section. The check runs at raise time only: questions raised before the change are never re-checked, and Jo's `approve` on them works as before. Not checked: whether a locator exists or really enforces its requirement (a test the plan will write does not exist yet); Jo, the cross-lab plan review and the code review judge that. A workload without a plan gets no enforcer check.
+
+**Supersedes PR #111** (`wl/wl-mv61aqy1u13zls`, item `migration/items/plan-slices-name-their-enforcement.md`, never merged; left for Jo to close). #111 put a category tag (`[render, gate, refusal, test]`, optional `prose`) on every plan-question slice line and every `lane_add_slice` task. Not built on as-is because: the unit and content differ (a slice tagged with a category names no enforcer a reviewer can open; Jo asks each requirement to name its own); its vocabulary would have been a second grammar on one question; and its `tiers/lane.md` growth (16301 bytes) broke the 15248-byte bound in `tiers/test/size.test.ts`, turning its full suite red, where this change keeps lane.md inside the bound and renders the grammar from code. Reused from #111: one refusal naming every offender, the two-word reason rule, the raise-time-only rule, and the scope sentence of its § B14.3 amendment. Dropped: the slice-line tag and the `lane_add_slice` task tag, so slices added on a workload without a plan are no longer checked (plan tradeoff 1).
+
+**Post-merge live check.** After Jo merges and the main checkout is fast-forwarded, a throwaway plan-first workload on main gets its cross-lab plan review, then raises a plan question whose plan file has no `## Requirements` section and is refused with the grammar in the refusal; the same plan with the section and one prompt-only requirement is raised, and Jo's needs-you line shows its `prompt-only:` line. Receipts: the refusal text, the question id and the main SHA. A plan-first lane started before the merge keeps the old check for its session; relaunch it to pick up the new one.

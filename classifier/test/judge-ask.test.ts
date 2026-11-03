@@ -19,9 +19,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CLASSIFIER_BY, Ledger } from "../../ledger/src/index";
-import { CEILING_OPTIONS } from "../../surface/src/ceiling";
-import { raiseCeilingQuestion } from "../../surface/scripts/lane";
-import { askChoices } from "../src/judge-ask";
+import { pairOffer, readPairSuggestConfig } from "../../surface/src/pair-suggest";
+import { askChoices, askJudgment, JEV_USD_PER_INPUT_TOKEN, type JudgmentQuestions } from "../src/judge-ask";
 import { tierTableFromConfig } from "../src/tier-table";
 import { extensionHost, fakeRegistry } from "./helpers";
 
@@ -108,9 +107,18 @@ describe("askChoices: validation (D4)", () => {
 		expect(await ask(reply(GOOD))).toMatchObject({ ok: true, cost: null });
 	});
 
-	test("probabilities summing to 1 within 1e-6 pass", async () => {
+	test("probabilities rounded to two decimals pass: a sum off by up to 0.005 per label", async () => {
 		const answers = { ...GOOD, taste: { choice: "yes", confidence: 0.5, probabilities: { yes: 0.5 + 1e-7, no: 0.5 } } };
 		expect(await ask(reply(answers))).toMatchObject({ ok: true });
+		const rounded = { ...GOOD, taste: { choice: "yes", confidence: 0.66, probabilities: { yes: 0.66, no: 0.33 } } };
+		expect(await ask(reply(rounded))).toMatchObject({ ok: true });
+		const past = { ...GOOD, taste: { choice: "yes", confidence: 0.66, probabilities: { yes: 0.66, no: 0.32 } } };
+		expect(await ask(reply(past))).toMatchObject({ ok: false, failure: "malformed" });
+	});
+
+	test("a four-level score whose rounded probabilities sum to 0.99 passes (live Jev reply shape)", async () => {
+		const goal = { type: "score", score: 2.4, confidence: 0.7, probabilities: { 0: 0.05, 1: 0.05, 2: 0.3, 3: 0.59 } };
+		expect(await askTyped(typedReply({ ...WIRE, goal }))).toMatchObject({ ok: true });
 	});
 
 	const bad: [string, unknown][] = [
@@ -179,12 +187,113 @@ describe("askChoices: validation (D4)", () => {
 	});
 });
 
+// ---- askJudgment (wl-mv8k039gvogt8g PLAN rev 5 § 2 D2, § 3 T5): choice, bool and score in one call ------------------
+// new guard: no fail-before (askJudgment does not exist before sl-rank-core).
+
+const TYPED: JudgmentQuestions = {
+	when: { type: "choice", instructions: "When is it due?", criteria: { none: "No date.", today: "Today." } },
+	unblocks: { type: "bool", instructions: "Does it unblock Jo?", criteria: { true: "Yes.", false: "No." } },
+	spend: { type: "bool", instructions: "Does it cut spend?" },
+	goal: { type: "score", instructions: "How far does it advance the goal?", criteria: ["Unrelated.", "Touches it.", "Partly.", "Delivers it."] },
+};
+/** OMP's library judge answers a `noul` question with `{ type: "noul", noul }` (pi-ai judgment/types.ts NoulAnswer). */
+const WIRE = {
+	when: { type: "choice", choice: "today", confidence: 0.8, probabilities: { none: 0.2, today: 0.8 } },
+	unblocks: { type: "noul", noul: 0.91 },
+	spend: { type: "noul", noul: 0 },
+	goal: { type: "score", score: 2.4, confidence: 0.7, probabilities: { 0: 0.05, 1: 0.05, 2: 0.3, 3: 0.6 } },
+};
+const typedReply = (answers: unknown, input?: number) => ({ answers, model: "jev-1.13.0", provider: "typesafe", ...(input === undefined ? {} : { usage: { input } }) });
+const askTyped = (r: unknown) => askJudgment({ judge: async () => r as never }, { item: "Restyle the settings modal" }, TYPED, { timeoutMs: 5_000 });
+
+describe("askJudgment: choice, bool and score in one call (wl-mv8k039gvogt8g D2)", () => {
+	test("valid answers of all three types pass: bool read from the wire's noul, a score between levels kept, spend from input tokens", async () => {
+		expect(await askTyped(typedReply(WIRE, 2_000))).toEqual({
+			ok: true,
+			answers: {
+				when: { type: "choice", choice: "today", confidence: 0.8, probabilities: { none: 0.2, today: 0.8 } },
+				unblocks: { type: "bool", bool: 0.91 },
+				spend: { type: "bool", bool: 0 },
+				goal: { type: "score", score: 2.4, confidence: 0.7, probabilities: { 0: 0.05, 1: 0.05, 2: 0.3, 3: 0.6 } },
+			},
+			model: "jev-1.13.0", provider: "typesafe", tokens: 2_000, cost: 2_000 * JEV_USD_PER_INPUT_TOKEN,
+		});
+	});
+
+	test("the request carries the state object and the questions with bool as noul, criteria kept, and a signal", async () => {
+		const calls: { req: unknown; signal?: AbortSignal }[] = [];
+		const recording = { judge: async (req: unknown, o?: { signal?: AbortSignal }) => { calls.push({ req, signal: o?.signal }); return typedReply(WIRE); } };
+		const state = { goals: ["ship as2"], item: "Restyle\n\nRestyle the settings modal", today: "2026-10-14 (Wednesday)" };
+		await askJudgment(recording as never, state, TYPED, { timeoutMs: 5_000 });
+		expect(calls.length).toBe(1);
+		expect(calls[0]!.req).toEqual({
+			state,
+			questions: {
+				when: TYPED.when,
+				unblocks: { type: "noul", instructions: "Does it unblock Jo?", criteria: { true: "Yes.", false: "No." } },
+				spend: { type: "noul", instructions: "Does it cut spend?" },
+				goal: TYPED.goal,
+			},
+		});
+		expect(calls[0]!.signal).toBeInstanceOf(AbortSignal);
+	});
+
+	const bad: [string, unknown][] = [
+		["a missing question", { ...WIRE, spend: undefined }],
+		["a bool above 1", { ...WIRE, unblocks: { type: "noul", noul: 1.2 } }],
+		["a bool below 0", { ...WIRE, unblocks: { type: "noul", noul: -0.1 } }],
+		["a bool as a string", { ...WIRE, unblocks: { type: "noul", noul: "0.9" } }],
+		["a bool answered as a choice", { ...WIRE, unblocks: { type: "choice", choice: "yes", confidence: 0.9, probabilities: { yes: 0.9, no: 0.1 } } }],
+		["a score above the top level", { ...WIRE, goal: { ...WIRE.goal, score: 3.5 } }],
+		["a score below 0", { ...WIRE, goal: { ...WIRE.goal, score: -1 } }],
+		["a score as a string", { ...WIRE, goal: { ...WIRE.goal, score: "2" } }],
+		["a score confidence above 1", { ...WIRE, goal: { ...WIRE.goal, confidence: 1.5 } }],
+		["score probabilities over labels, not level indices", { ...WIRE, goal: { ...WIRE.goal, probabilities: { low: 0.4, high: 0.6 } } }],
+		["score probabilities missing a level", { ...WIRE, goal: { ...WIRE.goal, probabilities: { 0: 0.1, 1: 0.1, 2: 0.8 } } }],
+		["score probabilities not summing to 1", { ...WIRE, goal: { ...WIRE.goal, probabilities: { 0: 0.5, 1: 0.5, 2: 0.5, 3: 0.5 } } }],
+		["a choice not among the labels", { ...WIRE, when: { ...WIRE.when, choice: "tomorrow" } }],
+		["a choice with no probabilities", { ...WIRE, when: { type: "choice", choice: "today", confidence: 0.8 } }],
+	];
+	for (const [name, answers] of bad) {
+		test(`${name}: not ok, reason malformed, the reported spend kept`, async () => {
+			const got = await askTyped(typedReply(answers, 1_500));
+			expect(got).toMatchObject({ ok: false, failure: "malformed", tokens: 1_500, cost: 1_500 * JEV_USD_PER_INPUT_TOKEN });
+			expect(got.ok ? "" : got.reason).toStartWith("malformed: ");
+		});
+	}
+
+	test("a thrown judge: not ok, reason error, cost unknown", async () => {
+		const got = await askJudgment({ judge: async () => { throw new Error("503 from typesafe"); } }, "s", TYPED, { timeoutMs: 5_000 });
+		expect(got).toEqual({ ok: false, failure: "error", reason: "error: 503 from typesafe", cost: null });
+	});
+
+	test("a judge that never answers: not ok, reason timeout, at timeoutMs and not before; the signal it got is aborted", async () => {
+		vi.useFakeTimers();
+		try {
+			let seen: AbortSignal | undefined;
+			const hanging = { judge: (_req: unknown, o?: { signal?: AbortSignal }) => { seen = o?.signal; return Promise.withResolvers<never>().promise; } };
+			let got: Outcome | undefined;
+			void askJudgment(hanging, "s", TYPED, { timeoutMs: 30_000 }).then((r) => (got = r));
+			await flush();
+			vi.advanceTimersByTime(29_999);
+			await flush();
+			expect(got).toBeUndefined();
+			vi.advanceTimersByTime(1);
+			await flush();
+			expect(got).toMatchObject({ ok: false, cost: null, reason: "timeout after 30000 ms" });
+			expect(seen?.aborted).toBe(true);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+});
+
 // ---- the lane classifier's background attempt (D4 scheduling, entries, the guarantee) ------------------------------
 
 const TABLE = tierTableFromConfig({
 	task: {
 		agentModelOverrides: {
-			fast: ["anthropic/claude-haiku-4-5"],
+			fast: ["anthropic/claude-haiku-5-5"],
 			standard: ["anthropic/claude-sonnet-5-5"],
 			strong: ["anthropic/claude-opus-5-5"],
 			deep: ["anthropic/claude-fable-5-1"],
@@ -195,15 +304,13 @@ const BRIEF = "Restyle the settings modal: match the new token scale and spacing
 const SUCCESS = "pair-signal: taste yes 0.91 ambiguous no 0.85 judge typesafe/jev-1.13.0 tokens unknown cost 0.0001";
 let seq = 0;
 
-/** A fresh ledger with one autonomous normal-stakes workload (a unique id: the attempt map is per workload) and one done slice. */
+/** A fresh ledger with one autonomous normal-stakes workload (a unique id: the attempt map is per workload). */
 function workload(): { ledger: Ledger; wl: string } {
 	const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "judge-ask-"));
 	dirs.push(dir);
 	const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backup: false });
 	const wl = `wl-jask${++seq}${Date.now().toString(36)}`;
 	ledger.openWorkload({ id: wl, brief: BRIEF, stakes: "normal", mode: "autonomous", by: "orch-test" });
-	const sl = ledger.addSlice({ by: "lane-test", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
-	ledger.completeSlice(sl, { by: "lane-test", artifact: "bun test → exit 0" });
 	return { ledger, wl };
 }
 
@@ -228,13 +335,8 @@ function host(ledger: Ledger, wl: string, judge: { judge(req: { state: string })
 
 const pairEntries = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => /^pair-signal(-failed)?:/.test(e.body)).map((e) => [e.created_by, e.body]);
 
-function ceilingRaise(ledger: Ledger, wl: string): { options: string[]; offers: number } {
-	const { questionId } = raiseCeilingQuestion(ledger, { workloadId: wl, laneId: "lane-test", spend: { usd: 40, tokens: 1000, wallMin: 30 }, ceiling: { usd: 50, wallMin: 360 }, stakes: "normal" });
-	return {
-		options: JSON.parse(ledger.question(questionId)!.options) as string[],
-		offers: ledger.entries(wl).filter((e) => e.body.startsWith(`pair-offer: ${questionId} `)).length,
-	};
-}
+/** The pair offer the round-limit raise would make now (classifier/extension.ts reads it the same way), with no stalled count: the signals, or null. */
+const raiseOffer = (ledger: Ledger, wl: string) => pairOffer(ledger, wl, { config: readPairSuggestConfig() });
 
 describe("the background pair-signal attempt (D4)", () => {
 	test("switch off: no judge call on any event", async () => {
@@ -327,7 +429,7 @@ describe("the background pair-signal attempt (D4)", () => {
 		}
 	});
 
-	test("switched on mid-session: the next tool result writes pair-signal:, and the next ceiling raise offers pair on E alone", async () => {
+	test("switched on mid-session: the next tool result writes pair-signal:, and the next round-limit raise offers pair on E alone", async () => {
 		pairSuggest("off");
 		const { ledger, wl } = workload();
 		const j = pairJudge(async () => reply(GOOD, 0.0001));
@@ -339,13 +441,10 @@ describe("the background pair-signal attempt (D4)", () => {
 		h.otherToolResult("read", {});
 		await flush();
 		expect(pairEntries(ledger, wl)).toEqual([[CLASSIFIER_BY, SUCCESS]]);
-		const raised = ceilingRaise(ledger, wl);
-		expect(raised).toEqual({ options: [...CEILING_OPTIONS, "pair"], offers: 1 });
-		const offer = ledger.entries(wl).find((e) => e.body.startsWith("pair-offer:"))!.body;
-		expect(offer).toMatch(/ signals e$/i);
+		expect(raiseOffer(ledger, wl)).toEqual({ signals: ["e"] });
 	});
 
-	test("a raise while the attempt is pending offers nothing and writes nothing that blocks the later raise, which offers on E", async () => {
+	test("a raise while the attempt is pending offers nothing, and the later raise offers on E", async () => {
 		pairSuggest("all");
 		const { ledger, wl } = workload();
 		const d = Promise.withResolvers<unknown>();
@@ -354,11 +453,11 @@ describe("the background pair-signal attempt (D4)", () => {
 		await h.turnEnd();
 		await flush();
 		expect(j.calls.length).toBe(1);
-		expect(ceilingRaise(ledger, wl)).toEqual({ options: [...CEILING_OPTIONS], offers: 0 });
+		expect(raiseOffer(ledger, wl)).toBeNull();
 		d.resolve(reply(GOOD, 0.0001));
 		await flush();
 		expect(pairEntries(ledger, wl)).toEqual([[CLASSIFIER_BY, SUCCESS]]);
-		expect(ceilingRaise(ledger, wl)).toEqual({ options: [...CEILING_OPTIONS, "pair"], offers: 1 });
+		expect(raiseOffer(ledger, wl)).toEqual({ signals: ["e"] });
 	});
 
 	test("the 0.70 cut is on the judge's own confidence: taste yes 0.69996 is written unrounded and offers nothing; 0.70 offers pair on E", async () => {
@@ -369,17 +468,17 @@ describe("the background pair-signal attempt (D4)", () => {
 			const h = host(ledger, wl, pairJudge(async () => reply(answers, 0.0001)).judge);
 			await h.turnEnd();
 			await flush();
-			return { signal: pairEntries(ledger, wl).map(([, body]) => body), raised: ceilingRaise(ledger, wl) };
+			return { signal: pairEntries(ledger, wl).map(([, body]) => body), raised: raiseOffer(ledger, wl) };
 		};
 		const below = await run(0.69996);
-		expect(below.raised).toEqual({ options: [...CEILING_OPTIONS], offers: 0 });
+		expect(below.raised).toBeNull();
 		expect(below.signal).toEqual(["pair-signal: taste yes 0.69996 ambiguous no 0.85 judge typesafe/jev-1.13.0 tokens unknown cost 0.0001"]);
 		const at = await run(0.7);
 		expect(at.signal).toEqual(["pair-signal: taste yes 0.7 ambiguous no 0.85 judge typesafe/jev-1.13.0 tokens unknown cost 0.0001"]);
-		expect(at.raised).toEqual({ options: [...CEILING_OPTIONS, "pair"], offers: 1 });
+		expect(at.raised).toEqual({ signals: ["e"] });
 		const whole = await run(1);
 		expect(whole.signal).toEqual(["pair-signal: taste yes 1 ambiguous no 0.85 judge typesafe/jev-1.13.0 tokens unknown cost 0.0001"]);
-		expect(whole.raised).toEqual({ options: [...CEILING_OPTIONS, "pair"], offers: 1 });
+		expect(whole.raised).toEqual({ signals: ["e"] });
 	});
 
 	// Review round 2: a lane's own record that the switch covered it, independent of the per-workload jev attempt.

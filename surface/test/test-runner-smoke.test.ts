@@ -9,13 +9,13 @@
 // names the failing test with its first error line, and `lane_complete_slice` is refused with the runner message.
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { renderExecWrapper } from "../src/as2test";
 import { recordRepo } from "../src/decision-log";
-import { type TestRun, testRuns } from "../src/test-run";
+import { partResult, type TestRun, testRuns, WRAPPER_EXIT } from "../src/test-run";
 import { INSTRUCTION_POLL_MS, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, timers, tmp, until } from "./helpers";
 
@@ -141,8 +141,10 @@ function world(): World {
 	const libexec = join(root, "libexec");
 	mkdirSync(libexec);
 	chmodSync(libexec, 0o755);
+	const resourcesPath = join(root, "resources.json");
+	writeFileSync(resourcesPath, JSON.stringify({ workerCpu: 1, workerMemoryBytes: 1, reserveCpu: 0, reserveMemoryBytes: 0, calibration: "synthetic test fixture only; not host calibration" }));
 	writeFileSync(join(libexec, "exec"), renderExecWrapper({
-		root: as2, bun: process.execPath, script: TEST_EXEC, sweepScope: "groups", hooks: join(root, "hooks"), killGraceMs: 300, sweepLockWaitMs: 30_000,
+		root: as2, bun: process.execPath, script: TEST_EXEC, sweepScope: "groups", hooks: join(root, "hooks"), resourcesPath, killGraceMs: 300, sweepLockWaitMs: 30_000,
 	}));
 	writeFileSync(join(libexec, "bun"), "stand-in for the installed bun\n");
 	writeFileSync(join(libexec, "test-exec.js"), "stand-in for the installed bundle\n");
@@ -264,7 +266,8 @@ describe("S5b: lane_full_test to the lane's aside, through the real starter and 
 		expect(run.full).toMatchObject({ pass: 2, fail: 0, exit: 0 });
 		await until("the settle", () => l.w.ledger.slice(slice!)?.state === "done", 30_000);
 		expect(l.w.ledger.slice(slice!)).toMatchObject({ state: "done", changed_by: TEST_RUNNER_BY });
-		expect(l.w.ledger.slice(slice!)!.artifact).toBe(`test-run ${runId}: green at ${fx.head.green} on PR #${PR.green}; full 2/0/0; alone: ./a.test.ts 1/0; ${join(l.w.runs, runId!)}`);
+		// PLAN wl-mvq4edh02r5z40 D1: the full part ran the changed a.test.ts, so nothing runs alone.
+		expect(l.w.ledger.slice(slice!)!.artifact).toBe(`test-run ${runId}: green at ${fx.head.green} on PR #${PR.green}; full 2/0/0; alone: none; ${join(l.w.runs, runId!)}`);
 
 		// (4) the lane row delivers exactly one aside, on the timer and on a tool result, never again
 		expect(l.asides()).toEqual([]);
@@ -276,7 +279,7 @@ describe("S5b: lane_full_test to the lane's aside, through the real starter and 
 		expect(a.options).toEqual({ deliverAs: "aside", triggerTurn: true });
 		expect(a.message.content).toStartWith(`Test run ${runId} on ${l.wl}: green at ${fx.head.green} (PR #${PR.green}, slice ${slice}, ledger entry ${run.entryId}).`);
 		expect(a.message.content).toContain("Full suite: 2 passed, 0 failed, 0 skipped.");
-		expect(a.message.content).toContain("Changed test files alone: ./a.test.ts 1 passed, 0 failed, 0 skipped.");
+		expect(a.message.content).toContain("Test files alone: none.");
 		expect(a.message.content).toContain(`The runner completed ${slice} on this green`);
 	});
 
@@ -309,7 +312,7 @@ describe("S5b: lane_full_test to the lane's aside, through the real starter and 
 		const c = l.asides()[0]!.message.content;
 		expect(c).toStartWith(`Test run ${runId} on ${l.wl}: red at ${fx.head.red} (PR #${PR.red}, slice ${slice}, ledger entry ${run.entryId}).`);
 		expect(c).toContain("Full suite: 2 passed, 1 failed, 0 skipped.");
-		expect(c).toContain("Changed test files alone: ./red.test.ts 1 passed, 1 failed, 0 skipped.");
+		expect(c).toContain("Test files alone: ./red.test.ts 1 passed, 1 failed, 0 skipped.");
 		expect(c).toContain(`Failing (2 of 2):\n- [full] ${failure.name}: ${failure.firstError}\n- [./red.test.ts] ${run.failures[1]!.name}: ${run.failures[1]!.firstError}`);
 		expect(c).toContain("kaboom: the broken thing broke");
 		expect(c).toContain(`${slice} stays open: fix, push, then call lane_full_test with pr ${PR.red} and slice ${slice} again.`);
@@ -317,5 +320,43 @@ describe("S5b: lane_full_test to the lane's aside, through the real starter and 
 		// the lane cannot complete the slice itself: the runner settles it
 		expect(await l.call("lane_complete_slice", { slice: slice!, artifact: "bun test passed" })).toBe(`the test runner settles ${slice}; call lane_full_test. Nothing was completed.`);
 		expect(l.w.ledger.slice(slice!)!.state).toBe("open");
+	});
+});
+
+// PLAN wl-mvq4edbaf13vnk D4 (R9): the Mac fallback of the hosted fast check, through the same rendered wrapper and fake sudo
+// the runner spawns, on the red PR's bundle: `fast` runs only the ./ test files it names, inside the clone, in one bun call.
+describe("fast through the installed-form wrapper: only the named ./ test files, in one bun test call", () => {
+	test("fast on the red PR's clone runs red.test.ts alone (never xa.test.ts), records one process group, and refuses an operand outside the clone or an option", () => {
+		const w = world();
+		const as2 = join(w.root, "as2");
+		const exec = join(w.root, "libexec", "exec");
+		const runId = "tr-fastsmoke1";
+		const stage = join(as2, "stage", runId);
+		mkdirSync(stage);
+		g(fx.bare, "bundle", "create", "-q", join(stage, "repo.bundle"), "--all");
+		writeFileSync(join(stage, "caps.json"), JSON.stringify({ fullCapMin: 2, soloCapMin: 2, fastCapMin: 2 }));
+		writeFileSync(join(as2, "stage", "current"), `${runId}\n`);
+		const wrap = (...args: string[]) => {
+			const r = Bun.spawnSync(["sudo", "-n", "-u", "_as2test", exec, ...args], { env: w.env, stdout: "pipe", stderr: "pipe" });
+			return { exit: r.exitCode, stderr: r.stderr.toString() };
+		};
+		expect(wrap("prepare", runId, fx.head.red)).toEqual({ exit: WRAPPER_EXIT.ok, stderr: "" });
+		const work = join(as2, "runs", runId);
+
+		for (const op of ["../xa.test.ts", "./../red.test.ts", "--bail", "xa.test.ts", "./README.md", "/etc/red.test.ts", "./missing.test.ts"]) {
+			const r = wrap("fast", runId, "./red.test.ts", op);
+			expect({ op, exit: r.exit }).toEqual({ op, exit: WRAPPER_EXIT.refused });
+		}
+		expect(readdirSync(work).filter((n) => n.startsWith("fast."))).toEqual([]);
+
+		const r = wrap("fast", runId, "./red.test.ts");
+		expect(r).toEqual({ exit: 1, stderr: "" });
+		expect(readFileSync(join(w.root, "sudo.log"), "utf8").trim().split("\n").at(-1)).toBe(`fast ${runId}`);
+		expect(readFileSync(join(work, "groups"), "utf8").split("\n").filter((l) => l !== "")).toHaveLength(1);
+		const junit = readFileSync(join(work, "fast.xml"), "utf8");
+		const result = partResult({ junit, log: readFileSync(join(work, "fast.log"), "utf8"), exit: r.exit, ms: 0 });
+		expect(result).toMatchObject({ pass: 1, fail: 1, skip: 0, exit: 1, error: null });
+		expect(result.failures.map((f) => f.name)).toEqual(["red.test.ts > the broken thing"]);
+		expect(junit).not.toContain("xa.test.ts");
 	});
 });

@@ -154,12 +154,16 @@ export interface Poll {
 const LANE_EXIT = /^lane-exit:\s+(lane-\S+)/;
 const LANE_STARTED = /^lane-started:\s+(lane-\S+)/;
 const BUILDER_LAB_ENTRY = /^builder-lab:/;
-/** Kinds whose single line accounts for open slices nobody holds: the death or the idle end was surfaced. */
-const SURFACED_END: readonly ErrorKind[] = ["lane-died", "idle"];
+/**
+ * Kinds whose single line accounts for open slices nobody holds: the death or the idle end was surfaced, or a taken pair
+ * (the only `pair` line `judgePoll` keeps: an offer line rides its question's and is dropped; PLAN wl-mvb9mw00ycfjeo D5).
+ */
+const SURFACED_END: readonly ErrorKind[] = ["lane-died", "idle", "pair"];
 
 /**
  * One judge poll of the throwaway ledger (§ 2.4): the needs-you lines naming `wl` from
- * `errorLines`, merged into `seen`, and the three conditions.
+ * `errorLines` (less offer-state `pair` lines, which add no line of their own to the one-line check),
+ * merged into `seen`, and the three conditions.
  *
  * (c) does not re-decide which hands count: chaos reads only that a hand's spawning lane has exited
  * — a later `lane-exit:` naming that lane, or a later `lane-started:` of another lane, from any writer
@@ -178,7 +182,7 @@ export function judgePoll(
 	const now = opts.now ?? ledger.now();
 	const n = seen.polls;
 	const lines = errorLines(ledger, ledger.inFlight(), { now })
-		.filter((l) => l.workloadId === wl)
+		.filter((l) => l.workloadId === wl && !(l.kind === "pair" && l.state === "offer"))
 		.map((l) => ({ identity: lineIdentity(l), kind: l.kind, rowId: l.rowId, text: l.line }));
 	const merged = new Map(seen.lines);
 	for (const l of lines) {

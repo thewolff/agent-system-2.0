@@ -33,8 +33,19 @@ export function resumeMarkerPath(sessionId) {
   return join(stateDir(), `resume-${String(sessionId).replace(/[^A-Za-z0-9._-]/g, "_")}`);
 }
 
+// Present once the session-start hook has shown its no-judge notice (hooks/i-have-audhd-inject.mjs).
+export function judgeNoticeMarkerPath() {
+  return join(stateDir(), "judge-notice-shown");
+}
+
 export function lastBlockedPath(sessionId) {
   return join(stateDir(), `last-blocked-${String(sessionId).replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
+}
+
+// The warn findings of the session's latest checked stop, waiting for its next turn
+// (lib/pending.mjs writes and consumes it).
+export function pendingWarningPath(sessionId) {
+  return join(stateDir(), `pending-warn-${String(sessionId).replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
 }
 
 export function sha256hex(text) {

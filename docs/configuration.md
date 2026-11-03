@@ -8,12 +8,12 @@ as2 was built for one user on one Mac. This page lists what you can change today
 |---|---|---|
 | `profile/config.yml` | `~/.omp/profiles/<profile>/agent/config.yml`, rendered with `{repo}` filled in | Extensions, skills, tier → model rows, the judge, the fence switch, the test runner, compaction, display |
 | `profile/models.yml` | Beside `config.yml` | The pinned judge model's definition on the `typesafe` provider |
-| `profile/mcp.json` | Beside `config.yml` | The profile's MCP servers. The installer refuses a file without an `mcpServers.ctx` entry that has a `command` |
+| `profile/mcp.json` | Merged into `mcp.json` beside `config.yml` | The profile's MCP servers: ctx, Linear and PostHog (definitions only; the Linear and PostHog logins are per profile, see [getting-started.md](getting-started.md#mcp-logins-linear-and-posthog)). The installer refuses a file without an `mcpServers.ctx` entry that has a `command` |
 | `tiers/*.md` | Linked into `agents/` | The six role prompts (orchestrator, lane, four hand tiers). Links, so edits are live without a re-install |
 | `voice/VOICE.md` | Read in place | The voice the orchestrator writes in; rendered into its system prompt at each `as2` launch |
-| `contract/output-types.md` | Read in place | The output-types contract injected into every session |
+| `plugins/output-types/skills/output-types/reference.md` | Read in place | The output-types contract injected into every session (the vendored public plugin, plugins/VENDOR.md) |
 
-Edit the files in the checkout and re-run `bash install/install.sh`. The installer overwrites the installed `config.yml`, `models.yml` and `mcp.json` on every run, so edits made directly in `~/.omp/profiles/` are lost at the next install. The one exception is `as2 on` / `as2 off`, which flips `gates.fence.enabled` in the installed file until the next install.
+Edit the files in the checkout and re-run `bash install/install.sh`. The installer overwrites the installed `config.yml` and `models.yml` on every run, so edits made directly in `~/.omp/profiles/` are lost at the next install. `mcp.json` is merged instead: each server named in `profile/mcp.json` replaces the installed server of the same name, and every other installed server and top-level setting is kept. A server removed from `profile/mcp.json` stays installed until you delete it from the installed file, and an installed `mcp.json` that is not a JSON object stops the install (exit 2) before anything is written. The one other exception is `as2 on` / `as2 off`, which flips `gates.fence.enabled` in the installed file until the next install.
 
 ### `profile/config.yml` keys
 
@@ -24,7 +24,8 @@ Edit the files in the checkout and re-run `bash install/install.sh`. The install
 | `retry.fallbackChains.judge` | `[]` | Keeps OMP from falling back to another judge |
 | `gates.fence.enabled` | `true` | `false` runs bash unwrapped; the gates write one ledger entry per lane session saying so |
 | `testRunner.repos` | `thewolff/agent-system-2.0` with `bun test` | The GitHub `owner/repo` origins the test runner serves, each with its test command. Replace it with your own repositories |
-| `testRunner.fullCapMin` / `soloCapMin` / `reportCapMb` / `queueMaxMin` | 20 / 10 / 50 / 60 | Per-run caps for the full suite, each changed file alone, report size, and lock wait |
+| `testRunner.fullCapMin` / `soloCapMin` / `reportCapMb` / `queueMaxMin` | 20 / 10 / 50 / 1440 | Per-run caps for the full suite (a part that passes its cap is killed and ends the run), each test file run alone (changed files with no executed case, or failing files), report size, and lock wait. A merge train's runs never end on the lock-wait cap: dead lock holders and dead waiters are replaced or pruned instead |
+| `testRunner.stuckStop` | `shadow` | The stuck-worker detector's mode, written into each run's `caps.json` beside `fullWorkers`. `shadow` logs `stuck-would-stop` and keeps going: a part is never stopped, so the wall cap stays the only stop. `enforce` stops a part whose worker is positively stuck in `Bun.spawnSync` (about 45 s from the first sign to the next run taking the lock), ends the run as an error with a `stuck:` reason and runs no further part. Anything else is refused. The detector is macOS only. `profile/config.yml` leaves it unset; `migration/items/stuck-worker-detector.md` says how to switch it on and read the field report |
 | `compaction.thresholdPercent` | 25 | When the orchestrator and lanes compact their context |
 | `skills.includeSkills` | 22 skills | Must equal the manifest's `skill` rows exactly, or the install is refused. Adding a skill means adding `skills/<name>/SKILL.md` with a frontmatter `description` and a manifest row |
 | `extensions` | surface, gates, classifier | Order matters: the surface must load before the gates, and the gates before the classifier |
@@ -37,9 +38,9 @@ Edit the files in the checkout and re-run `bash install/install.sh`. The install
 | `AGENT_SYSTEM_LEDGER_DB` | `$HOME/.agent-system-2/ledger.db` | Ledger file, for the installer and at run time |
 | `AGENT_SYSTEM_PROFILE` | `agent-system-2` | OMP profile name, for the installer and `as2` |
 | `AGENT_SYSTEM_MAX_LANES` | 3 | Autonomous lanes holding workloads at once |
-| `AGENT_SYSTEM_LANE_MAX_TIME` | `2h` | OMP `--max-time` for a lane; the ceiling's remaining wall time takes over when set |
+| `AGENT_SYSTEM_LANE_MAX_TIME` | `2h` | OMP `--max-time` for a lane; the ceiling's remaining wall time takes over when set. A merge train lane has no wall: it gets 1440 min (24 h) as a hang backstop, and a shorter value here still wins |
 | `AGENT_SYSTEM_VOICE` | `voice/VOICE.md` in the checkout | The voice document |
-| `AGENT_SYSTEM_CONTRACT` | `contract/output-types.md` in the checkout | The output-types contract |
+| `AGENT_SYSTEM_CONTRACT` | `plugins/output-types/skills/output-types/reference.md` in the checkout | The output-types contract |
 | `AGENT_SYSTEM_DECISION_LOG` | `<repo>/.ai/decision-log` | Where decision-log entries are read from, and written when no lane branch can take one |
 | `AGENT_SYSTEM_TEST_RUNS` | `test-runs/` beside the ledger | The test runner's runs root |
 
@@ -66,7 +67,7 @@ Each item names where it lives, so a change starts in the right file.
 - **The OpenAI review rule.** `REVIEW_ROW_FROM` in `classifier/src/lab.ts` sends a deep-tier review's OpenAI reviewer to the strong row ([MIGRATION.md](../MIGRATION.md) item 110).
 - **The judge.** The classifier's 0.55 threshold (`LOW_CONFIDENCE_THRESHOLD`, `classifier/src/route.ts`) was measured on `typesafe/jev-1.13.0`, recorded in `classifier/calibration.json`, and the classifier refuses to route on any other judge. Moving the judge needs a new classifier sample and calibration, not only a profile edit. A TypeSafe account is therefore required today. Planned: any judge-capable model, re-measured ([MIGRATION.md](../MIGRATION.md) item 95).
 - **Cross-lab review is always required.** With one lab, every review parks on a `same-lab` / `wait` question. There is no setting to allow same-lab reviews by default.
-- **Kind → tier and stakes → cap** (`KIND_TIER`, `STAKES_CAP` in `classifier/src/route.ts`), **ceilings by stakes** and the `change-large` factor of 3 (`CEILING_BY_STAKES`, `CHANGE_LARGE_FACTOR` in `surface/src/ceiling.ts`), and **review round limits** (`classifier/src/rounds.ts`) are constants. The per-workload words change one workload, not the defaults.
+- **Kind → tier and stakes → cap** (`KIND_TIER`, `STAKES_CAP` in `classifier/src/route.ts`), **ceilings by stakes** and the `change-large` factor of 3 (`CEILING_BY_STAKES`, `CHANGE_LARGE_FACTOR` in `surface/src/ceiling.ts`), the **merge train's daily budget**, $150 per America/Los_Angeles day with its 24 h per-run backstop (`TRAIN_DAILY_USD`, `TRAIN_TZ`, `TRAIN_RUN_MAX_TIME_MIN` in `surface/src/train-budget.ts`), and **review round limits** (`classifier/src/rounds.ts`) are constants. The per-workload words change one workload, not the defaults.
 
 ### Git host and repositories
 

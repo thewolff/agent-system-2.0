@@ -288,11 +288,13 @@ describe("bin/as2 drops exactly SHELL_START_HOOK_NAMES only where the clean shel
 		expect(r.status).toBe(0);
 		return r.stdout;
 	};
-	const MAIN = "env OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd ";
+	// None of these configs has an observability block, so the tracing switch (surface/src/tracing.ts) reads off and its one
+	// word, OTEL_SDK_DISABLED=true, follows the clean shell's -u words (the env here carries no OTEL_* name to unset).
+	const MAIN = "env OTEL_SDK_DISABLED=true OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd ";
 
 	test('gates.cleanShell "all": the launch line drops every hook name', () => {
 		const line = print('gates:\n  cleanShell: "all"\n');
-		expect(line).toStartWith(`env ${SHELL_START_HOOK_NAMES.map((n) => `-u ${n}`).join(" ")} OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd `);
+		expect(line).toStartWith(`env ${SHELL_START_HOOK_NAMES.map((n) => `-u ${n}`).join(" ")} OTEL_SDK_DISABLED=true OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd `);
 		expect(line).not.toContain("PI_NO_PTY");
 	});
 

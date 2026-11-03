@@ -1,27 +1,30 @@
-// PR 1 of wl-mv67564rdkfvnk (PLAN rev 5 § 2 D7; § 5 `sl-trig-tests`): Jo's typed `pair` on a round-limit or ceiling
-// question that offered it, through the surface's own word path (`interpret` then `apply`, surface/src/input.ts). In one
-// write it settles the question the way `stop` does (review-loop-end <sl> stop, or the ceiling slice done `answered stop`),
-// flips the workload to user-driven as Jo via the surface, records `pair-taken: <q> by <answer> mode user-driven`, and
-// asks a lane holding the workload live to stop (`lane-stop: <lane> requested …`). `pair` on a question with no valid
-// offer is refused naming the question, and nothing is written.
+// PR 1 of wl-mv67564rdkfvnk (PLAN rev 5 § 2 D7; § 5 `sl-trig-tests`): Jo's typed `pair` on a round-limit question that
+// offered it, through the surface's own word path (`interpret` then `apply`, surface/src/input.ts). In one write it
+// settles the question the way `stop` does (review-loop-end <sl> stop), flips the workload to user-driven as Jo via the
+// surface, records `pair-taken: <q> by <answer> mode user-driven`, and asks a lane holding the workload live to stop
+// (`lane-stop: <lane> requested …`). `pair` on a question with no valid offer is refused naming the question, and
+// nothing is written. The round-limit question is the one raise site since PLAN wl-mvfkv7llkp7nk0 § 4.
 //
-// The questions are built as the PR 1 raise sites write them (the plan's D1): the round-limit question raised by the lane
-// with its `review-limit:` entry and a classifier-stamped `pair-offer: <q> site round-limit …`; the ceiling question
-// raised by the lane runner on its `sl-ceiling-…` slice with a runner-stamped `pair-offer: <q> site ceiling …`.
+// The question is built as the raise site writes it (the plan's D1; PLAN wl-mvb9mw00ycfjeo D1: the body carries no
+// `pair:` line): raised by the lane with its `review-limit:` entry and a classifier-stamped
+// `pair-offer: <q> site round-limit …`.
+//
+// PLAN wl-mvb9mw00ycfjeo R4 and R5: `pair` answered single, by its number (`1 pair`) and on a pasted line settles the same
+// way, and pair on a question that does not offer it is refused on each path; the receipt ends on a line that is exactly
+// `as2 lane <workload-id>`.
 //
 // Regression: fails on 946c016 by assertion (`pair` is answered as a plain word: no loop end, no flip, no pair-taken:).
 import { describe, expect, test } from "bun:test";
 import { reviewLimitBody, reviewLoopEndBody, reviewRoundBody, ROUND_LIMIT_OPTIONS } from "../../classifier/src/rounds";
-import { CLASSIFIER_BY, LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
-import { type Ceiling, CEILING_OPTIONS } from "../src/ceiling";
-import { apply, interpret } from "../src/input";
+import { CLASSIFIER_BY, LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
+import { errorLines } from "../src/errors";
+import { apply, interpret, interpretBatch, interpretPaste } from "../src/input";
 import { controlEntries } from "../src/launch";
+import { Numbering } from "../src/numbering";
 import { SURFACE_BY } from "../src/types";
-import { ceilingKey, ceilingQuestionState } from "../scripts/lane";
 import { tempLedger } from "./helpers";
 
 const LANE = "lane-t-1";
-const NORMAL: Ceiling = { usd: 50, wallMin: 360 };
 
 /** An autonomous normal workload; with `held`, lane-t-1 holds it under a live lease. */
 function workload(ledger: Ledger, held: boolean): string {
@@ -42,23 +45,11 @@ function roundLimitQuestion(ledger: Ledger, o: { held: boolean; offer?: boolean;
 	ledger.recordEntry({ by: LANE, workloadId: wl, sliceId: sl, kind: "assumption", body: reviewRoundBody({ slice: sl, round: 1, token: "dt-r1", group: "dg-r1", verdict: "accepted", findings }) });
 	const q = ledger.raiseQuestion({
 		by: LANE, workloadId: wl, sliceId: sl,
-		body: `The review of ${sl} reached its round limit: 1 failed round of 1 allowed (normal stakes).\npair: jev: UI/taste work (0.91).`,
+		body: `The review of ${sl} reached its round limit: 1 failed round of 1 allowed (normal stakes).`,
 		options: o.options ?? [...ROUND_LIMIT_OPTIONS, "pair"],
 	});
 	ledger.recordEntry({ by: LANE, workloadId: wl, sliceId: sl, kind: "assumption", body: reviewLimitBody(q, sl) });
 	if (o.offer !== false) ledger.recordEntry({ by: CLASSIFIER_BY, workloadId: wl, kind: "assumption", body: `pair-offer: ${q} site round-limit signals e` });
-	return { wl, sl, q };
-}
-
-/** The runner's ceiling question for $50 / 6h on its own sl-ceiling slice, offering pair, with its runner-stamped pair-offer:. */
-function ceilingQuestion(ledger: Ledger, o: { held: boolean }): { wl: string; sl: string; q: string } {
-	const wl = workload(ledger, o.held);
-	const sl = ledger.addSlice({
-		by: LANE_RUNNER_BY, workloadId: wl, id: `sl-ceiling-${wl.slice(3)}-1`, task: "Jo decides the ceiling overrun",
-		doneCondition: `Jo answers stop, extend or split for the ceiling ${ceilingKey(NORMAL)}`, inputs: "ceiling",
-	});
-	const q = ledger.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body: "80 % of the ceiling\npair: 3 long steers from you since open.", options: [...CEILING_OPTIONS, "pair"] });
-	ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: `pair-offer: ${q} site ceiling signals b,c` });
 	return { wl, sl, q };
 }
 
@@ -70,6 +61,34 @@ function typed(ledger: Ledger, text: string): { receipt?: string; refused?: stri
 		return { receipt: apply(ledger, cmd) };
 	} catch (error) {
 		return { refused: error instanceof Error ? error.message : String(error) };
+	}
+}
+
+/** Jo answers by number (`text` a numbered batch over the needs-you lines as numbered now): the receipts, or the refusal lines. */
+function numbered(ledger: Ledger, text: string): { receipts?: string[]; refused?: string[] } {
+	const numbering = new Numbering();
+	numbering.assign(errorLines(ledger));
+	const r = interpretBatch(ledger, numbering, text);
+	if (r === null) return { refused: [`"${text}" is no batch`] };
+	if (!r.ok) return { refused: r.lines };
+	try {
+		return { receipts: ledger.write(() => r.items.map(({ cmd }) => apply(ledger, cmd))) };
+	} catch (error) {
+		return { refused: [error instanceof Error ? error.message : String(error)] };
+	}
+}
+
+/** Jo pastes `text` (several lines): the command receipts, or the refusal verdicts. */
+function pasted(ledger: Ledger, text: string): { receipts?: string[]; refused?: string[] } {
+	const numbering = new Numbering();
+	numbering.assign(errorLines(ledger));
+	const r = interpretPaste(ledger, numbering, text);
+	if (r === null) return { refused: ["prose"] };
+	if (!r.ok) return { refused: r.refused.map((f) => (f.why === null ? `line ${f.line} ok` : Array.isArray(f.why) ? f.why.join("; ") : "ambiguous")) };
+	try {
+		return { receipts: ledger.write(() => r.items.flatMap((i) => (i.kind === "command" ? [apply(ledger, i.cmd)] : i.kind === "batch" ? i.items.map(({ cmd }) => apply(ledger, cmd)) : []))) };
+	} catch (error) {
+		return { refused: [error instanceof Error ? error.message : String(error)] };
 	}
 }
 
@@ -129,32 +148,6 @@ describe("pair on an offered round-limit question (D7)", () => {
 	});
 });
 
-describe("pair on an offered ceiling question (D7)", () => {
-	test("held by a live lane: the ceiling slice is done `answered stop <answer>`, the runner reads stop, no ceiling raise or relaunch, the mode flips, pair-taken: and lane-stop: are written", () => {
-		const { ledger } = tempLedger();
-		const { wl, sl, q } = ceilingQuestion(ledger, { held: true });
-		expect(typed(ledger, "pair").refused).toBeUndefined();
-		const row = ledger.question(q)!;
-		expect(row.state).toBe("answered");
-		expect(ledger.slice(sl)).toMatchObject({ state: "done", artifact: `answered stop ${row.resolved_by}` });
-		expect(ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), ledger.instructions(wl), NORMAL)).toBe("stop");
-		expect(controlEntries(ledger.entries(wl, "assumption")).filter((c) => c.prefix === "ceiling" || c.prefix === "launch-requested").map((c) => c.body))
-			.toEqual(["ceiling: usd 50 wall 360 source stakes normal"]);
-		expectFlippedByJo(ledger, wl);
-		expect(bodies(ledger, wl, "pair-taken:").map((e) => [e.body, e.created_by])).toEqual([[`pair-taken: ${q} by ${row.resolved_by} mode user-driven`, SURFACE_BY]]);
-		expect(laneStops(ledger, wl).map((c) => c.createdBy)).toEqual([SURFACE_BY]);
-	});
-
-	test("no lane holds it: settled and flipped, no lane-stop:", () => {
-		const { ledger } = tempLedger();
-		const { wl, sl } = ceilingQuestion(ledger, { held: false });
-		expect(typed(ledger, "pair").refused).toBeUndefined();
-		expect(ledger.slice(sl)!.state).toBe("done");
-		expectFlippedByJo(ledger, wl);
-		expect(laneStops(ledger, wl)).toEqual([]);
-	});
-});
-
 describe("pair with no valid offer (D7)", () => {
 	test("a round-limit question listing pair with no pair-offer: entry: refused naming the question, nothing written", () => {
 		const { ledger } = tempLedger();
@@ -162,5 +155,54 @@ describe("pair with no valid offer (D7)", () => {
 		const before = snapshot(ledger, wl);
 		expect(typed(ledger, "pair")).toEqual({ refused: expect.stringContaining(`${q} does not offer pair`) });
 		expect(snapshot(ledger, wl)).toEqual(before);
+	});
+});
+
+describe("pair by number and pasted (PLAN wl-mvb9mw00ycfjeo R4, R5)", () => {
+	for (const [path, answer, words] of [["numbered", numbered, (_q: string) => "1 pair"], ["pasted", pasted, (q: string) => `pair ${q}\nKeep the token scale.`]] as const) {
+		test(`${path}: an offered round-limit question held by a live lane settles as stop, flips to user-driven, writes pair-taken: and requests lane-stop:; the receipt ends on exactly \`as2 lane <wl>\``, () => {
+			const { ledger } = tempLedger();
+			const { wl, sl, q } = roundLimitQuestion(ledger, { held: true });
+			const r = answer(ledger, words(q));
+			expect(r.refused).toBeUndefined();
+			expect(r.receipts).toHaveLength(1);
+			expect(r.receipts![0]!.split("\n").at(-1)).toBe(`as2 lane ${wl}`);
+			expect(ledger.question(q)!.state).toBe("answered");
+			expect(bodies(ledger, wl, "review-loop-end:").map((e) => e.body)).toEqual([reviewLoopEndBody(sl, "stop")]);
+			expectFlippedByJo(ledger, wl);
+			expect(bodies(ledger, wl, "pair-taken:")).toHaveLength(1);
+			expect(laneStops(ledger, wl).map((c) => c.createdBy)).toEqual([SURFACE_BY]);
+		});
+
+		test(`${path}: pair on a question listing pair with no pair-offer: entry is refused naming the question, nothing written`, () => {
+			const { ledger } = tempLedger();
+			const { wl, q } = roundLimitQuestion(ledger, { held: true, offer: false });
+			const before = snapshot(ledger, wl);
+			const r = answer(ledger, words(q));
+			expect(r.receipts).toBeUndefined();
+			expect(r.refused!.join("\n")).toContain(`${q} does not offer pair`);
+			expect(snapshot(ledger, wl)).toEqual(before);
+		});
+	}
+
+	test("pair on a question that never listed pair: refused on every path, nothing written", () => {
+		const { ledger } = tempLedger();
+		const { wl, q } = roundLimitQuestion(ledger, { held: true, offer: false, options: [...ROUND_LIMIT_OPTIONS] });
+		const before = snapshot(ledger, wl);
+		expect(typed(ledger, `pair ${q}`).receipt).toBeUndefined();
+		expect(numbered(ledger, "1 pair").receipts).toBeUndefined();
+		expect(pasted(ledger, `pair ${q}\nThanks.`).receipts).toBeUndefined();
+		expect(snapshot(ledger, wl)).toEqual(before);
+	});
+});
+
+describe("the pair receipt (PLAN wl-mvb9mw00ycfjeo D6, R5)", () => {
+	test("ends on `in another terminal:` then a line that is exactly the by-hand command; no `continue it yourself` clause", () => {
+		const { ledger } = tempLedger();
+		const { wl, q } = roundLimitQuestion(ledger, { held: false });
+		const lines = typed(ledger, `pair ${q}`).receipt!.split("\n");
+		expect(lines.slice(-2)).toEqual(["in another terminal:", `as2 lane ${wl}`]);
+		expect(lines[0]).toStartWith(`answered ${q} with "pair"`);
+		expect(lines.join("\n")).not.toContain("continue it yourself");
 	});
 });

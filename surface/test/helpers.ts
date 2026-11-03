@@ -7,11 +7,23 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
-import { type ControlEntry, controlEntries, holdersOf, laneStarted } from "../src/launch";
+import { type ControlEntry, controlEntries, holdersOf, laneStarted, PRECLAIM_LEASE_MS } from "../src/launch";
 import { laneDeaths } from "../src/signals";
 import type { SurfaceAPI } from "../src/types";
 
 export const tmp = (tag: string): string => mkdtempSync(join(tmpdir(), `surface-${tag}-`));
+
+/** A "How it fails" section a fixture brief or plan ends with, so the open tool and the plan question accept it (issue #334 item 2). */
+export const HOW_IT_FAILS = "\n## How it fails\n- a step fails: it surfaces in that step's output; fix it and retry, once";
+
+/**
+ * Fixture source: an expression whose value is a `Bun.spawn(["/usr/bin/true"], <options>)` subprocess still unreaped when the
+ * call returns, for fixtures that then block their event loop to hold the child as a zombie. Measured on bun 1.3.14, about a
+ * third of these calls return with the child already exited and reaped (`exitCode` set), leaving no zombie at all; the
+ * expression spawns again until one returns with `exitCode` null, and throws after 50 tries.
+ */
+export const unreapedTrue = (options = "{}"): string =>
+	`(() => { for (let i = 0; i < 50; i++) { const c = Bun.spawn(["/usr/bin/true"], ${options}); if (c.exitCode === null) return c; } throw new Error("50 Bun.spawn(/usr/bin/true) calls returned with the child already reaped"); })()`;
 
 /** A settable clock: `at(iso)` moves it; every ledger write stamps the current value. */
 export function clock(start = "2026-10-01T10:00:00.000Z"): { now: () => string; at: (iso: string) => void; plusHours: (h: number) => void } {
@@ -72,7 +84,7 @@ export function fakePi(tools = ["read", "bash", "ask", "task", "yield"], o: { ex
 		appendEntry: (type: string, data?: unknown) => entries.push({ type, data }),
 		registerTool: (t: FakeTool) => registered.set(t.name, t),
 		sendMessage: (message: Sent["message"], options?: unknown) => sent.push({ message, options }),
-		zod: { object: schema, string: schema, array: schema, enum: schema },
+		zod: { object: schema, string: schema, array: schema, enum: schema, union: schema },
 	};
 	/** pi.exec, opt-in (`fakePi(tools, { exec: true })`): recorded, answered by `execs.answer` (default: exit 0, empty output). */
 	const exec = async (command: string, args: string[], options?: unknown) => {
@@ -177,6 +189,31 @@ export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resum
 	};
 };
 
+/** Minimal offline Text double; ANSI controls are indivisible and only visible characters consume width. */
+export const loadTestText = async () => class TestText {
+	constructor(private readonly text: string) {}
+	invalidate(): void {}
+	render(width: number): string[] {
+		const rows: string[] = [];
+		for (const line of this.text.split("\n")) {
+			let row = "";
+			let columns = 0;
+			for (const token of line.match(/\x1b\]8;[^\x07]*(?:\x07)|\x1b\[[0-9;]*m|[^\x1b]/gu) ?? []) {
+				const size = token.startsWith("\x1b") ? 0 : Bun.stringWidth(token);
+				if (size > 0 && columns + size > width && columns > 0) {
+					rows.push(row);
+					row = "";
+					columns = 0;
+				}
+				row += token;
+				columns += size;
+			}
+			rows.push(row);
+		}
+		return rows;
+	}
+};
+
 // ---- the lane script's scratch root (surface/test/lane-script.test.ts, lane-smoke.test.ts) ----------
 
 export const LANE_SCRIPT = join(import.meta.dir, "..", "scripts", "lane.ts");
@@ -207,6 +244,8 @@ export interface FakeRecord {
 	/** On a `prompt` event: the frame's id and message. */
 	id?: string;
 	message?: string;
+	/** On a `prompt` event: the `@file` initial message (an interactive launch's first turn), not an rpc frame. */
+	initial?: boolean;
 	/** One per rpc command frame the fake received, in arrival order (`set_model` carries its provider and modelId). */
 	command?: string;
 	provider?: string;
@@ -218,7 +257,11 @@ export type FakeStep =
 	| { result: string; error?: { message: string; provider?: string; model?: string; retryable: boolean } }
 	| { usage: { usd: number; tokens: number }; hand?: string }
 	| { background: number | "never" } | { wake: { ms: number; steps: FakeStep[] } }
-	| { ledger: { body: string; slice?: string } | { routing: { slice: string } } };
+	| { ledger: { body: string; slice?: string } | { routing: { slice: string } } }
+	/** One frame written to stdout as-is (fake-omp.ts header). */
+	| { emit: Record<string, unknown> }
+	/** `text` written to `path`, e.g. the profile config re-rendered mid-run (fake-omp.ts header). */
+	| { writeFile: { path: string; text: string } };
 /** The fake omp's script (surface/test/fake-omp.ts header). */
 export interface FakeScript {
 	claim?: boolean;
@@ -240,6 +283,10 @@ export interface FakeScript {
 	shutdownOnTerm?: boolean;
 	/** A helper holds the fake's stdout open until this file exists (≤ 30 s): the runner's finish() waits past omp's death for the test. */
 	holdStdoutUntil?: string;
+	/** Exit before RPC ready; writes chunks verbatim (including a final fragment) before exiting or self-signalling. */
+	startup?: { chunks?: string[]; code?: number; signal?: "SIGTERM"; delayMs?: number };
+	/** A helper holds only stderr open until this gate exists (≤ 30 s). */
+	holdStderrUntil?: string;
 }
 
 export const sh = (cmd: string[], cwd: string, env?: Record<string, string>) => {
@@ -262,16 +309,25 @@ export function tempRepo(): string {
 
 /**
  * A scratch root for the lane script: HOME with the profile config and a fresh ledger, the fake omp
- * on PATH ahead of the real binary, a git repo with one commit and a bare remote. The readiness
- * window and the SIGKILL grace are shortened through the runner's two test knobs; `over` adds or
+ * on PATH ahead of the real binary, a git repo with one commit and a bare remote. The readiness window is the production one
+ * (PRECLAIM_LEASE_MS, 3 min), so no test's pass path races it: a busy full suite can delay the fake omp's claim past seconds.
+ * It is not what bounds a test that is not about it: a lane that never claims shows up as the test's own wait timing out
+ * (`until` names what it waited for) and `settleDrains`' SIGKILL of the runner. A test whose subject is the
+ * window sets its own short AGENT_SYSTEM_LANE_READY_MS in `over`. The SIGKILL grace is shortened
+ * through the runner's test knob; `over` adds or
  * replaces environment variables. The quota polls (`AS2_HEADROOM_POLLS`, classifier/src/headroom.ts) point at a file that
  * does not exist, so the runner's guard is open and never reads the real quota-watch polls (PLAN wl-mv71x5rwdu7eo0 § 4); a
- * headroom test passes its own fixture in `over`.
+ * headroom test passes its own fixture in `over`. `tag` names the temp root (`surface-<tag>-…`): one with spaces puts spaces in
+ * every path beneath it (HOME, the lane dir and its prompt.md, the repo and its worktree).
+ * `rootBase` confines all fixture files to an existing caller-owned scratch directory; omitted, the OS temp directory is used.
  */
-export function laneRoot(over: Record<string, string> = {}): LaneRoot {
+export function laneRoot(over: Record<string, string> = {}, tag = "lane-root", rootBase = tmpdir()): LaneRoot {
 	// git rev-parse --show-toplevel reports the canonical path and the worktree is derived from it: the root is canonical too.
-	const root = realpathSync(tmp("lane-root"));
+	const root = realpathSync(mkdtempSync(join(rootBase, `surface-${tag}-`)));
 	const home = join(root, "home");
+	const temp = join(root, "tmp");
+	const bunCache = join(root, "bun-cache");
+	for (const path of [temp, bunCache]) mkdirSync(path, { mode: 0o700 });
 	const profile = join(home, ".omp", "profiles", "agent-system-2", "agent");
 	mkdirSync(profile, { recursive: true });
 	writeFileSync(join(profile, "config.yml"), "setupVersion: 2\n");
@@ -280,7 +336,7 @@ export function laneRoot(over: Record<string, string> = {}): LaneRoot {
 	Ledger.open(ledgerPath, { create: true, backup: false, backupOnOpen: false }).close();
 	const bin = join(root, "bin");
 	mkdirSync(bin);
-	writeFileSync(join(bin, "omp"), `#!/bin/sh\nexec bun ${FAKE_OMP} "$@"\n`);
+	writeFileSync(join(bin, "omp"), `#!/bin/sh\nexec bun --no-install ${FAKE_OMP} "$@"\n`);
 	chmodSync(join(bin, "omp"), 0o755);
 	const repo = join(root, "repo");
 	mkdirSync(join(repo, ".ai", "decision-log"), { recursive: true });
@@ -298,7 +354,8 @@ export function laneRoot(over: Record<string, string> = {}): LaneRoot {
 	const script = join(root, "omp-script.json");
 	const env: Record<string, string> = {
 		PATH: `${bin}:${process.env.PATH ?? ""}`, HOME: home, AGENT_SYSTEM_LEDGER_DB: ledgerPath, FAKE_OMP_RECORD: record, FAKE_OMP_SCRIPT: script,
-		AGENT_SYSTEM_LANE_READY_MS: "4000", AGENT_SYSTEM_LANE_END_GRACE_MS: "1500", AGENT_SYSTEM_LEASE_MS: "60000", AS2_HEADROOM_POLLS: join(root, "no-headroom-polls.jsonl"), ...over,
+		TMPDIR: temp, BUN_INSTALL_CACHE_DIR: bunCache,
+		AGENT_SYSTEM_LANE_READY_MS: String(PRECLAIM_LEASE_MS), AGENT_SYSTEM_LANE_END_GRACE_MS: "1500", AGENT_SYSTEM_LEASE_MS: "60000", AS2_HEADROOM_POLLS: join(root, "no-headroom-polls.jsonl"), ...over,
 	};
 	return { root, home, repo, remote, ledgerPath, record, script, env };
 }
@@ -306,6 +363,17 @@ export function laneRoot(over: Record<string, string> = {}): LaneRoot {
 export const setScript = (r: LaneRoot, s: FakeScript) => writeFileSync(r.script, JSON.stringify(s));
 export const fakeRecords = (r: LaneRoot): FakeRecord[] => (existsSync(r.record) ? readFileSync(r.record, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as FakeRecord) : []);
 export const laneIdOf = (wl: string, n: number) => `lane-${wl.replace(/^wl-/, "")}-${n}`;
+/**
+ * The two extensions notices OMP really sent when install.sh re-rendered the profile's `extensions:` block mid-run, verbatim
+ * (~/.agent-system-2/lanes/wl-mvr888nftz0vcl/lane-5.jsonl:4231 and a verified/current one; decision en-mw01fr5uts72g0).
+ */
+export const SUSPENDED_FRAMES = [
+	`{"type":"notice","level":"warning","message":"Restart omp to load newly enabled extensions: /Users/jowolff/code/agent-system-2.0/surface/index.ts, /Users/jowolff/code/agent-system-2.0/gates/index.ts, /Users/jowolff/code/agent-system-2.0/classifier/extension.ts, /Users/jowolff/code/agent-system-2.0/plugins/index.ts","source":"extensions"}`,
+	`{"type":"notice","level":"warning","message":"Restart omp to load newly enabled extensions: /Users/jowolff/.agent-system-2/verified/current/surface/index.ts, /Users/jowolff/.agent-system-2/verified/current/gates/index.ts, /Users/jowolff/.agent-system-2/verified/current/classifier/extension.ts, /Users/jowolff/.agent-system-2/verified/current/plugins/index.ts","source":"extensions"}`,
+] as const;
+/** Other notice sources from real lane frames, verbatim (the lanes' lane-<n>.jsonl under ~/.agent-system-2/lanes): never a suspension. */
+export const COMPACTION_FRAME = `{"type":"notice","level":"warning","message":"Compaction freed too little context to make progress — pausing automatic maintenance to avoid a compaction loop. The most recent turn alone is too large to reduce further; shrink it (e.g. clear large tool output) or switch to a larger-context model.","source":"compaction"}`;
+export const SESSION_PERSISTENCE_FRAME = `{"type":"notice","level":"warning","message":"Session ~/.agent-system-2/lanes/wl-mv6144px2e2n7k/sessions/2026-10-13T01-55-34-285Z_01a132f8-e30d-7000-933b-3e6f036aacca.jsonl is open for writing in another omp process, so this session now saves to ~/.agent-system-2/lanes/wl-mv6144px2e2n7k/sessions/2026-10-14T22-30-06-414Z_01a13c89-7f4e-7000-bc3f-038a333dbfbd.jsonl instead of mixing its entries into that file.","source":"session-persistence"}`;
 
 /** The workload's rows as the launcher reads them, through a fresh handle (the processes write through their own). */
 export function laneSnapshot(r: LaneRoot, wl: string) {
@@ -390,10 +458,25 @@ function rootControl(r: LaneRoot): ControlEntry[] {
 }
 
 /**
+ * The runner pid each drain attempt names (`attempt <drain> <wl> exit 0: lane <laneId> runner <pid>`, the starter's line), by lane.
+ * A runner may quit before its lane-started: with nothing written (surface/scripts/lane.ts, every `not started: … nothing was
+ * written` refusal, e.g. ps not answering under load), so for such a lane this pid is the only process to wait on.
+ */
+function drainRunners(r: LaneRoot): Map<string, number> {
+	const out = new Map<string, number>();
+	for (const l of drainLines(r)) {
+		const m = /^attempt \d+ \S+ exit 0: .*\blane (lane-\S+) runner (\d+)$/.exec(l);
+		if (m) out.set(m[1]!, Number(m[2]));
+	}
+	return out;
+}
+
+/**
  * Before a root is removed: every runner's lane and every lane a drain launched has ended (lane-exit:, or
- * launch-failed: for a starter that failed after its reservation), every runner process is gone, every runner
- * that wrote its own lane-exit: has its `spawned` line, and every spawned drain has logged its end and is
- * gone. Repeated until a pass finds no new launch and no new drain, since a drain's lane spawns its own drain.
+ * launch-failed: for a starter that failed after its reservation, or, for a lane with no lane-started:, its runner,
+ * the pid its drain's attempt line names, gone: a runner that refuses to start writes nothing), every runner process
+ * is gone, every runner that wrote its own lane-exit: has its `spawned` line, and every spawned drain has logged its
+ * end and is gone. Repeated until a pass finds no new launch and no new drain, since a drain's lane spawns its own drain.
  * When a wait fails (its timeout, or an unreadable ledger), every runner and drain of the root still alive is
  * SIGKILLed and waited for until it is gone, then the failure is rethrown: the caller removes the root only
  * after this returns or rejects, so no process it waited on outlives its root.
@@ -402,14 +485,19 @@ export async function settleDrains(r: LaneRoot, timeoutMs = 60_000): Promise<voi
 	if (!existsSync(r.ledgerPath)) return;
 	const deadline = Date.now() + timeoutMs;
 	const left = () => Math.max(1_000, deadline - Date.now());
+	// The runner is checked before the ledger is read, so a runner seen gone has every write it made visible to that read.
+	const ended = (laneId: string): boolean => {
+		const pid = drainRunners(r).get(laneId);
+		const gone = pid !== undefined && !alive(pid);
+		const rows = rootControl(r).filter((c) => c.laneId === laneId);
+		return rows.some((c) => c.prefix === "lane-exit" || c.prefix === "launch-failed") || (gone && !rows.some((c) => c.prefix === "lane-started"));
+	};
 	try {
 		for (let seen = ""; ;) {
 			const control = rootControl(r);
 			const runnerLanes = new Set(control.filter((c) => c.prefix === "lane-started" && c.createdBy === "lane-runner").map((c) => c.laneId!));
 			const lanes = new Set([...runnerLanes, ...control.filter((c) => c.prefix === "launch" && / requested-by lane-runner$/.test(c.rest)).map((c) => c.laneId!)]);
-			for (const laneId of lanes) {
-				await until(`the end of ${laneId}`, () => rootControl(r).some((c) => c.laneId === laneId && (c.prefix === "lane-exit" || c.prefix === "launch-failed")), left());
-			}
+			for (const laneId of lanes) await until(`the end of ${laneId}`, () => ended(laneId), left());
 			for (const laneId of runnerLanes) {
 				const pid = laneStarted(control, laneId)?.runnerPid;
 				if (pid) await until(`runner ${pid} gone`, () => !alive(pid), left());
@@ -422,7 +510,8 @@ export async function settleDrains(r: LaneRoot, timeoutMs = 60_000): Promise<voi
 			seen = now;
 		}
 	} catch (err) {
-		// The pids this function waits on: every runner's (from its lane-started:, when the ledger still reads) and every drain's.
+		// The pids this function waits on: every runner's (from its lane-started:, when the ledger still reads, and from its
+		// drain's attempt line, which names one that never wrote lane-started:) and every drain's.
 		let runners: number[] = [];
 		try {
 			const control = rootControl(r);
@@ -430,7 +519,7 @@ export async function settleDrains(r: LaneRoot, timeoutMs = 60_000): Promise<voi
 		} catch {
 			// An unreadable ledger leaves the drains, which drain.log names.
 		}
-		const live = [...new Set([...runners, ...drainsSpawned(r).map((d) => d.pid)])].filter((pid) => pid > 0 && alive(pid));
+		const live = [...new Set([...runners, ...drainRunners(r).values(), ...drainsSpawned(r).map((d) => d.pid)])].filter((pid) => pid > 0 && alive(pid));
 		for (const pid of live) {
 			try {
 				process.kill(pid, "SIGKILL");

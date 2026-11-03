@@ -7,7 +7,7 @@
 // prompt leaves the prompt byte-identical, that a push after such a launch inlines neither, and that
 // as2 refuses to launch when a source file is missing.
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import contractRow from "../../gates/extensions/r02-contract";
 import { CONTRACT_MARKER } from "../../gates/src/rows/r02-contract";
@@ -124,6 +124,10 @@ describe("bin/as2 renders the file before omp and refuses to launch without a so
 	function as2(args: string[], over: Record<string, string> = {}) {
 		const e = env(over);
 		const home = tmp("home");
+		// The installed profile config a real launch has: without it bin/as2's tracing reader notes the missing file on stderr.
+		const agentDir = join(home, ".omp", "profiles", "agent-system-2", "agent");
+		mkdirSync(agentDir, { recursive: true });
+		copyFileSync(join(import.meta.dir, "..", "..", "profile", "config.yml"), join(agentDir, "config.yml"));
 		const bin = tmp("bin");
 		const argvFile = join(home, "omp-argv");
 		writeFileSync(join(bin, "omp"), `#!/bin/sh\nprintf '%s\\n' "$@" > '${argvFile}'\n`);

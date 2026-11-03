@@ -36,11 +36,12 @@
 // marker below). Emit hookSpecificOutput.additionalContext, exit 0. The OMP adapter
 // (omp/i-have-audhd-omp.ts) spawns this same file and forwards additionalContext.
 
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { stateDir, resumeMarkerPath, appendLog } from "../lib/state.mjs";
+import { stateDir, resumeMarkerPath, judgeNoticeMarkerPath, appendLog } from "../lib/state.mjs";
+import { judgeChoiceState, judgeNotice } from "../lib/judge-setup.mjs";
 
 const SKILL_PATH = fileURLToPath(
   new URL("../skills/i-have-audhd/SKILL.md", import.meta.url),
@@ -59,13 +60,32 @@ const POINTER =
   "`i-have-audhd` skill's reference.md. The Stop hook warns by default; a flag file at " +
   "~/.claude/.i-have-audhd-off disables it within one turn.";
 
-function emit(text) {
+// systemMessage is shown to the person (Claude Code); the OMP adapter shows it as a UI notice.
+function emit(text, systemMessage) {
   process.stdout.write(
     JSON.stringify({
+      ...(systemMessage ? { systemMessage } : {}),
       hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: text },
     }),
   );
   process.exit(0);
+}
+
+// The fallback for an install whose operator never ran tools/setup.mjs: when the profile has
+// made no judge choice (lib/judge-setup.mjs, THE THREE STATES), the first session start shows
+// one notice naming the checks that are off and the command that fixes it, then leaves a
+// marker so it never repeats. A marker that cannot be written costs a repeat, not a loss.
+function judgeNoticeOnce() {
+  if (judgeChoiceState(profilePath()) !== "unset") return "";
+  const marker = judgeNoticeMarkerPath();
+  if (existsSync(marker)) return "";
+  try {
+    mkdirSync(stateDir(), { recursive: true });
+    writeFileSync(marker, `${new Date().toISOString()}\n`);
+  } catch (err) {
+    appendLog("errors.log", `could not write the judge-notice marker: ${err.message}`);
+  }
+  return judgeNotice();
 }
 
 function profilePath() {
@@ -170,7 +190,8 @@ try {
 
   const core = md.slice(start + START.length, end).trim();
   const { text, note } = readProfile();
-  emit(INTRO + core + text + POINTER + (note ? `\n${note}` : ""));
+  const notice = judgeNoticeOnce();
+  emit(INTRO + core + text + POINTER + (note ? `\n${note}` : "") + (notice ? `\n${notice}` : ""), notice);
 } catch {
   // Fail open, and say so — a silent failure reads exactly like success.
   try {

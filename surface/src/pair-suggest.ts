@@ -1,15 +1,16 @@
-// The suggest-only `pair` trigger (PLAN wl-mv67564rdkfvnk § 2 D1–D9, PR 1). Two existing raise sites — the classifier's
-// round-limit question (classifier/extension.ts `roundSettled`) and the lane runner's ceiling question
-// (surface/scripts/lane.ts `raiseCeilingQuestion`) — add the option `pair` and one last `pair: <reasons>. <tail>` line
-// when the installed profile's `pairSuggest` switch covers the workload and a signal fired (`pairOffer`). Nothing else
-// changes at a raise: with nothing to offer the question is byte-identical to the raise without this module.
+// The suggest-only `pair` trigger (PLAN wl-mv67564rdkfvnk § 2 D1–D9, PR 1; PLAN wl-mvb9mw00ycfjeo D1–D3). One raise
+// site — the classifier's round-limit question (classifier/extension.ts `roundSettled`) — stores the option `pair` last
+// and writes a `pair-offer:` entry when the installed profile's `pairSuggest` switch covers the workload and a signal
+// fired (`pairOffer`). The lane runner's ceiling question was the second site until PLAN wl-mvfkv7llkp7nk0 § 4 turned
+// it into a notice. The body is never touched: it is byte-identical to the raise without this module, and every
+// surface render shows the offer as its own line instead (`pairOfferLine`, `pairPendingLine`), reading the
+// `pair-offer:` entry.
 //
 // Signals (D3), each computed from ledger rows only:
 //   a  the slice's review loop is stalled: two or more complete rounds with a known blocking count, the last at least
-//      the first (round-limit site only, from the count the raise read);
+//      the first (from the count the raise read);
 //   b  three or more long steers from Jo: surface-written instructions, author jo, channel surface, whose quoted words
 //      (a relay `Jo: "<words>" — reading: …`) or whole body run past 80 characters; d2 adds one;
-//   c  no slice done yet (the ceiling site only, and only with another signal);
 //   d1 jev reads the brief as ambiguous, e jev reads it as UI/taste work: the newest classifier-stamped `pair-signal:`
 //      with that answer `yes` at a confidence of 0.70 or more;
 //   d2 two or more `revise` answers on the plan question (listed only with b, which it feeds).
@@ -18,26 +19,27 @@
 //
 // The rows (D4, D7, D9): `pair-signal:` / `pair-signal-failed:` (the classifier's jev attempt), `pair-exposure:` (the
 // lane's classifier, once per lane session, when the switch covers its workload), `pair-offer:` (the raise site's record
-// that it offered pair: CLASSIFIER_BY at the round limit, LANE_RUNNER_BY at the ceiling) and `pair-taken:` (the surface,
-// when Jo answers pair). The first four are classifier machinery prefixes and the last a surface control prefix
-// (surface/src/launch.ts), so no lane tool writes any of them.
+// that it offered pair, stamped CLASSIFIER_BY) and `pair-taken:` (the surface, when Jo answers pair). The first four are
+// classifier machinery prefixes and the last a surface control prefix (surface/src/launch.ts), so no lane tool writes
+// any of them.
 //
-// D8: `mechanicalEligibility` is the ungated A/B/C read at a moment, `pairSuggestHealth` the per-lane number the report
+// D8: `mechanicalEligibility` is the ungated A/B read at a moment, `pairSuggestHealth` the per-lane number the report
 // compares across switched-on and switched-off lanes (surface/scripts/pair-suggest.ts), and `pairLaneExposure` the
 // group (on or off) a lane is counted in.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { countRounds, parseReviewRound, type RoundCount } from "../../classifier/src/rounds";
 import {
-	CLASSIFIER_BY, type EntryRow, type InstructionRow, LANE_RUNNER_BY, type Ledger, type SliceRow, type WorkloadRow,
+	CLASSIFIER_BY, type EntryRow, type InstructionRow, type Ledger, type WorkloadRow,
 } from "../../ledger/src/index";
 import { homeDir } from "../../ledger/src/locality";
-import { controlEntries, holdersOf, isPlanQuestionIn } from "./launch";
+import { EXTEND_SOURCE, parseCeiling } from "./ceiling";
+import { byHandLine, controlEntries, holdersOf, isPlanQuestionIn } from "./launch";
 import { SURFACE_BY } from "./types";
 
 export const PAIR_OPTION = "pair";
-export type PairSite = "round-limit" | "ceiling";
-export const PAIR_SIGNALS = ["a", "b", "c", "d1", "d2", "e"] as const;
+export type PairSite = "round-limit";
+export const PAIR_SIGNALS = ["a", "b", "d1", "d2", "e"] as const;
 export type PairSignalId = (typeof PAIR_SIGNALS)[number];
 
 /** D3: the jev answer counts at this confidence of the chosen answer or more. */
@@ -54,7 +56,7 @@ export const MAX_OFFERS = 2;
 export const OFFER_GAP_MS = 60 * 60_000;
 
 /** The reads every function here makes; `Ledger` satisfies it, and the classifier's ledger is a `Ledger` at run time. */
-export type PairLedger = Pick<Ledger, "workload" | "entries" | "instructions" | "questions" | "question" | "slices" | "holders" | "now">;
+export type PairLedger = Pick<Ledger, "workload" | "entries" | "instructions" | "question" | "holders" | "now">;
 
 // ---- the switch (D2) ------------------------------------------------------------------------------------------------
 
@@ -110,7 +112,7 @@ export function pairSignalFailedBody(attempt: number, failure: "timeout" | "erro
 	return `pair-signal-failed: attempt ${attempt} ${failure} tokens ${known(tokens, String)} cost ${known(cost, dollars)}`;
 }
 
-/** `pair-offer: <q> site <round-limit|ceiling> signals <a,b,…>`: the raise site offered pair on question q. */
+/** `pair-offer: <q> site round-limit signals <a,b,…>`: the raise site offered pair on question q. */
 export function pairOfferBody(questionId: string, site: PairSite, signals: readonly PairSignalId[]): string {
 	return `pair-offer: ${questionId} site ${site} signals ${signals.join(",")}`;
 }
@@ -163,7 +165,7 @@ export function parsePairSignalFailed(body: string): { attempt: number; failure:
 	return { attempt: Number(m[1]), failure: m[2]!, tokens: m[3] === undefined || m[3] === "unknown" ? null : Number(m[3]), cost: cost !== null && Number.isFinite(cost) ? cost : null };
 }
 
-const PAIR_OFFER = /^pair-offer: (\S+) site (round-limit|ceiling) signals ([a-z0-9]+(?:,[a-z0-9]+)*)$/;
+const PAIR_OFFER = /^pair-offer: (\S+) site (round-limit) signals ([a-z0-9]+(?:,[a-z0-9]+)*)$/;
 
 /** A `pair-offer:` body parsed; null when malformed. */
 export function parsePairOffer(body: string): { questionId: string; site: PairSite; signals: string[] } | null {
@@ -171,16 +173,10 @@ export function parsePairOffer(body: string): { questionId: string; site: PairSi
 	return m ? { questionId: m[1]!, site: m[2] as PairSite, signals: m[3]!.split(",") } : null;
 }
 
-/** The stamp a raise site writes its `pair-offer:` with: the classifier at the round limit, the runner at the ceiling. */
-export function pairOfferStamp(site: PairSite): string {
-	return site === "round-limit" ? CLASSIFIER_BY : LANE_RUNNER_BY;
-}
-
 // ---- signals --------------------------------------------------------------------------------------------------------
 
 interface Fired {
 	id: PairSignalId;
-	reason: string | null;
 }
 
 /** The workload's rows read once, cut by `upTo` to those written at or before `at`. */
@@ -188,47 +184,35 @@ interface Rows {
 	workload: WorkloadRow;
 	entries: EntryRow[];
 	instructions: InstructionRow[];
-	slices: SliceRow[];
 	holders: string[];
 }
 
 function readRows(ledger: PairLedger, workload: WorkloadRow): Rows {
 	const id = workload.id;
-	return { workload, entries: ledger.entries(id), instructions: ledger.instructions(id), slices: ledger.slices(id), holders: ledger.holders(id) };
+	return { workload, entries: ledger.entries(id), instructions: ledger.instructions(id), holders: ledger.holders(id) };
 }
 
-/** The rows as they stood at `at`: those written at or before it, and a slice done after `at` read as not done at `at`. */
+/** The rows as they stood at `at`: those written at or before it. */
 function upTo(rows: Rows, at: string): Rows {
-	return {
-		...rows,
-		entries: rows.entries.filter((e) => e.created_at <= at),
-		instructions: rows.instructions.filter((i) => i.created_at <= at),
-		slices: rows.slices.filter((s) => s.created_at <= at).map((s) => (s.state === "done" && s.changed_at > at ? { ...s, state: "open" } : s)),
-	};
+	return { ...rows, entries: rows.entries.filter((e) => e.created_at <= at), instructions: rows.instructions.filter((i) => i.created_at <= at) };
 }
 
-/** A: a stalled loop's reason, `blocking 2 → 2 → 2 over rounds 1–3`, or null. */
-function stalled(count: RoundCount): string | null {
+/** A: is the loop stalled — two or more complete rounds with a known blocking count, the last at least the first. */
+function stalled(count: RoundCount): boolean {
 	const rounds = count.rounds.filter((r) => r.complete && r.blocking !== null);
-	if (rounds.length < 2) return null;
-	const first = rounds[0]!;
-	const last = rounds[rounds.length - 1]!;
-	if (last.blocking! < first.blocking!) return null;
-	return `blocking ${rounds.map((r) => r.blocking).join(" → ")} over rounds ${first.n}–${last.n}`;
+	if (rounds.length < 2) return false;
+	return rounds[rounds.length - 1]!.blocking! >= rounds[0]!.blocking!;
 }
 
-/** A over every slice with review rounds in `rows`: the first stalled loop's reason, or null. */
-function stalledAnywhere(rows: Rows): string | null {
+/** A over every slice with review rounds in `rows`: is any loop stalled. */
+function stalledAnywhere(rows: Rows): boolean {
 	const slices = new Set<string>();
 	for (const e of rows.entries) {
 		const r = e.kind === "assumption" ? parseReviewRound(e.body) : null;
 		if (r) slices.add(r.slice);
 	}
-	for (const sl of slices) {
-		const reason = stalled(countRounds(rows.entries, sl));
-		if (reason) return reason;
-	}
-	return null;
+	for (const sl of slices) if (stalled(countRounds(rows.entries, sl))) return true;
+	return false;
 }
 
 /** Jo's own words in a surface instruction: the quoted words of a relay, else the whole body. */
@@ -262,35 +246,29 @@ function jevSignal(rows: Rows): PairSignalEntry | null {
 	return null;
 }
 
-const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? "" : "s"}`;
-
 /**
- * The signals firing over `rows`, in the canonical order. `a`: from `count` (the round-limit site), from every slice
- * (`"anywhere"`, the mechanical read), or not at all (`null`). `c`: only when `withC` and another signal fired.
- * `jev`: whether d1 and e are read.
+ * The signals firing over `rows`, in the canonical order. `a`: from `count` (the round-limit raise), from every slice
+ * (`"anywhere"`, the mechanical read), or not at all (`null`). `jev`: whether d1 and e are read.
  */
-function signalsOf(rows: Rows, o: { a: RoundCount | "anywhere" | null; withC: boolean; jev: boolean }): Fired[] {
+function signalsOf(rows: Rows, o: { a: RoundCount | "anywhere" | null; jev: boolean }): Fired[] {
 	const fired: Fired[] = [];
-	const a = o.a === null ? null : o.a === "anywhere" ? stalledAnywhere(rows) : stalled(o.a);
-	if (a) fired.push({ id: "a", reason: a });
+	const a = o.a === null ? false : o.a === "anywhere" ? stalledAnywhere(rows) : stalled(o.a);
+	if (a) fired.push({ id: "a" });
 	const steers = longSteers(rows);
-	const revises = planRevises(rows);
-	const d2 = revises >= PLAN_REVISES;
+	const d2 = planRevises(rows) >= PLAN_REVISES;
 	if (steers + (d2 ? 1 : 0) >= LONG_STEERS) {
-		fired.push({ id: "b", reason: `${plural(steers, "long steer")} from you since open` });
-		if (d2) fired.push({ id: "d2", reason: `${plural(revises, "revise answer")} on the plan` });
+		fired.push({ id: "b" });
+		if (d2) fired.push({ id: "d2" });
 	}
 	const signal = o.jev ? jevSignal(rows) : null;
-	if (signal?.ambiguous.yes && signal.ambiguous.confidence >= PAIR_CONFIDENCE) fired.push({ id: "d1", reason: `jev: ambiguous brief (${signal.ambiguous.text})` });
-	if (signal?.taste.yes && signal.taste.confidence >= PAIR_CONFIDENCE) fired.push({ id: "e", reason: `jev: UI/taste work (${signal.taste.text})` });
-	const done = rows.slices.some((s) => !s.id.startsWith("sl-ceiling-") && s.state === "done");
-	if (o.withC && fired.length > 0 && !done) fired.push({ id: "c", reason: "no slice done yet" });
+	if (signal?.ambiguous.yes && signal.ambiguous.confidence >= PAIR_CONFIDENCE) fired.push({ id: "d1" });
+	if (signal?.taste.yes && signal.taste.confidence >= PAIR_CONFIDENCE) fired.push({ id: "e" });
 	return fired.sort((x, y) => PAIR_SIGNALS.indexOf(x.id) - PAIR_SIGNALS.indexOf(y.id));
 }
 
 /**
- * D8: the ungated mechanical read at `at` — A over every slice, B with D2's +1, C only with another; no jev, no
- * switch, no stakes or mode gate. Eligible when A or B fires. Reads only rows written at or before `at`.
+ * D8: the ungated mechanical read at `at` — A over every slice, B with D2's +1; no jev, no switch, no stakes or mode
+ * gate. Eligible when A or B fires. Reads only rows written at or before `at`.
  */
 export function mechanicalEligibility(ledger: PairLedger, workloadId: string, at: string): { eligible: boolean; signals: PairSignalId[] } {
 	const w = ledger.workload(workloadId);
@@ -299,23 +277,16 @@ export function mechanicalEligibility(ledger: PairLedger, workloadId: string, at
 }
 
 function mechanicalAt(rows: Rows, at: string): { eligible: boolean; signals: PairSignalId[] } {
-	const signals = signalsOf(upTo(rows, at), { a: "anywhere", withC: true, jev: false }).map((f) => f.id);
+	const signals = signalsOf(upTo(rows, at), { a: "anywhere", jev: false }).map((f) => f.id);
 	return { eligible: signals.includes("a") || signals.includes("b"), signals };
 }
 
-// ---- the offer (D1, D5, D6) -----------------------------------------------------------------------------------------
-
-/** D6: the line's tail, saying what answering pair does at this site. */
-export function pairTail(site: PairSite, workloadId: string): string {
-	return site === "round-limit"
-		? `Answering pair stops this review loop like stop and switches this workload to user-driven, so you steer the lane yourself (as2 lane ${workloadId}).`
-		: `Answering pair is stop plus a switch to user-driven: the autonomous lane stops at the ceiling, and you continue it yourself (as2 lane ${workloadId}).`;
-}
+// ---- the offer (D1, D5) ---------------------------------------------------------------------------------------------
 
 /** D5: may the workload take another offer now, with `fired` firing? */
-function capsAllow(ledger: PairLedger, rows: Rows, site: PairSite, fired: readonly Fired[], now: string): boolean {
+function capsAllow(ledger: PairLedger, rows: Rows, fired: readonly Fired[], now: string): boolean {
 	const offers = rows.entries.flatMap((e) => {
-		if (e.kind !== "assumption" || (e.created_by !== CLASSIFIER_BY && e.created_by !== LANE_RUNNER_BY)) return [];
+		if (e.kind !== "assumption" || e.created_by !== CLASSIFIER_BY) return [];
 		const o = parsePairOffer(e.body);
 		return o ? [{ ...o, at: e.created_at }] : [];
 	});
@@ -328,32 +299,67 @@ function capsAllow(ledger: PairLedger, rows: Rows, site: PairSite, fired: readon
 		if (!q || q.state !== "answered") continue;
 		const answer = rows.instructions.find((x) => x.id === q.resolved_by);
 		if (!answer || answer.body.trim().toLowerCase() === PAIR_OPTION) return true;
-		const then = new Set<string>(signalsOf(upTo(rows, answer.created_at), { a: site === "round-limit" ? "anywhere" : null, withC: site === "ceiling", jev: true }).map((f) => f.id));
+		const then = new Set<string>(signalsOf(upTo(rows, answer.created_at), { a: "anywhere", jev: true }).map((f) => f.id));
 		return fired.some((f) => !o.signals.includes(f.id) && !then.has(f.id));
 	}
 	return true;
 }
 
 /**
- * D1: the `pair` offer for a question about to be raised at `site`, or null. Null unless the switch (`ctx.config`, the
- * parsed installed config) covers the workload, the stakes are not throwaway, the mode is autonomous, a signal fired
- * and D5's caps allow it. `ctx.count` is the round count the round-limit raise read (signal A). The line is the
- * question's last line; `signals` go in the site's `pair-offer:` entry.
+ * D1: the `pair` offer for a round-limit question about to be raised, or null. Null unless the switch (`ctx.config`,
+ * the parsed installed config) covers the workload, the stakes are not throwaway, the mode is autonomous, a signal
+ * fired and D5's caps allow it. `ctx.count` is the round count the raise read (signal A). `signals` go in the
+ * `pair-offer:` entry; the question's body is left as it is (PLAN wl-mvb9mw00ycfjeo D1).
  */
-export function pairOffer(
-	ledger: PairLedger,
-	workloadId: string,
-	site: PairSite,
-	ctx: { config: unknown; count?: RoundCount },
-): { line: string; signals: PairSignalId[] } | null {
+export function pairOffer(ledger: PairLedger, workloadId: string, ctx: { config: unknown; count?: RoundCount }): { signals: PairSignalId[] } | null {
 	if (!pairSuggestOn(ctx.config, workloadId)) return null;
 	const w = ledger.workload(workloadId);
 	if (!w || w.stakes === "throwaway" || w.mode !== "autonomous") return null;
 	const rows = readRows(ledger, w);
-	const fired = signalsOf(rows, { a: site === "round-limit" ? (ctx.count ?? null) : null, withC: site === "ceiling", jev: true });
-	if (fired.length === 0 || !capsAllow(ledger, rows, site, fired, ledger.now())) return null;
-	const reasons = fired.flatMap((f) => (f.reason ? [f.reason] : []));
-	return { line: `pair: ${reasons.join("; ")}. ${pairTail(site, workloadId)}`, signals: fired.map((f) => f.id) };
+	const fired = signalsOf(rows, { a: ctx.count ?? null, jev: true });
+	if (fired.length === 0 || !capsAllow(ledger, rows, fired, ledger.now())) return null;
+	return { signals: fired.map((f) => f.id) };
+}
+
+// ---- the text Jo reads (PLAN wl-mvb9mw00ycfjeo D2–D5) ---------------------------------------------------------------
+
+/** D3: one phrase per signal id, short and fixed (no counts, so never wrong). */
+export const PAIR_REASONS: Readonly<Record<PairSignalId, string>> = {
+	a: "the review loop is not converging",
+	b: "you sent several long steers",
+	d1: "the brief reads as ambiguous",
+	d2: "the plan was revised more than once",
+	e: "it reads as UI or taste work",
+};
+
+/** The phrases of `signals` (a `pair-offer:` entry's ids, in its order) joined with `; `; an id this module does not know is skipped. */
+export function pairReasons(signals: readonly string[]): string {
+	return signals.flatMap((s) => ((PAIR_SIGNALS as readonly string[]).includes(s) ? [PAIR_REASONS[s as PairSignalId]] : [])).join("; ");
+}
+
+/** A question's options as Jo reads them: the stored `pair` left out (D2); the offer has its own line. */
+export function shownOptions(options: readonly string[]): string[] {
+	return options.filter((o) => o.toLowerCase() !== PAIR_OPTION);
+}
+
+/** D3: the needs-you and ledger-render offer line, `pair offer on <words> (q-…): <reasons>. Answer pair q-… to stop …`. */
+export function pairOfferLine(words: string, questionId: string, workloadId: string, signals: readonly string[]): string {
+	return `pair offer on ${words} (${questionId}): ${pairReasons(signals)}. Answer pair ${questionId} to stop the lane and drive it yourself (${byHandLine(workloadId)}).`;
+}
+
+/** D4: the pending block's offer line, indented under its question's answer line or overflow sentence, with D3's tail. */
+export function pairPendingLine(questionId: string, workloadId: string, signals: readonly string[]): string {
+	return `  ↳ pair offer: ${pairReasons(signals)}. Answer pair ${questionId} instead to stop the lane and drive it yourself (${byHandLine(workloadId)}).`;
+}
+
+/** D5: the taken line, its by-hand command on a line of its own. */
+export function pairTakenLine(words: string, questionId: string, workloadId: string): string {
+	return `you took pair on ${words} (${questionId}); its lane has ended. Continue it in another terminal:\n${byHandLine(workloadId)}`;
+}
+
+/** The question id a `pair-taken: <q> by <answer> mode user-driven` control entry's rest names, or null when malformed. */
+export function pairTakenQuestion(rest: string): string | null {
+	return /^(\S+) by \S+ mode user-driven$/.exec(rest)?.[1] ?? null;
 }
 
 // ---- the health number (D8) -----------------------------------------------------------------------------------------
@@ -388,8 +394,10 @@ export interface PairLane {
 /**
  * D8 for one lane: on the lane's workload (`lane-<wl>-<n>`), between its `lane-started:` and its `lane-exit:` (or now),
  * the first moment the mechanical read is eligible, and the score `post-signal-failed-rounds`: the failed review rounds
- * completed after that moment plus Jo's `extend` answers on the runner's ceiling questions after it (0 when never
- * eligible). Null when the workload is unknown or the lane never started. The same whether the switch was on or off.
+ * completed after that moment plus the one-block raises after it (0 when never eligible): each surface-written
+ * `ceiling:` entry with source `extend one block`, which Jo's `extend <wl>` word writes (PLAN wl-mvfkv7llkp7nk0 § 4) as
+ * did the extend answer to the runner's former ceiling question. Null when the workload is unknown or the lane never
+ * started. The same whether the switch was on or off.
  */
 export function pairSuggestLane(ledger: PairLedger, laneId: string): PairLane | null {
 	const m = /^lane-(.+)-\d+$/.exec(laneId);
@@ -404,13 +412,8 @@ export function pairSuggestLane(ledger: PairLedger, laneId: string): PairLane | 
 	const moment = times.find((t) => mechanicalAt(rows, t).eligible);
 	if (moment === undefined) return { workloadId: w.id, start, end, moment: null, score: 0 };
 	const failed = completedRounds(rows.entries).filter((r) => r.at > moment && r.at <= end && !r.passed).length;
-	const ceilingQuestions = new Set(
-		ledger.questions(w.id).filter((q) => q.created_by === LANE_RUNNER_BY && q.slice_id.startsWith("sl-ceiling-")).map((q) => q.id),
-	);
-	const extendAnswers = rows.instructions.filter((x) =>
-		x.kind === "answer" && x.question_id !== null && ceilingQuestions.has(x.question_id) && x.body.trim().split(/\s+/)[0]?.toLowerCase() === "extend"
-		&& x.created_at > moment && x.created_at <= end).length;
-	return { workloadId: w.id, start, end, moment, score: failed + extendAnswers };
+	const raises = control.filter((c) => c.prefix === "ceiling" && parseCeiling(c.rest)?.source === EXTEND_SOURCE && c.createdAt > moment && c.createdAt <= end).length;
+	return { workloadId: w.id, start, end, moment, score: failed + raises };
 }
 
 /** D8's registry number for one lane (`pairSuggestLane`'s score; 0 when the lane never started). */
@@ -425,9 +428,8 @@ export type PairExposure = "on" | "off";
  * D8's group for one lane, from its workload's entries. The ledger keeps no history of the config; its record that the
  * switch covered a lane is the lane's own classifier-stamped `pair-exposure: <laneId> on` (written once per lane session
  * while the switch covers the workload), or a row only a switched-on workload gets within the lane's span [start, end]: a
- * classifier-stamped `pair-signal:` or `pair-signal-failed:` (the jev attempt), or a `pair-offer:` stamped by its raise
- * site's writer (classifier or lane runner). `on` with either; `off` otherwise, a lane from before the switch existed
- * included.
+ * classifier-stamped `pair-signal:`, `pair-signal-failed:` (the jev attempt) or `pair-offer:`. `on` with either; `off`
+ * otherwise, a lane from before the switch existed included.
  */
 export function pairLaneExposure(entries: readonly EntryRow[], laneId: string, lane: Pick<PairLane, "start" | "end">): PairExposure {
 	const exposed = pairExposureBody(laneId);
@@ -435,10 +437,7 @@ export function pairLaneExposure(entries: readonly EntryRow[], laneId: string, l
 		if (e.kind !== "assumption") continue;
 		if (e.created_by === CLASSIFIER_BY && e.body.trim() === exposed) return "on";
 		if (e.created_at < lane.start || e.created_at > lane.end) continue;
-		const switchRow = e.created_by === CLASSIFIER_BY
-			? parsePairSignal(e.body) !== null || parsePairSignalFailed(e.body) !== null || parsePairOffer(e.body) !== null
-			: e.created_by === LANE_RUNNER_BY && parsePairOffer(e.body) !== null;
-		if (switchRow) return "on";
+		if (e.created_by === CLASSIFIER_BY && (parsePairSignal(e.body) !== null || parsePairSignalFailed(e.body) !== null || parsePairOffer(e.body) !== null)) return "on";
 	}
 	return "off";
 }

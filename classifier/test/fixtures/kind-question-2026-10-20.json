@@ -1,0 +1,13 @@
+{
+  "kind": {
+    "type": "choice",
+    "instructions": "Classify this slice brief (a bounded task handed to one worker agent) by the kind of work it asks for. Pick exactly one of the five kinds.",
+    "criteria": {
+      "locate": "find where something is or list what exists — files, symbols, loaders, registrations, settings, or entries — with no interpretation; the deliverable is a location or an enumeration, such as an inventory table written to a report file",
+      "understand": "read and report on a surface without writing to it — a report, trace, or research write-up that establishes what something is or does; a smoke run or check that executes things but writes no repository file, only scratch files or its report, is understand",
+      "change-small": "write a change the brief already specifies, so the worker carries it out rather than works it out: a rename or contained edit to one module and its own tests, a new self-contained pure function that nothing calls yet, in its own new file, whose signature and rules the brief or a named plan spells out, plus its own test file, a mechanical mirror of an existing pattern, or a docs-only edit to any number of prose files whose content the brief or a named plan dictates",
+      "change-large": "write code whose design or correctness the worker must work out, even when the brief lists the steps in detail: new behaviour spanning several source modules or a new module that existing modules call or render, a change to a shared format or schema and every reader of it, writing the tests that fix an interface others will build to, a new committed end-to-end test file that boots real installed programs, deciding case by case what tests should prove, or any fix to concurrency, timing such as time windows, clocks, timeouts or retries, process handling, security or authority enforcement, performance, or replay and identity logic, however few files it touches",
+      "judge": "design, review, decide, or compare — anything whose output is a ruling or critique rather than an artifact, including a report that critiques a document, design, or decision for what it breaks, contradicts, or leaves undefined"
+    }
+  }
+}

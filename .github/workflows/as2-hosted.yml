@@ -1,0 +1,120 @@
+# as2's hosted suite: on every pull request to main and every push to main, the test files that do not need Jo's
+# machine run on GitHub-hosted runners, and each job shows on the PR as a check.
+#   linux (ubuntu-latest): every Bun test file minus testRunner.macOnly and testRunner.mainSkip
+#   macos (macos-latest):  testRunner.macOnly
+# The sets come from .github/as2-hosted/sets.ts, which fails on a stale list. testRunner.mainSkip's files need OMP
+# and run only in the local runner's suite. This workflow posts nothing else (no status, no comment) and its token is
+# read-only; `as2/full-suite` stays the local runner's, unchanged. `pull_request`, never `pull_request_target`: a fork's
+# PR gets a read-only token and no secrets, so its code runs on a throwaway VM with nothing to take.
+name: as2-hosted
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: as2-hosted-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  suite:
+    name: ${{ matrix.set }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: /tmp, as as2-fast.yml uses it ($RUNNER_TEMP's `_` gets Markdown-escaped by tests). macOS: the local
+          # runner's own shape and length, /Users/Shared/as2test/runs/<18-character run id>, made by the step below
+          # with the runner's group. decision-log's 1,000-entry budget test fails for a TMPDIR of 7 to 44 characters
+          # (measured 2026-10-28) and passes at the runner's 54.
+          - set: linux
+            os: ubuntu-latest
+            work: /tmp/as2work
+          - set: macos
+            os: macos-latest
+            work: /Users/Shared/as2test/runs/tr-0hostedrunner00
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      W: ${{ matrix.work }}
+      SET: ${{ matrix.set }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      # The bin/as2 tests spawn zsh, and the Linux pairing fence needs bubblewrap. Ubuntu 24.04's AppArmor blocks the
+      # unprivileged user namespaces bubblewrap needs (gates/test/paired-coding.test.ts: "bwrap: setting up uid map").
+      - name: Install zsh and bubblewrap (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends zsh bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Environment facts
+        run: |
+          uname -a; bun --version; git --version; zsh --version; /bin/bash --version | head -1
+          if [ "$RUNNER_OS" = Linux ]; then nproc; bwrap --version; else sysctl -n hw.ncpu; fi
+      # /Users/Shared is root:wheel and macOS gives a new directory its parent's group, so the work root is made here
+      # with the runner's own uid and primary group; everything the tests create under it then carries that group, as
+      # as2's install checks expect (surface/test/as2test.test.ts: "owned 501:0, expected 501:20").
+      - name: Create the work root (macOS)
+        if: runner.os == 'macOS'
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" /Users/Shared/as2test /Users/Shared/as2test/runs "$W"
+      - name: Select the ${{ matrix.set }} set
+        run: |
+          set -euo pipefail
+          mkdir -p "$W/out"
+          bun .github/as2-hosted/sets.ts "$SET" > "$W/files"
+          echo "$(wc -l < "$W/files" | tr -d ' ') test file(s) in the $SET set"
+      # The runner's child layout (surface/src/test-run.ts childEnv), as as2-fast.yml builds it: throwaway HOME, XDG
+      # dirs, bun cache, ledger path, a git shim first on PATH, a user-only gitconfig, and a detached checkout with no
+      # origin that carries main's record (refs/heads/main, refs/tags/as2-trusted-main).
+      - name: Prepare runner-like child layout
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
+          head="$(git rev-parse HEAD)"
+          main="$(git rev-parse --verify -q 'refs/remotes/origin/main^{commit}')"
+          mkdir -p "$W/home/tmp" "$W/home/.config" "$W/home/.cache" "$W/home/.local/share" "$W/home/.bun/install/cache" "$W/home/.agent-system-2" "$W/shim"
+          printf '[user]\n\tname = as2 test runner\n\temail = as2-test-runner@localhost\n' > "$W/home/.gitconfig"
+          REAL_GIT="$(command -v git)"
+          printf '#!/bin/sh\nGIT_CONFIG_NOSYSTEM=1\nGIT_TERMINAL_PROMPT=0\nGIT_ASKPASS=/usr/bin/false\nexport GIT_CONFIG_NOSYSTEM GIT_TERMINAL_PROMPT GIT_ASKPASS\nexec %s -c credential.helper= "$@"\n' "'$REAL_GIT'" > "$W/shim/git"
+          chmod 755 "$W/shim/git"
+          # Detach first: on a push to main, checkout leaves main checked out, and git refuses to move a checked-out branch.
+          git checkout --quiet --detach "$head"
+          git branch -f main "$main"
+          git tag -f as2-trusted-main "$main"
+          git remote remove origin
+      # One bun test call on the set, as the runner runs its full part (`bun test --parallel=<n>`), JUnit to suite.xml.
+      - name: Test the ${{ matrix.set }} set (one bun test call)
+        timeout-minutes: 20
+        run: |
+          # Actions runs this as `bash -e`; `set +e` lets a failing bun call reach the summary and tail below.
+          set -uo pipefail
+          set +e
+          if [ "$RUNNER_OS" = Linux ]; then n="$(nproc)"; else n="$(sysctl -n hw.ncpu)"; fi
+          start=$(date +%s)
+          env -i PATH="$W/shim:$PATH" LANG="${LANG:-C.UTF-8}" USER="$USER" LOGNAME="${LOGNAME:-$USER}" SHELL="${SHELL:-/bin/bash}" TERM="${TERM:-dumb}" \
+            HOME="$W/home" TMPDIR="$W/home/tmp" XDG_CONFIG_HOME="$W/home/.config" XDG_CACHE_HOME="$W/home/.cache" XDG_DATA_HOME="$W/home/.local/share" \
+            BUN_INSTALL_CACHE_DIR="$W/home/.bun/install/cache" AGENT_SYSTEM_LEDGER_DB="$W/home/.agent-system-2/ledger.db" \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$W/home/.gitconfig" GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false \
+            bun test --reporter=junit --reporter-outfile="$W/out/suite.xml" --parallel="$n" $(cat "$W/files") > "$W/out/suite.log" 2>&1
+          code=$?
+          end=$(date +%s)
+          printf '%s set: %s files, exit %s, wall %s s\n' "$SET" "$(wc -l < "$W/files" | tr -d ' ')" "$code" "$((end - start))" | tee "$W/out/suite.summary"
+          tail -n 60 "$W/out/suite.log"
+          exit "$code"
+      - name: Upload JUnit and log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: as2-hosted-${{ matrix.set }}
+          path: ${{ env.W }}/out
+          if-no-files-found: error

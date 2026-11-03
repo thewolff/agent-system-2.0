@@ -5,18 +5,24 @@
 // silent 3 h (fires with a lane alive, not without); replay semantics; a hung lane with and without a
 // process; refusal evidence landing after as-of; failed process probes (a skip, never a dead lane or
 // a lull); the git invariants over a real temp checkout behind, ahead of, level with and diverged from
-// its origin; and the CLI (--json, --reviews, a bad argument, the checked-in fixture from the repo).
+// its origin; the CLI (--json, --reviews, a bad argument, the checked-in fixture from the repo); and auto-apply-audit (PLAN
+// wl-mvqwn80onq9hq8 D7): a missing result, a trip, a row today's classifier asks for, a torn row, a scratch root gone.
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, realpathSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
+import { routineVerdict } from "../../gates/src/routine";
+import { askJo } from "../../gates/src/rulings";
+import { scratchRootFor } from "../../gates/src/scratch";
 import { backupNamespace, copyProblem, Ledger } from "../../ledger/src/index";
 import { canonicalPath } from "../../ledger/src/locality";
 import { laneExitBody } from "../src/launch";
+import { ESCALATION_BY, MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
+import { ensureStandingWorkload } from "../src/identity";
 import { reservedStates } from "../src/errors";
-import { BACKUP_GAP_MS, check, gitIn, type Git, type Input, jsonLines, newestWrite, orchestratorsFromPs, parseArgs, type Probe, type PsDeps, renderTable, type Report, reservedView, reviewsLine, type Run } from "../scripts/invariants";
+import { BACKUP_GAP_MS, backupState, check, gitIn, type Git, type Input, jsonLines, newestWrite, orchestratorsFromPs, parseArgs, type Probe, type PsDeps, renderTable, type Report, reservedView, reviewsLine, type Run } from "../scripts/invariants";
 import { AS_OF, buildFixture, LANE_RUNNER } from "./fixtures/invariants/build";
 
 const SCRIPT = join(import.meta.dir, "..", "scripts", "invariants.ts");
@@ -48,7 +54,7 @@ const noGit: Pick<Input, "repo" | "git" | "orchestrators"> = { repo: "/nonexiste
 function run(over: Partial<Input> = {}): Report {
 	return check({
 		db, asOf: AS_OF, replay: true, liveLanes: live(`${fixture.waiting.wl} ${fixture.waiting.lane}`), lanesDirOf: () => "/nonexistent/lanes", ...noGit,
-		backups: { dir: freshBackups, gapMs: BACKUP_GAP_MS }, ...over,
+		backups: { dir: freshBackups, gapMs: BACKUP_GAP_MS }, env: { HOME: "/nonexistent/home" }, ...over,
 	});
 }
 const keys = (r: Report) => r.findings.map((f) => f.key);
@@ -110,6 +116,30 @@ describe("the ledger invariants over the fixture (as-of, one lane alive)", () =>
 		for (const i of ["checkout-behind-main", "process-older-than-head", "ff-lull"]) expect(skipsOf(r, i)).toEqual([expect.stringContaining("replay (--as-of)")]);
 		expect(renderTable(r)).toContain("[checkout-behind-main] skipped: replay");
 		expect(renderTable(r)).toContain("6 finding(s): dead-lane=1 silent-lane=0 orphan-hand=1"); // + stale-reserved, stuck-question, provider-refusal-loop, silent-orchestrator
+	});
+});
+
+describe("silent-orchestrator and the train tick's rows (PLAN wl-mvbjiettjrfpxc D10)", () => {
+	/** Whether silent-orchestrator fires over a copy of the fixture with one more wl-orchestrator row by `by`, 10 min before as-of. */
+	const silentWith = (by: string, body: string) => {
+		const path = join(tmp("silent"), "ledger.db");
+		copyFileSync(fixture.path, path);
+		const at = new Date(Date.parse(AS_OF) - 10 * 60_000).toISOString();
+		const l = Ledger.open(path, { backup: false, backupOnOpen: false, clock: () => at });
+		l.recordEntry({ by, workloadId: "wl-orchestrator", kind: "assumption", body });
+		l.close();
+		const copy = new Database(path, { readonly: true });
+		try {
+			return run({ db: copy }).findings.some((x) => x.invariant === "silent-orchestrator");
+		} finally {
+			copy.close();
+		}
+	};
+
+	test("R12: the merge train's rows on wl-orchestrator do not hide a silent orchestrator; the orchestrator's own row does", () => {
+		expect(silentWith(MERGE_TRAIN_BY, "train-board-skip: workload wl-a1 pr 7 head none stakes production")).toBe(true);
+		expect(silentWith(MERGE_TRAIN_BY, "train-notice: protection thewolff/product gap no rule")).toBe(true);
+		expect(silentWith(SURFACE_BY, "decision: Jo asked for the plan")).toBe(false);
 	});
 });
 
@@ -407,6 +437,27 @@ describe("stale-backup: the newest write runs ahead of the newest copy by more t
 		expect(backupFinding(run({ backups: { dir: empty, gapMs: BACKUP_GAP_MS } }))).toBeUndefined();
 	});
 
+	test("a missing directory with a fresh ledger is ok: no copy yet, and every write (18:00 to 20:50) is within the gap of the first", () => {
+		const dir = join(tmp("backups-none"), "missing");
+		expect(backupState(db, dir, BACKUP_GAP_MS, AS_OF)).toEqual({ state: "ok", dir, copy: null, behindMs: 170 * 60_000, rejected: [] });
+	});
+
+	// Review r6 F16: existsSync is false when the parent cannot be searched (EACCES), so a check through it read such a
+	// directory as missing and passed. Root reads a mode-000 directory, so there the denial cannot be staged.
+	test.skipIf(process.getuid?.() === 0)("a backup directory under a mode-000 parent is unjudged with EACCES, never ok, with the same fresh ledger (skipped when run as root: root is never denied)", () => {
+		const parent = tmp("backups-denied");
+		const dir = join(parent, "backups");
+		mkdirSync(dir);
+		chmodSync(parent, 0o000);
+		try {
+			const b = backupState(db, dir, BACKUP_GAP_MS, AS_OF);
+			expect(b.state).toBe("unjudged");
+			expect(b.state === "unjudged" ? b.why : "").toStartWith(`the backup directory ${dir} could not be listed: EACCES`);
+		} finally {
+			chmodSync(parent, 0o700);
+		}
+	});
+
 	test("the fixture copies are complete by the ledger's own test, so the cases above exercise real backups", () => {
 		expect(copyProblem(join(freshBackups, "ledger-2026-10-11T20-55-00.000Z.db"))).toBeNull();
 	});
@@ -422,6 +473,14 @@ describe("stale-backup: the newest write runs ahead of the newest copy by more t
 		expect(f.key).toBe("stale-backup:none");
 		expect(f.since).toBe("2026-10-11T18:00:00.000Z");
 		expect(f.text).toContain(`no ledger backup at or before 2026-10-14T21:00:00.000Z (first ledger write 2026-10-11T18:00:00.000Z); not counted, not a complete copy: ${newestName} (empty file), ${oldCopy} (empty file) in ${dir}`);
+	});
+
+	test("review r7 F19: within the gap, an ok result still names every copy it did not count and why", () => {
+		const newestName = "ledger-2026-10-11T20-55-00.000Z.db";
+		const dir = tmp("backups-ok-rejected");
+		writeFileSync(join(dir, newestName), "");
+		const b = backupState(db, dir, BACKUP_GAP_MS, AS_OF);
+		expect(b).toEqual({ state: "ok", dir, copy: null, behindMs: 170 * 60_000, rejected: [`${newestName} (empty file)`] });
 	});
 
 	test("a newer file ending .invalid (the writer's quarantine) is never a candidate, even when its contents are a complete copy", () => {
@@ -570,5 +629,153 @@ describe("output and the CLI", () => {
 		expect(p.status).toBe(0);
 		const invariants = p.stdout.trim().split("\n").map((l) => JSON.parse(l)).filter((l) => l.key).map((l) => l.invariant).sort();
 		expect(invariants).toEqual(["dead-lane", "orphan-hand", "provider-refusal-loop", "stale-reserved", "stuck-question"]);
+	});
+});
+
+describe("ruling-miss (PLAN wl-mvfkv7llkp7nk0 § 1, R5)", () => {
+	test("activation is the ledger's first ruling-applied: entry: a covered question raised past askJo before it is not a finding, one raised after it is; a question no ruling covers never is", () => {
+		let now = "2026-10-20T09:00:00.000Z";
+		const path = join(mkdtempSync(join(tmpdir(), "inv-ruling-")), "ledger.db");
+		const ledger = Ledger.open(path, { create: true, backup: false, backupOnOpen: false, clock: () => now });
+		const wl = ledger.openWorkload({ by: "surface", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		const sl = () => ledger.addSlice({ by: "lane-a", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const covered = { body: "Open the docs workload now?", options: ["open", "later"] };
+		const before = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl(), ...covered });
+		now = "2026-10-20T10:00:00.000Z";
+		// The rulings check goes live: askJo decides a covered question and writes the ledger's first ruling-applied: entry.
+		expect(askJo(ledger, { by: "lane-b", workloadId: wl, sliceId: sl(), ...covered }, { asker: "lane", now: Date.parse(now) })).toHaveProperty("decided");
+		now = "2026-10-20T12:00:00.000Z";
+		const missed = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl(), ...covered });
+		ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl(), body: "Ship it?", options: ["ship", "hold"] });
+		ledger.close();
+		const db = new Database(path, { readonly: true });
+		const noProbe: Probe<never> = { skipped: "not run" };
+		const misses = (asOf: string) =>
+			check({ db, asOf, replay: true, liveLanes: { found: new Set<string>() }, lanesDirOf: () => "/nonexistent", repo: "/nonexistent", git: null, orchestrators: () => noProbe, backups: { dir: "/nonexistent", gapMs: 30 * 60 * 60_000 }, env: { HOME: "/nonexistent" } })
+				.findings.filter((f) => f.invariant === "ruling-miss");
+		const after = misses("2026-10-20T12:05:00.000Z");
+		expect(after.map((f) => [f.key, f.workload])).toEqual([[`ruling-miss:${missed}`, wl]]);
+		expect(after[0]!.text).toContain("flow-repair");
+		expect(after.some((f) => f.key.endsWith(before))).toBe(false);
+		// Replayed before the activation entry landed, nothing is selected, though `before` was open and covered then.
+		expect(misses("2026-10-20T09:30:00.000Z")).toEqual([]);
+		db.close();
+	});
+
+	test("a NOW question (askJo's valid now: mark) a ruling covers is no miss; an unmarked one, and one marked only by a lane-written now: look-alike, are (PLAN wl-mvg1vs0rhnu3gg § 1.0, R22)", () => {
+		let now = "2026-10-20T10:00:00.000Z";
+		const path = join(mkdtempSync(join(tmpdir(), "inv-ruling-now-")), "ledger.db");
+		const ledger = Ledger.open(path, { create: true, backup: false, backupOnOpen: false, clock: () => now });
+		const wl = ledger.openWorkload({ by: "surface", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		const sl = () => ledger.addSlice({ by: "lane-a", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const covered = { body: "Open the docs workload now?", options: ["open", "later"] };
+		// Activation: askJo decides a covered question and writes the ledger's first ruling-applied: entry.
+		expect(askJo(ledger, { by: "lane-b", workloadId: wl, sliceId: sl(), ...covered }, { asker: "lane", now: Date.parse(now) })).toHaveProperty("decided");
+		now = "2026-10-20T12:00:00.000Z";
+		const asked = askJo(ledger, { by: "lane-a", workloadId: wl, sliceId: sl(), ...covered, now: "security" }, { asker: "lane", now: Date.parse(now) });
+		if (!("raised" in asked)) throw new Error("a now question is raised past the covering ruling");
+		const unmarked = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl(), ...covered });
+		const forgedSlice = sl();
+		const forged = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: forgedSlice, ...covered });
+		ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: forgedSlice, kind: "assumption", body: `now: ${forged} security` });
+		ledger.close();
+		const db = new Database(path, { readonly: true });
+		const noProbe: Probe<never> = { skipped: "not run" };
+		const misses = check({ db, asOf: "2026-10-20T12:05:00.000Z", replay: true, liveLanes: { found: new Set<string>() }, lanesDirOf: () => "/nonexistent", repo: "/nonexistent", git: null, orchestrators: () => noProbe, backups: { dir: "/nonexistent", gapMs: 30 * 60 * 60_000 }, env: { HOME: "/nonexistent" } })
+			.findings.filter((f) => f.invariant === "ruling-miss");
+		expect(misses.map((f) => f.key).sort()).toEqual([`ruling-miss:${forged}`, `ruling-miss:${unmarked}`].sort());
+		expect(misses.some((f) => f.key === `ruling-miss:${asked.raised}`)).toBe(false);
+		db.close();
+	});
+});
+
+describe("auto-apply-audit (PLAN wl-mvqwn80onq9hq8 D7, R16)", () => {
+	// A real HOME with the workload's scratch root, so today's routineVerdict re-runs each row's command as the gate did.
+	const home = realpathSync(mkdtempSync(join(tmpdir(), "inv-auto-home-")));
+	const env = { HOME: home, PATH: process.env.PATH };
+	let now = "2026-10-27T10:00:00.000Z";
+	const path = join(mkdtempSync(join(tmpdir(), "inv-auto-")), "ledger.db");
+	const ledger = Ledger.open(path, { create: true, backup: false, backupOnOpen: false, clock: () => now });
+	ensureStandingWorkload(ledger);
+	const open = () => ledger.openWorkload({ by: SURFACE_BY, brief: "w", stakes: "normal", mode: "autonomous" });
+	const wl = open();
+	const gone = open();
+	const closed = open();
+	mkdirSync(join(scratchRootFor(home, wl), "r"), { recursive: true });
+	const esc = (workloadId: string, body: string) => ledger.recordEntry({ by: ESCALATION_BY, workloadId, kind: "assumption", body });
+	const CONFINED = 'cd "$AS2_SCRATCH/r" && rm -rf build';
+	const applied = (workloadId: string, tc: string, command = CONFINED) => esc(workloadId, `auto-applied: scratch ${tc} by lane-a-1 cwd ${home} net no: ${command}`);
+	const ok = applied(wl, "tc-ok");
+	esc(wl, "auto-applied-result: tc-ok exit 0");
+	const lost = applied(wl, "tc-lost");
+	const tripped = applied(wl, "tc-trip");
+	esc(wl, "auto-applied-result: tc-trip exit 1");
+	const trip = esc("wl-orchestrator", "auto-apply-tripped: tc-trip seatbelt deny(1) file-write /etc/x");
+	const ghost = esc("wl-orchestrator", "auto-apply-tripped: tc-ghost write > PATCH /repos/o/r/issues/1 HTTP/1.1");
+	// Applied before a classifier tightening: today rm -rf of a path outside the scratch root asks.
+	const wide = applied(wl, "tc-wide", "rm -rf build");
+	esc(wl, "auto-applied-result: tc-wide exit 0");
+	const torn = esc(wl, "auto-applied: scratch tc-torn by lane-a-1 cwd");
+	// A lane's look-alike is no row of the gate's: never read, even with no result.
+	const forged = ledger.recordEntry({ by: "lane-a-1", workloadId: wl, kind: "assumption", body: `auto-applied: scratch tc-forged by lane-a-1 cwd ${home} net no: rm -rf /` });
+	// A workload whose scratch root is gone: (c) cannot be re-run there, and says so; a closed workload is not read.
+	const unjudged = applied(gone, "tc-gone");
+	esc(gone, "auto-applied-result: tc-gone exit 0");
+	applied(closed, "tc-closed");
+	ledger.closeWorkload(closed, { by: SURFACE_BY });
+	now = "2026-10-27T10:15:00.000Z";
+	const pending = applied(wl, "tc-new");
+	ledger.close();
+	const db = new Database(path, { readonly: true });
+	afterAll(() => db.close());
+	const audit = (asOf: string) =>
+		check({ db, asOf, replay: true, liveLanes: { found: new Set<string>() }, lanesDirOf: () => "/nonexistent", repo: "/nonexistent", git: null, orchestrators: () => noProbe, backups: { dir: "/nonexistent", gapMs: 30 * 60 * 60_000 }, env });
+	const r = audit("2026-10-27T10:20:00.000Z");
+	const found = (id: string) => r.findings.find((f) => f.key === `auto-apply-audit:${id}`);
+
+	test("the fixture's premise: today's classifier lets the confined command through and asks for the wide one", () => {
+		const ctx = { role: "lane" as const, cwd: home, env: { ...env, AGENT_SYSTEM_WORKLOAD_ID: wl, AS2_SCRATCH: scratchRootFor(home, wl) } };
+		expect(routineVerdict({ toolName: "bash", input: { command: CONFINED } }, ctx)).toMatchObject({ rule: "scratch" });
+		expect(routineVerdict({ toolName: "bash", input: { command: "rm -rf build" } }, ctx)).toHaveProperty("ask");
+	});
+
+	test("(a) a row with no result after 10 minutes is a finding; one with its result, or younger than 10 minutes, is not", () => {
+		const f = found(lost)!;
+		expect(f).toMatchObject({ invariant: "auto-apply-audit", workload: wl, since: "2026-10-27T10:00:00.000Z" });
+		expect(f.text).toContain("(a) no auto-applied-result: for tool call tc-lost after 20 min");
+		expect(f.text).toContain(`auto-applied ${lost} (scratch, tool call tc-lost, by lane-a-1, cwd ${home}, net no): ${CONFINED}`);
+		expect(f.query).toContain("routineVerdict");
+		expect(found(ok)).toBeUndefined();
+		expect(found(pending)).toBeUndefined();
+		// Replayed before the result's 10 minutes ran out, the row is not yet missing.
+		expect(audit("2026-10-27T10:09:00.000Z").findings.some((x) => x.key === `auto-apply-audit:${lost}`)).toBe(false);
+	});
+
+	test("(b) a row its trip names is a finding with the trip's evidence; a trip naming no row is one of its own", () => {
+		expect(found(tripped)!.text).toContain(`(b) tripped: ${trip} at 2026-10-27T10:00:00.000Z: tc-trip seatbelt deny(1) file-write /etc/x`);
+		expect(found(tripped)!.text).not.toContain("(a)");
+		expect(found(ghost)).toMatchObject({ workload: "wl-orchestrator", text: `trip ${ghost} names tool call tc-ghost, which no auto-applied: row records: tc-ghost write > PATCH /repos/o/r/issues/1 HTTP/1.1` });
+	});
+
+	test("(c) a row today's routineVerdict asks for is a finding naming the reason", () => {
+		const f = found(wide)!;
+		expect(f.text).toContain("(c) today's routineVerdict asks:");
+		expect(f.text).not.toContain("(a)");
+	});
+
+	test("a row that does not parse is a finding; a look-alike by a lane and a row on a closed workload are not read", () => {
+		expect(found(torn)!.text).toContain("does not parse as `auto-applied: <rule> <toolCallId> by <id> cwd <cwd> net <yes|no>: <command>`");
+		expect(found(forged)).toBeUndefined();
+		expect(r.findings.filter((f) => f.invariant === "auto-apply-audit").map((f) => f.workload).every((w) => w === wl || w === "wl-orchestrator")).toBe(true);
+	});
+
+	test("a workload whose scratch root is gone is skipped for (c), naming the rows, never a finding", () => {
+		expect(found(unjudged)).toBeUndefined();
+		expect(skipsOf(r, "auto-apply-audit")).toEqual([`(c) not re-run on ${gone}: its scratch root ${scratchRootFor(home, gone)} is not a directory now; rows ${unjudged}`]);
+	});
+
+	test("the table counts the invariant", () => {
+		expect(r.findings.filter((f) => f.invariant === "auto-apply-audit").map((f) => f.key).sort()).toEqual([lost, tripped, ghost, wide, torn].map((id) => `auto-apply-audit:${id}`).sort());
+		expect(renderTable(r)).toContain("ruling-miss=0 auto-apply-audit=5 stuck-review=0");
 	});
 });

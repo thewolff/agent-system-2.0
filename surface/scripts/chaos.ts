@@ -86,7 +86,7 @@ const REPORTS_DIR = join(homedir(), "agent-scratch", "agent-system-2.0", "chaos"
 /** The scratch lease (§ 2.1): a runner killed with its lane surfaces through the lapse inside the window. */
 const LEASE_MS = 120_000;
 /** The chat model every chat role is pinned to (writeStubProfile's default). */
-const CHAT_MODEL = "anthropic/claude-haiku-4-5";
+const CHAT_MODEL = "anthropic/claude-haiku-5-5";
 /** The egress self-test: an un-routed provider, with a fake key given only to that probe. */
 const EGRESS_PROBE = { provider: "groq", model: "groq/gemma2-9b-it", host: "api.groq.com", keyEnv: "GROQ_API_KEY" };
 const JUDGE_MODEL = "jev-1.13.0";
@@ -593,7 +593,8 @@ class Run {
 		// The profile: install.sh from the copy, as a fresh machine (install/fresh-machine-test.sh run_install).
 		const install = await this.run(["bash", join(this.repo, "install", "install.sh")], { cwd: this.repo, env: { PATH: this.env.PATH!, HOME: this.home }, ms: 300_000 });
 		writeFileSync(join(this.S, "install.log"), `${install.out}\n--- stderr ---\n${install.err}`);
-		if (install.code !== 0) throw new HarnessError(`install.sh exited ${install.code}${install.timedOut ? " (timed out)" : ""}: ${oneLine(install.err.trim().split("\n").at(-1) ?? "")} (log ${join(this.S, "install.log")})`);
+		const outcome = installOutcome(install, join(this.S, "install.log"));
+		if (outcome.note !== null) this.notes.push(outcome.note);
 		if (!existsSync(join(this.agentDir, "config.yml"))) throw new HarnessError(`install.sh wrote no profile at ${this.agentDir}`);
 		this.profile = writeStubProfile(this.agentDir, this.stub.port, { unrouted: [EGRESS_PROBE.provider], chatModel: CHAT_MODEL });
 		this.notes.push(`setup: clone and copy ${secs(tClone - t0)}, install and profile ${secs(Date.now() - tClone)}`);
@@ -632,7 +633,7 @@ class Run {
 			after: ({ request }) => {
 				if (request.results.some((x) => x.name === "yield" || x.name === "submit_result")) return { text: "done" };
 				const out = request.results.at(-1);
-				return handReport(request, `**ACTION**\nappended one line to chaos/scratch.txt and ran \`bun test chaos/\` → ${out?.isError ? "error" : "ran"}: ${oneLine(out?.text ?? "no output", 400)}`);
+				return handReport(request, `Appended one line to chaos/scratch.txt and ran \`bun test chaos/\` → ${out?.isError ? "error" : "ran"}: ${oneLine(out?.text ?? "no output", 400)}`);
 			},
 		};
 		const review: StubScript = {
@@ -675,7 +676,7 @@ class Run {
 			kind: "orchestrator",
 			match: (r) => r.tools.includes("orchestrator_wake_read") || /You are the \*\*orchestrator\*\* surface/.test(r.system),
 			steps: [{ text: "recording the wake read", tool: { name: "orchestrator_wake_read", input: { body: `chaos ${this.token}: scratch orchestrator; the chaos workload ${this.wl} runs under its lane; next: wait.`, i: "Recording the wake read" } } }],
-			after: { text: "**PMDW**\nchaos scratch orchestrator: nothing to do." },
+			after: { text: "chaos scratch orchestrator: nothing to do." },
 		};
 		const unmatched: StubScript = {
 			kind: "unmatched",
@@ -719,7 +720,7 @@ class Run {
 			},
 			{ tool: "lane_complete_slice", afterHands: 2, input: { slice: SL_REVIEW, artifact: "review-findings: no findings", i: "Completing the review slice" } },
 			{ tool: "lane_add_slice", input: { id: SL_HOLD, task: "chaos-hold: wait for Jo", doneCondition: "Jo answers close or keep", inputs: "none", i: "Adding the hold slice" } },
-			{ tool: "lane_raise_question", input: { slice: SL_HOLD, body: `**QUESTION**\nchaos ${this.token}: close this scratch workload, or keep it? close ends it; keep leaves it parked.`, options: ["close", "keep"], i: "Raising the hold question" } },
+			{ tool: "lane_raise_question", input: { slice: SL_HOLD, body: `**Closing ask**\nchaos ${this.token}: close this scratch workload, or keep it? close ends it; keep leaves it parked.`, options: ["close", "keep"], i: "Raising the hold question" } },
 		];
 		let ptr = 0;
 		let trailingWaits = 0;
@@ -1318,8 +1319,28 @@ async function main(argv: string[]): Promise<number> {
 	return new Run(fault!, a.variant, a.nightly).execute();
 }
 
+/** install.sh exit code for "the closing doctor found failing parts" (install/install.sh header: "else `install incomplete: as2 doctor found failing parts (above)` and exit 5"). */
+const INSTALL_DOCTOR_FAILED = 5;
+
+/**
+ * What setup makes of install.sh's result. Exit 0 is success, silently. Exit INSTALL_DOCTOR_FAILED is success with one log line: the
+ * profile is written before the closing doctor runs, and the doctor's seat part cannot pass in a scratch clone (no orchestrator runs
+ * for it). Any other exit throws HarnessError. install's full output goes to install.log whatever the code (the caller writes it
+ * before this runs).
+ */
+function installOutcome(install: { code: number | null; timedOut?: boolean; err: string }, logPath: string): { note: string | null } {
+	if (install.code === 0) return { note: null };
+	if (install.code === INSTALL_DOCTOR_FAILED && !install.timedOut) {
+		return { note: `install.sh's closing doctor failed in the scratch HOME (exit ${INSTALL_DOCTOR_FAILED}), as expected for an isolated clone: no orchestrator runs for it, so the seat part cannot pass; full output in ${logPath}` };
+	}
+	throw new HarnessError(`install.sh exited ${install.code}${install.timedOut ? " (timed out)" : ""}: ${oneLine(install.err.trim().split("\n").at(-1) ?? "")} (log ${logPath})`);
+}
+
+export { parseArgs, nonceMisses, installOutcome, INSTALL_DOCTOR_FAILED };
+
+// The entry point stays last: `await main()` runs before any module-level `const` declared below it is initialized,
+// so a declaration after this block throws "Cannot access … before initialization" in the nightly run only
+// (tests import this module, so import.meta.main is false there). That shipped once: INSTALL_DOCTOR_FAILED, 2026-11-03.
 if (import.meta.main) {
 	process.exit(await main(process.argv.slice(2)));
 }
-
-export { parseArgs, nonceMisses };

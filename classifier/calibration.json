@@ -1,8 +1,11 @@
 {
-  "question_sha256": "5a72c35cf68f238f5bca23065dbb5e244afecd76a10cc6283a81e44578c16550",
+  "question_sha256": "2c0d088658c5318797d72b0a71f0011fa3694f688cc094c206ee9493b37d3f89",
   "judge_model": "typesafe/jev-1.13.0",
-  "measured": "2026-09-28, 32 briefs (the 2026-09-23 thirty plus two review additions), judge_batch jdgb-1591e526c4f2a16e, jdgb-1591e52f260de9ed, jdgb-1591e5335dd44050, jdgb-1591e5379ece2b1a",
-  "source": "research/classifier-sample.md § Re-measurement 2026-09-28; the recorded question is classifier/test/fixtures/kind-question-2026-09-28.json, the recorded answers classifier/test/fixtures/classifier-sample-2026-09-28.jsonl",
-  "superseded": "2026-09-23, question 47616267f77a946557e192663e750bff0e3c999522fbb9f086cf935206f25829, judge_batch jdgb-158b8f7d1395cceb, jdgb-158b8f819d15ccec, jdgb-158b8f81fc55cced (classifier/test/fixtures/kind-question-2026-09-23.json, classifier-sample-30.jsonl)",
+  "measured": "2026-10-20, 82 briefs (the 2026-09-28 thirty-two, the 2026-10-19 hand-size audit's twenty, held-out sets A of twenty and B of ten), judge_batch jdgb-15ad234df0d18da7",
+  "source": "research/classifier-sample.md § Re-measurement 2026-10-20; the recorded question is classifier/test/fixtures/kind-question-2026-10-20.json, the recorded answers classifier/test/fixtures/classifier-sample-2026-10-20.jsonl",
+  "superseded": [
+    "2026-09-28, question 5a72c35cf68f238f5bca23065dbb5e244afecd76a10cc6283a81e44578c16550, judge_batch jdgb-1591e526c4f2a16e, jdgb-1591e52f260de9ed, jdgb-1591e5335dd44050, jdgb-1591e5379ece2b1a (classifier/test/fixtures/kind-question-2026-09-28.json, classifier-sample-2026-09-28.jsonl)",
+    "2026-09-23, question 47616267f77a946557e192663e750bff0e3c999522fbb9f086cf935206f25829, judge_batch jdgb-158b8f7d1395cceb, jdgb-158b8f819d15ccec, jdgb-158b8f81fc55cced (classifier/test/fixtures/kind-question-2026-09-23.json, classifier-sample-30.jsonl)"
+  ],
   "note": "The classifier refuses to route while kind-question.json hashes to anything else. Changing the question or the judge needs a new sample recorded and this file updated from it, never a regenerated hash."
 }

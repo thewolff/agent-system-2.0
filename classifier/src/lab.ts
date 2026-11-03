@@ -14,6 +14,8 @@
  * - `reviewRow`: the tier row a review dispatch plans on (Jo's OpenAI-reviewer rule, `REVIEW_ROW_FROM`).
  * - `KIMI_OUT_RULE`: Jo's standing rule that a review parked only because Kimi is out runs same-lab
  *   (PLAN wl-mv5xay6bjp0268); `builderRoles` orders a same-lab hand least-involved builder lab first.
+ * - `ANTHROPIC_OUT_RULE`: the current OpenAI lane's dated, Codex-only review authorization, independent
+ *   of builder history and Kimi availability (PLAN wl-mvtusij5mhwtnv).
  */
 import { type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type RoutingRow } from "../../ledger/src/index";
 import { SURFACE_BY } from "../../surface/src/types";
@@ -92,23 +94,27 @@ export const reviewSameLabBody = (instructionId: string, token: string) => `revi
 export const laneBuilderBody = (lab: Lab | null, laneId: string, model: string) => `builder-lab: ${lab ?? "unknown"} lane ${laneId} model ${model}`;
 export const handBuilderBody = (lab: Lab | null, token: string, model: string) => `builder-lab: ${lab ?? "unknown"} hand ${token} model ${model}`;
 
-/** A `review-same-lab-rule:` entry (PLAN wl-mv5xay6bjp0268 § 2.2): Jo's Kimi-out rule let review hand `token` run same-lab. */
-export interface ReviewSameLabRule {
+/** A classifier-owned receipt immediately before the authorized token's spawn, in one transaction. */
+export type ReviewSameLabRule = {
 	input: string;
 	slice: string;
 	token: string;
-	/** The builder labs the hand may run on, in the order it tries them. */
 	labs: string[];
-	/** Why Kimi was skipped (the rule's evidence), free text. */
-	kimi: string;
-}
+} & ({ kimi: string } | { anthropicOut: true });
 
-/** Written by the classifier, as the lane id, immediately before that token's `hand-spawn:` in one transaction. */
-export function reviewSameLabRuleBody(r: { slice: string; token: string; labs: readonly string[]; kimi: string }): string {
-	return `review-same-lab-rule: ${KIMI_OUT_RULE.input} slice ${r.slice} token ${r.token} labs ${r.labs.join(",")} kimi ${r.kimi}`;
+/** Keeps the Kimi receipt unchanged; the dated variant names its own instruction and expiry. */
+export function reviewSameLabRuleBody(r: { slice: string; token: string; labs: readonly string[] } & ({ kimi: string } | { anthropicOut: true })): string {
+	const evidence = "kimi" in r
+		? `${KIMI_OUT_RULE.input} slice ${r.slice} token ${r.token} labs ${r.labs.join(",")} kimi ${r.kimi}`
+		: `${ANTHROPIC_OUT_RULE.input} slice ${r.slice} token ${r.token} labs ${r.labs.join(",")} anthropic-out until ${ANTHROPIC_OUT_RULE.endsAtText}`;
+	return `review-same-lab-rule: ${evidence}`;
 }
 
 export function parseReviewSameLabRule(body: string): ReviewSameLabRule | null {
+	const dated = REVIEW_ANTHROPIC_OUT_RULE.exec(body.trim());
+	if (dated && dated[1] === ANTHROPIC_OUT_RULE.input && dated[5] === ANTHROPIC_OUT_RULE.endsAtText) {
+		return { input: dated[1], slice: dated[2]!, token: dated[3]!, labs: dated[4]!.split(",").filter(Boolean), anthropicOut: true };
+	}
 	const m = REVIEW_SAME_LAB_RULE.exec(body.trim());
 	if (!m) return null;
 	return { input: m[1]!, slice: m[2]!, token: m[3]!, labs: m[4]!.split(",").filter(Boolean), kimi: m[5]! };
@@ -120,6 +126,7 @@ const REVIEW_WITHHELD = /^review-withheld:\s+(\S+)$/;
 const REVIEW_PARK = /^review-park:\s+(\S+)\s+slice\s+(\S+)$/;
 const REVIEW_SAME_LAB = /^review-same-lab:\s+(\S+)\s+token\s+(\S+)$/;
 const REVIEW_SAME_LAB_RULE = /^review-same-lab-rule:\s+(\S+)\s+slice\s+(\S+)\s+token\s+(\S+)\s+labs\s+(\S+)\s+kimi\s+(.+)$/;
+const REVIEW_ANTHROPIC_OUT_RULE = /^review-same-lab-rule:\s+(\S+)\s+slice\s+(\S+)\s+token\s+(\S+)\s+labs\s+(\S+)\s+anthropic-out until (\S+)$/;
 const BUILDER_LAB = /^builder-lab:\s+(\S+)\s+(lane|hand)\s+(\S+)\s+model\s+(\S+)$/;
 const BUILDER_LAB_VOID = /^builder-lab-void:\s+hand\s+(\S+)\s+by\s+(\S+)$/;
 const LANE_STARTED = /^lane-started:\s+(\S+)/;
@@ -420,10 +427,12 @@ export const REVIEW_ROW_FROM: Readonly<Partial<Record<Lab, Tier>>> = { openai: "
  * named in `REVIEW_ROW_FROM` replaced, at that lab's first deep entry, by the named tier's entries
  * of the same lab (identities de-duplicated); a lab with none there loses its deep entries and
  * never falls back to them. Other labs' entries stay where they are. Any other tier: its row.
+ * With explicit current-lane/time context, the active Anthropic-out rule then keeps only exact
+ * openai-codex provider entries. No context preserves the historical row for offline consumers.
  */
-export function reviewRow(table: TierTable, tier: Tier): string[] {
+export function reviewRow(table: TierTable, tier: Tier, context?: ReviewContext): string[] {
 	const row = table[tier];
-	if (tier !== "deep") return [...row];
+	if (tier !== "deep") return anthropicOutRuleActive(context) ? row.filter(s => providerOf(s) === "openai-codex") : [...row];
 	const out: string[] = [];
 	const replaced = new Set<Lab>();
 	for (const selector of row) {
@@ -442,20 +451,37 @@ export function reviewRow(table: TierTable, tier: Tier): string[] {
 			out.push(entry);
 		}
 	}
-	return out;
+	return anthropicOutRuleActive(context) ? out.filter(s => providerOf(s) === "openai-codex") : out;
 }
 
 // ---- Jo's Kimi-out rule (PLAN wl-mv5xay6bjp0268) -----------------------------------------------
 
 /**
  * Jo's standing rule (input in-mv5xafhywe3w8w, 2026-10-13): a review that parks only because Kimi is out goes same-lab with
- * no question (PLAN wl-mv5xay6bjp0268). It ends at the end of 2026-10-31 America/Los_Angeles (2026-11-01T00:00-07:00, PDT)
- * or on Jo's word, whichever is first; ending it early is setting `endsAt` to the moment of Jo's word, merging, and relaunching
- * the lanes. `rowOmission`: the installed tier rows dropped moonshot for this outage (2026-10-12 14:28 PDT), so a review row
- * with no kimi entry counts as Kimi out while the rule is active.
+ * no question (PLAN wl-mv5xay6bjp0268). Its record is the `kimi-out` ruling of gates/src/rulings.ts `STANDING_RULINGS`, which
+ * dates it by `endsAt`: the end of 2026-10-31 America/Los_Angeles (2026-11-01T00:00-07:00, PDT), or at once on Jo's
+ * `end-ruling kimi-out` (the classifier reads both through `rulingActive`). `kimiOutRuleActive` is the date alone, for the
+ * ledger-less checks: quota marking and honouring a 429 refusal. `rowOmission`: the installed tier rows dropped moonshot for
+ * this outage (2026-10-12 14:28 PDT), so a review row with no kimi entry counts as Kimi out while the rule is active.
  */
 export const KIMI_OUT_RULE = { input: "in-mv5xafhywe3w8w", endsAt: Date.parse("2026-11-01T00:00:00-07:00"), rowOmission: true } as const;
 export const kimiOutRuleActive = (now: number) => now < KIMI_OUT_RULE.endsAt;
+
+/** Jo's dated review-only restriction, independent of Kimi availability and aggregate builder labs. */
+export const ANTHROPIC_OUT_RULE = {
+	input: "in-mvtur7tlze7r5o",
+	endsAtText: "2026-10-31T06:00:00-07:00",
+	endsAt: Date.parse("2026-10-31T06:00:00-07:00"),
+} as const;
+
+/** Explicit dispatch/spawn context; omitted context preserves the historical helper policy. */
+export interface ReviewContext {
+	laneModel?: string;
+	now: number;
+}
+
+export const anthropicOutRuleActive = (context?: ReviewContext): boolean =>
+	context !== undefined && context.now < ANTHROPIC_OUT_RULE.endsAt && context.laneModel !== undefined && labOf(context.laneModel) === "openai";
 
 /** A Kimi quota or suspension refusal's message (Moonshot's 429 "account suspended due to insufficient balance"). */
 export const KIMI_QUOTA_MESSAGE = /exceeded_current_quota|insufficient balance|suspended/i;
@@ -489,6 +515,8 @@ export interface ReviewPlanInput {
 	pin?: Lab;
 	/** Why a row entry was not usable (selector → reason), for the park question and notes. */
 	skipped?: Readonly<Record<string, string>>;
+	/** Current lane and injected clock; never inferred from builder history. */
+	context?: ReviewContext;
 }
 
 export interface ReviewMember {
@@ -511,11 +539,26 @@ export type ReviewPlan =
  * independent), naming it; only a same-lab grant, which claims no independence and never runs it,
  * goes on. A grant appends the builder's entries after the other labs' and is always one hand; given
  * `roles`, the builder's entries go least-involved lab first (§ 2.3), each lab's in row order.
- * Every filter works per lab, not per entry.
+ * The explicit Anthropic-out context instead permits one Codex-only same-lab hand, independently
+ * of grants and Kimi availability, but never with unknown builder provenance or another lab's pin.
+ * Outside that dated policy every filter works per lab, not per entry.
  */
 export function reviewPlan(input: ReviewPlanInput): ReviewPlan {
 	const { row, usable, builders, stakes, grant, pin } = input;
 	const excluded = excludedLabs(builders);
+	if (anthropicOutRuleActive(input.context)) {
+		const legal = row.filter(s => providerOf(s) === "openai-codex");
+		const models = usable.filter(s => legal.includes(s));
+		const reasons = builders.unknown.length > 0
+			? builders.unknown
+			: pin !== undefined && pin !== "openai"
+				? [`Anthropic-out policy excludes the ${pin} pin; no other lab is substituted`]
+				: legal.length === 0
+					? ["Anthropic-out policy: no Codex (openai-codex) entry in the review row"]
+					: legal.filter(s => !usable.includes(s)).map(s => `${s} (${input.skipped?.[s] ?? "not usable"})`);
+		if (builders.unknown.length > 0 || (pin !== undefined && pin !== "openai") || models.length === 0) return { kind: "park", excluded, reasons };
+		return { kind: "single", models, allow: legal.map(modelIdentity), excluded, sameLab: true, short: null };
+	}
 	const reviewer = (selector: string) => {
 		const lab = labOf(selector);
 		return lab !== null && !isBuilder(builders, lab) && (pin === undefined || lab === pin);
@@ -563,4 +606,44 @@ export function reviewPlan(input: ReviewPlanInput): ReviewPlan {
 			? `production review fans out to ${otherLabs.join(", ")} only${unavailable.length > 0 ? ` (${unavailable.map(s => `${s} (${input.skipped?.[s] ?? "not usable"})`).join(", ")})` : ""}`
 			: null;
 	return { kind: "single", models: others, allow: allowOthers, excluded, sameLab: false, short };
+}
+
+// ---- Three-lab panels (PLAN wl-mv5m7qvgkxhpj4 § 3.4 rule 1; classifier/src/panel.ts) ---------
+
+/**
+ * A panel member's spawn row: only `lab`'s entries, builder lab or not. A panel is not a gate review,
+ * so the builder exclusion and the D5 fan-out do not apply to it; the pin alone keeps every other
+ * lab off the member, so no other lab is ever substituted. `reasons` say why the lab has no usable
+ * entry (empty when `models` is not).
+ */
+export function panelPin(input: { row: readonly string[]; usable: readonly string[]; lab: Lab; skipped?: Readonly<Record<string, string>> }): {
+	models: string[];
+	allow: string[];
+	reasons: string[];
+} {
+	const mine = input.row.filter(s => labOf(s) === input.lab);
+	const models = input.usable.filter(s => labOf(s) === input.lab);
+	const reasons =
+		mine.length === 0
+			? [`no ${input.lab} entry in the row`]
+			: models.length > 0
+				? []
+				: mine.map(s => `${s} (${input.skipped?.[s] ?? "not usable"})`);
+	return { models, allow: mine.map(modelIdentity), reasons };
+}
+
+/**
+ * The lab a panel's synthesis hand runs on: the first lab in row order with a usable entry that is
+ * not a builder; when there is none (every lab a builder, or the others down), the first usable
+ * builder lab, named as one (`builderLab`). Synthesis is not a gate review, so it never parks; with
+ * no usable lab at all it gets `reasons` and is dispatched again later.
+ */
+export function synthLab(input: { row: readonly string[]; usable: readonly string[]; builders: Builders; skipped?: Readonly<Record<string, string>> }):
+	| { lab: Lab; builderLab: boolean }
+	| { reasons: string[] } {
+	const labs = input.usable.flatMap(s => labOf(s) ?? []);
+	const other = labs.find(lab => !isBuilder(input.builders, lab));
+	if (other) return { lab: other, builderLab: false };
+	if (labs.length > 0) return { lab: labs[0]!, builderLab: true };
+	return { reasons: input.row.map(s => `${s} (${input.skipped?.[s] ?? "not usable"})`) };
 }

@@ -6,6 +6,8 @@ argument-hint: "[base-ref] [--ticket path/to/ticket.md] [--multi [--only r1,r2] 
 
 # triad — Cross-Provider Review
 
+From an as2 lane this mode runs as a panel (`triad`, then `triad-verify`), never through `scripts/`: see [`../panel/panel.md`](../panel/panel.md).
+
 ## Overview
 
 Single-model review has correlated blind spots. Claude reviewing Claude's code is the same

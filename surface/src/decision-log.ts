@@ -13,7 +13,7 @@ import type { Ledger } from "../../ledger/src/index";
 import { reservedStates } from "./errors";
 import { type Identity, authorSlug } from "./identity";
 import { controlEntries, doneBecause, doneLine, holdersOf, reservedPrefix } from "./launch";
-import { SURFACE_BY } from "./types";
+import { MERGE_TRAIN_BY, SURFACE_BY } from "./types";
 
 export const REPO_PREFIX = "repo:";
 const FILE_NAME = /^(\d{4}-\d{2}-\d{2})--(\d{4})--([^-][^/]*?)--(.+)\.md$/;
@@ -170,10 +170,14 @@ function fitEntry(heading: string, content: readonly string[], share: number, na
  * naming `dir`. When even the header line exceeds `maxBytes`, the result is that line clipped to fit.
  */
 export function decisionLogContext(dir: string, opts: ContextOptions = {}): string {
+	return renderLogContext(readLog(dir), dir, opts);
+}
+
+/** `decisionLogContext` over entries already read: no file I/O (`dir` only names the log in the "not rendered" line); `opts.now` defaults to the clock. */
+export function renderLogContext(entries: readonly LogEntry[], dir: string, opts: ContextOptions = {}): string {
 	const now = opts.now ?? new Date().toISOString();
 	const maxBytes = opts.maxBytes ?? DECISION_LOG_MAX_BYTES;
 	const entryBytes = opts.entryBytes ?? DECISION_LOG_ENTRY_BYTES;
-	const entries = readLog(dir);
 	const superseded = new Set(entries.map((e) => e.frontmatter.supersedes).filter((s): s is string => !!s && s !== "null" && s !== "~"));
 	let picked = entries.filter((e) => e.frontmatter.status !== "superseded" && !superseded.has(basename(e.path)) && !superseded.has(basename(e.path, ".md")));
 	if (opts.since) picked = picked.filter((e) => e.date > opts.since!);
@@ -221,12 +225,15 @@ export function decisionLogContext(dir: string, opts: ContextOptions = {}): stri
 	return out.join("\n").trimEnd();
 }
 
-/** The repo an open workload is on, from its `repo:` entry — the surface's (Codex review B7: a lane's note never routes git). */
+/**
+ * The repo an open workload is on, from its `repo:` entry — the surface's, or the train tick's on a fix workload it opened
+ * (PLAN wl-mv8s8srodefytc D8); never a lane's (Codex review B7: a lane's note never routes git).
+ */
 export function repoOf(ledger: Ledger, workloadId: string): string | null {
 	const rows = ledger.entries(workloadId, "assumption");
 	for (let i = rows.length - 1; i >= 0; i--) {
 		const e = rows[i]!;
-		if (e.created_by === SURFACE_BY && e.body.startsWith(REPO_PREFIX)) return e.body.slice(REPO_PREFIX.length).trim();
+		if ((e.created_by === SURFACE_BY || e.created_by === MERGE_TRAIN_BY) && e.body.startsWith(REPO_PREFIX)) return e.body.slice(REPO_PREFIX.length).trim();
 	}
 	return null;
 }

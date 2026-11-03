@@ -7,7 +7,7 @@
  * import, no I/O: callers read the rows and hand them in; the classifier and the surface both
  * import it, so they cannot disagree on a count.
  */
-import type { EntryRow, InstructionRow } from "../../ledger/src/index";
+import { CLASSIFIER_BY, type EntryRow, type InstructionRow } from "../../ledger/src/index";
 import { JO_HOLDER } from "../../surface/src/launch";
 import { SURFACE_BY } from "../../surface/src/types";
 import type { Stakes } from "./route";
@@ -25,8 +25,15 @@ export const REVIEW_ROUND_DEFAULTS: Readonly<Record<Stakes, number>> = {
 
 export const SEVERITIES = ["blocking", "major", "minor"] as const;
 export type Severity = (typeof SEVERITIES)[number];
-export const FINDING_KINDS = ["correctness", "security", "tests", "design", "docs", "other"] as const;
+/**
+ * `fault-tolerance` (Jo 2026-10-27, issue #334 item 1): a silent failure path, i.e. a swallowed error, an unannounced
+ * fallback, a long-running step with no progress deadline, or cleanup that deletes cited evidence. Always blocking:
+ * the parser reads one as blocking whatever severity the reviewer wrote (asFinding).
+ */
+export const FINDING_KINDS = ["correctness", "security", "tests", "design", "docs", "fault-tolerance", "other"] as const;
 export type FindingKind = (typeof FINDING_KINDS)[number];
+/** The finding kind that is blocking whatever severity it is written with. */
+export const ALWAYS_BLOCKING_KIND: FindingKind = "fault-tolerance";
 
 export interface Finding {
 	severity: Severity;
@@ -106,7 +113,9 @@ function asFinding(x: unknown): Finding | null {
 	if (typeof title !== "string") return null;
 	const t = title.replace(/\s+/g, " ").trim();
 	if (t === "") return null;
-	return { severity: severity as Severity, kind: kind as FindingKind, title: t.length > TITLE_CHARS ? `${t.slice(0, TITLE_CHARS - 1)}…` : t };
+	// Issue #334 item 1: a silent failure path blocks the round even when the reviewer called it major or minor.
+	const s = kind === ALWAYS_BLOCKING_KIND ? "blocking" : (severity as Severity);
+	return { severity: s, kind: kind as FindingKind, title: t.length > TITLE_CHARS ? `${t.slice(0, TITLE_CHARS - 1)}…` : t };
 }
 
 /** A stored `counts` JSON, validated back into `Findings`; null when it is not one. */
@@ -118,6 +127,8 @@ function asFindings(x: unknown): Findings | null {
 		if (!isObject(row)) return null;
 		for (const [k, n] of Object.entries(row)) {
 			if (!(FINDING_KINDS as readonly string[]).includes(k) || !Number.isInteger(n) || (n as number) < 1) return null;
+			// A fault-tolerance finding is only ever counted as blocking (asFinding); any other cell is not a stored block.
+			if (k === ALWAYS_BLOCKING_KIND && s !== "blocking") return null;
 			out.counts[s][k as FindingKind] = n as number;
 		}
 	}
@@ -227,12 +238,16 @@ export interface ReviewRoundsExtendEntry {
 	by: string;
 }
 
-/** `review-rounds-extend: <sl> +<n> by <answer id>`: one more block of rounds for one slice. */
+/**
+ * `review-rounds-extend: <sl> +<n> by <id>`: one more block of rounds for one slice. `<id>` is Jo's `extend` answer
+ * (`in-…`, written by the surface), or the `ruling-applied: review-auto-extend …` entry (`en-…`) of the classifier's
+ * auto-extend (PLAN wl-mvqwn80onq9hq8 D10, written by CLASSIFIER_BY with `<n>` the workload's round limit).
+ */
 export function reviewRoundsExtendBody(slice: string, rounds: number, by: string): string {
 	return `review-rounds-extend: ${slice} +${rounds} by ${by}`;
 }
 
-const REVIEW_ROUNDS_EXTEND = /^review-rounds-extend:\s+(\S+)\s+\+(\d+)\s+by\s+(in-\S+)$/;
+const REVIEW_ROUNDS_EXTEND = /^review-rounds-extend:\s+(\S+)\s+\+(\d+)\s+by\s+((?:in|en)-\S+)$/;
 
 export function parseReviewRoundsExtend(body: string): ReviewRoundsExtendEntry | null {
 	const m = REVIEW_ROUNDS_EXTEND.exec(body.trim());
@@ -289,11 +304,21 @@ const ROUNDS_INSTRUCTION = /^rounds:\s+(\d+)$/;
 // The two entries rounds.ts reads but does not write (sl-lab-route, PLAN D3 / D2).
 const HAND_SPAWN = /^hand-spawn:\s+(\S+)\s+session\s+(.+?)\s+spawn\s+(\S+)\s+review\s+(yes|no)\s+group\s+(\S+)\s+row\s+(.*)$/s;
 const REVIEW_WITHHELD = /^review-withheld:\s+(\S+)$/;
+/**
+ * The `ruling-applied:` entry gates/src/rulings.ts `askJo` writes when ruling review-auto-extend decides a slice's round-limit
+ * question (`rulingAppliedBody`, PLAN wl-mvqwn80onq9hq8 D10), matched here so this module needs no import of rulings.ts.
+ */
+const AUTO_EXTEND_APPLIED = /^ruling-applied: review-auto-extend kind round-limit slice (\S+) answer extend$/;
 
 // ---- counting ----------------------------------------------------------------------------------
 
 export type EntryInput = Pick<EntryRow, "kind" | "slice_id" | "body" | "created_at">;
 export type InstructionInput = Pick<InstructionRow, "id" | "kind" | "question_id" | "author" | "body" | "created_by" | "created_at">;
+/**
+ * What `effectiveRoundLimit` reads of an entry. `id` and `created_by` are read only for the classifier's auto-extend
+ * (D10): a caller that leaves them out never counts one.
+ */
+export type LimitEntryInput = EntryInput & Partial<Pick<EntryRow, "id" | "created_by">>;
 
 export interface RoundMember {
 	token: string;
@@ -358,7 +383,8 @@ export interface RoundCount {
  * `review-withheld:`) with a known block; it passes when every counted member is accepted with a
  * known block and no blocking finding; otherwise it is unread (PLAN wl-mv5i3lulwwbbi8 D9: a member's
  * block is unknown and nothing known failed it). The loop's first unread round is free, every
- * further one counts as failed. `entries` are the workload's, oldest first.
+ * further one counts as failed. A `pg-` group (a three-lab panel, classifier/src/panel.ts) is no
+ * round: panels are bounded by their own count. `entries` are the workload's, oldest first.
  */
 export function countRounds(entries: readonly EntryInput[], slice: string): RoundCount {
 	interface Group { loop: number; tokens: Map<string, ReviewRoundEntry | null>; ran: Set<string> }
@@ -392,7 +418,7 @@ export function countRounds(entries: readonly EntryInput[], slice: string): Roun
 		}
 		const s = HAND_SPAWN.exec(body);
 		if (s) {
-			if (e.slice_id !== slice || s[4] !== "yes") continue;
+			if (e.slice_id !== slice || s[4] !== "yes" || s[5]!.startsWith("pg-")) continue;
 			const g = groupOf(s[5]!);
 			g.ran.add(s[1]!);
 			if (!g.tokens.has(s[1]!)) g.tokens.set(s[1]!, null);
@@ -439,6 +465,16 @@ export function roundBlockingText(r: Pick<Round, "blocking" | "unknown">): strin
 	return r.unknown > 0 ? `${r.blocking} (+${r.unknown} unknown)` : String(r.blocking);
 }
 
+/**
+ * PLAN wl-mvqwn80onq9hq8 D10, ruling review-auto-extend's `fell` fact: the loop has at least two complete rounds, every one
+ * with a known blocking count (no member's block unknown, none unread), each strictly lower than the one before.
+ */
+export function fellEveryRound(count: Pick<RoundCount, "rounds">): boolean {
+	const done = count.rounds.filter((r) => r.complete);
+	if (done.length < 2 || done.some((r) => r.blocking === null || r.unknown > 0 || r.unread)) return false;
+	return done.every((r, i) => i === 0 || r.blocking! < done[i - 1]!.blocking!);
+}
+
 // ---- the limit ---------------------------------------------------------------------------------
 
 export interface RoundLimit {
@@ -458,14 +494,18 @@ export interface RoundLimit {
  * than the newest valid entry re-sizes the limit to the current stakes' default, as the stakes word
  * re-sizes the ceiling. Each valid `review-rounds-extend:` of the slice since its latest
  * `review-loop-end:` adds its block once per answer; a valid extend is an `extend` answer to a
- * `review-limit:` question on that slice.
+ * `review-limit:` question on that slice. PLAN wl-mvqwn80onq9hq8 D10: an extend written by CLASSIFIER_BY whose `by` is a
+ * `ruling-applied: review-auto-extend … slice <slice> … answer extend` entry (the classifier's auto-extend) adds its block
+ * too, at most one such per loop; that form from any other writer, or naming any other entry, adds nothing.
  */
-export function effectiveRoundLimit(entries: readonly EntryInput[], instructions: readonly InstructionInput[], stakes: Stakes, slice: string): RoundLimit {
+export function effectiveRoundLimit(entries: readonly LimitEntryInput[], instructions: readonly InstructionInput[], stakes: Stakes, slice: string): RoundLimit {
 	const limitQuestions = new Map<string, string>();
+	const autoApplied = new Set<string>();
 	for (const e of entries) {
 		if (e.kind !== "assumption") continue;
 		const l = parseReviewLimit(e.body);
 		if (l) limitQuestions.set(l.questionId, l.slice);
+		if (e.id !== undefined && AUTO_EXTEND_APPLIED.exec(e.body.trim())?.[1] === slice) autoApplied.add(e.id);
 	}
 	const fromJo = (id: string): InstructionInput | null =>
 		instructions.find((i) => i.id === id && i.author === JO_HOLDER && i.created_by === SURFACE_BY) ?? null;
@@ -475,6 +515,7 @@ export function effectiveRoundLimit(entries: readonly EntryInput[], instructions
 
 	let cur: { rounds: number; at: string } | null = null;
 	let extends_ = new Map<string, number>();
+	let auto: number | null = null;
 	for (const e of entries) {
 		if (e.kind !== "assumption") continue;
 		const r = parseReviewRounds(e.body);
@@ -489,18 +530,25 @@ export function effectiveRoundLimit(entries: readonly EntryInput[], instructions
 		const x = parseReviewRoundsExtend(e.body);
 		if (x) {
 			if (x.slice !== slice) continue;
+			if (x.by.startsWith("en-")) {
+				if (auto === null && e.created_by === CLASSIFIER_BY && autoApplied.has(x.by)) auto = x.rounds;
+				continue;
+			}
 			const i = fromJo(x.by);
 			if (i !== null && isExtendAnswer(i, slice) && !extends_.has(x.by)) extends_.set(x.by, x.rounds);
 			continue;
 		}
 		const end = parseReviewLoopEnd(e.body);
-		if (end && end.slice === slice) extends_ = new Map();
+		if (end && end.slice === slice) {
+			extends_ = new Map();
+			auto = null;
+		}
 	}
 	const flip = instructions
 		.filter((i) => i.author === JO_HOLDER && i.created_by === SURFACE_BY && i.body.startsWith("stakes: "))
 		.reduce<string | null>((at, i) => (at === null || i.created_at > at ? i.created_at : at), null);
 	const workload = cur !== null && (flip === null || cur.at >= flip) ? cur.rounds : REVIEW_ROUND_DEFAULTS[stakes];
-	const extend = [...extends_.values()].reduce((a, b) => a + b, 0);
+	const extend = [...extends_.values()].reduce((a, b) => a + b, 0) + (auto ?? 0);
 	return { workload, extend, total: workload + extend };
 }
 
@@ -590,6 +638,15 @@ export function estimateText(e: RoundsEstimate): string {
 	if (e.kind === "none") return e.reason;
 	const fall = Math.round(e.meanFall * 100) / 100;
 	return `about ${e.rounds} more round${e.rounds === 1 ? "" : "s"}, ceil(last ${e.last} / mean fall ${fall} per round)`;
+}
+
+/**
+ * PLAN wl-mvqwn80onq9hq8 D10: the notice the classifier sends when ruling review-auto-extend extended `slice`'s loop on
+ * `workloadId` (after `notice: `), with the blocking count of each complete round of the loop.
+ */
+export function autoExtendNoticeBody(slice: string, workloadId: string, count: Pick<RoundCount, "rounds">): string {
+	const blocking = count.rounds.filter((r) => r.complete).map(roundBlockingText).join("→");
+	return `review of ${slice} on ${workloadId} extended by itself (blocking ${blocking}, ruling review-auto-extend); \`stop-reviews ${workloadId}\` stops it; \`ask-all\` stops all auto-extends`;
 }
 
 // ---- helpers -----------------------------------------------------------------------------------

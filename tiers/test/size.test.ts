@@ -10,6 +10,24 @@
 //   strong.md         36 lines   3162 bytes
 //   deep.md           36 lines   3133 bytes
 //
+// Re-measured 2026-10-14 on wl/wl-mv8k039gvogt8g (base 60ac207) with the same command, after the Jev rank tier rule
+// (PLAN wl-mv8k039gvogt8g D4) filled the old 18168-byte bound; its bound below is recomputed by the same rule:
+//   orchestrator.md  263 lines  18407 bytes
+// and again after merging origin/main 479186d, whose lane.md (15219 bytes) plus the rank rule filled the old 15248:
+//   lane.md           73 lines  15399 bytes
+// Re-measured 2026-10-20 on wl/wl-mvg8itbt0rz3ls (origin/main e125cd2 merged with PR #267 49dcd04), where #267's
+// standing-rulings text (23005 bytes) plus main's open-links lines (dcc7a35, +2 lines per tier file) filled the old 23009:
+//   orchestrator.md  324 lines  23182 bytes
+// and again 2026-10-22 on wl/wl-mvifaz8r8dieps (base f2db8f2, main's orchestrator.md at 23005 bytes against a 23009
+// bound), after the rank-ordered launch list rule (PR #158) and the intake-queue rule (PLAN wl-mvbcjadqgblr7k D8) filled it:
+//   orchestrator.md  329 lines  23572 bytes
+// and again 2026-10-26 on wl/wl-mvifaz8r8dieps merged with origin/main 2a4f476 (#267's standing rulings and #305's
+// intake-queue rule together):
+//   orchestrator.md  328 lines  23478 bytes
+// Re-measured 2026-10-27 on plumb/fault-tolerance-tiers (base fe6ed4d), where the fault-tolerance section
+// (.ai/decision-log/2026-10-27--0540--plumb--fault-tolerance-principles-are-standing-rules.md) filled the old 19249:
+//   lane.md           93 lines  19605 bytes
+//
 // Bound per file and per measure = max(ceil(measured × 1.25), floor). The floor is rootstock's own
 // budget: 200 lines, and 2,000 tokens taken as 8,000 bytes at roughly four bytes per token for
 // English prose (a heuristic, not a tokenizer count). The floor keeps the small model-tier files from
@@ -26,8 +44,8 @@ const TIER_DIR = join(import.meta.dir, "..");
 const WARN_AT = 0.85;
 
 const BOUNDS: Record<string, { lines: number; bytes: number }> = {
-	"orchestrator.md": { lines: 269, bytes: 18168 },
-	"lane.md": { lines: 200, bytes: 15248 },
+	"orchestrator.md": { lines: 410, bytes: 29348 },
+	"lane.md": { lines: 200, bytes: 24507 },
 	"fast.md": { lines: 200, bytes: 8000 },
 	"standard.md": { lines: 200, bytes: 8000 },
 	"strong.md": { lines: 200, bytes: 8000 },

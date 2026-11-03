@@ -701,7 +701,7 @@ export function writeStubProfile(agentDir: string, port: number, opts: StubProfi
 	const configPath = join(agentDir, "config.yml");
 	const config = readYaml(configPath);
 	const tierProviders = selectorsIn(fields(config.task).agentModelOverrides).map((s) => s.split("/")[0]!);
-	const chatModel = opts.chatModel ?? "anthropic/claude-haiku-4-5";
+	const chatModel = opts.chatModel ?? "anthropic/claude-haiku-5-5";
 	const [chatProvider, ...chatRest] = chatModel.split("/");
 	const chatEntry = catalog[chatProvider!]?.[chatRest.join("/")];
 	if (!chatEntry || !isChat(chatEntry) || !routed.has(chatProvider!)) throw new Error(`chaos-stub: ${chatModel} is not a routed catalog chat model`);

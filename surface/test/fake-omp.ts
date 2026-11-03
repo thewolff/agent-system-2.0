@@ -15,12 +15,16 @@
 //   { claim?: false,               skip session_start (an extension that did not load: never ready)
 //     noSession?: true,            the get_state reply carries no sessionFile
 //     steps: [ { tool, args } | { sleepMs } | { exit: code } | { hang: true } | { result: "aborted" | "error", error? }
-//              | { usage: { usd, tokens }, hand? } | { background: ms | "never" } | { wake: { ms, steps } }
-//              | { ledger: { body, slice? } | { routing: { slice } } } ],
+//              | { usage: { usd, tokens }, hand? } | { background: ms | "never" } | { wake: { ms, steps } } | { emit: frame }
+//              | { writeFile: { path, text } } | { ledger: { body, slice? } | { routing: { slice } } } ],
 //                                an arg value "$slice" is the id the newest tool result named (lane_add_slice mints it);
 //                                a usage step appends one assistant message with that usage (usage.cost.total,
 //                                usage.totalTokens) to the session file, or with `hand` to <session>/<hand>.jsonl, where
 //                                OMP writes a hand's session file (the runner's ceiling meter reads both);
+//                                an emit step writes its frame object to stdout as-is, one JSON line (an omp frame no
+//                                other step produces, e.g. the extensions `notice`);
+//                                a writeFile step writes `text` to `path` (parents made), as install.sh rewrites the
+//                                profile config mid-run, before the steps after it run;
 //                                a background step ends the prompt with `sessionSettled: false`; after `ms` it records
 //                                `background-done`, runs the next turn's steps as the woken turn (no prompt_result) and
 //                                emits `session_settled`; an EOF first records `background-killed` ("never": always);
@@ -51,8 +55,9 @@
 //                                (SIGKILL included) until the test opens the gate: a window the test controls
 // Record (JSONL appended at $FAKE_OMP_RECORD): { pid, argv, cwd, env: { AGENT_SYSTEM_*, OMP_PROFILE }, hooks: [the
 // SHELL_START_HOOK_NAMES its env carries, names only], session, resumed }
-// at start, then { pid, event } for each frame or signal seen: prompt (with its id and message), abort, eof, sigterm,
-// sigint, background-done / background-killed, and wake; and { pid, command, id, provider?, modelId? } for every rpc
+// at start, then { pid, event } for each frame or signal seen: prompt (with its id and message; the `@file` initial
+// message as { event: "prompt", initial: true, message }, run as the first turn), abort, eof, sigterm, sigint,
+// background-done / background-killed, and wake; and { pid, command, id, provider?, modelId? } for every rpc
 // command frame received, in arrival order (a test asserts `set_model` and its `get_state` came before `prompt`).
 // A new session file opens as OMP's does: a `title` line, then `{"type":"session","id":"<uuid>",…}` (the
 // header surface/src/ctx-index.ts reads), and get_state's sessionId is that id; a resumed file keeps its own header.
@@ -62,7 +67,8 @@ import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import orchestratorSurface from "../index";
-import { ctxOf, type FakeScript, type FakeStep, fakePi } from "./helpers";
+import { ctxOf, fakePi, loadTestText } from "./helpers";
+import type { FakeScript, FakeStep } from "./helpers";
 
 const script: FakeScript = process.env.FAKE_OMP_SCRIPT && existsSync(process.env.FAKE_OMP_SCRIPT) ? (JSON.parse(readFileSync(process.env.FAKE_OMP_SCRIPT, "utf8")) as FakeScript) : { steps: [] };
 const argv = process.argv.slice(2);
@@ -72,12 +78,33 @@ const flag = (name: string): string | null => {
 };
 const sessionDir = flag("--session-dir") ?? join(process.cwd(), "sessions");
 const resumed = flag("--resume");
+// jo-issues #206: OMP refuses a missing --resume instead of silently creating a session.
+if (resumed !== null && !existsSync(resumed)) {
+	process.stderr.write(`Error: Session "${resumed}" not found.\n`);
+	process.exit(1);
+}
 /** `--model provider/id` as omp reports it in get_state (measured on 18.8.6: `openai-codex/gpt-6-sol` → provider `openai-codex`, id `gpt-6-sol`). */
 const named = flag("--model");
 /** The model get_state reports: the script's override, else `--model`'s, else `{ id: "fake" }`; a `set_model` frame replaces it. */
 let stateModel: { provider?: string; id?: string } | null =
 	script.stateModel !== undefined ? script.stateModel : named ? { provider: named.slice(0, named.indexOf("/")), id: named.slice(named.indexOf("/") + 1) } : { id: "fake" };
 const maxTime = flag("--max-time");
+// `@<path>` (interactive mode only: OMP refuses it under `--mode rpc` and exits 1, as it does for a missing file): OMP reads
+// each file as `<file name="<absolute path>">\n<text>\n</file>\n` and sends the text as the session's first user message
+// (@oh-my-pi/pi-coding-agent 18.8.6 src/cli/args.ts, file-processor.ts, initial-message.ts; main.ts session.prompt).
+const fileArgs = argv.filter((a) => a.startsWith("@")).map((a) => a.slice(1));
+if (fileArgs.length > 0 && flag("--mode") === "rpc") {
+	process.stderr.write("Error: @file arguments are not supported in RPC mode\n");
+	process.exit(1);
+}
+let initialMessage: string | null = null;
+for (const file of fileArgs) {
+	if (!existsSync(file)) {
+		process.stderr.write(`Error: File not found: ${file}\n`);
+		process.exit(1);
+	}
+	initialMessage = `${initialMessage ?? ""}<file name="${file}">\n${readFileSync(file, "utf8")}\n</file>\n`;
+}
 mkdirSync(sessionDir, { recursive: true });
 // `--resume <path>` appends to that same file, as OMP 18.4.4 does (`SessionManager.open(path, sessionDir)`): on workload
 // wl-muolz8qtp6ylfk, relaunched lanes 2–5 each reported lane 1's sessionFile in get_state (their lane-started: entries),
@@ -105,6 +132,23 @@ if (script.holdStdoutUntil) {
 		stdin: "ignore", stdout: "inherit", stderr: "ignore",
 	}).unref();
 }
+if (script.holdStderrUntil) {
+	Bun.spawn(["sh", "-c", 'i=0; while [ ! -e "$1" ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i+1)); done', "sh", script.holdStderrUntil], {
+		stdin: "ignore", stdout: "ignore", stderr: "inherit",
+	}).unref();
+}
+if (script.startup) {
+	for (const chunk of script.startup.chunks ?? []) {
+		await Bun.write(Bun.stderr, chunk);
+		await Bun.sleep(5);
+	}
+	if (script.startup.delayMs) await Bun.sleep(script.startup.delayMs);
+	if (script.startup.signal) {
+		process.kill(process.pid, script.startup.signal);
+		await Bun.sleep(1000);
+	}
+	process.exit(script.startup.code ?? 1);
+}
 
 const emit = (frame: Record<string, unknown>): void => {
 	process.stdout.write(`${JSON.stringify(frame)}\n`);
@@ -117,7 +161,7 @@ const durationMs = (d: string | null): number | null => {
 };
 
 const f = fakePi();
-orchestratorSurface(f.pi, process.env, {});
+await orchestratorSurface(f.pi, process.env, { loadText: loadTestText });
 const ctx = ctxOf({ cwd: process.cwd() });
 let shutDown = false;
 const shutdown = async (): Promise<void> => {
@@ -127,6 +171,19 @@ const shutdown = async (): Promise<void> => {
 	appendFileSync(session, `{"type":"session_shutdown"}\n`);
 	process.exit(0);
 };
+
+// session_start publishes the lane's claim before later handlers (including verifier git reads)
+// finish. A by-hand stop may signal as soon as that claim is visible, so install shutdown first.
+process.on("SIGTERM", () => {
+	recordLine({ event: "sigterm" });
+	if (script.ignoreTerm) return;
+	if (script.shutdownOnTerm === false) process.exit(143);
+	void shutdown();
+});
+process.on("SIGINT", () => {
+	recordLine({ event: "sigint" });
+	void shutdown();
+});
 
 emit({ type: "ready", protocolVersion: 1, fake: true });
 if (script.claim !== false) await f.emit("session_start", { type: "session_start" }, ctx);
@@ -221,6 +278,15 @@ const runSteps = async (steps: readonly FakeStep[]): Promise<number | "never" | 
 			ledgerStep(step.ledger);
 			continue;
 		}
+		if ("writeFile" in step) {
+			mkdirSync(dirname(step.writeFile.path), { recursive: true });
+			writeFileSync(step.writeFile.path, step.writeFile.text);
+			continue;
+		}
+		if ("emit" in step) {
+			emit(step.emit);
+			continue;
+		}
 		const args = Object.fromEntries(Object.entries(step.args).map(([k, v]) => [k, v === "$slice" ? lastSlice : v]));
 		const r = await f.tool(step.tool).execute(`c${Date.now()}`, args, undefined, undefined, ctx);
 		const text = r.content[0]?.text ?? "";
@@ -278,16 +344,11 @@ const runPrompt = async (message: string): Promise<void> => {
 	if (job !== null) background(job);
 };
 
-process.on("SIGTERM", () => {
-	recordLine({ event: "sigterm" });
-	if (script.ignoreTerm) return;
-	if (script.shutdownOnTerm === false) process.exit(143);
-	void shutdown();
-});
-process.on("SIGINT", () => {
-	recordLine({ event: "sigint" });
-	void shutdown();
-});
+// The `@file` text is the first user message, after session_start, as OMP prompts it (no `input` event: it is not typed).
+if (initialMessage !== null) {
+	recordLine({ event: "prompt", initial: true, message: initialMessage });
+	void runPrompt(initialMessage);
+}
 
 const reader = Bun.stdin.stream().getReader();
 const decoder = new TextDecoder();

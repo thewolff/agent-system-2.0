@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "panel triad-verify leg — one refutation verdict",
+  "description": "Output contract of one triad-verify panel leg: references/triad/prompts/refute.schema.json's verdict as the single entry of items. repro is required here (the empty string when refuted is true) because every field is required. The classifier assigns the item id <lab>-1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "description": "Exactly one verdict on the one finding under test.",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["refuted", "ground", "basis", "repro"],
+        "properties": {
+          "refuted": {
+            "type": "boolean",
+            "description": "true kills the finding. Default to true when the defect could not be established — uncertainty is a refutation, not a survival."
+          },
+          "ground": {
+            "type": "string",
+            "description": "Which kill condition landed, or survived if none did.",
+            "enum": [
+              "code_does_not_say_that",
+              "trigger_cannot_happen",
+              "outcome_is_intended",
+              "already_handled",
+              "taste_not_defect",
+              "could_not_establish",
+              "survived"
+            ]
+          },
+          "basis": {
+            "type": "string",
+            "description": "The receipt: the file:line read, the guard found and where it is, or the decision-log entry cited. Required for every verdict including refusals — 'seems unlikely' is not a basis."
+          },
+          "repro": {
+            "type": "string",
+            "description": "When refuted is false: the concrete input or sequence, and the wrong outcome. If this sentence cannot be written, the verdict is refuted. The empty string when refuted is true."
+          }
+        }
+      }
+    }
+  }
+}
