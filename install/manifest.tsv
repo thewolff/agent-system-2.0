@@ -1110,6 +1110,7 @@ surface/test/tool-mount.test.ts	test	-
 voice/VOICE.md	doc	-
 voice/agent-collaboration-with-adhd-and-autism.md	doc	-
 surface/src/launch.ts	module	-
+surface/src/lane-offsite.ts	module	-
 surface/src/jo-issues.ts	module	-
 surface/src/quota-move-alert.ts	module	-
 surface/extensions/launch.ts	module	-
@@ -1123,6 +1124,7 @@ ledger/test/lane.test.ts	test	-
 surface/test/fake-omp.ts	test	-
 surface/test/launch.test.ts	test	-
 surface/test/lane-script.test.ts	test	-
+surface/test/lane-offsite.test.ts	test	-
 surface/test/lane-live-lane.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-
 surface/test/lane-model.test.ts	test	-
