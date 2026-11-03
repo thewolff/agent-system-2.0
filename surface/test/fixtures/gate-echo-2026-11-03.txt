@@ -1,0 +1,42 @@
+your closing ask to Jo is not in the ledger: raise it with orchestrator_raise_question first and name the q-… id it returns in the closing ask, so Jo can answer it by id; a question with no row is not asked
+
+Your held reply was:
+
+
+## Needs you
+**The land-first proof failed.** All 19 fast-check runs you dispatched came back red-incomplete, so turning land-first on now would hold up ordinary PRs ({{Q}}).
+
+The lane's diagnosis, which I haven't checked:
+- **Cause:** ten test files listed in the profile's `testRunner.mainSkip` need an installed OMP: seven shell-start-session tests, the by-hand-session and loader plugin tests, and the surface tool-mount test. The hosted Linux runner has no OMP, so each of those files skips every test, and the fast check marks any planned file that ran no tests as red.
+- **Timing is fine:** every run took 299–383 s, under the 600 s cap.
+- **Receipts:** [/Users/jowolff/agent-scratch/agent-system-2.0/{{WL}}/PROOF.md](file:///Users/jowolff/agent-scratch/agent-system-2.0/{{WL}}/PROOF.md) and proof/TIMING.md.
+
+**CLAIM**
+The part I could check holds: the fast check leaves only `macOnly` files out of the Linux run and never looks at `mainSkip` ([/Users/jowolff/code/agent-system-2.0/surface/src/fast-set.ts:235](file:///Users/jowolff/code/agent-system-2.0/surface/src/fast-set.ts)).
+
+The lane offers three fixes:
+- **fastset:** the fast check also leaves `mainSkip` files out of the Linux run. A small code change plus a test, on the land-first PR, and you run dispatch.sh once more.
+- **maconly:** copy the ten files into the profile's `macOnly` list. Config only, but the list would then live in two places, and this one needs your waiver of land-first requirement R5.
+- **stop:** record the proof as failed. Land-first stays off and the fix becomes its own workload.
+
+I recommend fastset. Those ten files already run in no automated suite, so nothing loses coverage, and the list stays in one place.
+
+```text
+fastset {{Q}}
+```
+
+## Body
+**CLAIM**
+Your `train-fix` answer took effect. My duplicate workload for the routine-calls repair PR #420 ({{WL_DUP}}) went user-driven, and its lane accepted the stop at 03:54:04Z, then exited with code 0, having spent about $1.00. It recorded no push. The merge train's own fix workload ({{WL_TRAIN}}) still owns #420.
+
+Closing the duplicate takes your `withdraw {{WL_DUP}}`, which Plumb is putting on your clipboard. Withdraw works now that the lane no longer holds a lease.
+
+Plumb counts run-less-hot as full suites running at once, not lanes holding leases, and none is running now. I'll tell Plumb if the train's #420 fix asks for its full suite while the #424 merge lane still holds a lease, or if #424 isn't merged by 8:15 PM PST.
+
+The lane holding #424 is still merging it.
+
+## Closing ask
+**QUESTION**
+({{Q}}) How should the land-first lane fix the fast check, which reds ten OMP-dependent test files on Linux: make the fast check skip the `mainSkip` files (fastset), copy the ten files into the profile's `macOnly` list (maconly), or record the proof as failed and move the fix to its own workload (stop)? I recommend `fastset {{Q}}`: the list stays in one place and no coverage is lost.
+
+1 other waiting: `pending` shows them all

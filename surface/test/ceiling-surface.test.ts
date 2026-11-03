@@ -14,7 +14,7 @@ import { controlEntries, laneExitBody } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { oneLiner, renderWorkload } from "../src/render";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, HOW_IT_FAILS, notices, tempLedger, tmp } from "./helpers";
+import { ctxOf, fakePi, HOW_IT_FAILS, notices, tempLedger, tmp, typedTurn } from "./helpers";
 
 function env(): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
@@ -130,7 +130,7 @@ describe("Jo's ceiling word", () => {
 		seed.close();
 		orchestratorSurface(f.pi, e, {});
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `ceiling 60 8 ${wl}`, systemPrompt: [] }, ctxOf());
+		await typedTurn(f, ctxOf(), `ceiling 60 8 ${wl}`);
 		expect(notices).toEqual([expect.stringContaining(`ceiling on ${wl} → $60 / 8h`)]);
 		const l = open(e);
 		const ins = l.instructions(wl).at(-1)!;
@@ -191,7 +191,7 @@ describe("Jo's extend word (R13)", () => {
 		seed.close();
 		orchestratorSurface(f.pi, e, {});
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `extend ${wl}`, systemPrompt: [] }, ctxOf());
+		await typedTurn(f, ctxOf(), `extend ${wl}`);
 		expect(notices[0]).toContain(`→ $100 / 12h`);
 		expect(notices[0]).toContain("lane-t-1 stopped at the ceiling, so a relaunch is requested");
 		const l = open(e);

@@ -473,6 +473,7 @@ describe("P-11 row 15: the orchestrator's QUESTION is a ledger row, answered bef
 		await s.f.emit("input", { text: "hm", source: "interactive" }, s.ctx);
 		// A resolved row never published stays unrecorded at the working call, whatever the clock says.
 		const q4 = await s.raise(null);
+		await s.f.emit("input", { text: `draft ${q4}`, source: "interactive" }, s.ctx);
 		await s.f.emit("before_agent_start", { prompt: `draft ${q4}`, systemPrompt: [] }, s.ctx);
 		expect(s.question(q4)).toMatchObject({ state: "answered" });
 		s.entries.length = 0;
@@ -544,6 +545,7 @@ describe("P-11 row 15: a recorded answer lifts the gate on its own workload (MIG
 		];
 		for (const c of unscoped) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([s.qB]));
 		// Jo's word at the surface answers B's row the same way, and everything passes row 15.
+		await s.f.emit("input", { text: `draft ${s.qB}`, source: "interactive" }, s.ctx);
 		await s.f.emit("before_agent_start", { prompt: `draft ${s.qB}`, systemPrompt: [] }, s.ctx);
 		expect(s.question(s.qB)).toMatchObject({ state: "answered" });
 		for (const c of [...launchCalls(WL_A), ...launchCalls(WL_B)]) expect(await s.call(...c)).toBeUndefined();
@@ -588,6 +590,7 @@ describe("P-11 row 15: a recorded answer lifts the gate on its own workload (MIG
 		const q = await s.raise(null);
 		expect(await s.publish(`**Closing ask**\n(${q}) Rename me?`)).toBeNull();
 		for (const c of launchCalls(WL_A)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([q]));
+		await s.f.emit("input", { text: `withdraw ${q}`, source: "interactive" }, s.ctx);
 		await s.f.emit("before_agent_start", { prompt: `withdraw ${q}`, systemPrompt: [] }, s.ctx);
 		expect(s.question(q)).toMatchObject({ state: "withdrawn" });
 		for (const c of launchCalls(WL_A)) expect(await s.call(...c)).toBeUndefined();
@@ -617,6 +620,7 @@ describe("P-11 row 15: orchestrator_set_lane_model waits on its own workload's q
 		const q = await s.raise(null);
 		expect(await s.publish(`**Closing ask**\n(${q}) Rename me?`)).toBeNull();
 		for (const c of setModelCalls(WL_A)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([q]));
+		await s.f.emit("input", { text: `withdraw ${q}`, source: "interactive" }, s.ctx);
 		await s.f.emit("before_agent_start", { prompt: `withdraw ${q}`, systemPrompt: [] }, s.ctx);
 		expect(s.question(q)).toMatchObject({ state: "withdrawn" });
 		for (const c of setModelCalls(WL_A)) expect(await s.call(...c)).toBeUndefined();

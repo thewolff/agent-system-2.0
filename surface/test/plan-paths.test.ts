@@ -19,7 +19,7 @@ import { raiseOrchestratorQuestion } from "../src/orchestrator-question";
 import type { withPlanPaths as WithPlanPaths } from "../src/plan-paths";
 import { surfaceSession } from "../src/session";
 import { SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, loadTestText, notices, type Sent, timeouts, timers, tmp, workloadWithSlice } from "./helpers";
+import { ctxOf, fakePi, loadTestText, notices, type Sent, timeouts, timers, tmp, typedTurn, workloadWithSlice } from "./helpers";
 
 const PLAN_PATH = "surface-plan-path";
 const APPLIED = "## Applied from the surface since your last turn";
@@ -95,7 +95,8 @@ async function start(e: Record<string, string>, o: { exec?: boolean } = {}) {
 		n: (rowId: string) => s.numbering.numberOf(rowId)!,
 		/** The messages sent as one customType. */
 		of: (customType: string) => f.sent.filter((x) => x.message.customType === customType),
-		jo: async (prompt: string) => (await f.emit("before_agent_start", { prompt, systemPrompt: [] }, ctx)) as Turn,
+		/** Jo types `prompt` and the turn starts on it (a command applies only from Jo's typed take, jo-issues #306). */
+		jo: async (prompt: string) => (await typedTurn(f, ctx, prompt)) as Turn,
 		ledgerTool: async () => (await f.tool("orchestrator_ledger").execute("1", {}, undefined, undefined, ctx)).content[0]!.text,
 		turn,
 		fireFrom,

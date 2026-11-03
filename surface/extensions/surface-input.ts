@@ -8,10 +8,14 @@
 // (any length, never read as a batch; PLAN wl-mv8s939084z1ts D1), or a numbered batch
 // answering needs-you lines by their session number ("1 approve, 2 deny", or one per line;
 // MIGRATION.md § M7 follow-ups item 1). Read
-// from the turn's prompt in `before_agent_start` rather than from the `input` event, because
-// OMP emits `input` from the interactive TUI and rpc only (input-controller.ts, rpc-mode.ts), never
-// for `omp -p`, and the surface has to behave the same from the TUI,
-// an rpc front-end and `omp -p`. Every current answerable line is numbered first (the session's
+// from the turn's prompt in `before_agent_start`, and applied only from Jo's typed take (jo-issues
+// #306): every ledger command (an answer, a numbered batch, a paste, and every word above) applies
+// only when Jo typed the prompt, that is when OMP's `input` event (source interactive or rpc) pushed
+// the entry the turn takes. A prompt with no take (a session-stop continuation re-sending a held
+// reply, an extension-started prompt, `omp -p`, a prompt that matches more than one way) applies no
+// ledger command and writes no ledger row, whatever it quotes. `before_agent_start` carries no
+// source, so `omp -p` cannot be told apart from a continuation, and it applies none either. Every
+// current answerable line is numbered first (the session's
 // Numbering, surface/src/numbering.ts), so a number or a "which one?" refusal always names the row
 // Jo sees. A batch of any length is checked whole and applied all-or-nothing in one transaction,
 // one ledger row and one echo line per answer; a refused batch writes nothing and echoes one line
@@ -64,8 +68,8 @@
 // and judged: a TUI `!cmd` / `$ code` silently (OMP ran it locally), a `/…` with an info line that
 // names only the command, never its arguments, anything else with a warning to Jo and the model;
 // the same words arriving later get no row and one more warning. A prompt Jo did not type, or one
-// no entry matches, writes no row (fail closed): the model then has no receipt, and Jo answers by
-// `<option> q-…` or instructs by a lane's word instead.
+// no entry matches, applies no command and writes no row (fail closed): the model then has no
+// receipt, and Jo answers by typing `<option> q-…` or instructs by a lane's word instead.
 //
 // Lane launcher (DESIGN-lane-launcher.md decisions 7 and 9): an answer or a withdrawal is a
 // resolution a parked lane resumes on, so the launch trigger runs after it (once per workload for
@@ -92,7 +96,9 @@
 // (`pending` shows the block of every open answer line as a `surface-pending` message, queued for
 // the next idle poll while the session streams; `brb` holds the routine needs-you pushes); neither
 // goes on the typed FIFO. `back` reaches the model, and the wake row reads it in its
-// `before_agent_start`; its turn takes its own typed entry and writes no row.
+// `before_agent_start`; its turn takes its own typed entry and writes no row. The three are session
+// display state, not ledger commands: none writes a ledger row, so none needs a typed take, and
+// being whole-input only, none can be a continuation (the gate's reason, then the held reply).
 //
 // Pair (PLAN wl-mvb9mw00ycfjeo D6): a `pair` answer's receipt (surface/src/input.ts applyPair) ends on a
 // line that is exactly the by-hand command `as2 lane wl-…`. The launch trigger's note is never appended
@@ -198,6 +204,8 @@ const clip = (body: string): string => (body.length > 60 ? `${body.slice(0, 59)}
 
 /** What a turn's prompt took from Jo's typed FIFO (see the header): one entry, a joined run (`seq` the first one's), or nothing because it matched more than one way. */
 type Take = { kind: "one"; seq: number } | { kind: "joined"; texts: string[]; seq: number } | { kind: "ambiguous" };
+/** A take that means Jo typed exactly this prompt (one entry, or one contiguous run OMP joined): the only take a command applies from. */
+type Taken = Extract<Take, { kind: "one" } | { kind: "joined" }>;
 
 /**
  * The typed entry a turn's prompt takes (PLAN wl-mv65nllu5g181s D2): candidates are (a) each entry
@@ -313,16 +321,15 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 	const reason = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 	/**
-	 * The Jo-input row for a prose prompt (see the header): written only when Jo typed this prompt
-	 * (`joTyped`, the turn's take) and there is something it could answer or instruct (an open
+	 * The Jo-input row for a prose prompt Jo typed (see the header; the caller holds the turn's take):
+	 * written only when there is something it could answer or instruct (an open
 	 * orchestrator question, or an open workload besides the standing one), its id echoed for the
 	 * recorder. Its body is the prompt less a pasted `pending` block's pair offer lines; a prompt
 	 * that is nothing but such a block's wrapper writes no row and echoes PENDING_WRAPPER_ONLY.
 	 * `ledger` is the turn's handle when the prompt was read against the ledger already, else
 	 * opened here.
 	 */
-	const joInputRow = (s: SurfaceSession, ctx: Ctx, text: string, joTyped: boolean, ledger: Ledger | null): void => {
-		if (!joTyped) return;
+	const joInputRow = (s: SurfaceSession, ctx: Ctx, text: string, ledger: Ledger | null): void => {
 		const words = withoutPairOffers(text);
 		if (words === null) {
 			echo(s, ctx, text, [PENDING_WRAPPER_ONLY], "info");
@@ -467,123 +474,143 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		return [...echoes.slice(0, i), ...echoes.slice(i + 1), { ...e, line: `${e.line}\n${why === null ? "(copied to the clipboard)" : `(not copied: ${why})`}` }];
 	};
 
-	/** A turn's prompt as Jo's input (see the header): a command applies; prose goes to `asProse`, which the caller's take decides. */
-	const turn = async (s: SurfaceSession, ctx: Ctx, text: string, asProse: (ledger: Ledger | null) => void): Promise<undefined> => {
-		// Several lines are a paste, one command per line (a numbered batch one per line included, so its refusals name their lines).
-		const paste = text.includes("\n");
-		// Prose passes through untouched, without a ledger read (unless it is Jo's receipt, see the header): only a batch-shaped prompt, a short command, or a paste with such a line can be a command.
-		if (paste ? !text.split("\n").some((l) => commandShaped(l.trim())) : !commandShaped(text)) {
-			asProse(null);
-			return undefined;
-		}
-		let ledger: Ledger;
+	/**
+	 * A turn's prompt as Jo's input, from Jo's typed take only (see the header; the take is the proof Jo typed it): a command
+	 * applies; prose is read against the take, entries older than it judged first, then one row per typed message taken. A
+	 * joined take that does not read as prose writes no row and warns.
+	 */
+	const turn = async (s: SurfaceSession, ctx: Ctx, text: string, take: Taken): Promise<undefined> => {
+		let prose = false;
+		const asProse = (ledger: Ledger | null): void => {
+			prose = true;
+			discardOlder(s, ctx, take.seq);
+			if (take.kind === "joined") {
+				for (const t of take.texts) joInputRow(s, ctx, t.trim(), ledger);
+				return;
+			}
+			joInputRow(s, ctx, text, ledger);
+		};
 		try {
-			ledger = s.ledger();
-			s.numbering.assign(errorLines(ledger)); // D6: every answerable row has its number before a number or a "which one?" names it
-		} catch (err) {
-			echo(s, ctx, text, [`could not apply "${text}": ${reason(err)}`], "warning");
-			return undefined;
-		}
-
-		if (paste) {
-			const heartbeatOf = runHeartbeat(env);
-			const r = interpretPaste(ledger, s.numbering, text, heartbeatOf);
-			if (!r) {
-				asProse(ledger);
+			// Several lines are a paste, one command per line (a numbered batch one per line included, so its refusals name their lines).
+			const paste = text.includes("\n");
+			// Prose passes through untouched, without a ledger read (unless it is Jo's receipt, see the header): only a batch-shaped prompt, a short command, or a paste with such a line can be a command.
+			if (paste ? !text.split("\n").some((l) => commandShaped(l.trim())) : !commandShaped(text)) {
+				asProse(null);
 				return undefined;
 			}
-			/** The refusal echo: one verdict per command line, the held instructions, then the one line to fix. */
-			const refuse = (verdicts: { at: number; line: string }[], held: PasteInstruction[], fix: number): void => {
-				const instructions = held.map((h) => ({ at: h.from, line: `${span(h)}: an instruction for you, held with the rest; record nothing from this paste` }));
-				const lines = [...verdicts, ...instructions].sort((a, b) => a.at - b.at).map((x) => x.line);
-				echo(s, ctx, text, [...lines, `nothing applied: fix line ${fix} and paste all of it again`], "warning");
-			};
-			if (!r.ok) {
-				const verdicts = r.refused.map((f) => ({
-					at: f.line,
-					line: `line ${f.line} "${f.text}": ${f.why === null ? "ok, not applied" : Array.isArray(f.why) ? f.why.join("; ") : whichOne(ledger, s, f.why)}`,
-				}));
-				refuse(verdicts, r.held, r.refused.find((f) => f.why !== null)!.line);
-				return undefined;
-			}
-			let echoes: Echo[];
+			let ledger: Ledger;
 			try {
-				// All-or-nothing, one transaction, in paste order; each command through apply(), so each is its own ledger row.
-				echoes = ledger.write(() =>
-					r.items.flatMap((item) => {
-						if (item.kind === "instruction") return [{ wl: null, line: `${span(item)} → an instruction for you, one row: "${item.text.replace(/\s*\n\s*/g, " ")}"` }];
-						try {
-							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, heartbeatOf)}`, pair: pairOf(cmd) }));
-							return [applyOne(ledger, item.cmd, heartbeatOf, ctx.cwd)];
-						} catch (err) {
-							throw new LineFailure(item.line, item.text, err);
-						}
-					}),
-				);
+				ledger = s.ledger();
+				s.numbering.assign(errorLines(ledger)); // D6: every answerable row has its number before a number or a "which one?" names it
 			} catch (err) {
-				// The transaction rolled back: the ledger's refusal, on its line; every other command line stands unapplied.
-				const held = r.items.filter((i): i is PasteInstruction => i.kind === "instruction");
-				const failed = err instanceof LineFailure ? err : null;
-				const verdicts = r.items.flatMap((i) => {
-					if (i.kind === "instruction") return [];
-					const why = failed?.line === i.line ? String(failed.cause) : "ok, not applied";
-					return [{ at: i.line, line: `line ${i.line} "${i.text}": ${why}` }];
-				});
-				if (failed) refuse(verdicts, held, failed.line);
-				else echo(s, ctx, text, [`could not apply "${text}": ${reason(err)}`], "warning");
+				echo(s, ctx, text, [`could not apply "${text}": ${reason(err)}`], "warning");
 				return undefined;
 			}
-			await launchAfter(ledger, echoes);
-			await closeAfter(ledger, ctx, s, echoes);
-			echo(s, ctx, text, (await copyPair(ctx, echoes)).map((e) => e.line), "info");
-			return undefined;
-		}
 
-		const batch = interpretBatch(ledger, s.numbering, text);
-		if (batch && !batch.ok) {
-			echo(s, ctx, text, batch.lines, "warning");
-			return undefined;
-		}
-		if (batch) {
-			let lines: string[];
-			try {
-				// D4: all-or-nothing, one transaction; each answer through apply(), so each is its own ledger row.
+			if (paste) {
 				const heartbeatOf = runHeartbeat(env);
-				const echoes: Echo[] = ledger.write(() => batch.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, heartbeatOf)}`, pair: pairOf(cmd) })));
+				const r = interpretPaste(ledger, s.numbering, text, heartbeatOf);
+				if (!r) {
+					asProse(ledger);
+					return undefined;
+				}
+				/** The refusal echo: one verdict per command line, the held instructions, then the one line to fix. */
+				const refuse = (verdicts: { at: number; line: string }[], held: PasteInstruction[], fix: number): void => {
+					const instructions = held.map((h) => ({ at: h.from, line: `${span(h)}: an instruction for you, held with the rest; record nothing from this paste` }));
+					const lines = [...verdicts, ...instructions].sort((a, b) => a.at - b.at).map((x) => x.line);
+					echo(s, ctx, text, [...lines, `nothing applied: fix line ${fix} and paste all of it again`], "warning");
+				};
+				if (!r.ok) {
+					const verdicts = r.refused.map((f) => ({
+						at: f.line,
+						line: `line ${f.line} "${f.text}": ${f.why === null ? "ok, not applied" : Array.isArray(f.why) ? f.why.join("; ") : whichOne(ledger, s, f.why)}`,
+					}));
+					refuse(verdicts, r.held, r.refused.find((f) => f.why !== null)!.line);
+					return undefined;
+				}
+				let echoes: Echo[];
+				try {
+					// All-or-nothing, one transaction, in paste order; each command through apply(), so each is its own ledger row.
+					echoes = ledger.write(() =>
+						r.items.flatMap((item) => {
+							if (item.kind === "instruction") return [{ wl: null, line: `${span(item)} → an instruction for you, one row: "${item.text.replace(/\s*\n\s*/g, " ")}"` }];
+							try {
+								if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, heartbeatOf)}`, pair: pairOf(cmd) }));
+								return [applyOne(ledger, item.cmd, heartbeatOf, ctx.cwd)];
+							} catch (err) {
+								throw new LineFailure(item.line, item.text, err);
+							}
+						}),
+					);
+				} catch (err) {
+					// The transaction rolled back: the ledger's refusal, on its line; every other command line stands unapplied.
+					const held = r.items.filter((i): i is PasteInstruction => i.kind === "instruction");
+					const failed = err instanceof LineFailure ? err : null;
+					const verdicts = r.items.flatMap((i) => {
+						if (i.kind === "instruction") return [];
+						const why = failed?.line === i.line ? String(failed.cause) : "ok, not applied";
+						return [{ at: i.line, line: `line ${i.line} "${i.text}": ${why}` }];
+					});
+					if (failed) refuse(verdicts, held, failed.line);
+					else echo(s, ctx, text, [`could not apply "${text}": ${reason(err)}`], "warning");
+					return undefined;
+				}
 				await launchAfter(ledger, echoes);
-				lines = (await copyPair(ctx, echoes)).map((e) => e.line);
-			} catch (err) {
-				lines = [`could not apply "${text}": ${reason(err)}`];
+				await closeAfter(ledger, ctx, s, echoes);
+				echo(s, ctx, text, (await copyPair(ctx, echoes)).map((e) => e.line), "info");
+				return undefined;
 			}
-			echo(s, ctx, text, lines, "info");
-			return undefined;
-		}
 
-		let receipt: string;
-		try {
-			const heartbeatOf = runHeartbeat(env);
-			const cmd = interpret(ledger, text, heartbeatOf);
-			if (!cmd) {
-				asProse(ledger);
+			const batch = interpretBatch(ledger, s.numbering, text);
+			if (batch && !batch.ok) {
+				echo(s, ctx, text, batch.lines, "warning");
 				return undefined;
 			}
-			if (cmd.kind === "ambiguous") {
-				echo(s, ctx, text, [whichOne(ledger, s, cmd)], "warning");
+			if (batch) {
+				let lines: string[];
+				try {
+					// D4: all-or-nothing, one transaction; each answer through apply(), so each is its own ledger row.
+					const heartbeatOf = runHeartbeat(env);
+					const echoes: Echo[] = ledger.write(() => batch.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, heartbeatOf)}`, pair: pairOf(cmd) })));
+					await launchAfter(ledger, echoes);
+					lines = (await copyPair(ctx, echoes)).map((e) => e.line);
+				} catch (err) {
+					lines = [`could not apply "${text}": ${reason(err)}`];
+				}
+				echo(s, ctx, text, lines, "info");
 				return undefined;
 			}
-			if (cmd.kind === "refused") {
-				echo(s, ctx, text, [cmd.why], "warning");
-				return undefined;
+
+			let receipt: string;
+			try {
+				const heartbeatOf = runHeartbeat(env);
+				const cmd = interpret(ledger, text, heartbeatOf);
+				if (!cmd) {
+					asProse(ledger);
+					return undefined;
+				}
+				if (cmd.kind === "ambiguous") {
+					echo(s, ctx, text, [whichOne(ledger, s, cmd)], "warning");
+					return undefined;
+				}
+				if (cmd.kind === "refused") {
+					echo(s, ctx, text, [cmd.why], "warning");
+					return undefined;
+				}
+				const echoes = [ledger.write(() => applyOne(ledger, cmd, heartbeatOf, ctx.cwd))];
+				await launchAfter(ledger, echoes);
+				await closeAfter(ledger, ctx, s, echoes);
+				receipt = (await copyPair(ctx, echoes))[0]!.line;
+			} catch (err) {
+				receipt = `could not apply "${text}": ${reason(err)}`;
 			}
-			const echoes = [ledger.write(() => applyOne(ledger, cmd, heartbeatOf, ctx.cwd))];
-			await launchAfter(ledger, echoes);
-			await closeAfter(ledger, ctx, s, echoes);
-			receipt = (await copyPair(ctx, echoes))[0]!.line;
-		} catch (err) {
-			receipt = `could not apply "${text}": ${reason(err)}`;
+			echo(s, ctx, text, [receipt], "info");
+			return undefined;
+		} finally {
+			if (take.kind === "joined" && !prose) {
+				echo(s, ctx, text, [`${take.texts.length} messages Jo typed arrived joined as one prompt (OMP steeringMode all); none got an input row: re-send the plain-words ones one at a time, or set steeringMode to one-at-a-time`], "warning");
+			}
 		}
-		echo(s, ctx, text, [receipt], "info");
-		return undefined;
 	};
 
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -595,32 +622,18 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		const take = takeTyped(s, text);
 		// `back` as the whole input is a surface word (D4), read by the wake row: never an answer, a command, or Jo's receipt.
 		if (surfaceWord(text) === "back") return undefined;
-		if (take?.kind === "ambiguous") echo(s, ctx, text, ["this prompt matches more than one way Jo's typed messages could have been delivered; no input row: re-send it"], "warning");
-		// Jo typed exactly this prompt, once.
-		const joTyped = take?.kind === "one";
-		let prose = false;
-		/** The prose path: entries older than the take are judged first, then one row per typed message taken, or the late-arrival warning for words already warned about. */
-		const asProse = (ledger: Ledger | null): void => {
-			prose = true;
-			if (take?.kind === "one" || take?.kind === "joined") discardOlder(s, ctx, take.seq);
-			if (take?.kind === "joined") {
-				for (const t of take.texts) joInputRow(s, ctx, t.trim(), true, ledger);
-				return;
-			}
-			const late = joTyped ? -1 : s.discarded.indexOf(text);
+		// No typed take (a session-stop continuation re-sending a held reply, an extension's prompt, `omp -p`) or more than one
+		// (see the header): nothing applies and no row is written, whatever the prompt quotes (jo-issues #306). Only the two
+		// warnings: the ambiguous take's, and the late arrival of words already warned about.
+		if (take === null || take.kind === "ambiguous") {
+			if (take?.kind === "ambiguous") echo(s, ctx, text, ["this prompt matches more than one way Jo's typed messages could have been delivered; no input row: re-send it"], "warning");
+			const late = s.discarded.indexOf(text);
 			if (late >= 0) {
 				s.discarded.splice(late, 1);
 				echo(s, ctx, text, ["these words match Jo's message warned about above; they have no input row: Jo re-sends it"], "warning");
-				return;
 			}
-			joInputRow(s, ctx, text, joTyped, ledger);
-		};
-		try {
-			return await turn(s, ctx, text, asProse);
-		} finally {
-			if (take?.kind === "joined" && !prose) {
-				echo(s, ctx, text, [`${take.texts.length} messages Jo typed arrived joined as one prompt (OMP steeringMode all); none got an input row: re-send the plain-words ones one at a time, or set steeringMode to one-at-a-time`], "warning");
-			}
+			return undefined;
 		}
+		return turn(s, ctx, text, take);
 	});
 }

@@ -1,0 +1,42 @@
+P-11 row 1 refused this turn to Jo: its QUESTION block asks nothing (no question mark); the closing ask is not last (a **ACTION** block follows the QUESTION). Shape: needs-you first, body, one closing ask last (SPEC-2.0.md § B16). Rewrite the message and send it again.
+
+Your held reply was:
+
+
+## Needs you
+
+**CLAIM**
+The fast-checks build has three new reserved actions waiting. All three are local compile or test checks that don't write anywhere:
+1. **{{EN1}}:** in its own worktree, it runs `bun -e "await import('./$m')"` on each changed module and prints the last line of each. One of those modules is train-tick.ts, and importing it doesn't start a tick. Its entry point is guarded by `if (import.meta.main)` at [/Users/jowolff/code/agent-system-2.0-lanes/{{WL_FAST}}/surface/scripts/train-tick.ts:1301](file:///Users/jowolff/code/agent-system-2.0-lanes/{{WL_FAST}}/surface/scripts/train-tick.ts:1301).
+2. **{{EN2}}:** runs `bun test ./i0…i9.test.ts` inside its own scratch `…/imports` folder and greps for pass/fail lines.
+3. **{{EN3}}:** runs `bun build --no-bundle` on each changed file, writing to [/dev/null](file:///dev/null), with errors going to `$AS2_SCRATCH/b.err`.
+
+**QUESTION**
+({{Q}}) The signature dataviz plan you want to build from stops at the Kitchen editor picker. [/Users/jowolff/code/shipyard/.projects/signature-data-visualization/PIPELINE-PLAN.md](file:///Users/jowolff/code/shipyard/.projects/signature-data-visualization/PIPELINE-PLAN.md) has no workstream for showing the chosen chart to readers in newdle web or newdle mobile. Your options:
+- `pair`: you pair on the plan revision now, as a by-hand user-driven lane on the same workload ({{WL}}). No new workload gets opened, and this is the room your curb reserved.
+- `queue`: nothing runs until you lift the curb.
+
+I recommend `pair`. The newdle-db storage contract (W1) comes first in the build order, and the web and mobile rendering needs have to be in it before it freezes.
+
+## Body
+
+**ACTION**
+Your curb amendment is recorded as in-mvqxrya5ll9reo, on the fast-checks build alongside the curb itself. Your gap note about web and mobile rendering is recorded as in-mvqxrb8xjzspog, on the dataviz workload. From now on, whenever a lane slot frees up, I'll raise one question listing the top three queued workloads, each with its lab and ceiling, plus an option to hold the slot empty. I won't fill it myself, and if you don't answer, the slot stays empty.
+
+**GUESS(inference)**
+The tick launches lanes on its own when a workload gets a new instruction, a "cause" in its terms. So recording your note on the dataviz workload might make the tick start an autonomous lane there by itself. Its mode shows as "autonomous (flip pending…)". That would be machinery filling a slot, not me. If it happens, I'll tell you at once, so it doesn't silently cut into your Anthropic usage.
+
+## Closing ask
+
+**PMDW**
+I recommend pasting this block. It approves the fast-checks build's three local compile and test checks, plus the two older safe actions (the merge train's PR-state read and the flaky-tests load probe). It also starts your by-hand pairing session to add web and mobile rendering to the signature dataviz plan:
+```text
+approve {{EN1}}
+approve {{EN2}}
+approve {{EN3}}
+approve {{EN4}}
+approve {{EN5}}
+pair {{Q}}
+```
+
+2 others waiting: `pending` shows them all
