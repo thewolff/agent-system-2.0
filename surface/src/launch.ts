@@ -25,6 +25,7 @@ import { type TrainBudgetReason, type TrainBudgetRows, trainBudgetGate } from ".
 import {
 	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, ESCALATION_BY, HOLD_HOURS, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
 } from "./types";
+import type { AlertKind } from "./alert-path";
 
 // ---- knobs -------------------------------------------------------------------------------------
 
@@ -101,6 +102,7 @@ export const CONTROL_PREFIXES = [
 	"land-first", "main-retry", "train-reconciled", "runner-preflight", "fast-plan", "fast-fallback", "status-failed",
 	"land-first-off-pending", "land-first-off-complete",
 	"train-paused", "train-meter-error", "train-rule", "train-raise", "train-attempt",
+	"alert", "alert-popup", "lane-released",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -108,6 +110,7 @@ export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 const LANE_SCOPED: Record<string, true> = {
 	launch: true, "launch-failed": true, "lane-started": true, "lane-ready": true, "lane-exit": true, "lane-parked": true, "lane-stop": true,
 	"lane-decided": true, spend: true, "ctx-index": true, "released-open": true, "released-idle": true, "lane-headroom": true, "lane-metrics": true,
+	"lane-released": true,
 };
 /** The daily scratch sweep's `created_by` (surface/scripts/scratch-sweep.ts). */
 export const SCRATCH_SWEEP_BY = "scratch-sweep";
@@ -117,6 +120,8 @@ export const DAILY_REPORT_BY = "daily-report";
 export const DRIVE_BACKUP_BY = "drive-backup";
 /** `as2 doctor`'s `created_by` (surface/src/doctor.ts: the tick's ctx step, the after-restart job, terminal runs and the popup process), on the standing workload. */
 export const DOCTOR_BY = "as2-doctor";
+/** The alert path's `created_by` (PLAN wl-mw0vs9uc3xqtka D1, surface/src/alert-path.ts): the alert pass and its popup worker, on the standing workload. */
+export const ALERT_BY = "alert-path";
 /**
  * Fixed writers per prefix (§ 5). `lane-stop`, `plan` and `done-because` are refined in `validWriter`. The
  * starter writes `lane-started:` / `lane-exit:` for the interactive lane it runs in Jo's terminal
@@ -183,8 +188,9 @@ export const DOCTOR_BY = "as2-doctor";
  * train (a holder, `validWriter`); `train-task-settled: <tt-…> fixed|failed <evidence>` is the train tick's alone (MERGE_TRAIN_BY), as is
  * a fix workload's `train-fix: repo <owner/repo> pr <n> train <wl> train-entry <en-…>`, which `boundPrs` admits only when that entry is a
  * valid `train:` on that train listing n. The tick also writes a fix workload's `repo:` and `done:` and `launch-requested:` as MERGE_TRAIN_BY.
- * `train-alert: <q> level <n> sending|notified|sent [<url>]` and `train-alert: <q> acked|closed <why>` are the train tick's alone
- * (MERGE_TRAIN_BY, PLAN rev 17.1 D9): its send ladder for an alert question; surface/src/errors.ts reads them for the LOUD line.
+ * `train-alert: <q> level <n> sending|notified|sent [<url>]` and `train-alert: <q> acked|closed <why>` were the train tick's alone
+ * (MERGE_TRAIN_BY, PLAN rev 17.1 D9): its retired send ladder. No code writes them now; surface/src/alert-path.ts `legacyTrainAlerts`
+ * reads them once, for the alert path's adoption of an in-flight train alert (PLAN wl-mw0vs9uc3xqtka D3).
  * The auto-boarding rows (PLAN wl-mvbjiettjrfpxc D1-D3, D6, surface/src/merge-train.ts) are the train tick's alone too (MERGE_TRAIN_BY):
  * `train-board: pr <n> workload <W> head <sha> run <tr-…|none> review <en-…|none>` on a train makes PR n a member as Jo's
  * `train:` does (`trainBindings`; `boundPrs` admits it); `train-board-skip:`, `train-notice:` and `train-autoboard: on <iso>`
@@ -237,6 +243,11 @@ export const DOCTOR_BY = "as2-doctor";
  * `doctor-strike:` (a first failing tick of the ctx part), `doctor-down:` / `doctor-up:` (a part's episode opens and clears; an open
  * down is a `report` needs-you line), `doctor-popup:` (a popup process's claim and its outcome, the attempt budget) and
  * `doctor-boot:` (the after-restart run's once-per-boot mark). A copy by any other writer is dropped here, so nothing forges or clears an alert.
+ * The alert path's rows (PLAN wl-mw0vs9uc3xqtka D1, D3; surface/src/alert-path.ts) are ALERT_BY's alone, on the standing workload:
+ * `alert: <key> <row>` (`alertBody`; an episode's raise, level sends, updates, errors, legacy adoption, ack and close, which
+ * `alertRecords` reads) and `alert-popup: <key> <episode> <level> <step> [<detail>]` (`alertPopupBody`; the popup worker's claim and
+ * outcome and the pass's settlement of it). `lane-released: <laneId>` is written by `lane_release` in the release's transaction,
+ * as the lane it names, like `released-open:` (`validWriter`), so the alert pass can see a released lane whose process lives on.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -328,6 +339,9 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"train-rule": [LANE_RUNNER_BY],
 	"train-raise": [SURFACE_BY],
 	"train-attempt": [SURFACE_BY, MERGE_TRAIN_BY],
+	alert: [ALERT_BY],
+	"alert-popup": [ALERT_BY],
+	"lane-released": [],
 };
 
 export interface ControlEntry {
@@ -357,7 +371,7 @@ function validWriter(prefix: ControlPrefix, rest: string, createdBy: string, hol
 	if (prefix === "done-because" || prefix === "reserved-withdrawn" || prefix === "plan-question" || prefix === "push-dest" || prefix === "train-task" || prefix === "scratch-over-cap" || prefix === "scratch-under-cap") {
 		return holders.includes(createdBy);
 	}
-	if (prefix === "released-open" || prefix === "released-idle") return laneId === createdBy && holders.includes(createdBy);
+	if (prefix === "released-open" || prefix === "released-idle" || prefix === "lane-released") return laneId === createdBy && holders.includes(createdBy);
 	if (prefix === "plan") return /^approved auto\b/.test(rest) ? createdBy === ESCALATION_BY : createdBy === SURFACE_BY;
 	if (prefix === "lane-stop") {
 		if (/^accepted\b/.test(rest)) return createdBy === LANE_RUNNER_BY || createdBy === LANE_STARTER_BY;
@@ -1673,6 +1687,60 @@ export function laneStopAcceptedBody(laneId: string, ref: string): string {
 /** `lane-decided: <laneId> <outcome>`: the runner's intended decision, recorded before EOF (`exitClass`). */
 export function laneDecidedBody(laneId: string, outcome: LaneOutcome): string {
 	return `lane-decided: ${laneId} ${outcome}`;
+}
+/** `lane-released: <laneId>`: `lane_release`'s record, as the releasing lane, that it released (PLAN wl-mw0vs9uc3xqtka D2.3). */
+export function laneReleasedBody(laneId: string): string {
+	return `lane-released: ${laneId}`;
+}
+
+/**
+ * One `alert: <key> <row>` record of the alert path (PLAN wl-mw0vs9uc3xqtka D1, D3), ALERT_BY's alone on the standing workload.
+ * `raised` opens an episode (its id is that entry's id) with the digest of the text level 1 files; `level` records a send's
+ * two steps; `updated` a changed text's one comment; `error` a failed channel (gh or popup); `adopted` a legacy alert taken over
+ * as the key's episode (url `none` when no issue was found: level 0, filed fresh); `merged` / `merged-closed` a second legacy
+ * issue folded into the canonical one; `legacy-popup` a legacy quota-move popup's settlement; `acked` and `closed` the ends.
+ */
+export type AlertRow =
+	| { row: "raised"; kind: AlertKind; start: 1 | 2; digest: string }
+	| { row: "level"; level: number; step: "sending" | "sent"; url: string | null }
+	| { row: "updated"; digest: string }
+	| { row: "error"; channel: string; text: string }
+	| { row: "adopted"; url: string | null; level: number; from: string }
+	| { row: "merged"; url: string; into: string }
+	| { row: "merged-closed"; url: string }
+	| { row: "legacy-popup"; text: string }
+	| { row: "acked"; why: string }
+	| { row: "closed"; why: string };
+
+/** The `alert:` body of `row` for subject `key`. Throws when the key or a token field is empty or holds whitespace (it would not parse back). */
+export function alertBody(key: string, row: AlertRow): string {
+	const token = (what: string, v: string): string => {
+		if (v === "" || /\s/.test(v)) throw new Error(`alertBody: ${what} ${JSON.stringify(v)} of alert ${JSON.stringify(key)} must be one non-empty token`);
+		return v;
+	};
+	const head = `alert: ${token("key", key)}`;
+	switch (row.row) {
+		case "raised": return `${head} raised ${row.kind} start ${row.start} ${token("digest", row.digest)}`;
+		case "level": return `${head} level ${row.level} ${row.step}${row.url === null ? "" : ` ${token("url", row.url)}`}`;
+		case "updated": return `${head} updated ${token("digest", row.digest)}`;
+		case "error": return `${head} error ${token("channel", row.channel)} ${oneLine(row.text)}`;
+		case "adopted": return `${head} adopted ${row.url === null ? "none" : token("url", row.url)} level ${row.level} from ${oneLine(row.from)}`;
+		case "merged": return `${head} merged ${token("url", row.url)} into ${token("url", row.into)}`;
+		case "merged-closed": return `${head} merged-closed ${token("url", row.url)}`;
+		case "legacy-popup": return `${head} legacy-popup ${oneLine(row.text)}`;
+		case "acked":
+		case "closed": return `${head} ${row.row} ${oneLine(row.why)}`;
+	}
+}
+
+/** The steps of an alert popup (PLAN wl-mw0vs9uc3xqtka D3 popup worker): the worker's claim and outcome, the pass's spawn and settlement. */
+export const ALERT_POPUP_STEPS = ["spawning", "claim", "showing", "ok", "failed", "terminating", "unstarted"] as const;
+export type AlertPopupStep = (typeof ALERT_POPUP_STEPS)[number];
+/** `alert-popup: <key> <episode> <level> <step> [<detail>]`, ALERT_BY's alone on the standing workload; the detail is one line. */
+export function alertPopupBody(key: string, episode: string, level: number, step: AlertPopupStep, detail?: string): string {
+	if (/\s/.test(key) || /\s/.test(episode) || key === "" || episode === "") throw new Error(`alertPopupBody: key ${JSON.stringify(key)} and episode ${JSON.stringify(episode)} must each be one non-empty token`);
+	const rest = detail === undefined ? "" : oneLine(detail);
+	return `alert-popup: ${key} ${episode} ${level} ${step}${rest === "" ? "" : ` ${rest}`}`;
 }
 export function worktreeBody(path: string): string {
 	return `worktree: ${path}`;
