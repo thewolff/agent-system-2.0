@@ -9,6 +9,8 @@
 // (`settleIdle`: unsettled and silent, asked rather than waited on forever) and the lane's test runs
 // (`liveTestRuns` holds like a hand; `deadTestRuns` asks once for a new run), as pure helpers the
 // runner feeds from omp's frames, the ledger and the runs' heartbeat files.
+import { readFileSync, statSync } from "node:fs";
+import { resolve } from "node:path";
 import { parseHandSpawn, settledTokens } from "../../classifier/src/lab";
 import { type EntryRow, LANE_RUNNER_BY, type Ledger, type RoutingRow, type SliceRow } from "../../ledger/src/index";
 import { type ControlEntry } from "./launch";
@@ -249,6 +251,122 @@ export function promptEndedDeathBody(laneId: string, status: "error" | "aborted"
 /** `lane-died: <laneId>: turn-end decision failed: <e>`: the runner could not read what the decision needs. */
 export function turnEndFailedDeathBody(laneId: string, error: string): string {
 	return `${LANE_DIED_PREFIX} ${laneId}: turn-end decision failed: ${error.replace(/\s+/g, " ").trim()}`;
+}
+
+/**
+ * The as2 extension entry points, as the `{repo}/…` lines of profile/config.yml's `extensions:` block list them (in that
+ * order; turn-end.test.ts checks the two agree).
+ */
+export const AS2_EXTENSION_ENTRIES = ["surface/index.ts", "gates/index.ts", "classifier/extension.ts", "plugins/index.ts"] as const;
+const EXTENSIONS_ENABLED_PREFIX = "Restart omp to load newly enabled extensions: ";
+/** A path that names an as2 entry point: it ends in `/<entry>` for one of AS2_EXTENSION_ENTRIES. */
+const isAs2Entry = (p: string): boolean => AS2_EXTENSION_ENTRIES.some((e) => p.endsWith(`/${e}`));
+/**
+ * The trigger: the as2 entry paths an OMP extensions notice newly enables, or null when the frame is no such notice. OMP's
+ * live config listener (@oh-my-pi/pi-coding-agent src/sdk.ts `reconcileExtensionSources`) suspends a loaded extension whose
+ * path left the `extensions:` block without any frame of its own; it only emits `{type: "notice", level: "warning", message:
+ * "Restart omp to load newly enabled extensions: <p1>, <p2>, …", source: "extensions"}` for enabled paths this process never
+ * loaded, whether or not anything was suspended. So the notice alone proves nothing: an as2 copy added beside the loaded
+ * ones (or an unrelated path ending in an as2 entry) raises it with every loaded extension still enabled. The runner takes a
+ * non-null result as the cue to read the profile config again and confirm (`suspensionOf`: a loaded as2 path no longer
+ * enabled) before it ends the lane (decision en-mw01fr5uts72g0). A notice that enables only other extensions, and every
+ * other notice source (`compaction`, `session-persistence`), is null.
+ */
+export function extensionsSuspendedOf(frame: Record<string, unknown>): string[] | null {
+	if (frame.type !== "notice" || frame.source !== "extensions" || typeof frame.message !== "string") return null;
+	if (!frame.message.startsWith(EXTENSIONS_ENABLED_PREFIX)) return null;
+	const paths = frame.message.slice(EXTENSIONS_ENABLED_PREFIX.length).split(", ").map((p) => p.trim());
+	const as2 = paths.filter(isAs2Entry);
+	return as2.length > 0 ? as2 : null;
+}
+/**
+ * The as2 entry paths a parsed profile config enables: its `extensions:` strings that end in `/<as2 entry>`, each
+ * `path.resolve`d, as OMP compares resolved paths (sdk.ts `reconcileExtensionSources`). A config that is not a mapping, or
+ * whose `extensions:` is missing or not a list, enables none ([]).
+ */
+export function as2ExtensionPaths(config: unknown): string[] {
+	if (config === null || typeof config !== "object" || Array.isArray(config)) return [];
+	const list = (config as Record<string, unknown>).extensions;
+	if (!Array.isArray(list)) return [];
+	return list.filter((e): e is string => typeof e === "string" && isAs2Entry(e)).map((e) => resolve(e));
+}
+const errLine = (err: unknown): string => String(err instanceof Error ? err.message : err).replace(/\s+/g, " ").trim();
+/** `as2ExtensionPaths` of the profile config at `configPath`; a read or parse failure is its one-line error, never a throw. */
+export function readAs2ExtensionPaths(configPath: string): { paths: string[] } | { error: string } {
+	let text: string;
+	try {
+		text = readFileSync(configPath, "utf8");
+	} catch (err) {
+		return { error: `${configPath} could not be read: ${errLine(err)}` };
+	}
+	try {
+		return { paths: as2ExtensionPaths(Bun.YAML.parse(text)) };
+	} catch (err) {
+		return { error: `${configPath} does not parse: ${errLine(err)}` };
+	}
+}
+/** The loaded as2 paths `enabledNow` no longer lists: the ones OMP's config listener has suspended. */
+export function suspendedAs2(loaded: readonly string[], enabledNow: readonly string[]): string[] {
+	const now = new Set(enabledNow);
+	return loaded.filter((p) => !now.has(p));
+}
+/** What the profile config shows after the trigger: as2 paths suspended, nothing suspended, or no way to tell and why. */
+export type Suspension = { kind: "confirmed"; suspended: string[] } | { kind: "still-enabled" } | { kind: "unconfirmed"; reason: string };
+/**
+ * The confirmation, from the config read at spawn (`loaded`) and the one read at the notice (`now`). The lane goes on only
+ * when the evidence shows nothing it loaded was suspended: both reads succeeded, the spawn read listed as2 entries, and
+ * every one of them is still enabled. A spawn read that listed no as2 entry ends the lane unconfirmed rather than going on:
+ * the runner's spawn read is its only record of what the lane loaded, and an empty one does not show where the lane's as2
+ * extensions came from (a config caught mid-render, a profile that loads them some way this read does not see), so it
+ * cannot show the gates are still loaded; a safe stop and a relaunch beat a lane running without them.
+ */
+export function suspensionOf(loaded: { paths: string[] } | { error: string }, now: { paths: string[] } | { error: string }): Suspension {
+	if ("error" in loaded) return { kind: "unconfirmed", reason: `the profile config was unreadable at spawn: ${loaded.error}` };
+	if (loaded.paths.length === 0) return { kind: "unconfirmed", reason: "the profile config listed no as2 extension at spawn, so what the lane loaded is unknown" };
+	if ("error" in now) return { kind: "unconfirmed", reason: `the profile config re-read failed: ${now.error}` };
+	const suspended = suspendedAs2(loaded.paths, now.paths);
+	return suspended.length > 0 ? { kind: "confirmed", suspended } : { kind: "still-enabled" };
+}
+/**
+ * What a stop-poll re-read of the profile config shows with no notice (review round 2 of PR #428): OMP's config listener
+ * suspends a loaded path no longer enabled on every config change, but names a newly enabled path only once per process
+ * and a removal never, so A → A+B (a notice; the lane goes on) → B, or a removal alone, suspends with no frame at all.
+ * `loaded` is the spawn read's non-empty as2 set. Confirmed carries the suspended paths and the as2 paths the config now
+ * enables that the lane did not load (what OMP would name in a notice, in config order; none for a removal alone); an
+ * unreadable config is no evidence of a suspension, and the runner goes on.
+ */
+export type PolledSuspension = { kind: "confirmed"; suspended: string[]; enabled: string[] } | { kind: "still-enabled" } | { kind: "unreadable"; error: string };
+export function polledSuspensionOf(loaded: readonly string[], now: { paths: string[] } | { error: string }): PolledSuspension {
+	if ("error" in now) return { kind: "unreadable", error: now.error };
+	const suspended = suspendedAs2(loaded, now.paths);
+	if (suspended.length === 0) return { kind: "still-enabled" };
+	const had = new Set(loaded);
+	return { kind: "confirmed", suspended, enabled: [...new Set(now.paths)].filter((p) => !had.has(p)) };
+}
+/**
+ * The profile config's identity for the stop poll's change check (device, inode, size, mtime and ctime in ns): the poll
+ * re-reads the file only when it differs from the last one seen. A stat failure is its one-line error, never a throw.
+ */
+export function configStamp(configPath: string): { stamp: string } | { error: string } {
+	try {
+		const s = statSync(configPath, { bigint: true });
+		return { stamp: `${s.dev}:${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}` };
+	} catch (err) {
+		return { error: `${configPath} could not be stat'ed: ${errLine(err)}` };
+	}
+}
+/**
+ * `lane-died: <laneId>: extensions suspended by a profile config change (<loaded paths> no longer enabled; OMP now enables
+ * <paths>); …` (decision en-mw01fr5uts72g0). `enabled` is what the notice names, or, from the stop poll, the as2 paths the
+ * config enables that the lane did not load; with none (a removal alone) the `; OMP now enables …` clause is left out.
+ */
+export function extensionsSuspendedDeathBody(laneId: string, suspended: readonly string[], enabled: readonly string[] = []): string {
+	const now = enabled.length > 0 ? `; OMP now enables ${enabled.join(", ")}` : "";
+	return `${LANE_DIED_PREFIX} ${laneId}: extensions suspended by a profile config change (${suspended.join(", ")} no longer enabled${now}); a relaunch loads the current paths`;
+}
+/** `lane-died: <laneId>: extensions likely suspended by a profile config change (OMP now enables <paths>; not confirmed: <reason>); …`: the config could not confirm it, and the lane stops anyway. */
+export function extensionsUnconfirmedDeathBody(laneId: string, enabled: readonly string[], reason: string): string {
+	return `${LANE_DIED_PREFIX} ${laneId}: extensions likely suspended by a profile config change (OMP now enables ${enabled.join(", ")}; not confirmed: ${reason.replace(/\s+/g, " ").trim()}); a relaunch loads the current paths`;
 }
 
 /** The runner's death line for a decided turn-end outcome, or null for an intended one. */

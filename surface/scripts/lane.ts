@@ -9,8 +9,9 @@
 //   run <wl> <laneId>                    the runner: one `omp --mode rpc --no-ui` child, the first prompt and
 //                                        up to CONTINUE_LIMIT continue prompts on it, lane-started:/lane-ready:/
 //                                        lane-metrics:/lane-exit:, the turn-end decision once omp is settled (src/turn-end.ts),
-//                                        stop requests, its own deadline and the ceiling meter (spend:, the 80 %
-//                                        notice, the 100 % stop and its notice) polled every STOP_POLL_MS. It first takes the
+//                                        stop requests, its own deadline, the ceiling meter (spend:, the 80 %
+//                                        notice, the 100 % stop and its notice) and the profile config's as2 extensions
+//                                        (a suspension with no notice) polled every STOP_POLL_MS. It first takes the
 //                                        lane id's run lock (takeRunnerLock, one owner per lane id) and then checks
 //                                        the recorded omp and runner pids (liveRunnerOf); a lane id held or running,
 //                                        or one whose owner ps could not verify, exits 7 (held) before any ledger
@@ -85,8 +86,10 @@ import {
 	worktreePath,
 } from "../src/launch";
 import {
-	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continueCounter, continuePrompt, deadRunPrompt, type DeadTestRun, deadTestRuns, enqueueRunnerDeath, exitOutcome, heldOpenBody, IDLE_CHECK, IDLE_LIMIT, idleActivity,
-	idlePrompt, liveTestRuns, type PromptError, promptErrorOf, releasedIdle, releasedOpen, SETTLE_CHECK, SETTLE_IDLE_MS, settleIdle, sliceCounts, STATE_ID, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
+	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continueCounter, continuePrompt, deadRunPrompt, type DeadTestRun, deadTestRuns, enqueueRunnerDeath, exitOutcome, extensionsSuspendedDeathBody, extensionsSuspendedOf,
+	extensionsUnconfirmedDeathBody, configStamp, type PolledSuspension, polledSuspensionOf, readAs2ExtensionPaths, suspensionOf,
+	heldOpenBody, IDLE_CHECK, IDLE_LIMIT, idleActivity, idlePrompt, liveTestRuns, type PromptError, promptErrorOf, releasedIdle, releasedOpen, SETTLE_CHECK, SETTLE_IDLE_MS, settleIdle, sliceCounts, STATE_ID,
+	turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
 	type TurnEndInput, unsettledHandsOf,
 } from "../src/turn-end";
 import { waitingReserved } from "../src/errors";
@@ -1829,6 +1832,16 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		const ordinal = (/-(\d+)$/.exec(laneId) ?? [])[1] ?? "0";
 		const frames = join(p.dir, `lane-${ordinal}.jsonl`);
 		const { env, notes } = laneSpawnEnv(process.env, profileConfig(), { workloadId: wl, laneId });
+		// The as2 entry paths the lane's omp loads, read from the profile config it runs on (OMP_PROFILE), once, beside the spawn:
+		// a suspension notice later is confirmed against it (`suspensionOf`), and the stop poll compares a changed config with it
+		// (`polledSuspensionOf`). The stamp is taken before the read: a change between them makes the first poll re-read (one
+		// extra read), never miss it; a failed stamp leaves null, so the first poll re-reads too.
+		const spawnStamp = configStamp(profileConfig());
+		const loadedAs2 = readAs2ExtensionPaths(profileConfig());
+		if ("error" in loadedAs2) process.stderr.write(`runner: ${laneId} profile extensions unreadable at spawn: ${loadedAs2.error}; a suspension notice will end the lane unconfirmed\n`);
+		/** The config stamp the stop poll last read (`configStamp`), and its last logged check error (written once until it changes or clears). */
+		let configSeen: string | null = "stamp" in spawnStamp ? spawnStamp.stamp : null;
+		let configCheckError: string | null = null;
 		env.OMP_PROFILE = PROFILE;
 		for (const n of notes) process.stderr.write(`runner: ${laneId} tracing: ${n}\n`);
 		/**
@@ -1987,6 +2000,41 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		const stopPoll = setInterval(() => {
 			if (finished) return;
 			if (omp.exitCode === null && omp.signalCode === null) void rss.tick(omp.pid, Date.now());
+			// The as2 extensions suspended with no notice (review round 2 of PR #428): OMP's config listener suspends a loaded path
+			// no longer enabled on every config change but names a newly enabled path once per process and a removal never, so
+			// A → A+B (a notice; the lane goes on) → B, or a removal alone, suspends the lane's tools and gates in silence. Each
+			// poll stats the profile config and re-reads it only when it changed since the last read (the spawn read's first): a
+			// loaded as2 path no longer enabled ends the lane as the notice path does, within one poll. A failed stat, read or
+			// parse here is no evidence of a suspension (unlike the notice, nothing says OMP's set changed), so it is logged once
+			// per distinct error and the lane goes on; a notice still re-reads and ends it unconfirmed. An empty or failed spawn
+			// read skips the check: nothing to compare (the notice path ends those unconfirmed). Its own try: a ledger failure in
+			// the poll below never hides it, nor it them.
+			if (outcome === null && "paths" in loadedAs2 && loadedAs2.paths.length > 0) {
+				try {
+					const stamp = configStamp(profileConfig());
+					let s: PolledSuspension | null = null;
+					if ("error" in stamp) {
+						configSeen = null;
+						s = { kind: "unreadable", error: stamp.error };
+					} else if (stamp.stamp !== configSeen) {
+						configSeen = stamp.stamp;
+						s = polledSuspensionOf(loadedAs2.paths, readAs2ExtensionPaths(profileConfig()));
+					}
+					if (s?.kind === "unreadable") {
+						if (s.error !== configCheckError) process.stderr.write(`runner: ${laneId} profile config check failed: ${s.error}; no evidence of a suspension, the lane goes on (an extensions notice still re-reads it)\n`);
+						configCheckError = s.error;
+					} else if (s !== null) {
+						configCheckError = null;
+						if (s.kind === "confirmed") {
+							process.stderr.write(`runner: ${laneId} extensions suspended with no notice: ${s.suspended.join(", ")} no longer enabled in ${profileConfig()}; ending the lane\n`);
+							send({ id: "abort", type: "abort" });
+							conclude("error", extensionsSuspendedDeathBody(laneId, s.suspended, s.enabled));
+						}
+					}
+				} catch (err) {
+					process.stderr.write(`runner: ${laneId} stop poll's profile config check failed: ${String(err)}\n`);
+				}
+			}
 			try {
 				const { workload: cur, control } = controlNow();
 				const req = pendingStop(control, laneId);
@@ -2097,6 +2145,24 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					rerecord = true;
 				}
 				if (rerecord) record(startRecord());
+				// The as2 extensions suspended by a profile config change (decision en-mw01fr5uts72g0): the lane's tools and the P-11
+				// gates are gone, so the lane ends now as `error` with that death, before any hold, continue, settle or idle check
+				// (each of them needs outcome null), and before ready (the ready poll stops on an outcome). The notice is only the
+				// trigger: the profile config, read again now, confirms a loaded as2 path is no longer enabled. Every loaded one
+				// still enabled (an added copy, an unrelated path ending in an as2 entry) leaves the lane going; a config that
+				// cannot show which ends it unconfirmed, since the gates may be gone. A suspension OMP gives no notice for (a removal,
+				// or a path it announced before) is the stop poll's to find.
+				const enabled = outcome === null ? extensionsSuspendedOf(o) : null;
+				if (enabled !== null) {
+					const s = suspensionOf(loadedAs2, readAs2ExtensionPaths(profileConfig()));
+					if (s.kind === "still-enabled") process.stderr.write(`runner: ${laneId} extensions notice enables ${enabled.join(", ")}; the loaded as2 extensions are still enabled; the lane goes on\n`);
+					else {
+						const death = s.kind === "confirmed" ? extensionsSuspendedDeathBody(laneId, s.suspended, enabled) : extensionsUnconfirmedDeathBody(laneId, enabled, s.reason);
+						process.stderr.write(`runner: ${laneId} ${s.kind === "confirmed" ? `extensions suspended: ${s.suspended.join(", ")} no longer enabled` : `extensions likely suspended, not confirmed: ${s.reason}`}; OMP now enables ${enabled.join(", ")}; ending the lane\n`);
+						send({ id: "abort", type: "abort" });
+						conclude("error", death);
+					}
+				}
 				// A turn ends (B2) at the prompt_result for the prompt this runner sent, its status kept; agent_end is not an end.
 				if (o.type === "prompt_result" && o.id === current && outcome === null) {
 					current = null;
