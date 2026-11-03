@@ -1,0 +1,10 @@
+---
+status: resolved
+durable: true
+author: FenceBlockedCallFix
+date: 2026-11-03
+---
+
+# The M4b fence no longer reads a later extension's block as a bypass (jo-issues #233)
+
+When an extension loaded after the gates blocked a bash call the fence had wrapped (paired coding's `tool_call` handler, `plugins/paired-coding/omp/paired-coding-omp.ts:329-334`), OMP 18.8.6 returned the block and dropped the fence's revision (`pi-coding-agent/src/extensibility/extensions/runner.ts:1848-1849`), then started the call with the typed args the loop had kept (`pi-agent-core/src/agent-loop.ts:3076`, `:3090-3093`, `:3479-3486`), so the fence's `tool_execution_start` check saw a command other than its wrapper, wrote a `p11-fence-bypassed` assumption row and refused every later bash call in the session (ledger entry en-mw1818bc9d9huv, 2026-11-03 21:50Z). The fence now judges at the start only what the start can prove: its own wrapper is fenced, any command other than the typed one ran unfenced (a blocked call always starts with exactly the typed args) and is a bypass at once. A start carrying exactly the typed command is held open and settled by the first structural signal OMP gives: a `tool_result`, which OMP emits only from inside the tool wrapper's execute (`wrapper.ts:440-473`) that a blocked call never reaches because the block throws first (`agent-loop.ts:3517-3518`), means it ran and is a bypass; a `tool_execution_end` with `isError` and no `tool_result` (`agent-loop.ts:3591-3597`, `:3401-3407`) means it was blocked and is not; an end without an error is a bypass. The key is the `tool_result` absence, not the block's text: the text is the blocking handler's own `reason` (`agent-session.ts:4876-4878`, `run-collector.ts:619-623`) and an error end alone also fits a typed command that ran and timed out (`bash.ts:673-677` throws), so matching either would suppress real bypasses. Code: `gates/src/fence.ts` (`FencedCall`, the start, `tool_result` and `tool_execution_end` handlers); tests: `gates/test/fence.test.ts`, "a later extension's tool_call handler that drops the wrapper" and R3b.

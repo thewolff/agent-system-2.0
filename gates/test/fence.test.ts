@@ -27,7 +27,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import { Ledger } from "../../ledger/src/index";
-import { ALREADY_WRAPPED_REASON, FENCE_OFF_BODY, type FenceSettings, fenceBypassBody, fenceProfile, fenceSettingsFrom, INTERNAL_URL_REASON, registerFence, shellStartReason, wrapCommand } from "../src/fence";
+import { ALREADY_WRAPPED_REASON, FENCE_OFF_BODY, type FenceSettings, fenceBypassBody, fenceBypassRefusal, fenceProfile, fenceSettingsFrom, INTERNAL_URL_REASON, registerFence, shellStartReason, wrapCommand } from "../src/fence";
 import { type HostModules, VERIFIED_HOST } from "../src/host";
 import p11Gates from "../index";
 import { DISPLAY_LINKS } from "../extensions/open-links";
@@ -325,12 +325,15 @@ describe("a later extension's tool_call handler that drops the wrapper", () => {
 		return { f, l, wl, ctx: ctxOf(home) };
 	}
 
-	test("`return {}` after the gates: the unwrapped start is recorded as an assumption row and every later bash call is refused", async () => {
+	test("`return {}` after the gates: the unwrapped run is recorded as an assumption row and every later bash call is refused", async () => {
 		const { f, l, wl, ctx } = setup((e) => (e.toolName === "bash" ? {} : undefined));
 		const input = { command: "echo hi" };
 		const r = await f.emit("tool_call", { toolName: "bash", toolCallId: "b1", input }, ctx);
 		expect(r?.input).toBeUndefined();
+		// What OMP emits for a call that runs: the start, the wrapper's tool_result, the end.
 		await f.emit("tool_execution_start", { toolName: "bash", toolCallId: "b1", args: input }, ctx);
+		await f.emit("tool_result", { toolName: "bash", toolCallId: "b1", input, content: [{ type: "text", text: "hi\n" }], details: { exitCode: 0 }, isError: false }, ctx);
+		await f.emit("tool_execution_end", { toolName: "bash", toolCallId: "b1", result: { content: [{ type: "text", text: "hi\n" }], details: { exitCode: 0 } }, isError: false }, ctx);
 		expect(l.entries(wl, "assumption").map((e) => [e.body, e.created_by])).toEqual([[fenceBypassBody("b1"), "lane-bp"]]);
 		const next = await f.emit("tool_call", { toolName: "bash", toolCallId: "b2", input: { command: "true" } }, ctx);
 		expect({ block: next?.block, why: next?.reason?.includes("bash call b1 ran without the fence's wrapper") }).toEqual({ block: true, why: true });
@@ -343,6 +346,71 @@ describe("a later extension's tool_call handler that drops the wrapper", () => {
 		await f.emit("tool_execution_start", { toolName: "bash", toolCallId: "c1", args: r!.input }, ctx);
 		expect(l.entries(wl, "assumption")).toEqual([]);
 		expect(String((await f.emit("tool_call", { toolName: "bash", toolCallId: "c2", input: { command: "true" } }, ctx))?.input?.command)).toContain("sandbox-exec");
+		l.close();
+	});
+
+	// jo-issues #233. A later handler's `{ block: true, reason }` (paired coding's, paired-coding-omp.ts:329-334): OMP
+	// 18.8.6 emitToolCall returns it and drops the fence's revision (pi-coding-agent runner.ts:1848-1849); the loop keeps
+	// the typed args (pi-agent-core agent-loop.ts:3076, block at :3090-3093) and starts the call with them (:3479-3486);
+	// the block throws before the tool's execute (:3517-3518), so the wrapper's tool_result never fires (pi-coding-agent
+	// extensibility/extensions/wrapper.ts:440-473); the end carries isError and the reason as its text (:3591-3597,
+	// :3401-3407; run-collector.ts:619-623).
+	test("a later handler blocks the call: typed start, error end, no tool_result: no bypass row, the fence keeps wrapping", async () => {
+		const reason = "paired coding: bash is refused while pairing; use pair_run";
+		const { f, l, wl, ctx } = setup((e) => (e.toolName === "bash" ? { block: true, reason } : undefined));
+		const input = { command: "echo hi" };
+		expect(await f.emit("tool_call", { toolName: "bash", toolCallId: "k1", input }, ctx)).toEqual({ block: true, reason });
+		await f.emit("tool_execution_start", { toolName: "bash", toolCallId: "k1", args: input }, ctx);
+		await f.emit("tool_execution_end", { toolName: "bash", toolCallId: "k1", result: { content: [{ type: "text", text: reason }], details: {} }, isError: true }, ctx);
+		expect(l.entries(wl, "assumption")).toEqual([]);
+		expect(fenceBypassRefusal(ctx as never)).toBeNull();
+		const [own] = (await f.results("tool_call", { toolName: "bash", toolCallId: "k2", input: { command: "true" } }, ctx)) as Revised[];
+		expect(String(own?.input?.command)).toContain("sandbox-exec");
+		l.close();
+	});
+
+	test("a later handler hands back the typed input and it runs, then fails (a timeout's ToolError): still a bypass", async () => {
+		const { f, l, wl, ctx } = setup((e) => (e.toolName === "bash" ? { input: e.input } : undefined));
+		const input = { command: "sleep 100", timeout: 1 };
+		const r = await f.emit("tool_call", { toolName: "bash", toolCallId: "t1", input }, ctx);
+		expect(r?.input).toEqual(input);
+		const text = "Command timed out after 1 seconds";
+		await f.emit("tool_execution_start", { toolName: "bash", toolCallId: "t1", args: input }, ctx);
+		await f.emit("tool_result", { toolName: "bash", toolCallId: "t1", input, content: [{ type: "text", text }], details: undefined, isError: true }, ctx);
+		await f.emit("tool_execution_end", { toolName: "bash", toolCallId: "t1", result: { content: [{ type: "text", text }], details: {} }, isError: true }, ctx);
+		expect(l.entries(wl, "assumption").map((e) => e.body)).toEqual([fenceBypassBody("t1")]);
+		expect((await f.emit("tool_call", { toolName: "bash", toolCallId: "t2", input: { command: "true" } }, ctx))?.block).toBe(true);
+		l.close();
+	});
+
+	test("the typed input runs and its tool_result reaches the fence before the start does: still a bypass", async () => {
+		const { f, l, wl, ctx } = setup((e) => (e.toolName === "bash" ? { input: e.input } : undefined));
+		const input = { command: "echo hi" };
+		await f.emit("tool_call", { toolName: "bash", toolCallId: "o1", input }, ctx);
+		await f.emit("tool_result", { toolName: "bash", toolCallId: "o1", input, content: [{ type: "text", text: "hi\n" }], details: { exitCode: 0 }, isError: false }, ctx);
+		await f.emit("tool_execution_start", { toolName: "bash", toolCallId: "o1", args: input }, ctx);
+		expect(l.entries(wl, "assumption").map((e) => e.body)).toEqual([fenceBypassBody("o1")]);
+		l.close();
+	});
+
+	test("the typed command starts and ends without an error and without a tool_result: a bypass (only an error end reads as a block)", async () => {
+		const { f, l, wl, ctx } = setup((e) => (e.toolName === "bash" ? { input: e.input } : undefined));
+		const input = { command: "echo hi" };
+		await f.emit("tool_call", { toolName: "bash", toolCallId: "n1", input }, ctx);
+		await f.emit("tool_execution_start", { toolName: "bash", toolCallId: "n1", args: input }, ctx);
+		expect(l.entries(wl, "assumption")).toEqual([]);
+		await f.emit("tool_execution_end", { toolName: "bash", toolCallId: "n1", result: { content: [{ type: "text", text: "hi\n" }], details: { exitCode: 0 } }, isError: false }, ctx);
+		expect(l.entries(wl, "assumption").map((e) => e.body)).toEqual([fenceBypassBody("n1")]);
+		l.close();
+	});
+
+	test("a later handler's replacement with another command: recorded at its start, before it finishes", async () => {
+		const { f, l, wl, ctx } = setup((e) => (e.toolName === "bash" ? { input: { ...(e.input as Record<string, unknown>), command: "echo replaced" } } : undefined));
+		const r = await f.emit("tool_call", { toolName: "bash", toolCallId: "p1", input: { command: "echo hi" } }, ctx);
+		expect(r?.input?.command).toBe("echo replaced");
+		await f.emit("tool_execution_start", { toolName: "bash", toolCallId: "p1", args: r!.input }, ctx);
+		expect(l.entries(wl, "assumption").map((e) => e.body)).toEqual([fenceBypassBody("p1")]);
+		expect((await f.emit("tool_call", { toolName: "bash", toolCallId: "p2", input: { command: "true" } }, ctx))?.block).toBe(true);
 		l.close();
 	});
 });
@@ -596,6 +664,8 @@ describe("the bypass guard compares what bash executes, not the bytes around it"
 		const input = { command: "  echo ws  " };
 		await f.emit("tool_call", { toolName: "bash", toolCallId: "u1", input }, ctx);
 		await f.emit("tool_execution_start", { toolName: "bash", toolCallId: "u1", args: input }, ctx);
+		await f.emit("tool_result", { toolName: "bash", toolCallId: "u1", input, content: [{ type: "text", text: "ws\n" }], details: { exitCode: 0 }, isError: false }, ctx);
+		await f.emit("tool_execution_end", { toolName: "bash", toolCallId: "u1", result: { content: [{ type: "text", text: "ws\n" }], details: { exitCode: 0 } }, isError: false }, ctx);
 		expect(l.entries(wl, "assumption").map((e) => e.body)).toEqual([fenceBypassBody("u1")]);
 		expect((await f.emit("tool_call", { toolName: "bash", toolCallId: "u2", input: { command: "true" } }, ctx))?.block).toBe(true);
 		l.close();
@@ -1292,7 +1362,7 @@ describe("item 99: the model sees its own bash calls as typed (the fence's conte
 		expect(commandOf(returned?.messages, 0)).toBe(command);
 	});
 
-	test("R3b no entry when the started args are not the fence's proposal: a later wrapper-shaped replacement, and a post-fence block", async () => {
+	test("R3b no entry when the started args are not the fence's proposal: a later wrapper-shaped replacement (a bypass), and a post-fence block (not one)", async () => {
 		const d = tmp("unwrap-r3b");
 		const env = { HOME: d, PATH: process.env.PATH };
 		const replacing = host(env, d, {
@@ -1307,8 +1377,9 @@ describe("item 99: the model sees its own bash calls as typed (the fence's conte
 		const blocked = await blocking.turn([{ id: "pb1", input: { command: "git status" } }]);
 		expect(blocked.outcomes[0]).toEqual({ block: true, reason: "a later extension blocked this" });
 		expect(blocked.args[0]).toEqual({ command: "git status" });
-		// The pre-existing bypass record, unchanged, and no revision entry.
-		expect(blocking.f.entries).toEqual([{ type: "p11-fence-bypassed", data: { body: fenceBypassBody("pb1") } }]);
+		// The block ends as an error with no tool_result (agent-loop.ts:3517-3518, :3591-3597): no bypass record, no revision entry.
+		await blocking.f.emit("tool_execution_end", { toolName: "bash", toolCallId: "pb1", result: { content: [{ type: "text", text: "a later extension blocked this" }], details: {} }, isError: true }, blocking.ctx);
+		expect(blocking.f.entries).toEqual([]);
 		expect((await blocking.context()).returned).toBeUndefined();
 	});
 
