@@ -4,17 +4,20 @@
 // one-per-lane guard, and D6's hand predicate against forged and stale settles.
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { handSettledBody, handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
 import { controlEntries, exitClass, holdersOf } from "../src/launch";
 import { laneDeaths } from "../src/signals";
 import {
-	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, openWorkDeathBody, parkFailedDeathBody, releasedOpen, releasedOpenBody, sliceCounts, turnEnd,
+	AS2_EXTENSION_ENTRIES, BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, extensionsSuspendedDeathBody, extensionsSuspendedOf, heldOpenBody, openWorkDeathBody,
+	parkFailedDeathBody, releasedOpen, releasedOpenBody, sliceCounts, turnEnd,
 	turnEndDeathBody, type TurnEndInput, unsettledHands,
 } from "../src/turn-end";
 import { recordDecision } from "../scripts/lane";
 import { SURFACE_BY } from "../src/types";
-import { tempLedger } from "./helpers";
+import { COMPACTION_FRAME, SESSION_PERSISTENCE_FRAME, SUSPENDED_FRAMES, tempLedger } from "./helpers";
 
 const LANE = "lane-t-1";
 const HAND = { token: "dt-a", job: "sl-plan" };
@@ -331,5 +334,48 @@ describe("recordDecision: the runner's decided outcome on the ledger before EOF 
 		expect(ledger.question(q)!.state).toBe("open");
 		expect(markers()).toEqual([[LANE_RUNNER_BY, `lane-decided: ${LANE} parked`]]);
 		expect(deaths()).toEqual([]);
+	});
+});
+
+describe("turn end: the as2 extensions suspended by a profile config change (decision en-mw01fr5uts72g0)", () => {
+	const roots = ["/Users/jowolff/code/agent-system-2.0", "/Users/jowolff/.agent-system-2/verified/current"];
+	test("both real extensions notices name the four as2 entries; the death body is one line naming them", () => {
+		SUSPENDED_FRAMES.forEach((raw, k) => {
+			expect(extensionsSuspendedOf(JSON.parse(raw) as Record<string, unknown>)).toEqual(AS2_EXTENSION_ENTRIES.map((e) => `${roots[k]}/${e}`));
+		});
+		const paths = extensionsSuspendedOf(JSON.parse(SUSPENDED_FRAMES[1]) as Record<string, unknown>)!;
+		expect(extensionsSuspendedDeathBody(LANE, paths)).toBe(
+			`lane-died: ${LANE}: extensions suspended by a profile config change (OMP now enables /Users/jowolff/.agent-system-2/verified/current/surface/index.ts, /Users/jowolff/.agent-system-2/verified/current/gates/index.ts, /Users/jowolff/.agent-system-2/verified/current/classifier/extension.ts, /Users/jowolff/.agent-system-2/verified/current/plugins/index.ts); a relaunch loads the current paths`,
+		);
+	});
+
+	test("a notice enabling only another extension, another notice source or message, and a non-notice frame are not a suspension", () => {
+		const notice = (source: string, message: string) => ({ type: "notice", level: "warning", message, source });
+		expect(extensionsSuspendedOf(notice("extensions", "Restart omp to load newly enabled extensions: /Users/x/.omp/agent/extensions/foo.ts"))).toBeNull();
+		expect(extensionsSuspendedOf(notice("compaction", "Restart omp to load newly enabled extensions: /Users/x/surface/index.ts"))).toBeNull();
+		expect(extensionsSuspendedOf(notice("session-persistence", "Restart omp to load newly enabled extensions: /Users/x/gates/index.ts"))).toBeNull();
+		// the real compaction and session-persistence notices, verbatim
+		expect(extensionsSuspendedOf(JSON.parse(COMPACTION_FRAME) as Record<string, unknown>)).toBeNull();
+		expect(extensionsSuspendedOf(JSON.parse(SESSION_PERSISTENCE_FRAME) as Record<string, unknown>)).toBeNull();
+		expect(extensionsSuspendedOf(notice("extensions", "Extension /Users/x/surface/index.ts failed to load"))).toBeNull();
+		// the as2 entry name alone, or as part of another file name, is not the entry
+		expect(extensionsSuspendedOf(notice("extensions", "Restart omp to load newly enabled extensions: /Users/x/my-surface/index.ts.bak, surface/index.ts"))).toBeNull();
+		const real = JSON.parse(SUSPENDED_FRAMES[0]) as Record<string, unknown>;
+		expect(extensionsSuspendedOf({ ...real, type: "prompt_result" })).toBeNull();
+		expect(extensionsSuspendedOf({ type: "response", id: "state", data: { message: real.message } })).toBeNull();
+	});
+
+	test("an enable notice naming as2 entries among other extensions returns only the as2 ones", () => {
+		const message = "Restart omp to load newly enabled extensions: /Users/x/.omp/agent/extensions/foo.ts, /r/gates/index.ts";
+		expect(extensionsSuspendedOf({ type: "notice", level: "warning", message, source: "extensions" })).toEqual(["/r/gates/index.ts"]);
+	});
+
+	test("drift: AS2_EXTENSION_ENTRIES are the {repo}/… entries of profile/config.yml's extensions: list, in order", () => {
+		const root = "/as2-drift-root";
+		const text = readFileSync(join(import.meta.dir, "..", "..", "profile", "config.yml"), "utf8").replaceAll("{repo}", root);
+		const config = Bun.YAML.parse(text) as { extensions?: unknown };
+		expect(Array.isArray(config.extensions)).toBe(true);
+		const entries = (config.extensions as unknown[]).filter((e): e is string => typeof e === "string" && e.startsWith(`${root}/`)).map((e) => e.slice(root.length + 1));
+		expect(entries).toEqual([...AS2_EXTENSION_ENTRIES]);
 	});
 });

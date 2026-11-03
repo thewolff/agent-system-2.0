@@ -257,7 +257,9 @@ export type FakeStep =
 	| { result: string; error?: { message: string; provider?: string; model?: string; retryable: boolean } }
 	| { usage: { usd: number; tokens: number }; hand?: string }
 	| { background: number | "never" } | { wake: { ms: number; steps: FakeStep[] } }
-	| { ledger: { body: string; slice?: string } | { routing: { slice: string } } };
+	| { ledger: { body: string; slice?: string } | { routing: { slice: string } } }
+	/** One frame written to stdout as-is (fake-omp.ts header). */
+	| { emit: Record<string, unknown> };
 /** The fake omp's script (surface/test/fake-omp.ts header). */
 export interface FakeScript {
 	claim?: boolean;
@@ -359,6 +361,17 @@ export function laneRoot(over: Record<string, string> = {}, tag = "lane-root", r
 export const setScript = (r: LaneRoot, s: FakeScript) => writeFileSync(r.script, JSON.stringify(s));
 export const fakeRecords = (r: LaneRoot): FakeRecord[] => (existsSync(r.record) ? readFileSync(r.record, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as FakeRecord) : []);
 export const laneIdOf = (wl: string, n: number) => `lane-${wl.replace(/^wl-/, "")}-${n}`;
+/**
+ * The two extensions notices OMP really sent when install.sh re-rendered the profile's `extensions:` block mid-run, verbatim
+ * (~/.agent-system-2/lanes/wl-mvr888nftz0vcl/lane-5.jsonl:4231 and a verified/current one; decision en-mw01fr5uts72g0).
+ */
+export const SUSPENDED_FRAMES = [
+	`{"type":"notice","level":"warning","message":"Restart omp to load newly enabled extensions: /Users/jowolff/code/agent-system-2.0/surface/index.ts, /Users/jowolff/code/agent-system-2.0/gates/index.ts, /Users/jowolff/code/agent-system-2.0/classifier/extension.ts, /Users/jowolff/code/agent-system-2.0/plugins/index.ts","source":"extensions"}`,
+	`{"type":"notice","level":"warning","message":"Restart omp to load newly enabled extensions: /Users/jowolff/.agent-system-2/verified/current/surface/index.ts, /Users/jowolff/.agent-system-2/verified/current/gates/index.ts, /Users/jowolff/.agent-system-2/verified/current/classifier/extension.ts, /Users/jowolff/.agent-system-2/verified/current/plugins/index.ts","source":"extensions"}`,
+] as const;
+/** Other notice sources from real lane frames, verbatim (the lanes' lane-<n>.jsonl under ~/.agent-system-2/lanes): never a suspension. */
+export const COMPACTION_FRAME = `{"type":"notice","level":"warning","message":"Compaction freed too little context to make progress — pausing automatic maintenance to avoid a compaction loop. The most recent turn alone is too large to reduce further; shrink it (e.g. clear large tool output) or switch to a larger-context model.","source":"compaction"}`;
+export const SESSION_PERSISTENCE_FRAME = `{"type":"notice","level":"warning","message":"Session ~/.agent-system-2/lanes/wl-mv6144px2e2n7k/sessions/2026-10-13T01-55-34-285Z_01a132f8-e30d-7000-933b-3e6f036aacca.jsonl is open for writing in another omp process, so this session now saves to ~/.agent-system-2/lanes/wl-mv6144px2e2n7k/sessions/2026-10-14T22-30-06-414Z_01a13c89-7f4e-7000-bc3f-038a333dbfbd.jsonl instead of mixing its entries into that file.","source":"session-persistence"}`;
 
 /** The workload's rows as the launcher reads them, through a fresh handle (the processes write through their own). */
 export function laneSnapshot(r: LaneRoot, wl: string) {

@@ -15,12 +15,14 @@
 //   { claim?: false,               skip session_start (an extension that did not load: never ready)
 //     noSession?: true,            the get_state reply carries no sessionFile
 //     steps: [ { tool, args } | { sleepMs } | { exit: code } | { hang: true } | { result: "aborted" | "error", error? }
-//              | { usage: { usd, tokens }, hand? } | { background: ms | "never" } | { wake: { ms, steps } }
+//              | { usage: { usd, tokens }, hand? } | { background: ms | "never" } | { wake: { ms, steps } } | { emit: frame }
 //              | { ledger: { body, slice? } | { routing: { slice } } } ],
 //                                an arg value "$slice" is the id the newest tool result named (lane_add_slice mints it);
 //                                a usage step appends one assistant message with that usage (usage.cost.total,
 //                                usage.totalTokens) to the session file, or with `hand` to <session>/<hand>.jsonl, where
 //                                OMP writes a hand's session file (the runner's ceiling meter reads both);
+//                                an emit step writes its frame object to stdout as-is, one JSON line (an omp frame no
+//                                other step produces, e.g. the extensions `notice`);
 //                                a background step ends the prompt with `sessionSettled: false`; after `ms` it records
 //                                `background-done`, runs the next turn's steps as the woken turn (no prompt_result) and
 //                                emits `session_settled`; an EOF first records `background-killed` ("never": always);
@@ -272,6 +274,10 @@ const runSteps = async (steps: readonly FakeStep[]): Promise<number | "never" | 
 		}
 		if ("ledger" in step) {
 			ledgerStep(step.ledger);
+			continue;
+		}
+		if ("emit" in step) {
+			emit(step.emit);
 			continue;
 		}
 		const args = Object.fromEntries(Object.entries(step.args).map(([k, v]) => [k, v === "$slice" ? lastSlice : v]));

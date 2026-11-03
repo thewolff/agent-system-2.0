@@ -230,6 +230,33 @@ export function turnEndFailedDeathBody(laneId: string, error: string): string {
 	return `${LANE_DIED_PREFIX} ${laneId}: turn-end decision failed: ${error.replace(/\s+/g, " ").trim()}`;
 }
 
+/**
+ * The as2 extension entry points, as the `{repo}/…` lines of profile/config.yml's `extensions:` block list them (in that
+ * order; turn-end.test.ts checks the two agree).
+ */
+export const AS2_EXTENSION_ENTRIES = ["surface/index.ts", "gates/index.ts", "classifier/extension.ts", "plugins/index.ts"] as const;
+const EXTENSIONS_ENABLED_PREFIX = "Restart omp to load newly enabled extensions: ";
+/**
+ * The as2 entry paths an OMP extensions notice newly enables, or null when the frame is no such notice. OMP's live config
+ * listener (@oh-my-pi/pi-coding-agent src/sdk.ts `reconcileExtensionSources`) suspends a loaded extension whose path left
+ * the `extensions:` block without any frame of its own; it only emits `{type: "notice", level: "warning", message:
+ * "Restart omp to load newly enabled extensions: <p1>, <p2>, …", source: "extensions"}` for enabled paths this process never
+ * loaded. A lane loaded the as2 entries at its start, so a never-loaded as2 entry enabled means the block was re-rendered to
+ * another root and the loaded copies, the P-11 gates among them, are suspended (decision en-mw01fr5uts72g0). A notice that
+ * enables only other extensions, and every other notice source (`compaction`, `session-persistence`), is null.
+ */
+export function extensionsSuspendedOf(frame: Record<string, unknown>): string[] | null {
+	if (frame.type !== "notice" || frame.source !== "extensions" || typeof frame.message !== "string") return null;
+	if (!frame.message.startsWith(EXTENSIONS_ENABLED_PREFIX)) return null;
+	const paths = frame.message.slice(EXTENSIONS_ENABLED_PREFIX.length).split(", ").map((p) => p.trim());
+	const as2 = paths.filter((p) => AS2_EXTENSION_ENTRIES.some((e) => p.endsWith(`/${e}`)));
+	return as2.length > 0 ? as2 : null;
+}
+/** `lane-died: <laneId>: extensions suspended by a profile config change (OMP now enables <paths>); …` (decision en-mw01fr5uts72g0). */
+export function extensionsSuspendedDeathBody(laneId: string, enabled: readonly string[]): string {
+	return `${LANE_DIED_PREFIX} ${laneId}: extensions suspended by a profile config change (OMP now enables ${enabled.join(", ")}); a relaunch loads the current paths`;
+}
+
 /** The runner's death line for a decided turn-end outcome, or null for an intended one. */
 export function turnEndDeathBody(laneId: string, t: TurnEnd, i: Pick<TurnEndInput, "held" | "releasedOpen" | "limit" | "promptError"> & Partial<Pick<TurnEndInput, "settled" | "idle">>): string | null {
 	switch (t.decision) {
