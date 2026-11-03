@@ -53,7 +53,7 @@ describe("as2 routing", () => {
 		const lines = r.out.split("\n");
 		expect(lines[0]).toBe("3 rows · jev 3 · change-large 1 of 2 code rows");
 		// No session file exists for any hand: every hand is n/a and counted, never a zero.
-		expect(lines[1]).toBe("hands 3 · cost read 0 · n/a 3 (session file missing 3, unreadable 0) · no hand 0 · unparsed assistant lines 0");
+		expect(lines[1]).toBe("hands 3 · cost read 0 · n/a 3 (session file missing 3, unreadable 0, incomplete 0) · no hand 0");
 	});
 
 	test("--json prints the report object", () => {

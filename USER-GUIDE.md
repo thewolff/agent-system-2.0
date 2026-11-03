@@ -304,7 +304,7 @@ Land-first details, including the shadow-mode activation order and restart recov
 
 - `as2 routing` reads the ledger's `routings` table, read-only, and prints how hand spawns were routed. The first line is `<N> rows · jev <J> · change-large <L> of <C> code rows`. Then, per kind and tier: rows, outcomes, models, pull-ups and pull-downs, review vs build, and dollars and tokens per hand, plus `headroom-skip:` counts per model.
 - Options: `--since <ISO>` (inclusive), `--until <ISO>` (exclusive), `--split <ISO>` (two cohorts, before and after, each with its change-small share), `--workload <wl>`, `--ledger <path>` (default the live ledger), `--json`. A bad option exits 2 and names it; a ledger that will not open exits 1.
-- Cost comes from each hand's own session file. A hand whose file is gone shows `n/a` and is counted on the second line; it is never counted as $0.
+- Cost comes from each hand's own session file. A hand whose file is gone, is unreadable, or has lines without a cost (an assistant message with no cost, a line that is not JSON, or an unfinished last line) shows `n/a`: it is counted on the second line, listed at the end with its file and the reason, and left out of the dollar sums and per-hand averages. It is never counted as $0. An explicit cost of 0 is a real zero.
 - How hands are routed (SPEC-2.0.md § B4, *Amended 2026-11-03*; `migration/items/cheaper-routing.md`): a normal-stakes review (judge kind) runs on standard, a throwaway one on fast, a production one on deep; an OpenAI reviewer always runs gpt-6.1-sol. Opus hands and lanes run at medium effort (a lane gets medium each time it lands on Opus; a level you set while it stays there is kept).
 
 ### Notes from other agents (the agent channel)

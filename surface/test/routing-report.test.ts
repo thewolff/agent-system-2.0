@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Ledger, RoutingKind, RoutingOutcome, Tier } from "../../ledger/src/index";
-import { scanSpend } from "../src/ceiling";
+import { assistantUsage, scanSpend } from "../src/ceiling";
 import { HEADROOM_SKIP_PREFIX, readHandUsage, renderRoutingReport, type RoutingReport, routingReport } from "../src/routing-report";
 import { clock, tempLedger, tmp, workloadWithSlice } from "./helpers";
 
@@ -15,6 +15,10 @@ const JEV = "typesafe/jev-1.13.0";
 const assistant = (usd: number, tokens: number) =>
 	JSON.stringify({ type: "message", message: { role: "assistant", content: [], usage: { totalTokens: tokens, cost: { total: usd } } } });
 const user = JSON.stringify({ type: "message", message: { role: "user", content: "go" } });
+/** An assistant message line with the given `usage` object as is (a cost missing, a string, null). */
+const assistantUsing = (usage: Record<string, unknown>) => JSON.stringify({ type: "message", message: { role: "assistant", content: [], usage } });
+/** An `"assistant"` line cut off mid-JSON. */
+const tornLine = '{"type":"message","message":{"role":"assistant","usage":';
 
 interface RowSpec {
 	at: string;
@@ -163,11 +167,11 @@ describe("routing report: cost per hand", () => {
 		f.add({ at: "2026-10-10T01:01:00.000Z", kind: "change-large", tier: "strong", agentId: "gone" });
 		mkdirSync(join(f.root, "dir.jsonl"));
 		f.add({ at: "2026-10-10T01:02:00.000Z", kind: "judge", tier: "strong", agentId: "dir" });
-		writeFileSync(join(f.root, "torn.jsonl"), [assistant(1, 10), '{"type":"message","message":{"role":"assistant","usage":'].join("\n"));
+		writeFileSync(join(f.root, "torn.jsonl"), [assistant(1, 10), tornLine].join("\n"));
 		f.add({ at: "2026-10-10T01:03:00.000Z", kind: "judge", tier: "strong", agentId: "torn" });
 
 		const r = report(f);
-		expect(r.all.cost).toEqual({ hands: 4, read: 2, missing: 1, unreadable: 1, usd: 1.75, tokens: 3010, malformedLines: 1 });
+		expect(r.all.cost).toEqual({ hands: 4, read: 1, missing: 1, unreadable: 1, incomplete: 1, usd: 0.75, tokens: 3000 });
 		const large = r.all.cells.find((c) => c.kind === "change-large")!;
 		expect(large.cost).toMatchObject({ hands: 2, read: 1, missing: 1, usd: 0.75, tokens: 3000 });
 		const gone = r.hands.find((h) => h.file.endsWith("gone.jsonl"))!;
@@ -178,10 +182,13 @@ describe("routing report: cost per hand", () => {
 
 		const lines = renderRoutingReport(r).split("\n");
 		expect(lines[0]).toBe("4 rows · jev 4 · change-large 2 of 2 code rows");
-		expect(lines[1]).toBe("hands 4 · cost read 2 · n/a 2 (session file missing 1, unreadable 1) · no hand 0 · unparsed assistant lines 1");
+		expect(lines[1]).toBe("hands 4 · cost read 1 · n/a 3 (session file missing 1, unreadable 1, incomplete 1) · no hand 0");
 		expect(lines).toContain(`  n/a ${gone.routingId} ${f.wl} change-large/strong session file missing: ${join(f.root, "gone.jsonl")}`);
 		expect(lines.some((l) => l.startsWith(`  n/a ${dir.routingId} `) && l.includes("unreadable (") && l.includes("EISDIR"))).toBe(true);
-		expect(lines).toContain(`  ${r.hands.find((h) => h.file.endsWith("torn.jsonl"))!.routingId} ${f.wl} 1 line(s): ${join(f.root, "torn.jsonl")}`);
+		const torn = r.hands.find((h) => h.file.endsWith("torn.jsonl"))!;
+		expect(lines).toContain(`  n/a ${torn.routingId} ${f.wl} judge/strong incomplete (1 unparsed line(s), unterminated last line; partial usd 1.0000 tokens 10): ${join(f.root, "torn.jsonl")}`);
+		// One listing: the torn hand is not listed a second time under another heading.
+		expect(lines.filter((l) => l.includes(join(f.root, "torn.jsonl")))).toHaveLength(1);
 	});
 
 	test("a cell with no readable hand prints n/a for its dollars, not 0", () => {
@@ -190,6 +197,95 @@ describe("routing report: cost per hand", () => {
 		const text = renderRoutingReport(report(f));
 		expect(text).toContain("  cost       usd n/a · tokens n/a · read 0 of 1 hands · per hand n/a · n/a 1");
 		expect(text).not.toContain("usd 0.0000");
+	});
+
+	test("the shared parser flags a missing or non-numeric cost; usd and tokens stay what the meter sums", () => {
+		expect(assistantUsage(assistantUsing({ totalTokens: 123 }))).toEqual({ usd: 0, tokens: 123, malformed: false, costMissing: true });
+		expect(assistantUsage(assistantUsing({ totalTokens: 7, cost: { total: "0.42" } }))).toEqual({ usd: 0, tokens: 7, malformed: false, costMissing: true });
+		expect(assistantUsage(assistantUsing({ totalTokens: 7, cost: { total: null } }))).toEqual({ usd: 0, tokens: 7, malformed: false, costMissing: true });
+		expect(assistantUsage(assistant(0, 50))).toEqual({ usd: 0, tokens: 50, malformed: false, costMissing: false });
+		expect(assistantUsage(assistant(0.25, 100))).toEqual({ usd: 0.25, tokens: 100, malformed: false, costMissing: false });
+		expect(assistantUsage(user)).toEqual({ usd: 0, tokens: 0, malformed: false, costMissing: false });
+		expect(assistantUsage(tornLine)).toEqual({ usd: 0, tokens: 0, malformed: true, costMissing: false });
+	});
+
+	test("an assistant message with tokens but no cost makes the hand incomplete: n/a, out of the dollar sum and the per-hand average, listed with its file", () => {
+		const f = fixture();
+		writeFileSync(join(f.root, "known.jsonl"), [user, assistant(0.5, 1000), ""].join("\n"));
+		writeFileSync(join(f.root, "nocost.jsonl"), [user, assistant(1, 10), assistantUsing({ totalTokens: 123 }), ""].join("\n"));
+		f.add({ at: "2026-10-10T01:00:00.000Z", kind: "change-large", tier: "strong", agentId: "known" });
+		f.add({ at: "2026-10-10T01:01:00.000Z", kind: "change-large", tier: "strong", agentId: "nocost" });
+
+		const r = report(f);
+		expect(r.all.cost).toEqual({ hands: 2, read: 1, missing: 0, unreadable: 0, incomplete: 1, usd: 0.5, tokens: 1000 });
+		expect(r.all.cells.find((c) => c.kind === "change-large")!.cost).toEqual(r.all.cost);
+		const file = join(f.root, "nocost.jsonl");
+		const h = r.hands.find((x) => x.file === file)!;
+		const expected = { state: "incomplete", file, usd: null, tokens: null, incomplete: { costMissing: 1, malformed: 0, unterminated: false, usd: 1, tokens: 133 }, error: null };
+		expect(h).toMatchObject(expected);
+		// --json prints the report object: the state and the counts survive serialisation.
+		expect((JSON.parse(JSON.stringify(r)) as RoutingReport).hands.find((x) => x.file === file)).toMatchObject(expected);
+
+		const lines = renderRoutingReport(r).split("\n");
+		expect(lines[1]).toBe("hands 2 · cost read 1 · n/a 1 (session file missing 0, unreadable 0, incomplete 1) · no hand 0");
+		expect(lines).toContain("cost usd 0.5000 · tokens 1000 · read 1 of 2 hands · per hand usd 0.5000 tokens 1000 · n/a 1 (session file missing 0, unreadable 0, incomplete 1)");
+		expect(lines).toContain(`  n/a ${h.routingId} ${f.wl} change-large/strong incomplete (1 assistant line(s) without cost; partial usd 1.0000 tokens 133): ${file}`);
+
+		// The ceiling meter's sum over the same files is unchanged: it adds the known dollars and every token.
+		const meter = scanSpend(join(f.root, ".."), new Map(), { usd: 0, tokens: 0, wallMin: 0 });
+		expect(meter.usd).toBeCloseTo(1.5, 10);
+		expect(meter.tokens).toBe(1133);
+	});
+
+	for (const [what, total] of [["a string", "0.42"], ["null", null]] as const) {
+		test(`a non-numeric cost (${what}) makes the hand incomplete, never a zero`, () => {
+			const f = fixture();
+			writeFileSync(join(f.root, "known.jsonl"), [assistant(0.5, 1000), ""].join("\n"));
+			writeFileSync(join(f.root, "odd.jsonl"), [assistantUsing({ totalTokens: 40, cost: { total } }), ""].join("\n"));
+			f.add({ at: "2026-10-10T01:00:00.000Z", kind: "judge", tier: "strong", agentId: "known" });
+			f.add({ at: "2026-10-10T01:01:00.000Z", kind: "judge", tier: "strong", agentId: "odd" });
+			const r = report(f);
+			expect(r.all.cost).toEqual({ hands: 2, read: 1, missing: 0, unreadable: 0, incomplete: 1, usd: 0.5, tokens: 1000 });
+			const h = r.hands.find((x) => x.file === join(f.root, "odd.jsonl"))!;
+			expect(h).toMatchObject({ state: "incomplete", usd: null, tokens: null, incomplete: { costMissing: 1, malformed: 0, unterminated: false, usd: 0, tokens: 40 } });
+			expect(renderRoutingReport(r).split("\n")).toContain(`  n/a ${h.routingId} ${f.wl} judge/strong incomplete (1 assistant line(s) without cost; partial usd 0.0000 tokens 40): ${join(f.root, "odd.jsonl")}`);
+		});
+	}
+
+	test("an unparsed assistant line in a terminated file makes the hand incomplete", () => {
+		const f = fixture();
+		writeFileSync(join(f.root, "torn.jsonl"), [assistant(0.25, 100), tornLine, assistant(0.25, 100), ""].join("\n"));
+		f.add({ at: "2026-10-10T01:00:00.000Z", kind: "change-small", tier: "standard", agentId: "torn" });
+		const r = report(f);
+		expect(r.all.cost).toEqual({ hands: 1, read: 0, missing: 0, unreadable: 0, incomplete: 1, usd: 0, tokens: 0 });
+		const h = r.hands[0]!;
+		expect(h).toMatchObject({ state: "incomplete", usd: null, incomplete: { costMissing: 0, malformed: 1, unterminated: false, usd: 0.5, tokens: 200 } });
+		const lines = renderRoutingReport(r).split("\n");
+		expect(lines).toContain("cost usd n/a · tokens n/a · read 0 of 1 hands · per hand n/a · n/a 1 (session file missing 0, unreadable 0, incomplete 1)");
+		expect(lines).toContain(`  n/a ${h.routingId} ${f.wl} change-small/standard incomplete (1 unparsed line(s); partial usd 0.5000 tokens 200): ${join(f.root, "torn.jsonl")}`);
+	});
+
+	test("an unterminated last line makes the hand incomplete, even when every line parses", () => {
+		const f = fixture();
+		writeFileSync(join(f.root, "open.jsonl"), [assistant(0.25, 100), assistant(0.25, 100)].join("\n"));
+		f.add({ at: "2026-10-10T01:00:00.000Z", kind: "change-small", tier: "standard", agentId: "open" });
+		const r = report(f);
+		expect(r.all.cost).toEqual({ hands: 1, read: 0, missing: 0, unreadable: 0, incomplete: 1, usd: 0, tokens: 0 });
+		const h = r.hands[0]!;
+		expect(h).toMatchObject({ state: "incomplete", usd: null, incomplete: { costMissing: 0, malformed: 0, unterminated: true, usd: 0.5, tokens: 200 } });
+		expect(renderRoutingReport(r).split("\n")).toContain(`  n/a ${h.routingId} ${f.wl} change-small/standard incomplete (unterminated last line; partial usd 0.5000 tokens 200): ${join(f.root, "open.jsonl")}`);
+	});
+
+	test("control: an explicit cost of 0 in a terminated file is a known zero, read and counted", () => {
+		const f = fixture();
+		writeFileSync(join(f.root, "free.jsonl"), [user, assistant(0, 50), ""].join("\n"));
+		f.add({ at: "2026-10-10T01:00:00.000Z", kind: "change-small", tier: "standard", agentId: "free" });
+		const r = report(f);
+		expect(r.all.cost).toEqual({ hands: 1, read: 1, missing: 0, unreadable: 0, incomplete: 0, usd: 0, tokens: 50 });
+		expect(r.hands[0]).toMatchObject({ state: "read", usd: 0, tokens: 50, incomplete: null });
+		const text = renderRoutingReport(r);
+		expect(text.split("\n")).toContain("cost usd 0.0000 · tokens 50 · read 1 of 1 hands · per hand usd 0.0000 tokens 50 · n/a 0 (session file missing 0, unreadable 0, incomplete 0)");
+		expect(text).not.toContain("hands with cost n/a");
 	});
 
 	test("two hands under one session root are attributed separately, and the ceiling meter's total over the root is their sum", () => {

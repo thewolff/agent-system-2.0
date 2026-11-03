@@ -10,9 +10,11 @@
 // - the model of a row: `ran_models[0]`, else `model`, else `(none)` (a spawn that found no usable model);
 // - pull-ups by `pull_up_to`, pull-downs by `pull_down_to`;
 // - review vs build: `isReviewRouting` (classifier/src/lab.ts), the D2 read-back the plan gate uses;
-// - USD and tokens: summed over the hands whose session file was read; a hand whose file is gone is `n/a`, counted as
-//   missing, never a zero; a file that exists but cannot be read is `unreadable` with its error; an `"assistant"` line
-//   that is not JSON is counted as unparsed, per hand and in total. A refused spawn with no agent id has no hand.
+// - USD and tokens: summed over the hands whose session file was read whole; unknown cost is `n/a`, never zero, and
+//   never summed or averaged. A hand whose file is gone is `missing`; a file that exists but cannot be read is
+//   `unreadable` with its error; a read file with an assistant message lacking a finite `usage.cost.total`, an
+//   `"assistant"` line that is not JSON, or an unterminated last line is `incomplete`, listed with its file and the
+//   counts of each. An explicit numeric cost of 0 is a known zero. A refused spawn with no agent id has no hand.
 // - jev: rows whose `judge_model` starts `typesafe/jev`; code rows: change-small + change-large.
 // - headroom-skip entries (`headroom-skip: <selector> token <dt> <reason>`, classifier/extension.ts) per selector; a
 //   body without a selector is listed by entry id, never dropped.
@@ -28,9 +30,24 @@ export const HEADROOM_SKIP_PREFIX = "headroom-skip: ";
 /** The judge-model prefix the header's `jev` counts. */
 export const JEV_PREFIX = "typesafe/jev";
 
+/** What makes a read session file's cost unknown: its counts of each defect, and the part that was known, for display only. */
+export interface IncompleteUsage {
+	/** Assistant messages with no finite `usage.cost.total`. */
+	costMissing: number;
+	/** `"assistant"` lines that are not JSON. */
+	malformed: number;
+	/** The file does not end in a newline and its last line is not empty. */
+	unterminated: boolean;
+	/** The dollars and tokens of the lines that had them; never summed into a report total. */
+	usd: number;
+	tokens: number;
+}
+
 /** One hand's cost as its session file gives it. */
 export type HandUsage =
-	| { state: "read"; file: string; usd: number; tokens: number; malformed: number }
+	| { state: "read"; file: string; usd: number; tokens: number }
+	/** Read, but its cost is unknown: n/a, out of every sum and average. */
+	| ({ state: "incomplete"; file: string } & IncompleteUsage)
 	| { state: "missing"; file: string }
 	| { state: "unreadable"; file: string; error: string }
 	/** A refused spawn (`refused-no-usable-model`): no agent id, no hand, no file. */
@@ -43,7 +60,9 @@ export function sessionFile(row: Pick<RoutingRow, "session_root" | "agent_id">):
 
 /**
  * One hand's USD and tokens from its single session file, every line through `assistantUsage`. A file that does not
- * exist (ENOENT) is `missing`; any other read error is `unreadable` with its code and message.
+ * exist (ENOENT) is `missing`; any other read error is `unreadable` with its code and message. A file with any
+ * assistant message lacking a finite cost, any `"assistant"` line that is not JSON, or an unterminated last line is
+ * `incomplete`: its cost is unknown, and the known part rides along for display only.
  */
 export function readHandUsage(row: Pick<RoutingRow, "session_root" | "agent_id">): HandUsage {
 	const file = sessionFile(row);
@@ -59,26 +78,32 @@ export function readHandUsage(row: Pick<RoutingRow, "session_root" | "agent_id">
 	let usd = 0;
 	let tokens = 0;
 	let malformed = 0;
-	for (const line of text.split("\n")) {
+	let costMissing = 0;
+	const lines = text.split("\n");
+	for (const line of lines) {
 		if (line === "") continue;
 		const u = assistantUsage(line);
 		usd += u.usd;
 		tokens += u.tokens;
 		if (u.malformed) malformed++;
+		if (u.costMissing) costMissing++;
 	}
-	return { state: "read", file, usd, tokens, malformed };
+	const unterminated = lines[lines.length - 1] !== "";
+	if (malformed > 0 || costMissing > 0 || unterminated) return { state: "incomplete", file, costMissing, malformed, unterminated, usd, tokens };
+	return { state: "read", file, usd, tokens };
 }
 
 export interface CostTotals {
 	/** Rows with an agent id. */
 	hands: number;
+	/** Hands whose cost is known; the only ones in `usd`, `tokens` and the per-hand averages. */
 	read: number;
 	missing: number;
 	unreadable: number;
+	/** Hands whose file was read but whose cost is unknown (`incomplete`); n/a, never summed. */
+	incomplete: number;
 	usd: number;
 	tokens: number;
-	/** `"assistant"` lines that were not JSON, over the read files. */
-	malformedLines: number;
 }
 
 export interface Cell {
@@ -119,7 +144,7 @@ export interface Cohort {
 	headroomUnparsed: string[];
 }
 
-/** One hand's line: its routing, where its cost came from, and the cost (null when n/a). */
+/** One hand's line: its routing, where its cost came from, and the cost (null when n/a: missing, unreadable or incomplete). */
 export interface HandLine {
 	routingId: string;
 	workloadId: string;
@@ -127,11 +152,12 @@ export interface HandLine {
 	tier: Tier;
 	model: string;
 	createdAt: string;
-	state: "read" | "missing" | "unreadable";
+	state: "read" | "incomplete" | "missing" | "unreadable";
 	file: string;
 	usd: number | null;
 	tokens: number | null;
-	malformed: number;
+	/** For an `incomplete` hand: why its cost is unknown, and the known part (display only); else null. */
+	incomplete: IncompleteUsage | null;
 	error: string | null;
 }
 
@@ -180,18 +206,19 @@ const bump = (m: Record<string, number>, key: string) => {
 	m[key] = (m[key] ?? 0) + 1;
 };
 
-const zeroCost = (): CostTotals => ({ hands: 0, read: 0, missing: 0, unreadable: 0, usd: 0, tokens: 0, malformedLines: 0 });
+const zeroCost = (): CostTotals => ({ hands: 0, read: 0, missing: 0, unreadable: 0, incomplete: 0, usd: 0, tokens: 0 });
 
+/** Count one hand; only a hand whose cost is known (`read`) adds to `usd`, `tokens` and `read`. */
 function addCost(c: CostTotals, u: HandUsage): void {
 	if (u.state === "no-hand") return;
 	c.hands++;
 	if (u.state === "missing") c.missing++;
 	else if (u.state === "unreadable") c.unreadable++;
+	else if (u.state === "incomplete") c.incomplete++;
 	else {
 		c.read++;
 		c.usd += u.usd;
 		c.tokens += u.tokens;
-		c.malformedLines += u.malformed;
 	}
 }
 
@@ -262,7 +289,8 @@ export function routingReport(rows: readonly RoutingRow[], opts: ReportOptions):
 			routingId: j.row.id, workloadId: j.row.workload_id, kind: j.row.kind, tier: j.row.tier, model: j.model, createdAt: j.row.created_at,
 			state: u.state, file: u.file,
 			usd: u.state === "read" ? u.usd : null, tokens: u.state === "read" ? u.tokens : null,
-			malformed: u.state === "read" ? u.malformed : 0, error: u.state === "unreadable" ? u.error : null,
+			incomplete: u.state === "incomplete" ? { costMissing: u.costMissing, malformed: u.malformed, unterminated: u.unterminated, usd: u.usd, tokens: u.tokens } : null,
+			error: u.state === "unreadable" ? u.error : null,
 		});
 	}
 	const split = opts.split ?? null;
@@ -286,10 +314,13 @@ export function headerLine(c: Cohort): string {
 	return `${c.rows} rows · jev ${c.jev} · change-large ${c.changeLarge} of ${c.codeRows} code rows`;
 }
 
+/** The n/a count and its reasons: `n/a <N> (session file missing <M>, unreadable <U>, incomplete <I>)`. */
+const naText = (c: CostTotals) =>
+	`n/a ${c.missing + c.unreadable + c.incomplete} (session file missing ${c.missing}, unreadable ${c.unreadable}, incomplete ${c.incomplete})`;
+
 /** The hands line under the header: how many hands' cost was read, and how many are n/a and why. */
 export function handsLine(c: Cohort): string {
-	const na = c.cost.missing + c.cost.unreadable;
-	return `hands ${c.cost.hands} · cost read ${c.cost.read} · n/a ${na} (session file missing ${c.cost.missing}, unreadable ${c.cost.unreadable}) · no hand ${c.noHand} · unparsed assistant lines ${c.cost.malformedLines}`;
+	return `hands ${c.cost.hands} · cost read ${c.cost.read} · ${naText(c.cost)} · no hand ${c.noHand}`;
 }
 
 const usdText = (usd: number) => usd.toFixed(4);
@@ -298,11 +329,29 @@ const counts = (m: Record<string, number>) => {
 	return items.length === 0 ? "none" : items.map(([k, n]) => `${k} ${n}`).join(" · ");
 };
 
+/** Sums and per-hand averages over the `read` hands only; every n/a hand is counted in `n/a`, never as a zero. */
 function costText(c: CostTotals): string {
-	const na = c.missing + c.unreadable;
 	const per = c.read === 0 ? "per hand n/a" : `per hand usd ${usdText(c.usd / c.read)} tokens ${Math.round(c.tokens / c.read)}`;
 	const sum = c.read === 0 ? "usd n/a · tokens n/a" : `usd ${usdText(c.usd)} · tokens ${c.tokens}`;
-	return `${sum} · read ${c.read} of ${c.hands} hands · ${per} · n/a ${na}${c.malformedLines > 0 ? ` · unparsed lines ${c.malformedLines}` : ""}`;
+	return `${sum} · read ${c.read} of ${c.hands} hands · ${per} · ${naText(c)}`;
+}
+
+/** Why an incomplete hand's cost is unknown, then its known part: `1 assistant line(s) without cost, unterminated last line; partial usd 0.2500 tokens 100`. */
+function incompleteText(i: IncompleteUsage): string {
+	const why = [
+		...(i.costMissing > 0 ? [`${i.costMissing} assistant line(s) without cost`] : []),
+		...(i.malformed > 0 ? [`${i.malformed} unparsed line(s)`] : []),
+		...(i.unterminated ? ["unterminated last line"] : []),
+	];
+	return `${why.join(", ")}; partial usd ${usdText(i.usd)} tokens ${i.tokens}`;
+}
+
+/** Why a hand's cost is n/a, for the per-hand listing. */
+function naReason(h: HandLine): string {
+	if (h.state === "missing") return "session file missing";
+	if (h.state === "unreadable") return `unreadable (${h.error})`;
+	if (h.state === "incomplete" && h.incomplete !== null) return `incomplete (${incompleteText(h.incomplete)})`;
+	throw new Error(`renderRoutingReport: hand ${h.routingId} is ${h.state}, not an n/a state with its reason`);
 }
 
 function cohortLines(c: Cohort): string[] {
@@ -333,7 +382,7 @@ function cohortLines(c: Cohort): string[] {
 	return lines;
 }
 
-/** The report as text: the header line first, the cohort's figures, any split's two cohorts, then every n/a hand and every hand with unparsed lines. */
+/** The report as text: the header line first, the cohort's figures, any split's two cohorts, then every n/a hand with its reason and file. */
 export function renderRoutingReport(r: RoutingReport): string {
 	const lines = cohortLines(r.all);
 	lines.splice(2, 0, `window: since ${r.range.since ?? "(start)"} · until ${r.range.until ?? "(now)"} · workload ${r.range.workload ?? "all"}`);
@@ -343,14 +392,7 @@ export function renderRoutingReport(r: RoutingReport): string {
 	const na = r.hands.filter((h) => h.state !== "read");
 	if (na.length > 0) {
 		lines.push("", `hands with cost n/a: ${na.length}`);
-		for (const h of na) {
-			lines.push(`  n/a ${h.routingId} ${h.workloadId} ${h.kind}/${h.tier} ${h.state === "missing" ? "session file missing" : `unreadable (${h.error})`}: ${h.file}`);
-		}
-	}
-	const torn = r.hands.filter((h) => h.malformed > 0);
-	if (torn.length > 0) {
-		lines.push("", `hands with unparsed assistant lines: ${torn.length}`);
-		for (const h of torn) lines.push(`  ${h.routingId} ${h.workloadId} ${h.malformed} line(s): ${h.file}`);
+		for (const h of na) lines.push(`  n/a ${h.routingId} ${h.workloadId} ${h.kind}/${h.tier} ${naReason(h)}: ${h.file}`);
 	}
 	return lines.join("\n");
 }
