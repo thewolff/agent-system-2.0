@@ -3,16 +3,18 @@
 // grace — and `lane-exit:` follows; the next launch proceeds, and the process that spawns the next omp ends a self-released
 // lane's stale omp first. Through the real `lane.ts launch`, runner and `lane.ts interactive`, against the fake omp in
 // omp 18.8.6's shape (`deferShutdown`: the lane's ctx.shutdown() only requests it; `{ pending: true }`: background work that
-// never settles; `ignoreEof`). AGENT_SYSTEM_LANE_SETTLE_IDLE_MS stays at its 15-minute default (case 2c alone shortens it, to
-// reach the idle check as its event), so a runner that waits for the settle (the pre-change tree) never writes `lane-exit:`
-// inside these windows.
+// never settles; `ignoreEof`). AGENT_SYSTEM_LANE_SETTLE_IDLE_MS stays at its 15-minute default (cases 2c and 2d alone shorten
+// it, to reach the idle check as their event), so a runner that waits for the settle (the pre-change tree) never writes
+// `lane-exit:` inside these windows.
 import { afterAll, describe, expect, test } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { recordRepo } from "../src/decision-log";
+import { applyTrain, interpret } from "../src/input";
 import { doneBody, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, launchRequestedBody, STARTER_EXIT } from "../src/launch";
-import { psAnswer, runPs } from "../src/omp-probe";
+import { isTrain } from "../src/merge-train";
+import { ompPidState, psAnswer, runPs } from "../src/omp-probe";
 import { IDLE_CHECK } from "../src/turn-end";
 import { SURFACE_BY } from "../src/types";
 // A namespace import: a name lane.ts does not export fails only the test that calls it.
@@ -20,8 +22,13 @@ import * as laneScript from "../scripts/lane";
 import { alive, type FakeScript, type FakeStep, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh, until } from "./helpers";
 
 const roots: LaneRoot[] = [];
-/** Stale omps a case leaves alive on purpose: SIGKILLed after the file, whatever the case's outcome. */
-const leftovers: number[] = [];
+/**
+ * Stale omps a case leaves alive on purpose, each with the ps start time its lane-started: recorded: SIGKILLed after the file,
+ * whatever the case's outcome, but only while a fresh probe still shows that process (review r1 finding 1).
+ */
+const leftovers: { pid: number; start: string }[] = [];
+/** The ps gates (`psGate`) the cases made: each opened after the file, so a failed case never leaves a runner held at one. */
+const psGates: string[] = [];
 /** Lanes whose runner a case SIGKILLed: their lane-exit: is written for them after the file, as `lane.ts stop`'s no-runner fallback writes it (by the starter), so settleDrains finds every runner's lane ended. */
 const killedLanes: { r: LaneRoot; wl: string; laneId: string }[] = [];
 /** Short polls and graces; the settle-idle window stays at its default (see the header). */
@@ -31,18 +38,41 @@ const makeRoot = (over: Record<string, string> = {}): LaneRoot => {
 	return r;
 };
 /**
- * PLAN wl-mw0ytmzi89d683 F8: every cleanup failure is reported, never swallowed. A leftover already gone (ESRCH) is the only
- * kill error taken as done; a root whose drains did not settle is kept, its path printed, for the evidence in it; the drain
- * failures and every cleanup failure are thrown together.
+ * PLAN wl-mw0ytmzi89d683 F8: every cleanup failure is reported, never swallowed. A ps gate is opened first. A leftover is
+ * re-probed strictly before its signal (`ompPidState`, the probe production's endStale uses): only `same`, the recorded omp
+ * still running, is SIGKILLed; `gone` and `other` (its pid now names another process) are left alone; an identity ps could
+ * not verify (`failed`, or `unknown` with no start time) is a cleanup failure and is never signalled. ESRCH on the kill
+ * after a `same` is taken as done (it exited between the probe and the signal). A root whose drains did not settle is
+ * kept, its path printed, for the evidence in it; the drain failures and every cleanup failure are thrown together.
  */
 afterAll(async () => {
 	const failures: unknown[] = [];
-	for (const pid of leftovers) {
+	for (const gate of psGates) {
 		try {
-			process.kill(pid, "SIGKILL");
+			writeFileSync(gate, "open\n");
+		} catch (err) {
+			failures.push(new Error(`afterAll: the ps gate ${gate} could not be opened: ${String(err)}`, { cause: err }));
+		}
+	}
+	for (const o of leftovers) {
+		let why = "";
+		const st = ompPidState(o.pid, o.start, runPs, (reason) => {
+			why = reason;
+		});
+		if (st === "gone" || st === "other") continue;
+		if (st !== "same") {
+			failures.push(
+				new Error(
+					`afterAll: leftover omp pid ${o.pid} (recorded start "${o.start}") not signalled: its identity could not be verified (${st}${why ? `: ${why}` : ""}); check it with \`ps -p ${o.pid} -o stat=,lstart=\` and end it by hand if it is that omp`,
+				),
+			);
+			continue;
+		}
+		try {
+			process.kill(o.pid, "SIGKILL");
 		} catch (err) {
 			const code = (err as NodeJS.ErrnoException).code;
-			if (code !== "ESRCH") failures.push(new Error(`afterAll: SIGKILL of leftover omp pid ${pid} failed (${code ?? "no errno"}): ${String(err)}`, { cause: err }));
+			if (code !== "ESRCH") failures.push(new Error(`afterAll: SIGKILL of leftover omp pid ${o.pid} failed (${code ?? "no errno"}): ${String(err)}`, { cause: err }));
 		}
 	}
 	for (const k of killedLanes) {
@@ -132,6 +162,71 @@ const holderChanges = (r: LaneRoot, wl: string) => {
 		l.close();
 	}
 };
+
+/**
+ * Review r1 finding 2 (PLAN wl-mw0ytmzi89d683): the order of the new runner's cleanup and a case's own step is set by an
+ * event, not by the end grace. A ps wrapper put ahead of the real ps on the PATH of the launch it is passed to (the starter
+ * and the runner it starts) passes every call through to the ps the root's PATH finds, except the `at`-th
+ * `ps -p <pid> -o stat=,lstart=` of `pid`: that one writes `waiting` (`waiting()` resolves on it) and is held until the test
+ * writes the gate (`open()`). That call is endStale's probe of the stale omp: probe 1 comes before its SIGTERM, probe 2
+ * after it, and nothing before endStale probes that pid with those fields (the starter skips a self-released lane's pids,
+ * `liveLaneOf`). The launch's ps bound (AGENT_SYSTEM_LANE_PS_TIMEOUT_MS) is raised past the wrapper's own 60 s cap, so a
+ * held probe never times out into an ungated one; past that cap the wrapper exits 2 with a stderr line, a failed probe
+ * that endStale logs and never signals on. Production code has no hook for this: the gate is the ps it already runs.
+ */
+function psGate(r: LaneRoot, pid: number, at: number) {
+	const dir = join(r.root, `ps-gate-${pid}-${at}`);
+	const calls = join(dir, "calls");
+	const waiting = join(dir, "waiting");
+	const gate = join(dir, "open");
+	const real = Bun.which("ps", { PATH: r.env.PATH! });
+	if (real === null) throw new Error(`psGate: no ps on the root's PATH (${r.env.PATH}); the gate has nothing to pass calls to`);
+	for (const p of [dir, real]) if (p.includes("'")) throw new Error(`psGate: ${p} holds a single quote, which the wrapper's quoting cannot carry`);
+	mkdirSync(dir);
+	writeFileSync(
+		join(dir, "ps"),
+		[
+			"#!/bin/sh",
+			"# lane-release-exit.test.ts psGate: hold one endStale probe until the test opens the gate.",
+			`if [ "$#" -eq 4 ] && [ "$1" = "-p" ] && [ "$2" = "${pid}" ] && [ "$3" = "-o" ] && [ "$4" = "stat=,lstart=" ]; then`,
+			`\techo probe >> '${calls}'`,
+			`\tn=$(wc -l < '${calls}' | tr -d ' ')`,
+			`\tif [ "$n" -eq ${at} ]; then`,
+			`\t\techo "$$" > '${waiting}'`,
+			"\t\ti=0",
+			`\t\twhile [ ! -e '${gate}' ]; do`,
+			"\t\t\ti=$((i + 1))",
+			`\t\t\tif [ "$i" -gt 1200 ]; then echo "ps gate: '${gate}' not opened within 60 s (probe $n of pid ${pid}); exiting 2" >&2; exit 2; fi`,
+			"\t\t\tsleep 0.05",
+			"\t\tdone",
+			"\tfi",
+			"fi",
+			`exec '${real}' "$@"`,
+			"",
+		].join("\n"),
+	);
+	chmodSync(join(dir, "ps"), 0o755);
+	psGates.push(gate);
+	return {
+		env: { PATH: `${dir}:${r.env.PATH}`, AGENT_SYSTEM_LANE_PS_TIMEOUT_MS: "90000" },
+		waiting: () => until(`ps probe ${at} of pid ${pid} held at the gate ${gate}`, () => existsSync(waiting)),
+		open: () => writeFileSync(gate, "open\n"),
+	};
+}
+
+/** The one merge train, opened by Jo's `train 101` word on the root's repo, as lane-live-lane's `openTrainOn` opens it. */
+function openTrain(r: LaneRoot): string {
+	const l = ledgerOf(r);
+	try {
+		const cmd = interpret(l, "train 101");
+		if (cmd?.kind !== "train") throw new Error(`\`train 101\` did not interpret as the train word: ${JSON.stringify(cmd)}`);
+		const wl = applyTrain(l, cmd, r.repo).workloadId;
+		expect(isTrain(l, wl)).toBe(true);
+		return wl;
+	} finally {
+		l.close();
+	}
+}
 
 const DONE: FakeStep = { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } };
 const ADD: FakeStep = { tool: "lane_add_slice", args: { task: "probe", doneCondition: "probed", inputs: "README.md", kind: "change-small" } };
@@ -240,6 +335,40 @@ describe("a released lane's omp ends and lane-exit: follows (R1, R3, R8)", () =>
 		expect(promptsOf(r)).toHaveLength(1);
 	}, 60_000);
 
+	// Review r1 finding 3 (PLAN wl-mw0ytmzi89d683 F3, PLAN wl-mvr888nftz0vcl D3): the stop poll's own receipt read. A merge
+	// train is permanent, so a legacy done-because: its held lane wrote straight to the ledger is no receipt there either. The
+	// owned turn writes it and leaves a job pending; the turn ends unsettled and the runner waits. Were the poll's
+	// `terminalNow` to read the receipt without the train flag, every 200 ms tick would re-decide `wait` and restart the
+	// settle wait, so the idle check, the event this case waits for, would never come. After it the train's idle prompt
+	// goes out; that turn is held at a gate, so the ledger stop request ends the lane with nothing else in flight.
+	test("2d (F3): a held merge-train lane with a legacy done-because: and background pending → the stop poll waits to its idle check, then sends the train's idle prompt", async () => {
+		const r = makeRoot({ AGENT_SYSTEM_LANE_SETTLE_IDLE_MS: "1500" });
+		const wl = openTrain(r);
+		const gate = join(r.root, "gate-2d");
+		setScript(r, { steps: [{ awaitFile: gate }], prompts: [[{ ledger: { body: "done-because: every PR is merged" } }, PENDING]] });
+		launch(r, wl);
+		const lane1 = laneIdOf(wl, 1);
+		const started = (await startedOf(r, wl, lane1))!;
+		await until("lane 1's idle check", () => fakeRecords(r).some((x) => x.pid === started.pid && x.command === "get_state" && x.id === IDLE_CHECK));
+		const idlePrompt = await until("lane 1's idle prompt", () => promptsOf(r).filter((x) => x.pid === started.pid)[1]);
+		expect(idlePrompt.message).toContain("this train is permanent");
+		await until("lane 1's idle turn at the gate", () => eventsOf(r, started.pid).includes("awaiting-file"));
+		const snap = laneSnapshot(r, wl);
+		// the legacy receipt stands, written by the lane, and the lane still holds the train: nothing took it as done
+		expect(snap.entries.filter((e) => e.body.startsWith("done-because:")).map((e) => e.created_by)).toEqual([lane1]);
+		expect(snap.workload!.holder).toBe(lane1);
+		expect(laneExit(snap.control, lane1)).toBeNull();
+		expect(snap.deaths).toEqual([]);
+		const l = ledgerOf(r);
+		try {
+			l.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStopRequestBody(lane1, "test-stop", "test") });
+		} finally {
+			l.close();
+		}
+		expect(await exitOf(r, wl, lane1)).toMatchObject({ outcome: "stop" });
+		expect(fakeRecords(r).filter((x) => x.pid === started.pid && x.command === "get_state" && x.id === IDLE_CHECK)).toHaveLength(1);
+	}, 60_000);
+
 	test("3: a receipt only, owned turn, background pending → completed at once: omp ended, the workload released, no idle prompt", async () => {
 		const r = makeRoot();
 		const wl = openWorkload(r);
@@ -289,7 +418,7 @@ async function staleLane(r: LaneRoot) {
 	const runner = launch(r, wl, { AGENT_SYSTEM_LANE_SHUTDOWN_GRACE_MS: "120000" });
 	const lane1 = laneIdOf(wl, 1);
 	const stale = (await startedOf(r, wl, lane1))!;
-	leftovers.push(stale.pid);
+	leftovers.push({ pid: stale.pid, start: stale.start });
 	await until("lane 1's EOF", () => eventsOf(r, stale.pid).includes("eof"));
 	process.kill(runner, "SIGKILL");
 	killedLanes.push({ r, wl, laneId: lane1 });
@@ -309,15 +438,21 @@ const startedAfterGone = (r: LaneRoot, wl: string, laneId: string, stalePid: num
 	}, 60_000);
 
 describe("a self-released lane's stale omp at the next spawn (R5, R7, R15)", () => {
+	// The order is held by the ps gate (`psGate`), not by the 5 s grace: the new runner's first probe of the stale omp, the one
+	// its SIGTERM follows, waits at the gate until the starter has exited and the omp has been read alive.
 	test("6: the starter exits 0 at once with the stale omp still alive; the new runner ends it (SIGTERM, SIGKILL after 5 s) before its own lane-started:", async () => {
 		const r = makeRoot({ AGENT_SYSTEM_LANE_END_GRACE_MS: "5000" });
 		const { wl, stale } = await staleLane(r);
+		const gate = psGate(r, stale.pid, 1);
 		request(r, wl);
 		setScript(r, { steps: [RELEASE] });
-		launch(r, wl);
+		launch(r, wl, gate.env);
 		// read right after the starter exits: the stale omp still runs as recorded, so the starter did not wait on it
 		expect(laneScript.startTime(stale.pid)).toBe(stale.start);
 		expect(gone(stale.pid)).toBe(false);
+		await gate.waiting();
+		expect(eventsOf(r, stale.pid)).not.toContain("sigterm");
+		gate.open();
 		const lane2 = laneIdOf(wl, 2);
 		const s2 = (await startedAfterGone(r, wl, lane2, stale.pid))!;
 		expect(s2.pid).not.toBe(stale.pid);
@@ -336,7 +471,7 @@ describe("a self-released lane's stale omp at the next spawn (R5, R7, R15)", () 
 		const runner1 = launch(r, wl, { AGENT_SYSTEM_LANE_SHUTDOWN_GRACE_MS: "120000" });
 		const lane1 = laneIdOf(wl, 1);
 		const old = (await startedOf(r, wl, lane1))!;
-		leftovers.push(old.pid);
+		leftovers.push({ pid: old.pid, start: old.start });
 		await until("lane 1's EOF", () => eventsOf(r, old.pid).includes("eof"));
 		expect(gone(old.pid)).toBe(false);
 		expect(alive(runner1)).toBe(true);
@@ -357,14 +492,18 @@ describe("a self-released lane's stale omp at the next spawn (R5, R7, R15)", () 
 		expect(eventsOf(r, old.pid)).toContain("sigterm");
 	}, 90_000);
 
+	// The stop lands while the cleanup is mid-way, by the ps gate (`psGate`), not by the 5 s grace: the new runner's second
+	// probe of the stale omp, after its SIGTERM and before any SIGKILL, waits at the gate until the stop is submitted.
 	for (const how of ["signal", "ledger"] as const) {
 		test(`7${how === "signal" ? "a" : "b"}: a stop (${how === "signal" ? "SIGTERM to the new runner" : "a ledger stop request, no lane.ts stop"}) during the cleanup → no omp spawned, lane-exit: outcome stop by lane-runner`, async () => {
 			const r = makeRoot({ AGENT_SYSTEM_LANE_END_GRACE_MS: "5000" });
 			const { wl, stale } = await staleLane(r);
+			const gate = psGate(r, stale.pid, 2);
 			request(r, wl);
 			setScript(r, { steps: [RELEASE] });
-			const runner = launch(r, wl);
+			const runner = launch(r, wl, gate.env);
 			const lane2 = laneIdOf(wl, 2);
+			await gate.waiting();
 			await until("the cleanup's SIGTERM to the stale omp", () => eventsOf(r, stale.pid).includes("sigterm"));
 			expect(gone(stale.pid)).toBe(false);
 			let req: string | null = null;
@@ -374,6 +513,7 @@ describe("a self-released lane's stale omp at the next spawn (R5, R7, R15)", () 
 				req = l.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStopRequestBody(lane2, "test-stop", "test") });
 				l.close();
 			}
+			gate.open();
 			expect(await exitOf(r, wl, lane2)).toMatchObject({ outcome: "stop" });
 			const snap = laneSnapshot(r, wl);
 			expect(snap.control.find((c) => c.prefix === "lane-exit" && c.laneId === lane2)!.createdBy).toBe(LANE_RUNNER_BY);
