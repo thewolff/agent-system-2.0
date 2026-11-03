@@ -14,6 +14,7 @@ import { resolve } from "node:path";
 import { parseHandSpawn, settledTokens } from "../../classifier/src/lab";
 import { type EntryRow, LANE_RUNNER_BY, type Ledger, type RoutingRow, type SliceRow } from "../../ledger/src/index";
 import { type ControlEntry } from "./launch";
+import { TRAIN_DONE } from "./merge-train";
 import { laneDeaths } from "./signals";
 import { ownsRequest, type RunRecord, runLive } from "./test-run";
 import { LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, ORCHESTRATOR_RECIPIENT } from "./types";
@@ -89,6 +90,11 @@ export interface TurnEndInput {
 	handedOff: boolean;
 	/** The open-slice count this lane's `released-open:` marker names, or null when it wrote none (D4). */
 	releasedOpen: number | null;
+	/**
+	 * This lane wrote `released-idle:` (PLAN wl-mvr888nftz0vcl D13): a merge train lane released with nothing runnable, an
+	 * intended release, never a death. Absent means no such marker.
+	 */
+	releasedIdle?: boolean;
 	/** A holder's `done-because:` stands. */
 	receipt: boolean;
 	slices: SliceCounts;
@@ -155,7 +161,7 @@ export function turnEnd(i: TurnEndInput): TurnEnd {
 		return { decision: "error", parkError: err instanceof Error ? err.message : String(err) };
 	}
 	if (park.parked) return decided(park.open > 0 ? "parked" : "resume-pending");
-	if (!i.held) return decided(i.releasedOpen !== null ? "open-work" : "completed");
+	if (!i.held) return decided(i.releasedIdle === true ? "released" : i.releasedOpen !== null ? "open-work" : "completed");
 	if (i.receipt) return decided("completed");
 	if (i.slices.open + i.slices.paused === 0 && i.slices.done > 0) return decided("completed");
 	// D6: the last step for an idle session omp still reports unsettled.
@@ -173,8 +179,12 @@ export function continueCounter(t: TurnEnd): "continues" | "idle" | null {
 	return kind === "dead-run" ? null : kind === "idle" ? "idle" : "continues";
 }
 
-/** The continue prompt for the decision `continue` about hands, live test runs or open work, the `n`-th of `limit` (D2 step 6, D6 step 0; PLAN wl-mv5i3lulwwbbi8 D8). */
-export function continuePrompt(workloadId: string, i: Pick<TurnEndInput, "unsettledHands" | "slices"> & { liveTestRuns?: readonly string[] }, n: number, limit: number): string {
+/**
+ * The continue prompt for the decision `continue` about hands, live test runs or open work, the `n`-th of `limit` (D2 step 6, D6
+ * step 0; PLAN wl-mv5i3lulwwbbi8 D8). On the merge train (`train`, PLAN wl-mvr888nftz0vcl D11) the open-work texts carry the
+ * permanent done line and never ask for done-because.
+ */
+export function continuePrompt(workloadId: string, i: Pick<TurnEndInput, "unsettledHands" | "slices"> & { liveTestRuns?: readonly string[] }, n: number, limit: number, train = false): string {
 	const count = `(continue ${n} of ${limit})`;
 	if (i.unsettledHands.length > 0) {
 		return `Hand(s) ${i.unsettledHands.map((h) => `${h.token} (job ${h.job})`).join(", ")} you spawned have no result on the ledger yet. Keep your turn alive until each result is auto-delivered. If a job no longer exists, say so with lane_message. ${count}`;
@@ -183,16 +193,27 @@ export function continuePrompt(workloadId: string, i: Pick<TurnEndInput, "unsett
 	if (runs.length > 0) {
 		return `Test run(s) ${runs.join(", ")} on ${workloadId} have no result on the ledger yet; each result arrives as an aside. While you wait, \`sleep 60\` in bash, or end your turn: the runner holds this lane while a run is live. ${count}`;
 	}
+	if (train) {
+		const open = i.slices.open + i.slices.paused === 0 ? "with no PR slice open" : `with work open: ${i.slices.open} open slice(s), ${i.slices.paused} paused`;
+		return `Your turn ended on merge train ${workloadId} ${open} and no open question from you. done: ${TRAIN_DONE} Continue with the brief's step 0. If only Jo can decide, raise it with lane_raise_question. When nothing on the train is runnable, release with no done-because: this train is permanent. ${count}`;
+	}
 	if (i.slices.open + i.slices.paused === 0) {
 		return `Your turn ended on ${workloadId} with no slice cut, no open question from you and no done-because receipt. Continue: add the slices (on a plan-first workload, the judge plan slice first). ${count}`;
 	}
 	return `Your turn ended with work open on ${workloadId}: ${i.slices.open} open slice(s), ${i.slices.paused} paused, no open question from you, no done-because receipt. Continue. If only Jo can decide, raise it with lane_raise_question. When the done line is met, record done-because and lane_release. ${count}`;
 }
 
-/** The prompt for a `continue` about an idle session (PLAN wl-mv5i3lulwwbbi8 D6), the `n`-th of `limit` in this idle episode; the wait in whole minutes, or seconds under a minute (the runner's test knob). */
-export function idlePrompt(workloadId: string, idleMs: number, n: number, limit: number): string {
+/**
+ * The prompt for a `continue` about an idle session (PLAN wl-mv5i3lulwwbbi8 D6), the `n`-th of `limit` in this idle episode; the
+ * wait in whole minutes, or seconds under a minute (the runner's test knob). On the merge train (`train`, PLAN wl-mvr888nftz0vcl
+ * D11) it carries the permanent done line and never asks for done-because.
+ */
+export function idlePrompt(workloadId: string, idleMs: number, n: number, limit: number, train = false): string {
 	const wait = idleMs >= 60_000 ? `${Math.round(idleMs / 60_000)} min` : `${Math.round(idleMs / 1000)} s`;
-	return `Your session on ${workloadId} has background work pending and no activity for ${wait}: if you need its result, \`wait\` for it; otherwise continue your slices, or release (record done-because first when the done line is met, then lane_release). (idle prompt ${n} of ${limit})`;
+	const release = train
+		? `release with no done-because when nothing on the train is runnable (lane_release): this train is permanent. done: ${TRAIN_DONE}`
+		: "release (record done-because first when the done line is met, then lane_release).";
+	return `Your session on ${workloadId} has background work pending and no activity for ${wait}: if you need its result, \`wait\` for it; otherwise continue your slices, or ${release} (idle prompt ${n} of ${limit})`;
 }
 
 /** The prompt for a `continue` about a dead test run (PLAN wl-mv5i3lulwwbbi8 D8): once per run, counted nowhere. */
@@ -366,12 +387,14 @@ export function turnEndDeathBody(laneId: string, t: TurnEnd, i: Pick<TurnEndInpu
 /**
  * The outcome `finish()` records when omp exited before the runner decided one, with the death it enqueues whatever
  * the holder. A release carrying this lane's `released-open:` marker is `open-work` here too (D4): a woken turn's
- * `lane_release` can shut omp down before its `session_settled` reaches the turn-end decision.
+ * `lane_release` can shut omp down before its `session_settled` reaches the turn-end decision. A merge train lane's
+ * `released-idle:` (PLAN wl-mvr888nftz0vcl D13) is `released` with no death: its quiet idle release.
  * `never-ready` and `died` keep `finish()`'s own death, which needs the lane to still hold the workload.
  */
-export function exitOutcome(laneId: string, i: { ready: boolean; held: boolean; releasedOpen: number | null }): { outcome: "never-ready" | "died" | "open-work" | "released"; death: string | null } {
+export function exitOutcome(laneId: string, i: { ready: boolean; held: boolean; releasedOpen: number | null; releasedIdle?: boolean }): { outcome: "never-ready" | "died" | "open-work" | "released"; death: string | null } {
 	if (!i.ready) return { outcome: "never-ready", death: null };
 	if (i.held) return { outcome: "died", death: null };
+	if (i.releasedIdle === true) return { outcome: "released", death: null };
 	if (i.releasedOpen !== null) return { outcome: "open-work", death: releasedOpenDeathBody(laneId, i.releasedOpen) };
 	return { outcome: "released", death: null };
 }
@@ -422,6 +445,15 @@ export function releasedOpen(control: readonly ControlEntry[], laneId: string): 
 		if (m) return Number(m[1]);
 	}
 	return null;
+}
+
+/** `released-idle: <laneId> open <k>` (PLAN wl-mvr888nftz0vcl D13), written by lane_release on a merge train in place of `released-open:`. */
+export function releasedIdleBody(laneId: string, open: number): string {
+	return `released-idle: ${laneId} open ${open}`;
+}
+/** Whether `laneId` wrote a valid `released-idle:` (its own, as a holder; `controlEntries` checks the writer). */
+export function releasedIdle(control: readonly ControlEntry[], laneId: string): boolean {
+	return control.some((c) => c.prefix === "released-idle" && c.laneId === laneId && /^open\s+\d+$/.test(c.rest));
 }
 
 /**

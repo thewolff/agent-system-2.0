@@ -117,8 +117,8 @@ import { openPairOffer } from "./input";
 import { localMinute, openDowns, POPUP_ATTEMPT_LIMIT, popupAttempts } from "./doctor-entries";
 import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, landFirstOffPending, laneExit, mainRetries, queuedOf, sameRepo } from "./launch";
 import {
-	landFirstRepos, landFirstRows, type LandFirstRow, latestTrainReconciled, mainRedNotices, protectionEpisodes, RECONCILED_STALE_MS, stopEpisode, type TaskWindow, TRAIN_ALERT_LADDER,
-	trainAlertLevel, trainMembers, trainTaskWindows,
+	boardRefusals, landFirstRepos, landFirstRows, type LandFirstRow, latestTrainReconciled, mainRedNotices, protectionEpisodes, RECONCILED_STALE_MS, stopEpisode, type TaskWindow,
+	theTrain, TRAIN_ALERT_LADDER, trainAlertLevel, trainCheckout, trainMembers, trainTaskWindows,
 } from "./merge-train";
 import { attemptBlock, mainResults, mainVerdicts, parseRunnerPreflight } from "./main-state";
 import { questionSubject } from "./orchestrator-question";
@@ -689,6 +689,23 @@ function securityRedLines(ledger: Ledger): ErrorLine[] {
 	});
 }
 
+/**
+ * PLAN wl-mvr888nftz0vcl D2: each standing `train-board-refused:` (`boardRefusals`: the tick could not board a ready PR because
+ * the one merge train serves another repository) as a train line on the PR's own workload, naming the PR, its repository and
+ * the train with the train's repository, read now. It clears itself when that workload's PR ends or a train boards it.
+ */
+function boardRefusalLines(ledger: Ledger): ErrorLine[] {
+	const train = theTrain(ledger);
+	const serves = train === null ? "no merge train is open now" : `merge train ${train} serves ${trainCheckout(ledger, train) ?? "no repository (it has no repo: entry)"}`;
+	return boardRefusals(ledger).map((r) => {
+		const next = `merge #${r.pr} of ${r.repo} yourself: the one merge train takes PRs of its own repository only`;
+		return {
+			kind: "train" as const, workloadId: r.workloadId, rowId: r.entryId, next,
+			line: `merge train: #${r.pr} of ${r.repo} (${r.workloadId}) was not boarded: ${serves} — ${next}`,
+		};
+	});
+}
+
 /** The D4 NOW lines: each held, trusted `quota-move:` message of a recorded move (the writer `recordQuotaMove` used), in the order written, whatever the workload's state. */
 function quotaMoveLines(ledger: Ledger): ErrorLine[] {
 	return quotaMoves(ledger).flatMap((move) => {
@@ -873,6 +890,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			notice.push({ kind: "notice", workloadId: wl, rowId: m.id, messageIds: [m.id], next: "nothing to answer", line: `notice on ${label} (nothing to answer): ${text}` });
 		}
 	}
+	train.push(...boardRefusalLines(ledger));
 	const all = [...reserved, ...held, ...artifact, ...securityRed, ...quotaMove, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch, ...report, ...notice];
 	const channel = channelInForce(ledger);
 	if (!channel) return all;

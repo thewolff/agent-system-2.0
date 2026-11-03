@@ -175,6 +175,11 @@ The one-liner ends with the workload's ceiling (`ceiling $50 / 6h`). Lowering it
 (`orchestrator_lower_ceiling`); raising it is Jo's (`ceiling <usd> [<hours>] [wl-…]`, or `extend wl-…`
 for one block) and relaunches a lane the ceiling stopped. 80 % sends a notice; 100 % stops an
 autonomous lane with one (SPEC-2.0.md § B11). Nothing auto-extends; a by-hand lane never stops.
+The merge train is the exception: one permanent workload with no ceiling and no wall, $150 per
+Pacific day instead. Its one-liner ends `budget $<limit>/PDT day · no wall` (`· paused until <iso>`
+while paused); `extend`, `ceiling` and `orchestrator_lower_ceiling` are refused on it, and at the
+day's limit Jo answers its budget question with `raise <usd>` or `wait` (USER-GUIDE.md § 3, The
+merge train).
 
 A notice (`notice on <workload> (nothing to answer): …`: ceiling 80 % or stop, or a normal plan
 auto-started on a cross-lab pass) is unnumbered and shows until it reaches you once; pass it on,
