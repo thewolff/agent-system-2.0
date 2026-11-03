@@ -45,7 +45,7 @@ import { checkoutOwnerRepo, everyTrain, landFirstRows, mainRedNotices, stopEpiso
 import { alertSpawnLog, BUN, type DetachedSpawn, spawnDetached, unboundEnv } from "../src/notify";
 import { ompPidState, runPs } from "../src/omp-probe";
 import { alertRows, commentMarker, issueMarker, quotaMoves } from "../src/quota-move-alert";
-import { type QuotaWatchResult, quotaWatchDeps, runQuotaWatch } from "../src/quota-watch";
+import { POLL_FAILED_KEY, type QuotaWatchResult, quotaWatchDeps, runQuotaWatch } from "../src/quota-watch";
 import { type LockRefusal, type RunnerLock, selfIdentity, takeRunnerLock } from "../src/runner-probe";
 import { EXTEND_SOURCE, parseCeiling } from "../src/ceiling";
 import { HALT_WORD, isRunnerCeilingQuestion } from "../src/input";
@@ -121,7 +121,7 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 	// else (a later write failed) a problem line beside subjects that still hold.
 	const quota = d.quota(now);
 	for (const l of quota.log) say(l);
-	if (quota.error !== null && !quota.unavailable) problems.push(quota.error);
+	if (quota.error !== null && quota.unavailable === false) problems.push(quota.error);
 
 	// 2. The sources.
 	const control0 = standing();
@@ -147,9 +147,12 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 	const src = alertSources(ledger, seams);
 	// A source that failed is unknown state, not a clear (review r1 #4, r2 N1): every open episode of its kind (or the one key
 	// a problem names) is held unchanged this pass, and the failure is its `source:<kind>` key's error row, on the needs-you
-	// surface until the source evaluates cleanly again. The quota watch's unavailable pass is one more such problem.
+	// surface until the source evaluates cleanly again. The quota watch's unavailable pass is one more such problem. When only
+	// its usage read failed, the saved state it read still evaluated the outage alert (POLL_FAILED_KEY): that key is evaluated,
+	// not held, so it climbs the ladder and acks during the outage it reports (review r3 N8).
 	const quotaProblem = quota.error ?? "quota watch: unavailable with no error named (a defect in surface/src/quota-watch.ts runQuotaWatch)";
-	const sourceProblems: SourceProblem[] = quota.unavailable ? [{ source: "quota", error: quotaProblem }, ...src.problems] : src.problems;
+	const sourceProblems: SourceProblem[] = quota.unavailable !== false ? [{ source: "quota", error: quotaProblem }, ...src.problems] : src.problems;
+	const evaluatedKey = quota.unavailable === "usage" ? POLL_FAILED_KEY : null;
 	const sourceErrors = new Map<AlertKind, string[]>();
 	const failedKinds = new Set<AlertKind>();
 	const failedKeys = new Set<string>();
@@ -369,7 +372,7 @@ export function alertPass(d: AlertPassDeps): AlertPassResult {
 		const ep = openEpisode(rec);
 		if (ep === null) continue;
 		const kind = ep.kind ?? alertKindOfKey(key);
-		if (!failedKeys.has(key) && !(kind !== null && failedKinds.has(kind))) continue;
+		if (!failedKeys.has(key) && !(kind !== null && failedKinds.has(kind) && key !== evaluatedKey)) continue;
 		stopped.add(key);
 		say(`${key}: held unchanged: its ${kind ?? "unknown"} source could not be read this pass`);
 	}

@@ -184,12 +184,14 @@ describe("failed usage reads", () => {
 		const fail = (i: number) => new Error(`omp usage --json exited 1: boom ${i}`);
 		const r1 = w.pass(T0, fail(1));
 		expect(r1.error).toBe("quota watch: omp usage read failed (1 in a row): omp usage --json exited 1: boom 1");
-		// A failed read is not an evaluation: the alert pass holds the quota alerts it has (review r2 N1).
-		expect(r1.unavailable).toBe(true);
+		// A failed usage read is not an evaluation of the usage rules: the alert pass holds the quota alerts it has (review r2
+		// N1) but the outage alert, which the saved state it read still evaluates (review r3 N8).
+		expect(r1.unavailable).toBe("usage");
 		expect(r1.subjects).toEqual([]);
 		expect(w.pass(T0 + 5 * MIN, fail(2)).subjects).toEqual([]);
 		const r3 = w.pass(T0 + 10 * MIN, fail(3));
 		expect(r3.error).toBe("quota watch: omp usage read failed (3 in a row): omp usage --json exited 1: boom 3");
+		expect(r3.unavailable).toBe("usage");
 		expect(r3.subjects).toEqual([
 			{
 				key: POLL_FAILED_KEY,
@@ -228,7 +230,7 @@ describe("failed usage reads", () => {
 		const r = w.pass(T0, usage({ "anthropic/7d": 0.99 }));
 		expect(r.error).toStartWith(`quota watch: ${join(dir, "state.json")} is not JSON`);
 		expect(r.subjects).toEqual([]);
-		expect(r.unavailable).toBe(true);
+		expect(r.unavailable).toBe("state");
 		expect(w.calls()).toBe(0);
 		expect(readFileSync(join(dir, "state.json"), "utf8")).toBe("{ half");
 	});
@@ -289,7 +291,7 @@ describe("Plumb's watcher installed", () => {
 		const r = w.pass(T0, usage({ "anthropic/7d": 0.99 }));
 		expect(r.subjects).toEqual([]);
 		expect(r.error).toContain("EACCES: permission denied");
-		expect(r.unavailable).toBe(true);
+		expect(r.unavailable).toBe("state");
 		expect(w.calls()).toBe(0);
 	});
 
@@ -330,6 +332,6 @@ describe("subject lifetime and poll cadence", () => {
 		const held = w.pass(T0 + (MIN_POLL_GAP_S + 30) * 1000);
 		expect(w.calls()).toBe(2);
 		expect(held.error).toBe("quota watch: omp usage read failed (1 in a row): omp usage --json timed out after 120 s and was killed (the attempt 30 s ago)");
-		expect(held.unavailable).toBe(true);
+		expect(held.unavailable).toBe("usage");
 	});
 });

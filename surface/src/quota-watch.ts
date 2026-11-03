@@ -81,12 +81,15 @@ export interface QuotaWatchResult {
 	/** `quota watch: <what broke>` when this pass's read or write failed, for the needs-you line; else null. */
 	error: string | null;
 	/**
-	 * True when `subjects` is not this pass's evaluation of the quota: the plist check, the saved state's read or decode,
-	 * or the usage read failed (now, or in the attempt a pass under the poll gap repeats). The alert pass then holds every
-	 * open quota episode unchanged, as for any source that could not be read (review r2 N1). False for a pass that
-	 * evaluated, even when it found nothing or only a later write failed.
+	 * Why `subjects` is not wholly this pass's evaluation of the quota; false for a pass that evaluated, even when it found
+	 * nothing or only a later write failed.
+	 * - "state": the plist check or the saved state's read or decode failed, so no quota state is known. The alert pass holds
+	 *   every open quota episode unchanged, as for any source that could not be read (review r2 N1).
+	 * - "usage": the saved state was read but the usage read failed (now, or in the attempt a pass under the poll gap
+	 *   repeats), so the usage rules were not evaluated. The alert pass holds every open quota episode but POLL_FAILED_KEY's:
+	 *   that subject is the read state's evaluation of the failing reads, so it climbs the ladder and acks (review r3 N8).
 	 */
-	unavailable: boolean;
+	unavailable: false | "state" | "usage";
 }
 
 /** One poll line's limit, field for field as watch.py writes it. */
@@ -320,7 +323,7 @@ export function runQuotaWatch(deps: QuotaWatchDeps): QuotaWatchResult {
 		installed = deps.plistInstalled();
 	} catch (e) {
 		const error = `quota watch: cannot tell whether Plumb's watcher (${QUOTA_WATCH_PLIST_LABEL}.plist) is installed, so no poll this pass: ${message(e)}`;
-		return { subjects: [], log: [error], error, unavailable: true };
+		return { subjects: [], log: [error], error, unavailable: "state" };
 	}
 	if (installed) {
 		log.push(`quota watch: Plumb's watcher is still installed (~/Library/LaunchAgents/${QUOTA_WATCH_PLIST_LABEL}.plist); it polls, so this step raises nothing`);
@@ -345,13 +348,13 @@ export function runQuotaWatch(deps: QuotaWatchDeps): QuotaWatchResult {
 		lastError = typeof le === "string" ? le : null;
 	} catch (e) {
 		const error = `quota watch: ${message(e)}`;
-		return { subjects: [], log: [...log, error], error, unavailable: true };
+		return { subjects: [], log: [...log, error], error, unavailable: "state" };
 	}
 
 	const sinceAttempt = nowS - lastAttempt;
 	if (sinceAttempt >= 0 && sinceAttempt < MIN_POLL_GAP_S) {
 		log.push(`quota watch: last poll attempt ${Math.round(sinceAttempt)} s ago (under ${MIN_POLL_GAP_S} s); no poll this pass`);
-		return { subjects: activeSubjects(alerts, nowS), log, error: lastError ? `quota watch: ${lastError} (the attempt ${Math.round(sinceAttempt)} s ago)` : null, unavailable: lastError !== null };
+		return { subjects: activeSubjects(alerts, nowS), log, error: lastError ? `quota watch: ${lastError} (the attempt ${Math.round(sinceAttempt)} s ago)` : null, unavailable: lastError === null ? false : "usage" };
 	}
 	state[LAST_ATTEMPT] = nowS;
 
@@ -412,5 +415,5 @@ export function runQuotaWatch(deps: QuotaWatchDeps): QuotaWatchResult {
 	}
 	const error = errors.length > 0 ? `quota watch: ${errors.join("; ")}` : null;
 	if (error) log.push(error);
-	return { subjects: activeSubjects(alerts, nowS), log, error, unavailable: snap === null };
+	return { subjects: activeSubjects(alerts, nowS), log, error, unavailable: snap === null ? "usage" : false };
 }

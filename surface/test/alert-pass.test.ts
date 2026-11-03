@@ -13,7 +13,7 @@ import { laneDiedShutdownBody } from "../src/signals";
 import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { alertPass, lockedAlertPass } from "../scripts/alert-tick";
 import { popupRegistryPath, registryLine } from "../scripts/alert-popup";
-import { runQuotaWatch } from "../src/quota-watch";
+import { POLL_FAILED_KEY, runQuotaWatch } from "../src/quota-watch";
 import { takeRunnerLock } from "../src/runner-probe";
 import { type AlertWorld, ceilingStopped, ISSUE, world } from "./alert-world";
 import { tmp } from "./helpers";
@@ -323,6 +323,76 @@ describe("an ack in a crash window and an unreadable source (R13, D2)", () => {
 		expect(w.g.issues).toHaveLength(1);
 		expect(w.g.issues[0]!.state).toBe("OPEN");
 		expect(sourceLines()).toEqual([]);
+	});
+
+	describe("omp usage reads that keep failing: the outage alert climbs the ladder and acks while the reader stays down (review r3 N8)", () => {
+		const LEVEL_95 = "quota:anthropic/7d:level-95";
+		/**
+		 * One good poll at 96% (the level-95 alert opens), then omp usage throws on every read, a pass every 5 min, until the
+		 * third failed read fires the outage alert: its issue is the world's second.
+		 */
+		const outage = () => {
+			const w = world();
+			const dir = tmp("quota-outage");
+			let down = false;
+			const usage = JSON.stringify({ capacity: { anthropic: [{ window: "7d", accounts: 1, usedAccounts: 0.96 }] }, reports: [] });
+			w.deps.quota = (now) => runQuotaWatch({ dir, now: Date.parse(now), plistInstalled: () => false, readUsage: () => {
+				if (down) throw new Error("omp usage: provider offline");
+				return usage;
+			} });
+			alertPass(w.deps);
+			down = true;
+			for (let i = 0; i < 3; i++) {
+				w.c.plusHours(5 / 60);
+				alertPass(w.deps);
+			}
+			const levels = (key: string) => [...(openEpisode(alertRecords(controlEntries(w.ledger.entries(STANDING_WORKLOAD_ID))).get(key))?.sent.keys() ?? [])].sort();
+			const acked = () => w.rows().filter((r) => r.startsWith(`alert: ${POLL_FAILED_KEY} acked `));
+			const held = (key: string) => w.log.filter((l) => l === `alert pass: ${key}: held unchanged: its quota source could not be read this pass`);
+			expect(levels(POLL_FAILED_KEY)).toEqual([1, 2]);
+			expect(w.g.issues.map((i) => i.body.includes(POLL_FAILED_KEY))).toEqual([false, true]);
+			return { w, levels, acked, held };
+		};
+
+		test("8 h on with usage still failing it reaches level 3 (the critical label) while the level-95 alert, unevaluated, stays held", () => {
+			const { w, levels, held } = outage();
+			w.c.plusHours(8.1);
+			const r = alertPass(w.deps);
+			expect(levels(POLL_FAILED_KEY)).toEqual([1, 2, 3]);
+			expect(w.g.issues[1]!.labels).toContain("critical");
+			expect(held(POLL_FAILED_KEY)).toEqual([]);
+			// The usage rules were not evaluated: the level-95 alert is held at the levels it had, and the read failure is the
+			// quota source's problem and its `source:quota` error row, as for any source that could not be read.
+			expect(levels(LEVEL_95)).toEqual([1, 2]);
+			expect(held(LEVEL_95).length).toBeGreaterThan(0);
+			expect(r.problems).toEqual([expect.stringContaining("quota source: quota watch: omp usage read failed (4 in a row): omp usage: provider offline")]);
+			expect(errorLines(w.ledger).some((l) => l.kind === "alert" && l.line.includes("omp usage read failed (4 in a row)"))).toBe(true);
+		});
+
+		test("Jo closing its issue writes `acked` while usage still fails, and nothing is sent after it", () => {
+			const { w, acked } = outage();
+			w.g.issues[1]!.state = "CLOSED";
+			w.c.plusHours(5 / 60);
+			alertPass(w.deps);
+			expect(acked()).toHaveLength(1);
+			const comments = w.g.issues[1]!.comments.length;
+			w.c.plusHours(9);
+			alertPass(w.deps);
+			expect(acked()).toHaveLength(1);
+			expect(w.g.issues[1]!.comments).toHaveLength(comments);
+		});
+
+		test("Jo's `ack quota:omp-usage:poll-failed` writes `acked` and closes its issue while usage still fails", () => {
+			const { w, acked } = outage();
+			w.c.plusHours(5 / 60);
+			const cmd = interpret(w.ledger, `ack ${POLL_FAILED_KEY}`);
+			if (cmd === null) throw new Error(`interpret refused "ack ${POLL_FAILED_KEY}"`);
+			apply(w.ledger, cmd);
+			alertPass(w.deps);
+			expect(acked()).toHaveLength(1);
+			expect(w.g.issues[1]!.state).toBe("CLOSED");
+			expect(w.g.issues[0]!.state).toBe("OPEN");
+		});
 	});
 });
 
