@@ -2,7 +2,7 @@
 title: Cheaper routing, phase 2 (as2 routing report, judge reviews on standard, Opus at medium, Haiku 5.5 threshold)
 status: building
 workload: wl-mv71x5rwdu7eo0
-pr: none
+pr: 444
 ---
 Phase 2 of Jo's cheaper-routing workload (in-mv71wv0tc0xo1s). Plan: `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mv71x5rwdu7eo0/PLAN-p2-rev4.md` (rev 3 approved by Jo, q-mv92mqghg2ax34). Phase 1 was `migration/items/headroom-guard.md`.
 
