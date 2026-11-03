@@ -20,6 +20,7 @@ import {
 	NETWORK_ENV_PREFIX,
 	READ_ONLY_UNFENCED_REASON,
 	registerFence,
+	sandboxExecPath,
 	worktreeFence,
 } from "../src/fence";
 import { registerPairCalls, PAIR_RUN_CONFINED_REASON } from "../src/pair-call";
@@ -78,6 +79,9 @@ const ctxOf = (cwd: string, o: { hand?: boolean; artifacts?: Record<string, stri
 /** Probe once: can sandbox-exec apply a profile here (not inside another sandbox)? */
 const SANDBOX = spawnSync("sandbox-exec", ["-p", "(version 1)(allow default)", "/usr/bin/true"]).status === 0;
 if (!SANDBOX) console.warn("routine-gate.test.ts: sandbox-exec cannot apply a profile here (nested sandbox?); the behaviour-under-sandbox-exec tests are skipped");
+/** The fence's own load probe (fence.ts sandboxExecPath): without sandbox-exec on PATH (Linux) it fails closed and writes no wrapper. */
+const SANDBOX_EXEC = sandboxExecPath(process.env) !== null;
+if (!SANDBOX_EXEC) console.warn("routine-gate.test.ts: sandbox-exec is not on PATH; the tests asserting the fence's wrapper text are skipped");
 
 /** A lane bound to a fresh workload with one open slice, its own scratch root, and the alarm file beside its ledger. */
 function lane() {
@@ -266,7 +270,7 @@ describe("R7: every failure before the commit falls back to today's refusal and 
 });
 
 describe("R5: read-only runs with no file writes and network only for gh; scratch runs confined; with the fence off nothing auto-applies", () => {
-	test("the fence wraps an auto-applied gh read under the read-only network profile, the network env in front, stderr untouched", async () => {
+	test.skipIf(!SANDBOX_EXEC)("the fence wraps an auto-applied gh read under the read-only network profile, the network env in front, stderr untouched", async () => {
 		const l = lane();
 		const c = call(READ);
 		const r = await rows(l, { fence: ON }).emit("tool_call", c, ctxOf(l.home));
@@ -280,7 +284,7 @@ describe("R5: read-only runs with no file writes and network only for gh; scratc
 		expect(wrapped.endsWith(`/bin/bash -c '${READ}'`)).toBe(true);
 	});
 
-	test("an auto-applied scratch rm runs under the confined profile", async () => {
+	test.skipIf(!SANDBOX_EXEC)("an auto-applied scratch rm runs under the confined profile", async () => {
 		const l = lane();
 		const r = await rows(l, { fence: ON }).emit("tool_call", call(SCRATCH), ctxOf(l.home));
 		const wrapped = String(r?.input?.command);
@@ -561,7 +565,7 @@ describe("R33: the worktree fence", () => {
 		expect(() => worktreeFence(wt, l.wl, false)).toThrow("not this worktree's");
 	});
 
-	test("R32: an rm in the own worktree auto-applies as rule worktree and the fence wraps it under the worktree profile", async () => {
+	test.skipIf(!SANDBOX_EXEC)("R32: an rm in the own worktree auto-applies as rule worktree and the fence wraps it under the worktree profile", async () => {
 		const l = lane();
 		const { wt } = worktreeOf(l);
 		mkdirSync(join(wt, "build"));
