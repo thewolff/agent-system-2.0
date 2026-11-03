@@ -2562,9 +2562,10 @@ describe("the runs lock under test (Guard A, MIGRATION.md item 114)", () => {
 
 // A subprocess can be gone while its inherited stdout is still open in a descendant.
 // The helper holds the inherited stdout until the test releases it; no signal or live database is used by this reproduction.
+// Its root goes on `roots` (afterAll's deletion) only once the case and the release both passed: a failure keeps holder.stderr and
+// holder.status and names the root in its error, and a case abandoned at the test timeout never reaches the push, so it keeps them too.
 test("command completion does not wait for an exited child's inherited pipes", async () => {
 	const root = realpathSync(tmp("runner-pipe"));
-	roots.push(root);
 	const helper = join(root, "holder.ts");
 	const release = join(root, "release");
 	const pidFile = join(root, "holder.pid");
@@ -2623,13 +2624,20 @@ test("command completion does not wait for an exited child's inherited pipes", a
 		failure = { error };
 	}
 	// The release runs whatever the case's outcome; its failure never hides the case's own.
+	let released: { error: unknown } | null = null;
 	try {
 		await releaseHolder();
 	} catch (error) {
-		if (failure) throw new AggregateError([failure.error, error], `the case failed (${messageOf(failure.error)}), and releasing its holder failed too: ${messageOf(error)}`);
-		throw error;
+		released = { error };
 	}
-	if (failure) throw failure.error;
+	if (!failure && !released) {
+		roots.push(root);
+		return;
+	}
+	const kept = `fixture evidence kept at ${root}`;
+	if (failure && released) throw new AggregateError([failure.error, released.error], `the case failed (${messageOf(failure.error)}), and releasing its holder failed too: ${messageOf(released.error)}; ${kept}`);
+	const error = (failure ?? released)!.error;
+	throw new Error(`${messageOf(error)}; ${kept}`, { cause: error });
 });
 
 for (const point of ["head-recheck", "result"]) {
@@ -4438,10 +4446,13 @@ exit 125`);
 
 	// Review r1 finding 2: the post-stuck sweep's ownership checkpoint used to wait out publishIfOwner's busyLoop (12 busy_timeouts,
 	// about 60 s at the production 5 s) before the shared sweep deadline was even read.
+	// The hold starts at the checkpoint's own hook, after the stuck exit: `halt` has set runs.db's busy_timeout to 0 by then. A hold
+	// taken while the part still ran met the 500 ms heartbeat's synchronous UPDATE at the 5 s busy_timeout, which blocks the runner's
+	// thread until the busy wait ends, so when the exit was logged depended on whether a heartbeat fell inside the hold.
 	test("runs.db held from the stuck part's end through its sweep's ownership checkpoint: the checkpoint gives up once the runner's clock passes the sweep deadline, not after a synchronous busy wait, and the lock is released", async () => {
 		const w = world({ stuckStop: "enforce" });
 		const { wl, slice } = workload(w);
-		standIn(w, `while [ ! -f "$here/held" ]; do sleep 0.05; done
+		standIn(w, `while [ ! -f "$here/armed" ]; do sleep 0.05; done
 stp 4242 4243
 exit 125`);
 		const runId = request(w, wl, slice, PR.green, fx.head.green);
@@ -4457,10 +4468,23 @@ exit 125`);
 		let holding = false;
 		try {
 			await until("the stand-in started", () => existsSync(join(w.root, "standin.pid")), 60_000);
-			db.exec("BEGIN IMMEDIATE");
+			// The publish sweep's checkpoint is behind the run now: the next `phase-sweep` is the stuck part's bounded sweep's.
+			arm(w, runId, "phase-sweep");
+			writeFileSync(join(w.root, "armed"), "");
+			await reached(w, runId, "phase-sweep");
+			expect(runnerLog(w, runId)).toMatch(/ full tr-[a-z0-9]+ → exit 125$/m);
+			// BEGIN IMMEDIATE fails at once (busy_timeout 0) while the runner's nonblocking heartbeat is mid-UPDATE; it is retried until held.
+			await until("the test holds runs.db", () => {
+				try {
+					db.exec("BEGIN IMMEDIATE");
+					return true;
+				} catch (e) {
+					if (!/database is locked/.test((e as Error).message)) throw e;
+					return false;
+				}
+			});
 			holding = true;
-			writeFileSync(join(w.root, "held"), "");
-			await until("the runner saw the stuck exit", () => / full tr-[a-z0-9]+ → exit 125$/m.test(runnerLog(w, runId)), 60_000);
+			go(w, runId, "phase-sweep");
 			await until("the checkpoint retrying the held runs.db", () => marks(w, runId, "checkpoint-busy").length > 0);
 			// A checkpoint in a synchronous busy wait (12 × the 5 s busy_timeout) would not read the stepped deadline before this
 			// wait's 30 s failure bound; the nonblocking one gives up at its next attempt.
@@ -4481,7 +4505,8 @@ exit 125`);
 			expect(lockRow(db)).toBeNull();
 		} finally {
 			if (holding) db.exec("ROLLBACK");
-			writeFileSync(join(w.root, "held"), "");
+			writeFileSync(join(w.root, "armed"), "");
+			go(w, runId, "phase-sweep");
 			await child.exited;
 			db.close();
 		}
