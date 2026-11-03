@@ -13,7 +13,7 @@ import { afterAll, test as bunTest, describe, expect } from "bun:test";
 import * as childProcess from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
-	chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, watch, writeFileSync, writeSync,
+	chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync,
 } from "node:fs";
 import { userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -1280,7 +1280,7 @@ function publish(dir, body) {
 /**
  * A detached helper (its own process group) the spinning worker starts first: once the signature capture's file exists it
  * starts a second detached group (`sleep 300`) and publishes its pid as ../ready-late/pid, then stays alive as its parent.
- * It polls in its own process: the work dir it would watch is busy, so a watched event there can be dropped (`when`).
+ * It polls in its own process: the work dir it would watch is busy, and Bun's fs.watch can drop an event there (DIR_EVENTS).
  */
 const LATE_HELPER = `const fs = require("node:fs");
 const { spawn } = require("node:child_process");
@@ -1311,8 +1311,15 @@ ${late ? `\tspawn(process.execPath, ["-e", ${JSON.stringify(LATE_HELPER)}], { de
 interface Wrapper {
 	pid: number;
 	exitCode: number | null;
+	signalCode: string | null;
 	exited: Promise<number>;
 	stderr: ReadableStream<Uint8Array>;
+}
+
+/** How a wrapper that exited first ended, and its stderr, for the wait's error. */
+async function exitedFirst(what: string, p: Wrapper): Promise<Error> {
+	const how = p.signalCode !== null ? `was killed by ${p.signalCode}` : `exited ${p.exitCode}`;
+	return new Error(`${what}: the wrapper (pid ${p.pid}) ${how} first; stderr: ${await new Response(p.stderr).text()}`);
 }
 
 /** The spin fixture's ready-to-spin publication: its marker is held and its /usr/bin/true spawned; `at` is its own clock's time. */
@@ -1323,40 +1330,106 @@ interface Ready {
 }
 
 /**
- * `probe()`'s first defined answer, read before the first wait and again after every event in `dir`. `dir` must be one where
- * the awaited publication is the only event: Bun 1.3.14's fs.watch drops an event that repeats the type or the name of the
- * last one it emitted within about a millisecond. `p` exiting first is an error naming its exit and stderr. No timer: the
- * test's own timeout is the hang guard.
+ * The source of a `when` watch, run as `bun -e DIR_EVENTS <dir>`: it registers one kqueue EVFILT_VNODE filter (EV_CLEAR) on
+ * the directory, writes `armed`, then one `event` line per delivery (a name added, removed or renamed in it; the directory
+ * itself deleted, renamed or revoked ends it, exit 3). kevent registers in the kernel before it returns, so once `armed` is
+ * written no change in the directory can go unseen. Bun 1.3.14's fs.watch is not that on macOS: one FSEvents stream for the
+ * process, rebuilt on its CF thread from kFSEventStreamEventIdSinceNow at every watch and unwatch, with the dropped-event
+ * flags never surfaced (src/runtime/node/fs_events.zig `_schedule`, `_events_cb`), and it drops an event that repeats the
+ * type or the name of the last one it emitted within about a millisecond (path_watcher.zig `ChangeEvent.shouldEmit`).
+ * A failed call is one stderr line naming it and errno, exit 1.
+ */
+const DIR_EVENTS = `const { dlopen, FFIType, read } = require("bun:ffi");
+const { writeSync } = require("node:fs");
+const c = dlopen("/usr/lib/libSystem.B.dylib", {
+	open: { args: [FFIType.cstring, FFIType.i32], returns: FFIType.i32 },
+	kqueue: { args: [], returns: FFIType.i32 },
+	kevent: { args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+	__error: { args: [], returns: FFIType.ptr },
+}).symbols;
+const dir = process.argv.at(-1);
+const fail = (what, code = 1) => {
+	writeSync(2, "dir events on " + dir + ": " + what + "\\n");
+	process.exit(code);
+};
+const errno = () => read.i32(c.__error(), 0);
+// O_EVTONLY: a descriptor for event notification only.
+const fd = c.open(Buffer.from(dir + "\\0"), 0x8000);
+if (fd < 0) fail("open failed, errno " + errno());
+const kq = c.kqueue();
+if (kq < 0) fail("kqueue failed, errno " + errno());
+// struct kevent (arm64): ident u64, filter i16, flags u16, fflags u32, data i64, udata ptr.
+const change = new DataView(new ArrayBuffer(32));
+change.setBigUint64(0, BigInt(fd), true);
+change.setInt16(8, -4, true); // EVFILT_VNODE
+change.setUint16(10, 0x1 | 0x20, true); // EV_ADD | EV_CLEAR
+change.setUint32(12, 0x1 | 0x2 | 0x20 | 0x40, true); // NOTE_DELETE | NOTE_WRITE | NOTE_RENAME | NOTE_REVOKE
+if (c.kevent(kq, new Uint8Array(change.buffer), 1, null, 0, null) !== 0) fail("kevent EV_ADD failed, errno " + errno());
+writeSync(1, "armed\\n");
+const got = new Uint8Array(32);
+const fired = new DataView(got.buffer);
+for (;;) {
+	const n = c.kevent(kq, null, 0, got, 1, null);
+	if (n < 0 && errno() === 4) continue; // EINTR
+	if (n !== 1) fail("kevent wait returned " + n + ", errno " + errno());
+	if (fired.getUint16(10, true) & 0x4000) fail("kevent EV_ERROR " + fired.getBigInt64(16, true)); // EV_ERROR: data is the errno
+	writeSync(1, "event\\n");
+	if (fired.getUint32(12, true) & (0x1 | 0x20 | 0x40)) fail("the directory was deleted, renamed or revoked", 3);
+}
+`;
+
+/**
+ * `probe()`'s first defined answer, read before the first wait and again after every kernel event in `dir` (a DIR_EVENTS
+ * helper the case owns, armed before the wait can matter: a change before `armed` is seen by the probe that follows it).
+ * `p` exiting first is an error naming its exit and stderr, and so is the helper failing. No timer: `p`'s own bound (a part's
+ * cap) or the case's timeout is the hang guard.
  */
 async function when<T>(dir: string, probe: () => T | undefined, what: string, p?: Wrapper): Promise<T> {
-	let events = 0;
+	const o = owning(`${what}: the watch on ${dir}`);
+	const h = Bun.spawn([BUN, "-e", DIR_EVENTS, dir], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+	o.subprocs.push(h);
 	let failure = null as Error | null;
 	let wake = Promise.withResolvers<void>();
-	const w = watch(dir, () => {
-		events++;
+	// Every line wakes the wait; the stream's end (the helper exited) or a line out of protocol is the failure.
+	const pump = (async () => {
+		let why: string;
+		try {
+			const decoder = new TextDecoder();
+			let text = "";
+			for await (const chunk of h.stdout) {
+				text += decoder.decode(chunk, { stream: true });
+				const lines = text.split("\n");
+				text = lines.pop()!;
+				const odd = lines.find((l) => l !== "armed" && l !== "event");
+				if (odd !== undefined) throw new Error(`wrote ${JSON.stringify(odd)}`);
+				wake.resolve();
+			}
+			await h.exited;
+			why = h.signalCode !== null ? `was killed by ${h.signalCode}` : `exited ${h.exitCode}`;
+		} catch (e) {
+			why = e instanceof Error ? e.message : String(e);
+		}
+		const stderr = await new Response(h.stderr).text().catch((e: unknown) => `(unreadable: ${e instanceof Error ? e.message : String(e)})`);
+		failure ??= new Error(`${what}: the watch on ${dir} (pid ${h.pid}) ${why}; stderr: ${stderr}`);
 		wake.resolve();
-	});
-	w.on("error", (e: Error) => {
-		failure = new Error(`${what}: watching ${dir}: ${e.message}`);
-		wake.resolve();
-	});
+	})();
 	try {
 		for (;;) {
-			const seen = events;
+			wake = Promise.withResolvers<void>();
 			const v = probe();
 			if (v !== undefined) return v;
 			if (failure) throw failure;
-			if (events !== seen) continue;
-			wake = Promise.withResolvers<void>();
 			const exited = await Promise.race([wake.promise.then(() => false), p ? p.exited.then(() => true) : new Promise<boolean>(() => {})]);
 			if (exited) {
 				const last = probe();
 				if (last !== undefined) return last;
-				throw new Error(`${what}: the wrapper (pid ${p!.pid}) exited ${p!.exitCode} first; stderr: ${await new Response(p!.stderr).text()}`);
+				throw await exitedFirst(what, p!);
 			}
 		}
 	} finally {
-		w.close();
+		if (h.exitCode === null && h.signalCode === null) h.kill("SIGKILL");
+		await h.exited;
+		await pump;
 	}
 }
 
@@ -1365,6 +1438,16 @@ async function exitOf(pid: number): Promise<void> {
 	const c = Bun.spawn(["/usr/bin/caffeinate", "-w", String(pid)], { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
 	const code = await c.exited;
 	if (code !== 0) throw new Error(`/usr/bin/caffeinate -w ${pid} exited ${code}: ${await new Response(c.stderr).text()}`);
+}
+
+/** `pid`'s exit (`exitOf`) inside a running part: the wrapper `p` exiting first is an error naming its exit and stderr. */
+async function exitBefore(pid: number, p: Wrapper, what: string): Promise<void> {
+	const first = await Promise.race([
+		exitOf(pid).then(() => ({ pid: true as const }), (error: unknown) => ({ error })),
+		p.exited.then(() => ({ wrapper: true as const })),
+	]);
+	if ("error" in first) throw first.error;
+	if ("wrapper" in first) throw await exitedFirst(what, p);
 }
 
 /** Make the empty directories `<work>/<name>` a fixture publishes into (`publish`), before the part starts. */
@@ -2213,6 +2296,11 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 	// so what the controls test is the structure a tick sees, never how a loaded machine schedules.
 	describe("negative controls, fed ticks: each part ends normally with no signature and no decision (enforce, --parallel=2)", () => {
 		const HOLD = 2 + STUCK_DEFAULTS.persistMs / STUCK_DEFAULTS.tickMs;
+		/**
+		 * Every control's budget, as on main. Each wait in a control also ends when its wrapper exits, and the part's own cap
+		 * (fullCapMin 1, 60 s) bounds that, so a fixture that never gets there fails the case with the wrapper's exit and stderr.
+		 */
+		const CONTROL_TEST_MS = 240_000;
 		const head = (body: string) => `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\n${GATE_HEAD}${body}`;
 		/** The worker publishes ../w.pid, runs `before`, makes an unreaped /usr/bin/true (../z.pid), and holds at `hold`. */
 		const zombieHeld = (before = "") =>
@@ -2266,7 +2354,7 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 			const c = control(name, { "a.test.ts": OK_TEST, "c.test.ts": file }, ["hold"]);
 			const w = await reached(c.work, "hold", c.p);
 			expect(fixturePid(c.work, "w.pid")).toBe(w);
-			await exitOf(fixturePid(c.work, "z.pid"));
+			await exitBefore(fixturePid(c.work, "z.pid"), c.p, "the zombie /usr/bin/true's exit");
 			await c.feed(hot(w));
 			letThrough(c.work, "hold");
 			return { trace: await ended(c), w };
@@ -2275,12 +2363,12 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		test("a hot worker holding a zombie child, with no marker", async () => {
 			const { trace, w } = await heldZombie("zombie-no-marker", zombieHeld());
 			expect(trace.map((t) => ({ zombie: zombieOf(t, w), markers: activeAt(t) }))).toEqual(trace.map(() => ({ zombie: true, markers: [] })));
-		}, 60_000);
+		}, CONTROL_TEST_MS);
 
 		test("a real Bun.spawnSync(['/usr/bin/true']) that returns, then an async /usr/bin/true born at once, held hot: the marker is inactive", async () => {
 			const { trace, w } = await heldZombie("returned-call-then-zombie", zombieHeld(`\tBun.spawnSync(["/usr/bin/true"]);\n`));
 			expect(trace.map((t) => ({ zombie: zombieOf(t, w), markers: activeAt(t) }))).toEqual(trace.map(() => ({ zombie: true, markers: [] })));
-		}, 60_000);
+		}, CONTROL_TEST_MS);
 
 		test("the same with the marker file made immutable before the first call: no marker ever becomes active", async () => {
 			const file = `import { dlopen, FFIType } from "bun:ffi";
@@ -2301,7 +2389,7 @@ test("c", () => {
 `)}`;
 			const { trace, w } = await heldZombie("immutable-marker", file);
 			expect(trace.map((t) => ({ zombie: zombieOf(t, w), markers: activeAt(t) }))).toEqual(trace.map(() => ({ zombie: true, markers: [] })));
-		}, 60_000);
+		}, CONTROL_TEST_MS);
 
 		/**
 		 * A getter control: `call` (test code) runs GETTER_HOLD in a getter the call reads, then the fixture writes ../out.json
@@ -2313,7 +2401,7 @@ test("c", () => {
 			const c = control(name, { "a.test.ts": OK_TEST, "c.test.ts": file }, ["hold", "after"]);
 			if (runs) {
 				const held = await reached(c.work, "hold", c.p);
-				await exitOf(fixturePid(c.work, "z.pid"));
+				await exitBefore(fixturePid(c.work, "z.pid"), c.p, "the zombie /usr/bin/true's exit");
 				await c.feed(hot(held));
 				letThrough(c.work, "hold");
 			}
@@ -2329,7 +2417,7 @@ test("c", () => {
 		test("Bun.spawnSync(['/usr/bin/true', <getter>]) whose getter starts an async /usr/bin/true and holds hot: the call runs unpublished, so the hot worker's zombie never meets a marker", async () => {
 			const call = `(() => {\n\t\tconst argv = ["/usr/bin/true"];\n\t\tObject.defineProperty(argv, 1, { enumerable: true, get() {\n\t\t${GETTER_HOLD}\n\t\treturn "x";\n\t\t} });\n\t\treturn { exitCode: Bun.spawnSync(argv).exitCode };\n\t})()`;
 			expect(await getterControl("argv-getter", "", call, true)).toEqual({ exitCode: 0 });
-		}, 60_000);
+		}, CONTROL_TEST_MS);
 
 		for (const shape of ["proto-cwd", "env-array"] as const) {
 			const what = shape === "proto-cwd" ? "Bun.spawnSync(['/usr/bin/true'], {}) beside an Object.prototype cwd getter" : "Bun.spawnSync(['/usr/bin/true'], { env: <array with an enumerable named getter> })";
@@ -2339,7 +2427,7 @@ test("c", () => {
 				const native = r3GetterCall(shape, ["/usr/bin/true"], () => {});
 				const call = `r3GetterCall("${shape}", ["/usr/bin/true"], () => {\n\t\t${GETTER_HOLD}\n\t})`;
 				expect(await getterControl(`${shape}-getter`, `const r3GetterCall = ${r3GetterCall.toString()};\n`, call, native.hits > 0)).toEqual(native);
-			}, 60_000);
+			}, CONTROL_TEST_MS);
 		}
 
 		test("Bun.spawnSync(['/usr/bin/true'], { stdin: <Buffer with an own Symbol.asyncIterator getter> }) whose getter starts an async /usr/bin/true and holds hot: the call runs unpublished and does what it does unwrapped, so the hot worker's zombie never meets a marker", async () => {
@@ -2347,7 +2435,7 @@ test("c", () => {
 			expect(native).toEqual({ exitCode: 0, hits: 1 });
 			const call = `byteGetterCall(cp, "own", ["/usr/bin/true"], () => {\n\t\t${GETTER_HOLD}\n\t})`;
 			expect(await getterControl("byte-stdin-getter", `import * as cp from "node:child_process";\nconst byteGetterCall = ${byteGetterCall.toString()};\n`, call, true)).toEqual(native);
-		}, 60_000);
+		}, CONTROL_TEST_MS);
 
 		test("a long async test", async () => {
 			const c = control("long-async", { "a.test.ts": OK_TEST, "c.test.ts": head(`test("c", async () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tawait gateAsync("hold");\n}, 60_000);\n`) }, ["hold"]);
@@ -2356,7 +2444,7 @@ test("c", () => {
 			letThrough(c.work, "hold");
 			const trace = await ended(c);
 			expect(trace.map((t) => t.tree.some((p) => p.pid === w))).toEqual(trace.map(() => true));
-		}, 60_000);
+		}, CONTROL_TEST_MS);
 
 		test("a real Bun.spawnSync of a child that waits: the marker is active with a live child, and the worker is not hot", async () => {
 			const file = head(`test("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tconst r = Bun.spawnSync([SLEEP, "hold"]);\n\tif (r.exitCode !== 0) throw new Error("the hold gate's sleep exited " + r.exitCode);\n}, 60_000);\n`);
@@ -2367,23 +2455,34 @@ test("c", () => {
 			letThrough(c.work, "hold");
 			const trace = await ended(c);
 			expect(trace.map((t) => ({ marked: markedBy(t, w), child: t.tree.some((p) => p.pid === child && p.ppid === w) }))).toEqual(trace.map(() => ({ marked: ["sleep"], child: true })));
-		}, 60_000);
+		}, CONTROL_TEST_MS);
 
 		test("another worker printing continuously beside an idle one", async () => {
-			const printer = head(`test("prints", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tannounce("printing");\n\twhile (!__fs.existsSync(W + "/printed")) console.log("x".repeat(100));\n}, 60_000);\n`);
+			// The printer prints BURST lines before every tick and holds at that tick's gate while it is fed, so what it prints is
+			// bounded. Printing until the last tick was not: bun test --parallel keeps a worker's whole output in the worker and
+			// in the leader until the file ends (their RSS grew about 40 and 55 MB/s with the part log still empty, bun 1.3.14),
+			// the likely cause of the hosted macOS run that timed out here (as2-hosted run 41586402168).
+			const BURST = 1_000;
+			const LINE = "x".repeat(100);
+			const gates = Array.from({ length: HOLD }, (_, i) => `printed-${i + 1}`);
+			const printer = head(`test("prints", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tfor (const g of ${JSON.stringify(gates)}) {\n\t\tfor (let i = 0; i < ${BURST}; i++) console.log("${LINE}");\n\t\tgate(g);\n\t}\n}, 60_000);\n`);
 			const idler = head(`test("idles", async () => {\n\twriteFileSync("../idle.pid", String(process.pid));\n\tawait gateAsync("hold");\n}, 60_000);\n`);
 			// Two files on --parallel=2: each has a worker of its own, so the printer prints while the idle one waits.
-			const c = control("printer-beside-idle", { "c.test.ts": printer, "d.test.ts": idler }, ["printing", "hold"]);
-			const w = await reached(c.work, "printing", c.p);
+			const c = control("printer-beside-idle", { "c.test.ts": printer, "d.test.ts": idler }, ["hold", ...gates]);
 			const idle = await reached(c.work, "hold", c.p);
+			const w = await reached(c.work, gates[0]!, c.p);
 			expect([fixturePid(c.work, "w.pid"), fixturePid(c.work, "idle.pid")]).toEqual([w, idle]);
 			expect(idle).not.toBe(w);
-			await c.feed((at) => ({ ...hot(w)(at), ...flat(idle)(at) }));
+			for (const g of gates) {
+				expect(await reached(c.work, g, c.p)).toBe(w);
+				await c.feed((at) => ({ ...hot(w)(at), ...flat(idle)(at) }), 1);
+				letThrough(c.work, g);
+			}
 			letThrough(c.work, "hold");
-			writeFileSync(join(c.work, "printed"), "");
 			const trace = await ended(c);
 			expect(trace.map((t) => [w, idle].every((pid) => t.tree.some((p) => p.pid === pid)))).toEqual(trace.map(() => true));
-		}, 60_000);
+			expect(readFileSync(join(c.work, "full.log"), "utf8").split("\n").filter((l) => l === LINE)).toHaveLength(HOLD * BURST);
+		}, CONTROL_TEST_MS);
 
 		test("a zombie whose parent is a sleeping fixture process, beside a hot worker holding a marker", async () => {
 			// The sleeper: a bun child of the worker that makes the unreaped /usr/bin/true, then blocks at its gate.
@@ -2399,14 +2498,14 @@ test("c", () => {
 			const c = control("zombie-of-a-sleeper", { "a.test.ts": OK_TEST, "c.test.ts": file }, ["sleeper", "hold"]);
 			const s = await reached(c.work, "sleeper", c.p);
 			const w = await reached(c.work, "hold", c.p);
-			await exitOf(fixturePid(c.work, "z.pid"));
+			await exitBefore(fixturePid(c.work, "z.pid"), c.p, "the zombie /usr/bin/true's exit");
 			await c.feed(hot(w));
 			letThrough(c.work, "sleeper");
 			letThrough(c.work, "hold");
 			const trace = await ended(c);
 			expect(trace.map((t) => ({ marked: markedBy(t, w), sleeperZombie: zombieOf(t, s), workerZombie: zombieOf(t, w) })))
 				.toEqual(trace.map(() => ({ marked: ["true"], sleeperZombie: true, workerZombie: false })));
-		}, 60_000);
+		}, CONTROL_TEST_MS);
 	});
 });
 

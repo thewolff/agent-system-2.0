@@ -114,17 +114,32 @@ export function proofIterations(m: ProofManifest): ProofStep[] {
 	}
 	return out;
 }
+/**
+ * Each JUnit case of `xml` with its proof identity, the key a manifest names it by: `<file> > <describes joined " > "> > <name>`
+ * for the first case of that file and name, and `<that> [k]` for its k-th occurrence (k ≥ 2), counted per file and name in
+ * JUnit document order. Bun lists, for instance, the unnamed entries of a skipped describe under one name; the ordinal keeps
+ * each a case of its own, checked one by one. An ordinal that collides with a case literally named so is a duplicate.
+ * Only the proof keys cases this way: junitCases and the runner's verdict read the report unchanged.
+ */
+function identifiedCases(xml: string) {
+	const seen = new Map<string, number>();
+	const identities = new Set<string>();
+	return junitCases(xml).map((c) => {
+		const plain = `${c.file} > ${c.name}`;
+		const k = (seen.get(plain) ?? 0) + 1;
+		seen.set(plain, k);
+		const identity = k === 1 ? plain : `${plain} [${k}]`;
+		if (identities.has(identity)) throw new Error(`${identity}: duplicate JUnit case`);
+		identities.add(identity);
+		return { ...c, identity };
+	});
+}
 export function proofEvidence(m: ProofManifest, step: Pick<ProofStep, "phase" | "file">, xml: string, log: string) {
-	const cases = junitCases(xml);
+	const cases = identifiedCases(xml);
 	const selected = m.files.filter((f) => step.file === null || f.path === step.file);
 	const expected = new Set<string>();
 	const markers: string[] = [];
-	const byIdentity = new Map<string, (typeof cases)[number]>();
-	for (const c of cases) {
-		const key = `${c.file} > ${c.name}`;
-		if (byIdentity.has(key)) throw new Error(`${key}: duplicate JUnit case`);
-		byIdentity.set(key, c);
-	}
+	const byIdentity = new Map(cases.map((c) => [c.identity, c]));
 	const logLines = new Map<string, number>();
 	for (const line of log.split(/\r?\n/)) logLines.set(line, (logLines.get(line) ?? 0) + 1);
 	for (const f of selected) {

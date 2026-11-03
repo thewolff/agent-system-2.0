@@ -17,6 +17,8 @@ setDefaultTimeout(180_000);
 const sha = "a".repeat(40);
 const fixture = () => ({ version: 1, kind: "smoke", workload: "wl-proof", slice: "sl-proof", repo: "owner/repo", baseSha: sha, candidateSha: "b".repeat(40), mode: "isolated", productionBudget: false, load: "none", runs: { base: 0, candidate: 2 }, files: [{ path: "a.test.ts", cases: [{ base: ["old"], candidate: ["new", "split"], budgetMs: 5000, timingUnderTest: false }], hooks: { base: { setup: [], cleanup: [] }, candidate: { setup: [], cleanup: [] } }, skipped: { base: [], candidate: [] } }] });
 const xml = (names: string[], skipped = false) => `<testsuites tests="${names.length}" failures="0" skipped="${skipped ? names.length : 0}"><testsuite name="a.test.ts">${names.map((name) => `<testcase name="${name}" time="0.001">${skipped ? "<skipped/>" : ""}</testcase>`).join("")}</testsuite></testsuites>`;
+/** A one-file report of `[name, status]` cases in document order, with the counts parseJunit checks. */
+const report = (cases: [string, "pass" | "fail" | "skip"][]) => `<testsuites tests="${cases.length}" failures="${cases.filter(([, s]) => s === "fail").length}" skipped="${cases.filter(([, s]) => s === "skip").length}"><testsuite name="a.test.ts">${cases.map(([name, s]) => `<testcase name="${name}" time="0.001">${s === "skip" ? "<skipped/>" : s === "fail" ? '<failure message="red"/>' : ""}</testcase>`).join("")}</testsuite></testsuites>`;
 /** Executable inputs as submission records them: `tree` names the candidate's executable tree, `exec` the installed executor's hash. */
 const inputs = (m: ProofManifest, o: { tree?: string; exec?: string } = {}): ProofInputs => ({
 	base: { sha: m.baseSha, tree: "1".repeat(64) }, candidate: { sha: m.candidateSha, tree: (o.tree ?? "2").repeat(64) },
@@ -61,6 +63,26 @@ describe("executed-case and hook evidence", () => {
 		for (const report of [xml(["new", "split"], true), xml(["new", "new", "split"]), "<testsuites/>", xml(["new", "split"]).replaceAll('time="0.001"', 'time="3"')]) expect(() => proofEvidence(m, i, report, "")).toThrow();
 		m.files[0]!.hooks.candidate.cleanup.push("reaped");
 		expect(() => proofEvidence(m, i, xml(["new", "split"]), "")).toThrow("cleanup");
+	});
+	test("a repeated JUnit identity takes its ordinal in JUnit order, and every occurrence is checked on its own", () => {
+		const f = fixture();
+		const repeated = (skipped: Record<"base" | "candidate", string[]>) => ({ ...f, files: [{ ...f.files[0]!, cases: [{ base: ["run", "run [2]"], candidate: ["run", "run [2]"], budgetMs: 5000, timingUnderTest: false }], skipped }] });
+		const m = parseProofManifest(repeated({ base: ["(unnamed)", "(unnamed) [2]"], candidate: ["(unnamed)", "(unnamed) [2]"] }));
+		const i = { phase: "candidate" as const, file: "a.test.ts" };
+		const green: [string, "pass" | "fail" | "skip"][] = [["run", "pass"], ["(unnamed)", "skip"], ["run", "pass"], ["(unnamed)", "skip"]];
+		expect(proofEvidence(m, i, report(green), "").cases.map((c) => c.identity)).toEqual(["a.test.ts > run", "a.test.ts > (unnamed)", "a.test.ts > run [2]", "a.test.ts > (unnamed) [2]"]);
+		expect(proofEvidence(m, { ...i, phase: "base" }, report(green), "").cases).toHaveLength(4);
+		// A dropped skipped occurrence, a third one, a repeat that now runs and a repeat that is now skipped are each refused.
+		expect(() => proofEvidence(m, i, report(green.slice(0, 3)), "")).toThrow("a.test.ts > (unnamed) [2]: frozen skipped case changed");
+		expect(() => proofEvidence(m, i, report([...green, ["(unnamed)", "skip"]]), "")).toThrow("a.test.ts > (unnamed) [3]: unexpected JUnit case");
+		expect(() => proofEvidence(m, i, report([...green.slice(0, 3), ["(unnamed)", "pass"]]), "")).toThrow("a.test.ts > (unnamed) [2]: frozen skipped case changed");
+		expect(() => proofEvidence(m, i, report([...green.slice(0, 2), ["run", "skip"], ["(unnamed)", "skip"]]), "")).toThrow("a.test.ts > run [2]: expected exactly one EXECUTED case (skip)");
+		// Each executed occurrence is held to the candidate's pass on its own.
+		expect(() => proofEvidence(m, i, report([green[0]!, green[1]!, ["run", "fail"], green[3]!]), "")).toThrow("a.test.ts > run [2]: candidate case failed");
+		expect(() => proofEvidence(m, i, report([["run", "fail"], ...green.slice(1)]), "")).toThrow("a.test.ts > run: candidate case failed");
+		// An ordinal that collides with a case literally named so is a duplicate, and a manifest list still refuses a true duplicate.
+		expect(() => proofEvidence(m, i, report([["run", "pass"], ["run [2]", "pass"], ["run", "pass"]]), "")).toThrow("a.test.ts > run [2]: duplicate JUnit case");
+		expect(() => parseProofManifest(repeated({ base: ["(unnamed)", "(unnamed)"], candidate: [] }))).toThrow("duplicate identity");
 	});
 });
 

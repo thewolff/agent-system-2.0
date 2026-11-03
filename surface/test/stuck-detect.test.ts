@@ -481,7 +481,7 @@ process.stdin.on("data", () => writeSync(1, total() + "\\n"));
 		await p.exited;
 		expect(cpuNs(p.pid)).toBeNull(); // reaped: gone
 		expect(procArgv(p.pid)).toBeNull();
-	}, 30_000); // a failure bound only: one bun start and 50 ms of its CPU at any share of a core
+	}); // main's default budget, unchanged (R5): one bun start and 50 ms of its CPU
 
 	test("another uid's list is readable without a spawn (uid 0: launchd, pid 1)", () => {
 		const s = snapshot(0);
@@ -588,5 +588,5 @@ describe.skipIf(!LIVE)("live: observe and the classifier end to end", () => {
 		} finally {
 			p.kill("SIGKILL");
 		}
-	}, 30_000); // a failure bound only: one bun start and ten observations
+	}, 90_000); // main's failure bound, unchanged (R5): one bun start and ten observations
 });
