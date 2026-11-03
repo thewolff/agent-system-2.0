@@ -27,7 +27,12 @@
  *      `agent()`) plans only on the row's entries of the lane's lab, the lab of the lane's current
  *      model (`ctx.model`) at that spawn (`buildRow`, classifier/src/build-row.ts; Jo's inputs
  *      in-mv7hm58386f2o0 and in-mv7hmuk0u600e8): no current model, a model with no lab, or no entry
- *      of its lab refuses, and an unusable lane-lab entry never widens the row to another lab. A
+ *      of its lab refuses, and an unusable lane-lab entry never widens the row to another lab, with
+ *      one exception (Jo, in-mvwl9tkmsym86o, amending in-mv7hm58386f2o0; PLAN wl-mvwk0v0gmp6cjc D6):
+ *      when no lane-lab entry is usable and one is out on an exhausted week (`HeadroomDecision`
+ *      `exhausted`), the hand moves to the first usable entry of its tier row on another lab, records
+ *      `hand-headroom:` and the `quota-move:` message (surface/src/quota-move-alert.ts) with its
+ *      `hand-spawn:`, and the move alert is spawned. A 5h-only or week-pace-only out is refused. A
  *      review plans on `reviewRow` and the cross-lab rule instead. Headroom skips quota-out entries
  *      and writes one `headroom-skip:` per skip. A week-pace-only source can be retained against a
  *      faster-burning available configured budget (PLAN wl-mv958y95fk07wg, Policy B), with its
@@ -282,6 +287,7 @@ import { identity, loadTierTable, modelIdentity, type TierTable } from "./src/ti
 import { controlEntries, holdersOf, type LaneStarted, laneStarted, planFirst, planSlice } from "../surface/src/launch";
 import { ompPidState, type PidState } from "../surface/src/omp-probe";
 import { NOTICE_PREFIX } from "../surface/src/notice";
+import { quotaMoveSubject, recordQuotaMove, spawnMoveAlert } from "../surface/src/quota-move-alert";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../surface/src/types";
 import {
 	PAIR_OPTION, type PairLedger, type PairSignalId, pairExposureBody, pairOffer, pairOfferBody, pairSignalBody, pairSignalFailedBody, pairSuggestOn,
@@ -336,6 +342,12 @@ export interface ClassifierDeps {
 	ompState(pid: number, start: string): PidState;
 	/** Lost-hand settle (D2): when the file at `path` was last written (ms since the epoch), or null when it does not exist. Production: `statSync(path).mtimeMs`. */
 	lastWrite(path: string): number | null;
+	/**
+	 * PLAN wl-mvwk0v0gmp6cjc D6: start the move alert for a recorded hand move (event entry `eventId` on `workloadId`).
+	 * Production: surface/src/quota-move-alert.ts `spawnMoveAlert` with its detached spawner; tests inject a fake spawner.
+	 * Returns the worker's pid, or null when nothing was spawned; throws when even the failure could not be recorded.
+	 */
+	spawnMoveAlert?(ledger: Ledger, workloadId: string, eventId: string): number | null;
 }
 
 /** One classified tier item, waiting for its spawn. */
@@ -422,7 +434,8 @@ interface Hand extends Pending {
 	/**
 	 * The allowlist for what answered, as `provider/id` identities: the lane-lab build row at spawn
 	 * (`buildRow`), or for a review the row filtered to the labs outside the builders (D4), plus the
-	 * builder's entries when a same-lab grant was spent (D6). Fixed at spawn: a later lane model
+	 * builder's entries when a same-lab grant was spent (D6); for a build hand moved off an exhausted
+	 * week (PLAN wl-mvwk0v0gmp6cjc D6), its one other-lab entry. Fixed at spawn: a later lane model
 	 * switch does not change it.
 	 */
 	row: string[];
@@ -618,6 +631,7 @@ async function availableRow(
  * Legal spawn entries, with quota decisions against available configured budget alternatives.
  * Selectors absent from `budgets` fail closed; its other selectors never gain spawn authority. Core owns lab
  * filtering, ordering and comparison policy. Null room preserves credential/refusal-only Kimi checks.
+ * `exhausted`: each projected-out selector whose decision names an exhausted week (PLAN wl-mvwk0v0gmp6cjc D6).
  */
 async function usableRow(
 	row: readonly string[],
@@ -633,23 +647,29 @@ async function usableRow(
 	const why: Record<string, string> = {};
 	const projected: Record<string, string> = {};
 	const retained: Record<string, string> = {};
+	const exhausted: Record<string, string> = {};
 	for (const selector of row) {
 		if (!budgets.includes(selector)) why[selector] = "not in the configured budget row";
 		else if (available.why[selector]) why[selector] = available.why[selector]!;
 		else {
 			const decision = room?.decisionFor(selector, available.usable);
-			if (decision?.out) why[selector] = `projected out: ${(projected[selector] = decision.out)}`;
-			else {
+			if (decision?.out) {
+				why[selector] = `projected out: ${(projected[selector] = decision.out)}`;
+				if (decision.exhausted) exhausted[selector] = decision.exhausted;
+			} else {
 				usable.push(selector);
 				if (decision?.retained) retained[selector] = decision.retained;
 			}
 		}
 	}
-	return { usable, why, projected, retained, skipped: Object.entries(why).map(([selector, reason]) => `${selector} (${reason})`) };
+	return { usable, why, projected, retained, exhausted, skipped: Object.entries(why).map(([selector, reason]) => `${selector} (${reason})`) };
 }
 
 /** `headroom-skip: <selector> token <dt> <reason>`: hand `dt`'s spawn skipped `selector` for quota headroom (PLAN wl-mv71x5rwdu7eo0 § 3). */
 const headroomSkipBody = (selector: string, token: string, reason: string) => `headroom-skip: ${selector} token ${token} ${reason}`;
+
+/** `hand-headroom: <hand subject, "of lane <lane>"> <from> -> <to> (<exhausted week>)`: a build hand moved lab on a used-up week (PLAN wl-mvwk0v0gmp6cjc D6). */
+const handHeadroomBody = (subject: string, from: string, to: string, reason: string) => `hand-headroom: ${subject} ${from} -> ${to} (${reason})`;
 
 /**
  * A failed dispatch's refusal by `provider`, on the hand of token `dt`: a login refusal (HTTP 401 / 403, PLAN wl-muq13bkdghblmo
@@ -2785,7 +2805,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const outage = anthropicOutRuleActive(context);
 				const row = build ? build.row : reviewRow(table, tier, context);
 				const room = headroom({ now: clock() });
-				const { usable, why, skipped, projected: out, retained } = await usableRow(row, registry, disabled, providerRefused, spawnKey, room, build ? table[tier] : row);
+				const { usable, why, skipped, projected: out, retained, exhausted } = await usableRow(row, registry, disabled, providerRefused, spawnKey, room, build ? table[tier] : row);
 				if (found?.review && outage !== anthropicOutRuleActive({ now: clock(), laneModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined })) {
 					return refused(refusedRow("agent-system-2 classifier: review policy changed while checking usability; re-dispatch under the current policy"));
 				}
@@ -2826,6 +2846,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					models: string[],
 					grant: string | null,
 					rule: { labs: Lab[]; kimi: string } | null,
+					alsoRecord: (() => void) | null = null,
 				): "recorded" | "spent" | "expired" | { held: string } => {
 					const ledger = deps.ledger();
 					return ledger.write(() => {
@@ -2843,15 +2864,92 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						else if (rule) entry(reviewSameLabRuleBody({ slice: hand.sliceId, token: hand.token, labs: rule.labs, kimi: rule.kimi }));
 						headroomSkips(hand.token, entry);
 						entry(handSpawnBody({ token: hand.token, root: root!, spawnKey, review: hand.review, group: hand.group, row: models.map(modelIdentity) }));
+						// A hand move's record and its NOW message (D6) commit with the spawn record or not at all (a nested write is a savepoint).
+						alsoRecord?.();
 						return "recorded";
 					});
+				};
+
+				/**
+				 * PLAN wl-mvwk0v0gmp6cjc D6 (Jo, in-mvwl9tkmsym86o, amending in-mv7hm58386f2o0 for this case): a build hand with no
+				 * usable lane-lab entry, one of them out on an exhausted week, moves to the first entry of its tier row on another
+				 * (known) lab, in row order, that `usableRow` admits (the same checks: enabled, credentials, not refused, not out).
+				 * Null, with today's refusal, when no week is exhausted, no other-lab entry is usable, or an unclassified hand's
+				 * session is bound to no workload (the move could not be recorded). A hand whose lane already moved plans on the
+				 * lane's new lab and never reaches here.
+				 */
+				const handMove = async (lab: Lab): Promise<{ from: string; to: string; reason: string; workloadId: string; retained: string | null } | null> => {
+					const from = row.find(s => exhausted[s] !== undefined);
+					if (from === undefined) return null;
+					const reason = exhausted[from]!;
+					const workloadId = found?.workloadId ?? deps.boundWorkload();
+					if (!workloadId) {
+						log(`agent-system-2 classifier: unclassified hand ${spawnKey ?? "(no spawn key)"} not moved off ${from} (${reason}): this session is bound to no workload, so the move could not be recorded; refused as before`);
+						return null;
+					}
+					const others = table[tier].filter(s => {
+						const other = labOf(s);
+						return other !== null && other !== lab;
+					});
+					// An unclassified spawn plans its lane-lab row with no workload's refusals (above); its move is recorded on the
+					// bound workload, so the target is checked against that workload's refusals as a classified spawn's is.
+					const refusals = found ? providerRefused : refusedProviders(deps.ledger().entries(workloadId), clock());
+					const target = await usableRow(others, registry, disabled, refusals, spawnKey, room, table[tier]);
+					const to = target.usable[0];
+					if (to === undefined) return null;
+					return { from, to, reason, workloadId, retained: target.retained[to] ?? null };
 				};
 
 				if (build) {
 					const lane = `lane lab ${build.lab} (${laneModel})`;
 					if (usable.length === 0) {
-						return refuse(refusedRow(`agent-system-2 classifier: no usable ${tier} model on the ${lane}: ${skipped.join(", ")}; a build hand never runs on another lab`));
+						const move = await handMove(build.lab);
+						if (move === null) {
+							return refuse(refusedRow(`agent-system-2 classifier: no usable ${tier} model on the ${lane}: ${skipped.join(", ")}; a build hand never runs on another lab`));
+						}
+						// The move record and its alert need the whole ledger (surface/src/quota-move-alert.ts), not the routing port.
+						const port = deps.ledger();
+						if (!(port instanceof Ledger)) {
+							throw new Error(`the move of a ${tier} hand off ${move.from} (${move.reason}) needs the full ledger, but deps.ledger() returned a routing port only; nothing was recorded or spawned`);
+						}
+						const ledger = port;
+						const hand = { kind: "hand" as const, laneId: deps.laneId, token: found ? found.token : (spawnKey ?? undefined), slice: found?.sliceId };
+						const subject = quotaMoveSubject(hand);
+						const event: { id?: string } = {};
+						const recordMove = () => {
+							event.id = recordQuotaMove(ledger, {
+								...hand, workloadId: move.workloadId, from: move.from, to: move.to, reason: move.reason, by: deps.laneId,
+								eventBody: handHeadroomBody(subject, move.from, move.to, move.reason),
+							});
+						};
+						const models = [move.to];
+						// As a normal build spawn on its row: `hand-spawn:` now, the routing row at the verdict (settle), none at the move.
+						if (found && root) {
+							recordSpawn(found, models, null, null, recordMove);
+							hands.push({ ...found, root, spawnKey, tier, models, row: models.map(modelIdentity), cwd: ctx.cwd, before: null });
+						} else {
+							// An unclassified hand writes no `hand-spawn:` and no routing row, so its target lab is a builder of the
+							// workload only by its `builder-lab: … hand` mark, written with the move or not at all. Its token is the
+							// subject's spawn key, or the move's event id for a keyless hand. `builderRoles` reads the mark as `review`.
+							ledger.write(() => {
+								recordMove();
+								const token = hand.token ?? event.id;
+								if (token === undefined) throw new Error(`the move of ${subject} off ${move.from} returned no event id on ${move.workloadId}; nothing was recorded or spawned`);
+								ledger.recordEntry({ by: deps.laneId, workloadId: move.workloadId, kind: "assumption", body: handBuilderBody(labOf(move.to), token, move.to) });
+							});
+						}
+						const eventId = event.id;
+						if (eventId === undefined) throw new Error(`the move of ${subject} off ${move.from} was not recorded on ${move.workloadId}`);
+						// The move is recorded: a worker that cannot be started is logged, never fatal; the train tick finds the alert unstarted.
+						try {
+							(deps.spawnMoveAlert ?? spawnMoveAlert)(ledger, move.workloadId, eventId);
+						} catch (error) {
+							log(`agent-system-2 classifier: move alert ${eventId} on ${move.workloadId} (${subject} ${move.from} -> ${move.to}) not started: ${message(error)}; the train tick spawns it once the alert reads unstarted`);
+						}
+						const moved = `moved off the ${lane} to ${move.to}: ${move.reason} (hand-headroom ${eventId}, alert to Jo; Jo, in-mvwl9tkmsym86o)`;
+						return { model: models, note: routingNote(found?.routing ?? null, tier, models, skipped, [...(found?.note ? [found.note] : []), lane, moved, ...(move.retained ? [move.retained] : [])]) };
 					}
+
 					// The row is written at the verdict, once what answered on the hand is known (settle).
 					if (found && root) {
 						recordSpawn(found, usable, null, null);

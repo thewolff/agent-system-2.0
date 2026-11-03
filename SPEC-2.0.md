@@ -557,7 +557,9 @@ waits for the window. **Security red:** a full-suite run of any verdict but `sup
 `gates/test/` (as2's security tests) makes the test runner send `security-red: <wl> <slice> <run id> <sha> <n> <first>`,
 whatever holds the workload; it shows as its own on-fire needs-you line, past a live lane and a train task's routing,
 while the ordinary test-run line keeps its suppression. A lane asks Jo before it changes such a test. The daily sweep's
-`scratch-disk` line is on fire too.
+`scratch-disk` line (scratch total over `AGENT_SYSTEM_SCRATCH_TOTAL_MB`, or free space on the scratch volume under
+`scratchArchive.minFreeGib`) is on fire too. Scratch roots are archived before they are removed, at close and by the
+sweep, and a root whose archive fails is kept (`migration/items/close-archives-scratch.md`).
 
 **Amended 2026-10-27 — ruling `routine-calls`: record and announce** (`migration/items/routine-calls-auto-apply.md`;
 Jo, ledger input `in-mvqwmr95k54feo`; plan rev 13 § D6; built in wl-mvqwn80onq9hq8). `lane_raise_question` takes an

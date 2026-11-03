@@ -14,7 +14,7 @@
 // turn's context; the plan-path row then puts open plan questions' paths under the orchestrator's
 // messages (PLAN wl-mv61a8dh4aeneo D3); the agent channel row then drains other agents' notes into the ledger and
 // Ilex's context (PLAN wl-mv8vx7wdj5nx1c D2: after the wake row, so its session_start drain follows the wake's); the
-// workload, launch, ceiling, question and rank rows only register tools (the rank row's `as2_rank` on every session,
+// workload, launch, lane-model, ceiling, question and rank rows only register tools (the rank row's `as2_rank` on every session,
 // PLAN wl-mv8k039gvogt8g D4); the lane rows register last.
 //
 // This is the extension entry, so it is the one file here that may bare-import `@oh-my-pi/*`
@@ -26,6 +26,7 @@ import { type HostModules, hostSettings } from "../gates/src/host";
 import agentChannelRow from "./extensions/agent-channel";
 import ceilingRow from "./extensions/ceiling";
 import laneRow from "./extensions/lane";
+import laneModelRow from "./extensions/lane-model";
 import laneToolsRow from "./extensions/lane-tools";
 import launchRow from "./extensions/launch";
 import planPathRow from "./extensions/plan-path";
@@ -67,6 +68,7 @@ export default function orchestratorSurface(pi: SurfaceAPI, env: Record<string, 
 	agentChannelRow(ledgerPi, env);
 	workloadRow(pi, env, deps);
 	launchRow(pi, env);
+	laneModelRow(pi, env);
 	ceilingRow(pi, env);
 	questionRow(pi, env);
 	rankRow(pi, env, deps);

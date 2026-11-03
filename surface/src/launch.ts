@@ -90,9 +90,11 @@ export const CONTROL_PREFIXES = [
 	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-notice", "train-autoboard",
 	"withdrawn",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
+	"scratch-archived", "scratch-archive-expired",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
 	"queued",
 	"lane-metrics", "daily-report", "drive-backup",
+	"doctor-strike", "doctor-down", "doctor-up", "doctor-popup", "doctor-boot",
 	"now", "ruling-conflict",
 	"auto-applied", "auto-applied-result", "auto-apply-tripped", "routine-recorded", "ruling-notice-failed",
 	"land-first", "main-retry", "train-reconciled", "runner-preflight", "fast-plan", "fast-fallback", "status-failed",
@@ -111,6 +113,8 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
 export const DAILY_REPORT_BY = "daily-report";
 /** The Drive backup jobs' needs-you writer's `created_by` (surface/scripts/drive-backup-notice.ts), on the standing workload. */
 export const DRIVE_BACKUP_BY = "drive-backup";
+/** `as2 doctor`'s `created_by` (surface/src/doctor.ts: the tick's ctx step, the after-restart job, terminal runs and the popup process), on the standing workload. */
+export const DOCTOR_BY = "as2-doctor";
 /**
  * Fixed writers per prefix (§ 5). `lane-stop`, `plan` and `done-because` are refined in `validWriter`. The
  * starter writes `lane-started:` / `lane-exit:` for the interactive lane it runs in Jo's terminal
@@ -188,7 +192,9 @@ export const DRIVE_BACKUP_BY = "drive-backup";
  * The scratch lines (PLAN wl-mv5oikd5jtquww § 1.5, gates/src/scratch.ts SCRATCH_ENTRY) are machinery's alone, so a lane cannot
  * hide its own over-cap line with a forged `scratch-under-cap:`: `scratch-over-cap:` / `scratch-under-cap:` are the lane row's
  * turn-end measure, written as the lane holding the workload (a holder, `validWriter`); `scratch-disk:` / `scratch-disk-ok:` the
- * daily sweep's (SCRATCH_SWEEP_BY, on the standing workload); `scratch-removed:` / `scratch-remove-failed:` the close's (the surface).
+ * daily sweep's (SCRATCH_SWEEP_BY, on the standing workload); `scratch-removed:` / `scratch-remove-failed:` the close's (the surface);
+ * `scratch-archived:` (an archive written and verified before a root is removed) the close's and the daily sweep's, and
+ * `scratch-archive-expired:` (an archive past `scratchArchive.expireDays` removed) the daily sweep's.
  * Jev ranking's rows (PLAN wl-mv8k039gvogt8g D3, surface/src/rank.ts): `priority-signal:` / `priority-signal-failed:` (on the
  * ranked workload) and `rank-shown:` (on the standing workload) are the ranking machinery's (RANK_BY), whichever session ranked;
  * `rank-goals:`, `rank-override:`, `rank-unpin:` (Jo's words, bound to an input) and `rank-audit:` (the wake tick) are the surface's.
@@ -212,6 +218,10 @@ export const DRIVE_BACKUP_BY = "drive-backup";
  * the run's workload (surface/scripts/test-runner.ts): `fast-plan: <run id> <json>` (the admission's plan), `fast-fallback: <run id>
  * <reason>` (the one Mac fallback of the hosted fast check) and `status-failed: <run id> <state> on <sha>: <error>` (a refused final
  * post). `main-red:` is not one of them: a train holder writes `main-red: <url> run <id>` (surface/src/merge-train.ts D7).
+ * `as2 doctor`'s rows (PLAN wl-mvwks11ye3x9zu § Alerts, surface/src/doctor-entries.ts) are DOCTOR_BY's alone, on the standing workload:
+ * `doctor-strike:` (a first failing tick of the ctx part), `doctor-down:` / `doctor-up:` (a part's episode opens and clears; an open
+ * down is a `report` needs-you line), `doctor-popup:` (a popup process's claim and its outcome, the attempt budget) and
+ * `doctor-boot:` (the after-restart run's once-per-boot mark). A copy by any other writer is dropped here, so nothing forges or clears an alert.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -262,6 +272,8 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"scratch-disk-ok": [SCRATCH_SWEEP_BY],
 	"scratch-removed": [SURFACE_BY],
 	"scratch-remove-failed": [SURFACE_BY],
+	"scratch-archived": [SURFACE_BY, SCRATCH_SWEEP_BY],
+	"scratch-archive-expired": [SCRATCH_SWEEP_BY],
 	"priority-signal": [RANK_BY],
 	"priority-signal-failed": [RANK_BY],
 	"rank-shown": [RANK_BY],
@@ -273,6 +285,11 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"lane-metrics": [LANE_RUNNER_BY],
 	"daily-report": [DAILY_REPORT_BY],
 	"drive-backup": [DRIVE_BACKUP_BY],
+	"doctor-strike": [DOCTOR_BY],
+	"doctor-down": [DOCTOR_BY],
+	"doctor-up": [DOCTOR_BY],
+	"doctor-popup": [DOCTOR_BY],
+	"doctor-boot": [DOCTOR_BY],
 	now: [ESCALATION_BY],
 	"ruling-conflict": [ESCALATION_BY],
 	"auto-applied": [ESCALATION_BY],

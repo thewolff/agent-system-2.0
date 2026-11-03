@@ -12,8 +12,9 @@
 // held under a live lease or without the holder's `done-because:` receipt (unless Jo superseded or withdrew it), commits the rendered
 // entry (decision 13) on the workload's lane branch wl/<id>, never on the checkout's current branch,
 // and pushes it to an open PR (surface/src/close-entry.ts), through the extension API's exec, never
-// the bash tool. Once the row has closed, the workload's scratch root is removed in-process
-// (`closeScratchRoot`, PLAN wl-mv5oikd5jtquww § 1.5); a failed removal is an entry, never a failed close.
+// the bash tool. Once the row has closed, the workload's scratch root is archived and then removed in-process
+// (`closeScratchRoot`, PLAN wl-mv5oikd5jtquww § 1.5 as amended 2026-10-28); a failed archive keeps the root, and a failed
+// archive or removal is an entry, never a failed close.
 import { type InstructionRow, type Ledger, type MessageRow, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { checkHowItFails, HOW_IT_FAILS_HEADING, HOW_IT_FAILS_NA_LINE, howItFailsNote } from "../../gates/src/how-it-fails";
 import { classify, type KindJudge, loadKindQuestion } from "../../classifier/src/classify";
@@ -28,6 +29,7 @@ import { queuePosition, startedIdle } from "../src/rank-launch";
 import { oneLiner } from "../src/render";
 import { surfaceSession } from "../src/session";
 import { inferMode, inferStakes, type JudgedSize, judgedLarge, planFirstTrigger, saidNoPlan, saidPlanIt } from "../src/stakes";
+import { trustedQuotaMove } from "../src/quota-move-alert";
 import { parseSecurityRed, SECURITY_RED_PREFIX } from "../src/test-run";
 import {
 	CLOSE_WORKLOAD_TOOL, type Ctx, DUE_PREFIX, IDENTITY_TOOL, MODE_WORDS, OPEN_WORKLOAD_TOOL, ORCHESTRATOR_RECIPIENT, RECORD_INSTRUCTION_TOOL, SCHEDULE_TOOL,
@@ -66,14 +68,16 @@ const HELD_BODY_MAX = 200;
 
 /**
  * PLAN wl-mvbcjageg7o2yo § 2.5: inside the close transaction, ordinary held orchestrator-bound
- * messages move to `delivered`. Trusted security reds keep their dedicated closed-workload route
- * (`securityRedLines` / `consumeAllToOrchestrator`), so they still reach Jo before being delivered.
+ * messages move to `delivered`. Trusted security reds and trusted quota moves (`trustedQuotaMove`,
+ * PLAN wl-mvwk0v0gmp6cjc D4) keep their dedicated closed-workload route (`securityRedLines` /
+ * `quotaMoveLines` / `consumeAllToOrchestrator`), so they still reach Jo before being delivered.
  * Returns only the rows delivered here.
  */
 function deliverHeldAtClose(ledger: Ledger, id: string): MessageRow[] {
 	const held = ledger.db.query<MessageRow, [string, string]>(
 		"SELECT * FROM messages WHERE workload_id = ?1 AND state = 'held' AND recipient = ?2 ORDER BY created_at, rowid").all(id, ORCHESTRATOR_RECIPIENT)
-		.filter((m) => !(m.created_by === TEST_RUNNER_BY && m.body.startsWith(SECURITY_RED_PREFIX) && parseSecurityRed(m.body)?.workloadId === id));
+		.filter((m) => !(m.created_by === TEST_RUNNER_BY && m.body.startsWith(SECURITY_RED_PREFIX) && parseSecurityRed(m.body)?.workloadId === id))
+		.filter((m) => trustedQuotaMove(ledger, m) === null);
 	for (const m of held) ledger.advanceMessage(m.id, "delivered", { by: SURFACE_BY });
 	return held;
 }
@@ -177,8 +181,9 @@ export async function closeWorkloadWithEntry(
 			details: { id, path: entry?.path ?? null, branch: entry?.branch ?? null, commit, closed: false }, receipt: done,
 		};
 	}
-	// PLAN wl-mv5oikd5jtquww § 1.5: the closed workload's scratch root goes now; a failed removal is an entry, never a failed close.
-	const scratch = closeScratchRoot(ledger, env, id);
+	// PLAN wl-mv5oikd5jtquww § 1.5 (amended 2026-10-28): the closed workload's scratch root is archived, then removed; an archive
+	// that fails keeps the root. The done-because is passed so a deliverable it names inside the root is reported with its archive.
+	const scratch = closeScratchRoot(ledger, env, id, { doneBecause: done });
 	const pub: EntryPublish | null = entry && commit === null ? await publishEntry(pi, entry, id) : null;
 	const details = { id, path: entry?.path ?? null, branch: entry?.branch ?? null, commit, push: pub?.push ?? null, pr: pub?.pr ?? null, prReason: pub?.prReason ?? null, check: checked };
 	pi.appendEntry("surface-close", details);

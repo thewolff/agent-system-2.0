@@ -11,9 +11,9 @@ const SRC = join(import.meta.dir, "..", "src");
 const sources = ["errors.ts"].map((f) => readFileSync(join(SRC, f), "utf8")).join("\n");
 
 describe("every needs-you line kind names its next step", () => {
-	test("the kind list is the full union: seventeen kinds, none repeated", () => {
-		expect(NEEDS_YOU_KINDS).toHaveLength(17);
-		expect(new Set(NEEDS_YOU_KINDS).size).toBe(17);
+	test("the kind list is the full union: nineteen kinds, none repeated", () => {
+		expect(NEEDS_YOU_KINDS).toHaveLength(19);
+		expect(new Set(NEEDS_YOU_KINDS).size).toBe(19);
 	});
 
 	test("each kind is built somewhere with a `next` field, and no line is built without one", () => {

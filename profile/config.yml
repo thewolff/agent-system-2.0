@@ -310,8 +310,8 @@ testRunner:
   # Every fast set includes these smoke files. Files in macOnly run only in the full main suite:
   # macOS-specific sandbox, shell, filesystem and process APIs cannot be exercised on Linux;
   # the remaining portability cases depend on Linux filesystem identity/order/timing behavior.
-  # The 13 macOS-only files and four portability files found by the Linux probe, and test-runner-smoke found by the
-  # as2-hosted run of 2026-10-28 (each reason below), stay out of hosted Linux. They run in the post-merge Mac full
+  # Each file in macOnly (its reason beside it; the first 13 macOS-only and four portability files came from the Linux
+  # probe) stays out of hosted Linux. They run in the post-merge Mac full
   # suite and in .github/workflows/as2-hosted.yml's macos-latest job. Keep zsh and bubblewrap
   # tests in the fast set; the hosted workflow installs both. Activation is a ledger word, not a flag.
   # timing-lint.test.ts is the incidental-timing ratchet (Jo's rule, 2026-10-28): static, under a second, and it must
@@ -339,6 +339,7 @@ testRunner:
     surface/test/decision-log.test.ts: Linux directory iteration ordering differs
     surface/test/test-runner.test.ts: Linux timing/signal behavior differs in test T2c
     surface/test/test-runner-smoke.test.ts: admission reads the _as2test process snapshot, which Linux cannot inspect (S5b settles as admission refused, inspection denied)
+    surface/test/timing-proof.test.ts: historic load spawns /usr/sbin/taskpolicy and its teardown reads the darwin process list, neither of which exists on Linux
     surface/test/drive-backup.test.ts: the Drive backup zsh suites use macOS stat/md5/xattr/osascript and the Drive for desktop (DriveFS) layout
   # Files a main run's believability leaves out (§ 2 Main state, jo-issues #243): they need Jo's own machine (an
   # installed OMP) and skip every test under _as2test, so 185 of 195 files is the most a main run can execute and
@@ -424,3 +425,18 @@ jevRank:
 channel:
   senders:
     - { id: plumb, transport: omp-mailbox, authority: notes }
+
+# ── Scratch archives (surface/src/scratch-archive.ts readScratchArchiveConfig) ──
+# A closed workload's scratch root, and every root the daily sweep (surface/scripts/scratch-sweep.ts) removes,
+# is first written to one verified .tar.gz under ~/agent-scratch/agent-system-2.0/scratch-archive/<UTC date>/;
+# a root whose archive fails is kept. The per-root and total size caps stay in AGENT_SYSTEM_SCRATCH_CAP_MB and
+# AGENT_SYSTEM_SCRATCH_TOTAL_MB. expireDays: the daily sweep removes archives older than this (days, by mtime).
+# requireOffsite: when true, an archive expires only once an offsite copy job has written `<archive>.offsite`
+# beside it; false is plain age expiry. minFreeGib: the sweep's `scratch-disk:` needs-you line also opens when
+# free space on the scratch volume is under this many GiB. Read by the sweep at each run; a missing block or a
+# malformed key is its default (14, false, 20). OMP has no registration for the key and keeps it in the raw layer.
+# Reversal: delete the block (the defaults apply).
+scratchArchive:
+  expireDays: 14
+  requireOffsite: false
+  minFreeGib: 20

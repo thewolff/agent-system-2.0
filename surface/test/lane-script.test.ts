@@ -316,7 +316,8 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 
 describe("lane script: every exit is classified (decision 14; Codex review B1, B2, B3, B4)", () => {
 	test("B1 never-claims: valid rpc frames without the lane's claim → SIGKILL at the readiness window, launch-failed: + lane-died:, lease released, no prompt sent", async () => {
-		const r = makeRoot();
+		// The window elapsing is the subject: a short one, set here (the root's default is the production window).
+		const r = makeRoot({ AGENT_SYSTEM_LANE_READY_MS: "4000" });
 		const { wl } = openWorkload(r);
 		setScript(r, { claim: false, steps: [] });
 		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);

@@ -593,7 +593,8 @@ class Run {
 		// The profile: install.sh from the copy, as a fresh machine (install/fresh-machine-test.sh run_install).
 		const install = await this.run(["bash", join(this.repo, "install", "install.sh")], { cwd: this.repo, env: { PATH: this.env.PATH!, HOME: this.home }, ms: 300_000 });
 		writeFileSync(join(this.S, "install.log"), `${install.out}\n--- stderr ---\n${install.err}`);
-		if (install.code !== 0) throw new HarnessError(`install.sh exited ${install.code}${install.timedOut ? " (timed out)" : ""}: ${oneLine(install.err.trim().split("\n").at(-1) ?? "")} (log ${join(this.S, "install.log")})`);
+		const outcome = installOutcome(install, join(this.S, "install.log"));
+		if (outcome.note !== null) this.notes.push(outcome.note);
 		if (!existsSync(join(this.agentDir, "config.yml"))) throw new HarnessError(`install.sh wrote no profile at ${this.agentDir}`);
 		this.profile = writeStubProfile(this.agentDir, this.stub.port, { unrouted: [EGRESS_PROBE.provider], chatModel: CHAT_MODEL });
 		this.notes.push(`setup: clone and copy ${secs(tClone - t0)}, install and profile ${secs(Date.now() - tClone)}`);
@@ -1322,4 +1323,21 @@ if (import.meta.main) {
 	process.exit(await main(process.argv.slice(2)));
 }
 
-export { parseArgs, nonceMisses };
+/** install.sh exit code for "the closing doctor found failing parts" (install/install.sh header: "else `install incomplete: as2 doctor found failing parts (above)` and exit 5"). */
+const INSTALL_DOCTOR_FAILED = 5;
+
+/**
+ * What setup makes of install.sh's result. Exit 0 is success, silently. Exit INSTALL_DOCTOR_FAILED is success with one log line: the
+ * profile is written before the closing doctor runs, and the doctor's seat part cannot pass in a scratch clone (no orchestrator runs
+ * for it). Any other exit throws HarnessError. install's full output goes to install.log whatever the code (the caller writes it
+ * before this runs).
+ */
+function installOutcome(install: { code: number | null; timedOut?: boolean; err: string }, logPath: string): { note: string | null } {
+	if (install.code === 0) return { note: null };
+	if (install.code === INSTALL_DOCTOR_FAILED && !install.timedOut) {
+		return { note: `install.sh's closing doctor failed in the scratch HOME (exit ${INSTALL_DOCTOR_FAILED}), as expected for an isolated clone: no orchestrator runs for it, so the seat part cannot pass; full output in ${logPath}` };
+	}
+	throw new HarnessError(`install.sh exited ${install.code}${install.timedOut ? " (timed out)" : ""}: ${oneLine(install.err.trim().split("\n").at(-1) ?? "")} (log ${logPath})`);
+}
+
+export { parseArgs, nonceMisses, installOutcome, INSTALL_DOCTOR_FAILED };

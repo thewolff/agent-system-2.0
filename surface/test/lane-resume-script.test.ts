@@ -20,8 +20,9 @@ afterAll(async () => {
 	for (const r of roots) rmSync(r.root, { recursive: true, force: true });
 	for (const result of settled) if (result.status === "rejected") throw result.reason;
 }, 60_000);
-function fixture(model: string | null = X, readyMs = "4000") {
-	const r = laneRoot({ AGENT_SYSTEM_LANE_READY_MS: readyMs }, "resume", process.env.AS2_SCRATCH);
+// The root's readiness window is the production one; only the test whose subject is the window elapsing passes a short one.
+function fixture(model: string | null = X, readyMs?: string) {
+	const r = laneRoot(readyMs === undefined ? {} : { AGENT_SYSTEM_LANE_READY_MS: readyMs }, "resume", process.env.AS2_SCRATCH);
 	roots.push(r);
 	const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
 	const wl = l.openWorkload({ by: SURFACE_BY, brief: "resume regression", stakes: "normal", mode: "autonomous" });
