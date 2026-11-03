@@ -7,23 +7,28 @@
 // exit including a thrown exception after the reservation (B3), a stop persists its acceptance
 // then abort → stdin EOF → bounded SIGKILL (B4), and every exit is classified with a requested stop
 // never writing lane-died:.
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { ceilingBody, parseCeilingNotice, parseSpend } from "../src/ceiling";
-import { apply, interpret } from "../src/input";
+import { apply, applyTrain, interpret } from "../src/input";
+import {
+	emptyTrainScan, scanTrainDays, trainBudgetGate, trainBudgetRows, trainBudgetSliceId, trainMeterErrors, trainPausedBody, trainRaiseBody, type TrainScanResult,
+} from "../src/train-budget";
+import { TRAIN_LAUNCH_LIMIT, trainMeterQuestionBody, trainSliceId } from "../src/merge-train";
 import { errorLines } from "../src/errors";
 import { recordRepo } from "../src/decision-log";
-import { branchName, type ControlEntry, doneBody, laneCap, laneDir, laneEnv, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, verdictOf, worktreePath } from "../src/launch";
+import { branchName, type ControlEntry, doneBody, laneCap, laneDir, laneEnv, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, trainFixBody, verdictOf, worktreePath } from "../src/launch";
 import { heartbeatText, runDirOf, runsRoot, testRequestedBody, testRunBody } from "../src/test-run";
 // A namespace import, not named ones: a name lane.ts stops exporting fails only the test that calls it, not the module load.
 import * as laneScript from "../scripts/lane";
-import { SURFACE_BY } from "../src/types";
+import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
 import {
-	alive, drainEnded, drainLinesOf, drainSettled, drainsSpawned, type FakeStep, fakeRecords, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh, until,
+	alive, clock, drainEnded, drainLinesOf, drainSettled, drainsSpawned, type FakeStep, fakeRecords, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh,
+	tempLedger, tmp, until,
 } from "./helpers";
 
 const roots: LaneRoot[] = [];
@@ -1478,6 +1483,296 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 			w.close();
 		}
 	}, 90_000);
+});
+
+describe("lane script: a merge train's daily budget meter (PLAN wl-mvr888nftz0vcl D4, R3, R4, R5, R10, R22)", () => {
+	/** A merge train on the root's repo, opened by Jo's word (`train 101`). */
+	function openTrain(r: LaneRoot): string {
+		const l = ledgerOf(r);
+		try {
+			const cmd = interpret(l, "train 101");
+			if (cmd?.kind !== "train") throw new Error(`not a train: ${JSON.stringify(cmd)}`);
+			return applyTrain(l, cmd, r.repo).workloadId;
+		} finally {
+			l.close();
+		}
+	}
+	const maxTimeOf = (argv: readonly string[] | undefined) => argv?.[argv.indexOf("--max-time") + 1];
+
+	test("R22: every train lane start writes train-rule: before lane-ready:, runs --max-time 1440m, and its prompt carries the budget, never a ceiling", async () => {
+		const r = makeRoot();
+		const wl = openTrain(r);
+		setMeterScript(r, [{ tool: "lane_record_entry", args: { body: "train note" } }, { hang: true }]);
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		await readyOf(r, wl, laneId);
+		const snap = laneSnapshot(r, wl);
+		const rule = snap.entries.findIndex((e) => e.body.startsWith("train-rule:"));
+		const ready = snap.entries.findIndex((e) => e.body.startsWith(`lane-ready: ${laneId}`));
+		expect(snap.entries[rule]).toMatchObject({ created_by: LANE_RUNNER_BY, body: `train-rule: ${laneId} permanent budget 150 per PDT day max-time 1440m` });
+		expect(rule).toBeLessThan(ready);
+		const [rec] = fakeRecords(r);
+		expect(maxTimeOf(rec!.argv)).toBe("1440m");
+		const prompt = await until("the first prompt", () => fakeRecords(r).find((x) => x.pid === rec!.pid && x.event === "prompt"));
+		expect(prompt.message).toMatch(/budget: \$150 for today \(America\/Los_Angeles; \$150 base\); spent today \$0\.00; renews \d{4}-\d{2}-\d{2}T\d{2}:00:00\.000Z; no wall ceiling\./);
+		expect(prompt.message).not.toContain("ceiling: $");
+		expect(lane(r, ["stop", wl]).code).toBe(0);
+		await exitOf(r, wl, laneId);
+	}, 60_000);
+
+	test("a shorter AGENT_SYSTEM_LANE_MAX_TIME still wins on a train, and train-rule: says so", async () => {
+		const r = makeRoot({ AGENT_SYSTEM_LANE_MAX_TIME: "30m" });
+		const wl = openTrain(r);
+		setMeterScript(r, [{ hang: true }]);
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		await readyOf(r, wl, laneId);
+		expect(maxTimeOf(fakeRecords(r)[0]!.argv)).toBe("30m");
+		expect(laneSnapshot(r, wl).bodies).toContain(`${LANE_RUNNER_BY} train-rule: ${laneId} permanent budget 150 per PDT day max-time 30m`);
+		expect(lane(r, ["stop", wl]).code).toBe(0);
+		await exitOf(r, wl, laneId);
+	}, 60_000);
+
+	test("R5: an assistant line with no timestamp is a meter error: train-meter-error: plus lane-stop: accepted meter-error in place of a ceiling stop, and the gate refuses the next launch", async () => {
+		const r = makeRoot();
+		const wl = openTrain(r);
+		// The fake's usage line carries no top-level timestamp (surface/test/fake-omp.ts): the strict scan refuses to date it.
+		setMeterScript(r, [{ usage: { usd: 0.5, tokens: 10 } }, { hang: true }]);
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "stop", reason: "meter-error" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.deaths).toEqual([]);
+		expect(snap.workload!.holder).toBeNull();
+		const [rec] = fakeRecords(r);
+		const errors = snap.control.filter((c) => c.prefix === "train-meter-error");
+		expect(errors).toHaveLength(1);
+		expect(errors[0]!.createdBy).toBe(LANE_RUNNER_BY);
+		expect(errors[0]!.rest).toMatch(new RegExp(`^${laneId} ${rec!.session!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:\\d+ an assistant line with no parseable top-level timestamp; evidence /.+/meter-errors/${laneId}-\\S+\\.json$`));
+		expect(snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === laneId).map((s) => [s.createdBy, s.rest])).toEqual([[LANE_RUNNER_BY, "accepted meter-error"]]);
+		expect(ceilingNoticesOf(r, wl)).toEqual([]);
+		expect(snap.control.filter((c) => c.prefix === "train-paused")).toEqual([]);
+		await drainSettled(r, laneId);
+		const again = lane(r, ["launch", wl, "--requested-by", "test"]);
+		expect(again.code).toBe(STARTER_EXIT["not-launchable"]!);
+		expect(again.out + again.err).toContain(`${wl} not launched: meter-error`);
+		expect(laneSnapshot(r, wl).control.filter((c) => c.prefix === "launch")).toHaveLength(1);
+	}, 60_000);
+
+	test("R10: a train fix workload is no train: its run keeps the ceiling's prompt line, no train-rule:", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r);
+		const l = ledgerOf(r);
+		try {
+			l.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainFixBody({ repo: "acme/web", pr: 101, train: "wl-mvzzzzzzzzzzzz", trainEntry: "en-abc" }) });
+		} finally {
+			l.close();
+		}
+		tinyCeiling(r, wl, 1);
+		setMeterScript(r, [{ hang: true }]);
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		const [rec] = await until("the fake's start record", () => (fakeRecords(r).length > 0 ? fakeRecords(r) : null));
+		const prompt = await until("the first prompt", () => fakeRecords(r).find((x) => x.pid === rec!.pid && x.event === "prompt"));
+		expect(prompt.message).toContain("ceiling: $1 / 60 min for the workload");
+		expect(maxTimeOf(rec!.argv)).not.toBe("1440m");
+		expect(laneSnapshot(r, wl).control.filter((c) => c.prefix === "train-rule")).toEqual([]);
+		expect(lane(r, ["stop", wl]).code).toBe(0);
+		await exitOf(r, wl, laneId);
+	}, 60_000);
+});
+
+describe("trainMeterPoll: one transaction per poll (PLAN wl-mvr888nftz0vcl D4, R3, R4, R5, R27)", () => {
+	const LANE = "lane-mvtrain-1";
+	// 2026-11-02 18:00 PST, a fixed instant: its PDT day is 2026-11-02 and the next midnight 2026-11-03T08:00Z.
+	const NOW = Date.parse("2026-11-02T18:00:00.000Z");
+	const line = (timestamp: string, total: number) => JSON.stringify({ type: "message", timestamp, message: { role: "assistant", usage: { cost: { total } } } });
+	/** A train on a temp ledger, a session directory whose one file `scanOf` rewrites and scans from byte 0, and the lane directory a meter error's evidence goes under. */
+	interface TrainWorld {
+		ledger: Ledger;
+		path: string;
+		wl: string;
+		laneDir: string;
+		scanOf: (lines: string[]) => TrainScanResult;
+	}
+	function world(): TrainWorld {
+		const c = clock("2026-11-02T17:00:00.000Z");
+		const { ledger, path } = tempLedger(c.now);
+		const cmd = interpret(ledger, "train 101 106");
+		if (cmd?.kind !== "train") throw new Error(`not a train: ${JSON.stringify(cmd)}`);
+		const wl = applyTrain(ledger, cmd, tmp("train-repo")).workloadId;
+		const dir = tmp("train-sessions");
+		const scanOf = (lines: string[]) => {
+			writeFileSync(join(dir, "s.jsonl"), `${lines.join("\n")}\n`);
+			return scanTrainDays(dir, emptyTrainScan());
+		};
+		return { ledger, path, wl, laneDir: tmp("train-lane"), scanOf };
+	}
+	const poll = (w: TrainWorld, s: TrainScanResult, nowMs = NOW) =>
+		laneScript.trainMeterPoll(w.ledger, { workloadId: w.wl, laneId: LANE, laneDir: w.laneDir, scan: s.scan, errors: s.errors, nowMs });
+	const bodiesOf = (w: TrainWorld, prefix: string) => w.ledger.entries(w.wl).filter((e) => e.body.startsWith(prefix));
+	/** The evidence file a `train-meter-error:` cites, read back as JSON. */
+	const evidenceOf = (body: string): { workloadId: string; laneId: string; at: string; count: number; defects: { file: string; line: number; reason: string }[] } => {
+		const m = /; evidence (\/.+\.json)$/.exec(body);
+		if (!m) throw new Error(`no evidence path in ${body}`);
+		return JSON.parse(readFileSync(m[1]!, "utf8"));
+	};
+
+	test("under the day's limit nothing is written: no notice, no wall, no stop; yesterday's spend is not today's", () => {
+		const w = world();
+		const before = w.ledger.entries(w.wl).length;
+		const p = poll(w, w.scanOf([line("2026-11-02T07:30:00.000Z", 140), line("2026-11-02T17:00:00.000Z", 149.99)]));
+		expect(p).toMatchObject({ stop: false, ref: null, day: "2026-11-02", spent: 149.99 });
+		expect(w.ledger.entries(w.wl)).toHaveLength(before);
+		expect(w.ledger.questions(w.wl)).toEqual([]);
+	});
+
+	test("at the limit: train-paused: with the lane's PR and the next PDT midnight, its raise/wait question and lane-stop: accepted budget, in one poll", () => {
+		const w = world();
+		w.ledger.recordEntry({ by: LANE, workloadId: w.wl, kind: "assumption", body: "train-pr: 106 start" });
+		const p = poll(w, w.scanOf([line("2026-11-02T17:00:00.000Z", 100), line("2026-11-02T17:30:00.000Z", 50)]));
+		expect(p).toMatchObject({ stop: true, ref: "budget", accepted: true, spent: 150, errorId: null });
+		expect(bodiesOf(w, "train-paused:").map((e) => [e.id, e.created_by, e.body])).toEqual([
+			[p.pauseId, LANE_RUNNER_BY, trainPausedBody({ laneId: LANE, day: "2026-11-02", usd: 150, limit: 150, pr: 106, until: "2026-11-03T08:00:00.000Z" })],
+		]);
+		const qs = w.ledger.questions(w.wl);
+		expect(qs.map((q) => [q.id, q.slice_id, q.state])).toEqual([[p.questionId, trainBudgetSliceId(w.wl, p.pauseId!), "open"]]);
+		expect(qs[0]!.body.split("\n")[0]).toBe(`merge train ${w.wl} spent $150.00 of its $150 for 2026-11-02 (PDT) while on PR #106; paused until midnight PDT (2026-11-03T08:00:00.000Z)`);
+		expect(bodiesOf(w, "lane-stop:").map((e) => [e.created_by, e.body])).toEqual([[LANE_RUNNER_BY, laneStopAcceptedBody(LANE, "budget")]]);
+	});
+
+	test("the limit is read at the poll: a raise for today lets the lane go on; a raise for yesterday does not", () => {
+		const w = world();
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.wl, kind: "assumption", body: trainRaiseBody("2026-11-01", 500, "in-a") });
+		const s = w.scanOf([line("2026-11-02T17:00:00.000Z", 160)]);
+		expect(poll(w, s).ref).toBe("budget");
+		const v = world();
+		v.ledger.recordEntry({ by: SURFACE_BY, workloadId: v.wl, kind: "assumption", body: trainRaiseBody("2026-11-02", 50, "in-b") });
+		expect(poll(v, v.scanOf([line("2026-11-02T17:00:00.000Z", 160)]))).toMatchObject({ stop: false, ref: null });
+		expect(poll(v, v.scanOf([line("2026-11-02T17:00:00.000Z", 200)]))).toMatchObject({ stop: true, ref: "budget" });
+		expect(bodiesOf(v, "train-paused:")[0]!.body).toContain(" usd 200 limit 200 pr none until ");
+	});
+
+	test("a scan defect writes train-meter-error: and lane-stop: accepted meter-error; a pause the same poll reaches is written too", () => {
+		const w = world();
+		const p = poll(w, w.scanOf([line("2026-11-02T17:00:00.000Z", 151), "{torn", JSON.stringify({ type: "message", message: { role: "assistant" } })]));
+		expect(p).toMatchObject({ stop: true, ref: "meter-error", accepted: true });
+		expect(bodiesOf(w, "train-meter-error:")).toHaveLength(1);
+		expect(bodiesOf(w, "train-paused:")).toHaveLength(1);
+		expect(bodiesOf(w, "lane-stop:").map((e) => e.body)).toEqual([laneStopAcceptedBody(LANE, "meter-error")]);
+	});
+
+	test("every defect is kept: two defects are both named in train-meter-error:, and its evidence file under the lane directory holds both", () => {
+		const w = world();
+		const s = w.scanOf([line("2026-11-02T17:00:00.000Z", 1), "{torn", JSON.stringify({ type: "message", message: { role: "assistant" } })]);
+		const p = poll(w, s);
+		expect(p).toMatchObject({ stop: true, ref: "meter-error", accepted: true });
+		const errs = bodiesOf(w, "train-meter-error:");
+		expect(errs.map((e) => e.id)).toEqual([p.errorId!]);
+		const f = s.errors[0]!.file;
+		const evidence = join(w.laneDir, "meter-errors", `${LANE}-2026-11-02T18-00-00.000Z.json`);
+		expect(p.evidence).toEqual({ path: evidence });
+		expect(errs[0]!.body).toBe(`train-meter-error: ${LANE} ${f}:2 the line is not JSON; ${f}:3 an assistant line with no parseable top-level timestamp; evidence ${evidence}`);
+		expect(evidenceOf(errs[0]!.body)).toEqual({
+			workloadId: w.wl, laneId: LANE, at: "2026-11-02T18:00:00.000Z", count: 2,
+			defects: [{ file: f, line: 2, reason: "the line is not JSON" }, { file: f, line: 3, reason: "an assistant line with no parseable top-level timestamp" }],
+		});
+		// The parser, the gate and the meter question read the whole entry: both defects and the evidence path.
+		const rows = trainBudgetRows({ workload: { id: w.wl }, entries: w.ledger.entries(w.wl), questions: w.ledger.questions(w.wl), instructions: w.ledger.instructions(w.wl) });
+		const [parsed] = trainMeterErrors(rows.control);
+		expect(parsed).toMatchObject({ entryId: p.errorId, laneId: LANE, detail: errs[0]!.body.slice(`train-meter-error: ${LANE} `.length) });
+		const gate = trainBudgetGate(rows, w.ledger.now());
+		expect(gate).toMatchObject({ reason: "meter-error", entryId: p.errorId });
+		expect(gate!.detail).toContain(`${f}:3 an assistant line with no parseable top-level timestamp; evidence ${evidence}`);
+		expect(trainMeterQuestionBody(w.wl, parsed!)).toContain(`${f}:2 the line is not JSON; ${f}:3 an assistant line with no parseable top-level timestamp; evidence ${evidence} (${p.errorId})`);
+	});
+
+	test("twelve defects: the entry names the first ten and `and 2 more`; the evidence file holds all twelve", () => {
+		const w = world();
+		const s = w.scanOf(Array.from({ length: 12 }, (_, i) => `{torn ${i}`));
+		expect(s.errors).toHaveLength(12);
+		expect(poll(w, s)).toMatchObject({ stop: true, ref: "meter-error", accepted: true });
+		const body = bodiesOf(w, "train-meter-error:")[0]!.body;
+		const f = s.errors[0]!.file;
+		const named = Array.from({ length: 10 }, (_, i) => `${f}:${i + 1} the line is not JSON`).join("; ");
+		expect(body).toBe(`train-meter-error: ${LANE} ${named}; and 2 more; evidence ${join(w.laneDir, "meter-errors", `${LANE}-2026-11-02T18-00-00.000Z.json`)}`);
+		const kept = evidenceOf(body);
+		expect(kept.count).toBe(12);
+		expect(kept.defects.map((d) => `${d.file}:${d.line} ${d.reason}`)).toEqual(s.errors.map((e) => `${e.file}:${e.line} ${e.reason}`));
+	});
+
+	test("review r2 B1: an evidence file that cannot be written still stops the lane; the entry names every defect and why the write failed, stderr lists every defect, and the parser, gate and question read it all", () => {
+		const w = world();
+		// The lane directory is a plain file, so meter-errors/ under it cannot be made.
+		const blocked = join(w.laneDir, "not-a-dir");
+		writeFileSync(blocked, "");
+		// thirteen torn lines, past TRAIN_METER_NAMED: each defect is told apart by its own line number
+		const s = w.scanOf(Array.from({ length: 13 }, (_, i) => `{torn ${i}`));
+		expect(s.errors).toHaveLength(13);
+		const stderr = spyOn(process.stderr, "write").mockImplementation(() => true);
+		let p: laneScript.TrainMeterPoll;
+		let logged: string;
+		try {
+			p = laneScript.trainMeterPoll(w.ledger, { workloadId: w.wl, laneId: LANE, laneDir: blocked, scan: s.scan, errors: s.errors, nowMs: NOW });
+		} finally {
+			logged = stderr.mock.calls.map((c) => String(c[0])).join("");
+			stderr.mockRestore();
+		}
+		expect(p).toMatchObject({ stop: true, ref: "meter-error", accepted: true });
+		const failed = p.evidence !== null && "failed" in p.evidence ? p.evidence.failed : null;
+		expect(failed).toContain(`(under ${blocked})`);
+		const body = bodiesOf(w, "train-meter-error:")[0]!.body;
+		const every = s.errors.map((e) => `${e.file}:${e.line} ${e.reason}`);
+		expect(body).toStartWith(`train-meter-error: ${LANE} ${every.join("; ")}; evidence write failed: `);
+		expect(body).not.toContain(" more;");
+		expect(body).toMatch(/ENOTDIR|EEXIST|not a directory/i);
+		expect(logged).toContain(`could not be written: ${failed}; its train-meter-error: names all 13 defects instead`);
+		for (const d of every) expect(logged).toContain(`${LANE} meter defect ${d}\n`);
+		expect(bodiesOf(w, "lane-stop:").map((e) => e.body)).toEqual([laneStopAcceptedBody(LANE, "meter-error")]);
+		expect(existsSync(join(blocked, "meter-errors"))).toBe(false);
+		const rows = trainBudgetRows({ workload: { id: w.wl }, entries: w.ledger.entries(w.wl), questions: w.ledger.questions(w.wl), instructions: w.ledger.instructions(w.wl) });
+		const [parsed] = trainMeterErrors(rows.control);
+		expect(parsed).toMatchObject({ entryId: p.errorId, laneId: LANE, detail: body.slice(`train-meter-error: ${LANE} `.length) });
+		const gate = trainBudgetGate(rows, w.ledger.now());
+		const question = trainMeterQuestionBody(w.wl, parsed!);
+		for (const d of every) {
+			expect(gate!.detail).toContain(d);
+			expect(question).toContain(d);
+		}
+	});
+
+	test("a failed write after a stop was decided still stops (accepted false) and logs that the stop counts against the launch limit; under the limit a failure throws", () => {
+		const w = world();
+		const db = new Database(w.path);
+		try {
+			db.exec("CREATE TRIGGER inject_failure BEFORE INSERT ON entries WHEN NEW.body LIKE 'train-paused:%' BEGIN SELECT RAISE(ABORT, 'injected'); END;");
+		} finally {
+			db.close();
+		}
+		const stderr = spyOn(process.stderr, "write").mockImplementation(() => true);
+		let p: laneScript.TrainMeterPoll;
+		let logged: string;
+		try {
+			p = poll(w, w.scanOf([line("2026-11-02T17:00:00.000Z", 151)]));
+		} finally {
+			logged = stderr.mock.calls.map((c) => String(c[0])).join("");
+			stderr.mockRestore();
+		}
+		expect(p).toMatchObject({ stop: true, ref: "budget", accepted: false, pauseId: null });
+		expect(logged).toContain(`runner: the train meter's budget stop could not be written on ${w.wl}: `);
+		expect(logged).toContain(
+			`the lane is stopped anyway, and with no episode row naming ${LANE} this stop counts against the train's launch limit (${TRAIN_LAUNCH_LIMIT} failed launches)`,
+		);
+		expect(bodiesOf(w, "lane-stop:")).toEqual([]);
+		expect(() => laneScript.trainMeterPoll(w.ledger, { workloadId: "wl-missing", laneId: LANE, scan: emptyTrainScan(), errors: [], nowMs: NOW })).toThrow(/no workload wl-missing/);
+	});
+
+	test("activeTrainPr's fallback names the PR slice the lane last wrote on, and none when it wrote on none", () => {
+		const w = world();
+		w.ledger.addSlice({ by: LANE, workloadId: w.wl, id: trainSliceId(w.wl, 101), task: "PR 101", doneCondition: "merged", inputs: "PR" });
+		poll(w, w.scanOf([line("2026-11-02T17:00:00.000Z", 151)]));
+		expect(bodiesOf(w, "train-paused:")[0]!.body).toContain(" pr 101 until ");
+	});
 });
 
 describe("item 71: a queued launch starts when a lane slot frees (the runner's drain)", () => {

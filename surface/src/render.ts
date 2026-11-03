@@ -19,11 +19,13 @@ import { type ErrorLine, errorLines, parseDue, wordsOf } from "./errors";
 import { type Identity, identityOf } from "./identity";
 import { parseSpend } from "./ceiling";
 import { ceilingOf, ceilingText, openPairOffer } from "./input";
+import { trainMembers } from "./merge-train";
 import { byHandLine, type ControlEntry, controlEntries, doneLine, holdersOf, isPlanQuestionIn, planFirst, priorityPausedOf, priorityPausingOf, queuedOf } from "./launch";
 import { pairOfferLine, shownOptions } from "./pair-suggest";
 import { Numbering } from "./numbering";
 import { currentGoals, livePins, parseAudit, rankDay, rankOpen, rankPosition } from "./rank";
 import { queuePosition } from "./rank-launch";
+import { pdtDay, trainDayLimit, trainPauses, trainRaises } from "./train-budget";
 import { LAST_N, LEDGER_TOOL, STANDING_WORKLOAD_ID } from "./types";
 
 export interface RenderOptions {
@@ -57,20 +59,20 @@ export interface Rendered {
 /**
  * `stakes: normal (default …) · mode: autonomous` — one line, both halves flippable in one word; `plan first: …` when the flag stands (decision 15);
  * `queued #N of M` while the workload is in the intake queue (PLAN wl-mvbcjadqgblr7k D8, N from `queuePosition`);
- * the effective ceiling last (DESIGN-workload-ceiling.md § 2 item 5).
+ * the effective ceiling last (DESIGN-workload-ceiling.md § 2 item 5), or for a merge train its daily budget (`trainBudgetText`).
  */
 export function oneLiner(ledger: Ledger, workload: WorkloadStatusRow): string {
 	const p = oneLinerParts(ledger, workload);
-	return `${p.state} — flip either with one word: throwaway / normal / production, autonomous / user-driven · ceiling ${p.ceiling}`;
+	return `${p.state} — flip either with one word: throwaway / normal / production, autonomous / user-driven · ${p.limit}`;
 }
 
-/** The one-liner without its flip hint: `stakes: X · mode: Y[ · plan first: …][ · queued #N of M] · ceiling $A / Bh` (the wake line's core, and a "which one?" candidate, surface/extensions/surface-input.ts). */
+/** The one-liner without its flip hint: `stakes: X · mode: Y[ · plan first: …][ · queued #N of M] · ceiling $A / Bh` (a train: `· budget $L/PDT day · no wall[ · paused until <iso>]`; the wake line's core, and a "which one?" candidate, surface/extensions/surface-input.ts). */
 export function oneLinerCore(ledger: Ledger, workload: WorkloadStatusRow): string {
 	const p = oneLinerParts(ledger, workload);
-	return `${p.state} · ceiling ${p.ceiling}`;
+	return `${p.state} · ${p.limit}`;
 }
 
-function oneLinerParts(ledger: Ledger, workload: WorkloadStatusRow): { state: string; ceiling: string } {
+function oneLinerParts(ledger: Ledger, workload: WorkloadStatusRow): { state: string; limit: string } {
 	const flips = ledger.instructions(workload.id).filter((i) => i.kind === "mode-flip");
 	const lastFlip = flips[flips.length - 1];
 	const effective = ledger.entries(workload.id, "mode-effective");
@@ -83,7 +85,26 @@ function oneLinerParts(ledger: Ledger, workload: WorkloadStatusRow): { state: st
 	// D8: the queue tag ends with the first launch attempt (`queuedOf`); never a needs-you line, a queued ask waits by design.
 	const queued = queuedOf(control) !== null ? queuePosition(ledger, workload.id, ledger.now()) : null;
 	const queuedPart = queued ? ` · queued #${queued.position} of ${queued.of}` : "";
-	return { state: `stakes: ${workload.stakes} · mode: ${mode}${planPart}${queuedPart}`, ceiling: ceilingText(ceilingOf(ledger, workload.id)) };
+	const train = trainBudgetText(ledger, workload.id);
+	return { state: `stakes: ${workload.stakes} · mode: ${mode}${planPart}${queuedPart}`, limit: train ?? `ceiling ${ceilingText(ceilingOf(ledger, workload.id))}` };
+}
+
+// ---- a merge train's daily budget (PLAN wl-mvr888nftz0vcl D4, D5) ------------------------------------------------
+
+/**
+ * A merge train's limit part of the one-liner: `budget $<L>/PDT day · no wall`, L today's limit (`trainDayLimit`: $150 plus
+ * every valid `train-raise:` for today's PDT day), then ` · paused until <iso>` while the newest valid `train-paused:` runs
+ * past now and no raise for its day came after it, the gate's `budget-paused` rule (`trainBudgetGate`, which decides
+ * launches; this only shows). Null for a workload with no train membership (`trainMembers`): it keeps its ceiling.
+ */
+function trainBudgetText(ledger: Ledger, workloadId: string): string | null {
+	if (trainMembers(ledger.entries(workloadId), ledger.instructions(workloadId)).length === 0) return null;
+	const now = ledger.now();
+	const control = controlEntries(ledger.entries(workloadId, "assumption"));
+	const p = trainPauses(control).at(-1);
+	const paused = p !== undefined && Date.parse(p.until) > Date.parse(now)
+		&& !trainRaises(control).some((r) => r.day === p.day && control.findIndex((c) => c.id === r.entryId) > control.findIndex((c) => c.id === p.entryId));
+	return `budget $${Number(trainDayLimit(control, pdtDay(Date.parse(now))).toFixed(2))}/PDT day · no wall${p !== undefined && paused ? ` · paused until ${when(p.until)}` : ""}`;
 }
 
 const when = (iso: string): string => iso.replace(/\.\d{3}Z$/, "Z");
@@ -139,7 +160,10 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 		const p = c.prefix === "spend" ? parseSpend(c.rest) : null;
 		return p ? [p] : [];
 	}).at(-1);
-	if (spend) {
+	// A merge train has no ceiling (PLAN wl-mvr888nftz0vcl D4): its total is shown alone; its budget is the one-liner's.
+	if (spend && trainMembers(ledger.entries(workload.id), ledger.instructions(workload.id)).length > 0) {
+		out.push(`spent $${Number(spend.usd.toFixed(2))} since open, every PDT day together`);
+	} else if (spend) {
 		const c = ceilingOf(ledger, workload.id);
 		out.push(`spent $${Number(spend.usd.toFixed(2))} of $${Number(c.usd.toFixed(2))} · ${Number(spend.wallMin.toFixed(1))} of ${c.wallMin} min`);
 	}

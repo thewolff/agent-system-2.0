@@ -1,7 +1,7 @@
-// The merge-train word (PLAN wl-mv8s8srodefytc § 1, § 2): Jo's `train <N…>` opens a merge-train workload in one
-// transaction (the preallocated id, the brief naming this train's slice ids, TRAIN_DONE, the normal ceiling, no
-// plan), `train <wl-…> <N…>` adds to it, the train hold the starter applies, the skip close in the answer path,
-// and the train skip in the close check. Every case runs on a real temp ledger; the routes run through the surface.
+// The merge-train word (PLAN wl-mv8s8srodefytc § 1, § 2; PLAN wl-mvr888nftz0vcl D2): Jo's `train <N…>` opens the one merge
+// train in one transaction when none is open (the preallocated id, the brief naming this train's slice ids, TRAIN_DONE, no
+// ceiling, no plan) and appends to it otherwise, `train <wl-…> <N…>` adds to it, the train hold the starter applies, the skip
+// close in the answer path, and the train skip in the close check. Every case runs on a real temp ledger; the routes run through the surface.
 import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -10,10 +10,10 @@ import orchestratorSurface from "../index";
 import { recordRepo, repoOf } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { apply, applyTrain, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, TRAIN_IN_BATCH } from "../src/input";
-import { boundPrs, controlEntries, planAutoApprovedBody, planAutoStartNoticeBody, planFirst, planHaltedBody, trainBoardBody } from "../src/launch";
+import { boundPrs, controlEntries, planAutoApprovedBody, planAutoStartNoticeBody, planFirst, planHaltedBody, trainBoardBody, trainFixBody } from "../src/launch";
 import {
-	KNOWN_FLAKES, prStakes, RESOLVE_COMMAND, type StakesView, TRAIN_DONE, TRAIN_PREPARE, TRAIN_PUSH, trainBody, trainBrief, trainFullSliceId, trainHold, trainInstructionBody,
-	trainPrs, trainSkippedOf, trainSliceId, trainSlicePr,
+	KNOWN_FLAKES, prStakes, repoIdentity, RESOLVE_COMMAND, type StakesView, TRAIN_DONE, TRAIN_PREPARE, TRAIN_PUSH, trainAutonomousRefusal, trainBody, trainBrief, trainCheckout,
+	trainFullSliceId, trainHold, trainInstructionBody, trainNoWallRefusal, trainPermanentRefusal, trainPrs, trainSkippedOf, trainSliceId, trainSlicePr,
 } from "../src/merge-train";
 import { Numbering } from "../src/numbering";
 import { errorLines } from "../src/errors";
@@ -65,7 +65,8 @@ const open = (e: Record<string, string>) => Ledger.open(e.AGENT_SYSTEM_LEDGER_DB
 describe("train <N…> opens a merge train (§ 1)", () => {
 	test("`train 101, #106 101`: one normal autonomous workload, no plan:, done: TRAIN_DONE, the brief naming its slice ids, Jo's instruction then train:", () => {
 		const { ledger, repo, wl, line } = train();
-		expect(interpret(ledger, "train 101, #106 101")).toEqual({ kind: "train", prs: [101, 106] });
+		// the train is open now, so the same word appends: refused while #101 waits for its first attempt
+		expect(interpret(ledger, "train 101, #106 101")).toEqual({ kind: "refused", why: `#101 is already on open merge train ${wl}` });
 		const opened = ledger.inFlight().map((x) => x.workload).filter((w) => w.id !== STANDING_WORKLOAD_ID);
 		expect(opened.map((w) => w.id)).toEqual([wl]);
 		const w = ledger.workload(wl)!;
@@ -82,7 +83,8 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		expect(planFirst(control)).toBeNull();
 		expect(control.some((c) => c.prefix === "plan")).toBe(false);
 		expect(control.find((c) => c.prefix === "done")!.body).toBe(`done: ${TRAIN_DONE}`);
-		expect(control.find((c) => c.prefix === "ceiling")!.body).toBe("ceiling: usd 50 wall 360 source stakes normal");
+		// PLAN wl-mvr888nftz0vcl D4: a train's ceiling rows are never read, so opening one writes none
+		expect(control.some((c) => c.prefix === "ceiling")).toBe(false);
 		const [i] = ledger.instructions(wl);
 		expect(i).toMatchObject({ kind: "instruction", body: trainInstructionBody(wl, [101, 106]), author: "jo", channel: "surface", created_by: SURFACE_BY });
 		expect(i!.body).toBe(`train ${wl} 101 106`);
@@ -130,7 +132,7 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		expect(lines[step0]).toContain("Record the chain line with lane_record_entry");
 		expect(lines[step0]).toContain("gh pr edit B --body-file");
 		const rules = lines.find((l) => l.startsWith("Stacked PRs: "))!;
-		for (const s of ["done-because", "chain: #101 → **#106** → #107", "gh pr edit B --base main", "kind `stack`", "without Jo's word"]) {
+		for (const s of ["the entry the lane records before it releases", "chain: #101 → **#106** → #107", "gh pr edit B --base main", "kind `stack`", "without Jo's word"]) {
 			expect(rules).toContain(s);
 		}
 		// rev 14's stack questions are gone: a stack problem is passed over, never asked
@@ -208,7 +210,7 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		expect(controlEntries(ledger.entries(wl))).toEqual([]);
 	});
 
-	test("R16: the brief sends no lane_message, reads its members from list, re-reads list before done-because, and passes a hold over with no question", () => {
+	test("R16: the brief sends no lane_message, reads its members from list, re-reads list before its idle release, and passes a hold over with no question", () => {
 		const wl = "wl-mv8s8srodefytc";
 		for (const source of ["jo", "board"] as const) {
 			const brief = trainBrief(wl, [101], source);
@@ -225,12 +227,12 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 			// main's protection hold is named whole: a plan's `hold: <reason> until <time|jo>` (PLAN wl-mvfkv7llkp7nk0 § 3) is a train-hold:, not a train-error:
 			expect(lines[b]).toContain("`hold: main protection unverified (<gap>)`, or a second exit 2 → record step 1's `train-error:` and pass the PR over, no question and no merge");
 			expect(lines[b]).toContain("`production: <reason>` → Production stakes");
-			// before done-because, list once more; "nothing runnable" is an entry
+			// before the idle release, list once more; "nothing runnable" is an entry, and the train never records done-because
 			const terminal = lines.find((l) => l.startsWith("Terminal outcomes: "))!;
 			const relist = terminal.indexOf(`run \`${RESOLVE_COMMAND} list --workload ${wl}\` once more`);
 			expect(relist).toBeGreaterThan(-1);
-			expect(relist).toBeLessThan(terminal.indexOf("done-because when every PR"));
-			expect(terminal).toContain("lane_record_entry one entry listing each PR that is not terminal");
+			expect(relist).toBeLessThan(terminal.indexOf("then lane_release with no done-because"));
+			expect(terminal).toContain("lane_record_entry one entry listing each PR this pass worked with its outcome, and each PR that is not terminal");
 		}
 	});
 });
@@ -482,7 +484,7 @@ exit 1
 		expect(run(w.path, [], ["stakes", "--hold-ok", "--repo", REPO, "--pr", "999"]).code).toBe(2);
 	}, 30_000);
 
-	test("list: the train's members in membership order, `<n> jo` or `<n> board`, read-only, no gh; exit 2 for no such workload", () => {
+	test("list: the train's members in membership order, `<n> jo|board <current attempt's slice>`, read-only, no gh; exit 2 for no such workload", () => {
 		const w = stakesWorld();
 		const opened = interpret(w.ledger, "train 106 101");
 		if (opened?.kind !== "train") throw new Error("not a train");
@@ -494,7 +496,8 @@ exit 1
 		expect(apply(w.ledger, interpret(w.ledger, `train ${t} 150`)!)).toContain("#150");
 		const before = w.ledger.entries(t).length;
 		const r = run(w.path, [], ["list", "--workload", t]);
-		expect([r.code, r.out, r.err]).toEqual([0, "106 jo\n101 jo\n139 board\n150 jo\n", ""]);
+		const sl = (n: number) => trainSliceId(t, n);
+		expect([r.code, r.out, r.err]).toEqual([0, `106 jo ${sl(106)}\n101 jo ${sl(101)}\n139 board ${sl(139)}\n150 jo ${sl(150)}\n`, ""]);
 		expect(w.ledger.entries(t).length).toBe(before);
 		expect(run(w.path, [], ["list", "--workload", w.bare]).out).toBe("");
 		const none = run(w.path, [], ["list", "--workload", "wl-nosuch"]);
@@ -504,7 +507,7 @@ exit 1
 });
 
 describe("train <wl-…> <N…> adds to a train; parsing and refusals (§ 1)", () => {
-	test("append keeps the order 101, 106, 139; a PR already on the train is refused", () => {
+	test("append keeps the order 101, 106, 139; a PR whose current attempt is open or not yet sliced is refused", () => {
 		const { ledger, wl } = train();
 		const cmd = interpret(ledger, `train ${wl} #139`)!;
 		expect(cmd).toEqual({ kind: "train-append", workloadId: wl, prs: [139] });
@@ -514,13 +517,13 @@ describe("train <wl-…> <N…> adds to a train; parsing and refusals (§ 1)", (
 		expect(receipt).toStartWith(`added #139 to merge train ${wl} (instruction ${ins.id}); order 101, 106, 139`);
 		expect(trainPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([101, 106, 139]);
 		expect(boundPrs(ledger.entries(wl), ledger.instructions(wl)).map((b) => b.pr)).toEqual([101, 106, 139]);
-		const why = `#106 is already on train ${wl}; a skipped PR gets a new train: \`train 106\``;
+		const why = `#106 is already on open merge train ${wl}`;
 		expect(interpret(ledger, `train ${wl} 140 106`)).toEqual({ kind: "refused", why });
 		// apply checks again: a PR put on the train since the reading is refused, writing nothing
 		const late = interpret(ledger, `train ${wl} 141`)!;
 		apply(ledger, interpret(ledger, `train ${wl} 141`)!);
 		const before = ledger.instructions(wl).length;
-		expect(() => apply(ledger, late)).toThrow(`#141 is already on train ${wl}`);
+		expect(() => apply(ledger, late)).toThrow(`#141 is already on open merge train ${wl}`);
 		expect(ledger.instructions(wl)).toHaveLength(before);
 	});
 
@@ -716,7 +719,7 @@ describe("the train hold (§ 1 D4), on a temp ledger", () => {
 		expect(trainPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([101]);
 		expect(holdOf(ledger, wl)).toBeNull();
 		// a board-only train is not a duplicate-free zone: re-naming 101 while it runs is refused, as on Jo's train
-		expect(interpret(ledger, `train ${wl} 101`)).toEqual({ kind: "refused", why: `#101 is already on train ${wl}; a skipped PR gets a new train: \`train 101\`` });
+		expect(interpret(ledger, `train ${wl} 101`)).toEqual({ kind: "refused", why: `#101 is already on open merge train ${wl}` });
 		const q = ask(ledger, wl, trainSliceId(wl, 101), ["merged", "skip", "stop"]);
 		ledger.answerQuestion(q, { ...JO, answer: "stop" });
 		c.plusHours(0.01);
@@ -742,7 +745,7 @@ describe("the train hold (§ 1 D4), on a temp ledger", () => {
 		expect(interpret(ledger, `train ${wl} 106`)?.kind).toBe("refused");
 	});
 
-	test("a non-train workload is never held; train A's stop does not hold train B", () => {
+	test("a non-train workload is never held; train A's stop does not hold a stale second train B", () => {
 		const { ledger } = tempLedger();
 		const { wl } = workloadWithSlice(ledger);
 		const k = wl.replace(/^wl-/, "");
@@ -751,13 +754,15 @@ describe("the train hold (§ 1 D4), on a temp ledger", () => {
 		expect(holdOf(ledger, wl)).toBeNull();
 
 		const a = train([101, 106]);
-		// a PR rides one open train at a time (rev 17.1 D8): a second train on the same repo takes other PRs only
-		const again = interpret(a.ledger, "train 101");
-		if (again?.kind !== "train") throw new Error("not a train");
-		expect(() => applyTrain(a.ledger, again, a.repo)).toThrow(a.wl);
-		const bCmd = interpret(a.ledger, "train 139");
-		if (bCmd?.kind !== "train") throw new Error("not a train");
-		const b = applyTrain(a.ledger, bCmd, a.repo).workloadId;
+		// one train (PLAN wl-mvr888nftz0vcl D2): the word appends to A, so a stale second train B is built from rows, as one left
+		// open before the cutover would be
+		const b = a.ledger.write(() => {
+			const id = a.ledger.openWorkload({ by: SURFACE_BY, brief: trainBrief("wl-x", [139]), stakes: "normal", mode: "autonomous" });
+			recordRepo(a.ledger, id, tmp("stale-train-repo"));
+			const ins = a.ledger.recordInstruction({ ...JO, workloadId: id, body: trainInstructionBody(id, [139]) });
+			a.ledger.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: trainBody([139], ins) });
+			return id;
+		});
 		const qa = ask(a.ledger, a.wl, trainSliceId(a.wl, 101), ["merged", "skip", "stop"]);
 		a.ledger.addSlice({ by: LANE, workloadId: b, id: trainSliceId(b, 139), task: "t", doneCondition: "d", inputs: "i" });
 		a.ledger.answerQuestion(qa, { ...JO, answer: "stop" });
@@ -861,7 +866,7 @@ describe("the train skip in the close check (§ 1)", () => {
 		return {
 			number: 101, state: "OPEN", headRefName: "feature/x", headSha: SHA_A, result: { runId: "tr-red-1", verdict: "red", sha: SHA_A, scope: "full" },
 			headCompare: null, candidateCompare: null, waivedRun: null, onTrain: false, mergeCommit: null, cover: null, waivedByJo: null,
-			trainSkipped: trainSkippedOf(101, ledger.entries(wl), ledger.questions(wl), ledger.instructions(wl)), ...over,
+			trainSkipped: trainSkippedOf(101, ledger.entries(wl), ledger.questions(wl), ledger.instructions(wl), wl), ...over,
 		};
 	}
 	const facts = (prs: ClosePr[]) => ({ failure: null, branch: "wl/wl-t", defaultBranch: "main", candidate: { sha: SHA_B, changed: [] }, prs });
@@ -891,5 +896,90 @@ describe("the train skip in the close check (§ 1)", () => {
 		const nq = ask(ledger, wl, `sl-train-${wl.replace(/^wl-/, "")}-101`, ["rerun", "skip", "stop"]);
 		apply(ledger, interpret(ledger, `skip ${nq}`)!);
 		expect(closeFreshness(facts([pr101(ledger, wl)]))).toEqual(refusal);
+	});
+});
+
+describe("the one permanent merge train (PLAN wl-mvr888nftz0vcl D2-D5, R1-R3, R10)", () => {
+	const nonStanding = (ledger: Ledger) => ledger.inFlight().map((x) => x.workload.id).filter((id) => id !== STANDING_WORKLOAD_ID);
+
+	test("R1: `train <N…>` appends to the open train and opens one only when none is open; no ceiling row either way", () => {
+		const { ledger, c, repo, wl } = train([101]);
+		const cmd = interpret(ledger, "train #139, 140");
+		expect(cmd).toEqual({ kind: "train", prs: [139, 140] });
+		const r = applyTrain(ledger, cmd as Extract<typeof cmd, { kind: "train" }>, repo);
+		expect(r.workloadId).toBe(wl);
+		const ins = ledger.instructions(wl).at(-1)!;
+		expect(r.line).toStartWith(`added #139, #140 to merge train ${wl} (instruction ${ins.id}); order 101, 139, 140`);
+		expect(ins.body).toBe(trainInstructionBody(wl, [139, 140]));
+		expect(nonStanding(ledger)).toEqual([wl]);
+		expect(controlEntries(ledger.entries(wl)).some((e) => e.prefix === "ceiling")).toBe(false);
+		// two readings before either applies: the second applies as an append, never a second train
+		c.plusHours(0.01);
+		const a = interpret(ledger, "train 150")!;
+		const b = interpret(ledger, "train 151")!;
+		applyTrain(ledger, a as Extract<typeof a, { kind: "train" }>, repo);
+		expect(applyTrain(ledger, b as Extract<typeof b, { kind: "train" }>, repo).workloadId).toBe(wl);
+		expect(nonStanding(ledger)).toEqual([wl]);
+	});
+
+	test("R1: a PR of another repository is refused naming the train and its repository, nothing written", () => {
+		const { ledger, repo, wl } = train([101]);
+		const other = tmp("other-repo");
+		const cmd = interpret(ledger, "train 139");
+		const before = { entries: ledger.entries(wl).length, instructions: ledger.instructions(wl).length, workloads: nonStanding(ledger) };
+		const run = () => applyTrain(ledger, cmd as Extract<typeof cmd, { kind: "train" }>, other);
+		expect(run).toThrow(`merge train ${wl} serves ${trainCheckout(ledger, wl)}`);
+		expect(run).toThrow(`${other} (${repoIdentity(other)}) is another repository: the one merge train takes PRs of its own repository only, so #139 is not added; nothing was written; refused, never applied`);
+		expect({ entries: ledger.entries(wl).length, instructions: ledger.instructions(wl).length, workloads: nonStanding(ledger) }).toEqual(before);
+		expect(repoOf(ledger, wl)).toBe(repo);
+	});
+
+	test("lane decision en-mvznmxcdh0ucsj: a PR boards again as attempt 2 once attempt 1 is terminal, and is refused while attempt 2 waits", () => {
+		const { ledger, repo, wl } = train([101]);
+		const s1 = trainSliceId(wl, 101);
+		ledger.addSlice({ by: LANE, workloadId: wl, id: s1, task: "work #101", doneCondition: "a disposition", inputs: "the PR" });
+		expect(interpret(ledger, "train 101")).toEqual({ kind: "refused", why: `#101 is already on merge train ${wl} (${s1} open)` });
+		ledger.completeSlice(s1, { by: LANE, artifact: "returned to its owner" });
+		const cmd = interpret(ledger, "train 101");
+		expect(cmd).toEqual({ kind: "train", prs: [101] });
+		expect(applyTrain(ledger, cmd as Extract<typeof cmd, { kind: "train" }>, repo).line).toStartWith(`added #101 (attempt 2) to merge train ${wl}`);
+		expect(interpret(ledger, `train ${wl} 101`)).toEqual({ kind: "refused", why: `#101 is already on open merge train ${wl}` });
+	});
+
+	test("D3, D4, D5: withdraw, supersede, extend, ceiling and user-driven on the train are refused naming the rule, nothing written", () => {
+		const { ledger, wl } = train([101]);
+		const other = ledger.openWorkload({ by: SURFACE_BY, brief: "other", stakes: "normal", mode: "autonomous" });
+		const permanent = trainPermanentRefusal(ledger, wl)!;
+		const noWall = trainNoWallRefusal(ledger, wl)!;
+		const autonomous = trainAutonomousRefusal(ledger, wl)!;
+		expect([permanent, noWall, autonomous].every((s) => s.startsWith(`${wl} is the merge train`))).toBe(true);
+		const cases: [string, string][] = [
+			[`withdraw ${wl}`, permanent], [`supersede ${wl} ${other}`, permanent],
+			[`extend ${wl}`, noWall], [`ceiling 50 ${wl}`, noWall], [`ceiling 50 4 ${wl}`, noWall],
+			[`user-driven ${wl}`, autonomous],
+		];
+		const count = () => [ledger.entries(wl).length, ledger.instructions(wl).length, ledger.workload(wl)!.mode, ledger.workload(wl)!.status];
+		const before = count();
+		for (const [word, why] of cases) expect([word, interpret(ledger, word)]).toEqual([word, { kind: "refused", why }]);
+		// apply checks again inside its transaction, whatever built the command
+		expect(() => apply(ledger, { kind: "extend", workloadId: wl })).toThrow(`${noWall}; refused, never applied`);
+		expect(() => apply(ledger, { kind: "mode", workloadId: wl, mode: "user-driven" })).toThrow(`${autonomous}; refused, never applied`);
+		expect(() => apply(ledger, { kind: "withdraw-workload", workloadId: wl })).toThrow(permanent);
+		expect(() => apply(ledger, { kind: "supersede", workloadId: wl, by: other })).toThrow(permanent);
+		expect(count()).toEqual(before);
+		// autonomous stays allowed
+		expect(interpret(ledger, `autonomous ${wl}`)).toEqual({ kind: "mode", workloadId: wl, mode: "autonomous" });
+	});
+
+	test("R10: a train's fix workload is ordinary: withdraw, extend, ceiling and user-driven work on it", () => {
+		const { ledger, wl } = train([101]);
+		const entry = controlEntries(ledger.entries(wl)).find((e) => e.prefix === "train")!;
+		const fix = ledger.openWorkload({ by: MERGE_TRAIN_BY, brief: "fix #101", stakes: "normal", mode: "autonomous" });
+		ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: fix, kind: "assumption", body: trainFixBody({ repo: "jowolff/x", pr: 101, train: wl, trainEntry: entry.id }) });
+		expect(trainPermanentRefusal(ledger, fix)).toBeNull();
+		expect(interpret(ledger, `user-driven ${fix}`)).toEqual({ kind: "mode", workloadId: fix, mode: "user-driven" });
+		expect(interpret(ledger, `extend ${fix}`)).toEqual({ kind: "extend", workloadId: fix });
+		expect(interpret(ledger, `ceiling 50 ${fix}`)).toMatchObject({ kind: "ceiling", workloadId: fix });
+		expect(interpret(ledger, `withdraw ${fix}`)).toMatchObject({ kind: "withdraw-workload", workloadId: fix });
 	});
 });

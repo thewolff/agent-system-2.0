@@ -71,8 +71,8 @@ import {
 	planQuestionBody, planQuestionFiles, planQuestionProblem, planSlice, reservedPrefix,
 } from "../src/launch";
 import {
-	checkoutOwnerRepo, controlRootRefusal, mainProtectionGap, type Protection, recordTrainTask, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_DETAIL_MAX_BYTES, TRAIN_TASK_KINDS,
-	type TrainTaskKind, trainPrs,
+	attemptOf, checkoutOwnerRepo, controlRootRefusal, mainProtectionGap, type Protection, recordTrainTask, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_DETAIL_MAX_BYTES, TRAIN_TASK_KINDS,
+	isTrain, type TrainTaskKind, trainAttemptsOf, trainPermanentRefusal, trainPrs,
 	trainSignoff, trainSliceId, trainSlicePr,
 } from "../src/merge-train";
 import { DEFAULT_BRANCH } from "../src/merge-train-stack";
@@ -81,7 +81,7 @@ import { PAIR_OPTION } from "../src/pair-suggest";
 import { QUOTA_MOVE_PREFIX } from "../src/quota-move-alert";
 import { expandCallerHandles } from "../src/linked-api";
 import { SECURITY_RED_PREFIX, SHA_RE, testRuns } from "../src/test-run";
-import { releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
+import { releasedIdleBody, releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
 import {
 	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, type Ctx, ESCALATION_BY, HOLD_HOURS, LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL,
 	LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, LANE_HANDOFF_TOOL, LANE_MESSAGE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_RELEASE_TOOL,
@@ -723,12 +723,13 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			// PLAN wl-mvfkv7llkp7nk0 § 1: the standing rulings are checked first; a decided question writes no question row.
 			const subjectWrong = subjectProblem(options, subject);
 			if (subjectWrong !== null) return text(`${subjectWrong}; nothing was asked.`);
-			// PLAN wl-mvg8itbt0rz3ls D2: a train's merge question on a PR's disposition slice (`trainSliceId`, the slice the ruling's
-			// action completes and its notice reads) carries the `trainSignoff` fact Jo's ruling train-signoff reads; a `-full-<r>`
-			// slice's carries none and is raised. gh is read here, before the write, and the ledger half is computed inside it.
+			// PLAN wl-mvg8itbt0rz3ls D2: a train's merge question on a PR's disposition slice for its current attempt (`trainSliceId`
+			// with `trainAttempts`, the slice the ruling's action completes and its notice reads) carries the `trainSignoff` fact Jo's
+			// ruling train-signoff reads; a `-full-<r>` slice's, or an earlier attempt's, carries none and is raised. gh is read here,
+			// before the write, and the ledger half is computed inside it.
 			const train = trainPrs(ledger.entries(workloadId), ledger.instructions(workloadId)).length > 0;
 			const mergePr = train && questionKind(options, subject) === "merge" ? trainSlicePr(slice, workloadId) : null;
-			const signoffPr = mergePr !== null && slice === trainSliceId(workloadId, mergePr) ? mergePr : null;
+			const signoffPr = mergePr !== null && slice === trainSliceId(workloadId, mergePr, attemptOf(trainAttemptsOf(ledger, workloadId), mergePr)) ? mergePr : null;
 			const reads = signoffPr === null ? null : await signoffReads(ledger, workloadId, signoffPr);
 			const resolvedMeanwhile = new Error("the repeated open question was resolved");
 			let asked: AskResult | { refused: ToolResult };
@@ -795,6 +796,11 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			if (!body) return text("An entry has a body; nothing was recorded.");
 			const prefix = reservedPrefix(body);
 			if (prefix !== null && prefix !== "done-because") return reserved(body, "recorded")!;
+			if (prefix === "done-because") {
+				// PLAN wl-mvr888nftz0vcl D3: the merge train is permanent; its lane releases with no done-because.
+				const permanent = trainPermanentRefusal(o.own.ledger, o.own.workloadId);
+				if (permanent !== null) return text(`done-because refused: ${permanent}. When nothing on the train is runnable, lane_release with no done-because.`);
+			}
 			if (body.startsWith(ARTIFACT_COMMAND_PREFIX)) return text(`A slice's artifact command is declared with slice_artifact, not written as an entry; nothing was recorded.`);
 			const machinery = /^([a-z-]+):/.exec(body)?.[1];
 			if (machinery !== undefined && (CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).includes(machinery)) {
@@ -1038,7 +1044,10 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 					const entries = ledger.entries(workloadId);
 					const slices = sliceCounts(ledger.slices(workloadId));
 					const open = slices.open + slices.paused;
-					if (open > 0 && doneBecause(entries, holdersOf(entries, laneId, ledger.holders(workloadId))) === null) {
+					// PLAN wl-mvr888nftz0vcl D13: the merge train never has a receipt, so its release with open work is a quiet idle release.
+					if (open > 0 && isTrain(ledger, workloadId)) {
+						ledger.recordEntry({ by: laneId, workloadId, kind: "assumption", body: releasedIdleBody(laneId, open) });
+					} else if (open > 0 && doneBecause(entries, holdersOf(entries, laneId, ledger.holders(workloadId))) === null) {
 						ledger.recordEntry({ by: laneId, workloadId, kind: "assumption", body: releasedOpenBody(laneId, open) });
 					}
 					return released;
