@@ -38,7 +38,9 @@
 // Jo with `auto-start failed: <error>` first.
 // MIGRATION.md item 40 (PLAN wl-muq1v31q5ly7ls D4, D6): `lane_release` writes `released-open:` in the
 // release's own transaction when open or paused slices remain and no holder receipt stands, and the
-// terminal pair refuses while a hand this lane spawned is unsettled (surface/src/turn-end.ts);
+// terminal pair refuses while a hand this lane spawned is unsettled (surface/src/turn-end.ts); every release also writes
+// `lane-released: <laneId>` in that transaction (PLAN wl-mw0vs9uc3xqtka D2.3), so the alert sources see a released lane
+// whose runner or omp is still alive 5 minutes later;
 // `lane_record_entry` refuses the classifier's lines as well (`CLASSIFIER_MACHINERY_PREFIXES`: `hand-spawn:`,
 // `review-round:`, the same-lab and Kimi-out lines `review-same-lab:`, `review-same-lab-rule:`, `provider-refused:`
 // and the rest; PLAN wl-mv64rsqw2fcs1s D5, PLAN wl-mv5xay6bjp0268 § 2.6), so a lane cannot forge a settle or a round
@@ -71,7 +73,7 @@ import { repoOf } from "../src/decision-log";
 import { reservedStates } from "../src/errors";
 import { readFacts } from "../src/facts";
 import {
-	CLASSIFIER_MACHINERY_PREFIXES, type ControlEntry, controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, landFirstOn, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE,
+	CLASSIFIER_MACHINERY_PREFIXES, type ControlEntry, controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, landFirstOn, laneReleasedBody, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE,
 	PLAN_HOW_IT_FAILS_LINE, PLAN_REQUIREMENTS_HEADING, PLAN_FILE_MAX_BYTES, PLAN_REQUIREMENTS_SHAPE, type PlanBinding, planAutoApprovedBody, planAutoStartNoticeBody, planFirst, planHalted, planQuestionBinding,
 	planQuestionBody, planQuestionFiles, planQuestionProblem, planSlice, reservedPrefix,
 } from "../src/launch";
@@ -1112,11 +1114,13 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			const { ledger, workloadId, laneId } = o.own;
 			let r: { released: boolean; holder?: string | null };
 			try {
-				// D4: the marker and the release commit together, release first; a refused release writes no marker, and a
-				// failed marker insert rolls the release back, so there is never an unmarked release of open work.
+				// D4: the markers and the release commit together, release first; a refused release writes no marker, and a
+				// failed marker insert rolls the release back, so there is never an unmarked release of open work. `lane-released:`
+				// (PLAN wl-mw0vs9uc3xqtka D2.3) is written on every release, so a lane alive past its release is seen.
 				r = ledger.write(() => {
 					const released = ledger.releaseWorkload(workloadId, { by: laneId, holder: laneId });
 					if (!released.released) return released;
+					ledger.recordEntry({ by: laneId, workloadId, kind: "assumption", body: laneReleasedBody(laneId) });
 					const entries = ledger.entries(workloadId);
 					const slices = sliceCounts(ledger.slices(workloadId));
 					const open = slices.open + slices.paused;
