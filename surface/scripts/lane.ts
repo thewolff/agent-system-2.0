@@ -4,18 +4,23 @@
 //
 //   launch <wl> [--requested-by <who>]  the starter the surface execs: reserve (predicate inside the
 //                                        transaction, after the live-lane check: an earlier lane whose runner or
-//                                        omp still runs refuses `held`, liveLaneOf), preflight, worktree + branch,
-//                                        system prompt, spawn `run` detached; prints `lane <laneId> runner <pid>`
+//                                        omp still runs refuses `held`, liveLaneOf, unless that lane released
+//                                        itself: its pids are stale, ended by the next spawner), preflight,
+//                                        worktree + branch, system prompt, spawn `run` detached; prints
+//                                        `lane <laneId> runner <pid>`
 //   run <wl> <laneId>                    the runner: one `omp --mode rpc --no-ui` child, the first prompt and
 //                                        up to CONTINUE_LIMIT continue prompts on it, lane-started:/lane-ready:/
-//                                        lane-metrics:/lane-exit:, the turn-end decision once omp is settled (src/turn-end.ts),
+//                                        lane-metrics:/lane-exit:, the turn-end decision once omp is settled, or at once
+//                                        when the lane released itself or a holder's receipt stands (src/turn-end.ts),
 //                                        stop requests, its own deadline, the ceiling meter (spend:, the 80 %
 //                                        notice, the 100 % stop and its notice) and the profile config's as2 extensions
-//                                        (a suspension with no notice) polled every STOP_POLL_MS. It first takes the
+//                                        (a suspension with no notice) polled every STOP_POLL_MS. omp ends with stdin
+//                                        EOF, SIGTERM after SHUTDOWN_GRACE_MS, SIGKILL END_GRACE_MS later. It first takes the
 //                                        lane id's run lock (takeRunnerLock, one owner per lane id) and then checks
 //                                        the recorded omp and runner pids (liveRunnerOf); a lane id held or running,
 //                                        or one whose owner ps could not verify, exits 7 (held) before any ledger
-//                                        write or spawn; it spawns omp only while the lock still names it (startAsOwner,
+//                                        write or spawn; before its spawn it ends the omps of lanes that released
+//                                        themselves and never exited (staleOmps, endStale); it spawns omp only while the lock still names it (startAsOwner,
 //                                        else exit 7 with nothing written) and the workload is still held by its lane id
 //                                        (spawnIfReserved, else exit 7 with launch-failed:); only the lock's owner finalizes, and it
 //                                        frees the lock on exit. Every ps call is bounded (PS_TIMEOUT_MS in
@@ -25,7 +30,8 @@
 //                                        named model refuses before omp (launch-failed: … headroom); an unnamed lane
 //                                        moves to a base-in-quota strong-row model before its first prompt (lane-headroom:)
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy (after the same
-//                                        live-lane check), then omp in the TUI in the foreground (--model when Jo
+//                                        live-lane check), end the self-released lanes' stale omps (endStale), then
+//                                        omp in the TUI in the foreground (--model when Jo
 //                                        named one, --resume when recorded on that same model), spawned in one write
 //                                        with its lane-started: while the workload is still held by its lane id, its
 //                                        first prompt and the workload's state supplied as `@prompt.md` (resume too);
@@ -65,7 +71,7 @@ import { SCRATCH_ENV } from "../../gates/src/scratch";
 import { ensureScratchRoot } from "../src/scratch-root";
 import { canonicalPath, homeDir } from "../../ledger/src/locality";
 import {
-	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type ReserveResult, type ReserveRows, type ReserveVerdict, type SliceRow, type Stakes,
+	type EntryRow, type HolderChange, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type ReserveResult, type ReserveRows, type ReserveVerdict, type SliceRow, type Stakes,
 	type WorkloadRow,
 } from "../../ledger/src/index";
 import {
@@ -83,16 +89,16 @@ import {
 	trainMeterErrorBody, type TrainMeterEvidence, trainPausedBody, trainRuleBody, type TrainScan, type TrainScanError,
 } from "../src/train-budget";
 import {
-	attempts, branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, heldLive, holdersOf,
+	attempts, branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, exitClass, fencedBy, firstPrompt, heldLive, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
-	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody,
+	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneReceipt, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody,
 	launchRequestedBody, doneLine, maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeOrigin, resumePlan, scratchCapMb, sessionOrigin, STARTER_EXIT, stateModelCheck, stateModelOf,
 	STOP_POLL_MS, trainBindings, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continueCounter, continuePrompt, deadRunPrompt, type DeadTestRun, deadTestRuns, enqueueRunnerDeath, exitOutcome, extensionsSuspendedDeathBody, extensionsSuspendedOf,
 	extensionsUnconfirmedDeathBody, configStamp, type PolledSuspension, polledSuspensionOf, readAs2ExtensionPaths, suspensionOf,
-	heldOpenBody, IDLE_CHECK, IDLE_LIMIT, idleActivity, idlePrompt, liveTestRuns, type PromptError, promptErrorOf, releasedIdle, releasedOpen, SETTLE_CHECK, SETTLE_IDLE_MS, settleIdle, sliceCounts, STATE_ID,
+	heldOpenBody, IDLE_CHECK, IDLE_LIMIT, idleActivity, idlePrompt, liveTestRuns, type PromptError, promptErrorOf, releasedIdle, releasedOpen, selfReleased, SETTLE_CHECK, SETTLE_IDLE_MS, settleIdle, sliceCounts, STATE_ID,
 	turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
 	type TurnEndInput, unsettledHandsOf,
 } from "../src/turn-end";
@@ -116,7 +122,7 @@ import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
 const TIER_FILE = join(REPO_ROOT, "tiers", "lane.md");
-/** A millisecond knob from the environment, or its fallback (the fake-omp tests shorten the two waits below). */
+/** A millisecond knob from the environment, or its fallback (the fake-omp tests shorten the waits below). */
 const msEnv = (name: string, fallback: number): number => {
 	const n = Number(process.env[name]);
 	return Number.isFinite(n) && n > 0 ? n : fallback;
@@ -124,10 +130,16 @@ const msEnv = (name: string, fallback: number): number => {
 /** The readiness window: the lane's own claim must land within the pre-claim lease (decisions 8, 14). */
 const READY_MS = msEnv("AGENT_SYSTEM_LANE_READY_MS", PRECLAIM_LEASE_MS);
 const READY_POLL_MS = 1_000;
-/** After `abort` and stdin EOF, the wait before SIGKILL (§ 3 stop path). */
+/** After stdin EOF, the wait for omp's own graceful rpc shutdown before SIGTERM (PLAN wl-mvidsu83epvpj4 D3). */
+const SHUTDOWN_GRACE_MS = msEnv("AGENT_SYSTEM_LANE_SHUTDOWN_GRACE_MS", 10_000);
+/** After SIGTERM, the wait before SIGKILL (§ 3 stop path; D3). */
 const END_GRACE_MS = msEnv("AGENT_SYSTEM_LANE_END_GRACE_MS", 30_000);
 /** The least time between two RSS samples of the omp tree (PLAN wl-mvbcjageg7o2yo § 2.2); the fake-omp tests shorten it. */
 const RSS_SAMPLE_INTERVAL_MS = msEnv("AGENT_SYSTEM_LANE_RSS_SAMPLE_MS", RSS_SAMPLE_MS);
+/** The runner's ledger poll: stop requests, its deadline, the meter, the hold, the idle check, a self-release or receipt (D2), the lease renewal. */
+const STOP_POLL = msEnv("AGENT_SYSTEM_LANE_STOP_POLL_MS", STOP_POLL_MS);
+/** endStale's one aggregate deadline, inside the pre-claim lease that runs from the reservation (D4). */
+const STALE_END_MS = msEnv("AGENT_SYSTEM_LANE_STALE_END_MS", 60_000);
 /** The settle wait with no omp activity that makes a session idle (PLAN wl-mv5i3lulwwbbi8 D6); the fake-omp tests shorten it. */
 const SETTLE_IDLE = msEnv("AGENT_SYSTEM_LANE_SETTLE_IDLE_MS", SETTLE_IDLE_MS);
 const PROFILE = process.env.AGENT_SYSTEM_PROFILE || process.env.OMP_PROFILE || "agent-system-2";
@@ -519,10 +531,13 @@ export function reserve(
 	}
 }
 
-/** D2: `held: <laneId> still running (<omp|runner> pid <n>)` while an earlier lane on the workload is live (`liveLaneOf`), else null. */
+/**
+ * D2: `held: <laneId> still running (<omp|runner> pid <n>)` while an earlier lane on the workload is live (`liveLaneOf`), else
+ * null. A lane that released itself is skipped (PLAN wl-mvidsu83epvpj4 D4), read from the holder history the transaction read.
+ */
 function liveRefusal(rows: ReserveRows, probeFor: (laneId: string, workloadId: string) => RunnerProbe): ReserveVerdict | null {
 	const control = controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder, rows.holders));
-	const live = liveLaneOf(control, (laneId) => probeFor(laneId, rows.workload.id));
+	const live = liveLaneOf(control, rows.holderChanges, (laneId) => probeFor(laneId, rows.workload.id));
 	return live === null ? null : { launch: false, reason: `held: ${live.laneId} still running (${live.what} pid ${live.pid})` };
 }
 
@@ -565,7 +580,9 @@ function liveTrainLane(
 		if (w.holder !== null && heldLive(w, now)) return { laneId: w.holder, workloadId: other };
 		const entries = ledger.entries(other);
 		const control = controlEntries(entries, holdersOf(entries, w.holder, ledger.holders(other)));
-		const live = liveLaneOf(control, (laneId) => probeFor(laneId, other));
+		// No holder history: a peer train's lane refuses while its runner or omp lives, self-released or not (PLAN
+		// wl-mw0ytmzi89d683 F1); only the next spawner on the same workload ends a stale omp, so only that check skips it.
+		const live = liveLaneOf(control, [], (laneId) => probeFor(laneId, other));
 		if (live !== null) return { laneId: live.laneId, workloadId: other };
 		if (!pending) continue;
 		for (const a of attempts(control)) {
@@ -1382,11 +1399,16 @@ export function liveRunnerOf(control: readonly ControlEntry[], laneId: string, s
 
 /**
  * The first live lane on a workload (PLAN wl-mvgn310dpi5gcg D2), or null: every lane id with a `lane-started:` after its newest
- * `lane-exit:`, newest first, checked by `liveRunnerOf` with `probeFor(laneId)`. Released or not, a lane whose runner or omp
- * is alive refuses a new reservation, and so does one ps could not answer for (`uninspected`) or could not verify
- * (`unverified`), as `cmdRun` treats them. A crashed runner (both pids gone) never refuses.
+ * `lane-exit:`, newest first, checked by `liveRunnerOf` with `probeFor(laneId)`. A lane whose runner or omp is alive refuses
+ * a new reservation, and so does one ps could not answer for (`uninspected`) or could not verify (`unverified`), as `cmdRun`
+ * treats them, unless the lane released itself (`selfReleased` over `changes`, the workload's holder history; PLAN
+ * wl-mvidsu83epvpj4 D4): its pids are stale, and the process that spawns the next omp ends them first (`staleOmps`,
+ * `endStale`). A lane whose lease lapsed, that was taken over, or that crashed mid-turn did not release itself and still
+ * refuses while live. A crashed runner (both pids gone) never refuses.
  */
-export function liveLaneOf(control: readonly ControlEntry[], probeFor: (laneId: string) => RunnerProbe): (LiveRunner & { laneId: string }) | null {
+export function liveLaneOf(
+	control: readonly ControlEntry[], changes: readonly HolderChange[], probeFor: (laneId: string) => RunnerProbe,
+): (LiveRunner & { laneId: string }) | null {
 	const done = new Set<string>();
 	for (let i = control.length - 1; i >= 0; i--) {
 		const { prefix, laneId } = control[i]!;
@@ -1394,10 +1416,152 @@ export function liveLaneOf(control: readonly ControlEntry[], probeFor: (laneId: 
 		if (prefix === "lane-exit") done.add(laneId);
 		if (prefix !== "lane-started") continue;
 		done.add(laneId);
+		if (selfReleased(changes, laneId)) continue;
 		const live = liveRunnerOf(control, laneId, process.pid, probeFor(laneId));
 		if (live !== null) return { laneId, ...live };
 	}
 	return null;
+}
+
+/** One stale omp (D4): a self-released lane's omp pid and the ps start time its `lane-started:` recorded. */
+export interface StaleOmp {
+	laneId: string;
+	pid: number;
+	start: string;
+}
+
+/**
+ * D4's stale set, pure: every lane id but `selfLaneId` with a `lane-started:` after its newest `lane-exit:` that released
+ * itself (`selfReleased`), with each distinct omp pid and start time those entries recorded (the runner re-records
+ * `lane-started:` with the same pids once omp names its session). A lane that did not release itself is never stale.
+ */
+export function staleOmps(control: readonly ControlEntry[], changes: readonly HolderChange[], selfLaneId: string): StaleOmp[] {
+	const out: StaleOmp[] = [];
+	const done = new Set<string>([selfLaneId]);
+	const seen = new Set<string>();
+	for (let i = control.length - 1; i >= 0; i--) {
+		const { prefix, laneId } = control[i]!;
+		if (laneId === null || done.has(laneId)) continue;
+		if (prefix === "lane-exit") {
+			done.add(laneId);
+			continue;
+		}
+		if (prefix !== "lane-started" || !selfReleased(changes, laneId)) continue;
+		const s = laneStarted([control[i]!], laneId);
+		if (s === null || s.pid <= 0 || seen.has(`${s.pid} ${s.start}`)) continue;
+		seen.add(`${s.pid} ${s.start}`);
+		out.push({ laneId, pid: s.pid, start: s.start });
+	}
+	return out;
+}
+
+/** `endStale`'s outside world: ps, the signal, the clock and its sleep, the log line, the cancel check; the tests pass short waits or a fake clock. */
+export interface EndStaleOptions {
+	/** Called before every probe and every poll tick; true ends `endStale` at once (a stop was accepted). */
+	cancelled?: () => boolean;
+	/** One line per ps or kill failure, and per pid left alive (runner.log for the runner, stderr for the interactive starter). */
+	log?: (line: string) => void;
+	run?: PsRun;
+	kill?: (pid: number, signal: "SIGTERM" | "SIGKILL") => void;
+	deadlineMs?: number;
+	graceMs?: number;
+	pollMs?: number;
+	/** The clock every grace and the aggregate deadline are read on (default `Date.now`). */
+	now?: () => number;
+	/** The wait between polls (default `Bun.sleep`); a fake clock advances `now` here. */
+	sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * D4 (r1 F4): end the stale omps before this process spawns its own, within one aggregate deadline (`STALE_END_MS`). Each
+ * is sent SIGTERM only while `ps -p <pid> -o stat=,lstart=` still matches its recorded start time (`ompPidState` `same`:
+ * a reused pid, a zombie, a gone pid or one with no recorded start time is never signalled); they are polled together.
+ * A pid gets SIGKILL `END_GRACE_MS` after its own SIGTERM, or one poll before the deadline, whichever comes first, and
+ * each signal follows that pid's own fresh probe in the same pass, never a match cached from an earlier one. The deadline
+ * and the cancel check come before every probe, so it returns by the deadline plus one ps bound. It never throws: every
+ * ps or kill failure is one `log` line, and it returns what is still alive (or was never shown gone) at the deadline, on
+ * cancel, or once none is left. Only POSIX `ps` fields and `process.kill` (D5). Callers wait outside any ledger
+ * transaction and spawn whatever it returns.
+ */
+export async function endStale(stale: readonly StaleOmp[], o: EndStaleOptions = {}): Promise<StaleOmp[]> {
+	const run = o.run ?? runPs;
+	const log = o.log ?? ((l: string) => process.stderr.write(`${l}\n`));
+	const kill = o.kill ?? ((pid: number, signal: "SIGTERM" | "SIGKILL") => process.kill(pid, signal));
+	const cancelled = o.cancelled ?? (() => false);
+	const now = o.now ?? Date.now;
+	const sleep = o.sleep ?? ((ms: number) => Bun.sleep(ms));
+	const deadline = now() + (o.deadlineMs ?? STALE_END_MS);
+	const pollMs = o.pollMs ?? 250;
+	const graceMs = o.graceMs ?? END_GRACE_MS;
+	// The last escalation is due one poll before the deadline, so its pass still probes before the deadline stops probing.
+	const killCap = deadline - pollMs;
+	/** The pid is still the recorded omp; a failed probe is logged and counted as alive (never shown gone), never signalled. */
+	const state = (s: StaleOmp): PidState => ompPidState(s.pid, s.start, run, (reason) => log(`endStale: ${s.laneId} omp pid ${s.pid}: ps failed: ${reason}`));
+	const signal = (s: StaleOmp, sig: "SIGTERM" | "SIGKILL"): void => {
+		try {
+			kill(s.pid, sig);
+		} catch (err) {
+			log(`endStale: ${s.laneId} omp pid ${s.pid}: ${sig} failed: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	};
+	const past = (): boolean => now() >= deadline;
+	/** Each pid's SIGKILL due time, set at its own SIGTERM. */
+	const killDue = new Map<StaleOmp, number>();
+	/** One probe of every pid in `of`, the cancel check and the deadline before each; the unprobed rest is kept as is. */
+	const probe = (of: readonly StaleOmp[]): StaleOmp[] => {
+		const next: StaleOmp[] = [];
+		for (let i = 0; i < of.length; i++) {
+			if (cancelled() || past()) return [...next, ...of.slice(i)];
+			const s = of[i]!;
+			const st = state(s);
+			if (st === "unknown") log(`endStale: ${s.laneId} omp pid ${s.pid}: alive with no recorded start time, not signalled`);
+			if (st !== "same" && st !== "failed") continue;
+			if (st === "same") {
+				const due = killDue.get(s);
+				if (due === undefined) {
+					killDue.set(s, Math.min(now() + graceMs, killCap));
+					signal(s, "SIGTERM");
+				} else if (now() >= due) signal(s, "SIGKILL");
+			}
+			next.push(s);
+		}
+		return next;
+	};
+	/** The pids not shown gone at their newest probe (a failed probe counts as alive and is never signalled). */
+	let left = probe(stale);
+	while (left.length > 0 && !cancelled() && !past()) {
+		const nextDue = Math.min(deadline, ...left.map((s) => killDue.get(s) ?? deadline).filter((d) => d > now()));
+		await sleep(Math.max(1, Math.min(pollMs, nextDue - now())));
+		left = probe(left);
+	}
+	for (const s of left) log(`endStale: ${s.laneId} omp pid ${s.pid}: not shown gone when endStale returned`);
+	return left;
+}
+
+/** D4: the stale set as the ledger stands now (`staleOmps`), read by the process about to spawn omp, outside any transaction. */
+export function staleOf(ledger: Ledger, wl: string, laneId: string): StaleOmp[] {
+	const es = ledger.entries(wl);
+	return staleOmps(controlEntries(es, holdersOf(es, ledger.workload(wl)?.holder ?? null, ledger.holders(wl))), ledger.holderChanges(wl), laneId);
+}
+
+/**
+ * D4 at the spawner (the runner, `cmdInteractive`): read the stale set (`staleOf`) and end it (`endStale`), one stderr line
+ * per pid and per failure, prefixed `who:`. Never throws: a failed read is logged and the spawn proceeds.
+ */
+async function endStaleBeforeSpawn(ledger: Ledger, wl: string, laneId: string, who: string, cancelled?: () => boolean): Promise<void> {
+	const log = (l: string): void => {
+		process.stderr.write(`${who}: ${l}\n`);
+	};
+	let stale: StaleOmp[];
+	try {
+		stale = staleOf(ledger, wl, laneId);
+	} catch (err) {
+		log(`endStale: the stale set could not be read: ${oneLine(err)}`);
+		return;
+	}
+	if (stale.length === 0) return;
+	log(`${laneId} ending the stale omp(s) of self-released lane(s): ${stale.map((s) => `${s.laneId} pid ${s.pid}`).join(", ")}`);
+	await endStale(stale, { log, cancelled });
 }
 
 /** Whether `laneId` still holds the workload it reserved (D2b): a lapsed lease with the holder unchanged still does. */
@@ -1909,19 +2073,27 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	};
 	const meter = (control: readonly ControlEntry[]): boolean => (train ? trainMeter() : ceilingMeter(control));
 
-	/** Once: stdin EOF, then SIGKILL after the grace period if the child has not exited. */
+	/**
+	 * Once, every end but the readiness and failure paths' direct SIGKILL (PLAN wl-mvidsu83epvpj4 D3): stdin EOF (omp's own
+	 * graceful rpc shutdown), SIGTERM after SHUTDOWN_GRACE_MS if omp has not exited, SIGKILL END_GRACE_MS after the SIGTERM.
+	 */
 	const end = (): void => {
 		if (ended || !child) return;
 		ended = true;
 		const c = child;
+		const alive = (): boolean => c.exitCode === null && c.signalCode === null;
 		try {
 			c.stdin.end();
 		} catch {
 			// the pipe is already closed by a dead child
 		}
 		timers.push(setTimeout(() => {
-			if (c.exitCode === null && c.signalCode === null) c.kill("SIGKILL");
-		}, END_GRACE_MS));
+			if (!alive()) return;
+			c.kill("SIGTERM");
+			timers.push(setTimeout(() => {
+				if (alive()) c.kill("SIGKILL");
+			}, END_GRACE_MS));
+		}, SHUTDOWN_GRACE_MS));
 	};
 
 	/** Once: the exit record, the death message when the end was not intended, the conditional release; all of it only while this runner owns the lane id's lock. */
@@ -2049,6 +2221,17 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	};
 
 	/**
+	 * PLAN wl-mvidsu83epvpj4 D2's terminal signals as the ledger stands: this lane released itself (`selfReleased`, from the
+	 * holder history), and a holder's `done-because:` stands (`laneReceipt`: never on a merge train, the same rule as the
+	 * turn-end input, PLAN wl-mvr888nftz0vcl D3 and wl-mw0ytmzi89d683 F3).
+	 */
+	const terminalNow = (): { selfReleased: boolean; receipt: boolean } => {
+		const entries = ledger.entries(wl);
+		const holders = holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl));
+		return { selfReleased: selfReleased(ledger.holderChanges(wl), laneId), receipt: laneReceipt(entries, holders, train) };
+	};
+
+	/**
 	 * The turn-end decision (src/turn-end.ts) over the ledger as it stands, and its action. `idle`: omp is unsettled and the
 	 * settle wait went idle (PLAN wl-mv5i3lulwwbbi8 D6); a turn decided with omp settled ends the idle episode.
 	 */
@@ -2074,7 +2257,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				releasedOpen: releasedOpen(control, laneId),
 				releasedIdle: releasedIdle(control, laneId),
 				// PLAN wl-mvr888nftz0vcl D3: a merge train is permanent, so a legacy standing done-because on it is no receipt.
-				receipt: !train && doneBecause(entries, holders) !== null,
+				receipt: laneReceipt(entries, holders, train),
+				selfReleased: selfReleased(ledger.holderChanges(wl), laneId),
 				slices: sliceCounts(ledger.slices(wl)),
 				continues,
 				idleContinues,
@@ -2127,6 +2311,18 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		sessionsDir = p.sessionDir;
 		pushProbe = gitPushProbe(p.worktree);
 		laneFilesDir = p.dir;
+		// PLAN wl-mvidsu83epvpj4 D4: end the omps of lanes that released themselves and never exited, before this spawn and
+		// outside any ledger write; the starter never waits on it. A stop (ledger request or signal) ends it and the run, no omp.
+		await endStaleBeforeSpawn(ledger, wl, laneId, "runner", () => {
+			try {
+				const req = pendingStop(controlNow().control, laneId);
+				if (req) stop(req.entryId, req.reason);
+			} catch (err) {
+				process.stderr.write(`runner: the cleanup's stop check failed: ${String(err)}\n`);
+			}
+			return outcome !== null;
+		});
+		if (outcome !== null) throw new Fail("stop", `${laneId} stopped before its spawn; no omp spawned`, 0);
 		{
 			// A train has no wall (PLAN wl-mvr888nftz0vcl D4): its ceiling rows are never read, and `--max-time` is the 24 h hang
 			// backstop (`trainMaxTime`, a shorter AGENT_SYSTEM_LANE_MAX_TIME still wins). Any other workload: the ceiling's wall.
@@ -2190,6 +2386,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		 * closes with this runner, which is the only end it gets.
 		 */
 		const omp = startAsOwner(ledger, lock, () => {
+			// A stop that landed after the cleanup's last check spawns nothing either (D4); the catch ends the run as stopped.
+			if (child === null && outcome !== null) throw new Fail("stop", `${laneId} stopped before its spawn; no omp spawned`, 0);
 			child = spawnIfReserved(ledger, wl, laneId, child, () => {
 				runStart = Date.now();
 				const omp = spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
@@ -2377,6 +2575,15 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					conclude("deadline", laneDiedDeadlineBody(laneId, maxTime, inFlightNow()));
 				}
 				if (ready && outcome === null) meter(control);
+				// PLAN wl-mvidsu83epvpj4 D2 (b): a self-release while the runner waits or holds, or a receipt while it waits, decides
+				// now: a woken turn that wrote it has no prompt_result of the runner's own. A receipt while holding is not re-decided.
+				if (ready && outcome === null && current === null && (awaitingSettle || holding)) {
+					const t = terminalNow();
+					if (t.selfReleased || (t.receipt && awaitingSettle)) {
+						holding = false;
+						decideTurn();
+					}
+				}
 				// D6: held for the lane's hands, and (PLAN wl-mv5i3lulwwbbi8 D8) the workload's live test runs; once none is left,
 				// omp's own word on settled (get_state) comes first.
 				if (holding && outcome === null) {
@@ -2391,15 +2598,16 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					idleAsked = true;
 					send({ id: IDLE_CHECK, type: "get_state" });
 				}
-				// Renew the lease while ready and alive (the lane row renews too; this covers a lane whose timer stalled).
-				if (ready && outcome === null && cur && cur.holder === laneId) {
+				// Renew the lease while ready and alive (the lane row renews too; this covers a lane whose timer stalled). renewLease's
+				// own WHERE holder = laneId is the guard, so a release committed since this tick's read is never undone (D2b).
+				if (ready && outcome === null) {
 					const n = Number(process.env[LEASE_MS_ENV]);
-					ledger.claimWorkload(wl, { by: LANE_RUNNER_BY, holder: laneId, leaseMs: Number.isFinite(n) && n > 0 ? n : LEASE_MS });
+					ledger.renewLease(wl, { by: LANE_RUNNER_BY, holder: laneId, leaseMs: Number.isFinite(n) && n > 0 ? n : LEASE_MS });
 				}
 			} catch (err) {
 				process.stderr.write(`runner: stop poll failed: ${String(err)}\n`);
 			}
-		}, STOP_POLL_MS);
+		}, STOP_POLL);
 		timers.push(stopPoll);
 
 		const reader = omp.stdout.getReader();
@@ -2505,8 +2713,19 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					else {
 						if (status !== "completed") failedStatus ??= status === "aborted" ? "aborted" : "error";
 						if (status === "error") promptError ??= promptErrorOf(o);
+						// PLAN wl-mvidsu83epvpj4 D2 (a): unsettled, the decision still comes now when the lane released itself or a receipt stands.
 						if (settled) decideTurn();
-						else awaitSettle();
+						else {
+							let terminal = false;
+							try {
+								const t = terminalNow();
+								terminal = t.selfReleased || t.receipt;
+							} catch (err) {
+								process.stderr.write(`runner: the release/receipt read failed: ${String(err)}\n`);
+							}
+							if (terminal) decideTurn();
+							else awaitSettle();
+						}
 					}
 				}
 				if (o.type === "session_settled" && awaitingSettle && outcome === null) {
@@ -2549,6 +2768,12 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		const f = err instanceof Fail ? err : new Fail("run", String(err), STARTER_EXIT.unknown!);
 		process.stderr.write(`runner: ${f.stage}: ${f.message}\n`);
 		for (const t of timers) clearTimeout(t);
+		if (child === null && outcome === "stop") {
+			// PLAN wl-mvidsu83epvpj4 D4: a stop accepted during the pre-spawn cleanup ends the run with no omp, finalized as the
+			// lock's owner like any stop: the workload released as the stopped lane, `lane-exit: … outcome stop reason <r>`.
+			finish(null, null);
+			return 0;
+		}
 		if (child === null) {
 			// Before the spawn: a launch failure (decision 9), in the starter's shape; finalization has nothing to reap. A lost
 			// run lock writes nothing: the lane id may be another runner's now. The runner's own quota refusal of Jo's named model
@@ -2609,6 +2834,8 @@ async function cmdInteractive(wl: string): Promise<number> {
 		// After `laneEnv`, which drops any inherited value: only this by-hand launch carries it (PLAN-2 D4).
 		env[BY_HAND_ENV] = "1";
 		for (const n of notes) process.stderr.write(`lane: tracing: ${n}\n`);
+		// PLAN wl-mvidsu83epvpj4 D4: the self-released lanes' stale omps end before this spawn (Jo's terminal has no timeout).
+		await endStaleBeforeSpawn(ledger, wl, laneId, "lane");
 		line(`lane ${laneId} on ${wl} in ${p.worktree} (branch ${p.branch}); first prompt supplied from ${firstPromptPath}`);
 		if (skipped !== null) line(`a fresh session on ${model ?? "the profile default"}: ${skipped}`);
 		if (recovered !== null) line(recovered);

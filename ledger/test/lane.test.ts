@@ -140,6 +140,18 @@ describe("reserveLane (decision 8)", () => {
 		l.close();
 	});
 
+	test("launchRows carries the workload's holder history with each change's writer, beside capExempt (PLAN wl-mw0ytmzi89d683 F5)", () => {
+		const { ledger: l } = fresh("changes");
+		const w = l.openWorkload({ brief: "w", stakes: "normal", mode: "autonomous", by: "orch" });
+		expect(l.launchRows(w, 3)).toMatchObject({ holderChanges: [], capExempt: false });
+		l.claimWorkload(w, { by: "lane-w-1", holder: "lane-w-1", leaseMs: 60_000 });
+		l.releaseWorkload(w, { by: "lane-w-1", holder: "lane-w-1" });
+		const rows = l.launchRows(w, 3, { capExempt: new Set([w]) })!;
+		expect(rows.holderChanges.map((c) => [c.from, c.to, c.by])).toEqual([[null, "lane-w-1", "lane-w-1"], ["lane-w-1", null, "lane-w-1"]]);
+		expect(rows.capExempt).toBe(true);
+		l.close();
+	});
+
 	test("concurrent starters across processes: 3 workloads × 3 processes each → exactly one lane per workload, distinct ordinals, the fourth workload refused by the cap, refusals write nothing", async () => {
 		const { path, ledger: l } = fresh("concurrent");
 		const wls = ["wl-c1", "wl-c2", "wl-c3", "wl-c4"].map((id) => l.openWorkload({ brief: id, stakes: "normal", mode: "autonomous", by: "orch", id }));
