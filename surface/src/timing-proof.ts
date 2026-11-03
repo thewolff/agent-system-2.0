@@ -114,17 +114,39 @@ export function proofIterations(m: ProofManifest): ProofStep[] {
 	}
 	return out;
 }
+/**
+ * Each JUnit case of `xml` with its proof identity, the key a manifest names it by: `<file> > <describes joined " > "> > <name>`.
+ * A repeated identity is numbered `<that> [k]` (k ≥ 2, per file and name, JUnit document order) only when every occurrence is
+ * skipped: Bun lists, for instance, the unnamed entries of a skipped describe under one name, and no timing is read from a
+ * skipped case. A repeated identity with any executed occurrence has no stable discriminator (a reordering would hand one case
+ * the other's group and budget), so it is refused as a duplicate JUnit case. An ordinal that collides with a case literally
+ * named so is a duplicate too. Only the proof keys cases this way: junitCases and the runner's verdict read the report unchanged.
+ */
+function identifiedCases(xml: string) {
+	const all = junitCases(xml);
+	const total = new Map<string, number>();
+	for (const c of all) { const plain = `${c.file} > ${c.name}`; total.set(plain, (total.get(plain) ?? 0) + 1); }
+	for (const [plain, n] of total) {
+		if (n > 1 && !all.every((c) => `${c.file} > ${c.name}` !== plain || c.status === "skip")) throw new Error(`${plain}: duplicate JUnit case (${n} occurrences, at least one executed; no stable identity)`);
+	}
+	const seen = new Map<string, number>();
+	const identities = new Set<string>();
+	return all.map((c) => {
+		const plain = `${c.file} > ${c.name}`;
+		const k = (seen.get(plain) ?? 0) + 1;
+		seen.set(plain, k);
+		const identity = k === 1 ? plain : `${plain} [${k}]`;
+		if (identities.has(identity)) throw new Error(`${identity}: duplicate JUnit case`);
+		identities.add(identity);
+		return { ...c, identity };
+	});
+}
 export function proofEvidence(m: ProofManifest, step: Pick<ProofStep, "phase" | "file">, xml: string, log: string) {
-	const cases = junitCases(xml);
+	const cases = identifiedCases(xml);
 	const selected = m.files.filter((f) => step.file === null || f.path === step.file);
 	const expected = new Set<string>();
 	const markers: string[] = [];
-	const byIdentity = new Map<string, (typeof cases)[number]>();
-	for (const c of cases) {
-		const key = `${c.file} > ${c.name}`;
-		if (byIdentity.has(key)) throw new Error(`${key}: duplicate JUnit case`);
-		byIdentity.set(key, c);
-	}
+	const byIdentity = new Map(cases.map((c) => [c.identity, c]));
 	const logLines = new Map<string, number>();
 	for (const line of log.split(/\r?\n/)) logLines.set(line, (logLines.get(line) ?? 0) + 1);
 	for (const f of selected) {

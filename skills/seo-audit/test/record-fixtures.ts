@@ -8,7 +8,7 @@
 // data); a family that needs it adds `--record-lhr <fixture>/lhr.json` for its fixture.
 import { rmSync } from "node:fs";
 import { join } from "node:path";
-import { FIXTURES_DIR, auditFixture, fixtureNames, loadServe } from "./harness.ts";
+import { type AuditRun, FIXTURES_DIR, auditFixture, fixtureNames, loadServe } from "./harness.ts";
 
 const wanted = process.argv.slice(2);
 let failed = 0;
@@ -20,7 +20,16 @@ for (const name of wanted.length ? wanted : fixtureNames()) {
 	}
 	rmSync(join(dir, "rendered"), { recursive: true, force: true });
 	const started = Date.now();
-	const run = await auditFixture(name, "record");
+	// auditFixture fails when the fixture's port cannot be acquired (harness.ts ACQUIRE_DEADLINE_MS and its retry
+	// bounds); that fixture is reported and counted, and the rest are still recorded.
+	let run: AuditRun;
+	try {
+		run = await auditFixture(name, "record");
+	} catch (e) {
+		failed++;
+		console.log(`${name}: not recorded: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`);
+		continue;
+	}
 	const seconds = ((Date.now() - started) / 1000).toFixed(1);
 	if (run.code !== 0) {
 		failed++;

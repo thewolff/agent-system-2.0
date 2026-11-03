@@ -75,8 +75,13 @@ describe("install: openable links in the default OMP profile", () => {
 			expect(readFileSync(unrelated, "utf8")).toBe("export {};\n");
 		}
 		expect(fixture.calls()).toEqual(Array.from({ length: 2 }, () => ["plugin", "link", PLUGIN_ROOT]));
-		// The closing doctor's probes reached the fakes, never the real tools.
-		expect(fixture.fakeCalls()).toEqual(expect.arrayContaining(["ctx daemon status --format json", expect.stringMatching(/^launchctl print gui\/\d+\/com\.agent-system-2\.ledger-backup$/)]));
+		// The closing doctor's probes reached the fakes, never the real tools; off macOS it reads no launchd state at all.
+		if (process.platform === "darwin") {
+			expect(fixture.fakeCalls()).toEqual(expect.arrayContaining(["ctx daemon status --format json", expect.stringMatching(/^launchctl print gui\/\d+\/com\.agent-system-2\.ledger-backup$/)]));
+		} else {
+			expect(fixture.fakeCalls()).toContain("ctx daemon status --format json");
+			expect(fixture.fakeCalls().filter((c) => c.startsWith("launchctl ") || c.startsWith("plutil ") || c.startsWith("dscl "))).toEqual([]);
+		}
 	}, 30_000);
 
 	test("without herdr the installer succeeds, emits exactly one skip line, and still links the extension", () => {

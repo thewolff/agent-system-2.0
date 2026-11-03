@@ -160,7 +160,7 @@ function fake(): Fake {
 		}
 	};
 	f.deps = {
-		run, fs, now: () => c.ms, env: { HOME: home, PATH: "/usr/bin:/bin", CI: "1" }, home, uid: 501, user: "jo", repo: REPO, ledgerPath, pid: OWN_PID,
+		run, fs, now: () => c.ms, env: { HOME: home, PATH: "/usr/bin:/bin", CI: "1" }, home, uid: 501, user: "jo", repo: REPO, ledgerPath, platform: "darwin", pid: OWN_PID,
 		alive: (pid) => f.ps.has(pid),
 		kill: (pid) => {
 			f.killed.push(pid);
@@ -206,6 +206,28 @@ describe("parts", () => {
 		// One probe call per probe: every argv distinct.
 		const keys = f.calls.map((c) => c.argv.join(" "));
 		expect(new Set(keys).size).toBe(keys.length);
+	});
+
+	test("off macOS (injected platform linux): every launchd job is not installed with the not-macOS line, before any plist or launchctl read, and nothing fails", async () => {
+		const f = fake();
+		const reads: string[] = [];
+		const fs = f.deps.fs;
+		f.deps = { ...f.deps, platform: "linux", fs: { ...fs, exists: (p) => (reads.push(p), fs.exists(p)), mtimeMs: (p) => (reads.push(p), fs.mtimeMs(p)) } };
+		// ledger-backup's plist is there (the fake installs it); a missing one (doctor, own-home) is judged the same way.
+		expect(f.files.has(plistPathOf(f.home, "ledger-backup"))).toBe(true);
+		const rs = await checkParts(f.deps);
+		expect(rs.filter((r) => r.verdict === "fail" || r.verdict === "warn")).toEqual([]);
+		expect(verdicts(rs).filter((v) => v.startsWith("pass"))).toEqual(["job-inventory", "ctx", "ledger", "backup", "seat", "mailbox", "gh", "disk", "mcp"].map((p) => `pass ${p}`));
+		expect(rs.filter((r) => r.verdict === "not installed")).toEqual(
+			JOB_INVENTORY.map((r) => ({ part: `job:${r.name}`, verdict: "not installed", evidence: "not installed: not macOS (launchd jobs are macOS only; install.sh writes none here)", fix: "" })),
+		);
+		expect(rs.some((r) => r.part.startsWith("deps:"))).toBe(false);
+		expect(f.calls.filter((c) => ["launchctl", "plutil", "dscl"].includes(c.argv[0]!))).toEqual([]);
+		expect(reads.filter((p) => p.includes(join("Library", "LaunchAgents")))).toEqual([]);
+		// The same machine on darwin reads them: ledger-backup passes from its plist.
+		f.deps = { ...f.deps, platform: "darwin" };
+		expect(verdicts(checkJob(f.deps, row("ledger-backup")))).toEqual(["pass job:ledger-backup", "pass deps:ledger-backup"]);
+		expect(f.calls.some((c) => c.argv[0] === "launchctl")).toBe(true);
 	});
 
 	test("ctx: not running, refresh older than 2 h, a failed probe, non-JSON and an unknown shape each fail; a missing supervisor warns", () => {
