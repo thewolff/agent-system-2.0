@@ -3,13 +3,17 @@
 // grace — and `lane-exit:` follows; the next launch proceeds, and the process that spawns the next omp ends a self-released
 // lane's stale omp first. Through the real `lane.ts launch`, runner and `lane.ts interactive`, against the fake omp in
 // omp 18.8.6's shape (`deferShutdown`: the lane's ctx.shutdown() only requests it; `{ pending: true }`: background work that
-// never settles; `ignoreEof`). AGENT_SYSTEM_LANE_SETTLE_IDLE_MS stays at its 15-minute default, so a runner that waits for
-// the settle (the pre-change tree) never writes `lane-exit:` inside these windows.
+// never settles; `ignoreEof`). AGENT_SYSTEM_LANE_SETTLE_IDLE_MS stays at its 15-minute default (case 2c alone shortens it, to
+// reach the idle check as its event), so a runner that waits for the settle (the pre-change tree) never writes `lane-exit:`
+// inside these windows.
 import { afterAll, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { recordRepo } from "../src/decision-log";
 import { doneBody, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, launchRequestedBody, STARTER_EXIT } from "../src/launch";
+import { psAnswer, runPs } from "../src/omp-probe";
+import { IDLE_CHECK } from "../src/turn-end";
 import { SURFACE_BY } from "../src/types";
 // A namespace import: a name lane.ts does not export fails only the test that calls it.
 import * as laneScript from "../scripts/lane";
@@ -26,26 +30,49 @@ const makeRoot = (over: Record<string, string> = {}): LaneRoot => {
 	roots.push(r);
 	return r;
 };
+/**
+ * PLAN wl-mw0ytmzi89d683 F8: every cleanup failure is reported, never swallowed. A leftover already gone (ESRCH) is the only
+ * kill error taken as done; a root whose drains did not settle is kept, its path printed, for the evidence in it; the drain
+ * failures and every cleanup failure are thrown together.
+ */
 afterAll(async () => {
+	const failures: unknown[] = [];
 	for (const pid of leftovers) {
 		try {
 			process.kill(pid, "SIGKILL");
-		} catch {
-			// already gone
+		} catch (err) {
+			const code = (err as NodeJS.ErrnoException).code;
+			if (code !== "ESRCH") failures.push(new Error(`afterAll: SIGKILL of leftover omp pid ${pid} failed (${code ?? "no errno"}): ${String(err)}`, { cause: err }));
 		}
 	}
 	for (const k of killedLanes) {
-		if (laneExit(laneSnapshot(k.r, k.wl).control, k.laneId) !== null) continue;
-		const l = ledgerOf(k.r);
 		try {
-			l.recordEntry({ by: LANE_STARTER_BY, workloadId: k.wl, kind: "assumption", body: laneExitBody(k.laneId, { code: null, signal: "SIGKILL", outcome: "died" }) });
-		} finally {
-			l.close();
+			if (laneExit(laneSnapshot(k.r, k.wl).control, k.laneId) !== null) continue;
+			const l = ledgerOf(k.r);
+			try {
+				l.recordEntry({ by: LANE_STARTER_BY, workloadId: k.wl, kind: "assumption", body: laneExitBody(k.laneId, { code: null, signal: "SIGKILL", outcome: "died" }) });
+			} finally {
+				l.close();
+			}
+		} catch (err) {
+			failures.push(new Error(`afterAll: the stand-in lane-exit: of ${k.laneId} in ${k.r.root} could not be written: ${String(err)}`, { cause: err }));
 		}
 	}
 	const settled = await Promise.allSettled(roots.map((r) => settleDrains(r)));
-	for (const r of roots) rmSync(r.root, { recursive: true, force: true });
-	for (const s of settled) if (s.status === "rejected") throw s.reason;
+	settled.forEach((s, i) => {
+		const r = roots[i]!;
+		if (s.status === "rejected") {
+			failures.push(s.reason);
+			process.stderr.write(`lane-release-exit afterAll: kept ${r.root} (its drains did not settle; runner logs and the ledger are in it)\n`);
+			return;
+		}
+		try {
+			rmSync(r.root, { recursive: true, force: true });
+		} catch (err) {
+			failures.push(new Error(`afterAll: removing ${r.root} failed: ${String(err)}`, { cause: err }));
+		}
+	});
+	if (failures.length > 0) throw new AggregateError(failures, `lane-release-exit afterAll: ${failures.length} failure(s) in the drains or the cleanup`);
 }, 120_000);
 
 const ledgerOf = (r: LaneRoot) => Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
@@ -83,11 +110,19 @@ const spawnedPids = (r: LaneRoot) => [...new Set(fakeRecords(r).filter((x) => x.
 const exitOf = (r: LaneRoot, wl: string, laneId: string, ms = 30_000) => until(`lane-exit: of ${laneId}`, () => laneExit(laneSnapshot(r, wl).control, laneId), ms);
 const startedOf = (r: LaneRoot, wl: string, laneId: string) => until(`lane-started: of ${laneId}`, () => laneStarted(laneSnapshot(r, wl).control, laneId));
 const promptsOf = (r: LaneRoot) => fakeRecords(r).filter((x) => x.event === "prompt");
-/** Gone to ps: no row, or a zombie awaiting its reaper (the stale omp is an orphan). */
+/** `gone()` could not ask ps: the pid is neither shown gone nor alive. */
+class PsProbeFailed extends Error {
+	override name = "PsProbeFailed";
+}
+/** Gone to ps: no row, or a zombie awaiting its reaper (the stale omp is an orphan). A failed ps throws `PsProbeFailed`, never reads as gone. */
 const gone = (pid: number): boolean => {
-	const p = Bun.spawnSync(["ps", "-p", String(pid), "-o", "stat="], { stdout: "pipe", stderr: "pipe" });
-	const stat = p.stdout.toString().trim();
-	return stat === "" || stat.startsWith("Z");
+	let stat: string | null;
+	try {
+		stat = psAnswer(runPs, pid, "stat=");
+	} catch (err) {
+		throw new PsProbeFailed(`gone(${pid}): ps failed, so pid ${pid} cannot be shown gone or alive: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+	}
+	return stat === null || stat.startsWith("Z");
 };
 const holderChanges = (r: LaneRoot, wl: string) => {
 	const l = ledgerOf(r);
@@ -107,14 +142,17 @@ const PENDING: FakeStep = { pending: true };
 const deferred = (s: Omit<FakeScript, "deferShutdown" | "ignoreEof">): FakeScript => ({ deferShutdown: true, ignoreEof: true, ...s });
 
 describe("a released lane's omp ends and lane-exit: follows (R1, R3, R8)", () => {
-	test("1: release in the owned turn with background pending → shutdown-requested, EOF, SIGTERM; lane-exit: completed within 30 s; the next launch reserves and starts its lane", async () => {
+	test("1: release in the owned turn with background pending → shutdown-requested, EOF, SIGTERM; lane-exit: completed within 10 s; the next launch reserves and starts its lane", async () => {
 		const r = makeRoot();
 		const wl = openWorkload(r);
 		setScript(r, deferred({ steps: [ADD, COMPLETE, DONE, PENDING, RELEASE] }));
 		launch(r, wl);
 		const lane1 = laneIdOf(wl, 1);
 		const started = (await startedOf(r, wl, lane1))!;
-		expect(await exitOf(r, wl, lane1)).toMatchObject({ outcome: "completed" });
+		// The done line's 10 s bound as a failure-only hang guard (PLAN wl-mw0ytmzi89d683 "The 10 s bound"): the wait ends on
+		// the lane-exit: entry; nothing is measured. The path is the stop poll (200 ms), the shutdown grace and EOF (1.5 s),
+		// then SIGTERM; the pre-change tree's settle wait (15 min) never lands inside it.
+		expect(await exitOf(r, wl, lane1, 10_000)).toMatchObject({ outcome: "completed" });
 		expect(shutdownEvents(r, started.pid)).toEqual(["shutdown-requested", "eof", "sigterm"]);
 		expect(promptsOf(r)).toHaveLength(1);
 		expect(laneSnapshot(r, wl).deaths).toEqual([]);
@@ -167,29 +205,39 @@ describe("a released lane's omp ends and lane-exit: follows (R1, R3, R8)", () =>
 		expect(laneSnapshot(r, wl).deaths).toEqual([`lane-died: ${lane1}: released with 1 open slice(s), no done-because; background work was in flight`]);
 	}, 60_000);
 
-	test("2c (R17): a third-party release while the runner waits is not a self-release; the runner's lease renewal never re-claims it", async () => {
-		const r = makeRoot();
+	// PLAN wl-mw0ytmzi89d683 F2: no fixed waits. The runner writes nothing on a quiet poll, so the event is the idle check:
+	// the release lands while the fake holds its turn at a gate (`awaiting-file`), the turn then ends unsettled, and the runner
+	// waits (a self-release would decide at once) until the settle wait goes idle and it sends `idle-check` from a stop-poll
+	// tick, which renews the lease in that same synchronous tick, after the release. That renewal and every one before it
+	// wrote no holder change. ledger/test/ledger.test.ts ("renewLease … D2b") proves renewLease never re-claims on the Ledger.
+	test("2c (R17): a third-party release while the runner's lane works is not a self-release: the runner waits to its idle check, and its lease renewals never re-claim", async () => {
+		const r = makeRoot({ AGENT_SYSTEM_LANE_SETTLE_IDLE_MS: "1500" });
 		const wl = openWorkload(r);
-		setScript(r, deferred({ steps: [PENDING] }));
-		const runner = launch(r, wl);
+		const gate = join(r.root, "gate-2c");
+		setScript(r, deferred({ steps: [{ awaitFile: gate }, PENDING] }));
+		launch(r, wl);
 		const lane1 = laneIdOf(wl, 1);
-		await startedOf(r, wl, lane1);
-		// the lane's own claim (lane-ready: follows it), then its one turn, which ends unsettled at once
+		const started = (await startedOf(r, wl, lane1))!;
+		// the lane's own claim (lane-ready: follows it), then its one turn, held at the gate
 		await until("lane 1's lane-ready:", () => laneSnapshot(r, wl).control.some((c) => c.prefix === "lane-ready" && c.laneId === lane1));
-		await until("lane 1's prompt", () => promptsOf(r).length === 1);
-		await Bun.sleep(1_000);
+		await until("lane 1's turn at the gate", () => eventsOf(r, started.pid).includes("awaiting-file"));
 		expect(laneSnapshot(r, wl).workload!.holder).toBe(lane1);
 		const l = ledgerOf(r);
-		expect(l.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: lane1 })).toEqual({ released: true });
-		l.close();
+		try {
+			expect(l.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: lane1 })).toEqual({ released: true });
+		} finally {
+			l.close();
+		}
 		const at = holderChanges(r, wl).length;
-		// many stop-poll ticks (200 ms here; 5 s by default)
-		await Bun.sleep(6_000);
+		writeFileSync(gate, "open\n");
+		expect(await exitOf(r, wl, lane1)).toMatchObject({ outcome: "completed" });
+		// the runner waited for the settle and asked omp once the wait went idle: it did not take the release as its own
+		expect(fakeRecords(r).filter((x) => x.pid === started.pid && x.command === "get_state" && x.id === IDLE_CHECK)).toHaveLength(1);
 		expect(holderChanges(r, wl).slice(at)).toEqual([]);
-		expect(laneSnapshot(r, wl).workload!.holder).toBeNull();
-		expect(laneExit(laneSnapshot(r, wl).control, lane1)).toBeNull();
-		process.kill(runner, "SIGTERM");
-		expect(await exitOf(r, wl, lane1)).toMatchObject({ outcome: "stop" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.workload!.holder).toBeNull();
+		expect(snap.deaths).toEqual([]);
+		expect(promptsOf(r)).toHaveLength(1);
 	}, 60_000);
 
 	test("3: a receipt only, owned turn, background pending → completed at once: omp ended, the workload released, no idle prompt", async () => {
@@ -275,6 +323,38 @@ describe("a self-released lane's stale omp at the next spawn (R5, R7, R15)", () 
 		expect(s2.pid).not.toBe(stale.pid);
 		expect(eventsOf(r, stale.pid)).toContain("sigterm");
 		await exitOf(r, wl, lane2);
+	}, 90_000);
+
+	// PLAN wl-mw0ytmzi89d683 F4: both enders live at once. Lane 1's own runner sits in its EOF grace (a 120 s shutdown grace
+	// for that runner alone, an omp that ignores EOF), and the next launch's runner ends the same omp with endStale. Whichever
+	// signal lands first, the outcome is pinned, not who sent it: one lane-exit: for lane 1 (its intended outcome, no death),
+	// the old omp gone to ps at every sighting of lane 2's lane-started:, and a starter that never refused `held`.
+	test("6c: the next launch while lane 1's runner is in its EOF grace → one lane-exit: for lane 1, no lane-died:, the old omp gone before lane 2's lane-started:, never held", async () => {
+		const r = makeRoot({ AGENT_SYSTEM_LANE_END_GRACE_MS: "5000" });
+		const wl = openWorkload(r);
+		setScript(r, deferred({ steps: [ADD, COMPLETE, DONE, PENDING, RELEASE] }));
+		const runner1 = launch(r, wl, { AGENT_SYSTEM_LANE_SHUTDOWN_GRACE_MS: "120000" });
+		const lane1 = laneIdOf(wl, 1);
+		const old = (await startedOf(r, wl, lane1))!;
+		leftovers.push(old.pid);
+		await until("lane 1's EOF", () => eventsOf(r, old.pid).includes("eof"));
+		expect(gone(old.pid)).toBe(false);
+		expect(alive(runner1)).toBe(true);
+		request(r, wl);
+		setScript(r, { steps: [RELEASE] });
+		const out = lane(r, ["launch", wl, "--requested-by", "test"]);
+		expect(out.code).toBe(STARTER_EXIT.ok);
+		expect(`${out.out}\n${out.err}`).not.toMatch(/\bheld:|still running/);
+		const lane2 = laneIdOf(wl, 2);
+		const s2 = (await startedAfterGone(r, wl, lane2, old.pid))!;
+		expect(s2.pid).not.toBe(old.pid);
+		expect(await exitOf(r, wl, lane1)).toMatchObject({ outcome: "completed" });
+		await until("lane 1's runner gone", () => !alive(runner1));
+		await exitOf(r, wl, lane2);
+		const snap = laneSnapshot(r, wl);
+		expect(snap.control.filter((c) => c.prefix === "lane-exit" && c.laneId === lane1)).toHaveLength(1);
+		expect(snap.deaths).toEqual([]);
+		expect(eventsOf(r, old.pid)).toContain("sigterm");
 	}, 90_000);
 
 	for (const how of ["signal", "ledger"] as const) {

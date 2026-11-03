@@ -16,7 +16,8 @@
 //     noSession?: true,            the get_state reply carries no sessionFile
 //     steps: [ { tool, args } | { sleepMs } | { exit: code } | { hang: true } | { result: "aborted" | "error", error? }
 //              | { usage: { usd, tokens }, hand? } | { background: ms | "never" } | { wake: { ms, steps } } | { emit: frame }
-//              | { writeFile: { path, text } } | { ledger: { body, slice? } | { routing: { slice } } } | { pending: true } ],
+//              | { writeFile: { path, text } } | { ledger: { body, slice? } | { routing: { slice } } } | { pending: true }
+//              | { awaitFile: path } ],
 //                                an arg value "$slice" is the id the newest tool result named (lane_add_slice mints it);
 //                                a usage step appends one assistant message with that usage (usage.cost.total,
 //                                usage.totalTokens) to the session file, or with `hand` to <session>/<hand>.jsonl, where
@@ -35,6 +36,8 @@
 //                                wl-mvidsu83epvpj4 § Fixture): the turn's steps go on, its prompt_result says
 //                                `sessionSettled: false`, get_state answers `isSettled: false` from then on, and a woken
 //                                turn (a wake step's) ends without `session_settled` while it stands;
+//                                an awaitFile step records `awaiting-file` and holds the turn until `path` exists (a gate
+//                                the test opens once it has acted); a gate not opened within 60 s exits 1 with a stderr line;
 //                                a ledger step writes what the classifier would, through the ledger module as the lane:
 //                                one `assumption` entry (`$slice` and `$routing` in the body are the newest slice and
 //                                routing ids), or one judge routings row on the slice (its id becomes `$routing`)
@@ -280,6 +283,24 @@ const runSteps = async (steps: readonly FakeStep[]): Promise<number | "never" | 
 					}
 				}, 50);
 			});
+			continue;
+		}
+		if ("awaitFile" in step) {
+			// The test's gate: the turn stands still (recorded once as `awaiting-file`) until the file exists; never past 60 s.
+			recordLine({ event: "awaiting-file", path: step.awaitFile });
+			const opened = await new Promise<boolean>((r) => {
+				const until = Date.now() + 60_000;
+				const t = setInterval(() => {
+					if (aborted || existsSync(step.awaitFile) || Date.now() >= until) {
+						clearInterval(t);
+						r(existsSync(step.awaitFile));
+					}
+				}, 50);
+			});
+			if (!opened && !aborted) {
+				process.stderr.write(`fake-omp: the awaitFile gate ${step.awaitFile} was not opened within 60 s; exiting 1\n`);
+				process.exit(1);
+			}
 			continue;
 		}
 		if ("sleepMs" in step) {

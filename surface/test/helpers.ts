@@ -263,7 +263,9 @@ export type FakeStep =
 	/** `text` written to `path`, e.g. the profile config re-rendered mid-run (fake-omp.ts header). */
 	| { writeFile: { path: string; text: string } }
 	/** A background job that never settles, inside the turn: the steps go on, prompt_result says `sessionSettled: false` (PLAN wl-mvidsu83epvpj4 § Fixture). */
-	| { pending: true };
+	| { pending: true }
+	/** The turn holds until this file exists (a gate the test opens), recorded first as `awaiting-file` (fake-omp.ts header). */
+	| { awaitFile: string };
 /** The fake omp's script (surface/test/fake-omp.ts header). */
 export interface FakeScript {
 	claim?: boolean;
