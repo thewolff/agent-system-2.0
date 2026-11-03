@@ -14,6 +14,7 @@ import {
 	PRIORITY_REASON_PREFIX, priorityPausedOf, priorityPausingOf, requirementsProblem, reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
 	testPrBody, testPrInstructionBody, type Resolution, resumePlan, resumeSession, TRAIN_LANDS_LINE, TRAIN_LANDS_PRODUCTION_LINE, verdictOf, waivedPrs, waivePrBody, waivePrInstructionBody,
 	withdrawInstructionBody, withdrawnBody, withdrawnBy, landFirstBody, landFirstInstructionBody, landFirstOn, mainRetries, mainRetryBody, mainRetryInstructionBody, sameRepo,
+	laneModel, laneModelBody, modelProblem,
 } from "../src/launch";
 import { consumedByReady, TRAIN_DONE, TRAIN_LAUNCH_LIMIT, TRAIN_LAUNCH_OPTIONS, trainLaunchFailures, type TrainLaunchRows } from "../src/merge-train";
 import { trainBudgetSliceId, trainPausedBody, trainRaiseBody } from "../src/train-budget";
@@ -1334,5 +1335,22 @@ describe("a merge train is refused by hand (PLAN wl-mvr888nftz0vcl D5)", () => {
 		expect(decideInteractive(rows(workload({ mode: "user-driven", status: "closed" }), true))).toEqual({ launch: false, reason: "closed" });
 		expect(decideInteractive(rows(workload({ mode: "user-driven" }), false))).toEqual({ launch: true, cause: "interactive" });
 		expect(decideInteractive(rows(workload(), false))).toEqual({ launch: false, reason: "autonomous" });
+	});
+});
+
+describe("lane-model refuses a reviews-only lab (PLAN wl-mw148irbq33zt5 D3, R5)", () => {
+	test("Jo's lane-model word naming a zai model is refused with a reason naming REVIEW_ONLY_LABS; other labs pass", () => {
+		for (const model of ["zai/glm-5.3", "zai/glm-5.3-flash", "zai/glm-5.3-flashx"]) {
+			const problem = modelProblem(model);
+			expect(problem).toContain("REVIEW_ONLY_LABS");
+			expect(problem).toContain(`\`${model}\` is on lab zai, which takes reviews only`);
+		}
+		for (const model of ["anthropic/claude-opus-5-5", "openai-codex/gpt-6.1-sol", "moonshot/kimi-k2.7-code"]) expect(modelProblem(model)).toBeNull();
+	});
+
+	test("a zai lane-model: entry is never the lane's model: the newest valid entry before it stands", () => {
+		const rows = [entry(SURFACE_BY, laneModelBody("openai-codex/gpt-6.1-sol", NOW)), entry(SURFACE_BY, laneModelBody("zai/glm-5.3", NOW))];
+		expect(laneModel(control(rows))).toBe("openai-codex/gpt-6.1-sol");
+		expect(laneModel(control([entry(SURFACE_BY, laneModelBody("zai/glm-5.3", NOW))]))).toBeNull();
 	});
 });

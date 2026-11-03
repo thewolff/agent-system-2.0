@@ -18,7 +18,7 @@ import {
 import { createClassifierExtension } from "../extension";
 import { loadCalibration } from "../src/classify";
 import { builderLabs } from "../src/lab";
-import { tierTableFromConfig } from "../src/tier-table";
+import { type TierTable, tierTableFromConfig } from "../src/tier-table";
 import { asyncDelivery, currentModel, dist, type FakeRegistry, fakeRegistry, recordedQuestion } from "./helpers";
 
 const ROWS = {
@@ -126,14 +126,17 @@ interface Lane {
  * `ledger`: what `deps.ledger()` returns (a failing stand-in for the one-transaction check). `alert`: the move alert's
  * start, by default the real `spawnMoveAlert` with a fake spawner whose argv lands in `spawned`.
  */
-function lane(w: World, opts: { laneModel?: string; bound?: string | null; ledger?: Ledger; alert?: (ledger: Ledger, wl: string, eventId: string) => number | null } = {}): Lane {
+function lane(
+	w: World,
+	opts: { laneModel?: string; bound?: string | null; ledger?: Ledger; table?: TierTable; alert?: (ledger: Ledger, wl: string, eventId: string) => number | null } = {},
+): Lane {
 	const handlers: Record<string, Handler> = {};
 	const handSession: Record<string, Handler> = {};
 	const logs: string[] = [];
 	const spawned: string[][] = [];
 	const extension = createClassifierExtension({
 		judge: async () => JUDGE as never,
-		tierTable: () => TABLE,
+		tierTable: () => opts.table ?? TABLE,
 		disabledProviders: async () => [],
 		question: recordedQuestion(),
 		calibration: loadCalibration(),
@@ -318,6 +321,33 @@ describe("an exhausted Anthropic week moves a build hand to the first usable Ope
 		expect((await buildSpawn(h, w)).spawn?.model).toEqual([KIMI]);
 		expect(bodies(w, "hand-headroom:")).toEqual([expect.stringContaining(`${OPUS} -> ${KIMI} (${EXHAUSTED})`)]);
 		expect(builderLabs(w.ledger, w.wl).labs).toContain("kimi");
+	});
+
+	test("R5: a reviews-only zai entry second in the row is never the move target; the move goes to the next lab, OpenAI (PLAN wl-mw148irbq33zt5 D3)", async () => {
+		const GLM = "zai/glm-5.3";
+		const table = tierTableFromConfig({ task: { agentModelOverrides: { ...ROWS, strong: [OPUS, GLM, SOL, KIMI] } } });
+		const w = world(poll([week(1), openaiWeek]));
+		w.registry = fakeRegistry([...ALL, GLM], [...ALL, GLM]);
+		const h = lane(w, { table });
+		h.laneMessage(OPUS);
+		expect((await buildSpawn(h, w)).spawn?.model).toEqual([SOL]);
+		expect(bodies(w, "hand-headroom:")).toEqual([expect.stringContaining(`${OPUS} -> ${SOL} (${EXHAUSTED})`)]);
+		expect(bodies(w, "hand-spawn:").join("\n")).not.toContain(GLM);
+		expect(builderLabs(w.ledger, w.wl).labs).not.toContain("zai");
+	});
+
+	test("R5: with only the reviews-only zai entry usable off the lane lab, the hand is refused as today, with no move", async () => {
+		const GLM = "zai/glm-5.3";
+		const table = tierTableFromConfig({ task: { agentModelOverrides: { ...ROWS, strong: [OPUS, GLM, SOL, KIMI] } } });
+		const w = world(poll([week(1), openaiWeek]));
+		w.registry = fakeRegistry([...ALL, GLM], [...ALL, GLM].filter(m => m !== SOL && m !== KIMI));
+		const h = lane(w, { table });
+		h.laneMessage(OPUS);
+		const { spawn } = await buildSpawn(h, w);
+		expect(spawn?.block).toBe(true);
+		expect(spawn?.reason).toContain("a build hand never runs on another lab");
+		expect(quotaMoves(w.ledger)).toEqual([]);
+		expect(bodies(w, "hand-headroom:")).toEqual([]);
 	});
 
 	test("nothing usable on any lab: today's refusal and wording, no move", async () => {

@@ -19,7 +19,7 @@ import { checkHowItFails, HOW_IT_FAILS_HEADING, HOW_IT_FAILS_NA_LINE } from "../
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_CAP_ENV, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
-import { labOf } from "../../classifier/src/lab";
+import { labOf, REVIEW_ONLY_LABS } from "../../classifier/src/lab";
 import { consumedByReady, openTrains, TRAIN_DONE, type TrainAttempt, trainBrief, type TrainSource } from "./merge-train";
 import { type TrainBudgetReason, type TrainBudgetRows, trainBudgetGate } from "./train-budget";
 import {
@@ -816,14 +816,19 @@ const MODEL_SELECTOR = /^[a-z0-9-]+\/[A-Za-z0-9._-]+$/;
 /**
  * Why `value` is not a model Jo can name, or null when it is (MIGRATION.md item 85): an exact `provider/model`
  * (OMP's `--model` fuzzy-matches anything looser), no `:level` suffix (its handling under `--model` is not
- * documented), and a provider `labOf` knows; or the word `default`, which clears a named model.
+ * documented), and a provider `labOf` knows whose lab builds (not in `REVIEW_ONLY_LABS`, PLAN wl-mw148irbq33zt5
+ * D3: a lane builds); or the word `default`, which clears a named model.
  */
 export function modelProblem(value: string): string | null {
 	if (value === "") return "no model was named; name an exact provider/model, e.g. openai-codex/gpt-6-sol (or `default`), or omit `model`";
 	if (value === "default") return null;
 	if (value.includes(":")) return `\`${value}\` carries a \`:level\` suffix; name the model alone, e.g. openai-codex/gpt-6-sol`;
 	if (!MODEL_SELECTOR.test(value)) return `\`${value}\` is not an exact provider/model selector, e.g. openai-codex/gpt-6-sol (or \`default\`)`;
-	if (labOf(value) === null) return `\`${value}\` names a provider with no known lab; add it to classifier/src/lab.ts first`;
+	const lab = labOf(value);
+	if (lab === null) return `\`${value}\` names a provider with no known lab; add it to classifier/src/lab.ts first`;
+	if (REVIEW_ONLY_LABS.has(lab)) {
+		return `\`${value}\` is on lab ${lab}, which takes reviews only (REVIEW_ONLY_LABS in classifier/src/lab.ts); a lane builds, so name a model on another lab (or \`default\`)`;
+	}
 	return null;
 }
 

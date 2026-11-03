@@ -5,6 +5,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { isReviewOnly } from "../../classifier/src/lab";
 import { loadTierTable } from "../../classifier/src/tier-table";
 import { LANE_RUNNER_BY, Ledger } from "../../ledger/src/index";
 import { onFire } from "../src/batch";
@@ -187,10 +188,14 @@ describe("PLAN wl-mv71x5rwdu7eo0 § 4: the quota guard at the runner's spawn", (
 		expect(snap.workload!.holder).toBeNull();
 	}, 60_000);
 
-	test("an unnamed lane whose omp starts on anthropic, anthropic 5h at 0.85: set_model to the strong row's next entry, confirmed by get_state, before the first prompt; lane-headroom: by lane-runner", async () => {
+	test("an unnamed lane whose omp starts on anthropic, anthropic 5h at 0.85: set_model to the strong row's next entry a lane can run on, confirmed by get_state, before the first prompt; lane-headroom: by lane-runner", async () => {
 		const r = makeRoot({ anthropic: 0.85 });
-		// The target is the profile's strong row's first entry on another lab (profile/config.yml).
-		expect(loadTierTable(PROFILE_CONFIG).strong.find((s) => !s.startsWith("anthropic/"))).toBe(SOL);
+		// R5 (PLAN wl-mw148irbq33zt5 D3): the profile's strong row lists the reviews-only zai/glm-5.3 second, with room (no
+		// poll names zai), and the move skips it: the target is the first entry on another lab that builds (profile/config.yml).
+		const strong = loadTierTable(PROFILE_CONFIG).strong;
+		expect(strong[1]).toBe("zai/glm-5.3");
+		expect(isReviewOnly(strong[1]!)).toBe(true);
+		expect(strong.find((s) => !s.startsWith("anthropic/") && !isReviewOnly(s))).toBe(SOL);
 		const wl = openWorkload(r, null);
 		launch(r, wl, { steps: DONE, stateModel: { provider: "anthropic", id: "claude-opus-5-5" } });
 		const lane1 = laneIdOf(wl, 1);
@@ -223,7 +228,9 @@ describe("PLAN wl-mv71x5rwdu7eo0 § 4: the quota guard at the runner's spawn", (
 		expect(commandsOf(r, 1).some((c) => c.startsWith("set_model"))).toBe(false);
 		const failed = snap.control.filter((c) => c.prefix === "launch-failed");
 		expect(failed.map((c) => [c.laneId, c.createdBy])).toEqual([[lane1, LANE_RUNNER_BY]]);
-		expect(failed[0]!.rest).toStartWith(`headroom: ${A} is out (${REASON}); every strong-row entry is out: `);
+		// zai has room but takes reviews only, so it is neither a target nor listed (PLAN wl-mw148irbq33zt5 D3).
+		expect(failed[0]!.rest).toStartWith(`headroom: ${A} is out (${REASON}); every strong-row entry a lane can run on is out: `);
+		expect(failed[0]!.rest).not.toContain("zai/");
 		expect(snap.deaths.length).toBe(1);
 		expect(snap.deaths[0]).toStartWith(`lane-died: ${lane1}: launch failed at headroom: ${A} is out`);
 		expect(snap.workload!.holder).toBeNull();

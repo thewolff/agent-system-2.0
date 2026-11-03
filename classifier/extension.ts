@@ -195,7 +195,6 @@ import {
 	kimiOutRuleActive,
 	type Lab,
 	labOf,
-	LABS,
 	laneBuilderBody,
 	openParkQuestion,
 	PARK_OPTIONS,
@@ -207,7 +206,9 @@ import {
 	type ReviewContext,
 	type ReviewPlanInput,
 	reviewPlan,
+	REVIEW_ONLY_LABS,
 	REVIEW_ROW_FROM,
+	REVIEW_ROW_FROM_SOURCE,
 	reviewRow,
 	reviewSameLabBody,
 	reviewSameLabRuleBody,
@@ -238,6 +239,9 @@ import {
 	panelLegBody,
 	type Manifest,
 	type PanelLedger,
+	PANEL_LABS,
+	isPanelLab,
+	type PanelLab,
 	type PanelMode,
 	type PanelRole,
 	panelSynthBody,
@@ -596,7 +600,8 @@ function reviewRowNotes(table: TierTable, tier: Tier, pin: Lab | null, context?:
 		if (pin !== null && pin !== lab) return [];
 		const of = (r: readonly string[]) => r.filter(s => labOf(s) === lab).join(",");
 		if (of(row) === of(table[tier])) return [];
-		return [of(row) ? `${lab} reviewer from the ${from} row (Jo, in-mv5qfm8910ycjk)` : `no ${lab} reviewer: the ${from} row has no ${lab} entry and a review never falls back to the ${tier} row's (Jo, in-mv5qfm8910ycjk)`];
+		const source = REVIEW_ROW_FROM_SOURCE[lab] ?? "REVIEW_ROW_FROM";
+		return [of(row) ? `${lab} reviewer from the ${from} row (${source})` : `no ${lab} reviewer: the ${from} row has no ${lab} entry and a review never falls back to the ${tier} row's (${source})`];
 	});
 }
 
@@ -768,11 +773,11 @@ type PanelPlan =
 			run: string;
 			pg: string;
 			pdir: string;
-			members: Lab[];
-			missing: { lab: Lab; reason: string }[];
-			ingested: { inputs: Record<string, string>; mode: PanelMode; schema: unknown; tasks: Record<Lab, string> } | null;
+			members: PanelLab[];
+			missing: { lab: PanelLab; reason: string }[];
+			ingested: { inputs: Record<string, string>; mode: PanelMode; schema: unknown; tasks: Record<PanelLab, string> } | null;
 	  }
-	| { kind: "panel-synth"; run: string; pg: string; pdir: string; lab: Lab; builderLab: boolean; task: string; schema: unknown };
+	| { kind: "panel-synth"; run: string; pg: string; pdir: string; lab: PanelLab; builderLab: boolean; task: string; schema: unknown };
 
 /** D5 [R6]: a review's effective stakes, the higher of the brief's and the workload row's. */
 function effectiveStakes(brief: Stakes | null, workload: Stakes | null): Stakes | null {
@@ -1791,7 +1796,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	): void {
 		const ledger = deps.ledger();
 		const state = panelGroups(ledger.entries(workloadId)).get(spawn.group);
-		const lab = state ? (roleOf(state, spawn.token)?.lab ?? labOf(spawn.row[0] ?? "")) : null;
+		const found = state ? (roleOf(state, spawn.token)?.lab ?? labOf(spawn.row[0] ?? "")) : null;
+		// A panel hand only ever spawns on a panel lab (PANEL_LABS); a row naming another is not this panel's.
+		const lab = isPanelLab(found) ? found : null;
 		if (!state || !lab) return;
 		const panel: PanelRole = roleOf(state, spawn.token) ?? { group: spawn.group, pdir: state.group.pdir, lab, role: "synth" };
 		if (panel.role === "leg" ? state.legs.has(lab) : state.synths.get(spawn.token)?.end) return; // already judged
@@ -1836,7 +1843,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		}
 		if (runs.has(run)) return `the panel run ${run} is named twice in this call`;
 		runs.add(run);
-		const names = field.field === "panel" ? LABS.map(lab => `${c.sliceId}--${lab}`) : [`${c.sliceId}--synth`];
+		const names = field.field === "panel" ? PANEL_LABS.map(lab => `${c.sliceId}--${lab}`) : [`${c.sliceId}--synth`];
 		for (const name of names) {
 			if (!OMP_AGENT_ID.test(name)) return `\`${c.sliceId}\` is too long for its panel hand name \`${name}\` (at most 48 characters, an OMP agent id); use a shorter slice id`;
 			const conflict = spawnKeyConflict(name, waiting(), "pending ");
@@ -1863,7 +1870,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			if (existing) return `the panel run ${run} was already dispatched as ${existing.pg}; prepare a new run (one group per run)`;
 			const held = panelDispatchHeld(entries, ledger.instructions(c.workloadId), ledger.workload(c.workloadId)?.stakes ?? "normal", c.workloadId, c.sliceId);
 			if (held) return held;
-			const pins = LABS.map(lab => ({ lab, ...panelPin({ row, usable, lab, skipped: why }) }));
+			const pins = PANEL_LABS.map(lab => ({ lab, ...panelPin({ row, usable, lab, skipped: why }) }));
 			const members = pins.filter(p => p.models.length > 0).map(p => p.lab);
 			if (members.length === 0) return `no lab can run a panel member now (${pins.flatMap(p => p.reasons).join(", ")}); dispatch the panel again later`;
 			const pg = newToken("pg");
@@ -1889,7 +1896,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		} catch (error) {
 			return `panel ${state.pg} is void (${voidRun(ledger, at, state.pg, message(error))}); run a new panel`;
 		}
-		const pick = synthLab({ row, usable, builders: buildersOf(c.workloadId), skipped: why });
+		const pick = synthLab({ row, usable, builders: buildersOf(c.workloadId), labs: PANEL_LABS, skipped: why });
 		if ("reasons" in pick) return `no lab can run panel ${state.pg}'s synthesis now (${pick.reasons.join(", ")}); dispatch it again later`;
 		const task = synthTask(withoutPanelLines(c.item.task ?? ""), state.group.pdir, manifest, landedLabs(state), pick.lab, pick.builderLab);
 		return { kind: "panel-synth", run, pg: state.pg, pdir: state.group.pdir, lab: pick.lab, builderLab: pick.builderLab, task, schema };
@@ -1901,8 +1908,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		const manifest = ingested.manifest;
 		const schema: unknown = JSON.parse(readNoFollow(join(plan.pdir, "in", manifest.legSchema)).toString("utf8"));
 		const text = withoutPanelLines(c.item.task ?? "");
-		const tasks = { anthropic: "", openai: "", kimi: "" };
-		for (const lab of LABS) tasks[lab] = memberTask(text, plan.pdir, manifest, lab);
+		const tasks: Record<PanelLab, string> = { anthropic: "", openai: "", kimi: "" };
+		for (const lab of PANEL_LABS) tasks[lab] = memberTask(text, plan.pdir, manifest, lab);
 		plan.ingested = { inputs: ingested.inputs, mode: manifest.mode, schema, tasks };
 	}
 
@@ -2622,7 +2629,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						const base = { toolCallId: event.toolCallId, sliceId: c.sliceId, workloadId: c.workloadId, routing: c.routing, review: c.review, loop, dispatchedAt: Date.now(), panel: null };
 						if (typeof plan === "object" && plan.kind === "panel") {
 							const ingested = plan.ingested!;
-							const members: Record<Lab, string | null> = { anthropic: null, openai: null, kimi: null };
+							const members: Record<PanelLab, string | null> = { anthropic: null, openai: null, kimi: null };
 							for (const lab of plan.members) {
 								const token = newToken("dt");
 								members[lab] = token;
@@ -2873,7 +2880,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				/**
 				 * PLAN wl-mvwk0v0gmp6cjc D6 (Jo, in-mvwl9tkmsym86o, amending in-mv7hm58386f2o0 for this case): a build hand with no
 				 * usable lane-lab entry, one of them out on an exhausted week, moves to the first entry of its tier row on another
-				 * (known) lab, in row order, that `usableRow` admits (the same checks: enabled, credentials, not refused, not out).
+				 * (known) lab that builds (not `REVIEW_ONLY_LABS`), in row order, that `usableRow` admits (the same checks: enabled,
+				 * credentials, not refused, not out).
 				 * Null, with today's refusal, when no week is exhausted, no other-lab entry is usable, or an unclassified hand's
 				 * session is bound to no workload (the move could not be recorded). A hand whose lane already moved plans on the
 				 * lane's new lab and never reaches here.
@@ -2887,9 +2895,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						log(`agent-system-2 classifier: unclassified hand ${spawnKey ?? "(no spawn key)"} not moved off ${from} (${reason}): this session is bound to no workload, so the move could not be recorded; refused as before`);
 						return null;
 					}
+					// A reviews-only lab's entries are never a build hand's target (PLAN wl-mw148irbq33zt5 D3).
 					const others = table[tier].filter(s => {
 						const other = labOf(s);
-						return other !== null && other !== lab;
+						return other !== null && other !== lab && !REVIEW_ONLY_LABS.has(other);
 					});
 					// An unclassified spawn plans its lane-lab row with no workload's refusals (above); its move is recorded on the
 					// bound workload, so the target is checked against that workload's refusals as a classified spawn's is.

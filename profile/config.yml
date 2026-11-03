@@ -198,8 +198,8 @@ retry:
 # tier (omp://task-agent-discovery.md § "Model and structured-output precedence", item 1) and the
 # classifier extension returns the hand's own candidates from it at spawn, so a missing or malformed
 # row refuses the dispatch instead of inheriting the lane's model.
-# Each row is the tier's candidate inventory across the three flat-rate providers, one entry per lab
-# today, in order. A row may never list a model that appears in a higher tier's row (a pull-up),
+# Each row is the tier's candidate inventory across the flat-rate and prepaid providers, one entry per
+# lab, in order. A row may never list a model that appears in a higher tier's row (a pull-up),
 # and retry.fallbackChains may not be keyed on any model below or define `default`
 # (classifier/src/tier-table.ts).
 # Builds (every hand that is not a review) follow the lane's lab, tier for tier (SPEC-2.0.md § A1.3
@@ -218,11 +218,17 @@ retry:
 # automatically; builds continue to follow the lane lab throughout. Running classifier
 # processes must restart to load the code change. Deep review OpenAI substitution remains
 # the strong-row rule below; no tier selector is changed.
-# Row 1 of each tier is the ruled Anthropic pin (SPEC-2.0.md § A1.3; .omp/agents/*.md:4). Rows 2-3
-# (openai-codex, moonshot) are the same tier on the other providers, approved as written by Jo
-# 2026-09-28. Standard's row 1 is anthropic/claude-sonnet-5-5 (Jo, 2026-09-29). Row 3 moved from
-# kimi-code to moonshot (Jo, in-muq3zh77r02g3k).
-# The moonshot row-3 entries are removed until Kimi is paid again (Jo, 2026-10-26,
+# Row 1 of each tier is the ruled Anthropic pin (SPEC-2.0.md § A1.3; .omp/agents/*.md:4). The
+# openai-codex (and, when paid, moonshot) entries are the same tier on the other providers, approved
+# as written by Jo 2026-09-28. Standard's row 1 is anthropic/claude-sonnet-5-5 (Jo, 2026-09-29). The
+# kimi entries moved from kimi-code to moonshot (Jo, in-muq3zh77r02g3k).
+# Row 2 of fast, standard and strong is Z.ai's GLM-5.3 family (PLAN wl-mw148irbq33zt5 D2; prepaid
+# Standard API key): the first reviewer of Anthropic-built work, with openai-codex as the in-hand
+# fallback. Z.ai is a reviews-only lab (classifier/src/lab.ts REVIEW_ONLY_LABS): no build hand,
+# hand move, lane headroom move or `lane-model:` word picks it. Deep has no zai entry (three GLM-5.3
+# models, four tiers, and one model may sit in one tier only); deep reviews take the strong row's
+# zai/glm-5.3 through REVIEW_ROW_FROM (classifier/src/lab.ts).
+# The moonshot entries are removed until Kimi is paid again (Jo, 2026-10-26,
 # in-mvplvhx6h1c35s; the Moonshot account is suspended for insufficient balance). While
 # classifier/src/lab.ts KIMI_OUT_RULE is active (ends 2026-11-01T00:00-07:00), its rowOmission treats
 # a row with no kimi entry as Kimi out. migration/items/kimi-off-tier-rows-until-paid.md restores them.
@@ -234,15 +240,19 @@ task:
   agentModelOverrides:
     fast:
       - anthropic/claude-haiku-5-5
+      - zai/glm-5.3-flash
       - openai-codex/gpt-5.6-luna
     standard:
       - anthropic/claude-sonnet-5-5
+      - zai/glm-5.3-flashx
       - openai-codex/gpt-6-luna
     strong:
       - anthropic/claude-opus-5-5
+      - zai/glm-5.3
       - openai-codex/gpt-6.1-sol
     # Deep reviews substitute the OpenAI reviewer from this strong row (Jo, 2026-10-12,
-    # in-mv5qfm8910ycjk), until the review-cost framework workload lands or Jo says otherwise.
+    # in-mv5qfm8910ycjk), until the review-cost framework workload lands or Jo says otherwise, and
+    # take its zai/glm-5.3 as the zai reviewer (PLAN wl-mw148irbq33zt5 D2).
     # The strong-row entry is gpt-6.1-sol (Jo, 2026-10-14, in-mv8qzqym1ihmv4: it replaced
     # gpt-6-sol). The dated Anthropic-out restriction does not change this substitution.
     # Non-review deep spawns take their lane lab's entry of this row (an OpenAI lane's deep build runs

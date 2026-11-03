@@ -29,3 +29,23 @@ describe("profile template: strong-row OpenAI entry is gpt-6.1-sol (in-mv8qzqym1
 		expect(TIERS.filter(tier => table[tier].some(entry => modelIdentity(entry) === SOL))).toEqual(["strong"]);
 	});
 });
+
+describe("profile template: Z.ai GLM-5.3 reviewers (PLAN wl-mw148irbq33zt5 D2)", () => {
+	test("R2: the real table loads with each GLM model in one tier only", () => {
+		const table = tierTableFromConfig(Bun.YAML.parse(readFileSync(TEMPLATE, "utf8")));
+		const glm = TIERS.flatMap(tier => table[tier].filter(entry => labOf(entry) === "zai").map(entry => [tier, modelIdentity(entry)]));
+		expect(glm).toEqual([
+			["fast", "zai/glm-5.3-flash"],
+			["standard", "zai/glm-5.3-flashx"],
+			["strong", "zai/glm-5.3"],
+		]);
+	});
+
+	test("R4: a deep review on the real table takes the strong row's zai/glm-5.3, and its OpenAI leg stays gpt-6.1-sol", () => {
+		const table = loadTierTable(TEMPLATE);
+		const deep = reviewRow(table, "deep");
+		expect(deep.filter(entry => labOf(entry) === "zai")).toEqual(["zai/glm-5.3"]);
+		expect(deep.filter(entry => labOf(entry) === "openai")).toEqual([SOL]);
+		expect(deep).toEqual(["anthropic/claude-fable-5-1", SOL, "zai/glm-5.3"]);
+	});
+});

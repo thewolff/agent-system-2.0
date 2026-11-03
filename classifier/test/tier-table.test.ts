@@ -38,10 +38,25 @@ describe("profile template tier table", () => {
 		expect(table.standard[0]).toBe("anthropic/claude-sonnet-5-5");
 		expect(table.strong[0]).toBe("anthropic/claude-opus-5-5");
 		expect(table.deep[0]).toBe("anthropic/claude-fable-5-1");
-		// SPEC-2.0.md § B11: each row spreads across the flat-rate providers. Kimi is off the rows until
-		// Jo pays Moonshot (migration/items/kimi-off-tier-rows-until-paid.md restores the three-provider assertion).
+		// SPEC-2.0.md § B11: each row spreads across the providers. Kimi is off the rows until Jo pays Moonshot
+		// (migration/items/kimi-off-tier-rows-until-paid.md restores moonshot); zai is on every row but deep
+		// (PLAN wl-mw148irbq33zt5 D2: three GLM-5.3 models for four tiers).
 		for (const tier of TIERS) {
-			expect(new Set(table[tier].map(m => m.split("/")[0]))).toEqual(new Set(["anthropic", "openai-codex"]));
+			const providers = tier === "deep" ? ["anthropic", "openai-codex"] : ["anthropic", "zai", "openai-codex"];
+			expect(table[tier].map(m => m.split("/")[0])).toEqual(providers);
+		}
+	});
+
+	test("R2: fast, standard and strong each carry one distinct zai entry, second, before openai-codex; deep none", () => {
+		const table = loadTierTable(TEMPLATE);
+		const zai = (tier: (typeof TIERS)[number]) => table[tier].filter(m => labOf(m) === "zai");
+		expect(zai("fast")).toEqual(["zai/glm-5.3-flash"]);
+		expect(zai("standard")).toEqual(["zai/glm-5.3-flashx"]);
+		expect(zai("strong")).toEqual(["zai/glm-5.3"]);
+		expect(zai("deep")).toEqual([]);
+		for (const tier of ["fast", "standard", "strong"] as const) {
+			expect(table[tier][1]).toBe(zai(tier)[0]!);
+			expect(table[tier].findIndex(m => m.startsWith("zai/"))).toBeLessThan(table[tier].findIndex(m => m.startsWith("openai-codex/")));
 		}
 	});
 

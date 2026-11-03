@@ -16,21 +16,38 @@
  *   (PLAN wl-mv5xay6bjp0268); `builderRoles` orders a same-lab hand least-involved builder lab first.
  * - `ANTHROPIC_OUT_RULE`: the current OpenAI lane's dated, Codex-only review authorization, independent
  *   of builder history and Kimi availability (PLAN wl-mvtusij5mhwtnv).
+ * - `REVIEW_ONLY_LABS`: labs whose entries only reviews take (Z.ai, PLAN wl-mw148irbq33zt5 D3).
  */
 import { type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type RoutingRow } from "../../ledger/src/index";
 import { SURFACE_BY } from "../../surface/src/types";
 import { type HandSessionModels, handSessionModels } from "./hand-session";
+import type { PanelLab } from "./panel";
 import { type Kind, type Routing, type Stakes, type Tier, topTwoKinds } from "./route";
 import { modelIdentity, type TierTable } from "./tier-table";
 
-export type Lab = "anthropic" | "openai" | "kimi";
-/** Every lab, in the order the tier rows list them. */
-export const LABS: readonly Lab[] = ["anthropic", "openai", "kimi"];
+export type Lab = "anthropic" | "zai" | "openai" | "kimi";
+/** Every lab, in the order the tier rows list them. Panels keep their own three (`PANEL_LABS`, classifier/src/panel.ts). */
+export const LABS: readonly Lab[] = ["anthropic", "zai", "openai", "kimi"];
+
+/**
+ * Labs whose tier-row entries only reviews take (PLAN wl-mw148irbq33zt5 D3): builds on GLM would need
+ * their own ruling (Jo's standing ruling: build lanes run on Opus). A build hand on such a lane is
+ * refused (`buildRow`), and a hand move, an unnamed lane's headroom move, the week-pace comparator and a
+ * `lane-model:` word all skip or refuse it. Ending it is deleting the entry.
+ */
+export const REVIEW_ONLY_LABS: ReadonlySet<Lab> = new Set<Lab>(["zai"]);
+
+/** True when `selector`'s lab takes reviews only (`REVIEW_ONLY_LABS`); false for a provider with no lab. */
+export function isReviewOnly(selector: string): boolean {
+	const lab = labOf(selector);
+	return lab !== null && REVIEW_ONLY_LABS.has(lab);
+}
 
 // D1: one explicit map. A provider must be added here before a review can count it as another lab.
 // `kimi-code` stays after the tier rows moved to `moonshot` (Jo, in-muq3zh77r02g3k): older ledger rows name it.
 const PROVIDER_LAB: Readonly<Record<string, Lab>> = {
 	anthropic: "anthropic",
+	zai: "zai",
 	openai: "openai",
 	"openai-codex": "openai",
 	"kimi-code": "kimi",
@@ -419,14 +436,21 @@ export function parkQuestionBody(sliceId: string, builders: Builders, reasons: r
  * unchanged and non-review deep spawns keep the deep row. Each entry names a lab whose review
  * entries on the deep row come from the named tier's row instead. It holds until the review-cost
  * framework workload lands or Jo says otherwise; ending it is deleting the entry.
+ * `zai: "strong"` (PLAN wl-mw148irbq33zt5 D2): Z.ai has three GLM-5.3 models for four tiers, so the
+ * deep row has no zai entry and deep reviews borrow the strong row's glm-5.3.
  */
-export const REVIEW_ROW_FROM: Readonly<Partial<Record<Lab, Tier>>> = { openai: "strong" };
+export const REVIEW_ROW_FROM: Readonly<Partial<Record<Lab, Tier>>> = { openai: "strong", zai: "strong" };
+
+/** Who ruled each `REVIEW_ROW_FROM` entry, for the routing note (classifier/extension.ts `reviewRowNotes`). */
+export const REVIEW_ROW_FROM_SOURCE: Readonly<Partial<Record<Lab, string>>> = { openai: "Jo, in-mv5qfm8910ycjk", zai: "PLAN wl-mw148irbq33zt5 D2" };
 
 /**
  * The row a review dispatch on `tier` plans on. On `deep`: the deep row with every entry of a lab
  * named in `REVIEW_ROW_FROM` replaced, at that lab's first deep entry, by the named tier's entries
  * of the same lab (identities de-duplicated); a lab with none there loses its deep entries and
- * never falls back to them. Other labs' entries stay where they are. Any other tier: its row.
+ * never falls back to them. A `REVIEW_ROW_FROM` lab with no deep entry gets the named tier's
+ * entries appended after the row (PLAN wl-mw148irbq33zt5 D2). Other labs' entries stay where they
+ * are. Any other tier: its row.
  * With explicit current-lane/time context, the active Anthropic-out rule then keeps only exact
  * openai-codex provider entries. No context preserves the historical row for offline consumers.
  */
@@ -435,14 +459,7 @@ export function reviewRow(table: TierTable, tier: Tier, context?: ReviewContext)
 	if (tier !== "deep") return anthropicOutRuleActive(context) ? row.filter(s => providerOf(s) === "openai-codex") : [...row];
 	const out: string[] = [];
 	const replaced = new Set<Lab>();
-	for (const selector of row) {
-		const lab = labOf(selector);
-		const from = lab === null ? undefined : REVIEW_ROW_FROM[lab];
-		if (lab === null || from === undefined) {
-			out.push(selector);
-			continue;
-		}
-		if (replaced.has(lab)) continue;
+	const borrow = (lab: Lab, from: Tier) => {
 		replaced.add(lab);
 		const seen = new Set<string>();
 		for (const entry of table[from]) {
@@ -450,7 +467,17 @@ export function reviewRow(table: TierTable, tier: Tier, context?: ReviewContext)
 			seen.add(modelIdentity(entry));
 			out.push(entry);
 		}
+	};
+	for (const selector of row) {
+		const lab = labOf(selector);
+		const from = lab === null ? undefined : REVIEW_ROW_FROM[lab];
+		if (lab === null || from === undefined) {
+			out.push(selector);
+			continue;
+		}
+		if (!replaced.has(lab)) borrow(lab, from);
 	}
+	for (const [lab, from] of Object.entries(REVIEW_ROW_FROM) as [Lab, Tier][]) if (!replaced.has(lab)) borrow(lab, from);
 	return anthropicOutRuleActive(context) ? out.filter(s => providerOf(s) === "openai-codex") : out;
 }
 
@@ -609,6 +636,8 @@ export function reviewPlan(input: ReviewPlanInput): ReviewPlan {
 }
 
 // ---- Three-lab panels (PLAN wl-mv5m7qvgkxhpj4 § 3.4 rule 1; classifier/src/panel.ts) ---------
+// A panel's labs are `PANEL_LABS` (classifier/src/panel.ts), not `LABS`: a reviews-only or newer lab
+// joins panels only by its own change (PLAN wl-mw148irbq33zt5 D1).
 
 /**
  * A panel member's spawn row: only `lab`'s entries, builder lab or not. A panel is not a gate review,
@@ -616,7 +645,7 @@ export function reviewPlan(input: ReviewPlanInput): ReviewPlan {
  * lab off the member, so no other lab is ever substituted. `reasons` say why the lab has no usable
  * entry (empty when `models` is not).
  */
-export function panelPin(input: { row: readonly string[]; usable: readonly string[]; lab: Lab; skipped?: Readonly<Record<string, string>> }): {
+export function panelPin(input: { row: readonly string[]; usable: readonly string[]; lab: PanelLab; skipped?: Readonly<Record<string, string>> }): {
 	models: string[];
 	allow: string[];
 	reasons: string[];
@@ -633,17 +662,27 @@ export function panelPin(input: { row: readonly string[]; usable: readonly strin
 }
 
 /**
- * The lab a panel's synthesis hand runs on: the first lab in row order with a usable entry that is
- * not a builder; when there is none (every lab a builder, or the others down), the first usable
- * builder lab, named as one (`builderLab`). Synthesis is not a gate review, so it never parks; with
- * no usable lab at all it gets `reasons` and is dispatched again later.
+ * The lab a panel's synthesis hand runs on: the first panel lab (`labs`, the caller's `PANEL_LABS`)
+ * in row order with a usable entry that is not a builder; when there is none (every lab a builder,
+ * or the others down), the first usable builder panel lab, named as one (`builderLab`). Entries of a
+ * lab outside `labs` are never picked. Synthesis is not a gate review, so it never parks; with no
+ * usable panel lab at all it gets `reasons` and is dispatched again later.
  */
-export function synthLab(input: { row: readonly string[]; usable: readonly string[]; builders: Builders; skipped?: Readonly<Record<string, string>> }):
-	| { lab: Lab; builderLab: boolean }
-	| { reasons: string[] } {
-	const labs = input.usable.flatMap(s => labOf(s) ?? []);
+export function synthLab(input: {
+	row: readonly string[];
+	usable: readonly string[];
+	builders: Builders;
+	labs: readonly PanelLab[];
+	skipped?: Readonly<Record<string, string>>;
+}): { lab: PanelLab; builderLab: boolean } | { reasons: string[] } {
+	const panel = (lab: Lab | null): lab is PanelLab => lab !== null && (input.labs as readonly Lab[]).includes(lab);
+	const labs = input.usable.flatMap(s => {
+		const lab = labOf(s);
+		return panel(lab) ? [lab] : [];
+	});
 	const other = labs.find(lab => !isBuilder(input.builders, lab));
 	if (other) return { lab: other, builderLab: false };
 	if (labs.length > 0) return { lab: labs[0]!, builderLab: true };
-	return { reasons: input.row.map(s => `${s} (${input.skipped?.[s] ?? "not usable"})`) };
+	const rows = input.row.filter(s => panel(labOf(s)));
+	return { reasons: rows.length > 0 ? rows.map(s => `${s} (${input.skipped?.[s] ?? "not usable"})`) : [`no ${input.labs.join(", ")} entry in the row`] };
 }
