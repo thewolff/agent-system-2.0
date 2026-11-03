@@ -261,7 +261,9 @@ export type FakeStep =
 	/** One frame written to stdout as-is (fake-omp.ts header). */
 	| { emit: Record<string, unknown> }
 	/** `text` written to `path`, e.g. the profile config re-rendered mid-run (fake-omp.ts header). */
-	| { writeFile: { path: string; text: string } };
+	| { writeFile: { path: string; text: string } }
+	/** A background job that never settles, inside the turn: the steps go on, prompt_result says `sessionSettled: false` (PLAN wl-mvidsu83epvpj4 § Fixture). */
+	| { pending: true };
 /** The fake omp's script (surface/test/fake-omp.ts header). */
 export interface FakeScript {
 	claim?: boolean;
@@ -281,6 +283,8 @@ export interface FakeScript {
 	stateOnAbort?: boolean;
 	eofDelayMs?: number;
 	shutdownOnTerm?: boolean;
+	/** omp 18.8.6's RpcShutdownCoordinator: a lane tool's ctx.shutdown() is recorded as `shutdown-requested` and never ends the process (PLAN wl-mvidsu83epvpj4 § Fixture). */
+	deferShutdown?: boolean;
 	/** A helper holds the fake's stdout open until this file exists (≤ 30 s): the runner's finish() waits past omp's death for the test. */
 	holdStdoutUntil?: string;
 	/** Exit before RPC ready; writes chunks verbatim (including a final fragment) before exiting or self-signalling. */
@@ -355,7 +359,8 @@ export function laneRoot(over: Record<string, string> = {}, tag = "lane-root", r
 	const env: Record<string, string> = {
 		PATH: `${bin}:${process.env.PATH ?? ""}`, HOME: home, AGENT_SYSTEM_LEDGER_DB: ledgerPath, FAKE_OMP_RECORD: record, FAKE_OMP_SCRIPT: script,
 		TMPDIR: temp, BUN_INSTALL_CACHE_DIR: bunCache,
-		AGENT_SYSTEM_LANE_READY_MS: String(PRECLAIM_LEASE_MS), AGENT_SYSTEM_LANE_END_GRACE_MS: "1500", AGENT_SYSTEM_LEASE_MS: "60000", AS2_HEADROOM_POLLS: join(root, "no-headroom-polls.jsonl"), ...over,
+		AGENT_SYSTEM_LANE_READY_MS: String(PRECLAIM_LEASE_MS), AGENT_SYSTEM_LANE_SHUTDOWN_GRACE_MS: "1500", AGENT_SYSTEM_LANE_END_GRACE_MS: "1500", AGENT_SYSTEM_LEASE_MS: "60000",
+		AS2_HEADROOM_POLLS: join(root, "no-headroom-polls.jsonl"), ...over,
 	};
 	return { root, home, repo, remote, ledgerPath, record, script, env };
 }
