@@ -12,7 +12,7 @@ import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { apply, applyTrain, interpret } from "../src/input";
 import { JO_HOLDER, landFirstBody, landFirstInstructionBody, planAutoApprovedBody, planAutoStartNoticeBody, planFirstBody, trainBoardBody } from "../src/launch";
-import { reviewSettledPassed, trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
+import { reviewSettledPassed, trainAttemptBody, trainAttemptsOf, trainBody, trainFullSliceId, trainInstructionBody, trainSignoff, trainSliceId } from "../src/merge-train";
 import { sendNotice } from "../src/notice";
 import { makeRunId, testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
 import { ESCALATION_BY, HOLD_HOURS, LANE_RAISE_QUESTION_TOOL, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
@@ -621,6 +621,48 @@ describe("code review r2: Jo's halt and stop hold the sign-off, a pending plan's
 		const before = w.ledger.raiseQuestion({ by: TRAIN_LANE, workloadId: w.train, sliceId: w.full, body: `#${PR} merged / skip / stop?`, options: OPTIONS });
 		expectRaisedOnSl(w, (await w.ask()).text);
 		expect(w.ledger.questions(w.train).find((q) => q.id === before)!.state).toBe("open");
+	});
+});
+
+describe("permanent-train review r2 M1: the attempt boundary is a ledger position, never a timestamp", () => {
+	const VIEW = { number: PR, headRefName: "", headRefOid: H1, isCrossRepository: false, headRepository: { name: "product" }, headRepositoryOwner: { login: "thewolff" } };
+	/**
+	 * Jo's `train 101` began attempt 1, and the decided case's ledger (review passed, a green at H1), on a stopped clock: every
+	 * row has one created_at, so only ledger order (created_at, then rowid) tells the attempts apart. #101's attempt-1
+	 * disposition slice then turns terminal, so its next membership begins attempt 2.
+	 */
+	const stoppedAtAttemptTwo = (): World => {
+		const t = new Date().toISOString();
+		const w = world({ now: () => t });
+		passing(w);
+		w.ledger.cancelSlice(w.sl, { by: TRAIN_LANE });
+		return w;
+	};
+	const signoff = (w: World) => trainSignoff(w.ledger, w.train, PR, { ...VIEW, headRefName: `wl/${w.owner}` }, REPO, { state: "ok" });
+
+	test("attempt 1: Jo's `train 101` that began it signs it off (unchanged)", () => {
+		const t = new Date().toISOString();
+		const w = world({ now: () => t });
+		passing(w);
+		expect(signoff(w)).toMatchObject({ ok: true, slice: w.sl });
+	});
+
+	test("Jo's word on attempt 1, then the tick auto-boards attempt 2 in the same millisecond: refused", () => {
+		const w = stoppedAtAttemptTwo();
+		// boardLanding's two writes, in its order: the membership row, then the attempt row beside it
+		w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: w.train, kind: "assumption", body: trainBoardBody({ pr: PR, workload: w.owner, head: H1, run: null, review: null }) });
+		w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: w.train, kind: "assumption", body: trainAttemptBody(PR, 2) });
+		const at = w.ledger.entries(w.train).map((e) => e.created_at);
+		expect(new Set(at).size).toBe(1);
+		expect(trainAttemptsOf(w.ledger, w.train).get(PR)?.attempt).toBe(2);
+		expect(signoff(w)).toEqual({ ok: false, reason: `no train word of Jo's on ${w.train} names #${PR}` });
+	});
+
+	test("Jo's `train <train> 101` that itself begins attempt 2 in the same millisecond: accepted, on the -a2 slice", () => {
+		const w = stoppedAtAttemptTwo();
+		expect(apply(w.ledger, interpret(w.ledger, `train ${w.train} ${PR}`)!)).toContain(`added #${PR} (attempt 2) to merge train ${w.train}`);
+		expect(new Set(w.ledger.entries(w.train).map((e) => e.created_at)).size).toBe(1);
+		expect(signoff(w)).toMatchObject({ ok: true, slice: trainSliceId(w.train, PR, 2) });
 	});
 });
 

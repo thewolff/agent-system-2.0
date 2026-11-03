@@ -1,9 +1,11 @@
 // The orchestrator's half of the workload ceiling (DESIGN-workload-ceiling.md § 2 item 2): lowering.
 // Raising is Jo's, through the `ceiling` and `extend` words (surface/src/input.ts), each of
 // which names Jo's instruction; this tool writes a `ceiling:` entry that lowers either half and
-// refuses any value above the one in force, so it never needs one.
+// refuses any value above the one in force, so it never needs one. The merge train has no ceiling (PLAN wl-mvr888nftz0vcl D4):
+// the tool refuses it with nothing written.
 import { ceilingBody } from "../src/ceiling";
 import { ceilingOf, ceilingText } from "../src/input";
+import { trainNoWallRefusal } from "../src/merge-train";
 import { surfaceSession } from "../src/session";
 import { LOWER_CEILING_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult } from "../src/types";
 
@@ -34,6 +36,9 @@ export default function ceilingRow(pi: SurfaceAPI, env: Record<string, string | 
 			const w = ledger.workload(id);
 			if (!w) return text(`No workload ${id}; nothing was written.`);
 			if (w.status === "closed") return text(`${id} is closed (${w.closed_at}); nothing was written.`);
+			// PLAN wl-mvr888nftz0vcl D4: the merge train has no ceiling to lower; a train's fix workload keeps its own (R10).
+			const noWall = trainNoWallRefusal(ledger, id);
+			if (noWall !== null) return text(`Refused: ${noWall}.`);
 			const given = (v: unknown): number | null => (v === undefined || v === null || String(v).trim() === "" ? null : Number(v));
 			const usd = given(params.usd);
 			const wallMin = given(params.wallMinutes);

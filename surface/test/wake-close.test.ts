@@ -36,7 +36,11 @@ function env(): Record<string, string> {
 const open = (e: Record<string, string>) => Ledger.open(e.AGENT_SYSTEM_LEDGER_DB!, { backup: false, backupOnOpen: false });
 const HAND = "lane-plumb-by-hand";
 
-/** A by-hand holder's released workload with its `done-because:` receipt standing: awaiting close, nothing open. A `train` one is a merge train boarded with #7. */
+/**
+ * A by-hand holder's released workload with its `done-because:` receipt standing: awaiting close, nothing open. A `train` one
+ * is a merge train boarded with #7, its done-because a legacy row (PLAN wl-mvr888nftz0vcl D3 refuses a new one); the train is
+ * permanent, so its receipt is never read and it is never awaiting close.
+ */
 function awaitingClose(e: Record<string, string>, repo: string, train = false): string {
 	const l = open(e);
 	const wl = l.openWorkload({ by: SURFACE_BY, brief: "Add a verify line to the README", stakes: "normal", mode: "autonomous" });
@@ -48,7 +52,8 @@ function awaitingClose(e: Record<string, string>, repo: string, train = false): 
 	l.completeSlice(sl, { by: HAND, artifact: "the line" });
 	l.recordEntry({ by: HAND, workloadId: wl, kind: "assumption", body: "done-because: README.md carries a verify line\nchecked by reading it" });
 	l.releaseWorkload(wl, { by: HAND, holder: HAND });
-	expect(launchVerdict(l, e, wl)).toEqual({ launch: false, reason: "awaiting-close" });
+	if (train) expect(launchVerdict(l, e, wl)).not.toEqual({ launch: false, reason: "awaiting-close" });
+	else expect(launchVerdict(l, e, wl)).toEqual({ launch: false, reason: "awaiting-close" });
 	l.close();
 	return wl;
 }
@@ -160,8 +165,10 @@ describe("the tick's refused close is told once per refusal", () => {
 	});
 });
 
-describe("a merge train's auto-close is not pushed (PLAN wl-mvbjiettjrfpxc D10)", () => {
-	test("R19: one tick closes a merge train and an owner workload: the owner's close notice is pushed, the train's is not", async () => {
+// Rewritten for PLAN wl-mvr888nftz0vcl D3 (was "one tick closes a merge train and an owner workload"): the merge train is
+// permanent, so the tick never closes it, even with a legacy done-because standing; the owner's close is told as before.
+describe("a merge train is never auto-closed (PLAN wl-mvbjiettjrfpxc D10, wl-mvr888nftz0vcl D3)", () => {
+	test("R19: one tick closes an owner workload and leaves the merge train open: the owner's close notice is pushed, nothing about the train", async () => {
 		const e = env();
 		const repo = tmp("repo");
 		const owner = awaitingClose(e, repo);
@@ -181,7 +188,7 @@ describe("a merge train's auto-close is not pushed (PLAN wl-mvbjiettjrfpxc D10)"
 			await promise;
 		}
 		const after = open(e);
-		expect([after.workload(owner)!.status, after.workload(train)!.status]).toEqual(["closed", "closed"]);
+		expect([after.workload(owner)!.status, after.workload(train)!.status]).toEqual(["closed", "open"]);
 		after.close();
 		const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
 		const text = turn.messages[0]?.content ?? "";

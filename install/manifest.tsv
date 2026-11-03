@@ -1501,6 +1501,12 @@ surface/test/fixtures/timing-lint/positive.txt	test	-
 surface/test/fixtures/timing-lint/negative.txt	test	-
 surface/test/fixtures/timing-lint/opt-out.txt	test	-
 surface/test/fixtures/timing-lint/opt-out-bad.txt	test	-
+# The permanent merge train (wl-mvr888nftz0vcl, migration/items/permanent-merge-train.md): the daily budget, its
+# pause, raise, meter and launch gate, and the tests of the budget and of the train's permanence.
+surface/src/train-budget.ts	module	-
+surface/test/train-budget.test.ts	test	-
+surface/test/train-permanent.test.ts	test	-
+surface/test/errors-board-refused.test.ts	test	-
 # Test-timing automation, isolated proof requests and executor-owned resource admission.
 surface/src/timing-automation.ts	module	-
 surface/test/timing-automation.test.ts	test	-

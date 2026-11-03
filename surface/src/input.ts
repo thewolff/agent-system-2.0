@@ -77,17 +77,29 @@
 // surface's `waive-pr: <N…> <instruction id>` naming it, in one transaction; the close check reads them (`waivedPrs`,
 // surface/src/launch.ts) and passes a MERGED PR nothing covers. It never binds a PR for a test run (`boundPrs`).
 //
-// The merge train (PLAN wl-mv8s8srodefytc § 1, surface/src/merge-train.ts): `train <N> [<N> …]` (numbers by spaces and/or
-// commas, `#N` accepted, deduplicated, Jo's order kept, at most 50) opens a merge-train workload in one transaction
-// (`applyTrain`: the preallocated id, the brief `trainBrief`, normal and autonomous, the surface's repo, `done:` TRAIN_DONE,
-// the normal ceiling, no `plan:`, Jo's instruction `train <wl> <N…>` and the surface's `train: <N…> <instruction id>`);
-// `train <wl-…> <N> [<N> …]` adds PRs to an open train (refused on any other workload, the standing one, a closed one, or
-// for a PR already on the train), writing Jo's `launch-requested:` when no lane holds it live, so a stopped train
-// relaunches. Either form refuses a PR already on another open train of the same repo, unless Jo skipped it there (rev 17.1
-// D8, `onOtherTrain`). Exactly two forms fall through to the answer path, since a question may offer the option `train`: `train`
+// The merge train (PLAN wl-mv8s8srodefytc § 1, PLAN wl-mvr888nftz0vcl D2, surface/src/merge-train.ts): there is one, and it is
+// permanent. `train <N> [<N> …]` (numbers by spaces and/or commas, `#N` accepted, deduplicated, Jo's order kept, at most 50)
+// appends to the open train (`theTrain`), refusing a PR of a repository other than the train's with nothing written, and opens
+// one only when none is open, in one transaction (`applyTrain`: the preallocated id, the brief `trainBrief`, normal and
+// autonomous, the surface's repo, `done:` TRAIN_DONE, no `ceiling:` and no `plan:`, Jo's instruction `train <wl> <N…>` and the
+// surface's `train: <N…> <instruction id>`); `train <wl-…> <N> [<N> …]` adds PRs to that train (refused on any other workload,
+// the standing one or a closed one). A PR already on the train boards again only once its current attempt is terminal
+// (`trainAttemptFor`, lane decision en-mvznmxcdh0ucsj), except that on a train Jo's stop holds the word is the resume and may
+// re-name its PRs. Appending writes Jo's `launch-requested:` when no lane holds the train live, so a stopped train relaunches.
+// Either form refuses a PR already on another open train of the same repo, unless Jo skipped it there (rev 17.1 D8,
+// `onOtherTrain`). Exactly two forms fall through to the answer path, since a question may offer the option `train`: `train`
 // alone and `train <q-…>`; every other `train …` line is the command or `refused`, never prose. A train word inside a
-// numbered batch is refused (`trainInBatch`). Jo's `skip` on a question on a train slice of PR n cancels that PR's open
-// train slices in the answer's transaction, keeping open one whose test run is live (`trainSkipClose`).
+// numbered batch is refused (`trainInBatch`). Jo's `skip` on a question on a train slice of PR n cancels the open slices of
+// that PR's current attempt in the answer's transaction, keeping open one whose test run is live (`trainSkipClose`). On the
+// train, `withdraw` and `supersede` (D3), `extend` and `ceiling` (D4) and `user-driven` (D5) are refused with nothing written,
+// each naming its rule (`trainPermanentRefusal`, `trainNoWallRefusal`, `trainAutonomousRefusal`); a train's fix workload is
+// an ordinary workload (R10).
+//
+// The budget raise (PLAN wl-mvr888nftz0vcl D7, R26, R28): `raise <usd> [q-…]` answers the train's budget pause question
+// (`budgetPauseOf`) and adds `usd` to the paused PDT day's limit: one transaction checks again that the question is open and
+// the pause's day is today, then writes Jo's answer `raise` and the surface's `train-raise: day <D> usd <x> answer <id>`.
+// Refused, nothing written: `raise` alone, `raise <q-…>` or a numbered `raise` on a budget question, an amount that is not a
+// positive plain number, a day already over, no budget question open. Any other question offering `raise` keeps its answers.
 //
 // Ending a standing ruling at once (PLAN wl-mvfkv7llkp7nk0 § 1, gates/src/rulings.ts): `end-ruling <ruling-id>` writes Jo's
 // instruction `end-ruling <id>` on the standing workload, which `endedRulings` reads, so every later question of that
@@ -147,14 +159,18 @@ import {
 	LAND_FIRST_WORD, landFirstBody, landFirstInstructionBody, landFirstOffBody, landFirstOffPending, MAIN_RETRY_WORD, mainRetryBody, mainRetryInstructionBody, REPO_WORD_RE,
 } from "./launch";
 import { bootstrapRefusal } from "./main-state";
-import { onOtherTrain, TRAIN_DONE, trainBody, trainBrief, trainHold, trainInstructionBody, trainPrs, trainSlicePr } from "./merge-train";
+import {
+	currentAttemptSlice, isTrain, onOtherTrain, repoIdentity, TRAIN_DONE, trainAttemptBody, trainAttemptFor, trainAttemptsOf, trainAutonomousRefusal, trainBody, trainBrief, trainCheckout, trainHold,
+	trainInstructionBody, trainNoWallRefusal, trainPermanentRefusal, trainPrs, trainSlicePr, theTrain,
+} from "./merge-train";
+import { pdtDay, type TrainPause, trainBudgetSliceId, trainDayLimit, trainPauses, trainRaiseBody, usdText } from "./train-budget";
 import type { Numbering, Target } from "./numbering";
 import { ensureStandingWorkload } from "./identity";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
 import { PAIR_OPTION, type PairSite, pairOfferLine, pairTakenBody, parsePairOffer, shownOptions } from "./pair-suggest";
 import { parseHeartbeat, recordLive, type RunRecord, runDirOf, runsRoot, testRuns } from "./test-run";
 import { pendingWrapperLines } from "./pending";
-import { DUE_PREFIX, MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
+import { DUE_PREFIX, MERGE_TRAIN_BY, MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 /** A "which one?" candidate: a needs-you row (`Target`) or, for a bare stakes, mode, `ceiling`, `rounds` or `stop-reviews` word, a workload in view. */
 export type Candidate = Target | { kind: "workload"; workloadId: string };
@@ -196,6 +212,8 @@ export type Command =
 	| { kind: "halt"; workloadId: string }
 	/** `withdraw <wl-…>`: Jo withdraws the workload, closed with no done-because: receipt (PLAN wl-mv8s939084z1ts D1). */
 	| { kind: "withdraw-workload"; workloadId: string }
+	/** `raise <usd> [q-…]`: Jo's answer `raise` to the merge train's budget pause question `questionId`, adding `usd` to the pause's PDT day (PLAN wl-mvr888nftz0vcl D7). */
+	| { kind: "raise"; workloadId: string; questionId: string; usd: number }
 	/** A bare word that fits more than one row or workload: refused, never applied. */
 	| { kind: "ambiguous"; word: string; candidates: Candidate[] }
 	/** A command naming a row it cannot take (`deny en-…` for a request no longer waiting): refused with `why`, never applied and never prose. */
@@ -239,6 +257,9 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 	// The commands longer than two words; one that does not parse falls through, so an option named "ceiling" or "rounds" still answers.
 	if (word === "ceiling") {
 		const c = ceilingCommand(words.slice(1), view);
+		// PLAN wl-mvr888nftz0vcl D4: the merge train has no ceiling; nothing is written.
+		const why = c?.kind === "ceiling" ? trainNoWallRefusal(ledger, c.workloadId) : null;
+		if (why !== null) return { kind: "refused", why };
 		if (c) return c;
 	}
 	if (word === "rounds") {
@@ -265,6 +286,12 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 	}
 	// PLAN wl-mv8s939084z1ts D1: `withdraw wl-…` is the command or `refused` at any length; bare `withdraw` and `withdraw q-…` go on below.
 	if (word === "withdraw" && /^wl-/i.test(words[1] ?? "")) return withdrawWorkloadCommand(ledger, words.slice(1));
+	// PLAN wl-mvr888nftz0vcl D7: `raise <usd> [q-…]` on a budget pause question, ahead of the option answers; null lets `raise` and
+	// `raise q-…` answer any other question that offers `raise` (R28).
+	if (word === RAISE_WORD) {
+		const c = raiseCommand(ledger, words.slice(1));
+		if (c) return c;
+	}
 	if (words.length === 0 || words.length > 2) return null;
 	const arg = words[1];
 	const target = (): string | null => (arg && view.includes(arg) ? arg : view.length === 1 ? view[0]! : null);
@@ -280,7 +307,11 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 	}
 	if (workloadWord) {
 		const wl = target();
-		return wl ? { kind: "mode", workloadId: wl, mode: (word === "user driven" ? "user-driven" : word) as Mode } : null;
+		if (!wl) return null;
+		const mode = (word === "user driven" ? "user-driven" : word) as Mode;
+		// D5: the merge train runs autonomous only; nothing is written.
+		const why = mode === "user-driven" ? trainAutonomousRefusal(ledger, wl) : null;
+		return why === null ? { kind: "mode", workloadId: wl, mode } : { kind: "refused", why };
 	}
 	// One token (D10), so it never answers an option named `stop`.
 	if (word === "stop-reviews") return stopReviewsCommand(ledger, arg, view);
@@ -359,16 +390,16 @@ export interface BatchItem {
 export type BatchResult = { ok: true; items: BatchItem[] } | { ok: false; lines: string[] };
 
 /**
- * The words a single-line command may run to: `ceiling <usd> [<hours>] [wl-…]` is four, `rounds <n> [wl-…]` and
- * `supersede <wl-A> <wl-B>` three, `test-pr <wl-…> <N> [<N> …]`, `waive-pr <wl-…> <N> [<N> …]`,
+ * The words a single-line command may run to: `ceiling <usd> [<hours>] [wl-…]` is four, `rounds <n> [wl-…]`,
+ * `supersede <wl-A> <wl-B>` and `raise <usd> [q-…]` (PLAN wl-mvr888nftz0vcl D7) three, `test-pr <wl-…> <N> [<N> …]`, `waive-pr <wl-…> <N> [<N> …]`,
  * `train [<wl-…>] <N> [<N> …]`, `withdraw wl-…` (PLAN wl-mv8s939084z1ts D1), `land-first …` and `main-retry …` any number
  * (`interpret` refuses past `TEST_PR_MAX`, `withdraw` past one id, and the land-first words past their shape), everything else two.
  */
 export function maxWords(text: string): number {
 	if (/^withdraw\s+wl-/i.test(text)) return Number.POSITIVE_INFINITY;
-	const long = /^(ceiling|rounds|supersede|test-pr|waive-pr|train|land-first|main-retry)(?:\s|$)/i.exec(text)?.[1]!.toLowerCase() ?? null;
+	const long = /^(ceiling|rounds|supersede|raise|test-pr|waive-pr|train|land-first|main-retry)(?:\s|$)/i.exec(text)?.[1]!.toLowerCase() ?? null;
 	if (long === "ceiling") return 4;
-	if (long === "rounds" || long === "supersede") return 3;
+	if (long === "rounds" || long === "supersede" || long === RAISE_WORD) return 3;
 	return long === null ? 2 : Number.POSITIVE_INFINITY;
 }
 
@@ -427,6 +458,8 @@ function checkBatch(ledger: Ledger, numbering: Numbering, parsed: readonly { n: 
 		const q = questions.get(t.rowId);
 		if (!q) return stale;
 		if (w === "withdraw") return { n, cmd: { kind: "withdraw", workloadId: q.workload_id, questionId: q.id } };
+		// D7: the option word alone carries no amount on a budget pause question; any other question's `raise` answers it (R28).
+		if (w === RAISE_WORD && budgetPauseOf(ledger, q) !== null) return `#${n}: ${bareRaiseRefusal(q.id)}`;
 		const answer = q.options.find((o) => o.toLowerCase() === w);
 		if (answer === undefined) {
 			const { takes, after } = takesOf(ledger, q);
@@ -479,7 +512,7 @@ export function stripTail(line: string): string {
 /** The words that open a command: the stakes and mode words, the answer words, every option an open question offers, and the long commands. */
 function commandWords(ledger: Ledger): string[] {
 	const offered = ledger.inFlight().flatMap((w) => w.openQuestions).flatMap((q) => q.options.map((o) => o.toLowerCase()));
-	return [...STAKES_WORDS, ...MODE_WORDS, "approve", "deny", "withdraw", "ceiling", EXTEND_WORD, "rounds", "stop-reviews", HALT_WORD, ...offered];
+	return [...STAKES_WORDS, ...MODE_WORDS, "approve", "deny", "withdraw", "ceiling", EXTEND_WORD, "rounds", "stop-reviews", HALT_WORD, RAISE_WORD, ...offered];
 }
 
 /**
@@ -530,6 +563,7 @@ function resolves(cmd: Command): string | null {
 	switch (cmd.kind) {
 		case "answer":
 		case "withdraw":
+		case "raise":
 			return cmd.questionId;
 		case "reserved":
 			return cmd.entryId;
@@ -774,11 +808,13 @@ function prWordCommand(ledger: Ledger, word: PrWord, rest: readonly string[]): C
 const TRAIN_USAGE = "train <N> [<N> …] opens a merge train; train <wl-…> <N> [<N> …] adds PRs to one";
 
 /**
- * Why `train <wl> <prs>` cannot add to `wl` (PLAN wl-mv8s8srodefytc § 1), or null: an open workload in view, not the
- * standing one, that is a merge train (`trainPrs`: Jo's `train:` or the tick's `train-board:`, PLAN wl-mvbjiettjrfpxc D2), no
- * PR among `prs` already on that train (each PR appears once per train, so its slice ids are used once) unless Jo's stop
- * holds the train (`trainHold`): then the word is the resume and may re-name its PRs (D2), and none on another open train
- * of the same repo (rev 17.1 D8, `onOtherTrain`). `apply` checks it again inside its transaction.
+ * Why `train [<wl>] <prs>` cannot add to `wl` (PLAN wl-mv8s8srodefytc § 1; PLAN wl-mvr888nftz0vcl D2), or null: an open
+ * workload in view, not the standing one, that is a merge train (`trainPrs`: Jo's `train:` or the tick's `train-board:`, PLAN
+ * wl-mvbjiettjrfpxc D2); every PR among `prs` boardable now (`trainAttemptFor`, lane decision en-mvznmxcdh0ucsj: a PR never on
+ * the train takes attempt 1, a PR whose current attempt is terminal takes the next one, a PR whose current attempt is open or not
+ * yet sliced is refused) unless Jo's stop holds the train (`trainHold`): then the word is the resume and may re-name its PRs,
+ * starting no attempt for an open one (D2); and none on another open train of the same repo (rev 17.1 D8, `onOtherTrain`).
+ * `apply` and `applyTrain` check it again inside their transaction.
  */
 function trainAppendRefusal(ledger: Ledger, wl: string, prs: readonly number[]): string | null {
 	if (wl === STANDING_WORKLOAD_ID) return "the standing workload is never a merge train";
@@ -790,8 +826,12 @@ function trainAppendRefusal(ledger: Ledger, wl: string, prs: readonly number[]):
 	const on = trainPrs(entries, instructions);
 	if (on.length === 0) return `${wl} is not a merge train (no train: or train-board: entry); open one with train <N> [<N> …]`;
 	const held = trainHold({ entries, instructions, questions: ledger.questions(wl) }) !== null;
-	const dup = held ? undefined : prs.find((n) => on.includes(n));
-	if (dup !== undefined) return `#${dup} is already on train ${wl}; a skipped PR gets a new train: \`train ${dup}\``;
+	if (!held) {
+		for (const n of prs) {
+			const a = trainAttemptFor(ledger, wl, n);
+			if (!a.ok) return a.reason;
+		}
+	}
 	const repo = repoOf(ledger, wl);
 	return repo === null ? null : otherTrainRefusal(ledger, repo, prs, wl);
 }
@@ -803,10 +843,12 @@ function otherTrainRefusal(ledger: Ledger, repo: string, prs: readonly number[],
 }
 
 /**
- * `train …` after the word (§ 1): `train <N…>` opens a train, `train <wl-…> <N…>` adds to one; PR numbers separated
- * by spaces and/or commas, `#N` accepted, each a positive whole number, deduplicated in Jo's order, at most
- * `TEST_PR_MAX`. Null for exactly `train` alone and `train <q-…>`, which fall through to the answer path (a question
- * may offer the option `train`); every other line is the command or `refused` with the reason, never prose.
+ * `train …` after the word (§ 1; PLAN wl-mvr888nftz0vcl D2): `train <N…>` adds to the one open train (`theTrain`) or opens it
+ * when none is open, `train <wl-…> <N…>` adds to that train; PR numbers separated by spaces and/or commas, `#N` accepted, each
+ * a positive whole number, deduplicated in Jo's order, at most `TEST_PR_MAX`. `train <N…>` with a train open is checked here as
+ * an append (`trainAppendRefusal`); its repository check needs the surface's repo, so `applyTrain` makes it. Null for exactly
+ * `train` alone and `train <q-…>`, which fall through to the answer path (a question may offer the option `train`); every
+ * other line is the command or `refused` with the reason, never prose.
  */
 function trainCommand(ledger: Ledger, rest: readonly string[]): Command | null {
 	if (rest.length === 0 || (rest.length === 1 && /^q-/i.test(rest[0]!))) return null;
@@ -818,7 +860,11 @@ function trainCommand(ledger: Ledger, rest: readonly string[]): Command | null {
 	if (bad !== undefined) return { kind: "refused", why: `${bad} is not a PR number (a positive whole number, # allowed): ${TRAIN_USAGE}` };
 	const prs = [...new Set(tokens.map((t) => Number(t.replace(/^#/, ""))))];
 	if (prs.length > TEST_PR_MAX) return { kind: "refused", why: `train takes at most ${TEST_PR_MAX} PRs at once; ${prs.length} named` };
-	if (wl === null) return { kind: "train", prs };
+	if (wl === null) {
+		const train = theTrain(ledger);
+		const why = train === null ? null : trainAppendRefusal(ledger, train, prs);
+		return why === null ? { kind: "train", prs } : { kind: "refused", why };
+	}
 	const why = trainAppendRefusal(ledger, wl, prs);
 	return why === null ? { kind: "train-append", workloadId: wl, prs } : { kind: "refused", why };
 }
@@ -873,13 +919,18 @@ function cancelSliceCommand(ledger: Ledger, rest: readonly string[], heartbeatOf
 	return { kind: "cancel-slice", workloadId: wl, sliceId: id };
 }
 
-/** Why `supersede <a> <b>` cannot apply (D2), or null: A is an open workload other than the standing one, B exists, and they differ. `apply` checks it again. */
+/**
+ * Why `supersede <a> <b>` cannot apply (D2), or null: A is an open workload other than the standing one and not the merge
+ * train (permanent, PLAN wl-mvr888nftz0vcl D3), B exists, and they differ. `apply` checks it again.
+ */
 function supersedeRefusal(ledger: Ledger, a: string, b: string): string | null {
 	if (a === b) return `${a} cannot supersede itself`;
 	if (a === STANDING_WORKLOAD_ID || b === STANDING_WORKLOAD_ID) return "the standing workload is never superseded nor a successor";
 	const wa = ledger.workload(a);
 	if (!wa) return `no workload ${a}`;
 	if (wa.status !== "open") return `${a} is ${wa.status}: only an open workload is superseded`;
+	const permanent = trainPermanentRefusal(ledger, a);
+	if (permanent !== null) return permanent;
 	if (!ledger.workload(b)) return `no workload ${b}`;
 	return null;
 }
@@ -904,6 +955,9 @@ function withdrawRefusal(ledger: Ledger, wl: string): string | null {
 	const w = ledger.workload(wl);
 	if (!w) return `no workload ${wl}`;
 	if (w.status !== "open") return `${wl} is ${w.status}: only an open workload is withdrawn`;
+	// PLAN wl-mvr888nftz0vcl D3: the merge train is permanent.
+	const permanent = trainPermanentRefusal(ledger, wl);
+	if (permanent !== null) return permanent;
 	if (w.brief.startsWith(DUE_PREFIX)) return `${wl} is a scheduled row: close it with its receipt through the close tool`;
 	const live = ledger.slices(wl).filter((s) => s.state === "open" || s.state === "paused").map((s) => `${s.id} (${s.state})`);
 	const asked = ledger.questions(wl).filter((q) => q.state === "open").map((q) => q.id);
@@ -1003,7 +1057,84 @@ export const EXTEND_WORD = "extend";
 
 /** `extend <wl-…>`: the command on an open workload other than the standing one, else `refused`, never prose. */
 function extendCommand(ledger: Ledger, wl: string): Command {
-	return workloadsInView(ledger).includes(wl) ? { kind: "extend", workloadId: wl } : { kind: "refused", why: `${wl} is not an open workload` };
+	if (!workloadsInView(ledger).includes(wl)) return { kind: "refused", why: `${wl} is not an open workload` };
+	// PLAN wl-mvr888nftz0vcl D4: the merge train has no ceiling to extend; nothing is written.
+	const why = trainNoWallRefusal(ledger, wl);
+	return why === null ? { kind: "extend", workloadId: wl } : { kind: "refused", why };
+}
+
+/** Jo's word that raises the merge train's limit for a paused PDT day (PLAN wl-mvr888nftz0vcl D7). */
+export const RAISE_WORD = "raise";
+
+/**
+ * The pause question `q` asks about (D7), or null: `q` is a question the train tick (MERGE_TRAIN_BY) raised on a merge train
+ * on the budget slice of one of the train's runner-written `train-paused:` entries (`trainBudgetSliceId`). The meter-error
+ * question shares the slice shape but is keyed to a `train-meter-error:` entry, so it is never one.
+ */
+export function budgetPauseOf(ledger: Ledger, q: Pick<QuestionRow, "workload_id" | "slice_id" | "created_by">): TrainPause | null {
+	if (q.created_by !== MERGE_TRAIN_BY || !isTrain(ledger, q.workload_id)) return null;
+	return trainPauses(controlEntries(ledger.entries(q.workload_id, "assumption"))).find((p) => trainBudgetSliceId(q.workload_id, p.entryId) === q.slice_id) ?? null;
+}
+
+/** The refusal of `raise` with no amount on budget pause question `q` (D7): the option word alone carries no amount. */
+function bareRaiseRefusal(q: string): string {
+	return `${q} is the merge train's budget question: \`raise\` alone carries no amount; type \`raise <usd>\`, for example \`raise 50\` (or \`raise 50 ${q}\`), or answer \`wait\``;
+}
+
+/** Why a raise on budget pause question `q` (pause `p`) cannot apply now (D7), or null: the question is open and its pause's PDT day is today. */
+function raiseRefusal(ledger: Ledger, q: Pick<QuestionRow, "id" | "state">, p: TrainPause): string | null {
+	if (q.state !== "open") return `${q.id} is ${q.state}: a raise answers only an open budget question`;
+	const today = pdtDay(Date.parse(ledger.now()));
+	if (p.day !== today) return `the paused day ${p.day} (PDT) is over (today is ${today}): a raise adds money only to the day it names; answer \`wait ${q.id}\` instead`;
+	return null;
+}
+
+/**
+ * `raise …` after the word (D7, R26), scoped to budget pause questions (`budgetPauseOf`); null falls through to the answer path,
+ * so `raise` and `raise q-…` keep answering any other question that offers `raise` (R28), and `raise fifty` stays prose.
+ * - no argument: `refused` (`bareRaiseRefusal`) when a budget question is open and no other open question offers `raise`;
+ * - `raise <q-…>`: `refused` when that question is a budget question;
+ * - `raise <amount> [q-…]`, the amount any token that starts like a number (`50`, `$50`, `-5`, `.5`, `1e3`): the command when the
+ *   amount is a plain number of whole cents, at most two decimals and at least 0.01 (a leading `$` allowed, as `ceiling` takes
+ *   it; `0.001` or `1.005` would round in the `train-raise:` row, so they are refused, not rounded), the third word if any is a
+ *   question id, the named question (or the only open budget question) is a budget question, and `raiseRefusal` is clear.
+ *   Several open budget questions and none named is `ambiguous`; anything else is `refused`, never prose.
+ */
+function raiseCommand(ledger: Ledger, rest: readonly string[]): Command | null {
+	const open = ledger.inFlight().flatMap((w) => w.openQuestions);
+	const budget = open.filter((q) => budgetPauseOf(ledger, q) !== null);
+	if (rest.length === 0) {
+		const others = open.some((q) => budgetPauseOf(ledger, q) === null && q.options.some((o) => o.toLowerCase() === RAISE_WORD));
+		return budget.length > 0 && !others ? { kind: "refused", why: bareRaiseRefusal(budget.length === 1 ? budget[0]!.id : "q-…") } : null;
+	}
+	if (rest.length === 1 && /^q-/i.test(rest[0]!)) {
+		const named = budget.find((q) => q.id === rest[0]);
+		return named ? { kind: "refused", why: bareRaiseRefusal(named.id) } : null;
+	}
+	if (!/^[$+-]?\.?\d/.test(rest[0]!)) return null;
+	const usage = "raise <usd> [q-…], for example `raise 50`";
+	if (rest.length > 2 || (rest.length === 2 && !/^q-/i.test(rest[1]!))) return { kind: "refused", why: `the raise word is ${usage}` };
+	const m = /^\$?(\d+)(?:\.(\d+))?$/.exec(rest[0]!);
+	if ((m?.[2]?.length ?? 0) > 2) return { kind: "refused", why: `${rest[0]} has more than two decimals: a raise is whole cents (at most two decimals, at least 0.01), never rounded; ${usage}` };
+	const usd = m ? Number(m[2] === undefined ? m[1] : `${m[1]}.${m[2]}`) : Number.NaN;
+	if (!wholeCents(usd)) return { kind: "refused", why: `${rest[0]} is not a positive number of dollars: ${usage}` };
+	let q: (typeof open)[number] | undefined;
+	if (rest.length === 2) {
+		q = open.find((x) => x.id === rest[1]);
+		if (!q) return { kind: "refused", why: `${rest[1]} is not an open question` };
+		if (!budget.includes(q)) return { kind: "refused", why: `${q.id} is not the merge train's budget question; \`raise <usd>\` answers only that one` };
+	} else {
+		if (budget.length === 0) return { kind: "refused", why: "no merge-train budget question is open: a raise answers the train's pause question, and the train is not paused" };
+		if (budget.length > 1) return { kind: "ambiguous", word: [RAISE_WORD, ...rest].join(" "), candidates: budget.map((x) => ({ kind: "question", workloadId: x.workload_id, rowId: x.id })) };
+		q = budget[0]!;
+	}
+	const why = raiseRefusal(ledger, q, budgetPauseOf(ledger, q)!);
+	return why === null ? { kind: "raise", workloadId: q.workload_id, questionId: q.id, usd } : { kind: "refused", why };
+}
+
+/** A raise amount the `train-raise:` row stores exactly (D7): finite, at least 0.01, and whole cents (`usdText` keeps it as is). */
+function wholeCents(usd: number): boolean {
+	return Number.isFinite(usd) && usd >= 0.01 && Number(usdText(usd)) === usd;
 }
 
 /**
@@ -1133,7 +1264,8 @@ function cancelSlice(ledger: Ledger, cmd: Extract<Command, { kind: "cancel-slice
 /**
  * The skip close (PLAN wl-mv8s8srodefytc § 1), inside the transaction of Jo's answer `answerId` to `q`: when the
  * answer is `skip`, `q` sits on a train slice of PR n (`trainSlicePr`) and its workload carries a valid `train:`
- * entry, every open or paused train slice of n (`sl-train-<k>-<n>`, every `sl-train-<k>-<n>-full-<r>`) is cancelled
+ * entry, every open or paused slice of n's current attempt (`currentAttemptSlice`: its disposition slice and every full-suite
+ * slice of it, lane decision en-mvznmxcdh0ucsj) is cancelled
  * with cancel-slice's writer, citing the answer, so a skipped red PR leaves nothing open; a lane parked on `q`
  * relaunches as after `cancel-slice`. A slice whose test run is live (`liveRunOn`, cancel-slice's refusal, read with
  * `heartbeatOf`) is kept open and named, since its `test-run:` settles it; the skip itself is never refused. Returns
@@ -1147,7 +1279,8 @@ function trainSkipClose(ledger: Ledger, q: QuestionRow, answerId: string, heartb
 	// questions, and `q` itself when its own slice is cancelled, count for a relaunch. When q's slice is kept open (a live run), Jo's
 	// answer is a normal resolution and q stays out.
 	const settled: QuestionRow[] = [];
-	const open = ledger.slices(wl).filter((s) => trainSlicePr(s.id, wl) === n && (s.state === "open" || s.state === "paused"));
+	const attempts = trainAttemptsOf(ledger, wl);
+	const open = ledger.slices(wl).filter((s) => currentAttemptSlice(s.id, wl, attempts, n) && (s.state === "open" || s.state === "paused"));
 	const lines = open.flatMap((s) => {
 		const live = liveRunOn(ledger, wl, s.id, heartbeatOf);
 		if (live) return [`kept ${s.id} open: test run ${live.request.runId} is live; it settles the slice`];
@@ -1370,8 +1503,13 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 			});
 		}
 		case "mode": {
-			const id = ledger.flipMode(cmd.workloadId, { ...stamp, mode: cmd.mode });
-			return `mode on ${cmd.workloadId} → ${cmd.mode} (mode-flip ${id}; effective before the lane's next turn)`;
+			// D5 (PLAN wl-mvr888nftz0vcl): checked again inside the flip's transaction; the merge train runs autonomous only.
+			return ledger.write(() => {
+				const why = cmd.mode === "user-driven" ? trainAutonomousRefusal(ledger, cmd.workloadId) : null;
+				if (why !== null) throw new Error(`${why}; refused, never applied`);
+				const id = ledger.flipMode(cmd.workloadId, { ...stamp, mode: cmd.mode });
+				return `mode on ${cmd.workloadId} → ${cmd.mode} (mode-flip ${id}; effective before the lane's next turn)`;
+			});
 		}
 		case "answer": {
 			// Decision 15: on the plan slice's question, *approve* also writes `plan: approved <instruction>` (surface-stamped, same
@@ -1388,6 +1526,8 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 			const word = cmd.answer.toLowerCase();
 			// D7: `pair` is honoured only on a question that validly offered it; anywhere else it is refused, never a plain word.
 			if (word === PAIR_OPTION) return applyPair(ledger, q0, cmd.answer);
+			// PLAN wl-mvr888nftz0vcl D7: `raise` with no amount never answers a budget pause question, whatever route built the answer.
+			if (word === RAISE_WORD && budgetPauseOf(ledger, q0) !== null) throw new Error(`${bareRaiseRefusal(q0.id)}; refused, never applied`);
 			// D4: *approve* on any other question while `plan: first` stands unapproved approves nothing, and the receipt says so.
 			const notPlan = !plan && word === "approve" && planFirst(controlOf(ledger, q0.workload_id) ?? []) !== null;
 			const roundLimit = (ROUND_LIMIT_OPTIONS as readonly string[]).includes(word) && isReviewLimitQuestion(ledger, q0);
@@ -1429,6 +1569,8 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 		case "ceiling": {
 			// Jo's exact figure (§ 1 D): the instruction, then the entry naming it; omitted hours keep the wall in force.
 			return ledger.write(() => {
+				const train = trainNoWallRefusal(ledger, cmd.workloadId);
+				if (train !== null) throw new Error(`${train}; refused, never applied`);
 				const next = { usd: cmd.usd, wallMin: cmd.wallMin ?? ceilingOf(ledger, cmd.workloadId).wallMin };
 				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: ceilingInstructionBody(next) });
 				const tail = raiseCeiling(ledger, cmd.workloadId, next, "your word", id, "ceiling word");
@@ -1438,6 +1580,8 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 		case "extend": {
 			// One more block of the workload's own size on the value in force (PLAN wl-mvfkv7llkp7nk0 § 4), shaped like the ceiling word.
 			return ledger.write(() => {
+				const train = trainNoWallRefusal(ledger, cmd.workloadId);
+				if (train !== null) throw new Error(`${train}; refused, never applied`);
 				const { block, next } = extendedCeiling(ledger, cmd.workloadId);
 				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: ceilingInstructionBody(next) });
 				const tail = raiseCeiling(ledger, cmd.workloadId, next, EXTEND_SOURCE, id, "ceiling extend");
@@ -1490,22 +1634,9 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 		}
 		case "train":
 			throw new Error("train opens a workload in the surface's repo: applyTrain applies it, never apply");
-		case "train-append": {
+		case "train-append":
 			// Jo's instruction first, then the surface's `train:` naming it, in one transaction; a train no lane holds live relaunches.
-			return ledger.write(() => {
-				const why = trainAppendRefusal(ledger, cmd.workloadId, cmd.prs);
-				if (why !== null) throw new Error(why);
-				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: trainInstructionBody(cmd.workloadId, cmd.prs) });
-				ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: trainBody(cmd.prs, id) });
-				const w = ledger.workload(cmd.workloadId)!;
-				let relaunch = "";
-				if (w.mode === "autonomous" && !heldLive(w, ledger.now())) {
-					ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), "train append") });
-					relaunch = "; no lane holds it live, so a relaunch is requested";
-				}
-				return `added ${cmd.prs.map((n) => `#${n}`).join(", ")} to merge train ${cmd.workloadId} (instruction ${id}); order ${trainPrs(ledger.entries(cmd.workloadId), ledger.instructions(cmd.workloadId)).join(", ")}${relaunch}`;
-			});
-		}
+			return ledger.write(() => appendTrain(ledger, cmd.workloadId, cmd.prs));
 		case "end-ruling": {
 			// Jo's instruction on the standing workload is the end (`endedRulings`); nothing else is written.
 			return ledger.write(() => {
@@ -1583,6 +1714,22 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 				return `withdrew ${cmd.workloadId} (instruction ${id}); closing it with no done-because: receipt`;
 			});
 		}
+		case "raise": {
+			// PLAN wl-mvr888nftz0vcl D7: in one transaction, the question open and its pause's day today checked again (a reading made
+			// before midnight never applies a stale raise after it), then Jo's answer `raise` and the surface's `train-raise:` naming it.
+			if (!wholeCents(cmd.usd)) throw new Error(`raise ${cmd.usd} on ${cmd.questionId} is not whole cents (at most two decimals, at least 0.01): the train-raise: row would round it; refused, never applied`);
+			return ledger.write(() => {
+				const q = ledger.question(cmd.questionId);
+				const p = q ? budgetPauseOf(ledger, q) : null;
+				if (!q || !p) throw new Error(`${cmd.questionId} is not the merge train's budget question; refused, never applied`);
+				const why = raiseRefusal(ledger, q, p);
+				if (why !== null) throw new Error(`${why}; refused, never applied`);
+				const answerId = ledger.answerQuestion(q.id, { ...stamp, answer: RAISE_WORD });
+				const raiseId = ledger.recordEntry({ by: SURFACE_BY, workloadId: q.workload_id, kind: "assumption", body: trainRaiseBody(p.day, cmd.usd, answerId) });
+				const limit = trainDayLimit(controlEntries(ledger.entries(q.workload_id, "assumption")), p.day);
+				return `raised merge train ${q.workload_id}'s limit for ${p.day} (PDT) by $${usdText(cmd.usd)} to $${usdText(limit)}: answered ${q.id} with "raise" (answer ${answerId}; train-raise ${raiseId}); the next train tick relaunches it`;
+			});
+		}
 		case "ambiguous":
 			throw new Error(`"${cmd.word}" fits ${cmd.candidates.length} rows; an ambiguous word is refused, never applied`);
 		case "refused":
@@ -1591,22 +1738,63 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 }
 
 /**
- * Jo's `train <N…>` applied (PLAN wl-mv8s8srodefytc § 1), in one transaction: the id preallocated (`newId`) so the brief
- * names this train's slice ids, the workload opened normal and autonomous with brief `trainBrief(wl, prs)`, its repo
- * `repo` (the surface's cwd), `done:` TRAIN_DONE and the normal ceiling, no `plan:` (the procedure is the plan); then
- * Jo's instruction `train <wl> <N…>` and the surface's `train:` naming it. Returns the receipt and the new id, which
- * the routes launch (never parsed back from the receipt). Throws, writing nothing, when a PR is already on another open
- * train of `repo` (rev 17.1 D8): the repo is known only here, so the parse cannot check it.
+ * Add `prs` to merge train `wl` inside the caller's transaction (`train <wl> <N…>`, and `train <N…>` while a train is open):
+ * `trainAppendRefusal` checked again, then Jo's instruction `train <wl> <N…>` and the surface's `train:` naming it, and Jo's
+ * `launch-requested:` when the train is autonomous and no lane holds it live. A PR whose current attempt on the train is
+ * terminal boards its next attempt m (lane decision en-mvznmxcdh0ucsj): decided here, once, and recorded beside the `train:`
+ * as the surface's `train-attempt: pr <n> attempt <m>` (`trainAttempts` reads only that), named in the receipt. A PR re-named
+ * while its attempt is open (a held train's resume) gets no row and stays on its attempt. Returns the receipt.
+ */
+function appendTrain(ledger: Ledger, wl: string, prs: readonly number[]): string {
+	const why = trainAppendRefusal(ledger, wl, prs);
+	if (why !== null) throw new Error(`${why}; refused, never applied`);
+	// Decided before the write: once the train: row names a PR, its next attempt is the current one.
+	const next = prs.map((n) => {
+		const a = trainAttemptFor(ledger, wl, n);
+		return { n, attempt: a.ok && a.attempt > 1 ? a.attempt : null };
+	});
+	const stamp = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
+	const id = ledger.recordInstruction({ ...stamp, workloadId: wl, body: trainInstructionBody(wl, prs) });
+	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: trainBody(prs, id) });
+	for (const { n, attempt } of next) {
+		if (attempt !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: trainAttemptBody(n, attempt) });
+	}
+	const w = ledger.workload(wl)!;
+	let relaunch = "";
+	if (w.mode === "autonomous" && !heldLive(w, ledger.now())) {
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), "train append") });
+		relaunch = "; no lane holds it live, so a relaunch is requested";
+	}
+	const named = next.map(({ n, attempt }) => (attempt === null ? `#${n}` : `#${n} (attempt ${attempt})`));
+	return `added ${named.join(", ")} to merge train ${wl} (instruction ${id}); order ${trainPrs(ledger.entries(wl), ledger.instructions(wl)).join(", ")}${relaunch}`;
+}
+
+/**
+ * Jo's `train <N…>` applied (PLAN wl-mv8s8srodefytc § 1; PLAN wl-mvr888nftz0vcl D2), in one transaction, so two openers
+ * serialize and the second appends. With the merge train open (`theTrain`) it appends to it (`appendTrain`), after checking
+ * that `repo` (the surface's cwd, known only here) is the train's repository (`repoIdentity` of its `repo:` checkout):
+ * another repository, or a train with no `repo:` entry, throws naming the train and its repository, writing nothing. With
+ * none open it opens the train: the id preallocated (`newId`) so the brief names its slice ids, normal and autonomous with
+ * brief `trainBrief(wl, prs)`, its repo `repo`, `done:` TRAIN_DONE, no `plan:` (the procedure is the plan) and no `ceiling:`
+ * (a train's ceiling rows are never read, D4); then Jo's instruction `train <wl> <N…>` and the surface's `train:` naming it.
+ * Returns the receipt and the train's id, which the routes launch (never parsed back from the receipt).
  */
 export function applyTrain(ledger: Ledger, cmd: Extract<Command, { kind: "train" }>, repo: string): { line: string; workloadId: string } {
 	return ledger.write(() => {
-		const why = otherTrainRefusal(ledger, repo, cmd.prs, null);
-		if (why !== null) throw new Error(`${why}; refused, never applied`);
+		const train = theTrain(ledger);
+		if (train !== null) {
+			const checkout = trainCheckout(ledger, train);
+			const prs = cmd.prs.map((n) => `#${n}`).join(", ");
+			if (checkout === null) throw new Error(`merge train ${train} records no repository (no repo: entry), so ${prs} cannot be checked against it; nothing was written; refused, never applied`);
+			if (repoIdentity(checkout) !== repoIdentity(repo)) {
+				throw new Error(`merge train ${train} serves ${checkout} (${repoIdentity(checkout)}), and ${repo} (${repoIdentity(repo)}) is another repository: the one merge train takes PRs of its own repository only, so ${prs} is not added; nothing was written; refused, never applied`);
+			}
+			return { line: appendTrain(ledger, train, cmd.prs), workloadId: train };
+		}
 		const wl = newId("workload");
 		ledger.openWorkload({ by: SURFACE_BY, id: wl, brief: trainBrief(wl, cmd.prs), stakes: "normal", mode: "autonomous" });
 		recordRepo(ledger, wl, repo);
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody(TRAIN_DONE) });
-		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: ceilingBody(sizeFor("normal", null), stakesSource("normal", null)) });
 		const id = ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: wl, body: trainInstructionBody(wl, cmd.prs) });
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: trainBody(cmd.prs, id) });
 		return { line: `opened merge train ${wl} for ${cmd.prs.map((n) => `#${n}`).join(", ")} (instruction ${id})`, workloadId: wl };

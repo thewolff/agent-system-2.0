@@ -9,6 +9,7 @@ import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { controlEntries, doneBody, laneCap, laneExitBody, laneStartedBody, launchFailedBody, launchRequestedBody, PRECLAIM_LEASE_MS, STARTER_EXIT } from "../src/launch";
 import { applyTrain, interpret } from "../src/input";
+import { theTrain, TRAIN_DONE, trainBody, trainBrief, trainInstructionBody } from "../src/merge-train";
 import type { PidState } from "../src/omp-probe";
 import type { RankConfig } from "../src/rank-launch";
 import { releasedOpenBody } from "../src/turn-end";
@@ -269,11 +270,25 @@ describe("T2b: a spawn whose reservation another starter took spawns nothing", (
 
 // ---- PLAN wl-mvpsrr4tr0p1xc: the train's lane outside the cap (D1), one train lane at a time (D3), the launch limit (D4) ----
 
-/** A merge train on `l` as Jo's `train <pr>` word opens it (its own temp checkout, so two trains never share a PR's repo). */
+/**
+ * A merge train on `l` (its own temp checkout, so two trains never share a PR's repo): with none open, as Jo's `train <pr>`
+ * word opens it; with one open, a stale second train built from the rows the word wrote before the one-train cutover (PLAN
+ * wl-mvr888nftz0vcl D2: the word appends to the open train now), as one left open from before it would be.
+ */
 function openTrainOn(l: Ledger, pr: number, repo = tmp("train-repo")): string {
-	const cmd = interpret(l, `train ${pr}`);
-	if (cmd?.kind !== "train") throw new Error(`not a train: ${JSON.stringify(cmd)}`);
-	return applyTrain(l, cmd, repo).workloadId;
+	if (theTrain(l) === null) {
+		const cmd = interpret(l, `train ${pr}`);
+		if (cmd?.kind !== "train") throw new Error(`not a train: ${JSON.stringify(cmd)}`);
+		return applyTrain(l, cmd, repo).workloadId;
+	}
+	return l.write(() => {
+		const id = l.openWorkload({ by: SURFACE_BY, brief: trainBrief("wl-stale", [pr]), stakes: "normal", mode: "autonomous" });
+		recordRepo(l, id, repo);
+		l.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: doneBody(TRAIN_DONE) });
+		const ins = l.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: id, body: trainInstructionBody(id, [pr]) });
+		l.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: trainBody([pr], ins) });
+		return id;
+	});
 }
 /** A train attempt that failed before readiness: reserved, `launch-failed:` and released, as the starter's failure path leaves it. */
 function failedLaunch(l: Ledger, wl: string): string {
@@ -314,7 +329,8 @@ describe("D3: never two train lanes at once", () => {
 		ensureStandingWorkload(l);
 		const a = openTrainOn(l, 101);
 		const b = openTrainOn(l, 102);
-		// the interactive policy (`as2 lane <wl>`) runs on a user-driven workload: a train Jo flipped
+		// the interactive policy (`as2 lane <wl>`) runs on a user-driven workload: a train flipped by rows. Rewritten for PLAN
+		// wl-mvr888nftz0vcl D5: the train runs autonomous only, so the by-hand start is refused `train-autonomous` before the hold.
 		const byHand = openTrainOn(l, 103);
 		l.flipMode(byHand, { by: SURFACE_BY, mode: "user-driven", author: "jo", channel: "surface" });
 		const gone = fakeProbe(l, { omp: "gone", runner: "gone" }).probeFor;
@@ -324,7 +340,7 @@ describe("D3: never two train lanes at once", () => {
 		const before = l.entries(b).length;
 		const shown = l.entries(STANDING_WORKLOAD_ID).length;
 		expect(laneScript.reserve(l, b, "tick", false, SHOW, gone)).toEqual(held);
-		expect(laneScript.reserve(l, byHand, "jo", true, SHOW, gone)).toEqual(held);
+		expect(laneScript.reserve(l, byHand, "jo", true, SHOW, gone)).toEqual({ ok: false, reason: "train-autonomous" });
 		expect(l.entries(b).length).toBe(before);
 		expect(l.entries(byHand).filter((e) => e.body.startsWith("launch: "))).toEqual([]);
 		// no pick snapshot for the refused interactive start
@@ -408,9 +424,10 @@ describe("D4: the train launch limit binds the reservation", () => {
 		request(l, t);
 		const n = l.entries(t).length;
 		expect(laneScript.reserve(l, t, "tick", false, SHOW, gone)).toEqual({ ok: false, reason: limitReason(lanes) });
-		// the interactive policy on the train Jo flipped to user-driven: the same refusal
+		// the interactive policy on a train flipped to user-driven: refused too, by D5's `train-autonomous` (PLAN wl-mvr888nftz0vcl,
+		// rewritten from "the same refusal"), nothing written
 		l.flipMode(t, { by: SURFACE_BY, mode: "user-driven", author: "jo", channel: "surface" });
-		expect(laneScript.reserve(l, t, "jo", true, SHOW, gone)).toEqual({ ok: false, reason: limitReason(lanes) });
+		expect(laneScript.reserve(l, t, "jo", true, SHOW, gone)).toEqual({ ok: false, reason: "train-autonomous" });
 		l.flipMode(t, { by: SURFACE_BY, mode: "autonomous", author: "jo", channel: "surface" });
 		expect(l.entries(t).length).toBe(n);
 		expect(l.workload(t)!.holder).toBeNull();

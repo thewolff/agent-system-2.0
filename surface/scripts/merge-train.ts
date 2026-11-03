@@ -34,14 +34,15 @@
 //          With --hold-ok (PLAN wl-mvbjiettjrfpxc D5, the brief of every train opened since), a PR whose own stakes are
 //          normal prints `hold: main protection unverified (<why>)` instead, and the train passes it over with no question.
 // list     the train's members (`trainMembers`: Jo's `train:` and the train tick's `train-board:`, PLAN wl-mvbjiettjrfpxc
-//          D5) from the ledger opened read-only, in membership order, one line each: `<n> jo` or `<n> board`. No gh.
+//          D5) from the ledger opened read-only, in membership order, one line each: `<n> jo <slice>` or `<n> board <slice>`,
+//          `<slice>` the PR's disposition slice for its current attempt (`trainAttempts`, PLAN wl-mvr888nftz0vcl). No gh.
 //
 // --workload is the head branch's workload id when the branch is wl/<wl-…>, else none.
 // Exit 0 done; 2 a usage error or a git or gh process failure (or no ledger to open); 3 an unmerged path outside
 // MIGRATION.md, install/manifest.tsv and migration/items/*; 4 a conflict it cannot fix without losing an edit.
 // Nothing is written on 2, 3 or 4. No push, no ledger write; only order and stakes read the network (gh), and they write nothing.
 import { assertNotLiveLedgerUnderTest, defaultLedgerPath, Ledger } from "../../ledger/src/index";
-import { HOLD_PREFIX, type PrStakes, prStakes, prStakesLine, protectionGap, type StakesView, trainMembers } from "../src/merge-train";
+import { HOLD_PREFIX, type PrStakes, prStakes, prStakesLine, protectionGap, type StakesView, attemptOf, trainAttemptsOf, trainMembers, trainSliceId } from "../src/merge-train";
 import { checkItems, convertItems, EXIT_USAGE, type Outcome, resolveMerge, TrainExit, WORKLOAD_RE } from "../src/merge-train-resolve";
 import { DEFAULT_BRANCH, headsByBranch, type OpenHead, orderReport, prDeps, type StackPr } from "../src/merge-train-stack";
 
@@ -182,12 +183,13 @@ function stakes(repo: string, n: number, holdOk: boolean): Outcome {
 	return { out: [holdOk ? `${HOLD_PREFIX} (${p.text})` : `production: ${DEFAULT_BRANCH} protection unverified (${p.text})`], err: [] };
 }
 
-/** `list` (PLAN wl-mvbjiettjrfpxc D5): workload `wl`'s train members, `<n> jo` or `<n> board`, from the ledger read-only; exit 2 for no such workload. */
+/** `list` (PLAN wl-mvbjiettjrfpxc D5): workload `wl`'s train members, `<n> jo <slice>` or `<n> board <slice>`, from the ledger read-only; exit 2 for no such workload. */
 function list(wl: string): Outcome {
 	const ledger = openReadOnly();
 	try {
 		if (!ledger.workload(wl)) throw new TrainExit(`no workload ${wl}`, EXIT_USAGE);
-		return { out: trainMembers(ledger.entries(wl), ledger.instructions(wl)).map((m) => `${m.pr} ${m.source}`), err: [] };
+		const attempts = trainAttemptsOf(ledger, wl);
+		return { out: trainMembers(ledger.entries(wl), ledger.instructions(wl)).map((m) => `${m.pr} ${m.source} ${trainSliceId(wl, m.pr, attemptOf(attempts, m.pr))}`), err: [] };
 	} finally {
 		ledger.close();
 	}
