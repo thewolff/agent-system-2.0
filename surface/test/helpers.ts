@@ -259,7 +259,9 @@ export type FakeStep =
 	| { background: number | "never" } | { wake: { ms: number; steps: FakeStep[] } }
 	| { ledger: { body: string; slice?: string } | { routing: { slice: string } } }
 	/** One frame written to stdout as-is (fake-omp.ts header). */
-	| { emit: Record<string, unknown> };
+	| { emit: Record<string, unknown> }
+	/** `text` written to `path`, e.g. the profile config re-rendered mid-run (fake-omp.ts header). */
+	| { writeFile: { path: string; text: string } };
 /** The fake omp's script (surface/test/fake-omp.ts header). */
 export interface FakeScript {
 	claim?: boolean;

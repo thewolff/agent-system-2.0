@@ -4,14 +4,16 @@
 // one-per-lane guard, and D6's hand predicate against forged and stale settles.
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handSettledBody, handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
 import { controlEntries, exitClass, holdersOf } from "../src/launch";
 import { laneDeaths } from "../src/signals";
 import {
-	AS2_EXTENSION_ENTRIES, BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, extensionsSuspendedDeathBody, extensionsSuspendedOf, heldOpenBody, openWorkDeathBody,
+	AS2_EXTENSION_ENTRIES, as2ExtensionPaths, BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, extensionsSuspendedDeathBody, extensionsSuspendedOf,
+	extensionsUnconfirmedDeathBody, heldOpenBody, openWorkDeathBody, readAs2ExtensionPaths, suspendedAs2, suspensionOf,
 	parkFailedDeathBody, releasedOpen, releasedOpenBody, sliceCounts, turnEnd,
 	turnEndDeathBody, type TurnEndInput, unsettledHands,
 } from "../src/turn-end";
@@ -339,14 +341,75 @@ describe("recordDecision: the runner's decided outcome on the ledger before EOF 
 
 describe("turn end: the as2 extensions suspended by a profile config change (decision en-mw01fr5uts72g0)", () => {
 	const roots = ["/Users/jowolff/code/agent-system-2.0", "/Users/jowolff/.agent-system-2/verified/current"];
-	test("both real extensions notices name the four as2 entries; the death body is one line naming them", () => {
+	test("both real extensions notices name the four as2 entries (the trigger)", () => {
 		SUSPENDED_FRAMES.forEach((raw, k) => {
 			expect(extensionsSuspendedOf(JSON.parse(raw) as Record<string, unknown>)).toEqual(AS2_EXTENSION_ENTRIES.map((e) => `${roots[k]}/${e}`));
 		});
-		const paths = extensionsSuspendedOf(JSON.parse(SUSPENDED_FRAMES[1]) as Record<string, unknown>)!;
-		expect(extensionsSuspendedDeathBody(LANE, paths)).toBe(
-			`lane-died: ${LANE}: extensions suspended by a profile config change (OMP now enables /Users/jowolff/.agent-system-2/verified/current/surface/index.ts, /Users/jowolff/.agent-system-2/verified/current/gates/index.ts, /Users/jowolff/.agent-system-2/verified/current/classifier/extension.ts, /Users/jowolff/.agent-system-2/verified/current/plugins/index.ts); a relaunch loads the current paths`,
+	});
+
+	test("the death bodies are one line each: confirmed names the loaded paths no longer enabled, unconfirmed names why", () => {
+		const enabled = extensionsSuspendedOf(JSON.parse(SUSPENDED_FRAMES[1]) as Record<string, unknown>)!;
+		const loaded = AS2_EXTENSION_ENTRIES.map((e) => `${roots[0]}/${e}`);
+		expect(extensionsSuspendedDeathBody(LANE, loaded, enabled)).toBe(
+			`lane-died: ${LANE}: extensions suspended by a profile config change (/Users/jowolff/code/agent-system-2.0/surface/index.ts, /Users/jowolff/code/agent-system-2.0/gates/index.ts, /Users/jowolff/code/agent-system-2.0/classifier/extension.ts, /Users/jowolff/code/agent-system-2.0/plugins/index.ts no longer enabled; OMP now enables /Users/jowolff/.agent-system-2/verified/current/surface/index.ts, /Users/jowolff/.agent-system-2/verified/current/gates/index.ts, /Users/jowolff/.agent-system-2/verified/current/classifier/extension.ts, /Users/jowolff/.agent-system-2/verified/current/plugins/index.ts); a relaunch loads the current paths`,
 		);
+		expect(extensionsUnconfirmedDeathBody(LANE, ["/r/gates/index.ts"], "the profile config re-read failed: /p/config.yml does not parse:\n  bad\tyaml ")).toBe(
+			`lane-died: ${LANE}: extensions likely suspended by a profile config change (OMP now enables /r/gates/index.ts; not confirmed: the profile config re-read failed: /p/config.yml does not parse: bad yaml); a relaunch loads the current paths`,
+		);
+	});
+
+	test("as2ExtensionPaths: the rendered profile's four as2 entries, resolved, without the non-as2 one; no extensions list is none", () => {
+		const text = [
+			"setupVersion: 2",
+			"extensions:",
+			...AS2_EXTENSION_ENTRIES.map((e) => `  - "/r/a/../${e}"`),
+			'  - "/Users/x/.omp/agent/extensions/foo.ts"',
+			"  - 7",
+			"",
+		].join("\n");
+		expect(as2ExtensionPaths(Bun.YAML.parse(text))).toEqual(AS2_EXTENSION_ENTRIES.map((e) => `/r/${e}`));
+		// The shipped profile/config.yml rendered as install.sh does ({repo} → a root): its four as2 entries, in order.
+		const shipped = readFileSync(join(import.meta.dir, "..", "..", "profile", "config.yml"), "utf8").replaceAll("{repo}", "/as2-root");
+		expect(as2ExtensionPaths(Bun.YAML.parse(shipped))).toEqual(AS2_EXTENSION_ENTRIES.map((e) => `/as2-root/${e}`));
+		expect(as2ExtensionPaths(Bun.YAML.parse("setupVersion: 2\n"))).toEqual([]);
+		expect(as2ExtensionPaths({ extensions: "/r/surface/index.ts" })).toEqual([]);
+		expect(as2ExtensionPaths(null)).toEqual([]);
+	});
+
+	test("readAs2ExtensionPaths: the file's as2 paths; a missing file or invalid YAML is a one-line error, never a throw", () => {
+		const dir = mkdtempSync(join(tmpdir(), "turn-end-ext-"));
+		try {
+			const config = join(dir, "config.yml");
+			const missing = readAs2ExtensionPaths(config);
+			expect("error" in missing && missing.error.startsWith(`${config} could not be read: `)).toBe(true);
+			writeFileSync(config, 'extensions:\n  - "/r/gates/index.ts"\n');
+			expect(readAs2ExtensionPaths(config)).toEqual({ paths: ["/r/gates/index.ts"] });
+			writeFileSync(config, "extensions: [\"/r/gates/index.ts\"\n  bad: : :\n");
+			const invalid = readAs2ExtensionPaths(config);
+			expect("error" in invalid && invalid.error.startsWith(`${config} does not parse: `)).toBe(true);
+			expect("error" in invalid && invalid.error.includes("\n")).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("suspendedAs2: a replaced set is all suspended; a retained set, alone or with paths added, is none", () => {
+		const a = AS2_EXTENSION_ENTRIES.map((e) => `/a/${e}`);
+		const b = AS2_EXTENSION_ENTRIES.map((e) => `/b/${e}`);
+		expect(suspendedAs2(a, b)).toEqual(a);
+		expect(suspendedAs2(a, a)).toEqual([]);
+		expect(suspendedAs2(a, [...a, ...b, "/x/other/surface/index.ts"])).toEqual([]);
+		expect(suspendedAs2(a, [a[0]!, a[2]!])).toEqual([a[1]!, a[3]!]);
+	});
+
+	test("suspensionOf: confirmed, still enabled, or unconfirmed with the reason (spawn unreadable, nothing as2 at spawn, re-read failed)", () => {
+		const a = AS2_EXTENSION_ENTRIES.map((e) => `/a/${e}`);
+		const b = AS2_EXTENSION_ENTRIES.map((e) => `/b/${e}`);
+		expect(suspensionOf({ paths: a }, { paths: b })).toEqual({ kind: "confirmed", suspended: a });
+		expect(suspensionOf({ paths: a }, { paths: [...a, ...b] })).toEqual({ kind: "still-enabled" });
+		expect(suspensionOf({ error: "E1" }, { paths: a })).toEqual({ kind: "unconfirmed", reason: "the profile config was unreadable at spawn: E1" });
+		expect(suspensionOf({ paths: [] }, { paths: b })).toEqual({ kind: "unconfirmed", reason: "the profile config listed no as2 extension at spawn, so what the lane loaded is unknown" });
+		expect(suspensionOf({ paths: a }, { error: "E2" })).toEqual({ kind: "unconfirmed", reason: "the profile config re-read failed: E2" });
 	});
 
 	test("a notice enabling only another extension, another notice source or message, and a non-notice frame are not a suspension", () => {

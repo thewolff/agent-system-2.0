@@ -1,19 +1,22 @@
-// The runner ends a lane at once when OMP's extensions notice shows the as2 extensions suspended (decision
+// The runner ends a lane at once when the as2 extensions are suspended by a profile config change (decision
 // en-mw01fr5uts72g0): install.sh re-renders the profile's `extensions:` block, OMP's live config listener suspends the
 // loaded as2 extensions (the P-11 gates among them) with no frame of its own, and only says it would load the newly
-// enabled copies after a restart. Through the real runner (surface/scripts/lane.ts) and the fake omp
-// (surface/test/fake-omp.ts, its `emit` step writing the real frames verbatim), as lane-script.test.ts drives them:
-// the outcome is `error` with one lane-died: naming the cause, no continue prompt, no hold, and an unrelated notice
-// (a non-as2 extension enabled, compaction) never ends a lane.
+// enabled copies after a restart. That notice is the trigger; the runner confirms against the profile config it read at the
+// spawn and reads again (a loaded as2 path no longer enabled) before it ends the lane, and ends it unconfirmed when the
+// config cannot be read. Through the real runner (surface/scripts/lane.ts) and the fake omp (surface/test/fake-omp.ts, its
+// `writeFile` step rewriting the profile config as install.sh would and its `emit` step writing the real frames verbatim),
+// as lane-script.test.ts drives them: the outcome is `error` with one lane-died: naming the cause, no continue prompt, no
+// hold; an enable-only notice (every loaded as2 path still enabled) and an unrelated notice (a non-as2 extension enabled,
+// compaction) never end a lane.
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { handSpawnBody } from "../../classifier/src/lab";
 import { Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { recordRepo } from "../src/decision-log";
-import { doneBody, laneExit } from "../src/launch";
+import { doneBody, laneDir, laneExit } from "../src/launch";
 import { heartbeatText, runDirOf, runsRoot, testRequestedBody } from "../src/test-run";
-import { BACKGROUND_SUFFIX, extensionsSuspendedDeathBody, extensionsSuspendedOf } from "../src/turn-end";
+import { AS2_EXTENSION_ENTRIES, BACKGROUND_SUFFIX, extensionsSuspendedDeathBody, extensionsSuspendedOf, extensionsUnconfirmedDeathBody, readAs2ExtensionPaths } from "../src/turn-end";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
 import { COMPACTION_FRAME, type FakeStep, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh, SUSPENDED_FRAMES, until } from "./helpers";
 
@@ -61,18 +64,31 @@ const orchestratorMessages = (r: LaneRoot, wl: string): string[] => {
 	}
 };
 
-/** The verified/current notice (helpers.ts SUSPENDED_FRAMES), as the fake writes it, and the as2 paths it enables. */
+/** The verified/current notice (helpers.ts SUSPENDED_FRAMES), as the fake writes it, and the as2 paths it enables (root B's). */
 const notice = JSON.parse(SUSPENDED_FRAMES[1]) as Record<string, unknown>;
 const enabled = extensionsSuspendedOf(notice)!;
+/** Root A, where the lane's as2 extensions load from at the spawn; root B, the one the notice names. */
+const ROOT_A = "/Users/jowolff/code/agent-system-2.0";
+const ROOT_B = "/Users/jowolff/.agent-system-2/verified/current";
+const as2At = (root: string): string[] => AS2_EXTENSION_ENTRIES.map((e) => `${root}/${e}`);
+/** The installed profile config the runner reads (lane.ts profileConfig(); helpers.ts laneRoot writes it). */
+const configPath = (r: LaneRoot): string => join(r.home, ".omp", "profiles", "agent-system-2", "agent", "config.yml");
+const configText = (paths: readonly string[]): string => `setupVersion: 2\nextensions:\n${paths.map((p) => `  - "${p}"\n`).join("")}`;
+/** The profile config before the launch: the as2 entries at root A. */
+const writeConfigA = (r: LaneRoot): void => writeFileSync(configPath(r), configText(as2At(ROOT_A)));
+/** The fake's mid-run rewrite of the profile config, as install.sh would. */
+const rewrite = (r: LaneRoot, text: string): FakeStep => ({ writeFile: { path: configPath(r), text } });
+const INVALID_YAML = 'extensions: ["/a/gates/index.ts"\n  bad: : :\n';
 
 describe("the runner: as2 extensions suspended mid-run (decision en-mw01fr5uts72g0)", () => {
-	test("a slice open, the real notice mid-turn → outcome error at once: one lane-died: naming the cause (no open-work, no session shutdown line), released, an abort and only the first prompt", async () => {
+	test("a slice open, the config re-rendered to root B and the real notice mid-turn → outcome error at once: one confirmed lane-died: (no open-work, no session shutdown line), released, an abort and only the first prompt", async () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r);
-		setScript(r, { steps: [{ emit: notice }, { hang: true }] });
+		writeConfigA(r);
+		setScript(r, { steps: [rewrite(r, configText(as2At(ROOT_B))), { emit: notice }, { hang: true }] });
 		const laneId = launched(r, wl);
 		expect(await exitOf(r, wl, laneId)).toMatchObject({ code: "0", outcome: "error" });
-		const death = extensionsSuspendedDeathBody(laneId, enabled);
+		const death = extensionsSuspendedDeathBody(laneId, as2At(ROOT_A), enabled);
 		const snap = laneSnapshot(r, wl);
 		expect(snap.deaths).toEqual([death]);
 		expect(snap.workload!.holder).toBeNull();
@@ -80,6 +96,22 @@ describe("the runner: as2 extensions suspended mid-run (decision en-mw01fr5uts72
 		expect(eventsOf(r)).toContain("abort");
 		// The orchestrator's needs-you reads this lane's messages: the one it got names the suspension, nothing else.
 		expect(orchestratorMessages(r, wl)).toEqual([death]);
+	}, 30_000);
+
+	test("enable-only (review round 1 finding 1): root A's entries kept, a root B copy and an unrelated …/surface/index.ts added, their notice, then the clean end → completed, no lane-died:, no abort", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r);
+		writeConfigA(r);
+		const added = [...as2At(ROOT_B), "/x/other/surface/index.ts"];
+		const addNotice: FakeStep = { emit: { type: "notice", level: "warning", message: `Restart omp to load newly enabled extensions: ${added.join(", ")}`, source: "extensions" } };
+		setScript(r, { steps: [rewrite(r, configText([...as2At(ROOT_A), ...added])), addNotice, { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ code: "0", outcome: "completed" });
+		expect(laneSnapshot(r, wl).deaths).toEqual([]);
+		expect(promptsOf(r).map((p) => p.id)).toEqual(["p1"]);
+		expect(eventsOf(r)).not.toContain("abort");
+		// The notice did reach the runner: it read the config again and said why the lane goes on.
+		expect(readFileSync(join(laneDir(wl, r.home), "runner.log"), "utf8")).toContain(`runner: ${laneId} extensions notice enables ${[...as2At(ROOT_B), "/x/other/surface/index.ts"].join(", ")}; the loaded as2 extensions are still enabled; the lane goes on\n`);
 	}, 30_000);
 
 	test("an enable notice naming only a non-as2 extension, then a compaction notice, then the clean end → completed, no lane-died:", async () => {
@@ -96,9 +128,30 @@ describe("the runner: as2 extensions suspended mid-run (decision en-mw01fr5uts72
 		expect(eventsOf(r)).not.toContain("abort");
 	}, 30_000);
 
+	test("unconfirmed: the config rewritten as invalid YAML, then the notice → error at once with the unconfirmed death naming the parse failure", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r);
+		writeConfigA(r);
+		setScript(r, { steps: [rewrite(r, INVALID_YAML), { emit: notice }, { hang: true }] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ code: "0", outcome: "error" });
+		// The file still holds the invalid YAML: its read now is the error the runner's re-read met.
+		const reread = readAs2ExtensionPaths(configPath(r));
+		if (!("error" in reread)) throw new Error(`${configPath(r)} parsed; the test's INVALID_YAML must not`);
+		expect(reread.error).toContain("does not parse");
+		const death = extensionsUnconfirmedDeathBody(laneId, enabled, `the profile config re-read failed: ${reread.error}`);
+		const snap = laneSnapshot(r, wl);
+		expect(snap.deaths).toEqual([death]);
+		expect(snap.workload!.holder).toBeNull();
+		expect(orchestratorMessages(r, wl)).toEqual([death]);
+		expect(promptsOf(r).map((p) => p.id)).toEqual(["p1"]);
+		expect(eventsOf(r)).toContain("abort");
+	}, 30_000);
+
 	test("in flight, an unsettled review hand and a live test run at the notice → still error at once with the extensions death, no held-open message, no continue prompt", async () => {
 		const r = makeRoot();
 		const { wl, sl } = openWorkload(r);
+		writeConfigA(r);
 		const runId = "tr-0extsusp1";
 		const sha = "a".repeat(40);
 		const l = ledgerOf(r);
@@ -109,11 +162,11 @@ describe("the runner: as2 extensions suspended mid-run (decision en-mw01fr5uts72
 		writeFileSync(join(dir, "heartbeat"), heartbeatText(runId, Date.now()));
 		// The classifier's hand-spawn: as a fixture writes it (lane-script.test.ts spawnStep), never settled.
 		const spawn: FakeStep = { ledger: { body: handSpawnBody({ token: "dt-ext1", root: "/tmp/lane", spawnKey: sl, review: true, group: "dg-dt-ext1", row: ["openai-codex/gpt-6-astra"] }), slice: sl } };
-		setScript(r, { steps: [spawn, { emit: notice }, { hang: true }] });
+		setScript(r, { steps: [spawn, rewrite(r, configText(as2At(ROOT_B))), { emit: notice }, { hang: true }] });
 		const laneId = launched(r, wl);
 		expect(await exitOf(r, wl, laneId)).toMatchObject({ code: "0", outcome: "error" });
 		// No prompt_result had ended the turn, so the runner's `settled` was still its start value (true): no background suffix.
-		const death = extensionsSuspendedDeathBody(laneId, enabled);
+		const death = extensionsSuspendedDeathBody(laneId, as2At(ROOT_A), enabled);
 		expect(laneSnapshot(r, wl).deaths).toEqual([death]);
 		expect(orchestratorMessages(r, wl)).toEqual([death]);
 		expect(promptsOf(r).map((p) => p.id)).toEqual(["p1"]);
@@ -124,11 +177,13 @@ describe("the runner: as2 extensions suspended mid-run (decision en-mw01fr5uts72
 	test("in flight, the notice in a woken turn while the runner waits on omp's background job → error at once; the death carries the background suffix (settled was false)", async () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r);
-		// The prompt ends sessionSettled: false; the job's woken turn (prompts[1]) sends the notice.
-		setScript(r, { prompts: [[{ background: 1000 }], [{ emit: notice }]] });
+		writeConfigA(r);
+		// The prompt ends sessionSettled: false; the job's woken turn (prompts[1]) rewrites the config and sends the notice. With
+		// `background: 0` the woken turn runs on the fake's next tick, after its prompt_result frame: frame order carries the sequence.
+		setScript(r, { prompts: [[{ background: 0 }], [rewrite(r, configText(as2At(ROOT_B))), { emit: notice }]] });
 		const laneId = launched(r, wl);
 		expect(await exitOf(r, wl, laneId)).toMatchObject({ code: "0", outcome: "error" });
-		const death = `${extensionsSuspendedDeathBody(laneId, enabled)}${BACKGROUND_SUFFIX}`;
+		const death = `${extensionsSuspendedDeathBody(laneId, as2At(ROOT_A), enabled)}${BACKGROUND_SUFFIX}`;
 		expect(laneSnapshot(r, wl).deaths).toEqual([death]);
 		expect(orchestratorMessages(r, wl)).toEqual([death]);
 		expect(promptsOf(r).map((p) => p.id)).toEqual(["p1"]);

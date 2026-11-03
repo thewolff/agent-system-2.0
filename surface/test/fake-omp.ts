@@ -16,13 +16,15 @@
 //     noSession?: true,            the get_state reply carries no sessionFile
 //     steps: [ { tool, args } | { sleepMs } | { exit: code } | { hang: true } | { result: "aborted" | "error", error? }
 //              | { usage: { usd, tokens }, hand? } | { background: ms | "never" } | { wake: { ms, steps } } | { emit: frame }
-//              | { ledger: { body, slice? } | { routing: { slice } } } ],
+//              | { writeFile: { path, text } } | { ledger: { body, slice? } | { routing: { slice } } } ],
 //                                an arg value "$slice" is the id the newest tool result named (lane_add_slice mints it);
 //                                a usage step appends one assistant message with that usage (usage.cost.total,
 //                                usage.totalTokens) to the session file, or with `hand` to <session>/<hand>.jsonl, where
 //                                OMP writes a hand's session file (the runner's ceiling meter reads both);
 //                                an emit step writes its frame object to stdout as-is, one JSON line (an omp frame no
 //                                other step produces, e.g. the extensions `notice`);
+//                                a writeFile step writes `text` to `path` (parents made), as install.sh rewrites the
+//                                profile config mid-run, before the steps after it run;
 //                                a background step ends the prompt with `sessionSettled: false`; after `ms` it records
 //                                `background-done`, runs the next turn's steps as the woken turn (no prompt_result) and
 //                                emits `session_settled`; an EOF first records `background-killed` ("never": always);
@@ -274,6 +276,11 @@ const runSteps = async (steps: readonly FakeStep[]): Promise<number | "never" | 
 		}
 		if ("ledger" in step) {
 			ledgerStep(step.ledger);
+			continue;
+		}
+		if ("writeFile" in step) {
+			mkdirSync(dirname(step.writeFile.path), { recursive: true });
+			writeFileSync(step.writeFile.path, step.writeFile.text);
 			continue;
 		}
 		if ("emit" in step) {

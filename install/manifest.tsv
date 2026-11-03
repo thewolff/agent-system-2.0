@@ -1122,6 +1122,7 @@ surface/test/lane-model-script.test.ts	test	-
 surface/test/lane-resume-script.test.ts	test	-
 surface/test/by-hand-context.test.ts	test	-
 surface/test/lane-headroom-script.test.ts	test	-
+surface/test/lane-extensions-suspended.test.ts	test	-
 surface/src/ctx-index.ts	module	-
 surface/test/ctx-index.test.ts	test	-
 surface/src/close-entry.ts	module	-
