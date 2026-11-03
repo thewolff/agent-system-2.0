@@ -5,7 +5,7 @@
 # each row by its kind. Today that means: create or verify the ledger from the manifest's one
 # ledger-schema row, using its one ledger-init row, take the first scheduled copy with its one
 # ledger-backup row, (macOS) write the periodic backup job from its one ledger-backup-agent row
-# into $HOME/Library/LaunchAgents (written, never loaded: the load command is printed at the end),
+# into $HOME/Library/LaunchAgents (written, never loaded: the one-line load command for your own Terminal is printed),
 # and build the OMP profile: render the `profile` row profile/config.yml with {repo} filled into
 # $HOME/.omp/profiles/<profile>/agent/config.yml, place the `profile` row profile/models.yml beside
 # it, and link every `tier` row into $HOME/.omp/profiles/<profile>/agent/agents/. `skill` rows
@@ -22,7 +22,15 @@
 # as2 transcripts are in the ctx index. The tracing switch (observability.phoenix) keeps its installed
 # value across a re-install, and on macOS, unless that value is off and only when $HOME is this user's
 # own home, the Phoenix LaunchAgent is (re)installed with install/phoenix-agent.sh on; a Phoenix that
-# does not start is reported and does not fail the install. The last line names the providers the rendered profile
+# does not start is reported and does not fail the install. On macOS and only when $HOME is this user's own home, the
+# doctor job (install/com.agent-system-2.doctor.plist: surface/scripts/doctor.ts in its after-restart mode, at load and
+# every 600 s) is written and loaded the way the flag jobs below are, its PATH built from where each name its
+# JOB_INVENTORY row in surface/src/doctor.ts runs resolves now, then the system directories. A `launchctl bootstrap` that
+# fails (an agent shell gets "Bootstrap failed: 5") never fails the install: one line says what to run in your own
+# Terminal, `run this in your own Terminal (zsh): launchctl bootstrap gui/$(id -u) <plist>`, and the install goes on.
+# The last step runs the full doctor (bun surface/scripts/doctor.ts, every part) with its output shown: `install
+# complete` is printed only when it exits 0, else `install incomplete: as2 doctor found failing parts (above)` and
+# exit 5, everything already written kept. The last line names the providers the rendered profile
 # routes to and says each needs a /login once per profile (the profile's setupVersion skips OMP's
 # first-launch sign-in scene).
 # File links also install in the default OMP profile (persistent seats do not use the as2 profile):
@@ -34,7 +42,7 @@
 # chaos job: the template install/com.agent-system-2.chaos.plist filled with this checkout, the
 # absolute bun path, $HOME and a PATH of the bun, omp and git directories, written to
 # $HOME/Library/LaunchAgents/com.agent-system-2.chaos.plist and loaded with
-# `launchctl bootstrap gui/$UID` (a loaded copy is booted out first). Its log goes to
+# `launchctl bootstrap gui/$UID` (a loaded copy is booted out first; a failed bootstrap prints the line to run and goes on). Its log goes to
 # $HOME/agent-scratch/agent-system-2.0/chaos/launchd.log. --scratch-sweep writes the daily scratch
 # sweep job the same way: install/com.agent-system-2.scratch-sweep.plist filled with this checkout,
 # the absolute bun path, $HOME and the ledger path, written to
@@ -94,7 +102,7 @@
 #          AS2_KEEP_LOCAL           with --drive-backup only: 0 or 1, written into the nightly job; unset or empty
 #                                   keeps the installed nightly job's value (0 when none is installed); any other
 #                                   value refuses the flag
-# Exit:    0 installed, or (=off) each named job is confirmed not loaded and its plist is gone
+# Exit:    0 installed and the full doctor passed, or (=off) each named job is confirmed not loaded and its plist is gone
 #          1 other failure (=off: launchctl not on PATH, `launchctl print` failed for a reason other
 #            than "Could not find service", or bootout failed, each with the plist kept; or the
 #            plist removal failed)
@@ -111,6 +119,8 @@
 #          4 the ledger file exists at a schema version other than the supported one (5), e.g. a
 #            version-1 to -4 ledger from before schema v5 (nothing written; no upgrade exists:
 #            move the file aside and re-run to create a new ledger)
+#          5 installed, but the full doctor (the last step) did not exit 0: the failing parts are printed above it with
+#            their fixes, and everything written stays (fix them, then re-run)
 #
 # Order matters: every check runs before anything is written, so a failed install leaves the
 # machine as it found it. Safe to re-run: an existing ledger at the current schema is untouched,
@@ -287,12 +297,18 @@ fill_template() {
 	' "$@"
 }
 
+# The one line a person runs in their own Terminal to load a written plist: an agent shell's `launchctl bootstrap` gets
+# "Bootstrap failed: 5", so install never depends on its own bootstrap (bootstrap_line PLIST).
+bootstrap_line() { printf '==> run this in your own Terminal (zsh): launchctl bootstrap gui/$(id -u) %q\n' "$1"; }
+
 # Write a filled launchd template and (re)load it: load_job NAME LABEL TEMPLATE PLIST LOGDIR NAME=value...
 # launchd keeps the plist a job was bootstrapped with and refuses to bootstrap a label that is already
 # loaded, so a loaded job is booted out before the new plist replaces it; `launchctl print` exits 113
 # for a label that is not loaded. The filled plist must lint before anything is booted out. A caller may set
 # LOAD_JOB_NOTE for the call (LOAD_JOB_NOTE=... load_job ...): every failure here ends with it, so a failure can
-# name what an earlier load already changed.
+# name what an earlier load already changed. A failed bootstrap is not a failure: launchctl's own message stays above,
+# bootstrap_line prints the one line to run, and the install goes on, so the closing doctor reports the job not loaded.
+# LOAD_JOB_STATE says which happened, for the caller's step line.
 load_job() {
 	local name="$1" label="$2" template="$3" plist="$4" logdir="$5" note="${LOAD_JOB_NOTE:-}" status
 	shift 5
@@ -305,7 +321,20 @@ load_job() {
 		launchctl bootout "gui/$UID/$label" || { status=$?; rm -f "$plist.tmp.$$"; fail "launchctl bootout gui/$UID/$label exited $status$note" 1; }
 	fi
 	mv -f "$plist.tmp.$$" "$plist" || fail "mv -f $plist.tmp.$$ $plist exited $?$note" 1
-	launchctl bootstrap "gui/$UID" "$plist" || fail "launchctl bootstrap gui/$UID $plist exited $?$note" 1
+	if launchctl bootstrap "gui/$UID" "$plist"; then
+		LOAD_JOB_STATE="loaded"
+	else
+		bootstrap_line "$plist"
+		LOAD_JOB_STATE="written, not loaded (its bootstrap failed: run the line above)"
+	fi
+}
+
+# Whether $HOME is this user's own home directory, read from the user database with dscl, never from $HOME (Bun's
+# os.userInfo().homedir follows $HOME): launchd has one gui/<uid> domain per user, so a job loaded from another HOME (a
+# test's temp HOME) would replace the real one. Sets USER_HOME to dscl's answer (empty when dscl gives none).
+own_home() {
+	USER_HOME="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p')" || USER_HOME=""
+	[ -n "$USER_HOME" ] && [ "$(cd "$HOME" && pwd -P)" = "$(cd "$USER_HOME" 2>/dev/null && pwd -P)" ]
 }
 
 # --chaos-nightly is checked here, before anything is written: launchd is macOS only, and the job's
@@ -739,9 +768,8 @@ if [ "$(uname -s)" = Darwin ]; then
 		>"$PLIST.tmp.$$" || { rm -f "$PLIST.tmp.$$"; fail "backup job template $AGENT_ROW could not be filled" 1; }
 	/usr/bin/plutil -lint "$PLIST.tmp.$$" >/dev/null || { rm -f "$PLIST.tmp.$$"; fail "the filled backup job plist does not lint" 1; }
 	mv -f "$PLIST.tmp.$$" "$PLIST"
-	step "backup job written, not loaded. To load it (and after any re-install, unload first):"
-	printf '    launchctl bootstrap gui/$(id -u) %q\n' "$PLIST"
-	printf '  to unload:\n    launchctl bootout gui/$(id -u)/com.agent-system-2.ledger-backup\n'
+	step "backup job written, not loaded (after a re-install, unload the old one first: launchctl bootout gui/\$(id -u)/com.agent-system-2.ledger-backup)"
+	bootstrap_line "$PLIST"
 else
 	step "backup job: not macOS; no periodic job written (systemd timer not built yet); the open-time copy is the only schedule"
 fi
@@ -822,7 +850,7 @@ fi
 if [ "$CHAOS" = on ]; then
 	load_job "chaos nightly" "$CHAOS_LABEL" "$CHAOS_TEMPLATE" "$CHAOS_PLIST" "$CHAOS_LOG_DIR" \
 		"BUN=$CHAOS_BUN" "HOME=$HOME" "REPO=$REPO" "PATH=$CHAOS_PATH"
-	step "chaos nightly loaded: fires every quarter hour, runs once a night at 03:00 America/Los_Angeles; log $CHAOS_LOG_DIR/launchd.log; turn off with: bash install/install.sh --chaos-nightly=off"
+	step "chaos nightly $LOAD_JOB_STATE: fires every quarter hour, runs once a night at 03:00 America/Los_Angeles; log $CHAOS_LOG_DIR/launchd.log; turn off with: bash install/install.sh --chaos-nightly=off"
 fi
 
 # ---- 6d. the daily scratch sweep (--scratch-sweep only) -------------------------------------------
@@ -831,7 +859,7 @@ fi
 if [ "$SWEEP" = on ]; then
 	load_job "scratch sweep" "$SWEEP_LABEL" "$SWEEP_TEMPLATE" "$SWEEP_PLIST" "$SWEEP_LOG_DIR" \
 		"BUN=$SWEEP_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS"
-	step "scratch sweep loaded: runs daily at 04:30 local time; reports and log in $SWEEP_LOG_DIR; turn off with: bash install/install.sh --scratch-sweep=off"
+	step "scratch sweep $LOAD_JOB_STATE: runs daily at 04:30 local time; reports and log in $SWEEP_LOG_DIR; turn off with: bash install/install.sh --scratch-sweep=off"
 fi
 
 # ---- 6d2. the merge train's tick (--train-tick only) ----------------------------------------------
@@ -840,7 +868,7 @@ fi
 if [ "$TICK" = on ]; then
 	load_job "train tick" "$TICK_LABEL" "$TICK_TEMPLATE" "$TICK_PLIST" "$TICK_LOG_DIR" \
 		"BUN=$TICK_BUN" "HOME=$HOME" "REPO=$CONTROL_ROOT" "LEDGER_DB=$LEDGER_ABS" "PROFILE=$PROFILE_NAME" "PATH=$TICK_PATH"
-	step "train tick loaded from $CONTROL_ROOT: runs every 5 minutes; log $TICK_LOG_DIR/launchd.log; turn off with: bash install/install.sh --train-tick=off"
+	step "train tick $LOAD_JOB_STATE from $CONTROL_ROOT: runs every 5 minutes; log $TICK_LOG_DIR/launchd.log; turn off with: bash install/install.sh --train-tick=off"
 fi
 
 # ---- 6d3. the daily self-heal report (--daily-report only) ---------------------------------------
@@ -849,7 +877,7 @@ fi
 if [ "$REPORT" = on ]; then
 	load_job "daily report" "$REPORT_LABEL" "$REPORT_TEMPLATE" "$REPORT_PLIST" "$REPORT_LOG_DIR" \
 		"BUN=$REPORT_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS" "PROFILE=$PROFILE_NAME"
-	step "daily report loaded: runs daily at 07:00 local time; reports and log in $REPORT_LOG_DIR; turn off with: bash install/install.sh --daily-report=off"
+	step "daily report $LOAD_JOB_STATE: runs daily at 07:00 local time; reports and log in $REPORT_LOG_DIR; turn off with: bash install/install.sh --daily-report=off"
 fi
 
 # ---- 6d4. the nightly Google Drive backup (--drive-backup only) -----------------------------------
@@ -860,17 +888,18 @@ if [ "$DRIVE" = on ]; then
 	step "$DRIVE_KEEP_STEP"
 	load_job "drive backup" "$DRIVE_LABEL" "$DRIVE_TEMPLATE" "$DRIVE_PLIST" "$DRIVE_STATE" \
 		"BUN=$DRIVE_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS" "STATE=$DRIVE_STATE" "KEEP_LOCAL=$DRIVE_KEEP_LOCAL"
-	LOAD_JOB_NOTE="; the nightly job $DRIVE_LABEL is loaded from $DRIVE_PLIST with AS2_KEEP_LOCAL=$DRIVE_KEEP_LOCAL ($DRIVE_KEEP_SAYS), but the check job $DRIVE_CHECK_LABEL did not load; fix the cause and run bash install/install.sh --drive-backup again (AS2_KEEP_LOCAL unset keeps $DRIVE_KEEP_LOCAL), or turn both off with bash install/install.sh --drive-backup=off" \
+	drive_state="$LOAD_JOB_STATE"
+	LOAD_JOB_NOTE="; the nightly job $DRIVE_LABEL is $drive_state from $DRIVE_PLIST with AS2_KEEP_LOCAL=$DRIVE_KEEP_LOCAL ($DRIVE_KEEP_SAYS), but the check job $DRIVE_CHECK_LABEL did not load; fix the cause and run bash install/install.sh --drive-backup again (AS2_KEEP_LOCAL unset keeps $DRIVE_KEEP_LOCAL), or turn both off with bash install/install.sh --drive-backup=off" \
 		load_job "drive backup check" "$DRIVE_CHECK_LABEL" "$DRIVE_CHECK_TEMPLATE" "$DRIVE_CHECK_PLIST" "$DRIVE_STATE" \
 		"BUN=$DRIVE_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS" "STATE=$DRIVE_STATE"
-	step "drive backup loaded: backup-nightly.zsh runs nightly at 02:30 and check-backup-fresh.zsh daily at 09:00 local time; AS2_KEEP_LOCAL=$DRIVE_KEEP_LOCAL ($DRIVE_KEEP_SAYS); state and logs in $DRIVE_STATE; turn off with: bash install/install.sh --drive-backup=off"
+	[ "$drive_state" = loaded ] && [ "$LOAD_JOB_STATE" = loaded ] || drive_state="nightly job $drive_state, check job $LOAD_JOB_STATE"
+	step "drive backup $drive_state: backup-nightly.zsh runs nightly at 02:30 and check-backup-fresh.zsh daily at 09:00 local time; AS2_KEEP_LOCAL=$DRIVE_KEEP_LOCAL ($DRIVE_KEEP_SAYS); state and logs in $DRIVE_STATE; turn off with: bash install/install.sh --drive-backup=off"
 fi
 
 # ---- 6e. Phoenix, on by default (wl-mv65t5d34lts00 PLAN.md § 8.1) ------------------------------------
 # Phoenix, the local trace UI for as2's OMP spans: on macOS, unless observability.phoenix is off,
 # install/phoenix-agent.sh on (idempotent: it rewrites the same files and reloads the job). Only when $HOME is
-# this user's own home directory, read from the user database with dscl, never from $HOME (Bun's
-# os.userInfo().homedir follows $HOME): launchd has one gui/<uid> domain per user, so an install into another
+# this user's own home directory (own_home, above): launchd has one gui/<uid> domain per user, so an install into another
 # HOME (a test's temp HOME) must never boot out the real job or load one pointing into that directory
 # (phoenix-agent.sh refuses it too). A failing `on` (no phoenix uv tool, launchctl refused, not healthy in time)
 # is reported with the retry command and does not fail the install: with Phoenix down every omp drops its spans
@@ -880,11 +909,10 @@ if [ "$(uname -s)" = Darwin ]; then
 		const p = Bun.YAML.parse(await Bun.stdin.text())?.observability?.phoenix;
 		process.stdout.write(Array.isArray(p) ? `[${p.join(", ")}]` : String(p));
 	')" || fail "the rendered profile could not be read back for observability.phoenix" 1
-	user_home="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p')" || user_home=""
 	if [ "$phoenix_value" = off ]; then
 		step "Phoenix: observability.phoenix is off, so the LaunchAgent is neither installed nor changed (to turn it on: as2 phoenix all, then bash $REPO/install/phoenix-agent.sh on)"
-	elif [ -z "$user_home" ] || [ "$(cd "$HOME" && pwd -P)" != "$(cd "$user_home" 2>/dev/null && pwd -P)" ]; then
-		step "Phoenix: HOME ($HOME) is not this user's home directory (${user_home:-unknown}), so the LaunchAgent is not installed from this run (launchd has one domain per user)"
+	elif ! own_home; then
+		step "Phoenix: HOME ($HOME) is not this user's home directory (${USER_HOME:-unknown}), so the LaunchAgent is not installed from this run (launchd has one domain per user)"
 	elif bash "$REPO/install/phoenix-agent.sh" on; then
 		step "Phoenix: running on http://127.0.0.1:6006 for observability.phoenix: $phoenix_value (status: bash $REPO/install/phoenix-agent.sh status)"
 	else
@@ -893,6 +921,65 @@ if [ "$(uname -s)" = Darwin ]; then
 	fi
 fi
 
+# ---- 6f. the doctor job (PLAN wl-mvwks11ye3x9zu, install.sh F8) ---------------------------------------
+# macOS, and only when $HOME is this user's own home (own_home, the Phoenix rule in 6e): install/com.agent-system-2.doctor.plist
+# filled and loaded like the flag jobs, running surface/scripts/doctor.ts in its after-restart mode at load and every 600 s.
+# Its PATH holds the directory of each name the doctor runs by name (the doctor row's pathNames in JOB_INVENTORY,
+# surface/src/doctor.ts, read here so the two cannot drift), as resolved now, then the system directories. A name not
+# found is left off with a note, and the closing doctor's deps:doctor part fails until it is installed and install re-run.
+# Reversal: launchctl bootout gui/$(id -u)/com.agent-system-2.doctor, then delete $HOME/Library/LaunchAgents/com.agent-system-2.doctor.plist.
+DOCTOR_LABEL="com.agent-system-2.doctor"
+DOCTOR_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/doctor"
+if [ "$(uname -s)" != Darwin ]; then
+	step "doctor job: not macOS; no launchd job written"
+elif ! own_home; then
+	step "doctor job: HOME ($HOME) is not this user's home directory (${USER_HOME:-unknown}), so the doctor job is not installed from this run (launchd has one domain per user)"
+else
+	doctor_names="$(bun -e '
+		const { JOB_INVENTORY } = await import(process.argv[1]);
+		const row = JOB_INVENTORY.find((r) => r.name === "doctor");
+		if (!row) { console.error(`install: ${process.argv[1]} has no doctor row in JOB_INVENTORY`); process.exit(1); }
+		console.log(row.pathNames.join("\n"));
+	' "$REPO/surface/src/doctor.ts")" || fail "the doctor job's PATH names could not be read from $REPO/surface/src/doctor.ts (JOB_INVENTORY)" 1
+	DOCTOR_BUN="$(type -P bun)"
+	case "$DOCTOR_BUN" in /*) ;; *) DOCTOR_BUN="$PWD/$DOCTOR_BUN" ;; esac
+	dirs=""
+	doctor_missing=""
+	while IFS= read -r tool; do
+		[ -n "$tool" ] || continue
+		if tool_bin="$(type -P "$tool")"; then
+			case "$tool_bin" in /*) ;; *) tool_bin="$PWD/$tool_bin" ;; esac
+			dirs="${dirs:+$dirs:}$(dirname "$tool_bin")"
+		else
+			doctor_missing="$doctor_missing $tool"
+		fi
+	done <<<"$doctor_names"
+	# The tool directories first, then the system ones; each directory once, in first-seen order.
+	dirs="${dirs:+$dirs:}/usr/bin:/bin:/usr/sbin:/sbin"
+	DOCTOR_PATH=""
+	while IFS= read -r -d: dir; do
+		case ":$DOCTOR_PATH:" in *":$dir:"*) ;; *) DOCTOR_PATH="${DOCTOR_PATH:+$DOCTOR_PATH:}$dir" ;; esac
+	done <<<"$dirs:"
+	[ -z "$doctor_missing" ] || step "note: doctor job: not found on PATH:$doctor_missing; the job's PATH lacks them, and as2 doctor's deps:doctor part fails until each is installed and this script re-run"
+	load_job "doctor" "$DOCTOR_LABEL" "$REPO/install/$DOCTOR_LABEL.plist" "$LAUNCH_AGENTS/$DOCTOR_LABEL.plist" "$DOCTOR_LOG_DIR" \
+		"BUN=$DOCTOR_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS" "PROFILE=$PROFILE_NAME" "PATH=$DOCTOR_PATH"
+	step "doctor job $LOAD_JOB_STATE: as2 doctor --after-restart at load and every 10 minutes; log $DOCTOR_LOG_DIR/launchd.log"
+fi
+
+# ---- 6g. the full doctor, the last check (PLAN wl-mvwks11ye3x9zu, install.sh F8) ---------------------------
+# Every part (surface/scripts/doctor.ts, default mode) against the ledger and profile this run wrote, its output shown.
+# Install is complete only when it exits 0; on 1 (a part failed) or 2 (a bad argument or the doctor's own crash) the
+# install is incomplete and exits 5, keeping everything written above: fix what the doctor names, then re-run.
+step "as2 doctor: checking every part (bun $REPO/surface/scripts/doctor.ts)"
+set +e
+AGENT_SYSTEM_LEDGER_DB="$LEDGER_ABS" AGENT_SYSTEM_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/doctor.ts"
+status=$?
+set -e
+if [ "$status" -ne 0 ]; then
+	step "install incomplete: as2 doctor found failing parts (above)"
+	[ "$status" -eq 1 ] || step "note: as2 doctor exited $status (2 is a bad argument or the doctor's own crash; its error is above)"
+	exit 5
+fi
 step "install complete: ledger at $LEDGER_DB"
 
 # ---- 7. provider login, once per profile ---------------------------------------------------------

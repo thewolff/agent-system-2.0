@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  agent-system 2.0: the as2 doctor job (PLAN wl-mvwks11ye3x9zu, Modes), as a launchd user agent.
+  TEMPLATE: install/install.sh fills the upper-case placeholder values (XML-escaped), writes the result
+  to $HOME/Library/LaunchAgents/com.agent-system-2.doctor.plist and loads it with launchctl bootstrap,
+  only when HOME is this user's own home directory (launchd has one domain per user). launchd runs
+  surface/scripts/doctor.ts in its after-restart mode at load and every 600 s: it re-checks the parts with
+  an open episode and clears those that pass, shows a pending popup, and once per boot, after 10 minutes
+  of uptime, checks every part and opens a down for each failure. Each run logs one line (its heartbeat).
+  PATH holds the directories every probe the doctor runs by name resolves in (ctx, gh, osascript,
+  launchctl, plutil, df, pgrep, ps, sysctl, dscl: its JOB_INVENTORY row), as resolved at install, then
+  the system directories; the ledger and profile variables name what install wrote.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.agent-system-2.doctor</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@BUN@</string>
+		<string>@REPO@/surface/scripts/doctor.ts</string>
+		<string>--after-restart</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>AGENT_SYSTEM_LEDGER_DB</key>
+		<string>@LEDGER_DB@</string>
+		<key>AGENT_SYSTEM_PROFILE</key>
+		<string>@PROFILE@</string>
+		<key>HOME</key>
+		<string>@HOME@</string>
+		<key>PATH</key>
+		<string>@PATH@</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>@REPO@</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>600</integer>
+	<key>StandardOutPath</key>
+	<string>@HOME@/agent-scratch/agent-system-2.0/doctor/launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/agent-scratch/agent-system-2.0/doctor/launchd.log</string>
+</dict>
+</plist>

@@ -1,0 +1,16 @@
+#!/bin/sh
+# as2 doctor test fake (surface/test/fixtures/doctor-fakes): logs its argv to $AS2_FAKE_STATE/calls.log and answers
+# from files under $AS2_FAKE_STATE, which surface/test/fixtures/doctor-fakes/state.ts writes. Never runs the real tool.
+S=${AS2_FAKE_STATE:?AS2_FAKE_STATE is not set}
+printf '%s\n' "$(basename "$0") $*" >> "$S/calls.log"
+# ctx daemon status --format json; ctx.mode: fresh | stale | stopped | broken (exit 1); ctx.supervisor: its status.
+mode=$(cat "$S/ctx.mode" 2>/dev/null || echo fresh)
+sup=$(cat "$S/ctx.supervisor" 2>/dev/null || echo installed)
+now=$(( $(date +%s) * 1000 ))
+case $mode in
+  fresh) running=true; last=$(( now - 60000 )) ;;
+  stale) running=true; last=$(( now - 3 * 3600 * 1000 )) ;;
+  stopped) running=false; last=$(( now - 60000 )) ;;
+  *) echo "fake ctx: daemon status failed" >&2; exit 1 ;;
+esac
+printf '{"schema_version":1,"daemon":{"running":%s,"status":"ok","supervisor":{"status":"%s"},"jobs":{"core_refresh":{"last_run_at_ms":%s}}}}\n' "$running" "$sup" "$last"
