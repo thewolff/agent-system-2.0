@@ -122,6 +122,9 @@ gates/src/rows/r10-raw-ledger.ts	module	-
 gates/src/rows/r11-jo-instruction.ts	module	-
 gates/src/rows/r14-ask-policy.ts	module	-
 gates/src/rulings.ts	module	-
+gates/src/routine.ts	module	-
+gates/src/routine-switch.ts	module	-
+gates/src/routine-worker.ts	module	-
 gates/src/session.ts	module	-
 gates/src/shell-parse.ts	module	-
 gates/src/targets.ts	module	-
@@ -131,7 +134,11 @@ gates/src/git-model.ts	module	-
 gates/src/fence.ts	module	-
 gates/test/case-and-noexec.test.ts	test	-
 gates/test/rulings.test.ts	test	-
+gates/test/routine.test.ts	test	-
+gates/test/routine-switch.test.ts	test	-
 gates/test/r06-reserved.test.ts	test	-
+gates/test/r06-floor.test.ts	test	-
+gates/test/routine-gate.test.ts	test	-
 gates/test/r06-land-first.test.ts	test	-
 gates/test/extension.test.ts	test	-
 gates/test/helpers.ts	test	-
@@ -1091,6 +1098,7 @@ surface/test/input.test.ts	test	-
 surface/test/numbering.test.ts	test	-
 surface/test/decision-log.test.ts	test	-
 surface/test/extension.test.ts	test	-
+surface/test/errors.test.ts	test	-
 surface/src/signals.ts	module	-
 surface/src/delivery.ts	module	-
 surface/extensions/lane.ts	module	-
@@ -1155,6 +1163,7 @@ surface/src/merge-train-resolve.ts	module	-
 surface/src/merge-train-stack.ts	module	-
 surface/scripts/merge-train.ts	module	-
 surface/test/merge-train-resolve.test.ts	test	-
+surface/test/merge-train.test.ts	test	-
 surface/test/train-word.test.ts	test	-
 surface/test/merge-train-stack.test.ts	test	-
 surface/test/train-return.test.ts	test	-

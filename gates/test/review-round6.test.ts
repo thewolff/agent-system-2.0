@@ -121,7 +121,8 @@ const COMMANDS: [string, string, string, V][] = [
 	["P09", "", "git apply --build-fake-ancestor=/not-real/ledger.db patch", "REFUSE"],
 	["P09", "B7", "GIT_TRACE=/not-real/ledger.db git status", "REFUSE"],
 	["P09", "", `${RM} -rf /tmp/../not-real`, "REFUSE"],
-	["P09", "", `${RM} --recu --forc /tmp/not-real`, "ALLOW"],
+	// PLAN wl-mvqwn80onq9hq8 D11 removed the temp-path exemption (TEMP_PATH): ALLOW before the floor, REFUSE now.
+	["P09", "", `${RM} --recu --forc /tmp/not-real`, "REFUSE"],
 	["P09", "", `${RM} --recu --forc /not-real`, "REFUSE"],
 	["P09", "", `${RM} -rf /tmp/not-real/../cache`, "REFUSE"],
 	["P09", "", "git reset --h", "REFUSE"],

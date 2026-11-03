@@ -24,7 +24,9 @@
 //   sandbox-exec would exit 71 (fence.ts ALREADY_WRAPPED_REASON). At execute, every fence target of the
 //   command that the pairing profile would still let it write (unprotectedTargets) refuses the run.
 // - A scratch-root exemption (row 6 or 8 marked the call confined) holds only for a run confined to the
-//   scratch root with no network, which the pairing profile is not, so pair_run refuses it.
+//   scratch root with no network, and an auto-applied call (PLAN wl-mvqwn80onq9hq8 D3: marked read-only,
+//   confined or worktree-confined) only for a run under the fence's matching profile, which the pairing
+//   profile is not, so pair_run refuses every marked call.
 // - Where the clean shell is on (src/clean-shell.ts), pair_run must start hook-free: the env the adapter
 //   spawns `/bin/sh` with is this process's (host-io.mjs runSandboxed `opts.env ?? process.env`, and
 //   runVerb passes none), so that env is certified at execute, right before the spawn (pairRunStartReasons),
@@ -37,7 +39,7 @@ import type { CleanShellCheck } from "./clean-shell";
 import { nestedSandboxExec } from "./exec";
 import { ALREADY_WRAPPED_REASON, CLEAN_SHELL_NEEDS_FENCE, cleanShellSwitch, FenceError, type FenceSettings, type FenceTarget, fenceBypassRefusal, fenceTargets, shellStartReason } from "./fence";
 import { WAKE_READ_TOOL } from "./rows/r07-wake-read";
-import { type Ctx, type GatesAPI, isConfined, releaseConfined } from "./session";
+import { callMark, type Ctx, type GatesAPI, releaseConfined } from "./session";
 import { envHookReasons } from "./shell-start";
 import type { ToolCall } from "./types";
 
@@ -170,9 +172,9 @@ export function pairRunStartReasons(env: Record<string, string | undefined>): st
 	return envHookReasons(entries, () => "relaunch as2 from a shell that does not export it (pair_run's /bin/sh starts with this process's env)");
 }
 
-/** Why pair_run refuses a scratch-root exemption. */
+/** Why pair_run refuses a call a rule let through only on condition of the fence's narrower profile (session.ts CallMark). */
 export const PAIR_RUN_CONFINED_REASON =
-	"M4b OS fence: a scratch-root rule let this command through, and that rule holds only for a run confined to the own scratch root with no network; pair_run runs under the pairing sandbox, which is not that confinement, so it is refused. Run it with bash, where the fence confines it.";
+	"M4b OS fence: a scratch-root rule or the auto-apply gate let this command through, and that holds only for a run under the fence's narrower profile (confined to one root, or read-only); pair_run runs under the pairing sandbox, which is not that profile, so it is refused. Run it with bash, where the fence applies it.";
 
 /** Why pair_run refuses a call it could not judge (`why`). */
 const refuse = (why: string) => ({ block: true as const, reason: `M4b OS fence: ${why}; this pair_run is refused rather than run outside the fence's checks.` });
@@ -194,7 +196,7 @@ export function registerPairCalls(pi: GatesAPI, env: Record<string, string | und
 		if (event.toolName === "pair_run") {
 			const bypassed = fenceBypassRefusal(ctx);
 			if (bypassed) return bypassed;
-			if (isConfined(id)) {
+			if (callMark(id)) {
 				// The call ends at this refusal, so its mark goes with it.
 				releaseConfined(id);
 				return { block: true, reason: PAIR_RUN_CONFINED_REASON };
