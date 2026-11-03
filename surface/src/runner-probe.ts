@@ -1,10 +1,13 @@
-// The runner probe (PLAN wl-mw0vs9uc3xqtka D2.3): whether a lane id's runner or omp is still alive, asked of the machine
-// through ps. Moved out of surface/scripts/lane.ts so a reader outside the runner (the alert sources, surface/src/alert-sources.ts:
-// a released lane still alive 5 minutes later) asks the same question the run guard does, with the same identity rules.
-// lane.ts's run guard (`cmdRun`, `liveLaneOf`, `spawnIfReserved`) is cut over to these exports by sl-alert-pass; until then
-// lane.ts keeps its own copy of the same code.
+// The runner probe and the identity lock (PLAN wl-mw0vs9uc3xqtka D2.3, D3): whether a lane id's runner or omp is still alive,
+// asked of the machine through ps, and a lock file whose owner is a pid and its ps start time. Moved out of
+// surface/scripts/lane.ts so readers outside the runner ask the same questions with the same identity rules: the alert
+// sources (surface/src/alert-sources.ts: a released lane still alive 5 minutes later) use the probe, and the alert pass
+// (surface/scripts/alert-tick.ts: one pass at a time) takes its lock with `takeRunnerLock` as the runner takes a lane id's.
+import { linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import type { Ledger } from "../../ledger/src/index";
 import { type ControlEntry, laneStarted } from "./launch";
-import { ompPidState, type PidState, psAnswer, type PsRun, runPs } from "./omp-probe";
+import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "./omp-probe";
 
 /** How the guard asks the machine about a `lane-started:` entry's two pids; the tests pass a fake. */
 export interface RunnerProbe {
@@ -105,3 +108,124 @@ export function runnerProbe(wl: string, laneId: string, run: PsRun = runPs): Run
 	};
 	return p;
 }
+
+// ---- the identity lock: one owner at a time --------------------------------------------------------
+
+/** A runner's identity in its run lock: its pid and that pid's ps start time, so a reused pid never reads as the owner. */
+export interface RunnerIdentity {
+	pid: number;
+	start: string;
+}
+
+/** The lock file's owner: null when there is no file, `unreadable` when its content is not a pid and a start time. */
+function lockOwner(path: string): RunnerIdentity | null | "unreadable" {
+	let text: string;
+	try {
+		text = readFileSync(path, "utf8");
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw err;
+	}
+	try {
+		const o = JSON.parse(text) as { pid?: unknown; start?: unknown };
+		if (typeof o.pid === "number" && Number.isInteger(o.pid) && o.pid > 0 && typeof o.start === "string") return { pid: o.pid, start: o.start };
+	} catch {
+		// not JSON: unreadable, below
+	}
+	return "unreadable";
+}
+
+/**
+ * A run lock this runner took. `held` re-reads the file: true while no other runner holds the lane id, that is while the
+ * file names `self`, or while it is gone (removed under the runner, as with its lane dir) and nobody has taken it since;
+ * false once it names another runner or names none. `owns` is the strict read the spawn needs (`startAsOwner`): true only
+ * while the file exists and names `self`. `release` removes the file only while it names `self`.
+ */
+export interface RunnerLock {
+	path: string;
+	self: RunnerIdentity;
+	/** The stale owner this runner replaced (its pid gone, or reused by a process with another start time), or null. */
+	tookOver: { owner: RunnerIdentity; state: "gone" | "other" } | null;
+	held(): boolean;
+	owns(): boolean;
+	release(): void;
+}
+
+/**
+ * Why `takeRunnerLock` refused: the owner is alive (`same`), alive with no start time to verify it by (`unknown`), ps
+ * could not answer for it (`failed`), the file names no owner (`unreadable`), or a writer outside the protocol created
+ * the file between the read and the link (`raced`). Every one is a refusal, never a takeover.
+ */
+export interface LockRefusal {
+	owner: RunnerIdentity | null;
+	state: "same" | "unknown" | "failed" | "unreadable" | "raced";
+}
+
+function heldLock(path: string, self: RunnerIdentity, tookOver: RunnerLock["tookOver"]): RunnerLock {
+	/** Whether the file names this runner: null when there is no file, false when it names another runner or none. */
+	const mine = (): boolean | null => {
+		try {
+			const o = lockOwner(path);
+			return o === null ? null : o !== "unreadable" && o.pid === self.pid && o.start === self.start;
+		} catch {
+			return false;
+		}
+	};
+	return {
+		path, self, tookOver,
+		held: () => mine() !== false,
+		owns: () => mine() === true,
+		// No other runner replaces a lock whose owner is alive, so the file read as this runner's is still this runner's at the rm.
+		release: () => {
+			if (mine() === true) rmSync(path, { force: true });
+		},
+	};
+}
+
+/**
+ * Take a lane id's run lock at `path` for `self`, or refuse (openai review r2 #1). The file holds the owner's pid and ps
+ * start time and is created exclusively: the identity is written to a file of this pid's own and hard-linked in, so the
+ * lock never exists half-written, and the link fails EEXIST as an O_EXCL create does. An existing lock is taken over
+ * only when `check` (the same pid-and-start-time check an omp gets) reads its owner `gone` or `other`; any other answer
+ * refuses. The read, the check, the takeover and the create all run inside one ledger write: the ledger's BEGIN
+ * IMMEDIATE is the cross-process mutex, so two runners that both find one stale owner cannot both replace it, and the
+ * mutex is never left behind (SQLite drops it when its process dies). Nothing is written to the ledger. A lock that
+ * already names `self` is held (a busy-retried transaction runs this body twice). `check` runs inside the write, so it
+ * must be bounded: the runner's is `runnerProbe` over `runPs`, where a ps past PS_TIMEOUT_MS reads `failed` (a refusal).
+ */
+export function takeRunnerLock(ledger: Pick<Ledger, "write">, path: string, self: RunnerIdentity, check: (pid: number, start: string) => PidState): RunnerLock | LockRefusal {
+	mkdirSync(dirname(path), { recursive: true });
+	return ledger.write((): RunnerLock | LockRefusal => {
+		const owner = lockOwner(path);
+		if (owner === "unreadable") return { owner: null, state: "unreadable" };
+		if (owner !== null && owner.pid === self.pid && owner.start === self.start) return heldLock(path, self, null);
+		let tookOver: RunnerLock["tookOver"] = null;
+		if (owner !== null) {
+			const state = check(owner.pid, owner.start);
+			if (state !== "gone" && state !== "other") return { owner, state };
+			rmSync(path, { force: true });
+			tookOver = { owner, state };
+		}
+		const tmp = `${path}.${self.pid}.tmp`;
+		writeFileSync(tmp, `${JSON.stringify(self)}\n`, { mode: 0o600 });
+		try {
+			linkSync(tmp, path);
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+			const now = lockOwner(path);
+			return { owner: now === "unreadable" ? null : now, state: "raced" };
+		} finally {
+			rmSync(tmp, { force: true });
+		}
+		return heldLock(path, self, tookOver);
+	});
+}
+
+/** This process's identity for its run lock: its pid and its ps start time, read strictly (a ps failure throws). */
+export function selfIdentity(run: PsRun = runPs, pid: number = process.pid): RunnerIdentity {
+	const out = psAnswer(run, pid, "stat=,lstart=");
+	const start = out === null ? "" : statStart(out).start;
+	if (!start) throw new Error(`ps -p ${pid} -o stat=,lstart= answered ${out === null ? "no such process" : `no start time: ${out}`}`);
+	return { pid, start };
+}
+

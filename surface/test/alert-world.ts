@@ -1,0 +1,107 @@
+// The alert pass's test world: a temp ledger on a settable clock, a recording gh over one in-memory jo-issues repository,
+// and recording popup spawn, ps and kill seams. No real gh, popup or signal is ever used.
+import { join } from "node:path";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
+import { fsReportFiles } from "../src/alert-sources";
+import { ensureStandingWorkload } from "../src/identity";
+import { controlEntries, laneExitBody } from "../src/launch";
+import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import type { AlertPassDeps } from "../scripts/alert-tick";
+import { clock, tempLedger, tmp } from "./helpers";
+
+export const T0 = "2026-11-03T10:00:00.000Z";
+export const ISSUE = "https://github.com/thewolff/jo-issues/issues/77";
+
+/** A recording gh over one in-memory jo-issues repository: issues, their comments, labels and state. */
+/** A recording gh over one in-memory jo-issues repository. */
+export interface FakeGh {
+	gh: (args: string[]) => { code: number; stdout: string; stderr: string };
+	calls: string[][];
+	issues: { url: string; body: string; title: string; state: "OPEN" | "CLOSED"; comments: string[]; labels: string[] }[];
+}
+
+export function fakeGh(o: { fail?: (args: string[]) => boolean } = {}): FakeGh {
+	const calls: string[][] = [];
+	const issues: { url: string; body: string; title: string; state: "OPEN" | "CLOSED"; comments: string[]; labels: string[] }[] = [];
+	const labels = new Set(["as2-train"]);
+	const byNum = (n: string) => issues.find((i) => i.url.endsWith(`/${n}`))!;
+	const ok = (stdout: string) => ({ code: 0, stdout, stderr: "" });
+	const gh = (args: string[]) => {
+		calls.push(args);
+		if (o.fail?.(args)) return { code: 1, stdout: "", stderr: "HTTP 502: Bad Gateway" };
+		const [a, b] = args;
+		if (a === "api") return ok(JSON.stringify([issues.map((i) => ({ html_url: i.url, body: i.body }))]));
+		if (a === "label" && b === "list") return ok(JSON.stringify([...labels].map((name) => ({ name }))));
+		if (a === "label" && b === "create") {
+			labels.add(args[2]!);
+			return ok("");
+		}
+		if (a === "issue" && b === "create") {
+			const url = issues.length === 0 ? ISSUE : `https://github.com/thewolff/jo-issues/issues/${77 + issues.length}`;
+			issues.push({ url, body: args[args.indexOf("--body") + 1]!, title: args[args.indexOf("--title") + 1]!, state: "OPEN", comments: [], labels: [args[args.indexOf("--label") + 1]!] });
+			return ok(`${url}\n`);
+		}
+		const i = byNum(args[2]!);
+		if (b === "view") return ok(JSON.stringify({ state: i.state, body: i.body, comments: i.comments.map((body) => ({ body })) }));
+		if (b === "comment") i.comments.push(args[args.indexOf("--body") + 1]!);
+		if (b === "edit") i.labels.push(...args[args.indexOf("--add-label") + 1]!.split(","));
+		if (b === "close") i.state = "CLOSED";
+		return ok("");
+	};
+	return { gh, calls, issues };
+}
+
+/** A ceiling-stopped workload: $50 ceiling, $50.20 spent, the runner's accepted stop and exit, no holder. `brief` decides urgency. */
+export function ceilingStopped(ledger: Ledger, brief: string): string {
+	const wl = ledger.openWorkload({ by: SURFACE_BY, brief, stakes: "normal", mode: "autonomous" });
+	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: "ceiling: usd 50 wall 360 source stakes normal" });
+	ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-t-1 cause first requested-by test" });
+	ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "Move the offset", doneCondition: "bun test passes", inputs: "src/header.css" });
+	ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: "spend: lane-t-1 usd 50.2 tokens 1000 wall 40" });
+	ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: "lane-stop: lane-t-1 accepted ceiling" });
+	ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody("lane-t-1", { code: 0, signal: null, outcome: "stop", reason: "ceiling" }) });
+	return wl;
+}
+
+/** The test world: the ledger and its clock, the fake gh, the pass's deps, and what the popup seams recorded. */
+export interface AlertWorld {
+	c: { now: () => string; at: (iso: string) => void; plusHours: (h: number) => void };
+	ledger: Ledger;
+	g: FakeGh;
+	deps: AlertPassDeps;
+	spawns: { argv: string[]; env: Record<string, string> }[];
+	kills: [number, string][];
+	log: string[];
+	/** The standing workload's `alert:` and `alert-popup:` rows, oldest first. */
+	rows: () => string[];
+}
+
+export function world(o: { fail?: (args: string[]) => boolean; ps?: () => string } = {}): AlertWorld {
+	const c = clock(T0);
+	const { ledger } = tempLedger(c.now);
+	ensureStandingWorkload(ledger);
+	const g = fakeGh(o);
+	const spawns: { argv: string[]; env: Record<string, string> }[] = [];
+	const kills: [number, string][] = [];
+	const log: string[] = [];
+	const deps: AlertPassDeps = {
+		ledger, gh: g.gh, log: (l) => log.push(l),
+		quota: () => ({ subjects: [], log: [], error: null }),
+		sources: { alarmFile: join(tmp("alarm"), "alarm.jsonl"), reportsDir: join(tmp("reports"), "none"), files: fsReportFiles, probe: () => ({ failure: null, omp: () => "gone", runner: () => "gone" }), trainRepo: () => null },
+		popup: {
+			spawn: (argv, env) => {
+				spawns.push({ argv, env });
+				return 4242;
+			},
+			env: { PATH: "/usr/bin:/bin" }, log: join(tmp("alert-log"), "alert-pass.log"),
+			ps: o.ps ?? (() => ""),
+			kill: (pid, sig) => {
+				kills.push([pid, sig]);
+				return true;
+			},
+		},
+	};
+	const rows = () => controlEntries(ledger.entries(STANDING_WORKLOAD_ID)).filter((e) => e.prefix === "alert" || e.prefix === "alert-popup").map((e) => `${e.prefix}: ${e.rest}`);
+	return { c, ledger, g, deps, spawns, kills, log, rows };
+}
+

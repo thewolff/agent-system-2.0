@@ -32,7 +32,7 @@
  *      when no lane-lab entry is usable and one is out on an exhausted week (`HeadroomDecision`
  *      `exhausted`), the hand moves to the first usable entry of its tier row on another lab, records
  *      `hand-headroom:` and the `quota-move:` message (surface/src/quota-move-alert.ts) with its
- *      `hand-spawn:`, and the move alert is spawned. A 5h-only or week-pace-only out is refused. A
+ *      `hand-spawn:`, and the alert pass is kicked (surface/src/notify.ts `kickAlerts`). A 5h-only or week-pace-only out is refused. A
  *      review plans on `reviewRow` and the cross-lab rule instead. Headroom skips quota-out entries
  *      and writes one `headroom-skip:` per skip. A week-pace-only source can be retained against a
  *      faster-burning available configured budget (PLAN wl-mv958y95fk07wg, Policy B), with its
@@ -287,7 +287,8 @@ import { identity, loadTierTable, modelIdentity, type TierTable } from "./src/ti
 import { controlEntries, holdersOf, type LaneStarted, laneStarted, planFirst, planSlice } from "../surface/src/launch";
 import { ompPidState, type PidState } from "../surface/src/omp-probe";
 import { NOTICE_PREFIX } from "../surface/src/notice";
-import { quotaMoveSubject, recordQuotaMove, spawnMoveAlert } from "../surface/src/quota-move-alert";
+import { kickAlerts } from "../surface/src/notify";
+import { quotaMoveSubject, recordQuotaMove } from "../surface/src/quota-move-alert";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../surface/src/types";
 import {
 	PAIR_OPTION, type PairLedger, type PairSignalId, pairExposureBody, pairOffer, pairOfferBody, pairSignalBody, pairSignalFailedBody, pairSuggestOn,
@@ -343,11 +344,11 @@ export interface ClassifierDeps {
 	/** Lost-hand settle (D2): when the file at `path` was last written (ms since the epoch), or null when it does not exist. Production: `statSync(path).mtimeMs`. */
 	lastWrite(path: string): number | null;
 	/**
-	 * PLAN wl-mvwk0v0gmp6cjc D6: start the move alert for a recorded hand move (event entry `eventId` on `workloadId`).
-	 * Production: surface/src/quota-move-alert.ts `spawnMoveAlert` with its detached spawner; tests inject a fake spawner.
-	 * Returns the worker's pid, or null when nothing was spawned; throws when even the failure could not be recorded.
+	 * PLAN wl-mw0vs9uc3xqtka D3: start the alert pass now, after a recorded hand move (`why` names it). Production:
+	 * surface/src/notify.ts `kickAlerts` with its detached spawner; tests inject a fake. Returns the pass's pid; throws
+	 * when it could not be started (the train tick's next pass raises the move).
 	 */
-	spawnMoveAlert?(ledger: Ledger, workloadId: string, eventId: string): number | null;
+	kickAlerts?(why: string): number;
 }
 
 /** One classified tier item, waiting for its spawn. */
@@ -2940,11 +2941,11 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						}
 						const eventId = event.id;
 						if (eventId === undefined) throw new Error(`the move of ${subject} off ${move.from} was not recorded on ${move.workloadId}`);
-						// The move is recorded: a worker that cannot be started is logged, never fatal; the train tick finds the alert unstarted.
+						// The move is recorded: a pass that cannot be started is logged, never fatal; the train tick's next alert pass raises it.
 						try {
-							(deps.spawnMoveAlert ?? spawnMoveAlert)(ledger, move.workloadId, eventId);
+							(deps.kickAlerts ?? kickAlerts)(`quota move ${eventId}`);
 						} catch (error) {
-							log(`agent-system-2 classifier: move alert ${eventId} on ${move.workloadId} (${subject} ${move.from} -> ${move.to}) not started: ${message(error)}; the train tick spawns it once the alert reads unstarted`);
+							log(`agent-system-2 classifier: move ${eventId} on ${move.workloadId} (${subject} ${move.from} -> ${move.to}): ${message(error)}`);
 						}
 						const moved = `moved off the ${lane} to ${move.to}: ${move.reason} (hand-headroom ${eventId}, alert to Jo; Jo, in-mvwl9tkmsym86o)`;
 						return { model: models, note: routingNote(found?.routing ?? null, tier, models, skipped, [...(found?.note ? [found.note] : []), lane, moved, ...(move.retained ? [move.retained] : [])]) };

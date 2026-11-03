@@ -135,6 +135,7 @@ import {
 	attemptBlock, attribute, CHAIN_MAX, type ChainCommit, type GateDecision, type GateFacts, ghMainChain, mainResults, type MainState, mainState, mainVerdicts, type MainVerdictKind, mergeGate,
 	runnerPreflightBody,
 } from "../src/main-state";
+import { stopIssueUrl } from "../src/alert-path";
 import { type ControlRoot, controlRootRefusal, FULL_SUITE_STATUS, fixBindings, fixBinds, ghCompare, type LandFirstRow, landFirstRows, stopEpisode, trainHold, trainPrs } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
@@ -777,13 +778,17 @@ function incidentRepair(gh: Gh, ledger: Ledger, repo: string, pr: number, ref: s
 	return namedFix(gh, ledger, repo, pr) ? "fix" : null;
 }
 /**
- * PR `pr` is the fix the open stop episode's issue names (§ 2 The merge gate, D7): a line of the issue's body or a comment that says
- * `fix` and names `#<pr>` or `/pull/<pr>`. False with no open episode or no filed issue. Throws when GitHub cannot answer.
+ * PR `pr` is the fix the open stop episode's incident issue names (§ 2 The merge gate, D7): a line of the issue's body or a
+ * comment that says `fix` and names `#<pr>` or `/pull/<pr>`. The incident issue is `stopIssueUrl`'s (PLAN wl-mw0vs9uc3xqtka
+ * D2.4): a legacy episode's filed issue, else the `main:<repo>` alert episode's issue open while the stop is open. False with
+ * no open episode or no such issue. Throws when GitHub cannot answer.
  */
 export function namedFix(gh: Gh, ledger: Ledger, repo: string, pr: number): boolean {
-	const ep = stopEpisode(landFirstRows(ledger.entries(STANDING_WORKLOAD_ID), repo));
-	if (ep?.filed == null) return false;
-	const v = ghJsonOf(gh, ["issue", "view", ep.filed, "--json", "body,comments"]);
+	const entries = ledger.entries(STANDING_WORKLOAD_ID);
+	const ep = stopEpisode(landFirstRows(entries, repo));
+	const url = ep === null ? null : stopIssueUrl(entries, repo, ep);
+	if (url === null) return false;
+	const v = ghJsonOf(gh, ["issue", "view", url, "--json", "body,comments"]);
 	const comments = field(v, "comments");
 	const texts = [field(v, "body"), ...(Array.isArray(comments) ? comments.map((c) => field(c, "body")) : [])].filter((t): t is string => typeof t === "string");
 	const names = new RegExp(`\\bfix\\b.*(?:#|/pull/)${pr}\\b`, "i");
