@@ -12,7 +12,7 @@ import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "
 import type { Subprocess } from "bun";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { Ledger, LiveLedgerUnderTestError, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { KILL_GRACE_MS, renderExecWrapper, SWEEP_LOCK_WAIT_MS } from "../src/as2test";
@@ -2568,21 +2568,68 @@ test("command completion does not wait for an exited child's inherited pipes", a
 	const helper = join(root, "holder.ts");
 	const release = join(root, "release");
 	const pidFile = join(root, "holder.pid");
+	const errFile = join(root, "holder.stderr");
+	const statusFile = join(root, "holder.status");
 	expect(Bun.spawnSync(["/usr/bin/mkfifo", release]).exitCode).toBe(0);
-	// It records its pid, then blocks opening the FIFO for reading until the test writes it: the pipe stays open until then.
-	writeFileSync(helper, `import { readFileSync, writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nreadFileSync(${JSON.stringify(release)});\n`);
+	// It opens the FIFO read-write (which returns at once), records its pid, then blocks reading the FIFO until the test writes
+	// it: the pipe stays open until then, and while it lives the FIFO has a reader, so the release's nonblocking open finds one.
+	writeFileSync(helper, `import { openSync, readSync, writeFileSync } from "node:fs";\nconst gate = openSync(${JSON.stringify(release)}, "r+");\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nreadSync(gate, Buffer.alloc(1), 0, 1, null);\n`);
+	// A shell between the command and the helper keeps the helper's stderr and, once it has reaped it, its exit status (renamed
+	// in whole), so a helper that dies is reported; the shell holds the command's stdout and stderr as well.
+	const holder = ["/bin/sh", "-c", `"$1" "$2" 2>"$3"; echo "$?" >"$4.tmp" && /bin/mv "$4.tmp" "$4"`, "holder", process.execPath, helper, errFile, statusFile];
+	const statusOf = () => existsSync(statusFile) && readFileSync(statusFile, "utf8").trim();
+	const stderrOf = () => (existsSync(errFile) ? readFileSync(errFile, "utf8") : `(no ${errFile})`);
+	const messageOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+	/** Let the helper through with one byte into the FIFO, opened without blocking, and see it exit 0 before afterAll removes its directory. */
+	const releaseHolder = async (): Promise<void> => {
+		const ready = await until("the holder's pid, or its exit status", () => {
+			const pid = existsSync(pidFile) && Number(readFileSync(pidFile, "utf8"));
+			if (pid) return { pid };
+			const status = statusOf();
+			return status ? { status } : false;
+		});
+		if (!("pid" in ready)) throw new Error(`the holder exited (its shell reports exit status ${ready.status}) before recording its pid in ${pidFile}; stderr: ${stderrOf()}`);
+		const { pid } = ready;
+		let fd: number;
+		try {
+			fd = openSync(release, constants.O_WRONLY | constants.O_NONBLOCK);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENXIO") throw error;
+			// No reader: the helper opened the FIFO before recording its pid and keeps it open until written, so it is gone.
+			let status: string;
+			try {
+				status = await until(`the exit status of the holder (pid ${pid}), gone with no reader at ${release}`, statusOf);
+			} catch (statusError) {
+				status = `unknown (${messageOf(statusError)})`;
+			}
+			throw new Error(`releasing the holder (pid ${pid}): ${release} has no reader, so the holder is gone; its shell reports exit status ${status}; stderr: ${stderrOf()}`, { cause: error });
+		}
+		try {
+			writeSync(fd, "\n");
+		} finally {
+			closeSync(fd);
+		}
+		const status = await until(`the exit status of the holder (pid ${pid}) after its release`, statusOf);
+		expect({ pid, status, stderr: stderrOf() }).toEqual({ pid, status: "0", stderr: "" });
+	};
+	let failure: { error: unknown } | null = null;
 	try {
 		// A wait on the open pipe would never end before the release below: it would time out at 200 ms and throw instead.
-		const result = await run([process.execPath, "-e", `Bun.spawn([process.execPath, ${JSON.stringify(helper)}], {stdout: "inherit", stderr: "inherit", stdin: "ignore"}).unref(); console.log("done");`], {
+		const result = await run([process.execPath, "-e", `Bun.spawn(${JSON.stringify(holder)}, {stdout: "inherit", stderr: "inherit", stdin: "ignore"}).unref(); console.log("done");`], {
 			cwd: root, env: GIT_ENV, timeoutMs: 200,
 		});
 		expect(result).toMatchObject({ code: 0, out: "done\n", err: "" });
-	} finally {
-		// Release the helper and see it gone before afterAll removes its directory.
-		const pid = await until("the holder's pid", () => existsSync(pidFile) && Number(readFileSync(pidFile, "utf8")));
-		writeFileSync(release, "go");
-		await until("the holder gone", () => !alive(pid));
+	} catch (error) {
+		failure = { error };
 	}
+	// The release runs whatever the case's outcome; its failure never hides the case's own.
+	try {
+		await releaseHolder();
+	} catch (error) {
+		if (failure) throw new AggregateError([failure.error, error], `the case failed (${messageOf(failure.error)}), and releasing its holder failed too: ${messageOf(error)}`);
+		throw error;
+	}
+	if (failure) throw failure.error;
 });
 
 for (const point of ["head-recheck", "result"]) {

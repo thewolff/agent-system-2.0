@@ -8,6 +8,7 @@
 // the process groups that wrapper started. The refresh helper is rendered as a test render
 // (`buildUser: null`, `asRoot: false`, a local bare origin) into a tmp libexec. The setup script
 // runs with fake dscl, sudo and visudo under AS2TEST_SETUP_TEST_PREFIX; real sudo is never called.
+import { dlopen, FFIType, read } from "bun:ffi";
 import { Database } from "bun:sqlite";
 import { afterAll, test as bunTest, describe, expect } from "bun:test";
 import * as childProcess from "node:child_process";
@@ -164,6 +165,76 @@ function ownedIn(o: Owned, procs: Proc[]): OwnedNow {
 	return { pids: [...mine.values()], groups, unproven };
 }
 
+/** One member of a process group, of any uid. */
+interface Member {
+	pid: number;
+	ppid: number;
+	uid: number;
+	zombie: boolean;
+	comm: string;
+}
+/**
+ * struct kinfo_proc on arm64 macOS, as stuck-detect.ts reads it, plus kp_eproc.e_ucred.cr_uid (the effective uid) at 420:
+ * offsetof() from the SDK's sys/sysctl.h, read off `clang -arch arm64 -S` (2026-11-03). KERN_PROC_PGRP is 2.
+ */
+const KINFO = { size: 648, stat: 36, pid: 40, comm: 243, commLen: 17, uid: 420, ppid: 560, pgid: 564, szomb: 5, procPgrp: 2 } as const;
+let sysctlLib: { sysctl: (name: Int32Array, namelen: number, oldp: Uint8Array | null, oldlenp: BigUint64Array, newp: null, newlen: bigint) => number; __error: () => number | null } | undefined;
+/**
+ * Every process in group `pgid` now, of any uid, zombies included: sysctl {CTL_KERN, KERN_PROC, KERN_PROC_PGRP, pgid}
+ * (xnu walks PROC_ALLPROCLIST | PROC_ZOMBPROCLIST for it). `processes` lists only this user's; a group may hold another's.
+ */
+function groupMembers(pgid: number): Member[] {
+	sysctlLib ??= dlopen("/usr/lib/libSystem.B.dylib", {
+		sysctl: { args: [FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u64], returns: FFIType.i32 },
+		__error: { args: [], returns: FFIType.ptr },
+	}).symbols as unknown as NonNullable<typeof sysctlLib>;
+	const l = sysctlLib;
+	const fail = (step: string) => {
+		const e = l.__error();
+		return new Error(`sysctl(KERN_PROC_PGRP, ${pgid}) ${step}: errno ${e ? read.i32(e as never, 0) : "unreadable"}`);
+	};
+	const mib = new Int32Array([1, 14, KINFO.procPgrp, pgid]);
+	const len = new BigUint64Array([0n]);
+	if (l.sysctl(mib, mib.length, null, len, null, 0n) !== 0) throw fail("size probe");
+	// Headroom for members that join between the probe and the read; more than that is ENOMEM, an error.
+	const cap = Number(len[0]) + KINFO.size * 32;
+	const buf = new Uint8Array(cap);
+	len[0] = BigInt(cap);
+	if (l.sysctl(mib, mib.length, buf, len, null, 0n) !== 0) throw fail("read");
+	const n = Number(len[0]);
+	if (n % KINFO.size !== 0) throw new Error(`sysctl(KERN_PROC_PGRP, ${pgid}) returned ${n} bytes, not a multiple of the ${KINFO.size}-byte kinfo_proc`);
+	const dv = new DataView(buf.buffer, 0, n);
+	const out: Member[] = [];
+	for (let o = 0; o < n; o += KINFO.size) {
+		const comm = buf.subarray(o + KINFO.comm, o + KINFO.comm + KINFO.commLen);
+		const nul = comm.indexOf(0);
+		out.push({
+			pid: dv.getInt32(o + KINFO.pid, true), ppid: dv.getInt32(o + KINFO.ppid, true), uid: dv.getUint32(o + KINFO.uid, true),
+			zombie: dv.getInt8(o + KINFO.stat) === KINFO.szomb, comm: Buffer.from(comm.subarray(0, nul < 0 ? comm.length : nul)).toString("latin1"),
+		});
+		if (dv.getInt32(o + KINFO.pgid, true) !== pgid) throw new Error(`sysctl(KERN_PROC_PGRP, ${pgid}) listed pid ${out.at(-1)!.pid} of group ${dv.getInt32(o + KINFO.pgid, true)}: the kinfo_proc layout is not the one this reads`);
+	}
+	return out;
+}
+
+/**
+ * The EPERM a killpg(`g`) gave, judged by the group's members right after it. xnu's killpg1 skips a group's zombies and
+ * counts only the members it may signal, so EPERM means the group exists and holds no live member this process may
+ * signal. When every member is a zombie (it has exited and awaits its parent's reap: the sweep case's orphan, SIGKILLed by
+ * pid, before launchd reaps it) there is nothing left to kill: null. Any other EPERM (a live member of another uid) is an
+ * error naming the group's members, their uids and states; a failed listing is one too, the EPERM kept beside it.
+ */
+function groupEperm(g: number, eperm: unknown): Error | null {
+	let members: Member[];
+	try {
+		members = groupMembers(g);
+	} catch (listing) {
+		return new AggregateError([eperm, listing], `${messageOf(eperm)}, and listing the group's members to judge it failed: ${messageOf(listing)}`);
+	}
+	if (members.every((p) => p.zombie)) return null;
+	return new Error(`${messageOf(eperm)}; the group holds a member that is not a zombie, so the EPERM is real. Its members: ${members.map((p) => `${p.pid} (${p.comm}, uid ${p.uid}, parent ${p.ppid}, ${p.zombie ? "zombie" : "live"})`).join(", ")}`, { cause: eperm });
+}
+
 /** At most this many looks at the process list after the kill, each after awaiting the exit of every member it still saw. */
 const RELEASE_LOOKS = 3;
 
@@ -185,13 +256,18 @@ async function release(o: Owned, keep: boolean): Promise<{ errors: Error[]; kept
 		failed("reading what the case owns from the process list", error);
 	}
 	for (const u of owned.unproven) failed("an owned process group", new Error(u));
+	// Killed, or proved to hold nothing left to kill (`groupEperm`): the verification below checks each the same way.
 	const killedGroups: number[] = [];
 	for (const g of owned.groups) {
 		try {
 			process.kill(-g, "SIGKILL");
 			killedGroups.push(g);
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ESRCH") failed(`SIGKILL process group ${g}`, error);
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ESRCH") continue;
+			const why = code === "EPERM" ? groupEperm(g, error) : error;
+			if (why === null) killedGroups.push(g);
+			else failed(`SIGKILL process group ${g}`, why);
 		}
 	}
 	const live = (p: { exitCode: number | null; signalCode: string | null }) => p.exitCode === null && p.signalCode === null;
@@ -2945,6 +3021,64 @@ describe("sweep", () => {
 		for (const bad of [{ detectTickMs: 0 }, { detectPersistMs: -1 }, { stopGraceMs: 1.5 }, { detectTrace: "yes" as unknown as boolean }, { detectFeed: "yes" as unknown as boolean }, { detectFeed: true }]) {
 			expect(() => execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", ...bad })).toThrow(WrapperRenderError);
 		}
+	});
+});
+
+// ---- the case's release: killpg's EPERM ---------------------------------------------------------------------
+
+describe("the case's release: a killpg EPERM", () => {
+	// The hosted macOS run 41601934515 failed "a sweep whose current changed during the grace aborts before SIGKILL" in its
+	// release: the body SIGKILLs the orphan by pid, the release saw it as a zombie in its own group before launchd reaped it,
+	// and killpg of a group holding only zombies is EPERM on darwin (xnu bsd/kern/kern_sig.c, killpg1).
+	test("a group whose only member is a zombie awaiting its parent's reap is released, its zombie and parent left as they were", async () => {
+		// sh's job control puts the background /usr/bin/true in a group of its own; sh then execs sleep, which never reaps it.
+		const parent = Bun.spawn(["/bin/sh", "-c", "set -m; /usr/bin/true & echo $!; exec /bin/sleep 300"], { stdin: "ignore", stdout: "pipe", stderr: "inherit" });
+		own(parent.pid);
+		const reader = parent.stdout.getReader();
+		let line = "";
+		while (!line.includes("\n")) {
+			const chunk = await reader.read();
+			if (chunk.done) throw new Error(`the zombie's parent (pid ${parent.pid}) closed its stdout before naming the zombie: ${JSON.stringify(line)}`);
+			line += new TextDecoder().decode(chunk.value);
+		}
+		reader.releaseLock();
+		const z = Number(line.trim());
+		await exitOf(z);
+		const zombie = processes(`the zombie ${z}`).find((p) => p.pid === z);
+		expect(zombie).toMatchObject({ zombie: true, pgid: z, ppid: parent.pid });
+		expect(groupMembers(z)).toEqual([{ pid: z, ppid: parent.pid, uid: process.getuid!(), zombie: true, comm: "true" }]);
+		let eperm: unknown;
+		try {
+			process.kill(-z, "SIGKILL");
+		} catch (error) {
+			eperm = error;
+		}
+		expect((eperm as NodeJS.ErrnoException | undefined)?.code).toBe("EPERM");
+		// A release owning only the zombie: its group is the one killed, as the sweep case's was.
+		const o: Owned = { name: "a zombie-only group", dirs: [], subprocs: [], procs: [{ pid: z, started: zombie!.startUs }], groups: [], gates: [], hooks: [] };
+		expect(ownedIn(o, processes("the zombie's owner")).groups).toEqual([z]);
+		expect(await release(o, false)).toEqual({ errors: [], kept: false });
+		expect(processes(`the zombie ${z} after the release`).find((p) => p.pid === z)).toMatchObject({ zombie: true, ppid: parent.pid });
+		expect(alive(parent.pid)).toBe(true);
+	}, 30_000);
+
+	test("an EPERM over a group with a live member of another uid stays an error naming the group's members, their uids and states", () => {
+		const root = snapshot(0);
+		if (root.kind !== "ok") throw new Error(`root's process list is ${root.kind}: ${root.why}`);
+		// The oldest root group leader but launchd, a daemon that outlives the case; signal 0 delivers nothing.
+		const leader = root.procs.filter((p) => p.pid > 1 && p.pgid === p.pid && !p.zombie).sort((a, b) => a.startUs - b.startUs)[0];
+		if (leader === undefined) throw new Error("root's process list holds no process group leader but launchd");
+		let eperm: unknown;
+		try {
+			process.kill(-leader.pgid, 0);
+		} catch (error) {
+			eperm = error;
+		}
+		expect((eperm as NodeJS.ErrnoException | undefined)?.code).toBe("EPERM");
+		const why = groupEperm(leader.pgid, eperm);
+		expect(why?.message).toContain("EPERM");
+		expect(why?.message).toContain(`${leader.pid} (${leader.comm}, uid 0, parent ${leader.ppid}, live)`);
+		expect(why?.cause).toBe(eperm);
 	});
 });
 
