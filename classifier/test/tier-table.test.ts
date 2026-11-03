@@ -33,10 +33,11 @@ const problemsOf = (fn: () => unknown): string[] => {
 describe("profile template tier table", () => {
 	test("the shipped template parses and every tier has a row led by its ruled pin", () => {
 		const table = loadTierTable(TEMPLATE);
-		// SPEC-2.0.md § A1.3: today fast=haiku-5-5, standard=sonnet-5-5 (Jo, 2026-09-29), strong=opus-5-5, deep=fable-5-1.
+		// SPEC-2.0.md § A1.3: today fast=haiku-5-5, standard=sonnet-5-5 (Jo, 2026-09-29), strong=opus-5-5 at medium effort
+		// (Jo, in-mv8gcb2bbue4g0), deep=fable-5-1.
 		expect(table.fast[0]).toBe("anthropic/claude-haiku-5-5");
 		expect(table.standard[0]).toBe("anthropic/claude-sonnet-5-5");
-		expect(table.strong[0]).toBe("anthropic/claude-opus-5-5");
+		expect(table.strong[0]).toBe("anthropic/claude-opus-5-5:medium");
 		expect(table.deep[0]).toBe("anthropic/claude-fable-5-1");
 		// SPEC-2.0.md § B11: each row spreads across the flat-rate providers. Kimi is off the rows until
 		// Jo pays Moonshot (migration/items/kimi-off-tier-rows-until-paid.md restores the three-provider assertion).

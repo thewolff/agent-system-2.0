@@ -55,9 +55,14 @@
 //   in force as a context message, and at turn start and each final turn end Jo gets one pane line (ctx.ui.notify) per
 //   further 25 % of the original ceiling (surface/src/ceiling.ts pairedSpendStep), past 100 % too. The session-file
 //   offsets live in this session's state, so each measure reads only what OMP wrote since the last one.
+// - Opus at medium (PLAN-p2 rev 4 § 2.3, Jo's in-mv8gcb2bbue4g0): at each prompt a bound lane reads its current model;
+//   the first prompt of each entry to anthropic/claude-opus-5-5 (by identity) calls pi.setThinkingLevel("medium") and
+//   writes one `thinking-level:` entry, or one `thinking-level-failed:` entry when the setter is missing or throws.
+//   A level Jo sets while the lane stays on that entry is kept; other models are untouched.
 import { spawnSync } from "node:child_process";
 import { lstatSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { identity } from "../../classifier/src/tier-table";
 import { homeDir, type InstructionRow, type Ledger, type SliceRow } from "../../ledger/src/index";
 import { canonicalCall, canonicalResult } from "../../gates/src/pair-call";
 import { SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
@@ -106,6 +111,11 @@ interface LaneState {
 	scratchNotice: string | null;
 	/** The paired spend meter: null until the first measure reads the lane's `launch:` entry, false for a lane not started by hand. */
 	paired: { offsets: Map<string, number>; tally: Spend; pane: PairedState } | false | null;
+	/**
+	 * The Opus effort rule's flag, one per model-entry epoch (PLAN-p2 rev 4 § 2.3, Jo's in-mv8gcb2bbue4g0): a prompt on any
+	 * other model arms it; a prompt on OPUS_MEDIUM_MODEL while armed sets medium and disarms it. Starts armed.
+	 */
+	opusArmed: boolean;
 }
 const STORE = Symbol.for("agent-system-2.0/surface/lane-state");
 type Store = WeakMap<object, LaneState>;
@@ -117,7 +127,7 @@ function laneState(ctx: Ctx): LaneState {
 		st = {
 			waits: new Map(), renewing: false, released: false, timer: null, delivered: new Set(), primed: false, pollTimer: null, trees: new Map(), testRuns: new Set(), deadRuns: new Set(),
 			trainTasks: new Set(),
-			scratchMeasuredAt: null, scratchNotice: null, paired: null,
+			scratchMeasuredAt: null, scratchNotice: null, paired: null, opusArmed: true,
 		};
 		store.set(ctx.sessionManager, st);
 	}
@@ -143,6 +153,20 @@ const SPEND_TYPE = "lane-spend";
 export const SCRATCH_MEASURE_MS = 5 * 60_000;
 /** The bound on one `du -sk`; past it du is killed and nothing is written. */
 export const SCRATCH_DU_MS = 5_000;
+
+/**
+ * Jo's in-mv8gcb2bbue4g0 (PLAN-p2 rev 4 § 2.3): a lane on this model, by identity, runs at OPUS_LANE_LEVEL once per entry to
+ * it; other models keep their level. Hands get the same level from the strong row's `:medium` selector (profile/config.yml).
+ */
+export const OPUS_MEDIUM_MODEL = "anthropic/claude-opus-5-5";
+export const OPUS_LANE_LEVEL = "medium";
+/** The ledger entry for a lane put at OPUS_LANE_LEVEL on entering `model`. */
+export const thinkingLevelSetBody = (model: string): string =>
+	`thinking-level: ${model} entered; set ${OPUS_LANE_LEVEL} (Jo's in-mv8gcb2bbue4g0); a level set while on this entry is kept`;
+/** The ledger entry for a lane whose setThinkingLevel failed on entering `model`: the level is left as it was. */
+export const thinkingLevelFailedBody = (model: string, why: string): string =>
+	`thinking-level-failed: ${model} entered; pi.setThinkingLevel("${OPUS_LANE_LEVEL}") failed: ${why}; the level is left as it was. ` +
+	"Next step: check ExtensionAPI.setThinkingLevel in the installed OMP (pi-coding-agent extensibility/extensions/types.ts).";
 
 /** `du -sk <root>` in KiB, bounded to `timeoutMs`; null when du cannot run, is killed, or prints no size (a missing root). */
 export function scratchKib(root: string, timeoutMs = SCRATCH_DU_MS): number | null {
@@ -559,6 +583,41 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 		const content = st.scratchNotice;
 		st.scratchNotice = null;
 		return { message: { customType: SCRATCH_TYPE, content, display: true } };
+	});
+
+	/**
+	 * Opus at medium for lanes (PLAN-p2 rev 4 § 2.3): the session's model is read at each prompt, so the runner's headroom
+	 * `set_model` move and Jo's later model changes are covered. A prompt on another model (or none) arms the flag; one on
+	 * OPUS_MEDIUM_MODEL while armed sets OPUS_LANE_LEVEL, records it and disarms, so a level Jo sets while staying on that
+	 * entry is kept. A missing or throwing setter is recorded and notified, and the lane goes on at its current level. Limit:
+	 * Opus → other → Opus with no prompt between is not seen (OMP has no model-change event); the level is then kept.
+	 */
+	pi.on("before_agent_start", (_event, ctx) => {
+		const s = gateSession(ctx, env);
+		const st = laneState(ctx);
+		if (!s.bound || st.released) return undefined;
+		const model = ctx.model ? identity(`${ctx.model.provider}/${ctx.model.id}`) : null;
+		if (model !== OPUS_MEDIUM_MODEL) {
+			st.opusArmed = true;
+			return undefined;
+		}
+		if (!st.opusArmed) return undefined;
+		st.opusArmed = false;
+		let body: string;
+		try {
+			if (typeof pi.setThinkingLevel !== "function") throw new Error("the host's extension API has no setThinkingLevel");
+			pi.setThinkingLevel(OPUS_LANE_LEVEL);
+			body = thinkingLevelSetBody(model);
+		} catch (err) {
+			body = thinkingLevelFailedBody(model, String(err).replace(/\s+/g, " "));
+			ctx.ui.notify(body, "warning");
+		}
+		try {
+			s.ledger().recordEntry({ by: s.laneId, workloadId: s.workloadId!, kind: "assumption", body });
+		} catch (err) {
+			warn(ctx, `agent start: the entry "${body}"`, err);
+		}
+		return undefined;
 	});
 
 	pi.on("session_shutdown", (_e, ctx) => {

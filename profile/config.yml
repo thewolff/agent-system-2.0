@@ -56,11 +56,20 @@ hideThinkingBlock: true
 # (pi-coding-agent src/config/compaction-threshold.ts matchModelCompactionThreshold), so
 # "kimi-k2.*" covers k2.5, k2.6 and k2.7-code*, and not kimi-k2-* previews or kimi-k3 (1M window,
 # compacts at 25%). Reversal: delete the map.
+# "anthropic/claude-haiku-5-5" (Jo, in-mv8gcb2bbue4g0: a per-model threshold before a tier runs Haiku 5.5;
+# the fast row moved to it on 2026-10-26): `omp models` (OMP 18.8.6, 2026-11-03) lists claude-haiku-5-5 at 1M
+# context, 128K max-out, and https://platform.claude.com/docs/en/about-claude/models/overview.md (fetched
+# 2026-11-03) gives Claude Haiku 5.5 a "Context window" of "1M tokens". 250000 is the 25% default point at
+# that window, set explicitly as Jo asked: below the usable window (1M minus OMP's 15% reserve, 850000) and
+# above the ~93K lane floor after compaction given above, the floor bound used for a fast hand too (a hand's
+# own floor was not measured). An exact key wins over any prefix (matchModelCompactionThreshold). Reversal:
+# delete the entry.
 compaction:
   thresholdPercent: 25
   methodOrder: [shake, remote, snapcompact, handoff, soft]
   modelThresholds:
     "moonshot/kimi-k2.*": 180000
+    "anthropic/claude-haiku-5-5": 250000
 # extendedContext (Jo, 2026-10-13): openai-codex gpt-6-* and gpt-6.1-sol run their extended ~872-922K window instead
 # of 272K (omp settings.md "extendedContext"), so they compact at 25% like the 1M Claude models and
 # need no modelThresholds entry. Costs more Codex usage per request. Reversal: set false.
@@ -238,8 +247,13 @@ task:
     standard:
       - anthropic/claude-sonnet-5-5
       - openai-codex/gpt-6-luna
+    # Opus hands run at medium effort (Jo, in-mv8gcb2bbue4g0): OMP takes an explicit `:level` suffix on the
+    # resolved pattern over the agent definition's default (pi-coding-agent task/executor.ts, "explicit `:level`
+    # suffix" precedence; task.enableEffort is off, so no caller effort overrides it). Every consumer compares the
+    # row by identity (classifier/src/tier-table.ts modelIdentity). Lanes on Opus get medium from
+    # surface/extensions/lane.ts. Reversal: drop `:medium`.
     strong:
-      - anthropic/claude-opus-5-5
+      - anthropic/claude-opus-5-5:medium
       - openai-codex/gpt-6.1-sol
     # Deep reviews substitute the OpenAI reviewer from this strong row (Jo, 2026-10-12,
     # in-mv5qfm8910ycjk), until the review-cost framework workload lands or Jo says otherwise.
