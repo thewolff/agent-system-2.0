@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handSettledBody, handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
-import { controlEntries, exitClass, holdersOf } from "../src/launch";
+import { controlEntries, exitClass, holdersOf, laneReceipt } from "../src/launch";
 import { laneDeaths } from "../src/signals";
 import { TRAIN_DONE } from "../src/merge-train";
 import {
@@ -611,5 +611,45 @@ describe("turn end: a self-released lane and a standing receipt (PLAN wl-mvidsu8
 		l.renewLease(wl, { by: LANE_RUNNER_BY, holder: LANE, leaseMs: 60_000 });
 		expect(turnEndModule.selfReleased(l.holderChanges(wl), LANE)).toBe(true);
 		l.close();
+	});
+
+	// PLAN wl-mw0ytmzi89d683: #424's released-idle meets #304's self-release. A train lane that found nothing runnable writes
+	// `released-idle:` and releases itself while omp is still unsettled and a hand it spawned has no result: the release skips
+	// the wait and the hands, and lands on the quiet release, never a death.
+	test("a train lane that wrote released-idle: and released itself, omp unsettled, a hand unsettled: released, no death line", () => {
+		const { ledger, wl } = held();
+		expect(ledger.claimWorkload(wl, { by: LANE, holder: LANE, leaseMs: 60_000 }).won).toBe(true);
+		ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body: releasedIdleBody(LANE, 1) });
+		expect(ledger.releaseWorkload(wl, { by: LANE, holder: LANE }).released).toBe(true);
+		const entries = ledger.entries(wl);
+		const control = controlEntries(entries, holdersOf(entries, ledger.workload(wl)!.holder, ledger.holders(wl)));
+		const { i, calls } = input({
+			settled: false, held: false, unsettledHands: [HAND], releasedOpen: releasedOpen(control, LANE), releasedIdle: releasedIdle(control, LANE),
+			selfReleased: turnEndModule.selfReleased(ledger.holderChanges(wl), LANE), receipt: laneReceipt(entries, holdersOf(entries, null, ledger.holders(wl)), true),
+		});
+		expect([i.releasedIdle, i.selfReleased, i.releasedOpen, i.receipt]).toEqual([true, true, null, false]);
+		const t = turnEnd(i);
+		expect(t.decision).toBe("released");
+		expect(turnEndDeathBody(LANE, t, i)).toBeNull();
+		expect(calls).toHaveLength(1);
+		expect(exitClass(control, LANE)).toBe("intended");
+	});
+
+	// PLAN wl-mw0ytmzi89d683 F3: a merge train is permanent, so a legacy done-because on it is no receipt, for the turn-end
+	// input and the stop poll's trigger alike (both read `laneReceipt`): a held train lane with omp unsettled still waits.
+	test("a held, unreleased train lane with a legacy done-because: and omp unsettled: no receipt, so it waits; the same entries off a train are a receipt that decides", () => {
+		const { ledger, wl } = held();
+		expect(ledger.claimWorkload(wl, { by: LANE, holder: LANE, leaseMs: 60_000 }).won).toBe(true);
+		ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body: "done-because: every PR on the train landed" });
+		const entries = ledger.entries(wl);
+		const holders = holdersOf(entries, ledger.workload(wl)!.holder, ledger.holders(wl));
+		const selfRel = turnEndModule.selfReleased(ledger.holderChanges(wl), LANE);
+		expect(selfRel).toBe(false);
+		expect(laneReceipt(entries, holders, true)).toBe(false);
+		expect(laneReceipt(entries, holders, false)).toBe(true);
+		const onTrain = input({ settled: false, held: true, selfReleased: selfRel, receipt: laneReceipt(entries, holders, true) });
+		expect(turnEnd(onTrain.i).decision).toBe("wait");
+		expect(onTrain.calls).toHaveLength(0);
+		expect(turnEnd(input({ settled: false, held: true, selfReleased: selfRel, receipt: laneReceipt(entries, holders, false) }).i).decision).toBe("completed");
 	});
 });

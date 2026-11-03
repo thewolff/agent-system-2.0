@@ -232,8 +232,9 @@ describe("D4: the stale set, read from the ledger", () => {
 	});
 });
 
-// Real processes and the real ps on purpose (D5): the waits below are endStale's own grace and deadline against the platform
-// clock, kept short; no fake clock can stand in for a process ignoring SIGTERM.
+// Real processes and the real ps on purpose (D5) where a process must ignore SIGTERM; no fake clock stands in for that. The
+// grace and the aggregate deadline themselves run on endStale's injected clock (`now`, `sleep`; PLAN wl-mw0ytmzi89d683 F2):
+// those cases drive a fake one, so they measure nothing on the platform clock.
 describe("D4: endStale on real child processes", () => {
 	/** A child to stand in for a stale omp: `sleep 60`, or one that ignores SIGTERM (an `exec`ed sleep keeps the ignored disposition). */
 	const child = (ignoreTerm: boolean) => Bun.spawn(ignoreTerm ? ["sh", "-c", "trap '' TERM; exec sleep 60"] : ["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
@@ -294,71 +295,97 @@ describe("D4: endStale on real child processes", () => {
 		expect(logs.some((x) => x.includes("lane-a omp pid 999999: ps failed: ps: operation not permitted"))).toBe(true);
 	});
 
-	test("three stale omps that all ignore TERM: SIGKILL at the one aggregate deadline, returned within it plus one ps bound", async () => {
+	/** endStale's injected clock: `now` moves only when endStale sleeps or a simulated probe takes time (`advance`). */
+	const fakeClock = () => {
+		let t = 1_000_000;
+		return { now: () => t, sleep: async (ms: number) => void (t += ms), advance: (ms: number) => void (t += ms) };
+	};
+
+	test("three stale omps that all ignore TERM: SIGKILL at the one aggregate deadline, returned at it", async () => {
 		const cs = [child(true), child(true), child(true)];
 		const stale = await staleFor(cs);
-		const k = killer();
+		const clock = fakeClock();
+		const at: [number, string, number][] = [];
+		const t0 = clock.now();
 		const deadlineMs = 1_500;
-		const t0 = Date.now();
-		await laneScript.endStale(stale, { kill: k.kill, log: () => undefined, graceMs: 60_000, deadlineMs, pollMs: 100 });
-		const ms = Date.now() - t0;
-		expect(ms).toBeGreaterThanOrEqual(deadlineMs);
-		expect(ms).toBeLessThan(deadlineMs + 10_000);
+		const pollMs = 100;
+		await laneScript.endStale(stale, {
+			kill: (pid, sig) => {
+				at.push([pid, sig, clock.now() - t0]);
+				process.kill(pid, sig);
+			},
+			log: () => undefined, graceMs: 60_000, deadlineMs, pollMs, now: clock.now, sleep: clock.sleep,
+		});
+		// the grace (60 s) is past the deadline: each SIGKILL is due one poll before the deadline, and endStale returns at it
+		expect(clock.now() - t0).toBe(deadlineMs);
+		expect(at.filter(([, s]) => s === "SIGTERM").map(([, , t]) => t)).toEqual([0, 0, 0]);
+		expect(at.filter(([, s]) => s === "SIGKILL").map(([, , t]) => t)).toEqual([deadlineMs - pollMs, deadlineMs - pollMs, deadlineMs - pollMs]);
 		await Promise.all(cs.map((c) => c.exited));
 		expect(cs.map((c) => c.signalCode)).toEqual(["SIGKILL", "SIGKILL", "SIGKILL"]);
-		expect(k.calls.filter(([, s]) => s === "SIGKILL").map(([pid]) => pid).sort()).toEqual(cs.map((c) => c.pid).sort());
+		expect(at.filter(([, s]) => s === "SIGKILL").map(([pid]) => pid).sort()).toEqual(cs.map((c) => c.pid).sort());
 	}, 20_000);
 
 	// Review sl-review-exit: a slow probe of one pid crosses the grace after another pid's omp exited and its number was
-	// reused; the escalation must re-probe that pid, not SIGKILL it on the match its earlier probe cached. Simulated pids
-	// and a recording kill: no real process is signalled.
+	// reused; the escalation must re-probe that pid, not SIGKILL it on the match its earlier probe cached. Simulated pids,
+	// a recording kill, and the slow probe as 300 ms on the fake clock: no real process is signalled.
 	test("a pid reused while another pid's slow probe crosses the grace is not SIGKILLed", async () => {
+		const clock = fakeClock();
 		const calls: [number, string][] = [];
 		let reused = false;
 		let slowProbes = 0;
 		const run = (args: string[]) => {
 			const pid = Number(args[1]);
 			if (pid === 102 && ++slowProbes === 2) {
-				Bun.sleepSync(300);
+				clock.advance(300);
 				reused = true;
 			}
 			const start = pid === 101 && reused ? "Tue Oct 21 12:00:00 2026" : OMP_START;
 			return { exitCode: 0, stdout: `S ${start}\n`, stderr: "" };
 		};
 		const stale = [{ laneId: "lane-a", pid: 101, start: OMP_START }, { laneId: "lane-b", pid: 102, start: OMP_START }];
-		await laneScript.endStale(stale, { run, kill: (pid, sig) => calls.push([pid, sig]), log: () => undefined, graceMs: 100, deadlineMs: 800, pollMs: 50 });
+		await laneScript.endStale(stale, { run, kill: (pid, sig) => calls.push([pid, sig]), log: () => undefined, graceMs: 100, deadlineMs: 800, pollMs: 50, now: clock.now, sleep: clock.sleep });
+		expect(slowProbes).toBeGreaterThanOrEqual(2);
 		expect(calls.filter(([pid]) => pid === 101)).toEqual([[101, "SIGTERM"]]);
 		expect(calls.filter(([pid]) => pid === 102).slice(0, 2)).toEqual([[102, "SIGTERM"], [102, "SIGKILL"]]);
 	});
 
 	// Review sl-review-exit r2: the SIGKILL pass probes under the same aggregate deadline as every other pass, so slow
-	// probes of many pids end at the deadline plus one probe, not one probe per pid past it. Simulated pids.
+	// probes of many pids end at the deadline plus one probe, not one probe per pid past it. Simulated pids, each probe
+	// 50 ms on the fake clock.
 	test("ten slow-probing stale omps: endStale returns by the deadline plus one probe", async () => {
+		const clock = fakeClock();
+		const probeMs = 50;
+		let probes = 0;
 		const run = () => {
-			Bun.sleepSync(50);
+			probes++;
+			clock.advance(probeMs);
 			return { exitCode: 0, stdout: `S ${OMP_START}\n`, stderr: "" };
 		};
 		const stale = Array.from({ length: 10 }, (_, i) => ({ laneId: `lane-${i}`, pid: 200 + i, start: OMP_START }));
-		const t0 = Date.now();
-		const left = await laneScript.endStale(stale, { run, kill: () => undefined, log: () => undefined, graceMs: 100, deadlineMs: 300, pollMs: 50 });
-		const ms = Date.now() - t0;
-		expect(ms).toBeLessThan(300 + 50 + 150);
+		const t0 = clock.now();
+		const deadlineMs = 300;
+		const left = await laneScript.endStale(stale, { run, kill: () => undefined, log: () => undefined, graceMs: 100, deadlineMs, pollMs: 50, now: clock.now, sleep: clock.sleep });
+		expect(clock.now() - t0).toBeLessThanOrEqual(deadlineMs + probeMs);
+		// the deadline stopped the first pass part-way: fewer probes than pids, and the unprobed rest is returned
+		expect(probes).toBeLessThan(stale.length);
 		expect(left.length).toBeGreaterThan(0);
 	});
 
 	// Review sl-review-exit r2: a pid whose probes failed at first gets its SIGTERM late; its SIGKILL waits its own grace.
 	test("a pid first seen after the others' grace still gets its own grace between SIGTERM and SIGKILL", async () => {
+		const clock = fakeClock();
 		const calls: [string, number][] = [];
-		const t0 = Date.now();
+		const t0 = clock.now();
 		const run = () => {
-			if (Date.now() - t0 < 400) throw new Error("ps: temporarily unavailable");
+			if (clock.now() - t0 < 400) throw new Error("ps: temporarily unavailable");
 			return { exitCode: 0, stdout: `S ${OMP_START}\n`, stderr: "" };
 		};
-		await laneScript.endStale([{ laneId: "lane-a", pid: 301, start: OMP_START }], { run, kill: (_pid, sig) => calls.push([sig, Date.now()]), log: () => undefined, graceMs: 300, deadlineMs: 2_000, pollMs: 50 });
+		await laneScript.endStale([{ laneId: "lane-a", pid: 301, start: OMP_START }], { run, kill: (_pid, sig) => calls.push([sig, clock.now()]), log: () => undefined, graceMs: 300, deadlineMs: 2_000, pollMs: 50, now: clock.now, sleep: clock.sleep });
 		const term = calls.find(([s]) => s === "SIGTERM")?.[1];
 		const killAt = calls.find(([s]) => s === "SIGKILL")?.[1];
 		expect(term).toBeDefined();
 		expect(killAt).toBeDefined();
+		expect(term! - t0).toBeGreaterThanOrEqual(400);
 		expect(killAt! - term!).toBeGreaterThanOrEqual(300);
 	});
 });
@@ -570,6 +597,29 @@ describe("D3: never two train lanes at once", () => {
 		expect(live.calls.every((c) => c.inTransaction)).toBe(true);
 		expect(laneScript.reserve(l, ordinary, "tick", false, SHOW, live.probeFor)).toMatchObject({ ok: true, laneId: laneIdOf(ordinary, 1) });
 		expect(laneScript.reserve(l, b, "tick", false, SHOW, fakeProbe(l, { omp: "gone", runner: "gone" }).probeFor)).toMatchObject({ ok: true, laneId: laneIdOf(b, 1) });
+	});
+
+	// PLAN wl-mw0ytmzi89d683 F1: the self-release exemption is the own workload's only (its next spawner ends the stale omp);
+	// across trains a self-released lane with its omp alive still holds every other train.
+	test("at reservation: a peer train's lane that released itself, its omp still alive (runner gone), holds another train `held`; its own workload's next launch is admitted past it", () => {
+		const { ledger: l } = tempLedger();
+		const a = openTrainOn(l, 101);
+		const b = openTrainOn(l, 102);
+		const laneA = attempt(l, a, 1, false);
+		l.recordEntry({ by: laneA, workloadId: a, kind: "assumption", body: releasedOpenBody(laneA, 1) });
+		l.releaseWorkload(a, { by: laneA, holder: laneA });
+		expect(l.holderChanges(a).at(-1)).toMatchObject({ from: laneA, to: null, by: laneA });
+		const ompAlive = fakeProbe(l, { omp: "same", runner: "gone" });
+		const before = l.entries(b).length;
+		expect(laneScript.reserve(l, b, "tick", false, SHOW, ompAlive.probeFor)).toEqual({ ok: false, reason: `held: train lane ${laneA} live on ${a}` });
+		expect(ompAlive.calls.map((c) => [c.laneId, c.what, c.pid])).toEqual([[laneA, "omp", ompPid(1)]]);
+		expect(l.entries(b).length).toBe(before);
+		expect(l.workload(b)!.holder).toBeNull();
+		// the same lane on its own workload is stale, not live: train A's next launch is admitted with no probe of it
+		request(l, a);
+		const own = fakeProbe(l, { omp: "same", runner: "gone" });
+		expect(laneScript.reserve(l, a, "tick", false, SHOW, own.probeFor)).toMatchObject({ ok: true, laneId: laneIdOf(a, 2) });
+		expect(own.calls).toEqual([]);
 	});
 
 	test("at spawn: train A's pre-claim lapsed, train B reserved and started meanwhile; A's spawn write refuses (held, stage reserve) and spawns nothing until B's lane is gone", () => {

@@ -89,9 +89,9 @@ import {
 	trainMeterErrorBody, type TrainMeterEvidence, trainPausedBody, trainRuleBody, type TrainScan, type TrainScanError,
 } from "../src/train-budget";
 import {
-	attempts, branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, heldLive, holdersOf,
+	attempts, branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, exitClass, fencedBy, firstPrompt, heldLive, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
-	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody,
+	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneReceipt, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody,
 	launchRequestedBody, doneLine, maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeOrigin, resumePlan, scratchCapMb, sessionOrigin, STARTER_EXIT, stateModelCheck, stateModelOf,
 	STOP_POLL_MS, trainBindings, worktreeBody, worktreePath,
 } from "../src/launch";
@@ -1455,7 +1455,7 @@ export function staleOmps(control: readonly ControlEntry[], changes: readonly Ho
 	return out;
 }
 
-/** `endStale`'s outside world: ps, the signal, the clock's sleep, the log line, the cancel check; the tests pass short waits. */
+/** `endStale`'s outside world: ps, the signal, the clock and its sleep, the log line, the cancel check; the tests pass short waits or a fake clock. */
 export interface EndStaleOptions {
 	/** Called before every probe and every poll tick; true ends `endStale` at once (a stop was accepted). */
 	cancelled?: () => boolean;
@@ -1466,6 +1466,10 @@ export interface EndStaleOptions {
 	deadlineMs?: number;
 	graceMs?: number;
 	pollMs?: number;
+	/** The clock every grace and the aggregate deadline are read on (default `Date.now`). */
+	now?: () => number;
+	/** The wait between polls (default `Bun.sleep`); a fake clock advances `now` here. */
+	sleep?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -1484,7 +1488,9 @@ export async function endStale(stale: readonly StaleOmp[], o: EndStaleOptions = 
 	const log = o.log ?? ((l: string) => process.stderr.write(`${l}\n`));
 	const kill = o.kill ?? ((pid: number, signal: "SIGTERM" | "SIGKILL") => process.kill(pid, signal));
 	const cancelled = o.cancelled ?? (() => false);
-	const deadline = Date.now() + (o.deadlineMs ?? STALE_END_MS);
+	const now = o.now ?? Date.now;
+	const sleep = o.sleep ?? ((ms: number) => Bun.sleep(ms));
+	const deadline = now() + (o.deadlineMs ?? STALE_END_MS);
 	const pollMs = o.pollMs ?? 250;
 	const graceMs = o.graceMs ?? END_GRACE_MS;
 	// The last escalation is due one poll before the deadline, so its pass still probes before the deadline stops probing.
@@ -1498,7 +1504,7 @@ export async function endStale(stale: readonly StaleOmp[], o: EndStaleOptions = 
 			log(`endStale: ${s.laneId} omp pid ${s.pid}: ${sig} failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	};
-	const past = (): boolean => Date.now() >= deadline;
+	const past = (): boolean => now() >= deadline;
 	/** Each pid's SIGKILL due time, set at its own SIGTERM. */
 	const killDue = new Map<StaleOmp, number>();
 	/** One probe of every pid in `of`, the cancel check and the deadline before each; the unprobed rest is kept as is. */
@@ -1513,9 +1519,9 @@ export async function endStale(stale: readonly StaleOmp[], o: EndStaleOptions = 
 			if (st === "same") {
 				const due = killDue.get(s);
 				if (due === undefined) {
-					killDue.set(s, Math.min(Date.now() + graceMs, killCap));
+					killDue.set(s, Math.min(now() + graceMs, killCap));
 					signal(s, "SIGTERM");
-				} else if (Date.now() >= due) signal(s, "SIGKILL");
+				} else if (now() >= due) signal(s, "SIGKILL");
 			}
 			next.push(s);
 		}
@@ -1524,8 +1530,8 @@ export async function endStale(stale: readonly StaleOmp[], o: EndStaleOptions = 
 	/** The pids not shown gone at their newest probe (a failed probe counts as alive and is never signalled). */
 	let left = probe(stale);
 	while (left.length > 0 && !cancelled() && !past()) {
-		const nextDue = Math.min(deadline, ...left.map((s) => killDue.get(s) ?? deadline).filter((d) => d > Date.now()));
-		await Bun.sleep(Math.max(1, Math.min(pollMs, nextDue - Date.now())));
+		const nextDue = Math.min(deadline, ...left.map((s) => killDue.get(s) ?? deadline).filter((d) => d > now()));
+		await sleep(Math.max(1, Math.min(pollMs, nextDue - now())));
 		left = probe(left);
 	}
 	for (const s of left) log(`endStale: ${s.laneId} omp pid ${s.pid}: not shown gone when endStale returned`);
@@ -2216,13 +2222,13 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 
 	/**
 	 * PLAN wl-mvidsu83epvpj4 D2's terminal signals as the ledger stands: this lane released itself (`selfReleased`, from the
-	 * holder history), and a holder's `done-because:` stands (`receipt`; never on a merge train, as the turn-end input reads
-	 * it, PLAN wl-mvr888nftz0vcl D3 and wl-mw0ytmzi89d683 F3).
+	 * holder history), and a holder's `done-because:` stands (`laneReceipt`: never on a merge train, the same rule as the
+	 * turn-end input, PLAN wl-mvr888nftz0vcl D3 and wl-mw0ytmzi89d683 F3).
 	 */
 	const terminalNow = (): { selfReleased: boolean; receipt: boolean } => {
 		const entries = ledger.entries(wl);
 		const holders = holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl));
-		return { selfReleased: selfReleased(ledger.holderChanges(wl), laneId), receipt: !train && doneBecause(entries, holders) !== null };
+		return { selfReleased: selfReleased(ledger.holderChanges(wl), laneId), receipt: laneReceipt(entries, holders, train) };
 	};
 
 	/**
@@ -2251,7 +2257,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				releasedOpen: releasedOpen(control, laneId),
 				releasedIdle: releasedIdle(control, laneId),
 				// PLAN wl-mvr888nftz0vcl D3: a merge train is permanent, so a legacy standing done-because on it is no receipt.
-				receipt: !train && doneBecause(entries, holders) !== null,
+				receipt: laneReceipt(entries, holders, train),
 				selfReleased: selfReleased(ledger.holderChanges(wl), laneId),
 				slices: sliceCounts(ledger.slices(wl)),
 				continues,
