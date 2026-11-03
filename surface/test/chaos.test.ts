@@ -13,7 +13,6 @@ import { dirname, join } from "node:path";
 import { handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { INSTALL_DOCTOR_FAILED, installOutcome } from "../scripts/chaos";
-import { isRunnerCommand } from "../scripts/lane";
 import {
 	copyIntoScratch, daysSinceEpoch, END_RECEIPT_SKEW_MS, emptySeen, type Evidence, type EvidenceItem, FAULT_EVIDENCE, FAULTS, type FaultName, firstHolder, HarnessError, ISOLATION_LIMIT,
 	isolationDiff, type IsolationSnapshot, isolationSnapshot, isScratchRunner, judgePoll, killRefusal, killTargets, laneStarts, liveActorsOf, newStarts, nightlyDue, nightlyFault, type Poll, type ProcRow, PS_SHIM,
@@ -21,6 +20,7 @@ import {
 	verdict, writeScratchFile,
 } from "../src/chaos";
 import { laneExitBody, laneStartedBody } from "../src/launch";
+import { isRunnerCommand } from "../src/runner-probe";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
 import { clock, tmp } from "./helpers";
 

@@ -6,14 +6,14 @@ import { fsReportFiles } from "../src/alert-sources";
 import { ensureStandingWorkload } from "../src/identity";
 import { controlEntries, laneExitBody } from "../src/launch";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import type { AlertPassDeps } from "../scripts/alert-tick";
+import type { AlertLock, AlertPassDeps } from "../scripts/alert-tick";
+import type { Gh } from "../src/jo-issues";
 import { clock, tempLedger, tmp } from "./helpers";
 
 export const T0 = "2026-11-03T10:00:00.000Z";
 export const ISSUE = "https://github.com/thewolff/jo-issues/issues/77";
 
 /** A recording gh over one in-memory jo-issues repository: issues, their comments, labels and state. */
-/** A recording gh over one in-memory jo-issues repository. */
 export interface FakeGh {
 	gh: (args: string[]) => { code: number; stdout: string; stderr: string };
 	calls: string[][];
@@ -63,31 +63,27 @@ export function ceilingStopped(ledger: Ledger, brief: string): string {
 	return wl;
 }
 
-/** The test world: the ledger and its clock, the fake gh, the pass's deps, and what the popup seams recorded. */
-export interface AlertWorld {
-	c: { now: () => string; at: (iso: string) => void; plusHours: (h: number) => void };
-	ledger: Ledger;
-	g: FakeGh;
-	deps: AlertPassDeps;
+/** What the popup seams recorded: each detached spawn (argv and env) and each signal (pid and signal). */
+export interface PopupRecord {
 	spawns: { argv: string[]; env: Record<string, string> }[];
 	kills: [number, string][];
-	log: string[];
-	/** The standing workload's `alert:` and `alert-popup:` rows, oldest first. */
-	rows: () => string[];
 }
 
-export function world(o: { fail?: (args: string[]) => boolean; ps?: () => string } = {}): AlertWorld {
-	const c = clock(T0);
-	const { ledger } = tempLedger(c.now);
-	ensureStandingWorkload(ledger);
-	const g = fakeGh(o);
-	const spawns: { argv: string[]; env: Record<string, string> }[] = [];
-	const kills: [number, string][] = [];
-	const log: string[] = [];
-	const deps: AlertPassDeps = {
-		ledger, gh: g.gh, log: (l) => log.push(l),
+/** The pass's seams beside the ledger, the log and the train repository: what TickDeps.alerts carries (surface/scripts/train-tick.ts). */
+export type AlertSeams = Omit<AlertPassDeps, "ledger" | "log" | "sources"> & { sources: Omit<AlertPassDeps["sources"], "trainRepo"> };
+
+/**
+ * Recording seams for one alert pass over `gh`: no quota subjects, an alarm file and chaos dir with nothing in them, a runner
+ * probe that finds every lane gone, a popup spawn that records and answers pid 4242, `ps` from `o.ps` (no process by default)
+ * and a kill that records. No real gh, popup, ps or signal is ever used.
+ */
+export function alertSeams(gh: Gh, o: { ps?: () => string } = {}): PopupRecord & { seams: AlertSeams } {
+	const spawns: PopupRecord["spawns"] = [];
+	const kills: PopupRecord["kills"] = [];
+	const seams: AlertSeams = {
+		gh,
 		quota: () => ({ subjects: [], log: [], error: null }),
-		sources: { alarmFile: join(tmp("alarm"), "alarm.jsonl"), reportsDir: join(tmp("reports"), "none"), files: fsReportFiles, probe: () => ({ failure: null, omp: () => "gone", runner: () => "gone" }), trainRepo: () => null },
+		sources: { alarmFile: join(tmp("alarm"), "alarm.jsonl"), reportsDir: join(tmp("reports"), "none"), files: fsReportFiles, probe: () => ({ failure: null, omp: () => "gone", runner: () => "gone" }) },
 		popup: {
 			spawn: (argv, env) => {
 				spawns.push({ argv, env });
@@ -101,7 +97,35 @@ export function world(o: { fail?: (args: string[]) => boolean; ps?: () => string
 			},
 		},
 	};
-	const rows = () => controlEntries(ledger.entries(STANDING_WORKLOAD_ID)).filter((e) => e.prefix === "alert" || e.prefix === "alert-popup").map((e) => `${e.prefix}: ${e.rest}`);
-	return { c, ledger, g, deps, spawns, kills, log, rows };
+	return { seams, spawns, kills };
+}
+
+/** A pass lock that is always free (TickDeps.alerts's `lock`): the tests run one pass at a time. */
+export const freeLock: AlertLock = () => ({ release: () => {} });
+
+/** The test world: the ledger and its clock, the fake gh, the pass's deps, and what the popup seams recorded. */
+export interface AlertWorld extends PopupRecord {
+	c: { now: () => string; at: (iso: string) => void; plusHours: (h: number) => void };
+	ledger: Ledger;
+	g: FakeGh;
+	deps: AlertPassDeps;
+	log: string[];
+	/** The standing workload's `alert:` and `alert-popup:` rows, oldest first. */
+	rows: () => string[];
+}
+
+/** The standing workload's `alert:` and `alert-popup:` rows on `ledger`, oldest first, each as `<prefix>: <rest>`. */
+export const alertRowsOf = (ledger: Ledger): string[] =>
+	controlEntries(ledger.entries(STANDING_WORKLOAD_ID)).filter((e) => e.prefix === "alert" || e.prefix === "alert-popup").map((e) => `${e.prefix}: ${e.rest}`);
+
+export function world(o: { fail?: (args: string[]) => boolean; ps?: () => string } = {}): AlertWorld {
+	const c = clock(T0);
+	const { ledger } = tempLedger(c.now);
+	ensureStandingWorkload(ledger);
+	const g = fakeGh(o);
+	const log: string[] = [];
+	const { seams, spawns, kills } = alertSeams(g.gh, o);
+	const deps: AlertPassDeps = { ...seams, ledger, log: (l) => log.push(l), sources: { ...seams.sources, trainRepo: () => null } };
+	return { c, ledger, g, deps, spawns, kills, log, rows: () => alertRowsOf(ledger) };
 }
 

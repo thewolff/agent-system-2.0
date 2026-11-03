@@ -81,31 +81,34 @@ describe("red main (D7)", () => {
 		w.ledger.entries(STANDING_WORKLOAD_ID).filter((e) => e.created_by === MERGE_TRAIN_BY && e.body.startsWith("train-notice: main-red ")).map((e) => e.body);
 	const lines = (w: Seen) => errorLines(w.ledger).filter((l) => l.kind === "train");
 
-	test("R8: a red main reaches Jo once per main-red issue (one notice, one issue, one needs-you line) and clears when that issue closes", () => {
+	test("R8: a red main reaches Jo once per main-red issue (one notice, one issue through the alert pass, one needs-you line) and clears when that issue closes", () => {
 		const w = world();
 		ensureStandingWorkload(w.ledger);
 		w.g.repoIssues.set(9, "OPEN");
 		w.ledger.recordEntry({ by: TRAIN_LANE, workloadId: w.train, kind: "assumption", body: `main-red: ${MAIN_RED} run tr-abc1` });
 		w.run();
 		w.run();
-		expect(rows(w)).toEqual([`train-notice: main-red ${MAIN_RED} raised run tr-abc1`, `train-notice: main-red ${MAIN_RED} filed ${ISSUE}`]);
+		// the tick writes the notice's rows only; the alert pass's main:<repo> key (PLAN wl-mw0vs9uc3xqtka D2.4) files its issue
+		expect(rows(w)).toEqual([`train-notice: main-red ${MAIN_RED} raised run tr-abc1`]);
 		expect(w.creates()).toHaveLength(1);
-		expect(w.g.issues[0]).toMatchObject({ title: `merge train: main is red on ${REPO}`, labels: [TRAIN_ALERT_LABEL] });
+		expect(w.g.issues[0]).toMatchObject({ title: `main is red on ${REPO}`, labels: [TRAIN_ALERT_LABEL], body: expect.stringContaining(`Main is red on ${REPO}: ${MAIN_RED} (merge train run tr-abc1`) });
+		expect(w.alertRows()).toContainEqual(`alert: main:${REPO} level 1 sent ${ISSUE}`);
 		expect(lines(w)).toEqual([expect.objectContaining({ workloadId: STANDING_WORKLOAD_ID, line: expect.stringContaining(`main is red: ${MAIN_RED} (run tr-abc1)`) })]);
 		// the same url on a later run, and a url that is no issue on the train's repository: nothing more reaches Jo
 		w.ledger.recordEntry({ by: TRAIN_LANE, workloadId: w.train, kind: "assumption", body: `main-red: ${MAIN_RED} run tr-abc2` });
 		w.ledger.recordEntry({ by: TRAIN_LANE, workloadId: w.train, kind: "assumption", body: "main-red: https://github.com/someone/else/issues/3 run tr-abc3" });
 		const out = w.run();
 		expect(out).toContainEqual(expect.stringContaining("main-red https://github.com/someone/else/issues/3"));
-		expect(rows(w)).toHaveLength(2);
+		expect(rows(w)).toHaveLength(1);
 		expect(w.creates()).toHaveLength(1);
 		expect(lines(w)).toHaveLength(1);
 		// the main-red issue closes: cleared, the jo-issues issue closed, the line gone
 		w.g.repoIssues.set(9, "CLOSED");
 		w.run();
 		w.run();
-		expect(rows(w).slice(2)).toEqual([`train-notice: main-red ${MAIN_RED} cleared ${MAIN_RED} closed`]);
+		expect(rows(w).slice(1)).toEqual([`train-notice: main-red ${MAIN_RED} cleared ${MAIN_RED} closed`]);
 		expect(w.g.issues[0]!.state).toBe("CLOSED");
+		expect(w.alertRows().filter((r) => r.startsWith(`alert: main:${REPO} closed `))).toHaveLength(1);
 		expect(lines(w)).toEqual([]);
 	});
 

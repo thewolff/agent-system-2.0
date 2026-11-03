@@ -115,8 +115,8 @@ function lane(w: World, opts: { fingerprint?: (cwd: string) => string; now?: () 
 	const handlers: Record<string, Handler> = {};
 	const handSession: Record<string, Handler> = {};
 	const logs: string[] = [];
-	/** The move alerts the extension started (PLAN wl-mvwk0v0gmp6cjc D6): workload and event id; no process is spawned. */
-	const moveAlerts: { workloadId: string; eventId: string }[] = [];
+	/** The alert-pass kicks the extension made after a hand move (PLAN wl-mw0vs9uc3xqtka D3): each `why`; no process is spawned. */
+	const kicks: string[] = [];
 	const extension = createClassifierExtension({
 		judge: async () => JUDGE as never,
 		tierTable: () => w.table,
@@ -132,9 +132,9 @@ function lane(w: World, opts: { fingerprint?: (cwd: string) => string; now?: () 
 		log: line => logs.push(line),
 		now: opts.now ?? (() => RULE_END),
 		...(opts.fingerprint ? { fingerprint: opts.fingerprint } : {}),
-		spawnMoveAlert: (_ledger, workloadId, eventId) => {
-			moveAlerts.push({ workloadId, eventId });
-			return null;
+		kickAlerts: why => {
+			kicks.push(why);
+			return 4242;
 		},
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
@@ -149,7 +149,7 @@ function lane(w: World, opts: { fingerprint?: (cwd: string) => string; now?: () 
 	const text = (msg: unknown) => (typeof msg === "object" && msg !== null && "content" in msg ? String(msg.content) : "");
 	return {
 		logs,
-		moveAlerts,
+		kicks,
 		/** The lane switches to `selector` (OMP's model switch): its later build hands run on that lab. */
 		setLaneModel: (selector: string) => void (ctx.model = currentModel(selector)),
 		toolCall: (input: unknown, toolCallId = "call-1") => handlers.tool_call!({ type: "tool_call", toolName: "task", toolCallId, input }, ctx) as Promise<Reply>,
@@ -2310,7 +2310,8 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 		expect(bodies(w, "hand-spawn:")).toEqual([expect.stringContaining(` row ${KIMI}`)]);
 		expect(bodies(w, "hand-headroom:")).toEqual([expect.stringMatching(new RegExp(`^hand-headroom: hand dt-\\S+ \\(slice sl-work\\) of lane lane-test ${SOL} -> ${KIMI} \\(openai-codex 7d 1\\.00 used, quota exhausted\\)$`))]);
 		expect(bodies(w, "headroom-skip:")).toEqual([expect.stringContaining(`headroom-skip: ${SOL} token `)]);
-		expect(h.moveAlerts).toHaveLength(1);
+		const event = w.ledger.entries(w.wl).find(e => e.body.startsWith("hand-headroom:"))!;
+		expect(h.kicks).toEqual([`quota move ${event.id}`]);
 	});
 
 	test("unavailable counterfactual budgets cannot retain a build, including session-free and spawn-specific credentials", async () => {

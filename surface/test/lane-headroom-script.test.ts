@@ -3,16 +3,17 @@
 // Otherwise named models refuse before omp; unnamed models move only to base-in-quota strong-row entries,
 // confirmed by get_state before the first prompt. These process tests run outside the fence.
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadTierTable } from "../../classifier/src/tier-table";
 import { LANE_RUNNER_BY, Ledger } from "../../ledger/src/index";
 import { onFire } from "../src/batch";
 import { recordRepo } from "../src/decision-log";
 import { errorLines } from "../src/errors";
-import { doneBody, laneDir, laneExit, laneModelBody, laneStarted } from "../src/launch";
-import { DISMISS_BUTTON, quotaMoves } from "../src/quota-move-alert";
-import { SURFACE_BY } from "../src/types";
+import { ensureStandingWorkload } from "../src/identity";
+import { controlEntries, doneBody, laneDir, laneExit, laneModelBody, laneStarted } from "../src/launch";
+import { quotaMoves } from "../src/quota-move-alert";
+import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import type { FakeScript, FakeStep, LaneRoot } from "./helpers";
 import { fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, laneSnapshot, setScript, settleDrains, sh, until } from "./helpers";
 
@@ -51,18 +52,23 @@ function installTierTable(r: LaneRoot, strong?: readonly string[]): void {
 }
 
 /**
- * The move alert's gh and osascript (PLAN wl-mvwk0v0gmp6cjc D4), so a moved lane's detached `lane.ts move-alert` worker never
- * reaches GitHub or shows a dialog: gh logs its argv and the lane binding it saw, then fails offline; osascript answers Dismiss.
+ * The alert pass's gh (PLAN wl-mw0vs9uc3xqtka D3, `AS2_ALERT_GH`), so the pass a moved lane's runner kicks
+ * (`bun surface/scripts/alert-tick.ts`, detached) never reaches GitHub: gh logs its argv and the lane binding it saw, then
+ * fails offline. With every gh call failing no level is sent, so the pass never starts a popup worker. The root's ledger
+ * gets the standing workload, where the pass writes its `alert:` rows.
  */
-function installMoveAlertFakes(r: LaneRoot): void {
+function installAlertFakes(r: LaneRoot): void {
 	const gh = join(r.root, "fake-gh");
 	writeFileSync(gh, `#!/bin/sh\nprintf '%s role=%s wl=%s lane=%s\\n' "$*" "\${AGENT_SYSTEM_ROLE-unset}" "\${AGENT_SYSTEM_WORKLOAD_ID-unset}" "\${AGENT_SYSTEM_LANE_ID-unset}" >> '${join(r.root, "gh.log")}'\necho 'fake gh: offline' >&2\nexit 1\n`);
-	const osa = join(r.root, "fake-osascript");
-	writeFileSync(osa, `#!/bin/sh\necho popup >> '${join(r.root, "popup.log")}'\necho '${DISMISS_BUTTON}'\n`);
 	chmodSync(gh, 0o755);
-	chmodSync(osa, 0o755);
-	r.env.AS2_MOVE_ALERT_GH = gh;
-	r.env.AS2_MOVE_ALERT_OSASCRIPT = osa;
+	r.env.AS2_ALERT_GH = gh;
+	r.env.AS2_ALERT_SPAWN_LOG = join(r.root, "alert-pass.log");
+	const l = ledgerOf(r);
+	try {
+		ensureStandingWorkload(l);
+	} finally {
+		l.close();
+	}
 }
 
 const makeRoot = (used: Record<string, number>): LaneRoot => {
@@ -70,7 +76,7 @@ const makeRoot = (used: Record<string, number>): LaneRoot => {
 	roots.push(r);
 	writePolls(r, used);
 	installTierTable(r);
-	installMoveAlertFakes(r);
+	installAlertFakes(r);
 	return r;
 };
 
@@ -103,7 +109,9 @@ function removeTierTable(r: LaneRoot): void {
 }
 
 const runnerLog = (r: LaneRoot, wl: string) => readFileSync(join(laneDir(wl, r.home), "runner.log"), "utf8");
-const ledgerOf = (r: LaneRoot) => Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+function ledgerOf(r: LaneRoot): Ledger {
+	return Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+}
 /** An autonomous workload with its done: line and one open slice, and Jo's `lane-model:` when `model` is given. */
 function openWorkload(r: LaneRoot, model: string | null): string {
 	const l = ledgerOf(r);
@@ -142,8 +150,8 @@ const deathSenders = (r: LaneRoot, wl: string) => {
 
 /**
  * R5: the confirmed move wrote its `lane-headroom:` record and one orchestrator-bound `quota-move:` message (one transaction,
- * `recordQuotaMove`), shown as an on-fire NOW line; then the spawned `move-alert` worker, unbound from the lane, ran both
- * channels on the fakes (the comment failed offline, the popup answered Dismiss). Waits on the worker's popup result.
+ * `recordQuotaMove`), shown as an on-fire NOW line; then the alert pass the runner kicked, unbound from the lane, raised the
+ * move's `move:<E>` key and tried jo-issues on the fake gh (offline, so its `error gh` row). Waits on that row.
  */
 async function expectMoveAlerted(r: LaneRoot, wl: string, laneId: string, from: string, to: string, reason: string) {
 	const l = ledgerOf(r);
@@ -159,15 +167,16 @@ async function expectMoveAlerted(r: LaneRoot, wl: string, laneId: string, from: 
 		const now = errorLines(l).filter((x) => x.kind === "quota-move" && x.workloadId === wl);
 		expect(now.map((x) => x.line)).toEqual([`NOW: lane ${laneId} on ${wl} moved ${from} -> ${to} (${move.reason})`]);
 		expect(onFire(l, now[0]!)).toBe(true);
-		const rows = () => l.entries(wl, "assumption").filter((e) => e.created_by === LANE_RUNNER_BY && e.body.startsWith(`quota-move-alert: ${move.eventId} `)).map((e) => e.body.split(" ").slice(2, 4).join(" "));
-		await until(`the move alert's popup result for ${move.eventId}`, () => rows().includes(`popup ok`));
-		expect(rows().filter((x) => !x.endsWith("spawning"))).toEqual(["comment claim", "comment failed", "popup claim", "popup showing", "popup ok"]);
+		const key = `move:${move.eventId}`;
+		const rows = () => controlEntries(l.entries(STANDING_WORKLOAD_ID)).filter((e) => e.prefix === "alert" && e.rest.startsWith(`${key} `)).map((e) => e.rest.slice(key.length + 1));
+		await until(`the kicked alert pass's gh error for ${key}`, () => rows().some((x) => x.startsWith("error gh ")));
+		expect(rows()[0]).toStartWith("raised quota-move start 2 ");
+		expect(rows().find((x) => x.startsWith("error gh "))).toContain("fake gh: offline");
 	} finally {
 		l.close();
 	}
 	const gh = readFileSync(join(r.root, "gh.log"), "utf8");
 	expect(gh).toContain("role=unset wl=unset lane=unset");
-	expect(existsSync(join(r.root, "popup.log"))).toBe(true);
 }
 
 describe("PLAN wl-mv71x5rwdu7eo0 § 4: the quota guard at the runner's spawn", () => {
