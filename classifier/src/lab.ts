@@ -17,6 +17,7 @@
  * - `ANTHROPIC_OUT_RULE`: the current OpenAI lane's dated, Codex-only review authorization, independent
  *   of builder history and Kimi availability (PLAN wl-mvtusij5mhwtnv).
  * - `REVIEW_ONLY_LABS`: labs whose entries only reviews take (Z.ai, PLAN wl-mw148irbq33zt5 D3).
+ * - `isZaiBalanceEmpty`: a Z.ai 429 with code 1113, which parks a review instead of a re-dispatch (PLAN wl-mw148irbq33zt5 D4).
  */
 import { type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type RoutingRow } from "../../ledger/src/index";
 import { SURFACE_BY } from "../../surface/src/types";
@@ -520,6 +521,46 @@ export const KIMI_QUOTA_MESSAGE = /exceeded_current_quota|insufficient balance|s
 export function isKimiQuotaRefusal(provider: string, status: number | null, message: string | null, now: number): boolean {
 	return kimiOutRuleActive(now) && status === 429 && labOf(provider) === "kimi" && KIMI_QUOTA_MESSAGE.test(message ?? "");
 }
+
+// ---- Z.ai balance empty (PLAN wl-mw148irbq33zt5 D4) ---------------------------------------------
+
+/** Z.ai's top-up page, named in the balance-empty park reason and notice. */
+export const ZAI_BILLING_URL = "https://z.ai/manage-apikey/billing";
+
+/**
+ * Z.ai's code 1113 ("Insufficient balance or no resource package") in either shape OMP carries a Z.ai 429 in (PLAN § 1):
+ * the anthropic route's JSON body (`"code":"1113"`) or the openai route's `(type=1113)` suffix.
+ */
+const ZAI_BALANCE_CODE = /"code"\s*:\s*"1113"|\(type=1113\)/;
+
+/**
+ * Does a failed turn say the Z.ai balance is empty? Only a zai-lab provider's HTTP 429 whose message carries code 1113;
+ * the status alone never decides it, so a 1302 / 1305 rate limit or a bare 429 stays an ordinary failed dispatch.
+ */
+export function isZaiBalanceEmpty(provider: string, status: number | null, message: string | null): boolean {
+	return status === 429 && labOf(provider) === "zai" && ZAI_BALANCE_CODE.test(message ?? "");
+}
+
+/** The classifier's receipt that review hand `token`'s turn on `model` hit the empty Z.ai balance (written at its settle). */
+export const zaiBalanceBody = (token: string, model: string) => `zai-balance: token ${token} model ${model}`;
+const ZAI_BALANCE = /^zai-balance:\s+token\s+(\S+)\s+model\s+(\S+)$/;
+
+/** token → model, from `zai-balance:` entries. */
+export function zaiBalanceTokens(entries: readonly Entry[]): Map<string, string> {
+	const out = new Map<string, string>();
+	for (const body of bodies(entries)) {
+		const m = ZAI_BALANCE.exec(body);
+		if (m) out.set(m[1]!, m[2]!);
+	}
+	return out;
+}
+
+/** The park reason for a review that cannot run because `model`'s Z.ai balance is empty. */
+export const zaiBalanceReason = (model: string) => `${model} (Z.ai balance empty: HTTP 429 code 1113; top up at ${ZAI_BILLING_URL})`;
+
+/** The orchestrator notice (without its `notice:` prefix) for a review of `sliceId` that another model answered after a 1113. */
+export const zaiBalanceNoticeBody = (workloadId: string, sliceId: string, models: readonly string[]) =>
+	`Z.ai balance empty (HTTP 429 code 1113) on ${workloadId}: ${sliceId}'s review fell back to ${models.join(", ")}; top up at ${ZAI_BILLING_URL}`;
 
 // ---- D4–D6: the routing decision -------------------------------------------------------------
 

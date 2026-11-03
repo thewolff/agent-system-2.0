@@ -2,7 +2,7 @@
 // tests"): every § 3 / § 6 state as a row of the matrix, then the Codex-review regressions that
 // live in surface/src/launch.ts (B6 null-start resume, S1 superseded done-because:, S7 merge line).
 import { describe, expect, test } from "bun:test";
-import { handBuilderBody, handSettledBody, handSpawnBody, laneBuilderBody, reviewParkBody, reviewSameLabBody, reviewWithheldBody } from "../../classifier/src/lab";
+import { handBuilderBody, handSettledBody, handSpawnBody, laneBuilderBody, reviewParkBody, reviewSameLabBody, reviewWithheldBody, zaiBalanceBody } from "../../classifier/src/lab";
 import { reviewGroupBody, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import {
 	LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type InstructionRow, type QuestionRow, type ReserveRows, type WorkloadRow,
@@ -358,6 +358,8 @@ describe("done-because: receipt (decision 16, Codex review S1)", () => {
 			"pair-exposure: lane-m-1 on",
 			// classifier/src/lab.ts reviewSameLabRuleBody (PLAN wl-mv5xay6bjp0268 § 2.2), as a literal so it loads on the baseline
 			"review-same-lab-rule: in-mv5xafhywe3w8w slice sl-x token dt-a labs openai,anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)",
+			// classifier/src/lab.ts zaiBalanceBody: an empty Z.ai balance on a review hand (PLAN wl-mw148irbq33zt5 D4)
+			zaiBalanceBody("dt-a", "zai/glm-5.3"),
 		];
 		for (const b of bodies) expect(CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).toContain(/^([a-z-]+):/.exec(b)![1]!);
 		expect(new Set(bodies.map((b) => /^([a-z-]+):/.exec(b)![1])).size).toBe(CLASSIFIER_MACHINERY_PREFIXES.length);

@@ -1267,10 +1267,12 @@ export function doneLine(control: readonly ControlEntry[]): string | null {
  * no lane can forge them (PLAN wl-mv67564rdkfvnk D9, surface/src/pair-suggest.ts).
  * `headroom-skip: <selector> token <dt> <reason>` is the classifier's record of a tier-row entry it skipped as projected out of
  * quota (PLAN wl-mv71x5rwdu7eo0 § 3, classifier/src/headroom.ts), written beside `provider-refused:`.
+ * `zai-balance: token <dt> model <selector>` is the classifier's receipt that a review hand hit an empty Z.ai balance
+ * (HTTP 429 code 1113; classifier/src/lab.ts zaiBalanceBody, PLAN wl-mw148irbq33zt5 D4), which a fan-out's park reads.
  */
 export const CLASSIFIER_MACHINERY_PREFIXES = [
 	"hand-spawn", "hand-settled", "review-round", "review-group", "review-withheld", "review-park", "review-same-lab", "review-same-lab-rule", "review-limit",
-	"review-loop-end", "builder-lab", "provider-refused", "headroom-skip", "pair-signal", "pair-signal-failed", "pair-offer", "pair-exposure",
+	"review-loop-end", "builder-lab", "provider-refused", "headroom-skip", "pair-signal", "pair-signal-failed", "pair-offer", "pair-exposure", "zai-balance",
 ] as const;
 
 /**
