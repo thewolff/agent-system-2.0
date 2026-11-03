@@ -139,6 +139,58 @@ export function serveFixture(dir: string, cfg: ServeConfig = loadServe(dir)): Se
 	});
 }
 
+// Fixture ports are fixed (recorded pages, canonicals and rendered/127.0.0.1-<port>__*.json name them), and every family
+// test file audits every fixture, so two files run at once (`bun test --parallel`, or two `bun test` calls, possibly from
+// two checkouts) want the same port at the same time. The bound port is the lock: one process serves a fixture at a time
+// and the rest wait for it to let go. A waiter holds a plain TCP connection to the holder's listener and wakes on that
+// connection's end: `server.stop(true)` closes it as it releases the port, an idle timeout or reset closes it earlier
+// (the waiter then finds the port still bound and waits again). No timer is involved: every retry follows an event.
+// A port that refuses connections yet will not bind is bound by something that is not listening; that is not a
+// fixture server, so after REFUSED_LIMIT such rounds in a row the wait fails with the port named.
+const REFUSED_LIMIT = 3;
+
+// Resolves "released" when the listener on 127.0.0.1:<port> closes a connection held to it, "refused" when nothing
+// listens there. Any other connect failure throws.
+async function holderReleases(port: number): Promise<"released" | "refused"> {
+	const ended = Promise.withResolvers<"released">();
+	try {
+		await Bun.connect({
+			hostname: "127.0.0.1",
+			port,
+			socket: {
+				data() {},
+				end(socket) {
+					socket.end();
+					ended.resolve("released");
+				},
+				close: () => ended.resolve("released"),
+				error: () => ended.resolve("released"),
+			},
+		});
+	} catch (e) {
+		if (e instanceof Error && "code" in e && e.code === "ECONNREFUSED") return "refused";
+		throw new Error(`fixture port ${port}: waiting for its holder, connect failed: ${String(e)}`, { cause: e });
+	}
+	return ended.promise;
+}
+
+// serveFixture on the fixture's port once no other process serves it.
+export async function serveFixtureExclusive(dir: string, cfg: ServeConfig = loadServe(dir)): Promise<Server<undefined>> {
+	let refused = 0;
+	for (;;) {
+		try {
+			return serveFixture(dir, cfg);
+		} catch (e) {
+			if (!(e instanceof Error && "code" in e && e.code === "EADDRINUSE")) throw e;
+		}
+		if ((await holderReleases(cfg.port)) === "released") refused = 0;
+		else if (++refused === REFUSED_LIMIT)
+			throw new Error(
+				`fixture port ${cfg.port} (${dir}): bind failed with EADDRINUSE and connects were refused ${REFUSED_LIMIT} times in a row, so a socket that is not a listening fixture server holds 127.0.0.1:${cfg.port}; find it with \`lsof -nP -iTCP:${cfg.port}\` and free the port`,
+			);
+	}
+}
+
 // The base64 SHA-256 of a certificate's SubjectPublicKeyInfo, the form Chrome's
 // --ignore-certificate-errors-spki-list takes: it lets the recording Chrome trust a TLS fixture's self-signed cert.
 export function spkiHash(certPem: string): string {
@@ -193,7 +245,7 @@ export async function runAudit(args: string[], env: Record<string, string> = {})
 export async function auditFixture(name: string, mode: "recorded" | "record" = "recorded"): Promise<AuditRun> {
 	const dir = join(FIXTURES_DIR, name);
 	const cfg = loadServe(dir);
-	const server = serveFixture(dir, cfg);
+	const server = await serveFixtureExclusive(dir, cfg);
 	const out = mkdtempSync(join(tmpdir(), `seo-audit-${name}-`));
 	try {
 		const env: Record<string, string> = cfg.tls ? { NODE_EXTRA_CA_CERTS: join(dir, "cert.pem") } : {};

@@ -9,11 +9,11 @@
 // (`buildUser: null`, `asRoot: false`, a local bare origin) into a tmp libexec. The setup script
 // runs with fake dscl, sudo and visudo under AS2TEST_SETUP_TEST_PREFIX; real sudo is never called.
 import { Database } from "bun:sqlite";
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, test as bunTest, describe, expect } from "bun:test";
 import * as childProcess from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
-	chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, watch, writeFileSync,
+	chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, watch, writeFileSync, writeSync,
 } from "node:fs";
 import { userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -22,7 +22,7 @@ import {
 	bundleInputs, CAPTURE_MS, CREDENTIAL_PATHS, execArgv, execConfigOf, type InstallVerdict, installDecision, installLayout, parseSource, preflightDecision,
 	preflightProbes, probeCall, probeDecision, readInstall, renderExecWrapper, type SweepScope, UID_SWEEP, WrapperRenderError,
 } from "../src/as2test";
-import { STUCK_DEFAULTS } from "../src/stuck-detect";
+import { snapshot, STUCK_DEFAULTS } from "../src/stuck-detect";
 import { AS2TEST_USER, CHILD_ENV_ALLOWLIST, childEnv, partResult, WRAPPER_EXIT, type WrapperCall } from "../src/test-run";
 import { tmp, unreapedTrue } from "./helpers";
 
@@ -47,36 +47,138 @@ const SYS_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
 /** The tag the refresh helper fetches (PLAN wl-mvq4edbaf13vnk § 2 "The bundle"), spelled out: a rename must break these tests. */
 const VERIFIED_TAG = "as2-verified";
 
-const made: string[] = [];
-/** chmod u+rwx every directory beneath, so rmSync can delete what a test sealed. */
+/** chmod u+rwx every directory beneath, so rmSync can delete what a test sealed. A path already gone is nothing to unseal. */
 function unseal(p: string): void {
 	let st;
 	try {
 		st = lstatSync(p);
-	} catch {
-		return;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
 	}
 	if (!st.isDirectory()) return;
 	chmodSync(p, 0o755);
 	for (const n of readdirSync(p)) unseal(join(p, n));
 }
-const pids: number[] = [];
-afterAll(() => {
-	for (const pid of pids) {
+
+/**
+ * What one case made: its tmp directories, the subprocesses it spawned, and the other processes it took (each pid with the
+ * start time `ps` gave when the case took it, its identity: a pid already gone then is never signalled, and a pid that names
+ * another process by release is left alone). The case's own wrapper (`test` below) releases them inside the case's own time.
+ */
+interface Owned {
+	name: string;
+	dirs: string[];
+	subprocs: { pid: number; exitCode: number | null; signalCode: string | null; exited: Promise<number>; kill(signal?: NodeJS.Signals): void }[];
+	procs: { pid: number; started: number }[];
+}
+let owner: Owned | null = null;
+function owning(what: string): Owned {
+	if (owner === null) throw new Error(`as2test.test.ts: ${what} was made outside a case; only a case can own it`);
+	return owner;
+}
+
+/**
+ * `pid → start time (µs)` for those of `list` that exist now (a zombie exists), from the detector's own spawn-free process
+ * list (`snapshot`, sysctl KERN_PROC_UID): no ps, which a sandboxed run may not spawn.
+ */
+function startTimes(list: number[]): Map<number, number> {
+	const out = new Map<number, number>();
+	if (list.length === 0) return out;
+	const s = snapshot(process.getuid!());
+	if (s.kind !== "ok") throw new Error(`the process list for pids ${list.join(", ")} is ${s.kind}: ${s.why}`);
+	for (const p of s.procs) if (list.includes(p.pid)) out.set(p.pid, p.startUs);
+	return out;
+}
+
+/** The current case owns these processes (fixture pids, process group leaders): it SIGKILLs and reaps them at its end. */
+function own(...list: number[]): void {
+	const o = owning(`a process (${list.join(", ")})`);
+	for (const [pid, started] of startTimes(list)) o.procs.push({ pid, started });
+}
+
+/**
+ * Release what `o` owns: SIGKILL each subprocess still running and each taken process that is still the one taken, await
+ * every exit (a subprocess's `exited`, any other process's kernel exit event through `exitOf`), then unseal and remove its
+ * directories. Every failure is returned, none stops the rest.
+ */
+async function release(o: Owned): Promise<Error[]> {
+	const errors: Error[] = [];
+	const failed = (what: string, error: unknown) => errors.push(new Error(`${what}: ${error instanceof Error ? error.message : String(error)}`, { cause: error }));
+	for (const p of o.subprocs) {
+		if (p.exitCode !== null || p.signalCode !== null) continue;
 		try {
-			process.kill(pid, "SIGKILL");
-		} catch {
-			// already gone
+			p.kill("SIGKILL");
+		} catch (error) {
+			failed(`SIGKILL subprocess ${p.pid}`, error);
 		}
 	}
-	for (const r of made) {
-		unseal(r);
-		rmSync(r, { recursive: true, force: true });
+	const killed: number[] = [];
+	let now = new Map<number, number>();
+	try {
+		now = startTimes([...new Set(o.procs.map((p) => p.pid))]);
+	} catch (error) {
+		failed("reading the start times of the owned processes", error);
 	}
-});
+	for (const { pid, started } of o.procs) {
+		if (now.get(pid) !== started || killed.includes(pid)) continue;
+		try {
+			process.kill(pid, "SIGKILL");
+			killed.push(pid);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ESRCH") failed(`SIGKILL ${pid}`, error);
+		}
+	}
+	const exits = await Promise.allSettled([...o.subprocs.map((p) => p.exited), ...killed.map((pid) => exitOf(pid))]);
+	for (const e of exits) if (e.status === "rejected") failed("awaiting an owned process's exit", e.reason);
+	for (const d of o.dirs) {
+		try {
+			unseal(d);
+			rmSync(d, { recursive: true, force: true });
+		} catch (error) {
+			failed(`removing ${d}`, error);
+		}
+	}
+	return errors;
+}
+
+/** A case whose `finally` bun test never ran (it timed out): its leftovers are released by the next case, or after the file. */
+async function releaseAbandoned(): Promise<void> {
+	const left = owner;
+	if (left === null) return;
+	owner = null;
+	const errors = await release(left);
+	if (errors.length > 0) throw new AggregateError(errors, `releasing what the abandoned case "${left.name}" owned failed: ${errors.map((e) => e.message).join("; ")}`);
+}
+afterAll(releaseAbandoned);
+
+/**
+ * bun test's `test`, with the case owning what it makes: its body runs, then everything it owns is released and awaited
+ * inside its own timeout. A body failure is rethrown as is; a release failure fails the case too, joined with the body's.
+ */
+function test(name: string, body: () => unknown, timeout?: number): void {
+	bunTest(name, async () => {
+		await releaseAbandoned();
+		const o: Owned = { name, dirs: [], subprocs: [], procs: [] };
+		owner = o;
+		let failure: { error: unknown } | null = null;
+		try {
+			await body();
+		} catch (error) {
+			failure = { error };
+		}
+		owner = null;
+		const errors = await release(o);
+		if (failure && errors.length > 0) throw new AggregateError([failure.error, ...errors], `${name}: the case failed, and releasing what it owned failed too: ${errors.map((e) => e.message).join("; ")}`);
+		if (failure) throw failure.error;
+		if (errors.length > 0) throw new AggregateError(errors, `${name}: releasing what the case owned failed: ${errors.map((e) => e.message).join("; ")}`);
+	}, timeout);
+}
+
 const dir = (tag: string): string => {
+	const o = owning(`the tmp dir ${tag}`);
 	const d = realpathSync(tmp(`as2test-${tag}`));
-	made.push(d);
+	o.dirs.push(d);
 	return d;
 };
 
@@ -97,15 +199,14 @@ const alive = (pid: number): boolean => {
 		return false;
 	}
 };
-// These tests drive real processes, signals and file locks, so they poll the condition they await;
-// fake timers cannot move another process's clock.
-async function until(cond: () => boolean, ms: number): Promise<boolean> {
-	const end = Date.now() + ms;
-	while (Date.now() < end) {
-		if (cond()) return true;
-		await Bun.sleep(25);
-	}
-	return cond();
+/** Every pid in `list` has exited: each one's kernel exit event (`exitOf`); a pid already gone counts. */
+async function exited(...list: number[]): Promise<void> {
+	await Promise.all(list.map(exitOf));
+}
+
+/** `path` exists, awaited on its directory's events (`when`); `p` exiting first is an error. */
+function appeared(path: string, what: string, p?: Wrapper): Promise<true> {
+	return when(dirname(path), () => (existsSync(path) ? true : undefined), what, p);
 }
 
 function git(cwd: string, ...args: string[]): string {
@@ -179,8 +280,9 @@ function call(b: Box, c: WrapperCall): Ran {
 	return { exit: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
 }
 function spawnCall(b: Box, c: WrapperCall, exec = b.exec) {
+	const o = owning("a wrapper call");
 	const p = Bun.spawn(execArgv(c, exec), { env: callerEnv(b), stdout: "pipe", stderr: "pipe" });
-	pids.push(p.pid);
+	o.subprocs.push(p);
 	return p;
 }
 
@@ -301,10 +403,15 @@ const captureLeftovers = (work: string): string[] => readdirSync(work).filter((n
 // ---- the wrapper's argv checks ---------------------------------------------------------------------------
 
 describe("the wrapper refuses bad argv", () => {
-	const b = box("argv");
-	setCurrent(b, "tr-a1");
+	/** The case's own box, current run tr-a1. */
+	const argvBox = (): Box => {
+		const b = box("argv");
+		setCurrent(b, "tr-a1");
+		return b;
+	};
 
 	test("a run id outside ^tr-[a-z0-9]+$ is refused, by the sh wrapper and by test-exec itself", () => {
+		const b = argvBox();
 		for (const id of ["tr-", "tr-A1", "tr-a_1", "x-a1", "tr-a1/../b", "tr-a1 ", "../tr-a1"]) {
 			const r = raw(b, ["full", id]);
 			expect(r.exit).toBe(WRAPPER_EXIT.refused);
@@ -318,6 +425,7 @@ describe("the wrapper refuses bad argv", () => {
 	});
 
 	test("wrong arity is refused for every subcommand", () => {
+		const b = argvBox();
 		for (const args of [["full"], ["full", "tr-a1", "x"], ["sweep", "tr-a1", "x"], ["prepare", "tr-a1"], ["prepare", "tr-a1", "a".repeat(40), "x"], ["solo", "tr-a1"],
 			["solo", "tr-a1", "./a.test.ts", "./b.test.ts"], ["cleanup", "tr-a1"], ["cleanup", "tr-a1", "tr-b", "tr-c"], ["probe", "tr-a1"], ["bogus", "tr-a1"],
 			["base-prepare", "tr-a1"], ["base-solo", "tr-a1"], ["base-solo", "tr-a1", "./a.test.ts", "./b.test.ts"], ["fast", "tr-a1"]]) {
@@ -327,6 +435,7 @@ describe("the wrapper refuses bad argv", () => {
 	});
 
 	test("prepare refuses a sha that is not 40 hex", () => {
+		const b = argvBox();
 		const r = raw(b, ["prepare", "tr-a1", "abc123"]);
 		expect(r.exit).toBe(WRAPPER_EXIT.refused);
 		expect(r.stderr).toContain("not a full sha");
@@ -596,8 +705,8 @@ describe("prepare, full and solo", () => {
 		expect(Date.now() - t0).toBeLessThan(2_400 + CAPTURE_MS + 500 + 5_000);
 		const work = workOf(b, "tr-c1");
 		const pid = Number(readFileSync(join(work, "slow.pid"), "utf8"));
-		pids.push(pid);
-		expect(await until(() => !alive(pid), 3_000)).toBe(true);
+		own(pid);
+		await exited(pid);
 		const leader = Number(readFileSync(join(work, "groups"), "utf8").trim());
 		const text = readFileSync(join(work, "full.stuck.log"), "utf8");
 		const s = stuckSections(text);
@@ -696,12 +805,12 @@ describe("fullWorkers: the PR full part runs its files at once; base and a keyle
 		`;
 		prepared(b, "tr-dc1", { "detached.test.ts": fixture }, { fullCapMin: 0.04, soloCapMin: 0.04 });
 		const sibling = Bun.spawn(["/bin/sleep", "300"]);
-		pids.push(sibling.pid);
+		own(sibling.pid);
 		try {
 			const r = call(b, { sub: "full", runId: "tr-dc1" });
 			const work = workOf(b, "tr-dc1");
 			const { group, child } = JSON.parse(readFileSync(join(work, "detached.json"), "utf8")) as { group: number; child: number };
-			pids.push(group, child);
+			own(group, child);
 			expect(r.exit).toBe(WRAPPER_EXIT.timeout);
 			expect(r.stderr).toContain("timeout: the part passed its cap of 2400 ms");
 			// The leader cannot reap this detached group, and neither it nor its child cooperates with TERM.
@@ -710,7 +819,7 @@ describe("fullWorkers: the PR full part runs its files at once; base and a keyle
 			const s = call(b, { sub: "sweep", runId: "tr-dc1" });
 			expect(s.stderr).toBe("");
 			expect(s.exit).toBe(WRAPPER_EXIT.ok);
-			expect(await until(() => !alive(group) && !alive(child), 3_000)).toBe(true);
+			await exited(group, child);
 			expect(alive(sibling.pid)).toBe(true);
 		} finally {
 			sibling.kill("SIGKILL");
@@ -754,13 +863,13 @@ describe("fullWorkers: the PR full part runs its files at once; base and a keyle
 			writeFileSync(target, "UNCHANGED\n");
 			const p = spawnCall(b, { sub: "full", runId });
 			try {
-				const completed = await until(() => p.exitCode !== null, 2_400 + 2_000 + 500 + 5_000);
+				// Not blocked on the hostile file: the wrapper exits (a block would hold it past the case's own timeout).
+				const code = await p.exited;
 				const { group, child } = JSON.parse(readFileSync(join(work, "detached.json"), "utf8")) as { group: number; child: number };
 				const leader = Number(readFileSync(join(work, "leader.pid"), "utf8"));
-				pids.push(leader, group, child);
+				own(leader, group, child);
 				expect(existsSync(join(work, "groups-swapped"))).toBe(true);
-				expect(completed).toBe(true);
-				expect(p.exitCode).toBe(WRAPPER_EXIT.failed);
+				expect(code).toBe(WRAPPER_EXIT.failed);
 				const stderr = await new Response(p.stderr).text();
 				expect(stderr).toContain("timeout: the part passed its cap of 2400 ms; its group was killed");
 				expect(stderr).toContain(`timeout cleanup: cannot persist descendant groups to ${join(work, "groups")}`);
@@ -768,7 +877,7 @@ describe("fullWorkers: the PR full part runs its files at once; base and a keyle
 				expect(lstatSync(join(work, "groups"))[how === "fifo" ? "isFIFO" : "isSymbolicLink"]()).toBe(true);
 				expect(readFileSync(target, "utf8")).toBe("UNCHANGED\n");
 				// Do not sweep: its existing pathname read is unsafe for this deliberately hostile groups file.
-				expect(await until(() => [leader, group, child].every((pid) => !alive(pid)), 3_000)).toBe(true);
+				await exited(leader, group, child);
 			} finally {
 				if (p.exitCode === null) p.kill("SIGKILL");
 				await p.exited;
@@ -787,7 +896,7 @@ describe("fullWorkers: the PR full part runs its files at once; base and a keyle
 		const work = workOf(b, "tr-pc1");
 		const workers = [...runners(work)];
 		const children = readdirSync(work).filter((n) => n.startsWith("child-")).map((n) => Number(readFileSync(join(work, n), "utf8")));
-		pids.push(...workers, ...children);
+		own(...workers, ...children);
 		// Every file had started on its own worker before the cap fired.
 		expect(workers).toHaveLength(3);
 		expect(children).toHaveLength(3);
@@ -797,7 +906,7 @@ describe("fullWorkers: the PR full part runs its files at once; base and a keyle
 		const s = call(b, { sub: "sweep", runId: "tr-pc1" });
 		expect(s.stderr).toBe("");
 		expect(s.exit).toBe(WRAPPER_EXIT.ok);
-		expect(await until(() => [...workers, ...children].every((pid) => !alive(pid)), 3_000)).toBe(true);
+		await exited(...workers, ...children);
 	}, 90_000);
 });
 
@@ -909,8 +1018,8 @@ describe("fast: only the named ./ test files inside the clone, in one bun test c
 		expect(r.stderr).toContain("timeout: the part passed its cap of 2400 ms; its group was killed");
 		const work = workOf(b, "tr-fc1");
 		const pid = Number(readFileSync(join(work, "slow.pid"), "utf8"));
-		pids.push(pid);
-		expect(await until(() => !alive(pid), 3_000)).toBe(true);
+		own(pid);
+		await exited(pid);
 		// The capture ran before the kill (cut at its 2 s deadline here): its file names the stuck process in the group's tree.
 		expect(treePids(stuckSections(readFileSync(join(work, "fast.stuck.log"), "utf8"))["1"]!)).toContain(pid);
 	}, 60_000);
@@ -932,15 +1041,16 @@ describe("the stuck capture at the cap: bounded, safe reads, never blocks the ki
 		writeFileSync(`${hook}.pause`, "");
 		const p = spawnCall(b, { sub: "full", runId: "tr-cut1" });
 		try {
-			expect(await until(() => p.exitCode !== null, 2_400 + 2_000 + 500 + 5_000)).toBe(true);
+			// The wrapper exits while the capture is still held at its hook: the cut ended it.
+			const code = await p.exited;
 			expect(existsSync(`${hook}.reached`)).toBe(true);
 			expect(existsSync(`${hook}.go`)).toBe(false);
-			expect(p.exitCode).toBe(WRAPPER_EXIT.timeout);
+			expect(code).toBe(WRAPPER_EXIT.timeout);
 			expect(await new Response(p.stderr).text()).toContain(TIMEOUT_LINE);
 			const work = workOf(b, "tr-cut1");
 			const pid = Number(readFileSync(join(work, "slow.pid"), "utf8"));
-			pids.push(pid);
-			expect(await until(() => !alive(pid), 3_000)).toBe(true);
+			own(pid);
+			await exited(pid);
 			const text = readFileSync(join(work, "full.stuck.log"), "utf8");
 			const cutAt = Number(/^capture cut at (\d+) ms$/m.exec(text)?.[1]);
 			expect(cutAt).toBeGreaterThanOrEqual(2_000);
@@ -949,44 +1059,48 @@ describe("the stuck capture at the cap: bounded, safe reads, never blocks the ki
 			expect(Object.keys(stuckSections(text))).toEqual(["1"]);
 			expect(captureLeftovers(work)).toEqual([]);
 			const tools = capturePids(text);
-			expect(await until(() => tools.every((t) => !alive(t)), 2_000)).toBe(true);
+			await exited(...tools);
 		} finally {
 			writeFileSync(`${hook}.go`, "");
 		}
 	}, 60_000);
 
-	test("a cap dir filled by a same-account process with 20,000 entries never delays the kill: the group dies within captureMs + grace + slack of the capture's start, the file says the dir was left for after the kill, and the wrapper removes it before it exits timeout", async () => {
-		const captureMs = 2_500;
-		const b = box("fill", { captureMs });
+	test("a cap dir filled by a same-account process with 20,000 entries never delays the kill: the capture leaves the dir for after the kill, the part's worker is dead before that removal ends, and the wrapper removes it before it exits timeout", async () => {
+		const b = box("fill", { captureMs: 2_500 });
 		prepared(b, "tr-fill1", { "slow.test.ts": SLOW_TEST }, CAPS);
 		const hook = join(b.hooks, "tr-fill1.stuck-capture");
 		writeFileSync(`${hook}.pause`, "");
-		// Empty directories: cheap to plant and dear to remove recursively (about 2 s for 20,000), so a recursive removal before
-		// the kill would push the kill past the bound below. They are planted before the run, so the cap dir is filled by one
-		// rename inside the capture window: 20,000 mkdirs there raced the deadline on a loaded host (tr-0mvs6sjezd3t06f).
+		// Empty directories: cheap to plant and dear to remove recursively (seconds for 20,000). They are planted before the
+		// run, so the cap dir is filled by one rename inside the capture window: 20,000 mkdirs there raced the deadline on a
+		// loaded host (tr-0mvs6sjezd3t06f).
 		const filled = join(dir("fill-planted"), "planted");
 		mkdirSync(filled);
 		for (let i = 0; i < 20_000; i++) mkdirSync(join(filled, `planted-${i}`));
-		const t0 = Date.now();
 		const p = spawnCall(b, { sub: "full", runId: "tr-fill1" });
 		try {
-			expect(await until(() => existsSync(`${hook}.reached`), 2_400 + 5_000)).toBe(true);
-			// The capture started before its hook was reached, so its deadline is at or before `at + captureMs`.
-			const { at } = JSON.parse(readFileSync(`${hook}.reached`, "utf8")) as { at: number };
+			await when(b.hooks, () => (existsSync(`${hook}.reached`) ? true : undefined), "the stuck-capture hook", p);
 			const work = workOf(b, "tr-fill1");
 			const pid = Number(readFileSync(join(work, "slow.pid"), "utf8"));
-			pids.push(pid);
+			own(pid);
 			const capDirs = readdirSync(work).filter((n) => n.startsWith("full.stuck-"));
 			expect(capDirs).toHaveLength(1);
 			const capDir = join(work, capDirs[0]!);
-			// The planted dir takes the cap dir's place while it is still empty (the 3 s sample writes its report at its end),
-			// all before the deadline, so the cut meets every entry.
+			// The planted dir takes the cap dir's place while the capture is held at its hook (the cap dir is still empty: the
+			// 3 s sample writes its report at its end), so the cut meets every entry; the log line below says it did.
 			renameSync(filled, capDir);
 			expect(readdirSync(capDir)).toHaveLength(20_000);
-			expect(Date.now()).toBeLessThan(at + captureMs);
-			expect(await until(() => !alive(pid), at + captureMs + 500 + 1_000 - Date.now())).toBe(true);
-			expect(await until(() => p.exitCode !== null, 2_400 + captureMs + 500 + 8_000 - (Date.now() - t0))).toBe(true);
-			expect(p.exitCode).toBe(WRAPPER_EXIT.timeout);
+			// The order is the subject, not a bound: the executor removes the dir only after it killed the group, so when the
+			// dir is gone the worker has exited (a zombie or reaped). A removal before the kill, recursive and seconds long,
+			// would end with the worker still running its hang.
+			const worker = await when(work, () => {
+				if (existsSync(capDir)) return undefined;
+				const s = snapshot(process.getuid!());
+				if (s.kind !== "ok") throw new Error(`the process list at the cap dir's removal is ${s.kind}: ${s.why}`);
+				const w = s.procs.find((x) => x.pid === pid);
+				return w === undefined ? "gone" : w.zombie ? "zombie" : "running";
+			}, "the cap dir's removal", p);
+			expect(worker).not.toBe("running");
+			expect(await p.exited).toBe(WRAPPER_EXIT.timeout);
 			expect(await new Response(p.stderr).text()).toContain(TIMEOUT_LINE);
 			const text = readFileSync(join(work, "full.stuck.log"), "utf8");
 			expect(text).toMatch(/^capture cut at \d+ ms$/m);
@@ -1009,19 +1123,17 @@ describe("the stuck capture at the cap: bounded, safe reads, never blocks the ki
 			prepared(b, runId, { "swap.test.ts": hangAfter(`unlinkSync("../full.log");\n\t${swap}`) }, CAPS);
 			const hook = join(b.hooks, `${runId}.stuck-sample-read`);
 			writeFileSync(`${hook}.pause`, "");
-			const t0 = Date.now();
 			const p = spawnCall(b, { sub: "full", runId });
-			expect(await until(() => existsSync(`${hook}.reached`), 2_400 + CAPTURE_MS)).toBe(true);
+			await appeared(`${hook}.reached`, "the stuck-sample-read hook", p);
 			const { report } = JSON.parse(readFileSync(`${hook}.reached`, "utf8")) as { report: string };
 			rmSync(report, { force: true });
 			if (how === "fifo") expect(Bun.spawnSync(["/usr/bin/mkfifo", report]).exitCode).toBe(0);
 			else symlinkSync(secret, report);
 			writeFileSync(`${hook}.go`, "");
-			expect(await until(() => p.exitCode !== null, 2_400 + CAPTURE_MS + 500 + 5_000 - (Date.now() - t0))).toBe(true);
-			expect(p.exitCode).toBe(WRAPPER_EXIT.timeout);
+			expect(await p.exited).toBe(WRAPPER_EXIT.timeout);
 			expect(await new Response(p.stderr).text()).toContain(TIMEOUT_LINE);
 			const work = workOf(b, runId);
-			pids.push(Number(readFileSync(join(work, "slow.pid"), "utf8")));
+			own(Number(readFileSync(join(work, "slow.pid"), "utf8")));
 			const text = readFileSync(join(work, "full.stuck.log"), "utf8");
 			expect(text).not.toContain("capture cut");
 			expect(text).not.toContain("SECRET-CONTENT");
@@ -1048,7 +1160,7 @@ describe("the stuck capture at the cap: bounded, safe reads, never blocks the ki
 			expect(r.stderr).toContain(TIMEOUT_LINE);
 			expect(r.stderr).toContain(`stuck capture skipped: cannot create ${join(workOf(b, runId), "full.stuck.log")}`);
 			const work = workOf(b, runId);
-			pids.push(Number(readFileSync(join(work, "slow.pid"), "utf8")));
+			own(Number(readFileSync(join(work, "slow.pid"), "utf8")));
 			if (how === "file") expect(readFileSync(join(work, "full.stuck.log"), "utf8")).toBe("planted\n");
 			else expect(lstatSync(join(work, "full.stuck.log")).isSymbolicLink()).toBe(true);
 			expect(readFileSync(target, "utf8")).toBe("untouched\n");
@@ -1065,14 +1177,14 @@ describe("the stuck capture at the cap: bounded, safe reads, never blocks the ki
 		expect(r.stderr).toContain(TIMEOUT_LINE);
 		const work = workOf(b, "tr-sc1");
 		const pid = Number(readFileSync(join(work, "slow.pid"), "utf8"));
-		pids.push(pid);
+		own(pid);
 		const text = readFileSync(join(work, "solo-1.stuck.log"), "utf8");
 		expect(Object.keys(stuckSections(text))).toEqual(["1", "2", "3", "4"]);
 		expect(treePids(stuckSections(text)["1"]!)).toContain(pid);
 		expect(text).toContain(`== 4. last 200 lines of ${join(work, "solo-1.log")} (`);
 		expect(existsSync(join(work, "full.stuck.log"))).toBe(false);
 		expect(captureLeftovers(work)).toEqual([]);
-		expect(await until(() => !alive(pid), 3_000)).toBe(true);
+		await exited(pid);
 	}, 60_000);
 });
 
@@ -1266,10 +1378,10 @@ function published(work: string, name: string): string | undefined {
 	return existsSync(path) ? readFileSync(path, "utf8") : undefined;
 }
 
-/** The spin fixture's `Ready` (its worker joins the pids afterAll kills); the wrapper exiting first is an error. */
+/** The spin fixture's `Ready` (the case owns its worker); the wrapper exiting first is an error. */
 async function readySpin(work: string, p: Wrapper): Promise<Ready> {
 	const r = JSON.parse(await when(join(work, "ready-spin"), () => published(work, "ready-spin"), "the spin fixture's ready-spin", p)) as Ready;
-	pids.push(r.worker);
+	own(r.worker);
 	return r;
 }
 
@@ -1323,11 +1435,87 @@ async function feedToMatch(tick: (at: number, cpu: Record<number, number>) => Pr
 /** The test knobs of a fed detector: STUCK_DEFAULTS tick and persistence on fed time, the trace on. */
 const FED = { detectFeed: true, detectTrace: true } as const;
 
-/** The pid a fixture wrote to `<work>/<name>`, added to the pids afterAll kills. */
+/** The pid a fixture wrote to `<work>/<name>`, owned by the case. */
 function fixturePid(work: string, name: string): number {
 	const pid = Number(readFileSync(join(work, name), "utf8"));
-	pids.push(pid);
+	own(pid);
 	return pid;
+}
+
+/**
+ * A fed-tick fixture's gates: `gate(g)` opens `<work>/<g>.go` (a FIFO the test made, `makeGates`) read-write, so the open never
+ * waits for a writer, publishes `<work>/<g>/pid` whole by a rename from outside `<g>`, then blocks reading the FIFO until the
+ * test's line (`pass`). SLEEP is `<work>/bin/sleep`, a call's child named sleep that does the same for the gate its argument
+ * names. A tick fed at a gate sees the fixture exactly there: no clock decides what a tick observes.
+ */
+const GATE_HEAD = `const __fs = require("node:fs");
+const W = require("node:path").resolve("..");
+const SLEEP = W + "/bin/sleep";
+/** Publish <W>/<g>/pid whole (this process's pid), without waiting. */
+function announce(g) {
+	__fs.writeFileSync(W + "/" + g + ".tmp", String(process.pid));
+	__fs.renameSync(W + "/" + g + ".tmp", W + "/" + g + "/pid");
+}
+function gate(g) {
+	const fd = __fs.openSync(W + "/" + g + ".go", "r+");
+	try {
+		announce(g);
+		if (__fs.readSync(fd, Buffer.alloc(1)) !== 1) throw new Error("gate " + g + ": its FIFO gave no line");
+	} finally {
+		__fs.closeSync(fd);
+	}
+}
+/** gate(), with the event loop free while it waits. */
+async function gateAsync(g) {
+	const fh = await __fs.promises.open(W + "/" + g + ".go", "r+");
+	try {
+		announce(g);
+		if ((await fh.read(Buffer.alloc(1), 0, 1)).bytesRead !== 1) throw new Error("gate " + g + ": its FIFO gave no line");
+	} finally {
+		await fh.close();
+	}
+}
+`;
+
+/** Make the gates `names` in `work` (each an empty publication dir and a FIFO) and `<work>/bin/sleep`, GATE_HEAD's SLEEP. */
+function makeGates(work: string, names: string[]): void {
+	readyDirs(work, ...names);
+	const r = Bun.spawnSync(["/usr/bin/mkfifo", ...names.map((g) => join(work, `${g}.go`))], { stdout: "pipe", stderr: "pipe" });
+	if (r.exitCode !== 0) throw new Error(`/usr/bin/mkfifo in ${work} exited ${r.exitCode}: ${r.stderr.toString()}`);
+	mkdirSync(join(work, "bin"));
+	const at = (suffix: string) => `'${work}/'"$1"'${suffix}'`;
+	writeFileSync(join(work, "bin", "sleep"), [
+		"#!/bin/sh",
+		"# GATE_HEAD's gate() for the gate named by $1: open its FIFO read-write, publish $$ whole, block until the test's line.",
+		`exec 3<>${at(".go")} || exit 3`,
+		`printf '%s' "$$" > ${at(".tmp")} && /bin/mv ${at(".tmp")} ${at("/pid")} || exit 3`,
+		"IFS= read -r _ <&3 || exit 3",
+		"exit 0",
+		"",
+	].join("\n"), { mode: 0o755 });
+}
+
+/** Await gate `g`'s publication (`announce`); returns the pid it published. */
+async function reached(work: string, g: string, p: Wrapper): Promise<number> {
+	return Number(await when(join(work, g), () => published(work, g), `the gate ${g}`, p));
+}
+
+/** Let the fixture through gate `g`: one line on its FIFO, written non-blocking (the fixture holds it open, so a missing reader is an error, never a wait). */
+function letThrough(work: string, g: string): void {
+	const fd = openSync(join(work, `${g}.go`), constants.O_WRONLY | constants.O_NONBLOCK);
+	try {
+		writeSync(fd, "\n");
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/** Await gate `g`, feed the tick there (`tick`), then let the fixture through; returns that tick's ack. */
+async function pass(work: string, g: string, p: Wrapper, tick: () => Promise<Ack>): Promise<Ack> {
+	await reached(work, g, p);
+	const ack = await tick();
+	letThrough(work, g);
+	return ack;
 }
 
 /**
@@ -1511,75 +1699,73 @@ function byteGetterCall(cp: typeof childProcess, shape: "own" | "inherited" | "n
 }
 
 /**
- * The real preload's qualification fixture (PLAN sl-sd-exec). Each phase logs its window to ../qual.jsonl and idles 1 s after,
- * so the trace's 250 ms ticks see the marker during the call and its absence after. A phase whose command is "" must run with
- * no marker of this worker active at all: the call's arguments ran test code, so it is unpublished.
+ * The real preload's qualification fixture (PLAN sl-sd-exec), on gates (GATE_HEAD): each phase's call blocks at its gates
+ * (`in-<phase>` in the call's child, `get-<phase>` in a getter test code runs for it), then the phase logs its window to
+ * ../qual.jsonl and stops at `after-<phase>`, so a fed tick sees the marker during the call and its absence after. A phase
+ * whose command is "" must run with no marker of this worker active at all: the call's arguments ran test code, so it is
+ * unpublished. QUAL_PHASES lists the gates in the order this file reaches them.
  */
 const QUAL_TEST = `import { test } from "bun:test";
 import * as cp from "node:child_process";
 import { appendFileSync } from "node:fs";
+${GATE_HEAD}
 const callFields = ${callFields.toString()};
 const r3GetterCall = ${r3GetterCall.toString()};
 const byteGetterCall = ${byteGetterCall.toString()};
 const log = (o) => appendFileSync("../qual.jsonl", JSON.stringify(o) + "\\n");
-const idle = (ms = 2_000) => Bun.sleep(ms);
-// A real hot computation on the real clock: the detector samples this process's CPU over real 250 ms ticks, so no fake time.
-const spin = (ms) => {
-	const end = Date.now() + ms;
-	while (Date.now() < end) {}
-};
 async function phase(name, command, f) {
 	const start = Date.now();
 	const out = f();
 	const end = Date.now();
 	log({ name, command, start, end, out });
-	await idle();
+	gate("after-" + name);
 }
 test("qualifies", async () => {
 	const marker = process.env.AS2TEST_STUCK_MARKERS + "/" + process.pid;
 	log({ name: "start", pid: process.pid, preloadGlobal: globalThis.__fixturePreload ?? null, wrapped: Bun.spawnSync[Symbol.for("as2test.stuck-marker")] === true });
-	await idle();
-	await phase("bun", "sleep", () => Bun.spawnSync(["/bin/sleep", "2"]).exitCode);
+	gate("start");
+	await phase("bun", "sleep", () => Bun.spawnSync([SLEEP, "in-bun"]).exitCode);
 	// Plain data in every option (helpers.ts's sh shape, a spread of process.env): published. process.env itself is not plain
 	// data in bun (TZ and the proxy variables are accessors), so a call given it runs unpublished.
-	await phase("bun-options-no-bytes", "sleep", () => Bun.spawnSync(["/bin/sleep", "2"], { cwd: "/", env: { ...process.env }, stdin: "ignore", stdout: "pipe", stderr: "pipe" }).exitCode);
+	await phase("bun-options-no-bytes", "sleep", () => Bun.spawnSync([SLEEP, "in-bun-options-no-bytes"], { cwd: "/", env: { ...process.env }, stdin: "ignore", stdout: "pipe", stderr: "pipe" }).exitCode);
 	// Review r4: bytes in any option (here a Buffer stdin) run unpublished, since bun looks up a byte container's
 	// Symbol.asyncIterator, own or inherited, before it takes the bytes.
-	await phase("bun-options", "", () => Bun.spawnSync(["/bin/sleep", "2"], { cwd: "/", env: { ...process.env }, stdin: Buffer.from("x"), stdout: "pipe", stderr: "pipe" }).exitCode);
-	await phase("node-spawnSync", "sleep", () => cp.spawnSync("/bin/sleep", ["2"]).status);
-	await phase("node-execSync", "sh", () => cp.execSync("/bin/sleep 2; echo slept").toString());
-	await phase("node-execFileSync", "sleep", () => cp.execFileSync("/bin/sleep", ["2"]).toString());
+	await phase("bun-options", "", () => Bun.spawnSync([SLEEP, "in-bun-options"], { cwd: "/", env: { ...process.env }, stdin: Buffer.from("x"), stdout: "pipe", stderr: "pipe" }).exitCode);
+	await phase("node-spawnSync", "sleep", () => cp.spawnSync(SLEEP, ["in-node-spawnSync"]).status);
+	await phase("node-execSync", "sh", () => cp.execSync('"' + SLEEP + '" in-node-execSync; echo slept').toString());
+	await phase("node-execFileSync", "sleep", () => cp.execFileSync(SLEEP, ["in-node-execFileSync"]).toString());
 	// node's own options object with cwd, env, timeout and no input: published.
-	await phase("node-options-no-input", "sleep", () => cp.spawnSync("/bin/sleep", ["2"], { cwd: "/", env: { PATH: "/bin" }, timeout: 30_000, encoding: "utf8" }).status);
+	await phase("node-options-no-input", "sleep", () => cp.spawnSync(SLEEP, ["in-node-options-no-input"], { cwd: "/", env: { PATH: "/bin" }, timeout: 30_000, encoding: "utf8" }).status);
 	// The same with input (node puts a Buffer in its stdio array): unpublished (review r4).
-	await phase("node-options", "", () => cp.spawnSync("/bin/sleep", ["2"], { cwd: "/", env: { PATH: "/bin" }, input: "x", timeout: 30_000, encoding: "utf8" }).status);
-	// Review r4: a hot 1.2 s Symbol.asyncIterator getter on a Buffer stdin (own, then inherited from a subclass prototype) and on
-	// node's execFileSync input, which bun runs before it takes the bytes, then the 1 s sleep itself: all unpublished.
-	await phase("byte-own-getter", "", () => byteGetterCall(cp, "own", ["/bin/sleep", "1"], () => spin(1_200)));
-	await phase("byte-inherited-getter", "", () => byteGetterCall(cp, "inherited", ["/bin/sleep", "1"], () => spin(1_200)));
-	await phase("byte-node-input-getter", "", () => byteGetterCall(cp, "node-input", ["/bin/sleep", "1"], () => spin(1_200)));
-	// Test code the original runs while it reads its arguments: a hot 1.2 s getter, then the 1 s sleep itself, all unpublished.
+	await phase("node-options", "", () => cp.spawnSync(SLEEP, ["in-node-options"], { cwd: "/", env: { PATH: "/bin" }, input: "x", timeout: 30_000, encoding: "utf8" }).status);
+	// Review r4: a Symbol.asyncIterator getter on a Buffer stdin (own, then inherited from a subclass prototype) and on node's
+	// execFileSync input, which bun runs before it takes the bytes, then the call itself: all unpublished.
+	for (const shape of ["own", "inherited", "node-input"]) {
+		const name = "byte-" + shape + "-getter";
+		await phase(name, "", () => byteGetterCall(cp, shape, [SLEEP, "in-" + name], () => gate("get-" + name)));
+	}
+	// Test code the original runs while it reads its arguments: the getter, then the call itself, all unpublished.
 	await phase("argv-getter", "", () => {
-		const argv = ["/bin/sleep"];
+		const argv = [SLEEP];
 		Object.defineProperty(argv, 1, { enumerable: true, get() {
-			spin(1_200);
-			return "1";
+			gate("get-argv-getter");
+			return "in-argv-getter";
 		} });
 		return Bun.spawnSync(argv).exitCode;
 	});
-	await phase("cwd-getter", "", () => Bun.spawnSync(["/bin/sleep", "1"], { get cwd() {
-		spin(1_200);
+	await phase("cwd-getter", "", () => Bun.spawnSync([SLEEP, "in-cwd-getter"], { get cwd() {
+		gate("get-cwd-getter");
 		return "/";
 	} }).exitCode);
-	await phase("env-getter", "", () => Bun.spawnSync(["/bin/sleep", "1"], { env: { get PATH() {
-		spin(1_200);
+	await phase("env-getter", "", () => Bun.spawnSync([SLEEP, "in-env-getter"], { env: { get PATH() {
+		gate("get-env-getter");
 		return "/bin";
 	} } }).exitCode);
 	// Review r3: an env array with an enumerable named getter (bun runs it), and an Object.prototype accessor beside a {} options
 	// object (bun 1.3.14 stops its option lookups before Object.prototype, so this getter does not run: the call is unpublished
 	// because Object.prototype is not clean): both unpublished throughout.
-	await phase("env-array-getter", "", () => r3GetterCall("env-array", ["/bin/sleep", "1"], () => spin(1_200)));
-	await phase("proto-cwd-getter", "", () => r3GetterCall("proto-cwd", ["/bin/sleep", "2"], () => spin(1_200)));
+	await phase("env-array-getter", "", () => r3GetterCall("env-array", [SLEEP, "in-env-array-getter"], () => gate("get-env-array-getter")));
+	await phase("proto-cwd-getter", "", () => r3GetterCall("proto-cwd", [SLEEP, "in-proto-cwd-getter"], () => gate("get-proto-cwd-getter")));
 	await phase("fields", null, () => callFields(cp));
 	// A nested call from inside the call's own argv accessor (read by spawnSync itself): neither the outer head nor the nested
 	// sh publishes, so both read the same, earlier marker line.
@@ -1587,7 +1773,7 @@ test("qualifies", async () => {
 		let inner = null;
 		const argv = ["/usr/bin/head", "-c", "200"];
 		Object.defineProperty(argv, 3, { enumerable: true, get() {
-			inner = Bun.spawnSync(["/bin/sh", "-c", 'cat "$0"; exec /bin/sleep 2', marker]);
+			inner = Bun.spawnSync(["/bin/sh", "-c", 'cat "$0"; exec "$1" in-nested-accessor', marker, SLEEP]);
 			return marker;
 		} });
 		const r = Bun.spawnSync(argv);
@@ -1604,19 +1790,18 @@ test("qualifies", async () => {
 		return { outer: cp.execFileSync("/usr/bin/head", args).toString(), inner };
 	});
 	const uchg = Bun.spawnSync(["/usr/bin/chflags", "uchg", marker]).exitCode;
-	await idle();
 	try {
-		await phase("immutable", null, () => ({ uchg, sleep: Bun.spawnSync(["/bin/sleep", "2"]).exitCode, node: cp.spawnSync("/bin/sleep", ["1"]).status, fields: callFields(cp) }));
+		await phase("immutable", "", () => ({ uchg, sleep: Bun.spawnSync([SLEEP, "in-immutable-bun"]).exitCode, node: cp.spawnSync(SLEEP, ["in-immutable-node"]).status, fields: callFields(cp) }));
 	} finally {
 		log({ name: "nouchg", out: Bun.spawnSync(["/usr/bin/chflags", "nouchg", marker]).exitCode });
 	}
-	await idle();
+	// A sleep the call backgrounds outlives it (../inherit.pid: the test owns and kills it) and must hold no marker fd.
 	const start = Date.now();
-	const child = Number(Bun.spawnSync(["/bin/sh", "-c", "/bin/sleep 4 >/dev/null 2>&1 & echo $!"]).stdout.toString().trim());
+	const child = Number(Bun.spawnSync(["/bin/sh", "-c", "/bin/sleep 300 >/dev/null 2>&1 & echo $!"]).stdout.toString().trim());
 	const end = Date.now();
-	await idle(1_500);
-	// lsof is itself a published call of this worker; the test's after-window for this phase ends before it starts.
-	const lsofAt = Date.now();
+	appendFileSync("../inherit.pid", String(child));
+	gate("after-inherit");
+	// lsof is itself a published call of this worker, made after the after-inherit gate's tick.
 	const lsof = Bun.spawnSync(["/usr/sbin/lsof", "-nP", "-p", String(child)]);
 	let alive = true;
 	try {
@@ -1624,54 +1809,82 @@ test("qualifies", async () => {
 	} catch {
 		alive = false;
 	}
-	log({ name: "inherit", command: null, start, end, next: lsofAt, out: { child, alive, lsofExit: lsof.exitCode, holdsMarker: lsof.stdout.toString().includes(marker), lsofHasSleep: lsof.stdout.toString().includes("sleep") } });
+	log({ name: "inherit", command: null, start, end, out: { child, alive, lsofExit: lsof.exitCode, holdsMarker: lsof.stdout.toString().includes(marker), lsofHasSleep: lsof.stdout.toString().includes("sleep") } });
 }, 240_000);
 `;
 
+/** QUAL_TEST's phases in order, each with the gates its call passes before its `after-<phase>` gate. */
+const QUAL_PHASES: [string, string[]][] = [
+	...["bun", "bun-options-no-bytes", "bun-options", "node-spawnSync", "node-execSync", "node-execFileSync", "node-options-no-input", "node-options"].map((n): [string, string[]] => [n, [`in-${n}`]]),
+	...["byte-own-getter", "byte-inherited-getter", "byte-node-input-getter", "argv-getter", "cwd-getter", "env-getter", "env-array-getter", "proto-cwd-getter"].map((n): [string, string[]] => [n, [`get-${n}`, `in-${n}`]]),
+	["fields", []],
+	["nested-accessor", ["in-nested-accessor"]],
+	["nested-node", []],
+	["immutable", ["in-immutable-bun", "in-immutable-node"]],
+	["inherit", []],
+];
+
 describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)", () => {
-	test("the real preload: a bunfig preload still runs beside it; Bun.spawnSync and node's spawnSync, execSync and execFileSync publish a marker during the call and none after, plain-data options included, return and throw what they would unwrapped, run test-owned accessors and proxy traps exactly as often as unwrapped (a throwing one included), run a call whose argv or options hold a getter (an env array's included) or that meets an Object.prototype accessor unpublished (during the getter and the call), run a call carrying bytes (a Buffer stdin, node's input) unpublished, an own or inherited Symbol.asyncIterator getter on them included, publish no call nested in such a getter, an immutable marker only stops publication, and the marker fd is not inherited", () => {
-		const b = box("stuck-qual", DETECT);
+	test("the real preload: a bunfig preload still runs beside it; Bun.spawnSync and node's spawnSync, execSync and execFileSync publish a marker during the call and none after, plain-data options included, return and throw what they would unwrapped, run test-owned accessors and proxy traps exactly as often as unwrapped (a throwing one included), run a call whose argv or options hold a getter (an env array's included) or that meets an Object.prototype accessor unpublished (during the getter and the call), run a call carrying bytes (a Buffer stdin, node's input) unpublished, an own or inherited Symbol.asyncIterator getter on them included, publish no call nested in such a getter, an immutable marker only stops publication, and the marker fd is not inherited", async () => {
+		const b = box("stuck-qual", FED);
 		prepared(b, "tr-sq1", {
 			"bunfig.toml": `[test]\npreload = ["./setup.ts"]\n`,
 			"setup.ts": "(globalThis as Record<string, unknown>).__fixturePreload = 1;\n",
 			"qual.test.ts": QUAL_TEST,
 			"a.test.ts": OK_TEST,
 		}, { fullCapMin: 5, soloCapMin: 5, fullWorkers: 2, stuckStop: "enforce" });
-		const r = call(b, { sub: "full", runId: "tr-sq1" });
 		const work = workOf(b, "tr-sq1");
-		expect(r.stderr).toBe("");
-		expect(r.exit).toBe(0);
+		// bun 1.3.14 runs no Object.prototype accessor beside a {} options object: that phase then passes no getter gate.
+		const getterRuns: Record<string, boolean> = {
+			"env-array-getter": r3GetterCall("env-array", ["/usr/bin/true"], () => {}).hits > 0,
+			"proto-cwd-getter": r3GetterCall("proto-cwd", ["/usr/bin/true"], () => {}).hits > 0,
+		};
+		const order = ["start", ...QUAL_PHASES.flatMap(([name, during]) => [...during.filter((g) => !g.startsWith("get-") || getterRuns[name] !== false), `after-${name}`])];
+		makeGates(work, order);
+		type QualRow = { name: string; command: string | null; start: number; end: number; out: unknown; pid?: number; preloadGlobal?: unknown; wrapped?: boolean };
+		const rowsOf = () => readFileSync(join(work, "qual.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as QualRow);
+		const p = spawnCall(b, { sub: "full", runId: "tr-sq1" });
+		const tick = feeder(b, "tr-sq1", p);
+		// One fed tick at each gate, STUCK_DEFAULTS.tickMs apart on fed time. The worker's CPU is fed flat (sampled, never hot):
+		// it blocks in each call, so no signature may form.
+		let w = 0;
+		const atGate: Record<string, number> = {};
+		for (const [k, g] of order.entries()) {
+			const ack = await pass(work, g, p, () => {
+				if (g === "start") w = rowsOf()[0]!.pid!;
+				return tick(k * STUCK_DEFAULTS.tickMs, { [w]: 0 });
+			});
+			expect({ g, n: ack.n, error: ack.error, ended: ack.ended, signatures: ack.signatures, started: ack.started }).toEqual({ g, n: k + 1, error: undefined, ended: undefined, signatures: [], started: [] });
+			atGate[g] = ack.at!;
+		}
+		own(Number(readFileSync(join(work, "inherit.pid"), "utf8")));
+		const [exit, stdout, stderr] = await Promise.all([p.exited, new Response(p.stdout).text(), new Response(p.stderr).text()]);
+		expect(stderr).toBe("");
+		expect(exit).toBe(0);
 		// No signature ever forms: the worker blocks in each call (never hot) and no child is left unreaped.
-		expect(keywordsOf(r.stdout)).toEqual([]);
-		const rows = readFileSync(join(work, "qual.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as { name: string; command: string | null; start: number; end: number; next?: number; out: unknown; pid?: number; preloadGlobal?: unknown; wrapped?: boolean });
-		const byName = Object.fromEntries(rows.map((x) => [x.name, x]));
+		expect(keywordsOf(stdout)).toEqual([]);
+		const byName = Object.fromEntries(rowsOf().map((x) => [x.name, x]));
 		expect(byName.start).toMatchObject({ preloadGlobal: 1, wrapped: true });
-		const w = byName.start!.pid!;
+		expect(byName.start!.pid).toBe(w);
 		// A worker of --parallel=2, not the leader.
 		expect(w).not.toBe(Number(readFileSync(join(work, "groups"), "utf8").split("\n")[0]));
 		const trace = traceOf(work);
 		expect(trace.every((t) => t.snap === "ok")).toBe(true);
+		expect(trace.map((t) => t.at)).toEqual(order.map((g) => atGate[g]));
 		const mine = (t: TraceRow) => activeAt(t).filter((m) => m.pid === w);
-		const ticks = (from: number, to: number) => trace.filter((t) => t.at > from && t.at < to);
-		const phases = rows.filter((x) => typeof x.start === "number");
-		for (const [i, p] of phases.entries()) {
-			// The worker's next spawn call: the next phase's, or the one a phase names itself (inherit's lsof).
-			const next = phases[i + 1]?.start ?? p.next ?? p.end + 2_000;
-			const during = ticks(p.start + 300, p.end - 300);
-			if (p.command !== null) {
-				expect({ phase: p.name, during: during.length }).toEqual({ phase: p.name, during: expect.any(Number) });
-				expect(during.length).toBeGreaterThanOrEqual(3);
-				for (const t of during) {
-					expect({ phase: p.name, at: t.at, markers: mine(t).map((m) => m.command) }).toEqual({ phase: p.name, at: t.at, markers: p.command === "" ? [] : [p.command] });
-					if (p.command === "") continue;
-					expect(mine(t)[0]!.since).toBeGreaterThanOrEqual(p.start);
-					expect(mine(t)[0]!.since).toBeLessThanOrEqual(p.end);
-				}
+		const seenAt = (g: string) => trace.find((t) => t.at === atGate[g])!;
+		for (const [name, during] of QUAL_PHASES) {
+			const ph = byName[name]!;
+			// During the call (and any getter it runs): the call's command, or no marker when the call is unpublished.
+			for (const g of during.filter((d) => d in atGate)) {
+				const t = seenAt(g);
+				expect({ phase: name, gate: g, markers: mine(t).map((m) => m.command) }).toEqual({ phase: name, gate: g, markers: ph.command === "" ? [] : [ph.command] });
+				if (ph.command === "") continue;
+				expect(mine(t)[0]!.since).toBeGreaterThanOrEqual(ph.start);
+				expect(mine(t)[0]!.since).toBeLessThanOrEqual(ph.end);
 			}
-			// Each phase idles 2 s after its call, so a loaded machine's late 250 ms ticks still land in this window.
-			const after = ticks(p.end + 300, Math.min(p.end + 2_000, next) - 50);
-			expect(after.length).toBeGreaterThanOrEqual(1);
-			for (const t of after) expect({ phase: p.name, at: t.at, markers: mine(t) }).toEqual({ phase: p.name, at: t.at, markers: [] });
+			// After the call returned, before the worker's next call: no marker.
+			expect({ phase: name, markers: mine(seenAt(`after-${name}`)) }).toEqual({ phase: name, markers: [] });
 		}
 		expect(byName.bun!.out).toBe(0);
 		expect([byName["bun-options-no-bytes"]!.out, byName["bun-options"]!.out]).toEqual([0, 0]);
@@ -1715,12 +1928,9 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		expect(viaNode.inner).toMatch(/^\d+\tcat\n$/);
 		expect(viaNode.outer).toMatch(/^\d+\thead\n$/);
 		expect(Number(viaNode.outer.split("\t")[0])).toBeGreaterThanOrEqual(Number(viaNode.inner.split("\t")[0]));
-		// Immutable marker: chflags worked, every call still returned what it would, and no marker was active in its window.
+		// Immutable marker: chflags worked, every call still returned what it would, and no marker was active at its gates (above).
 		const imm = byName.immutable!;
 		expect(imm.out).toEqual({ uchg: 0, sleep: 0, node: 0, fields: plain });
-		const immTicks = ticks(imm.start + 100, imm.end - 100);
-		expect(immTicks.length).toBeGreaterThanOrEqual(3);
-		for (const t of immTicks) expect(mine(t)).toEqual([]);
 		expect(byName.nouchg!.out).toBe(0);
 		// Not inherited: the backgrounded sleep outlived the call, holds no marker fd, and the marker was inactive meanwhile.
 		expect(byName.inherit!.out).toMatchObject({ alive: true, lsofExit: 0, holdsMarker: false, lsofHasSleep: true });
@@ -1749,7 +1959,7 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 			await feedToMatch(feeder(b, "tr-se1", p), ready);
 			// The capture holds at its hook until the helper has made its second group: that group is new during the capture.
 			late = Number(await when(join(work, "ready-late"), () => published(work, "ready-late"), "the late helper's ready-late", p));
-			pids.push(late);
+			own(late);
 		} finally {
 			writeFileSync(`${hook}.go`, "");
 		}
@@ -1823,7 +2033,7 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 				const late = Number(await when(join(work, "ready-late"), () => published(work, "ready-late"), "the late helper's ready-late", p));
 				const helper = fixturePid(work, "helper.pid");
 				const leader = Number(readFileSync(join(work, "groups"), "utf8").split("\n")[0]);
-				pids.push(leader, late);
+				own(leader, late);
 				rmSync(join(work, "groups"));
 				if (how === "fifo") expect(Bun.spawnSync(["/usr/bin/mkfifo", join(work, "groups")], { timeout: 1_000 }).exitCode).toBe(0);
 				else symlinkSync(target, join(work, "groups"));
@@ -1998,26 +2208,83 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		}
 	});
 
-	describe("negative controls: each part ends normally with no signature and no decision (enforce, --parallel=2)", () => {
-		/** One test file per control; `<name>.pid` is the worker's pid. Each runs about 6 s. */
-		const LOOP = "const end = Date.now() + 6_000;\n\twhile (Date.now() < end) {}";
-		/**
-		 * The getter controls' hot computation: as long as LOOP, well past the persistence, so a loaded machine whose late
-		 * executor ticks miss part of it still sees the unmarked zombie over MEANINGFUL_SPAN_MS.
-		 */
-		const GETTER_HOT_MS = 6_000;
-		const fixtures: Record<string, Record<string, string>> = {
-			"zombie-no-marker": {
-				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\t${unreapedTrue()};\n\t${LOOP}\n}, 60_000);\n`,
-			},
-			"returned-call-then-zombie": {
-				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tBun.spawnSync(["/usr/bin/true"]);\n\t${unreapedTrue()};\n\t${LOOP}\n}, 60_000);\n`,
-			},
-			"immutable-marker": {
-				"c.test.ts": `import { test } from "bun:test";
-import { dlopen, FFIType } from "bun:ffi";
-import { writeFileSync } from "node:fs";
-const { chflags } = dlopen("/usr/lib/libSystem.B.dylib", { chflags: { args: [FFIType.cstring, FFIType.u32], returns: FFIType.i32 } }).symbols;
+	// Each control holds its worker at a gate (GATE_HEAD) in the state under test while the test feeds as many ticks as a
+	// hot signature needs to start and match (HOLD); the worker's CPU is fed (hot where the control's worker is a hot one),
+	// so what the controls test is the structure a tick sees, never how a loaded machine schedules.
+	describe("negative controls, fed ticks: each part ends normally with no signature and no decision (enforce, --parallel=2)", () => {
+		const HOLD = 2 + STUCK_DEFAULTS.persistMs / STUCK_DEFAULTS.tickMs;
+		const head = (body: string) => `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\n${GATE_HEAD}${body}`;
+		/** The worker publishes ../w.pid, runs `before`, makes an unreaped /usr/bin/true (../z.pid), and holds at `hold`. */
+		const zombieHeld = (before = "") =>
+			head(`test("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n${before}\twriteFileSync("../z.pid", String(${unreapedTrue()}.pid));\n\tgate("hold");\n}, 60_000);\n`);
+		/** A getter's body: the unreaped /usr/bin/true (../z.pid), then the hold gate. */
+		const GETTER_HOLD = `writeFileSync("../z.pid", String(${unreapedTrue()}.pid));\n\t\tgate("hold");`;
+		const hot = (pid: number) => (at: number) => ({ [pid]: at * 1e6 });
+		const flat = (pid: number) => (_at: number) => ({ [pid]: 0 });
+
+		interface Control {
+			work: string;
+			p: Wrapper & { stdout: ReadableStream<Uint8Array> };
+			/** Feed `n` ticks (HOLD by default), STUCK_DEFAULTS.tickMs apart on fed time from the last; none may start, match or clear. */
+			feed: (cpu: (at: number) => Record<number, number>, n?: number) => Promise<void>;
+			/** How many ticks were fed. */
+			fed: () => number;
+		}
+		function control(name: string, files: Record<string, string>, gates: string[]): Control {
+			const b = box(`stuck-neg-${name}`, FED);
+			prepared(b, "tr-sn1", files, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
+			const work = workOf(b, "tr-sn1");
+			makeGates(work, gates);
+			const p = spawnCall(b, { sub: "full", runId: "tr-sn1" });
+			const tick = feeder(b, "tr-sn1", p);
+			let k = 0;
+			const feed = async (cpu: (at: number) => Record<number, number>, n = HOLD) => {
+				for (let i = 0; i < n; i++, k++) {
+					const at = k * STUCK_DEFAULTS.tickMs;
+					const a = await tick(at, cpu(at));
+					expect({ name, n: a.n, error: a.error, ended: a.ended, signatures: a.signatures, started: a.started, matched: a.matched, cleared: a.cleared })
+						.toEqual({ name, n: k + 1, error: undefined, ended: undefined, signatures: [], started: [], matched: [], cleared: [] });
+				}
+			};
+			return { work, p, feed, fed: () => k };
+		}
+		/** The control ended normally with no detector line at all; returns its trace, one row per fed tick. */
+		async function ended(c: Control): Promise<TraceRow[]> {
+			const [exit, stdout, stderr] = await Promise.all([c.p.exited, new Response(c.p.stdout).text(), new Response(c.p.stderr).text()]);
+			expect({ exit, stderr, lines: keywordsOf(stdout) }).toEqual({ exit: 0, stderr: "", lines: [] });
+			const trace = traceOf(c.work);
+			expect(trace).toHaveLength(c.fed());
+			expect(trace.every((t) => t.snap === "ok" && t.signatures.length === 0)).toBe(true);
+			expect(existsSync(join(c.work, "stuck-markers-full"))).toBe(false);
+			return trace;
+		}
+		const zombieOf = (t: TraceRow, ppid: number) => t.zombies.some((z) => z.ppid === ppid && z.comm === "true");
+		const markedBy = (t: TraceRow, w: number) => activeAt(t).filter((m) => m.pid === w).map((m) => m.command);
+
+		/** Hold a zombie-making control, feed HOLD hot ticks once its /usr/bin/true has exited, then let it end. */
+		async function heldZombie(name: string, file: string): Promise<{ trace: TraceRow[]; w: number }> {
+			const c = control(name, { "a.test.ts": OK_TEST, "c.test.ts": file }, ["hold"]);
+			const w = await reached(c.work, "hold", c.p);
+			expect(fixturePid(c.work, "w.pid")).toBe(w);
+			await exitOf(fixturePid(c.work, "z.pid"));
+			await c.feed(hot(w));
+			letThrough(c.work, "hold");
+			return { trace: await ended(c), w };
+		}
+
+		test("a hot worker holding a zombie child, with no marker", async () => {
+			const { trace, w } = await heldZombie("zombie-no-marker", zombieHeld());
+			expect(trace.map((t) => ({ zombie: zombieOf(t, w), markers: activeAt(t) }))).toEqual(trace.map(() => ({ zombie: true, markers: [] })));
+		}, 60_000);
+
+		test("a real Bun.spawnSync(['/usr/bin/true']) that returns, then an async /usr/bin/true born at once, held hot: the marker is inactive", async () => {
+			const { trace, w } = await heldZombie("returned-call-then-zombie", zombieHeld(`\tBun.spawnSync(["/usr/bin/true"]);\n`));
+			expect(trace.map((t) => ({ zombie: zombieOf(t, w), markers: activeAt(t) }))).toEqual(trace.map(() => ({ zombie: true, markers: [] })));
+		}, 60_000);
+
+		test("the same with the marker file made immutable before the first call: no marker ever becomes active", async () => {
+			const file = `import { dlopen, FFIType } from "bun:ffi";
+${head(`const { chflags } = dlopen("/usr/lib/libSystem.B.dylib", { chflags: { args: [FFIType.cstring, FFIType.u32], returns: FFIType.i32 } }).symbols;
 test("c", () => {
 	writeFileSync("../w.pid", String(process.pid));
 	const marker = Buffer.from(process.env.AS2TEST_STUCK_MARKERS + "/" + process.pid + "\\0");
@@ -2025,218 +2292,121 @@ test("c", () => {
 	if (chflags(marker, 2) !== 0) throw new Error("chflags uchg failed");
 	try {
 		Bun.spawnSync(["/usr/bin/true"]);
-		${unreapedTrue()};
-		${LOOP}
+		writeFileSync("../z.pid", String(${unreapedTrue()}.pid));
+		gate("hold");
 	} finally {
 		chflags(marker, 0);
 	}
 }, 60_000);
-`,
-			},
-			"long-async": {
-				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", async () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tawait Bun.sleep(6_000);\n}, 60_000);\n`,
-			},
-			"sync-sleep": {
-				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tBun.spawnSync(["/bin/sleep", "3"]);\n}, 60_000);\n`,
-			},
-			"printer-beside-idle": {
-				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("prints", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tconst end = Date.now() + 6_000;\n\twhile (Date.now() < end) console.log("x".repeat(100));\n}, 60_000);\n`,
-				"d.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("idles", async () => {\n\twriteFileSync("../idle.pid", String(process.pid));\n\tawait Bun.sleep(6_000);\n}, 60_000);\n`,
-			},
-			// The positive fixture but for the zombie's parent: a sleeping process of the fixture, not the hot marked worker.
-			"zombie-of-a-sleeper": {
-				"c.test.ts": `${SPIN_HEAD}test("c", () => {
-	writeFileSync("../w.pid", String(process.pid));
-	const fd = holdMarker("true");
-	Bun.spawn(["/bin/sh", "-c", "/usr/bin/true & exec /bin/sleep 8"]);
-	${LOOP}
-	closeSync(fd);
-}, 60_000);
-`,
-			},
-			// Review r2 finding 1: healthy test code inside the call's own argv getter (an async /usr/bin/true born at once, then a
-			// hot computation past the persistence) while the original Bun.spawnSync(["/usr/bin/true", …]) reads its arguments.
-			"argv-getter": {
-				"c.test.ts": `import { test } from "bun:test";
-import { writeFileSync } from "node:fs";
-test("c", () => {
-	writeFileSync("../w.pid", String(process.pid));
-	const argv = ["/usr/bin/true"];
-	Object.defineProperty(argv, 1, { enumerable: true, get() {
-		${unreapedTrue()};
-		const end = Date.now() + ${GETTER_HOT_MS};
-		while (Date.now() < end) {}
-		return "x";
-	} });
-	if (Bun.spawnSync(argv).exitCode !== 0) throw new Error("true failed");
-}, 60_000);
-`,
-			},
-			// Review r3: the same healthy getter outside the options' own data, run through r3GetterCall with argv ["/usr/bin/true"]:
-			// a `cwd` accessor on Object.prototype under a {} options object, and an env array with an enumerable named getter. A
-			// real 3 s idle after the call keeps the part alive for the trace's 10 real-clock ticks when the getter does not run (the
-			// detector samples the real process over real 250 ms ticks, so fake timers cannot stand in).
-			...Object.fromEntries((["proto-cwd", "env-array"] as const).map((shape) => [`${shape}-getter`, {
-				"c.test.ts": `import { test } from "bun:test";
-import { writeFileSync } from "node:fs";
-const r3GetterCall = ${r3GetterCall.toString()};
-test("c", async () => {
-	writeFileSync("../w.pid", String(process.pid));
-	const out = r3GetterCall("${shape}", ["/usr/bin/true"], () => {
-		${unreapedTrue()};
-		const end = Date.now() + ${GETTER_HOT_MS};
-		while (Date.now() < end) {}
-	});
-	writeFileSync("../out.json", JSON.stringify(out));
-	await Bun.sleep(3_000);
-}, 60_000);
-`,
-			}])),
-			// Review r4: the same healthy getter as a Symbol.asyncIterator getter on a Buffer stdin, which bun looks up before it
-			// takes the bytes, run through byteGetterCall("own") with argv ["/usr/bin/true"]; the same real 3 s idle after (the
-			// detector samples the real process over real 250 ms ticks, so fake timers cannot stand in).
-			"byte-stdin-getter": {
-				"c.test.ts": `import { test } from "bun:test";
-import * as cp from "node:child_process";
-import { writeFileSync } from "node:fs";
-const byteGetterCall = ${byteGetterCall.toString()};
-test("c", async () => {
-	writeFileSync("../w.pid", String(process.pid));
-	const out = byteGetterCall(cp, "own", ["/usr/bin/true"], () => {
-		${unreapedTrue()};
-		const end = Date.now() + ${GETTER_HOT_MS};
-		while (Date.now() < end) {}
-	});
-	writeFileSync("../out.json", JSON.stringify(out));
-	await Bun.sleep(3_000);
-}, 60_000);
-`,
-			},
-		};
-		type Done = { b: Box; work: string; exit: number | null; stdout: string; stderr: string };
-		let all: Promise<Record<string, Done>> | null = null;
+`)}`;
+			const { trace, w } = await heldZombie("immutable-marker", file);
+			expect(trace.map((t) => ({ zombie: zombieOf(t, w), markers: activeAt(t) }))).toEqual(trace.map(() => ({ zombie: true, markers: [] })));
+		}, 60_000);
+
 		/**
-		 * Three controls at a time (each in its own box), started by the first test that needs them: most of them spin a worker
-		 * hot for 6 s, and all at once they starved the rest of the full suite of CPU.
+		 * A getter control: `call` (test code) runs GETTER_HOLD in a getter the call reads, then the fixture writes ../out.json
+		 * and stops at `after`. `runs`: whether this bun runs that getter at all (the unwrapped shape says); when it does, HOLD
+		 * hot ticks see the worker's zombie with no marker of the worker; then one more tick at `after`.
 		 */
-		const CONTROLS_AT_ONCE = 3;
-		/** Every test here may be the first to wait for all the controls. */
-		const CONTROL_TEST_MS = 240_000;
-		const runControl = async ([name, files]: [string, Record<string, string>], i: number): Promise<[string, Done]> => {
-			const b = box(`stuck-neg-${name}`, DETECT);
-			const runId = `tr-sn${i}`;
-			prepared(b, runId, { "a.test.ts": OK_TEST, ...files }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
-			const p = spawnCall(b, { sub: "full", runId });
-			const exit = await p.exited;
-			return [name, { b, work: workOf(b, runId), exit, stdout: await new Response(p.stdout).text(), stderr: await new Response(p.stderr).text() }];
-		};
-		const results = (): Promise<Record<string, Done>> =>
-			(all ??= (async () => {
-				const entries = Object.entries(fixtures);
-				const done: [string, Done][] = [];
-				let next = 0;
-				const worker = async (): Promise<void> => {
-					while (next < entries.length) {
-						const i = next++;
-						done.push(await runControl(entries[i]!, i));
-					}
-				};
-				await Promise.all(Array.from({ length: CONTROLS_AT_ONCE }, worker));
-				return Object.fromEntries(done);
-			})());
-		/** The control ended normally, with no detector line at all; returns its trace and worker pid. */
-		async function settled(name: string): Promise<{ trace: TraceRow[]; w: number; work: string }> {
-			const d = (await results())[name]!;
-			expect({ name, exit: d.exit, stderr: d.stderr, lines: keywordsOf(d.stdout) }).toEqual({ name, exit: 0, stderr: "", lines: [] });
-			const trace = traceOf(d.work);
-			expect(trace.length).toBeGreaterThanOrEqual(10);
-			expect(trace.every((t) => t.snap === "ok" && t.signatures.length === 0)).toBe(true);
-			expect(existsSync(join(d.work, "stuck-markers-full"))).toBe(false);
-			return { trace, w: fixturePid(d.work, "w.pid"), work: d.work };
+		async function getterControl(name: string, imports: string, call: string, runs: boolean): Promise<unknown> {
+			const file = `${imports}${head(`test("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tconst out = ${call};\n\twriteFileSync("../out.json", JSON.stringify(out));\n\tgate("after");\n}, 60_000);\n`)}`;
+			const c = control(name, { "a.test.ts": OK_TEST, "c.test.ts": file }, ["hold", "after"]);
+			if (runs) {
+				const held = await reached(c.work, "hold", c.p);
+				await exitOf(fixturePid(c.work, "z.pid"));
+				await c.feed(hot(held));
+				letThrough(c.work, "hold");
+			}
+			const w = await reached(c.work, "after", c.p);
+			await c.feed(hot(w), 1);
+			letThrough(c.work, "after");
+			const trace = await ended(c);
+			const held = trace.slice(0, runs ? HOLD : 0);
+			expect(held.map((t) => ({ zombie: zombieOf(t, w), marked: markedBy(t, w) }))).toEqual(held.map(() => ({ zombie: true, marked: [] })));
+			return JSON.parse(readFileSync(join(c.work, "out.json"), "utf8"));
 		}
-		const zombieOf = (trace: TraceRow[], ppid: number) => trace.some((t) => t.zombies.some((z) => z.ppid === ppid && z.comm === "true"));
-		/**
-		 * Whether the control meant something: ticks saw the worker's `true` zombie over at least a second (four ticks' worth)
-		 * without the worker's marker. A span, not a tick count: under a loaded machine the executor's ticks come late and few,
-		 * while the zombie still stands through the getter's whole hot computation.
-		 */
-		const unmarkedZombieSpanMs = (trace: TraceRow[], w: number): number => {
-			const at = trace.filter((t) => t.zombies.some((z) => z.ppid === w && z.comm === "true") && !activeAt(t).some((m) => m.pid === w)).map((t) => t.at);
-			return at.length < 2 ? 0 : at[at.length - 1]! - at[0]!;
-		};
-		const MEANINGFUL_SPAN_MS = 4 * DETECT.detectTickMs;
 
-		test("a 6 s sync loop holding a zombie child, with no marker", async () => {
-			const { trace, w } = await settled("zombie-no-marker");
-			expect(zombieOf(trace, w)).toBe(true);
-			expect(trace.every((t) => activeAt(t).length === 0)).toBe(true);
-		}, CONTROL_TEST_MS);
-
-		test("a real Bun.spawnSync(['/usr/bin/true']) that returns, then an async /usr/bin/true born at once and a 6 s sync loop: the marker is inactive", async () => {
-			const { trace, w } = await settled("returned-call-then-zombie");
-			expect(zombieOf(trace, w)).toBe(true);
-			expect(trace.filter((t) => t.zombies.length > 0).every((t) => activeAt(t).length === 0)).toBe(true);
-		}, CONTROL_TEST_MS);
-
-		test("the same with the marker file made immutable before the first call: no marker ever becomes active", async () => {
-			const { trace, w } = await settled("immutable-marker");
-			expect(zombieOf(trace, w)).toBe(true);
-			expect(trace.every((t) => activeAt(t).length === 0)).toBe(true);
-		}, CONTROL_TEST_MS);
-
-		test("Bun.spawnSync(['/usr/bin/true', <getter>]) whose getter starts an async /usr/bin/true and computes past the persistence: the call runs unpublished, so the hot worker's zombie never meets a marker", async () => {
-			const { trace, w } = await settled("argv-getter");
-			expect(unmarkedZombieSpanMs(trace, w)).toBeGreaterThanOrEqual(MEANINGFUL_SPAN_MS);
-		}, CONTROL_TEST_MS);
+		test("Bun.spawnSync(['/usr/bin/true', <getter>]) whose getter starts an async /usr/bin/true and holds hot: the call runs unpublished, so the hot worker's zombie never meets a marker", async () => {
+			const call = `(() => {\n\t\tconst argv = ["/usr/bin/true"];\n\t\tObject.defineProperty(argv, 1, { enumerable: true, get() {\n\t\t${GETTER_HOLD}\n\t\treturn "x";\n\t\t} });\n\t\treturn { exitCode: Bun.spawnSync(argv).exitCode };\n\t})()`;
+			expect(await getterControl("argv-getter", "", call, true)).toEqual({ exitCode: 0 });
+		}, 60_000);
 
 		for (const shape of ["proto-cwd", "env-array"] as const) {
 			const what = shape === "proto-cwd" ? "Bun.spawnSync(['/usr/bin/true'], {}) beside an Object.prototype cwd getter" : "Bun.spawnSync(['/usr/bin/true'], { env: <array with an enumerable named getter> })";
-			test(`${what} whose getter starts an async /usr/bin/true and computes past the persistence: the call runs unpublished and does what it does unwrapped, so the hot worker's zombie never meets a marker`, async () => {
-				const { trace, w, work } = await settled(`${shape}-getter`);
-				const out = JSON.parse(readFileSync(join(work, "out.json"), "utf8")) as { exitCode: number; hits: number };
-				expect(out).toEqual(r3GetterCall(shape, ["/usr/bin/true"], () => {}));
-				const zombieTicks = trace.filter((t) => t.zombies.some((z) => z.ppid === w && z.comm === "true"));
-				expect(zombieTicks.filter((t) => activeAt(t).some((m) => m.pid === w))).toEqual([]);
+			test(`${what} whose getter starts an async /usr/bin/true and holds hot: the call runs unpublished and does what it does unwrapped, so the hot worker's zombie never meets a marker`, async () => {
 				// bun 1.3.14 runs the env array's getter; it stops its option lookups before Object.prototype, so the inherited
 				// getter runs only if a later bun reads it, and then it must meet no marker either.
-				expect(unmarkedZombieSpanMs(trace, w)).toBeGreaterThanOrEqual(out.hits > 0 ? MEANINGFUL_SPAN_MS : 0);
-			}, CONTROL_TEST_MS);
+				const native = r3GetterCall(shape, ["/usr/bin/true"], () => {});
+				const call = `r3GetterCall("${shape}", ["/usr/bin/true"], () => {\n\t\t${GETTER_HOLD}\n\t})`;
+				expect(await getterControl(`${shape}-getter`, `const r3GetterCall = ${r3GetterCall.toString()};\n`, call, native.hits > 0)).toEqual(native);
+			}, 60_000);
 		}
 
-		test("Bun.spawnSync(['/usr/bin/true'], { stdin: <Buffer with an own Symbol.asyncIterator getter> }) whose getter starts an async /usr/bin/true and computes past the persistence: the call runs unpublished and does what it does unwrapped, so the hot worker's zombie never meets a marker", async () => {
-			const { trace, w, work } = await settled("byte-stdin-getter");
+		test("Bun.spawnSync(['/usr/bin/true'], { stdin: <Buffer with an own Symbol.asyncIterator getter> }) whose getter starts an async /usr/bin/true and holds hot: the call runs unpublished and does what it does unwrapped, so the hot worker's zombie never meets a marker", async () => {
 			const native = byteGetterCall(childProcess, "own", ["/usr/bin/true"], () => {});
 			expect(native).toEqual({ exitCode: 0, hits: 1 });
-			const out: unknown = JSON.parse(readFileSync(join(work, "out.json"), "utf8"));
-			expect(out).toEqual(native);
-			// bun runs the getter before it takes the bytes, so the zombie is there throughout the hot computation, unmarked.
-			const zombieTicks = trace.filter((t) => t.zombies.some((z) => z.ppid === w && z.comm === "true"));
-			expect(unmarkedZombieSpanMs(trace, w)).toBeGreaterThanOrEqual(MEANINGFUL_SPAN_MS);
-			expect(zombieTicks.filter((t) => activeAt(t).some((m) => m.pid === w))).toEqual([]);
-		}, CONTROL_TEST_MS);
+			const call = `byteGetterCall(cp, "own", ["/usr/bin/true"], () => {\n\t\t${GETTER_HOLD}\n\t})`;
+			expect(await getterControl("byte-stdin-getter", `import * as cp from "node:child_process";\nconst byteGetterCall = ${byteGetterCall.toString()};\n`, call, true)).toEqual(native);
+		}, 60_000);
 
 		test("a long async test", async () => {
-			const { trace, w } = await settled("long-async");
-			expect(trace.some((t) => t.tree.some((p) => p.pid === w))).toBe(true);
-		}, CONTROL_TEST_MS);
+			const c = control("long-async", { "a.test.ts": OK_TEST, "c.test.ts": head(`test("c", async () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tawait gateAsync("hold");\n}, 60_000);\n`) }, ["hold"]);
+			const w = await reached(c.work, "hold", c.p);
+			await c.feed(flat(w));
+			letThrough(c.work, "hold");
+			const trace = await ended(c);
+			expect(trace.map((t) => t.tree.some((p) => p.pid === w))).toEqual(trace.map(() => true));
+		}, 60_000);
 
-		test("a real Bun.spawnSync(['/bin/sleep', '3']): the marker is active with a live child, and the worker is not hot", async () => {
-			const { trace, w } = await settled("sync-sleep");
-			expect(trace.some((t) => activeAt(t).some((m) => m.pid === w && m.command === "sleep") && t.tree.some((p) => p.ppid === w && p.comm === "sleep"))).toBe(true);
-		}, CONTROL_TEST_MS);
+		test("a real Bun.spawnSync of a child that waits: the marker is active with a live child, and the worker is not hot", async () => {
+			const file = head(`test("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tconst r = Bun.spawnSync([SLEEP, "hold"]);\n\tif (r.exitCode !== 0) throw new Error("the hold gate's sleep exited " + r.exitCode);\n}, 60_000);\n`);
+			const c = control("sync-sleep", { "a.test.ts": OK_TEST, "c.test.ts": file }, ["hold"]);
+			const child = await reached(c.work, "hold", c.p);
+			const w = fixturePid(c.work, "w.pid");
+			await c.feed(flat(w));
+			letThrough(c.work, "hold");
+			const trace = await ended(c);
+			expect(trace.map((t) => ({ marked: markedBy(t, w), child: t.tree.some((p) => p.pid === child && p.ppid === w) }))).toEqual(trace.map(() => ({ marked: ["sleep"], child: true })));
+		}, 60_000);
 
 		test("another worker printing continuously beside an idle one", async () => {
-			const { trace, w, work } = await settled("printer-beside-idle");
-			const idle = fixturePid(work, "idle.pid");
+			const printer = head(`test("prints", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tannounce("printing");\n\twhile (!__fs.existsSync(W + "/printed")) console.log("x".repeat(100));\n}, 60_000);\n`);
+			const idler = head(`test("idles", async () => {\n\twriteFileSync("../idle.pid", String(process.pid));\n\tawait gateAsync("hold");\n}, 60_000);\n`);
+			// Two files on --parallel=2: each has a worker of its own, so the printer prints while the idle one waits.
+			const c = control("printer-beside-idle", { "c.test.ts": printer, "d.test.ts": idler }, ["printing", "hold"]);
+			const w = await reached(c.work, "printing", c.p);
+			const idle = await reached(c.work, "hold", c.p);
+			expect([fixturePid(c.work, "w.pid"), fixturePid(c.work, "idle.pid")]).toEqual([w, idle]);
 			expect(idle).not.toBe(w);
-			expect(trace.some((t) => t.tree.some((p) => p.pid === w) && t.tree.some((p) => p.pid === idle))).toBe(true);
-		}, CONTROL_TEST_MS);
+			await c.feed((at) => ({ ...hot(w)(at), ...flat(idle)(at) }));
+			letThrough(c.work, "hold");
+			writeFileSync(join(c.work, "printed"), "");
+			const trace = await ended(c);
+			expect(trace.map((t) => [w, idle].every((pid) => t.tree.some((p) => p.pid === pid)))).toEqual(trace.map(() => true));
+		}, 60_000);
 
 		test("a zombie whose parent is a sleeping fixture process, beside a hot worker holding a marker", async () => {
-			const { trace, w } = await settled("zombie-of-a-sleeper");
-			expect(trace.some((t) => activeAt(t).some((m) => m.pid === w && m.command === "true") && t.zombies.some((z) => z.comm === "true" && z.ppid !== w))).toBe(true);
-			expect(zombieOf(trace, w)).toBe(false);
-		}, CONTROL_TEST_MS);
+			// The sleeper: a bun child of the worker that makes the unreaped /usr/bin/true, then blocks at its gate.
+			const sleeper = `${GATE_HEAD}__fs.writeFileSync("../z.pid", String(${unreapedTrue()}.pid));\ngate("sleeper");\n`;
+			const file = `${SPIN_HEAD}${GATE_HEAD}test("c", () => {
+	writeFileSync("../w.pid", String(process.pid));
+	const fd = holdMarker("true");
+	Bun.spawn([process.execPath, "-e", ${JSON.stringify(sleeper)}]);
+	gate("hold");
+	closeSync(fd);
+}, 60_000);
+`;
+			const c = control("zombie-of-a-sleeper", { "a.test.ts": OK_TEST, "c.test.ts": file }, ["sleeper", "hold"]);
+			const s = await reached(c.work, "sleeper", c.p);
+			const w = await reached(c.work, "hold", c.p);
+			await exitOf(fixturePid(c.work, "z.pid"));
+			await c.feed(hot(w));
+			letThrough(c.work, "sleeper");
+			letThrough(c.work, "hold");
+			const trace = await ended(c);
+			expect(trace.map((t) => ({ marked: markedBy(t, w), sleeperZombie: zombieOf(t, s), workerZombie: zombieOf(t, w) })))
+				.toEqual(trace.map(() => ({ marked: ["true"], sleeperZombie: true, workerZombie: false })));
+		}, 60_000);
 	});
 });
 
@@ -2248,14 +2418,14 @@ describe("sweep", () => {
 		prepared(b, "tr-w1", { "orphan.test.ts": ORPHAN_TEST });
 		expect(call(b, { sub: "full", runId: "tr-w1" }).exit).toBe(0);
 		const orphan = Number(readFileSync(join(workOf(b, "tr-w1"), "orphan.pid"), "utf8"));
-		pids.push(orphan);
+		own(orphan);
 		expect(alive(orphan)).toBe(true);
 		const sibling = Bun.spawn(["/bin/sleep", "300"]);
-		pids.push(sibling.pid);
+		own(sibling.pid);
 		const r = call(b, { sub: "sweep", runId: "tr-w1" });
 		expect(r.stderr).toBe("");
 		expect(r.exit).toBe(WRAPPER_EXIT.ok);
-		expect(await until(() => !alive(orphan), 3_000)).toBe(true);
+		await exited(orphan);
 		expect(alive(sibling.pid)).toBe(true);
 		sibling.kill("SIGKILL");
 	}, 30_000);
@@ -2270,19 +2440,31 @@ describe("sweep", () => {
 		const b = box("lock");
 		setCurrent(b, "tr-l1");
 		chmodSync(join(b.root, "locks"), 0o555);
-		writeFileSync(join(b.hooks, "tr-l1.sweep-read1.pause"), "");
+		const hook = join(b.hooks, "tr-l1.sweep-read1");
+		writeFileSync(`${hook}.pause`, "");
+		const reachedBy = (): number => {
+			const v: unknown = JSON.parse(readFileSync(`${hook}.reached`, "utf8"));
+			if (typeof v === "object" && v !== null && "pid" in v && typeof v.pid === "number") return v.pid;
+			throw new Error(`${hook}.reached names no pid: ${JSON.stringify(v)}`);
+		};
 		const first = spawnCall(b, { sub: "sweep", runId: "tr-l1" });
-		expect(await until(() => existsSync(join(b.hooks, "tr-l1.sweep-read1.reached")), 10_000)).toBe(true);
-		rmSync(join(b.hooks, "tr-l1.sweep-read1.pause"));
+		await appeared(`${hook}.reached`, "the first sweep at sweep-read1", first);
+		const holder = reachedBy();
+		// The hook stays paused: the first sweep holds sweep.db's exclusive lock at it for as long as it lives, and every
+		// sweep takes that lock before it reaches sweep-read1, so the second one cannot reach the hook while the first lives.
 		const second = spawnCall(b, { sub: "sweep", runId: "tr-l1" });
-		// A real delay: the claim is that the second sweep is still blocked on the lock after it.
-		await Bun.sleep(1_500);
 		expect(second.exitCode).toBeNull();
+		expect(reachedBy()).toBe(holder);
 		first.kill("SIGKILL");
 		expect(await first.exited).not.toBe(0);
-		const t0 = Date.now();
+		// Once the first is gone the second gets the lock and reaches the hook itself (each hook visit renames a fresh .reached).
+		const next = await when(b.hooks, () => {
+			const by = reachedBy();
+			return by === holder ? undefined : by;
+		}, "the second sweep at sweep-read1", second);
+		expect(next).not.toBe(holder);
+		writeFileSync(`${hook}.go`, "");
 		expect(await second.exited).toBe(WRAPPER_EXIT.ok);
-		expect(Date.now() - t0).toBeLessThan(3_000);
 		expect(readdirSync(join(b.root, "locks"))).toEqual(["sweep.db"]);
 	}, 30_000);
 
@@ -2292,7 +2474,7 @@ describe("sweep", () => {
 		setCurrent(b, "tr-h1");
 		writeFileSync(join(b.hooks, "tr-h1.sweep-read1.pause"), "");
 		const holder = spawnCall(b, { sub: "sweep", runId: "tr-h1" });
-		expect(await until(() => existsSync(join(b.hooks, "tr-h1.sweep-read1.reached")), 10_000)).toBe(true);
+		await appeared(join(b.hooks, "tr-h1.sweep-read1.reached"), "the holder at sweep-read1", holder);
 		rmSync(join(b.hooks, "tr-h1.sweep-read1.pause"));
 		const t0 = Date.now();
 		const waiter = spawnCall(b, { sub: "sweep", runId: "tr-h1" }, quick);
@@ -2308,10 +2490,10 @@ describe("sweep", () => {
 		prepared(b, "tr-g1", { "stubborn.test.ts": STUBBORN_TEST });
 		expect(call(b, { sub: "full", runId: "tr-g1" }).exit).toBe(0);
 		const orphan = Number(readFileSync(join(workOf(b, "tr-g1"), "orphan.pid"), "utf8"));
-		pids.push(orphan);
+		own(orphan);
 		writeFileSync(join(b.hooks, "tr-g1.sweep-read1.pause"), "");
 		const sweep = spawnCall(b, { sub: "sweep", runId: "tr-g1" });
-		expect(await until(() => existsSync(join(b.hooks, "tr-g1.sweep-read1.reached")), 10_000)).toBe(true);
+		await appeared(join(b.hooks, "tr-g1.sweep-read1.reached"), "the sweep at sweep-read1", sweep);
 		setCurrent(b, "tr-g2");
 		writeFileSync(join(b.hooks, "tr-g1.sweep-read1.go"), "");
 		expect(await sweep.exited).toBe(WRAPPER_EXIT.fenced);
@@ -2827,7 +3009,17 @@ describe("the refresh helper", () => {
 		walk(root);
 		return out;
 	}
-	const buildDirs = () => readdirSync("/private/tmp").filter((n) => n.startsWith("as2test-refresh."));
+	/**
+	 * The build dir the rig's last run left: the one that run named in refresh.d/stage/build (its $MADE, mktemp's output),
+	 * when that dir is still there. Every helper on the host makes its dirs in the shared /private/tmp, so a scan of
+	 * as2test-refresh.* there also sees other runs' dirs (tr-0mvs4as6e1nc6g0's T5 saw as2test-refresh.91mYTX).
+	 */
+	const leftBuilds = (r: { state: string }): string[] => {
+		const made = join(r.state, "stage", "build");
+		if (!existsSync(made)) return [];
+		const d = readFileSync(made, "utf8").trim();
+		return d !== "" && existsSync(d) ? [d] : [];
+	};
 
 	interface HelperRig {
 		base: string;
@@ -2879,7 +3071,7 @@ describe("the refresh helper", () => {
 		};
 		const spawn = async (): Promise<Ran> => {
 			const p = Bun.spawn([join(libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: base, stdout: "pipe", stderr: "pipe" });
-			pids.push(p.pid);
+			own(p.pid);
 			const [exit, stdout, stderr] = await Promise.all([p.exited, new Response(p.stdout).text(), new Response(p.stderr).text()]);
 			return { exit, stdout, stderr };
 		};
@@ -2923,7 +3115,6 @@ describe("the refresh helper", () => {
 		for (const tool of ["git-fetch", "git-upload-pack", "git-remote-file", "git-remote-https", "git-remote-http", "git-index-pack", "git-archive", "git-cat-file", "git-rev-parse"]) {
 			writeFileSync(join(hostileExec, tool), `#!/bin/sh\necho "${tool} $*" >> '${marker}'\nexit 1\n`, { mode: 0o755 });
 		}
-		const before = buildDirs();
 		const out = r.run([], {
 			cwd: o.work,
 			env: {
@@ -2951,7 +3142,7 @@ describe("the refresh helper", () => {
 		);
 		expect(statSync(join(r.libexec, "test-exec.js")).size).toBeGreaterThan(0);
 		expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
-		expect(buildDirs().filter((d) => !before.includes(d))).toEqual([]);
+		expect(leftBuilds(r)).toEqual([]);
 
 		// The runner's checkout at main passes; the same checkout on feature is input drift on the file feature changed.
 		git(o.work, "checkout", "-q", "main");
@@ -3016,7 +3207,6 @@ describe("the refresh helper", () => {
 				rmSync(policy, { force: true });
 				make();
 				const before = tree(r.libexec, ["refresh.d"]);
-				const dirs = buildDirs();
 				const out = r.run();
 				expect({ helper, name, exit: out.exit, stdout: out.stdout }).toEqual({ helper, name, exit: 71, stdout: "" });
 				expect(out.stderr).toContain(why);
@@ -3024,7 +3214,7 @@ describe("the refresh helper", () => {
 				if (name === "not measured costs") expect(out.stderr.trim().split("\n").at(-1)).toMatch(/render-exec at [0-9a-f]+ failed \(exit \d+\): .*is not a measured resource policy/);
 				expect(tree(r.libexec, ["refresh.d"])).toEqual(before);
 				expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
-				expect(buildDirs().filter((d) => !dirs.includes(d))).toEqual([]);
+				expect(leftBuilds(r)).toEqual([]);
 			}
 		};
 		checkRefusal("this helper");
@@ -3105,8 +3295,8 @@ describe("the refresh helper", () => {
 		r.place({ lockWaitS: 1 });
 		const held = join(r.base, "held");
 		const holder = Bun.spawn(["/usr/bin/lockf", "-k", join(r.state, "lock"), "/bin/sh", "-c", `: > '${held}'; exec /bin/sleep 20`], { stdout: "ignore", stderr: "ignore" });
-		pids.push(holder.pid);
-		expect(await until(() => existsSync(held), 10_000)).toBe(true);
+		own(holder.pid);
+		await appeared(held, "the lock holder's held file", holder);
 		const t0 = Date.now();
 		const out = r.run();
 		expect({ exit: out.exit, stdout: out.stdout }).toEqual({ exit: 69, stdout: "" });
@@ -3201,10 +3391,11 @@ describe("the refresh helper", () => {
 		// main's bundle-inputs (run by the helper as the build user) records its pid, then sleeps with TERM ignored: only a KILL ends it.
 		const started = join(r.base, "bundle-inputs.pid");
 		const hang = [
-			'import { writeFileSync as __wf } from "node:fs";',
+			'import { renameSync as __rn, writeFileSync as __wf } from "node:fs";',
 			'if (process.argv[2] === "bundle-inputs") {',
 			'\tprocess.on("SIGTERM", () => {});',
-			`\t__wf(${JSON.stringify(started)}, String(process.pid));`,
+			`\t__wf(${JSON.stringify(`${started}.tmp`)}, String(process.pid));`,
+			`\t__rn(${JSON.stringify(`${started}.tmp`)}, ${JSON.stringify(started)});`,
 			"\tBun.sleepSync(120_000);",
 			"}",
 			"",
@@ -3214,12 +3405,12 @@ describe("the refresh helper", () => {
 
 		// A TERM to the helper: Jo's own signal to its own process, as a test render runs.
 		const installed = tree(r.libexec, ["refresh.d"]);
-		const before = buildDirs();
 		const p = Bun.spawn([join(r.libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: r.base, stdout: "pipe", stderr: "pipe" });
-		pids.push(p.pid);
-		expect(await until(() => existsSync(started) && readFileSync(started, "utf8") !== "", 90_000)).toBe(true);
+		own(p.pid);
+		// The pid file is renamed in whole, so it exists only with its pid in it.
+		await appeared(started, "bundle-inputs' pid file", p);
 		children.push(Number(readFileSync(started, "utf8")));
-		pids.push(children[0]!);
+		own(children[0]!);
 		const t0 = Date.now();
 		process.kill(p.pid, "SIGTERM");
 		const [exit, stdout, stderr] = await Promise.all([p.exited, new Response(p.stdout).text(), new Response(p.stderr).text()]);
@@ -3227,7 +3418,7 @@ describe("the refresh helper", () => {
 		expect(stderr).toContain("as2test-refresh: ended by a signal; nothing was installed");
 		expect(Date.now() - t0).toBeLessThan(10_000);
 		expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
-		expect(buildDirs().filter((d) => !before.includes(d))).toEqual([]);
+		expect(leftBuilds(r)).toEqual([]);
 		expect(tree(r.libexec, ["refresh.d"])).toEqual(installed);
 
 		// The helper's own cap, with no signal from outside.
@@ -3241,20 +3432,11 @@ describe("the refresh helper", () => {
 		expect(Date.now() - t1).toBeLessThan(15_000);
 		if (existsSync(started)) children.push(Number(readFileSync(started, "utf8")));
 		expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
-		expect(buildDirs().filter((d) => !before.includes(d))).toEqual([]);
+		expect(leftBuilds(r)).toEqual([]);
 		expect(tree(r.libexec, ["refresh.d"])).toEqual(placed);
 
 		// The TERM-proof bundle-inputs of each run is gone.
-		const alive = () =>
-			children.filter((pid) => {
-				try {
-					process.kill(pid, 0);
-					return true;
-				} catch {
-					return false;
-				}
-			});
-		expect(await until(() => alive().length === 0, 5_000)).toBe(true);
+		await exited(...children);
 	}, 240_000);
 
 	// TOOLS-REVIEW r3 minor 2: render-exec's stderr is streamed, not only captured, so a stop mid-render-exec loses none of it.
@@ -3266,30 +3448,38 @@ describe("the refresh helper", () => {
 		const said = "render-exec probe: written before render-exec stalls";
 		// main's render-exec writes one stderr line, records its pid, then blocks on a wait nothing ends: only the helper's stop ends it.
 		const stall = [
-			'import { writeFileSync as __wf } from "node:fs";',
+			'import { renameSync as __rn, writeFileSync as __wf } from "node:fs";',
 			'if (process.argv[2] === "render-exec") {',
 			`\tprocess.stderr.write(${JSON.stringify(`${said}\n`)});`,
-			`\t__wf(${JSON.stringify(started)}, String(process.pid));`,
+			`\t__wf(${JSON.stringify(`${started}.tmp`)}, String(process.pid));`,
+			`\t__rn(${JSON.stringify(`${started}.tmp`)}, ${JSON.stringify(started)});`,
 			"\tAtomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);",
 			"}",
 			"",
 		].join("\n");
 		o.commit({ [AS2]: stall + fixtureSources().get(AS2)! }, "a render-exec that stalls after one stderr line");
 		const installed = tree(r.libexec, ["refresh.d"]);
-		const before = buildDirs();
 		const children: number[] = [];
 		// SIGALRM is what the helper's cap watchdog sends it: sending it here takes the cap's path without waiting out a cap.
 		for (const [signal, says] of [["SIGTERM", "as2test-refresh: ended by a signal; nothing was installed"], ["SIGALRM", " s cap; nothing was installed"]] as const) {
 			rmSync(started, { force: true });
 			const p = Bun.spawn([join(r.libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: r.base, stdout: "pipe", stderr: "pipe" });
-			pids.push(p.pid);
+			own(p.pid);
 			let stderr = "";
 			const decoder = new TextDecoder();
-			const drained = (async () => { for await (const chunk of p.stderr) stderr += decoder.decode(chunk, { stream: true }); })();
+			const saw = Promise.withResolvers<void>();
+			const drained = (async () => {
+				for await (const chunk of p.stderr) {
+					stderr += decoder.decode(chunk, { stream: true });
+					if (stderr.includes(said)) saw.resolve();
+				}
+				saw.reject(new Error(`the refresh helper's stderr ended without "${said}": ${stderr}`));
+			})();
 			// Live: the line is on the helper's stderr while render-exec still runs, before any stop.
-			expect(await until(() => stderr.includes(said) && existsSync(started) && readFileSync(started, "utf8") !== "", 90_000)).toBe(true);
+			await saw.promise;
+			await appeared(started, "render-exec's pid file", p);
 			children.push(Number(readFileSync(started, "utf8")));
-			pids.push(children.at(-1)!);
+			own(children.at(-1)!);
 			process.kill(p.pid, signal);
 			const [exit, stdout] = await Promise.all([p.exited, new Response(p.stdout).text(), drained]);
 			expect({ signal, exit, stdout }).toEqual({ signal, exit: 71, stdout: "" });
@@ -3298,14 +3488,10 @@ describe("the refresh helper", () => {
 			const stop = lines.findIndex((l) => l.includes(says));
 			expect(stop).toBeGreaterThan(lines.indexOf(said));
 			expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
-			expect(buildDirs().filter((d) => !before.includes(d))).toEqual([]);
+			expect(leftBuilds(r)).toEqual([]);
 			expect(tree(r.libexec, ["refresh.d"])).toEqual(installed);
 		}
-		const alive = () => children.filter((pid) => {
-			try { process.kill(pid, 0); return true; }
-			catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; }
-		});
-		expect(await until(() => alive().length === 0, 5_000)).toBe(true);
+		await exited(...children);
 	}, 240_000);
 
 	// TOOLS-REVIEW r3 minor 3: an uncaught error ends with Bun's version line, which names no cause.
@@ -3334,20 +3520,19 @@ describe("the refresh helper", () => {
 		// Each staging install sleeps 30 s once its .new copy is written; a second helper waits 1 s for the lock.
 		r.place({ stallS: 30, lockWaitS: 1 });
 		const installed = tree(r.libexec, ["refresh.d"]);
-		const before = buildDirs();
 		const p = Bun.spawn([join(r.libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: r.base, stdout: "pipe", stderr: "pipe" });
-		pids.push(p.pid);
+		own(p.pid);
 		const stdout = new Response(p.stdout).text();
 		const stderr = new Response(p.stderr).text();
-		expect(await until(() => existsSync(join(r.libexec, ".exec.new")), 90_000)).toBe(true);
-		expect(buildDirs().filter((d) => !before.includes(d))).toHaveLength(1);
+		await appeared(join(r.libexec, ".exec.new"), "the staging install's .exec.new", p);
+		expect(leftBuilds(r)).toHaveLength(1);
 
 		// While it holds refresh.d/lock, another refresh (the next run's, after the runner gave up on this one) gets 69 and touches nothing.
 		const second = r.run();
 		expect({ exit: second.exit, stdout: second.stdout }).toEqual({ exit: 69, stdout: "" });
 		expect(second.stderr).toContain("another refresh holds");
 		expect(existsSync(join(r.libexec, ".exec.new"))).toBe(true);
-		expect(buildDirs().filter((d) => !before.includes(d))).toHaveLength(1);
+		expect(leftBuilds(r)).toHaveLength(1);
 
 		const t0 = Date.now();
 		process.kill(p.pid, "SIGTERM");
@@ -3356,7 +3541,7 @@ describe("the refresh helper", () => {
 		expect(await stderr).toContain("as2test-refresh: ended by a signal; nothing was installed");
 		expect(Date.now() - t0).toBeLessThan(10_000);
 		expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
-		expect(buildDirs().filter((d) => !before.includes(d))).toEqual([]);
+		expect(leftBuilds(r)).toEqual([]);
 		expect(tree(r.libexec, ["refresh.d"])).toEqual(installed);
 	}, 120_000);
 
@@ -3367,9 +3552,8 @@ describe("the refresh helper", () => {
 		o.commit({ [TEST_EXEC]: "export const broken = ;\n" }, "does not compile");
 		// The build user's removal of the build dir's src and out sleeps 30 s first; the cleanup bound is 2 s.
 		r.place({ cleanupStallS: 30, cleanupS: 2 });
-		const before = buildDirs();
 		const p = Bun.spawn([join(r.libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: r.base, stdout: "pipe", stderr: "pipe" });
-		pids.push(p.pid);
+		own(p.pid);
 		const stdout = new Response(p.stdout).text();
 		// When the build fails the helper says so and exits; its EXIT cleanup starts from there.
 		let stderr = "";
@@ -3387,12 +3571,11 @@ describe("the refresh helper", () => {
 		expect({ exit, stdout: await stdout }).toEqual({ exit: 71, stdout: "" });
 		expect(failedAt).toBeGreaterThan(0);
 		expect(exitedAt - failedAt).toBeLessThan(2_000 + 3_000);
-		// The dir it left is the one this run made: named on stderr, new since the run began, still there.
+		// The dir it left is the one this run made: named on stderr and in its $MADE, still there.
 		const named = /as2test-refresh: left the build dir \/private\/tmp\/(as2test-refresh\.[A-Za-z0-9]{6}): its removal did not end within the 2 s cleanup bound\n/.exec(stderr);
 		expect(named?.[1]).toBeString();
 		const left = named![1]!;
-		expect(before).not.toContain(left);
-		expect(buildDirs()).toContain(left);
+		expect(leftBuilds(r)).toEqual([join("/private/tmp", left)]);
 
 		// The lock is free: the next run takes it at once (lockWaitS 1, else 69), removes the dir left, and builds main.
 		const fixed = o.commit({ [TEST_EXEC]: original }, "compiles again");
@@ -3473,7 +3656,7 @@ describe("the refresh helper", () => {
 		].join("\n");
 		const ran = Bun.spawnSync(["/bin/sh", "-c", script, "as2test-identity", d], { env: { PATH: SYS_PATH }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
 		const [pg, child, escSh, esc, stranger] = ["pg", "child", "esc-sh", "escapee", "stranger"].map((f) => Number(readFileSync(join(d, f), "utf8"))) as [number, number, number, number, number];
-		for (const pid of [pg, child, escSh, esc, stranger]) pids.push(pid);
+		for (const pid of [pg, child, escSh, esc, stranger]) own(pid);
 		const alive = (pid: number) => {
 			try {
 				process.kill(pid, 0);
@@ -3490,7 +3673,7 @@ describe("the refresh helper", () => {
 				`still ${[pg, child, escSh, esc].join(" ")} `,
 				`after ${[child, escSh, esc].join(" ")} `,
 			]);
-			expect(await until(() => ![pg, child, escSh, esc].some(alive), 5_000)).toBe(true);
+			await exited(pg, child, escSh, esc);
 			expect(alive(stranger)).toBe(true);
 		} finally {
 			try {
